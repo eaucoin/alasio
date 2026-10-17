@@ -70,6 +70,7 @@ import {
   releaseSettings,
   RELEASE_AFTER_SECONDS,
   routeAddress,
+  runCronJob,
   SESSIONS,
   setUp,
   tcp,
@@ -180,6 +181,12 @@ interface Scenario {
 const collectorOf = (config: { readonly install?: { readonly telemetry?: { readonly collector?: Readonly<Record<string, unknown>> } } }): Readonly<Record<string, unknown>> =>
   config.install?.telemetry?.collector ?? {};
 
+/** The lake's settings, as the configuration `config` sets them. */
+const lakeOf = (config: { readonly install?: { readonly lake?: Readonly<Record<string, unknown>> } }): Readonly<Record<string, unknown>> => config.install?.lake ?? {};
+
+/** The lake's resources the upgrade shard's release before is installed with (./harness.ts), which the cut-over makes its loader's. */
+const LAKE_RESOURCES = { requests: { cpu: "20m", memory: "256Mi" } };
+
 /** Whether `call` is the answer of a turn on Codex, the stand-in's, in the chat `chat`, the operator's unless given. */
 const answered = (call: RecordedCall, chat?: number) =>
   call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER && (chat === undefined || Number(call.payload.chat_id) === chat);
@@ -233,6 +240,9 @@ if (inShard("upgrade")) {
     let upgraded: number;
     /** The users main's bot allows, as its Secret says them. */
     const allowed = async () => Buffer.from((await kube.get<V1Secret>(ref("Secret", `${RELEASE}-telegram`, NAMESPACE)))?.data?.["allowedUserIds"] ?? "", "base64").toString("utf8");
+    /** The lines of Codex's rollouts the lake holds, and how many it had loaded on the release before. */
+    const lakeLines = async () => Number((await lakeQuery("select count(*) as n from codex.lines"))[0]?.["n"] ?? 0);
+    let loaded: number;
     const scenarios: readonly Scenario[] = [
       {
         seeds: "main's bot allowing no user, as 7.0.0 let in the first to write to it, kept in the store",
@@ -301,8 +311,8 @@ if (inShard("upgrade")) {
           assert.equal(await onRecord("select count(*) from neon_control.layout"), "1");
           await until("neon-control recorded the layout it gave main's compute", async () =>
             (await onRecord("select id from neon_control.compute_layouts")).split("\n").includes(computeId(MAIN)) || undefined, 180_000);
-          const lake = (await kube.get<V1Deployment>(ref("Deployment", `${RELEASE}-lake`, NAMESPACE)))?.spec?.template.spec?.containers.find(({ name }) => name === "lake");
-          assert.equal(lake?.env?.find(({ name }) => name === "LAKE_SOURCE_ENDPOINT")?.value, replicaId(MAIN));
+          const loader = (await kube.get<V1Deployment>(ref("Deployment", componentName("lake-loader"), NAMESPACE)))?.spec?.template.spec?.containers.find(({ name }) => name === "loader");
+          assert.equal(loader?.env?.find(({ name }) => name === "LAKE_SOURCE_ENDPOINT")?.value, replicaId(MAIN));
           const since = Date.now();
           await tg.say("through the replica");
           await tg.waitFor((call) => answered(call));
@@ -336,6 +346,20 @@ if (inShard("upgrade")) {
         },
       },
       {
+        seeds: "a configuration that sets the lake's resources, as 7.0.0's may",
+        seed: async () => {
+          assert.deepEqual(lakeOf(JSON.parse(readFileSync(paths().configFile, "utf8")))["resources"], LAKE_RESOURCES);
+        },
+        keeps: "them as its loader's, which loads as 7.0.0's one pod did, in the configuration and on the loader",
+        check: async () => {
+          const lake = lakeOf(JSON.parse(readFileSync(paths().configFile, "utf8")));
+          assert.deepEqual([lake["resources"], (lake["loader"] as { resources?: unknown } | undefined)?.resources], [undefined, LAKE_RESOURCES]);
+          const loader = await kube.get<V1Deployment>(ref("Deployment", componentName("lake-loader"), NAMESPACE));
+          // Its requests 7.0.0's lake's, as the configuration sets them; its limit the loader's own.
+          assert.deepEqual(loader?.spec?.template.spec?.containers.find(({ name }) => name === "loader")?.resources?.requests, LAKE_RESOURCES.requests);
+        },
+      },
+      {
         seeds: "main's bot taking its updates by getUpdates, where it is in them kept in the store",
         seed: async () => {
           assert.match(await onDatabase(NAMESPACE, "select value from state.bot_state where key = 'telegram_update_offset'"), /^\d+$/u);
@@ -351,9 +375,42 @@ if (inShard("upgrade")) {
           await tg.waitFor((call) => answered(call));
         },
       },
+      {
+        seeds: "the lake, the rollouts of main's turns loaded by its one pod",
+        seed: async () => {
+          // Its table is made with the first rollout it loads.
+          for (const deadline = Date.now() + 600_000; (loaded = await lakeLines().catch(() => 0)) === 0; await sleep(10_000)) {
+            if (Date.now() > deadline) assert.fail("the lake loaded no turn's rollout");
+          }
+        },
+        keeps: "the lake keeps what it loaded, read by its readers, its loader asleep once it has loaded what alasio wrote and woken by a turn, which it loads",
+        check: async () => {
+          assert.equal(await kube.get(ref("Deployment", componentName("lake"), NAMESPACE)), null);
+          assert.ok((await lakeLines()) >= loaded);
+          // Asleep, as status says it, once it has loaded what alasio wrote, which may wake it again meanwhile.
+          const asleep = new RegExp(`^ {2}Deployment ${NAMESPACE}/alasio-lake-loader: asleep, nothing left to load$`, "mu");
+          for (const deadline = Date.now() + 600_000; !asleep.test(await alasioOk("status")); await sleep(10_000)) {
+            if (Date.now() > deadline) assert.fail("the lake's loader never went to sleep");
+          }
+          const before = await lakeLines();
+          await tg.say("loaded again");
+          await tg.waitFor((call) => answered(call));
+          for (const deadline = Date.now() + 300_000; (await lakeLines()) <= before; await sleep(2000)) {
+            if (Date.now() > deadline) assert.fail("the turn's rollout was not loaded");
+          }
+        },
+      },
     ];
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
+
+    test(`the cut-over from ${PREVIOUS}'s settings give the lake's loader no resources where the configuration sets the lake none`, () => {
+      const file = join(mkdtempSync(join(tmpdir(), "alasio-e2e-settings-")), "config.json");
+      writeFileSync(file, JSON.stringify({ install: { lake: { enabled: true } } }));
+      const given = spawnSync("bash", [join(import.meta.dirname, "..", "..", "upgrades", `from-${PREVIOUS}.sh`), "release-settings", file], { encoding: "utf8" });
+      assert.equal(given.status, 0, given.stderr);
+      assert.deepEqual(JSON.parse(given.stdout).install.lake, { enabled: true });
+    });
 
     // A branch environment another release made does not run on what an upgrade changes,
     // so the cut-over refuses while one exists, as its first checks find it, before the
@@ -545,10 +602,10 @@ describe("alasio's command line, on the alasio it installed", () => {
 
   test("logs shows what alasio and its components log, and names those it has when asked for another", async () => {
     assert.notEqual((await alasioOk("logs")).trim(), "");
-    await alasioOk("logs", "lake", "--since", "1h");
+    await alasioOk("logs", "lake-query", "--since", "1h");
     const unknown = await alasio("logs", "nothing");
     assert.equal(unknown.code, 1);
-    assert.match(unknown.stderr, /^alasio: alasio has no component nothing; it has .*\blake\b/mu);
+    assert.match(unknown.stderr, /^alasio: alasio has no component nothing; it has .*\blake-query\b/mu);
   });
 
   test("lake answers a query of the analytics lake, in the format asked for", async () => {
@@ -1590,10 +1647,53 @@ if (inShard("telemetry")) {
       );
     });
 
+    test("the lake's loader sleeps once it has loaded what alasio wrote, and a turn's transcript wakes it, which it loads", async () => {
+      const loader = ref("Deployment", componentName("lake-loader"), NAMESPACE);
+      const replicas = async () => (await kube.get<V1Deployment>(loader))?.spec?.replicas ?? 0;
+      // Asleep: KEDA's cooldown past the last record alasio wrote, of the turns before.
+      for (const deadline = Date.now() + 600_000; (await replicas()) > 0; await sleep(10_000)) {
+        if (Date.now() > deadline) assert.fail("the lake's loader never went to sleep");
+      }
+      const lines = async () => Number((await lakeQuery("select count(*) as n from codex.lines"))[0]?.["n"] ?? 0);
+      const before = await lines();
+      await tg.say("hello again");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      const answered = Date.now();
+      let woke = false;
+      for (const deadline = Date.now() + 300_000; (await lines()) <= before; await sleep(2000)) {
+        woke ||= (await replicas()) > 0;
+        if (Date.now() > deadline) assert.fail(`the turn's rollout was not loaded; the loader ${woke ? "woke" : "never woke"}`);
+      }
+      console.error(`# the turn's rollout was in the lake ${((Date.now() - answered) / 1000).toFixed(1)} s after its answer, its loader woken from none`);
+      assert.ok(woke || (await replicas()) > 0, "the turn's rollout was loaded with the loader never awake");
+    });
+
+    test("main's readers scale out on the queries waiting on them, as any of them sums the pool's", async () => {
+      const readers = ref("Deployment", componentName("lake-query"), NAMESPACE);
+      const ready = async () => (await kube.get<V1Deployment>(readers))?.status?.readyReplicas ?? 0;
+      assert.equal(await ready(), 1);
+      // Queries of a second or so each, six at a time, all on one reader, until the pool has another.
+      const slow = "select count(*) as n from range(500000000) t(i) where i % 7 = 3";
+      let loading = true;
+      const load = Array.from({ length: 6 }, async () => {
+        while (loading) await alasio("lake", slow);
+      });
+      try {
+        for (const deadline = Date.now() + 300_000; (await ready()) < 2; await sleep(5000)) {
+          if (Date.now() > deadline) assert.fail("the lake's readers did not scale out");
+        }
+      } finally {
+        loading = false;
+        await Promise.all(load);
+      }
+      const asked = await kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, componentName("lake-query")), ["node", "-e", 'fetch("http://127.0.0.1:8090/pool").then(async (r) => process.stdout.write(await r.text()))'], { container: "query" });
+      assert.equal((JSON.parse(asked) as { readers: number }).readers, 2);
+    });
+
     test("the stack's telemetry is in the lake, the compute's and the lake's own among it", async () => {
-      // What the collector scrapes is named for its job; the lake exports its events itself.
+      // What the collector scrapes is named for its job; the lake's readers export their events themselves.
       await untilInLake("metric of the compute's", metricRows("ServiceName = 'compute'"));
-      await untilInLake("log record of the lake's", "select count(*) as n from otel.logs where ServiceName = 'alasio-lake'");
+      await untilInLake("log record of the lake's readers'", "select count(*) as n from otel.logs where ServiceName = 'alasio-lake-query'");
       await untilInLake("metric of JuiceFS's", metricRows("MetricName like 'juicefs_%'"));
       // Each Valkey's, named by its Service.
       for (const valkey of [`${RELEASE}-valkey`, `${RELEASE}-seaweedfs-filer-store`]) {
@@ -1664,12 +1764,11 @@ if (inShard("telemetry")) {
         const restarts = (await kube.list<CoreV1Event>("Event", { namespace: NAMESPACE }))
           .filter(({ involvedObject, reason, message }) => involvedObject.name?.startsWith("alasio-grafana-") && reason === "BackOff" && message?.startsWith("Back-off restarting"));
         assert.deepEqual(restarts.map(({ message }) => message), []);
-        // What Grafana and the lake's query endpoint hold, as their cgroups count it.
+        // What Grafana and a reader of the lake hold, as their cgroups count it.
         const memory = async (pod: string, container: string) =>
           (await kube.execOk(NAMESPACE, pod, ["cat", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.peak"], { container })).trim().split("\n").map((bytes) => `${Math.round(Number(bytes) / 1048576)} MiB`).join(", peak ");
         t.diagnostic(`Grafana: ${await memory(await kube.runningPod(NAMESPACE, "alasio-grafana"), "grafana")}`);
-        t.diagnostic(`the lake's query endpoint: ${await memory(await kube.runningPod(NAMESPACE, "alasio-lake"), "query")}`);
-        t.diagnostic(`the lake service: ${await memory(await kube.runningPod(NAMESPACE, "alasio-lake"), "lake")}`);
+        t.diagnostic(`a reader of the lake: ${await memory(await kube.runningPod(NAMESPACE, "alasio-lake-query"), "query")}`);
       });
 
       test("a turn that failed alerts each of the bot's users, through the bot", async () => {
@@ -2375,17 +2474,10 @@ async function neonControl(path: string): Promise<string> {
   return kube.execOk(NAMESPACE, pod, ["curl", "-sS", "-H", "@-", `http://127.0.0.1:8080${path}`], { container: "neon-control", stdin: `authorization: Bearer ${token}\n` });
 }
 
-/** Waits until main's lake logs a maintenance pass that `passes` holds for, after those it logged before. */
-async function untilMaintained(what: string, passes: (line: string) => boolean): Promise<void> {
-  const pod = await kube.runningPod(NAMESPACE, "alasio-lake");
-  const seen = (await kube.logs(NAMESPACE, pod, "lake")).split("\n").length;
-  const deadline = Date.now() + 240_000;
-  while (Date.now() < deadline) {
-    const lines = (await kube.logs(NAMESPACE, pod, "lake")).split("\n").slice(seen);
-    if (lines.some((line) => line.includes('"message":"maintained"') && passes(line))) return;
-    await sleep(5000);
-  }
-  assert.fail(`main's lake logged no maintenance that ${what}`);
+/** Runs main's lake's daily maintenance pass now, as its CronJob does on its schedule, and checks that what it logged it did `passes`. */
+async function maintained(what: string, passes: (line: string) => boolean): Promise<void> {
+  const logged = await runCronJob(componentName("lake-maintenance"));
+  assert.ok(logged.split("\n").some((line) => line.includes('"message":"maintained"') && passes(line)), `main's lake's maintenance ${what}: it logged ${logged}`);
 }
 
 if (inShard("branches")) {
@@ -2400,15 +2492,6 @@ if (inShard("branches")) {
       tg = operator(telegram.base);
       branch = operator(branchTelegram.base);
       await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
-      // Main's lake loaded and maintained every few seconds, so the run sees its passes.
-      const lake = await kube.get<V1Deployment>(ref("Deployment", "alasio-lake", NAMESPACE));
-      const containers = lake?.spec?.template.spec?.containers ?? [];
-      assert.ok(containers.some(({ name }) => name === "lake"));
-      const often = [{ name: "LAKE_INTERVAL_SECONDS", value: "10" }, { name: "LAKE_MAINTENANCE_HOURS", value: "0.002" }];
-      // A merge patch replaces the list whole: the query endpoint's container is given back as it was.
-      const patched = containers.map((container) => (container.name === "lake" ? { ...container, env: [...(container.env ?? []), ...often] } : container));
-      await kube.patch(ref("Deployment", "alasio-lake", NAMESPACE), { spec: { template: { spec: { containers: patched } } } });
-      await kube.awaitReady([ref("Deployment", "alasio-lake", NAMESPACE)], "5 minutes");
     });
 
     after(() => {
@@ -2427,7 +2510,7 @@ if (inShard("branches")) {
       console.error(`# the branch ran ${((Date.now() - started) / 1000).toFixed(1)}s after alasio branch create was run`);
       await branch.waitFor((call) => call.method === "setMyCommands", 300_000);
       assert.match(await alasioOk("branch", "list"), new RegExp(`^${BRANCH}: a branch of main, \\d+m old, made by alasio \\S+, its alasio ready, `, "mu"));
-      await untilMaintained("kept the files for the branch", (line) => line.includes(`"keptFilesFor":["${BRANCH}"]`));
+      await maintained("kept the files for the branch", (line) => line.includes(`"keptFilesFor":["${BRANCH}"]`));
     });
 
     test("a turn on the branch goes on in main's conversation in a fork of its workspace, which main made, and nothing of main's changes", async () => {
@@ -2449,6 +2532,23 @@ if (inShard("branches")) {
       assert.deepEqual((await tg.calls()).filter((call) => call.method !== "getUpdates" && call.method !== "answerCallbackQuery"), []);
       // The branch's database has the turn main's does not.
       assert.ok(Number(await onDatabase(BRANCH_NAMESPACE, "select count(*) from state.messages")) > Number(messages));
+    });
+
+    test("the branch's lake loader sleeps while the branch is idle, and a turn on the branch wakes it, which loads it", async () => {
+      const loader = ref("Deployment", componentName("lake-loader"), BRANCH_NAMESPACE);
+      const replicas = async () => (await kube.get<V1Deployment>(loader))?.spec?.replicas ?? 0;
+      for (const deadline = Date.now() + 600_000; (await replicas()) > 0; await sleep(10_000)) {
+        if (Date.now() > deadline) assert.fail("the branch's lake loader never went to sleep");
+      }
+      await branch.say("and again");
+      await branch.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      const loaded = async () => {
+        const [pod] = (await kube.list<V1Pod>("Pod", { namespace: BRANCH_NAMESPACE, labelSelector: "app.kubernetes.io/component=lake-loader" })).filter(({ status }) => status?.phase === "Running");
+        return pod?.metadata?.name ? (await kube.logs(BRANCH_NAMESPACE, pod.metadata.name, "loader").catch(() => "")).includes('"message":"loaded"') : false;
+      };
+      for (const deadline = Date.now() + 300_000; !(await loaded()); await sleep(3000)) {
+        if (Date.now() > deadline) assert.fail("the branch's lake loader did not wake and load for the turn");
+      }
     });
 
     test("the branch's credentials are its own: main's compute takes neither its password nor its compute's token", async () => {
@@ -2487,25 +2587,28 @@ if (inShard("branches")) {
       await branch.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /^This is the branch environment e2e, .* A folder is this machine's own files/mu.test(call.payload.text ?? ""));
     });
 
-    test("the branch's alasio, compute, read replica and lake fit the run's cluster, as the metrics server measures them", async () => {
+    test("the branch's alasio, compute, read replica and lake's loader, while it loads, fit the run's cluster, as the metrics server measures them", async () => {
       const deadline = Date.now() + 300_000;
       let measured: readonly (KubernetesObject & { containers?: { usage?: { memory?: string } }[] })[] = [];
-      while (Date.now() < deadline && measured.length < 4) {
+      // Its alasio, compute and read replica, and its loader where it is awake.
+      const running = async () => (await kube.list<V1Pod>("Pod", { namespace: BRANCH_NAMESPACE })).filter(({ status }) => status?.phase === "Running").length;
+      for (; Date.now() < deadline; await sleep(10_000)) {
         measured = await kube.list("PodMetrics", { namespace: BRANCH_NAMESPACE }).catch(() => []);
-        if (measured.length < 4) await sleep(10_000);
+        if (measured.length >= 3 && measured.length >= (await running())) break;
       }
       const pods = await kube.list<V1Pod>("Pod", { namespace: BRANCH_NAMESPACE });
       for (const { metadata, containers } of measured) {
         const node = pods.find((pod) => pod.metadata?.name === metadata?.name)?.spec?.nodeName;
         console.error(`# measured: ${metadata?.name} on ${node} uses ${containers?.map(({ usage }) => usage?.memory).join(" + ")}`);
       }
-      assert.equal(measured.length, 4, "the metrics server measured the branch's four pods");
+      assert.ok(measured.length >= 3, "the metrics server measured the branch's pods");
       if (AGENTS === 0) assert.equal(new Set(pods.map((pod) => pod.spec?.nodeName)).size, 1);
     });
 
     test("the branch's compute sleeps once nothing has had a session on it for its minute, and its first connection, through main's proxy, wakes it", async () => {
-      // Its alasio and lake stopped, which hold sessions on it, its lake's loader always.
-      for (const name of ["alasio", "alasio-lake"]) await kube.patch(ref("Deployment", name, BRANCH_NAMESPACE), { spec: { replicas: 0 } });
+      // Its alasio and its lake's loader stopped, which hold sessions on it, the loader's scaler paused at none.
+      await kube.patch(ref("ScaledObject", "alasio-lake-loader", BRANCH_NAMESPACE), { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": "0" } } });
+      for (const name of ["alasio", "alasio-lake-loader"]) await kube.patch(ref("Deployment", name, BRANCH_NAMESPACE), { spec: { replicas: 0 } });
       const compute = ref("Deployment", "alasio-neon-compute", BRANCH_NAMESPACE);
       const deadline = Date.now() + 300_000;
       while ((await kube.get<V1Deployment>(compute))?.spec?.replicas !== 0) {
@@ -2547,7 +2650,7 @@ if (inShard("branches")) {
       const controller = await kube.runningPod(NAMESPACE, "alasio-neon-storage-controller");
       const found = await kube.execOk(NAMESPACE, controller, ["sh", "-c", 'curl -sS -o /dev/null -w "%{http_code}" -H "authorization: Bearer $CONTROL_PLANE_JWT_TOKEN" "$0"', `http://127.0.0.1:1234/v1/tenant/${tenantId}/timeline/${timeline}`]);
       assert.equal(found, "404");
-      await untilMaintained("deleted files again", (line) => !line.includes("keptFilesFor"));
+      await maintained("deleted files again", (line) => !line.includes("keptFilesFor"));
       // Main goes on as it was.
       await tg.say("and main?");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);

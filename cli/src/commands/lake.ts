@@ -1,4 +1,4 @@
-/** `alasio lake [--format table|csv|json] <sql>`: a read-only query of the analytics lake, in its query endpoint's container. */
+/** `alasio lake [--format table|csv|json] <sql>`: a read-only query of the analytics lake, in a reader's container. */
 import { PassThrough } from "node:stream";
 
 import { NodeStream } from "@effect/platform-node";
@@ -26,7 +26,7 @@ export const lake = Command.make(
       Effect.gen(function*() {
         const kube = yield* KubeApi;
         const stdio = yield* Stdio.Stdio;
-        const pod = yield* runningPod("lake");
+        const pod = yield* runningPod("lake-query");
         const stdout = new PassThrough();
         const stderr = new PassThrough();
         const forward = (stream: PassThrough, sink: ReturnType<Stdio.Stdio["stdout"]>) =>

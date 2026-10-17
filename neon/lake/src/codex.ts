@@ -20,7 +20,7 @@ export interface CodexHome {
 }
 
 export interface CodexSyncOptions {
-  /** For tests: runs inside each file's transaction just before it commits. */
+  /** Runs inside each file's transaction just before it commits: the fence of the loader's lock, or a test's. */
   beforeCommit?: () => Promise<void>;
 }
 
@@ -152,9 +152,9 @@ async function recordFile(db: DuckDBConnection, home: string, file: SourceRollou
 }
 
 /**
- * Brings the lake's rollout lines in line with the source's, for every home the
- * source has. `beforeCommit`, for tests, runs inside each file's transaction just
- * before it commits. Returns `{ files, inserted, deleted }`: files loaded, and lines.
+ * Brings the lake's rollout lines in line with the source's, for every home the source
+ * has. `beforeCommit` runs inside each file's transaction just before it commits. Returns
+ * `{ files, inserted, deleted }`: files loaded, and lines.
  */
 export async function syncCodex(db: DuckDBConnection, { beforeCommit = async () => {} }: CodexSyncOptions = {}): Promise<CodexLoad> {
   const totals = { files: 0, inserted: 0, deleted: 0 };

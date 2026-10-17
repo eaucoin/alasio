@@ -21,6 +21,7 @@ import { withLogScope } from "../shared/log.ts";
 import { withAlasioSpan } from "../telemetry/index.ts";
 import { ensureGrafanaRole } from "./grafana.ts";
 import { ensureLakeReaderRole, ensureLakeRole, lakeEnabled, syncLakeReads } from "./lake.ts";
+import { LakeWake } from "./lake-wake.ts";
 
 /** What Neon failed with, as the database or the driver said it. */
 export class NeonUnavailable extends Schema.TaggedError<NeonUnavailable>()("NeonUnavailable", {
@@ -122,6 +123,17 @@ const onNeon = <A>(query: () => Promise<A>): Effect.Effect<A, NeonUnavailable> =
 const endPool = (pool: Pool): Effect.Effect<void> => onNeon(() => pool.end()).pipe(Effect.ignore);
 
 /**
+ * What says a store's write was committed on `pool`'s database: `wake` told, the primary's
+ * WAL position read as its record is written.
+ */
+const writtenOn = (pool: Pool, wake: LakeWake["Service"]): (() => void) => () =>
+  wake.written(async () => {
+    const { rows: [row] } = await pool.query<{ lsn: string }>("select pg_current_wal_lsn()::text as lsn");
+    if (!row) throw new Error("the primary named no WAL position");
+    return row.lsn;
+  });
+
+/**
  * Connects to a Neon that is already up and makes what alasio keeps in it: the session
  * and rollout stores' schemas, the lake's role and reads, and the lake reader's and
  * Grafana's roles when their verifiers are given. A pool that cannot is ended: before
@@ -131,6 +143,7 @@ const endPool = (pool: Pool): Effect.Effect<void> => onNeon(() => pool.end()).pi
 const openNeon = Effect.fnUntraced(function*(
   { databaseUrl, lakeVerifier, lake, lakeReaderVerifier, grafanaVerifier }: NeonAccess,
   onIdleError: (error: Error) => void,
+  wake: LakeWake["Service"],
 ): Effect.fn.Return<OpenNeon, NeonUnavailable> {
   const pool = new pg.Pool({
     connectionString: Redacted.value(databaseUrl),
@@ -141,8 +154,9 @@ const openNeon = Effect.fnUntraced(function*(
   // An idle connection dies with the compute when it restarts; the pool
   // replaces it on the next checkout.
   pool.on("error", onIdleError);
-  const sessionStore = new NeonSessionStore(pool);
-  const rollouts = new NeonRolloutStore(pool);
+  const written = writtenOn(pool, wake);
+  const sessionStore = new NeonSessionStore(pool, { written });
+  const rollouts = new NeonRolloutStore(pool, { written });
   yield* onNeon(async () => {
     await sessionStore.ensureSchema();
     await rollouts.ensureSchema();
@@ -175,18 +189,19 @@ const whileNeonStarts = Schedule.max([Schedule.spaced(CONNECT_RETRY), Schedule.d
  * beside alasio, so it is waited for, up to ten minutes, retrying while it does not
  * answer; a stop meanwhile stops the wait.
  */
-const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope> = Effect.gen(function*() {
+const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope | LakeWake> = Effect.gen(function*() {
   const databaseUrl = yield* deploymentSecret("ALASIO_DATABASE_URL");
   const lakeVerifier = yield* Effect.flatMap(deploymentSecret("ALASIO_LAKE_VERIFIER"), verifier("ALASIO_LAKE_VERIFIER"));
   const lake = yield* lakeEnabled;
   const lakeReaderVerifier = yield* givenVerifier("ALASIO_LAKE_READER_VERIFIER");
   const grafanaVerifier = yield* givenVerifier("ALASIO_GRAFANA_VERIFIER");
+  const wake = yield* LakeWake;
   const runFork = yield* FiberSet.makeRuntime();
   const onIdleError = (error: Error): void => {
     runFork(Effect.logWarning(`idle database connection lost: ${error.message}`));
   };
   const { pool, sessionStore, rollouts } = yield* Effect.acquireRelease(
-    openNeon({ databaseUrl, lakeVerifier, lake, lakeReaderVerifier, grafanaVerifier }, onIdleError).pipe(
+    openNeon({ databaseUrl, lakeVerifier, lake, lakeReaderVerifier, grafanaVerifier }, onIdleError, wake).pipe(
       Effect.retry(whileNeonStarts),
       withAlasioSpan("alasio.neon.connect", { attributes: { "alasio.neon.lake": lake } }),
       Effect.interruptible,
@@ -200,7 +215,7 @@ const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope> = Effect
     rollouts,
     lake,
     sessionFsRollouts: onNeon(async () => {
-      const store = new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA });
+      const store = new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA, written: writtenOn(pool, wake) });
       await store.ensureSchema();
       // The analytics lake loads this home too, once it may read it.
       await syncLakeReads(pool, lake);

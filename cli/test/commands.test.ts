@@ -781,14 +781,14 @@ test("restore-filer-store lists the filer store's backups, and puts one back wit
   );
   assert.deepEqual(kube.changes.slice(before).filter(({ path }) => !path.includes("filer-store-backups-listing")), []);
 
-  // A branch environment's alasio; the gateways scaled by KEDA, and the lake's ScaledObject paused before; the lifecycle pass suspended before; a backup of Neon's running.
+  // A branch environment's alasio; the gateways scaled by KEDA, and the lake loader's ScaledObject paused before; the lifecycle pass suspended before; a backup of Neon's running.
   const labels = (component: string) => ({ "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component });
   kube.put("deployments", { apiVersion: "apps/v1", kind: "Deployment", metadata: { name: "alasio", namespace: "alasio-branch-feature", labels: labels("alasio") }, spec: { replicas: 1, selector: { matchLabels: labels("alasio") } } });
   kube.put("pods", { apiVersion: "v1", kind: "Pod", metadata: { name: "alasio-0", namespace: "alasio-branch-feature", labels: labels("alasio") }, status: { phase: "Running" } });
   const scaler = (name: string, annotations: Record<string, string>) =>
     kube.put("scaledobjects", { apiVersion: "keda.sh/v1alpha1", kind: "ScaledObject", metadata: { name, namespace: "alasio", labels: labels(name), annotations }, spec: { scaleTargetRef: { name } } });
   scaler("alasio-seaweedfs", {});
-  scaler("alasio-lake", { "autoscaling.keda.sh/paused-replicas": "1" });
+  scaler("alasio-lake-loader", { "autoscaling.keda.sh/paused-replicas": "1" });
   const lifecycle = at("batch/v1/namespaces/alasio/cronjobs/alasio-seaweedfs-lifecycle");
   assert.ok(lifecycle?.spec);
   lifecycle.spec["suspend"] = true;
@@ -828,14 +828,14 @@ test("restore-filer-store lists the filer store's backups, and puts one back wit
   for (const [held, free] of [["/statefulsets/alasio-neon-pageserver", "/deployments/alasio-neon-compute"], ["/statefulsets/alasio-neon-safekeeper", "/deployments/alasio"]] as const) {
     assert.ok(last(held) >= 0 && last(held) < last(free), `${held} before ${free}`);
   }
-  // Started again as each was: the replicas, the gateways' ScaledObject unpaused, the lake's paused as before, the lifecycle pass still suspended.
+  // Started again as each was: the replicas, the gateways' ScaledObject unpaused, the lake loader's paused as before, the lifecycle pass still suspended.
   for (const path of ["apps/v1/namespaces/alasio/deployments/alasio-seaweedfs", "apps/v1/namespaces/alasio-branch-feature/deployments/alasio", "apps/v1/namespaces/alasio/statefulsets/alasio-seaweedfs-filer-store"]) {
     const workload = at(path);
     assert.equal(workload?.spec?.["replicas"], 1, path);
     assert.equal((workload?.metadata["annotations"] as Record<string, string> | undefined)?.["alasio.dev/restore-filer-store"], undefined, path);
   }
   const annotations = (name: string) => at(`keda.sh/v1alpha1/namespaces/alasio/scaledobjects/${name}`)?.metadata["annotations"];
-  assert.deepEqual([annotations("alasio-seaweedfs"), annotations("alasio-lake")], [{}, { "autoscaling.keda.sh/paused-replicas": "1" }]);
+  assert.deepEqual([annotations("alasio-seaweedfs"), annotations("alasio-lake-loader")], [{}, { "autoscaling.keda.sh/paused-replicas": "1" }]);
   assert.deepEqual(
     ["alasio-seaweedfs-lifecycle", "alasio-seaweedfs-filer-store-backup"].map((name) => at(`batch/v1/namespaces/alasio/cronjobs/${name}`)?.spec?.["suspend"]),
     [true, false],
@@ -851,7 +851,7 @@ test("restore-filer-store lists the filer store's backups, and puts one back wit
     "the filer store holds 1234 keys of the 1235 restored: everything else stays stopped; alasio restore-filer-store 20261013T092300Z again puts the backup back anew",
   );
   assert.equal(at("apps/v1/namespaces/alasio/deployments/alasio-seaweedfs")?.spec?.["replicas"], 0);
-  assert.deepEqual(annotations("alasio-lake"), {
+  assert.deepEqual(annotations("alasio-lake-loader"), {
     "autoscaling.keda.sh/paused-replicas": "0",
     "alasio.dev/restore-filer-store": '{"autoscaling.keda.sh/paused-replicas":"1","autoscaling.keda.sh/paused":null}',
   });
@@ -859,7 +859,7 @@ test("restore-filer-store lists the filer store's backups, and puts one back wit
   kube.logs.set("alasio-seaweedfs-filer-store-restore-0/restore", "restored 1234 keys\n");
   succeeded(await alasio(["restore-filer-store", "20261013T092300Z", "--yes"]));
   assert.equal(at("apps/v1/namespaces/alasio/deployments/alasio-seaweedfs")?.spec?.["replicas"], 1);
-  assert.deepEqual(annotations("alasio-lake"), { "autoscaling.keda.sh/paused-replicas": "1" });
+  assert.deepEqual(annotations("alasio-lake-loader"), { "autoscaling.keda.sh/paused-replicas": "1" });
 });
 
 test("init and up raise inotify limits too low for the cluster here as root, now and for every boot, and status says them too low", async (t) => {
@@ -932,13 +932,13 @@ test("logs prints a component's log, each line with its pod's name when it has s
   const several = await alasio(["logs", "neon-safekeeper", "--since", "10m"]);
   succeeded(several);
   assert.deepEqual(several.stdout.split("\n").filter(Boolean).sort(), ["[alasio-neon-safekeeper-0] zero", "[alasio-neon-safekeeper-1] one"]);
-  // The lake's pod's containers, each line said with its container's name.
-  kube.logs.set("alasio-lake-0/lake", "loaded\n");
-  kube.logs.set("alasio-lake-0/query", "taking queries\n");
-  const lake = await alasio(["logs", "lake"]);
-  succeeded(lake);
-  assert.deepEqual(lake.stdout.split("\n").filter(Boolean).sort(), ["[lake] loaded", "[query] taking queries"]);
-  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has agent-sandbox-controller, alasio, collector, collector-scraper, grafana, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake, lake-intake, log, /u);
+  // The log's pod's containers, each line said with its container's name.
+  kube.logs.set("alasio-log-0/log", "serving\n");
+  kube.logs.set("alasio-log-0/access", "applied\n");
+  const log = await alasio(["logs", "log"]);
+  succeeded(log);
+  assert.deepEqual(log.stdout.split("\n").filter(Boolean).sort(), ["[access] applied", "[log] serving"]);
+  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has agent-sandbox-controller, alasio, collector, collector-scraper, grafana, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake-intake, lake-loader, lake-query, log, /u);
 });
 
 test("restart rolls alasio's pod out again as a manager of its own, and waits until it runs", async (t) => {
@@ -966,8 +966,7 @@ test("upgrade says what it installs, and which images change", async (t) => {
   succeeded(changed);
   assert.equal(changed.printed[0], [
     "alasio 0.0.0-development, with other images:",
-    "  alasio-lake: ghcr.io/eaucoin/alasio-lake:0.0.0-development → ghcr.io/eaucoin/alasio-lake:9.9.9",
-    "  alasio-lake-intake: ghcr.io/eaucoin/alasio-lake:0.0.0-development → ghcr.io/eaucoin/alasio-lake:9.9.9",
+    ...["loader", "maintenance", "merge", "query", "intake"].map((part) => `  alasio-lake-${part}: ghcr.io/eaucoin/alasio-lake:0.0.0-development → ghcr.io/eaucoin/alasio-lake:9.9.9`),
   ].join("\n"));
 });
 
@@ -1388,6 +1387,7 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
     LAKE_BRANCHES_TOKEN: "b",
   });
   stackSecret(setup.kube, "alasio-neon-compute", { NEON_CONTROL_PLANE_TOKEN: "c" });
+  stackSecret(setup.kube, "alasio-log-scaler", { sasl: "scram_sha512", username: "scaler", password: "s" });
   stackSecret(setup.kube, "alasio-branches", { "control-token": "admin", "fork-key": "key" });
   const neon: FakeNeon = { branches: [{ name: "main", parent: null, state: "ready", createdAt: "2026-10-07T00:00:00Z" }], asked: [], turns: "0", computes: [],
     tenant: ONE_SHARD,
@@ -1584,6 +1584,98 @@ test("up refuses fewer of Neon's pageservers than the storage controller has reg
   succeeded(await alasio(["up"]));
 });
 
+test("status says a workload KEDA scales is waking while a pod it scaled to starts, as the lake's intake woken from none, and not ready where nothing scales it", async (t) => {
+  const { alasio, kube } = await branchable(t);
+  const intake = kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio-lake-intake");
+  const pod = kube.get("/api/v1/namespaces/alasio/pods/alasio-lake-intake-0");
+  assert.ok(intake?.spec && intake.status && pod?.metadata && pod.status);
+  assert.ok(kube.get("/apis/keda.sh/v1alpha1/namespaces/alasio/scaledobjects/alasio-lake-intake"));
+  // KEDA's taking it from none to one, its pod just made, not yet ready.
+  intake.spec["replicas"] = 1;
+  intake.status["availableReplicas"] = 0;
+  pod.status["conditions"] = [{ type: "Ready", status: "False" }];
+  pod.status["containerStatuses"] = [{ name: "intake", ready: false, restartCount: 0, image: "lake", imageID: "", state: { running: {} } }];
+  pod.metadata["creationTimestamp"] = new Date().toISOString();
+  let run = await alasio(["status"]);
+  succeeded(run);
+  assert.ok(run.printed.includes("  Deployment alasio/alasio-lake-intake: waking, 0 of 1 available"), run.printed.join("\n"));
+  // Nothing scales it: a pod not ready is not ready.
+  kube.objects.delete("/apis/keda.sh/v1alpha1/namespaces/alasio/scaledobjects/alasio-lake-intake");
+  run = await alasio(["status"]);
+  assert.match(failure(run), /^1 of alasio's \d+ workloads are not ready$/u);
+});
+
+test("status says of the lake's loader whether it is awake, waking, or asleep with nothing left to load", async (t) => {
+  const { alasio, kube } = await branchable(t);
+  const loader = kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio-lake-loader");
+  assert.ok(loader?.spec && loader.status);
+  loader.spec["replicas"] = 1;
+  let run = await alasio(["status"]);
+  succeeded(run);
+  assert.ok(run.printed.includes("  Deployment alasio/alasio-lake-loader: awake"), run.printed.join("\n"));
+  // Woken, its pod not yet ready: waking while the pod starts, within the Deployment's progress
+  // deadline; not ready once a container of it restarted, or past the deadline.
+  loader.status["availableReplicas"] = 0;
+  const pod = kube.get("/api/v1/namespaces/alasio/pods/alasio-lake-loader-0");
+  assert.ok(pod?.metadata && pod.status);
+  pod.status["conditions"] = [{ type: "Ready", status: "False" }];
+  const container = (restartCount: number) => [{ name: "loader", ready: false, restartCount, image: "lake", imageID: "", state: { running: {} } }];
+  for (const [restarts, made, said] of [
+    [0, new Date(), "waking, 0 of 1 available"],
+    [1, new Date(), null],
+    [0, new Date(Date.now() - 11 * 60_000), null],
+  ] as const) {
+    pod.status["containerStatuses"] = container(restarts);
+    pod.metadata["creationTimestamp"] = made.toISOString();
+    run = await alasio(["status"]);
+    if (said) succeeded(run);
+    else assert.match(failure(run), /^1 of alasio's \d+ workloads are not ready$/u);
+    assert.ok(run.printed.includes(`  Deployment alasio/alasio-lake-loader: ${said ?? "0 of 1 available"}`), run.printed.join("\n"));
+  }
+  // Woken, its pod not made yet, as just after KEDA scales it: waking while KEDA last found
+  // it work within the progress deadline; not ready past it, where its pods are refused, or
+  // once the Deployment says it is past its deadline.
+  kube.objects.delete("/api/v1/namespaces/alasio/pods/alasio-lake-loader-0");
+  const scaler = kube.get("/apis/keda.sh/v1alpha1/namespaces/alasio/scaledobjects/alasio-lake-loader");
+  assert.ok(scaler);
+  const unready = async () => {
+    run = await alasio(["status"]);
+    assert.match(failure(run), /^1 of alasio's \d+ workloads are not ready$/u);
+  };
+  for (const [woken, conditions, said] of [
+    [new Date(), [], "waking, 0 of 1 available"],
+    [new Date(Date.now() - 11 * 60_000), [], null],
+    [new Date(), [{ type: "ReplicaFailure", status: "True", reason: "FailedCreate" }], null],
+    [new Date(), [{ type: "Progressing", status: "False", reason: "ProgressDeadlineExceeded" }], null],
+  ] as const) {
+    scaler["status"] = { lastActiveTime: woken.toISOString() };
+    loader.status["conditions"] = conditions;
+    if (said) {
+      run = await alasio(["status"]);
+      succeeded(run);
+      assert.ok(run.printed.includes(`  Deployment alasio/alasio-lake-loader: ${said}`), run.printed.join("\n"));
+    } else {
+      await unready();
+    }
+  }
+  // Asleep, with nothing left to load, only while its ScaledObject would wake it.
+  loader.spec["replicas"] = 0;
+  loader.status["conditions"] = [];
+  run = await alasio(["status"]);
+  succeeded(run);
+  assert.ok(run.printed.includes("  Deployment alasio/alasio-lake-loader: asleep, nothing left to load"), run.printed.join("\n"));
+  for (const [annotations, conditions, said] of [
+    [{ "autoscaling.keda.sh/paused": "true" }, [], "at no replica, its ScaledObject paused, which wakes it no more"],
+    [{ "autoscaling.keda.sh/paused-replicas": "0" }, [], "at no replica, its ScaledObject paused, which wakes it no more"],
+    [{}, [{ type: "Ready", status: "False", reason: "ScaledObjectCheckFailed", message: "the topic lake.main has no partitions" }], "at no replica, its ScaledObject not ready (the topic lake.main has no partitions), which wakes it no more"],
+  ] as const) {
+    (scaler["metadata"] as Record<string, unknown>)["annotations"] = annotations;
+    scaler["status"] = { conditions };
+    await unready();
+    assert.ok(run.printed.includes(`  Deployment alasio/alasio-lake-loader: ${said}`), run.printed.join("\n"));
+  }
+});
+
 test("branch create's help says how far back Neon keeps its history, and so a branch point", async (t) => {
   const { alasio } = await rig(t);
   const run = await alasio(["branch", "create", "--help"]);
@@ -1617,7 +1709,7 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   assert.equal(deployment?.spec.template.spec.containers[0]?.image, "registry.example:5000/alasio:next");
   assert.equal(deployment?.metadata.labels["alasio.dev/branch"], "try");
   assert.ok(kube.get("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute"));
-  assert.ok(kube.get("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-lake"));
+  assert.ok(kube.get("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-lake-loader"));
   // Its own bot, for main's users; its own token to ask main to fork with.
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-telegram", "token"), "456:branch");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-telegram", "allowedUserIds"), "42");
@@ -1644,9 +1736,14 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-claude", "token"), "sk-ant-oat01-claude");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branch-fork", "token"), forkToken("key", "try"));
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branches", "control-token"), undefined);
+  // KEDA's principal on the log, which its loader's scaler reads as, and which may only describe how far behind it is.
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-log-scaler", "username"), "scaler");
   // Its own principal and topic on the log, by the log's access applier; its own route, which Telegram delivers its bot's updates to.
   assert.ok(kube.execs.some(({ pod, container, command }) => pod === "alasio-log-0" && container === "access" && command.join(" ") === "node /opt/alasio/src/log/access.ts environment"));
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-log-alasio", "username"), "alasio-try");
+  // Its lake loader's own, which reads its wake topic, of a password of its own.
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-log-loader", "username"), "loader-try");
+  assert.notEqual(secretIn(kube, "alasio-branch-try", "alasio-log-loader", "password"), secretIn(kube, "alasio-branch-try", "alasio-log-alasio", "password"));
   const route = JSON.parse(secretValue(kube, ROUTES_SECRET, "try") ?? "") as { path: string; secretToken: string; allowedUserIds: string[] };
   assert.deepEqual(route.allowedUserIds, ["42"]);
   assert.notEqual(route.path, (JSON.parse(secretValue(kube, ROUTES_SECRET, "main") ?? "") as { path: string }).path);
@@ -1661,11 +1758,12 @@ test("branch create warns when no node has the memory main's alasio, compute and
   writeFileSync(join(home, "branch"), "456:branch");
   kube.put("nodes", { apiVersion: "v1", kind: "Node", metadata: { name: "machine" }, status: { allocatable: { memory: "4Gi" } } });
   kube.put("nodes", { apiVersion: "metrics.k8s.io/v1beta1", kind: "NodeMetrics", metadata: { name: "machine" }, usage: { memory: "3584Mi" } });
-  // Not the lake's query endpoint, which a branch's lake has none of.
+  // Not the lake's readers, which a branch has none of.
   for (const [component, containers] of [
     ["alasio", { alasio: "400Mi" }],
     ["neon-compute", { compute: "300Mi" }],
-    ["lake", { lake: "200Mi", query: "150Mi" }],
+    ["lake-loader", { loader: "200Mi" }],
+    ["lake-query", { query: "150Mi" }],
     ["neon-pageserver", { pageserver: "1Gi" }],
   ] as const) {
     const labels = { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component };
@@ -1731,7 +1829,8 @@ test("branch delete refuses while the branch's alasio has a turn running unless 
   assert.ok(at(BRANCH_DEPLOYMENT) >= 0 && at(BRANCH_DEPLOYMENT) < at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute"), deleted.join("\n"));
   // Its read replica too, before its branch of Neon is deleted.
   assert.ok(at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute-ro") >= 0, deleted.join("\n"));
-  assert.ok(at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-lake") < at("/api/v1/namespaces/alasio-branch-try"));
+  const loader = at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-lake-loader");
+  assert.ok(loader >= 0 && loader < at("/api/v1/namespaces/alasio-branch-try"), deleted.join("\n"));
   assert.deepEqual(neon.branches.map(({ name }) => name), ["main"]);
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try"), undefined);
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try-sessions"), undefined);

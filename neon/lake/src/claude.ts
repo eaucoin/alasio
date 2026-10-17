@@ -17,7 +17,7 @@ import { LAKE, SOURCE, rows, transaction } from "./lake.ts";
 export interface ClaudeSyncOptions {
   /** Entries loaded per transaction. */
   batchEntries?: number;
-  /** For tests: runs inside each batch's transaction just before it commits. */
+  /** Runs inside each batch's transaction just before it commits: the fence of the loader's lock, or a test's. */
   beforeCommit?: () => Promise<void>;
 }
 
@@ -109,9 +109,8 @@ const INSERT_BLOCKS = `
   from parts`;
 
 /**
- * Brings the lake's entries in line with the source's. `beforeCommit`, for tests,
- * runs inside each batch's transaction just before it commits. Returns
- * `{ inserted, deleted }`.
+ * Brings the lake's entries in line with the source's. `beforeCommit` runs inside each
+ * batch's transaction just before it commits. Returns `{ inserted, deleted }`.
  */
 export async function syncClaude(
   db: DuckDBConnection,

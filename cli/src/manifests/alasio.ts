@@ -29,7 +29,7 @@ import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "
 import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { alasioAccount, busyLabelPolicy, cloneJobPolicy, resumedConditionPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
-import { alasioGroup, environmentLogSecret, environmentName, LOG_BROKERS, telegramTopic } from "./log.ts";
+import { alasioGroup, environmentLogSecret, environmentName, lakeWakeTopic, LOG_BROKERS, telegramTopic } from "./log.ts";
 import {
   BRANCH_FORK_SECRET,
   BRANCH_LABEL,
@@ -44,6 +44,7 @@ import {
   hostVolumes,
   imagePullSecrets,
   labels,
+  lakeRuns,
   MAIN_ENVIRONMENT,
   NAMESPACE,
   nodeAgentRuns,
@@ -409,6 +410,8 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     { name: "ALASIO_LOG_PASSWORD_FILE", value: "/run/alasio/log/password" },
     { name: "ALASIO_TELEGRAM_TOPIC", value: telegramTopic(environmentName(environment)) },
     { name: "ALASIO_TELEGRAM_GROUP", value: alasioGroup(environmentName(environment)) },
+    // Its environment's wake topic, which it tells the lake's loader of each transcript it writes on, as that principal.
+    ...(lakeRuns(config) ? [{ name: "ALASIO_LAKE_WAKE_TOPIC", value: lakeWakeTopic(environmentName(environment)) }] : []),
     { name: "ALASIO_TELEMETRY_RECEIVER_SERVICE", value: `${componentName("telemetry")}.${environment.namespace}.svc` },
     { name: "ALASIO_TELEMETRY_RECEIVER_PORT", value: String(config.telemetry.receiverPort) },
     ...(alasio.defaultHarness ? [{ name: "ALASIO_DEFAULT_HARNESS", value: alasio.defaultHarness }] : []),

@@ -4,7 +4,7 @@
  * without a sensible default are required, so a misconfigured lake fails at once
  * rather than mid-cycle.
  *
- * The lake service (./service.ts), which writes the lake:
+ * The loader (./service.ts), which loads the lake from alasio's database:
  *
  *   LAKE_DATABASE_HOST, LAKE_DATABASE_PORT  Neon's proxy, as the stack's network reaches it
  *   LAKE_DATABASE_ENDPOINT                  the compute it connects to through the proxy,
@@ -19,18 +19,23 @@
  *   LAKE_CATALOG_DATABASE                   the catalog's database (default lake)
  *   LAKE_DATA_PATH                          where the Parquet files go: s3://lake/ on the stack
  *   LAKE_S3_ENDPOINT, LAKE_S3_KEY, LAKE_S3_SECRET  for an s3:// data path
- *   LAKE_INTERVAL_SECONDS                   between loads (default 300)
- *   LAKE_MAINTENANCE_HOURS                  between maintenance passes (default 24); 0 for
- *                                           none, as a branch environment's lake, whose
- *                                           files are main's too, has it
- *   LAKE_BRANCHES_URL, LAKE_BRANCHES_TOKEN  neon-control's list of Neon's branches, and the
- *                                           token it is read with: while it lists any but
- *                                           main, maintenance deletes no file (sync.ts)
- *   LAKE_RETENTION_DAYS                     the days of telemetry kept (default 30)
  *   LAKE_MEMORY_LIMIT, LAKE_THREADS         DuckDB's (default 1GB, 2)
  *   LAKE_EXTENSION_DIRECTORY                the extensions the image installed; with it
  *                                           set, none is ever downloaded
  *   LAKE_HTTP_PORT                          health and Prometheus metrics (default 9464)
+ *   LOG_BROKERS                             the log's brokers, comma-separated host:port
+ *   LOG_USERNAME, LOG_PASSWORD              its principal on the log, `loader-<environment>`
+ *   LAKE_WAKE_TOPIC, LAKE_WAKE_GROUP        the topic alasio says it wrote transcripts on,
+ *                                           `lake.<environment>`, and the loader's group
+ *
+ * Maintenance (./maintain.ts), a process a pass, main's alone:
+ *
+ *   LAKE_DATABASE_*, LAKE_CATALOG_DATABASE, LAKE_DATA_PATH, LAKE_S3_*, LAKE_MEMORY_LIMIT,
+ *   LAKE_THREADS, LAKE_EXTENSION_DIRECTORY  as the loader's
+ *   LAKE_BRANCHES_URL, LAKE_BRANCHES_TOKEN  neon-control's list of Neon's branches, and the
+ *                                           token it is read with: while it lists any but
+ *                                           main, maintenance deletes no file (sync.ts)
+ *   LAKE_RETENTION_DAYS                     the days of telemetry kept (default 30)
  *
  * The telemetry intake (./intake-service.ts), which writes the lake's `otel` schema alone:
  *
@@ -49,6 +54,9 @@
  *   LAKE_READER_S3_KEY, LAKE_READER_S3_SECRET  the object store's read-only identity's
  *   LAKE_QUERY_TOKEN                        the bearer token a query must carry
  *   LAKE_QUERY_PORT                         where it takes queries (default 8090)
+ *   LAKE_QUERY_PEERS                        the name every reader resolves at, their
+ *                                           headless Service's, whose queues /pool sums;
+ *                                           unset, its own alone
  *   LAKE_MEMORY_LIMIT, LAKE_THREADS         its DuckDB's (default 256MB, 2)
  *
  * Their own telemetry is configured by OpenTelemetry's standard variables (./telemetry.ts).
@@ -95,26 +103,38 @@ export interface SourceConfig {
   options: string;
 }
 
+/** The log as a client reaches it: its brokers, and the principal it is reached as. */
+export interface LogConfig {
+  brokers: string[];
+  username: string;
+  password: string;
+}
+
 export interface LakeConfig extends LakeAccess {
   /** alasio's database, which the lake loads from: through the catalog's server, read as the catalog's role. */
   source: SourceConfig;
-  intervalMs: number;
-  /** Null for a lake that is never maintained. */
-  maintenanceIntervalMs: number | null;
+  httpPort: number;
+  /** The log, and what the loader is woken by on it: its topic, and its group. */
+  log: LogConfig;
+  wake: { topic: string; group: string };
+}
+
+export interface MaintenanceConfig extends LakeAccess {
   /** Where the lake learns of Neon's branches, which may read its files; null where it is not told. */
   branches: BranchesSource | null;
   retentionDays: number;
-  httpPort: number;
 }
 
 export interface IntakeConfig extends LakeAccess {
   httpPort: number;
-  log: { brokers: string[]; username: string; password: string };
+  log: LogConfig;
 }
 
 export interface EndpointConfig extends LakeAccess {
   token: string;
   port: number;
+  /** The name every reader of the pool resolves at, as their headless Service; null for this one alone. */
+  peers: string | null;
 }
 
 /** The roles the lake connects as: the lake service's, and the query endpoint's. */
@@ -137,11 +157,6 @@ function positive(env: NodeJS.ProcessEnv, name: string, fallback: number): numbe
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive number, got ${JSON.stringify(raw)}`);
   return value;
-}
-
-/** A positive number, or 0 for none: null. */
-function positiveOrNone(env: NodeJS.ProcessEnv, name: string, fallback: number): number | null {
-  return env[name]?.trim() === "0" ? null : positive(env, name, fallback);
 }
 
 /** The lake as `user` opens it, with the password and object store credentials of the variables `secrets` names. */
@@ -171,36 +186,44 @@ function access(
   };
 }
 
-/** The lake service's configuration. */
+/** The lake as its writers open it: as role `lake`, with the object store's identity of the lake's. */
+const writerAccess = (env: NodeJS.ProcessEnv, memoryLimit: string): LakeAccess =>
+  access(env, ROLE, { password: "LAKE_DATABASE_PASSWORD", s3Key: "LAKE_S3_KEY", s3Secret: "LAKE_S3_SECRET" }, memoryLimit);
+
+/** The log, as LOG_BROKERS, LOG_USERNAME and LOG_PASSWORD say it. */
+const logConfig = (env: NodeJS.ProcessEnv): LogConfig => ({
+  brokers: required(env, "LOG_BROKERS").split(",").map((broker) => broker.trim()).filter(Boolean),
+  username: required(env, "LOG_USERNAME"),
+  password: required(env, "LOG_PASSWORD"),
+});
+
+/** The loader's configuration. */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): LakeConfig {
-  const lake = access(env, ROLE, { password: "LAKE_DATABASE_PASSWORD", s3Key: "LAKE_S3_KEY", s3Secret: "LAKE_S3_SECRET" }, "1GB");
-  const maintenanceHours = positiveOrNone(env, "LAKE_MAINTENANCE_HOURS", 24);
-  const branchesUrl = env["LAKE_BRANCHES_URL"]?.trim();
   return {
-    ...lake,
+    ...writerAccess(env, "1GB"),
     source: {
       database: optional(env, "LAKE_SOURCE_DATABASE", "alasio"),
       options: env["LAKE_SOURCE_ENDPOINT"]?.trim() ? `endpoint=${env["LAKE_SOURCE_ENDPOINT"].trim()}` : "",
     },
-    intervalMs: positive(env, "LAKE_INTERVAL_SECONDS", 300) * 1000,
-    maintenanceIntervalMs: maintenanceHours === null ? null : maintenanceHours * 3_600_000,
+    httpPort: positive(env, "LAKE_HTTP_PORT", 9464),
+    log: logConfig(env),
+    wake: { topic: required(env, "LAKE_WAKE_TOPIC"), group: required(env, "LAKE_WAKE_GROUP") },
+  };
+}
+
+/** Maintenance's configuration. */
+export function loadMaintenanceConfig(env: NodeJS.ProcessEnv = process.env): MaintenanceConfig {
+  const branchesUrl = env["LAKE_BRANCHES_URL"]?.trim();
+  return {
+    ...writerAccess(env, "1GB"),
     branches: branchesUrl ? { url: branchesUrl, token: required(env, "LAKE_BRANCHES_TOKEN") } : null,
     retentionDays: positive(env, "LAKE_RETENTION_DAYS", 30),
-    httpPort: positive(env, "LAKE_HTTP_PORT", 9464),
   };
 }
 
 /** The telemetry intake's configuration. */
 export function loadIntakeConfig(env: NodeJS.ProcessEnv = process.env): IntakeConfig {
-  return {
-    ...access(env, ROLE, { password: "LAKE_DATABASE_PASSWORD", s3Key: "LAKE_S3_KEY", s3Secret: "LAKE_S3_SECRET" }, "256MB"),
-    httpPort: positive(env, "LAKE_HTTP_PORT", 9464),
-    log: {
-      brokers: required(env, "LOG_BROKERS").split(",").map((broker) => broker.trim()).filter(Boolean),
-      username: required(env, "LOG_USERNAME"),
-      password: required(env, "LOG_PASSWORD"),
-    },
-  };
+  return { ...writerAccess(env, "256MB"), httpPort: positive(env, "LAKE_HTTP_PORT", 9464), log: logConfig(env) };
 }
 
 /** The query endpoint's configuration. */
@@ -209,5 +232,6 @@ export function loadEndpointConfig(env: NodeJS.ProcessEnv = process.env): Endpoi
     ...access(env, READER_ROLE, { password: "LAKE_READER_PASSWORD", s3Key: "LAKE_READER_S3_KEY", s3Secret: "LAKE_READER_S3_SECRET" }, "256MB"),
     token: required(env, "LAKE_QUERY_TOKEN"),
     port: positive(env, "LAKE_QUERY_PORT", 8090),
+    peers: env["LAKE_QUERY_PEERS"]?.trim() || null,
   };
 }

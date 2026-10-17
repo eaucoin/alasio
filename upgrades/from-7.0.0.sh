@@ -80,13 +80,14 @@ private_address() {
   local a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]}))
   ((a == 0 || a == 10 || a == 127 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) || (a == 100 && b >= 64 && b <= 127) || (a == 169 && b == 254) || (a == 198 && (b == 18 || b == 19)) || a >= 224))
 }
-# The configuration $1 in this release's settings, on stdout: the collector's resources gone,
-# as this release has its gateway's and its scraper's; the address Telegram delivers to $2.
-# What the cut-over gives the configuration before UPGRADE_CHECK reads it; and what
-# `from-7.0.0.sh release-settings <file>` says alone, the address the configuration's or this
-# machine's on its route, as the upgrade shard gives a copy of the configuration it.
+# The configuration $1 in this release's settings, on stdout: the collector's resources
+# gone, as this release has its gateway's and its scraper's; the lake's its loader's,
+# which loads as 7.0.0's one pod did, where it sets them; the address Telegram delivers to
+# $2. What the cut-over gives the configuration before UPGRADE_CHECK reads it; and what
+# `from-7.0.0.sh release-settings <file>` says alone, the address the configuration's or
+# this machine's on its route, as the upgrade shard gives a copy of the configuration it.
 release_settings() {
-  jq --arg address "$2" 'del(.install.telemetry.collector.resources) | .install.webhook.publicAddress = $address' "$1"
+  jq --arg address "$2" 'del(.install.telemetry.collector.resources) | (if .install.lake.resources == null then . else .install.lake.loader.resources = .install.lake.resources end) | del(.install.lake.resources) | .install.webhook.publicAddress = $address' "$1"
 }
 case "${1:-}" in
   release-settings)

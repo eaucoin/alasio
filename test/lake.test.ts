@@ -19,23 +19,25 @@ import { LAKE_READER_ROLE, LAKE_ROLE } from "../neon/control/secrets.ts";
 import { branchesBesideMain } from "../neon/lake/src/branches.ts";
 import { syncClaude } from "../neon/lake/src/claude.ts";
 import { syncCodex } from "../neon/lake/src/codex.ts";
-import { type EndpointConfig, type LakeConfig, loadConfig, loadEndpointConfig } from "../neon/lake/src/config.ts";
+import { type EndpointConfig, type LakeConfig, loadConfig, loadEndpointConfig, loadMaintenanceConfig } from "../neon/lake/src/config.ts";
 import { startEndpoint } from "../neon/lake/src/endpoint.ts";
 import { EXTENSIONS } from "../neon/lake/src/extensions.ts";
 import { BATCH, DUCKDB_MEMORY, type IntakeSource, type LogRecord, type PartitionAt, REREAD_SKEW_MS, startIntake, unreachable } from "../neon/lake/src/intake.ts";
 import { conninfo, LAKE, type Lake, openLake, type Row, rows, transaction, writeLock, WriteLockLost } from "../neon/lake/src/lake.ts";
 import { gathering, type Read } from "../neon/lake/src/log.ts";
-import { startLoader } from "../neon/lake/src/loader.ts";
+import { furthestWrite, type LoaderLake, lsnValue, openLoaderLake, readUpTo, sourceReplayed, startLoader, type WakeRecord, type WakeSource } from "../neon/lake/src/loader.ts";
+import { runPass } from "../neon/lake/src/maintain.ts";
 import { createMetrics, sampleMemory } from "../neon/lake/src/metrics.ts";
 import { lakeModelVersion, MODEL_VERSION, ROW_GROUP_ROWS } from "../neon/lake/src/model.ts";
 import { askReread, ensureOtel, type Held, LakeSetBack, mergeTelemetry, type Position, rereadGaps, type TelemetryRows, telemetryRows, telemetryTime, writeConsumed } from "../neon/lake/src/otel.ts";
 import { encodeRequest, type LogsRequest, type MetricsRequest, PART_ITEMS, REQUEST_ROW_BYTES, requestParts, requestRowBytes } from "../neon/lake/src/otlp.ts";
 import { format } from "../neon/lake/src/query.ts";
 import { answer, grantReads, openReader } from "../neon/lake/src/reader.ts";
-import { type LakeLoad, lastMaintained, maintainLake, prepareLake, syncLake } from "../neon/lake/src/sync.ts";
+import { type LakeSyncOptions, maintainLake, prepareLake, syncLake } from "../neon/lake/src/sync.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import { ensureLakeReaderRole, ensureLakeRole, lakeEnabled, syncLakeReads } from "../src/neon/lake.ts";
+import { wakeRecord } from "../src/neon/lake-wake.ts";
 import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 // The lake loads alasio's Neon into DuckLake. Here its source is a throwaway Postgres
@@ -45,6 +47,37 @@ import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 const LAKE_PASSWORD = "lake-test-password";
 const READER_PASSWORD = "reader-test-password";
 const QUERY_TOKEN = "query-test-token";
+/** Where the loader would be woken from, which these tests give it themselves (wakeSource). */
+const LOADER_LOG = { LOG_BROKERS: "log:9092", LOG_USERNAME: "loader-main", LOG_PASSWORD: "log-test-password", LAKE_WAKE_TOPIC: "lake.main", LAKE_WAKE_GROUP: "lake-loader.main" };
+
+/** A record of the wake topic's, at `offset` of its one partition. */
+const woken = (offset: bigint): Position => ({ topic: "lake.main", partition: 0, offset });
+
+/** The record of the wake topic's at `position`, as alasio writes one, naming the primary's WAL position `lsn` where given. */
+const recordAt = (position: Position, lsn: string | null = null): WakeRecord => ({ ...position, value: wakeRecord(lsn) });
+
+/** A member of the loader's group given `batches` of records in turn, then none, which says what it was told; a record a position, naming no WAL position. */
+function wakeSource(batches: (Position | WakeRecord)[][]): WakeSource & { readonly told: Position[][] } {
+  const told: Position[][] = [];
+  return {
+    told,
+    next: async ({ ms }) => {
+      const batch = batches.shift();
+      if (!batch) await new Promise((resolve) => setTimeout(resolve, ms));
+      return (batch ?? []).map((record) => ("value" in record ? record : recordAt(record)));
+    },
+    commit: async (offsets) => void told.push([...offsets]),
+    close: async () => {},
+  };
+}
+
+/** The loader's lock as a lake given the loader in these tests takes it: none to wait for, its fence passing. */
+const unlocked: LoaderLake["locked"] = (load) => load(async () => {});
+
+/** Waits until `done` says so, for at most `ms`. */
+async function eventually(done: () => boolean, ms = 30_000): Promise<void> {
+  for (let waited = 0; !done() && waited < ms; waited += 20) await new Promise((resolve) => setTimeout(resolve, 20));
+}
 
 // Set by the first hook.
 let postgres: TestPostgres | undefined;
@@ -74,7 +107,7 @@ before(async () => {
   await syncLakeReads(admin, true);
   dataDir = mkdtempSync(join(tmpdir(), "alasio-lake-data-"));
   const env = { LAKE_DATABASE_HOST: url.hostname, LAKE_DATABASE_PORT: url.port, LAKE_DATA_PATH: `${dataDir}/` };
-  config = loadConfig({ ...env, LAKE_DATABASE_PASSWORD: LAKE_PASSWORD });
+  config = loadConfig({ ...env, ...LOADER_LOG, LAKE_DATABASE_PASSWORD: LAKE_PASSWORD });
   readerConfig = loadEndpointConfig({ ...env, LAKE_READER_PASSWORD: READER_PASSWORD, LAKE_QUERY_TOKEN: QUERY_TOKEN });
   // As the intake does as it opens the lake (neon/lake/src/service.ts): the first open makes the catalog.
   (await openLake(config)).close();
@@ -1399,7 +1432,7 @@ describe("telemetry", () => {
     });
   });
 
-  test("a maintenance pass cuts the days it keeps, and records when it ran, of the one time it is given", async () => {
+  test("a maintenance pass cuts the days it keeps of the one time it is given", async () => {
     await withLake(async (db) => {
       const service = `cut-${Date.now()}`;
       await writeConsumed(db, [{ topic: "otel.logs", topicId: "otel.logs-id", partition: 33, offset: 0n, rows: [telemetryRows("logs", logRequest(service, NOW - 30n * DAY, NOW - 29n * DAY))] }], fromStart);
@@ -1407,7 +1440,6 @@ describe("telemetry", () => {
       const now = new Date(Number((NOW + DAY) / 1_000_000n));
       await maintainLake(db, { retentionDays: 30, keepFiles: true, now });
       assert.equal((await one<Count>(db, `select count(*) as n from ${LAKE}.otel.logs where ServiceName = '${service}'`)).n, 1n);
-      assert.deepEqual(await lastMaintained(db), now);
     });
   });
 
@@ -1584,48 +1616,116 @@ describe("the lake", () => {
     }
   });
 
-  test("maintenance runs and is recorded, and the loader loop loads, maintains, and stops", async () => {
+  test("the loader loads once records come on its wake topic, tells its group it has read them only then, and loads nothing while none come", async () => {
     await withLake(async (db) => {
       const metrics = createMetrics();
       const logs: string[] = [];
-      const open = async () => ({ db, close: async () => {}, lost: () => false });
-      const loader = startLoader({ open, metrics, log: (message) => logs.push(message), intervalMs: 60_000, maintenanceIntervalMs: 3_600_000, retentionDays: 30 });
-      for (let waited = 0; !logs.includes("maintained") && waited < 30_000; waited += 50) {
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
+      const source = wakeSource([[woken(0n), woken(1n)], [], [woken(2n)]]);
+      const open = async () => ({ db, close: async () => {}, replayed: async () => true, locked: unlocked });
+      const loader = startLoader({ open, join: async () => source, metrics, log: (message) => logs.push(message), gatherMs: 10 });
+      await eventually(() => source.told.length === 2);
       await loader.stop();
-      assert.deepEqual(logs, ["loaded", "maintained"]);
+      assert.deepEqual(logs, ["loaded", "loaded"]);
+      assert.deepEqual(source.told, [[woken(2n)], [woken(3n)]]);
       assert.deepEqual(loader.health(), { ok: true, detail: "loaded" });
-      assert.ok(await lastMaintained(db));
       const text = metrics.render();
-      assert.match(text, /^lake_cycles_total\{outcome="success"\} 1$/m);
-      assert.match(text, /^lake_maintenance_total\{outcome="success",files="deleted"\} 1$/m);
+      assert.match(text, /^lake_cycles_total\{outcome="success"\} 2$/m);
       assert.match(text, /^# TYPE lake_rows_total counter$/m);
-      // Maintained within the interval: the next loader does not maintain again.
-      const again = startLoader({ open, metrics, log: (message) => logs.push(message), intervalMs: 60_000, maintenanceIntervalMs: 3_600_000, retentionDays: 30 });
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      await again.stop();
-      assert.equal(logs.filter((message) => message === "maintained").length, 1);
-      await maintainLake(db, { retentionDays: 30, keepFiles: false }); // and on demand it runs at once
     });
   });
 
-  test("the loader merges the telemetry's files once their interval has passed since its start or its last merge, a branch's lake never", async () => {
-    const merged: number[] = [];
-    const metrics = createMetrics();
-    const open = async () => ({ db: {} as DuckDBConnection, close: async () => {}, lost: () => false });
-    const sync = async () => ({ claude: { inserted: 0, deleted: 0 }, codex: { inserted: 0, deleted: 0 } }) as LakeLoad;
-    const options = { open, metrics, log: () => {}, intervalMs: 20, maintenanceIntervalMs: null, retentionDays: 30, sync, merge: async () => merged.push(Date.now()) };
-    const loader = startLoader({ ...options, mergeIntervalMs: 100 });
-    await new Promise((resolve) => setTimeout(resolve, 360));
-    await loader.stop();
-    assert.ok(merged.length >= 2 && merged.length <= 4, String(merged.length));
-    assert.match(metrics.render(), /^lake_telemetry_merges_total\{outcome="success"\} \d+$/m);
-    const branch = startLoader({ ...options, mergeIntervalMs: null });
-    merged.length = 0;
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    await branch.stop();
-    assert.deepEqual(merged, []);
+  test("the loader loads its records once its source has replayed the furthest write they name, and, past its wait, tells its group nothing, reading them again", async () => {
+    await withLake(async (db) => {
+      const logs: string[] = [];
+      // A replica held behind 0/3000 while asked, then caught up.
+      let replayedTo = lsnValue("0/1000");
+      const asked: bigint[] = [];
+      const replayed = async (lsn: bigint) => {
+        asked.push(lsn);
+        return replayedTo >= lsn;
+      };
+      const source = wakeSource([[recordAt(woken(0n), "0/2000"), recordAt(woken(1n), "0/3000"), recordAt(woken(2n))]]);
+      let synced = 0;
+      const sync = async (lake: DuckDBConnection) => {
+        synced += 1;
+        return syncLake(lake);
+      };
+      const loader = startLoader({ open: async () => ({ db, close: async () => {}, replayed, locked: unlocked }), join: async () => source, metrics: createMetrics(), log: (message) => logs.push(message), gatherMs: 10, replayWaitMs: 60_000, replayPollMs: 10, sync });
+      await eventually(() => asked.length >= 3);
+      assert.deepEqual([synced, source.told], [0, []]);
+      replayedTo = lsnValue("0/3000");
+      await eventually(() => source.told.length === 1);
+      await loader.stop();
+      assert.deepEqual([synced, source.told, asked.every((lsn) => lsn === lsnValue("0/3000"))], [1, [[woken(3n)]], true]);
+      // Never replayed within the wait: the load fails, its records told of nothing.
+      const behind = wakeSource([[recordAt(woken(3n), "0/4000")]]);
+      const stuck = startLoader({ open: async () => ({ db, close: async () => {}, replayed, locked: unlocked }), join: async () => behind, metrics: createMetrics(), log: (message) => logs.push(message), gatherMs: 10, replayWaitMs: 50, replayPollMs: 10, retryMs: 60_000, sync });
+      await eventually(() => logs.includes("load failed"));
+      await stuck.stop();
+      assert.deepEqual([synced, behind.told], [1, []]);
+    });
+  });
+
+  test("a wake record names the primary's WAL position, which the loader reads, as Postgres's source answers how far it replayed", async () => {
+    assert.deepEqual(furthestWrite([recordAt(woken(0n), "0/16B3748"), recordAt(woken(1n), "1/0"), recordAt(woken(2n))]), { furthest: lsnValue("1/0"), malformed: 0 });
+    assert.deepEqual(furthestWrite([recordAt(woken(0n)), { ...woken(1n), value: Buffer.from("{}") }]), { furthest: null, malformed: 0 });
+    // Neither alasio's record nor a position: skipped, and counted, the others still waited for.
+    assert.deepEqual(furthestWrite([{ ...woken(0n), value: Buffer.from("not json") }, recordAt(woken(1n), "16"), recordAt(woken(2n), "0/10")]), { furthest: lsnValue("0/10"), malformed: 2 });
+    assert.equal(lsnValue("16/B374D848"), (0x16n << 32n) + 0xb374d848n);
+    assert.throws(() => lsnValue("16"), /is no WAL position/u);
+    // A primary, as the tests' Postgres is, replays nothing: it is as far as any write.
+    const client = await admin.connect();
+    try {
+      assert.equal(await sourceReplayed(client, lsnValue("FFFF/0")), true);
+    } finally {
+      client.release();
+    }
+  });
+
+  test("a load whose loader's lock is lost as it loads commits nothing, and tells its group nothing, so that its records are read again", async () => {
+    const unfenced = { projectKey: "-home-operator-unfenced", sessionId: "44444444-4444-4444-8444-444444444444" };
+    await withLake(async (db) => {
+      await store.append(unfenced, [{ type: "user", uuid: "unfenced-0", timestamp: at(0), message: { role: "user", content: "entry" } }]);
+      const failures: unknown[] = [];
+      const source = wakeSource([[woken(0n)]]);
+      // The lock's connection cut as the load begins, as a compute restarting or an operator's terminating it would.
+      const sync = async (lake: DuckDBConnection, options: LakeSyncOptions) => {
+        await admin.query("select pg_terminate_backend(pid) from pg_locks where locktype = 'advisory' and granted and objsubid = 1 and objid = oid(hashtext($1)::bigint & 4294967295)", ["alasio.lake.loader"]);
+        return syncLake(lake, options);
+      };
+      const loader = startLoader({
+        open: (signal) => openLoaderLake(config, () => {}, signal),
+        join: async () => source,
+        metrics: createMetrics(),
+        log: (message, fields) => void (message === "load failed" && failures.push(fields?.["error"])),
+        gatherMs: 10,
+        retryMs: 60_000,
+        sync,
+      });
+      await eventually(() => failures.length === 1);
+      await loader.stop();
+      assert.match(String(failures[0]), /the loader's lock was lost/u);
+      assert.deepEqual(source.told, []);
+      assert.equal((await one<Count>(db, `select count(*) as n from ${LAKE}.claude.entries where uuid = 'unfenced-0'`)).n, 0n);
+    });
+  });
+
+  test("the loader tells its group each partition is read past the last record it loaded for", () => {
+    const other = (offset: bigint): Position => ({ topic: "lake.main", partition: 1, offset });
+    assert.deepEqual(readUpTo([woken(4n), woken(2n), other(9n), woken(7n)]), [woken(8n), other(10n)]);
+    assert.deepEqual(readUpTo([]), []);
+  });
+
+  test("maintenance's daily pass deletes the telemetry past its retention and runs DuckLake's maintenance; its merge pass merges the telemetry's files", async () => {
+    await withLake(async (db) => {
+      const logs: string[] = [];
+      const log = (message: string) => void logs.push(message);
+      await writeTelemetry(db, telemetryRows("logs", logRequest("expired", NOW - 40n * DAY)));
+      assert.equal(await runPass(db, "maintain", { retentionDays: 30, branches: async () => [], log }), true);
+      assert.equal((await one<Count>(db, `select count(*) as n from ${LAKE}.otel.logs where ServiceName = 'expired'`)).n, 0n);
+      assert.equal(await runPass(db, "merge", { retentionDays: 30, branches: async () => [], log }), true);
+      assert.deepEqual(logs, ["maintained", "merged the telemetry's files"]);
+    });
   });
 
   test("maintenance merges the files written since its last pass, and leaves one already as large as it merges files to", async () => {
@@ -1663,33 +1763,24 @@ describe("the lake", () => {
     });
   });
 
-  test("while Neon has branches the loader's maintenance deletes no file, nor when it cannot learn them; a branch's lake is never maintained", async () => {
+  test("while Neon has branches maintenance deletes no file, nor when it cannot learn them, and says so; a pass that fails says so and fails", async () => {
     await withLake(async (db) => {
-      const metrics = createMetrics();
       const logs: string[] = [];
-      const open = async () => ({ db, close: async () => {}, lost: () => false });
-      const maintained = async (options: Pick<Parameters<typeof startLoader>[0], "maintenanceIntervalMs" | "branches">) => {
-        await db.run(`delete from ${LAKE}.loader.meta where key = 'maintained_at'`);
-        const loader = startLoader({ open, metrics, log: (message, fields) => logs.push(`${message}${fields ? ` ${JSON.stringify(fields)}` : ""}`), intervalMs: 60_000, retentionDays: 30, ...options });
-        for (let waited = 0; !logs.some((line) => line.startsWith("maintained")) && waited < 2000; waited += 50) {
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
-        await loader.stop();
-        return logs.splice(0).filter((line) => !line.startsWith("loaded"));
+      const log = (message: string, fields?: Record<string, unknown>) => void logs.push(`${message}${fields ? ` ${JSON.stringify(fields)}` : ""}`);
+      const maintained = async (branches: () => Promise<readonly string[]>) => {
+        assert.equal(await runPass(db, "maintain", { retentionDays: 30, branches, log }), true);
+        return logs.splice(0);
       };
-      assert.deepEqual(await maintained({ maintenanceIntervalMs: 3_600_000, branches: async () => ["try-codex"] }), ['maintained {"keptFilesFor":["try-codex"]}']);
-      assert.deepEqual(await maintained({
-        maintenanceIntervalMs: 3_600_000,
-        branches: async () => {
-          throw new Error("neon-control answered 503");
-        },
+      assert.deepEqual(await maintained(async () => ["try-codex"]), ['maintained {"keptFilesFor":["try-codex"]}']);
+      assert.deepEqual(await maintained(async () => {
+        throw new Error("neon-control answered 503");
       }), ['could not learn Neon\'s branches; keeping every file {"error":"neon-control answered 503"}', 'maintained {"keptFilesFor":"unknown branches"}']);
-      assert.deepEqual(await maintained({ maintenanceIntervalMs: 3_600_000, branches: async () => [] }), ["maintained {}"]);
-      assert.deepEqual(await maintained({ maintenanceIntervalMs: null }), []);
-      assert.equal(await lastMaintained(db), null);
-      const text = metrics.render();
-      assert.match(text, /^lake_maintenance_total\{outcome="success",files="kept"\} 2$/m);
-      assert.match(text, /^lake_maintenance_total\{outcome="success",files="deleted"\} 1$/m);
+      assert.deepEqual(await maintained(async () => []), ["maintained {}"]);
+      // Its lake closed under it, a pass fails, and says why.
+      const lake = await openLake(config);
+      lake.close();
+      assert.equal(await runPass(lake.db, "merge", { retentionDays: 30, branches: async () => [], log }), false);
+      assert.match(logs.join("\n"), /^merging the telemetry's files failed \{"error":/u);
     });
   });
 
@@ -1768,20 +1859,23 @@ describe("the lake", () => {
     }
   });
 
-  test("a load that fails drops its connections, and the next is made on fresh ones", async () => {
+  test("a load that fails drops its connections and its member of the group, and the next is made on fresh ones, its records read again", async () => {
     await withLake(async (db) => {
       const events: string[] = [];
       let attempts = 0;
+      const sources = [wakeSource([[woken(0n)]]), wakeSource([[woken(0n)]])];
       const loader = startLoader({
         open: async () => {
           events.push("open");
-          return { db, close: async () => events.push("close"), lost: () => false };
+          return { db, close: async () => events.push("close"), replayed: async () => true, locked: unlocked };
+        },
+        join: async () => {
+          events.push("join");
+          return sources[events.filter((event) => event === "join").length - 1]!;
         },
         metrics: createMetrics(),
         log: (message) => events.push(message),
-        intervalMs: 60_000,
-        maintenanceIntervalMs: 3_600_000,
-        retentionDays: 30,
+        gatherMs: 10,
         retryMs: 10,
         sync: async (lake) => {
           attempts += 1;
@@ -1789,11 +1883,10 @@ describe("the lake", () => {
           return syncLake(lake);
         },
       });
-      for (let waited = 0; !events.includes("maintained") && waited < 30_000; waited += 20) {
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
+      await eventually(() => events.includes("loaded"));
       await loader.stop();
-      assert.deepEqual(events, ["open", "load failed", "close", "open", "loaded", "maintained", "close"]);
+      assert.deepEqual(events, ["open", "join", "load failed", "close", "open", "join", "loaded", "close"]);
+      assert.deepEqual(sources.map(({ told }) => told), [[], [[woken(1n)]]]);
       assert.deepEqual(loader.health(), { ok: true, detail: "loaded" });
     });
   });
@@ -1805,13 +1898,11 @@ describe("the lake", () => {
     const loader = startLoader({
       open: async () => {
         const lake = await openLake(unreachable, { source: unreachable.source });
-        return { db: lake.db, close: async () => lake.close(), lost: () => false };
+        return { db: lake.db, close: async () => lake.close(), replayed: async () => true, locked: unlocked };
       },
       metrics: createMetrics(),
+      join: async () => wakeSource([]),
       log: (message, fields) => logs.push(JSON.stringify({ message, ...fields })),
-      intervalMs: 60_000,
-      maintenanceIntervalMs: null,
-      retentionDays: 30,
     });
     for (let waited = 0; logs.length === 0 && waited < 30_000; waited += 50) await new Promise((resolve) => setTimeout(resolve, 50));
     await loader.stop();
@@ -2009,7 +2100,7 @@ describe("the lake's reader", () => {
     }
   });
 
-  test("the query endpoint answers 503 within its bound where a query before holds the lake for good, and is not well once it has held it long", async () => {
+  test("the query endpoint answers 503 within its bound where a query before holds the lake for good, counts both until the lake is free of them, and is not well once it has held it long", async () => {
     // A DuckDB blocked on a statement it sent Postgres, which nothing interrupts.
     const db = { extractStatements: async () => ({ count: 1 }), streamAndReadUntil: () => new Promise(() => {}), interrupt() {} };
     const logged: string[] = [];
@@ -2021,7 +2112,8 @@ describe("the lake's reader", () => {
     try {
       const [first, second] = await Promise.all([query("select 'held'"), query("select 'behind'")]);
       assert.deepEqual([first.status, second.status], [503, 503]);
-      assert.match(await second.text(), /a query has held the lake for \d+ s: select 'held'/u);
+      assert.match(await second.text(), /a query \(select 'held'\) has held the lake for \d+ s/u);
+      assert.deepEqual(await (await fetch(`${base}/queue`)).json(), { queries: 2 });
       assert.equal((await fetch(`${base}/healthz`)).status, 200);
       await new Promise((resolve) => setTimeout(resolve, 1100));
       const healthz = await fetch(`${base}/healthz`);
@@ -2029,6 +2121,102 @@ describe("the lake's reader", () => {
       assert.deepEqual(logged.filter((message) => message === "query endpoint wedged"), ["query endpoint wedged"]);
     } finally {
       server.close();
+    }
+  });
+
+  test("the query endpoint is not well once an opening of the lake that never settles has held it long", async () => {
+    const endpoint = startEndpoint({ open: () => new Promise<Lake>(() => {}), token: QUERY_TOKEN, log: () => {}, wedgedMs: 300 });
+    const server = createServer(endpoint.handle);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      assert.equal((await fetch(`${base}/healthz`)).status, 200);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const healthz = await fetch(`${base}/healthz`);
+      assert.deepEqual([healthz.status, (await healthz.text()).includes("opening it has held the lake")], [503, true]);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("the query endpoint opens the lake as it starts, again until it can, is ready once it has, and says how many queries it has not answered yet", async () => {
+    let opens = 0;
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const metrics = createMetrics();
+    const endpoint = startEndpoint({
+      open: async () => {
+        opens += 1;
+        if (opens === 1) throw new Error("the compute is waking");
+        await held;
+        return openReader(readerConfig);
+      },
+      token: QUERY_TOKEN,
+      log: () => {},
+      metrics,
+      retryMs: 10,
+    });
+    const server = createServer(endpoint.handle);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const queue = async () => (await (await fetch(`${base}/queue`)).json()) as { queries: number };
+    try {
+      await eventually(() => opens === 2);
+      assert.equal((await fetch(`${base}/readyz`)).status, 503);
+      // Two queries taken while it opens the lake, the second behind the first.
+      const answers = [1, 2].map((n) => fetch(`${base}/query`, { method: "POST", headers: { authorization: `Bearer ${QUERY_TOKEN}` }, body: `select ${n} as n` }));
+      for (let waited = 0; (await queue()).queries < 2 && waited < 5000; waited += 20) await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(await queue(), { queries: 2 });
+      assert.match(await (await fetch(`${base}/metrics`)).text(), /^lake_query_queue 2$/mu);
+      release();
+      assert.deepEqual(await Promise.all(answers.map(async (answered) => (await answered).json())), [[{ n: 1 }], [{ n: 2 }]]);
+      assert.deepEqual([(await fetch(`${base}/readyz`)).status, await queue(), opens], [200, { queries: 0 }, 2]);
+      assert.match(metrics.render(), /^lake_queries_total\{status="200"\} 2$/mu);
+    } finally {
+      server.close();
+      await endpoint.close();
+    }
+  });
+
+  test("a reader says the queries every reader of its pool has not answered yet, of those that say within their patience", async () => {
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const listening = async (endpoint: ReturnType<typeof startEndpoint>) => {
+      const server = createServer(endpoint.handle);
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      return { server, base: `http://127.0.0.1:${(server.address() as AddressInfo).port}` };
+    };
+    const bases: string[] = [];
+    // One busy, its lake held from opening, and one idle; and one that does not answer, as one gone.
+    const busy = startEndpoint({
+      open: async () => {
+        await held;
+        return openReader(readerConfig);
+      },
+      token: QUERY_TOKEN,
+      log: () => {},
+      peers: async () => bases,
+    });
+    const idle = startEndpoint({ open: () => openReader(readerConfig), token: QUERY_TOKEN, log: () => {}, peers: async () => bases });
+    const [a, b] = [await listening(busy), await listening(idle)];
+    bases.push(a.base, b.base, "http://127.0.0.1:1");
+    try {
+      const answers = [1, 2, 3].map((n) => fetch(`${a.base}/query`, { method: "POST", headers: { authorization: `Bearer ${QUERY_TOKEN}` }, body: `select ${n} as n` }));
+      const pool = async (base: string) => (await (await fetch(`${base}/pool`)).json()) as { queries: number; readers: number };
+      for (let waited = 0; (await pool(a.base)).queries < 3 && waited < 5000; waited += 20) await new Promise((resolve) => setTimeout(resolve, 20));
+      // Either reader says the pool's, which a scaler reading one of them through their Service reads.
+      assert.deepEqual([await pool(a.base), await pool(b.base)], [{ queries: 3, readers: 2 }, { queries: 3, readers: 2 }]);
+      release();
+      await Promise.all(answers);
+      assert.deepEqual(await pool(b.base), { queries: 0, readers: 2 });
+    } finally {
+      a.server.close();
+      b.server.close();
+      await Promise.all([busy.close(), idle.close()]);
     }
   });
 
@@ -2330,20 +2518,20 @@ describe("the lake's reader", () => {
   });
 });
 
-test("a failing load is tried again soon, and the loader turns unhealthy only once loads keep failing", async () => {
+test("a failing load is tried again soon, and the loader turns unhealthy only once loads keep failing for long", async () => {
   let attempts = 0;
   const logs: string[] = [];
   // A connection of its own, which the load, replaced, never uses.
   const instance = await DuckDBInstance.create(":memory:");
   const db = await instance.connect();
   const loader = startLoader({
-    open: async () => ({ db, close: async () => {}, lost: () => false }),
+    open: async () => ({ db, close: async () => {}, replayed: async () => true, locked: unlocked }),
+    join: async () => wakeSource([[woken(0n)], [woken(0n)], [woken(0n)], [woken(0n)], [woken(0n)], [woken(0n)]]),
     metrics: createMetrics(),
     log: (message) => logs.push(message),
-    intervalMs: 100,
-    maintenanceIntervalMs: 3_600_000,
-    retentionDays: 30,
+    gatherMs: 1,
     retryMs: 10,
+    unhealthyAfterMs: 300,
     sync: async () => {
       attempts += 1;
       throw new Error("permission denied for table entries");
@@ -2351,9 +2539,9 @@ test("a failing load is tried again soon, and the loader turns unhealthy only on
   });
   try {
     await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.ok(attempts >= 3, `retried sooner than the interval (${attempts} attempts)`);
+    assert.ok(attempts >= 3, `retried soon (${attempts} attempts)`);
     assert.deepEqual(loader.health(), { ok: true, detail: "load failed: permission denied for table entries" });
-    await new Promise((resolve) => setTimeout(resolve, 300)); // past three intervals of failing
+    await new Promise((resolve) => setTimeout(resolve, 300)); // past failing for long
     assert.equal(loader.health().ok, false);
   } finally {
     await loader.stop();
@@ -2372,10 +2560,12 @@ test("the lake is off unless ALASIO_LAKE_ENABLED is 1", () => {
 
 test("the lake's configuration names what is missing and refuses what is malformed", () => {
   const base = { LAKE_DATABASE_HOST: "compute", LAKE_DATABASE_PASSWORD: "p", LAKE_DATA_PATH: "s3://lake/" };
-  assert.throws(() => loadConfig(base), /LAKE_S3_ENDPOINT is not set/);
-  assert.throws(() => loadConfig({ ...base, LAKE_DATA_PATH: "/data", LAKE_INTERVAL_SECONDS: "soon" }), /LAKE_INTERVAL_SECONDS must be a positive number/);
-  const config = loadConfig({ ...base, LAKE_S3_ENDPOINT: "http://seaweedfs:8333", LAKE_S3_KEY: "k", LAKE_S3_SECRET: "s" });
-  assert.deepEqual([config.source, config.catalog.database, config.catalog.user, config.intervalMs], [{ database: "alasio", options: "" }, "lake", "lake", 300_000]);
+  assert.throws(() => loadConfig({ ...base, ...LOADER_LOG }), /LAKE_S3_ENDPOINT is not set/);
+  assert.throws(() => loadConfig({ ...base, LAKE_DATA_PATH: "/data", ...LOADER_LOG, LAKE_WAKE_GROUP: "" }), /LAKE_WAKE_GROUP is not set/);
+  assert.throws(() => loadConfig({ ...base, LAKE_DATA_PATH: "/data", ...LOADER_LOG, LOG_PASSWORD: "" }), /LOG_PASSWORD is not set/);
+  const config = loadConfig({ ...base, ...LOADER_LOG, LAKE_S3_ENDPOINT: "http://seaweedfs:8333", LAKE_S3_KEY: "k", LAKE_S3_SECRET: "s" });
+  assert.deepEqual([config.source, config.catalog.database, config.catalog.user], [{ database: "alasio", options: "" }, "lake", "lake"]);
+  assert.deepEqual([config.log, config.wake], [{ brokers: ["log:9092"], username: "loader-main", password: "log-test-password" }, { topic: "lake.main", group: "lake-loader.main" }]);
   // The query endpoint has the reader's credentials alone.
   const reader = { ...base, LAKE_S3_ENDPOINT: "http://seaweedfs:8333", LAKE_READER_PASSWORD: "r", LAKE_READER_S3_KEY: "rk", LAKE_READER_S3_SECRET: "rs" };
   assert.throws(() => loadEndpointConfig(reader), /LAKE_QUERY_TOKEN is not set/);
@@ -2384,19 +2574,19 @@ test("the lake's configuration names what is missing and refuses what is malform
     [endpoint.catalog.user, endpoint.catalog.password, endpoint.catalog.database, endpoint.s3?.key, endpoint.token, endpoint.port, endpoint.memoryLimit],
     ["lake_reader", "r", "lake", "rk", "t", 8090, "256MB"],
   );
-  assert.deepEqual([config.maintenanceIntervalMs, config.branches], [86_400_000, null]);
+  // Maintenance learns Neon's branches where it is told, and keeps a month of telemetry unless told otherwise.
   const local = { ...base, LAKE_DATA_PATH: "/data" };
-  assert.equal(loadConfig({ ...local, LAKE_MAINTENANCE_HOURS: "0" }).maintenanceIntervalMs, null);
-  assert.throws(() => loadConfig({ ...local, LAKE_MAINTENANCE_HOURS: "-1" }), /LAKE_MAINTENANCE_HOURS must be a positive number/);
-  assert.throws(() => loadConfig({ ...local, LAKE_BRANCHES_URL: "http://control:8080/branches" }), /LAKE_BRANCHES_TOKEN is not set/);
-  assert.deepEqual(loadConfig({ ...local, LAKE_BRANCHES_URL: "http://control:8080/branches", LAKE_BRANCHES_TOKEN: "t" }).branches, { url: "http://control:8080/branches", token: "t" });
+  assert.deepEqual([loadMaintenanceConfig(local).branches, loadMaintenanceConfig(local).retentionDays], [null, 30]);
+  assert.throws(() => loadMaintenanceConfig({ ...local, LAKE_RETENTION_DAYS: "-1" }), /LAKE_RETENTION_DAYS must be a positive number/);
+  assert.throws(() => loadMaintenanceConfig({ ...local, LAKE_BRANCHES_URL: "http://control:8080/branches" }), /LAKE_BRANCHES_TOKEN is not set/);
+  assert.deepEqual(loadMaintenanceConfig({ ...local, LAKE_BRANCHES_URL: "http://control:8080/branches", LAKE_BRANCHES_TOKEN: "t" }).branches, { url: "http://control:8080/branches", token: "t" });
   // Through Neon's proxy, every connection names its compute; straight to a Postgres, none.
-  assert.equal(loadConfig(local).catalog.options, "");
-  assert.equal(loadConfig({ ...local, LAKE_DATABASE_ENDPOINT: "branch-try" }).catalog.options, "endpoint=branch-try");
+  assert.equal(loadConfig({ ...local, ...LOADER_LOG }).catalog.options, "");
+  assert.equal(loadConfig({ ...local, ...LOADER_LOG, LAKE_DATABASE_ENDPOINT: "branch-try" }).catalog.options, "endpoint=branch-try");
   assert.equal(loadEndpointConfig({ ...reader, LAKE_QUERY_TOKEN: "t", LAKE_DATABASE_ENDPOINT: "alasio" }).catalog.options, "endpoint=alasio");
   // Its source on the read replica, its catalog on the primary, each named apart.
-  assert.deepEqual(loadConfig({ ...local, LAKE_DATABASE_ENDPOINT: "alasio", LAKE_SOURCE_ENDPOINT: "alasio-ro" }).source, { database: "alasio", options: "endpoint=alasio-ro" });
-  assert.deepEqual(loadConfig({ ...local, LAKE_DATABASE_ENDPOINT: "alasio" }).source, { database: "alasio", options: "" });
+  assert.deepEqual(loadConfig({ ...local, ...LOADER_LOG, LAKE_DATABASE_ENDPOINT: "alasio", LAKE_SOURCE_ENDPOINT: "alasio-ro" }).source, { database: "alasio", options: "endpoint=alasio-ro" });
+  assert.deepEqual(loadConfig({ ...local, ...LOADER_LOG, LAKE_DATABASE_ENDPOINT: "alasio" }).source, { database: "alasio", options: "" });
   assert.equal(conninfo("lake"), "dbname='lake' connect_timeout=60");
   assert.equal(conninfo("it's", "endpoint=alasio"), "dbname='it\\'s' connect_timeout=60 options='endpoint=alasio'");
 });

@@ -145,16 +145,23 @@ test("the stack's secrets are made once, and every service's rendered from them 
   // access applier; and each principal's, KEDA's with its mechanism.
   assert.match(value(kube, names.log, "KAFKA_CLUSTER_ID"), /^[\w-]{22}$/u);
   assert.equal(value(kube, names.log, "LOG_ADMIN_PASSWORD"), root.log.admin);
-  assert.deepEqual(Object.keys(kube.secrets.get(names.logAccess)?.data ?? {}).sort(), ["alasio-main", "gateway", "intake", "scaler", "webhook"]);
-  assert.deepEqual(names.logPrincipals, { "gateway": "q-log-gateway", "intake": "q-log-intake", "scaler": "q-log-scaler", "webhook": "q-log-webhook", "alasio-main": "q-log-alasio-main" });
-  for (const principal of ["gateway", "intake", "scaler", "webhook", "alasio-main"] as const) {
+  assert.deepEqual(Object.keys(kube.secrets.get(names.logAccess)?.data ?? {}).sort(), ["alasio-main", "gateway", "intake", "loader-main", "scaler", "webhook"]);
+  assert.deepEqual(names.logPrincipals, {
+    "gateway": "q-log-gateway",
+    "intake": "q-log-intake",
+    "scaler": "q-log-scaler",
+    "webhook": "q-log-webhook",
+    "alasio-main": "q-log-alasio-main",
+    "loader-main": "q-log-loader-main",
+  });
+  for (const principal of ["gateway", "intake", "scaler", "webhook", "alasio-main", "loader-main"] as const) {
     assert.equal(value(kube, names.logAccess, principal), root.log[principal]);
     assert.equal(value(kube, names.logPrincipals[principal], "username"), principal);
     assert.equal(value(kube, names.logPrincipals[principal], "password"), root.log[principal]);
   }
   assert.equal(value(kube, names.logPrincipals.scaler, "sasl"), "scram_sha512");
   assert.equal(kube.secrets.get(names.logPrincipals.gateway)?.data?.["sasl"], undefined);
-  assert.equal(new Set(Object.values(root.log)).size, 6);
+  assert.equal(new Set(Object.values(root.log)).size, 7);
   // The filers' store's users' passwords, each its own: the filers', the collector's and the backups'.
   assert.equal(value(kube, names.filerStoreFiler, "password"), root.filerStoreFilerPassword);
   assert.equal(value(kube, names.filerStoreCollector, "password"), root.filerStoreCollectorPassword);
@@ -339,7 +346,7 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     verifiers: { alasio: "SCRAM-SHA-256$q", lake: "SCRAM-SHA-256$l", lake_reader: "SCRAM-SHA-256$r", grafana: "SCRAM-SHA-256$g" },
     nodeAgentToken: "n",
     logClusterId: "cluster",
-    log: { "admin": "la", "gateway": "lg", "intake": "li", "scaler": "ls", "webhook": "lw", "alasio-main": "lm" },
+    log: { "admin": "la", "gateway": "lg", "intake": "li", "scaler": "ls", "webhook": "lw", "alasio-main": "lm", "loader-main": "ll" },
   };
 }
 

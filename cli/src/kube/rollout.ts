@@ -168,6 +168,21 @@ export function podProblems(pod: V1Pod): string[] {
   return problems.length > 0 || ready ? problems : [`pod ${name} is ${pod.status?.phase ?? "not yet started"}`];
 }
 
+/** What a container waits on as its pod starts, which is no problem of it. */
+const STARTING = new Set(["ContainerCreating", "PodInitializing"]);
+
+/**
+ * Whether `pod` is starting, not stuck: on a node, none of its containers restarted, each
+ * running, done or waiting on its start alone, and made within `withinMs` of `now`.
+ */
+export function starting(pod: V1Pod, withinMs: number, now: number): boolean {
+  if (pod.status?.conditions?.some(({ type, status }) => type === "PodScheduled" && status === "False")) return false;
+  const started = new Date(pod.metadata?.creationTimestamp ?? 0).getTime();
+  return now - started < withinMs && [...(pod.status?.initContainerStatuses ?? []), ...(pod.status?.containerStatuses ?? [])].every(({ restartCount, state }) =>
+    restartCount === 0 && (!state?.waiting || STARTING.has(state.waiting.reason ?? "")) && (!state?.terminated || state.terminated.exitCode === 0)
+  );
+}
+
 /** When `event` last happened. */
 const lastSeen = (event: CoreV1Event): number =>
   new Date(event.lastTimestamp ?? event.eventTime ?? event.metadata.creationTimestamp ?? 0).getTime();

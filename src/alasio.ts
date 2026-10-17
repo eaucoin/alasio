@@ -33,7 +33,7 @@ import { Outbox } from "./telegram/outbox.ts";
 import type { TelegramUpdates } from "./telegram/update-consumer.ts";
 
 /** What alasio is made with: its configuration, its Neon and what main keeps there, what the deployment's templates offer, and where its updates come from. */
-export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog">, TelegramAppConfig {
+export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog" | "lakeWake">, TelegramAppConfig {
   /** Telegram's updates: its environment's topic in the log (TelegramUpdates.layer), or a stand-in's in alasio's tests. */
   readonly updates: Layer.Layer<TelegramUpdates>;
   /** The pool of alasio's Neon database, which its state is kept in. */

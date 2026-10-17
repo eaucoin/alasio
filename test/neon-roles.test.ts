@@ -13,6 +13,7 @@ import pg from "pg";
 import { Neon } from "../src/neon/connect.ts";
 import { isScramVerifier, scramVerifier } from "../neon/control/scram.ts";
 import { ensureGrafanaRole } from "../src/neon/grafana.ts";
+import { LakeWake } from "../src/neon/lake-wake.ts";
 import { startPostgres } from "./support/postgres.ts";
 
 /** Runs `statements` on a connection to `url`: each one's rows. */
@@ -69,7 +70,7 @@ test("alasio makes the lake reader's role and Grafana's, with Grafana's database
     }
     await assert.rejects(run(as("grafana", "grafana-password", "grafana")), /password authentication failed for user "grafana"/u);
     // Twice, as alasio starts again: the second changes nothing.
-    for (const _ of [1, 2]) await Effect.runPromise(Effect.scoped(Effect.asVoid(Neon.make)).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env })))));
+    for (const _ of [1, 2]) await Effect.runPromise(Effect.scoped(Effect.asVoid(Neon.make)).pipe(Effect.provideService(LakeWake, LakeWake.none), Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env })))));
 
     // Grafana makes its tables in its database, and takes the session lock its migrations take.
     const [, lock] = await run(as("grafana", "grafana-password", "grafana"), "create table migration_log (id int)", "select pg_try_advisory_lock(4004004031) as held");

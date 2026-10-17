@@ -3,7 +3,7 @@
  *
  *   node src/query.ts [--format table|csv|json] "<SQL>"
  *
- * `alasio lake [--format table|csv|json] "<SQL>"` runs it in the lake's query container,
+ * `alasio lake [--format table|csv|json] "<SQL>"` runs it in a reader's query container,
  * where it asks the query endpoint beside it (./endpoint.ts), as Grafana does: the lake
  * is its reader's, so a query can change nothing, and its tables are named as from
  * inside it, as `claude.entries`, `codex.turns`, `otel.traces`, and so on (model.ts,

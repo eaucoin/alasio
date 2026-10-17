@@ -8,23 +8,25 @@
  * password of alasio's role on its compute, which neon-control gives the role there, the
  * lake's role's, which its alasio gives it, and its compute's token, which fetches its
  * spec alone), none of which reaches main's compute or another branch's; its bot's;
- * Claude Code's token when main has one; the pull Secrets of its images; its token to
- * ask main to fork with; and its principal on the log, which reads its own topic alone,
- * made beside the log's node by its access applier. Its bot's updates are delivered to the
- * webhook intake at a route of its own (./webhook.ts), which its bot is registered with
- * once its alasio runs. Its lake has main's object store identity, as it reads main's
- * files where they are (one data path: DuckLake keeps every file's path relative to it),
- * and SeaweedFS's Write, which writing needs, deletes too. Its clients reach its compute
- * as main's do theirs, through Neon's proxy, by its compute's id. neon-control is called
- * in its own pod, as the API server's service proxy drops the Authorization header it
- * authenticates its callers by, which neon-control would read a token from; and a compute
- * this works in, which may sleep, it wakes first.
+ * Claude Code's token when main has one; the pull Secrets of its images; its token to ask
+ * main to fork with; and its principals on the log, its alasio's, which reads its own
+ * Telegram topic and writes its own wake topic alone, and its lake loader's, which reads
+ * that alone, made beside the log's node by its access applier. Its bot's updates are
+ * delivered to the webhook intake at a route of its own (./webhook.ts), which its bot is
+ * registered with once its alasio runs. Its lake has main's object store identity, as it
+ * reads main's files where they are (one data path: DuckLake keeps every file's path
+ * relative to it), and SeaweedFS's Write, which writing needs, deletes too; and KEDA's
+ * principal on the log, which describes how far its loader is behind and reads nothing.
+ * Its clients reach its compute as main's do theirs, through Neon's proxy, by its
+ * compute's id. neon-control is called in its own pod, as the API server's service proxy
+ * drops the Authorization header it authenticates its callers by, which neon-control
+ * would read a token from; and a compute this works in, which may sleep, it wakes first.
  *
  * A branch is deleted in the order nothing of it outlives what it runs on: its alasio and
  * lake stopped, its Sandboxes and their claims deleted (JuiceFS keeps every chunk main
- * still uses), its computes stopped, its branch of Neon's deleted, and its namespaces with
- * all that is left in them; its bot told to deliver nowhere first, its route, its topic and
- * its principal gone last.
+ * still uses), its computes stopped, its branch of Neon's deleted, and its namespaces
+ * with all that is left in them; its bot told to deliver nowhere first, its route, its
+ * topics and its principals gone last.
  */
 import { randomBytes } from "node:crypto";
 
@@ -42,11 +44,12 @@ import { hasStatus, kind, KubeApi, type KubeApiError, type ObjectRef, refOf } fr
 import { applyObjects } from "./kube/apply.ts";
 import { awaitGone, awaitReady, awaitReclaimed, readiness, selectorOf, type WaitOptions } from "./kube/rollout.ts";
 import { sandboxPolicyName } from "./manifests/admission.ts";
-import { alasioPrincipal, environmentAccess, type EnvironmentLogAccess, environmentLogSecret, LOG } from "./manifests/log.ts";
+import { alasioPrincipal, environmentAccess, type EnvironmentLogAccess, environmentLogSecret, LOG, loaderLogSecret, loaderPrincipal, logPrincipalSecret } from "./manifests/log.ts";
 import { branchObjects } from "./manifests/branch.ts";
 import { REPLICA_NAME } from "./manifests/neon.ts";
 import { BRANCH_FORK_SECRET, BRANCH_LABEL, componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
+import { LOADER_COMPONENT } from "./manifests/lake.ts";
 import { CLAUDE_SECRET, readClaudeToken, readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "./secrets.ts";
 import { TelegramBotApi } from "./telegram.ts";
 import { ensureRoute, registerBot, removeRoute } from "./webhook.ts";
@@ -179,17 +182,12 @@ interface MemoryUsage extends KubernetesObject {
   readonly containers?: readonly { readonly name?: string; readonly usage?: { readonly memory?: string } }[];
 }
 
-/** The containers of main's pods a branch environment runs none of: the lake's query endpoint, as a branch has no Grafana. */
-const UNBRANCHED_CONTAINERS: readonly string[] = ["query"];
-
-/** The memory `of` uses now; of a pod, that of the containers a branch runs its own of. */
+/** The memory `of` uses now: a pod's containers', or a node's. */
 const used = (of: MemoryUsage): number =>
-  of.containers
-    ? of.containers.filter(({ name }) => !UNBRANCHED_CONTAINERS.includes(name ?? "")).reduce((sum, container) => sum + memoryBytes(container.usage?.memory ?? "0"), 0)
-    : memoryBytes(of.usage?.memory ?? "0");
+  of.containers ? of.containers.reduce((sum, container) => sum + memoryBytes(container.usage?.memory ?? "0"), 0) : memoryBytes(of.usage?.memory ?? "0");
 
-/** The components a branch environment runs its own of. */
-const BRANCHED_COMPONENTS = ["alasio", "neon-compute", "neon-compute-ro", "lake"] as const;
+/** The components a branch environment runs its own of; its lake's loader only while it loads, as main's. */
+const BRANCHED_COMPONENTS = ["alasio", "neon-compute", "neon-compute-ro", LOADER_COMPONENT] as const;
 
 /** What a branch takes and what the cluster has, measured now: null where the cluster measures nothing. */
 export interface MemoryMeasure {
@@ -295,12 +293,13 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
 
   // The branch's own, as the module says: none of main's passwords or tokens of its Neon.
   const own = () => randomBytes(24).toString("base64url");
-  const credentials = { alasio: own(), lake: own(), compute: own(), log: own() };
+  const credentials = { alasio: own(), lake: own(), compute: own(), log: own(), loader: own() };
   // Their verifiers, each made once and given to whatever sets the role or answers for it.
   const verifiers = { [ROLE]: scramVerifier(credentials.alasio), [LAKE_ROLE]: scramVerifier(credentials.lake) };
   // Each of its principals on the log a password of its own, its alasio's the one in its Secret.
   const access = environmentAccess(name);
-  const log = { ...access, principals: access.principals.map((principal) => ({ ...principal, password: principal.name === alasioPrincipal(name) ? credentials.log : own() })) };
+  const passwords: Readonly<Record<string, string>> = { [alasioPrincipal(name)]: credentials.log, [loaderPrincipal(name)]: credentials.loader };
+  const log = { ...access, principals: access.principals.map((principal) => ({ ...principal, password: passwords[principal.name] ?? own() })) };
   // Main's URL, through the proxy, with the branch's password, on the branch's compute.
   const url = new URL(yield* requiredSecret(componentName("database"), "url"));
   url.password = credentials.alasio;
@@ -316,6 +315,14 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
     branchSecret(name, TELEGRAM_SECRET, { token: Redacted.value(bot.token), allowedUserIds: bot.allowedUserIds.join(",") }),
     branchSecret(name, BRANCH_FORK_SECRET, { token: forkToken(yield* requiredSecret(componentName("branches"), "fork-key"), name) }),
     branchSecret(name, environmentLogSecret({ namespace: branchNamespace(name), branch: name }), { username: alasioPrincipal(name), password: credentials.log }),
+    // Its lake loader's, which reads its wake topic alone; and KEDA's, which may describe
+    // how far behind that is and read nothing, which its loader's scaler reads as.
+    ...(lake
+      ? [
+        branchSecret(name, loaderLogSecret({ namespace: branchNamespace(name), branch: name }), { username: loaderPrincipal(name), password: credentials.loader }),
+        yield* copiedSecret(name, logPrincipalSecret("scaler")),
+      ]
+      : []),
   ];
 
   // At main's current WAL position, so the branch holds every commit main has made.
@@ -469,7 +476,7 @@ export const deleteBranch = Effect.fnUntraced(function*(name: string, { force }:
     // Its bot's updates delivered nowhere: what Telegram holds of them it keeps, for no one.
     const token = (yield* kube.get<V1Secret>({ ...SECRET, namespace, name: TELEGRAM_SECRET }))?.data?.["token"];
     if (token) yield* Effect.flatMap(TelegramBotApi, (telegram) => telegram.deleteWebhook(Redacted.make(Buffer.from(token, "base64").toString("utf8"))));
-    yield* stopped(namespace, [RELEASE, componentName("lake")], options);
+    yield* stopped(namespace, [RELEASE, componentName(LOADER_COMPONENT)], options);
     const sandboxes = yield* kube.list(kind("Sandbox"), { namespace: sessions }).pipe(Effect.catchIf(hasStatus(404), () => Effect.succeed([])));
     yield* removed(sandboxes.map(refOf), options);
     const claimed = (yield* kube.list<V1PersistentVolume>(kind("PersistentVolume"))).filter(({ spec }) => spec?.claimRef?.namespace === sessions);

@@ -914,16 +914,39 @@ const InstallStruct = Schema.Struct({
   log: defaulted(Log, {}),
   webhook: defaulted(Webhook, {}),
   /**
-   * The analytics lake, loaded from Neon into DuckLake; its query endpoint, which Grafana
-   * and alasio lake read it through; and its telemetry intake, which writes what the log
-   * holds of the stack's telemetry to it, scaled on how much is waiting there, to none
-   * while nothing is.
+   * The analytics lake, in DuckLake: its loader, which loads it from Neon while alasio says
+   * it wrote transcripts and sleeps otherwise; its maintenance, main's, in passes on a
+   * schedule; its readers, main's, which Grafana and alasio lake read it through, scaled on
+   * the queries waiting on them, never below one; and its telemetry intake, which writes
+   * what the log holds of the stack's telemetry to it, scaled on how much is waiting there,
+   * to none while nothing is.
    */
   lake: defaulted(
     Schema.Struct({
       enabled: defaulted(Schema.Boolean, true),
-      resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "1536Mi" } }),
-      query: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "1Gi" } }) }), {}),
+      loader: defaulted(
+        Schema.Struct({
+          /** None while nothing is left to load, which KEDA wakes; one, never two, as a load is not parallel. At one, it never sleeps, and needs no KEDA. */
+          scaling: Scaling({ min: 0, max: 1 }, { floor: false, scaled: true, most: 1 }),
+          resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "1536Mi" } }),
+        }),
+        {},
+      ),
+      maintenance: defaulted(
+        Schema.Struct({
+          /** When its daily pass runs, away from Neon's backup; the telemetry's files are merged hourly besides. */
+          schedule: defaulted(Schema.String.check(Schema.isMinLength(9, { message: "must be a cron schedule" })), "17 2 * * *"),
+          resources: Resources({ requests: { cpu: "50m", memory: "256Mi" }, limits: { memory: "1Gi" } }),
+        }),
+        {},
+      ),
+      query: defaulted(
+        Schema.Struct({
+          scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: true }),
+          resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "1Gi" } }),
+        }),
+        {},
+      ),
       intake: defaulted(
         Schema.Struct({
           scaling: Scaling({ min: 0, max: 2 }, { floor: false, scaled: true }),

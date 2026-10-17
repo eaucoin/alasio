@@ -9,22 +9,26 @@ import { TestClock } from "effect/testing";
 import pg from "pg";
 
 import { scramVerifier } from "../neon/control/scram.ts";
+import { lsnValue } from "../neon/lake/src/loader.ts";
 import { Neon, type NeonError } from "../src/neon/connect.ts";
+import { LakeWake } from "../src/neon/lake-wake.ts";
 import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 /** The lake's verifier, as the deployment gives it. */
 const LAKE_VERIFIER = scramVerifier("lake-password");
 
-/** Neon as alasio connects to it, with `env` for its environment and its log lines kept in `lines`. */
+/** Neon as alasio connects to it, with `env` for its environment, its log lines kept in `lines`, and `wake` told of its stores' writes. */
 function connecting<A, E>(
   env: Record<string, string>,
   lines: string[],
   use: (neon: Neon["Service"]) => Effect.Effect<A, E>,
+  wake: LakeWake["Service"] = LakeWake.none,
 ): Effect.Effect<A, E | NeonError> {
   const logger = Logger.make(({ message }) => {
     lines.push(Arr.ensure(message).join(" "));
   });
   return Effect.scoped(Effect.flatMap(Neon.make, use)).pipe(
+    Effect.provideService(LakeWake, wake),
     Effect.provide(Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), Logger.layer([logger]))),
   );
 }
@@ -119,6 +123,20 @@ describe("Neon, answering", () => {
     ));
     assert.equal(pool.ended, true);
     assert.deepEqual(lines, ["connected to Neon"]);
+  });
+
+  test("tells the lake's loader of each store's writes, with the primary's WAL position as its record is written, past the writes", async () => {
+    assert.ok(database);
+    const env = { ALASIO_DATABASE_URL: database.url, ALASIO_LAKE_VERIFIER: scramVerifier("lake-password"), ALASIO_LAKE_ENABLED: "1" };
+    const told: (() => Promise<string>)[] = [];
+    const wake = LakeWake.of({ written: (lsn) => void told.push(lsn) });
+    await Effect.runPromise(connecting(env, [], (neon) =>
+      Effect.promise(async () => {
+        await neon.sessionStore.append({ projectKey: "-home-operator-wake", sessionId: "44444444-4444-4444-8444-444444444444" }, [{ type: "user", uuid: "w1", message: { role: "user", content: "told" } }]);
+        assert.equal(told.length, 1);
+        const after = (await admin.query<{ lsn: string }>("select pg_current_wal_lsn()::text as lsn")).rows[0]?.lsn ?? "";
+        assert.ok(lsnValue(await told[0]!()) >= lsnValue(after), "the position read is before the write it tells of");
+      }), wake));
   });
 
   test("with the lake off, revokes its reads", async () => {

@@ -82,19 +82,23 @@ export interface RestorableRollout {
 
 export interface NeonRolloutStoreOptions {
   readonly schema?: string;
+  /** Told of each write once it is committed: the lake's wake (src/neon/lake-wake.ts). */
+  readonly written?: () => void;
 }
 
 export class NeonRolloutStore {
   #pool: Pool;
   #schema: string;
+  #written: () => void;
 
   /** `schema` is where the tables live: alasio's, or a test's own. */
-  constructor(pool: Pool, { schema = DEFAULT_SCHEMA }: NeonRolloutStoreOptions = {}) {
+  constructor(pool: Pool, { schema = DEFAULT_SCHEMA, written = () => {} }: NeonRolloutStoreOptions = {}) {
     if (!/^[a-z_][a-z0-9_]*$/u.test(schema)) {
       throw new Error(`invalid schema name: ${schema}`);
     }
     this.#pool = pool;
     this.#schema = schema;
+    this.#written = written;
   }
 
   /** Creates the tables if they are missing. Idempotent. */
@@ -138,11 +142,13 @@ export class NeonRolloutStore {
         );
       }
     });
+    this.#written();
   }
 
   /** Records that a rollout's file is now at `path`, as archiving moves it. */
   async move(name: string, path: string): Promise<void> {
     await this.#pool.query(`update ${this.#schema}.rollouts set path = $2 where name = $1`, [name, path]);
+    this.#written();
   }
 
   /**

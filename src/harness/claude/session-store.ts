@@ -85,6 +85,8 @@ export type SessionTranscripts = Omit<SessionKey, "subpath">;
 
 export interface NeonSessionStoreOptions {
   readonly schema?: string;
+  /** Told of each write once it is committed: the lake's wake (src/neon/lake-wake.ts). */
+  readonly written?: () => void;
 }
 
 /**
@@ -112,14 +114,16 @@ export function docOf(value: unknown): unknown {
 export class NeonSessionStore implements SessionStore {
   #pool: Pool;
   #schema: string;
+  #written: () => void;
 
   /** `schema` is where the tables live: alasio's, or a test's own. */
-  constructor(pool: Pool, { schema = DEFAULT_SCHEMA }: NeonSessionStoreOptions = {}) {
+  constructor(pool: Pool, { schema = DEFAULT_SCHEMA, written = () => {} }: NeonSessionStoreOptions = {}) {
     if (!/^[a-z_][a-z0-9_]*$/u.test(schema)) {
       throw new Error(`invalid schema name: ${schema}`);
     }
     this.#pool = pool;
     this.#schema = schema;
+    this.#written = written;
   }
 
   /** Creates the tables if they are missing. Idempotent. */
@@ -182,6 +186,7 @@ export class NeonSessionStore implements SessionStore {
         );
       }
       await client.query("commit");
+      if (inserted.length > 0) this.#written();
     } catch (error) {
       await client.query("rollback").catch(() => {});
       throw error;
@@ -225,12 +230,14 @@ export class NeonSessionStore implements SessionStore {
          delete from ${this.#schema}.summaries where project_key = $1 and session_id = $2`,
         [key.projectKey, key.sessionId],
       );
+      this.#written();
       return;
     }
     await this.#pool.query(
       `delete from ${this.#schema}.entries where project_key = $1 and session_id = $2 and subpath = $3`,
       [key.projectKey, key.sessionId, key.subpath],
     );
+    this.#written();
   }
 
   async listSubkeys(key: SessionTranscripts): Promise<string[]> {

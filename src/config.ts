@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { getDefaultHarness, type HarnessName } from "./harness/names.ts";
+import { type WakeLog, wakeLogOf } from "./neon/lake-wake.ts";
 import { type TelegramLog, telegramLogOf } from "./telegram/update-consumer.ts";
 
 /** alasio's configuration, as its environment sets it. */
@@ -10,6 +11,8 @@ export interface AlasioConfig {
   readonly allowedUserIds: string;
   /** Where the bot's updates are: its environment's topic in the log, which alasio consumes. */
   readonly telegramLog: TelegramLog;
+  /** Where alasio tells the lake's loader it wrote transcripts: its environment's wake topic in the log; null where the lake does not run. */
+  readonly lakeWake: WakeLog | null;
   readonly workingDirectory: string | null;
   readonly workspaceRoot: string;
   readonly stateDir: string;
@@ -49,6 +52,7 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
     telegramBotToken: requireEnv(env, "TELEGRAM_BOT_TOKEN"),
     allowedUserIds: env["TELEGRAM_ALLOWED_USER_IDS"] ?? "",
     telegramLog: telegramLogOf(env),
+    lakeWake: wakeLogOf(env),
     // Optional pre-mount for new conversations; unset means the operator picks a folder in Telegram.
     workingDirectory: env["WORKING_DIRECTORY"]?.trim() || null,
     // Every folder chosen or created from Telegram must live directly under this root.

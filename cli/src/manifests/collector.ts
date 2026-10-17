@@ -14,7 +14,7 @@
  *   one is set, which alone is sent the configured headers, from a queue in its memory.
  *   It scales on its CPU where its scale's min and max are apart;
  * - its scraper, one replica, so nothing is scraped twice: every Neon service's, the
- *   lake's and its intake's, the log's, the webhook intake's, each of SeaweedFS's parts' and, with workspace
+ *   lake's loader's, readers' and intake's, the log's, the webhook intake's, each of SeaweedFS's parts' and, with workspace
  *   storage, JuiceFS's Prometheus metrics, each pod of each found among the pods of its
  *   namespace, which it may list, so a component's replicas are each scraped and one that
  *   sleeps is not; and it reads the Valkeys', the object store's filer store's and
@@ -33,6 +33,7 @@ import type { InstallConfig } from "./config.ts";
 import { LOG_BROKERS, LOG_METRICS_PORT, LOG_RECORD_BYTES, logPrincipalSecret, TELEMETRY_TOPICS } from "./log.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { DRIVER_METRICS_PORT, DRIVER_POD_NAME, JUICEFS_METRICS_PORT, MOUNT_POD_NAME } from "./juicefs-csi.ts";
+import { INTAKE_COMPONENT, LAKE_METRICS_PORT, LAKE_QUERY_PORT, LOADER_COMPONENT, QUERY_COMPONENT } from "./lake.ts";
 import { COMPONENTS, FILER_STORE, FILER_STORE_USERS, METRICS_PORT as SEAWEEDFS_METRICS_PORT } from "./object-store.ts";
 import { priority } from "./priorities.ts";
 import { cpuUtilization, scaledObject } from "./scalers.ts";
@@ -47,9 +48,6 @@ export const GATEWAY_COMPONENT = "collector";
 /** The scraper's name and its pods' component. */
 export const SCRAPER = componentName("collector-scraper");
 export const SCRAPER_COMPONENT = "collector-scraper";
-
-/** The port the lake, its intake and the log serve their metrics on. */
-const LAKE_METRICS_PORT = 9464;
 
 /**
  * How often it scrapes the stack. The stack's metrics are most of all the telemetry
@@ -146,7 +144,9 @@ function scrapes(config: InstallConfig): object[] {
         safekeeper: [["neon-safekeeper"], 7676],
       } as const
       : {}),
-    ...(lakeRuns(config) ? { lake: [["lake"], LAKE_METRICS_PORT], "lake-intake": [["lake-intake"], LAKE_METRICS_PORT] } as const : {}),
+    ...(lakeRuns(config)
+      ? { "lake-loader": [[LOADER_COMPONENT], LAKE_METRICS_PORT], "lake-query": [[QUERY_COMPONENT], LAKE_QUERY_PORT], "lake-intake": [[INTAKE_COMPONENT], LAKE_METRICS_PORT] } as const
+      : {}),
     log: [["log"], LOG_METRICS_PORT],
     webhook: [["webhook"], WEBHOOK_HEALTH_PORT],
   };

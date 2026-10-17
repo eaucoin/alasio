@@ -1,20 +1,15 @@
 /**
- * The intake's member of the log's consumer group (./intake.ts's IntakeSource), on the one
- * Kafka client of alasio's code, @platformatic/kafka: as the intake's principal, over
- * SCRAM-SHA-512, offsets committed by hand once the lake has what they cover, read from
- * where the group was last told, or from each partition's start for one it never was.
+ * A member of a consumer group of the log, the intake's (./intake.ts's IntakeSource) or a
+ * lake loader's on its wake topic (./loader.ts's WakeSource), on the one Kafka client of
+ * alasio's code, @platformatic/kafka: as its component's principal, over SCRAM-SHA-512,
+ * offsets committed by hand once the lake has what they cover, read from where the group
+ * was last told, or from each partition's start for one it never was.
  */
 import { Consumer, MessagesStreamFallbackModes, MessagesStreamModes } from "@platformatic/kafka";
 
+import type { LogConfig } from "./config.ts";
 import type { BatchBounds, IntakeSource } from "./intake.ts";
 import type { Position } from "./otel.ts";
-
-/** The log as a client reaches it: its brokers, and the principal it is reached as. */
-export interface LogAccess {
-  brokers: string[];
-  username: string;
-  password: string;
-}
 
 /** How long a member's session lasts without a heartbeat before the group gives its partitions to another. */
 const SESSION_TIMEOUT_MS = 30_000;
@@ -66,7 +61,7 @@ export function gathering(records: AsyncIterator<Read>): (bounds: Pick<BatchBoun
 }
 
 /** Joins `group` on `topics` as `clientId`: the member's batches, and its commits. */
-export async function joinLog(access: LogAccess, group: string, topics: readonly string[], clientId: string): Promise<IntakeSource> {
+export async function joinLog(access: LogConfig, group: string, topics: readonly string[], clientId: string): Promise<IntakeSource> {
   const consumer = new Consumer({
     clientId,
     groupId: group,

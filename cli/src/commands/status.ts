@@ -1,5 +1,5 @@
 /** `alasio status`: what runs, and whether it is healthy; how it is scaled and sized, and the cluster's memory. */
-import type { KubernetesObject, V1Node, V1Pod, V1Secret, V1StatefulSet } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Deployment, V1Node, V1Pod, V1Secret, V1StatefulSet } from "@kubernetes/client-node";
 import { Console, Effect, Option, Redacted, Schema } from "effect";
 import { Command } from "effect/cli";
 
@@ -14,8 +14,9 @@ import { clusterReleases, describeKept, snapshotReleases } from "../kept-release
 import { describeMemory, describeScale, describeSizing, memoryBytes, memoryText, type ScaledWorkload } from "../capacity.ts";
 import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
-import { diagnose, readiness, selectorOf } from "../kube/rollout.ts";
+import { diagnose, readiness, selectorOf, starting } from "../kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE } from "../manifests/common.ts";
+import { LOADER_COMPONENT } from "../manifests/lake.ts";
 import { REPLICA_NAME } from "../manifests/neon.ts";
 import { MASTER, METRICS_PORT, VOLUME_SERVER } from "../manifests/object-store.ts";
 import type { ScaledObject } from "../manifests/scalers.ts";
@@ -167,6 +168,78 @@ function describeTenant({ shards, pageservers }: TenantView): string[] {
   ];
 }
 
+/** KEDA's annotations pausing a ScaledObject: at its replicas now, or at a count of them. */
+const PAUSED = "autoscaling.keda.sh/paused";
+const PAUSED_REPLICAS = "autoscaling.keda.sh/paused-replicas";
+
+/**
+ * Why KEDA would not wake `scaler`'s workload from no replica, if it would not: its
+ * ScaledObject gone, paused (its annotations, or its Paused condition), or not ready; null
+ * where it would.
+ */
+function unwakeable(scaler: ScaledObject | undefined): string | null {
+  if (!scaler) return "with no ScaledObject to wake it";
+  const annotations = scaler.metadata?.annotations ?? {};
+  const condition = (type: string) => scaler.status?.conditions?.find((each) => each.type === type);
+  if (annotations[PAUSED] === "true" || annotations[PAUSED_REPLICAS] !== undefined || condition("Paused")?.status === "True") return "its ScaledObject paused, which wakes it no more";
+  const ready = condition("Ready");
+  if (ready && ready.status !== "True") return `its ScaledObject not ready (${ready.message || ready.reason || ready.status}), which wakes it no more`;
+  return null;
+}
+
+/**
+ * A workload that is ready: a compute, a read replica among them, or the lake's loader,
+ * each asleep at no replica until it is woken, a compute by a connection and the loader
+ * by alasio's writing, or awake; any other, at no replica too, ready, as KEDA leaves one.
+ * The loader asleep is ready only while its ScaledObject would wake it (unwakeable): what
+ * it says, and whether it is ready.
+ */
+function describeReady(workload: ScaledWorkload, computes: ReadonlyMap<string, ComputeTimes>, scaler: ScaledObject | undefined): { said: string; ready: boolean } {
+  switch (workload.metadata?.name) {
+    case neonName("compute"):
+    case REPLICA_NAME:
+      return { said: describeCompute(workload, computes), ready: true };
+    case componentName(LOADER_COMPONENT): {
+      if (workload.spec?.replicas !== 0) return { said: "awake", ready: true };
+      const why = unwakeable(scaler);
+      return why === null ? { said: "asleep, nothing left to load", ready: true } : { said: `at no replica, ${why}`, ready: false };
+    }
+    default:
+      return { said: "ready", ready: true };
+  }
+}
+
+/** How long Kubernetes gives a Deployment's pods to come up by default, of its progressDeadlineSeconds. */
+const PROGRESS_DEADLINE_SECONDS = 600;
+
+/**
+ * Whether `workload`, one that wakes on demand (describeReady's: a compute, a read replica
+ * among them, or the lake's loader) or that KEDA scales (`scaler`), as the lake's intake
+ * woken from none or Grafana scaled out, is waking: each of its pods not ready starting
+ * (../kube/rollout.ts), within its Deployment's progress deadline, or, where `scaler` woke
+ * it, its pods not all made yet while KEDA still finds it work, as it last did within that
+ * deadline. KEDA renews its lastActiveTime at each poll it finds work at, and records no
+ * time it woke the loader, so a pod never made is bounded by the ReplicaSet's saying it
+ * cannot make it (ReplicaFailure), not by time. One whose pod crashed, whose pods cannot be
+ * made, or that has not come up within the deadline, is not ready.
+ */
+const waking = Effect.fnUntraced(function*(workload: ScaledWorkload, scaler: ScaledObject | undefined): Effect.fn.Return<boolean, KubeApiError, KubeApi> {
+  if (scaler === undefined && ![neonName("compute"), REPLICA_NAME, componentName(LOADER_COMPONENT)].includes(workload.metadata?.name ?? "")) return false;
+  const { metadata, spec, status } = workload as V1Deployment;
+  // Past its progress deadline, or its pods refused, as the Deployment says: stuck, not
+  // waking.
+  const said = (type: string, is: string) => status?.conditions?.some((condition) => condition.type === type && condition.status === is) ?? false;
+  if (said("Progressing", "False") || said("ReplicaFailure", "True")) return false;
+  const pods = yield* (yield* KubeApi).list<V1Pod>(kind("Pod"), { namespace: metadata?.namespace, labelSelector: selectorOf(spec?.selector.matchLabels ?? {}) });
+  const unready = pods.filter((pod) => !pod.status?.conditions?.some(({ type, status: ready }) => type === "Ready" && ready === "True"));
+  const now = Date.now();
+  const deadlineMs = (spec?.progressDeadlineSeconds ?? PROGRESS_DEADLINE_SECONDS) * 1000;
+  // Its pods not all made yet, as just after KEDA woke it, while KEDA still finds it work.
+  const woken = scaler?.status?.lastActiveTime;
+  const unmade = pods.length < (spec?.replicas ?? 0) && woken !== undefined && now - Date.parse(woken) < deadlineMs;
+  return (unready.length > 0 || unmade) && unready.every((pod) => starting(pod, deadlineMs, now));
+});
+
 /** How main's bot's and each branch environment's deliveries fare, as Telegram says. */
 const deliveries = (config: Parameters<typeof installConfig>[0]) =>
   Effect.gen(function*() {
@@ -229,11 +302,18 @@ export const status = Command.make("status", {}, () =>
         for (const workload of workloads as readonly ScaledWorkload[]) {
           const state = readiness(workload);
           // A DaemonSet runs a pod on every node it schedules to, of no scale of its own.
-          const scale = workload.kind === "DaemonSet" ? "" : `${describeScale(workload, of(scaledObjects, workload, ({ spec }) => spec.scaleTargetRef.name))}; `;
+          const scaler = of(scaledObjects, workload, ({ spec }) => spec.scaleTargetRef.name);
+          const scale = workload.kind === "DaemonSet" ? "" : `${describeScale(workload, scaler)}; `;
           const sizing = `    ${scale}${describeSizing(workload, of(sizings, workload, ({ spec }) => spec.targetRef.name))}`;
           if (state._tag === "Ready") {
-            const isCompute = workload.metadata?.name === neonName("compute") || workload.metadata?.name === REPLICA_NAME;
-            yield* Console.log(`  ${describeRef(refOf(workload))}: ${isCompute ? describeCompute(workload, computes) : "ready"}`);
+            const { said, ready } = describeReady(workload, computes, scaler);
+            if (!ready) notReady += 1;
+            yield* Console.log(`  ${describeRef(refOf(workload))}: ${said}`);
+            yield* Console.log(sizing);
+            continue;
+          }
+          if (state._tag === "Waiting" && (yield* waking(workload, scaler))) {
+            yield* Console.log(`  ${describeRef(refOf(workload))}: waking, ${state.status}`);
             yield* Console.log(sizing);
             continue;
           }
@@ -282,7 +362,9 @@ export const status = Command.make("status", {}, () =>
     Command.withDescription(
       "Says where alasio runs (and, for the cluster on this machine, k3s's service and node, or its nodes in Docker, and this " +
         "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready (a compute awake, or " +
-        "asleep, as one no client has used for a while is until the next connection wakes it, and when it was last woken), or what it is at and " +
+        "asleep, as one no client has used for a while is until the next connection wakes it, and when it was last woken; the lake's loader " +
+        "awake, or asleep with nothing left to load until alasio writes again), waking (a compute or the loader whose pod starts, within " +
+        "its Deployment's progress deadline), or what it is at and " +
         "why; its replicas, and its scale where KEDA moves it; and its pods' requests, beside " +
         "what VPA recommends once it has measured them; where sessions are snapshotted, the CPU baseline they are held to, and the nodes that lack it, and the gVisor releases kept, with the snapshots naming each. Of the bundled object store, the copies it keeps of each object, and of each " +
         "volume server, as its metrics say: what it may still fill of its disk before it takes no more writes, what it keeps " +

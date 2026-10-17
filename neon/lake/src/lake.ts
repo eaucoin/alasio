@@ -15,6 +15,7 @@
  */
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import { type DuckDBConnection, DuckDBInstance, type DuckDBValue, type JS } from "@duckdb/node-api";
 import pg from "pg";
@@ -221,6 +222,63 @@ export function writeLock(catalog: DatabaseConfig, waitMs = WRITE_LOCK_WAIT_MS):
       });
     }
   };
+}
+
+/** Names the advisory lock of the one load of the lake from alasio's database at a time, in the catalog's database. */
+const LOADER_LOCK = "alasio.lake.loader";
+/** How often the lock is asked for again while another holds it. */
+export const LOADER_LOCK_RETRY_MS = 10_000;
+
+/**
+ * The loader's lock, held: `fence()` rejects where it is no longer held, as its connection
+ * was lost, which a write under it checks just before it commits, as the write lock's fence
+ * does; `release()` lets it go.
+ */
+export interface LoaderLock {
+  fence(): Promise<void>;
+  release(): Promise<void>;
+}
+
+/** Where the loader's lock was lost under a load. */
+export class LoaderLockLost extends Error {
+  override readonly name = "LoaderLockLost";
+  constructor(cause: unknown) {
+    super(`the loader's lock was lost: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+  }
+}
+
+/**
+ * Takes the lock of the one load of the lake from alasio's database at a time, waiting
+ * while another holds it, until `signal` aborts: the loader's, for each load (./loader.ts),
+ * so that no two compute what the lake lacks, and load it, at once, which would load it
+ * twice. `log` says that it waits.
+ */
+export async function takeLoaderLock(
+  catalog: DatabaseConfig,
+  log: (message: string, fields?: Record<string, unknown>) => void,
+  { signal, retryMs = LOADER_LOCK_RETRY_MS }: { signal?: AbortSignal | undefined; retryMs?: number | undefined } = {},
+): Promise<LoaderLock> {
+  const client = new pg.Client({ ...catalog, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
+  // A connection lost is found by the fence's round trip.
+  client.on("error", () => {});
+  try {
+    await client.connect();
+    for (let attempt = 0; ; attempt += 1) {
+      const { rows: [answer] } = await client.query<{ held: boolean }>("select pg_try_advisory_lock(hashtext($1)) as held", [LOADER_LOCK]);
+      if (answer?.held) {
+        return {
+          // A round trip on the lock's connection answers only while its session, and so its lock, lasts.
+          fence: () => client.query("select").then(() => {}, (error: unknown) => Promise.reject(new LoaderLockLost(error))),
+          release: () => client.end().catch(() => {}),
+        };
+      }
+      if (attempt % 6 === 0) log("another loader holds the lock; waiting");
+      await sleep(retryMs, undefined, { signal });
+    }
+  } catch (error) {
+    await client.end().catch(() => {});
+    throw error;
+  }
 }
 
 const writes = queue();

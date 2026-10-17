@@ -36,7 +36,7 @@ import { FILER, FILER_STORE, FILER_STORE_USERS, GATEWAY, MASTER, VOLUME_SERVER }
 import { JUICEFS_ADMIN, VALKEY, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/workspace-storage.ts";
 import type { Sandbox } from "../../src/kube/sandboxes.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
-import { AGENTS, inAlasio, inSession, kube, onNode, type Ran, ref, SESSIONS, tcp } from "./harness.ts";
+import { AGENTS, inAlasio, inSession, kube, onNode, type Ran, ref, runCronJob, SESSIONS, tcp } from "./harness.ts";
 import type { BroughtUp } from "./session-bring-up.ts";
 import type { Made } from "./session-volumes.ts";
 
@@ -263,32 +263,6 @@ async function mountState(volumeId: string, node: string, volume: string): Promi
   const seen = await inWorkspace(volumeId, "stat --file-system --format=%T /workspace; ls -la /workspace /workspace/juicefs-e2e");
   const mounts = await onNode(node, `grep '${volume}' /proc/self/mountinfo || true`);
   return `in the session: ${seen.stdout}${seen.stderr}\non the node: ${mounts}${await driverState(node)}`;
-}
-
-/** Runs a Job of the CronJob's template, as one it starts on its schedule is, until it completes: what its pods logged. */
-async function runJob(cronJob: string): Promise<string> {
-  const name = `${cronJob}-e2e-${Date.now()}`;
-  const template = (await kube.get<V1CronJob>(ref("CronJob", cronJob, NAMESPACE)))?.spec?.jobTemplate;
-  assert.ok(template?.spec, `there is no CronJob ${cronJob}`);
-  const job: V1Job = { apiVersion: "batch/v1", kind: "Job", metadata: { name, namespace: NAMESPACE, labels: template.metadata?.labels ?? {} }, spec: template.spec };
-  await kube.apply(job);
-  const logs = async () => {
-    const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "job-name": name }) });
-    const logged = await Promise.all(pods.flatMap((pod) =>
-      [...(pod.spec?.initContainers ?? []), ...(pod.spec?.containers ?? [])].map((container) =>
-        kube.logs(NAMESPACE, pod.metadata?.name ?? "", container.name).catch((error: unknown) => (error instanceof Error ? error.message : String(error)))
-      )
-    ));
-    return logged.join("");
-  };
-  try {
-    await kube.awaitReady([ref("Job", name, NAMESPACE)], "10 minutes").catch(async (error: unknown) => {
-      throw new Error(`${error instanceof Error ? error.message : String(error)}\n${await logs()}`);
-    });
-    return await logs();
-  } finally {
-    await kube.remove(ref("Job", name, NAMESPACE)).catch(() => {});
-  }
 }
 
 /**
@@ -633,7 +607,7 @@ export function workspaceStorage(): void {
     });
 
     test("the daily quota check checks each workspace's quota", async () => {
-      const said = await runJob(componentName("juicefs-quota-check"));
+      const said = await runCronJob(componentName("juicefs-quota-check"));
       for (const netMode of ["none", "full"] as const) {
         const directory = await directoryOf(sessions[netMode]);
         assert.match(said, new RegExp(`quota of /${directory} is consistent|/${directory}: quota\\(`, "u"), directory);
@@ -641,7 +615,7 @@ export function workspaceStorage(): void {
     });
 
     test("the daily collection collects the file system", async () => {
-      await runJob(componentName("juicefs-gc"));
+      await runCronJob(componentName("juicefs-gc"));
     });
 
     test("a workspace's volume is deleted with its claim, and its directory with it", async () => {
@@ -717,7 +691,7 @@ export function workspaceStorage(): void {
           const last = (await dumps()).at(-1);
           return last && dumpedAt(last) > fixtureWrittenAt ? last : undefined;
         }, 12 * 60_000);
-        await runJob(neonName("backup"));
+        await runCronJob(neonName("backup"));
         const name = (await inPod("s3", 'printf %s "$WORKSPACES_NAME"')).trim();
         const copies = await listed(inPod, "s3://$BUCKET/", new RegExp(`^${name}-dump-.*\\.json\\.gz$`, "u"));
         // The newest when the backup ran: that one, or one made since.

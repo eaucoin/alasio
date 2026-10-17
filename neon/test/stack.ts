@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 
-import type { CoreV1Event, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Node, V1Pod, V1PodSpec, V1PriorityClass, V1StatefulSet } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Node, V1Pod, V1PodSpec, V1PriorityClass, V1StatefulSet } from "@kubernetes/client-node";
 import pg, { type QueryResultRow } from "pg";
 
 import { cpuMillis } from "../../cli/src/capacity.ts";
@@ -34,6 +34,7 @@ import { SUSPEND_AFTER } from "../control/endpoints.ts";
 import { computeCtlToken, signToken } from "../control/jwt.ts";
 import { scramVerifier } from "../control/scram.ts";
 import type { StackSecrets } from "../control/secrets.ts";
+import { GATHER_MS } from "../lake/src/loader.ts";
 
 /** The stack's pods, by their labels. */
 const STACK = selectorOf({ "app.kubernetes.io/instance": RELEASE, "alasio.dev/stack": "neon" });
@@ -342,11 +343,60 @@ async function untilLoaded(check: () => Promise<boolean>, what: string) {
   assert.fail(`the lake never ${what}: ${last instanceof Error ? last.message : last}`);
 }
 
-/** Restarts the lake, as a rollout restart of its Deployment does, and waits until it runs again. */
-async function restartLake() {
-  const lake = ref("Deployment", `${RELEASE}-lake`, NAMESPACE);
-  await kube.patch(lake, { spec: { template: { metadata: { annotations: { "kubectl.kubernetes.io/restartedAt": new Date().toISOString() } } } } });
-  await kube.awaitReady([lake], "5 minutes");
+/**
+ * Tells main's lake loader transcripts were written, as alasio does once its stores have
+ * committed them (src/neon/lake-wake.ts): a record on main's wake topic, written from
+ * alasio's pod as its principal, which KEDA wakes the loader on.
+ */
+async function wakeLake() {
+  const script = [
+    'const { Producer } = await import("@platformatic/kafka");',
+    'const { readFileSync } = await import("node:fs");',
+    "const { ALASIO_LOG_BROKERS, ALASIO_LOG_USERNAME, ALASIO_LOG_PASSWORD_FILE, ALASIO_LAKE_WAKE_TOPIC } = process.env;",
+    'const producer = new Producer({ clientId: "e2e", bootstrapBrokers: ALASIO_LOG_BROKERS.split(","), sasl: { mechanism: "SCRAM-SHA-512", username: ALASIO_LOG_USERNAME, password: readFileSync(ALASIO_LOG_PASSWORD_FILE, "utf8").trim() } });',
+    'await producer.send({ messages: [{ topic: ALASIO_LAKE_WAKE_TOPIC, value: Buffer.from("{}") }] });',
+    "await producer.close();",
+  ].join("\n");
+  // From alasio's directory in its image, where its packages resolve from.
+  await kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), ["sh", "-c", 'cd /opt/alasio && node --input-type=module -e "$1"', "node", script], { container: "alasio" });
+}
+
+/** main's lake loader. */
+const LOADER = ref("Deployment", componentName("lake-loader"), NAMESPACE);
+
+/**
+ * Waits until main's lake loader is settled, none of its pods going: asleep, or awake while
+ * KEDA holds it active, which it does for its cooldown past what woke it. A loader KEDA has
+ * not found active since its ScaledObject was made, as one the stack's tests put back, is
+ * put to sleep at KEDA's next poll, and a load under way as it stops finishes first, telling
+ * the group of the record that woke it, which then wakes nothing.
+ */
+async function untilSettled() {
+  const scaler = ref("ScaledObject", componentName("lake-loader"), NAMESPACE);
+  for (const deadline = Date.now() + 360_000; ; await sleep(1000)) {
+    const active = (await kube.get<KubernetesObject & { status?: { conditions?: { type: string; status: string }[] } }>(scaler))?.status?.conditions
+      ?.some(({ type, status }) => type === "Active" && status === "True") ?? false;
+    const loader = await kube.get<V1Deployment>(LOADER);
+    const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(loader?.spec?.selector.matchLabels ?? {}) });
+    const replicas = loader?.spec?.replicas ?? 0;
+    if (!pods.some(({ metadata }) => metadata?.deletionTimestamp) && (active ? replicas > 0 : replicas === 0 && pods.length === 0)) return;
+    assert.ok(Date.now() < deadline, `the lake's loader never settled: ${replicas} replicas, ${pods.length} pods, ${active ? "" : "not "}active`);
+  }
+}
+
+/** Wakes main's lake loader (wakeLake), once settled, and waits until it is past its gathering of what woke it, into its load. */
+async function untilLoading() {
+  await untilSettled();
+  await wakeLake();
+  for (const deadline = Date.now() + 120_000; !(await kube.get<V1Deployment>(LOADER))?.status?.readyReplicas; await sleep(1000)) {
+    if (Date.now() > deadline) {
+      // What KEDA and the Deployment say of it: why it did not wake.
+      const scaler = await kube.get<KubernetesObject & { status?: unknown }>(ref("ScaledObject", componentName("lake-loader"), NAMESPACE));
+      const loader = await kube.get<V1Deployment>(LOADER);
+      assert.fail(`the lake's loader never woke: its ScaledObject ${JSON.stringify(scaler?.status)}, its Deployment ${JSON.stringify({ replicas: loader?.spec?.replicas, status: loader?.status })}`);
+    }
+  }
+  await sleep(GATHER_MS + 1500);
 }
 
 /** What the pageserver answers to which LSN a moment was at. */
@@ -742,8 +792,12 @@ export function neonStack(): void {
       });
 
       test("an upgrade that changes nothing restarts nothing of the stack", async () => {
-        // Its workloads' pods: not a Job's, which a CronJob starts at its minute whatever an upgrade does.
-        const pods = async () => (await runningPods()).filter(({ metadata }) => !metadata?.ownerReferences?.some(({ kind }) => kind === "Job")).map((pod) => pod.metadata?.uid).sort();
+        // Its workloads' pods: not a Job's, which a CronJob starts at its minute whatever an upgrade
+        // does, nor the lake loader's, which wakes and sleeps as alasio writes.
+        const pods = async () =>
+          (await runningPods())
+            .filter(({ metadata }) => !metadata?.ownerReferences?.some(({ kind }) => kind === "Job") && metadata?.labels?.["app.kubernetes.io/component"] !== "lake-loader")
+            .map((pod) => pod.metadata?.uid).sort();
         const before = await pods();
         await alasioOk("upgrade", "--timeout", "10m");
         assert.deepEqual(await pods(), before);
@@ -1045,9 +1099,9 @@ export function neonStack(): void {
       });
 
       test("the object store's parts refuse the stack's other pods: the lake reaches a gateway's S3 port, and neither its gRPC and metrics ports, nor any master, volume server or filer", async () => {
-        const lake = await kube.runningPod(NAMESPACE, componentName("lake"));
+        const lake = await kube.runningPod(NAMESPACE, componentName("lake-query"));
         const addressOf = async (pod: string) => (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.status?.podIP ?? assert.fail(`${pod} has no address`);
-        const reached = async (pod: string, port: number) => (await kube.execOk(NAMESPACE, lake, ["node", "-e", tcp(JSON.stringify(await addressOf(pod)), port)], { container: "lake" })).trim();
+        const reached = async (pod: string, port: number) => (await kube.execOk(NAMESPACE, lake, ["node", "-e", tcp(JSON.stringify(await addressOf(pod)), port)], { container: "query" })).trim();
         const gateway = await kube.runningPod(NAMESPACE, componentName("seaweedfs"));
         assert.equal(await reached(gateway, 8333), "open");
         for (const port of [18333, 9327]) assert.equal(await reached(gateway, port), "blocked", `seaweedfs:${port}`);
@@ -1413,14 +1467,32 @@ export function neonStack(): void {
     describe("Neon's proxy", () => {
       const COMPUTE_DEPLOYMENT = ref("Deployment", neonName("compute"), NAMESPACE);
       const CONTROL = ref("Deployment", neonName("control"), NAMESPACE);
-      /** Main's clients, which hold sessions on its compute, its lake's loader and intake always. */
-      const CLIENTS = [RELEASE, componentName("lake"), componentName("lake-intake"), componentName("grafana")].map((name) => ref("Deployment", name, NAMESPACE));
-      /** What scales the intake by what it has yet to read of the log, which would start it again while it is stopped: held at none meanwhile. */
-      const INTAKE_SCALER = ref("ScaledObject", componentName("lake-intake"), NAMESPACE);
-      const PAUSED_REPLICAS = "autoscaling.keda.sh/paused-replicas";
+      /** Main's clients, which hold sessions on its compute: its lake's readers and intake always, its loader while it is awake. */
+      const CLIENTS = [RELEASE, componentName("lake-loader"), componentName("lake-query"), componentName("lake-intake"), componentName("grafana")].map((name) => ref("Deployment", name, NAMESPACE));
+      /** Main's lake's passes, each of which holds a session on its compute while it runs. */
+      const PASSES = [componentName("lake-maintenance"), componentName("lake-merge")].map((name) => ref("CronJob", name, NAMESPACE));
 
-      /** The Deployment scaled to none, and its pods gone, a terminating one too. */
+      /** The CronJob `pass` suspended, or no longer, and, suspended, none of its pods left running. */
+      async function suspend(pass: ObjectRef, suspended: boolean) {
+        await kube.patch(pass, { spec: { suspend: suspended } });
+        const labels = (await kube.get<V1CronJob>(pass))?.spec?.jobTemplate.spec?.template.metadata?.labels ?? {};
+        const deadline = Date.now() + 300_000;
+        while (suspended && (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(labels) })).some(({ status }) => status?.phase === "Pending" || status?.phase === "Running")) {
+          assert.ok(Date.now() < deadline, `${pass.name}'s pass did not end`);
+          await sleep(1000);
+        }
+      }
+
+      /** The ScaledObject that scales `workload`, of its name, if KEDA scales it. */
+      const scalerOf = async (workload: ObjectRef) => {
+        const scaler = ref("ScaledObject", workload.name, NAMESPACE);
+        return (await kube.get(scaler)) ? scaler : null;
+      };
+
+      /** The Deployment scaled to none, its ScaledObject, if any, paused at none, and its pods gone, a terminating one too. */
       async function stopped(workload: ObjectRef) {
+        const scaler = await scalerOf(workload);
+        if (scaler) await kube.patch(scaler, { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": "0" } } });
         await kube.patch(workload, { spec: { replicas: 0 } });
         const labels = (await kube.get<V1Deployment>(workload))?.spec?.selector.matchLabels ?? {};
         const deadline = Date.now() + 120_000;
@@ -1480,8 +1552,12 @@ export function neonStack(): void {
 
       after(async () => {
         if (installedSuspend !== undefined) await kube.patch(COMPUTE_DEPLOYMENT, { metadata: { annotations: { [SUSPEND_AFTER]: installedSuspend } } });
-        await kube.patch(INTAKE_SCALER, { metadata: { annotations: { [PAUSED_REPLICAS]: null } } });
-        for (const workload of [CONTROL, ...CLIENTS]) await kube.patch(workload, { spec: { replicas: 1 } });
+        for (const pass of PASSES) await suspend(pass, false);
+        for (const workload of [CONTROL, ...CLIENTS]) {
+          const scaler = await scalerOf(workload);
+          if (scaler) await kube.patch(scaler, { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": null } } });
+          await kube.patch(workload, { spec: { replicas: 1 } });
+        }
         await up();
         await kube.awaitReady(CLIENTS, "5 minutes");
       });
@@ -1495,14 +1571,14 @@ export function neonStack(): void {
           "select distinct usename || ' ' || host(client_addr) from pg_stat_activity where usename in ('alasio', 'lake', 'lake_reader', 'grafana')",
         ], { container: "compute" });
         const seen = sessions.trim().split("\n").filter(Boolean).map((line) => line.split(" "));
-        assert.ok(seen.some(([role]) => role === "lake"), `the lake's loader holds a session: ${sessions}`);
+        assert.ok(seen.some(([role]) => role === "lake_reader"), `the lake's readers hold a session: ${sessions}`);
         for (const [role, address] of seen) assert.ok(proxies.includes(address), `${role}'s session comes from ${address}, not the proxy (${proxies.join(", ")})`);
       });
 
       test("wakes a compute that sleeps on the first connection to it, within alasio's patience, warm and with the pageserver just restarted", async () => {
         // Main's clients stopped, which would wake it again at once, a terminating one's last reconnection too.
-        await kube.patch(INTAKE_SCALER, { metadata: { annotations: { [PAUSED_REPLICAS]: "0" } } });
         for (const workload of CLIENTS) await stopped(workload);
+        for (const pass of PASSES) await suspend(pass, true);
         const warm: number[] = [];
         for (let wake = 0; wake < 3; wake++) {
           await asleep();
@@ -1682,7 +1758,7 @@ export function neonStack(): void {
         return counts;
       };
 
-      test("loads what alasio's stores hold, as it starts and as it runs", async () => {
+      test("loads what alasio's stores hold once it is told they wrote it", async () => {
         const store = new NeonSessionStore(pool);
         await store.append(KEY, Array.from({ length: 50 }, (_, n) => entry(n)));
         const rollouts = new NeonRolloutStore(pool);
@@ -1691,7 +1767,7 @@ export function neonStack(): void {
           { name: "rollout-kube.jsonl", path: "sessions/rollout-kube.jsonl", threadId: "thread-k", rolloutId: "thread-k", historyBase: null, size: Buffer.byteLength(line), headDigest: "h", modifiedMs: Date.now() },
           { start: 0, bytes: Buffer.from(line) },
         );
-        await restartLake();
+        await wakeLake();
         const expected = await sourceCount();
         await untilLoaded(async () => Number((await lakeCounts())["n"]) === expected, `held all ${expected} entries`);
         const lines = await lakeQuery("select type, thread_id from codex.lines where thread_id = 'thread-k'");
@@ -1700,9 +1776,10 @@ export function neonStack(): void {
 
       test("keeps every entry exactly once through its loader being killed mid-load", async () => {
         await new NeonSessionStore(pool).append(KEY, Array.from({ length: 20_000 }, (_, n) => entry(1000 + n)));
-        await sleep(1500);
-        await kube.kill(NAMESPACE, await podOf("lake"));
-        await kube.awaitReady([ref("Deployment", `${RELEASE}-lake`, NAMESPACE)], "5 minutes");
+        // Woken, and loading: killed then, its record untold, it is woken again and loads anew.
+        await untilLoading();
+        await kube.kill(NAMESPACE, await podOf("lake-loader"));
+        await kube.awaitReady([LOADER], "5 minutes");
         const expected = await sourceCount();
         await untilLoaded(async () => {
           const { n, seqs } = await lakeCounts();
@@ -1712,8 +1789,7 @@ export function neonStack(): void {
 
       test("keeps every entry exactly once through a pageserver killed mid-load", async () => {
         await new NeonSessionStore(pool).append(KEY, Array.from({ length: 20_000 }, (_, n) => entry(30_000 + n)));
-        await restartLake();
-        await sleep(1500);
+        await untilLoading();
         await kube.kill(NAMESPACE, await podOf("neon-pageserver"));
         await kube.awaitReady([ref("StatefulSet", neonName("pageserver"), NAMESPACE)], "5 minutes");
         const expected = await sourceCount();
@@ -1752,7 +1828,7 @@ export function neonStack(): void {
           await sleep(1000);
         }
         await new NeonSessionStore(pool).append(KEY, [entry(60_000)]);
-        await restartLake();
+        await wakeLake();
         const expected = await sourceCount();
         await untilLoaded(async () => Number((await lakeCounts())["n"]) === expected, `held all ${expected} entries, read on the replica woken`);
         assert.equal((await kube.get<V1Deployment>(deployment))?.spec?.replicas, 1);

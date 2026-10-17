@@ -12,6 +12,7 @@ import { sessionFsCodexHome } from "./codex/sessionfs.ts";
 import { indexTranscripts } from "./harness/claude/search/index.ts";
 import { loadKubeTemplates } from "./kube/config.ts";
 import { Neon } from "./neon/connect.ts";
+import { LakeWake } from "./neon/lake-wake.ts";
 import { serveAlasio } from "./alasio.ts";
 import { withLogScope } from "./shared/log.ts";
 import { runAlasio } from "./shared/run.ts";
@@ -23,8 +24,9 @@ const alasio = Effect.gen(function*() {
   const kubeTemplates = yield* loadKubeTemplates;
   // alasio's state, Claude Code's transcripts and Codex's rollouts are kept in alasio's
   // Neon, which the deployment runs, and Codex's are mirrored from the start so no turn
-  // runs unmirrored. Neon may take minutes to answer, and a stop meanwhile stops the wait.
-  const neon = yield* Neon.make;
+  // runs unmirrored; the lake's loader is told of each write, where the lake runs. Neon
+  // may take minutes to answer, and a stop meanwhile stops the wait.
+  const neon = yield* Neon.make.pipe(Effect.provideServiceEffect(LakeWake, config.lakeWake ? LakeWake.make(config.lakeWake) : Effect.succeed(LakeWake.none)));
   const codexRollouts = yield* CodexRollouts.make({ store: neon.rollouts, home: codexHome() });
   // Session filesystems (an empty, isolated workspace per session) are on when the
   // deployment renders their template. Their Codex runs from a home of its own,

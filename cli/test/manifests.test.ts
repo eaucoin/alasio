@@ -400,11 +400,11 @@ describe("neon", () => {
     assert.equal(setup?.env?.find(({ name }) => name === "S3_EXTERNAL"), undefined);
   });
 
-  test("runs each workload at the count its scale fixes: one, but for the safekeepers, the compute, whose count neon-control owns, and the lake's intake, which KEDA scales", () => {
+  test("runs each workload at the count its scale fixes: one, but for the safekeepers, the compute, whose count neon-control owns, and the lake's intake and loader, which KEDA scales", () => {
     const objects = install({ host: { enabled: true } });
     const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet")];
     assert.ok(workloads.length > 10);
-    const counts: Record<string, number | undefined> = { "alasio-neon-safekeeper": 3, "alasio-neon-compute": undefined, "alasio-neon-compute-ro": undefined, "alasio-lake-intake": undefined };
+    const counts: Record<string, number | undefined> = { "alasio-neon-safekeeper": 3, "alasio-neon-compute": undefined, "alasio-neon-compute-ro": undefined, "alasio-lake-intake": undefined, "alasio-lake-loader": undefined };
     for (const { metadata, spec } of workloads) assert.equal(spec?.replicas, Object.hasOwn(counts, metadata?.name ?? "") ? counts[metadata?.name ?? ""] : 1, metadata?.name);
   });
 
@@ -481,7 +481,7 @@ describe("neon", () => {
     assert.equal(decoded.failure.message, "neon.pageserver.scaling.max must equal min: nothing scales it between them");
   });
 
-  test("runs a read replica of main's compute while the lake runs, which the lake loads from, asleep as the compute may be", () => {
+  test("runs a read replica of main's compute while the lake runs, which the lake's loader loads from, asleep as the compute may be", () => {
     const objects = install();
     const replica = one<V1Deployment>(objects, "Deployment", "alasio-neon-compute-ro");
     const args = container(replica).args ?? [];
@@ -490,7 +490,7 @@ describe("neon", () => {
     assert.equal(replica.metadata?.annotations?.["alasio.dev/suspend-after-seconds"], "300");
     assert.deepEqual(container(replica).resources, { requests: { cpu: "100m", memory: "192Mi" }, limits: { memory: "1Gi" } });
     assert.equal(one<V1Service>(objects, "Service", "alasio-neon-compute-ro").spec?.publishNotReadyAddresses, true);
-    assert.equal(container(one<V1Deployment>(objects, "Deployment", "alasio-lake")).env?.find(({ name }) => name === "LAKE_SOURCE_ENDPOINT")?.value, "alasio-ro");
+    assert.equal(container(one<V1Deployment>(objects, "Deployment", "alasio-lake-loader")).env?.find(({ name }) => name === "LAKE_SOURCE_ENDPOINT")?.value, "alasio-ro");
     // Without the lake, nothing reads from one.
     const without = install({ lake: { enabled: false } });
     assert.deepEqual(without.filter(({ kind, metadata }) => kind !== "NetworkPolicy" && metadata?.name === "alasio-neon-compute-ro"), []);
@@ -719,16 +719,44 @@ describe("neon", () => {
 /** The variables that name the files of the verifiers alasio is given, and the files. */
 const verifierFiles = (workload: V1Deployment) => container(workload).env?.filter(({ name }) => name.endsWith("_VERIFIER_FILE")).map(({ name, value }) => [name, value]);
 
-describe("the lake's query endpoint", () => {
-  test("reads the lake through its query endpoint, a container of the lake's pod with the reader's credentials alone", () => {
-    const lake = one<V1Deployment>(install({ lake: { query: { resources: { limits: { memory: "2Gi" } } } } }), "Deployment", "alasio-lake");
-    const query = lake.spec?.template.spec?.containers.find(({ name }) => name === "query");
-    assert.deepEqual(query?.command, ["node", "src/endpoint.ts"]);
-    assert.equal(query?.envFrom, undefined);
-    const secrets = query?.env?.flatMap(({ name, valueFrom }) => (valueFrom?.secretKeyRef ? [`${name}=${valueFrom.secretKeyRef.name}/${valueFrom.secretKeyRef.key}`] : []));
+describe("the lake's readers", () => {
+  test("read the lake with the reader's credentials alone, behind the lake's Service, each ready once it has the lake open", () => {
+    const objects = install({ lake: { query: { resources: { limits: { memory: "2Gi" } } } } });
+    const readers = one<V1Deployment>(objects, "Deployment", "alasio-lake-query");
+    const query = container(readers);
+    assert.deepEqual([query.name, query.command, query.envFrom, readers.spec?.replicas, readers.spec?.template.spec?.priorityClassName], ["query", ["node", "src/endpoint.ts"], undefined, 1, "alasio-floor"]);
+    const secrets = query.env?.flatMap(({ name, valueFrom }) => (valueFrom?.secretKeyRef ? [`${name}=${valueFrom.secretKeyRef.name}/${valueFrom.secretKeyRef.key}`] : []));
     assert.deepEqual(secrets, ["LAKE_READER_PASSWORD", "LAKE_READER_S3_KEY", "LAKE_READER_S3_SECRET", "LAKE_QUERY_TOKEN"].map((key) => `${key}=alasio-lake/${key}`));
-    assert.deepEqual(query?.resources?.limits, { memory: "2Gi" });
-    assert.deepEqual(query?.ports, [{ name: "query", containerPort: 8090 }]);
+    assert.deepEqual(query.resources?.limits, { memory: "2Gi" });
+    assert.deepEqual(query.ports, [{ name: "query", containerPort: 8090 }]);
+    assert.deepEqual(query.readinessProbe?.httpGet, { path: "/readyz", port: "query" });
+    // The lake's Service, which Grafana and alasio lake reach, is theirs; each finds the others by a headless one.
+    const selector = { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "lake-query" };
+    assert.deepEqual(one<V1Service>(objects, "Service", "alasio-lake").spec, { selector, ports: [{ name: "query", port: 8090 }] });
+    assert.deepEqual(one<V1Service>(objects, "Service", "alasio-lake-query-peers").spec, { clusterIP: "None", selector, ports: [{ name: "query", port: 8090 }] });
+    assert.deepEqual(query.env?.find(({ name }) => name === "LAKE_QUERY_PEERS"), { name: "LAKE_QUERY_PEERS", value: "alasio-lake-query-peers.alasio.svc.cluster.local" });
+  });
+
+  test("scale on the queries the pool has not answered, as any reader sums them, two to a reader, never below one", () => {
+    const objects = install({ lake: { query: { scaling: { min: 1, max: 3 } } } });
+    assert.equal(one<V1Deployment>(objects, "Deployment", "alasio-lake-query").spec?.replicas, undefined);
+    const scaled = one<ScaledObject>(objects, "ScaledObject", "alasio-lake-query");
+    assert.deepEqual([scaled.spec.minReplicaCount, scaled.spec.maxReplicaCount, scaled.spec.triggers], [1, 3, [{
+      type: "metrics-api",
+      metadata: { url: "http://alasio-lake.alasio.svc.cluster.local:8090/pool", valueLocation: "queries", targetValue: "2" },
+    }]]);
+    // KEDA's operator asks any of them, as do the others, which are pods of the stack.
+    const pod = (name: string) => ({ namespace: "alasio", namespaceLabels: { "kubernetes.io/metadata.name": "alasio" }, labels: one<V1Deployment>(objects, "Deployment", name).spec?.template.metadata?.labels ?? {} });
+    const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
+    assert.deepEqual([admits(policies, pod("alasio-keda-operator"), pod("alasio-lake-query"), 8090), admits(policies, pod("alasio-lake-query"), pod("alasio-lake-query"), 8090)], [true, true]);
+    // Several, a budget of one at a time, spread across nodes.
+    assert.ok(one(objects, "PodDisruptionBudget", "alasio-lake-query"));
+    assert.ok(one<V1Deployment>(objects, "Deployment", "alasio-lake-query").spec?.template.spec?.topologySpreadConstraints);
+    // At one, neither, nor a scaler; and never none, as Grafana's alerts read them.
+    assert.deepEqual(install().filter(({ kind, metadata }) => ["ScaledObject", "PodDisruptionBudget"].includes(kind ?? "") && metadata?.name === "alasio-lake-query"), []);
+    const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, lake: { query: { scaling: { min: 0, max: 2 } } } });
+    assert.ok(Result.isFailure(decoded));
+    assert.equal(decoded.failure.message, "lake.query.scaling.min must be at least 1: it never sleeps");
   });
 
   test("has alasio make the lake reader's role while the lake runs", () => {
@@ -742,6 +770,71 @@ describe("the lake's query endpoint", () => {
     assert.deepEqual(verifierFiles(alasio({ lake: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_VERIFIER_FILE"]);
     // The log's password beside them, as alasio reaches its Telegram topic.
     assert.equal(container(alasio({})).env?.find(({ name }) => name === "ALASIO_LOG_PASSWORD_FILE")?.value, "/run/alasio/log/password");
+  });
+});
+
+describe("the lake's writers", () => {
+  /** `workload`'s variables, by name: each's value, or the Secret's key it is from. */
+  const variables = (from: V1Container) =>
+    Object.fromEntries((from.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? `${valueFrom?.secretKeyRef?.name}/${valueFrom?.secretKeyRef?.key}`]));
+
+  test("load it with a loader of each environment, which KEDA wakes from none as soon as its group is behind on the environment's wake topic", () => {
+    const objects = install();
+    const loader = one<V1Deployment>(objects, "Deployment", "alasio-lake-loader");
+    assert.deepEqual([loader.spec?.replicas, loader.spec?.strategy?.type, loader.spec?.template.spec?.priorityClassName], [undefined, "Recreate", "alasio-component"]);
+    const env = variables(container(loader));
+    assert.deepEqual(
+      [env["LOG_BROKERS"], env["LOG_USERNAME"], env["LOG_PASSWORD"], env["LAKE_WAKE_TOPIC"], env["LAKE_WAKE_GROUP"], env["LAKE_DATABASE_PASSWORD"], env["OTEL_SERVICE_NAME"]],
+      ["alasio-log.alasio.svc:9092", "alasio-log-loader-main/username", "alasio-log-loader-main/password", "lake.main", "lake-loader.main", "alasio-lake/LAKE_DATABASE_PASSWORD", "alasio-lake-loader"],
+    );
+    // None of the reader's credentials, nor maintenance's.
+    assert.deepEqual([container(loader).envFrom, env["LAKE_READER_PASSWORD"], env["LAKE_BRANCHES_TOKEN"]], [undefined, undefined, undefined]);
+    const scaled = one<ScaledObject>(objects, "ScaledObject", "alasio-lake-loader");
+    assert.deepEqual([scaled.spec.minReplicaCount, scaled.spec.maxReplicaCount, scaled.spec.triggers], [0, 1, [{
+      type: "kafka",
+      metadata: { bootstrapServers: "alasio-log.alasio.svc:9092", consumerGroup: "lake-loader.main", topic: "lake.main", lagThreshold: "1", activationLagThreshold: "0", offsetResetPolicy: "earliest" },
+      authenticationRef: { name: "alasio-lake-loader" },
+    }]]);
+    assert.deepEqual((one<KubernetesObject & { spec: object }>(objects, "TriggerAuthentication", "alasio-lake-loader")).spec, {
+      secretTargetRef: ["sasl", "username", "password"].map((parameter) => ({ parameter, name: "alasio-log-scaler", key: parameter })),
+    });
+    // alasio tells it on that topic.
+    assert.deepEqual(container(one<V1Deployment>(objects, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_LAKE_WAKE_TOPIC"), { name: "ALASIO_LAKE_WAKE_TOPIC", value: "lake.main" });
+  });
+
+  test("maintain it in passes of their own, main's: daily on lake.maintenance.schedule, and the telemetry's files merged hourly, each waiting for the one before", () => {
+    const objects = install({ lake: { maintenance: { schedule: "5 4 * * *" } }, telemetry: { retentionDays: 7 } });
+    const pass = (name: string) => {
+      const cronJob = one<V1CronJob>(objects, "CronJob", name);
+      const job = cronJob.spec?.jobTemplate.spec?.template.spec;
+      assert.ok(job?.containers[0], name);
+      return { cronJob, container: job.containers[0] };
+    };
+    const daily = pass("alasio-lake-maintenance");
+    const hourly = pass("alasio-lake-merge");
+    assert.deepEqual([daily.cronJob.spec?.schedule, daily.container.command], ["5 4 * * *", ["node", "src/maintain.ts", "maintain"]]);
+    assert.deepEqual([hourly.cronJob.spec?.schedule, hourly.container.command], ["47 * * * *", ["node", "src/maintain.ts", "merge"]]);
+    for (const { cronJob } of [daily, hourly]) assert.equal(cronJob.spec?.concurrencyPolicy, "Forbid");
+    // It keeps telemetry.retentionDays days of it, and keeps its files while Neon has branches, whose lakes read them, asking neon-control with its token.
+    const env = variables(daily.container);
+    assert.deepEqual([env["LAKE_RETENTION_DAYS"], env["LAKE_BRANCHES_URL"], env["LAKE_BRANCHES_TOKEN"]], ["7", "http://alasio-neon-control:8080/branches", "alasio-lake/LAKE_BRANCHES_TOKEN"]);
+    // Without the lake, none.
+    assert.deepEqual(install({ lake: { enabled: false } }).filter(({ metadata }) => /^alasio-lake/u.test(metadata?.name ?? "")).map(({ metadata }) => metadata?.name), []);
+  });
+
+  test("give each pass's DuckDB three fifths of its container's memory limit, the rest Node's and the Parquet reader's", () => {
+    const limitOf = (objects: readonly KubernetesObject[]) =>
+      all<V1CronJob>(objects, "CronJob").filter(({ metadata }) => metadata?.name?.startsWith("alasio-lake-")).map(({ metadata, spec }) => [metadata?.name, variables(spec?.jobTemplate.spec?.template.spec?.containers[0] ?? { name: "" })["LAKE_MEMORY_LIMIT"]]);
+    assert.deepEqual(limitOf(install()), [["alasio-lake-maintenance", "614MiB"], ["alasio-lake-merge", "614MiB"]]);
+    assert.deepEqual(limitOf(install({ lake: { maintenance: { resources: { limits: { memory: "2Gi" } } } } })), [["alasio-lake-maintenance", "1228MiB"], ["alasio-lake-merge", "1228MiB"]]);
+  });
+
+  test("take their settings apart from the readers', refusing the key they replaced", () => {
+    const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, lake: { resources: { limits: { memory: "2Gi" } } } });
+    assert.ok(Result.isFailure(decoded));
+    assert.match(decoded.failure.message, /^lake\.resources /u);
+    const loader = one<V1Deployment>(install({ lake: { loader: { resources: { limits: { memory: "2Gi" } } } } }), "Deployment", "alasio-lake-loader");
+    assert.deepEqual(container(loader).resources?.limits, { memory: "2Gi" });
   });
 });
 
@@ -1201,16 +1294,16 @@ describe("Grafana", () => {
     }
   });
 
-  test("admits no pod to Grafana, and lets it reach DNS, its database, the lake's query endpoint and the internet's HTTPS alone", () => {
+  test("admits no pod to Grafana, and lets it reach DNS, its database, the lake's readers and the internet's HTTPS alone", () => {
     const objects = install();
     const own = one<Policy>(objects, "NetworkPolicy", "alasio-grafana").spec;
     assert.deepEqual([own.podSelector, own.policyTypes, own.ingress], [{ matchLabels: GRAFANA }, ["Ingress", "Egress"], undefined]);
     const egress = own.egress as { to: Record<string, unknown>[]; ports: { protocol: string; port: number }[] }[];
     assert.deepEqual(egress.map(({ ports }) => ports.map(({ protocol, port }) => `${protocol}/${port}`).join(",")), ["UDP/53,TCP/53", "TCP/5432", "TCP/8090", "TCP/443"]);
     assert.deepEqual(egress[3]?.to, [{ ipBlock: { cidr: "0.0.0.0/0", except: ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4"] } }]);
-    // Neither Neon's proxy nor the lake admits it as a pod of the stack: each does so on its port alone.
+    // Neither Neon's proxy nor the lake's readers admit it as a pod of the stack: each does so on its port alone.
     assert.equal(one<V1Deployment>(objects, "Deployment", "alasio-grafana").spec?.template.metadata?.labels?.["alasio.dev/stack"], undefined);
-    for (const [component, port] of [["neon-proxy", 5432], ["lake", 8090]] as const) {
+    for (const [component, port] of [["neon-proxy", 5432], ["lake-query", 8090]] as const) {
       assert.deepEqual(one<Policy>(objects, "NetworkPolicy", `alasio-${component}-from-grafana`).spec.ingress, [{ from: [{ podSelector: { matchLabels: GRAFANA } }], ports: [{ protocol: "TCP", port }] }]);
     }
   });
@@ -1280,7 +1373,7 @@ describe("telemetry", () => {
     const gateway = one<V1Deployment>(objects, "Deployment", "alasio-collector");
     assert.deepEqual(variable(gateway, "LOG_PASSWORD"), { name: "LOG_PASSWORD", valueFrom: { secretKeyRef: { name: "alasio-log-gateway", key: "password" } } });
     assert.deepEqual(one<V1Service>(objects, "Service", "alasio-collector").spec?.ports, [{ name: "otlp-http", port: 4318, targetPort: "otlp-http" }]);
-    assert.deepEqual(one<V1Service>(objects, "Service", "alasio-lake").spec?.ports?.map(({ name }) => name), ["metrics", "query"]);
+    assert.deepEqual(one<V1Service>(objects, "Service", "alasio-lake").spec?.ports?.map(({ name }) => name), ["query"]);
     // Its scraper sends what it scrapes to it, a minute's at a time, as the stack's.
     const scraper = scraperConfig(objects);
     assert.deepEqual(scraper.exporters, { "otlphttp/gateway": { endpoint: "http://alasio-collector:4318" } });
@@ -1335,9 +1428,9 @@ describe("telemetry", () => {
     assert.deepEqual(Object.keys(collectorConfig(install({ lake: { enabled: false }, telemetry })).exporters), ["otlphttp/external"]);
   });
 
-  test("has alasio, the lake and the compute export to the collector, and nothing export without it", () => {
+  test("has alasio, the lake's loader and readers and the compute export to the collector, and nothing export without it", () => {
     const objects = install({ telemetry: { otlpEndpoint: "https://otlp.example.com", resourceAttributes: "deployment.environment.name=prod" } });
-    for (const name of ["alasio", "alasio-lake", "alasio-neon-compute"]) {
+    for (const name of ["alasio", "alasio-lake-loader", "alasio-lake-query", "alasio-neon-compute"]) {
       const workload = one<V1Deployment>(objects, "Deployment", name);
       assert.deepEqual(variable(workload, "OTEL_EXPORTER_OTLP_ENDPOINT"), { name: "OTEL_EXPORTER_OTLP_ENDPOINT", value: COLLECTOR }, name);
       assert.deepEqual(variable(workload, "OTEL_EXPORTER_OTLP_PROTOCOL"), { name: "OTEL_EXPORTER_OTLP_PROTOCOL", value: "http/protobuf" }, name);
@@ -1347,17 +1440,6 @@ describe("telemetry", () => {
     const without = install({ lake: { enabled: false } });
     assert.equal(variable(one<V1Deployment>(without, "Deployment", "alasio"), "OTEL_EXPORTER_OTLP_ENDPOINT"), undefined);
     assert.deepEqual(variable(one<V1Deployment>(without, "Deployment", "alasio-neon-compute"), "OTEL_SDK_DISABLED"), { name: "OTEL_SDK_DISABLED", value: "true" });
-  });
-
-  test("keeps telemetry.retentionDays days of it in the lake", () => {
-    const lake = one<V1Deployment>(install({ telemetry: { retentionDays: 7 } }), "Deployment", "alasio-lake");
-    assert.deepEqual(variable(lake, "LAKE_RETENTION_DAYS"), { name: "LAKE_RETENTION_DAYS", value: "7" });
-  });
-
-  test("has the lake ask neon-control for Neon's branches, whose lakes read its files, with the token of its Secret", () => {
-    const lake = one<V1Deployment>(install(), "Deployment", "alasio-lake");
-    assert.deepEqual(variable(lake, "LAKE_BRANCHES_URL"), { name: "LAKE_BRANCHES_URL", value: "http://alasio-neon-control:8080/branches" });
-    assert.deepEqual(container(lake).envFrom, [{ secretRef: { name: "alasio-lake" } }]);
   });
 
   test("admits alasio, the node agents, folder workspaces' bayma, and branch environments' alasio, compute and lake to the collector, beside the stack", () => {
@@ -1386,7 +1468,7 @@ describe("telemetry", () => {
   test("scrapes each pod of every service of the stack, every minute, found in its namespace, so one that sleeps is not scraped", () => {
     const config = scraperConfig(install());
     const jobs: { job_name: string; scrape_interval: string }[] = config.receivers.prometheus.config.scrape_configs;
-    assert.deepEqual(jobs.map(({ job_name }) => job_name), ["compute", "lake", "lake-intake", "log", "neon-control", "pageserver", "proxy", "safekeeper", "storage-broker", "storage-controller", "webhook", "seaweedfs", "juicefs", "juicefs-csi"]);
+    assert.deepEqual(jobs.map(({ job_name }) => job_name), ["compute", "lake-intake", "lake-loader", "lake-query", "log", "neon-control", "pageserver", "proxy", "safekeeper", "storage-broker", "storage-controller", "webhook", "seaweedfs", "juicefs", "juicefs-csi"]);
     assert.deepEqual(jobs.find(({ job_name }) => job_name === "safekeeper"), {
       job_name: "safekeeper",
       scrape_interval: "60s",
@@ -1403,12 +1485,12 @@ describe("telemetry", () => {
     const compute = jobs.find(({ job_name }) => job_name === "compute") as unknown as { relabel_configs: { regex?: string; replacement?: string }[] };
     assert.deepEqual([compute.relabel_configs[0]?.regex, compute.relabel_configs[2]?.replacement], ["neon-compute|neon-compute-ro", "$$1:3080"]);
     // Each of neon-control's replicas among them, as any of them wakes a compute, and the proxy's.
-    assert.deepEqual(["lake", "lake-intake", "log", "neon-control", "pageserver", "proxy"].map(port), ["$$1:9464", "$$1:9464", "$$1:9464", "$$1:8080", "$$1:9898", "$$1:7001"]);
+    assert.deepEqual(["lake-loader", "lake-query", "lake-intake", "log", "neon-control", "pageserver", "proxy"].map(port), ["$$1:9464", "$$1:8090", "$$1:9464", "$$1:9464", "$$1:8080", "$$1:9898", "$$1:7001"]);
     for (const job of jobs) assert.equal(job.scrape_interval, "60s", job.job_name);
     assert.equal(config.receivers.redis.collection_interval, "60s");
-    // Without the lake, neither it nor its intake; the log, which carries Telegram's updates too, still.
+    // Without the lake, none of its parts; the log, which carries Telegram's updates too, still.
     const without: { job_name: string }[] = scraperConfig(install({ lake: { enabled: false }, telemetry: { otlpEndpoint: "https://otlp.example.com" } })).receivers.prometheus.config.scrape_configs;
-    assert.deepEqual(without.filter(({ job_name }) => ["lake", "lake-intake", "log"].includes(job_name)).map(({ job_name }) => job_name), ["log"]);
+    assert.deepEqual(without.filter(({ job_name }) => job_name.startsWith("lake") || job_name === "log").map(({ job_name }) => job_name), ["log"]);
   });
 
   test("scrapes JuiceFS's pods, found in the driver's namespace, and Valkey, with its password, when workspace storage is on", () => {
@@ -1622,24 +1704,42 @@ describe("the log", () => {
     assert.match(refusal({ log: { storage: { size: "1Gi" } }, lake: { intake: { scaling: { max: 4 } } } }), /^log\.storage\.size must be at least 2\.0 GiB: each of the telemetry topics' 12 partitions /u);
   });
 
-  test("gives each principal what it does alone: the gateway writes the telemetry topics, the intake reads them in its group, KEDA describes both, the webhook intake writes the Telegram topics, main's alasio reads its own", () => {
+  test("gives each principal what it does alone: the gateway writes the telemetry topics, the intake reads them in its group, KEDA describes both and the wake topics, the webhook intake writes the Telegram topics, main's alasio reads its own and writes its wake topic, main's loader reads that", () => {
     const access = JSON.parse(logConfig(install())["access.json"] ?? "");
     // Each telemetry topic flushed to the volume within a second, so a host's crash loses a second of what it acknowledged at most.
     assert.deepEqual(access.topics, [
       ...["otel.spans", "otel.logs", "otel.metrics"].map((name) => ({ name, partitions: 2, retentionMs: 259_200_000, retentionBytes: 448 * 1024 * 1024, configs: { "flush.ms": "1000" } })),
       // A week of main's Telegram updates, on one partition, as its one alasio reads them, within a segment beside the one it writes, each flushed as it is written.
       { name: "telegram.main", partitions: 1, retentionMs: 604_800_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
+      // A day of main's wake records, on one partition, as its one loader reads them, within a segment beside the one it writes.
+      { name: "lake.main", partitions: 1, retentionMs: 86_400_000, retentionBytes: 64 * 1024 * 1024, configs: {} },
     ]);
     const telemetry = { resource: "topic", name: "otel.", pattern: "prefixed" };
     const group = { resource: "group", name: "lake-intake", pattern: "literal" };
     assert.deepEqual(access.principals, [
       { name: "gateway", acls: [{ ...telemetry, operations: ["write", "describe"] }] },
       { name: "intake", acls: [{ ...telemetry, operations: ["read", "describe"] }, { ...group, operations: ["read"] }] },
-      { name: "scaler", acls: [{ ...telemetry, operations: ["describe"] }, { ...group, operations: ["describe"] }] },
+      {
+        name: "scaler",
+        acls: [
+          { ...telemetry, operations: ["describe"] },
+          { ...group, operations: ["describe"] },
+          { resource: "topic", name: "lake.", pattern: "prefixed", operations: ["describe"] },
+          { resource: "group", name: "lake-loader.", pattern: "prefixed", operations: ["describe"] },
+        ],
+      },
       { name: "webhook", acls: [{ resource: "topic", name: "telegram.", pattern: "prefixed", operations: ["write", "describe"] }] },
       {
         name: "alasio-main",
-        acls: [{ resource: "topic", name: "telegram.main", pattern: "literal", operations: ["read", "describe"] }, { resource: "group", name: "alasio.main", pattern: "literal", operations: ["read"] }],
+        acls: [
+          { resource: "topic", name: "telegram.main", pattern: "literal", operations: ["read", "describe"] },
+          { resource: "group", name: "alasio.main", pattern: "literal", operations: ["read"] },
+          { resource: "topic", name: "lake.main", pattern: "literal", operations: ["write", "describe"] },
+        ],
+      },
+      {
+        name: "loader-main",
+        acls: [{ resource: "topic", name: "lake.main", pattern: "literal", operations: ["read", "describe"] }, { resource: "group", name: "lake-loader.main", pattern: "literal", operations: ["read"] }],
       },
     ]);
     // Each one the stack's setup makes a password for, main's environment's among them.
@@ -1648,7 +1748,7 @@ describe("the log", () => {
     assert.equal(JSON.parse(logConfig(install({ lake: { intake: { scaling: { max: 5 } } } }))["access.json"] ?? "").topics[0].partitions, 5);
   });
 
-  test("admits the gateway, the intake, KEDA's operator, the webhook intake and alasio alone as its clients, its own nodes to its controllers, and the scraper to its metrics", () => {
+  test("admits the gateway, the intake, KEDA's operator, the webhook intake, alasio and the lake's loader alone as its clients, its own nodes to its controllers, and the scraper to its metrics", () => {
     const objects = install();
     const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
     const labelsOf = (kind: string, name: string) => one<V1Deployment | V1StatefulSet>(objects, kind, name).spec?.template.metadata?.labels ?? {};
@@ -1662,14 +1762,15 @@ describe("the log", () => {
         reach("alasio-keda-operator", 9092),
         reach("alasio-webhook", 9092),
         reach("alasio", 9092),
+        reach("alasio-lake-loader", 9092),
         reach("alasio-log", 9093, "StatefulSet"),
         reach("alasio-collector-scraper", 9464),
       ],
-      [true, true, true, true, true, true, true],
+      [true, true, true, true, true, true, true, true],
     );
-    // Not the lake, Neon, nor the scraper as a client, nor a client to the controllers.
+    // Not the lake's readers, Neon, nor the scraper as a client, nor a client to the controllers.
     assert.deepEqual(
-      [reach("alasio-lake", 9092), reach("alasio-neon-pageserver", 9092, "StatefulSet"), reach("alasio-collector-scraper", 9092), reach("alasio-collector", 9093), reach("alasio-webhook", 9093)],
+      [reach("alasio-lake-query", 9092), reach("alasio-neon-pageserver", 9092, "StatefulSet"), reach("alasio-collector-scraper", 9092), reach("alasio-collector", 9093), reach("alasio-webhook", 9093)],
       [false, false, false, false, false],
     );
     // The cluster's own KEDA's operator, where it scales alasio, in its namespace.
@@ -2454,7 +2555,7 @@ describe("branch environments", () => {
   const of = <T extends KubernetesObject>(kind: string, name: string, namespace = "alasio-branch-try") =>
     one<T>(branch.filter(({ metadata }) => metadata?.namespace === namespace || (kind === "Namespace" && metadata?.name === name)), kind, name);
 
-  test("are an alasio, a compute and a lake in a namespace of the branch's own, its sessions in another, everything labelled with the branch", () => {
+  test("are an alasio, a compute and a lake's loader in a namespace of the branch's own, its sessions in another, everything labelled with the branch", () => {
     assert.deepEqual(all<V1Namespace>(branch, "Namespace").map(({ metadata }) => [metadata?.name, metadata?.labels?.["alasio.dev/branch"]]), [
       ["alasio-branch-try", "try"],
       ["alasio-branch-try-sessions", "try"],
@@ -2466,9 +2567,9 @@ describe("branch environments", () => {
       ["ValidatingAdmissionPolicy", "alasio-branch-try-sandboxes"],
       ["ValidatingAdmissionPolicyBinding", "alasio-branch-try-sandboxes"],
     ]);
-    assert.deepEqual(all<V1Deployment>(branch, "Deployment").map(({ metadata }) => metadata?.name).sort(), ["alasio", "alasio-lake", "alasio-neon-compute", "alasio-neon-compute-ro"]);
+    assert.deepEqual(all<V1Deployment>(branch, "Deployment").map(({ metadata }) => metadata?.name).sort(), ["alasio", "alasio-lake-loader", "alasio-neon-compute", "alasio-neon-compute-ro"]);
     // Named as main's are, as each namespace is the branch's own.
-    assert.deepEqual(all<V1Service>(branch, "Service").map(({ metadata }) => metadata?.name).sort(), ["alasio-lake", "alasio-neon-compute", "alasio-neon-compute-ro", "alasio-telemetry"]);
+    assert.deepEqual(all<V1Service>(branch, "Service").map(({ metadata }) => metadata?.name).sort(), ["alasio-neon-compute", "alasio-neon-compute-ro", "alasio-telemetry"]);
   });
 
   test("run an alasio that knows it is the branch, asks main to fork what it inherited with its token, and sends its telemetry tagged with the branch", () => {
@@ -2516,19 +2617,21 @@ describe("branch environments", () => {
     assert.deepEqual(of<V1RoleBinding>("RoleBinding", "alasio-parent", "alasio-branch-try-sessions").subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
   });
 
-  test("run a compute on the branch's timeline, from main's neon-control, which alone scales it, and a lake that is never maintained", () => {
+  test("run a compute on the branch's timeline, from main's neon-control, which alone scales it, and a lake's loader woken on the branch's wake topic, and never maintained", () => {
     const compute = of<V1Deployment>("Deployment", "alasio-neon-compute");
     const args = container(compute).args ?? [];
     assert.equal(args[args.indexOf("--compute-id") + 1], "branch-try");
     assert.equal(args[args.indexOf("--control-plane-uri") + 1], "http://alasio-neon-control.alasio.svc:8080");
-    const lake = of<V1Deployment>("Deployment", "alasio-lake");
-    assert.equal(variable(lake, "LAKE_MAINTENANCE_HOURS"), "0");
-    assert.equal(variable(lake, "LAKE_BRANCHES_URL"), undefined);
-    // Nor has it a query endpoint, as it has no Grafana.
-    assert.deepEqual(lake.spec?.template.spec?.containers.map(({ name }) => name), ["lake"]);
-    assert.deepEqual(of<V1Service>("Service", "alasio-lake").spec?.ports?.map(({ name }) => name), ["metrics"]);
-    // Nor an intake: what it sends is written to main's lake.
-    assert.deepEqual(branch.filter(({ metadata }) => metadata?.name?.includes("intake")), []);
+    const lake = of<V1Deployment>("Deployment", "alasio-lake-loader");
+    assert.deepEqual([variable(lake, "LAKE_WAKE_TOPIC"), variable(lake, "LAKE_WAKE_GROUP")], ["lake.try", "lake-loader.try"]);
+    assert.deepEqual(container(lake).env?.find(({ name }) => name === "LOG_USERNAME")?.valueFrom?.secretKeyRef, { name: "alasio-log-loader", key: "username" });
+    assert.equal(variable(of<V1Deployment>("Deployment", "alasio"), "ALASIO_LAKE_WAKE_TOPIC"), "lake.try");
+    assert.deepEqual(of<ScaledObject>("ScaledObject", "alasio-lake-loader").spec.triggers.map(({ metadata }) => [metadata["consumerGroup"], metadata["topic"]]), [["lake-loader.try", "lake.try"]]);
+    // KEDA reads it as the scaler, from the Secret's copy in the branch's namespace.
+    assert.ok(of("TriggerAuthentication", "alasio-lake-loader"));
+    // Nor has it maintenance, readers, as it has no Grafana, or an intake: what it sends is written to main's lake.
+    assert.deepEqual(branch.filter(({ kind }) => kind === "CronJob"), []);
+    assert.deepEqual(branch.filter(({ metadata }) => /lake-(query|intake|maintenance|merge)/u.test(metadata?.name ?? "")), []);
     assert.deepEqual(branch.filter(({ metadata }) => metadata?.name?.includes("grafana")), []);
     // Its compute, through main's Neon proxy.
     assert.deepEqual([variable(lake, "LAKE_DATABASE_HOST"), variable(lake, "LAKE_DATABASE_PORT"), variable(lake, "LAKE_DATABASE_ENDPOINT")], ["alasio-neon-proxy.alasio.svc", "5432", "branch-try"]);
@@ -2546,12 +2649,12 @@ describe("branch environments", () => {
     assert.deepEqual([variable(control, "NEON_PAGESERVERS"), variable(control, "NEON_SHARDS")], ["1", "1"]);
   });
 
-  test("run a read replica of the branch's compute, which its lake loads from", () => {
+  test("run a read replica of the branch's compute, which its lake's loader loads from", () => {
     const replica = of<V1Deployment>("Deployment", "alasio-neon-compute-ro");
     const args = container(replica).args ?? [];
     assert.equal(args[args.indexOf("--compute-id") + 1], "branch-try-ro");
     assert.equal(replica.spec?.replicas, undefined);
-    assert.equal(variable(of<V1Deployment>("Deployment", "alasio-lake"), "LAKE_SOURCE_ENDPOINT"), "branch-try-ro");
+    assert.equal(variable(of<V1Deployment>("Deployment", "alasio-lake-loader"), "LAKE_SOURCE_ENDPOINT"), "branch-try-ro");
     assert.ok(of<KubernetesObject>("NetworkPolicy", "alasio-neon-compute-ro"));
   });
 
@@ -2580,13 +2683,14 @@ describe("branch environments", () => {
     const branchPods = {
       alasio: podOf(branch, "alasio", "alasio-branch-try"),
       compute: podOf(branch, "alasio-neon-compute", "alasio-branch-try"),
-      lake: podOf(branch, "alasio-lake", "alasio-branch-try"),
+      lake: podOf(branch, "alasio-lake-loader", "alasio-branch-try"),
       session: { namespace: "alasio-branch-try-sessions", namespaceLabels: { ...namespaces.get("alasio-branch-try-sessions"), "kubernetes.io/metadata.name": "alasio-branch-try-sessions" }, labels: { "alasio.dev/workload": "session" } },
     };
     const targets: [string, Pod, number][] = [
       ["main's compute", podOf(main, "alasio-neon-compute", "alasio"), 55433],
       ...[4318, 4319].map((port): [string, Pod, number] => [`main's alasio on ${port}`, podOf(main, "alasio", "alasio"), port]),
-      ...[4318, 8090, 9464].map((port): [string, Pod, number] => [`main's lake on ${port}`, podOf(main, "alasio-lake", "alasio"), port]),
+      [`main's lake's readers`, podOf(main, "alasio-lake-query", "alasio"), 8090],
+      [`main's lake's loader`, podOf(main, "alasio-lake-loader", "alasio"), 9464],
     ];
     const reached = Object.entries(branchPods).flatMap(([from, pod]) =>
       targets.filter(([, target, port]) => admits(policies, pod, target, port)).map(([to]) => `${from} → ${to}`)
@@ -2606,12 +2710,14 @@ describe("branch environments", () => {
     };
     const clients: [string, Pod][] = [
       ["main's alasio", podOf(main, "alasio", "alasio")],
-      ["main's lake", podOf(main, "alasio-lake", "alasio")],
+      ["main's lake's loader", podOf(main, "alasio-lake-loader", "alasio")],
+      ["main's lake's readers", podOf(main, "alasio-lake-query", "alasio")],
+      ["main's lake's maintenance", podIn("alasio", one<V1CronJob>(main, "CronJob", "alasio-lake-maintenance").spec?.jobTemplate.spec?.template.metadata?.labels)],
       ["main's lake intake", podOf(main, "alasio-lake-intake", "alasio")],
       ["main's Grafana", podOf(main, "alasio-grafana", "alasio")],
       ["main's backup", podIn("alasio", one<V1CronJob>(main, "CronJob", "alasio-neon-backup").spec?.jobTemplate.spec?.template.metadata?.labels)],
       ["the branch's alasio", podOf(branch, "alasio", "alasio-branch-try")],
-      ["the branch's lake", podOf(branch, "alasio-lake", "alasio-branch-try")],
+      ["the branch's lake's loader", podOf(branch, "alasio-lake-loader", "alasio-branch-try")],
     ];
     const proxy = podOf(main, "alasio-neon-proxy", "alasio");
     const control = podOf(main, "alasio-neon-control", "alasio");
@@ -2698,7 +2804,9 @@ describe("scaling", () => {
     for (const [name, priorityClassName] of [...tiers, ...podSpecs(branchObjects(configOf(), "try")).map(([name, spec]) => [name, spec.priorityClassName])]) {
       assert.ok(priorityClassName && (classes.has(priorityClassName) || priorityClassName.startsWith("system-")), name);
     }
-    assert.deepEqual(["alasio-seaweedfs", "alasio-grafana", "alasio-collector", "alasio-lake"].map((name) => tiers.get(name)), Array(4).fill("alasio-floor"));
+    assert.deepEqual(["alasio-seaweedfs", "alasio-grafana", "alasio-collector", "alasio-lake-query"].map((name) => tiers.get(name)), Array(4).fill("alasio-floor"));
+    // The lake's loader sleeps, and its maintenance waits a pass.
+    assert.deepEqual(["alasio-lake-loader", "alasio-lake-maintenance", "alasio-lake-merge"].map((name) => tiers.get(name)), Array(3).fill("alasio-component"));
     // Above the floor, exactly its StatefulSets whose claims hold them to a node; a branch has none.
     const held = (of: readonly KubernetesObject[]) =>
       all<V1StatefulSet>(of, "StatefulSet").filter(({ spec }) => (spec?.volumeClaimTemplates?.length ?? 0) > 0).map(({ metadata }) => metadata?.name).sort();
@@ -2720,9 +2828,9 @@ describe("scaling", () => {
     assert.equal(tiers.get("alasio-neon-compute-ro"), "alasio-component");
     assert.deepEqual(["alasio-neon-setup", "alasio-neon-backup", "clone"].map((name) => tiers.get(name)), Array(3).fill("alasio-component"));
     assert.deepEqual(["alasio", "session", "folder-bayma"].map((name) => tiers.get(name)), Array(3).fill("alasio-turn"));
-    // A branch's alasio runs turns; its lake serves no alert, and its compute sleeps.
+    // A branch's alasio runs turns; its lake's loader and its compute sleep.
     const branch = new Map(podSpecs(branchObjects(configOf(), "try")).map(([name, spec]) => [name, spec.priorityClassName]));
-    assert.deepEqual(["alasio", "alasio-lake", "alasio-neon-compute"].map((name) => branch.get(name)), ["alasio-turn", "alasio-component", "alasio-component"]);
+    assert.deepEqual(["alasio", "alasio-lake-loader", "alasio-neon-compute"].map((name) => branch.get(name)), ["alasio-turn", "alasio-component", "alasio-component"]);
   });
 
   test("lets alasio's pods take others' places only on a cluster it makes, unless told, and keeps no headroom where they may not", () => {

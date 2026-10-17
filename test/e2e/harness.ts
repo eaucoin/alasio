@@ -51,7 +51,9 @@ import {
   type KubernetesObject,
   PortForward,
   type V1ConfigMap,
+  type V1CronJob,
   type V1Deployment,
+  type V1Job,
   type V1NetworkPolicy,
   type V1Node,
   type V1Pod,
@@ -239,7 +241,8 @@ export async function alasioOk(...args: string[]): Promise<string> {
 export async function alasioOkWith(env: NodeJS.ProcessEnv, ...args: string[]): Promise<string> {
   const { bin } = current();
   const ran = await capture(spawn(bin, args, { env: { ...current().env, ...env }, stdio: ["ignore", "pipe", "pipe"] }));
-  if (ran.code !== 0) throw new Error(`alasio ${args.join(" ")} exited with ${ran.code}:\n${ran.stderr}`);
+  // What it printed too, as status's list of what is not ready.
+  if (ran.code !== 0) throw new Error(`alasio ${args.join(" ")} exited with ${ran.code}:\n${ran.stderr}${ran.stdout ? `printed:\n${ran.stdout}` : ""}`);
   return ran.stdout;
 }
 
@@ -435,6 +438,32 @@ export const kube = {
   },
 };
 
+/** Runs a Job of the CronJob's template, as one it starts on its schedule is, until it completes: what its pods logged. */
+export async function runCronJob(cronJob: string): Promise<string> {
+  const name = `${cronJob}-e2e-${Date.now()}`;
+  const template = (await kube.get<V1CronJob>(ref("CronJob", cronJob, NAMESPACE)))?.spec?.jobTemplate;
+  if (!template?.spec) throw new Error(`there is no CronJob ${cronJob}`);
+  const job: V1Job = { apiVersion: "batch/v1", kind: "Job", metadata: { name, namespace: NAMESPACE, labels: template.metadata?.labels ?? {} }, spec: template.spec };
+  await kube.apply(job);
+  const logs = async () => {
+    const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "job-name": name }) });
+    const logged = await Promise.all(pods.flatMap((pod) =>
+      [...(pod.spec?.initContainers ?? []), ...(pod.spec?.containers ?? [])].map((container) =>
+        kube.logs(NAMESPACE, pod.metadata?.name ?? "", container.name).catch((error: unknown) => (error instanceof Error ? error.message : String(error)))
+      )
+    ));
+    return logged.join("");
+  };
+  try {
+    await kube.awaitReady([ref("Job", name, NAMESPACE)], "10 minutes").catch(async (error: unknown) => {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}\n${await logs()}`);
+    });
+    return await logs();
+  } finally {
+    await kube.remove(ref("Job", name, NAMESPACE)).catch(() => {});
+  }
+}
+
 /** The namespace of session filesystems' Sandboxes. */
 export const SESSIONS = "alasio-sessions";
 
@@ -610,9 +639,16 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       },
     },
     lake: {
-      resources: { requests: { cpu: "20m", memory: "256Mi" } },
-      query: { resources: { requests: { cpu: "10m", memory: "128Mi" } } },
-      ...(of === "release" ? { intake: { resources: { requests: { cpu: "20m", memory: "128Mi" } } } } : {}),
+      ...(of === "previous"
+        ? { resources: { requests: { cpu: "20m", memory: "256Mi" } }, query: { resources: { requests: { cpu: "10m", memory: "128Mi" } } } }
+        : {
+          // In the upgrade shard, the release before's lake's, which the cut-over makes its loader's.
+          ...(SHARD === "upgrade" ? {} : { loader: { resources: { requests: { cpu: "20m", memory: "256Mi" } } } }),
+          maintenance: { resources: { requests: { cpu: "10m", memory: "128Mi" } } },
+          // As many as two, so the run sees them scale out.
+          query: { scaling: { min: 1, max: 2 }, resources: { requests: { cpu: "10m", memory: "128Mi" } } },
+          intake: { resources: { requests: { cpu: "20m", memory: "128Mi" } } },
+        }),
     },
     // Two, where the run proves Grafana highly available.
     grafana: { ...(inShard("scaling") ? { scaling: { min: 2, max: 2 } } : {}), resources: { requests: { cpu: "20m", memory: "192Mi" } } },
@@ -884,7 +920,7 @@ export async function dumpClusterState(): Promise<void> {
         for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
       }
     }
-    const waking = new Set(["neon-proxy", "neon-control", "neon-compute", "lake", "lake-intake"]);
+    const waking = new Set(["neon-proxy", "neon-control", "neon-compute", "lake-loader", "lake-query", "lake-intake"]);
     const restarts = (pod: V1Pod) => (pod.status?.containerStatuses ?? []).some(({ restartCount }) => restartCount > 0);
     const told = (pod: V1Pod) => waking.has(pod.metadata?.labels?.["app.kubernetes.io/component"] ?? "") || restarts(pod);
     for (const pod of pods.filter((each) => each.status?.phase === "Running" && told(each) && podProblems(each).length === 0)) {

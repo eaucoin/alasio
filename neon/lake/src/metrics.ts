@@ -1,8 +1,9 @@
 /**
  * The lake's own metrics, in Prometheus's text format, for the stack's telemetry
- * collector to scrape (cli/src/manifests/collector.ts): how the lake service's loads and
- * maintenance go, and the telemetry intake's batches (each a process of its own), how much
- * each changed, and the memory the process holds.
+ * collector to scrape (cli/src/manifests/collector.ts): how the loader's loads go, the
+ * telemetry intake's batches and the query endpoint's queries (each a process of its
+ * own), how much each changed, and the memory the process holds. Maintenance's passes,
+ * each a process of its own that ends, are said by their Jobs.
  */
 
 interface Metric {
@@ -15,19 +16,20 @@ const METRICS = {
   lake_rows_total: { type: "counter", help: "Rows loaded into or deleted from the lake, by table and change" },
   lake_cycle_duration_seconds: { type: "gauge", help: "How long the last load took" },
   lake_last_success_timestamp_seconds: { type: "gauge", help: "When a load last succeeded" },
-  lake_maintenance_total: { type: "counter", help: "Maintenance passes run, by outcome, and whether they deleted files or kept them for Neon's branches" },
+  lake_wake_records_malformed_total: { type: "counter", help: "Records of the wake topic the loader could not read a WAL position of, which it loaded for without waiting for their writes" },
   lake_telemetry_records_total: { type: "counter", help: "Records of the log's the telemetry intake consumed, by topic and outcome: written, malformed, or repeated (written before)" },
   lake_telemetry_batches_total: { type: "counter", help: "Batches the telemetry intake failed to write, which it reads again" },
   lake_telemetry_commit_seconds: { type: "gauge", help: "How long the telemetry intake's last commit to the lake took" },
-  lake_telemetry_merges_total: { type: "counter", help: "Hourly merges of the telemetry's files, by outcome" },
   lake_telemetry_rows_total: { type: "counter", help: "Rows the telemetry intake wrote, by table" },
   lake_telemetry_duplicate_rows_total: { type: "counter", help: "Rows the telemetry intake did not write as the lake has them, by table: what the log holds twice" },
   lake_telemetry_reread_gaps_total: { type: "counter", help: "Rereads of what the lake lost, by signal, that the log no longer held all of, its retention past it" },
   lake_telemetry_reread_gap_seconds: { type: "gauge", help: "The time the last such reread could not refill, by signal, in seconds" },
   lake_telemetry_lag_records: { type: "gauge", help: "Records the telemetry intake's group has yet to read, by topic, as a member last asked the log" },
+  lake_query_queue: { type: "gauge", help: "Queries the query endpoint has taken and not answered yet, running and waiting" },
+  lake_queries_total: { type: "counter", help: "Queries the query endpoint answered, by status" },
   lake_resident_memory_bytes: { type: "gauge", help: "The process's resident memory, what its container's memory limit counts" },
   lake_heap_used_bytes: { type: "gauge", help: "What V8's heap holds" },
-  lake_duckdb_memory_bytes: { type: "gauge", help: "What the buffer manager of its DuckDB, the loader's or the intake's, holds; 0 while it is not open" },
+  lake_duckdb_memory_bytes: { type: "gauge", help: "What the buffer manager of its DuckDB, the loader's, the intake's or the reader's, holds; 0 while it is not open" },
 } satisfies Record<string, Metric>;
 
 export type MetricName = keyof typeof METRICS;

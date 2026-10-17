@@ -21,6 +21,7 @@ import {
   given,
   grafanaRuns,
   labels,
+  lakeRuns,
   MAIN_ENVIRONMENT,
   NAMESPACE,
   nodeAgentRuns,
@@ -30,7 +31,7 @@ import {
 import type { InstallConfig } from "./config.ts";
 import { replicated } from "./disruption.ts";
 import { GOSSIP_PORT } from "./grafana.ts";
-import { INTAKE_COMPONENT, LAKE_QUERY_PORT } from "./lake.ts";
+import { INTAKE_COMPONENT, LAKE_QUERY_PORT, LOADER_COMPONENT, QUERY_COMPONENT } from "./lake.ts";
 import { LOG, LOG_COMPONENT, LOG_CONTROLLER_PORT, LOG_METRICS_PORT, LOG_PORT } from "./log.ts";
 import { WEBHOOK, WEBHOOK_COMPONENT, WEBHOOK_HEALTH_PORT } from "./webhook.ts";
 import {
@@ -311,19 +312,25 @@ function filerStorePolicies(): NetworkPolicy[] {
 }
 
 /**
+ * KEDA's operator, which reads what it scales on: alasio's, or, where the cluster's own KEDA
+ * scales alasio (autoscaling.keda.enabled false), the operator its release manifest
+ * labels, in any namespace.
+ */
+const kedaOperator = (config: InstallConfig): V1NetworkPolicyPeer =>
+  config.autoscaling.keda.enabled
+    ? { podSelector: { matchLabels: selectorLabels("keda-operator") } }
+    : { namespaceSelector: {}, podSelector: { matchLabels: { "app.kubernetes.io/name": "keda-operator" } } };
+
+/**
  * The log takes its clients on their port from the collector's gateway and the webhook
- * intake, which write to it, and the lake's intake, KEDA's operator, and each
- * environment's alasio, main's and branch environments', which read it, alone; its controllers'
- * port, and its clients' as its brokers reach each other, from its own nodes; and its
- * metrics port from the collector's scraper. KEDA's operator is alasio's, or, where the
- * cluster's own KEDA scales alasio (autoscaling.keda.enabled false), the operator its
- * release manifest labels, in any namespace.
+ * intake, which write to it, and the lake's intake, KEDA's operator (kedaOperator), and
+ * each environment's alasio and lake loader, main's and branch environments', which read
+ * it, alone; its controllers' port, and its clients' as its brokers reach each other,
+ * from its own nodes; and its metrics port from the collector's scraper.
  */
 function logPolicy(config: InstallConfig): NetworkPolicy {
   const of = (component: string): V1NetworkPolicyPeer => ({ podSelector: { matchLabels: selectorLabels(component) } });
-  const operator: V1NetworkPolicyPeer = config.autoscaling.keda.enabled
-    ? of("keda-operator")
-    : { namespaceSelector: {}, podSelector: { matchLabels: { "app.kubernetes.io/name": "keda-operator" } } };
+  const operator = kedaOperator(config);
   return policy(LOG, NAMESPACE, LOG_COMPONENT, {
     podSelector: { matchLabels: selectorLabels(LOG_COMPONENT) },
     policyTypes: ["Ingress"],
@@ -336,7 +343,9 @@ function logPolicy(config: InstallConfig): NetworkPolicy {
           of(INTAKE_COMPONENT),
           operator,
           of("alasio"),
+          of(LOADER_COMPONENT),
           { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } },
+          { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels(LOADER_COMPONENT) } },
         ],
         ports: [{ protocol: "TCP", port: LOG_PORT }],
       },
@@ -424,14 +433,23 @@ function grafanaPolicies({ sessions, grafana: { scaling } }: InstallConfig): Net
         ...(gossip.length > 0 ? [{ to: [grafana], ports: gossip }] : []),
         CLUSTER_DNS,
         { to: [{ podSelector: { matchLabels: selectorLabels("neon-proxy") } }], ports: [{ protocol: "TCP", port: PROXY_PORT }] },
-        { to: [{ podSelector: { matchLabels: selectorLabels("lake") } }], ports: [{ protocol: "TCP", port: LAKE_QUERY_PORT }] },
+        { to: [{ podSelector: { matchLabels: selectorLabels(QUERY_COMPONENT) } }], ports: [{ protocol: "TCP", port: LAKE_QUERY_PORT }] },
         // The addresses sessions with internet may not reach, the cluster's and its network's, are Grafana's too.
         { to: [{ ipBlock: { cidr: "0.0.0.0/0", except: [...sessions.blockedCidrs] } }], ports: [{ protocol: "TCP", port: 443 }] },
       ],
     }),
     admitted("neon-proxy", PROXY_PORT),
-    admitted("lake", LAKE_QUERY_PORT),
+    admitted(QUERY_COMPONENT, LAKE_QUERY_PORT),
   ];
+}
+
+/** The lake's readers take KEDA's operator on their query port, which asks any of them how many queries the pool has not answered (their /pool). */
+function lakeQueryPolicy(config: InstallConfig): NetworkPolicy {
+  return policy(componentName(`${QUERY_COMPONENT}-from-autoscaler`), NAMESPACE, QUERY_COMPONENT, {
+    podSelector: { matchLabels: selectorLabels(QUERY_COMPONENT) },
+    policyTypes: ["Ingress"],
+    ingress: [{ from: [kedaOperator(config)], ports: [{ protocol: "TCP", port: LAKE_QUERY_PORT }] }],
+  });
 }
 
 /**
@@ -520,6 +538,7 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
     webhookPolicy(config),
     ...(collectorRuns(config) ? [collectorPolicy(config)] : []),
     ...(grafanaRuns(config) ? grafanaPolicies(config) : []),
+    ...(lakeRuns(config) ? [lakeQueryPolicy(config)] : []),
     ...(config.workspaceStorage.enabled ? workspaceStoragePolicies(config) : []),
     ...(nodeAgentRuns(config) ? nodeAgentPolicies(config) : []),
   ];

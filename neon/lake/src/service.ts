@@ -1,40 +1,28 @@
 /**
- * The lake service: the stack's container that keeps the analytics lake loaded from
- * alasio's Neon (model.ts), maintains it, and merges the telemetry's files hourly, which
- * the telemetry intake writes (intake-service.ts, a Deployment of its own). One loads at a
- * time, which a Postgres advisory lock on the catalog makes sure of, and its writes take
- * turns with the intake's under the lake's write lock (lake.ts); DuckDB keeps nothing of
- * its own, so the container is replaceable at any moment, and the loader opens its
- * connections again whenever they fail, as when the compute restarts.
+ * The loader's service: a replica of `lake-loader` (cli/src/manifests/lake.ts), which
+ * keeps the analytics lake loaded from alasio's Neon (model.ts) while alasio says it wrote
+ * transcripts, and sleeps otherwise (loader.ts). One load runs at a time, its or a
+ * reconciliation's, which a Postgres advisory lock on the catalog makes sure of, taken for
+ * each, and its writes take turns with every other writer's of the lake under its write
+ * lock (lake.ts); DuckDB keeps nothing of its own, so
+ * the container is replaceable at any moment, and the loader opens its connections again
+ * whenever they fail, as when the compute restarts.
  *
- * It serves /healthz and /readyz (its pod's liveness and readiness: loads are not failing
- * for long) and /metrics (Prometheus, for the stack's telemetry collector) on
- * LAKE_HTTP_PORT. It logs a JSON line per event, and exports each as telemetry too
- * (telemetry.ts). The lake is read through the query endpoint (endpoint.ts), a process of
- * its own beside this one.
+ * It serves /healthz (its liveness: loads are not failing for long), /readyz (it holds the
+ * lake open, and its member of the group) and /metrics (Prometheus, for the
+ * stack's telemetry collector) on LAKE_HTTP_PORT. It logs a JSON line per event, and
+ * exports each as telemetry too (telemetry.ts). The lake is maintained by maintain.ts, and
+ * read through the query endpoint (endpoint.ts), each a process of its own.
  */
 import { createServer } from "node:http";
-import { setTimeout as sleep } from "node:timers/promises";
+import { hostname } from "node:os";
 
-import pg from "pg";
-
-import { branchesBesideMain } from "./branches.ts";
-import { type DatabaseConfig, loadConfig } from "./config.ts";
-import { CONNECT_TIMEOUT_MS, type Lake, openLake, writeLock } from "./lake.ts";
-import { type LoaderLake, startLoader } from "./loader.ts";
+import { loadConfig } from "./config.ts";
+import { type Lake, writeLock } from "./lake.ts";
+import { type LoaderLake, openLoaderLake, startLoader } from "./loader.ts";
+import { joinLog } from "./log.ts";
 import { createMetrics, sampleMemory } from "./metrics.ts";
-import { prepareLake } from "./sync.ts";
 import { startTelemetry } from "./telemetry.ts";
-
-/** Names the one loader's advisory lock, in the catalog database. */
-const LOCK = "alasio.lake.loader";
-const LOCK_RETRY_MS = 10_000;
-
-/** The loader's lock: the connection holding it, and whether that has since been lost. */
-interface LoaderLock {
-  client: pg.Client;
-  lost: () => boolean;
-}
 
 const telemetry = startTelemetry();
 
@@ -43,85 +31,33 @@ function log(message: string, fields: Record<string, unknown> = {}): void {
   telemetry?.emit(message, fields);
 }
 
-/**
- * Takes the loader's lock, waiting while another loader holds it, so two never load
- * the same entries. Resolves `{ client, lost() }`: the connection holding it, and
- * whether that connection, and so the lock, has since been lost.
- */
-async function takeLock(catalog: DatabaseConfig, signal: AbortSignal): Promise<LoaderLock> {
-  const client = new pg.Client({ ...catalog, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
-  let lost = false;
-  client.on("error", (error) => {
-    lost = true;
-    log("lost the loader lock's connection", { error: error.message });
-  });
-  client.on("end", () => {
-    lost = true;
-  });
-  try {
-    await client.connect();
-    for (let attempt = 0; ; attempt += 1) {
-      const { rows } = await client.query<{ held: boolean }>("select pg_try_advisory_lock(hashtext($1)) as held", [LOCK]);
-      // A select of a function is one row.
-      if (rows[0]!.held) return { client, lost: () => lost };
-      if (attempt % 6 === 0) log("another loader holds the lock; waiting");
-      await sleep(LOCK_RETRY_MS, undefined, { signal });
-    }
-  } catch (error) {
-    await client.end().catch(() => {});
-    throw error;
-  }
-}
-
 const config = loadConfig();
 writeLock(config.catalog);
 
 /** The lake as the loader has it open now, whose DuckDB's memory /metrics reports. */
 const opened: Record<"loader", Lake | null> = { loader: null };
 
-/** Opens the lake for loading, under the lock, its model made ready. */
+/** The lake opened for loading (loader.ts's openLoaderLake), whose DuckDB /metrics reports while it is open. */
 async function open(signal: AbortSignal): Promise<LoaderLake> {
-  const lock = await takeLock(config.catalog, signal);
-  let lake: Lake | undefined;
-  try {
-    lake = await openLake(config, { source: config.source });
-    const rebuilt = await prepareLake(lake.db);
-    log(rebuilt ? "lake built, to be loaded from the source" : "lake open");
-  } catch (error) {
-    lake?.close();
-    await lock.client.end().catch(() => {});
-    throw error;
-  }
-  opened.loader = lake;
+  const held = await openLoaderLake(config, log, signal);
+  opened.loader = held.lake;
   return {
-    db: lake.db,
-    lost: lock.lost,
+    ...held,
     async close() {
       opened.loader = null;
-      lake.close();
-      await lock.client.end().catch(() => {});
+      await held.close();
     },
   };
 }
 
 const metrics = createMetrics();
-const { branches } = config;
-const loader = startLoader({
-  open,
-  metrics,
-  log,
-  intervalMs: config.intervalMs,
-  maintenanceIntervalMs: config.maintenanceIntervalMs,
-  retentionDays: config.retentionDays,
-  ...(branches ? { branches: () => branchesBesideMain(branches) } : {}),
-  // A branch environment's lake, never maintained, holds no telemetry to merge.
-  ...(config.maintenanceIntervalMs === null ? { mergeIntervalMs: null } : {}),
-});
+const loader = startLoader({ open, join: () => joinLog(config.log, config.wake.group, [config.wake.topic], hostname()), metrics, log });
 
 const server = createServer((request, response) => {
   if (request.method === "GET" && (request.url === "/healthz" || request.url === "/readyz")) {
     const { ok, detail } = loader.health();
-    response.writeHead(ok ? 200 : 503, { "content-type": "text/plain" }).end(`loader: ${detail}\n`);
+    const well = request.url === "/healthz" ? ok : ok && loader.ready();
+    response.writeHead(well ? 200 : 503, { "content-type": "text/plain" }).end(`loader: ${detail}\n`);
     return;
   }
   if (request.method === "GET" && request.url === "/metrics") {

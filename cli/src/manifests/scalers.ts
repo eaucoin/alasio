@@ -31,6 +31,11 @@ export interface ScaledObject extends KubernetesObject {
     readonly maxReplicaCount: number;
     readonly triggers: readonly Trigger[];
   };
+  /** As KEDA reports it: whether it is ready, active or paused, and when it last became active. */
+  readonly status?: {
+    readonly conditions?: readonly { readonly type: string; readonly status: string; readonly reason?: string; readonly message?: string }[];
+    readonly lastActiveTime?: string;
+  };
 }
 
 /**

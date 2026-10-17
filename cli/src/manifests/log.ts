@@ -70,23 +70,49 @@ export const alasioPrincipal = (name: string): string => `alasio-${name}`;
 /** The consumer group the environment `name`'s alasio reads its Telegram topic in. */
 export const alasioGroup = (name: string): string => `alasio.${name}`;
 
+/** How long an environment's wake records are kept: a day, long past its lake loader's waking at the first. */
+export const WAKE_RETENTION_MS = 86_400_000;
+/** The topic the environment `name`'s alasio writes as it commits transcripts, which wakes its lake loader. */
+export const lakeWakeTopic = (name: string): string => `lake.${name}`;
+/** The principal the environment `name`'s lake loader reaches the log as. */
+export const loaderPrincipal = (name: string): string => `loader-${name}`;
+/** The consumer group the environment `name`'s lake loader reads its wake topic in. */
+export const loaderGroup = (name: string): string => `lake-loader.${name}`;
+
 /**
  * What the log gives the environment `name`: a principal for each of its components that
  * reaches the log, each with what it may do alone, and the topics they use, made and
- * forgotten with the environment. Now its alasio's, `alasio-<name>`, reading its Telegram
- * topic in its group, `alasio.<name>`; that topic, of one partition, as one alasio reads it,
- * a chat's updates in order, keeping a segment beside the one it writes at most (a week of
- * a bot's updates is kilobytes), each flushed to the volume as it is written.
+ * forgotten with the environment. Its alasio's, `alasio-<name>`, reading its Telegram
+ * topic in its group, `alasio.<name>`, and writing its wake topic, `lake.<name>`, as it
+ * commits transcripts; its lake loader's, `loader-<name>`, reading the wake topic in its
+ * group, `lake-loader.<name>`; those topics, of one partition each, as one alasio and one
+ * loader read them, a chat's updates in order, each keeping a segment beside the one it
+ * writes at most: a week of a bot's updates, and a day of wakes, is kilobytes. Each update
+ * is flushed to the volume as it is written; a wake, lost, costs nothing.
  */
 export function environmentAccess(name: string): EnvironmentLogAccess {
   const topic = telegramTopic(name);
+  const wake = lakeWakeTopic(name);
   return {
-    principals: [{
-      name: alasioPrincipal(name),
-      acls: [{ resource: "topic", name: topic, pattern: "literal", operations: ["read", "describe"] }, { resource: "group", name: alasioGroup(name), pattern: "literal", operations: ["read"] }],
-    }],
-    // Each update flushed to the volume as it is written: Telegram, answered once the log has it, sends it no more.
-    topics: [{ name: topic, partitions: 1, retentionMs: TELEGRAM_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: { "flush.messages": "1" } }],
+    principals: [
+      {
+        name: alasioPrincipal(name),
+        acls: [
+          { resource: "topic", name: topic, pattern: "literal", operations: ["read", "describe"] },
+          { resource: "group", name: alasioGroup(name), pattern: "literal", operations: ["read"] },
+          { resource: "topic", name: wake, pattern: "literal", operations: ["write", "describe"] },
+        ],
+      },
+      {
+        name: loaderPrincipal(name),
+        acls: [{ resource: "topic", name: wake, pattern: "literal", operations: ["read", "describe"] }, { resource: "group", name: loaderGroup(name), pattern: "literal", operations: ["read"] }],
+      },
+    ],
+    topics: [
+      // Each update flushed to the volume as it is written: Telegram, answered once the log has it, sends it no more.
+      { name: topic, partitions: 1, retentionMs: TELEGRAM_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: { "flush.messages": "1" } },
+      { name: wake, partitions: 1, retentionMs: WAKE_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: {} },
+    ],
   };
 }
 
@@ -102,6 +128,9 @@ export const logPrincipalSecret = (principal: LogPrincipal): string => component
  * command line writes as it makes the branch's principal.
  */
 export const environmentLogSecret = ({ branch }: Environment): string => (branch === null ? logPrincipalSecret("alasio-main") : componentName("log-alasio"));
+
+/** The Secret of the principal the lake loader of `environment` reads its wake topic as, in its namespace: main's, which the stack's setup writes; a branch environment's, which alasio's command line writes. */
+export const loaderLogSecret = ({ branch }: Environment): string => (branch === null ? logPrincipalSecret("loader-main") : componentName("log-loader"));
 
 /** A node's address, by its ordinal: its pod's name in the log's headless Service. */
 const nodeAddress = (ordinal: number | string): string => `${LOG}-${ordinal}.${LOG}.${NAMESPACE}.svc`;
@@ -155,10 +184,10 @@ const retentionMs = (retention: string): number => Number(retention.slice(0, -1)
  * runs replicas at most, so each has one to read, each partition keeping its share of the
  * volume at most (telemetryRetentionBytes), each flushed to its volume within a second
  * (flush.ms); the gateway's writing them, the intake's reading them in its group, and
- * KEDA's reading how far the group is behind on them, which asks to describe both and to
- * read neither; main's Telegram topic; the webhook intake's writing every environment's, a
- * branch's among them, and nothing else; and main's environment's principals and topics
- * (environmentAccess).
+ * KEDA's reading how far the group is behind on them, and each environment's lake loader on
+ * its wake topic, which asks to describe both and to read neither; the webhook intake's
+ * writing every environment's Telegram topic, a branch's among them, and nothing else; and
+ * main's environment's principals and topics (environmentAccess).
  *
  * A write is acknowledged once a majority of the nodes have it in their page caches, not
  * on their volumes. On one node, the volume outlives the pod, so a restart of the pod loses
@@ -178,7 +207,13 @@ export function logAccess(config: InstallConfig): LogAccess {
   const services: Record<Exclude<LogPrincipal, MainEnvironmentPrincipal>, readonly LogAcl[]> = {
     gateway: [{ ...telemetry, operations: ["write", "describe"] }],
     intake: [{ ...telemetry, operations: ["read", "describe"] }, { ...group, operations: ["read"] }],
-    scaler: [{ ...telemetry, operations: ["describe"] }, { ...group, operations: ["describe"] }],
+    // And every environment's wake topic and its loader's group, which it reads how far behind on too.
+    scaler: [
+      { ...telemetry, operations: ["describe"] },
+      { ...group, operations: ["describe"] },
+      { resource: "topic", name: "lake.", pattern: "prefixed", operations: ["describe"] },
+      { resource: "group", name: "lake-loader.", pattern: "prefixed", operations: ["describe"] },
+    ],
     webhook: [{ resource: "topic", name: "telegram.", pattern: "prefixed", operations: ["write", "describe"] }],
   };
   const retention = { retentionMs: retentionMs(config.log.retention), retentionBytes: telemetryRetentionBytes(config) };
