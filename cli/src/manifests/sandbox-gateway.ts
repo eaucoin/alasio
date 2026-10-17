@@ -48,6 +48,7 @@ import { BAYMA_CONTAINER, NET_MODE_LABEL } from "../../../src/kube/sandbox-shape
 import { ATTACH_ROOT, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
 import { RECEIVER_PORT_VARIABLE, SESSIONS_NAMESPACE_VARIABLE } from "../../../src/receiver/receiver.ts";
 import { imageReference } from "../images.ts";
+import { READY_ONCE_BOUND_ANNOTATION } from "../kube/rollout.ts";
 import { sessionsNamespace } from "./alasio.ts";
 import {
   componentName,
@@ -165,7 +166,8 @@ function poolObjects(config: InstallConfig, pool: Pool, mode: keyof typeof POOLS
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
     kind: "Deployment",
-    metadata: { name: pool.name, namespace: pool.namespace, labels: labels(POOL_COMPONENT) },
+    // Ready, as `alasio up` and `alasio status` say it, once its pods run: each is ready only once bound.
+    metadata: { name: pool.name, namespace: pool.namespace, labels: labels(POOL_COMPONENT), annotations: { [READY_ONCE_BOUND_ANNOTATION]: "true" } },
     spec: {
       ...replicasOf(config.sessions.pools),
       selector: { matchLabels: { ...freeLabels(pool) } },
