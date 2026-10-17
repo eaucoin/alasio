@@ -22,13 +22,25 @@ import { parseKeyValueList, resolveTelemetry, type Signal, SIGNALS, signalSettin
 /** How an OTLP request is encoded: binary protobuf or JSON. */
 export type OtlpEncoding = "protobuf" | "json";
 
-/** What exporting one request came to. */
-export type ForwardResult = { readonly ok: true } | { readonly ok: false; readonly error: string };
+/**
+ * What exporting one request came to: sent; or not, with why, whether a server answered it
+ * as one to send again (429, 502, 503, 504) or no server answered at all, and the wait its
+ * last Retry-After asked for, where one did.
+ */
+export type ForwardResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly error: string; readonly retryable: boolean; readonly retryAfterMs: number | null };
+
+/** How long one export may take, at most, less than the signal's timeout where given; and what ends it at once, where given. */
+export interface ForwardOptions {
+  readonly withinMs?: number;
+  readonly signal?: AbortSignal;
+}
 
 /** What the forwarder offers; see createOtlpForwarder. */
 export interface OtlpForwarder {
   readonly protocols: Partial<Record<Signal, string>>;
-  export(signal: Signal, encoding: OtlpEncoding, body: Buffer): Promise<ForwardResult>;
+  export(signal: Signal, encoding: OtlpEncoding, body: Buffer, options?: ForwardOptions): Promise<ForwardResult>;
   close(): void;
 }
 
@@ -119,11 +131,11 @@ function signalTargets(env: Readonly<NodeJS.ProcessEnv>, warn: Warn): Partial<Re
 }
 
 /** One POST: `{ status, retryAfter }`, or `{ error }` for a connection that failed. */
-function post(target: SignalTarget, body: Buffer, headers: OutgoingHttpHeaders, timeoutMs: number): Promise<PostResult> {
+function post(target: SignalTarget, body: Buffer, headers: OutgoingHttpHeaders, timeoutMs: number, signal: AbortSignal | undefined): Promise<PostResult> {
   return new Promise((resolve) => {
     // alasio's own HTTP instrumentation would otherwise trace every export it relays.
     context.with(suppressTracing(context.active()), () => {
-      const req = target.request(target.url, { method: "POST", agent: target.agent, headers, timeout: timeoutMs }, (res) => {
+      const req = target.request(target.url, { method: "POST", agent: target.agent, headers, timeout: timeoutMs, ...(signal ? { signal } : {}) }, (res) => {
         let received = 0;
         res.on("data", (chunk: Buffer) => {
           received += chunk.length;
@@ -143,8 +155,10 @@ function post(target: SignalTarget, body: Buffer, headers: OutgoingHttpHeaders, 
  * The forwarder for the signals `env` exports. `protocols` maps each signal it forwards
  * to the protocol alasio exports it over (http/protobuf or http/json); a signal it does
  * not forward is absent. `export(signal, encoding, body)` sends one request, encoded as
- * `encoding` ("protobuf" or "json"), and resolves `{ ok: true }` or `{ ok: false, error }`
- * once it is sent or given up on. `close()` ends the connections it keeps open.
+ * `encoding` ("protobuf" or "json"), within the signal's timeout or `withinMs` where less,
+ * and resolves `{ ok: true }` once a server took it, or `{ ok: false, ... }` once it is given
+ * up on (ForwardResult), or `signal` aborts it, which ends the request it is sending.
+ * `close()` ends the connections it keeps open.
  */
 export function createOtlpForwarder(
   env: Readonly<NodeJS.ProcessEnv> = process.env,
@@ -159,27 +173,29 @@ export function createOtlpForwarder(
   return {
     protocols,
 
-    async export(signal, encoding, body) {
+    async export(signal, encoding, body, { withinMs, signal: abort }: ForwardOptions = {}) {
       const target = targets[signal];
-      if (!target) return { ok: false, error: `${signal} are not forwarded` };
+      if (!target) return { ok: false, error: `${signal} are not forwarded`, retryable: false, retryAfterMs: null };
       const headers: OutgoingHttpHeaders = {
         ...target.headers,
         "content-type": CONTENT_TYPES[encoding],
         ...(target.gzip ? { "content-encoding": "gzip" } : {}),
       };
       const payload = target.gzip ? gzipSync(body) : body;
-      const deadline = Date.now() + target.timeoutMs;
+      const deadline = Date.now() + Math.min(target.timeoutMs, withinMs ?? Infinity);
       let backoff = INITIAL_BACKOFF_MS;
       for (let attempt = 0; ; attempt += 1) {
-        const result = await post(target, payload, headers, Math.max(1, deadline - Date.now()));
+        const result = await post(target, payload, headers, Math.max(1, deadline - Date.now()), abort);
         if (result.status !== undefined && result.status >= 200 && result.status < 300) return { ok: true };
         const error = result.error?.message ?? `HTTP ${result.status}`;
         const retryable = result.error || (result.status !== undefined && RETRYABLE_STATUS.has(result.status));
-        if (attempt === MAX_RETRIES || !retryable) return { ok: false, error };
+        const failed = { ok: false, error, retryable: Boolean(retryable), retryAfterMs: result.retryAfter ?? null } as const;
+        if (attempt === MAX_RETRIES || !retryable) return failed;
         const wait = result.retryAfter ?? Math.min(backoff * (1 + (Math.random() * 2 - 1) * JITTER), MAX_BACKOFF_MS);
         backoff *= BACKOFF_MULTIPLIER;
-        if (Date.now() + wait >= deadline) return { ok: false, error };
-        await sleep(wait);
+        if (Date.now() + wait >= deadline || abort?.aborted) return failed;
+        const waited = await sleep(wait, true, abort ? { signal: abort } : {}).catch(() => false);
+        if (!waited) return failed;
       }
     },
 

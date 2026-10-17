@@ -88,7 +88,7 @@ test("a retryable answer is retried after the server's Retry-After, and any othe
 
     fresh();
     statuses.push([400]);
-    assert.deepEqual(await forwarder.export("traces", "protobuf", Buffer.from([1])), { ok: false, error: "HTTP 400" });
+    assert.deepEqual(await forwarder.export("traces", "protobuf", Buffer.from([1])), { ok: false, error: "HTTP 400", retryable: false, retryAfterMs: null });
     assert.equal(received.length, 1);
   } finally {
     forwarder.close();
@@ -101,11 +101,71 @@ test("retries stop at the signal's timeout", async () => {
   try {
     statuses.push([503, { "retry-after": "1" }]);
     const startedAt = Date.now();
-    assert.deepEqual(await forwarder.export("traces", "protobuf", Buffer.from([1])), { ok: false, error: "HTTP 503" });
+    assert.deepEqual(await forwarder.export("traces", "protobuf", Buffer.from([1])), { ok: false, error: "HTTP 503", retryable: true, retryAfterMs: 1000 });
     assert.ok(Date.now() - startedAt < 1000);
     assert.equal(received.length, 1);
   } finally {
     forwarder.close();
+  }
+});
+
+test("retries stop within what an export is given, where less than the signal's timeout, and a server not answering is one to send again", async () => {
+  fresh();
+  const forwarder = createOtlpForwarder({ OTEL_EXPORTER_OTLP_ENDPOINT: base });
+  try {
+    statuses.push([503]);
+    const startedAt = Date.now();
+    assert.deepEqual(await forwarder.export("traces", "protobuf", Buffer.from([1]), { withinMs: 300 }), { ok: false, error: "HTTP 503", retryable: true, retryAfterMs: null });
+    assert.ok(Date.now() - startedAt < 1000);
+    assert.equal(received.length, 1);
+  } finally {
+    forwarder.close();
+  }
+  // A port nothing listens on, as a collector that is down.
+  const closed = createServer();
+  await new Promise<void>((resolve) => closed.listen(0, "127.0.0.1", resolve));
+  const port = (closed.address() as AddressInfo).port;
+  await new Promise((resolve) => closed.close(resolve));
+  const down = createOtlpForwarder({ OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}` });
+  try {
+    const result = await down.export("traces", "protobuf", Buffer.from([1]), { withinMs: 300 });
+    assert.deepEqual(result.ok ? null : [result.retryable, result.retryAfterMs], [true, null]);
+  } finally {
+    down.close();
+  }
+});
+
+test("an export aborted ends the request it is sending, and any wait to send it again", async () => {
+  // A collector that never answers, saying when a request it was sent goes away.
+  let closed = 0;
+  const silent = createServer((request) => void request.on("close", () => void (closed += 1)));
+  await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", resolve));
+  const forwarder = createOtlpForwarder({ OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${(silent.address() as AddressInfo).port}` });
+  try {
+    const sending = new AbortController();
+    setTimeout(() => sending.abort(), 100);
+    const startedAt = Date.now();
+    assert.equal((await forwarder.export("traces", "protobuf", Buffer.from([1]), { signal: sending.signal })).ok, false);
+    assert.ok(Date.now() - startedAt < 1000);
+    for (const deadline = Date.now() + 2000; closed === 0 && Date.now() < deadline;) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(closed, 1);
+  } finally {
+    forwarder.close();
+    silent.closeAllConnections();
+    await new Promise((resolve) => silent.close(resolve));
+  }
+  fresh();
+  const waiting = createOtlpForwarder({ OTEL_EXPORTER_OTLP_ENDPOINT: base });
+  try {
+    statuses.push([503, { "retry-after": "5" }]);
+    const sending = new AbortController();
+    setTimeout(() => sending.abort(), 100);
+    const startedAt = Date.now();
+    assert.equal((await waiting.export("traces", "protobuf", Buffer.from([1]), { signal: sending.signal })).ok, false);
+    assert.ok(Date.now() - startedAt < 1000);
+    assert.equal(received.length, 1);
+  } finally {
+    waiting.close();
   }
 });
 

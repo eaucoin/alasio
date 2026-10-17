@@ -44,6 +44,7 @@
   "devDependencies": {
     "@duckdb/node-api": "1.5.6-r.1",
     "@grammyjs/types": "^5.0.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.222.0",
     "@opentelemetry/otlp-transformer": "^0.222.0",
     "@opentelemetry/sdk-logs": "^0.222.0",
     "@opentelemetry/sdk-metrics": "^2.11.0",
