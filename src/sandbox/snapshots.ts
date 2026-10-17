@@ -258,8 +258,9 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
 
   /**
    * Of each running session, the snapshot taken of it live that holds it still, with the
-   * generation it holds it at, which the watch spends once bayma moves on from it. In memory:
-   * alasio's start begins them anew.
+   * generation it holds it at, which the watch spends once bayma moves on from it, unless a
+   * restart is released into it, whose restore spends it. In memory: alasio's start begins
+   * them anew.
    */
   const takenLive = new Map<string, { readonly snapshot: string; readonly generation: number }>();
 
@@ -784,7 +785,14 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
           );
         }
         // What a session that runs no more was, as its release or its end supersedes it.
-        for (const map of [busySince, savedLiveAt, takenLive]) for (const name of map.keys()) if (!running.has(name)) map.delete(name);
+        for (const map of [busySince, savedLiveAt]) for (const name of map.keys()) if (!running.has(name)) map.delete(name);
+        // Its snapshot taken live is kept while its Sandbox runs, not ready as it may be, to be spent
+        // once it runs again moved on from it, as after agent-sandbox made its deleted pod again,
+        // whose bayma starts from its checkpoints; but not before, as the restart of a pod that
+        // ended restores from it, spending it. Once the Sandbox is suspended, released into another
+        // snapshot or into this one, which its restore spends, or gone, it is the Sandbox's to hold.
+        const unsuspended = new Set((listed as readonly StoredSandbox[]).filter((sandbox) => sandbox.spec.operatingMode !== "Suspended").map((sandbox) => sandbox.metadata.name));
+        for (const name of takenLive.keys()) if (!unsuspended.has(name)) takenLive.delete(name);
       }).pipe(Effect.catch((error) => Effect.logWarning(`could not look at sessions to release: ${error.message}`)));
       yield* look.pipe(Effect.repeat(Schedule.spaced(RELEASE_POLL)), Effect.forkScoped);
       yield* collect.pipe(Effect.repeat(Schedule.spaced(COLLECT_POLL)), Effect.forkScoped);
@@ -833,7 +841,12 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       return !restoring && template !== undefined && template !== templates.current && template === templates.previous;
     },
     restore,
-    live: (name) => liveSnapshotOf(name).pipe(withLogScope("snapshots")),
+    // Its restore, or the fallback from it, the one to spend it, not the watch as well.
+    live: (name) =>
+      liveSnapshotOf(name).pipe(
+        Effect.tap((live) => Effect.sync(() => (live !== null && takenLive.get(name)?.snapshot === live.snapshot ? takenLive.delete(name) : undefined))),
+        withLogScope("snapshots"),
+      ),
     saveStopping: (sandbox, pod) => saveStopping(sandbox, pod).pipe(withLogScope("snapshots")),
     watch,
     forget: (name) =>
