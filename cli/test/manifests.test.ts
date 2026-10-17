@@ -3517,7 +3517,7 @@ describe("the sandbox service", () => {
     assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-sandbox-gateway-nodes").rules, [{ apiGroups: [""], resources: ["nodes"], verbs: ["get"] }]);
   });
 
-  test("receives sessions' telemetry in a receiver of its own, which watches its pools' Leases, and mounts workspace storage on each node in a pod of its own, whose replacement takes its mount over first", () => {
+  test("receives sessions' telemetry in a receiver of its own, which watches its pools' Leases, and mounts workspace storage on each node, in the node's own mount namespace, from a pod of its own, whose replacement takes its mount over first", () => {
     const objects = install();
     const receiver = one<V1Deployment>(objects, "Deployment", "alasio-receiver");
     const env = Object.fromEntries((receiver.spec?.template.spec?.containers[0]?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom?.secretKeyRef]));
@@ -3525,18 +3525,22 @@ describe("the sandbox service", () => {
     const watching = all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio-receiver");
     assert.deepEqual([watching?.metadata?.namespace, watching?.rules], ["alasio-sessions", [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]]);
     const mount = one<V1DaemonSet>(objects, "DaemonSet", "alasio-workspace-mount");
-    // The new pod beside the old, which it takes the mount over from, by the node's PIDs and JuiceFS's state on the node.
+    // The new pod beside the old, which it takes the mount over from, by the node's PIDs and mount namespace.
     assert.deepEqual(mount.spec?.updateStrategy, { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } });
     assert.equal(mount.spec?.template.spec?.hostPID, true);
     const [juicefs] = mount.spec?.template.spec?.containers ?? [];
+    // Of alasio's image, for JuiceFS's static release, which runs in the node's namespace as it is; of the node's mount, no mount of its own.
+    assert.equal(juicefs?.image, one<V1Deployment>(objects, "Deployment", "alasio").spec?.template.spec?.containers[0]?.image);
+    assert.deepEqual(juicefs?.securityContext, { privileged: true });
     assert.deepEqual(juicefs?.volumeMounts, [
-      { name: "workspaces", mountPath: "/var/lib/alasio/workspaces", mountPropagation: "Bidirectional" },
-      { name: "state", mountPath: "/tmp" },
+      { name: "bin", mountPath: "/var/lib/alasio/bin" },
+      { name: "state", mountPath: "/var/lib/alasio/juicefs-state" },
+      { name: "cache", mountPath: "/var/lib/alasio/juicefs-cache" },
       { name: "run", mountPath: "/run/alasio" },
     ]);
     assert.deepEqual(mount.spec?.template.spec?.volumes?.[1], { name: "state", hostPath: { path: "/var/lib/alasio/juicefs-state", type: "DirectoryOrCreate" } });
     assert.deepEqual(juicefs?.command, ["sh", "-c", workspaceMountScript("/var/lib/alasio/workspaces", 1024)]);
-    assert.match(juicefs?.command?.[2] ?? "", /juicefs mount --no-bgjob --cache-size 1024 "\$META_URL" \/var\/lib\/alasio\/workspaces /u);
+    assert.match(juicefs?.command?.[2] ?? "", /nsenter -t 1 -m -- "\$node_juicefs" mount --no-bgjob --cache-dir \/var\/lib\/alasio\/juicefs-cache --cache-size 1024 "\$META_URL" \/var\/lib\/alasio\/workspaces /u);
     assert.deepEqual(juicefs?.readinessProbe?.exec?.command, ["sh", "-c", workspaceMountReady("/var/lib/alasio/workspaces")]);
     assert.equal(mount.spec?.template.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
   });
