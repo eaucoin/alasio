@@ -23,8 +23,9 @@
  * saved with, those that hold its images first; its workspace attached while its init container
  * waits for it (attach-wait), before its sandbox is restored as its bayma starts, as a restore
  * reopens every file the sandbox held open; left paused until its node's agent sees its egress
- * confined there, then resumed, and ready. One whose sandbox cannot start from its snapshot
- * falls back at once. Only the snapshot the record says it was
+ * confined there, then resumed, and ready. One whose restore runsc refuses falls back at once;
+ * one whose pod cannot start otherwise, as a pull or a node's hiccup fails it, is deferred, as
+ * the others that may pass. Only the snapshot the record says it was
  * released into restores, or one its node's agent compacted from it since, which is the same:
  * one it has moved on from since is stale. A restore that cannot be done now, as what it needs
  * fails for a while, is deferred, its snapshot kept, the bind refused to be tried again, for
@@ -99,6 +100,13 @@ const restoreDuration = meter.createHistogram("alasio.sandbox.restore.duration",
 /** What kubelet says of a container waiting that could not start, which a restore's that cannot be restored is, started again only to fail as it did. */
 const START_FAILURES: ReadonlySet<string> = new Set(["CrashLoopBackOff", "RunContainerError", "StartError", "CreateContainerError"]);
 
+/**
+ * What a restore's container says of a start that failed as runsc refused the restore itself,
+ * the snapshot, as one whose files are not there or do not validate: its OCI runtime's restore
+ * failing, its kernel's CompleteRestore, or a container it can no longer restore.
+ */
+const RESTORE_REFUSED = /OCI runtime restore failed|CompleteRestore|cannot restore container|restore[^;]*validat/iu;
+
 /** How long a restored pod is waited for to run its containers, its images pulled. */
 const POD_RUNNING_TIMEOUT_MS = 180_000;
 /**
@@ -129,7 +137,7 @@ class RestoreRefused extends Schema.TaggedError<RestoreRefused>()("RestoreRefuse
   reason: Schema.String,
   resumed: Schema.Boolean,
   stale: Schema.optional(Schema.Boolean),
-  /** Whether no try restores it, as its sandbox could not start from its snapshot. */
+  /** Whether no try restores it, as runsc refused to restore its sandbox from its snapshot. */
   failed: Schema.optional(Schema.Boolean),
 }) {
   override get message(): string {
@@ -397,30 +405,33 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
     });
 
   /**
-   * Why the restore's pod `pod` will not come back, where it will not: it ended, or a container of
-   * it ended, or could not start, as a sandbox that cannot be restored cannot, its container
-   * started again by kubelet only to fail as it did. Its init container, attach-wait, ends as it
-   * should once its workspace is attached.
+   * Why the restore's pod `pod` will not come back now, where it will not: it ended, or a
+   * container of it ended, or could not start, started again by kubelet only to fail; and
+   * whether what failed is the restore itself, runsc refusing the snapshot, as its container's
+   * message says (RESTORE_REFUSED), which no try restores, or what may pass, as a pull or a node's
+   * hiccup. Its init container, attach-wait, ends as it should once its workspace is attached.
    */
-  const failedStart = (pod: V1Pod | null): string | null => {
-    if (pod?.status?.phase === "Failed" || pod?.status?.phase === "Succeeded") return `its pod ended (${pod.status.reason ?? pod.status.phase})`;
+  const failedStart = (pod: V1Pod | null): { readonly why: string; readonly refused: boolean } | null => {
+    if (pod?.status?.phase === "Failed" || pod?.status?.phase === "Succeeded") return { why: `its pod ended (${pod.status.reason ?? pod.status.phase})`, refused: false };
     for (const status of [...(pod?.status?.initContainerStatuses ?? []), ...(pod?.status?.containerStatuses ?? [])]) {
       const ended = status.state?.terminated;
-      if (ended && !(status.name === ATTACH_WAIT.name && ended.exitCode === 0)) return `its ${status.name} ended (${ended.message ?? ended.reason ?? ended.exitCode})`;
       const before = status.lastState?.terminated;
-      if (status.restartCount > 0 || before) return `its ${status.name} could not start (${before?.message ?? before?.reason ?? "started again"})`;
       const waiting = status.state?.waiting;
-      if (waiting?.reason !== undefined && START_FAILURES.has(waiting.reason)) return `its ${status.name} could not start (${waiting.message ?? waiting.reason})`;
+      const said = [ended?.message, before?.message, waiting?.message].filter((message) => message !== undefined).join("; ");
+      const failure = (why: string) => ({ why: `its ${status.name} ${why}`, refused: RESTORE_REFUSED.test(said) });
+      if (ended && !(status.name === ATTACH_WAIT.name && ended.exitCode === 0)) return failure(`ended (${ended.message ?? ended.reason ?? ended.exitCode})`);
+      if (status.restartCount > 0 || before) return failure(`could not start (${before?.message ?? before?.reason ?? "started again"})`);
+      if (waiting?.reason !== undefined && START_FAILURES.has(waiting.reason)) return failure(`could not start (${waiting.message ?? waiting.reason})`);
     }
     return null;
   };
 
-  /** The restore's pod `name` of `pool`, once `until` holds of it, `what` it waits for; refused, never to be tried again, where it will not come back (failedStart), and refused where it does not within POD_RUNNING_TIMEOUT_MS. */
+  /** The restore's pod `name` of `pool`, once `until` holds of it, `what` it waits for; refused where it will not come back now (failedStart), never to be tried again where runsc refused its restore, and refused where it does not within POD_RUNNING_TIMEOUT_MS. */
   const podOnce = (pool: Pool, name: string, until: (pod: V1Pod) => boolean, what: string): Effect.Effect<V1Pod, RestoreRefused> =>
     podOf(pool, name).pipe(
       Effect.flatMap((pod): Effect.Effect<V1Pod, PodNotRunning | RestoreRefused> => {
         const failed = failedStart(pod);
-        if (failed !== null) return Effect.fail(new RestoreRefused({ reason: failed, resumed: false, failed: true }));
+        if (failed !== null) return Effect.fail(new RestoreRefused({ reason: failed.why, resumed: false, failed: failed.refused }));
         return pod && until(pod) ? Effect.succeed(pod) : Effect.fail(new PodNotRunning());
       }),
       Effect.retry({ while: (error) => error._tag === "PodNotRunning", schedule: Schedule.max([Schedule.spaced("500 millis"), Schedule.during(POD_RUNNING_TIMEOUT_MS)]) }),

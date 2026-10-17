@@ -680,18 +680,23 @@ test("a workspace released into its snapshot is restored from it as it is next b
   assert.equal(((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/free=true")))) as V1Pod[]).length, 1);
 });
 
-test("a restore whose sandbox cannot start from its snapshot, its bayma started again only to fail, falls back at once, abandoned, its snapshot forgotten, the workspace bound to a free pod", async () => {
+/**
+ * A restore of `workspace` whose bayma fails to start as `status` says, of a pool of two free
+ * pods: what its bind came to, what the agents were asked, what was abandoned, and what was counted.
+ */
+async function failedRestore(workspace: string, status: Record<string, unknown>) {
   const env = await environment(2, { gvisor: true });
   await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
   const snapshot = "20261017T120000000Z-0000000c";
-  const recorded = restoringAgents(manifestOf(env, "fs-unstarted", snapshot), { snapshot, release: "r1" });
+  const recorded = restoringAgents(manifestOf(env, workspace, snapshot), { snapshot, release: "r1" });
   const abandoned: string[] = [];
   const agents: NodeAgents = { ...recorded.agents, abandon: (node, request) => Effect.sync(() => (abandoned.push(`${node} ${request.pod}`), [])) };
   const { binder, sessions } = await sessionsOf(options(env, 7290), agents);
-  const key = sessionKey("fs-unstarted");
+  const key = sessionKey(workspace);
   const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  let name = "";
   const counted = await added("alasio.sandbox.restores", async () => {
-    const binding = Effect.runPromise(binder.bind(placement.pool, key, placement).pipe(Effect.retry({ times: 1 })));
+    const binding = Effect.runPromise(Effect.result(binder.bind(placement.pool, key, placement)));
     const restored = await (async () => {
       for (;;) {
         const [pod] = (await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/binding")))) as V1Pod[];
@@ -699,17 +704,39 @@ test("a restore whose sandbox cannot start from its snapshot, its bayma started 
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
     })();
-    const name = restored.metadata?.name ?? "";
+    name = restored.metadata?.name ?? "";
     await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Pending", initContainerStatuses: [{ name: "attach-wait", image: "agent", imageID: "", ready: false, restartCount: 0, state: { running: {} } }] } })));
     for (const deadline = Date.now() + 10_000; recorded.attached.length === 0; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its workspace was not attached");
-    // Its restore fails as its bayma starts, as a sandbox whose files are not there fails, and kubelet starts it again.
-    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", initContainerStatuses: [{ name: "attach-wait", image: "agent", imageID: "", ready: false, restartCount: 0, state: { terminated: { exitCode: 0 } } }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 1, state: { waiting: { reason: "CrashLoopBackOff" } }, lastState: { terminated: { exitCode: 128, reason: "StartError", message: "vfs.CompleteRestore() failed" } } }] } })));
-    const bound = await binding;
-    assert.match(bound.pod, /^none-/u);
-    assert.deepEqual(abandoned, [`node-a ${name}`]);
-    assert.ok(recorded.asked.includes(`forget fs-unstarted`), recorded.asked.join("\n"));
+    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", initContainerStatuses: [{ name: "attach-wait", image: "agent", imageID: "", ready: false, restartCount: 0, state: { terminated: { exitCode: 0 } } }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, ...status }] } })));
+    return binding;
+  });
+  return { counted, recorded, abandoned, name, bindAgain: () => Effect.runPromise(Effect.result(binder.bind(placement.pool, key, placement))) };
+}
+
+test("a restore runsc refuses, its kernel failing to restore the sandbox, falls back at once, abandoned, its snapshot forgotten, the workspace bound to a free pod", async () => {
+  const { counted, recorded, abandoned, name, bindAgain } = await failedRestore("fs-refused", {
+    restartCount: 1,
+    state: { waiting: { reason: "CrashLoopBackOff" } },
+    lastState: { terminated: { exitCode: 128, reason: "StartError", message: "failed to start containerd task \"bayma\": OCI runtime restore failed: vfs.CompleteRestore() failed" } },
   });
   assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=restore": 1 });
+  assert.deepEqual(abandoned, [`node-a ${name}`]);
+  assert.ok(recorded.asked.includes("forget fs-refused"), recorded.asked.join("\n"));
+  const bound = await bindAgain();
+  assert.ok(bound._tag === "Success" && /^none-/u.test(bound.success.pod));
+});
+
+test("a restore whose pod cannot start otherwise, as a node's hiccup fails it, is deferred, abandoned, its snapshot kept for the next bind to restore", async () => {
+  const { counted, recorded, abandoned, name } = await failedRestore("fs-hiccup", {
+    restartCount: 0,
+    state: { waiting: { reason: "CreateContainerError", message: "context deadline exceeded" } },
+  });
+  assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=deferred,alasio.sandbox.restore.fallback=restore": 1 });
+  assert.deepEqual(abandoned, [`node-a ${name}`]);
+  assert.ok(!recorded.asked.some((asked) => asked.startsWith("forget")), recorded.asked.join("\n"));
+  // Its snapshot, and its record of it, kept, for its next bind to restore, within DEFER_FOR_MS.
+  assert.notEqual(recorded.state.current, null);
+  assert.notEqual(recorded.state.released, null);
 });
 
 test("a workspace whose record names a snapshot it holds no more, or another than its current one, is bound to a free pod, its snapshot and its record forgotten", async () => {
