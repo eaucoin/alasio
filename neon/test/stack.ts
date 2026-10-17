@@ -1293,6 +1293,11 @@ export function neonStack(): void {
           } finally {
             await kube.remove(ref("Job", name, NAMESPACE)).catch(() => {});
           }
+          // The backup put back is the newest listed now, before anything is written after it:
+          // the CronJob's own, as it fires on the hour's minute it is set to, may come after
+          // the writes below and hold them.
+          const listed = await alasioOk("restore-filer-store");
+          const stamp = /^ {2}(\d{8}T\d{6}Z) /mu.exec(listed)?.[1] ?? assert.fail(`no backup is listed:\n${listed}`);
           await onGateway(await gateway(), `echo after > /tmp/body; s3api 127.0.0.1:8333 put-object --bucket ${bucket} --key after --body /tmp/body >/dev/null`);
           assert.deepEqual([await held("before"), await held("after")], ["held", "held"]);
           // Transcript entries loaded since, more than DuckLake inlines in its catalog: a file of the lake's the restore loses.
@@ -1305,8 +1310,6 @@ export function neonStack(): void {
           const logNodes = async () =>
             (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "log" }) })).map(({ metadata }) => metadata?.uid);
           const nodes = await logNodes();
-          const listed = await alasioOk("restore-filer-store");
-          const stamp = /^ {2}(\d{8}T\d{6}Z) /mu.exec(listed)?.[1] ?? assert.fail(`no backup is listed:\n${listed}`);
           const restored = await alasioOk("restore-filer-store", stamp, "--yes", "--timeout", "20m");
           assert.match(restored, /^The filer store is as it was at .+, with its \d+ keys, and alasio runs on it again\.$/mu);
           assert.match(restored, /^ {2}main's lake: the lake lost \d+ rows? of claude\.entries, in \d+ files?.*: loaded again from alasio's database$/mu);
