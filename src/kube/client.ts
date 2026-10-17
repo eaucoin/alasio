@@ -120,8 +120,11 @@ export class KubeClient extends Context.Service<KubeClient, {
    * conditions by their type.
    */
   readonly patchPodStatus: (namespace: string, name: string, patch: object) => Effect.Effect<void, KubeApiError>;
-  /** Deletes it, with its dependents in the background; one already gone is not an error. */
-  readonly remove: (apiVersion: string, kind: string, namespace: string, name: string) => Effect.Effect<void, KubeApiError>;
+  /**
+   * Deletes it, with its dependents in the background; one already gone is not an error.
+   * Given `resourceVersion`, only as it is at that version: 409 when it has changed since.
+   */
+  readonly remove: (apiVersion: string, kind: string, namespace: string, name: string, resourceVersion?: string) => Effect.Effect<void, KubeApiError>;
   /**
    * Runs `command` in the container: `{ exitCode, stdout, stderr }`, stdout of at most
    * `maxBytes` (the command is ended past it). Interrupting it closes the exec.
@@ -215,8 +218,10 @@ function makeKubeClient(kubeConfig: KubeConfig): KubeClient["Service"] {
       call(() =>
         core.patchNamespacedPodStatus({ namespace, name, body: patch, fieldManager: "alasio" }, setHeaderOptions("Content-Type", PatchStrategy.StrategicMergePatch))
       ).pipe(Effect.asVoid),
-    remove: (apiVersion, kind, namespace, name) =>
-      call(() => objects.delete(ref(apiVersion, kind, namespace, name), undefined, undefined, undefined, undefined, "Background")).pipe(
+    remove: (apiVersion, kind, namespace, name, resourceVersion) =>
+      call(() =>
+        objects.delete(ref(apiVersion, kind, namespace, name), undefined, undefined, undefined, undefined, "Background", resourceVersion === undefined ? undefined : { preconditions: { resourceVersion } })
+      ).pipe(
         Effect.asVoid,
         Effect.catchIf(hasStatus(404), () => Effect.void),
       ),
