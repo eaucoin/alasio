@@ -15,6 +15,35 @@ test("mountinfo's mount points are read with their escapes undone", () => {
   assert.deepEqual(mountPoints("36 35 98:0 /mnt1 /mnt/a\\040b rw - ext3 /dev/root rw\n37 35 0:50 / /var rw - tmpfs tmpfs rw\n"), ["/mnt/a b", "/var"]);
 });
 
+test("a workspace is made with its quota, which is read back, its directories its agent's, JuiceFS told the metadata engine's password out of its arguments", async () => {
+  const at = workspacesNode();
+  try {
+    const ref = { environment: "main", workspace: "fs-made" };
+    await Effect.runPromise(at.workspaces.create(ref, 10 * 1024 ** 3 - 1));
+    const files = join(at.workspacesRoot, "main", "fs-made", "files");
+    for (const directory of [files, join(files, "workspace"), join(files, "home")]) assert.equal(statSync(directory).uid, process.getuid?.() ?? 1000, directory);
+    assert.deepEqual(await Effect.runPromise(at.workspaces.quota(ref)), { capacityBytes: 10 * 1024 ** 3, usedBytes: 12 * 1024 ** 2 });
+    // Made again: as it was, its quota set anew.
+    await Effect.runPromise(at.workspaces.create(ref, 20 * 1024 ** 3));
+    assert.deepEqual((await Effect.runPromise(at.workspaces.quota(ref)))?.capacityBytes, 20 * 1024 ** 3);
+    assert.deepEqual(at.juicefsCalls(), [
+      "quota set redis://valkey.alasio.svc:6379/1 --path /main/fs-made --capacity 10 META_PASSWORD=the password",
+      "quota get redis://valkey.alasio.svc:6379/1 --path /main/fs-made META_PASSWORD=the password",
+      "quota set redis://valkey.alasio.svc:6379/1 --path /main/fs-made --capacity 20 META_PASSWORD=the password",
+      "quota get redis://valkey.alasio.svc:6379/1 --path /main/fs-made META_PASSWORD=the password",
+    ]);
+    // Of names that are none, or a quota that is none: refused, nothing made.
+    assert.equal(await refusal(at.workspaces.create({ environment: "main", workspace: "../etc" }, 1024)), 400);
+    assert.equal(await refusal(at.workspaces.create({ environment: "main", workspace: "fs-other" }, 0)), 400);
+    assert.equal(existsSync(join(at.workspacesRoot, "main", "fs-other")), false);
+    // One whose quota is not there: JuiceFS's refusal, as the agent says it.
+    const missing = await Effect.runPromise(Effect.flip(at.workspaces.quota({ environment: "main", workspace: "fs-never" })));
+    assert.match(missing.message, /^juicefs quota get failed: no quota of \/main\/fs-never$/u);
+  } finally {
+    at.done();
+  }
+});
+
 test("a workspace is attached into a pod's directory with its binding's token beside it, and never into one that holds a mount", async () => {
   const at = workspacesNode();
   try {
