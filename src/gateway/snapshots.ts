@@ -37,6 +37,15 @@
  * none where its bayma holds no stop, where its turn comes once it holds it no more, or where
  * its save fails, the workspace then coming back from bayma's checkpoints. Counted by outcome
  * (alasio.sandbox.stop_releases).
+ *
+ * A bound pod of main's whose execs run is saved live every `liveEverySeconds` while they run,
+ * from that long after they began, its sandbox running on (keepLive), as alasio's sessions
+ * were: the snapshot it took holds the workspace while bayma's state generation is the one it
+ * caught, and is spent once bayma moves on from it. A binding that ends unsaved, as its pod went
+ * while it was bound, or its bayma ended, is released into that snapshot (liveSnapshotOf), whose
+ * restore its resume refuses where bayma had moved on from it. One whose live save says it can be
+ * saved no more is ended now (unsaveable), to come back from bayma's checkpoints, as its next
+ * save would fail as this one did.
  */
 import type { V1Deployment, V1NetworkPolicy, V1Node, V1Pod, V1PodTemplateSpec, V1Toleration } from "@kubernetes/client-node";
 import { Clock, Effect, Schedule, Schema, Semaphore } from "effect";
@@ -48,7 +57,7 @@ import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, RESTORE_ANNOTATION, RESTORE_PAUSED
 import type { SavedSnapshot } from "../kube/sandboxes.ts";
 import type { Manifest } from "../node-agent/agent.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
-import { type Fallback, holdsStop, hookOf, selects, stopHookOf } from "../sandbox/snapshots.ts";
+import { type Fallback, holdsStop, hookOf, selects, stateDirOf, stopHookOf } from "../sandbox/snapshots.ts";
 import { withLogScope } from "../shared/log.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
 import type { GatewaySnapshots as SnapshotsConfig } from "./names.ts";
@@ -65,6 +74,10 @@ const stopReleases = meter.createCounter("alasio.sandbox.stop_releases", {
 
 /** How many bound pods of one node are saved as they end at a time. */
 const RELEASES_PER_NODE = 2;
+
+const liveCheckpoints = meter.createCounter("alasio.sandbox.live_checkpoints", {
+  description: "Snapshots of running sessions taken live, their sandboxes running on, by outcome: taken, or failed; and spent, as the session moved on from one",
+});
 
 const restores = meter.createCounter("alasio.sandbox.restores", {
   description: "Session sandboxes brought up with a snapshot, by outcome: restored, or not, by why",
@@ -150,6 +163,20 @@ export interface GatewaySnapshots {
    * binding's Lease.
    */
   readonly saveStopping: (pool: Pool, workspace: string, pod: V1Pod) => Effect.Effect<void>;
+  /**
+   * Keeps the snapshot taken live of `pod`, bound to `workspace` of `pool`, true to it, as
+   * bayma's /status, `status`, says it at `now`, as the module says: spent once bayma's
+   * generation has moved on from it, and one taken every liveEvery while its execs run, in
+   * the background, its node saving RELEASES_PER_NODE at a time. Where a live save says it can be
+   * saved no more, `unsaveable` is run, which ends its binding.
+   */
+  readonly keepLive: (pool: Pool, workspace: string, pod: V1Pod, status: BaymaStatus, now: number, unsaveable: Effect.Effect<void>) => Effect.Effect<void>;
+  /** Ends `pod`, bound to `workspace` of `pool`, which can be saved no more, as the module says: its bayma told to go on with its stop, released into none, and counted. Run while the gateway holds the binding's Lease. */
+  readonly endUnsaveable: (pool: Pool, workspace: string, pod: string) => Effect.Effect<void, KubeApiError>;
+  /** The snapshot taken live of `workspace` of `pool`, where its current snapshot is one, as the binding that ends unsaved is released into; none otherwise. */
+  readonly liveSnapshotOf: (pool: Pool, workspace: string) => Effect.Effect<SavedSnapshot | null>;
+  /** Of the bindings of the sessions' namespace `namespace`, forgets what was kept live of those of workspaces not among `bound`, as they are bound no more. */
+  readonly forgetLive: (namespace: string, bound: ReadonlySet<string>) => Effect.Effect<void>;
   /** How a bind of `workspace` of `pool`, of its sessions' internet `mode`, restores it, as the module says. */
   readonly restoring: (pool: Pool, workspace: string, mode: "none" | "full") => Restoring;
   /**
@@ -159,6 +186,10 @@ export interface GatewaySnapshots {
    */
   readonly save: (pool: Pool, workspace: string, pod: string) => Effect.Effect<Saved, KubeApiError>;
 }
+
+/** What bayma's /status says: its execs running and queued, since when none has run, if none does, and its state generation, which a snapshot taken of it live holds it at. */
+export const BaymaStatus = Schema.Struct({ execsRunning: Schema.Number, execsQueued: Schema.Number, idleSinceMs: Schema.NullOr(Schema.Number), generation: Schema.Number });
+export type BaymaStatus = typeof BaymaStatus.Type;
 
 /** What makeGatewaySnapshots is given: the node agents, how main's sessions are snapshotted, none where they are not, and main's sessions' namespace. */
 export interface GatewaySnapshotsOptions {
@@ -530,7 +561,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       if (!holdsStop(pod.spec?.containers.find((container) => container.name === BAYMA_CONTAINER))) {
         yield* Effect.logWarning(`${named(pool, workspace)} is not snapshotted as its pod ends: its bayma holds no stop for it`);
         yield* counted("unheld");
-        return yield* record(null);
+        return yield* record(yield* liveSnapshotOf(pool, workspace));
       }
       const saved = yield* stopSlot(node).withPermits(1)(Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis;
@@ -548,7 +579,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         yield* counted("unsnapshotted");
         return null;
       }));
-      yield* record(saved);
+      // Saved into none, it is released into the snapshot taken of it live, if any, as alasio's sessions were.
+      yield* record(saved ?? (yield* liveSnapshotOf(pool, workspace)));
     }).pipe(
       Effect.catch((error) => Effect.logWarning(`could not snapshot ${named(pool, workspace)} as its pod ends: ${error.message}`).pipe(Effect.andThen(counted("error")))),
       withAlasioSpan("alasio.sandbox.stop_release", { attributes: { "alasio.sandbox.name": workspace, "k8s.node.name": node } }),
@@ -556,5 +588,104 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
     );
   };
 
-  return { save, saveStopping, restoring };
+
+  /**
+   * Of each bound workspace, by its pool's namespace and name: the snapshot taken of it live that
+   * holds it still, with the generation it holds it at; since when its execs have run; and when
+   * it was last saved live. In memory: the gateway's start begins them anew.
+   */
+  const takenLive = new Map<string, { readonly snapshot: string; readonly generation: number }>();
+  const busySince = new Map<string, number>();
+  const savedLiveAt = new Map<string, number>();
+  /** How many live saves run on each node, which its agent checkpoints one beside the other. */
+  const liveOnNode = new Map<string, number>();
+  const liveEveryMs = (snapshots?.liveEverySeconds ?? 0) * 1000;
+
+  /** Saves `pod`'s sandbox live by its node's agent, running on: the snapshot it took and the generation it holds the workspace at; null where none was taken; or "unsaveable". */
+  const saveLive = (pool: Pool, workspace: string, pod: V1Pod): Effect.Effect<{ readonly snapshot: string; readonly generation: number } | null | "unsaveable", KubeApiError> =>
+    Effect.gen(function*() {
+      const counted = (outcome: string) => Effect.sync(() => liveCheckpoints.add(1, { "alasio.sandbox.live_checkpoint.outcome": outcome }));
+      const containerId = baymaId(pod);
+      const bayma = pod.spec?.containers.find((container) => container.name === BAYMA_CONTAINER);
+      const hook = bayma ? hookOf(bayma) : null;
+      const stateDir = bayma ? stateDirOf(bayma) : null;
+      const node = pod.spec?.nodeName;
+      if (!node || !containerId || pod.spec?.runtimeClassName === undefined || !hook || !stateDir) return null;
+      const deployment = (yield* kube.read("apps/v1", "Deployment", pool.namespace, pool.name)) as V1Deployment | null;
+      const name = pod.metadata?.name ?? "";
+      const taken = yield* agents.checkpoint(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, containerId, hook, podTemplate: { ...deployment?.spec?.template }, live: { stateDir } }).pipe(Effect.result);
+      if (taken._tag === "Failure" && unsaveable(taken.failure)) {
+        yield* counted("unsaveable");
+        return "unsaveable" as const;
+      }
+      if (taken._tag === "Failure" || taken.success.live === undefined) {
+        yield* counted("failed");
+        yield* Effect.logWarning(`could not snapshot ${named(pool, workspace)} live, which runs on: ${taken._tag === "Failure" ? taken.failure.message : "its manifest says nothing of the save"}`);
+        return null;
+      }
+      const { snapshot, bytes, pauseMs, live } = taken.success;
+      yield* counted("taken");
+      yield* Effect.logInfo(`snapshotted ${named(pool, workspace)} live as ${snapshot} on ${node}, at bayma's generation ${live.generation}: ${bytes} bytes, paused ${pauseMs} ms`);
+      return { snapshot, generation: live.generation };
+    });
+
+  const keepLive = (pool: Pool, workspace: string, pod: V1Pod, status: BaymaStatus, now: number, ended: Effect.Effect<void>): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      if (!snapshots || pool.namespace !== mainNamespace || liveEveryMs <= 0) return;
+      const it = named(pool, workspace);
+      const taken = takenLive.get(it);
+      if (taken && taken.generation !== status.generation) {
+        takenLive.delete(it);
+        yield* agents.spend(ref(pool, workspace), taken.snapshot).pipe(
+          Effect.tap(() => Effect.sync(() => liveCheckpoints.add(1, { "alasio.sandbox.live_checkpoint.outcome": "spent" }))),
+          Effect.tap(() => Effect.logInfo(`spent the snapshot ${taken.snapshot} of ${it}, taken live, which has moved on from it`)),
+          Effect.catch((error) => Effect.logWarning(`could not spend the snapshot ${taken.snapshot} of ${it}, which has moved on from it: ${error.message}`)),
+        );
+      }
+      if (status.execsRunning === 0) {
+        busySince.delete(it);
+        return;
+      }
+      const since = busySince.get(it) ?? now;
+      busySince.set(it, since);
+      if (now - Math.max(since, savedLiveAt.get(it) ?? since) < liveEveryMs) return;
+      const node = pod.spec?.nodeName ?? "";
+      if ((liveOnNode.get(node) ?? 0) >= RELEASES_PER_NODE) return;
+      liveOnNode.set(node, (liveOnNode.get(node) ?? 0) + 1);
+      savedLiveAt.set(it, now);
+      yield* Effect.forkDetach(saveLive(pool, workspace, pod).pipe(
+        Effect.flatMap((saved) => (saved === "unsaveable" ? ended : Effect.sync(() => void (saved ? takenLive.set(it, saved) : undefined)))),
+        Effect.catch((error) => Effect.logWarning(`could not snapshot ${it} live: ${error.message}`)),
+        Effect.ensuring(Effect.sync(() => void liveOnNode.set(node, (liveOnNode.get(node) ?? 1) - 1))),
+        withAlasioSpan("alasio.sandbox.live_checkpoint", { attributes: { "alasio.sandbox.name": workspace } }),
+        withLogScope("snapshots"),
+      ));
+    });
+
+  const liveSnapshotOf = (pool: Pool, workspace: string): Effect.Effect<SavedSnapshot | null> =>
+    !snapshots || pool.namespace !== mainNamespace
+      ? Effect.succeed(null)
+      : agents.current(ref(pool, workspace)).pipe(
+        Effect.map((manifest): SavedSnapshot | null => (manifest?.live === undefined ? null : { snapshot: manifest.snapshot, release: manifest.release })),
+        // Its restore, or the fallback from it, the one to spend it, not the look as well.
+        Effect.tap((live) => Effect.sync(() => (live !== null && takenLive.get(named(pool, workspace))?.snapshot === live.snapshot ? takenLive.delete(named(pool, workspace)) : undefined))),
+        Effect.catch((error) => Effect.logWarning(`could not read whether ${named(pool, workspace)} has a snapshot taken live: ${error.message}`).pipe(Effect.as(null))),
+      );
+
+  const forgetLive = (namespace: string, bound: ReadonlySet<string>): Effect.Effect<void> =>
+    Effect.sync(() => {
+      for (const map of [takenLive, busySince, savedLiveAt]) {
+        for (const it of [...map.keys()]) if (it.startsWith(`${namespace}/`) && !bound.has(it.slice(namespace.length + 1))) map.delete(it);
+      }
+    });
+
+  const endUnsaveable = (pool: Pool, workspace: string, name: string): Effect.Effect<void, KubeApiError> =>
+    Effect.gen(function*() {
+      releases.add(1, { "alasio.sandbox.release.outcome": "unsaveable" });
+      yield* Effect.logWarning(`${named(pool, workspace)} can be saved no more, as its live checkpoint failed as every checkpoint of it will: it is released, to come back from bayma's checkpoints`);
+      yield* goOnWithStop(pool, workspace, name);
+      yield* agents.setReleased(ref(pool, workspace), null).pipe(Effect.catch((error) => Effect.logWarning(`could not record ${named(pool, workspace)}'s release into none: ${error.message}`)));
+    }).pipe(withLogScope("snapshots"));
+
+  return { save, saveStopping, endUnsaveable, keepLive, liveSnapshotOf, forgetLive, restoring };
 });

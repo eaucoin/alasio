@@ -86,8 +86,10 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
       readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, quota: unused,
       checkpoint: (node, request) =>
         Effect.gen(function*() {
-          asked.push(`checkpoint ${node} ${request.pod}`);
+          asked.push(`checkpoint ${node} ${request.pod}${request.live ? " live" : ""}`);
           saved.push(request);
+          // Taken live, its sandbox runs on, at bayma's generation 1.
+          if (request.live) return { snapshot: "s-live", release: "r1", live: { stateDir: request.live.stateDir, generation: 1, running: [] } } as unknown as Manifest;
           if (checkpoint === "unsaveable") return yield* new NodeAgentError({ node, call: "snapshot", status: 410, reason: "its restore from the bucket failed to read some of its pages" });
           if (checkpoint !== "fails") yield* Effect.promise(() => end(request));
           if (checkpoint !== "saves") return yield* new NodeAgentError({ node, call: "snapshot", status: 500, reason: "runsc checkpoint failed" });
@@ -614,4 +616,80 @@ test("a bound pod ended by other than the gateway, as a drain ends one, is saved
   assert.deepEqual(counted, { "alasio.sandbox.stop_release.outcome=snapshotted": 1 });
   assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-drained released into s-1`, `detach node-a ${bound.pod}`]);
   assert.ok(told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "deleted" && event.binding === bound.binding));
+});
+
+/** A stand-in for bayma's /status that says its state generation too, as bayma 0.14 does. */
+async function baymaOfGeneration(): Promise<{ port: number; status: { execsRunning: number; execsQueued: number; idleSinceMs: number | null; generation: number }; close: () => void }> {
+  const stand = { status: { execsRunning: 0, execsQueued: 0, idleSinceMs: 0 as number | null, generation: 1 } };
+  const server = createServer((_incoming, outgoing) => void outgoing.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(stand.status)));
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  return { port: (server.address() as AddressInfo).port, get status() { return stand.status; }, set status(value) { stand.status = value; }, close: () => server.close() };
+}
+
+test("a bound pod whose execs run is saved live every liveEvery, its sandbox running on, and its snapshot spent once bayma's generation moves on from it", async () => {
+  const env = await environment(1, { gvisor: true });
+  const stand = await baymaOfGeneration();
+  const recorded = agents();
+  const spent: string[] = [];
+  try {
+    const opts = options(env, stand.port);
+    const { binder, sessions } = await sessionsOf({ ...opts, snapshots: { ...opts.snapshots!, liveEverySeconds: 1 } }, { ...recorded.agents, spend: (_ref, snapshot) => Effect.sync(() => void spent.push(snapshot)) });
+    const key = sessionKey("fs-busy");
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+    stand.status = { execsRunning: 1, execsQueued: 0, idleSinceMs: null, generation: 1 };
+    const look = () => Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
+    const counted = await added("alasio.sandbox.live_checkpoints", async () => {
+      // Its execs begun: not saved live before liveEvery has passed since.
+      await look();
+      assert.deepEqual(recorded.asked, [] as string[]);
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      await look();
+      for (const deadline = Date.now() + 5_000; !recorded.asked.includes(`checkpoint node-a ${bound.pod} live`); await new Promise((resolve) => setTimeout(resolve, 50))) assert.ok(Date.now() < deadline);
+      assert.deepEqual(recorded.saved.at(-1)?.live, { stateDir: "/home/agent/.bayma" });
+      // bayma moved on from the generation it caught: spent.
+      stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now(), generation: 2 };
+      await look();
+    });
+    assert.deepEqual(spent, ["s-live"]);
+    assert.deepEqual(counted, { "alasio.sandbox.live_checkpoint.outcome=taken": 1, "alasio.sandbox.live_checkpoint.outcome=spent": 1 });
+  } finally {
+    stand.close();
+  }
+});
+
+test("a bound pod whose bayma ended in it, or was started again, is released as broken, into the snapshot taken of it live; and one whose pod went, as lost, into it too, recorded while its Lease holds", async () => {
+  const env = await environment(2, { gvisor: true });
+  const recorded = agents();
+  // Saved live once it is bound.
+  let saved = false;
+  const live = { ...recorded.agents, current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/home/agent/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null) };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), live);
+  const key = sessionKey("fs-broken");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  saved = true;
+  // Started again in its pod, as kubelet starts a container that ended.
+  await run(withKube((kube) => kube.patchPodStatus(env.namespace, bound.pod, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 1, containerID: "containerd://c-0", state: { waiting: { reason: "CrashLoopBackOff" } } }] } })));
+  // Its deletion ends it, as kubelet would.
+  const ending = (async () => {
+    for (;;) {
+      const pod = (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, bound.pod)))) as V1Pod | null;
+      if (pod?.metadata?.deletionTimestamp) {
+        await run(withKube((kube) => kube.patchPodStatus(env.namespace, bound.pod, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 1, containerID: "containerd://c-0", state: { terminated: { exitCode: 1 } } }] } })));
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  })();
+  await Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
+  await ending;
+  for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its binding was not let go");
+  assert.deepEqual(recorded.asked, [`record ${env.namespace}/fs-broken released into s-live`, `detach node-a ${bound.pod}`]);
+  assert.ok(told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "broken"));
+  // One whose pod went: released into it as its Lease is let go.
+  const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-gone", namespace: env.namespace, annotations: { "alasio.dev/binding-key": sessionKey("fs-gone") } }, spec: { holderIdentity: "none-9" } };
+  await Effect.runPromise(sessions.recordLost(env.none, lease));
+  assert.equal(recorded.asked.at(-1), `record ${env.namespace}/fs-gone released into s-live`);
 });
