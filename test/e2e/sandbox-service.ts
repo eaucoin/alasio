@@ -254,7 +254,7 @@ export function sandboxService(): void {
       await until("the gateway making a workspace after it", async () => ((await gatewayCall(await mainToken("fs-e2erebooted"), "POST", "/workspace")).status === 204 ? true : undefined), 60_000);
       // The bound one, its workspace unreachable in its pod, released as broken.
       await until("the bound pod released", async () =>
-        (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` })).length === 0 ? true : undefined, 180_000, async () => `\n${await serviceLogs(workspace)}`);
+        (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` })).length === 0 ? true : undefined, 180_000, async () => `\nits node's agent says of what is attached: ${(await agentCall("GET", "/attachments")).said}\n${await serviceLogs(workspace)}`);
       assert.match(await serviceLogs(workspace), /workspace is unreachable in its pod/u);
       await until("the gateway binding the workspace again", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
       const again = await boundPod(workspace);

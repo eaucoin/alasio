@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 import { Effect } from "effect";
 
-import { mountPoints, reaching, WorkspaceRefused } from "../src/node-agent/workspaces.ts";
+import { lookOnNode, mountPoints, reaching, WorkspaceRefused } from "../src/node-agent/workspaces.ts";
 import { workspacesNode } from "./support/node-workspaces.ts";
 
 const refusal = <A>(effect: Effect.Effect<A, unknown>) => Effect.runPromise(Effect.flip(effect)).then((error) => (error instanceof WorkspaceRefused ? error.status : error));
@@ -22,7 +22,20 @@ test("what is mounted is unreachable where reading it answers ENOTCONN or EIO, a
   assert.equal(await reaching(failing("EACCES"))("/p"), true);
   assert.equal(await reaching(() => Promise.resolve([]))("/p"), true);
   assert.equal(await reaching(() => new Promise(() => {}), 50)("/p"), true);
-  assert.equal(await reaching()(import.meta.dirname), true);
+});
+
+test("what is attached into a pod is looked at in the node's mount namespace, where its mount is, and unreachable as ls there says its mount is not connected, or fails to read it", async () => {
+  const ran: string[] = [];
+  const said = new Map([
+    ["/attach/pool-0/ws", { exitCode: 0, stdout: "/attach/pool-0/ws\n", stderr: "" }],
+    ["/attach/pool-1/ws", { exitCode: 1, stdout: "", stderr: "ls: /attach/pool-1/ws: Transport endpoint is not connected\n" }],
+    ["/attach/pool-2/ws", { exitCode: 2, stdout: "", stderr: "ls: cannot access '/attach/pool-2/ws': Input/output error\n" }],
+    ["/attach/pool-3/ws", { exitCode: 1, stdout: "", stderr: "ls: /attach/pool-3/ws: Permission denied\n" }],
+  ]);
+  const host = { run: (command: readonly string[]) => Effect.sync(() => (ran.push(command.join(" ")), said.get(command.at(-1) ?? "") ?? { exitCode: 0, stdout: "", stderr: "" })) };
+  const reaches = reaching(lookOnNode(host));
+  assert.deepEqual(await Promise.all([0, 1, 2, 3].map((n) => reaches(`/attach/pool-${n}/ws`))), [true, false, false, true]);
+  assert.equal(ran[0], "ls -d -- /attach/pool-0/ws");
 });
 
 test("the pods a workspace is attached into are listed each by whether it is reachable, and none other of the node's mounts", async () => {

@@ -179,7 +179,7 @@ export interface WorkspacesOptions {
   readonly host: HostCommands;
   /** Whether workspace storage is mounted at the workspaces' root: as its file system says, but for tests. */
   readonly mounted?: (root: string) => Promise<boolean>;
-  /** Whether what is mounted at a point is reachable: as reaching says, but for tests. */
+  /** Whether what is mounted at a point is reachable: as reaching says of a look in the node's mount namespace (lookOnNode), but for tests. */
   readonly reaches?: (point: string) => Promise<boolean>;
   readonly runsc: Pick<Runsc, "container" | "exec">;
   readonly juicefs: Juicefs | null;
@@ -196,11 +196,11 @@ const FUSE_SUPER_MAGIC = 0x65735546;
 const fuseAt = (root: string): Promise<boolean> => statfs(root).then(({ type }) => type === FUSE_SUPER_MAGIC, () => false);
 
 /**
- * Whether what is mounted at a point is reachable, as `read` reads its directory: not where the
+ * Whether what is mounted at a point is reachable, as `read` looks at it: not where the
  * mount it was bound from ended under it, as FUSE answers ENOTCONN, or EIO, of one whose
  * process ended; one that does not answer within `timeoutMs` is not taken for lost.
  */
-export const reaching = (read: (point: string) => Promise<unknown> = readdir, timeoutMs = 5_000) => (point: string): Promise<boolean> =>
+export const reaching = (read: (point: string) => Promise<unknown>, timeoutMs = 5_000) => (point: string): Promise<boolean> =>
   new Promise((resolve) => {
     const timer = setTimeout(() => resolve(true), timeoutMs);
     read(point).then(() => true, (error: NodeJS.ErrnoException) => error.code !== "ENOTCONN" && error.code !== "EIO").then((reached) => {
@@ -209,7 +209,19 @@ export const reaching = (read: (point: string) => Promise<unknown> = readdir, ti
     });
   });
 
-export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches = reaching(), workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID }: WorkspacesOptions): Workspaces {
+/**
+ * A look at the mount point `point` in the node's mount namespace, by `host`, where the mounts
+ * of what is attached into pods are, which the agent's own does not see: as a read of it would
+ * fail, its failure's code as `ls` says it (ENOTCONN, EIO, or none it names).
+ */
+export const lookOnNode = (host: HostCommands) => (point: string): Promise<void> =>
+  Effect.runPromise(Effect.orDie(host.run(["ls", "-d", "--", point]))).then(({ exitCode, stderr }) => {
+    if (exitCode === 0) return;
+    const code = /not connected/iu.test(stderr) ? "ENOTCONN" : /input\/output error/iu.test(stderr) ? "EIO" : "EUNKNOWN";
+    throw Object.assign(new Error(stderr.trim()), { code });
+  });
+
+export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches = reaching(lookOnNode(host)), workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID }: WorkspacesOptions): Workspaces {
   /** Where `ref`'s files are on the node, its names checked. */
   const filesOf = ({ environment, workspace }: WorkspaceRef): Effect.Effect<string, WorkspaceRefused> =>
     !ENVIRONMENT.test(environment) || !isValidVolumeId(workspace)
