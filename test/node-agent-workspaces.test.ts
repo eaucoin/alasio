@@ -267,3 +267,31 @@ test("nothing is made, cloned, attached or recorded where workspace storage is n
     at.done();
   }
 });
+
+test("bayma of a bound pod of a pool on this node is told to go on with its stop, by its hook run in its container, and no other container nor pod's is", async () => {
+  const at = workspacesNode();
+  try {
+    at.pod("pool-0");
+    const pod = (name: string, container = "bayma", namespace = "alasio-sessions") => ({ "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": name, "io.kubernetes.cri.container-name": container });
+    for (const [id, annotations] of [["c-bayma", pod("pool-0")], ["c-other", pod("pool-0", "sidecar")], ["c-elsewhere", pod("other-0")]] as const) {
+      at.running.add(id);
+      at.annotations.set(id, annotations);
+    }
+    const hook = ["node", "/opt/bayma/bayma.js", "sandbox-hook", "stop", "--state-dir", "/home/agent/.bayma"];
+    const stop = (containerId: string, of = "pool-0", argv: readonly string[] = hook) => at.workspaces.stop({ namespace: "alasio-sessions", pod: of, containerId, hook: argv });
+    await Effect.runPromise(stop("c-bayma"));
+    assert.deepEqual(at.execs, [`r c-bayma ${hook.join(" ")}`]);
+    // Not its pod's bayma; not the pod it says; of no pool here, as kubelet made it no directory; a hook but stop's; a container that runs not.
+    assert.equal(await refusal(stop("c-other")), 403);
+    assert.equal(await refusal(stop("c-bayma", "pool-1")), 403);
+    assert.equal(await refusal(stop("c-elsewhere", "other-0")), 403);
+    assert.equal(await refusal(stop("c-bayma", "pool-0", ["sh", "-c", "rm -rf /"])), 400);
+    assert.equal(await refusal(stop("c-gone")), 404);
+    assert.equal(at.execs.length, 1);
+    // A hook that fails, its failure said.
+    at.hooks.fail = true;
+    assert.equal(await refusal(stop("c-bayma")), 502);
+  } finally {
+    at.done();
+  }
+});

@@ -318,6 +318,21 @@ test("a runtime's options file gives runsc its shim's flags", () => {
   assert.throws(() => runscFlags("[runsc_config]\n  debug = true\n"), /\[runsc_config\] holds what is not a string flag: debug = true/u);
 });
 
+test("a command is run in a container by its release's runsc's exec, its failure said", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-runsc-exec-"));
+  try {
+    const releases = fakeReleases(root, [RELEASE]);
+    const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot });
+    await Effect.runPromise(runsc.exec(RELEASE, "container-0", ["bayma", "sandbox-hook", "stop"], 10_000));
+    assert.deepEqual(releases.calls(RELEASE).at(-1)?.filter((arg) => !arg.startsWith("--")), ["exec", "container-0", "bayma", "sandbox-hook", "stop"]);
+    writeFileSync(join(releases.dirOf(RELEASE), "fail-exec"), "");
+    const failed = await Effect.runPromise(Effect.flip(runsc.exec(RELEASE, "container-0", ["bayma", "sandbox-hook", "stop"], 10_000)));
+    assert.match(failed.message, /the hook exited 1/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a checkpoint saves the sandbox with its release's runsc, uploads its image under its digest, checks the bucket holds it as put, then writes its manifest and commits it", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
@@ -1894,6 +1909,7 @@ const unusedWorkspaces: Workspaces = {
   detach: () => Effect.die("no workspace is detached"),
   read: () => Effect.die("no workspace's file is read"),
   write: () => Effect.die("no workspace's file is written"),
+  stop: () => Effect.die("no bayma is told to stop"),
   released: () => Effect.die("no workspace's release is read"),
   setReleased: () => Effect.die("no workspace's release is recorded"),
 };
@@ -2442,6 +2458,13 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       const tooLarge = yield* Effect.flip(agents.readFile(ref, "home/.alasio/received/1/blob", 2));
       assert.equal(tooLarge._tag === "NodeAgentError" && tooLarge.status, 413);
       at.running.add("container-0");
+      // Its bayma told to go on with its stop, through its node's agent; another pod's bayma not.
+      at.annotations.set("container-0", { "io.kubernetes.cri.sandbox-namespace": "alasio-sessions", "io.kubernetes.cri.sandbox-name": "pool-0", "io.kubernetes.cri.container-name": "bayma" });
+      const hook = ["bayma", "sandbox-hook", "stop", "--state-dir", "/home/agent/.bayma"];
+      yield* agents.stop("node-1", { namespace: "alasio-sessions", pod: "pool-0", containerId: "container-0", hook });
+      assert.deepEqual(at.execs, [`r container-0 ${hook.join(" ")}`]);
+      const notItsPod = yield* Effect.flip(agents.stop("node-1", { namespace: "alasio-sessions", pod: "pool-1", containerId: "container-0", hook }));
+      assert.equal(notItsPod._tag === "NodeAgentError" && notItsPod.status, 403);
       const running = yield* Effect.flip(agents.detach("node-1", "pool-0", ["container-0"]));
       assert.equal(running._tag === "NodeAgentError" && running.status, 409);
       at.running.delete("container-0");
