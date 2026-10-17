@@ -35,8 +35,9 @@ export interface BinderOptions {
   readonly staleMs?: number;
 }
 
-/** A key bound: its pod, and the pod's address. */
+/** A key bound: its binding, its Lease's uid; its pod, and the pod's address. */
 export interface Bound {
+  readonly binding: string;
   readonly pod: string;
   readonly address: string;
 }
@@ -91,12 +92,12 @@ export class Binder extends Context.Service<Binder, {
             () => Effect.sync(() => void waits.set(poolKey(pool), (waits.get(poolKey(pool)) ?? 1) - 1)),
           );
 
-        /** The pod `name` once it serves, by `deadline`. */
-        const servingBy = (pool: Pool, key: string, name: string, deadline: number): Effect.Effect<Bound, KubeApiError | BindTimeout> =>
+        /** The binding `binding`'s pod `name` once it serves, by `deadline`. */
+        const servingBy = (pool: Pool, key: string, binding: string, name: string, deadline: number): Effect.Effect<Bound, KubeApiError | BindTimeout> =>
           Effect.gen(function*() {
             for (;;) {
               const pod = (yield* kube.read("v1", "Pod", pool.namespace, name)) as V1Pod | null;
-              if (pod && serving(pod) && pod.status?.podIP) return { pod: name, address: pod.status.podIP };
+              if (pod && serving(pod) && pod.status?.podIP) return { binding, pod: name, address: pod.status.podIP };
               if ((yield* Clock.currentTimeMillis) >= deadline) return yield* new BindTimeout({ key, pool: pool.name, waited: "pod serving" });
               yield* Effect.sleep(BIND_POLL_MS);
             }
@@ -129,11 +130,12 @@ export class Binder extends Context.Service<Binder, {
          * Binds `key` with the Lease `taken` this bind took: a pod got for it (podFor), its
          * Lease renewed every `renewMs` the while, however long that takes, as a restore may take
          * minutes, so that another binder takes it over only once this one has stopped renewing
-         * it; then the pod named its holder, the renewals stopped first, none under way. The pod's
-         * name, or null where another binder took the Lease over meanwhile, which then finds the
-         * pod bound to the key, and holds it. A bind that gets no pod lets the Lease go.
+         * it; then the pod named its holder, the renewals stopped first, none under way. The
+         * Lease and the pod's name, or null where another binder took the Lease over meanwhile,
+         * which then finds the pod bound to the key, and holds it. A bind that gets no pod lets
+         * the Lease go.
          */
-        const underWay = (pool: Pool, key: string, taken: BindingLease, make: MakePod | undefined, deadline: number): Effect.Effect<string | null, KubeApiError | BindTimeout> =>
+        const underWay = (pool: Pool, key: string, taken: BindingLease, make: MakePod | undefined, deadline: number): Effect.Effect<{ readonly lease: BindingLease; readonly name: string } | null, KubeApiError | BindTimeout> =>
           Effect.gen(function*() {
             let held = taken;
             let lost = false;
@@ -150,7 +152,8 @@ export class Binder extends Context.Service<Binder, {
               Effect.tapError(() => provide(releaseLease(held)).pipe(Effect.ignore)),
             );
             const name = pod.metadata?.name ?? "";
-            return lost || !(yield* provide(holdLease(held, name))) ? null : name;
+            const holding = lost ? null : yield* provide(holdLease(held, name));
+            return holding ? { lease: holding, name } : null;
           });
 
         const bind = (pool: Pool, key: string, { make }: BindOptions = {}): Effect.Effect<Bound, KubeApiError | BindTimeout> =>
@@ -159,14 +162,14 @@ export class Binder extends Context.Service<Binder, {
             for (;;) {
               const taken = yield* provide(takeLease(pool, key, binder, staleMs));
               if (taken.taken) {
-                const name = yield* underWay(pool, key, taken.lease, make, deadline);
-                if (name === null) continue;
-                return yield* servingBy(pool, key, name, deadline);
+                const bound = yield* underWay(pool, key, taken.lease, make, deadline);
+                if (bound === null) continue;
+                return yield* servingBy(pool, key, bound.lease.metadata?.uid ?? "", bound.name, deadline);
               }
               const holder = taken.lease.spec?.holderIdentity;
               if (holder) {
                 const pod = yield* provide(boundPod(pool, key));
-                if (pod?.metadata?.name === holder && !pod.metadata.deletionTimestamp) return yield* servingBy(pool, key, holder, deadline);
+                if (pod?.metadata?.name === holder && !pod.metadata.deletionTimestamp) return yield* servingBy(pool, key, taken.lease.metadata?.uid ?? "", holder, deadline);
                 // Its pod gone, or going: its Lease let go, as it was read, and the key bound anew.
                 yield* provide(releaseLease(taken.lease)).pipe(Effect.catchIf(hasStatus(409), () => Effect.void));
                 continue;
