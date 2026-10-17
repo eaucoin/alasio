@@ -32,7 +32,7 @@ import { Effect } from "effect";
 
 import pins from "../../cluster/node/pins.json" with { type: "json" };
 import { NAMESPACE } from "../../cli/src/manifests/common.ts";
-import { CONTAINERD, gvisorDirectory, gvisorHandler } from "../../src/node-agent/names.ts";
+import { CONTAINERD, gvisorDirectory, gvisorHandler, gvisorRuntimeClass } from "../../src/node-agent/names.ts";
 import { runscFlags } from "../../src/node-agent/runsc.ts";
 import { makeS3Bucket, type S3Bucket } from "../../src/node-agent/s3.ts";
 import { hookOf } from "../../src/sandbox/snapshots.ts";
@@ -274,6 +274,9 @@ let s3: { readonly endpoint: string; readonly region: string; readonly bucket: s
 /** Whether this machine, as a node, reaches the bucket: what listing it said. */
 const reaches = () => Effect.runPromise(bucket.list("gate-12/").pipe(Effect.as("listed"), Effect.catch((error) => Effect.succeed(error.message))));
 
+/** Where gate 4 put image D in the bucket, for the diagnostic of copies. */
+let uploadedD: { readonly own: string; readonly layersPrefix: string } | undefined;
+
 /** Puts the files of `image` under `prefix`. */
 async function upload(image: string, prefix: string): Promise<void> {
   for (const file of (await node(`find ${q(image)} -maxdepth 1 -type f -printf '%f\\n'`)).split("\n").filter(Boolean)) {
@@ -312,6 +315,7 @@ test("4. a chain restores straight from the bucket, from a directory holding s3_
     await upload(at("D"), `${layersPrefix}${own}/`);
     for (const layer of layers) await upload(byDigest.get(layer) ?? "", `${layersPrefix}${layer}/`);
     seen["uploadMs"] = Date.now() - uploadingAt;
+    uploadedD = { own, layersPrefix };
 
     // runsc, and the shim through it, reads every file of the image from the bucket.
     const directory = at("bucket-D");
@@ -413,4 +417,83 @@ test("7. a live snapshot restores into a new pod while its exec runs, which goes
     assert.ok(afresh.ready, JSON.stringify(afresh));
     seen["afterwards"] = await inGate<Read>("read", session.volumeId, session.replId).catch((error: unknown) => String(error));
     seen["exec"] = second.execId;
+  }));
+
+test("D. diagnostic: a server-side copy of an image reads the same whole and in ranges, and restores from the bucket as its source does; gVisor .6 restores from the bucket an image put there", { timeout: 40 * 60_000 }, () =>
+  recorded("diagnostic", async (seen) => {
+    assert.ok(uploadedD, "gate 4 put no image in the bucket");
+    const { own, layersPrefix } = uploadedD;
+    const copiedPrefix = `gate-12/${session.volumeId}/copied/layers/`;
+    // Each object of D and its layers, copied server-side, as the agent's fork and the cut-over's move copy them.
+    const objects = (await Effect.runPromise(bucket.list(layersPrefix))).map(({ key }) => key);
+    const sizes = new Map<string, number>();
+    for (const key of objects) {
+      const stored = await Effect.runPromise(bucket.head(key));
+      sizes.set(key, stored?.bytes ?? 0);
+      await Effect.runPromise(bucket.copy(key, `${copiedPrefix}${key.slice(layersPrefix.length)}`, stored?.bytes ?? 0));
+    }
+    seen["copied"] = objects.length;
+    // Each read through the AWS CLI on this machine: whole, and in ranges as a reader of pages reads, its SHA-256 and size.
+    const credentials = `AWS_ACCESS_KEY_ID=${q(s3.accessKeyId)} AWS_SECRET_ACCESS_KEY=${q(s3.secretAccessKey)} AWS_DEFAULT_REGION=${q(s3.region)}`;
+    const read = async (key: string, range?: string) =>
+      (await node(`rm -f /tmp/diag-read && ${credentials} aws --endpoint-url ${q(s3.endpoint)} s3api get-object --bucket ${q(s3.bucket)} --key ${q(key)} ${range ? `--range ${q(range)}` : ""} /tmp/diag-read >/dev/null 2>/tmp/diag-err; echo "$(sha256sum /tmp/diag-read 2>/dev/null | cut -d' ' -f1) $(stat -c %s /tmp/diag-read 2>/dev/null) $(head -c 300 /tmp/diag-err | tr '\n' ' ')"`)).trim();
+    const differing: Record<string, unknown>[] = [];
+    let compared = 0;
+    for (const key of objects) {
+      const size = sizes.get(key) ?? 0;
+      const ranges = [undefined, ...(size > 0 ? [`bytes=0-${Math.min(4095, size - 1)}`, `bytes=${Math.max(0, size - 4096)}-${size - 1}`] : []), ...(size > (16 << 20) ? [`bytes=4096-${(1 << 20) + 4095}`, `bytes=${Math.floor(size / 2)}-${Math.floor(size / 2) + (8 << 20) - 1}`] : [])];
+      for (const range of ranges) {
+        const [source, copy] = [await read(key, range), await read(`${copiedPrefix}${key.slice(layersPrefix.length)}`, range)];
+        compared += 1;
+        if (source !== copy) differing.push({ key, size, range: range ?? "whole", source, copy });
+      }
+    }
+    seen["reads"] = { compared, differing };
+
+    // The copy restored straight from the bucket, as gate 4 restored its source; from a new pod, as gate 7 left the session.
+    const directory = at("bucket-D-copied");
+    await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && umask 077 && printf '%s' ${q(goferOptions(`${copiedPrefix}${own}/`, copiedPrefix))} >${q(`${directory}/s3_opts.json`)}`);
+    seen["copiedRestore"] = await restoreFrom(directory).catch((error: unknown) => String(error));
+
+    // gVisor .6, as the box kept it, restoring an image it took and put in the bucket, of a pod of its own.
+    const six = pins.gvisor.releases.find(({ release: each }) => each !== release)?.release;
+    seen["six"] = six ?? "none kept";
+    if (!six) return;
+    const podOf = (name: string, annotations: Record<string, string> = {}) => ({
+      apiVersion: "v1",
+      kind: "Pod",
+      metadata: { name, namespace: "default", annotations },
+      spec: {
+        runtimeClassName: gvisorRuntimeClass(six),
+        restartPolicy: "Never",
+        containers: [{ name: "main", image: "mirror.gcr.io/library/busybox:1.37.0", command: ["sh", "-c", "echo six >/tmp/marker; sleep 86400"] }],
+      },
+    });
+    const phase = async (name: string) => (await kube.get<V1Pod>(ref("Pod", name, "default")))?.status?.phase;
+    const until = async (name: string, ms: number) => {
+      const deadline = Date.now() + ms;
+      while (Date.now() < deadline && (await phase(name)) !== "Running") await sleep(1000);
+      return (await phase(name)) ?? "gone";
+    };
+    try {
+      await kube.apply(podOf("diag-six"));
+      seen["sixRan"] = await until("diag-six", 180_000);
+      const pod = (await node(`k3s crictl pods --namespace default --name '^diag-six$' --state ready --quiet`)).trim();
+      const container = (await node(`k3s crictl ps --pod ${pod} --name '^main$' --quiet`)).trim();
+      const flags = runscFlags(await node(`cat ${q(`${CONTAINERD}/${gvisorHandler(six)}.toml`)}`));
+      const image = at("six");
+      await node(`rm -rf ${q(image)}`);
+      seen["sixCheckpoint"] = await node([`${gvisorDirectory(six)}/runsc`, `--root=${RUNSC_ROOT}`, ...flags, "checkpoint", `--image-path=${image}`, container].map(q).join(" ")).catch((error: unknown) => String(error));
+      await upload(image, "gate-12/diag/six/");
+      const restoring = at("bucket-six");
+      await node(`rm -rf ${q(restoring)} && mkdir -p ${q(restoring)} && umask 077 && printf '%s' ${q(goferOptions("gate-12/diag/six/", "gate-12/diag/six-layers/"))} >${q(`${restoring}/s3_opts.json`)}`);
+      await node("k3s kubectl delete pod diag-six --namespace default --grace-period=0 --force --wait=false").catch(() => "");
+      await kube.apply(podOf("diag-six-restored", { [RESTORE_ANNOTATION]: restoring }));
+      seen["sixRestored"] = await until("diag-six-restored", 180_000);
+      const listed = await kube.list<CoreV1Event>("Event", { namespace: "default", fieldSelector: "involvedObject.name=diag-six-restored" });
+      seen["sixEvents"] = listed.map(({ type, reason, message }) => `${type} ${reason}: ${message?.trim().slice(0, 600)}`).slice(-10);
+      if (seen["sixRestored"] === "Running") seen["sixMarker"] = (await node(`k3s kubectl exec diag-six-restored --namespace default -- cat /tmp/marker`)).trim();
+    } catch (error) {
+      seen["sixError"] = error instanceof Error ? error.message : String(error);
+    }
   }));
