@@ -14,7 +14,7 @@ import { clusterReleases, describeKept, snapshotReleases } from "../kept-release
 import { describeMemory, describeScale, describeSizing, memoryBytes, memoryText, type ScaledWorkload } from "../capacity.ts";
 import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
-import { diagnose, readinessOf, selectorOf, starting } from "../kube/rollout.ts";
+import { diagnose, READY_ONCE_BOUND_ANNOTATION, readinessOf, selectorOf, starting } from "../kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE } from "../manifests/common.ts";
 import { LOADER_COMPONENT } from "../manifests/lake.ts";
 import { REPLICA_NAME } from "../manifests/neon.ts";
@@ -195,6 +195,8 @@ function unwakeable(scaler: ScaledObject | undefined): string | null {
  * it says, and whether it is ready.
  */
 function describeReady(workload: ScaledWorkload, computes: ReadonlyMap<string, ComputeTimes>, scaler: ScaledObject | undefined): { said: string; ready: boolean } {
+  // A sandbox pool's, ready as its pods run: as many warm, each ready only once bound.
+  if (workload.metadata?.annotations?.[READY_ONCE_BOUND_ANNOTATION] === "true") return { said: `pool, ${workload.spec?.replicas ?? 1} warm`, ready: true };
   switch (workload.metadata?.name) {
     case neonName("compute"):
     case REPLICA_NAME:
