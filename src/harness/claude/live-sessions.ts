@@ -840,16 +840,29 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     yield* persistence.updateActiveTurnPendingResponseId(pendingResponseId);
     const done = yield* Deferred.make<TurnResult, StoreError | TurnFenced>();
     let host: ClaudeHost | null = null;
-    /** Stops the turn, once its process runs it; one still starting is stopped as it ends. */
+    /** Whether the turn's prompt is pushed to its process: before then, a stop is the turn's to take up (stoppedBeforePush). */
+    let pushed = false;
+    /** Why the turn is stopped, where it was before its prompt was pushed; null while it is not. */
+    let stoppedFor: string | null = null;
+    /**
+     * Stops the turn: once its prompt is pushed, by interrupting its process; before then, as
+     * its process starts or its prompt's dispatch is recorded, by the turn itself, which then
+     * pushes nothing and ends as interrupted.
+     */
     const stop = Effect.fnUntraced(function*(reason: StopReason) {
       // However the turn ends, the stop is done once it has.
       const ended = Effect.ignore(Deferred.await(done));
+      const text = stopReasonText(reason);
+      if (!pushed) {
+        stoppedFor ??= text;
+        yield* ended;
+        return;
+      }
       const live = host;
       if (!live || live.current !== current) {
         yield* ended;
         return;
       }
-      const text = stopReasonText(reason);
       current.interrupted = true;
       current.projection.blockSequence.length = 0;
       for (const uuid of current.promptUuids) {
@@ -897,6 +910,24 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       done,
       registration: yield* Scope.make(),
     };
+    /**
+     * Ends the turn stopped, for `reason`, before its prompt was pushed to `live`, its process,
+     * which it leaves idle, as finishOperatorTurn ends one: the conversation let go of, the turn
+     * done, and the conversation's idle hook run, for what waits on it to go on.
+     */
+    const stoppedBeforePush = Effect.fnUntraced(function*(live: ClaudeHost, reason: string) {
+      if (live.current === current) live.current = null;
+      current.interrupted = true;
+      current.projection.blockSequence.length = 0;
+      current.promptUuids.clear();
+      yield* current.turnTimer("query.interrupted", { reason });
+      yield* Effect.logInfo(`Claude Code turn stopped before its prompt was sent: ${reason}`);
+      yield* Scope.close(current.registration, Exit.void);
+      const interrupted: TurnResult = { blockSequence: current.projection.blockSequence, sessionId: live.sessionId ?? params.resumeSession ?? null, pendingResponseId, interrupted: true, responseCompleted: false };
+      yield* Deferred.complete(done, storeBlocks(current.projection, persistence).pipe(Effect.as(interrupted)));
+      yield* params.onIdle ?? Effect.void;
+      return yield* Deferred.await(done);
+    });
     // Registered before the process is made sure of, so the conversation reads as busy at
     // once; the registration ends with the turn, or with this fiber if it is interrupted.
     yield* activeTurns.register(threadKey, { cliInitiated: false, stop, steer }, { workspace: workspacePod?.(threadKey) }).pipe(Scope.provide(current.registration));
@@ -910,6 +941,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
           return null;
         })),
       );
+      if (started !== null && stoppedFor !== null) return yield* stoppedBeforePush(started, stoppedFor);
       if (started === null) {
         const failed: TurnResult = { blockSequence: current.projection.blockSequence, sessionId: params.resumeSession ?? null, pendingResponseId, interrupted: false, responseCompleted: false };
         // A stop asked for while the process was starting waits for how the turn ended.
@@ -931,6 +963,9 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       if (params.onPromptDispatched) {
         yield* params.onPromptDispatched;
       }
+      // Stopped as its dispatch was recorded, the turn pushes nothing; past this, a stop interrupts its process.
+      if (stoppedFor !== null) return yield* stoppedBeforePush(started, stoppedFor);
+      pushed = true;
       yield* started.channel.push(buildClaudeUserMessage(prompt, uuid));
       for (const steerPrompt of current.earlySteers.splice(0)) {
         yield* steer(steerPrompt);

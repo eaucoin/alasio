@@ -1134,3 +1134,77 @@ test("a stop asked while Claude Code is still starting is done once the turn end
   assert.equal(busy(activeTurns, "telegram:1"), false);
   await closeAll();
 });
+
+test("a stop asked while Claude Code is still starting stops the turn as it starts: its prompt is neither dispatched nor sent", { timeout: 10_000 }, async () => {
+  const persistence = createPersistence();
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const { promise: bayma, resolve: answerBayma } = Promise.withResolvers<BaymaMcpServer>();
+  const { liveSessions, closeAll } = openLiveSessions({
+    workingDirectory: "/work",
+    sessions: quietSessions,
+    queryFactory: cli.queryFactory,
+    // Starting the process waits on the conversation's bayma.
+    folderBayma: () => Effect.promise(() => bayma),
+  }, activeTurns);
+  let dispatched = false;
+  let idle = 0;
+  const turn = runTurn(liveSessions, turnParams(persistence, { onPromptDispatched: Effect.sync(() => void (dispatched = true)), onIdle: Effect.sync(() => void (idle += 1)) }));
+  while (!busy(activeTurns, "telegram:1")) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  const stopping = runningTurnOf(activeTurns, "telegram:1").stop();
+  assert.equal(await settlesSoon(stopping), false, "the stop waits for the turn to end");
+  answerBayma(Effect.runSync(folderBayma({ threadKey: "telegram:1" })));
+  const result = await turn;
+  assert.equal(await settlesSoon(stopping), true, "the stop is done once the turn ends");
+  assert.equal(result.interrupted, true);
+  assert.equal(result.responseCompleted, false);
+  await settle();
+  assert.deepEqual(cli.prompts, [], "the prompt was never sent");
+  assert.equal(dispatched, false, "nor recorded as dispatched, for a restart to take as sent");
+  assert.equal(idle, 1, "the conversation's idle hook runs, as for any turn's end");
+  assert.equal(cli.state.interrupts, 0);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
+  await closeAll();
+});
+
+test("a stop asked as the turn's prompt is dispatched, its process running, stops the turn there: its prompt is never sent", { timeout: 10_000 }, async () => {
+  const persistence = createPersistence();
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: quietSessions, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  // The prompt's dispatch takes its while to record.
+  const { promise: recorded, resolve: record } = Promise.withResolvers<void>();
+  let dispatching = false;
+  let idle = 0;
+  const turn = runTurn(liveSessions, turnParams(persistence, {
+    onIdle: Effect.sync(() => void (idle += 1)),
+    onPromptDispatched: Effect.suspend(() => {
+      dispatching = true;
+      return Effect.promise(() => recorded);
+    }),
+  }));
+  while (!dispatching) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  const stopping = runningTurnOf(activeTurns, "telegram:1").stop();
+  assert.equal(await settlesSoon(stopping), false, "the stop waits for the turn to end");
+  record();
+  const result = await turn;
+  assert.equal(await settlesSoon(stopping), true, "the stop is done once the turn ends");
+  assert.equal(result.interrupted, true);
+  await settle();
+  assert.deepEqual(cli.prompts, [], "the prompt was never sent");
+  assert.equal(cli.state.interrupts, 0, "the idle process is not interrupted");
+  assert.equal(idle, 1, "the conversation's idle hook runs, as for any turn's end");
+  assert.equal(busy(activeTurns, "telegram:1"), false);
+  // The process serves the conversation's next turn.
+  const next = runTurn(liveSessions, turnParams(persistence, { prompt: "again" }));
+  const again = await cli.nextPrompt();
+  assert.equal(again.message.content, "again");
+  cli.emit(successResult({ result: "Done.", session_id: "s-1", user_message_uuids: [again.uuid] }));
+  assert.equal((await next).responseCompleted, true);
+  assert.equal(cli.state.created, 1);
+  await closeAll();
+});
