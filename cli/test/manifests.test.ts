@@ -3556,6 +3556,20 @@ describe("the sandbox service", () => {
     assert.equal(mount.spec?.template.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
   });
 
+  test("rolls the nodes' mount where a Service it reaches by address is made anew, or its bucket is another, and not otherwise", () => {
+    const annotation = (objects: readonly KubernetesObject[]) => one<V1DaemonSet>(objects, "DaemonSet", "alasio-workspace-mount").spec?.template.metadata?.annotations?.["checksum/storage-services"];
+    const reaching = (mountServices: Record<string, string | null>, file: Record<string, unknown> = {}) => annotation(manifests(configOf(file), { ...NOTHING_CARRIED, cpuBaseline: BASELINE, mountServices }));
+    const before = reaching({ "alasio-valkey": "uid-1", "alasio-seaweedfs": "uid-2" });
+    assert.match(before ?? "", /^[0-9a-f]{16}$/u);
+    assert.equal(reaching({ "alasio-valkey": "uid-1", "alasio-seaweedfs": "uid-2" }), before);
+    // Valkey made anew, the object store's Service, or one not there yet, as up makes it.
+    for (const remade of [{ "alasio-valkey": "uid-3", "alasio-seaweedfs": "uid-2" }, { "alasio-valkey": "uid-1", "alasio-seaweedfs": "uid-4" }, { "alasio-valkey": null, "alasio-seaweedfs": "uid-2" }]) {
+      assert.notEqual(reaching(remade), before, JSON.stringify(remade));
+    }
+    // Another bucket.
+    assert.notEqual(reaching({ "alasio-valkey": "uid-1", "alasio-seaweedfs": "uid-2" }, { objectStore: { buckets: { workspaces: "elsewhere" } } }), before);
+  });
+
   test("confines a pool's pods to the gateway in and the receiver out, with internet to the public internet beside, and admits alasio, its replicas and KEDA to the gateway, and the gateway to the node agents", () => {
     const policies = all<NetworkPolicyObject>(install(), "NetworkPolicy");
     const podOf = (component: string, namespace = "alasio", labels: Record<string, string> = {}): Pod => ({

@@ -292,17 +292,20 @@ export type CpuBaseline = readonly string[] | null;
  * checksum of the bot's Secret (../secrets.ts botChecksum), which alasio reads only as it
  * starts, so its pod carries it, and is replaced when the bot or its users change; and where
  * its API server is (../api-server.ts), which the NetworkPolicies of what may reach it alone
- * name, null where it cannot be read.
+ * name, null where it cannot be read; and the UIDs of the Services the nodes' mount of workspace
+ * storage reaches by their addresses (./sandbox-gateway.ts mountServices), each by its name,
+ * null where it is not there, so a Service made anew rolls the mount onto its address.
  */
 export interface Kept {
   readonly cpuBaseline: CpuBaseline;
   readonly gvisorReleases: readonly string[];
   readonly botChecksum: string | null;
   readonly apiServer: ApiServer | null;
+  readonly mountServices: Readonly<Record<string, string | null>>;
 }
 
-/** What a cluster keeps where up has found nothing of it yet: no baseline, the releases pinned, no bot, and no API server known. */
-export const NOTHING_KEPT: Kept = { cpuBaseline: null, gvisorReleases: gvisorReleases(NODE_PINS), botChecksum: null, apiServer: null };
+/** What a cluster keeps where up has found nothing of it yet: no baseline, the releases pinned, no bot, no API server known, and none of the mount's Services. */
+export const NOTHING_KEPT: Kept = { cpuBaseline: null, gvisorReleases: gvisorReleases(NODE_PINS), botChecksum: null, apiServer: null, mountServices: {} };
 
 /**
  * What `alasio up` carries forward from the installation it replaces: the sandbox pools'
