@@ -1,5 +1,5 @@
 /**
- * 12's gates on k3s (program/12-live-lazy.md, gates 2 to 8): alasio up on k3s on the runner,
+ * 12's gates on k3s (program/12-live-lazy.md, gates 2 to 8 and 10): alasio up on k3s on the runner,
  * the host target (test/e2e/harness.ts), its sessions' runtime with 12's options, as alasio
  * installs them (dirty tracking by write-protection, working sets recorded, restores in the
  * background), and a
@@ -22,7 +22,9 @@
  *      whose held file changed since, which the restore refuses;
  *   8. a restore from the bucket whose proxy goes away during its background reads, for a
  *      while: briefly, as long as a node agent takes to come back, and for five minutes; its
- *      reads wait for the proxy, its memory comes back intact, and it saves again.
+ *      reads wait for the proxy, its memory comes back intact, and it saves again;
+ *  10. a restore from the bucket whose proxy goes away for good during its background reads:
+ *      its pod, deleted, goes within its grace, its sandbox and checkpoint gofer with it.
  *
  * What each records goes into $OUT/evidence.json.
  *
@@ -652,3 +654,77 @@ test("8. a restore from the bucket whose proxy goes away during its background r
     }
   }));
 
+/** How long past its grace a deleted session pod whose store went for good may take to go, its sandbox and checkpoint gofer with it. */
+const TEARDOWN_MARGIN_MS = 15_000;
+/** How long gate 10 leaves a restore's reads waiting for a store gone for good before its pod is deleted: past the gofer's attempts of a read. */
+const WAITING_MS = 120_000;
+
+/** Which of the processes `pids` run on the node, zombies aside, whose command lines are empty. */
+const running = async (pids: readonly string[]): Promise<string[]> =>
+  pids.length === 0 ? [] : (await node(pids.map((pid) => `[ -n "$(tr -d '\\0' </proc/${pid}/cmdline 2>/dev/null)" ] && echo ${pid}`).join("; ") + "; true")).split("\n").filter(Boolean);
+/** The processes on the node whose command line `pattern` (pgrep -f's) matches. */
+const pgrep = async (pattern: string): Promise<string[]> => (await node(`pgrep -f ${q(pattern)} || true`)).split("\n").filter(Boolean);
+
+test("10. a restore from the bucket whose proxy goes away for good during its background reads: its pod, deleted, goes within its grace, its sandbox and checkpoint gofer with it", { timeout: 30 * 60_000 }, () =>
+  recorded("goneForGood", async (seen) => {
+    await throughProxy(async (proxy) => {
+      Object.assign(session, await inGate<Created>("create"));
+      seen["session"] = { ...session };
+      seen["ballast"] = await inGate("ballast", session.volumeId, session.replId, String(BALLAST_MIB));
+      const layersPrefix = `gate-12/${session.volumeId}/layers/`;
+      const image = "gone-for-good";
+      seen["checkpoint"] = await checkpoint(image, { live: false });
+      const own = await digest(at(image));
+      await upload(at(image), `${layersPrefix}${own}/`);
+      const pagesBytes = Number((await node(`stat -c %s ${q(`${at(image)}/pages.img`)}`)).trim());
+      seen["pagesBytes"] = pagesBytes;
+      const token = minted(proxy, layersPrefix);
+      const relay = await relayTo(proxy.endpoint, { bytesPerSecond: OUTAGE_RELAY_BYTES_PER_SECOND });
+      try {
+        const directory = at(`bucket-${image}`);
+        await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && umask 077 && printf '%s' ${q(goferOptions(`${layersPrefix}${own}/`, layersPrefix, relay.endpoint, { access_key_id: token.accessKeyId, secret_access_key: token.secretAccessKey }))} >${q(`${directory}/s3_opts.json`)}`);
+        const gofersBefore = new Set(await pgrep("^runsc-checkpointgofer "));
+        const startedAt = Date.now();
+        const restored = await restoreFrom(directory);
+        seen["restore"] = restored;
+        assert.ok(restored.ready, JSON.stringify(restored));
+        const { pod } = await ids();
+        const sandboxes = await pgrep(`^runsc-sandbox .*${pod}`);
+        const gofers = (await pgrep("^runsc-checkpointgofer ")).filter((pid) => !gofersBefore.has(pid));
+        seen["processes"] = { pod, sandboxes, gofers };
+        assert.ok(sandboxes.length > 0 && gofers.length > 0, JSON.stringify(seen["processes"]));
+        // Cut as the background reads go on, a quarter of the pages read at least, for good.
+        for (;;) {
+          const { bytes, lastAt } = relay.carried();
+          assert.ok(bytes < pagesBytes * 0.9, `the restore read ${bytes} of ${pagesBytes} bytes before the gate could cut it`);
+          if (bytes >= pagesBytes / 4 && Date.now() - lastAt < 1000) break;
+          assert.ok(Date.now() - startedAt < 300_000, `the restore read ${bytes} of ${pagesBytes} bytes in 5 minutes`);
+          await sleep(100);
+        }
+        seen["cutAt"] = { bytes: relay.carried().bytes, ms: Date.now() - startedAt };
+        await relay.cut();
+        await sleep(WAITING_MS);
+        seen["podWaiting"] = await podState();
+        // Its reads waiting for the store still, the pod is deleted, as alasio deletes a
+        // session's pod it stops: its Sandbox suspended.
+        const grace = (await kube.get<V1Pod>(ref("Pod", session.volumeId, SESSIONS)))?.spec?.terminationGracePeriodSeconds ?? 30;
+        const deletedAt = Date.now();
+        await kube.patch(ref("Sandbox", session.volumeId, SESSIONS), { spec: { operatingMode: "Suspended" } });
+        while ((await podState()) !== "gone") {
+          assert.ok(Date.now() - deletedAt < 600_000, `the pod of ${session.volumeId} is still there 10 minutes after its deletion`);
+          await sleep(250);
+        }
+        const goneMs = Date.now() - deletedAt;
+        let left = await running([...sandboxes, ...gofers]);
+        while (left.length > 0 && Date.now() - deletedAt < goneMs + TEARDOWN_MARGIN_MS) {
+          await sleep(250);
+          left = await running(left);
+        }
+        seen["teardown"] = { graceSeconds: grace, goneMs, left, events: await events() };
+        assert.ok(goneMs <= grace * 1000 + TEARDOWN_MARGIN_MS, JSON.stringify(seen["teardown"]));
+        assert.deepEqual(left, [], JSON.stringify(seen["teardown"]));
+      } finally {
+        relay.close();
+      }
+    });
+  }));
