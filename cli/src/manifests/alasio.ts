@@ -24,7 +24,7 @@ import type {
 
 import { Result } from "effect";
 
-import { BRANCH_FORK_PORT, branchSessionsNamespace } from "../../../src/branch/names.ts";
+import { BRANCH_FORK_PORT, BRANCH_PARENT_LABEL, branchSessionsNamespace, MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
 import { decodeKubeTemplates, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import { BAYMA_STOP_SECONDS, CPU_FEATURES_ANNOTATION, STOP_WAIT_ARG } from "../../../src/kube/sandbox-shape.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "../../../src/node-agent/names.ts";
@@ -573,7 +573,8 @@ function branchForksService(): V1Service {
  * and warns and audits of "restricted", the sandbox pods' policy holding every pod of it to the
  * pools' templates instead (./admission.ts sandboxPodPolicy). The host profile's is
  * "privileged", as its pods mount the machine. A branch environment always has its own,
- * beside its own namespace.
+ * beside its own namespace, which records the environment it was branched from, main's
+ * (BRANCH_PARENT_LABEL), as the sandbox gateway forks main's sessions into it for that alone.
  */
 function namespaces(config: InstallConfig, environment: Environment): V1Namespace[] {
   const { sessions, host } = config;
@@ -590,6 +591,7 @@ function namespaces(config: InstallConfig, environment: Environment): V1Namespac
           labels: {
             ...labels("session"),
             ...branched,
+            ...(branch ? { [BRANCH_PARENT_LABEL]: MAIN_ENVIRONMENT_NAME } : {}),
             ...(sandboxServiceRuns(config)
               ? { "pod-security.kubernetes.io/enforce": "privileged", "pod-security.kubernetes.io/audit": "restricted", "pod-security.kubernetes.io/audit-version": "latest" }
               : { "pod-security.kubernetes.io/enforce": "restricted", "pod-security.kubernetes.io/enforce-version": "latest" }),

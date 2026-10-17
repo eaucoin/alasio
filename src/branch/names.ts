@@ -9,6 +9,13 @@ import { createHmac } from "node:crypto";
 /** The label of a branch environment's objects and namespaces, whose value is its name. */
 export const BRANCH_LABEL = "alasio.dev/branch";
 
+/**
+ * The label of a branch environment's sessions' namespace whose value is the environment it
+ * was branched from, its parent's, main's: the one the sandbox gateway forks sessions into it
+ * for (src/gateway/sessions.ts).
+ */
+export const BRANCH_PARENT_LABEL = "alasio.dev/branch-parent";
+
 /** The name of main's environment, as its sessions are told apart from a branch's. */
 export const MAIN_ENVIRONMENT_NAME = "main";
 

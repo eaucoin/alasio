@@ -71,7 +71,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
     const environments = yield* makeEnvironments({ main: config.environment });
     const events = yield* eventsOf;
     const sessions = yield* makeSessions(
-      { environments, pools: config.pools, releaseAfterMs: config.releaseAfterSeconds * 1000, podPort: config.podPort, bindingKey, events },
+      { environments, pools: config.pools, releaseAfterMs: config.releaseAfterSeconds * 1000, podPort: config.podPort, bindingKey, events, quotaBytes: config.quotaBytes },
       agents,
       binder,
     );
@@ -97,6 +97,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       bindingKey,
       podPort: config.podPort,
       poolOf: sessions.place,
+      operate: sessions.operate,
       // Every replica's address but its own, which answers its own waiting.
       peers: () =>
         Effect.tryPromise(() => lookup(config.peers, { all: true })).pipe(

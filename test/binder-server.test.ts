@@ -11,7 +11,7 @@ import { Effect, Exit, Layer, Scope } from "effect";
 import { Binder } from "../src/binder/binder.ts";
 import { activeAt, readLease } from "../src/binder/bindings.ts";
 import { environmentKey, freeLabels, type Pool } from "../src/binder/names.ts";
-import { type BinderServer, NO_BIND_HEADER, type Placement, PlacementRefused, serveBinder } from "../src/binder/server.ts";
+import { type BinderServer, MAX_OPERATION_BYTES, NO_BIND_HEADER, type Operation, type Placement, PlacementRefused, serveBinder } from "../src/binder/server.ts";
 import { mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
@@ -68,12 +68,13 @@ async function front(
     placed = [] as Readonly<Record<string, string>>[],
     release = undefined as Placement["release"],
     keyOf = callerKey as Buffer | ((claims: TokenClaims) => Buffer | null),
+    operate = undefined as ((claims: TokenClaims, operation: Operation) => Effect.Effect<{ status: number; json?: unknown; bytes?: Uint8Array }>) | undefined,
   } = {},
 ): Promise<BinderServer & { close: () => Promise<void> }> {
   const scope = await Effect.runPromise(Scope.make());
   const layer = Layer.provideMerge(Binder.layer({ waitMs }), Layer.fresh(KubeClient.layer));
   const served = await Effect.runPromise(
-    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, poolOf: (_key, options) =>
+    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), poolOf: (_key, options) =>
       options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: of, release })), peers: () => Effect.succeed(peers) }).pipe(
       Effect.provide(layer),
       Scope.provide(scope),
@@ -287,6 +288,40 @@ test("a key is bound where the gateway places it, by what its caller's token say
     const nowhere = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:other", Date.now() + 60_000, { environment: "nowhere" }) } });
     assert.equal(nowhere.status, 403);
     assert.equal(await run(readLease(of, "sessionfs:other")), null);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a request under /workspace is answered by the front itself, as its operate says, of its caller's token's claims, binding nothing; one past the most it takes is refused", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  const asked: { claims: TokenClaims; method: string; path: string; query: string; body: string }[] = [];
+  const served = await front(of, stand.port, {
+    operate: (claims, { method, path, query, body }) =>
+      Effect.sync(() => {
+        asked.push({ claims, method, path, query: query.toString(), body: Buffer.from(body).toString() });
+        return path === "/workspace/files" ? { status: 200, bytes: Buffer.from("bytes of a file") } : { status: 201, json: { made: true } };
+      }),
+  });
+  try {
+    const key = "sessionfs:workspace";
+    const made = await fetch(`http://127.0.0.1:${served.port}/workspace`, { method: "POST", headers: { authorization: caller(key, Date.now() + 60_000, { environment: "main" }) }, body: "{\"a\":1}" });
+    assert.deepEqual([made.status, await made.json()], [201, { made: true }]);
+    const read = await fetch(`http://127.0.0.1:${served.port}/workspace/files?path=workspace%2Fa`, { headers: { authorization: caller(key) } });
+    assert.deepEqual([read.status, read.headers.get("content-type"), await read.text()], [200, "application/octet-stream", "bytes of a file"]);
+    assert.deepEqual(asked.map(({ claims, ...rest }) => ({ ...rest, key: claims.key, options: claims.options })), [
+      { method: "POST", path: "/workspace", query: "", body: "{\"a\":1}", key, options: { environment: "main" } },
+      { method: "GET", path: "/workspace/files", query: "path=workspace%2Fa", body: "", key, options: undefined },
+    ]);
+    const over = await fetch(`http://127.0.0.1:${served.port}/workspace/files`, { method: "PUT", headers: { authorization: caller(key) }, body: Buffer.alloc(MAX_OPERATION_BYTES + 1) });
+    assert.equal(over.status, 413);
+    assert.equal(asked.length, 2);
+    // Without a caller's token, nothing is asked.
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/workspace`, { method: "POST" })).status, 401);
+    assert.deepEqual([await run(readLease(of, key)), stand.sent.length, asked.length], [null, 0, 2]);
   } finally {
     await served.close();
     stand.close();

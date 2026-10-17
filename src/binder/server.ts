@@ -13,6 +13,9 @@
  *   `peers` names them; asked without a token, as KEDA's metrics-api trigger asks.
  * - `GET /waiting/<namespace>/<pool>`: `{ waiting }`, this replica's alone, as its peers ask.
  * - `GET /healthz`: 200 once it serves, asked without a token.
+ * - `/workspace` and what is under it: what the front answers itself of the token's key,
+ *   beyond binding it, as `operate` says, such as the files of what the key binds; its body
+ *   of MAX_OPERATION_BYTES at most (413 past it).
  * - anything else: passed to the pod the token's key is bound to, the key bound first where
  *   it is not (./proxy.ts), but for a request that says it must bind nothing (NO_BIND_HEADER
  *   `never`), as one that reads what a binding has, answered 409 `{ "bound": false }` where the
@@ -39,6 +42,24 @@ import { counts, touchLease } from "./bindings.ts";
 import { type Pool } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
 import { bindingToken, type TokenClaims, verifyToken } from "./tokens.ts";
+
+/** The most a request the front answers itself may carry: a file of a workspace's, as its node agent writes one, with room. */
+export const MAX_OPERATION_BYTES = 64 * 1024 ** 2;
+
+/** A caller's request the front answers itself (`operate`): its method, its path, under /workspace, its query, and its body. */
+export interface Operation {
+  readonly method: string;
+  readonly path: string;
+  readonly query: URLSearchParams;
+  readonly body: Uint8Array;
+}
+
+/** How the front answers an Operation: its status, and its body, as JSON or as bytes. */
+export interface Answer {
+  readonly status: number;
+  readonly json?: unknown;
+  readonly bytes?: Uint8Array;
+}
 
 /** The header of a request that binds nothing: passed on where its key is bound, and otherwise answered as unbound. */
 export const NO_BIND_HEADER = "x-alasio-bind";
@@ -75,6 +96,8 @@ export interface BinderServerOptions {
   readonly poolOf: (key: string, options: Readonly<Record<string, string>>) => Effect.Effect<Placement, PlacementRefused>;
   /** The addresses (`host:port`) of the binder's other replicas. */
   readonly peers?: () => Effect.Effect<readonly string[]>;
+  /** What the front answers itself of a caller's key, as its token says it, under /workspace; none where it answers nothing of it. */
+  readonly operate?: (claims: TokenClaims, operation: Operation) => Effect.Effect<Answer>;
 }
 
 /** A listening front: its port, and how many requests of each key it is passing on now. */
@@ -88,11 +111,26 @@ const answer = (outgoing: ServerResponse, status: number, body?: unknown, header
   else outgoing.writeHead(status, { ...headers, "content-type": "application/json" }).end(JSON.stringify(body));
 };
 
+/** The body of `incoming`, of `limit` bytes at most; null past it. */
+async function bodyOf(incoming: IncomingMessage, limit: number): Promise<Uint8Array | null> {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of incoming as AsyncIterable<Buffer>) {
+    bytes += chunk.length;
+    if (bytes > limit) {
+      incoming.resume();
+      return null;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
 const Waiting = Schema.Struct({ waiting: Schema.Number });
 const decodeWaiting = Schema.decodeUnknownOption(Waiting);
 
 /** Serves the front on `port` until the scope closes, as the module says. */
-export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]) }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
+export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]), operate }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
   const binder = yield* Binder;
   const kube = yield* KubeClient;
   const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
@@ -153,6 +191,14 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       // A caller's token, which stops; a binding's, which a bound pod takes requests with, is none.
       if (!claims || claims.expires === undefined || claims.binding !== undefined) return answer(outgoing, 401, { error: "no caller's token" });
       const { key } = claims;
+      const [path = "", search = ""] = url.split("?", 2);
+      if (operate && (path === "/workspace" || path.startsWith("/workspace/"))) {
+        const body = yield* Effect.promise(() => bodyOf(incoming, MAX_OPERATION_BYTES));
+        if (body === null) return answer(outgoing, 413, { error: `a request answered here is ${MAX_OPERATION_BYTES} bytes at most` });
+        const answered = yield* operate(claims, { method: incoming.method ?? "GET", path, query: new URLSearchParams(search), body });
+        if (answered.bytes !== undefined) return void outgoing.writeHead(answered.status, { "content-type": "application/octet-stream" }).end(answered.bytes);
+        return answer(outgoing, answered.status, answered.json);
+      }
       if (incoming.method === "POST" && url === "/release") {
         incoming.resume();
         routes.delete(key);
