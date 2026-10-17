@@ -218,8 +218,9 @@ const PROGRESS_DEADLINE_SECONDS = 600;
  * woken from none or Grafana scaled out, is waking: each of its pods not ready starting
  * (../kube/rollout.ts), within its Deployment's progress deadline, or, where `scaler` woke
  * it, its pods not all made yet while KEDA still finds it work, as it last did within that
- * deadline. KEDA renews its lastActiveTime at each poll it finds work at, and records no
- * time it woke the loader, so a pod never made is bounded by the ReplicaSet's saying it
+ * deadline, or its pods ready that the Deployment does not count yet, each come up within
+ * that deadline. KEDA renews its lastActiveTime at each poll it finds work at, and records
+ * no time it woke the loader, so a pod never made is bounded by the ReplicaSet's saying it
  * cannot make it (ReplicaFailure), not by time. One whose pod crashed, whose pods cannot be
  * made, or that has not come up within the deadline, is not ready.
  */
@@ -231,13 +232,23 @@ const waking = Effect.fnUntraced(function*(workload: ScaledWorkload, scaler: Sca
   const said = (type: string, is: string) => status?.conditions?.some((condition) => condition.type === type && condition.status === is) ?? false;
   if (said("Progressing", "False") || said("ReplicaFailure", "True")) return false;
   const pods = yield* (yield* KubeApi).list<V1Pod>(kind("Pod"), { namespace: metadata?.namespace, labelSelector: selectorOf(spec?.selector.matchLabels ?? {}) });
-  const unready = pods.filter((pod) => !pod.status?.conditions?.some(({ type, status: ready }) => type === "Ready" && ready === "True"));
+  const readyAt = (pod: V1Pod) => pod.status?.conditions?.find(({ type, status: ready }) => type === "Ready" && ready === "True")?.lastTransitionTime;
+  const unready = pods.filter((pod) => readyAt(pod) === undefined);
   const now = Date.now();
   const deadlineMs = (spec?.progressDeadlineSeconds ?? PROGRESS_DEADLINE_SECONDS) * 1000;
   // Its pods not all made yet, as just after KEDA woke it, while KEDA still finds it work.
   const woken = scaler?.status?.lastActiveTime;
   const unmade = pods.length < (spec?.replicas ?? 0) && woken !== undefined && now - Date.parse(woken) < deadlineMs;
-  return (unready.length > 0 || unmade) && unready.every((pod) => starting(pod, deadlineMs, now));
+  // Its pods ready that the Deployment does not count available, each as one just come up,
+  // within the deadline: ready since the Deployment was read, which status reads before
+  // its pods, or before its controller counted them.
+  const uncounted = pods.length - unready.length - (status?.availableReplicas ?? 0);
+  const cameUp = pods.filter((pod) => {
+    const at = readyAt(pod);
+    return at !== undefined && now - new Date(at).getTime() < deadlineMs;
+  }).length;
+  const comingUp = uncounted > 0 && cameUp >= uncounted;
+  return (unready.length > 0 || unmade || comingUp) && unready.every((pod) => starting(pod, deadlineMs, now));
 });
 
 /** How main's bot's and each branch environment's deliveries fare, as Telegram says. */
