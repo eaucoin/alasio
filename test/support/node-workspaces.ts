@@ -48,8 +48,11 @@ export function workspacesNode() {
     'echo "+--+"; echo "| $path | $(cat "$file").0 GiB | 12 MiB | 1% | unlimited | 3 | |"; echo "+--+"',
   ].join("\n"));
   chmodSync(juicefs, 0o755);
+  // Workspace storage mounted at the root, unless a test says it is not.
+  const storage = { mounted: true };
   const workspaces = makeWorkspaces({
     host,
+    mounted: () => Promise.resolve(storage.mounted),
     juicefs: makeJuicefs({ metaUrl: "redis://:the%20password@valkey.alasio.svc:6379/1", juicefs }),
     runsc: { container: (id) => (running.has(id) ? Effect.succeed({ release: "r", annotations: {}, tracksWrites: false, bundle: "" }) : Effect.fail(new RunscError({ release: "", command: "state", reason: "not found" }))) },
     workspacesRoot,
@@ -66,6 +69,6 @@ export function workspacesNode() {
   const pod = (name: string) => mkdirSync(join(attachRoot, name), { recursive: true });
   /** What JuiceFS's command was run with, a call a line. */
   const juicefsCalls = () => (existsSync(join(root, "juicefs.log")) ? readFileSync(join(root, "juicefs.log"), "utf8").trim().split("\n") : []);
-  return { root, workspacesRoot, attachRoot, mounts, ran, running, workspaces, files, pod, juicefsCalls, done: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, workspacesRoot, attachRoot, mounts, ran, running, storage, workspaces, files, pod, juicefsCalls, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 

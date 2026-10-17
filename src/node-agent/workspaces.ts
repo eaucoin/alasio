@@ -19,6 +19,10 @@
  * unmounted lazily, as the sandbox's gofer keeps them busy to the last, then the directory is
  * removed, so its pod can be deleted: kubelet deletes no pod whose directory holds a mount.
  *
+ * Each is made, cloned, attached and recorded in workspace storage alone: where the node's
+ * mount of it is not there, as for the moment its mount's pod hands it over, the agent
+ * refuses (503), rather than write into the directory beneath it.
+ *
  * A workspace is made as its session is (create): its directory, with its files' `workspace/`
  * and `home/`, its agent's, and its quota set on the directory (./juicefs.ts), at once; made
  * again, it is as it was, its quota set anew. Its quota is read back as it is asked for. One
@@ -37,7 +41,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { chown, lstat, mkdir, open, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { chown, lstat, mkdir, open, readdir, readFile, rename, rm, statfs, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Effect, Schema } from "effect";
@@ -149,6 +153,8 @@ const confined = <A>(path: string, io: () => Promise<A>): Effect.Effect<A, Works
 /** What makeWorkspaces is given: the node's commands (mounts are made in its mount namespace), its runsc, JuiceFS's command, none where the agent is given no workspace storage, and, but for tests, where its roots are and whose files are. */
 export interface WorkspacesOptions {
   readonly host: HostCommands;
+  /** Whether workspace storage is mounted at the workspaces' root: as its file system says, but for tests. */
+  readonly mounted?: (root: string) => Promise<boolean>;
   readonly runsc: Pick<Runsc, "container">;
   readonly juicefs: Juicefs | null;
   readonly workspacesRoot?: string;
@@ -157,7 +163,13 @@ export interface WorkspacesOptions {
 }
 
 /** The agent's workspaces, as the module says. */
-export function makeWorkspaces({ host, runsc, juicefs, workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID }: WorkspacesOptions): Workspaces {
+/** Linux's magic number of FUSE's file systems (statfs(2)), JuiceFS's mount's. */
+const FUSE_SUPER_MAGIC = 0x65735546;
+
+/** Whether `root` is FUSE's, as its file system says. */
+const fuseAt = (root: string): Promise<boolean> => statfs(root).then(({ type }) => type === FUSE_SUPER_MAGIC, () => false);
+
+export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID }: WorkspacesOptions): Workspaces {
   /** Where `ref`'s files are on the node, its names checked. */
   const filesOf = ({ environment, workspace }: WorkspaceRef): Effect.Effect<string, WorkspaceRefused> =>
     !ENVIRONMENT.test(environment) || !isValidVolumeId(workspace)
@@ -180,9 +192,15 @@ export function makeWorkspaces({ host, runsc, juicefs, workspacesRoot = WORKSPAC
   const quotaPath = ({ environment, workspace }: WorkspaceRef): string => `/${environment}/${workspace}`;
   /** Whether `path` is there, on the node's mount. */
   const there = (path: string) => Effect.promise(() => lstat(path).then(() => true, () => false));
-  /** `work` done on the node's mount, a failure of it refused as workspace storage's not answering. */
-  const onMount = (what: string, work: () => Promise<unknown>) =>
-    Effect.tryPromise({ try: work, catch: (error) => refused(503, `${what}: ${error instanceof Error ? error.message : String(error)}`) });
+  /** Workspace storage mounted at the workspaces' root, as the module says; refused, saying `what` cannot be done, where it is not. */
+  const storage = (what: string) =>
+    Effect.promise(() => mounted(workspacesRoot)).pipe(
+      Effect.filterOrFail((is) => is, () => refused(503, `${what}: workspace storage is not mounted at ${workspacesRoot} on this node now`)),
+      Effect.asVoid,
+    );
+  /** `work` done on the node's mount, there, a failure of it refused as workspace storage's not answering. */
+  const onMount = <A>(what: string, work: () => Promise<A>) =>
+    storage(what).pipe(Effect.andThen(Effect.tryPromise({ try: work, catch: (error) => refused(503, `${what}: ${error instanceof Error ? error.message : String(error)}`) })));
 
   return {
     create: (ref, quotaBytes) =>
@@ -245,6 +263,7 @@ export function makeWorkspaces({ host, runsc, juicefs, workspacesRoot = WORKSPAC
         if (!made) return yield* refused(404, `no pod of a pool on this node is named ${pod}: kubelet has made it no directory`);
         const held = yield* mountsUnder(directory);
         if (held.length > 0) return yield* refused(409, `${pod}'s directory holds ${held.join(", ")}: a pod serves one binding, and nothing is mounted over another`);
+        yield* storage(`${ref.environment}/${ref.workspace} could not be attached`);
         const found = yield* host.run(["test", "-d", files]);
         if (found.exitCode !== 0) return yield* refused(404, `there is no workspace ${ref.environment}/${ref.workspace}`);
         const ws = join(directory, "ws");
