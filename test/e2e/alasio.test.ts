@@ -1256,6 +1256,46 @@ if (inShard("snapshots")) {
 }
 
 if (inShard("workspaces")) {
+  describe("diagnostic: the snapshots store from each node's own network, as a checkpoint gofer reaches it", () => {
+    test("each node's network reaches the store's Service and pods, and once a policy lets the nodes in", async (t) => {
+      const service = await kube.get<V1Service>(ref("Service", componentName("seaweedfs"), NAMESPACE));
+      const selector = Object.entries(selectorLabels("seaweedfs")).map(([label, value]) => `${label}=${value}`).join(",");
+      const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selector });
+      const nodes = await kube.list<V1Node>("Node");
+      const targets = [`${service?.spec?.clusterIP}:8333`, ...pods.map((pod) => `${pod.status?.podIP}:8333`)];
+      t.diagnostic(`store pods: ${pods.map((pod) => `${pod.metadata?.name} ${pod.status?.podIP} on ${pod.spec?.nodeName}`).join("; ")}`);
+      const probe = async (label: string) => {
+        for (const node of nodes) {
+          const name = node.metadata?.name ?? "";
+          const script = [
+            "for tool in wget nc curl ip iptables-save timeout; do command -v $tool >/dev/null && printf '%s ' $tool; done; echo",
+            ...targets.map((target) => `printf '%s: ' ${target}; (timeout 8 wget -q -T 6 -O /dev/null http://${target}/ 2>&1; echo " rc=$?") | tr '\n' ' '; echo`),
+            "ip -4 -o addr 2>/dev/null | awk '{print $2, $4}' | tr '\n' ';'; echo",
+            "echo kube-rules: $(iptables-save 2>/dev/null | grep -c -e KUBE-SVC -e KUBE-ROUTER)",
+          ].join("\n");
+          const said = await onNode(name, script).catch((error: unknown) => String(error));
+          t.diagnostic(`${label} ${name} (${node.status?.addresses?.map(({ address }) => address).join(",")}, podCIDR ${node.spec?.podCIDR}):\n${said}`);
+        }
+      };
+      await probe("as installed:");
+      // The nodes let in: each node's address and its flannel address, its podCIDR's first.
+      const blocks = nodes.flatMap((node) => [
+        ...(node.status?.addresses ?? []).filter(({ type }) => type === "InternalIP").map(({ address }) => `${address}/32`),
+        ...(node.spec?.podCIDR ? [`${node.spec.podCIDR.split("/")[0]}/32`] : []),
+      ]);
+      await kube.apply({
+        apiVersion: "networking.k8s.io/v1",
+        kind: "NetworkPolicy",
+        metadata: { name: "diag-nodes-to-store", namespace: NAMESPACE },
+        spec: { podSelector: { matchLabels: selectorLabels("seaweedfs") }, policyTypes: ["Ingress"], ingress: [{ from: blocks.map((cidr) => ({ ipBlock: { cidr } })), ports: [{ protocol: "TCP", port: 8333 }] }] },
+      } as KubernetesObject);
+      t.diagnostic(`let in: ${blocks.join(", ")}`);
+      await sleep(10_000);
+      await probe("nodes let in:");
+      // Left in place: the forks after are restored with it.
+    });
+  });
+
   describe("a session workspace forked from Telegram", () => {
     before(async () => {
       telegram = await forward(TELEGRAM);
