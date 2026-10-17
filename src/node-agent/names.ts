@@ -38,6 +38,15 @@ export const gvisorRuntimeClass = (release: string): string => `gvisor-${gvisorL
 /** The version runsc of gVisor's `release` reports, and saves its images with: its release's tag. */
 export const runscVersion = (release: string): string => `release-${release}`;
 
+/**
+ * Where a node has workspace storage mounted, held by a pod of its own, each workspace's
+ * files at `<environment>/<workspace>/files`.
+ */
+export const WORKSPACES_ROOT = "/var/lib/alasio/workspaces";
+
+/** Where a node keeps the directory of each pod of a sandbox pool, which the pod mounts by `subPathExpr` of its name. */
+export const ATTACH_ROOT = "/var/lib/alasio/attach";
+
 /** The root the gVisor shims run runsc with for Kubernetes' containers, under the node's /run. */
 export const RUNSC_ROOT = "/run/containerd/runsc/k8s.io";
 
