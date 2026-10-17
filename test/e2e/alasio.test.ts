@@ -23,7 +23,7 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1Node, V1PersistentVolume, V1Pod, V1Secret, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1Node, V1PersistentVolume, V1Pod, V1Secret, V1StatefulSet, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
@@ -259,6 +259,13 @@ if (inShard("upgrade")) {
       await onRecord("select branch->>'timelineId' from neon_control.branches where name = 'main'"),
     ];
     let held: string[];
+    /** The log's StatefulSet, its pod and its claim, by their uids. */
+    const logHeld = async () => [
+      (await kube.get(ref("StatefulSet", componentName("log"), NAMESPACE)))?.metadata?.uid,
+      (await kube.get(ref("Pod", `${componentName("log")}-0`, NAMESPACE)))?.metadata?.uid,
+      (await kube.get(ref("PersistentVolumeClaim", `data-${componentName("log")}-0`, NAMESPACE)))?.metadata?.uid,
+    ];
+    let logBefore: (string | undefined)[];
     /** When the telemetry the lake held was counted, and how many of alasio's spans it held then; and when the cut-over was through. */
     let counted: number;
     let spans: number;
@@ -324,6 +331,23 @@ if (inShard("upgrade")) {
           await tg.say("through the replica");
           await tg.waitFor((call) => answered(call));
           await untilInLake("main's turn, loaded through its read replica", `select count(*) as n from codex.turns where epoch_ms(completed_at) >= ${since}`, 600_000);
+        },
+      },
+      {
+        seeds: "the log on its claim, its StatefulSet's claims labelled with its version",
+        seed: async () => {
+          logBefore = await logHeld();
+          assert.ok(logBefore.every(Boolean), JSON.stringify(logBefore));
+          const statefulSet = await kube.get<V1StatefulSet>(ref("StatefulSet", componentName("log"), NAMESPACE));
+          assert.equal(statefulSet?.spec?.volumeClaimTemplates?.[0]?.metadata?.labels?.["app.kubernetes.io/version"], PREVIOUS);
+        },
+        keeps: "the log on its claim, its StatefulSet made anew, which no release's version labels the claims of",
+        check: async () => {
+          const [statefulSet, , claim] = await logHeld();
+          assert.notEqual(statefulSet, logBefore[0]);
+          assert.equal(claim, logBefore[2]);
+          const made = await kube.get<V1StatefulSet>(ref("StatefulSet", componentName("log"), NAMESPACE));
+          assert.equal(made?.spec?.volumeClaimTemplates?.[0]?.metadata?.labels?.["app.kubernetes.io/version"], undefined);
         },
       },
       {
@@ -408,8 +432,12 @@ if (inShard("upgrade")) {
       const generation = await alasioGeneration();
       const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
       assert.notEqual(failed.code, 0, failed.stdout);
-      assert.match(failed.stderr, /checking that the upgrade can run [^\n]*\n[^]*FAILED: a failure injected before the point of no return\n$/u);
+      assert.match(failed.stderr, /deleting the log's StatefulSet, its pod and claim kept[^]*checking that the upgrade can run [^\n]*\n[^]*FAILED: a failure injected before the point of no return\n[^\n]* making the log's StatefulSet again, as [^\n]* had it\n$/u);
       assert.ok(!(await recorded()).includes("point-of-no-return"));
+      // Made again as the release before had it, its pod and claim taken back as they were.
+      const [statefulSet, pod, claim] = await logHeld();
+      assert.ok(statefulSet && statefulSet !== logBefore[0], "the log's StatefulSet is not made again");
+      assert.deepEqual([pod, claim], [logBefore[1], logBefore[2]]);
       assert.equal(await alasioGeneration(), generation);
       assert.ok(await runs(RELEASE), "alasio runs as it did");
       await tg.say("between the cut-overs");

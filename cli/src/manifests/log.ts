@@ -25,7 +25,7 @@ import type { KubernetesObject, V1ConfigMap, V1Container, V1EnvVar, V1Service, V
 
 import type { LogPrincipal, MainEnvironmentPrincipal } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, type Environment, NAMESPACE, replicasOf, restrictedContainer, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
+import { claimLabels, claimSpec, componentName, type Environment, NAMESPACE, replicasOf, restrictedContainer, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
 import { type InstallConfig, LOG_SEGMENT_BYTES, telemetryRetentionBytes } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -439,7 +439,7 @@ export function logObjects(config: InstallConfig): KubernetesObject[] {
           ],
         },
       },
-      volumeClaimTemplates: [{ metadata: { name: "data", labels: stackLabels(LOG_COMPONENT) }, spec: claimSpec(log.storage) }],
+      volumeClaimTemplates: [{ metadata: { name: "data", labels: claimLabels(stackLabels(LOG_COMPONENT)) }, spec: claimSpec(log.storage) }],
     },
   };
   return [configMap, service, statefulSet, ...replicaBudget(LOG_COMPONENT, NAMESPACE, log.scaling), verticalPodAutoscaler(statefulSet, "Recommended")];
