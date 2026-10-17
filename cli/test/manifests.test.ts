@@ -3503,13 +3503,18 @@ describe("the sandbox service", () => {
     assert.equal(JSON.parse(one<V1ConfigMap>(install({}, null), "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}").snapshots, null);
     const sessions = all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio-sandbox-gateway" && metadata.namespace === "alasio-sessions");
     assert.deepEqual(sessions?.rules, [
-      { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch", "update", "delete"] },
+      // A restore's pod made too, its readiness set, and the policies that select it read.
+      { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch", "create", "update", "delete"] },
+      { apiGroups: [""], resources: ["pods/status"], verbs: ["patch"] },
+      { apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], verbs: ["list"] },
       { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] },
       { apiGroups: ["apps"], resources: ["deployments"], verbs: ["get"], resourceNames: ["sandboxes-none", "sandboxes-full"] },
       // The Events of the pods the sandbox pods' policy refused, which it counts.
       { apiGroups: [""], resources: ["events"], verbs: ["list"] },
     ]);
     assert.equal(one<V1Service>(objects, "Service", "alasio-sandbox-gateway-peers").spec?.clusterIP, "None");
+    // Of the cluster, the nodes it reads whether a restore's pod may be scheduled onto, alone.
+    assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-sandbox-gateway-nodes").rules, [{ apiGroups: [""], resources: ["nodes"], verbs: ["get"] }]);
   });
 
   test("receives sessions' telemetry in a receiver of its own, which watches its pools' Leases, and mounts workspace storage on each node in a pod of its own, whose replacement takes its mount over first", () => {
