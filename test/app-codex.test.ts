@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { agentMessage, codexThread, codexTurn, commandExecution, threadResumeResponse, turnCompleted, turnError } from "./support/codex-protocol.ts";
+import { agentMessage, codexThread, codexTurn, commandExecution, threadResumeResponse, turnCompleted, turnError, turnStarted } from "./support/codex-protocol.ts";
 import type { RunningAlasio } from "./support/alasio.ts";
 import {
   WORKING,
@@ -20,10 +20,22 @@ import {
   alasioFor,
   timeless,
 } from "./support/scenarios.ts";
+import { testPool } from "./support/store.ts";
 import { OPERATOR_ID } from "./support/telegram.ts";
 
 /** What alasio adds to every Codex thread's developer instructions. */
 const REPLY_INSTRUCTIONS = "Your replies reach the operator in Telegram through alasio. To show the operator an image or video file, embed it on a line of its own with Markdown image syntax and a local path, `![short caption](path)`, absolute or relative to the working directory: alasio sends the file itself in its place, several embeds in one paragraph as a collage. Naming a path any other way, such as in backticks, only refers to the file. Photos up to 10 MB and videos up to 50 MB, at most 10 per reply.";
+
+/** Once a statement of the conversation store's `schema` sleeps, as a test's trigger has it, waiting for it. */
+async function sleepingIn(schema: string): Promise<void> {
+  const pool = await testPool();
+  for (let waited = 0; ; waited += 50) {
+    const { rows } = await pool.query<{ n: string }>("select count(*) as n from pg_stat_activity where wait_event = 'PgSleep' and query ilike $1", [`%${schema}.prompt_jobs%`]);
+    if (Number(rows[0]?.n) > 0) return;
+    assert.ok(waited < 10_000, "the store never slept on the turn's start");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
 
 /** The concurrency panel's buttons. */
 const CONCURRENT_BUTTONS = [["Steer", "Queue"], ["Swerve", "Discard"]];
@@ -360,6 +372,94 @@ test("a concurrent message left unsettled as its turn ends is asked about again,
   ]);
   await answerLoadedThreads(codex, ["thread-1"]);
   assert.equal(inputText(await answerTurnStart(codex, "thread-1", "turn-2")), "Also update the docs");
+});
+
+test("/stop as Codex starts the turn, before its app-server has answered turn/start, interrupts the turn it then starts", async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex } = alasio;
+  await mount(alasio, "codex", "alpha");
+  telegram.say("Fix the build");
+  await answerThreadStart(codex, "thread-1", alasio.folder("alpha"));
+  // Asked to start the turn, the app-server has not answered yet as the operator stops it.
+  const start = await codex.next("turn/start");
+  await telegram.waitFor("sendMessage", (call) => call.params.text.startsWith("Codex is working"));
+  const mark = telegram.mark();
+  telegram.say("/stop");
+  await telegram.waitFor("sendMessage", (call) => call.params.text === "Stopping Codex...", { mark });
+  codex.answer(start, { turn: codexTurn("turn-1") });
+  codex.notify(turnStarted("thread-1", codexTurn("turn-1")));
+  // The turn it started is interrupted there, not left running.
+  const interrupt = await codex.next("turn/interrupt");
+  assert.deepEqual(interrupt.params, { threadId: "thread-1", turnId: "turn-1" });
+  codex.answer(interrupt, {});
+  codex.notify(turnCompleted("thread-1", codexTurn("turn-1", { status: "interrupted" })));
+  await telegram.waitFor("editMessageText", (call) => call.params.text === "Codex stopped.", { mark });
+});
+
+test("/stop as the turn's start is recorded, before its events are read, interrupts the turn the app-server started", { timeout: 30_000 }, async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex, stateSchema } = alasio;
+  // The store takes its while to record that the turn started upstream.
+  await (await testPool()).query(`
+    create function ${stateSchema}.slow_upstream_start() returns trigger language plpgsql as $$
+      begin
+        if new.upstream_started_at is not null and old.upstream_started_at is null then perform pg_sleep(3); end if;
+        return new;
+      end
+    $$;
+    create trigger slow_upstream_start before update on ${stateSchema}.prompt_jobs for each row execute function ${stateSchema}.slow_upstream_start();
+  `);
+  await mount(alasio, "codex", "alpha");
+  telegram.say("Fix the build");
+  await answerThreadStart(codex, "thread-1", alasio.folder("alpha"));
+  await answerTurnStart(codex, "thread-1", "turn-1");
+  // Stopped once the store is recording the turn's start, the app-server having answered it.
+  await sleepingIn(stateSchema);
+  const mark = telegram.mark();
+  telegram.say("/stop");
+  const interrupt = await codex.next("turn/interrupt");
+  assert.deepEqual(interrupt.params, { threadId: "thread-1", turnId: "turn-1" });
+  codex.answer(interrupt, {});
+  codex.notify(turnCompleted("thread-1", codexTurn("turn-1", { status: "interrupted" })));
+  await telegram.waitFor("editMessageText", (call) => call.params.text === "Codex stopped.", { mark, timeoutMs: 10_000 });
+});
+
+test("a turn that ends as the app-server starts another of its own on the thread, a goal's, leaves that one running", async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex } = alasio;
+  await runningTurn(alasio);
+  const mark = telegram.mark();
+  // The turn's end, and at once the app-server's next turn on the thread.
+  answerTurn(codex, "thread-1", "turn-1", "Done.");
+  codex.notify(turnStarted("thread-1", codexTurn("turn-2")));
+  await telegram.waitFor("sendRichMessage", (call) => call.params.rich_message.markdown === "Done.", { mark });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepEqual(codex.requests("turn/interrupt"), []);
+});
+
+test("/stop as the app-server hangs on the turn's start says Codex stopped only once the turn is stopped, and holds back no later update meanwhile", { timeout: 30_000 }, async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex } = alasio;
+  await mount(alasio, "codex", "alpha");
+  telegram.say("Fix the build");
+  await answerThreadStart(codex, "thread-1", alasio.folder("alpha"));
+  const start = await codex.next("turn/start");
+  await telegram.waitFor("sendMessage", (call) => call.params.text.startsWith("Codex is working"));
+  let mark = telegram.mark();
+  telegram.say("/stop");
+  await telegram.waitFor("sendMessage", (call) => call.params.text === "Stopping Codex...", { mark });
+  // The app-server not answering, the next update is answered at once.
+  mark = telegram.mark();
+  telegram.say("/start");
+  await telegram.waitFor("sendMessage", () => true, { mark, timeoutMs: 5_000 });
+  // The stop still says it is stopping, until the app-server answers and the turn it started is stopped.
+  assert.equal(telegram.callsTo("editMessageText").some((call) => call.params.text === "Codex stopped."), false);
+  mark = telegram.mark();
+  codex.answer(start, { turn: codexTurn("turn-1") });
+  const interrupt = await codex.next("turn/interrupt");
+  codex.answer(interrupt, {});
+  codex.notify(turnCompleted("thread-1", codexTurn("turn-1", { status: "interrupted" })));
+  await telegram.waitFor("editMessageText", (call) => call.params.text === "Codex stopped.", { mark });
 });
 
 test("/stop interrupts the running turn, which ends as stopped, and the next prompt runs", async (t) => {

@@ -85,8 +85,9 @@ test("failed app-server interrupt forgets local turn ownership", async () => {
     const client = makeAppServerThreads({
       start: () => Effect.sync(() => assert.fail("an interrupt starts no app-server")),
       request: () => Effect.fail(new AppServerRequestTimeout({ method: "turn/interrupt" })),
+      stop: Effect.void,
       whenGone: Effect.succeed(Effect.never),
-    }, notifications);
+    }, notifications, (work) => Effect.forkDetach(work));
     const interrupted = yield* Effect.flip(client.interrupt("thread", "stream-error"));
     assert.equal(interrupted.message, "Codex app-server request timed out: turn/interrupt");
     assert.equal(yield* notifications.currentTurnId("thread"), undefined);

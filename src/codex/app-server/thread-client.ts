@@ -1,5 +1,5 @@
 import type { v2 } from "../../../.types/codex/index.js";
-import { Clock, type Duration, Effect, Schema } from "effect";
+import { Clock, type Duration, Effect, Fiber, Schema } from "effect";
 
 import {
   ALASIO_CODEX_MODEL,
@@ -12,6 +12,16 @@ import type { AppServerParams, AppServerResult } from "./protocol.ts";
 import type { AppServerGone, AppServerRequestError, AppServerRpc, AppServerScope, AppServerStartError } from "./rpc-client.ts";
 
 const INTERRUPT_TIMEOUT = "5 seconds";
+/** How long a turn's start stopped as it waited is waited for still, so that the turn it starts is interrupted. */
+const STOPPED_START_WAIT = "30 seconds";
+
+/** The app-server did not answer, within STOPPED_START_WAIT, the start of a turn stopped as it waited: the turn may run on there. */
+class StoppedStartUnanswered extends Schema.TaggedError<StoppedStartUnanswered>()("StoppedStartUnanswered", {}) {
+  override get message(): string {
+    return `the app-server did not answer the turn's start within ${STOPPED_START_WAIT}`;
+  }
+}
+
 /** Threads or turns one list request asks for. */
 const LIST_PAGE_SIZE = 100;
 /**
@@ -115,8 +125,8 @@ export interface AppServerThreads {
   /** The id of the thread's running turn, once it has one; null if none starts within `timeout`. */
   readonly waitForTurnId: (threadId: string, timeout?: Duration.Input) => Effect.Effect<string | null, AppServerGone>;
   readonly steerTurn: (options: SteerTurnOptions) => Effect.Effect<v2.TurnSteerResponse, AppServerRequestError | NoActiveTurn>;
-  /** Interrupts the thread's running turn; whether it had one. `origin` says, in the log, who asked. */
-  readonly interrupt: (threadId: string, origin?: string) => Effect.Effect<boolean, AppServerRequestError>;
+  /** Interrupts the thread's running turn, or none but the turn `only` where given: whether there was one. `origin` says, in the log, who asked. */
+  readonly interrupt: (threadId: string, origin?: string, only?: string) => Effect.Effect<boolean, AppServerRequestError>;
   readonly getGoal: (scope: ThreadScope) => Effect.Effect<v2.ThreadGoalGetResponse, AppServerStartError>;
   readonly setGoal: (options: SetGoalOptions) => Effect.Effect<v2.ThreadGoalSetResponse, AppServerStartError>;
   readonly clearGoal: (scope: ThreadScope) => Effect.Effect<v2.ThreadGoalClearResponse, AppServerStartError>;
@@ -137,10 +147,17 @@ function threadOverrides({ cwd, config }: { readonly cwd: string; readonly confi
 const millisSince = (startedAt: bigint): Effect.Effect<string> =>
   Effect.map(Clock.currentTimeNanos, (now) => (Number(now - startedAt) / 1_000_000).toFixed(1));
 
-/** A thread's work in the app-server `rpc` talks to, its turns followed by `notifications`. */
+/** Runs `work` apart from what asked for it, in the app-server's time: its stop waits for it. */
+export type AppServerApart = (work: Effect.Effect<void>) => Effect.Effect<Fiber.Fiber<void>>;
+
+/**
+ * A thread's work in the app-server `rpc` talks to, its turns followed by `notifications`;
+ * what outlasts what asked for it run `apart`.
+ */
 export function makeAppServerThreads(
-  rpc: Pick<AppServerRpc, "start" | "request" | "whenGone">,
+  rpc: Pick<AppServerRpc, "start" | "request" | "stop" | "whenGone">,
   notifications: AppServerNotifications,
+  apart: AppServerApart,
 ): AppServerThreads {
   /** Every page of one of the app-server's paginated lists. */
   const listAll = Effect.fnUntraced(function*<M extends ListMethod>(method: M, params: AppServerParams<M>): Effect.fn.Return<AppServerResult<M>["data"][number][], AppServerRequestError> {
@@ -154,9 +171,9 @@ export function makeAppServerThreads(
     return all;
   });
 
-  const interrupt = Effect.fnUntraced(function*(threadId: string, origin = "unspecified"): Effect.fn.Return<boolean, AppServerRequestError> {
+  const interrupt = Effect.fnUntraced(function*(threadId: string, origin = "unspecified", only?: string): Effect.fn.Return<boolean, AppServerRequestError> {
     const turnId = yield* notifications.currentTurnId(threadId);
-    if (!turnId) {
+    if (!turnId || (only !== undefined && !(yield* notifications.turnAliases(threadId)).has(only))) {
       return false;
     }
     yield* Effect.logInfo(`interrupting app-server turn thread=${threadId.slice(0, 8)} turn=${turnId} origin=${origin}`);
@@ -164,6 +181,37 @@ export function makeAppServerThreads(
     yield* rpc.request("turn/interrupt", { threadId, turnId }, INTERRUPT_TIMEOUT);
     return true;
   });
+
+  /**
+   * Stops the app-server, the one sure way to stop a turn it does not answer for, as `cause`
+   * says: which ends every turn it runs, every conversation's, goals' among them, so it is
+   * done only where it gave no answer, saying which threads' turns it ends. The app-server
+   * stopped is the one the turn was started on: a request of one that was replaced fails at
+   * once, as its connection goes (./rpc-client.ts), so one that went unanswered for its whole
+   * wait was of the app-server that runs still.
+   */
+  const recycle = (threadId: string, cause: { readonly message: string }): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      const running = (yield* notifications.runningTurns).map(({ threadId: thread, turnId }) => `${thread.slice(0, 8)}/${turnId}`).join(",") || "none";
+      yield* Effect.logWarning(`stopping the app-server, as it gave no answer for the turn stopped as it started thread=${threadId.slice(0, 8)} error=${cause.message} ending=${running}`);
+      yield* rpc.stop;
+      yield* notifications.clear;
+    });
+
+  /**
+   * Says what became of the turn `turnId` the app-server answered the interrupt of with an
+   * error: ended as the interrupt went, gone with its app-server, or, where neither, run on.
+   */
+  const refused = (threadId: string, turnId: string, error: AppServerRequestError): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      if (error._tag !== "AppServerRequestFailed") {
+        return yield* Effect.logInfo(`the turn stopped as it started is gone with its app-server thread=${threadId.slice(0, 8)} turn=${turnId}`);
+      }
+      const ended = !(yield* notifications.currentTurnId(threadId)) && (yield* notifications.turnAliases(threadId)).has(turnId);
+      yield* ended
+        ? Effect.logInfo(`the turn stopped as it started had ended as its interrupt went thread=${threadId.slice(0, 8)} turn=${turnId}`)
+        : Effect.logWarning(`the app-server refused to interrupt the turn stopped as it started, which may run on thread=${threadId.slice(0, 8)} turn=${turnId} error=${error.message}`);
+    });
 
   return {
     ensureThread: Effect.fnUntraced(function*({ threadId, threadKey, cwd, env, config }) {
@@ -235,7 +283,10 @@ export function makeAppServerThreads(
       yield* notifications.beginTurn(threadId);
       const startedAt = yield* Clock.currentTimeNanos;
       if (onPromptDispatched) yield* onPromptDispatched;
-      const response = yield* rpc.request("turn/start", {
+      // The app-server starts the turn whether or not this waits for its answer still: so the
+      // answer is taken, and its turn remembered, apart from the wait, and a wait stopped, as
+      // a /stop stops it, stops the turn the app-server then starts, once it has.
+      const started = yield* Effect.forkDetach(rpc.request("turn/start", {
         threadId,
         input: [{ type: "text", text: prompt, text_elements: [] }],
         cwd,
@@ -243,9 +294,36 @@ export function makeAppServerThreads(
         ...(effort ? { effort } : {}),
         approvalPolicy: "never",
         sandboxPolicy: { type: "dangerFullAccess" },
-      });
+      }).pipe(
+        Effect.flatMap((response) => Effect.map(notifications.rememberTurn(threadId, response?.turn?.id), (remembered) => ({ response, remembered }))),
+      ));
+      /**
+       * Stops the turn the app-server starts, once it says which, or the app-server itself,
+       * its one sure way to stop it, where it does not say in time or cannot interrupt it.
+       */
+      const stopStarted = Fiber.join(started).pipe(
+        Effect.timeoutOrElse({ duration: STOPPED_START_WAIT, orElse: () => Effect.fail(new StoppedStartUnanswered()) }),
+        Effect.matchEffect({
+          onFailure: (error) =>
+            error._tag === "StoppedStartUnanswered"
+              ? recycle(threadId, error)
+              : Effect.logInfo(`the turn stopped as it started did not start thread=${threadId.slice(0, 8)} error=${error.message}`),
+          onSuccess: ({ remembered }) =>
+            remembered
+              ? interrupt(threadId, "stopped-as-it-started", remembered).pipe(
+                Effect.asVoid,
+                Effect.catch((error) => (error._tag === "AppServerRequestTimeout" ? recycle(threadId, error) : refused(threadId, remembered, error))),
+              )
+              : Effect.void,
+        }),
+      );
+      // Stopped as it waits, the turn waits for its stop there, which runs apart, in the
+      // app-server's time, so that the app-server's stop waits for it too.
+      const { response, remembered } = yield* Fiber.join(started).pipe(
+        Effect.onInterrupt(() => Effect.flatMap(apart(stopStarted), Fiber.await)),
+      );
       const responseTurnId = response?.turn?.id;
-      const turnId = (yield* notifications.rememberTurn(threadId, responseTurnId)) ?? responseTurnId;
+      const turnId = remembered ?? responseTurnId;
       yield* notifications.discardStaleForTurn(threadId, turnId);
       const turnDetail = responseTurnId && turnId !== responseTurnId ? ` response_turn=${responseTurnId}` : "";
       yield* Effect.logInfo(`turn start accepted thread=${threadId.slice(0, 8)} turn=${turnId ?? "unknown"}${turnDetail} ms=${yield* millisSince(startedAt)}`);

@@ -120,7 +120,16 @@ const createAppServerStream = Effect.fnUntraced(function*({ resumeSession, threa
   yield* persistence.updatePendingSessionId(pendingResponseId, sessionId);
   yield* persistence.updateActiveTurnSessionId(sessionId);
   const { model, effort } = resolveCodexModelChoice(modelChoice);
-  const turnId = yield* appServer.startTurn({ threadId: sessionId, prompt, model, effort, onPromptDispatched, ...scope });
+  // The turn started, it is interrupted as the scope it was started in closes unless it has
+  // ended, so that a stop before its events are read, as the turn's start is recorded, stops it
+  // there too; one stopped as it starts, startTurn stops itself.
+  const turnId = yield* Effect.uninterruptibleMask((restore) =>
+    restore(appServer.startTurn({ threadId: sessionId, prompt, model, effort, onPromptDispatched, ...scope })).pipe(
+      Effect.tap((started) =>
+        Effect.addFinalizer(() => (started ? appServer.interrupt(sessionId, "stopped-before-its-events", started).pipe(Effect.ignore) : Effect.void))
+      ),
+    )
+  );
   yield* turnTimer("app_server.turn_start.returned", { turn_id: turnId ?? "unknown" });
   const stream: CodexEventStream = { sessionId, turnId, events: appServer.eventsForTurn(sessionId, turnId) };
   return stream;

@@ -1,4 +1,4 @@
-import { Context, Effect, Exit, Layer, Schema, type Scope, Stream } from "effect";
+import { Context, Effect, Exit, FiberSet, Layer, Schema, type Scope, Stream } from "effect";
 
 import { withLogScope } from "../../shared/log.ts";
 import { makeAppServerNotifications } from "./notification-queue.ts";
@@ -95,7 +95,7 @@ function inLogScope(appServer: AppServer): AppServer {
     claimTurn: (threadId, turnId) => scoped(appServer.claimTurn(threadId, turnId)),
     waitForTurnId: (threadId, timeout) => scoped(appServer.waitForTurnId(threadId, timeout)),
     steerTurn: (options) => scoped(appServer.steerTurn(options)),
-    interrupt: (threadId, origin) => scoped(appServer.interrupt(threadId, origin)),
+    interrupt: (threadId, origin, only) => scoped(appServer.interrupt(threadId, origin, only)),
     getGoal: (scope) => scoped(appServer.getGoal(scope)),
     setGoal: (options) => scoped(appServer.setGoal(options)),
     clearGoal: (scope) => scoped(appServer.clearGoal(scope)),
@@ -108,7 +108,11 @@ function inLogScope(appServer: AppServer): AppServer {
 export const makeAppServer = Effect.fnUntraced(function*({ spawn = spawnAppServer }: AppServerOptions = {}): Effect.fn.Return<AppServer, never, Scope.Scope> {
   const notifications = yield* makeAppServerNotifications;
   const rpc = yield* makeAppServerRpc({ spawn, onNotification: notifications.observe });
-  const threads = makeAppServerThreads(rpc, notifications);
+  // What outlasts what asked for it (a turn stopped as it starts, stopped there): the
+  // app-server waits for it before it stops, each bounded as it runs.
+  const apart = yield* FiberSet.make<void>();
+  yield* Effect.addFinalizer(() => FiberSet.awaitEmpty(apart));
+  const threads = makeAppServerThreads(rpc, notifications, (work) => FiberSet.run(apart, work));
   const stop = rpc.stop.pipe(Effect.andThen(notifications.clear));
 
   /** The turn's notifications, as the events they map to, until the turn's end. */

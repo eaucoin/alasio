@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { FileChangeItem as SdkFileChangeItem } from "@openai/codex-sdk";
-import { Array as Arr, Deferred, Effect, Exit, Fiber, Logger, Option, Stream } from "effect";
+import { Array as Arr, Deferred, Effect, Exit, Fiber, Logger, Option, Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 
 import type { v2 } from "../.types/codex/index.js";
@@ -18,9 +18,10 @@ import {
   mapNotificationToSdkEvent,
   notificationMatchesTurn,
 } from "../src/codex/app-server/protocol.ts";
-import type { AppServerRpc } from "../src/codex/app-server/rpc-client.ts";
-import { makeAppServerThreads } from "../src/codex/app-server/thread-client.ts";
+import { AppServerRequestFailed, type AppServerRequestError, AppServerRequestTimeout, type AppServerRpc } from "../src/codex/app-server/rpc-client.ts";
+import { type AppServerApart, makeAppServerThreads } from "../src/codex/app-server/thread-client.ts";
 import { mapItemToBlocks, responseProjection } from "../src/codex/event-projection.ts";
+import type { CodexThreadConfig } from "../src/codex/thread-config.ts";
 import { appServerProcess } from "./support/app-server-process.ts";
 import { agentMessage, codexThread, codexTurn } from "./support/codex-protocol.ts";
 
@@ -59,13 +60,17 @@ function noTokenUsage(): v2.ThreadTokenUsage {
 
 /** How a test's app-server answers each request it expects. */
 type AppServerAnswers = {
-  readonly [M in AppServerMethod]?: (params: AppServerParams<M>) => Effect.Effect<AppServerResult<M>>;
+  readonly [M in AppServerMethod]?: (params: AppServerParams<M>) => Effect.Effect<AppServerResult<M>, AppServerRequestError>;
 };
 
 /** An app-server that is already running and answers requests with `answers`; any other request fails the test. */
-function answeringRpc(answers: AppServerAnswers): Pick<AppServerRpc, "start" | "request" | "whenGone"> {
+/** What the threads' work runs apart, here detached. */
+const apart: AppServerApart = (work) => Effect.forkDetach(work);
+
+function answeringRpc(answers: AppServerAnswers): Pick<AppServerRpc, "start" | "request" | "stop" | "whenGone"> {
   return {
     start: () => Effect.void,
+    stop: Effect.void,
     request: (method, params) => {
       const answer = answers[method];
       return answer ? answer(params) : Effect.sync(() => assert.fail(`unexpected app-server request ${method}`));
@@ -149,6 +154,123 @@ test("app-server goal handoff after completion starts a distinct logical turn", 
     assert.deepEqual([...yield* queue.turnAliases("thread-1")], ["goal-turn"]);
   })));
 
+/**
+ * A turn stopped as it waits for its start, which `answer` answers, once its start is asked
+ * (`asked`) and the stop let through (`stop`), `settle` run then, the turns of `others`
+ * running on other threads meanwhile: whether the app-server was stopped once the stop is
+ * done, and what it was asked; what was logged put in `logged`.
+ */
+const stoppedAsItStarts = (
+  answer: (asked: Deferred.Deferred<void>, stop: Deferred.Deferred<void>) => AppServerAnswers,
+  settle: Effect.Effect<void>,
+  { others = [], logged = [] }: { readonly others?: readonly { readonly threadId: string; readonly turnId: string }[]; readonly logged?: string[] } = {},
+) =>
+  withNotifications((queue) => Effect.gen(function*() {
+    for (const { threadId, turnId } of others) yield* queue.observe({ method: "turn/started", params: { threadId, turn: codexTurn(turnId) } });
+    const asked = yield* Deferred.make<void>();
+    const stop = yield* Deferred.make<void>();
+    const methods: string[] = [];
+    let stopped = false;
+    const answers = answer(asked, stop);
+    const rpc = answeringRpc(answers);
+    const thread = makeAppServerThreads({
+      ...rpc,
+      request: (method, params, timeout) => Effect.suspend(() => {
+        methods.push(method);
+        return rpc.request(method, params, timeout);
+      }),
+      stop: Effect.sync(() => {
+        stopped = true;
+      }),
+    }, queue, apart);
+    const starting = yield* Effect.forkChild(thread.startTurn({ threadId: "thread-1", prompt: "go", cwd: "/tmp" }));
+    yield* Deferred.await(asked);
+    const stopping = yield* Effect.forkChild(Fiber.interrupt(starting));
+    yield* Effect.yieldNow;
+    yield* Deferred.succeed(stop, undefined);
+    yield* settle;
+    yield* Fiber.join(stopping);
+    return { stopped, methods };
+  }).pipe(
+    Effect.provide(TestClock.layer()),
+    Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push(Arr.ensure(message).join(" ")))])),
+  ));
+
+test("a turn stopped as it starts, whose start the app-server answers late, is interrupted there once it is", async () => {
+  const { stopped, methods } = await stoppedAsItStarts((asked) => ({
+    "turn/start": () => Deferred.succeed(asked, undefined).pipe(Effect.andThen(Effect.sleep("10 seconds")), Effect.as({ turn: codexTurn("turn-1") })),
+    "turn/interrupt": () => Effect.succeed({}),
+  }), TestClock.adjust("10 seconds"));
+  assert.deepEqual([stopped, methods], [false, ["turn/start", "turn/interrupt"]]);
+});
+
+test("a turn stopped as it starts, whose start or interrupt the app-server gives no answer to in time, takes the app-server with it", async () => {
+  const logged: string[] = [];
+  const unanswered = await stoppedAsItStarts((asked) => ({
+    "turn/start": () => Deferred.succeed(asked, undefined).pipe(Effect.andThen(Effect.never)),
+  }), TestClock.adjust("30 seconds"), { others: [{ threadId: "thread-2", turnId: "goal-turn" }], logged });
+  assert.deepEqual(unanswered, { stopped: true, methods: ["turn/start"] });
+  // Which threads' turns the app-server's stop ends, others' among them, is said.
+  assert.ok(logged.some((line) => /stopping the app-server, .* ending=thread-2\/goal-turn$/u.test(line)), logged.join("\n"));
+  const refused = await stoppedAsItStarts((asked, stop) => ({
+    "turn/start": () => Deferred.succeed(asked, undefined).pipe(Effect.andThen(Deferred.await(stop)), Effect.as({ turn: codexTurn("turn-1") })),
+    "turn/interrupt": () => Effect.fail(new AppServerRequestTimeout({ method: "turn/interrupt" })),
+  }), Effect.void);
+  assert.deepEqual(refused, { stopped: true, methods: ["turn/start", "turn/interrupt"] });
+});
+
+test("a turn stopped as it starts, whose interrupt the app-server answers with an error, as one that ended as it went, leaves the app-server running", async () => {
+  const answered = await stoppedAsItStarts((asked, stop) => ({
+    "turn/start": () => Deferred.succeed(asked, undefined).pipe(Effect.andThen(Deferred.await(stop)), Effect.as({ turn: codexTurn("turn-1") })),
+    "turn/interrupt": () => Effect.fail(new AppServerRequestFailed({ error: { code: -32600, message: "no active turn to interrupt" } })),
+  }), Effect.void);
+  assert.deepEqual(answered, { stopped: false, methods: ["turn/start", "turn/interrupt"] });
+});
+
+test("an interrupt of a thread's turn by its id interrupts that turn alone, not the one the app-server went on to after it", () =>
+  withNotifications((queue) => Effect.gen(function*() {
+    const interrupted: unknown[] = [];
+    const thread = makeAppServerThreads({
+      ...answeringRpc({ "turn/interrupt": (params) => Effect.sync(() => void interrupted.push(params)).pipe(Effect.as({})) }),
+      stop: Effect.void,
+    }, queue, apart);
+    // The thread's turn-1 ends, and the app-server goes on to turn-2 of its own, a goal's.
+    yield* queue.observe({ method: "turn/started", params: { threadId: "thread-1", turn: codexTurn("turn-1") } });
+    yield* queue.observe({ method: "turn/completed", params: { threadId: "thread-1", turn: codexTurn("turn-1", { status: "completed" }) } });
+    yield* queue.observe({ method: "turn/started", params: { threadId: "thread-1", turn: codexTurn("turn-2") } });
+    assert.equal(yield* thread.interrupt("thread-1", "test", "turn-1"), false);
+    assert.deepEqual(interrupted, []);
+    assert.equal(yield* thread.interrupt("thread-1", "test", "turn-2"), true);
+    assert.deepEqual(interrupted, [{ threadId: "thread-1", turnId: "turn-2" }]);
+  })));
+
+/** A thread's configuration of nothing alasio adds. */
+const NO_CONFIG: CodexThreadConfig = { developer_instructions: "", mcp_servers: {} };
+
+test("an app-server closed while a turn stopped as it started waits on its start interrupts the turn there before it stops", async () => {
+  const process = appServerProcess();
+  process.answer("thread/list", () => ({ data: [], nextCursor: null }));
+  process.answer("turn/interrupt", () => ({}));
+  await Effect.runPromise(Effect.gen(function*() {
+    const scope = yield* Scope.make();
+    const appServer = yield* makeAppServer({ spawn: process.spawn }).pipe(Scope.provide(scope));
+    yield* appServer.listThreads({ cwd: "/repo", env: {} });
+    const starting = yield* Effect.forkDetach(appServer.startTurn({ threadId: "thread-1", threadKey: "conversation-1", prompt: "go", cwd: "/repo", env: {}, config: NO_CONFIG }));
+    // Stopped once its start is asked, the app-server not yet answering it.
+    while (!process.written.some(({ method }) => method === "turn/start")) yield* Effect.yieldNow;
+    const stopping = yield* Effect.forkDetach(Fiber.interrupt(starting));
+    yield* Effect.yieldNow;
+    // The app-server's scope closes, as alasio stops, with the stopped start pending still.
+    const closing = yield* Effect.forkDetach(Scope.close(scope, Exit.void));
+    yield* Effect.sleep("20 millis");
+    const start = process.written.find(({ method }) => method === "turn/start");
+    process.send({ id: start?.id, result: { turn: codexTurn("turn-1") } });
+    yield* Fiber.join(closing);
+    yield* Fiber.join(stopping);
+  }).pipe(Effect.provide(Logger.layer([]))));
+  assert.deepEqual(process.written.filter(({ method }) => method === "turn/interrupt").map(({ params }) => params), [{ threadId: "thread-1", turnId: "turn-1" }]);
+});
+
 test("app-server notification waits have no timeout of their own", () =>
   withNotifications((queue) => Effect.gen(function*() {
     const waiting = yield* Effect.forkChild(queue.nextForThread("thread-1"));
@@ -190,7 +312,7 @@ test("app-server start sends configured model and keeps observed notification tu
         yield* queue.observe({ method: "turn/started", params: { threadId: "thread-1", turn: codexTurn("notification-turn") } });
         return { turn: codexTurn("response-turn") };
       }),
-    }), queue);
+    }), queue, apart);
 
     const turnId = yield* thread.startTurn({ threadId: "thread-1", prompt: "go", cwd: "/tmp" });
 
@@ -216,7 +338,7 @@ test("app-server fast completion cannot become a leftover turn after the start r
         }
         return { turn: codexTurn(`response-turn-${starts}`) };
       }),
-    }), queue);
+    }), queue, apart);
 
     assert.equal(yield* thread.startTurn({ threadId: "thread-1", prompt: "first", cwd: "/tmp" }), "notification-turn-1");
     assert.equal(yield* queue.currentTurnId("thread-1"), undefined);
@@ -241,7 +363,7 @@ test("app-server thread start and resume carry alasio model config", () =>
         starts.push(params);
         return threadLoaded(codexThread("thread-started"));
       }),
-    }), queue);
+    }), queue, apart);
     const config = { project_doc_max_bytes: 32768, developer_instructions: "", mcp_servers: {} };
 
     yield* thread.ensureThread({ threadId: "thread-existing", threadKey: "conversation-1", cwd: "/repo", env: {}, config });

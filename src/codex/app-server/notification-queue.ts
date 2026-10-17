@@ -59,6 +59,8 @@ export interface AppServerNotifications {
   readonly discardStaleForTurn: (threadId: string, turnId: string | null | undefined) => Effect.Effect<number>;
   /** Forgets every thread's turn and queued notifications. */
   readonly clear: Effect.Effect<void>;
+  /** The threads with a turn running, each with the turn's id: what stopping the app-server ends. */
+  readonly runningTurns: Effect.Effect<ReadonlyArray<{ readonly threadId: string; readonly turnId: string }>>;
 }
 
 /**
@@ -169,6 +171,9 @@ export const makeAppServerNotifications: Effect.Effect<AppServerNotifications, n
       }).pipe(Effect.timeoutOrElse({ duration: timeout, orElse: () => Effect.succeed(null) }))),
 
     currentTurnId: (threadId) => Effect.sync(() => currentTurnIdNow(threadId)),
+    runningTurns: Effect.sync(() =>
+      [...turnByThread].flatMap(([threadId, turn]) => (!turn.completed && turn.preferredId ? [{ threadId, turnId: turn.preferredId }] : []))
+    ),
     turnAliases: (threadId) => Effect.sync(() => turnAliasesNow(threadId)),
     beginTurn: (threadId) => Effect.sync(() => beginTurnNow(threadId)),
     rememberTurn: (threadId, turnId, options) => Effect.sync(() => rememberTurnNow(threadId, turnId, options)),
