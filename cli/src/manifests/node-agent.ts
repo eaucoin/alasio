@@ -2,8 +2,9 @@
  * The node agent (src/node-agent/): one pod on every node sessions run on, which takes
  * whole-sandbox snapshots of their sandboxes and prepares them for restores there, kept
  * in the object store's snapshots bucket, and resumes a restored one once its pod's
- * network policies are in force there. It runs where sandboxes are snapshotted
- * (common.ts nodeAgentRuns).
+ * network policies are in force there; and attaches session workspaces into the sandbox
+ * pools' pods on its node, from its node's mount of workspace storage (./sandbox-gateway.ts).
+ * It runs where sandboxes are snapshotted (common.ts nodeAgentRuns).
  *
  * It is the one component that runs runsc on a node, beside containerd's shims, as they
  * run it, so it runs as the node does: privileged, as root, in the node's PID namespace
@@ -22,6 +23,7 @@
 import type { KubernetesObject, V1DaemonSet, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
 
 import {
+  ATTACH_ROOT,
   CONTAINERD,
   CPU_FEATURES_CONTAINER,
   GVISOR_RELEASES,
@@ -30,6 +32,7 @@ import {
   OPERATION_LIMIT_SECONDS,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
+  WORKSPACES_ROOT,
 } from "../../../src/node-agent/names.ts";
 import { currentGvisorRelease } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
@@ -50,6 +53,10 @@ const HOST_PATHS: readonly { readonly name: string; readonly path: string; reado
   { name: "gvisor", path: GVISOR_RELEASES, type: "DirectoryOrCreate", readOnly: true },
   { name: "containerd", path: CONTAINERD, type: "DirectoryOrCreate", readOnly: true },
   { name: "snapshots", path: SNAPSHOT_CACHE_DIR, type: "DirectoryOrCreate" },
+  // Workspace storage, as the node's mount of it holds it, and the pool pods' directories,
+  // which it attaches workspaces into and writes their tokens beside.
+  { name: "workspaces", path: WORKSPACES_ROOT, type: "DirectoryOrCreate" },
+  { name: "attach", path: ATTACH_ROOT, type: "DirectoryOrCreate" },
 ];
 
 /** What each suffix of a size multiplies it by, as Kubernetes counts a quantity. */
@@ -70,8 +77,8 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
     name,
     mountPath: path,
     ...(readOnly ? { readOnly } : {}),
-    // What is mounted under the node's /run after the agent starts is the agent's too.
-    ...(name === "run" ? { mountPropagation: "HostToContainer" } : {}),
+    // What is mounted under the node's /run, and its mount of workspace storage, after the agent starts are the agent's too.
+    ...(name === "run" || name === "workspaces" ? { mountPropagation: "HostToContainer" } : {}),
   }));
   return {
     apiVersion: "apps/v1",
