@@ -3,7 +3,9 @@
  * whole-sandbox snapshots of their sandboxes and prepares them for restores there, kept
  * in the object store's snapshots bucket, and resumes a restored one once its pod's
  * network policies are in force there; and attaches session workspaces into the sandbox
- * pools' pods on its node, from its node's mount of workspace storage (./sandbox-gateway.ts).
+ * pools' pods on its node, from its node's mount of workspace storage (./sandbox-gateway.ts),
+ * makes their directories there, and sets their quotas on workspace storage's metadata
+ * engine, with JuiceFS's own command, of its image.
  * It runs where sandboxes are snapshotted (common.ts nodeAgentRuns).
  *
  * It is the one component that runs runsc on a node, beside containerd's shims, as they
@@ -27,6 +29,7 @@ import {
   CONTAINERD,
   CPU_FEATURES_CONTAINER,
   GVISOR_RELEASES,
+  META_URL_VARIABLE,
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
   OPERATION_LIMIT_SECONDS,
@@ -40,6 +43,7 @@ import { componentName, given, imagePullSecrets, labels, NAMESPACE, nodeAgentRun
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
+import { WORKSPACES_CREDENTIALS } from "./workspace-storage.ts";
 
 /** The Secret of the snapshots bucket, its endpoint, region and name and the agents' keys to it. */
 const SNAPSHOTS_SECRET = componentName("snapshots");
@@ -124,6 +128,8 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
               { name: "NODE_NAME", valueFrom: { fieldRef: { fieldPath: "spec.nodeName" } } },
               { name: NODE_AGENT_TOKEN_VARIABLE, valueFrom: { secretKeyRef: { name: NODE_AGENT_SECRET, key: "token" } } },
               { name: SNAPSHOT_CACHE_BYTES_VARIABLE, value: String(sizeBytes(sessions.snapshots.nodeCache)) },
+              // Workspace storage's metadata engine, which it sets workspaces' quotas on alone: no key of its object store.
+              ...(config.workspaceStorage.enabled ? [{ name: META_URL_VARIABLE, valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key: "metaurl" } } }] : []),
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: "alasio-node-agent" }, ...otelEnv(config)] : []),
             ],
             envFrom: [{ secretRef: { name: SNAPSHOTS_SECRET } }],

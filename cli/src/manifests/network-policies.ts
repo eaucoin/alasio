@@ -215,10 +215,10 @@ function branchStoragePolicy(config: InstallConfig): NetworkPolicy {
 /**
  * Workspace storage's metadata and data are reached by JuiceFS's own pods alone (its
  * controller, its node service, the mount pods it runs and the Jobs that delete volumes'
- * directories, in the driver's namespace) and alasio's JuiceFS admin pods: Valkey takes no
- * other connection but the collector's scraper's, which reads its metrics, and the bundled
- * object store takes theirs on its S3 port beside the stack's own, and Valkey's, whose pod
- * formats the file system. The driver's Jobs are told by no label of their own, so any
+ * directories, in the driver's namespace) and alasio's JuiceFS admin pods: Valkey takes, beside
+ * theirs, the node agents', which set workspaces' quotas on it, and no other connection but the
+ * collector's scraper's, which reads its metrics; and the bundled object store takes theirs on
+ * its S3 port beside the stack's own, and Valkey's, whose pod formats the file system. The driver's Jobs are told by no label of their own, so any
  * Job's pod in its namespace is admitted, which the credentials of each still guard.
  */
 function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
@@ -230,12 +230,14 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
     { namespaceSelector: driverNamespace, podSelector: JOB_POD_SELECTOR },
     { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": NAMESPACE } }, podSelector: { matchLabels: JUICEFS_ADMIN } },
   ];
+  // The node agents, which set workspaces' quotas on the metadata engine, and reach no object store of it.
+  const quotas: V1NetworkPolicyPeer[] = nodeAgentRuns(config) ? [NODE_AGENT] : [];
   return [
     policy(componentName("valkey"), NAMESPACE, "valkey", {
       podSelector: { matchLabels: selectorLabels("valkey") },
       policyTypes: ["Ingress"],
       ingress: [
-        { from: juicefs, ports: [{ protocol: "TCP", port: VALKEY_PORT }] },
+        { from: [...juicefs, ...quotas], ports: [{ protocol: "TCP", port: VALKEY_PORT }] },
         { from: [{ podSelector: { matchLabels: selectorLabels(SCRAPER_COMPONENT) } }], ports: [{ protocol: "TCP", port: VALKEY_PORT }] },
       ],
     }),
@@ -477,10 +479,10 @@ function lakeQueryPolicy(config: InstallConfig): NetworkPolicy {
 
 /**
  * The node agents take alasio's calls and the sandbox service's gateway's, which attaches
- * workspaces through them, on their API's port, and nothing else; they reach
- * the cluster's DNS, the object store's S3 port, the bundled one's or the operator's at
- * any address, and the collector where it runs, and nothing else. The bundled object
- * store admits them.
+ * workspaces through them, on their API's port, and nothing else; they reach the cluster's
+ * DNS, the object store's S3 port, the bundled one's or the operator's at any address,
+ * workspace storage's metadata engine, which they set workspaces' quotas on, and the collector
+ * where it runs, and nothing else. The bundled object store, and the metadata engine, admit them.
  */
 function nodeAgentPolicies(config: InstallConfig): NetworkPolicy[] {
   const { bundled, external } = config.objectStore;
@@ -500,6 +502,7 @@ function nodeAgentPolicies(config: InstallConfig): NetworkPolicy[] {
       egress: [
         CLUSTER_DNS,
         objectStore,
+        ...(config.workspaceStorage.enabled ? [{ to: [{ podSelector: { matchLabels: selectorLabels("valkey") } }], ports: [{ protocol: "TCP", port: VALKEY_PORT }] }] : []),
         ...(collectorRuns(config) ? [{ to: [{ podSelector: { matchLabels: selectorLabels("collector") } }], ports: [{ protocol: "TCP", port: COLLECTOR_PORT }] }] : []),
       ],
     }),

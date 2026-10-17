@@ -1,10 +1,15 @@
-# alasio's image: the bot, neon-control, and the Neon setup job, on Node.
+# alasio's image: the bot, neon-control, and the Neon setup job, on Node; and the node agent,
+# which sets workspaces' quotas with JuiceFS's own command, copied from the very mount image
+# the nodes mount workspace storage with (cli/src/manifests/config.ts mountImage), so the two
+# are one release of JuiceFS.
 #
 # The base is a full Ubuntu userland rather than a slim one because, with the host
 # profile, the harnesses work on the operator's own machine from inside this
 # container: Codex runs its shell commands here, so the commands an agent runs should
 # behave as they do on an ordinary Ubuntu host. Published as ghcr.io/eaucoin/alasio by
 # .github/workflows/release.yml.
+FROM juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673 AS juicefs
+
 FROM ubuntu:24.04@sha256:a853f94d226358a79c740cfc7bce0c289748f3fe3488d921d038ccd752c61b60
 LABEL org.opencontainers.image.source=https://github.com/eaucoin/alasio \
       org.opencontainers.image.description="alasio: the bot, neon-control and the Neon setup job"
@@ -29,6 +34,9 @@ RUN curl -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-
  && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
  && rm /tmp/node.tar.xz \
  && node --version
+
+COPY --from=juicefs /usr/local/bin/juicefs /usr/local/bin/juicefs
+RUN juicefs version
 
 WORKDIR /opt/alasio
 COPY package.json package-lock.json ./
