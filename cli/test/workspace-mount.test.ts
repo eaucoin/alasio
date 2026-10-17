@@ -128,9 +128,10 @@ test("a mount that serves keeps a bind of the node's mount of its own, and binds
   assert.equal(serving.mounted().length, 2);
 });
 
-test("a mount that has handed its session over keeps the node's mount no more", async (t) => {
+test("a mount that has handed its session over makes its mounts of the node's its own, so its going leaves the node's whole, and keeps the node's mount no more", async (t) => {
   const handed = mount(t, "hands over");
   await until(() => existsSync(join(handed.run, "handed-over")));
+  await until(() => handed.mounted().includes(`--make-rprivate ${handed.root}`));
   const bound = handed.mounted().length;
   handed.lose();
   await sleep(1500);

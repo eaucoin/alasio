@@ -470,7 +470,9 @@ export const HANDED_OVER = "transfer FUSE session to others";
  * log copied out; and, once it ends, idle where it ended by handing its mount over, as it
  * said, to the mount of the pod that replaces it, until its own pod is deleted, or, where it
  * ended any other way, a failure, so kubelet starts it again and it mounts anew. Asked to end
- * while it mounts, it has its mount end too. `run` is MOUNT_RUN but for tests.
+ * while it mounts, it has its mount end too. `run` is MOUNT_RUN but for tests. Handed over, it
+ * makes its mounts of `root` its own (private), so the teardown of its container's mounts as it
+ * ends takes none of the node's with it, which they would share otherwise (Bidirectional).
  *
  * While its juicefs serves, it keeps the node's mount at `root`: a bind of it of its own, in
  * its own directory, which no other pod's going takes with it, and, where the node has lost
@@ -494,7 +496,7 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, run = M
     `  while kill -0 "$pid" 2>/dev/null; do`,
     `    if type=$(stat -f -c %T ${root} 2>/dev/null); then`,
     `      case "$type" in`,
-    `        fuse*) [ -n "$bound" ] || { mkdir -p "$kept" && mount --bind ${root} "$kept" && bound=1; } ;;`,
+    `        fuse*) [ -n "$bound" ] || { mkdir -p "$kept" && mount --bind ${root} "$kept" && bound=1 && echo "it keeps a bind of the node's mount of its own"; } ;;`,
     `        *) [ -n "$bound" ] && mount --bind "$kept" ${root} && echo "the node's mount was lost, as the pod that held it went: it is bound again from this pod's own" ;;`,
     "      esac",
     "    fi",
@@ -513,6 +515,8 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, run = M
     `kill "$tailer" "$keeper" 2>/dev/null`,
     `if grep -qF '${HANDED_OVER}' "$run/juicefs.log"; then`,
     `  touch "$run/handed-over"`,
+    // Its own mounts of the node's mount kept from the node's: torn down as its container ends, they take the node's with them otherwise.
+    `  mount --make-rprivate ${root} && echo "its mounts are its own: its going leaves the node's mount whole"`,
     "  echo 'the mount is handed over to the pod that replaces this one, which is idle until it is deleted'",
     "  trap 'exit 0' TERM INT",
     "  while :; do sleep 3600 & wait $!; done",
