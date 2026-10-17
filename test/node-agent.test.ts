@@ -470,6 +470,8 @@ test("a cached image that is not what its manifest says is read again from the b
       const { manifest } = yield* there.agent.prepare(workspace);
       yield* there.agent.spend(workspace, manifest.snapshot);
       yield* there.agent.resume(resumeRequest(manifest.snapshot));
+      // A delta once its base is fetched into the cache, as a checkpoint waits on no download.
+      yield* fetched(there, base);
       const delta = yield* there.agent.checkpoint(request("fs-abc"));
       const [own] = delta.layers;
       assert.ok(own);
