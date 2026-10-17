@@ -9,13 +9,14 @@ import { before, test } from "node:test";
 import type { V1Deployment, V1Pod } from "@kubernetes/client-node";
 import { Effect, Layer } from "effect";
 
+import { added } from "./support/metrics.ts";
 import { Binder } from "../src/binder/binder.ts";
 import { readLease, touchLease } from "../src/binder/bindings.ts";
 import { freeLabels, type Pool } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
 import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
 import type { EventInput } from "../src/events/events.ts";
-import { makeSessions, type SessionsOptions } from "../src/gateway/sessions.ts";
+import { ATTACH_DURATION, DETACH_DURATION, makeSessions, RELEASES, type SessionsOptions } from "../src/gateway/sessions.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
 import { type AttachRequest, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
@@ -215,9 +216,11 @@ test("a bound pod whose bayma is idle is kept while a request of it came within 
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
     })();
-    const released = await Effect.runPromise(Effect.provide(sessions.sweep, Layer.fresh(KubeClient.layer)));
+    let released: readonly string[] = [];
+    const counted = await added(RELEASES, async () => (released = await Effect.runPromise(Effect.provide(sessions.sweep, Layer.fresh(KubeClient.layer)))));
     await stopping;
     assert.deepEqual(released, [key]);
+    assert.deepEqual(counted, { [`k8s.namespace.name=${env.namespace},alasio.gateway.release.reason=idle`]: 1 });
     assert.deepEqual(recorded.detached, [`node-a ${bound.pod} c-0`]);
     assert.equal(await run(readLease(env.none, key)), null);
     // Told of, to its environment's alasio.
@@ -383,4 +386,36 @@ test("main forks its workspace into a branch of its own, as the branch records m
     `clone ${main.namespace}/fs-shared1 ${main.namespace}/fs-copy01 ${2 * 1024 ** 3}`,
     `clone ${one.namespace}/fs-shared1 ${one.namespace}/fs-copy02 ${2 * 1024 ** 3}`,
   ]);
+});
+
+test("each attach and detach is timed, and each binding released counted by why: asked by its caller, or lost as its pod went", async () => {
+  const env = await environment(1);
+  const recorded = agents();
+  const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+  const key = sessionKey("fs-timed1");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const of = `k8s.namespace.name=${env.namespace}`;
+  assert.deepEqual(await added(ATTACH_DURATION, () => Effect.runPromise(binder.bind(placement.pool, key, placement))), { [of]: 1 });
+  // Released as its caller asks, as the binder's front runs its placement's release; its pod's deletion, under no gVisor, ends it.
+  const bound = await Effect.runPromise(binder.bound(placement.pool, key));
+  const stopping = (async () => {
+    for (;;) {
+      const pod = await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, bound?.pod ?? ""))) as V1Pod | null;
+      if (!pod || pod.metadata?.deletionTimestamp) {
+        if (pod) await run(withKube((kube) => kube.patchPodStatus(env.namespace, pod.metadata?.name ?? "", { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated: { exitCode: 143 } } }] } })));
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  })();
+  const detached = await added(DETACH_DURATION, async () => {
+    const asked = await added(RELEASES, async () => {
+      assert.equal(await Effect.runPromise(binder.release(placement.pool, key, placement.release)), true);
+    });
+    assert.deepEqual(asked, { [`${of},alasio.gateway.release.reason=asked`]: 1 });
+  });
+  await stopping;
+  assert.deepEqual(detached, { [of]: 1 });
+  const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-gone", namespace: env.namespace, annotations: { "alasio.dev/binding-key": key } }, spec: { holderIdentity: "none-0" } };
+  assert.deepEqual(await added(RELEASES, () => Effect.runPromise(sessions.lost(env.none, lease))), { [`${of},alasio.gateway.release.reason=lost`]: 1 });
 });

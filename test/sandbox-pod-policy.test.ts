@@ -12,6 +12,7 @@ import { CoreV1Api, KubeConfig, type KubernetesObject, type V1Deployment, type V
 import { Effect, Layer, Result } from "effect";
 
 import { decodeInstallConfig, manifests } from "../cli/src/manifests/index.ts";
+import { refusedByPolicy } from "../src/gateway/refusals.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
 
@@ -142,4 +143,6 @@ test("a pool's pod bound changes its binding's labels and annotations alone, kee
 test("no pod but a pool's is made in a namespace of sessions", async () => {
   const other = await made({ apiVersion: "v1", kind: "Pod", metadata: { name: "other", namespace: SESSIONS }, spec: { containers: [{ name: "other", image: "busybox" }] } });
   assert.ok("refused" in other && /sandbox-pods/u.test(other.refused), JSON.stringify(other));
+  // As a ReplicaSet tells of it, which the gateway counts (src/gateway/refusals.ts).
+  assert.ok(refusedByPolicy({ reason: "FailedCreate", message: `Error creating: ${other.refused}`, involvedObject: {}, metadata: {} }), other.refused);
 });

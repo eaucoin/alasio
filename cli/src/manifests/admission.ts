@@ -30,6 +30,7 @@ import type { KubernetesObject, V1Container, V1PodSpec, V1PodTemplateSpec, V1Vol
 
 import { BINDING_LABEL, FREE_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../../src/binder/names.ts";
 import { branchNamespace, branchSessionsNamespace } from "../../../src/branch/names.ts";
+import { SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
 import { BUSY_ANNOTATIONS, BUSY_LABEL } from "../../../src/kube/busy-label.ts";
 import { CLONE_VARIABLES, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import {
@@ -528,7 +529,7 @@ interface SandboxPodScope {
  * It fails closed: where it cannot say, the API server refuses.
  */
 export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sessionsNamespace, sandboxController }: SandboxPodScope): KubernetesObject[] {
-  const name = componentName("sandbox-pods");
+  const name = SANDBOX_POD_POLICY;
   const metadata = { name, labels: labels("session") };
   const made = templates.map((template) => {
     const labels = { ...(template.metadata?.labels ?? {}), "pod-template-hash": ANY_STRING } as PinnedMap;
