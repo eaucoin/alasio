@@ -10,7 +10,7 @@ import { Effect, Exit, Layer, Scope } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
 import { freeLabels, type Pool, readLease } from "../src/binder/bindings.ts";
-import { type BinderServer, serveBinder } from "../src/binder/server.ts";
+import { type BinderServer, PlacementRefused, serveBinder } from "../src/binder/server.ts";
 import { mintToken, verifyToken } from "../src/binder/tokens.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
@@ -58,11 +58,16 @@ async function pods(): Promise<{ port: number; sent: IncomingHttpHeaders[]; clos
 }
 
 /** A front on its own client and Binder, binds waiting up to `waitMs`, every key in `of`; and how to stop it. */
-async function front(of: Pool, podPort: number, { waitMs = 5_000, peers = [] as string[] } = {}): Promise<BinderServer & { close: () => Promise<void> }> {
+async function front(
+  of: Pool,
+  podPort: number,
+  { waitMs = 5_000, peers = [] as string[], placed = [] as Readonly<Record<string, string>>[] } = {},
+): Promise<BinderServer & { close: () => Promise<void> }> {
   const scope = await Effect.runPromise(Scope.make());
   const layer = Layer.provideMerge(Binder.layer({ waitMs }), Layer.fresh(KubeClient.layer));
   const served = await Effect.runPromise(
-    serveBinder({ port: 0, host: "127.0.0.1", callerKey, bindingKey, podPort, poolOf: () => Effect.succeed({ pool: of }), peers: () => Effect.succeed(peers) }).pipe(
+    serveBinder({ port: 0, host: "127.0.0.1", callerKey, bindingKey, podPort, poolOf: (_key, options) =>
+      options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: of })), peers: () => Effect.succeed(peers) }).pipe(
       Effect.provide(layer),
       Scope.provide(scope),
     ),
@@ -70,7 +75,7 @@ async function front(of: Pool, podPort: number, { waitMs = 5_000, peers = [] as 
   return { ...served, close: () => Effect.runPromise(Scope.close(scope, Exit.void)) };
 }
 
-const caller = (key: string, expires = Date.now() + 60_000) => `Bearer ${mintToken(callerKey, { key, expires })}`;
+const caller = (key: string, expires = Date.now() + 60_000, options?: Record<string, string>) => `Bearer ${mintToken(callerKey, { key, expires, ...(options ? { options } : {}) })}`;
 
 before(async () => {
   process.env["KUBECONFIG"] = (await startKubeApiServer()).kubeconfig;
@@ -180,6 +185,25 @@ test("a pool's counts are its free pods, its bindings, and the binds waiting in 
     assert.deepEqual(await (await fetch(`http://127.0.0.1:${counting.port}/counts/${of.namespace}/${of.name}`)).json(), { free: 1, bound: 2, waiting: 0 });
   } finally {
     await Promise.all([one.close(), two.close(), counting.close()]);
+    stand.close();
+  }
+});
+
+test("a key is bound where the gateway places it, by what its caller's token says it is bound with, and refused where it is placed nowhere", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  const placed: Readonly<Record<string, string>>[] = [];
+  const served = await front(of, stand.port, { placed });
+  try {
+    const bound = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:workspace", Date.now() + 60_000, { environment: "main", mode: "none" }) } });
+    assert.equal(bound.status, 204);
+    assert.deepEqual(placed, [{ environment: "main", mode: "none" }]);
+    const nowhere = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:other", Date.now() + 60_000, { environment: "nowhere" }) } });
+    assert.equal(nowhere.status, 403);
+    assert.equal(await run(readLease(of, "sessionfs:other")), null);
+  } finally {
+    await served.close();
     stand.close();
   }
 });

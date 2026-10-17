@@ -11,8 +11,9 @@
  * - `GET /waiting/<namespace>/<pool>`: `{ waiting }`, this replica's alone, as its peers ask.
  * - anything else: passed to the pod the token's key is bound to, the key bound first where
  *   it is not (./proxy.ts), with the binding's token for the caller's; 503 with a Retry-After
- *   where its pool had no pod for it in time, or its pod was not reached, its route then
- *   forgotten, so the next request binds the key anew.
+ *   where it could not be bound now (its pool had no pod for it in time, its pod could not
+ *   be readied), or its pod was not reached, its route then forgotten, so the next request
+ *   binds the key anew; 403 where the gateway binds it nowhere, as its token says it is bound.
  *
  * A token that is no caller's, or has stopped, is answered 401. The gateway that serves on
  * it says which pool each key is bound in, and how its pod is made where it makes its own
@@ -34,6 +35,13 @@ import { mintToken, verifyToken } from "./tokens.ts";
 /** What a Retry-After asks a caller to wait, in seconds, before it asks again. */
 const RETRY_AFTER_S = 1;
 
+/** A key bound nowhere, as its caller's token says it is bound: why, answered 403. */
+export class PlacementRefused extends Schema.TaggedError<PlacementRefused>()("PlacementRefused", { reason: Schema.String }) {
+  override get message(): string {
+    return this.reason;
+  }
+}
+
 /** Where a key is bound: its pool, and how its pod is made, where it is not claimed. */
 export interface Placement extends BindOptions {
   readonly pool: Pool;
@@ -49,8 +57,8 @@ export interface BinderServerOptions {
   readonly bindingKey: Buffer;
   /** The port bound pods serve on. */
   readonly podPort: number;
-  /** Where `key` is bound. */
-  readonly poolOf: (key: string) => Effect.Effect<Placement>;
+  /** Where `key` is bound, with what its caller's token says it is bound with; refused where it is bound nowhere. */
+  readonly poolOf: (key: string, options: Readonly<Record<string, string>>) => Effect.Effect<Placement, PlacementRefused>;
   /** The addresses (`host:port`) of the binder's other replicas. */
   readonly peers?: () => Effect.Effect<readonly string[]>;
 }
@@ -77,12 +85,12 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
   const routes = new Map<string, Route>();
   const flights = new Map<string, number>();
 
-  /** The route to `key`'s pod: the one known, or its pod bound now. */
-  const routeOf = (key: string): Effect.Effect<Route, KubeApiError | BindTimeout | BindStepFailed> =>
+  /** The route to `key`'s pod: the one known, or its pod bound now, with `options`. */
+  const routeOf = (key: string, options: Readonly<Record<string, string>>): Effect.Effect<Route, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused> =>
     Effect.suspend(() => {
       const known = routes.get(key);
       if (known) return Effect.succeed(known);
-      return poolOf(key).pipe(
+      return poolOf(key, options).pipe(
         Effect.flatMap(({ pool, ...options }) => binder.bind(pool, key, options)),
         Effect.map(({ binding, address }) => {
           const route = { address, port: podPort, token: mintToken(bindingKey, { key, binding }) };
@@ -119,17 +127,18 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       // A caller's token, which stops; a binding's, which a bound pod takes requests with, is none.
       if (!claims || claims.expires === undefined || claims.binding !== undefined) return answer(outgoing, 401, { error: "no caller's token" });
       const { key } = claims;
-      const route = yield* routeOf(key).pipe(
-        Effect.tapError((error) => Effect.logWarning(`binding ${key} failed: ${error.message}`)),
-        Effect.option,
-      );
-      if (Option.isNone(route)) return answer(outgoing, 503, { error: `${key} could not be bound in time` }, { "retry-after": String(RETRY_AFTER_S) });
+      const route = yield* routeOf(key, claims.options ?? {}).pipe(Effect.result);
+      if (route._tag === "Failure") {
+        if (route.failure._tag === "PlacementRefused") return answer(outgoing, 403, { error: route.failure.message });
+        yield* Effect.logWarning(`binding ${key} failed: ${route.failure.message}`);
+        return answer(outgoing, 503, { error: `${key} could not be bound now` }, { "retry-after": String(RETRY_AFTER_S) });
+      }
       if (incoming.method === "POST" && url === "/bind") {
         incoming.resume();
         return answer(outgoing, 204);
       }
       flights.set(key, (flights.get(key) ?? 0) + 1);
-      const proxied = yield* Effect.promise(() => proxy(incoming, outgoing, route.value)).pipe(
+      const proxied = yield* Effect.promise(() => proxy(incoming, outgoing, route.success)).pipe(
         Effect.ensuring(Effect.sync(() => void flights.set(key, (flights.get(key) ?? 1) - 1))),
       );
       if (proxied.reached) return;
