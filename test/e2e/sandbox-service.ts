@@ -7,7 +7,8 @@
  * write into it done, through the node's mount of workspace storage handed over to the pod
  * that replaces the one that held it; the node's mount killed with no successor, as a reboot
  * ends it, mounted again by the DaemonSet's restart, a workspace made after it and one bound
- * through it released as broken, then bound again with what it held; another made, given a received file, bound, held to its
+ * through it released as broken, then bound again with what it held; one released with
+ * processes holding its files open restored whole from its snapshot as it is next bound; another made, given a received file, bound, held to its
  * quota, read back of what its session wrote, released, bound again, and deleted.
  *
  * Registered with sandboxService() in the workspaces shard (test/e2e/alasio.test.ts).
