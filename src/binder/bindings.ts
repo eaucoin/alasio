@@ -19,22 +19,11 @@
  * the next's. Bound, it says what keeps a node autoscaler from removing its node while it is
  * (BUSY_ANNOTATIONS), as what it holds lives only in it until its release.
  */
-import { createHash } from "node:crypto";
-
 import type { KubernetesObject, V1Pod } from "@kubernetes/client-node";
 import { Clock, Effect } from "effect";
 
-import { BUSY_ANNOTATIONS } from "../kube/busy-label.ts";
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
-
-/** The label of a pool's pods, its name. */
-export const POOL_LABEL = "alasio.dev/pool";
-/** The label of a pool's free pods, which its Deployment's selector selects with POOL_LABEL. */
-export const FREE_LABEL = "alasio.dev/free";
-/** The label of a bound pod, and of its Lease: its key's hash. */
-export const BINDING_LABEL = "alasio.dev/binding";
-/** The annotation of a bound pod, and of its Lease: its key. */
-export const KEY_ANNOTATION = "alasio.dev/binding-key";
+import { BINDING_LABEL, boundAnnotations, boundLabels, FREE_LABEL, freeLabels, KEY_ANNOTATION, keyHash, leaseName, type Pool, POOL_LABEL } from "./names.ts";
 
 /** The annotation of a binding's Lease while it is released: the releasing binder. */
 export const RELEASING_ANNOTATION = "alasio.dev/releasing";
@@ -56,27 +45,6 @@ export interface BindingLease extends KubernetesObject {
 
 /** `ms`, as the API's MicroTime. */
 const microTime = (ms: number): string => `${new Date(ms).toISOString().slice(0, -1)}000Z`;
-
-/** A pool: its name and namespace. */
-export interface Pool {
-  readonly name: string;
-  readonly namespace: string;
-}
-
-/** The hash of `key` its Lease and pod are named and labelled by: a label's value at most. */
-export const keyHash = (key: string): string => createHash("sha256").update(key).digest("hex").slice(0, 40);
-
-/** The name of the Lease of `key`'s binding. */
-export const leaseName = (key: string): string => `binding-${keyHash(key)}`;
-
-/** The labels of a pool's free pods, as its Deployment's template and selector give them. */
-export const freeLabels = (pool: Pool): Readonly<Record<string, string>> => ({ [POOL_LABEL]: pool.name, [FREE_LABEL]: "true" });
-
-/** The labels of a pod of `pool` bound to `key`. */
-export const boundLabels = (pool: Pool, key: string): Readonly<Record<string, string>> => ({ [POOL_LABEL]: pool.name, [BINDING_LABEL]: keyHash(key) });
-
-/** The annotations of a pod bound to `key`: the key, and what keeps its node from being removed while it is. */
-export const boundAnnotations = (key: string): Readonly<Record<string, string>> => ({ [KEY_ANNOTATION]: key, ...BUSY_ANNOTATIONS });
 
 const selector = (labels: Readonly<Record<string, string>>): string => Object.entries(labels).map(([label, value]) => `${label}=${value}`).join(",");
 

@@ -10,7 +10,8 @@ import type { V1Deployment, V1Pod } from "@kubernetes/client-node";
 import { Effect, Layer } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
-import { freeLabels, type Pool, readLease, touchLease } from "../src/binder/bindings.ts";
+import { readLease, touchLease } from "../src/binder/bindings.ts";
+import { freeLabels, type Pool } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
 import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
 import { makeSessions, type SessionsOptions } from "../src/gateway/sessions.ts";
