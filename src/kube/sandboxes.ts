@@ -32,6 +32,7 @@ import type {
   V1Container,
   V1ObjectMeta,
   V1PersistentVolumeClaim,
+  V1Pod,
   V1PodSpec,
   V1PodTemplateSpec,
   V1Secret,
@@ -294,6 +295,14 @@ export interface Sandboxes {
    * suspended; a Sandbox not ready and running is left as it is.
    */
   readonly release: <E>(name: string, save: (sandbox: StoredSandbox) => Effect.Effect<Saved, E>) => Effect.Effect<boolean, E | KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone>;
+  /**
+   * Releases the running Sandbox whose pod is ending though alasio did not end it, as a
+   * drain, an eviction or a deletion through the API server ends one, its bayma holding its
+   * stop meanwhile, with no bring-up of it meanwhile, as releaseEnding does. Whether it was;
+   * a Sandbox not running, or whose pod is not ending, is left as it is, as is every one
+   * where alasio is given no saveStopping.
+   */
+  readonly releaseStopping: (name: string) => Effect.Effect<boolean, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone>;
   readonly remove: (name: string) => Effect.Effect<void, KubeApiError>;
 }
 
@@ -329,6 +338,17 @@ export interface SandboxesOptions {
    * has none.
    */
   readonly live?: (name: string) => Effect.Effect<SavedSnapshot | null>;
+  /**
+   * Has the bayma of the running Sandbox `sandbox` go on with its stop at once, rather than
+   * hold it for a snapshot, before alasio ends the Sandbox's pod for its own reasons, as it
+   * moves it onto its template or restarts a pod with a fault: none is taken of those.
+   */
+  readonly stopNow?: (sandbox: StoredSandbox) => Effect.Effect<void>;
+  /**
+   * Saves the running Sandbox `sandbox`, whose pod `pod` is ending though alasio did not end
+   * it, while its bayma holds its stop: the snapshot it is released into, or none.
+   */
+  readonly saveStopping?: (sandbox: StoredSandbox, pod: V1Pod) => Effect.Effect<SavedSnapshot | null>;
 }
 
 /** The annotation of a Sandbox that says which pod template it runs: podTemplateHash's. */
@@ -483,6 +503,8 @@ export const makeSandboxes = Effect.fnUntraced(function*({
   keeps = () => false,
   restore,
   live,
+  stopNow = () => Effect.void,
+  saveStopping,
 }: SandboxesOptions): Effect.fn.Return<Sandboxes, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
   const fetch = yield* FetchHttpClient.Fetch;
@@ -600,6 +622,7 @@ export const makeSandboxes = Effect.fnUntraced(function*({
   const moveOnto = Effect.fnUntraced(function*(sandbox: StoredSandbox, desired: Sandbox): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone> {
     const name = sandbox.metadata.name;
     yield* Effect.logInfo(`moving Sandbox ${namespace}/${name} onto its current pod template`);
+    if (sandbox.spec.operatingMode !== "Suspended") yield* stopNow(sandbox);
     const moved = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
       metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: desired.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] } },
       spec: { operatingMode: "Suspended", podTemplate: mergePatch(sandbox.spec.podTemplate, desired.spec.podTemplate) },
@@ -622,6 +645,8 @@ export const makeSandboxes = Effect.fnUntraced(function*({
   ): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone> {
     const name = sandbox.metadata.name;
     yield* Effect.logInfo(`restarting Sandbox ${namespace}/${name}, whose ${why}${into ? `, from its snapshot ${into.snapshot}, taken live` : ""}`);
+    // A pod that runs still, with a fault, ends without a snapshot.
+    if (!podEnded(sandbox)) yield* stopNow(sandbox);
     const suspended = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
       ...(into ? { metadata: { annotations: snapshotBinding(into) } } : {}),
       spec: { operatingMode: "Suspended" },
@@ -667,6 +692,8 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     );
     if ("failure" in back) {
       const came = yield* plan.failed(back.failure);
+      // A sandbox that ran holds its stop as its pod ends, unless told to go on with it.
+      if (back.failure.resumed) yield* stopNow(restoring);
       // Ended, its pod's sandbox never having run, the Sandbox is released into its snapshot again.
       const suspending = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
         ...(came === "deferred" ? { metadata: { annotations: snapshotBinding(plan.snapshot) } } : {}),
@@ -685,6 +712,33 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     return { restored };
   });
 
+  /** The pod of the Sandbox `name`, if it is ending, or null. */
+  const endingPod = (name: string): Effect.Effect<V1Pod | null, KubeApiError> =>
+    // A core Pod, as the API server returns one.
+    kube.read("v1", "Pod", namespace, name).pipe(Effect.map((read) => ((read as V1Pod | null)?.metadata?.deletionTimestamp ? (read as V1Pod) : null)));
+
+  /**
+   * Releases the running Sandbox `sandbox`, whose pod `pod` is ending though alasio did not
+   * end it, under the lock its caller holds: suspended first, so that agent-sandbox makes no
+   * pod in its place, whose bayma would move the session's state on past any snapshot of it;
+   * then saved, by `save`; then bound to the snapshot it gives, or to none, its bayma then
+   * told to go on with the stop it holds for nothing; then once its pod is gone, suspended.
+   */
+  const releaseEnding = Effect.fnUntraced(function*(
+    sandbox: StoredSandbox,
+    pod: V1Pod,
+    save: NonNullable<SandboxesOptions["saveStopping"]>,
+  ): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone> {
+    const name = sandbox.metadata.name;
+    yield* Effect.logInfo(`releasing Sandbox ${namespace}/${name}, whose pod is ending though alasio did not end it`);
+    const suspended = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }));
+    const saved = yield* save(suspended, pod);
+    const bound = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { metadata: { annotations: snapshotBinding(saved) } }));
+    if (!saved) yield* stopNow(bound);
+    yield* Effect.logInfo(`released Sandbox ${namespace}/${name}${saved ? ` into its snapshot ${saved.snapshot}` : ", into no snapshot"}`);
+    return yield* awaitCondition(bound, "Suspended");
+  });
+
   const bringUp = Effect.fnUntraced(function*(name: string, manifest: () => Sandbox): Effect.fn.Return<BaymaEndpoint, SandboxError> {
     const desired = manifest();
     let sandbox = yield* readOrCreate(name, desired);
@@ -692,7 +746,12 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     const current = (made: StoredSandbox) => made.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] === desired.metadata.annotations?.[POD_TEMPLATE_ANNOTATION];
     // A suspended Sandbox's template is chosen as it resumes, below.
     if (sandbox.spec?.operatingMode !== "Suspended") {
-      if (!current(sandbox) && !(keeps(sandbox) && !podEnded(sandbox))) {
+      // Its pod ending though alasio did not end it, it is released, as the watch would release
+      // it, under the lock this holds, and then restored: no prompt is given a stopping bayma.
+      const ending = saveStopping ? yield* endingPod(name) : null;
+      if (ending && saveStopping) {
+        sandbox = yield* releaseEnding(sandbox, ending, saveStopping);
+      } else if (!current(sandbox) && !(keeps(sandbox) && !podEnded(sandbox))) {
         sandbox = yield* moveOnto(sandbox, desired);
       } else if (podEnded(sandbox)) {
         // Lost with what ran in it: a snapshot taken live of it, if any, brings it back.
@@ -760,6 +819,9 @@ export const makeSandboxes = Effect.fnUntraced(function*({
       exclusively(
         name,
         Effect.gen(function*() {
+          // Its bayma told to go on with the stop it would hold for a snapshot, none taken of it.
+          const running = yield* read(name);
+          if (running && running.spec?.operatingMode !== "Suspended") yield* stopNow(running);
           const suspending = yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }).pipe(
             Effect.map(stored),
             Effect.catchIf(hasStatus(404), () => Effect.succeed(null)),
@@ -788,8 +850,25 @@ export const makeSandboxes = Effect.fnUntraced(function*({
         }),
       ).pipe(withLogScope("sandboxes")),
 
+    releaseStopping: (name) =>
+      exclusively(
+        name,
+        Effect.gen(function*() {
+          if (!saveStopping) return false;
+          const sandbox = yield* read(name);
+          if (!sandbox || sandbox.spec?.operatingMode === "Suspended") return false;
+          const pod = yield* endingPod(name);
+          if (!pod) return false;
+          yield* releaseEnding(sandbox, pod, saveStopping);
+          return true;
+        }),
+      ).pipe(withLogScope("sandboxes")),
+
+    // Its bayma told to go on with the stop it would hold for a snapshot, none taken of it.
     remove: (name) =>
       Effect.sync(() => tokens.delete(name)).pipe(
+        Effect.andThen(read(name)),
+        Effect.flatMap((running) => (running && running.spec?.operatingMode !== "Suspended" ? stopNow(running) : Effect.void)),
         Effect.andThen(kube.remove(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name)),
         Effect.andThen(Effect.logInfo(`deleted Sandbox ${namespace}/${name}`)),
         withLogScope("sandboxes"),

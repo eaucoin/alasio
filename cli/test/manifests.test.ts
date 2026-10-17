@@ -177,6 +177,7 @@ describe("configuration", () => {
     assert.deepEqual(config.sessions.snapshots, {
       releaseAfter: "5m",
       liveEvery: "10m",
+      stopWait: "60s",
       nodeCache: "5Gi",
       nodeAgent: { resources: { requests: { cpu: "20m", memory: "160Mi" }, limits: { memory: "512Mi" } } },
     });
@@ -210,6 +211,11 @@ describe("configuration", () => {
     assert.match(refused({ sessions: { snapshots: { releaseAfter: "five minutes" } } }), /^sessions\.snapshots\.releaseAfter must be a duration such as 5m$/u);
     assert.match(refused({ sessions: { snapshots: { releaseAfter: "0s" } } }), /^sessions\.snapshots\.releaseAfter must be a duration such as 5m$/u);
     assert.match(refused({ sessions: { snapshots: { liveEvery: "never" } } }), /^sessions\.snapshots\.liveEvery must be a duration such as 10m$/u);
+    for (const stopWait of ["never", "15s", "601s"]) {
+      assert.match(refused({ sessions: { snapshots: { stopWait } } }), /^sessions\.snapshots\.stopWait must be a duration of more than 15s and at most 10m, such as 60s$/u);
+    }
+    // Past one look for ending pods, and as long as a drain sanely waits on one.
+    for (const stopWait of ["16s", "10m"]) assert.equal(configOf({ sessions: { snapshots: { stopWait } } }).sessions.snapshots.stopWait, stopWait);
     assert.match(refused({ sessions: { snapshots: { nodeCache: "lots" } } }), /^sessions\.snapshots\.nodeCache must be a storage size, such as 20Gi$/u);
   });
 
@@ -2544,7 +2550,7 @@ describe("security", () => {
     const sessionsRole = (objects: readonly KubernetesObject[]) =>
       all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio" && metadata.namespace === "alasio-sessions")?.rules ?? [];
     const tokenOf = (objects: readonly KubernetesObject[]) => container(one<V1Deployment>(objects, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_NODE_AGENT_TOKEN");
-    const objects = install({ sessions: { snapshots: { releaseAfter: "10m", liveEvery: "15m" } } });
+    const objects = install({ sessions: { snapshots: { releaseAfter: "10m", liveEvery: "15m", stopWait: "45s" } } });
     assert.deepEqual(sessions(objects).snapshots, {
       releaseAfterSeconds: 600,
       liveEverySeconds: 900,
@@ -2568,9 +2574,15 @@ describe("security", () => {
     const kept = manifests(configOf({}), { ...NOTHING_CARRIED, cpuBaseline: BASELINE, gvisorReleases: [...NODE_PINS.gvisor.releases.map(({ release }) => release), "20990101.0"] });
     assert.deepEqual(sessions(kept).snapshots?.releases.at(-1), { release: "20990101.0", runtimeClassName: "gvisor-20990101-0" });
     assert.ok(JSON.stringify(one(kept, "ValidatingAdmissionPolicy", "alasio-sandboxes")).includes('\\"gvisor-20990101-0\\"'));
+    // Its bayma holds a stop alasio did not make for that long, its pod given that and 30 s more.
+    const spec = sessions(objects).podTemplate.spec;
+    assert.equal(spec?.terminationGracePeriodSeconds, 75);
+    assert.deepEqual(spec?.containers[0]?.args?.slice(-2), ["--stop-wait-ms", "45000"]);
     // Until alasio up records a CPU baseline, nothing is snapshotted, though the agents run to say what their nodes have.
     const unheld = install({}, null);
     assert.equal(sessions(unheld).snapshots, undefined);
+    assert.equal(sessions(unheld).podTemplate.spec?.terminationGracePeriodSeconds, undefined);
+    assert.ok(!sessions(unheld).podTemplate.spec?.containers[0]?.args?.includes("--stop-wait-ms"));
     assert.equal(sessions(unheld).podTemplate.metadata?.annotations?.["dev.gvisor.internal.cpufeatures"], undefined);
     const variables = one<KubernetesObject & { spec: { variables: unknown } }>(unheld, "ValidatingAdmissionPolicy", "alasio-sandboxes").spec.variables;
     assert.ok(!JSON.stringify(variables).includes("dev.gvisor.internal"));
