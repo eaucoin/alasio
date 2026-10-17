@@ -66,6 +66,7 @@ import { subnetAddress } from "../../cli/src/cluster/docker.ts";
 import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "../../cli/src/kube/api.ts";
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
+import { COMPONENTS as OBJECT_STORE_COMPONENTS } from "../../cli/src/manifests/object-store.ts";
 import { installCli, packCli } from "../../tooling/cli-package.ts";
 import { NODE_BUILD_ARGS } from "../../tooling/node-image.ts";
 import { OTLP, STAND_INS, standInObjects, TELEGRAM, TELEGRAM_TLS_PORT, urlOf } from "./stand-ins.ts";
@@ -888,7 +889,7 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
  * within its container leaves its pod ready, and says why in its log alone; the lake's and
  * its intake's, whose queries and writes wait on the catalog there unseen; and of any
  * other ready pod a container of which restarted, as one killed for its memory is ready
- * again by the time this is said.
+ * again by the time this is said; and the warnings and errors of the object store's parts.
  */
 export async function dumpClusterState(): Promise<void> {
   if (!api) return;
@@ -935,6 +936,18 @@ export async function dumpClusterState(): Promise<void> {
           say(`--- logs of ${container.name} of ${namespace}/${name}${previous ? ", before it restarted" : ""}:`);
           for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
         }
+      }
+    }
+    // Ready as they stay, the object store's parts say why a request failed in their logs
+    // alone: an S3 gateway's InternalError, the filer's or a volume server's failing under it.
+    // Their warnings and errors, as glog marks them, of each of their containers.
+    const objectStore = new Set<string>(Object.values(OBJECT_STORE_COMPONENTS));
+    for (const pod of pods.filter((each) => each.status?.phase === "Running" && objectStore.has(each.metadata?.labels?.["app.kubernetes.io/component"] ?? ""))) {
+      const { namespace = "", name = "" } = pod.metadata ?? {};
+      for (const container of pod.spec?.containers ?? []) {
+        const logged = await kube.logs(namespace, name, container.name).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        say(`--- ${namespace}/${name}: the warnings and errors of ${container.name}`);
+        for (const line of logged.trimEnd().split("\n").filter((each) => /^[EW]\d{4} /u.test(each)).slice(-40)) say(`  ${line}`);
       }
     }
     // Ready as they may be, alasio and the node agents log why a snapshot was not taken or

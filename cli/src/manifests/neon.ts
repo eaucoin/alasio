@@ -823,14 +823,24 @@ function backup(config: InstallConfig): V1CronJob {
         "prune() { s3 ls \"s3://$BUCKET/\" | awk '{print $4}' | grep \"$1\" | sort -r | tail -n +$((KEEP + 1)) \\",
         '  | while read -r old; do s3 rm "s3://$BUCKET/$old"; done; }',
         "stamp=$(date -u +%Y%m%dT%H%M%SZ)",
-        's3 cp /backup/alasio.dump "s3://$BUCKET/alasio-$stamp.dump"',
+        's3 cp "$BACKUP_DIR/alasio.dump" "s3://$BUCKET/alasio-$stamp.dump"',
         "prune '^alasio-.*\\.dump$'",
         ...(workspaceStorage.enabled
           ? [
             'meta="s3://$WORKSPACES_BUCKET/$WORKSPACES_NAME/meta/"',
             "dump=$(s3 ls \"$meta\" | awk '{print $4}' | grep '^dump-.*\\.json\\.gz$' | sort -r | head -n 1)",
-            // None until a workspace's volume has been mounted for a while.
-            'if [ -n "$dump" ]; then s3 cp "$meta$dump" "s3://$BUCKET/$WORKSPACES_NAME-$dump"; else echo "JuiceFS has dumped no metadata of $WORKSPACES_NAME yet"; fi',
+            // Copied by its bytes, read and written as every object is, not by the object store's
+            // own copy (CopyObject), which SeaweedFS failed for a dump, all of the job's tries;
+            // checked as the gzip it is, and read back the same once written. None until a
+            // workspace's volume has been mounted for a while.
+            'copied="s3://$BUCKET/$WORKSPACES_NAME-$dump"',
+            'if [ -n "$dump" ]; then',
+            '  s3 cp "$meta$dump" "$BACKUP_DIR/workspaces.json.gz"',
+            '  gzip -t "$BACKUP_DIR/workspaces.json.gz" 2>/dev/null || { echo "$dump is no whole gzip" >&2; exit 1; }',
+            '  s3 cp "$BACKUP_DIR/workspaces.json.gz" "$copied"',
+            '  s3 cp "$copied" "$BACKUP_DIR/workspaces.copied"',
+            '  cmp -s "$BACKUP_DIR/workspaces.json.gz" "$BACKUP_DIR/workspaces.copied" || { echo "the copy of $dump in $BUCKET is not the dump read" >&2; exit 1; }',
+            'else echo "JuiceFS has dumped no metadata of $WORKSPACES_NAME yet"; fi',
             'prune "^$WORKSPACES_NAME-dump-.*\\.json\\.gz$"',
           ]
           : []),
@@ -840,6 +850,8 @@ function backup(config: InstallConfig): V1CronJob {
       { name: "S3_ENDPOINT", value: s3Endpoint(config) },
       { name: "BUCKET", value: objectStore.buckets.backups },
       { name: "KEEP", value: String(config.neon.backup.keep) },
+      // Where the database's dump is, which the backup's own reads of JuiceFS's are put beside.
+      { name: "BACKUP_DIR", value: "/backup" },
       ...(workspaceStorage.enabled
         ? [{ name: "WORKSPACES_BUCKET", value: objectStore.buckets.workspaces }, { name: "WORKSPACES_NAME", value: workspaceStorage.name }]
         : []),
