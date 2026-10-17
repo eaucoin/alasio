@@ -42,7 +42,7 @@ import { NAMESPACE } from "../../cli/src/manifests/common.ts";
 import { CONTAINERD, gvisorDirectory, gvisorHandler } from "../../src/node-agent/names.ts";
 import { runscFlags } from "../../src/node-agent/runsc.ts";
 import { makeS3Bucket, type S3Bucket } from "../../src/node-agent/s3.ts";
-import { makeStoreProxy, type StoreProxy } from "../../src/node-agent/store-proxy.ts";
+import { makeStoreProxy, type StoreProxy, type StoreToken } from "../../src/node-agent/store-proxy.ts";
 import { hookOf } from "../../src/sandbox/snapshots.ts";
 import { dumpClusterState, inAlasio, inSession, kube, nodeAgents, onNode, ref, SESSIONS, setUp, TARGET, tearDown } from "../../test/e2e/harness.ts";
 import type { Created, Read, Seen, Started } from "./session.ts";
@@ -372,6 +372,13 @@ async function readsOf(relay: Relay, startedAt: number, quietMs = 5000): Promise
   return { bytes, lastReadMs: lastAt - startedAt };
 }
 
+/** The token `proxy` mints for the session's restore, of the images under `layersPrefix`: one it must, as it does not drain. */
+function minted(proxy: StoreProxy, layersPrefix: string): StoreToken {
+  const token = proxy.mint(`gate-12/${session.volumeId}`, layersPrefix);
+  assert.ok(token, "the proxy minted no token");
+  return token;
+}
+
 /** What `use` makes of the node agent's proxy of the bucket, in this process, on this machine, as long as it uses it. */
 async function throughProxy<A>(use: (proxy: StoreProxy) => Promise<A>): Promise<A> {
   let release = () => {};
@@ -445,7 +452,7 @@ test("4. a chain restores straight from the bucket, from a directory holding s3_
     seen["direct"] = await restoredThrough("D0", await checkpointed("D0", at("restore-C")), s3.endpoint);
     const own = await checkpointed("D", at("D0"));
     seen["proxied"] = await throughProxy(async (proxy) => {
-      const token = proxy.mint(`gate-12/${session.volumeId}`, layersPrefix);
+      const token = minted(proxy, layersPrefix);
       return restoredThrough("D", own, proxy.endpoint, { access_key_id: token.accessKeyId, secret_access_key: token.secretAccessKey });
     });
   }));
@@ -591,7 +598,7 @@ test("8. a restore from the bucket whose proxy goes away during its background r
           await upload(at(image), `${layersPrefix}${own}/`);
           const pagesBytes = Number((await node(`stat -c %s ${q(`${at(image)}/pages.img`)}`)).trim());
           outcome["pagesBytes"] = pagesBytes;
-          const token = proxy.mint(`gate-12/${session.volumeId}`, layersPrefix);
+          const token = minted(proxy, layersPrefix);
           const relay = await relayTo(proxy.endpoint, { bytesPerSecond: OUTAGE_RELAY_BYTES_PER_SECOND });
           try {
             const directory = at(`bucket-${image}`);
