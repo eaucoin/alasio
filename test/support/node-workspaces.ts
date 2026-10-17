@@ -51,7 +51,7 @@ export function workspacesNode() {
   const workspaces = makeWorkspaces({
     host,
     juicefs: makeJuicefs({ metaUrl: "redis://:the%20password@valkey.alasio.svc:6379/1", juicefs }),
-    runsc: { container: (id) => (running.has(id) ? Effect.succeed({ release: "r", annotations: {} }) : Effect.fail(new RunscError({ release: "", command: "state", reason: "not found" }))) },
+    runsc: { container: (id) => (running.has(id) ? Effect.succeed({ release: "r", annotations: {}, tracksWrites: false, bundle: "" }) : Effect.fail(new RunscError({ release: "", command: "state", reason: "not found" }))) },
     workspacesRoot,
     attachRoot,
     agentUid: process.getuid?.() ?? 1000,
