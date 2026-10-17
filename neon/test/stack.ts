@@ -710,8 +710,8 @@ export function neonStack(): void {
         // the whole stack restarted, never comes to run: compute_ctl stays in init. Notified,
         // or at the next round of the replica that leads, which sets the layout right on its
         // own, neon-control restarts it, as a 412 from a compute in init is answered.
-        const restartedAt = async () => (await kube.get<V1Deployment>(COMPUTE))?.spec?.template.metadata?.annotations?.["kubectl.kubernetes.io/restartedAt"];
-        const restartedBefore = await restartedAt();
+        const RESTARTED_AT = "kubectl.kubernetes.io/restartedAt";
+        const restartedAt = async () => (await kube.get<V1Deployment>(COMPUTE))?.spec?.template.metadata?.annotations?.[RESTARTED_AT];
         const recordedLayout = async () => JSON.parse(await onRecord(`select layout from neon_control.layout where tenant_id = '${tenantId}'`)) as { pageservers: string[] };
         const givenLayout = async () => (JSON.parse((await onRecord("select layout from neon_control.compute_layouts where id = 'alasio'")) || "null") as { pageservers: string[] } | null);
         try {
@@ -722,8 +722,10 @@ export function neonStack(): void {
             return answered?.status === 200 ? (JSON.parse(answered.text) as { status: string }).status : null;
           };
           let stuck: string | undefined;
+          let restartedBefore: string | undefined;
           for (let attempt = 1; stuck === undefined; attempt++) {
-            assert.ok(attempt <= 3, "the leader's round set the layout right before the compute fetched its spec, three times");
+            assert.ok(attempt <= 3, "the leader's round set the layout right before the compute fetched its spec, or restarted it before its pod was read, three times");
+            restartedBefore = await restartedAt();
             const old = (await computePods()).map(({ metadata }) => metadata?.uid);
             await kube.patch(COMPUTE, { spec: { replicas: 0 } });
             await until("the compute did not stop", async () => !(await computePods()).some(({ metadata }) => old.includes(metadata?.uid)));
@@ -735,7 +737,10 @@ export function neonStack(): void {
             // It fetches its spec with the stale layout, unless the leader's round set the record right first.
             await until("the compute did not fetch its spec", async () => (await givenLayout()) !== null || (await recordedLayout()).pageservers.join() !== stale.join());
             if ((await givenLayout())?.pageservers.join() !== stale.join()) continue;
-            stuck = (await computePods()).find(({ metadata }) => metadata?.deletionTimestamp === undefined)?.metadata?.uid;
+            // The pod that fetched it, of the template before any restart: the leader's round may
+            // have set the record right and restarted the compute already, its pod a new one,
+            // which fetches its spec anew. Then none is, and it starts again.
+            stuck = (await computePods()).find(({ metadata }) => metadata?.deletionTimestamp === undefined && metadata?.annotations?.[RESTARTED_AT] === restartedBefore)?.metadata?.uid;
           }
           // Notified, neon-control restarts it, and it starts on the shards where they are.
           await notified(control);
