@@ -4,7 +4,8 @@
  *
  * A bind of a key bound already finds its pod; one whose binding another binder has under
  * way waits for it; one whose binding is this call's gets a pod by the pool's way to (a claim
- * of a free pod, unless the caller makes one itself, as a restore does), names it the
+ * of a free pod, unless the caller makes one itself, as a restore does, which it may decline
+ * to, as it finds under the binding's Lease, for the claim), names it the
  * Lease's holder, and waits for it to serve. Where the pool has no free pod, the bind waits,
  * up to `waitMs`, counted waiting meanwhile, so the pool is scaled for it;
  * one that gives up releases its Lease. A Lease naming a pod gone, as one deleted by hand or
@@ -71,9 +72,10 @@ export class BindTimeout extends Schema.TaggedError<BindTimeout>()("BindTimeout"
 
 /**
  * Makes the pod of a binding itself, rather than claim one: given the labels and annotations
- * the pod is to carry from the first, the pod made.
+ * the pod is to carry from the first, the pod made; or null, where it makes none after all,
+ * as it finds under the binding's Lease, for a free pod to be claimed instead.
  */
-export type MakePod = (labels: Readonly<Record<string, string>>, annotations: Readonly<Record<string, string>>) => Effect.Effect<V1Pod, KubeApiError | BindStepFailed>;
+export type MakePod = (labels: Readonly<Record<string, string>>, annotations: Readonly<Record<string, string>>) => Effect.Effect<V1Pod | null, KubeApiError | BindStepFailed>;
 
 /**
  * Readies the pod got for a binding before it is the binding's, as by attaching what it
@@ -151,7 +153,8 @@ export class Binder extends Context.Service<Binder, {
           Effect.gen(function*() {
             const already = yield* provide(boundPod(pool, key));
             if (already?.metadata?.name) yield* kube.remove("v1", "Pod", pool.namespace, already.metadata.name);
-            if (make) return { pod: yield* make(boundLabels(pool, key), boundAnnotations(key)), start: "made" as const };
+            const made = make ? yield* make(boundLabels(pool, key), boundAnnotations(key)) : null;
+            if (made) return { pod: made, start: "made" as const };
             const claimed = yield* provide(claim(pool, key));
             if (claimed) return { pod: claimed, start: "warm" as const };
             return yield* waitingFor(pool, Effect.gen(function*() {
