@@ -5,7 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -24,13 +24,22 @@ const JUICEFS: Record<Juicefs, string> = {
 
 interface Mount {
   readonly run: string;
+  readonly root: string;
+  /** Has the node lose its mount at the root, as the pod that held it going does. */
+  readonly lose: () => void;
+  /** What mount was asked, a call a line. */
+  readonly mounted: () => string[];
   readonly child: ChildProcess;
   readonly out: () => string;
   readonly ended: Promise<number | null>;
   readonly ready: () => boolean;
 }
 
-/** The mount's script, its juicefs doing as `juicefs` says, and stat saying the root is FUSE's. */
+/**
+ * The mount's script, its juicefs doing as `juicefs` says; stat saying the root is FUSE's
+ * while the file `fs` says so, as it does unless a test says otherwise; and mount binding as it
+ * is asked, each call logged in `mounts`, a bind at the root making it FUSE's again.
+ */
 function mount(t: TestContext, juicefs: Juicefs): Mount {
   const directory = mkdtempSync(join(tmpdir(), "alasio-workspace-mount-"));
   const bin = join(directory, "bin");
@@ -38,8 +47,12 @@ function mount(t: TestContext, juicefs: Juicefs): Mount {
   const run = join(directory, "run");
   mkdirSync(bin);
   writeFileSync(join(bin, "juicefs"), `#!/bin/sh\n${JUICEFS[juicefs]}\n`);
-  writeFileSync(join(bin, "stat"), "#!/bin/sh\necho fuseblk\n");
-  for (const name of ["juicefs", "stat"]) chmodSync(join(bin, name), 0o755);
+  const fs = join(directory, "fs");
+  const mounts = join(directory, "mounts");
+  writeFileSync(fs, "fuseblk\n");
+  writeFileSync(join(bin, "stat"), `#!/bin/sh\ncat ${fs}\n`);
+  writeFileSync(join(bin, "mount"), `#!/bin/sh\necho "$*" >> ${mounts}\nif [ "$3" = ${root} ]; then echo fuseblk > ${fs}; fi\n`);
+  for (const name of ["juicefs", "stat", "mount"]) chmodSync(join(bin, name), 0o755);
   const env = { ...process.env, PATH: `${bin}:${process.env["PATH"] ?? ""}`, META_URL: "redis://valkey/1" };
   // A group of its own, so whatever it started is ended with it.
   const child = spawn("sh", ["-c", workspaceMountScript(root, 1024, run)], { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
@@ -55,7 +68,16 @@ function mount(t: TestContext, juicefs: Juicefs): Mount {
     }
     rmSync(directory, { recursive: true, force: true });
   });
-  return { run, child, out: () => out, ended, ready: () => spawnSync("sh", ["-c", workspaceMountReady(root, run)], { env }).status === 0 };
+  return {
+    run,
+    root,
+    child,
+    out: () => out,
+    ended,
+    ready: () => spawnSync("sh", ["-c", workspaceMountReady(root, run)], { env }).status === 0,
+    lose: () => writeFileSync(fs, "overlayfs\n"),
+    mounted: () => (existsSync(mounts) ? readFileSync(mounts, "utf8").trim().split("\n") : []),
+  };
 }
 
 /** Waits until `condition` holds, for a few seconds at most. */
@@ -90,4 +112,27 @@ test("a mount that ends without handing its session over fails, so kubelet start
   assert.equal(existsSync(join(failed.run, "handed-over")), false);
   assert.match(failed.out(), /the metadata engine refused us/u);
   assert.match(failed.out(), /juicefs mount ended \(3\) without handing its mount over/u);
+});
+
+test("a mount that serves keeps a bind of the node's mount of its own, and binds it back at the root once the node has lost it", async (t) => {
+  const serving = mount(t, "serves");
+  await until(() => serving.mounted().length === 1);
+  assert.deepEqual(serving.mounted(), [`--bind ${serving.root} ${join(serving.run, "kept")}`]);
+  // The pod that held it before a handover gone, its mount with it.
+  serving.lose();
+  await until(() => serving.mounted().length === 2);
+  assert.equal(serving.mounted()[1], `--bind ${join(serving.run, "kept")} ${serving.root}`);
+  await until(() => serving.out().includes("it is bound again from this pod's own"));
+  // The node's again: bound back once, not again and again.
+  await sleep(1500);
+  assert.equal(serving.mounted().length, 2);
+});
+
+test("a mount that has handed its session over keeps the node's mount no more", async (t) => {
+  const handed = mount(t, "hands over");
+  await until(() => existsSync(join(handed.run, "handed-over")));
+  const bound = handed.mounted().length;
+  handed.lose();
+  await sleep(1500);
+  assert.equal(handed.mounted().length, bound);
 });
