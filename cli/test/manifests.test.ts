@@ -1787,7 +1787,7 @@ describe("the log", () => {
     assert.match(refusal({ log: { storage: { size: "1Gi" } }, lake: { intake: { scaling: { max: 4 } } } }), /^log\.storage\.size must be at least 2\.0 GiB: each of the telemetry topics' 12 partitions /u);
   });
 
-  test("gives each principal what it does alone: the gateway writes the telemetry topics, the intake reads them in its group, KEDA describes both and the wake topics, the webhook intake writes the Telegram topics, main's alasio reads its own and writes its wake topic, main's loader reads that", () => {
+  test("gives each principal what it does alone: the gateway writes the telemetry topics, the intake reads them in its group, KEDA describes both and the wake topics, the webhook intake writes the Telegram topics, the sandbox gateway the events topics, main's alasio reads its own and its events, and writes its wake topic, main's loader reads that", () => {
     const access = JSON.parse(logConfig(install())["access.json"] ?? "");
     // Each telemetry topic flushed to the volume within a second, so a host's crash loses a second of what it acknowledged at most.
     assert.deepEqual(access.topics, [
@@ -1796,6 +1796,8 @@ describe("the log", () => {
       { name: "telegram.main", partitions: 1, retentionMs: 604_800_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
       // A day of main's wake records, on one partition, as its one loader reads them, within a segment beside the one it writes.
       { name: "lake.main", partitions: 1, retentionMs: 86_400_000, retentionBytes: 64 * 1024 * 1024, configs: {} },
+      // A week of main's events, on one partition, as its one alasio reads them, each flushed as it is written, as what told of it tells no more.
+      { name: "events.main", partitions: 1, retentionMs: 604_800_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
     ]);
     const telemetry = { resource: "topic", name: "otel.", pattern: "prefixed" };
     const group = { resource: "group", name: "lake-intake", pattern: "literal" };
@@ -1812,12 +1814,14 @@ describe("the log", () => {
         ],
       },
       { name: "webhook", acls: [{ resource: "topic", name: "telegram.", pattern: "prefixed", operations: ["write", "describe"] }] },
+      { name: "sandbox-gateway", acls: [{ resource: "topic", name: "events.", pattern: "prefixed", operations: ["write", "describe"] }] },
       {
         name: "alasio-main",
         acls: [
           { resource: "topic", name: "telegram.main", pattern: "literal", operations: ["read", "describe"] },
           { resource: "group", name: "alasio.main", pattern: "literal", operations: ["read"] },
           { resource: "topic", name: "lake.main", pattern: "literal", operations: ["write", "describe"] },
+          { resource: "topic", name: "events.main", pattern: "literal", operations: ["read", "describe"] },
         ],
       },
       {
@@ -1831,7 +1835,7 @@ describe("the log", () => {
     assert.equal(JSON.parse(logConfig(install({ lake: { intake: { scaling: { max: 5 } } } }))["access.json"] ?? "").topics[0].partitions, 5);
   });
 
-  test("admits the gateway, the intake, KEDA's operator, the webhook intake, alasio and the lake's loader alone as its clients, its own nodes to its controllers, and the scraper to its metrics", () => {
+  test("admits the gateway, the intake, KEDA's operator, the webhook intake, the sandbox gateway, alasio and the lake's loader alone as its clients, its own nodes to its controllers, and the scraper to its metrics", () => {
     const objects = install();
     const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
     const labelsOf = (kind: string, name: string) => one<V1Deployment | V1StatefulSet>(objects, kind, name).spec?.template.metadata?.labels ?? {};
@@ -1846,11 +1850,15 @@ describe("the log", () => {
         reach("alasio-webhook", 9092),
         reach("alasio", 9092),
         reach("alasio-lake-loader", 9092),
+        reach("alasio-sandbox-gateway", 9092),
         reach("alasio-log", 9093, "StatefulSet"),
         reach("alasio-collector-scraper", 9464),
       ],
-      [true, true, true, true, true, true, true, true],
+      [true, true, true, true, true, true, true, true, true],
     );
+    // The sandbox gateway reaches it, as it writes each environment's events; the receiver it takes not.
+    assert.equal(reaches(policies, pod(labelsOf("Deployment", "alasio-sandbox-gateway")), node, 9092), true);
+    assert.equal(reach("alasio-receiver", 9092), false);
     // Not the lake's readers, Neon, nor the scraper as a client, nor a client to the controllers.
     assert.deepEqual(
       [reach("alasio-lake-query", 9092), reach("alasio-neon-pageserver", 9092, "StatefulSet"), reach("alasio-collector-scraper", 9092), reach("alasio-collector", 9093), reach("alasio-webhook", 9093)],
@@ -3344,6 +3352,9 @@ describe("the sandbox service", () => {
       { name: "alasio-sandbox-gateway", key: "binding-key" },
       { name: "alasio-node-agent", key: "token" },
     ]);
+    // Every environment's events, written as its principal on the log.
+    assert.deepEqual([env["EVENTS_BROKERS"], env["EVENTS_USERNAME"], env["EVENTS_PASSWORD_FILE"]], ["alasio-log.alasio.svc:9092", { name: "alasio-log-sandbox-gateway", key: "username" }, "/run/alasio/log/password"]);
+    assert.deepEqual(gateway.spec?.template.spec?.volumes?.find(({ name }) => name === "log"), { name: "log", secret: { secretName: "alasio-log-sandbox-gateway", items: [{ key: "password", path: "password" }] } });
     const config = JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}");
     assert.deepEqual(config, {
       port: 8080,

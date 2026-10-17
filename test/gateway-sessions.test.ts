@@ -14,6 +14,7 @@ import { readLease, touchLease } from "../src/binder/bindings.ts";
 import { freeLabels, type Pool } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
 import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
+import type { EventInput } from "../src/events/events.ts";
 import { makeSessions, type SessionsOptions } from "../src/gateway/sessions.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
@@ -124,12 +125,16 @@ const found = (list: readonly SessionsEnvironment[]): Environments => ({
   ofNamespace: (namespace) => Effect.succeed(list.find((each) => each.namespace === namespace) ?? null),
 });
 
+/** What the sessions told of, as each environment's alasio reads it. */
+const told: EventInput[] = [];
+
 const options = (env: SessionsEnvironment, podPort: number): SessionsOptions => ({
   environments: found([env]),
   pools: { none: "sandboxes-none", full: "sandboxes-full" },
   releaseAfterMs: 60_000,
   podPort,
   bindingKey,
+  events: { tell: (event) => Effect.sync(() => void told.push(event)) },
 });
 
 /** The gateway's sessions and its Binder, on clients of their own. */
@@ -214,6 +219,10 @@ test("a bound pod whose bayma is idle is kept while a request of it came within 
     assert.deepEqual(released, [key]);
     assert.deepEqual(recorded.detached, [`node-a ${bound.pod} c-0`]);
     assert.equal(await run(readLease(env.none, key)), null);
+    // Told of, to its environment's alasio.
+    assert.deepEqual(told.filter((event) => event.subject.key === key && event.environment === env.name), [
+      { kind: "workspace.released", environment: env.name, source: "sandbox-gateway", subject: { kind: "workspace", key }, binding: bound.binding, reason: "idle" },
+    ]);
   } finally {
     stand.close();
   }
@@ -265,4 +274,15 @@ test("a release whose save fails leaving the sandbox running keeps the binding, 
       stand.close();
     }
   }
+});
+
+test("a binding let go as its pod went while it was bound is told of, to its environment's alasio, as lost", async () => {
+  const env = { name: "try", namespace: "alasio-branch-try-sessions" };
+  const { sessions } = await sessionsOf(options(env, 7290), agents().agents);
+  const key = sessionKey("fs-lost");
+  const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-lost", namespace: env.namespace, annotations: { "alasio.dev/binding-key": key } }, spec: { holderIdentity: "sandboxes-none-0" } };
+  await Effect.runPromise(sessions.lost({ name: "sandboxes-none", namespace: env.namespace }, lease));
+  assert.deepEqual(told.filter((event) => event.subject.key === key), [
+    { kind: "workspace.lost", environment: "try", source: "sandbox-gateway", subject: { kind: "workspace", key }, binding: "uid-lost", pod: "sandboxes-none-0", reason: "its pod went while it was bound" },
+  ]);
 });

@@ -48,9 +48,10 @@ export type MainEnvironmentPrincipal = (typeof MAIN_ENVIRONMENT_PRINCIPALS)[numb
  * The log's principals besides its admin, each with a password of its own: the collector's
  * gateway, which writes the stack's telemetry to it; the lake's intake, which reads that;
  * KEDA, which reads how much the intake has yet to; the webhook intake, which writes each
- * environment's Telegram updates to it; and main's environment's (MAIN_ENVIRONMENT_PRINCIPALS).
+ * environment's Telegram updates to it; the sandbox gateway, which writes each environment's
+ * events; and main's environment's (MAIN_ENVIRONMENT_PRINCIPALS).
  */
-export const LOG_PRINCIPALS = ["gateway", "intake", "scaler", "webhook", ...MAIN_ENVIRONMENT_PRINCIPALS] as const;
+export const LOG_PRINCIPALS = ["gateway", "intake", "scaler", "webhook", "sandbox-gateway", ...MAIN_ENVIRONMENT_PRINCIPALS] as const;
 export type LogPrincipal = (typeof LOG_PRINCIPALS)[number];
 
 export interface S3Credentials {
