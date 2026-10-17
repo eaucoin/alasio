@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Stream } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { buildCodexThreadConfig, codexMcpServer } from "../src/codex/thread-config.ts";
@@ -76,6 +76,7 @@ test("a folder conversation's bayma is its host Sandbox's endpoint, in Claude Co
     patchPodStatus: () => Effect.die("no pod's status is patched"),
     remove: () => Effect.die("nothing is removed"),
     exec: () => Effect.die("nothing is run"),
+    watch: () => Stream.die("nothing is watched"),
   });
   const layer = HostBayma.layer(host, {}).pipe(
     Layer.provide(Layer.succeed(KubeClient, kube)),

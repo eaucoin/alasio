@@ -17,7 +17,7 @@ import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { ProtobufTraceSerializer } from "@opentelemetry/otlp-transformer";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
-import { Array as Arr, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Result, Schema, type Scope } from "effect";
+import { Array as Arr, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Result, Schema, type Scope, Stream } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
 
@@ -195,6 +195,7 @@ function fakeKube({ onExec = () => ({ exitCode: 0, stdout: Buffer.alloc(0), stde
       }
       return Effect.void;
     }),
+    watch: () => Stream.die("nothing is watched"),
     exec: (...args) => Effect.suspend(() => {
       calls.push(["exec", ...args]);
       const result = onExec(...args);
