@@ -307,3 +307,15 @@ test("a bind of a key whose release was left unrenewed, its releaser ended, fini
   assert.notEqual(again.pod, first.pod);
   assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [again.pod]);
 });
+
+test("a pod once bound is never claimed again, even labelled free again", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const layer = binderOf({ waitMs: 1_000 });
+  const first = await bindIn(layer, (each) => each.bind(of, "sessionfs:first"));
+  // Its release left half done, its pod labelled free again, as by hand.
+  await run(binder(), withKube((client) => client.patch("v1", "Pod", of.namespace, first.pod, { metadata: { labels: { [FREE_LABEL]: "true" } } })));
+  assert.equal(await run(binder(), claim(of, "sessionfs:second")), null);
+  const timedOut = await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (each) => Effect.flip(each.bind(of, "sessionfs:second"))), layer));
+  assert.ok(timedOut instanceof BindTimeout && timedOut.waited === "free pod", String(timedOut));
+});
