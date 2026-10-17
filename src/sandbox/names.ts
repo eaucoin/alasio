@@ -49,3 +49,12 @@ export function assertValidVolumeId(volumeId: unknown): string {
 export function newVolumeId(random: () => string = () => crypto.randomUUID()): string {
   return `fs-${random().replace(/-/g, "").slice(0, 12)}`;
 }
+
+/** The key a session filesystem's workspace is bound by in the sandbox service: `sessionfs:<volumeId>`. */
+export const sessionKey = (volumeId: string): string => `sessionfs:${volumeId}`;
+
+/** The volume id of the session filesystem `key` binds, where it binds one; else null. */
+export function volumeIdOfKey(key: string): string | null {
+  const volumeId = key.startsWith("sessionfs:") ? key.slice("sessionfs:".length) : "";
+  return isValidVolumeId(volumeId) ? volumeId : null;
+}
