@@ -426,15 +426,15 @@ test("D. diagnostic: a server-side copy of an image reads the same whole and in 
     const copiedPrefix = `gate-12/${session.volumeId}/copied/layers/`;
     // Each object of D and its layers, copied server-side, as the agent's fork and the cut-over's move copy them.
     const objects = (await Effect.runPromise(bucket.list(layersPrefix))).map(({ key }) => key);
-    const sizes = new Map<string, number>();
-    for (const key of objects) {
-      const stored = await Effect.runPromise(bucket.head(key));
-      sizes.set(key, stored?.bytes ?? 0);
-      await Effect.runPromise(bucket.copy(key, `${copiedPrefix}${key.slice(layersPrefix.length)}`, stored?.bytes ?? 0));
-    }
-    seen["copied"] = objects.length;
     // Each read through the AWS CLI on this machine: whole, and in ranges as a reader of pages reads, its SHA-256 and size.
     const credentials = `AWS_ACCESS_KEY_ID=${q(s3.accessKeyId)} AWS_SECRET_ACCESS_KEY=${q(s3.secretAccessKey)} AWS_DEFAULT_REGION=${q(s3.region)}`;
+    const sizes = new Map<string, number>();
+    for (const key of objects) {
+      const bytes = Number((await node(`${credentials} aws --endpoint-url ${q(s3.endpoint)} s3api head-object --bucket ${q(s3.bucket)} --key ${q(key)} --query ContentLength --output text`)).trim());
+      sizes.set(key, bytes);
+      await Effect.runPromise(bucket.copy(key, `${copiedPrefix}${key.slice(layersPrefix.length)}`, bytes));
+    }
+    seen["copied"] = Object.fromEntries(sizes);
     const read = async (key: string, range?: string) =>
       (await node(`rm -f /tmp/diag-read && ${credentials} aws --endpoint-url ${q(s3.endpoint)} s3api get-object --bucket ${q(s3.bucket)} --key ${q(key)} ${range ? `--range ${q(range)}` : ""} /tmp/diag-read >/dev/null 2>/tmp/diag-err; echo "$(sha256sum /tmp/diag-read 2>/dev/null | cut -d' ' -f1) $(stat -c %s /tmp/diag-read 2>/dev/null) $(head -c 300 /tmp/diag-err | tr '\n' ' ')"`)).trim();
     const differing: Record<string, unknown>[] = [];
