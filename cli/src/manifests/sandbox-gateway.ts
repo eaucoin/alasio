@@ -116,6 +116,9 @@ export function poolTemplate(config: InstallConfig, pool: Pool, mode: keyof type
       securityContext: restrictedPod(1000, 1000),
       automountServiceAccountToken: false,
       enableServiceLinks: false,
+      // Names resolved as its internet says, as a session's are: by none but itself without one.
+      dnsPolicy: "None",
+      dnsConfig: { nameservers: mode === "full" ? [...sessions.fullModeNameservers] : ["127.0.0.1"] },
       ...imagePullSecrets(config),
       ...given("nodeSelector", { ...sessions.nodeSelector }),
       ...given("tolerations", [...sessions.tolerations]),
