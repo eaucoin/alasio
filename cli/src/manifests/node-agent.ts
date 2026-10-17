@@ -48,7 +48,7 @@ import { componentName, given, imagePullSecrets, labels, NAMESPACE, nodeAgentRun
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
-import { WORKSPACES_CREDENTIALS } from "./workspace-storage.ts";
+import { WORKSPACE_QUOTAS } from "./workspace-storage.ts";
 
 /** The Secret of the snapshots bucket, its endpoint, region and name and the agents' keys to it. */
 const SNAPSHOTS_SECRET = componentName("snapshots");
@@ -141,8 +141,8 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
               { name: SNAPSHOT_CACHE_BYTES_VARIABLE, value: String(sizeBytes(sessions.snapshots.nodeCache)) },
               { name: RESTORES_FROM_BUCKET_SINCE_VARIABLE, value: NODE_PINS.gvisor.restoresFromBucketSince },
               { name: BACKGROUND_READ_SECONDS_VARIABLE, value: String(backgroundReadSeconds(sandboxBytes)) },
-              // Workspace storage's metadata engine, which it sets workspaces' quotas on alone: no key of its object store.
-              ...(config.workspaceStorage.enabled ? [{ name: META_URL_VARIABLE, valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key: "metaurl" } } }] : []),
+              // Workspace storage's metadata engine, which it sets workspaces' quotas on alone, as a user of its own there: no key of its object store.
+              ...(config.workspaceStorage.enabled ? [{ name: META_URL_VARIABLE, valueFrom: { secretKeyRef: { name: WORKSPACE_QUOTAS, key: "metaurl" } } }] : []),
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: "alasio-node-agent" }, ...otelEnv(config)] : []),
             ],
             envFrom: [{ secretRef: { name: SNAPSHOTS_SECRET } }],
