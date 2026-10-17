@@ -64,6 +64,7 @@ import {
   type SandboxOperatingMode,
   sandboxManifest,
   snapshotBinding,
+  type StoredSandbox,
 } from "../kube/sandboxes.ts";
 import { withLogScope } from "../shared/log.ts";
 import { sameToken } from "../shared/tokens.ts";
@@ -71,7 +72,7 @@ import { overLimitNote } from "../telegram/rich-media.ts";
 import type { OtlpForwarder } from "../telemetry/forward.ts";
 import { assertValidVolumeId, SessionToken } from "./names.ts";
 import { makeNodeAgents } from "./node-agents.ts";
-import { makeSessionSnapshots, type SessionSnapshots, sessionTemplateHash } from "./snapshots.ts";
+import { holdsStop, makeSessionSnapshots, type SessionSnapshots, sessionTemplateHash, stopHookOf } from "./snapshots.ts";
 import { sandboxBaymaTelemetryEnv, sandboxResource } from "./telemetry.ts";
 import { serveTelemetryReceiver } from "./telemetry-receiver.ts";
 
@@ -187,6 +188,8 @@ export interface Inheritance {
 const BROKEN_MOUNT = /Transport endpoint is not connected|Software caused connection abort|Input\/output error/u;
 /** How long a look at a session's workspace mount may take; a mount that hangs is not one a new pod mends. */
 const MOUNT_CHECK_TIMEOUT: Duration.Input = "10 seconds";
+/** How long bayma's hook may take to tell bayma to go on with its stop: it asks bayma and returns. */
+const STOP_NOW_TIMEOUT: Duration.Input = "10 seconds";
 
 /**
  * JuiceFS's mount pods, by the labels its CSI driver (v0.33.0, pkg/common/common.go)
@@ -455,6 +458,25 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
       Effect.catch((error) => Effect.logWarning(`could not look at the workspace mount of session ${volumeId}: ${error.message}`).pipe(Effect.as(null))),
     );
 
+  /**
+   * Has the session's bayma go on with the stop it would hold for a snapshot, before alasio
+   * ends its pod for its own reasons, or as alasio takes none of a pod ending: its bayma, as
+   * its pod runs it, where it holds a stop at all. What it cannot is said, and its stop is
+   * then held.
+   */
+  const stopNow = (sandbox: StoredSandbox): Effect.Effect<void> => {
+    const name = sandbox.metadata.name;
+    return Effect.gen(function*() {
+      // A core Pod, as the API server returns one.
+      const pod = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
+      const bayma = pod?.spec?.containers.find((container) => container.name === BAYMA_CONTAINER);
+      const command = bayma && holdsStop(bayma) ? stopHookOf(bayma) : null;
+      if (!command) return;
+      const { exitCode, stderr } = yield* kube.exec(profile.namespace, name, BAYMA_CONTAINER, command).pipe(Effect.timeout(STOP_NOW_TIMEOUT));
+      if (exitCode !== 0) yield* Effect.logWarning(`could not have session ${name}'s bayma stop at once (exit ${exitCode}): ${stderr.trim()}`);
+    }).pipe(Effect.catch((error) => Effect.logWarning(`could not have session ${name}'s bayma stop at once: ${error.message}`)));
+  };
+
   /** The fault of a session whose mount is lost: `why`, and, where alasio's JuiceFS driver runs, its mount pods removed before it resumes. */
   const lostMount = (volumeId: string, why: string): Effect.Effect<SandboxFault> => {
     const mountPodNamespace = profile.mountPodNamespace;
@@ -475,7 +497,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
     namespace: profile.namespace,
     port: profile.port,
     fault: brokenMount,
-    ...(snapshots ? { keeps: snapshots.keeps, restore: snapshots.restore, live: snapshots.live } : {}),
+    ...(snapshots ? { keeps: snapshots.keeps, restore: snapshots.restore, live: snapshots.live, stopNow, saveStopping: snapshots.saveStopping } : {}),
   });
   /** The turns running on each session, and when its last ended. */
   const turns = new Map<string, { readonly running: number; readonly endedAt: number }>();

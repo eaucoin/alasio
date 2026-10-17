@@ -33,7 +33,7 @@ import { WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { computeId, MAIN, replicaId } from "../../neon/control/branches.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import { SNAPSHOT_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
-import type { Sandbox } from "../../src/kube/sandboxes.ts";
+import { POD_TEMPLATE_ANNOTATION, type Sandbox } from "../../src/kube/sandboxes.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, UNSYNCED_DOWNLOAD_BYTES } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
@@ -1362,6 +1362,75 @@ if (inShard("snapshots")) {
         await kube.patch(ref("Node", node), { spec: { taints } });
         await until(`a node agent ready again on ${node}`, async () => ((await nodeAgents()).has(node) ? true : undefined), 300_000);
       }
+    });
+
+    test("a session whose node is drained while it idles is released into a snapshot as its bayma holds its stop, and comes back on another node, its REPL whole", { skip: AGENTS < 2 && "a drain of the cluster's one node stops all of it" }, async (t) => {
+      const drained = await newSession("none");
+      const { sessionId: held } = await repl.set(drained, `drained with ${drained}`);
+      const node = (await kube.get<V1Pod>(ref("Pod", drained, SESSIONS)))?.spec?.nodeName;
+      assert.ok(node, `the session ${drained} runs on no node`);
+      const began = Date.now();
+      try {
+        // kubectl drain, of the session's pods alone, as the node's other pods are not this test's.
+        assert.match(await onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=app.kubernetes.io/component=session --delete-emptydir-data --timeout=300s`), /evicted/u);
+        const bound = await until("the drained session released into a snapshot", async () => {
+          const sandbox = await kube.get<KubernetesObject & { spec?: { operatingMode?: string } }>(ref("Sandbox", drained, SESSIONS));
+          const snapshot = sandbox?.metadata?.annotations?.[SNAPSHOT_ANNOTATION];
+          return sandbox?.spec?.operatingMode === "Suspended" && snapshot ? snapshot : undefined;
+        }, 180_000);
+        const manifest = await snapshotOf(drained);
+        assert.equal(manifest?.snapshot, bound);
+        // A release's snapshot, its sandbox ended by it, not one taken live.
+        assert.equal(manifest?.live, undefined);
+        t.diagnostic(`released ${Date.now() - began} ms after the drain began: ${manifest?.bytes} bytes, its sandbox paused ${manifest?.pauseMs} ms`);
+        await turn("hello after the drain");
+        const restoredOn = (await kube.get<V1Pod>(ref("Pod", drained, SESSIONS)))?.spec?.nodeName;
+        assert.ok(restoredOn && restoredOn !== node, `the session was restored on ${restoredOn}, the node drained`);
+        const seen = await repl.read(drained, held);
+        assert.deepEqual([seen.live, seen.checkpointed], [`drained with ${drained}`, `drained with ${drained}`]);
+        assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+      } finally {
+        await onNode(`${CLUSTER}-server-0`, `kubectl uncordon ${node}`);
+      }
+    });
+
+    test("a session alasio moves onto its template has its bayma go on with its stop, its pod ending well within the time its bayma holds a stop alasio did not make", async (t) => {
+      const moving = await newSession("none");
+      const { sessionId: kept } = await repl.set(moving, `checkpointed by ${moving}`);
+      const pod = await kube.get<V1Pod>(ref("Pod", moving, SESSIONS));
+      const uid = pod?.metadata?.uid;
+      assert.ok(uid && !pod.metadata?.deletionTimestamp, `the session ${moving} runs no pod`);
+      // As though made from another template: its next bring-up moves it onto alasio's, ending its pod.
+      await kube.patch(ref("Sandbox", moving, SESSIONS), { metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: "another" } } });
+      const replied = turn("hello after the move");
+      const current = async () => {
+        const now = await kube.get<V1Pod>(ref("Pod", moving, SESSIONS));
+        return now?.metadata?.uid === uid ? now : null;
+      };
+      const asked = await until(`the pod ${uid} of ${moving} ending`, async () => {
+        const now = await current();
+        return now === null || now.metadata?.deletionTimestamp !== undefined ? Date.now() : undefined;
+      }, 120_000);
+      const gone = await until(`the pod ${uid} of ${moving} gone`, async () => ((await current()) === null ? Date.now() : undefined), 120_000);
+      t.diagnostic(`its pod ended ${gone - asked} ms after it was seen ending`);
+      // Its bayma holds a stop alasio did not make for 60 s (sessions.snapshots.stopWait).
+      assert.ok(gone - asked < 20_000, `the pod of ${moving} took ${gone - asked} ms to end, as its bayma held its stop`);
+      await replied;
+      const seen = await repl.read(moving, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${moving}`]);
+    });
+
+    test("a session whose pod is deleted outright, as kubectl delete --force or the removal of its Node deletes one, takes no snapshot, and comes back from bayma's checkpoints", async () => {
+      const killed = await newSession("none");
+      const { sessionId: kept } = await repl.set(killed, `checkpointed by ${killed}`);
+      const node = (await kube.get<V1Pod>(ref("Pod", killed, SESSIONS)))?.spec?.nodeName ?? "";
+      const deleted = kubectl(["delete", "pod", killed, "--namespace", SESSIONS, "--grace-period=0", "--force"]);
+      assert.ok(deleted.ok, deleted.said);
+      await turn("hello after the kill");
+      const seen = await repl.read(killed, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${killed}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+      assert.equal(await snapshotOf(killed), null, `a snapshot of ${killed} was taken as its pod on ${node} was killed`);
     });
 
     test("a session whose snapshot's image is corrupted comes back from bayma's checkpoints, as alasio logs and bayma tells the next exec", async () => {
