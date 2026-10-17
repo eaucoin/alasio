@@ -14,7 +14,9 @@ import type { V1ConfigMap, V1CronJob, V1Node, V1Pod } from "@kubernetes/client-n
 import { componentName, NAMESPACE } from "../../cli/src/manifests/common.ts";
 import { JUICEFS_ADMIN, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/workspace-storage.ts";
 import { kube, onNode, ref } from "./harness.ts";
-import { inPool, isReady, poolPod, ROOT, said, SPIKE_NAMESPACE } from "./spike-attach.ts";
+import { inPool, isReady, poolPod, ROOT, said } from "./spike-attach.ts";
+
+const NS = "alasio-spike-mount";
 import { until } from "./workspace-storage.ts";
 
 /** A pod holding the node's JuiceFS mount at ROOT/jfs, in the foreground, as a mount DaemonSet's would. */
@@ -60,16 +62,19 @@ export function spikeMount(): void {
       const image = template?.containers[0]?.image;
       const juicefs = (await kube.get<V1CronJob>(ref("CronJob", componentName("juicefs-quota-check"), NAMESPACE)))?.spec?.jobTemplate.spec?.template.spec?.containers[0]?.image;
       assert.ok(template && image && juicefs);
-      await kube.apply({ apiVersion: "v1", kind: "Namespace", metadata: { name: SPIKE_NAMESPACE } });
+      await kube.apply({ apiVersion: "v1", kind: "Namespace", metadata: { name: NS } });
       const pod = "pool-g7";
       try {
         await kube.apply(mounter("spike-mounter-a", node, juicefs));
         await until("the first mounter's mount", async () => ((await inMounter("spike-mounter-a", "stat -f -c %T /spike/jfs").catch(() => ({ out: "" }))).out.includes("fuse") ? true : undefined), 120_000);
         said("G7", "juicefs version", (await inMounter("spike-mounter-a", "juicefs version")).out);
-        await inMounter("spike-mounter-a", `mkdir -p /spike/jfs/spike/g7/files/workspace /spike/pods/${pod}/ws && chown -R 1000:1000 /spike/jfs/spike/g7 /spike/pods/${pod} && mount --bind /spike/jfs/spike/g7/files /spike/pods/${pod}/ws`);
-        await kube.apply(poolPod(pod, node, template, image));
-        await until("the pool pod running", async () => (isReady(await kube.get<V1Pod>(ref("Pod", pod, SPIKE_NAMESPACE))) ? true : undefined));
-        const writing = inPool(pod, WRITER(100));
+        await inMounter("spike-mounter-a", `mkdir -p /spike/jfs/spike/g7/files/workspace /spike/pods/${pod}/ws && chown -R 1000:1000 /spike/jfs/spike/g7 /spike/pods/${pod}`);
+        await kube.apply(poolPod(pod, node, template, image, NS));
+        await until("the pool pod running", async () => (isReady(await kube.get<V1Pod>(ref("Pod", pod, NS))) ? true : undefined));
+        // Attached once it runs, as a claim attaches.
+        await inMounter("spike-mounter-a", `mount --bind /spike/jfs/spike/g7/files /spike/pods/${pod}/ws`);
+        await until("the workspace in the pool pod", async () => ((await inPool(pod, "test -d /attach/ws/workspace && echo yes", NS)).out === "yes" ? true : undefined), 60_000);
+        const writing = inPool(pod, WRITER(100), NS);
         await new Promise((resolve) => setTimeout(resolve, 15_000));
 
         // A second pod's mount on the same mount point: JuiceFS's smooth upgrade.
@@ -84,22 +89,22 @@ export function spikeMount(): void {
         said("G7", "the first mounter's log", (await kube.logs(NAMESPACE, "spike-mounter-a", "juicefs").catch(() => "")).split("\n").slice(-12));
         said("G7", "the second mounter's log", (await kube.logs(NAMESPACE, "spike-mounter-b", "juicefs").catch(() => "")).split("\n").slice(-12));
         await kube.remove(ref("Pod", "spike-mounter-a", NAMESPACE)).catch(() => undefined);
-        said("G7", "the mount in the pool pod after the takeover", (await inPool(pod, "stat -f -c %T /attach/ws; ls /attach/ws/workspace/g7 | wc -l")).out);
+        said("G7", "the mount in the pool pod after the takeover", (await inPool(pod, "stat -f -c %T /attach/ws; ls /attach/ws/workspace/g7 | wc -l", NS)).out);
         await new Promise((resolve) => setTimeout(resolve, 20_000));
 
         // The second gone too, none after it.
         const goneAt = Date.now();
         await kube.remove(ref("Pod", "spike-mounter-b", NAMESPACE));
         await until("the second mounter gone", async () => ((await kube.get<V1Pod>(ref("Pod", "spike-mounter-b", NAMESPACE))) === null ? true : undefined), 120_000);
-        said("G7", "the mount in the pool pod with no mounter", { afterMs: Date.now() - goneAt, ...(await inPool(pod, "stat -f -c %T /attach/ws; ls /attach/ws/workspace/g7 | wc -l")) });
+        said("G7", "the mount in the pool pod with no mounter", { afterMs: Date.now() - goneAt, ...(await inPool(pod, "stat -f -c %T /attach/ws; ls /attach/ws/workspace/g7 | wc -l", NS)) });
         const wrote = await writing;
         said("G7", "the writer", wrote.out.split("\n").slice(-40));
       } finally {
         // Detached first, as a pod whose directory holds a mount is never deleted whole.
         await onNode(node, `umount -l ${ROOT}/pods/${pod}/ws; umount -l ${ROOT}/jfs; true`).catch(() => undefined);
         for (const name of ["spike-mounter-a", "spike-mounter-b"]) await kube.remove(ref("Pod", name, NAMESPACE)).catch(() => undefined);
-        await kube.remove(ref("Pod", pod, SPIKE_NAMESPACE)).catch(() => undefined);
-        await kube.remove(ref("Namespace", SPIKE_NAMESPACE)).catch(() => undefined);
+        await kube.remove(ref("Pod", pod, NS)).catch(() => undefined);
+        await kube.remove(ref("Namespace", NS)).catch(() => undefined);
       }
     });
   });

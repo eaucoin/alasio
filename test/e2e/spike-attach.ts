@@ -31,17 +31,17 @@ async function inAttacher(script: string): Promise<{ code: number; out: string }
 }
 
 /** Runs `script` in the pool pod `pod`, as its agent user: what it printed and its exit status. */
-export async function inPool(pod: string, script: string): Promise<{ code: number; out: string }> {
-  const ran = await kube.exec(SPIKE_NAMESPACE, pod, ["sh", "-c", `${script} 2>&1`]);
+export async function inPool(pod: string, script: string, namespace = SPIKE_NAMESPACE): Promise<{ code: number; out: string }> {
+  const ran = await kube.exec(namespace, pod, ["sh", "-c", `${script} 2>&1`]);
   return { code: ran.code, out: ran.stdout.trim() };
 }
 
 /** A pod of the sessions' template, on `node`, its /attach the node's ROOT/pods/<its name>, mounted HostToContainer, and nothing else of a session's. */
-export function poolPod(name: string, node: string, template: V1Pod["spec"] & object, image: string): V1Pod {
+export function poolPod(name: string, node: string, template: V1Pod["spec"] & object, image: string, namespace = SPIKE_NAMESPACE): V1Pod {
   return {
     apiVersion: "v1",
     kind: "Pod",
-    metadata: { name, namespace: SPIKE_NAMESPACE, labels: { "alasio.dev/spike": "pool" } },
+    metadata: { name, namespace, labels: { "alasio.dev/spike": "pool" } },
     spec: {
       ...(template.runtimeClassName ? { runtimeClassName: template.runtimeClassName } : {}),
       ...(template.securityContext ? { securityContext: template.securityContext } : {}),
