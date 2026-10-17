@@ -9,7 +9,8 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Effect, Exit, Layer, Scope } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
-import { activeAt, freeLabels, type Pool, readLease } from "../src/binder/bindings.ts";
+import { activeAt, readLease } from "../src/binder/bindings.ts";
+import { freeLabels, type Pool } from "../src/binder/names.ts";
 import { type BinderServer, PlacementRefused, serveBinder } from "../src/binder/server.ts";
 import { mintToken, verifyToken } from "../src/binder/tokens.ts";
 import { KubeClient } from "../src/kube/client.ts";

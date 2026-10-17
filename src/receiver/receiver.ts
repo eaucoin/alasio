@@ -14,6 +14,7 @@ import type { HttpServerError } from "effect/http";
 import { type BindingNamespaces, LiveBindings } from "../binder/live.ts";
 import { verifyToken } from "../binder/tokens.ts";
 import { makeEnvironments, type SessionsEnvironment } from "../gateway/environments.ts";
+import { BINDING_KEY_VARIABLE, RECEIVER_PORT_VARIABLE, SESSIONS_NAMESPACE_VARIABLE } from "../gateway/names.ts";
 import { KubeClient } from "../kube/client.ts";
 import { volumeIdOfKey } from "../sandbox/names.ts";
 import { sandboxResource } from "../sandbox/telemetry.ts";
@@ -21,13 +22,6 @@ import { type Authenticated, AuthenticationUnknown, serveTelemetryReceiver } fro
 import type { ResourceStamp } from "../sandbox/otlp-resource.ts";
 import { withLogScope } from "../shared/log.ts";
 import { createOtlpForwarder } from "../telemetry/forward.ts";
-
-/** The variable of the port the receiver serves on. */
-export const RECEIVER_PORT_VARIABLE = "RECEIVER_PORT";
-/** The variable of the key bindings' tokens are signed with: its text, as the stack's setup makes it. */
-export const BINDING_KEY_VARIABLE = "BINDING_KEY";
-/** The variable of main's sessions' namespace; branch environments' are found. */
-export const SESSIONS_NAMESPACE_VARIABLE = "SESSIONS_NAMESPACE";
 
 /**
  * What a session's telemetry is stamped with: its sandbox's, and, of a branch environment's

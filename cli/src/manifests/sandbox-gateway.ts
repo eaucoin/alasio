@@ -42,11 +42,10 @@ import type {
   V1ServiceAccount,
 } from "@kubernetes/client-node";
 
-import { freeLabels, type Pool } from "../../../src/binder/bindings.ts";
-import { BINDING_KEY_VARIABLE, CALLER_KEY_VARIABLE, GATEWAY_CONFIG_VARIABLE, type GatewayConfig } from "../../../src/gateway/gateway.ts";
+import { freeLabels, type Pool } from "../../../src/binder/names.ts";
+import { BINDING_KEY_VARIABLE, CALLER_KEY_VARIABLE, GATEWAY_CONFIG_VARIABLE, type GatewayConfig, RECEIVER_PORT_VARIABLE, SESSIONS_NAMESPACE_VARIABLE } from "../../../src/gateway/names.ts";
 import { BAYMA_CONTAINER, NET_MODE_LABEL } from "../../../src/kube/sandbox-shape.ts";
 import { ATTACH_ROOT, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
-import { RECEIVER_PORT_VARIABLE, SESSIONS_NAMESPACE_VARIABLE } from "../../../src/receiver/receiver.ts";
 import { imageReference } from "../images.ts";
 import { READY_ONCE_BOUND_ANNOTATION } from "../kube/rollout.ts";
 import { sessionsNamespace } from "./alasio.ts";

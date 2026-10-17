@@ -17,7 +17,8 @@
 import { Context, Effect, FiberMap, Layer, Schedule, Stream } from "effect";
 
 import { INITIAL_EVENTS_END, KubeClient } from "../kube/client.ts";
-import { BINDING_LABEL, type BindingLease, KEY_ANNOTATION } from "./bindings.ts";
+import { type BindingLease } from "./bindings.ts";
+import { BINDING_LABEL, KEY_ANNOTATION } from "./names.ts";
 
 /** How long a watch that failed waits before it watches again. */
 const RETRY_MS = 1_000;

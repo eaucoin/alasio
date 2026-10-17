@@ -22,7 +22,7 @@
  */
 import type { V1PodDisruptionBudget, V1TopologySpreadConstraint } from "@kubernetes/client-node";
 
-import { BINDING_LABEL } from "../../../src/binder/bindings.ts";
+import { BINDING_LABEL } from "../../../src/binder/names.ts";
 import { BUSY_LABEL } from "../../../src/kube/busy-label.ts";
 import { componentName, labels, selectorLabels } from "./common.ts";
 import type { Scale } from "./config.ts";

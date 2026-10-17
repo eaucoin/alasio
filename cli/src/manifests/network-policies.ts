@@ -10,7 +10,7 @@ import type { V1NetworkPolicy, V1NetworkPolicyEgressRule, V1NetworkPolicyIngress
 import { COMPUTE_CTL_PORT, COMPUTE_PORT } from "../../../neon/control/branches.ts";
 import { BRANCH_FORK_PORT } from "../../../src/branch/names.ts";
 import type { ApiServer } from "../api-server.ts";
-import { POOL_LABEL } from "../../../src/binder/bindings.ts";
+import { POOL_LABEL } from "../../../src/binder/names.ts";
 import { NET_MODE_LABEL } from "../../../src/kube/sandbox-shape.ts";
 import { NODE_AGENT_PORT } from "../../../src/node-agent/names.ts";
 import { forksForBranches, sessionsNamespace } from "./alasio.ts";
