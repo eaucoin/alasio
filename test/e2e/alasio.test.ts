@@ -39,7 +39,7 @@ import type { Manifest } from "../../src/node-agent/agent.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER } from "./codex-stand-in.ts";
-import { sandboxService } from "./sandbox-service.ts";
+import { bindInBranch, mainSandboxService, sandboxService, servesBranch } from "./sandbox-service.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
 import {
   AGENTS,
@@ -2839,6 +2839,8 @@ if (inShard("branches")) {
     let branchTelegram: Forward | undefined;
     let branch: ReturnType<typeof operator>;
     let volumeId: string;
+    /** Main's sandbox service, as it ran before the branch was made. */
+    let mainService: string[];
 
     before(async () => {
       telegram = await forward(TELEGRAM);
@@ -2858,6 +2860,7 @@ if (inShard("branches")) {
     });
 
     test("alasio branch create makes the branch, serving its own bot, and main's lake keeps its files while it is", async () => {
+      mainService = await mainSandboxService();
       const started = Date.now();
       // Its compute sleeps after a minute idle.
       await createBranch(branchTelegram?.base, { neon: { compute: { suspendAfter: "1m" } } });
@@ -2865,6 +2868,12 @@ if (inShard("branches")) {
       await branch.waitFor((call) => call.method === "setMyCommands", 300_000);
       assert.match(await alasioOk("branch", "list"), new RegExp(`^${BRANCH}: a branch of main, \\d+m old, made by alasio \\S+, its alasio ready, `, "mu"));
       await maintained("kept the files for the branch", (line) => line.includes(`"keptFilesFor":["${BRANCH}"]`));
+    });
+
+    test("main's sandbox gateway binds the branch's sessions in the branch's own pools, by the branch's own key, and nothing of main's sandbox service restarted", async () => {
+      assert.equal((await servesBranch(BRANCH)).status, 409);
+      assert.deepEqual(await bindInBranch(BRANCH), { namespace: BRANCH_SESSIONS });
+      assert.deepEqual(await mainSandboxService(), mainService);
     });
 
     test("a turn on the branch goes on in main's conversation in a fork of its workspace, which main made, and nothing of main's changes", async () => {
@@ -3010,6 +3019,18 @@ if (inShard("branches")) {
       const found = await kube.execOk(NAMESPACE, controller, ["sh", "-c", 'curl -sS -o /dev/null -w "%{http_code}" -H "authorization: Bearer $CONTROL_PLANE_JWT_TOKEN" "$0"', `http://127.0.0.1:1234/v1/tenant/${tenantId}/timeline/${timeline}`]);
       assert.equal(found, "404");
       await maintained("deleted files again", (line) => !line.includes("keptFilesFor"));
+      // Main's sandbox gateway serves the branch no more, and nothing of it restarted.
+      // Let go of as the gateway finds its environments anew, within its refresh (src/gateway/environments.ts).
+      for (const deadline = Date.now() + 120_000; ; await sleep(5000)) {
+        const served = await servesBranch(BRANCH);
+        if (served.status === 403) {
+          assert.match(served.said, new RegExp(`there is no environment ${BRANCH} of sessions`, "u"));
+          break;
+        }
+        assert.equal(served.status, 409, served.said);
+        assert.ok(Date.now() < deadline, "main's gateway still serves the deleted branch");
+      }
+      assert.deepEqual(await mainSandboxService(), mainService);
       // Main goes on as it was.
       await tg.say("and main?");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
