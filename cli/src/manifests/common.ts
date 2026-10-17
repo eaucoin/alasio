@@ -50,8 +50,7 @@ export interface Environment {
 /** main: alasio's own environment. */
 export const MAIN_ENVIRONMENT: Environment = { namespace: NAMESPACE, branch: null };
 
-/** The label of a branch environment's objects and namespaces, whose value is its name. */
-export const BRANCH_LABEL = "alasio.dev/branch";
+export { BRANCH_LABEL } from "../../../src/branch/names.ts";
 
 /** A component's name: `alasio-<component>`. */
 export function componentName(component: string): string {
