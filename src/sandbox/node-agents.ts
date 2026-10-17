@@ -83,6 +83,27 @@ export interface NodeAgents {
   readonly workspaces: (environment: string) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
   /** Has `node`'s cache discard the workspace's snapshots but `keep` that no restore there may be reading: their ids. */
   readonly discard: (node: string, workspace: WorkspaceRef, keep: string | null) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
+  /**
+   * Attaches the workspace's files into the directory of the sandbox pool pod `pod` on
+   * `node`, its binding's `token` beside them. An agent refuses one whose directory holds a
+   * mount with 409.
+   */
+  readonly attach: (node: string, request: AttachRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /**
+   * Detaches what is attached into `pod`'s directory on `node`. An agent refuses while any of
+   * `containerIds`, the pod's sandbox's containers by their runtime's ids, runs, with 409.
+   */
+  readonly detach: (node: string, pod: string, containerIds: readonly string[]) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** The workspace's file at `path`, `workspace/...` or `home/...`, of `maxBytes` at most, as any agent reads it. */
+  readonly readFile: (workspace: WorkspaceRef, path: string, maxBytes: number) => Effect.Effect<Uint8Array, NodeAgentError | KubeApiError>;
+  /** Writes `bytes` as the workspace's file at `path`, as any agent writes it. */
+  readonly writeFile: (workspace: WorkspaceRef, path: string, bytes: Uint8Array) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+}
+
+/** What an attach is of: the workspace, the pool pod it goes into, and the binding's token beside it. */
+export interface AttachRequest extends WorkspaceRef {
+  readonly pod: string;
+  readonly token: string;
 }
 
 /** How long a checkpoint, a prepare or a copy may take. */
@@ -94,11 +115,12 @@ const RESUME_CALL: Duration.Input = Duration.sum(Duration.millis(POLICY_WAIT_MS)
 /** How long any other call may take. */
 const SHORT_CALL: Duration.Input = "30 seconds";
 
-/** A call of an agent: what, with what, for how long; with `absent`, a 404 is an answer, not a failure. */
+/** A call of an agent: what, with what (JSON, or bytes as they are), for how long; with `absent`, a 404 is an answer, not a failure. */
 interface AgentCall {
-  readonly method: "GET" | "POST" | "DELETE";
+  readonly method: "GET" | "POST" | "PUT" | "DELETE";
   readonly path: string;
   readonly body?: unknown;
+  readonly bytes?: Uint8Array;
   readonly timeout: Duration.Input;
   readonly absent?: true;
 }
@@ -124,25 +146,29 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     ),
   );
 
-  /** A call of the agent of `node`, `what` it is asked as a sentence ends: its answer's status and text, or why it failed. */
-  const send = (node: string, what: string, request: AgentCall): Effect.Effect<{ readonly status: number; readonly text: string }, NodeAgentError | KubeApiError> =>
+  /** A call of the agent of `node`, `what` it is asked as a sentence ends: its answer's status, bytes and text, or why it failed. */
+  const send = (node: string, what: string, request: AgentCall): Effect.Effect<{ readonly status: number; readonly bytes: Uint8Array; readonly text: string }, NodeAgentError | KubeApiError> =>
     Effect.gen(function*() {
       const failed = (reason: string, status?: number) => new NodeAgentError({ node, call: what, reason, ...(status === undefined ? {} : { status }) });
       const base = (yield* addresses).get(node);
       if (!base) return yield* failed("no agent is ready there");
-      const { status, ok, text } = yield* Effect.tryPromise({
+      const { status, ok, bytes } = yield* Effect.tryPromise({
         try: async (signal) => {
           const response = await fetch(`${base}${request.path}`, {
             method: request.method,
-            headers: { authorization: `Bearer ${Redacted.value(token)}`, ...(request.body === undefined ? {} : { "content-type": "application/json" }) },
-            ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
+            headers: {
+              authorization: `Bearer ${Redacted.value(token)}`,
+              ...(request.body !== undefined ? { "content-type": "application/json" } : request.bytes !== undefined ? { "content-type": "application/octet-stream" } : {}),
+            },
+            ...(request.body !== undefined ? { body: JSON.stringify(request.body) } : request.bytes !== undefined ? { body: request.bytes } : {}),
             signal: AbortSignal.any([signal, AbortSignal.timeout(Duration.toMillis(request.timeout))]),
           });
-          return { status: response.status, ok: response.ok, text: await response.text() };
+          return { status: response.status, ok: response.ok, bytes: new Uint8Array(await response.arrayBuffer()) };
         },
         catch: (cause) => failed(cause instanceof Error ? cause.message : String(cause)),
       });
-      if (ok || (status === 404 && request.absent)) return { status, text };
+      const text = new TextDecoder().decode(bytes);
+      if (ok || (status === 404 && request.absent)) return { status, bytes, text };
       const refusal = Schema.decodeUnknownOption(Schema.fromJsonString(Refusal))(text);
       return yield* failed(refusal._tag === "Some" ? refusal.value.error : `it answered ${status}`, status);
     });
@@ -182,8 +208,19 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     return first === undefined ? Effect.fail(new NodeAgentError({ node: "any node", call: "be reached", reason: "no agent is ready" })) : Effect.succeed(first);
   });
 
+  /** The path of a workspace's file. */
+  const filePath = ({ environment, workspace }: WorkspaceRef, path: string) => `/files/${encodeURIComponent(environment)}/${encodeURIComponent(workspace)}?path=${encodeURIComponent(path)}`;
+
   return {
     nodes: Effect.map(addresses, (known) => [...known.keys()]),
+    attach: (node, request) => send(node, `attach ${request.environment}/${request.workspace} into ${request.pod}`, { method: "POST", path: "/attach", body: request, timeout: SHORT_CALL }).pipe(Effect.asVoid),
+    detach: (node, pod, containerIds) => send(node, `detach what is attached into ${pod}`, { method: "POST", path: "/detach", body: { pod, containerIds }, timeout: SHORT_CALL }).pipe(Effect.asVoid),
+    readFile: (workspace, path, maxBytes) =>
+      Effect.flatMap(anyNode, (node) => send(node, `read ${path} of ${workspace.environment}/${workspace.workspace}`, { method: "GET", path: `${filePath(workspace, path)}&max=${maxBytes}`, timeout: SHORT_CALL })).pipe(
+        Effect.map(({ bytes }) => bytes),
+      ),
+    writeFile: (workspace, path, bytes) =>
+      Effect.flatMap(anyNode, (node) => send(node, `write ${path} of ${workspace.environment}/${workspace.workspace}`, { method: "PUT", path: filePath(workspace, path), bytes, timeout: SHORT_CALL })).pipe(Effect.asVoid),
     checkpoint: (node, request) => operate(node, `snapshot ${request.environment}/${request.workspace}`, "/checkpoints", request, Manifest),
     prepare: (node, workspace) => operate(node, `prepare ${workspace.environment}/${workspace.workspace}'s snapshot`, "/prepare", workspace, Prepared),
     current: (workspace) =>

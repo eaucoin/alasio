@@ -106,6 +106,10 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
       }),
     current: () => (read ? Effect.fail(read) : Effect.succeed(current)),
     copy: () => Effect.die("nothing is copied"),
+    attach: () => Effect.die("nothing is attached"),
+    detach: () => Effect.die("nothing is detached"),
+    readFile: () => Effect.die("no file is read"),
+    writeFile: () => Effect.die("no file is written"),
     forget: (workspace) => Effect.sync(() => void asked.push(`forget ${workspace.environment}/${workspace.workspace}`)),
     resume: (node, request) =>
       Effect.suspend(() => {
