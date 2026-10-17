@@ -487,6 +487,8 @@ export function sandboxPoolObjects(config: InstallConfig, environment: Environme
       { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] },
       // Its pools' templates, which a release's snapshot records.
       { apiGroups: ["apps"], resources: ["deployments"], verbs: ["get"], resourceNames: [POOLS.none, POOLS.full] },
+      // What the API server tells of the pods it refused to make, as the sandbox pods' policy refused them (src/gateway/refusals.ts).
+      { apiGroups: [""], resources: ["events"], verbs: ["list"] },
     ]),
     ...accountRole(RECEIVER, RECEIVER_COMPONENT, namespace, [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]),
     ...poolObjects(config, pools.none, "none"),

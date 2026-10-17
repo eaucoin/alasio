@@ -26,6 +26,10 @@
  * - `GET /workspace/all`: `{ workspaces }`, the names of the environment's workspaces (200).
  * What is refused is `{ error }` with its status; a node agent's refusal is its own, and
  * what failed otherwise 502.
+ *
+ * Its metrics: how long each attach and detach took (ATTACH_DURATION, DETACH_DURATION), and
+ * each binding released, by why (RELEASES): `idle`, released by its sweep; `asked`, by its
+ * caller; `lost`, its pod gone while it was bound. Each of its pool's namespace.
  */
 import { lookup } from "node:dns/promises";
 
@@ -44,7 +48,29 @@ import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import { isValidVolumeId, volumeIdOfKey } from "../sandbox/names.ts";
 import { hookOf } from "../sandbox/snapshots.ts";
 import type { Events, EventInput } from "../events/events.ts";
+import { meter } from "../telemetry/index.ts";
 import type { Environments } from "./environments.ts";
+
+/** The metrics of the gateway's sessions, as the module says. */
+export const ATTACH_DURATION = "alasio.gateway.attach.duration";
+export const DETACH_DURATION = "alasio.gateway.detach.duration";
+export const RELEASES = "alasio.gateway.releases";
+const attachDuration = meter.createHistogram(ATTACH_DURATION, { description: "How long a node agent took to attach a workspace into its bound pod", unit: "s" });
+const detachDuration = meter.createHistogram(DETACH_DURATION, { description: "How long a node agent took to detach a workspace from its released pod", unit: "s" });
+const releases = meter.createCounter(RELEASES, { description: "Bindings released, by why: idle, asked by their caller, or lost as their pod went" });
+
+/** Why a binding was released. */
+type ReleaseReason = "idle" | "asked" | "lost";
+const released = (pool: Pool, reason: ReleaseReason) => Effect.sync(() => releases.add(1, { "k8s.namespace.name": pool.namespace, "alasio.gateway.release.reason": reason }));
+
+/** `effect`, its duration, when it succeeds, recorded on `histogram` of `pool`'s namespace. */
+const timed = <A, E, R>(histogram: typeof attachDuration, pool: Pool, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.gen(function*() {
+    const started = yield* Clock.currentTimeMillis;
+    const value = yield* effect;
+    histogram.record(((yield* Clock.currentTimeMillis) - started) / 1000, { "k8s.namespace.name": pool.namespace });
+    return value;
+  });
 
 /** A session's internet. */
 export type NetMode = "none" | "full";
@@ -132,18 +158,18 @@ export const makeSessions = Effect.fnUntraced(function*(
       return {
         pool,
         // Released as it is when idle: saved whole first, then detached, then deleted.
-        release: ({ pod }) => endAndDetach(pool, volumeId, pod),
+        release: ({ pod }) => endAndDetach(pool, volumeId, pod).pipe(Effect.tap(() => released(pool, "asked"))),
         // Its workspace attached, its binding's token beside it, on which its bayma starts.
         prepare: (pod, binding) =>
           Effect.gen(function*() {
             const env = telemetry ? { ...telemetry.env, OTEL_EXPORTER_OTLP_ENDPOINT: `http://${yield* addressOf(telemetry.host)}:${telemetry.port}` } : {};
-            yield* agents.attach(pod.spec?.nodeName ?? "", {
+            yield* timed(attachDuration, pool, agents.attach(pod.spec?.nodeName ?? "", {
               environment: environment.namespace,
               workspace: volumeId,
               pod: pod.metadata?.name ?? "",
               token: bindingToken(bindingKey, { key, binding, namespace: environment.namespace }),
               env,
-            }).pipe(Effect.mapError((error) => new BindStepFailed({ reason: error.message })));
+            })).pipe(Effect.mapError((error) => new BindStepFailed({ reason: error.message })));
           }),
       };
     });
@@ -199,7 +225,7 @@ export const makeSessions = Effect.fnUntraced(function*(
         yield* kube.remove("v1", "Pod", pool.namespace, name);
       }
       yield* stopped(pool, name);
-      yield* agents.detach(node, name, containers);
+      yield* timed(detachDuration, pool, agents.detach(node, name, containers));
     });
 
   /** Tells `pool`'s environment's alasio of what `of` says; where `pool`'s environment is gone, no one. */
@@ -212,9 +238,9 @@ export const makeSessions = Effect.fnUntraced(function*(
     idleness: baymaIdleness({ podPort, releaseAfterMs, idlePollMs, bindingKey }),
     release: (pool: Pool, key: string, lease: BindingLease) =>
       binder.release(pool, key, ({ pod: name }) => endAndDetach(pool, volumeIdOfKey(key) ?? "", name)).pipe(
-        Effect.tap((released) =>
-          released
-            ? tell(pool, (environment) => ({ kind: "workspace.released", environment, source: "sandbox-gateway", subject: subject(key), binding: lease.metadata?.uid ?? "", reason: "idle" }))
+        Effect.tap((done) =>
+          done
+            ? Effect.andThen(released(pool, "idle"), tell(pool, (environment) => ({ kind: "workspace.released", environment, source: "sandbox-gateway", subject: subject(key), binding: lease.metadata?.uid ?? "", reason: "idle" })))
             : Effect.void
         ),
       ),
@@ -222,7 +248,7 @@ export const makeSessions = Effect.fnUntraced(function*(
 
   const lost = (pool: Pool, lease: BindingLease): Effect.Effect<void> => {
     const key = lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
-    return tell(pool, (environment) => ({
+    return Effect.andThen(released(pool, "lost"), tell(pool, (environment) => ({
       kind: "workspace.lost",
       environment,
       source: "sandbox-gateway",
@@ -230,7 +256,7 @@ export const makeSessions = Effect.fnUntraced(function*(
       binding: lease.metadata?.uid ?? "",
       pod: lease.spec?.holderIdentity ?? "",
       reason: "its pod went while it was bound",
-    }));
+    })));
   };
 
   /** A refusal of `status`, saying `error`. */

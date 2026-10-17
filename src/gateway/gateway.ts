@@ -7,7 +7,8 @@
  * telling each environment's alasio of what happens to its sessions' bindings on the log
  * (../events/events.ts).
  * What a gateway that ended left between a binding's steps is set right as it starts, and
- * every RECONCILE_MS after; bound pods are looked at for one to release every SWEEP_MS.
+ * every RECONCILE_MS after; bound pods are looked at for one to release every SWEEP_MS; the
+ * pools' refusals by the sandbox pods' policy are counted every REFUSALS_MS (./refusals.ts).
  * What stops it is logged.
  */
 import { lookup } from "node:dns/promises";
@@ -25,6 +26,7 @@ import { KubeClient } from "../kube/client.ts";
 import { makeNodeAgents } from "../sandbox/node-agents.ts";
 import { withLogScope } from "../shared/log.ts";
 import { makeEnvironments } from "./environments.ts";
+import { makeRefusalCount } from "./refusals.ts";
 import {
   BINDING_KEY_VARIABLE,
   CALLER_KEY_VARIABLE,
@@ -40,6 +42,8 @@ import { makeSessions } from "./sessions.ts";
 const SWEEP_MS = 5_000;
 /** How often the pools' bindings are set right where a gateway ended between their steps. */
 const RECONCILE_MS = 60_000;
+/** How often the pools' refusals by the sandbox pods' policy are counted. */
+const REFUSALS_MS = 30_000;
 
 /** The gateway's configuration, read from its file once, as it starts, and checked. */
 const loadConfig = Effect.gen(function*() {
@@ -84,6 +88,11 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
         ), { discard: true }));
     yield* setRight;
     yield* Effect.forkScoped(Effect.repeat(setRight, Schedule.spaced(RECONCILE_MS)));
+    const countRefusals = yield* makeRefusalCount(sessions.pools);
+    yield* Effect.forkScoped(Effect.repeat(
+      countRefusals.pipe(Effect.catch((error) => Effect.logWarning(`counting the pod policy's refusals failed: ${error.message}`))),
+      Schedule.spaced(REFUSALS_MS),
+    ));
     yield* Effect.forkScoped(Effect.repeat(
       sessions.sweep.pipe(
         Effect.tap((released) => (released.length > 0 ? Effect.logInfo(`released ${released.join(", ")}`) : Effect.void)),

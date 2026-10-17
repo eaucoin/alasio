@@ -21,6 +21,9 @@ export const EVENTS_PASSWORD_FILE_VARIABLE = "EVENTS_PASSWORD_FILE";
 export const RECEIVER_PORT_VARIABLE = "RECEIVER_PORT";
 export const SESSIONS_NAMESPACE_VARIABLE = "SESSIONS_NAMESPACE";
 
+/** The sandbox pods' policy, which holds every pod of a sessions' namespace to its pools' templates (cli/src/manifests/admission.ts sandboxPodPolicy). */
+export const SANDBOX_POD_POLICY = "alasio-sandbox-pods";
+
 /** The gateway's configuration, as `alasio up` renders it (cli/src/manifests/sandbox-gateway.ts). */
 export const GatewayConfig = Schema.Struct({
   /** The port it serves on, and the host its replicas' headless Service resolves to, each at that port. */

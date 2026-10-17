@@ -3469,6 +3469,8 @@ describe("the sandbox service", () => {
       { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch", "update", "delete"] },
       { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] },
       { apiGroups: ["apps"], resources: ["deployments"], verbs: ["get"], resourceNames: ["sandboxes-none", "sandboxes-full"] },
+      // The Events of the pods the sandbox pods' policy refused, which it counts.
+      { apiGroups: [""], resources: ["events"], verbs: ["list"] },
     ]);
     assert.equal(one<V1Service>(objects, "Service", "alasio-sandbox-gateway-peers").spec?.clusterIP, "None");
   });
