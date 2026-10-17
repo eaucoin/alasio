@@ -13,7 +13,9 @@
  *   (Recreate);
  * - its maintenance, main's alone, a pass a process (neon/lake/src/maintain.ts): a
  *   CronJob of the daily pass, on lake.maintenance.schedule, and one of the hourly merge of
- *   the telemetry's files, each of which waits for the one before it;
+ *   the telemetry's files, each of which waits for the one before it; and, of each
+ *   environment, the reconciliation of its catalog with the object store, a Job run on
+ *   demand (lakeReconcile);
  * - its readers, `lake-query`, main's alone, through which Grafana and alasio lake read it
  *   (neon/lake/src/endpoint.ts), each with only the reader's credentials, from
  *   lake.query's least, never below one for Grafana's alert rules, to its most, which KEDA
@@ -26,7 +28,7 @@
  *   them: from none, while nothing is waiting, to lake.intake's most, as many as the
  *   topics have partitions.
  */
-import type { KubernetesObject, V1Container, V1CronJob, V1Deployment, V1EnvVar, V1Service } from "@kubernetes/client-node";
+import type { KubernetesObject, V1CronJob, V1Deployment, V1EnvVar, V1Job, V1JobSpec, V1Service } from "@kubernetes/client-node";
 
 import { computeId, MAIN, replicaId } from "../../../neon/control/branches.ts";
 import { memoryBytes } from "../capacity.ts";
@@ -50,6 +52,7 @@ import {
 import { replicaBudget, spread } from "./disruption.ts";
 import type { InstallConfig } from "./config.ts";
 import { PROXY_HOST, PROXY_PORT } from "./neon.ts";
+import { FILER, MASTER } from "./object-store.ts";
 import { priority } from "./priorities.ts";
 import { scaledObject, type Trigger, type TriggerAuthentication } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
@@ -62,6 +65,8 @@ export const LAKE_METRICS_PORT = 9464;
 export const LOADER_COMPONENT = "lake-loader";
 export const QUERY_COMPONENT = "lake-query";
 export const MAINTENANCE_COMPONENT = "lake-maintenance";
+/** The reconciliation's, apart from maintenance's, as the bundled object store's filer, masters and volume servers admit it alone of the lake (./network-policies.ts). */
+export const RECONCILE_COMPONENT = "lake-reconcile";
 export const INTAKE_COMPONENT = "lake-intake";
 
 /** When the telemetry's files are merged: hourly, away from the hour's other passes. */
@@ -155,9 +160,7 @@ function loaderObjects(config: InstallConfig, environment: Environment): Kuberne
             env: [
               ...lakeEnv(config, environment),
               ...writerSecrets(),
-              // alasio's database, which it loads from, on its environment's read replica, which
-              // takes nothing of what alasio's own compute serves alasio.
-              { name: "LAKE_SOURCE_ENDPOINT", value: replicaId(environment.branch ?? MAIN) },
+              sourceEnv(environment),
               { name: "LOG_BROKERS", value: LOG_BROKERS },
               fromSecret("LOG_USERNAME", log, "username"),
               fromSecret("LOG_PASSWORD", log, "password"),
@@ -184,6 +187,13 @@ function loaderObjects(config: InstallConfig, environment: Environment): Kuberne
 }
 
 /**
+ * Where `environment`'s alasio's database is read from, which its loader and its
+ * reconciliation load from: its read replica, which takes nothing of what alasio's own
+ * compute serves alasio.
+ */
+const sourceEnv = (environment: Environment): V1EnvVar => ({ name: "LAKE_SOURCE_ENDPOINT", value: replicaId(environment.branch ?? MAIN) });
+
+/**
  * What DuckDB is let hold in a container whose memory limit is `limit`: three fifths of it,
  * the rest Node's and the Parquet reader's, which DuckDB's own limit does not count; its
  * own default, where the container has none.
@@ -191,61 +201,104 @@ function loaderObjects(config: InstallConfig, environment: Environment): Kuberne
 const duckdbMemory = (limit: string | undefined): V1EnvVar[] =>
   limit ? [{ name: "LAKE_MEMORY_LIMIT", value: `${Math.floor((memoryBytes(limit) * 3) / 5 / 2 ** 20)}MiB` }] : [];
 
+/**
+ * A pass of maintenance's (neon/lake/src/maintain.ts) on `environment`'s lake: its
+ * container, given `env` beside where the lake is and its writer's credentials, and its pod
+ * template, as a Job of the pass runs it.
+ */
+function passTemplate(config: InstallConfig, environment: Environment, pass: "maintain" | "merge" | "reconcile", env: readonly V1EnvVar[]): V1JobSpec {
+  return {
+    backoffLimit: 2,
+    activeDeadlineSeconds: 3600,
+    template: {
+      metadata: { labels: stackLabels(pass === "reconcile" ? RECONCILE_COMPONENT : MAINTENANCE_COMPONENT) },
+      spec: {
+        restartPolicy: "Never",
+        ...priority("component"),
+        ...stackPodSpec(config),
+        containers: [{
+          name: "maintenance",
+          image: imageReference(config.images.lake),
+          imagePullPolicy: config.images.pullPolicy,
+          command: ["node", "src/maintain.ts", pass],
+          env: [
+            ...lakeEnv(config, environment),
+            ...writerSecrets(),
+            ...duckdbMemory(config.lake.maintenance.resources.limits?.["memory"]),
+            ...env,
+            ...otelEnv(config, environment),
+            { name: "OTEL_SERVICE_NAME", value: "alasio-lake-maintenance" },
+          ],
+          securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
+          resources: config.lake.maintenance.resources,
+          volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],
+        }],
+        volumes: [{ name: "tmp", emptyDir: { sizeLimit: "4Gi" } }],
+      },
+    },
+  };
+}
+
 /** Main's maintenance: a CronJob of each of its passes, its daily one on `schedule`, the merge hourly. */
 function maintenanceObjects(config: InstallConfig): KubernetesObject[] {
-  const cronJob = (pass: "maintain" | "merge", schedule: string): V1CronJob => {
-    const name = componentName(pass === "merge" ? "lake-merge" : MAINTENANCE_COMPONENT);
-    const container: V1Container = {
-      name: "maintenance",
-      image: imageReference(config.images.lake),
-      imagePullPolicy: config.images.pullPolicy,
-      command: ["node", "src/maintain.ts", pass],
-      env: [
-        ...lakeEnv(config),
-        ...writerSecrets(),
-        ...duckdbMemory(config.lake.maintenance.resources.limits?.["memory"]),
-        { name: "LAKE_RETENTION_DAYS", value: String(config.telemetry.retentionDays) },
-        // It keeps its files while Neon has branches, whose lakes read them.
-        { name: "LAKE_BRANCHES_URL", value: `http://${neonName("control")}:8080/branches` },
-        fromSecret("LAKE_BRANCHES_TOKEN", componentName("lake"), "LAKE_BRANCHES_TOKEN"),
-        ...otelEnv(config),
-        { name: "OTEL_SERVICE_NAME", value: "alasio-lake-maintenance" },
-      ],
-      securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
-      resources: config.lake.maintenance.resources,
-      volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],
-    };
-    return {
-      apiVersion: "batch/v1",
-      kind: "CronJob",
-      metadata: { name, namespace: NAMESPACE, labels: stackLabels(MAINTENANCE_COMPONENT) },
-      spec: {
-        schedule,
-        // A pass waits for the one before it; one missed by more than an hour waits for the next.
-        concurrencyPolicy: "Forbid",
-        startingDeadlineSeconds: 3600,
-        successfulJobsHistoryLimit: 1,
-        failedJobsHistoryLimit: 3,
-        jobTemplate: {
-          spec: {
-            backoffLimit: 2,
-            activeDeadlineSeconds: 3600,
-            template: {
-              metadata: { labels: stackLabels(MAINTENANCE_COMPONENT) },
-              spec: {
-                restartPolicy: "Never",
-                ...priority("component"),
-                ...stackPodSpec(config),
-                containers: [container],
-                volumes: [{ name: "tmp", emptyDir: { sizeLimit: "4Gi" } }],
-              },
-            },
-          },
-        },
+  const cronJob = (pass: "maintain" | "merge", schedule: string): V1CronJob => ({
+    apiVersion: "batch/v1",
+    kind: "CronJob",
+    metadata: { name: componentName(pass === "merge" ? "lake-merge" : MAINTENANCE_COMPONENT), namespace: NAMESPACE, labels: stackLabels(MAINTENANCE_COMPONENT) },
+    spec: {
+      schedule,
+      // A pass waits for the one before it; one missed by more than an hour waits for the next.
+      concurrencyPolicy: "Forbid",
+      startingDeadlineSeconds: 3600,
+      successfulJobsHistoryLimit: 1,
+      failedJobsHistoryLimit: 3,
+      jobTemplate: {
+        spec: passTemplate(config, MAIN_ENVIRONMENT, pass, [
+          { name: "LAKE_RETENTION_DAYS", value: String(config.telemetry.retentionDays) },
+          // It keeps its files while Neon has branches, whose lakes read them.
+          { name: "LAKE_BRANCHES_URL", value: `http://${neonName("control")}:8080/branches` },
+          fromSecret("LAKE_BRANCHES_TOKEN", componentName("lake"), "LAKE_BRANCHES_TOKEN"),
+        ]),
       },
-    };
-  };
+    },
+  });
   return [cronJob("maintain", config.lake.maintenance.schedule), cronJob("merge", MERGE_SCHEDULE)];
+}
+
+/** The Job of a lake's reconciliation, in its environment's namespace. */
+export const LAKE_RECONCILE = componentName("lake-reconcile");
+
+/**
+ * The reconciliation of `environment`'s lake, main's or a branch environment's, each with a
+ * catalog of its own: a Job of maintenance's reconcile pass, which sets its catalog right with
+ * the object store where files it names are gone, and loads again from its alasio's database
+ * what its transcripts lost (neon/lake/src/reconcile.ts). It is run on demand alone, by alasio
+ * lake reconcile and by alasio restore-filer-store, as a pass that changes the catalog
+ * on its own would hide a loss a person is to look into.
+ */
+export function lakeReconcile(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT): V1Job {
+  return {
+    apiVersion: "batch/v1",
+    kind: "Job",
+    metadata: { name: LAKE_RECONCILE, namespace: environment.namespace, labels: stackLabels(RECONCILE_COMPONENT) },
+    spec: {
+      ...passTemplate(config, environment, "reconcile", [
+        sourceEnv(environment),
+        // A branch environment's lake's telemetry is main's as of its branch point, which main's reads again.
+        ...(environment.branch === null ? [] : [{ name: "LAKE_BRANCH", value: environment.branch }]),
+        // The bundled store's parts, which say whether a file the store fails a read of is gone.
+        ...(config.objectStore.bundled.enabled
+          ? [
+            { name: "LAKE_STORE_FILER_URL", value: `http://${FILER}.${NAMESPACE}.svc:8888` },
+            { name: "LAKE_STORE_MASTER_URL", value: `http://${MASTER}.${NAMESPACE}.svc:9333` },
+            // Every one of which the masters are to know before their not knowing a volume says it is gone.
+            { name: "LAKE_STORE_VOLUME_SERVERS", value: String(config.objectStore.bundled.volumeServers.scaling.min) },
+          ]
+          : []),
+      ]),
+      backoffLimit: 0,
+    },
+  };
 }
 
 /** Main's readers, their Service, which keeps the lake's name, and the headless one each finds the others by. */

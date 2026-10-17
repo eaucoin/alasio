@@ -582,3 +582,42 @@ groups:
               type: threshold
               expression: deliveries
               conditions: [{evaluator: {type: gt, params: [0]}}]
+
+      - uid: alasio-lake-files-lost
+        title: The lake names files the object store does not hold
+        condition: lost
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $values.failed }} of the lake's maintenance passes failed in the last two hours on a file its catalog names that the object store does not hold: what it wrote since a backup put back, or a file deleted. Find why, then run alasio lake reconcile, which forgets them, loads what the transcripts lost again from alasio's database, and says what telemetry was lost."
+        data:
+          - refId: failed
+            relativeTimeRange: {from: 7200, to: 0}
+            datasourceUid: lake
+            model:
+              refId: failed
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select count(*) as failed
+                  from otel.logs
+                  where ServiceName = 'alasio-lake-maintenance' and LogAttributes['because'] is not null and Timestamp > now()::timestamp - interval 2 hour
+              root_selector: ""
+              columns:
+                - {selector: failed, text: failed, type: number}
+          - refId: lost
+            datasourceUid: __expr__
+            model:
+              refId: lost
+              type: threshold
+              expression: failed
+              conditions: [{evaluator: {type: gt, params: [0]}}]

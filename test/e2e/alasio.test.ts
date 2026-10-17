@@ -2551,6 +2551,11 @@ if (inShard("branches")) {
       }
     });
 
+    test("alasio lake reconcile --branch reconciles the branch's lake against its own catalog, as a Job in its namespace, and finds it whole", async () => {
+      assert.deepEqual((await alasioOk("lake", "reconcile", "--branch", BRANCH)).trim().split("\n"), ["the lake lost no file"]);
+      assert.equal(await kube.get(ref("Job", componentName("lake-reconcile"), BRANCH_NAMESPACE)), null);
+    });
+
     test("the branch's credentials are its own: main's compute takes neither its password nor its compute's token", async () => {
       const passwordOf = async (namespace: string) => decodeURIComponent(new URL(await kube.secret(namespace, "alasio-database", "url")).password);
       const compute = await kube.runningPod(NAMESPACE, "alasio-neon-compute");

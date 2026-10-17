@@ -31,7 +31,7 @@ import {
 import type { InstallConfig } from "./config.ts";
 import { replicated } from "./disruption.ts";
 import { GOSSIP_PORT } from "./grafana.ts";
-import { INTAKE_COMPONENT, LAKE_QUERY_PORT, LOADER_COMPONENT, QUERY_COMPONENT } from "./lake.ts";
+import { INTAKE_COMPONENT, LAKE_QUERY_PORT, LOADER_COMPONENT, QUERY_COMPONENT, RECONCILE_COMPONENT } from "./lake.ts";
 import { LOG, LOG_COMPONENT, LOG_CONTROLLER_PORT, LOG_METRICS_PORT, LOG_PORT } from "./log.ts";
 import { WEBHOOK, WEBHOOK_COMPONENT, WEBHOOK_HEALTH_PORT } from "./webhook.ts";
 import {
@@ -251,17 +251,25 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
  * - the filers, by each other, which follow each other's changes, the gateways, and the
  *   lifecycle pass, which replays their log.
  *
- * The stack's other pods, which reach the store through its gateways, reach none of them.
+ * And each environment's lake's reconciliation, main's and branch environments', reaches the
+ * filers, masters and volume servers on their HTTP ports alone, which it asks whether a file
+ * the store fails a read of has its data still (neon/lake/src/reconcile.ts's gone). The
+ * stack's other pods, which reach the store through its gateways, reach none of them.
  */
 function partPolicies(): NetworkPolicy[] {
   const of = (component: string): V1NetworkPolicyPeer => ({ podSelector: { matchLabels: selectorLabels(component) } });
   const ports = (http: number) => [http, http + 10_000].map((port) => ({ protocol: "TCP", port }));
+  const reconciliations: V1NetworkPolicyPeer[] = [
+    ofMain(RECONCILE_COMPONENT),
+    { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels(RECONCILE_COMPONENT) } },
+  ];
   const part = (name: string, component: string, http: number, from: readonly string[]) =>
     policy(name, NAMESPACE, component, {
       podSelector: { matchLabels: selectorLabels(component) },
       policyTypes: ["Ingress"],
       ingress: [
         { from: from.map(of), ports: ports(http) },
+        { from: reconciliations, ports: [{ protocol: "TCP", port: http }] },
         { from: [of(SCRAPER_COMPONENT)], ports: [{ protocol: "TCP", port: METRICS_PORT }] },
       ],
     });

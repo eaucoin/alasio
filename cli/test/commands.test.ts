@@ -758,7 +758,7 @@ test("up changes no count of the object store's masters, nor lowers its volume s
   assert.equal(statefulSet("alasio-seaweedfs-volume")?.spec?.["replicas"], 1);
 });
 
-test("restore-filer-store lists the filer store's backups, and puts one back with what writes to the store stopped, alasio and Neon first, the log left running, and started again as it was", async (t) => {
+test("restore-filer-store lists the filer store's backups, and puts one back with what writes to the store stopped, alasio and Neon first, the log left running, and started again as it was, then the lake's catalog set right with it, saying what the lake lost", async (t) => {
   const { alasio, kube } = await installed(t);
   const at = (path: string) => kube.get(`/apis/${path}`);
   const listing = "filer-store-20261013T082300Z.rdb\nfiler-store-20261013T092300Z.rdb\n";
@@ -783,6 +783,7 @@ test("restore-filer-store lists the filer store's backups, and puts one back wit
 
   // A branch environment's alasio; the gateways scaled by KEDA, and the lake loader's ScaledObject paused before; the lifecycle pass suspended before; a backup of Neon's running.
   const labels = (component: string) => ({ "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component });
+  kube.put("namespaces", { apiVersion: "v1", kind: "Namespace", metadata: { name: "alasio-branch-feature", labels: { "alasio.dev/branch": "feature" } } });
   kube.put("deployments", { apiVersion: "apps/v1", kind: "Deployment", metadata: { name: "alasio", namespace: "alasio-branch-feature", labels: labels("alasio") }, spec: { replicas: 1, selector: { matchLabels: labels("alasio") } } });
   kube.put("pods", { apiVersion: "v1", kind: "Pod", metadata: { name: "alasio-0", namespace: "alasio-branch-feature", labels: labels("alasio") }, status: { phase: "Running" } });
   const scaler = (name: string, annotations: Record<string, string>) =>
@@ -802,10 +803,27 @@ test("restore-filer-store lists the filer store's backups, and puts one back wit
     pod === "alasio-seaweedfs-filer-store-0" && container === "valkey"
       ? { exitCode: 0, stdout: "# Keyspace\ndb0:keys=1234,expires=0,avg_ttl=0\n# Persistence\nloading:0\naof_enabled:1\naof_last_bgrewrite_status:ok\n" }
       : { exitCode: 0 };
+  // Each lake's reconciliation, main's and the branch environment's, once they run again, which says what each table lost (neon/lake/src/maintain.ts).
+  const lost = (table: string, files: number, rows: number, recovered: "database" | "log") =>
+    JSON.stringify({ message: "lost from the object store", table, files, rows, from: "2026-10-13 09:30:00+00", to: "2026-10-13 10:05:00+00", recovered });
+  // The logs' first minute gone from the log too, and the metrics not read again yet.
+  const lostForGood = JSON.stringify({ message: "lost from the object store, and from the log, which no longer holds it", signal: "logs", from: "2026-10-13T09:30:00.000Z", to: "2026-10-13T09:31:00.000Z" });
+  const stillToRead = JSON.stringify({ message: "lost from the object store, still to be read again from the log", signals: ["metrics"] });
+  kube.logs.set("alasio-lake-reconcile-0/maintenance", [lost("claude.entries", 1, 40, "database"), lost("otel.logs", 3, 1, "log"), lostForGood, stillToRead, '{"message":"reconciled","lost":2}', ""].join("\n"));
   const start = kube.changes.length;
   const restored = await alasio(["restore-filer-store", "20261013T092300Z", "--yes"]);
   succeeded(restored);
-  assert.deepEqual(restored.printed, ["The filer store is as it was at 2026-10-13 09:23:00 UTC, with its 1234 keys, and alasio runs on it again."]);
+  const losses = (lake: string) => [
+    `  ${lake}: the lake lost 40 rows of claude.entries, in 1 file, from 2026-10-13 09:30:00+00 to 2026-10-13 10:05:00+00: loaded again from alasio's database`,
+    `  ${lake}: the lake lost 1 row of otel.logs, in 3 files, from 2026-10-13 09:30:00+00 to 2026-10-13 10:05:00+00: read again from the log, where it still holds it`,
+    `  ${lake}: the lake's logs telemetry from 2026-10-13T09:30:00.000Z to 2026-10-13T09:31:00.000Z cannot be refilled: the log no longer holds it`,
+    `  ${lake}: the lake's metrics telemetry is still to be read again from the log: its intake had not taken it up as the reconciliation ended`,
+  ];
+  assert.deepEqual(restored.printed.join("\n").split("\n"), [
+    "The filer store is as it was at 2026-10-13 09:23:00 UTC, with its 1234 keys, and alasio runs on it again.",
+    ...losses("main's lake"),
+    ...losses("the lake of branch environment feature"),
+  ]);
   // Stopped in order: the CronJobs, alasio, Neon and the lake, then the gateways, then the filer store, before the backup is put back.
   const changed = kube.changes.slice(start);
   const first = (path: string) => changed.findIndex((change) => change.path.endsWith(path));
@@ -840,8 +858,12 @@ test("restore-filer-store lists the filer store's backups, and puts one back wit
     ["alasio-seaweedfs-lifecycle", "alasio-seaweedfs-filer-store-backup"].map((name) => at(`batch/v1/namespaces/alasio/cronjobs/${name}`)?.spec?.["suspend"]),
     [true, false],
   );
-  // Nothing of the restore is left but its NetworkPolicy, of the installation.
-  assert.deepEqual([...kube.objects.keys()].filter((path) => path.includes("filer-store-restore") && !path.includes("/networkpolicies/")), []);
+  // Each reconciliation ran in its environment's namespace once the lakes ran again, before the CronJobs resumed; and nothing of the restore is left but its NetworkPolicy, of the installation.
+  for (const namespace of ["alasio", "alasio-branch-feature"]) {
+    const reconciled = first(`/namespaces/${namespace}/jobs/alasio-lake-reconcile`);
+    assert.ok(reconciled > last("/statefulsets/alasio-neon-safekeeper") && reconciled < last("/cronjobs/alasio-seaweedfs-filer-store-backup"), namespace);
+  }
+  assert.deepEqual([...kube.objects.keys()].filter((path) => (path.includes("filer-store-restore") && !path.includes("/networkpolicies/")) || path.includes("lake-reconcile")), []);
 
   // A filer store that holds other than what was restored is said, and what is stopped stays so, until the next run.
   kube.logs.set("alasio-seaweedfs-filer-store-backups-listing-0/list", listing);
@@ -992,6 +1014,51 @@ test("lake runs the query in the lake's query container and prints its answer, i
   const refused = await alasio(["lake", "SELEC"]);
   assert.equal(failure(refused), "the lake's query exited with 2");
   assert.equal(refused.stderr, "Parser Error: syntax error\n");
+});
+
+test("lake reconcile runs an environment's reconciliation as its Job, in its namespace, says what its lake lost, and fails as the Job does", async (t) => {
+  const { alasio, kube } = await installed(t);
+  const job = (namespace: string) => kube.changes.findIndex(({ method, path }) => method !== "DELETE" && path.endsWith(`/namespaces/${namespace}/jobs/alasio-lake-reconcile`));
+  kube.logs.set("alasio-lake-reconcile-0/maintenance", '{"message":"reconciled","lost":0}\n');
+  const none = await alasio(["lake", "reconcile"]);
+  succeeded(none);
+  assert.deepEqual(none.printed, ["the lake lost no file"]);
+  assert.ok(job("alasio") >= 0);
+  assert.equal(kube.get("/apis/batch/v1/namespaces/alasio/jobs/alasio-lake-reconcile"), undefined);
+  // A branch environment's, against its own catalog; one there is not, refused before anything runs.
+  assert.equal(failure(await alasio(["lake", "reconcile", "--branch", "try"])), "there is no branch environment try");
+  assert.equal(job("alasio-branch-try"), -1);
+  kube.put("namespaces", { apiVersion: "v1", kind: "Namespace", metadata: { name: "alasio-branch-try", labels: { "alasio.dev/branch": "try" } } });
+  kube.logs.set("alasio-lake-reconcile-0/maintenance", [
+    JSON.stringify({ message: "lost from the object store, loaded again from alasio's database", table: "codex.lines", files: 2, rows: 7, from: null, to: null, recovered: "database" }),
+    JSON.stringify({ message: "lost from the object store, main's telemetry as of the branch point, which main's lake reads again from the log", table: "otel.logs", files: 1, rows: 3, from: null, to: null, recovered: "main" }),
+    "",
+  ].join("\n"));
+  const branch = await alasio(["lake", "reconcile", "--branch", "try"]);
+  succeeded(branch);
+  assert.deepEqual(branch.printed.join("\n").split("\n"), [
+    "the lake lost 7 rows of codex.lines, in 2 files: loaded again from alasio's database",
+    "the lake lost 3 rows of otel.logs, in 1 file: main's telemetry as of the branch point, which main's lake reads again from the log",
+  ]);
+  assert.ok(job("alasio-branch-try") >= 0);
+  kube.failing.add("alasio-lake-reconcile");
+  assert.match(failure(await alasio(["lake", "reconcile"])), /alasio-lake-reconcile/u);
+  // Failed, saying why: why.
+  kube.logs.set("alasio-lake-reconcile-0/maintenance", `${JSON.stringify({ message: "reconciling the catalog with the object store failed", error: "HTTP Error: 403" })}\n`);
+  assert.equal(failure(await alasio(["lake", "reconcile"])), "the lake's reconciliation in alasio failed: HTTP Error: 403");
+  // One that runs still is left to end, and refused; one that ended is removed, and run afresh.
+  kube.failing.delete("alasio-lake-reconcile");
+  kube.logs.set("alasio-lake-reconcile-0/maintenance", '{"message":"reconciled","lost":0}\n');
+  const running = { apiVersion: "batch/v1", kind: "Job", metadata: { name: "alasio-lake-reconcile", namespace: "alasio" }, spec: {}, status: { active: 1 } };
+  kube.put("jobs", running);
+  kube.changes.length = 0;
+  assert.equal(
+    failure(await alasio(["lake", "reconcile"])),
+    "a reconciliation of the lake in alasio runs already, as its Job alasio-lake-reconcile does: once it ends (kubectl -n alasio get job alasio-lake-reconcile), run this again",
+  );
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
+  kube.put("jobs", { ...running, status: { conditions: [{ type: "Complete", status: "True" }] } });
+  succeeded(await alasio(["lake", "reconcile"]));
 });
 
 test("grafana forwards a port here to Grafana's pod until interrupted, and prints its admin's password when asked", async (t) => {

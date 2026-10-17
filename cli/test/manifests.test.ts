@@ -40,7 +40,9 @@ import { hostBaymaStateDir } from "../../src/mcp/bayma.ts";
 import { memoryBytes } from "../src/capacity.ts";
 import { NODE_PINS } from "../src/cluster/node.ts";
 import { installConfigOf } from "../src/config.ts";
-import { branchObjects } from "../src/manifests/branch.ts";
+import { branchEnvironment, branchObjects } from "../src/manifests/branch.ts";
+import { MAIN_ENVIRONMENT } from "../src/manifests/common.ts";
+import { lakeReconcile } from "../src/manifests/lake.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
 import { filerStoreBackupHours } from "../src/manifests/config.ts";
@@ -822,6 +824,36 @@ describe("the lake's writers", () => {
     assert.deepEqual(install({ lake: { enabled: false } }).filter(({ metadata }) => /^alasio-lake/u.test(metadata?.name ?? "")).map(({ metadata }) => metadata?.name), []);
   });
 
+  test("reconcile each environment's lake on demand alone, as a Job of the pass in its namespace, against its own catalog", () => {
+    const config = configOf();
+    // No object of the installation's runs it on a schedule.
+    assert.equal(install().some(({ kind, metadata }) => kind === "CronJob" && metadata?.name === "alasio-lake-reconcile"), false);
+    for (const [environment, endpoint, replica] of [[MAIN_ENVIRONMENT, "alasio", "alasio-ro"], [branchEnvironment("try"), "branch-try", "branch-try-ro"]] as const) {
+      const job = lakeReconcile(config, environment);
+      const pass = job.spec?.template.spec?.containers[0];
+      assert.ok(pass);
+      assert.deepEqual([job.metadata?.name, job.metadata?.namespace, job.spec?.backoffLimit, pass.command], ["alasio-lake-reconcile", environment.namespace, 0, ["node", "src/maintain.ts", "reconcile"]]);
+      const env = variables(pass);
+      // Its catalog on its primary, alasio's database read on its read replica, as its loader reads it.
+      assert.deepEqual([env["LAKE_DATABASE_ENDPOINT"], env["LAKE_SOURCE_ENDPOINT"], env["LAKE_DATABASE_PASSWORD"]], [endpoint, replica, "alasio-lake/LAKE_DATABASE_PASSWORD"]);
+      // Its DuckDB sized as the other passes' are.
+      assert.equal(env["LAKE_MEMORY_LIMIT"], "614MiB");
+      // The bundled store's filer and masters, which it asks whether a file the store fails a read of is gone, as the reconciliation's pod, which they admit.
+      assert.deepEqual(
+        [env["LAKE_STORE_FILER_URL"], env["LAKE_STORE_MASTER_URL"], env["LAKE_STORE_VOLUME_SERVERS"]],
+        ["http://alasio-seaweedfs-filer.alasio.svc:8888", "http://alasio-seaweedfs-master.alasio.svc:9333", "1"],
+      );
+      assert.equal(job.spec?.template.metadata?.labels?.["app.kubernetes.io/component"], "lake-reconcile");
+      // A branch environment's telemetry, main's as of its branch point, which main's reads again from the log.
+      assert.equal(env["LAKE_BRANCH"], environment.branch ?? undefined);
+    }
+    // Another store: no parts to ask.
+    const external = variables(lakeReconcile(configOf({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com", existingSecret: "s3", snapshotsSecret: "s3-snapshots" } } })).spec?.template.spec?.containers[0] ?? { name: "" });
+    assert.deepEqual([external["LAKE_STORE_FILER_URL"], external["LAKE_STORE_MASTER_URL"], external["LAKE_STORE_VOLUME_SERVERS"]], [undefined, undefined, undefined]);
+    // As many as the store runs.
+    assert.equal(variables(lakeReconcile(configOf({ objectStore: { bundled: { replication: "001", volumeServers: { scaling: { min: 3, max: 3 } } } } })).spec?.template.spec?.containers[0] ?? { name: "" })["LAKE_STORE_VOLUME_SERVERS"], "3");
+  });
+
   test("give each pass's DuckDB three fifths of its container's memory limit, the rest Node's and the Parquet reader's", () => {
     const limitOf = (objects: readonly KubernetesObject[]) =>
       all<V1CronJob>(objects, "CronJob").filter(({ metadata }) => metadata?.name?.startsWith("alasio-lake-")).map(({ metadata, spec }) => [metadata?.name, variables(spec?.jobTemplate.spec?.template.spec?.containers[0] ?? { name: "" })["LAKE_MEMORY_LIMIT"]]);
@@ -1028,21 +1060,26 @@ describe("object store", () => {
 
   test("admits to each part behind the gateways what talks to it alone, and the collector's scraper, and leaves them out of the data stack's policy", () => {
     const objects = install();
-    type Rule = { from: { podSelector: { matchLabels: Record<string, string> } }[]; ports: { port: number }[] };
+    type Rule = { from: { namespaceSelector?: unknown; podSelector: { matchLabels: Record<string, string> } }[]; ports: { port: number }[] };
     const admitted = (name: string) =>
       one<KubernetesObject & { spec: { ingress: Rule[] } }>(objects, "NetworkPolicy", name).spec.ingress.map(({ from, ports }) => [
-        from.map(({ podSelector }) => podSelector.matchLabels["app.kubernetes.io/component"]),
+        from.map(({ namespaceSelector, podSelector }) => `${podSelector.matchLabels["app.kubernetes.io/component"]}${namespaceSelector ? ` in ${JSON.stringify(namespaceSelector)}` : ""}`),
         ports.map(({ port }) => port),
       ]);
+    // Each environment's lake's reconciliation, on their HTTP port alone.
+    const main = `lake-reconcile in ${JSON.stringify({ matchLabels: { "kubernetes.io/metadata.name": "alasio" } })}`;
+    const branches = `lake-reconcile in ${JSON.stringify({ matchExpressions: [{ key: "alasio.dev/branch", operator: "Exists" }] })}`;
     assert.deepEqual(admitted("alasio-seaweedfs-master"), [
       [["seaweedfs-master", "seaweedfs-volume", "seaweedfs-filer", "seaweedfs", "seaweedfs-lifecycle"], [9333, 19333]],
+      [[main, branches], [9333]],
       [["collector-scraper"], [9327]],
     ]);
     assert.deepEqual(admitted("alasio-seaweedfs-volume"), [
       [["seaweedfs-volume", "seaweedfs-master", "seaweedfs-filer", "seaweedfs", "seaweedfs-lifecycle"], [8080, 18080]],
+      [[main, branches], [8080]],
       [["collector-scraper"], [9327]],
     ]);
-    assert.deepEqual(admitted("alasio-seaweedfs-filer"), [[["seaweedfs-filer", "seaweedfs", "seaweedfs-lifecycle"], [8888, 18888]], [["collector-scraper"], [9327]]]);
+    assert.deepEqual(admitted("alasio-seaweedfs-filer"), [[["seaweedfs-filer", "seaweedfs", "seaweedfs-lifecycle"], [8888, 18888]], [[main, branches], [8888]], [["collector-scraper"], [9327]]]);
     // The gateways take the data stack's pods on their S3 port, the lifecycle pass alone on their gRPC port, and the collector's scraper alone on their metrics port.
     const gateway = one<KubernetesObject & { spec: { ingress: { from: { podSelector: { matchLabels: Record<string, string> } }[]; ports: { port: number }[] }[] } }>(objects, "NetworkPolicy", "alasio-seaweedfs").spec.ingress;
     assert.deepEqual(gateway.map(({ from, ports }) => [from.map(({ podSelector }) => podSelector.matchLabels), ports.map(({ port }) => port)]), [

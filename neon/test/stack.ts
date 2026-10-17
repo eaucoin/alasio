@@ -27,7 +27,7 @@ import { componentName, NAMESPACE, neonName, RELEASE } from "../../cli/src/manif
 import { pageserverName, REPLICA_NAME } from "../../cli/src/manifests/neon.ts";
 import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
-import { AGENTS, alasioOk, type Forward, kube, lakeQuery, paths, ref, tcp } from "../../test/e2e/harness.ts";
+import { AGENTS, alasioOk, type Forward, kube, lakeQuery, paths, ref, runCronJob, tcp } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
 import { type Branch, type BranchView, COMPUTE_PORT, computeId, MAIN, type ReadyBranch, replicaId, tokenSha256 } from "../control/branches.ts";
 import { SUSPEND_AFTER } from "../control/endpoints.ts";
@@ -1262,8 +1262,14 @@ export function neonStack(): void {
       });
 
       // Bounded, as the restore's waits are: a restore that waits on, its command line ended as the run ends (test/e2e/harness.ts tearDown).
-      test("alasio restore-filer-store puts the filer store back from its backup: what was there then is, what was written since is not, the log goes on throughout, and the stack runs on it again", { timeout: 1_500_000 }, async () => {
+      test("alasio restore-filer-store puts the filer store back from its backup: what was there then is, what was written since is not, the log goes on throughout, and the stack runs on it again, the lake's catalog set right with it, its transcripts whole, its intake caught up with the log, and every table of it read", { timeout: 1_500_000 }, async () => {
         const bucket = `restore-${Date.now()}`;
+        /** Whether the lake holds each of alasio's transcript entries once, which it reads from its files. */
+        const transcriptsWhole = async () => {
+          const [held] = await lakeQuery("select count(*) as n, count(distinct seq) as seqs from claude.entries");
+          const [source] = await query<{ n: number }>("select count(*)::int as n from claude_sessions.entries");
+          return Number(held?.["n"]) === source?.n && Number(held?.["seqs"]) === source?.n;
+        };
         const gateway = async () => (await gateways())[0] ?? assert.fail("no gateway runs");
         const held = async (key: string) =>
           (await onGateway(await gateway(), `s3api 127.0.0.1:8333 head-object --bucket ${bucket} --key ${key} >/dev/null 2>&1 && echo held || echo missing`)).trim();
@@ -1284,6 +1290,11 @@ export function neonStack(): void {
           }
           await onGateway(await gateway(), `echo after > /tmp/body; s3api 127.0.0.1:8333 put-object --bucket ${bucket} --key after --body /tmp/body >/dev/null`);
           assert.deepEqual([await held("before"), await held("after")], ["held", "held"]);
+          // Transcript entries loaded since, more than DuckLake inlines in its catalog: a file of the lake's the restore loses.
+          const entries = Array.from({ length: 50 }, (_, n) => ({ type: "user", uuid: `restored-${n}`, timestamp: new Date(1790000000000 + n).toISOString(), message: { role: "user", content: `entry ${n}` } }));
+          await new NeonSessionStore(pool).append({ projectKey: "-kube-stack-restore", sessionId: "44444444-4444-4444-8444-444444444444" }, entries);
+          await wakeLake();
+          await untilLoaded(transcriptsWhole, "loaded the entries written since the backup");
 
           // The log's nodes, by their pods' ids, which run on throughout the restore.
           const logNodes = async () =>
@@ -1293,9 +1304,24 @@ export function neonStack(): void {
           const stamp = /^ {2}(\d{8}T\d{6}Z) /mu.exec(listed)?.[1] ?? assert.fail(`no backup is listed:\n${listed}`);
           const restored = await alasioOk("restore-filer-store", stamp, "--yes", "--timeout", "20m");
           assert.match(restored, /^The filer store is as it was at .+, with its \d+ keys, and alasio runs on it again\.$/mu);
+          assert.match(restored, /^ {2}main's lake: the lake lost \d+ rows? of claude\.entries, in \d+ files?.*: loaded again from alasio's database$/mu);
           await up();
           assert.deepEqual([await held("before"), await held("after")], ["held", "missing"]);
           assert.deepEqual(await query("select said from restored"), [{ said: "before" }]);
+          // The lake's transcripts whole again, and the merge, which read every file of the telemetry's, through.
+          await untilLoaded(transcriptsWhole, "held each entry once after the restore");
+          // Its intake writing again, as one that met a file the store lost would not: its
+          // group behind on no topic by more than the stack's telemetry of a few seconds.
+          await untilLoaded(async () => {
+            const metrics = await kube.execOk(NAMESPACE, await podOf("lake-intake"), ["node", "--input-type=module", "-e", "process.stdout.write(await (await fetch('http://127.0.0.1:9464/metrics')).text())"]);
+            const lags = [...metrics.matchAll(/^lake_telemetry_lag_records\{topic="[^"]+"\} (\d+)$/gmu)].map(([, records]) => Number(records));
+            return lags.length > 0 && lags.every((records) => records < 100);
+          }, "caught its intake up with the log after the restore");
+          // Every file of every table read, as no file it names is lost.
+          const tables = await lakeQuery("select schema_name, table_name from duckdb_tables() where database_name = current_database()");
+          assert.ok(tables.length > 0, "the lake has no tables");
+          for (const { schema_name: schema, table_name: table } of tables) await lakeQuery(`select count(*) as n from "${String(schema)}"."${String(table)}"`);
+          assert.match(await runCronJob(componentName("lake-merge")), /"message":"merged the telemetry's files"/u);
           assert.deepEqual(await logNodes(), nodes);
         } finally {
           await onGateway(await gateway(), `aws s3 --endpoint-url http://127.0.0.1:8333 rb --force s3://${bucket} >/dev/null`).catch(() => {});

@@ -650,8 +650,10 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
           intake: { resources: { requests: { cpu: "20m", memory: "128Mi" } } },
         }),
     },
-    // Two, where the run proves Grafana highly available.
-    grafana: { ...(inShard("scaling") ? { scaling: { min: 2, max: 2 } } : {}), resources: { requests: { cpu: "20m", memory: "192Mi" } } },
+    // Two, where the run proves Grafana highly available. An idle Grafana, its alert rules
+    // evaluated each minute, takes 10 to 13m of CPU (measured in CI): its request well above,
+    // so KEDA's CPU scaler, at 80 % of it, scales it on load rather than on that idle work.
+    grafana: { ...(inShard("scaling") ? { scaling: { min: 2, max: 2 } } : {}), resources: { requests: { cpu: "40m", memory: "192Mi" } } },
     // JuiceFS's metadata dumped as often as it allows, so one lands within the run.
     workspaceStorage: { backupInterval: "5m" },
     agentSandbox: { resources: { requests: { cpu: "10m", memory: "32Mi" } } },

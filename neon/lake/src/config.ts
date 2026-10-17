@@ -30,12 +30,23 @@
  *
  * Maintenance (./maintain.ts), a process a pass, main's alone:
  *
- *   LAKE_DATABASE_*, LAKE_CATALOG_DATABASE, LAKE_DATA_PATH, LAKE_S3_*, LAKE_MEMORY_LIMIT,
- *   LAKE_THREADS, LAKE_EXTENSION_DIRECTORY  as the loader's
+ *   LAKE_DATABASE_*, LAKE_SOURCE_DATABASE, LAKE_SOURCE_ENDPOINT, LAKE_CATALOG_DATABASE,
+ *   LAKE_DATA_PATH, LAKE_S3_*, LAKE_MEMORY_LIMIT, LAKE_THREADS, LAKE_EXTENSION_DIRECTORY
+ *                                           as the loader's: the reconciliation loads from
+ *                                           alasio's database, as the loader does
  *   LAKE_BRANCHES_URL, LAKE_BRANCHES_TOKEN  neon-control's list of Neon's branches, and the
  *                                           token it is read with: while it lists any but
  *                                           main, maintenance deletes no file (sync.ts)
  *   LAKE_RETENTION_DAYS                     the days of telemetry kept (default 30)
+ *   LAKE_BRANCH                             the branch environment whose lake it is; unset
+ *                                           for main's, whose telemetry a branch's is
+ *   LAKE_STORE_FILER_URL, LAKE_STORE_MASTER_URL  the bundled object store's filer and masters,
+ *                                           which the reconciliation asks whether a file the
+ *                                           store fails a read of has its data still; unset
+ *                                           for another store (reconcile.ts's StoreParts)
+ *   LAKE_STORE_VOLUME_SERVERS               how many volume servers it runs, every one of
+ *                                           which its masters are to know before their not
+ *                                           knowing a volume says it is gone (default 1)
  *
  * The telemetry intake (./intake-service.ts), which writes the lake's `otel` schema alone:
  *
@@ -120,9 +131,22 @@ export interface LakeConfig extends LakeAccess {
 }
 
 export interface MaintenanceConfig extends LakeAccess {
+  /** alasio's database, which the reconciliation loads what the transcripts lost from, as the loader does. */
+  source: SourceConfig;
   /** Where the lake learns of Neon's branches, which may read its files; null where it is not told. */
   branches: BranchesSource | null;
   retentionDays: number;
+  /** The bundled object store's filer and masters, which say whether a file's data is gone; null for another store. */
+  store: StoreParts | null;
+  /** The branch environment whose lake this is; null for main's. */
+  branch: string | null;
+}
+
+/** The bundled object store's filer and masters, by their HTTP addresses, and how many volume servers it runs. */
+export interface StoreParts {
+  filer: string;
+  master: string;
+  volumeServers: number;
 }
 
 export interface IntakeConfig extends LakeAccess {
@@ -197,14 +221,17 @@ const logConfig = (env: NodeJS.ProcessEnv): LogConfig => ({
   password: required(env, "LOG_PASSWORD"),
 });
 
+/** alasio's database, as LAKE_SOURCE_DATABASE and LAKE_SOURCE_ENDPOINT say it. */
+const sourceConfig = (env: NodeJS.ProcessEnv): SourceConfig => ({
+  database: optional(env, "LAKE_SOURCE_DATABASE", "alasio"),
+  options: env["LAKE_SOURCE_ENDPOINT"]?.trim() ? `endpoint=${env["LAKE_SOURCE_ENDPOINT"].trim()}` : "",
+});
+
 /** The loader's configuration. */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): LakeConfig {
   return {
     ...writerAccess(env, "1GB"),
-    source: {
-      database: optional(env, "LAKE_SOURCE_DATABASE", "alasio"),
-      options: env["LAKE_SOURCE_ENDPOINT"]?.trim() ? `endpoint=${env["LAKE_SOURCE_ENDPOINT"].trim()}` : "",
-    },
+    source: sourceConfig(env),
     httpPort: positive(env, "LAKE_HTTP_PORT", 9464),
     log: logConfig(env),
     wake: { topic: required(env, "LAKE_WAKE_TOPIC"), group: required(env, "LAKE_WAKE_GROUP") },
@@ -216,9 +243,20 @@ export function loadMaintenanceConfig(env: NodeJS.ProcessEnv = process.env): Mai
   const branchesUrl = env["LAKE_BRANCHES_URL"]?.trim();
   return {
     ...writerAccess(env, "1GB"),
+    source: sourceConfig(env),
     branches: branchesUrl ? { url: branchesUrl, token: required(env, "LAKE_BRANCHES_TOKEN") } : null,
     retentionDays: positive(env, "LAKE_RETENTION_DAYS", 30),
+    store: storeParts(env),
+    branch: env["LAKE_BRANCH"]?.trim() || null,
   };
+}
+
+/** The bundled object store's parts, where both are given; neither, for another store; one alone is a mistake. */
+function storeParts(env: NodeJS.ProcessEnv): StoreParts | null {
+  const filer = env["LAKE_STORE_FILER_URL"]?.trim();
+  const master = env["LAKE_STORE_MASTER_URL"]?.trim();
+  if (!filer && !master) return null;
+  return { filer: required(env, "LAKE_STORE_FILER_URL"), master: required(env, "LAKE_STORE_MASTER_URL"), volumeServers: positive(env, "LAKE_STORE_VOLUME_SERVERS", 1) };
 }
 
 /** The telemetry intake's configuration. */

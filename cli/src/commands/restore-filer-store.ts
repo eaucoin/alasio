@@ -13,11 +13,14 @@ import type { KubernetesObject, V1CronJob, V1Job, V1Pod } from "@kubernetes/clie
 import { Console, Effect, Option, Schema, Stream } from "effect";
 import { Argument, Command, Flag, Prompt } from "effect/cli";
 
+import { branchNamespaces } from "../branches.ts";
 import { loadConfig } from "../config.ts";
 import { installConfig } from "../install.ts";
 import { type Kind, kind, KubeApi, type ObjectRef, refOf } from "../kube/api.ts";
 import { awaitEnded, awaitGone, awaitReady, awaitScheduled, selectorOf, type WaitOptions } from "../kube/rollout.ts";
-import { NAMESPACE, RELEASE } from "../manifests/common.ts";
+import { reconcileLake } from "../lake.ts";
+import { branchEnvironment } from "../manifests/branch.ts";
+import { lakeRuns, MAIN_ENVIRONMENT, NAMESPACE, RELEASE } from "../manifests/common.ts";
 import type { InstallConfig } from "../manifests/config.ts";
 import { LOG_COMPONENT } from "../manifests/log.ts";
 import {
@@ -208,6 +211,27 @@ const resumeCronJobs = Effect.gen(function*() {
   }
 });
 
+/**
+ * Every environment's lake's catalog set right with the store put back, which no longer
+ * holds the files written since: main's, and each branch environment's, each against its own
+ * catalog (../lake.ts); a line of what each lost, or of why its reconciliation failed, as
+ * alasio lake reconcile runs it again. None where the lake does not run.
+ */
+const reconciledLakes = Effect.fnUntraced(function*(settings: InstallConfig, options: WaitOptions) {
+  if (!lakeRuns(settings)) return [];
+  const environments = [MAIN_ENVIRONMENT, ...(yield* branchNamespaces).map(branchEnvironment)];
+  const lines = yield* Effect.forEach(environments, (environment) => {
+    const which = environment.branch === null ? "main's lake" : `the lake of branch environment ${environment.branch}`;
+    return reconcileLake(settings, environment, options).pipe(
+      Effect.map((lost) => (lost.length > 0 ? lost.map((line) => `${which}: ${line}`) : [`${which} lost no file`])),
+      Effect.catch((error) =>
+        Effect.succeed([`${which} could not be set right (${error.message}): alasio lake reconcile${environment.branch === null ? "" : ` --branch ${environment.branch}`} runs it again`])
+      ),
+    );
+  });
+  return lines.flat();
+});
+
 /** The keys the filer store holds, and whether its last append-only file rewrite went well, as it says, logged in as its collector. */
 const filerStoreState = Effect.gen(function*() {
   const kube = yield* KubeApi;
@@ -259,15 +283,19 @@ const restore = Effect.fnUntraced(function*(settings: InstallConfig, stamp: stri
   const again = yield* writers;
   yield* start(again.front, options);
   yield* start(again.clients, options);
+  yield* Effect.logInfo("setting each lake's catalog right with the store, and loading again what its transcripts lost");
+  const lost = yield* reconciledLakes(settings, options);
   yield* resumeCronJobs;
-  yield* Console.log(`The filer store is as it was at ${when(stamp)}, with its ${restored} keys, and alasio runs on it again.`);
+  yield* Console.log([`The filer store is as it was at ${when(stamp)}, with its ${restored} keys, and alasio runs on it again.`, ...lost.map((line) => `  ${line}`)].join("\n"));
 });
 
 /** What a restore rolls back, as the command's confirmation and its help say. */
 const ROLLS_BACK = "The store's namespace, every bucket, object, version and tag, goes back to when the backup was taken: what was written since is lost, " +
   "and what was deleted since is listed again with its data gone. Neon's own files in the store go back with it while its pageserver's and safekeepers' volumes do not: " +
   "what the database wrote since is likely lost, and Neon may not start on them at all, when the database's dumps in the backups bucket, of before the backup, are what restores it. " +
-  "Workspace storage's files written since lose their data. The log, on its own volumes, keeps what it holds, and the webhook intake goes on taking Telegram's updates into it.";
+  "Workspace storage's files written since lose their data. The lake's files written since are lost: once the lake runs again, its catalog is set right with the store, " +
+  "the transcripts' rows they held are loaded again from alasio's database, and the telemetry's read again from the log, where it still holds them, as it says. " +
+  "The log, on its own volumes, keeps what it holds, and the webhook intake goes on taking Telegram's updates into it.";
 
 export const restoreFilerStore = Command.make(
   "restore-filer-store",
@@ -320,7 +348,8 @@ export const restoreFilerStore = Command.make(
       "It stops alasio, Neon and the lake (main's and branch environments'), but not the log nor the webhook intake, then the object store's gateways and filers, and the installation's CronJobs, " +
       "waiting for their running Jobs to end; sessions keep running, their workspace storage failing to write until the store is back. " +
       "It loads the backup onto the filer store's volume, checks the filer store holds as many keys as the backup, and starts everything again as it was: " +
-      "its replicas, and its ScaledObjects and CronJobs paused or suspended only where they were before. " +
+      "its replicas, and its ScaledObjects and CronJobs paused or suspended only where they were before; and once the lakes run, each environment's lake's " +
+      "reconciliation, as alasio lake reconcile runs it, saying what each lost. " +
       "Should it stop midway, what it stopped stays stopped, and running it again with the same backup picks up where it stopped. " +
       "Past --timeout a wait gives up, saying what it still waits for.",
   ),

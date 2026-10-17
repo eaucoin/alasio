@@ -166,7 +166,7 @@ export class WriteLockLost extends Error {
 }
 
 /** Work that writes to the lake, given `fence`, which rejects where the write lock it runs under is no longer held. */
-type Write<T> = (fence: () => Promise<void>) => Promise<T>;
+export type Write<T> = (fence: () => Promise<void>) => Promise<T>;
 
 /** Runs `work` holding the lake's write lock across processes; unset, `work` alone, its fence passing at once. */
 let acrossProcesses: <T>(work: Write<T>) => Promise<T> = (work) => work(async () => {});
@@ -250,8 +250,8 @@ export class LoaderLockLost extends Error {
 /**
  * Takes the lock of the one load of the lake from alasio's database at a time, waiting
  * while another holds it, until `signal` aborts: the loader's, for each load (./loader.ts),
- * so that no two compute what the lake lacks, and load it, at once, which would load it
- * twice. `log` says that it waits.
+ * and a reconciliation's reload (./reconcile.ts), so that no two compute what the lake
+ * lacks, and load it, at once, which would load it twice. `log` says that it waits.
  */
 export async function takeLoaderLock(
   catalog: DatabaseConfig,
@@ -284,7 +284,7 @@ export async function takeLoaderLock(
 const writes = queue();
 
 /** Runs `work`, which writes to the lake, after every write given before it, one at a time, and under the write lock where one is set (writeLock). */
-function serially<T>(work: Write<T>): Promise<T> {
+export function serially<T>(work: Write<T>): Promise<T> {
   return writes(() => acrossProcesses(work));
 }
 

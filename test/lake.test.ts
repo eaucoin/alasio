@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, before, describe, test } from "node:test";
 
 import { type DuckDBConnection, DuckDBInstance, type DuckDBValue } from "@duckdb/node-api";
@@ -23,21 +24,23 @@ import { type EndpointConfig, type LakeConfig, loadConfig, loadEndpointConfig, l
 import { startEndpoint } from "../neon/lake/src/endpoint.ts";
 import { EXTENSIONS } from "../neon/lake/src/extensions.ts";
 import { BATCH, DUCKDB_MEMORY, type IntakeSource, type LogRecord, type PartitionAt, REREAD_SKEW_MS, startIntake, unreachable } from "../neon/lake/src/intake.ts";
-import { conninfo, LAKE, type Lake, openLake, type Row, rows, transaction, writeLock, WriteLockLost } from "../neon/lake/src/lake.ts";
+import { conninfo, LAKE, type Lake, openLake, type Row, rows, takeLoaderLock, transaction, writeLock, WriteLockLost } from "../neon/lake/src/lake.ts";
 import { gathering, type Read } from "../neon/lake/src/log.ts";
-import { furthestWrite, type LoaderLake, lsnValue, openLoaderLake, readUpTo, sourceReplayed, startLoader, type WakeRecord, type WakeSource } from "../neon/lake/src/loader.ts";
-import { runPass } from "../neon/lake/src/maintain.ts";
+import { furthestWrite, type LoaderLake, type Log, lsnValue, openLoaderLake, readUpTo, sourceReplayed, startLoader, type WakeRecord, type WakeSource } from "../neon/lake/src/loader.ts";
+import { type PassOptions, runPass } from "../neon/lake/src/maintain.ts";
 import { createMetrics, sampleMemory } from "../neon/lake/src/metrics.ts";
 import { lakeModelVersion, MODEL_VERSION, ROW_GROUP_ROWS } from "../neon/lake/src/model.ts";
-import { askReread, ensureOtel, type Held, LakeSetBack, mergeTelemetry, type Position, rereadGaps, type TelemetryRows, telemetryRows, telemetryTime, writeConsumed } from "../neon/lake/src/otel.ts";
+import { askReread, ensureOtel, type Held, LakeSetBack, mergeTelemetry, type Position, readAgainFrom, rereadGaps, rereadsAsked, type TelemetryRows, telemetryRows, telemetryTime, writeConsumed } from "../neon/lake/src/otel.ts";
 import { encodeRequest, type LogsRequest, type MetricsRequest, PART_ITEMS, REQUEST_ROW_BYTES, requestParts, requestRowBytes } from "../neon/lake/src/otlp.ts";
 import { format } from "../neon/lake/src/query.ts";
 import { answer, grantReads, openReader } from "../neon/lake/src/reader.ts";
+import { readable, StoreUndecided, stored } from "../neon/lake/src/reconcile.ts";
 import { type LakeSyncOptions, maintainLake, prepareLake, syncLake } from "../neon/lake/src/sync.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import { ensureLakeReaderRole, ensureLakeRole, lakeEnabled, syncLakeReads } from "../src/neon/lake.ts";
 import { wakeRecord } from "../src/neon/lake-wake.ts";
+import { startFakeS3 } from "./support/fake-s3.ts";
 import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 // The lake loads alasio's Neon into DuckLake. Here its source is a throwaway Postgres
@@ -136,6 +139,10 @@ async function withLake<T>(fn: (db: DuckDBConnection) => Promise<T>, { memoryLim
     lake.close();
   }
 }
+
+/** What maintenance's passes are given (neon/lake/src/maintain.ts): `log`, and `branches` beside main, none unless given. */
+const passing = (log: Log, branches: () => Promise<readonly string[]> = async () => []): PassOptions =>
+  ({ retentionDays: 30, branches, catalog: config.catalog, dataPath: config.dataPath, log });
 
 /** The first row `sql` selects, which it has. */
 async function one<Selected = Row>(db: DuckDBConnection, sql: string, values?: DuckDBValue[]): Promise<Selected> {
@@ -1469,6 +1476,21 @@ describe("telemetry", () => {
   });
 });
 
+test("the lake's image has its DuckDB's allocator give back the memory it frees at once", () => {
+  const lake = join(import.meta.dirname, "../neon/lake");
+  const conf = /^\s*DUCKDB_JE_MALLOC_CONF=(\S+)$/mu.exec(readFileSync(join(lake, "Dockerfile"), "utf8"))?.[1];
+  assert.ok(conf, "the image sets no DUCKDB_JE_MALLOC_CONF");
+  // jemalloc says the options it runs with as the process exits.
+  const opened = spawnSync(process.execPath, ["--input-type=module", "-e", "import { DuckDBInstance } from '@duckdb/node-api'; await (await DuckDBInstance.create(':memory:')).connect(); process.exit(0);"], {
+    cwd: lake,
+    env: { ...process.env, DUCKDB_JE_MALLOC_CONF: `${conf},stats_print:true` },
+    encoding: "utf8",
+  });
+  assert.equal(opened.status, 0, opened.stderr);
+  assert.match(opened.stderr, /^\s*opt\.dirty_decay_ms: 0 /mu);
+  assert.match(opened.stderr, /^\s*opt\.muzzy_decay_ms: 0 /mu);
+});
+
 test("the lake's writes take turns, whichever DuckDB makes them", async () => {
   const instances = await Promise.all([DuckDBInstance.create(":memory:"), DuckDBInstance.create(":memory:")]);
   const [first, second] = await Promise.all(instances.map((instance) => instance.connect()));
@@ -1721,9 +1743,9 @@ describe("the lake", () => {
       const logs: string[] = [];
       const log = (message: string) => void logs.push(message);
       await writeTelemetry(db, telemetryRows("logs", logRequest("expired", NOW - 40n * DAY)));
-      assert.equal(await runPass(db, "maintain", { retentionDays: 30, branches: async () => [], log }), true);
+      assert.equal(await runPass(db, "maintain", passing(log)), true);
       assert.equal((await one<Count>(db, `select count(*) as n from ${LAKE}.otel.logs where ServiceName = 'expired'`)).n, 0n);
-      assert.equal(await runPass(db, "merge", { retentionDays: 30, branches: async () => [], log }), true);
+      assert.equal(await runPass(db, "merge", passing(log)), true);
       assert.deepEqual(logs, ["maintained", "merged the telemetry's files"]);
     });
   });
@@ -1768,7 +1790,7 @@ describe("the lake", () => {
       const logs: string[] = [];
       const log = (message: string, fields?: Record<string, unknown>) => void logs.push(`${message}${fields ? ` ${JSON.stringify(fields)}` : ""}`);
       const maintained = async (branches: () => Promise<readonly string[]>) => {
-        assert.equal(await runPass(db, "maintain", { retentionDays: 30, branches, log }), true);
+        assert.equal(await runPass(db, "maintain", passing(log, branches)), true);
         return logs.splice(0);
       };
       assert.deepEqual(await maintained(async () => ["try-codex"]), ['maintained {"keptFilesFor":["try-codex"]}']);
@@ -1779,8 +1801,488 @@ describe("the lake", () => {
       // Its lake closed under it, a pass fails, and says why.
       const lake = await openLake(config);
       lake.close();
-      assert.equal(await runPass(lake.db, "merge", { retentionDays: 30, branches: async () => [], log }), false);
+      assert.equal(await runPass(lake.db, "merge", passing(log)), false);
       assert.match(logs.join("\n"), /^merging the telemetry's files failed \{"error":/u);
+    });
+  });
+
+  test("the reconciliation forgets the files the store lost, says what each table lost, loads again what the transcripts lost, and asks the log again for what the telemetry lost, saying what the log no longer holds, after which the passes that failed on them do not", async () => {
+    const name = "rollout-2026-10-01T12-00-00-thread-reconciled.jsonl";
+    const reconciled = { projectKey: "-home-operator-reconciled", sessionId: "22222222-2222-4222-8222-222222222222" };
+    // More rows than DuckLake inlines in its catalog, so each load writes a file.
+    const entries = (from: number) => Array.from({ length: 20 }, (_, n) => ({ type: "user", uuid: `r${from + n}`, timestamp: at(n), message: { role: "user", content: `entry ${from + n}` } }));
+    const lines = Array.from({ length: 40 }, (_, ordinal) => line({ timestamp: at(ordinal % 60), ordinal, type: "response_item", payload: { type: "message" } }));
+    const firstPart = Buffer.from(lines.slice(0, 20).join(""));
+    await withLake(async (db) => {
+      try {
+        // Two loads of each, so each table has a file the store keeps and one it loses.
+        await store.append(reconciled, entries(0));
+        await saveRollout(name, firstPart);
+        await syncLake(db);
+        const kept = new Set((await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', 'entries', schema => 'claude')`)).map(({ data_file }) => data_file));
+        await store.append(reconciled, entries(20));
+        await saveRollout(name, Buffer.from(lines.slice(20).join("")), { start: firstPart.length, head: Buffer.from(lines.join("")) });
+        await syncLake(db);
+        await writeTelemetry(db, telemetryRows("logs", logRequest("kept", NOW)));
+        await writeTelemetry(db, telemetryRows("logs", logRequest("lost", NOW, NOW + 1n)));
+        const { since: lostSince } = await one<{ since: string }>(db, `select min(Timestamp)::varchar as since from ${LAKE}.otel.logs where ServiceName = 'lost'`);
+        const counts = async () => one<Record<string, bigint>>(db, `select
+          (select count(*) from ${LAKE}.claude.entries) as entries, (select count(distinct seq) from ${LAKE}.claude.entries) as seqs,
+          (select count(*) from ${LAKE}.claude.content_blocks) as blocks, (select count(*) from ${LAKE}.codex.lines) as lines`);
+        const whole = await counts();
+        const newest = async (schema: string, table: string) =>
+          (await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', '${table}', schema => '${schema}')`)).map(({ data_file }) => data_file).filter((file) => !kept.has(file)).at(-1);
+        const lost = [await newest("claude", "entries"), await newest("codex", "lines"), await newest("otel", "logs")];
+        for (const file of lost) {
+          assert.ok(file);
+          rmSync(file);
+        }
+        await assert.rejects(rows(db, `select sum(seq) from ${LAKE}.claude.entries`), /No such file|IO Error/iu);
+        const logs: string[] = [];
+        const log = (message: string, fields?: Record<string, unknown>) => void logs.push(`${message}${fields ? ` ${JSON.stringify(fields)}` : ""}`);
+        // A pass on a file the store lost fails, naming what sets it right.
+        assert.equal(await runPass(db, "merge", passing(log)), false);
+        assert.match(logs.splice(0).join("\n"), /^merging the telemetry's files failed .*"because":"a file of the lake's catalog is gone from the object store: once you know why, alasio lake reconcile forgets it/mu);
+
+        // Its write lock lost as it forgets them, as where the lock's connection drops alone, it forgets none.
+        writeLock(config.catalog);
+        const writer = new pg.Client({ ...config.catalog });
+        await writer.connect();
+        // Another writer's commit under way, which the reconciliation's lock of the catalog's snapshots waits for.
+        await writer.query("begin");
+        await writer.query(`insert into ducklake.ducklake_snapshot
+          select snapshot_id + 1, now(), schema_version, next_catalog_id, next_file_id from ducklake.ducklake_snapshot order by snapshot_id desc limit 1`);
+        const fenced = runPass(db, "reconcile", passing(log));
+        for (const deadline = Date.now() + 30_000; (await writer.query("select 1 from pg_locks where relation = 'ducklake.ducklake_snapshot'::regclass and not granted")).rowCount === 0;) {
+          assert.ok(Date.now() < deadline, "the reconciliation never waited on the catalog's snapshots");
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        const { rowCount } = await admin.query("select pg_terminate_backend(pid) from pg_locks where locktype = 'advisory' and granted");
+        assert.equal(rowCount, 1);
+        await writer.query("rollback");
+        await writer.end();
+        assert.equal(await fenced, false);
+        assert.match(logs.splice(0).join("\n"), /forgetting the lost files in the catalog failed/u);
+        await assert.rejects(rows(db, `select sum(seq) from ${LAKE}.claude.entries`), /No such file|IO Error/iu);
+
+        const gauges: [string, number, Record<string, string>][] = [];
+        // Another writer commits a snapshot of its own as the reconciliation runs: it takes the next after it.
+        const other = new pg.Client({ ...config.catalog });
+        await other.connect();
+        // The catalog's snapshots past a power of ten, as a lake's run, whose last is the greatest, not the last in their text's order.
+        const lastSnapshot = async () => Number((await other.query<{ id: string }>("select max(snapshot_id)::text as id from ducklake.ducklake_snapshot")).rows[0]?.id);
+        for (const past = 10 ** String(await lastSnapshot()).length; (await lastSnapshot()) < past;) {
+          await other.query(`insert into ducklake.ducklake_snapshot
+            select snapshot_id + 1, now(), schema_version, next_catalog_id, next_file_id from ducklake.ducklake_snapshot order by snapshot_id desc limit 1`);
+        }
+        await other.query("begin");
+        await other.query(`insert into ducklake.ducklake_snapshot
+          select snapshot_id + 1, now(), schema_version, next_catalog_id, next_file_id from ducklake.ducklake_snapshot order by snapshot_id desc limit 1`);
+        const committed = new Promise((resolve) => setTimeout(resolve, 500)).then(() => other.query("commit")).finally(() => other.end());
+        // An intake, which takes up what the reconciliation asks of the log, as it finds the log
+        // no longer holds a minute of it; what was asked, as it took it up.
+        const intake = await openLake(config);
+        const gap = { signal: "logs", from: "2026-10-01T00:00:00.000Z", to: "2026-10-01T00:01:00.000Z" } as const;
+        const takenUp = (async () => {
+          for (const deadline = Date.now() + 60_000; Date.now() < deadline; await new Promise((resolve) => setTimeout(resolve, 100))) {
+            const asked = await rereadsAsked(intake.db);
+            if (asked.length === 0) continue;
+            const fromLost = await rows(intake.db, `select Signal as signal, Since = $1::TIMESTAMP_NS as fromLost from ${LAKE}.otel.intake_rereads`, [lostSince]);
+            await readAgainFrom(intake.db, asked, [], [gap]);
+            return fromLost;
+          }
+          return null;
+        })().finally(() => intake.close());
+        assert.equal(await runPass(db, "reconcile", { ...passing(log), telemetry: { gauge: (...gauge) => void gauges.push(gauge) } }), true);
+        await committed;
+        const said = logs.splice(0).map((line) => ({ message: line.slice(0, line.indexOf(" {")), ...JSON.parse(line.slice(line.indexOf(" {"))) }) as Record<string, unknown>);
+        const lostOf = (table: string) => said.find((event) => event["table"] === table);
+        assert.deepEqual([lostOf("claude.entries")?.["files"], lostOf("claude.entries")?.["recovered"]], [1, "database"]);
+        assert.deepEqual([lostOf("codex.lines")?.["files"], lostOf("codex.lines")?.["recovered"]], [1, "database"]);
+        assert.deepEqual([lostOf("otel.logs")?.["files"], lostOf("otel.logs")?.["rows"], lostOf("otel.logs")?.["recovered"]], [1, 2, "log"]);
+        // The intake asked to read the logs' topic again from the earliest time the lost file
+        // held; and what it found the log no longer holds, said.
+        assert.deepEqual(await takenUp, [{ signal: "logs", fromLost: true }]);
+        assert.deepEqual(said.filter(({ message }) => message === "lost from the object store, and from the log, which no longer holds it"), [
+          { message: "lost from the object store, and from the log, which no longer holds it", ...gap },
+        ]);
+        assert.deepEqual(gauges.filter(([gauge, , { table }]) => gauge === "lake_lost_rows" && table === "otel.logs").map(([, value]) => value), [2]);
+
+        // The transcripts whole again, each entry once; the telemetry the store kept, and none it lost.
+        assert.deepEqual(await counts(), whole);
+        assert.deepEqual(await rows(db, `select ServiceName as service from ${LAKE}.otel.logs where ServiceName in ('kept', 'lost')`), [{ service: "kept" }]);
+        assert.equal(await runPass(db, "merge", passing(log)), true);
+        // Nothing more to set right.
+        assert.equal(await runPass(db, "reconcile", passing(log)), true);
+        assert.deepEqual(logs.splice(0).at(-1), 'reconciled {"lost":0}');
+      } finally {
+        // What it asked of the log, and what the log no longer held, are no later test's.
+        await db.run(`delete from ${LAKE}.otel.intake_rereads`);
+        await db.run(`delete from ${LAKE}.otel.intake_reread_gaps`);
+      }
+    });
+  });
+
+  test("the reconciliation says the telemetry it asked the log for again is still to be read where no intake takes it up within its wait", async () => {
+    await withLake(async (db) => {
+      try {
+        await writeTelemetry(db, telemetryRows("logs", logRequest("pending-kept", NOW)));
+        const kept = new Set((await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', 'logs', schema => 'otel')`)).map(({ data_file }) => data_file));
+        await writeTelemetry(db, telemetryRows("logs", logRequest("pending-lost", NOW)));
+        const lost = (await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', 'logs', schema => 'otel')`)).map(({ data_file }) => data_file).filter((file) => !kept.has(file));
+        assert.equal(lost.length, 1);
+        rmSync(lost[0]!);
+        const logs: string[] = [];
+        assert.equal(await runPass(db, "reconcile", { ...passing((message, fields) => void logs.push(`${message} ${JSON.stringify(fields ?? {})}`)), rereadWaitMs: 300 }), true, logs.join("\n"));
+        assert.ok(logs.includes('lost from the object store, still to be read again from the log {"signals":["logs"]}'), logs.join("\n"));
+      } finally {
+        await db.run(`delete from ${LAKE}.otel.intake_rereads`);
+      }
+    });
+  });
+
+  test("a branch environment's reconciliation asks no log again, as its lake has no intake, and says main's lake reads its telemetry again", async () => {
+    await withLake(async (db) => {
+      // Before any reconciliation lost anything, its record not made yet.
+      const catalog = new pg.Client({ ...config.catalog });
+      await catalog.connect();
+      try {
+        await catalog.query("drop schema if exists reconcile cascade");
+      } finally {
+        await catalog.end();
+      }
+      assert.equal(await runPass(db, "reconcile", { ...passing(() => {}), branch: true }), true);
+      await writeTelemetry(db, telemetryRows("logs", logRequest("branch-kept", NOW)));
+      const kept = new Set((await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', 'logs', schema => 'otel')`)).map(({ data_file }) => data_file));
+      await writeTelemetry(db, telemetryRows("logs", logRequest("branch-lost", NOW)));
+      const lost = (await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', 'logs', schema => 'otel')`)).map(({ data_file }) => data_file).filter((file) => !kept.has(file));
+      assert.equal(lost.length, 1);
+      rmSync(lost[0]!);
+      const logs: string[] = [];
+      const started = Date.now();
+      // Its whole wait for an intake, were it to wait.
+      assert.equal(await runPass(db, "reconcile", { ...passing((message, fields) => void logs.push(`${message} ${JSON.stringify(fields ?? {})}`)), branch: true, rereadWaitMs: 60_000 }), true, logs.join("\n"));
+      assert.ok(Date.now() - started < 30_000, `it took ${Date.now() - started} ms`);
+      const said = logs.find((line) => line.includes('"table":"otel.logs"'));
+      assert.match(said ?? "", /^lost from the object store, main's telemetry as of the branch point, which main's lake reads again from the log .*"recovered":"main"/u);
+      assert.ok(!logs.some((line) => line.includes("still to be read again")), logs.join("\n"));
+      assert.deepEqual(await rows(db, `select * from ${LAKE}.otel.intake_rereads`), []);
+    });
+  });
+
+  test("the reconciliation loads what the transcripts lost under the loader's lock, waiting while a loader loads, so that each entry is loaded once", async () => {
+    const fenced = { projectKey: "-home-operator-fenced", sessionId: "33333333-3333-4333-8333-333333333333" };
+    // More rows than DuckLake inlines in its catalog, so each load writes a file.
+    const entries = (from: number) => Array.from({ length: 20 }, (_, n) => ({ type: "user", uuid: `fenced-${from + n}`, timestamp: at(n), message: { role: "user", content: `entry ${from + n}` } }));
+    await withLake(async (db) => {
+      await store.append(fenced, entries(0));
+      await syncLake(db);
+      const files = async () => (await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', 'entries', schema => 'claude')`)).map(({ data_file }) => data_file);
+      const kept = new Set(await files());
+      await store.append(fenced, entries(20));
+      await syncLake(db);
+      const lost = (await files()).filter((file) => !kept.has(file));
+      assert.equal(lost.length, 1);
+      rmSync(lost[0]!);
+      const logs: string[] = [];
+      const log = (message: string) => void logs.push(message);
+      // A loader holding its lock, which the reconciliation waits for once it has forgotten the file.
+      const loader = await takeLoaderLock(config.catalog, () => {});
+      const catalog = new pg.Client({ ...config.catalog });
+      await catalog.connect();
+      let settled = false;
+      const reconciled = runPass(db, "reconcile", { ...passing(log), lockRetryMs: 100 }).finally(() => {
+        settled = true;
+      });
+      try {
+        const forgotten = async () => (await catalog.query<{ n: number }>("select count(*)::int as n from reconcile.lost_files where path = $1", [lost[0]]).catch(() => ({ rows: [{ n: 0 }] }))).rows[0]?.n ?? 0;
+        for (const deadline = Date.now() + 30_000; (await forgotten()) === 0; await new Promise((resolve) => setTimeout(resolve, 100))) {
+          assert.ok(Date.now() < deadline && !settled, "the reconciliation never forgot the file");
+        }
+        // The loader loads meanwhile, from a DuckDB of its own, as one awake beside a restore's reconciliation does.
+        await store.append(fenced, entries(40));
+        const other = await openLake(config, { source: config.source });
+        try {
+          await syncLake(other.db);
+        } finally {
+          other.close();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        assert.equal(settled, false, "the reconciliation loaded while the loader held its lock");
+      } finally {
+        await loader.release();
+        await catalog.end();
+      }
+      assert.equal(await reconciled, true, logs.join("\n"));
+      const { n, uuids } = await one<{ n: bigint; uuids: bigint }>(db, `select count(*) as n, count(distinct uuid) as uuids from ${LAKE}.claude.entries where uuid like 'fenced-%'`);
+      assert.deepEqual([n, uuids], [60n, 60n]);
+    });
+  });
+
+  test("a reconciliation whose loader's lock is lost as it loads again commits nothing of that load, and the next loads it whole", async () => {
+    const cut = { projectKey: "-home-operator-cut", sessionId: "55555555-5555-4555-8555-555555555555" };
+    const entries = (from: number) => Array.from({ length: 20 }, (_, n) => ({ type: "user", uuid: `cut-${from + n}`, timestamp: at(n), message: { role: "user", content: `entry ${from + n}` } }));
+    await withLake(async (db) => {
+      await store.append(cut, entries(0));
+      await syncLake(db);
+      const files = async () => (await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', 'entries', schema => 'claude')`)).map(({ data_file }) => data_file);
+      const kept = new Set(await files());
+      await store.append(cut, entries(20));
+      await syncLake(db);
+      const lost = (await files()).filter((file) => !kept.has(file));
+      assert.equal(lost.length, 1);
+      rmSync(lost[0]!);
+      const logs: string[] = [];
+      const log: Log = (message, fields) => void logs.push(`${message} ${JSON.stringify(fields ?? {})}`);
+      // The lock's connection cut as soon as the reconciliation holds it.
+      let cutting = true;
+      const cutter = (async () => {
+        while (cutting) {
+          const { rowCount } = await admin.query("select pg_terminate_backend(pid) from pg_locks where locktype = 'advisory' and granted and objsubid = 1 and objid = oid(hashtext($1)::bigint & 4294967295)", ["alasio.lake.loader"]);
+          if (rowCount) return;
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      })();
+      try {
+        assert.equal(await runPass(db, "reconcile", passing(log)), false);
+      } finally {
+        cutting = false;
+        await cutter;
+      }
+      assert.match(logs.join("\n"), /the loader's lock was lost/u);
+      const count = async () => (await one<Count>(db, `select count(*) as n from ${LAKE}.claude.entries where uuid like 'cut-%'`)).n;
+      assert.equal(await count(), 20n);
+      assert.equal(await runPass(db, "reconcile", passing(log)), true, logs.join("\n"));
+      assert.equal(await count(), 40n);
+    });
+  });
+
+  test("a reconciliation runs to its end beside a loader awake, which holds the loader's lock only while it loads", async () => {
+    await withLake(async (db) => {
+      const source = wakeSource([[woken(0n)]]);
+      const loader = startLoader({ open: (signal) => openLoaderLake(config, () => {}, signal, 100), join: async () => source, metrics: createMetrics(), log: () => {}, gatherMs: 10 });
+      const logs: string[] = [];
+      try {
+        await eventually(() => source.told.length === 1);
+        assert.equal(loader.ready(), true);
+        const waited = new Promise<"waited">((resolve) => setTimeout(() => resolve("waited"), 20_000).unref());
+        assert.equal(await Promise.race([runPass(db, "reconcile", { ...passing((message) => void logs.push(message)), lockRetryMs: 100 }), waited]), true, logs.join("\n"));
+        assert.equal(loader.ready(), true);
+      } finally {
+        await loader.stop();
+      }
+    });
+  });
+
+  test("the reconciliation asks an object store of a file by a listing of its name, as DuckDB's S3 glob gives back a name with no wildcard unlisted", async () => {
+    const s3 = await startFakeS3({ bucket: "lake", region: "us-east-1", accessKeyId: "k", secretAccessKey: "s" });
+    const instance = await DuckDBInstance.create(":memory:");
+    const db = await instance.connect();
+    try {
+      await db.run("install httpfs");
+      await db.run("load httpfs");
+      await db.run(`create secret (type s3, key_id 'k', secret 's', region 'us-east-1', endpoint '${new URL(s3.endpoint).host}', url_style 'path', use_ssl false)`);
+      s3.objects.set("claude/entries/kept.parquet", Buffer.from("PAR1"));
+      assert.deepEqual([await stored(db, "s3://lake/claude/entries/kept.parquet"), await stored(db, "s3://lake/claude/entries/lost.parquet")], [true, false]);
+    } finally {
+      db.closeSync();
+      instance.closeSync();
+      await s3.close();
+    }
+  });
+
+  test("the reconciliation reads each file the store lists, holding lost one whose data the store no longer gives, after asking again, and failing where the store does not answer", async () => {
+    const s3 = await startFakeS3({ bucket: "lake", region: "us-east-1", accessKeyId: "k", secretAccessKey: "s" });
+    const instance = await DuckDBInstance.create(":memory:");
+    const db = await instance.connect();
+    const parquet = join(mkdtempSync(join(tmpdir(), "alasio-lake-readable-")), "one.parquet");
+    try {
+      await db.run("install httpfs");
+      await db.run("load httpfs");
+      await db.run(`create secret (type s3, key_id 'k', secret 's', region 'us-east-1', endpoint '${new URL(s3.endpoint).host}', url_style 'path', use_ssl false)`);
+      await db.run(`copy (select 1 as i) to '${parquet}' (format parquet)`);
+      for (const name of ["kept", "back", "gone"]) s3.objects.set(`claude/entries/${name}.parquet`, readFileSync(parquet));
+      s3.objects.set("claude/entries/emptied.parquet", Buffer.alloc(0));
+      s3.objects.set("claude/entries/other.parquet", Buffer.from("not a Parquet file at all"));
+      // A file the store has none of, every time, or for a moment.
+      let missing = 0;
+      s3.refuse = (method, key) => {
+        if (key === "claude/entries/gone.parquet") return 404;
+        if (key === "claude/entries/back.parquet" && method === "HEAD" && missing < 2) {
+          missing += 1;
+          return 404;
+        }
+        return null;
+      };
+      const read = (name: string) => readable(db, `s3://lake/claude/entries/${name}.parquet`, { retryMs: 10 });
+      assert.deepEqual(
+        [await read("kept"), await read("back"), await read("gone"), await read("emptied"), await read("other")],
+        [true, true, false, false, false],
+      );
+      // A store that does not answer says nothing of the file.
+      s3.refuse = (_method, key) => (key === "claude/entries/kept.parquet" ? 503 : null);
+      await assert.rejects(read("kept"), /HTTP 503/u);
+    } finally {
+      db.closeSync();
+      instance.closeSync();
+      await s3.close();
+      rmSync(dirname(parquet), { recursive: true, force: true });
+    }
+  });
+
+  test("the reconciliation holds lost a file the store fails a read of only where its filer and masters show a chunk of it gone, and fails, naming it, where they do not", async () => {
+    const s3 = await startFakeS3({ bucket: "lake", region: "us-east-1", accessKeyId: "k", secretAccessKey: "s" });
+    const instance = await DuckDBInstance.create(":memory:");
+    const db = await instance.connect();
+    // The bundled store's filer, masters and volume server, at one address, each answering
+    // as `parts` says: the filer's entry of the file, the masters' lookup of its volume, and
+    // the volume server's status for its chunk, and the volume servers the masters' topology holds, each time it is read.
+    type Parts = { entry: number | object; lookup: [number, object]; chunk: number; servers?: () => string[] };
+    const both = () => ["volume-0:8080", "volume-1:8080"];
+    let parts: Parts = { entry: 200, lookup: [200, {}], chunk: 200 };
+    const server = createServer((request, response) => {
+      const url = new URL(request.url ?? "/", "http://parts");
+      const json = (status: number, body: unknown) => response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+      if (url.pathname === "/buckets/lake/claude/entries/failing.parquet" && url.searchParams.has("metadata")) {
+        return typeof parts.entry === "number" ? json(parts.entry, {}) : json(200, parts.entry);
+      }
+      if (url.pathname === "/dir/lookup" && url.searchParams.get("volumeId") === "7") return json(...parts.lookup);
+      if (url.pathname === "/dir/status") return json(200, { Topology: { DataCenters: [{ Racks: [{ DataNodes: (parts.servers ?? both)().map((Url) => ({ Url })) }] }] } });
+      if (url.pathname === "/7,01637037d6" && request.method === "HEAD") return response.writeHead(parts.chunk).end();
+      return json(500, { error: `no ${request.method} ${request.url}` });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const host = `127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const store = { filer: `http://${host}`, master: `http://${host}`, volumeServers: 2 };
+    const entry = { FullPath: "/buckets/lake/claude/entries/failing.parquet", FileSize: 4, chunks: [{ file_id: "7,01637037d6", size: 4 }] };
+    const located: [number, object] = [200, { volumeOrFileId: "7", locations: [{ url: host, publicUrl: host }] }];
+    try {
+      await db.run("install httpfs");
+      await db.run("load httpfs");
+      await db.run(`create secret (type s3, key_id 'k', secret 's', region 'us-east-1', endpoint '${new URL(s3.endpoint).host}', url_style 'path', use_ssl false)`);
+      s3.objects.set("claude/entries/failing.parquet", Buffer.from("PAR1"));
+      // The store fails every read of it, as it does of an entry whose chunks are gone, and as it does for a moment while a volume server restarts.
+      s3.refuse = (method, key) => (key === "claude/entries/failing.parquet" && method === "GET" ? 500 : null);
+      const path = "s3://lake/claude/entries/failing.parquet";
+      const read = () => readable(db, path, { store, retryMs: 10, pulseMs: 10 });
+      const unknown: [number, object] = [404, { volumeId: "7", error: "volume id 7 not found" }];
+      // Its chunk's volume unknown to masters that know every volume server, its chunk gone from its volume, its entry gone, or an entry of bytes with no chunk: lost.
+      for (const shown of [
+        { entry, lookup: unknown, chunk: 200 },
+        { entry, lookup: located, chunk: 404 },
+        { entry: 404, lookup: located, chunk: 200 },
+        { entry: { ...entry, chunks: [] }, lookup: located, chunk: 200 },
+      ] as const) {
+        parts = shown as typeof parts;
+        assert.equal(await read(), false, JSON.stringify(shown));
+      }
+      // Its chunk served, as where the store failed the read for a moment, or a part not
+      // answering as one that knows: the reconciliation fails, naming the file.
+      // Its volume unknown to masters short of a volume server, as one restarts, or whose servers change as they are read, is that too.
+      let reads = 0;
+      for (const shown of [
+        { entry, lookup: located, chunk: 200 },
+        { entry, lookup: located, chunk: 503 },
+        { entry: 503, lookup: located, chunk: 200 },
+        { entry, lookup: [503, {}], chunk: 200 },
+        { entry, lookup: unknown, chunk: 200, servers: () => ["volume-0:8080"] },
+        { entry, lookup: unknown, chunk: 200, servers: () => (reads++ === 0 ? ["volume-0:8080", "volume-1:8080"] : ["volume-0:8080", "volume-2:8080"]) },
+      ] as const) {
+        parts = shown as Parts;
+        await assert.rejects(read(), (error: unknown) => error instanceof StoreUndecided && error.message.includes(path), JSON.stringify(shown));
+      }
+      // Another store than the bundled one, whose parts are not asked.
+      await assert.rejects(readable(db, path, { retryMs: 10 }), /not the bundled one/u);
+    } finally {
+      server.close();
+      db.closeSync();
+      instance.closeSync();
+      await s3.close();
+    }
+  });
+
+  test("a reconciliation on the bundled store forgets nothing while its masters miss a volume server, nor where its filer has no /buckets, and forgets the file once they know every one", async () => {
+    const s3 = await startFakeS3({ bucket: "lake", region: "us-east-1", accessKeyId: "k", secretAccessKey: "s" });
+    // The filer, masters and volume server, at one address: the bucket, the file's entry and
+    // its chunk's volume unknown to the masters, whose topology holds `servers`.
+    let buckets = 200;
+    let servers = ["volume-0:8080"];
+    let entry: object = {};
+    const server = createServer((request, response) => {
+      const url = new URL(request.url ?? "/", "http://parts");
+      const json = (status: number, body: unknown) => response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+      if (url.pathname === "/buckets/lake/") return json(buckets, { Path: "/buckets/lake", Entries: [] });
+      if (url.pathname.startsWith("/buckets/lake/") && url.searchParams.has("metadata")) return json(200, entry);
+      if (url.pathname === "/dir/lookup") return json(404, { volumeId: url.searchParams.get("volumeId"), error: `volume id ${url.searchParams.get("volumeId")} not found` });
+      if (url.pathname === "/dir/status") return json(200, { Topology: { DataCenters: [{ Racks: [{ DataNodes: servers.map((Url) => ({ Url })) }] }] } });
+      return json(500, { error: `no ${request.method} ${request.url}` });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const host = `127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const store = { filer: `http://${host}`, master: `http://${host}`, volumeServers: 2 };
+    const superuser = new pg.Client({ connectionString: postgres?.url });
+    await superuser.connect();
+    await superuser.query("create database reconcile_s3 owner lake");
+    const onStore: LakeConfig = { ...config, dataPath: "s3://lake/", s3: { endpoint: s3.endpoint, key: "k", secret: "s" }, catalog: { ...config.catalog, database: "reconcile_s3" } };
+    const lake = await openLake(onStore);
+    try {
+      await prepareLake(lake.db);
+      // A file of the store's, which the catalog names as one of its table's.
+      const local = join(mkdtempSync(join(tmpdir(), "alasio-lake-held-")), "held.parquet");
+      await lake.db.run(`copy (select range::INTEGER as i from range(100)) to '${local}' (format parquet)`);
+      s3.objects.set("held/one.parquet", readFileSync(local));
+      rmSync(dirname(local), { recursive: true, force: true });
+      await lake.db.run(`create table ${LAKE}.held (i integer)`);
+      await lake.db.run(`call ducklake_add_data_files('${LAKE}', 'held', 's3://lake/held/one.parquet')`);
+      const file = "s3://lake/held/one.parquet";
+      assert.deepEqual((await rows<{ data_file: string }>(lake.db, `select data_file from ducklake_list_files('${LAKE}', 'held')`)).map(({ data_file }) => data_file), [file]);
+      entry = { FullPath: `/buckets/lake/${file.slice("s3://lake/".length)}`, FileSize: 4, chunks: [{ file_id: "7,01637037d6", size: 4 }] };
+      // The store fails every read of it, as while a volume server restarts.
+      s3.refuse = (method, key) => (method === "GET" && `s3://lake/${key}` === file ? 500 : null);
+      const named = async () => (await rows(lake.db, `select data_file from ducklake_list_files('${LAKE}', 'held')`)).length;
+      const pass = async () => {
+        const logs: string[] = [];
+        const passed = await runPass(lake.db, "reconcile", { ...passing((message, fields) => void logs.push(`${message} ${JSON.stringify(fields ?? {})}`)), catalog: onStore.catalog, dataPath: onStore.dataPath, store });
+        return { passed, said: logs.join("\n") };
+      };
+      // One of its two volume servers not registered: the pass fails, naming the file, and forgets nothing.
+      const missing = await pass();
+      assert.deepEqual([missing.passed, missing.said.includes(file), /1 of the store's 2 volume servers/u.test(missing.said), await named()], [false, true, true, 1]);
+      // Its filer without the bucket's /buckets, where an entry's absence proves nothing: no more.
+      [buckets, servers] = [404, ["volume-0:8080", "volume-1:8080"]];
+      const unlisted = await pass();
+      assert.deepEqual([unlisted.passed, /has no \/buckets\/lake/u.test(unlisted.said), await named()], [false, true, 1]);
+      // Every volume server known, the volume not: the file is gone, and forgotten.
+      buckets = 200;
+      const known = await pass();
+      assert.deepEqual([known.passed, await named()], [true, 0], known.said);
+    } finally {
+      lake.close();
+      server.close();
+      await s3.close();
+      await superuser.query("drop database reconcile_s3 with (force)").catch(() => {});
+      await superuser.end();
+    }
+  });
+
+  test("the reconciliation forgets a file the store names whose data is gone, and loads again what it held", async () => {
+    const emptied = { projectKey: "-home-operator-emptied", sessionId: "66666666-6666-4666-8666-666666666666" };
+    const entries = (from: number) => Array.from({ length: 20 }, (_, n) => ({ type: "user", uuid: `emptied-${from + n}`, timestamp: at(n), message: { role: "user", content: `entry ${from + n}` } }));
+    await withLake(async (db) => {
+      await store.append(emptied, entries(0));
+      await syncLake(db);
+      const files = async () => (await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', 'entries', schema => 'claude')`)).map(({ data_file }) => data_file);
+      const kept = new Set(await files());
+      await store.append(emptied, entries(20));
+      await syncLake(db);
+      const named = (await files()).filter((file) => !kept.has(file));
+      assert.equal(named.length, 1);
+      // Named still, as the restored filer names it, its data gone.
+      writeFileSync(named[0]!, "");
+      const logs: string[] = [];
+      assert.equal(await runPass(db, "reconcile", passing((message, fields) => void logs.push(`${message} ${JSON.stringify(fields ?? {})}`))), true, logs.join("\n"));
+      assert.match(logs.join("\n"), /"lost":1/u);
+      assert.deepEqual(await one<{ n: bigint; uuids: bigint }>(db, `select count(*) as n, count(distinct uuid) as uuids from ${LAKE}.claude.entries where uuid like 'emptied-%'`), { n: 40n, uuids: 40n });
     });
   });
 
@@ -2503,6 +3005,31 @@ describe("the lake's reader", () => {
     }
   });
 
+  test("the alert rules count the lake's passes that failed on a file the store does not hold, and no other failure of theirs", async () => {
+    // As a pass exports what it logs (neon/lake/src/maintain.ts): one that failed on a lost file, one that failed otherwise.
+    const failure = (because: string | null) => ({
+      timeUnixNano: String(BigInt(Date.now()) * 1_000_000n),
+      body: { stringValue: "merging the telemetry's files failed" },
+      attributes: [{ key: "error", value: { stringValue: "HTTP 404" } }, ...(because ? [{ key: "because", value: { stringValue: because } }] : [])],
+    });
+    await withLake(async (db) => {
+      await writeTelemetry(db, telemetryRows("logs", {
+        resourceLogs: [{
+          resource: { attributes: [{ key: "service.name", value: { stringValue: "alasio-lake-maintenance" } }] },
+          scopeLogs: [{ logRecords: [failure("a file of the lake's catalog is gone from the object store"), failure(null)] }],
+        }],
+      }));
+    });
+    const rules = readFileSync(new URL("../neon/grafana/provisioning/alerting/rules.yaml", import.meta.url), "utf8");
+    const [, indent = "", block = ""] = /^ *title: .*\n[\s\S]*?^( *)data: \|\n((?:\1 {2}.*\n)+)/mu.exec(rules.slice(rules.indexOf("title: The lake names files the object store does not hold"))) ?? [];
+    const reader = await openReader(readerConfig);
+    try {
+      assert.deepEqual(await answer(reader.db, block.replaceAll(`\n${indent}  `, "\n").trim()), [{ failed: 1 }]);
+    } finally {
+      reader.close();
+    }
+  });
+
   test("the query endpoint answers 503 while it cannot open the lake", async () => {
     const endpoint = startEndpoint({ open: () => Promise.reject(new Error("the compute is restarting")), token: QUERY_TOKEN, log: () => {} });
     const server = createServer(endpoint.handle);
@@ -2587,6 +3114,7 @@ test("the lake's configuration names what is missing and refuses what is malform
   // Its source on the read replica, its catalog on the primary, each named apart.
   assert.deepEqual(loadConfig({ ...local, ...LOADER_LOG, LAKE_DATABASE_ENDPOINT: "alasio", LAKE_SOURCE_ENDPOINT: "alasio-ro" }).source, { database: "alasio", options: "endpoint=alasio-ro" });
   assert.deepEqual(loadConfig({ ...local, ...LOADER_LOG, LAKE_DATABASE_ENDPOINT: "alasio" }).source, { database: "alasio", options: "" });
+  assert.deepEqual(loadMaintenanceConfig({ ...local, LAKE_SOURCE_ENDPOINT: "alasio-ro" }).source, { database: "alasio", options: "endpoint=alasio-ro" });
   assert.equal(conninfo("lake"), "dbname='lake' connect_timeout=60");
   assert.equal(conninfo("it's", "endpoint=alasio"), "dbname='it\\'s' connect_timeout=60 options='endpoint=alasio'");
 });

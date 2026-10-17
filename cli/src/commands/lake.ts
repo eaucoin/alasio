@@ -1,16 +1,65 @@
-/** `alasio lake [--format table|csv|json] <sql>`: a read-only query of the analytics lake, in a reader's container. */
+/**
+ * `alasio lake [--format table|csv|json] <sql>`: a read-only query of the analytics lake, in a
+ * reader's container; `alasio lake reconcile [--branch <name>]`: an environment's lake's
+ * catalog set right with the object store.
+ */
 import { PassThrough } from "node:stream";
 
 import { NodeStream } from "@effect/platform-node";
-import { Effect, Stdio, Stream } from "effect";
+import { Console, Effect, Option, Schema, Stdio, Stream } from "effect";
 import { Argument, Command, Flag } from "effect/cli";
 
+import { branchNamespaces } from "../branches.ts";
+import { loadConfig } from "../config.ts";
+import { installConfig } from "../install.ts";
 import { KubeApi } from "../kube/api.ts";
-import { NAMESPACE } from "../manifests/common.ts";
-import { CommandFailed, onCluster, runningPod } from "./common.ts";
+import { reconcileLake } from "../lake.ts";
+import { branchEnvironment } from "../manifests/branch.ts";
+import { lakeRuns, MAIN_ENVIRONMENT, NAMESPACE } from "../manifests/common.ts";
+import { CommandFailed, onCluster, runningPod, timeoutFlag, waitOptions } from "./common.ts";
 
 /** The lake's query, as its image has it (neon/lake). */
 const QUERY = ["node", "/opt/lake/src/query.ts"] as const;
+
+/** What alasio lake reconcile cannot set right. */
+export class ReconcileRefused extends Schema.TaggedError<ReconcileRefused>()("ReconcileRefused", {
+  message: Schema.String,
+}) {}
+
+const reconcile = Command.make(
+  "reconcile",
+  {
+    branch: Flag.String("branch").pipe(
+      Flag.optional,
+      Flag.withMetavar("name"),
+      Flag.withDescription("The branch environment whose lake to set right, rather than main's"),
+    ),
+    timeout: timeoutFlag,
+  },
+  ({ branch, timeout }) =>
+    onCluster(() =>
+      Effect.gen(function*() {
+        const settings = yield* installConfig(yield* loadConfig);
+        if (!lakeRuns(settings)) return yield* new ReconcileRefused({ message: "alasio runs no lake" });
+        if (Option.isSome(branch) && !(yield* branchNamespaces).includes(branch.value)) {
+          return yield* new ReconcileRefused({ message: `there is no branch environment ${branch.value}` });
+        }
+        const lost = yield* reconcileLake(settings, Option.match(branch, { onNone: () => MAIN_ENVIRONMENT, onSome: branchEnvironment }), waitOptions(timeout));
+        yield* Console.log(lost.length > 0 ? lost.join("\n") : "the lake lost no file");
+      })
+    ),
+).pipe(
+  Command.withShortDescription("Set the lake's catalog right with the object store"),
+  Command.withDescription(
+    "Sets the lake's catalog right with the object store where files it names are gone from the store, as a restore of the filer store loses " +
+      "what was written since its backup (alasio restore-filer-store runs it then, for every environment): it forgets each, in one transaction of " +
+      "the catalog, loads again from alasio's database what the transcripts' and rollouts' tables lost, has the intake read again from the log " +
+      "what the telemetry lost, where the log still holds it, and says what each table lost, its rows, files and time, and what of the telemetry the log no " +
+      "longer holds, or has yet to give back. Main's lake, or with --branch a branch environment's, each " +
+      "of a catalog of its own. It runs on demand alone, once you know why the files are gone: the alert \"The lake names files the object store " +
+      "does not hold\" says when maintenance fails on one. Past --timeout it gives up, saying what it still waits for.",
+  ),
+);
 
 export const lake = Command.make(
   "lake",
@@ -62,6 +111,8 @@ export const lake = Command.make(
       "FROM otel.traces WHERE SpanName = 'alasio.turn' GROUP BY 1\". A conversation's Claude output tokens: " +
       "\"SELECT conversation, sum(output_tokens) FROM (SELECT DISTINCT " +
       "SpanAttributes['alasio.conversation.id'] AS conversation, SpanAttributes['alasio.session.id'] AS session_id FROM " +
-      "otel.traces WHERE SpanName = 'alasio.turn') JOIN claude.messages USING (session_id) GROUP BY 1\".",
+      "otel.traces WHERE SpanName = 'alasio.turn') JOIN claude.messages USING (session_id) GROUP BY 1\". " +
+      "alasio lake reconcile sets its catalog right with the object store where files it names are gone.",
   ),
+  Command.withSubcommands([reconcile]),
 );
