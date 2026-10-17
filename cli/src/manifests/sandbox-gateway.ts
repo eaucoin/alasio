@@ -381,6 +381,13 @@ export const HANDED_OVER = "transfer FUSE session to others";
  * said, to the mount of the pod that replaces it, until its own pod is deleted, or, where it
  * ended any other way, a failure, so kubelet starts it again and it mounts anew. Asked to end
  * while it mounts, it has its mount end too. `run` is MOUNT_RUN but for tests.
+ *
+ * While its juicefs serves, it keeps the node's mount at `root`: a bind of it of its own, in
+ * its own directory, which no other pod's going takes with it, and, where the node has lost
+ * it, as it does once the pod that held it before a handover goes (its container's mounts
+ * torn down, and with them the node's, which they share), binds that one back at `root`, the
+ * node's again, every second it looks. A `root` that cannot be read, as a mount whose
+ * session is lost, it leaves be.
  */
 export function workspaceMountScript(root: string, cacheSizeMiB: number, run = MOUNT_RUN): string {
   return [
@@ -392,6 +399,20 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, run = M
     `juicefs mount --no-bgjob --cache-size ${cacheSizeMiB} "$META_URL" ${root} >> "$run/juicefs.log" 2>&1 &`,
     "pid=$!",
     `echo "$pid" > "$run/juicefs.pid"`,
+    "keep() {",
+    `  kept="$run/kept"; bound=""`,
+    `  while kill -0 "$pid" 2>/dev/null; do`,
+    `    if type=$(stat -f -c %T ${root} 2>/dev/null); then`,
+    `      case "$type" in`,
+    `        fuse*) [ -n "$bound" ] || { mkdir -p "$kept" && mount --bind ${root} "$kept" && bound=1; } ;;`,
+    `        *) [ -n "$bound" ] && mount --bind "$kept" ${root} && echo "the node's mount was lost, as the pod that held it went: it is bound again from this pod's own" ;;`,
+    "      esac",
+    "    fi",
+    "    sleep 1",
+    "  done",
+    "}",
+    "keep &",
+    "keeper=$!",
     `tail -n +1 -f "$run/juicefs.log" &`,
     "tailer=$!",
     `trap 'kill -TERM "$pid"' TERM INT`,
@@ -399,7 +420,7 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, run = M
     // A TERM's wait ends as the trap runs; the mount's own end is waited for.
     `while kill -0 "$pid" 2>/dev/null; do wait "$pid"; code=$?; done`,
     "sleep 1",
-    `kill "$tailer" 2>/dev/null`,
+    `kill "$tailer" "$keeper" 2>/dev/null`,
     `if grep -qF '${HANDED_OVER}' "$run/juicefs.log"; then`,
     `  touch "$run/handed-over"`,
     "  echo 'the mount is handed over to the pod that replaces this one, which is idle until it is deleted'",
@@ -424,7 +445,8 @@ export function workspaceMountReady(root: string, run = MOUNT_RUN): string {
  * old (maxSurge), and its mount of the same mount point takes the old's FUSE session over,
  * which needs them to share the node's PIDs and JuiceFS's state (JUICEFS_STATE); the old pod
  * idles once it has handed its mount over (workspaceMountScript), not ready, and is deleted
- * once the new is ready.
+ * once the new is ready, which then keeps the node's mount itself, as the old one's going
+ * takes the node's with it (workspaceMountScript).
  */
 function workspaceMount(config: InstallConfig): V1DaemonSet {
   const credential = (name: string, key: string): V1EnvVar => ({ name, valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key } } });
