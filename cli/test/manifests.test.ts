@@ -3629,7 +3629,7 @@ describe("the sandbox service", () => {
     assert.deepEqual(branch.filter(({ metadata }) => metadata?.namespace === "alasio").map(named), []);
   });
 
-  test("gives the node agent the metadata engine alone, which it sets quotas on with JuiceFS's own command, of the very mount image the nodes mount with", () => {
+  test("gives the node agent the metadata engine alone, which it sets quotas on with JuiceFS's own command, of the release the nodes mount with", () => {
     const objects = install();
     const [agent] = one<V1DaemonSet>(objects, "DaemonSet", "alasio-node-agent").spec?.template.spec?.containers ?? [];
     // As a Valkey user of its own, of no command Valkey calls dangerous but INFO, and no key of workspace storage's object store.
@@ -3640,12 +3640,13 @@ describe("the sandbox service", () => {
     assert.deepEqual(args.slice(args.indexOf("--user")), ["--user", "quotas", "on", ">$(VALKEY_QUOTAS_PASSWORD)", "~*", "&*", "+@all", "-@dangerous", "+info"]);
     assert.ok(args.includes("--requirepass"));
     assert.deepEqual(server?.env?.find(({ name }) => name === "VALKEY_QUOTAS_PASSWORD")?.valueFrom?.secretKeyRef, { name: "alasio-workspaces-quotas", key: "password" });
-    const { repository, tag, digest } = configOf().workspaceStorage.csi.mountImage;
+    // JuiceFS's own release of the mount image's version, pinned by its checksum, checked to be that version as the image is built.
+    const { tag } = configOf().workspaceStorage.csi.mountImage;
     const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
-    assert.match(dockerfile, new RegExp(`^FROM ${repository}:${tag}@${digest} AS juicefs$`, "mu"));
-    // Its juicefs taken with the libraries it loads, and its loader, as that image installs them.
-    assert.match(dockerfile, /^COPY --from=juicefs \/opt\/juicefs \/opt\/juicefs$/mu);
-    assert.match(dockerfile, /exec \/opt\/juicefs\/ld\.so --library-path \/opt\/juicefs\/lib \/opt\/juicefs\/juicefs/u);
+    assert.equal(/^ARG JUICEFS_VERSION=(.+)$/mu.exec(dockerfile)?.[1], tag.replace(/^ce-v/u, ""));
+    assert.match(dockerfile, /^ARG JUICEFS_SHA256=[0-9a-f]{64}$/mu);
+    assert.match(dockerfile, /sha256sum -c -/u);
+    assert.match(dockerfile, /juicefs version \| grep -F "juicefs version \$\{JUICEFS_VERSION\}\+"/u);
     // And the metadata engine takes them, as they reach it.
     const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
     const pod = (component: string): Pod => ({ namespace: "alasio", namespaceLabels: { "kubernetes.io/metadata.name": "alasio" }, labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component } });

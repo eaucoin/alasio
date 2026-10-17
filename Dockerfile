@@ -1,25 +1,12 @@
 # alasio's image: the bot, neon-control, and the Neon setup job, on Node; and the node agent,
-# which sets workspaces' quotas with JuiceFS's own command, copied from the very mount image
-# the nodes mount workspace storage with (cli/src/manifests/config.ts mountImage), so the two
-# are one release of JuiceFS.
+# which sets workspaces' quotas with JuiceFS's own command, of the release of JuiceFS the
+# nodes mount workspace storage with (cli/src/manifests/config.ts mountImage).
 #
 # The base is a full Ubuntu userland rather than a slim one because, with the host
 # profile, the harnesses work on the operator's own machine from inside this
 # container: Codex runs its shell commands here, so the commands an agent runs should
 # behave as they do on an ordinary Ubuntu host. Published as ghcr.io/eaucoin/alasio by
 # .github/workflows/release.yml.
-FROM juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673 AS juicefs
-# Its juicefs loads FoundationDB's, Ceph's and Gluster's client libraries, as that image
-# installs them: it is taken with every library it loads, and the loader it was linked for,
-# under /opt/juicefs, and run by that loader on those alone, as it runs there.
-RUN mkdir -p /opt/juicefs/lib /opt/juicefs/bin \
- && cp /usr/local/bin/juicefs /opt/juicefs/juicefs \
- && ldd /usr/local/bin/juicefs | awk '$3 ~ /^\// { print $3 }' | xargs -I '{}' cp -L '{}' /opt/juicefs/lib/ \
- && cp -L "$(ldd /usr/local/bin/juicefs | awk '$1 ~ /^\// { print $1 }')" /opt/juicefs/ld.so \
- && printf '#!/bin/sh\nexec /opt/juicefs/ld.so --library-path /opt/juicefs/lib /opt/juicefs/juicefs "$@"\n' > /opt/juicefs/bin/juicefs \
- && chmod 755 /opt/juicefs/bin/juicefs \
- && /opt/juicefs/bin/juicefs version
-
 FROM ubuntu:24.04@sha256:a853f94d226358a79c740cfc7bce0c289748f3fe3488d921d038ccd752c61b60
 LABEL org.opencontainers.image.source=https://github.com/eaucoin/alasio \
       org.opencontainers.image.description="alasio: the bot, neon-control and the Neon setup job"
@@ -45,8 +32,15 @@ RUN curl -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-
  && rm /tmp/node.tar.xz \
  && node --version
 
-COPY --from=juicefs /opt/juicefs /opt/juicefs
-RUN ln -s /opt/juicefs/bin/juicefs /usr/local/bin/juicefs && juicefs version
+# JuiceFS's command, its own release's static build, of the mount image's version, verified
+# against the release's published checksum, and checked to be that version.
+ARG JUICEFS_VERSION=1.4.1
+ARG JUICEFS_SHA256=01ee09a21a9351a465e09906f113845e1c6a19bea70f530e5e2b2125b2dd3b82
+RUN curl -fsSLo /tmp/juicefs.tar.gz "https://github.com/juicedata/juicefs/releases/download/v${JUICEFS_VERSION}/juicefs-${JUICEFS_VERSION}-linux-amd64.tar.gz" \
+ && echo "${JUICEFS_SHA256}  /tmp/juicefs.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/juicefs.tar.gz -C /usr/local/bin --no-same-owner juicefs \
+ && rm /tmp/juicefs.tar.gz \
+ && HOME=/tmp juicefs version | grep -F "juicefs version ${JUICEFS_VERSION}+"
 
 WORKDIR /opt/alasio
 COPY package.json package-lock.json ./
