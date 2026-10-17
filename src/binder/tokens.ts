@@ -1,0 +1,44 @@
+/**
+ * The binder's tokens, which say what they are for and are checked by the key that signed
+ * them alone, so whatever checks one holds no store of them, as the binder holds no state:
+ * `<claims>.<signature>`, the claims base64url JSON, the signature their HMAC-SHA256 under the
+ * key, base64url, compared in constant time.
+ *
+ * A caller's token names the key it may reach and when it stops: what the binder's callers
+ * present, which the binder checks and never forwards. A binding's token names the key and
+ * the binding, its Lease's uid, so one minted for a binding is no other's, even of the same
+ * key: what the bound pod is given, to take its calls, and its telemetry, by.
+ */
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+import { Option, Schema } from "effect";
+
+/** What a token says: the key it is for; the binding, for a binding's; and, for a caller's, the time it stops, in ms. */
+export const TokenClaims = Schema.Struct({
+  key: Schema.String,
+  binding: Schema.optional(Schema.String),
+  expires: Schema.optional(Schema.Number),
+});
+export type TokenClaims = typeof TokenClaims.Type;
+
+const decodeClaims = Schema.decodeUnknownOption(Schema.fromJsonString(TokenClaims));
+
+const signatureOf = (secret: Buffer, claims: string): Buffer => createHmac("sha256", secret).update(claims).digest();
+
+/** A token of `claims`, signed with `secret`. */
+export function mintToken(secret: Buffer, claims: TokenClaims): string {
+  const encoded = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  return `${encoded}.${signatureOf(secret, encoded).toString("base64url")}`;
+}
+
+/** What `token` says, where `secret` signed it and it has not stopped by `now`; else null. */
+export function verifyToken(secret: Buffer, token: string, now: number): TokenClaims | null {
+  const dot = token.indexOf(".");
+  if (dot < 0) return null;
+  const [encoded, signature] = [token.slice(0, dot), Buffer.from(token.slice(dot + 1), "base64url")];
+  const expected = signatureOf(secret, encoded);
+  if (signature.length !== expected.length || !timingSafeEqual(signature, expected)) return null;
+  const claims = decodeClaims(Buffer.from(encoded, "base64url").toString("utf8"));
+  if (Option.isNone(claims)) return null;
+  return claims.value.expires !== undefined && claims.value.expires <= now ? null : claims.value;
+}
