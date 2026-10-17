@@ -77,7 +77,7 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" = "saves"): {
     saved,
     agents: {
       nodes: Effect.succeed(["node-a"]),
-      prepare: unused, current: unused, copy: unused, forget: unused, resume: unused, holdings: unused, workspaces: unused, discard: unused,
+      prepare: unused, current: unused, copy: unused, forget: unused, resume: unused, holdings: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
       readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, quota: unused,
       checkpoint: (node, request) =>
         Effect.gen(function*() {
