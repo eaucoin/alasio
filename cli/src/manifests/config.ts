@@ -367,6 +367,16 @@ const Sessions = Schema.Struct({
   nodeSelector: NodeSelector,
   tolerations: Tolerations,
   snapshots: defaulted(Snapshots, {}),
+  /**
+   * The sandbox pools' free pods, of each of a session's internets (cli/src/manifests/
+   * sandbox-gateway.ts): `min` kept running before any is bound, more made, to `max`, for
+   * the binds that wait for one.
+   */
+  pools: Scaling({ min: 1, max: 10 }, { floor: false, scaled: true }),
+  /** The sandbox gateway, which binds a session's workspace to a pool's pod. */
+  gateway: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "256Mi" } }) }), {}),
+  /** The session telemetry receiver, which bound pods' bayma exports to. */
+  receiver: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "256Mi" } }) }), {}),
 });
 
 const Host = Schema.Struct({
@@ -747,6 +757,8 @@ const WorkspaceStorage = Schema.Struct({
   cacheSizeMiB: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0, { message: "must be 0 or more" })), 1024),
   csi: defaulted(Csi, {}),
   valkey: defaulted(Valkey, {}),
+  /** Each node's mount of the file system, which the node agent attaches session workspaces from (./sandbox-gateway.ts). */
+  mount: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "1Gi" } }) }), {}),
 });
 
 /** agent-sandbox's controller, installed once per cluster; off where the cluster already has it. */

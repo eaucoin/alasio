@@ -51,6 +51,7 @@ import { filerStoreBackupHours } from "../src/manifests/config.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
+import { hookOf } from "../../src/sandbox/snapshots.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
 /** A NetworkPolicy as rendered, its ingress rules' peers under `from`. */
@@ -413,11 +414,11 @@ describe("neon", () => {
     assert.equal(setup?.env?.find(({ name }) => name === "S3_EXTERNAL"), undefined);
   });
 
-  test("runs each workload at the count its scale fixes: one, but for the safekeepers, the compute, whose count neon-control owns, and the lake's intake and loader, which KEDA scales", () => {
+  test("runs each workload at the count its scale fixes: one, but for the safekeepers, the compute, whose count neon-control owns, and the lake's intake and loader and the sandbox pools, which KEDA scales", () => {
     const objects = install({ host: { enabled: true } });
     const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet")];
     assert.ok(workloads.length > 10);
-    const counts: Record<string, number | undefined> = { "alasio-neon-safekeeper": 3, "alasio-neon-compute": undefined, "alasio-neon-compute-ro": undefined, "alasio-lake-intake": undefined, "alasio-lake-loader": undefined };
+    const counts: Record<string, number | undefined> = { "alasio-neon-safekeeper": 3, "alasio-neon-compute": undefined, "alasio-neon-compute-ro": undefined, "alasio-lake-intake": undefined, "alasio-lake-loader": undefined, "sandboxes-none": undefined, "sandboxes-full": undefined };
     for (const { metadata, spec } of workloads) assert.equal(spec?.replicas, Object.hasOwn(counts, metadata?.name ?? "") ? counts[metadata?.name ?? ""] : 1, metadata?.name);
   });
 
@@ -2322,7 +2323,8 @@ describe("workspace storage", () => {
 
   test("leaves the driver to the cluster when told", () => {
     const objects = install({ workspaceStorage: { csi: { enabled: false } } });
-    assert.deepEqual([...all(objects, "CSIDriver"), ...all(objects, "DaemonSet").filter(({ metadata }) => metadata?.name !== "alasio-node-agent")], []);
+    // The nodes' mount of the file system is alasio's own, the sandbox service's, whoever's the driver is.
+    assert.deepEqual([...all(objects, "CSIDriver"), ...all(objects, "DaemonSet").filter(({ metadata }) => metadata?.name !== "alasio-node-agent" && metadata?.name !== "alasio-workspace-mount")], []);
     assert.deepEqual(objects.filter((object) => /^(alasio-)?juicefs-(csi|mount)/u.test(object.metadata?.name ?? "")), []);
     assert.ok(one(objects, "StorageClass", "alasio-workspaces"));
     assert.ok(one(objects, "StatefulSet", "alasio-valkey"));
@@ -2376,6 +2378,8 @@ describe("node agents", () => {
       { name: "gvisor", hostPath: { path: "/usr/local/lib/alasio/gvisor", type: "DirectoryOrCreate" } },
       { name: "containerd", hostPath: { path: "/var/lib/rancher/k3s/agent/etc/containerd", type: "DirectoryOrCreate" } },
       { name: "snapshots", hostPath: { path: "/var/lib/alasio/snapshots", type: "DirectoryOrCreate" } },
+      { name: "workspaces", hostPath: { path: "/var/lib/alasio/workspaces", type: "DirectoryOrCreate" } },
+      { name: "attach", hostPath: { path: "/var/lib/alasio/attach", type: "DirectoryOrCreate" } },
     ]);
     const [container] = pod?.containers ?? [];
     assert.equal(container?.image, one<V1Deployment>(objects, "Deployment", "alasio").spec?.template.spec?.containers[0]?.image);
@@ -2386,6 +2390,9 @@ describe("node agents", () => {
       { name: "gvisor", mountPath: "/usr/local/lib/alasio/gvisor", readOnly: true },
       { name: "containerd", mountPath: "/var/lib/rancher/k3s/agent/etc/containerd", readOnly: true },
       { name: "snapshots", mountPath: "/var/lib/alasio/snapshots" },
+      // The node's mount of workspace storage, made after the agent starts, is the agent's too.
+      { name: "workspaces", mountPath: "/var/lib/alasio/workspaces", mountPropagation: "HostToContainer" },
+      { name: "attach", mountPath: "/var/lib/alasio/attach" },
     ]);
     assert.deepEqual(container?.ports, [{ name: "api", containerPort: 8484 }]);
     assert.deepEqual(container?.readinessProbe, { httpGet: { path: "/healthz", port: "api" }, periodSeconds: 10 });
@@ -2985,6 +2992,9 @@ describe("scaling", () => {
       "alasio-valkey",
       "juicefs-csi-controller",
       "juicefs-csi-node",
+      "sandboxes-none",
+      "sandboxes-full",
+      "alasio-workspace-mount",
     ];
     for (const [name, mode] of modes) assert.equal(mode, recommended.includes(name.split("/")[1] ?? "") ? "Off" : "InPlace", name);
     // A branch's alasio runs turns as main's does.
@@ -3308,5 +3318,90 @@ describe("admission", () => {
     // Templates it cannot read carry nothing, nor does an installation without sessions.
     assert.deepEqual(carriedFrom(configOf(cpu("102m")), "{ not JSON", { ...NOTHING_KEPT, cpuBaseline: BASELINE }).previousSessions, null);
     assert.deepEqual(carriedFrom(configOf({ sessions: { enabled: false }, workspaceStorage: { enabled: false }, host: { enabled: true } }), templatesOf(first), { ...NOTHING_KEPT, cpuBaseline: BASELINE }).previousSessions, null);
+  });
+});
+
+describe("the sandbox service", () => {
+  test("pools each internet's sessions as pods of the agent image under gVisor, each mounting its own directory on its node, its bayma started on its binding's token, kept free by KEDA", () => {
+    const objects = install();
+    for (const mode of ["none", "full"] as const) {
+      const pool = one<V1Deployment>(objects, "Deployment", `sandboxes-${mode}`);
+      assert.equal(pool.metadata?.namespace, "alasio-sessions");
+      assert.deepEqual(pool.spec?.selector.matchLabels, { "alasio.dev/pool": `sandboxes-${mode}`, "alasio.dev/free": "true" });
+      // None is ready before it is bound: the old free pods go as the new come.
+      assert.deepEqual(pool.spec?.strategy, { type: "Recreate" });
+      assert.equal(pool.spec?.replicas, undefined);
+      const template = pool.spec?.template;
+      assert.equal(template?.metadata?.labels?.["alasio.dev/net-mode"], mode);
+      const spec = template?.spec;
+      assert.deepEqual([spec?.runtimeClassName, spec?.automountServiceAccountToken, spec?.enableServiceLinks], ["gvisor", false, false]);
+      assert.deepEqual(spec?.volumes?.[0], { name: "attach", hostPath: { path: "/var/lib/alasio/attach", type: "DirectoryOrCreate" } });
+      const [bayma] = spec?.containers ?? [];
+      assert.deepEqual(bayma?.volumeMounts?.[0], { name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAME)", mountPropagation: "HostToContainer" });
+      assert.deepEqual(bayma?.env?.[0], { name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } });
+      assert.deepEqual(bayma?.command, ["/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"]);
+      assert.deepEqual(bayma?.args?.slice(-4), ["--token-file", "/attach/token", "--telemetry-token-file", "/attach/token"]);
+      // Its hook, as a release's snapshot runs it, through the same start.
+      assert.deepEqual(hookOf(bayma ?? { name: "" }), ["/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"]);
+      const scaled = one<ScaledObject>(objects, "ScaledObject", `sandboxes-${mode}`);
+      assert.deepEqual([scaled.spec.minReplicaCount, scaled.spec.maxReplicaCount], [1, 10]);
+      assert.deepEqual(scaled.spec.triggers, [{
+        type: "metrics-api",
+        metadata: { url: `http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio-sessions/sandboxes-${mode}`, valueLocation: "waiting", targetValue: "1" },
+      }]);
+    }
+  });
+
+  test("binds through a gateway of alasio's image, configured with its pools and the node agents, its keys the stack's, which may claim and delete its pools' pods and hold their Leases alone", () => {
+    const objects = install();
+    const gateway = one<V1Deployment>(objects, "Deployment", "alasio-sandbox-gateway");
+    const [container] = gateway.spec?.template.spec?.containers ?? [];
+    assert.deepEqual(container?.command, ["node", "/opt/alasio/src/gateway/main.ts"]);
+    const env = Object.fromEntries((container?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom?.secretKeyRef ?? valueFrom?.fieldRef]));
+    assert.deepEqual([env["CALLER_KEY"], env["BINDING_KEY"], env["ALASIO_NODE_AGENT_TOKEN"]], [
+      { name: "alasio-sandbox-gateway", key: "caller-key" },
+      { name: "alasio-sandbox-gateway", key: "binding-key" },
+      { name: "alasio-node-agent", key: "token" },
+    ]);
+    const config = JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}");
+    assert.deepEqual(config, {
+      port: 8080,
+      peers: "alasio-sandbox-gateway-peers.alasio.svc.cluster.local",
+      podPort: 7290,
+      waitSeconds: 120,
+      releaseAfterSeconds: 300,
+      environments: [{ name: "main", namespace: "alasio-sessions" }],
+      pools: { none: "sandboxes-none", full: "sandboxes-full" },
+      nodeAgents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", port: 8484 },
+    });
+    const sessions = all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio-sandbox-gateway" && metadata.namespace === "alasio-sessions");
+    assert.deepEqual(sessions?.rules, [
+      { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch", "update", "delete"] },
+      { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] },
+      { apiGroups: ["apps"], resources: ["deployments"], verbs: ["get"], resourceNames: ["sandboxes-none", "sandboxes-full"] },
+    ]);
+    assert.equal(one<V1Service>(objects, "Service", "alasio-sandbox-gateway-peers").spec?.clusterIP, "None");
+  });
+
+  test("receives sessions' telemetry in a receiver of its own, which watches its pools' Leases, and mounts workspace storage on each node in a pod of its own, replaced only as it is deleted", () => {
+    const objects = install();
+    const receiver = one<V1Deployment>(objects, "Deployment", "alasio-receiver");
+    const env = Object.fromEntries((receiver.spec?.template.spec?.containers[0]?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom?.secretKeyRef]));
+    assert.deepEqual([env["BINDING_NAMESPACES"], env["BINDING_KEY"]], ["alasio-sessions", { name: "alasio-sandbox-gateway", key: "binding-key" }]);
+    const watching = all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio-receiver");
+    assert.deepEqual([watching?.metadata?.namespace, watching?.rules], ["alasio-sessions", [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]]);
+    const mount = one<V1DaemonSet>(objects, "DaemonSet", "alasio-workspace-mount");
+    assert.deepEqual(mount.spec?.updateStrategy, { type: "OnDelete" });
+    const [juicefs] = mount.spec?.template.spec?.containers ?? [];
+    assert.deepEqual(juicefs?.volumeMounts, [{ name: "workspaces", mountPath: "/var/lib/alasio/workspaces", mountPropagation: "Bidirectional" }]);
+    assert.match(juicefs?.command?.[2] ?? "", /exec juicefs mount --no-bgjob --cache-size 1024 "\$META_URL" \/var\/lib\/alasio\/workspaces$/u);
+    assert.equal(mount.spec?.template.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
+  });
+
+  test("runs none of it without workspace storage, or where sandboxes are not snapshotted, as the node agents attach its workspaces", () => {
+    for (const file of [{ workspaceStorage: { enabled: false } }, { sessions: { runtimeClassName: "" } }]) {
+      const objects = install(file);
+      assert.deepEqual(objects.filter(({ metadata }) => /sandbox-gateway|sandboxes-|alasio-receiver|workspace-mount/u.test(metadata?.name ?? "")).map(({ kind, metadata }) => `${kind}/${metadata?.name}`), [], JSON.stringify(file));
+    }
   });
 });
