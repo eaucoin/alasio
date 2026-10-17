@@ -78,6 +78,7 @@ import {
   tearDown,
 } from "./harness.ts";
 import type { ListedExport } from "./otlp-sink.ts";
+import { spikeAttach } from "./spike-attach.ts";
 import type { ReplFilled, ReplSeen, ReplSet, ReplSummed } from "./session-repl.ts";
 import type { RoundtripSeen } from "./session-roundtrip.ts";
 import type { Corrupted, Released } from "./snapshot-bucket.ts";
@@ -1433,6 +1434,8 @@ if (inShard("snapshots")) {
     });
   });
 }
+
+if (inShard("spike")) spikeAttach();
 
 if (inShard("workspaces")) {
   describe("a session workspace forked from Telegram", () => {

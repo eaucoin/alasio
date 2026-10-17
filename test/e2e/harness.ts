@@ -110,7 +110,7 @@ export function targetOf(value: string | undefined): "host" | "docker" {
 }
 
 /** The shards of the suites, each run on a cluster of its own. */
-export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade"] as const;
+export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "spike"] as const;
 export type Shard = (typeof SHARDS)[number];
 
 /** The shard `value` names, or none, when it is unset or empty. */
@@ -136,7 +136,7 @@ export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
 
 /** Whether a run of the shard `selected`, or of none, runs the suites of `shard`: the snapshots and upgrade shards' only when selected. */
 export const runsShard = (selected: Shard | undefined, shard: Shard): boolean =>
-  selected === shard || (selected === undefined && shard !== "snapshots" && shard !== "upgrade");
+  selected === shard || (selected === undefined && shard !== "snapshots" && shard !== "upgrade" && shard !== "spike");
 
 /** Whether the run runs the suites of `shard`. */
 export const inShard = (shard: Shard): boolean => runsShard(SHARD, shard);

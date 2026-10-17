@@ -69,7 +69,7 @@ const UNREACHED: readonly Store[] = [...STORES, { name: MASTER, kind: "StatefulS
 const podOfStore = async ({ name, kind }: Store) => (kind === "Deployment" ? kube.runningPod(NAMESPACE, name) : `${name}-0`);
 
 /** Where the suite works in a session's workspace, and the files it writes first and expects everywhere after. */
-const WORKDIR = "/workspace/juicefs-e2e";
+export const WORKDIR = "/workspace/juicefs-e2e";
 const FIXTURE = `${WORKDIR}/fixture`;
 
 /** Where the suite writes the files a fork is to keep, beside one in the home. */
@@ -86,7 +86,7 @@ const MOUNT_CHECK = "env LC_ALL=C stat --file-system --format=%T /workspace";
  * The file operations workspaces' tools rely on, in the session's workspace, as its agent,
  * each saying `PASS name` or `FAIL name: why`. Writes a 100 MiB file and deletes it.
  */
-const FILE_OPERATIONS = String.raw`
+export const FILE_OPERATIONS = String.raw`
 set -u
 W=${WORKDIR}/operations; rm -rf "$W"; mkdir -p "$W"; cd "$W" || exit 1
 check() { name=$1; shift; if "$@" >/tmp/out 2>&1; then echo "PASS $name"; else echo "FAIL $name: $(tail -3 /tmp/out | tr '\n' ' ')"; fi; }
