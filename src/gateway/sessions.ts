@@ -13,6 +13,8 @@
  * ran and the last request of it say: at most four requests a minute of each bound pod's,
  * and one a release's wait for most.
  */
+import { lookup } from "node:dns/promises";
+
 import type { V1Deployment, V1Pod } from "@kubernetes/client-node";
 import { Clock, Effect, Schema } from "effect";
 
@@ -46,6 +48,12 @@ export interface SessionsOptions {
   readonly bindingKey: Buffer;
   /** How often a bound pod's bayma is asked whether it is idle, at most: IDLE_POLL_MS unless given. */
   readonly idlePollMs?: number;
+  /**
+   * Where bound pods' bayma exports its telemetry, where it does: the session telemetry
+   * receiver's host and port, its address resolved as each pod is readied, as a session with
+   * no internet resolves no name, and the variables that say what it exports.
+   */
+  readonly telemetry?: { readonly host: string; readonly port: number; readonly env: Readonly<Record<string, string>> } | undefined;
 }
 
 /** How often a bound pod's bayma is asked whether it is idle, at most. */
@@ -74,12 +82,16 @@ export interface Sessions {
 
 /** The gateway's sessions, as the module says, on the node agents, the binder, and the KubeClient. */
 export const makeSessions = Effect.fnUntraced(function*(
-  { environments, pools: poolNames, releaseAfterMs, podPort, bindingKey, idlePollMs = IDLE_POLL_MS }: SessionsOptions,
+  { environments, pools: poolNames, releaseAfterMs, podPort, bindingKey, idlePollMs = IDLE_POLL_MS, telemetry }: SessionsOptions,
   agents: NodeAgents,
   binder: Binder["Service"],
 ): Effect.fn.Return<Sessions, never, KubeClient> {
   const kube = yield* KubeClient;
   const pools = environments.flatMap(({ namespace }) => (Object.values(poolNames) as string[]).map((name): Pool => ({ name, namespace })));
+  /** The address `host` resolves to. */
+  const addressOf = (host: string): Effect.Effect<string, BindStepFailed> =>
+    Effect.tryPromise({ try: () => lookup(host), catch: (error) => new BindStepFailed({ reason: `${host} did not resolve: ${String(error)}` }) }).pipe(Effect.map(({ address }) => address));
+
   /** When each bound key is next asked whether it is idle, by its binding. */
   const due = new Map<string, number>();
 
@@ -95,12 +107,16 @@ export const makeSessions = Effect.fnUntraced(function*(
         pool: { name: poolNames[mode], namespace: environment.namespace },
         // Its workspace attached, its binding's token beside it, on which its bayma starts.
         prepare: (pod, binding) =>
-          agents.attach(pod.spec?.nodeName ?? "", {
-            environment: environment.namespace,
-            workspace: volumeId,
-            pod: pod.metadata?.name ?? "",
-            token: mintToken(bindingKey, { key, binding }),
-          }).pipe(Effect.mapError((error) => new BindStepFailed({ reason: error.message }))),
+          Effect.gen(function*() {
+            const env = telemetry ? { ...telemetry.env, OTEL_EXPORTER_OTLP_ENDPOINT: `http://${yield* addressOf(telemetry.host)}:${telemetry.port}` } : {};
+            yield* agents.attach(pod.spec?.nodeName ?? "", {
+              environment: environment.namespace,
+              workspace: volumeId,
+              pod: pod.metadata?.name ?? "",
+              token: mintToken(bindingKey, { key, binding }),
+              env,
+            }).pipe(Effect.mapError((error) => new BindStepFailed({ reason: error.message })));
+          }),
       };
     });
 
