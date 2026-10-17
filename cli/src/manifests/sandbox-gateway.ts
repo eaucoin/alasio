@@ -383,7 +383,9 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, run = M
     `run=${run}`,
     `mkdir -p ${root} "$run"`,
     `rm -f "$run/handed-over"`,
-    `juicefs mount --no-bgjob --cache-size ${cacheSizeMiB} "$META_URL" ${root} > "$run/juicefs.log" 2>&1 &`,
+    // Made, empty, before the mount starts or the log is followed, which would not find it yet.
+    `: > "$run/juicefs.log"`,
+    `juicefs mount --no-bgjob --cache-size ${cacheSizeMiB} "$META_URL" ${root} >> "$run/juicefs.log" 2>&1 &`,
     "pid=$!",
     `echo "$pid" > "$run/juicefs.pid"`,
     `tail -n +1 -f "$run/juicefs.log" &`,
