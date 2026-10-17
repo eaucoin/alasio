@@ -85,6 +85,16 @@ export function stackLabels(component: string): Labels {
   return { ...labels(component), "alasio.dev/stack": "neon" };
 }
 
+/**
+ * Labels as a StatefulSet's claim template carries them: `of`, but the release's version,
+ * as Kubernetes changes no StatefulSet's claim templates, which the version would change at
+ * each release, every upgrade refused.
+ */
+export function claimLabels(of: Labels): Labels {
+  const { "app.kubernetes.io/version": _version, ...kept } = of;
+  return kept;
+}
+
 /** The labels that select a component's pods. */
 export function selectorLabels(component: string): Labels {
   return { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": component };

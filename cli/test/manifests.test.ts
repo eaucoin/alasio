@@ -3339,3 +3339,17 @@ test("every workload KEDA scales on its CPU is scaled up only on a use that outl
   // What scales on what waits for it rather than on CPU (the lake's readers, on their queue) has no start-up to outlast.
   assert.equal(one<ScaledObject>(objects, "ScaledObject", "alasio-lake-query").spec.advanced, undefined);
 });
+
+test("no StatefulSet's claim templates change from one release to the next, as Kubernetes changes none: none carries the release's version", () => {
+  for (const objects of [install(), branchObjects(configOf(), "try")]) {
+    for (const statefulSet of all<V1StatefulSet>(objects, "StatefulSet")) {
+      for (const claim of statefulSet.spec?.volumeClaimTemplates ?? []) {
+        assert.equal(claim.metadata?.labels?.["app.kubernetes.io/version"], undefined, `${statefulSet.metadata?.name}'s claim ${claim.metadata?.name}`);
+      }
+    }
+  }
+  // The log's carry its other labels, which its pods do.
+  const log = one<V1StatefulSet>(install(), "StatefulSet", "alasio-log");
+  const { "app.kubernetes.io/version": _version, ...podLabels } = log.spec?.template.metadata?.labels ?? {};
+  assert.deepEqual(log.spec?.volumeClaimTemplates?.[0]?.metadata?.labels, podLabels);
+});
