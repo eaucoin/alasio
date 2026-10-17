@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { Effect } from "effect";
 
 import type { HostCommands } from "../../src/node-agent/host.ts";
-import { makeQuotas } from "../../src/node-agent/quotas.ts";
+import { makeJuicefs } from "../../src/node-agent/juicefs.ts";
 import { RunscError } from "../../src/node-agent/runsc.ts";
 import { makeWorkspaces } from "../../src/node-agent/workspaces.ts";
 
@@ -40,7 +40,9 @@ export function workspacesNode() {
   writeFileSync(juicefs, [
     "#!/bin/sh",
     `echo "$* META_PASSWORD=$META_PASSWORD" >> ${join(root, "juicefs.log")}`,
+    'if [ "$1" = clone ]; then cp -a "$3" "$4"; exit; fi',
     'path="$5"; file="' + quotaDir + '/$(echo "$path" | tr / _)"',
+    'if [ "$2" = delete ]; then rm -f "$file"; exit; fi',
     'if [ "$2" = set ]; then echo "$7" > "$file"; fi',
     'if [ ! -f "$file" ]; then echo "no quota of $path" >&2; exit 1; fi',
     'echo "+--+"; echo "| $path | $(cat "$file").0 GiB | 12 MiB | 1% | unlimited | 3 | |"; echo "+--+"',
@@ -48,7 +50,7 @@ export function workspacesNode() {
   chmodSync(juicefs, 0o755);
   const workspaces = makeWorkspaces({
     host,
-    quotas: makeQuotas({ metaUrl: "redis://:the%20password@valkey.alasio.svc:6379/1", juicefs }),
+    juicefs: makeJuicefs({ metaUrl: "redis://:the%20password@valkey.alasio.svc:6379/1", juicefs }),
     runsc: { container: (id) => (running.has(id) ? Effect.succeed({ release: "r", annotations: {} }) : Effect.fail(new RunscError({ release: "", command: "state", reason: "not found" }))) },
     workspacesRoot,
     attachRoot,
