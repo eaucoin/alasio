@@ -107,6 +107,12 @@ export class Binder extends Context.Service<Binder, {
    * is not bound, or another binder is binding or releasing it.
    */
   readonly release: <E = never>(pool: Pool, key: string, before?: (bound: { readonly pod: string; readonly binding: string }) => Effect.Effect<void, E>) => Effect.Effect<boolean, KubeApiError | E>;
+  /**
+   * Runs `effect` holding the key's binding Lease, as a bind holds it under way, renewed the
+   * while, binds of it waiting meanwhile; then lets it go: what `effect` came to, or null,
+   * `effect` not run, where the key is bound, or being bound or released by another binder.
+   */
+  readonly hold: <A, E>(pool: Pool, key: string, effect: Effect.Effect<A, E>) => Effect.Effect<{ readonly value: A } | null, KubeApiError | E>;
   /** How many binds of the pool wait for a free pod now, in this binder. */
   readonly waiting: (pool: Pool) => Effect.Effect<number>;
   /** The key's binding as it is now, its pod serving it; null where it has none so, binding nothing and taking no Lease. */
@@ -284,6 +290,15 @@ export class Binder extends Context.Service<Binder, {
             }
           });
 
+        const hold = <A, E>(pool: Pool, key: string, effect: Effect.Effect<A, E>): Effect.Effect<{ readonly value: A } | null, KubeApiError | E> =>
+          Effect.gen(function*() {
+            const taken = yield* provide(takeLease(pool, key, binder, staleMs));
+            if (!taken.taken) return null;
+            const { value, lease } = yield* renewing(taken.lease, () => effect, (held) => provide(releaseLease(held)).pipe(Effect.ignore));
+            if (lease) yield* provide(releaseLease(lease)).pipe(Effect.catchIf(hasStatus(409), () => Effect.void));
+            return { value };
+          });
+
         const bound = (pool: Pool, key: string): Effect.Effect<Bound | null, KubeApiError> =>
           Effect.gen(function*() {
             const lease = yield* provide(readLease(pool, key));
@@ -297,6 +312,7 @@ export class Binder extends Context.Service<Binder, {
         return Binder.of({
           bind,
           bound,
+          hold,
           release: (pool, key, before = () => Effect.void) => releaseBinding(pool, key, before),
           waiting: (pool) => Effect.sync(() => waits.get(poolKey(pool)) ?? 0),
         });

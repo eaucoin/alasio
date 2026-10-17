@@ -15,14 +15,20 @@
  * token names it, signed by that environment's key: the node agents are the gateway's. Under
  * /workspace, of the token's key's workspace:
  * - `POST /workspace`: makes it, of `quotaBytes` (204); again, sets its quota anew.
- * - `DELETE /workspace`: deletes it (204), as it does one there is not; 409 while it is bound.
+ * - `DELETE /workspace`: deletes it (204), as it does one there is not, its snapshots
+ *   forgotten with it (./snapshots.ts forget), under its binding's Lease, which binds of it
+ *   wait for; 409 while it is bound, or being bound or released.
  * - `GET /workspace/files?path=<path>&max=<bytes>`, `PUT /workspace/files?path=<path>`: its
  *   file at `path`, as the node agents read and write one (200, 204).
  * - `GET /workspace/quota`: `{ capacityBytes, usedBytes }` (200); 404 where it has none.
  * - `POST /workspace/forks`, `{ environment, workspace }`: makes `workspace` of `environment` a
  *   clone of it (204), where `environment` is the caller's own or one branched from it, as
  *   its namespace records (./environments.ts): main forks into its branches, and a branch
- *   into itself alone, holding no key of any other's; 403 elsewhere.
+ *   into itself alone, holding no key of any other's; 403 elsewhere. A fork of a workspace
+ *   released into a snapshot is given a copy of it, and recorded released into it, so it
+ *   restores as its source would (./snapshots.ts copy), under the bindings' Leases of both;
+ *   one of a workspace bound is a clone of its files alone; 409 while the fork is bound, or
+ *   being bound or released.
  * - `GET /workspace/all`: `{ workspaces }`, the names of the environment's workspaces (200).
  * What is refused is `{ error }` with its status; a node agent's refusal is its own, and
  * what failed otherwise 502.
@@ -48,7 +54,7 @@ import { bindingToken, type TokenClaims } from "../binder/tokens.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
-import { isValidVolumeId, volumeIdOfKey } from "../sandbox/names.ts";
+import { isValidVolumeId, sessionKey, volumeIdOfKey } from "../sandbox/names.ts";
 import type { Events, EventInput } from "../events/events.ts";
 import { meter } from "../telemetry/index.ts";
 import type { Environments } from "./environments.ts";
@@ -144,6 +150,8 @@ export interface Sessions {
   readonly live: Effect.Effect<void, KubeApiError>;
   /** Records what the binding `lease` of `pool`, whose pod went while it was bound, is released into, while its Lease holds still. */
   readonly recordLost: (pool: Pool, lease: BindingLease) => Effect.Effect<void>;
+  /** Collects what of main's snapshots no workspace has a use for (./snapshots.ts collect). */
+  readonly collect: Effect.Effect<void>;
   /** Tells of the binding `lease` of `pool`, let go as its pod went while it was bound, as lost. */
   readonly lost: (pool: Pool, lease: BindingLease) => Effect.Effect<void>;
   /** Answers a caller's request of its workspaces, as the module says. */
@@ -414,10 +422,10 @@ export const makeSessions = Effect.fnUntraced(function*(
         case "POST /workspace":
           return yield* answered(agents.createWorkspace(ref, quotaBytes), () => done);
         case "DELETE /workspace": {
-          const bound = yield* Effect.forEach(Object.values(poolNames) as string[], (name) => binder.bound({ name, namespace: environment.namespace }, claims.key)).pipe(Effect.result);
-          if (bound._tag === "Failure") return refused(502, bound.failure.message);
-          if (bound.success.some((each) => each !== null)) return refused(409, `${workspace} is bound; it is deleted once released`);
-          return yield* answered(agents.removeWorkspace(ref), () => done);
+          // The Lease is the namespace's of the key, whichever pool binds it.
+          const pool = { name: poolNames.none, namespace: environment.namespace };
+          return yield* answered(binder.hold(pool, claims.key, Effect.andThen(agents.removeWorkspace(ref), snapshots.forget(pool, workspace))), (held) =>
+            held ? done : refused(409, `${workspace} is bound, or being bound or released; it is deleted once released`));
         }
         case "GET /workspace/files": {
           const maxBytes = Number(query.get("max") ?? MAX_READ_BYTES);
@@ -436,12 +444,26 @@ export const makeSessions = Effect.fnUntraced(function*(
           if (!target || (target.name !== environment.name && target.parent !== environment.name)) {
             return refused(403, `${environment.name}'s sessions are forked into ${environment.name} and the environments branched from it alone, not ${asked.environment}`);
           }
-          return yield* answered(agents.cloneWorkspace(ref, { environment: target.namespace, workspace: asked.workspace }, quotaBytes), () => done);
+          const from = { name: poolNames.none, namespace: environment.namespace };
+          const into = { name: poolNames.none, namespace: target.namespace };
+          const fork = { environment: target.namespace, workspace: asked.workspace };
+          const clone = agents.cloneWorkspace(ref, fork, quotaBytes);
+          const forked = Effect.gen(function*() {
+            // Its source held too, so what it was released into is read as it is; one bound is cloned of its files alone.
+            const copied = yield* binder.hold(from, claims.key, Effect.andThen(clone, snapshots.copy(from, workspace, into, asked.workspace)));
+            if (!copied) return yield* clone;
+            if (!copied.value) return;
+            yield* agents.setReleased(fork, copied.value).pipe(
+              Effect.catch((error) => Effect.logWarning(`${fork.environment}/${fork.workspace}'s release into its snapshot ${copied.value?.snapshot} could not be recorded, so it is bound from bayma's checkpoints: ${error.message}`)),
+            );
+          });
+          return yield* answered(binder.hold(into, sessionKey(asked.workspace), forked), (held) =>
+            held ? done : refused(409, `${asked.environment}'s ${asked.workspace} is bound, or being bound or released`));
         }
         default:
           return refused(404, `there is no ${route}`);
       }
     });
 
-  return { place, pools, sweep, drain, live, recordLost, lost, operate };
+  return { place, pools, sweep, drain, live, recordLost, lost, operate, collect: snapshots.collect };
 });

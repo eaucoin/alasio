@@ -46,6 +46,12 @@
  * restore its resume refuses where bayma had moved on from it. One whose live save says it can be
  * saved no more is ended now (unsaveable), to come back from bayma's checkpoints, as its next
  * save would fail as this one did.
+ *
+ * A workspace deleted has its snapshots forgotten with it, in the bucket and every node's cache
+ * (forget); a fork of one released into a snapshot is given a copy of it (copy), which it is
+ * recorded released into, so it restores as its source would; and what of main's snapshots no
+ * workspace has a use for is collected (collect), as alasio's were: those of workspaces gone,
+ * what no snapshot of a workspace needs, and what a node caches that none needs.
  */
 import type { V1Deployment, V1NetworkPolicy, V1Node, V1Pod, V1PodTemplateSpec, V1Toleration } from "@kubernetes/client-node";
 import { Clock, Effect, Schedule, Schema, Semaphore } from "effect";
@@ -185,6 +191,27 @@ export interface GatewaySnapshots {
    * released. Counted as the release's outcome. Run while the gateway holds the binding's Lease.
    */
   readonly save: (pool: Pool, workspace: string, pod: string) => Effect.Effect<Saved, KubeApiError>;
+  /**
+   * Forgets the snapshots of `workspace` of `pool`, deleted, in the bucket and in every node's
+   * cache that holds them; what cannot be forgotten now is said so, and collected later. Run
+   * while the gateway holds the workspace's binding's Lease.
+   */
+  readonly forget: (pool: Pool, workspace: string) => Effect.Effect<void>;
+  /**
+   * Makes the snapshot `from` of `pool` was released into, if any, the current snapshot of
+   * `to`, its fork, of `into`: the snapshot `to` is then released into, to be recorded so, or
+   * none, where `from` was released into none, or holds it no more, or it cannot be copied
+   * now, why said. Run while the gateway holds the bindings' Leases of both.
+   */
+  readonly copy: (pool: Pool, from: string, into: Pool, to: string) => Effect.Effect<SavedSnapshot | null>;
+  /**
+   * Collects what of main's snapshots no workspace has a use for, whose images hold what its
+   * sessions held, secrets among it, as alasio's own were: the snapshots in the bucket of
+   * workspaces that are gone, which a deletion that could not forget them left; of each
+   * workspace, what its agent says none of its snapshots needs any more; and the images a
+   * node caches that none of them needs, but those a restore may be reading.
+   */
+  readonly collect: Effect.Effect<void>;
 }
 
 /** What bayma's /status says: its execs running and queued, since when none has run, if none does, and its state generation, which a snapshot taken of it live holds it at. */
@@ -687,5 +714,56 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       yield* agents.setReleased(ref(pool, workspace), null).pipe(Effect.catch((error) => Effect.logWarning(`could not record ${named(pool, workspace)}'s release into none: ${error.message}`)));
     }).pipe(withLogScope("snapshots"));
 
-  return { save, saveStopping, endUnsaveable, keepLive, liveSnapshotOf, forgetLive, restoring };
+  /** Whether `pool`'s workspaces are snapshotted: main's alone, as alasio's were. */
+  const snapshotted = (pool: Pool) => snapshots !== null && pool.namespace === mainNamespace;
+
+  const forgetDeleted = (pool: Pool, workspace: string): Effect.Effect<void> =>
+    !snapshotted(pool) ? Effect.void : Effect.gen(function*() {
+      yield* agents.forget(ref(pool, workspace));
+      for (const node of yield* agents.nodes) yield* agents.discard(node, ref(pool, workspace), []);
+      yield* Effect.logInfo(`forgot the snapshots of ${pool.namespace}/${workspace}, deleted`);
+    }).pipe(
+      Effect.catch((error) => Effect.logWarning(`could not forget the snapshots of ${pool.namespace}/${workspace}, deleted, which are collected later: ${error.message}`)),
+      withLogScope("snapshots"),
+    );
+
+  const copy = (pool: Pool, from: string, into: Pool, to: string): Effect.Effect<SavedSnapshot | null> =>
+    !snapshotted(pool) || !snapshotted(into) ? Effect.succeed(null) : Effect.gen(function*() {
+      // Only the snapshot it was released into, or one compacted from that one since, which is the same: not one it has moved on from.
+      const released = yield* agents.released(ref(pool, from));
+      if (!released) return null;
+      const current = yield* agents.current(ref(pool, from));
+      if (current?.snapshot !== released.snapshot && current?.compactedFrom !== released.snapshot) return null;
+      const { snapshot, release } = yield* agents.copy(ref(pool, from), ref(into, to));
+      yield* Effect.logInfo(`gave the fork ${into.namespace}/${to} of ${pool.namespace}/${from} its snapshot ${snapshot}`);
+      return { snapshot, release };
+    }).pipe(
+      Effect.catch((error) => Effect.as(Effect.logWarning(`the fork ${into.namespace}/${to} of ${pool.namespace}/${from} carries no snapshot: ${error.message}`), null)),
+      withLogScope("snapshots"),
+    );
+
+  const collect: Effect.Effect<void> = !snapshots ? Effect.void : Effect.gen(function*() {
+    const there = new Set(yield* agents.listWorkspaces(mainNamespace));
+    const kept = new Map<string, readonly string[]>();
+    for (const workspace of yield* agents.workspaces(mainNamespace)) {
+      const of = { environment: mainNamespace, workspace };
+      if (there.has(workspace)) {
+        kept.set(workspace, yield* agents.collect(of));
+        continue;
+      }
+      yield* agents.forget(of);
+      yield* Effect.logInfo(`forgot the snapshots of ${mainNamespace}/${workspace}, which is gone`);
+    }
+    for (const node of yield* agents.nodes) {
+      for (const held of (yield* agents.holdings(node)).cached.filter((cached) => cached.environment === mainNamespace)) {
+        const keep = kept.get(held.workspace) ?? [];
+        if (held.images.some((digest) => !keep.includes(digest))) yield* agents.discard(node, { environment: mainNamespace, workspace: held.workspace }, keep);
+      }
+    }
+  }).pipe(
+    Effect.catch((error) => Effect.logWarning(`could not collect main's snapshots: ${error.message}`)),
+    withLogScope("snapshots"),
+  );
+
+  return { save, saveStopping, endUnsaveable, keepLive, liveSnapshotOf, forgetLive, restoring, forget: forgetDeleted, copy, collect };
 });
