@@ -28,6 +28,7 @@ import {
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
   OPERATION_LIMIT_SECONDS,
+  POD_IP_VARIABLE,
   RESTORES_FROM_BUCKET_SINCE_VARIABLE,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
@@ -116,6 +117,8 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
             command: ["node", "/opt/alasio/src/node-agent/main.ts"],
             env: [
               { name: "NODE_NAME", valueFrom: { fieldRef: { fieldPath: "spec.nodeName" } } },
+              // Its pod's address, which it serves the bucket to its node's restores on (src/node-agent/store-proxy.ts).
+              { name: POD_IP_VARIABLE, valueFrom: { fieldRef: { fieldPath: "status.podIP" } } },
               { name: NODE_AGENT_TOKEN_VARIABLE, valueFrom: { secretKeyRef: { name: NODE_AGENT_SECRET, key: "token" } } },
               { name: SNAPSHOT_CACHE_BYTES_VARIABLE, value: String(sizeBytes(sessions.snapshots.nodeCache)) },
               { name: RESTORES_FROM_BUCKET_SINCE_VARIABLE, value: NODE_PINS.gvisor.restoresFromBucketSince },

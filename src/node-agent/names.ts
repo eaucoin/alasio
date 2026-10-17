@@ -11,6 +11,16 @@
 export const NODE_AGENT_PORT = 8484;
 
 /**
+ * The port a node agent serves the snapshots bucket on, to its node's restores, on its
+ * pod's address (../node-agent/store-proxy.ts): no network policy admits it, so the node
+ * alone reaches it, as a node reaches the pods it runs.
+ */
+export const STORE_PROXY_PORT = 8485;
+
+/** The variable that gives a node agent its pod's address, which it serves the bucket to its node on. */
+export const POD_IP_VARIABLE = "POD_IP";
+
+/**
  * Where a node keeps the gVisor releases alasio keeps, each in a directory of its own
  * named after it, as its release archive has them: runsc, its shim, and gvisor-bin/, the
  * binaries runsc runs beside it.

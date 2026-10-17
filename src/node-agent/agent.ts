@@ -81,6 +81,7 @@ import { egressGap, type PodAddress } from "./kube-router.ts";
 import { restoresFromBucket, runscVersion } from "./names.ts";
 import { type ReleaseNotInstalled, type Runsc, type RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
 import type { S3Bucket, S3Error } from "./s3.ts";
+import type { StoreProxy, StoreToken } from "./store-proxy.ts";
 import { hostPathOf, readUnder, type UnderRoot } from "./volume.ts";
 
 /** An environment's or a workspace's name: a DNS label, as their namespaces' and Sandboxes' names are. */
@@ -390,7 +391,7 @@ export class ContainerElsewhere extends Schema.TaggedError<ContainerElsewhere>()
 }
 
 /** How preparing a snapshot fails. */
-export type PrepareError = NoSnapshot | Unrestorable | SnapshotCorrupt | S3Error | CacheError | RunscError | StoreUnresolved;
+export type PrepareError = NoSnapshot | Unrestorable | SnapshotCorrupt | S3Error | CacheError | RunscError;
 
 /** How resuming a sandbox fails. */
 export type ResumeError = PoliciesNotInForce | ContainerElsewhere | SnapshotOutlived | HostCommandError | RunscError | ReleaseNotInstalled | S3Error | SnapshotCorrupt;
@@ -437,32 +438,13 @@ export interface NodeAgentOptions {
   readonly cache: SnapshotCache;
   readonly bucket: S3Bucket;
   /**
-   * The bucket as the checkpoint gofer of a restore reads it, from the node: an endpoint the
-   * node reaches, which the agent's own may not be, as a name in the cluster's DNS is not,
-   * and the agent's identity. Looked up as each restore from the bucket is prepared.
+   * The bucket as the checkpoint gofer of a restore reads it, from the node: through the
+   * agent, by a token of the restore's own (./store-proxy.ts).
    */
-  readonly store: Effect.Effect<GoferStore, StoreUnresolved>;
+  readonly storeProxy: StoreProxy;
   readonly host: HostCommands;
   /** The first gVisor release that restores straight from the bucket (restoresFromBucket); none where empty. */
   readonly restoresFromBucketSince: string;
-}
-
-/** The bucket, as the checkpoint gofer reaches it from the node, and with whose credentials. */
-export interface GoferStore {
-  readonly endpoint: string;
-  readonly region: string;
-  readonly bucket: string;
-  readonly accessKeyId: string;
-  readonly secretAccessKey: string;
-}
-
-/** Where the checkpoint gofer reaches the bucket from the node could not be told. */
-export class StoreUnresolved extends Schema.TaggedError<StoreUnresolved>()("StoreUnresolved", {
-  reason: Schema.String,
-}) {
-  override get message(): string {
-    return `the snapshots bucket cannot be reached from the node: ${this.reason}`;
-  }
 }
 
 /** The checkpoint gofer's options file for an image in an S3 store (runsc's checkpoint_restore.md). */
@@ -501,6 +483,13 @@ const HOOK_TIMEOUT = "30s";
 const EVICT_POLL: Duration.Input = "1 minute";
 /** How often a resume looks for a restored pod's rules. */
 const POLICY_POLL = "250 millis";
+/**
+ * How long a restore from the bucket, its sandbox resumed, may read the bucket through the
+ * agent for what its sandbox did not touch first, before its token is revoked: its next
+ * checkpoint, abandon or prepare revokes it before, and an agent that starts again holds none.
+ */
+export const BACKGROUND_READ_MS = 30 * 60_000;
+
 /** The most scans an abandon runs for what runsc runs for a pod, each after the kills of the one before (abandonNow). */
 const ABANDON_SCANS = 10;
 
@@ -612,7 +601,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache, bucket, store, host, restoresFromBucketSince }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache, bucket, storeProxy, host, restoresFromBucketSince }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   const locks = yield* RcMap.make({ lookup: (_workspace: string) => Semaphore.make(1) });
   /** How many operations run on, or wait to run on, each workspace, by its prefix, and compactions write to it: the cache spares those of any. */
   const inFlight = new Map<string, number>();
@@ -969,12 +958,19 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           )
         ),
         Effect.onInterrupt(() => forgetNow(request).pipe(Effect.ignore)),
-        // The sandbox it saved ended.
-        Effect.ensuring(Effect.sync(() => bases.delete(request.containerId))),
+        // The sandbox it saved ended, and its restore's reads of the bucket with it.
+        Effect.ensuring(Effect.sync(() => {
+          bases.delete(request.containerId);
+          storeProxy.revoke(prefixOf(request));
+        })),
       )
       : taken.pipe(
-        // The sandbox runs on from the image it was saved to, which its next checkpoint saves what changed since.
-        Effect.tap((manifest) => Effect.sync(() => bases.set(request.containerId, manifest))),
+        // The sandbox runs on from the image it was saved to, which its next checkpoint saves what
+        // changed since, all of its memory read now: its restore reads the bucket no more.
+        Effect.tap((manifest) => Effect.sync(() => {
+          bases.set(request.containerId, manifest);
+          storeProxy.revoke(prefixOf(request));
+        })),
         // What runsc saved of the writes since its base, which the next would build on, is gone with it.
         Effect.tapError(() => Effect.sync(() => bases.delete(request.containerId))),
         Effect.mapError((error) => failed(`${error.message}; its snapshot is kept, as a live checkpoint that fails changes nothing`)),
@@ -1105,12 +1101,16 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       return missing.length > 0 ? `this node's CPU lacks features it was saved with: ${missing.join(", ")}` : null;
     });
 
-  /** The checkpoint gofer's options for the image `own` of the workspace's, its layers under its own prefix of them, as the bucket keeps them. */
-  const goferOptions = (ref: WorkspaceRef, own: string, { endpoint, region, bucket: name, accessKeyId, secretAccessKey }: GoferStore): string =>
+  /**
+   * The checkpoint gofer's options for the image `own` of the workspace's, its layers under
+   * its own prefix of them, as the bucket keeps them, read through the agent's proxy of the
+   * bucket with `token`, the restore's own, which reads that prefix alone.
+   */
+  const goferOptions = (ref: WorkspaceRef, own: string, { accessKeyId, secretAccessKey }: StoreToken): string =>
     JSON.stringify({
-      endpoint,
-      region,
-      bucket: name,
+      endpoint: storeProxy.endpoint,
+      region: storeProxy.region,
+      bucket: storeProxy.bucket,
       object_prefix: `${prefixOf(ref)}/${LAYERS_DIR}/${own}/`,
       layers_prefix: `${prefixOf(ref)}/${LAYERS_DIR}/`,
       addressing: "path",
@@ -1153,6 +1153,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     exclusive(
       [ref],
       Effect.gen(function*() {
+        // A restore of the workspace before this one is done with, its reads of the bucket with it.
+        storeProxy.revoke(prefixOf(ref));
         const manifest = yield* current(ref);
         if (manifest === null) return yield* new NoSnapshot(ref);
         const { environment, workspace, snapshot, release } = manifest;
@@ -1230,7 +1232,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             if (!(yield* inBucket(ref, layer))) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${layer.digest} is not in the bucket as it was put` });
           }
         }
-        if (imagePath === null) imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, goferOptions(ref, own.digest, yield* store));
+        if (imagePath === null) {
+          imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, goferOptions(ref, own.digest, storeProxy.mint(prefixOf(ref), `${prefixOf(ref)}/${LAYERS_DIR}/`)));
+        }
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
         prepared.set(prefixOf(ref), manifest);
         if (source === "bucket" && !fetchedFirst) yield* fetchLater(ref, manifest);
@@ -1402,6 +1406,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
       // Its sandbox runs from the snapshot it was restored from, which its next checkpoint saves what changed since.
       for (const id of request.containerIds) bases.set(id, from);
+      // Its restore reads what its sandbox did not touch first in the background, for a while yet.
+      storeProxy.revokeIn(prefixOf(request), BACKGROUND_READ_MS);
       return waited;
     }).pipe(
       Effect.tap((waited) =>
@@ -1449,7 +1455,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     });
 
   const abandon = (request: AbandonRequest): Effect.Effect<readonly Killed[], RunscError> =>
-    exclusive([request], abandonNow(request)).pipe(
+    exclusive([request], Effect.sync(() => storeProxy.revoke(prefixOf(request))).pipe(Effect.andThen(abandonNow(request)))).pipe(
       Effect.tap(([killed, found]) =>
         Effect.sync(() => abandons.add(1, { "alasio.node_agent.abandon.outcome": "abandoned" })).pipe(
           Effect.andThen(Effect.annotateCurrentSpan({ "alasio.abandon.killed": killed.length })),

@@ -10,6 +10,7 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { request as httpRequest } from "node:http";
 import { closeSync, constants, type PathLike, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
@@ -46,9 +47,10 @@ import { makeSnapshotCache, RESERVE_BYTES, type SnapshotCache, type Spared } fro
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
 import { egressGap } from "../src/node-agent/kube-router.ts";
 import { makeRunsc, type Runsc, runscFlags } from "../src/node-agent/runsc.ts";
-import { makeS3Bucket } from "../src/node-agent/s3.ts";
+import { makeS3Bucket, sigV4Authorization } from "../src/node-agent/s3.ts";
+import { makeStoreProxy, type StoreProxy } from "../src/node-agent/store-proxy.ts";
 import { NODE_PINS } from "../cli/src/cluster/node.ts";
-import { NODE_AGENT_PORT, restoresFromBucket } from "../src/node-agent/names.ts";
+import { NODE_AGENT_PORT, restoresFromBucket, STORE_PROXY_PORT } from "../src/node-agent/names.ts";
 import { makeOperations } from "../src/node-agent/operations.ts";
 import { serveNodeAgent } from "../src/node-agent/server.ts";
 import { makeNodeAgents } from "../src/sandbox/node-agents.ts";
@@ -180,6 +182,8 @@ interface Node {
   readonly cacheDir: string;
   readonly cache: SnapshotCache;
   readonly host: FakeHost;
+  /** The agent's proxy of the bucket, which its node's restores read through. */
+  readonly storeProxy: StoreProxy;
   readonly agent: NodeAgent;
   readonly restarted: Effect.Effect<NodeAgent, never, Scope.Scope>;
 }
@@ -206,9 +210,9 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
       const [running] = installed;
       if (running !== undefined) for (const id of [CONTAINER, OTHER_CONTAINER]) releases.runs(id, running, SESSIONS, POD);
       const host = fakeHost();
-      const store = Effect.succeed({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-      const restarted = makeNodeAgent({ node: name, nodeRoot: "/", runsc, cache, bucket, store, host: host.host, restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince });
-      return { releases, cacheDir, cache, host, agent: yield* restarted, restarted };
+      const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0 }).pipe(Effect.orDie);
+      const restarted = makeNodeAgent({ node: name, nodeRoot: "/", runsc, cache, bucket, storeProxy, host: host.host, restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince });
+      return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted };
     });
   try {
     await Effect.runPromise(Effect.scoped(body({ s3, node })));
@@ -415,15 +419,19 @@ test("the checkpoint of a sandbox restored from a snapshot, which tracks its wri
       assert.equal(remote.source, "bucket");
       const { files, mode, options } = goferOptionsOf(remote.imagePath);
       assert.deepEqual([files, mode], [["s3_opts.json"], "600"]);
-      assert.deepEqual(options, {
-        endpoint: s3.endpoint,
+      // Through the node agent's proxy of the bucket, by a token of the restore's own: none of the bucket's credentials.
+      const { credentials, ...where } = options as { credentials: { access_key_id: string; secret_access_key: string } };
+      assert.deepEqual(where, {
+        endpoint: third.storeProxy.endpoint,
         region: "us-east-1",
         bucket: "snapshots",
         object_prefix: `main/fs-abc/layers/${own.digest}/`,
         layers_prefix: "main/fs-abc/layers/",
         addressing: "path",
-        credentials: { access_key_id: CREDENTIALS.accessKeyId, secret_access_key: CREDENTIALS.secretAccessKey },
       });
+      assert.match(credentials.access_key_id, /^ALASIO[0-9A-F]{20}$/u);
+      assert.equal(Buffer.from(credentials.secret_access_key, "base64url").length, 32);
+      assert.ok(!JSON.stringify(options).includes(CREDENTIALS.secretAccessKey) && !JSON.stringify(options).includes(CREDENTIALS.accessKeyId));
       // Restored there again once its images are fetched, from the cache: both images, its own, and the one it refers to where runsc finds it.
       yield* fetched(third, delta);
       const prepared = yield* third.agent.prepare(workspace);
@@ -1046,6 +1054,87 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
       assert.equal(resumes(), before);
       s3.objects.delete(manifestKey);
       yield* refused(unkept, /its manifest cannot be read, so whether it may run cannot be told: neither this node nor the bucket holds it/u);
+    })
+  ));
+
+/** The token of the gofer's options in `imagePath`, as the agent gave it. */
+const tokenIn = (imagePath: string) => {
+  const { credentials } = goferOptionsOf(imagePath).options as { credentials: { access_key_id: string; secret_access_key: string } };
+  return { accessKeyId: credentials.access_key_id, secretAccessKey: credentials.secret_access_key };
+};
+
+/** The status of a GET of `key` through `node`'s proxy of the bucket, signed with `token`. */
+const throughProxy = (node: Node, token: { readonly accessKeyId: string; readonly secretAccessKey: string }, key: string): Effect.Effect<number> =>
+  Effect.promise(() =>
+    new Promise<number>((resolve, reject) => {
+      const url = new URL(node.storeProxy.endpoint);
+      const empty = createHash("sha256").update("").digest("hex");
+      const headers: Record<string, string> = { host: url.host, "x-amz-date": new Date().toISOString().replace(/[-:]|\.\d{3}/gu, ""), "x-amz-content-sha256": empty };
+      headers["authorization"] = sigV4Authorization({ method: "GET", path: `/snapshots/${key}`, query: {}, headers: { ...headers }, payloadHash: empty }, { region: "us-east-1", service: "s3" }, token);
+      const asked = httpRequest({ host: url.hostname, port: url.port, path: `/snapshots/${key}`, headers }, (response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      });
+      asked.on("error", reject);
+      asked.end();
+    })
+  );
+
+test("a restore from the bucket reads its own images through the agent by a token of its own, which its sandbox's resume lets read on in the background, and its abandon, its next prepare and its next checkpoint revoke", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const taker = yield* node("node-1");
+      const manifest = yield* taker.agent.checkpoint(request("fs-abc"));
+      const [image] = manifest.layers;
+      assert.ok(image);
+      const own = `main/fs-abc/layers/${image.digest}/pages.img`;
+      const others = (yield* taker.agent.checkpoint(request("fs-other", OTHER_CONTAINER))).layers[0]?.digest;
+      const other = yield* node("node-2");
+      /** Prepared from the bucket, as a node whose cache holds none of it does, once what a prepare before fetched is cleared: the token it was given. */
+      let fetching = false;
+      const preparedRemote = Effect.gen(function*() {
+        if (fetching) yield* fetched(other, manifest);
+        fetching = true;
+        yield* other.cache.clear("main", "fs-abc");
+        const prepared = yield* other.agent.prepare(workspace);
+        assert.equal(prepared.source, "bucket");
+        return tokenIn(prepared.imagePath);
+      });
+      const first = yield* preparedRemote;
+      assert.equal(yield* throughProxy(other, first, own), 200);
+      // The workspace's images alone.
+      assert.equal(yield* throughProxy(other, first, `main/fs-other/layers/${others}/pages.img`), 403);
+      // Prepared again: a token of its own, the one before revoked.
+      const second = yield* preparedRemote;
+      assert.deepEqual([yield* throughProxy(other, first, own), yield* throughProxy(other, second, own)], [403, 200]);
+      // Abandoned: revoked.
+      yield* other.agent.abandon({ ...workspace, namespace: SESSIONS, pod: POD, uid: POD_UID });
+      assert.equal(yield* throughProxy(other, second, own), 403);
+      // Resumed, it reads on, as its restore reads in the background what its sandbox did not touch first.
+      const third = yield* preparedRemote;
+      yield* other.agent.resume(resumeRequest(manifest.snapshot));
+      assert.equal(yield* throughProxy(other, third, own), 200);
+      // Its sandbox checkpointed live, all of its memory read: revoked.
+      const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
+      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
+      mkdirSync(join(volume, ".bayma"));
+      writeFileSync(join(volume, ".bayma", "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
+      writeFileSync(join(volume, ".bayma", "generation.json"), JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation }));
+      other.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/home/agent", source: volume }]);
+      yield* other.agent.checkpoint(live("fs-abc"));
+      assert.equal(yield* throughProxy(other, third, own), 403);
+      // And at its release, its sandbox ending.
+      const fourth = yield* preparedRemote;
+      yield* other.agent.resume(resumeRequest((yield* other.agent.current(workspace))?.snapshot ?? ""));
+      assert.equal(yield* throughProxy(other, fourth, `main/fs-abc/layers/${(yield* other.agent.current(workspace))?.layers[0]?.digest}/pages.img`), 200);
+      yield* other.agent.checkpoint(request("fs-abc"));
+      assert.equal(yield* throughProxy(other, fourth, own), 403);
+      // A prepare from the cache, as of one now held, revokes the one before it too.
+      const fifth = yield* preparedRemote;
+      yield* fetched(other, (yield* other.agent.current(workspace))!);
+      assert.equal((yield* other.agent.prepare(workspace)).source, "cache");
+      assert.equal(yield* throughProxy(other, fifth, own), 403);
     })
   ));
 
@@ -2116,6 +2205,7 @@ test("the agent runs as its own process from its environment, and stops when tol
   const env = {
     PATH: process.env["PATH"],
     NODE_NAME: "node-1",
+    POD_IP: "127.0.0.1",
     ALASIO_NODE_AGENT_TOKEN: "the token",
     S3_ENDPOINT: s3.endpoint,
     S3_REGION: "us-east-1",
@@ -2146,9 +2236,13 @@ test("the agent runs as its own process from its environment, and stops when tol
       }
     })();
     assert.deepEqual(holdings, { node: "node-1", releases: [], cached: [] });
+    // And the bucket, to its node, on its pod's address: refusing what no restore's token signs.
+    const unsigned = await fetch(`http://127.0.0.1:${STORE_PROXY_PORT}/snapshots/main/fs-abc/current.json`);
+    assert.equal(unsigned.status, 403);
+    assert.match(await unsigned.text(), /<Code>AccessDenied<\/Code>/u);
     running.agent.kill("SIGTERM");
     assert.equal(await running.exited, 0);
-    assert.match(running.output(), /\[node-agent\] the node agent of node-1 serves on port 8484, its cache within 5368709120 bytes/u);
+    assert.match(running.output(), /\[node-agent\] the node agent of node-1 serves on port 8484, and the snapshots bucket to its node on 127\.0\.0\.1:8485, its cache within 5368709120 bytes/u);
   } finally {
     await s3.close();
   }

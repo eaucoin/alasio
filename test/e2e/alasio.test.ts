@@ -36,7 +36,7 @@ import { neonStack } from "../../neon/test/stack.ts";
 import { SNAPSHOT_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
 import { POD_TEMPLATE_ANNOTATION, type Sandbox } from "../../src/kube/sandboxes.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
-import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, UNSYNCED_DOWNLOAD_BYTES } from "../../src/node-agent/names.ts";
+import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER } from "./codex-stand-in.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
@@ -1680,6 +1680,34 @@ if (inShard("snapshots")) {
 }
 
 if (inShard("workspaces")) {
+  describe("the node agents' proxy of the snapshots bucket", () => {
+    test("each node reaches its own node agent's proxy of the snapshots bucket, as its restores' gofers do, and no other node, nor a pod, reaches it", async () => {
+      const agents = await nodeAgents();
+      assert.ok(agents.size > 0, "no node agent runs ready");
+      const addresses = new Map<string, string>();
+      for (const [node, agent] of agents) {
+        const address = (await kube.get<V1Pod>(ref("Pod", agent, NAMESPACE)))?.status?.podIP;
+        assert.ok(address, `${agent} has no address`);
+        addresses.set(node, address);
+      }
+      /** What a GET of the proxy at `address` comes to from the node `from`'s own network, unsigned. */
+      const fromNode = (from: string, address: string) =>
+        onNode(from, `timeout 8 wget -q -T 6 -O /dev/null http://${address}:${STORE_PROXY_PORT}/snapshots/main/x 2>&1; true`);
+      for (const [node, address] of addresses) {
+        // Its own node: the proxy answers, refusing what no restore's token signs.
+        assert.match(await fromNode(node, address), /403 Forbidden/u, `${node} to its own agent's proxy`);
+        // Another node: refused before the proxy.
+        for (const other of addresses.keys()) {
+          if (other === node) continue;
+          assert.doesNotMatch(await fromNode(other, address), /HTTP\/1\.1 \d+/u, `${other} reached ${node}'s agent's proxy`);
+        }
+        // A pod, alasio's, which reaches the agent's own API: not its proxy.
+        assert.equal((await inAlasioContainer(["node", "-e", tcp(JSON.stringify(address), STORE_PROXY_PORT)])).trim(), "blocked", `alasio's pod reached ${node}'s agent's proxy`);
+        assert.equal((await inAlasioContainer(["node", "-e", tcp(JSON.stringify(address), NODE_AGENT_PORT)])).trim(), "open");
+      }
+    });
+  });
+
   describe("a session workspace forked from Telegram", () => {
     before(async () => {
       telegram = await forward(TELEGRAM);

@@ -130,8 +130,9 @@ export interface SnapshotCache {
   readonly drop: (environment: string, workspace: string, digest: string) => Effect.Effect<void, CacheError>;
   /**
    * The directory a restore of the snapshot reads from the bucket, made anew: the checkpoint
-   * gofer's options file `name` alone, holding `options`, which name the bucket and the
-   * agent's credentials, readable and writable by its owner only, as the gofer requires.
+   * gofer's options file `name` alone, holding `options`, which name the agent's proxy of the
+   * bucket and the restore's token for it, readable and writable by its owner only, as the
+   * gofer requires of a file of credentials.
    * The workspace is used now.
    */
   readonly prepareRemote: (environment: string, workspace: string, snapshot: string, name: string, options: string) => Effect.Effect<string, CacheError>;
@@ -353,7 +354,7 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
       return attempt(async () => {
         await rm(directory, { recursive: true, force: true });
         await mkdir(directory, { recursive: true, mode: 0o700 });
-        // Owner-only from its making: it holds credentials.
+        // Owner-only from its making: it holds the restore's token.
         await writeFile(join(directory, name), options, { mode: 0o600, flag: "wx" });
       }).pipe(Effect.andThen(use(environment, workspace)), Effect.as(directory));
     },
