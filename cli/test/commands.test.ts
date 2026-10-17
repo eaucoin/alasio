@@ -587,10 +587,10 @@ test("status says each workload's state, and fails when one is not ready", async
   const sleeping = await alasio(["status"]);
   succeeded(sleeping);
   assert.ok(sleeping.printed.includes("  Deployment alasio/alasio-neon-compute: asleep"), sleeping.printed.join("\n"));
-  // A pool whose pods do not run is not ready, as never a pod of it starts: it says so.
+  // A pool whose pods do not run, as none can be scheduled, is not ready, nor waking, as never a pod of it starts: it says so.
   const pools = [...kube.objects.entries()].filter(([path, object]) => path.startsWith("/api/v1/namespaces/alasio-sessions/pods/") && object.metadata.labels?.["alasio.dev/pool"] === "sandboxes-none");
   assert.ok(pools.length > 0);
-  for (const [, pod] of pools) pod.status = { ...pod.status, phase: "Pending" };
+  for (const [, pod] of pools) pod.status = { ...pod.status, phase: "Pending", conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable" }] };
   const unstarted = await alasio(["status"]);
   assert.match(failure(unstarted), /^1 of alasio's \d+ workloads are not ready$/u);
   assert.ok(unstarted.printed.includes("  Deployment alasio-sessions/sandboxes-none: 0 of 1 running"), unstarted.printed.join("\n"));
