@@ -11,7 +11,10 @@
  * names, and that is not pinned, is removed, its RuntimeClass with it. On a cluster in
  * Docker, the releases are its node image's, the pinned ones: a snapshot naming another
  * falls back, as one whose release is not kept does. On a cluster of a kubeconfig, the
- * operator keeps the releases.
+ * operator keeps the releases. A release before gvisor.restoresFromBucketSince, as the
+ * fork's .6, does not end a restore it refuses, which stalls the next pod's teardown for
+ * minutes before the fallback (progress/live-lazy.md); its snapshots, released again under
+ * a later release, leave it unkept over time.
  */
 import type { V1RuntimeClass } from "@kubernetes/client-node";
 import { Effect } from "effect";

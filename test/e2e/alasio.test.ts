@@ -36,7 +36,7 @@ import { neonStack } from "../../neon/test/stack.ts";
 import { SNAPSHOT_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
 import { POD_TEMPLATE_ANNOTATION, type Sandbox } from "../../src/kube/sandboxes.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
-import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, UNSYNCED_DOWNLOAD_BYTES } from "../../src/node-agent/names.ts";
+import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER } from "./codex-stand-in.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
@@ -1481,7 +1481,7 @@ if (inShard("snapshots")) {
       const corrupt = await newSession("none");
       const { sessionId: kept } = await repl.set(corrupt, `checkpointed by ${corrupt}`);
       await untilReleased(corrupt, Date.now());
-      // Read again from the bucket wherever it is restored, where a file of it is not what its manifest says.
+      // Restored straight from the bucket wherever it is, where a file of its image is not as it was put.
       const agents = await nodeAgents();
       for (const pod of agents.values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${corrupt}`], { container: "node-agent" });
       const [node = ""] = agents.keys();
@@ -1490,7 +1490,7 @@ if (inShard("snapshots")) {
       const logged = (await kube.logs(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), "alasio"))
         .split("\n")
         .find((line) => line.includes(`session ${corrupt} is resumed from bayma's checkpoints, not from its snapshot: `));
-      assert.ok(logged?.includes(`'s file ${corrupted.path} is ${corrupted.bytes} bytes of SHA-256 `), `alasio logged no fallback for its corrupted file ${corrupted.path}: ${logged}`);
+      assert.ok(logged?.includes(`is corrupt: its image ${corrupted.image} is not in the bucket as it was put`), `alasio logged no fallback for its corrupted image ${corrupted.image}'s file ${corrupted.path}: ${logged}`);
       const seen = await repl.read(corrupt, kept);
       assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${corrupt}`]);
       assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
@@ -1603,6 +1603,81 @@ if (inShard("snapshots")) {
       }
     });
 
+    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket comes back whole and is saved again, its node's agent stopped as its sandbox reads the rest of it, which the agent's stop waits on`, async (t) => {
+      const big = await newSession("none");
+      const { sessionId: held, sha256 } = await repl.fill(big, BIG_REPL_MEBIBYTES);
+      await untilReleased(big, Date.now());
+      for (const pod of (await nodeAgents()).values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
+      const answered = turn(`hello with ${BIG_REPL_MEBIBYTES} MiB, its node's agent stopped`);
+      // Its sandbox resumed, reading the rest of it in the background: its node's agent stopped, as a rollout stops it.
+      const node = await until(`the restored pod of ${big} resumed`, async () => {
+        const pod = await kube.get<V1Pod>(ref("Pod", big, SESSIONS));
+        return pod?.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True") ? pod.spec?.nodeName : undefined;
+      }, 600_000);
+      const agent = (await nodeAgents()).get(node);
+      assert.ok(agent, `no node agent runs ready on ${node}`);
+      const stoppedAt = Date.now();
+      await kube.remove(ref("Pod", agent, NAMESPACE));
+      try {
+        // What it says as it stops, read until it is gone.
+        let logged = "";
+        await until(`the node agent ${agent} gone`, async () => {
+          logged = await kube.logs(NAMESPACE, agent, "node-agent").catch(() => logged);
+          return (await kube.get(ref("Pod", agent, NAMESPACE))) === null ? true : undefined;
+        }, 1_800_000);
+        t.diagnostic(`the node agent ${agent} was gone ${Date.now() - stoppedAt} ms after it was stopped`);
+        assert.match(logged, new RegExp(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: 1 read it now`, "u"));
+        await answered;
+        const summed = await repl.sum(big, held);
+        assert.equal(summed.sha256, sha256);
+        assert.match(summed.notice ?? "", CAME_BACK_WHOLE);
+      } finally {
+        await until(`a node agent ready again on ${node}`, async () => ((await nodeAgents()).has(node) ? true : undefined), 300_000);
+      }
+      // Saved again, as a sandbox whose background reads failed could be no more.
+      await untilReleased(big, Date.now());
+      assert.ok(await snapshotOf(big), `the session ${big} was released with no snapshot`);
+    });
+
+    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket whose node's agent is killed outright as its sandbox reads the rest, which no stop can wait on, comes back from bayma's checkpoints, as bayma tells its next exec`, async (t) => {
+      const big = await newSession("none");
+      const { sessionId: kept } = await repl.set(big, `checkpointed by ${big}`);
+      await repl.fill(big, BIG_REPL_MEBIBYTES);
+      await untilReleased(big, Date.now());
+      for (const pod of (await nodeAgents()).values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
+      const answered = turn(`hello with ${BIG_REPL_MEBIBYTES} MiB, its node's agent killed`).catch((error: unknown) => String(error));
+      const node = await until(`the restored pod of ${big} resumed`, async () => {
+        const pod = await kube.get<V1Pod>(ref("Pod", big, SESSIONS));
+        return pod?.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True") ? pod.spec?.nodeName : undefined;
+      }, 600_000);
+      const agent = (await nodeAgents()).get(node);
+      assert.ok(agent, `no node agent runs ready on ${node}`);
+      const restored = (await kube.get<V1Pod>(ref("Pod", big, SESSIONS)))?.metadata?.uid;
+      // As a crash, or the kernel's OOM killer, ends it.
+      const killed = kubectl(["delete", "pod", agent, "--namespace", NAMESPACE, "--grace-period=0", "--force"]);
+      assert.ok(killed.ok, killed.said);
+      try {
+        await answered;
+        // Its sandbox, which read not all of itself, ends, or, run on, is ended as no save of it can be taken.
+        const how = await until(`the restored sandbox of ${big} ended`, async () => {
+          const sandbox = await kube.get<Sandbox>(ref("Sandbox", big, SESSIONS));
+          if (sandbox?.spec.operatingMode === "Suspended") return "suspended, as it could be saved no more";
+          const pod = await kube.get<V1Pod>(ref("Pod", big, SESSIONS));
+          const bayma = pod?.status?.containerStatuses?.find(({ name }) => name === "bayma");
+          if (!pod || pod.metadata?.uid !== restored) return "its pod gone";
+          if (pod.status?.phase === "Failed" || bayma?.state?.terminated || (bayma?.restartCount ?? 0) > 0) return `its pod's bayma ended: ${JSON.stringify(bayma?.state?.terminated ?? bayma?.lastState?.terminated)}`;
+          return undefined;
+        }, 900_000);
+        t.diagnostic(`the restored sandbox of ${big} ended so: ${how}`);
+      } finally {
+        await until(`a node agent ready again on ${node}`, async () => ((await nodeAgents()).has(node) ? true : undefined), 300_000);
+      }
+      await turn("hello after its node's agent died");
+      const seen = await repl.read(big, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${big}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+    });
+
     test("a session released before alasio up changes the sessions' template is restored onto the one it was taken on, which the admission policy pins whole beside the new one, and admits no variant of", async (t) => {
       const taken = await newSession("none");
       const { sessionId: kept } = await repl.set(taken, `taken on the template before by ${taken}`);
@@ -1680,6 +1755,37 @@ if (inShard("snapshots")) {
 }
 
 if (inShard("workspaces")) {
+  describe("the node agents' proxy of the snapshots bucket", () => {
+    test("each node reaches its own node agent's proxy of the snapshots bucket, as its restores' gofers do, and no other node, nor a pod, alasio's or a session's, reaches it", async () => {
+      const session = await newSession("none");
+      const agents = await nodeAgents();
+      assert.ok(agents.size > 0, "no node agent runs ready");
+      const addresses = new Map<string, string>();
+      for (const [node, agent] of agents) {
+        const address = (await kube.get<V1Pod>(ref("Pod", agent, NAMESPACE)))?.status?.podIP;
+        assert.ok(address, `${agent} has no address`);
+        addresses.set(node, address);
+      }
+      /** What a GET of the proxy at `address` comes to from the node `from`'s own network, unsigned: its status line, as GNU's wget and BusyBox's both show it with -S. */
+      const fromNode = (from: string, address: string) =>
+        onNode(from, `timeout 8 wget -S -T 6 -O /dev/null http://${address}:${STORE_PROXY_PORT}/snapshots/main/x 2>&1; true`);
+      for (const [node, address] of addresses) {
+        // Its own node: the proxy answers, refusing what no restore's token signs.
+        assert.match(await fromNode(node, address), /403 Forbidden/u, `${node} to its own agent's proxy`);
+        // Another node: refused before the proxy.
+        for (const other of addresses.keys()) {
+          if (other === node) continue;
+          assert.doesNotMatch(await fromNode(other, address), /HTTP\/1\.1 \d+/u, `${other} reached ${node}'s agent's proxy`);
+        }
+        // A pod, alasio's, which reaches the agent's own API: not its proxy.
+        assert.equal((await inAlasioContainer(["node", "-e", tcp(JSON.stringify(address), STORE_PROXY_PORT)])).trim(), "blocked", `alasio's pod reached ${node}'s agent's proxy`);
+        assert.equal((await inAlasioContainer(["node", "-e", tcp(JSON.stringify(address), NODE_AGENT_PORT)])).trim(), "open");
+        // Nor a session's, which a restore from the bucket runs in.
+        assert.equal((await inSession(session, tcp(JSON.stringify(address), STORE_PROXY_PORT))).trim(), "blocked", `the session ${session} reached ${node}'s agent's proxy`);
+      }
+    });
+  });
+
   describe("a session workspace forked from Telegram", () => {
     before(async () => {
       telegram = await forward(TELEGRAM);

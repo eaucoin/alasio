@@ -35,6 +35,8 @@ export class RunscError extends Schema.TaggedError<RunscError>()("RunscError", {
   release: Schema.String,
   command: Schema.String,
   reason: Schema.String,
+  /** The status runsc exited with, where it ran and exited. */
+  exitCode: Schema.optional(Schema.Number),
 }) {
   override get message(): string {
     return `runsc ${this.command} of ${this.release} failed: ${this.reason}`;
@@ -146,6 +148,17 @@ export interface CompactOptions {
   readonly output: string;
 }
 
+/**
+ * Why `runsc image verify --host` finds an image unrestorable, by the status it exits with
+ * (runsc/cmd/image/image.go): malformed or corrupt (3), a layer of it missing (4), or not
+ * restorable by this runsc on this host (5): another version's, saved with a CPU feature
+ * this one lacks, or on a platform it has not.
+ */
+export const VERIFY_STATUSES = { invalid: 3, layerNotFound: 4, notRestorable: 5 } as const;
+
+/** What `runsc image verify --host` found of an image: restorable, or why not, by its exit status, and what it said. */
+export type Verified = { readonly restorable: true } | { readonly restorable: false; readonly status: number; readonly said: string };
+
 /** The node's releases and their runsc; see makeRunsc. */
 export interface Runsc {
   /** The releases installed on this node, in order. */
@@ -158,13 +171,6 @@ export interface Runsc {
   /** Resumes a container, by its runtime's id, of a sandbox restored paused; one that runs already is left so. */
   readonly resume: (release: string, containerId: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   readonly inspect: (release: string, imagePath: string) => Effect.Effect<InspectedImage, RunscError | ReleaseNotInstalled>;
-  /**
-   * Checks that the image `imagePath` is whole, as `runsc image verify` does: the checksums
-   * and consistency of its pages metadata, and the identity and size of each of its layers,
-   * which it finds in its `layers/`. Fails, saying what is not, otherwise. It reads none of
-   * its pages.
-   */
-  readonly verify: (release: string, imagePath: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   /** The digests of the images an image holds pages of besides its own, its layers, which a restore of it reads too. */
   readonly layers: (release: string, imagePath: string) => Effect.Effect<readonly string[], RunscError | ReleaseNotInstalled>;
   /**
@@ -174,6 +180,14 @@ export interface Runsc {
    * priorities, as nothing waits on it.
    */
   readonly compact: (release: string, options: CompactOptions) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
+  /**
+   * Whether this node's `release` restores the image at `imagePath`, its layers where a
+   * restore finds them, as `runsc image verify --host` says: whole (the checksums and
+   * consistency of its pages metadata, and the identity and size of each of its layers, read
+   * from its `layers/`, none of its pages), and of this runsc, this node's CPU and platform
+   * (VERIFY_STATUSES); fails where runsc could not tell.
+   */
+  readonly verify: (release: string, imagePath: string) => Effect.Effect<Verified, RunscError | ReleaseNotInstalled>;
   /** The CPU features of this node, by the names `release` gives them. */
   readonly cpuFeatures: (release: string) => Effect.Effect<readonly string[], RunscError | ReleaseNotInstalled>;
   /**
@@ -298,12 +312,15 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
           const [file = "", ...rest] = lowest ? [...LOWEST_PRIORITY, ...argv] : argv;
           return new Promise<Ran>((resolve, reject) => {
             execFile(file, rest, { signal, maxBuffer: MAX_OUTPUT_BYTES }, (error, stdout, stderr) => {
-              if (error) reject(new Error(stderr.trim() || error.message));
+              if (error) reject(Object.assign(new Error(stderr.trim() || stdout.trim() || error.message), { exitCode: typeof error.code === "number" ? error.code : undefined }));
               else resolve({ stdout });
             });
           });
         },
-        catch: (cause) => new RunscError({ release, command: command.join(" "), reason: cause instanceof Error ? cause.message : String(cause) }),
+        catch: (cause) => {
+          const exitCode = (cause as { readonly exitCode?: number }).exitCode;
+          return new RunscError({ release, command: command.join(" "), reason: cause instanceof Error ? cause.message : String(cause), ...(exitCode === undefined ? {} : { exitCode }) });
+        },
       })),
     );
 
@@ -356,9 +373,16 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         })),
       ),
 
-    verify: (release, imagePath) => run(release, ["image", "verify"], [imagePath]).pipe(Effect.asVoid),
-
     layers: (release, imagePath) => run(release, ["image", "layers"], [imagePath]).pipe(Effect.map(({ stdout }) => stdout.split("\n").filter(Boolean))),
+
+    verify: (release, imagePath) =>
+      run(release, ["image", "verify"], ["--host", imagePath]).pipe(
+        Effect.as({ restorable: true } as Verified),
+        Effect.catchIf(
+          (error): error is RunscError => error._tag === "RunscError" && Object.values(VERIFY_STATUSES).includes(error.exitCode as never),
+          (error) => Effect.succeed({ restorable: false, status: error.exitCode ?? 0, said: error.reason } as Verified),
+        ),
+      ),
 
     compact: (release, { imagePath, layerPath, output }) =>
       run(release, ["image", "compact"], [`--output=${output}`, `--layer-path=${layerPath}`, "--working-set-first", imagePath], true).pipe(Effect.asVoid),

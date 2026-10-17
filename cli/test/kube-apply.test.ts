@@ -203,6 +203,57 @@ test("a workload that does not run is waited for until the timeout, which says w
   assert.ok(progress.includes("waiting for alasio (0 of 1 available)"));
 });
 
+test("a workload one of whose pods stops within its grace, as a node agent's does while restores read the bucket through it, is waited for past the timeout until it is gone, the wait saying so", { timeout: 60_000 }, async (t) => {
+  const { kube, progress, run } = await rig(t);
+  kube.stuck.add("alasio-node-agent");
+  const STOPPING = "/api/v1/namespaces/alasio/pods/alasio-node-agent-before";
+  /** The agent's pod before, stopping as its grace lets it until `until`, and what it logged last; held there past it, as by a finalizer, until the test removes it. */
+  const stopping = (until: Date) => {
+    kube.put("pods", {
+      apiVersion: "v1",
+      kind: "Pod",
+      metadata: {
+        name: "alasio-node-agent-before",
+        namespace: "alasio",
+        labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "node-agent" },
+        deletionTimestamp: until.toISOString(),
+        finalizers: ["example.com/held"],
+      },
+      spec: { nodeName: "machine", containers: [{ name: "node-agent", image: "alasio" }] },
+      status: { phase: "Running" },
+    });
+    kube.logs.set("alasio-node-agent-before/node-agent", "serving\nthe node agent of machine stops once the restores reading the snapshots bucket through it are done: 1 read it now\n");
+  };
+  const until = new Date(Date.now() + 60_000);
+  stopping(until);
+  let ended = false;
+  const applied = run(applyInstallation(objectsOf(), { timeout: "300 millis", poll: "10 millis" })).finally(() => (ended = true));
+  // Once it waits, past its timeout, it waits on, saying for what.
+  for (let waited = 0; !progress.some((line) => line.startsWith("waiting for ")); waited++) {
+    assert.ok(waited < 3000, progress.join("\n"));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  assert.equal(ended, false);
+  assert.ok(
+    progress.includes(`waiting for alasio-node-agent (0 of 1 nodes ready; pod alasio-node-agent-before on machine stopping, as it may until ${until.toISOString()}, last saying: the node agent of machine stops once the restores reading the snapshots bucket through it are done: 1 read it now)`),
+    progress.join("\n"),
+  );
+  // Gone, the agent after it ready: done.
+  kube.objects.delete(STOPPING);
+  const agents = kube.get("/apis/apps/v1/namespaces/alasio/daemonsets/alasio-node-agent");
+  assert.ok(agents);
+  agents.status = { ...agents.status, numberReady: 1 };
+  await applied;
+
+  // One past its grace, which the kubelet ends, holds no wait.
+  kube.stuck.add("alasio-node-agent");
+  stopping(new Date(Date.now() - 1000));
+  const error = await run(Effect.flip(applyInstallation(objectsOf(), { timeout: "300 millis", poll: "10 millis" })));
+  assert.equal(error._tag, "NotReadyInTime");
+  assert.match(error.message, /^not ready within 0\.3s, still waiting for:\n {2}DaemonSet alasio\/alasio-node-agent: 0 of 1 nodes ready; pod alasio-node-agent-before on machine stopping/u);
+});
+
 test("a Job that fails fails the apply, saying why, before any workload is applied", async (t) => {
   const { kube, run } = await rig(t);
   kube.failing.add("alasio-neon-setup");

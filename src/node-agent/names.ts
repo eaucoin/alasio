@@ -11,6 +11,16 @@
 export const NODE_AGENT_PORT = 8484;
 
 /**
+ * The port a node agent serves the snapshots bucket on, to its node's restores, on its
+ * pod's address (../node-agent/store-proxy.ts): no network policy admits it, so the node
+ * alone reaches it, as a node reaches the pods it runs.
+ */
+export const STORE_PROXY_PORT = 8485;
+
+/** The variable that gives a node agent its pod's address, which it serves the bucket to its node on. */
+export const POD_IP_VARIABLE = "POD_IP";
+
+/**
  * Where a node keeps the gVisor releases alasio keeps, each in a directory of its own
  * named after it, as its release archive has them: runsc, its shim, and gvisor-bin/, the
  * binaries runsc runs beside it.
@@ -19,6 +29,31 @@ export const GVISOR_RELEASES = "/usr/local/lib/alasio/gvisor";
 
 /** The directory of gVisor's `release` on a node. */
 export const gvisorDirectory = (release: string): string => `${GVISOR_RELEASES}/${release}`;
+
+/**
+ * Whether gVisor's `release` restores a sandbox straight from the bucket, its images read
+ * through the checkpoint gofer as the restore goes: one of the fork's at or past `since`,
+ * the first release that does, as cluster/node/pins.json says it (restoresFromBucketSince)
+ * and the installation gives the node agent it (RESTORES_FROM_BUCKET_SINCE_VARIABLE), by
+ * its base's date and patch, then its own number. One before it, as the fork's
+ * 20260921.0-eaucoin.6, which ends the sandbox as it tries (`urpc method
+ * "containerManager.Restore" failed: EOF`), is fetched into the node's cache first and
+ * restored from there; so is one that names no release of the fork's, and every release
+ * where `since` names none.
+ */
+export function restoresFromBucket(release: string, since: string): boolean {
+  const parts = (named: string) => {
+    const matched = /^(\d{8})\.(\d+)-eaucoin\.(\d+)$/u.exec(named);
+    return matched ? matched.slice(1).map(Number) : null;
+  };
+  const [of, first] = [parts(release), parts(since)];
+  if (of === null || first === null) return false;
+  const differs = of.findIndex((part, index) => part !== first[index]);
+  return differs === -1 || (of[differs] ?? 0) > (first[differs] ?? 0);
+}
+
+/** The variable that gives the node agent the first gVisor release that restores straight from the bucket (restoresFromBucket). */
+export const RESTORES_FROM_BUCKET_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_FROM_BUCKET_SINCE";
 
 /** Where k3s's containerd reads its template, and runsc its options. */
 export const CONTAINERD = "/var/lib/rancher/k3s/agent/etc/containerd";
@@ -94,6 +129,44 @@ export const SNAPSHOT_CACHE_BYTES_VARIABLE = "ALASIO_SNAPSHOT_CACHE_BYTES";
 /**
  * How long a checkpoint, a prepare or a copy may take: a sandbox's memory, through the store,
  * both ways, or within it. alasio waits for one so long, and an agent that stops lets the
- * ones it runs end within it (./operations.ts).
+ * ones it runs end within it (./operations.ts), after its restores' reads (nodeAgentStopSeconds).
  */
 export const OPERATION_LIMIT_SECONDS = 15 * 60;
+
+/**
+ * How long a restore from the bucket may take from its prepare to its resume, which its token
+ * lasts unless resumed before (./store-proxy.ts): well beyond the longest it takes, alasio
+ * waiting 3 minutes for its pod to run (POD_RUNNING_TIMEOUT in src/sandbox/snapshots.ts), then
+ * for the agent's resume.
+ */
+export const RESTORE_PREPARED_FOR_SECONDS = 15 * 60;
+
+/** The variable holding how long, in seconds, a resumed restore from the bucket may read it through the node agent (backgroundReadSeconds). */
+export const BACKGROUND_READ_SECONDS_VARIABLE = "ALASIO_BACKGROUND_READ_SECONDS";
+
+/**
+ * The slowest a resumed restore is taken to read the rest of its sandbox through the node
+ * agent, in the background: half of what gate 4 measured on a runner's bundled SeaweedFS,
+ * 8.7 MB/s through the agent's proxy from the restore's start to its last read
+ * (program/progress/live-lazy.md).
+ */
+export const BACKGROUND_READ_BYTES_PER_SECOND = 4 * 1024 ** 2;
+
+/**
+ * How long a resumed restore of a sandbox of at most `memoryBytes` may read the rest of it
+ * through the node agent, at the slowest (BACKGROUND_READ_BYTES_PER_SECOND), in seconds: a
+ * minute at least.
+ */
+export function backgroundReadSeconds(memoryBytes: number): number {
+  return Math.max(60, Math.ceil(memoryBytes / BACKGROUND_READ_BYTES_PER_SECOND));
+}
+
+/**
+ * How long a node agent that stops may take, its sandboxes of at most `memoryBytes`: the
+ * restores that read the bucket through it done first, each within its token's time (as
+ * long as one takes from its prepare to its resume, or to read its sandbox whole once
+ * resumed), then the checkpoints, prepares and copies it runs (OPERATION_LIMIT_SECONDS).
+ */
+export function nodeAgentStopSeconds(memoryBytes: number): number {
+  return Math.max(RESTORE_PREPARED_FOR_SECONDS, backgroundReadSeconds(memoryBytes)) + OPERATION_LIMIT_SECONDS;
+}

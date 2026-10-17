@@ -109,7 +109,18 @@ const restoreDuration = meter.createHistogram("alasio.sandbox.restore.duration",
 type Taken =
   | { readonly outcome: "snapshotted"; readonly saved: SavedSnapshot }
   | { readonly outcome: "kept" }
-  | { readonly outcome: "lost" | "failed"; readonly why: string };
+  | { readonly outcome: "lost" | "failed" | "unsaveable"; readonly why: string };
+
+/**
+ * What a node agent answers of a checkpoint whose sandbox can be saved no more, its restore
+ * from the bucket having failed to read some of its pages (../node-agent/agent.ts
+ * SandboxUnsaveable): no checkpoint of it will be taken, so it is ended, to come back from
+ * bayma's checkpoints, rather than left running unsaved.
+ */
+const UNSAVEABLE_STATUS = 410;
+
+/** Whether `error`, a checkpoint's, says its sandbox can be saved no more. */
+const unsaveable = (error: NodeAgentError | KubeApiError): boolean => error._tag === "NodeAgentError" && error.status === UNSAVEABLE_STATUS;
 
 /** Why a session with a snapshot was resumed without it. */
 export type Fallback = "release" | "template" | "stale" | "node" | "prepare" | "restore" | "unreadable";
@@ -539,8 +550,9 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
   /**
    * Saves the session's sandbox whole by its node's agent, which ends it: snapshotted, into
    * the snapshot it took; kept, as its pod runs no bayma under gVisor; lost, its sandbox
-   * ended by a save that failed, its REPLs with it; or failed, its sandbox running on, why
-   * said. What becomes of the Sandbox is the caller's.
+   * ended by a save that failed, its REPLs with it; unsaveable, as the agent says no save of
+   * it will be taken; or failed, its sandbox running on, why said. What becomes of the
+   * Sandbox is the caller's.
    */
   const take = (sandbox: StoredSandbox): Effect.Effect<Taken, KubeApiError> => {
     const name = sandbox.metadata.name;
@@ -563,6 +575,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
         yield* Effect.logInfo(`snapshotted session ${name} as ${snapshot} on ${node}: ${bytes} bytes, paused ${pauseMs} ms, uploaded in ${uploadMs} ms`);
         return { outcome: "snapshotted", saved: { snapshot, release } } as const;
       }
+      if (unsaveable(taken.failure)) return { outcome: "unsaveable", why: taken.failure.message } as const;
       // A core Pod, as the API server returns one.
       const after = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
       const ended = after?.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER)?.state?.terminated !== undefined;
@@ -572,8 +585,9 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
 
   /**
    * Saves the session's sandbox for its release, by take: suspended once it is saved, or
-   * once a save that failed has ended it anyway, which bayma's checkpoints keep; left running
-   * otherwise, said why. Counted as the release's outcome.
+   * once a save that failed has ended it anyway, or where none of it will be taken, which
+   * bayma's checkpoints keep; left running otherwise, said why. Counted as the release's
+   * outcome.
    */
   const save = (sandbox: StoredSandbox): Effect.Effect<Saved, KubeApiError> =>
     take(sandbox).pipe(
@@ -581,11 +595,18 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       Effect.flatMap((taken): Effect.Effect<Saved> => {
         if (taken.outcome === "snapshotted") return Effect.succeed({ saved: taken.saved });
         if (taken.outcome === "kept") return Effect.succeed("keep");
+        if (taken.outcome === "unsaveable") return unsaveableEnded(sandbox.metadata.name, taken.why);
         const ended = taken.outcome === "lost";
         return Effect.logWarning(`could not snapshot session ${sandbox.metadata.name}: ${taken.why}; ${ended ? "its sandbox ended, so it is suspended" : "it runs on"}`).pipe(
           Effect.as(ended ? { saved: null } : "keep"),
         );
       }),
+    );
+
+  /** What a release of session `name`, whose sandbox can be saved no more, as `why` says, comes to: suspended into no snapshot, said so, to come back from bayma's checkpoints. */
+  const unsaveableEnded = (name: string, why: string): Effect.Effect<Saved> =>
+    Effect.logWarning(`session ${name} can be saved no more: ${why}; it is suspended, to come back from bayma's checkpoints, as bayma tells its next exec`).pipe(
+      Effect.as({ saved: null }),
     );
 
   // The releases of stopped sessions each node runs at once, RELEASES_PER_NODE, the others
@@ -656,10 +677,10 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
 
   /**
    * Saves the running session's sandbox live by its node's agent, the sandbox running on: the
-   * snapshot it took and the state generation that snapshot holds the session at, or null
-   * where none was taken, said why.
+   * snapshot it took and the state generation that snapshot holds the session at; null where
+   * none was taken, said why; or "unsaveable" where the agent says none of it will be.
    */
-  const saveLive = (sandbox: StoredSandbox): Effect.Effect<{ readonly snapshot: string; readonly generation: number } | null, KubeApiError> => {
+  const saveLive = (sandbox: StoredSandbox): Effect.Effect<{ readonly snapshot: string; readonly generation: number } | null | "unsaveable", KubeApiError> => {
     const name = sandbox.metadata.name;
     const counted = (outcome: string) => Effect.sync(() => liveCheckpoints.add(1, { "alasio.sandbox.live_checkpoint.outcome": outcome }));
     return Effect.gen(function*() {
@@ -680,6 +701,10 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
         podTemplate: { ...sandbox.spec.podTemplate },
         live: { stateDir },
       }).pipe(Effect.result);
+      if (taken._tag === "Failure" && unsaveable(taken.failure)) {
+        yield* counted("unsaveable");
+        return "unsaveable" as const;
+      }
       if (taken._tag === "Failure" || taken.success.live === undefined) {
         yield* counted("failed");
         yield* Effect.logWarning(`could not snapshot session ${name} live, which runs on: ${taken._tag === "Failure" ? taken.failure.message : "its manifest says nothing of the save"}`);
@@ -770,7 +795,18 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
             name,
             saving,
             saveLive(sandbox).pipe(
-              Effect.tap((saved) => Effect.sync(() => (saved ? takenLive.set(name, saved) : undefined))),
+              Effect.flatMap((saved) =>
+                saved === "unsaveable"
+                  // Its next checkpoint would fail as this one did, at its release too: ended now.
+                  ? sandboxes.release(name, () =>
+                    unsaveableEnded(name, "its live checkpoint failed, as every checkpoint of it will").pipe(
+                      Effect.tap(() => Effect.sync(() => releases.add(1, { "alasio.sandbox.release.outcome": "unsaveable" }))),
+                    )).pipe(
+                      Effect.catch((error) => Effect.logWarning(`could not end session ${name}, which can be saved no more: ${error.message}`)),
+                      Effect.asVoid,
+                    )
+                  : Effect.sync(() => void (saved ? takenLive.set(name, saved) : undefined))
+              ),
               Effect.catch((error) => Effect.logWarning(`could not snapshot session ${name} live: ${error.message}`)),
               Effect.asVoid,
               withAlasioSpan("alasio.sandbox.live_checkpoint", { attributes: { "alasio.sandbox.name": name } }),

@@ -43,7 +43,7 @@ export function fakeReleases({ k3s = "v1.99.0+k3s1", gvisor = ["20990101.0"] }: 
   const archives = new Map(gvisor.map((release) => [release, gvisorArchive(release)]));
   const pins: NodePins = {
     k3s: { ...NODE_PINS.k3s, version: k3s, sha256: sha("sha256", binary), installScript: { commit: `commit-of-${k3s}`, sha256: sha("sha256", script) } },
-    gvisor: { releases: [...archives].map(([release, archive]) => ({ release, sha512: sha("sha512", archive) })) },
+    gvisor: { restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince, releases: [...archives].map(([release, archive]) => ({ release, sha512: sha("sha512", archive) })) },
   };
   const from = downloads(pins);
   const served = new Map([
