@@ -14,6 +14,7 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import type {
   KubernetesObject,
   V1ClusterRole,
+  V1ClusterRoleBinding,
   V1ConfigMap,
   V1Container,
   V1CronJob,
@@ -2570,6 +2571,10 @@ describe("security", () => {
       agents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", port: 8484 },
     });
     assert.deepEqual(tokenOf(objects), { name: "ALASIO_NODE_AGENT_TOKEN", valueFrom: { secretKeyRef: { name: "alasio-node-agent", key: "token" } } });
+    // The nodes, read alone, for a restore to go to one that takes the session's pod.
+    assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-nodes").rules, [{ apiGroups: [""], resources: ["nodes"], verbs: ["get"] }]);
+    assert.deepEqual(one<V1ClusterRoleBinding>(objects, "ClusterRoleBinding", "alasio-nodes").subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
+    assert.equal(one<V1ClusterRoleBinding>(objects, "ClusterRoleBinding", "alasio-nodes").roleRef.name, "alasio-nodes");
     assert.ok(sessionsRole(objects).some(({ resources, verbs }) => resources?.includes("pods/status") && verbs.join() === "patch"));
     assert.ok(sessionsRole(objects).some(({ apiGroups, resources, verbs }) => apiGroups?.join() === "networking.k8s.io" && resources?.join() === "networkpolicies" && verbs.join() === "list"));
     // The templates its snapshots restore into are alasio up's to carry forward, not alasio's to record: no role of its own lets it write a ConfigMap.
@@ -2604,6 +2609,7 @@ describe("security", () => {
     assert.equal(sessions(unsnapshotted).snapshots, undefined);
     assert.equal(tokenOf(unsnapshotted), undefined);
     assert.ok(!sessionsRole(unsnapshotted).some(({ resources }) => resources?.includes("pods/status") || resources?.includes("networkpolicies")));
+    assert.deepEqual(all(unsnapshotted, "ClusterRole").filter(({ metadata }) => metadata?.name === "alasio-nodes"), []);
   });
 
   test("lets the host profile's agents restart alasio's own Deployment and nothing else", () => {
