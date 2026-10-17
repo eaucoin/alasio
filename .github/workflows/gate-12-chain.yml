@@ -45,7 +45,7 @@ jobs:
           SOURCE: https://github.com/${{ github.repository }}
         run: |
           declare -A pids
-          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-node:cluster/node"; do
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-log:neon/log" "alasio-collector:neon/collector" "alasio-webhook:webhook" "alasio-node:cluster/node"; do
             name=${image%%:*}
             args=()
             [ "$name" != alasio-node ] || mapfile -t args < <(node tooling/node-image.ts)
