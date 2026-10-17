@@ -75,9 +75,11 @@ export const boundLabels = (pool: Pool, key: string): Readonly<Record<string, st
 
 const selector = (labels: Readonly<Record<string, string>>): string => Object.entries(labels).map(([label, value]) => `${label}=${value}`).join(",");
 
-/** Whether `pod` runs ready, and is not being deleted. */
-export const serving = (pod: V1Pod): boolean =>
-  !pod.metadata?.deletionTimestamp && pod.status?.phase === "Running" && (pod.status.conditions ?? []).some(({ type, status }) => type === "Ready" && status === "True");
+/** Whether `pod` runs, its containers started, and is not being deleted: free to be claimed, as it waits for what it is to serve. */
+export const running = (pod: V1Pod): boolean => !pod.metadata?.deletionTimestamp && pod.status?.phase === "Running";
+
+/** Whether `pod` runs ready, and is not being deleted: serving its binding. */
+export const serving = (pod: V1Pod): boolean => running(pod) && (pod.status?.conditions ?? []).some(({ type, status }) => type === "Ready" && status === "True");
 
 /** A Lease as the API holds it, by its key: null where there is none. */
 export const readLease = Effect.fnUntraced(function*(pool: Pool, key: string): Effect.fn.Return<BindingLease | null, KubeApiError, KubeClient> {
@@ -188,7 +190,8 @@ export const renewLease = Effect.fnUntraced(function*(lease: BindingLease): Effe
 });
 
 /**
- * Claims a free pod of `pool` serving ready for `key`: each tried in turn, from a random
+ * Claims a free pod of `pool` that runs for `key`, ready or not, as one is ready only once
+ * what it serves is readied for it (BindOptions' prepare): each tried in turn, from a random
  * one on, so binders claiming at once mostly try apart, relabelled by an update conditioned
  * on the version read; one another claimed first is passed over. The pod claimed, or null
  * where none was free.
@@ -198,7 +201,7 @@ export const claim = Effect.fnUntraced(function*(pool: Pool, key: string): Effec
   // A pod that was ever bound is never claimed, whatever its labels came to say since: it
   // serves one binding in its life, as a sandbox released can still reach what it was given.
   const free = ((yield* kube.list("v1", "Pod", pool.namespace, selector(freeLabels(pool)))) as V1Pod[]).filter((pod) =>
-    serving(pod) && pod.metadata?.labels?.[BINDING_LABEL] === undefined && pod.metadata?.annotations?.[KEY_ANNOTATION] === undefined
+    running(pod) && pod.metadata?.labels?.[BINDING_LABEL] === undefined && pod.metadata?.annotations?.[KEY_ANNOTATION] === undefined
   );
   const from = Math.floor(Math.random() * free.length);
   for (let n = 0; n < free.length; n += 1) {
@@ -230,10 +233,10 @@ export const releaseLease = Effect.fnUntraced(function*(lease: BindingLease): Ef
   yield* kube.remove("coordination.k8s.io/v1", "Lease", lease.metadata?.namespace ?? "", lease.metadata?.name ?? "", lease.metadata?.resourceVersion);
 });
 
-/** How many of `pool`'s pods are free and serving, and how many of its keys are bound. */
+/** How many of `pool`'s pods are free and running, and how many of its keys are bound. */
 export const counts = Effect.fnUntraced(function*(pool: Pool): Effect.fn.Return<{ readonly free: number; readonly bound: number }, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;
-  const free = ((yield* kube.list("v1", "Pod", pool.namespace, selector(freeLabels(pool)))) as V1Pod[]).filter(serving).length;
+  const free = ((yield* kube.list("v1", "Pod", pool.namespace, selector(freeLabels(pool)))) as V1Pod[]).filter(running).length;
   const leases = (yield* kube.list("coordination.k8s.io/v1", "Lease", pool.namespace, `${POOL_LABEL}=${pool.name}`)) as BindingLease[];
   return { free, bound: leases.filter(({ spec }) => spec?.holderIdentity).length };
 });

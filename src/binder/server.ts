@@ -5,7 +5,7 @@
  *
  * - `POST /bind`: binds the token's key ahead of any request (204), so its pod is got while
  *   nothing waits on it; 503 with a Retry-After where its pool had no pod for it in time.
- * - `GET /counts/<namespace>/<pool>`: `{ free, bound, waiting }`, the pool's free pods serving,
+ * - `GET /counts/<namespace>/<pool>`: `{ free, bound, waiting }`, the pool's free pods running,
  *   its bindings, and the binds waiting for a free pod in every replica of the binder, as
  *   `peers` names them; asked without a token, as KEDA's metrics-api trigger asks.
  * - `GET /waiting/<namespace>/<pool>`: `{ waiting }`, this replica's alone, as its peers ask.

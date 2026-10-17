@@ -118,7 +118,7 @@ test("of binders claiming a pool's free pods at once, each pod is claimed once, 
   }
 });
 
-test("a claim passes over a free pod not serving, and one being deleted", async () => {
+test("a claim takes a free pod that runs, ready or not, and passes over one not yet running, and one being deleted", async () => {
   const of = await pool();
   const kube = binder();
   await run(kube, withKube((client) =>
@@ -129,6 +129,9 @@ test("a claim passes over a free pod not serving, and one being deleted", async 
   await run(kube, withKube((client) => Effect.andThen(client.patch("v1", "Pod", of.namespace, ending!, { metadata: { finalizers: ["alasio.dev/test"] } }), client.remove("v1", "Pod", of.namespace, ending!))));
   assert.equal(await run(kube, claim(of, "sessionfs:workspace")), null);
   await run(kube, withKube((client) => client.patch("v1", "Pod", of.namespace, ending!, { metadata: { finalizers: null } })));
+  // Running, its containers started, not ready, as a pool's pod waits for its workspace: claimed.
+  await run(kube, withKube((client) => client.patchPodStatus(of.namespace, "starting", { status: { phase: "Running", conditions: [{ type: "Ready", status: "False" }] } })));
+  assert.equal((await run(kube, claim(of, "sessionfs:workspace")))?.metadata?.name, "starting");
 });
 
 /** A binder's Binder, binds waiting up to `waitMs`, on a client of its own. */
