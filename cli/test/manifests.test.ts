@@ -50,6 +50,7 @@ import { filerStoreBackupHours } from "../src/manifests/config.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { apiServerUnconfined } from "../src/install.ts";
+import { workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
 import { hookOf } from "../../src/sandbox/snapshots.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
@@ -3357,7 +3358,7 @@ describe("the sandbox service", () => {
     assert.equal(one<V1Service>(objects, "Service", "alasio-sandbox-gateway-peers").spec?.clusterIP, "None");
   });
 
-  test("receives sessions' telemetry in a receiver of its own, which watches its pools' Leases, and mounts workspace storage on each node in a pod of its own, replaced only as it is deleted", () => {
+  test("receives sessions' telemetry in a receiver of its own, which watches its pools' Leases, and mounts workspace storage on each node in a pod of its own, whose replacement takes its mount over first", () => {
     const objects = install();
     const receiver = one<V1Deployment>(objects, "Deployment", "alasio-receiver");
     const env = Object.fromEntries((receiver.spec?.template.spec?.containers[0]?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom?.secretKeyRef]));
@@ -3365,10 +3366,19 @@ describe("the sandbox service", () => {
     const watching = all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio-receiver");
     assert.deepEqual([watching?.metadata?.namespace, watching?.rules], ["alasio-sessions", [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]]);
     const mount = one<V1DaemonSet>(objects, "DaemonSet", "alasio-workspace-mount");
-    assert.deepEqual(mount.spec?.updateStrategy, { type: "OnDelete" });
+    // The new pod beside the old, which it takes the mount over from, by the node's PIDs and JuiceFS's state on the node.
+    assert.deepEqual(mount.spec?.updateStrategy, { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } });
+    assert.equal(mount.spec?.template.spec?.hostPID, true);
     const [juicefs] = mount.spec?.template.spec?.containers ?? [];
-    assert.deepEqual(juicefs?.volumeMounts, [{ name: "workspaces", mountPath: "/var/lib/alasio/workspaces", mountPropagation: "Bidirectional" }]);
-    assert.match(juicefs?.command?.[2] ?? "", /exec juicefs mount --no-bgjob --cache-size 1024 "\$META_URL" \/var\/lib\/alasio\/workspaces$/u);
+    assert.deepEqual(juicefs?.volumeMounts, [
+      { name: "workspaces", mountPath: "/var/lib/alasio/workspaces", mountPropagation: "Bidirectional" },
+      { name: "state", mountPath: "/tmp" },
+      { name: "run", mountPath: "/run/alasio" },
+    ]);
+    assert.deepEqual(mount.spec?.template.spec?.volumes?.[1], { name: "state", hostPath: { path: "/var/lib/alasio/juicefs-state", type: "DirectoryOrCreate" } });
+    assert.deepEqual(juicefs?.command, ["sh", "-c", workspaceMountScript("/var/lib/alasio/workspaces", 1024)]);
+    assert.match(juicefs?.command?.[2] ?? "", /juicefs mount --no-bgjob --cache-size 1024 "\$META_URL" \/var\/lib\/alasio\/workspaces /u);
+    assert.deepEqual(juicefs?.readinessProbe?.exec?.command, ["sh", "-c", workspaceMountReady("/var/lib/alasio/workspaces")]);
     assert.equal(mount.spec?.template.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
   });
 
