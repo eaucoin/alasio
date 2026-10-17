@@ -127,19 +127,24 @@ export class NeonOutboxRepository {
    * message id of the status message it edits, which was sent before it.
    */
   getDue(limit = 20): Effect.Effect<DueOutboxEntry[], StoreError> {
-    return this.#sql.query<DueOutboxEntry>(
-      `select reply.*, edited.telegram_message_id as edited_message_id
+    return this.#sql.query<DueOutboxEntry>(`${this.#due("true")} order by reply.seq limit $1`, [limit]);
+  }
+
+  /** The chat's next entry, if it is due. */
+  getDueOf(chatId: string): Effect.Effect<DueOutboxEntry | null, StoreError> {
+    return this.#sql.query<DueOutboxEntry>(this.#due("reply.chat_id = $1"), [chatId]).pipe(Effect.map(([entry]) => entry ?? null));
+  }
+
+  /** The entries due, of the chats `where` says: each one's next entry, if it is due. */
+  #due(where: string): string {
+    return `select reply.*, edited.telegram_message_id as edited_message_id
        from ${this.#schema}.telegram_outbox reply
        left join ${this.#schema}.telegram_outbox edited on edited.id = reply.edits
-       where reply.state = 'pending' and reply.available_at <= now()
+       where reply.state = 'pending' and reply.available_at <= now() and ${where}
          and not exists (
            select 1 from ${this.#schema}.telegram_outbox earlier
            where earlier.chat_id = reply.chat_id and earlier.state = 'pending' and earlier.seq < reply.seq
-         )
-       order by reply.seq
-       limit $1`,
-      [limit],
-    );
+         )`;
   }
 
   /** The media the reply shows, in the order they were queued. */

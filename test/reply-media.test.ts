@@ -19,6 +19,7 @@ import { findMediaEmbeds, mediaIdsIn, placeMedia, sniffMedia, withoutMediaLines 
 import { toRichMarkdown } from "../src/telegram/rich-markdown.ts";
 import { sessionFsWorkspace } from "../src/workspace/kind.ts";
 import { type BotCall, botApiClient, botApiError, botApiLayer, paramsOf } from "./support/bot-api.ts";
+import { deliverAll } from "./support/outbox.ts";
 import { run, testStore } from "./support/store.ts";
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -213,7 +214,7 @@ test("a reply's media are kept with it until it is sent, by whichever alasio sen
     calls.push(call);
     return { message_id: 1 };
   });
-  await Effect.runPromise(Effect.scoped(Effect.flatMap(Outbox, (outbox) => outbox.deliverDue)).pipe(
+  await Effect.runPromise(Effect.scoped(Effect.flatMap(Outbox, (outbox) => deliverAll(outbox, store))).pipe(
     Effect.provide(Outbox.layer.pipe(Layer.provide([telegram, Layer.succeed(Store, store)]))),
   ));
   assert.deepEqual(calls.map((call) => [call.method, call.files]), [["sendRichMessage", [

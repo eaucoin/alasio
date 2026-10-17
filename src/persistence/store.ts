@@ -6,7 +6,7 @@
  * span them, each in one transaction.
  */
 import type { Update } from "@grammyjs/types";
-import { Context, Duration, Effect, Layer, Schema } from "effect";
+import { Context, Duration, Effect, Layer, Option, Schema } from "effect";
 import type { Pool } from "pg";
 
 import type { HarnessName } from "../harness/names.ts";
@@ -68,7 +68,16 @@ export interface StoreOptions {
   readonly workingDirectory?: string | null | undefined;
   /** The branch environment alasio is, whose state is made its own as it first opens (./branch-start.ts); none for main. */
   readonly branch?: string | null | undefined;
+  /** How long handling a chat's update waits for the chat's handling lock (withHandlingLock): HANDLING_LOCK_TIMEOUT unless a test says. */
+  readonly handlingLockTimeout?: Duration.Input | undefined;
 }
+
+/**
+ * How long handling a chat's update waits for the chat's handling lock before it fails,
+ * and the update is taken again: far longer than an update's handling, so only a holder
+ * that is stuck makes it fail.
+ */
+export const HANDLING_LOCK_TIMEOUT = Duration.seconds(30);
 
 /** Each of alasio's repositories, on one connection or transaction. */
 const repositories = (sql: Sql, schema: string, workingDirectory: string | null) => ({
@@ -88,6 +97,43 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
 
 /** What alasio does with its store; each of it fails as Neon does. */
 type Stored<A> = Effect.Effect<A, StoreError>;
+
+/**
+ * A chat's locks, each held by one at a time of all the alasios on the store: its updates'
+ * handling, and its replies' delivery, apart, so a reply Telegram is slow to take holds
+ * back no update. Each is a transaction's advisory lock, the transaction open on a
+ * connection of its own, let go of however what holds it ends. What its holder marks of
+ * its work is written in that transaction (HandlingMarks, DeliveryMarks), so a lock lost,
+ * as its connection is, rolls back the marks made under it: none outlives its lock.
+ */
+export type ChatLock = "handling" | "delivery";
+
+/** What a chat's handling lock's holder marks of an update, in the lock's transaction. */
+export interface HandlingMarks {
+  /** Keeps an update, unless it is kept already: whether it is yet to be processed. */
+  readonly recordTelegramUpdate: (update: Update) => Stored<boolean>;
+  readonly markTelegramUpdateProcessed: (updateId: number) => Stored<void>;
+}
+
+/** What a chat's delivery lock's holder reads and marks of the chat's outbox, in the lock's transaction. */
+export interface DeliveryMarks {
+  /** The chat's next entry, if it is due. */
+  readonly getDueOutboxOf: (chatId: string) => Stored<DueOutboxEntry | null>;
+  /** Marks an entry delivered: a status message with its message's id, one given up on with why. */
+  readonly markOutboxSent: (id: string, delivered?: { readonly telegramMessageId?: number | null; readonly refused?: string | null }) => Stored<void>;
+  readonly rescheduleOutbox: (id: string, error: unknown, delayMs: number) => Stored<void>;
+  /**
+   * A round trip on the lock's connection: it fails where the connection, and so the lock,
+   * is lost, for its holder to send nothing it may no longer send.
+   */
+  readonly fence: Stored<void>;
+}
+
+/**
+ * What names a chat's lock to Postgres, whose advisory locks are numbers: its text, of the
+ * store's schema, the lock and the chat, which Postgres hashes to one (hashtextextended).
+ */
+export const chatLockName = (schema: string, lock: ChatLock, chatId: string | number): string => `${schema}:${lock}:${chatId}`;
 
 /**
  * A turn's write refused, as another turn has claimed its conversation since
@@ -175,6 +221,20 @@ export class Store extends Context.Service<Store, {
 
   /** Keeps an update, unless it is kept already: whether it is yet to be processed. */
   readonly recordTelegramUpdate: (update: Update) => Stored<boolean>;
+  /**
+   * Runs `work` holding the chat's handling lock (ChatLock), given the marks it makes in
+   * the lock's transaction, waiting while another holds it, as an update waits its turn,
+   * but for the store's handling lock timeout at most: past it, it fails as the store does,
+   * without running `work`.
+   */
+  readonly withHandlingLock: <A, E, R>(chatId: string | number, work: (marks: HandlingMarks) => Effect.Effect<A, E, R>) => Effect.Effect<A, E | StoreError, R>;
+  /**
+   * Runs `work` holding the chat's delivery lock (ChatLock), given the reads and marks it
+   * makes in the lock's transaction, where no other holds it: what it gave, or none,
+   * without running `work`, where another does, which is delivering the chat's replies, so
+   * nothing waits on it holding a connection.
+   */
+  readonly withDeliveryLock: <A, E, R>(chatId: string | number, work: (marks: DeliveryMarks) => Effect.Effect<A, E, R>) => Effect.Effect<Option.Option<A>, E | StoreError, R>;
   readonly markTelegramUpdateProcessed: (updateId: number) => Stored<void>;
   readonly insertMessage: (message: NewMessage) => Stored<string>;
   readonly insertFile: (file: NewFile) => Stored<string>;
@@ -219,6 +279,8 @@ export class Store extends Context.Service<Store, {
   /** Queues an edit of the status message `edits`. */
   readonly enqueueOutboxEdit: (edits: string, edit: NewOutboxStatus) => Stored<string>;
   readonly getDueOutbox: (limit?: number) => Stored<DueOutboxEntry[]>;
+  /** The chat's next entry, if it is due. */
+  readonly getDueOutboxOf: (chatId: string) => Stored<DueOutboxEntry | null>;
   /** The media a queued reply shows, kept with it until it is sent. */
   readonly getOutboxMedia: (id: string) => Stored<MediaAttachment[]>;
   /** Marks an entry delivered: a status message with its message's id, one given up on with why. */
@@ -279,7 +341,7 @@ export class Store extends Context.Service<Store, {
   static readonly layer = (options: StoreOptions): Layer.Layer<Store, StoreError> => Layer.effect(Store, makeStore(options));
 }
 
-const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, workingDirectory = null, branch = null }: StoreOptions) {
+const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, workingDirectory = null, branch = null, handlingLockTimeout = HANDLING_LOCK_TIMEOUT }: StoreOptions) {
   const database = poolDatabase(pool);
   yield* ensureSchema(database, schema);
   if (branch && (yield* startBranch(database, schema, branch))) {
@@ -316,6 +378,35 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
     consumeCallbackAction: (id) => callbacks.consumeCallbackAction(id),
 
     recordTelegramUpdate: (update) => telegramContent.recordTelegramUpdate(update),
+    withHandlingLock: (chatId, work) =>
+      database.transaction((sql) =>
+        // Past the timeout, Postgres fails the wait (lock_not_available), and the transaction with it.
+        sql.query("select set_config('lock_timeout', $1, true)", [`${Duration.toMillis(handlingLockTimeout)}ms`]).pipe(
+          Effect.andThen(sql.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [chatLockName(schema, "handling", chatId)])),
+          Effect.andThen(Effect.suspend(() => {
+            const { telegramContent: locked } = repositoriesOn(sql);
+            return work({
+              recordTelegramUpdate: (update) => locked.recordTelegramUpdate(update),
+              markTelegramUpdateProcessed: (updateId) => locked.markTelegramUpdateProcessed(updateId),
+            });
+          })),
+        )
+      ),
+    withDeliveryLock: (chatId, work) =>
+      database.transaction((sql) =>
+        sql.query<{ taken: boolean }>("select pg_try_advisory_xact_lock(hashtextextended($1, 0)) as taken", [chatLockName(schema, "delivery", chatId)]).pipe(
+          Effect.flatMap(([row]) => {
+            if (!row?.taken) return Effect.succeedNone;
+            const { outbox: locked } = repositoriesOn(sql);
+            return Effect.asSome(work({
+              getDueOutboxOf: (chat) => locked.getDueOf(chat),
+              markOutboxSent: (id, delivered) => locked.markSent(id, delivered),
+              rescheduleOutbox: (id, error, delayMs) => locked.reschedule(id, error, delayMs),
+              fence: Effect.asVoid(sql.query("select 1")),
+            }));
+          }),
+        )
+      ),
     markTelegramUpdateProcessed: (updateId) => telegramContent.markTelegramUpdateProcessed(updateId),
     insertMessage: (message) => telegramContent.insertMessage(message),
     insertFile: (file) => telegramContent.insertFile(file),
@@ -375,6 +466,7 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
     enqueueOutboxStatus: (status) => outbox.enqueueStatus(status),
     enqueueOutboxEdit: (edits, edit) => outbox.enqueueEdit(edits, edit),
     getDueOutbox: (limit) => outbox.getDue(limit),
+    getDueOutboxOf: (chatId) => outbox.getDueOf(chatId),
     getOutboxMedia: (id) => outbox.getMedia(id),
     markOutboxSent: (id, delivered) => outbox.markSent(id, delivered),
     rescheduleOutbox: (id, error, delayMs) => outbox.reschedule(id, error, delayMs),

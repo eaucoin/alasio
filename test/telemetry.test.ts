@@ -21,6 +21,7 @@ import type { Store as StoreService } from "../src/persistence/store.ts";
 import type { Effect as EffectTypes } from "effect";
 import type { Outbox as OutboxService } from "../src/telegram/outbox.ts";
 import type { BotAnswer } from "./support/bot-api.ts";
+import { deliverAll } from "./support/outbox.ts";
 import { forgetfulPersistence, ownTurnsOn } from "./support/persistence.ts";
 
 // alasio records through the OpenTelemetry API; an SDK registered before alasio's modules
@@ -349,7 +350,7 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
       ));
       // The conversation's prompt worker runs the turn, whose reply the outbox delivers.
       await eventually("the turn to end", () => spans.getFinishedSpans().find((span) => span.name === "alasio.turn"));
-      await alasio.runPromise(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
+      await alasio.runPromise(Effect.flatMap(Outbox, (delivery) => deliverAll(delivery, store)));
     });
 
     const update = finishedSpan("alasio.update");
@@ -388,7 +389,7 @@ test("a deferred delivery records what stopped it and keeps its trace", async (t
   spans.reset();
   const turn = await inOtelSpan("test.turn", async (span) => {
     await run(Effect.flatMap(Outbox, (outbox) => outbox.enqueueText({ chatId: "43", text: "reply" })));
-    await run(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
+    await run(Effect.flatMap(Outbox, (delivery) => deliverAll(delivery, store)));
     return span;
   }, ROOT_CONTEXT);
   const delivery = finishedSpan("alasio.delivery");
