@@ -7,19 +7,22 @@
  * something was written, as a load is everything the source has that the lake does not:
  * one is written WAKE_DELAY after the first write since the last, the writes meanwhile in
  * it, and one as alasio starts, for what it wrote before. A record that is not written is
- * logged, and the next write's covers it. Each names the primary's WAL position as it is
+ * logged and written again until it is (LakeWake.over). Each names the primary's WAL position as it is
  * written, past the writes it tells of, which the loader waits for its source, a read
  * replica, to have replayed before it loads (wakeRecord).
  */
 import { readFileSync } from "node:fs";
 
 import { ProduceAcks, Producer } from "@platformatic/kafka";
-import { Context, Duration, Effect, FiberSet, type Scope } from "effect";
+import { Context, Duration, Effect, FiberSet, Schedule, type Scope } from "effect";
 
 import { withLogScope } from "../shared/log.ts";
 
 /** How long after a write its record is written, the writes meanwhile in it: a turn's transcript is written an entry at a time. */
 export const WAKE_DELAY = Duration.seconds(2);
+
+/** How long a record not written waits to be written again: from a second, doubling, to a minute, for as long as the log does not take it. */
+const RETRY = Schedule.min([Schedule.exponential(Duration.seconds(1)), Schedule.spaced(Duration.minutes(1))]);
 
 /** Where the environment's wake topic is: the log's brokers, alasio's principal on them, and the topic. */
 export interface WakeLog {
@@ -73,6 +76,23 @@ export class LakeWake extends Context.Service<LakeWake, {
         ),
         (made) => Effect.promise(() => made.close().catch(() => {})),
       );
+      return yield* LakeWake.over((value) => producer.send({ messages: [{ topic: log.topic, value }] }));
+    }).pipe(withLogScope("lake-wake"));
+
+  /**
+   * What tells the lake's loader by `send`, which writes a record on the wake topic: one
+   * WAKE_DELAY after the first write since the last record, and one as it starts. A record
+   * not written is written again, after `retry`'s waits, until it is: the loader loads on
+   * the records alone, so one lost would leave what it tells of unloaded until the next
+   * write, which may never come. One record is written at a time, and each attempt says
+   * the writes made by then, so the writes made while one is retried are in it, or in the
+   * one after it.
+   */
+  static readonly over = (
+    send: (value: Buffer) => Promise<unknown>,
+    { delay = WAKE_DELAY, retry = RETRY }: { readonly delay?: Duration.Input; readonly retry?: Schedule.Schedule<unknown> } = {},
+  ): Effect.Effect<LakeWake["Service"], never, Scope.Scope> =>
+    Effect.gen(function*() {
       const runFork = yield* FiberSet.makeRuntime();
       // Read as the record is written, after the writes it tells of: those meanwhile
       // write another.
@@ -81,19 +101,32 @@ export class LakeWake extends Context.Service<LakeWake, {
         const read = lsnOf;
         return read === null ? Effect.succeed(null) : Effect.tryPromise({ try: read, catch: errorText });
       }).pipe(Effect.catch((error) => Effect.as(Effect.logWarning(`could not read the primary's WAL position for the lake's loader: ${error}`), null)));
-      const send = Effect.flatMap(position, (lsn) =>
-        Effect.tryPromise({
-          try: () => producer.send({ messages: [{ topic: log.topic, value: wakeRecord(lsn) }] }),
-          catch: errorText,
-        })
-      ).pipe(Effect.catch((error) => Effect.logWarning(`could not tell the lake's loader of transcripts written: ${error}`)));
+      const once = Effect.flatMap(position, (lsn) => Effect.tryPromise({ try: () => send(wakeRecord(lsn)), catch: errorText })).pipe(
+        Effect.tapError((error) => Effect.logWarning(`could not tell the lake's loader of transcripts written, trying again: ${error}`)),
+      );
+      // Whether a record is owed, of writes since the last one begun, and whether one is
+      // being written: the writer writes those owed until none is, one at a time.
       let due = false;
+      let writing = false;
+      const write: Effect.Effect<void> = Effect.suspend(() => {
+        if (!due) {
+          writing = false;
+          return Effect.void;
+        }
+        return Effect.sleep(delay).pipe(
+          Effect.andThen(Effect.sync(() => {
+            due = false;
+          })),
+          Effect.andThen(Effect.retry(once, retry)),
+          Effect.ignore,
+          Effect.andThen(write),
+        );
+      });
       const tell = (): void => {
-        if (due) return;
         due = true;
-        runFork(Effect.sleep(WAKE_DELAY).pipe(Effect.andThen(Effect.sync(() => {
-          due = false;
-        })), Effect.andThen(send)));
+        if (writing) return;
+        writing = true;
+        runFork(write);
       };
       tell();
       return LakeWake.of({
@@ -102,5 +135,5 @@ export class LakeWake extends Context.Service<LakeWake, {
           tell();
         },
       });
-    }).pipe(withLogScope("lake-wake"));
+    });
 }
