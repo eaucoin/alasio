@@ -17,7 +17,8 @@ import type { V1Deployment, V1Pod } from "@kubernetes/client-node";
 import { Clock, Effect } from "effect";
 
 import { type Binder, BindStepFailed } from "../binder/binder.ts";
-import { type Pool } from "../binder/names.ts";
+import type { BindingLease } from "../binder/bindings.ts";
+import { KEY_ANNOTATION, type Pool } from "../binder/names.ts";
 import { type Placement, PlacementRefused } from "../binder/server.ts";
 import { baymaIdleness, IDLE_POLL_MS, makeSweep } from "../binder/sweep.ts";
 import { bindingToken } from "../binder/tokens.ts";
@@ -26,6 +27,7 @@ import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import { volumeIdOfKey } from "../sandbox/names.ts";
 import { hookOf } from "../sandbox/snapshots.ts";
+import type { Events, EventInput } from "../events/events.ts";
 import type { Environments } from "./environments.ts";
 
 /** A session's internet. */
@@ -48,6 +50,8 @@ export interface SessionsOptions {
    * no internet resolves no name, and the variables that say what it exports.
    */
   readonly telemetry?: { readonly host: string; readonly port: number; readonly env: Readonly<Record<string, string>> } | undefined;
+  /** What tells each environment's alasio of what happens to its sessions' bindings (../events/events.ts). */
+  readonly events: Events["Service"];
 }
 
 /** How long a pod's containers are waited for to stop, once its deletion is asked. */
@@ -63,13 +67,15 @@ export interface Sessions {
   readonly place: (key: string, options: Readonly<Record<string, string>>) => Effect.Effect<Placement, PlacementRefused>;
   /** Every pool the gateway binds in now, of every environment there is. */
   readonly pools: Effect.Effect<readonly Pool[]>;
-  /** Releases each bound pod of the gateway's pools that is idle by `now`, as the module says, and says which. */
+  /** Releases each bound pod of the gateway's pools that is idle by `now`, as the module says, and says which, telling of each. */
   readonly sweep: Effect.Effect<readonly string[], KubeApiError>;
+  /** Tells of the binding `lease` of `pool`, let go as its pod went while it was bound, as lost. */
+  readonly lost: (pool: Pool, lease: BindingLease) => Effect.Effect<void>;
 }
 
 /** The gateway's sessions, as the module says, on the node agents, the binder, and the KubeClient. */
 export const makeSessions = Effect.fnUntraced(function*(
-  { environments, pools: poolNames, releaseAfterMs, podPort, bindingKey, idlePollMs = IDLE_POLL_MS, telemetry }: SessionsOptions,
+  { environments, pools: poolNames, releaseAfterMs, podPort, bindingKey, idlePollMs = IDLE_POLL_MS, telemetry, events }: SessionsOptions,
   agents: NodeAgents,
   binder: Binder["Service"],
 ): Effect.fn.Return<Sessions, never, KubeClient> {
@@ -158,11 +164,36 @@ export const makeSessions = Effect.fnUntraced(function*(
       yield* agents.detach(node, name, containers);
     });
 
+  /** Tells `pool`'s environment's alasio of what `of` says; where `pool`'s environment is gone, no one. */
+  const tell = (pool: Pool, of: (environment: string) => EventInput): Effect.Effect<void> =>
+    Effect.flatMap(environments.ofNamespace(pool.namespace), (environment) => (environment ? events.tell(of(environment.name)) : Effect.void));
+  const subject = (key: string) => ({ kind: "workspace", key }) as const;
+
   const sweep = yield* makeSweep({
     pools,
     idleness: baymaIdleness({ podPort, releaseAfterMs, idlePollMs, bindingKey }),
-    release: (pool: Pool, key: string) => binder.release(pool, key, ({ pod: name }) => endAndDetach(pool, volumeIdOfKey(key) ?? "", name)),
+    release: (pool: Pool, key: string, lease: BindingLease) =>
+      binder.release(pool, key, ({ pod: name }) => endAndDetach(pool, volumeIdOfKey(key) ?? "", name)).pipe(
+        Effect.tap((released) =>
+          released
+            ? tell(pool, (environment) => ({ kind: "workspace.released", environment, source: "sandbox-gateway", subject: subject(key), binding: lease.metadata?.uid ?? "", reason: "idle" }))
+            : Effect.void
+        ),
+      ),
   });
 
-  return { place, pools, sweep };
+  const lost = (pool: Pool, lease: BindingLease): Effect.Effect<void> => {
+    const key = lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
+    return tell(pool, (environment) => ({
+      kind: "workspace.lost",
+      environment,
+      source: "sandbox-gateway",
+      subject: subject(key),
+      binding: lease.metadata?.uid ?? "",
+      pod: lease.spec?.holderIdentity ?? "",
+      reason: "its pod went while it was bound",
+    }));
+  };
+
+  return { place, pools, sweep, lost };
 });

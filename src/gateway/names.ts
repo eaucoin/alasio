@@ -12,6 +12,11 @@ export const GATEWAY_CONFIG_VARIABLE = "ALASIO_GATEWAY_CONFIG";
 export const CALLER_KEY_VARIABLE = "CALLER_KEY";
 export const BINDING_KEY_VARIABLE = "BINDING_KEY";
 
+/** The variables of where the gateway tells of events (../events/events.ts): the log's brokers, its principal's name, and the file of its password. */
+export const EVENTS_BROKERS_VARIABLE = "EVENTS_BROKERS";
+export const EVENTS_USERNAME_VARIABLE = "EVENTS_USERNAME";
+export const EVENTS_PASSWORD_FILE_VARIABLE = "EVENTS_PASSWORD_FILE";
+
 /** The variables of the receiver's port, and of main's sessions' namespace, beside which it takes branch environments' bindings. */
 export const RECEIVER_PORT_VARIABLE = "RECEIVER_PORT";
 export const SESSIONS_NAMESPACE_VARIABLE = "SESSIONS_NAMESPACE";

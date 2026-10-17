@@ -43,7 +43,17 @@ import type {
 } from "@kubernetes/client-node";
 
 import { freeLabels, type Pool } from "../../../src/binder/names.ts";
-import { BINDING_KEY_VARIABLE, CALLER_KEY_VARIABLE, GATEWAY_CONFIG_VARIABLE, type GatewayConfig, RECEIVER_PORT_VARIABLE, SESSIONS_NAMESPACE_VARIABLE } from "../../../src/gateway/names.ts";
+import {
+  BINDING_KEY_VARIABLE,
+  CALLER_KEY_VARIABLE,
+  EVENTS_BROKERS_VARIABLE,
+  EVENTS_PASSWORD_FILE_VARIABLE,
+  EVENTS_USERNAME_VARIABLE,
+  GATEWAY_CONFIG_VARIABLE,
+  type GatewayConfig,
+  RECEIVER_PORT_VARIABLE,
+  SESSIONS_NAMESPACE_VARIABLE,
+} from "../../../src/gateway/names.ts";
 import { BAYMA_CONTAINER, NET_MODE_LABEL } from "../../../src/kube/sandbox-shape.ts";
 import { ATTACH_ROOT, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
 import { imageReference } from "../images.ts";
@@ -67,6 +77,7 @@ import {
   sha256,
 } from "./common.ts";
 import { durationSeconds, type InstallConfig } from "./config.ts";
+import { LOG_BROKERS, logPrincipalSecret } from "./log.ts";
 import { boundBudget } from "./disruption.ts";
 import { priority } from "./priorities.ts";
 import { scaledObject } from "./scalers.ts";
@@ -280,15 +291,19 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
               key(BINDING_KEY_VARIABLE, "binding-key"),
               { name: NODE_AGENT_TOKEN_VARIABLE, valueFrom: { secretKeyRef: { name: componentName("node-agent"), key: "token" } } },
               { name: "POD_IP", valueFrom: { fieldRef: { fieldPath: "status.podIP" } } },
+              // Every environment's events topic, which it writes as its principal on the log (src/events/).
+              { name: EVENTS_BROKERS_VARIABLE, value: LOG_BROKERS },
+              { name: EVENTS_USERNAME_VARIABLE, valueFrom: { secretKeyRef: { name: logPrincipalSecret("sandbox-gateway"), key: "username" } } },
+              { name: EVENTS_PASSWORD_FILE_VARIABLE, value: "/run/alasio/log/password" },
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: GATEWAY }, ...otelEnv(config)] : []),
             ],
             ports: [{ name: "gateway", containerPort: GATEWAY_PORT }],
             readinessProbe: { httpGet: { path: "/healthz", port: "gateway" }, periodSeconds: 5 },
             securityContext: restrictedContainer(),
             resources: config.sessions.gateway.resources,
-            volumeMounts: [{ name: "config", mountPath: "/etc/gateway", readOnly: true }],
+            volumeMounts: [{ name: "config", mountPath: "/etc/gateway", readOnly: true }, { name: "log", mountPath: "/run/alasio/log", readOnly: true }],
           }],
-          volumes: [{ name: "config", configMap: { name: GATEWAY } }],
+          volumes: [{ name: "config", configMap: { name: GATEWAY } }, { name: "log", secret: { secretName: logPrincipalSecret("sandbox-gateway"), items: [{ key: "password", path: "password" }] } }],
         },
       },
     },

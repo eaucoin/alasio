@@ -342,8 +342,8 @@ const kedaOperator = (config: InstallConfig): V1NetworkPolicyPeer =>
     : { namespaceSelector: {}, podSelector: { matchLabels: { "app.kubernetes.io/name": "keda-operator" } } };
 
 /**
- * The log takes its clients on their port from the collector's gateway and the webhook
- * intake, which write to it, and the lake's intake, KEDA's operator (kedaOperator), and
+ * The log takes its clients on their port from the collector's gateway, the webhook intake
+ * and the sandbox gateway, which write to it, and the lake's intake, KEDA's operator (kedaOperator), and
  * each environment's alasio and lake loader, main's and branch environments', which read
  * it, alone; its controllers' port, and its clients' as its brokers reach each other,
  * from its own nodes; and its metrics port from the collector's scraper.
@@ -360,6 +360,7 @@ function logPolicy(config: InstallConfig): NetworkPolicy {
         from: [
           of(GATEWAY_COMPONENT),
           of(WEBHOOK_COMPONENT),
+          ...(sandboxServiceRuns(config) ? [of(SANDBOX_GATEWAY_COMPONENT)] : []),
           of(INTAKE_COMPONENT),
           operator,
           of("alasio"),
@@ -561,7 +562,8 @@ function poolPolicies(config: InstallConfig, environment: Environment): NetworkP
  *   other what is bound on the pods each holds, and KEDA's operator (kedaOperator), which asks
  *   it how many binds wait for a pool, on its port alone; it reaches the cluster's DNS, the
  *   pools' pods of every environment on bayma's port, the node agents, its replicas, the
- *   collector where it runs, and the API server;
+ *   log, which it writes each environment's events to, the collector where it runs, and the
+ *   API server;
  * - the receiver takes the pools' pods alone, of main's sessions and of branch environments',
  *   on its port; it reaches the cluster's DNS, the collector where it runs, and the API server.
  *
@@ -586,6 +588,8 @@ function sandboxServicePolicies(config: InstallConfig, apiServer: ApiServer | nu
         { to: pools, ports: [{ protocol: "TCP", port: POOL_POD_PORT }] },
         { to: [NODE_AGENT], ports: [{ protocol: "TCP", port: NODE_AGENT_PORT }] },
         { to: [SANDBOX_GATEWAY], ports: [{ protocol: "TCP", port: SANDBOX_GATEWAY_PORT }] },
+        // The log, its events written to it.
+        { to: [{ podSelector: { matchLabels: selectorLabels(LOG_COMPONENT) } }], ports: [{ protocol: "TCP", port: LOG_PORT }] },
         ...collector,
         apiServerRule(apiServer),
       ],
