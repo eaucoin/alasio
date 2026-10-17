@@ -42,6 +42,14 @@ export const gvisorDirectory = (release: string): string => `${GVISOR_RELEASES}/
  * where `since` names none.
  */
 export function restoresFromBucket(release: string, since: string): boolean {
+  return releaseAtOrPast(release, since);
+}
+
+/**
+ * Whether gVisor's `release` is the fork's `since` or one past it, by its base's date and
+ * patch, then its own number; never where either names no release of the fork's.
+ */
+export function releaseAtOrPast(release: string, since: string): boolean {
   const parts = (named: string) => {
     const matched = /^(\d{8})\.(\d+)-eaucoin\.(\d+)$/u.exec(named);
     return matched ? matched.slice(1).map(Number) : null;
@@ -51,6 +59,24 @@ export function restoresFromBucket(release: string, since: string): boolean {
   const differs = of.findIndex((part, index) => part !== first[index]);
   return differs === -1 || (of[differs] ?? 0) > (first[differs] ?? 0);
 }
+
+/**
+ * How a restore's checkpoint gofer reads its images: through a socket or over TCP, and
+ * whether it reads again a range of pages a read of failed; as the release that took the
+ * snapshot restores best, which the gateway says of each kept release (gofersOf).
+ */
+export interface Gofer {
+  readonly transport: "socket" | "tcp";
+  readonly pagesRetry: boolean;
+}
+
+/**
+ * The gofer a restore of a snapshot taken under gVisor's `release` asks for: through a socket,
+ * reading again pages a read of failed, of one at or past `since`, the first release that
+ * restores so, as cluster/node/pins.json says it (gvisor.restoresThroughSocketSince); none,
+ * the agent's own way, over TCP, of one before it, and of every release where `since` names none.
+ */
+export const goferOf = (release: string, since: string): Gofer | null => (releaseAtOrPast(release, since) ? { transport: "socket", pagesRetry: true } : null);
 
 /** The variable that gives the node agent the first gVisor release that restores straight from the bucket (restoresFromBucket). */
 export const RESTORES_FROM_BUCKET_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_FROM_BUCKET_SINCE";
