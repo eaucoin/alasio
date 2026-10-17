@@ -4,7 +4,8 @@ import { before, test } from "node:test";
 import type { V1Pod } from "@kubernetes/client-node";
 import { Effect, Fiber, Layer } from "effect";
 
-import { BindStepFailed, BindTimeout, Binder, type BinderOptions } from "../src/binder/binder.ts";
+import { added } from "./support/metrics.ts";
+import { BIND_DURATION, BindStepFailed, BindTimeout, Binder, type BinderOptions } from "../src/binder/binder.ts";
 import { type BindingLease, claim, markReleasing, readLease, reconcile, releaseLease, renewLease, takeLease } from "../src/binder/bindings.ts";
 import { BINDING_LABEL, boundLabels, FREE_LABEL, freeLabels, KEY_ANNOTATION, keyHash, leaseName, type Pool, POOL_LABEL } from "../src/binder/names.ts";
 import { KubeClient } from "../src/kube/client.ts";
@@ -369,4 +370,35 @@ test("a bind that finds a pod bound to the key and not yet held, as a binder tha
   const bound = await bindIn(binderOf({ staleMs: 1_000 }), (each) => each.bind(of, "sessionfs:workspace"));
   assert.notEqual(bound.pod, left?.metadata?.name);
   assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [bound.pod]);
+});
+
+test("each binding a binder makes is timed, by its pool and how its pod came: claimed at once, waited for, or made; a bind of a key bound already is not", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const layer = binderOf({ waitMs: 10_000 });
+  const timed = await added(BIND_DURATION, () =>
+    Effect.runPromise(Effect.provide(Effect.gen(function*() {
+      const each = yield* Binder;
+      yield* each.bind(of, "sessionfs:warm");
+      yield* each.bind(of, "sessionfs:warm");
+      const waiting = yield* Effect.forkChild(each.bind(of, "sessionfs:cold"));
+      for (let tries = 0; (yield* each.waiting(of)) === 0; tries += 1) {
+        assert.ok(tries < 100, "the bind never waited");
+        yield* Effect.sleep(50);
+      }
+      yield* Effect.promise(() => freePods(of, 1, 1));
+      yield* Fiber.join(waiting);
+      yield* each.bind(of, "sessionfs:made", {
+        make: (labels, annotations) =>
+          withKube((client) =>
+            Effect.gen(function*() {
+              const pod = yield* client.create<V1Pod>({ apiVersion: "v1", kind: "Pod", metadata: { name: "made", namespace: of.namespace, labels: { ...labels }, annotations: { ...annotations } }, spec: { containers: [{ name: "bayma", image: "agent" }] } });
+              yield* serve(client, of, "made");
+              return pod;
+            })
+          ).pipe(Effect.provide(binder())),
+      });
+    }), layer)));
+  const of_ = (start: string) => `alasio.binder.pool=sandboxes,k8s.namespace.name=${of.namespace},alasio.binder.start=${start}`;
+  assert.deepEqual(timed, { [of_("warm")]: 1, [of_("cold")]: 1, [of_("made")]: 1 });
 });

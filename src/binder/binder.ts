@@ -9,6 +9,10 @@
  * up to `waitMs`, counted waiting meanwhile, so the pool is scaled for it;
  * one that gives up releases its Lease. A Lease naming a pod gone, as one deleted by hand or
  * evicted, is released, and the key bound anew.
+ *
+ * How long each binding this binder made took, from the bind asked to its pod serving, is
+ * BIND_DURATION's, by its pool and how its pod came: `warm`, a free pod claimed at once;
+ * `cold`, waited for, as its pool was scaled; `made`, its own, as a restore makes one.
  */
 import { randomUUID } from "node:crypto";
 
@@ -16,6 +20,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Clock, Context, Effect, Fiber, Layer, Schema, Semaphore } from "effect";
 
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
+import { meter } from "../telemetry/index.ts";
 import { BINDING_TIMEOUT_MS, type BindingLease, boundPod, claim, holdLease, markReleasing, readLease, RELEASING_ANNOTATION, releaseLease, renewLease, serving, stale, takeLease, unmarkReleasing } from "./bindings.ts";
 import { boundAnnotations, boundLabels, type Pool } from "./names.ts";
 
@@ -35,6 +40,16 @@ export interface BinderOptions {
   readonly renewMs?: number;
   readonly staleMs?: number;
 }
+
+/** The histogram of how long the bindings a binder made took, as the module says. */
+export const BIND_DURATION = "alasio.binder.bind.duration";
+const bindDuration = meter.createHistogram(BIND_DURATION, {
+  description: "How long a binding took, from its bind asked to its pod serving, by its pool and how its pod came: warm, cold or made",
+  unit: "s",
+});
+
+/** How a binding's pod came, as the module says. */
+type PodStart = "warm" | "cold" | "made";
 
 /** A key bound: its binding, its Lease's uid; its pod, and the pod's address. */
 export interface Bound {
@@ -132,19 +147,19 @@ export class Binder extends Context.Service<Binder, {
          * already, as by a binder that ended after it claimed it, readied or not, is deleted
          * first: a pod serves one binding, as it was got for it.
          */
-        const podFor = (pool: Pool, key: string, make: MakePod | undefined, deadline: number, lost: () => boolean): Effect.Effect<V1Pod, KubeApiError | BindTimeout | BindStepFailed> =>
+        const podFor = (pool: Pool, key: string, make: MakePod | undefined, deadline: number, lost: () => boolean): Effect.Effect<{ readonly pod: V1Pod; readonly start: PodStart }, KubeApiError | BindTimeout | BindStepFailed> =>
           Effect.gen(function*() {
             const already = yield* provide(boundPod(pool, key));
             if (already?.metadata?.name) yield* kube.remove("v1", "Pod", pool.namespace, already.metadata.name);
-            if (make) return yield* make(boundLabels(pool, key), boundAnnotations(key));
+            if (make) return { pod: yield* make(boundLabels(pool, key), boundAnnotations(key)), start: "made" as const };
             const claimed = yield* provide(claim(pool, key));
-            if (claimed) return claimed;
+            if (claimed) return { pod: claimed, start: "warm" as const };
             return yield* waitingFor(pool, Effect.gen(function*() {
               for (;;) {
                 yield* Effect.sleep(BIND_POLL_MS);
                 if (lost()) return yield* new BindTimeout({ key, pool: pool.name, waited: "binding" });
                 const pod = yield* provide(claim(pool, key));
-                if (pod) return pod;
+                if (pod) return { pod, start: "cold" as const };
                 if ((yield* Clock.currentTimeMillis) >= deadline) return yield* new BindTimeout({ key, pool: pool.name, waited: "free pod" });
               }
             }));
@@ -188,11 +203,14 @@ export class Binder extends Context.Service<Binder, {
          * meanwhile, which then gets a pod of its own. A bind that gets no pod, or cannot ready
          * the one it got, which is then deleted, lets the Lease go.
          */
-        const underWay = (pool: Pool, key: string, taken: BindingLease, { make, prepare }: BindOptions, deadline: number): Effect.Effect<{ readonly lease: BindingLease; readonly name: string } | null, KubeApiError | BindTimeout | BindStepFailed> =>
+        const underWay = (pool: Pool, key: string, taken: BindingLease, { make, prepare }: BindOptions, deadline: number): Effect.Effect<{ readonly lease: BindingLease; readonly name: string; readonly start: PodStart } | null, KubeApiError | BindTimeout | BindStepFailed> =>
           Effect.gen(function*() {
+            let start: PodStart = "warm";
             const readied = (lost: () => boolean) =>
               Effect.gen(function*() {
-                const pod = yield* podFor(pool, key, make, deadline, lost);
+                const got = yield* podFor(pool, key, make, deadline, lost);
+                const pod = got.pod;
+                start = got.start;
                 if (prepare) {
                   yield* prepare(pod, taken.metadata?.uid ?? "").pipe(
                     Effect.tapError(() => kube.remove("v1", "Pod", pool.namespace, pod.metadata?.name ?? "").pipe(Effect.ignore)),
@@ -204,7 +222,7 @@ export class Binder extends Context.Service<Binder, {
             const { value: pod, lease } = yield* renewing(taken, readied, (held) => provide(releaseLease(held)).pipe(Effect.ignore));
             const name = pod.metadata?.name ?? "";
             const holding = lease ? yield* provide(holdLease(lease, name)) : null;
-            return holding ? { lease: holding, name } : null;
+            return holding ? { lease: holding, name, start } : null;
           });
 
         /**
@@ -230,13 +248,17 @@ export class Binder extends Context.Service<Binder, {
 
         const bind = (pool: Pool, key: string, options: BindOptions = {}): Effect.Effect<Bound, KubeApiError | BindTimeout | BindStepFailed> =>
           Effect.gen(function*() {
-            const deadline = (yield* Clock.currentTimeMillis) + waitMs;
+            const asked = yield* Clock.currentTimeMillis;
+            const deadline = asked + waitMs;
             for (;;) {
               const taken = yield* provide(takeLease(pool, key, binder, staleMs));
               if (taken.taken) {
                 const bound = yield* underWay(pool, key, taken.lease, options, deadline);
                 if (bound === null) continue;
-                return yield* servingBy(pool, key, bound.lease.metadata?.uid ?? "", bound.name, deadline);
+                const served = yield* servingBy(pool, key, bound.lease.metadata?.uid ?? "", bound.name, deadline);
+                const took = ((yield* Clock.currentTimeMillis) - asked) / 1000;
+                bindDuration.record(took, { "alasio.binder.pool": pool.name, "k8s.namespace.name": pool.namespace, "alasio.binder.start": bound.start });
+                return served;
               }
               const holder = taken.lease.spec?.holderIdentity;
               if (taken.lease.metadata?.annotations?.[RELEASING_ANNOTATION]) {
