@@ -12,7 +12,7 @@ import { TestClock } from "effect/testing";
 
 import { added } from "./support/metrics.ts";
 import { Binder } from "../src/binder/binder.ts";
-import { readLease, touchLease } from "../src/binder/bindings.ts";
+import { readLease, releaseLease, takeLease, touchLease } from "../src/binder/bindings.ts";
 import { freeLabels, type Pool } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
 import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
@@ -320,18 +320,57 @@ test("a binding let go as its pod went while it was bound is told of, to its env
   ]);
 });
 
-/** Node agents that keep workspaces as a map of their files, by environment and name, recording each call. */
-function workspaceAgents(): { agents: NodeAgents; calls: string[]; files: Map<string, Map<string, Uint8Array>> } {
+/** Makes the namespace `name`, as a branch's sessions' is made, where it is not there. */
+const namespaced = (name: string) => run(withKube((kube) => kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name } })).pipe(Effect.ignore));
+
+/**
+ * Node agents that keep workspaces as a map of their files, by environment and name, and their
+ * current snapshots and records of what they were released into, as maps of theirs, recording
+ * each call.
+ */
+function workspaceAgents(): {
+  agents: NodeAgents;
+  calls: string[];
+  files: Map<string, Map<string, Uint8Array>>;
+  snapshots: Map<string, { snapshot: string; release: string }>;
+  records: Map<string, { snapshot: string; release: string }>;
+  cached: Map<string, readonly string[]>;
+} {
   const calls: string[] = [];
   const files = new Map<string, Map<string, Uint8Array>>();
+  const snapshots = new Map<string, { snapshot: string; release: string }>();
+  const records = new Map<string, { snapshot: string; release: string }>();
+  // The images node-a caches of each workspace.
+  const cached = new Map<string, readonly string[]>();
   const name = ({ environment, workspace }: { environment: string; workspace: string }) => `${environment}/${workspace}`;
   const missing = (call: string) => new NodeAgentError({ node: "node-a", call, status: 404, reason: "there is no such workspace" });
   const base = agents().agents;
+  const ofName = (each: string) => ({ environment: each.split("/")[0] ?? "", workspace: each.split("/")[1] ?? "" });
   return {
     calls,
     files,
+    snapshots,
+    records,
+    cached,
     agents: {
       ...base,
+      current: (ref) => Effect.sync(() => (snapshots.has(name(ref)) ? ({ ...snapshots.get(name(ref)) } as unknown as Manifest) : null)),
+      released: (ref) => Effect.sync(() => records.get(name(ref)) ?? null),
+      setReleased: (ref, into) => Effect.sync(() => (calls.push(`record ${name(ref)} released into ${into?.snapshot ?? "none"}`), void (into ? records.set(name(ref), into) : records.delete(name(ref))))),
+      copy: (from, to) =>
+        Effect.suspend(() => {
+          calls.push(`copy ${name(from)} ${name(to)}`);
+          const source = snapshots.get(name(from));
+          if (!source) return Effect.fail(missing("copy"));
+          const copied = { snapshot: `${source.snapshot}-copy`, release: source.release };
+          snapshots.set(name(to), copied);
+          return Effect.succeed(copied as unknown as Manifest);
+        }),
+      forget: (ref) => Effect.sync(() => (calls.push(`forget ${name(ref)}`), void snapshots.delete(name(ref)))),
+      discard: (node, ref, keep) => Effect.sync(() => (calls.push(`discard ${node} ${name(ref)} keeping ${keep.join(",") || "none"}`), cached.set(name(ref), (cached.get(name(ref)) ?? []).filter((digest) => keep.includes(digest))), true)),
+      workspaces: (environment) => Effect.sync(() => [...snapshots.keys()].filter((each) => each.startsWith(`${environment}/`)).map((each) => ofName(each).workspace)),
+      collect: (ref) => Effect.sync(() => (calls.push(`collect ${name(ref)}`), [`${snapshots.get(name(ref))?.snapshot}-image`])),
+      holdings: (node) => Effect.sync(() => ({ node, releases: [], cached: [...cached].map(([each, images]) => ({ ...ofName(each), images, bytes: 1, usedAt: "2026-10-17T12:00:00Z" })) })),
       createWorkspace: (ref, quotaBytes) => Effect.sync(() => (calls.push(`create ${name(ref)} ${quotaBytes}`), void files.set(name(ref), files.get(name(ref)) ?? new Map()))),
       removeWorkspace: (ref) => Effect.sync(() => (calls.push(`remove ${name(ref)}`), void files.delete(name(ref)))),
       cloneWorkspace: (from, to, quotaBytes) =>
@@ -381,8 +420,19 @@ test("a caller makes, writes, reads, measures, lists and deletes its own environ
   await Effect.runPromise(binder.bind(placement.pool, key, placement));
   assert.equal((await ask("DELETE", "/workspace")).status, 409);
   await Effect.runPromise(binder.release(placement.pool, key));
+  // Being bound, as by another binder whose bind is under way, it is not deleted either.
+  const under = await run(takeLease(placement.pool, key, "another-binder"));
+  assert.equal((await ask("DELETE", "/workspace")).status, 409);
+  await run(releaseLease(under.lease));
+  // Released into a snapshot, held by node-a's cache: deleted, its snapshots forgotten with it everywhere, under its Lease, let go after.
+  recorded.snapshots.set(`${env.namespace}/fs-own123`, { snapshot: "s-1", release: "r1" });
+  recorded.cached.set(`${env.namespace}/fs-own123`, ["s-1-image"]);
+  recorded.calls.length = 0;
   assert.deepEqual(await ask("DELETE", "/workspace"), { status: 204 });
   assert.equal(recorded.files.has(`${env.namespace}/fs-own123`), false);
+  assert.deepEqual(recorded.calls, [`remove ${env.namespace}/fs-own123`, `forget ${env.namespace}/fs-own123`, `discard node-a ${env.namespace}/fs-own123 keeping none`]);
+  assert.equal(recorded.snapshots.size, 0);
+  assert.equal(await run(readLease(placement.pool, key)), null);
   // An environment there is not, a key of no workspace, and a route there is not.
   assert.equal((await ask("POST", "/workspace", "", { ...claims, options: { environment: "nowhere", mode: "none" } })).status, 403);
   assert.equal((await ask("POST", "/workspace", "", { ...claims, key: "folder:claude:conversation" })).status, 403);
@@ -394,6 +444,7 @@ test("main forks its workspace into a branch of its own, as the branch records m
   const one = { name: "one", namespace: "alasio-branch-one-sessions", parent: "main" };
   const two = { name: "two", namespace: "alasio-branch-two-sessions", parent: "main" };
   const recorded = workspaceAgents();
+  for (const env of [main, one, two]) await namespaced(env.namespace);
   const { sessions } = await sessionsOf({ ...options(main, 7290), environments: found([main, one, two]) }, recorded.agents);
   for (const env of [main, one]) recorded.files.set(`${env.namespace}/fs-shared1`, new Map([["workspace/a", Buffer.from(env.name)]]));
   const fork = (from: SessionsEnvironment, to: string, workspace = "fs-shared1") =>
@@ -415,6 +466,73 @@ test("main forks its workspace into a branch of its own, as the branch records m
     `clone ${main.namespace}/fs-shared1 ${main.namespace}/fs-copy01 ${2 * 1024 ** 3}`,
     `clone ${one.namespace}/fs-shared1 ${one.namespace}/fs-copy02 ${2 * 1024 ** 3}`,
   ]);
+});
+
+test("a fork of main's workspace released into a snapshot into main is given a copy of it, recorded released into it, under both Leases; one of a workspace bound, or into a branch, a clone of its files alone; and none into a fork bound", async () => {
+  const env = await environment(1);
+  const branch = { name: "forked", namespace: "fork-branch-sessions", parent: env.name };
+  const recorded = workspaceAgents();
+  await namespaced(branch.namespace);
+  const { binder, sessions } = await sessionsOf({ ...options(env, 7290), environments: found([env, branch]) }, recorded.agents);
+  const source = `${env.namespace}/fs-source1`;
+  recorded.files.set(source, new Map([["workspace/a", Buffer.from("a")]]));
+  recorded.snapshots.set(source, { snapshot: "s-1", release: "r1" });
+  recorded.records.set(source, { snapshot: "s-1", release: "r1" });
+  const claims = { key: sessionKey("fs-source1"), expires: Date.now() + 60_000, options: { environment: env.name, mode: "none" } };
+  const fork = (environment: string, workspace: string) =>
+    Effect.runPromise(sessions.operate(claims, { method: "POST", path: "/workspace/forks", query: new URLSearchParams(), body: Buffer.from(JSON.stringify({ environment, workspace })) }));
+  assert.deepEqual(await fork(env.name, "fs-fork0001"), { status: 204 });
+  assert.deepEqual(recorded.calls, [
+    `clone ${source} ${env.namespace}/fs-fork0001 ${2 * 1024 ** 3}`,
+    `copy ${source} ${env.namespace}/fs-fork0001`,
+    `record ${env.namespace}/fs-fork0001 released into s-1-copy`,
+  ]);
+  for (const workspace of ["fs-source1", "fs-fork0001"]) assert.equal(await run(readLease(env.none, sessionKey(workspace))), null, `${workspace}'s Lease is let go`);
+  // Into a branch, whose sessions are not snapshotted: its files alone.
+  recorded.calls.length = 0;
+  assert.deepEqual(await fork(branch.name, "fs-fork0002"), { status: 204 });
+  assert.deepEqual(recorded.calls, [`clone ${source} ${branch.namespace}/fs-fork0002 ${2 * 1024 ** 3}`]);
+  // Of one that moved on from what it was released into: its files alone.
+  recorded.snapshots.set(source, { snapshot: "s-2", release: "r1" });
+  recorded.calls.length = 0;
+  assert.deepEqual(await fork(env.name, "fs-fork0003"), { status: 204 });
+  assert.deepEqual(recorded.calls, [`clone ${source} ${env.namespace}/fs-fork0003 ${2 * 1024 ** 3}`]);
+  // Of one bound: its files alone, as its sandbox runs on from its snapshot; bound here from bayma's checkpoints, its record then as it was.
+  recorded.records.delete(source);
+  const placement = await Effect.runPromise(sessions.place(claims.key, claims.options));
+  await Effect.runPromise(binder.bind(placement.pool, claims.key, placement));
+  recorded.snapshots.set(source, { snapshot: "s-1", release: "r1" });
+  recorded.records.set(source, { snapshot: "s-1", release: "r1" });
+  recorded.calls.length = 0;
+  assert.deepEqual(await fork(env.name, "fs-fork0004"), { status: 204 });
+  assert.deepEqual(recorded.calls, [`clone ${source} ${env.namespace}/fs-fork0004 ${2 * 1024 ** 3}`]);
+  await Effect.runPromise(binder.release(placement.pool, claims.key));
+  // Into one bound, or being bound: none.
+  const under = await run(takeLease(env.none, sessionKey("fs-fork0005"), "another-binder"));
+  recorded.calls.length = 0;
+  assert.equal((await fork(env.name, "fs-fork0005")).status, 409);
+  assert.deepEqual(recorded.calls, []);
+  await run(releaseLease(under.lease));
+});
+
+test("what of main's snapshots no workspace has a use for is collected: the snapshots of one gone forgotten, and what its node caches that none needs discarded", async () => {
+  const env = await environment(1);
+  const recorded = workspaceAgents();
+  const { sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+  recorded.files.set(`${env.namespace}/fs-kept0001`, new Map());
+  recorded.snapshots.set(`${env.namespace}/fs-kept0001`, { snapshot: "s-1", release: "r1" });
+  recorded.snapshots.set(`${env.namespace}/fs-gone0001`, { snapshot: "s-2", release: "r1" });
+  recorded.cached.set(`${env.namespace}/fs-kept0001`, ["s-1-image", "s-0-image"]);
+  recorded.cached.set(`${env.namespace}/fs-gone0001`, ["s-2-image"]);
+  recorded.cached.set("other-sessions/fs-other001", ["s-3-image"]);
+  await Effect.runPromise(sessions.collect);
+  assert.deepEqual(recorded.calls, [
+    `collect ${env.namespace}/fs-kept0001`,
+    `forget ${env.namespace}/fs-gone0001`,
+    `discard node-a ${env.namespace}/fs-kept0001 keeping s-1-image`,
+    `discard node-a ${env.namespace}/fs-gone0001 keeping none`,
+  ]);
+  assert.deepEqual([...recorded.snapshots.keys()], [`${env.namespace}/fs-kept0001`]);
 });
 
 test("each attach and detach is timed, and each binding released counted by why: asked by its caller, or lost as its pod went", async () => {

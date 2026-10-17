@@ -433,3 +433,33 @@ test("a bind whose maker declines, as it finds under the binding's Lease, claims
   assert.equal(held.length, 1);
   assert.ok(held[0]);
 });
+
+test("a hold of a key runs what it holds for under the key's Lease, a bind meanwhile waiting for it, then lets it go; one of a key bound runs nothing, and one whose effect fails lets the Lease go", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const layer = binderOf();
+  await Effect.runPromise(Effect.provide(Effect.gen(function*() {
+    const each = yield* Binder;
+    const order: string[] = [];
+    const held = yield* each.hold(of, "sessionfs:held", Effect.gen(function*() {
+      const lease = yield* Effect.promise(() => run(binder(), readLease(of, "sessionfs:held")));
+      assert.ok(lease && !lease.spec?.holderIdentity, "its Lease is not held under way");
+      // A bind meanwhile, by another binder, waits for it.
+      const binding = yield* Effect.forkChild(Effect.promise(() => bindIn(binderOf(), (other) => other.bind(of, "sessionfs:held"))).pipe(Effect.tap(() => Effect.sync(() => order.push("bound")))));
+      yield* Effect.sleep("1500 millis");
+      order.push("held");
+      return binding;
+    }));
+    assert.ok(held);
+    const bound = yield* Fiber.join(held.value);
+    assert.deepEqual(order, ["held", "bound"]);
+    // Bound: nothing run.
+    let ran = false;
+    assert.equal(yield* each.hold(of, "sessionfs:held", Effect.sync(() => (ran = true))), null);
+    assert.equal(ran, false);
+    assert.equal((yield* Effect.promise(() => run(binder(), readLease(of, "sessionfs:held"))))?.spec?.holderIdentity, bound.pod);
+    // Failed: its failure given, the Lease let go.
+    assert.equal(yield* Effect.flip(each.hold(of, "sessionfs:failing", Effect.fail("it failed"))), "it failed");
+    assert.equal(yield* Effect.promise(() => run(binder(), readLease(of, "sessionfs:failing"))), null);
+  }), layer));
+});
