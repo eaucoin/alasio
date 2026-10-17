@@ -11,7 +11,9 @@
  * - `GET /waiting/<namespace>/<pool>`: `{ waiting }`, this replica's alone, as its peers ask.
  * - `GET /healthz`: 200 once it serves, asked without a token.
  * - anything else: passed to the pod the token's key is bound to, the key bound first where
- *   it is not (./proxy.ts), with the binding's token for the caller's, the key's Lease
+ *   it is not (./proxy.ts), but for a request that says it must bind nothing (NO_BIND_HEADER
+ *   `never`), as one that reads what a binding has, answered 409 `{ "bound": false }` where the
+ *   key has no binding serving, its Lease untaken and no pod claimed; with the binding's token for the caller's, the key's Lease
  *   stamped active now and then, as what releases it reads; 503 with a Retry-After
  *   where it could not be bound now (its pool had no pod for it in time, its pod could not
  *   be readied), or its pod was not reached, its route then forgotten, so the next request
@@ -34,6 +36,9 @@ import { counts, touchLease } from "./bindings.ts";
 import { type Pool } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
 import { bindingToken, verifyToken } from "./tokens.ts";
+
+/** The header of a request that binds nothing: passed on where its key is bound, and otherwise answered as unbound. */
+export const NO_BIND_HEADER = "x-alasio-bind";
 
 /** What a Retry-After asks a caller to wait, in seconds, before it asks again. */
 const RETRY_AFTER_S = 1;
@@ -100,19 +105,20 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       yield* Effect.provideService(touchLease(pool, key, now), KubeClient, kube).pipe(Effect.catch((error) => Effect.logDebug(`stamping ${key}'s binding active failed: ${error.message}`)));
     });
 
-  /** The route to `key`'s pod: the one known, or its pod bound now, with `options`. */
-  const routeOf = (key: string, options: Readonly<Record<string, string>>): Effect.Effect<Route & { readonly pool: Pool }, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused> =>
-    Effect.suspend(() => {
+  /**
+   * The route to `key`'s pod: the one known, or its pod bound now, with `options`; or, where
+   * it is to bind nothing (`unbound`), its pod as its binding is now, null where none serves.
+   */
+  const routeOf = (key: string, options: Readonly<Record<string, string>>, unbound: boolean): Effect.Effect<(Route & { readonly pool: Pool }) | null, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused> =>
+    Effect.gen(function*() {
       const known = routes.get(key);
-      if (known) return Effect.succeed(known);
-      return poolOf(key, options).pipe(
-        Effect.flatMap(({ pool, ...placed }) => binder.bind(pool, key, placed).pipe(Effect.map((bound) => ({ ...bound, pool })))),
-        Effect.map(({ binding, address, pool }) => {
-          const route = { address, port: podPort, token: bindingToken(bindingKey, { key, binding, namespace: pool.namespace }), pool };
-          routes.set(key, route);
-          return route;
-        }),
-      );
+      if (known) return known;
+      const { pool, ...placed } = yield* poolOf(key, options);
+      const bound = unbound ? yield* binder.bound(pool, key) : yield* binder.bind(pool, key, placed);
+      if (!bound) return null;
+      const route = { address: bound.address, port: podPort, token: bindingToken(bindingKey, { key, binding: bound.binding, namespace: pool.namespace }), pool };
+      routes.set(key, route);
+      return route;
     });
 
   /** The pool's counts, its waiting summed over every replica's. */
@@ -143,19 +149,26 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       // A caller's token, which stops; a binding's, which a bound pod takes requests with, is none.
       if (!claims || claims.expires === undefined || claims.binding !== undefined) return answer(outgoing, 401, { error: "no caller's token" });
       const { key } = claims;
-      const route = yield* routeOf(key, claims.options ?? {}).pipe(Effect.result);
-      if (route._tag === "Failure") {
-        if (route.failure._tag === "PlacementRefused") return answer(outgoing, 403, { error: route.failure.message });
-        yield* Effect.logWarning(`binding ${key} failed: ${route.failure.message}`);
+      const unbound = incoming.headers[NO_BIND_HEADER] === "never";
+      delete incoming.headers[NO_BIND_HEADER];
+      const routed = yield* routeOf(key, claims.options ?? {}, unbound).pipe(Effect.result);
+      if (routed._tag === "Failure") {
+        if (routed.failure._tag === "PlacementRefused") return answer(outgoing, 403, { error: routed.failure.message });
+        yield* Effect.logWarning(`binding ${key} failed: ${routed.failure.message}`);
         return answer(outgoing, 503, { error: `${key} could not be bound now` }, { "retry-after": String(RETRY_AFTER_S) });
+      }
+      const route = routed.success;
+      if (!route) {
+        incoming.resume();
+        return answer(outgoing, 409, { bound: false });
       }
       if (incoming.method === "POST" && url === "/bind") {
         incoming.resume();
         return answer(outgoing, 204);
       }
-      yield* active(key, route.success.pool);
+      yield* active(key, route.pool);
       flights.set(key, (flights.get(key) ?? 0) + 1);
-      const proxied = yield* Effect.promise(() => proxy(incoming, outgoing, route.success)).pipe(
+      const proxied = yield* Effect.promise(() => proxy(incoming, outgoing, route)).pipe(
         Effect.ensuring(Effect.sync(() => void flights.set(key, (flights.get(key) ?? 1) - 1))),
       );
       if (proxied.reached) return;
