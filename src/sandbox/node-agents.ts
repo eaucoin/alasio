@@ -100,6 +100,10 @@ export interface NodeAgents {
   readonly readFile: (workspace: WorkspaceRef, path: string, maxBytes: number) => Effect.Effect<Uint8Array, NodeAgentError | KubeApiError>;
   /** Makes the workspace, its directory and its quota of `quotaBytes`, through any agent, each sees workspace storage as another; again, sets its quota anew. */
   readonly createWorkspace: (workspace: WorkspaceRef, quotaBytes: number) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** Makes the workspace `to` a clone of `from`, of `quotaBytes`, through any agent. */
+  readonly cloneWorkspace: (from: WorkspaceRef, to: WorkspaceRef, quotaBytes: number) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** Deletes the workspace, its quota with it, through any agent; one not there is not an error. */
+  readonly removeWorkspace: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** The workspace's quota, and what it holds, through any agent; null where it has none. */
   readonly quota: (workspace: WorkspaceRef) => Effect.Effect<{ readonly capacityBytes: number; readonly usedBytes: number } | null, NodeAgentError | KubeApiError>;
   /** Writes `bytes` as the workspace's file at `path`, as any agent writes it. */
@@ -228,6 +232,12 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
       ),
     createWorkspace: (workspace, quotaBytes) =>
       Effect.flatMap(anyNode, (node) => send(node, `make ${workspace.environment}/${workspace.workspace}`, { method: "POST", path: "/workspaces", body: { ...workspace, quotaBytes }, timeout: SHORT_CALL })).pipe(Effect.asVoid),
+    cloneWorkspace: (from, to, quotaBytes) =>
+      Effect.flatMap(anyNode, (node) =>
+        send(node, `clone ${from.environment}/${from.workspace} into ${to.environment}/${to.workspace}`, { method: "POST", path: "/workspaces/clones", body: { from, to, quotaBytes }, timeout: LONG_CALL })).pipe(Effect.asVoid),
+    removeWorkspace: (workspace) =>
+      Effect.flatMap(anyNode, (node) =>
+        send(node, `delete ${workspace.environment}/${workspace.workspace}`, { method: "DELETE", path: `/workspaces/${encodeURIComponent(workspace.environment)}/${encodeURIComponent(workspace.workspace)}`, timeout: SHORT_CALL })).pipe(Effect.asVoid),
     quota: (workspace) =>
       Effect.gen(function*() {
         const node = yield* anyNode;
