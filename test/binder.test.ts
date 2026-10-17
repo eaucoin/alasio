@@ -5,7 +5,8 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Effect, Fiber, Layer } from "effect";
 
 import { BindStepFailed, BindTimeout, Binder, type BinderOptions } from "../src/binder/binder.ts";
-import { BINDING_LABEL, type BindingLease, boundLabels, claim, FREE_LABEL, freeLabels, KEY_ANNOTATION, keyHash, leaseName, markReleasing, type Pool, POOL_LABEL, readLease, reconcile, releaseLease, renewLease, takeLease } from "../src/binder/bindings.ts";
+import { type BindingLease, claim, markReleasing, readLease, reconcile, releaseLease, renewLease, takeLease } from "../src/binder/bindings.ts";
+import { BINDING_LABEL, boundLabels, FREE_LABEL, freeLabels, KEY_ANNOTATION, keyHash, leaseName, type Pool, POOL_LABEL } from "../src/binder/names.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
 

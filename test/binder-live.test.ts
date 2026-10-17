@@ -4,7 +4,8 @@ import { before, test } from "node:test";
 import { type Cause, Context, Effect, Exit, Layer, Queue, Scope, Stream } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
-import { freeLabels, KEY_ANNOTATION, type Pool, readLease } from "../src/binder/bindings.ts";
+import { readLease } from "../src/binder/bindings.ts";
+import { freeLabels, KEY_ANNOTATION, type Pool } from "../src/binder/names.ts";
 import { type BindingNamespaces, LiveBindings } from "../src/binder/live.ts";
 import { INITIAL_EVENTS_END, KubeClient, type WatchEvent } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";

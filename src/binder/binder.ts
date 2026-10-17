@@ -16,7 +16,8 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Clock, Context, Effect, Fiber, Layer, Schema, Semaphore } from "effect";
 
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
-import { BINDING_TIMEOUT_MS, type BindingLease, boundAnnotations, boundLabels, boundPod, claim, holdLease, markReleasing, type Pool, readLease, RELEASING_ANNOTATION, releaseLease, renewLease, serving, stale, takeLease, unmarkReleasing } from "./bindings.ts";
+import { BINDING_TIMEOUT_MS, type BindingLease, boundPod, claim, holdLease, markReleasing, readLease, RELEASING_ANNOTATION, releaseLease, renewLease, serving, stale, takeLease, unmarkReleasing } from "./bindings.ts";
+import { boundAnnotations, boundLabels, type Pool } from "./names.ts";
 
 /** How often a bind looks again, for a free pod, a binding another has under way, or its pod serving. */
 export const BIND_POLL_MS = 250;

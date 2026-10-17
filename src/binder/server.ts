@@ -30,7 +30,8 @@ import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken } from "../shared/tokens.ts";
 import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
-import { counts, type Pool, touchLease } from "./bindings.ts";
+import { counts, touchLease } from "./bindings.ts";
+import { type Pool } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
 import { bindingToken, verifyToken } from "./tokens.ts";
 

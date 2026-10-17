@@ -20,7 +20,8 @@ import type { V1Deployment, V1Pod } from "@kubernetes/client-node";
 import { Clock, Effect, Schema } from "effect";
 
 import { type Binder, BindStepFailed } from "../binder/binder.ts";
-import { activeAt, type BindingLease, heldLeases, KEY_ANNOTATION, type Pool } from "../binder/bindings.ts";
+import { activeAt, type BindingLease, heldLeases } from "../binder/bindings.ts";
+import { KEY_ANNOTATION, type Pool } from "../binder/names.ts";
 import { type Placement, PlacementRefused } from "../binder/server.ts";
 import { bindingToken } from "../binder/tokens.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
