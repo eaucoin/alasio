@@ -25,6 +25,7 @@ import type {
   V1LabelSelector,
   V1Namespace,
   V1PersistentVolumeClaim,
+  V1PodDisruptionBudget,
   V1PodSpec,
   V1PriorityClass,
   V1Role,
@@ -3468,6 +3469,15 @@ describe("the sandbox service", () => {
     assert.equal(connects(policies, gateway, agent, 8484), true);
     assert.equal(connects(policies, gateway, collector, 4318), true);
     assert.equal(connects(policies, receiver, collector, 4318), true);
+  });
+
+  test("lets no drain evict a pod bound to a workspace, but one not ready", () => {
+    const budget = one<V1PodDisruptionBudget>(install(), "PodDisruptionBudget", "alasio-bound");
+    assert.deepEqual([budget.metadata?.namespace, budget.spec], ["alasio-sessions", {
+      maxUnavailable: 0,
+      selector: { matchExpressions: [{ key: "alasio.dev/binding", operator: "Exists" }] },
+      unhealthyPodEvictionPolicy: "AlwaysAllow",
+    }]);
   });
 
   test("runs none of it without workspace storage, or where sandboxes are not snapshotted, as the node agents attach its workspaces", () => {

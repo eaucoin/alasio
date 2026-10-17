@@ -16,13 +16,15 @@
  * named one is taken over once it has gone unrenewed for a while, BINDING_TIMEOUT_MS by default. A pod
  * serves one binding in its life: claimed, bound, released, deleted, never returned to its
  * pool, nor claimed again whatever its labels come to say, so nothing of one key's can reach
- * the next's.
+ * the next's. Bound, it says what keeps a node autoscaler from removing its node while it is
+ * (BUSY_ANNOTATIONS), as what it holds lives only in it until its release.
  */
 import { createHash } from "node:crypto";
 
 import type { KubernetesObject, V1Pod } from "@kubernetes/client-node";
 import { Clock, Effect } from "effect";
 
+import { BUSY_ANNOTATIONS } from "../kube/busy-label.ts";
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
 
 /** The label of a pool's pods, its name. */
@@ -72,6 +74,9 @@ export const freeLabels = (pool: Pool): Readonly<Record<string, string>> => ({ [
 
 /** The labels of a pod of `pool` bound to `key`. */
 export const boundLabels = (pool: Pool, key: string): Readonly<Record<string, string>> => ({ [POOL_LABEL]: pool.name, [BINDING_LABEL]: keyHash(key) });
+
+/** The annotations of a pod bound to `key`: the key, and what keeps its node from being removed while it is. */
+export const boundAnnotations = (key: string): Readonly<Record<string, string>> => ({ [KEY_ANNOTATION]: key, ...BUSY_ANNOTATIONS });
 
 const selector = (labels: Readonly<Record<string, string>>): string => Object.entries(labels).map(([label, value]) => `${label}=${value}`).join(",");
 
@@ -213,7 +218,7 @@ export const claim = Effect.fnUntraced(function*(pool: Pool, key: string): Effec
       // A listed object's own, as a list's items come without them.
       apiVersion: "v1",
       kind: "Pod",
-      metadata: { ...pod.metadata, labels: { ...labels, ...boundLabels(pool, key) }, annotations: { ...pod.metadata?.annotations, [KEY_ANNOTATION]: key } },
+      metadata: { ...pod.metadata, labels: { ...labels, ...boundLabels(pool, key) }, annotations: { ...pod.metadata?.annotations, ...boundAnnotations(key) } },
     }).pipe(Effect.catchIf((error) => hasStatus(409)(error) || hasStatus(404)(error), () => Effect.succeed(null)));
     if (claimed) return claimed;
   }

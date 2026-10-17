@@ -16,7 +16,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Clock, Context, Effect, Fiber, Layer, Schema, Semaphore } from "effect";
 
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
-import { BINDING_TIMEOUT_MS, type BindingLease, boundLabels, boundPod, claim, holdLease, KEY_ANNOTATION, markReleasing, type Pool, readLease, RELEASING_ANNOTATION, releaseLease, renewLease, serving, stale, takeLease, unmarkReleasing } from "./bindings.ts";
+import { BINDING_TIMEOUT_MS, type BindingLease, boundAnnotations, boundLabels, boundPod, claim, holdLease, markReleasing, type Pool, readLease, RELEASING_ANNOTATION, releaseLease, renewLease, serving, stale, takeLease, unmarkReleasing } from "./bindings.ts";
 
 /** How often a bind looks again, for a free pod, a binding another has under way, or its pod serving. */
 export const BIND_POLL_MS = 250;
@@ -133,7 +133,7 @@ export class Binder extends Context.Service<Binder, {
           Effect.gen(function*() {
             const already = yield* provide(boundPod(pool, key));
             if (already?.metadata?.name) yield* kube.remove("v1", "Pod", pool.namespace, already.metadata.name);
-            if (make) return yield* make(boundLabels(pool, key), { [KEY_ANNOTATION]: key });
+            if (make) return yield* make(boundLabels(pool, key), boundAnnotations(key));
             const claimed = yield* provide(claim(pool, key));
             if (claimed) return claimed;
             return yield* waitingFor(pool, Effect.gen(function*() {
