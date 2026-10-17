@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
 import { test } from "node:test";
 
-import { mintToken, verifyToken } from "../src/binder/tokens.ts";
+import { environmentKey, mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 
 const secret = randomBytes(32);
 
@@ -25,4 +25,18 @@ test("a token another key signed, one changed, one stopped, and one that is no t
   // Signed, but not claims.
   const notClaims = Buffer.from("[]").toString("base64url");
   assert.equal(verifyToken(secret, `${notClaims}.${createHmac("sha256", secret).update(notClaims).digest("base64url")}`, 1_000), null);
+});
+
+test("an environment's callers sign with a key of their own, of the master, and a token is checked by the key of the environment it names alone", () => {
+  const master = randomBytes(32);
+  const keyOf = ({ options }: TokenClaims) => (options?.["environment"] ? environmentKey(master, options["environment"]) : null);
+  const of = (environment: string, signer = environmentKey(master, environment)) =>
+    mintToken(signer, { key: "sessionfs:workspace", expires: 2_000, options: { environment, mode: "none" } });
+  assert.deepEqual(verifyToken(keyOf, of("main"), 1_000)?.options, { environment: "main", mode: "none" });
+  assert.deepEqual(verifyToken(keyOf, of("try"), 1_000)?.options, { environment: "try", mode: "none" });
+  // A branch's key names main's sessions in vain, as the master itself, and a token naming none.
+  assert.equal(verifyToken(keyOf, of("main", environmentKey(master, "try")), 1_000), null);
+  assert.equal(verifyToken(keyOf, of("main", master), 1_000), null);
+  assert.equal(verifyToken(keyOf, mintToken(master, { key: "sessionfs:workspace", expires: 2_000 }), 1_000), null);
+  assert.notDeepEqual(environmentKey(master, "main"), environmentKey(master, "try"));
 });

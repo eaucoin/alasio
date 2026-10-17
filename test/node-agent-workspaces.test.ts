@@ -86,7 +86,7 @@ test("an attach of a workspace there is not, or by names that are none, is refus
   }
 });
 
-test("a workspace is cloned into another, of any environment, its files' owners and modes kept, its quota its own; and deleted, its quota with it", async () => {
+test("a workspace is cloned into another, of any environment, its files' owners and modes kept, its quota its own; listed by environment; and deleted, its quota with it", async () => {
   const at = workspacesNode();
   try {
     const source = { environment: "main", workspace: "fs-source" };
@@ -103,6 +103,12 @@ test("a workspace is cloned into another, of any environment, its files' owners 
     // Of one not there, or into one there already: refused.
     assert.equal(await refusal(at.workspaces.clone({ environment: "main", workspace: "fs-never" }, { environment: "main", workspace: "fs-other" }, 1024)), 404);
     assert.equal(await refusal(at.workspaces.clone(source, fork, 1024)), 409);
+    // Listed by environment, of what are workspaces' names alone; of one with none, none.
+    mkdirSync(join(at.workspacesRoot, "main", ".partial"), { recursive: true });
+    assert.deepEqual(await Effect.runPromise(at.workspaces.list("main")), ["fs-source"]);
+    assert.deepEqual(await Effect.runPromise(at.workspaces.list("alasio-branch-try-sessions")), ["fs-source"]);
+    assert.deepEqual(await Effect.runPromise(at.workspaces.list("elsewhere")), []);
+    assert.equal(await refusal(at.workspaces.list("../etc")), 400);
     // Deleted, its quota with it; again, nothing.
     await Effect.runPromise(at.workspaces.remove(fork));
     assert.equal(existsSync(join(at.workspacesRoot, "alasio-branch-try-sessions", "fs-source")), false);

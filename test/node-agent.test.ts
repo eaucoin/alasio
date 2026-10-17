@@ -1886,6 +1886,7 @@ const unusedWorkspaces: Workspaces = {
   create: () => Effect.die("no workspace is made"),
   clone: () => Effect.die("no workspace is cloned"),
   remove: () => Effect.die("no workspace is deleted"),
+  list: () => Effect.die("no workspace is listed"),
   quota: () => Effect.die("no workspace's quota is read"),
   attach: () => Effect.die("no workspace is attached"),
   detach: () => Effect.die("no workspace is detached"),
@@ -2452,6 +2453,7 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       const fork = { environment: "main", workspace: "fs-fork" };
       yield* agents.cloneWorkspace(made, fork, 1024 ** 3);
       assert.deepEqual((yield* agents.quota(fork))?.capacityBytes, 1024 ** 3);
+      assert.deepEqual(yield* agents.listWorkspaces("main"), ["fs-abc123", "fs-fork", "fs-made"]);
       yield* agents.removeWorkspace(fork);
       assert.equal(yield* agents.quota(fork), null);
     })
