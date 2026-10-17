@@ -3638,7 +3638,9 @@ describe("the sandbox service", () => {
     const { repository, tag, digest } = configOf().workspaceStorage.csi.mountImage;
     const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
     assert.match(dockerfile, new RegExp(`^FROM ${repository}:${tag}@${digest} AS juicefs$`, "mu"));
-    assert.match(dockerfile, /^COPY --from=juicefs \/usr\/local\/bin\/juicefs \/usr\/local\/bin\/juicefs$/mu);
+    // Its juicefs taken with the libraries it loads, and its loader, as that image installs them.
+    assert.match(dockerfile, /^COPY --from=juicefs \/opt\/juicefs \/opt\/juicefs$/mu);
+    assert.match(dockerfile, /exec \/opt\/juicefs\/ld\.so --library-path \/opt\/juicefs\/lib \/opt\/juicefs\/juicefs/u);
     // And the metadata engine takes them, as they reach it.
     const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
     const pod = (component: string): Pod => ({ namespace: "alasio", namespaceLabels: { "kubernetes.io/metadata.name": "alasio" }, labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component } });
