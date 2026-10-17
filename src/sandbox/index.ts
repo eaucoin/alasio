@@ -534,13 +534,12 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
       yield* serveTelemetryReceiver({
         port: receiverPort,
         forwarder,
-        stampFor: (volumeId) => sandboxResource(volumeId, env),
         authenticate: (token) =>
           Option.match(Schema.decodeUnknownOption(SessionToken)(token), {
             onNone: () => Effect.succeed(null),
             onSome: ([volumeId]) =>
               sandboxes.token(volumeId).pipe(
-                Effect.map((expected) => (expected && sameToken(token, expected) ? volumeId : null)),
+                Effect.map((expected) => (expected && sameToken(token, expected) ? { session: volumeId, stamp: sandboxResource(volumeId, env) } : null)),
                 Effect.orElseSucceed(() => null),
               ),
           }),

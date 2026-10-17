@@ -10,7 +10,10 @@
  * profile: a folder is the machine's own files, which a branch cannot copy. Its alasio's
  * identity reaches its own sessions alone; main's alasio may make Sandboxes there, and
  * read their claims, to fork into it the sessions the branch inherited
- * (src/branch/fork.ts). Its Secrets are the command's to write: the database's, the
+ * (src/branch/fork.ts). Its sessions' sandboxes are main's sandbox service's, in pools of its
+ * own in its sessions' namespace, which the service finds by its label
+ * (src/gateway/environments.ts), so nothing of main's changes as a branch comes or goes. Its
+ * Secrets are the command's to write: the database's, the
  * lake's and the compute's, as main's (the data is a copy, its roles and passwords main's);
  * its own bot's; Claude Code's token, when main has one; and its token to ask main to fork
  * with.
@@ -24,6 +27,7 @@ import type { InstallConfig } from "./config.ts";
 import { lakeObjects } from "./lake.ts";
 import { compute, computeScaling } from "./neon.ts";
 import { networkPolicyObjects } from "./network-policies.ts";
+import { sandboxPoolObjects } from "./sandbox-gateway.ts";
 
 /** The environment of the branch `name`. */
 export const branchEnvironment = (name: string): Environment => ({ namespace: branchNamespace(name), branch: name });
@@ -65,5 +69,6 @@ export function branchObjects(config: InstallConfig, name: string): KubernetesOb
     ...lakeObjects(config, environment),
     ...networkPolicyObjects(config, environment),
     ...(config.sessions.enabled ? parentAccess(config, environment) : []),
+    ...sandboxPoolObjects(config, environment),
   ].map((object) => branchLabelled(object, name));
 }

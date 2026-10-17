@@ -32,7 +32,7 @@ import { BearerToken } from "../shared/tokens.ts";
 import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
 import { counts, type Pool, touchLease } from "./bindings.ts";
 import { proxy, type Route } from "./proxy.ts";
-import { mintToken, verifyToken } from "./tokens.ts";
+import { bindingToken, verifyToken } from "./tokens.ts";
 
 /** What a Retry-After asks a caller to wait, in seconds, before it asks again. */
 const RETRY_AFTER_S = 1;
@@ -107,7 +107,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       return poolOf(key, options).pipe(
         Effect.flatMap(({ pool, ...placed }) => binder.bind(pool, key, placed).pipe(Effect.map((bound) => ({ ...bound, pool })))),
         Effect.map(({ binding, address, pool }) => {
-          const route = { address, port: podPort, token: mintToken(bindingKey, { key, binding }), pool };
+          const route = { address, port: podPort, token: bindingToken(bindingKey, { key, binding, namespace: pool.namespace }), pool };
           routes.set(key, route);
           return route;
         }),
