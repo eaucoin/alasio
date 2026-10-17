@@ -97,7 +97,7 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" = "saves"): {
 }
 
 /** An environment of the test's own, its pools' namespace, with `count` free pods of the `none` pool on node-a, serving at the loopback. */
-async function environment(count: number, { gvisor = false } = {}): Promise<{ name: string; namespace: string; none: Pool }> {
+async function environment(count: number, { gvisor = false } = {}): Promise<SessionsEnvironment & { none: Pool }> {
   const namespace = `sessions-${(namespaces += 1)}`;
   const none: Pool = { name: "sandboxes-none", namespace };
   await run(withKube((kube) =>
@@ -115,7 +115,7 @@ async function environment(count: number, { gvisor = false } = {}): Promise<{ na
       }
     })
   ));
-  return { name: `env-${namespaces}`, namespace, none };
+  return { name: `env-${namespaces}`, namespace, parent: null, none };
 }
 
 /** The environments `list`, as found: those alone. */
@@ -133,6 +133,7 @@ const options = (env: SessionsEnvironment, podPort: number): SessionsOptions => 
   pools: { none: "sandboxes-none", full: "sandboxes-full" },
   releaseAfterMs: 60_000,
   podPort,
+  quotaBytes: 2 * 1024 ** 3,
   bindingKey,
   events: { tell: (event) => Effect.sync(() => void told.push(event)) },
 });
@@ -277,12 +278,109 @@ test("a release whose save fails leaving the sandbox running keeps the binding, 
 });
 
 test("a binding let go as its pod went while it was bound is told of, to its environment's alasio, as lost", async () => {
-  const env = { name: "try", namespace: "alasio-branch-try-sessions" };
+  const env = { name: "try", namespace: "alasio-branch-try-sessions", parent: "main" };
   const { sessions } = await sessionsOf(options(env, 7290), agents().agents);
   const key = sessionKey("fs-lost");
   const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-lost", namespace: env.namespace, annotations: { "alasio.dev/binding-key": key } }, spec: { holderIdentity: "sandboxes-none-0" } };
   await Effect.runPromise(sessions.lost({ name: "sandboxes-none", namespace: env.namespace }, lease));
   assert.deepEqual(told.filter((event) => event.subject.key === key), [
     { kind: "workspace.lost", environment: "try", source: "sandbox-gateway", subject: { kind: "workspace", key }, binding: "uid-lost", pod: "sandboxes-none-0", reason: "its pod went while it was bound" },
+  ]);
+});
+
+/** Node agents that keep workspaces as a map of their files, by environment and name, recording each call. */
+function workspaceAgents(): { agents: NodeAgents; calls: string[]; files: Map<string, Map<string, Uint8Array>> } {
+  const calls: string[] = [];
+  const files = new Map<string, Map<string, Uint8Array>>();
+  const name = ({ environment, workspace }: { environment: string; workspace: string }) => `${environment}/${workspace}`;
+  const missing = (call: string) => new NodeAgentError({ node: "node-a", call, status: 404, reason: "there is no such workspace" });
+  const base = agents().agents;
+  return {
+    calls,
+    files,
+    agents: {
+      ...base,
+      createWorkspace: (ref, quotaBytes) => Effect.sync(() => (calls.push(`create ${name(ref)} ${quotaBytes}`), void files.set(name(ref), files.get(name(ref)) ?? new Map()))),
+      removeWorkspace: (ref) => Effect.sync(() => (calls.push(`remove ${name(ref)}`), void files.delete(name(ref)))),
+      cloneWorkspace: (from, to, quotaBytes) =>
+        Effect.suspend(() => {
+          calls.push(`clone ${name(from)} ${name(to)} ${quotaBytes}`);
+          const source = files.get(name(from));
+          return source ? Effect.sync(() => void files.set(name(to), new Map(source))) : Effect.fail(missing("clone"));
+        }),
+      listWorkspaces: (environment) => Effect.sync(() => [...files.keys()].filter((each) => each.startsWith(`${environment}/`)).map((each) => each.slice(environment.length + 1))),
+      quota: (ref) => Effect.sync(() => (files.has(name(ref)) ? { capacityBytes: 2 * 1024 ** 3, usedBytes: 5 } : null)),
+      readFile: (ref, path) => {
+        const file = files.get(name(ref))?.get(path);
+        return file ? Effect.succeed(file) : Effect.fail(missing("read"));
+      },
+      writeFile: (ref, path, bytes) => {
+        const workspace = files.get(name(ref));
+        return workspace ? Effect.sync(() => void workspace.set(path, Uint8Array.from(bytes))) : Effect.fail(missing("write"));
+      },
+    },
+  };
+}
+
+test("a caller makes, writes, reads, measures, lists and deletes its own environment's workspace through the gateway alone, one bound not deleted", async () => {
+  const env = await environment(1);
+  const recorded = workspaceAgents();
+  const { binder, sessions } = await sessionsOf({ ...options(env, 7290), environments: found([env, { name: "other", namespace: "other-sessions", parent: null }]) }, recorded.agents);
+  const key = sessionKey("fs-own123");
+  const claims = { key, expires: Date.now() + 60_000, options: { environment: env.name, mode: "none" } };
+  const ask = (method: string, path: string, body: unknown = "", of = claims) => {
+    const [route = "", search = ""] = path.split("?", 2);
+    const bytes = typeof body === "string" ? Buffer.from(body) : Buffer.from(JSON.stringify(body));
+    return Effect.runPromise(sessions.operate(of, { method, path: route, query: new URLSearchParams(search), body: bytes }));
+  };
+  assert.deepEqual(await ask("POST", "/workspace"), { status: 204 });
+  assert.deepEqual(await ask("PUT", "/workspace/files?path=workspace/note.txt", "hello"), { status: 204 });
+  const read = await ask("GET", "/workspace/files?path=workspace/note.txt");
+  assert.deepEqual([read.status, Buffer.from(read.bytes ?? []).toString()], [200, "hello"]);
+  assert.equal((await ask("GET", "/workspace/files?path=workspace/none.txt")).status, 404);
+  assert.equal((await ask("GET", "/workspace/files?path=workspace/note.txt&max=many")).status, 400);
+  assert.deepEqual(await ask("GET", "/workspace/quota"), { status: 200, json: { capacityBytes: 2 * 1024 ** 3, usedBytes: 5 } });
+  assert.deepEqual(await ask("GET", "/workspace/all"), { status: 200, json: { workspaces: ["fs-own123"] } });
+  // Made in its own environment's namespace, of the gateway's quota; another's lists none of it.
+  assert.deepEqual(recorded.calls, [`create ${env.namespace}/fs-own123 ${2 * 1024 ** 3}`]);
+  assert.deepEqual(await ask("GET", "/workspace/all", "", { ...claims, options: { environment: "other", mode: "none" } }), { status: 200, json: { workspaces: [] } });
+  // Bound, it is not deleted; released, it is.
+  const placement = await Effect.runPromise(sessions.place(key, claims.options));
+  await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  assert.equal((await ask("DELETE", "/workspace")).status, 409);
+  await Effect.runPromise(binder.release(placement.pool, key));
+  assert.deepEqual(await ask("DELETE", "/workspace"), { status: 204 });
+  assert.equal(recorded.files.has(`${env.namespace}/fs-own123`), false);
+  // An environment there is not, a key of no workspace, and a route there is not.
+  assert.equal((await ask("POST", "/workspace", "", { ...claims, options: { environment: "nowhere", mode: "none" } })).status, 403);
+  assert.equal((await ask("POST", "/workspace", "", { ...claims, key: "folder:claude:conversation" })).status, 403);
+  assert.equal((await ask("PATCH", "/workspace")).status, 404);
+});
+
+test("main forks its workspace into a branch of its own, as the branch records main its parent, and a branch into itself, but never into main nor into a sibling", async () => {
+  const main: SessionsEnvironment = { name: "main", namespace: "fork-main-sessions", parent: null };
+  const one = { name: "one", namespace: "alasio-branch-one-sessions", parent: "main" };
+  const two = { name: "two", namespace: "alasio-branch-two-sessions", parent: "main" };
+  const recorded = workspaceAgents();
+  const { sessions } = await sessionsOf({ ...options(main, 7290), environments: found([main, one, two]) }, recorded.agents);
+  for (const env of [main, one]) recorded.files.set(`${env.namespace}/fs-shared1`, new Map([["workspace/a", Buffer.from(env.name)]]));
+  const fork = (from: SessionsEnvironment, to: string, workspace = "fs-shared1") =>
+    Effect.runPromise(sessions.operate(
+      { key: sessionKey("fs-shared1"), expires: Date.now() + 60_000, options: { environment: from.name, mode: "none" } },
+      { method: "POST", path: "/workspace/forks", query: new URLSearchParams(), body: Buffer.from(JSON.stringify({ environment: to, workspace })) },
+    ));
+  assert.deepEqual(await fork(main, "one"), { status: 204 });
+  assert.equal(Buffer.from(recorded.files.get(`${one.namespace}/fs-shared1`)?.get("workspace/a") ?? []).toString(), "main");
+  assert.deepEqual(await fork(main, "main", "fs-copy01"), { status: 204 });
+  assert.deepEqual(await fork(one, "one", "fs-copy02"), { status: 204 });
+  for (const [from, to] of [[one, "main"], [one, "two"], [main, "nowhere"]] as const) {
+    const refused = await fork(from, to, "fs-stolen1");
+    assert.equal(refused.status, 403, `${from.name} into ${to}`);
+  }
+  assert.equal((await fork(main, "one", "Not A Name")).status, 400);
+  assert.deepEqual(recorded.calls, [
+    `clone ${main.namespace}/fs-shared1 ${one.namespace}/fs-shared1 ${2 * 1024 ** 3}`,
+    `clone ${main.namespace}/fs-shared1 ${main.namespace}/fs-copy01 ${2 * 1024 ** 3}`,
+    `clone ${one.namespace}/fs-shared1 ${one.namespace}/fs-copy02 ${2 * 1024 ** 3}`,
   ]);
 });

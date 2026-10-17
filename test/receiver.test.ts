@@ -38,7 +38,7 @@ test("the receiver takes an instance's telemetry with its binding's token while 
     },
   };
   const authenticate = authenticateBinding(bindingKey, (volumeId, namespace) =>
-    Effect.succeed(sessionResource(volumeId, namespace === "alasio-branch-try-sessions" ? { name: "try", namespace } : { name: "main", namespace }, {})));
+    Effect.succeed(sessionResource(volumeId, namespace === "alasio-branch-try-sessions" ? { name: "try", namespace, parent: "main" } : { name: "main", namespace, parent: null }, {})));
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const receiver = yield* serveTelemetryReceiver({
       port: 0,

@@ -33,6 +33,8 @@ export const GatewayConfig = Schema.Struct({
   releaseAfterSeconds: Schema.Number,
   /** main's environment of sessions, by its name, and the namespace its pools are in; branch environments' are found (./environments.ts). */
   environment: Schema.Struct({ name: Schema.String, namespace: Schema.String }),
+  /** The quota of a workspace the gateway makes, in bytes. */
+  quotaBytes: Schema.Number,
   /** Each pool's name, by its sessions' internet. */
   pools: Schema.Struct({ none: Schema.String, full: Schema.String }),
   /** Where the node agents are. */

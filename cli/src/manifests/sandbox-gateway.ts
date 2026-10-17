@@ -43,6 +43,7 @@ import type {
 } from "@kubernetes/client-node";
 
 import { freeLabels, type Pool } from "../../../src/binder/names.ts";
+import { MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
 import {
   BINDING_KEY_VARIABLE,
   CALLER_KEY_VARIABLE,
@@ -56,6 +57,7 @@ import {
 } from "../../../src/gateway/names.ts";
 import { BAYMA_CONTAINER, NET_MODE_LABEL } from "../../../src/kube/sandbox-shape.ts";
 import { ATTACH_ROOT, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
+import { memoryBytes } from "../capacity.ts";
 import { imageReference } from "../images.ts";
 import { READY_ONCE_BOUND_ANNOTATION } from "../kube/rollout.ts";
 import { sessionsNamespace } from "./alasio.ts";
@@ -206,7 +208,9 @@ function gatewayConfig(config: InstallConfig): GatewayConfig {
     waitSeconds: 120,
     // A duration, as the configuration checks it.
     releaseAfterSeconds: durationSeconds(config.sessions.snapshots.releaseAfter) ?? 0,
-    environment: { name: "main", namespace: sessionsNamespace(config, MAIN_ENVIRONMENT) },
+    environment: { name: MAIN_ENVIRONMENT_NAME, namespace: sessionsNamespace(config, MAIN_ENVIRONMENT) },
+    // A new session's volume's size, as the configuration checks it.
+    quotaBytes: memoryBytes(config.sessions.storage.size),
     pools: { none: POOLS.none, full: POOLS.full },
     nodeAgents: {
       namespace: NAMESPACE,

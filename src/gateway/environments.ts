@@ -1,7 +1,8 @@
 /**
  * The environments of sessions the sandbox service serves: main's, as it is configured, and
  * each branch environment's (`alasio branch create`), found by its sessions' namespace, which
- * carries BRANCH_LABEL, its branch's name, and is named for it. They are found anew every
+ * carries BRANCH_LABEL, its branch's name, and BRANCH_PARENT_LABEL, its parent's, and is named
+ * for it. They are found anew every
  * `refreshMs`, and at once when one is asked for that was not found, as a token signed for
  * one names it, so a branch made is served from its first bind, and one deleted is let go
  * of. Finds are made one at a time, an ask answered by the first begun after it, so the asks
@@ -9,13 +10,18 @@
  */
 import { Effect, Schedule, type Scope, Semaphore } from "effect";
 
-import { BRANCH_LABEL, branchSessionsNamespace } from "../branch/names.ts";
+import { BRANCH_LABEL, BRANCH_PARENT_LABEL, branchSessionsNamespace } from "../branch/names.ts";
 import { KubeClient } from "../kube/client.ts";
 
-/** An environment's sessions: its name, and the namespace its pools are in, which names its workspaces to the node agents. */
+/**
+ * An environment's sessions: its name; the namespace its pools are in, which names its
+ * workspaces to the node agents; and the environment it was branched from, as its namespace
+ * records it, whose sessions may be forked into it; null for main, and a branch that records none.
+ */
 export interface SessionsEnvironment {
   readonly name: string;
   readonly namespace: string;
+  readonly parent: string | null;
 }
 
 /** The environments of sessions there are; see makeEnvironments. */
@@ -41,15 +47,18 @@ export function branchEnvironmentsOf(
 ): SessionsEnvironment[] {
   return namespaces.flatMap(({ metadata }) => {
     const branch = metadata?.labels?.[BRANCH_LABEL];
-    return branch && metadata?.name === branchSessionsNamespace(branch) && metadata.deletionTimestamp === undefined ? [{ name: branch, namespace: metadata.name }] : [];
+    return branch && metadata?.name === branchSessionsNamespace(branch) && metadata.deletionTimestamp === undefined
+      ? [{ name: branch, namespace: metadata.name, parent: metadata.labels?.[BRANCH_PARENT_LABEL] ?? null }]
+      : [];
   });
 }
 
 /** The environments, as the module says: `main`, and the branch environments the KubeClient finds. */
 export const makeEnvironments = Effect.fnUntraced(function*(
-  { main, refreshMs = REFRESH_MS }: { readonly main: SessionsEnvironment; readonly refreshMs?: number },
+  { main: mainOf, refreshMs = REFRESH_MS }: { readonly main: Omit<SessionsEnvironment, "parent">; readonly refreshMs?: number },
 ): Effect.fn.Return<Environments, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
+  const main: SessionsEnvironment = { ...mainOf, parent: null };
   let found: readonly SessionsEnvironment[] = [main];
   const finding = yield* Semaphore.make(1);
   /** How many finds have begun, so an ask that one begun after it answers asks no more. */

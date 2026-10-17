@@ -2751,6 +2751,9 @@ describe("branch environments", () => {
     // Its pods held to the sandbox pools' templates, as main's are (./admission.ts sandboxPodPolicy).
     assert.equal(of<V1Namespace>("Namespace", "alasio-branch-try-sessions").metadata?.labels?.["pod-security.kubernetes.io/enforce"], "privileged");
     assert.equal(of<V1Namespace>("Namespace", "alasio-branch-try-sessions").metadata?.labels?.["pod-security.kubernetes.io/warn"], "restricted");
+    // Its sessions' namespace records main its parent, as the sandbox gateway forks main's sessions into it for that alone; its alasio's, and main's, record none.
+    assert.deepEqual(all<V1Namespace>(branch, "Namespace").map(({ metadata }) => metadata?.labels?.["alasio.dev/branch-parent"]), [undefined, "main"]);
+    assert.deepEqual(all<V1Namespace>(install(), "Namespace").map(({ metadata }) => metadata?.labels?.["alasio.dev/branch-parent"]).filter((parent) => parent !== undefined), []);
     assert.deepEqual(branch.filter(({ metadata }) => metadata?.labels?.["alasio.dev/branch"] !== "try"), []);
     // But its Sandboxes' admission policy, which is the cluster's.
     assert.deepEqual(branch.filter(({ kind, metadata }) => kind !== "Namespace" && !metadata?.namespace?.startsWith("alasio-branch-try")).map(({ kind, metadata }) => [kind, metadata?.name]), [
@@ -3456,6 +3459,8 @@ describe("the sandbox service", () => {
       waitSeconds: 120,
       releaseAfterSeconds: 300,
       environment: { name: "main", namespace: "alasio-sessions" },
+      // A new session's volume's size, 10Gi by default.
+      quotaBytes: 10 * 1024 ** 3,
       pools: { none: "sandboxes-none", full: "sandboxes-full" },
       nodeAgents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", port: 8484 },
     });
