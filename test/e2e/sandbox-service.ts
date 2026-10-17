@@ -66,9 +66,10 @@ export function sandboxService(): void {
       assert.equal(read.status, 200, read.said);
       const quota = JSON.parse(read.said) as { capacityBytes: number; usedBytes: number };
       assert.deepEqual([quota.capacityBytes, quota.usedBytes >= 0], [2 * 1024 ** 3, true]);
-      // Its user may not flush, list every key, nor read or change the server's configuration.
-      // Quoted, as a shell runs them: `*` a pattern of Valkey's, not of the shell's files.
-      for (const command of ["FLUSHDB", "KEYS '*'", "CONFIG GET maxmemory", "DEBUG SLEEP 0"]) {
+      // Its user may not flush, list every key, read the server's configuration, nor its users.
+      // (DEBUG, which the server refuses everyone, says nothing of it.) Quoted, as a shell runs
+      // them: `*` a pattern of Valkey's, not of the shell's files.
+      for (const command of ["FLUSHDB", "KEYS '*'", "CONFIG GET maxmemory", "ACL LIST"]) {
         const ran = await kube.exec(NAMESPACE, `${VALKEY}-0`, ["sh", "-c", `valkey-cli --no-auth-warning --user quotas --pass "$VALKEY_QUOTAS_PASSWORD" -n 1 ${command}`], { container: "valkey" });
         assert.match(`${ran.stdout}${ran.stderr}`, /NOPERM/u, command);
       }
