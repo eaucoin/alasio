@@ -151,7 +151,8 @@ test("a mount left at the root by a juicefs gone, as a pod killed with no succes
   await until(() => serving.ready());
   const ran = serving.inNode();
   assert.ok(ran.indexOf(`umount -l ${serving.root}`) >= 0 && ran.indexOf(`umount -l ${serving.root}`) < ran.findIndex((command) => command.includes(" mount ")), ran.join("\n"));
-  assert.match(serving.out(), /unmounted the node's mount its juicefs left/u);
+  // As its output comes, which may be after its mount is ready.
+  await until(() => serving.out().includes("unmounted the node's mount its juicefs left"));
   // One that serves is left be.
   const whole = mount(t, "serves");
   await until(() => whole.ready());
