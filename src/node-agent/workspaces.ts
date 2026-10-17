@@ -326,7 +326,8 @@ export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches
         const directory = yield* podDirectory(pod);
         const running = yield* Effect.forEach(containerIds, (id) => runsc.container(id).pipe(Effect.as(true), Effect.orElseSucceed(() => false)));
         if (running.some(Boolean)) return yield* refused(409, `${pod}'s sandbox still runs: what is attached into it is detached once it can no longer act`);
-        for (const point of yield* mountsUnder(directory)) yield* onNode(host, ["umount", "--lazy", point]);
+        // `-l`, not `--lazy`, which the busybox of k3s's own binaries, first on the node's PATH, does not take.
+        for (const point of yield* mountsUnder(directory)) yield* onNode(host, ["umount", "-l", point]);
         yield* Effect.promise(() => rm(directory, { recursive: true, force: true }));
       }),
 

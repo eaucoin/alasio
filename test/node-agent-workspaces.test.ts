@@ -178,8 +178,8 @@ test("a detach is refused while the pod's sandbox runs, and once it has ended un
     at.running.delete("container-1");
     await Effect.runPromise(at.workspaces.detach("pool-0", ["container-0", "container-1"]));
     assert.deepEqual(at.ran.filter((command) => command.startsWith("umount")), [
-      `umount --lazy ${join(at.attachRoot, "pool-0", "ws", "workspace", "inner")}`,
-      `umount --lazy ${join(at.attachRoot, "pool-0", "ws")}`,
+      `umount -l ${join(at.attachRoot, "pool-0", "ws", "workspace", "inner")}`,
+      `umount -l ${join(at.attachRoot, "pool-0", "ws")}`,
     ]);
     assert.deepEqual(at.mounts, []);
     assert.equal(existsSync(join(at.attachRoot, "pool-0")), false);
