@@ -10,7 +10,7 @@ import { FetchHttpClient } from "effect/http";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, POLICY_WAIT_MS, type ResumeRequest, type WorkspaceRef } from "../node-agent/agent.ts";
 import { NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
-import { Released } from "../node-agent/workspaces.ts";
+import { Released, type StopRequest } from "../node-agent/workspaces.ts";
 
 /** Where the node agents are: their pods' namespace and labels, and the port they serve on. */
 export interface NodeAgentsLocation {
@@ -124,6 +124,12 @@ export interface NodeAgents {
   readonly removeWorkspace: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** The workspaces of `environment` there are, by their names, through any agent. */
   readonly listWorkspaces: (environment: string) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
+  /**
+   * Has the bayma of the bound pod `request.pod`, on `node`, go on with the stop it holds,
+   * by its hook `request.hook` (`sandbox-hook stop`), which its node's agent runs in its
+   * container; an agent refuses one that is not the bayma of a pool's pod there with 403.
+   */
+  readonly stop: (node: string, request: StopRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** The snapshot the workspace was last released into, as any agent reads its record of it; null where none is recorded. */
   readonly released: (workspace: WorkspaceRef) => Effect.Effect<Released | null, NodeAgentError | KubeApiError>;
   /** Records the snapshot the workspace is released into, or none, through any agent. */
@@ -268,6 +274,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     removeWorkspace: (workspace) =>
       Effect.flatMap(anyNode, (node) =>
         send(node, `delete ${workspace.environment}/${workspace.workspace}`, { method: "DELETE", path: `/workspaces/${encodeURIComponent(workspace.environment)}/${encodeURIComponent(workspace.workspace)}`, timeout: SHORT_CALL })).pipe(Effect.asVoid),
+    stop: (node, request) => send(node, `tell ${request.namespace}/${request.pod}'s bayma to go on with its stop`, { method: "POST", path: "/stop", body: request, timeout: SHORT_CALL }).pipe(Effect.asVoid),
     released: (workspace) =>
       Effect.gen(function*() {
         const node = yield* anyNode;

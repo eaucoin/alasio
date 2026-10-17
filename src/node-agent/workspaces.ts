@@ -33,6 +33,11 @@
  * name at a time as ./volume.ts walks one: one any part of whose path is a symlink, or that
  * is not a regular file, is refused, and so is one not reached in time.
  *
+ * A bound pod's bayma that holds its stop for a save is told to go on with it (stop): its
+ * hook, `sandbox-hook stop`, run in its container under the gVisor release that runs it, as
+ * a checkpoint runs its hook, and in no container but the bayma of a pod of a pool on this
+ * node: one whose pod's directory kubelet made, its pod named by containerd's annotations.
+ *
  * Beside its files, which its sandbox sees, and so out of its sandbox's reach, a workspace
  * keeps the snapshot it was last released into (`released.json`, a Released), which its
  * gateway records as it releases it and reads as it binds it, holding its binding's Lease
@@ -49,7 +54,7 @@ import { Effect, Schema } from "effect";
 import { isValidVolumeId } from "../sandbox/names.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import type { Juicefs, JuicefsError, Quota } from "./juicefs.ts";
-import { SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
+import { BAYMA_CONTAINER, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { ATTACH_ROOT, WORKSPACES_ROOT } from "./names.ts";
 import type { Runsc } from "./runsc.ts";
 import { readUnder, writeUnder } from "./volume.ts";
@@ -105,6 +110,17 @@ export type Released = typeof Released.Type;
 /** The name of a workspace's record of the snapshot it was released into, beside its files. */
 const RELEASED_FILE = "released.json";
 
+/** What a stop asks: the bound pod, by its namespace and name, its bayma's container by its runtime's id, and bayma's hook, `sandbox-hook stop`. */
+export interface StopRequest {
+  readonly namespace: string;
+  readonly pod: string;
+  readonly containerId: string;
+  readonly hook: readonly string[];
+}
+
+/** How long bayma's hook may take to go on with its stop. */
+const STOP_TIMEOUT_MS = 30_000;
+
 /** What a workspace's agent does with workspaces; see makeWorkspaces. */
 export interface Workspaces {
   /** Makes `ref`, as the module says, its quota `quotaBytes`. */
@@ -125,6 +141,8 @@ export interface Workspaces {
   readonly read: (ref: WorkspaceRef, path: string, maxBytes: number) => Effect.Effect<Buffer, WorkspaceRefused>;
   /** Writes `bytes` as the file at `path` of `ref`'s files, its agent's, its directories made. */
   readonly write: (ref: WorkspaceRef, path: string, bytes: Uint8Array) => Effect.Effect<void, WorkspaceRefused>;
+  /** Has the bayma of a bound pod go on with the stop it holds, as the module says. */
+  readonly stop: (request: StopRequest) => Effect.Effect<void, WorkspaceRefused>;
   /** The snapshot `ref` was last released into, as the module says; null where none is recorded. */
   readonly released: (ref: WorkspaceRef) => Effect.Effect<Released | null, WorkspaceRefused>;
   /** Records the snapshot `ref` is released into, or none, as the module says; refused where there is no such workspace. */
@@ -155,7 +173,7 @@ export interface WorkspacesOptions {
   readonly host: HostCommands;
   /** Whether workspace storage is mounted at the workspaces' root: as its file system says, but for tests. */
   readonly mounted?: (root: string) => Promise<boolean>;
-  readonly runsc: Pick<Runsc, "container">;
+  readonly runsc: Pick<Runsc, "container" | "exec">;
   readonly juicefs: Juicefs | null;
   readonly workspacesRoot?: string;
   readonly attachRoot?: string;
@@ -304,6 +322,22 @@ export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, workspa
         if (!names) return yield* refused(400, `${path} is not a path of a workspace's files`);
         const root = yield* filesOf(ref);
         yield* confined(path, () => writeUnder({ root, names }, bytes, { uid: agentUid, gid: agentUid }));
+      }),
+
+    stop: ({ namespace, pod, containerId, hook }) =>
+      Effect.gen(function*() {
+        const directory = yield* podDirectory(pod);
+        const at = hook.indexOf("sandbox-hook");
+        if (at < 0 || hook[at + 1] !== "stop") return yield* refused(400, `${hook.join(" ")} is not bayma's sandbox-hook stop`);
+        const container = yield* runsc.container(containerId).pipe(Effect.mapError(() => refused(404, `no container ${containerId} runs on this node`)));
+        const { annotations } = container;
+        const of = `${annotations["io.kubernetes.cri.sandbox-namespace"] ?? "?"}/${annotations["io.kubernetes.cri.sandbox-name"] ?? "?"}`;
+        if (of !== `${namespace}/${pod}` || annotations["io.kubernetes.cri.container-name"] !== BAYMA_CONTAINER) {
+          return yield* refused(403, `container ${containerId} is ${of}'s ${annotations["io.kubernetes.cri.container-name"] ?? "?"}, not the bayma of ${namespace}/${pod}`);
+        }
+        const pooled = yield* Effect.promise(() => lstat(directory).then((stats) => stats.isDirectory(), () => false));
+        if (!pooled) return yield* refused(403, `${namespace}/${pod} is no pod of a pool on this node: kubelet has made it no directory`);
+        yield* runsc.exec(container.release, containerId, hook, STOP_TIMEOUT_MS).pipe(Effect.mapError((error) => refused(502, `bayma of ${namespace}/${pod} did not go on with its stop: ${error.message}`)));
       }),
 
     released: (ref) =>

@@ -21,6 +21,10 @@ export function workspacesNode() {
   const mounts: string[] = [];
   const ran: string[] = [];
   const running = new Set<string>();
+  // Of each container that runs, the annotations containerd gives its spec; what runsc ran in them, in order; and whether a hook fails.
+  const annotations = new Map<string, Readonly<Record<string, string>>>();
+  const execs: string[] = [];
+  const hooks = { fail: false };
   const host: HostCommands = {
     run: (command) =>
       Effect.sync(() => {
@@ -54,7 +58,15 @@ export function workspacesNode() {
     host,
     mounted: () => Promise.resolve(storage.mounted),
     juicefs: makeJuicefs({ metaUrl: "redis://:the%20password@valkey.alasio.svc:6379/1", juicefs }),
-    runsc: { container: (id) => (running.has(id) ? Effect.succeed({ release: "r", annotations: {}, tracksWrites: false, bundle: "" }) : Effect.fail(new RunscError({ release: "", command: "state", reason: "not found" }))) },
+    runsc: {
+      container: (id) =>
+        running.has(id) ? Effect.succeed({ release: "r", annotations: { ...annotations.get(id) }, tracksWrites: false, bundle: "" }) : Effect.fail(new RunscError({ release: "", command: "state", reason: "not found" })),
+      exec: (release, id, argv) =>
+        Effect.suspend(() => {
+          execs.push(`${release} ${id} ${argv.join(" ")}`);
+          return hooks.fail ? Effect.fail(new RunscError({ release, command: "exec", reason: "the hook exited 1" })) : Effect.void;
+        }),
+    },
     workspacesRoot,
     attachRoot,
     agentUid: process.getuid?.() ?? 1000,
@@ -69,6 +81,6 @@ export function workspacesNode() {
   const pod = (name: string) => mkdirSync(join(attachRoot, name), { recursive: true });
   /** What JuiceFS's command was run with, a call a line. */
   const juicefsCalls = () => (existsSync(join(root, "juicefs.log")) ? readFileSync(join(root, "juicefs.log"), "utf8").trim().split("\n") : []);
-  return { root, workspacesRoot, attachRoot, mounts, ran, running, storage, workspaces, files, pod, juicefsCalls, done: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, workspacesRoot, attachRoot, mounts, ran, running, annotations, execs, hooks, storage, workspaces, files, pod, juicefsCalls, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 
