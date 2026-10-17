@@ -13,8 +13,8 @@
  *   4. a chain restores straight from the snapshots bucket, its gofer reaching the store from
  *      the node, from a directory holding s3_opts.json alone, each image of the chain in the
  *      bucket once, under layers/<digest>/, as the node agent keeps them: straight from the
- *      store, then through the node agent's proxy of it, by a restore's own token, each
- *      timed to its pod ready and to the last read of its background;
+ *      store, then, a checkpoint later, through the node agent's proxy of it, by a restore's
+ *      own token, each timed to its pod ready and to the last read of its background;
  *   5. a delta after a restore from the bucket: whether its parent's pages_meta.img alone
  *      will do, or its pages too;
  *   6. a server-side copy of a 1 GiB layer in the bundled SeaweedFS: its time and bytes;
@@ -340,25 +340,35 @@ test("4. a chain restores straight from the bucket, from a directory holding s3_
     seen["reachedFromTheNode"] = await reaches();
 
     await inGate("set", session.volumeId, session.replId, "4");
-    seen["D"] = await checkpoint("D", { live: false, parent: at("restore-C") });
     // Each image once, by its digest, as the node agent keeps a workspace's.
     const layersPrefix = `gate-12/${session.volumeId}/layers/`;
-    const layers = (await runsc(["image", "layers", at("D")])).split("\n").filter(Boolean);
-    seen["layers"] = layers;
     const byDigest = new Map(await Promise.all(["A", "B", "C"].map(async (name) => [await digest(at(name)), at(name)] as const)));
-    const own = await digest(at("D"));
-    const uploadingAt = Date.now();
-    await upload(at("D"), `${layersPrefix}${own}/`);
-    for (const layer of layers) await upload(byDigest.get(layer) ?? "", `${layersPrefix}${layer}/`);
-    seen["uploadMs"] = Date.now() - uploadingAt;
+    const inBucket = new Set<string>();
+    /** Checkpoints the image `name` at release, a delta of `parent`, and puts it in the bucket, with each of its layers not there yet: its own digest. */
+    const checkpointed = async (name: string, parent: string) => {
+      seen[name] = await checkpoint(name, { live: false, parent });
+      const layers = (await runsc(["image", "layers", at(name)])).split("\n").filter(Boolean);
+      const own = await digest(at(name));
+      const uploadingAt = Date.now();
+      for (const [each, image] of [[own, at(name)], ...layers.map((layer) => [layer, byDigest.get(layer) ?? ""] as const)] as const) {
+        if (inBucket.has(each)) continue;
+        await upload(image, `${layersPrefix}${each}/`);
+        inBucket.add(each);
+      }
+      seen[`${name}Uploaded`] = { layers, ms: Date.now() - uploadingAt };
+      byDigest.set(own, at(name));
+      return own;
+    };
 
     // runsc, and the shim through it, reads every file of the image from the bucket: straight
     // from the store, then through the node agent's proxy of it, as alasio's restores do,
     // a restore's own token signing it; each through a relay that times its reads to their end.
-    const restoredThrough = async (name: string, endpoint: string, credentials?: { access_key_id: string; secret_access_key: string }) => {
+    // Each restores a checkpoint of its own, the last, as a session's restores do: the one
+    // before ran bayma, whose files on the node the image held, and so would be refused.
+    const restoredThrough = async (name: string, own: string, endpoint: string, credentials?: { access_key_id: string; secret_access_key: string }) => {
       const relay = await relayTo(endpoint);
       try {
-        const directory = at(`bucket-D-${name}`);
+        const directory = at(`bucket-${name}`);
         await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && umask 077 && printf '%s' ${q(goferOptions(`${layersPrefix}${own}/`, layersPrefix, relay.endpoint, credentials))} >${q(`${directory}/s3_opts.json`)}`);
         const startedAt = Date.now();
         const restored = await restoreFrom(directory);
@@ -372,7 +382,8 @@ test("4. a chain restores straight from the bucket, from a directory holding s3_
         relay.close();
       }
     };
-    seen["direct"] = await restoredThrough("direct", s3.endpoint);
+    seen["direct"] = await restoredThrough("D0", await checkpointed("D0", at("restore-C")), s3.endpoint);
+    const own = await checkpointed("D", at("D0"));
     let release = () => {};
     const proxy = await new Promise<StoreProxy>((resolve, reject) => {
       Effect.runPromise(Effect.scoped(Effect.gen(function*() {
@@ -382,7 +393,7 @@ test("4. a chain restores straight from the bucket, from a directory holding s3_
     });
     try {
       const token = proxy.mint(`gate-12/${session.volumeId}`, layersPrefix);
-      seen["proxied"] = await restoredThrough("proxied", proxy.endpoint, { access_key_id: token.accessKeyId, secret_access_key: token.secretAccessKey });
+      seen["proxied"] = await restoredThrough("D", own, proxy.endpoint, { access_key_id: token.accessKeyId, secret_access_key: token.secretAccessKey });
     } finally {
       release();
     }
@@ -403,7 +414,7 @@ test("5. a delta after a restore from the bucket, its parent's pages_meta.img al
       seen["parentNeeds"] = "pages.img too";
     }
     seen["layers"] = (await runsc(["image", "layers", at("E")])).split("\n").filter(Boolean);
-    const restored = await restoreFrom(await prepared("E", ["A", "B", "C", "D"]));
+    const restored = await restoreFrom(await prepared("E", ["A", "B", "C", "D0", "D"]));
     seen["restore"] = restored;
     assert.ok(restored.ready, JSON.stringify(restored));
     const read = await inGate<Read>("read", session.volumeId, session.replId);
@@ -446,7 +457,7 @@ test("7. a live snapshot restores into a new pod while its exec runs, which goes
     // bayma's state generation as L caught it, and as its pod crashes: one moved on since makes
     // L outlived, which the restored bayma refuses, telling its exec nothing.
     seen["generationAfterL"] = await generation();
-    const directory = await prepared("L", ["A", "B", "C", "D", "E"]);
+    const directory = await prepared("L", ["A", "B", "C", "D0", "D", "E"]);
     seen["generationAtCrash"] = await generation();
     const restored = await restoreFrom(directory, { crashed: true });
     seen["restore"] = restored;
@@ -465,7 +476,7 @@ test("7. a live snapshot restores into a new pod while its exec runs, which goes
     await sleep(2000);
     seen["M"] = await checkpoint("M", { live: true, parent: at("restore-L") });
     await inSession(session.volumeId, 'require("node:fs").appendFileSync("/workspace/gate-12-held", " and changed")');
-    const refused = await restoreFrom(await prepared("M", ["A", "B", "C", "D", "E", "L"]), { crashed: true });
+    const refused = await restoreFrom(await prepared("M", ["A", "B", "C", "D0", "D", "E", "L"]), { crashed: true });
     seen["refused"] = refused;
     assert.equal(refused.ready, false, JSON.stringify(refused));
     // For the file it holds, which changed, and for nothing else.
