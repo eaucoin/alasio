@@ -1,12 +1,13 @@
 /**
  * Waiting for what was applied to run: a CRD until it is established, a Job until it
- * completes, a Deployment, StatefulSet or DaemonSet until its rollout is done, and a
+ * completes, a Deployment, StatefulSet or DaemonSet until its rollout is done (a sandbox
+ * pool's Deployment, whose pods are ready only once each is bound, until they run), and a
  * StatefulSet until its pods are scheduled; waiting for what was deleted to be gone; and
  * for volumes let go of to be deleted. A wait says
  * what it still waits for as that changes, and when it gives up, why each thing is not
  * ready, from its pods' state and the cluster's warnings about them.
  */
-import type { CoreV1Event, KubernetesObject, V1ContainerStatus, V1PersistentVolume, V1Pod, V1StatefulSet } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ContainerStatus, V1Deployment, V1PersistentVolume, V1Pod, V1StatefulSet } from "@kubernetes/client-node";
 import { Duration, Effect, Schedule, Schema } from "effect";
 
 import { describeRef, kind, KubeApi, type KubeApiError, type ObjectRef } from "./api.ts";
@@ -92,6 +93,32 @@ export function reclamation(volume: V1PersistentVolume): Readiness {
   const claim = volume.spec?.claimRef;
   return waiting(phase === "Bound" && claim ? `bound to ${claim.namespace}/${claim.name}` : phase.toLowerCase());
 }
+
+/**
+ * The annotation of a Deployment whose pods are ready only once each is bound, a sandbox
+ * pool's (../manifests/sandbox-gateway.ts), each then out of the Deployment: it is ready once
+ * a pod of each of its replicas runs, ready or not (readinessOf).
+ */
+export const READY_ONCE_BOUND_ANNOTATION = "alasio.dev/ready-once-bound";
+
+/**
+ * Where `object` is, as readiness says; but a Deployment annotated READY_ONCE_BOUND_ANNOTATION,
+ * once its rollout has made a pod of each of its replicas and none of before, ready once each
+ * runs, its containers started, as its pods say.
+ */
+export const readinessOf = Effect.fnUntraced(function*(object: KubernetesObject): Effect.fn.Return<Readiness, KubeApiError, KubeApi> {
+  if (object.kind !== "Deployment" || object.metadata?.annotations?.[READY_ONCE_BOUND_ANNOTATION] !== "true") return readiness(object);
+  const { metadata, spec, status } = object as V1Deployment;
+  const replicas = spec?.replicas ?? 1;
+  const updated = status?.updatedReplicas ?? 0;
+  if ((status?.observedGeneration ?? 0) < (metadata?.generation ?? 0)) return waiting("not yet rolled out");
+  if (updated < replicas) return waiting(`${updated} of ${replicas} updated`);
+  if ((status?.replicas ?? 0) > updated) return waiting(`${(status?.replicas ?? 0) - updated} old pods stopping`);
+  const kube = yield* KubeApi;
+  const pods = yield* kube.list<V1Pod>(POD, { namespace: metadata?.namespace, labelSelector: selectorOf(spec?.selector?.matchLabels ?? {}) });
+  const runs = pods.filter((pod) => !pod.metadata?.deletionTimestamp && pod.status?.phase === "Running" && (pod.status.containerStatuses ?? []).every(({ state }) => state?.running)).length;
+  return runs < replicas ? waiting(`${runs} of ${replicas} running`) : READY;
+});
 
 /** Something waited for that is not ready, as people read it: the object, and what it is at. */
 const NotReadyObject = Schema.Struct({
@@ -253,9 +280,9 @@ const awaitAll = Effect.fnUntraced(function*(
 /** The object `ref`, or null when there is none. */
 const current = (ref: ObjectRef): Effect.Effect<KubernetesObject | null, KubeApiError, KubeApi> => Effect.flatMap(KubeApi, (kube) => kube.get(ref));
 
-/** Waits until every ref is ready (readiness). */
+/** Waits until every ref is ready (readinessOf). */
 export const awaitReady = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
-  awaitAll(refs, (ref) => Effect.map(current(ref), (object) => (object ? readiness(object) : waiting("not found"))), diagnose, options);
+  awaitAll(refs, (ref) => Effect.flatMap(current(ref), (object) => (object ? readinessOf(object) : Effect.succeed(waiting("not found")))), diagnose, options);
 
 /**
  * Waits until every StatefulSet ref has made a pod for each of its replicas and each is

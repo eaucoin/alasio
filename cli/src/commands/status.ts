@@ -14,7 +14,7 @@ import { clusterReleases, describeKept, snapshotReleases } from "../kept-release
 import { describeMemory, describeScale, describeSizing, memoryBytes, memoryText, type ScaledWorkload } from "../capacity.ts";
 import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
-import { diagnose, readiness, selectorOf, starting } from "../kube/rollout.ts";
+import { diagnose, readinessOf, selectorOf, starting } from "../kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE } from "../manifests/common.ts";
 import { LOADER_COMPONENT } from "../manifests/lake.ts";
 import { REPLICA_NAME } from "../manifests/neon.ts";
@@ -300,7 +300,7 @@ export const status = Command.make("status", {}, () =>
         const computes = yield* computeTimes;
         let notReady = 0;
         for (const workload of workloads as readonly ScaledWorkload[]) {
-          const state = readiness(workload);
+          const state = yield* readinessOf(workload);
           // A DaemonSet runs a pod on every node it schedules to, of no scale of its own.
           const scaler = of(scaledObjects, workload, ({ spec }) => spec.scaleTargetRef.name);
           const scale = workload.kind === "DaemonSet" ? "" : `${describeScale(workload, scaler)}; `;

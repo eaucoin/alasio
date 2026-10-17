@@ -20,7 +20,7 @@ import { installationObjects } from "../src/install.ts";
 import { KubeApi } from "../src/kube/api.ts";
 import { applyInstallation, removeInstallation, VOLUME_DRIVER_LABEL } from "../src/kube/apply.ts";
 import { checkAutoscalers } from "../src/kube/autoscalers.ts";
-import { readiness } from "../src/kube/rollout.ts";
+import { READY_ONCE_BOUND_ANNOTATION, readiness, readinessOf } from "../src/kube/rollout.ts";
 import { type FakeKube, serveFakeKube } from "./support/fake-kube.ts";
 
 const WAIT = { timeout: "2 seconds", poll: "10 millis" } as const;
@@ -352,6 +352,34 @@ test("a DaemonSet is ready once every node it schedules to runs its current pod,
   assert.deepEqual(readiness(daemonSet({ observedGeneration: 2, desiredNumberScheduled: 3, updatedNumberScheduled: 1, numberReady: 3 })), { _tag: "Waiting", status: "1 of 3 nodes updated" });
   assert.deepEqual(readiness(daemonSet({ observedGeneration: 2, desiredNumberScheduled: 3, updatedNumberScheduled: 3, numberReady: 2 })), { _tag: "Waiting", status: "2 of 3 nodes ready" });
   assert.deepEqual(readiness(daemonSet({ observedGeneration: 2, desiredNumberScheduled: 3, updatedNumberScheduled: 3, numberReady: 3 })), { _tag: "Ready" });
+});
+
+test("a sandbox pool's Deployment, whose pods are ready only once bound, is ready once a pod of each replica runs, ready or not; another, once each is available", async (t) => {
+  const { kube, run } = await rig(t);
+  const deployment = (annotated: boolean) => ({
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: { name: "sandboxes-none", namespace: "alasio-sessions", generation: 1, ...(annotated ? { annotations: { [READY_ONCE_BOUND_ANNOTATION]: "true" } } : {}) },
+    spec: { replicas: 2, selector: { matchLabels: { "alasio.dev/pool": "sandboxes-none", "alasio.dev/free": "true" } } },
+    status: { observedGeneration: 1, replicas: 2, updatedReplicas: 2, availableReplicas: 0 },
+  });
+  const pod = (name: string, running: boolean, labels: Record<string, string> = { "alasio.dev/pool": "sandboxes-none", "alasio.dev/free": "true" }) => ({
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name, namespace: "alasio-sessions", labels },
+    status: { phase: running ? "Running" : "Pending", conditions: [{ type: "Ready", status: "False" }], containerStatuses: [{ name: "bayma", ready: false, state: running ? { running: {} } : { waiting: { reason: "ContainerCreating" } } }] },
+  });
+  kube.put("pods", pod("free-0", true));
+  kube.put("pods", pod("free-1", false));
+  // One bound, out of the Deployment's selector, is none of its.
+  kube.put("pods", pod("bound-0", true, { "alasio.dev/pool": "sandboxes-none", "alasio.dev/binding": "0".repeat(40) }));
+  const of = (object: KubernetesObject & { readonly status?: object }) => run(readinessOf(object));
+  assert.deepEqual(await of(deployment(true)), { _tag: "Waiting", status: "1 of 2 running" });
+  kube.put("pods", pod("free-1", true));
+  assert.deepEqual(await of(deployment(true)), { _tag: "Ready" });
+  assert.deepEqual(await of(deployment(false)), { _tag: "Waiting", status: "0 of 2 available" });
+  // Its rollout not done: as a Deployment's.
+  assert.deepEqual(await of({ ...deployment(true), status: { observedGeneration: 1, replicas: 3, updatedReplicas: 2 } }), { _tag: "Waiting", status: "1 old pods stopping" });
 });
 
 test("applying again keeps a CSI driver, what it needs and its volumes' class while those volumes remain, and deletes them once they are gone", async (t) => {
