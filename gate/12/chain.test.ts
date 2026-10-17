@@ -12,7 +12,9 @@
  *      linked in the prepared directory's layers/<digest>/;
  *   4. a chain restores straight from the snapshots bucket, its gofer reaching the store from
  *      the node, from a directory holding s3_opts.json alone, each image of the chain in the
- *      bucket once, under layers/<digest>/, as the node agent keeps them;
+ *      bucket once, under layers/<digest>/, as the node agent keeps them: straight from the
+ *      store, then through the node agent's proxy of it, by a restore's own token, each
+ *      timed to its pod ready and to the last read of its background;
  *   5. a delta after a restore from the bucket: whether its parent's pages_meta.img alone
  *      will do, or its pages too;
  *   6. a server-side copy of a 1 GiB layer in the bundled SeaweedFS: its time and bytes;
@@ -25,6 +27,7 @@
  */
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { type AddressInfo, connect, createServer } from "node:net";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
@@ -36,6 +39,7 @@ import { NAMESPACE } from "../../cli/src/manifests/common.ts";
 import { CONTAINERD, gvisorDirectory, gvisorHandler } from "../../src/node-agent/names.ts";
 import { runscFlags } from "../../src/node-agent/runsc.ts";
 import { makeS3Bucket, type S3Bucket } from "../../src/node-agent/s3.ts";
+import { makeStoreProxy, type StoreProxy } from "../../src/node-agent/store-proxy.ts";
 import { hookOf } from "../../src/sandbox/snapshots.ts";
 import { dumpClusterState, inAlasio, inSession, kube, onNode, ref, SESSIONS, setUp, TARGET, tearDown } from "../../test/e2e/harness.ts";
 import type { Created, Read, Seen, Started } from "./session.ts";
@@ -282,9 +286,47 @@ async function upload(image: string, prefix: string): Promise<void> {
   }
 }
 
-/** The options of the S3 gofer for the image at `objectPrefix` in the bucket, its layers each under `layersPrefix`, as JSON. */
-const goferOptions = (objectPrefix: string, layersPrefix: string) =>
-  JSON.stringify({ endpoint: s3.endpoint, region: s3.region, bucket: s3.bucket, object_prefix: objectPrefix, layers_prefix: layersPrefix, addressing: "path", credentials: { access_key_id: s3.accessKeyId, secret_access_key: s3.secretAccessKey } });
+/**
+ * The options of the S3 gofer for the image at `objectPrefix` in the bucket, its layers each
+ * under `layersPrefix`, as JSON: at `endpoint` with `credentials`, the store's own unless said.
+ */
+const goferOptions = (objectPrefix: string, layersPrefix: string, endpoint = s3.endpoint, credentials = { access_key_id: s3.accessKeyId, secret_access_key: s3.secretAccessKey }) =>
+  JSON.stringify({ endpoint, region: s3.region, bucket: s3.bucket, object_prefix: objectPrefix, layers_prefix: layersPrefix, addressing: "path", credentials });
+
+/**
+ * A relay on this machine to `target` (`http://host:port`), as the gofer, on the node, reaches
+ * it: what it carries back, and when it last did, so that a restore's reads, its working set
+ * first and the rest in the background after, are timed to their end, whatever they go through.
+ */
+async function relayTo(target: string): Promise<{ readonly endpoint: string; readonly carried: () => { readonly bytes: number; readonly lastAt: number }; readonly close: () => void }> {
+  const url = new URL(target);
+  let bytes = 0;
+  let lastAt = 0;
+  const server = createServer((client) => {
+    const upstream = connect({ host: url.hostname, port: Number(url.port) || 80 });
+    client.pipe(upstream);
+    upstream.on("data", (chunk: Buffer) => {
+      bytes += chunk.length;
+      lastAt = Date.now();
+    });
+    upstream.pipe(client);
+    upstream.on("error", () => client.destroy());
+    client.on("error", () => upstream.destroy());
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return { endpoint: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, carried: () => ({ bytes, lastAt }), close: () => server.close() };
+}
+
+/** How long a restore that began at `startedAt` read through `relay`, once its reads have stopped for `quietMs`: to its working set, and to its end. */
+async function readsOf(relay: Awaited<ReturnType<typeof relayTo>>, startedAt: number, quietMs = 5000): Promise<{ readonly bytes: number; readonly lastReadMs: number }> {
+  for (;;) {
+    const { lastAt } = relay.carried();
+    if (lastAt > 0 && Date.now() - lastAt >= quietMs) break;
+    await sleep(500);
+  }
+  const { bytes, lastAt } = relay.carried();
+  return { bytes, lastReadMs: lastAt - startedAt };
+}
 
 test("4. a chain restores straight from the bucket, from a directory holding s3_opts.json alone", { timeout: 30 * 60_000 }, () =>
   recorded("bucket", async (seen) => {
@@ -310,16 +352,40 @@ test("4. a chain restores straight from the bucket, from a directory holding s3_
     for (const layer of layers) await upload(byDigest.get(layer) ?? "", `${layersPrefix}${layer}/`);
     seen["uploadMs"] = Date.now() - uploadingAt;
 
-    // runsc, and the shim through it, reads every file of the image from the bucket.
-    const directory = at("bucket-D");
-    await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && umask 077 && printf '%s' ${q(goferOptions(`${layersPrefix}${own}/`, layersPrefix))} >${q(`${directory}/s3_opts.json`)}`);
-    const restored = await restoreFrom(directory);
-    seen["restore"] = restored;
-    assert.ok(restored.ready, JSON.stringify(restored));
-    const read = await inGate<Read>("read", session.volumeId, session.replId);
-    seen["read"] = read;
-    assert.deepEqual([read.marker, read.step], ["42", "4"]);
-    assert.match(read.notice ?? "", CAME_BACK_WHOLE);
+    // runsc, and the shim through it, reads every file of the image from the bucket: straight
+    // from the store, then through the node agent's proxy of it, as alasio's restores do,
+    // a restore's own token signing it; each through a relay that times its reads to their end.
+    const restoredThrough = async (name: string, endpoint: string, credentials?: { access_key_id: string; secret_access_key: string }) => {
+      const relay = await relayTo(endpoint);
+      try {
+        const directory = at(`bucket-D-${name}`);
+        await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && umask 077 && printf '%s' ${q(goferOptions(`${layersPrefix}${own}/`, layersPrefix, relay.endpoint, credentials))} >${q(`${directory}/s3_opts.json`)}`);
+        const startedAt = Date.now();
+        const restored = await restoreFrom(directory);
+        assert.ok(restored.ready, JSON.stringify(restored));
+        const reads = await readsOf(relay, startedAt);
+        const read = await inGate<Read>("read", session.volumeId, session.replId);
+        assert.deepEqual([read.marker, read.step], ["42", "4"]);
+        assert.match(read.notice ?? "", CAME_BACK_WHOLE);
+        return { restore: restored, readyMs: restored.ms, ...reads, read };
+      } finally {
+        relay.close();
+      }
+    };
+    seen["direct"] = await restoredThrough("direct", s3.endpoint);
+    let release = () => {};
+    const proxy = await new Promise<StoreProxy>((resolve, reject) => {
+      Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        resolve(yield* makeStoreProxy({ store: s3, host: "127.0.0.1", port: 0 }));
+        yield* Effect.promise(() => new Promise<void>((resolved) => (release = resolved)));
+      }))).catch(reject);
+    });
+    try {
+      const token = proxy.mint(`gate-12/${session.volumeId}`, layersPrefix);
+      seen["proxied"] = await restoredThrough("proxied", proxy.endpoint, { access_key_id: token.accessKeyId, secret_access_key: token.secretAccessKey });
+    } finally {
+      release();
+    }
   }));
 
 test("5. a delta after a restore from the bucket, its parent's pages_meta.img alone on the node, or its pages too", { timeout: 30 * 60_000 }, () =>
