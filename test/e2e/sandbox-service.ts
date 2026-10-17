@@ -205,7 +205,10 @@ export function sandboxService(): void {
       const agent = (await nodeAgents()).get(node) ?? "";
       const seen = async () => {
         const mount = (await kube.exec(NAMESPACE, agent, ["sh", "-c", `stat -f -c 'agent sees %T' ${WORKSPACES_ROOT}; grep -E ' ${WORKSPACES_ROOT}| fuse' /proc/1/mountinfo || echo 'the node mounts nothing there'`], { container: "node-agent" })).stdout.trim();
-        const logged = await Promise.all((await mountPods()).map(async ({ metadata }) => `${metadata?.name}: ${(await kube.logs(NAMESPACE, metadata?.name ?? "", "workspace-mount").catch((error: unknown) => String(error))).split("\n").slice(-15).join("\n")}`));
+        // What the mount's pod said of the node's mount, beside juicefs's own.
+        const logged = await Promise.all((await mountPods()).map(async ({ metadata }) =>
+          `${metadata?.name}: ${(await kube.logs(NAMESPACE, metadata?.name ?? "", "workspace-mount").catch((error: unknown) => String(error))).split("\n").filter((line) => !/juicefs\[\d+\]/u.test(line)).join("\n")}`
+        ));
         return [mount, ...logged].join("\n");
       };
       // Within the mount's look, once a second, at whether the node has lost its mount.
