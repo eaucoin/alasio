@@ -66,10 +66,19 @@ async function gatewayCall(token: string, method: string, path: string, body?: s
   return { status: Number(lines.at(-1)), said: lines.slice(0, -1).join("\n") };
 }
 
+/** Binds `workspace` through the gateway by `token`, as its caller binds it, waiting up to `timeoutMs`; what the gateway last answered, and logged of it, said where it does not. */
+async function bindThrough(token: string, workspace: string, what: string, timeoutMs: number): Promise<void> {
+  let last = { status: 0, said: "" };
+  await until(what, async () => {
+    last = await gatewayCall(token, "POST", "/bind");
+    return last.status === 204 ? true : undefined;
+  }, timeoutMs, async () => `; it last answered ${last.status} ${last.said}\n${await serviceLogs(workspace)}`);
+}
+
 /** The pod of main's sessions bound to `workspace`, once it is: its name and node. */
 async function boundPod(workspace: string): Promise<{ readonly name: string; readonly node: string }> {
   const [bound] = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` });
-  assert.ok(bound?.metadata?.name, `no pod is bound to ${workspace}`);
+  assert.ok(bound?.metadata?.name, `no pod is bound to ${workspace}\n${await serviceLogs(workspace)}`);
   return { name: bound.metadata.name, node: bound.spec?.nodeName ?? "" };
 }
 
@@ -137,7 +146,7 @@ async function serviceLogs(workspace: string): Promise<string> {
   ];
   const said = await Promise.all(pods.map(async ([pod, container]) => {
     const logged = await kube.logs(NAMESPACE, pod.metadata?.name ?? "", container).catch((error: unknown) => String(error));
-    return `${pod.metadata?.name}:\n${logged.split("\n").filter((line) => line.includes(workspace)).slice(-20).join("\n")}`;
+    return `${pod.metadata?.name}:\n${logged.split("\n").filter((line) => line.includes(workspace)).slice(-40).join("\n")}`;
   }));
   return said.join("\n");
 }
@@ -256,7 +265,7 @@ export function sandboxService(): void {
       await until("the bound pod released", async () =>
         (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` })).length === 0 ? true : undefined, 180_000, async () => `\nits node's agent says of what is attached: ${(await agentCall("GET", "/attachments")).said}\n${await serviceLogs(workspace)}`);
       assert.match(await serviceLogs(workspace), /workspace is unreachable in its pod/u);
-      await until("the gateway binding the workspace again", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      await bindThrough(token, workspace, "the gateway binding the workspace again", 180_000);
       const again = await boundPod(workspace);
       assert.notEqual(again.name, bound.name);
       assert.equal(await kube.execOk(SESSIONS, again.name, ["cat", "/workspace/before"], { container: "bayma" }), "kept through it");
@@ -298,7 +307,7 @@ export function sandboxService(): void {
       assert.equal(released.status, 204, `${released.said}\n${await serviceLogs(workspace)}`);
       await until("the released pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", first.name, SESSIONS))) === null ? true : undefined), 180_000);
       // Bound again: restored, by a pod of its own, its processes running on from where they were, their files held.
-      await until("the gateway binding the workspace again", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 300_000);
+      await bindThrough(token, workspace, "the gateway binding the workspace again", 300_000);
       const restored = await boundPod(workspace);
       assert.match(restored.name, /^sandboxes-none-restore-/u, await serviceLogs(workspace));
       await new Promise((resolve) => setTimeout(resolve, 2_000));
@@ -355,7 +364,7 @@ export function sandboxService(): void {
       assert.deepEqual(await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` }), []);
       assert.equal((await gatewayCall(token, "GET", "/workspace/quota")).status, 200);
       // Bound again, to another pod, with what it held.
-      await until("the gateway binding the workspace again", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      await bindThrough(token, workspace, "the gateway binding the workspace again", 180_000);
       assert.notEqual((await boundPod(workspace)).name, claimed.name);
       assert.equal(await inSandbox("cat /workspace/out/reply.txt"), "a chart, drawn");
       // Deleted once released, and not before.
