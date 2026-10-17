@@ -2,7 +2,9 @@
  * The sandbox gateway, a program of alasio's image on the floor: the binder's front
  * (../binder/server.ts) for session workspaces (./sessions.ts), as its configuration file
  * (GATEWAY_CONFIG_VARIABLE, which `alasio up` renders) and its keys (CALLER_KEY_VARIABLE,
- * BINDING_KEY_VARIABLE) say, reaching the node agents with their token, as alasio does.
+ * BINDING_KEY_VARIABLE) say, reaching the node agents with their token, as alasio does, and
+ * telling each environment's alasio of what happens to its sessions' bindings on the log
+ * (../events/events.ts).
  * What a gateway that ended left between a binding's steps is set right as it starts, and
  * every RECONCILE_MS after; bound pods are looked at for one to release every SWEEP_MS.
  * What stops it is logged.
@@ -16,11 +18,20 @@ import { FetchHttpClient } from "effect/http";
 import { Binder } from "../binder/binder.ts";
 import { reconcile } from "../binder/bindings.ts";
 import { serveBinder } from "../binder/server.ts";
+import { Events } from "../events/events.ts";
 import { KubeClient } from "../kube/client.ts";
 import { makeNodeAgents } from "../sandbox/node-agents.ts";
 import { withLogScope } from "../shared/log.ts";
 import { makeEnvironments } from "./environments.ts";
-import { BINDING_KEY_VARIABLE, CALLER_KEY_VARIABLE, GATEWAY_CONFIG_VARIABLE, GatewayConfig } from "./names.ts";
+import {
+  BINDING_KEY_VARIABLE,
+  CALLER_KEY_VARIABLE,
+  EVENTS_BROKERS_VARIABLE,
+  EVENTS_PASSWORD_FILE_VARIABLE,
+  EVENTS_USERNAME_VARIABLE,
+  GATEWAY_CONFIG_VARIABLE,
+  GatewayConfig,
+} from "./names.ts";
 import { makeSessions } from "./sessions.ts";
 
 /** How often bound pods are looked at for one to release: each pod's bayma is asked no oftener than its poll (./sessions.ts). */
@@ -33,6 +44,14 @@ const loadConfig = Effect.gen(function*() {
   const path = yield* Config.String(GATEWAY_CONFIG_VARIABLE);
   const text = yield* Effect.try({ try: () => readFileSync(path, "utf8"), catch: (error) => new Error(`${GATEWAY_CONFIG_VARIABLE} ${path} cannot be read: ${String(error)}`) });
   return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(GatewayConfig))(text);
+});
+
+/** What tells of events, on the log its variables name (./names.ts). */
+const eventsOf = Effect.gen(function*() {
+  const brokers = yield* Config.String(EVENTS_BROKERS_VARIABLE);
+  const username = yield* Config.String(EVENTS_USERNAME_VARIABLE);
+  const passwordFile = yield* Config.String(EVENTS_PASSWORD_FILE_VARIABLE);
+  return yield* Events.make({ brokers: brokers.split(","), username, passwordFile });
 });
 
 /** A key, its text, from the variable `name`. */
@@ -48,16 +67,19 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
     const binder = yield* Binder;
     const agents = yield* makeNodeAgents(config.nodeAgents);
     const environments = yield* makeEnvironments({ main: config.environment });
+    const events = yield* eventsOf;
     const sessions = yield* makeSessions(
-      { environments, pools: config.pools, releaseAfterMs: config.releaseAfterSeconds * 1000, podPort: config.podPort, bindingKey },
+      { environments, pools: config.pools, releaseAfterMs: config.releaseAfterSeconds * 1000, podPort: config.podPort, bindingKey, events },
       agents,
       binder,
     );
-    const setRight = Effect.forEach(yield* sessions.pools, (pool) =>
-      reconcile(pool).pipe(
-        Effect.tap(({ pods, leases }) => (pods.length + leases.length > 0 ? Effect.logInfo(`set ${pool.namespace}/${pool.name} right: deleted ${pods.join(", ") || "no pod"}, let go ${leases.join(", ") || "no Lease"}`) : Effect.void)),
-        Effect.catch((error) => Effect.logWarning(`setting ${pool.namespace}/${pool.name} right failed: ${error.message}`)),
-      ), { discard: true });
+    // Of the pools there are as each round begins.
+    const setRight = Effect.flatMap(sessions.pools, (pools) =>
+      Effect.forEach(pools, (pool) =>
+        reconcile(pool, (lease) => sessions.lost(pool, lease)).pipe(
+          Effect.tap(({ pods, leases }) => (pods.length + leases.length > 0 ? Effect.logInfo(`set ${pool.namespace}/${pool.name} right: deleted ${pods.join(", ") || "no pod"}, let go ${leases.join(", ") || "no Lease"}`) : Effect.void)),
+          Effect.catch((error) => Effect.logWarning(`setting ${pool.namespace}/${pool.name} right failed: ${error.message}`)),
+        ), { discard: true }));
     yield* setRight;
     yield* Effect.forkScoped(Effect.repeat(setRight, Schedule.spaced(RECONCILE_MS)));
     yield* Effect.forkScoped(Effect.repeat(

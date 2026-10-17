@@ -24,6 +24,7 @@
 import type { KubernetesObject, V1ConfigMap, V1Container, V1EnvVar, V1Service, V1StatefulSet } from "@kubernetes/client-node";
 
 import type { LogPrincipal, MainEnvironmentPrincipal } from "../../../neon/control/secrets.ts";
+import { eventsTopic } from "../../../src/events/names.ts";
 import { imageReference } from "../images.ts";
 import { claimSpec, componentName, type Environment, NAMESPACE, replicasOf, restrictedContainer, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
 import { type InstallConfig, LOG_SEGMENT_BYTES, telemetryRetentionBytes } from "./config.ts";
@@ -72,6 +73,9 @@ export const alasioGroup = (name: string): string => `alasio.${name}`;
 
 /** How long an environment's wake records are kept: a day, long past its lake loader's waking at the first. */
 export const WAKE_RETENTION_MS = 86_400_000;
+/** How long an environment's events are kept: as long as its Telegram updates, past any wait of its alasio's to read them. */
+export const EVENTS_RETENTION_MS = TELEGRAM_RETENTION_MS;
+
 /** The topic the environment `name`'s alasio writes as it commits transcripts, which wakes its lake loader. */
 export const lakeWakeTopic = (name: string): string => `lake.${name}`;
 /** The principal the environment `name`'s lake loader reaches the log as. */
@@ -85,14 +89,17 @@ export const loaderGroup = (name: string): string => `lake-loader.${name}`;
  * forgotten with the environment. Its alasio's, `alasio-<name>`, reading its Telegram
  * topic in its group, `alasio.<name>`, and writing its wake topic, `lake.<name>`, as it
  * commits transcripts; its lake loader's, `loader-<name>`, reading the wake topic in its
- * group, `lake-loader.<name>`; those topics, of one partition each, as one alasio and one
- * loader read them, a chat's updates in order, each keeping a segment beside the one it
- * writes at most: a week of a bot's updates, and a day of wakes, is kilobytes. Each update
- * is flushed to the volume as it is written; a wake, lost, costs nothing.
+ * group, `lake-loader.<name>`; and its events topic, `events.<name>` (src/events/), which the
+ * gateways write and its alasio reads in its group; those topics, of one partition each, as
+ * one alasio and one loader read them, a chat's updates in order, each keeping a segment
+ * beside the one it writes at most: a week of a bot's updates, or of events, and a day of
+ * wakes, is kilobytes. Each update, and each event, is flushed to the volume as it is
+ * written, as what told of it does not tell again; a wake, lost, costs nothing.
  */
 export function environmentAccess(name: string): EnvironmentLogAccess {
   const topic = telegramTopic(name);
   const wake = lakeWakeTopic(name);
+  const events = eventsTopic(name);
   return {
     principals: [
       {
@@ -101,6 +108,7 @@ export function environmentAccess(name: string): EnvironmentLogAccess {
           { resource: "topic", name: topic, pattern: "literal", operations: ["read", "describe"] },
           { resource: "group", name: alasioGroup(name), pattern: "literal", operations: ["read"] },
           { resource: "topic", name: wake, pattern: "literal", operations: ["write", "describe"] },
+          { resource: "topic", name: events, pattern: "literal", operations: ["read", "describe"] },
         ],
       },
       {
@@ -112,6 +120,7 @@ export function environmentAccess(name: string): EnvironmentLogAccess {
       // Each update flushed to the volume as it is written: Telegram, answered once the log has it, sends it no more.
       { name: topic, partitions: 1, retentionMs: TELEGRAM_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: { "flush.messages": "1" } },
       { name: wake, partitions: 1, retentionMs: WAKE_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: {} },
+      { name: events, partitions: 1, retentionMs: EVENTS_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: { "flush.messages": "1" } },
     ],
   };
 }
@@ -186,8 +195,9 @@ const retentionMs = (retention: string): number => Number(retention.slice(0, -1)
  * (flush.ms); the gateway's writing them, the intake's reading them in its group, and
  * KEDA's reading how far the group is behind on them, and each environment's lake loader on
  * its wake topic, which asks to describe both and to read neither; the webhook intake's
- * writing every environment's Telegram topic, a branch's among them, and nothing else; and
- * main's environment's principals and topics (environmentAccess).
+ * writing every environment's Telegram topic, a branch's among them, and nothing else; the
+ * sandbox gateway's writing every environment's events topic, and nothing else; and main's
+ * environment's principals and topics (environmentAccess).
  *
  * A write is acknowledged once a majority of the nodes have it in their page caches, not
  * on their volumes. On one node, the volume outlives the pod, so a restart of the pod loses
@@ -215,6 +225,8 @@ export function logAccess(config: InstallConfig): LogAccess {
       { resource: "group", name: "lake-loader.", pattern: "prefixed", operations: ["describe"] },
     ],
     webhook: [{ resource: "topic", name: "telegram.", pattern: "prefixed", operations: ["write", "describe"] }],
+    // Every environment's events, a branch's among them, and nothing else.
+    "sandbox-gateway": [{ resource: "topic", name: "events.", pattern: "prefixed", operations: ["write", "describe"] }],
   };
   const retention = { retentionMs: retentionMs(config.log.retention), retentionBytes: telemetryRetentionBytes(config) };
   return {
