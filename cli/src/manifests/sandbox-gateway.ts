@@ -76,6 +76,8 @@ import {
   selectorLabels,
   sha256,
 } from "./common.ts";
+import { sandboxPodPolicy } from "./admission.ts";
+import { SANDBOX_CONTROLLER_USER } from "./agent-sandbox.ts";
 import { durationSeconds, type InstallConfig } from "./config.ts";
 import { LOG_BROKERS, logPrincipalSecret } from "./log.ts";
 import { boundBudget } from "./disruption.ts";
@@ -491,9 +493,15 @@ export function sandboxPoolObjects(config: InstallConfig, environment: Environme
 export function sandboxServiceObjects(config: InstallConfig): KubernetesObject[] {
   if (!sandboxServiceRuns(config)) return [];
   const mount = workspaceMount(config);
+  const pools = poolsOf(config, MAIN_ENVIRONMENT);
   return [
     ...gatewayIdentity(),
     ...gatewayObjects(config),
+    // Every pod of every environment's sessions held to the pools' templates, as Pod Security cannot.
+    ...sandboxPodPolicy([poolTemplate(config, pools.none, "none"), poolTemplate(config, pools.full, "full")], {
+      sessionsNamespace: sessionsNamespace(config, MAIN_ENVIRONMENT),
+      sandboxController: SANDBOX_CONTROLLER_USER,
+    }),
     ...receiverObjects(config),
     ...sandboxPoolObjects(config, MAIN_ENVIRONMENT),
     mount,

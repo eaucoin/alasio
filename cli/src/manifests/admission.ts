@@ -28,7 +28,8 @@ import { posix } from "node:path";
 
 import type { KubernetesObject, V1Container, V1PodSpec, V1PodTemplateSpec, V1Volume } from "@kubernetes/client-node";
 
-import { branchNamespace } from "../../../src/branch/names.ts";
+import { BINDING_LABEL, FREE_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../../src/binder/names.ts";
+import { branchNamespace, branchSessionsNamespace } from "../../../src/branch/names.ts";
 import { BUSY_ANNOTATIONS, BUSY_LABEL } from "../../../src/kube/busy-label.ts";
 import { CLONE_VARIABLES, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import {
@@ -434,6 +435,160 @@ function sandboxOf(template: SessionsProfile | HostProfile, workspace: SessionWo
     podTemplate: { ...podTemplate, metadata: { ...podTemplate.metadata, labels: { ...podTemplate.metadata?.labels, ...own }, ...metadataAnnotations }, spec: podSpec },
     ...(claims.length > 0 ? { volumeClaimTemplates: claims.length === 1 ? claims[0] : oneOf(...(claims as Pinned[])) } : {}),
   } as unknown as PinnedMap, { shutdownPolicy: "Retain" });
+}
+
+/** Any number. */
+const ANY_NUMBER = new Check((expression) => `type(${expression}) == int || type(${expression}) == double`);
+
+/** The tolerations the API server gives a pod of a node not ready or unreachable, for five minutes, where it has none of its own of them (DefaultTolerationSeconds). */
+const DEFAULT_TOLERATIONS: readonly Pinned[] = ["node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable"].map((key) => ({ key, operator: "Exists", effect: "NoExecute", tolerationSeconds: 300 }));
+
+/**
+ * What the API server gives a sandbox pool's pod, of its template, where the template has
+ * not: its own defaults, its priority from its class, its ServiceAccount the namespace's
+ * default, which it mounts no token of; of each container, where its termination message
+ * goes, and its resources as VPA sizes them; of a probe, its timeout and thresholds; of a
+ * port, its protocol; of a field reference, its API version.
+ */
+const POOL_POD_DEFAULTS = {
+  pod: {
+    restartPolicy: "Always",
+    terminationGracePeriodSeconds: 30,
+    schedulerName: "default-scheduler",
+    serviceAccountName: "default",
+    serviceAccount: "default",
+    priority: ANY_NUMBER,
+    preemptionPolicy: oneOf("PreemptLowerPriority", "Never"),
+  },
+  container: { terminationMessagePath: "/dev/termination-log", terminationMessagePolicy: "File", resources: ANY },
+  probe: { timeoutSeconds: 1, successThreshold: 1, failureThreshold: 3 },
+} satisfies Record<string, Record<string, Pinned>>;
+
+/** `container` of a pool's template, as the API server stores it in a pod (POOL_POD_DEFAULTS). */
+function poolContainer(container: V1Container): Pinned {
+  const each = container as unknown as PinnedMap;
+  const probe = each["readinessProbe"] as PinnedMap | undefined;
+  return defaulted({
+    ...each,
+    // Its resources are VPA's, as it sizes the pod as it is made, and resizes it after (pods/resize).
+    resources: ANY,
+    ...(container.ports ? { ports: container.ports.map((port) => defaulted(port as unknown as PinnedMap, { protocol: "TCP" })) } : {}),
+    ...(container.env
+      ? {
+        env: container.env.map((variable) =>
+          variable.valueFrom?.fieldRef
+            ? { ...variable, valueFrom: { fieldRef: defaulted(variable.valueFrom.fieldRef as unknown as PinnedMap, { apiVersion: "v1" }) } }
+            : variable
+        ) as unknown as Pinned[],
+      }
+      : {}),
+    ...(probe ? { readinessProbe: defaulted(probe, POOL_POD_DEFAULTS.probe) } : {}),
+  }, POOL_POD_DEFAULTS.container);
+}
+
+/** The spec of a pod of the pool template `template`, as the API server stores it: what POOL_POD_DEFAULTS adds, and its tolerations, its template's then the API server's own. */
+function poolPodSpec(template: V1PodTemplateSpec): Pinned {
+  const spec = template.spec ?? { containers: [] };
+  const tolerations = (spec.tolerations ?? []) as unknown as Pinned[];
+  return defaulted({
+    ...(spec as unknown as PinnedMap),
+    containers: spec.containers.map(poolContainer),
+    // The API server's of a node not ready and unreachable, in either order.
+    tolerations: oneOf([...tolerations, ...DEFAULT_TOLERATIONS], [...tolerations, ...[...DEFAULT_TOLERATIONS].reverse()]),
+  }, POOL_POD_DEFAULTS.pod);
+}
+
+/**
+ * Where the sandbox pods' policy holds: main's sessions' namespace, by its name, and every
+ * branch environment's; and who makes the pods of the session Sandboxes there are, beside the
+ * pools', until they are gone: agent-sandbox's controller, by its user's name.
+ */
+interface SandboxPodScope {
+  readonly sessionsNamespace: string;
+  readonly sandboxController: string;
+}
+
+/**
+ * Every pod of a namespace of sessions, main's or a branch environment's, made or changed by
+ * anyone, held to what the pools' templates, `templates`, make, as Pod Security's restricted
+ * level, which the namespaces keep warning and auditing of, cannot: a pool's pod mounts its
+ * own directory on its node, a hostPath no level but privileged allows, which the namespaces
+ * enforce, so this policy is their boundary.
+ *
+ * - A pod made is a pod of one of `templates`, as the API server stores it (poolPodSpec), its
+ *   template's labels and annotations, its ReplicaSet's template hash beside them, and what
+ *   VPA notes; or, of the session Sandboxes there are until they go, one agent-sandbox's
+ *   controller makes, of a Sandbox the Sandbox policy holds to its template.
+ * - A pod changed keeps its spec whole (its resources change by pods/resize, which this does
+ *   not match), and of its labels and annotations changes those a binding has alone (its free
+ *   label taken off, its binding's put on) and those that keep its node, and of its owners lets
+ *   go alone.
+ * - No pod gets an ephemeral container.
+ *
+ * It fails closed: where it cannot say, the API server refuses.
+ */
+export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sessionsNamespace, sandboxController }: SandboxPodScope): KubernetesObject[] {
+  const name = componentName("sandbox-pods");
+  const metadata = { name, labels: labels("session") };
+  const made = templates.map((template) => {
+    const labels = { ...(template.metadata?.labels ?? {}), "pod-template-hash": ANY_STRING } as PinnedMap;
+    const annotations = { ...(template.metadata?.annotations ?? {}), vpaObservedContainers: optional(ANY_STRING), vpaUpdates: optional(ANY_STRING) } as PinnedMap;
+    return `(${pinned("object.spec", poolPodSpec(template))} && ${pinned("variables.labels", labels)} && ${pinned("variables.annotations", annotations)})`;
+  });
+  const bound = [BINDING_LABEL, FREE_LABEL];
+  const policy = {
+    apiVersion: "admissionregistration.k8s.io/v1",
+    kind: "ValidatingAdmissionPolicy",
+    metadata,
+    spec: {
+      failurePolicy: "Fail",
+      matchConstraints: {
+        resourceRules: [
+          { apiGroups: [""], apiVersions: ["*"], resources: ["pods"], operations: ["CREATE", "UPDATE"] },
+          { apiGroups: [""], apiVersions: ["*"], resources: ["pods/ephemeralcontainers"], operations: ["CREATE", "UPDATE"] },
+        ],
+      },
+      matchConditions: [{
+        name: "of-sessions",
+        expression: `request.namespace == ${JSON.stringify(sessionsNamespace)} || request.namespace.matches(${JSON.stringify(`^${literally(branchSessionsNamespace("\u0000")).replace("\u0000", DNS_LABEL)}$`)})`,
+      }],
+      variables: [
+        { name: "labels", expression: "object.metadata.?labels.orValue({})" },
+        { name: "annotations", expression: "object.metadata.?annotations.orValue({})" },
+        { name: "oldLabels", expression: "request.operation == 'UPDATE' ? oldObject.metadata.?labels.orValue({}) : {}" },
+        { name: "newLabels", expression: "object.metadata.?labels.orValue({})" },
+        { name: "oldAnnotations", expression: "request.operation == 'UPDATE' ? oldObject.metadata.?annotations.orValue({}) : {}" },
+        { name: "newAnnotations", expression: "object.metadata.?annotations.orValue({})" },
+        { name: "pooled", expression: `${JSON.stringify(POOL_LABEL)} in variables.labels || ${JSON.stringify(POOL_LABEL)} in variables.oldLabels` },
+      ],
+      validations: [
+        { expression: "request.?subResource.orValue('') != 'ephemeralcontainers'", message: "no pod of a namespace of sessions gets an ephemeral container" },
+        {
+          expression: `request.operation != 'CREATE' || !variables.pooled || ${made.join(" || ")}`,
+          message: "a pod of a sandbox pool is its pool's template, as alasio up renders it, and nothing else",
+        },
+        {
+          expression: `request.operation != 'CREATE' || variables.pooled || request.userInfo.username == ${JSON.stringify(sandboxController)}`,
+          message: "no pod is made in a namespace of sessions but a sandbox pool's, and a session Sandbox's",
+        },
+        { expression: "request.operation != 'UPDATE' || object.spec == oldObject.spec", message: "no pod's spec changes in a namespace of sessions" },
+        {
+          expression: `request.operation != 'UPDATE' || !variables.pooled || (${unchanged("Labels", bound)})`,
+          message: `no label of a sandbox pool's pod changes but ${bound.join(" and ")}, as it is bound`,
+        },
+        {
+          expression: `request.operation != 'UPDATE' || !variables.pooled || (${unchanged("Annotations", [KEY_ANNOTATION, ...Object.keys(BUSY_ANNOTATIONS)])})`,
+          message: `no annotation of a sandbox pool's pod changes but ${KEY_ANNOTATION} and what keeps its node, as it is bound`,
+        },
+        {
+          expression: "request.operation != 'UPDATE' || object.metadata.?ownerReferences.orValue([]).all(owner, owner in oldObject.metadata.?ownerReferences.orValue([]))",
+          message: "a pod of a namespace of sessions gets no owner it had not",
+        },
+      ],
+    },
+  };
+  const binding = { apiVersion: "admissionregistration.k8s.io/v1", kind: "ValidatingAdmissionPolicyBinding", metadata, spec: { policyName: name, validationActions: ["Deny"] } };
+  return [policy, binding];
 }
 
 /** The name of the Sandbox policy of the alasio of the namespace `namespace`. */
