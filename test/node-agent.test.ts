@@ -2395,6 +2395,7 @@ test("the agent's API attaches, detaches, reads and writes a workspace's files a
       const at = workspacesNode();
       yield* Effect.addFinalizer(() => Effect.sync(at.done));
       at.files("fs-abc123");
+      at.pod("pool-0");
       const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent, workspaces: at.workspaces });
       const call = (method: string, path: string, body?: string) =>
         Effect.promise(() => fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { authorization: "Bearer the token" }, ...(body === undefined ? {} : { body }) }));
@@ -2422,6 +2423,7 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       const at = workspacesNode();
       yield* Effect.addFinalizer(() => Effect.sync(at.done));
       at.files("fs-abc123");
+      at.pod("pool-0");
       const agents = yield* agentsOf(here.agent, at.workspaces);
       const ref = { environment: "main", workspace: "fs-abc123" };
       yield* agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding", env: {} });
