@@ -311,12 +311,15 @@ interface Relay {
 /**
  * A relay on this machine to `target` (`http://host:port`), as the gofer, on the node, reaches
  * it: what it carries back, and when it last did, so that a restore's reads, its working set
- * first and the rest in the background after, are timed to their end, whatever they go through.
+ * first and the rest in the background after, are timed to their end, whatever they go through;
+ * at most `bytesPerSecond` of them, all together, where given, as a store farther away gives
+ * them.
  */
-async function relayTo(target: string): Promise<Relay> {
+async function relayTo(target: string, { bytesPerSecond }: { readonly bytesPerSecond?: number } = {}): Promise<Relay> {
   const url = new URL(target);
   let bytes = 0;
   let lastAt = 0;
+  const startedAt = Date.now();
   const carrying = new Set<Socket>();
   const server = createServer((client) => {
     const upstream = connect({ host: url.hostname, port: Number(url.port) || 80 });
@@ -328,6 +331,12 @@ async function relayTo(target: string): Promise<Relay> {
     upstream.on("data", (chunk: Buffer) => {
       bytes += chunk.length;
       lastAt = Date.now();
+      // Ahead of its rate: held until it is not.
+      const ahead = bytesPerSecond === undefined ? 0 : (bytes / bytesPerSecond) * 1000 - (Date.now() - startedAt);
+      if (ahead > 0) {
+        upstream.pause();
+        setTimeout(() => upstream.resume(), ahead);
+      }
     });
     upstream.pipe(client);
     upstream.on("error", () => client.destroy());
@@ -533,6 +542,8 @@ test("7. a live snapshot restores into a new pod while its exec runs, which goes
 
 /** The random bytes gate 8's session holds, which its restores read in the background, untouched. */
 const BALLAST_MIB = 512;
+/** How fast gate 8's relay carries a restore's reads: slow enough that its background lasts half a minute. */
+const OUTAGE_RELAY_BYTES_PER_SECOND = 16 * 1024 ** 2;
 /** How long gate 8 holds the proxy away for good: past the gofer's attempts of a read, 5, each at most 20 s after the one before. */
 const GONE_FOR_GOOD_MS = 150_000;
 /** How long gate 8 waits for an answer of a sandbox that may not give one. */
@@ -560,20 +571,20 @@ async function agentReplaced(): Promise<{ readonly ms: number; readonly from: st
 test("8. a restore from the bucket whose proxy goes away during its background reads, for a while and for good, and how long a node agent takes to come back", { timeout: 60 * 60_000 }, () =>
   recorded("outage", async (seen) => {
     seen["agentReplaced"] = await agentReplaced();
-    Object.assign(session, await inGate<Created>("create"));
-    seen["session"] = { ...session };
-    seen["ballast"] = await inGate("ballast", session.volumeId, session.replId, String(BALLAST_MIB));
-    const layersPrefix = `gate-12/${session.volumeId}/layers/`;
     const restartMs = (seen["agentReplaced"] as { readonly ms: number }).ms;
     // For a while, then back on the same port: briefly, and as long as an agent takes to come
-    // back; then for good. Each a whole image of the sandbox, which the restore reads every
-    // page of from the bucket.
+    // back; then for good. Each of a session of its own, a whole image of whose sandbox the
+    // restore reads every page of from the bucket.
     const outages = [["brief", 10_000], ["restart", restartMs], ["forGood", null]] as const;
     await throughProxy(async (proxy) => {
       for (const [name, outageMs] of outages) {
         const outcome: Record<string, unknown> = { outageMs };
         seen[name] = outcome;
         try {
+          Object.assign(session, await inGate<Created>("create"));
+          outcome["session"] = { ...session };
+          outcome["ballast"] = await inGate("ballast", session.volumeId, session.replId, String(BALLAST_MIB));
+          const layersPrefix = `gate-12/${session.volumeId}/layers/`;
           const image = `outage-${name}`;
           outcome["checkpoint"] = await checkpoint(image, { live: false });
           const own = await digest(at(image));
@@ -581,7 +592,7 @@ test("8. a restore from the bucket whose proxy goes away during its background r
           const pagesBytes = Number((await node(`stat -c %s ${q(`${at(image)}/pages.img`)}`)).trim());
           outcome["pagesBytes"] = pagesBytes;
           const token = proxy.mint(`gate-12/${session.volumeId}`, layersPrefix);
-          const relay = await relayTo(proxy.endpoint);
+          const relay = await relayTo(proxy.endpoint, { bytesPerSecond: OUTAGE_RELAY_BYTES_PER_SECOND });
           try {
             const directory = at(`bucket-${image}`);
             await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && umask 077 && printf '%s' ${q(goferOptions(`${layersPrefix}${own}/`, layersPrefix, relay.endpoint, { access_key_id: token.accessKeyId, secret_access_key: token.secretAccessKey }))} >${q(`${directory}/s3_opts.json`)}`);
