@@ -30,14 +30,21 @@
  * bayma's checkpoints, why logged and counted (alasio.sandbox.restores). A restore refused
  * before its sandbox resumed is abandoned on its node first, as alasio's were. Main's sessions
  * alone are snapshotted, as alasio's were.
+ *
+ * A bound pod ended by other than the gateway, as a drain, an eviction or a deletion through
+ * the API server ends one, is saved while its bayma holds its stop for it (saveStopping), as
+ * alasio's sessions were: RELEASES_PER_NODE of a node's at once, the others waiting their turn;
+ * none where its bayma holds no stop, where its turn comes once it holds it no more, or where
+ * its save fails, the workspace then coming back from bayma's checkpoints. Counted by outcome
+ * (alasio.sandbox.stop_releases).
  */
 import type { V1Deployment, V1NetworkPolicy, V1Node, V1Pod, V1PodTemplateSpec, V1Toleration } from "@kubernetes/client-node";
-import { Clock, Effect, Schedule, Schema } from "effect";
+import { Clock, Effect, Schedule, Schema, Semaphore } from "effect";
 
 import { BindStepFailed, type MakePod } from "../binder/binder.ts";
 import { FREE_LABEL, type Pool } from "../binder/names.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
-import { BAYMA_CONTAINER, RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION } from "../kube/sandbox-shape.ts";
+import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION } from "../kube/sandbox-shape.ts";
 import type { SavedSnapshot } from "../kube/sandboxes.ts";
 import type { Manifest } from "../node-agent/agent.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
@@ -50,6 +57,14 @@ const releases = meter.createCounter("alasio.sandbox.releases", {
   description:
     "Session sandboxes released, by outcome: snapshotted; kept, as they run under no gVisor, released unsaved; failed, running on; lost, their sandbox ended unsaved, its REPLs with it; unsaveable, as no save of it will be taken; or error, the release failing beside its save",
 });
+
+const stopReleases = meter.createCounter("alasio.sandbox.stop_releases", {
+  description:
+    "Session sandboxes released as their pods were ended by other than the gateway, as a drain, an eviction or a deletion through the API server ends them, by outcome: snapshotted; unsnapshotted, as their snapshot failed; late, as their turn came once their bayma held its stop no more; unheld, as their bayma holds no stop; or error, the release failing beside its save",
+});
+
+/** How many bound pods of one node are saved as they end at a time. */
+const RELEASES_PER_NODE = 2;
 
 const restores = meter.createCounter("alasio.sandbox.restores", {
   description: "Session sandboxes brought up with a snapshot, by outcome: restored, or not, by why",
@@ -128,6 +143,13 @@ export interface Restoring {
 
 /** The gateway's snapshots; see makeGatewaySnapshots. */
 export interface GatewaySnapshots {
+  /**
+   * Saves the sandbox of `pod`, bound to `workspace` of `pool`, which is ending though the
+   * gateway did not end it, while its bayma holds its stop for it, as the module says, and
+   * records what it was released into: the snapshot, or none. Run while the gateway holds the
+   * binding's Lease.
+   */
+  readonly saveStopping: (pool: Pool, workspace: string, pod: V1Pod) => Effect.Effect<void>;
   /** How a bind of `workspace` of `pool`, of its sessions' internet `mode`, restores it, as the module says. */
   readonly restoring: (pool: Pool, workspace: string, mode: "none" | "full") => Restoring;
   /**
@@ -485,5 +507,54 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
     return { make, ready };
   };
 
-  return { save, restoring };
+
+  // The releases of ending pods each node runs at once, RELEASES_PER_NODE, the others waiting their turn, as their bayma holds its stop for them.
+  const stopSlots = new Map<string, Semaphore.Semaphore>();
+  const stopSlot = (node: string): Semaphore.Semaphore => {
+    const found = stopSlots.get(node);
+    if (found) return found;
+    const made = Semaphore.makeUnsafe(RELEASES_PER_NODE);
+    stopSlots.set(node, made);
+    return made;
+  };
+
+  const saveStopping = (pool: Pool, workspace: string, pod: V1Pod): Effect.Effect<void> => {
+    const node = pod.spec?.nodeName ?? "";
+    const counted = (outcome: string) => Effect.sync(() => stopReleases.add(1, { "alasio.sandbox.stop_release.outcome": outcome }));
+    const deletion = pod.metadata?.deletionTimestamp;
+    // Its bayma holds its stop until its pod's deletion less its own stop (BAYMA_STOP_SECONDS).
+    const heldUntil = deletion === undefined ? Infinity : new Date(deletion).getTime() - BAYMA_STOP_SECONDS * 1000;
+    const record = (saved: SavedSnapshot | null) => agents.setReleased(ref(pool, workspace), saved);
+    return Effect.gen(function*() {
+      if (!snapshots || pool.namespace !== mainNamespace) return yield* record(null);
+      if (!holdsStop(pod.spec?.containers.find((container) => container.name === BAYMA_CONTAINER))) {
+        yield* Effect.logWarning(`${named(pool, workspace)} is not snapshotted as its pod ends: its bayma holds no stop for it`);
+        yield* counted("unheld");
+        return yield* record(null);
+      }
+      const saved = yield* stopSlot(node).withPermits(1)(Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis;
+        if (now >= heldUntil) {
+          yield* Effect.logWarning(`${named(pool, workspace)} is not snapshotted as its pod ends: its turn came ${Math.round((now - heldUntil) / 1000)} s after its bayma held its stop no more`);
+          yield* counted("late");
+          return null;
+        }
+        const taken = yield* take(pool, workspace, pod.metadata?.name ?? "");
+        if (taken.outcome === "snapshotted") {
+          yield* counted("snapshotted");
+          return taken.saved;
+        }
+        if (taken.outcome !== "kept") yield* Effect.logWarning(`could not snapshot ${named(pool, workspace)} as its pod ends: ${taken.why}`);
+        yield* counted("unsnapshotted");
+        return null;
+      }));
+      yield* record(saved);
+    }).pipe(
+      Effect.catch((error) => Effect.logWarning(`could not snapshot ${named(pool, workspace)} as its pod ends: ${error.message}`).pipe(Effect.andThen(counted("error")))),
+      withAlasioSpan("alasio.sandbox.stop_release", { attributes: { "alasio.sandbox.name": workspace, "k8s.node.name": node } }),
+      withLogScope("snapshots"),
+    );
+  };
+
+  return { save, saveStopping, restoring };
 });

@@ -7,7 +7,8 @@
  * telling each environment's alasio of what happens to its sessions' bindings on the log
  * (../events/events.ts).
  * What a gateway that ended left between a binding's steps is set right as it starts, and
- * every RECONCILE_MS after; bound pods are looked at for one to release every SWEEP_MS; the
+ * every RECONCILE_MS after; bound pods are looked at for one to release every SWEEP_MS, and for
+ * one ending though the gateway did not end it, released as it ends (./sessions.ts drain); the
  * pools' refusals by the sandbox pods' policy are counted every REFUSALS_MS (./refusals.ts).
  * What stops it is logged.
  */
@@ -97,6 +98,14 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       sessions.sweep.pipe(
         Effect.tap((released) => (released.length > 0 ? Effect.logInfo(`released ${released.join(", ")}`) : Effect.void)),
         Effect.catch((error) => Effect.logWarning(`looking at bound pods failed: ${error.message}`)),
+      ),
+      Schedule.spaced(SWEEP_MS),
+    ));
+    // As often, the bound pods ending though the gateway did not end them, each released in the background as its bayma holds its stop.
+    yield* Effect.forkScoped(Effect.repeat(
+      sessions.drain.pipe(
+        Effect.tap((began) => (began.length > 0 ? Effect.logInfo(`releasing ${began.join(", ")}, as their pods end`) : Effect.void)),
+        Effect.catch((error) => Effect.logWarning(`looking at ending bound pods failed: ${error.message}`)),
       ),
       Schedule.spaced(SWEEP_MS),
     ));

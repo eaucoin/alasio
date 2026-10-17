@@ -29,7 +29,10 @@
  *
  * Its metrics: how long each attach and detach took (ATTACH_DURATION, DETACH_DURATION), and
  * each binding released, by why (RELEASES): `idle`, released by its sweep; `asked`, by its
- * caller; `lost`, its pod gone while it was bound. Each of its pool's namespace.
+ * caller; `lost`, its pod gone while it was bound; `deleted`, its pod ended by other than the
+ * gateway, as a drain ends one, saved first where its bayma holds its stop (./snapshots.ts
+ * saveStopping), its workspace detached once its containers stopped (drain). Each of its pool's
+ * namespace.
  */
 import { lookup } from "node:dns/promises";
 
@@ -38,7 +41,7 @@ import { Clock, Effect } from "effect";
 
 import { type Binder, BindStepFailed } from "../binder/binder.ts";
 import type { BindingLease } from "../binder/bindings.ts";
-import { KEY_ANNOTATION, type Pool } from "../binder/names.ts";
+import { BINDING_LABEL, KEY_ANNOTATION, type Pool, POOL_LABEL } from "../binder/names.ts";
 import { type Answer, type Operation, type Placement, PlacementRefused } from "../binder/server.ts";
 import { baymaIdleness, IDLE_POLL_MS, makeSweep } from "../binder/sweep.ts";
 import { bindingToken, type TokenClaims } from "../binder/tokens.ts";
@@ -57,10 +60,10 @@ export const DETACH_DURATION = "alasio.gateway.detach.duration";
 export const RELEASES = "alasio.gateway.releases";
 const attachDuration = meter.createHistogram(ATTACH_DURATION, { description: "How long a node agent took to attach a workspace into its bound pod", unit: "s" });
 const detachDuration = meter.createHistogram(DETACH_DURATION, { description: "How long a node agent took to detach a workspace from its released pod", unit: "s" });
-const releases = meter.createCounter(RELEASES, { description: "Bindings released, by why: idle, asked by their caller, or lost as their pod went" });
+const releases = meter.createCounter(RELEASES, { description: "Bindings released, by why: idle, asked by their caller, lost as their pod went, or deleted as their pod was ended by other than the gateway" });
 
 /** Why a binding was released. */
-type ReleaseReason = "idle" | "asked" | "lost";
+type ReleaseReason = "idle" | "asked" | "lost" | "deleted";
 const released = (pool: Pool, reason: ReleaseReason) => Effect.sync(() => releases.add(1, { "k8s.namespace.name": pool.namespace, "alasio.gateway.release.reason": reason }));
 
 /** `effect`, its duration, when it succeeds, recorded on `histogram` of `pool`'s namespace. */
@@ -131,6 +134,8 @@ export interface Sessions {
   readonly pools: Effect.Effect<readonly Pool[]>;
   /** Releases each bound pod of the gateway's pools that is idle by `now`, as the module says, and says which, telling of each. */
   readonly sweep: Effect.Effect<readonly string[], KubeApiError>;
+  /** Releases each bound pod of the gateway's pools that is ending though the gateway did not end it, as the module says, in the background: which keys, of those it began. */
+  readonly drain: Effect.Effect<readonly string[], KubeApiError>;
   /** Tells of the binding `lease` of `pool`, let go as its pod went while it was bound, as lost. */
   readonly lost: (pool: Pool, lease: BindingLease) => Effect.Effect<void>;
   /** Answers a caller's request of its workspaces, as the module says. */
@@ -231,6 +236,43 @@ export const makeSessions = Effect.fnUntraced(function*(
       ),
   });
 
+  /** The bound pods ending though the gateway did not end them whose release runs, by their uid. */
+  const draining = new Set<string>();
+  /** Saves `pod`, bound to `workspace` of `pool` and ending, where its bayma holds its stop, then detaches its workspace once its containers stopped. */
+  const drained = (pool: Pool, workspace: string, pod: V1Pod): Effect.Effect<void, KubeApiError | NodeAgentError | BindStepFailed> =>
+    Effect.gen(function*() {
+      const name = pod.metadata?.name ?? "";
+      yield* snapshots.saveStopping(pool, workspace, pod);
+      yield* stopped(pool, name);
+      yield* timed(detachDuration, pool, agents.detach(pod.spec?.nodeName ?? "", name, containerIdsOf(pod)));
+    });
+  const drain: Effect.Effect<readonly string[], KubeApiError> = Effect.gen(function*() {
+    const started: string[] = [];
+    for (const pool of yield* pools) {
+      const pods = (yield* kube.list("v1", "Pod", pool.namespace, `${BINDING_LABEL},${POOL_LABEL}=${pool.name}`)) as V1Pod[];
+      for (const pod of pods) {
+        const uid = pod.metadata?.uid ?? "";
+        const key = pod.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
+        const workspace = volumeIdOfKey(key);
+        if (pod.metadata?.deletionTimestamp === undefined || !workspace || draining.has(uid)) continue;
+        draining.add(uid);
+        started.push(key);
+        // Released as the binder releases one, its Lease marked releasing first: a release of the gateway's own under way is one of none.
+        let binding = "";
+        yield* Effect.forkDetach(binder.release(pool, key, (bound) => (bound.pod === pod.metadata?.name ? ((binding = bound.binding), drained(pool, workspace, pod)) : Effect.void)).pipe(
+          Effect.tap((done) =>
+            done
+              ? Effect.andThen(released(pool, "deleted"), tell(pool, (environment) => ({ kind: "workspace.released", environment, source: "sandbox-gateway", subject: subject(key), binding, reason: "deleted" })))
+              : Effect.void
+          ),
+          Effect.catch((error) => Effect.logWarning(`releasing ${key}, as its pod ends, failed: ${error.message}`)),
+          Effect.ensuring(Effect.sync(() => void draining.delete(uid))),
+        ));
+      }
+    }
+    return started;
+  });
+
   const lost = (pool: Pool, lease: BindingLease): Effect.Effect<void> => {
     const key = lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
     return Effect.andThen(released(pool, "lost"), tell(pool, (environment) => ({
@@ -299,5 +341,5 @@ export const makeSessions = Effect.fnUntraced(function*(
       }
     });
 
-  return { place, pools, sweep, lost, operate };
+  return { place, pools, sweep, drain, lost, operate };
 });

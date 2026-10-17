@@ -119,7 +119,9 @@ async function environment(count: number, { gvisor = false, holdsStop = false } 
       yield* kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: namespace } });
       // The pool's template, as its snapshots record it.
       // Its bayma holding its stop for a save, where it is told to, as a pool's of snapshotted sessions does.
-      const spec = holdsStop ? { containers: BAYMA_SPEC.containers.map((container) => ({ ...container, args: [...container.args, "--stop-wait-ms", "60000"] })) } : BAYMA_SPEC;
+      const spec = holdsStop
+        ? { terminationGracePeriodSeconds: 90, containers: BAYMA_SPEC.containers.map((container) => ({ ...container, args: [...container.args, "--stop-wait-ms", "60000"] })) }
+        : BAYMA_SPEC;
       template = { metadata: { labels: { ...freeLabels(none) }, annotations: { "alasio.dev/session-template": "t-current" } }, spec: { ...spec, ...(gvisor ? { runtimeClassName: "gvisor" } : {}) } };
       yield* kube.create<V1Deployment>({ apiVersion: "apps/v1", kind: "Deployment", metadata: { name: none.name, namespace }, spec: { replicas: 0, selector: { matchLabels: { ...freeLabels(none) } }, template } });
       for (let n = 0; n < count; n += 1) {
@@ -590,4 +592,26 @@ test("a restore whose snapshot cannot be prepared now is deferred, the bind refu
   });
   assert.equal(recorded.state.current, null);
   assert.equal((await run(readLease(env.none, key)))?.spec?.holderIdentity, "none-0");
+});
+
+test("a bound pod ended by other than the gateway, as a drain ends one, is saved as its bayma holds its stop, its release recorded, its workspace detached once its containers stopped, and its binding let go", async () => {
+  const env = await environment(1, { gvisor: true, holdsStop: true });
+  const recorded = agents();
+  const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+  const key = sessionKey("fs-drained");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  // Deleted as a drain deletes it: with its grace, kubelet to end it.
+  await run(withKube((kube) => kube.remove("v1", "Pod", env.namespace, bound.pod)));
+  const counted = await added("alasio.sandbox.stop_releases", async () => {
+    assert.deepEqual(await Effect.runPromise(Effect.provide(sessions.drain, Layer.fresh(KubeClient.layer))), [key]);
+    // Begun once, however often it is looked at meanwhile.
+    assert.deepEqual(await Effect.runPromise(Effect.provide(sessions.drain, Layer.fresh(KubeClient.layer))), []);
+    for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) {
+      assert.ok(Date.now() < deadline, "its binding was not let go");
+    }
+  });
+  assert.deepEqual(counted, { "alasio.sandbox.stop_release.outcome=snapshotted": 1 });
+  assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-drained released into s-1`, `detach node-a ${bound.pod}`]);
+  assert.ok(told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "deleted" && event.binding === bound.binding));
 });
