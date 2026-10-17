@@ -247,7 +247,7 @@ test("a binding under way is renewed however long its pod takes to make, so no o
   assert.deepEqual(second, await first);
 });
 
-test("reconciling a pool deletes a bound pod no Lease names and lets go a Lease whose pod is gone, and leaves a binding whole, or under way", async () => {
+test("reconciling a pool deletes a bound pod no Lease names and lets go a Lease whose pod is gone, telling of it, and leaves a binding whole, or under way", async () => {
   const of = await pool();
   await freePods(of, 3);
   const layer = binderOf();
@@ -259,8 +259,11 @@ test("reconciling a pool deletes a bound pod no Lease names and lets go a Lease 
   await run(binder(), withKube((client) => client.remove("v1", "Pod", of.namespace, gone.pod)));
   // A binding under way.
   await run(binder(), takeLease(of, "sessionfs:under-way", "binder"));
-  const set = await run(binder(), reconcile(of));
+  const told: string[] = [];
+  const set = await run(binder(), reconcile(of, (lease) => Effect.sync(() => void told.push(`${lease.metadata?.annotations?.[KEY_ANNOTATION]} ${lease.metadata?.uid === gone.binding} ${lease.spec?.holderIdentity === gone.pod}`))));
   assert.deepEqual(set, { pods: [orphan?.metadata?.name], leases: [leaseName("sessionfs:gone")] });
+  // The binding whose pod went, as what binds may say lost: its key, binding and pod.
+  assert.deepEqual(told, ["sessionfs:gone true true"]);
   assert.ok(await run(binder(), readLease(of, "sessionfs:under-way")));
   assert.equal((await run(binder(), readLease(of, "sessionfs:whole")))?.spec?.holderIdentity, whole.pod);
   assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [whole.pod]);

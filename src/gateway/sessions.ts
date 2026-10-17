@@ -2,27 +2,24 @@
  * The sandbox gateway's session workspaces, on the binder (../binder/): a session's
  * workspace, `sessionfs:<volume id>`, bound to a pod of its environment's pool of its
  * internet (`none` or `full`), as its caller's token says (`environment`, `mode`), of the
- * environments there are (./environments.ts); the pod
- * readied by the node agent of its node attaching the workspace into it, with the binding's
- * token beside it, which the pod's bayma starts on; and released once its bayma has run no
- * exec, and no request of it has come, for `releaseAfterMs`: its sandbox saved whole by its
- * node's agent, which ends it, the workspace detached once it has ended, then the pod deleted,
- * so a pod serves one binding.
- *
- * Whether a bound pod is idle is asked of its bayma (`GET /status`), at most once every
- * IDLE_POLL_MS a pod, and not before it could be idle for long enough, as the last exec it
- * ran and the last request of it say: at most four requests a minute of each bound pod's,
- * and one a release's wait for most.
+ * environments there are (./environments.ts); the pod readied by the node agent of its node
+ * attaching the workspace into it, with the binding's token beside it, which the pod's bayma
+ * starts on; and released once its bayma has run no exec, and no request of it has come, for
+ * `releaseAfterMs` (../binder/sweep.ts): its sandbox saved whole by its node's agent, which
+ * ends it, the workspace detached once it has ended, then the pod deleted, so a pod serves one
+ * binding. Whether a bound pod is idle is asked of its bayma at most once every `idlePollMs`
+ * (IDLE_POLL_MS by default): at most four requests a minute of each bound pod's, and one a
+ * release's wait for most.
  */
 import { lookup } from "node:dns/promises";
 
 import type { V1Deployment, V1Pod } from "@kubernetes/client-node";
-import { Clock, Effect, Schema } from "effect";
+import { Clock, Effect } from "effect";
 
 import { type Binder, BindStepFailed } from "../binder/binder.ts";
-import { activeAt, type BindingLease, heldLeases } from "../binder/bindings.ts";
-import { KEY_ANNOTATION, type Pool } from "../binder/names.ts";
+import { type Pool } from "../binder/names.ts";
 import { type Placement, PlacementRefused } from "../binder/server.ts";
+import { baymaIdleness, IDLE_POLL_MS, makeSweep } from "../binder/sweep.ts";
 import { bindingToken } from "../binder/tokens.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
@@ -53,15 +50,8 @@ export interface SessionsOptions {
   readonly telemetry?: { readonly host: string; readonly port: number; readonly env: Readonly<Record<string, string>> } | undefined;
 }
 
-/** How often a bound pod's bayma is asked whether it is idle, at most. */
-export const IDLE_POLL_MS = 15_000;
-/** How long an ask of a bayma's status may take. */
-const STATUS_TIMEOUT_MS = 5_000;
 /** How long a pod's containers are waited for to stop, once its deletion is asked. */
 const STOP_TIMEOUT_MS = 120_000;
-
-/** What bayma's /status says: its execs running and queued, and since when none has run, if none does. */
-const BaymaStatus = Schema.Struct({ execsRunning: Schema.Number, execsQueued: Schema.Number, idleSinceMs: Schema.NullOr(Schema.Number) });
 
 /** The runtime's ids of `pod`'s containers, as its status names them. */
 const containerIdsOf = (pod: V1Pod): string[] =>
@@ -88,9 +78,6 @@ export const makeSessions = Effect.fnUntraced(function*(
   /** The address `host` resolves to. */
   const addressOf = (host: string): Effect.Effect<string, BindStepFailed> =>
     Effect.tryPromise({ try: () => lookup(host), catch: (error) => new BindStepFailed({ reason: `${host} did not resolve: ${String(error)}` }) }).pipe(Effect.map(({ address }) => address));
-
-  /** When each bound key is next asked whether it is idle, by its binding. */
-  const due = new Map<string, number>();
 
   const place = (key: string, options: Readonly<Record<string, string>>): Effect.Effect<Placement, PlacementRefused> =>
     Effect.gen(function*() {
@@ -171,52 +158,10 @@ export const makeSessions = Effect.fnUntraced(function*(
       yield* agents.detach(node, name, containers);
     });
 
-  /** Whether the binding `lease`, of its pod `pod`, is idle at `now`; where not, when it is next to be asked. */
-  const idleness = (lease: BindingLease, pod: V1Pod | null, now: number): Effect.Effect<{ readonly idle: true } | { readonly idle: false; readonly askAt: number }> =>
-    Effect.gen(function*() {
-      const key = lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
-      const address = pod?.status?.podIP;
-      if (!address) return { idle: false, askAt: now + idlePollMs } as const;
-      const token = bindingToken(bindingKey, { key, binding: lease.metadata?.uid ?? "", namespace: lease.metadata?.namespace ?? "" });
-      const status = yield* Effect.tryPromise({
-        try: async (signal) => {
-          const response = await fetch(`http://${address}:${podPort}/status`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.any([signal, AbortSignal.timeout(STATUS_TIMEOUT_MS)]) });
-          if (!response.ok) throw new Error(`it answered ${response.status}`);
-          return await response.text();
-        },
-        catch: (cause) => new BindStepFailed({ reason: cause instanceof Error ? cause.message : String(cause) }),
-      }).pipe(Effect.flatMap((text) => Schema.decodeUnknownEffect(Schema.fromJsonString(BaymaStatus))(text)), Effect.option);
-      if (status._tag === "None" || status.value.execsRunning > 0 || status.value.execsQueued > 0 || status.value.idleSinceMs === null) {
-        return { idle: false, askAt: now + idlePollMs } as const;
-      }
-      // Idle since its last exec, its last request, or its binding, whichever was last.
-      const bound = Date.parse(String(pod?.metadata?.creationTimestamp ?? "")) || 0;
-      const since = Math.max(status.value.idleSinceMs, activeAt(lease) ?? 0, bound);
-      return now - since >= releaseAfterMs ? ({ idle: true } as const) : ({ idle: false, askAt: Math.max(now + idlePollMs, since + releaseAfterMs) } as const);
-    });
-
-  const sweep: Effect.Effect<readonly string[], KubeApiError> = Effect.gen(function*() {
-    const released: string[] = [];
-    for (const pool of yield* pools) {
-      for (const lease of yield* Effect.provideService(heldLeases(pool), KubeClient, kube)) {
-        const key = lease.metadata?.annotations?.[KEY_ANNOTATION];
-        const binding = lease.metadata?.uid ?? "";
-        const now = yield* Clock.currentTimeMillis;
-        if (!key || (due.get(binding) ?? 0) > now) continue;
-        const pod = (yield* kube.read("v1", "Pod", pool.namespace, lease.spec?.holderIdentity ?? "")) as V1Pod | null;
-        const asked = yield* idleness(lease, pod, now);
-        if (!asked.idle) {
-          due.set(binding, asked.askAt);
-          continue;
-        }
-        due.delete(binding);
-        const done = yield* binder.release(pool, key, ({ pod: name }) => endAndDetach(pool, volumeIdOfKey(key) ?? "", name)).pipe(
-          Effect.catch((error) => Effect.logWarning(`releasing ${key} failed: ${error.message}`).pipe(Effect.as(false))),
-        );
-        if (done) released.push(key);
-      }
-    }
-    return released;
+  const sweep = yield* makeSweep({
+    pools,
+    idleness: baymaIdleness({ podPort, releaseAfterMs, idlePollMs, bindingKey }),
+    release: (pool: Pool, key: string) => binder.release(pool, key, ({ pod: name }) => endAndDetach(pool, volumeIdOfKey(key) ?? "", name)),
   });
 
   return { place, pools, sweep };
