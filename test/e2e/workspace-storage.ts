@@ -588,7 +588,8 @@ export function workspaceStorage(): void {
     test("a workspace moves to another node with its files, as a JuiceFS volume is no node's", { skip: AGENTS < 2 && "the run has one node" }, async () => {
       const full = sessions.full;
       const written = (await inWorkspaceOk(full, `mkdir -p ${WORKDIR} && head -c 1048576 /dev/urandom > ${WORKDIR}/moving && sha256sum < ${WORKDIR}/moving`)).trim();
-      const node = (await podOf(full)).spec?.nodeName ?? "";
+      const pod = await podOf(full);
+      const node = pod.spec?.nodeName ?? "";
       const sandbox = ref("Sandbox", full, SESSIONS);
       const nodeSelector = (await kube.get<Sandbox>(sandbox))?.spec.podTemplate.spec?.nodeSelector ?? null;
       await kube.patch(ref("Node", node), { spec: { unschedulable: true } });
@@ -597,6 +598,11 @@ export function workspaceStorage(): void {
         // Sandbox but from its template, which places sessions on one node in this run.
         await kube.patch(sandbox, { spec: { podTemplate: { spec: { nodeSelector: null } } } });
         await kube.remove(ref("Pod", full, SESSIONS));
+        // Its pod ended though alasio did not end it, alasio releases the session into a snapshot
+        // as bayma holds its stop (src/sandbox/snapshots.ts releaseStopped), under the Sandbox's
+        // lock, which this bring-up, in a process of its own, does not wait for: it is brought
+        // up once that pod is gone, from that snapshot, or anew.
+        await until(`the pod ${pod.metadata?.uid} of ${full} gone`, async () => ((await kube.get<V1Pod>(ref("Pod", full, SESSIONS)))?.metadata?.uid === pod.metadata?.uid ? undefined : true), 180_000);
         const moved = await bringUp(full);
         assert.ok(moved.node && moved.node !== node, `the session stayed on ${node}`);
         assert.equal((await inWorkspaceOk(full, `sha256sum < ${WORKDIR}/moving`)).trim(), written);

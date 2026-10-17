@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { KubernetesObject, V1LabelSelector, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
-import { Effect, Layer } from "effect";
+import { Deferred, Effect, Fiber, Layer } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
 
@@ -15,7 +15,7 @@ import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
 import { sessionSandboxManifest } from "../src/sandbox/index.ts";
 import { type Holdings, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
 import { CPU_FEATURES_ANNOTATION, RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION } from "../src/kube/sandbox-shape.ts";
-import { hookOf, makeSessionSnapshots, sessionTemplateHash } from "../src/sandbox/snapshots.ts";
+import { hookOf, makeSessionSnapshots, sessionTemplateHash, stopHookOf } from "../src/sandbox/snapshots.ts";
 
 const CURRENT = "20260921.0-eaucoin.4";
 const PREVIOUS = "20260921.0-eaucoin.3";
@@ -777,4 +777,125 @@ test("a restore bayma refuses, its state generation moved on from the snapshot t
     "forget alasio-sessions/fs-abc123",
   ]);
   assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=stale": 1 });
+});
+
+/**
+ * The pod of session `name` on `on`, ending, deleted at `deletion`, as an eviction or a
+ * deletion through the API server leaves one; its bayma holding its stop, unless `held` is false.
+ */
+const endingPod = (name: string, deletion: Date, held = true, on = "node-a"): V1Pod => ({
+  apiVersion: "v1",
+  kind: "Pod",
+  metadata: { name, namespace: "alasio-sessions", deletionTimestamp: deletion },
+  spec: {
+    nodeName: on,
+    runtimeClassName: "gvisor",
+    containers: [{ name: "bayma", args: ["mcp-http", "--state-dir", "/home/agent/.bayma", ...(held ? ["--stop-wait-ms", "60000"] : [])] }],
+  },
+  status: { containerStatuses: [{ name: "bayma", containerID: `containerd://${"a".repeat(64)}`, image: "", imageID: "", ready: true, restartCount: 0 }] },
+});
+
+test("the watch releases a running session whose pod is ending though alasio did not end it, its bayma holding its stop; not one alasio ends, one being deleted, nor one whose bayma holds none", async () => {
+  const look = async (change: (sandbox: StoredSandbox) => void, held = true) => {
+    const objects = runningOnNodeA();
+    objects.set("Pod/alasio-sessions/fs-abc123", endingPod("fs-abc123", new Date(Date.now() + 90_000), held));
+    change(objects.get("Sandbox/alasio-sessions/fs-abc123") as StoredSandbox);
+    const { agents } = fakeAgents({ holdings: [node("node-a", [CURRENT])] });
+    const asked: string[] = [];
+    const sandboxes = {
+      token: () => Effect.succeed("token"),
+      release: () => Effect.die("no session is idle"),
+      releaseStopping: (name: string) => Effect.sync(() => (asked.push(name), true)),
+    } as unknown as Sandboxes;
+    await run(fakeKube(objects), Effect.scoped(Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+      yield* snapshotted.watch(sandboxes, () => null);
+      yield* Effect.sleep("50 millis");
+    })), () => ({ execsRunning: 1, execsQueued: 0, idleSinceMs: null, generation: 0 }));
+    return asked;
+  };
+  assert.deepEqual(await look(() => undefined), ["fs-abc123"]);
+  // Suspended, as alasio suspends a Sandbox before it ends its pod: alasio's own stop, snapshotted already or not to be.
+  assert.deepEqual(await look((sandbox) => void (sandbox.spec = { ...sandbox.spec, operatingMode: "Suspended" })), []);
+  // Being deleted, its pod with it.
+  assert.deepEqual(await look((sandbox) => void (sandbox.metadata = { ...sandbox.metadata, deletionTimestamp: new Date(0) })), []);
+  // Made before its bayma was told to hold its stop: it stops as it is told to.
+  assert.deepEqual(await look(() => undefined, false), []);
+});
+
+test("a session whose pod is ending is snapshotted as a release's while its bayma holds its stop, for as long as the agent's call takes; and not where its bayma holds none, where its turn comes once it holds it no more, or where its snapshot fails, which no release counts", async () => {
+  const sandbox = stored(sessionOf(profile()), "Suspended", null);
+  // Deleted at 90 s, its bayma holds its stop until 60 s, then stops in 30.
+  const saved = async (pod: V1Pod, { checkpoint, at = 0 }: { checkpoint?: NodeAgents["checkpoint"]; at?: number } = {}) => {
+    const objects = runningOnNodeA();
+    objects.set("Pod/alasio-sessions/fs-abc123", pod);
+    const base = fakeAgents({ holdings: [node("node-a", [CURRENT])] });
+    const agents: NodeAgents = checkpoint ? { ...base.agents, checkpoint } : base.agents;
+    let snapshot: unknown;
+    let counted: Readonly<Record<string, number>> = {};
+    const releases = await added("alasio.sandbox.releases", async () => {
+      counted = await added("alasio.sandbox.stop_releases", () =>
+        run(fakeKube(objects), Effect.gen(function*() {
+          const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+          yield* TestClock.setTime(at);
+          // Slow as it may be: the clock runs on two minutes, past its bayma's stop, as it saves.
+          const saving = yield* snapshotted.saveStopping(sandbox, pod).pipe(Effect.forkChild);
+          yield* TestClock.withLive(Effect.sleep("20 millis"));
+          yield* TestClock.adjust("2 minutes");
+          snapshot = yield* Fiber.join(saving);
+        }).pipe(Effect.provide(TestClock.layer()))));
+    });
+    assert.deepEqual(releases, {});
+    return { snapshot, counted, checkpoints: base.checkpoints };
+  };
+  const deletedAt = new Date(90_000);
+  const slow: NodeAgents["checkpoint"] = (_node, request) => Effect.sleep("100 seconds").pipe(Effect.as(manifestOf(request.podTemplate as V1PodTemplateSpec)));
+  const snapshotted = await saved(endingPod("fs-abc123", deletedAt), { checkpoint: slow });
+  assert.deepEqual(snapshotted.snapshot, { snapshot: "s-1", release: CURRENT });
+  assert.deepEqual(snapshotted.counted, { "alasio.sandbox.stop_release.outcome=snapshotted": 1 });
+  // Its bayma holds no stop.
+  const unheld = await saved(endingPod("fs-abc123", deletedAt, false));
+  assert.equal(unheld.snapshot, null);
+  assert.deepEqual(unheld.checkpoints, []);
+  assert.deepEqual(unheld.counted, { "alasio.sandbox.stop_release.outcome=unheld": 1 });
+  // Its turn comes at 60 s, as its bayma holds its stop no more.
+  const late = await saved(endingPod("fs-abc123", deletedAt), { at: 60_000 });
+  assert.equal(late.snapshot, null);
+  assert.deepEqual(late.checkpoints, []);
+  assert.deepEqual(late.counted, { "alasio.sandbox.stop_release.outcome=late": 1 });
+  // Its snapshot fails, its sandbox running on until its bayma stops: none, and no release failed, running on.
+  const failing: NodeAgents["checkpoint"] = (on) => Effect.fail(new NodeAgentError({ node: on, call: "snapshot", status: 500, reason: "runsc checkpoint failed" }));
+  const failed = await saved(endingPod("fs-abc123", deletedAt), { checkpoint: failing });
+  assert.equal(failed.snapshot, null);
+  assert.deepEqual(failed.counted, { "alasio.sandbox.stop_release.outcome=unsnapshotted": 1 });
+});
+
+test("a node snapshots two of its sessions whose pods are ending at a time, the others waiting their turn, and another node its own beside them", async () => {
+  const names = [["fs-a1", "node-a"], ["fs-a2", "node-a"], ["fs-a3", "node-a"], ["fs-b1", "node-b"]] as const;
+  const objects = new Map<string, KubernetesObject>(names.map(([name, on]) => [`Pod/alasio-sessions/${name}`, endingPod(name, new Date(Date.now() + 90_000), true, on)]));
+  const base = fakeAgents({ holdings: [node("node-a", [CURRENT]), node("node-b", [CURRENT])] });
+  const saving: string[] = [];
+  const done = await Effect.runPromise(Deferred.make<void>());
+  const agents: NodeAgents = {
+    ...base.agents,
+    checkpoint: (on, request) => Effect.sync(() => saving.push(`${request.workspace} on ${on}`)).pipe(Effect.andThen(Deferred.await(done)), Effect.andThen(base.agents.checkpoint(on, request))),
+  };
+  await run(fakeKube(objects), Effect.scoped(Effect.gen(function*() {
+    const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+    const fibers = yield* Effect.forEach(names, ([name]) =>
+      snapshotted.saveStopping(stored(sessionOf(profile(), name), "Suspended", null), objects.get(`Pod/alasio-sessions/${name}`) as V1Pod).pipe(Effect.forkScoped));
+    yield* Effect.sleep("50 millis");
+    assert.deepEqual(saving.toSorted(), ["fs-a1 on node-a", "fs-a2 on node-a", "fs-b1 on node-b"]);
+    // Theirs done, the third of node-a's has its turn.
+    yield* Deferred.succeed(done, undefined);
+    yield* Fiber.joinAll(fibers);
+    assert.deepEqual(saving.toSorted(), ["fs-a1 on node-a", "fs-a2 on node-a", "fs-a3 on node-a", "fs-b1 on node-b"]);
+  })));
+});
+
+test("bayma's hook is told to go on with its held stop as the hook is told its other modes", () => {
+  const [bayma] = profile().podTemplate.spec?.containers ?? [];
+  assert.ok(bayma);
+  assert.deepEqual(stopHookOf(bayma), ["node", "/opt/bayma/bayma.js", "sandbox-hook", "stop", "--state-dir", "/home/agent/.bayma"]);
+  assert.equal(stopHookOf({ name: "bayma", command: ["bayma"], args: ["mcp-http"] }), null);
 });

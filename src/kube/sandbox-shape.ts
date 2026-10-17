@@ -46,6 +46,15 @@ export const DEFAULT_FULL_MODE_NAMESERVERS: readonly string[] = ["1.1.1.1", "8.8
 /** The argument a folder's bayma is given its state directory by, under its template's state root. */
 export const STATE_DIR_ARG = "--state-dir";
 
+/**
+ * The argument a session's bayma is given how long it holds a stop by, for alasio to
+ * snapshot it first (bayma's mcp-http help): a bayma run without it holds none.
+ */
+export const STOP_WAIT_ARG = "--stop-wait-ms";
+
+/** How long a session's bayma takes to stop once it holds its stop no more: it persists its sessions. */
+export const BAYMA_STOP_SECONDS = 30;
+
 /** A path segment from `value`: never empty, nor starting with a dot. */
 export function sanitizePathToken(value: string): string {
   return String(value).replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[-.]+|-+$/g, "") || "default";

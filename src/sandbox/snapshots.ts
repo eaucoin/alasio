@@ -27,18 +27,20 @@
  * Sandbox is suspended, waits on none of it.
  */
 import type { V1Container, V1LabelSelector, V1NetworkPolicy, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
-import { Clock, Duration, Effect, FiberMap, Schedule, Schema, type Scope } from "effect";
+import { Clock, Duration, Effect, FiberMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { SessionsProfile } from "../kube/config.ts";
 import {
   BAYMA_CONTAINER,
+  BAYMA_STOP_SECONDS,
   RESTORE_ANNOTATION,
   RESTORE_PAUSED_ANNOTATION,
   RESUMED_CONDITION,
   SANDBOX_LABEL,
   SESSION_TEMPLATE_ANNOTATION,
+  STOP_WAIT_ARG,
 } from "../kube/sandbox-shape.ts";
 import {
   podTemplateHash,
@@ -91,6 +93,10 @@ const releases = meter.createCounter("alasio.sandbox.releases", {
 const restores = meter.createCounter("alasio.sandbox.restores", {
   description: "Session sandboxes brought up with a snapshot, by outcome: restored, or not, by why",
 });
+const stopReleases = meter.createCounter("alasio.sandbox.stop_releases", {
+  description:
+    "Session sandboxes released as their pods were ended by other than alasio, as a drain, an eviction or a deletion through the API server ends them, by outcome: snapshotted; unsnapshotted, as their snapshot failed; late, as their turn came once their bayma held its stop no more; unheld, as their bayma holds no stop; or error, the release failing beside its save",
+});
 const liveCheckpoints = meter.createCounter("alasio.sandbox.live_checkpoints", {
   description: "Snapshots of running sessions taken live, their sandboxes running on, by outcome: taken, or failed; and spent, as the session moved on from one",
 });
@@ -99,6 +105,12 @@ const restoreDuration = meter.createHistogram("alasio.sandbox.restore.duration",
   unit: "s",
 });
 
+/** What came of a save of a session's sandbox whole (take). */
+type Taken =
+  | { readonly outcome: "snapshotted"; readonly saved: SavedSnapshot }
+  | { readonly outcome: "kept" }
+  | { readonly outcome: "lost" | "failed"; readonly why: string };
+
 /** Why a session with a snapshot was resumed without it. */
 export type Fallback = "release" | "template" | "stale" | "node" | "prepare" | "restore" | "unreadable";
 
@@ -106,6 +118,11 @@ export type Fallback = "release" | "template" | "stale" | "node" | "prepare" | "
 export interface KeptTemplates {
   readonly current: string;
   readonly previous: string | null;
+}
+
+/** Whether bayma's container `bayma` holds a stop it is given for a snapshot: one run with STOP_WAIT_ARG. Pure, for tests. */
+export function holdsStop(bayma: V1Container | undefined): boolean {
+  return bayma?.args?.includes(STOP_WAIT_ARG) ?? false;
 }
 
 /** A restored pod does not run its containers yet. */
@@ -138,6 +155,15 @@ export function hookOf(bayma: V1Container): string[] | null {
   const program = command.includes("--") ? command.slice(command.indexOf("--") + 1) : command;
   const stateDir = stateDirOf(bayma);
   return program.length > 0 && stateDir ? [...program, "sandbox-hook", "--state-dir", stateDir] : null;
+}
+
+/**
+ * bayma's hook, as hookOf says it, told to go on with the stop bayma holds (sandbox-hook
+ * stop), or null where bayma has none. Pure, for tests.
+ */
+export function stopHookOf(bayma: V1Container): string[] | null {
+  const hook = hookOf(bayma);
+  return hook ? [...hook.slice(0, -2), "stop", ...hook.slice(-2)] : null;
 }
 
 /** The state directory bayma's container runs bayma with, or null for none. Pure, for tests. */
@@ -194,6 +220,15 @@ export interface SessionSnapshots {
    * alasio started.
    */
   readonly watch: (sandboxes: Sandboxes, lastTurn: (name: string) => number | null) => Effect.Effect<void, never, Scope.Scope>;
+  /**
+   * Saves the running Sandbox `sandbox`, whose pod `pod` is ending though alasio did not end
+   * it (Sandboxes.releaseStopping), while its bayma holds its stop for it: snapshotted as it
+   * is released for idling, its node saving RELEASES_PER_NODE of these at once, the others
+   * waiting their turn; or, where its bayma holds no stop, where its turn comes once it holds
+   * it no more, or where its snapshot fails, none, the session coming back from bayma's
+   * checkpoints. Counted by outcome.
+   */
+  readonly saveStopping: (sandbox: StoredSandbox, pod: V1Pod) => Effect.Effect<SavedSnapshot | null>;
   /** Releases the running session now, idle or not, as a fork of it does: whether it was suspended. */
   readonly release: (sandboxes: Sandboxes, name: string) => Effect.Effect<boolean, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone>;
   /** Forgets the session's snapshot, as it is deleted, in the bucket and in every node's cache; one that cannot be is said so, and collected later. */
@@ -220,6 +255,13 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
 
   /** Since when each session's restore has been deferred, from the first that was: in memory, as alasio's start begins a window anew. */
   const deferredSince = new Map<string, number>();
+
+  /**
+   * Of each running session, the snapshot taken of it live that holds it still, with the
+   * generation it holds it at, which the watch spends once bayma moves on from it. In memory:
+   * alasio's start begins them anew.
+   */
+  const takenLive = new Map<string, { readonly snapshot: string; readonly generation: number }>();
 
   /** Resumes the session without its snapshot, which is forgotten, saying why, and counted as `fallback`. */
   const fallBack = (name: string, fallback: Fallback, why: string): Effect.Effect<null> =>
@@ -450,12 +492,13 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
   };
 
   /**
-   * Saves the session's sandbox by its node's agent: suspended once it is saved, or once
-   * a save that failed has ended it anyway; left running otherwise, said why.
+   * Saves the session's sandbox whole by its node's agent, which ends it: snapshotted, into
+   * the snapshot it took; kept, as its pod runs no bayma under gVisor; lost, its sandbox
+   * ended by a save that failed, its REPLs with it; or failed, its sandbox running on, why
+   * said. What becomes of the Sandbox is the caller's.
    */
-  const save = (sandbox: StoredSandbox): Effect.Effect<Saved, KubeApiError> => {
+  const take = (sandbox: StoredSandbox): Effect.Effect<Taken, KubeApiError> => {
     const name = sandbox.metadata.name;
-    const counted = (outcome: string) => Effect.sync(() => releases.add(1, { "alasio.sandbox.release.outcome": outcome }));
     return Effect.gen(function*() {
       // A core Pod, as the API server returns one.
       const pod = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
@@ -467,24 +510,84 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       const node = pod?.spec?.nodeName;
       if (!node || !containerId || !gvisor || !hook) {
         yield* Effect.logWarning(`session ${name} is not snapshotted: its pod runs no bayma under gVisor`);
-        yield* counted("kept");
-        return "keep" as const;
+        return { outcome: "kept" } as const;
       }
       const taken = yield* agents.checkpoint(node, { ...ref(name), namespace: profile.namespace, pod: name, containerId, hook, podTemplate: { ...sandbox.spec.podTemplate } }).pipe(Effect.result);
       if (taken._tag === "Success") {
         const { snapshot, release, bytes, pauseMs, uploadMs } = taken.success;
         yield* Effect.logInfo(`snapshotted session ${name} as ${snapshot} on ${node}: ${bytes} bytes, paused ${pauseMs} ms, uploaded in ${uploadMs} ms`);
-        yield* counted("snapshotted");
-        return { saved: { snapshot, release } };
+        return { outcome: "snapshotted", saved: { snapshot, release } } as const;
       }
       // A core Pod, as the API server returns one.
       const after = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
       const ended = after?.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER)?.state?.terminated !== undefined;
-      // One that ended its sandbox lost what ran in it but bayma's checkpoints keep.
-      yield* counted(ended ? "lost" : "failed");
-      yield* Effect.logWarning(`could not snapshot session ${name}: ${taken.failure.message}; ${ended ? "its sandbox ended, so it is suspended" : "it runs on"}`);
-      return ended ? { saved: null } : ("keep" as const);
+      return { outcome: ended ? "lost" : "failed", why: taken.failure.message } as const;
     });
+  };
+
+  /**
+   * Saves the session's sandbox for its release, by take: suspended once it is saved, or
+   * once a save that failed has ended it anyway, which bayma's checkpoints keep; left running
+   * otherwise, said why. Counted as the release's outcome.
+   */
+  const save = (sandbox: StoredSandbox): Effect.Effect<Saved, KubeApiError> =>
+    take(sandbox).pipe(
+      Effect.tap(({ outcome }) => Effect.sync(() => releases.add(1, { "alasio.sandbox.release.outcome": outcome }))),
+      Effect.flatMap((taken): Effect.Effect<Saved> => {
+        if (taken.outcome === "snapshotted") return Effect.succeed({ saved: taken.saved });
+        if (taken.outcome === "kept") return Effect.succeed("keep");
+        const ended = taken.outcome === "lost";
+        return Effect.logWarning(`could not snapshot session ${sandbox.metadata.name}: ${taken.why}; ${ended ? "its sandbox ended, so it is suspended" : "it runs on"}`).pipe(
+          Effect.as(ended ? { saved: null } : "keep"),
+        );
+      }),
+    );
+
+  // The releases of stopped sessions each node runs at once, RELEASES_PER_NODE, the others
+  // waiting their turn, as their bayma holds its stop for them.
+  const stopSlots = new Map<string, Semaphore.Semaphore>();
+  const stopSlot = (node: string): Semaphore.Semaphore => {
+    const found = stopSlots.get(node);
+    if (found) return found;
+    const made = Semaphore.makeUnsafe(RELEASES_PER_NODE);
+    stopSlots.set(node, made);
+    return made;
+  };
+
+  const saveStopping = (sandbox: StoredSandbox, pod: V1Pod): Effect.Effect<SavedSnapshot | null> => {
+    const name = sandbox.metadata.name;
+    const node = pod.spec?.nodeName ?? "";
+    const counted = (outcome: string) => Effect.sync(() => stopReleases.add(1, { "alasio.sandbox.stop_release.outcome": outcome }));
+    const deletion = pod.metadata?.deletionTimestamp;
+    // Its bayma holds its stop until its pod's deletion less its own stop (BAYMA_STOP_SECONDS).
+    const heldUntil = deletion === undefined ? Infinity : new Date(deletion).getTime() - BAYMA_STOP_SECONDS * 1000;
+    return Effect.gen(function*() {
+      if (!holdsStop(pod.spec?.containers.find((container) => container.name === BAYMA_CONTAINER))) {
+        yield* Effect.logWarning(`session ${name} is not snapshotted as its pod ends: its bayma holds no stop for it`);
+        yield* counted("unheld");
+        return null;
+      }
+      return yield* stopSlot(node).withPermits(1)(Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis;
+        if (now >= heldUntil) {
+          yield* Effect.logWarning(`session ${name} is not snapshotted as its pod ends: its turn came ${Math.round((now - heldUntil) / 1000)} s after its bayma held its stop no more`);
+          yield* counted("late");
+          return null;
+        }
+        // Bounded by the agent's own call, LONG_CALL: what the agent says comes of the save.
+        const taken = yield* take(sandbox);
+        if (taken.outcome === "snapshotted") {
+          yield* counted("snapshotted");
+          return taken.saved;
+        }
+        if (taken.outcome !== "kept") yield* Effect.logWarning(`could not snapshot session ${name} as its pod ends: ${taken.why}`);
+        yield* counted("unsnapshotted");
+        return null;
+      }));
+    }).pipe(
+      Effect.catch((error) => Effect.logWarning(`could not snapshot session ${name} as its pod ends: ${error.message}`).pipe(Effect.andThen(counted("error")), Effect.as(null))),
+      withAlasioSpan("alasio.sandbox.stop_release", { attributes: { "alasio.sandbox.name": name, "k8s.node.name": node } }),
+    );
   };
 
   /** What the session's bayma says of its execs and its state generation, or null where it cannot be asked. */
@@ -552,10 +655,28 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
   const idle = (sandboxes: Sandboxes, sandbox: StoredSandbox, now: number): Effect.Effect<boolean> =>
     statusOf(sandboxes, sandbox).pipe(Effect.map((status) => idleBy(status, now)));
 
+  /** The snapshot taken live of the session, if its current snapshot is one, or null; one that cannot be read, null too, as its restore would not find it either. */
+  const liveSnapshotOf = (name: string): Effect.Effect<SavedSnapshot | null> =>
+    agents.current(ref(name)).pipe(
+      Effect.map((manifest): SavedSnapshot | null => (manifest?.live === undefined ? null : { snapshot: manifest.snapshot, release: manifest.release })),
+      Effect.catch((error) => Effect.logWarning(`could not read whether session ${name} has a snapshot taken live: ${error.message}`).pipe(Effect.as(null))),
+    );
+
   const watch = (sandboxes: Sandboxes, lastTurn: (name: string) => number | null): Effect.Effect<void, never, Scope.Scope> =>
     Effect.gen(function*() {
       const releasing = yield* FiberMap.make<string>();
       const saving = yield* FiberMap.make<string>();
+      const stopping = yield* FiberMap.make<string>();
+      /** Releases the session whose pod is ending though alasio did not end it, as Sandboxes.releaseStopping does, by saveStopping. */
+      const releaseStopped = (name: string): Effect.Effect<void> =>
+        sandboxes.releaseStopping(name).pipe(
+          Effect.asVoid,
+          Effect.catch((error) =>
+            Effect.logWarning(`could not release session ${name} as its pod ends: ${error.message}`).pipe(
+              Effect.andThen(Effect.sync(() => stopReleases.add(1, { "alasio.sandbox.stop_release.outcome": "error" }))),
+            )
+          ),
+        );
       // How many releases and live saves run on each node, which its agent checkpoints one beside the other.
       const onNode = new Map<string, number>();
       // Of each running session: since when its execs have run, when it was last saved live,
@@ -563,7 +684,6 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       // generation it holds it at. In memory: alasio's start begins them anew.
       const busySince = new Map<string, number>();
       const savedLiveAt = new Map<string, number>();
-      const takenLive = new Map<string, { readonly snapshot: string; readonly generation: number }>();
       /** Runs `effect` for the session on its node, if the node runs fewer than RELEASES_PER_NODE: whether it does. */
       const onItsNode = (name: string, map: FiberMap.FiberMap<string>, effect: Effect.Effect<void>): Effect.Effect<boolean, KubeApiError> =>
         Effect.gen(function*() {
@@ -615,11 +735,24 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
         });
       const look = Effect.gen(function*() {
         const listed = yield* kube.list(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, "alasio.dev/workload=session");
+        // Session pods, one call each look: those ending are seen within a look.
+        const pods = new Map(((yield* kube.list("v1", "Pod", profile.namespace, "alasio.dev/workload=session")) as readonly V1Pod[]).map((pod) => [pod.metadata?.name ?? "", pod]));
         const now = yield* Clock.currentTimeMillis;
         const running = new Set<string>();
         for (const sandbox of listed as readonly StoredSandbox[]) {
           const name = sandbox.metadata.name;
-          if (sandbox.spec.operatingMode === "Suspended" || !sandboxReady(sandbox) || (yield* FiberMap.has(releasing, name))) continue;
+          const pod = pods.get(name);
+          // Ending, though alasio, which suspends a Sandbox or deletes it first, did not end it;
+          // released where its bayma holds its stop for it, as a pod made before it was told to
+          // does not.
+          if (pod?.metadata?.deletionTimestamp !== undefined) {
+            const held = holdsStop(pod.spec?.containers.find((container) => container.name === BAYMA_CONTAINER));
+            if (sandbox.spec.operatingMode !== "Suspended" && sandbox.metadata.deletionTimestamp === undefined && held) {
+              yield* FiberMap.run(stopping, name, releaseStopped(name), { onlyIfMissing: true });
+            }
+            continue;
+          }
+          if (sandbox.spec.operatingMode === "Suspended" || !sandboxReady(sandbox) || (yield* FiberMap.has(releasing, name)) || (yield* FiberMap.has(stopping, name))) continue;
           running.add(name);
           const status = yield* statusOf(sandboxes, sandbox);
           if (status === null) continue;
@@ -700,12 +833,8 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       return !restoring && template !== undefined && template !== templates.current && template === templates.previous;
     },
     restore,
-    live: (name) =>
-      agents.current(ref(name)).pipe(
-        Effect.map((manifest): SavedSnapshot | null => (manifest?.live === undefined ? null : { snapshot: manifest.snapshot, release: manifest.release })),
-        Effect.catch((error) => Effect.logWarning(`could not read whether session ${name} has a snapshot taken live: ${error.message}`).pipe(Effect.as(null))),
-        withLogScope("snapshots"),
-      ),
+    live: (name) => liveSnapshotOf(name).pipe(withLogScope("snapshots")),
+    saveStopping: (sandbox, pod) => saveStopping(sandbox, pod).pipe(withLogScope("snapshots")),
     watch,
     forget: (name) =>
       forgetEverywhere(name).pipe(
