@@ -15,14 +15,14 @@ import { JUICEFS_ADMIN, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/w
 import { kube, onNode, ref } from "./harness.ts";
 import { FILE_OPERATIONS, until, WORKDIR } from "./workspace-storage.ts";
 
-const SPIKE_NAMESPACE = "alasio-spike";
+export const SPIKE_NAMESPACE = "alasio-spike";
 /** The node's directory of the spike: JuiceFS's mount at jfs/, each pod's attach directory under pods/. */
-const ROOT = "/var/lib/alasio-spike";
+export const ROOT = "/var/lib/alasio-spike";
 const ATTACHER = "spike-attacher";
 
-const said = (gate: string, finding: string, value: unknown) => console.error(`SPIKE ${gate} ${finding}: ${typeof value === "string" ? value : JSON.stringify(value)}`);
+export const said = (gate: string, finding: string, value: unknown) => console.error(`SPIKE ${gate} ${finding}: ${typeof value === "string" ? value : JSON.stringify(value)}`);
 
-const isReady = (pod: V1Pod | null | undefined) => pod?.status?.conditions?.some(({ type, status }) => type === "Ready" && status === "True") ?? false;
+export const isReady = (pod: V1Pod | null | undefined) => pod?.status?.conditions?.some(({ type, status }) => type === "Ready" && status === "True") ?? false;
 
 /** Runs `script` in the attacher, as root on the node's mounts: what it printed and its exit status, never throwing. */
 async function inAttacher(script: string): Promise<{ code: number; out: string }> {
@@ -31,13 +31,13 @@ async function inAttacher(script: string): Promise<{ code: number; out: string }
 }
 
 /** Runs `script` in the pool pod `pod`, as its agent user: what it printed and its exit status. */
-async function inPool(pod: string, script: string): Promise<{ code: number; out: string }> {
+export async function inPool(pod: string, script: string): Promise<{ code: number; out: string }> {
   const ran = await kube.exec(SPIKE_NAMESPACE, pod, ["sh", "-c", `${script} 2>&1`]);
   return { code: ran.code, out: ran.stdout.trim() };
 }
 
 /** A pod of the sessions' template, on `node`, its /attach the node's ROOT/pods/<its name>, mounted HostToContainer, and nothing else of a session's. */
-function poolPod(name: string, node: string, template: V1Pod["spec"] & object, image: string): V1Pod {
+export function poolPod(name: string, node: string, template: V1Pod["spec"] & object, image: string): V1Pod {
   return {
     apiVersion: "v1",
     kind: "Pod",

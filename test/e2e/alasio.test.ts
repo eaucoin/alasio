@@ -80,6 +80,7 @@ import {
 import type { ListedExport } from "./otlp-sink.ts";
 import { spikeAttach } from "./spike-attach.ts";
 import { spikeBinder } from "./spike-binder.ts";
+import { spikeMount } from "./spike-mount.ts";
 import type { ReplFilled, ReplSeen, ReplSet, ReplSummed } from "./session-repl.ts";
 import type { RoundtripSeen } from "./session-roundtrip.ts";
 import type { Corrupted, Released } from "./snapshot-bucket.ts";
@@ -1439,6 +1440,7 @@ if (inShard("snapshots")) {
 if (inShard("spike")) {
   spikeBinder();
   spikeAttach();
+  spikeMount();
 }
 
 if (inShard("workspaces")) {
