@@ -29,6 +29,7 @@ const unusedOutbox: Layer.Layer<Outbox> = Layer.succeed(Outbox, Outbox.of({
   enqueueStatus: () => Effect.succeed("outbox-status-1"),
   enqueueEdit: () => Effect.succeed("outbox-edit-1"),
   deliverDue: Effect.void,
+  deliverChat: () => Effect.void,
 }));
 
 /** What a recording outbox was given to queue: replies, status messages, and edits of them, each with the id it answered. */
@@ -50,6 +51,7 @@ export function recordingOutbox(): { readonly layer: Layer.Layer<Outbox>; readon
       enqueueStatus: (status) => Effect.sync(() => queued.statuses[queued.statuses.push({ ...status, id: id() }) - 1]!.id),
       enqueueEdit: (edits, edit) => Effect.sync(() => (queued.edits.push({ ...edit, edits }), id())),
       deliverDue: Effect.void,
+      deliverChat: () => Effect.void,
     })),
   };
 }

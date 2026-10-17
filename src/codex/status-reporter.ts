@@ -214,11 +214,12 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
     finishWithoutResponse,
     restarting: (chatId, status, harnessName) =>
       status
-        // Delivered now if it can be, as alasio stops; else after the restart, before anything the turn sends then.
-        // The wait is RESTARTING_DELIVERY at most: the pass goes on detached, so an entry it is
+        // Delivered now if it can be, as alasio stops, by its passes, the outbox's own among
+        // them; else after the restart, before anything the turn sends then. The wait is
+        // RESTARTING_DELIVERY at most: the passes go on detached, so an entry one is
         // delivering then, which is not cut short, holds alasio's stopping back no longer.
         ? edit(chatId, status, restartingStatusText(harnessName)).pipe(
-          Effect.andThen(Effect.forkDetach(outbox.deliverDue)),
+          Effect.andThen(Effect.forkDetach(outbox.deliverChat(chatId))),
           Effect.flatMap((pass) => Fiber.await(pass).pipe(Effect.timeoutOption(RESTARTING_DELIVERY))),
           Effect.asVoid,
         )

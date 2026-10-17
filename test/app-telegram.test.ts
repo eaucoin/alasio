@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import type { RunningAlasio } from "./support/alasio.ts";
 import {
@@ -16,7 +17,8 @@ import {
   mount,
   alasioFor,
 } from "./support/scenarios.ts";
-import { testPool } from "./support/store.ts";
+import { holdChatLock, testPool } from "./support/store.ts";
+import { OPERATOR_ID } from "./support/telegram.ts";
 
 /** Mounts Codex on alpha and has the operator send `first`, then `second` while it runs, queued behind it. */
 async function twoQueuedPrompts(alasio: RunningAlasio, first: string, second: string): Promise<void> {
@@ -79,6 +81,21 @@ test("an update whose processing fails is skipped, and the updates after it are 
     ["Service", 200],
     ["No active query to stop.", 200],
   ]);
+});
+
+test("a chat's update waits for its handling lock, which another alasio on the store holds, and is handled once it is let go of", { timeout: 30_000 }, async (t) => {
+  const alasio = await alasioFor(t);
+  const { telegram, stateSchema } = alasio;
+  // Another alasio, handling the operator's chat.
+  const letGo = await holdChatLock(stateSchema, "handling", OPERATOR_ID);
+  try {
+    telegram.say("/stop");
+    await sleep(1500);
+    assert.deepEqual(telegram.callsTo("sendMessage").map((call) => call.params.text), []);
+  } finally {
+    await letGo();
+  }
+  await telegram.waitFor("sendMessage", (call) => call.params.text === "No active query to stop.");
 });
 
 test("an update whose handling the store fails is handled once the store answers, and answered once", { timeout: 30_000 }, async (t) => {

@@ -23,7 +23,7 @@ import { CLAUDE_HARNESS, CODEX_HARNESS } from "../harness/names.ts";
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
 import { Mounts } from "../operator/mounts.ts";
 import type { StoreError } from "../persistence/sql.ts";
-import { Store } from "../persistence/store.ts";
+import { type HandlingMarks, Store } from "../persistence/store.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import { withLogScope } from "../shared/log.ts";
 import { SpanKind, withAlasioSpan } from "../telemetry/index.ts";
@@ -167,6 +167,9 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   }).pipe(Effect.catch((error) => Effect.logWarning(`Linked session warmup failed: ${error.message}`)));
 
   /**
+   * A chat's update is handled holding the chat's handling lock (Store.withHandlingLock),
+   * which every alasio on the store takes for it, so one at a time handles its updates;
+   * one that waits for it too long fails as the store does, and is taken again.
    * Each update starts a trace of its own, which everything it leads to joins: the
    * turn its prompt queues, however much later it runs, and the reply's delivery.
    * What it leads to runs on after it, so that consuming goes on meanwhile. One the store
@@ -178,8 +181,10 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   const processUpdate = (update: Update): Effect.Effect<void, StoreError> =>
     Effect.suspend(() => {
       const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
-      return Effect.gen(function*() {
-        if (!(yield* store.recordTelegramUpdate(update))) {
+      // Its marks made in the lock's transaction, where it has a chat's: a lock lost rolls them back.
+      const underLock = <A, E, R>(handle: (marks: HandlingMarks) => Effect.Effect<A, E, R>) => chatId === undefined ? handle(store) : store.withHandlingLock(chatId, handle);
+      return underLock((marks) => Effect.gen(function*() {
+        if (!(yield* marks.recordTelegramUpdate(update))) {
           return yield* Effect.logInfo(`Skipping update ${update.update_id}, processed already`);
         }
         const callbackQuery = update.callback_query;
@@ -203,8 +208,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
             yield* FiberSet.run(handling, processIncomingPrompt(prompt).pipe(Effect.provideContext(services), Effect.interruptible));
           }
         }
-        yield* store.markTelegramUpdateProcessed(update.update_id);
-      }).pipe(
+        yield* marks.markTelegramUpdateProcessed(update.update_id);
+      })).pipe(
         Effect.tapError((error) => Effect.logError(`Failed to keep update ${update.update_id}: ${error}`)),
         withAlasioSpan("alasio.update", {
           kind: SpanKind.CONSUMER,
