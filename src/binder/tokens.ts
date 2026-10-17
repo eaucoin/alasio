@@ -4,8 +4,8 @@
  * `<claims>.<signature>`, the claims base64url JSON, the signature their HMAC-SHA256 under the
  * key, base64url, compared in constant time.
  *
- * A caller's token names the key it may reach and when it stops: what the binder's callers
- * present, which the binder checks and never forwards. A binding's token names the key and
+ * A caller's token names the key it may reach, when it stops, and what its key is bound with:
+ * what the binder's callers present, which the binder checks and never forwards. A binding's token names the key and
  * the binding, its Lease's uid, so one minted for a binding is no other's, even of the same
  * key: what the bound pod is given, to take its calls, and its telemetry, by.
  */
@@ -13,11 +13,16 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 import { Option, Schema } from "effect";
 
-/** What a token says: the key it is for; the binding, for a binding's; and, for a caller's, the time it stops, in ms. */
+/**
+ * What a token says: the key it is for; the binding, for a binding's; and, for a caller's,
+ * the time it stops, in ms, and what its key is bound with where it is not bound yet, which
+ * the binder's gateway reads (as a session's environment and internet).
+ */
 export const TokenClaims = Schema.Struct({
   key: Schema.String,
   binding: Schema.optional(Schema.String),
   expires: Schema.optional(Schema.Number),
+  options: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 });
 export type TokenClaims = typeof TokenClaims.Type;
 
