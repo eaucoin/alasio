@@ -2948,6 +2948,84 @@ describe("the lake's reader", () => {
     }
   });
 
+  test("the Sandbox gateway row times its binds by how their pod came and its attaches and detaches, counts its releases by why and the pods the policy refused, and the alerts page on refusals and slow warm binds", async () => {
+    const minute = 60_000;
+    const now = Math.floor(Date.now() / minute) * minute;
+    const keyValues = (attributes: Readonly<Record<string, string>>) => Object.entries(attributes).map(([key, value]) => ({ key, value: { stringValue: value } }));
+    const nanos = (ms: number) => String(BigInt(ms) * 1_000_000n);
+    /** A point a minute of a series begun `startedAgo` minutes ago, of the values `at` (minutes before now) by each. */
+    const points = <Point extends object>(startedAgo: number, at: readonly (readonly [number, number])[], point: (seen: readonly number[]) => Point) =>
+      Array.from({ length: Math.max(...at.map(([ago]) => ago)) + 1 }, (_, index) => Math.max(...at.map(([ago]) => ago)) - index).map((ago) => ({
+        startTimeUnixNano: nanos(now - startedAgo * minute),
+        timeUnixNano: nanos(now - ago * minute),
+        ...point(at.filter(([happened]) => happened >= ago).map(([, value]) => value)),
+      }));
+    const counter = (name: string, attributes: Readonly<Record<string, string>>, at: readonly number[]) => ({
+      name,
+      sum: { aggregationTemporality: 2, isMonotonic: true, dataPoints: points(180, at.map((ago) => [ago, 1]), (seen) => ({ asDouble: seen.length, attributes: keyValues(attributes) })) },
+    });
+    const histogram = (name: string, attributes: Readonly<Record<string, string>>, at: readonly (readonly [number, number])[]) => ({
+      name,
+      histogram: {
+        aggregationTemporality: 2,
+        dataPoints: points(180, at, (seen) => ({ count: String(seen.length), sum: seen.reduce((total, value) => total + value, 0), bucketCounts: [String(seen.length)], explicitBounds: [], attributes: keyValues(attributes) })),
+      },
+    });
+    const main = { "k8s.namespace.name": "alasio-sessions" };
+    const bind = (start: string) => ({ ...main, "alasio.binder.pool": "sandboxes-none", "alasio.binder.start": start });
+    const reason = (why: string) => ({ ...main, "alasio.gateway.release.reason": why });
+    // The gateway up for three hours, which timed and counted before the last hour too.
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      await writeTelemetry(db, telemetryRows("metrics", {
+        resourceMetrics: [{
+          resource: { attributes: keyValues({ "service.name": "alasio-sandbox-gateway", "service.instance.id": "gateway-0" }) },
+          scopeMetrics: [{
+            metrics: [
+              histogram("alasio.binder.bind.duration", bind("warm"), [[150, 99], [20, 12], [10, 14]]),
+              histogram("alasio.binder.bind.duration", bind("cold"), [[20, 90]]),
+              histogram("alasio.binder.bind.duration", bind("made"), [[5, 40]]),
+              histogram("alasio.gateway.attach.duration", main, [[20, 2], [10, 4]]),
+              histogram("alasio.gateway.detach.duration", main, [[5, 1]]),
+              counter("alasio.gateway.releases", reason("idle"), [150, 40, 30]),
+              counter("alasio.gateway.releases", reason("asked"), [20]),
+              counter("alasio.gateway.releases", reason("lost"), [10]),
+              counter("alasio.gateway.pod_policy.refusals", { "k8s.namespace.name": "alasio-branch-try-sessions" }, [100, 5, 4]),
+            ],
+          }],
+        }],
+      }));
+    });
+    const dashboard: { panels: { title: string; targets?: { url_options: { data: string } }[] }[] } =
+      JSON.parse(readFileSync(new URL("../neon/grafana/dashboards/stack-health.json", import.meta.url), "utf8"));
+    const panel = (title: string) => {
+      const sql = dashboard.panels.find((found) => found.title === title)?.targets?.[0]?.url_options.data;
+      assert.ok(sql, title);
+      return [["${__from}", String(now - 60 * minute)], ["${__to}", String(now + minute)], ["${__interval_ms}", String(minute)]]
+        .reduce((text, [variable = "", value = ""]) => text.replaceAll(variable, value), sql);
+    };
+    const rules = readFileSync(new URL("../neon/grafana/provisioning/alerting/rules.yaml", import.meta.url), "utf8");
+    const alertQuery = (title: string) => {
+      const [, indent = "", block = ""] = /^ *title: .*\n[\s\S]*?^( *)data: \|\n((?:\1 {2}.*\n)+)/mu.exec(rules.slice(rules.indexOf(`title: ${title}`))) ?? [];
+      return block.replaceAll(`\n${indent}  `, "\n").trim();
+    };
+    const reader = await openReader(readerConfig);
+    try {
+      const rows = async (title: string, label: string, value: string) =>
+        (await answer(reader.db, panel(title))).map((row) => `${String(row[label])} ${Number(row[value])}`).sort();
+      // Each bind of the last hour, by how its pod came; the one before it, not.
+      assert.deepEqual(await rows("Bind time", "start", "seconds"), ["cold 90", "made 40", "warm 12", "warm 14"]);
+      assert.deepEqual(await rows("Attach and detach time", "phase", "seconds"), ["attach 2", "attach 4", "detach 1"]);
+      assert.deepEqual(await rows("Bindings released", "reason", "releases"), ["asked 1", "idle 1", "idle 1", "lost 1"]);
+      assert.deepEqual(await rows("Pods the policy refused", "namespace", "refused"), ["alasio-branch-try-sessions 1", "alasio-branch-try-sessions 1"]);
+      // Two refused in the last fifteen minutes; the warm binds of the last half hour, 13 s on average.
+      assert.deepEqual(await answer(reader.db, alertQuery("The sandbox pods' policy refuses pods")), [{ refused: 2 }]);
+      assert.deepEqual(await answer(reader.db, alertQuery("Binds are slow")), [{ seconds: 13 }]);
+    } finally {
+      reader.close();
+    }
+  });
+
   test("the alert rules say which volume server is filling its disk, which Valkey nears its memory limit, and which collection keeps too few copies", async () => {
     const now = String(BigInt(Date.now()) * 1_000_000n);
     const strings = (values: Record<string, string>) => Object.entries(values).map(([key, value]) => ({ key, value: { stringValue: value } }));
