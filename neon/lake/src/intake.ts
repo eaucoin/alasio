@@ -144,6 +144,8 @@ export interface IntakeOptions {
   stallMs?: number;
   /** How long its batches may fail one after another before it is not well (FAILING_MS). */
   failingMs?: number;
+  /** The clock its health is told by, in milliseconds: when its loop came round, and since when its batches have failed (Date.now). */
+  now?: () => number;
 }
 
 /** Whether the intake is well, and what it says of that: where its batches keep failing, the last failure. */
@@ -265,7 +267,7 @@ export function unreachable(reread: Reread, partitions: readonly PartitionAt[], 
 }
 
 /** Starts the intake: it opens the lake and joins the group now, and consumes until stopped. */
-export function startIntake({ open, join, metrics, log, batch: bounds = BATCH, retryMs = RETRY_MS, stallMs = STALL_MS, failingMs = FAILING_MS }: IntakeOptions): Intake {
+export function startIntake({ open, join, metrics, log, batch: bounds = BATCH, retryMs = RETRY_MS, stallMs = STALL_MS, failingMs = FAILING_MS, now = Date.now }: IntakeOptions): Intake {
   const stopped = new AbortController();
   let lake: IntakeLake | null = null;
   let source: IntakeSource | null = null;
@@ -419,13 +421,13 @@ export function startIntake({ open, join, metrics, log, batch: bounds = BATCH, r
     await member.close().catch(() => {});
   }
 
-  let cameRound = Date.now();
+  let cameRound = now();
   /** Since when its batches have failed one after another; null while they are written. */
   let failingSince: number | null = null;
   /** What the last batch to fail failed as. */
   let lastFailure = "";
   const done = (async () => {
-    for (; !stopped.signal.aborted; cameRound = Date.now()) {
+    for (; !stopped.signal.aborted; cameRound = now()) {
       if (!lake || !source) {
         try {
           lake ??= await open();
@@ -466,7 +468,7 @@ export function startIntake({ open, join, metrics, log, batch: bounds = BATCH, r
         failingSince = null;
         await measureLag(source);
       } catch (error) {
-        failingSince ??= Date.now();
+        failingSince ??= now();
         lastFailure = errorText(error);
         metrics.add("lake_telemetry_batches_total", { outcome: "failed" });
         await drop(error);
@@ -479,10 +481,10 @@ export function startIntake({ open, join, metrics, log, batch: bounds = BATCH, r
   return {
     ready: () => lake !== null && source !== null,
     health() {
-      const now = Date.now();
-      if (now - cameRound >= stallMs) return { ok: false, detail: `its loop has not come round for ${Math.round((now - cameRound) / 1000)} s` };
-      if (failingSince !== null && now - failingSince >= failingMs) {
-        return { ok: false, detail: `its batches have failed for ${Math.round((now - failingSince) / 1000)} s, the last as ${lastFailure}` };
+      const at = now();
+      if (at - cameRound >= stallMs) return { ok: false, detail: `its loop has not come round for ${Math.round((at - cameRound) / 1000)} s` };
+      if (failingSince !== null && at - failingSince >= failingMs) {
+        return { ok: false, detail: `its batches have failed for ${Math.round((at - failingSince) / 1000)} s, the last as ${lastFailure}` };
       }
       return { ok: true, detail: "its loop comes round" };
     },

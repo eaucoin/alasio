@@ -1280,15 +1280,20 @@ describe("telemetry", () => {
     const log = (message: string) => {
       if (message === "telemetry intake lost the lake or the log") failures += 1;
     };
-    const intake = startIntake({ open, join: async () => group.source, metrics: createMetrics(), log, batch: { ...BATCH, ms: 10 }, retryMs: 10, failingMs: 1000 });
+    // Its health told by the test's clock, which moves as the test says, however slowly the
+    // loop comes round under load.
+    let clock = 0;
+    const intake = startIntake({ open, join: async () => group.source, metrics: createMetrics(), log, batch: { ...BATCH, ms: 10 }, retryMs: 10, failingMs: 1000, now: () => clock });
     try {
       await until("a batch's failure", () => failures > 0);
+      clock += 999;
       assert.equal(intake.health().ok, true);
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-      assert.ok(failures > 1, `${failures} failures`);
+      clock += 1;
+      const failed = failures;
+      await until("another batch's failure", () => failures > failed);
       const { ok, detail } = intake.health();
       assert.equal(ok, false);
-      assert.match(detail, /^its batches have failed for \d+ s, the last as the lake's write lock was not held: Connection terminated unexpectedly$/u);
+      assert.equal(detail, "its batches have failed for 1 s, the last as the lake's write lock was not held: Connection terminated unexpectedly");
     } finally {
       await intake.stop();
     }
