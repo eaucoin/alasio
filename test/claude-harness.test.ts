@@ -14,7 +14,7 @@ import type {
   SessionStore,
   SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
-import { Effect, Exit, Option, Scope } from "effect";
+import { Deferred, Effect, Exit, Option, Scope } from "effect";
 
 import type { ResponseBlock } from "../src/codex/event-projection.ts";
 import { finalResponseToMarkdown } from "../src/codex/response-markdown.ts";
@@ -897,6 +897,86 @@ test("a report Claude Code starts while another turn holds the conversation wait
   await closeAll();
 });
 
+test("a turn Claude Code starts while the turn before it still lets go of the conversation holds it once that turn has, while it runs, so a prompt then finds it busy", async () => {
+  const persistence = createPersistence();
+  const own = createPersistence();
+  const ended: string[] = [];
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const turn = runTurn(liveSessions, { ...turnParams(persistence), ownTurns: ownTurnsOn(own, ended) });
+  const first = await cli.nextPrompt();
+  cli.emit(initMessage("s-1"));
+  cli.emit(successResult({ result: "Tests are running; I'll report back.", session_id: "s-1", user_message_uuids: [first.uuid] }));
+  await turn;
+
+  // The operator's turn, its answer given, still holds the conversation as alasio lets go
+  // of it, as Claude Code begins a turn of its own.
+  const lettingGo = Effect.runSync(Scope.make());
+  Effect.runSync(activeTurns.register("telegram:1", { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false }).pipe(Scope.provide(lettingGo)));
+  cli.emit(assistantMessage([text("Checking the log.")]));
+  await settle();
+  assert.equal(runningTurnOf(activeTurns, "telegram:1").cliInitiated, false);
+  assert.deepEqual(own.state.pending, []);
+
+  // Once it has let go, Claude Code's turn, running still, holds the conversation and has claimed it.
+  await Effect.runPromise(Scope.close(lettingGo, Exit.void));
+  await settle();
+  assert.equal(busy(activeTurns, "telegram:1"), true, "a prompt now finds the conversation busy");
+  assert.equal(runningTurnOf(activeTurns, "telegram:1").cliInitiated, true);
+  assert.equal(own.state.pending.length, 1);
+
+  // It ends, delivered under its claim, and lets go.
+  cli.emit(successResult({ result: "All 212 tests passed.", session_id: "s-1" }));
+  await settle();
+  await settle();
+  assert.deepEqual(own.state.completed, ["pending-1"]);
+  assert.deepEqual(ended, ["completed"]);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
+  await closeAll();
+});
+
+test("a turn Claude Code starts whose claim's first write of its blocks is slow delivers its reply after that write, each block once and in order", async () => {
+  const persistence = createPersistence();
+  const own = createPersistence();
+  const ended: string[] = [];
+  // Its first write of blocks, its claim's, waits until the test lets it go on.
+  const slowWrite = Effect.runSync(Deferred.make<void>());
+  let writes = 0;
+  const slow: TurnPersistence = {
+    ...own,
+    appendBlocksToPending: (id, blocks) => ((writes += 1) === 1 ? Deferred.await(slowWrite) : Effect.void).pipe(Effect.andThen(own.appendBlocksToPending(id, blocks))),
+  };
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const turn = runTurn(liveSessions, { ...turnParams(persistence), ownTurns: ownTurnsOn(slow, ended) });
+  const first = await cli.nextPrompt();
+  cli.emit(initMessage("s-1"));
+  cli.emit(successResult({ result: "Tests are running.", session_id: "s-1", user_message_uuids: [first.uuid] }));
+  await turn;
+
+  const lettingGo = Effect.runSync(Scope.make());
+  Effect.runSync(activeTurns.register("telegram:1", { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false }).pipe(Scope.provide(lettingGo)));
+  cli.emit(assistantMessage([text("Checking the log.")]));
+  await settle();
+  // The turn before lets go: Claude Code's claims the conversation, its first write held.
+  await Effect.runPromise(Scope.close(lettingGo, Exit.void));
+  await settle();
+  assert.equal(writes, 1);
+  // Meanwhile it says more, and ends.
+  cli.emit(assistantMessage([text("All green.")]));
+  cli.emit(successResult({ result: "All 212 tests passed.", session_id: "s-1" }));
+  await settle();
+  assert.deepEqual(own.state.completed, [], "nothing is delivered while its claim's first write is in flight");
+  Effect.runSync(Deferred.succeed(slowWrite, undefined));
+  for (let waited = 0; ended.length === 0 && waited < 2000; waited += 20) await settle();
+  assert.deepEqual(textBlocks(own.state.blocks as ResponseBlock[]).map(({ content }) => content), ["Checking the log.", "All green.", "All 212 tests passed."]);
+  assert.deepEqual([own.state.completed, ended], [["pending-1"], ["completed"]]);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
+  await closeAll();
+});
+
 test("a turn Claude Code starts while a fork holds its conversation waits, unclaimed, until the hold is let go of, then claims it and delivers its reply", async () => {
   const persistence = createPersistence();
   const own = createPersistence();
@@ -921,6 +1001,41 @@ test("a turn Claude Code starts while a fork holds its conversation waits, uncla
   for (let waited = 0; ended.length === 0 && waited < 4000; waited += 20) await settle();
   assert.deepEqual(textBlocks(own.state.blocks as ResponseBlock[]).map(({ content }) => content), ["Checking the log.", "All 212 tests passed."]);
   assert.deepEqual([own.state.completed, ended], [["pending-1"], ["completed"]]);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
+  await closeAll();
+});
+
+test("a turn Claude Code starts that is stopped as it claims its conversation ends that claim", async () => {
+  const persistence = createPersistence();
+  const own = createPersistence();
+  const ended: string[] = [];
+  // Its claim of the conversation is made once the test lets it.
+  const slowClaim = Effect.runSync(Deferred.make<void>());
+  const claiming = Effect.runSync(Deferred.make<void>());
+  const ownTurns = ownTurnsOn(own, ended);
+  const slowly: typeof ownTurns = { ...ownTurns, claim: (messageId, sessionId) => Deferred.succeed(claiming, undefined).pipe(Effect.andThen(Deferred.await(slowClaim)), Effect.andThen(ownTurns.claim(messageId, sessionId))) };
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const turn = runTurn(liveSessions, { ...turnParams(persistence), ownTurns: slowly });
+  const first = await cli.nextPrompt();
+  cli.emit(initMessage("s-1"));
+  cli.emit(successResult({ result: "Tests are running.", session_id: "s-1", user_message_uuids: [first.uuid] }));
+  await turn;
+
+  const lettingGo = Effect.runSync(Scope.make());
+  Effect.runSync(activeTurns.register("telegram:1", { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false }).pipe(Scope.provide(lettingGo)));
+  cli.emit(assistantMessage([text("Checking the log.")]));
+  await settle();
+  await Effect.runPromise(Scope.close(lettingGo, Exit.void));
+  await Effect.runPromise(Deferred.await(claiming));
+  // Stopped as it claims: the claim is made, and ended.
+  const stopping = runningTurnOf(activeTurns, "telegram:1").stop();
+  await settle();
+  Effect.runSync(Deferred.succeed(slowClaim, undefined));
+  await stopping;
+  for (let waited = 0; ended.length === 0 && waited < 2000; waited += 20) await settle();
+  assert.deepEqual(ended, ["interrupted"]);
   assert.equal(busy(activeTurns, "telegram:1"), false);
   await closeAll();
 });

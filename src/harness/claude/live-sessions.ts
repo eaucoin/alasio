@@ -154,6 +154,13 @@ export interface CliTurn {
   readonly promptUuids: Set<string>;
   /** Its registration as its conversation's running turn, closed as it ends. */
   readonly registration: Scope.Closeable;
+  /**
+   * Where it began while another turn held its conversation, or a report before it waited
+   * to: its wait to hold the conversation and claim it, as it runs; and what it lets the
+   * report after it go with, once it is let go of. Null where it held the conversation as
+   * it began.
+   */
+  taking: { readonly fiber: Fiber.Fiber<void, StoreError | TurnFenced>; readonly delivered: Deferred.Deferred<void> } | null;
 }
 
 /** How a live process came to serve its session: resuming it, starting it under a reserved id, or starting a new one. */
@@ -234,13 +241,24 @@ const needed = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, ClaudeCodeE
 /** Now, as a log line gives it. */
 const now = Effect.map(Clock.currentTimeMillis, (millis) => new Date(millis).toISOString());
 
-/** Ends a turn the CLI started: its prompts retired, and the conversation let go of. */
+/**
+ * Ends a turn the CLI started: its prompts retired, its wait to hold the conversation
+ * given up where it waits still, the conversation let go of, and the report after it let go.
+ */
 const releaseCliTurn = (host: ClaudeHost, cliTurn: CliTurn): Effect.Effect<void> =>
   Effect.suspend(() => {
     for (const uuid of cliTurn.promptUuids) {
       host.retiredUuids.add(uuid);
     }
-    return Scope.close(cliTurn.registration, Exit.void);
+    const taking = cliTurn.taking;
+    return (taking ? Fiber.interrupt(taking.fiber) : Effect.void).pipe(
+      Effect.andThen(Scope.close(cliTurn.registration, Exit.void)),
+      Effect.andThen(taking
+        ? Deferred.succeed(taking.delivered, undefined).pipe(Effect.andThen(Effect.sync(() => {
+          if (host.reportsWaiting === taking.delivered) host.reportsWaiting = null;
+        })))
+        : Effect.void),
+    );
   }).pipe(Effect.andThen(host.notifyIdle));
 
 /**
@@ -364,6 +382,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     if (host.cliTurn) {
       const cliTurn = host.cliTurn;
       host.cliTurn = null;
+      yield* stopTaking(cliTurn);
       yield* endCliTurn(host, cliTurn, "incomplete");
       yield* releaseCliTurn(host, cliTurn);
     }
@@ -398,27 +417,32 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
 
   /**
    * Claims the conversation for a CLI turn that holds it busy: its pending response begun,
-   * with the blocks it has so far. A claim whose response could not be begun, or its blocks
-   * stored, is ended.
+   * with the blocks it has so far, and only then the turn's claim, after which what it says
+   * is stored as it says it, and its reply delivered. Not interrupted midway, so a claim made
+   * is the turn's, which ends it; a claim whose response could not be begun, or its blocks
+   * stored, is ended here.
    */
-  const claimCliTurn = Effect.fnUntraced(function*(host: ClaudeHost, cliTurn: CliTurn) {
-    const messageId = `claude-cli-turn:${randomUUID()}`;
-    const own = yield* host.ownTurns.claim(messageId, host.sessionId);
-    yield* Effect.gen(function*() {
-      const pendingResponseId = yield* own.persistence.createPendingResponse(host.chatId, messageId, host.sessionId);
-      cliTurn.claim = { own, commandPolicy: createCommandEventPolicy({ persistence: own.persistence, chatId: host.chatId, messageId }) };
-      cliTurn.projection = { ...cliTurn.projection, pendingResponseId };
-      yield* storeBlocks(cliTurn.projection, own.persistence);
-    }).pipe(
-      // Ended here, and so by nothing after.
-      Effect.tapError(() =>
-        Effect.sync(() => void (cliTurn.claim = null)).pipe(
-          Effect.andThen(own.end("failed")),
-          Effect.catch((error) => Effect.logWarning(`could not end a CLI turn's claim thread=${host.threadKey}: ${error.message}`)),
-        )
-      ),
-    );
-  });
+  const claimCliTurn = (host: ClaudeHost, cliTurn: CliTurn): Effect.Effect<void, StoreError | TurnFenced> =>
+    Effect.uninterruptible(Effect.gen(function*() {
+      const messageId = `claude-cli-turn:${randomUUID()}`;
+      const own = yield* host.ownTurns.claim(messageId, host.sessionId);
+      yield* Effect.gen(function*() {
+        const pendingResponseId = yield* own.persistence.createPendingResponse(host.chatId, messageId, host.sessionId);
+        cliTurn.projection = { ...cliTurn.projection, pendingResponseId };
+        yield* storeBlocks(cliTurn.projection, own.persistence);
+        cliTurn.claim = { own, commandPolicy: createCommandEventPolicy({ persistence: own.persistence, chatId: host.chatId, messageId }) };
+      }).pipe(
+        Effect.tapError(() =>
+          own.end("failed").pipe(Effect.catch((error) => Effect.logWarning(`could not end a CLI turn's claim thread=${host.threadKey}: ${error.message}`)))
+        ),
+      );
+    }));
+
+  /**
+   * Gives up a CLI turn's wait to hold its conversation, where it waits still, once its
+   * claim, if it is making one, is made: so that what ends the turn ends that claim too.
+   */
+  const stopTaking = (cliTurn: CliTurn): Effect.Effect<void> => (cliTurn.taking ? Effect.asVoid(Fiber.interrupt(cliTurn.taking.fiber)) : Effect.void);
 
   /** The options a CLI turn holds the conversation busy with. */
   const cliTurnRegistration = (host: ClaudeHost) => ({ onlyIfIdle: true, workspace: workspacePod?.(host.threadKey) });
@@ -485,6 +509,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       yield* interrupt(host, abortReason);
       if (host.cliTurn === cliTurn) {
         host.cliTurn = null;
+        yield* stopTaking(cliTurn);
         yield* endCliTurn(host, cliTurn, "interrupted");
         yield* releaseCliTurn(host, cliTurn);
       }
@@ -505,6 +530,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       running: { cliInitiated: true, stop, steer },
       promptUuids: new Set(),
       registration: yield* Scope.make(),
+      taking: null,
     };
     host.cliTurn = cliTurn;
     const held = host.reportsWaiting === null
@@ -514,9 +540,25 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         Effect.onError(() => Effect.sync(() => void (host.cliTurn = null)).pipe(Effect.andThen(releaseCliTurn(host, cliTurn)))),
       );
       yield* Effect.logInfo(`cli-turn.started thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)}`);
-    } else {
-      yield* Effect.logInfo(`cli-turn.started thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)} unclaimed: another turn holds the conversation, or a fork's hold does, or a report waits to`);
+      return cliTurn;
     }
+    // Another turn holds the conversation, as an operator's turn that has just ended holds it
+    // until it has let go, or a fork's hold does, or a report before this one waits to: this
+    // one waits behind that
+    // report, then holds the conversation and claims it, while it runs, so a prompt that
+    // comes once the other has let go finds it busy, and its reply is delivered under its
+    // claim. The process reads on meanwhile.
+    const before = host.reportsWaiting;
+    const delivered = yield* Deferred.make<void>();
+    host.reportsWaiting = delivered;
+    const fiber = yield* (before ? Deferred.await(before) : Effect.void).pipe(
+      Effect.andThen(holdForCliTurnWhenFree(host, cliTurn)),
+      Effect.andThen(claimCliTurn(host, cliTurn)),
+      Effect.andThen(Effect.logInfo(`cli-turn.claimed thread=${host.threadKey} as the turn before it let go`)),
+      Effect.forkIn(scope),
+    );
+    cliTurn.taking = { fiber, delivered };
+    yield* Effect.logInfo(`cli-turn.started thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)} unclaimed: another turn holds the conversation, or a report waits to`);
     return cliTurn;
   });
 
@@ -526,6 +568,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     const projected = projectResultMessage(message);
     const text = projected?.ok ? projected.text?.trim() : `Error: ${projected?.error ?? "Claude did not complete"}`;
     if (!text) {
+      yield* stopTaking(cliTurn);
       yield* endCliTurn(host, cliTurn, "incomplete");
       yield* Effect.logInfo(`cli-turn.done thread=${host.threadKey} delivered=false`);
       yield* releaseCliTurn(host, cliTurn);
@@ -536,19 +579,15 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       content: text,
       phase: "final_answer",
     });
-    if (cliTurn.claim) {
-      yield* deliverCliTurn(host, cliTurn, cliTurn.claim.own);
+    const taking = cliTurn.taking;
+    if (!taking) {
+      if (cliTurn.claim) yield* deliverCliTurn(host, cliTurn, cliTurn.claim.own);
       return;
     }
-    // Another turn holds the conversation, or a report before this one waits for it: the
-    // reply waits behind that report, then for the conversation to be free, and is then
-    // delivered under a claim of its own. The process reads on meanwhile.
-    const before = host.reportsWaiting;
-    const delivered = yield* Deferred.make<void>();
-    host.reportsWaiting = delivered;
-    yield* (before ? Deferred.await(before) : Effect.void).pipe(
-      Effect.andThen(holdForCliTurnWhenFree(host, cliTurn)),
-      Effect.andThen(claimCliTurn(host, cliTurn)),
+    // It began while another turn held its conversation (ensureCliTurn): the reply is
+    // delivered under its claim once that is made, whether it is being made or yet to be.
+    // The process reads on meanwhile.
+    yield* Fiber.join(taking.fiber).pipe(
       Effect.flatMap(() => (cliTurn.claim ? deliverCliTurn(host, cliTurn, cliTurn.claim.own) : Effect.void)),
       Effect.catch((error) =>
         Effect.logWarning(`could not deliver a CLI turn's reply thread=${host.threadKey}: ${error.message}`).pipe(
@@ -556,12 +595,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         )
       ),
       // However it went, the conversation is let go of, and the report after it may go.
-      Effect.ensuring(releaseCliTurn(host, cliTurn).pipe(
-        Effect.andThen(Deferred.succeed(delivered, undefined)),
-        Effect.andThen(Effect.sync(() => {
-          if (host.reportsWaiting === delivered) host.reportsWaiting = null;
-        })),
-      )),
+      Effect.ensuring(releaseCliTurn(host, cliTurn)),
       Effect.forkIn(scope),
     );
   });
