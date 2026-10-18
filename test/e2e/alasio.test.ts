@@ -288,6 +288,9 @@ if (inShard("upgrade")) {
     /** The lines of Codex's rollouts the lake holds, and how many it had loaded on the release before. */
     const lakeLines = async () => Number((await lakeQuery("select count(*) as n from codex.lines"))[0]?.["n"] ?? 0);
     let loaded: number;
+    /** The Telegram message kept twice on the release before, by the id of the one kept first; and Telegram's id of it. */
+    let keptOnce: string;
+    let sentAs: string;
     const scenarios: readonly Scenario[] = [
       {
         seeds: "main's bot allowing the users its owner gave it",
@@ -420,6 +423,22 @@ if (inShard("upgrade")) {
         check: async () => {
           await tg.say("by webhook");
           await tg.waitFor((call) => answered(call));
+        },
+      },
+      {
+        seeds: "a Telegram message kept twice, as two of main's alasios could keep it as they handed over",
+        seed: async () => {
+          // The operator's first, which nothing of the run reads again.
+          [keptOnce, sentAs] = (await onDatabase(NAMESPACE, "select id, transport_message_id from state.messages where transport_message_id is not null and kind = 'text' order by created_at limit 1")).split("|") as [string, string];
+          await onDatabase(NAMESPACE, `insert into state.messages (id, conversation_id, direction, kind, transport_message_id, text, media_group_id, raw, session_id, turn_id, created_at)
+            select id || '-again', conversation_id, direction, kind, transport_message_id, text, media_group_id, raw, session_id, turn_id, created_at + interval '1 second'
+            from state.messages where id = '${keptOnce}'`);
+        },
+        keeps: "the message once, as it was kept first, its copy told of before the cut-over changed anything and removed past its point of no return",
+        check: async () => {
+          assert.equal(await onDatabase(NAMESPACE, `select string_agg(id, ',' order by id) from state.messages where id in ('${keptOnce}', '${keptOnce}-again')`), keptOnce);
+          assert.match((await inCutOverRecord("cat telegram-duplicates.tsv")).trim(), new RegExp(`^message\\t[^\\t]+\\t[^\\t]+\\t${sentAs}\\t[^\\t]*\\t2\\t1$`, "u"));
+          assert.equal((await inCutOverRecord("cat telegram-copies-removed")).trim(), "1");
         },
       },
     ];
