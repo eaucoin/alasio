@@ -788,6 +788,20 @@ if (inShard("sessions")) {
       assert.equal(await inAlasioContainer(["cat", `${home}/e2e-folder-proof`]), `written by ${HOST_USER}`);
     });
 
+    test("a folder conversation's instance restarted saves its REPL sessions whole as it stops, and the next bind's restores them", { skip: !HOST_PROFILE && "folder workspaces are for a single node", timeout: 20 * 60_000 }, async () => {
+      const key = "folder:claude:e2e:folder";
+      const set = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", GATEWAY_MCP, await mainKeyToken(key), "kept by e2e:folder");
+      const [before] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+      assert.match(await alasioOk("folder", "restart", "e2e:folder"), /^Claude: its folder instance of e2e:folder is let go, its REPL sessions saved; the next message makes it anew$/mu);
+      const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(key), set.python, set.bun);
+      assert.deepEqual([seen.python.kept, seen.python.counting, seen.bun.live, seen.bun.checkpointed], ["kept by e2e:folder", true, "kept by e2e:folder", "kept by e2e:folder"], JSON.stringify(seen));
+      assert.ok((seen.python.count ?? 0) > set.count, JSON.stringify(seen));
+      for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
+      // A pod of its own, made anew.
+      const [after] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+      assert.notEqual(after?.metadata?.uid, before?.metadata?.uid);
+    });
+
     test("no one makes a pod in the folders' namespace but the gateway, which makes none but of the folder template, nor a Secret there but an instance's token", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
       const [instance] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
       assert.ok(instance?.metadata?.name && instance.spec, "the folder's instance is made");
