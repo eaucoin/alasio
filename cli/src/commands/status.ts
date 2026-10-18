@@ -421,7 +421,10 @@ export const status = Command.make("status", {}, () =>
         "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready (a compute awake, or " +
         "asleep, as one no client has used for a while is until the next connection wakes it, and when it was last woken; the lake's loader " +
         "awake, or asleep with nothing left to load until alasio writes again; a sandbox pool with its warm pods, its bindings and the binds " +
-        "waiting for a pod, as the sandbox gateway counts them), waking (a compute or the loader whose pod starts, within " +
+        "waiting for a pod, as the sandbox gateway counts them; a bound pod is its pool's no more, so a node that holds one is drained only by " +
+        "`kubectl drain --force`, which refuses it at once without --force, and whose eviction of it the bound pods' disruption budget refuses " +
+        "while it is bound: the drain waits until the gateway releases the session, idle, into its snapshot, which its next bind restores on " +
+        "another node), waking (a compute or the loader whose pod starts, within " +
         "its Deployment's progress deadline), or what it is at and " +
         "why; its replicas, and its scale where KEDA moves it; and its pods' requests, beside " +
         "what VPA recommends once it has measured them; where sessions are snapshotted, the CPU baseline they are held to, and the nodes that lack it, and the gVisor releases kept, with the snapshots naming each. Of the bundled object store, the copies it keeps of each object, and of each " +

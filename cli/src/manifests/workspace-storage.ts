@@ -21,7 +21,10 @@
  *   pending deletion deleted, leaked objects deleted, and chunks left in many slices
  *   compacted, which a mount otherwise compacts only as it reads and writes them;
  * - the metadata's dump (metadataDump), every backupInterval, as JuiceFS's own backup would
- *   have made it.
+ *   have made it;
+ * - the stale sessions' cleanup (staleSessions), every five minutes: the sessions of clients
+ *   that died, their locks and the files they held open let go, which a lock a dead client
+ *   held is held by until then, seven minutes at most.
  */
 import type { KubernetesObject, V1Container, V1CronJob, V1StorageClass } from "@kubernetes/client-node";
 
@@ -176,6 +179,86 @@ function collection(config: InstallConfig): V1CronJob {
   return dailyAdminTask(config, "juicefs-gc", COLLECTION_SCHEDULE, "gc", 'juicefs gc "$META_URL" --compact --delete');
 }
 
+/**
+ * How often the stale clients' sessions are cleaned (staleSessions): the most a lock a dead
+ * client held blocks another, past the minute before its session counts as stale.
+ */
+export const STALE_SESSIONS_SCHEDULE = "*/5 * * * *";
+
+/**
+ * How long staleSessions runs its client, in seconds: past two of its refreshes, a
+ * heartbeat's each (12 s, ±10%), as its first may come before the cleanups' last mark has
+ * aged past 0.9 of a heartbeat, which the cleanup waits for (JuiceFS's pkg/meta base.go
+ * refresh and CleanStaleSessions).
+ */
+export const STALE_SESSIONS_RUN_SECONDS = 40;
+
+/**
+ * The sessions of clients that died cleaned, every STALE_SESSIONS_SCHEDULE, one run at a
+ * time: what a client's background jobs do, and no mount of the nodes' does. A session
+ * counts as stale once its client has sent no heartbeat for five of them (60 s), and a client
+ * with background jobs cleans the stale sessions as it refreshes its own, every heartbeat:
+ * their locks let go and the files they held open after their deletion freed. So a lock a
+ * client that died held blocks another for 60 s and up to a schedule's interval more, and
+ * this job's run: seven minutes at most. The client is JuiceFS's S3 gateway, on the
+ * pod's loopback, which opens a session with background jobs and needs no FUSE, run for
+ * STALE_SESSIONS_RUN_SECONDS: no mount, so nothing of it is anywhere a workspace lives, and
+ * no backup of its own (`--backup-meta 0`). Its other background jobs, the trash's expiry and
+ * deletions pending, are the daily collection's too, which they overlap harmlessly. The
+ * sessions are said as it begins and ends.
+ */
+function staleSessions(config: InstallConfig): V1CronJob {
+  const component = "juicefs-sessions";
+  const sessions = `juicefs status "$META_URL" 2>/dev/null | grep -c '"Sid"' || true`;
+  const container: V1Container = {
+    ...adminContainer(
+      config,
+      "sessions",
+      `echo "sessions as it begins: $(${sessions})"`,
+      // The gateway's own S3 credentials, which nothing reaches it by: random, as it listens on the pod's loopback alone.
+      "MINIO_ROOT_USER=maintenance MINIO_ROOT_PASSWORD=$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \\n') \\",
+      '  juicefs gateway --no-usage-report --backup-meta 0 --cache-dir /tmp/cache --cache-size 0 "$META_URL" 127.0.0.1:9000 &',
+      "client=$!",
+      `sleep ${STALE_SESSIONS_RUN_SECONDS}`,
+      'kill -TERM "$client"',
+      'wait "$client" || true',
+      `echo "sessions as it ends: $(${sessions})"`,
+    ),
+    securityContext: restrictedContainer(),
+    env: [{ name: "META_URL", valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key: "metaurl" } } }, { name: "HOME", value: "/tmp" }],
+    resources: { requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "512Mi" } },
+    volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],
+  };
+  return {
+    apiVersion: "batch/v1",
+    kind: "CronJob",
+    metadata: { name: componentName(component), namespace: NAMESPACE, labels: labels(component) },
+    spec: {
+      schedule: STALE_SESSIONS_SCHEDULE,
+      concurrencyPolicy: "Forbid",
+      successfulJobsHistoryLimit: 1,
+      failedJobsHistoryLimit: 3,
+      jobTemplate: {
+        spec: {
+          backoffLimit: 1,
+          activeDeadlineSeconds: 240,
+          template: {
+            metadata: { labels: { ...labels(component), ...JUICEFS_ADMIN } },
+            spec: {
+              restartPolicy: "Never",
+              ...priority("component"),
+              ...imagePullSecrets(config),
+              securityContext: restrictedPod(NOBODY, NOBODY),
+              containers: [container],
+              volumes: [{ name: "tmp", emptyDir: {} }],
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
 /** How many of the metadata's dumps the bucket's meta/ keeps, the newest: a day's, at the default interval. */
 export const DUMPS_KEPT = 24;
 
@@ -323,5 +406,5 @@ export function workspaceStorageObjects(config: InstallConfig): KubernetesObject
     // settings in.
     ...(nodeAgentRuns(config) ? { besideDefault: [{ name: WORKSPACE_QUOTAS_USER, secret: WORKSPACE_QUOTAS, rules: QUOTAS_RULES }] } : {}),
   };
-  return [...valkeyObjects(config, instance, [formatter(config)]), ...juicefsCsiObjects(config), storageClass(config), quotaCheck(config), collection(config), metadataDump(config)];
+  return [...valkeyObjects(config, instance, [formatter(config)]), ...juicefsCsiObjects(config), storageClass(config), quotaCheck(config), collection(config), metadataDump(config), staleSessions(config)];
 }

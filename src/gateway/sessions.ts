@@ -37,6 +37,13 @@
  * What is refused is `{ error }` with its status; a node agent's refusal is its own, and
  * what failed otherwise 502.
  *
+ * A bound pod is its pool's ReplicaSet's no more, its owner let go as it is claimed, and the
+ * bound pods' disruption budget (cli/src/manifests/disruption.ts boundBudget) refuses its
+ * eviction: `kubectl drain` refuses a node holding one but with --force, and then waits for
+ * the binding's release, as it idles, into its snapshot, which the session's next bind
+ * restores on another node. A bound pod deleted outright, not evicted, is saved as its bayma
+ * holds its stop (drain, below).
+ *
  * Its metrics: how long each attach and detach took (ATTACH_DURATION, DETACH_DURATION), and
  * each binding released, by why (RELEASES): `idle`, released by its sweep; `asked`, by its
  * caller; `lost`, its pod gone while it was bound; `deleted`, its pod ended by other than the

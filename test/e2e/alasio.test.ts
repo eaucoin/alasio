@@ -2657,7 +2657,13 @@ if (inShard("scaling")) {
       await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
       await tg.say("wait 60");
       await until("alasio's pod busy", async () => ((await labelledBusy(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE))) ? true : undefined), 60_000);
-      // kubectl drain, of the session's bound pod alone, as the node's other pods are not this test's: forced, as a bound pod is its ReplicaSet's no more.
+      // kubectl drain refuses a node holding a bound pod at once, unless forced, as a bound pod is its ReplicaSet's no more.
+      const selector = `${BINDING_LABEL}=${keyHash(sessionKey(volumeId))}`;
+      const began = Date.now();
+      const unforced = await onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=${selector} --delete-emptydir-data --timeout=60s`).then(() => "drained", (error: unknown) => String(error));
+      assert.match(unforced, /cannot delete Pods that declare no controller \(use --force to override\)/u);
+      assert.ok(Date.now() - began < 30_000, `the unforced drain took ${Date.now() - began} ms to refuse`);
+      // Forced, of the session's bound pod alone, as the node's other pods are not this test's.
       let drained = 0;
       const draining = onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=${BINDING_LABEL}=${keyHash(sessionKey(volumeId))} --force --delete-emptydir-data --timeout=600s`).then((said) => {
         drained = Date.now();

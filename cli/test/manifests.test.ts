@@ -2224,6 +2224,39 @@ describe("workspace storage", () => {
     }
   });
 
+  test("cleans the sessions of clients that died every five minutes, one run at a time, by a client of background jobs run past two of its refreshes, on no mount, of no backup of its own", () => {
+    const cleaning = one<V1CronJob>(install(), "CronJob", "alasio-juicefs-sessions");
+    assert.equal(cleaning.spec?.schedule, "*/5 * * * *");
+    assert.equal(cleaning.spec?.concurrencyPolicy, "Forbid");
+    const pod = cleaning.spec?.jobTemplate.spec?.template;
+    assert.equal(pod?.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
+    assert.equal(pod?.spec?.securityContext?.runAsNonRoot, true);
+    const [client] = pod?.spec?.containers ?? [];
+    assert.ok(client);
+    // Unprivileged, as it mounts nothing.
+    assert.deepEqual(client.securityContext, { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } });
+    const juicefs = [
+      'echo "$@" >> "$ROOT/calls"',
+      'if [ "$1" = status ]; then echo \'{"Sessions": [\'; echo \'{"Sid": 1,\'; echo \'{"Sid": 2,\'; echo "]}"; exit 0; fi',
+      '[ -n "$MINIO_ROOT_PASSWORD" ] && [ "${#MINIO_ROOT_PASSWORD}" -ge 8 ] || exit 3',
+      "trap 'echo stopped >> \"$ROOT/calls\"; exit 0' TERM",
+      "while :; do sleep 0.1; done",
+    ].join("\n");
+    const metaUrl = "redis://:secret@alasio-valkey.alasio.svc.cluster.local:6379/1";
+    const { root, run, remove } = runScript(client, { META_URL: metaUrl }, { juicefs, sleep: 'if [ "$1" = 40 ]; then echo "slept $1" >> "$ROOT/calls"; /bin/sleep 1; else /bin/sleep "$1"; fi' });
+    try {
+      const said = run();
+      assert.match(said, /^sessions as it begins: 2$/mu);
+      assert.match(said, /^sessions as it ends: 2$/mu);
+      const calls = readFileSync(join(root, "calls"), "utf8").trim().split("\n").filter((call) => !call.startsWith("0.1"));
+      // The sessions counted, the client started beside the wait, stopped once it is through, and the sessions counted again.
+      assert.deepEqual([calls[0], calls.at(-1), calls.at(-2)], [`status ${metaUrl}`, `status ${metaUrl}`, "stopped"]);
+      assert.deepEqual(calls.slice(1, -2).sort(), [`gateway --no-usage-report --backup-meta 0 --cache-dir /tmp/cache --cache-size 0 ${metaUrl} 127.0.0.1:9000`, "slept 40"]);
+    } finally {
+      remove();
+    }
+  });
+
   test("collects the file system daily, as a JuiceFS admin on the pinned client, kept as the driver is", () => {
     const collection = one<V1CronJob>(install(), "CronJob", "alasio-juicefs-gc");
     assert.equal(collection.metadata?.namespace, "alasio");

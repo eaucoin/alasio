@@ -485,6 +485,38 @@ export function workspaceStorage(): void {
       assert.ok(!listing.split("\n").includes(deleted), `the deleted workspace's directory remains: ${listing}`);
     });
 
+    test("a lock a client that died held lets go once the job that cleans stale sessions has run, its session gone", async () => {
+      const { node } = await bringUp(none);
+      const mountPods = async () => (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("workspace-mount")) })).filter(({ spec }) => spec?.nodeName === node);
+      const [mount] = await mountPods();
+      assert.ok(mount?.metadata?.name, `${node} runs no mount's pod`);
+      const sessions = () => withAdminPod((inPod) => inPod("juicefs", 'juicefs status "$META_URL" 2>/dev/null')).then((said) => [...said.matchAll(/"Sid": *([0-9]+)/gu)].map(([, sid]) => sid));
+      const before = await sessions();
+      // Locked through the node's mount, as its agent sees it, by a process that holds it; then the mount's client killed, as a reboot ends it.
+      const agent = (await nodeAgents()).get(node);
+      assert.ok(agent, `no node agent runs ready on ${node}`);
+      const inAgent = (script: string) => kube.exec(NAMESPACE, agent, ["sh", "-c", script], { container: "node-agent" });
+      const locked = `${WORKSPACES_ROOT}/${directoryOf(none)}/files${WORKDIR}/locked`;
+      const tryLock = async () => ((await inAgent(`flock -n -x ${locked} true`)).code === 0 ? "free" : "held");
+      await inAgent(`touch ${locked}`);
+      const holding = inAgent(`flock -x ${locked} sleep 120`).catch(() => undefined);
+      await until("the lock held", async () => ((await tryLock()) === "held" ? true : undefined), 30_000);
+      const killed = Date.now();
+      await kube.kill(NAMESPACE, mount.metadata.name);
+      // Its holder ends as its sleep does, its lock the dead client's session's meanwhile.
+      void holding;
+      await until("the node's mount served again by a new pod", async () =>
+        (await mountPods()).some(({ metadata, status }) => metadata?.uid !== mount.metadata?.uid && status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True")) ? true : undefined, 240_000);
+      // Held still, by the session of the client that died, until it is cleaned.
+      assert.equal(await tryLock(), "held");
+      // Stale once its client has sent no heartbeat for a minute; then cleaned by the job.
+      await sleep(Math.max(0, killed + 75_000 - Date.now()));
+      await runCronJob(componentName("juicefs-sessions"));
+      assert.equal(await tryLock(), "free");
+      const after = await sessions();
+      assert.ok(before.some((sid) => !after.includes(sid)), `no session of before is gone: ${before.join(", ")} then ${after.join(", ")}`);
+    });
+
     test("JuiceFS dumps its metadata to its bucket, the nightly backup copies the newest, and the copy restores the same files", async () => {
       await withAdminPod(async (inPod) => {
         const meta = "s3://$WORKSPACES_BUCKET/$WORKSPACES_NAME/meta/";
