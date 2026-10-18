@@ -12,6 +12,7 @@ import { ActiveTurns } from "../../src/harness/active-turns.ts";
 import { type Harness, Harnesses } from "../../src/harness/index.ts";
 import type { HarnessName } from "../../src/harness/names.ts";
 import { Mounts } from "../../src/operator/mounts.ts";
+import { StoreError } from "../../src/persistence/sql.ts";
 import { Store } from "../../src/persistence/store.ts";
 import type { AlasioServices } from "../../src/alasio.ts";
 import { SessionSandboxes } from "../../src/sandbox/index.ts";
@@ -26,6 +27,7 @@ import { recordingTelegram } from "./telegram-calls.ts";
 /** An outbox that queues nothing, for turns whose replies a test does not follow. */
 const unusedOutbox: Layer.Layer<Outbox> = Layer.succeed(Outbox, Outbox.of({
   enqueueText: () => Effect.succeed("outbox-1"),
+  enqueuePanel: () => Effect.succeed("outbox-panel-1"),
   enqueueStatus: () => Effect.succeed("outbox-status-1"),
   enqueueEdit: () => Effect.succeed("outbox-edit-1"),
   deliverDue: Effect.void,
@@ -39,20 +41,34 @@ export interface QueuedToOutbox {
   readonly edits: (OutboxStatus & { readonly edits: string })[];
 }
 
-/** An outbox that delivers nothing and records what it is given to queue, in `queued`. */
-export function recordingOutbox(): { readonly layer: Layer.Layer<Outbox>; readonly queued: QueuedToOutbox } {
+/**
+ * An outbox that delivers nothing and records what it is given to queue, in `queued`: a
+ * reply with buttons among its replies, its buttons' actions kept in the store, as the
+ * outbox keeps them. The first `failedPanels` replies with buttons fail, keeping nothing,
+ * as the store failing them would.
+ */
+export function recordingOutbox({ failedPanels = 0 }: { readonly failedPanels?: number } = {}): { readonly layer: Layer.Layer<Outbox, never, Store>; readonly queued: QueuedToOutbox } {
   const queued: QueuedToOutbox = { texts: [], statuses: [], edits: [] };
   let ids = 0;
+  let panels = 0;
   const id = () => `outbox-${(ids += 1)}`;
+  const record = (text: OutboxText) => Effect.sync(() => queued.texts[queued.texts.push({ ...text, id: id() }) - 1]!.id);
   return {
     queued,
-    layer: Layer.succeed(Outbox, Outbox.of({
-      enqueueText: (text) => Effect.sync(() => queued.texts[queued.texts.push({ ...text, id: id() }) - 1]!.id),
+    layer: Layer.effect(Outbox, Effect.map(Effect.service(Store), (store) => Outbox.of({
+      enqueueText: record,
+      enqueuePanel: ({ conversationId, chatId, text, keyboard }) =>
+        (panels += 1) <= failedPanels
+          ? Effect.fail(new StoreError({ cause: new Error("the store is down") }))
+          : Effect.flatMap(store.createCallbackActions(conversationId, keyboard.flat()), (actionIds) => {
+            let next = 0;
+            return record({ chatId, text, options: { reply_markup: { inline_keyboard: keyboard.map((row) => row.map((button) => ({ text: button.text, callback_data: actionIds[next++]! }))) } } });
+          }),
       enqueueStatus: (status) => Effect.sync(() => queued.statuses[queued.statuses.push({ ...status, id: id() }) - 1]!.id),
       enqueueEdit: (edits, edit) => Effect.sync(() => (queued.edits.push({ ...edit, edits }), id())),
       deliverDue: Effect.void,
       deliverChat: () => Effect.void,
-    })),
+    }))),
   };
 }
 
@@ -88,7 +104,7 @@ export interface TestServicesOptions {
   readonly stateDir?: string | undefined;
   readonly allowedUserIds?: string | undefined;
   /** The outbox replies are queued to: unusedOutbox unless given. */
-  readonly outbox?: Layer.Layer<Outbox> | undefined;
+  readonly outbox?: Layer.Layer<Outbox, never, Store> | undefined;
   /** Session filesystems, where a test offers them. */
   readonly sandbox?: SessionSandboxes["Service"] | undefined;
   /** The branch environment alasio is, if it is one. */

@@ -4,6 +4,7 @@ import { Clock, Context, Effect, Latch, Layer, Option, Semaphore } from "effect"
 import type { DueOutboxEntry, NewOutboxStatus, NewOutboxText, OutboxEntry } from "../persistence/outbox-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { type DeliveryMarks, Store } from "../persistence/store.ts";
+import type { PanelDraft } from "../operator/panel.ts";
 import { withLogScope } from "../shared/log.ts";
 import { currentTraceparent, meter, withAlasioSpan } from "../telemetry/index.ts";
 import { type TelegramError, TelegramClient } from "./client.ts";
@@ -31,6 +32,11 @@ const pendingReplies = meter.createObservableGauge("alasio.outbox.pending", {
 export type OutboxText = Omit<NewOutboxText, "traceparent">;
 /** A status message, or an edit of one, to queue: everything but the trace, as a reply. */
 export type OutboxStatus = Omit<NewOutboxStatus, "traceparent">;
+/** A reply with buttons to queue: the conversation and chat it is to, its text, and its buttons, row by row. */
+export interface OutboxPanel extends PanelDraft {
+  readonly conversationId: string;
+  readonly chatId: number | string;
+}
 
 /**
  * Whether Telegram refused a status message, or an edit of one, for good: one it answers
@@ -59,6 +65,11 @@ function retryDelayMs(item: OutboxEntry, error: TelegramError): number {
 export class Outbox extends Context.Service<Outbox, {
   /** Queues a reply and wakes delivery; its delivery joins the trace it is queued in. The reply's id. */
   readonly enqueueText: (text: OutboxText) => Effect.Effect<string, StoreError>;
+  /**
+   * Queues a reply with buttons to the conversation's chat, as enqueueText does, the
+   * buttons' actions kept with it, in one transaction: neither is kept without the other.
+   */
+  readonly enqueuePanel: (panel: OutboxPanel) => Effect.Effect<string, StoreError>;
   /** Queues a turn's status message and wakes delivery: its id, which an edit of it names. */
   readonly enqueueStatus: (status: OutboxStatus) => Effect.Effect<string, StoreError>;
   /** Queues an edit of the status message `edits` and wakes delivery. */
@@ -207,6 +218,14 @@ export class Outbox extends Context.Service<Outbox, {
 
     return Outbox.of({
       enqueueText: (text) => queued((traceparent) => store.enqueueOutboxText({ ...text, traceparent })),
+      enqueuePanel: ({ conversationId, chatId, text, keyboard }) =>
+        queued((traceparent) =>
+          store.enqueueOutboxPanel(conversationId, keyboard.flat(), (ids) => {
+            let next = 0;
+            const inline_keyboard = keyboard.map((row) => row.map((button) => ({ text: button.text, callback_data: ids[next++]! })));
+            return { chatId, text, options: { reply_markup: { inline_keyboard } }, traceparent };
+          })
+        ),
       enqueueStatus: (status) => queued((traceparent) => store.enqueueOutboxStatus({ ...status, traceparent })),
       enqueueEdit: (edits, edit) => queued((traceparent) => store.enqueueOutboxEdit(edits, { ...edit, traceparent })),
       deliverDue,

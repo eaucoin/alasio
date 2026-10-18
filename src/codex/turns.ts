@@ -499,14 +499,15 @@ const makeTurns = Effect.fnUntraced(function*() {
   }): Effect.fn.Return<void, StoreError> {
     const payload: ConcurrentPromptPayload = { jobId: job.id, prompt: job.prompt };
     const mount = yield* store.getMount(conversationId);
-    const question = yield* keepPanel(conversationId, {
+    yield* outbox.enqueuePanel({
+      conversationId,
+      chatId,
       text: `${harnessLabelOf(mount)} is currently working. What should I do with this message?\n\n${truncateText(job.visible_text, 220)}`,
       keyboard: [
         [{ text: "Steer", kind: "steer", payload }, { text: "Queue", kind: "queue", payload }],
         [{ text: "Swerve", kind: "swerve", payload }, { text: "Discard", kind: "discard", payload }],
       ],
-    }).pipe(Effect.provideService(Store, store));
-    yield* outbox.enqueueText({ chatId, text: question.text, options: { reply_markup: question.options.reply_markup } });
+    });
   });
 
   /** The held prompt jobs asked about again, by conversation, while each is held. */
@@ -575,8 +576,9 @@ const makeTurns = Effect.fnUntraced(function*() {
           state: (yield* activeTurns.isBusy(conversationId)) ? "awaiting_choice" : "pending",
           traceparent,
         });
-        // Asked about once: a prompt queued already, as its update is handled again, was asked about then.
-        if (queued.fresh && queued.state === "awaiting_choice") yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job: queued });
+        // Asked about once: a prompt queued already, as its update is handled again, was
+        // asked about then, its buttons kept with the question, unless asking it failed.
+        if (queued.state === "awaiting_choice" && !(yield* store.hasCallbackActionsOfJob(queued.id))) yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job: queued });
         return queued;
       }));
       if (job.state === "pending") yield* schedule(conversationId);

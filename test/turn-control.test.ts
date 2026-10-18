@@ -20,7 +20,7 @@ import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { StoreError } from "../src/persistence/sql.ts";
 import { Store, TurnFenced } from "../src/persistence/store.ts";
 import { forgetfulPersistence } from "./support/persistence.ts";
-import { holdsIn, newSchema, run, testStore } from "./support/store.ts";
+import { holdsIn, newSchema, run, testPool, testStore } from "./support/store.ts";
 import { type QueuedToOutbox, recordingOutbox, type TestAlasio, withServices } from "./support/turns.ts";
 
 /** A Codex harness whose turns run as `turn` says, given what alasio gives each. */
@@ -75,8 +75,9 @@ async function withTurns<T>(
   store: Store["Service"],
   harness: Harness,
   use: (alasio: TestAlasio, queued: QueuedToOutbox) => Promise<T>,
+  outboxOptions: Parameters<typeof recordingOutbox>[0] = {},
 ): Promise<T> {
-  const outbox = recordingOutbox();
+  const outbox = recordingOutbox(outboxOptions);
   return await withServices({ store, harnesses: { [CODEX_HARNESS]: harness }, outbox: outbox.layer }, (alasio) => use(alasio, outbox.queued));
 }
 
@@ -309,7 +310,7 @@ test("a turn's status message says what its row says it does, as the row changes
     yield* TestClock.adjust("30 seconds");
     yield* settle;
     assert.equal(outbox.queued.edits.length, 2);
-  })).pipe(Effect.provide(Layer.mergeAll(Layer.succeed(Store, store), outbox.layer, TestClock.layer()))));
+  })).pipe(Effect.provide(Layer.mergeAll(outbox.layer, TestClock.layer()).pipe(Layer.provideMerge(Layer.succeed(Store, store))))));
 });
 
 test("a held prompt sent to steer is done only once the turn took it, and queued, as it was, where it did not", async () => {
@@ -420,4 +421,39 @@ test("a prompt queued again while a turn runs, as its update is handled again af
     assert.equal(queued.texts.filter(({ text }) => text.startsWith("Codex is currently working.")).length, 1);
   });
   assert.deepEqual((await run(store.listHeldPromptJobs(conversationId))).map(({ message_id: messageId }) => messageId), ["77"]);
+});
+
+test("a question's buttons are kept with its reply or not at all: a reply the store refuses keeps none of its buttons' actions", async () => {
+  const { store, schema, conversationId } = await conversation();
+  await (await testPool()).query(`
+    create sequence ${schema}.replies_queued;
+    create function ${schema}.refuse_first_reply() returns trigger language plpgsql as $$
+      begin
+        if nextval('${schema}.replies_queued') = 1 then raise exception 'the store is down'; end if;
+        return new;
+      end
+    $$;
+    create trigger refuse_first_reply before insert on ${schema}.telegram_outbox for each row execute function ${schema}.refuse_first_reply();
+  `);
+  const payload = { jobId: "job-1", prompt: "And the docs?" };
+  const ask = store.enqueueOutboxPanel(conversationId, [{ kind: "steer", payload }, { kind: "queue", payload }], (ids) => ({ chatId: CONVERSATION_CHAT, text: `asked ${ids.join(" ")}` }));
+  assert.equal((await Effect.runPromise(Effect.flip(ask)))._tag, "StoreError");
+  assert.equal(await run(store.hasCallbackActionsOfJob("job-1")), false);
+  await run(ask);
+  assert.equal(await run(store.hasCallbackActionsOfJob("job-1")), true);
+});
+
+test("a prompt held while a turn runs whose question could not be asked, the store failing it, is asked about as its update is handled again", async () => {
+  const { store, conversationId } = await conversation();
+  await withTurns(store, scriptedHarness(() => Effect.never), async (alasio, queued) => {
+    await alasio.runPromise(Effect.scoped(Effect.gen(function*() {
+      assert.ok(yield* (yield* ActiveTurns).reserve(conversationId));
+      const turns = yield* Turns;
+      const prompt = { conversationId, chatId: CONVERSATION_CHAT, messageId: 78, prompt: "And the docs?", fileIds: [], visibleText: "And the docs?" };
+      // The update's handling fails as the question does, and is handled again.
+      assert.equal((yield* Effect.flip(turns.submit(prompt)))._tag, "StoreError");
+      yield* turns.submit(prompt);
+    })));
+    assert.equal(queued.texts.filter(({ text }) => text.startsWith("Codex is currently working.")).length, 1);
+  }, { failedPanels: 1 });
 });

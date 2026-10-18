@@ -26,7 +26,7 @@ import {
   type WorkspaceConversation,
 } from "./conversation-repository.ts";
 import { type DueOutboxEntry, NeonOutboxRepository, type NewOutboxStatus, type NewOutboxText } from "./outbox-repository.ts";
-import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState, type QueuedPromptJob } from "./prompt-job-repository.ts";
+import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState } from "./prompt-job-repository.ts";
 import { type CompletedResponse, NeonResponseRepository, type ResponseBlock } from "./response-repository.ts";
 import { NeonRestartRepository, type NewRestartEvent, type RestartEvent } from "./restart-repository.ts";
 import { ensureSchema } from "./schema.ts";
@@ -230,6 +230,8 @@ export class Store extends Context.Service<Store, {
   readonly createCallbackActions: (conversationId: string, actions: readonly NewCallbackAction[]) => Stored<string[]>;
   /** The action of a button pressed for the first time; null for one pressed before, or unknown. */
   readonly consumeCallbackAction: (id: string) => Stored<CallbackAction | null>;
+  /** Whether buttons that settle the held prompt job `jobId` are kept, as asking about it keeps them until it is settled. */
+  readonly hasCallbackActionsOfJob: (jobId: string) => Stored<boolean>;
 
   /** Keeps an update, unless it is kept already: whether it is yet to be processed. */
   readonly recordTelegramUpdate: (update: Update) => Stored<boolean>;
@@ -286,6 +288,12 @@ export class Store extends Context.Service<Store, {
 
   /** Queues a reply: its id, or that of the one already queued for its pending response. */
   readonly enqueueOutboxText: (text: NewOutboxText) => Stored<string>;
+  /**
+   * Queues a reply with buttons, `compose` making it of their actions' ids, in order: the
+   * actions kept and the reply queued in one transaction, so that neither is without the
+   * other. Its id.
+   */
+  readonly enqueueOutboxPanel: (conversationId: string, actions: readonly NewCallbackAction[], compose: (ids: readonly string[]) => NewOutboxText) => Stored<string>;
   /** Queues a turn's status message: its id, which an edit of it names. */
   readonly enqueueOutboxStatus: (status: NewOutboxStatus) => Stored<string>;
   /** Queues an edit of the status message `edits`. */
@@ -301,7 +309,7 @@ export class Store extends Context.Service<Store, {
   readonly getPendingOutboxCount: Stored<number>;
 
   /** Queues a prompt: the job queued, or the one already queued for its message. */
-  readonly enqueuePromptJob: (job: NewPromptJob) => Stored<QueuedPromptJob>;
+  readonly enqueuePromptJob: (job: NewPromptJob) => Stored<PromptJob>;
   readonly hasOpenPromptJobs: (conversationId: string) => Stored<boolean>;
   readonly getPromptJob: (id: string) => Stored<PromptJob | null>;
   /** Starts the conversation's next pending job: the job, or null when none waits. */
@@ -398,6 +406,7 @@ const makeStore = Effect.fnUntraced(function*({
 
     createCallbackActions: (conversationId, actions) => callbacks.createCallbackActions(conversationId, actions),
     consumeCallbackAction: (id) => callbacks.consumeCallbackAction(id),
+    hasCallbackActionsOfJob: (jobId) => callbacks.hasActionsOfJob(jobId),
 
     recordTelegramUpdate: (update) => telegramContent.recordTelegramUpdate(update),
     withHandlingLock: (chatId, work) =>
@@ -490,6 +499,11 @@ const makeStore = Effect.fnUntraced(function*({
     getCompletedResponsesPendingDelivery: responses.getCompletedResponsesPendingDelivery(),
 
     enqueueOutboxText: (text) => outbox.enqueueText(text),
+    enqueueOutboxPanel: (conversationId, actions, compose) =>
+      database.transaction((sql) => {
+        const on = repositoriesOn(sql);
+        return Effect.flatMap(on.callbacks.createCallbackActions(conversationId, actions), (ids) => on.outbox.enqueueText(compose(ids)));
+      }),
     enqueueOutboxStatus: (status) => outbox.enqueueStatus(status),
     enqueueOutboxEdit: (edits, edit) => outbox.enqueueEdit(edits, edit),
     getDueOutbox: (limit) => outbox.getDue(limit),
