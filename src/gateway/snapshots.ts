@@ -66,7 +66,6 @@ import { BindStepFailed, type MakePod } from "../binder/binder.ts";
 import { FREE_LABEL, type Pool } from "../binder/names.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION, STOP_WAIT_ARG } from "../kube/sandbox-shape.ts";
-import type { SavedSnapshot } from "../kube/sandboxes.ts";
 import type { Manifest } from "../node-agent/agent.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { withLogScope } from "../shared/log.ts";
@@ -208,6 +207,12 @@ const UNSAVEABLE_STATUS = 410;
 
 /** Whether `error`, a checkpoint's, says its sandbox can be saved no more. */
 const unsaveable = (error: NodeAgentError | KubeApiError): boolean => error._tag === "NodeAgentError" && error.status === UNSAVEABLE_STATUS;
+
+/** A snapshot a workspace is released into: its id, and the gVisor release that took it. */
+export interface SavedSnapshot {
+  readonly snapshot: string;
+  readonly release: string;
+}
 
 /** What came of a save of a bound pod's sandbox whole (take). */
 export type Taken =

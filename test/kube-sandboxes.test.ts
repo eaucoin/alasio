@@ -9,14 +9,14 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { gzipSync } from "node:zlib";
 
-import type { KubernetesObject, V1Condition, V1Container, V1ObjectMeta, V1Pod } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Condition, V1Container, V1ObjectMeta } from "@kubernetes/client-node";
 import type { Attributes } from "@opentelemetry/api";
 import { type ExportResult, ExportResultCode } from "@opentelemetry/core";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { ProtobufTraceSerializer } from "@opentelemetry/otlp-transformer";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
-import { ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Option, Result, Schema, type Scope, Stream } from "effect";
+import { ConfigProvider, Effect, Exit, Fiber, Layer, Option, Result, Schema, type Scope, Stream } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
 
@@ -29,21 +29,10 @@ import {
   podEnded,
   POD_TEMPLATE_ANNOTATION,
   podTemplateHash,
-  type RestoreDeferred,
-  type Sandbox,
-  type SandboxFault,
-  type SandboxRestore,
-  SandboxRestoreRefused,
-  type Saved,
-  type Sandboxes,
-  type SandboxesOptions,
   type SandboxSpec,
   type SandboxStatus,
   sandboxManifest,
   sandboxReady,
-  SNAPSHOT_ANNOTATION,
-  SNAPSHOT_RELEASE_ANNOTATION,
-  type StoredSandbox,
   tokenSecretManifest,
 } from "../src/kube/sandboxes.ts";
 import { SessionToken } from "../src/sandbox/names.ts";
@@ -427,7 +416,7 @@ test("ensure resumes a suspended Sandbox and gives one left without a token its 
   // Made from its current template, it is resumed and nothing else.
   assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch" || verb === "create").map(([verb, kind, , change]) => [verb, kind, change]), [
     ["create", "Secret", undefined],
-    ["patch", "Sandbox", { metadata: { annotations: { "alasio.dev/snapshot": null, "alasio.dev/snapshot-release": null } }, spec: { operatingMode: "Running" } }],
+    ["patch", "Sandbox", { spec: { operatingMode: "Running" } }],
   ]);
 });
 
@@ -520,7 +509,7 @@ test("ensure moves a Sandbox made from another pod template onto alasio's, endin
       metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: current.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] } },
       spec: { operatingMode: "Suspended", podTemplate: mergePatch(older.spec.podTemplate, current.spec.podTemplate) },
     },
-    { metadata: { annotations: { "alasio.dev/snapshot": null, "alasio.dev/snapshot-release": null } }, spec: { operatingMode: "Running" } },
+    { spec: { operatingMode: "Running" } },
   ]);
   assert.deepEqual(controller.pods, ["agent@sha256:2"]);
   const moved = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
@@ -550,281 +539,10 @@ test("ensure restarts a Sandbox whose pod has ended, which agent-sandbox never r
   })).finally(controller.stop);
   assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch").map(([, , , change]) => change), [
     { spec: { operatingMode: "Suspended" } },
-    { metadata: { annotations: { "alasio.dev/snapshot": null, "alasio.dev/snapshot-release": null } }, spec: { operatingMode: "Running" } },
+    { spec: { operatingMode: "Running" } },
   ]);
   assert.equal(controller.pods.length, 1);
   assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.uid, created.metadata?.uid);
-});
-
-test("a Sandbox whose pod has ended is released into the snapshot taken of it live, which its restore is then asked for, and one with none into none", async () => {
-  const restartedFrom = async (live: { readonly snapshot: string; readonly release: string } | null) => {
-    const kube = fakeKube();
-    const manifest = () => sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-    kube.create(manifest());
-    const sandbox = kube.objects.get("Sandbox/alasio-sessions/fs-abc123");
-    assert.ok(sandbox);
-    sandbox.status = { conditions: [{ ...readyCondition(sandbox.metadata.generation), status: "False", reason: "PodFailed", message: "Pod failed" }] };
-    kube.calls.length = 0;
-    const asked: string[] = [];
-    // The snapshot each restore the Sandbox comes back through is asked for, as it is bound; none is restored here.
-    const bound: (string | null)[] = [];
-    const controller = kube.control("alasio-sessions", "fs-abc123");
-    await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-      const sandboxes = yield* makeSandboxes({
-        namespace: "alasio-sessions",
-        port: 7290,
-        poll: "5 millis",
-        live: (name) => Effect.sync(() => (asked.push(name), live)),
-        restore: (stored) => Effect.sync(() => (bound.push(stored.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? null), null)),
-      });
-      yield* sandboxes.ensure("fs-abc123", manifest);
-    })).finally(controller.stop);
-    return { asked, bound, suspended: kube.calls.filter(([verb]) => verb === "patch").map(([, , , change]) => change)[0] };
-  };
-  const lost = await restartedFrom({ snapshot: "20261015T201500123Z-0a1b2c3d", release: "20260921.0-eaucoin.7" });
-  assert.deepEqual(lost.asked, ["fs-abc123"]);
-  assert.deepEqual(lost.suspended, {
-    metadata: { annotations: { [SNAPSHOT_ANNOTATION]: "20261015T201500123Z-0a1b2c3d", [SNAPSHOT_RELEASE_ANNOTATION]: "20260921.0-eaucoin.7" } },
-    spec: { operatingMode: "Suspended" },
-  });
-  assert.deepEqual(lost.bound, ["20261015T201500123Z-0a1b2c3d"]);
-  const none = await restartedFrom(null);
-  assert.deepEqual(none.suspended, { spec: { operatingMode: "Suspended" } });
-  assert.deepEqual(none.bound, [null]);
-});
-
-/** The Sandbox fs-abc123 made, its pod running and ready, as agent-sandbox makes one; and the controller's stop. */
-const runningSandbox = (kube: FakeKube) => {
-  const manifest = () => sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  kube.create(manifest());
-  const controller = kube.control("alasio-sessions", "fs-abc123");
-  return { manifest, controller };
-};
-
-/** Marks the pod of fs-abc123 ending, as a drain's eviction or a deletion does. */
-const podEnding = (kube: FakeKube) => {
-  const pod = kube.objects.get("Pod/alasio-sessions/fs-abc123");
-  assert.ok(pod);
-  pod.metadata.deletionTimestamp = new Date(0);
-};
-
-const SAVED = { snapshot: "20261015T220000000Z-0a1b2c3d", release: "20260921.0-eaucoin.7" };
-
-test("a running Sandbox whose pod is ending though alasio did not end it is suspended first, then saved, then bound to its snapshot, its bayma told to go on with its stop where none was taken, then waited for to be suspended; one alasio ends, or whose pod is not ending, is left as it is", async () => {
-  const released = async (snapshot: typeof SAVED | null, saving = true) => {
-    const kube = fakeKube();
-    const { manifest, controller } = runningSandbox(kube);
-    const told: string[] = [];
-    await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-      const sandboxes = yield* makeSandboxes({
-        namespace: "alasio-sessions",
-        port: 7290,
-        poll: "5 millis",
-        stopNow: (sandbox) => Effect.sync(() => void told.push(`stop, bound to ${sandbox.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? "none"}`)),
-        ...(saving ? { saveStopping: (sandbox: StoredSandbox, pod: V1Pod) => Effect.sync(() => (told.push(`save ${sandbox.spec.operatingMode}, its pod ${pod.metadata?.deletionTimestamp ? "ending" : "running"}`), snapshot)) } : {}),
-      });
-      yield* sandboxes.ensure("fs-abc123", manifest);
-      // Its pod runs on: nothing to release.
-      assert.equal(yield* sandboxes.releaseStopping("fs-abc123"), false);
-      kube.calls.length = 0;
-      podEnding(kube);
-      assert.equal(yield* sandboxes.releaseStopping("fs-abc123"), saving);
-      if (!saving) return;
-      // Its pod gone, as it is suspended.
-      assert.equal(kube.peek("Pod", "alasio-sessions", "fs-abc123"), null);
-      // Suspended already, as alasio's own release leaves it: nothing.
-      assert.equal(yield* sandboxes.releaseStopping("fs-abc123"), false);
-    })).finally(controller.stop);
-    return { told, patches: kube.calls.filter(([verb]) => verb === "patch").map(([, , , change]) => change) };
-  };
-  const snapshotted = await released(SAVED);
-  assert.deepEqual(snapshotted.told, ["save Suspended, its pod ending"]);
-  assert.deepEqual(snapshotted.patches, [
-    { spec: { operatingMode: "Suspended" } },
-    { metadata: { annotations: { [SNAPSHOT_ANNOTATION]: SAVED.snapshot, [SNAPSHOT_RELEASE_ANNOTATION]: SAVED.release } } },
-  ]);
-  // None taken: its bayma holds its stop for nothing, and is told to go on with it.
-  const unsaved = await released(null);
-  assert.deepEqual(unsaved.told, ["save Suspended, its pod ending", "stop, bound to none"]);
-  assert.deepEqual(unsaved.patches, [{ spec: { operatingMode: "Suspended" } }, { metadata: { annotations: { [SNAPSHOT_ANNOTATION]: null, [SNAPSHOT_RELEASE_ANNOTATION]: null } } }]);
-  // Where sessions are not snapshotted, nothing is.
-  const unsnapshotted = await released(SAVED, false);
-  assert.deepEqual(unsnapshotted.told, []);
-  assert.deepEqual(unsnapshotted.patches, []);
-});
-
-test("a bring-up that races the release of a Sandbox whose pod is ending waits for it, and comes back from its snapshot", async () => {
-  const kube = fakeKube();
-  const { manifest, controller } = runningSandbox(kube);
-  const bound: (string | null)[] = [];
-  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const taken = yield* Deferred.make<void>();
-    const sandboxes = yield* makeSandboxes({
-      namespace: "alasio-sessions",
-      port: 7290,
-      poll: "5 millis",
-      restore: (stored) => Effect.sync(() => (bound.push(stored.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? null), null)),
-      saveStopping: () => Deferred.await(taken).pipe(Effect.as(SAVED)),
-    });
-    yield* sandboxes.ensure("fs-abc123", manifest);
-    podEnding(kube);
-    const release = yield* sandboxes.releaseStopping("fs-abc123").pipe(Effect.forkScoped);
-    yield* Effect.sleep("20 millis");
-    const bringUp = yield* sandboxes.ensure("fs-abc123", manifest).pipe(Effect.forkScoped);
-    yield* Effect.sleep("50 millis");
-    // The bring-up waits on the release, which holds the Sandbox.
-    assert.equal(bringUp.pollUnsafe(), undefined);
-    assert.deepEqual(bound, []);
-    yield* Deferred.succeed(taken, undefined);
-    assert.equal(yield* Fiber.join(release), true);
-    yield* Fiber.join(bringUp);
-  })).finally(controller.stop);
-  assert.deepEqual(bound, [SAVED.snapshot]);
-});
-
-test("a bring-up of a running Sandbox whose pod is ending releases it first, under the lock it holds, then restores it, no prompt given a stopping bayma; the watch's release after it finds it released", async () => {
-  const kube = fakeKube();
-  const { manifest, controller } = runningSandbox(kube);
-  const told: string[] = [];
-  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const taken = yield* Deferred.make<void>();
-    const sandboxes = yield* makeSandboxes({
-      namespace: "alasio-sessions",
-      port: 7290,
-      poll: "5 millis",
-      restore: (stored) => Effect.sync(() => (told.push(`restore ${stored.spec.operatingMode}, bound to ${stored.metadata.annotations?.[SNAPSHOT_ANNOTATION]}`), null)),
-      saveStopping: (sandbox) => Effect.sync(() => void told.push(`save ${sandbox.spec.operatingMode}`)).pipe(Effect.andThen(Deferred.await(taken)), Effect.as(SAVED)),
-    });
-    yield* sandboxes.ensure("fs-abc123", manifest);
-    podEnding(kube);
-    const bringUp = yield* sandboxes.ensure("fs-abc123", manifest).pipe(Effect.forkScoped);
-    yield* Effect.sleep("20 millis");
-    const release = yield* sandboxes.releaseStopping("fs-abc123").pipe(Effect.forkScoped);
-    yield* Effect.sleep("50 millis");
-    assert.deepEqual(told, ["save Suspended"]);
-    assert.equal(release.pollUnsafe(), undefined);
-    yield* Deferred.succeed(taken, undefined);
-    yield* Fiber.join(bringUp);
-    assert.equal(yield* Fiber.join(release), false);
-  })).finally(controller.stop);
-  assert.deepEqual(told, ["save Suspended", `restore Suspended, bound to ${SAVED.snapshot}`]);
-  // Brought up in a pod of its own, not the one that was ending.
-  assert.equal(controller.pods.length, 2);
-  assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode, "Running");
-});
-
-test("a release into no snapshot of a Sandbox whose bayma runs still, as one that can be saved no more, has its bayma stop at once before the Sandbox is suspended; one into a snapshot, or whose bayma ended with its save, does not", async () => {
-  /** What stopNow saw of the Sandbox, as the API server held it then, as `save` releases it, its bayma ended or not. */
-  const stoppedAs = async (saved: Saved, baymaEnded = false) => {
-    const kube = fakeKube();
-    const { manifest, controller } = runningSandbox(kube);
-    const seen: (string | undefined)[] = [];
-    await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-      const sandboxes = yield* makeSandboxes({
-        namespace: "alasio-sessions",
-        port: 7290,
-        poll: "5 millis",
-        stopNow: () => Effect.sync(() => void seen.push(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode)),
-      });
-      yield* sandboxes.ensure("fs-abc123", manifest);
-      if (baymaEnded) {
-        const pod = kube.objects.get("Pod/alasio-sessions/fs-abc123");
-        assert.ok(pod);
-        // A core Pod's status, as the kubelet reports one, which the fake keeps as it is given.
-        pod.status = { containerStatuses: [{ name: "bayma", state: { terminated: { exitCode: 0 } } }] } as unknown as NonNullable<typeof pod.status>;
-      }
-      assert.equal(yield* sandboxes.release("fs-abc123", () => Effect.succeed(saved)), true);
-      assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode, "Suspended");
-    })).finally(controller.stop);
-    return seen;
-  };
-  // Told while its Sandbox runs, before it is suspended.
-  assert.deepEqual(await stoppedAs({ saved: null }), ["Running"]);
-  assert.deepEqual(await stoppedAs({ saved: SAVED }), []);
-  assert.deepEqual(await stoppedAs({ saved: null }, true), []);
-});
-
-test("alasio has its bayma stop at once before it ends a running Sandbox's pod itself, as it moves, restarts, suspends or deletes one, or suspends one whose restored sandbox ran, and not once its pod has ended, nor where it never ran", async () => {
-  const stops = async (act: (sandboxes: Sandboxes, kube: FakeKube, manifest: () => Sandbox) => Effect.Effect<unknown, unknown>, options: { fault?: SandboxFault; restore?: SandboxesOptions["restore"] } = {}) => {
-    const kube = fakeKube();
-    const { manifest, controller } = runningSandbox(kube);
-    const stopped: string[] = [];
-    await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-      let faulted = false;
-      const sandboxes = yield* makeSandboxes({
-        namespace: "alasio-sessions",
-        port: 7290,
-        poll: "5 millis",
-        fault: () => Effect.sync(() => (faulted ? null : ((faulted = true), options.fault ?? null))),
-        stopNow: (sandbox) => Effect.sync(() => void stopped.push(`${sandbox.metadata.name} ${sandbox.spec.operatingMode}`)),
-        ...(options.restore ? { restore: options.restore } : {}),
-      });
-      yield* sandboxes.ensure("fs-abc123", manifest);
-      yield* act(sandboxes, kube, manifest);
-    })).finally(controller.stop);
-    return stopped;
-  };
-  const ensureAfter = (change: (kube: FakeKube) => void) => (sandboxes: Sandboxes, kube: FakeKube, manifest: () => Sandbox) =>
-    Effect.sync(() => change(kube)).pipe(Effect.andThen(sandboxes.ensure("fs-abc123", manifest)));
-  // Moved onto another template.
-  assert.deepEqual(await stops(ensureAfter((kube) => kube.patch("Sandbox", "alasio-sessions", "fs-abc123", { metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: "older" } } }))), ["fs-abc123 Running"]);
-  // Restarted for a fault.
-  assert.deepEqual(await stops(ensureAfter(() => undefined), { fault: { why: "workspace mount is broken", beforeResume: Effect.void } }), ["fs-abc123 Running"]);
-  // Restarted once its pod ended: nothing runs to stop.
-  assert.deepEqual(await stops(ensureAfter((kube) => {
-    const sandbox = kube.objects.get("Sandbox/alasio-sessions/fs-abc123");
-    assert.ok(sandbox);
-    sandbox.status = { conditions: [{ ...readyCondition(sandbox.metadata.generation), status: "False", reason: "PodFailed", message: "Pod failed" }] };
-  })), []);
-  // Suspended, as a fork's source is where its release keeps it running; once, as a suspended one runs nothing.
-  assert.deepEqual(await stops((sandboxes) => sandboxes.suspend("fs-abc123").pipe(Effect.andThen(sandboxes.suspend("fs-abc123")))), ["fs-abc123 Running"]);
-  // Deleted.
-  assert.deepEqual(await stops((sandboxes) => sandboxes.remove("fs-abc123")), ["fs-abc123 Running"]);
-  // Suspended again as its restore fails: once its restored sandbox ran, and not where it never did.
-  const older = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  const failedRestore = (resumed: boolean) =>
-    stops(
-      (sandboxes, kube, manifest) => sandboxes.suspend("fs-abc123").pipe(Effect.andThen(Effect.sync(() => (kube.calls.length = 0))), Effect.andThen(sandboxes.ensure("fs-abc123", manifest))),
-      { restore: () => Effect.succeed(restoreOf(older, [], { reason: "its readiness could not be set", resumed })) },
-    );
-  assert.deepEqual(await failedRestore(true), ["fs-abc123 Running", "fs-abc123 Running"]);
-  assert.deepEqual(await failedRestore(false), ["fs-abc123 Running"]);
-});
-
-test("ensure restarts a running Sandbox whose pod has a fault only a new pod mends, looking only at a pod that ran before, and does what the fault asks before it resumes", async () => {
-  const kube = fakeKube();
-  const manifest = () => sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  const looked: string[] = [];
-  // The mode the Sandbox was in as the fault's work was done.
-  const doneWhile: (string | undefined)[] = [];
-  const beforeResume = Effect.sync(() => doneWhile.push(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode));
-  const faults: (SandboxFault | null)[] = [{ why: "workspace mount is broken (Transport endpoint is not connected)", beforeResume }, null];
-  const fault = (name: string) => Effect.sync(() => {
-    looked.push(name);
-    return faults.shift() ?? null;
-  });
-  const controller = kube.control("alasio-sessions", "fs-abc123");
-  const patches = await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", fault });
-    // Just made, its pod is new.
-    yield* sandboxes.ensure("fs-abc123", manifest);
-    assert.deepEqual(looked, []);
-    // Its pod has a fault: suspended and resumed, its volumes kept.
-    yield* sandboxes.ensure("fs-abc123", manifest);
-    const restarted = kube.calls.filter(([verb]) => verb === "patch").map(([, , , change]) => change);
-    kube.calls.length = 0;
-    // Its new pod has none: left as it is.
-    yield* sandboxes.ensure("fs-abc123", manifest);
-    assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch"), []);
-    // Suspended, it is resumed, and its new pod not looked at.
-    yield* sandboxes.suspend("fs-abc123");
-    yield* sandboxes.ensure("fs-abc123", manifest);
-    return restarted;
-  })).finally(controller.stop);
-  assert.deepEqual(patches, [{ spec: { operatingMode: "Suspended" } }, { metadata: { annotations: { "alasio.dev/snapshot": null, "alasio.dev/snapshot-release": null } }, spec: { operatingMode: "Running" } }]);
-  assert.deepEqual(doneWhile, ["Suspended"]);
-  assert.deepEqual(looked, ["fs-abc123", "fs-abc123"]);
-  assert.equal(controller.pods.length, 3);
 });
 
 test("ensure gives up on a Sandbox that does not become ready in five minutes, saying why", async () => {
@@ -841,232 +559,6 @@ test("ensure gives up on a Sandbox that does not become ready in five minutes, s
     return yield* Fiber.join(ensuring);
   }).pipe(Effect.provide(TestClock.layer())));
   assert.equal(error.message, "Sandbox ns/fs-abc123 did not become ready within 300s");
-});
-
-/** The annotation a restore's pod template carries in these tests, as alasio's fork of gVisor's restore annotation does. */
-const RESTORING = "test.dev/restore-from";
-
-/**
- * A restore of the Sandbox `current` makes, from a snapshot of a pod of `older`'s template:
- * what it is told, in `told`; refused `refused`, as its sandbox ran or not, then fallen back,
- * or deferred where `defers` says so.
- */
-const restoreOf = (older: Sandbox, told: string[], refused?: { readonly reason: string; readonly resumed: boolean }, defers = false): SandboxRestore => ({
-  snapshot: { snapshot: "s-1", release: "20990101.0" },
-  podTemplate: { ...older.spec.podTemplate, metadata: { ...older.spec.podTemplate.metadata, annotations: { [RESTORING]: "/snapshots/fs-abc123" } } },
-  kept: older.spec.podTemplate,
-  resume: refused === undefined ? Effect.sync(() => void told.push("resumed")) : Effect.fail(new SandboxRestoreRefused(refused)),
-  restored: Effect.sync(() => told.push("restored")),
-  failed: ({ why, resumed }) => Effect.sync(() => (told.push(`failed${resumed ? " after its resume" : ""}: ${why}`), defers && !resumed ? "deferred" : "fallen back")),
-});
-
-test("ensure resumes a suspended Sandbox from a snapshot of its pod, by the template the snapshot gives, then keeps the template that pod was made from", async () => {
-  const kube = fakeKube();
-  const older = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  kube.create(older);
-  kube.patch("Sandbox", "alasio-sessions", "fs-abc123", { spec: { operatingMode: "Suspended" } });
-  const current = sandboxManifest({
-    name: "fs-abc123",
-    namespace: "alasio-sessions",
-    template: profile({ podTemplate: { spec: { ...profile().podTemplate.spec, containers: [{ name: "bayma", image: "agent@sha256:2", args: ["mcp-http", "--port", "7290"] }] } } }),
-  });
-  const told: string[] = [];
-  const asked: string[] = [];
-  const restore = (sandbox: StoredSandbox, desired: Sandbox) => Effect.sync(() => {
-    asked.push(`${sandbox.spec.operatingMode} for ${desired.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] === current.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] ? "current" : "other"}`);
-    return restoreOf(older, told);
-  });
-  const restoring: (string | undefined)[] = [];
-  const controller = kube.control("alasio-sessions", "fs-abc123", (sandbox) => {
-    restoring.push(sandbox.spec?.podTemplate?.metadata?.annotations?.[RESTORING]);
-    return null;
-  });
-  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", restore, keeps: () => true });
-    yield* sandboxes.ensure("fs-abc123", () => current);
-    assert.deepEqual(told, ["resumed", "restored"]);
-    // Brought up again, its pod runs on, of the older template, which it keeps.
-    kube.calls.length = 0;
-    yield* sandboxes.ensure("fs-abc123", () => current);
-    assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch"), []);
-  })).finally(controller.stop);
-  assert.deepEqual(asked, ["Suspended for current"]);
-  // One pod, the snapshot's, brought back by the template that restores it.
-  assert.deepEqual(controller.pods, ["agent@sha256:1"]);
-  assert.deepEqual(restoring, ["/snapshots/fs-abc123"]);
-  const restored = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
-  assert.deepEqual(restored?.spec?.podTemplate, older.spec.podTemplate);
-  assert.equal(restored?.metadata.annotations?.[POD_TEMPLATE_ANNOTATION], older.metadata.annotations?.[POD_TEMPLATE_ANNOTATION]);
-  assert.equal(restored?.spec?.operatingMode, "Running");
-});
-
-test("a Sandbox whose restore's pod ends is suspended again, its restore told why, then moved onto alasio's template and resumed as it is", async () => {
-  const kube = fakeKube();
-  const older = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  kube.create(older);
-  kube.patch("Sandbox", "alasio-sessions", "fs-abc123", { spec: { operatingMode: "Suspended" } });
-  const current = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  const told: string[] = [];
-  const controller = kube.control("alasio-sessions", "fs-abc123", (sandbox) => (sandbox.spec?.podTemplate?.metadata?.annotations?.[RESTORING] ? "PodFailed" : null));
-  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", restore: () => Effect.succeed(restoreOf(older, told)) });
-    yield* sandboxes.ensure("fs-abc123", () => current);
-  })).finally(controller.stop);
-  assert.deepEqual(told, ["resumed", "failed after its resume: the pod of Sandbox alasio-sessions/fs-abc123 ended (PodFailed)"]);
-  // The restore's pod, then one of alasio's template.
-  assert.equal(controller.pods.length, 2);
-  const resumed = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
-  assert.deepEqual(resumed?.spec?.podTemplate, current.spec.podTemplate);
-  assert.equal(resumed?.spec?.operatingMode, "Running");
-});
-
-test("a Sandbox alasio stopped restoring, on the restore's template, which its hash names, is moved onto alasio's as it is next brought up", async () => {
-  const kube = fakeKube();
-  const older = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  kube.create(older);
-  kube.patch("Sandbox", "alasio-sessions", "fs-abc123", { spec: { operatingMode: "Suspended" } });
-  const current = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  const told: string[] = [];
-  const plan = restoreOf(older, told);
-  // alasio stops as the restore waits for its pod: the Sandbox is left as the restore made it.
-  const named: (string | undefined)[] = [];
-  const stopped = kube.control("alasio-sessions", "fs-abc123", (sandbox) => {
-    named.push(sandbox.metadata?.annotations?.[POD_TEMPLATE_ANNOTATION]);
-    return null;
-  });
-  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", restore: () => Effect.succeed({ ...plan, resume: Effect.never }) });
-    yield* sandboxes.ensure("fs-abc123", () => current).pipe(Effect.timeout("100 millis"), Effect.ignore);
-  })).finally(stopped.stop);
-  assert.deepEqual(named, [podTemplateHash(plan.podTemplate)]);
-  assert.notEqual(podTemplateHash(plan.podTemplate), podTemplateHash(plan.kept));
-  // Started again, alasio keeps no Sandbox on a restore's template.
-  const controller = kube.control("alasio-sessions", "fs-abc123");
-  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", keeps: (sandbox) => !sandbox.spec.podTemplate.metadata?.annotations?.[RESTORING] });
-    yield* sandboxes.ensure("fs-abc123", () => current);
-  })).finally(controller.stop);
-  const moved = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
-  assert.deepEqual(moved?.spec?.podTemplate, current.spec.podTemplate);
-  assert.equal(moved?.metadata.annotations?.[POD_TEMPLATE_ANNOTATION], current.metadata.annotations?.[POD_TEMPLATE_ANNOTATION]);
-});
-
-test("a Sandbox whose restored pod is not let run is suspended again, its restore told why, and resumed as it is", async () => {
-  const kube = fakeKube();
-  const older = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  kube.create(older);
-  kube.patch("Sandbox", "alasio-sessions", "fs-abc123", { spec: { operatingMode: "Suspended" } });
-  const current = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  const told: string[] = [];
-  const controller = kube.control("alasio-sessions", "fs-abc123");
-  const refused = { reason: "its readiness could not be set", resumed: true };
-  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", restore: () => Effect.succeed(restoreOf(older, told, refused, true)) });
-    yield* sandboxes.ensure("fs-abc123", () => current);
-  })).finally(controller.stop);
-  assert.deepEqual(told, ["failed after its resume: its readiness could not be set"]);
-  const resumed = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
-  assert.deepEqual(resumed?.spec?.podTemplate, current.spec.podTemplate);
-  assert.equal(resumed?.spec?.operatingMode, "Running");
-});
-
-test("a Sandbox whose restore is deferred, before it or as its pod's sandbox never ran, is left suspended, released into its snapshot, and the bring-up fails saying so", async () => {
-  const kube = fakeKube();
-  const older = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  kube.create(older);
-  kube.patch("Sandbox", "alasio-sessions", "fs-abc123", { metadata: { annotations: { [SNAPSHOT_ANNOTATION]: "s-1" } }, spec: { operatingMode: "Suspended" } });
-  const current = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  const told: string[] = [];
-  const controller = kube.control("alasio-sessions", "fs-abc123");
-  const plans: (SandboxRestore | RestoreDeferred)[] = [
-    { deferred: "the bucket answered 503" },
-    restoreOf(older, told, { reason: "the network policies of alasio-sessions/fs-abc123 are not in force", resumed: false }, true),
-  ];
-  const errors = await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", restore: () => Effect.sync(() => plans.shift() ?? null) });
-    const first = yield* Effect.flip(sandboxes.ensure("fs-abc123", () => current));
-    const second = yield* Effect.flip(sandboxes.ensure("fs-abc123", () => current));
-    return [first.message, second.message];
-  })).finally(controller.stop);
-  assert.deepEqual(errors, [
-    "Sandbox alasio-sessions/fs-abc123 could not be restored from its snapshot now, which is kept for the next try: the bucket answered 503",
-    "Sandbox alasio-sessions/fs-abc123 could not be restored from its snapshot now, which is kept for the next try: the network policies of alasio-sessions/fs-abc123 are not in force",
-  ]);
-  assert.deepEqual(told, ["failed: the network policies of alasio-sessions/fs-abc123 are not in force"]);
-  const left = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
-  assert.equal(left?.spec?.operatingMode, "Suspended");
-  assert.equal(left?.metadata.annotations?.[SNAPSHOT_ANNOTATION], "s-1");
-  assert.equal(left?.metadata.annotations?.["alasio.dev/snapshot-release"], "20990101.0");
-});
-
-test("a running Sandbox on another template is moved onto alasio's unless its caller keeps it, and a pod that ends as it is waited for fails the bring-up at once", async () => {
-  const kube = fakeKube();
-  const older = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  kube.create(older);
-  kube.ready("alasio-sessions", "fs-abc123");
-  const current = sandboxManifest({
-    name: "fs-abc123",
-    namespace: "alasio-sessions",
-    template: profile({ podTemplate: { spec: { ...profile().podTemplate.spec, containers: [{ name: "bayma", image: "agent@sha256:2", args: ["mcp-http", "--port", "7290"] }] } } }),
-  });
-  const kept: string[] = [];
-  const keeps = (sandbox: StoredSandbox) => {
-    kept.push(sandbox.metadata.name);
-    return true;
-  };
-  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", keeps });
-    kube.calls.length = 0;
-    yield* sandboxes.ensure("fs-abc123", () => current);
-    assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch"), []);
-  }));
-  assert.deepEqual(kept, ["fs-abc123"]);
-  // Not kept, it is moved, and its new pod ends.
-  const controller = kube.control("alasio-sessions", "fs-abc123", () => "PodFailed");
-  const error = await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis" });
-    return yield* Effect.flip(sandboxes.ensure("fs-abc123", () => current));
-  })).finally(controller.stop);
-  assert.equal(error.message, "the pod of Sandbox alasio-sessions/fs-abc123 ended (PodFailed)");
-});
-
-test("release gives a ready, running Sandbox to be saved, then suspends it or leaves it running as the save says, and a bring-up meanwhile waits for it", async () => {
-  const kube = fakeKube();
-  const manifest = () => sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
-  const controller = kube.control("alasio-sessions", "fs-abc123");
-  const happened: string[] = [];
-  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis" });
-    yield* sandboxes.ensure("fs-abc123", manifest);
-    // Kept running, as a save that leaves it says.
-    assert.equal(yield* sandboxes.release("fs-abc123", () => Effect.succeed("keep" as const)), false);
-    assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode, "Running");
-    // Saved, then suspended, a bring-up asked meanwhile waiting until it is.
-    const save = (sandbox: StoredSandbox) =>
-      Effect.gen(function*() {
-        happened.push(`saving ${sandbox.metadata.name}`);
-        yield* Effect.sleep("50 millis");
-        happened.push("saved");
-        return { saved: { snapshot: "s-1", release: "20990101.0" } };
-      });
-    const releasing = yield* Effect.forkChild(sandboxes.release("fs-abc123", save));
-    yield* Effect.sleep("10 millis");
-    const bringing = yield* Effect.forkChild(sandboxes.ensure("fs-abc123", manifest).pipe(Effect.tap(() => Effect.sync(() => happened.push("brought up")))));
-    assert.equal(yield* Fiber.join(releasing), true);
-    yield* Fiber.join(bringing);
-    // A suspended one is not released, nor one that is gone.
-    yield* sandboxes.suspend("fs-abc123");
-    assert.equal(yield* sandboxes.release("fs-abc123", () => Effect.die("not saved")), false);
-    assert.equal(yield* sandboxes.release("fs-gone", () => Effect.die("not saved")), false);
-  })).finally(controller.stop);
-  assert.deepEqual(happened, ["saving fs-abc123", "saved", "brought up"]);
-  // Released into a snapshot, the Sandbox was bound to it, and its resume let go of it.
-  const patches = kube.calls.filter(([verb, kind]) => verb === "patch" && kind === "Sandbox").map(([, , , change]) => change);
-  assert.ok(patches.some((change) => JSON.stringify(change) === JSON.stringify({ metadata: { annotations: { "alasio.dev/snapshot": "s-1", "alasio.dev/snapshot-release": "20990101.0" } }, spec: { operatingMode: "Suspended" } })));
-  assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.annotations?.["alasio.dev/snapshot"], undefined);
-  assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.annotations?.["alasio.dev/snapshot-release"], undefined);
-  // Released, then resumed by the bring-up, each with a pod of its own.
-  assert.equal(controller.pods.length, 2);
 });
 
 /** The egress gate against an API server on `port` of this machine, given 1.5s: its exit code and stderr. */
