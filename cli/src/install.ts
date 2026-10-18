@@ -137,6 +137,37 @@ const checkApplicable = (objects: readonly KubernetesObject[]): Effect.Effect<vo
       }),
     ));
 
+/**
+ * The sessions' namespace holds session workspaces of the release before: its Sandboxes, and
+ * their workspaces' claims, which this release runs no session on and moves nothing of. alasio
+ * applies nothing while one remains, saying how to delete each, which deletes its files.
+ */
+export class SessionWorkspacesLeft extends Schema.TaggedError<SessionWorkspacesLeft>()("SessionWorkspacesLeft", {
+  namespace: Schema.String,
+  sandboxes: Schema.Array(Schema.String),
+  claims: Schema.Array(Schema.String),
+}) {
+  override get message(): string {
+    const deletions = [
+      ...this.sandboxes.map((name) => `kubectl -n ${this.namespace} delete sandboxes.agents.x-k8s.io ${name}`),
+      ...this.claims.map((name) => `kubectl -n ${this.namespace} delete pvc ${name}`),
+    ];
+    return `${this.namespace} holds session workspaces of the release before (${[...this.sandboxes.map((name) => `Sandbox ${name}`), ...this.claims.map((name) => `claim ${name}`)].join(", ")}), ` +
+      `which this release runs no session on and moves nothing of, so alasio applies nothing: delete each first, its files with it (${deletions.join("; ")})`;
+  }
+}
+
+/** Refuses a cluster whose sessions' namespace, `namespace`, holds the release before's session workspaces (SessionWorkspacesLeft); none where its Sandboxes' CRD is gone. */
+const checkSessionWorkspacesGone = (namespace: string): Effect.Effect<void, KubeApiError | SessionWorkspacesLeft, KubeApi> =>
+  Effect.gen(function*() {
+    const kube = yield* KubeApi;
+    const names = (objects: readonly KubernetesObject[]) => objects.map(({ metadata }) => metadata?.name ?? "").sort();
+    const sandboxes = names(yield* kube.list(kind("Sandbox"), { namespace }).pipe(Effect.catchIf(hasStatus(404), () => Effect.succeed([]))));
+    // This release claims no volume there: each claim is a workspace of the release before's.
+    const claims = names(yield* kube.list(kind("PersistentVolumeClaim"), { namespace }));
+    if (sandboxes.length > 0 || claims.length > 0) return yield* new SessionWorkspacesLeft({ namespace, sandboxes, claims });
+  });
+
 /** The installation `config` describes, as checkInstallation finds it, with what its objects carry forward. */
 interface Checked {
   readonly bot: TelegramBot;
@@ -159,14 +190,15 @@ interface Checked {
  * The installation `config` describes, with its bot, refused where applying it would not do:
  * with no bot set, or one that allows no user, with no address for Telegram to deliver to,
  * against the cluster's own autoscalers, its object store's layout and scale, or Neon's
- * storage (./neon-storage.ts), or where an object the cluster has cannot take this release's
- * of it. Its objects carry forward what the installation they replace recorded.
+ * storage (./neon-storage.ts), where the sessions' namespace holds the release before's session
+ * workspaces (SessionWorkspacesLeft), or where an object the cluster has cannot take this
+ * release's of it. Its objects carry forward what the installation they replace recorded.
  */
 export const checkInstallation = Effect.fnUntraced(function*(
   config: OperatorConfig,
 ): Effect.fn.Return<
   Checked,
-  KubeApiError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused,
+  KubeApiError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused | SessionWorkspacesLeft,
   KubeApi
 > {
   const bot = yield* readTelegramBot;
@@ -186,6 +218,7 @@ export const checkInstallation = Effect.fnUntraced(function*(
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
   yield* checkNeonStorage(settings);
+  if (settings.sessions.enabled) yield* checkSessionWorkspacesGone(settings.sessions.namespace);
   yield* checkApplicable(objects);
   return { bot, settings, objects, liveGateway, recorded, gvisorReleases, checksum, apiServer, mountServices };
 });
@@ -201,7 +234,7 @@ export const install = Effect.fnUntraced(function*(
   options: WaitOptions,
 ): Effect.fn.Return<
   Installed,
-  ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused | WebhookNotServing | WebhookError,
+  ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused | SessionWorkspacesLeft | WebhookNotServing | WebhookError,
   KubeApi | TelegramBotApi
 > {
   yield* ensureBotChecksumKey;

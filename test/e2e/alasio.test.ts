@@ -97,14 +97,12 @@ import { workspaceStorage } from "./workspace-storage.ts";
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /** The host profile's namespace, where folder workspaces' bayma run. */
-/** A session's Sandbox of the release upgraded from, whose sessions agent-sandbox ran: its metadata alone is read. */
+/** A Sandbox of the release upgraded from, whose bayma agent-sandbox ran: its metadata alone is read. */
 interface Sandbox extends KubernetesObject {
   readonly metadata: V1ObjectMeta;
 }
 /** The bayma the release upgraded from pins for folders: one other than this release's, whose instance refuses a snapshot this release's took. */
 const PREVIOUS_BAYMA = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.2", digest: "sha256:5a9a731371d083cae815c6f27c5eb0147e1e77fac400544285f8416047ba4109" } as const;
-/** The annotation of such a Sandbox, suspended, naming the snapshot it was saved into. */
-const SNAPSHOT_ANNOTATION = "alasio.dev/snapshot";
 /** A folder conversation's bayma's Sandbox of the release upgraded from: its pod template, which its bayma's state directory is an argument of. */
 interface FolderSandbox extends Sandbox {
   readonly spec: { readonly podTemplate: V1PodTemplateSpec };
@@ -286,8 +284,10 @@ if (inShard("upgrade")) {
     let folderBayma: { readonly name: string; readonly key: string; readonly state: string };
     /** The folder chat's REPL sessions in its bayma. */
     let folderRepls: FolderReplsSet;
+    /** Main's session workspace, made on the release before, then left for a folder. */
     let volumeId: string;
-    /** The folder mounted in the other chat, and what it holds. */
+    /** The folders mounted in main's chat and the other, which hold a file each. */
+    let main: string;
     let folder: string;
     let messages: number;
     /** Runs `sql` on the storage controller's database, neon-control's record among it: what psql printed. */
@@ -345,29 +345,30 @@ if (inShard("upgrade")) {
         },
       },
       {
-        seeds: "main at work, in a session workspace and in a folder, a file in each",
+        seeds: "main at work in a folder, a session workspace of its left from before it, and the folder chat at work in a folder of its own, a file in each folder",
         seed: async () => {
-          volumeId = await workInMain();
+          volumeId = await workInMainOnPrevious();
+          main = await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'");
+          assert.ok(main.startsWith(paths().home), `main mounts ${main}`);
           await tg.say("hello", FOLDER_CHAT);
           await tg.waitFor((call) => answered(call, FOLDER_CHAT));
           folder = await onDatabase(NAMESPACE, `select working_directory from state.conversations where id = 'telegram:${FOLDER_CHAT}'`);
           assert.ok(folder.startsWith(paths().home), `the folder chat mounts ${folder}`);
-          await onNode("", `printf %s 'written by main' >'${folder}/proof' && chown ${HOST_USER}:${HOST_USER} '${folder}/proof'`);
+          for (const each of [main, folder]) await onNode("", `printf %s 'written by main' >'${each}/proof' && chown ${HOST_USER}:${HOST_USER} '${each}/proof'`);
           messages = Number(await onDatabase(NAMESPACE, "select count(*) from state.messages"));
         },
-        keeps: "main's conversations go on where they were mounted, in the session workspace and in the folder, each file as it was",
+        keeps: "main's conversations go on in their folders, each file as it was",
         check: async () => {
           // What status says of the compute alone: the lake's intake, which KEDA scales from none as the log
           // fills, may be starting as it runs, not yet ready.
           assert.match((await alasio("status")).stdout, new RegExp(`^ {2}Deployment ${NAMESPACE}/alasio-neon-compute: awake`, "mu"));
-          assert.equal(await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'"), `sessionfs:${volumeId}`);
+          assert.equal(await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'"), main);
           assert.equal(await onDatabase(NAMESPACE, `select working_directory from state.conversations where id = 'telegram:${FOLDER_CHAT}'`), folder);
           await tg.say("again");
           await tg.waitFor((call) => answered(call));
-          assert.equal(await inSession(volumeId, 'process.stdout.write(require("fs").readFileSync("/workspace/proof", "utf8"))'), "written by main");
           await tg.say("again", FOLDER_CHAT);
           await tg.waitFor((call) => answered(call, FOLDER_CHAT));
-          assert.equal(readFileSync(`${folder}/proof`, "utf8"), "written by main");
+          for (const each of [main, folder]) assert.equal(readFileSync(`${each}/proof`, "utf8"), "written by main");
           assert.ok(Number(await onDatabase(NAMESPACE, "select count(*) from state.messages")) > messages);
         },
       },
@@ -515,25 +516,24 @@ if (inShard("upgrade")) {
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
 
-    /**
-     * Main's session's REPL, live as the session is released, and the snapshot it is last
-     * released into on PREVIOUS: each turn the tests have main answer before the upgrade
-     * restores the session, which is released again into a snapshot of its own.
-     */
-    let releasedRepl: string;
-    let releasedAs: string;
-
-    /** Waits for main's session, its turn answered, to be released into a snapshot, which it takes as the one the upgrade is to restore. */
-    const released = async () => {
-      await untilReleased(volumeId, Date.now());
-      releasedAs = (await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS)))?.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? "";
-      assert.ok(releasedAs, `the session ${volumeId} was released into no snapshot`);
-      assert.equal((await snapshotOf(volumeId))?.snapshot, releasedAs);
-    };
-
-    test(`on ${PREVIOUS}: main's session released into a snapshot, a REPL live in it`, { timeout: 30 * 60_000 }, async () => {
-      ({ sessionId: releasedRepl } = await repl.set(volumeId, `released by ${volumeId}`));
-      await released();
+    // A session workspace another release made is one this release runs no session on and
+    // moves nothing of, so the cut-over refuses while one is left, before it changes anything.
+    test(`on ${PREVIOUS}: main's session workspace, which the cut-over refuses to go past, before it changes anything, naming it, until it is deleted`, { timeout: 30 * 60_000 }, async () => {
+      const generation = await alasioGeneration();
+      const claims = (await kube.list<KubernetesObject>("PersistentVolumeClaim", { namespace: SESSIONS })).map(({ metadata }) => metadata?.name ?? "");
+      assert.ok(claims.length > 0, "main's session workspace has its claim");
+      const refused = await cutOver();
+      assert.notEqual(refused.code, 0, refused.stdout);
+      assert.match(refused.stderr, new RegExp(`FAILED: ${SESSIONS} holds session workspaces of ${(PREVIOUS ?? "").replaceAll(".", "\\.")}'s[^\\n]*kubectl -n ${SESSIONS} delete sandbox\\.agents\\.x-k8s\\.io/${volumeId}`, "u"));
+      for (const claim of claims) assert.ok(refused.stderr.includes(`kubectl -n ${SESSIONS} delete persistentvolumeclaim/${claim}`), refused.stderr);
+      assert.doesNotMatch(refused.stderr, /checking that the upgrade can run|upgrading, from the cut-over/u);
+      assert.ok(!(await recorded()).includes("point-of-no-return"));
+      assert.equal(await alasioGeneration(), generation);
+      // Deleted as the refusal says, its files with it.
+      await kube.remove(ref("Sandbox", volumeId, SESSIONS));
+      for (const claim of claims) await kube.remove(ref("PersistentVolumeClaim", claim, SESSIONS));
+      await until("main's session workspace gone", async () =>
+        (await kube.list("PersistentVolumeClaim", { namespace: SESSIONS })).length === 0 && (await kube.list("Sandbox", { namespace: SESSIONS })).length === 0 ? true : undefined, 300_000);
     });
 
     // A branch environment another release made does not run on what an upgrade changes,
@@ -578,8 +578,6 @@ if (inShard("upgrade")) {
         console.error(`# the log's pod's restarts: ${JSON.stringify(restarts)}\n# its first lines:\n${said.slice(0, 60).join("\n")}\n# its last:\n${said.slice(-40).join("\n")}`);
         throw error;
       });
-      // The last turn before the upgrade, whose session the release before releases again.
-      await released();
     });
 
     test(`the cut-over from ${PREVIOUS}, failing past its point of no return, before the upgrade, goes on with it when run again, its checks not run again`, { timeout: 60 * 60_000 }, async () => {
@@ -605,16 +603,6 @@ if (inShard("upgrade")) {
       assert.match(again.stderr, /upgraded at \S+\n[^\n]* removing what of [^\n]* this release has no use for[^\n]*\n[^\n]* through\n$/u);
       assert.equal(await alasioGeneration(), generation);
       upgraded = Date.now();
-    });
-
-    test(`upgraded: main's session restored from the snapshot it was released into on ${PREVIOUS}, with its REPL whole`, { timeout: 30 * 60_000 }, async () => {
-      // Its Sandbox gone with agent-sandbox, the snapshot it was released into its workspace's last.
-      assert.equal((await snapshotOf(volumeId))?.snapshot, releasedAs);
-      await tg.say("from the snapshot");
-      await tg.waitFor((call) => answered(call));
-      const seen = await repl.read(volumeId, releasedRepl);
-      assert.deepEqual([seen.live, seen.checkpointed], [`released by ${volumeId}`, `released by ${volumeId}`]);
-      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
     });
 
     for (const { keeps, check } of scenarios) test(`upgraded: ${keeps}`, check);
@@ -2780,6 +2768,35 @@ const FOLDER_CHAT = OTHER_OPERATOR;
  * written in it, and a turn on Codex there, in the operator's chat; and, where folder
  * workspaces are on, a folder mounted in another chat, on Codex. The session's volume id.
  */
+/**
+ * Main at work on the release before, as the upgrade shard seeds it: in a session workspace,
+ * made from the panel and run a turn in on Codex, as that release runs them, then in a folder
+ * of its own, which it goes on in; and the other chat in a folder of its own. Main's session
+ * workspace, which the cut-over refuses while it is left.
+ */
+async function workInMainOnPrevious(): Promise<string> {
+  await tg.calls();
+  await tg.say("/workspace");
+  await tg.choose(/New empty workspace/u);
+  await tg.choose(/No internet/u);
+  const created = await tg.waitFor((call) => /Created and mounted session workspace/u.test(call.payload.text ?? ""));
+  const volumeId = /fs-[0-9a-f]+/u.exec(created.payload.text ?? "")?.[0];
+  assert.ok(volumeId, `alasio named no workspace: ${created.payload.text}`);
+  await tg.say("/service codex");
+  await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+  await tg.say("hello");
+  await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+  await tg.say("/workspace new e2e-main");
+  await tg.waitFor((call) => /e2e-main/u.test(call.payload.text ?? ""));
+  await tg.say("hello");
+  await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+  await tg.say("/workspace new e2e-folder", FOLDER_CHAT);
+  await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /e2e-folder/u.test(call.payload.text ?? ""));
+  await tg.say("/service codex", FOLDER_CHAT);
+  await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /^Active: Codex$/mu.test(call.payload.text ?? ""));
+  return volumeId;
+}
+
 async function workInMain(): Promise<string> {
   const volumeId = await newSession("none");
   await inSession(volumeId, 'require("fs").writeFileSync("/workspace/proof", "written by main")');

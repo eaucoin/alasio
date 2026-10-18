@@ -45,6 +45,10 @@ function machine() {
   const sandboxes = join(root, "sandboxes.tsv");
   const config = join(root, "config.json");
   const reboot = join(root, "reboot-required");
+  const sessionSandboxes = join(root, "session-sandboxes");
+  const sessionClaims = join(root, "session-claims");
+  writeFileSync(sessionSandboxes, "");
+  writeFileSync(sessionClaims, "");
   writeFileSync(namespaces, "");
   writeFileSync(folders, JSON.stringify({ items: [] }));
   writeFileSync(sandboxes, "");
@@ -62,6 +66,8 @@ case "$*" in
   "-n alasio delete statefulset alasio-log --cascade=orphan --wait=true") rm '${statefulSet}' ;;
   "-n alasio create -f -") cat >'${statefulSet}' ;;
   "get crd sandboxes.agents.x-k8s.io --ignore-not-found -o name") [ ! -e '${crd}' ] || echo customresourcedefinition.apiextensions.k8s.io/sandboxes.agents.x-k8s.io ;;
+  "-n alasio-sessions get sandboxes.agents.x-k8s.io -o name") cat '${sessionSandboxes}' ;;
+  "-n alasio-sessions get pvc -o name") cat '${sessionClaims}' ;;
   "-n alasio get pod -l "*" -o name") ;;
   "get pod -A -l alasio.dev/workload=folder -o json") cat '${folders}' ;;
   "get sandboxes.agents.x-k8s.io -A -o jsonpath="*) cat '${sandboxes}' ;;
@@ -126,6 +132,11 @@ esac
     /** The configuration's file, and what it holds. */
     config,
     configured: () => JSON.parse(readFileSync(config, "utf8")) as { install: Record<string, unknown> },
+    /** Gives the sessions' namespace the release before's session workspaces: Sandboxes and claims, by name. */
+    hasSessionWorkspaces: (sandboxes: readonly string[], claims: readonly string[]) => {
+      writeFileSync(sessionSandboxes, sandboxes.map((name) => `sandbox.agents.x-k8s.io/${name}\n`).join(""));
+      writeFileSync(sessionClaims, claims.map((name) => `persistentvolumeclaim/${name}\n`).join(""));
+    },
     /** Leaves this machine a reboot pending, or none. */
     rebootPending: (pending: boolean) => (pending ? writeFileSync(reboot, "") : rmSync(reboot, { force: true })),
     root,
@@ -402,6 +413,24 @@ test("once upgraded, the cut-over deletes what of 8.0.0's this release has no us
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
     assert.deepEqual(at.calls(), removed);
+  } finally {
+    at.remove();
+  }
+});
+
+test("the cut-over refuses session workspaces of 8.0.0's before it changes anything, naming each with how to delete it, and goes on once they are deleted", () => {
+  const at = machine();
+  try {
+    at.hasAgentSandbox([], []);
+    at.hasSessionWorkspaces(["fs-abc123"], ["workspace-fs-abc123"]);
+    const refused = at.cutOver();
+    assert.notEqual(refused.code, 0);
+    assert.match(refused.said, /FAILED: alasio-sessions holds session workspaces of 8\.0\.0's, which this release runs no session on and moves nothing of: delete each first, its files with it \(kubectl -n alasio-sessions delete sandbox\.agents\.x-k8s\.io\/fs-abc123; kubectl -n alasio-sessions delete persistentvolumeclaim\/workspace-fs-abc123\), and run the cut-over again\n$/u);
+    assert.deepEqual([at.ran(), at.marks(), at.calls()], [[], [], []]);
+    assert.deepEqual(at.statefulSet(), logStatefulSet("8.0.0"));
+    at.hasSessionWorkspaces([], []);
+    const again = at.cutOver();
+    assert.equal(again.code, 0, again.said);
   } finally {
     at.remove();
   }

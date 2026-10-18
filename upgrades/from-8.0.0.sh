@@ -57,6 +57,10 @@
 # its Sandboxes, its role in the folders' namespace, its admission policies of Sandboxes and
 # their Secrets, and the network policy that let it reach the folders' bayma.
 #
+# A session workspace 8.0.0 made, a Sandbox in the sessions' namespace or its workspace's claim,
+# is refused before anything changes, each named with how to delete it: this release runs no
+# session on it and moves nothing of it, as no one's needs moving.
+#
 # Run again, it goes on from where it stopped: a failure before the point of no return makes
 # again what the steps changed, and a run again starts over. Once past it
 # (OUT/point-of-no-return), a run again goes on from there, and once the upgrade went through
@@ -120,6 +124,15 @@ if [ ! -e "$OUT/point-of-no-return" ]; then
   branches=$(printf '%s\n' "$namespaces" | awk -F '\t' 'NF == 2 && $1 == "alasio-branch-" $2 { print $2 }')
   [ -z "$branches" ] ||
     fail "alasio upgrades main alone, and the branch environments 8.0.0 made would not run on what upgrading changes: delete each first ($(printf '%s\n' "$branches" | awk 'NR > 1 { printf ", " } { printf "alasio branch delete %s", $0 }')), and make them again once alasio is upgraded"
+  # The release before's session workspaces, which this release runs no session on and moves nothing of.
+  log "checking that no session workspace of 8.0.0's is left, as this release moves none"
+  sessions=$(jq -r '.install.sessions.namespace // "alasio-sessions"' "$CONFIG")
+  left=$(
+    if [ -n "$(kubectl get crd "$SANDBOXES" --ignore-not-found -o name)" ]; then kubectl -n "$sessions" get "$SANDBOXES" -o name; fi
+    kubectl -n "$sessions" get pvc -o name
+  ) || fail "what $sessions holds could not be listed, so whether a session workspace is left cannot be told"
+  [ -z "$left" ] ||
+    fail "$sessions holds session workspaces of 8.0.0's, which this release runs no session on and moves nothing of: delete each first, its files with it ($(printf '%s\n' "$left" | awk -v ns="$sessions" 'NR > 1 { printf "; " } { printf "kubectl -n %s delete %s", ns, $0 }')), and run the cut-over again"
   [ ! -e "$REBOOT_REQUIRED" ] ||
     fail "this machine has a reboot pending ($REBOOT_REQUIRED): reboot it first, then cut over, as a reboot before the folders' bayma starts again refuses what it saved of their REPLs"
   # The configuration, of no agent-sandbox, as this release reads it.
