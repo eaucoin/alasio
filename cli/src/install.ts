@@ -77,30 +77,46 @@ export interface Installed {
   readonly cpuBaseline: BaselineDecision | null;
 }
 
+/** An object the cluster has that cannot take this release's of it, and why, as a dry run of its apply said. */
+const Refusal = Schema.Struct({ object: Schema.String, reason: Schema.String });
+
 /**
- * The cluster has an object of the installation that cannot take this release's of it, as
- * applying it as a dry run said: nothing is applied, as one refused midway would leave the
- * installation half of one release, half of the other.
+ * The cluster has objects of the installation that cannot take this release's of them, as
+ * applying each as a dry run said, all of them told at once: nothing is applied, as one
+ * refused midway would leave the installation half of one release, half of the other.
  */
-export class ObjectRefused extends Schema.TaggedError<ObjectRefused>()("ObjectRefused", { object: Schema.String, reason: Schema.String }) {
+export class ObjectRefused extends Schema.TaggedError<ObjectRefused>()("ObjectRefused", { refused: Schema.NonEmptyArray(Refusal) }) {
   override get message(): string {
-    return `the cluster's ${this.object} cannot take this release's of it (${this.reason}), so alasio applies nothing`;
+    const [first, ...more] = this.refused;
+    return more.length === 0
+      ? `the cluster's ${first.object} cannot take this release's of it (${first.reason}), so alasio applies nothing`
+      : `the cluster's objects cannot take this release's of them, so alasio applies nothing:\n${this.refused.map(({ object, reason }) => `  ${object}: ${reason}`).join("\n")}`;
   }
 }
 
-/** Refuses `objects` where the cluster has one that cannot take this release's of it, each applied as a dry run. */
+/**
+ * Refuses `objects` where the cluster has any that cannot take this release's of it, each
+ * applied as a dry run, every one refused told at once. A Job, whose pod template cannot
+ * change, is left out: it is run afresh, one of its name deleted first (./kube/apply.ts).
+ */
 const checkApplicable = (objects: readonly KubernetesObject[]): Effect.Effect<void, KubeApiError | ObjectRefused, KubeApi> =>
   Effect.flatMap(KubeApi, (kube) =>
-    Effect.forEach(objects, (object) => {
+    Effect.forEach(objects.filter(({ kind }) => kind !== "Job"), (object) => {
       const ref = refOf(object);
       return Effect.flatMap(kube.get(ref), (live) =>
         live
           ? kube.dryApply(labelled(object)).pipe(
-            Effect.asVoid,
-            Effect.catchIf(hasStatus(422), (error) => Effect.fail(new ObjectRefused({ object: describeRef(ref), reason: error.reason }))),
+            Effect.as(null),
+            Effect.catchIf(hasStatus(422), (error) => Effect.succeed({ object: describeRef(ref), reason: error.reason })),
           )
-          : Effect.void);
-    }, { concurrency: 8, discard: true }));
+          : Effect.succeed(null));
+    }, { concurrency: 8 }).pipe(
+      Effect.flatMap((each) => {
+        const refused = each.filter((refusal) => refusal !== null).sort((a, b) => a.object.localeCompare(b.object));
+        const [first, ...more] = refused;
+        return first === undefined ? Effect.void : Effect.fail(new ObjectRefused({ refused: [first, ...more] }));
+      }),
+    ));
 
 /** The installation `config` describes, as checkInstallation finds it, with what its objects carry forward. */
 interface Checked {

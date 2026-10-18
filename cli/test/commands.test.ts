@@ -1649,6 +1649,38 @@ test("up applies nothing where an object the cluster has cannot take this releas
   assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
 });
 
+test("up applies nothing where objects the cluster has cannot take this release's of them, telling every one refused at once, as a dry run of each says", async (t) => {
+  const { alasio, kube } = await branchable(t);
+  // Two of them, the log's and the pageservers' StatefulSets, each with its pods started in order, which no StatefulSet changes.
+  for (const name of ["alasio-log", "alasio-neon-pageserver"]) {
+    const statefulSet = kube.get(`/apis/apps/v1/namespaces/alasio/statefulsets/${name}`);
+    assert.ok(statefulSet?.spec, name);
+    statefulSet.spec["podManagementPolicy"] = "OrderedReady";
+  }
+  kube.changes.length = 0;
+  for (const command of [["up"], ["upgrade", "--check"]]) {
+    assert.equal(
+      failure(await alasio(command)),
+      "the cluster's objects cannot take this release's of them, so alasio applies nothing:\n" +
+        ["alasio-log", "alasio-neon-pageserver"].map((name) =>
+          `  StatefulSet alasio/${name}: StatefulSet.apps "${name}" is invalid: spec: Forbidden: ` +
+          "updates to statefulset spec for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy', 'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden"
+        ).join("\n"),
+    );
+  }
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
+});
+
+test("up runs afresh a Job a run before left, whose pod template cannot change, rather than refuse it as one the cluster cannot take this release's of", async (t) => {
+  const { alasio, kube } = await branchable(t);
+  // Neon's setup, as a run before that stopped left it, of another pod template.
+  const path = "/apis/batch/v1/namespaces/alasio/jobs/alasio-neon-setup";
+  kube.objects.set(path, { apiVersion: "batch/v1", kind: "Job", metadata: { name: "alasio-neon-setup", namespace: "alasio", uid: "left" }, spec: { template: { metadata: { labels: { "app.kubernetes.io/version": "8.0.0" } } } } });
+  succeeded(await alasio(["upgrade", "--check"]));
+  succeeded(await alasio(["up"]));
+  assert.notEqual(kube.get(path)?.metadata["uid"], "left");
+});
+
 test("up checks Neon's storage by the storage controller, which every release runs, and asks neon-control nothing, whose release it may be upgrading", async (t) => {
   const { alasio, neon } = await branchable(t);
   // neon-control of a release before this one, which has no /tenant.
