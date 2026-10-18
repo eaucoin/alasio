@@ -87,6 +87,10 @@ create table if not exists ${SCHEMA}.messages (
 );
 
 create index if not exists messages_media_group on ${SCHEMA}.messages (media_group_id);
+-- A Telegram message kept once, by its id and the time it was sent
+-- (./telegram-content-repository.ts insertMessage), whichever alasio keeps it.
+create unique index if not exists messages_telegram_once on ${SCHEMA}.messages (conversation_id, direction, transport_message_id, (raw->>'date'))
+  nulls not distinct where transport_message_id is not null;
 
 -- Files messages carried, whole: the Bot API lets bots download 20 MB at most.
 create table if not exists ${SCHEMA}.files (
@@ -107,6 +111,8 @@ create table if not exists ${SCHEMA}.files (
 );
 
 create index if not exists files_message on ${SCHEMA}.files (message_id);
+-- A file a message carried kept once, whichever alasio keeps it.
+create unique index if not exists files_telegram_once on ${SCHEMA}.files (message_id, telegram_file_unique_id) where telegram_file_unique_id is not null;
 
 create table if not exists ${SCHEMA}.media_groups (
   id text primary key,
