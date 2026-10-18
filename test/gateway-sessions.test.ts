@@ -1006,10 +1006,13 @@ test("a bound pod whose workspace its node can reach no more, as its node's moun
   })();
   await Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
   await ending;
-  for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its binding was not let go");
+  // Its binding let go, then its release told, once its Lease is gone.
+  const toldBroken = () => told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "broken");
+  for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null || !toldBroken(); await new Promise((resolve) => setTimeout(resolve, 100))) {
+    assert.ok(Date.now() < deadline, "its binding was not let go as broken");
+  }
   // Its node was asked once, for both.
   assert.deepEqual(recorded.asked, ["attachments node-a", `record ${env.namespace}/fs-unreachable released into s-live`, `detach node-a ${bound.pod}`]);
-  assert.ok(told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "broken"));
   assert.notEqual(await run(readLease(env.none, kept)), null);
   assert.ok(!told.some((event) => event.kind === "workspace.released" && event.subject.key === kept));
   assert.notEqual(other.pod, bound.pod);
