@@ -102,7 +102,8 @@ function watchRestore(node: string): { readonly stop: () => void; readonly said:
 
 /** The pod of main's sessions bound to `workspace`, once it is: its name and node. */
 async function boundPod(workspace: string): Promise<{ readonly name: string; readonly node: string }> {
-  const [bound] = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` });
+  // Not one being deleted, as a restore's that failed is, which binds nothing more.
+  const [bound] = (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` })).filter(({ metadata }) => !metadata?.deletionTimestamp);
   assert.ok(bound?.metadata?.name, `no pod is bound to ${workspace}\n${await serviceLogs(workspace)}`);
   return { name: bound.metadata.name, node: bound.spec?.nodeName ?? "" };
 }
@@ -339,6 +340,7 @@ export function sandboxService(): void {
       // Claimed: a pool's pod bound to it, the file in its sandbox.
       await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
       const claimed = await boundPod(workspace);
+      const claimedGvisor = (await kube.get<V1Pod>(ref("Pod", claimed.name, SESSIONS)))?.spec?.runtimeClassName !== undefined;
       assert.equal(await inSandbox("cat /workspace/received/note.txt"), "a file received on Telegram\n");
       // Held to its quota, the pool's sessions' size, 1Gi in the run, once the node's mount has read it, as JuiceFS's client reads its quotas anew every few seconds.
       const fill = () =>
@@ -364,7 +366,10 @@ export function sandboxService(): void {
       assert.deepEqual(await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` }), []);
       assert.equal((await gatewayCall(token, "GET", "/workspace/quota")).status, 200);
       // Bound again, to another pod, with what it held.
-      await bindThrough(token, workspace, "the gateway binding the workspace again", 180_000);
+      const seen = watchRestore(claimed.node);
+      await bindThrough(token, workspace, "the gateway binding the workspace again", 180_000).finally(seen.stop);
+      // Restored from the snapshot it was released into, by a pod of its own, where its pool's run under gVisor, and are snapshotted.
+      if (claimedGvisor) assert.match((await boundPod(workspace)).name, /^sandboxes-none-restore-/u, `${await serviceLogs(workspace)}\nas its node held its restore's directory:\n${seen.said().join("\n---\n")}`);
       assert.notEqual((await boundPod(workspace)).name, claimed.name);
       assert.equal(await inSandbox("cat /workspace/out/reply.txt"), "a chart, drawn");
       // Deleted once released, and not before.
