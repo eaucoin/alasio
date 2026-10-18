@@ -1604,39 +1604,51 @@ if (inShard("snapshots")) {
       }
     });
 
-    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket comes back whole and is saved again, its node's agent stopped as its sandbox reads the rest of it, which the agent's stop waits on`, async (t) => {
+    // Gate 9 of program/12-live-lazy.md. A release that restores through the node agent's
+    // socket (gvisor.restoresThroughSocketSince) has its restore's gofer read the bucket on
+    // through an agent killed and started again, which takes the restore's token back from
+    // its tokens file, its gofer reading pages again while the sandbox runs (pages_retry).
+    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket through its node agent's socket comes back whole and is saved again, its node's agent killed the moment the sandbox resumes and the agent started again taking its token back`, async (t) => {
       const big = await newSession("none");
       const { sessionId: held, sha256 } = await repl.fill(big, BIG_REPL_MEBIBYTES);
       await untilReleased(big, Date.now());
-      for (const pod of (await nodeAgents()).values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
-      const answered = turn(`hello with ${BIG_REPL_MEBIBYTES} MiB, its node's agent stopped`);
-      // Its sandbox resumed, reading the rest of it in the background: its node's agent stopped, as a rollout stops it.
-      const node = await until(`the restored pod of ${big} resumed`, async () => {
+      const agents = await nodeAgents();
+      for (const pod of agents.values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
+      const answered = turn(`hello with ${BIG_REPL_MEBIBYTES} MiB, its node's agent killed`);
+      // Looked at often, as the rest of it is read within seconds: resumed once the gateway
+      // marks it so, its agent's resume answered.
+      const deadline = Date.now() + 600_000;
+      let node: string | undefined;
+      while (node === undefined) {
+        assert.ok(Date.now() < deadline, `the restored pod of ${big} did not resume within 600 s`);
         const pod = await kube.get<V1Pod>(ref("Pod", big, SESSIONS));
-        return pod?.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True") ? pod.spec?.nodeName : undefined;
-      }, 600_000);
-      const agent = (await nodeAgents()).get(node);
-      assert.ok(agent, `no node agent runs ready on ${node}`);
-      // What it says as it stops, followed from before its stop: once its container is gone,
-      // its log can no more be read, though its pod is still there.
-      const log = following(NAMESPACE, agent, "node-agent", new RegExp(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: 1 read it now`, "u"));
-      await log.started;
-      const stoppedAt = Date.now();
-      await kube.remove(ref("Pod", agent, NAMESPACE));
-      try {
-        await until(`the node agent ${agent} gone`, async () => ((await kube.get(ref("Pod", agent, NAMESPACE))) === null ? true : undefined), 1_800_000);
-        t.diagnostic(`the node agent ${agent} was gone ${Date.now() - stoppedAt} ms after it was stopped`);
-        const said = await Promise.race([log.said, sleep(30_000).then(() => undefined)]);
-        assert.ok(said, `the node agent ${agent} did not say, as it stopped, that it waits on the restore reading the bucket through it`);
-        t.diagnostic(said);
-        await answered;
-        const summed = await repl.sum(big, held);
-        assert.equal(summed.sha256, sha256);
-        assert.match(summed.notice ?? "", CAME_BACK_WHOLE);
-      } finally {
-        log.stop();
-        await until(`a node agent ready again on ${node}`, async () => ((await nodeAgents()).has(node) ? true : undefined), 300_000);
+        if (pod?.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True")) node = pod.spec?.nodeName;
+        else await sleep(200);
       }
+      const agent = agents.get(node);
+      assert.ok(agent, `no node agent ran ready on ${node}`);
+      const resumedAt = Date.now();
+      // Its sandbox resumed, reading the rest of it in the background: its node's agent killed
+      // at once, as a crash kills it, with no drain.
+      await kube.kill(NAMESPACE, agent);
+      t.diagnostic(`the node agent ${agent} was killed ${Date.now() - resumedAt} ms after the gateway marked the restore resumed`);
+      const again = await until(`a node agent ready again on ${node}`, async () => {
+        const pod = (await nodeAgents()).get(node);
+        return pod !== undefined && pod !== agent ? pod : undefined;
+      }, 300_000);
+      // As it starts again, it takes the restore's token back from its tokens file.
+      const tookBack = following(NAMESPACE, again, "node-agent", /the node agent took back the tokens of [1-9]\d* restores reading the snapshots bucket through it/u);
+      try {
+        const said = await Promise.race([tookBack.said, sleep(60_000).then(() => undefined)]);
+        assert.ok(said, `the node agent ${again} did not say, as it started, that it took back the restore's token`);
+        t.diagnostic(said);
+      } finally {
+        tookBack.stop();
+      }
+      await answered;
+      const summed = await repl.sum(big, held);
+      assert.equal(summed.sha256, sha256);
+      assert.match(summed.notice ?? "", CAME_BACK_WHOLE);
       // Saved again, as a sandbox whose background reads failed could be no more.
       await untilReleased(big, Date.now());
       assert.ok(await snapshotOf(big), `the session ${big} was released with no snapshot`);
