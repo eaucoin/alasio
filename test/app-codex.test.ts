@@ -366,12 +366,17 @@ test("a concurrent message left unsettled as its turn ends is asked about again,
 
   mark = telegram.mark();
   telegram.press("Run it");
-  assert.deepEqual(await telegram.waitForShown(2, { mark }), [
+  await answerLoadedThreads(codex, ["thread-1"]);
+  assert.equal(inputText(await answerTurnStart(codex, "thread-1", "turn-2")), "Also update the docs");
+  await telegram.waitFor("editMessageText", (call) => call.params.text === "Codex is running this now.", { mark });
+  await telegram.waitFor("sendMessage", (call) => call.params.text.startsWith("Codex is working"), { mark });
+  // The press is answered as the turn it runs starts, whose status message comes in its own time.
+  const shown = timeless(telegram.shown(mark));
+  assert.deepEqual(shown.filter(({ method }) => method !== "sendMessage"), [
     { method: "answerCallbackQuery", text: "Running." },
     { method: "editMessageText", text: "Codex is running this now." },
   ]);
-  await answerLoadedThreads(codex, ["thread-1"]);
-  assert.equal(inputText(await answerTurnStart(codex, "thread-1", "turn-2")), "Also update the docs");
+  assert.deepEqual(shown.filter(({ method }) => method === "sendMessage"), [{ method: "sendMessage", text: WORKING("Codex") }]);
 });
 
 test("/stop as Codex starts the turn, before its app-server has answered turn/start, interrupts the turn it then starts", async (t) => {
