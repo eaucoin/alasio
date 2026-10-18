@@ -16,8 +16,11 @@
  * - `image inspect --json DIR`: describes the image, as saved by the release's runsc, whose
  *   version is `release-RELEASE` (or what a file `saved-by` beside it says), with the CPU
  *   features of `image-cpu-features`, its digest that of its pages metadata, as runsc's; or,
- *   of an image in the bucket (DIR holding s3_opts.json), one of the bytes of pages a file
- *   `remote-page-bytes` beside it says, failing where there is none;
+ *   of an image in the bucket (DIR holding s3_opts.json), while a file `remote-inspect` is
+ *   beside it, what the fork's runsc says of its test image (./runsc-image-inspect.json, a
+ *   copy of runsc/cmd/image/testdata/inspect.json: two layers, 45056 bytes of pages), as
+ *   saved by the release's runsc, failing while there is none, and taking a minute while a
+ *   file `hang-inspect` is;
  * - `image layers DIR`: its layers' digests, a line each;
  * - `image verify --host DIR`: says nothing of an image DIR holds whose layers are each in
  *   DIR/layers, of the digest it is named by, as runsc checks each layer's identity; fails
@@ -49,6 +52,9 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, wr
 import { join } from "node:path";
 
 import { gvisorHandler } from "../../src/node-agent/names.ts";
+
+/** What the fork's runsc says of its test image, which an image in the bucket is described as. */
+const INSPECTED = readFileSync(new URL("./runsc-image-inspect.json", import.meta.url), "utf8");
 
 const SCRIPT = `#!/usr/bin/env node
 const { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } = require("node:fs");
@@ -90,14 +96,11 @@ if (rest[0] === "checkpoint") {
   }
   checkpoint();
 } else if (rest[0] === "image" && rest[1] === "inspect" && existsSync(join(rest[rest.length - 1], "s3_opts.json"))) {
-  const bytes = read("remote-page-bytes", "");
-  if (bytes === "") { process.stderr.write("no image in the bucket to inspect\\n"); process.exit(1); }
-  process.stdout.write(JSON.stringify({
-    digest: "f".repeat(64),
-    format: { major: 2, minor: 0 },
-    state: { metadata: { runsc_version: read("saved-by", "release-" + basename(here)), cpu_features: read("image-cpu-features", "sse,avx"), platform: "systrap" } },
-    memory_files: [{ owner: "", committed_bytes: Number(bytes), extents: 1, layer_bytes: [Number(bytes)] }],
-  }, null, 2) + "\\n");
+  if (existsSync(join(here, "hang-inspect"))) { setTimeout(() => {}, 60000); return; }
+  if (!existsSync(join(here, "remote-inspect"))) { process.stderr.write("no image in the bucket to inspect\\n"); process.exit(1); }
+  const inspected = JSON.parse(${JSON.stringify(INSPECTED)});
+  inspected.state.metadata.runsc_version = read("saved-by", "release-" + basename(here));
+  process.stdout.write(JSON.stringify(inspected, null, 2) + "\\n");
 } else if (rest[0] === "image" && rest[1] === "inspect") {
   const image = rest[rest.length - 1];
   const meta = readFileSync(join(image, "pages_meta.img"));

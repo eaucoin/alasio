@@ -484,6 +484,8 @@ export interface NodeAgentOptions {
    * (./names.ts backgroundReadSeconds).
    */
   readonly backgroundReadMs: number;
+  /** How long runsc may take to say how many bytes of pages a restore from the bucket reads, INSPECT_TIMEOUT_MS unless told. */
+  readonly inspectTimeoutMs?: number;
 }
 
 /** The checkpoint gofer's options file for an image in an S3 store (runsc's checkpoint_restore.md). */
@@ -510,6 +512,13 @@ export const STATE_FILE_BYTES = 1024 * 1024;
  * STATE_FILE_BYTES at most, on a volume of the node's, is read well within it.
  */
 export const STATE_READ_TIMEOUT_MS = 5_000;
+
+/**
+ * How long runsc may take to describe an image in the bucket, reading its metadata through
+ * the node agent: well within it, as a restore reads the same before it starts. Past it, its
+ * process is killed, and the restore's reads are waited on by their quiet.
+ */
+export const INSPECT_TIMEOUT_MS = 60_000;
 /** bayma's state generation, as its state directory's generation.json says it. */
 const StateGenerationFile = Schema.fromJsonString(Schema.Struct({ schemaVersion: Schema.Literal(1), generation: Count }));
 /** What bayma's last save caught, as its state directory's last-save.json says it. */
@@ -633,7 +642,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache, bucket, storeProxy, host, restoresFromBucketSince, backgroundReadMs }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache, bucket, storeProxy, host, restoresFromBucketSince, backgroundReadMs, inspectTimeoutMs = INSPECT_TIMEOUT_MS }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   const locks = yield* RcMap.make({ lookup: (_workspace: string) => Semaphore.make(1) });
   /** One fetch of each workspace's images at a time (fetchLater), beside its operations. */
   const fetchLocks = yield* RcMap.make({ lookup: (_workspace: string) => Semaphore.make(1) });
@@ -1204,18 +1213,20 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   /**
    * Tells the proxy how many bytes of pages the restore of the snapshot prepared at
-   * `imagePath`, read from the bucket, reads through it, as runsc says of the image, so that
-   * the agent's stop waits for them all however its loader paces its reads: unknown until
-   * runsc has said, which it asks in the background; where runsc cannot say, the stop waits
-   * on the restore only while its reads go on, as the proxy's quiet tells.
+   * `imagePath`, read from the bucket by the token `accessKeyId`, reads through it, as runsc
+   * says of the image, so that the agent's stop waits for them all however its loader paces
+   * its reads: unknown until runsc has said, which it asks in the background, for as long as
+   * inspectTimeoutMs at most, its process killed past it; where runsc cannot say, the stop
+   * waits on the restore only while its reads go on, as the proxy's quiet tells.
    */
-  const expectPages = (ref: WorkspaceRef, release: string, imagePath: string): Effect.Effect<void> =>
-    Effect.sync(() => storeProxy.expect(prefixOf(ref), Number.POSITIVE_INFINITY)).pipe(
+  const expectPages = (ref: WorkspaceRef, accessKeyId: string, release: string, imagePath: string): Effect.Effect<void> =>
+    Effect.sync(() => storeProxy.expect(accessKeyId, Number.POSITIVE_INFINITY)).pipe(
       Effect.andThen(
         runsc.inspect(release, imagePath).pipe(
-          Effect.tap(({ pageBytes }) => Effect.sync(() => storeProxy.expect(prefixOf(ref), pageBytes))),
+          Effect.timeoutOrElse({ duration: inspectTimeoutMs, orElse: () => Effect.fail(new Error(`it did not answer within ${inspectTimeoutMs / 1000} s`)) }),
+          Effect.tap(({ pageBytes }) => Effect.sync(() => storeProxy.expect(accessKeyId, pageBytes))),
           Effect.tapError((error) =>
-            Effect.sync(() => storeProxy.expect(prefixOf(ref), null)).pipe(
+            Effect.sync(() => storeProxy.expect(accessKeyId, null)).pipe(
               Effect.andThen(Effect.logWarning(`runsc does not say how many bytes of pages the restore of ${prefixOf(ref)} reads through the node agent, so the agent's stop waits on it only while its reads go on: ${error.message}`)),
             )
           ),
@@ -1320,7 +1331,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           const token = storeProxy.mint(prefixOf(ref), `${prefixOf(ref)}/${LAYERS_DIR}/`);
           if (token === null) return yield* new AgentStopping({ environment, workspace });
           imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, goferOptions(ref, own.digest, token));
-          yield* expectPages(ref, release, imagePath);
+          yield* expectPages(ref, token.accessKeyId, release, imagePath);
         }
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
         prepared.set(prefixOf(ref), manifest);

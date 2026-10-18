@@ -1,0 +1,47 @@
+{
+  "digest": "4eb1150a729226e882608dfc88a0a34ac647264581202ce90c9f5ec32279be9f",
+  "format": {
+    "major": 2,
+    "minor": 0
+  },
+  "state": {
+    "size": 218,
+    "metadata": {
+      "image_format": "2.0",
+      "runsc_version": "VERSION",
+      "timestamp": "2026-10-08 12:00:00"
+    }
+  },
+  "containers": [
+    "app",
+    "sidecar"
+  ],
+  "layers": [
+    {
+      "pages_size": 16384,
+      "path": "ROOT/delta/pages.img"
+    },
+    {
+      "digest": "8b3f2574f42e922f9fdbf50314bd9570addf6bedb2fefa21780a01b7985f0b6d",
+      "pages_size": 28672,
+      "path": "ROOT/delta/layers/8b3f2574f42e922f9fdbf50314bd9570addf6bedb2fefa21780a01b7985f0b6d/pages.img"
+    }
+  ],
+  "memory_files": [
+    {
+      "owner": "",
+      "committed_bytes": 49152,
+      "extents": 2,
+      "layer_bytes": [
+        16384,
+        28672
+      ]
+    }
+  ],
+  "working_set": {
+    "unit": 4096,
+    "window_ns": 3000000000,
+    "extents": 2,
+    "bytes": 12288
+  }
+}
