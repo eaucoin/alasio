@@ -22,8 +22,8 @@ const PREFIX = "main/fs-abc/layers/";
 const KEY = `${PREFIX}${"a".repeat(64)}/pages.img`;
 const EMPTY = createHash("sha256").update("").digest("hex");
 
-/** How long a proxy's tokens and quiet last, unless told: as the proxy has them; and its socket and tokens file, if any. */
-type Times = Pick<StoreProxyOptions, "preparedForMs" | "quietMs" | "socket" | "tokensFile">;
+/** How long a proxy's tokens and quiet last, and how often it keeps its tokens, unless told: as the proxy has them; and its socket and tokens file, if any. */
+type Times = Pick<StoreProxyOptions, "preparedForMs" | "quietMs" | "askedWindowMs" | "resumedCeilingMs" | "keptEveryMs" | "socket" | "tokensFile">;
 
 /** `effect` with a proxy of a fake bucket holding KEY, of `times`, run to its end; what it logs, put in `logged`. */
 function withProxy<A>(effect: (context: { readonly proxy: StoreProxy; readonly s3: FakeS3 }) => Effect.Effect<A, unknown, Scope.Scope>, times: Times = {}, logged: string[] = []): Promise<A> {
@@ -206,6 +206,98 @@ test("a token lasts as long as a restore takes to its resume, and from its resum
       proxy.resumed("main/fs-none", 1000);
       assert.equal(proxy.reading(), 0);
     }), { preparedForMs: 300 }));
+
+test("a resumed token lasts while its restore keeps asking, through a bucket away for ten times its window, failing or not answering; once it asks no more, a window later it ends", () =>
+  withProxy(({ proxy, s3 }) =>
+    Effect.gen(function*() {
+      const status = (token: StoreToken, through = proxy) => Effect.promise(() => ask(through.endpoint, `/snapshots/${KEY}`, { token })).pipe(Effect.map(refusal));
+      const token = minted(proxy);
+      proxy.resumed("main/fs-abc", 100);
+      // The bucket failing every read for ten windows, its restore asking again every 50 ms,
+      // as its gofer does: each answered as the bucket answers, the token lasting.
+      s3.refuse = (method) => (method === "GET" ? 503 : null);
+      for (const startedAt = Date.now(); Date.now() - startedAt < 2000;) {
+        assert.equal(yield* status(token), "503 InternalError");
+        yield* sleep(50);
+      }
+      // Back, it reads.
+      s3.refuse = () => null;
+      assert.equal(yield* status(token), "200 ");
+      // Asked no more, it ends a window after its last request.
+      yield* sleep(100);
+      assert.equal(yield* status(token), "200 ");
+      yield* sleep(300);
+      assert.equal(yield* status(token), "403 AccessDenied");
+      // A bucket that does not answer at all, likewise.
+      yield* Effect.scoped(Effect.gen(function*() {
+        const away = yield* makeStoreProxy({ store: { endpoint: "http://127.0.0.1:1", region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, askedWindowMs: 200 });
+        const unanswered = away.mint("main/fs-abc", PREFIX);
+        assert.ok(unanswered);
+        away.resumed("main/fs-abc", 100);
+        for (const startedAt = Date.now(); Date.now() - startedAt < 2000;) {
+          assert.equal(yield* status(unanswered, away), "502 BadGateway");
+          yield* sleep(50);
+        }
+        yield* sleep(300);
+        assert.equal(yield* status(unanswered, away), "403 AccessDenied");
+      }));
+      // Never resumed, its requests lengthen it not: it ends as a prepare's does.
+      const prepared = minted(proxy, "main/fs-prepared");
+      for (let asked = 0; asked < 4; asked++) {
+        yield* status(prepared);
+        yield* sleep(100);
+      }
+      assert.equal(yield* status(prepared), "403 AccessDenied");
+    }), { askedWindowMs: 200, preparedForMs: 300 }));
+
+test("a resumed token ends at its ceiling from its resume, however its restore keeps asking", () =>
+  withProxy(({ proxy }) =>
+    Effect.gen(function*() {
+      const token = minted(proxy);
+      proxy.resumed("main/fs-abc", 100);
+      const startedAt = Date.now();
+      let refused = 0;
+      while (refused === 0 && Date.now() - startedAt < 3000) {
+        const said = refusal(yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token })));
+        if (said !== "200 ") refused = Date.now() - startedAt;
+        yield* sleep(50);
+      }
+      assert.ok(refused >= 1000 && refused < 1400, `refused ${refused} ms after its resume`);
+    }), { askedWindowMs: 200, resumedCeilingMs: 1000 }));
+
+test("a proxy that starts again takes back the time its tokens' requests lengthened, kept at most every so often", () =>
+  withDirectory(async (directory) => {
+    const tokensFile = join(directory, "node-agent", "tokens.json");
+    const status = (proxy: StoreProxy, token: StoreToken) => Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token })).pipe(Effect.map(refusal));
+    const until = () => (JSON.parse(readFileSync(tokensFile, "utf8")) as { tokens: { until: number }[] }).tokens[0]?.until ?? 0;
+    const token = await withProxy(({ proxy }) =>
+      Effect.gen(function*() {
+        const token = minted(proxy, "main/fs-a", "socket");
+        proxy.resumed("main/fs-a", 100);
+        const resumedUntil = until();
+        // Asked of, its lengthened time kept.
+        assert.equal(yield* status(proxy, token), "200 ");
+        const asked = until();
+        assert.ok(asked >= resumedUntil + 50_000, `${asked} kept, ${resumedUntil} on its resume`);
+        return token;
+      }), { tokensFile, askedWindowMs: 60_000, keptEveryMs: 0 });
+    // Past its resume's time, taken back, it reads, as its requests lengthened it.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await withProxy(({ proxy }) => Effect.gen(function*() {
+      assert.equal(yield* status(proxy, token), "200 ");
+    }), { tokensFile });
+    // Written at most every keptEveryMs: a request within it lengthens the token, not the file.
+    await withProxy(({ proxy }) =>
+      Effect.gen(function*() {
+        const again = minted(proxy, "main/fs-b", "socket");
+        proxy.resumed("main/fs-b", 100);
+        const written = readFileSync(tokensFile, "utf8");
+        assert.equal(yield* status(proxy, again), "200 ");
+        assert.equal(readFileSync(tokensFile, "utf8"), written);
+        yield* sleep(300);
+        assert.equal(yield* status(proxy, again), "200 ");
+      }), { tokensFile, askedWindowMs: 60_000, keptEveryMs: 60_000 });
+  }));
 
 test("a proxy that drains mints no token, and ends once no restore reads through it: none prepared and not yet resumed, none whose read is under way, none resumed whose reads have been quiet for less than its quiet", () =>
   withProxy(({ proxy, s3 }) =>
