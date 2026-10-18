@@ -383,16 +383,19 @@ const Sessions = Schema.Struct({
   receiver: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "256Mi" } }) }), {}),
 });
 
+/** The bayma the host profile's folder instances run, as this release pins it. */
+export const HOST_BAYMA_IMAGE = {
+  repository: "ghcr.io/eaucoin/bayma",
+  tag: "0.14.3",
+  digest: "sha256:add3c8ad2024f5dad077d2deac67fcda911722eee75be866946d17b17dd31be7",
+} as const;
+
 const Host = Schema.Struct({
   /** The host profile: folder workspaces on the machine's own files. Privileged, for a single-node cluster the operator owns. */
   enabled: defaulted(Schema.Boolean, false),
   namespace: defaulted(Namespace, "alasio-host"),
   createNamespace: defaulted(Schema.Boolean, true),
-  baymaImage: Image({
-    repository: "ghcr.io/eaucoin/bayma",
-    tag: "0.14.3",
-    digest: "sha256:add3c8ad2024f5dad077d2deac67fcda911722eee75be866946d17b17dd31be7",
-  }),
+  baymaImage: Image(HOST_BAYMA_IMAGE),
   /** The operator's user and home, which alasio and each folder's bayma run as and in. */
   uid: defaulted(Id, 1000),
   gid: defaulted(Id, 1000),

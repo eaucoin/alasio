@@ -27,6 +27,7 @@ import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Node, 
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
+import type { KindName } from "../../cli/src/kube/api.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
@@ -42,6 +43,7 @@ import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER } from "./codex-stand-in.ts";
 import { bindBranchSession, bindInBranch, mainSandboxService, sandboxService, serviceLogs, servesBranch } from "./sandbox-service.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
+import type { FolderReplsRead, FolderReplsSet } from "./folder-repl.ts";
 import {
   AGENTS,
   alasio,
@@ -67,6 +69,7 @@ import {
   KEEP,
   kube,
   lakeQuery,
+  mainKeyToken,
   mainToken,
   nodeAgents,
   onNode,
@@ -100,6 +103,26 @@ interface Sandbox extends KubernetesObject {
 }
 /** The annotation of such a Sandbox, suspended, naming the snapshot it was saved into. */
 const SNAPSHOT_ANNOTATION = "alasio.dev/snapshot";
+/** A folder conversation's bayma's Sandbox of the release upgraded from: its pod template, which its bayma's state directory is an argument of. */
+interface FolderSandbox extends Sandbox {
+  readonly spec: { readonly podTemplate: V1PodTemplateSpec };
+}
+/**
+ * What of the release upgraded from's this release has no use for, which the cut-over
+ * removes, by kind, name and namespace: agent-sandbox's controller and CRD, alasio's templates
+ * of its Sandboxes, its role and network policy in the folders' namespace, and its admission
+ * policies of Sandboxes and their Secrets.
+ */
+const PREVIOUS_ONLY: readonly (readonly [KindName, string, string?])[] = [
+  ["CustomResourceDefinition", "sandboxes.agents.x-k8s.io"],
+  ["Deployment", "alasio-agent-sandbox-controller", "alasio"],
+  ["ClusterRole", "alasio-agent-sandbox-controller"],
+  ["ConfigMap", "alasio-sandbox-templates", "alasio"],
+  ["Role", "alasio", "alasio-host"],
+  ["NetworkPolicy", "bayma-from-alasio", "alasio-host"],
+  ["ValidatingAdmissionPolicy", "alasio-sandboxes"],
+  ["ValidatingAdmissionPolicy", "alasio-secrets"],
+];
 const HOST_NAMESPACE = "alasio-host";
 
 // What the cluster was doing is said as something of the run fails, while the cluster is
@@ -257,6 +280,10 @@ if (inShard("upgrade")) {
     /** The files of the cut-over's record, which its markers are among. */
     const recorded = async () => (await inCutOverRecord("ls -1")).split("\n").filter(Boolean);
 
+    /** The folder chat's bayma's Sandbox, on the release before: its name, the key of its folder instance on this release, and its state directory. */
+    let folderBayma: { readonly name: string; readonly key: string; readonly state: string };
+    /** The folder chat's REPL sessions in its bayma. */
+    let folderRepls: FolderReplsSet;
     let volumeId: string;
     /** The folder mounted in the other chat, and what it holds. */
     let folder: string;
@@ -340,6 +367,53 @@ if (inShard("upgrade")) {
           await tg.waitFor((call) => answered(call, FOLDER_CHAT));
           assert.equal(readFileSync(`${folder}/proof`, "utf8"), "written by main");
           assert.ok(Number(await onDatabase(NAMESPACE, "select count(*) from state.messages")) > messages);
+        },
+      },
+      {
+        seeds: "the folder conversation's REPL sessions live in its bayma's Sandbox, a Python one counting in a thread of its own, and a Bun one",
+        seed: async () => {
+          const [sandbox, ...others] = (await kube.list<FolderSandbox>("Sandbox", { namespace: HOST_NAMESPACE })).filter(({ metadata }) => metadata.labels?.["alasio.dev/workload"] === "folder");
+          assert.ok(sandbox && others.length === 0, "the folder chat's bayma is one Sandbox");
+          const args = sandbox.spec.podTemplate.spec?.containers.find(({ name }) => name === "bayma")?.args ?? [];
+          folderBayma = {
+            name: sandbox.metadata.name ?? "",
+            key: `folder:${sandbox.spec.podTemplate.metadata?.labels?.["alasio.dev/harness"]}:${sandbox.metadata.annotations?.["alasio.dev/conversation"]}`,
+            state: args[args.indexOf("--state-dir") + 1] ?? "",
+          };
+          assert.match(folderBayma.key, new RegExp(`^folder:[a-z]+:telegram:${FOLDER_CHAT}$`, "u"));
+          const token = await kube.secret(HOST_NAMESPACE, `${folderBayma.name}-bayma-token`, "token");
+          folderRepls = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", `http://${folderBayma.name}.${HOST_NAMESPACE}.svc:7290/mcp`, token, `kept by ${folderBayma.name}`);
+          assert.ok(folderRepls.count > 0, JSON.stringify(folderRepls));
+        },
+        keeps: "the folder conversation's REPL sessions, each back whole in the gateway's folder instance of the conversation, on its bayma's state directory, left in place",
+        check: async () => {
+          const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), folderRepls.python, folderRepls.bun);
+          const kept = `kept by ${folderBayma.name}`;
+          assert.deepEqual([seen.python.kept, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, true, kept, kept], JSON.stringify(seen));
+          assert.ok((seen.python.count ?? 0) > folderRepls.count, `the count went on from ${folderRepls.count}: ${JSON.stringify(seen)}`);
+          for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
+          // The gateway's pod of the folder pool, bound to the conversation's key, on the state directory the Sandbox's bayma had.
+          const [instance, ...others] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+          assert.deepEqual(others, []);
+          assert.equal(instance?.metadata?.annotations?.["alasio.dev/binding-key"], folderBayma.key);
+          const args = instance?.spec?.containers.find(({ name }) => name === "bayma")?.args ?? [];
+          assert.equal(args[args.indexOf("--state-dir") + 1], folderBayma.state);
+        },
+      },
+      {
+        seeds: "agent-sandbox, the folder's bayma's Sandbox, alasio's templates of it, its role and network policy in the folders' namespace, its policies of Sandboxes and their Secrets, and the configuration sizing agent-sandbox",
+        seed: async () => {
+          const named = async (kind: KindName, name: string, namespace?: string) => (await kube.get(ref(kind, name, namespace))) !== null;
+          assert.deepEqual(await Promise.all(PREVIOUS_ONLY.map(([kind, name, namespace]) => named(kind, name, namespace))), PREVIOUS_ONLY.map(() => true));
+          assert.ok("agentSandbox" in (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: object }).install);
+        },
+        keeps: "none of them: the cut-over removed each, and the configuration's agent-sandbox, which the release runs none of",
+        check: async () => {
+          const named = async (kind: KindName, name: string, namespace?: string) => (await kube.get(ref(kind, name, namespace))) !== null;
+          assert.deepEqual(await Promise.all(PREVIOUS_ONLY.map(([kind, name, namespace]) => named(kind, name, namespace))), PREVIOUS_ONLY.map(() => false));
+          assert.ok(!("agentSandbox" in (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: object }).install));
+          // The folder's state directory, as its bayma left it, which the folder instance runs on.
+          assert.ok(existsSync(folderBayma.state), folderBayma.state);
         },
       },
       {
@@ -483,8 +557,10 @@ if (inShard("upgrade")) {
       const generation = await alasioGeneration();
       const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
       assert.notEqual(failed.code, 0, failed.stdout);
-      assert.match(failed.stderr, /deleting the log's StatefulSet, its pod and claim kept[^]*checking that the upgrade can run [^\n]*\n[^]*FAILED: a failure injected before the point of no return\n[^\n]* making the log's StatefulSet again, as [^\n]* had it\n$/u);
+      assert.match(failed.stderr, /deleting the log's StatefulSet, its pod and claim kept[^]*checking that the upgrade can run [^\n]*\n[^]*FAILED: a failure injected before the point of no return\n[^\n]* making the log's StatefulSet again, as [^\n]* had it\n[^\n]* putting install\.agentSandbox back in [^\n]*, as [^\n]* had it\n$/u);
       assert.ok(!(await recorded()).includes("point-of-no-return"));
+      // The configuration as the release before reads it, its agent-sandbox's sizing put back.
+      assert.ok("agentSandbox" in (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: object }).install);
       // Made again as the release before had it, its pod and claim taken back as they were.
       const [statefulSet, pod, claim] = await logHeld();
       assert.ok(statefulSet && statefulSet !== logBefore[0], "the log's StatefulSet is not made again");
@@ -524,13 +600,14 @@ if (inShard("upgrade")) {
       const again = await cutOver();
       assert.equal(again.code, 0, `${again.stdout}${again.stderr}`);
       assert.doesNotMatch(again.stderr, /checking that|upgrading, from the cut-over begun at /u);
-      assert.match(again.stderr, /upgraded at \S+\n[^\n]* through\n$/u);
+      assert.match(again.stderr, /upgraded at \S+\n[^\n]* removing what of [^\n]* this release has no use for[^\n]*\n[^\n]* through\n$/u);
       assert.equal(await alasioGeneration(), generation);
       upgraded = Date.now();
     });
 
     test(`upgraded: main's session restored from the snapshot it was released into on ${PREVIOUS}, with its REPL whole`, { timeout: 30 * 60_000 }, async () => {
-      assert.equal((await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS)))?.metadata.annotations?.[SNAPSHOT_ANNOTATION], releasedAs);
+      // Its Sandbox gone with agent-sandbox, the snapshot it was released into its workspace's last.
+      assert.equal((await snapshotOf(volumeId))?.snapshot, releasedAs);
       await tg.say("from the snapshot");
       await tg.waitFor((call) => answered(call));
       const seen = await repl.read(volumeId, releasedRepl);
@@ -683,7 +760,7 @@ if (inShard("sessions")) {
       const [instance, ...others] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
       assert.deepEqual(others, []);
       assert.match(instance?.metadata?.name ?? "", /^bayma-[0-9a-f]{16}-[0-9a-z]{5}$/u);
-      assert.equal(instance?.metadata?.annotations?.["alasio.dev/key"], "folder:claude:e2e:folder");
+      assert.equal(instance?.metadata?.annotations?.["alasio.dev/binding-key"], "folder:claude:e2e:folder");
       assert.equal(instance?.spec?.restartPolicy, "Never");
       assert.match(instance?.spec?.containers[0]?.args?.join(" ") ?? "", /--state-dir \/\S+\/claude\/e2e-folder$/u);
       // The operator's home is the machine's, shared between alasio and the folder's bayma.
@@ -936,6 +1013,10 @@ const repl = {
 /** What bayma tells the first exec of a session that came back whole with its sandbox, and of one that came back from its checkpoint. */
 const CAME_BACK_WHOLE = /^bayma: this session came back whole with bayma's sandbox, restored from a snapshot taken at /u;
 const CAME_BACK_FROM_CHECKPOINT = /^bayma: this session came back from its checkpoint /u;
+/** What bayma tells the first exec of a folder's session that came back whole, its processes restored as they were. */
+const FOLDER_CAME_BACK_WHOLE = /^bayma: this session came back whole/u;
+/** The sandbox gateway's MCP endpoint, as alasio reaches it from its pod. */
+const GATEWAY_MCP = `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`;
 
 /**
  * Waits until the sandbox gateway has released the session, last used at `since`: no pod

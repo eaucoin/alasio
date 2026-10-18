@@ -65,6 +65,7 @@ import { subnetAddress } from "../../cli/src/cluster/docker.ts";
 import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "../../cli/src/kube/api.ts";
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
+import { HOST_BAYMA_IMAGE } from "../../cli/src/manifests/config.ts";
 import { COMPONENTS as OBJECT_STORE_COMPONENTS } from "../../cli/src/manifests/object-store.ts";
 import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { BINDING_LABEL, environmentKey, keyHash } from "../../src/binder/names.ts";
@@ -476,6 +477,12 @@ export async function mainToken(workspace: string, mode: SessionMode = sessionMo
   return mintToken(environmentKey(Buffer.from(callerKey), "main"), { key: sessionKey(workspace), expires: Date.now() + 600_000, options: { environment: "main", mode } });
 }
 
+/** A caller's token of main's environment for `key`, good for ten minutes, as main's alasio signs one: of a folder conversation's instance, say. */
+export async function mainKeyToken(key: string): Promise<string> {
+  const callerKey = await kube.secret(NAMESPACE, GATEWAY, "caller-key");
+  return mintToken(environmentKey(Buffer.from(callerKey), "main"), { key, expires: Date.now() + 600_000, options: { environment: "main" } });
+}
+
 /** What the gateway answers `method path` with, asked as alasio asks it, from its pod, with `token`, `body` sent as it is: its status, and what it said. */
 export async function gatewayCall(token: string, method: string, path: string, body?: string, { bind = true } = {}): Promise<{ readonly status: number; readonly said: string }> {
   const alasioPod = await kube.runningPod(NAMESPACE, RELEASE);
@@ -620,7 +627,10 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       resources: { requests: { cpu: "50m", memory: "256Mi" } },
       ...on("agent-1"),
     },
-    host: { resources: { requests: { cpu: "20m", memory: "128Mi" } } },
+    // The release before's folders running this release's bayma, as the box's do, so their REPLs
+    // come back whole across the upgrade; and the release before's agent-sandbox sized, as the
+    // box's configuration may say, which the cut-over removes.
+    host: { resources: { requests: { cpu: "20m", memory: "128Mi" } }, ...(of === "previous" ? { baymaImage: HOST_BAYMA_IMAGE } : {}) },
     sessions: {
       storage: { size: "1Gi" },
       // The snapshots shard's sessions hold a REPL of BIG_REPL_MEBIBYTES live, with room for bayma and gVisor.
@@ -693,7 +703,7 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
     grafana: { ...(inShard("scaling") ? { scaling: { min: 2, max: 2 } } : {}), resources: { requests: { cpu: "40m", memory: "192Mi" } } },
     // JuiceFS's metadata dumped as often as it allows, so one lands within the run.
     workspaceStorage: { backupInterval: "5m" },
-    agentSandbox: { resources: { requests: { cpu: "10m", memory: "32Mi" } } },
+    ...(of === "previous" ? { agentSandbox: { resources: { requests: { cpu: "10m", memory: "32Mi" } } } } : {}),
   };
 }
 
@@ -875,7 +885,7 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
   ].join(" && ");
   const out = cutOverRecord();
   console.error(`# the cut-over from ${PREVIOUS}: upgrades/from-${PREVIOUS}.sh, recording in ${out}`);
-  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `OUT=${out}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
+  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `OUT=${out}`, `CONFIG=${join(configHome, "alasio", "config.json")}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
     stdio: ["ignore", "pipe", "pipe"],
   }));
   if (ran.code === 0) current().bin = release;
