@@ -64,7 +64,8 @@ await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestIn
 try {
   if (verb === "set") {
     const value = JSON.stringify(rest[0]);
-    const { session: python } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "python", title: "e2e" });
+    // In a directory every bayma's pod has, of the operator's or of a session.
+    const { session: python } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "python", title: "e2e", cwd: "/tmp" });
     const counted = await exec(client, python.session_id, [
       "import threading, time",
       `kept = ${value}`,
@@ -78,7 +79,7 @@ try {
       "time.sleep(1)",
       'print(state["count"])',
     ].join("\n"));
-    const { session: bun } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "bun", title: "e2e" });
+    const { session: bun } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "bun", title: "e2e", cwd: "/tmp" });
     await exec(client, bun.session_id, `globalThis.kept = ${value}; $checkpoint = { kept: ${value} }; console.log("set")`);
     // Let go of, so the next client takes them over at once.
     for (const session of [python, bun]) await call(client, "session.release_controller", { session_id: session.session_id });

@@ -856,8 +856,9 @@ if (inShard("sessions")) {
       await inSession(full, `require("fs").writeFileSync("/workspace/shown.png", Buffer.from(${JSON.stringify(png)}, "base64"))`);
       await tg.calls();
       await tg.say("show /workspace/shown.png");
-      const photo = await tg.waitFor((call) => call.method === "sendPhoto");
-      assert.ok(Number(photo.payload.multipartBytes ?? 0) >= Buffer.from(png, "base64").length, JSON.stringify(photo.payload));
+      // The reply as a rich message, its image uploaded with it.
+      const shown = await tg.waitFor((call) => call.method === "sendRichMessage" && Number(call.payload.multipartBytes ?? 0) > 0);
+      assert.ok(Number(shown.payload.multipartBytes) >= Buffer.from(png, "base64").length, JSON.stringify(shown.payload));
     });
 
     test("alasio comes back from alasio restart with its conversation's workspace", async () => {
