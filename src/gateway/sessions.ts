@@ -187,7 +187,9 @@ export const makeSessions = Effect.fnUntraced(function*(
         make: restoring.make,
         // Released as it is when idle: saved whole first, then detached, then deleted.
         release: ({ pod }) => endAndDetach(pool, volumeId, pod).pipe(Effect.tap(() => released(pool, "asked"))),
-        // Its workspace attached, its binding's token beside it, on which its bayma starts.
+        // Its workspace attached, its binding's token beside it, on which its bayma starts; what
+        // was attached into one whose readying failed, which the binder deletes, detached once its
+        // containers stopped, its directory with it.
         prepare: (got, binding) =>
           restoring.ready(got, (pod) =>
             Effect.gen(function*() {
@@ -199,8 +201,25 @@ export const makeSessions = Effect.fnUntraced(function*(
                 token: bindingToken(bindingKey, { key, binding, namespace: environment.namespace }),
                 env,
               })).pipe(Effect.mapError((error) => new BindStepFailed({ reason: error.message })));
-            })),
+            })).pipe(Effect.tapError(() => unready(pool, got))),
       };
+    });
+
+  /**
+   * Detaches, in the background, what was attached into `got`, a pod of `pool` whose readying
+   * failed, which its binder deletes: once its containers have stopped, on its node, its
+   * directory there with it, as one that never ran has one kubelet made.
+   */
+  const unready = (pool: Pool, got: V1Pod): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      const name = got.metadata?.name ?? "";
+      const latest = ((yield* kube.read("v1", "Pod", pool.namespace, name).pipe(Effect.orElseSucceed(() => null))) as V1Pod | null) ?? got;
+      const node = latest.spec?.nodeName;
+      if (!node) return;
+      yield* Effect.forkDetach(Effect.gen(function*() {
+        yield* stopped(pool, name);
+        yield* timed(detachDuration, pool, agents.detach(node, name, containerIdsOf(latest)));
+      }).pipe(Effect.catch((error) => Effect.logWarning(`could not detach what was attached into ${pool.namespace}/${name}, whose readying failed: ${error.message}`))));
     });
 
   /** Waits until `name`'s containers have all stopped, or it is gone. */

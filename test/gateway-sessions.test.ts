@@ -208,6 +208,26 @@ test("a session's workspace is placed in its environment's pool of its internet,
   assert.deepEqual(attach?.env, { OTEL_TRACES_EXPORTER: "otlp", OTEL_EXPORTER_OTLP_ENDPOINT: `http://${(await lookup("localhost")).address}:4318` });
 });
 
+test("a pod whose readying failed, its workspace not attached, is detached once its binder deleted it and its containers stopped, its directory on its node with it", async () => {
+  const env = await environment(2);
+  const recorded = agents();
+  let fails = true;
+  const failing: NodeAgents = {
+    ...recorded.agents,
+    attach: (node, request) => (fails ? ((fails = false), Effect.fail(new NodeAgentError({ node, call: "attach", status: 503, reason: "workspace storage is not mounted" }))) : recorded.agents.attach(node, request)),
+  };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), failing);
+  const key = sessionKey("fs-unready");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const failed = await Effect.runPromise(Effect.result(binder.bind(placement.pool, key, placement)));
+  assert.equal(failed._tag, "Failure");
+  // Deleted by its binder, it ends, as kubelet would end it.
+  const [name] = ((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "")))) as V1Pod[]).filter(({ metadata }) => metadata?.deletionTimestamp).map(({ metadata }) => metadata?.name ?? "");
+  assert.ok(name, "no pod was deleted");
+  await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-x", state: { terminated: { exitCode: 0 } } }] } })));
+  for (const deadline = Date.now() + 10_000; !recorded.asked.includes(`detach node-a ${name}`); await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, recorded.asked.join("\n"));
+});
+
 test("a bound pod whose bayma runs an exec is kept, and its bayma asked again only once its poll comes round, with its binding's token", async () => {
   const env = await environment(2);
   const stand = await bayma();
