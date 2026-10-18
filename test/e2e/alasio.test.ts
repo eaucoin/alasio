@@ -1735,9 +1735,12 @@ if (inShard("workspaces")) {
           if (other === node) continue;
           assert.doesNotMatch(await fromNode(other, address), /HTTP\/1\.1 \d+/u, `${other} reached ${node}'s agent's proxy`);
         }
-        // A pod, alasio's, which reaches the agent's own API: not its proxy.
+        // The gateway's pod, which reaches the agent's own API: not its proxy; and alasio's, neither.
+        const fromGateway = async (port: number) =>
+          (await kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, componentName("sandbox-gateway")), ["node", "-e", tcp(JSON.stringify(address), port)], { container: "sandbox-gateway" })).trim();
+        assert.equal(await fromGateway(STORE_PROXY_PORT), "blocked", `the gateway's pod reached ${node}'s agent's proxy`);
+        assert.equal(await fromGateway(NODE_AGENT_PORT), "open", `the gateway's pod did not reach ${node}'s agent`);
         assert.equal((await inAlasioContainer(["node", "-e", tcp(JSON.stringify(address), STORE_PROXY_PORT)])).trim(), "blocked", `alasio's pod reached ${node}'s agent's proxy`);
-        assert.equal((await inAlasioContainer(["node", "-e", tcp(JSON.stringify(address), NODE_AGENT_PORT)])).trim(), "open");
         // Nor a session's, which a restore from the bucket runs in.
         assert.equal((await inSession(session, tcp(JSON.stringify(address), STORE_PROXY_PORT))).trim(), "blocked", `the session ${session} reached ${node}'s agent's proxy`);
       }
