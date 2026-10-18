@@ -266,6 +266,32 @@ if (inShard("upgrade")) {
       (await kube.get(ref("PersistentVolumeClaim", `data-${componentName("log")}-0`, NAMESPACE)))?.metadata?.uid,
     ];
     let logBefore: (string | undefined)[];
+    /**
+     * What the log's node is, as told for a failure: its containers' commands, environment and
+     * mounts, as its pod's spec has them; its volume's meta.properties and metadata log; its
+     * configuration's identity; the hash of the admin password it runs with, of its base64 as
+     * stackSecrets hashes the log's Secret's; and the SCRAM credentials its metadata log holds.
+     */
+    const logIdentity = async (when: string) => {
+      const name = `${componentName("log")}-0`;
+      const pod = await kube.get<V1Pod>(ref("Pod", name, NAMESPACE));
+      const containers = [...(pod?.spec?.initContainers ?? []), ...(pod?.spec?.containers ?? [])].map(({ name: container, image, command, args, env, volumeMounts }) => ({
+        container,
+        image,
+        command,
+        args,
+        env: env?.map(({ name: variable, value, valueFrom }) => `${variable}=${value ?? JSON.stringify(valueFrom)}`),
+        mounts: volumeMounts?.map(({ name: volume, mountPath, subPath }) => `${volume}:${mountPath}${subPath ? `:${subPath}` : ""}`),
+      }));
+      const inside = await kube.execOk(NAMESPACE, name, ["sh", "-c", [
+        "printf 'admin password %s\\n' \"$(printf %s \"$LOG_ADMIN_PASSWORD\" | base64 -w0 | sha256sum | cut -c1-12)\"",
+        "grep -E '^(node.id|controller.quorum.voters|advertised.listeners|log.dirs|metadata.log.dir|process.roles)=' /tmp/server.properties",
+        "cat /data/log/meta.properties",
+        "ls -la /data/log /data/log/__cluster_metadata-0",
+        "for each in /data/log/__cluster_metadata-0/*.checkpoint /data/log/__cluster_metadata-0/*.log; do echo \"== $each\"; KAFKA_HEAP_OPTS=-Xmx128m /opt/kafka/bin/kafka-metadata-shell.sh --snapshot \"$each\" find /image/scram 2>&1 | tail -n 20; done",
+      ].join("; ")], { container: "log" }).catch((error: unknown) => `could not be read: ${String(error)}`);
+      console.error(`# the log's node ${when}: pod ${pod?.metadata?.uid}, its Secret's ${JSON.stringify((await stackSecrets()).log)}, ${JSON.stringify(containers)}\n${inside}`);
+    };
     /** The stack's secrets, as the root Secret's secrets.json and the log's Secret keep them: each key's value's hash, none of the values. */
     const stackSecrets = async () => {
       const hash = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 12);
@@ -277,6 +303,12 @@ if (inShard("upgrade")) {
       };
     };
     let secretsBefore: Awaited<ReturnType<typeof stackSecrets>>;
+    /** The keys of the stack's secrets whose values differ from those it had before the cut-over. */
+    const secretsChanged = async () => {
+      const after = await stackSecrets();
+      const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => [...new Set([...Object.keys(before), ...Object.keys(now)])].filter((key) => before[key] !== now[key]);
+      return { root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) };
+    };
     /** When the telemetry the lake held was counted, and how many of alasio's spans it held then; and when the cut-over was through. */
     let counted: number;
     let spans: number;
@@ -352,15 +384,14 @@ if (inShard("upgrade")) {
         },
         keeps: "the stack's secrets, each kept, the log's credentials as its nodes were formatted with",
         check: async () => {
-          const after = await stackSecrets();
-          const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
-          assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
+          assert.deepEqual(await secretsChanged(), { root: [], log: [] });
         },
       },
       {
         seeds: "the log on its claim, its StatefulSet's claims labelled with its version",
         seed: async () => {
           logBefore = await logHeld();
+          await logIdentity(`on ${PREVIOUS}`);
           assert.ok(logBefore.every(Boolean), JSON.stringify(logBefore));
           const statefulSet = await kube.get<V1StatefulSet>(ref("StatefulSet", componentName("log"), NAMESPACE));
           assert.equal(statefulSet?.spec?.volumeClaimTemplates?.[0]?.metadata?.labels?.["app.kubernetes.io/version"], PREVIOUS);
@@ -488,6 +519,10 @@ if (inShard("upgrade")) {
       assert.ok(marks.includes("point-of-no-return") && !marks.includes("upgraded"), marks.join(", "));
       // Failing once the upgrade is through, which it records.
       const through = await cutOver({ failAt: "after-the-upgrade" });
+      if (!/FAILED: a failure injected once the upgrade was through\n$/u.test(through.stderr)) {
+        await logIdentity("after the upgrade failed");
+        console.error(`# the upgrade failed; the stack's secrets changed: ${JSON.stringify(await secretsChanged())}; the log's StatefulSet, pod and claim ${JSON.stringify(await logHeld())}, ${JSON.stringify(logBefore)} before`);
+      }
       assert.notEqual(through.code, 0, through.stdout);
       assert.doesNotMatch(through.stderr, /checking that no branch environment exists|checking that the upgrade can run/u);
       assert.match(through.stderr, /upgrading, from the cut-over begun at [^]*FAILED: a failure injected once the upgrade was through\n$/u);
