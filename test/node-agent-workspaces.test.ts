@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -174,6 +174,32 @@ test("an attach into a pod's directory kubelet has not made, or that is no direc
     symlinkSync(join(at.attachRoot, "pool-1"), join(at.attachRoot, "pool-2"));
     assert.equal(await refusal(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-2", "t", {})), 404);
     assert.deepEqual([at.mounts, existsSync(join(at.attachRoot, "pool-1", "token"))], [[], false]);
+  } finally {
+    at.done();
+  }
+});
+
+test("a detach whose unmount did not take removes nothing of the pod's directory, the workspace's files beneath it whole; and one that did leaves what no attach wrote there, and the directory with it", async () => {
+  const at = workspacesNode();
+  try {
+    at.files("fs-abc123");
+    at.pod("pool-0");
+    await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-0", "t", {}));
+    // The workspace's files, as the pod's directory shows them through its mount.
+    const ws = join(at.attachRoot, "pool-0", "ws");
+    mkdirSync(join(ws, "workspace"), { recursive: true });
+    writeFileSync(join(ws, "workspace", "precious"), "the user's");
+    at.stuck.add(ws);
+    assert.equal(await refusal(at.workspaces.detach("pool-0", [])), 409);
+    assert.equal(readFileSync(join(ws, "workspace", "precious"), "utf8"), "the user's");
+    assert.ok(existsSync(join(at.attachRoot, "pool-0", "token")));
+    // Unmounted at last: what the attach wrote removed, what it did not left, and said.
+    at.stuck.clear();
+    rmSync(join(ws, "workspace"), { recursive: true });
+    writeFileSync(join(at.attachRoot, "pool-0", "stray"), "no attach wrote this");
+    await Effect.runPromise(at.workspaces.detach("pool-0", []));
+    assert.deepEqual(readdirSync(join(at.attachRoot, "pool-0")), ["stray"]);
+    assert.equal(readFileSync(join(at.attachRoot, "pool-0", "stray"), "utf8"), "no attach wrote this");
   } finally {
     at.done();
   }

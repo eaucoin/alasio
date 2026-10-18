@@ -18,6 +18,10 @@
  * checkpoint ended it, or its containers stopped), each mount under its directory is
  * unmounted lazily, as the sandbox's gofer keeps them busy to the last, then the directory is
  * removed, so its pod can be deleted: kubelet deletes no pod whose directory holds a mount.
+ * Nothing is removed where anything is mounted at or under it still, on the node or as the
+ * agent sees it; and nothing is removed recursively, which would walk into a workspace a mount
+ * left there: what an attach wrote, then each directory by rmdir, empty, and what no attach
+ * wrote is left, and said.
  *
  * Each is made, cloned, attached and recorded in workspace storage alone: where the node's
  * mount of it is not there, as for the moment its mount's pod hands it over, the agent
@@ -46,7 +50,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { chown, lstat, mkdir, open, readdir, readFile, rename, rm, statfs, unlink, writeFile } from "node:fs/promises";
+import { chown, lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, statfs, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Effect, Schema } from "effect";
@@ -189,6 +193,36 @@ export interface WorkspacesOptions {
 }
 
 /** The agent's workspaces, as the module says. */
+/** What an attach writes into a pod's directory, beside its workspace's mount point (`ws`), and what its bayma marks there (`served`). */
+const ATTACHED_FILES: readonly string[] = ["token", "env", "served"];
+
+/** The mount points at or under `directory` as the agent's own mount namespace has them. */
+const ownMountsUnder = (directory: string): Promise<string[]> =>
+  readFile("/proc/self/mountinfo", "utf8").then(
+    (table) => mountPoints(table).filter((point) => point === directory || point.startsWith(`${directory}/`)),
+    () => [],
+  );
+
+/**
+ * Removes a pod's directory, `directory`, nothing mounted under it: what an attach wrote into
+ * it, each a file of its own, then its workspace's mount point and itself, each by rmdir, which
+ * removes only what is empty, never anything beneath; what is left, as what no attach wrote
+ * keeps one not empty, by name.
+ */
+async function removeAttached(directory: string): Promise<string[]> {
+  for (const name of ATTACHED_FILES) {
+    const path = join(directory, name);
+    if ((await lstat(path).catch(() => null))?.isFile()) await unlink(path);
+  }
+  const left: string[] = [];
+  for (const path of [join(directory, "ws"), directory]) {
+    await rmdir(path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") left.push(path);
+    });
+  }
+  return left.length === 0 ? [] : (await readdir(directory).catch(() => [] as string[])).map((name) => join(directory, name));
+}
+
 /** Linux's magic number of FUSE's file systems (statfs(2)), JuiceFS's mount's. */
 const FUSE_SUPER_MAGIC = 0x65735546;
 
@@ -342,7 +376,11 @@ export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches
         if (running.some(Boolean)) return yield* refused(409, `${pod}'s sandbox still runs: what is attached into it is detached once it can no longer act`);
         // `-l`, not `--lazy`, which the busybox of k3s's own binaries, first on the node's PATH, does not take.
         for (const point of yield* mountsUnder(directory)) yield* onNode(host, ["umount", "-l", point]);
-        yield* Effect.promise(() => rm(directory, { recursive: true, force: true }));
+        // Nothing removed where anything is mounted still, on the node or as the agent sees it, which a removal would walk into.
+        const still = [...(yield* mountsUnder(directory)), ...(yield* Effect.promise(() => ownMountsUnder(directory)))];
+        if (still.length > 0) return yield* refused(409, `${pod}'s directory holds ${[...new Set(still)].join(", ")} still, unmounted as it was: nothing of it is removed`);
+        const left = yield* Effect.promise(() => removeAttached(directory));
+        if (left.length > 0) yield* Effect.logWarning(`${pod}'s directory is left on the node, as it holds what no attach wrote: ${left.join(", ")}`);
       }),
 
     read: (ref, path, maxBytes) =>

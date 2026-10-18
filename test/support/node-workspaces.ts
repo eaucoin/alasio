@@ -19,6 +19,8 @@ export function workspacesNode() {
   const workspacesRoot = join(root, "workspaces");
   const attachRoot = join(root, "attach");
   const mounts: string[] = [];
+  // The mount points an unmount does not take, as one that did not.
+  const stuck = new Set<string>();
   const ran: string[] = [];
   // Of each mount made, whether a token was beside it already.
   const tokenAtMount: boolean[] = [];
@@ -38,7 +40,7 @@ export function workspacesNode() {
           mounts.push(args[2] ?? "");
           tokenAtMount.push(existsSync(join(args[2] ?? "", "..", "token")));
         }
-        if (name === "umount") mounts.splice(mounts.indexOf(args[1] ?? ""), 1);
+        if (name === "umount" && !stuck.has(args[1] ?? "")) mounts.splice(mounts.indexOf(args[1] ?? ""), 1);
         return { exitCode: 0, stdout: "", stderr: "" };
       }),
   };
@@ -89,6 +91,6 @@ export function workspacesNode() {
   const pod = (name: string) => mkdirSync(join(attachRoot, name), { recursive: true });
   /** What JuiceFS's command was run with, a call a line. */
   const juicefsCalls = () => (existsSync(join(root, "juicefs.log")) ? readFileSync(join(root, "juicefs.log"), "utf8").trim().split("\n") : []);
-  return { root, workspacesRoot, attachRoot, mounts, ran, tokenAtMount, running, annotations, execs, hooks, storage, unreachable, workspaces, files, pod, juicefsCalls, done: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, workspacesRoot, attachRoot, mounts, stuck, ran, tokenAtMount, running, annotations, execs, hooks, storage, unreachable, workspaces, files, pod, juicefsCalls, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 
