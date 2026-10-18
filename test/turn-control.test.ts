@@ -284,6 +284,18 @@ test("alasio starting ends a turn whose job the agent finished as the last alasi
   });
 });
 
+test("a turn that fails as it starts, after its status message is queued, ends that message saying so, and lets go of the conversation", async () => {
+  const { store, conversationId } = await conversation();
+  const failing = scriptedHarness(() => Effect.fail(new StoreError({ cause: new Error("the store is down") })));
+  await withTurns(store, failing, async (alasio, queued) => {
+    const failed = await alasio.runPromise(Effect.flip(turnOf(conversationId, "go")));
+    assert.equal(failed._tag, "StoreError");
+    assert.equal(queued.statuses.length, 1);
+    assert.deepEqual(queued.edits.map(({ edits, text }) => [edits, text]), [[queued.statuses[0]?.id, "Codex hit an error."]]);
+  });
+  assert.equal((await run(store.getTurn(conversationId)))?.outcome, "failed");
+});
+
 test("a turn's status message says what its row says it does, as the row changes, and is recorded on it", async () => {
   const { store, conversationId } = await conversation();
   const outbox = recordingOutbox();

@@ -18,6 +18,7 @@ import { Context, Effect, Layer, Option, PubSub, type Scope } from "effect";
 
 import type { ModelChoice, Mount } from "../persistence/conversation-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
+import { type ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
 import { Store, type TurnFenced } from "../persistence/store.ts";
 import { ActiveTurns, type StopReason } from "./active-turns.ts";
 import { type AttachedTurn, type Harness, type HarnessError, Harnesses, type HarnessHostError, type HarnessUnavailable, type OwnTurn, type OwnTurns, type TurnResult } from "./index.ts";
@@ -31,6 +32,8 @@ export interface TurnStart {
   readonly harness: HarnessName;
   readonly workingDirectory: string;
   readonly prompt: string;
+  /** The files the prompt names, which the host writes where its harness reads them before the turn runs. */
+  readonly fileIds: readonly string[];
   /** The session it resumes, or none for one the harness makes. */
   readonly resumeSession: string | null;
   /** The model the conversation chose for the harness with /model; null for its default. */
@@ -82,12 +85,16 @@ export class HarnessHost extends Context.Service<HarnessHost, {
   readonly reserve: (conversationId: string) => Effect.Effect<boolean, StoreError | HarnessHostError, Scope.Scope>;
   /**
    * Runs a turn to its end, its conversation busy meanwhile. It fails only as alasio's
-   * store does, with TurnFenced where another turn has claimed the conversation since, or
-   * where no harness serves it there: what else goes wrong ends up in its response.
+   * store does, with TurnFenced where another turn has claimed the conversation since,
+   * where no harness serves it there, or where the files its prompt names cannot be
+   * written: what else goes wrong ends up in its response.
    */
-  readonly startTurn: (start: TurnStart) => Effect.Effect<TurnResult, StoreError | TurnFenced | HarnessUnavailable>;
-  /** Sends the conversation's running turn more guidance: whether it took it, or none when no turn runs. */
-  readonly steer: (conversationId: string, prompt: string) => Effect.Effect<Option.Option<boolean>, HarnessError>;
+  readonly startTurn: (start: TurnStart) => Effect.Effect<TurnResult, StoreError | TurnFenced | HarnessUnavailable | ReceivedFileError>;
+  /**
+   * Sends the conversation's running turn more guidance, the files it names written first
+   * where its harness reads them: whether it took it, or none when no turn runs.
+   */
+  readonly steer: (conversationId: string, prompt: string, fileIds: readonly string[]) => Effect.Effect<Option.Option<boolean>, HarnessError | StoreError | ReceivedFileError>;
   /** Stops the conversation's running turn for `reason`, once it has let go: whether one ran; failing where a host elsewhere is not reached. */
   readonly interrupt: (conversationId: string, reason: StopReason) => Effect.Effect<boolean, HarnessHostError>;
   /** What the host says of the conversation; failing where it cannot say, a host elsewhere not reached. */
@@ -99,11 +106,12 @@ export class HarnessHost extends Context.Service<HarnessHost, {
   /** Subscribes to the host's events, for as long as the scope lasts. */
   readonly events: Effect.Effect<PubSub.Subscription<HostEvent>, never, Scope.Scope>;
 }>()("alasio/harness/HarnessHost") {
-  /** The host in alasio's process, over its harnesses and its running turns. */
-  static readonly layer: Layer.Layer<HarnessHost, never, Harnesses | ActiveTurns | Store> = Layer.effect(HarnessHost, Effect.gen(function*() {
+  /** The host in alasio's process, over its harnesses, its running turns, and the files received. */
+  static readonly layer: Layer.Layer<HarnessHost, never, Harnesses | ActiveTurns | Store | ReceivedFiles> = Layer.effect(HarnessHost, Effect.gen(function*() {
     const harnesses = yield* Harnesses;
     const activeTurns = yield* ActiveTurns;
     const store = yield* Store;
+    const receivedFiles = yield* ReceivedFiles;
     const events = yield* PubSub.unbounded<HostEvent>();
     const tell = (event: HostEvent): Effect.Effect<void> => Effect.asVoid(PubSub.publish(events, event));
 
@@ -129,6 +137,7 @@ export class HarnessHost extends Context.Service<HarnessHost, {
       startTurn: (start) =>
         Effect.gen(function*() {
           const harness = yield* harnesses.getFor(start.harness, start.workingDirectory);
+          yield* receivedFiles.materialize(start.fileIds);
           /**
            * What the job's turn records of its progress, for a restart to know what became of
            * its prompt. The turn dies on a record it cannot make: so a prompt whose dispatch is
@@ -157,7 +166,7 @@ export class HarnessHost extends Context.Service<HarnessHost, {
             onIdle: tell({ kind: "idle", conversationId: start.conversationId }),
           });
         }),
-      steer: (conversationId, prompt) => activeTurns.steer(conversationId, prompt),
+      steer: (conversationId, prompt, fileIds) => Effect.andThen(receivedFiles.materialize(fileIds), activeTurns.steer(conversationId, prompt)),
       interrupt: (conversationId, reason) => activeTurns.stop(conversationId, reason),
       status: (conversationId) =>
         Effect.gen(function*() {

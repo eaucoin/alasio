@@ -24,6 +24,7 @@ import { KubeApiError } from "../src/kube/client.ts";
 import { Store } from "../src/persistence/store.ts";
 import { SessionForkError, SessionSandboxes } from "../src/sandbox/index.ts";
 import { takeCallbackQuery } from "../src/telegram/callback-handler.ts";
+import { ReceivedFiles } from "../src/telegram/files.ts";
 import { newSchema, run, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 import { recordingOutbox, turnsStub, withServices } from "./support/turns.ts";
@@ -98,7 +99,7 @@ test("an alasio forks a session one of its conversations knows for the branch wh
       Layer.buildWithScope(Layer.mergeAll(Layer.succeed(SessionSandboxes, sandboxes), Layer.succeed(Turns, turns)).pipe(
         Layer.provideMerge(HarnessHost.layer),
         Layer.provideMerge(Harnesses.layer({})),
-        Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, Layer.succeed(Store, store))),
+        Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: "/nonexistent-state-dir" }).pipe(Layer.provideMerge(Layer.succeed(Store, store))))),
       ), scope),
     );
     const { port } = await Effect.runPromise(Effect.provide(serveBranchForks({ port: 0, host: "127.0.0.1", keyFile }), services).pipe(Scope.provide(scope)));

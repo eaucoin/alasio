@@ -7,6 +7,9 @@
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { ConfigProvider, Context, Effect, Layer } from "effect";
@@ -22,6 +25,7 @@ import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { Neon } from "../src/neon/connect.ts";
 import { LakeWake } from "../src/neon/lake-wake.ts";
 import { Store } from "../src/persistence/store.ts";
+import { ReceivedFiles } from "../src/telegram/files.ts";
 import { startPostgres } from "./support/postgres.ts";
 
 /** Runs `statements` on a connection to `url`. */
@@ -88,6 +92,8 @@ test("a turn run through the harness host as its own role writes all a turn writ
     return url.toString();
   };
   const harnessPool = new pg.Pool({ connectionString: as(HARNESS_ROLE, "harness-password") });
+  // Where the host writes the files a prompt names, as its harness reads them.
+  const stateDir = mkdtempSync(join(tmpdir(), "alasio-harness-role-"));
   try {
     await run(database.url, "create role alasio login password 'alasio-password' createrole createdb", "create database alasio owner alasio");
     const env = { ALASIO_DATABASE_URL: as("alasio", "alasio-password"), ALASIO_LAKE_VERIFIER: scramVerifier("lake-password"), ALASIO_HARNESS_VERIFIER: scramVerifier("harness-password") };
@@ -116,7 +122,7 @@ test("a turn run through the harness host as its own role writes all a turn writ
       // The host, on a store of the harness's role, of the state alasio made: it makes none of it.
       const services = yield* Layer.build(HarnessHost.layer.pipe(
         Layer.provideMerge(Harnesses.layer({ overrides: { [CODEX_HARNESS]: writingHarness(own) } })),
-        Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer)),
+        Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir }))),
         Layer.provideMerge(Store.layer({ pool: harnessPool, makesSchema: false })),
       ));
       const harness = { host: Context.get(services, HarnessHost), store: Context.get(services, Store) };
@@ -127,6 +133,7 @@ test("a turn run through the harness host as its own role writes all a turn writ
         harness: CODEX_HARNESS,
         workingDirectory: "/work",
         prompt: "go",
+        fileIds: [fileId],
         resumeSession: null,
         modelChoice: null,
         epoch,
@@ -151,8 +158,8 @@ test("a turn run through the harness host as its own role writes all a turn writ
       assert.ok(holder);
       assert.deepEqual([(yield* harness.host.status(conversationId)).busy, (yield* harness.host.status(conversationId)).held], [true, true]);
       yield* alasio.releaseHolds(holder);
-      // The files a prompt names, which it reads.
-      assert.deepEqual((yield* harness.store.getFileContents([fileId])).map(({ name }) => name), ["report.txt"]);
+      // The file the prompt named, written where its harness reads it.
+      assert.equal(readFileSync(join(stateDir, "telegram-files", fileId, "report.txt"), "utf8"), "a report");
     }).pipe(
       Effect.provideService(LakeWake, LakeWake.none),
       Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))),
@@ -182,5 +189,6 @@ test("a turn run through the harness host as its own role writes all a turn writ
   } finally {
     await harnessPool.end();
     await database.stop();
+    rmSync(stateDir, { recursive: true, force: true });
   }
 });

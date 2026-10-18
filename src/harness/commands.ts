@@ -14,7 +14,6 @@ import { Effect, Option, Result } from "effect";
 import { Turns } from "../codex/turns.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
-import { type ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
 import type { StopReason } from "./active-turns.ts";
 import { HarnessHost } from "./host.ts";
 import type { HarnessHostError } from "./index.ts";
@@ -61,16 +60,14 @@ export const stopTurnSaying = (conversationId: string, reason: StopReason): Effe
  * restart finds steering, the turn may or may not have taken: the operator is asked what
  * to do with it (Turns.reconcilePersistentState), rather than it run again or lost unsaid.
  */
-export const steerWithHeld = (conversationId: string, jobId: string): Effect.Effect<Steered, StoreError | ReceivedFileError, HarnessHost | Turns | Store | ReceivedFiles> =>
+export const steerWithHeld = (conversationId: string, jobId: string): Effect.Effect<Steered, StoreError, HarnessHost | Turns | Store> =>
   Effect.gen(function*() {
     const store = yield* Store;
     const turns = yield* Turns;
     const job = yield* store.settleHeldPromptJob(jobId, "steering");
     if (!job) return { outcome: "gone" } as const;
     const queued = turns.setPromptDisposition(job.id, "pending");
-    // The files the prompt names, written again if a restart came since.
-    yield* (yield* ReceivedFiles).materialize(job.file_ids).pipe(Effect.tapError(() => queued));
-    const steered = yield* (yield* HarnessHost).steer(conversationId, job.prompt).pipe(Effect.result);
+    const steered = yield* (yield* HarnessHost).steer(conversationId, job.prompt, job.file_ids).pipe(Effect.result);
     if (Result.isSuccess(steered) && Option.getOrElse(steered.success, () => false)) {
       yield* store.setPromptJobDisposition(job.id, "completed");
       return { outcome: "steered" } as const;
