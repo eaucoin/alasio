@@ -178,7 +178,7 @@ const Telemetry = Schema.Struct({
   headersSecret: defaulted(OptionalSecretName, ""),
   headersKey: defaulted(NonEmpty, "headers"),
   resourceAttributes: defaulted(Schema.String, ""),
-  /** The port alasio receives session sandboxes' telemetry on. */
+  /** The port the sandbox service's receiver takes session sandboxes' telemetry on. */
   receiverPort: defaulted(Schema.Int.check(Schema.isBetween({ minimum: 1024, maximum: 65535 }, { message: "must be a port from 1024 to 65535" })), 4318),
   /** How many days of telemetry the lake keeps. */
   retentionDays: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be at least 1" })), 30),

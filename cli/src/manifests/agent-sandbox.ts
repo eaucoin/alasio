@@ -29,9 +29,6 @@ export const SANDBOX_CRD: KubernetesObject = sandboxes;
 
 const NAME = `${RELEASE}-agent-sandbox-controller`;
 
-/** The user the controller asks as: its ServiceAccount's. */
-export const SANDBOX_CONTROLLER_USER = `system:serviceaccount:${NAMESPACE}:${NAME}`;
-
 /** The labels of the controller's objects: the controller's name and version, the installation, and alasio as their manager. */
 const LABELS = {
   "app.kubernetes.io/name": "agent-sandbox-controller",

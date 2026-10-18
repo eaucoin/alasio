@@ -3,7 +3,9 @@
  * server holds pods to it: a pool's pod as its ReplicaSet makes it from its template is
  * admitted, and the same pod with any field it pins changed is refused; a pod bound changes its
  * binding's labels and annotations alone; no pod gets an ephemeral container; and no pod but a
- * pool's is made in a namespace of sessions.
+ * pool's is made in a namespace of sessions. And the gateway's restores' readiness (the
+ * resumed-condition policy): it sets a restore's pod's resumed condition true, and nothing else
+ * of any pod's status.
  */
 import assert from "node:assert/strict";
 import { before, test } from "node:test";
@@ -53,21 +55,28 @@ const made = (pod: V1Pod): Promise<{ readonly name: string } | { readonly refuse
 
 let api: { readonly server: string; readonly token: string; readonly ca: Buffer };
 
-/** Whether the API server makes `pod` asked by `user`, as the administrator impersonates it: its name, or why not. */
-const madeAs = (user: string, pod: V1Pod): Promise<{ readonly name: string } | { readonly refused: string }> =>
+/** Whether the API server takes `body` at `path` by `method`, asked by `user`, as the administrator impersonates it: its name, or why not. */
+const askedAs = (user: string, method: string, path: string, type: string, body: unknown): Promise<{ readonly name: string } | { readonly refused: string }> =>
   new Promise((resolve, reject) => {
-    const url = new URL(`${api.server}/api/v1/namespaces/${pod.metadata?.namespace}/pods`);
-    const asked = request(url, { method: "POST", ca: api.ca, headers: { authorization: `Bearer ${api.token}`, "content-type": "application/json", "impersonate-user": user, "impersonate-group": "system:authenticated" } }, (response) => {
-      let body = "";
-      response.on("data", (chunk: Buffer) => (body += chunk.toString()));
+    const url = new URL(`${api.server}${path}`);
+    const asked = request(url, { method, ca: api.ca, headers: { authorization: `Bearer ${api.token}`, "content-type": type, "impersonate-user": user, "impersonate-group": "system:authenticated" } }, (response) => {
+      let text = "";
+      response.on("data", (chunk: Buffer) => (text += chunk.toString()));
       response.on("end", () => {
-        const answered = JSON.parse(body) as { metadata?: { name?: string }; message?: string };
-        resolve(response.statusCode === 201 ? { name: answered.metadata?.name ?? "" } : { refused: answered.message ?? body });
+        const answered = JSON.parse(text) as { metadata?: { name?: string }; message?: string };
+        resolve(response.statusCode !== undefined && response.statusCode < 300 ? { name: answered.metadata?.name ?? "" } : { refused: answered.message ?? text });
       });
     });
     asked.on("error", reject);
-    asked.end(JSON.stringify(pod));
+    asked.end(JSON.stringify(body));
   });
+
+/** Whether the API server makes `pod` asked by `user`: its name, or why not. */
+const madeAs = (user: string, pod: V1Pod) => askedAs(user, "POST", `/api/v1/namespaces/${pod.metadata?.namespace}/pods`, "application/json", pod);
+
+/** Whether the API server takes `patch` of the status of the pod `name` of the sessions' namespace, a strategic merge patch as the gateway's, asked by `user`. */
+const statusPatchedAs = (user: string, name: string, patch: unknown) =>
+  askedAs(user, "PATCH", `/api/v1/namespaces/${SESSIONS}/pods/${name}/status`, "application/strategic-merge-patch+json", patch);
 
 before(async () => {
   const started = await startKubeApiServer();
@@ -83,7 +92,7 @@ before(async () => {
       // The kept releases', which restores run under.
       for (const release of gvisorReleases(NODE_PINS)) yield* kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: gvisorRuntimeClass(release) }, handler: gvisorRuntimeClass(release) });
       yield* kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: SESSIONS } });
-      for (const object of objects.filter(({ metadata }) => metadata?.name === "alasio-sandbox-pods")) yield* kube.create(object);
+      for (const object of objects.filter(({ metadata }) => metadata?.name === "alasio-sandbox-pods" || metadata?.name === "alasio-resumed-condition")) yield* kube.create(object);
       // What the gateway may do in main's sessions, as alasio up gives it; and another, which may make pods there too.
       for (const object of objects.filter(({ kind, metadata }) => (kind === "Role" || kind === "RoleBinding") && metadata?.name === "alasio-sandbox-gateway" && metadata.namespace === SESSIONS)) yield* kube.create(object);
       yield* kube.create({ apiVersion: "rbac.authorization.k8s.io/v1", kind: "Role", metadata: { name: "pod-maker", namespace: SESSIONS }, rules: [{ apiGroups: [""], resources: ["pods"], verbs: ["create"] }] } as never);
@@ -241,4 +250,28 @@ test("a restore's pod of a pool's template is made by the sandbox gateway alone,
   // Nor by anyone but the gateway.
   const other = await madeAs("system:serviceaccount:alasio:alasio", restorePod());
   assert.ok("refused" in other && /sandbox-pods/u.test(other.refused), JSON.stringify(other));
+});
+
+test("the sandbox gateway sets a restore's pod's resumed condition true, and nothing else of any pod's status", async () => {
+  const restore = await madeAs(GATEWAY_USER, restorePod("fs-resumed1"));
+  assert.ok("name" in restore, JSON.stringify(restore));
+  const free = await made(poolPod());
+  assert.ok("name" in free, JSON.stringify(free));
+  const resumed = { status: { conditions: [{ type: "alasio.dev/resumed", status: "True", lastTransitionTime: new Date().toISOString() }] } };
+  // In force once the API server refuses what it says it refuses, as it takes a while to.
+  for (const deadline = Date.now() + 30_000; ; await new Promise((resolve) => setTimeout(resolve, 200))) {
+    if ("refused" in (await statusPatchedAs(GATEWAY_USER, restore.name, { status: { podIP: "10.0.0.9" } }))) break;
+    assert.ok(Date.now() < deadline, "the resumed-condition policy never came into force");
+  }
+  const refused = (answer: { readonly name: string } | { readonly refused: string }) => "refused" in answer && /resumed-condition/u.test(answer.refused);
+  assert.ok("name" in (await statusPatchedAs(GATEWAY_USER, restore.name, resumed)));
+  const changes: Record<string, unknown> = {
+    "its address": { status: { podIP: "10.0.0.9", podIPs: [{ ip: "10.0.0.9" }] } },
+    "its phase": { status: { phase: "Failed" } },
+    "another condition": { status: { conditions: [{ type: "Ready", status: "True" }] } },
+    "its condition false": { status: { conditions: [{ type: "alasio.dev/resumed", status: "False" }] } },
+  };
+  for (const [what, patch] of Object.entries(changes)) assert.ok(refused(await statusPatchedAs(GATEWAY_USER, restore.name, patch)), what);
+  // Of a free pod, gated on nothing, not even its condition.
+  assert.ok(refused(await statusPatchedAs(GATEWAY_USER, free.name, resumed)), "a free pod");
 });

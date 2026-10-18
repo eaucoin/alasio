@@ -93,10 +93,9 @@ export interface StoredSandbox extends Sandbox {
   metadata: SandboxMetadata & { uid: string };
 }
 
-/** What a Sandbox is made from: a profile's templates (./config.ts). */
+/** What a Sandbox is made from: a profile's pod template (./config.ts). */
 export interface SandboxTemplate {
   readonly podTemplate?: V1PodTemplateSpec;
-  readonly volumeClaimTemplates?: readonly V1PersistentVolumeClaim[] | undefined;
 }
 
 /** What sandboxManifest is given. */
@@ -211,11 +210,6 @@ const POLL: Duration.Input = "500 millis";
 /** How long one look at whether bayma answers may take. */
 const ANSWER_TIMEOUT_MS = 5000;
 
-/** The claim agent-sandbox makes for the Sandbox `sandbox` of its volume claim template `template`. */
-export function claimName(template: string, sandbox: string): string {
-  return `${template}-${sandbox}`;
-}
-
 /**
  * A token that names its Sandbox, `<name>.<random>`, so what presents one can be looked
  * up by it (../sandbox/names.ts SessionToken) without a table of tokens.
@@ -237,8 +231,8 @@ export function podTemplateHash(podTemplate: V1PodTemplateSpec): string {
 }
 
 /**
- * The Sandbox for `name` from a profile's `template` (`{ podTemplate,
- * volumeClaimTemplates }`, as the installation gives it), with what every Sandbox
+ * The Sandbox for `name` from a profile's `template` (`{ podTemplate }`, as the
+ * installation gives it), with what every Sandbox
  * needs: its labels, its operating mode (Running unless told), its Service, bayma given
  * its token, and the hash of the pod template it runs. `configure(podSpec, bayma)` adds
  * what is the caller's own and returns the spec. Pure, for tests.
@@ -273,12 +267,7 @@ export function sandboxManifest({
     apiVersion: SANDBOX_API_VERSION,
     kind: SANDBOX_KIND,
     metadata: { name, namespace, labels: allLabels, annotations: { ...annotations, [POD_TEMPLATE_ANNOTATION]: podTemplateHash(podTemplate) } },
-    spec: {
-      operatingMode,
-      service: true,
-      podTemplate,
-      ...(template.volumeClaimTemplates?.length ? { volumeClaimTemplates: structuredClone(template.volumeClaimTemplates) } : {}),
-    },
+    spec: { operatingMode, service: true, podTemplate },
   };
 }
 

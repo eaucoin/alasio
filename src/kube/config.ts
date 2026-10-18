@@ -3,23 +3,17 @@
  * is the path of a JSON file, which its Deployment mounts from a ConfigMap
  * (cli/src/manifests/alasio.ts), of the form
  *
- *     {
- *       "sessions": { "namespace", "port", "workspaceDir", "fullModeNameservers",
- *                     "mountPodNamespace", "podTemplate", "volumeClaimTemplates", "clone",
- *                     "snapshots" },
- *       "host":     { "namespace", "port", "stateRoot", "podTemplate" }
- *     }
+ *     { "host": { "namespace", "port", "stateRoot", "podTemplate" } }
  *
- * either of which may be absent: no `sessions`, no session filesystems; no `host`, no
- * folder workspaces. Each `podTemplate` has a container named `bayma` whose arguments
- * serve MCP over HTTP on `port`; alasio adds the rest per Sandbox (./sandboxes.ts).
+ * whose `host` may be absent: no folder workspaces. Its `podTemplate` has a container named
+ * `bayma` whose arguments serve MCP over HTTP on `port`; alasio adds the rest per Sandbox
+ * (./sandboxes.ts). Session workspaces are the sandbox gateway's (../gateway/), which
+ * alasio reaches as its configuration says (../config.ts sessionsGateway).
  */
 import { readFileSync } from "node:fs";
 
-import type { V1Job, V1PersistentVolumeClaim, V1PodTemplateSpec } from "@kubernetes/client-node";
+import type { V1PodTemplateSpec } from "@kubernetes/client-node";
 import { Config, Effect, Predicate, Result, Schema, SchemaGetter, SchemaIssue } from "effect";
-
-import { CLAIM_TEMPLATE_MAX } from "../sandbox/names.ts";
 
 /** The deployment's templates could not be read, or are not what alasio needs; the message says which. */
 export class KubeTemplatesError extends Schema.TaggedError<KubeTemplatesError>()("KubeTemplatesError", {
@@ -54,62 +48,11 @@ const Path = said(Schema.String, "must be a path");
 
 /**
  * What alasio relies on of a pod template is checked with its profile (a container named
- * `bayma`); the rest of it, and the claim templates, are Kubernetes objects the
- * installation gives, which the API server checks as each Sandbox is made.
+ * `bayma`); the rest of it is a Kubernetes object the installation gives, which the API
+ * server checks as each Sandbox is made.
  */
 const PodTemplate = said(Schema.declare((value): value is V1PodTemplateSpec => Predicate.isObject(value)), "must be an object").pipe(
   Schema.withDecodingDefaultKey(Effect.succeed({})),
-);
-
-const VolumeClaimTemplates = said(
-  Schema.Array(Schema.declare((value): value is V1PersistentVolumeClaim => Predicate.isObject(value))),
-  "must be a list of volume claim templates",
-);
-
-/**
- * How a session's volume is cloned (cloneJob in cli/src/manifests/workspace-storage.ts):
- * the name of the volume's claim template, and the Job that clones one claim of it into
- * another, given the claims' namespaces and names as `SOURCE_NAMESPACE`, `SOURCE_CLAIM`,
- * `DESTINATION_NAMESPACE` and `DESTINATION_CLAIM`. The Job is a Kubernetes object the
- * installation gives, which the API server checks as each is made.
- */
-const Clone = said(
-  Schema.Struct({
-    // Short enough that each claim of it, named `<template>-<volume id>`, is a DNS label.
-    claimTemplate: said(
-      Schema.String.check(Schema.isPattern(new RegExp(`^[a-z0-9]([-a-z0-9]{0,${CLAIM_TEMPLATE_MAX - 2}}[a-z0-9])?$`, "u"))),
-      `must be a claim template's name, a DNS label of at most ${CLAIM_TEMPLATE_MAX} characters`,
-    ),
-    job: said(Schema.declare((value): value is V1Job => Predicate.isObject(value)), "must be an object"),
-  }),
-  "must be an object",
-);
-
-/** The variables a clone's Job is given, after its own, in this order (src/sandbox/index.ts). */
-export const CLONE_VARIABLES = ["SOURCE_NAMESPACE", "SOURCE_CLAIM", "DESTINATION_NAMESPACE", "DESTINATION_CLAIM"] as const;
-
-const Count = said(Schema.Number.check(Schema.isInt({ message: "must be a whole number" }), Schema.isGreaterThan(0, { message: "must be positive" })), "must be a positive whole number");
-
-/**
- * Session sandboxes' whole-sandbox snapshots, as alasio's own Sandboxes had them: how long a session
- * runs no exec and no turn before its Sandbox is snapshotted and released; how often one
- * whose execs run is snapshotted live, running on; the gVisor
- * releases a snapshot is restored under, each by its RuntimeClass, the current one first;
- * and where the node agents that take and prepare the snapshots are, by their pods'
- * namespace and labels, and the port they serve on.
- */
-const Snapshots = said(
-  Schema.Struct({
-    releaseAfterSeconds: Count,
-    liveEverySeconds: Count,
-    releases: said(
-      Schema.Array(Schema.Struct({ release: said(Schema.NonEmptyString, "must be a release"), runtimeClassName: said(Schema.NonEmptyString, "must be a RuntimeClass's name") }))
-        .check(Schema.isMinLength(1, { message: "must name a release" })),
-      "must be a list of releases",
-    ),
-    agents: said(Schema.Struct({ namespace: Namespace, selector: said(Schema.NonEmptyString, "must be a label selector"), port: Port }), "must be an object"),
-  }),
-  "must be an object",
 );
 
 /** Whether `podTemplate`, as the installation gives it, runs a container named `bayma`. */
@@ -120,38 +63,15 @@ function runsBayma(podTemplate: unknown): boolean {
   return Array.isArray(containers) && containers.some((container: unknown) => Predicate.hasProperty(container, "name") && container.name === "bayma");
 }
 
-/** What both profiles hold: where their Sandboxes are made, and from what. */
-const sandboxProfile = { namespace: Namespace, port: Port, podTemplate: PodTemplate };
-
 /** The issue of a profile whose pod template runs no bayma. */
 const baymaIssue = { path: ["podTemplate", "spec", "containers"], issue: 'must include one named "bayma"' };
-
-/** The template of session filesystems' Sandboxes (sessionsProfile in cli/src/manifests/alasio.ts). */
-const SessionsProfile = said(
-  Schema.Struct({
-    ...sandboxProfile,
-    /** Where the session's workspace is in bayma's container. */
-    workspaceDir: Path,
-    /** The resolvers sessions with internet access use, or none for alasio's defaults. */
-    fullModeNameservers: Schema.optional(said(Schema.NullOr(Schema.Array(Schema.String)), "must be a list of addresses")),
-    /**
-     * Where JuiceFS's CSI driver, which alasio installs, runs the mount pods of sessions'
-     * volumes, whose broken ones a session's restart removes; none where it installs none.
-     */
-    mountPodNamespace: Schema.optional(Schema.NullOr(Namespace)),
-    volumeClaimTemplates: Schema.optional(VolumeClaimTemplates),
-    /** How a session's volume is cloned, where its storage can; none where it cannot, and sessions are not forked. */
-    clone: Schema.optional(Schema.NullOr(Clone)),
-    /** How sessions' Sandboxes are snapshotted as they are released, where they are; none where they are not. */
-    snapshots: Schema.optional(Schema.NullOr(Snapshots)),
-  }),
-  "must be an object",
-).check(Schema.makeFilter((profile) => (runsBayma(profile.podTemplate) ? undefined : baymaIssue)));
 
 /** The template of folder workspaces' bayma (hostProfile in cli/src/manifests/alasio.ts). */
 const HostProfile = said(
   Schema.Struct({
-    ...sandboxProfile,
+    namespace: Namespace,
+    port: Port,
+    podTemplate: PodTemplate,
     /** The directory on the host under which each conversation's bayma keeps its state. */
     stateRoot: Path,
   }),
@@ -162,18 +82,9 @@ const HostProfile = said(
 const optionalProfile = <S extends Schema.Top>(schema: S) =>
   said(Schema.NullOr(schema), "must be an object").pipe(Schema.withDecodingDefaultKey(Effect.succeed(null)));
 
-/**
- * ALASIO_KUBE_TEMPLATES, checked: a profile the deployment does not render is null; and
- * the sessions' profile before the current one, as `alasio up` carries it forward until
- * their template changes again, which sessions' snapshots may restore onto
- * (the gateway's, ../gateway/snapshots.ts), null where there is none.
- */
-const KubeTemplates = said(
-  Schema.Struct({ sessions: optionalProfile(SessionsProfile), previousSessions: optionalProfile(SessionsProfile), host: optionalProfile(HostProfile) }),
-  "must be an object",
-);
+/** ALASIO_KUBE_TEMPLATES, checked: a profile the deployment does not render is null. */
+const KubeTemplates = said(Schema.Struct({ host: optionalProfile(HostProfile) }), "must be an object");
 
-export type SessionsProfile = typeof SessionsProfile.Type;
 export type HostProfile = typeof HostProfile.Type;
 export type KubeTemplates = typeof KubeTemplates.Type;
 

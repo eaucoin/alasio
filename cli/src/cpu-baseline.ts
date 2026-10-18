@@ -11,8 +11,9 @@
  * sessions to those every node has once every node with an agent has said them, and to
  * the baseline it recorded before while any has not.
  *
- * It records the baseline in the sessions' template (manifests/alasio.ts), which alasio
- * and the admission policy take whole, in the cluster rather than in the machine's stamp
+ * It records the baseline in the sandbox pools' template (manifests/sandbox-gateway.ts),
+ * which the gateway's configuration and the sandbox pods' policy take whole, in the
+ * cluster rather than in the machine's stamp
  * (cluster/node.ts): a cluster in Docker or of a kubeconfig has no stamp, and a cluster
  * on this machine may have nodes of other machines, which its stamp does not describe.
  *
@@ -31,8 +32,9 @@ import { CPU_FEATURES_CONTAINER, type CpuFeaturesReport } from "../../src/node-a
 import { currentGvisorRelease } from "./cluster/node.ts";
 import { kind, KubeApi, type KubeApiError } from "./kube/api.ts";
 import { selectorOf } from "./kube/rollout.ts";
-import { type CpuBaseline, recordedCpuBaseline, SANDBOX_TEMPLATES } from "./manifests/alasio.ts";
+import type { CpuBaseline } from "./manifests/alasio.ts";
 import { NAMESPACE, selectorLabels } from "./manifests/common.ts";
+import { GATEWAY, recordedCpuBaseline } from "./manifests/sandbox-gateway.ts";
 
 /** What a node agent's pod says of its node's CPU: the features it has, or why they are not known. */
 export type NodeCpu =
@@ -64,10 +66,14 @@ export const surveyCpu: Effect.Effect<readonly NodeCpu[], KubeApiError, KubeApi>
   return pods.filter((pod) => !pod.metadata?.deletionTimestamp).flatMap((pod) => nodeCpuOf(pod, release) ?? []).toSorted((a, b) => a.node.localeCompare(b.node));
 });
 
-/** The baseline the installation the cluster runs holds sessions to, as its templates' ConfigMap records it. */
-export const recordedBaseline: Effect.Effect<{ readonly live: string | undefined; readonly baseline: CpuBaseline }, KubeApiError, KubeApi> = Effect.gen(function*() {
-  const live = (yield* (yield* KubeApi).get<V1ConfigMap>({ ...kind("ConfigMap"), namespace: NAMESPACE, name: SANDBOX_TEMPLATES }))?.data?.["templates.json"];
-  return { live, baseline: recordedCpuBaseline(live) };
+/**
+ * The baseline the installation the cluster runs holds sessions to, as its sandbox
+ * gateway's configuration records it in its pools' template, and that configuration,
+ * which up carries the pools' templates before the current ones from.
+ */
+export const recordedBaseline: Effect.Effect<{ readonly liveGateway: string | undefined; readonly baseline: CpuBaseline }, KubeApiError, KubeApi> = Effect.gen(function*() {
+  const liveGateway = (yield* (yield* KubeApi).get<V1ConfigMap>({ ...kind("ConfigMap"), namespace: NAMESPACE, name: GATEWAY }))?.data?.["config.json"];
+  return { liveGateway, baseline: recordedCpuBaseline(liveGateway) };
 });
 
 /** The baseline sessions are held to, and what of the nodes it says. */

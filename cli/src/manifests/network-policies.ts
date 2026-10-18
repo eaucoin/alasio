@@ -72,9 +72,6 @@ type NetworkPolicy = Omit<V1NetworkPolicy, "spec"> & { spec: NetworkPolicySpec }
 type NetworkPolicySpec = Omit<V1NetworkPolicySpec, "ingress"> & { ingress?: IngressRule[] };
 type IngressRule = Omit<V1NetworkPolicyIngressRule, "_from"> & { from?: V1NetworkPolicyPeer[] };
 
-/** The label of every session's pod, which alasio gives it. */
-const SESSION = { "alasio.dev/workload": "session" };
-
 /** The namespace `name`, as a peer's selector. */
 const namespaceNamed = (name: string) => ({ matchLabels: { "kubernetes.io/metadata.name": name } });
 
@@ -102,27 +99,11 @@ function policy(name: string, namespace: string, component: string, spec: Networ
 }
 
 /**
- * Sessions: nothing in or out but bayma from their alasio, and, for a session with
- * internet, the public internet, none of the cluster's or its network's private addresses. A branch
- * environment's sessions are its alasio's alone, as main's are main's.
+ * Sessions: nothing in or out of their namespace's pods but what the sandbox service's
+ * pools' policies admit (poolPolicies): a pod of no pool reaches nothing, and nothing it.
  */
 function sessionPolicies(config: InstallConfig, environment: Environment): NetworkPolicy[] {
-  const { blockedCidrs } = config.sessions;
-  const namespace = sessionsNamespace(config, environment);
-  const alasio = alasioOf(environment);
-  return [
-    policy("default-deny", namespace, "session", { podSelector: {}, policyTypes: ["Ingress", "Egress"] }),
-    policy("bayma-from-alasio", namespace, "session", {
-      podSelector: { matchLabels: SESSION },
-      policyTypes: ["Ingress"],
-      ingress: [{ from: [alasio], ports: [{ protocol: "TCP", port: 7290 }] }],
-    }),
-    policy("full-internet", namespace, "session", {
-      podSelector: { matchLabels: { ...SESSION, "alasio.dev/net-mode": "full" } },
-      policyTypes: ["Egress"],
-      egress: [{ to: [{ ipBlock: { cidr: "0.0.0.0/0", except: [...blockedCidrs] } }] }],
-    }),
-  ];
+  return [policy("default-deny", sessionsNamespace(config, environment), "session", { podSelector: {}, policyTypes: ["Ingress", "Egress"] })];
 }
 
 /** The object store's parts, of the stack, to each of which partPolicies and gatewayPolicy admit what talks to it alone. */

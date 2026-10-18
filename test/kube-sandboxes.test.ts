@@ -10,7 +10,7 @@ import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
 
 import { type ExecResult, exitCodeOf, KubeApiError, KubeClient, KubeExecError, mergePatch, patchBody } from "../src/kube/client.ts";
-import { decodeKubeTemplates, type KubeTemplates, loadKubeTemplates, type SessionsProfile } from "../src/kube/config.ts";
+import { decodeKubeTemplates, type HostProfile, type KubeTemplates, loadKubeTemplates } from "../src/kube/config.ts";
 import {
   makeSandboxes,
   newToken,
@@ -26,10 +26,10 @@ import {
 import { SessionToken } from "../src/sandbox/names.ts";
 import { sameToken } from "../src/shared/tokens.ts";
 
-const profile = (extra: Partial<SessionsProfile> = {}): SessionsProfile => ({
-  namespace: "alasio-sessions",
+const profile = (extra: Partial<HostProfile> = {}): HostProfile => ({
+  namespace: "alasio-host",
   port: 7290,
-  workspaceDir: "/workspace",
+  stateRoot: "/var/lib/alasio/bayma",
   podTemplate: {
     metadata: { labels: { team: "a" } },
     spec: {
@@ -38,7 +38,6 @@ const profile = (extra: Partial<SessionsProfile> = {}): SessionsProfile => ({
       volumes: [{ name: "tmp", emptyDir: {} }],
     },
   },
-  volumeClaimTemplates: [{ metadata: { name: "data" }, spec: { resources: { requests: { storage: "1Gi" } } } }],
   ...extra,
 });
 
@@ -250,35 +249,23 @@ const after = (ms: number, then: () => void) => setTimeout(then, ms);
 test("the deployment's templates are checked as alasio starts", async () => {
   const load = (value: unknown): Result.Result<KubeTemplates, { readonly message: string }> => decodeKubeTemplates("/t.json", JSON.stringify(value));
   const failure = (value: unknown) => Result.match(load(value), { onSuccess: () => assert.fail("decoded"), onFailure: (error) => error.message });
-  const sessions = Result.getOrThrow(load({ sessions: profile() }));
-  assert.equal(sessions.host, null);
-  assert.equal(sessions.sessions?.podTemplate.spec?.containers[0]?.image, "agent@sha256:1");
+  const host = Result.getOrThrow(load({ host: profile() }));
+  assert.equal(host.host?.podTemplate.spec?.containers[0]?.image, "agent@sha256:1");
+  assert.equal(Result.getOrThrow(load({})).host, null);
   // A namespace YAML reads as a number is that name.
-  assert.equal(Result.getOrThrow(load({ sessions: { ...profile(), namespace: 123 } })).sessions?.namespace, "123");
+  assert.equal(Result.getOrThrow(load({ host: { ...profile(), namespace: 123 } })).host?.namespace, "123");
   assert.equal(
     Result.match(decodeKubeTemplates("/t.json", "{"), { onSuccess: () => "", onFailure: (error) => error.message }),
     "ALASIO_KUBE_TEMPLATES /t.json is not readable JSON: Expected property name or '}' in JSON at position 1 (line 1 column 2)",
   );
-  assert.equal(failure({ sessions: { ...profile(), namespace: "Bad_NS" } }), "ALASIO_KUBE_TEMPLATES sessions.namespace must be a namespace name");
-  assert.equal(failure({ sessions: { ...profile(), port: 0 } }), "ALASIO_KUBE_TEMPLATES sessions.port must be a port number");
+  assert.equal(failure({ host: { ...profile(), namespace: "Bad_NS" } }), "ALASIO_KUBE_TEMPLATES host.namespace must be a namespace name");
+  assert.equal(failure({ host: { ...profile(), port: 0 } }), "ALASIO_KUBE_TEMPLATES host.port must be a port number");
   assert.equal(
-    failure({ host: { ...profile(), stateRoot: "/s", podTemplate: { spec: { containers: [{ name: "x" }] } } } }),
+    failure({ host: { ...profile(), podTemplate: { spec: { containers: [{ name: "x" }] } } } }),
     'ALASIO_KUBE_TEMPLATES host.podTemplate.spec.containers must include one named "bayma"',
   );
-  assert.equal(
-    failure({ sessions: { ...profile(), podTemplate: { spec: { containers: { name: "bayma" } } } } }),
-    'ALASIO_KUBE_TEMPLATES sessions.podTemplate.spec.containers must include one named "bayma"',
-  );
-  assert.equal(failure({ sessions: { ...profile(), workspaceDir: undefined } }), "ALASIO_KUBE_TEMPLATES sessions.workspaceDir must be a path");
-  assert.equal(failure({ host: profile() }), "ALASIO_KUBE_TEMPLATES host.stateRoot must be a path");
-  assert.equal(failure({ sessions: 5 }), "ALASIO_KUBE_TEMPLATES sessions must be an object");
-  const clone = { claimTemplate: "data", job: { kind: "Job" } };
-  assert.deepEqual(Result.getOrThrow(load({ sessions: { ...profile(), clone } })).sessions?.clone, clone);
-  const shortName = "ALASIO_KUBE_TEMPLATES sessions.clone.claimTemplate must be a claim template's name, a DNS label of at most 4 characters";
-  assert.equal(failure({ sessions: { ...profile(), clone: { ...clone, claimTemplate: "" } } }), shortName);
-  // Its claims, `<template>-<volume id>`, would be longer than a DNS label.
-  assert.equal(failure({ sessions: { ...profile(), clone: { ...clone, claimTemplate: "volume" } } }), shortName);
-  assert.equal(failure({ sessions: { ...profile(), clone: { claimTemplate: "data" } } }), "ALASIO_KUBE_TEMPLATES sessions.clone.job must be an object");
+  assert.equal(failure({ host: { ...profile(), stateRoot: undefined } }), "ALASIO_KUBE_TEMPLATES host.stateRoot must be a path");
+  assert.equal(failure({ host: 5 }), "ALASIO_KUBE_TEMPLATES host must be an object");
 
   const loading = (env: Record<string, string>) =>
     Effect.runPromiseExit(loadKubeTemplates.pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env })))));
@@ -288,10 +275,10 @@ test("the deployment's templates are checked as alasio starts", async () => {
   const directory = mkdtempSync(join(tmpdir(), "alasio-templates-"));
   try {
     const path = join(directory, "templates.json");
-    writeFileSync(path, JSON.stringify({ sessions: profile() }));
+    writeFileSync(path, JSON.stringify({ host: profile() }));
     const loaded = await loading({ ALASIO_KUBE_TEMPLATES: path });
     assert.ok(Exit.isSuccess(loaded));
-    assert.equal(loaded.value.sessions?.namespace, "alasio-sessions");
+    assert.equal(loaded.value.host?.namespace, "alasio-host");
     const missing = await loading({ ALASIO_KUBE_TEMPLATES: join(directory, "missing.json") });
     assert.ok(Exit.isFailure(missing));
     assert.match(Option.getOrThrow(Exit.findErrorOption(missing)).message, /^ALASIO_KUBE_TEMPLATES .*missing\.json is not readable JSON: ENOENT/u);
@@ -329,7 +316,7 @@ test("every Sandbox serves bayma with its token, from a Secret it owns", () => {
     name: "alasio-bayma-token",
     secret: { secretName: "fs-abc123-bayma-token", defaultMode: 0o440 },
   });
-  assert.equal(sandbox.spec.volumeClaimTemplates?.[0]?.metadata?.name, "data");
+  assert.equal(sandbox.spec.volumeClaimTemplates, undefined);
   assert.equal(sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile(), operatingMode: "Suspended" }).spec.operatingMode, "Suspended");
   assert.throws(
     () => sandboxManifest({ name: "x", namespace: "n", template: { podTemplate: { spec: { containers: [{ name: "other" }] } } } }),
@@ -418,7 +405,7 @@ test("suspend returns once the Sandbox's pod has ended, and leaves one that is g
 });
 
 test("a Sandbox records the pod template it runs, the same for the same template however it is written", () => {
-  const hashOf = (template: SessionsProfile) =>
+  const hashOf = (template: HostProfile) =>
     sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template }).metadata.annotations?.[POD_TEMPLATE_ANNOTATION];
   const recorded = hashOf(profile());
   assert.match(recorded ?? "", /^[0-9a-f]{64}$/u);
@@ -499,7 +486,6 @@ test("ensure moves a Sandbox made from another pod template onto alasio's, endin
   assert.deepEqual(moved.spec?.podTemplate, current.spec.podTemplate);
   assert.equal(moved.metadata.annotations?.[POD_TEMPLATE_ANNOTATION], current.metadata.annotations?.[POD_TEMPLATE_ANNOTATION]);
   assert.equal(moved.spec?.operatingMode, "Running");
-  assert.deepEqual(moved.spec?.volumeClaimTemplates, older.spec.volumeClaimTemplates);
   assert.equal(moved.metadata.uid, created.metadata?.uid, "the Sandbox, and so its volumes, are the same");
   assert.equal(kube.peek("Secret", "alasio-sessions", "fs-abc123-bayma-token")?.metadata.ownerReferences?.[0]?.uid, created.metadata?.uid);
 });

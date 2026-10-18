@@ -38,7 +38,7 @@ import { DOWN, ENTER, pressed, replaced, typed } from "./support/fake-terminal.t
 const BOT_TOKEN = "123:valid";
 const BOT = "alasio_test_bot";
 const DEPLOYMENT = "/apis/apps/v1/namespaces/alasio/deployments/alasio";
-const TEMPLATES = "/api/v1/namespaces/alasio/configmaps/alasio-sandbox-templates";
+const GATEWAY_CONFIG = "/api/v1/namespaces/alasio/configmaps/alasio-sandbox-gateway";
 
 /** Where the node agent's pod says its node's CPU features, as the fake API keeps what it says. */
 const CPU_FEATURES = "alasio-node-agent/cpu-features";
@@ -476,19 +476,21 @@ test("up replaces alasio's pod when the users its bot allows change, which alasi
   assert.equal(annotations()["checksum/telegram"], createHmac("sha256", given).update(JSON.stringify([BOT_TOKEN, "42,43"])).digest("hex"));
 });
 
-test("up holds sessions to the CPU features every node agent says its node has, recorded in their template, and to none, unsnapshotted, until each has", async (t) => {
+/** The sandbox gateway's configuration, as up applied it: the pools' templates, and how main's sessions are snapshotted. */
+function gatewayConfigOf(kube: FakeKube): {
+  readonly snapshots: { readonly templates: Record<"none" | "full", { readonly current: { readonly metadata: { readonly annotations: Record<string, string> } }; readonly previous: { readonly metadata: { readonly annotations: Record<string, string> } } | null }> } | null;
+} {
+  return JSON.parse(String((kube.get(GATEWAY_CONFIG)?.["data"] as Record<string, string>)["config.json"]));
+}
+
+test("up holds sessions to the CPU features every node agent says its node has, recorded in their pools' template, and to none, unsnapshotted, until each has", async (t) => {
   const setup = await rig(t);
   await initialize(setup);
-  const sessions = () => JSON.parse(String((setup.kube.get(TEMPLATES)?.["data"] as Record<string, string>)["templates.json"])) as {
-    readonly sessions: { readonly podTemplate: { readonly metadata: { readonly annotations: Record<string, string> } }; readonly snapshots?: unknown };
-    readonly previousSessions?: { readonly podTemplate: { readonly metadata: { readonly annotations: Record<string, string> } } };
-  };
-  const applied = () => setup.kube.changes.filter(({ path }) => path === TEMPLATES).length;
-  const cpuFeatures = () => sessions().sessions.podTemplate.metadata.annotations["dev.gvisor.internal.cpufeatures"];
+  const applied = () => setup.kube.changes.filter(({ path }) => path === GATEWAY_CONFIG).length;
+  const cpuFeatures = () => gatewayConfigOf(setup.kube).snapshots?.templates.none.current.metadata.annotations["dev.gvisor.internal.cpufeatures"];
   // Installed first, sessions are held to none until the agents have said: then up records what they said, applying it again.
   succeeded(await setup.alasio(["up"]));
   assert.equal(cpuFeatures(), "avx,avx2,sse");
-  assert.ok(sessions().sessions.snapshots);
   assert.equal(applied(), 2);
   // The same again changes nothing.
   succeeded(await setup.alasio(["up"]));
@@ -505,7 +507,7 @@ test("up holds sessions to the CPU features every node agent says its node has, 
   setup.kube.said.set(CPU_FEATURES, cpuReport(["sse", "avx"]));
   succeeded(await setup.alasio(["up"]));
   assert.equal(cpuFeatures(), "avx,sse");
-  assert.equal(sessions().previousSessions?.podTemplate.metadata.annotations["dev.gvisor.internal.cpufeatures"], "avx,avx2,sse");
+  assert.equal(gatewayConfigOf(setup.kube).snapshots?.templates.none.previous?.metadata.annotations["dev.gvisor.internal.cpufeatures"], "avx,avx2,sse");
   // Features said under another release are not the current one's: the baseline stays.
   setup.kube.said.set(CPU_FEATURES, cpuReport(["sse"], "20000101.0"));
   const stale = await setup.alasio(["up"]);
@@ -521,11 +523,7 @@ test("up records no CPU baseline the nodes do not share: sessions are not snapsh
   const run = await setup.alasio(["up"]);
   succeeded(run);
   assert.ok(run.printed[0]?.includes("\nsessions are not snapshotted: they are held to no CPU baseline, as the nodes share no CPU feature under gVisor\n"), run.printed[0]);
-  const { sessions } = JSON.parse(String((setup.kube.get(TEMPLATES)?.["data"] as Record<string, string>)["templates.json"])) as {
-    readonly sessions: { readonly podTemplate: { readonly metadata: { readonly annotations: Record<string, string> } }; readonly snapshots?: unknown };
-  };
-  assert.equal(sessions.podTemplate.metadata.annotations["dev.gvisor.internal.cpufeatures"], undefined);
-  assert.equal(sessions.snapshots, undefined);
+  assert.equal(gatewayConfigOf(setup.kube).snapshots, null);
 });
 
 test("up without a bot says to run init, and without the address Telegram delivers to that init asks it; up past its timeout says what still waits, and why", async (t) => {

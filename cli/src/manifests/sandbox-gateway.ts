@@ -85,8 +85,7 @@ import {
   selectorLabels,
   sha256,
 } from "./common.ts";
-import { sandboxPodPolicy } from "./admission.ts";
-import { SANDBOX_CONTROLLER_USER } from "./agent-sandbox.ts";
+import { resumedConditionPolicy, sandboxPodPolicy } from "./admission.ts";
 import { durationSeconds, type InstallConfig } from "./config.ts";
 import { LOG_BROKERS, logPrincipalSecret } from "./log.ts";
 import { boundBudget } from "./disruption.ts";
@@ -129,8 +128,8 @@ export const poolsOf = (config: InstallConfig, environment: Environment): Record
  * Each sandbox pool's template before the current one, as the gateway's configuration it
  * replaces, `liveGateway` (its ConfigMap's `config.json`), carried it: the one it rendered, where
  * the template changes, or else the one it carried; none where it rendered none, as where its
- * sessions were not snapshotted. A template is carried for one change of it, and no more, as
- * alasio's sessions' profile is (./alasio.ts carriedFrom); and pinned into the sandbox pods'
+ * sessions were not snapshotted. A template is carried for one change of it, and no more
+ * (./alasio.ts carriedFrom); and pinned into the sandbox pods'
  * policy for the restores of the snapshots taken on it, read back from the cluster: the
  * ConfigMap is that trust's anchor, which only the operator, by `alasio up`, writes. Pure, for tests.
  */
@@ -146,6 +145,19 @@ export function carriedPools(config: InstallConfig, liveGateway: string | undefi
     return (isDeepStrictEqual(current, now) ? previous : current) as V1PodTemplateSpec | null;
   };
   return { none: carry("none"), full: carry("full") };
+}
+
+/**
+ * The CPU baseline the installation whose gateway's configuration is `liveGateway` (as
+ * carriedPools takes it) holds sessions to: what its pools' current template sets, if
+ * anything, as only a pool of snapshotted sessions is held to one. Pure, for tests.
+ */
+export function recordedCpuBaseline(liveGateway: string | undefined): CpuBaseline {
+  if (liveGateway === undefined) return null;
+  const held = Schema.decodeUnknownOption(Schema.fromJsonString(GatewayConfigSchema))(liveGateway);
+  if (held._tag === "None") return null;
+  const recorded = (held.value.snapshots?.templates.none.current as V1PodTemplateSpec | undefined)?.metadata?.annotations?.[CPU_FEATURES_ANNOTATION];
+  return recorded ? recorded.split(",") : null;
 }
 
 /** Whether the sandbox pools' sessions are snapshotted: where the node agents run, which save them, and the nodes' CPU baseline is recorded, which they are held to. */
@@ -277,7 +289,7 @@ function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
     environment: { name: MAIN_ENVIRONMENT_NAME, namespace: sessionsNamespace(config, MAIN_ENVIRONMENT) },
     // A new session's volume's size, as the configuration checks it.
     quotaBytes: memoryBytes(config.sessions.storage.size),
-    // As alasio's own sessions were snapshotted (./alasio.ts sessionSnapshots), under the releases the cluster keeps.
+    // Under the releases the cluster keeps, each restored with a RuntimeClass of its own.
     snapshots: poolsSnapshotted(config, carried.cpuBaseline)
       ? {
         liveEverySeconds: durationSeconds(config.sessions.snapshots.liveEvery) ?? 0,
@@ -700,7 +712,6 @@ export function sandboxServiceObjects(config: InstallConfig, carried: Carried): 
     // Every pod of every environment's sessions held to the pools' templates, as Pod Security cannot.
     ...sandboxPodPolicy([poolTemplate(config, pools.none, "none", carried.cpuBaseline), poolTemplate(config, pools.full, "full", carried.cpuBaseline)], {
       sessionsNamespace: sessionsNamespace(config, MAIN_ENVIRONMENT),
-      sandboxController: SANDBOX_CONTROLLER_USER,
       // Main's restores, by the gateway alone, onto each pool's template and the one before it, under the releases kept.
       restores: poolsSnapshotted(config, carried.cpuBaseline)
         ? {
@@ -710,6 +721,8 @@ export function sandboxServiceObjects(config: InstallConfig, carried: Carried): 
         }
         : null,
     }),
+    // Where main's sessions are snapshotted, what the gateway may set of a restore's pod's status.
+    ...(poolsSnapshotted(config, carried.cpuBaseline) ? resumedConditionPolicy(componentName("resumed-condition"), GATEWAY_USER, pools.none.namespace) : []),
     ...receiverObjects(config),
     ...sandboxPoolObjects(config, MAIN_ENVIRONMENT, carried.cpuBaseline),
     mount,

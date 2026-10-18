@@ -139,7 +139,7 @@ test("an installation is applied as alasio, in the order what runs needs it, eve
 test("objects reach the API server as the manifests have them, keys client-node's model lacks included", async (t) => {
   const { kube, run } = await rig(t);
   await run(applyInstallation(objectsOf(), WAIT));
-  const policy = kube.get("/apis/networking.k8s.io/v1/namespaces/alasio-sessions/networkpolicies/bayma-from-alasio");
+  const policy = kube.get("/apis/networking.k8s.io/v1/namespaces/alasio-sessions/networkpolicies/alasio-sandboxes");
   assert.deepEqual((policy?.spec?.["ingress"] as Array<{ from: unknown[] }>)[0]?.from.length, 1);
   const crd = kube.get("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/sandboxes.agents.x-k8s.io");
   assert.match(JSON.stringify(crd), /"x-kubernetes-/u);
@@ -166,7 +166,7 @@ test("applying again deletes what the installation no longer has, but for what h
   assert.ok(deleted.includes("/apis/apps/v1/namespaces/alasio/deployments/alasio-neon-compute"));
   assert.ok(deleted.includes("/apis/apps/v1/namespaces/alasio/statefulsets/alasio-neon-safekeeper"));
   assert.ok(deleted.includes("/apis/networking.k8s.io/v1/namespaces/alasio-sessions/networkpolicies/default-deny"));
-  assert.ok(deleted.includes("/apis/rbac.authorization.k8s.io/v1/namespaces/alasio-sessions/roles/alasio"));
+  assert.ok(deleted.includes("/apis/rbac.authorization.k8s.io/v1/namespaces/alasio-sessions/roles/alasio-sandbox-gateway"));
   assert.ok(!deleted.includes("/api/v1/namespaces/alasio-sessions"));
   assert.ok(!deleted.includes("/api/v1/namespaces/alasio/persistentvolumeclaims/alasio-seaweedfs-filer-store-backups"));
   assert.ok(kube.get("/api/v1/namespaces/alasio-sessions"));
