@@ -51,7 +51,6 @@ import {
   VOLUME_SERVER,
 } from "./object-store.ts";
 import { PROXY_PORT } from "./neon.ts";
-import { CONTROLLER_POD_LABELS, JOB_POD_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "./juicefs-csi.ts";
 import { VALKEY_PORT } from "./valkey.ts";
 import { JUICEFS_ADMIN } from "./workspace-storage.ts";
 import {
@@ -188,23 +187,14 @@ function branchStoragePolicy(config: InstallConfig): NetworkPolicy {
 }
 
 /**
- * Workspace storage's metadata and data are reached by JuiceFS's own pods alone (its
- * controller, its node service, the mount pods it runs and the Jobs that delete volumes'
- * directories, in the driver's namespace) and alasio's JuiceFS admin pods: Valkey takes, beside
- * theirs, the node agents', which set workspaces' quotas on it, and no other connection but the
- * collector's scraper's, which reads its metrics; and the bundled object store takes theirs on
- * its S3 port beside the stack's own, and Valkey's, whose pod formats the file system. The driver's Jobs are told by no label of their own, so any
- * Job's pod in its namespace is admitted, which the credentials of each still guard.
+ * Workspace storage's metadata and data are reached by JuiceFS's clients alone, alasio's
+ * JuiceFS admin pods, the nodes' mount among them: Valkey takes, beside theirs, the node
+ * agents', which set workspaces' quotas on it, and no other connection but the collector's
+ * scraper's, which reads its metrics; and the bundled object store takes theirs on its S3
+ * port beside the stack's own, and Valkey's, whose pod formats the file system.
  */
 function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
-  const driverNamespace = { matchLabels: { "kubernetes.io/metadata.name": config.workspaceStorage.csi.namespace } };
-  const juicefs: V1NetworkPolicyPeer[] = [
-    { namespaceSelector: driverNamespace, podSelector: { matchLabels: MOUNT_POD_LABELS } },
-    { namespaceSelector: driverNamespace, podSelector: { matchLabels: CONTROLLER_POD_LABELS } },
-    { namespaceSelector: driverNamespace, podSelector: { matchLabels: NODE_POD_LABELS } },
-    { namespaceSelector: driverNamespace, podSelector: JOB_POD_SELECTOR },
-    { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": NAMESPACE } }, podSelector: { matchLabels: JUICEFS_ADMIN } },
-  ];
+  const juicefs: V1NetworkPolicyPeer[] = [{ podSelector: { matchLabels: JUICEFS_ADMIN } }];
   // The node agents, which set workspaces' quotas on the metadata engine, and reach no object store of it.
   const quotas: V1NetworkPolicyPeer[] = nodeAgentRuns(config) ? [NODE_AGENT] : [];
   return [

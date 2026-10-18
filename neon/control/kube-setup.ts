@@ -16,9 +16,7 @@
  * for the snapshots bucket alone, which nothing but it may write: the setup refuses a main
  * key that can (refuseMainKeyOnSnapshots). With workspace storage on, WORKSPACES_NAME (its JuiceFS
  * file system's), WORKSPACES_BUCKET and WORKSPACES_BUCKET_URL (its bucket's name
- * and URL), WORKSPACES_TRASH_DAYS, VALKEY_ADDRESS (its metadata engine's host:port), and
- * WORKSPACES_SECRET_LABELS (a JSON object of the labels its Secrets carry, by which
- * alasio keeps them while its volumes remain). With session sandboxes snapshotted,
+ * and URL), WORKSPACES_TRASH_DAYS, and VALKEY_ADDRESS (its metadata engine's host:port). With session sandboxes snapshotted,
  * SNAPSHOTS_BUCKET (the bucket their snapshots are kept in). WEBHOOK_ADDRESS, the address
  * Telegram delivers to, which the webhook intake's certificate is made for
  * (./certificate.ts).
@@ -95,7 +93,6 @@ export interface WorkspacesConfig {
   bucketUrl: string;
   trashDays: string;
   valkeyAddress: string;
-  secretLabels: Record<string, string>;
 }
 
 /** The deployment's configuration, from the environment the module comment lists. */
@@ -322,8 +319,8 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
   Object.assign(rendered, neonSecrets(neon));
   if (workspaces) {
     rendered[names.valkey] = { password: secrets.valkeyPassword };
-    // The file system's volume credentials, as JuiceFS's CSI driver reads them; the
-    // format options are applied as the file system is first made.
+    // The file system's credentials, as alasio's JuiceFS clients read them (the nodes'
+    // mount and the admin jobs); the format options are applied as it is first made.
     rendered[names.workspaces] = {
       name: workspaces.name,
       // Its database 1, leaving the others free for a restore to be loaded into.
@@ -402,7 +399,6 @@ export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
         bucketUrl: required("WORKSPACES_BUCKET_URL"),
         trashDays: required("WORKSPACES_TRASH_DAYS"),
         valkeyAddress: required("VALKEY_ADDRESS"),
-        secretLabels: JSON.parse(required("WORKSPACES_SECRET_LABELS")),
       }
       : null,
     snapshotsBucket: env["SNAPSHOTS_BUCKET"]?.trim() || null,
@@ -448,12 +444,11 @@ export async function setupKube({ kube, config, log = console.log }: SetupKubeOp
   const { certificate: webhookTls, made } = webhookCertificate(config.webhookAddress, current);
   if (made) log(`making the webhook intake's certificate for ${config.webhookAddress}`);
 
-  const workspaceSecrets = new Set([names.valkey, names.workspaces]);
   for (const [name, stringData] of Object.entries(renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, webhookTls }))) {
     const object = {
       apiVersion: "v1",
       kind: "Secret",
-      metadata: { name, namespace: config.namespace, labels: { ...labels, ...(workspaceSecrets.has(name) ? config.workspaces?.secretLabels : {}) } },
+      metadata: { name, namespace: config.namespace, labels },
       type: "Opaque",
       stringData,
     } satisfies V1Secret;

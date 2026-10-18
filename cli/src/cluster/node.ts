@@ -107,8 +107,12 @@ const SERVICE_CIDR = "10.43.0.0/16";
  * (cli/src/manifests/network-policies.ts).
  */
 export const CLUSTER_NETWORKS: readonly string[] = [CLUSTER_CIDR, SERVICE_CIDR];
-/** The directories JuiceFS's CSI driver keeps on the node, its mounts in them, which nothing of k3s's removes. */
-const JUICEFS = ["/var/lib/juicefs", "/run/juicefs-csi"] as const;
+/**
+ * The directory alasio's pods keep on the node, which nothing of k3s's removes: the workspaces'
+ * JuiceFS mount and its state and cache, its juicefs, and the attachments bound into sessions'
+ * pods, mounts all (cli/src/manifests/sandbox-gateway.ts, src/node-agent/names.ts).
+ */
+const NODE_DIRECTORY = "/var/lib/alasio";
 /** What alasio installs of a gVisor release, in the release's directory: runsc and its shim, and the binaries runsc runs beside it. */
 const GVISOR = ["runsc", "containerd-shim-runsc-v1", "gvisor-bin"] as const;
 
@@ -282,8 +286,7 @@ export function describeNodeStep(step: NodeStep): string {
       return `stop the cluster's gVisor pods, ` +
         (step.firewall && step.firewall.added.length > 0 ? `remove the rules alasio added to ${step.firewall.tool} for ${step.firewall.added.join(" and ")}, ` : "") +
         `uninstall k3s with k3s-uninstall.sh, which removes its service, ${K3S_ETC} and its data, ` +
-        `and remove what it leaves, its node's password in ${NODE_PASSWORD}, gVisor's releases in ${GVISOR_RELEASES}, and JuiceFS's mounts and directories, ` +
-        JUICEFS.join(" and ");
+        `and remove what it leaves, its node's password in ${NODE_PASSWORD}, gVisor's releases in ${GVISOR_RELEASES}, and alasio's mounts and directory, ${NODE_DIRECTORY}`;
     case "RemoveStorage":
       return `remove ${step.path}, the cluster's volumes`;
     case "ReadKubeconfig":
@@ -321,18 +324,18 @@ const killGvisor = Effect.fnUntraced(function*(releases: readonly string[]): Eff
 });
 
 /**
- * Unmounts what is mounted in JUICEFS, at once, as their FUSE clients are gone with the
+ * Unmounts what is mounted in NODE_DIRECTORY, at once, as their FUSE clients are gone with the
  * cluster's pods, then removes them. A mount point's spaces and the like are octal
  * escapes in /proc/self/mounts.
  */
-const removeJuicefs = Effect.gen(function*() {
+const removeNodeDirectory = Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
   const { root } = yield* Machine;
   const table = under(root, "/proc/self/mounts");
   const mounts = (yield* fs.exists(table)) ? (yield* fs.readFileString(table)).split("\n").map((line) => (line.split(" ")[1] ?? "").replace(/\\(\d{3})/gu, (_, code: string) => String.fromCharCode(Number.parseInt(code, 8)))) : [];
-  const inside = mounts.filter((point) => JUICEFS.some((directory) => point === directory || point.startsWith(`${directory}/`))).toSorted().toReversed();
+  const inside = mounts.filter((point) => point === NODE_DIRECTORY || point.startsWith(`${NODE_DIRECTORY}/`)).toSorted().toReversed();
   for (const point of inside) yield* (yield* RootSystem).run("umount", ["--lazy", point]);
-  for (const directory of JUICEFS) yield* fs.remove(under(root, directory), { recursive: true, force: true });
+  yield* fs.remove(under(root, NODE_DIRECTORY), { recursive: true, force: true });
 });
 
 /** What a firewall alasio opens the cluster's networks in is asked, and told, as root. */
@@ -474,7 +477,7 @@ export const performNodeStep = (step: NodeStep): Effect.Effect<string | void, No
         yield* killGvisor(yield* installedGvisor);
         if (step.firewall) yield* closeFirewall(step.firewall);
         if (yield* fs.exists(under(root, UNINSTALL))) yield* system.run(UNINSTALL, []);
-        yield* removeJuicefs;
+        yield* removeNodeDirectory;
         // alasio's own, and the node's password, which k3s keeps and its uninstall script leaves.
         for (const path of [GVISOR_RELEASES, CONFIG_YAML, REGISTRIES_YAML, STAMP, CONTAINERD, NODE_PASSWORD]) {
           yield* fs.remove(under(root, path), { recursive: true, force: true });

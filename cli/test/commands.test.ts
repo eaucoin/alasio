@@ -565,8 +565,8 @@ test("status says each workload's state, and fails when one is not ready", async
   succeeded(healthy);
   assert.equal(healthy.printed[0], `alasio 0.0.0-development, in the cluster of the current context of ${kubeconfig} (${kube.server}):`);
   assert.ok(healthy.printed.includes("  Deployment alasio/alasio: ready"));
-  // Workspace storage's: JuiceFS's driver, in its own namespace, and Valkey.
-  for (const line of ["  StatefulSet kube-system/juicefs-csi-controller: ready", "  DaemonSet kube-system/juicefs-csi-node: ready", "  StatefulSet alasio/alasio-valkey: ready"]) {
+  // Workspace storage's: each node's mount, and Valkey.
+  for (const line of ["  DaemonSet alasio/alasio-workspace-mount: ready", "  StatefulSet alasio/alasio-valkey: ready"]) {
     assert.ok(healthy.printed.includes(line), line);
   }
   // A sandbox pool's, ready once its pods run, ready or not: what it holds, as the gateway counts it.
@@ -649,7 +649,7 @@ test("status says each workload's replicas and scale, its requests beside VPA's 
   const after = (printed: readonly string[], line: string) => printed[printed.indexOf(line) + 1];
   let printed = await lines();
   assert.equal(after(printed, "  Deployment alasio/alasio: ready"), "    1 replica; requests 250m CPU and 768 MiB");
-  assert.equal(after(printed, "  DaemonSet kube-system/juicefs-csi-node: ready"), "    requests 30m CPU and 96 MiB");
+  assert.equal(after(printed, "  DaemonSet alasio/alasio-workspace-mount: ready"), "    requests 50m CPU and 128 MiB");
   assert.equal(printed.at(-1), "the cluster has no metrics server: VPA recommends nothing");
 
   const vpa = kube.get("/apis/autoscaling.k8s.io/v1/namespaces/alasio/verticalpodautoscalers/alasio");
@@ -1461,19 +1461,28 @@ test("uninstall --purge removes k3s, gVisor, JuiceFS's directories, the storage,
   const tokenFile = join(env.HOME, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
   succeeded(await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--up"]));
-  machine.write("/proc/self/mounts", "proc /proc proc rw 0 0\nJuiceFS:workspaces /var/lib/juicefs/volume/pvc\\040one fuse.juicefs rw 0 0\n");
-  machine.write("/var/lib/juicefs/volume/pvc one/file", "data");
+  machine.write(
+    "/proc/self/mounts",
+    "proc /proc proc rw 0 0\nJuiceFS:workspaces /var/lib/alasio/workspaces fuse.juicefs rw 0 0\nJuiceFS:workspaces /var/lib/alasio/attach/pod\\040one fuse.juicefs rw 0 0\n",
+  );
+  machine.write("/var/lib/alasio/workspaces/main/one/files/file", "data");
+  machine.write("/var/lib/alasio/attach/pod one/file", "data");
   const storagePath = join(env.XDG_DATA_HOME, "alasio", "storage");
   const run = await alasio(["uninstall", "--purge"], [pressed("y")]);
   succeeded(run);
   assert.match(run.prompts, /Remove alasio and all its data from k3s on this machine, and k3s and gVisor themselves\? This cannot be undone/u);
   assert.deepEqual(rootSteps(run), [
-    "stop the cluster's gVisor pods, uninstall k3s with k3s-uninstall.sh, which removes its service, /etc/rancher/k3s and its data, and remove what it leaves, its node's password in /etc/rancher/node, gVisor's releases in /usr/local/lib/alasio/gvisor, and JuiceFS's mounts and directories, /var/lib/juicefs and /run/juicefs-csi",
+    "stop the cluster's gVisor pods, uninstall k3s with k3s-uninstall.sh, which removes its service, /etc/rancher/k3s and its data, and remove what it leaves, its node's password in /etc/rancher/node, gVisor's releases in /usr/local/lib/alasio/gvisor, and alasio's mounts and directory, /var/lib/alasio",
     `remove ${storagePath}, the cluster's volumes`,
     `remove ${SYSCTL_FILE}, which raises the inotify limits at every boot`,
   ]);
-  assert.deepEqual(machine.commands().slice(-3), ["systemctl stop k3s", "/usr/local/bin/k3s-uninstall.sh", "umount --lazy /var/lib/juicefs/volume/pvc one"]);
-  for (const path of ["/usr/local/bin/k3s", "/usr/local/lib/alasio", "/etc/rancher", "/var/lib/rancher", "/var/lib/juicefs", SYSCTL_FILE]) {
+  assert.deepEqual(machine.commands().slice(-4), [
+    "systemctl stop k3s",
+    "/usr/local/bin/k3s-uninstall.sh",
+    "umount --lazy /var/lib/alasio/workspaces",
+    "umount --lazy /var/lib/alasio/attach/pod one",
+  ]);
+  for (const path of ["/usr/local/bin/k3s", "/usr/local/lib/alasio", "/etc/rancher", "/var/lib/rancher", "/var/lib/alasio", SYSCTL_FILE]) {
     assert.ok(!machine.has(path), `${path} is left`);
   }
   assert.ok(!existsSync(storagePath));

@@ -477,6 +477,8 @@ function receiverObjects(config: InstallConfig): KubernetesObject[] {
 export const MOUNT_RUN = "/run/alasio";
 /** Where JuiceFS keeps a mount's open handles on the node, which the mount that takes it over reads. */
 export const JUICEFS_STATE = "/var/lib/alasio/juicefs-state";
+/** The port each node's mount serves JuiceFS's client's metrics on, in its pod's own network, which the collector's scraper reads. */
+export const JUICEFS_METRICS_PORT = 9567;
 /** Where the node runs JuiceFS's command from: its static release, copied from alasio's image, under its digest. */
 export const JUICEFS_BIN = "/var/lib/alasio/bin";
 /** Where the node's mount of workspace storage caches its blocks. */
@@ -583,7 +585,7 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     `  ${inNode} umount -l ${root} && echo "unmounted the node's mount its juicefs left, which served nothing"`,
     "fi",
     `${inNode} mkdir -p ${root}`,
-    `TMPDIR=${state} ${inNode} "$node_juicefs" mount --no-bgjob --bucket "$bucket" --cache-dir ${cache} --cache-size ${cacheSizeMiB} "$meta" ${root} >> "$run/juicefs.log" 2>&1 &`,
+    `TMPDIR=${state} ${inNode} "$node_juicefs" mount --no-bgjob --metrics 0.0.0.0:${JUICEFS_METRICS_PORT} --bucket "$bucket" --cache-dir ${cache} --cache-size ${cacheSizeMiB} "$meta" ${root} >> "$run/juicefs.log" 2>&1 &`,
     "pid=$!",
     `echo "$pid" > "$run/juicefs.pid"`,
     `tail -n +1 -f "$run/juicefs.log" &`,
@@ -659,6 +661,7 @@ function workspaceMount(config: InstallConfig, mountServices: Kept["mountService
             imagePullPolicy: config.images.pullPolicy,
             command: ["sh", "-c", workspaceMountScript(WORKSPACES_ROOT, config.workspaceStorage.cacheSizeMiB)],
             env: [credential("META_URL", "metaurl"), credential("BUCKET", "bucket"), credential("ACCESS_KEY", "access-key"), credential("SECRET_KEY", "secret-key")],
+            ports: [{ name: "metrics", containerPort: JUICEFS_METRICS_PORT }],
             readinessProbe: { exec: { command: ["sh", "-c", workspaceMountReady(WORKSPACES_ROOT)] }, periodSeconds: 2 },
             securityContext: { privileged: true },
             resources: config.workspaceStorage.mount.resources,

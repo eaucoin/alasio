@@ -32,7 +32,7 @@ import { COLLECTOR_PORT, collectorRuns, componentName, given, goJson, lakeRuns, 
 import type { InstallConfig } from "./config.ts";
 import { LOG_BROKERS, LOG_METRICS_PORT, LOG_RECORD_BYTES, logPrincipalSecret, TELEMETRY_TOPICS } from "./log.ts";
 import { replicaBudget, spread } from "./disruption.ts";
-import { DRIVER_METRICS_PORT, DRIVER_POD_NAME, JUICEFS_METRICS_PORT, MOUNT_POD_NAME } from "./juicefs-csi.ts";
+import { JUICEFS_METRICS_PORT, sandboxServiceRuns, WORKSPACE_MOUNT_COMPONENT } from "./sandbox-gateway.ts";
 import { INTAKE_COMPONENT, LAKE_METRICS_PORT, LAKE_QUERY_PORT, LOADER_COMPONENT, QUERY_COMPONENT } from "./lake.ts";
 import { COMPONENTS, FILER_STORE, FILER_STORE_USERS, METRICS_PORT as SEAWEEDFS_METRICS_PORT } from "./object-store.ts";
 import { priority } from "./priorities.ts";
@@ -109,27 +109,9 @@ function podJob(job: string, namespace: string, components: readonly string[], p
   };
 }
 
-/** JuiceFS's pods of the name `name` in the driver's namespace, on the port `port` they serve their metrics on. */
-function juicefsJob(config: InstallConfig, job: string, name: string, port: number): object {
-  return {
-    job_name: job,
-    scrape_interval: SCRAPE_INTERVAL,
-    kubernetes_sd_configs: [{
-      role: "pod",
-      namespaces: { names: [config.workspaceStorage.csi.namespace] },
-      selectors: [{ role: "pod", label: `app.kubernetes.io/name=${name}` }],
-    }],
-    relabel_configs: [
-      { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
-      { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: `$$1:${port}` },
-      { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
-    ],
-  };
-}
-
 /** What it scrapes, a job of each component's pods, by the job's name, which its metrics' service is named. */
 function scrapes(config: InstallConfig): object[] {
-  const { neon, workspaceStorage } = config;
+  const { neon } = config;
   const stack: Record<string, readonly [components: readonly string[], port: number]> = {
     ...(neon.enabled
       ? {
@@ -157,10 +139,8 @@ function scrapes(config: InstallConfig): object[] {
     }),
     // The object store's parts, each labelled with its part.
     ...(seaweedfsRuns(config) ? [podJob("seaweedfs", NAMESPACE, SEAWEEDFS_SCRAPED, SEAWEEDFS_METRICS_PORT, true)] : []),
-    // The mount pods, the clients, and the controller's and node service's, the driver.
-    ...(workspaceStorage.enabled
-      ? [juicefsJob(config, "juicefs", MOUNT_POD_NAME, JUICEFS_METRICS_PORT), juicefsJob(config, "juicefs-csi", DRIVER_POD_NAME, DRIVER_METRICS_PORT)]
-      : []),
+    // Each node's mount of workspace storage, JuiceFS's client.
+    ...(sandboxServiceRuns(config) ? [podJob("juicefs", NAMESPACE, [WORKSPACE_MOUNT_COMPONENT], JUICEFS_METRICS_PORT)] : []),
   ];
 }
 
@@ -338,7 +318,6 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
 
 /** The scraper's objects, when it scrapes or reads anything: who it is, that it may list the pods it scrapes, its configuration and its Deployment. */
 function scraperObjects(config: InstallConfig): KubernetesObject[] {
-  const { workspaceStorage } = config;
   const scraped = scrapes(config);
   const read = valkeys(config);
   if (scraped.length === 0 && read.length === 0) return [];
@@ -373,8 +352,8 @@ function scraperObjects(config: InstallConfig): KubernetesObject[] {
   };
   const sized = [configMap, deployment, verticalPodAutoscaler(deployment, "InPlace")];
   if (scraped.length === 0) return sized;
-  // Who the scraper is, and that it may find the pods it scrapes in the namespaces they are in: its own, and JuiceFS's driver's.
-  const listed = [NAMESPACE, ...(workspaceStorage.enabled ? [workspaceStorage.csi.namespace] : [])];
+  // Who the scraper is, and that it may find the pods it scrapes in its own namespace, where they are.
+  const listed = [NAMESPACE];
   const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata };
   const podLister = (namespace: string): KubernetesObject[] => {
     const inNamespace = { ...metadata, namespace };

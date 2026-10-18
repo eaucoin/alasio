@@ -1,16 +1,13 @@
 /**
- * Workspace storage: each new session's workspace a volume of one JuiceFS file system, its
- * metadata in Valkey (./valkey.ts), its data in the object store's workspaces bucket, made
- * into volumes by JuiceFS's CSI driver (./juicefs-csi.ts) from the StorageClass here, as
- * the driver's guide says (guide/pv.md "Volume credentials", "Dynamic provisioning";
- * guide/configurations.md "PV expansion", "Use more readable names for PV directory").
- *
- * A claim of the class is a directory of the file system named after it,
- * `<namespace>-<name>`, whose quota is the claim's size, grown as the claim is. Deleting
- * the claim, as deleting its Sandbox does, deletes the directory into the file system's
- * trash. The file system's credentials, the metadata engine's URL with Valkey's password
- * and the bucket's keys, are in a Secret the stack's setup makes (./neon.ts), which the
- * driver reads, and alasio's JuiceFS admin pods (the jobs here), never a workspace.
+ * Workspace storage: each session's workspace a directory of one JuiceFS file system,
+ * `/<environment>/<workspace>`, made by a node agent with its quota (src/node-agent/
+ * workspaces.ts), its metadata in Valkey (./valkey.ts), its data in the object store's
+ * workspaces bucket, which each node mounts whole (./sandbox-gateway.ts workspaceMount) and
+ * the node agents attach workspaces from. Deleting a workspace deletes its directory into
+ * the file system's trash. The file system's credentials, the metadata engine's URL with
+ * Valkey's password and the bucket's keys, are in a Secret the stack's setup makes
+ * (./neon.ts), which the nodes' mount reads, and alasio's JuiceFS admin pods (the jobs
+ * here), never a workspace.
  *
  * The nodes' mount of the file system runs no background job (`--no-bgjob`,
  * ./sandbox-gateway.ts workspaceMount), so what a client's background jobs would do is the
@@ -26,14 +23,13 @@
  *   that died, their locks and the files they held open let go, which a lock a dead client
  *   held is held by until then, seven minutes at most.
  */
-import type { KubernetesObject, V1Container, V1CronJob, V1StorageClass } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Container, V1CronJob } from "@kubernetes/client-node";
 
 import { WORKSPACE_QUOTAS_USER } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
 import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, nodeAgentRuns, restrictedContainer, restrictedPod, s3Endpoint, script } from "./common.ts";
 import { everyIntervalCron, type InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
-import { CSI_DRIVER, juicefsCsiObjects, VOLUME_DRIVER } from "./juicefs-csi.ts";
 import { VALKEY_PORT, valkeyObjects, valkeyPassword } from "./valkey.ts";
 
 /** The Secret of the file system's credentials. */
@@ -55,45 +51,19 @@ const COLLECTION_SCHEDULE = "17 4 * * *";
 /** Whom the quota check and the collection run as: nobody, as they write nothing of their own. */
 const NOBODY = 65534;
 
-/** The directory of the file system a claim of the class is, `<namespace>-<claim>`, of the driver's template's variables in the StorageClass's pathPattern. */
-const volumeDirectory = (namespace: string, claim: string) => `${namespace}-${claim}`;
-
 /** The file system's Valkey's name: its Service's, its StatefulSet's, and its password's Secret's. */
 export const VALKEY = componentName("valkey");
 
 /** The file system's Valkey's password, as a variable's source. */
 export const VALKEY_PASSWORD = valkeyPassword(VALKEY);
 
-/** Valkey's address, as the driver's pods reach it from their own namespace. */
+/** Valkey's address, as what reaches it from another namespace does. */
 export const VALKEY_ADDRESS = `${VALKEY}.${NAMESPACE}.svc.cluster.local:${VALKEY_PORT}`;
 
-/** The workspaces bucket's URL, path-style, as the driver's pods reach it from their own namespace. */
+/** The workspaces bucket's URL, path-style, as what reaches it from another namespace does. */
 export function workspacesBucketUrl({ objectStore }: InstallConfig): string {
   const endpoint = objectStore.bundled.enabled ? `http://${componentName("seaweedfs")}.${NAMESPACE}.svc.cluster.local:8333` : objectStore.external.endpoint.replace(/\/+$/u, "");
   return `${endpoint}/${objectStore.buckets.workspaces}`;
-}
-
-/** The StorageClass of workspaces' volumes. */
-function storageClass({ workspaceStorage }: InstallConfig): V1StorageClass {
-  const secret = { name: WORKSPACES_CREDENTIALS, namespace: NAMESPACE };
-  return {
-    apiVersion: "storage.k8s.io/v1",
-    kind: "StorageClass",
-    metadata: { name: workspaceStorage.storageClassName, labels: labels("workspaces") },
-    provisioner: CSI_DRIVER,
-    parameters: {
-      "csi.storage.k8s.io/provisioner-secret-name": secret.name,
-      "csi.storage.k8s.io/provisioner-secret-namespace": secret.namespace,
-      "csi.storage.k8s.io/node-publish-secret-name": secret.name,
-      "csi.storage.k8s.io/node-publish-secret-namespace": secret.namespace,
-      "csi.storage.k8s.io/controller-expand-secret-name": secret.name,
-      "csi.storage.k8s.io/controller-expand-secret-namespace": secret.namespace,
-      pathPattern: volumeDirectory("${.pvc.namespace}", "${.pvc.name}"),
-    },
-    reclaimPolicy: "Delete",
-    allowVolumeExpansion: true,
-    volumeBindingMode: "Immediate",
-  };
 }
 
 /**
@@ -103,7 +73,7 @@ function storageClass({ workspaceStorage }: InstallConfig): V1StorageClass {
 function adminContainer(config: InstallConfig, name: string, ...lines: string[]): V1Container {
   return {
     name,
-    image: imageReference(config.workspaceStorage.csi.mountImage),
+    image: imageReference(config.workspaceStorage.image),
     imagePullPolicy: "IfNotPresent",
     command: ["/bin/sh", "-c", script("set -eu", ...lines)],
     env: [{ name: "META_URL", valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key: "metaurl" } } }],
@@ -113,13 +83,13 @@ function adminContainer(config: InstallConfig, name: string, ...lines: string[])
 
 /**
  * A daily JuiceFS admin task, `component`, whose container `name` runs `lines` restricted
- * as nobody. Kept, as the driver's objects are, while the volumes remain.
+ * as nobody.
  */
 function dailyAdminTask(config: InstallConfig, component: string, schedule: string, name: string, ...lines: string[]): V1CronJob {
   return {
     apiVersion: "batch/v1",
     kind: "CronJob",
-    metadata: { name: componentName(component), namespace: NAMESPACE, labels: { ...labels(component), ...VOLUME_DRIVER } },
+    metadata: { name: componentName(component), namespace: NAMESPACE, labels: labels(component) },
     spec: {
       schedule,
       concurrencyPolicy: "Forbid",
@@ -159,9 +129,9 @@ function quotaCheck(config: InstallConfig): V1CronJob {
     "quota-check",
     'quotas=$(juicefs quota list "$META_URL")',
     // The table's rows of workspaces, the directories of the file system's environments
-    // (`/<environment>/<workspace>`, as the node agents make them) and the volumes at its top,
-    // not those deleted into its trash, whose first column is their path.
-    "printf '%s\\n' \"$quotas\" | awk -F '|' '$2 ~ /^ \\/[^\\/. ][^\\/ ]*(\\/[^\\/ ]+)? +$/ { gsub(/ /, \"\", $2); print $2 }' | while read -r path; do",
+    // (`/<environment>/<workspace>`, as the node agents make them), not those deleted into its
+    // trash, whose first column is their path.
+    "printf '%s\\n' \"$quotas\" | awk -F '|' '$2 ~ /^ \\/[^\\/. ][^\\/ ]*\\/[^\\/ ]+ +$/ { gsub(/ /, \"\", $2); print $2 }' | while read -r path; do",
     '  juicefs quota check "$META_URL" --path "$path" --repair',
     "done",
   );
@@ -353,17 +323,16 @@ function metadataDump(config: InstallConfig): V1CronJob {
 
 /**
  * Formats the file system, unless it is formatted already, beside Valkey's server, whose
- * pod is ready only once it is: JuiceFS's driver sets a new volume's quota before the
- * volume's mount pod has formatted the file system, so the first volume made on one not
- * yet formatted would have none. Formatted as mount pods format it, with the bucket and
- * its keys; it reaches Valkey on its pod's loopback, in the database the file system's
- * `metaurl` names (neon/control/kube-setup.ts), and the object store as JuiceFS's pods do.
+ * pod is ready only once it is, so nothing mounts or sets a quota on one not yet formatted.
+ * Formatted with the bucket and its keys; it reaches Valkey on its pod's loopback, in the
+ * database the file system's `metaurl` names (neon/control/kube-setup.ts), and the object
+ * store as the nodes' mount does.
  */
 function formatter(config: InstallConfig): V1Container {
   const credential = (name: string, key: string) => ({ name, valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key } } });
   return {
     name: "juicefs-format",
-    image: imageReference(config.workspaceStorage.csi.mountImage),
+    image: imageReference(config.workspaceStorage.image),
     imagePullPolicy: "IfNotPresent",
     command: [
       "/bin/sh",
@@ -391,20 +360,18 @@ function formatter(config: InstallConfig): V1Container {
   };
 }
 
-/** Workspace storage's objects, when it is on: Valkey, the CSI driver, the StorageClass, the quota check and the collection. */
+/** Workspace storage's objects, when it is on: Valkey, and the jobs that do what a mount's background jobs would. */
 export function workspaceStorageObjects(config: InstallConfig): KubernetesObject[] {
   if (!config.workspaceStorage.enabled) return [];
   const { valkey } = config.workspaceStorage;
-  // JuiceFS's driver needs it to delete its volumes' data, so it is kept while they remain.
   const instance = {
     name: VALKEY,
     component: "valkey",
-    labels: VOLUME_DRIVER,
     ...valkey,
     // The node agents', which set workspaces' quotas: every key, but no command Valkey calls
     // dangerous, those that read or change its server whole, but INFO, which JuiceFS reads its
     // settings in.
     ...(nodeAgentRuns(config) ? { besideDefault: [{ name: WORKSPACE_QUOTAS_USER, secret: WORKSPACE_QUOTAS, rules: QUOTAS_RULES }] } : {}),
   };
-  return [...valkeyObjects(config, instance, [formatter(config)]), ...juicefsCsiObjects(config), storageClass(config), quotaCheck(config), collection(config), metadataDump(config), staleSessions(config)];
+  return [...valkeyObjects(config, instance, [formatter(config)]), quotaCheck(config), collection(config), metadataDump(config), staleSessions(config)];
 }

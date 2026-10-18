@@ -3054,7 +3054,7 @@ const INSTALLED_HERE = [
   "/etc/rancher",
   "/var/lib/rancher",
   "/var/lib/kubelet",
-  "/var/lib/juicefs",
+  "/var/lib/alasio",
   "/etc/sysctl.d/60-alasio-inotify.conf",
 ];
 

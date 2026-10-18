@@ -32,7 +32,6 @@ const ENV = {
   WORKSPACES_BUCKET_URL: "http://q-seaweedfs.alasio.svc.cluster.local:8333/workspaces",
   WORKSPACES_TRASH_DAYS: "1",
   VALKEY_ADDRESS: "q-valkey.alasio.svc.cluster.local:6379",
-  WORKSPACES_SECRET_LABELS: '{"alasio.dev/volume-driver":"csi.juicefs.com"}',
   SNAPSHOTS_BUCKET: "snapshots",
   WEBHOOK_ADDRESS: "203.0.113.10",
 };
@@ -204,10 +203,6 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.equal(value(kube, names.workspaces, "access-key"), root.s3.workspaces.accessKey);
   assert.equal(value(kube, names.workspaces, "secret-key"), root.s3.workspaces.secretKey);
   assert.equal(value(kube, names.workspaces, "format-options"), "trash-days=1");
-  const driverOf = (name: string) => kube.secrets.get(name)?.metadata.labels?.["alasio.dev/volume-driver"];
-  assert.equal(driverOf(names.valkey), "csi.juicefs.com");
-  assert.equal(driverOf(names.workspaces), "csi.juicefs.com");
-  assert.equal(driverOf(names.database), undefined);
   assert.deepEqual(seaweed.identities.find((identity) => identity.name === "workspaces")?.actions, [
     "Read:workspaces",
     "List:workspaces",

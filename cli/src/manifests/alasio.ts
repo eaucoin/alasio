@@ -79,11 +79,6 @@ export function stopWaitSeconds(config: InstallConfig): number {
   return durationSeconds(config.sessions.snapshots.stopWait) ?? 0;
 }
 
-/** Whether alasio forks sessions: where their volumes are workspace storage's, which JuiceFS clones. */
-export function sessionsForked({ sessions, workspaceStorage }: InstallConfig): boolean {
-  return workspaceStorage.enabled && [workspaceStorage.storageClassName, ""].includes(sessions.storage.storageClassName);
-}
-
 /** The template of folder workspaces' bayma: bayma itself, as the operator, with the machine's mounts. */
 function hostProfile(config: InstallConfig): HostProfile {
   const { host } = config;
@@ -225,9 +220,9 @@ function branchSecretVolume(config: InstallConfig, { branch }: Environment): V1V
   return forksForBranches(config) ? [{ name: "branch", secret: { secretName: componentName("branches"), items: [{ key: "fork-key", path: "fork-key" }], optional: true } }] : [];
 }
 
-/** Whether main forks its sessions for branch environments: where it has Neon to branch, and forks sessions. */
+/** Whether main forks its sessions for branch environments: where it has Neon to branch, and the sandbox service, whose node agents clone them. */
 export function forksForBranches(config: InstallConfig): boolean {
-  return config.neon.enabled && sessionsForked(config);
+  return config.neon.enabled && sandboxServiceRuns(config);
 }
 
 /**
