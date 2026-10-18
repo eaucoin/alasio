@@ -163,6 +163,25 @@ test("a workspace is cloned into another, of any environment, its files' owners 
   }
 });
 
+test("an attach for a restore's pod yet to be made makes its directory, and attaches into it, but never into one there already, nor through a symlink", async () => {
+  const at = workspacesNode();
+  try {
+    at.files("fs-abc123");
+    const ref = { environment: "main", workspace: "fs-abc123" };
+    await Effect.runPromise(at.workspaces.attach(ref, "pool-restore-0abc", "t", {}, { made: true }));
+    assert.deepEqual(at.mounts, [join(at.attachRoot, "pool-restore-0abc", "ws")]);
+    assert.equal(readFileSync(join(at.attachRoot, "pool-restore-0abc", "token"), "utf8"), "t");
+    // One there already, a directory kubelet made, or a symlink to another's: refused, nothing attached.
+    at.pod("pool-0");
+    symlinkSync(join(at.attachRoot, "pool-0"), join(at.attachRoot, "pool-restore-1abc"));
+    for (const pod of ["pool-0", "pool-restore-1abc"]) assert.equal(await refusal(at.workspaces.attach(ref, pod, "t", {}, { made: true })), 409, pod);
+    assert.equal(at.mounts.length, 1);
+    assert.equal(existsSync(join(at.attachRoot, "pool-0", "token")), false);
+  } finally {
+    at.done();
+  }
+});
+
 test("an attach into a pod's directory kubelet has not made, or that is no directory, is refused, and none is made", async () => {
   const at = workspacesNode();
   try {

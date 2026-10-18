@@ -72,10 +72,11 @@ export class BindTimeout extends Schema.TaggedError<BindTimeout>()("BindTimeout"
 
 /**
  * Makes the pod of a binding itself, rather than claim one: given the labels and annotations
- * the pod is to carry from the first, the pod made; or null, where it makes none after all,
- * as it finds under the binding's Lease, for a free pod to be claimed instead.
+ * the pod is to carry from the first, and the binding, its Lease's uid, the pod made; or null,
+ * where it makes none after all, as it finds under the binding's Lease, for a free pod to be
+ * claimed instead.
  */
-export type MakePod = (labels: Readonly<Record<string, string>>, annotations: Readonly<Record<string, string>>) => Effect.Effect<V1Pod | null, KubeApiError | BindStepFailed>;
+export type MakePod = (labels: Readonly<Record<string, string>>, annotations: Readonly<Record<string, string>>, binding: string) => Effect.Effect<V1Pod | null, KubeApiError | BindStepFailed>;
 
 /**
  * Readies the pod got for a binding before it is the binding's, as by attaching what it
@@ -155,11 +156,11 @@ export class Binder extends Context.Service<Binder, {
          * already, as by a binder that ended after it claimed it, readied or not, is deleted
          * first: a pod serves one binding, as it was got for it.
          */
-        const podFor = (pool: Pool, key: string, make: MakePod | undefined, deadline: number, lost: () => boolean): Effect.Effect<{ readonly pod: V1Pod; readonly start: PodStart }, KubeApiError | BindTimeout | BindStepFailed> =>
+        const podFor = (pool: Pool, key: string, binding: string, make: MakePod | undefined, deadline: number, lost: () => boolean): Effect.Effect<{ readonly pod: V1Pod; readonly start: PodStart }, KubeApiError | BindTimeout | BindStepFailed> =>
           Effect.gen(function*() {
             const already = yield* provide(boundPod(pool, key));
             if (already?.metadata?.name) yield* kube.remove("v1", "Pod", pool.namespace, already.metadata.name);
-            const made = make ? yield* make(boundLabels(pool, key), boundAnnotations(key)) : null;
+            const made = make ? yield* make(boundLabels(pool, key), boundAnnotations(key), binding) : null;
             if (made) return { pod: made, start: "made" as const };
             const claimed = yield* provide(claim(pool, key));
             if (claimed) return { pod: claimed, start: "warm" as const };
@@ -217,7 +218,7 @@ export class Binder extends Context.Service<Binder, {
             let start: PodStart = "warm";
             const readied = (lost: () => boolean) =>
               Effect.gen(function*() {
-                const got = yield* podFor(pool, key, make, deadline, lost);
+                const got = yield* podFor(pool, key, taken.metadata?.uid ?? "", make, deadline, lost);
                 const pod = got.pod;
                 start = got.start;
                 if (prepare) {

@@ -154,6 +154,8 @@ export interface AttachRequest extends WorkspaceRef {
   readonly pod: string;
   readonly token: string;
   readonly env: Readonly<Record<string, string>>;
+  /** Whether the pod's directory is made now, for a restore's pod made once its workspace is there, not one kubelet made. */
+  readonly made?: boolean;
 }
 
 /** How long a checkpoint, a prepare or a copy may take. */

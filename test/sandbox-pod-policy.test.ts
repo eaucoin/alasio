@@ -16,7 +16,7 @@ import { request } from "node:https";
 import { gvisorReleases, NODE_PINS } from "../cli/src/cluster/node.ts";
 import { decodeInstallConfig, manifests, NOTHING_CARRIED } from "../cli/src/manifests/index.ts";
 import { GATEWAY_USER } from "../cli/src/manifests/sandbox-gateway.ts";
-import { attachWait, ownDirectory } from "../src/gateway/names.ts";
+import { ownDirectory } from "../src/gateway/names.ts";
 import { gvisorRuntimeClass, SNAPSHOT_CACHE_DIR } from "../src/node-agent/names.ts";
 import { refusedByPolicy } from "../src/gateway/refusals.ts";
 import { KubeClient } from "../src/kube/client.ts";
@@ -206,7 +206,6 @@ function restorePod(workspace = "fs-abc123", change: (pod: { metadata: Record<st
     spec: {
       ...own,
       runtimeClassName: gvisorRuntimeClass(release ?? ""),
-      initContainers: own.containers.filter(({ name }) => name === "bayma").map(attachWait),
       readinessGates: [{ conditionType: "alasio.dev/resumed" }],
       affinity: { nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["node-a"] }] }] } } },
     },
@@ -226,7 +225,7 @@ test("a restore's pod of a pool's template is made by the sandbox gateway alone,
     "never resumed": (pod) => void (pod.spec.readinessGates = []),
     "on any node": (pod) => void delete pod.spec.affinity,
     "another image": (pod) => void (pod.spec.containers[0]!.image = "busybox"),
-    "an init container of its own": (pod) => void (pod.spec.initContainers![0]!.command = ["sh", "-c", "cat /attach/token"]),
+    "an init container": (pod) => void (pod.spec.initContainers = [{ name: "first", image: "busybox", command: ["sh", "-c", "cat /attach/token"] }]),
     "another pod's directory": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = "/var/lib/alasio/attach/sandboxes-none-0"),
     "every pod's directory": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = "/var/lib/alasio/attach"),
   };

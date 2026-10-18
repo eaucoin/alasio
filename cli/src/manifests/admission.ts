@@ -30,7 +30,7 @@ import type { KubernetesObject, V1Container, V1PodSpec, V1PodTemplateSpec, V1Vol
 
 import { BINDING_LABEL, FREE_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../../src/binder/names.ts";
 import { branchNamespace, branchSessionsNamespace } from "../../../src/branch/names.ts";
-import { ATTACH_VOLUME, attachWait, ownDirectory, SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
+import { ATTACH_VOLUME, ownDirectory, SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
 import { BUSY_ANNOTATIONS, BUSY_LABEL } from "../../../src/kube/busy-label.ts";
 import { CLONE_VARIABLES, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import {
@@ -535,7 +535,7 @@ const OWN_DIRECTORY = new Check((expression) => `${expression} == ${JSON.stringi
  * A restore's pod of the pool template `template`, as the gateway makes it (src/gateway/snapshots.ts)
  * and the API server stores it: its template's, bound from the first, never free, its sandbox
  * restored paused from the image its node's agent prepared, under one of `runtimeClasses`, on that
- * node, its workspace attached first (attach-wait), and ready once resumed.
+ * node, its own directory there its volume's, and ready once resumed.
  */
 function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClasses: readonly string[]): string {
   // Its own directory named by its volume's path, its own name's (ownDirectory).
@@ -551,8 +551,6 @@ function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClass
       ...owned,
       volumes,
       runtimeClassName: oneOf(...runtimeClasses),
-      // Its workspace attached before its sandbox is restored, as its bayma starts.
-      initContainers: [...owned.containers.filter(({ name }) => name === BAYMA_CONTAINER).map(attachWait), ...(owned.initContainers ?? [])],
       readinessGates: [...((template.spec?.readinessGates ?? []) as unknown as Pinned[]), { conditionType: RESUMED_CONDITION }],
       affinity: restoredOn,
     } as unknown as V1PodSpec,

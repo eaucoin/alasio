@@ -137,8 +137,12 @@ export interface Workspaces {
   readonly quota: (ref: WorkspaceRef) => Effect.Effect<Quota | null, WorkspaceRefused | JuicefsError>;
   /** The workspaces of `environment` there are, by their names. */
   readonly list: (environment: string) => Effect.Effect<readonly string[], WorkspaceRefused>;
-  /** Attaches `ref`'s files into `pod`'s directory, its binding's `token` and the variables `env` beside them. */
-  readonly attach: (ref: WorkspaceRef, pod: string, token: string, env: Readonly<Record<string, string>>) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
+  /**
+   * Attaches `ref`'s files into `pod`'s directory, its binding's `token` and the variables `env`
+   * beside them: the directory kubelet made, or, `made`, one made now, for a restore's pod the
+   * gateway makes once its workspace is there.
+   */
+  readonly attach: (ref: WorkspaceRef, pod: string, token: string, env: Readonly<Record<string, string>>, options?: { readonly made?: boolean }) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
   /** Detaches what is attached into `pod`'s directory, once none of `containerIds`, its sandbox's containers by their runtime's ids, runs. */
   readonly detach: (pod: string, containerIds: readonly string[]) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
   /** The file at `path` of `ref`'s files, `workspace/...` or `home/...`, of `maxBytes` at most. */
@@ -339,14 +343,21 @@ export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches
         return yield* command.quota(quotaPath(ref));
       }),
 
-    attach: (ref, pod, token, env) =>
+    attach: (ref, pod, token, env, { made = false } = {}) =>
       Effect.gen(function*() {
         const files = yield* filesOf(ref);
         const unnamed = Object.keys(env).find((name) => !VARIABLE.test(name));
         if (unnamed !== undefined) return yield* refused(400, `${unnamed} is no variable's name`);
         const directory = yield* podDirectory(pod);
-        const made = yield* Effect.promise(() => lstat(directory).then((stats) => stats.isDirectory(), () => false));
-        if (!made) return yield* refused(404, `no pod of a pool on this node is named ${pod}: kubelet has made it no directory`);
+        if (made) {
+          // Made now, never one there already, whatever it is.
+          yield* storage(`${ref.environment}/${ref.workspace} could not be attached`);
+          const making = yield* Effect.promise(() => mkdir(attachRoot, { recursive: true }).then(() => mkdir(directory)).then(() => null, (error: NodeJS.ErrnoException) => error.code ?? "failed"));
+          if (making === "EEXIST") return yield* refused(409, `${pod} has a directory on this node already: a restore's pod's is made for it alone`);
+          if (making !== null) return yield* refused(500, `${pod}'s directory could not be made: ${making}`);
+        }
+        const there = yield* Effect.promise(() => lstat(directory).then((stats) => stats.isDirectory(), () => false));
+        if (!there) return yield* refused(404, `no pod of a pool on this node is named ${pod}: kubelet has made it no directory`);
         const held = yield* mountsUnder(directory);
         if (held.length > 0) return yield* refused(409, `${pod}'s directory holds ${held.join(", ")}: a pod serves one binding, and nothing is mounted over another`);
         yield* storage(`${ref.environment}/${ref.workspace} could not be attached`);

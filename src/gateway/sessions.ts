@@ -180,28 +180,34 @@ export const makeSessions = Effect.fnUntraced(function*(
       const mode = options["mode"];
       if (mode !== "none" && mode !== "full") return yield* new PlacementRefused({ reason: `a session's internet is none or full, not ${mode ?? "unsaid"}` });
       const pool = { name: poolNames[mode], namespace: environment.namespace };
-      // Restored from the snapshot it was released into, where it was, by a pod of its own (./snapshots.ts).
-      const restoring = snapshots.restoring(pool, volumeId, mode);
+      // Its workspace attached into `pod`'s directory on `node`, its binding's token beside it, on
+      // which its bayma starts; the directory made now where `made`, for a restore's pod made after.
+      const attachInto = (node: string, pod: string, binding: string, made: boolean) =>
+        Effect.gen(function*() {
+          const env = telemetry ? { ...telemetry.env, OTEL_EXPORTER_OTLP_ENDPOINT: `http://${yield* addressOf(telemetry.host)}:${telemetry.port}` } : {};
+          yield* timed(attachDuration, pool, agents.attach(node, {
+            environment: environment.namespace,
+            workspace: volumeId,
+            pod,
+            token: bindingToken(bindingKey, { key, binding, namespace: environment.namespace }),
+            env,
+            ...(made ? { made } : {}),
+          })).pipe(Effect.mapError((error) => new BindStepFailed({ reason: error.message })));
+        });
+      // Restored from the snapshot it was released into, where it was, by a pod of its own, its workspace attached first (./snapshots.ts).
+      const restoring = snapshots.restoring(pool, volumeId, mode, {
+        attach: (node, pod, binding) => attachInto(node, pod, binding, true),
+        detach: (node, pod) => detachOnceGone(pool, node, pod),
+      });
       return {
         pool,
         make: restoring.make,
         // Released as it is when idle: saved whole first, then detached, then deleted.
         release: ({ pod }) => endAndDetach(pool, volumeId, pod).pipe(Effect.tap(() => released(pool, "asked"))),
-        // Its workspace attached, its binding's token beside it, on which its bayma starts; what
-        // was attached into one whose readying failed, which the binder deletes, detached once its
-        // containers stopped, its directory with it.
+        // A free pod's workspace attached; what was attached into one whose readying failed,
+        // which the binder deletes, detached once its containers stopped, its directory with it.
         prepare: (got, binding) =>
-          restoring.ready(got, (pod) =>
-            Effect.gen(function*() {
-              const env = telemetry ? { ...telemetry.env, OTEL_EXPORTER_OTLP_ENDPOINT: `http://${yield* addressOf(telemetry.host)}:${telemetry.port}` } : {};
-              yield* timed(attachDuration, pool, agents.attach(pod.spec?.nodeName ?? "", {
-                environment: environment.namespace,
-                workspace: volumeId,
-                pod: pod.metadata?.name ?? "",
-                token: bindingToken(bindingKey, { key, binding, namespace: environment.namespace }),
-                env,
-              })).pipe(Effect.mapError((error) => new BindStepFailed({ reason: error.message })));
-            })).pipe(Effect.tapError(() => unready(pool, got))),
+          restoring.ready(got, (pod) => attachInto(pod.spec?.nodeName ?? "", pod.metadata?.name ?? "", binding, false)).pipe(Effect.tapError(() => unready(pool, got))),
       };
     });
 
@@ -215,12 +221,16 @@ export const makeSessions = Effect.fnUntraced(function*(
       const name = got.metadata?.name ?? "";
       const latest = ((yield* kube.read("v1", "Pod", pool.namespace, name).pipe(Effect.orElseSucceed(() => null))) as V1Pod | null) ?? got;
       const node = latest.spec?.nodeName;
-      if (!node) return;
-      yield* Effect.forkDetach(Effect.gen(function*() {
-        yield* stopped(pool, name);
-        yield* timed(detachDuration, pool, agents.detach(node, name, containerIdsOf(latest)));
-      }).pipe(Effect.catch((error) => Effect.logWarning(`could not detach what was attached into ${pool.namespace}/${name}, whose readying failed: ${error.message}`))));
+      if (node) yield* detachOnceGone(pool, node, name);
     });
+
+  /** Detaches, in the background, what was attached into `name`'s directory on `node`, once its containers have stopped, or it is gone, its directory there with it. */
+  const detachOnceGone = (pool: Pool, node: string, name: string): Effect.Effect<void> =>
+    Effect.asVoid(Effect.forkDetach(Effect.gen(function*() {
+      yield* stopped(pool, name);
+      const last = (yield* kube.read("v1", "Pod", pool.namespace, name)) as V1Pod | null;
+      yield* timed(detachDuration, pool, agents.detach(node, name, last ? containerIdsOf(last) : []));
+    }).pipe(Effect.catch((error) => Effect.logWarning(`could not detach what was attached into ${pool.namespace}/${name}, whose readying failed: ${error.message}`)))));
 
   /** Waits until `name`'s containers have all stopped, or it is gone. */
   const stopped = (pool: Pool, name: string): Effect.Effect<void, KubeApiError | BindStepFailed> =>

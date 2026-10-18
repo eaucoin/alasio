@@ -87,10 +87,12 @@
  * - `DELETE /workspaces/<environment>/<workspace>/released`: records none (204).
  * - `GET /workspaces/<environment>/<workspace>/quota`: `{ capacityBytes, usedBytes }`, its
  *   quota and what it holds (200); 404 where it has none.
- * - `POST /attach`, `{ environment, workspace, pod, token, env }`: attaches the workspace's
+ * - `POST /attach`, `{ environment, workspace, pod, token, env, made? }`: attaches the workspace's
  *   files into the directory of the sandbox pool pod `pod` on this node, its binding's `token`
- *   and the variables its bayma runs with, `env`, beside them (./workspaces.ts) (204); 409 when the pod's directory holds a mount, 404 when
- *   there is no such workspace.
+ *   and the variables its bayma runs with, `env`, beside them (./workspaces.ts) (204), the
+ *   directory kubelet made, or, `made`, one made now for a restore's pod yet to be made; 409 when
+ *   the pod's directory holds a mount, or, `made`, is there already, 404 when there is no such
+ *   workspace.
  * - `GET /attachments`: `{ attachments: [{ pod, reachable }] }`, the pods of this node a
  *   workspace is attached into, each by whether what is attached is reachable still (./workspaces.ts).
  * - `POST /stop`, `{ namespace, pod, containerId, hook }`: has the bayma of the bound pod
@@ -182,7 +184,7 @@ const CreateRequest = Schema.Struct({ ...WorkspaceRef.fields, quotaBytes: Schema
 const CloneRequest = Schema.Struct({ from: WorkspaceRef, to: WorkspaceRef, quotaBytes: Schema.Number });
 
 /** What `POST /attach` is given. */
-const AttachRequest = Schema.Struct({ ...WorkspaceRef.fields, pod: Schema.NonEmptyString, token: Schema.NonEmptyString, env: Schema.Record(Schema.String, Schema.String) });
+const AttachRequest = Schema.Struct({ ...WorkspaceRef.fields, pod: Schema.NonEmptyString, token: Schema.NonEmptyString, env: Schema.Record(Schema.String, Schema.String), made: Schema.optional(Schema.Boolean) });
 /** What `POST /detach` is given. */
 const DetachRequest = Schema.Struct({ pod: Schema.NonEmptyString, containerIds: Schema.Array(Schema.NonEmptyString) });
 /** What `POST /stop` is given. */
@@ -355,7 +357,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
       );
     }
     if (method === "POST" && url === "/attach") {
-      return body(AttachRequest).pipe(Effect.flatMap(({ pod, token: binding, env, ...ref }) => workspaces.attach(ref, pod, binding, env)), Effect.as(HttpServerResponse.empty({ status: 204 })));
+      return body(AttachRequest).pipe(Effect.flatMap(({ pod, token: binding, env, made, ...ref }) => workspaces.attach(ref, pod, binding, env, { made: made === true })), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }
     if (method === "GET" && url === "/attachments") return workspaces.attachments.pipe(Effect.map((attachments) => answer(200, { attachments })));
     if (method === "POST" && url === "/stop") {

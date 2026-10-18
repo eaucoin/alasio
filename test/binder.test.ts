@@ -198,17 +198,19 @@ test("a key whose Lease names a pod gone is bound anew, to another pod", async (
   assert.equal((await run(binder(), readLease(of, "sessionfs:workspace")))?.spec?.holderIdentity, again.pod);
 });
 
-test("a bind that makes its own pod makes it bound to the key from the first, and claims none", async () => {
+test("a bind that makes its own pod makes it bound to the key from the first, given the binding it makes it for, and claims none", async () => {
   const of = await pool();
   await freePods(of, 1);
   const made: Record<string, string>[][] = [];
+  const bindings: string[] = [];
   const layer = binderOf();
   const bound = await bindIn(layer, (each) =>
     each.bind(of, "sessionfs:restored", {
-      make: (labels, annotations) =>
+      make: (labels, annotations, binding) =>
         withKube((client) =>
           Effect.gen(function*() {
             made.push([{ ...labels }, { ...annotations }]);
+            bindings.push(binding);
             const pod = yield* client.create<V1Pod>({ apiVersion: "v1", kind: "Pod", metadata: { name: "restored", namespace: of.namespace, labels: { ...labels }, annotations: { ...annotations } }, spec: { containers: [{ name: "bayma", image: "agent" }] } });
             yield* serve(client, of, "restored");
             return pod;
@@ -223,6 +225,8 @@ test("a bind that makes its own pod makes it bound to the key from the first, an
     "karpenter.sh/do-not-disrupt": "true",
   }]]);
   assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), ["restored"]);
+  // The binding's, its Lease's uid, as its pod's token names it.
+  assert.deepEqual(bindings, [bound.binding]);
 });
 
 test("a binding under way is renewed however long its pod takes to make, so no other binder takes it over meanwhile", async () => {

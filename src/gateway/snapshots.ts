@@ -20,9 +20,9 @@
  * pool's template the snapshot was taken on: its current one, or the one before it, which
  * `alasio up` carries for one change of it (GatewaySnapshots templates), and nothing older; on
  * a node that has the gVisor release that took it, still kept, and the CPU features it was
- * saved with, those that hold its images first; its workspace attached while its init container
- * waits for it (attach-wait), before its sandbox is restored as its bayma starts, as a restore
- * reopens every file the sandbox held open; left paused until its node's agent sees its egress
+ * saved with, those that hold its images first; its workspace attached into its directory there,
+ * made for it, before its pod is made, so its sandbox, restored as its bayma starts, finds every
+ * file it held open, as a restore reopens each; left paused until its node's agent sees its egress
  * confined there, then resumed, and ready. One whose restore runsc refuses falls back at once;
  * one whose pod cannot start otherwise, as a pull or a node's hiccup fails it, is deferred, as
  * the others that may pass. Only the snapshot the record says it was
@@ -72,7 +72,7 @@ import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { type Fallback, holdsStop, hookOf, selects, stateDirOf, stopHookOf } from "../sandbox/snapshots.ts";
 import { withLogScope } from "../shared/log.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
-import { ATTACH_WAIT, attachWait, type GatewaySnapshots as SnapshotsConfig, ownDirectory } from "./names.ts";
+import { type GatewaySnapshots as SnapshotsConfig, ownDirectory } from "./names.ts";
 
 const releases = meter.createCounter("alasio.sandbox.releases", {
   description:
@@ -169,13 +169,24 @@ export type Saved = "keep" | { readonly saved: SavedSnapshot | null };
 /**
  * How one bind of a workspace restores it, if it does: `make`, the binding's maker, which
  * under the binding's Lease finds whether the workspace restores, and makes its pod where it
- * does, or declines; and `ready`, what readies the pod it got, its workspace attached, and, of a
- * restore, its sandbox let run, the restore done, or fails it, the restore deferred or fallen back.
+ * does, its workspace attached first, or declines; and `ready`, what readies the pod it got, its
+ * workspace attached where it is a free pod, and, of a restore, its sandbox let run, the restore
+ * done, or fails it, the restore deferred or fallen back, what was attached for it detached.
  */
 export interface Restoring {
   readonly make: MakePod;
-  /** Readies `pod`: its workspace attached, by `attach`, once it runs, then, where it is this bind's restore's, its sandbox resumed. */
+  /** Readies `pod`: where it is this bind's restore's, its sandbox resumed; where not, its workspace attached, by `attach`. */
   readonly ready: (pod: V1Pod, attach: (pod: V1Pod) => Effect.Effect<void, BindStepFailed>) => Effect.Effect<void, BindStepFailed>;
+}
+
+/**
+ * How a restore's workspace is attached into the directory of its pod, `pod`, on `node`, made for
+ * it, before the pod is (`attach`, of the binding `binding`); and how what was attached is
+ * detached, once the pod has gone, as its restore did not come back (`detach`).
+ */
+export interface Attaching {
+  readonly attach: (node: string, pod: string, binding: string) => Effect.Effect<void, BindStepFailed>;
+  readonly detach: (node: string, pod: string) => Effect.Effect<void>;
 }
 
 /** The gateway's snapshots; see makeGatewaySnapshots. */
@@ -201,8 +212,8 @@ export interface GatewaySnapshots {
   readonly liveSnapshotOf: (pool: Pool, workspace: string) => Effect.Effect<SavedSnapshot | null>;
   /** Of the bindings of the sessions' namespace `namespace`, forgets what was kept live of those of workspaces not among `bound`, as they are bound no more. */
   readonly forgetLive: (namespace: string, bound: ReadonlySet<string>) => Effect.Effect<void>;
-  /** How a bind of `workspace` of `pool`, of its sessions' internet `mode`, restores it, as the module says. */
-  readonly restoring: (pool: Pool, workspace: string, mode: "none" | "full") => Restoring;
+  /** How a bind of `workspace` of `pool`, of its sessions' internet `mode`, restores it, as the module says, its workspace attached as `attaching` says. */
+  readonly restoring: (pool: Pool, workspace: string, mode: "none" | "full", attaching: Attaching) => Restoring;
   /**
    * Saves the sandbox of `pod`, bound to `workspace` of `pool`, for its release, as the module
    * says, and records what it was released into: the binding kept where it runs on, or
@@ -411,7 +422,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
    * container of it ended, or could not start, started again by kubelet only to fail; and
    * whether what failed is the restore itself, runsc refusing the snapshot, as its container's
    * message says (RESTORE_REFUSED), which no try restores, or what may pass, as a pull or a node's
-   * hiccup. Its init container, attach-wait, ends as it should once its workspace is attached.
+   * hiccup.
    */
   const failedStart = (pod: V1Pod | null): { readonly why: string; readonly refused: boolean } | null => {
     if (pod?.status?.phase === "Failed" || pod?.status?.phase === "Succeeded") return { why: `its pod ended (${pod.status.reason ?? pod.status.phase})`, refused: false };
@@ -421,7 +432,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       const waiting = status.state?.waiting;
       const said = [ended?.message, before?.message, waiting?.message].filter((message) => message !== undefined).join("; ");
       const failure = (why: string) => ({ why: `its ${status.name} ${why}`, refused: RESTORE_REFUSED.test(said) });
-      if (ended && !(status.name === ATTACH_WAIT.name && ended.exitCode === 0)) return failure(`ended (${ended.message ?? ended.reason ?? ended.exitCode})`);
+      if (ended) return failure(`ended (${ended.message ?? ended.reason ?? ended.exitCode})`);
       if (status.restartCount > 0 || before) return failure(`could not start (${before?.message ?? before?.reason ?? "started again"})`);
       if (waiting?.reason !== undefined && START_FAILURES.has(waiting.reason)) return failure(`could not start (${waiting.message ?? waiting.reason})`);
     }
@@ -442,18 +453,14 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
     );
 
   /**
-   * Lets the restored pod `name`, on `node`, restored from `snapshot`, run: its workspace attached
-   * by `attach` while its init container waits for it (attach-wait), before its sandbox is
-   * restored as its bayma starts, so the restore finds every file the sandbox held open; then,
-   * once its containers run, paused, its node's agent resumes its sandbox once the pod's egress is
-   * confined there, and the pod is then ready, by its readiness gate. A pod that ends meanwhile,
-   * or cannot start, whose sandbox the agent does not resume, or whose readiness cannot be set,
-   * is refused.
+   * Lets the restored pod `name`, on `node`, restored from `snapshot`, its workspace attached
+   * before it was made, run: once its containers run, paused, its node's agent resumes its
+   * sandbox once the pod's egress is confined there, and the pod is then ready, by its readiness
+   * gate. A pod that ends meanwhile, or cannot start, whose sandbox the agent does not resume, or
+   * whose readiness cannot be set, is refused.
    */
-  const resumeRestored = (pool: Pool, workspace: string, name: string, node: string, snapshot: string, attach: (pod: V1Pod) => Effect.Effect<void, BindStepFailed>): Effect.Effect<void, RestoreRefused> =>
+  const resumeRestored = (pool: Pool, workspace: string, name: string, node: string, snapshot: string): Effect.Effect<void, RestoreRefused> =>
     Effect.gen(function*() {
-      const waiting = yield* podOnce(pool, name, (pod) => pod.status?.initContainerStatuses?.find((status) => status.name === ATTACH_WAIT.name)?.state?.running !== undefined, "wait for its workspace");
-      yield* attach(waiting).pipe(Effect.mapError((error) => new RestoreRefused({ reason: `its workspace was not attached: ${error.message}`, resumed: false })));
       const running = yield* podOnce(
         pool,
         name,
@@ -507,11 +514,11 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
     return hash === hashOf(kept.previous) ? (kept.previous as V1PodTemplateSpec) : null;
   };
 
-  const restoring = (pool: Pool, workspace: string, mode: "none" | "full"): Restoring => {
+  const restoring = (pool: Pool, workspace: string, mode: "none" | "full", attaching: Attaching): Restoring => {
     /** What this bind's maker restored, which its pod's readying resumes. */
     let restored: { readonly pod: string; readonly node: string; readonly snapshot: string; readonly manifest: Manifest; readonly started: number } | null = null;
 
-    const make: MakePod = (labels, annotations) =>
+    const make: MakePod = (labels, annotations, binding) =>
       Effect.gen(function*() {
         if (!snapshots || pool.namespace !== mainNamespace) return null;
         const started = yield* Clock.currentTimeMillis;
@@ -553,10 +560,11 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           const from = prepared.success.manifest;
           yield* Effect.logInfo(`restoring ${named(pool, workspace)} on ${node} from its snapshot ${from.snapshot}, taken at ${from.takenAt} under gVisor ${from.release}`);
           const { [FREE_LABEL]: _free, ...own } = base.metadata?.labels ?? {};
-          // Named before it is made, as its own directory is by its name (ownDirectory).
+          // Named before it is made, as its own directory is by its name (ownDirectory); its workspace
+          // attached there first, so its sandbox, restored as its bayma starts, finds every file it held open.
           const name = `${pool.name}-restore-${randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7)}`;
+          yield* attaching.attach(node, name, binding);
           const spec = ownDirectory({ containers: [], ...base.spec }, name);
-          const bayma = spec.containers.filter((container) => container.name === BAYMA_CONTAINER);
           const pod = yield* kube.create<V1Pod>({
             apiVersion: "v1",
             kind: "Pod",
@@ -569,13 +577,14 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             },
             spec: {
               ...spec,
-              // Its workspace attached before its sandbox is restored, as its bayma starts.
-              initContainers: [...bayma.map(attachWait), ...(spec.initContainers ?? [])],
               runtimeClassName: kept.runtimeClassName,
               readinessGates: [...(base.spec?.readinessGates ?? []), { conditionType: RESUMED_CONDITION }],
               affinity: { ...base.spec?.affinity, nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: [node] }] }] } } },
             },
-          }).pipe(Effect.mapError((error) => new BindStepFailed({ reason: `its restore's pod could not be made: ${error.message}` })));
+          }).pipe(
+            Effect.tapError(() => attaching.detach(node, name)),
+            Effect.mapError((error) => new BindStepFailed({ reason: `its restore's pod could not be made: ${error.message}` })),
+          );
           restored = { pod: pod.metadata?.name ?? "", node, snapshot: from.snapshot, manifest, started };
           return pod;
         }
@@ -594,7 +603,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       Effect.gen(function*() {
         const of = restored;
         if (of === null || of.pod !== pod.metadata?.name) return yield* attach(pod);
-        const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot, attach).pipe(Effect.result);
+        const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot).pipe(Effect.result);
         if (done._tag === "Success") {
           const now = yield* Clock.currentTimeMillis;
           deferredSince.delete(named(pool, workspace));
@@ -606,6 +615,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           return;
         }
         const { reason: why, resumed, stale, failed } = done.failure;
+        // What was attached for it detached, once its pod, which its binder deletes, has gone.
+        yield* attaching.detach(of.node, of.pod);
         // Its sandbox never having run, its restore is abandoned; one of a snapshot that holds the session no more, or that could not start from it, falls back at once.
         if (resumed) yield* fallBack(pool, workspace, "restore", why);
         else {

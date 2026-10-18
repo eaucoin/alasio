@@ -656,7 +656,7 @@ function restoringAgents(current: Manifest | null, released: { snapshot: string;
   return { ...base, state, agents: restoring };
 }
 
-test("a workspace released into its snapshot is restored from it as it is next bound, by a pod of its own of the pool's template, its workspace attached while its init container waits for it, before its sandbox is restored, paused until its node's agent resumes it, then spent", async () => {
+test("a workspace released into its snapshot is restored from it as it is next bound, by a pod of its own of the pool's template, its workspace attached into its directory, made for it, before the pod is made, paused until its node's agent resumes it, then spent", async () => {
   const env = await environment(1, { gvisor: true });
   await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
   const snapshot = "20261017T120000000Z-0000000a";
@@ -675,11 +675,10 @@ test("a workspace released into its snapshot is restored from it as it is next b
       }
     })();
     const name = restored.metadata?.name ?? "";
-    // Its init container waits for its workspace, which is attached then, before its bayma starts, its sandbox restored.
-    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Pending", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], initContainerStatuses: [{ name: "attach-wait", image: "agent", imageID: "", ready: false, restartCount: 0, state: { running: {} } }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, state: { waiting: { reason: "PodInitializing" } } }] } })));
-    for (const deadline = Date.now() + 10_000; recorded.attached.length === 0; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its workspace was not attached while its init container waited");
+    // Its workspace attached into its directory on the node it is restored on, made for it, before the pod was made.
+    assert.deepEqual(recorded.attached.map(({ node, pod, made }) => ({ node, pod, made })), [{ node: "node-a", pod: name, made: true }]);
     assert.deepEqual(recorded.asked, [`prepare node-a socket retrying pages`]);
-    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", initContainerStatuses: [{ name: "attach-wait", image: "agent", imageID: "", ready: false, restartCount: 0, state: { terminated: { exitCode: 0 } } }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-restored", state: { running: {} } }] } })));
+    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-restored", state: { running: {} } }] } })));
     for (;;) {
       const pod = (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, name)))) as V1Pod;
       if (pod.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True")) break;
@@ -692,12 +691,10 @@ test("a workspace released into its snapshot is restored from it as it is next b
     assert.deepEqual([restored.metadata?.annotations?.["dev.gvisor.internal.restore.host-image-path"], restored.metadata?.annotations?.["dev.gvisor.internal.restore.paused"]], ["/var/cache/alasio/image", "true"]);
     assert.equal(restored.spec?.runtimeClassName, "gvisor-r1");
     const plain = (value: unknown) => JSON.parse(JSON.stringify(value)) as unknown;
-    // Its init container, of its bayma's image, waits for its binding's token, written once its workspace is attached.
-    const [waits] = restored.spec?.initContainers ?? [];
-    assert.deepEqual([waits?.name, waits?.image, waits?.command], ["attach-wait", restored.spec?.containers[0]?.image, ["sh", "-c", "until [ -s /attach/token ]; do sleep 0.2; done"]]);
-    // Its own directory named by its volume's path, not a subpath, so its workspace, attached first, is bound into its containers with it.
+    // Its own directory named by its volume's path, not a subpath, so its workspace, attached first, is bound into its container with it.
     assert.deepEqual(plain(restored.spec?.volumes?.find(({ name }) => name === "attach")), { name: "attach", hostPath: { path: `/var/lib/alasio/attach/${name}`, type: "DirectoryOrCreate" } });
-    for (const container of [waits, restored.spec?.containers[0]]) assert.deepEqual(plain(container?.volumeMounts), [{ name: "attach", mountPath: "/attach", mountPropagation: "HostToContainer" }]);
+    assert.deepEqual(plain(restored.spec?.containers[0]?.volumeMounts), [{ name: "attach", mountPath: "/attach", mountPropagation: "HostToContainer" }]);
+    assert.equal(restored.spec?.initContainers, undefined);
     assert.deepEqual(plain(restored.spec?.readinessGates), [{ conditionType: "alasio.dev/resumed" }]);
     assert.deepEqual(plain(restored.spec?.affinity?.nodeAffinity?.requiredDuringSchedulingIgnoredDuringExecution?.nodeSelectorTerms), [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["node-a"] }] }]);
     // Bound from the first, and no pool's free pod, which its ReplicaSet would take for its own.
@@ -737,11 +734,14 @@ async function failedRestore(workspace: string, status: Record<string, unknown>)
       }
     })();
     name = restored.metadata?.name ?? "";
-    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Pending", initContainerStatuses: [{ name: "attach-wait", image: "agent", imageID: "", ready: false, restartCount: 0, state: { running: {} } }] } })));
-    for (const deadline = Date.now() + 10_000; recorded.attached.length === 0; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its workspace was not attached");
-    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", initContainerStatuses: [{ name: "attach-wait", image: "agent", imageID: "", ready: false, restartCount: 0, state: { terminated: { exitCode: 0 } } }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, ...status }] } })));
+    assert.deepEqual(recorded.attached.map(({ pod, made }) => ({ pod, made })), [{ pod: name, made: true }]);
+    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, ...status }] } })));
     return binding;
   });
+  // What was attached for it detached once its pod, which its binder deletes, has gone.
+  for (const deadline = Date.now() + 10_000; !recorded.asked.includes(`detach node-a ${name}`); await new Promise((resolve) => setTimeout(resolve, 100))) {
+    assert.ok(Date.now() < deadline, `what was attached for ${name} was not detached: ${recorded.asked.join(", ")}`);
+  }
   return { counted, recorded, abandoned, name, bindAgain: () => Effect.runPromise(Effect.result(binder.bind(placement.pool, key, placement))) };
 }
 

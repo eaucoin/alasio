@@ -40,8 +40,8 @@ export const ATTACH_VOLUME = "attach";
  * The spec `spec`, a pool's template's, of a restore's pod named `name`: its own directory on its
  * node named by its volume's path, not by a subpath of the directory of every pod's. A subpath is
  * bound into its container alone, without what is mounted beneath it, as kubelet binds one; a
- * volume's path is bound with it, so the workspace attached before its sandbox is restored is
- * there as the restore reopens the files it held open.
+ * volume's path is bound with it, so the workspace attached there before the pod is made is
+ * there as its restore reopens the files it held open.
  */
 export function ownDirectory(spec: V1PodSpec, name: string): V1PodSpec {
   const unsubpathed = (container: V1Container): V1Container => ({
@@ -61,31 +61,6 @@ export function ownDirectory(spec: V1PodSpec, name: string): V1PodSpec {
     containers: spec.containers.map(unsubpathed),
     ...(spec.initContainers ? { initContainers: spec.initContainers.map(unsubpathed) } : {}),
     ...(spec.volumes ? { volumes: spec.volumes.map((volume) => (volume.name === ATTACH_VOLUME ? { name: ATTACH_VOLUME, hostPath: { path: `${ATTACH_ROOT}/${name}`, type: "DirectoryOrCreate" } } : volume)) } : {}),
-  };
-}
-
-/** The init container of a restore's pod: its name, and its resources. */
-export const ATTACH_WAIT = { name: "attach-wait", resources: { requests: { cpu: "10m", memory: "16Mi" }, limits: { memory: "32Mi" } } } as const;
-
-/**
- * The init container of a restore's pod (./snapshots.ts), of its bayma's, `bayma`'s, image,
- * security and own directory: it waits until its workspace is attached there, its binding's
- * token written beside it once it is, so the sandbox restored as its bayma starts finds every
- * file it held open in it, as a restore reopens each before it resumes.
- */
-export function attachWait(bayma: V1Container): V1Container {
-  const attach = (bayma.volumeMounts ?? []).filter(({ name }) => name === ATTACH_VOLUME);
-  const directory = attach[0]?.mountPath ?? "/attach";
-  return {
-    name: ATTACH_WAIT.name,
-    ...(bayma.image === undefined ? {} : { image: bayma.image }),
-    ...(bayma.imagePullPolicy === undefined ? {} : { imagePullPolicy: bayma.imagePullPolicy }),
-    command: ["sh", "-c", `until [ -s ${directory}/token ]; do sleep 0.2; done`],
-    // Its directory's subPathExpr names the pod by it.
-    env: (bayma.env ?? []).filter(({ name }) => name === "POD_NAME"),
-    ...(bayma.securityContext === undefined ? {} : { securityContext: bayma.securityContext }),
-    volumeMounts: attach,
-    resources: { requests: { ...ATTACH_WAIT.resources.requests }, limits: { ...ATTACH_WAIT.resources.limits } },
   };
 }
 
