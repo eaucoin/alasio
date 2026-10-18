@@ -51,6 +51,7 @@ import { filerStoreBackupHours } from "../src/manifests/config.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
+import { VERSION } from "../src/release.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
 /** A NetworkPolicy as rendered, its ingress rules' peers under `from`. */
@@ -3324,15 +3325,30 @@ describe("admission", () => {
   });
 });
 
-test("no StatefulSet's claim templates change from one release to the next, as Kubernetes changes none: none carries the release's version", () => {
+test("no field Kubernetes changes of no object once made carries the release's version, which would refuse every upgrade: workloads' selectors, StatefulSets' service names and claim templates", () => {
+  /** The fields of `object` Kubernetes changes of none once made, by their names. */
+  const immutable = ({ kind, spec }: KubernetesObject & { spec?: Record<string, unknown> }): [string, unknown][] => {
+    switch (kind) {
+      case "Deployment":
+      case "DaemonSet":
+      case "ReplicaSet":
+        return [["selector", spec?.["selector"]]];
+      case "StatefulSet":
+        return [["selector", spec?.["selector"]], ["serviceName", spec?.["serviceName"]], ["volumeClaimTemplates", spec?.["volumeClaimTemplates"]]];
+      default:
+        // A Job's pod template, which cannot change either, is run afresh, one of its name deleted first (src/kube/apply.ts).
+        return [];
+    }
+  };
   for (const objects of [install(), branchObjects(configOf(), "try")]) {
-    for (const statefulSet of all<V1StatefulSet>(objects, "StatefulSet")) {
-      for (const claim of statefulSet.spec?.volumeClaimTemplates ?? []) {
-        assert.equal(claim.metadata?.labels?.["app.kubernetes.io/version"], undefined, `${statefulSet.metadata?.name}'s claim ${claim.metadata?.name}`);
+    for (const object of objects) {
+      for (const [field, value] of immutable(object)) {
+        const said = JSON.stringify(value ?? null);
+        assert.ok(!said.includes("app.kubernetes.io/version") && !said.includes(VERSION), `${object.kind} ${object.metadata?.name}'s ${field}: ${said}`);
       }
     }
   }
-  // The log's carry its other labels, which its pods do.
+  // The log's claims carry its pods' other labels.
   const log = one<V1StatefulSet>(install(), "StatefulSet", "alasio-log");
   const { "app.kubernetes.io/version": _version, ...podLabels } = log.spec?.template.metadata?.labels ?? {};
   assert.deepEqual(log.spec?.volumeClaimTemplates?.[0]?.metadata?.labels, podLabels);
