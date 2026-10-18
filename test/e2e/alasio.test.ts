@@ -379,7 +379,10 @@ if (inShard("upgrade")) {
       {
         seeds: "the folder conversation's REPL sessions live in its bayma's Sandbox, a Python one counting in a thread of its own, and a Bun one",
         seed: async () => {
-          const [sandbox, ...others] = (await kube.list<FolderSandbox>("Sandbox", { namespace: HOST_NAMESPACE })).filter(({ metadata }) => metadata.labels?.["alasio.dev/workload"] === "folder");
+          // Main's folder has a bayma of its own beside it.
+          const [sandbox, ...others] = (await kube.list<FolderSandbox>("Sandbox", { namespace: HOST_NAMESPACE })).filter(({ metadata }) =>
+            metadata.labels?.["alasio.dev/workload"] === "folder" && metadata.annotations?.["alasio.dev/conversation"] === `telegram:${FOLDER_CHAT}`
+          );
           assert.ok(sandbox && others.length === 0, "the folder chat's bayma is one Sandbox");
           const args = sandbox.spec.podTemplate.spec?.containers.find(({ name }) => name === "bayma")?.args ?? [];
           folderBayma = {
@@ -400,9 +403,9 @@ if (inShard("upgrade")) {
           assert.ok((seen.python.count ?? 0) > folderRepls.count, `the count went on from ${folderRepls.count}: ${JSON.stringify(seen)}`);
           for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
           // The gateway's pod of the folder pool, bound to the conversation's key, on the state directory the Sandbox's bayma had.
-          const [instance, ...others] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
-          assert.deepEqual(others, []);
-          assert.equal(instance?.metadata?.annotations?.["alasio.dev/binding-key"], folderBayma.key);
+          const [instance, ...others] = (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" }))
+            .filter((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"] === folderBayma.key);
+          assert.ok(instance && others.length === 0, `the folder chat's folder instance is one pod, bound to ${folderBayma.key}`);
           const args = instance?.spec?.containers.find(({ name }) => name === "bayma")?.args ?? [];
           assert.equal(args[args.indexOf("--state-dir") + 1], folderBayma.state);
         },
@@ -638,7 +641,8 @@ if (inShard("upgrade")) {
       const kept = `kept by ${folderBayma.name}`;
       assert.deepEqual([seen.python.kept, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, false, null, kept], JSON.stringify(seen));
       for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", CAME_BACK_FROM_CHECKPOINT);
-      const [instance] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+      const instance = (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" }))
+        .find((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"] === folderBayma.key);
       assert.match(instance?.spec?.containers.find(({ name }) => name === "bayma")?.image ?? "", new RegExp(`@${PREVIOUS_BAYMA.digest}$`, "u"));
     });
   });
