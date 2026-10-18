@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Effect, PubSub } from "effect";
+import { Effect, Option, PubSub } from "effect";
 
 import { HarnessHost } from "../src/harness/host.ts";
 import type { Harness, TurnParams, TurnResult } from "../src/harness/index.ts";
@@ -82,6 +82,10 @@ test("a turn started through the host runs on its harness under the turn's claim
       assert.equal(yield* host.startFreshSession({ conversationId, harness: CODEX_HARNESS, workingDirectory: "/work" }), `fresh-of-${conversationId}`);
       // No turn of it runs once it has ended.
       assert.deepEqual(yield* host.status(conversationId), { busy: false });
+      // The panels reach the mount's harness through the host.
+      const panels = Option.getOrNull(yield* host.panels(yield* store.getMount(conversationId)));
+      assert.equal(panels?.displayName, harnessDisplayName(CODEX_HARNESS));
+      assert.throws(() => panels?.listModels(), /the recording harness has no listModels/u);
     })))
   );
   const [params] = seen;

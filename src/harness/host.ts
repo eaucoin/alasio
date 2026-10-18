@@ -16,11 +16,11 @@
  */
 import { Context, Effect, Layer, Option, PubSub, type Scope } from "effect";
 
-import type { ModelChoice } from "../persistence/conversation-repository.ts";
+import type { ModelChoice, Mount } from "../persistence/conversation-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store, type TurnFenced } from "../persistence/store.ts";
 import { ActiveTurns, type StopReason } from "./active-turns.ts";
-import { type AttachedTurn, type HarnessError, Harnesses, type HarnessUnavailable, type OwnTurn, type OwnTurns, type TurnResult } from "./index.ts";
+import { type AttachedTurn, type Harness, type HarnessError, Harnesses, type HarnessUnavailable, type OwnTurn, type OwnTurns, type TurnResult } from "./index.ts";
 import type { HarnessName } from "./names.ts";
 
 /** A turn for the host to run: where, on what, and as which claim of the conversation. */
@@ -50,6 +50,12 @@ export type HostEvent =
   /** It let go of the conversation, which may run what waits on it. */
   | { readonly kind: "idle"; readonly conversationId: string };
 
+/**
+ * What the operator's panels reach of a mount's harness, through its host: what it is,
+ * its sessions, its goals where it has them, and its models.
+ */
+export type HarnessPanels = Pick<Harness, "name" | "displayName" | "supportsGoals" | "sessions" | "goals" | "listModels" | "defaultModelChoice">;
+
 /** What the host says of a conversation. */
 export interface HarnessStatus {
   /** Whether a turn runs in it, or it is held for one, so no other may start. */
@@ -76,6 +82,8 @@ export class HarnessHost extends Context.Service<HarnessHost, {
   readonly status: (conversationId: string) => Effect.Effect<HarnessStatus>;
   /** A new, empty session of `harness` in `workingDirectory` for the conversation: its id. */
   readonly startFreshSession: (params: { readonly conversationId: string; readonly harness: HarnessName; readonly workingDirectory: string }) => Effect.Effect<string, HarnessError | HarnessUnavailable>;
+  /** What the panels reach of the mount's harness in its folder; none until both are mounted. */
+  readonly panels: (mount: Mount) => Effect.Effect<Option.Option<HarnessPanels>, HarnessUnavailable>;
   /** Subscribes to the host's events, for as long as the scope lasts. */
   readonly events: Effect.Effect<PubSub.Subscription<HostEvent>, never, Scope.Scope>;
 }>()("alasio/harness/HarnessHost") {
@@ -137,6 +145,7 @@ export class HarnessHost extends Context.Service<HarnessHost, {
       status: (conversationId) => Effect.map(activeTurns.isBusy(conversationId), (busy) => ({ busy })),
       startFreshSession: ({ conversationId, harness, workingDirectory }) =>
         Effect.flatMap(harnesses.getFor(harness, workingDirectory), (found) => found.startFreshSession({ threadKey: conversationId, workingDirectory })),
+      panels: (mount) => harnesses.forMount(mount),
       events: PubSub.subscribe(events),
     });
   }));

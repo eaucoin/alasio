@@ -84,7 +84,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     yield* handleWorkspaceTextCommand({ ...conversation, args: cmd.args });
     return true;
   }
-  const harness = Option.getOrNull(yield* Effect.flatMap(Harnesses, (harnesses) => harnesses.forMount(mount)));
+  const harness = Option.getOrNull(yield* Effect.flatMap(HarnessHost, (host) => host.panels(mount)));
   if (cmd.type === "model") {
     yield* sendModelPanel({ harness, ...conversation });
     return true;
