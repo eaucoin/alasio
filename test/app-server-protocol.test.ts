@@ -18,12 +18,12 @@ import {
   mapNotificationToSdkEvent,
   notificationMatchesTurn,
 } from "../src/codex/app-server/protocol.ts";
-import { AppServerRequestFailed, type AppServerRequestError, AppServerRequestTimeout, type AppServerRpc } from "../src/codex/app-server/rpc-client.ts";
+import { AppServerNotRunning, AppServerRequestFailed, type AppServerRequestError, AppServerRequestTimeout, type AppServerRpc } from "../src/codex/app-server/rpc-client.ts";
 import { type AppServerApart, makeAppServerThreads } from "../src/codex/app-server/thread-client.ts";
 import { mapItemToBlocks, responseProjection } from "../src/codex/event-projection.ts";
 import type { CodexThreadConfig } from "../src/codex/thread-config.ts";
 import { appServerProcess } from "./support/app-server-process.ts";
-import { agentMessage, codexModel, codexThread, codexTurn } from "./support/codex-protocol.ts";
+import { agentMessage, codexModel, codexThread, codexTurn, turnCompleted } from "./support/codex-protocol.ts";
 
 /** An active goal as Codex reports it. */
 function activeGoal(threadId: string, objective: string): v2.ThreadGoal {
@@ -513,4 +513,92 @@ test("the login's models not listed within ten seconds are none for the turn tha
     // Not kept: the next turn asks again, and keeps the list that came.
     assert.deepEqual([(yield* thread.loginModels(scope)).map(({ id }) => id), asked], [["gpt-5.6-terra"], 2]);
     assert.deepEqual([(yield* thread.loginModels(scope)).map(({ id }) => id), asked], [["gpt-5.6-terra"], 2]);
+  }).pipe(Effect.provide(TestClock.layer()))));
+
+test("a conversation has Codex working on its own while a turn of any of its threads runs, whoever started it, or any of them has a terminal running; none of a thread not loaded, nor where no app-server runs", () =>
+  withNotifications((queue) => Effect.gen(function*() {
+    const asked: string[] = [];
+    const terminal = (itemId: string): v2.ThreadBackgroundTerminal => ({ itemId, processId: itemId, command: "sleep 20", cwd: "/tmp", osPid: null, cpuPercent: null, rssKb: null });
+    let terminals: (threadId: string) => Effect.Effect<v2.ThreadBackgroundTerminalsListResponse, AppServerRequestError> = (threadId) =>
+      Effect.succeed({ data: threadId === "thread-old" ? [terminal("c1")] : [], nextCursor: null });
+    const thread = makeAppServerThreads(answeringRpc({
+      "thread/start": () => Effect.succeed(threadLoaded(codexThread("thread-old")) as v2.ThreadStartResponse),
+      "thread/fork": () => Effect.succeed(threadLoaded(codexThread("thread-new")) as v2.ThreadForkResponse),
+      "thread/backgroundTerminals/list": (params) => Effect.suspend(() => (asked.push(params.threadId), terminals(params.threadId))),
+    }), queue, apart);
+    const scope = { threadKey: "telegram:41", cwd: "/tmp", env: {}, config: NO_CONFIG };
+    // No thread of its own yet: nothing to ask.
+    assert.deepEqual([yield* thread.backgroundWork("telegram:41"), asked], [false, []]);
+    // Its session started, then forked into a new one: the old thread, loaded still, runs a terminal.
+    yield* thread.startThread(scope);
+    yield* thread.forkThread({ ...scope, threadId: "thread-old", beforeTurnId: "turn-1" });
+    assert.deepEqual([yield* thread.backgroundWork("telegram:41"), asked.toSorted()], [true, ["thread-old"]]);
+    assert.deepEqual(yield* thread.backgroundWork("telegram:42"), false);
+    // A turn none of alasio's ran, a goal's, as its thread/goal/updated names it: work, asked nothing of.
+    terminals = () => Effect.succeed({ data: [], nextCursor: null });
+    asked.length = 0;
+    yield* queue.observe({ method: "thread/goal/updated", params: { threadId: "thread-new", turnId: "goal-turn", goal: null } } as never);
+    assert.deepEqual([yield* thread.backgroundWork("telegram:41"), asked], [true, ["thread-old"]]);
+    yield* queue.observe(turnCompleted("thread-new", codexTurn("goal-turn", { status: "completed" })));
+    assert.equal(yield* thread.backgroundWork("telegram:41"), false);
+    // A thread its app-server no longer has is none, and asked of no more.
+    terminals = (threadId) => (threadId === "thread-old" ? Effect.fail(new AppServerRequestFailed({ error: { code: -32600, message: `thread not found: ${threadId}` } })) : Effect.succeed({ data: [], nextCursor: null }));
+    asked.length = 0;
+    assert.equal(yield* thread.backgroundWork("telegram:41"), false);
+    assert.equal(yield* thread.backgroundWork("telegram:41"), false);
+    assert.deepEqual(asked, ["thread-old", "thread-new", "thread-new"]);
+    // No app-server running: none.
+    terminals = () => Effect.fail(new AppServerNotRunning());
+    assert.equal(yield* thread.backgroundWork("telegram:41"), false);
+  })));
+
+test("a conversation's session the app-server has loaded already, or resumes, as after a restart, is asked of for its background work, and no more once the app-server is gone", () =>
+  withNotifications((queue) => Effect.gen(function*() {
+    const asked: string[] = [];
+    const thread = makeAppServerThreads(answeringRpc({
+      "thread/loaded/list": () => Effect.succeed({ data: ["thread-loaded"], nextCursor: null }),
+      "thread/resume": (params) => Effect.succeed(threadLoaded(codexThread(params.threadId))),
+      "thread/backgroundTerminals/list": (params) => Effect.sync(() => (asked.push(params.threadId), { data: [], nextCursor: null })),
+    }), queue, apart);
+    const scope = { threadKey: "telegram:41", cwd: "/tmp", env: {}, config: NO_CONFIG };
+    // One the app-server has loaded already, and one it resumes.
+    yield* thread.ensureThread({ ...scope, threadId: "thread-loaded" });
+    yield* thread.ensureThread({ ...scope, threadId: "thread-resumed" });
+    assert.deepEqual([yield* thread.backgroundWork("telegram:41"), asked], [false, ["thread-loaded", "thread-resumed"]]);
+    // Its app-server stopped, or gone on its own (./rpc-client.ts onEnded): its threads are no conversation's, nor its turns.
+    yield* queue.observe({ method: "thread/goal/updated", params: { threadId: "thread-loaded", turnId: "goal-turn", goal: null } } as never);
+    assert.equal(yield* thread.backgroundWork("telegram:41"), true);
+    asked.length = 0;
+    yield* queue.clear;
+    assert.deepEqual([yield* thread.backgroundWork("telegram:41"), asked], [false, []]);
+  })));
+
+test("a goal's turn an app-server ran as it crashed is gone with it: its conversation has no work of Codex's own after, its threads no more asked of", async () => {
+  const process = appServerProcess();
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const appServer = yield* makeAppServer({ spawn: process.spawn });
+    process.answer("thread/start", () => threadLoaded(codexThread("thread-1")));
+    process.answer("thread/backgroundTerminals/list", () => ({ data: [], nextCursor: null }));
+    yield* appServer.startThread({ threadKey: "telegram:41", cwd: "/tmp", env: {}, config: NO_CONFIG });
+    process.send({ method: "thread/goal/updated", params: { threadId: "thread-1", turnId: "goal-turn", goal: null } });
+    for (let waited = 0; !(yield* appServer.backgroundWork("telegram:41")) && waited < 2000; waited += 20) yield* Effect.sleep("20 millis");
+    assert.equal(yield* appServer.backgroundWork("telegram:41"), true);
+    process.exit();
+    for (let waited = 0; (yield* appServer.backgroundWork("telegram:41")) && waited < 2000; waited += 20) yield* Effect.sleep("20 millis");
+    assert.equal(yield* appServer.backgroundWork("telegram:41"), false);
+  })).pipe(Effect.provide(Logger.layer([]))));
+});
+
+test("a conversation's background work not told within five seconds fails as not told, which its harness takes as work going on", () =>
+  withNotifications((queue) => Effect.gen(function*() {
+    const thread = makeAppServerThreads(answeringRpc({
+      "thread/start": () => Effect.succeed(threadLoaded(codexThread("thread-1")) as v2.ThreadStartResponse),
+      "thread/backgroundTerminals/list": () => Effect.never,
+    }), queue, apart);
+    yield* thread.startThread({ threadKey: "telegram:41", cwd: "/tmp", env: {}, config: NO_CONFIG });
+    const asking = yield* Effect.forkChild(Effect.flip(thread.backgroundWork("telegram:41")));
+    yield* TestClock.adjust("4 seconds");
+    assert.equal(asking.pollUnsafe(), undefined);
+    yield* TestClock.adjust("1 second");
+    assert.equal((yield* Fiber.join(asking))._tag, "AppServerRequestTimeout");
   }).pipe(Effect.provide(TestClock.layer()))));

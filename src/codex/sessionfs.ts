@@ -26,7 +26,7 @@ import { Context, Effect, Layer, RcRef, type Scope } from "effect";
 import { getCodexTransportMode } from "../config.ts";
 import { SESSION_FS_AGENT_INSTRUCTIONS } from "../harness/workspace-instructions.ts";
 import type { BaymaEndpoint } from "../kube/sandboxes.ts";
-import { makeAppServer } from "./app-server/client.ts";
+import { type AppServer, makeAppServer } from "./app-server/client.ts";
 import { type SpawnAppServer, spawnAppServer } from "./app-server/process.ts";
 import { type CodexEnv, codexHome } from "./env.ts";
 import { type StartLoginRelay, startLoginRelay } from "./login-relay.ts";
@@ -96,6 +96,8 @@ export interface SessionFsScopeParams {
 export class SessionFsCodex extends Context.Service<SessionFsCodex, {
   /** Its Codex home. */
   readonly home: string;
+  /** Its app-server, as the scopes give it, for what asks of one only where it runs (backgroundWork). */
+  readonly appServer: AppServer;
   /** The scope a call in the workspace reached through `bayma` runs against, in `directory`. */
   readonly scope: (params: SessionFsScopeParams) => Effect.Effect<CodexScope, CodexScopeError | CodexTransportRefused>;
   /** The scope a thread list, a model list, or a goal read runs against: no workspace needed. */
@@ -144,6 +146,7 @@ export const makeSessionFsCodex = Effect.fnUntraced(function*({
 
   return SessionFsCodex.of({
     home,
+    appServer,
     scope: ({ directory, bayma }) =>
       getCodexTransportMode() === "exec"
         ? Effect.fail(new CodexTransportRefused({ message: "session-filesystem workspaces run Codex through its app-server; unset ALASIO_CODEX_TRANSPORT=exec" }))

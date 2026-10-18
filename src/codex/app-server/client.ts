@@ -92,6 +92,7 @@ function inLogScope(appServer: AppServer): AppServer {
     listTurns: (scope) => scoped(appServer.listTurns(scope)),
     listModels: (scope) => scoped(appServer.listModels(scope)),
     loginModels: (scope) => scoped(appServer.loginModels(scope)),
+    backgroundWork: (threadKey) => scoped(appServer.backgroundWork(threadKey)),
     startTurn: (options) => scoped(appServer.startTurn(options)),
     claimTurn: (threadId, turnId) => scoped(appServer.claimTurn(threadId, turnId)),
     waitForTurnId: (threadId, timeout) => scoped(appServer.waitForTurnId(threadId, timeout)),
@@ -108,7 +109,8 @@ function inLogScope(appServer: AppServer): AppServer {
 /** A Codex app-server, run as asked until the scope closes. */
 export const makeAppServer = Effect.fnUntraced(function*({ spawn = spawnAppServer }: AppServerOptions = {}): Effect.fn.Return<AppServer, never, Scope.Scope> {
   const notifications = yield* makeAppServerNotifications;
-  const rpc = yield* makeAppServerRpc({ spawn, onNotification: notifications.observe });
+  // What an app-server that ended on its own had running is gone with it: its turns, and the threads it loaded.
+  const rpc = yield* makeAppServerRpc({ spawn, onNotification: notifications.observe, onEnded: notifications.clear });
   // What outlasts what asked for it (a turn stopped as it starts, stopped there): the
   // app-server waits for it before it stops, each bounded as it runs.
   const apart = yield* FiberSet.make<void>();

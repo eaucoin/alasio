@@ -4,10 +4,10 @@
  * answered as the test says (initialize always is), and the test sends it lines as the
  * app-server writes them.
  */
-import { type Cause, Deferred, Effect, Queue, Stream } from "effect";
+import { type Cause, Deferred, Effect, Exit, Queue, Stream } from "effect";
 
 import type { ClientRequest, RequestId } from "../../.types/codex/index.js";
-import type { AppServerEnded, AppServerProcessOptions, SpawnAppServer } from "../../src/codex/app-server/process.ts";
+import { type AppServerEnded, AppServerExited, type AppServerProcessOptions, type SpawnAppServer } from "../../src/codex/app-server/process.ts";
 import { initializeResponse } from "./codex-protocol.ts";
 
 /** A message alasio wrote to the app-server: a request, a notification, or an answer to one of its requests. */
@@ -32,6 +32,8 @@ export interface AppServerProcessStandIn {
   send(message: object): void;
   /** Answers every request of `method` from now on with what `answer` returns. */
   answer(method: ClientRequest["method"], answer: Answer): void;
+  /** Ends the process started last on its own, as one that crashed exits. */
+  exit(): void;
 }
 
 export function appServerProcess(): AppServerProcessStandIn {
@@ -39,6 +41,7 @@ export function appServerProcess(): AppServerProcessStandIn {
   const written: WrittenMessage[] = [];
   const answers = new Map<string, Answer>([["initialize", () => initializeResponse()]]);
   let output: Queue.Queue<string, Cause.Done> | null = null;
+  let end: Deferred.Deferred<never, AppServerEnded> | null = null;
 
   const spawn: SpawnAppServer = (options) =>
     Effect.gen(function*() {
@@ -46,6 +49,7 @@ export function appServerProcess(): AppServerProcessStandIn {
       const lines = yield* Effect.acquireRelease(Queue.unbounded<string, Cause.Done>(), Queue.end);
       const ended = yield* Deferred.make<never, AppServerEnded>();
       output = lines;
+      end = ended;
       return {
         write: (line) =>
           Effect.sync(() => {
@@ -70,6 +74,10 @@ export function appServerProcess(): AppServerProcessStandIn {
     },
     answer(method, answer) {
       answers.set(method, answer);
+    },
+    exit() {
+      if (!end) throw new Error("no app-server process was started");
+      Deferred.doneUnsafe(end, Exit.fail(new AppServerExited({ code: null, signal: "SIGSEGV" })));
     },
   };
 }

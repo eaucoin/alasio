@@ -19,6 +19,7 @@ import { HarnessHost, type HostEvent } from "./host.ts";
 import { HarnessHostError } from "./index.ts";
 import {
   Alive,
+  BackgroundWorkAnswer,
   type CrossingError,
   crossingErrorOf,
   decodeTurnAnswer,
@@ -184,6 +185,8 @@ const makeRemoteHost = Effect.fnUntraced(function*({ url, token, panels }: Remot
         Effect.mapError((error) => (error._tag === "HarnessHostError" ? error : new HarnessHostError({ reason: error.message }))),
       ),
     status: (conversationId) => call(HOST_PATHS.status, { conversationId }, StatusAnswer).pipe(Effect.mapError(asStatusError)),
+    backgroundWork: (conversationId) =>
+      call(HOST_PATHS.backgroundWork, { conversationId }, BackgroundWorkAnswer).pipe(Effect.map(({ working }) => working), Effect.mapError(asStatusError)),
     startFreshSession: ({ conversationId, harness, workingDirectory }) =>
       call(HOST_PATHS.freshSession, { conversationId, harness, workingDirectory }, FreshSessionAnswer).pipe(
         Effect.map(({ sessionId }) => sessionId),

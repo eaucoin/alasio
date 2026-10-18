@@ -28,6 +28,7 @@ export interface AppServerRequests {
   "thread/list": { params: ProtocolParams<"thread/list">; result: v2.ThreadListResponse };
   "thread/turns/list": { params: ProtocolParams<"thread/turns/list">; result: v2.ThreadTurnsListResponse };
   "model/list": { params: ProtocolParams<"model/list">; result: v2.ModelListResponse };
+  "thread/backgroundTerminals/list": { params: ProtocolParams<"thread/backgroundTerminals/list">; result: v2.ThreadBackgroundTerminalsListResponse };
   "turn/start": { params: ProtocolParams<"turn/start">; result: v2.TurnStartResponse };
   "turn/steer": { params: ProtocolParams<"turn/steer">; result: v2.TurnSteerResponse };
   "turn/interrupt": { params: ProtocolParams<"turn/interrupt">; result: v2.TurnInterruptResponse };

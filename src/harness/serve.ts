@@ -27,6 +27,8 @@ import type { ReceivedFileError } from "../telegram/files.ts";
 import { HarnessHost, type TurnStart } from "./host.ts";
 import type { HarnessUnavailable, TurnResult } from "./index.ts";
 import {
+  BackgroundWorkAnswer,
+  BackgroundWorkRequest,
   encodeTurnAnswer,
   failureOf,
   FreshSessionAnswer,
@@ -175,6 +177,12 @@ export const serveHost = Effect.fnUntraced(function*(
         return Effect.flatMap(body(StatusRequest), () =>
           host.status(conversationId).pipe(
             Effect.map((status) => answer(200, Schema.encodeSync(StatusAnswer)(status))),
+            Effect.mapError((error) => failed(422, error)),
+          ));
+      case HOST_PATHS.backgroundWork:
+        return Effect.flatMap(body(BackgroundWorkRequest), () =>
+          host.backgroundWork(conversationId).pipe(
+            Effect.map((working) => answer(200, Schema.encodeSync(BackgroundWorkAnswer)({ working }))),
             Effect.mapError((error) => failed(422, error)),
           ));
       case HOST_PATHS.freshSession:

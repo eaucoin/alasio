@@ -57,7 +57,13 @@ export interface AppServerNotifications {
   readonly forgetTurn: (threadId: string) => Effect.Effect<void>;
   /** Drops the thread's queued notifications of turns other than `turnId`'s; how many it dropped. */
   readonly discardStaleForTurn: (threadId: string, turnId: string | null | undefined) => Effect.Effect<number>;
-  /** Forgets every thread's turn and queued notifications. */
+  /** Records that `threadId` is loaded for the conversation `threadKey`: one of the threads its background work is asked of. */
+  readonly recordThread: (threadKey: string, threadId: string) => Effect.Effect<void>;
+  /** The threads loaded for the conversation `threadKey` (recordThread). */
+  readonly threadsOf: (threadKey: string) => Effect.Effect<ReadonlyArray<string>>;
+  /** Forgets that `threadId` is loaded for the conversation `threadKey`, as the app-server has it no more. */
+  readonly forgetThread: (threadKey: string, threadId: string) => Effect.Effect<void>;
+  /** Forgets every thread's turn and queued notifications, and the threads loaded, as the app-server they were of is gone. */
   readonly clear: Effect.Effect<void>;
   /** The threads with a turn running, each with the turn's id: what stopping the app-server ends. */
   readonly runningTurns: Effect.Effect<ReadonlyArray<{ readonly threadId: string; readonly turnId: string }>>;
@@ -71,6 +77,8 @@ export interface AppServerNotifications {
  */
 export const makeAppServerNotifications: Effect.Effect<AppServerNotifications, never, Scope.Scope> = Effect.gen(function*() {
   const turnByThread = new Map<string, ThreadTurn>();
+  // The threads loaded for each conversation, by its thread key.
+  const threadsByKey = new Map<string, Set<string>>();
   let queues = new Map<string, Queue.Queue<AppServerNotification>>();
   const remembered = yield* Effect.acquireRelease(PubSub.unbounded<RememberedTurn>(), PubSub.shutdown);
   // A queue is added to, or sorted through, by one fiber at a time, so its order holds.
@@ -198,11 +206,16 @@ export const makeAppServerNotifications: Effect.Effect<AppServerNotifications, n
       return discarded;
     }),
 
+    recordThread: (threadKey, threadId) => Effect.sync(() => void threadsByKey.set(threadKey, (threadsByKey.get(threadKey) ?? new Set<string>()).add(threadId))),
+    threadsOf: (threadKey) => Effect.sync(() => [...(threadsByKey.get(threadKey) ?? [])]),
+    forgetThread: (threadKey, threadId) => Effect.sync(() => void threadsByKey.get(threadKey)?.delete(threadId)),
+
     clear: Effect.sync(() => {
       // A wait on a forgotten queue goes on until the wait for the app-server it was on
-      // (whose stop clears these) ends it.
+      // (whose stop or end clears these) ends it.
       queues = new Map();
       turnByThread.clear();
+      threadsByKey.clear();
     }),
   };
 });
