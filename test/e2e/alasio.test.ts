@@ -23,7 +23,7 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Node, V1PersistentVolume, V1Pod, V1PodTemplateSpec, V1Secret, V1Service, V1StatefulSet, V1ValidatingAdmissionPolicy, V1ValidatingAdmissionPolicyBinding, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Node, V1Pod, V1PodTemplateSpec, V1Secret, V1Service, V1StatefulSet, V1ValidatingAdmissionPolicy, V1ValidatingAdmissionPolicyBinding, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
@@ -39,7 +39,7 @@ import type { Sandbox } from "../../src/kube/sandboxes.ts";
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
-import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES } from "../../src/node-agent/names.ts";
+import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER } from "./codex-stand-in.ts";
 import { bindInBranch, mainSandboxService, sandboxService, servesBranch } from "./sandbox-service.ts";
@@ -2994,16 +2994,26 @@ if (inShard("branches")) {
       assert.equal((await kube.get<V1Deployment>(compute))?.spec?.replicas, 1);
     });
 
-    test("alasio branch delete leaves nothing of the branch, and main's lake maintenance deletes files again", async () => {
+    test("alasio branch delete refuses while a workspace of the branch's sessions is bound, and with --force leaves nothing of the branch, its workspaces deleted, and main's lake maintenance deletes files again", async () => {
       const { branches } = JSON.parse(await neonControl("/branches")) as { branches: { name: string; timelineId: string }[] };
       const timeline = branches.find(({ name }) => name === BRANCH)?.timelineId;
       assert.ok(timeline);
+      // Its session's workspace bound by a turn, which has ended.
+      await branch.say("once more");
+      await branch.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      assert.ok(await boundPodOf(volumeId, BRANCH_SESSIONS), `the branch's ${volumeId} is bound to no pod of its own pools`);
+      const refused = await alasio("branch", "delete", BRANCH);
+      assert.notEqual(refused.code, 0, refused.stdout);
+      assert.match(refused.stderr, new RegExp(`its sessions?'s? workspaces? [^\\n]*\\b${volumeId}\\b[^\\n]* bound; --force deletes it all the same`, "u"));
+      assert.ok(await kube.get(ref("Namespace", BRANCH_SESSIONS)));
       // Its bot told to deliver nowhere, as the branch's stand-in is told.
-      await alasioOkWith({ TELEGRAM_API_ROOT: branchTelegram?.base }, "branch", "delete", BRANCH);
+      await alasioOkWith({ TELEGRAM_API_ROOT: branchTelegram?.base }, "branch", "delete", BRANCH, "--force");
       assert.equal(await alasioOk("branch", "list"), "alasio has no branch environments.\n");
       for (const namespace of [BRANCH_NAMESPACE, BRANCH_SESSIONS]) assert.equal(await kube.get(ref("Namespace", namespace)), null);
-      const volumes = await kube.list<V1PersistentVolume>("PersistentVolume");
-      assert.deepEqual(volumes.filter(({ spec }) => spec?.claimRef?.namespace === BRANCH_SESSIONS).map(({ metadata }) => metadata?.name), []);
+      // Nothing of its sessions' workspaces is left in workspace storage, as each node mounts it.
+      for (const agent of (await nodeAgents()).values()) {
+        assert.equal(await kube.execOk(NAMESPACE, agent, ["sh", "-c", `ls -A "$0" 2>/dev/null || true`, `${WORKSPACES_ROOT}/${BRANCH_SESSIONS}`], { container: "node-agent" }), "");
+      }
       const { tenantId } = JSON.parse(await kube.secret(NAMESPACE, "alasio-neon-root", "secrets.json")) as { tenantId: string };
       const controller = await kube.runningPod(NAMESPACE, "alasio-neon-storage-controller");
       const found = await kube.execOk(NAMESPACE, controller, ["sh", "-c", 'curl -sS -o /dev/null -w "%{http_code}" -H "authorization: Bearer $CONTROL_PLANE_JWT_TOKEN" "$0"', `http://127.0.0.1:1234/v1/tenant/${tenantId}/timeline/${timeline}`]);

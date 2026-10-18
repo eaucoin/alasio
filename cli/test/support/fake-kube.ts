@@ -155,10 +155,11 @@ function parse(path: string): { api: string; plural: string; namespace?: string;
   return { api, plural: rest[0] ?? "", ...(rest[1] ? { name: rest[1] } : {}) };
 }
 
-/** Whether `labels` carry every `key=value` of `selector`. */
+/** Whether `labels` carry every `key=value` of `selector`, and every bare `key` of it, of any value. */
 function selects(selector: string | null, labels: Readonly<Record<string, string>> | undefined): boolean {
   if (!selector) return true;
   return selector.split(",").every((pair) => {
+    if (!pair.includes("=")) return labels?.[pair] !== undefined;
     const [key = "", value = ""] = pair.split("=");
     return labels?.[key] === value;
   });

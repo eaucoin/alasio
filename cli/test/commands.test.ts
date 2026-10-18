@@ -1262,22 +1262,39 @@ test("up on k3s here asks root for nothing once all is as it should, gives CoreD
 /** Where a forward of the sandbox gateway's pod's port leads. */
 const GATEWAY_FORWARD = "alasio-sandbox-gateway-0:8080";
 
+/** What the sandbox gateway's front answers a call: its status, and its JSON, if any. */
+interface FrontAnswer {
+  readonly status: number;
+  readonly json?: unknown;
+}
+
 /**
- * The sandbox gateway's front, as `up` and `status` reach it through a port-forward to its
- * pod: what its snapshots name, as `answer` says, to main's token alone, signed by main's own
- * key, which alasio-sessions-caller holds, of the gateway's caller key `master`.
+ * The sandbox gateway's front, as the command line reaches it through a port-forward to its
+ * pod: `answer` answers each call whose token an environment's key, of the gateway's caller
+ * key `master`, signed, as the environment and key it names; any other is refused, 403.
  */
-async function gatewayReleases(t: TestContext, kube: FakeKube, answer: () => unknown): Promise<void> {
-  stackSecret(kube, "alasio-sessions-caller", { "caller-key": environmentKey(Buffer.from("master"), "main").toString() });
+async function gatewayFront(t: TestContext, kube: FakeKube, answer: (environment: string, key: string, method: string, path: string) => FrontAnswer): Promise<void> {
   const front = createHttpServer((request, response) => {
     const token = /^Bearer (.+)$/u.exec(request.headers.authorization ?? "")?.[1] ?? "";
     const claims = verifyToken(({ options }) => (options?.["environment"] === undefined ? null : environmentKey(Buffer.from("master"), options["environment"])), token, Date.now());
-    if (claims?.options?.["environment"] !== "main" || request.url !== "/snapshots/releases") return void response.writeHead(403).end();
-    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(answer()));
+    const environment = claims?.options?.["environment"];
+    const { status, json } = claims && environment ? answer(environment, claims.key, request.method ?? "", request.url ?? "") : { status: 403 };
+    response.writeHead(status, json === undefined ? {} : { "content-type": "application/json" }).end(json === undefined ? undefined : JSON.stringify(json));
   });
   await new Promise<void>((resolve) => front.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => (front.close(resolve), front.closeAllConnections())));
   kube.forwarded.set(GATEWAY_FORWARD, (front.address() as AddressInfo).port);
+}
+
+/**
+ * The sandbox gateway's front, as `up` and `status` reach it: what its snapshots name, as
+ * `answer` says, to main's token alone, signed by main's own key, which alasio-sessions-caller
+ * holds.
+ */
+async function gatewayReleases(t: TestContext, kube: FakeKube, answer: () => unknown): Promise<void> {
+  stackSecret(kube, "alasio-sessions-caller", { "caller-key": environmentKey(Buffer.from("master"), "main").toString() });
+  await gatewayFront(t, kube, (environment, _key, method, path) =>
+    environment === "main" && method === "GET" && path === "/snapshots/releases" ? { status: 200, json: answer() } : { status: 403 });
 }
 
 test("upgrade installs this version's k3s and gVisor release beside the one before, then removes that once it is no longer pinned, as no snapshot the gateway says names it, and up after each nothing", async (t) => {
@@ -1544,7 +1561,36 @@ function verifies(verifier: string | undefined, password: string): boolean {
  * computes answering in their pods as they do: neon-control's API through curl, the
  * databases through psql.
  */
-async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNeon }> {
+/** The workspaces the sandbox gateway serves, of each environment, and those deleted through it, `<environment>/<workspace>`. */
+interface FakeGateway {
+  readonly workspaces: Map<string, string[]>;
+  readonly deleted: string[];
+}
+
+/**
+ * The sandbox gateway's front for workspaces: lists an environment's, and deletes one, 409
+ * while a pod of its environment's sessions' namespace is bound to it, as its annotation
+ * says, as the gateway holds its binding until its pod is gone.
+ */
+async function workspacesGateway(t: TestContext, kube: FakeKube): Promise<FakeGateway> {
+  const gateway: FakeGateway = { workspaces: new Map(), deleted: [] };
+  const sessions = (environment: string) => `/api/v1/namespaces/alasio-branch-${environment}-sessions/pods/`;
+  const bound = (environment: string, key: string) =>
+    [...kube.objects].some(([path, pod]) => path.startsWith(sessions(environment)) && (pod.metadata["annotations"] as Record<string, string> | undefined)?.["alasio.dev/binding-key"] === key);
+  await gatewayFront(t, kube, (environment, key, method, path) => {
+    const of = gateway.workspaces.get(environment) ?? [];
+    if (method === "GET" && path === "/workspace/all") return { status: 200, json: { workspaces: of } };
+    const workspace = key.startsWith("sessionfs:") ? key.slice("sessionfs:".length) : "";
+    if (method !== "DELETE" || path !== "/workspace" || !workspace) return { status: 404 };
+    if (bound(environment, key)) return { status: 409, json: { error: `${workspace} is bound, or being bound or released; it is deleted once released` } };
+    gateway.workspaces.set(environment, of.filter((each) => each !== workspace));
+    gateway.deleted.push(`${environment}/${workspace}`);
+    return { status: 204 };
+  });
+  return gateway;
+}
+
+async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNeon; readonly gateway: FakeGateway }> {
   const setup = await installed(t);
   stackSecret(setup.kube, "alasio-database", {
     url: "postgresql://alasio:p@alasio-neon-proxy.alasio.svc:5432/alasio?options=endpoint%3Dalasio",
@@ -1604,7 +1650,7 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
     }
     return { exitCode: 0 };
   };
-  return { ...setup, neon };
+  return { ...setup, neon, gateway: await workspacesGateway(t, setup.kube) };
 }
 
 /** The value of `key` of the Secret `name` in `namespace`. */
@@ -2001,27 +2047,53 @@ test("branch list says each branch, what it is a branch of, its age, the release
   assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, made by alasio 0.0.0-development, its alasio ready, 1.8 GiB requested, 0 MiB used"]);
 });
 
-test("branch delete refuses while the branch's alasio has a turn running unless --force, and deletes it whole: its alasio and lake, its sessions, its compute, its branch of Neon, its namespaces, its Sandboxes' policy", async (t) => {
-  const { alasio, home, kube, neon, telegram } = await branchable(t);
+test("branch delete refuses while the branch's alasio has a turn running, or a workspace of its sessions is bound, unless --force, and deletes it whole: its alasio and lake, its sessions' workspaces, its compute, its branch of Neon, its namespaces, its Sandboxes' policy", async (t) => {
+  const { alasio, gateway, home, kube, neon, telegram } = await branchable(t);
   telegram.bots.set("456:branch", "branch_bot");
   writeFileSync(join(home, "branch"), "456:branch");
   succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
   const policy = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/alasio-branch-try-sandboxes";
   const binding = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/alasio-branch-try-sandboxes";
   assert.ok(kube.get(policy) && kube.get(binding));
+  // Its sessions' workspaces, as the gateway serves them, one of them bound to a pod of its pool's; and main's, which it leaves be.
+  gateway.workspaces.set("try", ["fs-abc123", "fs-def456"]);
+  gateway.workspaces.set("main", ["fs-abc123"]);
+  const boundPod = "/api/v1/namespaces/alasio-branch-try-sessions/pods/sandboxes-none-7d9f8-x2v5q";
+  kube.put("pods", {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: {
+      name: "sandboxes-none-7d9f8-x2v5q",
+      namespace: "alasio-branch-try-sessions",
+      labels: { "alasio.dev/pool": "sandboxes-none", "alasio.dev/binding": "0123abcd" },
+      annotations: { "alasio.dev/binding-key": "sessionfs:fs-def456" },
+    },
+    spec: { containers: [{ name: "bayma", image: "bayma" }] },
+    status: { phase: "Running" },
+  });
   neon.turns = "1";
   neon.asked.length = 0;
   assert.equal(failure(await alasio(["branch", "delete", "try"])), "its alasio has 1 turn running; --force deletes it all the same");
   // Its compute, which may sleep, woken to be asked.
   assert.deepEqual(neon.asked.filter(({ method }) => method === "POST").map(({ path }) => path), ["/computes/branch-try/wake"]);
+  neon.turns = "0";
+  kube.changes.length = 0;
+  assert.equal(failure(await alasio(["branch", "delete", "try"])), "its session's workspace fs-def456 is bound; --force deletes it all the same");
+  // Refused before anything changed.
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET").map(({ path }) => path).filter((path) => !path.includes("/exec")), []);
+  assert.deepEqual(gateway.deleted, []);
   assert.ok(kube.get(BRANCH_DEPLOYMENT));
   kube.changes.length = 0;
   const run = await alasio(["branch", "delete", "try", "--force"]);
   succeeded(run);
   assert.equal(run.printed.at(-1), "The branch try is deleted, with all it had; main's data is as it was.");
+  // Each of its workspaces deleted through the gateway, by the branch's own key, the bound one once its pod is gone; main's left be.
+  assert.deepEqual(gateway.deleted, ["try/fs-abc123", "try/fs-def456"]);
+  assert.deepEqual(gateway.workspaces.get("main"), ["fs-abc123"]);
   const deleted = kube.changes.filter(({ method }) => method === "DELETE").map(({ path }) => path);
   const at = (path: string) => deleted.indexOf(path);
-  assert.ok(at(BRANCH_DEPLOYMENT) >= 0 && at(BRANCH_DEPLOYMENT) < at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute"), deleted.join("\n"));
+  assert.ok(at(BRANCH_DEPLOYMENT) >= 0 && at(BRANCH_DEPLOYMENT) < at(boundPod), deleted.join("\n"));
+  assert.ok(at(boundPod) < at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute"), deleted.join("\n"));
   // Its read replica too, before its branch of Neon is deleted.
   assert.ok(at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute-ro") >= 0, deleted.join("\n"));
   const loader = at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-lake-loader");

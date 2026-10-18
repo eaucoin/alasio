@@ -5,7 +5,7 @@
  * (src/gateway/snapshots.ts). The sandbox gateway says which those are, of every
  * environment's workspaces, the snapshot each was released into and its current one, as
  * main's token reads it (GET /snapshots/releases, src/gateway/sessions.ts), through a
- * port-forward to a gateway pod of its own.
+ * port-forward to a gateway pod of its own (./gateway-calls.ts).
  *
  * Where the gateway cannot be read (the cluster is down, no gateway runs, or what it
  * answers is not what it says), every release installed is kept, and it is said so. A
@@ -18,19 +18,14 @@
  * (progress/live-lazy.md); its snapshots, released again under a later release, leave it
  * unkept over time.
  */
-import { request } from "node:http";
-import { type AddressInfo, createServer, type Server, type Socket } from "node:net";
-
 import type { V1RuntimeClass, V1Secret } from "@kubernetes/client-node";
-import { Clock, Effect, FiberSet, Schema } from "effect";
+import { Effect, Schema } from "effect";
 
 import { MAIN_ENVIRONMENT_NAME } from "../../src/branch/names.ts";
-import { mintToken } from "../../src/binder/tokens.ts";
 import { GVISOR_RELEASE_ANNOTATION } from "./cluster/k3s.ts";
-import { runningPodIn } from "./commands/common.ts";
+import { gatewayCalls, GatewayUnreached } from "./gateway-calls.ts";
 import { kind, KubeApi } from "./kube/api.ts";
 import { NAMESPACE, SESSIONS_CALLER_SECRET } from "./manifests/common.ts";
-import { GATEWAY_COMPONENT, GATEWAY_PORT } from "./manifests/sandbox-gateway.ts";
 
 /** The snapshots a workspace may be restored from, by the gVisor release that took each, as the gateway names them. */
 export type SnapshotReleases = ReadonlyMap<string, readonly string[]>;
@@ -56,62 +51,16 @@ export const snapshotReleasesFrom = <R>(asked: Effect.Effect<unknown, { readonly
     ),
   );
 
-/** The gateway refused to say what the snapshots name, or main's caller key is not there to ask it with. */
-class GatewayUnread extends Schema.TaggedError<GatewayUnread>()("GatewayUnread", { reason: Schema.String }) {
-  override get message(): string {
-    return this.reason;
-  }
-}
-
-/** A server on a free port of the loopback, open while the scope is, each connection forwarded by `forward`. */
-const loopback = (forward: (socket: Socket) => void) =>
-  Effect.acquireRelease(
-    Effect.callback<Server, GatewayUnread>((resume) => {
-      const server = createServer(forward);
-      server.once("error", (error) => resume(Effect.fail(new GatewayUnread({ reason: `no port of this machine could be listened on: ${error.message}` }))));
-      server.listen(0, "127.0.0.1", () => resume(Effect.succeed(server)));
-    }),
-    (server) => Effect.sync(() => server.close()),
-  );
-
-/** What the gateway answers of the releases its snapshots name, asked by main's token, through a port-forward to one of its pods. */
+/** What the gateway answers of the releases its snapshots name, asked by main's token, signed by main's own key. */
 const askGateway = Effect.gen(function*() {
   const kube = yield* KubeApi;
   const secret = yield* kube.get<V1Secret>({ ...kind("Secret"), namespace: NAMESPACE, name: SESSIONS_CALLER_SECRET });
   const callerKey = secret?.data?.["caller-key"];
-  if (!callerKey) return yield* new GatewayUnread({ reason: `${SESSIONS_CALLER_SECRET} holds no caller key of main's` });
-  const pod = yield* runningPodIn(NAMESPACE, GATEWAY_COMPONENT);
-  const run = yield* FiberSet.makeRuntime<never>();
-  const server = yield* loopback((socket) => {
-    socket.on("error", () => socket.destroy());
-    run(kube.portForward({ namespace: NAMESPACE, pod }, GATEWAY_PORT, socket).pipe(Effect.catch(() => Effect.sync(() => socket.destroy()))));
-  });
-  // A server listening on a TCP port has an address of its own.
-  const { port } = server.address() as AddressInfo;
-  const token = mintToken(Buffer.from(callerKey, "base64"), { key: "snapshots", expires: (yield* Clock.currentTimeMillis) + 60_000, options: { environment: MAIN_ENVIRONMENT_NAME } });
-  // Asked on a connection of its own, closed once answered, so its forward ends with it.
-  return yield* Effect.tryPromise({
-    try: (signal) =>
-      new Promise<unknown>((resolve, reject) => {
-        const asked = request({ host: "127.0.0.1", port, path: "/snapshots/releases", headers: { authorization: `Bearer ${token}` }, agent: false, signal }, (response) => {
-          const chunks: Buffer[] = [];
-          response.on("data", (chunk: Buffer) => chunks.push(chunk));
-          response.on("error", reject);
-          response.on("end", () => {
-            const text = Buffer.concat(chunks).toString("utf8");
-            if (response.statusCode !== 200) return reject(new Error(`it answered ${response.statusCode}: ${text}`));
-            try {
-              resolve(JSON.parse(text));
-            } catch (error) {
-              reject(error);
-            }
-          });
-        });
-        asked.on("error", reject);
-        asked.end();
-      }),
-    catch: (error) => new GatewayUnread({ reason: error instanceof Error ? error.message : String(error) }),
-  });
+  if (!callerKey) return yield* new GatewayUnreached({ reason: `${SESSIONS_CALLER_SECRET} holds no caller key of main's` });
+  const call = yield* gatewayCalls;
+  const { status, text } = yield* call({ callerKey: Buffer.from(callerKey, "base64"), environment: MAIN_ENVIRONMENT_NAME, key: "snapshots", method: "GET", path: "/snapshots/releases" });
+  if (status !== 200) return yield* new GatewayUnreached({ reason: `it answered ${status}: ${text}` });
+  return yield* Effect.try({ try: (): unknown => JSON.parse(text), catch: (error) => new GatewayUnreached({ reason: error instanceof Error ? error.message : String(error) }) });
 }).pipe(Effect.scoped);
 
 /** What the snapshots name, as the sandbox gateway says, by snapshotReleasesFrom; null where it cannot be read. */

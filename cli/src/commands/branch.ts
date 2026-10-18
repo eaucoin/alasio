@@ -133,7 +133,7 @@ const remove = Command.make(
   "delete",
   {
     name,
-    force: Flag.Boolean("force").pipe(Flag.withDefault(false), Flag.withDescription("Delete it even while its alasio has a turn running, or when that cannot be read")),
+    force: Flag.Boolean("force").pipe(Flag.withDefault(false), Flag.withDescription("Delete it even while its alasio has a turn running, or when that cannot be read, or a workspace of its sessions is bound")),
     timeout: timeoutFlag,
   },
   ({ name, force, timeout }) =>
@@ -146,9 +146,10 @@ const remove = Command.make(
 ).pipe(
   Command.withShortDescription("Delete a branch environment"),
   Command.withDescription(
-    "Deletes the branch environment name: stops its alasio and lake, deletes its sessions and their volumes (JuiceFS keeps every " +
-      "chunk main still uses), stops its compute, deletes its branch of Neon's, and its namespaces with its Secrets. It refuses " +
-      "while the branch's alasio has a turn running, as its database says, unless --force.",
+    "Deletes the branch environment name: stops its alasio and lake, deletes its sessions' workspaces and their snapshots through " +
+      "the sandbox gateway, their bound pods first (JuiceFS keeps every chunk a fork shares with main's), stops its compute, deletes " +
+      "its branch of Neon's, and its namespaces with its Secrets. It refuses while the branch's alasio has a turn running, as its " +
+      "database says, or a workspace of its sessions is bound, unless --force.",
   ),
 );
 
