@@ -448,6 +448,10 @@ export async function serveFakeKube(): Promise<FakeKube> {
       if (existing?.kind === "RuntimeClass" && patch["handler"] !== undefined && patch["handler"] !== existing["handler"]) {
         return refuse(response, 422, `RuntimeClass.node.k8s.io "${target.name}" is invalid: handler: Invalid value: ${JSON.stringify(patch["handler"])}: field is immutable`);
       }
+      // Nor a Job's pod template.
+      if (existing?.kind === "Job" && patch.spec?.["template"] !== undefined && JSON.stringify(patch.spec["template"]) !== JSON.stringify(existing.spec?.["template"])) {
+        return refuse(response, 422, `Job.batch "${target.name}" is invalid: spec.template: Invalid value: ${JSON.stringify(patch.spec["template"])}: field is immutable`);
+      }
       // Nor a StatefulSet's way of managing its pods.
       const policy = (object: KubeObject) => (object.spec?.["podManagementPolicy"] as string | undefined) ?? "OrderedReady";
       if (existing?.kind === "StatefulSet" && patch.spec?.["podManagementPolicy"] !== undefined && policy(patch) !== policy(existing)) {
