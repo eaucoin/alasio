@@ -4,12 +4,15 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import type { Message } from "@grammyjs/types";
 import { Array as Arr, Effect, Fiber, Layer, Logger } from "effect";
+import type pg from "pg";
 
 import { StoreError } from "../src/persistence/sql.ts";
 import { Store } from "../src/persistence/store.ts";
+import { NeonTelegramContentRepository } from "../src/persistence/telegram-content-repository.ts";
 import { TelegramTransportError } from "../src/telegram/client.ts";
 import { ReceivedFiles } from "../src/telegram/files.ts";
 import { handleMessage, TELEGRAM_BOT_FILE_LIMIT_BYTES } from "../src/telegram/message-handler.ts";
@@ -113,6 +116,52 @@ test("a message handled again, as an update whose handling lock was lost is, is 
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
+});
+
+test("a store whose messages hold one kept twice, as 8.0.0 could keep one, refuses to start, naming the table and the key kept twice and the cut-over that removes them", async () => {
+  const schema = newSchema();
+  await testStore({ schema });
+  const pool = await testPool();
+  // As 8.0.0 kept them: no index keeping a message once, and one kept twice.
+  await pool.query(`drop index ${schema}.messages_telegram_once`);
+  await pool.query(`insert into ${schema}.conversations (id, transport, chat_id) values ('telegram:43', 'telegram', '43')`);
+  for (const id of ["first", "again"]) {
+    await pool.query(
+      `insert into ${schema}.messages (id, conversation_id, direction, kind, transport_message_id, text, raw) values ($1, 'telegram:43', 'inbound', 'text', '10', 'hello', '{"date": 1700000000}')`,
+      [id],
+    );
+  }
+  const refused = await testStore({ schema }).then(() => null, (error: unknown) => error);
+  assert.ok(refused instanceof StoreError, String(refused));
+  assert.match(refused.message, new RegExp(`^alasio's schema cannot be made: ${schema}\\.messages holds rows this release keeps once, kept twice \\(Key \\(conversation_id, direction, transport_message_id, \\(raw ->> 'date'::text\\)\\)=\\(telegram:43, inbound, 10, 1700000000\\) is duplicated\\.\\)\\. upgrades/from-8\\.0\\.0\\.sh removes them`, "u"));
+  // Nothing was put right: both are kept, and no index made.
+  assert.equal((await pool.query(`select 1 from ${schema}.messages`)).rows.length, 2);
+  assert.equal((await pool.query("select 1 from pg_indexes where schemaname = $1 and indexname = 'messages_telegram_once'", [schema])).rows.length, 0);
+});
+
+test("a message two alasios keep at once, as a rebalance mid-handling has them, is kept once, the second given the first's", async () => {
+  const schema = newSchema();
+  await testStore({ schema });
+  const pool = await testPool();
+  const conversationId = "telegram:42";
+  await pool.query(`insert into ${schema}.conversations (id, transport, chat_id) values ($1, 'telegram', '42')`, [conversationId]);
+  /** The repository on `client`, as a store's statements run on it. */
+  const on = (client: pg.ClientBase | pg.Pool) =>
+    new NeonTelegramContentRepository({ query: (text, values = []) => Effect.promise(async () => (await client.query(text, [...values])).rows) }, schema);
+  const message = { conversationId, direction: "in" as const, kind: "text" as const, transportMessageId: 9, text: "hi", raw: { message_id: 9, date: 1_000, chat: CHAT, text: "hi" } };
+  // The first keeps it in a transaction not yet committed, as its handling goes on.
+  const first = await pool.connect();
+  try {
+    await first.query("begin");
+    const kept = await Effect.runPromise(on(first).insertMessage(message));
+    const second = Effect.runPromise(on(pool).insertMessage(message));
+    await sleep(200);
+    await first.query("commit");
+    assert.equal(await second, kept);
+  } finally {
+    first.release();
+  }
+  assert.equal(Number((await pool.query<{ n: string }>(`select count(*) as n from ${schema}.messages`)).rows[0]?.n), 1);
 });
 
 test("a message whose id one sent earlier had, as a branch's bot's has one its parent's state holds, is kept as a message of its own", async () => {
