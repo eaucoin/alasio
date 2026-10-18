@@ -319,6 +319,8 @@ if (inShard("upgrade")) {
     /** The lines of Codex's rollouts the lake holds, and how many it had loaded on the release before. */
     const lakeLines = async () => Number((await lakeQuery("select count(*) as n from codex.lines"))[0]?.["n"] ?? 0);
     let loaded: number;
+    /** The forks' holds' columns: each one's name, whether it may be null, and its default. */
+    const HOLD_COLUMNS = "select column_name, is_nullable, coalesce(column_default, '') from information_schema.columns where table_schema = 'state' and table_name = 'conversation_holds' order by ordinal_position";
     /** The Telegram message kept twice on the release before, by the id of the one kept first; and Telegram's id of it. */
     let keptOnce: string;
     let sentAs: string;
@@ -469,6 +471,16 @@ if (inShard("upgrade")) {
           assert.equal(await onDatabase(NAMESPACE, `select string_agg(id, ',' order by id) from state.messages where id in ('${keptOnce}', '${keptOnce}-again')`), keptOnce);
           assert.match((await inCutOverRecord("cat telegram-duplicates.tsv")).trim(), new RegExp(`^message\\t[^\\t]+\\t[^\\t]+\\t${sentAs}\\t[^\\t]*\\t2\\t1$`, "u"));
           assert.equal((await inCutOverRecord("cat telegram-copies-removed")).trim(), "1");
+        },
+      },
+      {
+        seeds: "the forks' holds, as 8.0.0's table keeps them, without a holder or an expiry",
+        seed: async () => {
+          assert.equal(await onDatabase(NAMESPACE, HOLD_COLUMNS), "conversation_id|NO|\nreason|NO|\nheld_at|NO|now()");
+        },
+        keeps: "the forks' holds as this release makes them, each with its holder and expiry, which no default gives",
+        check: async () => {
+          assert.equal(await onDatabase(NAMESPACE, HOLD_COLUMNS), "conversation_id|NO|\nreason|NO|\nheld_at|NO|now()\nholder|NO|\nexpires_at|NO|");
         },
       },
     ];

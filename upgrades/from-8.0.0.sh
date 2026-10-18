@@ -40,6 +40,11 @@
 # to be put right by hand. Past the point of no return, it removes those copies, keeping the
 # one kept first, on alasio's database as alasio reaches it, from its pod.
 #
+# The forks' holds, a table of 8.0.0's, have a holder and an expiry in this release, which
+# alasio's schema defines as the table is now, and evolves no table it has: past the point
+# of no return, the cut-over gives 8.0.0's table the two, with defaults while 8.0.0 still
+# holds without them, and, once the upgrade is through, takes the defaults off.
+#
 # The changes this release is made of add their steps to it, with what those steps need:
 # before the point of no return, each with what makes again what it changed (restore), as a
 # run that fails before it leaves the installation as it was; past it, before the upgrade;
@@ -125,6 +130,19 @@ where f.message_id = c.id
 delete from state.messages m using copies c where m.id = c.id;
 select count(*) from copies;
 commit;"
+# The holder and the expiry of each of the forks' holds, which this release keeps and
+# 8.0.0's table has not (src/persistence/schema.ts conversation_holds): given past the point
+# of no return, with defaults, as 8.0.0 still runs and holds without them, until the upgrade
+# (a hold of 8.0.0's expired, as alasio lets go of every hold as it starts); and once the
+# upgrade is through, without them, as this release makes the table.
+HOLD_COLUMNS="
+alter table state.conversation_holds
+  add column if not exists holder text not null default '',
+  add column if not exists expires_at timestamptz not null default now();"
+HOLD_DEFAULTS="
+alter table state.conversation_holds
+  alter column holder drop default,
+  alter column expires_at drop default;"
 # Makes again what the steps before the point of no return changed, as a run that fails
 # before it leaves the installation as it was: each step's own making again, here. The log's
 # StatefulSet, as 8.0.0 had it, from OUT, where it is deleted: it takes its pod back.
@@ -183,12 +201,20 @@ if [ ! -e "$OUT/upgraded" ]; then
     printf '%s\n' "$removed" >"$OUT/telegram-copies-removed"
     log "removed $removed exact copies of Telegram messages kept twice"
   fi
+  if [ ! -e "$OUT/holds-columns" ]; then
+    on_database <<<"$HOLD_COLUMNS" >/dev/null || fail "the forks' holds could not be given their holder and expiry: the cut-over run again goes on with it"
+    touch "$OUT/holds-columns"
+    log "gave the forks' holds their holder and expiry, which this release keeps"
+  fi
   log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
   printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
   bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" || fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it"
   date -u +%FT%TZ >"$OUT/upgraded"
 fi
 [ "${FAIL_AT:-}" != after-the-upgrade ] || fail "a failure injected once the upgrade was through"
+
+on_database <<<"$HOLD_DEFAULTS" >/dev/null || fail "the forks' holds could not be made as this release makes them: the cut-over run again goes on with it"
+log "made the forks' holds as this release makes them, without the defaults 8.0.0's needed"
 
 log "upgraded at $(cat "$OUT/upgraded")"
 log "through"

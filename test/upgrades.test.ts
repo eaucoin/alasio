@@ -27,6 +27,15 @@ const REPOSITORY = fileURLToPath(new URL("..", import.meta.url));
 const pool = await testPool();
 await testStore({ schema: "state" });
 await pool.query("drop index state.messages_telegram_once; drop index state.files_telegram_once");
+/** Makes the forks' holds as 8.0.0's table keeps them: without their holder and expiry. */
+const holdsOf800 = () =>
+  pool.query(`drop table state.conversation_holds;
+    create table state.conversation_holds (
+      conversation_id text primary key references state.conversations (id) on delete cascade,
+      reason text not null,
+      held_at timestamptz not null default now()
+    )`);
+await holdsOf800();
 const DATABASE_URL = await testDatabaseUrl();
 
 /** The log's StatefulSet, its claims labelled with `version` if given, as the cluster has it. */
@@ -306,7 +315,7 @@ test("the cut-over says which Telegram messages 8.0.0 kept twice before it chang
     assert.deepEqual(await messages(), ["first", "later", "other", "other-again", "second"]);
     const run = at.cutOver();
     assert.equal(run.code, 0, run.said);
-    assert.match(run.said, /past the point of no return[^\n]*\n[^\n]* removed 2 exact copies of Telegram messages kept twice\n[^\n]* upgrading, from the cut-over/u);
+    assert.match(run.said, /past the point of no return[^\n]*\n[^\n]* removed 2 exact copies of Telegram messages kept twice\n[^]* upgrading, from the cut-over/u);
     assert.deepEqual(await messages(), ["first", "later", "other"]);
     // The copy's file goes to the message kept, which had none; a file the message kept has already is let go of, kept.
     assert.deepEqual(await files(), [["document", "other"], ["document-again", null], ["photo", "first"]]);
@@ -338,5 +347,37 @@ test("the cut-over refuses a Telegram message 8.0.0 kept twice whose copies diff
   } finally {
     at.remove();
     await forget();
+  }
+});
+
+/** The forks' holds' columns, each with whether it may be null and its default. */
+const holdColumns = async () =>
+  (await pool.query<{ column_name: string; is_nullable: string; column_default: string | null }>(
+    "select column_name, is_nullable, column_default from information_schema.columns where table_schema = 'state' and table_name = 'conversation_holds' order by ordinal_position",
+  )).rows.map(({ column_name, is_nullable, column_default }) => [column_name, is_nullable, column_default]);
+
+test("the cut-over gives 8.0.0's forks' holds their holder and expiry past its point of no return, with defaults 8.0.0's holds need, and takes those off once the upgrade is through", async () => {
+  await holdsOf800();
+  const at = machine();
+  try {
+    // 8.0.0 holds a conversation, as it does without either.
+    await pool.query("insert into state.conversations (id, transport, chat_id) values ('telegram:8', 'telegram', '8') on conflict do nothing");
+    await pool.query("insert into state.conversation_holds (conversation_id, reason) values ('telegram:8', 'forking')");
+    const failed = at.cutOver("after-the-upgrade");
+    assert.notEqual(failed.code, 0);
+    assert.match(failed.said, /past the point of no return[^]*gave the forks' holds their holder and expiry[^]*upgrading, from the cut-over/u);
+    const given = await holdColumns();
+    assert.deepEqual(given.map(([name, nullable]) => [name, nullable]), [["conversation_id", "NO"], ["reason", "NO"], ["held_at", "NO"], ["holder", "NO"], ["expires_at", "NO"]]);
+    assert.ok(given.slice(3).every(([, , fallback]) => fallback !== null), "8.0.0's holds are made with defaults until the upgrade");
+    // 8.0.0's hold, expired as alasio starts.
+    assert.equal((await pool.query("select 1 from state.conversation_holds where expires_at > now()")).rows.length, 0);
+    const again = at.cutOver();
+    assert.equal(again.code, 0, again.said);
+    assert.match(again.said, /made the forks' holds as this release makes them, without the defaults 8\.0\.0's needed\n[^\n]* upgraded at /u);
+    assert.deepEqual((await holdColumns()).slice(3), [["holder", "NO", null], ["expires_at", "NO", null]]);
+  } finally {
+    at.remove();
+    await pool.query("delete from state.conversations");
+    await holdsOf800();
   }
 });
