@@ -227,13 +227,21 @@ test("a workload one of whose pods stops within its grace, as a node agent's doe
   const until = new Date(Date.now() + 60_000);
   stopping(until);
   let ended = false;
-  const applied = run(applyInstallation(objectsOf(), { timeout: "300 millis", poll: "10 millis" })).finally(() => (ended = true));
+  // Its timeout well past a poll, so a look the event loop is late to is still within it.
+  const applied = run(applyInstallation(objectsOf(), { timeout: "1 second", poll: "10 millis" })).finally(() => (ended = true));
+  /** Waits until alasio says `line`, as it waits. */
+  const said = async (line: string) => {
+    for (let waited = 0; !progress.includes(line); waited++) {
+      assert.ok(waited < 3000, `${line} was not said: ${progress.join("\n")}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
   // Once it waits, past its timeout, it waits on, saying for what.
   for (let waited = 0; !progress.some((line) => line.startsWith("waiting for ")); waited++) {
     assert.ok(waited < 3000, progress.join("\n"));
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+  await new Promise((resolve) => setTimeout(resolve, 1500));
   assert.equal(ended, false);
   assert.ok(
     progress.includes(`waiting for alasio-node-agent (0 of 1 nodes ready; pod alasio-node-agent-before on machine stopping, as it may until ${until.toISOString()}, last saying: the node agent of machine stops once the restores reading the snapshots bucket through it are done: 1 read it now)`),
@@ -242,8 +250,13 @@ test("a workload one of whose pods stops within its grace, as a node agent's doe
   // What it last logged, alone read.
   assert.ok(kube.logReads.length > 0);
   assert.ok(kube.logReads.every((query) => query.get("tailLines") === "1"), kube.logReads.map(String).join("; "));
-  // Gone, the agent after it ready: done.
+  // Gone, it waits on for the agent after it, for its timeout from the last look that found
+  // it; ready: done. Its pod's going and the agent's readiness are each waited on apart, as a
+  // look reads the agent, then its pods, and a look that read the agent before one changed and
+  // its pods after would not see the two at once.
   kube.objects.delete(STOPPING);
+  await said("waiting for alasio-node-agent (0 of 1 nodes ready)");
+  assert.equal(ended, false);
   const agents = kube.get("/apis/apps/v1/namespaces/alasio/daemonsets/alasio-node-agent");
   assert.ok(agents);
   agents.status = { ...agents.status, numberReady: 1 };
