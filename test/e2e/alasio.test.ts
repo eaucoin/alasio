@@ -101,6 +101,8 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 interface Sandbox extends KubernetesObject {
   readonly metadata: V1ObjectMeta;
 }
+/** The bayma the release upgraded from pins for folders: one other than this release's, whose instance refuses a snapshot this release's took. */
+const PREVIOUS_BAYMA = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.2", digest: "sha256:5a9a731371d083cae815c6f27c5eb0147e1e77fac400544285f8416047ba4109" } as const;
 /** The annotation of such a Sandbox, suspended, naming the snapshot it was saved into. */
 const SNAPSHOT_ANNOTATION = "alasio.dev/snapshot";
 /** A folder conversation's bayma's Sandbox of the release upgraded from: its pod template, which its bayma's state directory is an argument of. */
@@ -616,6 +618,24 @@ if (inShard("upgrade")) {
     });
 
     for (const { keeps, check } of scenarios) test(`upgraded: ${keeps}`, check);
+
+    // A later bump of the folders' bayma, a release of its own: a snapshot holds its bayma's
+    // version, which another refuses, so the folder's REPLs come back from their checkpoints.
+    test("upgraded: the folders' bayma changed and the folder's instance restarted, its REPLs come back from their checkpoints, what those keep intact", { timeout: 30 * 60_000 }, async () => {
+      const { configFile } = paths();
+      const config = JSON.parse(readFileSync(configFile, "utf8"));
+      config.install.host = { ...config.install.host, baymaImage: PREVIOUS_BAYMA };
+      writeFileSync(configFile, JSON.stringify(config));
+      await alasioOk("up", "--timeout", "20m");
+      const conversation = folderBayma.key.slice(folderBayma.key.indexOf(":", "folder:".length) + 1);
+      assert.match(await alasioOk("folder", "restart", conversation), /its folder instance of [^\n]+ is let go, its REPL sessions saved; the next message makes it anew/u);
+      const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), folderRepls.python, folderRepls.bun);
+      const kept = `kept by ${folderBayma.name}`;
+      assert.deepEqual([seen.python.kept, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, false, null, kept], JSON.stringify(seen));
+      for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+      const [instance] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+      assert.match(instance?.spec?.containers.find(({ name }) => name === "bayma")?.image ?? "", new RegExp(`@${PREVIOUS_BAYMA.digest}$`, "u"));
+    });
   });
 }
 
