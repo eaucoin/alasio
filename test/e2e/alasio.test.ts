@@ -29,6 +29,7 @@ import pg from "pg";
 import { memoryBytes } from "../../cli/src/capacity.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
+import { environmentAccess } from "../../cli/src/manifests/log.ts";
 import { PAGESERVERS_NAME, pageserverName } from "../../cli/src/manifests/neon.ts";
 import { WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { computeId, MAIN, replicaId } from "../../neon/control/branches.ts";
@@ -2019,6 +2020,47 @@ if (inShard("telemetry")) {
       await tg.say("after the log's restart");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
       await untilInLake("trace of alasio's, through the log after its restart", `select count(*) as n from otel.traces where ServiceName = 'alasio' and Timestamp > make_timestamp(${restartedAt * 1000})`);
+    });
+
+    // As a branch environment made and deleted since the log last started leaves it: its
+    // principals made, then forgotten, by the access applier beside the log's first node, as
+    // alasio branch create and delete have it do.
+    test("the log, an environment's principals made and forgotten since it started, comes back from its pod's deletion taking every client's credentials", { timeout: 30 * 60_000 }, async () => {
+      const name = `${componentName("log")}-0`;
+      const pod = ref("Pod", name, NAMESPACE);
+      // Of a name whose loader's principal comes first in the order of Kafka 4.2's map of a
+      // delta's credentials (ScramDelta), as the upgrade shard's branch e2e's did, so that its
+      // removal, replayed as the log starts, comes before every credential added.
+      const access = environmentAccess("left");
+      const change = (mode: "environment" | "forget", input: object) =>
+        kube.execOk(NAMESPACE, name, ["node", "/opt/alasio/src/log/access.ts", mode], { container: "access", stdin: JSON.stringify(input) });
+      // The log's topics, as its admin lists them.
+      const topics = async () =>
+        JSON.parse(await kube.execOk(NAMESPACE, name, ["node", "--input-type=module", "-e", 'import { logAdmin } from "/opt/alasio/src/log/access.ts"; const admin = logAdmin(process.env.LOG_BROKERS.split(","), process.env.LOG_ADMIN_PASSWORD); console.log(JSON.stringify([...(await admin.topics()).keys()])); await admin.close();'], { container: "access" })) as string[];
+      const own = access.topics.map((topic) => topic.name);
+      await change("environment", { ...access, principals: access.principals.map((principal) => ({ ...principal, password: randomUUID() })) });
+      const made = await topics();
+      assert.ok(own.every((topic) => made.includes(topic)), JSON.stringify(made));
+      await change("forget", access);
+      const left = await topics();
+      assert.deepEqual(own.filter((topic) => left.includes(topic)), [], "the environment's topics are deleted as it is forgotten");
+      const before = (await kube.get<V1Pod>(pod))?.metadata?.uid;
+      assert.ok(before, "the log runs no pod");
+      const restartedAt = Date.now();
+      await kube.remove(pod);
+      await until("the log's pod made again", async () => {
+        const uid = (await kube.get<V1Pod>(pod))?.metadata?.uid;
+        return uid && uid !== before ? true : undefined;
+      }, 300_000);
+      await kube.awaitReady([ref("StatefulSet", componentName("log"), NAMESPACE)], "10 minutes").catch(async (error: unknown) => {
+        const said = (await kube.logs(NAMESPACE, name, "log").catch(String)).split("\n");
+        console.error(`# the log after its restart:\n${said.filter((line) => !line.includes("Failed authentication")).slice(-40).join("\n")}\n# failed authentications: ${said.filter((line) => line.includes("Failed authentication")).length}`);
+        throw error;
+      });
+      await tg.calls();
+      await tg.say("after the log's restart, an environment forgotten");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      await untilInLake("trace of alasio's, through the log after its restart, an environment forgotten", `select count(*) as n from otel.traces where ServiceName = 'alasio' and Timestamp > make_timestamp(${restartedAt * 1000})`);
     });
 
     test("main's readers scale out on the queries waiting on them, as any of them sums the pool's", async () => {
