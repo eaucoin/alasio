@@ -5,7 +5,8 @@
  * ./codex-stand-in.Dockerfile builds. It speaks the app-server's JSON-RPC over stdio as
  * Codex does, as far as alasio's turns go: threads start, resume and are listed, and each
  * turn is answered with ANSWER as its final answer: at once, or, for a prompt `wait N`, N
- * seconds after it starts, as a turn whose tools run that long. Every request is a server
+ * seconds after it starts, as a turn whose tools run that long; for a prompt `show <path>`,
+ * beside the file at `path` of its workspace, shown as an image is. Every request is a server
  * span named by its method, of the trace alasio sends it in when it does, with the name
  * the client initialized with, exported where alasio's `-c otel.trace_exporter=` says,
  * from the service codex-app-server, as Codex's own are. Each thread's rollout is written
@@ -165,14 +166,16 @@ async function serve(args: readonly string[]): Promise<void> {
       const startedAt = now();
       const turn = codexTurn(randomUUID(), { startedAt });
       span.setAttribute("turn.id", turn.id);
-      const answer = agentMessage(randomUUID(), ANSWER, "final_answer");
-      const done = codexTurn(turn.id, { items: [userMessage(randomUUID(), input), answer], itemsView: "full", status: "completed", startedAt, completedAt: now(), durationMs: 0 });
       const text = input.map((item) => (item.type === "text" ? item.text : "")).join("");
+      const shown = /^show (\S+)$/u.exec(text)?.[1];
+      const said = shown ? `${ANSWER}\n\n![shown](${shown})` : ANSWER;
+      const answer = agentMessage(randomUUID(), said, "final_answer");
+      const done = codexTurn(turn.id, { items: [userMessage(randomUUID(), input), answer], itemsView: "full", status: "completed", startedAt, completedAt: now(), durationMs: 0 });
       record(threadId, "turn_context", { turn_id: turn.id, cwd: thread.cwd, model: ALASIO_CODEX_MODEL });
       record(threadId, "event_msg", { type: "task_started", turn_id: turn.id });
       record(threadId, "response_item", { type: "message", role: "user", content: [{ type: "input_text", text }] });
-      record(threadId, "response_item", { type: "message", role: "assistant", content: [{ type: "output_text", text: ANSWER }] });
-      record(threadId, "event_msg", { type: "task_complete", turn_id: turn.id, last_agent_message: ANSWER, duration_ms: 0 });
+      record(threadId, "response_item", { type: "message", role: "assistant", content: [{ type: "output_text", text: said }] });
+      record(threadId, "event_msg", { type: "task_complete", turn_id: turn.id, last_agent_message: said, duration_ms: 0 });
       threads.set(threadId, { ...thread, preview: thread.preview || text, updatedAt: now(), turns: [...thread.turns, done] });
       // After the answer to turn/start, as Codex reports a turn once it has accepted it.
       const seconds = Number(/^wait (\d+)$/u.exec(text)?.[1] ?? 0);

@@ -843,6 +843,16 @@ if (inShard("sessions")) {
       await untilInLake("span of Codex's app-server", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'turn/start'");
     });
 
+    test("an image a reply shows from a session workspace is read through the gateway and sent with it", async () => {
+      // A PNG of one pixel, written in the session's workspace as its agent would write one.
+      const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+      await inSession(full, `require("fs").writeFileSync("/workspace/shown.png", Buffer.from(${JSON.stringify(png)}, "base64"))`);
+      await tg.calls();
+      await tg.say("show /workspace/shown.png");
+      const photo = await tg.waitFor((call) => call.method === "sendPhoto");
+      assert.ok(Number(photo.payload.multipartBytes ?? 0) >= Buffer.from(png, "base64").length, JSON.stringify(photo.payload));
+    });
+
     test("alasio comes back from alasio restart with its conversation's workspace", async () => {
       assert.equal(await alasioOk("restart"), "alasio restarted; a turn it was running continues.\n");
       await tg.waitFor((call) => call.method === "setMyCommands", 300_000);
