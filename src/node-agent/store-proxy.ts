@@ -23,8 +23,12 @@
  * which it reads in the background once it is resumed: an agent that stopped meanwhile would
  * leave it without the rest, for good (gate 8 of program/12-live-lazy.md). So the agent's stop
  * waits on the proxy's drain, which mints no token more, and ends once no restore reads
- * through it: none prepared and not resumed yet, none whose request is under way, and none
- * resumed whose last request ended within QUIET_MS, all within each token's time.
+ * through it, within each token's time: none prepared and not resumed yet, none whose
+ * request is under way, and none resumed that has not been served the bytes of pages its
+ * image holds, where the agent told them (expect), counted once each, however they were
+ * read, or, where it did not, whose last request ended within QUIET_MS. A background
+ * load's reads may be spaced as long as its loader paces them, longer than any quiet: the
+ * bytes say when it is done.
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, request as httpRequest, type Server, type ServerResponse } from "node:http";
@@ -33,7 +37,7 @@ import type { AddressInfo } from "node:net";
 
 import { Hash } from "@smithy/hash-node";
 import { SignatureV4 } from "@smithy/signature-v4";
-import { Effect, Schedule, Schema, type Scope } from "effect";
+import { Effect, FiberSet, Schedule, Schema, type Scope } from "effect";
 
 import { RESTORE_PREPARED_FOR_SECONDS } from "./names.ts";
 
@@ -70,6 +74,13 @@ export interface StoreProxy {
   readonly revoke: (holder: string) => void;
   /** The token `holder` holds, if any, lasts `ms` from now, as its restore's sandbox, resumed, reads the rest of its pages. */
   readonly resumed: (holder: string, ms: number) => void;
+  /**
+   * The restore of the token `holder` holds, if any, reads `bytes` bytes of the pages files
+   * under its prefix, its image's and its layers' (`.../pages.img`), as runsc says of its
+   * image: until it has been served them all, it reads, however quiet; Infinity while they
+   * are not known yet, null where they are not known (then its quiet tells, as for none).
+   */
+  readonly expect: (holder: string, bytes: number | null) => void;
   /** Mints no token more, and ends once no restore reads through the proxy, as the module says. */
   readonly drained: Effect.Effect<void>;
   /** How many restores read through the proxy, as its drain waits on them. */
@@ -143,7 +154,7 @@ export function keyOf(path: string, bucket: string): string | null {
   return named === bucket ? key.join("/") : null;
 }
 
-/** What makeStoreProxy is given: the store, where it listens, and, unless told, PREPARED_FOR_MS and QUIET_MS. */
+/** What makeStoreProxy is given: the store, where it listens, and, unless told, PREPARED_FOR_MS and QUIET_MS (for a restore whose bytes the agent did not tell). */
 export interface StoreProxyOptions {
   readonly store: ProxiedStore;
   readonly host: string;
@@ -166,11 +177,44 @@ interface HeldToken {
   under: number;
   /** When its last request began or ended, or it was resumed. */
   lastAt: number;
+  /** The bytes of pages files its restore reads, where the agent told them (expect). */
+  expected: number | null;
+  /** The byte ranges of each pages file it was served, each [start, end), sorted and apart. */
+  readonly served: Map<string, [number, number][]>;
+  /** Whether it has been served every byte it was expected to, as the proxy logs once. */
+  servedAll: boolean;
 }
+
+/** Whether `key` is a pages file of an image's, as a restore's background load reads them. */
+const isPagesFile = (key: string): boolean => key.endsWith("/pages.img");
+
+/** Where the range `header` asks for begins (bytes=START-…), 0 for none; null for one the proxy does not count. */
+function rangeStart(header: string | undefined): number | null {
+  if (header === undefined) return 0;
+  const start = /^bytes=(\d+)-\d*$/u.exec(header)?.[1];
+  return start === undefined ? null : Number(start);
+}
+
+/** `ranges`, each [start, end), sorted and apart, with [start, end) added. */
+export function withRange(ranges: readonly [number, number][], start: number, end: number): [number, number][] {
+  if (end <= start) return [...ranges];
+  const merged: [number, number][] = [];
+  let [from, to] = [start, end];
+  for (const [a, b] of ranges) {
+    if (b < from || a > to) merged.push([a, b]);
+    else [from, to] = [Math.min(a, from), Math.max(b, to)];
+  }
+  merged.push([from, to]);
+  return merged.sort(([a], [b]) => a - b);
+}
+
+/** How many bytes `token`'s restore was served of pages files, each counted once. */
+const servedBytes = (token: HeldToken): number => [...token.served.values()].reduce((sum, ranges) => sum + ranges.reduce((each, [a, b]) => each + b - a, 0), 0);
 
 /** The proxy of `store`, as the module says, listening on `host`:`port` for as long as the scope lasts. */
 export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, preparedForMs = PREPARED_FOR_MS, quietMs = QUIET_MS }: StoreProxyOptions): Effect.fn.Return<StoreProxy, StoreProxyError, Scope.Scope> {
   const tokens = new Map<string, HeldToken>();
+  const runFork = yield* FiberSet.makeRuntime();
   let draining = false;
   const held = new Map<string, string>();
   const upstream = new URL(store.endpoint);
@@ -227,8 +271,11 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
     return { token };
   };
 
-  /** Asks the bucket for what `request` asked, as the agent, streaming its answer back. */
-  const forward = async (request: IncomingMessage, response: ServerResponse, path: string, query: Record<string, string>): Promise<void> => {
+  /**
+   * Asks the bucket for what `request` asked, as the agent, streaming its answer back; the
+   * bytes of a successful answer, as they stream, given to `carried`.
+   */
+  const forward = async (request: IncomingMessage, response: ServerResponse, path: string, query: Record<string, string>, carried: (bytes: number) => void = () => {}): Promise<void> => {
     const headers: Record<string, string> = { host: upstream.host, "x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" };
     if (request.headers.range !== undefined) headers["range"] = String(request.headers.range);
     const signed = await upstreamSigner.sign({ method: "GET", protocol: upstream.protocol, hostname: upstream.hostname, ...(upstream.port === "" ? {} : { port: Number(upstream.port) }), path, query, headers });
@@ -249,7 +296,9 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
         const value = answer.headers[name];
         if (value !== undefined) kept[name] = value;
       }
-      response.writeHead(answer.statusCode ?? 502, kept);
+      const status = answer.statusCode ?? 502;
+      response.writeHead(status, kept);
+      if (status === 200 || status === 206) answer.on("data", (chunk: Buffer) => carried(chunk.length));
       answer.pipe(response);
       answer.once("error", () => response.destroy());
       answer.once("end", () => response.off("close", abandoned));
@@ -274,14 +323,24 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
       if ("refused" in grant) return refuse(response, 403, "AccessDenied", grant.refused);
       const { token } = grant;
       if (!key.startsWith(token.prefix)) return refuse(response, 403, "AccessDenied", "the object is not one the restore reads");
-      // Under way until its answer ends, however it ends.
+      // Under way until its answer ends, however it ends; the bytes of a pages file it carried
+      // counted as served once its answer was given whole, as its gofer reads again what it
+      // was not.
       token.under += 1;
       token.lastAt = Date.now();
+      const start = isPagesFile(key) ? rangeStart(request.headers.range) : null;
+      let carried = 0;
       response.once("close", () => {
         token.under -= 1;
         token.lastAt = Date.now();
+        if (start !== null && response.writableFinished) {
+          token.served.set(key, withRange(token.served.get(key) ?? [], start, start + carried));
+          servedAllOnce(token);
+        }
       });
-      await forward(request, response, path, query);
+      await forward(request, response, path, query, (bytes) => {
+        carried += bytes;
+      });
     })().catch((error: unknown) => {
       if (response.headersSent) response.destroy();
       else refuse(response, 500, "InternalError", error instanceof Error ? error.message : String(error));
@@ -302,10 +361,22 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
   const address = server.address() as AddressInfo;
   const shown = address.family === "IPv6" ? `[${address.address}]` : address.address;
 
+  /**
+   * Logs, once, that `token`'s restore has been served every byte of pages it was expected
+   * to: its reads through the proxy are done, as an agent stopped from then on need not wait.
+   */
+  const servedAllOnce = (token: HeldToken): void => {
+    if (token.servedAll || token.expected === null || servedBytes(token) < token.expected) return;
+    token.servedAll = true;
+    runFork(Effect.logInfo(`the restore of ${token.holder} has been served all ${token.expected} bytes of its pages through the node agent`));
+  };
+
   /** How many restores read through the proxy now, as the module says. */
   const reading = (): number => {
     const now = Date.now();
-    return [...tokens.values()].filter((token) => now < token.until && (!token.resumed || token.under > 0 || now - token.lastAt < quietMs)).length;
+    return [...tokens.values()].filter((token) =>
+      now < token.until && (!token.resumed || token.under > 0 || (token.expected === null ? now - token.lastAt < quietMs : servedBytes(token) < token.expected))
+    ).length;
   };
 
   return {
@@ -319,7 +390,7 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
       const accessKeyId = `ALASIO${randomBytes(10).toString("hex").toUpperCase()}`;
       const secretAccessKey = randomBytes(32).toString("base64url");
       const now = Date.now();
-      tokens.set(accessKeyId, { secretAccessKey, prefix, holder, until: now + preparedForMs, resumed: false, under: 0, lastAt: now });
+      tokens.set(accessKeyId, { secretAccessKey, prefix, holder, until: now + preparedForMs, resumed: false, under: 0, lastAt: now, expected: null, served: new Map(), servedAll: false });
       held.set(holder, accessKeyId);
       return { accessKeyId, secretAccessKey };
     },
@@ -336,6 +407,12 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
       token.until = now + ms;
       token.resumed = true;
       token.lastAt = now;
+    },
+    expect: (holder, bytes) => {
+      const token = tokens.get(held.get(holder) ?? "");
+      if (!token) return;
+      token.expected = bytes;
+      servedAllOnce(token);
     },
     drained: Effect.sync(() => {
       draining = true;

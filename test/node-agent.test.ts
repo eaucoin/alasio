@@ -195,6 +195,8 @@ interface NodeOptions {
   readonly releases?: readonly string[];
   readonly budget?: number;
   readonly runsc?: (runsc: Runsc, releases: FakeReleases) => Runsc;
+  /** How long its proxy takes a resumed restore told no bytes of pages to be done once its reads are quiet. */
+  readonly quietMs?: number;
 }
 
 /** A bucket and a directory of the test's, and nodes made on them, removed after `body`. */
@@ -202,7 +204,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, quietMs }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -212,7 +214,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
       const [running] = installed;
       if (running !== undefined) for (const id of [CONTAINER, OTHER_CONTAINER]) releases.runs(id, running, SESSIONS, POD);
       const host = fakeHost();
-      const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0 }).pipe(Effect.orDie);
+      const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, ...(quietMs === undefined ? {} : { quietMs }) }).pipe(Effect.orDie);
       const restarted = makeNodeAgent({ node: name, nodeRoot: "/", runsc, cache, bucket, storeProxy, host: host.host, restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince, backgroundReadMs: BACKGROUND_READ_MS });
       return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted };
     });
@@ -1146,6 +1148,40 @@ test("a restore from the bucket reads its own images through the agent by a toke
       yield* fetched(other, (yield* other.agent.current(workspace))!);
       assert.equal((yield* other.agent.prepare(workspace)).source, "cache");
       assert.equal(yield* throughProxy(other, fifth, own), 403);
+    })
+  ));
+
+test("a restore from the bucket is told the bytes of pages its image holds, as runsc says, and its agent's stop waits for them all, however quiet its reads; told none, its quiet", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const taker = yield* node("node-1");
+      const manifest = yield* taker.agent.checkpoint(request("fs-abc"));
+      const own = `main/fs-abc/layers/${manifest.layers[0]?.digest}/pages.img`;
+      const there = yield* node("node-2", { quietMs: 100 });
+      const restored = (bytes: string | null) =>
+        Effect.gen(function*() {
+          const told = join(there.releases.releasesDir, RELEASE, "remote-page-bytes");
+          if (bytes === null) rmSync(told, { force: true });
+          else writeFileSync(told, bytes);
+          yield* there.cache.clear("main", "fs-abc");
+          const prepared = yield* there.agent.prepare(workspace);
+          assert.equal(prepared.source, "bucket");
+          const token = tokenIn(prepared.imagePath);
+          yield* there.agent.resume(resumeRequest(manifest.snapshot));
+          return token;
+        });
+      // Told 4096 bytes, its image's pages: reading, its reads however far apart, until it was served them.
+      const token = yield* restored("4096");
+      yield* Effect.sleep("400 millis");
+      assert.equal(there.storeProxy.reading(), 1);
+      assert.equal(yield* throughProxy(there, token, own), 200);
+      yield* Effect.sleep("50 millis");
+      assert.equal(there.storeProxy.reading(), 0);
+      // Told none, as runsc fails to say: done once its quiet has passed.
+      yield* restored(null);
+      yield* Effect.sleep("400 millis");
+      assert.equal(there.storeProxy.reading(), 0);
     })
   ));
 
