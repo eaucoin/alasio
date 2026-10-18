@@ -309,9 +309,9 @@ groups:
       # template or gVisor release is no longer kept falls back as designed, after an
       # upgrade, and counts neither way. A session is restored at most once each time it
       # comes back from idle, so restores are few, and the window an hour: one failure among
-      # four or fewer pages, as each costs a session its REPLs.
-      # alasio's counts are running totals, since its process started, exported every
-      # minute: what a series added is each point less the one before it, its first counted
+      # four or fewer pages, as each costs a session its REPLs. The sandbox gateway counts
+      # them, which snapshots main's sessions alone: its counts are running totals, since
+      # its process started, exported every minute: what a series added is each point less the one before it, its first counted
       # from zero, the hour before the window giving each its point before.
       - uid: alasio-restores-falling-back
         title: Restores are falling back
@@ -343,7 +343,7 @@ groups:
                     select TimeUnix, Attributes['alasio.sandbox.restore.fallback'] as fallback,
                       Value - coalesce(lag(Value) over (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix), 0) as added
                     from otel.metrics_sum
-                    where MetricName = 'alasio.sandbox.restores' and ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] is null
+                    where MetricName = 'alasio.sandbox.restores' and ServiceName = 'alasio-sandbox-gateway'
                       and TimeUnix > now()::timestamp - interval 2 hour
                   )
                   where TimeUnix > now()::timestamp - interval 1 hour and coalesce(fallback not in ('template', 'release'), true)
@@ -362,8 +362,8 @@ groups:
       # Of the sessions released in the last hour, the share whose release failed: its
       # sandbox's checkpoint failed while it runs on ("failed", tried again later), or once
       # it had ended it ("lost": its REPLs' live state is gone, the session resumed from
-      # bayma's checkpoints), or the release failed beside it ("error", as a Sandbox that
-      # could not be suspended, whose snapshot is then stale). One not snapshotted, as it
+      # bayma's checkpoints), or the release failed beside it ("error", as a release whose
+      # record could not be written, whose snapshot is then stale). One not snapshotted, as it
       # runs under no gVisor, is kept as designed and counts neither way. Counted as the
       # restores' alert counts.
       - uid: alasio-releases-failing
@@ -396,7 +396,7 @@ groups:
                     select TimeUnix, Attributes['alasio.sandbox.release.outcome'] as outcome,
                       Value - coalesce(lag(Value) over (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix), 0) as added
                     from otel.metrics_sum
-                    where MetricName = 'alasio.sandbox.releases' and ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] is null
+                    where MetricName = 'alasio.sandbox.releases' and ServiceName = 'alasio-sandbox-gateway'
                       and TimeUnix > now()::timestamp - interval 2 hour
                   )
                   where TimeUnix > now()::timestamp - interval 1 hour and outcome != 'kept'

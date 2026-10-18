@@ -20,17 +20,16 @@ import { describe, test } from "node:test";
 import type { V1DaemonSet, V1Pod } from "@kubernetes/client-node";
 
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
-import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
+import { componentName, NAMESPACE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { PROXY_PORT } from "../../cli/src/manifests/neon.ts";
 import { GATEWAY, GATEWAY_PORT, RECEIVER, WORKSPACE_MOUNT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { VALKEY } from "../../cli/src/manifests/workspace-storage.ts";
 import { BINDING_LABEL, environmentKey, keyHash, POOL_LABEL } from "../../src/binder/names.ts";
-import { NO_BIND_HEADER } from "../../src/binder/server.ts";
 import { mintToken } from "../../src/binder/tokens.ts";
 import { NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { ReplChecked, ReplHeld } from "./gateway-repl.ts";
-import { inAlasio, kube, nodeAgents, onNode, ref, SESSIONS, tcp } from "./harness.ts";
+import { boundPodOf, gatewayCall, inAlasio, kube, mainToken, nodeAgents, onNode, ref, SESSIONS, tcp } from "./harness.ts";
 import { until } from "./workspace-storage.ts";
 
 /** What a node agent answers `method path` with, `body` as JSON: its status, and what it said. */
@@ -44,27 +43,6 @@ async function agentCall(method: string, path: string, body?: unknown): Promise<
     `curl -sS -w '\\n%{http_code}' -X ${method} -H "authorization: Bearer $${NODE_AGENT_TOKEN_VARIABLE}"${data} http://127.0.0.1:${NODE_AGENT_PORT}${path}`,
   ], { container: "node-agent" });
   const lines = printed.trimEnd().split("\n");
-  return { status: Number(lines.at(-1)), said: lines.slice(0, -1).join("\n") };
-}
-
-/** A caller's token of the workspace `workspace` of main's sessions, signed by main's own key, as main's alasio signs one. */
-async function mainToken(workspace: string): Promise<string> {
-  const callerKey = await kube.secret(NAMESPACE, GATEWAY, "caller-key");
-  return mintToken(environmentKey(Buffer.from(callerKey), "main"), { key: sessionKey(workspace), expires: Date.now() + 600_000, options: { environment: "main", mode: "none" } });
-}
-
-/** What the gateway answers `method path` with, asked as alasio asks it, from its pod, with `token`, `body` sent as it is: its status, and what it said. */
-async function gatewayCall(token: string, method: string, path: string, body?: string, { bind = true } = {}): Promise<{ readonly status: number; readonly said: string }> {
-  const alasioPod = await kube.runningPod(NAMESPACE, RELEASE);
-  const printed = await kube.execOk(NAMESPACE, alasioPod, [
-    "sh",
-    "-c",
-    `curl -sS -w '\n%{http_code}' -X ${method} -H "authorization: Bearer $1"${bind ? "" : ` -H '${NO_BIND_HEADER}: never'`}${body === undefined ? "" : " --data-binary @-"} "http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}$2"`,
-    "sh",
-    token,
-    path,
-  ], { container: "alasio", ...(body === undefined ? {} : { stdin: body }) });
-  const lines = printed.split("\n");
   return { status: Number(lines.at(-1)), said: lines.slice(0, -1).join("\n") };
 }
 
@@ -103,9 +81,9 @@ function watchRestore(node: string): { readonly stop: () => void; readonly said:
 /** The pod of main's sessions bound to `workspace`, once it is: its name and node. */
 async function boundPod(workspace: string): Promise<{ readonly name: string; readonly node: string }> {
   // Not one being deleted, as a restore's that failed is, which binds nothing more.
-  const [bound] = (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` })).filter(({ metadata }) => !metadata?.deletionTimestamp);
-  assert.ok(bound?.metadata?.name, `no pod is bound to ${workspace}\n${await serviceLogs(workspace)}`);
-  return { name: bound.metadata.name, node: bound.spec?.nodeName ?? "" };
+  const bound = await boundPodOf(workspace);
+  assert.ok(bound, `no pod is bound to ${workspace}\n${await serviceLogs(workspace)}`);
+  return bound;
 }
 
 /** The components of main's sandbox service, in alasio's namespace, which serve every environment. */
@@ -165,7 +143,7 @@ export async function bindInBranch(branch: string): Promise<{ readonly namespace
 }
 
 /** What the gateway and the node agents logged of `workspace`, for a failure to say. */
-async function serviceLogs(workspace: string): Promise<string> {
+export async function serviceLogs(workspace: string): Promise<string> {
   const pods = [
     ...(await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("sandbox-gateway")) })).map((pod) => [pod, "sandbox-gateway"] as const),
     ...(await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("node-agent")) })).map((pod) => [pod, "node-agent"] as const),

@@ -2848,11 +2848,11 @@ describe("the lake's reader", () => {
     }
   });
 
-  test("the Sandboxes row counts what alasio's running totals added in each interval, and the fallback and release alerts main's failures alone", async () => {
+  test("the Sandboxes row counts what the sandbox gateway's running totals added in each interval, and the fallback and release alerts the gateway's failures alone", async () => {
     const minute = 60_000;
     const now = Math.floor(Date.now() / minute) * minute;
     const keyValues = (attributes: Readonly<Record<string, string>>) => Object.entries(attributes).map(([key, value]) => ({ key, value: { stringValue: value } }));
-    const resource = (instance: string, branch?: string) => ({ attributes: keyValues({ "service.name": "alasio", "service.instance.id": instance, ...(branch ? { "alasio.branch": branch } : {}) }) });
+    const resource = (instance: string, service = "alasio-sandbox-gateway") => ({ attributes: keyValues({ "service.name": service, "service.instance.id": instance }) });
     const nanos = (ms: number) => String(BigInt(ms) * 1_000_000n);
     /**
      * A point a minute of a series, as alasio's SDK exports one, from the minute after its
@@ -2885,8 +2885,8 @@ describe("the lake's reader", () => {
     });
     const outcome = (restore: string, fallback?: string) => ({ "alasio.sandbox.restore.outcome": restore, ...(fallback ? { "alasio.sandbox.restore.fallback": fallback } : {}) });
     const restores = "alasio.sandbox.restores";
-    // One alasio up for three hours, which counted before the last hour too; one started
-    // fifty minutes ago, counting from zero; a branch's, which pages no one.
+    // One gateway up for three hours, which counted before the last hour too; one started
+    // fifty minutes ago, counting from zero; another service's, which pages no one.
     const metrics: MetricsRequest = {
       resourceMetrics: [
         {
@@ -2906,7 +2906,7 @@ describe("the lake's reader", () => {
           }],
         },
         { resource: resource("restarted"), scopeMetrics: [{ metrics: [counter(restores, 50, outcome("restored"), [45, 5]), counter(restores, 50, outcome("fallback", "restore"), [15])] }] },
-        { resource: resource("branch", "try"), scopeMetrics: [{ metrics: [counter(restores, 120, outcome("fallback", "node"), [25, 24, 23, 22])] }] },
+        { resource: resource("elsewhere", "alasio"), scopeMetrics: [{ metrics: [counter(restores, 120, outcome("fallback", "node"), [25, 24, 23, 22])] }] },
       ],
     };
     await withLake(async (db) => {

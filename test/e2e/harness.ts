@@ -67,6 +67,11 @@ import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { COMPONENTS as OBJECT_STORE_COMPONENTS } from "../../cli/src/manifests/object-store.ts";
+import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
+import { BINDING_LABEL, environmentKey, keyHash } from "../../src/binder/names.ts";
+import { NO_BIND_HEADER } from "../../src/binder/server.ts";
+import { mintToken } from "../../src/binder/tokens.ts";
+import { sessionKey } from "../../src/sandbox/names.ts";
 import { installCli, packCli } from "../../tooling/cli-package.ts";
 import { NODE_BUILD_ARGS } from "../../tooling/node-image.ts";
 import { OTLP, STAND_INS, standInObjects, TELEGRAM, TELEGRAM_TLS_PORT, urlOf } from "./stand-ins.ts";
@@ -465,11 +470,60 @@ export async function runCronJob(cronJob: string): Promise<string> {
   }
 }
 
-/** The namespace of session filesystems' Sandboxes. */
+/** The namespace of main's sessions, its sandbox pools'. */
 export const SESSIONS = "alasio-sessions";
 
-/** Node run in a session's bayma container: its stdout. */
-export const inSession = (volumeId: string, code: string): Promise<string> => kube.execOk(SESSIONS, volumeId, ["node", "-e", code], { container: "bayma" });
+/** A session's internet, as its alasio records it, and binds it with. */
+export type SessionMode = "none" | "full";
+
+/** The internet of each session the run made, as alasio recorded it: what a token of it is minted with, none unless said. */
+const sessionModes = new Map<string, SessionMode>();
+
+/** Records the internet alasio made the session `volumeId` with, as tokens of it are minted with. */
+export const recordSession = (volumeId: string, mode: SessionMode): void => void sessionModes.set(volumeId, mode);
+
+/** A caller's token of the workspace `workspace` of main's sessions, signed by main's own key, as main's alasio signs one, of its internet. */
+export async function mainToken(workspace: string, mode: SessionMode = sessionModes.get(workspace) ?? "none"): Promise<string> {
+  const callerKey = await kube.secret(NAMESPACE, GATEWAY, "caller-key");
+  return mintToken(environmentKey(Buffer.from(callerKey), "main"), { key: sessionKey(workspace), expires: Date.now() + 600_000, options: { environment: "main", mode } });
+}
+
+/** What the gateway answers `method path` with, asked as alasio asks it, from its pod, with `token`, `body` sent as it is: its status, and what it said. */
+export async function gatewayCall(token: string, method: string, path: string, body?: string, { bind = true } = {}): Promise<{ readonly status: number; readonly said: string }> {
+  const alasioPod = await kube.runningPod(NAMESPACE, RELEASE);
+  const printed = await kube.execOk(NAMESPACE, alasioPod, [
+    "sh",
+    "-c",
+    `curl -sS -w '\n%{http_code}' -X ${method} -H "authorization: Bearer $1"${bind ? "" : ` -H '${NO_BIND_HEADER}: never'`}${body === undefined ? "" : " --data-binary @-"} "http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}$2"`,
+    "sh",
+    token,
+    path,
+  ], { container: "alasio", ...(body === undefined ? {} : { stdin: body }) });
+  const lines = printed.split("\n");
+  return { status: Number(lines.at(-1)), said: lines.slice(0, -1).join("\n") };
+}
+
+/** The pod of `namespace`'s sessions, main's unless said, bound to `workspace`, not one being deleted: its name and node; null where none is. */
+export async function boundPodOf(workspace: string, namespace = SESSIONS): Promise<{ readonly name: string; readonly node: string } | null> {
+  const [bound] = (await kube.list<V1Pod>("Pod", { namespace, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` })).filter(({ metadata }) => !metadata?.deletionTimestamp);
+  return bound?.metadata?.name ? { name: bound.metadata.name, node: bound.spec?.nodeName ?? "" } : null;
+}
+
+/** Binds main's session `volumeId` through the gateway, as alasio binds it, asked again while its pool has no pod for it: the pod it is bound to. */
+export async function bindSession(volumeId: string, timeoutMs = 300_000): Promise<{ readonly name: string; readonly node: string }> {
+  const token = await mainToken(volumeId);
+  let last = { status: 0, said: "" };
+  for (const deadline = Date.now() + timeoutMs; ; await new Promise((resolve) => setTimeout(resolve, 2_000))) {
+    last = await gatewayCall(token, "POST", "/bind");
+    const bound = last.status === 204 ? await boundPodOf(volumeId) : null;
+    if (bound) return bound;
+    if (Date.now() >= deadline) throw new Error(`the gateway did not bind ${volumeId} within ${timeoutMs / 1000}s: it last answered ${last.status} ${last.said}`);
+  }
+}
+
+/** Node run in main's session's bayma container, the session bound first, as a turn binds it: its stdout. */
+export const inSession = async (volumeId: string, code: string): Promise<string> =>
+  kube.execOk(SESSIONS, (await bindSession(volumeId)).name, ["node", "-e", code], { container: "bayma" });
 
 /** Node code that prints whether a TCP connection to `host` (an expression) on `port` opens. */
 export const tcp = (host: string, port: number): string =>

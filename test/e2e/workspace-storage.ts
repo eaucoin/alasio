@@ -1,15 +1,16 @@
 /**
-/**
  * Workspaces on JuiceFS as alasio installs it: a session's workspace a directory of the
- * file system, made by JuiceFS's CSI driver, doing in gVisor what tools ask of a file
- * system within the claim's size; its files kept through the session suspended, Valkey
- * and the object store killed mid-write, its mount pod deleted and its mount lost, and,
- * on several nodes, its moving to another; a session forked, its fork a clone of its
- * files with their owners, its own quota, and neither touched by what is done in the
- * other or by its deletion; neither Valkey nor the object store, nor their credentials,
- * within a session's reach; a volume deleted with its claim, its directory with it; the
- * file system checked and collected daily; and its metadata dumped, backed up nightly,
- * and restored from the backup with the same files.
+ * file system, made through the sandbox gateway by a node agent with its quota, on the
+ * nodes' mount of it (cli/src/manifests/sandbox-gateway.ts workspaceMount), doing in gVisor
+ * what tools ask of a file system within its quota; its files kept through the session
+ * released and bound again, and Valkey and the object store killed mid-write, and, on
+ * several nodes, its moving to another; a session forked, its fork a clone of its files
+ * with their owners, its own quota, and neither touched by what is done in the other or by
+ * its deletion; neither Valkey nor the object store, nor their credentials, within a
+ * session's reach; a workspace deleted, its directory with it; the file system checked and
+ * collected daily; and its metadata dumped, backed up nightly, and restored from the backup
+ * with the same files. The nodes' mount through a handover and a reboot is the sandbox
+ * service's suite's (./sandbox-service.ts).
  *
  * The end-to-end run's workspaces shard (test/e2e/alasio.test.ts), registered with
  * workspaceStorage(): it makes its sessions as alasio does, one with no internet, which
@@ -18,31 +19,17 @@
 import assert from "node:assert/strict";
 import { before, describe, test } from "node:test";
 
-import type {
-  V1CronJob,
-  V1Deployment,
-  V1Job,
-  V1PersistentVolume,
-  V1PersistentVolumeClaim,
-  V1Pod,
-  V1Service,
-  V1StorageClass,
-} from "@kubernetes/client-node";
+import type { V1CronJob, V1Deployment, V1Pod, V1Service } from "@kubernetes/client-node";
 
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
-import { componentName, NAMESPACE, neonName } from "../../cli/src/manifests/common.ts";
-import { CSI_DRIVER, JUICEFS_PODS_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "../../cli/src/manifests/juicefs-csi.ts";
+import { componentName, NAMESPACE, neonName, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { FILER, FILER_STORE, FILER_STORE_USERS, GATEWAY, MASTER, VOLUME_SERVER } from "../../cli/src/manifests/object-store.ts";
 import { JUICEFS_ADMIN, VALKEY, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/workspace-storage.ts";
-import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
-import type { Sandbox } from "../../src/kube/sandboxes.ts";
+import { WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
-import { sessionKey } from "../../src/sandbox/names.ts";
-import { AGENTS, inAlasio, inSession, kube, nodeAgents, onNode, type Ran, ref, runCronJob, SESSIONS, tcp } from "./harness.ts";
+import { AGENTS, bindSession, boundPodOf, gatewayCall, inAlasio, inSession, kube, mainToken, nodeAgents, recordSession, ref, runCronJob, SESSIONS, tcp } from "./harness.ts";
 import type { Made } from "./session-volumes.ts";
 
-/** Where the installation's JuiceFS driver runs, and makes its mount pods: its default namespace. */
-const DRIVER_NAMESPACE = "kube-system";
 /**
  * What a workspace's writes go through, of the stack's: its metadata's Valkey, and the
  * object store's parts its data does, each a StatefulSet's but its gateways, a
@@ -79,9 +66,6 @@ const FORKED_HOME = "/home/agent/forked";
 
 /** The digest of the files under the current directory, which two copies of it share only when they hold the same. */
 const DIGEST = "find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-16";
-
-/** What alasio looks at to tell a session's workspace mount is broken (src/sandbox/index.ts). */
-const MOUNT_CHECK = "env LC_ALL=C stat --file-system --format=%T /workspace";
 
 /**
  * The file operations workspaces' tools rely on, in the session's workspace, as its agent,
@@ -177,103 +161,44 @@ export async function until<T>(what: string, check: () => Promise<T | undefined>
   }
 }
 
-/** sh run in the session's bayma container, as its agent. */
-const inWorkspace = (volumeId: string, script: string): Promise<Ran> => kube.exec(SESSIONS, volumeId, ["sh", "-c", script], { container: "bayma" });
-const inWorkspaceOk = (volumeId: string, script: string): Promise<string> => kube.execOk(SESSIONS, volumeId, ["sh", "-c", script], { container: "bayma" });
+/** The pod the session is bound to, it bound first as a turn binds it: its name and node. */
+const bringUp = (volumeId: string) => bindSession(volumeId);
 
-/**
- * What MOUNT_CHECK comes to in the session, given ten seconds, and a minute in all: a
- * mount whose client is gone but whose connection is held may answer nothing at all.
- */
-async function checkMount(volumeId: string): Promise<Ran> {
-  const hung: Ran = { code: 124, stdout: "", stderr: "the look at the workspace's mount did not end" };
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      inWorkspace(volumeId, `timeout -k 5 10 ${MOUNT_CHECK}`),
-      new Promise<Ran>((resolve) => {
-        timer = setTimeout(() => resolve(hung), 60_000);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
+/** sh run in the session's bayma container, as its agent, the session bound first. */
+const inWorkspaceOk = async (volumeId: string, script: string): Promise<string> => kube.execOk(SESSIONS, (await bringUp(volumeId)).name, ["sh", "-c", script], { container: "bayma" });
 
 /** The digest of the fixture, as the session sees it. */
 const fixtureDigest = async (volumeId: string) => (await inWorkspaceOk(volumeId, `cd ${FIXTURE} && timeout -k 5 120 sh -c '${DIGEST}'`)).trim();
 
-/** The pod the session runs in once it is up. */
-interface BroughtUp {
-  readonly uid: string | undefined;
-  readonly node: string | undefined;
-}
-
-/** Brings the session up as a turn does (./session-volumes.ts bind), through the gateway: the pod it is bound to then. */
-async function bringUp(volumeId: string, netMode: NetMode = "none"): Promise<BroughtUp> {
-  await inAlasio<Made>("./session-volumes.ts", "bind", volumeId, netMode);
-  const [pod] = (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(volumeId))}` })).filter(({ metadata }) => !metadata?.deletionTimestamp);
-  return { uid: pod?.metadata?.uid, node: pod?.spec?.nodeName };
-}
-
 const isReady = (pod: V1Pod | null | undefined) => pod?.status?.conditions?.some(({ type, status }) => type === "Ready" && status === "True") ?? false;
 
-/** Makes the session `volumeId` with `netMode` as alasio does (./session-volumes.ts). */
-const create = (volumeId: string, netMode: NetMode) => inAlasio<Made>("./session-volumes.ts", "create", volumeId, netMode);
+/** Makes the session `volumeId` with `netMode` as alasio does (./session-volumes.ts), recorded so, as tokens of it are minted. */
+async function create(volumeId: string, netMode: NetMode): Promise<Made> {
+  recordSession(volumeId, netMode);
+  return inAlasio<Made>("./session-volumes.ts", "create", volumeId, netMode);
+}
 
 /** Forks the session `source` into `volumeId` as alasio does (./session-volumes.ts). */
 const fork = (source: string, volumeId: string) => inAlasio<Made>("./session-volumes.ts", "fork", source, volumeId);
 
-/** The session's pod, which runs. */
-async function podOf(volumeId: string): Promise<V1Pod> {
-  const pod = await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS));
-  assert.ok(pod?.spec?.nodeName, `the session ${volumeId} runs in no pod`);
-  return pod;
+/** Deletes the session `volumeId` as alasio does (./session-volumes.ts), its binding let go first. */
+const destroy = (volumeId: string) => inAlasio<Made>("./session-volumes.ts", "destroy", volumeId, "none");
+
+/** Lets the session's binding go, as the gateway releases one idle: its pod gone once it is. */
+async function release(volumeId: string): Promise<void> {
+  const released = await gatewayCall(await mainToken(volumeId), "POST", "/release");
+  assert.equal(released.status, 204, released.said);
+  await until(`the release of ${volumeId}`, async () => ((await boundPodOf(volumeId)) === null ? true : undefined), 180_000);
 }
 
-/** The session's claim, and its volume. */
-async function volumeOf(volumeId: string): Promise<{ claim: V1PersistentVolumeClaim; volume: V1PersistentVolume }> {
-  const claimName = (await podOf(volumeId)).spec?.volumes?.find((volume) => volume.persistentVolumeClaim)?.persistentVolumeClaim?.claimName;
-  assert.ok(claimName, `the session ${volumeId} has no claim`);
-  const claim = await kube.get<V1PersistentVolumeClaim>(ref("PersistentVolumeClaim", claimName, SESSIONS));
-  assert.ok(claim?.spec?.volumeName, `the claim ${claimName} is bound to no volume`);
-  const volume = await kube.get<V1PersistentVolume>(ref("PersistentVolume", claim.spec.volumeName));
-  assert.ok(volume);
-  return { claim, volume };
-}
+/** The directory of the file system that is the session's workspace, as a node agent makes it, of its environment's. */
+const directoryOf = (volumeId: string) => `${SESSIONS}/${volumeId}`;
 
-/** The directory of the file system that is the session's volume, named by the StorageClass's pathPattern. */
-const directoryOf = async (volumeId: string) => `${SESSIONS}-${(await volumeOf(volumeId)).claim.metadata?.name}`;
-
-/** The mount pod that serves the session's volume on its node, unless it is being deleted. */
-async function mountPodOf(volumeId: string): Promise<V1Pod | undefined> {
-  const node = (await podOf(volumeId)).spec?.nodeName;
-  const volume = (await volumeOf(volumeId)).volume.metadata?.name ?? "";
-  const pods = await kube.list<V1Pod>("Pod", { namespace: DRIVER_NAMESPACE, labelSelector: selectorOf(MOUNT_POD_LABELS) });
-  // A mount pod mounts the file system at a path named after the volume.
-  return pods.find((pod) => pod.spec?.nodeName === node && !pod.metadata?.deletionTimestamp && JSON.stringify(pod.spec).includes(volume));
-}
-
-/** The driver's mount pods, and what its node service on `node` last logged. */
-async function driverState(node: string): Promise<string> {
-  const pods = await kube.list<V1Pod>("Pod", { namespace: DRIVER_NAMESPACE, labelSelector: JUICEFS_PODS_SELECTOR });
-  const mountPods = pods.filter(({ metadata }) => metadata?.labels?.["app.kubernetes.io/name"] === MOUNT_POD_LABELS["app.kubernetes.io/name"]);
-  const plugin = pods.find(({ metadata, spec }) => metadata?.labels?.["app"] === NODE_POD_LABELS["app"] && spec?.nodeName === node)?.metadata?.name ?? "";
-  const logged = await kube.logs(DRIVER_NAMESPACE, plugin, "juicefs-plugin").catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
-  return [
-    ...mountPods.map((pod) =>
-      `\nmount pod ${pod.metadata?.name} (${pod.metadata?.uid}) on ${pod.spec?.nodeName}: ${pod.status?.phase}${isReady(pod) ? ", ready" : ""}${pod.metadata?.deletionTimestamp ? ", being deleted" : ""}`
-    ),
-    `\nthe node service ${plugin} last logged:`,
-    ...logged.trimEnd().split("\n").slice(-40).map((line) => `\n  ${line}`),
-  ].join("");
-}
-
-/** What the session's workspace is in the session, its volume's mounts on `node`, and the driver's state there. */
-async function mountState(volumeId: string, node: string, volume: string): Promise<string> {
-  const seen = await inWorkspace(volumeId, "stat --file-system --format=%T /workspace; ls -la /workspace /workspace/juicefs-e2e");
-  const mounts = await onNode(node, `grep '${volume}' /proc/self/mountinfo || true`);
-  return `in the session: ${seen.stdout}${seen.stderr}\non the node: ${mounts}${await driverState(node)}`;
+/** The session's workspace's quota, as the gateway reads it back: its capacity and what it holds, in bytes. */
+async function quotaOf(volumeId: string): Promise<{ readonly capacityBytes: number; readonly usedBytes: number }> {
+  const read = await gatewayCall(await mainToken(volumeId), "GET", "/workspace/quota");
+  assert.equal(read.status, 200, read.said);
+  return JSON.parse(read.said) as { capacityBytes: number; usedBytes: number };
 }
 
 /**
@@ -362,12 +287,16 @@ export function workspaceStorage(): void {
       fixtureWrittenAt = Date.now();
     });
 
-    test("a session's workspace is a volume of the workspaces' class, made by JuiceFS's driver, whose mount pod is ready", async () => {
-      const { claim, volume } = await volumeOf(none);
-      const storageClass = await kube.get<V1StorageClass>(ref("StorageClass", claim.spec?.storageClassName ?? ""));
-      assert.equal(storageClass?.provisioner, CSI_DRIVER);
-      assert.equal(volume.spec?.csi?.driver, CSI_DRIVER);
-      await until("the session's mount pod ready", async () => (isReady(await mountPodOf(none)) ? true : undefined), 60_000, async () => driverState((await podOf(none)).spec?.nodeName ?? ""));
+    test("a session's workspace is a directory of the file system, of a quota its own, on the mount of the node it is bound on, whose pod is ready", async () => {
+      assert.deepEqual((await quotaOf(none)).capacityBytes, 1024 ** 3);
+      const { node } = await bringUp(none);
+      const mounts = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("workspace-mount")) });
+      assert.ok(isReady(mounts.find(({ spec }) => spec?.nodeName === node)), `the mount of ${node} is not ready`);
+      // On the node, as its agent sees it: the workspace's files under its directory of the file system.
+      const agent = (await nodeAgents()).get(node);
+      assert.ok(agent, `no node agent runs ready on ${node}`);
+      const listed = await kube.execOk(NAMESPACE, agent, ["sh", "-c", `ls ${WORKSPACES_ROOT}/${directoryOf(none)}/files`], { container: "node-agent" });
+      assert.deepEqual(listed.trim().split("\n").sort(), ["home", "workspace"]);
     });
 
     test("a workspace on JuiceFS does in gVisor what tools ask of a file system", async () => {
@@ -376,7 +305,7 @@ export function workspaceStorage(): void {
       assert.deepEqual(said, ["fsync", "rename", "hardlink", "symlink", "chmod", "flock", "mmap", "large-file", "small-files", "git"].map((name) => `PASS ${name}`));
     });
 
-    test("a workspace takes no more than its claim's size", async () => {
+    test("a workspace takes no more than its quota", async () => {
       const said = await inWorkspaceOk(none, [
         `cd ${WORKDIR}`,
         'fallocate -l 900M quota-a && echo "took 900M"',
@@ -420,14 +349,14 @@ export function workspaceStorage(): void {
       }
     });
 
-    test("a workspace suspended resumes with its files", async () => {
-      await kube.patch(ref("Sandbox", none, SESSIONS), { spec: { operatingMode: "Suspended" } });
-      await until("the session's pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", none, SESSIONS))) ? undefined : true));
-      await bringUp(none);
+    test("a workspace released is bound again with its files", async () => {
+      const before = await bringUp(none);
+      await release(none);
+      assert.notEqual((await bringUp(none)).name, before.name);
       assert.equal(await fixtureDigest(none), fixture);
     });
 
-    test("a fork holds its source's files, with their owners, modes and symlinks, counted by its own quota, and its source runs again after", async () => {
+    test("a fork holds its source's files, with their owners, modes and symlinks, counted by its own quota, its source running on", async () => {
       await inWorkspaceOk(none, [
         "set -e",
         `mkdir -p ${FORKED}/private && cd ${FORKED}`,
@@ -441,21 +370,19 @@ export function workspaceStorage(): void {
       const listed = await listing(none);
       assert.match(listed, /\/private\/key 1000:1000 600 f \n/u);
       assert.match(listed, /\/link 1000:1000 777 l private\/key\n/u);
-      const running = (await podOf(none)).metadata?.uid;
+      const running = (await bringUp(none)).name;
 
       assert.deepEqual(await fork(none, forked), { volumeId: forked, netMode: "none" });
-      // Its source, suspended for the clone, runs again, in a new pod, with its files.
-      const source = await podOf(none);
-      assert.ok(isReady(source) && source.metadata?.uid !== running, `the source runs in ${source.metadata?.uid}, as before the fork`);
+      // Its source runs on, bound as it was, with its files.
+      assert.equal((await boundPodOf(none))?.name, running);
       assert.equal(await listing(none), listed);
-      // The fork waits to be brought up, its volume's quota the claim's, counting what it was cloned with.
-      assert.equal((await kube.get<Sandbox>(ref("Sandbox", forked, SESSIONS)))?.spec.operatingMode, "Suspended");
-      const claim = await kube.get<V1PersistentVolumeClaim>(ref("PersistentVolumeClaim", `data-${forked}`, SESSIONS));
-      assert.equal(claim?.status?.phase, "Bound");
-      const directory = `${SESSIONS}-data-${forked}`;
-      const quota = await withAdminPod((inPod) => inPod("juicefs", `juicefs quota get "$META_URL" --path /${directory} && juicefs quota check "$META_URL" --path /${directory} 2>&1`));
-      assert.match(quota, new RegExp(`\\| /${directory} +\\| +1\\.0 GiB +\\| +[1-9][0-9.]* MiB `, "u"));
-      assert.match(quota, new RegExp(`quota of /${directory} is consistent`, "u"));
+      // The fork waits to be bound, its quota its own, counting what it was cloned with.
+      assert.equal(await boundPodOf(forked), null);
+      const quota = await quotaOf(forked);
+      assert.ok(quota.capacityBytes === 1024 ** 3 && quota.usedBytes > 0, JSON.stringify(quota));
+      const directory = directoryOf(forked);
+      const checked = await withAdminPod((inPod) => inPod("juicefs", `juicefs quota check "$META_URL" --path /${directory} 2>&1`));
+      assert.match(checked, new RegExp(`quota of /${directory} is consistent`, "u"));
       await bringUp(forked);
       assert.equal(await listing(forked), listed);
       assert.equal(await fixtureDigest(forked), fixture);
@@ -470,7 +397,7 @@ export function workspaceStorage(): void {
       assert.equal(await seen(forked), "dangling\nfrom-fork\nlink\nprivate\nchanged\nhome\n");
     });
 
-    test("a fork takes no more than its own claim's size", async () => {
+    test("a fork takes no more than its own quota", async () => {
       const said = await inWorkspaceOk(forked, [
         `cd ${WORKDIR}`,
         'fallocate -l 900M quota-a && echo "took 900M"',
@@ -485,20 +412,20 @@ export function workspaceStorage(): void {
     test("deleting a fork leaves whole both the session it was forked from and its own fork", async () => {
       const again = `${forked}-again`;
       assert.deepEqual(await fork(forked, again), { volumeId: again, netMode: "none" });
-      const volume = (await volumeOf(forked)).volume.metadata?.name ?? "";
-      await kube.remove(ref("Sandbox", forked, SESSIONS));
-      await until(`the fork's volume ${volume} deleted`, async () => ((await kube.get<V1PersistentVolume>(ref("PersistentVolume", volume))) ? undefined : true));
+      await destroy(forked);
+      const gone = await gatewayCall(await mainToken(forked), "GET", "/workspace/quota");
+      assert.equal(gone.status, 404, gone.said);
       assert.equal(await fixtureDigest(none), fixture);
-      await bringUp(again);
       assert.equal(await fixtureDigest(again), fixture);
       assert.equal(await inWorkspaceOk(again, `cat ${FORKED}/private/key`), "changed\n");
-      await kube.remove(ref("Sandbox", again, SESSIONS));
+      await destroy(again);
     });
 
     for (const store of STORES) {
       test(`a workspace keeps every file written through ${store.name} being killed mid-write`, async () => {
         const dir = `${WORKDIR}/through-${store.name}`;
-        const writing = kube.execOk(SESSIONS, none, ["node", "-e", WRITER, dir, "30000"], { container: "bayma" });
+        const pod = (await bringUp(none)).name;
+        const writing = kube.execOk(SESSIONS, pod, ["node", "-e", WRITER, dir, "30000"], { container: "bayma" });
         await sleep(3000);
         const name = await podOfStore(store);
         const killed = await kube.get<V1Pod>(ref("Pod", name, NAMESPACE));
@@ -512,123 +439,24 @@ export function workspaceStorage(): void {
         await kube.awaitReady([ref(store.kind, store.name, NAMESPACE)], "10 minutes");
         const written = (await writing).trim().split("\n").filter(Boolean);
         assert.ok(written.length > 0, "nothing was written");
-        const kept = new Set<string>(JSON.parse(await kube.execOk(SESSIONS, none, ["node", "-e", WRITTEN, dir], { container: "bayma" })));
+        const kept = new Set<string>(JSON.parse(await kube.execOk(SESSIONS, pod, ["node", "-e", WRITTEN, dir], { container: "bayma" })));
         assert.deepEqual(written.filter((file) => !kept.has(file)), []);
         assert.equal(await fixtureDigest(none), fixture);
       });
     }
 
-    test("a workspace keeps working through its mount pod's client crashing, as the driver holds the mount for the client started again", async () => {
-      const running = await podOf(none);
-      const node = running.spec?.nodeName ?? "";
-      const volume = (await volumeOf(none)).volume.metadata?.name;
-      const mountPod = await mountPodOf(none);
-      assert.ok(mountPod?.metadata?.name && volume, `the session ${none} has no mount pod`);
-      const name = mountPod.metadata.name;
-      const restarts = mountPod.status?.containerStatuses?.[0]?.restartCount ?? 0;
-      // The client mounts the volume at a path of the driver's named after it, which its
-      // command line names; the bracket keeps the pattern from matching the shell's own.
-      await onNode(node, [
-        "set -eu",
-        `clients=$(for process in /proc/[0-9]*; do grep -q '[/]jfs/${volume}-' "$process/cmdline" 2>/dev/null && echo "\${process#/proc/}"; done; true)`,
-        '[ -n "$clients" ]',
-        "kill -9 $clients",
-      ].join("\n"));
-      await until("the mount pod's client started again", async () => {
-        const status = (await kube.get<V1Pod>(ref("Pod", name, DRIVER_NAMESPACE)))?.status?.containerStatuses?.[0];
-        return (status?.restartCount ?? 0) > restarts && status?.state?.running ? true : undefined;
-      }, 120_000, () => driverState(node));
-      const checked = await checkMount(none);
-      const after = await bringUp(none);
-      assert.deepEqual({ answered: checked.code, uid: after.uid }, { answered: 0, uid: running.metadata?.uid }, checked.stderr);
-      assert.equal(await fixtureDigest(none), fixture);
-    });
-
-    test("a session keeps its files through its mount pod being deleted: on the mount the driver holds for the one it makes anew, or restarted as it is brought up", async () => {
-      const running = await podOf(none);
-      const node = running.spec?.nodeName ?? "";
-      const mountPod = await mountPodOf(none);
-      assert.ok(mountPod?.metadata?.name, `the session ${none} has no mount pod`);
-      await kube.remove(ref("Pod", mountPod.metadata.name, DRIVER_NAMESPACE));
-      await until("its mount pod made anew", async () => {
-        const made = await mountPodOf(none);
-        return made?.metadata?.uid !== mountPod.metadata?.uid && made?.status?.phase === "Running" ? true : undefined;
-      }, 300_000, () => driverState(node));
-      const checked = await checkMount(none);
-      const after = await bringUp(none);
-      const restarted = after.uid !== running.metadata?.uid;
-      assert.equal(restarted, checked.code !== 0, `restarted: ${restarted}, as its workspace answered ${checked.code} ${checked.stderr}`);
-      assert.equal(await fixtureDigest(none), fixture);
-    });
-
-    test("a session whose workspace's mount is lost is restarted as it is brought up, at once, on a JuiceFS mount made anew, its files kept", async () => {
-      const running = await podOf(none);
-      const node = running.spec?.nodeName ?? "";
-      const volume = (await volumeOf(none)).volume.metadata?.name ?? "";
-      const lost = await mountPodOf(none);
-      assert.ok(lost?.metadata?.name, `the session ${none} has no mount pod`);
-      /** The file system types of what is mounted at the pod `uid`'s volumes on the node. */
-      const mountedAt = async (uid: string | undefined) => onNode(node, `awk '$5 ~ /\\/pods\\/${uid}\\/volumes\\// { print $(NF - 2) }' /proc/self/mountinfo`);
-      // The FUSE connection of the session's mount on the node aborted, as the kernel does
-      // to a mount whose client is gone for good: the major:minor of its mount names it.
-      await onNode(node, [
-        "set -eu",
-        `device=$(awk '$5 ~ /\\/pods\\/${running.metadata?.uid}\\/volumes\\// && / - fuse\\.juicefs / { print $3; exit }' /proc/self/mountinfo)`,
-        '[ -n "$device" ]',
-        'connection=$(echo "$device" | cut -d: -f2)',
-        '[ -e "/sys/fs/fuse/connections/$connection" ] || mount -t fusectl fusectl /sys/fs/fuse/connections',
-        'echo 1 > "/sys/fs/fuse/connections/$connection/abort"',
-      ].join("\n"));
-      const broken = await until("the session's workspace broken", async () => {
-        const checked = await checkMount(none);
-        return checked.code === 0 ? undefined : checked.stderr;
-      }, 60_000);
-      assert.match(broken, /Transport endpoint is not connected|Software caused connection abort|Input\/output error/u);
-      const after = await bringUp(none);
-      assert.notEqual(after.uid, running.metadata?.uid);
-      // The broken mount's pod is gone, and the session's new pod has its volume from JuiceFS,
-      // not the node's directory under the mount point.
-      const remaining = await kube.get<V1Pod>(ref("Pod", lost.metadata.name, DRIVER_NAMESPACE));
-      assert.ok(remaining?.metadata?.uid !== lost.metadata.uid || remaining?.metadata?.deletionTimestamp, `${lost.metadata.name} still serves`);
-      const state = await mountState(none, node, volume);
-      assert.deepEqual([...new Set((await mountedAt(after.uid)).trim().split("\n"))].filter((type) => type !== "tmpfs"), ["fuse.juicefs"], state);
-      const files = await inWorkspace(none, `cd ${FIXTURE} && timeout -k 5 120 sh -c '${DIGEST}'`);
-      assert.equal(files.stdout.trim(), fixture, state);
-    });
-
-    test("a workspace moves to another node with its files, as a JuiceFS volume is no node's", { skip: AGENTS < 2 && "the run has one node" }, async () => {
+    test("a workspace moves to another node with its files, as a directory of the file system is no node's", { skip: AGENTS < 2 && "the run has one node" }, async () => {
       const full = sessions.full;
       const written = (await inWorkspaceOk(full, `mkdir -p ${WORKDIR} && head -c 1048576 /dev/urandom > ${WORKDIR}/moving && sha256sum < ${WORKDIR}/moving`)).trim();
-      const pod = await podOf(full);
-      const node = pod.spec?.nodeName ?? "";
-      const sandbox = ref("Sandbox", full, SESSIONS);
-      const nodeSelector = (await kube.get<Sandbox>(sandbox))?.spec.podTemplate.spec?.nodeSelector ?? null;
+      const { node } = await bringUp(full);
+      await release(full);
       await kube.patch(ref("Node", node), { spec: { unschedulable: true } });
       try {
-        // Free to run on any node, and made anew: as the cluster's admin, as alasio makes no
-        // Sandbox but from its template, which places sessions on one node in this run.
-        await kube.patch(sandbox, { spec: { podTemplate: { spec: { nodeSelector: null } } } });
-        await kube.remove(ref("Pod", full, SESSIONS));
-        // Its pod ended though alasio did not end it, alasio releases the session into a snapshot
-        // as bayma holds its stop (src/gateway/snapshots.ts saveStopping), under the Sandbox's
-        // lock, which this bring-up, in a process of its own, does not wait for: it is brought
-        // up once that pod is gone, from that snapshot, or anew.
-        await until(`the pod ${pod.metadata?.uid} of ${full} gone`, async () => ((await kube.get<V1Pod>(ref("Pod", full, SESSIONS)))?.metadata?.uid === pod.metadata?.uid ? undefined : true), 180_000);
+        // Bound again, of a pool's pod on another node, which reaches the same file system.
         const moved = await bringUp(full);
         assert.ok(moved.node && moved.node !== node, `the session stayed on ${node}`);
-        // Released into a snapshot on the cordoned node as its pod ended, it is restored on no
-        // node that takes no pod of it: the cordoned node prepares none of it. The node agents
-        // run where sessions do, which this run is one node, so no other node restores it, and
-        // the session comes back from bayma's checkpoints, its files on JuiceFS.
-        const agent = (await nodeAgents()).get(node);
-        assert.ok(agent, `no node agent runs ready on ${node}`);
-        const logged = (await kube.logs(NAMESPACE, agent, "node-agent")).split("\n");
-        const taken = logged.map((line) => new RegExp(`took the snapshot (\\S+) of ${SESSIONS}/${full}:`, "u").exec(line)?.[1]).filter(Boolean).at(-1);
-        assert.ok(taken, `${node}'s agent took no snapshot of ${full} as its pod ended`);
-        assert.deepEqual(logged.filter((line) => line.includes(`prepared the snapshot ${taken} of ${SESSIONS}/${full}`)), []);
         assert.equal((await inWorkspaceOk(full, `sha256sum < ${WORKDIR}/moving`)).trim(), written);
       } finally {
-        await kube.patch(sandbox, { spec: { podTemplate: { spec: { nodeSelector } } } });
         await kube.patch(ref("Node", node), { spec: { unschedulable: null } });
       }
     });
@@ -636,7 +464,7 @@ export function workspaceStorage(): void {
     test("the daily quota check checks each workspace's quota", async () => {
       const said = await runCronJob(componentName("juicefs-quota-check"));
       for (const netMode of ["none", "full"] as const) {
-        const directory = await directoryOf(sessions[netMode]);
+        const directory = directoryOf(sessions[netMode]);
         assert.match(said, new RegExp(`quota of /${directory} is consistent|/${directory}: quota\\(`, "u"), directory);
       }
     });
@@ -645,68 +473,23 @@ export function workspaceStorage(): void {
       await runCronJob(componentName("juicefs-gc"));
     });
 
-    test("a workspace's volume is deleted with its claim, and its directory with it", async () => {
-      const { claim: session } = await volumeOf(none);
-      const image = (await kube.get<V1CronJob>(ref("CronJob", componentName("juicefs-quota-check"), NAMESPACE)))?.spec?.jobTemplate.spec?.template.spec?.containers[0]?.image;
-      assert.ok(image);
-      const name = `juicefs-e2e-deleted-${Date.now()}`;
-      const claim: V1PersistentVolumeClaim = {
-        apiVersion: "v1",
-        kind: "PersistentVolumeClaim",
-        metadata: { name, namespace: NAMESPACE },
-        spec: { storageClassName: session.spec?.storageClassName ?? "", accessModes: session.spec?.accessModes ?? [], resources: { requests: { storage: "1Gi" } } },
-      };
-      const writer: V1Pod = {
-        apiVersion: "v1",
-        kind: "Pod",
-        metadata: { name, namespace: NAMESPACE },
-        spec: {
-          restartPolicy: "Never",
-          terminationGracePeriodSeconds: 0,
-          containers: [{ name: "writer", image, command: ["sh", "-c", "head -c 1048576 /dev/urandom > /data/written && sync"], volumeMounts: [{ name: "data", mountPath: "/data" }] }],
-          volumes: [{ name: "data", persistentVolumeClaim: { claimName: name } }],
-        },
-      };
-      await kube.apply(claim);
-      await kube.apply(writer);
-      try {
-        await until(`${name} written in its volume`, async () => {
-          const phase = (await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))?.status?.phase;
-          assert.notEqual(phase, "Failed", `${name} could not write in its volume`);
-          return phase === "Succeeded" ? true : undefined;
-        });
-      } finally {
-        await kube.remove(ref("Pod", name, NAMESPACE));
-      }
-      const volume = (await kube.get<V1PersistentVolumeClaim>(ref("PersistentVolumeClaim", name, NAMESPACE)))?.spec?.volumeName;
-      assert.ok(volume, `the claim ${name} is bound to no volume`);
-      await kube.remove(ref("PersistentVolumeClaim", name, NAMESPACE));
-      // Its Job, which knows no claim, on the client mount pods run and sized as they are, not on JuiceFS's defaults.
-      const client = (await mountPodOf(none))?.spec?.containers[0];
-      let job: V1Job | undefined;
-      for (const deadline = Date.now() + 120_000; !job; await sleep(500)) {
-        assert.ok(Date.now() < deadline, `no Job deleted ${volume}'s directory`);
-        job = (await kube.list<V1Job>("Job", { namespace: DRIVER_NAMESPACE })).find(({ metadata }) => metadata?.name?.endsWith("-delvol"));
-      }
-      const deleting = job.spec?.template.spec?.containers[0];
-      assert.deepEqual([deleting?.image, deleting?.resources], [client?.image, client?.resources]);
-      await until(`the volume ${volume} deleted`, async () => ((await kube.get<V1PersistentVolume>(ref("PersistentVolume", volume))) ? undefined : true), 300_000, async () => {
-        const left = await kube.get<V1PersistentVolume>(ref("PersistentVolume", volume));
-        const logged = await kube.logs(DRIVER_NAMESPACE, "juicefs-csi-controller-0", "juicefs-plugin").catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
-        return `: it is ${left?.status?.phase}; the controller last logged:\n${logged.trimEnd().split("\n").slice(-20).join("\n")}`;
-      });
+    test("a workspace deleted through the gateway is gone from the file system, its directory with it", async () => {
+      const deleted = "fs-e2e-deleted";
+      assert.deepEqual(await create(deleted, "none"), { volumeId: deleted, netMode: "none" });
+      await inWorkspaceOk(deleted, "head -c 1048576 /dev/urandom > /workspace/written && sync");
+      await destroy(deleted);
       const listing = await withAdminPod((inPod) =>
         inPod("juicefs", [
           "set -eu",
           "mkdir -p /mounted",
           // It prints a dot on its standard output each time it finds the mount not ready yet, and no newline after.
           'juicefs mount --background --read-only --no-bgjob --cache-size 0 "$META_URL" /mounted >/dev/null',
-          "ls -a /mounted",
+          `ls -a /mounted/${SESSIONS}`,
           "umount /mounted",
         ].join("\n"))
       );
-      assert.ok(listing.split("\n").includes(await directoryOf(none)), `the file system holds no workspace's directory: ${listing}`);
-      assert.ok(!listing.split("\n").includes(`${NAMESPACE}-${name}`), `the deleted volume's directory remains: ${listing}`);
+      assert.ok(listing.split("\n").includes(none), `the file system holds no workspace's directory: ${listing}`);
+      assert.ok(!listing.split("\n").includes(deleted), `the deleted workspace's directory remains: ${listing}`);
     });
 
     test("JuiceFS dumps its metadata to its bucket, the nightly backup copies the newest, and the copy restores the same files", async () => {
@@ -736,7 +519,7 @@ export function workspaceStorage(): void {
           'juicefs fsck "$restored"',
           "mkdir -p /restored",
           'juicefs mount --background --read-only --no-bgjob --cache-size 0 "$restored" /restored >/dev/null',
-          `cd /restored/${await directoryOf(none)}${FIXTURE}`,
+          `cd /restored/${directoryOf(none)}/files${FIXTURE}`,
           DIGEST,
           "cd / && umount /restored",
         ].join("\n"));
