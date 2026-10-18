@@ -1455,14 +1455,16 @@ if (inShard("snapshots")) {
         assert.ok(agent, `no node agent runs on ${node}`);
         await kube.remove(ref("Pod", agent, NAMESPACE));
         await until(`the node agent ${agent} gone`, async () => ((await kube.get(ref("Pod", agent, NAMESPACE))) === null ? true : undefined), 300_000);
-        const answered = await turn("hello from elsewhere");
-        const restoredOn = (await sessionPod(session)).spec?.nodeName;
+        // Bound as alasio binds it, whichever session the chat's conversation is in now.
+        const binding = Date.now();
+        const restoredOn = (await bindSession(session)).node;
+        const answered = Date.now() - binding;
         assert.ok(restoredOn && restoredOn !== node, `the session was restored on ${restoredOn}, where it was saved`);
         const seen = await repl.read(session, sessionId);
         assert.deepEqual([seen.live, seen.checkpointed], [`moved by ${session}`, `moved by ${session}`]);
         assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
         assert.equal((await inSession(session, 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync("/workspace/moving")).digest("hex"))')).trim(), written);
-        t.diagnostic(`the turn's answer came ${answered} ms after its prompt, the session restored meanwhile on ${restoredOn}, saved on ${node}`);
+        t.diagnostic(`the session was bound ${answered} ms after it was asked for, restored meanwhile on ${restoredOn}, saved on ${node}`);
       } finally {
         await kube.patch(ref("Node", node), { spec: { taints } });
         await until(`a node agent ready again on ${node}`, async () => ((await nodeAgents()).has(node) ? true : undefined), 300_000);
@@ -1648,11 +1650,13 @@ if (inShard("snapshots")) {
         t.diagnostic(said);
         await answered;
         // What the gateway and the node agents said of it, where it cannot be read.
+        const logged = async () => console.error(`# what the sandbox service logged of ${big}:\n${await serviceLogs(big)}`);
         const summed = await repl.sum(big, held).catch(async (error: unknown) => {
-          console.error(`# what the sandbox service logged of ${big}:\n${await serviceLogs(big)}`);
+          await logged();
           throw error;
         });
-        assert.equal(summed.sha256, sha256);
+        if (summed.sha256 !== sha256) await logged();
+        assert.equal(summed.sha256, sha256, summed.notice ?? "bayma told the exec nothing");
         assert.match(summed.notice ?? "", CAME_BACK_WHOLE);
       } finally {
         log.stop();
