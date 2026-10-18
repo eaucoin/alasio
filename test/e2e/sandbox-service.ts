@@ -210,6 +210,19 @@ export function sandboxService(): void {
       }
     });
 
+    test("the node agents take the sandbox gateway's calls alone: alasio's pod reaches none of them, the gateway's each", async () => {
+      const [alasio, gateway] = await Promise.all([kube.runningPod(NAMESPACE, "alasio"), kube.runningPod(NAMESPACE, GATEWAY)]);
+      const agents = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("node-agent")) });
+      assert.ok(agents.length > 0, "no node agent runs");
+      for (const { metadata, status } of agents) {
+        assert.ok(status?.podIP, `${metadata?.name} has no address`);
+        const from = async (pod: string, container: string) =>
+          (await kube.execOk(NAMESPACE, pod, ["node", "-e", tcp(JSON.stringify(status.podIP), NODE_AGENT_PORT)], { container })).trim();
+        assert.equal(await from(gateway, "sandbox-gateway"), "open", `the gateway does not reach ${metadata?.name}`);
+        assert.equal(await from(alasio, "alasio"), "blocked", `alasio reaches ${metadata?.name}`);
+      }
+    });
+
     test("a workspace made and bound to a pool's pod through the gateway keeps every write into it as the node's mount of workspace storage is handed over to the pod that replaces the one that held it", async () => {
       const workspace = "fs-e2etakeover";
       // Made and bound as alasio makes and binds it: a caller's token of the key, signed by main's key, through the gateway alone.

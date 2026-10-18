@@ -2394,7 +2394,7 @@ describe("node agents", () => {
     }
   });
 
-  test("take alasio's calls alone, and the sandbox gateway's, and reach the cluster's DNS, the object store's S3 port, workspace storage's metadata engine and the collector alone", () => {
+  test("take the sandbox gateway's calls alone, and reach the cluster's DNS, the object store's S3 port, workspace storage's metadata engine and the collector alone", () => {
     const objects = install();
     const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
     const podOf = (component: string, namespace = "alasio") => ({
@@ -2403,11 +2403,15 @@ describe("node agents", () => {
       labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component },
     });
     const agent = podOf("node-agent");
-    assert.equal(admits(policies, podOf("alasio"), agent, 8484), true);
+    assert.equal(admits(policies, podOf("sandbox-gateway"), agent, 8484), true);
+    assert.equal(admits(policies, podOf("alasio"), agent, 8484), false);
     assert.equal(admits(policies, podOf("collector"), agent, 8484), false);
     assert.equal(admits(policies, podOf("alasio", "alasio-branch-try"), agent, 8484), false);
     assert.equal(admits(policies, { ...podOf("session", "alasio-sessions"), labels: { "alasio.dev/workload": "session" } }, agent, 8484), false);
-    assert.equal(admits(policies, podOf("alasio"), agent, 8485), false);
+    assert.equal(admits(policies, podOf("sandbox-gateway"), agent, 8485), false);
+    // Where no gateway runs, as without workspace storage, none.
+    const ungated = all<NetworkPolicyObject>(install({ workspaceStorage: { enabled: false } }), "NetworkPolicy");
+    assert.equal(admits(ungated, podOf("sandbox-gateway"), agent, 8484), false);
     assert.equal(admits(policies, agent, podOf("seaweedfs"), 8333), true);
     assert.equal(admits(policies, agent, podOf("collector"), 4318), true);
     const egress = (file: Record<string, unknown>) =>

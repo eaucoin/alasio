@@ -443,8 +443,9 @@ function lakeQueryPolicy(config: InstallConfig): NetworkPolicy {
 }
 
 /**
- * The node agents take alasio's calls and the sandbox service's gateway's, which attaches
- * workspaces through them, on their API's port, and nothing else; they reach the cluster's
+ * The node agents take the sandbox service's gateway's calls alone, which attaches workspaces
+ * and saves and restores sandboxes through them, on their API's port, and nothing else, the
+ * gateway alone holding the token they take (./node-agent.ts); they reach the cluster's
  * DNS, the object store's S3 port, the bundled one's or the operator's at any address,
  * workspace storage's metadata engine, which they set workspaces' quotas on, and the collector
  * where it runs, and nothing else. The bundled object store, and the metadata engine, admit them.
@@ -460,10 +461,7 @@ function nodeAgentPolicies(config: InstallConfig): NetworkPolicy[] {
     policy(componentName("node-agent"), NAMESPACE, "node-agent", {
       ...NODE_AGENT,
       policyTypes: ["Ingress", "Egress"],
-      ingress: [{
-        from: [{ podSelector: { matchLabels: selectorLabels("alasio") } }, ...(sandboxServiceRuns(config) ? [SANDBOX_GATEWAY] : [])],
-        ports: [{ protocol: "TCP", port: NODE_AGENT_PORT }],
-      }],
+      ingress: sandboxServiceRuns(config) ? [{ from: [SANDBOX_GATEWAY], ports: [{ protocol: "TCP", port: NODE_AGENT_PORT }] }] : [],
       egress: [
         CLUSTER_DNS,
         objectStore,
