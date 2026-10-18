@@ -117,6 +117,7 @@ const create = (profile: SessionsProfile) => Effect.gen(function*() {
         '"ready"',
       ].join("\n"));
       if (answer(made) !== '"ready"') throw new Error(`the REPL said ${answer(made)}`);
+      await release(client, session.session_id);
       return { volumeId, replId: session.session_id };
     } finally {
       await client.close();
@@ -124,26 +125,8 @@ const create = (profile: SessionsProfile) => Effect.gen(function*() {
   });
 });
 
-/**
- * Takes the REPL `replId` over as `client`'s: bayma refuses while the client before still
- * holds a connection, as the one a step before this closed may for a while once it closed
- * it, and so is asked again, for up to ACQUIRE_WITHIN_MS.
- */
-async function acquire(client: Client, replId: string): Promise<void> {
-  const deadline = Date.now() + ACQUIRE_WITHIN_MS;
-  for (;;) {
-    try {
-      await call(client, "session.acquire_controller", { session_id: replId });
-      return;
-    } catch (error) {
-      if (!(error instanceof Error && error.message.includes("controller lease already held")) || Date.now() >= deadline) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-  }
-}
-
-/** How long acquire asks again for a REPL the client before still holds. */
-const ACQUIRE_WITHIN_MS = 60_000;
+/** Lets go of `client`'s control of the REPL `replId`, so the next step takes it over at once: bayma keeps a controller's lease while it sees its client connected, and a close may reach it after the next step's acquire. */
+const release = (client: Client, replId: string): Promise<unknown> => call(client, "session.release_controller", { session_id: replId });
 
 /** The session's REPL, as a new client that takes it over, given to `use`. */
 const inRepl = <A>(profile: SessionsProfile, volumeId: string, replId: string, use: (client: Client) => Promise<A>) => Effect.gen(function*() {
@@ -156,8 +139,10 @@ const inRepl = <A>(profile: SessionsProfile, volumeId: string, replId: string, u
   return yield* Effect.promise(async () => {
     const client = await connect(bayma);
     try {
-      await acquire(client, replId);
-      return await use(client);
+      await call(client, "session.acquire_controller", { session_id: replId });
+      const used = await use(client);
+      await release(client, replId);
+      return used;
     } finally {
       await client.close();
     }
