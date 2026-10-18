@@ -101,6 +101,13 @@ before(async () => {
     await withKube((kube) => kube.remove("v1", "Pod", FOLDERS, tried.name));
     assert.ok(Date.now() < deadline, "the policy never came into force");
   }
+  // And the Secrets' policy: a Secret it refuses refused.
+  for (let tries = 0, deadline = Date.now() + 30_000; ; tries += 1, await new Promise((resolve) => setTimeout(resolve, 200))) {
+    const tried = await askedAs(GATEWAY_USER, "POST", `/api/v1/namespaces/${FOLDERS}/secrets`, "application/json", { apiVersion: "v1", kind: "Secret", metadata: { name: `warm-up-${tries}`, namespace: FOLDERS }, type: "Opaque", stringData: { token: "t" } });
+    if ("refused" in tried) break;
+    await withKube((kube) => kube.remove("v1", "Secret", FOLDERS, tried.name));
+    assert.ok(Date.now() < deadline, "the Secrets' policy never came into force");
+  }
 });
 
 test("a folder instance's pod, as the gateway makes it of the folder template, is made by the gateway, and by no one else", async () => {
