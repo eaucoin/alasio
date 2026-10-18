@@ -773,7 +773,14 @@ if (inShard("sessions")) {
 
     test("a folder conversation's bayma is its instance, bound through the gateway, working on the machine as the operator, in their home", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
       const { home } = paths();
-      const { url, seen } = await inAlasio<FolderBaymaSeen>("./folder-bayma.ts");
+      const { url, seen } = await inAlasio<FolderBaymaSeen>("./folder-bayma.ts").catch(async (error: unknown) => {
+        // What the gateway said of the folder's binds, and the pods there are of them.
+        const gateway = await kube.runningPod(NAMESPACE, GATEWAY);
+        const said = (await kube.logs(NAMESPACE, gateway, GATEWAY_COMPONENT).catch(String)).split("\n").filter((line) => /folder/u.test(line)).slice(-40);
+        const pods = (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE })).map(({ metadata, status }) => ({ name: metadata?.name, phase: status?.phase, containers: status?.containerStatuses?.map(({ state }) => state) }));
+        console.error(`# the gateway of the folder's binds:\n${said.join("\n")}\n# the folders' pods: ${JSON.stringify(pods)}`);
+        throw error;
+      });
       assert.equal(url, `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`);
       assert.deepEqual(seen, { uid: HOST_USER, home });
       // The gateway's pod of the folder pool, bound, on the conversation's state directory, never started again.
