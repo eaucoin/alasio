@@ -6,7 +6,7 @@
  * (../gateway/sessions.ts); the receiver stamps what arrives with what is known of the session
  * and exports it where the stack's telemetry goes.
  */
-import { parseKeyValueList, resolveTelemetry, sharedResourceAttributes, SIGNALS, telemetryEnabled } from "../telemetry/index.ts";
+import { parseKeyValueList, resolveTelemetry, sharedResourceAttributes, SIGNALS, telemetryEnabled } from "../telemetry/config.ts";
 import type { ResourceStamp } from "./otlp-resource.ts";
 
 /**
