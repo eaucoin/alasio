@@ -426,16 +426,25 @@ if (inShard("upgrade")) {
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
 
-    /** Main's session's REPL, live as the session is released, and the snapshot it is released into on PREVIOUS. */
+    /**
+     * Main's session's REPL, live as the session is released, and the snapshot it is last
+     * released into on PREVIOUS: each turn the tests have main answer before the upgrade
+     * restores the session, which is released again into a snapshot of its own.
+     */
     let releasedRepl: string;
     let releasedAs: string;
 
-    test(`on ${PREVIOUS}: main's session released into a snapshot, a REPL live in it`, { timeout: 30 * 60_000 }, async () => {
-      ({ sessionId: releasedRepl } = await repl.set(volumeId, `released by ${volumeId}`));
+    /** Waits for main's session, its turn answered, to be released into a snapshot, which it takes as the one the upgrade is to restore. */
+    const released = async () => {
       await untilReleased(volumeId, Date.now());
       releasedAs = (await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS)))?.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? "";
       assert.ok(releasedAs, `the session ${volumeId} was released into no snapshot`);
       assert.equal((await snapshotOf(volumeId))?.snapshot, releasedAs);
+    };
+
+    test(`on ${PREVIOUS}: main's session released into a snapshot, a REPL live in it`, { timeout: 30 * 60_000 }, async () => {
+      ({ sessionId: releasedRepl } = await repl.set(volumeId, `released by ${volumeId}`));
+      await released();
     });
 
     // A branch environment another release made does not run on what an upgrade changes,
@@ -478,6 +487,8 @@ if (inShard("upgrade")) {
         console.error(`# the log's pod's restarts: ${JSON.stringify(restarts)}\n# its first lines:\n${said.slice(0, 60).join("\n")}\n# its last:\n${said.slice(-40).join("\n")}`);
         throw error;
       });
+      // The last turn before the upgrade, whose session the release before releases again.
+      await released();
     });
 
     test(`the cut-over from ${PREVIOUS}, failing past its point of no return, before the upgrade, goes on with it when run again, its checks not run again`, { timeout: 60 * 60_000 }, async () => {
