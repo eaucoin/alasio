@@ -3,11 +3,10 @@
  * file system, made through the sandbox gateway by a node agent with its quota, on the
  * nodes' mount of it (cli/src/manifests/sandbox-gateway.ts workspaceMount), doing in gVisor
  * what tools ask of a file system within its quota; its files kept through the session
- * released and bound again, and Valkey and the object store killed mid-write, and, on
- * several nodes, its moving to another; a session forked, its fork a clone of its files
+ * released and bound again, and Valkey and the object store killed mid-write; a session forked, its fork a clone of its files
  * with their owners, its own quota, and neither touched by what is done in the other or by
  * its deletion; neither Valkey nor the object store, nor their credentials, within a
- * session's reach; a workspace deleted, its directory with it; the file system checked and
+ * session's reach (its moving to another node is the snapshots shard's); a workspace deleted, its directory with it; the file system checked and
  * collected daily; and its metadata dumped, backed up nightly, and restored from the backup
  * with the same files. The nodes' mount through a handover and a reboot is the sandbox
  * service's suite's (./sandbox-service.ts).
@@ -27,7 +26,7 @@ import { FILER, FILER_STORE, FILER_STORE_USERS, GATEWAY, MASTER, VOLUME_SERVER }
 import { JUICEFS_ADMIN, VALKEY, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/workspace-storage.ts";
 import { WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
-import { AGENTS, bindSession, boundPodOf, gatewayCall, inAlasio, inSession, kube, mainToken, nodeAgents, recordSession, ref, runCronJob, SESSIONS, tcp } from "./harness.ts";
+import { bindSession, boundPodOf, gatewayCall, inAlasio, inSession, kube, mainToken, nodeAgents, recordSession, ref, runCronJob, SESSIONS, tcp } from "./harness.ts";
 import type { Made } from "./session-volumes.ts";
 
 /**
@@ -191,6 +190,17 @@ async function release(volumeId: string): Promise<void> {
   await until(`the release of ${volumeId}`, async () => ((await boundPodOf(volumeId)) === null ? true : undefined), 180_000);
 }
 
+/**
+ * What `script`, which fills the session's workspace past its quota, said, once the quota
+ * holds: JuiceFS's client reads quotas anew every few seconds, so a mount may not hold one
+ * just set for a while; asked again for up to a minute.
+ */
+async function untilQuotaHeld(volumeId: string, script: string): Promise<string> {
+  let said = await inWorkspaceOk(volumeId, script);
+  for (const deadline = Date.now() + 60_000; !/quota exceeded/iu.test(said) && Date.now() < deadline; said = await inWorkspaceOk(volumeId, script)) await sleep(5_000);
+  return said;
+}
+
 /** The directory of the file system that is the session's workspace, as a node agent makes it, of its environment's. */
 const directoryOf = (volumeId: string) => `${SESSIONS}/${volumeId}`;
 
@@ -306,7 +316,7 @@ export function workspaceStorage(): void {
     });
 
     test("a workspace takes no more than its quota", async () => {
-      const said = await inWorkspaceOk(none, [
+      const said = await untilQuotaHeld(none, [
         `cd ${WORKDIR}`,
         'fallocate -l 900M quota-a && echo "took 900M"',
         'fallocate -l 300M quota-b 2>&1 && echo "took 300M more"',
@@ -398,7 +408,7 @@ export function workspaceStorage(): void {
     });
 
     test("a fork takes no more than its own quota", async () => {
-      const said = await inWorkspaceOk(forked, [
+      const said = await untilQuotaHeld(forked, [
         `cd ${WORKDIR}`,
         'fallocate -l 900M quota-a && echo "took 900M"',
         'fallocate -l 300M quota-b 2>&1 && echo "took 300M more"',
@@ -445,28 +455,11 @@ export function workspaceStorage(): void {
       });
     }
 
-    test("a workspace moves to another node with its files, as a directory of the file system is no node's", { skip: AGENTS < 2 && "the run has one node" }, async () => {
-      const full = sessions.full;
-      const written = (await inWorkspaceOk(full, `mkdir -p ${WORKDIR} && head -c 1048576 /dev/urandom > ${WORKDIR}/moving && sha256sum < ${WORKDIR}/moving`)).trim();
-      const { node } = await bringUp(full);
-      await release(full);
-      await kube.patch(ref("Node", node), { spec: { unschedulable: true } });
-      try {
-        // Bound again, of a pool's pod on another node, which reaches the same file system.
-        const moved = await bringUp(full);
-        assert.ok(moved.node && moved.node !== node, `the session stayed on ${node}`);
-        assert.equal((await inWorkspaceOk(full, `sha256sum < ${WORKDIR}/moving`)).trim(), written);
-      } finally {
-        await kube.patch(ref("Node", node), { spec: { unschedulable: null } });
-      }
-    });
-
-    test("the daily quota check checks each workspace's quota", async () => {
-      const said = await runCronJob(componentName("juicefs-quota-check"));
-      for (const netMode of ["none", "full"] as const) {
-        const directory = directoryOf(sessions[netMode]);
-        assert.match(said, new RegExp(`quota of /${directory} is consistent|/${directory}: quota\\(`, "u"), directory);
-      }
+    test("the daily quota check checks each workspace's quota, which is consistent after it", async () => {
+      await runCronJob(componentName("juicefs-quota-check"));
+      const checked = await withAdminPod((inPod) =>
+        inPod("juicefs", (["none", "full"] as const).map((netMode) => `juicefs quota check "$META_URL" --path /${directoryOf(sessions[netMode])} 2>&1`).join("\n")));
+      for (const netMode of ["none", "full"] as const) assert.match(checked, new RegExp(`quota of /${directoryOf(sessions[netMode])} is consistent`, "u"), netMode);
     });
 
     test("the daily collection collects the file system", async () => {

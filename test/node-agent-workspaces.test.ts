@@ -156,7 +156,13 @@ test("a workspace is cloned into another, of any environment, its files' owners 
     assert.equal(existsSync(join(at.workspacesRoot, "alasio-branch-try-sessions", "fs-source")), false);
     await Effect.runPromise(at.workspaces.remove(fork));
     assert.ok(at.juicefsCalls().some((call) => call.startsWith("quota delete redis://valkey.alasio.svc:6379/1 --path /alasio-branch-try-sessions/fs-source ")));
-    assert.ok(at.juicefsCalls().some((call) => call.startsWith(`clone --preserve ${sourceFiles} `)));
+    // Cloned, its quota set, then its usage counted anew.
+    const cloned = at.juicefsCalls().findIndex((call) => call.startsWith(`clone --preserve ${sourceFiles} `));
+    assert.ok(cloned >= 0);
+    assert.deepEqual(at.juicefsCalls().slice(cloned + 1, cloned + 3).map((call) => call.split(" META_PASSWORD")[0]), [
+      "quota set redis://valkey.alasio.svc:6379/1 --path /alasio-branch-try-sessions/fs-source --capacity 3",
+      "quota check redis://valkey.alasio.svc:6379/1 --path /alasio-branch-try-sessions/fs-source --repair",
+    ]);
     assert.equal(readFileSync(join(sourceFiles, "workspace", "kept"), "utf8"), "from the source");
   } finally {
     at.done();

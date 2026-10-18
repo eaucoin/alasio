@@ -10,15 +10,25 @@
  * the claim, as deleting its Sandbox does, deletes the directory into the file system's
  * trash. The file system's credentials, the metadata engine's URL with Valkey's password
  * and the bucket's keys, are in a Secret the stack's setup makes (./neon.ts), which the
- * driver reads, and alasio's JuiceFS admin pods (the daily quota check and collection
- * here), never a workspace.
+ * driver reads, and alasio's JuiceFS admin pods (the jobs here), never a workspace.
+ *
+ * The nodes' mount of the file system runs no background job (`--no-bgjob`,
+ * ./sandbox-gateway.ts workspaceMount), so what a client's background jobs would do is the
+ * jobs' here, each of its own:
+ * - the quota check (quotaCheck), daily: each workspace's usage counted anew and repaired;
+ * - the collection (collection), daily, `juicefs gc --compact --delete`: what the trash keeps
+ *   past its days expired, the trees of clones never attached removed, files and slices
+ *   pending deletion deleted, leaked objects deleted, and chunks left in many slices
+ *   compacted, which a mount otherwise compacts only as it reads and writes them;
+ * - the metadata's dump (metadataDump), every backupInterval, as JuiceFS's own backup would
+ *   have made it.
  */
 import type { KubernetesObject, V1Container, V1CronJob, V1StorageClass } from "@kubernetes/client-node";
 
 import { WORKSPACE_QUOTAS_USER } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
-import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, nodeAgentRuns, restrictedContainer, restrictedPod, script } from "./common.ts";
-import type { InstallConfig } from "./config.ts";
+import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, nodeAgentRuns, restrictedContainer, restrictedPod, s3Endpoint, script } from "./common.ts";
+import { everyIntervalCron, type InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { CSI_DRIVER, juicefsCsiObjects, VOLUME_DRIVER } from "./juicefs-csi.ts";
 import { VALKEY_PORT, valkeyObjects, valkeyPassword } from "./valkey.ts";
@@ -133,9 +143,9 @@ function dailyAdminTask(config: InstallConfig, component: string, schedule: stri
 }
 
 /**
- * The volumes' usage checked daily against what they hold, and repaired (guide/quota.md
+ * The workspaces' usage checked daily against what they hold, and repaired (guide/quota.md
  * "Usage check and fix"): a client that ends unexpectedly loses the usage it had yet to
- * write, after which a volume's quota counts wrongly. Each volume, as `juicefs quota
+ * write, after which a workspace's quota counts wrongly. Each workspace, as `juicefs quota
  * list` tables it, is checked in turn.
  */
 function quotaCheck(config: InstallConfig): V1CronJob {
@@ -145,23 +155,117 @@ function quotaCheck(config: InstallConfig): V1CronJob {
     QUOTA_CHECK_SCHEDULE,
     "quota-check",
     'quotas=$(juicefs quota list "$META_URL")',
-    // The table's rows of volumes, the directories at the file system's top (not those
-    // deleted into its trash), whose first column is their path.
-    "printf '%s\\n' \"$quotas\" | awk -F '|' '$2 ~ /^ \\/[^\\/ ]+ +$/ { gsub(/ /, \"\", $2); print $2 }' | while read -r path; do",
+    // The table's rows of workspaces, the directories of the file system's environments
+    // (`/<environment>/<workspace>`, as the node agents make them) and the volumes at its top,
+    // not those deleted into its trash, whose first column is their path.
+    "printf '%s\\n' \"$quotas\" | awk -F '|' '$2 ~ /^ \\/[^\\/. ][^\\/ ]*(\\/[^\\/ ]+)? +$/ { gsub(/ /, \"\", $2); print $2 }' | while read -r path; do",
     '  juicefs quota check "$META_URL" --path "$path" --repair',
     "done",
   );
 }
 
 /**
- * The file system collected daily (`juicefs gc --delete`, guide/gc.md): what no file
- * holds deleted from the bucket, and the trees of clones that never finished removed, a
- * day after they were begun. A clone builds its tree detached and attaches it only once
+ * The file system collected daily (`juicefs gc --compact --delete`, guide/gc.md): what no
+ * file holds deleted from the bucket, its trash's expired entries and its files pending
+ * deletion with it, chunks of many slices compacted, and the trees of clones that never
+ * finished removed, a day after they were begun. A clone builds its tree detached and attaches it only once
  * it is whole, and its client removes it when the clone fails; nothing but this removes
  * one whose client ended first.
  */
 function collection(config: InstallConfig): V1CronJob {
-  return dailyAdminTask(config, "juicefs-gc", COLLECTION_SCHEDULE, "gc", 'juicefs gc "$META_URL" --delete');
+  return dailyAdminTask(config, "juicefs-gc", COLLECTION_SCHEDULE, "gc", 'juicefs gc "$META_URL" --compact --delete');
+}
+
+/** How many of the metadata's dumps the bucket's meta/ keeps, the newest: a day's, at the default interval. */
+export const DUMPS_KEPT = 24;
+
+/**
+ * The file system's metadata dumped to its bucket, every backupInterval, one at a time, as
+ * JuiceFS's own backup would have, which no mount takes (the nodes' mount runs with no
+ * background job): by `juicefs dump`, its object store's keys left out, then put in meta/ as
+ * JuiceFS names its dumps, `dump-YYYY-MM-DD-hhmmss.json.gz` of UTC, which the nightly backup
+ * copies the newest of (./neon.ts backup); the dump checked as the gzip it is, and read back
+ * of the same size and checksum once put; the dumps but the newest DUMPS_KEPT deleted after.
+ * Put by the file system's own keys, which may write its bucket, with the AWS command line
+ * of the stack's image.
+ */
+function metadataDump(config: InstallConfig): V1CronJob {
+  const component = "juicefs-dump";
+  const credential = (name: string, key: string) => ({ name, valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key } } });
+  const schedule = everyIntervalCron(config.workspaceStorage.backupInterval);
+  // The configuration holds its interval to one a cron line keeps.
+  if (schedule === null) throw new Error(`workspaceStorage.backupInterval ${config.workspaceStorage.backupInterval} is kept by no cron line`);
+  const dump: V1Container = {
+    ...adminContainer(config, "dump", 'juicefs dump "$META_URL" /dump/dump.json.gz'),
+    securityContext: restrictedContainer(),
+    // Its metadata held whole, as Valkey's maxmemory bounds it.
+    resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "1Gi" } },
+    volumeMounts: [{ name: "dump", mountPath: "/dump" }],
+  };
+  const upload: V1Container = {
+    name: "upload",
+    image: imageReference(config.neon.image),
+    imagePullPolicy: "IfNotPresent",
+    command: [
+      "/bin/sh",
+      "-c",
+      script(
+        "set -eu",
+        's3() { aws s3 --endpoint-url "$S3_ENDPOINT" "$@"; }',
+        'meta="s3://$WORKSPACES_BUCKET/$WORKSPACES_NAME/meta/"',
+        'gzip -t "$DUMP/dump.json.gz" 2>/dev/null || { echo "the dump is no whole gzip" >&2; exit 1; }',
+        'name="dump-$(date -u +%Y-%m-%d-%H%M%S).json.gz"',
+        's3 cp "$DUMP/dump.json.gz" "$meta$name"',
+        's3 cp "$meta$name" "$DUMP/read.json.gz"',
+        `[ "$(stat -c %s "$DUMP/dump.json.gz")" = "$(stat -c %s "$DUMP/read.json.gz")" ] || { echo "$name in the bucket is not of the dump's size" >&2; exit 1; }`,
+        '[ "$(sha256sum < "$DUMP/dump.json.gz")" = "$(sha256sum < "$DUMP/read.json.gz")" ] || { echo "$name in the bucket is not the dump" >&2; exit 1; }',
+        `s3 ls "$meta" | awk '{print $4}' | grep '^dump-.*\\.json\\.gz$' | sort -r | tail -n +${DUMPS_KEPT + 1} | while read -r old; do s3 rm "$meta$old"; done`,
+        'echo "dumped the metadata of $WORKSPACES_NAME to $meta$name"',
+      ),
+    ],
+    env: [
+      { name: "S3_ENDPOINT", value: s3Endpoint(config) },
+      { name: "WORKSPACES_BUCKET", value: config.objectStore.buckets.workspaces },
+      { name: "WORKSPACES_NAME", value: config.workspaceStorage.name },
+      credential("AWS_ACCESS_KEY_ID", "access-key"),
+      credential("AWS_SECRET_ACCESS_KEY", "secret-key"),
+      { name: "AWS_DEFAULT_REGION", value: config.objectStore.external.region },
+      { name: "HOME", value: "/tmp" },
+      { name: "DUMP", value: "/dump" },
+    ],
+    securityContext: restrictedContainer(),
+    resources: { requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "512Mi" } },
+    volumeMounts: [{ name: "dump", mountPath: "/dump" }, { name: "tmp", mountPath: "/tmp" }],
+  };
+  return {
+    apiVersion: "batch/v1",
+    kind: "CronJob",
+    metadata: { name: componentName(component), namespace: NAMESPACE, labels: labels(component) },
+    spec: {
+      schedule,
+      concurrencyPolicy: "Forbid",
+      successfulJobsHistoryLimit: 1,
+      failedJobsHistoryLimit: 3,
+      jobTemplate: {
+        spec: {
+          backoffLimit: 2,
+          activeDeadlineSeconds: 1800,
+          template: {
+            metadata: { labels: { ...labels(component), ...JUICEFS_ADMIN } },
+            spec: {
+              restartPolicy: "Never",
+              ...priority("component"),
+              ...imagePullSecrets(config),
+              securityContext: restrictedPod(NOBODY, NOBODY),
+              initContainers: [dump],
+              containers: [upload],
+              volumes: [{ name: "dump", emptyDir: {} }, { name: "tmp", emptyDir: {} }],
+            },
+          },
+        },
+      },
+    },
+  };
 }
 
 /**
@@ -219,5 +323,5 @@ export function workspaceStorageObjects(config: InstallConfig): KubernetesObject
     // settings in.
     ...(nodeAgentRuns(config) ? { besideDefault: [{ name: WORKSPACE_QUOTAS_USER, secret: WORKSPACE_QUOTAS, rules: QUOTAS_RULES }] } : {}),
   };
-  return [...valkeyObjects(config, instance, [formatter(config)]), ...juicefsCsiObjects(config), storageClass(config), quotaCheck(config), collection(config)];
+  return [...valkeyObjects(config, instance, [formatter(config)]), ...juicefsCsiObjects(config), storageClass(config), quotaCheck(config), collection(config), metadataDump(config)];
 }

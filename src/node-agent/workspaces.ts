@@ -318,6 +318,8 @@ export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches
         yield* onMount(`${to.environment}/${to.workspace} could not be made`, () => mkdir(join(destination, ".."), { recursive: true }));
         yield* command.clone(source, destination);
         yield* command.setQuota(quotaPath(to), quotaBytes);
+        // The usage the quota is set with, counted as the clone's tree was attached, may be off what the tree holds: counted anew.
+        yield* command.repairQuota(quotaPath(to));
       }),
 
     remove: (ref) =>

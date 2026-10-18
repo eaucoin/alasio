@@ -536,7 +536,7 @@ function poolPolicies(config: InstallConfig, environment: Environment): NetworkP
  * The sandbox service's gateway and receiver, which take what sandboxes send, and so reach
  * what they need of the cluster alone:
  *
- * - the gateway takes main's alasio, which binds through it, its own replicas, which pass each
+ * - the gateway takes main's alasio and each branch environment's, which bind through it, its own replicas, which pass each
  *   other what is bound on the pods each holds, and KEDA's operator (kedaOperator), which asks
  *   it how many binds wait for a pool, on its port alone; it reaches the cluster's DNS, the
  *   pools' pods of every environment on bayma's port, the node agents, its replicas, the
@@ -560,7 +560,10 @@ function sandboxServicePolicies(config: InstallConfig, apiServer: ApiServer | nu
     policy(SANDBOX_GATEWAY_NAME, NAMESPACE, SANDBOX_GATEWAY_COMPONENT, {
       ...SANDBOX_GATEWAY,
       policyTypes: ["Ingress", "Egress"],
-      ingress: [{ from: [{ podSelector: { matchLabels: selectorLabels("alasio") } }, SANDBOX_GATEWAY, kedaOperator(config)], ports: [{ protocol: "TCP", port: SANDBOX_GATEWAY_PORT }] }],
+      ingress: [{
+        from: [{ podSelector: { matchLabels: selectorLabels("alasio") } }, { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } }, SANDBOX_GATEWAY, kedaOperator(config)],
+        ports: [{ protocol: "TCP", port: SANDBOX_GATEWAY_PORT }],
+      }],
       egress: [
         CLUSTER_DNS,
         { to: pools, ports: [{ protocol: "TCP", port: POOL_POD_PORT }] },

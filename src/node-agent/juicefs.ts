@@ -2,7 +2,7 @@
  * Workspace storage as JuiceFS's own command, of the agent's image, works on it: its own
  * release's static build, of the version the nodes mount workspace storage with (../../Dockerfile).
  *
- * - A workspace's directory's quota, set, read and deleted on the metadata engine alone
+ * - A workspace's directory's quota, set, read, repaired and deleted on the metadata engine alone
  *   (`juicefs quota`), as the agent's Valkey user there, which runs no command Valkey calls
  *   dangerous. The engine's address is given whole, as the stack's setup makes it, its
  *   password in it; the command is given it without, the password in META_PASSWORD, which
@@ -39,6 +39,8 @@ export interface Juicefs {
   readonly quota: (path: string) => Effect.Effect<Quota | null, JuicefsError>;
   /** Deletes the directory `path`'s quota. */
   readonly deleteQuota: (path: string) => Effect.Effect<void, JuicefsError>;
+  /** Counts what the directory `path` holds anew and repairs its quota's usage where it differs. */
+  readonly repairQuota: (path: string) => Effect.Effect<void, JuicefsError>;
   /** Clones the directory `source`, a path of the node's mount, into `destination`, which is not there yet, its parent being. */
   readonly clone: (source: string, destination: string) => Effect.Effect<void, JuicefsError>;
 }
@@ -101,6 +103,7 @@ export function makeJuicefs({ metaUrl, juicefs = JUICEFS }: JuicefsOptions): Jui
     setQuota: (path, bytes) => Effect.asVoid(run("quota set", ["quota", "set", address, "--path", path, "--capacity", String(Math.max(1, Math.ceil(bytes / 1024 ** 3)))])),
     quota: (path) => Effect.map(run("quota get", ["quota", "get", address, "--path", path]), (printed) => quotaOf(printed, path)),
     deleteQuota: (path) => Effect.asVoid(run("quota delete", ["quota", "delete", address, "--path", path])),
+    repairQuota: (path) => Effect.asVoid(run("quota check", ["quota", "check", address, "--path", path, "--repair"])),
     // Its files' owners and modes as they are, not the agent's, which runs it as root.
     clone: (source, destination) => Effect.asVoid(run("clone", ["clone", "--preserve", source, destination])),
   };

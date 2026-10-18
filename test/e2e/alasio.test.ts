@@ -1407,7 +1407,8 @@ if (inShard("snapshots")) {
       await assertNoInternet(session);
     });
 
-    test("a session saved on one node is restored on another, from the bucket, its REPL whole", { skip: AGENTS < 2 && "one node" }, async (t) => {
+    test("a session saved on one node is restored on another, from the bucket, its REPL whole and its workspace's files with it, as a directory of the file system is no node's", { skip: AGENTS < 2 && "one node" }, async (t) => {
+      const written = (await inSession(session, 'const f=require("fs");f.writeFileSync("/workspace/moving",require("crypto").randomBytes(1<<20));process.stdout.write(require("crypto").createHash("sha256").update(f.readFileSync("/workspace/moving")).digest("hex"))')).trim();
       ({ sessionId } = await repl.set(session, `moved by ${session}`));
       const since = Date.now();
       const node = (await sessionPod(session)).spec?.nodeName;
@@ -1428,6 +1429,7 @@ if (inShard("snapshots")) {
         const seen = await repl.read(session, sessionId);
         assert.deepEqual([seen.live, seen.checkpointed], [`moved by ${session}`, `moved by ${session}`]);
         assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+        assert.equal((await inSession(session, 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync("/workspace/moving")).digest("hex"))')).trim(), written);
         t.diagnostic(`the turn's answer came ${answered} ms after its prompt, the session restored meanwhile on ${restoredOn}, saved on ${node}`);
       } finally {
         await kube.patch(ref("Node", node), { spec: { taints } });
@@ -1442,8 +1444,9 @@ if (inShard("snapshots")) {
       assert.ok(node, `the session ${drained} runs on no node`);
       const began = Date.now();
       try {
-        // kubectl drain, of the sessions' pods alone, as the node's other pods are not this test's: a bound one's waits for its release.
-        await onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=app.kubernetes.io/component=session --delete-emptydir-data --timeout=420s`);
+        // kubectl drain, of the session's bound pod alone, as the node's other pods are not this test's, which waits for its release:
+        // forced, as a bound pod is its ReplicaSet's no more.
+        await onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=${BINDING_LABEL}=${keyHash(sessionKey(drained))} --force --delete-emptydir-data --timeout=420s`);
         const manifest = await snapshotOf(drained);
         assert.ok(manifest, `the drained session ${drained} has no snapshot`);
         // A release's snapshot, its sandbox ended by it, not one taken live.
@@ -1910,6 +1913,8 @@ if (inShard("telemetry")) {
 
     test("a session's bayma's telemetry is in the lake, stamped with its session, and reaches the installation's backend too", async () => {
       const volumeId = await newSession("none");
+      // An exec of its bayma's, through the gateway, which bayma traces.
+      await repl.set(volumeId, "traced");
       await untilInLake("trace of the session's bayma", `select count(*) as n from otel.traces where ServiceName = 'bayma' and ResourceAttributes['alasio.volume.id'] = '${volumeId}'`);
       assert.ok(await untilExported("traces", volumeId, 120_000), "no trace of the session's bayma arrived at the backend stamped with it");
     });
@@ -2652,9 +2657,9 @@ if (inShard("scaling")) {
       await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
       await tg.say("wait 60");
       await until("alasio's pod busy", async () => ((await labelledBusy(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE))) ? true : undefined), 60_000);
-      // kubectl drain, of the sessions' pods alone, as the node's other pods are not this test's.
+      // kubectl drain, of the session's bound pod alone, as the node's other pods are not this test's: forced, as a bound pod is its ReplicaSet's no more.
       let drained = 0;
-      const draining = onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=app.kubernetes.io/component=session --delete-emptydir-data --timeout=600s`).then((said) => {
+      const draining = onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=${BINDING_LABEL}=${keyHash(sessionKey(volumeId))} --force --delete-emptydir-data --timeout=600s`).then((said) => {
         drained = Date.now();
         return said;
       });

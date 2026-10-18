@@ -48,7 +48,7 @@ import { MAIN_ENVIRONMENT } from "../src/manifests/common.ts";
 import { lakeReconcile } from "../src/manifests/lake.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
-import { filerStoreBackupHours } from "../src/manifests/config.ts";
+import { everyIntervalCron, filerStoreBackupHours } from "../src/manifests/config.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { goferOf, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
@@ -328,9 +328,8 @@ describe("configuration", () => {
       const result = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, workspaceStorage: given });
       return Result.isFailure(result) ? result.failure.message : "";
     };
-    assert.equal(refused({ backupInterval: "4m59s" }), "workspaceStorage.backupInterval must be a duration of 5m or more, such as 1h");
-    assert.equal(refused({ backupInterval: "0" }), "workspaceStorage.backupInterval must be a duration of 5m or more, such as 1h");
-    assert.equal(refused({ backupInterval: "1h30m" }), "");
+    for (const interval of ["4m59s", "0", "7m", "1h30m"]) assert.equal(refused({ backupInterval: interval }), "workspaceStorage.backupInterval must be 5m or more, of whole minutes that divide an hour or whole hours that divide a day, such as 1h", interval);
+    assert.equal(refused({ backupInterval: "30m" }), "");
     assert.equal(refused({ trashDays: -1 }), "workspaceStorage.trashDays must be 0 or more");
     assert.equal(refused({ name: "Workspaces" }), "workspaceStorage.name must be a JuiceFS file system name");
     assert.equal(refused({ valkey: { maxmemory: "384MB" } }), "workspaceStorage.valkey.maxmemory must be an amount of memory such as 384mb");
@@ -2148,6 +2147,8 @@ describe("workspace storage", () => {
       "| /.trash/2026-10-05-03/1-77-alasio-sessions-data | 1.0 GiB | 8.0 KiB |   0% | unchanged |     2 |       |",
       "| /alasio-sessions-data-fs-abc123                 | 1.0 GiB | 1.6 MiB |   0% | unchanged |   314 |       |",
       "| /alasio-sessions-data-fs-def456                 | 2.0 GiB |     0 B |   0% | unchanged |     0 |       |",
+      "| /alasio-sessions/fs-ghi789                      | 1.0 GiB | 4.0 KiB |   0% | unchanged |     3 |       |",
+      "| /alasio-sessions/fs-ghi789/files                | 1.0 GiB |     0 B |   0% | unchanged |     0 |       |",
       "| inode:42                                        | 1.0 GiB |     0 B |   0% | unchanged |     0 |       |",
       "| uid:1000                                        | 4.0 GiB | 1.6 MiB |   0% | unchanged |   314 |       |",
       "+-------------------------------------------------+---------+---------+------+-----------+-------+-------+",
@@ -2161,7 +2162,63 @@ describe("workspace storage", () => {
         `quota list ${metaUrl}`,
         `quota check ${metaUrl} --path /alasio-sessions-data-fs-abc123 --repair`,
         `quota check ${metaUrl} --path /alasio-sessions-data-fs-def456 --repair`,
+        `quota check ${metaUrl} --path /alasio-sessions/fs-ghi789 --repair`,
       ]);
+    } finally {
+      remove();
+    }
+  });
+
+  test("dumps the file system's metadata every backupInterval, one at a time, into its bucket's meta/ as JuiceFS names its dumps, read back the same, the newest kept", () => {
+    assert.deepEqual(["5m", "15m", "30m", "1h", "6h", "24h", "4m", "7m", "90m", "5h", "1h30m", "10s"].map(everyIntervalCron), ["*/5 * * * *", "*/15 * * * *", "*/30 * * * *", "0 */1 * * *", "0 */6 * * *", "0 0 * * *", null, null, null, null, null, null]);
+    const dumping = one<V1CronJob>(install({ workspaceStorage: { backupInterval: "15m" } }), "CronJob", "alasio-juicefs-dump");
+    assert.equal(dumping.spec?.schedule, "*/15 * * * *");
+    assert.equal(dumping.spec?.concurrencyPolicy, "Forbid");
+    const pod = dumping.spec?.jobTemplate.spec?.template;
+    assert.equal(pod?.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
+    assert.equal(pod?.spec?.securityContext?.runAsNonRoot, true);
+    const [dump] = pod?.spec?.initContainers ?? [];
+    assert.ok(dump);
+    // Dumped by JuiceFS, its keys left out, of bounded memory.
+    assert.match(dump.command?.[2] ?? "", /^juicefs dump "\$META_URL" \/dump\/dump\.json\.gz$/mu);
+    assert.deepEqual(dump.resources?.limits, { memory: "1Gi" });
+    const [upload] = pod?.spec?.containers ?? [];
+    assert.ok(upload);
+    const env = Object.fromEntries((upload.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? `${valueFrom?.secretKeyRef?.name}/${valueFrom?.secretKeyRef?.key}`]));
+    assert.deepEqual([env["AWS_ACCESS_KEY_ID"], env["AWS_SECRET_ACCESS_KEY"], env["WORKSPACES_BUCKET"], env["WORKSPACES_NAME"]], ["alasio-workspaces-juicefs/access-key", "alasio-workspaces-juicefs/secret-key", "workspaces", "workspaces"]);
+    // The object store, a directory of buckets, as aws s3 lists, reads, writes and deletes from it; a write it corrupts, where CORRUPT says.
+    const aws = [
+      "shift 3; verb=$1; shift",
+      'at() { case $1 in s3://*) printf "%s/%s" "$ROOT/store" "${1#s3://}" ;; *) printf "%s" "$1" ;; esac; }',
+      "case $verb in",
+      '  ls) [ -d "$(at "$1")" ] || exit 1; for f in "$(at "$1")"*; do [ -e "$f" ] && echo "2026-10-05 03:17:00 1 ${f##*/}"; done; true ;;',
+      '  cp) mkdir -p "$(dirname "$(at "$2")")"; cp "$(at "$1")" "$(at "$2")"',
+      '      case $2 in s3://*) [ -n "${CORRUPT:-}" ] && printf x >> "$(at "$2")" ;; esac; true ;;',
+      '  rm) rm "$(at "$1")" ;;',
+      "esac",
+    ].join("\n");
+    const { root, run: runIn, remove } = runScript(upload, Object.fromEntries((upload.env ?? []).flatMap(({ name, value }) => (value === undefined ? [] : [[name, value]]))), { aws });
+    const run = (more: Readonly<Record<string, string>> = {}) => runIn({ DUMP: join(root, "dump"), ...more });
+    try {
+      const meta = join(root, "store", "workspaces", "workspaces", "meta");
+      mkdirSync(meta, { recursive: true });
+      mkdirSync(join(root, "dump"));
+      // More than it keeps, of before.
+      const older = Array.from({ length: 25 }, (_, hour) => `dump-2026-10-04-${String(hour % 24).padStart(2, "0")}${hour >= 24 ? "3" : "0"}0000.json.gz`);
+      for (const name of older) writeFileSync(join(meta, name), gzipSync("older"));
+      writeFileSync(join(root, "dump", "dump.json.gz"), gzipSync("the metadata"));
+      const said = run();
+      const put = /dumped the metadata of workspaces to s3:\/\/workspaces\/workspaces\/meta\/(dump-\d{4}-\d{2}-\d{2}-\d{6}\.json\.gz)$/mu.exec(said)?.[1];
+      assert.ok(put, said);
+      assert.equal(gunzipSync(readFileSync(join(meta, put))).toString(), "the metadata");
+      // The newest 24 kept, the one put among them.
+      const kept = readdirSync(meta).sort();
+      assert.equal(kept.length, 24);
+      assert.ok(kept.includes(put) && !kept.includes(older.toSorted()[0] ?? ""), kept.join(", "));
+      // One the store keeps wrong fails it, saying so; as does a dump that is no whole gzip.
+      assert.throws(() => run({ CORRUPT: "1" }), /in the bucket is not of the dump's size/u);
+      writeFileSync(join(root, "dump", "dump.json.gz"), gzipSync("cut short").subarray(0, 12));
+      assert.throws(() => run(), /the dump is no whole gzip/u);
     } finally {
       remove();
     }
@@ -2184,7 +2241,7 @@ describe("workspace storage", () => {
     const { root, run, remove } = runScript(gc, { META_URL: metaUrl }, { juicefs: 'echo "$@" >> "$ROOT/calls"' });
     try {
       run();
-      assert.deepEqual(readFileSync(join(root, "calls"), "utf8").trim().split("\n"), [`gc ${metaUrl} --delete`]);
+      assert.deepEqual(readFileSync(join(root, "calls"), "utf8").trim().split("\n"), [`gc ${metaUrl} --compact --delete`]);
     } finally {
       remove();
     }
@@ -3308,7 +3365,7 @@ describe("the sandbox service", () => {
     assert.notEqual(reaching({ "alasio-valkey": "uid-1", "alasio-seaweedfs": "uid-2" }, { objectStore: { buckets: { workspaces: "elsewhere" } } }), before);
   });
 
-  test("confines a pool's pods to the gateway in and the receiver out, with internet to the public internet beside, and admits alasio, its replicas and KEDA to the gateway, and the gateway to the node agents", () => {
+  test("confines a pool's pods to the gateway in and the receiver out, with internet to the public internet beside, and admits every environment's alasio, its replicas and KEDA to the gateway, and the gateway to the node agents", () => {
     const policies = all<NetworkPolicyObject>(install(), "NetworkPolicy");
     const podOf = (component: string, namespace = "alasio", labels: Record<string, string> = {}): Pod => ({
       namespace,
@@ -3338,8 +3395,9 @@ describe("the sandbox service", () => {
       to: [{ ipBlock: { cidr: "0.0.0.0/0", except: ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4"] } }],
     }]]]);
     assert.deepEqual(internet.filter(({ metadata, spec }) => metadata?.namespace === "alasio-sessions" && selects(spec.podSelector, pooled("none", true).labels)), []);
-    // The gateway, from main's alasio, its replicas and KEDA's operator, on its port alone.
-    for (const [from, admitted] of [[alasio, true], [gateway, true], [keda, true], [receiver, false], [collector, false], [podOf("alasio", "alasio-branch-try"), false]] as const) {
+    // The gateway, from main's alasio and a branch environment's, its replicas and KEDA's operator, on its port alone; not an alasio of a namespace of no branch's.
+    const branchAlasio: Pod = { ...podOf("alasio", "alasio-branch-try"), namespaceLabels: { "kubernetes.io/metadata.name": "alasio-branch-try", "alasio.dev/branch": "try" } };
+    for (const [from, admitted] of [[alasio, true], [branchAlasio, true], [gateway, true], [keda, true], [receiver, false], [collector, false], [podOf("alasio", "elsewhere"), false]] as const) {
       assert.equal(connects(policies, from, gateway, 8080), admitted, from.labels["app.kubernetes.io/component"]);
     }
     assert.equal(connects(policies, alasio, gateway, 8081), false);

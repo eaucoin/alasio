@@ -680,6 +680,21 @@ export function durationSeconds(duration: string): number | null {
   return Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3] ?? 0);
 }
 
+/**
+ * The cron schedule of something done every `duration`: of whole minutes, 5 or more, that
+ * divide an hour, at those minutes of each hour; of whole hours that divide a day, on the
+ * hour, at those hours of each day; null for another, which no cron line keeps evenly. Pure, for tests.
+ */
+export function everyIntervalCron(duration: string): string | null {
+  const seconds = durationSeconds(duration);
+  if (seconds === null || seconds < 300 || seconds % 60 !== 0) return null;
+  const minutes = seconds / 60;
+  if (minutes < 60) return 60 % minutes === 0 ? `*/${minutes} * * * *` : null;
+  const hours = minutes / 60;
+  if (!Number.isInteger(hours) || 24 % hours !== 0) return null;
+  return hours === 24 ? "0 0 * * *" : `0 */${hours} * * *`;
+}
+
 /** A component of JuiceFS's CSI driver: its resources. */
 const CsiComponent = (resources: Parameters<typeof Resources>[0]) => defaulted(Schema.Struct({ resources: Resources(resources) }), {});
 
@@ -751,9 +766,9 @@ const WorkspaceStorage = Schema.Struct({
   storageClassName: defaulted(matching(NAME, "must be a StorageClass name"), "alasio-workspaces"),
   /** How many days a deleted file is kept in the file system's trash, 0 for none; set as the file system is first made. */
   trashDays: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0, { message: "must be 0 or more" })), 1),
-  /** How often JuiceFS dumps the file system's metadata to its bucket's meta/: a duration of 5m or more, the least it takes. */
+  /** How often the file system's metadata is dumped to its bucket's meta/ (./workspace-storage.ts metadataDump): a schedule a cron line keeps, as everyIntervalCron says. */
   backupInterval: defaulted(
-    Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) >= 300 || "must be a duration of 5m or more, such as 1h")),
+    Schema.String.check(Schema.makeFilter((duration) => everyIntervalCron(duration) !== null || "must be 5m or more, of whole minutes that divide an hour or whole hours that divide a day, such as 1h")),
     "1h",
   ),
   /** Each mount's read cache on its node's disk, in MiB. */
