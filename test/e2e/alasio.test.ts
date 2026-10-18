@@ -748,19 +748,21 @@ if (inShard("sessions")) {
     });
 
     test("runs each of alasio's images on remote snapshots, the first session's pulled lazily in seconds", { skip: !ESTARGZ && "the run's own images are built whole" }, async () => {
+      const session = await sessionPod(none);
+      const sessionName = session.metadata?.name ?? "";
       const pods: [string, string][] = [
         [NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)],
         [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("lake"))],
         [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("grafana"))],
-        [SESSIONS, none],
+        [SESSIONS, sessionName],
       ];
       for (const [namespace, name] of pods) assert.ok(await onRemoteSnapshot(namespace, name), `${namespace}/${name} runs on no remote snapshot`);
       // Its FUSE manager under Go's soft memory limit, inherited from the daemon.
-      const node = (await kube.get<V1Pod>(ref("Pod", none, SESSIONS)))?.spec?.nodeName ?? "";
+      const node = session.spec?.nodeName ?? "";
       const limits = await onNode(node, `for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = stargz-fuse-man ] && tr '\\0' '\\n' <"$p/environ" | grep '^GOMEMLIMIT='; done; true`);
       assert.match(limits, /^GOMEMLIMIT=128MiB$/mu);
       // The agent's image was on no node before the first session: kubelet says how long it took.
-      const events = await kube.list<CoreV1Event>("Event", { namespace: SESSIONS, fieldSelector: `involvedObject.name=${none},reason=Pulled` });
+      const events = await kube.list<CoreV1Event>("Event", { namespace: SESSIONS, fieldSelector: `involvedObject.name=${sessionName},reason=Pulled` });
       const pulled = events.map(({ message }) => /^Successfully pulled image "[^"]*alasio-agent[^"]*" in (\S+) /u.exec(message ?? "")?.[1]).find((took) => took !== undefined);
       assert.ok(pulled, `kubelet said nothing of pulling the agent's image: ${events.map(({ message }) => message).join("; ")}`);
       console.error(`# the agent's image, on no node before, pulled lazily in ${goSeconds(pulled)} s`);
@@ -930,7 +932,8 @@ if (inShard("sessions")) {
     // Last, as a restart of k3s ends the port forwards the tests before it reach the stand-ins through.
     test("keeps pods pulled lazily running through a restart of k3s, and of stargz-snapshotter's daemon with it", { skip: (TARGET !== "host" || !ESTARGZ) && "k3s is restarted on its own where it is a service of the machine's, and its pods pulled lazily" }, async () => {
       const session = await newSession("none");
-      const watched: [string, string][] = [[NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)], [SESSIONS, session]];
+      const sessionName = (await sessionPod(session)).metadata?.name ?? "";
+      const watched: [string, string][] = [[NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)], [SESSIONS, sessionName]];
       const restarts = () => Promise.all(watched.map(async ([namespace, name]) => (await kube.get<V1Pod>(ref("Pod", name, namespace)))?.status?.containerStatuses?.map(({ restartCount }) => restartCount)));
       const before = await restarts();
       // The daemon's service is part of k3s's, so it restarts with it; its FUSE manager keeps the mounts.
@@ -939,7 +942,7 @@ if (inShard("sessions")) {
       const ran = () => inSession(session, 'console.log(require("node:fs").readdirSync("/usr/lib").length > 0)').then((said) => said.trim(), () => undefined);
       assert.equal(await until("the session's bayma reached again", async () => await ran(), 300_000), "true");
       assert.deepEqual(await restarts(), before);
-      assert.ok(await onRemoteSnapshot(SESSIONS, session));
+      assert.ok(await onRemoteSnapshot(SESSIONS, sessionName));
     });
   });
 
