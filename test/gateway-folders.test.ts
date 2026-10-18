@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 import { before, test } from "node:test";
 
 import type { V1Pod, V1Secret } from "@kubernetes/client-node";
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Scope } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
 import { readLease } from "../src/binder/bindings.ts";
@@ -50,14 +50,14 @@ async function bayma(): Promise<{ port: number; status: { execsRunning: number; 
 let namespaces = 0;
 
 /** The gateway's folder instances in a namespace of the test's own, their bayma the stand-in's, idle ones kept `releaseAfterMs`. */
-async function foldersOf(port: number, releaseAfterMs = 60_000) {
+async function foldersOf(port: number, releaseAfterMs = 60_000, startMs = 10_000) {
   const namespace = `folders-${(namespaces += 1)}`;
   await run(withKube((kube) => kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: namespace } })));
   return Effect.runPromise(Effect.provide(Effect.gen(function*() {
     const binder = yield* Binder;
-    const folders = yield* makeFolders({ namespace, template: TEMPLATE, stateRoot: "/home/operator/.alasio/bayma", releaseAfterMs, main: "main", podPort: port, bindingKey, idlePollMs: 50 }, binder);
+    const folders = yield* makeFolders({ namespace, template: TEMPLATE, stateRoot: "/home/operator/.alasio/bayma", releaseAfterMs, main: "main", podPort: port, bindingKey, idlePollMs: 50, startMs }, binder);
     return { namespace, binder, folders };
-  }), Layer.provideMerge(Binder.layer({ waitMs: 10_000 }), Layer.fresh(KubeClient.layer))));
+  }).pipe(Scope.provide(Scope.makeUnsafe())), Layer.provideMerge(Binder.layer({ waitMs: 10_000 }), Layer.fresh(KubeClient.layer))));
 }
 
 /** Binds `key` as the gateway's front does, its pod run, as kubelet would run it, and ready. */
@@ -149,6 +149,97 @@ test("a folder instance idle for its time is released, its pod gone before its L
       assert.ok(Date.now() < deadline, "the broken folder instance was not released");
     }
     assert.equal(await run(withKube((kube) => kube.read("v1", "Pod", of.namespace, broken.metadata?.name ?? ""))), null);
+  } finally {
+    stand.close();
+  }
+});
+
+/** Binds `key` as the front does, its pod given `status` as kubelet would, or none: how the bind ended. */
+async function bindAs(of: Awaited<ReturnType<typeof foldersOf>>, key: string, status: object | null, options: Readonly<Record<string, string>> = {}) {
+  const placement = await Effect.runPromise(of.folders.place(key, { environment: "main", ...options }));
+  const binding = Effect.runPromise(Effect.result(of.binder.bind(placement.pool, key, placement)));
+  if (status) {
+    for (;;) {
+      const [pod] = (await run(withKube((kube) => kube.list("v1", "Pod", of.namespace, `${BINDING_LABEL}=${keyHash(key)}`)))) as V1Pod[];
+      if (pod?.metadata?.name) {
+        await run(withKube((kube) => kube.patchPodStatus(of.namespace, pod.metadata?.name ?? "", { status })));
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  return { placement, result: await binding };
+}
+
+test("a folder instance's bind gives its pod its time to run and its bayma to answer, or deletes the pod and its Lease, saying why", async () => {
+  const stand = await bayma();
+  try {
+    const of = await foldersOf(stand.port, 60_000, 1_500);
+    const pool = { name: FOLDER_POOL, namespace: of.namespace };
+    const container = (state: object) => ({ name: "bayma", image: "bayma", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state });
+    const failures: [string, object | null, RegExp][] = [
+      ["unscheduled", { phase: "Pending", conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: "0/1 nodes are available: 1 Insufficient memory." }] }, /did not serve within 1\.5 s: its pod is pending: 0\/1 nodes are available: 1 Insufficient memory\.$/u],
+      ["unpulled", { phase: "Pending", containerStatuses: [container({ waiting: { reason: "ImagePullBackOff", message: "Back-off pulling image \"bayma\"" } })] }, /did not serve within 1\.5 s: its bayma did not start: ImagePullBackOff \(Back-off pulling image "bayma"\)$/u],
+      ["ended", { phase: "Running", podIP: "127.0.0.1", containerStatuses: [container({ terminated: { exitCode: 2, reason: "Error" } })] }, /^its bayma ended \(Error\)$/u],
+      ["unanswered", { phase: "Running", podIP: "127.0.0.2", podIPs: [{ ip: "127.0.0.2" }], containerStatuses: [container({ running: {} })] }, /did not serve within 1\.5 s: its bayma did not answer: /u],
+    ];
+    for (const [conversation, status, reason] of failures) {
+      const key = folderKey("claude", `telegram:${conversation}`);
+      const { result } = await bindAs(of, key, status);
+      assert.equal(result._tag, "Failure", conversation);
+      assert.match(result._tag === "Failure" ? result.failure.message : "", reason, conversation);
+      assert.equal(await run(readLease(pool, key)), null, conversation);
+      for (const deadline = Date.now() + 10_000; ; await new Promise((resolve) => setTimeout(resolve, 100))) {
+        const left = await run(withKube((kube) => kube.list("v1", "Pod", of.namespace, `${BINDING_LABEL}=${keyHash(key)}`)));
+        if (left.every((pod) => (pod as V1Pod).metadata?.deletionTimestamp)) break;
+        assert.ok(Date.now() < deadline, `the pod of ${conversation} was not deleted`);
+      }
+    }
+  } finally {
+    stand.close();
+  }
+});
+
+test("three binds of a folder instance failing in a row hold it, bound again only as its caller asks, until one goes through; the instances are listed to main's callers, with their failures, and the held counted", async () => {
+  const stand = await bayma();
+  try {
+    const of = await foldersOf(stand.port);
+    const key = folderKey("codex", "telegram:7");
+    const placed = await Effect.runPromise(of.folders.place(key, { environment: "main" }));
+    const settle = (failure: string | null) => Effect.runPromise(placed.settled?.(failure) ?? Effect.void);
+    const heldNow = async (options: Readonly<Record<string, string>> = {}) => Effect.runPromise((await Effect.runPromise(of.folders.place(key, { environment: "main", ...options }))).held ?? Effect.succeed(null));
+    await settle("its pod is pending: no node");
+    await settle("its pod is pending: no node");
+    assert.equal(await heldNow(), null);
+    await settle("its bayma did not answer: refused");
+    assert.equal(await heldNow(), `its last 3 binds failed, the last as its bayma did not answer: refused`);
+    // As its caller asks, it is bound.
+    assert.equal(await heldNow({ retry: "1" }), null);
+    const listed = await Effect.runPromise(Effect.provide(of.folders.list, Layer.fresh(KubeClient.layer)));
+    assert.equal(listed.length, 1);
+    assert.deepEqual({ ...listed[0], failing: { ...listed[0]?.failing, at: "" } }, {
+      key, harness: "codex", conversation: "telegram:7", pod: null, boundAt: null, lastExecAt: null,
+      failing: { reason: "its bayma did not answer: refused", at: "", times: 3, held: true },
+    });
+    await Effect.runPromise(Effect.provide(of.folders.live, Layer.fresh(KubeClient.layer)));
+    assert.equal(of.folders.failing(), 1);
+    // Main's callers alone, of GET /folders alone.
+    const main = { key: "folder:*", expires: Date.now() + 60_000, options: { environment: "main" } };
+    const asked = (claims: typeof main, method: string, path: string) => Effect.runPromise(Effect.provide(of.folders.operate(claims, { method, path, query: new URLSearchParams(), body: new Uint8Array() }), Layer.fresh(KubeClient.layer)));
+    const answered = await asked(main, "GET", "/folders");
+    assert.equal(answered.status, 200);
+    assert.equal((answered.json as { folders: { key: string }[] }).folders[0]?.key, key);
+    assert.equal((await asked({ ...main, options: { environment: "try" } }, "GET", "/folders")).status, 403);
+    assert.equal((await asked(main, "POST", "/folders")).status, 404);
+    // A bind that goes through forgets them.
+    stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.parse("2026-10-18T12:00:00Z") };
+    const pod = await bound(of, key);
+    await settle(null);
+    assert.equal(await heldNow(), null);
+    const after = await Effect.runPromise(Effect.provide(of.folders.list, Layer.fresh(KubeClient.layer)));
+    assert.deepEqual(after.map(({ pod: name, failing, lastExecAt }) => ({ name, failing, lastExecAt })), [{ name: pod.metadata?.name, failing: null, lastExecAt: "2026-10-18T12:00:00.000Z" }]);
+    await Effect.runPromise(Effect.provide(of.folders.live, Layer.fresh(KubeClient.layer)));
+    assert.equal(of.folders.failing(), 0);
   } finally {
     stand.close();
   }

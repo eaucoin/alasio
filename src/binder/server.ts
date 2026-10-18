@@ -14,7 +14,7 @@
  *   `peers` names them; asked without a token, as KEDA's metrics-api trigger asks.
  * - `GET /waiting/<namespace>/<pool>`: `{ waiting }`, this replica's alone, as its peers ask.
  * - `GET /healthz`: 200 once it serves, asked without a token.
- * - `/workspace` and `/snapshots`, and what is under them: what the front answers itself of
+ * - `/workspace`, `/snapshots` and `/folders`, and what is under them: what the front answers itself of
  *   the token's key, beyond binding it, or of its caller, as `operate` says, such as the files
  *   of what the key binds; its body of MAX_OPERATION_BYTES at most (413 past it).
  * - anything else: passed to the pod the token's key is bound to, the key bound first where
@@ -24,7 +24,9 @@
  *   stamped active now and then, as what releases it reads; 503 with a Retry-After
  *   where it could not be bound now (its pool had no pod for it in time, its pod could not
  *   be readied), or its pod was not reached, its route then forgotten, so the next request
- *   binds the key anew; 403 where the gateway binds it nowhere, as its token says it is bound.
+ *   binds the key anew, the 503 saying why (`reason`); 403 where the gateway binds it nowhere, as
+ *   its token says it is bound; and 503 `{ "held": true }`, with no Retry-After, where its binds
+ *   failed one after another, so it is bound again only as its caller asks.
  *
  * A token that is no caller's, or has stopped, is answered 401. The gateway that serves on
  * it says which pool each key is bound in, and how its pod is made where it makes its own
@@ -48,10 +50,10 @@ import { bindingToken, type TokenClaims, verifyToken } from "./tokens.ts";
 /** The most a request the front answers itself may carry: a file of a workspace's, as its node agent writes one, with room. */
 export const MAX_OPERATION_BYTES = 64 * 1024 ** 2;
 
-/** The paths of the requests the front answers itself (`operate`): /workspace and /snapshots, and what is under them. */
-const OPERATED = /^\/(workspace|snapshots)(\/|$)/u;
+/** The paths of the requests the front answers itself (`operate`): /workspace, /snapshots and /folders, and what is under them. */
+const OPERATED = /^\/(workspace|snapshots|folders)(\/|$)/u;
 
-/** A caller's request the front answers itself (`operate`): its method, its path, under /workspace or /snapshots, its query, and its body. */
+/** A caller's request the front answers itself (`operate`): its method, its path, under /workspace, /snapshots or /folders, its query, and its body. */
 export interface Operation {
   readonly method: string;
   readonly path: string;
@@ -81,10 +83,24 @@ export class PlacementRefused extends Schema.TaggedError<PlacementRefused>()("Pl
   }
 }
 
-/** Where a key is bound: its pool, how its pod is made, where it is not claimed, and what comes before its release. */
+/** A key is bound again only as its caller asks, its binds having failed one after another: why the last did. */
+export class PlacementHeld extends Schema.TaggedError<PlacementHeld>()("PlacementHeld", { reason: Schema.String }) {
+  override get message(): string {
+    return this.reason;
+  }
+}
+
+/**
+ * Where a key is bound: its pool, how its pod is made, where it is not claimed, and what comes
+ * before its release; whether a bind of it is held, and why (`held`), as one that is is
+ * refused; and what is told of each bind of it as it ends (`settled`): why it failed, or null
+ * where it went through.
+ */
 export interface Placement extends BindOptions {
   readonly pool: Pool;
   readonly release?: ((bound: { readonly pod: string; readonly binding: string }) => Effect.Effect<void, { readonly message: string }>) | undefined;
+  readonly held?: Effect.Effect<string | null> | undefined;
+  readonly settled?: ((failure: string | null) => Effect.Effect<void>) | undefined;
 }
 
 /** What serveBinder is given; see the module. */
@@ -101,7 +117,7 @@ export interface BinderServerOptions {
   readonly poolOf: (key: string, options: Readonly<Record<string, string>>) => Effect.Effect<Placement, PlacementRefused>;
   /** The addresses (`host:port`) of the binder's other replicas. */
   readonly peers?: () => Effect.Effect<readonly string[]>;
-  /** What the front answers itself of a caller's key, or its caller, as its token says them, under /workspace and /snapshots; none where it answers nothing. */
+  /** What the front answers itself of a caller's key, or its caller, as its token says them, under /workspace, /snapshots and /folders; none where it answers nothing. */
   readonly operate?: (claims: TokenClaims, operation: Operation) => Effect.Effect<Answer>;
   /**
    * Whether the binding `binding` of `key`, its Lease's uid in `namespace`, is held now, as the
@@ -163,14 +179,21 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
    * The route to `key`'s pod: the one known, or its pod bound now, with `options`; or, where
    * it is to bind nothing (`unbound`), its pod as its binding is now, null where none serves.
    */
-  const routeOf = (key: string, options: Readonly<Record<string, string>>, unbound: boolean): Effect.Effect<(Route & { readonly pool: Pool }) | null, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused> =>
+  const routeOf = (key: string, options: Readonly<Record<string, string>>, unbound: boolean): Effect.Effect<(Route & { readonly pool: Pool }) | null, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused | PlacementHeld> =>
     Effect.gen(function*() {
       const known = routes.get(key);
       // One whose binding is gone, as its watch says, is bound anew; one not yet known of is used as it is.
       if (known && (!routeHeld || (yield* routeHeld(key, known.binding, known.pool.namespace)) !== "gone")) return known;
       routes.delete(key);
-      const { pool, ...placed } = yield* poolOf(key, options);
-      const bound = unbound ? yield* binder.bound(pool, key) : yield* binder.bind(pool, key, placed);
+      const { pool, held, settled, ...placed } = yield* poolOf(key, options);
+      if (!unbound && held) {
+        const reason = yield* held;
+        if (reason !== null) return yield* new PlacementHeld({ reason });
+      }
+      const bound = unbound ? yield* binder.bound(pool, key) : yield* binder.bind(pool, key, placed).pipe(
+        Effect.tapError((error) => settled?.(error.message) ?? Effect.void),
+        Effect.tap(() => settled?.(null) ?? Effect.void),
+      );
       if (!bound) return null;
       const route = { address: bound.address, port: podPort, token: bindingToken(bindingKey, { key, binding: bound.binding, namespace: pool.namespace }), pool, binding: bound.binding };
       routes.set(key, route);
@@ -234,8 +257,10 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       const routed = yield* routeOf(key, claims.options ?? {}, unbound).pipe(Effect.result);
       if (routed._tag === "Failure") {
         if (routed.failure._tag === "PlacementRefused") return answer(outgoing, 403, { error: routed.failure.message });
+        // Held, it is bound again only as its caller asks: no Retry-After.
+        if (routed.failure._tag === "PlacementHeld") return answer(outgoing, 503, { error: `${key} is bound again only as its caller asks`, reason: routed.failure.message, held: true });
         yield* Effect.logWarning(`binding ${key} failed: ${routed.failure.message}`);
-        return answer(outgoing, 503, { error: `${key} could not be bound now` }, { "retry-after": String(RETRY_AFTER_S) });
+        return answer(outgoing, 503, { error: `${key} could not be bound now`, reason: routed.failure.message }, { "retry-after": String(RETRY_AFTER_S) });
       }
       const route = routed.success;
       if (!route) {

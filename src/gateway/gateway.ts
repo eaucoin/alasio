@@ -177,7 +177,8 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       bindingKey,
       podPort: config.podPort,
       poolOf: (key, options) => (folders && folderOfKey(key) ? folders.place(key, options) : sessions.place(key, options)),
-      operate: sessions.operate,
+      // The folder instances' listing, where there are folder instances; the rest, the sessions'.
+      operate: (claims, operation) => (folders && /^\/folders(\/|$)/u.test(operation.path) ? folders.operate(claims, operation) : sessions.operate(claims, operation)),
       routeHeld: live.holds,
       // Every replica's address but its own, which answers its own waiting.
       peers: () =>

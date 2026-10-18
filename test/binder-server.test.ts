@@ -68,6 +68,7 @@ async function front(
     peers = [] as string[],
     placed = [] as Readonly<Record<string, string>>[],
     release = undefined as Placement["release"],
+    told = {} as Pick<Placement, "held" | "settled">,
     keyOf = callerKey as Buffer | ((claims: TokenClaims) => Buffer | null),
     operate = undefined as ((claims: TokenClaims, operation: Operation) => Effect.Effect<{ status: number; json?: unknown; bytes?: Uint8Array }>) | undefined,
     watched = false,
@@ -84,7 +85,7 @@ async function front(
     : null;
   const served = await Effect.runPromise(
     serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), ...(live ? { routeHeld: live.holds } : {}), poolOf: (_key, options) =>
-      options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: of, release })), peers: () => Effect.succeed(peers) }).pipe(
+      options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: of, release, ...told })), peers: () => Effect.succeed(peers) }).pipe(
       Effect.provide(layer),
       Scope.provide(scope),
     ),
@@ -237,6 +238,34 @@ test("a bind asked ahead binds the key; one whose pool has no pod in time is ans
     assert.deepEqual(stand.sent, []);
     const late = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:second") } });
     assert.deepEqual([late.status, late.headers.get("retry-after")], [503, "1"]);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a bind tells its placement how it ended, and the 503 of one that failed says why; one its placement holds is refused, saying why, with no Retry-After, binding nothing", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  const settled: (string | null)[] = [];
+  let holding: string | null = null;
+  const served = await front(of, stand.port, { waitMs: 1_000, told: { held: Effect.sync(() => holding), settled: (failure) => Effect.sync(() => void settled.push(failure)) } });
+  try {
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:first") } })).status, 204);
+    const late = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:second") } });
+    const said = (await late.json()) as { reason: string };
+    assert.equal(late.status, 503);
+    assert.match(said.reason, /^sessionfs:second was not bound in pool sandboxes in time: it waited for a free pod$/u);
+    assert.deepEqual(settled, [null, said.reason]);
+    holding = "its last 3 binds failed, the last as its pod is pending";
+    const held = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:third") } });
+    assert.deepEqual([held.status, held.headers.get("retry-after"), await held.json()], [503, null, { error: "sessionfs:third is bound again only as its caller asks", reason: holding, held: true }]);
+    assert.equal(await run(readLease(of, "sessionfs:third")), null);
+    assert.equal(settled.length, 2);
+    // A request that binds nothing is not held: it asks how the key is bound.
+    const unbound = await fetch(`http://127.0.0.1:${served.port}/status`, { headers: { authorization: caller("sessionfs:third"), [NO_BIND_HEADER]: "never" } });
+    assert.equal(unbound.status, 409);
   } finally {
     await served.close();
     stand.close();
