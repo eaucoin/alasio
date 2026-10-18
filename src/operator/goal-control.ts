@@ -2,7 +2,7 @@ import type { v2 } from "../../.types/codex/index.js";
 import { Effect } from "effect";
 
 import { type TurnError, Turns } from "../codex/turns.ts";
-import { ActiveTurns } from "../harness/active-turns.ts";
+import { HarnessHost } from "../harness/host.ts";
 import { isBusy, stopTurn } from "../harness/commands.ts";
 import type { HarnessError, HarnessGoals } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
@@ -27,7 +27,7 @@ export interface GoalTurnRequest {
 type GoalError = HarnessError | NewSessionError | TurnError | TelegramError | StoreError;
 
 /** What the goal controls run on: the store, Telegram, and the turns, running and to run. */
-export type GoalServices = Store | TelegramClient | ActiveTurns | Turns;
+export type GoalServices = Store | TelegramClient | HarnessHost | Turns;
 
 /** How a goal's turn is going, as the goal panel shows it. */
 export type GoalTurnState = "working" | "starting" | "queued" | "idle";

@@ -9,6 +9,7 @@ import { Effect, Layer, ManagedRuntime } from "effect";
 import { CodexAppServer } from "../../src/codex/app-server/client.ts";
 import { Turns } from "../../src/codex/turns.ts";
 import { ActiveTurns } from "../../src/harness/active-turns.ts";
+import { HarnessHost } from "../../src/harness/host.ts";
 import { type Harness, Harnesses } from "../../src/harness/index.ts";
 import type { HarnessName } from "../../src/harness/names.ts";
 import { Mounts } from "../../src/operator/mounts.ts";
@@ -127,6 +128,7 @@ function testServices({
   return MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot, branch }), Authorizer.layer(allowedUserIds))),
     Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer()),
+    Layer.provideMerge(HarnessHost.layer),
     Layer.provideMerge(Harnesses.layer({ overrides: harnesses, branch })),
     Layer.provideMerge(Layer.mergeAll(
       ActiveTurns.layer,
