@@ -1,7 +1,7 @@
 import { Effect } from "effect";
 
 import type { ConversationChat } from "../codex/turns.ts";
-import { ActiveTurns } from "../harness/active-turns.ts";
+import { HarnessHost } from "../harness/host.ts";
 import { isBusy } from "../harness/commands.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS, HARNESS_NAMES, harnessDisplayName, normalizeHarnessName } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
@@ -16,7 +16,7 @@ import { truncateText } from "./text.ts";
 import { sendChooseWorkspacePanel } from "./workspace-control.ts";
 
 /** What the service controls run on. */
-export type ServiceControlServices = Store | TelegramClient | ActiveTurns | Mounts;
+export type ServiceControlServices = Store | TelegramClient | HarnessHost | Mounts;
 
 const SERVICE_KIND_PREFIX = "service:";
 
@@ -79,7 +79,7 @@ export function buildServicePanel({ conversation, working, notice = "" }: Servic
 }
 
 /** The conversation's service panel as it stands, with `notice` under it. */
-const servicePanel = Effect.fnUntraced(function*(conversationId: string, notice?: string): Effect.fn.Return<ControlPanel, StoreError, Store | ActiveTurns> {
+const servicePanel = Effect.fnUntraced(function*(conversationId: string, notice?: string): Effect.fn.Return<ControlPanel, StoreError, Store | HarnessHost> {
   const working = yield* isBusy(conversationId);
   const conversation = yield* Effect.flatMap(Store, (store) => store.getConversation(conversationId));
   return yield* keepPanel(conversationId, buildServicePanel({ conversation, working, notice }));
@@ -89,7 +89,7 @@ const servicePanel = Effect.fnUntraced(function*(conversationId: string, notice?
  * Reply used whenever a prompt or control arrives before any service is mounted.
  * It is the only thing alasio says in that state.
  */
-export const sendChooseServicePanel = ({ conversationId, chatId }: ConversationChat): Effect.Effect<void, TelegramError | StoreError, Store | TelegramClient | ActiveTurns> =>
+export const sendChooseServicePanel = ({ conversationId, chatId }: ConversationChat): Effect.Effect<void, TelegramError | StoreError, Store | TelegramClient | HarnessHost> =>
   Effect.flatMap(servicePanel(conversationId, CHOOSE_SERVICE_NOTICE), (panel) => sendPanel(chatId, panel));
 
 function describeSwitch(result: HarnessSwitch, harness: HarnessName): string {

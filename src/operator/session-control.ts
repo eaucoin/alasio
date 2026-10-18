@@ -2,7 +2,7 @@ import { Effect } from "effect";
 
 import { type ConversationBusy, Turns } from "../codex/turns.ts";
 import type { ListedSession } from "../harness/claude/sessions.ts";
-import { ActiveTurns } from "../harness/active-turns.ts";
+import { HarnessHost } from "../harness/host.ts";
 import { isBusy, stopTurn } from "../harness/commands.ts";
 import type { Harness, HarnessError, HarnessUnavailable, NoServiceMounted } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
@@ -150,7 +150,7 @@ export interface CurrentSessionPanelRequest {
 const buildCurrentSessionPanel = Effect.fnUntraced(function*({ harness, conversationId }: CurrentSessionPanelRequest): Effect.fn.Return<
   ControlPanel,
   HarnessError | StoreError,
-  Store | ActiveTurns
+  Store | HarnessHost
 > {
   const sessionId = yield* mountedSession(conversationId);
   if (!sessionId) {
@@ -231,7 +231,7 @@ const buildRewindPanel = Effect.fnUntraced(function*({ harness, conversationId, 
   readonly page?: unknown;
   /** The session to rewind; the mounted one when left out. */
   readonly sessionId?: string | null | undefined;
-}): Effect.fn.Return<ControlPanel, HarnessError | StoreError, Store | ActiveTurns> {
+}): Effect.fn.Return<ControlPanel, HarnessError | StoreError, Store | HarnessHost> {
   const targetSessionId = sessionId ?? (yield* mountedSession(conversationId));
   if (!targetSessionId) {
     return yield* buildCurrentSessionPanel({ harness, conversationId });
@@ -281,7 +281,7 @@ const buildRewindPreviewPanel = Effect.fnUntraced(function*({ harness, conversat
   readonly sessionId: string;
   readonly index: number | undefined;
   readonly page?: unknown;
-}): Effect.fn.Return<ControlPanel, HarnessError | StoreError, Store | ActiveTurns> {
+}): Effect.fn.Return<ControlPanel, HarnessError | StoreError, Store | HarnessHost> {
   const messages = yield* harness.sessions.listSessionMessages(sessionId);
   const target = messages.find((message) => message.index === index);
   if (!target) {
@@ -322,7 +322,7 @@ export interface SendCurrentSessionPanelRequest extends CurrentSessionPanelReque
 export const sendCurrentSessionPanel = Effect.fnUntraced(function*({ chatId, ...request }: SendCurrentSessionPanelRequest): Effect.fn.Return<
   void,
   HarnessError | TelegramError | StoreError,
-  Store | ActiveTurns | TelegramClient
+  Store | HarnessHost | TelegramClient
 > {
   yield* sendPanel(chatId, yield* buildCurrentSessionPanel(request));
 });
@@ -337,7 +337,7 @@ export const handleSessionControlCallback = Effect.fnUntraced(function*({
   callbackQueryId,
   chatId,
   messageId,
-}: SessionControlCallback): Effect.fn.Return<void, NewSessionError | TelegramError, Store | ActiveTurns | Turns | TelegramClient> {
+}: SessionControlCallback): Effect.fn.Return<void, NewSessionError | TelegramError, Store | HarnessHost | Turns | TelegramClient> {
   const store = yield* Store;
   const client = yield* TelegramClient;
   const { conversationId } = action;

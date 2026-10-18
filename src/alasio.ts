@@ -15,6 +15,7 @@ import { Turns } from "./codex/turns.ts";
 import type { AlasioConfig, BranchEnvironment } from "./config.ts";
 import { ActiveTurns } from "./harness/active-turns.ts";
 import type { ClaudeQueryFactory } from "./harness/claude/runtime.ts";
+import { HarnessHost } from "./harness/host.ts";
 import { Harnesses } from "./harness/index.ts";
 import type { KubeTemplates } from "./kube/config.ts";
 import { BusyPods } from "./kube/busy.ts";
@@ -54,6 +55,7 @@ export type AlasioServices =
   | Outbox
   | CodexAppServer
   | ActiveTurns
+  | HarnessHost
   | Harnesses
   | Turns
   | Mounts
@@ -73,6 +75,7 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       branchForks(options),
     )),
     Layer.provideMerge(Turns.layer()),
+    Layer.provideMerge(HarnessHost.layer),
     Layer.provideMerge(Harnesses.layer({
       branch: options.branch?.name,
       sessionStore: options.sessionStore,
