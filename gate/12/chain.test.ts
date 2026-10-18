@@ -644,6 +644,7 @@ test("8. a restore from the bucket whose proxy goes away during its background r
           try {
             const directory = at(`bucket-${image}`);
             await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && umask 077 && printf '%s' ${q(goferOptions(`${layersPrefix}${own}/`, layersPrefix, relay.endpoint, { access_key_id: token.accessKeyId, secret_access_key: token.secretAccessKey }))} >${q(`${directory}/s3_opts.json`)}`);
+            if (how === "stopped") await debugOn();
             const startedAt = Date.now();
             const restored = await restoreFrom(directory);
             outcome["restore"] = restored;
@@ -678,6 +679,8 @@ test("8. a restore from the bucket whose proxy goes away during its background r
           outcome["saved"] = await within(checkpoint(`${image}-after`, { live: true }));
         } catch (error) {
           outcome["error"] = error instanceof Error ? error.stack : String(error);
+        } finally {
+          if (how === "stopped") outcome["debugLogs"] = await within(debugOff(`outage-${name}`));
         }
       }
     });
@@ -694,6 +697,22 @@ test("8. a restore from the bucket whose proxy goes away during its background r
       assert.equal(typeof outcome["saved"], "object", said);
     }
   }));
+
+/** Where runsc writes its debug logs while the gate has it (debugOn). */
+const DEBUG_LOGS = "/var/log/gate-12-runsc";
+
+/** Has every runsc the shim runs from now write its debug logs, of each of its commands, the sandbox's and gofers' among them, under DEBUG_LOGS. */
+async function debugOn(): Promise<void> {
+  await node(`rm -rf ${q(DEBUG_LOGS)} && mkdir -p ${q(DEBUG_LOGS)} && cp ${q(OPTIONS)} ${q(`${OPTIONS}.gate-12`)} && printf '%s\\n' '  debug = "true"' '  debug-log = "${DEBUG_LOGS}/"' >>${q(OPTIONS)}`);
+}
+
+/** Has runsc write no debug logs again, and keeps those it wrote in $OUT/`name`-runsc, the evidence's: where they are, and how many bytes. */
+async function debugOff(name: string): Promise<{ readonly at: string; readonly bytes: number }> {
+  const at = join(OUT, `${name}-runsc`);
+  await node(`mv ${q(`${OPTIONS}.gate-12`)} ${q(OPTIONS)}`);
+  const bytes = Number((await node(`rm -rf ${q(at)} && mkdir -p ${q(at)} && cp -r ${q(DEBUG_LOGS)}/. ${q(at)}/ && chmod -R a+rX ${q(at)} && du -sb ${q(at)} | cut -f1`)).trim());
+  return { at, bytes };
+}
 
 /** How long past its grace a deleted session pod whose store went for good may take to go, its sandbox and checkpoint gofer with it. */
 const TEARDOWN_MARGIN_MS = 15_000;
