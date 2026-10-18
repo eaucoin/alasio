@@ -1702,6 +1702,23 @@ if (inShard("snapshots")) {
 }
 
 if (inShard("workspaces")) {
+  describe("workspace storage's usage", () => {
+    before(async () => {
+      sink = await forward(OTLP);
+    });
+
+    after(() => {
+      sink?.close();
+    });
+
+    test("each node agent reports what workspace storage uses and has, as its node's mount counts them, which the stack's collector sends on", async () => {
+      // The nodes' mount runs no background job, so JuiceFS reports no usage of its own.
+      for (const name of ["alasio.workspace_storage.used", "alasio.workspace_storage.capacity", "alasio.workspace_storage.inodes.used", "alasio.workspace_storage.inodes"]) {
+        assert.ok(await untilExported("metrics", name, 240_000), `no ${name} arrived`);
+      }
+    });
+  });
+
   describe("the node agents' proxy of the snapshots bucket", () => {
     // A session is made as the operator makes one, in Telegram.
     before(async () => {
@@ -2127,9 +2144,9 @@ if (inShard("telemetry")) {
     });
 
     test("the stack's collector sends JuiceFS's metrics and Valkey's to the installation's backend too", async () => {
-      // JuiceFS's are its own Prometheus metrics, scraped from each node's mount, its client,
-      // its operations and its used space among them; Valkey's, the collector's redis receiver's.
-      const names = ["juicefs_fuse_ops", "juicefs_used_space", "redis.memory.used"];
+      // JuiceFS's are its own Prometheus metrics, scraped from each node's mount, its client's
+      // operations among them; Valkey's, the collector's redis receiver's.
+      const names = ["juicefs_fuse_ops", "redis.memory.used"];
       const arrived = await Promise.all(names.map((name) => untilExported("metrics", name, 180_000)));
       assert.deepEqual(names.filter((_, index) => !arrived[index]), [], "no metric of these names arrived");
     });

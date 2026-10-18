@@ -164,11 +164,13 @@ import {
   NODE_AGENT_RUN_DIR_VARIABLE,
   storeSocket,
   storeTokensFile,
+  WORKSPACES_ROOT,
 } from "./names.ts";
 import { type Failure, makeOperations, type Operations } from "./operations.ts";
 import { makeRunsc } from "./runsc.ts";
 import { makeS3Bucket } from "./s3.ts";
 import { makeStoreProxy, type StoreProxyError } from "./store-proxy.ts";
+import { observeStorageUsage } from "./storage-usage.ts";
 
 /** What serveNodeAgent is given: where it listens, the token it takes, and the agent and workspaces it serves. */
 export interface NodeAgentServerOptions {
@@ -476,6 +478,8 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   // Workspace storage's metadata engine, where the agent is given it, which it sets quotas on alone.
   const metaUrl = yield* Config.option(Config.Redacted(META_URL_VARIABLE));
   const juicefs = Option.match(metaUrl, { onNone: () => null, onSome: (url) => makeJuicefs({ metaUrl: Redacted.value(url) }) });
+  // What workspace storage holds, as the node's mount counts it, where the agent works with it.
+  if (juicefs) yield* observeStorageUsage(WORKSPACES_ROOT);
   const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces: makeWorkspaces({ host, runsc, juicefs }) });
   // As it stops, before its API does: its restores' reads of the bucket done first.
   yield* Effect.addFinalizer(() =>

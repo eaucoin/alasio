@@ -757,7 +757,7 @@
         "w": 8,
         "h": 8
       },
-      "description": "The space workspace storage's file system uses, as its mounts report it.",
+      "description": "The space workspace storage's file system uses and has, as each node's mount of it counts them and its node agent reports them: every agent's of the one file system, so the greatest of them, never their sum.",
       "datasource": {
         "type": "yesoreyeram-infinity-datasource",
         "uid": "lake"
@@ -779,7 +779,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, 'used' as space, max(Value) as bytes\nfrom otel.metrics_gauge where MetricName = 'juicefs_used_space' and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all order by 1"
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, case MetricName when 'alasio.workspace_storage.used' then 'used' else 'total' end as space, max(Value) as bytes\nfrom otel.metrics_gauge where MetricName in ('alasio.workspace_storage.used', 'alasio.workspace_storage.capacity') and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all order by 1"
           },
           "root_selector": "",
           "columns": [
