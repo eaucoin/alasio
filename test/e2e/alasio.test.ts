@@ -1993,6 +1993,34 @@ if (inShard("telemetry")) {
       assert.ok(woke || (await replicas()) > 0, "the turn's rollout was loaded with the loader never awake");
     });
 
+    // The log holds every client's credentials across its pod's restarts, as a node's restart
+    // or an eviction ends its pod: Telegram's updates and the stack's telemetry go through it.
+    test("the log, its pod deleted, comes back taking every client's credentials: its access applied, Telegram's updates and the stack's telemetry through it", { timeout: 30 * 60_000 }, async () => {
+      const pod = ref("Pod", `${componentName("log")}-0`, NAMESPACE);
+      const before = (await kube.get<V1Pod>(pod))?.metadata?.uid;
+      assert.ok(before, "the log runs no pod");
+      // Answered through it first, as it is: Codex the chat's service, in the workspace the
+      // tests before made.
+      await tg.calls();
+      await tg.say("before the log's restart");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      const restartedAt = Date.now();
+      await kube.remove(pod);
+      await until("the log's pod made again", async () => {
+        const uid = (await kube.get<V1Pod>(pod))?.metadata?.uid;
+        return uid && uid !== before ? true : undefined;
+      }, 300_000);
+      // Ready, its access applier among its containers, which logs in as its admin.
+      await kube.awaitReady([ref("StatefulSet", componentName("log"), NAMESPACE)], "10 minutes").catch(async (error: unknown) => {
+        const said = (await kube.logs(NAMESPACE, `${componentName("log")}-0`, "log").catch(String)).split("\n");
+        console.error(`# the log after its restart:\n${said.slice(0, 80).join("\n")}\n# its last:\n${said.slice(-40).join("\n")}`);
+        throw error;
+      });
+      await tg.say("after the log's restart");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      await untilInLake("trace of alasio's, through the log after its restart", `select count(*) as n from otel.traces where ServiceName = 'alasio' and Timestamp > make_timestamp(${restartedAt * 1000})`);
+    });
+
     test("main's readers scale out on the queries waiting on them, as any of them sums the pool's", async () => {
       const readers = ref("Deployment", componentName("lake-query"), NAMESPACE);
       const ready = async () => (await kube.get<V1Deployment>(readers))?.status?.readyReplicas ?? 0;
