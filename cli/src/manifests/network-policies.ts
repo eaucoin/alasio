@@ -102,9 +102,8 @@ function policy(name: string, namespace: string, component: string, spec: Networ
 }
 
 /**
- * Sessions: nothing in or out but bayma from their alasio, its telemetry receiver (the
- * one egress of a session without internet), and, for a session with internet, the
- * public internet, none of the cluster's or its network's private addresses. A branch
+ * Sessions: nothing in or out but bayma from their alasio, and, for a session with
+ * internet, the public internet, none of the cluster's or its network's private addresses. A branch
  * environment's sessions are its alasio's alone, as main's are main's.
  */
 function sessionPolicies(config: InstallConfig, environment: Environment): NetworkPolicy[] {
@@ -117,11 +116,6 @@ function sessionPolicies(config: InstallConfig, environment: Environment): Netwo
       podSelector: { matchLabels: SESSION },
       policyTypes: ["Ingress"],
       ingress: [{ from: [alasio], ports: [{ protocol: "TCP", port: 7290 }] }],
-    }),
-    policy("telemetry-to-alasio", namespace, "session", {
-      podSelector: { matchLabels: SESSION },
-      policyTypes: ["Egress"],
-      egress: [{ to: [alasio], ports: [{ protocol: "TCP", port: config.telemetry.receiverPort }] }],
     }),
     policy("full-internet", namespace, "session", {
       podSelector: { matchLabels: { ...SESSION, "alasio.dev/net-mode": "full" } },
@@ -607,18 +601,12 @@ function sandboxServicePolicies(config: InstallConfig, apiServer: ApiServer | nu
 }
 
 /**
- * alasio takes no connections but its sessions' telemetry, and, main, where it forks
- * sessions for branch environments, their alasio's asking it to (src/branch/fork.ts).
+ * alasio takes no connections but, main, where it forks sessions for branch environments,
+ * their alasio's asking it to (src/branch/fork.ts).
  */
 function alasioPolicy(config: InstallConfig, environment: Environment): NetworkPolicy {
   const forks = environment.branch === null && forksForBranches(config);
   const ingress: IngressRule[] = [
-    ...(config.sessions.enabled
-      ? [{
-        from: [{ namespaceSelector: namespaceNamed(sessionsNamespace(config, environment)), podSelector: { matchLabels: SESSION } }],
-        ports: [{ protocol: "TCP", port: config.telemetry.receiverPort }],
-      }]
-      : []),
     ...(forks
       ? [{ from: [{ namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } }], ports: [{ protocol: "TCP", port: BRANCH_FORK_PORT }] }]
       : []),

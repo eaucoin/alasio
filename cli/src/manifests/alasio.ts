@@ -451,8 +451,6 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     { name: "ALASIO_TELEGRAM_GROUP", value: alasioGroup(environmentName(environment)) },
     // Its environment's wake topic, which it tells the lake's loader of each transcript it writes on, as that principal.
     ...(lakeRuns(config) ? [{ name: "ALASIO_LAKE_WAKE_TOPIC", value: lakeWakeTopic(environmentName(environment)) }] : []),
-    { name: "ALASIO_TELEMETRY_RECEIVER_SERVICE", value: `${componentName("telemetry")}.${environment.namespace}.svc` },
-    { name: "ALASIO_TELEMETRY_RECEIVER_PORT", value: String(config.telemetry.receiverPort) },
     ...(alasio.defaultHarness ? [{ name: "ALASIO_DEFAULT_HARNESS", value: alasio.defaultHarness }] : []),
     ...(host.enabled && host.workspaceRoot ? [{ name: "ALASIO_WORKSPACE_ROOT", value: host.workspaceRoot }] : []),
     ...(alasio.claude.existingSecret
@@ -525,10 +523,7 @@ function deployment(config: InstallConfig, templatesChecksum: string, botChecksu
             workingDir: home,
             env: alasioEnv(config, home, operatorHome, environment),
             ...given("envFrom", [...alasio.envFrom]),
-            ports: [
-              { name: "telemetry", containerPort: config.telemetry.receiverPort },
-              ...(environment.branch === null && forksForBranches(config) ? [{ name: "branch-forks", containerPort: BRANCH_FORK_PORT }] : []),
-            ],
+            ...(environment.branch === null && forksForBranches(config) ? { ports: [{ name: "branch-forks", containerPort: BRANCH_FORK_PORT }] } : {}),
             securityContext: restrictedContainer(),
             resources: alasio.resources,
             volumeMounts: [
@@ -562,16 +557,6 @@ function deployment(config: InstallConfig, templatesChecksum: string, botChecksu
         },
       },
     },
-  };
-}
-
-/** Where session sandboxes export their telemetry: alasio's receiver. */
-function telemetryService(config: InstallConfig, environment: Environment): V1Service {
-  return {
-    apiVersion: "v1",
-    kind: "Service",
-    metadata: { name: componentName("telemetry"), namespace: environment.namespace, labels: labels("alasio") },
-    spec: { selector: selectorLabels("alasio"), ports: [{ name: "otlp-http", port: config.telemetry.receiverPort, targetPort: "telemetry" }] },
   };
 }
 
@@ -771,7 +756,6 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
     verticalPodAutoscaler(alasio, "Recommended"),
     // A drain waits for the turns running in its pod and its workspaces' to end.
     ...[environment.namespace, ...workspaceNamespaces(config, environment)].map(busyBudget),
-    telemetryService(config, environment),
     ...(environment.branch === null && forksForBranches(config) ? [branchForksService()] : []),
     // What alasio may do beyond what RBAC can say; the cluster's, but for its Sandboxes', made with main's.
     ...(environment.branch === null ? [...busyLabelPolicy(), ...secretPolicy()] : []),

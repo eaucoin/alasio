@@ -2604,13 +2604,16 @@ describe("security", () => {
     assert.equal(namespaces[1]?.metadata?.labels?.["pod-security.kubernetes.io/enforce"], "privileged");
   });
 
-  test("denies everything in the sessions namespace but bayma from alasio and telemetry to it", () => {
+  test("denies everything in the sessions namespace but bayma from alasio, alasio taking nothing of it", () => {
     const objects = install();
     const policy = (name: string) => one<KubernetesObject & { spec: Record<string, unknown> }>(objects, "NetworkPolicy", name).spec;
     assert.deepEqual(policy("default-deny")["policyTypes"], ["Ingress", "Egress"]);
     assert.deepEqual(policy("default-deny")["podSelector"], {});
     assert.deepEqual((policy("bayma-from-alasio")["ingress"] as Array<{ ports: unknown }>)[0]?.ports, [{ protocol: "TCP", port: 7290 }]);
-    assert.deepEqual((policy("telemetry-to-alasio")["egress"] as Array<{ ports: unknown }>)[0]?.ports, [{ protocol: "TCP", port: 4318 }]);
+    assert.equal(all<KubernetesObject>(objects, "NetworkPolicy").find(({ metadata }) => metadata?.name === "telemetry-to-alasio"), undefined);
+    // alasio takes none of its sessions' telemetry: no rule of its admits its port.
+    const ports = ((policy("alasio-alasio")["ingress"] ?? []) as Array<{ ports?: Array<{ port: number }> }>).flatMap((rule) => rule.ports ?? []).map(({ port }) => port);
+    assert.ok(!ports.includes(4318), String(ports));
   });
 
   test("keeps a session with internet off private, link-local and metadata addresses", () => {
@@ -2763,7 +2766,7 @@ describe("branch environments", () => {
     // Its sessions' pools beside, the sandbox service's (main's binds in them).
     assert.deepEqual(all<V1Deployment>(branch, "Deployment").map(({ metadata }) => metadata?.name).sort(), ["alasio", "alasio-lake-loader", "alasio-neon-compute", "alasio-neon-compute-ro", "sandboxes-full", "sandboxes-none"]);
     // Named as main's are, as each namespace is the branch's own.
-    assert.deepEqual(all<V1Service>(branch, "Service").map(({ metadata }) => metadata?.name).sort(), ["alasio-neon-compute", "alasio-neon-compute-ro", "alasio-telemetry"]);
+    assert.deepEqual(all<V1Service>(branch, "Service").map(({ metadata }) => metadata?.name).sort(), ["alasio-neon-compute", "alasio-neon-compute-ro"]);
   });
 
   test("run an alasio that knows it is the branch, asks main to fork what it inherited with its token, and sends its telemetry tagged with the branch", () => {
@@ -2772,7 +2775,9 @@ describe("branch environments", () => {
     assert.equal(variable(alasio, "ALASIO_PARENT_FORKS_URL"), "http://alasio-branches.alasio.svc:4319");
     assert.equal(variable(alasio, "ALASIO_BRANCH_FORK_TOKEN_FILE"), "/run/alasio/branch/token");
     assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "branch"), { name: "branch", secret: { secretName: "alasio-branch-fork", items: [{ key: "token", path: "token" }] } });
-    assert.equal(variable(alasio, "ALASIO_TELEMETRY_RECEIVER_SERVICE"), "alasio-telemetry.alasio-branch-try.svc");
+    // Its sessions' telemetry is the sandbox service's receiver's, never its own.
+    assert.equal(variable(alasio, "ALASIO_TELEMETRY_RECEIVER_SERVICE"), undefined);
+    assert.equal(container(alasio).ports, undefined);
     // Its sessions through main's gateway, as the branch, by the branch's own key of the gateway's, in its own namespace.
     assert.equal(variable(alasio, "ALASIO_GATEWAY_URL"), "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080");
     assert.equal(variable(alasio, "ALASIO_GATEWAY_ENVIRONMENT"), "try");
@@ -2864,11 +2869,8 @@ describe("branch environments", () => {
     const policy = (name: string, namespace: string) => of<KubernetesObject & { spec: Record<string, unknown> }>("NetworkPolicy", name, namespace).spec;
     const alasio = { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio-branch-try" } }, podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "alasio" } } };
     assert.deepEqual(policy("bayma-from-alasio", "alasio-branch-try-sessions")["ingress"], [{ from: [alasio], ports: [{ protocol: "TCP", port: 7290 }] }]);
-    assert.deepEqual(policy("telemetry-to-alasio", "alasio-branch-try-sessions")["egress"], [{ to: [alasio], ports: [{ protocol: "TCP", port: 4318 }] }]);
-    assert.deepEqual(policy("alasio-alasio", "alasio-branch-try")["ingress"], [{
-      from: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio-branch-try-sessions" } }, podSelector: { matchLabels: { "alasio.dev/workload": "session" } } }],
-      ports: [{ protocol: "TCP", port: 4318 }],
-    }]);
+    // Its alasio takes no connection, its sessions' telemetry the sandbox service's receiver's.
+    assert.equal(policy("alasio-alasio", "alasio-branch-try")["ingress"], undefined);
     assert.ok(policy("alasio-neon-compute", "alasio-branch-try"));
   });
 
