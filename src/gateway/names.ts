@@ -19,6 +19,15 @@ export const GATEWAY_CONFIG_VARIABLE = "ALASIO_GATEWAY_CONFIG";
 export const CALLER_KEY_VARIABLE = "CALLER_KEY";
 export const BINDING_KEY_VARIABLE = "BINDING_KEY";
 
+/**
+ * The variables alasio reaches its environment's sessions through the gateway by: the gateway's
+ * address, its environment's name, as its callers' tokens name it, and its environment's own key
+ * of the gateway's caller key, which signs them (../binder/names.ts environmentKey).
+ */
+export const ALASIO_GATEWAY_URL_VARIABLE = "ALASIO_GATEWAY_URL";
+export const ALASIO_GATEWAY_ENVIRONMENT_VARIABLE = "ALASIO_GATEWAY_ENVIRONMENT";
+export const ALASIO_GATEWAY_CALLER_KEY_VARIABLE = "ALASIO_GATEWAY_CALLER_KEY";
+
 /** The variables of where the gateway tells of events (../events/events.ts): the log's brokers, its principal's name, and the file of its password. */
 export const EVENTS_BROKERS_VARIABLE = "EVENTS_BROKERS";
 export const EVENTS_USERNAME_VARIABLE = "EVENTS_USERNAME";

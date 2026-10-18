@@ -2774,6 +2774,10 @@ describe("branch environments", () => {
     assert.equal(variable(alasio, "ALASIO_BRANCH_FORK_TOKEN_FILE"), "/run/alasio/branch/token");
     assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "branch"), { name: "branch", secret: { secretName: "alasio-branch-fork", items: [{ key: "token", path: "token" }] } });
     assert.equal(variable(alasio, "ALASIO_TELEMETRY_RECEIVER_SERVICE"), "alasio-telemetry.alasio-branch-try.svc");
+    // Its sessions through main's gateway, as the branch, by the branch's own key of the gateway's, in its own namespace.
+    assert.equal(variable(alasio, "ALASIO_GATEWAY_URL"), "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080");
+    assert.equal(variable(alasio, "ALASIO_GATEWAY_ENVIRONMENT"), "try");
+    assert.deepEqual(container(alasio).env?.find(({ name }) => name === "ALASIO_GATEWAY_CALLER_KEY")?.valueFrom, { secretKeyRef: { name: "alasio-sessions-caller", key: "caller-key" } });
     assert.equal(variable(alasio, "ALASIO_BRANCH_FORK_KEY_FILE"), undefined);
     // It makes no role for what reads main's Neon beside it, which a branch has none of.
     assert.equal(variable(alasio, "ALASIO_LAKE_READER_VERIFIER_FILE"), undefined);
@@ -3524,6 +3528,17 @@ describe("the sandbox service", () => {
     assert.equal(one<V1Service>(objects, "Service", "alasio-sandbox-gateway-peers").spec?.clusterIP, "None");
     // Of the cluster, the nodes it reads whether a restore's pod may be scheduled onto, alone.
     assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-sandbox-gateway-nodes").rules, [{ apiGroups: [""], resources: ["nodes"], verbs: ["get"] }]);
+  });
+
+  test("has alasio reach main's sessions through the gateway, as main, by main's own key of the gateway's, and not where the sandbox service runs not", () => {
+    const env = (objects: readonly KubernetesObject[]) => container(one<V1Deployment>(objects, "Deployment", "alasio")).env ?? [];
+    const of = (objects: readonly KubernetesObject[], name: string) => env(objects).find((each) => each.name === name);
+    const objects = install();
+    assert.equal(of(objects, "ALASIO_GATEWAY_URL")?.value, "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080");
+    assert.equal(of(objects, "ALASIO_GATEWAY_ENVIRONMENT")?.value, "main");
+    assert.deepEqual(of(objects, "ALASIO_GATEWAY_CALLER_KEY")?.valueFrom, { secretKeyRef: { name: "alasio-sessions-caller", key: "caller-key" } });
+    const without = install({ sessions: { enabled: false }, workspaceStorage: { enabled: false } });
+    assert.ok(!env(without).some(({ name }) => name.startsWith("ALASIO_GATEWAY_")));
   });
 
   test("receives sessions' telemetry in a receiver of its own, which watches its pools' Leases, and mounts workspace storage on each node, in the node's own mount namespace, from a pod of its own, whose replacement takes its mount over first", () => {

@@ -28,12 +28,13 @@ import { Result } from "effect";
 import { BRANCH_FORK_PORT, BRANCH_PARENT_LABEL, branchSessionsNamespace, MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
 import { decodeKubeTemplates, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import { BAYMA_STOP_SECONDS, CPU_FEATURES_ANNOTATION, STOP_WAIT_ARG } from "../../../src/kube/sandbox-shape.ts";
+import { ALASIO_GATEWAY_CALLER_KEY_VARIABLE, ALASIO_GATEWAY_ENVIRONMENT_VARIABLE, ALASIO_GATEWAY_URL_VARIABLE } from "../../../src/gateway/names.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "../../../src/node-agent/names.ts";
 import type { ApiServer } from "../api-server.ts";
 import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { alasioAccount, busyLabelPolicy, cloneJobPolicy, resumedConditionPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
-import { carriedPools, sandboxServiceRuns } from "./sandbox-gateway.ts";
+import { carriedPools, GATEWAY, GATEWAY_PORT, sandboxServiceRuns } from "./sandbox-gateway.ts";
 import { alasioGroup, environmentLogSecret, environmentName, lakeWakeTopic, LOG_BROKERS, telegramTopic } from "./log.ts";
 import {
   BRANCH_FORK_SECRET,
@@ -61,6 +62,7 @@ import {
   restrictedPod,
   roleVerifiers,
   selectorLabels,
+  SESSIONS_CALLER_SECRET,
   sha256,
 } from "./common.ts";
 import { durationSeconds, type InstallConfig } from "./config.ts";
@@ -460,6 +462,14 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     // What it presents to the node agents, which snapshot its sessions.
     ...(environment.branch === null && nodeAgentRuns(config)
       ? [{ name: NODE_AGENT_TOKEN_VARIABLE, valueFrom: { secretKeyRef: { name: componentName("node-agent"), key: "token" } } }]
+      : []),
+    // Its environment's sessions, through the sandbox gateway, by its environment's own key of the gateway's.
+    ...(sandboxServiceRuns(config)
+      ? [
+        { name: ALASIO_GATEWAY_URL_VARIABLE, value: `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}` },
+        { name: ALASIO_GATEWAY_ENVIRONMENT_VARIABLE, value: environmentName(environment) },
+        { name: ALASIO_GATEWAY_CALLER_KEY_VARIABLE, valueFrom: { secretKeyRef: { name: SESSIONS_CALLER_SECRET, key: "caller-key" } } },
+      ]
       : []),
     ...branchEnv(config, environment),
     ...otelEnv(config, environment),
