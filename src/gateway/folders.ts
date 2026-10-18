@@ -16,9 +16,10 @@
  * the same state directory, restores them; nothing of the node agents', nor of the bucket's. A
  * pod whose bayma ended is released as broken, the next bind making another.
  *
- * A bind gives its pod FOLDER_START_MS to run and its bayma to answer, or deletes it and its
- * Lease, saying why: its pod pending, as unscheduled; its image not pulled; its bayma ended;
- * or its bayma not answering. FOLDER_FAILURES binds of a key failing one after another within
+ * A bind gives its pod FOLDER_START_MS to run (FOLDER_PULL_MS while its image is being
+ * pulled), and its bayma as long again to answer once it runs, or deletes it and its Lease,
+ * saying why: its pod pending, as unscheduled; its image not pulled; its bayma ended; or its
+ * bayma not answering. FOLDER_FAILURES binds of a key failing one after another within
  * FOLDER_FAILING_MS hold it: it is bound again only as its caller asks (its token's `retry`),
  * until a bind goes through. Its failures are a Lease's of their own in the folder namespace
  * (failingLease), so every replica of the gateway holds it alike, and they are counted, of
@@ -47,8 +48,10 @@ import { FOLDER_POOL, FOLDER_STOP_SECONDS, folderOfKey, folderPodName, folderPod
 /** How long a folder instance's release waits for its pod to be gone, past its stop. */
 const GONE_WAIT_MS = (FOLDER_STOP_SECONDS + 60) * 1000;
 
-/** How long a folder instance's bind gives its pod to run and its bayma to answer. */
+/** How long a folder instance's bind gives its pod to run, and its bayma, once it runs, to answer. */
 export const FOLDER_START_MS = 120_000;
+/** How long it gives its pod to run while its image is still being pulled, as a node that has never run it pulls it first. */
+export const FOLDER_PULL_MS = 8 * 60_000;
 /** How many binds of a key failing one after another, within FOLDER_FAILING_MS, hold it. */
 export const FOLDER_FAILURES = 3;
 export const FOLDER_FAILING_MS = 10 * 60_000;
@@ -98,8 +101,9 @@ export interface FoldersOptions {
   readonly podPort: number;
   readonly bindingKey: Buffer;
   readonly idlePollMs?: number;
-  /** How long a bind gives its pod to run and its bayma to answer: FOLDER_START_MS unless said. */
+  /** How long a bind gives its pod to run and its bayma to answer: FOLDER_START_MS unless said; and its pod to run while its image is pulled: FOLDER_PULL_MS unless said. */
   readonly startMs?: number;
+  readonly pullMs?: number;
 }
 
 /** The gateway's folder instances; see makeFolders. */
@@ -122,7 +126,7 @@ export interface Folders {
 
 /** The gateway's folder instances, as the module says, on the binder and the KubeClient. */
 export const makeFolders = Effect.fnUntraced(function*(
-  { namespace, template, stateRoot, releaseAfterMs, main, podPort, bindingKey, idlePollMs = IDLE_POLL_MS, startMs = FOLDER_START_MS }: FoldersOptions,
+  { namespace, template, stateRoot, releaseAfterMs, main, podPort, bindingKey, idlePollMs = IDLE_POLL_MS, startMs = FOLDER_START_MS, pullMs = FOLDER_PULL_MS }: FoldersOptions,
   binder: Binder["Service"],
 ): Effect.fn.Return<Folders, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
@@ -194,25 +198,34 @@ export const makeFolders = Effect.fnUntraced(function*(
     return "its pod is not running yet";
   };
 
-  /** Waits for the pod `made`, bound to `key` by `binding`, to run and its bayma to answer, for `startMs`; or fails, saying why it did not. */
+  /**
+   * Waits for the pod `made`, bound to `key` by `binding`, to run, for `startMs`, or `pullMs`
+   * while its image is still being pulled, and then its bayma to answer, for `startMs` of its
+   * start; or fails, saying why it did not.
+   */
   const prepare = (key: string) => (made: V1Pod, binding: string): Effect.Effect<void, BindStepFailed> =>
     Effect.gen(function*() {
       const name = made.metadata?.name ?? "";
-      const deadline = (yield* Clock.currentTimeMillis) + startMs;
-      let why = "its pod is not running yet";
+      const asked = yield* Clock.currentTimeMillis;
+      let runningSince: number | null = null;
       for (;;) {
+        const now = yield* Clock.currentTimeMillis;
         const pod = (yield* kube.read("v1", "Pod", namespace, name).pipe(Effect.orElseSucceed(() => made))) as V1Pod | null;
         if (!pod) return yield* new BindStepFailed({ reason: `its pod ${name} is gone` });
-        const running = pod.status?.containerStatuses?.find(({ name: container }) => container === BAYMA_CONTAINER)?.state?.running !== undefined && Boolean(pod.status?.podIP);
-        if (running) {
+        const bayma = pod.status?.containerStatuses?.find(({ name: container }) => container === BAYMA_CONTAINER);
+        if (bayma?.state?.running !== undefined && pod.status?.podIP) {
+          runningSince ??= now;
           const answered = yield* Effect.result(statusOf(pod, key, binding));
           if (answered._tag === "Success") return;
-          why = `its bayma did not answer: ${answered.failure.message}`;
+          if (now >= runningSince + startMs) return yield* new BindStepFailed({ reason: `its bayma did not answer within ${startMs / 1000} s of its start: ${answered.failure.message}` });
         } else {
-          why = notServing(pod);
+          const why = notServing(pod);
           if (why.startsWith("its bayma ended")) return yield* new BindStepFailed({ reason: why });
+          // Scheduled, its image being pulled, as a node that has never run it pulls it first.
+          const pulling = bayma?.state?.waiting?.reason === "ContainerCreating" || (bayma === undefined && pod.status?.conditions?.some(({ type, status }) => type === "PodScheduled" && status === "True") === true);
+          const waited = pulling ? pullMs : startMs;
+          if (now >= asked + waited) return yield* new BindStepFailed({ reason: `its pod ${name} did not serve within ${waited / 1000} s: ${pulling ? "its image is still being pulled" : why}` });
         }
-        if ((yield* Clock.currentTimeMillis) >= deadline) return yield* new BindStepFailed({ reason: `its pod ${name} did not serve within ${startMs / 1000} s: ${why}` });
         yield* Effect.sleep(START_POLL_MS);
       }
     });

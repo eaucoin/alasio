@@ -50,12 +50,12 @@ async function bayma(): Promise<{ port: number; status: { execsRunning: number; 
 let namespaces = 0;
 
 /** The gateway's folder instances in a namespace of the test's own, their bayma the stand-in's, idle ones kept `releaseAfterMs`. */
-async function foldersOf(port: number, releaseAfterMs = 60_000, startMs = 10_000) {
+async function foldersOf(port: number, releaseAfterMs = 60_000, startMs = 10_000, pullMs = 3_000) {
   const namespace = `folders-${(namespaces += 1)}`;
   await run(withKube((kube) => kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: namespace } })));
   return Effect.runPromise(Effect.provide(Effect.gen(function*() {
     const binder = yield* Binder;
-    const folders = yield* makeFolders({ namespace, template: TEMPLATE, stateRoot: "/home/operator/.alasio/bayma", releaseAfterMs, main: "main", podPort: port, bindingKey, idlePollMs: 50, startMs }, binder);
+    const folders = yield* makeFolders({ namespace, template: TEMPLATE, stateRoot: "/home/operator/.alasio/bayma", releaseAfterMs, main: "main", podPort: port, bindingKey, idlePollMs: 50, startMs, pullMs }, binder);
     return { namespace, binder, folders };
   }).pipe(Scope.provide(Scope.makeUnsafe())), Layer.provideMerge(Binder.layer({ waitMs: 10_000 }), Layer.fresh(KubeClient.layer))));
 }
@@ -181,7 +181,9 @@ test("a folder instance's bind gives its pod its time to run and its bayma to an
       ["unscheduled", { phase: "Pending", conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: "0/1 nodes are available: 1 Insufficient memory." }] }, /did not serve within 1\.5 s: its pod is pending: 0\/1 nodes are available: 1 Insufficient memory\.$/u],
       ["unpulled", { phase: "Pending", containerStatuses: [container({ waiting: { reason: "ImagePullBackOff", message: "Back-off pulling image \"bayma\"" } })] }, /did not serve within 1\.5 s: its bayma did not start: ImagePullBackOff \(Back-off pulling image "bayma"\)$/u],
       ["ended", { phase: "Running", podIP: "127.0.0.1", containerStatuses: [container({ terminated: { exitCode: 2, reason: "Error" } })] }, /^its bayma ended \(Error\)$/u],
-      ["unanswered", { phase: "Running", podIP: "127.0.0.2", podIPs: [{ ip: "127.0.0.2" }], containerStatuses: [container({ running: {} })] }, /did not serve within 1\.5 s: its bayma did not answer: /u],
+      ["unanswered", { phase: "Running", podIP: "127.0.0.2", podIPs: [{ ip: "127.0.0.2" }], containerStatuses: [container({ running: {} })] }, /^its bayma did not answer within 1\.5 s of its start: /u],
+      // Scheduled, its image pulled the longer while, then given up on.
+      ["pulling", { phase: "Pending", conditions: [{ type: "PodScheduled", status: "True" }], containerStatuses: [container({ waiting: { reason: "ContainerCreating" } })] }, /did not serve within 3 s: its image is still being pulled$/u],
     ];
     for (const [conversation, status, reason] of failures) {
       const key = folderKey("claude", `telegram:${conversation}`);
