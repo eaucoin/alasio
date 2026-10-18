@@ -11,6 +11,7 @@ import { Harnesses } from "../src/harness/index.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { StoreError } from "../src/persistence/sql.ts";
 import { Store, TurnFenced } from "../src/persistence/store.ts";
+import { ReceivedFiles } from "../src/telegram/files.ts";
 import { holdsIn, newSchema, run, testPool, testStore } from "./support/store.ts";
 
 /** A conversation of Codex's in a new store, in `schema`, and a turn claim of it. */
@@ -189,7 +190,7 @@ test("a fork's hold is a row of the store while it lasts, held only where no tur
     }));
   }).pipe(Effect.provide(HarnessHost.layer.pipe(
     Layer.provideMerge(Harnesses.layer({})),
-    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, Layer.succeed(Store, store))),
+    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: "/nonexistent-state-dir" }).pipe(Layer.provideMerge(Layer.succeed(Store, store))))),
   ))));
 });
 
@@ -197,7 +198,7 @@ test("a fork's hold is a row of the store while it lasts, held only where no tur
 const withHost = <A>(store: Store["Service"], body: (host: HarnessHost["Service"]) => Effect.Effect<A, unknown>) =>
   Effect.runPromise(Effect.flatMap(HarnessHost, body).pipe(Effect.provide(HarnessHost.layer.pipe(
     Layer.provideMerge(Harnesses.layer({})),
-    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, Layer.succeed(Store, store))),
+    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: "/nonexistent-state-dir" }).pipe(Layer.provideMerge(Layer.succeed(Store, store))))),
   ))));
 
 test("a fork's hold whose letting go fails is let go of once the store takes it, tried until it is through", async () => {

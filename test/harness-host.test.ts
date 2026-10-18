@@ -4,6 +4,10 @@
  * and its job's progress, and tells, as its events, what the harness does on its own.
  */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { Effect, Option, PubSub } from "effect";
@@ -14,8 +18,11 @@ import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { run, testStore } from "./support/store.ts";
 import { turnsStub, withServices } from "./support/turns.ts";
 
-/** A Codex harness whose one turn hands what it was given to `seen`, and acts as a harness that runs on between prompts would. */
-function recordingHarness(seen: TurnParams[]): Harness {
+/**
+ * A Codex harness whose one turn hands what it was given to `seen`, and acts as a harness
+ * that runs on between prompts would; `onRun` says what it finds as it runs.
+ */
+function recordingHarness(seen: TurnParams[], onRun: () => void = () => {}): Harness {
   const unused = (name: string) => () => assert.fail(`the recording harness has no ${name}`);
   return {
     name: CODEX_HARNESS,
@@ -36,6 +43,7 @@ function recordingHarness(seen: TurnParams[]): Harness {
     runTurn: (params) =>
       Effect.gen(function*() {
         seen.push(params);
+        onRun();
         yield* params.onPromptDispatched ?? Effect.void;
         yield* params.onBackgroundResponse ?? Effect.void;
         yield* params.onIdle ?? Effect.void;
@@ -68,6 +76,7 @@ test("a turn started through the host runs on its harness under the turn's claim
         harness: CODEX_HARNESS,
         workingDirectory: "/work",
         prompt: "go",
+        fileIds: [],
         resumeSession: null,
         modelChoice: null,
         epoch,
@@ -105,4 +114,58 @@ test("a turn started through the host runs on its harness under the turn's claim
   );
   // The job's dispatch, recorded by the host as the harness said it sent the prompt.
   assert.ok((await run(store.getPromptJob(job.id)))?.upstream_dispatched_at);
+});
+
+test("the files a turn's prompt names, and a steer's, are written where the harness reads them before it runs, or is steered", async () => {
+  const store = await testStore();
+  const stateDir = mkdtempSync(join(tmpdir(), "alasio-host-files-"));
+  try {
+    const conversationId = await run(store.upsertConversation({ chatId: "41", user: { id: 41 } }));
+    await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+    await run(store.setWorkingDirectory(conversationId, "/work"));
+    /** A file a message of the conversation's carried, kept in the store alone: its id. */
+    const kept = async (name: string, text: string) => {
+      const messageId = await run(store.insertMessage({ conversationId, direction: "in", kind: "file", text: name }));
+      const content = Buffer.from(text);
+      return await run(store.insertFile({
+        conversationId,
+        messageId,
+        file: { kind: "document", file_id: name, file_unique_id: name, file_name: name },
+        name,
+        content,
+        sha256: createHash("sha256").update(content).digest("hex"),
+      }));
+    };
+    const report = await kept("report.txt", "a report");
+    const notes = await kept("notes.txt", "some notes");
+    const written = (id: string, name: string) => join(stateDir, "telegram-files", id, name);
+    const epoch = await run(store.claimTurn({ conversationId, chatId: "41", messageId: "10", sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));
+    let found: string | null = null;
+    const harness = recordingHarness([], () => (found = existsSync(written(report, "report.txt")) ? readFileSync(written(report, "report.txt"), "utf8") : null));
+    await withServices({ store, stateDir, harnesses: { [CODEX_HARNESS]: harness }, turns: turnsStub({}) }, (alasio) =>
+      alasio.runPromise(Effect.gen(function*() {
+        const host = yield* HarnessHost;
+        yield* host.startTurn({
+          conversationId,
+          chatId: "41",
+          messageId: "10",
+          harness: CODEX_HARNESS,
+          workingDirectory: "/work",
+          prompt: "go",
+          fileIds: [report],
+          resumeSession: null,
+          modelChoice: null,
+          epoch,
+          jobId: null,
+          attachedTurn: null,
+        });
+        assert.equal(found, "a report", "the harness found the file as it ran");
+        // No turn runs to take the steer, but its file is written all the same, for the turn it is queued for.
+        assert.deepEqual(yield* host.steer(conversationId, "and these", [notes]), Option.none());
+        assert.equal(readFileSync(written(notes, "notes.txt"), "utf8"), "some notes");
+      }))
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 });

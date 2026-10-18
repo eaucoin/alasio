@@ -22,7 +22,7 @@ import type { Turn, TurnOutcome } from "../persistence/turn-repository.ts";
 import { Store, type TurnFenced } from "../persistence/store.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import type { ChatId } from "../telegram/client.ts";
-import { ReceivedFiles } from "../telegram/files.ts";
+import type { ReceivedFileError } from "../telegram/files.ts";
 import { Outbox } from "../telegram/outbox.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { truncateText } from "../operator/text.ts";
@@ -58,7 +58,7 @@ export interface ConversationChat {
 export interface QueuedPrompt extends ConversationChat {
   readonly messageId: number;
   readonly prompt: string;
-  /** The files sent with it, which the prompt names where ReceivedFiles writes them. */
+  /** The files sent with it, which the prompt names where the harness host writes them. */
   readonly fileIds: readonly string[];
   /** What the operator wrote, as the concurrent prompt's question quotes it. */
   readonly visibleText: string;
@@ -70,6 +70,8 @@ export interface TurnRequest extends ConversationChat {
   readonly prompt: string;
   /** The prompt job the turn runs, if it runs one. */
   readonly jobId?: string | null | undefined;
+  /** The files the prompt names, which its host writes where its harness reads them; none unless given. */
+  readonly fileIds?: readonly string[] | undefined;
   /** The trace to continue: a queued prompt's, or null for a trace of its own; the active span when absent. */
   readonly traceparent?: string | null | undefined;
 }
@@ -109,7 +111,7 @@ export class ConversationBusy extends Schema.TaggedError<ConversationBusy>()("Co
  * holding the conversation, alasio's store failing, or another turn claiming the
  * conversation as it ran.
  */
-export type TurnError = NoServiceMounted | HarnessUnavailable | GoalTurnsUnsupported | ConversationBusy | StoreError | TurnFenced;
+export type TurnError = NoServiceMounted | HarnessUnavailable | GoalTurnsUnsupported | ConversationBusy | StoreError | TurnFenced | ReceivedFileError;
 
 /** What a turn that ended without its answer shows: that it did not complete, and why, when the harness said. */
 function notCompleted(harnessName: string, blocks: readonly ResponseBlock[]): string {
@@ -158,7 +160,7 @@ export class Turns extends Context.Service<Turns, {
   static readonly layer = (): Layer.Layer<
     Turns,
     never,
-    Store | Outbox | Harnesses | HarnessHost | ReceivedFiles
+    Store | Outbox | Harnesses | HarnessHost
   > => Layer.effect(Turns, makeTurns());
 }
 
@@ -176,7 +178,6 @@ const makeTurns = Effect.fnUntraced(function*() {
       Effect.map(({ busy }) => busy),
       Effect.catch((error) => Effect.as(Effect.logWarning(`could not tell whether ${conversationId} is busy: ${error.message}`), false)),
     );
-  const receivedFiles = yield* ReceivedFiles;
   const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
   const status = yield* makeStatusReporter({
     replyMedia: makeReplyMedia({
@@ -209,8 +210,8 @@ const makeTurns = Effect.fnUntraced(function*() {
   const runTurn = Effect.fnUntraced(function*(
     harness: Harness,
     mount: Mount,
-    { conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null }: Omit<SessionTurn, "traceparent">,
-  ): Effect.fn.Return<{ readonly outcome: TurnOutcome; readonly completed: boolean }, GoalTurnsUnsupported | NoWorkspaceMounted | HarnessUnavailable | StoreError | TurnFenced> {
+    { conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null, fileIds = [] }: Omit<SessionTurn, "traceparent">,
+  ): Effect.fn.Return<{ readonly outcome: TurnOutcome; readonly completed: boolean }, GoalTurnsUnsupported | NoWorkspaceMounted | HarnessUnavailable | StoreError | TurnFenced | ReceivedFileError> {
     if (attachedTurn && !harness.supportsGoals) {
       return yield* new GoalTurnsUnsupported({ harness: harness.displayName });
     }
@@ -273,6 +274,7 @@ const makeTurns = Effect.fnUntraced(function*() {
           harness: harness.name,
           workingDirectory,
           prompt,
+          fileIds,
           resumeSession: existingSession ?? null,
           modelChoice,
           epoch,
@@ -312,11 +314,16 @@ const makeTurns = Effect.fnUntraced(function*() {
         return { outcome: "completed", completed: true } as const;
       }).pipe(
         Effect.onInterrupt(() => leaveForRestart),
-        // A turn that failed lets go of its conversation, said so; one interrupted is left for the restart.
+        // A turn that failed lets go of its conversation, its status message saying so; one
+        // interrupted is left for the restart.
         Effect.onError((cause) =>
           Cause.hasInterruptsOnly(cause)
             ? Effect.void
-            : letGo("failed").pipe(Effect.catch((error) => Effect.logError(`Could not end failed turn ${conversationId}: ${error.message}`)))
+            : Deferred.await(posted).pipe(
+              Effect.flatMap((shown) => status.finishWithoutResponse({ chatId, pendingResponseId: null, status: shown, statusText: `${harness.displayName} hit an error.` })),
+              Effect.andThen(letGo("failed")),
+              Effect.catch((error) => Effect.logError(`Could not end failed turn ${conversationId}: ${error.message}`)),
+            )
         ),
       );
     }));
@@ -412,12 +419,12 @@ const makeTurns = Effect.fnUntraced(function*() {
             promptWait.record((job.started_at!.getTime() - job.created_at.getTime()) / 1000, { "alasio.harness": activeHarness });
           })
         ),
-        Effect.andThen(receivedFiles.materialize(job.file_ids)),
         Effect.andThen(run({
           conversationId,
           chatId: job.chat_id,
           messageId: job.message_id,
           prompt: job.prompt,
+          fileIds: job.file_ids,
           jobId: job.id,
           traceparent: job.traceparent,
         })),
