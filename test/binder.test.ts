@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { isIP } from "node:net";
 import { before, test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
@@ -160,6 +161,9 @@ test("binders binding one key at once bind it to one pod, which each is routed t
   assert.equal(new Set(bound.map(({ pod }) => pod)).size, 1);
   assert.equal(new Set(bound.map(({ address }) => address)).size, 1);
   assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [bound[0]?.pod]);
+  // Routed to the pod's own address, there as it serves, not a name of DNS's, whose record may come after.
+  assert.equal(isIP(bound[0]?.address ?? ""), 4);
+  assert.equal(bound[0]?.address, (await boundPods(of))[0]?.status?.podIP);
   const lease = await run(binder(), readLease(of, "sessionfs:workspace"));
   assert.equal(lease?.spec?.holderIdentity, bound[0]?.pod);
   // Bound already, a bind finds its pod.
