@@ -2784,8 +2784,8 @@ if (inShard("scaling")) {
         assert.ok(scaledObject);
         const hpa = kedaHpa();
         assert.deepEqual(
-          [hpa?.spec?.minReplicas, hpa?.spec?.maxReplicas, hpa?.spec?.metrics?.map(({ type, resource }) => [type, resource?.name, resource?.target.averageUtilization])],
-          [2, 4, [["Resource", "cpu", 80]]],
+          [hpa?.spec?.minReplicas, hpa?.spec?.maxReplicas, hpa?.spec?.metrics?.map(({ type, resource }) => [type, resource?.name, resource?.target.averageUtilization]), hpa?.spec?.behavior?.scaleUp?.stabilizationWindowSeconds],
+          [2, 4, [["Resource", "cpu", 80]], 180],
         );
       });
 

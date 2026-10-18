@@ -47,7 +47,7 @@ import { claimSpec, componentName, labels, NAMESPACE, neonName, replicasOf, rest
 import { filerStoreMaxmemoryBytes, type InstallConfig, type Scale } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
-import { cpuUtilization, scaledObject } from "./scalers.ts";
+import { cpuScaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 import { VALKEY_PORT, valkeyObjects, valkeyPassword, valkeyPod, type ValkeyUser } from "./valkey.ts";
 
@@ -550,7 +550,9 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
   return [
     service,
     deployment,
-    ...scaledObject(deployment, scaling, [cpuUtilization(80)]),
+    // Its start is the gateway reaching its filer and, beside it, `weed shell` making the
+    // buckets and their lifecycle rules, which it is not ready until done.
+    ...cpuScaledObject(deployment, scaling, { percent: 80, startUpSeconds: 120 }),
     ...replicaBudget(COMPONENTS.gateway, NAMESPACE, scaling),
     // Of memory alone where KEDA scales the gateways on their CPU, as the two would chase each other.
     verticalPodAutoscaler(deployment, "InPlace", scaled(scaling) ? ["memory"] : undefined),

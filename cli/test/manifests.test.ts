@@ -1007,6 +1007,8 @@ describe("object store", () => {
   });
 
   test("scales its gateways on their CPU where their scale is a range, KEDA owning their replicas", () => {
+    // Held off scaling up past the start of each, which a rollout's gateways each have.
+    assert.equal(one<ScaledObject>(install({ objectStore: { bundled: { gateways: { scaling: { min: 2, max: 4 } } } } }), "ScaledObject", "alasio-seaweedfs").spec.advanced?.horizontalPodAutoscalerConfig.behavior.scaleUp.stabilizationWindowSeconds, 120);
     const objects = install({ objectStore: { bundled: { gateways: { scaling: { min: 2, max: 4 } } } } });
     const gateway = one<V1Deployment>(objects, "Deployment", "alasio-seaweedfs");
     assert.equal(gateway.spec?.replicas, undefined);
@@ -1327,6 +1329,7 @@ describe("Grafana", () => {
       minReplicaCount: 1,
       maxReplicaCount: 3,
       triggers: [{ type: "cpu", metricType: "Utilization", metadata: { value: "80" } }],
+      advanced: { horizontalPodAutoscalerConfig: { behavior: { scaleUp: { stabilizationWindowSeconds: 180 } } } },
     });
     // VPA sizes its memory alone, as its CPU is what it scales on.
     assert.deepEqual(one<VerticalPodAutoscaler>(objects, "VerticalPodAutoscaler", "alasio-grafana").spec.resourcePolicy.containerPolicies.map((policy) => (policy as { controlledResources?: string[] }).controlledResources), [["memory"]]);
@@ -1457,6 +1460,7 @@ describe("telemetry", () => {
     assert.equal(gateway.spec?.replicas, undefined);
     const scaled = one<ScaledObject>(objects, "ScaledObject", "alasio-collector");
     assert.deepEqual([scaled.spec.minReplicaCount, scaled.spec.maxReplicaCount, scaled.spec.triggers], [2, 4, [{ type: "cpu", metricType: "Utilization", metadata: { value: "80" } }]]);
+    assert.equal(scaled.spec.advanced?.horizontalPodAutoscalerConfig.behavior.scaleUp.stabilizationWindowSeconds, 60);
     assert.ok(one(objects, "PodDisruptionBudget", "alasio-collector"));
     assert.equal(one<V1Deployment>(objects, "Deployment", "alasio-collector-scraper").spec?.replicas, 1);
     const single = install();
@@ -3309,4 +3313,16 @@ describe("admission", () => {
     assert.deepEqual(carriedFrom(configOf(cpu("102m")), "{ not JSON", { ...NOTHING_KEPT, cpuBaseline: BASELINE }).previousSessions, null);
     assert.deepEqual(carriedFrom(configOf({ sessions: { enabled: false }, workspaceStorage: { enabled: false }, host: { enabled: true } }), templatesOf(first), { ...NOTHING_KEPT, cpuBaseline: BASELINE }).previousSessions, null);
   });
+});
+
+test("every workload KEDA scales on its CPU is scaled up only on a use that outlasts its start-up, so no rollout scales it up", () => {
+  const range = { scaling: { min: 2, max: 4 } };
+  const objects = install({ grafana: range, telemetry: { collector: { gateway: range } }, objectStore: { bundled: { gateways: range } }, lake: { query: range } });
+  const onCpu = all<ScaledObject>(objects, "ScaledObject").filter(({ spec }) => spec.triggers.some(({ type }) => type === "cpu"));
+  assert.deepEqual(
+    onCpu.map(({ metadata, spec }) => [metadata?.name, spec.advanced?.horizontalPodAutoscalerConfig.behavior.scaleUp.stabilizationWindowSeconds]).sort(),
+    [["alasio-collector", 60], ["alasio-grafana", 180], ["alasio-seaweedfs", 120]],
+  );
+  // What scales on what waits for it rather than on CPU (the lake's readers, on their queue) has no start-up to outlast.
+  assert.equal(one<ScaledObject>(objects, "ScaledObject", "alasio-lake-query").spec.advanced, undefined);
 });
