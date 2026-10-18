@@ -31,8 +31,9 @@
  *   ALASIO_E2E_TARGET=host ALASIO_E2E_REGISTRY=... OUT=... node --test gate/12/chain.test.ts
  */
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { type AddressInfo, connect, createServer, type Socket } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
@@ -382,19 +383,52 @@ function minted(proxy: StoreProxy, layersPrefix: string): StoreToken {
   return token;
 }
 
-/** What `use` makes of the node agent's proxy of the bucket, in this process, on this machine, as long as it uses it. */
-async function throughProxy<A>(use: (proxy: StoreProxy) => Promise<A>): Promise<A> {
-  let release = () => {};
-  const proxy = await new Promise<StoreProxy>((resolve, reject) => {
-    Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      resolve(yield* makeStoreProxy({ store: s3, host: "127.0.0.1", port: 0 }));
+/** A proxy of the bucket started, and how to stop it: once all it serves has ended. */
+interface StartedProxy {
+  readonly proxy: StoreProxy;
+  readonly stop: () => Promise<void>;
+}
+
+/** The node agent's proxy of the bucket, in this process, on `port` (any if 0), keeping its tokens in `tokensFile`, as the agent does. */
+function startProxy(port: number, tokensFile: string): Promise<StartedProxy> {
+  return new Promise((resolve, reject) => {
+    let release = () => {};
+    const ended: Promise<void> = Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const proxy = yield* makeStoreProxy({ store: s3, host: "127.0.0.1", port, tokensFile });
+      resolve({
+        proxy,
+        stop: async () => {
+          release();
+          await ended;
+        },
+      });
       yield* Effect.promise(() => new Promise<void>((resolved) => (release = resolved)));
-    }))).catch(reject);
+    })));
+    ended.catch(reject);
   });
+}
+
+/**
+ * What `use` makes of the node agent's proxy of the bucket, in this process, on this machine,
+ * as long as it uses it, given `restart`: the proxy stopped, as an agent that goes away, and
+ * after `awayMs` started again on the same port from its tokens file, as the agent that comes
+ * back, which it answers.
+ */
+async function throughProxy<A>(use: (proxy: StoreProxy, restart: (awayMs: number) => Promise<StoreProxy>) => Promise<A>): Promise<A> {
+  const directory = mkdtempSync(join(tmpdir(), "gate-12-proxy-"));
+  const tokensFile = join(directory, "tokens.json");
+  let current = await startProxy(0, tokensFile);
+  const port = Number(new URL(current.proxy.endpoint).port);
   try {
-    return await use(proxy);
+    return await use(current.proxy, async (awayMs) => {
+      await current.stop();
+      await sleep(awayMs);
+      current = await startProxy(port, tokensFile);
+      return current.proxy;
+    });
   } finally {
-    release();
+    await current.stop();
+    rmSync(directory, { recursive: true, force: true });
   }
 }
 
@@ -582,14 +616,17 @@ test("8. a restore from the bucket whose proxy goes away during its background r
   recorded("outage", async (seen) => {
     seen["agentReplaced"] = await agentReplaced();
     const restartMs = (seen["agentReplaced"] as { readonly ms: number }).ms;
-    // For a while, then back on the same port: briefly, as long as an agent takes to come
-    // back, and for five minutes. Each of a session of its own, a whole image of whose
-    // sandbox the restore reads every page of from the bucket, its reads of pages waiting
-    // for the store as long as the sandbox runs (pages_retry).
-    const outages = [["brief", 10_000], ["restart", restartMs], ["long", LONG_OUTAGE_MS]] as const;
-    await throughProxy(async (proxy) => {
-      for (const [name, outageMs] of outages) {
-        const outcome: Record<string, unknown> = { outageMs };
+    // For a while, then back on the same port: briefly and as long as an agent takes to come
+    // back, cut off the proxy; and for five minutes, the proxy itself stopped and started
+    // again from its tokens file, as an agent away that long comes back, which a restore can
+    // ask nothing of meanwhile. Each of a session of its own, a whole image of whose sandbox
+    // the restore reads every page of from the bucket, its reads of pages waiting for the
+    // store as long as the sandbox runs (pages_retry).
+    const outages = [["brief", 10_000, "cut"], ["restart", restartMs, "cut"], ["long", LONG_OUTAGE_MS, "stopped"]] as const;
+    await throughProxy(async (started, restart) => {
+      let proxy = started;
+      for (const [name, outageMs, how] of outages) {
+        const outcome: Record<string, unknown> = { outageMs, how };
         seen[name] = outcome;
         try {
           Object.assign(session, await inGate<Created>("create"));
@@ -622,9 +659,13 @@ test("8. a restore from the bucket whose proxy goes away during its background r
               await sleep(100);
             }
             outcome["cutAt"] = { bytes: relay.carried().bytes, ms: Date.now() - startedAt };
-            await relay.cut();
-            await sleep(outageMs);
-            await relay.back();
+            if (how === "cut") {
+              await relay.cut();
+              await sleep(outageMs);
+              await relay.back();
+            } else {
+              proxy = await restart(outageMs);
+            }
             outcome["reads"] = await readsOf(relay, startedAt, 30_000);
           } finally {
             relay.close();
