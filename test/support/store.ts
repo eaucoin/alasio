@@ -57,16 +57,18 @@ export function newSchema(): string {
 /**
  * The store in `schema` (a new one unless given), made empty where it was not made, a
  * branch environment's when `branch` names one, waiting for a chat's handling lock as long
- * as `handlingLockTimeout` says, where it says.
+ * as `handlingLockTimeout` says, and bounding a statement under a chat's lock as
+ * `lockedStatementTimeout` does, where they say.
  */
-export async function testStore({ schema = newSchema(), workingDirectory = null, branch = null, handlingLockTimeout }: {
+export async function testStore({ schema = newSchema(), workingDirectory = null, branch = null, handlingLockTimeout, lockedStatementTimeout }: {
   readonly schema?: string | undefined;
   readonly workingDirectory?: string | null | undefined;
   readonly branch?: string | null | undefined;
   readonly handlingLockTimeout?: Duration.Input | undefined;
+  readonly lockedStatementTimeout?: Duration.Input | undefined;
 } = {}): Promise<Store["Service"]> {
   const { pool } = await database();
-  return Effect.runPromise(Effect.provide(Store, Store.layer({ pool, schema, workingDirectory, branch, handlingLockTimeout })));
+  return Effect.runPromise(Effect.provide(Store, Store.layer({ pool, schema, workingDirectory, branch, handlingLockTimeout, lockedStatementTimeout })));
 }
 
 /** The backend that holds the chat's `lock` of the store in `schema`, by its pid, for a test to end it as a lost connection is. */

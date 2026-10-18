@@ -405,3 +405,19 @@ test("a stop is done once the turn has let go of its conversation: its harness's
     assert.equal(yield* activeTurns.isBusy(conversationId), false);
   })).pipe(Effect.provide(ActiveTurns.layer)));
 });
+
+test("a prompt queued again while a turn runs, as its update is handled again after its handling lock was lost, is queued once and asked about once", async () => {
+  const { store, conversationId } = await conversation();
+  await withTurns(store, scriptedHarness(() => Effect.never), async (alasio, queued) => {
+    await alasio.runPromise(Effect.scoped(Effect.gen(function*() {
+      // A turn runs in the conversation.
+      assert.ok(yield* (yield* ActiveTurns).reserve(conversationId));
+      const turns = yield* Turns;
+      const prompt = { conversationId, chatId: CONVERSATION_CHAT, messageId: 77, prompt: "Is it done?", fileIds: [], visibleText: "Is it done?" };
+      yield* turns.submit(prompt);
+      yield* turns.submit(prompt);
+    })));
+    assert.equal(queued.texts.filter(({ text }) => text.startsWith("Codex is currently working.")).length, 1);
+  });
+  assert.deepEqual((await run(store.listHeldPromptJobs(conversationId))).map(({ message_id: messageId }) => messageId), ["77"]);
+});

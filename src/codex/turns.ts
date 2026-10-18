@@ -575,7 +575,8 @@ const makeTurns = Effect.fnUntraced(function*() {
           state: (yield* activeTurns.isBusy(conversationId)) ? "awaiting_choice" : "pending",
           traceparent,
         });
-        if (queued.state === "awaiting_choice") yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job: queued });
+        // Asked about once: a prompt queued already, as its update is handled again, was asked about then.
+        if (queued.fresh && queued.state === "awaiting_choice") yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job: queued });
         return queued;
       }));
       if (job.state === "pending") yield* schedule(conversationId);

@@ -144,10 +144,11 @@ export class Outbox extends Context.Service<Outbox, {
      * else whether it was delivered, or nothing was due, rather than deferred.
      */
     const deliverNext = (chat: string): Effect.Effect<Option.Option<boolean>, StoreError> =>
-      // Uninterruptible from the lock's taking, which waits for nothing, to its transaction's
-      // commit, so an entry sent as alasio stops is marked sent with it; but where the
-      // client waits out a rate limit before Telegram has taken any call of it (./client.ts).
-      holders.withPermit(Effect.uninterruptible(store.withDeliveryLock(chat, (marks) =>
+      // Uninterruptible from the lock's being taken to its transaction's commit
+      // (Store.withDeliveryLock), so an entry sent as alasio stops is marked sent with it;
+      // but where the client waits out a rate limit before Telegram has taken any call of
+      // it (./client.ts).
+      holders.withPermit(store.withDeliveryLock(chat, (marks) =>
         Effect.gen(function*() {
           const item = yield* marks.getDueOutboxOf(chat);
           if (item === null) return true;
@@ -159,7 +160,7 @@ export class Outbox extends Context.Service<Outbox, {
             Effect.match({ onFailure: () => false, onSuccess: () => true }),
           );
         })
-      )));
+      ));
 
     // What is due is each chat's next entry, so a pass asks again until nothing is due. An
     // entry's delivery is not interrupted but where it waits out a rate limit before

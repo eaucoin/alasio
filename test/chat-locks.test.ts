@@ -1,15 +1,19 @@
 /**
- * A chat's handling lock, which every alasio on the store takes to handle the chat's
- * update (src/telegram/app.ts): waited for while another holds it, but not for ever; and
- * the marks made under it rolled back where it is lost.
+ * A chat's locks, which every alasio on the store takes (src/persistence/store.ts): its
+ * handling lock waited for while another holds it, but not for ever, and the marks made
+ * under it rolled back where it is lost; its delivery lock's taking cut short as alasio
+ * stops, and the statements under each bounded in time.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import type { Update } from "@grammyjs/types";
-import { Deferred, Effect, Exit, Fiber } from "effect";
+import { Deferred, Duration, Effect, Exit, Fiber, Option } from "effect";
+import pg from "pg";
 
-import { holdChatLock, lockHolder, newSchema, testPool, testStore } from "./support/store.ts";
+import { LOCKED_STATEMENT_TIMEOUT, Store } from "../src/persistence/store.ts";
+import { holdChatLock, lockHolder, newSchema, testDatabaseUrl, testPool, testStore } from "./support/store.ts";
 
 test("handling waits for the chat's handling lock another holds, and fails, its work not run, past the store's timeout", { timeout: 20_000 }, async () => {
   const schema = newSchema();
@@ -54,4 +58,53 @@ test("an update's marks made under a handling lock that is lost, its connection 
   assert.ok(Exit.isFailure(await Effect.runPromise(Fiber.await(handling))));
   // Nothing of it kept: kept again, it is yet to be processed.
   assert.equal(await Effect.runPromise(store.recordTelegramUpdate(update)), true);
+});
+
+test("a delivery waiting for a connection of a pool that has none to give is stopped at once, not after the connection's timeout, and the connection that comes later is given back", { timeout: 30_000 }, async () => {
+  const schema = newSchema();
+  const pool = new pg.Pool({ connectionString: await testDatabaseUrl(), max: 1, connectionTimeoutMillis: 10_000 });
+  try {
+    const store = await Effect.runPromise(Effect.provide(Store, Store.layer({ pool, schema })));
+    // The pool's one connection, held elsewhere.
+    const held = await pool.connect();
+    let ran = false;
+    try {
+      const waiting = Effect.runFork(store.withDeliveryLock(42, () => Effect.sync(() => void (ran = true))));
+      await sleep(300);
+      const started = Date.now();
+      await Effect.runPromise(Fiber.interrupt(waiting));
+      assert.ok(Date.now() - started < 2000, "stopped as it waited, not as the connection timed out");
+    } finally {
+      held.release();
+    }
+    assert.equal(ran, false);
+    // The connection the stopped wait would have had is the pool's again.
+    assert.deepEqual(await Effect.runPromise(store.withDeliveryLock(42, () => Effect.succeed("delivered")).pipe(Effect.timeout("5 seconds"))), Option.some("delivered"));
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a delivery whose mark is stuck behind a lock no one lets go of ends as its lock's statements are bounded, rather than holding the delivery", { timeout: 30_000 }, async () => {
+  const schema = newSchema();
+  const other = await (await testPool()).connect();
+  try {
+    const store = await testStore({ schema, lockedStatementTimeout: "500 millis" });
+    const id = await Effect.runPromise(store.enqueueOutboxText({ chatId: 42, text: "stuck" }));
+    // The entry's row held by another, as a statement of a frozen compute would hold it.
+    await other.query("begin");
+    await other.query(`select 1 from ${schema}.telegram_outbox where id = $1 for update`, [id]);
+    const started = Date.now();
+    const marked = await Effect.runPromiseExit(store.withDeliveryLock(42, (marks) => marks.markOutboxSent(id)));
+    assert.ok(Exit.isFailure(marked));
+    assert.match(String(Exit.isFailure(marked) && marked.cause), /statement timeout/u);
+    assert.ok(Date.now() - started < 5000, "ended by the statement timeout");
+  } finally {
+    await other.query("rollback").catch(() => {});
+    other.release();
+  }
+});
+
+test("a statement under a chat's lock is ended by Postgres well within the grace alasio's pod is stopped with", () => {
+  assert.ok(Duration.isLessThan(LOCKED_STATEMENT_TIMEOUT, Duration.seconds(60)));
 });

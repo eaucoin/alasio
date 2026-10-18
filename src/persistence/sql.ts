@@ -3,7 +3,7 @@
  * transactions, whose statements run on one connection between `begin` and `commit`.
  * A transaction whose work fails, or is interrupted, is rolled back.
  */
-import { Effect, Exit, Schema } from "effect";
+import { Effect, Exit, Option, Schema } from "effect";
 import type { Pool, PoolClient } from "pg";
 
 /** What alasio's store failed with, as Postgres or the driver said it. */
@@ -24,6 +24,14 @@ export interface Sql {
 export interface Database extends Sql {
   /** Runs `work`'s statements in one transaction: committed if it succeeds, rolled back if not. */
   readonly transaction: <A, E, R>(work: (sql: Sql) => Effect.Effect<A, E, R>) => Effect.Effect<A, E | StoreError, R>;
+  /**
+   * Runs, in one transaction, `take`'s statements, then, where they say so, `work`'s: what
+   * `work` gave, or none where `take` said not, and `work` was not run. Waiting for a
+   * connection and `take` may be interrupted, as nothing is done yet; `work`, and the
+   * commit after it, are not, once `take` has said so, so what `work` did is committed with
+   * it. Rolled back where it fails.
+   */
+  readonly guardedTransaction: <A, E, R>(take: (sql: Sql) => Effect.Effect<boolean, StoreError>, work: (sql: Sql) => Effect.Effect<A, E, R>) => Effect.Effect<Option.Option<A>, E | StoreError, R>;
 }
 
 const onPostgres = <A>(run: () => Promise<A>): Effect.Effect<A, StoreError> =>
@@ -33,6 +41,28 @@ const sqlOn = (client: Pool | PoolClient): Sql => ({
   query: <Row extends object>(text: string, values: readonly unknown[] = []) =>
     onPostgres(async () => (await client.query<Row>(text, [...values])).rows),
 });
+
+/**
+ * A connection of `pool`, waited for as long as it takes, or until interrupted: one that
+ * comes after its wait was interrupted is given back to the pool, not lost to it.
+ */
+const connection = (pool: Pool): Effect.Effect<PoolClient, StoreError> =>
+  Effect.callback<PoolClient, StoreError>((resume) => {
+    let abandoned = false;
+    pool.connect().then(
+      (client) => (abandoned ? client.release() : resume(Effect.succeed(client))),
+      (cause: unknown) => abandoned || resume(Effect.fail(new StoreError({ cause }))),
+    );
+    return Effect.sync(() => {
+      abandoned = true;
+    });
+  });
+
+/** Gives a transaction's connection back: as it is where it committed, rolled back first where not; one that cannot roll back is ended. */
+const releasing = (client: PoolClient, exit: Exit.Exit<unknown, unknown>): Effect.Effect<void> =>
+  Exit.isSuccess(exit)
+    ? Effect.sync(() => client.release())
+    : Effect.promise(() => client.query("rollback").then(() => client.release(), (error: Error) => client.release(error)));
 
 /** The database `pool` connects to. */
 export function poolDatabase(pool: Pool): Database {
@@ -48,11 +78,23 @@ export function poolDatabase(pool: Pool): Database {
             Effect.tap(() => sql.query("commit")),
           );
         },
-        // A connection that cannot roll back is not given back to the pool, but ended.
-        (client, exit) =>
-          Exit.isSuccess(exit)
-            ? Effect.sync(() => client.release())
-            : Effect.promise(() => client.query("rollback").then(() => client.release(), (error: Error) => client.release(error))),
+        releasing,
+      ),
+    guardedTransaction: (take, work) =>
+      Effect.acquireUseRelease(
+        Effect.interruptible(connection(pool)),
+        (client) => {
+          const sql = sqlOn(client);
+          return sql.query("begin").pipe(
+            Effect.andThen(take(sql)),
+            Effect.flatMap((taken) =>
+              taken
+                ? Effect.uninterruptible(work(sql).pipe(Effect.tap(() => sql.query("commit")))).pipe(Effect.map(Option.some))
+                : sql.query("commit").pipe(Effect.as(Option.none()))
+            ),
+          );
+        },
+        releasing,
       ),
   };
 }

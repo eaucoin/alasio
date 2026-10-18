@@ -38,6 +38,11 @@ export interface PromptJob {
   readonly completed_at: Date | null;
 }
 
+/** A prompt job as queueing it found it: whether it was queued now, or had been already, as for an update handled again. */
+export interface QueuedPromptJob extends PromptJob {
+  readonly fresh: boolean;
+}
+
 export interface NewPromptJob {
   readonly conversationId: string;
   readonly chatId: number | string;
@@ -63,14 +68,18 @@ export class NeonPromptJobRepository {
     this.#schema = schema;
   }
 
-  /** Queues a prompt: the job queued, or the one already queued for its message. */
-  enqueue({ conversationId, chatId, messageId, prompt, visibleText = prompt, fileIds = [], state = "pending", priority = 0, harness, traceparent = null }: NewPromptJob): Effect.Effect<PromptJob, StoreError> {
-    // The no-op update makes the job already queued the one returned.
-    return this.#sql.query<PromptJob>(
+  /**
+   * Queues a prompt: the job queued, or the one already queued for its message, as an update
+   * handled again queues it again; and whether it was queued now.
+   */
+  enqueue({ conversationId, chatId, messageId, prompt, visibleText = prompt, fileIds = [], state = "pending", priority = 0, harness, traceparent = null }: NewPromptJob): Effect.Effect<QueuedPromptJob, StoreError> {
+    // The no-op update makes the job already queued the one returned: a row the statement
+    // made has no xmax, one it updated has.
+    return this.#sql.query<QueuedPromptJob>(
       `insert into ${this.#schema}.prompt_jobs (id, conversation_id, chat_id, message_id, prompt, visible_text, file_ids, harness, state, priority, traceparent)
        select $1, id, $3, $4, $5, $11, $6, coalesce($7, active_harness), $8, $9, $10 from ${this.#schema}.conversations where id = $2
        on conflict (conversation_id, message_id) do update set conversation_id = excluded.conversation_id
-       returning *`,
+       returning *, xmax = 0 as fresh`,
       [newId(), conversationId, String(chatId), String(messageId), prompt, fileIds, harness ?? null, state, priority, traceparent, visibleText],
     ).pipe(Effect.map(([row]) => row!));
   }

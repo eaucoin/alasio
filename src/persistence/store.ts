@@ -26,7 +26,7 @@ import {
   type WorkspaceConversation,
 } from "./conversation-repository.ts";
 import { type DueOutboxEntry, NeonOutboxRepository, type NewOutboxStatus, type NewOutboxText } from "./outbox-repository.ts";
-import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState } from "./prompt-job-repository.ts";
+import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState, type QueuedPromptJob } from "./prompt-job-repository.ts";
 import { type CompletedResponse, NeonResponseRepository, type ResponseBlock } from "./response-repository.ts";
 import { NeonRestartRepository, type NewRestartEvent, type RestartEvent } from "./restart-repository.ts";
 import { ensureSchema } from "./schema.ts";
@@ -70,6 +70,8 @@ export interface StoreOptions {
   readonly branch?: string | null | undefined;
   /** How long handling a chat's update waits for the chat's handling lock (withHandlingLock): HANDLING_LOCK_TIMEOUT unless a test says. */
   readonly handlingLockTimeout?: Duration.Input | undefined;
+  /** How long a statement under a chat's lock may run (LOCKED_STATEMENT_TIMEOUT unless a test says). */
+  readonly lockedStatementTimeout?: Duration.Input | undefined;
 }
 
 /**
@@ -78,6 +80,16 @@ export interface StoreOptions {
  * that is stuck makes it fail.
  */
 export const HANDLING_LOCK_TIMEOUT = Duration.seconds(30);
+
+/**
+ * How long a statement made under a chat's lock, in its transaction, may run before
+ * Postgres ends it: far longer than any of them takes (a mark, a read of the chat's next
+ * entry), and less than the grace alasio's pod stops with (60 s), so one that never
+ * returns, as of a compute frozen under it, holds no delivery, which alasio does not cut
+ * short as it stops, past its stopping. Set on the locks' transactions alone: alasio's
+ * other statements, its schema's setup and its pruning among them, are not bounded by it.
+ */
+export const LOCKED_STATEMENT_TIMEOUT = Duration.seconds(45);
 
 /** Each of alasio's repositories, on one connection or transaction. */
 const repositories = (sql: Sql, schema: string, workingDirectory: string | null) => ({
@@ -289,7 +301,7 @@ export class Store extends Context.Service<Store, {
   readonly getPendingOutboxCount: Stored<number>;
 
   /** Queues a prompt: the job queued, or the one already queued for its message. */
-  readonly enqueuePromptJob: (job: NewPromptJob) => Stored<PromptJob>;
+  readonly enqueuePromptJob: (job: NewPromptJob) => Stored<QueuedPromptJob>;
   readonly hasOpenPromptJobs: (conversationId: string) => Stored<boolean>;
   readonly getPromptJob: (id: string) => Stored<PromptJob | null>;
   /** Starts the conversation's next pending job: the job, or null when none waits. */
@@ -341,8 +353,18 @@ export class Store extends Context.Service<Store, {
   static readonly layer = (options: StoreOptions): Layer.Layer<Store, StoreError> => Layer.effect(Store, makeStore(options));
 }
 
-const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, workingDirectory = null, branch = null, handlingLockTimeout = HANDLING_LOCK_TIMEOUT }: StoreOptions) {
+const makeStore = Effect.fnUntraced(function*({
+  pool,
+  schema = DEFAULT_SCHEMA,
+  workingDirectory = null,
+  branch = null,
+  handlingLockTimeout = HANDLING_LOCK_TIMEOUT,
+  lockedStatementTimeout = LOCKED_STATEMENT_TIMEOUT,
+}: StoreOptions) {
   const database = poolDatabase(pool);
+  /** Bounds the statements of a chat's lock's transaction `sql` (LOCKED_STATEMENT_TIMEOUT), for that transaction alone. */
+  const bounded = (sql: Sql): Effect.Effect<void, StoreError> =>
+    Effect.asVoid(sql.query("select set_config('statement_timeout', $1, true)", [`${Duration.toMillis(lockedStatementTimeout)}ms`]));
   yield* ensureSchema(database, schema);
   if (branch && (yield* startBranch(database, schema, branch))) {
     yield* Effect.logInfo(`made the state the branch ${branch}'s: what was in flight where it was branched from is gone`);
@@ -381,7 +403,8 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
     withHandlingLock: (chatId, work) =>
       database.transaction((sql) =>
         // Past the timeout, Postgres fails the wait (lock_not_available), and the transaction with it.
-        sql.query("select set_config('lock_timeout', $1, true)", [`${Duration.toMillis(handlingLockTimeout)}ms`]).pipe(
+        bounded(sql).pipe(
+          Effect.andThen(sql.query("select set_config('lock_timeout', $1, true)", [`${Duration.toMillis(handlingLockTimeout)}ms`])),
           Effect.andThen(sql.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [chatLockName(schema, "handling", chatId)])),
           Effect.andThen(Effect.suspend(() => {
             const { telegramContent: locked } = repositoriesOn(sql);
@@ -392,20 +415,24 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
           })),
         )
       ),
+    // Waiting for a connection, and for the lock, may be cut short, as alasio stops; the
+    // delivery under it, once the lock is taken, and its commit, are not.
     withDeliveryLock: (chatId, work) =>
-      database.transaction((sql) =>
-        sql.query<{ taken: boolean }>("select pg_try_advisory_xact_lock(hashtextextended($1, 0)) as taken", [chatLockName(schema, "delivery", chatId)]).pipe(
-          Effect.flatMap(([row]) => {
-            if (!row?.taken) return Effect.succeedNone;
-            const { outbox: locked } = repositoriesOn(sql);
-            return Effect.asSome(work({
-              getDueOutboxOf: (chat) => locked.getDueOf(chat),
-              markOutboxSent: (id, delivered) => locked.markSent(id, delivered),
-              rescheduleOutbox: (id, error, delayMs) => locked.reschedule(id, error, delayMs),
-              fence: Effect.asVoid(sql.query("select 1")),
-            }));
-          }),
-        )
+      database.guardedTransaction(
+        (sql) =>
+          bounded(sql).pipe(
+            Effect.andThen(sql.query<{ taken: boolean }>("select pg_try_advisory_xact_lock(hashtextextended($1, 0)) as taken", [chatLockName(schema, "delivery", chatId)])),
+            Effect.map(([row]) => row?.taken ?? false),
+          ),
+        (sql) => {
+          const { outbox: locked } = repositoriesOn(sql);
+          return work({
+            getDueOutboxOf: (chat) => locked.getDueOf(chat),
+            markOutboxSent: (id, delivered) => locked.markSent(id, delivered),
+            rescheduleOutbox: (id, error, delayMs) => locked.reschedule(id, error, delayMs),
+            fence: Effect.asVoid(sql.query("select 1")),
+          });
+        },
       ),
     markTelegramUpdateProcessed: (updateId) => telegramContent.markTelegramUpdateProcessed(updateId),
     insertMessage: (message) => telegramContent.insertMessage(message),

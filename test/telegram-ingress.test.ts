@@ -14,7 +14,7 @@ import { TelegramTransportError } from "../src/telegram/client.ts";
 import { ReceivedFiles } from "../src/telegram/files.ts";
 import { handleMessage, TELEGRAM_BOT_FILE_LIMIT_BYTES } from "../src/telegram/message-handler.ts";
 import { consumeUpdates, TelegramUpdates, type UpdateFeed } from "../src/telegram/update-consumer.ts";
-import { run, testStore } from "./support/store.ts";
+import { newSchema, run, testPool, testStore } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { withServices } from "./support/turns.ts";
 
@@ -87,6 +87,46 @@ test("a file a message carries is kept in the store, and written where its promp
       await alasio.runPromise(Effect.flatMap(ReceivedFiles, (files) => files.materialize([file.id])));
       assert.deepEqual(readFileSync(file.path), content);
     });
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("a message handled again, as an update whose handling lock was lost is, is kept once, its file once, and its prompt names the file kept", async () => {
+  const schema = newSchema();
+  const store = await testStore({ schema });
+  const stateDir = mkdtempSync(join(tmpdir(), "alasio-ingress-"));
+  const content = Buffer.from("a photo");
+  const telegram = recordingTelegram({
+    downloadTelegramFile: () =>
+      Effect.succeed({ name: "photo.jpg", content, sha256: createHash("sha256").update(content).digest("hex"), remote: { file_id: "photo", file_unique_id: "photo" } }),
+  });
+  const message: Message = { message_id: 14, date: 0, chat: CHAT, from: OPERATOR, caption: "look", photo: [{ file_id: "photo", file_unique_id: "photo", width: 1, height: 1 }] };
+  try {
+    await withServices({ store, telegram: telegram.layer, allowedUserIds: String(OPERATOR.id), stateDir }, async (alasio) => {
+      const first = await alasio.runPromise(handleMessage(message, 4));
+      const again = await alasio.runPromise(handleMessage(message, 4));
+      assert.deepEqual(again?.files.map(({ id }) => id), first?.files.map(({ id }) => id));
+    });
+    const count = async (table: string) => Number((await (await testPool()).query<{ n: string }>(`select count(*) as n from ${schema}.${table}`)).rows[0]?.n);
+    assert.deepEqual([await count("messages"), await count("files")], [1, 1]);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("a message whose id one sent earlier had, as a branch's bot's has one its parent's state holds, is kept as a message of its own", async () => {
+  const schema = newSchema();
+  const store = await testStore({ schema });
+  const stateDir = mkdtempSync(join(tmpdir(), "alasio-ingress-"));
+  try {
+    await withServices({ store, allowedUserIds: String(OPERATOR.id), stateDir }, async (alasio) => {
+      // The parent's, sent to its own bot before the branch was made; the branch's bot numbers its chat's messages from 1 again.
+      await alasio.runPromise(handleMessage({ message_id: 1, date: 1_000, chat: CHAT, from: OPERATOR, text: "hello" }, 1));
+      await alasio.runPromise(handleMessage({ message_id: 1, date: 2_000, chat: CHAT, from: OPERATOR, text: "again" }, 1));
+    });
+    const { rows } = await (await testPool()).query<{ text: string }>(`select text from ${schema}.messages order by created_at`);
+    assert.deepEqual(rows.map(({ text }) => text), ["hello", "again"]);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

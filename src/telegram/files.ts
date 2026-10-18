@@ -60,7 +60,8 @@ export class ReceivedFiles extends Context.Service<ReceivedFiles, {
       return ReceivedFiles.of({
         keep: Effect.fnUntraced(function*(file) {
           const id = yield* store.insertFile(file);
-          yield* write({ id, name: file.name, content: file.content });
+          // Written once: a file kept already, as for a message handled again, is there.
+          if (!existsSync(join(root, id))) yield* write({ id, name: file.name, content: file.content });
           return { id, path: pathOf({ id, name: file.name }) };
         }),
         pathOf,
