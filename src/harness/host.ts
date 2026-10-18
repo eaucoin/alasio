@@ -10,9 +10,9 @@
  * control plane claimed the turn under, as are the claims of the turns its harness starts
  * on its own, and the progress of the prompt job it runs.
  *
- * It runs in alasio's process for now, over Harnesses and ActiveTurns; a host elsewhere
- * (14.3's harness gateway) is another implementation of this service, which the control
- * plane reaches through it as it does this one.
+ * HarnessHost.layer is the host in alasio's process, over Harnesses and ActiveTurns;
+ * ./remote-host.ts is one elsewhere, an `alasio harness` (./program.ts) the control plane
+ * reaches over HTTP (./serve.ts) as it does this one.
  */
 import { Context, Effect, Layer, Option, PubSub, type Scope } from "effect";
 

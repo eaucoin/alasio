@@ -261,8 +261,8 @@ export const folderRefusedOnBranch = (branch: string): string =>
   "which cannot be copied on write, so a branch never works in one: use /workspace for a session workspace.";
 
 /**
- * The conversation's harness host, elsewhere, not reached, or failing a call with what no
- * host of alasio's fails with, as `reason` says.
+ * The conversation's harness host, elsewhere (./remote-host.ts), not reached, or failing a
+ * call with what no host of alasio's fails with, as `reason` says.
  */
 export class HarnessHostError extends Schema.TaggedError<HarnessHostError>()("HarnessHostError", {
   reason: Schema.String,
