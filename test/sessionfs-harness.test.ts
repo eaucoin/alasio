@@ -34,16 +34,15 @@ function fakeSandbox(): SessionSandboxes["Service"] & { readonly ensured: string
   const unused = () => assert.fail("a harness only finds a session's directory and starts its host");
   return {
     ensured,
-    volumes: { create: unused, fork: unused, destroy: unused, forks: Effect.sync(unused) },
+    volumes: { create: unused, fork: unused, destroy: unused, list: Effect.sync(unused) },
     harnessDirectory: (volumeId) => `/state/sessionfs/workspaces/${volumeId}`,
-    pod: (volumeId) => ({ namespace: "alasio-sessions", name: volumeId }),
     ensureSession: (volumeId) =>
       Effect.sync(() => {
         ensured.push(volumeId);
         return { bayma: BAYMA };
       }),
     readFile: unused,
-    holding: () => Effect.void,
+    writeFile: unused,
   };
 }
 

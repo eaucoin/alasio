@@ -1,15 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
-import { ConfigProvider, Effect, Exit, Layer, Scope, Stream } from "effect";
+import { Effect, Exit, Scope } from "effect";
 
 import { type AppServerProcessOptions, AppServerSpawnFailed } from "../src/codex/app-server/process.ts";
 import type { LoginRelay } from "../src/codex/login-relay.ts";
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.ts";
-import type { SessionsProfile } from "../src/kube/config.ts";
 import type { BaymaEndpoint } from "../src/kube/sandboxes.ts";
 import { SESSION_FS_CLAUDE_TOOLS } from "../src/harness/claude/sessionfs.ts";
 import { SESSION_FS_INSTRUCTIONS } from "../src/harness/workspace-instructions.ts";
@@ -19,8 +18,6 @@ import {
   sessionFsCodexConfigToml,
   sessionFsThreadConfig,
 } from "../src/codex/sessionfs.ts";
-import { KubeClient } from "../src/kube/client.ts";
-import { SessionSandboxes } from "../src/sandbox/index.ts";
 import { assertValidVolumeId, isValidVolumeId, newVolumeId } from "../src/sandbox/names.ts";
 import { isSessionFs, parseWorkspace, sessionFsWorkspace } from "../src/workspace/kind.ts";
 
@@ -157,23 +154,3 @@ test("the session-filesystem Codex writes its own home, carries none of the oper
   }
 });
 
-test("a session's harness directory is its own, under the state directory, outside the sandbox", async () => {
-  const stateDir = tempDir();
-  const profile: SessionsProfile = { namespace: "alasio-sessions", port: 7290, workspaceDir: "/workspace", podTemplate: { spec: { containers: [{ name: "bayma" }] } } };
-  // A session's harness directory is alasio's own; Kubernetes is never reached for it.
-  const unreachable = () => Effect.die("the harness directory reached Kubernetes");
-  const kube = Layer.succeed(KubeClient, KubeClient.of({ read: unreachable, list: unreachable, create: unreachable, replace: unreachable, patch: unreachable, patchPodStatus: unreachable, remove: unreachable, exec: unreachable, watch: () => Stream.die("nothing is watched") }));
-  const layer = SessionSandboxes.layer({ profile, stateDir, env: {} }).pipe(
-    Layer.provide(kube),
-    Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))),
-  );
-  await Effect.runPromise(SessionSandboxes.pipe(
-    Effect.map((sessions) => {
-      const directory = sessions.harnessDirectory("fs-abc123");
-      assert.equal(directory, join(stateDir, "sessionfs", "workspaces", "fs-abc123"));
-      assert.ok(existsSync(directory));
-      assert.throws(() => sessions.harnessDirectory("../escape"), /invalid session volume id/);
-    }),
-    Effect.provide(layer),
-  ));
-});

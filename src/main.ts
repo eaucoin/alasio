@@ -29,9 +29,9 @@ const alasio = Effect.gen(function*() {
   const neon = yield* Neon.make.pipe(Effect.provideServiceEffect(LakeWake, config.lakeWake ? LakeWake.make(config.lakeWake) : Effect.succeed(LakeWake.none)));
   const codexRollouts = yield* CodexRollouts.make({ store: neon.rollouts, home: codexHome() });
   // Session filesystems (an empty, isolated workspace per session) are on when the
-  // deployment renders their template. Their Codex runs from a home of its own,
+  // deployment gives alasio a sandbox gateway. Their Codex runs from a home of its own,
   // mirrored the same way into a schema of its own.
-  const sessionFsCodexRollouts = kubeTemplates.sessions
+  const sessionFsCodexRollouts = config.sessionsGateway
     ? yield* SessionFsCodexRollouts.make({ store: yield* neon.sessionFsRollouts, home: sessionFsCodexHome(config.stateDir) })
     : null;
   yield* serveAlasio({

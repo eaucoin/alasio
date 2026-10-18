@@ -860,17 +860,14 @@ if (inShard("sessions")) {
       assert.equal(fromStub, "blocked");
     });
 
-    test("alasio reads a session's files as its agent, a suspended session resumes with them, and one recorded of another pod template is moved onto the current one with them", async () => {
+    test("alasio reaches a session's bayma and reads its files through the gateway, none outside them, and a session released is read still and brought up again with them", async () => {
       const seen = await roundtrip(none);
       assert.equal(seen.exec, '"written"');
       assert.match(seen.read ?? "", /^hello from /u);
       assert.equal(seen.missing, "file not found");
-      assert.equal(seen.suspendedPod, "gone");
-      assert.equal(seen.whileSuspended, "the session is not running");
-      assert.equal(seen.afterResume, seen.read);
-      assert.equal(seen.execAfterResume, JSON.stringify(seen.read));
-      assert.equal(seen.podReplaced, true);
-      assert.equal(seen.execAfterMove, JSON.stringify(seen.read));
+      assert.equal(seen.outside, "not in the session's files");
+      assert.equal(seen.whileReleased, seen.read);
+      assert.equal(seen.execAfterBind, JSON.stringify(seen.read));
     });
 
     test("a folder conversation's bayma works on the machine as the operator, in their home", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {

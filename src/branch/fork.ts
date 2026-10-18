@@ -7,22 +7,23 @@
  * NetworkPolicy opens to branch environments' alasio alone
  * (cli/src/manifests/network-policies.ts): `POST /branches/<branch>/sessions/<volumeId>/fork`,
  * with the bearer forkToken(key, branch), forks its session `volumeId` into the branch's
- * sessions namespace under the same id, suspended (../sandbox/index.ts fork), and
- * answers `{ volumeId }`. It forks only a session it made, or one of its conversations
- * knows, and none while a turn runs in it, as the fork suspends it: the conversations
- * that mount it are held busy while it forks (ActiveTurns' hold), so none starts a turn
- * under it, and their prompts that came meanwhile run after. 401 without the branch's
- * token, 404 for a session it does not know, 409 while a turn runs in it, 502 when the
- * fork failed. A session forked already is answered as forked.
+ * environment under the same id, through the sandbox gateway (../sandbox/index.ts fork), and
+ * answers `{ volumeId, netMode }`, the internet it was made with. It forks only a session it
+ * made, or one of its conversations knows, and none while a turn runs in it, so no turn
+ * writes into it as it is cloned: the conversations that mount it are held busy while it
+ * forks (ActiveTurns' hold), so none starts a turn under it, and their prompts that came
+ * meanwhile run after. 401 without the branch's token, 404 for a session it does not know,
+ * 409 while a turn runs in it, 502 when the fork failed. A session forked already is
+ * answered as forked.
  *
  * The key is the stack's (neon/control/kube-setup.ts), which the parent reads as each
  * request comes, from a Secret that may be made after it started; each branch is given
  * its own token by `alasio branch create`, and can sign no other branch's.
  *
  * The branch asks as it first brings an inherited session up (parentForks), finds it in
- * its own sessions namespace, under the id its conversations already name, so their
- * working directories and harness sessions stay as they are, and records it as a session
- * workspace it made, in its own database.
+ * its own environment, under the id its conversations already name, so their working
+ * directories and harness sessions stay as they are, and records it as a session workspace it
+ * made, with the internet its parent says, in its own database.
  */
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -35,14 +36,13 @@ import { nameProblem } from "../../neon/control/branches.ts";
 import { Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
 import { holdConversations } from "../harness/holds.ts";
-import { hasStatus } from "../kube/client.ts";
 import { Store } from "../persistence/store.ts";
-import { SessionInheritError, SessionSandboxes } from "../sandbox/index.ts";
+import { type NetMode, SessionInheritError, SessionSandboxes } from "../sandbox/index.ts";
 import { isValidVolumeId } from "../sandbox/names.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken, sameToken } from "../shared/tokens.ts";
 import { sessionFsWorkspace } from "../workspace/kind.ts";
-import { BRANCH_FORK_PORT, branchSessionsNamespace, forkToken } from "./names.ts";
+import { BRANCH_FORK_PORT, forkToken } from "./names.ts";
 
 const FORK = /^\/branches\/([^/]+)\/sessions\/([^/]+)\/fork$/u;
 
@@ -81,14 +81,15 @@ export const serveBranchForks = Effect.fnUntraced(function*({
     }
     if (!isValidVolumeId(volumeId)) return answer(404, { error: `${volumeId} is no session's id` });
     const knowing = yield* store.listWorkspaceConversations(sessionFsWorkspace(volumeId));
-    const made = (yield* store.listSessionWorkspaces).some((workspace) => workspace.volumeId === volumeId && workspace.madeAt !== null);
+    const made = (yield* store.listSessionWorkspaces).find((workspace) => workspace.volumeId === volumeId && workspace.madeAt !== null);
     if (knowing.length === 0 && !made) return answer(404, { error: `alasio has no session ${volumeId}` });
+    const netMode: NetMode = made?.netMode ?? "none";
     const mounting = knowing.filter(({ mounted }) => mounted).map(({ conversationId }) => conversationId);
     const forked = yield* Effect.scoped(Effect.gen(function*() {
       if (!(yield* holdConversations(activeTurns, store, mounting, `forking session ${volumeId} for the branch ${branch}`))) return false;
-      yield* sandboxes.volumes.fork(volumeId, volumeId, branchSessionsNamespace(branch)).pipe(
+      yield* sandboxes.volumes.fork(volumeId, volumeId, branch).pipe(
         // Forked already, by an earlier request of the branch's.
-        Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(409)(error), () => Effect.void),
+        Effect.catchIf((error) => error._tag === "GatewayError" && error.status === 409, () => Effect.void),
       );
       return true;
     })).pipe(Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })));
@@ -96,7 +97,7 @@ export const serveBranchForks = Effect.fnUntraced(function*({
       return answer(409, { error: `a turn runs in the session ${volumeId} now, which a fork would suspend: send again once it ends` });
     }
     yield* Effect.logInfo(`forked session ${volumeId} for the branch ${branch}`);
-    return answer(200, { volumeId });
+    return answer(200, { volumeId, netMode });
   }).pipe(
     Effect.catch((error) => Effect.logWarning(`a fork for a branch failed: ${error.message}`).pipe(Effect.as(answer(502, { error: error.message })))),
     withLogScope("branch-forks"),
@@ -119,25 +120,26 @@ export interface ParentForksOptions {
 
 /**
  * A branch environment's `inherit` (../sandbox/index.ts): its parent's session forked
- * into its own sessions as it is first brought up here; false for a session the parent
- * does not know.
+ * into its own sessions as it is first brought up here, and the internet it was made with;
+ * null for a session the parent does not know.
  */
-export const parentForks = ({ url, branch, tokenFile }: ParentForksOptions) => (volumeId: string): Effect.Effect<boolean, SessionInheritError> =>
+export const parentForks = ({ url, branch, tokenFile }: ParentForksOptions) => (volumeId: string): Effect.Effect<NetMode | null, SessionInheritError> =>
   Effect.tryPromise({
     try: async () => {
       const token = (await readFile(tokenFile, "utf8")).trim();
       const response = await fetch(`${url}/branches/${branch}/sessions/${volumeId}/fork`, { method: "POST", headers: { authorization: `Bearer ${token}` } });
       const body: unknown = await response.json().catch(() => null);
       const said = typeof body === "object" && body !== null && "error" in body ? String(body.error) : `it answered ${response.status}`;
-      return { status: response.status, said };
+      const netMode: NetMode = typeof body === "object" && body !== null && "netMode" in body && body.netMode === "full" ? "full" : "none";
+      return { status: response.status, said, netMode };
     },
     catch: (cause) => new SessionInheritError({ message: `the alasio this branch was branched from could not be asked to fork the session ${volumeId}: ${cause instanceof Error ? cause.message : String(cause)}` }),
   }).pipe(
-    Effect.flatMap(({ status, said }) =>
+    Effect.flatMap(({ status, said, netMode }) =>
       status === 200
-        ? Effect.succeed(true)
+        ? Effect.succeed(netMode)
         : status === 404
-        ? Effect.succeed(false)
+        ? Effect.succeed(null)
         : Effect.fail(new SessionInheritError({ message: `the alasio this branch was branched from did not fork the session ${volumeId}: ${said}` }))
     ),
   );

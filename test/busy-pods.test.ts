@@ -235,15 +235,13 @@ test("a label the API refuses, or does not answer in time, is logged, and the tu
   assert.deepEqual(logged.map((line) => line.split(":")[0]), ["could not label the pod alasio-sessions/s1 busy", "could not unlabel the pod alasio-sessions/s1 busy"]);
 });
 
-test("a conversation's turns work in its session's pod, or its folder's bayma's under the harness, where the service that runs it is there", () => {
-  const sandbox = { pod: (volumeId: string) => ({ namespace: "alasio-sessions", name: volumeId }) };
+test("a conversation's turns hold its folder's bayma's pod under the harness busy, where the service that runs it is there, and none of a session's, which the gateway holds busy itself", () => {
   const hostBayma = { pod: ({ harness, threadKey }: { harness: string; threadKey: string }) => ({ namespace: "alasio-host", name: `${harness}-${threadKey}` }) };
   const session = { harness: CODEX_HARNESS, workingDirectory: "sessionfs:session-1", threadKey: "telegram:1" } as const;
   const folder = { harness: CLAUDE_HARNESS, workingDirectory: "/home/operator/repo", threadKey: "telegram:1" } as const;
-  assert.deepEqual(workspacePodOf(session, sandbox, hostBayma), { namespace: "alasio-sessions", name: "session-1" });
-  assert.deepEqual(workspacePodOf(folder, sandbox, hostBayma), { namespace: "alasio-host", name: "claude-telegram:1" });
-  assert.equal(workspacePodOf(session, null, hostBayma), null);
-  assert.equal(workspacePodOf(folder, sandbox, null), null);
+  assert.equal(workspacePodOf(session, hostBayma), null);
+  assert.deepEqual(workspacePodOf(folder, hostBayma), { namespace: "alasio-host", name: "claude-telegram:1" });
+  assert.equal(workspacePodOf(folder, null), null);
 });
 
 test("a turn registered holds its pods until it ends, and one not registered, its conversation busy already, holds none", async () => {

@@ -1,6 +1,6 @@
 /**
- * Whole-sandbox snapshots of the sandbox gateway's session workspaces, as alasio's own were
- * (../sandbox/snapshots.ts), of a bound pool pod rather than of a Sandbox: a workspace, of an
+ * Whole-sandbox snapshots of the sandbox gateway's session workspaces, as alasio's own
+ * Sandboxes' were, of a bound pool pod rather than of a Sandbox: a workspace, of an
  * environment's sessions' namespace, released is saved whole by the node agent on its pod's node
  * (../sandbox/node-agents.ts), bayma told first (`bayma sandbox-hook`), which ends it; and the
  * snapshot it was released into is recorded with the workspace (its node agents' record of it,
@@ -176,7 +176,7 @@ export const DEFER_FOR_MS = 15 * 60_000;
  */
 const READINESS_TAINTS: ReadonlySet<string> = new Set(["node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable"]);
 
-/** Whether `toleration` tolerates `taint`, as the scheduler has it (../sandbox/snapshots.ts). */
+/** Whether `toleration` tolerates `taint`, as the scheduler has it. */
 function tolerates(toleration: V1Toleration, taint: { readonly key: string; readonly value?: string; readonly effect: string }): boolean {
   if (toleration.effect && toleration.effect !== taint.effect) return false;
   if (toleration.operator === "Exists") return !toleration.key || toleration.key === taint.key;

@@ -91,7 +91,7 @@ export const CLONE_VARIABLES = ["SOURCE_NAMESPACE", "SOURCE_CLAIM", "DESTINATION
 const Count = said(Schema.Number.check(Schema.isInt({ message: "must be a whole number" }), Schema.isGreaterThan(0, { message: "must be positive" })), "must be a positive whole number");
 
 /**
- * Session sandboxes' whole-sandbox snapshots (../sandbox/snapshots.ts): how long a session
+ * Session sandboxes' whole-sandbox snapshots, as alasio's own Sandboxes had them: how long a session
  * runs no exec and no turn before its Sandbox is snapshotted and released; how often one
  * whose execs run is snapshotted live, running on; the gVisor
  * releases a snapshot is restored under, each by its RuntimeClass, the current one first;
@@ -168,7 +168,7 @@ const optionalProfile = <S extends Schema.Top>(schema: S) =>
  * ALASIO_KUBE_TEMPLATES, checked: a profile the deployment does not render is null; and
  * the sessions' profile before the current one, as `alasio up` carries it forward until
  * their template changes again, which sessions' snapshots may restore onto
- * (../sandbox/snapshots.ts), null where there is none.
+ * (the gateway's, ../gateway/snapshots.ts), null where there is none.
  */
 const KubeTemplates = said(
   Schema.Struct({ sessions: optionalProfile(SessionsProfile), previousSessions: optionalProfile(SessionsProfile), host: optionalProfile(HostProfile) }),

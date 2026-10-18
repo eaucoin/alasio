@@ -1,40 +1,40 @@
 /**
  * Run inside alasio's pod, by node there (inAlasio in harness.ts): makes a session as
- * alasio does, through its own session filesystems and its ServiceAccount's permissions,
- * `create <volumeId> <none|full>`, or forks one, `fork <sourceVolumeId> <volumeId>`.
- * Prints one JSON line of the session made.
- *
- * Its Sandbox is made from what this script, without alasio's telemetry settings, makes
- * of the template, as ./session-bring-up.ts brings sessions up, so either finds the
- * other's sessions on their own template.
+ * alasio does, through its own session filesystems, through the sandbox gateway,
+ * `create <volumeId> <none|full>`, or forks one, `fork <sourceVolumeId> <volumeId>`, or
+ * brings one up as a turn does, `bind <volumeId> <none|full>`. Prints one JSON line of the
+ * session made, or brought up.
  *
  * alasio's modules are imported by their paths in the repository, which inAlasio in
  * harness.ts rewrites to the image's as it pipes this in.
  */
 import { Effect } from "effect";
 
-import { KubeClient } from "../../src/kube/client.ts";
-import { loadKubeTemplates } from "../../src/kube/config.ts";
-import { type NetMode, SessionSandboxes } from "../../src/sandbox/index.ts";
+import { loadAlasioConfig } from "../../src/config.ts";
+import { makeSessionSandboxes, type NetMode } from "../../src/sandbox/index.ts";
 
-/** The session made. */
+/** The session made, or brought up. */
 export interface Made {
   readonly volumeId: string;
   readonly netMode: NetMode;
 }
 
 const [verb, first, second] = process.argv.slice(2);
-if (!first || !second || !((verb === "create" && (second === "none" || second === "full")) || verb === "fork")) {
-  throw new Error("usage: session-volumes.ts create <volumeId> <none|full> | fork <sourceVolumeId> <volumeId>");
+const mode = (named: string | undefined): NetMode | null => (named === "none" || named === "full" ? named : null);
+if (!first || !second || !(((verb === "create" || verb === "bind") && mode(second)) || verb === "fork")) {
+  throw new Error("usage: session-volumes.ts create <volumeId> <none|full> | fork <sourceVolumeId> <volumeId> | bind <volumeId> <none|full>");
 }
 
+const { sessionsGateway: gateway } = loadAlasioConfig();
+if (!gateway) throw new Error("the installation gives alasio no sandbox gateway");
+// The internet alasio records of each session: the one it is told of here, none of a fork's source unless told.
+const sessions = makeSessionSandboxes({ gateway, stateDir: "/tmp/volumes", netModeOf: () => Effect.succeed(mode(second)) });
+
 const made = await Effect.runPromise(Effect.gen(function*() {
-  const { sessions } = yield* loadKubeTemplates;
-  if (!sessions) return yield* Effect.die(new Error("the installation gives no sessions template"));
-  return yield* Effect.gen(function*() {
-    const { volumes } = yield* SessionSandboxes;
-    const done: Made = verb === "create" ? yield* volumes.create(first, second === "full" ? "full" : "none") : yield* volumes.fork(first, second);
-    return done;
-  }).pipe(Effect.provide(SessionSandboxes.layer({ profile: sessions, stateDir: "/tmp/volumes", env: {} })));
-}).pipe(Effect.scoped, Effect.provide(KubeClient.layer)));
+  if (verb === "create") return yield* sessions.volumes.create(first, mode(second) ?? "none");
+  if (verb === "fork") return yield* sessions.volumes.fork(first, second);
+  yield* sessions.ensureSession(first);
+  const done: Made = { volumeId: first, netMode: mode(second) ?? "none" };
+  return done;
+}));
 console.log(JSON.stringify(made));

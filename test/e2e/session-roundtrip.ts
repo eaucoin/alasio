@@ -1,9 +1,10 @@
 /**
  * Run inside alasio's pod, by node there, with a session's volume id (inAlasio in
- * alasio.test.ts): drives one session through alasio's own Kubernetes driver and its
- * ServiceAccount's permissions. bayma answers over MCP with the session's token, writes
- * a file in the workspace, which alasio reads back through exec; the session is
- * suspended, resumed, and the file is still there. Prints one JSON line of what it saw.
+ * alasio.test.ts): drives one session through alasio's own session filesystems, through the
+ * sandbox gateway, by alasio's environment's key to it. bayma answers over MCP through the
+ * gateway, writes a file in the workspace, which alasio reads back through the gateway, and
+ * nothing outside the session's files; the session is released, its file still read while it
+ * is bound to no pod, and brought up again with it. Prints one JSON line of what it saw.
  *
  * alasio's modules are imported by their paths in the repository, which inAlasio in
  * alasio.test.ts rewrites to the image's as it pipes this in.
@@ -13,19 +14,12 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult, ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 
-import { Effect, Schedule } from "effect";
+import { Effect } from "effect";
 
-import { KubeClient } from "../../src/kube/client.ts";
-import { loadKubeTemplates, type SessionsProfile } from "../../src/kube/config.ts";
-import {
-  type BaymaEndpoint,
-  makeSandboxes,
-  POD_TEMPLATE_ANNOTATION,
-  SANDBOX_API_VERSION,
-  SANDBOX_KIND,
-  type Sandbox,
-} from "../../src/kube/sandboxes.ts";
-import { SessionSandboxes } from "../../src/sandbox/index.ts";
+import { loadAlasioConfig } from "../../src/config.ts";
+import type { BaymaEndpoint } from "../../src/kube/sandboxes.ts";
+import { makeGatewayWorkspaces } from "../../src/sandbox/gateway-client.ts";
+import { makeSessionSandboxes } from "../../src/sandbox/index.ts";
 
 /** What bayma's session.create answers, as far as the end-to-end scripts read it. */
 export interface BaymaSessionCreated {
@@ -46,14 +40,9 @@ export interface RoundtripSeen {
   exec: string;
   read?: string | undefined;
   missing?: string | undefined;
-  outside: string;
-  suspendedPod: "still there" | "gone";
-  whileSuspended?: string | undefined;
-  resumeMs: number;
-  afterResume?: string | undefined;
-  execAfterResume?: string | undefined;
-  podReplaced: boolean;
-  execAfterMove?: string | undefined;
+  outside?: string | undefined;
+  whileReleased?: string | undefined;
+  execAfterBind?: string | undefined;
 }
 
 const volumeId = process.argv[2];
@@ -80,58 +69,28 @@ async function exec(bayma: BaymaEndpoint, code: string): Promise<BaymaExecResult
   }
 }
 
-/** The round trip, through alasio's session filesystems on the `sessions` profile. */
-const roundtrip = (profile: SessionsProfile) => Effect.gen(function*() {
-  const sessions = yield* SessionSandboxes;
-  const kube = yield* KubeClient;
+const { sessionsGateway: gateway } = loadAlasioConfig();
+if (!gateway) throw new Error("the installation gives alasio no sandbox gateway");
+const workspaces = makeGatewayWorkspaces(gateway);
+// As alasio records it: a session made with no internet.
+const sessions = makeSessionSandboxes({ gateway, stateDir: "/tmp/roundtrip", netModeOf: () => Effect.succeed("none"), workspaces });
+
+const seen = await Effect.runPromise(Effect.gen(function*() {
   const seen: Partial<RoundtripSeen> = {};
   const read = (path: string, maxBytes: number) => sessions.readFile(volumeId, path, maxBytes);
-
-  // Brought up as alasio made it, which this script, without alasio's telemetry settings,
-  // would not make it: from the Sandbox as it is, whose pod template is its own.
-  const sandboxes = yield* makeSandboxes({ namespace: profile.namespace, port: profile.port });
-  // A Sandbox, as the API server returns one.
-  const made = (yield* kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, volumeId)) as Sandbox | null;
-  if (!made) return yield* Effect.die(new Error(`alasio made no Sandbox for ${volumeId}`));
-  const bringUp = sandboxes.ensure(volumeId, () => made);
-
-  let bayma = yield* bringUp;
+  const { bayma } = yield* sessions.ensureSession(volumeId);
   const wrote = yield* Effect.promise(() => exec(bayma, 'await Bun.write("/workspace/out/hello.txt", "hello from " + require("os").release()); "written"'));
   seen.exec = wrote.result_text || JSON.stringify(wrote).slice(0, 300);
   seen.read = (yield* read("out/hello.txt", 1024)).bytes?.toString("utf8");
   seen.missing = (yield* read("out/nope.txt", 1024)).note;
-  seen.outside = (yield* read("/etc/passwd", 4096)).bytes ? "read /etc/passwd of the sandbox, not the host" : "refused";
-
-  yield* sandboxes.suspend(volumeId);
-  // The pod goes within a minute of the suspension.
-  const pod = yield* kube.read("v1", "Pod", profile.namespace, volumeId).pipe(
-    Effect.repeat({ schedule: Schedule.spaced("1 second"), times: 59, while: (pod) => pod !== null }),
-  );
-  seen.suspendedPod = pod ? "still there" : "gone";
-  seen.whileSuspended = (yield* read("out/hello.txt", 1024)).note;
-  const resumedAt = Date.now();
-  bayma = yield* bringUp;
-  seen.resumeMs = Date.now() - resumedAt;
-  seen.afterResume = (yield* read("out/hello.txt", 1024)).bytes?.toString("utf8");
-  const again = yield* Effect.promise(() => exec(bayma, 'require("fs").readFileSync("/workspace/out/hello.txt", "utf8")'));
-  seen.execAfterResume = again.result_text;
-
-  // Recorded as of another pod template, as after an upgrade, which alasio moves onto
-  // the current one as it brings it up: its pod is made anew, and its files are kept.
-  const currentPod = kube.read("v1", "Pod", profile.namespace, volumeId);
-  const podBefore = yield* currentPod;
-  yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, volumeId, { metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: "another" } } });
-  bayma = yield* sandboxes.ensure(volumeId, () => made);
-  const podAfter = yield* currentPod;
-  seen.podReplaced = !!podBefore?.metadata?.uid && !!podAfter?.metadata?.uid && podBefore.metadata.uid !== podAfter.metadata.uid;
-  const afterMove = yield* Effect.promise(() => exec(bayma, 'require("fs").readFileSync("/workspace/out/hello.txt", "utf8")'));
-  seen.execAfterMove = afterMove.result_text;
+  seen.outside = (yield* read("/etc/passwd", 4096)).note;
+  // Released: its pod gone, its files read all the same, through the gateway's node agents.
+  yield* workspaces.release(volumeId, "none");
+  seen.whileReleased = (yield* read("out/hello.txt", 1024)).bytes?.toString("utf8");
+  // Brought up again, by a pod of its own, with them.
+  const again = yield* sessions.ensureSession(volumeId);
+  const after = yield* Effect.promise(() => exec(again.bayma, 'require("fs").readFileSync("/workspace/out/hello.txt", "utf8")'));
+  seen.execAfterBind = after.result_text;
   return seen;
-});
-
-const seen = await Effect.runPromise(Effect.gen(function*() {
-  const { sessions } = yield* loadKubeTemplates;
-  if (!sessions) return yield* Effect.die(new Error("the installation gives no sessions template"));
-  return yield* roundtrip(sessions).pipe(Effect.provide(SessionSandboxes.layer({ profile: sessions, stateDir: "/tmp/roundtrip", env: {} })));
-}).pipe(Effect.scoped, Effect.provide(KubeClient.layer)));
+}));
 console.log(JSON.stringify(seen));

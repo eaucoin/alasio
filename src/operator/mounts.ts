@@ -22,7 +22,7 @@ import { folderRefusedOnBranch, harnessLabelOf, isHarnessName } from "../harness
 import type { HarnessName } from "../harness/names.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
-import { type NetMode, type SessionError, type SessionForkError, SessionSandboxes } from "../sandbox/index.ts";
+import { type NetMode, type SessionError, SessionSandboxes } from "../sandbox/index.ts";
 import { isValidVolumeId, newVolumeId } from "../sandbox/names.ts";
 import { withLogScope } from "../shared/log.ts";
 import { isSessionFs, parseWorkspace, sessionFsWorkspace } from "../workspace/kind.ts";
@@ -65,7 +65,7 @@ export class WorkspaceFolderError extends Schema.TaggedError<WorkspaceFolderErro
 }
 
 /** How changing a conversation's folder fails. */
-export type WorkspaceChangeError = MountRefused | WorkspaceFolderError | SessionError | SessionForkError;
+export type WorkspaceChangeError = MountRefused | WorkspaceFolderError | SessionError;
 
 /** The scope these lines have always been logged in, kept for whatever reads alasio's logs. */
 const LOG_SCOPE = "codex-turn-controller";
@@ -101,7 +101,7 @@ export class Mounts extends Context.Service<Mounts, {
    * busy until it is (ActiveTurns' hold), so no turn starts under the clone, and what was
    * asked of them meanwhile runs after.
    */
-  readonly forkSessionWorkspace: (conversationId: string) => Effect.Effect<WorkspaceChange, MountRefused | SessionError | SessionForkError | StoreError>;
+  readonly forkSessionWorkspace: (conversationId: string) => Effect.Effect<WorkspaceChange, MountRefused | SessionError | StoreError>;
   /**
    * Deletes the session filesystems a failure or a crash left unmade: those recorded but
    * not made, and forks' Sandboxes no record made. As alasio starts, before any is made.
@@ -133,7 +133,7 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
     }
   });
 
-  /** Deletes the session filesystem `volumeId`, and its record once it is gone. */
+  /** Deletes the session filesystem `volumeId`, and its record once the gateway has, as alasio's store is what says which conversation forked what. */
   const discard = (volumeId: string): Effect.Effect<void> =>
     Effect.gen(function*() {
       if (sandbox) yield* sandbox.volumes.destroy(volumeId);
@@ -245,16 +245,21 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
       );
       return { ...change, forkedFrom: source.volumeId };
     }, withLogScope(LOG_SCOPE)),
+    // What the gateway holds and alasio's store records, set against each other and said where they differ: nothing is deleted.
     reconcileSessionWorkspaces: Effect.gen(function*() {
       if (!sandbox) return;
       const workspaces = yield* store.listSessionWorkspaces;
-      const unmade = workspaces.filter(({ madeAt }) => madeAt === null).map(({ volumeId }) => volumeId);
-      const made = new Set(workspaces.filter(({ madeAt }) => madeAt !== null).map(({ volumeId }) => volumeId));
-      const forks = yield* sandbox.volumes.forks.pipe(
-        Effect.catch((error) => Effect.logWarning(`could not list the forks' Sandboxes: ${error.message}`).pipe(Effect.as([]))),
-      );
-      const orphans = forks.filter((volumeId) => !made.has(volumeId) && !unmade.includes(volumeId));
-      for (const volumeId of [...unmade, ...orphans]) yield* discard(volumeId);
+      const listed = yield* sandbox.volumes.list.pipe(Effect.option);
+      if (Option.isNone(listed)) return yield* Effect.logWarning("could not list the gateway's session workspaces, to set them against alasio's records");
+      const there = new Set(listed.value);
+      const recorded = new Set(workspaces.map(({ volumeId }) => volumeId));
+      for (const { volumeId, madeAt } of workspaces) {
+        if (madeAt === null) yield* Effect.logWarning(`workspace.unmade.sessionfs volume=${volumeId}: its making never ended; it is left as it is`);
+        else if (!there.has(volumeId)) yield* Effect.logWarning(`workspace.missing.sessionfs volume=${volumeId}: recorded as made, and the gateway holds none of it`);
+      }
+      for (const volumeId of there) {
+        if (!recorded.has(volumeId)) yield* Effect.logWarning(`workspace.orphan.sessionfs volume=${volumeId}: the gateway holds it, and alasio records none of it; it is left as it is`);
+      }
     }).pipe(withLogScope(LOG_SCOPE)),
   });
 });

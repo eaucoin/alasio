@@ -34,10 +34,11 @@ import { componentName, NAMESPACE, neonName } from "../../cli/src/manifests/comm
 import { CSI_DRIVER, JUICEFS_PODS_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "../../cli/src/manifests/juicefs-csi.ts";
 import { FILER, FILER_STORE, FILER_STORE_USERS, GATEWAY, MASTER, VOLUME_SERVER } from "../../cli/src/manifests/object-store.ts";
 import { JUICEFS_ADMIN, VALKEY, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/workspace-storage.ts";
+import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
 import type { Sandbox } from "../../src/kube/sandboxes.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
+import { sessionKey } from "../../src/sandbox/names.ts";
 import { AGENTS, inAlasio, inSession, kube, nodeAgents, onNode, type Ran, ref, runCronJob, SESSIONS, tcp } from "./harness.ts";
-import type { BroughtUp } from "./session-bring-up.ts";
 import type { Made } from "./session-volumes.ts";
 
 /** Where the installation's JuiceFS driver runs, and makes its mount pods: its default namespace. */
@@ -202,8 +203,18 @@ async function checkMount(volumeId: string): Promise<Ran> {
 /** The digest of the fixture, as the session sees it. */
 const fixtureDigest = async (volumeId: string) => (await inWorkspaceOk(volumeId, `cd ${FIXTURE} && timeout -k 5 120 sh -c '${DIGEST}'`)).trim();
 
-/** Brings the session up as a turn does (./session-bring-up.ts): the pod it runs in then. */
-const bringUp = (volumeId: string) => inAlasio<BroughtUp>("./session-bring-up.ts", volumeId);
+/** The pod the session runs in once it is up. */
+interface BroughtUp {
+  readonly uid: string | undefined;
+  readonly node: string | undefined;
+}
+
+/** Brings the session up as a turn does (./session-volumes.ts bind), through the gateway: the pod it is bound to then. */
+async function bringUp(volumeId: string, netMode: NetMode = "none"): Promise<BroughtUp> {
+  await inAlasio<Made>("./session-volumes.ts", "bind", volumeId, netMode);
+  const [pod] = (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(volumeId))}` })).filter(({ metadata }) => !metadata?.deletionTimestamp);
+  return { uid: pod?.metadata?.uid, node: pod?.spec?.nodeName };
+}
 
 const isReady = (pod: V1Pod | null | undefined) => pod?.status?.conditions?.some(({ type, status }) => type === "Ready" && status === "True") ?? false;
 
@@ -599,7 +610,7 @@ export function workspaceStorage(): void {
         await kube.patch(sandbox, { spec: { podTemplate: { spec: { nodeSelector: null } } } });
         await kube.remove(ref("Pod", full, SESSIONS));
         // Its pod ended though alasio did not end it, alasio releases the session into a snapshot
-        // as bayma holds its stop (src/sandbox/snapshots.ts releaseStopped), under the Sandbox's
+        // as bayma holds its stop (src/gateway/snapshots.ts saveStopping), under the Sandbox's
         // lock, which this bring-up, in a process of its own, does not wait for: it is brought
         // up once that pod is gone, from that snapshot, or anew.
         await until(`the pod ${pod.metadata?.uid} of ${full} gone`, async () => ((await kube.get<V1Pod>(ref("Pod", full, SESSIONS)))?.metadata?.uid === pod.metadata?.uid ? undefined : true), 180_000);

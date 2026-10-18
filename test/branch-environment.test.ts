@@ -18,9 +18,9 @@ import { Mounts } from "../src/operator/mounts.ts";
 import { buildWorkspacePanel } from "../src/operator/workspace-control.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { Harnesses } from "../src/harness/index.ts";
-import { KubeApiError } from "../src/kube/client.ts";
 import { Store } from "../src/persistence/store.ts";
-import { SessionForkError, SessionSandboxes } from "../src/sandbox/index.ts";
+import { GatewayError } from "../src/sandbox/gateway-client.ts";
+import { type NetMode, SessionSandboxes } from "../src/sandbox/index.ts";
 import { takeCallbackQuery } from "../src/telegram/callback-handler.ts";
 import { newSchema, run, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
@@ -65,27 +65,26 @@ test("a branch's state, as it first starts, keeps its conversations and loses wh
   assert.equal(await run((await testStore({ schema, branch: "try-again" })).hasOpenPromptJobs(conversationId)), false);
 });
 
-test("an alasio forks a session one of its conversations knows for the branch whose token asks, into the branch's sessions, and none while a turn runs in it", async () => {
+test("an alasio forks a session one of its conversations knows for the branch whose token asks, into the branch's environment through the gateway, saying the internet it was made with, and none while a turn runs in it", async () => {
   const directory = mkdtempSync(join(tmpdir(), "alasio-branch-forks-"));
   const keyFile = join(directory, "fork-key");
   const store = await testStore();
   const conversationId = await run(store.upsertConversation({ chatId: 1001 }));
   await run(store.setWorkingDirectory(conversationId, "sessionfs:fs-abc123"));
   const forked: string[][] = [];
-  let outcome: Effect.Effect<void, KubeApiError | SessionForkError> = Effect.void;
+  let outcome: Effect.Effect<void, GatewayError> = Effect.void;
   const sandboxes = SessionSandboxes.of({
     volumes: {
       create: () => Effect.die("the parent makes no session for a branch"),
-      fork: (source, volumeId, namespace = "alasio-sessions") =>
-        Effect.sync(() => forked.push([source, volumeId, namespace])).pipe(Effect.andThen(outcome), Effect.as({ volumeId, netMode: "none" as const })),
+      fork: (source, volumeId, environment = "main") =>
+        Effect.sync(() => forked.push([source, volumeId, environment])).pipe(Effect.andThen(outcome), Effect.as({ volumeId, netMode: "none" as const })),
       destroy: () => Effect.die("the parent deletes no session for a branch"),
-      forks: Effect.die("the parent lists no fork for a branch"),
+      list: Effect.die("the parent lists no workspace for a branch"),
     },
     harnessDirectory: () => directory,
-    pod: (volumeId: string) => ({ namespace: "alasio-sessions", name: volumeId }),
     ensureSession: () => Effect.die("the parent brings no session up for a branch"),
     readFile: () => Effect.die("the parent reads no file for a branch"),
-    holding: () => Effect.void,
+    writeFile: () => Effect.die("the parent writes no file for a branch"),
   });
   const scope = Effect.runSync(Scope.make());
   try {
@@ -99,7 +98,7 @@ test("an alasio forks a session one of its conversations knows for the branch wh
     const tokenFile = join(directory, "token");
     const asking = (branch: string, volumeId: string) =>
       Effect.runPromiseExit(parentForks({ url: `http://127.0.0.1:${port}`, branch, tokenFile })(volumeId));
-    const refusal = (exit: Exit.Exit<boolean, { readonly message: string }>) => (Exit.isFailure(exit) ? Option.getOrThrow(Exit.findErrorOption(exit)).message : "");
+    const refusal = (exit: Exit.Exit<NetMode | null, { readonly message: string }>) => (Exit.isFailure(exit) ? Option.getOrThrow(Exit.findErrorOption(exit)).message : "");
 
     // No key yet: no branch is let in.
     writeFileSync(tokenFile, forkToken("key", "try"));
@@ -108,20 +107,20 @@ test("an alasio forks a session one of its conversations knows for the branch wh
     assert.match(refusal(await asking("other", "fs-abc123")), /no branch's token/u);
     assert.deepEqual(forked, []);
 
-    assert.deepEqual(await asking("try", "fs-abc123"), Exit.succeed(true));
-    assert.deepEqual(forked, [["fs-abc123", "fs-abc123", "alasio-branch-try-sessions"]]);
+    assert.deepEqual(await asking("try", "fs-abc123"), Exit.succeed("none"));
+    assert.deepEqual(forked, [["fs-abc123", "fs-abc123", "try"]]);
     forked.length = 0;
-    // One the parent never had is not its to give; one it made, which no conversation mounts, is.
-    assert.deepEqual(await asking("try", "fs-zzz999"), Exit.succeed(false));
+    // One the parent never had is not its to give; one it made, which no conversation mounts, is, with the internet it was made with.
+    assert.deepEqual(await asking("try", "fs-zzz999"), Exit.succeed(null));
     await run(store.recordSessionWorkspace({ volumeId: "fs-made01", forkedFrom: null }));
-    assert.deepEqual(await asking("try", "fs-made01"), Exit.succeed(false));
+    assert.deepEqual(await asking("try", "fs-made01"), Exit.succeed(null));
     await run(store.markSessionWorkspaceMade("fs-made01", "full"));
-    assert.deepEqual(await asking("try", "fs-made01"), Exit.succeed(true));
+    assert.deepEqual(await asking("try", "fs-made01"), Exit.succeed("full"));
     // Forked already, by an earlier ask.
-    outcome = Effect.fail(new KubeApiError({ status: 409, cause: new Error("exists") }));
-    assert.deepEqual(await asking("try", "fs-abc123"), Exit.succeed(true));
-    outcome = Effect.fail(new SessionForkError({ message: "the clone of alasio-sessions/data-fs-abc123 failed: BackoffLimitExceeded" }));
-    assert.match(refusal(await asking("try", "fs-abc123")), /did not fork the session fs-abc123: the clone of .* failed: BackoffLimitExceeded$/u);
+    outcome = Effect.fail(new GatewayError({ call: "fork fs-abc123", status: 409, reason: "fs-abc123 is there already" }));
+    assert.deepEqual(await asking("try", "fs-abc123"), Exit.succeed("none"));
+    outcome = Effect.fail(new GatewayError({ call: "fork fs-abc123", status: 502, reason: "its clone failed" }));
+    assert.match(refusal(await asking("try", "fs-abc123")), /did not fork the session fs-abc123: the sandbox gateway did not fork fs-abc123 \(502\): its clone failed$/u);
     outcome = Effect.void;
 
     // While a turn runs in it, which the fork would suspend.
@@ -135,7 +134,7 @@ test("an alasio forks a session one of its conversations knows for the branch wh
     assert.match(refusal(await asking("try", "fs-abc123")), /a turn runs in the session fs-abc123 now/u);
     await Effect.runPromise(Deferred.succeed(turning, undefined));
     await Effect.runPromise(Fiber.join(turn));
-    assert.deepEqual(await asking("try", "fs-abc123"), Exit.succeed(true));
+    assert.deepEqual(await asking("try", "fs-abc123"), Exit.succeed("none"));
 
     // No turn starts while it forks, which would suspend the session under it; what was
     // asked of the conversation meanwhile is run once the fork lets go of it.
@@ -152,7 +151,7 @@ test("an alasio forks a session one of its conversations knows for the branch wh
     } finally {
       await Effect.runPromise(Deferred.succeed(forkEnds, undefined));
     }
-    assert.deepEqual(await asked, Exit.succeed(true));
+    assert.deepEqual(await asked, Exit.succeed("none"));
     assert.equal(await Effect.runPromise(busy), false);
     assert.deepEqual(scheduled, [conversationId]);
     outcome = Effect.void;
@@ -186,12 +185,11 @@ test("a branch environment mounts and makes no folder, forks no workspace itself
   const conversationId = await run(store.upsertConversation({ chatId: 1001 }));
   await run(store.setWorkingDirectory(conversationId, "sessionfs:fs-abc123"));
   const sandbox = SessionSandboxes.of({
-    volumes: { create: () => Effect.die("no session is made"), fork: () => Effect.die("no session is forked"), destroy: () => Effect.die("no session is deleted"), forks: Effect.succeed([]) },
+    volumes: { create: () => Effect.die("no session is made"), fork: () => Effect.die("no session is forked"), destroy: () => Effect.die("no session is deleted"), list: Effect.succeed([]) },
     harnessDirectory: () => "/nonexistent",
-    pod: (volumeId: string) => ({ namespace: "alasio-sessions", name: volumeId }),
     ensureSession: () => Effect.die("no session is brought up"),
     readFile: () => Effect.die("no file is read"),
-    holding: () => Effect.void,
+    writeFile: () => Effect.die("no file is written"),
   });
   await withServices({ store, branch: "try", sandbox, workspaceRoot: tmpdir() }, async (alasio) => {
     const refusal = (change: (mounts: Mounts["Service"]) => Effect.Effect<unknown, { readonly message: string }>) =>

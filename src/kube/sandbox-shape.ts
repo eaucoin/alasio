@@ -62,7 +62,7 @@ export function sanitizePathToken(value: string): string {
 
 /**
  * What a session's pod template carries of its whole-sandbox snapshots
- * (../sandbox/snapshots.ts): the hash of the template it was made from, which its
+ * (../gateway/snapshots.ts): the hash of the template it was made from, which its
  * snapshots record; the CPU features its sandbox is held to; and, of a pod restored from
  * a snapshot, the image it is restored from, on its node under the snapshot cache, left
  * paused until its node's agent resumes it, which its readiness gate waits for.

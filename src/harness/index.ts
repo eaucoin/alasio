@@ -284,17 +284,15 @@ export class Harnesses extends Context.Service<Harnesses, {
 }
 
 /**
- * The pod a conversation's turns under `harness` in `workingDirectory` work in: its
- * session's Sandbox's, or its folder's bayma's under the harness; none where the service
- * that runs it is not there.
+ * The pod a conversation's turns under `harness` in `workingDirectory` work in, which they hold
+ * busy: its folder's bayma's under the harness; none for a session filesystem, whose pod the
+ * sandbox gateway holds busy as it binds it, nor where the service that runs it is not there.
  */
 export function workspacePodOf(
   { harness, workingDirectory, threadKey }: { readonly harness: HarnessName; readonly workingDirectory: string; readonly threadKey: string },
-  sandbox: Pick<SessionSandboxes["Service"], "pod"> | null,
   hostBayma: Pick<HostBayma["Service"], "pod"> | null,
 ): PodRef | null {
-  const workspace = parseWorkspace(workingDirectory);
-  if (workspace?.kind === "sessionfs") return sandbox?.pod(workspace.volumeId) ?? null;
+  if (parseWorkspace(workingDirectory)?.kind === "sessionfs") return null;
   return hostBayma?.pod({ harness, threadKey }) ?? null;
 }
 
@@ -313,7 +311,7 @@ const makeHarnesses = Effect.fnUntraced(function*({
   const adapters = new Map<string, Harness>();
 
   const make = (name: HarnessName, workingDirectory: string): Effect.Effect<Harness, SessionFilesystemsDisabled> => {
-    const forDirectory = { ...harnessOptions, workingDirectory, workspacePod: (threadKey: string) => workspacePodOf({ harness: name, workingDirectory, threadKey }, sandbox, hostBayma) };
+    const forDirectory = { ...harnessOptions, workingDirectory, workspacePod: (threadKey: string) => workspacePodOf({ harness: name, workingDirectory, threadKey }, hostBayma) };
     const made: Effect.Effect<Harness, SessionFilesystemsDisabled, CodexAppServer | ActiveTurns | Scope.Scope> = name === CODEX_HARNESS
       ? makeCodexHarness({ ...forDirectory, sessionFsCodex })
       : makeClaudeHarness(forDirectory);

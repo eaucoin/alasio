@@ -236,8 +236,6 @@ const makeTurns = Effect.fnUntraced(function*() {
        */
       const recordJob = (record: (jobId: string) => Effect.Effect<void, StoreError>): Effect.Effect<void> =>
         jobId ? Effect.orDie(record(jobId)) : Effect.void;
-      // Its session is not released under it, however long it thinks between tool calls.
-      if (workspace?.kind === "sessionfs" && sandbox) yield* sandbox.holding(workspace.volumeId);
       const posted = yield* status.statusUpdates({ chatId, conversationId, epoch, harnessName: harness.displayName });
 
       /** Leaves the turn, as alasio stops, for after the restart. */

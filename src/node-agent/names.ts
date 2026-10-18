@@ -203,7 +203,7 @@ export const OPERATION_LIMIT_SECONDS = 15 * 60;
 /**
  * How long a restore from the bucket may take from its prepare to its resume, which its token
  * lasts unless resumed before (./store-proxy.ts): the longest it takes, alasio waiting 3
- * minutes for its pod to run (POD_RUNNING_TIMEOUT in src/sandbox/snapshots.ts), then for the
+ * minutes for its pod to run (POD_RUNNING_TIMEOUT_MS in src/gateway/snapshots.ts), then for the
  * agent's resume, and a margin.
  */
 export const RESTORE_PREPARED_FOR_SECONDS = 5 * 60;

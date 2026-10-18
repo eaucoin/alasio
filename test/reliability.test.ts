@@ -289,6 +289,7 @@ test("alasio's services wire the durable outbox into final response delivery", a
       defaultHarness: null,
       branch: null,
       branchForkKeyFile: null,
+      sessionsGateway: null,
       // No update comes: the stand-in is refused as Telegram is.
       updates: stubUpdates("http://127.0.0.1:9"),
     };
