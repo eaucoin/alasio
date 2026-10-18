@@ -1817,9 +1817,16 @@ const metricRows = (condition: string) =>
  * Waits until `sql`, a count as `n`, counts some of the lake's rows, as the collector
  * sends them within seconds, and the loader loads transcripts within its interval. Should
  * none arrive, the failure says what each of `parts` of what `sql` joins answers then as
- * `n`, a count or what it lists, so one failure names the part that is missing.
+ * `n`, a count or what it lists, so one failure names the part that is missing, and what
+ * each of `elsewhere` says of what is not in the lake, as Neon's rows.
  */
-async function untilInLake(what: string, sql: string, timeoutMs = 240_000, parts: Readonly<Record<string, string>> = {}): Promise<void> {
+async function untilInLake(
+  what: string,
+  sql: string,
+  timeoutMs = 240_000,
+  parts: Readonly<Record<string, string>> = {},
+  elsewhere: Readonly<Record<string, () => Promise<string>>> = {},
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   const answer = (query: string) => lakeQuery(query).then(([row]) => row?.["n"] ?? 0, (error: unknown) => error);
   const said = (answered: unknown) => (answered instanceof Error ? answered.message : typeof answered === "string" && Number.isNaN(Number(answered)) ? answered : `${String(answered)} rows`);
@@ -1831,7 +1838,8 @@ async function untilInLake(what: string, sql: string, timeoutMs = 240_000, parts
     await sleep(5000);
   }
   const counted = await Promise.all(Object.entries(parts).map(async ([part, query]) => `\n  ${part}: ${said(await answer(query))}`));
-  assert.fail(`no ${what} arrived in the lake: ${said(last)}${counted.join("")}`);
+  const found = await Promise.all(Object.entries(elsewhere).map(async ([part, ask]) => `\n  ${part}: ${await ask().catch((error: unknown) => (error instanceof Error ? error.message : String(error))) || "none"}`));
+  assert.fail(`no ${what} arrived in the lake: ${said(last)}${counted.join("")}${found.join("")}`);
 }
 
 /** Waits until the stand-in backend has received an export of `signal` that contains `needle`. */
@@ -1968,6 +1976,19 @@ if (inShard("telemetry")) {
             where turn.SpanName = 'alasio.turn' and codex.completed_at is not null`,
           "the threads alasio's turns name": "select coalesce(string_agg(distinct SpanAttributes['alasio.session.id'], ', '), 'none') as n from otel.traces where SpanName = 'alasio.turn'",
           "the transcripts' threads": "select coalesce(string_agg(distinct thread_id, ', '), 'none') as n from codex.turns",
+          // Whether the loader loaded the rollout's bytes, and what each of its loads said.
+          "the rollout files the lake has, with the bytes it loaded of each":
+            "select coalesce(string_agg(home || '/' || name || ' ' || loaded_bytes || ' of ' || size, ', '), 'none') as n from codex.files",
+          "the loader's loads": `select coalesce(string_agg(strftime(Timestamp, '%H:%M:%S') || ' ' || Body || ' ' || cast(LogAttributes as varchar), '; ' order by Timestamp), 'none') as n
+            from otel.logs where ServiceName = 'alasio-lake-loader'`,
+          "alasio's wakes of the loader and its rollouts' mirroring": `select coalesce(string_agg(strftime(Timestamp, '%H:%M:%S') || ' ' || Body, '; ' order by Timestamp), 'none') as n
+            from otel.logs where ServiceName = 'alasio' and (Body ilike '%wake%' or Body ilike '%rollout%' or Body ilike '%mirror%')`,
+        },
+        {
+          // Whether alasio mirrored the rollout to Neon at all, and when, in either Codex home's store.
+          "the rollouts Neon keeps": () =>
+            onDatabase(NAMESPACE, `select string_agg(home || name || ' ' || size || ' bytes', ', ') from (
+              select 'folder/' as home, name, size from codex_sessions.rollouts union all select 'sessionfs/', name, size from codex_sessionfs_sessions.rollouts) kept`),
         },
       );
     });
