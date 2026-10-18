@@ -366,11 +366,11 @@ test("the proxy serves a restore's token through its socket too, only root's, by
     await withProxy(() => Effect.sync(() => assert.equal((statSync(socket).mode & 0o777).toString(8), "600")), { socket });
   }));
 
-test("a proxy that starts again takes back from its tokens file the tokens of the restores before it, but those ended or revoked; one whose file cannot be read takes none, says so, and starts", () =>
+test("a proxy that starts again takes back from its tokens file the tokens of the restores before it, a resumed one whose window ended while it was away among them, but those revoked; one whose file cannot be read takes none, says so, and starts", () =>
   withDirectory(async (directory) => {
     const tokensFile = join(directory, "node-agent", "tokens.json");
     const status = (proxy: StoreProxy, token: StoreToken) => Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token })).pipe(Effect.map(refusal));
-    const [resumed, prepared, ended, revoked] = await withProxy(({ proxy }) =>
+    const [resumed, prepared, lapsed, revoked] = await withProxy(({ proxy }) =>
       Effect.gen(function*() {
         const tokens = [minted(proxy, "main/fs-a", "socket"), minted(proxy, "main/fs-b", "socket"), minted(proxy, "main/fs-c"), minted(proxy, "main/fs-d", "socket")] as const;
         proxy.resumed("main/fs-a", 60_000);
@@ -381,13 +381,14 @@ test("a proxy that starts again takes back from its tokens file the tokens of th
       }), { tokensFile });
     await withProxy(({ proxy }) =>
       Effect.gen(function*() {
-        // Kept again as it mints one, those ended no more among them.
+        // Kept again as it mints one, the one revoked no more among them.
         minted(proxy, "main/fs-e", "socket");
         const kept = JSON.parse(readFileSync(tokensFile, "utf8")) as { tokens: { holder: string }[] };
-        assert.deepEqual(kept.tokens.map(({ holder }) => holder).sort(), ["main/fs-a", "main/fs-b", "main/fs-e"]);
+        assert.deepEqual(kept.tokens.map(({ holder }) => holder).sort(), ["main/fs-a", "main/fs-b", "main/fs-c", "main/fs-e"]);
         assert.equal(yield* status(proxy, resumed), "200 ");
         assert.equal(yield* status(proxy, prepared), "200 ");
-        assert.equal(yield* status(proxy, ended), "403 AccessDenied");
+        // Its window ended while no agent ran, which its restore could not ask of.
+        assert.equal(yield* status(proxy, lapsed), "200 ");
         assert.equal(yield* status(proxy, revoked), "403 AccessDenied");
         // Its holder's still: minted anew, the one before reads nothing.
         minted(proxy, "main/fs-a", "socket");
@@ -404,6 +405,39 @@ test("a proxy that starts again takes back from its tokens file the tokens of th
       assert.equal(read, "403 AccessDenied");
       assert.ok(logged.some((line) => line.startsWith("Error ") && line.includes(`cannot read back the tokens of the restores reading the snapshots bucket through it, ${tokensFile}`)), logged.join("\n"));
     }
+  }));
+
+test("a resumed token read back by a proxy that starts again lasts a window from its start, however long it was away, a window later ends once its restore asks no more, and past its ceiling is not taken back", () =>
+  withDirectory(async (directory) => {
+    const tokensFile = join(directory, "node-agent", "tokens.json");
+    const status = (proxy: StoreProxy, token: StoreToken) => Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token })).pipe(Effect.map(refusal));
+    const windows = { tokensFile, askedWindowMs: 200, keptEveryMs: 0 };
+    const [away, capped] = await withProxy(({ proxy }) =>
+      Effect.gen(function*() {
+        const away = minted(proxy, "main/fs-a", "socket");
+        const capped = minted(proxy, "main/fs-b", "socket");
+        proxy.resumed("main/fs-a", 100);
+        proxy.resumed("main/fs-b", 100);
+        assert.equal(yield* status(proxy, away), "200 ");
+        return [away, capped] as const;
+      }), { ...windows, resumedCeilingMs: 60_000 });
+    // Away for ten times its window, as an agent down for twenty minutes is for two.
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await withProxy(({ proxy }) =>
+      Effect.gen(function*() {
+        assert.equal(yield* status(proxy, away), "200 ");
+        // Asked of no more: a window later, it ends.
+        yield* sleep(400);
+        assert.equal(yield* status(proxy, away), "403 AccessDenied");
+      }), { ...windows, resumedCeilingMs: 60_000 });
+    // Past its ceiling, as an agent away longer than a restore's ceiling: refused.
+    const file = JSON.parse(readFileSync(tokensFile, "utf8")) as { tokens: { holder: string; ceiling: number }[] };
+    for (const token of file.tokens) if (token.holder === "main/fs-b") token.ceiling = Date.now() - 1;
+    writeFileSync(tokensFile, JSON.stringify(file));
+    await withProxy(({ proxy }) =>
+      Effect.gen(function*() {
+        assert.equal(yield* status(proxy, capped), "403 AccessDenied");
+      }), windows);
   }));
 
 test("a proxy that drains waits on no restore through its socket, which waits for the agent that comes back, however many bytes of its pages it has yet to be served; only on those over TCP, until they have been", () =>

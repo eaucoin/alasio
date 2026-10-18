@@ -42,13 +42,16 @@
  * answer cut short counting what it gave, as the gofer keeps those bytes and asks only for
  * the rest. One whose bucket is away keeps asking, and so keeps its token and the drain,
  * until the agent's grace ends it (./names.ts nodeAgentStopSeconds). One through the socket
- * waits instead for the agent that comes back, at the same
- * path, its reads retried as long as its sandbox runs: the tokens are kept, where told, in a
- * file on the node's tmpfs (tokensFile), which an agent that starts again reads back, those
- * that have ended dropped. The time a token's requests lengthened is kept within
- * KEPT_EVERY_MS of them, so that one taken back has at least ASKED_WINDOW_MS less
- * KEPT_EVERY_MS left past its restore's last request. A file that cannot be read gives
- * none, said loudly, and stops nothing.
+ * waits instead for the agent that comes back, at the same path, its reads retried as long as
+ * its sandbox runs: the tokens are kept, where told, in a file on the node's tmpfs
+ * (tokensFile), which an agent that starts again reads back. A restore cannot ask while its
+ * agent is away, so a resumed token's window counts from its restore's last request or the
+ * agent's start, whichever is later: one read back within its ceiling lasts ASKED_WINDOW_MS
+ * from the start at least, however long the agent was away; one not resumed yet, and one
+ * past its ceiling, are dropped once ended. The time a token's requests lengthened is kept
+ * within KEPT_EVERY_MS of them. A file that cannot be read gives none, said loudly, and stops
+ * nothing. What is left: an agent away longer than a restore's RESUMED_CEILING_MS from its
+ * resume ends that restore, whose reads are then refused, as no token outlives its ceiling.
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -258,11 +261,12 @@ const TokensFile = Schema.fromJsonString(Schema.Struct({
 }));
 
 /**
- * The tokens `file` keeps that have not ended by `now`, as an agent that starts again takes
- * them back, none of their requests under way; none where there is no file, or, with `why`,
- * where it cannot be read.
+ * The tokens `file` keeps, as an agent that starts again at `now` takes them back, none of
+ * their requests under way: each resumed and within its ceiling, lasting `askedWindowMs`
+ * from `now` at least, as its restore could not ask while the agent was away; and each other
+ * that has not ended. None where there is no file, or, with `why`, where it cannot be read.
  */
-function tokensKept(file: string, now: number): { readonly tokens: ReadonlyMap<string, HeldToken>; readonly why?: string } {
+function tokensKept(file: string, now: number, askedWindowMs: number): { readonly tokens: ReadonlyMap<string, HeldToken>; readonly why?: string } {
   let text: string;
   try {
     text = readFileSync(file, "utf8");
@@ -273,7 +277,10 @@ function tokensKept(file: string, now: number): { readonly tokens: ReadonlyMap<s
   const decoded = Schema.decodeUnknownExit(TokensFile)(text);
   if (decoded._tag === "Failure") return { tokens: new Map(), why: Cause.pretty(decoded.cause) };
   return {
-    tokens: new Map(decoded.value.tokens.filter(({ until }) => until > now).map(({ accessKeyId, ...token }) => [accessKeyId, { ...token, under: 0, lastAt: now, expected: null, served: new Map(), servedBytes: 0, servedAll: false }])),
+    tokens: new Map(decoded.value.tokens.flatMap(({ accessKeyId, ...token }) => {
+      const until = token.resumed && now < token.ceiling ? Math.max(token.until, Math.min(token.ceiling, now + askedWindowMs)) : token.until;
+      return until > now ? [[accessKeyId, { ...token, until, under: 0, lastAt: now, expected: null, served: new Map(), servedBytes: 0, servedAll: false }] as const] : [];
+    })),
   };
 }
 
@@ -331,7 +338,7 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
   // What the agent's logger says, from the proxy's plain callbacks.
   const runSync = Effect.runSyncWith(yield* Effect.context<never>());
   if (tokensFile !== undefined) {
-    const kept = tokensKept(tokensFile, Date.now());
+    const kept = tokensKept(tokensFile, Date.now(), askedWindowMs);
     if (kept.why !== undefined) runSync(Effect.logError(`the node agent cannot read back the tokens of the restores reading the snapshots bucket through it, ${tokensFile}: those restores are refused from now (${kept.why})`));
     for (const [accessKeyId, token] of kept.tokens) {
       tokens.set(accessKeyId, token);
