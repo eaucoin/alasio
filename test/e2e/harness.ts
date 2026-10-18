@@ -588,6 +588,9 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       // On one agent, but in the snapshots shard, where a session runs on any node, as it may be restored on another than it was saved on.
       ...(SHARD === "snapshots" ? {} : on("agent-0")),
     },
+    // Three, where the run proves the log a quorum: each node's access applier writes the
+    // credentials through whichever is KRaft's active controller, and its node is ready.
+    ...(AGENTS >= 2 && inShard("telemetry") ? { log: { scaling: { min: 3, max: 3 } } } : {}),
     neon: {
       safekeepers: { storage: { size: "2Gi" }, resources: { requests: { cpu: "20m", memory: "64Mi" } } },
       // Two, where the run proves Neon's storage scaled out: its tenant split across them.
