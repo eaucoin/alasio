@@ -42,7 +42,7 @@ import type { Manifest } from "../../src/node-agent/agent.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER } from "./codex-stand-in.ts";
-import { bindBranchSession, bindInBranch, mainSandboxService, sandboxService, servesBranch } from "./sandbox-service.ts";
+import { bindBranchSession, bindInBranch, mainSandboxService, sandboxService, serviceLogs, servesBranch } from "./sandbox-service.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
 import {
   AGENTS,
@@ -1647,7 +1647,11 @@ if (inShard("snapshots")) {
         assert.ok(said, `the node agent ${agent} did not say, as it stopped, that it waits on the restore reading the bucket through it`);
         t.diagnostic(said);
         await answered;
-        const summed = await repl.sum(big, held);
+        // What the gateway and the node agents said of it, where it cannot be read.
+        const summed = await repl.sum(big, held).catch(async (error: unknown) => {
+          console.error(`# what the sandbox service logged of ${big}:\n${await serviceLogs(big)}`);
+          throw error;
+        });
         assert.equal(summed.sha256, sha256);
         assert.match(summed.notice ?? "", CAME_BACK_WHOLE);
       } finally {
