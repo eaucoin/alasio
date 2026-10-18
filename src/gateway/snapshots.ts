@@ -647,6 +647,10 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             },
             spec: {
               ...spec,
+              // Never started again: its container, ended by its save, would be restored once more from the image it was
+              // restored from, which its workspace's files have moved on from, and a sandbox restored paused that fails holds
+              // its pod from being deleted.
+              restartPolicy: "Never",
               runtimeClassName: kept.runtimeClassName,
               readinessGates: [...(base.spec?.readinessGates ?? []), { conditionType: RESUMED_CONDITION }],
               affinity: { ...base.spec?.affinity, nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: [node] }] }] } } },

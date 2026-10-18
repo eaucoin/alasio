@@ -716,6 +716,8 @@ test("a workspace released into its snapshot is restored from it as it is next b
       }
     })();
     const name = restored.metadata?.name ?? "";
+    // Never started again, as its container's start restores it from its snapshot.
+    assert.equal(restored.spec?.restartPolicy, "Never");
     // Its workspace attached into its directory on the node it is restored on, made for it, before the pod was made.
     assert.deepEqual(recorded.attached.map(({ node, pod, made }) => ({ node, pod, made })), [{ node: "node-a", pod: name, made: true }]);
     assert.deepEqual(recorded.asked, [`prepare node-a socket retrying pages`]);

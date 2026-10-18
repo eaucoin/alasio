@@ -381,7 +381,7 @@ const OWN_DIRECTORY = new Check((expression) => `${expression} == ${JSON.stringi
  * A restore's pod of the pool template `template`, as the gateway makes it (src/gateway/snapshots.ts)
  * and the API server stores it: its template's, bound from the first, never free, its sandbox
  * restored paused from the image its node's agent prepared, under one of `runtimeClasses`, on that
- * node, its own directory there its volume's, and ready once resumed.
+ * node, its own directory there its volume's, ready once resumed, and never started again.
  */
 function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClasses: readonly string[]): string {
   // Its own directory named by its volume's path, its own name's (ownDirectory).
@@ -396,6 +396,7 @@ function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClass
     spec: {
       ...owned,
       volumes,
+      restartPolicy: "Never",
       runtimeClassName: oneOf(...runtimeClasses),
       readinessGates: [...((template.spec?.readinessGates ?? []) as unknown as Pinned[]), { conditionType: RESUMED_CONDITION }],
       affinity: restoredOn,

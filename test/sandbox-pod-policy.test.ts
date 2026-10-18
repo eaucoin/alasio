@@ -218,6 +218,7 @@ function restorePod(workspace = "fs-abc123", change: (pod: { metadata: Record<st
     },
     spec: {
       ...own,
+      restartPolicy: "Never",
       runtimeClassName: gvisorRuntimeClass(release ?? ""),
       readinessGates: [{ conditionType: "alasio.dev/resumed" }],
       affinity: { nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["node-a"] }] }] } } },
@@ -227,7 +228,7 @@ function restorePod(workspace = "fs-abc123", change: (pod: { metadata: Record<st
   return pod as V1Pod;
 }
 
-test("a restore's pod of a pool's template is made by the sandbox gateway alone, its image its workspace's, under a release kept, on one node, ready once resumed, and bound from the first", async () => {
+test("a restore's pod of a pool's template is made by the sandbox gateway alone, its image its workspace's, under a release kept, on one node, ready once resumed, never started again, and bound from the first", async () => {
   const made = await madeAs(GATEWAY_USER, restorePod());
   assert.ok("name" in made, JSON.stringify(made));
   const changes: Record<string, (pod: { metadata: Record<string, unknown>; spec: V1PodSpec }) => void> = {
@@ -236,6 +237,7 @@ test("a restore's pod of a pool's template is made by the sandbox gateway alone,
     "another workspace's image": (pod) => void ((pod.metadata["annotations"] as Record<string, string>)["dev.gvisor.internal.restore.host-image-path"] = `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/fs-other/20261017T120000000Z-0000000a`),
     "an image elsewhere": (pod) => void ((pod.metadata["annotations"] as Record<string, string>)["dev.gvisor.internal.restore.host-image-path"] = "/etc/passwd"),
     "never resumed": (pod) => void (pod.spec.readinessGates = []),
+    "started again": (pod) => void (pod.spec.restartPolicy = "Always"),
     "on any node": (pod) => void delete pod.spec.affinity,
     "another image": (pod) => void (pod.spec.containers[0]!.image = "busybox"),
     "an init container": (pod) => void (pod.spec.initContainers = [{ name: "first", image: "busybox", command: ["sh", "-c", "cat /attach/token"] }]),
