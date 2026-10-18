@@ -437,13 +437,15 @@ function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClass
 export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sessionsNamespace, restores = null }: SandboxPodScope): KubernetesObject[] {
   const name = SANDBOX_POD_POLICY;
   const metadata = { name, labels: labels("session") };
-  const made = templates.map((template) => {
+  // Each template's pin a variable of its own, as CEL holds each expression to 100,000 code points, which all of them together pass.
+  const made = templates.map((template, index) => {
     const labels = { ...(template.metadata?.labels ?? {}), "pod-template-hash": ANY_STRING } as PinnedMap;
     const annotations = { ...(template.metadata?.annotations ?? {}), vpaObservedContainers: optional(ANY_STRING), vpaUpdates: optional(ANY_STRING) } as PinnedMap;
-    return `(${pinned("object.spec", poolPodSpec(template))} && ${pinned("variables.labels", labels)} && ${pinned("variables.annotations", annotations)})`;
+    return { name: `made${index}`, expression: `${pinned("object.spec", poolPodSpec(template))} && ${pinned("variables.labels", labels)} && ${pinned("variables.annotations", annotations)}` };
   });
+  const restoring = (restores?.templates ?? []).map((template, index) => ({ name: `restored${index}`, expression: restorePod(template, sessionsNamespace, restores?.runtimeClasses ?? []) }));
   const restored = restores
-    ? [`(request.namespace == ${JSON.stringify(sessionsNamespace)} && request.userInfo.username == ${JSON.stringify(restores.restorer)} && (${restores.templates.map((template) => restorePod(template, sessionsNamespace, restores.runtimeClasses)).join(" || ")}))`]
+    ? [`(request.namespace == ${JSON.stringify(sessionsNamespace)} && request.userInfo.username == ${JSON.stringify(restores.restorer)} && (${restoring.map(({ name }) => `variables.${name}`).join(" || ")}))`]
     : [];
   const bound = [BINDING_LABEL, FREE_LABEL];
   const policy = {
@@ -470,11 +472,13 @@ export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sess
         { name: "oldAnnotations", expression: "request.operation == 'UPDATE' ? oldObject.metadata.?annotations.orValue({}) : {}" },
         { name: "newAnnotations", expression: "object.metadata.?annotations.orValue({})" },
         { name: "pooled", expression: `${JSON.stringify(POOL_LABEL)} in variables.labels || ${JSON.stringify(POOL_LABEL)} in variables.oldLabels` },
+        ...made,
+        ...restoring,
       ],
       validations: [
         { expression: "request.?subResource.orValue('') != 'ephemeralcontainers'", message: "no pod of a namespace of sessions gets an ephemeral container" },
         {
-          expression: `request.operation != 'CREATE' || !variables.pooled || ${[...made, ...restored].join(" || ")}`,
+          expression: `request.operation != 'CREATE' || !variables.pooled || ${[...made.map(({ name }) => `variables.${name}`), ...restored].join(" || ")}`,
           message: "a pod of a sandbox pool is its pool's template, as alasio up renders it, or a restore's of one, as the sandbox gateway makes it, and nothing else",
         },
         { expression: "request.operation != 'CREATE' || variables.pooled", message: "no pod is made in a namespace of sessions but a sandbox pool's" },

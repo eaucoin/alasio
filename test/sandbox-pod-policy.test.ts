@@ -16,7 +16,7 @@ import { Effect, Layer, Result } from "effect";
 import { request } from "node:https";
 
 import { gvisorReleases, NODE_PINS } from "../cli/src/cluster/node.ts";
-import { decodeInstallConfig, manifests, NOTHING_CARRIED } from "../cli/src/manifests/index.ts";
+import { carriedFrom, decodeInstallConfig, manifests, NOTHING_KEPT } from "../cli/src/manifests/index.ts";
 import { GATEWAY_USER } from "../cli/src/manifests/sandbox-gateway.ts";
 import { ownDirectory } from "../src/gateway/names.ts";
 import { gvisorRuntimeClass, SNAPSHOT_CACHE_DIR } from "../src/node-agent/names.ts";
@@ -28,9 +28,13 @@ const run = <A, E>(effect: Effect.Effect<A, E, KubeClient>): Promise<A> => Effec
 const withKube = <A, E>(use: (kube: KubeClient["Service"]) => Effect.Effect<A, E>) => run(Effect.flatMap(KubeClient, use));
 
 const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } } });
-if (Result.isFailure(decoded)) throw new Error(decoded.failure.message);
-// Main's sessions snapshotted, as the nodes' CPU baseline is recorded: the gateway restores them.
-const objects = manifests(decoded.success, { ...NOTHING_CARRIED, cpuBaseline: ["sse"] });
+const earlier = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, sessions: { resources: { requests: { cpu: "101m" } } } });
+if (Result.isFailure(decoded) || Result.isFailure(earlier)) throw new Error("the configuration does not decode");
+// Main's sessions snapshotted, as the nodes' CPU baseline is recorded: the gateway restores them, onto each pool's
+// template and the one before it, of an installation whose sessions asked for other CPU, carried as alasio up carries it.
+const kept = { ...NOTHING_KEPT, cpuBaseline: ["sse"] };
+const previous = manifests(earlier.success, carriedFrom(earlier.success, kept)).find(({ kind, metadata }) => kind === "ConfigMap" && metadata?.name === "alasio-sandbox-gateway") as { data?: Record<string, string> } | undefined;
+const objects = manifests(decoded.success, carriedFrom(decoded.success, kept, previous?.data?.["config.json"]));
 const of = <T extends KubernetesObject>(kind: string, name: string) => objects.find((object) => object.kind === kind && object.metadata?.name === name) as T;
 const pool = of<V1Deployment>("Deployment", "sandboxes-none");
 const template = pool.spec?.template;

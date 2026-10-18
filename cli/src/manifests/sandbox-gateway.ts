@@ -303,6 +303,7 @@ function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
       selector: Object.entries(selectorLabels("node-agent")).map(([label, value]) => `${label}=${value}`).join(","),
       port: NODE_AGENT_PORT,
     },
+    receiver: { host: `${RECEIVER}.${NAMESPACE}.svc.cluster.local`, port: config.telemetry.receiverPort },
   };
 }
 

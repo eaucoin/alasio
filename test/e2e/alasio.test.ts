@@ -1150,9 +1150,9 @@ const CAME_BACK_FROM_CHECKPOINT = /^bayma: this session came back from its check
  * Waits until the sandbox gateway has released the session, last used at `since`: no pod
  * bound to it, nor one bound to it ending. How long after `since` it was.
  */
-async function untilReleased(volumeId: string, since: number): Promise<number> {
-  // releaseAfter, and a look at the bound pods every few seconds, then the save.
-  const within = (RELEASE_AFTER_SECONDS + 15) * 1000 + 180_000;
+async function untilReleased(volumeId: string, since: number, { savingMs = 180_000 } = {}): Promise<number> {
+  // releaseAfter, and a look at the bound pods every few seconds, then the save, of `savingMs` at most.
+  const within = (RELEASE_AFTER_SECONDS + 15) * 1000 + savingMs;
   await until(`the release of the session ${volumeId}`, async () =>
     (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(volumeId))}` })).length === 0 ? true : undefined, within);
   return Date.now() - since;
@@ -1582,7 +1582,7 @@ if (inShard("snapshots")) {
         return "not logged";
       };
       for (const from of ["cache", "bucket"] as const) {
-        const released = await untilReleased(big, Date.now());
+        const released = await untilReleased(big, Date.now(), { savingMs: 480_000 });
         const snapshot = await snapshotOf(big);
         assert.ok(snapshot, `the session ${big} was released with no snapshot`);
         assert.ok(snapshot.bytes >= BIG_REPL_MEBIBYTES * 1024 * 1024, `its image is ${snapshot.bytes} bytes`);
@@ -1622,7 +1622,7 @@ if (inShard("snapshots")) {
     test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket comes back whole and is saved again, its node's agent stopped as its sandbox reads the rest of it, which the agent's stop waits on`, async (t) => {
       const big = await newSession("none");
       const { sessionId: held, sha256 } = await repl.fill(big, BIG_REPL_MEBIBYTES);
-      await untilReleased(big, Date.now());
+      await untilReleased(big, Date.now(), { savingMs: 480_000 });
       for (const pod of (await nodeAgents()).values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
       const answered = turn(`hello with ${BIG_REPL_MEBIBYTES} MiB, its node's agent stopped`);
       // Its sandbox resumed, reading the rest of it in the background: its node's agent stopped, as a rollout stops it.
@@ -1654,7 +1654,7 @@ if (inShard("snapshots")) {
         await until(`a node agent ready again on ${node}`, async () => ((await nodeAgents()).has(node) ? true : undefined), 300_000);
       }
       // Saved again, as a sandbox whose background reads failed could be no more.
-      await untilReleased(big, Date.now());
+      await untilReleased(big, Date.now(), { savingMs: 480_000 });
       assert.ok(await snapshotOf(big), `the session ${big} was released with no snapshot`);
     });
 

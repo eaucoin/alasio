@@ -127,5 +127,7 @@ export const GatewayConfig = Schema.Struct({
   pools: Schema.Struct({ none: Schema.String, full: Schema.String }),
   /** Where the node agents are. */
   nodeAgents: Schema.Struct({ namespace: Schema.String, selector: Schema.String, port: Schema.Number }),
+  /** Where bound pods' bayma exports its telemetry, the session telemetry receiver's Service, by its name and port; none where none runs. */
+  receiver: Schema.NullOr(Schema.Struct({ host: Schema.String, port: Schema.Number })),
 });
 export type GatewayConfig = typeof GatewayConfig.Type;

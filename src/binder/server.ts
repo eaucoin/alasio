@@ -42,6 +42,7 @@ import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from 
 import { counts, touchLease } from "./bindings.ts";
 import { type Pool } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
+import type { Held } from "./live.ts";
 import { bindingToken, type TokenClaims, verifyToken } from "./tokens.ts";
 
 /** The most a request the front answers itself may carry: a file of a workspace's, as its node agent writes one, with room. */
@@ -102,6 +103,13 @@ export interface BinderServerOptions {
   readonly peers?: () => Effect.Effect<readonly string[]>;
   /** What the front answers itself of a caller's key, or its caller, as its token says them, under /workspace and /snapshots; none where it answers nothing. */
   readonly operate?: (claims: TokenClaims, operation: Operation) => Effect.Effect<Answer>;
+  /**
+   * Whether the binding `binding` of `key`, its Lease's uid in `namespace`, is held now, as the
+   * bindings' Leases are watched (./live.ts): a route the front knew of a binding gone, as
+   * another replica released it, is forgotten before a request is passed by it, and the key
+   * bound anew. None where routes are trusted until a request finds their pod unreached.
+   */
+  readonly routeHeld?: (key: string, binding: string, namespace: string) => Effect.Effect<Held>;
 }
 
 /** A listening front: its port, and how many requests of each key it is passing on now. */
@@ -134,11 +142,11 @@ const Waiting = Schema.Struct({ waiting: Schema.Number });
 const decodeWaiting = Schema.decodeUnknownOption(Waiting);
 
 /** Serves the front on `port` until the scope closes, as the module says. */
-export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]), operate }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
+export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]), operate, routeHeld }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
   const binder = yield* Binder;
   const kube = yield* KubeClient;
   const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
-  const routes = new Map<string, Route & { readonly pool: Pool }>();
+  const routes = new Map<string, Route & { readonly pool: Pool; readonly binding: string }>();
   const flights = new Map<string, number>();
   const stamped = new Map<string, number>();
 
@@ -158,11 +166,13 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
   const routeOf = (key: string, options: Readonly<Record<string, string>>, unbound: boolean): Effect.Effect<(Route & { readonly pool: Pool }) | null, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused> =>
     Effect.gen(function*() {
       const known = routes.get(key);
-      if (known) return known;
+      // One whose binding is gone, as its watch says, is bound anew; one not yet known of is used as it is.
+      if (known && (!routeHeld || (yield* routeHeld(key, known.binding, known.pool.namespace)) !== "gone")) return known;
+      routes.delete(key);
       const { pool, ...placed } = yield* poolOf(key, options);
       const bound = unbound ? yield* binder.bound(pool, key) : yield* binder.bind(pool, key, placed);
       if (!bound) return null;
-      const route = { address: bound.address, port: podPort, token: bindingToken(bindingKey, { key, binding: bound.binding, namespace: pool.namespace }), pool };
+      const route = { address: bound.address, port: podPort, token: bindingToken(bindingKey, { key, binding: bound.binding, namespace: pool.namespace }), pool, binding: bound.binding };
       routes.set(key, route);
       return route;
     });

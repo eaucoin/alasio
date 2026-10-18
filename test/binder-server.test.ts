@@ -6,13 +6,14 @@ import type { AddressInfo } from "node:net";
 import { before, test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
-import { Effect, Exit, Layer, Scope } from "effect";
+import { Context, Effect, Exit, Layer, Scope } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
 import { activeAt, readLease } from "../src/binder/bindings.ts";
+import { LiveBindings } from "../src/binder/live.ts";
 import { environmentKey, freeLabels, type Pool } from "../src/binder/names.ts";
 import { type BinderServer, MAX_OPERATION_BYTES, NO_BIND_HEADER, type Operation, type Placement, PlacementRefused, serveBinder } from "../src/binder/server.ts";
-import { mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
+import { bindingToken, mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
 
@@ -69,12 +70,20 @@ async function front(
     release = undefined as Placement["release"],
     keyOf = callerKey as Buffer | ((claims: TokenClaims) => Buffer | null),
     operate = undefined as ((claims: TokenClaims, operation: Operation) => Effect.Effect<{ status: number; json?: unknown; bytes?: Uint8Array }>) | undefined,
+    watched = false,
   } = {},
 ): Promise<BinderServer & { close: () => Promise<void> }> {
   const scope = await Effect.runPromise(Scope.make());
   const layer = Layer.provideMerge(Binder.layer({ waitMs }), Layer.fresh(KubeClient.layer));
+  // Its routes checked against the bindings' Leases as they are watched, where it is told to.
+  const live = watched
+    ? await Effect.runPromise(Effect.map(Layer.build(LiveBindings.layer({ namespaces: { current: Effect.succeed([of.namespace]), known: (namespace) => Effect.succeed(namespace === of.namespace) } })), (built) => Context.get(built, LiveBindings)).pipe(
+      Effect.provide(Layer.fresh(KubeClient.layer)),
+      Scope.provide(scope),
+    ))
+    : null;
   const served = await Effect.runPromise(
-    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), poolOf: (_key, options) =>
+    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), ...(live ? { routeHeld: live.holds } : {}), poolOf: (_key, options) =>
       options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: of, release })), peers: () => Effect.succeed(peers) }).pipe(
       Effect.provide(layer),
       Scope.provide(scope),
@@ -252,6 +261,32 @@ test("a bind asked ahead, and a no-bind request, of a key whose binding another 
     assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
     const again = (await run(readLease(of, key)))?.spec?.holderIdentity;
     assert.ok(again && again !== first, `${first} then ${again}`);
+  } finally {
+    stand.close();
+    await served.close();
+    await other.close();
+  }
+});
+
+test("a front that watches the bindings forgets a route it knew of a binding another front let go, and binds its key anew before it passes a request by it", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  const stand = await pods();
+  const served = await front(of, stand.port, { watched: true });
+  const other = await front(of, stand.port);
+  try {
+    const key = "sessionfs:watched";
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" })).status, 200);
+    const first = await run(readLease(of, key));
+    assert.ok(first?.spec?.holderIdentity);
+    // Let go through another front, as the gateway's sweep lets one go, and seen gone by the first's watch.
+    assert.equal((await fetch(`http://127.0.0.1:${other.port}/release`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" })).status, 200);
+    // Bound anew, its request passed with the new binding's token, not the one let go.
+    const again = await run(readLease(of, key));
+    assert.ok(again?.spec?.holderIdentity && again.metadata?.uid !== first.metadata?.uid, `${first.metadata?.uid} then ${again?.metadata?.uid}`);
+    assert.equal(stand.sent.at(-1)?.authorization, `Bearer ${bindingToken(bindingKey, { key, binding: again.metadata?.uid ?? "", namespace: of.namespace })}`);
   } finally {
     stand.close();
     await served.close();

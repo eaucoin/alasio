@@ -3,7 +3,8 @@
  * (../binder/server.ts) for session workspaces (./sessions.ts), as its configuration file
  * (GATEWAY_CONFIG_VARIABLE, which `alasio up` renders) and its keys (CALLER_KEY_VARIABLE,
  * BINDING_KEY_VARIABLE) say, a caller's token checked by the key of the environment it names,
- * of the caller key (../binder/names.ts environmentKey), as its alasio signs it, reaching the node agents with their token, as alasio does, and
+ * of the caller key (../binder/names.ts environmentKey), as its alasio signs it, reaching the node agents with their token, as alasio does, forgetting a route it knew of a
+ * binding another replica let go as the bindings' Leases are watched (../binder/live.ts), and
  * telling each environment's alasio of what happens to its sessions' bindings on the log
  * (../events/events.ts).
  * What a gateway that ended left between a binding's steps is set right as it starts, and
@@ -17,16 +18,18 @@
 import { lookup } from "node:dns/promises";
 import { readFileSync } from "node:fs";
 
-import { Cause, Config, Effect, Layer, Redacted, Schedule, Schema, type Scope } from "effect";
+import { Cause, Config, Context, Effect, Layer, Redacted, Schedule, Schema, type Scope } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { Binder } from "../binder/binder.ts";
+import { type BindingNamespaces, LiveBindings } from "../binder/live.ts";
 import { reconcile } from "../binder/bindings.ts";
 import { environmentKey } from "../binder/names.ts";
 import { serveBinder } from "../binder/server.ts";
 import { Events } from "../events/events.ts";
 import { KubeClient } from "../kube/client.ts";
 import { makeNodeAgents } from "../sandbox/node-agents.ts";
+import { sandboxBaymaTelemetryEnv } from "../sandbox/telemetry.ts";
 import { withLogScope } from "../shared/log.ts";
 import { makeEnvironments } from "./environments.ts";
 import { makeRefusalCount } from "./refusals.ts";
@@ -78,9 +81,28 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
     const binder = yield* Binder;
     const agents = yield* makeNodeAgents(config.nodeAgents);
     const environments = yield* makeEnvironments({ main: config.environment });
+    // The bindings' Leases watched, every environment's, so a route this replica knew of a binding another released is let go.
+    const namespaces: BindingNamespaces = {
+      current: Effect.map(environments.current, (current) => current.map(({ namespace }) => namespace)),
+      known: (namespace) => Effect.map(environments.ofNamespace(namespace), (environment) => environment !== null),
+    };
+    const live = Context.get(yield* Layer.build(LiveBindings.layer({ namespaces })), LiveBindings);
     const events = yield* eventsOf;
+    const baymaTelemetry = sandboxBaymaTelemetryEnv();
     const sessions = yield* makeSessions(
-      { environments, pools: config.pools, releaseAfterMs: config.releaseAfterSeconds * 1000, podPort: config.podPort, bindingKey, events, quotaBytes: config.quotaBytes, snapshots: config.snapshots, mainNamespace: config.environment.namespace },
+      {
+        environments,
+        pools: config.pools,
+        releaseAfterMs: config.releaseAfterSeconds * 1000,
+        podPort: config.podPort,
+        bindingKey,
+        events,
+        quotaBytes: config.quotaBytes,
+        snapshots: config.snapshots,
+        mainNamespace: config.environment.namespace,
+        // Bound pods' bayma exports each signal the gateway exports, to the receiver, where the installation exports any.
+        telemetry: config.receiver && Object.keys(baymaTelemetry).length > 0 ? { ...config.receiver, env: baymaTelemetry } : undefined,
+      },
       agents,
       binder,
     );
@@ -126,6 +148,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       podPort: config.podPort,
       poolOf: sessions.place,
       operate: sessions.operate,
+      routeHeld: live.holds,
       // Every replica's address but its own, which answers its own waiting.
       peers: () =>
         Effect.tryPromise(() => lookup(config.peers, { all: true })).pipe(

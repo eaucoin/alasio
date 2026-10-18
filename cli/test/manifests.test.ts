@@ -3229,6 +3229,21 @@ describe("the sandbox service", () => {
     }
   });
 
+  test("pins each pool's template, and each a restore is made onto, the one before the current carried, in a variable of its own, each within CEL's size limit of an expression", () => {
+    const kept = { ...NOTHING_KEPT, cpuBaseline: BASELINE };
+    const cpu = (request: string) => ({ sessions: { resources: { requests: { cpu: request } } } });
+    const first = manifests(configOf(cpu("101m")), carriedFrom(configOf(cpu("101m")), kept));
+    const gateway = one<V1ConfigMap>(first, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"];
+    const objects = manifests(configOf(cpu("102m")), carriedFrom(configOf(cpu("102m")), kept, gateway));
+    const policy = one<KubernetesObject & { spec: { variables: { name: string; expression: string }[]; validations: { expression: string }[] } }>(objects, "ValidatingAdmissionPolicy", "alasio-sandbox-pods");
+    const named = (prefix: string) => policy.spec.variables.filter(({ name }) => name.startsWith(prefix));
+    assert.equal(named("made").length, 2);
+    // Each pool's current template and the one before it.
+    assert.equal(named("restored").length, 4);
+    assert.equal(new Set(named("restored").map(({ expression }) => expression)).size, 4);
+    for (const { expression } of [...policy.spec.variables, ...policy.spec.validations]) assert.ok([...expression].length <= 100_000, `an expression of ${[...expression].length} code points`);
+  });
+
   test("carries each pool's template before the current one, as the gateway's configuration it replaces held it, for one change of it and no more", () => {
     const kept = { ...NOTHING_KEPT, cpuBaseline: BASELINE };
     const gatewayOf = (objects: readonly KubernetesObject[]) => one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"];
@@ -3284,6 +3299,8 @@ describe("the sandbox service", () => {
       quotaBytes: 10 * 1024 ** 3,
       pools: { none: "sandboxes-none", full: "sandboxes-full" },
       nodeAgents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", port: 8484 },
+      // Where bound pods' bayma exports its telemetry: the receiver's Service.
+      receiver: { host: "alasio-receiver.alasio.svc.cluster.local", port: 4318 },
       // Main's sessions snapshotted as alasio's own were, under the releases kept, each pool's template as the pool runs it, none carried before it.
       snapshots: {
         liveEverySeconds: 600,

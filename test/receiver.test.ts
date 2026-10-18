@@ -11,6 +11,7 @@ import { type Held, LiveBindings } from "../src/binder/live.ts";
 import { bindingToken, mintToken } from "../src/binder/tokens.ts";
 import { authenticateBinding, sessionResource } from "../src/receiver/receiver.ts";
 import { sessionKey } from "../src/sandbox/names.ts";
+import { sandboxBaymaTelemetryEnv } from "../src/sandbox/telemetry.ts";
 import { makeRateLimiter, serveTelemetryReceiver } from "../src/sandbox/telemetry-receiver.ts";
 import type { ForwardResult } from "../src/telemetry/forward.ts";
 
@@ -74,4 +75,14 @@ test("the receiver takes an instance's telemetry with its binding's token while 
       assert.equal(exported.length, 2);
     });
   })));
+});
+
+test("a bound pod's bayma is told to export each signal the gateway exports, in its protocol, and none where the gateway exports none", () => {
+  assert.deepEqual(sandboxBaymaTelemetryEnv({}), {});
+  const settings = sandboxBaymaTelemetryEnv({ OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318", OTEL_METRICS_EXPORTER: "none" });
+  assert.equal(settings["OTEL_TRACES_EXPORTER"], "otlp");
+  assert.equal(settings["OTEL_METRICS_EXPORTER"], "none");
+  assert.ok(settings["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"]);
+  // Its endpoint, and its token, the sandbox's own.
+  assert.ok(!Object.keys(settings).some((name) => name === "OTEL_EXPORTER_OTLP_ENDPOINT" || name.includes("HEADERS")), JSON.stringify(settings));
 });
