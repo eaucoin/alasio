@@ -100,6 +100,13 @@ export interface Gofer {
  */
 export const goferOf = (release: string, since: string): Gofer | null => (releaseAtOrPast(release, since) ? { transport: "socket", pagesRetry: true } : null);
 
+/**
+ * The name of a restore's pod, as the gateway makes it (../gateway/names.ts restorePodName): its
+ * pool's, `-restore-`, then seven of base 36's digits; the one name whose directory the node
+ * agent makes for it, before the pod is made.
+ */
+export const RESTORE_POD = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?-restore-[0-9a-z]{7}$/u;
+
 /** The variable that gives the node agent the first gVisor release that restores straight from the bucket (restoresFromBucket). */
 export const RESTORES_FROM_BUCKET_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_FROM_BUCKET_SINCE";
 

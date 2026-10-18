@@ -72,7 +72,7 @@ import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { type Fallback, holdsStop, hookOf, selects, stateDirOf, stopHookOf } from "../sandbox/snapshots.ts";
 import { withLogScope } from "../shared/log.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
-import { type GatewaySnapshots as SnapshotsConfig, ownDirectory } from "./names.ts";
+import { type GatewaySnapshots as SnapshotsConfig, ownDirectory, restorePodName } from "./names.ts";
 
 const releases = meter.createCounter("alasio.sandbox.releases", {
   description:
@@ -562,7 +562,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           const { [FREE_LABEL]: _free, ...own } = base.metadata?.labels ?? {};
           // Named before it is made, as its own directory is by its name (ownDirectory); its workspace
           // attached there first, so its sandbox, restored as its bayma starts, finds every file it held open.
-          const name = `${pool.name}-restore-${randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7)}`;
+          const name = restorePodName(pool.name, randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7));
           yield* attaching.attach(node, name, binding);
           const spec = ownDirectory({ containers: [], ...base.spec }, name);
           const pod = yield* kube.create<V1Pod>({

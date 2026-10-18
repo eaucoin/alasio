@@ -11,6 +11,8 @@ import { Schema } from "effect";
 
 import { ATTACH_ROOT } from "../node-agent/names.ts";
 
+export { RESTORE_POD } from "../node-agent/names.ts";
+
 /** The variable of the path of the gateway's configuration, a GatewayConfig as JSON. */
 export const GATEWAY_CONFIG_VARIABLE = "ALASIO_GATEWAY_CONFIG";
 /** The variables of the keys callers' tokens, and bindings', are signed with: the keys' text, as the stack's setup makes them. */
@@ -32,6 +34,9 @@ export function templateHash(template: object): string {
     typeof value === "object" && value !== null && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : value;
   return createHash("sha256").update(JSON.stringify(template, sorted)).digest("hex");
 }
+
+/** The name of a restore's pod of the pool `pool`, by its random part, `suffix`, seven of base 36's digits, as RESTORE_POD matches it. */
+export const restorePodName = (pool: string, suffix: string): string => `${pool}-restore-${suffix}`;
 
 /** The volume of a pool's pod's own directory on its node, which its workspace is attached under (cli/src/manifests/sandbox-gateway.ts poolTemplate). */
 export const ATTACH_VOLUME = "attach";
@@ -60,7 +65,8 @@ export function ownDirectory(spec: V1PodSpec, name: string): V1PodSpec {
     ...spec,
     containers: spec.containers.map(unsubpathed),
     ...(spec.initContainers ? { initContainers: spec.initContainers.map(unsubpathed) } : {}),
-    ...(spec.volumes ? { volumes: spec.volumes.map((volume) => (volume.name === ATTACH_VOLUME ? { name: ATTACH_VOLUME, hostPath: { path: `${ATTACH_ROOT}/${name}`, type: "DirectoryOrCreate" } } : volume)) } : {}),
+    // One there already, as its node's agent made it, its workspace attached; kubelet makes none, so the pod starts not where it is not there.
+    ...(spec.volumes ? { volumes: spec.volumes.map((volume) => (volume.name === ATTACH_VOLUME ? { name: ATTACH_VOLUME, hostPath: { path: `${ATTACH_ROOT}/${name}`, type: "Directory" } } : volume)) } : {}),
   };
 }
 

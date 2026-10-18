@@ -184,14 +184,14 @@ test("no pod but a pool's is made in a namespace of sessions", async () => {
 /** A restore's pod of the pool's, as the gateway makes it of its template, of the workspace `workspace`, changed as `change` says. */
 let restores = 0;
 function restorePod(workspace = "fs-abc123", change: (pod: { metadata: Record<string, unknown>; spec: V1PodSpec }) => void = () => {}): V1Pod {
-  const own = ownDirectory(template?.spec as V1PodSpec, `sandboxes-none-restore-${restores + 1}`);
+  const own = ownDirectory(template?.spec as V1PodSpec, `sandboxes-none-restore-${String(restores + 1).padStart(7, "0")}`);
   const { ["alasio.dev/free"]: _free, ...labels } = template?.metadata?.labels ?? {};
   const [release] = gvisorReleases(NODE_PINS);
   const pod = structuredClone({
     apiVersion: "v1",
     kind: "Pod",
     metadata: {
-      name: `sandboxes-none-restore-${(restores += 1)}`,
+      name: `sandboxes-none-restore-${String((restores += 1)).padStart(7, "0")}`,
       namespace: SESSIONS,
       labels: { ...labels, "alasio.dev/binding": "0".repeat(40) },
       annotations: {
@@ -228,6 +228,11 @@ test("a restore's pod of a pool's template is made by the sandbox gateway alone,
     "an init container": (pod) => void (pod.spec.initContainers = [{ name: "first", image: "busybox", command: ["sh", "-c", "cat /attach/token"] }]),
     "another pod's directory": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = "/var/lib/alasio/attach/sandboxes-none-0"),
     "every pod's directory": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = "/var/lib/alasio/attach"),
+    "a directory kubelet would make": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.type = "DirectoryOrCreate"),
+    "named as no restore's pod": (pod) => {
+      pod.metadata["name"] = "sandboxes-none-5d4f8b7c9-x2k8q";
+      pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = "/var/lib/alasio/attach/sandboxes-none-5d4f8b7c9-x2k8q";
+    },
   };
   for (const [what, change] of Object.entries(changes)) {
     const refused = await madeAs(GATEWAY_USER, restorePod("fs-abc123", change));

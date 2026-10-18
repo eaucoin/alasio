@@ -59,7 +59,7 @@ import { isValidVolumeId } from "../sandbox/names.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import type { Juicefs, JuicefsError, Quota } from "./juicefs.ts";
 import { BAYMA_CONTAINER, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
-import { ATTACH_ROOT, WORKSPACES_ROOT } from "./names.ts";
+import { ATTACH_ROOT, RESTORE_POD, WORKSPACES_ROOT } from "./names.ts";
 import type { Runsc } from "./runsc.ts";
 import { readUnder, writeUnder } from "./volume.ts";
 
@@ -350,7 +350,8 @@ export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches
         if (unnamed !== undefined) return yield* refused(400, `${unnamed} is no variable's name`);
         const directory = yield* podDirectory(pod);
         if (made) {
-          // Made now, never one there already, whatever it is.
+          // A restore's pod's alone, made now, never one there already, whatever it is: no pod's that runs is ever attached into so.
+          if (!RESTORE_POD.test(pod)) return yield* refused(400, `${pod} is no restore's pod: no directory is made for it`);
           yield* storage(`${ref.environment}/${ref.workspace} could not be attached`);
           const making = yield* Effect.promise(() => mkdir(attachRoot, { recursive: true }).then(() => mkdir(directory)).then(() => null, (error: NodeJS.ErrnoException) => error.code ?? "failed"));
           if (making === "EEXIST") return yield* refused(409, `${pod} has a directory on this node already: a restore's pod's is made for it alone`);

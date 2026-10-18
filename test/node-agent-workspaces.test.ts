@@ -163,20 +163,23 @@ test("a workspace is cloned into another, of any environment, its files' owners 
   }
 });
 
-test("an attach for a restore's pod yet to be made makes its directory, and attaches into it, but never into one there already, nor through a symlink", async () => {
+test("an attach for a restore's pod yet to be made makes its directory, and attaches into it, but never for a pool's pod, nor into one there already, nor through a symlink", async () => {
   const at = workspacesNode();
   try {
     at.files("fs-abc123");
     const ref = { environment: "main", workspace: "fs-abc123" };
-    await Effect.runPromise(at.workspaces.attach(ref, "pool-restore-0abc", "t", {}, { made: true }));
-    assert.deepEqual(at.mounts, [join(at.attachRoot, "pool-restore-0abc", "ws")]);
-    assert.equal(readFileSync(join(at.attachRoot, "pool-restore-0abc", "token"), "utf8"), "t");
-    // One there already, a directory kubelet made, or a symlink to another's: refused, nothing attached.
-    at.pod("pool-0");
-    symlinkSync(join(at.attachRoot, "pool-0"), join(at.attachRoot, "pool-restore-1abc"));
-    for (const pod of ["pool-0", "pool-restore-1abc"]) assert.equal(await refusal(at.workspaces.attach(ref, pod, "t", {}, { made: true })), 409, pod);
+    await Effect.runPromise(at.workspaces.attach(ref, "sandboxes-none-restore-0abc123", "t", {}, { made: true }));
+    assert.deepEqual(at.mounts, [join(at.attachRoot, "sandboxes-none-restore-0abc123", "ws")]);
+    assert.equal(readFileSync(join(at.attachRoot, "sandboxes-none-restore-0abc123", "token"), "utf8"), "t");
+    // A pool's pod's, its directory kubelet's: refused by its name, nothing attached into it.
+    at.pod("sandboxes-none-5d4f8b7c9-x2k8q");
+    assert.equal(await refusal(at.workspaces.attach(ref, "sandboxes-none-5d4f8b7c9-x2k8q", "t", {}, { made: true })), 400);
+    // A restore's there already, or a symlink to another's: refused, nothing attached.
+    at.pod("sandboxes-none-restore-1abc123");
+    symlinkSync(join(at.attachRoot, "sandboxes-none-5d4f8b7c9-x2k8q"), join(at.attachRoot, "sandboxes-none-restore-2abc123"));
+    for (const pod of ["sandboxes-none-restore-1abc123", "sandboxes-none-restore-2abc123"]) assert.equal(await refusal(at.workspaces.attach(ref, pod, "t", {}, { made: true })), 409, pod);
     assert.equal(at.mounts.length, 1);
-    assert.equal(existsSync(join(at.attachRoot, "pool-0", "token")), false);
+    assert.equal(existsSync(join(at.attachRoot, "sandboxes-none-5d4f8b7c9-x2k8q", "token")), false);
   } finally {
     at.done();
   }

@@ -692,7 +692,7 @@ test("a workspace released into its snapshot is restored from it as it is next b
     assert.equal(restored.spec?.runtimeClassName, "gvisor-r1");
     const plain = (value: unknown) => JSON.parse(JSON.stringify(value)) as unknown;
     // Its own directory named by its volume's path, not a subpath, so its workspace, attached first, is bound into its container with it.
-    assert.deepEqual(plain(restored.spec?.volumes?.find(({ name }) => name === "attach")), { name: "attach", hostPath: { path: `/var/lib/alasio/attach/${name}`, type: "DirectoryOrCreate" } });
+    assert.deepEqual(plain(restored.spec?.volumes?.find(({ name }) => name === "attach")), { name: "attach", hostPath: { path: `/var/lib/alasio/attach/${name}`, type: "Directory" } });
     assert.deepEqual(plain(restored.spec?.containers[0]?.volumeMounts), [{ name: "attach", mountPath: "/attach", mountPropagation: "HostToContainer" }]);
     assert.equal(restored.spec?.initContainers, undefined);
     assert.deepEqual(plain(restored.spec?.readinessGates), [{ conditionType: "alasio.dev/resumed" }]);
