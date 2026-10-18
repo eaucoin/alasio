@@ -102,6 +102,18 @@ export class NeonOutboxRepository {
     ).pipe(Effect.map(([row]) => row!.id));
   }
 
+  /**
+   * Records that the conversation is told `notice`, unless it was already: whether it is to
+   * be told now. Run in a transaction (./store.ts enqueueOutboxNotice), which queues it
+   * with the record.
+   */
+  recordNotice(conversationId: string, notice: string): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `insert into ${this.#schema}.conversation_notices (conversation_id, notice) values ($1, $2) on conflict do nothing returning notice`,
+      [conversationId, notice],
+    ).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
   /** Queues a turn's status message: its id, which an edit of it names. */
   enqueueStatus(status: NewOutboxStatus): Effect.Effect<string, StoreError> {
     return this.#enqueue("status", null, status);

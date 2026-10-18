@@ -16,7 +16,7 @@ import type { AppServerRequestError, AppServerStartError } from "./app-server/rp
 import type { NoActiveTurn, StaleTurnCleanupError, ThreadIdMissing } from "./app-server/thread-client.ts";
 import type { CodexEnv } from "./env.ts";
 import { disabledFeaturesConfig } from "./features.ts";
-import { ALASIO_CODEX_MODEL, resolveCodexModelChoice, withAlasioCodexModelConfig } from "./model.ts";
+import { ALASIO_CODEX_MODEL, choiceForLogin, resolveCodexModelChoice, withAlasioCodexModelConfig } from "./model.ts";
 import type { CodexThreadConfig } from "./thread-config.ts";
 import type { TurnTimer } from "./turn-timing.ts";
 
@@ -50,6 +50,8 @@ export interface CodexEventStream {
   readonly sessionId: string | null | undefined;
   readonly turnId: string | null;
   readonly events: Stream.Stream<CodexEvent, CodexEventsError>;
+  /** What the operator is told of the turn besides its reply: why it runs on another model than chosen. */
+  readonly notice?: string | null | undefined;
 }
 
 /** Where a transport records the session a turn runs in. */
@@ -120,7 +122,10 @@ const createAppServerStream = Effect.fnUntraced(function*({ resumeSession, threa
     : yield* appServer.startThread(scope);
   yield* persistence.updatePendingSessionId(pendingResponseId, sessionId);
   yield* persistence.updateActiveTurnSessionId(sessionId);
-  const { model, effort } = resolveCodexModelChoice(modelChoice);
+  // The model the login has: the one chosen where it has it, the login's own otherwise.
+  const wanted = resolveCodexModelChoice(modelChoice);
+  const { choice: { model, effort }, notice } = choiceForLogin(wanted, yield* appServer.loginModels({ env: codexEnv, cwd: workingDirectory }));
+  if (notice !== null) yield* Effect.logInfo(`codex.model.fallback thread=${threadKey} wanted=${wanted.model} model=${model} effort=${effort}`);
   // The turn started, it is interrupted as the scope it was started in closes unless it has
   // ended, so that a stop before its events are read, as the turn's start is recorded, stops it
   // there too; one stopped as it starts, startTurn stops itself.
@@ -132,7 +137,7 @@ const createAppServerStream = Effect.fnUntraced(function*({ resumeSession, threa
     )
   );
   yield* turnTimer("app_server.turn_start.returned", { turn_id: turnId ?? "unknown" });
-  const stream: CodexEventStream = { sessionId, turnId, events: appServer.eventsForTurn(sessionId, turnId) };
+  const stream: CodexEventStream = { sessionId, turnId, events: appServer.eventsForTurn(sessionId, turnId), notice };
   return stream;
 });
 
@@ -154,7 +159,12 @@ export const execCodexOptions = (codexEnv: CodexEnv, codexConfig: CodexThreadCon
   config: { ...withAlasioCodexModelConfig(codexConfig), ...disabledFeaturesConfig() },
 });
 
-/** The exec transport's turn: a Codex SDK thread run with the prompt, stopped when the scope closes. */
+/**
+ * The exec transport's turn: a Codex SDK thread run with the prompt, stopped when the scope
+ * closes. It runs on alasio's pinned model, whatever the login offers: `codex exec`, which
+ * the Codex SDK runs, has no way to list a login's models, as the app-server's model/list
+ * does, so no other model is chosen for it here.
+ */
 const createExecSdkStream = Effect.fnUntraced(function*({ resumeSession, workingDirectory, codexEnv, codexConfig, prompt, codexFactory, turnTimer, onPromptDispatched }: CodexStreamParams) {
   const codex = yield* Effect.try({
     try: () => (codexFactory ? codexFactory() : new Codex(execCodexOptions(codexEnv, codexConfig))),

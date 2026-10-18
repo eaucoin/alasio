@@ -112,6 +112,8 @@ export interface TurnResult {
   readonly pendingResponseId: string;
   readonly interrupted: boolean;
   readonly responseCompleted: boolean;
+  /** What the operator is told of the turn besides its reply, as that it ran on another model than chosen. */
+  readonly notice?: string | null | undefined;
 }
 
 export interface FreshSessionParams {

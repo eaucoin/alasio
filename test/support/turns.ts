@@ -30,6 +30,7 @@ import { recordingTelegram } from "./telegram-calls.ts";
 const unusedOutbox: Layer.Layer<Outbox> = Layer.succeed(Outbox, Outbox.of({
   enqueueText: () => Effect.succeed("outbox-1"),
   enqueuePanel: () => Effect.succeed("outbox-panel-1"),
+  enqueueNotice: () => Effect.succeed(true),
   enqueueStatus: () => Effect.succeed("outbox-status-1"),
   enqueueEdit: () => Effect.succeed("outbox-edit-1"),
   deliverDue: Effect.void,
@@ -47,9 +48,14 @@ export interface QueuedToOutbox {
  * An outbox that delivers nothing and records what it is given to queue, in `queued`: a
  * reply with buttons among its replies, its buttons' actions kept in the store, as the
  * outbox keeps them. The first `failedPanels` replies with buttons fail, keeping nothing,
- * as the store failing them would.
+ * as the store failing them would, and so does each reply `refusesText` says to. A notice is
+ * recorded as told in the store, as the outbox records it, and among the replies where it
+ * is queued now.
  */
-export function recordingOutbox({ failedPanels = 0 }: { readonly failedPanels?: number } = {}): { readonly layer: Layer.Layer<Outbox, never, Store>; readonly queued: QueuedToOutbox } {
+export function recordingOutbox({ failedPanels = 0, refusesText = () => false }: {
+  readonly failedPanels?: number;
+  readonly refusesText?: (text: OutboxText) => boolean;
+} = {}): { readonly layer: Layer.Layer<Outbox, never, Store>; readonly queued: QueuedToOutbox } {
   const queued: QueuedToOutbox = { texts: [], statuses: [], edits: [] };
   let ids = 0;
   let panels = 0;
@@ -58,11 +64,15 @@ export function recordingOutbox({ failedPanels = 0 }: { readonly failedPanels?: 
   return {
     queued,
     layer: Layer.effect(Outbox, Effect.map(Effect.service(Store), (store) => Outbox.of({
-      enqueueText: record,
+      enqueueText: (text) => (refusesText(text) ? Effect.fail(new StoreError({ cause: new Error("the store is down") })) : record(text)),
       enqueuePanel: ({ conversationId, chatId, text, keyboard }) =>
         (panels += 1) <= failedPanels
           ? Effect.fail(new StoreError({ cause: new Error("the store is down") }))
           : Effect.flatMap(store.createCallbackActions(conversationId, keyboard.flat()), (actionIds) => record({ chatId, text, options: { reply_markup: inlineKeyboard(keyboard, actionIds) } })),
+      enqueueNotice: ({ conversationId, chatId, text }) =>
+        refusesText({ chatId, text })
+          ? Effect.fail(new StoreError({ cause: new Error("the store is down") }))
+          : Effect.flatMap(store.enqueueOutboxNotice(conversationId, { chatId, text }), (fresh) => (fresh ? Effect.as(record({ chatId, text }), true) : Effect.succeed(false))),
       enqueueStatus: (status) => Effect.sync(() => queued.statuses[queued.statuses.push({ ...status, id: id() }) - 1]!.id),
       enqueueEdit: (edits, edit) => Effect.sync(() => (queued.edits.push({ ...edit, edits }), id())),
       deliverDue: Effect.void,

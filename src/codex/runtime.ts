@@ -187,6 +187,7 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
   yield* Effect.logInfo(`Querying Codex (resume=${resumeSession})`);
   yield* turnTimer("query.start");
   let sessionId: string | null | undefined = resumeSession;
+  let notice: string | null = null;
   let interrupted = false;
   let responseCompleted = false;
   const pendingResponseId = yield* persistence.createPendingResponse(chatId, messageId, resumeSession);
@@ -306,6 +307,7 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
       })
       : yield* openCodexEventStream(streamParams);
     sessionId = streamed.sessionId;
+    notice = streamed.notice ?? null;
     if (params.onTransportStarted) {
       yield* params.onTransportStarted({ sessionId, turnId: streamed.turnId });
     }
@@ -372,5 +374,6 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
     pendingResponseId,
     interrupted,
     responseCompleted,
+    notice,
   };
 }, withLogScope("codex-runtime"));

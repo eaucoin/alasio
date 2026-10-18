@@ -283,6 +283,13 @@ const makeTurns = Effect.fnUntraced(function*() {
         });
         const { blockSequence, sessionId: newSessionId, pendingResponseId, interrupted } = queryResult;
         responseCompleted = queryResult.responseCompleted;
+        // What the operator is told of the turn besides its reply, after it, once a conversation.
+        const tellNotice = queryResult.notice
+          ? outbox.enqueueNotice({ conversationId, chatId, text: queryResult.notice }).pipe(
+            Effect.asVoid,
+            Effect.catch((error) => Effect.logWarning(`Could not tell ${conversationId} of its turn: ${error.message}`)),
+          )
+          : Effect.void;
         const shown = yield* Deferred.await(posted);
         if (newSessionId && !existingSession) {
           yield* persistence.updateActiveTurnSessionId(newSessionId);
@@ -290,6 +297,7 @@ const makeTurns = Effect.fnUntraced(function*() {
         }
         if (interrupted) {
           yield* status.finishWithoutResponse({ chatId, pendingResponseId, status: shown, harnessName: harness.displayName });
+          yield* tellNotice;
           yield* letGo("interrupted");
           return { outcome: "interrupted", completed: false } as const;
         }
@@ -300,6 +308,7 @@ const makeTurns = Effect.fnUntraced(function*() {
             status: shown,
             statusText: notCompleted(harness.displayName, blockSequence),
           });
+          yield* tellNotice;
           yield* letGo("incomplete");
           return { outcome: "incomplete", completed: false } as const;
         }
@@ -310,6 +319,7 @@ const makeTurns = Effect.fnUntraced(function*() {
           Effect.catch((error) => Effect.logError(`Final response handoff deferred for ${conversationId}: ${error.message}`)),
           Effect.catchDefect((defect) => Effect.logError(`Final response handoff deferred for ${conversationId}: ${errorText(defect)}`)),
         );
+        yield* tellNotice;
         yield* letGo("completed");
         return { outcome: "completed", completed: true } as const;
       }).pipe(

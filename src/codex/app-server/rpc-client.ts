@@ -85,8 +85,10 @@ interface OutgoingMessage {
   readonly trace?: TraceCarrier;
 }
 
-/** A started app-server: its process, the requests it has yet to answer, and its end. */
+/** A started app-server: which it is, its process, the requests it has yet to answer, and its end. */
 interface Connection {
+  /** Which of the app-servers started it is, counting from 1. */
+  readonly started: number;
   readonly process: AppServerProcess;
   readonly pending: Map<RequestId, Deferred.Deferred<unknown, AppServerRequestFailed>>;
   /** Fails with why the app-server is gone, once it is. */
@@ -110,6 +112,8 @@ export interface AppServerRpc {
    * forever when none was started, or it was stopped.
    */
   readonly whenGone: Effect.Effect<Effect.Effect<never, AppServerGone>>;
+  /** Which of the app-servers started is the one running, counting from 1; 0 where none runs. */
+  readonly running: Effect.Effect<number>;
 }
 
 export interface AppServerRpcOptions {
@@ -132,6 +136,7 @@ export const makeAppServerRpc = Effect.fnUntraced(function*({ spawn, onNotificat
   // One start at a time: whoever comes while one runs finds its app-server.
   const starting = yield* Semaphore.make(1);
   let nextId = 1;
+  let started = 0;
 
   const running = (connection: Option.Option<Connection>) => Option.filter(connection, ({ gone }) => !Deferred.isDoneUnsafe(gone));
 
@@ -197,6 +202,7 @@ export const makeAppServerRpc = Effect.fnUntraced(function*({ spawn, onNotificat
   const connect = Effect.fnUntraced(function*({ env, cwd }: AppServerScope) {
     const startedAt = yield* Clock.currentTimeNanos;
     const connection: Connection = {
+      started: ++started,
       process: yield* spawn({ cwd, env }),
       pending: new Map(),
       gone: yield* Deferred.make<never, AppServerGone>(),
@@ -253,5 +259,7 @@ export const makeAppServerRpc = Effect.fnUntraced(function*({ spawn, onNotificat
       onNone: () => Effect.never,
       onSome: ({ gone }) => Deferred.await(gone),
     })),
+
+    running: Effect.map(ScopedRef.get(current), (connection) => Option.match(running(connection), { onNone: () => 0, onSome: ({ started }) => started })),
   };
 });

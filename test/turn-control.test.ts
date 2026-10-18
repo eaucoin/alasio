@@ -469,3 +469,41 @@ test("a prompt held while a turn runs whose question could not be asked, the sto
     assert.equal(queued.texts.filter(({ text }) => text.startsWith("Codex is currently working.")).length, 1);
   }, { failedPanels: 1 });
 });
+
+test("what a turn tells besides its reply is queued after it, once a conversation, and again for the next turn where queueing it failed", async () => {
+  const { store, conversationId } = await conversation();
+  const NOTICE = "This Codex login doesn't offer gpt-5.6-sol, so Codex used gpt-5.6-terra, the login's default (at high effort). Use /model to choose another.";
+  const harness = scriptedHarness((params) => Effect.map(answered(params, "Done."), (result) => ({ ...result, notice: NOTICE })));
+  let refusals = 1;
+  await withTurns(store, harness, async (alasio, queued) => {
+    const told = () => queued.texts.filter(({ text }) => text === NOTICE).length;
+    await alasio.runPromise(turnOf(conversationId, "first"));
+    assert.equal(told(), 0, "the store refused it");
+    await alasio.runPromise(turnOf(conversationId, "second"));
+    assert.equal(told(), 1);
+    await alasio.runPromise(turnOf(conversationId, "third"));
+    assert.equal(told(), 1, "told once");
+  }, { refusesText: ({ text }) => text === NOTICE && (refusals -= 1) >= 0 });
+});
+
+test("a notice one alasio told a conversation is told by no other on its store, as another replica or one restarted would be", async () => {
+  const { store, conversationId } = await conversation();
+  const NOTICE = "This Codex login doesn't offer gpt-5.6-sol, so Codex used gpt-5.6-terra, the login's default (at high effort). Use /model to choose another.";
+  const harness = scriptedHarness((params) => Effect.map(answered(params, "Done."), (result) => ({ ...result, notice: NOTICE })));
+  const told = (queued: QueuedToOutbox) => queued.texts.filter(({ text }) => text === NOTICE).length;
+  assert.equal(await withTurns(store, harness, async (alasio, queued) => (await alasio.runPromise(turnOf(conversationId, "first")), told(queued))), 1);
+  assert.equal(await withTurns(store, harness, async (alasio, queued) => (await alasio.runPromise(turnOf(conversationId, "second")), told(queued))), 0);
+});
+
+test("a notice whose reply could not be queued is not recorded as told, the two being one transaction", async () => {
+  const { store, schema, conversationId } = await conversation();
+  const pool = await testPool();
+  // A reply the store cannot queue, as its outbox refuses it.
+  await pool.query(`alter table ${schema}.telegram_outbox add constraint refused check (text <> 'refused') not valid`);
+  const refused = await Effect.runPromise(Effect.flip(store.enqueueOutboxNotice(conversationId, { chatId: CONVERSATION_CHAT, text: "refused" })));
+  assert.equal(refused._tag, "StoreError");
+  assert.deepEqual((await pool.query(`select notice from ${schema}.conversation_notices`)).rows, []);
+  assert.equal(await run(store.enqueueOutboxNotice(conversationId, { chatId: CONVERSATION_CHAT, text: "told" })), true);
+  assert.equal(await run(store.enqueueOutboxNotice(conversationId, { chatId: CONVERSATION_CHAT, text: "told" })), false);
+  assert.equal((await pool.query(`select 1 from ${schema}.telegram_outbox where text = 'told'`)).rows.length, 1);
+});

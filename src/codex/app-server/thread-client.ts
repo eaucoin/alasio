@@ -1,5 +1,5 @@
 import type { v2 } from "../../../.types/codex/index.js";
-import { Clock, type Duration, Effect, Fiber, Schema } from "effect";
+import { Clock, Deferred, type Duration, Effect, Fiber, Schema } from "effect";
 
 import {
   ALASIO_CODEX_MODEL,
@@ -24,6 +24,8 @@ class StoppedStartUnanswered extends Schema.TaggedError<StoppedStartUnanswered>(
 
 /** Threads or turns one list request asks for. */
 const LIST_PAGE_SIZE = 100;
+/** How long a turn waits for the login's models (loginModels) before it runs on the model chosen. */
+const LOGIN_MODELS_TIMEOUT = "10 seconds";
 /**
  * The thread sources the session panels list: the Codex CLI's and editors',
  * which include alasio's app-server threads, and alasio's exec transport's.
@@ -118,6 +120,14 @@ export interface AppServerThreads {
   readonly listTurns: (scope: ThreadScope) => Effect.Effect<v2.Turn[], AppServerStartError>;
   /** The models this machine's Codex login can use, as the app-server reports them. */
   readonly listModels: (scope: AppServerScope) => Effect.Effect<v2.Model[], AppServerStartError>;
+  /**
+   * Every model the login offers, hidden ones too, which a turn may run on: listed once an
+   * app-server, as its first turn asks, within LOGIN_MODELS_TIMEOUT, and kept for its next.
+   * None where the list could not be read in time, said in alasio's log, so the turns
+   * waiting on it run on the model chosen; what did not come is not kept, and the next
+   * turn asks again.
+   */
+  readonly loginModels: (scope: AppServerScope) => Effect.Effect<readonly v2.Model[], AppServerStartError>;
   /** Starts a turn of the prompt, interrupting one left running first; the turn's id. */
   readonly startTurn: (options: StartTurnOptions) => Effect.Effect<string, AppServerRequestError | StaleTurnCleanupError>;
   /** Takes the turn `turnId`, which the app-server runs on its own (a goal's), as the thread's. */
@@ -155,7 +165,7 @@ export type AppServerApart = (work: Effect.Effect<void>) => Effect.Effect<Fiber.
  * what outlasts what asked for it run `apart`.
  */
 export function makeAppServerThreads(
-  rpc: Pick<AppServerRpc, "start" | "request" | "stop" | "whenGone">,
+  rpc: Pick<AppServerRpc, "start" | "request" | "stop" | "whenGone" | "running">,
   notifications: AppServerNotifications,
   apart: AppServerApart,
 ): AppServerThreads {
@@ -170,6 +180,9 @@ export function makeAppServerThreads(
     } while (cursor);
     return all;
   });
+
+  /** The models the login offers, as the app-server running listed them, and which app-server that is. */
+  let offered: { readonly running: number; readonly models: Deferred.Deferred<readonly v2.Model[]> } | null = null;
 
   const interrupt = Effect.fnUntraced(function*(threadId: string, origin = "unspecified", only?: string): Effect.fn.Return<boolean, AppServerRequestError> {
     const turnId = yield* notifications.currentTurnId(threadId);
@@ -271,6 +284,36 @@ export function makeAppServerThreads(
     listTurns: ({ threadId, env, cwd }) => rpc.start({ env, cwd }).pipe(Effect.andThen(listAll("thread/turns/list", { threadId }))),
 
     listModels: ({ env, cwd }) => rpc.start({ env, cwd }).pipe(Effect.andThen(listAll("model/list", { includeHidden: false }))),
+
+    loginModels: ({ env, cwd }) =>
+      Effect.gen(function*() {
+        yield* rpc.start({ env, cwd });
+        const running = yield* rpc.running;
+        const listing = yield* Effect.sync(() => {
+          if (offered?.running === running) return { models: offered.models, first: false };
+          offered = { running, models: Deferred.makeUnsafe<readonly v2.Model[]>() };
+          return { models: offered.models, first: true };
+        });
+        // Listed apart from the turn that asks first, so one stopped as it waits leaves the list to the next.
+        if (listing.first) {
+          yield* apart(listAll("model/list", { includeHidden: true }).pipe(
+            Effect.timeoutOrElse({ duration: LOGIN_MODELS_TIMEOUT, orElse: () => Effect.fail(`it did not answer within ${LOGIN_MODELS_TIMEOUT}`) }),
+            // Kept only where it came: the turns waiting on this one run on the model chosen,
+            // and the next turn asks again.
+            Effect.catch((error) =>
+              Effect.sync(() => {
+                if (offered?.models === listing.models) offered = null;
+              }).pipe(
+                Effect.andThen(Effect.logWarning(`could not list the Codex login's models, so this turn runs on the model chosen, and the next asks again: ${typeof error === "string" ? error : error.message}`)),
+                Effect.as([]),
+              )
+            ),
+            Effect.flatMap((models) => Deferred.succeed(listing.models, models)),
+            Effect.asVoid,
+          ));
+        }
+        return yield* Deferred.await(listing.models);
+      }),
 
     startTurn: Effect.fnUntraced(function*({ threadId, prompt, cwd, model = ALASIO_CODEX_MODEL, effort = ALASIO_CODEX_REASONING_EFFORT, onPromptDispatched }) {
       const previousTurnId = yield* notifications.currentTurnId(threadId);
