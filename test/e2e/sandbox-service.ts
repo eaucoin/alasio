@@ -22,7 +22,7 @@ import type { V1DaemonSet, V1Pod } from "@kubernetes/client-node";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { PROXY_PORT } from "../../cli/src/manifests/neon.ts";
-import { GATEWAY, GATEWAY_PORT, RECEIVER, WORKSPACE_MOUNT } from "../../cli/src/manifests/sandbox-gateway.ts";
+import { GATEWAY, GATEWAY_PORT, JUICEFS_STATE, RECEIVER, WORKSPACE_MOUNT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { VALKEY } from "../../cli/src/manifests/workspace-storage.ts";
 import { BINDING_LABEL, environmentKey, keyHash, POOL_LABEL } from "../../src/binder/names.ts";
 import { mintToken } from "../../src/binder/tokens.ts";
@@ -235,6 +235,14 @@ export function sandboxService(): void {
       const written = await writing;
       const outcomes = written.stdout.trim().split("\n");
       const failed = outcomes.filter((line) => line.startsWith("fail"));
+      if (failed.length > 0) {
+        // What each mount's pod and juicefs said, and what the node mounts, for the failure to say.
+        const mounted = await onNode(node, `grep -E ' ${WORKSPACES_ROOT}| fuse' /proc/1/mountinfo; ls -la ${JUICEFS_STATE}; ps -eo pid,ppid,etime,args | grep '[j]uicefs-'`).catch((error: unknown) => String(error));
+        const logged = await Promise.all((await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("workspace-mount")) })).map(async ({ metadata, spec }) =>
+          `${metadata?.name} on ${spec?.nodeName}:\n${(await kube.logs(NAMESPACE, metadata?.name ?? "", "workspace-mount").catch((error: unknown) => String(error))).split("\n").slice(-60).join("\n")}`
+        ));
+        console.error(`# the node's mounts:\n${mounted}\n# the mounts' pods:\n${logged.join("\n")}`);
+      }
       assert.deepEqual(failed, [], `of ${outcomes.length} writes`);
       assert.ok(outcomes.length > 500, `${outcomes.length} writes`);
       const kept = (await kube.execOk(SESSIONS, pod, ["sh", "-c", "ls /workspace/takeover | wc -l"], { container: "bayma" })).trim();
