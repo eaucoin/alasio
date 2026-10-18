@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -9,6 +9,7 @@ import type { Message } from "@grammyjs/types";
 import { Array as Arr, Effect, Fiber, Layer, Logger } from "effect";
 
 import { StoreError } from "../src/persistence/sql.ts";
+import type { SessionSandboxes } from "../src/sandbox/index.ts";
 import { Store } from "../src/persistence/store.ts";
 import { TelegramTransportError } from "../src/telegram/client.ts";
 import { ReceivedFiles } from "../src/telegram/files.ts";
@@ -84,13 +85,51 @@ test("a file a message carries is kept in the store, and written where its promp
       assert.deepEqual(readFileSync(file.path), content);
       // alasio's state directory does not outlast its pod.
       rmSync(join(stateDir, "telegram-files"), { recursive: true });
-      await alasio.runPromise(Effect.flatMap(ReceivedFiles, (files) => files.materialize([file.id])));
+      await alasio.runPromise(Effect.flatMap(ReceivedFiles, (files) => files.materialize([file.id], null)));
       assert.deepEqual(readFileSync(file.path), content);
     });
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("a file sent to a conversation on a session workspace is written into its session, under its home, through the session filesystems, and again before its prompt runs; none under alasio's state directory", async () => {
+  const store = await testStore();
+  const stateDir = mkdtempSync(join(tmpdir(), "alasio-ingress-"));
+  const content = Buffer.from("a photo");
+  const written: string[] = [];
+  const unused = () => Effect.die("only a file is written");
+  const sandbox: SessionSandboxes["Service"] = {
+    volumes: { create: unused, fork: unused, destroy: unused, list: Effect.die("no workspace is listed") },
+    harnessDirectory: () => assert.fail("no harness runs"),
+    ensureSession: unused,
+    readFile: unused,
+    writeFile: (volumeId, path, bytes) => Effect.sync(() => void written.push(`${volumeId} ${path} ${Buffer.from(bytes).toString()}`)),
+  };
+  const telegram = recordingTelegram({
+    downloadTelegramFile: () =>
+      Effect.succeed({ name: "photo.jpg", content, sha256: createHash("sha256").update(content).digest("hex"), remote: { file_id: "photo", file_unique_id: "photo" } }),
+  });
+  try {
+    const conversationId = await run(store.upsertConversation({ chatId: CHAT.id, user: OPERATOR }));
+    await run(store.setWorkingDirectory(conversationId, "sessionfs:fs-abc123"));
+    await withServices({ store, telegram: telegram.layer, allowedUserIds: String(OPERATOR.id), stateDir, sandbox }, async (alasio) => {
+      const prompt = await alasio.runPromise(handleMessage({ message_id: 12, date: 0, chat: CHAT, from: OPERATOR, photo: [{ file_id: "photo", file_unique_id: "photo", width: 1, height: 1 }] }, 3));
+      const [file] = prompt?.files ?? [];
+      assert.ok(file);
+      // Where the session's agent reads it, which its prompt names.
+      assert.equal(file.path, `/home/agent/.alasio/received/${file.id}/photo.jpg`);
+      assert.deepEqual(written, [`fs-abc123 ${file.path} a photo`]);
+      assert.equal(existsSync(join(stateDir, "telegram-files")), false);
+      // Written again as its prompt runs, as alasio cannot see what the session holds.
+      await alasio.runPromise(Effect.flatMap(ReceivedFiles, (files) => files.materialize([file.id], { kind: "sessionfs", volumeId: "fs-abc123" })));
+      assert.equal(written.length, 2);
+    });
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 
 test("a message handled again, as an update whose handling lock was lost is, is kept once, its file once, and its prompt names the file kept", async () => {
   const schema = newSchema();

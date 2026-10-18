@@ -10,6 +10,7 @@ import { processPrompt } from "../operator/prompts.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
+import { parseWorkspace } from "../workspace/kind.ts";
 import { ReceivedFiles } from "./files.ts";
 
 /** How long a media group waits for more of its messages before it is handled. */
@@ -49,10 +50,11 @@ const makeMediaGroups = Effect.fnUntraced(function*(flushAfter: Duration.Input) 
     const files = yield* store.getFilesForMessages(messages.map((message) => message.id));
     const text = messages.map((message) => String(message.text ?? "").trim()).find(Boolean) ?? "";
     const messageId = Number(messages[0]?.transport_message_id ?? 0) || (yield* Clock.currentTimeMillis);
-    // Written as they arrived, unless a restart came since.
-    yield* receivedFiles.materialize(files.map((file) => file.id));
+    // Written as they arrived, unless a restart came since, where the agent of the conversation's workspace reads them.
+    const workspace = parseWorkspace((yield* store.getMount(conversationId)).workingDirectory);
+    yield* receivedFiles.materialize(files.map((file) => file.id), workspace);
     yield* store.markMediaGroupFlushed(mediaGroupId);
-    const received = files.map((file) => ({ id: file.id, path: receivedFiles.pathOf(file) }));
+    const received = files.map((file) => ({ id: file.id, path: receivedFiles.pathOf(file, workspace) }));
     yield* processPrompt({ conversationId, chatId, messageId, text, files: received }).pipe(Effect.provideContext(services));
   });
 

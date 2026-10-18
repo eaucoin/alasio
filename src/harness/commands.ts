@@ -15,6 +15,7 @@ import { Turns } from "../codex/turns.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { type ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
+import { parseWorkspace } from "../workspace/kind.ts";
 import { ActiveTurns, type StopReason } from "./active-turns.ts";
 
 /** What became of a prompt held while a turn ran, sent to steer it. */
@@ -56,7 +57,8 @@ export const steerWithHeld = (conversationId: string, jobId: string): Effect.Eff
     if (!job) return { outcome: "gone" } as const;
     const queued = turns.setPromptDisposition(job.id, "pending");
     // The files the prompt names, written again if a restart came since.
-    yield* (yield* ReceivedFiles).materialize(job.file_ids).pipe(Effect.tapError(() => queued));
+    const workspace = parseWorkspace((yield* store.getMount(conversationId)).workingDirectory);
+    yield* (yield* ReceivedFiles).materialize(job.file_ids, workspace).pipe(Effect.tapError(() => queued));
     const steered = yield* (yield* ActiveTurns).steer(conversationId, job.prompt).pipe(Effect.result);
     if (Result.isSuccess(steered) && Option.getOrElse(steered.success, () => false)) {
       yield* store.setPromptJobDisposition(job.id, "completed");

@@ -425,8 +425,8 @@ const makeTurns = Effect.fnUntraced(function*() {
         return;
       }
       // A mount no harness serves (none, or one the deployment cannot serve) fails the job, saying why.
-      yield* store.getMount(conversationId).pipe(
-        Effect.flatMap(harnesses.requireForMount),
+      const mount = yield* store.getMount(conversationId);
+      yield* harnesses.requireForMount(mount).pipe(
         Effect.tap(({ name: activeHarness }) =>
           Effect.gen(function*() {
             if (job.harness !== activeHarness) {
@@ -436,7 +436,7 @@ const makeTurns = Effect.fnUntraced(function*() {
             promptWait.record((job.started_at!.getTime() - job.created_at.getTime()) / 1000, { "alasio.harness": activeHarness });
           })
         ),
-        Effect.andThen(receivedFiles.materialize(job.file_ids)),
+        Effect.andThen(receivedFiles.materialize(job.file_ids, parseWorkspace(mount.workingDirectory))),
         Effect.andThen(run({
           conversationId,
           chatId: job.chat_id,

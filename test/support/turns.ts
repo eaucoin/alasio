@@ -111,11 +111,13 @@ function testServices({
   return MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot, branch }), Authorizer.layer(allowedUserIds))),
     Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer()),
-    Layer.provideMerge(Harnesses.layer({ overrides: harnesses, branch })),
+    Layer.provideMerge(Layer.mergeAll(
+      Harnesses.layer({ overrides: harnesses, branch }),
+      // Received files are written nowhere a test does not say; into a session through the test's session filesystems.
+      ReceivedFiles.layer({ stateDir: stateDir ?? "/nonexistent-state-dir" }),
+    )),
     Layer.provideMerge(Layer.mergeAll(
       ActiveTurns.layer,
-      // Received files are written nowhere a test does not say.
-      ReceivedFiles.layer({ stateDir: stateDir ?? "/nonexistent-state-dir" }),
       outbox,
       // Started only by a turn on alasio's own Codex harness, which a test stands in for.
       CodexAppServer.layer,

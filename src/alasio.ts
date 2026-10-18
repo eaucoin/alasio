@@ -73,17 +73,20 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       branchForks(options),
     )),
     Layer.provideMerge(Turns.layer()),
-    Layer.provideMerge(Harnesses.layer({
-      branch: options.branch?.name,
-      sessionStore: options.sessionStore,
-      codexRollouts: options.codexRollouts,
-      sessionFsCodexRollouts: options.sessionFsCodexRollouts,
-      folderBayma: options.folderBayma,
-      claudeQueryFactory: options.claudeQueryFactory,
-    })),
+    Layer.provideMerge(Layer.mergeAll(
+      Harnesses.layer({
+        branch: options.branch?.name,
+        sessionStore: options.sessionStore,
+        codexRollouts: options.codexRollouts,
+        sessionFsCodexRollouts: options.sessionFsCodexRollouts,
+        folderBayma: options.folderBayma,
+        claudeQueryFactory: options.claudeQueryFactory,
+      }),
+      // After the session filesystems, which it writes a session's files into.
+      ReceivedFiles.layer(options),
+    )),
     Layer.provideMerge(Layer.mergeAll(
       Outbox.layer,
-      ReceivedFiles.layer(options),
       // Before Codex is first started, which is not before a turn needs it.
       options.keepCodexLogin ? Layer.effectDiscard(keepCodexLogin(codexHome())) : Layer.empty,
       workspaceServices(options),
