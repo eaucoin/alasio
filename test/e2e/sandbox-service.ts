@@ -7,8 +7,9 @@
  * write into it done, through the node's mount of workspace storage handed over to the pod
  * that replaces the one that held it; the node's mount killed with no successor, as a reboot
  * ends it, mounted again by the DaemonSet's restart, a workspace made after it and one bound
- * through it released as broken, then bound again with what it held; one released with
- * processes holding its files open restored whole from its snapshot as it is next bound; another made, given a received file, bound, held to its
+ * through it released as broken, then bound again with what it held; one released with a
+ * session holding its files open restored whole from its snapshot as it is next bound, the
+ * session running on; another made, given a received file, bound, held to its
  * quota, read back of what its session wrote, released, bound again, and deleted.
  *
  * Registered with sandboxService() in the workspaces shard (test/e2e/alasio.test.ts).
@@ -28,7 +29,8 @@ import { NO_BIND_HEADER } from "../../src/binder/server.ts";
 import { mintToken } from "../../src/binder/tokens.ts";
 import { NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
-import { kube, nodeAgents, onNode, ref, SESSIONS, tcp } from "./harness.ts";
+import type { ReplChecked, ReplHeld } from "./gateway-repl.ts";
+import { inAlasio, kube, nodeAgents, onNode, ref, SESSIONS, tcp } from "./harness.ts";
 import { until } from "./workspace-storage.ts";
 
 /** What a node agent answers `method path` with, `body` as JSON: its status, and what it said. */
@@ -295,7 +297,7 @@ export function sandboxService(): void {
       assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
     });
 
-    test("a workspace released with processes holding its files open, a writer mid-write, an open SQLite database and a git index.lock among them, is restored whole from its snapshot as it is next bound, its processes running on, their files held", async (t) => {
+    test("a workspace released with a session holding its files open, a writer mid-write, an SQLite transaction under way and a git index.lock among them, is restored whole from its snapshot as it is next bound, the session running on, its files held", async (t) => {
       const workspace = "fs-e2eheld";
       const token = await mainToken(workspace);
       await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
@@ -303,52 +305,26 @@ export function sandboxService(): void {
       const first = await boundPod(workspace);
       const pod = await kube.get<V1Pod>(ref("Pod", first.name, SESSIONS));
       if (pod?.spec?.runtimeClassName === undefined) return t.skip("the pools run under no gVisor here, so nothing is snapshotted");
-      const inSandbox = async (name: string, script: string) => kube.execOk(SESSIONS, name, ["sh", "-c", script], { container: "bayma" });
-      // Each started apart from the exec that starts it, as a session's processes run on.
-      await inSandbox(first.name, [
-        "mkdir -p /workspace/held/.git && cd /workspace/held",
-        `setsid sh -c 'echo $$ > writer.pid; exec 3>>counter; exec 4>.git/index.lock; i=0; while :; do i=$((i + 1)); echo $i >&3; sleep 0.2; done' </dev/null >/dev/null 2>&1 &`,
-        `setsid python3 -c '${[
-          "import os, sqlite3, time",
-          "open(\"db.pid\", \"w\").write(str(os.getpid()))",
-          "db = sqlite3.connect(\"db.sqlite\")",
-          "db.execute(\"create table if not exists t (n integer)\")",
-          "db.commit()",
-          "n = 0",
-          "while True:",
-          "    n += 1",
-          "    db.execute(\"insert into t values (?)\", (n,))",
-          "    if n % 5 == 0: db.commit()",
-          "    time.sleep(0.1)",
-        ].join("\n")}' </dev/null >/dev/null 2>&1 &`,
-        "sleep 3",
-      ].join("\n"));
-      const written = Number((await inSandbox(first.name, "wc -l < /workspace/held/counter")).trim());
-      assert.ok(written > 5, `${written} lines written`);
+      // A session of its bayma's, reached through the gateway as alasio reaches it.
+      const url = `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`;
+      const held = await inAlasio<ReplHeld>("./gateway-repl.ts", "hold", url, token);
+      assert.ok(held.step > 5, `its writer at step ${held.step}`);
       // Released mid-write: saved whole into its snapshot.
       const released = await gatewayCall(token, "POST", "/release");
       assert.equal(released.status, 204, `${released.said}\n${await serviceLogs(workspace)}`);
       await until("the released pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", first.name, SESSIONS))) === null ? true : undefined), 180_000);
-      // Bound again: restored, by a pod of its own, its processes running on from where they were, their files held.
+      // Bound again: restored, by a pod of its own, the session running on from where it was, its files held.
       const seen = watchRestore(first.node);
       await bindThrough(token, workspace, "the gateway binding the workspace again", 300_000).finally(seen.stop);
       const restored = await boundPod(workspace);
       assert.match(restored.name, /^sandboxes-none-restore-/u, `${await serviceLogs(workspace)}\nas its node held its restore's directory:\n${seen.said().join("\n---\n")}`);
-      await new Promise((resolve) => setTimeout(resolve, 2_000));
-      const held = await inSandbox(restored.name, [
-        "cd /workspace/held",
-        'kill -0 "$(cat writer.pid)" && echo "writer runs"',
-        'kill -0 "$(cat db.pid)" && echo "database runs"',
-        'readlink "/proc/$(cat writer.pid)/fd/4"',
-        "awk 'NR != $1 { gap = 1 } END { print (gap ? \"a gap\" : \"whole\"), NR }' counter",
-        `python3 -c 'import sqlite3; db = sqlite3.connect("db.sqlite"); print(db.execute("pragma integrity_check").fetchone()[0], db.execute("select count(*) from t").fetchone()[0] > 0)'`,
-      ].join("; "));
-      assert.match(held, /^writer runs$/mu, held);
-      assert.match(held, /^database runs$/mu, held);
-      assert.match(held, /^\/workspace\/held\/\.git\/index\.lock$/mu, held);
-      const [, kept] = /^whole (\d+)$/mu.exec(held) ?? [];
-      assert.ok(Number(kept) > written, held);
-      assert.match(held, /^ok True$/mu, held);
+      const checked = await inAlasio<ReplChecked>("./gateway-repl.ts", "check", url, token, held.sessionId);
+      assert.deepEqual(
+        { writing: checked.writing, whole: checked.whole, committed: checked.committed, integrity: checked.integrity, locked: checked.locked },
+        { writing: true, whole: true, committed: 2, integrity: "ok", locked: true },
+        JSON.stringify(checked),
+      );
+      assert.ok(checked.step > held.step && checked.lines >= checked.step - 1, JSON.stringify(checked));
       assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
     });
 
