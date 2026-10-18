@@ -11,6 +11,7 @@ import { Turns } from "../../src/codex/turns.ts";
 import { ActiveTurns } from "../../src/harness/active-turns.ts";
 import { type Harness, Harnesses } from "../../src/harness/index.ts";
 import type { HarnessName } from "../../src/harness/names.ts";
+import { HostBayma } from "../../src/mcp/bayma.ts";
 import { Mounts } from "../../src/operator/mounts.ts";
 import { Store } from "../../src/persistence/store.ts";
 import type { AlasioServices } from "../../src/alasio.ts";
@@ -91,6 +92,8 @@ export interface TestServicesOptions {
   readonly outbox?: Layer.Layer<Outbox> | undefined;
   /** Session filesystems, where a test offers them. */
   readonly sandbox?: SessionSandboxes["Service"] | undefined;
+  /** Folder workspaces' bayma, the gateway's folder instances, where a test offers them. */
+  readonly hostBayma?: HostBayma["Service"] | undefined;
   /** The branch environment alasio is, if it is one. */
   readonly branch?: string | undefined;
 }
@@ -106,6 +109,7 @@ function testServices({
   allowedUserIds = "",
   outbox = unusedOutbox,
   sandbox,
+  hostBayma,
   branch,
 }: TestServicesOptions): Layer.Layer<AlasioServices> {
   return MediaGroups.layer().pipe(
@@ -122,6 +126,7 @@ function testServices({
       // Started only by a turn on alasio's own Codex harness, which a test stands in for.
       CodexAppServer.layer,
       sandbox ? Layer.succeed(SessionSandboxes, sandbox) : Layer.empty,
+      hostBayma ? Layer.succeed(HostBayma, hostBayma) : Layer.empty,
     )),
     Layer.provideMerge(Layer.mergeAll(Layer.succeed(Store, store), telegram)),
   );

@@ -1,8 +1,10 @@
-import { Effect } from "effect";
+import { Effect, Option } from "effect";
 
 import type { ConversationChat } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
 import { isBusy } from "../harness/commands.ts";
+import { CLAUDE_HARNESS, CODEX_HARNESS, harnessDisplayName, type HarnessName } from "../harness/names.ts";
+import { HostBayma } from "../mcp/bayma.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
@@ -65,6 +67,8 @@ export interface WorkspacePanelRequest {
   readonly sessionWorkspaces?: readonly MadeSessionWorkspace[] | undefined;
   /** The branch environment alasio is, which offers no folder and forks no workspace of its own; none for main. */
   readonly branch?: string | null | undefined;
+  /** Whether a folder's bayma is a folder instance of the gateway's, which the panel restarts. */
+  readonly folderInstances?: boolean | undefined;
 }
 
 /** A session workspace alasio has made. */
@@ -88,7 +92,7 @@ const FORK_HELP = [
  * or `/workspace sessionfs:<volume>`. A session workspace mounted can be forked. A branch
  * environment's offers its session workspaces alone, which it forks none of itself.
  */
-export function buildWorkspacePanel({ current, workspaceRoot, listing, working, notice = "", sandboxEnabled = false, sessionWorkspaces = [], branch = null }: WorkspacePanelRequest): PanelDraft {
+export function buildWorkspacePanel({ current, workspaceRoot, listing, working, notice = "", sandboxEnabled = false, sessionWorkspaces = [], branch = null, folderInstances = false }: WorkspacePanelRequest): PanelDraft {
   const candidates = "candidates" in listing && !branch ? listing.candidates : [];
   const shown = candidates.slice(0, MAX_LISTED_WORKSPACES);
   const sessionsShown = sessionWorkspaces.slice(0, MAX_LISTED_WORKSPACES);
@@ -131,6 +135,10 @@ export function buildWorkspacePanel({ current, workspaceRoot, listing, working, 
   if (mounted?.kind === "sessionfs" && sandboxEnabled && !branch) {
     keyboard.push([button("Fork this workspace", "fork")]);
   }
+  // Its bayma stopped, its REPL sessions saved, and started anew by the next message.
+  if (mounted?.kind === "folder" && folderInstances && !branch) {
+    keyboard.push([button("Restart folder instance", "folder_restart")]);
+  }
   if (sandboxEnabled) {
     keyboard.push([button("New empty workspace…", "sessionfs")]);
   }
@@ -164,6 +172,7 @@ const workspacePanel = Effect.fnUntraced(function*(conversationId: string, notic
     sessionWorkspaces: mounts.sessionFilesystems
       ? (yield* store.listSessionWorkspaces).filter((workspace): workspace is MadeSessionWorkspace => workspace.madeAt !== null)
       : [],
+    folderInstances: Option.isSome(yield* Effect.serviceOption(HostBayma)),
   }));
 });
 
@@ -281,6 +290,22 @@ export const handleWorkspaceControlCallback = Effect.fnUntraced(function*({ acti
     const notice = yield* applyWorkspaceChange(mounts.forkSessionWorkspace(conversationId));
     yield* client.sendMessage(chatId, notice);
     yield* editPanel(chatId, messageId, yield* workspacePanel(conversationId, notice));
+    return;
+  }
+  if (kind === "folder_retry" || kind === "folder_restart") {
+    const host = yield* Effect.serviceOption(HostBayma);
+    if (Option.isNone(host)) {
+      yield* client.answerCallbackQuery(callbackQueryId, "This deployment runs no folder instances.");
+      return;
+    }
+    // The harness its notice was of; from the panel, each harness's.
+    const harnesses: readonly HarnessName[] = payload["harness"] === CLAUDE_HARNESS || payload["harness"] === CODEX_HARNESS ? [payload["harness"]] : [CLAUDE_HARNESS, CODEX_HARNESS];
+    yield* client.answerCallbackQuery(callbackQueryId, kind === "folder_retry" ? "Starting its bayma…" : "Restarting its folder instance…");
+    const said = yield* Effect.forEach(harnesses, (harness) => {
+      const scope = { harness, threadKey: conversationId };
+      return Effect.map(kind === "folder_retry" ? host.value.retry(scope) : host.value.restart(scope), (told) => (harnesses.length > 1 ? `${harnessDisplayName(harness)}: ${told}` : told));
+    });
+    yield* client.sendMessage(chatId, said.join("\n"));
     return;
   }
   if (kind === "close") {

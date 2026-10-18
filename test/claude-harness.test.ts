@@ -31,13 +31,12 @@ import { ALASIO_CLAUDE_EFFORT, ALASIO_CLAUDE_MODEL } from "../src/harness/claude
 import { type ClaudeSessionApi, type ClaudeTranscriptStore, createClaudeSessionApi } from "../src/harness/claude/sessions.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { TurnParams, TurnPersistence, TurnResult } from "../src/harness/index.ts";
-import type { BaymaMcpServer, HostBaymaScope } from "../src/mcp/bayma.ts";
+import { type BaymaMcpServer, type FolderBaymaOutcome, type FolderBaymaScope, type HostBaymaScope, NoFolderWorkspaces } from "../src/mcp/bayma.ts";
 import type { ModelChoice } from "../src/persistence/conversation-repository.ts";
 import type { ResponseBlock as StoredBlock } from "../src/persistence/response-repository.ts";
 import { StoreError } from "../src/persistence/sql.ts";
 import type { NewRestartEvent } from "../src/persistence/restart-repository.ts";
 import type { SessionUsage } from "../src/persistence/usage-repository.ts";
-import { GatewayError } from "../src/sandbox/gateway-client.ts";
 import {
   assistantMessage,
   backgroundTasksChanged,
@@ -141,12 +140,12 @@ function abortSignalOf(options: Options): AbortSignal {
 }
 
 /** A folder conversation's bayma, as the deployment's host profile would give it. */
-const folderBayma = ({ threadKey }: Pick<HostBaymaScope, "threadKey">) =>
-  Effect.succeed<BaymaMcpServer>({
-    type: "http",
-    url: `http://bayma-${threadKey.replace(/\W/gu, "")}.alasio-host.svc:7290/mcp`,
-    headers: { Authorization: "Bearer t" },
-  });
+const folderServer = ({ threadKey }: Pick<HostBaymaScope, "threadKey">): BaymaMcpServer => ({
+  type: "http",
+  url: `http://alasio-sandbox-gateway.alasio.svc:8080/mcp`,
+  headers: { Authorization: `Bearer ${threadKey}` },
+});
+const folderBayma = (scope: Pick<HostBaymaScope, "threadKey">) => Effect.succeed<FolderBaymaOutcome>({ server: folderServer(scope), notice: null });
 
 /** A turn for runClaudeTurn: the turn, what its live sessions are made with, and the running turns they register in. */
 interface ClaudeTurnRun extends Omit<TurnParams, "modelChoice" | "ownTurns"> {
@@ -1036,6 +1035,44 @@ test("later prompts on the same session reuse the live process; a new session or
   await closeAll();
 });
 
+test("a turn whose folder's bayma did not start runs without it, told so before its prompt, and the next, its bayma started, runs in a process started anew with it", async () => {
+  const persistence = createPersistence();
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const notice = "Folder workspace /work: its bayma did not start (its pod is pending). This turn runs without bayma's REPL tools; your REPL sessions are kept and come back when it starts.";
+  const asked: Omit<FolderBaymaScope, "harness">[] = [];
+  let started = false;
+  const { liveSessions, closeAll } = openLiveSessions({
+    workingDirectory: "/work",
+    sessions: { sessionExists: () => Effect.succeed(true) },
+    queryFactory: cli.queryFactory,
+    folderBayma: (scope) => Effect.sync((): FolderBaymaOutcome => (asked.push(scope), started ? { server: folderServer(scope), notice: null } : { server: null, notice })),
+  }, activeTurns);
+  const run = async (prompt: string) => {
+    const turn = runTurn(liveSessions, turnParams(persistence, { prompt }));
+    const received = await cli.nextPrompt();
+    cli.emit(successResult({ result: "done", session_id: "s-1", user_message_uuids: [received.uuid] }));
+    await turn;
+    return received.message.content;
+  };
+  cli.emit(initMessage("s-1"));
+  assert.equal(await run("one"), `${notice}\n\none`);
+  assert.equal(cli.state.options[0]?.mcpServers, undefined, "no bayma");
+  // Asked again before the next turn, the process kept while it has none.
+  assert.equal(await run("two"), `${notice}\n\ntwo`);
+  assert.equal(cli.state.created, 1);
+  started = true;
+  assert.equal(await run("three"), "three");
+  assert.equal(cli.state.created, 2, "the process started anew with its bayma");
+  assert.deepEqual(Object.keys(cli.state.options[1]?.mcpServers ?? {}), ["bayma"]);
+  assert.equal(await run("four"), "four");
+  assert.equal(cli.state.created, 2);
+  // Its folder and its chat given, so a turn's failed bind is told there.
+  assert.equal(asked.length, 3);
+  assert.deepEqual(asked[0], { threadKey: "telegram:1", workingDirectory: "/work", chatId: turnParams(persistence).chatId });
+  await closeAll();
+});
+
 test("steering a Claude-started turn is answered in that turn's own reply", async () => {
   const persistence = createPersistence();
   const activeTurns = makeActiveTurns();
@@ -1110,13 +1147,13 @@ test("a Claude Code process that exits mid-turn fails that turn and the next pro
 test("a stop asked while Claude Code is still starting is done once the turn ends, though the start fails", async () => {
   const persistence = createPersistence();
   const activeTurns = makeActiveTurns();
-  const { promise: bayma, reject: failBayma } = Promise.withResolvers<BaymaMcpServer>();
+  const { promise: bayma, reject: failBayma } = Promise.withResolvers<FolderBaymaOutcome>();
   const { liveSessions, closeAll } = openLiveSessions({
     workingDirectory: "/work",
     sessions: quietSessions,
     queryFactory: () => assert.fail("Claude Code never starts"),
     // Starting the process waits on the conversation's bayma.
-    folderBayma: () => Effect.tryPromise({ try: () => bayma, catch: () => new GatewayError({ call: "bind folder:claude:telegram:1", status: 503, reason: "unreachable" }) }),
+    folderBayma: () => Effect.tryPromise({ try: () => bayma, catch: () => new NoFolderWorkspaces() }),
   }, activeTurns);
   const turn = runTurn(liveSessions, turnParams(persistence));
   while (!busy(activeTurns, "telegram:1")) {
@@ -1128,7 +1165,7 @@ test("a stop asked while Claude Code is still starting is done once the turn end
   const result = await turn;
   assert.equal(await settlesSoon(stopping), true, "the stop is done once the turn ends");
   assert.equal(result.responseCompleted, false);
-  assert.deepEqual(result.blockSequence, [{ type: "text", content: "Error: the sandbox gateway did not bind folder:claude:telegram:1 (503): unreachable" }]);
+  assert.deepEqual(result.blockSequence, [{ type: "text", content: "Error: this deployment offers no folder workspaces: it has no host profile" }]);
   assert.equal(busy(activeTurns, "telegram:1"), false);
   await closeAll();
 });
@@ -1137,7 +1174,7 @@ test("a stop asked while Claude Code is still starting stops the turn as it star
   const persistence = createPersistence();
   const activeTurns = makeActiveTurns();
   const cli = createFakeCli();
-  const { promise: bayma, resolve: answerBayma } = Promise.withResolvers<BaymaMcpServer>();
+  const { promise: bayma, resolve: answerBayma } = Promise.withResolvers<FolderBaymaOutcome>();
   const { liveSessions, closeAll } = openLiveSessions({
     workingDirectory: "/work",
     sessions: quietSessions,

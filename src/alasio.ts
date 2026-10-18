@@ -105,7 +105,7 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
  * folder workspaces' bayma (HostBayma), the gateway's folder instances, where it serves them.
  * They are not among AlasioServices, which are always there; what uses them asks whether they are.
  */
-function workspaceServices({ folders, sessionsGateway, stateDir, branch }: AlasioOptions): Layer.Layer<never, never, Store> {
+function workspaceServices({ folders, sessionsGateway, stateDir, branch }: AlasioOptions): Layer.Layer<never, never, Store | TelegramClient> {
   return Layer.mergeAll(
     sessionsGateway
       ? Layer.unwrap(Effect.gen(function*() {

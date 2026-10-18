@@ -15,7 +15,6 @@ import type { CallToolResult, ContentBlock } from "@modelcontextprotocol/sdk/typ
 import { Effect } from "effect";
 
 import { loadAlasioConfig } from "../../src/config.ts";
-import { HostBayma } from "../../src/mcp/bayma.ts";
 import { makeGatewayWorkspaces } from "../../src/sandbox/gateway-client.ts";
 import type { BaymaExecResult, BaymaSessionCreated } from "./session-roundtrip.ts";
 
@@ -33,10 +32,10 @@ function text(part: ContentBlock | undefined): string {
 
 const { sessionsGateway, folders } = loadAlasioConfig();
 if (!sessionsGateway || !folders) throw new Error("alasio is given no sandbox gateway that serves folder instances");
-const bayma = await Effect.runPromise(HostBayma.pipe(
-  Effect.flatMap((hostBayma) => hostBayma.ensure({ harness: "claude", threadKey: "e2e:folder" })),
-  Effect.provide(HostBayma.layer(makeGatewayWorkspaces(sessionsGateway).folders)),
-));
+// Bound ahead, as a turn binds it, then reached at its endpoint.
+const { folders: instances } = makeGatewayWorkspaces(sessionsGateway);
+const scope = { harness: "claude", threadKey: "e2e:folder" };
+const bayma = await Effect.runPromise(Effect.andThen(instances.bind(scope), instances.endpoint(scope)));
 const client = new Client({ name: "alasio-e2e", version: "1.0.0" });
 // The transport is one; the SDK declares its sessionId `string | undefined` where Transport has it optional.
 await client.connect(new StreamableHTTPClientTransport(new URL(bayma.url), { requestInit: { headers: bayma.headers } }) as Transport);

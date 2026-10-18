@@ -53,6 +53,20 @@ export class GatewayError extends Schema.TaggedError<GatewayError>()("GatewayErr
   }
 }
 
+/**
+ * A folder instance's bind failed, the gateway saying why, its pod deleted (../gateway/
+ * folders.ts); `held` where its binds failed one after another, so the gateway binds it again
+ * only as its caller asks.
+ */
+export class FolderBindFailed extends Schema.TaggedError<FolderBindFailed>()("FolderBindFailed", { reason: Schema.String, held: Schema.Boolean }) {
+  override get message(): string {
+    return this.reason;
+  }
+}
+
+/** What the gateway says of a failed bind: why, and whether it holds the key. */
+const BindRefusal = Schema.Struct({ reason: Schema.optional(Schema.String), held: Schema.optional(Schema.Boolean) });
+
 /** A bind refused as its pool had no pod for it in time, to be asked again after what it said. */
 class NotYet extends Schema.TaggedError<NotYet>()("NotYet", { reason: Schema.String }) {}
 
@@ -84,7 +98,8 @@ export interface GatewayWorkspaces {
   /** Folder conversations' instances (../gateway/folders.ts), each of a conversation under a harness: its bayma's endpoint, its bind ahead of any request, and its release. */
   readonly folders: {
     readonly endpoint: (scope: FolderScope) => Effect.Effect<BaymaEndpoint>;
-    readonly bind: (scope: FolderScope) => Effect.Effect<void, GatewayError>;
+    /** Its bind, once, as its pod is made and its bayma starts: refused, saying why, where it failed, or the gateway holds it; `retry` binds one held. */
+    readonly bind: (scope: FolderScope, options?: { readonly retry?: boolean }) => Effect.Effect<void, GatewayError | FolderBindFailed>;
     readonly release: (scope: FolderScope) => Effect.Effect<void, GatewayError>;
   };
 }
@@ -175,7 +190,19 @@ export function makeGatewayWorkspaces({ url, environment, callerKey }: GatewayWo
     bind: (volumeId, mode) => bindBy(`bind ${volumeId}`, tokenOf(volumeId, mode)),
     folders: {
       endpoint: ({ harness, threadKey }) => Effect.map(tokenFor(folderKey(harness, threadKey), {}), (token) => ({ url: `${base}/mcp`, headers: { Authorization: `Bearer ${token}` } })),
-      bind: ({ harness, threadKey }) => bindBy(`bind the folder instance of ${threadKey} under ${harness}`, tokenFor(folderKey(harness, threadKey), {})),
+      // Once: its bind waits as its pod is made and its bayma starts, and one asked again would fail as it did.
+      bind: ({ harness, threadKey }, { retry = false } = {}) => {
+        const what = `bind the folder instance of ${threadKey} under ${harness}`;
+        return askAs(what, tokenFor(folderKey(harness, threadKey), retry ? { retry: "1" } : {}), "POST", "/bind", { timeoutMs: LONG_CALL_TIMEOUT_MS }).pipe(
+          Effect.flatMap(({ status, bytes }): Effect.Effect<void, GatewayError | FolderBindFailed> => {
+            if (status === 204) return Effect.void;
+            if (status !== 503) return Effect.fail(new GatewayError({ call: what, status, reason: said(bytes) }));
+            const refusal = Schema.decodeUnknownOption(Schema.fromJsonString(BindRefusal))(Buffer.from(bytes).toString("utf8"));
+            const { reason, held } = refusal._tag === "Some" ? refusal.value : {};
+            return Effect.fail(new FolderBindFailed({ reason: reason ?? said(bytes), held: held ?? false }));
+          }),
+        );
+      },
       release: ({ harness, threadKey }) => {
         const what = `release the folder instance of ${threadKey} under ${harness}`;
         return askAs(what, tokenFor(folderKey(harness, threadKey), {}), "POST", "/release", { timeoutMs: LONG_CALL_TIMEOUT_MS }).pipe(Effect.flatMap(expect(what, [204])), Effect.asVoid);

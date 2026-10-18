@@ -48,7 +48,7 @@ export const makeClaudeHarness = Effect.fnUntraced(function*({
     sessions,
     sessionStore,
     sessionFsBayma,
-    folderBayma: ({ threadKey }) => folderBayma({ harness: CLAUDE_HARNESS, threadKey }),
+    folderBayma: (scope) => folderBayma({ ...scope, harness: CLAUDE_HARNESS }),
     queryFactory: claudeQueryFactory,
   });
   return {

@@ -33,14 +33,12 @@ export function codexMcpServer(server: BaymaEndpoint): CodexMcpServer {
   return { url: server.url, http_headers: server.headers, startup_timeout_sec: BAYMA_STARTUP_TIMEOUT_MS / 1000 };
 }
 
-/** The overrides for a folder workspace's thread, whose bayma server is `bayma`. */
-export function buildCodexThreadConfig({ codexEnv, bayma }: { readonly codexEnv: CodexEnv; readonly bayma: BaymaEndpoint }): CodexThreadConfig {
+/** The overrides for a folder workspace's thread, whose bayma server is `bayma`: none where its bayma did not start. */
+export function buildCodexThreadConfig({ codexEnv, bayma }: { readonly codexEnv: CodexEnv; readonly bayma: BaymaEndpoint | null }): CodexThreadConfig {
   return {
     project_doc_max_bytes: 32768,
     // An override replaces the config's own, so the operator's are kept, then alasio's.
     developer_instructions: withReplyInstructions(operatorDeveloperInstructions(codexHome(codexEnv))),
-    mcp_servers: {
-      [BAYMA_SERVER_NAME]: codexMcpServer(bayma),
-    },
+    mcp_servers: bayma ? { [BAYMA_SERVER_NAME]: codexMcpServer(bayma) } : {},
   };
 }

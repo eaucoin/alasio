@@ -47,6 +47,8 @@ function getErrorMessage(error: unknown): string {
 /** What a call runs against: a listing scope, with the config its threads run with. */
 export interface CodexScope extends CodexListingScope {
   readonly codexConfig: CodexThreadConfig;
+  /** Why the call runs without its folder's bayma, which a turn's prompt is told: none where it has it, or runs in a session filesystem. */
+  readonly baymaNotice?: string | null | undefined;
 }
 
 /** What a call could not be run against: the workspace's bayma, its session's host, or its Codex did not come up. */
@@ -71,6 +73,8 @@ export interface CodexScopeParams {
   readonly scope?: CodexScopeProvider | null | undefined;
   /** The conversation's bayma in a folder workspace; none unless the deployment, or a test, gives one. */
   readonly folderBayma?: FolderBayma | undefined;
+  /** The chat to tell of a folder's bayma that did not start: a turn's; none for a call no operator waits on. */
+  readonly noticeChatId?: string | undefined;
 }
 
 export interface ForkCodexSessionParams extends CodexScopeParams {
@@ -118,12 +122,13 @@ const folderCodexScope = ({
   threadKey,
   appServer,
   folderBayma = noFolderBayma,
+  noticeChatId,
 }: Omit<CodexScopeParams, "scope">): Effect.Effect<CodexScope, CodexScopeError> =>
-  folderBayma({ harness: CODEX_HARNESS, threadKey }).pipe(
+  folderBayma({ harness: CODEX_HARNESS, threadKey, workingDirectory, chatId: noticeChatId }).pipe(
     Effect.mapError((cause) => new CodexScopeError({ cause })),
-    Effect.map((bayma) => {
+    Effect.map(({ server, notice }) => {
       const codexEnv = buildCodexEnv();
-      return { cwd: workingDirectory, codexEnv, codexConfig: buildCodexThreadConfig({ codexEnv, bayma }), appServer };
+      return { cwd: workingDirectory, codexEnv, codexConfig: buildCodexThreadConfig({ codexEnv, bayma: server }), appServer, baymaNotice: notice };
     }),
   );
 
@@ -277,7 +282,7 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
 
   /** The turn's events, read to their end, in a scope the transport keeps what it runs in. */
   const readEvents = Effect.scoped(Effect.gen(function*() {
-    const { cwd, codexEnv, codexConfig, appServer } = yield* codexScope(params);
+    const { cwd, codexEnv, codexConfig, appServer, baymaNotice } = yield* codexScope({ ...params, noticeChatId: params.chatId });
     yield* turnTimer("env.built");
     yield* turnTimer("bayma.ready");
     const streamParams: CodexStreamParams = {
@@ -286,7 +291,8 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
       workingDirectory: cwd,
       codexEnv,
       codexConfig,
-      prompt,
+      // Told, where it runs without its folder's bayma, that its REPL tools are gone.
+      prompt: baymaNotice ? `${baymaNotice}\n\n${prompt}` : prompt,
       modelChoice: params.modelChoice,
       persistence,
       pendingResponseId,

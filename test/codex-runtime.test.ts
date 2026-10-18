@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { ThreadEvent } from "@openai/codex-sdk";
+import type { Thread, ThreadEvent } from "@openai/codex-sdk";
 import { Effect, Layer, Logger } from "effect";
 
 import { makeAppServer } from "../src/codex/app-server/client.ts";
@@ -9,13 +9,18 @@ import { executeCodexTurn } from "../src/codex/runtime.ts";
 import type { CodexExecClient } from "../src/codex/transport.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { TurnPersistence } from "../src/harness/index.ts";
+import type { FolderBayma, FolderBaymaScope } from "../src/mcp/bayma.ts";
 import { type Hold, recordingBusyPods } from "./support/busy-pods.ts";
 import { ownTurnsOn } from "./support/persistence.ts";
+
+/** The prompts the test's Codex was given, in order. */
+const prompted: string[] = [];
 
 /** A Codex whose every thread runs one turn that edits three files, answers, and completes. */
 function codexFactory(): CodexExecClient {
   const thread = {
-    async runStreamed() {
+    async runStreamed(prompt: Parameters<Pick<Thread, "runStreamed">["runStreamed"]>[0]) {
+      prompted.push(String(prompt));
       return {
         events: (async function* (): AsyncGenerator<ThreadEvent> {
           yield { type: "thread.started", thread_id: "thread-1" };
@@ -60,7 +65,7 @@ function recordingPersistence(calls: string[], stored: unknown[][] = []): TurnPe
 const runTurn = (
   persistence: TurnPersistence,
   beforeResponseComplete: (sessionId: string | null | undefined) => Effect.Effect<void> = () => Effect.void,
-  { holds = [] }: { readonly holds?: Hold[] } = {},
+  { holds = [], folderBayma = () => Effect.succeed({ server: { type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }, notice: null }) }: { readonly holds?: Hold[]; readonly folderBayma?: FolderBayma } = {},
 ) =>
   Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     // The exec transport's turn, which no app-server serves.
@@ -77,7 +82,7 @@ const runTurn = (
       persistence,
       appServer,
       codexFactory,
-      folderBayma: () => Effect.succeed({ type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }),
+      folderBayma,
       beforeResponseComplete,
     });
   })).pipe(Effect.provide([ActiveTurns.layer.pipe(Layer.provide(recordingBusyPods(holds).layer)), Logger.layer([])])));
@@ -110,4 +115,13 @@ test("the blocks an event adds to a turn's response are stored together, in one 
     [{ type: "text", content: "done", phase: null }],
   ]);
   assert.deepEqual(result.blockSequence, stored.flat());
+});
+
+test("a turn whose folder's bayma did not start runs without it, its prompt told so first, its chat given to tell", async () => {
+  const asked: FolderBaymaScope[] = [];
+  const notice = "Folder workspace /work: its bayma did not start (its pod is pending). This turn runs without bayma's REPL tools; your REPL sessions are kept and come back when it starts.";
+  prompted.length = 0;
+  await runTurn(recordingPersistence([]), () => Effect.void, { folderBayma: (scope) => Effect.sync(() => (asked.push(scope), { server: null, notice })) });
+  assert.deepEqual(prompted, [`${notice}\n\nhello`]);
+  assert.deepEqual(asked.map(({ harness, threadKey, chatId }) => ({ harness, threadKey, chatId })), [{ harness: "codex", threadKey: "conversation-1", chatId: "1" }]);
 });

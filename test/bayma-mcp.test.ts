@@ -1,36 +1,90 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Effect } from "effect";
+import type { InlineKeyboardMarkup } from "@grammyjs/types";
+import { Effect, Layer } from "effect";
 
 import { buildCodexThreadConfig, codexMcpServer } from "../src/codex/thread-config.ts";
 import { claudeMcpServers } from "../src/harness/claude/mcp.ts";
 import { type BaymaMcpServer, folderBayma, HostBayma, noFolderBayma } from "../src/mcp/bayma.ts";
-import type { FolderScope } from "../src/sandbox/gateway-client.ts";
+import { Store } from "../src/persistence/store.ts";
+import { FolderBindFailed, type FolderScope, GatewayError, type GatewayWorkspaces } from "../src/sandbox/gateway-client.ts";
+import { run, testStore } from "./support/store.ts";
+import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 
 const BAYMA: BaymaMcpServer = { type: "http", url: "http://alasio-sandbox-gateway.alasio.svc:8080/mcp", headers: { Authorization: "Bearer folder.t" } };
 
 test("a deployment whose gateway serves no folder instances offers no folder bayma", async () => {
   const none = Effect.runSync(folderBayma);
   assert.equal(none, noFolderBayma);
-  const refused = await Effect.runPromise(Effect.flip(none({ harness: "claude", threadKey: "telegram:42" })));
+  const refused = await Effect.runPromise(Effect.flip(none({ harness: "claude", threadKey: "telegram:42", workingDirectory: "/home/op/repo" })));
   assert.equal(refused.message, "this deployment offers no folder workspaces: it has no host profile");
 });
 
-test("a folder conversation's bayma is its folder instance, bound through the gateway before its endpoint is given, in Claude Code's shape", async () => {
+/** Folder instances as the gateway's client gives them, binding as `binds` says, each call recorded in `calls`. */
+function fakeFolders(binds: () => Effect.Effect<void, FolderBindFailed | GatewayError>) {
   const calls: string[] = [];
-  const said = (verb: string) => (scope: FolderScope) => Effect.sync(() => void calls.push(`${verb} ${scope.harness} ${scope.threadKey}`));
   const folders = {
-    bind: said("bind"),
-    release: said("release"),
-    endpoint: (scope: FolderScope) => Effect.as(said("endpoint")(scope), { url: BAYMA.url, headers: BAYMA.headers }),
+    bind: (scope: FolderScope, { retry = false }: { readonly retry?: boolean } = {}) => Effect.andThen(Effect.sync(() => void calls.push(`bind${retry ? " retry" : ""} ${scope.harness} ${scope.threadKey}`)), binds()),
+    release: (scope: FolderScope) => Effect.sync(() => void calls.push(`release ${scope.harness} ${scope.threadKey}`)),
+    endpoint: (scope: FolderScope) => Effect.sync(() => (calls.push(`endpoint ${scope.harness} ${scope.threadKey}`), { url: BAYMA.url, headers: BAYMA.headers })),
   };
-  const server = await Effect.runPromise(Effect.provide(
-    Effect.flatMap(folderBayma, (ensure) => ensure({ harness: "claude", threadKey: "telegram:42" })),
-    HostBayma.layer(folders),
-  ));
-  assert.deepEqual(server, BAYMA);
+  return { calls, folders };
+}
+
+/** Runs `use` of HostBayma on `folders`, on a store holding the conversation telegram:42 and Telegram recording into `telegram`. */
+async function withHostBayma<A>(folders: GatewayWorkspaces["folders"], telegram: RecordingTelegram, use: (host: HostBayma["Service"]) => Effect.Effect<A>): Promise<A> {
+  const store = await testStore();
+  await run(store.upsertConversation({ chatId: 42, user: { id: 1 } }));
+  return Effect.runPromise(Effect.flatMap(HostBayma, use).pipe(Effect.provide(HostBayma.layer(folders).pipe(Layer.provide(Layer.merge(Layer.succeed(Store, store), telegram.layer))))));
+}
+
+const SCOPE = { harness: "claude", threadKey: "telegram:42", workingDirectory: "/home/op/repo" } as const;
+
+test("a folder conversation's bayma is its folder instance, bound through the gateway before its endpoint is given, in Claude Code's shape", async () => {
+  const { calls, folders } = fakeFolders(() => Effect.void);
+  const telegram = recordingTelegram();
+  const outcome = await withHostBayma(folders, telegram, (host) => host.ensure({ ...SCOPE, chatId: "42" }));
+  assert.deepEqual(outcome, { server: BAYMA, notice: null });
   assert.deepEqual(calls, ["bind claude telegram:42", "endpoint claude telegram:42"]);
+  assert.deepEqual(telegram.calls.sendMessage, []);
+});
+
+test("a folder instance that did not start leaves the turn without bayma, told why, the chat told first with buttons to retry and to restart it; held, the chat is told so once, until a bind goes through", async () => {
+  let failing: FolderBindFailed | null = new FolderBindFailed({ reason: "its pod is pending: no node", held: false });
+  const { calls, folders } = fakeFolders(() => (failing ? Effect.fail(failing) : Effect.void));
+  const telegram = recordingTelegram();
+  const told = () => telegram.calls.sendMessage.map(([, text, options]) => [text, (options as { reply_markup?: InlineKeyboardMarkup } | undefined)?.reply_markup?.inline_keyboard.flat().map(({ text: label }) => label)]);
+  await withHostBayma(folders, telegram, (host) =>
+    Effect.gen(function*() {
+      const notice = "Folder workspace /home/op/repo: its bayma did not start (its pod is pending: no node). This turn runs without bayma's REPL tools; your REPL sessions are kept and come back when it starts.";
+      assert.deepEqual(yield* host.ensure({ ...SCOPE, chatId: "42" }), { server: null, notice });
+      assert.deepEqual(told(), [[notice, ["Retry now", "Restart folder instance"]]]);
+      // No chat given, none told: a call no operator waits on.
+      assert.deepEqual(yield* host.ensure(SCOPE), { server: null, notice });
+      assert.equal(told().length, 1);
+      failing = new FolderBindFailed({ reason: "its last 3 binds failed, the last as its pod is pending: no node", held: true });
+      const held = "Folder workspace /home/op/repo: its bayma failed to start three times in a row (its last 3 binds failed, the last as its pod is pending: no node), so alasio tries no more until you ask. This turn runs without bayma's REPL tools; your REPL sessions are kept and come back when it starts.";
+      assert.deepEqual(yield* host.ensure({ ...SCOPE, chatId: "42" }), { server: null, notice: held });
+      assert.deepEqual(yield* host.ensure({ ...SCOPE, chatId: "42" }), { server: null, notice: held });
+      assert.deepEqual(told().map(([text]) => text), [notice, held], "held, told once");
+      // As the operator asks, bound again though held.
+      failing = null;
+      assert.equal(yield* host.retry(SCOPE), "Its bayma started: the next message works with its REPL tools.");
+      assert.equal(yield* host.restart(SCOPE), "Its folder instance stopped, its REPL sessions saved: the next message starts it anew.");
+    }));
+  assert.deepEqual(calls.filter((call) => !call.startsWith("bind claude")), ["bind retry claude telegram:42", "release claude telegram:42"]);
+});
+
+test("a retry that fails says why, and a restart the gateway refuses says it was not", async () => {
+  const telegram = recordingTelegram();
+  const { folders } = fakeFolders(() => Effect.fail(new FolderBindFailed({ reason: "its bayma ended (Error)", held: false })));
+  const refusing = { ...folders, release: () => Effect.fail(new GatewayError({ call: "release the folder instance of telegram:42 under claude", status: 503, reason: "not now" })) };
+  const said = await withHostBayma(refusing, telegram, (host) => Effect.all([host.retry(SCOPE), host.restart(SCOPE)]));
+  assert.deepEqual(said, [
+    "Its bayma did not start: its bayma ended (Error)",
+    "Its folder instance could not be restarted: the sandbox gateway did not release the folder instance of telegram:42 under claude (503): not now",
+  ]);
 });
 
 test("alasio adds bayma to Claude Code's servers, in its shape", () => {
@@ -41,6 +95,8 @@ test("Codex threads add bayma over HTTP and leave the operator's servers and app
   const config = buildCodexThreadConfig({ codexEnv: {}, bayma: BAYMA });
   assert.deepEqual(config.mcp_servers, { bayma: codexMcpServer(BAYMA) });
   assert.deepEqual(codexMcpServer(BAYMA), { url: BAYMA.url, http_headers: BAYMA.headers, startup_timeout_sec: 60 });
+  // Of a folder whose bayma did not start, none of alasio's.
+  assert.deepEqual(buildCodexThreadConfig({ codexEnv: {}, bayma: null }).mcp_servers, {});
   // The config's type has no `features`; this pins that none is sent at all.
   assert.equal(Reflect.get(config, "features"), undefined);
 });

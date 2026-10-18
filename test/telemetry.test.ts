@@ -479,7 +479,7 @@ test("Claude Code's process does not join the turn's trace, and its hooks and re
         workingDirectory: "/work",
         sessions: { sessionExists: () => Effect.succeed(false) },
         queryFactory,
-        folderBayma: () => Effect.succeed({ type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }),
+        folderBayma: () => Effect.succeed({ server: { type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }, notice: null }),
       });
       const result = yield* liveSessions.runTurn({
         prompt: "hello",
