@@ -28,7 +28,10 @@
  * image holds, where the agent told them (expect), counted once each, however they were
  * read, or, where it did not, whose last request ended within QUIET_MS. A background
  * load's reads may be spaced as long as its loader paces them, longer than any quiet: the
- * bytes say when it is done.
+ * bytes say when it is done. A pages file's bytes are counted as they are handed to the
+ * gofer's connection, from where the bucket's answer says they begin (its Content-Range, or
+ * 0 for the whole object), an answer cut short counting what it gave, as the gofer keeps
+ * those bytes and asks only for the rest.
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, request as httpRequest, type Server, type ServerResponse } from "node:http";
@@ -75,12 +78,14 @@ export interface StoreProxy {
   /** The token `holder` holds, if any, lasts `ms` from now, as its restore's sandbox, resumed, reads the rest of its pages. */
   readonly resumed: (holder: string, ms: number) => void;
   /**
-   * The restore of the token `holder` holds, if any, reads `bytes` bytes of the pages files
-   * under its prefix, its image's and its layers' (`.../pages.img`), as runsc says of its
-   * image: until it has been served them all, it reads, however quiet; Infinity while they
-   * are not known yet, null where they are not known (then its quiet tells, as for none).
+   * The restore of the token `accessKeyId`, if the proxy holds it still, reads `bytes` bytes
+   * of the pages files under its prefix, its image's and its layers' (`.../pages.img`), as
+   * runsc says of its image: until it has been served them all, it reads, however quiet;
+   * Infinity while they are not known yet, null where they are not known (then its quiet
+   * tells, as for none). By the token, not its holder, so that what is said of one restore
+   * is never taken for a later one's of the same workspace.
    */
-  readonly expect: (holder: string, bytes: number | null) => void;
+  readonly expect: (accessKeyId: string, bytes: number | null) => void;
   /** Mints no token more, and ends once no restore reads through the proxy, as the module says. */
   readonly drained: Effect.Effect<void>;
   /** How many restores read through the proxy, as its drain waits on them. */
@@ -181,6 +186,8 @@ interface HeldToken {
   expected: number | null;
   /** The byte ranges of each pages file it was served, each [start, end), sorted and apart. */
   readonly served: Map<string, [number, number][]>;
+  /** How many bytes those ranges hold, together. */
+  servedBytes: number;
   /** Whether it has been served every byte it was expected to, as the proxy logs once. */
   servedAll: boolean;
 }
@@ -188,11 +195,17 @@ interface HeldToken {
 /** Whether `key` is a pages file of an image's, as a restore's background load reads them. */
 const isPagesFile = (key: string): boolean => key.endsWith("/pages.img");
 
-/** Where the range `header` asks for begins (bytes=START-…), 0 for none; null for one the proxy does not count. */
-function rangeStart(header: string | undefined): number | null {
-  if (header === undefined) return 0;
-  const start = /^bytes=(\d+)-\d*$/u.exec(header)?.[1];
-  return start === undefined ? null : Number(start);
+/**
+ * Where the body of the bucket's answer `status`, of Content-Range `range`, begins in its
+ * object: 0 for the whole object (200), its range's first byte for part of it (206); null for
+ * any other, and for a part whose range does not say (bytes FIRST-LAST/SIZE), which the proxy
+ * counts nothing of.
+ */
+export function answerStart(status: number, range: string | undefined): number | null {
+  if (status === 200) return 0;
+  if (status !== 206 || range === undefined) return null;
+  const first = /^bytes (\d+)-\d+\/(?:\d+|\*)$/u.exec(range)?.[1];
+  return first === undefined ? null : Number(first);
 }
 
 /** `ranges`, each [start, end), sorted and apart, with [start, end) added. */
@@ -208,8 +221,8 @@ export function withRange(ranges: readonly [number, number][], start: number, en
   return merged.sort(([a], [b]) => a - b);
 }
 
-/** How many bytes `token`'s restore was served of pages files, each counted once. */
-const servedBytes = (token: HeldToken): number => [...token.served.values()].reduce((sum, ranges) => sum + ranges.reduce((each, [a, b]) => each + b - a, 0), 0);
+/** How many bytes `ranges` hold. */
+const bytesOf = (ranges: readonly [number, number][]): number => ranges.reduce((sum, [a, b]) => sum + b - a, 0);
 
 /** The proxy of `store`, as the module says, listening on `host`:`port` for as long as the scope lasts. */
 export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, preparedForMs = PREPARED_FOR_MS, quietMs = QUIET_MS }: StoreProxyOptions): Effect.fn.Return<StoreProxy, StoreProxyError, Scope.Scope> {
@@ -272,10 +285,18 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
   };
 
   /**
-   * Asks the bucket for what `request` asked, as the agent, streaming its answer back; the
-   * bytes of a successful answer, as they stream, given to `carried`.
+   * Asks the bucket for what `request` asked, as the agent, streaming its answer back: where
+   * its body begins in the object given to `answered` (answerStart), and each part of it
+   * handed to the client's connection, as it is, to `delivered`.
    */
-  const forward = async (request: IncomingMessage, response: ServerResponse, path: string, query: Record<string, string>, carried: (bytes: number) => void = () => {}): Promise<void> => {
+  const forward = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+    path: string,
+    query: Record<string, string>,
+    answered: (start: number | null) => void = () => {},
+    delivered: (bytes: number) => void = () => {},
+  ): Promise<void> => {
     const headers: Record<string, string> = { host: upstream.host, "x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" };
     if (request.headers.range !== undefined) headers["range"] = String(request.headers.range);
     const signed = await upstreamSigner.sign({ method: "GET", protocol: upstream.protocol, hostname: upstream.hostname, ...(upstream.port === "" ? {} : { port: Number(upstream.port) }), path, query, headers });
@@ -298,10 +319,21 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
       }
       const status = answer.statusCode ?? 502;
       response.writeHead(status, kept);
-      if (status === 200 || status === 206) answer.on("data", (chunk: Buffer) => carried(chunk.length));
-      answer.pipe(response);
+      answered(answerStart(status, typeof answer.headers["content-range"] === "string" ? answer.headers["content-range"] : undefined));
+      // As a pipe streams it, held back while the client's connection is, each part counted
+      // once its connection has taken it.
+      answer.on("data", (chunk: Buffer) => {
+        const more = response.write(chunk, (error) => {
+          if (!error) delivered(chunk.length);
+        });
+        if (!more) answer.pause();
+      });
+      response.on("drain", () => answer.resume());
+      answer.once("end", () => {
+        response.off("close", abandoned);
+        response.end();
+      });
       answer.once("error", () => response.destroy());
-      answer.once("end", () => response.off("close", abandoned));
     });
     asked.once("error", (error) => {
       if (response.headersSent) response.destroy();
@@ -323,23 +355,22 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
       if ("refused" in grant) return refuse(response, 403, "AccessDenied", grant.refused);
       const { token } = grant;
       if (!key.startsWith(token.prefix)) return refuse(response, 403, "AccessDenied", "the object is not one the restore reads");
-      // Under way until its answer ends, however it ends; the bytes of a pages file it carried
-      // counted as served once its answer was given whole, as its gofer reads again what it
-      // was not.
+      // Under way until its answer ends, however it ends; the bytes of a pages file it gave
+      // counted as served then, from where the bucket said they begin, however much of it was
+      // given, as its gofer asks again for the rest alone.
       token.under += 1;
       token.lastAt = Date.now();
-      const start = isPagesFile(key) ? rangeStart(request.headers.range) : null;
-      let carried = 0;
+      let start: number | null = null;
+      let given = 0;
       response.once("close", () => {
         token.under -= 1;
         token.lastAt = Date.now();
-        if (start !== null && response.writableFinished) {
-          token.served.set(key, withRange(token.served.get(key) ?? [], start, start + carried));
-          servedAllOnce(token);
-        }
+        if (start !== null && given > 0) served(token, key, start, start + given);
       });
-      await forward(request, response, path, query, (bytes) => {
-        carried += bytes;
+      await forward(request, response, path, query, (from) => {
+        start = isPagesFile(key) ? from : null;
+      }, (bytes) => {
+        given += bytes;
       });
     })().catch((error: unknown) => {
       if (response.headersSent) response.destroy();
@@ -361,12 +392,21 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
   const address = server.address() as AddressInfo;
   const shown = address.family === "IPv6" ? `[${address.address}]` : address.address;
 
+  /** `token`'s restore served [start, end) of the pages file `key`, its total kept as it goes. */
+  const served = (token: HeldToken, key: string, start: number, end: number): void => {
+    const before = token.served.get(key) ?? [];
+    const after = withRange(before, start, end);
+    token.served.set(key, after);
+    token.servedBytes += bytesOf(after) - bytesOf(before);
+    servedAllOnce(token);
+  };
+
   /**
    * Logs, once, that `token`'s restore has been served every byte of pages it was expected
    * to: its reads through the proxy are done, as an agent stopped from then on need not wait.
    */
   const servedAllOnce = (token: HeldToken): void => {
-    if (token.servedAll || token.expected === null || servedBytes(token) < token.expected) return;
+    if (token.servedAll || token.expected === null || token.servedBytes < token.expected) return;
     token.servedAll = true;
     runFork(Effect.logInfo(`the restore of ${token.holder} has been served all ${token.expected} bytes of its pages through the node agent`));
   };
@@ -375,7 +415,7 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
   const reading = (): number => {
     const now = Date.now();
     return [...tokens.values()].filter((token) =>
-      now < token.until && (!token.resumed || token.under > 0 || (token.expected === null ? now - token.lastAt < quietMs : servedBytes(token) < token.expected))
+      now < token.until && (!token.resumed || token.under > 0 || (token.expected === null ? now - token.lastAt < quietMs : token.servedBytes < token.expected))
     ).length;
   };
 
@@ -390,7 +430,7 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
       const accessKeyId = `ALASIO${randomBytes(10).toString("hex").toUpperCase()}`;
       const secretAccessKey = randomBytes(32).toString("base64url");
       const now = Date.now();
-      tokens.set(accessKeyId, { secretAccessKey, prefix, holder, until: now + preparedForMs, resumed: false, under: 0, lastAt: now, expected: null, served: new Map(), servedAll: false });
+      tokens.set(accessKeyId, { secretAccessKey, prefix, holder, until: now + preparedForMs, resumed: false, under: 0, lastAt: now, expected: null, served: new Map(), servedBytes: 0, servedAll: false });
       held.set(holder, accessKeyId);
       return { accessKeyId, secretAccessKey };
     },
@@ -408,8 +448,8 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
       token.resumed = true;
       token.lastAt = now;
     },
-    expect: (holder, bytes) => {
-      const token = tokens.get(held.get(holder) ?? "");
+    expect: (accessKeyId, bytes) => {
+      const token = tokens.get(accessKeyId);
       if (!token) return;
       token.expected = bytes;
       servedAllOnce(token);

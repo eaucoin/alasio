@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { Effect, Fiber, Logger, type Scope } from "effect";
 
 import { sigV4Authorization } from "../src/node-agent/s3.ts";
-import { keyOf, makeStoreProxy, SKEW_MS, type StoreProxy, type StoreProxyOptions, type StoreToken, withRange } from "../src/node-agent/store-proxy.ts";
+import { answerStart, keyOf, makeStoreProxy, SKEW_MS, type StoreProxy, type StoreProxyOptions, type StoreToken, withRange } from "../src/node-agent/store-proxy.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
 
 // The snapshots bucket through the node agent, as a restore's checkpoint gofer reads it
@@ -245,7 +245,7 @@ test("a resumed restore told the bytes of pages its image holds reads until it h
       const token = minted(proxy);
       const read = (range?: string, key = KEY) => Effect.promise(() => ask(proxy.endpoint, `/snapshots/${key}`, { token, ...(range === undefined ? {} : { range }) })).pipe(Effect.map(refusal));
       proxy.resumed("main/fs-abc", 60_000);
-      proxy.expect("main/fs-abc", 4096);
+      proxy.expect(token.accessKeyId, 4096);
       // Its first half read, then nothing for longer than its quiet: it reads on, as its loader paces it.
       assert.equal(yield* read("bytes=0-2047"), "206 ");
       yield* sleep(300);
@@ -262,7 +262,7 @@ test("a resumed restore told the bytes of pages its image holds reads until it h
       assert.equal(proxy.reading(), 0);
       // Read again, and told again: logged once.
       assert.equal(yield* read("bytes=0-4095"), "206 ");
-      proxy.expect("main/fs-abc", 4096);
+      proxy.expect(token.accessKeyId, 4096);
       yield* sleep(50);
       assert.deepEqual(logged.filter((line) => line.includes("has been served")), [SERVED_ALL]);
       yield* proxy.drained.pipe(Effect.timeout("2 seconds"));
@@ -275,11 +275,11 @@ test("a resumed restore served its pages before the proxy is told how many bytes
     Effect.gen(function*() {
       const token = minted(proxy);
       proxy.resumed("main/fs-abc", 60_000);
-      proxy.expect("main/fs-abc", Number.POSITIVE_INFINITY);
+      proxy.expect(token.accessKeyId, Number.POSITIVE_INFINITY);
       assert.equal(refusal(yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token }))), "200 ");
       yield* sleep(50);
       assert.equal(proxy.reading(), 1);
-      proxy.expect("main/fs-abc", 4096);
+      proxy.expect(token.accessKeyId, 4096);
       assert.equal(proxy.reading(), 0);
       yield* sleep(50);
       assert.deepEqual(logged.filter((line) => line.includes("has been served")), [SERVED_ALL]);
@@ -289,17 +289,98 @@ test("a resumed restore served its pages before the proxy is told how many bytes
 test("a resumed restore whose bytes of pages are not known yet reads however quiet, and once told none, as its quiet says", () =>
   withProxy(({ proxy }) =>
     Effect.gen(function*() {
-      minted(proxy);
+      const token = minted(proxy);
       proxy.resumed("main/fs-abc", 60_000);
-      proxy.expect("main/fs-abc", Number.POSITIVE_INFINITY);
+      proxy.expect(token.accessKeyId, Number.POSITIVE_INFINITY);
       yield* sleep(300);
       assert.equal(proxy.reading(), 1);
-      proxy.expect("main/fs-abc", null);
+      proxy.expect(token.accessKeyId, null);
       assert.equal(proxy.reading(), 0);
-      // Of a holder of none, nothing.
-      proxy.expect("main/fs-none", 1);
+      // Of a token there is not, nothing.
+      proxy.expect("ALASIONONE", 1);
       assert.equal(proxy.reading(), 0);
     }), { quietMs: 100 }));
+
+test("what the proxy is told of a restore's bytes is of the token it names, never of a later token of the same workspace", () =>
+  withProxy(({ proxy }) =>
+    Effect.gen(function*() {
+      const before = minted(proxy);
+      const after = minted(proxy);
+      proxy.resumed("main/fs-abc", 60_000);
+      // A slow inspect of the restore before tells its bytes once the next one is prepared: not the next one's.
+      proxy.expect(before.accessKeyId, 4096);
+      yield* sleep(300);
+      assert.equal(proxy.reading(), 0);
+      proxy.expect(after.accessKeyId, 4096);
+      assert.equal(proxy.reading(), 1);
+    }), { quietMs: 100 }));
+
+/** A GET of `path` through `endpoint`, signed with `token`, of `range`, its client ending it once `cutAt` bytes of its body came: how many did. */
+function askCut(endpoint: string, path: string, token: StoreToken, range: string, cutAt: number): Promise<number> {
+  const url = new URL(endpoint);
+  const headers: Record<string, string> = { host: url.host, "x-amz-date": amzDate(new Date()), "x-amz-content-sha256": EMPTY, range };
+  headers["authorization"] = sigV4Authorization({ method: "GET", path, query: {}, headers: { ...headers }, payloadHash: EMPTY }, { region: "us-east-1", service: "s3" }, token);
+  return new Promise((resolve, reject) => {
+    const asked = httpRequest({ host: url.hostname, port: url.port, path, headers }, (response) => {
+      let came = 0;
+      response.on("data", (chunk: Buffer) => {
+        came += chunk.length;
+        if (came >= cutAt) {
+          asked.destroy();
+          resolve(came);
+        }
+      });
+      response.on("end", () => resolve(came));
+    });
+    asked.on("error", (error) => (asked.destroyed ? undefined : reject(error)));
+    asked.end();
+  });
+}
+
+test("an answer of pages cut short counts what it gave, as the gofer keeps it and asks for the rest alone", () =>
+  withProxy(({ proxy, s3 }) =>
+    Effect.gen(function*() {
+      const size = 16 * 1024 * 1024;
+      s3.objects.set(KEY, Buffer.alloc(size, 3));
+      const token = minted(proxy);
+      proxy.resumed("main/fs-abc", 60_000);
+      proxy.expect(token.accessKeyId, size);
+      // Cut once a MiB came, as a connection lost mid-answer is.
+      const came = yield* Effect.promise(() => askCut(proxy.endpoint, `/snapshots/${KEY}`, token, `bytes=0-${size - 1}`, 1024 * 1024));
+      assert.ok(came >= 1024 * 1024 && came < size, `${came} bytes came`);
+      yield* sleep(100);
+      assert.equal(proxy.reading(), 1);
+      // The rest, from where it was cut: done.
+      const rest = yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token, range: `bytes=${came}-${size - 1}` }));
+      assert.equal(rest.body.length, size - came);
+      yield* sleep(50);
+      assert.equal(proxy.reading(), 0);
+    }), { quietMs: 100 }));
+
+test("pages are counted from where the bucket's answer says they begin, a range it answers whole from 0, whatever the request asked", () =>
+  withProxy(({ proxy }) =>
+    Effect.gen(function*() {
+      const token = minted(proxy);
+      proxy.resumed("main/fs-abc", 60_000);
+      proxy.expect(token.accessKeyId, 4096);
+      // A range the bucket does not take, which it answers with the whole object.
+      const asked = yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token, range: "bytes=-100" }));
+      assert.equal(asked.status, 200);
+      yield* sleep(50);
+      assert.equal(proxy.reading(), 0);
+    }), { quietMs: 100 }));
+
+test("an answer's body begins at 0 of a whole object, at its range's first byte of a part, and nowhere the proxy counts where its range does not say", () => {
+  assert.equal(answerStart(200, undefined), 0);
+  assert.equal(answerStart(200, "bytes 5-9/10"), 0);
+  assert.equal(answerStart(206, "bytes 1024-2047/4096"), 1024);
+  assert.equal(answerStart(206, "bytes 1024-2047/*"), 1024);
+  assert.equal(answerStart(206, undefined), null);
+  assert.equal(answerStart(206, "bytes */4096"), null);
+  assert.equal(answerStart(206, "items 0-1/2"), null);
+  assert.equal(answerStart(416, "bytes */4096"), null);
+  assert.equal(answerStart(500, undefined), null);
+});
 
 test("byte ranges are kept sorted and apart, those that meet or overlap merged", () => {
   assert.deepEqual(withRange([], 0, 10), [[0, 10]]);

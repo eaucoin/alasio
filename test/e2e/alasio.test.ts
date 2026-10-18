@@ -1628,18 +1628,25 @@ if (inShard("snapshots")) {
       });
       // What it says before and as it stops, followed from its start and from before its stop:
       // once its container is gone, its log can no more be read, though its pod is still
-      // there. However fast it was served the rest, the agent's stop waits on it, or the
-      // agent said it had been served it all before it stopped.
-      const log = following(NAMESPACE, agent, "node-agent", new RegExp(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: 1 read it now|the restore of ${SESSIONS}/${big} has been served all \\d+ bytes of its pages through the node agent`, "u"));
-      await log.started;
+      // there. Its stop waits on the restore while it reads, or found it had read every page
+      // already; either way it was served every byte of pages runsc said its image holds,
+      // which runsc did say, as the drain counts bytes and not its reads' quiet.
+      const waits = following(NAMESPACE, agent, "node-agent", new RegExp(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: 1 read it now`, "u"));
+      const servedAll = following(NAMESPACE, agent, "node-agent", new RegExp(`the restore of ${SESSIONS}/${big} has been served all [1-9]\\d* bytes of its pages through the node agent`, "u"));
+      const unsaid = following(NAMESPACE, agent, "node-agent", new RegExp(`runsc does not say how many bytes of pages the restore of ${SESSIONS}/${big} reads`, "u"));
+      const log = { stop: () => [waits, servedAll, unsaid].forEach((each) => each.stop()) };
+      await Promise.all([waits.started, servedAll.started, unsaid.started]);
       const stoppedAt = Date.now();
       await kube.remove(ref("Pod", agent, NAMESPACE));
       try {
         await until(`the node agent ${agent} gone`, async () => ((await kube.get(ref("Pod", agent, NAMESPACE))) === null ? true : undefined), 1_800_000);
         t.diagnostic(`the node agent ${agent} was gone ${Date.now() - stoppedAt} ms after it was stopped`);
-        const said = await Promise.race([log.said, sleep(30_000).then(() => undefined)]);
-        assert.ok(said, `the node agent ${agent} said neither, as it stopped, that it waits on the restore reading the bucket through it, nor before that it had served it all its pages`);
-        t.diagnostic(said);
+        const within = <A>(said: Promise<A>) => Promise.race([said, sleep(30_000).then(() => undefined)]);
+        const [waited, all, warned] = await Promise.all([within(waits.said), within(servedAll.said), within(unsaid.said)]);
+        assert.equal(warned, undefined, `the node agent ${agent} said runsc did not tell the bytes of pages of ${big}'s image: ${warned}`);
+        assert.ok(all, `the node agent ${agent} did not say it served ${big}'s restore all its pages`);
+        t.diagnostic(waited ?? `the node agent ${agent} stopped at once, its restore served whole before`);
+        t.diagnostic(all);
         await answered;
         const summed = await repl.sum(big, held);
         assert.equal(summed.sha256, sha256);
