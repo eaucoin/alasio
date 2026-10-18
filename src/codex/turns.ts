@@ -27,7 +27,6 @@ import type { ChatId } from "../telegram/client.ts";
 import { ReceivedFiles } from "../telegram/files.ts";
 import { Outbox } from "../telegram/outbox.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
-import { keepPanel } from "../operator/panel.ts";
 import { truncateText } from "../operator/text.ts";
 import { makeReplyMedia } from "./reply-media.ts";
 import { recoverInterruptedTurns } from "./restart-recovery.ts";
@@ -499,14 +498,15 @@ const makeTurns = Effect.fnUntraced(function*() {
   }): Effect.fn.Return<void, StoreError> {
     const payload: ConcurrentPromptPayload = { jobId: job.id, prompt: job.prompt };
     const mount = yield* store.getMount(conversationId);
-    const question = yield* keepPanel(conversationId, {
+    yield* outbox.enqueuePanel({
+      conversationId,
+      chatId,
       text: `${harnessLabelOf(mount)} is currently working. What should I do with this message?\n\n${truncateText(job.visible_text, 220)}`,
       keyboard: [
         [{ text: "Steer", kind: "steer", payload }, { text: "Queue", kind: "queue", payload }],
         [{ text: "Swerve", kind: "swerve", payload }, { text: "Discard", kind: "discard", payload }],
       ],
-    }).pipe(Effect.provideService(Store, store));
-    yield* outbox.enqueueText({ chatId, text: question.text, options: { reply_markup: question.options.reply_markup } });
+    });
   });
 
   /** The held prompt jobs asked about again, by conversation, while each is held. */
@@ -526,11 +526,12 @@ const makeTurns = Effect.fnUntraced(function*() {
       askedAgain.set(conversationId, new Set(held.flatMap(({ id }) => (asked.has(id) ? [id] : []))));
       for (const job of held.filter(({ id }) => !asked.has(id))) {
         const payload: ConcurrentPromptPayload = { jobId: job.id, prompt: job.prompt };
-        const question = yield* keepPanel(conversationId, {
+        yield* outbox.enqueuePanel({
+          conversationId,
+          chatId: job.chat_id,
           text: `The turn has ended. What should I do with this message?\n\n${truncateText(job.visible_text, 220)}`,
           keyboard: [[{ text: "Run it", kind: "queue", payload }, { text: "Discard", kind: "discard", payload }]],
-        }).pipe(Effect.provideService(Store, store));
-        yield* outbox.enqueueText({ chatId: job.chat_id, text: question.text, options: { reply_markup: question.options.reply_markup } });
+        });
         askedAgain.set(conversationId, new Set([...askedAgain.get(conversationId) ?? [], job.id]));
       }
       if (askedAgain.get(conversationId)?.size === 0) askedAgain.delete(conversationId);
@@ -544,11 +545,12 @@ const makeTurns = Effect.fnUntraced(function*() {
   const askAboutUnsteered = (job: PromptJob): Effect.Effect<void, StoreError> =>
     Effect.gen(function*() {
       const payload: ConcurrentPromptPayload = { jobId: job.id, prompt: job.prompt };
-      const question = yield* keepPanel(job.conversation_id, {
+      yield* outbox.enqueuePanel({
+        conversationId: job.conversation_id,
+        chatId: job.chat_id,
         text: `alasio restarted as it sent this message to steer the running turn, which may not have taken it. What should I do with it?\n\n${truncateText(job.visible_text, 220)}`,
         keyboard: [[{ text: "Run it", kind: "queue", payload }, { text: "Discard", kind: "discard", payload }]],
-      }).pipe(Effect.provideService(Store, store));
-      yield* outbox.enqueueText({ chatId: job.chat_id, text: question.text, options: { reply_markup: question.options.reply_markup } });
+      });
       askedAgain.set(job.conversation_id, new Set([...askedAgain.get(job.conversation_id) ?? [], job.id]));
     });
 
@@ -575,8 +577,9 @@ const makeTurns = Effect.fnUntraced(function*() {
           state: (yield* activeTurns.isBusy(conversationId)) ? "awaiting_choice" : "pending",
           traceparent,
         });
-        // Asked about once: a prompt queued already, as its update is handled again, was asked about then.
-        if (queued.fresh && queued.state === "awaiting_choice") yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job: queued });
+        // Asked about once: a prompt queued already, as its update is handled again, was
+        // asked about then, its buttons kept with the question, unless asking it failed.
+        if (queued.state === "awaiting_choice" && !(yield* store.hasCallbackActionsOfJob(queued.id))) yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job: queued });
         return queued;
       }));
       if (job.state === "pending") yield* schedule(conversationId);

@@ -33,16 +33,18 @@ export interface PanelDraft {
   readonly keyboard: readonly (readonly ButtonDraft[])[];
 }
 
+/** The inline keyboard of `keyboard`'s buttons, given their kept actions' ids, in the order its rows list them. */
+export function inlineKeyboard(keyboard: PanelDraft["keyboard"], ids: readonly string[]): InlineKeyboardMarkup {
+  let next = 0;
+  return { inline_keyboard: keyboard.map((row) => row.map((button) => ({ text: button.text, callback_data: ids[next++]! }))) };
+}
+
 /** The panel `draft` is of, its buttons' actions kept for the conversation, all in one statement. */
 export const keepPanel = (conversationId: string, { text, keyboard }: PanelDraft): Effect.Effect<ControlPanel, StoreError, Store> =>
-  Effect.gen(function*() {
-    const ids = yield* Effect.flatMap(Store, (store) => store.createCallbackActions(conversationId, keyboard.flat()));
-    let next = 0;
-    return {
-      text,
-      options: panelOptions({ inline_keyboard: keyboard.map((row) => row.map((button) => ({ text: button.text, callback_data: ids[next++]! }))) }),
-    };
-  });
+  Effect.map(
+    Effect.flatMap(Store, (store) => store.createCallbackActions(conversationId, keyboard.flat())),
+    (ids) => ({ text, options: panelOptions(inlineKeyboard(keyboard, ids)) }),
+  );
 
 /** A pressed panel button, as the callback handler hands it to a control. */
 export interface ControlCallback {
