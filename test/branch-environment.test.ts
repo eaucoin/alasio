@@ -12,11 +12,13 @@ import { Deferred, Effect, Exit, Fiber, Layer, Option, Scope } from "effect";
 
 import { parentForks, serveBranchForks } from "../src/branch/fork.ts";
 import { forkToken } from "../src/branch/names.ts";
+import { CodexAppServer } from "../src/codex/app-server/client.ts";
 import { Turns } from "../src/codex/turns.ts";
 import { handleTextCommand } from "../src/operator/command-handler.ts";
 import { Mounts } from "../src/operator/mounts.ts";
 import { buildWorkspacePanel } from "../src/operator/workspace-control.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
+import { HarnessHost } from "../src/harness/host.ts";
 import { Harnesses } from "../src/harness/index.ts";
 import { KubeApiError } from "../src/kube/client.ts";
 import { Store } from "../src/persistence/store.ts";
@@ -93,7 +95,11 @@ test("an alasio forks a session one of its conversations knows for the branch wh
     const scheduled: string[] = [];
     const turns = turnsStub({ schedule: (id) => Effect.sync(() => void scheduled.push(id)) });
     const services = await Effect.runPromise(
-      Layer.buildWithScope(Layer.mergeAll(ActiveTurns.layer, Layer.succeed(Store, store), Layer.succeed(SessionSandboxes, sandboxes), Layer.succeed(Turns, turns)), scope),
+      Layer.buildWithScope(Layer.mergeAll(Layer.succeed(SessionSandboxes, sandboxes), Layer.succeed(Turns, turns)).pipe(
+        Layer.provideMerge(HarnessHost.layer),
+        Layer.provideMerge(Harnesses.layer({})),
+        Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, Layer.succeed(Store, store))),
+      ), scope),
     );
     const { port } = await Effect.runPromise(Effect.provide(serveBranchForks({ port: 0, host: "127.0.0.1", keyFile }), services).pipe(Scope.provide(scope)));
     const tokenFile = join(directory, "token");
@@ -145,7 +151,7 @@ test("an alasio forks a session one of its conversations knows for the branch wh
     scheduled.length = 0;
     const asked = asking("try", "fs-abc123");
     await Effect.runPromise(Deferred.await(forking));
-    const busy = Effect.flatMap(ActiveTurns, (active) => active.isBusy(conversationId)).pipe(Effect.provide(services));
+    const busy = Effect.flatMap(HarnessHost, (host) => Effect.map(host.status(conversationId), ({ busy: held }) => held)).pipe(Effect.provide(services));
     try {
       assert.equal(await Effect.runPromise(busy), true);
       assert.deepEqual(scheduled, []);

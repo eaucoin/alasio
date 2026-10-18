@@ -248,7 +248,7 @@ test("alasio starting lets go of the holds the last one left, and ends each turn
   const { store, schema, conversationId } = await conversation();
   const harness = scriptedHarness((params) => answered(params, "unused"));
   // Left by an alasio killed mid-turn: its hold, and its turn, working, with its status message.
-  await run(store.holdConversations([conversationId], "forking"));
+  await run(store.holdConversations([conversationId], "forking", 60_000));
   const epoch = await run(store.claimTurn({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "9", harness: CODEX_HARNESS }));
   assert.equal(await run(store.setTurnStatusMessage(conversationId, epoch, "status-of-the-killed")), true);
   const killed = store.turnPersistence(conversationId, epoch);

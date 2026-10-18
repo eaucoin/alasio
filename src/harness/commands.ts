@@ -17,6 +17,7 @@ import { Store } from "../persistence/store.ts";
 import { type ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
 import type { StopReason } from "./active-turns.ts";
 import { HarnessHost } from "./host.ts";
+import type { HarnessHostError } from "./index.ts";
 
 /** What became of a prompt held while a turn ran, sent to steer it. */
 export type Steered =
@@ -34,12 +35,23 @@ export type Steered =
   | { readonly outcome: "gone" };
 
 /** Stops the conversation's running turn for `reason`, once it has let go: whether one ran. */
-export const stopTurn = (conversationId: string, reason: StopReason): Effect.Effect<boolean, never, HarnessHost> =>
+export const stopTurn = (conversationId: string, reason: StopReason): Effect.Effect<boolean, HarnessHostError, HarnessHost> =>
   Effect.flatMap(HarnessHost, (host) => host.interrupt(conversationId, reason));
 
-/** Whether a bound harness runs a turn in the conversation. */
-export const isBusy = (conversationId: string): Effect.Effect<boolean, never, HarnessHost> =>
+/** Whether no turn may start in the conversation, as its harness host says (HarnessStatus.busy). */
+export const isBusy = (conversationId: string): Effect.Effect<boolean, StoreError | HarnessHostError, HarnessHost> =>
   Effect.flatMap(HarnessHost, (host) => Effect.map(host.status(conversationId), ({ busy }) => busy));
+
+/**
+ * Whether the operator's panels show the conversation working, and refuse what it would
+ * change: as isBusy says, or working where that cannot be told, said in alasio's log.
+ */
+export const shownBusy = (conversationId: string): Effect.Effect<boolean, never, HarnessHost> =>
+  isBusy(conversationId).pipe(Effect.catch((error) => Effect.as(Effect.logWarning(`could not tell whether ${conversationId} is busy: ${error.message}`), true)));
+
+/** Stops the conversation's running turn, as stopTurn does, saying what the operator is told where its host is not reached: whether one ran, or what to say. */
+export const stopTurnSaying = (conversationId: string, reason: StopReason): Effect.Effect<boolean | string, never, HarnessHost> =>
+  stopTurn(conversationId, reason).pipe(Effect.catchTag("HarnessHostError", (error) => Effect.succeed(error.message)));
 
 /**
  * Steers the conversation's running turn with the prompt held as the job `jobId`, or
@@ -84,7 +96,8 @@ export const discardHeld = (jobId: string): Effect.Effect<boolean, StoreError, S
 export const swerveTo = (conversationId: string, jobId: string): Effect.Effect<boolean, StoreError, HarnessHost | Turns | Store> =>
   Effect.gen(function*() {
     if (!(yield* (yield* Store).settleHeldPromptJob(jobId, "pending", 1))) return false;
-    yield* stopTurn(conversationId, "swerve");
+    // Where a host elsewhere stops no turn, the prompt runs once the turn ends, which is said.
+    yield* stopTurn(conversationId, "swerve").pipe(Effect.catch((error) => Effect.logWarning(`could not swerve ${conversationId}'s turn: ${error.message}`)));
     yield* (yield* Turns).schedule(conversationId);
     return true;
   });

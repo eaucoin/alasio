@@ -67,6 +67,7 @@ export const makeClaudeHarness = Effect.fnUntraced(function*({
      * the one it serves.
      */
     runTurn: (params) => liveSessions.runTurn({ ...params, workingDirectory: directory }),
+    backgroundWork: (threadKey) => Effect.sync(() => (liveSessions.get(threadKey)?.backgroundTasks.length ?? 0) > 0),
     listModels: () => listClaudeModels({ workingDirectory: directory }),
     /** What a turn runs on when no /model choice is stored. */
     defaultModelChoice: () => ({ model: getClaudeModel(), effort: getClaudeEffort() }),

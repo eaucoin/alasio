@@ -897,6 +897,34 @@ test("a report Claude Code starts while another turn holds the conversation wait
   await closeAll();
 });
 
+test("a turn Claude Code starts while a fork holds its conversation waits, unclaimed, until the hold is let go of, then claims it and delivers its reply", async () => {
+  const persistence = createPersistence();
+  const own = createPersistence();
+  const ended: string[] = [];
+  // A fork's hold, a row of the store, which the CLI turn asks of through its own turns.
+  let held = true;
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const turn = runTurn(liveSessions, { ...turnParams(persistence), ownTurns: ownTurnsOn(own, ended, Effect.sync(() => held)) });
+  const first = await cli.nextPrompt();
+  cli.emit(initMessage("s-1"));
+  cli.emit(successResult({ result: "Tests are running.", session_id: "s-1", user_message_uuids: [first.uuid] }));
+  await turn;
+
+  cli.emit(assistantMessage([text("Checking the log.")]));
+  cli.emit(successResult({ result: "All 212 tests passed.", session_id: "s-1" }));
+  await settle();
+  // Neither running in the conversation nor claiming it, under the hold.
+  assert.deepEqual([busy(activeTurns, "telegram:1"), own.state.blocks, ended], [false, [], []]);
+  held = false;
+  for (let waited = 0; ended.length === 0 && waited < 4000; waited += 20) await settle();
+  assert.deepEqual(textBlocks(own.state.blocks as ResponseBlock[]).map(({ content }) => content), ["Checking the log.", "All 212 tests passed."]);
+  assert.deepEqual([own.state.completed, ended], [["pending-1"], ["completed"]]);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
+  await closeAll();
+});
+
 test("reports Claude Code starts while another turn holds the conversation are delivered in the order it made them", async () => {
   const persistence = createPersistence();
   const own = createPersistence();

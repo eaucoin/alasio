@@ -33,8 +33,8 @@ import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "eff
 
 import { nameProblem } from "../../neon/control/branches.ts";
 import { Turns } from "../codex/turns.ts";
-import { ActiveTurns } from "../harness/active-turns.ts";
 import { holdConversations } from "../harness/holds.ts";
+import { HarnessHost } from "../harness/host.ts";
 import { hasStatus } from "../kube/client.ts";
 import { Store } from "../persistence/store.ts";
 import { SessionInheritError, SessionSandboxes } from "../sandbox/index.ts";
@@ -63,9 +63,9 @@ export const serveBranchForks = Effect.fnUntraced(function*({
   port = BRANCH_FORK_PORT,
   host = "0.0.0.0",
   keyFile,
-}: BranchForksOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope | Store | ActiveTurns | Turns | SessionSandboxes> {
+}: BranchForksOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope | Store | HarnessHost | Turns | SessionSandboxes> {
   const store = yield* Store;
-  const activeTurns = yield* ActiveTurns;
+  const harnessHost = yield* HarnessHost;
   const turns = yield* Turns;
   const sandboxes = yield* SessionSandboxes;
 
@@ -85,7 +85,7 @@ export const serveBranchForks = Effect.fnUntraced(function*({
     if (knowing.length === 0 && !made) return answer(404, { error: `alasio has no session ${volumeId}` });
     const mounting = knowing.filter(({ mounted }) => mounted).map(({ conversationId }) => conversationId);
     const forked = yield* Effect.scoped(Effect.gen(function*() {
-      if (!(yield* holdConversations(activeTurns, store, mounting, `forking session ${volumeId} for the branch ${branch}`))) return false;
+      if (!(yield* holdConversations(harnessHost, store, mounting, `forking session ${volumeId} for the branch ${branch}`))) return false;
       yield* sandboxes.volumes.fork(volumeId, volumeId, branchSessionsNamespace(branch)).pipe(
         // Forked already, by an earlier request of the branch's.
         Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(409)(error), () => Effect.void),

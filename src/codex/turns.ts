@@ -168,7 +168,15 @@ const makeTurns = Effect.fnUntraced(function*() {
   const outbox = yield* Outbox;
   const harnesses = yield* Harnesses;
   const host = yield* HarnessHost;
-  const isBusy = (conversationId: string): Effect.Effect<boolean> => Effect.map(host.status(conversationId), ({ busy }) => busy);
+  /**
+   * Whether no turn may start in the conversation, as its host says; where it cannot say,
+   * a host elsewhere not reached, not busy, said so: what would start then fails, saying why.
+   */
+  const isBusy = (conversationId: string): Effect.Effect<boolean> =>
+    host.status(conversationId).pipe(
+      Effect.map(({ busy }) => busy),
+      Effect.catch((error) => Effect.as(Effect.logWarning(`could not tell whether ${conversationId} is busy: ${error.message}`), false)),
+    );
   const receivedFiles = yield* ReceivedFiles;
   const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
   const status = yield* makeStatusReporter({
@@ -615,7 +623,7 @@ const makeTurns = Effect.fnUntraced(function*() {
     }),
     reconcilePersistentState: Effect.gen(function*() {
       // What the last alasio held busy, it held while it ran.
-      yield* store.releaseConversations(null);
+      yield* store.releaseHolds(null);
       // A turn whose job the agent finished ended so, whatever stopped alasio as it did.
       for (const conversationId of yield* store.recoverPromptJobsAfterRestart) {
         const turn = yield* store.getActiveTurn(conversationId);

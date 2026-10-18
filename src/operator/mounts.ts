@@ -17,6 +17,7 @@ import { Context, Effect, Layer, Option, Schema } from "effect";
 import type { AlasioConfig } from "../config.ts";
 import { Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
+import { HarnessHost } from "../harness/host.ts";
 import { holdConversations } from "../harness/holds.ts";
 import { folderRefusedOnBranch, harnessLabelOf, isHarnessName } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
@@ -109,13 +110,13 @@ export class Mounts extends Context.Service<Mounts, {
   readonly reconcileSessionWorkspaces: Effect.Effect<void, StoreError>;
 }>()("alasio/operator/Mounts") {
   /** The mounts of an alasio of `workspaceRoot`, the branch environment `branch` unless it is none, main. */
-  static readonly layer = ({ workspaceRoot, branch = null }: Pick<AlasioConfig, "workspaceRoot"> & { readonly branch?: string | null | undefined }): Layer.Layer<Mounts, never, Store | ActiveTurns | Turns> =>
+  static readonly layer = ({ workspaceRoot, branch = null }: Pick<AlasioConfig, "workspaceRoot"> & { readonly branch?: string | null | undefined }): Layer.Layer<Mounts, never, Store | ActiveTurns | HarnessHost | Turns> =>
     Layer.effect(Mounts, makeMounts(workspaceRoot, branch));
 }
 
-const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: string | null): Effect.fn.Return<Mounts["Service"], never, Store | ActiveTurns | Turns> {
+const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: string | null): Effect.fn.Return<Mounts["Service"], never, Store | ActiveTurns | HarnessHost | Turns> {
   const store = yield* Store;
-  const activeTurns = yield* ActiveTurns;
+  const host = yield* HarnessHost;
   const turns = yield* Turns;
   const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
 
@@ -124,7 +125,10 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
 
   /** Refuses a change while a turn runs in the conversation or prompts wait for its service; `doing` is the change, as the operator is told. */
   const unblocked = Effect.fnUntraced(function*(conversationId: string, doing = "switching services"): Effect.fn.Return<void, MountRefused | StoreError> {
-    if (yield* activeTurns.isBusy(conversationId)) {
+    const status = yield* host.status(conversationId).pipe(
+      Effect.catchTag("HarnessHostError", (error) => Effect.fail(new MountRefused({ message: `${error.message}, so whether it is working cannot be told. Try again once it answers.` }))),
+    );
+    if (status.busy) {
       const mount = yield* store.getMount(conversationId);
       return yield* new MountRefused({ message: `${harnessLabelOf(mount)} is currently working. Stop the active turn before ${doing}.` });
     }
@@ -233,7 +237,10 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
       ]);
       const volumeId = newVolumeId();
       yield* Effect.scoped(Effect.gen(function*() {
-        if (!(yield* holdConversations(activeTurns, store, [...mounting], `forking session ${source.volumeId} into ${volumeId}`))) {
+        const held = yield* holdConversations(host, store, [...mounting], `forking session ${source.volumeId} into ${volumeId}`).pipe(
+          Effect.catchTag("HarnessHostError", (error) => Effect.fail(new MountRefused({ message: `${error.message}, so whether a turn runs on this session workspace cannot be told. Fork it once it answers.` }))),
+        );
+        if (!held) {
           return yield* new MountRefused({ message: "A turn runs on this session workspace now, which a fork would suspend. Fork it once that turn ends." });
         }
         yield* recorded(volumeId, source.volumeId, sandbox.volumes.fork(source.volumeId, volumeId));

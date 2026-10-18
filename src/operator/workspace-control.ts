@@ -2,7 +2,7 @@ import { Effect } from "effect";
 
 import type { ConversationChat } from "../codex/turns.ts";
 import { HarnessHost } from "../harness/host.ts";
-import { isBusy } from "../harness/commands.ts";
+import { shownBusy } from "../harness/commands.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
@@ -150,7 +150,7 @@ const listWorkspaces = (workspaceRoot: string): Effect.Effect<WorkspaceListing> 
 /** The conversation's workspace panel as it stands, with `notice` under it. */
 const workspacePanel = Effect.fnUntraced(function*(conversationId: string, notice = ""): Effect.fn.Return<ControlPanel, StoreError, Store | HarnessHost | Mounts> {
   const mounts = yield* Mounts;
-  const working = yield* isBusy(conversationId);
+  const working = yield* shownBusy(conversationId);
   const store = yield* Store;
   const { workingDirectory } = yield* store.getMount(conversationId);
   return yield* keepPanel(conversationId, buildWorkspacePanel({

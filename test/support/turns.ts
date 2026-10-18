@@ -94,6 +94,8 @@ export interface TestServicesOptions {
   readonly sandbox?: SessionSandboxes["Service"] | undefined;
   /** The branch environment alasio is, if it is one. */
   readonly branch?: string | undefined;
+  /** What the harness host is made into, for a test that stands in for part of it: as made unless given. */
+  readonly host?: ((host: HarnessHost["Service"]) => HarnessHost["Service"]) | undefined;
 }
 
 /** alasio's services over `options`, as src/alasio.ts makes them but for what the test stands in. */
@@ -108,11 +110,12 @@ function testServices({
   outbox = unusedOutbox,
   sandbox,
   branch,
+  host,
 }: TestServicesOptions): Layer.Layer<AlasioServices> {
   return MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot, branch }), Authorizer.layer(allowedUserIds))),
     Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer()),
-    Layer.provideMerge(HarnessHost.layer),
+    Layer.provideMerge(host ? Layer.effect(HarnessHost, Effect.map(HarnessHost, host)).pipe(Layer.provide(HarnessHost.layer)) : HarnessHost.layer),
     Layer.provideMerge(Harnesses.layer({ overrides: harnesses, branch })),
     Layer.provideMerge(Layer.mergeAll(
       ActiveTurns.layer,

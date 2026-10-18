@@ -144,11 +144,15 @@ create table if not exists ${SCHEMA}.turns (
 );
 
 -- What holds a conversation busy that is no turn: a fork of the workspace it mounts, which
--- suspends it; a row while it lasts, gone with the alasio that held it (Turns.reconcilePersistentState).
+-- suspends it; a row while it lasts, by its holder, who renews it until it expires_at, so a
+-- holder that stopped or is stuck holds it no longer than that (../harness/holds.ts); and
+-- gone with the alasio that held it (Turns.reconcilePersistentState).
 create table if not exists ${SCHEMA}.conversation_holds (
   conversation_id text primary key references ${SCHEMA}.conversations (id) on delete cascade,
   reason text not null,
-  held_at timestamptz not null default now()
+  holder text not null,
+  held_at timestamptz not null default now(),
+  expires_at timestamptz not null
 );
 
 create table if not exists ${SCHEMA}.responses (
