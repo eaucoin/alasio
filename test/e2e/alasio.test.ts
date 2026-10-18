@@ -2124,10 +2124,9 @@ if (inShard("telemetry")) {
     });
 
     test("the stack's collector sends JuiceFS's metrics and Valkey's to the installation's backend too", async () => {
-      // JuiceFS's are its own Prometheus metrics, scraped from its clients and from its
-      // driver, whose provisioning errors only its controller counts; Valkey's, the
-      // collector's redis receiver's.
-      const names = ["juicefs_", "juicefs_provision_errors", "redis.memory.used"];
+      // JuiceFS's are its own Prometheus metrics, scraped from each node's mount, its client,
+      // its operations and its used space among them; Valkey's, the collector's redis receiver's.
+      const names = ["juicefs_fuse_ops", "juicefs_used_space", "redis.memory.used"];
       const arrived = await Promise.all(names.map((name) => untilExported("metrics", name, 180_000)));
       assert.deepEqual(names.filter((_, index) => !arrived[index]), [], "no metric of these names arrived");
     });
