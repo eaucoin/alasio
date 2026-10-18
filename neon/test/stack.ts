@@ -1346,7 +1346,7 @@ export function neonStack(): void {
       /** Its compute's own credentials: its roles' passwords, and its token, which neon-control is given the hashes of. */
       const PASSWORD = `branch-${randomUUID()}`;
       const COMPUTE_TOKEN = `compute-${randomUUID()}`;
-      const compute = { verifiers: { alasio: scramVerifier(PASSWORD), lake: scramVerifier(`lake-${randomUUID()}`) }, tokenSha256: tokenSha256(COMPUTE_TOKEN) };
+      const compute = { verifiers: { alasio: scramVerifier(PASSWORD), lake: scramVerifier(`lake-${randomUUID()}`), harness: scramVerifier(`harness-${randomUUID()}`) }, tokenSha256: tokenSha256(COMPUTE_TOKEN) };
       let control: Forward | undefined;
 
       /** neon-control's API, called with `bearer`, a token of the admin scope unless given: its status, and what it answered. */
@@ -1661,7 +1661,7 @@ export function neonStack(): void {
         const replicas = await controlReplicas();
         assert.equal(replicas.length, 2);
         const name = `twice-${Date.now()}`;
-        const body = { name, compute: { verifiers: { alasio: scramVerifier(randomUUID()), lake: scramVerifier(randomUUID()) }, tokenSha256: tokenSha256(randomUUID()) } };
+        const body = { name, compute: { verifiers: { alasio: scramVerifier(randomUUID()), lake: scramVerifier(randomUUID()), harness: scramVerifier(randomUUID()) }, tokenSha256: tokenSha256(randomUUID()) } };
         const answers = await Promise.all(replicas.map(async (pod) => JSON.parse(await inside(pod, "POST", "http://127.0.0.1:8080/branches", "admin", body)) as Listed));
         assert.equal(new Set(answers.map(({ timelineId }) => timelineId)).size, 1, JSON.stringify(answers));
         assert.equal((await recorded()).filter((branch) => branch.name === name).length, 1);

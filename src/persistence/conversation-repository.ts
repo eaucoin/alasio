@@ -10,7 +10,8 @@ interface ModelColumns {
   readonly effort: "claude_effort" | "codex_effort";
 }
 
-const SESSION_COLUMNS: Readonly<Record<HarnessName, SessionColumn>> = {
+/** The column each harness's session in a conversation is kept in. */
+export const SESSION_COLUMNS: Readonly<Record<HarnessName, SessionColumn>> = {
   [CODEX_HARNESS]: "codex_session_id",
   [CLAUDE_HARNESS]: "claude_session_id",
 };

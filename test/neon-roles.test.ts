@@ -1,6 +1,7 @@
 /**
  * The roles alasio makes in its Neon for what reads it beside alasio (src/neon/lake.ts,
- * src/neon/grafana.ts), made as Neon's alasio makes them: as a role that may make roles
+ * src/neon/grafana.ts), and the harness host's (src/neon/harness.ts, whose writes
+ * ./harness-role.test.ts tries), made as Neon's alasio makes them: as a role that may make roles
  * and databases, and is no superuser. A test file of its own, as roles are a server's:
  * here alasio makes every one of them, as it does in its Neon.
  */
@@ -30,7 +31,7 @@ async function run(url: string, ...statements: string[]): Promise<Record<string,
 }
 
 /** Each role's verifier, as the deployment gives it: made once, its salt at random. */
-const verifiers = { grafana: scramVerifier("grafana-password"), lake: scramVerifier("lake-password"), lake_reader: scramVerifier("reader-password") };
+const verifiers = { grafana: scramVerifier("grafana-password"), harness: scramVerifier("harness-password"), lake: scramVerifier("lake-password"), lake_reader: scramVerifier("reader-password") };
 
 test("a role's verifier is salted at random, so two of one password differ", () => {
   assert.notEqual(scramVerifier("p"), scramVerifier("p"));
@@ -43,7 +44,7 @@ test("a verifier is one whole, and nothing more: its prefix alone, or one with m
   for (const text of ["SCRAM-SHA-256$p", `${verifier}'`, `${verifier}\n`, verifier.replace(":", "x"), "md5" + "0".repeat(32)]) assert.ok(!isScramVerifier(text), text);
 });
 
-test("alasio makes the lake reader's role and Grafana's, with Grafana's database, when given their verifiers, and each may do what it is for alone", async () => {
+test("alasio makes the lake reader's role and Grafana's, with Grafana's database, when given their verifiers, and the harness host's, and each may do what it is for alone", async () => {
   const database = await startPostgres();
   /** `database`'s server, as `user`, in the database `name`. */
   const as = (user: string, password: string, name: string) => {
@@ -56,6 +57,7 @@ test("alasio makes the lake reader's role and Grafana's, with Grafana's database
     const env = {
       ALASIO_DATABASE_URL: as("alasio", "alasio-password", "alasio"),
       ALASIO_LAKE_VERIFIER: verifiers.lake,
+      ALASIO_HARNESS_VERIFIER: verifiers.harness,
       ALASIO_LAKE_READER_VERIFIER: verifiers.lake_reader,
       ALASIO_GRAFANA_VERIFIER: verifiers.grafana,
     };
@@ -78,7 +80,7 @@ test("alasio makes the lake reader's role and Grafana's, with Grafana's database
     await assert.rejects(run(as("lake_reader", "reader-password", "lake"), "create table written (id int)"), /permission denied/);
     const [roles, privileges] = await run(
       database.url,
-      "select r.rolname from pg_auth_members m join pg_roles r on r.oid = m.member where r.rolname in ('grafana', 'lake_reader')",
+      "select r.rolname from pg_auth_members m join pg_roles r on r.oid = m.member where r.rolname in ('grafana', 'lake_reader', 'harness')",
       `select has_database_privilege('public', 'grafana', 'connect') as public_connects,
         has_database_privilege('lake_reader', 'grafana', 'connect') as reader_connects,
         has_database_privilege('lake_reader', 'lake', 'connect') as reader_reads_lake`,
@@ -86,9 +88,10 @@ test("alasio makes the lake reader's role and Grafana's, with Grafana's database
     assert.deepEqual(roles, [], "neither is a member of another role");
     assert.deepEqual(privileges, [{ public_connects: false, reader_connects: false, reader_reads_lake: true }]);
     // Each stored as the verifier given, the one neon-control answers Neon's proxy with for it, to the byte.
-    const [stored] = await run(database.url, "select rolname, rolpassword from pg_authid where rolname in ('lake', 'lake_reader', 'grafana') order by rolname");
+    const [stored] = await run(database.url, "select rolname, rolpassword from pg_authid where rolname in ('lake', 'lake_reader', 'grafana', 'harness') order by rolname");
     assert.deepEqual(stored, [
       { rolname: "grafana", rolpassword: verifiers.grafana },
+      { rolname: "harness", rolpassword: verifiers.harness },
       { rolname: "lake", rolpassword: verifiers.lake },
       { rolname: "lake_reader", rolpassword: verifiers.lake_reader },
     ]);

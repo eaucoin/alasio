@@ -1463,6 +1463,7 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
     "lake-verifier": "SCRAM-SHA-256$l",
     "lake-reader-verifier": "SCRAM-SHA-256$r",
     "grafana-verifier": "SCRAM-SHA-256$g",
+    "harness-verifier": "SCRAM-SHA-256$h",
   });
   stackSecret(setup.kube, "alasio-lake", {
     LAKE_DATABASE_PASSWORD: "l",
@@ -1830,11 +1831,18 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   // Its lake's role's verifier, which its alasio sets the role to, the one neon-control is given.
   assert.ok(verifies(compute?.verifiers["lake"], lakePassword ?? ""));
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-database", "lake-verifier"), compute?.verifiers["lake"]);
-  assert.deepEqual(Object.keys(compute?.verifiers ?? {}), ["alasio", "lake"]);
+  // Its harness host's role's own password, in a Secret of its own for its harness pools, whose verifier its alasio sets the role to.
+  const harnessUrl = new URL(secretIn(kube, "alasio-branch-try", "alasio-harness-database", "url") ?? "");
+  assert.deepEqual([harnessUrl.username, harnessUrl.host, harnessUrl.pathname, harnessUrl.searchParams.get("options")], ["harness", "alasio-neon-proxy.alasio.svc:5432", "/alasio", "endpoint=branch-try"]);
+  assert.notEqual(harnessUrl.password, url.password);
+  assert.ok(verifies(compute?.verifiers["harness"], decodeURIComponent(harnessUrl.password)));
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-database", "harness-verifier"), compute?.verifiers["harness"]);
+  assert.deepEqual(Object.keys(compute?.verifiers ?? {}), ["alasio", "lake", "harness"]);
   // Of main's, only the lake's object store identity, which reads main's files where they are.
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-lake", "LAKE_S3_KEY"), "k");
   const keys = (name: string) => Object.keys((kube.get(`/api/v1/namespaces/alasio-branch-try/secrets/${name}`)?.["data"] ?? {}) as object).sort();
-  assert.deepEqual(keys("alasio-database"), ["lake-verifier", "url"]);
+  assert.deepEqual(keys("alasio-database"), ["harness-verifier", "lake-verifier", "url"]);
+  assert.deepEqual(keys("alasio-harness-database"), ["url"]);
   assert.deepEqual(keys("alasio-lake"), ["LAKE_DATABASE_PASSWORD", "LAKE_S3_KEY", "LAKE_S3_SECRET"]);
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-claude", "token"), "sk-ant-oat01-claude");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branch-fork", "token"), forkToken("key", "try"));
