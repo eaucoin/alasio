@@ -426,6 +426,9 @@ if (inShard("upgrade")) {
       assert.equal(await alasioGeneration(), generation);
       assert.ok(await runs(RELEASE), "alasio runs as it did");
       await alasioOk("branch", "delete", BRANCH);
+      // Main's alasio answers as it did, its branch gone.
+      await tg.say("after the branch");
+      await tg.waitFor((call) => answered(call));
     });
 
     test(`the cut-over from ${PREVIOUS}, failing before its point of no return, once every step before it has run, changes nothing, and a run again starts over`, { timeout: 60 * 60_000 }, async () => {
@@ -438,10 +441,17 @@ if (inShard("upgrade")) {
       const [statefulSet, pod, claim] = await logHeld();
       assert.ok(statefulSet && statefulSet !== logBefore[0], "the log's StatefulSet is not made again");
       assert.deepEqual([pod, claim], [logBefore[1], logBefore[2]]);
+      await kube.awaitReady([ref("StatefulSet", componentName("log"), NAMESPACE)], "10 minutes");
       assert.equal(await alasioGeneration(), generation);
       assert.ok(await runs(RELEASE), "alasio runs as it did");
       await tg.say("between the cut-overs");
-      await tg.waitFor((call) => answered(call));
+      await tg.waitFor((call) => answered(call)).catch(async (error: unknown) => {
+        // What the log said, as nothing answered: its pod's restarts, and its node's last lines.
+        const restarts = (await kube.get<V1Pod>(ref("Pod", `${componentName("log")}-0`, NAMESPACE)))?.status?.containerStatuses?.map(({ name, restartCount }) => `${name} ${restartCount}`);
+        const said = (await kube.logs(NAMESPACE, `${componentName("log")}-0`, "log").catch(String)).split("\n");
+        console.error(`# the log's pod's restarts: ${JSON.stringify(restarts)}\n# its first lines:\n${said.slice(0, 60).join("\n")}\n# its last:\n${said.slice(-40).join("\n")}`);
+        throw error;
+      });
     });
 
     test(`the cut-over from ${PREVIOUS}, failing past its point of no return, before the upgrade, goes on with it when run again, its checks not run again`, { timeout: 60 * 60_000 }, async () => {
