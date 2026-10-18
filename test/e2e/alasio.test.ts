@@ -1407,6 +1407,38 @@ if (inShard("snapshots")) {
       await assertNoInternet(session);
     });
 
+    test("a session whose snapshot's image is corrupted comes back from bayma's checkpoints, as the gateway logs and bayma tells the next exec, which the alert on restores falling back says", async () => {
+      const corrupt = await newSession("none");
+      const { sessionId: kept } = await repl.set(corrupt, `checkpointed by ${corrupt}`);
+      await untilReleased(corrupt, Date.now());
+      // Restored straight from the bucket wherever it is, where a file of its image is not as it was put.
+      const agents = await nodeAgents();
+      for (const pod of agents.values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${corrupt}`], { container: "node-agent" });
+      const [node = ""] = agents.keys();
+      const corrupted = await inNodeAgent<Corrupted>(node, "./snapshot-bucket.ts", "corrupt", SESSIONS, corrupt);
+      await turn("hello after the rot");
+      const logged = (await gatewayLogs()).find((line) => line.includes(`${SESSIONS}/${corrupt} is bound from bayma's checkpoints, not from its snapshot: `));
+      assert.ok(logged?.includes(`is corrupt: its image ${corrupted.image} is not in the bucket as it was put`), `the gateway logged no fallback for its corrupted image ${corrupted.image}'s file ${corrupted.path}: ${logged}`);
+      const seen = await repl.read(corrupt, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${corrupt}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+      assert.equal(await snapshotOf(corrupt), null);
+      // A restore that fell back for a failure, as this one did, is what the alert on
+      // restores falling back is for: it fires, whenever its message came during the turn,
+      // as one of the shard's first restores, more than a fifth of those of the hour.
+      const stub = telegram?.base;
+      assert.ok(stub, "the Telegram stand-in is not forwarded");
+      const deadline = Date.now() + 420_000;
+      const alerted = async () => {
+        const listed = (await (await fetch(`${stub}/control/calls?since=0`)).json()) as CallsListing;
+        return listed.calls.some((call) => call.method === "sendMessage" && /^\*\*Firing\*\*[\s\S]*alertname = Restores are falling back/u.test(call.payload.text ?? ""));
+      };
+      while (!(await alerted())) {
+        assert.ok(Date.now() < deadline, "no alert on restores falling back reached Telegram");
+        await sleep(5_000);
+      }
+    });
+
     test("a session saved on one node is restored on another, from the bucket, its REPL whole and its workspace's files with it, as a directory of the file system is no node's", { skip: AGENTS < 2 && "one node" }, async (t) => {
       const written = (await inSession(session, 'const f=require("fs");f.writeFileSync("/workspace/moving",require("crypto").randomBytes(1<<20));process.stdout.write(require("crypto").createHash("sha256").update(f.readFileSync("/workspace/moving")).digest("hex"))')).trim();
       ({ sessionId } = await repl.set(session, `moved by ${session}`));
@@ -1499,37 +1531,6 @@ if (inShard("snapshots")) {
       assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${killed}`]);
       assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
       assert.equal(await snapshotOf(killed), null, `a snapshot of ${killed} was taken as its pod on ${pod.spec?.nodeName} was killed`);
-    });
-
-    test("a session whose snapshot's image is corrupted comes back from bayma's checkpoints, as the gateway logs and bayma tells the next exec, which the alert on restores falling back says", async () => {
-      const corrupt = await newSession("none");
-      const { sessionId: kept } = await repl.set(corrupt, `checkpointed by ${corrupt}`);
-      await untilReleased(corrupt, Date.now());
-      // Restored straight from the bucket wherever it is, where a file of its image is not as it was put.
-      const agents = await nodeAgents();
-      for (const pod of agents.values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${corrupt}`], { container: "node-agent" });
-      const [node = ""] = agents.keys();
-      const corrupted = await inNodeAgent<Corrupted>(node, "./snapshot-bucket.ts", "corrupt", SESSIONS, corrupt);
-      await turn("hello after the rot");
-      const logged = (await gatewayLogs()).find((line) => line.includes(`${SESSIONS}/${corrupt} is bound from bayma's checkpoints, not from its snapshot: `));
-      assert.ok(logged?.includes(`is corrupt: its image ${corrupted.image} is not in the bucket as it was put`), `the gateway logged no fallback for its corrupted image ${corrupted.image}'s file ${corrupted.path}: ${logged}`);
-      const seen = await repl.read(corrupt, kept);
-      assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${corrupt}`]);
-      assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
-      assert.equal(await snapshotOf(corrupt), null);
-      // A restore that fell back for a failure, as this one did, is what the alert on
-      // restores falling back is for: it fires, whenever its message came during the turn.
-      const stub = telegram?.base;
-      assert.ok(stub, "the Telegram stand-in is not forwarded");
-      const deadline = Date.now() + 420_000;
-      const alerted = async () => {
-        const listed = (await (await fetch(`${stub}/control/calls?since=0`)).json()) as CallsListing;
-        return listed.calls.some((call) => call.method === "sendMessage" && /^\*\*Firing\*\*[\s\S]*alertname = Restores are falling back/u.test(call.payload.text ?? ""));
-      };
-      while (!(await alerted())) {
-        assert.ok(Date.now() < deadline, "no alert on restores falling back reached Telegram");
-        await sleep(5_000);
-      }
     });
 
     test("a session whose snapshot was taken by a gVisor release no longer kept comes back from bayma's checkpoints, said so, as status says it will", async () => {
