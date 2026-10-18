@@ -28,7 +28,7 @@ import { BINDING_LABEL, environmentKey, keyHash, POOL_LABEL } from "../../src/bi
 import { mintToken } from "../../src/binder/tokens.ts";
 import { NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
-import type { ReplChecked, ReplHeld } from "./gateway-repl.ts";
+import type { ReplChecked, ReplHeld, ReplWaited } from "./gateway-repl.ts";
 import { boundPodOf, gatewayCall, inAlasio, kube, mainToken, nodeAgents, onNode, ref, SESSIONS, tcp } from "./harness.ts";
 import { until } from "./workspace-storage.ts";
 
@@ -335,6 +335,61 @@ export function sandboxService(): void {
       );
       assert.ok(checked.step > held.step && checked.lines >= checked.step - 1, JSON.stringify(checked));
       assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
+    });
+
+    test("a workspace bound through its node's agent started again stays bound to its pod, its session running on, its files held, as what is attached outlives the agent", async () => {
+      const workspace = "fs-e2eagentagain";
+      const token = await mainToken(workspace);
+      await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
+      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      const first = await boundPod(workspace);
+      const url = `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`;
+      const held = await inAlasio<ReplHeld>("./gateway-repl.ts", "hold", url, token);
+      const agent = (await nodeAgents()).get(first.node);
+      assert.ok(agent, `no node agent runs ready on ${first.node}`);
+      await kube.remove(ref("Pod", agent, NAMESPACE));
+      await until(`the node agent ${agent} gone`, async () => ((await kube.get(ref("Pod", agent, NAMESPACE))) === null ? true : undefined), 300_000);
+      await until(`a node agent ready again on ${first.node}`, async () => ((await nodeAgents()).has(first.node) ? true : undefined), 300_000);
+      // Through the gateway's looks at the bound pods meanwhile, and two after it.
+      await new Promise((resolve) => setTimeout(resolve, 30_000));
+      assert.equal((await boundPod(workspace)).name, first.name, await serviceLogs(workspace));
+      const checked = await inAlasio<ReplChecked>("./gateway-repl.ts", "check", url, token, held.sessionId);
+      assert.deepEqual(
+        { writing: checked.writing, whole: checked.whole, locked: checked.locked, notice: checked.notice },
+        { writing: true, whole: true, locked: true, notice: null },
+        JSON.stringify(checked),
+      );
+      assert.ok(checked.step > held.step, JSON.stringify(checked));
+      assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
+      await until("the gateway deleting the workspace", async () => ((await gatewayCall(token, "DELETE", "/workspace")).status === 204 ? true : undefined), 180_000);
+    });
+
+    test("a call through the gateway as the gateway is started again fails, not hangs, and its binding survives it, its session running on", async () => {
+      const workspace = "fs-e2egatewayagain";
+      const token = await mainToken(workspace);
+      await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
+      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      const first = await boundPod(workspace);
+      const url = `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`;
+      const held = await inAlasio<ReplHeld>("./gateway-repl.ts", "hold", url, token);
+      const gateways = () => kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("sandbox-gateway")) });
+      const before = new Set((await gateways()).map(({ metadata }) => metadata?.uid));
+      // A call of half a minute under way through it, as its pods are deleted.
+      const started = Date.now();
+      const waiting = inAlasio<ReplWaited>("./gateway-repl.ts", "wait", url, token, held.sessionId);
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      for (const { metadata } of await gateways()) await kube.remove(ref("Pod", metadata?.name ?? "", NAMESPACE));
+      const waited = await waiting;
+      assert.equal(waited.answered, false, "the call came back answered through a gateway deleted under it");
+      assert.ok(Date.now() - started < 90_000, `the call failed only after ${Date.now() - started} ms: ${waited.failure}`);
+      await until("a gateway of its own ready again", async () =>
+        (await gateways()).some(({ metadata, status }) => !before.has(metadata?.uid) && status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True")) ? true : undefined, 300_000);
+      // Its binding as it was, its pod's session running on, reached through the new gateway.
+      assert.equal((await boundPod(workspace)).name, first.name, await serviceLogs(workspace));
+      const checked = await inAlasio<ReplChecked>("./gateway-repl.ts", "check", url, token, held.sessionId);
+      assert.deepEqual({ writing: checked.writing, whole: checked.whole, notice: checked.notice }, { writing: true, whole: true, notice: null }, JSON.stringify(checked));
+      assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
+      await until("the gateway deleting the workspace", async () => ((await gatewayCall(token, "DELETE", "/workspace")).status === 204 ? true : undefined), 180_000);
     });
 
     test("a workspace is made, given a received file, bound, held to its quota, read back of what its session wrote, released and deleted through the gateway alone", async () => {

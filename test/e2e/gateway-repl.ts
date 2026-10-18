@@ -12,6 +12,8 @@
  *   does, and prints what it holds of them: whether the writer runs on, at what step, whether
  *   every line it wrote is there in turn, whether the transaction under way commits whole,
  *   whether the lock is still held; and what bayma told the exec of how the session came back.
+ * - `wait <url> <token> <sessionId>`: takes the session over and runs an exec of half a
+ *   minute in it, printing whether its call came back answered, or what failed it.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -24,6 +26,12 @@ import type { BaymaExecResult, BaymaSessionCreated } from "./session-roundtrip.t
 export interface ReplHeld {
   readonly sessionId: string;
   readonly step: number;
+}
+
+/** How `wait`'s call came back: answered, or failed, by what. */
+export interface ReplWaited {
+  readonly answered: boolean;
+  readonly failure: string | null;
 }
 
 /** What `check` saw of what the session held, and bayma's notice to the exec, if any. */
@@ -39,8 +47,8 @@ export interface ReplChecked {
 }
 
 const [verb, url, token, argument] = process.argv.slice(2);
-if (!url || !token || (verb !== "hold" && !(verb === "check" && argument))) {
-  throw new Error("usage: gateway-repl.ts hold <url> <token> | check <url> <token> <sessionId>");
+if (!url || !token || (verb !== "hold" && !((verb === "check" || verb === "wait") && argument))) {
+  throw new Error("usage: gateway-repl.ts hold <url> <token> | check <url> <token> <sessionId> | wait <url> <token> <sessionId>");
 }
 
 const HOLD = [
@@ -111,6 +119,13 @@ try {
     const { stdout } = await exec(client, session.session_id, HOLD);
     const held: ReplHeld = { sessionId: session.session_id, step: Number(stdout.trim()) };
     console.log(JSON.stringify(held));
+  } else if (verb === "wait") {
+    await call(client, "session.acquire_controller", { session_id: argument });
+    const waited: ReplWaited = await exec(client, argument ?? "", "import time\ntime.sleep(30)").then(
+      () => ({ answered: true, failure: null }),
+      (error: unknown) => ({ answered: false, failure: error instanceof Error ? error.message : String(error) }),
+    );
+    console.log(JSON.stringify(waited));
   } else {
     await call(client, "session.acquire_controller", { session_id: argument });
     const { stdout, notice } = await exec(client, argument ?? "", CHECK);
@@ -118,5 +133,6 @@ try {
     console.log(JSON.stringify(checked));
   }
 } finally {
-  await client.close();
+  // Its transport may be gone with what it reached, as `wait`'s may be.
+  await client.close().catch(() => undefined);
 }
