@@ -142,6 +142,15 @@ export async function bindInBranch(branch: string): Promise<{ readonly namespace
   return { namespace: bound.metadata.namespace ?? "" };
 }
 
+/** Binds the workspace `workspace` of the branch environment `branch` through main's gateway, by the branch's own key, as its alasio would: the pod it is bound to. */
+export async function bindBranchSession(branch: string, workspace: string): Promise<string> {
+  const token = await branchToken(branch, workspace);
+  await until(`the gateway binding the branch's ${workspace}`, async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 300_000);
+  const [bound] = await kube.list<V1Pod>("Pod", { namespace: `alasio-branch-${branch}-sessions`, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` });
+  assert.ok(bound?.metadata?.name, `no pod of the branch's is bound to its ${workspace}`);
+  return bound.metadata.name;
+}
+
 /** What the gateway and the node agents logged of `workspace`, for a failure to say. */
 export async function serviceLogs(workspace: string): Promise<string> {
   const pods = [

@@ -42,7 +42,7 @@ import type { Manifest } from "../../src/node-agent/agent.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER } from "./codex-stand-in.ts";
-import { bindInBranch, mainSandboxService, sandboxService, servesBranch } from "./sandbox-service.ts";
+import { bindBranchSession, bindInBranch, mainSandboxService, sandboxService, servesBranch } from "./sandbox-service.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
 import {
   AGENTS,
@@ -2998,10 +2998,8 @@ if (inShard("branches")) {
       const { branches } = JSON.parse(await neonControl("/branches")) as { branches: { name: string; timelineId: string }[] };
       const timeline = branches.find(({ name }) => name === BRANCH)?.timelineId;
       assert.ok(timeline);
-      // Its session's workspace bound by a turn, which has ended.
-      await branch.say("once more");
-      await branch.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
-      assert.ok(await boundPodOf(volumeId, BRANCH_SESSIONS), `the branch's ${volumeId} is bound to no pod of its own pools`);
+      // Its session's workspace bound, as its alasio, stopped since, would bind it.
+      await bindBranchSession(BRANCH, volumeId);
       const refused = await alasio("branch", "delete", BRANCH);
       assert.notEqual(refused.code, 0, refused.stdout);
       assert.match(refused.stderr, new RegExp(`its sessions?'s? workspaces? [^\\n]*\\b${volumeId}\\b[^\\n]* bound; --force deletes it all the same`, "u"));
