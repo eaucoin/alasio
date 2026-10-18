@@ -2,7 +2,7 @@
  * The gVisor releases alasio keeps: those it pins (cluster/node/pins.json, the current
  * one first, which new sandboxes run), and every other one installed that a snapshot
  * still names, as only the release that took a snapshot restores it
- * (src/sandbox/snapshots.ts). A session's Sandbox released into a snapshot names it, and
+ * (src/gateway/snapshots.ts). A session's Sandbox released into a snapshot names it, and
  * the release that took it (src/kube/sandboxes.ts snapshotBinding), so what the cluster's
  * Sandboxes name is every release a snapshot may be restored with.
  *

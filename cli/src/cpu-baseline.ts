@@ -21,7 +21,7 @@
  * one that joined since `alasio up` last ran; gVisor gives its sandboxes the features it
  * has of the baseline's, so their snapshots restore anywhere, and a snapshot taken under
  * the whole baseline restores on the nodes that have it, which alasio picks
- * (src/sandbox/snapshots.ts). `alasio status` says which node lacks it, and the next
+ * (src/gateway/snapshots.ts nodesFor). `alasio status` says which node lacks it, and the next
  * `alasio up` narrows it to what every node has.
  */
 import type { V1ConfigMap, V1Pod } from "@kubernetes/client-node";
