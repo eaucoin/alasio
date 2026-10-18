@@ -26,7 +26,7 @@ import type { KubernetesObject, V1ConfigMap, V1Container, V1EnvVar, V1Service, V
 import type { LogPrincipal, MainEnvironmentPrincipal } from "../../../neon/control/secrets.ts";
 import { eventsTopic } from "../../../src/events/names.ts";
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, type Environment, NAMESPACE, replicasOf, restrictedContainer, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
+import { claimLabels, claimSpec, componentName, type Environment, NAMESPACE, replicasOf, restrictedContainer, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
 import { type InstallConfig, LOG_SEGMENT_BYTES, telemetryRetentionBytes } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -245,8 +245,10 @@ export function logAccess(config: InstallConfig): LogAccess {
  * look never by default; a record of up to 8 MiB, as a minute's
  * scrape of the stack in one export may be; its segments on its volume, each closed within
  * the hour or at LOG_SEGMENT_BYTES, so its retention, which deletes closed ones alone,
- * reaches them in time. What differs from node to node (its id, its address, its admin's
- * password) its start script adds (START).
+ * reaches them in time; and a snapshot of its metadata every ten minutes where it changed,
+ * rather than every hour, so that a start replays little of it (src/log/access.ts says
+ * what a replay may lose). What differs from node to node (its id, its address, its
+ * admin's password) its start script adds (START).
  */
 function serverProperties(config: InstallConfig): string {
   const nodes = config.log.scaling.min;
@@ -277,6 +279,7 @@ function serverProperties(config: InstallConfig): string {
     "log.roll.ms=3600000",
     `message.max.bytes=${LOG_RECORD_BYTES}`,
     "log.flush.scheduler.interval.ms=1000",
+    "metadata.log.max.snapshot.interval.ms=600000",
   );
 }
 
@@ -432,6 +435,8 @@ export function logObjects(config: InstallConfig): KubernetesObject[] {
               command: ["node", "/opt/alasio/src/log/access.ts"],
               env: [
                 { name: "LOG_BROKERS", value: `127.0.0.1:${LOG_PORT}` },
+                // Every voter's, as KRaft's active controller alone writes a credential.
+                { name: "LOG_CONTROLLERS", value: Array.from({ length: log.scaling.min }, (_, ordinal) => `${nodeAddress(ordinal)}:${LOG_CONTROLLER_PORT}`).join(",") },
                 secret("LOG_ADMIN_PASSWORD"),
                 { name: "LOG_ACCESS", value: "/etc/log/access.json" },
                 { name: "LOG_PASSWORDS", value: "/etc/log-passwords" },
@@ -451,7 +456,7 @@ export function logObjects(config: InstallConfig): KubernetesObject[] {
           ],
         },
       },
-      volumeClaimTemplates: [{ metadata: { name: "data", labels: stackLabels(LOG_COMPONENT) }, spec: claimSpec(log.storage) }],
+      volumeClaimTemplates: [{ metadata: { name: "data", labels: claimLabels(stackLabels(LOG_COMPONENT)) }, spec: claimSpec(log.storage) }],
     },
   };
   return [configMap, service, statefulSet, ...replicaBudget(LOG_COMPONENT, NAMESPACE, log.scaling), verticalPodAutoscaler(statefulSet, "Recommended")];

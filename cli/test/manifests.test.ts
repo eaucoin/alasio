@@ -52,6 +52,7 @@ import { apiServerUnconfined } from "../src/install.ts";
 import { carriedPools, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
 import { folderStateDir, templateHash } from "../../src/gateway/names.ts";
 import { hookOf } from "../../src/gateway/snapshots.ts";
+import { VERSION } from "../src/release.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
 /** A NetworkPolicy as rendered, its ingress rules' peers under `from`. */
@@ -1681,6 +1682,14 @@ describe("the log", () => {
     // Its access applier, on alasio's image, logs in as its admin beside it, and its node is ready once it has applied what it applies.
     assert.deepEqual(access?.command, ["node", "/opt/alasio/src/log/access.ts"]);
     assert.deepEqual(access?.readinessProbe?.httpGet, { path: "/readyz", port: "access" });
+    // It writes every credential again through the controllers' listener first, unauthenticated there, of each voter in turn (src/log/access.ts).
+    assert.deepEqual(access?.env?.filter(({ name }) => name.startsWith("LOG_") && name !== "LOG_ADMIN_PASSWORD").map(({ name, value }) => [name, value]), [
+      ["LOG_BROKERS", "127.0.0.1:9092"],
+      ["LOG_CONTROLLERS", "alasio-log-0.alasio-log.alasio.svc:9093"],
+      ["LOG_ACCESS", "/etc/log/access.json"],
+      ["LOG_PASSWORDS", "/etc/log-passwords"],
+      ["LOG_ACCESS_PORT", "8080"],
+    ]);
     assert.deepEqual(pod?.volumes?.find(({ name }) => name === "passwords")?.secret, { secretName: "alasio-log-access" });
     // Headless, each node reached by its pod's name before it is ready, as KRaft's quorum forms.
     const service = one<V1Service>(objects, "Service", "alasio-log").spec;
@@ -1716,6 +1725,8 @@ describe("the log", () => {
       "message.max.bytes=8388608",
       // Its flusher looking each second for what its topics' flush.ms says to flush, where it would look never.
       "log.flush.scheduler.interval.ms=1000",
+      // A snapshot of its metadata every ten minutes where it changed, so that a start replays little.
+      "metadata.log.max.snapshot.interval.ms=600000",
     ]) assert.ok(lines.includes(line), line);
     assert.match(properties(install({ log: { retention: "6h" }, objectStore: { bundled: { filerStore: { backups: { enabled: false } } } } })), /^log\.retention\.ms=21600000$/mu);
   });
@@ -1739,6 +1750,9 @@ describe("the log", () => {
     const objects = install({ log: { scaling: { min: 3, max: 3 } } });
     assert.equal(log(objects).spec?.replicas, 3);
     assert.match(properties(objects), /^controller\.quorum\.voters=0@alasio-log-0\.alasio-log\.alasio\.svc:9093,1@alasio-log-1\.alasio-log\.alasio\.svc:9093,2@alasio-log-2\.alasio-log\.alasio\.svc:9093$/mu);
+    // Its access applier writes credentials through whichever voter is KRaft's active controller.
+    const access = log(objects).spec?.template.spec?.containers.find(({ name }) => name === "access");
+    assert.equal(access?.env?.find(({ name }) => name === "LOG_CONTROLLERS")?.value, "alasio-log-0.alasio-log.alasio.svc:9093,alasio-log-1.alasio-log.alasio.svc:9093,alasio-log-2.alasio-log.alasio.svc:9093");
     const lines = properties(objects).split("\n");
     for (const line of ["default.replication.factor=3", "offsets.topic.replication.factor=3", "transaction.state.log.replication.factor=3", "min.insync.replicas=2", "transaction.state.log.min.isr=2"]) {
       assert.ok(lines.includes(line), line);
@@ -3473,4 +3487,33 @@ describe("the sandbox service", () => {
       assert.deepEqual(objects.filter(({ metadata }) => /sandbox-gateway|sandboxes-|alasio-receiver|workspace-mount/u.test(metadata?.name ?? "")).map(({ kind, metadata }) => `${kind}/${metadata?.name}`), [], JSON.stringify(file));
     }
   });
+});
+
+test("no field Kubernetes changes of no object once made carries the release's version, which would refuse every upgrade: workloads' selectors, StatefulSets' service names and claim templates", () => {
+  /** The fields of `object` Kubernetes changes of none once made, by their names. */
+  const immutable = ({ kind, spec }: KubernetesObject & { spec?: Record<string, unknown> }): [string, unknown][] => {
+    switch (kind) {
+      case "Deployment":
+      case "DaemonSet":
+      case "ReplicaSet":
+        return [["selector", spec?.["selector"]]];
+      case "StatefulSet":
+        return [["selector", spec?.["selector"]], ["serviceName", spec?.["serviceName"]], ["volumeClaimTemplates", spec?.["volumeClaimTemplates"]]];
+      default:
+        // A Job's pod template, which cannot change either, is run afresh, one of its name deleted first (src/kube/apply.ts).
+        return [];
+    }
+  };
+  for (const objects of [install(), branchObjects(configOf(), "try", BASELINE)]) {
+    for (const object of objects) {
+      for (const [field, value] of immutable(object)) {
+        const said = JSON.stringify(value ?? null);
+        assert.ok(!said.includes("app.kubernetes.io/version") && !said.includes(VERSION), `${object.kind} ${object.metadata?.name}'s ${field}: ${said}`);
+      }
+    }
+  }
+  // The log's claims carry its pods' other labels.
+  const log = one<V1StatefulSet>(install(), "StatefulSet", "alasio-log");
+  const { "app.kubernetes.io/version": _version, ...podLabels } = log.spec?.template.metadata?.labels ?? {};
+  assert.deepEqual(log.spec?.volumeClaimTemplates?.[0]?.metadata?.labels, podLabels);
 });
