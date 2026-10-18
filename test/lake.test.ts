@@ -3026,7 +3026,7 @@ describe("the lake's reader", () => {
     }
   });
 
-  test("the alert rules say which volume server is filling its disk, which Valkey nears its memory limit, and which collection keeps too few copies", async () => {
+  test("the alert rules say which volume server is filling its disk, which Valkey nears its memory limit, which collection keeps too few copies, and how many folders are held", async () => {
     const now = String(BigInt(Date.now()) * 1_000_000n);
     const strings = (values: Record<string, string>) => Object.entries(values).map(([key, value]) => ({ key, value: { stringValue: value } }));
     const gauge = (resource: Record<string, string>, name: string, value: number, attributes: Record<string, string> = {}) => ({
@@ -3052,6 +3052,8 @@ describe("the lake's reader", () => {
           // Two masters, the leader saying 2 of neon's volumes under-replicated, the other its stale 0.
           gauge({ "service.name": "seaweedfs" }, "SeaweedFS_master_under_replicated_volumes", 2, { pod: "leader-0", collection: "neon-gate", rp: "001" }),
           gauge({ "service.name": "seaweedfs" }, "SeaweedFS_master_under_replicated_volumes", 0, { pod: "follower-1", collection: "neon-gate", rp: "001" }),
+          // Two gateway replicas, each counting the one folder held.
+          ...["gateway-0", "gateway-1"].map((instance) => gauge({ "service.name": "alasio-sandbox-gateway", "service.instance.id": instance }, "alasio.gateway.folders.failing", 1, { "k8s.namespace.name": "alasio-host" })),
         ],
       }));
     });
@@ -3068,6 +3070,8 @@ describe("the lake's reader", () => {
       assert.deepEqual([held["filer-store"], held["roomy-valkey"]], [95, 10]);
       const under = Object.fromEntries((await answer(reader.db, rule("The object store keeps fewer copies than it should"))).map((row) => [row["collection"], row["volumes"]]));
       assert.equal(under["neon-gate"], 2);
+      // The folders held, as every replica counts them: the greatest, not their sum.
+      assert.deepEqual(await answer(reader.db, rule("Folder binds are failing")), [{ held: 1 }]);
     } finally {
       reader.close();
     }

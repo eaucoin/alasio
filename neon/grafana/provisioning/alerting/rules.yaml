@@ -412,6 +412,51 @@ groups:
               expression: failed
               conditions: [{evaluator: {type: gt, params: [0.2]}}]
 
+      # The folder conversations held, their instances' binds having failed three times in a
+      # row: each runs its turns without bayma's REPL tools until its operator asks again. One
+      # stuck folder is one operator's whole workspace, so any held alerts. Every gateway
+      # replica counts the same record, so the greatest of their last counts.
+      - uid: alasio-folder-binds-failing
+        title: Folder binds are failing
+        condition: failing
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $values.held.Value }} folder conversations' bayma failed to start three times in a row: their turns run without its REPL tools until they are restarted (alasio status says why)."
+        data:
+          - refId: held
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: lake
+            model:
+              refId: held
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select max(Value) as held
+                  from otel.metrics_gauge
+                  where MetricName = 'alasio.gateway.folders.failing' and ServiceName = 'alasio-sandbox-gateway'
+                    and TimeUnix > now()::timestamp - interval 3 minute
+                  having count(*) > 0
+              root_selector: ""
+              columns:
+                - {selector: held, text: held, type: number}
+          - refId: failing
+            datasourceUid: __expr__
+            model:
+              refId: failing
+              type: threshold
+              expression: held
+              conditions: [{evaluator: {type: gt, params: [0]}}]
+
       - uid: alasio-replica-lagging
         title: A read replica trails its primary
         condition: lagging
