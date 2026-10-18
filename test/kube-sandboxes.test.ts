@@ -1,6 +1,4 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { once } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -22,7 +20,6 @@ import { TestClock } from "effect/testing";
 
 import { type ExecResult, exitCodeOf, KubeApiError, KubeClient, KubeExecError, mergePatch, patchBody } from "../src/kube/client.ts";
 import { decodeKubeTemplates, type KubeTemplates, loadKubeTemplates, type SessionsProfile } from "../src/kube/config.ts";
-import { EGRESS_GATE_SCRIPT } from "../src/kube/sandbox-shape.ts";
 import {
   makeSandboxes,
   newToken,
@@ -559,33 +556,6 @@ test("ensure gives up on a Sandbox that does not become ready in five minutes, s
     return yield* Fiber.join(ensuring);
   }).pipe(Effect.provide(TestClock.layer())));
   assert.equal(error.message, "Sandbox ns/fs-abc123 did not become ready within 300s");
-});
-
-/** The egress gate against an API server on `port` of this machine, given 1.5s: its exit code and stderr. */
-function runGate(port: number) {
-  return new Promise<{ code: number | null; stderr: string }>((resolve) => {
-    const child = spawn(process.execPath, ["-e", EGRESS_GATE_SCRIPT.replace("120000", "1500")], {
-      env: { KUBERNETES_SERVICE_HOST: "127.0.0.1", KUBERNETES_SERVICE_PORT: String(port) },
-    });
-    let stderr = "";
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("exit", (code) => resolve({ code, stderr }));
-  });
-}
-
-test("the egress gate passes once the API server is unreachable, and fails a pod whose egress stays open", async () => {
-  // Nothing listens on port 9 here: connections are refused, as egress policy refuses them.
-  assert.equal((await runGate(9)).code, 0);
-  const server = createServer().listen(0, "127.0.0.1");
-  await once(server, "listening");
-  try {
-    // Listening on a TCP port, the server's address is an AddressInfo.
-    const open = await runGate((server.address() as AddressInfo).port);
-    assert.equal(open.code, 1);
-    assert.match(open.stderr, /egress is not confined/);
-  } finally {
-    server.close();
-  }
 });
 
 test("an exec's exit code is read from its status", () => {

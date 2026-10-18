@@ -36,8 +36,6 @@ import { CLONE_VARIABLES, type HostProfile, type SessionsProfile } from "../../.
 import {
   BAYMA_CONTAINER,
   DEFAULT_FULL_MODE_NAMESERVERS,
-  EGRESS_GATE,
-  EGRESS_GATE_SCRIPT,
   HARNESS_LABEL,
   MANAGED_BY,
   NET_MODE_LABEL,
@@ -352,7 +350,6 @@ function sandboxOf(template: SessionsProfile | HostProfile, workspace: SessionWo
   const spec: V1PodSpec = podTemplate.spec ?? { containers: [] };
   const session = "session" in workspace ? workspace.session : null;
   const snapshots = "current" in workspace ? (workspace.current.snapshots ?? null) : null;
-  const bayma = spec.containers.find(({ name }) => name === BAYMA_CONTAINER);
   const tokenMount = { name: TOKEN_VOLUME, mountPath: TOKEN_DIR, readOnly: true };
   // Under the state root as hostBaymaStateDir joins it: normalized, its one slash after it.
   const stateDir = "folder" in workspace ? [STATE_DIR_ARG, matching(`${literally(posix.join(workspace.folder.stateRoot, "/"))}${PATH_TOKEN}/${PATH_TOKEN}`)] : [];
@@ -370,16 +367,7 @@ function sandboxOf(template: SessionsProfile | HostProfile, workspace: SessionWo
         env: optional(startingWith((each.env ?? []) as unknown as Pinned[], SET)),
       }) as unknown as PinnedMap,
     );
-  const gate = session && session.egressGate !== false
-    ? [{
-      name: EGRESS_GATE.name,
-      ...(bayma?.image === undefined ? {} : { image: bayma.image }),
-      command: ["node", "-e", EGRESS_GATE_SCRIPT],
-      ...(bayma?.securityContext === undefined ? {} : { securityContext: bayma.securityContext }),
-      resources: EGRESS_GATE.resources,
-    }]
-    : [];
-  const initContainers = ([...gate, ...(spec.initContainers ?? [])] as unknown as PinnedMap[]).map(stored);
+  const initContainers = ((spec.initContainers ?? []) as unknown as PinnedMap[]).map(stored);
   const volumes: Pinned[] = [...((spec.volumes ?? []) as V1Volume[] as unknown as Pinned[]), { name: TOKEN_VOLUME, secret: { secretName: OWN_TOKEN, defaultMode: TOKEN_MODE } }];
   const own = {
     ...MANAGED_BY,

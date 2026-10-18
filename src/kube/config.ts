@@ -4,7 +4,7 @@
  * (cli/src/manifests/alasio.ts), of the form
  *
  *     {
- *       "sessions": { "namespace", "port", "workspaceDir", "egressGate", "fullModeNameservers",
+ *       "sessions": { "namespace", "port", "workspaceDir", "fullModeNameservers",
  *                     "mountPodNamespace", "podTemplate", "volumeClaimTemplates", "clone",
  *                     "snapshots" },
  *       "host":     { "namespace", "port", "stateRoot", "podTemplate" }
@@ -132,8 +132,6 @@ const SessionsProfile = said(
     ...sandboxProfile,
     /** Where the session's workspace is in bayma's container. */
     workspaceDir: Path,
-    /** Whether a session waits for its egress to be confined before it starts; only false turns it off. */
-    egressGate: Schema.optional(said(Schema.NullOr(Schema.Boolean), "must be true or false")),
     /** The resolvers sessions with internet access use, or none for alasio's defaults. */
     fullModeNameservers: Schema.optional(said(Schema.NullOr(Schema.Array(Schema.String)), "must be a list of addresses")),
     /**

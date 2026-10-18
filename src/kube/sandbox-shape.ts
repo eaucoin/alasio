@@ -91,25 +91,3 @@ export const SNAPSHOT_CACHE_DIR = "/var/lib/alasio/snapshots";
 export const SNAPSHOT_ID = "[0-9]{8}T[0-9]{9}Z-[0-9a-f]{8}";
 /** A DNS label: an environment's name (its sessions' namespace) and a workspace's (its Sandbox's), as the snapshot cache's directories are named. */
 export const NAME = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u;
-
-/** The init container that holds a session's pod until its egress is confined: its name, and its resources. */
-export const EGRESS_GATE = { name: "egress-gate", resources: { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "64Mi" } } } as const;
-
-/**
- * The egress gate's program: exits once three connections in a row to the API server
- * fail, and fails the pod if they still succeed after two minutes. Runs on the agent
- * image's Node.
- */
-export const EGRESS_GATE_SCRIPT = [
-  "const net = require('node:net');",
-  "const host = process.env.KUBERNETES_SERVICE_HOST, port = Number(process.env.KUBERNETES_SERVICE_PORT);",
-  "const deadline = Date.now() + 120000; let refused = 0;",
-  "(function probe() {",
-  "  const socket = net.connect({ host, port, timeout: 1000 });",
-  "  const next = (blocked) => { socket.destroy(); refused = blocked ? refused + 1 : 0;",
-  "    if (refused >= 3) process.exit(0);",
-  "    if (Date.now() > deadline) { console.error('egress is not confined: is NetworkPolicy enforced in this cluster?'); process.exit(1); }",
-  "    setTimeout(probe, 250); };",
-  "  socket.once('connect', () => next(false)); socket.once('timeout', () => next(true)); socket.once('error', () => next(true));",
-  "})();",
-].join("\n");

@@ -354,8 +354,6 @@ const Sessions = Schema.Struct({
   /** A new session's volume; its class, when empty, is workspace storage's, or the cluster's default without it. */
   storage: Storage("10Gi"),
   resources: Resources({ requests: { cpu: "250m", memory: "512Mi" }, limits: { cpu: "2", memory: "2Gi" } }),
-  /** Whether a session's pod waits until NetworkPolicy confines it. */
-  egressGate: defaulted(Schema.Boolean, true),
   /** The resolvers sessions with internet access use. */
   fullModeNameservers: defaulted(
     Schema.Array(Schema.String.check(Schema.makeFilter((address) => isIPv4(address) || "must be an IPv4 address"))).check(

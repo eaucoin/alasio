@@ -109,7 +109,6 @@ function sessionsProfile(config: InstallConfig, environment: Environment, { cpuB
     namespace: sessionsNamespace(config, environment),
     port: BAYMA_PORT,
     workspaceDir: "/workspace",
-    egressGate: sessions.egressGate,
     fullModeNameservers: [...sessions.fullModeNameservers],
     ...(main && mountPodsRemoved(config) ? { mountPodNamespace: workspaceStorage.csi.namespace } : {}),
     podTemplate: {

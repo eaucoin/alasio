@@ -410,10 +410,9 @@ describe("alasio", () => {
     assert.equal(spec?.volumes?.find(({ name }) => name === "alasio-home"), undefined);
   });
 
-  test("renders sessions under gVisor with the egress gate, and no host profile by default", () => {
+  test("renders sessions under gVisor, and no host profile by default", () => {
     const json = templates(install());
     assert.match(json, /"runtimeClassName": "gvisor"/u);
-    assert.match(json, /"egressGate": true/u);
     assert.doesNotMatch(json, /"host":/u);
   });
 
@@ -445,7 +444,7 @@ describe("alasio", () => {
       one<V1Deployment>(objects, "Deployment", "alasio").spec?.template.metadata?.annotations?.["checksum/sandbox-templates"];
     assert.match(checksum(install()) ?? "", /^[0-9a-f]{64}$/u);
     assert.equal(checksum(install()), checksum(install()));
-    assert.notEqual(checksum(install()), checksum(install({ sessions: { egressGate: false } })));
+    assert.notEqual(checksum(install()), checksum(install({ sessions: { fullModeNameservers: ["9.9.9.9"] } })));
   });
 });
 
