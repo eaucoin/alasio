@@ -1203,6 +1203,31 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     );
 
   /**
+   * Tells the proxy how many bytes of pages the restore of the snapshot prepared at
+   * `imagePath`, read from the bucket, reads through it, as runsc says of the image, so that
+   * the agent's stop waits for them all however its loader paces its reads: unknown until
+   * runsc has said, which it asks in the background; where runsc cannot say, the stop waits
+   * on the restore only while its reads go on, as the proxy's quiet tells.
+   */
+  const expectPages = (ref: WorkspaceRef, release: string, imagePath: string): Effect.Effect<void> =>
+    Effect.sync(() => storeProxy.expect(prefixOf(ref), Number.POSITIVE_INFINITY)).pipe(
+      Effect.andThen(
+        runsc.inspect(release, imagePath).pipe(
+          Effect.tap(({ pageBytes }) => Effect.sync(() => storeProxy.expect(prefixOf(ref), pageBytes))),
+          Effect.tapError((error) =>
+            Effect.sync(() => storeProxy.expect(prefixOf(ref), null)).pipe(
+              Effect.andThen(Effect.logWarning(`runsc does not say how many bytes of pages the restore of ${prefixOf(ref)} reads through the node agent, so the agent's stop waits on it only while its reads go on: ${error.message}`)),
+            )
+          ),
+          Effect.ignore,
+          withLogScope("node-agent"),
+          Effect.forkIn(scope),
+        ),
+      ),
+      Effect.asVoid,
+    );
+
+  /**
    * The snapshot of the workspace, prepared for a restore on this node: from the node's cache
    * where it holds every image of it intact and this node's runsc restores it there, as
    * `runsc image verify --host` says; otherwise from the bucket, which the restore reads as it
@@ -1295,6 +1320,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           const token = storeProxy.mint(prefixOf(ref), `${prefixOf(ref)}/${LAYERS_DIR}/`);
           if (token === null) return yield* new AgentStopping({ environment, workspace });
           imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, goferOptions(ref, own.digest, token));
+          yield* expectPages(ref, release, imagePath);
         }
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
         prepared.set(prefixOf(ref), manifest);

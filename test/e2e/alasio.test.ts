@@ -1603,22 +1603,34 @@ if (inShard("snapshots")) {
       }
     });
 
-    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket comes back whole and is saved again, its node's agent stopped as its sandbox reads the rest of it, which the agent's stop waits on`, async (t) => {
+    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket comes back whole and is saved again, its node's agent stopped as its sandbox resumes, which stops once the restore has been served all its pages`, async (t) => {
       const big = await newSession("none");
       const { sessionId: held, sha256 } = await repl.fill(big, BIG_REPL_MEBIBYTES);
       await untilReleased(big, Date.now());
-      for (const pod of (await nodeAgents()).values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
+      const agents = await nodeAgents();
+      for (const pod of agents.values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
+      // Every node agent's log followed from its start, for the one that resumes the sandbox.
+      const resuming = [...agents.entries()].map(([node, pod]) => ({ node, pod, log: following(NAMESPACE, pod, "node-agent", new RegExp(`resumed the sandbox of ${SESSIONS}/${big} in `, "u")) }));
       const answered = turn(`hello with ${BIG_REPL_MEBIBYTES} MiB, its node's agent stopped`);
-      // Its sandbox resumed, reading the rest of it in the background: its node's agent stopped, as a rollout stops it.
-      const node = await until(`the restored pod of ${big} resumed`, async () => {
-        const pod = await kube.get<V1Pod>(ref("Pod", big, SESSIONS));
-        return pod?.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True") ? pod.spec?.nodeName : undefined;
-      }, 600_000);
-      const agent = (await nodeAgents()).get(node);
-      assert.ok(agent, `no node agent runs ready on ${node}`);
-      // What it says as it stops, followed from before its stop: once its container is gone,
-      // its log can no more be read, though its pod is still there.
-      const log = following(NAMESPACE, agent, "node-agent", new RegExp(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: 1 read it now`, "u"));
+      // Its sandbox resumed, reading the rest of it in the background: its node's agent stopped
+      // at once, as a rollout stops it.
+      const { node, pod: agent } = await new Promise<(typeof resuming)[number]>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`no node agent resumed the sandbox of ${big} within 600 s`)), 600_000);
+        for (const each of resuming) {
+          void each.log.said.then((line) => {
+            if (line === undefined) return;
+            clearTimeout(timer);
+            resolve(each);
+          });
+        }
+      }).finally(() => {
+        for (const { log } of resuming) log.stop();
+      });
+      // What it says before and as it stops, followed from its start and from before its stop:
+      // once its container is gone, its log can no more be read, though its pod is still
+      // there. However fast it was served the rest, the agent's stop waits on it, or the
+      // agent said it had been served it all before it stopped.
+      const log = following(NAMESPACE, agent, "node-agent", new RegExp(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: 1 read it now|the restore of ${SESSIONS}/${big} has been served all \\d+ bytes of its pages through the node agent`, "u"));
       await log.started;
       const stoppedAt = Date.now();
       await kube.remove(ref("Pod", agent, NAMESPACE));
@@ -1626,7 +1638,7 @@ if (inShard("snapshots")) {
         await until(`the node agent ${agent} gone`, async () => ((await kube.get(ref("Pod", agent, NAMESPACE))) === null ? true : undefined), 1_800_000);
         t.diagnostic(`the node agent ${agent} was gone ${Date.now() - stoppedAt} ms after it was stopped`);
         const said = await Promise.race([log.said, sleep(30_000).then(() => undefined)]);
-        assert.ok(said, `the node agent ${agent} did not say, as it stopped, that it waits on the restore reading the bucket through it`);
+        assert.ok(said, `the node agent ${agent} said neither, as it stopped, that it waits on the restore reading the bucket through it, nor before that it had served it all its pages`);
         t.diagnostic(said);
         await answered;
         const summed = await repl.sum(big, held);

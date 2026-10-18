@@ -6,10 +6,10 @@ import { createServer, type IncomingMessage, request as httpRequest } from "node
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 
-import { Effect, Fiber, type Scope } from "effect";
+import { Effect, Fiber, Logger, type Scope } from "effect";
 
 import { sigV4Authorization } from "../src/node-agent/s3.ts";
-import { keyOf, makeStoreProxy, SKEW_MS, type StoreProxy, type StoreProxyOptions, type StoreToken } from "../src/node-agent/store-proxy.ts";
+import { keyOf, makeStoreProxy, SKEW_MS, type StoreProxy, type StoreProxyOptions, type StoreToken, withRange } from "../src/node-agent/store-proxy.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
 
 // The snapshots bucket through the node agent, as a restore's checkpoint gofer reads it
@@ -24,8 +24,8 @@ const EMPTY = createHash("sha256").update("").digest("hex");
 /** How long a proxy's tokens and quiet last, unless told: as the proxy has them. */
 type Times = Pick<StoreProxyOptions, "preparedForMs" | "quietMs">;
 
-/** `effect` with a proxy of a fake bucket holding KEY, of `times`, run to its end. */
-function withProxy<A>(effect: (context: { readonly proxy: StoreProxy; readonly s3: FakeS3 }) => Effect.Effect<A, unknown, Scope.Scope>, times: Times = {}): Promise<A> {
+/** `effect` with a proxy of a fake bucket holding KEY, of `times`, run to its end; what it logs, put in `logged`. */
+function withProxy<A>(effect: (context: { readonly proxy: StoreProxy; readonly s3: FakeS3 }) => Effect.Effect<A, unknown, Scope.Scope>, times: Times = {}, logged: string[] = []): Promise<A> {
   return Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const s3 = yield* Effect.acquireRelease(
       Effect.promise(() => startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS })),
@@ -34,7 +34,7 @@ function withProxy<A>(effect: (context: { readonly proxy: StoreProxy; readonly s
     s3.objects.set(KEY, Buffer.from(Array.from({ length: 4096 }, (_, index) => index % 251)));
     const proxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, ...times });
     return yield* effect({ proxy, s3 });
-  })));
+  })).pipe(Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push(String(message)))]))));
 }
 
 /** The token `proxy` mints for `holder`, of PREFIX, which it must. */
@@ -234,6 +234,80 @@ test("a proxy that drains mints no token, and ends once no restore reads through
       proxy.revoke("main/fs-a");
       assert.equal(refusal(yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token: prepared }))), "403 AccessDenied");
     }), { quietMs: 300 }));
+
+const SERVED_ALL = "the restore of main/fs-abc has been served all 4096 bytes of its pages through the node agent";
+
+test("a resumed restore told the bytes of pages its image holds reads until it has been served them all, each once, however long its reads are apart, as the proxy logs once", () => {
+  const logged: string[] = [];
+  return withProxy(({ proxy, s3 }) =>
+    Effect.gen(function*() {
+      s3.objects.set(`${PREFIX}${"a".repeat(64)}/checkpoint.img`, Buffer.alloc(100, 1));
+      const token = minted(proxy);
+      const read = (range?: string, key = KEY) => Effect.promise(() => ask(proxy.endpoint, `/snapshots/${key}`, { token, ...(range === undefined ? {} : { range }) })).pipe(Effect.map(refusal));
+      proxy.resumed("main/fs-abc", 60_000);
+      proxy.expect("main/fs-abc", 4096);
+      // Its first half read, then nothing for longer than its quiet: it reads on, as its loader paces it.
+      assert.equal(yield* read("bytes=0-2047"), "206 ");
+      yield* sleep(300);
+      assert.equal(proxy.reading(), 1);
+      // The same bytes again, as a read made again after a failure, and another file's: counted once, and not at all.
+      assert.equal(yield* read("bytes=1024-2047"), "206 ");
+      assert.equal(yield* read(undefined, `${PREFIX}${"a".repeat(64)}/checkpoint.img`), "200 ");
+      yield* sleep(300);
+      assert.equal(proxy.reading(), 1);
+      assert.deepEqual(logged.filter((line) => line.includes("has been served")), []);
+      // The rest: done.
+      assert.equal(yield* read("bytes=2048-4095"), "206 ");
+      yield* sleep(50);
+      assert.equal(proxy.reading(), 0);
+      // Read again, and told again: logged once.
+      assert.equal(yield* read("bytes=0-4095"), "206 ");
+      proxy.expect("main/fs-abc", 4096);
+      yield* sleep(50);
+      assert.deepEqual(logged.filter((line) => line.includes("has been served")), [SERVED_ALL]);
+      yield* proxy.drained.pipe(Effect.timeout("2 seconds"));
+    }), { quietMs: 100 }, logged);
+});
+
+test("a resumed restore served its pages before the proxy is told how many bytes they are is done once it is told, as it logs", () => {
+  const logged: string[] = [];
+  return withProxy(({ proxy }) =>
+    Effect.gen(function*() {
+      const token = minted(proxy);
+      proxy.resumed("main/fs-abc", 60_000);
+      proxy.expect("main/fs-abc", Number.POSITIVE_INFINITY);
+      assert.equal(refusal(yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token }))), "200 ");
+      yield* sleep(50);
+      assert.equal(proxy.reading(), 1);
+      proxy.expect("main/fs-abc", 4096);
+      assert.equal(proxy.reading(), 0);
+      yield* sleep(50);
+      assert.deepEqual(logged.filter((line) => line.includes("has been served")), [SERVED_ALL]);
+    }), { quietMs: 100 }, logged);
+});
+
+test("a resumed restore whose bytes of pages are not known yet reads however quiet, and once told none, as its quiet says", () =>
+  withProxy(({ proxy }) =>
+    Effect.gen(function*() {
+      minted(proxy);
+      proxy.resumed("main/fs-abc", 60_000);
+      proxy.expect("main/fs-abc", Number.POSITIVE_INFINITY);
+      yield* sleep(300);
+      assert.equal(proxy.reading(), 1);
+      proxy.expect("main/fs-abc", null);
+      assert.equal(proxy.reading(), 0);
+      // Of a holder of none, nothing.
+      proxy.expect("main/fs-none", 1);
+      assert.equal(proxy.reading(), 0);
+    }), { quietMs: 100 }));
+
+test("byte ranges are kept sorted and apart, those that meet or overlap merged", () => {
+  assert.deepEqual(withRange([], 0, 10), [[0, 10]]);
+  assert.deepEqual(withRange([[0, 10]], 10, 20), [[0, 20]]);
+  assert.deepEqual(withRange([[0, 10], [30, 40]], 5, 35), [[0, 40]]);
+  assert.deepEqual(withRange([[30, 40]], 0, 10), [[0, 10], [30, 40]]);
+  assert.deepEqual(withRange([[0, 10]], 5, 5), [[0, 10]]);
+});
 
 test("a path is a key of the bucket only as it names it, segment by segment, once decoded", () => {
   assert.equal(keyOf("/snapshots/main/fs-abc/layers/a%20b/pages.img", "snapshots"), "main/fs-abc/layers/a b/pages.img");
