@@ -137,6 +137,8 @@ test("a workspace is cloned into another, of any environment, its files' owners 
     writeFileSync(join(sourceFiles, "workspace", "kept"), "from the source");
     chmodSync(join(sourceFiles, "workspace", "kept"), 0o640);
     const fork = { environment: "alasio-branch-try-sessions", workspace: "fs-source" };
+    // Its quota found off once after its first repair, as the clone's counts settle.
+    at.inconsistentChecks(1);
     await Effect.runPromise(at.workspaces.clone(source, fork, 3 * 1024 ** 3));
     const forked = join(at.workspacesRoot, "alasio-branch-try-sessions", "fs-source", "files", "workspace", "kept");
     assert.equal(readFileSync(forked, "utf8"), "from the source");
@@ -156,12 +158,15 @@ test("a workspace is cloned into another, of any environment, its files' owners 
     assert.equal(existsSync(join(at.workspacesRoot, "alasio-branch-try-sessions", "fs-source")), false);
     await Effect.runPromise(at.workspaces.remove(fork));
     assert.ok(at.juicefsCalls().some((call) => call.startsWith("quota delete redis://valkey.alasio.svc:6379/1 --path /alasio-branch-try-sessions/fs-source ")));
-    // Cloned, its quota set, then its usage counted anew.
+    // Cloned, its quota set, then its usage counted anew until a check finds it holds.
     const cloned = at.juicefsCalls().findIndex((call) => call.startsWith(`clone --preserve ${sourceFiles} `));
     assert.ok(cloned >= 0);
-    assert.deepEqual(at.juicefsCalls().slice(cloned + 1, cloned + 3).map((call) => call.split(" META_PASSWORD")[0]), [
+    assert.deepEqual(at.juicefsCalls().slice(cloned + 1, cloned + 6).map((call) => call.split(" META_PASSWORD")[0]), [
       "quota set redis://valkey.alasio.svc:6379/1 --path /alasio-branch-try-sessions/fs-source --capacity 3",
       "quota check redis://valkey.alasio.svc:6379/1 --path /alasio-branch-try-sessions/fs-source --repair",
+      "quota check redis://valkey.alasio.svc:6379/1 --path /alasio-branch-try-sessions/fs-source",
+      "quota check redis://valkey.alasio.svc:6379/1 --path /alasio-branch-try-sessions/fs-source --repair",
+      "quota check redis://valkey.alasio.svc:6379/1 --path /alasio-branch-try-sessions/fs-source",
     ]);
     assert.equal(readFileSync(join(sourceFiles, "workspace", "kept"), "utf8"), "from the source");
   } finally {
@@ -387,6 +392,32 @@ test("bayma of a bound pod of a pool on this node is told to go on with its stop
     // A hook that fails, its failure said.
     at.hooks.fail = true;
     assert.equal(await refusal(stop("c-bayma")), 502);
+  } finally {
+    at.done();
+  }
+});
+
+test("the sandbox of a bound pod's bayma of a pool on this node is told to write its files through, by sync run in its container, and no other container nor pod's is", async () => {
+  const at = workspacesNode();
+  try {
+    at.pod("pool-0");
+    const pod = (name: string, container = "bayma", namespace = "alasio-sessions") => ({ "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": name, "io.kubernetes.cri.container-name": container });
+    for (const [id, annotations] of [["c-bayma", pod("pool-0")], ["c-other", pod("pool-0", "sidecar")], ["c-elsewhere", pod("other-0")]] as const) {
+      at.running.add(id);
+      at.annotations.set(id, annotations);
+    }
+    const sync = (containerId: string, of = "pool-0") => at.workspaces.sync({ namespace: "alasio-sessions", pod: of, containerId });
+    await Effect.runPromise(sync("c-bayma"));
+    assert.deepEqual(at.execs, ["r c-bayma sync"]);
+    // Not its pod's bayma; not the pod it says; of no pool here; a container that runs not.
+    assert.equal(await refusal(sync("c-other")), 403);
+    assert.equal(await refusal(sync("c-bayma", "pool-1")), 403);
+    assert.equal(await refusal(sync("c-elsewhere", "other-0")), 403);
+    assert.equal(await refusal(sync("c-gone")), 404);
+    assert.equal(at.execs.length, 1);
+    // One that fails, its failure said.
+    at.hooks.fail = true;
+    assert.equal(await refusal(sync("c-bayma")), 502);
   } finally {
     at.done();
   }

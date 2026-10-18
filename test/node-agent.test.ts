@@ -1972,6 +1972,7 @@ const unusedWorkspaces: Workspaces = {
   read: () => Effect.die("no workspace's file is read"),
   write: () => Effect.die("no workspace's file is written"),
   stop: () => Effect.die("no bayma is told to stop"),
+  sync: () => Effect.die("no sandbox is told to write its files through"),
   released: () => Effect.die("no workspace's release is read"),
   setReleased: () => Effect.die("no workspace's release is recorded"),
 };

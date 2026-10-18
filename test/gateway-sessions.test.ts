@@ -94,7 +94,7 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
       // What is attached on its node is reachable, unless a test says otherwise.
       attachments: () => Effect.succeed([]),
       prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
-      readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, listEnvironments: unused(), quota: unused,
+      readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, listEnvironments: unused(), quota: unused, sync: unused,
       checkpoint: (node, request) =>
         Effect.gen(function*() {
           asked.push(`checkpoint ${node} ${request.pod}${request.live ? " live" : ""}`);
@@ -402,6 +402,7 @@ function workspaceAgents(): {
       holdings: (node) => Effect.sync(() => ({ node, releases: [], cached: [...cached].map(([each, images]) => ({ ...ofName(each), images, bytes: 1, usedAt: "2026-10-17T12:00:00Z" })) })),
       createWorkspace: (ref, quotaBytes) => Effect.sync(() => (calls.push(`create ${name(ref)} ${quotaBytes}`), void files.set(name(ref), files.get(name(ref)) ?? new Map()))),
       removeWorkspace: (ref) => Effect.sync(() => (calls.push(`remove ${name(ref)}`), void files.delete(name(ref)))),
+      sync: (node, request) => Effect.sync(() => void calls.push(`sync ${node} ${request.namespace}/${request.pod} ${request.containerId}`)),
       cloneWorkspace: (from, to, quotaBytes) =>
         Effect.suspend(() => {
           calls.push(`clone ${name(from)} ${name(to)} ${quotaBytes}`);
@@ -564,15 +565,17 @@ test("a fork of main's workspace released into a snapshot into main is given a c
   recorded.calls.length = 0;
   assert.deepEqual(await fork(env.name, "fs-fork0003"), { status: 204 });
   assert.deepEqual(recorded.calls, [`clone ${source} ${env.namespace}/fs-fork0003 ${2 * 1024 ** 3}`]);
-  // Of one bound: its files alone, as its sandbox runs on from its snapshot; bound here from bayma's checkpoints, its record then as it was.
+  // Of one bound: its files alone, as its sandbox runs on from its snapshot, once its sandbox has written them through to its
+  // node's mount; bound here from bayma's checkpoints, its record then as it was.
   recorded.records.delete(source);
   const placement = await Effect.runPromise(sessions.place(claims.key, claims.options));
   await Effect.runPromise(binder.bind(placement.pool, claims.key, placement));
+  const boundPod = (await Effect.runPromise(binder.bound(placement.pool, claims.key)))?.pod;
   recorded.snapshots.set(source, { snapshot: "s-1", release: "r1" });
   recorded.records.set(source, { snapshot: "s-1", release: "r1" });
   recorded.calls.length = 0;
   assert.deepEqual(await fork(env.name, "fs-fork0004"), { status: 204 });
-  assert.deepEqual(recorded.calls, [`clone ${source} ${env.namespace}/fs-fork0004 ${2 * 1024 ** 3}`]);
+  assert.deepEqual(recorded.calls, [`sync node-a ${env.namespace}/${boundPod} c-0`, `clone ${source} ${env.namespace}/fs-fork0004 ${2 * 1024 ** 3}`]);
   await Effect.runPromise(binder.release(placement.pool, claims.key));
   // Into one bound, or being bound: none.
   const under = await run(takeLease(env.none, sessionKey("fs-fork0005"), "another-binder"));

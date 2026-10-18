@@ -101,6 +101,9 @@
  *   it holds, by `hook`, its `sandbox-hook stop`, run in it (./workspaces.ts) (204); 403 for a
  *   container that is not the bayma of a pool's pod here, 404 for one that runs not, 502 where
  *   the hook fails.
+ * - `POST /sync`, `{ namespace, pod, containerId }`: has the sandbox of that bayma write what it
+ *   holds of its files through to the node's mount, by `sync` run in it (./workspaces.ts)
+ *   (204); refused as a stop is, 502 where it fails.
  * - `POST /detach`, `{ pod, containerIds }`: detaches what is attached into `pod`'s directory
  *   (204); 409 while any of `containerIds`, its sandbox's containers, runs.
  * - `GET /files/<environment>/<workspace>?path=<path>&max=<bytes>`: the workspace's file at
@@ -188,6 +191,8 @@ const CloneRequest = Schema.Struct({ from: WorkspaceRef, to: WorkspaceRef, quota
 const AttachRequest = Schema.Struct({ ...WorkspaceRef.fields, pod: Schema.NonEmptyString, token: Schema.NonEmptyString, env: Schema.Record(Schema.String, Schema.String), made: Schema.optional(Schema.Boolean) });
 /** What `POST /detach` is given. */
 const DetachRequest = Schema.Struct({ pod: Schema.NonEmptyString, containerIds: Schema.Array(Schema.NonEmptyString) });
+/** What `POST /sync` is given. */
+const SyncRequest = Schema.Struct({ namespace: Schema.NonEmptyString, pod: Schema.NonEmptyString, containerId: Schema.NonEmptyString });
 /** What `POST /stop` is given. */
 const StopRequest = Schema.Struct({ namespace: Schema.NonEmptyString, pod: Schema.NonEmptyString, containerId: Schema.NonEmptyString, hook: Schema.Array(Schema.String.check(Schema.isPattern(/^\S+$/u))).check(Schema.isMinLength(1)) });
 
@@ -362,6 +367,9 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
       return body(AttachRequest).pipe(Effect.flatMap(({ pod, token: binding, env, made, ...ref }) => workspaces.attach(ref, pod, binding, env, { made: made === true })), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }
     if (method === "GET" && url === "/attachments") return workspaces.attachments.pipe(Effect.map((attachments) => answer(200, { attachments })));
+    if (method === "POST" && url === "/sync") {
+      return body(SyncRequest).pipe(Effect.flatMap(workspaces.sync), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    }
     if (method === "POST" && url === "/stop") {
       return body(StopRequest).pipe(Effect.flatMap(workspaces.stop), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }

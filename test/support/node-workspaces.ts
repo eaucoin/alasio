@@ -55,6 +55,11 @@ export function workspacesNode() {
     'path="$5"; file="' + quotaDir + '/$(echo "$path" | tr / _)"',
     'if [ "$2" = delete ]; then rm -f "$file"; exit; fi',
     'if [ "$2" = set ]; then echo "$7" > "$file"; fi',
+    // A check without repair finds the quota off as many times as the test says, as JuiceFS says it.
+    `if [ "$2" = check ] && [ -z "$6" ] && [ "$(cat ${join(root, "inconsistent")} 2>/dev/null || echo 0)" -gt 0 ]; then`,
+    `  echo $(( $(cat ${join(root, "inconsistent")}) - 1 )) > ${join(root, "inconsistent")}`,
+    '  echo "<FATAL>: quota of $path is inconsistent, please repair it with --repair flag [main@main.go:31]" >&2; exit 1',
+    "fi",
     'if [ ! -f "$file" ]; then echo "no quota of $path" >&2; exit 1; fi',
     'echo "+--+"; echo "| $path | $(cat "$file").0 GiB | 12 MiB | 1% | unlimited | 3 | |"; echo "+--+"',
   ].join("\n"));
@@ -80,7 +85,10 @@ export function workspacesNode() {
     workspacesRoot,
     attachRoot,
     agentUid: process.getuid?.() ?? 1000,
+    quotaSettleMs: 0,
   });
+  /** Has the next `count` checks of a quota, without repair, find it off. */
+  const inconsistentChecks = (count: number) => writeFileSync(join(root, "inconsistent"), `${count}\n`);
   const files = (workspace: string) => {
     const directory = join(workspacesRoot, "main", workspace, "files");
     mkdirSync(join(directory, "workspace"), { recursive: true });
@@ -91,6 +99,6 @@ export function workspacesNode() {
   const pod = (name: string) => mkdirSync(join(attachRoot, name), { recursive: true });
   /** What JuiceFS's command was run with, a call a line. */
   const juicefsCalls = () => (existsSync(join(root, "juicefs.log")) ? readFileSync(join(root, "juicefs.log"), "utf8").trim().split("\n") : []);
-  return { root, workspacesRoot, attachRoot, mounts, stuck, ran, tokenAtMount, running, annotations, execs, hooks, storage, unreachable, workspaces, files, pod, juicefsCalls, done: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, workspacesRoot, attachRoot, mounts, stuck, ran, tokenAtMount, running, annotations, execs, hooks, storage, unreachable, workspaces, files, pod, juicefsCalls, inconsistentChecks, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 

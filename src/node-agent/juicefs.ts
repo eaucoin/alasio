@@ -41,6 +41,8 @@ export interface Juicefs {
   readonly deleteQuota: (path: string) => Effect.Effect<void, JuicefsError>;
   /** Counts what the directory `path` holds anew and repairs its quota's usage where it differs. */
   readonly repairQuota: (path: string) => Effect.Effect<void, JuicefsError>;
+  /** Whether the directory `path`'s quota's usage is what it holds, as a check without repair says. */
+  readonly quotaHolds: (path: string) => Effect.Effect<boolean, JuicefsError>;
   /** Clones the directory `source`, a path of the node's mount, into `destination`, which is not there yet, its parent being. */
   readonly clone: (source: string, destination: string) => Effect.Effect<void, JuicefsError>;
 }
@@ -104,6 +106,12 @@ export function makeJuicefs({ metaUrl, juicefs = JUICEFS }: JuicefsOptions): Jui
     quota: (path) => Effect.map(run("quota get", ["quota", "get", address, "--path", path]), (printed) => quotaOf(printed, path)),
     deleteQuota: (path) => Effect.asVoid(run("quota delete", ["quota", "delete", address, "--path", path])),
     repairQuota: (path) => Effect.asVoid(run("quota check", ["quota", "check", address, "--path", path, "--repair"])),
+    // A check that finds the usage off fails, saying the quota is inconsistent.
+    quotaHolds: (path) =>
+      run("quota check", ["quota", "check", address, "--path", path]).pipe(
+        Effect.as(true),
+        Effect.catchIf((error) => error.reason.includes(`quota of ${path} is inconsistent`), () => Effect.succeed(false)),
+      ),
     // Its files' owners and modes as they are, not the agent's, which runs it as root.
     clone: (source, destination) => Effect.asVoid(run("clone", ["clone", "--preserve", source, destination])),
   };

@@ -11,7 +11,7 @@ import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { Gofer } from "../node-agent/names.ts";
 import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, POLICY_WAIT_MS, type ResumeRequest, type WorkspaceRef } from "../node-agent/agent.ts";
 import { NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
-import { Released, type StopRequest } from "../node-agent/workspaces.ts";
+import { Released, type StopRequest, type SyncRequest } from "../node-agent/workspaces.ts";
 
 /** Where the node agents are: their pods' namespace and labels, and the port they serve on. */
 export interface NodeAgentsLocation {
@@ -140,6 +140,12 @@ export interface NodeAgents {
    * container; an agent refuses one that is not the bayma of a pool's pod there with 403.
    */
   readonly stop: (node: string, request: StopRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /**
+   * Has the sandbox of the bound pod `request.pod`'s bayma, on `node`, write what it holds of
+   * its files through to the node's mount, by `sync`, which its node's agent runs in its
+   * container; refused as a stop is.
+   */
+  readonly sync: (node: string, request: SyncRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** The pods of `node` a workspace is attached into, each by whether what is attached is reachable still. */
   readonly attachments: (node: string) => Effect.Effect<readonly { readonly pod: string; readonly reachable: boolean }[], NodeAgentError | KubeApiError>;
   /** The snapshot the workspace was last released into, as any agent reads its record of it; null where none is recorded. */
@@ -169,6 +175,8 @@ const OPERATION_POLL: Duration.Input = "500 millis";
 const RESUME_CALL: Duration.Input = Duration.sum(Duration.millis(POLICY_WAIT_MS), Duration.seconds(30));
 /** How long any other call may take. */
 const SHORT_CALL: Duration.Input = "30 seconds";
+/** How long a sandbox's sync may take: what it writes through, which the agent waits a minute for. */
+const SYNC_CALL: Duration.Input = "90 seconds";
 
 /** A call of an agent: what, with what (JSON, or bytes as they are), for how long; with `absent`, a 404 is an answer, not a failure. */
 interface AgentCall {
@@ -295,6 +303,8 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     attachments: (node) =>
       ask(node, "say what is attached on it", { method: "GET", path: "/attachments", timeout: SHORT_CALL }, Attachments).pipe(Effect.map(({ attachments }) => attachments)),
     stop: (node, request) => send(node, `tell ${request.namespace}/${request.pod}'s bayma to go on with its stop`, { method: "POST", path: "/stop", body: request, timeout: SHORT_CALL }).pipe(Effect.asVoid),
+    sync: (node, request) =>
+      send(node, `have ${request.namespace}/${request.pod}'s sandbox write its files through`, { method: "POST", path: "/sync", body: request, timeout: SYNC_CALL }).pipe(Effect.asVoid),
     released: (workspace) =>
       Effect.gen(function*() {
         const node = yield* anyNode;

@@ -41,6 +41,9 @@
  * hook, `sandbox-hook stop`, run in its container under the gVisor release that runs it, as
  * a checkpoint runs its hook, and in no container but the bayma of a pod of a pool on this
  * node: one whose pod's directory kubelet made, its pod named by containerd's annotations.
+ * Such a bayma's sandbox is told to write what it holds of its files through to the node's
+ * mount (sync), its `sync` run in it likewise, as a fork of its workspace is cloned from what
+ * the mount has.
  *
  * Beside its files, which its sandbox sees, and so out of its sandbox's reach, a workspace
  * keeps the snapshot it was last released into (`released.json`, a Released), which its
@@ -125,6 +128,12 @@ export interface StopRequest {
 /** How long bayma's hook may take to go on with its stop. */
 const STOP_TIMEOUT_MS = 30_000;
 
+/** What a sync asks: the bound pod, by its namespace and name, and its bayma's container by its runtime's id. */
+export type SyncRequest = Omit<StopRequest, "hook">;
+
+/** How long a bound pod's sandbox may take to write what it holds of its files through. */
+const SYNC_TIMEOUT_MS = 60_000;
+
 /** What a workspace's agent does with workspaces; see makeWorkspaces. */
 export interface Workspaces {
   /** Makes `ref`, as the module says, its quota `quotaBytes`. */
@@ -159,6 +168,8 @@ export interface Workspaces {
   readonly attachments: Effect.Effect<readonly { readonly pod: string; readonly reachable: boolean }[], HostCommandError>;
   /** Has the bayma of a bound pod go on with the stop it holds, as the module says. */
   readonly stop: (request: StopRequest) => Effect.Effect<void, WorkspaceRefused>;
+  /** Has the sandbox of a bound pod's bayma write what it holds of its files through, as the module says. */
+  readonly sync: (request: SyncRequest) => Effect.Effect<void, WorkspaceRefused>;
   /** The snapshot `ref` was last released into, as the module says; null where none is recorded. */
   readonly released: (ref: WorkspaceRef) => Effect.Effect<Released | null, WorkspaceRefused>;
   /** Records the snapshot `ref` is released into, or none, as the module says; refused where there is no such workspace. */
@@ -196,7 +207,19 @@ export interface WorkspacesOptions {
   readonly workspacesRoot?: string;
   readonly attachRoot?: string;
   readonly agentUid?: number;
+  /** How long a fork's quota is left to settle after each repair before it is checked (QUOTA_SETTLE_MS), but for tests. */
+  readonly quotaSettleMs?: number;
 }
+
+/**
+ * How long a fork's quota is left to settle after it is repaired before it is checked, and how
+ * many times it is repaired at most: the mount that cloned it writes what it cloned to its
+ * directories' stats in the metadata engine a moment later, so the usage it was repaired to may
+ * be off what they then sum to. One still off after the last is repaired by the daily quota
+ * check (cli/src/manifests/workspace-storage.ts).
+ */
+const QUOTA_SETTLE_MS = 2_000;
+const QUOTA_REPAIRS = 5;
 
 /** The agent's workspaces, as the module says. */
 /** What an attach writes into a pod's directory, beside its workspace's mount point (`ws`), and what its bayma marks there (`served`). */
@@ -261,7 +284,9 @@ export const lookOnNode = (host: HostCommands) => (point: string): Promise<void>
     throw Object.assign(new Error(stderr.trim()), { code });
   });
 
-export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches = reaching(lookOnNode(host)), workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID }: WorkspacesOptions): Workspaces {
+export function makeWorkspaces(
+  { host, runsc, juicefs, mounted = fuseAt, reaches = reaching(lookOnNode(host)), workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID, quotaSettleMs = QUOTA_SETTLE_MS }: WorkspacesOptions,
+): Workspaces {
   /** Where `ref`'s files are on the node, its names checked. */
   const filesOf = ({ environment, workspace }: WorkspaceRef): Effect.Effect<string, WorkspaceRefused> =>
     !ENVIRONMENT.test(environment) || !isValidVolumeId(workspace)
@@ -277,6 +302,21 @@ export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches
     onNode(host, ["cat", "/proc/self/mountinfo"]).pipe(
       Effect.map(({ stdout }) => mountPoints(stdout).filter((point) => point === directory || point.startsWith(`${directory}/`)).toSorted((a, b) => b.length - a.length)),
     );
+
+  /** The container `containerId`, where it is the bayma of the pod `namespace`/`pod` of a pool on this node, as the module says; refused otherwise. */
+  const baymaOf = ({ namespace, pod, containerId }: SyncRequest) =>
+    Effect.gen(function*() {
+      const directory = yield* podDirectory(pod);
+      const container = yield* runsc.container(containerId).pipe(Effect.mapError(() => refused(404, `no container ${containerId} runs on this node`)));
+      const { annotations } = container;
+      const of = `${annotations["io.kubernetes.cri.sandbox-namespace"] ?? "?"}/${annotations["io.kubernetes.cri.sandbox-name"] ?? "?"}`;
+      if (of !== `${namespace}/${pod}` || annotations["io.kubernetes.cri.container-name"] !== BAYMA_CONTAINER) {
+        return yield* refused(403, `container ${containerId} is ${of}'s ${annotations["io.kubernetes.cri.container-name"] ?? "?"}, not the bayma of ${namespace}/${pod}`);
+      }
+      const pooled = yield* Effect.promise(() => lstat(directory).then((stats) => stats.isDirectory(), () => false));
+      if (!pooled) return yield* refused(403, `${namespace}/${pod} is no pod of a pool on this node: kubelet has made it no directory`);
+      return container;
+    });
 
   /** JuiceFS's command, refused where the agent is given none. */
   const juicefsOr = juicefs ? Effect.succeed(juicefs) : Effect.fail(refused(501, "this node agent makes no workspace, as workspace storage is not given it"));
@@ -318,8 +358,17 @@ export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches
         yield* onMount(`${to.environment}/${to.workspace} could not be made`, () => mkdir(join(destination, ".."), { recursive: true }));
         yield* command.clone(source, destination);
         yield* command.setQuota(quotaPath(to), quotaBytes);
-        // The usage the quota is set with, counted as the clone's tree was attached, may be off what the tree holds: counted anew.
-        yield* command.repairQuota(quotaPath(to));
+        // The usage the quota is set with, counted as the clone's tree was attached, may be off what the tree holds: counted
+        // anew, until a check after it has settled finds it holds (QUOTA_SETTLE_MS).
+        for (let repairs = 1; ; repairs += 1) {
+          yield* command.repairQuota(quotaPath(to));
+          yield* Effect.sleep(quotaSettleMs);
+          if (yield* command.quotaHolds(quotaPath(to))) break;
+          if (repairs === QUOTA_REPAIRS) {
+            yield* Effect.logWarning(`${to.environment}/${to.workspace}'s quota is still off what it holds after ${QUOTA_REPAIRS} repairs; the daily quota check repairs it`);
+            break;
+          }
+        }
       }),
 
     remove: (ref) =>
@@ -426,20 +475,22 @@ export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches
       return yield* Effect.forEach(attached, (point) => Effect.promise(() => reaches(point)).pipe(Effect.map((reachable) => ({ pod: point.split("/").at(-2) ?? "", reachable }))), { concurrency: 8 });
     }),
 
-    stop: ({ namespace, pod, containerId, hook }) =>
+    stop: (request) =>
       Effect.gen(function*() {
-        const directory = yield* podDirectory(pod);
+        const { namespace, pod, containerId, hook } = request;
         const at = hook.indexOf("sandbox-hook");
         if (at < 0 || hook[at + 1] !== "stop") return yield* refused(400, `${hook.join(" ")} is not bayma's sandbox-hook stop`);
-        const container = yield* runsc.container(containerId).pipe(Effect.mapError(() => refused(404, `no container ${containerId} runs on this node`)));
-        const { annotations } = container;
-        const of = `${annotations["io.kubernetes.cri.sandbox-namespace"] ?? "?"}/${annotations["io.kubernetes.cri.sandbox-name"] ?? "?"}`;
-        if (of !== `${namespace}/${pod}` || annotations["io.kubernetes.cri.container-name"] !== BAYMA_CONTAINER) {
-          return yield* refused(403, `container ${containerId} is ${of}'s ${annotations["io.kubernetes.cri.container-name"] ?? "?"}, not the bayma of ${namespace}/${pod}`);
-        }
-        const pooled = yield* Effect.promise(() => lstat(directory).then((stats) => stats.isDirectory(), () => false));
-        if (!pooled) return yield* refused(403, `${namespace}/${pod} is no pod of a pool on this node: kubelet has made it no directory`);
+        const container = yield* baymaOf(request);
         yield* runsc.exec(container.release, containerId, hook, STOP_TIMEOUT_MS).pipe(Effect.mapError((error) => refused(502, `bayma of ${namespace}/${pod} did not go on with its stop: ${error.message}`)));
+      }),
+
+    sync: (request) =>
+      Effect.gen(function*() {
+        const { namespace, pod, containerId } = request;
+        const container = yield* baymaOf(request);
+        yield* runsc.exec(container.release, containerId, ["sync"], SYNC_TIMEOUT_MS).pipe(
+          Effect.mapError((error) => refused(502, `the sandbox of ${namespace}/${pod} did not write its files through: ${error.message}`)),
+        );
       }),
 
     released: (ref) =>

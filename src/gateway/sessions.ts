@@ -27,7 +27,8 @@
  *   into itself alone, holding no key of any other's; 403 elsewhere. A fork of a workspace
  *   released into a snapshot is given a copy of it, and recorded released into it, so it
  *   restores as its source would (./snapshots.ts copy), under the bindings' Leases of both;
- *   one of a workspace bound is a clone of its files alone; 409 while the fork is bound, or
+ *   one of a workspace bound is a clone of its files alone, once its sandbox has written them
+ *   through to its node's mount (syncBound); 409 while the fork is bound, or
  *   being bound or released.
  * - `GET /workspace/all`: `{ workspaces }`, the names of the environment's workspaces (200).
  * And of no workspace, to main's token alone (403 to any other environment's):
@@ -61,7 +62,7 @@ import { Clock, Effect, Schema } from "effect";
 
 import { type Binder, BindStepFailed } from "../binder/binder.ts";
 import { type BindingLease, heldLeases } from "../binder/bindings.ts";
-import { BINDING_LABEL, KEY_ANNOTATION, type Pool, POOL_LABEL } from "../binder/names.ts";
+import { BINDING_LABEL, KEY_ANNOTATION, keyHash, type Pool, POOL_LABEL } from "../binder/names.ts";
 import { type Answer, type Operation, type Placement, PlacementRefused } from "../binder/server.ts";
 import { baymaIdleness, IDLE_POLL_MS, makeSweep } from "../binder/sweep.ts";
 import { bindingToken, type TokenClaims } from "../binder/tokens.ts";
@@ -459,6 +460,22 @@ export const makeSessions = Effect.fnUntraced(function*(
     );
   const done: Answer = { status: 204 };
 
+  /**
+   * Has the sandbox of each pod bound to `key` in `namespace` write what it holds of its files
+   * through to its node's mount (../node-agent/workspaces.ts sync), as a fork of its workspace,
+   * bound, is cloned from what the mount has; a pod whose bayma runs not yet holds none.
+   */
+  const syncBound = (namespace: string, key: string) =>
+    Effect.gen(function*() {
+      const pods = (yield* kube.list("v1", "Pod", namespace, `${BINDING_LABEL}=${keyHash(key)}`)) as V1Pod[];
+      yield* Effect.forEach(pods, (pod) => {
+        const bayma = pod.status?.containerStatuses?.find(({ name, state }) => name === BAYMA_CONTAINER && state?.running);
+        const containerId = bayma?.containerID?.replace(/^[a-z]+:\/\//u, "");
+        const [node, name] = [pod.spec?.nodeName, pod.metadata?.name];
+        return node && name && containerId ? agents.sync(node, { namespace, pod: name, containerId }) : Effect.void;
+      }, { discard: true });
+    });
+
   const operate = (claims: TokenClaims, { method, path, query, body }: Operation): Effect.Effect<Answer> =>
     Effect.gen(function*() {
       const named = claims.options?.["environment"];
@@ -504,9 +521,10 @@ export const makeSessions = Effect.fnUntraced(function*(
           const fork = { environment: target.namespace, workspace: asked.workspace };
           const clone = agents.cloneWorkspace(ref, fork, quotaBytes);
           const forked = Effect.gen(function*() {
-            // Its source held too, so what it was released into is read as it is; one bound is cloned of its files alone.
+            // Its source held too, so what it was released into is read as it is; one bound is cloned of its files alone, once
+            // its sandbox has written them through.
             const copied = yield* binder.hold(from, claims.key, Effect.andThen(clone, snapshots.copy(from, workspace, into, asked.workspace)));
-            if (!copied) return yield* clone;
+            if (!copied) return yield* Effect.andThen(syncBound(environment.namespace, claims.key), clone);
             if (!copied.value) return;
             yield* agents.setReleased(fork, copied.value).pipe(
               Effect.catch((error) => Effect.logWarning(`${fork.environment}/${fork.workspace}'s release into its snapshot ${copied.value?.snapshot} could not be recorded, so it is bound from bayma's checkpoints: ${error.message}`)),
