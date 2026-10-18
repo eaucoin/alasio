@@ -9,7 +9,7 @@ import { Effect, Exit, Scope } from "effect";
 import { type AppServerProcessOptions, AppServerSpawnFailed } from "../src/codex/app-server/process.ts";
 import type { LoginRelay } from "../src/codex/login-relay.ts";
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.ts";
-import type { BaymaEndpoint } from "../src/kube/sandboxes.ts";
+import type { BaymaEndpoint } from "../src/sandbox/gateway-client.ts";
 import { SESSION_FS_CLAUDE_TOOLS } from "../src/harness/claude/sessionfs.ts";
 import { SESSION_FS_INSTRUCTIONS } from "../src/harness/workspace-instructions.ts";
 import {

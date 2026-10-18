@@ -38,9 +38,6 @@ import type {
   V1Deployment,
   V1EnvVar,
   V1PodTemplateSpec,
-  V1PolicyRule,
-  V1Role,
-  V1RoleBinding,
   V1Service,
   V1ServiceAccount,
 } from "@kubernetes/client-node";
@@ -57,6 +54,7 @@ import {
   GATEWAY_CONFIG_VARIABLE,
   GatewayConfig as GatewayConfigSchema,
   type GatewayConfig,
+  FOLDERS_NAMESPACE_VARIABLE,
   RECEIVER_PORT_VARIABLE,
   SESSIONS_NAMESPACE_VARIABLE,
   templateHash,
@@ -68,7 +66,9 @@ import { NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { READY_ONCE_BOUND_ANNOTATION } from "../kube/rollout.ts";
 import { type Carried, type CpuBaseline, type Kept, type PreviousPools, sessionsNamespace, stopWaitSeconds } from "./alasio.ts";
+import { folderTemplate, foldersRun } from "./folders.ts";
 import {
+  accountRole,
   componentName,
   type Environment,
   given,
@@ -304,23 +304,13 @@ function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
       port: NODE_AGENT_PORT,
     },
     receiver: { host: `${RECEIVER}.${NAMESPACE}.svc.cluster.local`, port: config.telemetry.receiverPort },
+    // Folder conversations' instances, of the host profile, where the installation has folder workspaces.
+    folders: foldersRun(config)
+      ? { namespace: config.host.namespace, template: { ...folderTemplate(config) }, stateRoot: config.host.stateRoot, releaseAfterSeconds: durationSeconds(config.host.releaseAfter) ?? 0 }
+      : null,
   };
 }
 
-/** A Role in `namespace` of `rules`, named for the ServiceAccount `account` of alasio's namespace, and its binding to it. */
-function accountRole(account: string, component: string, namespace: string, rules: V1PolicyRule[]): [V1Role, V1RoleBinding] {
-  const metadata = { name: account, namespace, labels: labels(component) };
-  return [
-    { apiVersion: "rbac.authorization.k8s.io/v1", kind: "Role", metadata, rules },
-    {
-      apiVersion: "rbac.authorization.k8s.io/v1",
-      kind: "RoleBinding",
-      metadata,
-      roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: account },
-      subjects: [{ kind: "ServiceAccount", name: account, namespace: NAMESPACE }],
-    },
-  ];
-}
 
 /**
  * What lets the ServiceAccount `account` find the branch environments, by their namespaces
@@ -454,6 +444,7 @@ function receiverObjects(config: InstallConfig): KubernetesObject[] {
               { name: RECEIVER_PORT_VARIABLE, value: String(port) },
               { name: BINDING_KEY_VARIABLE, valueFrom: { secretKeyRef: { name: GATEWAY, key: "binding-key" } } },
               { name: SESSIONS_NAMESPACE_VARIABLE, value: sessionsNamespace(config, MAIN_ENVIRONMENT) },
+              ...(foldersRun(config) ? [{ name: FOLDERS_NAMESPACE_VARIABLE, value: config.host.namespace }] : []),
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: RECEIVER }, ...otelEnv(config)] : []),
             ],
             ports: [{ name: "otlp-http", containerPort: port }],

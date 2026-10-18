@@ -17,8 +17,7 @@ import type { CallToolResult, ContentBlock } from "@modelcontextprotocol/sdk/typ
 import { Effect } from "effect";
 
 import { loadAlasioConfig } from "../../src/config.ts";
-import type { BaymaEndpoint } from "../../src/kube/sandboxes.ts";
-import { makeGatewayWorkspaces } from "../../src/sandbox/gateway-client.ts";
+import { type BaymaEndpoint, makeGatewayWorkspaces } from "../../src/sandbox/gateway-client.ts";
 import { makeSessionSandboxes } from "../../src/sandbox/index.ts";
 
 /** What bayma's session.create answers, as far as the end-to-end scripts read it. */

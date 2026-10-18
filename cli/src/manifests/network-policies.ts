@@ -52,6 +52,7 @@ import {
 } from "./object-store.ts";
 import { PROXY_PORT } from "./neon.ts";
 import { VALKEY_PORT } from "./valkey.ts";
+import { FOLDER_PORT, foldersRun } from "./folders.ts";
 import { JUICEFS_ADMIN } from "./workspace-storage.ts";
 import {
   GATEWAY as SANDBOX_GATEWAY_NAME,
@@ -73,9 +74,6 @@ type IngressRule = Omit<V1NetworkPolicyIngressRule, "_from"> & { from?: V1Networ
 
 /** The namespace `name`, as a peer's selector. */
 const namespaceNamed = (name: string) => ({ matchLabels: { "kubernetes.io/metadata.name": name } });
-
-/** The alasio pod of `environment`, as a peer. */
-const alasioOf = ({ namespace }: Environment): V1NetworkPolicyPeer => ({ namespaceSelector: namespaceNamed(namespace), podSelector: { matchLabels: selectorLabels("alasio") } });
 
 /** Every branch environment's namespace, as a peer's selector, by the label each has. */
 const BRANCH_NAMESPACES = { matchExpressions: [{ key: BRANCH_LABEL, operator: "Exists" }] };
@@ -372,14 +370,13 @@ function webhookPolicy(config: InstallConfig): NetworkPolicy {
 }
 
 /**
- * The telemetry collector's gateway takes OTLP from alasio, the node agents, the sandbox
- * service's gateway and receiver, and folder workspaces' bayma, beside the stack's own pods
- * (neonPolicies), its scraper among them, and from branch environments' alasio, compute and
- * lake, and from nothing else: sessions' telemetry reaches it through a receiver alone, their
+ * The telemetry collector's gateway takes OTLP from alasio, the node agents, and the sandbox
+ * service's gateway and receiver, beside the stack's own pods (neonPolicies), its scraper
+ * among them, and from branch environments' alasio, compute and lake, and from nothing else:
+ * sessions' and folder instances' telemetry reaches it through a receiver alone, their
  * alasio's or the sandbox service's.
  */
 function collectorPolicy(config: InstallConfig): NetworkPolicy {
-  const { host } = config;
   return policy(componentName("collector"), NAMESPACE, GATEWAY_COMPONENT, {
     podSelector: { matchLabels: selectorLabels(GATEWAY_COMPONENT) },
     policyTypes: ["Ingress"],
@@ -388,7 +385,6 @@ function collectorPolicy(config: InstallConfig): NetworkPolicy {
         { podSelector: { matchLabels: selectorLabels("alasio") } },
         ...(nodeAgentRuns(config) ? [NODE_AGENT] : []),
         ...(sandboxServiceRuns(config) ? [SANDBOX_GATEWAY, SANDBOX_RECEIVER] : []),
-        ...(host.enabled ? [{ namespaceSelector: namespaceNamed(host.namespace) }] : []),
         { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } },
         { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: STACK } },
       ],
@@ -541,6 +537,8 @@ function sandboxServicePolicies(config: InstallConfig, apiServer: ApiServer | nu
     { namespaceSelector: namespaceNamed(sessionsNamespace(config, MAIN_ENVIRONMENT)), podSelector: POOLED },
     { namespaceSelector: BRANCH_NAMESPACES, podSelector: POOLED },
   ];
+  // Folder conversations' instances, which the gateway binds and the receiver takes the telemetry of as of the pools' pods.
+  const folders = foldersRun(config) ? [{ namespaceSelector: namespaceNamed(config.host.namespace), podSelector: POOLED }] : [];
   const collector: V1NetworkPolicyEgressRule[] = collectorRuns(config)
     ? [{ to: [{ podSelector: { matchLabels: selectorLabels(GATEWAY_COMPONENT) } }], ports: [{ protocol: "TCP", port: COLLECTOR_PORT }] }]
     : [];
@@ -554,7 +552,7 @@ function sandboxServicePolicies(config: InstallConfig, apiServer: ApiServer | nu
       }],
       egress: [
         CLUSTER_DNS,
-        { to: pools, ports: [{ protocol: "TCP", port: POOL_POD_PORT }] },
+        { to: [...pools, ...folders], ports: [{ protocol: "TCP", port: POOL_POD_PORT }] },
         { to: [NODE_AGENT], ports: [{ protocol: "TCP", port: NODE_AGENT_PORT }] },
         { to: [SANDBOX_GATEWAY], ports: [{ protocol: "TCP", port: SANDBOX_GATEWAY_PORT }] },
         // The log, its events written to it.
@@ -566,7 +564,7 @@ function sandboxServicePolicies(config: InstallConfig, apiServer: ApiServer | nu
     policy(RECEIVER, NAMESPACE, RECEIVER_COMPONENT, {
       ...SANDBOX_RECEIVER,
       policyTypes: ["Ingress", "Egress"],
-      ingress: [{ from: pools, ports: [{ protocol: "TCP", port }] }],
+      ingress: [{ from: [...pools, ...folders], ports: [{ protocol: "TCP", port }] }],
       egress: [CLUSTER_DNS, ...collector, apiServerRule(apiServer)],
     }),
   ];
@@ -609,12 +607,13 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
   }
   return [
     ...(sessions.enabled ? sessionPolicies(config, environment) : []),
-    // Folder workspaces' bayma is reached by alasio alone; what it reaches is the machine's.
-    ...(host.enabled
-      ? [policy("bayma-from-alasio", host.namespace, "folder-bayma", {
+    // Folder conversations' instances are reached by the sandbox gateway alone, which binds them; what they reach is the machine's.
+    ...(foldersRun(config)
+      ? [policy("folders-from-gateway", host.namespace, "folder-bayma", {
+        // Every pod of the namespace, which none but a folder instance's may be.
         podSelector: {},
         policyTypes: ["Ingress"],
-        ingress: [{ from: [alasioOf(environment)], ports: [{ protocol: "TCP", port: 7290 }] }],
+        ingress: [{ from: [{ namespaceSelector: namespaceNamed(NAMESPACE), ...SANDBOX_GATEWAY }], ports: [{ protocol: "TCP", port: FOLDER_PORT }] }],
       })]
       : []),
     alasioPolicy(config, environment),

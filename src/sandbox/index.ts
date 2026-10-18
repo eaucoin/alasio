@@ -30,9 +30,8 @@ import { join } from "node:path";
 
 import { Context, Effect, Layer, Schema } from "effect";
 
-import type { BaymaEndpoint } from "../kube/sandboxes.ts";
 import { withLogScope } from "../shared/log.ts";
-import { type GatewayError, type GatewayWorkspaces, type GatewayWorkspacesOptions, makeGatewayWorkspaces, type NetMode } from "./gateway-client.ts";
+import { type BaymaEndpoint, type GatewayError, type GatewayWorkspaces, type GatewayWorkspacesOptions, makeGatewayWorkspaces, type NetMode } from "./gateway-client.ts";
 import { assertValidVolumeId } from "./names.ts";
 
 export type { NetMode } from "./gateway-client.ts";

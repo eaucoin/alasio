@@ -28,8 +28,8 @@ function traceRequest(): Buffer {
 
 test("the receiver takes an instance's telemetry with its binding's token while its binding is held, stamped with its workspace, and asks again while the bindings are not known", async () => {
   const bindings = new Map<string, Held>([["held-uid", "held"], ["gone-uid", "gone"], ["unknown-uid", "unknown"]]);
-  // The bindings of main's sessions' namespace; another is of no environment's.
-  const live = Layer.succeed(LiveBindings, LiveBindings.of({ holds: (_key, binding, namespace) => Effect.succeed(namespace.endsWith("sessions") ? (bindings.get(binding) ?? "gone") : "gone") }));
+  // The bindings of main's sessions' namespace, and of the folder namespace; another is of no environment's.
+  const live = Layer.succeed(LiveBindings, LiveBindings.of({ holds: (_key, binding, namespace) => Effect.succeed(namespace.endsWith("sessions") || namespace === "alasio-host" ? (bindings.get(binding) ?? "gone") : "gone") }));
   const exported: Buffer[] = [];
   const forwarder = {
     protocols: { traces: "http/protobuf" },
@@ -59,6 +59,10 @@ test("the receiver takes an instance's telemetry with its binding's token while 
       // A branch environment's session's, tagged with its branch.
       assert.equal((await post(binding("held-uid", "alasio-branch-try-sessions"))).status, 200);
       assert.match(exported[1]?.toString("latin1") ?? "", /alasio\.branch[^]*try/u);
+      // A folder conversation's instance's, stamped with its conversation and its harness.
+      assert.equal((await post(bindingToken(bindingKey, { key: "folder:claude:telegram:42", binding: "held-uid", namespace: "alasio-host" }))).status, 200);
+      assert.match(exported[2]?.toString("latin1") ?? "", /alasio\.conversation\.id[^]*telegram:42/u);
+      assert.match(exported[2]?.toString("latin1") ?? "", /alasio\.harness[^]*claude/u);
       const refused = [
         binding("gone-uid"),
         // One of a namespace of no environment's; one that names no namespace.
@@ -67,12 +71,13 @@ test("the receiver takes an instance's telemetry with its binding's token while 
         // A caller's, of no binding; one another key signed; one of no session's workspace.
         mintToken(bindingKey, { key, expires: Date.now() + 60_000 }),
         bindingToken(randomBytes(32), { key, binding: "held-uid", namespace: "alasio-sessions" }),
-        bindingToken(bindingKey, { key: "folder:claude:conversation", binding: "held-uid", namespace: "alasio-sessions" }),
+        bindingToken(bindingKey, { key: "folder:claude:conversation", binding: "gone-uid", namespace: "alasio-host" }),
+        bindingToken(bindingKey, { key: "workspace:somewhere", binding: "held-uid", namespace: "alasio-sessions" }),
       ];
       for (const token of refused) assert.equal((await post(token)).status, 401, token);
       const unknown = await post(binding("unknown-uid"));
       assert.deepEqual([unknown.status, unknown.headers.get("retry-after")], [503, "1"]);
-      assert.equal(exported.length, 2);
+      assert.equal(exported.length, 3);
     });
   })));
 });

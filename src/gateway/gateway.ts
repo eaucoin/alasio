@@ -18,6 +18,7 @@
 import { lookup } from "node:dns/promises";
 import { readFileSync } from "node:fs";
 
+import type { V1PodTemplateSpec } from "@kubernetes/client-node";
 import { Cause, Config, Context, Effect, Layer, Redacted, Schedule, Schema, type Scope } from "effect";
 import { FetchHttpClient } from "effect/http";
 
@@ -39,9 +40,11 @@ import {
   EVENTS_BROKERS_VARIABLE,
   EVENTS_PASSWORD_FILE_VARIABLE,
   EVENTS_USERNAME_VARIABLE,
+  folderOfKey,
   GATEWAY_CONFIG_VARIABLE,
   GatewayConfig,
 } from "./names.ts";
+import { makeFolders } from "./folders.ts";
 import { makeSessions } from "./sessions.ts";
 
 /** How often bound pods are looked at for one to release: each pod's bayma is asked no oftener than its poll (./sessions.ts). */
@@ -81,10 +84,11 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
     const binder = yield* Binder;
     const agents = yield* makeNodeAgents(config.nodeAgents);
     const environments = yield* makeEnvironments({ main: config.environment });
-    // The bindings' Leases watched, every environment's, so a route this replica knew of a binding another released is let go.
+    const foldersNamespace = config.folders?.namespace ?? null;
+    // The bindings' Leases watched, every environment's and the folder instances', so a route this replica knew of a binding another released is let go.
     const namespaces: BindingNamespaces = {
-      current: Effect.map(environments.current, (current) => current.map(({ namespace }) => namespace)),
-      known: (namespace) => Effect.map(environments.ofNamespace(namespace), (environment) => environment !== null),
+      current: Effect.map(environments.current, (current) => [...current.map(({ namespace }) => namespace), ...(foldersNamespace ? [foldersNamespace] : [])]),
+      known: (namespace) => namespace === foldersNamespace ? Effect.succeed(true) : Effect.map(environments.ofNamespace(namespace), (environment) => environment !== null),
     };
     const live = Context.get(yield* Layer.build(LiveBindings.layer({ namespaces })), LiveBindings);
     const events = yield* eventsOf;
@@ -106,8 +110,20 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       agents,
       binder,
     );
-    // Of the pools there are as each round begins.
-    const setRight = Effect.flatMap(sessions.pools, (pools) =>
+    // Folder conversations' instances, where the installation has folder workspaces (./folders.ts).
+    const folders = config.folders
+      ? yield* makeFolders({
+        namespace: config.folders.namespace,
+        template: config.folders.template as V1PodTemplateSpec,
+        stateRoot: config.folders.stateRoot,
+        releaseAfterMs: config.folders.releaseAfterSeconds * 1000,
+        main: config.environment.name,
+        podPort: config.podPort,
+        bindingKey,
+      }, binder)
+      : null;
+    // Of the pools there are as each round begins, the folder instances' among them.
+    const setRight = Effect.flatMap(Effect.map(sessions.pools, (pools) => [...pools, ...(folders ? [folders.pool] : [])]), (pools) =>
       Effect.forEach(pools, (pool) =>
         reconcile(pool, (lease) => sessions.lost(pool, lease), (lease) => sessions.recordLost(pool, lease)).pipe(
           Effect.tap(({ pods, leases }) => (pods.length + leases.length > 0 ? Effect.logInfo(`set ${pool.namespace}/${pool.name} right: deleted ${pods.join(", ") || "no pod"}, let go ${leases.join(", ") || "no Lease"}`) : Effect.void)),
@@ -133,6 +149,20 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       Schedule.spaced(SWEEP_MS),
     ));
     yield* Effect.forkScoped(Effect.repeat(sessions.collect, Schedule.spaced(COLLECT_MS)));
+    // The folder instances', as often: each idle one released, and each whose bayma ended.
+    if (folders) {
+      yield* Effect.forkScoped(Effect.repeat(
+        folders.sweep.pipe(
+          Effect.tap((released) => (released.length > 0 ? Effect.logInfo(`released ${released.join(", ")}`) : Effect.void)),
+          Effect.catch((error) => Effect.logWarning(`looking at folder instances failed: ${error.message}`)),
+        ),
+        Schedule.spaced(SWEEP_MS),
+      ));
+      yield* Effect.forkScoped(Effect.repeat(
+        folders.live.pipe(Effect.catch((error) => Effect.logWarning(`looking at folder instances' bayma failed: ${error.message}`))),
+        Schedule.spaced(SWEEP_MS),
+      ));
+    }
     // As often, the bound pods ending though the gateway did not end them, each released in the background as its bayma holds its stop.
     yield* Effect.forkScoped(Effect.repeat(
       sessions.drain.pipe(
@@ -146,7 +176,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       callerKey: ({ options }) => (options?.["environment"] === undefined ? null : environmentKey(callerKey, options["environment"])),
       bindingKey,
       podPort: config.podPort,
-      poolOf: sessions.place,
+      poolOf: (key, options) => (folders && folderOfKey(key) ? folders.place(key, options) : sessions.place(key, options)),
       operate: sessions.operate,
       routeHeld: live.holds,
       // Every replica's address but its own, which answers its own waiting.

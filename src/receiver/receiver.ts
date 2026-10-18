@@ -14,10 +14,10 @@ import type { HttpServerError } from "effect/http";
 import { type BindingNamespaces, LiveBindings } from "../binder/live.ts";
 import { verifyToken } from "../binder/tokens.ts";
 import { makeEnvironments, type SessionsEnvironment } from "../gateway/environments.ts";
-import { BINDING_KEY_VARIABLE, RECEIVER_PORT_VARIABLE, SESSIONS_NAMESPACE_VARIABLE } from "../gateway/names.ts";
+import { BINDING_KEY_VARIABLE, folderOfKey, FOLDERS_NAMESPACE_VARIABLE, RECEIVER_PORT_VARIABLE, SESSIONS_NAMESPACE_VARIABLE } from "../gateway/names.ts";
 import { KubeClient } from "../kube/client.ts";
 import { volumeIdOfKey } from "../sandbox/names.ts";
-import { sandboxResource } from "../sandbox/telemetry.ts";
+import { folderResource, sandboxResource } from "../sandbox/telemetry.ts";
 import { type Authenticated, AuthenticationUnknown, serveTelemetryReceiver } from "../sandbox/telemetry-receiver.ts";
 import type { ResourceStamp } from "../sandbox/otlp-resource.ts";
 import { withLogScope } from "../shared/log.ts";
@@ -37,19 +37,23 @@ const MAIN = "main";
 
 /**
  * The session whose binding's token `token` is, signed with `bindingKey`, where its binding
- * is held now, stamped as `stampFor` says of its volume id and its binding's namespace; null
- * where it is no binding's, or its binding is gone; AuthenticationUnknown where the bindings
- * are not known now.
+ * is held now: a session workspace's, stamped as `stampFor` says of its volume id and its
+ * binding's namespace, its rate its own; or a folder conversation's instance's, stamped as
+ * folderResource says, its rate its key's; null where it is no binding's, or its binding is
+ * gone; AuthenticationUnknown where the bindings are not known now.
  */
-export const authenticateBinding = (bindingKey: Buffer, stampFor: (volumeId: string, namespace: string) => Effect.Effect<ResourceStamp>) =>
+export const authenticateBinding = (bindingKey: Buffer, stampFor: (volumeId: string, namespace: string) => Effect.Effect<ResourceStamp>, env: Readonly<NodeJS.ProcessEnv> = process.env) =>
 (token: string): Effect.Effect<Authenticated | null, AuthenticationUnknown, LiveBindings> =>
   Effect.gen(function*() {
     const claims = verifyToken(bindingKey, token, yield* Clock.currentTimeMillis);
-    const volumeId = claims?.binding === undefined ? null : volumeIdOfKey(claims.key);
-    if (!claims?.binding || !claims.namespace || !volumeId) return null;
+    if (!claims?.binding || !claims.namespace) return null;
+    const volumeId = volumeIdOfKey(claims.key);
+    const folder = folderOfKey(claims.key);
+    if (!volumeId && !folder) return null;
     const held = yield* (yield* LiveBindings).holds(claims.key, claims.binding, claims.namespace);
     if (held === "unknown") return yield* new AuthenticationUnknown();
-    return held === "held" ? { session: volumeId, stamp: yield* stampFor(volumeId, claims.namespace) } : null;
+    if (held !== "held") return null;
+    return volumeId ? { session: volumeId, stamp: yield* stampFor(volumeId, claims.namespace) } : { session: claims.key, stamp: folderResource(folder?.harness ?? "", folder?.conversation ?? "", env) };
   });
 
 /**
@@ -63,6 +67,8 @@ export const receiver: Effect.Effect<void, Config.ConfigError | HttpServerError.
   const port = yield* Config.Int(RECEIVER_PORT_VARIABLE);
   const bindingKey = Buffer.from(Redacted.value(yield* Config.Redacted(BINDING_KEY_VARIABLE)));
   const main = { name: MAIN, namespace: yield* Config.String(SESSIONS_NAMESPACE_VARIABLE) };
+  // Folder conversations' instances', where the installation has folder workspaces.
+  const folders = (yield* Config.String(FOLDERS_NAMESPACE_VARIABLE).pipe(Config.withDefault(""))) || null;
   // The forwarder's warnings, which it gives as it is made, logged here.
   const runFork = yield* FiberSet.makeRuntime();
   const forwarder = yield* Effect.acquireRelease(
@@ -72,8 +78,8 @@ export const receiver: Effect.Effect<void, Config.ConfigError | HttpServerError.
   const kube = yield* Layer.build(KubeClient.layer);
   const environments = yield* Effect.provide(makeEnvironments({ main }), kube);
   const namespaces: BindingNamespaces = {
-    current: Effect.map(environments.current, (current) => current.map(({ namespace }) => namespace)),
-    known: (namespace) => Effect.map(environments.ofNamespace(namespace), (environment) => environment !== null),
+    current: Effect.map(environments.current, (current) => [...current.map(({ namespace }) => namespace), ...(folders ? [folders] : [])]),
+    known: (namespace) => (namespace === folders ? Effect.succeed(true) : Effect.map(environments.ofNamespace(namespace), (environment) => environment !== null)),
   };
   const live = yield* Layer.build(Layer.provide(LiveBindings.layer({ namespaces }), Layer.succeedContext(kube)));
   const authenticate = authenticateBinding(bindingKey, (volumeId, namespace) => Effect.map(environments.ofNamespace(namespace), (environment) => sessionResource(volumeId, environment)));

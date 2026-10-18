@@ -237,8 +237,9 @@ const Snapshots = Schema.Struct({
    * back from its live snapshot while that still holds it, and otherwise from bayma's
    * checkpoints. A pod deleted outright, as kubectl delete --force or the removal of its Node
    * deletes it, or one ended that alasio is not running to see, as on a single node that a
-   * drain empties of alasio too, agent-sandbox makes again: its bayma starts from its
-   * checkpoints, moving on from its live snapshot, which no restore takes after. A duration
+   * drain empties of alasio too, the gateway releases as broken, and the next turn binds
+   * another, whose bayma starts from its checkpoints, moving on from its live snapshot, which
+   * no restore takes after. A duration
    * such as 60s.
    */
   stopWait: defaulted(
@@ -399,6 +400,8 @@ const Host = Schema.Struct({
   home: defaulted(AbsolutePath, "/home/operator"),
   /** Where folder workspaces' bayma keeps its state, under a mount. */
   stateRoot: defaulted(AbsolutePath, "/home/operator/.alasio/bayma"),
+  /** How long a folder conversation's instance runs no exec before it is released, its REPL sessions saved whole as it stops (src/gateway/folders.ts). */
+  releaseAfter: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 1h")), "1h"),
   mounts: defaulted(Schema.Array(HostMount), []),
   /** The directory folder workspaces are created under, a path of the mounts; empty leaves alasio's default. */
   workspaceRoot: defaulted(matching(/^(|\/.*)$/u, "must be an absolute path, or empty"), ""),
@@ -735,24 +738,6 @@ const WorkspaceStorage = Schema.Struct({
   mount: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "1Gi" } }) }), {}),
 });
 
-/** agent-sandbox's controller, installed once per cluster; off where the cluster already has it. */
-const AgentSandbox = Schema.Struct({
-  enabled: defaulted(Schema.Boolean, true),
-  image: defaulted(
-    Schema.Struct({
-      repository: defaulted(NonEmpty, "registry.k8s.io/agent-sandbox/agent-sandbox-controller"),
-      tag: defaulted(Schema.String, "v1.0.5"),
-      digest: defaulted(Digest, "sha256:28a9cbdbfd6ac0a4e5c7e9261ace1aa30ee2da681cb640dccdfed98e8dd9d98b"),
-      pullPolicy: defaulted(PullPolicy, "IfNotPresent"),
-    }),
-    {},
-  ),
-  resources: Resources({ requests: { cpu: "20m", memory: "32Mi" }, limits: { memory: "256Mi" } }),
-  nodeSelector: NodeSelector,
-  tolerations: Tolerations,
-  affinity: Affinity,
-});
-
 /** A container of a controller alasio installs: its pinned image and its resources. */
 const ControllerContainer = (image: Parameters<typeof Image>[0], resources: Parameters<typeof Resources>[0]) =>
   defaulted(Schema.Struct({ image: Image(image), resources: Resources(resources) }), {});
@@ -991,7 +976,6 @@ const InstallStruct = Schema.Struct({
   ),
   /** NetworkPolicies confining sessions, folder workspaces' bayma and Neon. */
   networkPolicies: defaulted(Schema.Struct({ enabled: defaulted(Schema.Boolean, true) }), {}),
-  agentSandbox: defaulted(AgentSandbox, {}),
   autoscaling: defaulted(Autoscaling, {}),
 });
 

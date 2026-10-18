@@ -31,3 +31,14 @@ export function sandboxBaymaTelemetryEnv(env: Readonly<NodeJS.ProcessEnv> = proc
 export function sandboxResource(volumeId: string, env: Readonly<NodeJS.ProcessEnv> = process.env): ResourceStamp {
   return { ...parseKeyValueList(sharedResourceAttributes(env)), "service.name": "bayma", "alasio.volume.id": volumeId };
 }
+
+/**
+ * What a folder conversation's instance's telemetry is stamped with: bayma's, of the
+ * conversation, as alasio's own of the conversation is, and the harness it is under.
+ */
+export const folderResource = (harness: string, conversation: string, env: Readonly<NodeJS.ProcessEnv> = process.env): ResourceStamp => ({
+  ...parseKeyValueList(sharedResourceAttributes(env)),
+  "service.name": "bayma",
+  "alasio.conversation.id": conversation,
+  "alasio.harness": harness,
+});

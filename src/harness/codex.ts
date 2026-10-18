@@ -68,7 +68,6 @@ export const makeCodexHarness = Effect.fnUntraced(function*({
   sessionFsCodex,
   sessionFsCodexRollouts = null,
   folderBayma,
-  workspacePod,
 }: CodexHarnessOptions): Effect.fn.Return<Harness, SessionFilesystemsDisabled, CodexAppServer | ActiveTurns> {
   const appServer = yield* CodexAppServer;
   const activeTurns = yield* ActiveTurns;
@@ -141,7 +140,7 @@ export const makeCodexHarness = Effect.fnUntraced(function*({
       ensureRollouts(sessionId).pipe(Effect.andThen(warmCodexSession({ sessionId, threadKey, ...scopeParams })), scoped),
     runTurn: (params) =>
       ensureRollouts(params.resumeSession).pipe(
-        Effect.andThen(executeCodexTurn({ ...params, ...scopeParams, workspacePod: workspacePod?.(params.threadKey), beforeResponseComplete: flushRollouts })),
+        Effect.andThen(executeCodexTurn({ ...params, ...scopeParams, beforeResponseComplete: flushRollouts })),
         Effect.provideService(ActiveTurns, activeTurns),
         scoped,
       ),

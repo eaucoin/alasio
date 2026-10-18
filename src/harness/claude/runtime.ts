@@ -22,7 +22,7 @@ import type {
   SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
 import { Effect, Schema } from "effect";
-import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
+import type { BaymaEndpoint } from "../../sandbox/gateway-client.ts";
 import type { ModelChoice } from "../../persistence/conversation-repository.ts";
 import { withLogScope } from "../../shared/log.ts";
 import { sessionFsQueryOptions } from "./sessionfs.ts";

@@ -10,6 +10,9 @@ import { createHash } from "node:crypto";
 
 import type {
   V1Container,
+  V1PolicyRule,
+  V1Role,
+  V1RoleBinding,
   V1EnvVar,
   V1LocalObjectReference,
   V1PersistentVolumeClaimSpec,
@@ -285,4 +288,19 @@ export function goJson(value: unknown, indent?: string): string {
 /** The sha256 of `text`, in hex. */
 export function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
+}
+
+/** A Role in `namespace` of `rules`, named for the ServiceAccount `account` of alasio's namespace, and its binding to it. */
+export function accountRole(account: string, component: string, namespace: string, rules: V1PolicyRule[]): [V1Role, V1RoleBinding] {
+  const metadata = { name: account, namespace, labels: labels(component) };
+  return [
+    { apiVersion: "rbac.authorization.k8s.io/v1", kind: "Role", metadata, rules },
+    {
+      apiVersion: "rbac.authorization.k8s.io/v1",
+      kind: "RoleBinding",
+      metadata,
+      roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: account },
+      subjects: [{ kind: "ServiceAccount", name: account, namespace: NAMESPACE }],
+    },
+  ];
 }

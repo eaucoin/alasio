@@ -1,25 +1,23 @@
 /**
- * Pods running work, labelled so for as long as they do: alasio's own, while its
- * harnesses run a turn, and the pod the turn works in, a session's Sandbox or a folder
- * workspace's bayma. Each namespace's PodDisruptionBudget of BUSY_LABEL's pods
- * (cli/src/manifests/disruption.ts) lets a drain evict none of them, so it waits until
- * the work is done; BUSY_ANNOTATIONS keep a node autoscaler from removing their nodes
- * meanwhile, as a drain reads neither.
+ * alasio's own pod, labelled busy for as long as its harnesses run a turn. Its namespace's
+ * PodDisruptionBudget of BUSY_LABEL's pods (cli/src/manifests/disruption.ts) lets a drain
+ * evict none of them, so it waits until the turn is done; BUSY_ANNOTATIONS keep a node
+ * autoscaler from removing its node meanwhile, as a drain reads neither. The pods a turn
+ * works in are the sandbox gateway's, which holds them while bound.
  *
- * A pod held by several turns at once is busy until the last lets go. Each held pod has a
+ * The pod, held by several turns at once, is busy until the last lets go. A held pod has a
  * labeller of its own, in the background, which a hold or its release only wakes, so no
  * turn waits on the API server: one patch of the pod's at a time, the last after the
  * holds have changed saying what they come to, so a release and a new hold close together
- * leave the pod as the holds are. While held, it is labelled again every `refresh`: a
- * workspace's pod the turn starts or resumes, or one made again, is there only after the
- * turn took its hold. A label that cannot be set or taken off within a few seconds is
- * logged, and the turn goes on.
+ * leave the pod as the holds are. While held, it is labelled again every `refresh`, so a
+ * label given up on is set by the next. A label that cannot be set or taken off within a
+ * few seconds is logged, and the turn goes on.
  *
- * What alasio holds no more is unlabelled: as alasio stops, each pod it holds, once its
- * labellers have stopped; and every `sweep`, from its start, each pod of its namespaces
- * labelled busy that it does not hold, through a labeller of the pod's, as a hold's
- * release is: what a run of alasio's that ended without taking its labels off left
- * labelled, and a label whose patch, given up on, landed after the pod was unlabelled.
+ * What alasio holds no more is unlabelled: as alasio stops, its pod, once its labellers
+ * have stopped; and every `sweep`, from its start, each pod of its namespace labelled busy
+ * that it does not hold, through a labeller of the pod's, as a hold's release is: what a
+ * run of alasio's that ended without taking its label off left labelled, and a label whose
+ * patch, given up on, landed after the pod was unlabelled.
  */
 import { Config, Context, Deferred, type Duration, Effect, Layer, Option, Scope } from "effect";
 
@@ -43,12 +41,10 @@ export function busyPatch(busy: boolean): object {
 }
 
 /**
- * What BusyPods.layer is given: the namespaces of the pods alasio holds besides its own,
- * how often a held pod is labelled again, and how often the pods it does not hold are
- * looked for labelled.
+ * What BusyPods.layer is given: how often a held pod is labelled again, and how often the
+ * pods alasio does not hold are looked for labelled.
  */
 export interface BusyPodsOptions {
-  readonly namespaces: readonly string[];
   readonly refresh?: Duration.Input | undefined;
   readonly sweep?: Duration.Input | undefined;
 }
@@ -64,14 +60,14 @@ interface Held {
 }
 
 export class BusyPods extends Context.Service<BusyPods, {
-  /** Holds alasio's own pod busy, and `workspace` when there is one, until the scope closes. */
-  readonly hold: (workspace: PodRef | null) => Effect.Effect<void, never, Scope.Scope>;
+  /** Holds alasio's own pod busy until the scope closes. */
+  readonly hold: Effect.Effect<void, never, Scope.Scope>;
 }>()("alasio/kube/BusyPods") {
   /**
    * On the KubeClient, alasio's own pod as its Deployment names it (ALASIO_POD,
-   * ALASIO_NAMESPACE), none outside a pod; sweeping alasio's namespace and `namespaces`.
+   * ALASIO_NAMESPACE), none outside a pod; sweeping alasio's namespace.
    */
-  static readonly layer = ({ namespaces, refresh = "10 seconds", sweep = "1 minute" }: BusyPodsOptions): Layer.Layer<BusyPods, Config.ConfigError, KubeClient> =>
+  static readonly layer = ({ refresh = "10 seconds", sweep = "1 minute" }: BusyPodsOptions): Layer.Layer<BusyPods, Config.ConfigError, KubeClient> =>
     Layer.effect(
       BusyPods,
       Effect.gen(function*() {
@@ -133,25 +129,21 @@ export class BusyPods extends Context.Service<BusyPods, {
             return Effect.asVoid(Effect.forkIn(labeller(pod, first), labellers));
           });
 
-        /** Unlabels the pods of alasio's namespaces labelled busy that it does not hold, each through a labeller of its own. */
-        const sweepOnce = Effect.forEach([...new Set([namespace, ...namespaces])], (each) =>
-          kube.list("v1", "Pod", each, `${BUSY_LABEL}=true`).pipe(
-            Effect.timeout(PATCH_TIMEOUT),
-            Effect.flatMap((pods) =>
-              Effect.forEach(pods, ({ metadata }) => {
-                const pod = { namespace: each, name: metadata?.name ?? "" };
-                return held.has(keyOf(pod)) ? Effect.void : change(pod, 0);
-              }, { discard: true })
-            ),
-            Effect.catch((error) => Effect.logWarning(`could not find the pods of ${each} labelled busy: ${error.message}`)),
-          ), { discard: true });
+        /** Unlabels the pods of alasio's namespace labelled busy that it does not hold, each through a labeller of its own. */
+        const sweepOnce = Effect.suspend(() => kube.list("v1", "Pod", namespace, `${BUSY_LABEL}=true`)).pipe(
+          Effect.timeout(PATCH_TIMEOUT),
+          Effect.flatMap((pods) =>
+            Effect.forEach(pods, ({ metadata }) => {
+              const pod = { namespace, name: metadata?.name ?? "" };
+              return held.has(keyOf(pod)) ? Effect.void : change(pod, 0);
+            }, { discard: true })
+          ),
+          Effect.catch((error) => Effect.logWarning(`could not find the pods of ${namespace} labelled busy: ${error.message}`)),
+        );
         yield* Effect.forkIn(Effect.forever(Effect.andThen(sweepOnce, Effect.sleep(sweep))), labellers);
 
         return BusyPods.of({
-          hold: (workspace) =>
-            Effect.forEach([...Option.toArray(own), ...(workspace ? [workspace] : [])], (pod) => Effect.acquireRelease(change(pod, 1), () => change(pod, -1)), {
-              discard: true,
-            }),
+          hold: Option.match(own, { onNone: () => Effect.void, onSome: (pod) => Effect.acquireRelease(change(pod, 1), () => change(pod, -1)) }),
         });
       }),
     );

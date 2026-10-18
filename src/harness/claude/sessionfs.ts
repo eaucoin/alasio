@@ -15,7 +15,7 @@
  */
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 
-import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
+import type { BaymaEndpoint } from "../../sandbox/gateway-client.ts";
 import { SESSION_FS_AGENT_INSTRUCTIONS } from "../workspace-instructions.ts";
 
 /** The query options that confine Claude Code to a session filesystem. */

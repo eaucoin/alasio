@@ -5,10 +5,13 @@
  * line, which renders them, takes it without either.
  */
 import { createHash } from "node:crypto";
+import { posix } from "node:path";
 
 import type { V1Container, V1PodSpec } from "@kubernetes/client-node";
 import { Schema } from "effect";
 
+import { keyHash } from "../binder/names.ts";
+import { sanitizePathToken } from "../kube/sandbox-shape.ts";
 import { ATTACH_ROOT } from "../node-agent/names.ts";
 
 export { RESTORE_POD } from "../node-agent/names.ts";
@@ -27,6 +30,8 @@ export const BINDING_KEY_VARIABLE = "BINDING_KEY";
 export const ALASIO_GATEWAY_URL_VARIABLE = "ALASIO_GATEWAY_URL";
 export const ALASIO_GATEWAY_ENVIRONMENT_VARIABLE = "ALASIO_GATEWAY_ENVIRONMENT";
 export const ALASIO_GATEWAY_CALLER_KEY_VARIABLE = "ALASIO_GATEWAY_CALLER_KEY";
+/** The variable that says the gateway serves alasio's folder workspaces' instances too: "1" where it does. */
+export const ALASIO_GATEWAY_FOLDERS_VARIABLE = "ALASIO_GATEWAY_FOLDERS";
 
 /** The variables of where the gateway tells of events (../events/events.ts): the log's brokers, its principal's name, and the file of its password. */
 export const EVENTS_BROKERS_VARIABLE = "EVENTS_BROKERS";
@@ -36,6 +41,8 @@ export const EVENTS_PASSWORD_FILE_VARIABLE = "EVENTS_PASSWORD_FILE";
 /** The variables of the receiver's port, and of main's sessions' namespace, beside which it takes branch environments' bindings. */
 export const RECEIVER_PORT_VARIABLE = "RECEIVER_PORT";
 export const SESSIONS_NAMESPACE_VARIABLE = "SESSIONS_NAMESPACE";
+/** The variable of the folder namespace, whose folder conversations' instances' bindings the receiver takes too; empty where there are none. */
+export const FOLDERS_NAMESPACE_VARIABLE = "FOLDERS_NAMESPACE";
 
 /** The hash of `template`, of its JSON with every object's keys in order, as a pool's template records its own (cli/src/manifests/sandbox-gateway.ts poolTemplate). */
 export function templateHash(template: object): string {
@@ -76,6 +83,76 @@ export function ownDirectory(spec: V1PodSpec, name: string): V1PodSpec {
     ...(spec.initContainers ? { initContainers: spec.initContainers.map(unsubpathed) } : {}),
     // One there already, as its node's agent made it, its workspace attached; kubelet makes none, so the pod starts not where it is not there.
     ...(spec.volumes ? { volumes: spec.volumes.map((volume) => (volume.name === ATTACH_VOLUME ? { name: ATTACH_VOLUME, hostPath: { path: `${ATTACH_ROOT}/${name}`, type: "Directory" } } : volume)) } : {}),
+  };
+}
+
+/** The pool of folder instances, by its name, in the folder namespace: its Leases' and its pods' label (./folders.ts). */
+export const FOLDER_POOL = "folder";
+
+/** What a folder instance's key begins with: `folder:<harness>:<conversation>` (./folders.ts). */
+export const FOLDER_KEY_PREFIX = "folder:";
+
+/** A harness's name, as a folder instance's key carries it. */
+const HARNESS = /^[a-z][a-z0-9-]{0,30}$/u;
+
+/** The key of the folder instance of the conversation `conversation` under the harness `harness`. */
+export const folderKey = (harness: string, conversation: string): string => `${FOLDER_KEY_PREFIX}${harness}:${conversation}`;
+
+/** The harness and conversation of the folder instance `key` is of; null where it is no folder instance's. */
+export function folderOfKey(key: string): { readonly harness: string; readonly conversation: string } | null {
+  if (!key.startsWith(FOLDER_KEY_PREFIX)) return null;
+  const rest = key.slice(FOLDER_KEY_PREFIX.length);
+  const at = rest.indexOf(":");
+  const [harness, conversation] = [rest.slice(0, Math.max(at, 0)), rest.slice(at + 1)];
+  return at > 0 && HARNESS.test(harness) && conversation.length > 0 && conversation.length <= 512 ? { harness, conversation } : null;
+}
+
+/**
+ * Where the folder instance of `conversation` under `harness` keeps its state, under
+ * `stateRoot`: bayma leases its state directory to a single server, and a Codex thread keeps
+ * its server alive after the conversation switches to Claude, so the directory is keyed by
+ * harness as well as conversation, as a folder's Sandbox kept it.
+ */
+export const folderStateDir = (stateRoot: string, harness: string, conversation: string): string =>
+  posix.join(stateRoot, sanitizePathToken(harness), sanitizePathToken(conversation));
+
+/** The name of a folder instance's pod of `key`, by its random part, `suffix`, five of base 36's digits, as FOLDER_POD matches it. */
+export const folderPodName = (key: string, suffix: string): string => `bayma-${keyHash(key).slice(0, 16)}-${suffix}`;
+export const FOLDER_POD = /^bayma-[0-9a-f]{16}-[0-9a-z]{5}$/u;
+
+/** The Secret of a folder instance's pod `pod`'s binding's token, which its bayma takes requests with, mounted where FOLDER_TOKEN_FILE is. */
+export const folderTokenSecret = (pod: string): string => `${pod}-bayma-token`;
+export const FOLDER_TOKEN_VOLUME = "alasio-bayma-token";
+export const FOLDER_TOKEN_DIRECTORY = "/run/alasio/bayma";
+export const FOLDER_TOKEN_FILE = `${FOLDER_TOKEN_DIRECTORY}/token`;
+
+/**
+ * How long a folder instance's pod is given to stop: its bayma's CRIU dumps of its idle REPL
+ * sessions, one at a time, each within bayma's own 120 s; a state of the box's size is dumped
+ * in well under a minute (gate G8, program/13.4-folder-instances.md).
+ */
+export const FOLDER_STOP_SECONDS = 600;
+
+/**
+ * The spec of a folder instance's pod, `pod`, of the folder template's `spec`: its bayma
+ * given its binding's token, from its Secret, and its state directory, `stateDir`; stopped
+ * within FOLDER_STOP_SECONDS; and never started again, as a bayma that ended is a binding to
+ * release, not a container to start. Pure, as the gateway makes it and the folder pods' policy
+ * pins it (cli/src/manifests/admission.ts folderPodPolicy).
+ */
+export function folderPodSpec(spec: V1PodSpec, pod: string, stateDir: string): V1PodSpec {
+  return {
+    ...spec,
+    terminationGracePeriodSeconds: FOLDER_STOP_SECONDS,
+    restartPolicy: "Never",
+    containers: spec.containers.map((container) =>
+      container.name !== "bayma" ? container : {
+        ...container,
+        args: [...(container.args ?? []), "--token-file", FOLDER_TOKEN_FILE, "--state-dir", stateDir],
+        volumeMounts: [...(container.volumeMounts ?? []), { name: FOLDER_TOKEN_VOLUME, mountPath: FOLDER_TOKEN_DIRECTORY, readOnly: true }],
+      }
+    ),
+    volumes: [...(spec.volumes ?? []), { name: FOLDER_TOKEN_VOLUME, secret: { secretName: folderTokenSecret(pod), defaultMode: 0o440 } }],
   };
 }
 
@@ -129,5 +206,12 @@ export const GatewayConfig = Schema.Struct({
   nodeAgents: Schema.Struct({ namespace: Schema.String, selector: Schema.String, port: Schema.Number }),
   /** Where bound pods' bayma exports its telemetry, the session telemetry receiver's Service, by its name and port; none where none runs. */
   receiver: Schema.NullOr(Schema.Struct({ host: Schema.String, port: Schema.Number })),
+  /**
+   * Folder conversations' instances (./folders.ts): the namespace they run in, the template of
+   * their pods, as `alasio up` renders it of the host profile, the directory under which each
+   * keeps its state, and how long an idle one is kept; none where the installation has no
+   * folder workspaces.
+   */
+  folders: Schema.NullOr(Schema.Struct({ namespace: Schema.String, template: Template, stateRoot: Schema.String, releaseAfterSeconds: Schema.Number })),
 });
 export type GatewayConfig = typeof GatewayConfig.Type;

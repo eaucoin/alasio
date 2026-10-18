@@ -25,7 +25,7 @@ import { Context, Effect, Layer, RcRef, type Scope } from "effect";
 
 import { getCodexTransportMode } from "../config.ts";
 import { SESSION_FS_AGENT_INSTRUCTIONS } from "../harness/workspace-instructions.ts";
-import type { BaymaEndpoint } from "../kube/sandboxes.ts";
+import type { BaymaEndpoint } from "../sandbox/gateway-client.ts";
 import { makeAppServer } from "./app-server/client.ts";
 import { type SpawnAppServer, spawnAppServer } from "./app-server/process.ts";
 import { type CodexEnv, codexHome } from "./env.ts";

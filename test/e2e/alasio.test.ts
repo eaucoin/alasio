@@ -23,19 +23,17 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Node, V1Pod, V1PodTemplateSpec, V1Secret, V1Service, V1StatefulSet, V1ValidatingAdmissionPolicy, V1ValidatingAdmissionPolicyBinding, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1Secret, V1Service, V1StatefulSet, V1ValidatingAdmissionPolicy, V1ValidatingAdmissionPolicyBinding, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
-import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
+import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { PAGESERVERS_NAME, pageserverName } from "../../cli/src/manifests/neon.ts";
 import { WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { computeId, MAIN, replicaId } from "../../neon/control/branches.ts";
 import { neonStack } from "../../neon/test/stack.ts";
-import { SNAPSHOT_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
-import type { Sandbox } from "../../src/kube/sandboxes.ts";
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
@@ -100,6 +98,12 @@ import { workspaceStorage } from "./workspace-storage.ts";
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /** The host profile's namespace, where folder workspaces' bayma run. */
+/** A session's Sandbox of the release upgraded from, whose sessions agent-sandbox ran: its metadata alone is read. */
+interface Sandbox extends KubernetesObject {
+  readonly metadata: V1ObjectMeta;
+}
+/** The annotation of such a Sandbox, suspended, naming the snapshot it was saved into. */
+const SNAPSHOT_ANNOTATION = "alasio.dev/snapshot";
 const HOST_NAMESPACE = "alasio-host";
 
 // What the cluster was doing is said as something of the run fails, while the cluster is
@@ -892,44 +896,53 @@ if (inShard("sessions")) {
       assert.equal(seen.execAfterBind, JSON.stringify(seen.read));
     });
 
-    test("a folder conversation's bayma works on the machine as the operator, in their home", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
+    test("a folder conversation's bayma is its instance, bound through the gateway, working on the machine as the operator, in their home", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
       const { home } = paths();
       const { url, seen } = await inAlasio<FolderBaymaSeen>("./folder-bayma.ts");
-      assert.match(url, /^http:\/\/bayma-[0-9a-f]{20}\.alasio-host\.svc/u);
+      assert.equal(url, `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`);
       assert.deepEqual(seen, { uid: HOST_USER, home });
+      // The gateway's pod of the folder pool, bound, on the conversation's state directory, never started again.
+      const [instance, ...others] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+      assert.deepEqual(others, []);
+      assert.match(instance?.metadata?.name ?? "", /^bayma-[0-9a-f]{16}-[0-9a-z]{5}$/u);
+      assert.equal(instance?.metadata?.annotations?.["alasio.dev/key"], "folder:claude:e2e:folder");
+      assert.equal(instance?.spec?.restartPolicy, "Never");
+      assert.match(instance?.spec?.containers[0]?.args?.join(" ") ?? "", /--state-dir \/\S+\/claude\/e2e-folder$/u);
       // The operator's home is the machine's, shared between alasio and the folder's bayma.
       assert.equal(readFileSync(`${home}/e2e-folder-proof`, "utf8"), `written by ${HOST_USER}`);
       assert.equal(await inAlasioContainer(["cat", `${home}/e2e-folder-proof`]), `written by ${HOST_USER}`);
     });
 
-    test("alasio may make a folder's bayma's Sandbox from its template alone, and no Secret but a Sandbox's token", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
-      const made = (await kube.list<Sandbox>("Sandbox", { namespace: HOST_NAMESPACE })).find(({ metadata }) => metadata?.name?.startsWith("bayma-"));
-      assert.ok(made?.metadata?.name, "the folder's bayma's Sandbox is made");
-      const name = made.metadata.name;
-      // As the folder's, under another name and suspended; with `args` after its bayma's.
-      const copied = (as: string, args: readonly string[] = []) => {
-        const sandbox: Sandbox = JSON.parse(JSON.stringify({ apiVersion: made.apiVersion, kind: made.kind, metadata: { name, namespace: HOST_NAMESPACE }, spec: { ...made.spec, operatingMode: "Suspended" } }).replaceAll(name, as));
-        const bayma = sandbox.spec.podTemplate.spec?.containers.find((container) => container.name === "bayma");
-        if (bayma) bayma.args = [...(bayma.args ?? []), ...args];
-        return sandbox;
+    test("no one makes a pod in the folders' namespace but the gateway, which makes none but of the folder template, nor a Secret there but an instance's token", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
+      const [instance] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+      assert.ok(instance?.metadata?.name && instance.spec, "the folder's instance is made");
+      const name = instance.metadata.name;
+      // As the instance was asked for, under another name, of what the API server adds as it
+      // makes a pod and schedules it: with `args` after its bayma's.
+      const added = (volume: string) => volume.startsWith("kube-api-access-");
+      const copied = (args: readonly string[] = []): V1Pod => {
+        const { nodeName: _scheduled, tolerations: _defaulted, ...spec } = structuredClone(instance.spec) as V1PodSpec;
+        spec.volumes = (spec.volumes ?? []).filter((volume) => !added(volume.name));
+        spec.containers = spec.containers.map((container) => ({
+          ...container,
+          volumeMounts: (container.volumeMounts ?? []).filter((mount) => !added(mount.name)),
+          ...(container.name === "bayma" ? { args: [...(container.args ?? []), ...args] } : {}),
+        }));
+        return { apiVersion: "v1", kind: "Pod", metadata: { name: name.replace(/.{5}$/u, "e2e00"), labels: instance.metadata?.labels ?? {}, annotations: instance.metadata?.annotations ?? {} }, spec };
       };
-      const sandboxes = `/apis/agents.x-k8s.io/v1beta1/namespaces/${HOST_NAMESPACE}/sandboxes`;
-      assert.equal(await asAlasio("POST", sandboxes, "application/json", copied("e2e-folder-other", ["--listen", "0.0.0.0:1"])), 422);
+      const pods = `/api/v1/namespaces/${HOST_NAMESPACE}/pods`;
+      assert.equal(await asAlasio("POST", pods, "application/json", copied()), 403);
+      assert.equal(await asGateway("POST", pods, "application/json", copied(["--listen", "0.0.0.0:1"])), 422);
       // Its state anywhere but under the template's state root.
-      const elsewhere = copied("e2e-folder-elsewhere");
-      const args = elsewhere.spec.podTemplate.spec?.containers.find((container) => container.name === "bayma")?.args ?? [];
-      const at = args.indexOf("--state-dir") + 1;
-      assert.ok(at > 0, "the folder's bayma has a state directory");
-      args[at] = "/tmp/claude/e2e";
-      assert.equal(await asAlasio("POST", sandboxes, "application/json", elsewhere), 422);
-      assert.equal(await asAlasio("POST", sandboxes, "application/json", copied("e2e-folder-made")), 201);
-      await kube.remove(ref("Sandbox", "e2e-folder-made", HOST_NAMESPACE));
-      // An Opaque Secret named as a token's, holding more than a token; and one holding the token alone, which is made.
+      const elsewhere = copied();
+      const args = elsewhere.spec?.containers.find((container) => container.name === "bayma")?.args ?? [];
+      args[args.indexOf("--state-dir") + 1] = "/tmp/claude/e2e";
+      assert.equal(await asGateway("POST", pods, "application/json", elsewhere), 422);
+      // An Opaque Secret named as a token's, holding more than a token; and none of alasio's at all.
       const secrets = `/api/v1/namespaces/${HOST_NAMESPACE}/secrets`;
       const secret = (data: Record<string, string>) => ({ apiVersion: "v1", kind: "Secret", metadata: { name: "e2e-folder-bayma-token" }, type: "Opaque", data });
-      assert.equal(await asAlasio("POST", secrets, "application/json", secret({ token: "dG9rZW4=", other: "b3RoZXI=" })), 422);
-      assert.equal(await asAlasio("POST", secrets, "application/json", secret({ token: "dG9rZW4=" })), 201);
-      await kube.remove(ref("Secret", "e2e-folder-bayma-token", HOST_NAMESPACE));
+      assert.equal(await asGateway("POST", secrets, "application/json", secret({ token: "dG9rZW4=", other: "b3RoZXI=" })), 422);
+      assert.equal(await asAlasio("POST", secrets, "application/json", secret({ token: "dG9rZW4=" })), 403);
     });
 
     test("a message runs a turn on Codex, the run's stand-in for it, whose answer reaches the operator, and its spans the lake", async () => {
@@ -2484,7 +2497,18 @@ function kedaHpa(): V2HorizontalPodAutoscaler | null {
 
 /** Asks the API server `method` of `path`, with `body` as `contentType`, as alasio's ServiceAccount, from its pod: the status it answered. */
 async function asAlasio(method: string, path: string, contentType: string, body: unknown): Promise<number> {
-  const said = await inAlasioContainer([
+  return asAccountIn(inAlasioContainer, method, path, contentType, body);
+}
+
+/** Asks the API server as asAlasio does, as the sandbox gateway's ServiceAccount, from its pod. */
+async function asGateway(method: string, path: string, contentType: string, body: unknown): Promise<number> {
+  const gateway = await kube.runningPod(NAMESPACE, GATEWAY);
+  return asAccountIn((command, stdin) => kube.execOk(NAMESPACE, gateway, command, { container: GATEWAY_COMPONENT, ...(stdin === undefined ? {} : { stdin }) }), method, path, contentType, body);
+}
+
+/** Asks the API server `method` of `path`, with `body` as `contentType`, by curl `run` in a pod, as the pod's ServiceAccount: the status it answered. */
+async function asAccountIn(run: (command: readonly string[], stdin?: string) => Promise<string>, method: string, path: string, contentType: string, body: unknown): Promise<number> {
+  const said = await run([
     "sh",
     "-c",
     'cd /var/run/secrets/kubernetes.io/serviceaccount && curl -sS -o /dev/null -w "%{http_code}" --cacert ca.crt -H "Authorization: Bearer $(cat token)" ' +
@@ -2650,11 +2674,11 @@ if (inShard("scaling")) {
       assert.equal(await asAlasio("PATCH", pod(NAMESPACE, grafana), patched, otherImage), 422);
       assert.equal(await asAlasio("PATCH", pod(NAMESPACE, own), merged, busyLabel(false)), 200);
       assert.equal(await asAlasio("PATCH", pod(NAMESPACE, own), merged, { metadata: { labels: { "app.kubernetes.io/component": "other" } } }), 422);
-      // Of its sessions, nothing: their pods, Sandboxes, Secrets and Jobs are none of its.
+      // Of its sessions, nothing: their pods, Secrets and Jobs are none of its.
       assert.equal(await asAlasio("PATCH", pod(SESSIONS, session), merged, busyLabel(true)), 403);
       assert.equal(await asAlasio("PATCH", pod(SESSIONS, session), patched, otherImage), 403);
-      const sandbox = { apiVersion: "agents.x-k8s.io/v1beta1", kind: "Sandbox", metadata: { name: "e2e-made" }, spec: { podTemplate: { spec: { containers: [{ name: "bayma", image: "busybox" }] } } } };
-      assert.equal(await asAlasio("POST", `/apis/agents.x-k8s.io/v1beta1/namespaces/${SESSIONS}/sandboxes`, "application/json", sandbox), 403);
+      const made = { apiVersion: "v1", kind: "Pod", metadata: { name: "e2e-made" }, spec: { containers: [{ name: "bayma", image: "busybox" }] } };
+      assert.equal(await asAlasio("POST", `/api/v1/namespaces/${SESSIONS}/pods`, "application/json", made), 403);
       const token = { apiVersion: "v1", kind: "Secret", metadata: { name: "e2e-bayma-token" }, type: "Opaque", data: { token: "dG9rZW4=" } };
       assert.equal(await asAlasio("POST", `/api/v1/namespaces/${SESSIONS}/secrets`, "application/json", token), 403);
       const job = { apiVersion: "batch/v1", kind: "Job", metadata: { generateName: "e2e-borrowed-" }, spec: { template: { spec: { restartPolicy: "Never", serviceAccountName: componentName("keda-operator"), containers: [{ name: "x", image: "busybox" }] } } } };

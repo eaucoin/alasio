@@ -4,7 +4,6 @@
  * A volume id is what alasio generates and stores, and its session's workspace, which the
  * sandbox gateway holds, is named for it (sessionKey).
  */
-import { Schema } from "effect";
 
 /** The longest a volume id is: a DNS label's 63 characters, with room to spare, as the ids alasio has stored are. */
 export const VOLUME_ID_MAX = 58;
@@ -16,15 +15,6 @@ export const VOLUME_ID_MAX = 58;
  * satisfy this, and this guards against any that would not.
  */
 const VOLUME_ID_PATTERN = new RegExp(`^[a-z0-9][a-z0-9-]{1,${VOLUME_ID_MAX - 2}}[a-z0-9]$`, "u");
-
-/** A volume id, as what comes from outside alasio is decoded. */
-const VolumeId = Schema.String.check(Schema.isPattern(VOLUME_ID_PATTERN));
-
-/**
- * A session's token, `<volumeId>.<random>` (../kube/sandboxes.ts newToken), decoded into
- * the session it names and the rest.
- */
-export const SessionToken = Schema.TemplateLiteralParser([VolumeId, ".", Schema.NonEmptyString]);
 
 export function isValidVolumeId(volumeId: unknown): volumeId is string {
   return typeof volumeId === "string" && VOLUME_ID_PATTERN.test(volumeId);

@@ -31,13 +31,13 @@ import { ALASIO_CLAUDE_EFFORT, ALASIO_CLAUDE_MODEL } from "../src/harness/claude
 import { type ClaudeSessionApi, type ClaudeTranscriptStore, createClaudeSessionApi } from "../src/harness/claude/sessions.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { TurnParams, TurnPersistence, TurnResult } from "../src/harness/index.ts";
-import { BaymaNotAnswering } from "../src/kube/sandboxes.ts";
 import type { BaymaMcpServer, HostBaymaScope } from "../src/mcp/bayma.ts";
 import type { ModelChoice } from "../src/persistence/conversation-repository.ts";
 import type { ResponseBlock as StoredBlock } from "../src/persistence/response-repository.ts";
 import { StoreError } from "../src/persistence/sql.ts";
 import type { NewRestartEvent } from "../src/persistence/restart-repository.ts";
 import type { SessionUsage } from "../src/persistence/usage-repository.ts";
+import { GatewayError } from "../src/sandbox/gateway-client.ts";
 import {
   assistantMessage,
   backgroundTasksChanged,
@@ -974,34 +974,32 @@ test("a report whose claim is made but whose blocks so far cannot be stored ends
   await closeAll();
 });
 
-test("a turn holds the pod it works in busy while it runs: an operator's, and one Claude Code starts itself to report", async () => {
+test("a turn holds alasio's pod busy while it runs: an operator's, and one Claude Code starts itself to report", async () => {
   const persistence = createPersistence();
   const holds: Hold[] = [];
   const activeTurns = activeTurnsHolding(holds);
   const cli = createFakeCli();
-  const pod = { namespace: "alasio-host", name: "bayma-telegram-1" };
-  const workspacePod = (threadKey: string) => (threadKey === "telegram:1" ? pod : null);
   const { liveSessions, closeAll } = openLiveSessions(
-    { workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma, workspacePod },
+    { workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma },
     activeTurns,
   );
   const turn = runTurn(liveSessions, turnParams(persistence));
   const first = await cli.nextPrompt();
-  assert.deepEqual(holds, [{ workspace: pod, released: false }]);
+  assert.deepEqual(holds, [{ released: false }]);
   cli.emit(initMessage("s-1"));
   cli.emit(assistantMessage([toolUse("t1", "Bash", { command: "bun run test", run_in_background: true })]));
   cli.emit(backgroundTasksChanged([{ task_id: "b1", task_type: "local_bash", description: "bun run test" }]));
   cli.emit(successResult({ result: "Tests are running.", session_id: "s-1", user_message_uuids: [first.uuid] }));
   await turn;
-  assert.deepEqual(holds, [{ workspace: pod, released: true }]);
+  assert.deepEqual(holds, [{ released: true }]);
 
   cli.emit(backgroundTasksChanged([]));
   cli.emit(assistantMessage([text("Checking the log.")]));
   await settle();
-  assert.deepEqual(holds.at(-1), { workspace: pod, released: false });
+  assert.deepEqual(holds.at(-1), { released: false });
   cli.emit(successResult({ result: "All 212 tests passed.", session_id: "s-1" }));
   await settle();
-  assert.deepEqual(holds, [{ workspace: pod, released: true }, { workspace: pod, released: true }]);
+  assert.deepEqual(holds, [{ released: true }, { released: true }]);
   await closeAll();
 });
 
@@ -1118,7 +1116,7 @@ test("a stop asked while Claude Code is still starting is done once the turn end
     sessions: quietSessions,
     queryFactory: () => assert.fail("Claude Code never starts"),
     // Starting the process waits on the conversation's bayma.
-    folderBayma: () => Effect.tryPromise({ try: () => bayma, catch: () => new BaymaNotAnswering({ url: "http://bayma:7290/mcp", reason: "unreachable" }) }),
+    folderBayma: () => Effect.tryPromise({ try: () => bayma, catch: () => new GatewayError({ call: "bind folder:claude:telegram:1", status: 503, reason: "unreachable" }) }),
   }, activeTurns);
   const turn = runTurn(liveSessions, turnParams(persistence));
   while (!busy(activeTurns, "telegram:1")) {
@@ -1130,7 +1128,7 @@ test("a stop asked while Claude Code is still starting is done once the turn end
   const result = await turn;
   assert.equal(await settlesSoon(stopping), true, "the stop is done once the turn ends");
   assert.equal(result.responseCompleted, false);
-  assert.deepEqual(result.blockSequence, [{ type: "text", content: "Error: bayma in http://bayma:7290/mcp did not answer: unreachable" }]);
+  assert.deepEqual(result.blockSequence, [{ type: "text", content: "Error: the sandbox gateway did not bind folder:claude:telegram:1 (503): unreachable" }]);
   assert.equal(busy(activeTurns, "telegram:1"), false);
   await closeAll();
 });

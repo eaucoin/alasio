@@ -6,11 +6,9 @@
  */
 import type {
   KubernetesObject,
-  V1ConfigMap,
   V1Deployment,
   V1EnvVar,
   V1Namespace,
-  V1ObjectMeta,
   V1Role,
   V1RoleBinding,
   V1Service,
@@ -20,12 +18,12 @@ import type {
 } from "@kubernetes/client-node";
 
 import { BRANCH_FORK_PORT, BRANCH_PARENT_LABEL, branchSessionsNamespace, MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
-import type { HostProfile } from "../../../src/kube/config.ts";
-import { ALASIO_GATEWAY_CALLER_KEY_VARIABLE, ALASIO_GATEWAY_ENVIRONMENT_VARIABLE, ALASIO_GATEWAY_URL_VARIABLE } from "../../../src/gateway/names.ts";
+import { ALASIO_GATEWAY_CALLER_KEY_VARIABLE, ALASIO_GATEWAY_ENVIRONMENT_VARIABLE, ALASIO_GATEWAY_FOLDERS_VARIABLE, ALASIO_GATEWAY_URL_VARIABLE } from "../../../src/gateway/names.ts";
 import type { ApiServer } from "../api-server.ts";
 import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
-import { alasioAccount, busyLabelPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
+import { busyLabelPolicy } from "./admission.ts";
+import { foldersRun } from "./folders.ts";
 import { carriedPools, GATEWAY, GATEWAY_PORT, sandboxServiceRuns } from "./sandbox-gateway.ts";
 import { alasioGroup, environmentLogSecret, environmentName, lakeWakeTopic, LOG_BROKERS, telegramTopic } from "./log.ts";
 import {
@@ -36,7 +34,6 @@ import {
   type Environment,
   envOf,
   given,
-  goJson,
   hostVolumeMounts,
   hostVolumes,
   imagePullSecrets,
@@ -53,76 +50,21 @@ import {
   roleVerifiers,
   selectorLabels,
   SESSIONS_CALLER_SECRET,
-  sha256,
 } from "./common.ts";
 import { durationSeconds, type InstallConfig } from "./config.ts";
 import { busyBudget } from "./disruption.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 
-/** The port every workspace's bayma serves MCP on. */
-const BAYMA_PORT = 7290;
-
 /** The namespace of the sessions of the alasio of `environment`: the configured one, or a branch environment's own. */
 export function sessionsNamespace(config: InstallConfig, { branch }: Environment): string {
   return branch ? branchSessionsNamespace(branch) : config.sessions.namespace;
-}
-
-/** The namespaces whose Sandboxes alasio drives: the host profile's, its folder workspaces'; the sessions' pods are the sandbox gateway's. */
-function workspaceNamespaces(config: InstallConfig): string[] {
-  return config.host.enabled ? [config.host.namespace] : [];
 }
 
 /** How long a session's bayma holds a stop alasio did not make (sessions.snapshots.stopWait). */
 export function stopWaitSeconds(config: InstallConfig): number {
   // A duration, as the configuration checks it.
   return durationSeconds(config.sessions.snapshots.stopWait) ?? 0;
-}
-
-/** The template of folder workspaces' bayma: bayma itself, as the operator, with the machine's mounts. */
-function hostProfile(config: InstallConfig): HostProfile {
-  const { host } = config;
-  return {
-    namespace: host.namespace,
-    port: BAYMA_PORT,
-    stateRoot: host.stateRoot,
-    podTemplate: {
-      metadata: { labels: { "app.kubernetes.io/part-of": "alasio", "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "folder-bayma" } },
-      spec: {
-        // May restart alasio, by rolling out its Deployment, as an agent restarts it.
-        serviceAccountName: componentName("host-agent"),
-        ...priority("turn"),
-        securityContext: {
-          runAsUser: host.uid,
-          runAsGroup: host.gid,
-          // The group the bayma token's Secret volume is given, which the operator's user
-          // reads it as; the node's own paths the mounts give are left as they are.
-          fsGroup: host.gid,
-          ...given("supplementalGroups", [...host.supplementalGroups]),
-        },
-        ...imagePullSecrets(config),
-        containers: [{
-          name: "bayma",
-          image: imageReference(host.baymaImage),
-          imagePullPolicy: "IfNotPresent",
-          args: ["mcp-http", "--host", "0.0.0.0", "--port", String(BAYMA_PORT), "--default-durability", "checkpointed"],
-          workingDir: host.home,
-          env: [{ name: "HOME", value: host.home }, ...envOf(host.env)],
-          ports: [{ name: "mcp", containerPort: BAYMA_PORT }],
-          securityContext: {
-            // What bayma needs to snapshot its REPL sessions' processes as it stops and
-            // restore them whole as it starts again.
-            capabilities: { add: ["CHECKPOINT_RESTORE", "SYS_PTRACE"] },
-            seccompProfile: { type: "Unconfined" },
-            appArmorProfile: { type: "Unconfined" },
-          },
-          resources: host.resources,
-          ...given("volumeMounts", hostVolumeMounts(config)),
-        }],
-        ...given("volumes", hostVolumes(config)),
-      },
-    },
-  };
 }
 
 /**
@@ -171,9 +113,6 @@ export type PreviousPools = Readonly<Record<"none" | "full", V1PodTemplateSpec |
 /** Nothing carried forward: a first installation's, and a branch environment's. */
 export const NOTHING_CARRIED: Carried = { previousPools: { none: null, full: null }, ...NOTHING_KEPT };
 
-/** The ConfigMap of the templates, by its name. */
-export const SANDBOX_TEMPLATES = componentName("sandbox-templates");
-
 /**
  * What the installation `config` describes, with what the cluster keeps, `kept`, carries
  * forward from `liveGateway`, the sandbox gateway's configuration of the installation it
@@ -182,16 +121,6 @@ export const SANDBOX_TEMPLATES = componentName("sandbox-templates");
  */
 export function carriedFrom(config: InstallConfig, kept: Kept, liveGateway?: string): Carried {
   return { ...kept, previousPools: carriedPools(config, liveGateway, kept) };
-}
-
-/** The ConfigMap of the templates, and their checksum, which alasio's pod carries so it is replaced when they change. */
-function sandboxTemplates(config: InstallConfig, environment: Environment): { readonly configMap: V1ConfigMap; readonly checksum: string } {
-  const name = SANDBOX_TEMPLATES;
-  const templates = goJson(config.host.enabled ? { host: hostProfile(config) } : {}, "  ");
-  return {
-    configMap: { apiVersion: "v1", kind: "ConfigMap", metadata: { name, namespace: environment.namespace, labels: labels("alasio") }, data: { "templates.json": templates } },
-    checksum: sha256(templates),
-  };
 }
 
 /** Where alasio's Secrets of branch environments are mounted: main's key, or a branch's token. */
@@ -238,7 +167,6 @@ function readerRoles(config: InstallConfig, { branch }: Environment): ReturnType
 function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, environment: Environment): V1EnvVar[] {
   const { alasio, host } = config;
   return [
-    { name: "ALASIO_KUBE_TEMPLATES", value: "/etc/alasio/templates.json" },
     { name: "ALASIO_STATE_DIR", value: "/var/lib/alasio/state" },
     { name: "HOME", value: home },
     // A home of alasio's own does not outlast its pod; the operator's keeps their login.
@@ -273,6 +201,8 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
         { name: ALASIO_GATEWAY_CALLER_KEY_VARIABLE, valueFrom: { secretKeyRef: { name: SESSIONS_CALLER_SECRET, key: "caller-key" } } },
       ]
       : []),
+    // Main's folder workspaces, the gateway's folder instances, where the host profile renders them.
+    ...(environment.branch === null && foldersRun(config) ? [{ name: ALASIO_GATEWAY_FOLDERS_VARIABLE, value: "1" }] : []),
     ...branchEnv(config, environment),
     ...otelEnv(config, environment),
     ...envOf(alasio.env),
@@ -289,10 +219,10 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
  * branch environment's runs in its namespace on the branch's database, told it is the
  * branch, with its token to ask main to fork the sessions it inherited; main's is given
  * the key branch environments' tokens are signed with, where it forks sessions. Its pod
- * carries the checksums of its templates and, where up read it, of its bot's Secret, so
- * it is replaced when either changes.
+ * carries, where up read it, the checksum of its bot's Secret, so it is replaced when it
+ * changes.
  */
-function deployment(config: InstallConfig, templatesChecksum: string, botChecksum: string | null, environment: Environment): V1Deployment {
+function deployment(config: InstallConfig, botChecksum: string | null, environment: Environment): V1Deployment {
   const { alasio, host } = config;
   const operatorHome = host.enabled && host.alasioHome;
   const home = operatorHome ? host.home : "/var/lib/alasio/home";
@@ -312,7 +242,7 @@ function deployment(config: InstallConfig, templatesChecksum: string, botChecksu
       template: {
         metadata: {
           labels: labels("alasio"),
-          annotations: { "checksum/sandbox-templates": templatesChecksum, ...(botChecksum === null ? {} : { "checksum/telegram": botChecksum }) },
+          ...(botChecksum === null ? {} : { annotations: { "checksum/telegram": botChecksum } }),
         },
         spec: {
           serviceAccountName: RELEASE,
@@ -334,7 +264,6 @@ function deployment(config: InstallConfig, templatesChecksum: string, botChecksu
             volumeMounts: [
               { name: "state", mountPath: "/var/lib/alasio/state" },
               ...(operatorHome ? [] : [{ name: "alasio-home", mountPath: home }]),
-              { name: "templates", mountPath: "/etc/alasio", readOnly: true },
               { name: "database", mountPath: "/run/alasio/database", readOnly: true },
               { name: "log", mountPath: "/run/alasio/log", readOnly: true },
               ...branchSecret.map(({ name }) => ({ name, mountPath: BRANCH_SECRETS, readOnly: true })),
@@ -344,7 +273,6 @@ function deployment(config: InstallConfig, templatesChecksum: string, botChecksu
           volumes: [
             { name: "state", emptyDir: {} },
             ...(operatorHome ? [] : [{ name: "alasio-home", emptyDir: {} }]),
-            { name: "templates", configMap: { name: componentName("sandbox-templates") } },
             {
               name: "database",
               secret: {
@@ -422,44 +350,22 @@ function namespaces(config: InstallConfig, environment: Environment): V1Namespac
 }
 
 /**
- * alasio's identity: it drives its folder workspaces' Sandboxes and their token Secrets in
- * the host profile's namespace, reading their pods and running in them, labelling them busy
- * while turns run in them, as it does its own pod in its own namespace (src/kube/busy.ts);
- * and nothing else. Its sessions are the sandbox gateway's, which it reaches by its key alone.
+ * alasio's identity: it labels its own pod busy while turns run in it (src/kube/busy.ts), and
+ * nothing else. Its sessions and its folder workspaces are the sandbox gateway's, which it
+ * reaches by its key alone.
  */
 function identity(config: InstallConfig, environment: Environment): KubernetesObject[] {
-  const binding = (metadata: V1ObjectMeta): V1RoleBinding => ({
+  const inOwnNamespace = { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") };
+  const own: V1Role = { apiVersion: "rbac.authorization.k8s.io/v1", kind: "Role", metadata: inOwnNamespace, rules: [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }] };
+  const binding: V1RoleBinding = {
     apiVersion: "rbac.authorization.k8s.io/v1",
     kind: "RoleBinding",
-    metadata,
+    metadata: inOwnNamespace,
     subjects: [{ kind: "ServiceAccount", name: RELEASE, namespace: environment.namespace }],
     roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: RELEASE },
-  });
-  const inOwnNamespace = { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") };
-  // Its own pod's busy label.
-  const own: V1Role = { apiVersion: "rbac.authorization.k8s.io/v1", kind: "Role", metadata: inOwnNamespace, rules: [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }] };
+  };
   const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") } };
-  return [
-    serviceAccount,
-    ...workspaceNamespaces(config).flatMap((namespace): KubernetesObject[] => {
-      const metadata = { name: RELEASE, namespace, labels: labels("alasio") };
-      const role: V1Role = {
-        apiVersion: "rbac.authorization.k8s.io/v1",
-        kind: "Role",
-        metadata,
-        rules: [
-          { apiGroups: ["agents.x-k8s.io"], resources: ["sandboxes"], verbs: ["get", "list", "watch", "create", "patch", "delete"] },
-          { apiGroups: [""], resources: ["secrets"], verbs: ["get", "create"] },
-          { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "patch"] },
-          { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
-        ],
-      };
-      return [role, binding(metadata)];
-    }),
-    own,
-    binding(inOwnNamespace),
-    ...(config.host.enabled ? hostAgentIdentity(config) : []),
-  ];
+  return [serviceAccount, own, binding, ...(environment.branch === null && foldersRun(config) ? hostAgentIdentity(config) : [])];
 }
 
 /**
@@ -496,20 +402,17 @@ function hostAgentIdentity(config: InstallConfig): KubernetesObject[] {
 
 /** The objects of the alasio of `environment`, main's unless a branch environment's, with what main's carries forward. */
 export function alasioObjects(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT, carried: Carried = NOTHING_CARRIED): KubernetesObject[] {
-  const templates = sandboxTemplates(config, environment);
-  const alasio = deployment(config, templates.checksum, carried.botChecksum, environment);
+  const alasio = deployment(config, carried.botChecksum, environment);
   return [
     ...namespaces(config, environment),
     ...identity(config, environment),
-    templates.configMap,
     alasio,
     // It runs turns, in its harnesses, which a recreation would end.
     verticalPodAutoscaler(alasio, "Recommended"),
-    // A drain waits for the turns running in its pod and its workspaces' to end.
-    ...[environment.namespace, ...workspaceNamespaces(config)].map(busyBudget),
+    // A drain waits for the turns running in its pod to end.
+    busyBudget(environment.namespace),
     ...(environment.branch === null && forksForBranches(config) ? [branchForksService()] : []),
-    // What alasio may do beyond what RBAC can say; the cluster's, but for its Sandboxes', made with main's.
-    ...(environment.branch === null ? [...busyLabelPolicy(), ...secretPolicy()] : []),
-    ...sandboxPolicy(sandboxPolicyName(environment.namespace), alasioAccount(environment.namespace), config.host.enabled ? hostProfile(config) : null),
+    // What alasio may do beyond what RBAC can say: the cluster's, made with main's.
+    ...(environment.branch === null ? busyLabelPolicy() : []),
   ];
 }

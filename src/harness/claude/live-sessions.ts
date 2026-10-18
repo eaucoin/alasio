@@ -62,8 +62,7 @@ import {
   storeBlocks,
 } from "../../codex/event-projection.ts";
 import { createTurnTimer, type TurnTimer } from "../../codex/turn-timing.ts";
-import type { PodRef } from "../../kube/busy.ts";
-import type { BaymaEndpoint, SandboxError } from "../../kube/sandboxes.ts";
+import type { BaymaEndpoint, GatewayError } from "../../sandbox/gateway-client.ts";
 import type { ModelChoice } from "../../persistence/conversation-repository.ts";
 import type { StoreError } from "../../persistence/sql.ts";
 import type { TurnFenced } from "../../persistence/store.ts";
@@ -196,9 +195,7 @@ export interface ClaudeLiveSessionsOptions {
   readonly sessions: Pick<ClaudeSessionApi, "sessionExists">;
   readonly sessionStore?: SessionStore | null;
   readonly sessionFsBayma?: Effect.Effect<BaymaEndpoint, SessionError> | null;
-  readonly folderBayma?: (scope: Pick<HostBaymaScope, "threadKey">) => Effect.Effect<BaymaMcpServer, SandboxError | NoFolderWorkspaces>;
-  /** The pod a conversation's turns work in, which each holds busy while it runs (ActiveTurns). */
-  readonly workspacePod?: ((threadKey: string) => PodRef | null) | undefined;
+  readonly folderBayma?: (scope: Pick<HostBaymaScope, "threadKey">) => Effect.Effect<BaymaMcpServer, GatewayError | NoFolderWorkspaces>;
   readonly queryFactory?: ClaudeQueryFactory | undefined;
 }
 
@@ -268,7 +265,6 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   sessionStore = null,
   sessionFsBayma = null,
   folderBayma = defaultFolderBayma,
-  workspacePod,
   queryFactory = query,
 }: ClaudeLiveSessionsOptions): Effect.fn.Return<ClaudeLiveSessions, never, Scope.Scope | ActiveTurns> {
   const scope = yield* Effect.scope;
@@ -417,9 +413,6 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     );
   });
 
-  /** The options a CLI turn holds the conversation busy with. */
-  const cliTurnRegistration = (host: ClaudeHost) => ({ onlyIfIdle: true, workspace: workspacePod?.(host.threadKey) });
-
   /**
    * Delivers a CLI turn's reply, once it has claimed its conversation: its response
    * completed and its claim ended, then the conversation let go of, however that went,
@@ -475,7 +468,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     };
     host.cliTurn = cliTurn;
     const held = host.reportsWaiting === null
-      && (yield* activeTurns.register(host.threadKey, cliTurn.running, cliTurnRegistration(host)).pipe(Scope.provide(cliTurn.registration)));
+      && (yield* activeTurns.register(host.threadKey, cliTurn.running, { onlyIfIdle: true }).pipe(Scope.provide(cliTurn.registration)));
     if (held) {
       yield* claimCliTurn(host, cliTurn).pipe(
         Effect.onError(() => Effect.sync(() => void (host.cliTurn = null)).pipe(Effect.andThen(releaseCliTurn(host, cliTurn)))),
@@ -514,7 +507,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     const delivered = yield* Deferred.make<void>();
     host.reportsWaiting = delivered;
     yield* (before ? Deferred.await(before) : Effect.void).pipe(
-      Effect.andThen(activeTurns.registerWhenIdle(host.threadKey, cliTurn.running, cliTurnRegistration(host)).pipe(Scope.provide(cliTurn.registration))),
+      Effect.andThen(activeTurns.registerWhenIdle(host.threadKey, cliTurn.running).pipe(Scope.provide(cliTurn.registration))),
       Effect.andThen(claimCliTurn(host, cliTurn)),
       Effect.flatMap(() => (cliTurn.claim ? deliverCliTurn(host, cliTurn, cliTurn.claim.own) : Effect.void)),
       Effect.catch((error) =>
@@ -930,7 +923,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     });
     // Registered before the process is made sure of, so the conversation reads as busy at
     // once; the registration ends with the turn, or with this fiber if it is interrupted.
-    yield* activeTurns.register(threadKey, { cliInitiated: false, stop, steer }, { workspace: workspacePod?.(threadKey) }).pipe(Scope.provide(current.registration));
+    yield* activeTurns.register(threadKey, { cliInitiated: false, stop, steer }).pipe(Scope.provide(current.registration));
     return yield* Effect.gen(function*() {
       yield* turnTimer("env.built");
       const started = yield* hostFor(params).pipe(

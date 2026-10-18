@@ -47,7 +47,6 @@ import { gatewayCalls } from "./gateway-calls.ts";
 import { kind, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./kube/api.ts";
 import { applyObjects } from "./kube/apply.ts";
 import { awaitGone, awaitReady, readiness, selectorOf, type WaitOptions } from "./kube/rollout.ts";
-import { sandboxPolicyName } from "./manifests/admission.ts";
 import { alasioPrincipal, environmentAccess, type EnvironmentLogAccess, environmentLogSecret, LOG, loaderLogSecret, loaderPrincipal, logPrincipalSecret } from "./manifests/log.ts";
 import { branchObjects } from "./manifests/branch.ts";
 import { REPLICA_NAME } from "./manifests/neon.ts";
@@ -550,8 +549,7 @@ export const deleteBranch = Effect.fnUntraced(function*(name: string, { force }:
     );
   }
   yield* removed([namespace, sessions].map((each) => ({ ...NAMESPACE_KIND, name: each })), options);
-  // What of its is the cluster's: its Sandboxes' admission policy, its route, its topic and its principal.
-  yield* removed([kind("ValidatingAdmissionPolicyBinding"), kind("ValidatingAdmissionPolicy")].map((each) => ({ ...each, name: sandboxPolicyName(namespace) })), options);
+  // What of its is the cluster's: its route, its topic and its principal.
   yield* removeRoute(name);
   yield* changeEnvironment("forget", environmentAccess(name));
 });

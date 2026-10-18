@@ -141,7 +141,7 @@ test("objects reach the API server as the manifests have them, keys client-node'
   await run(applyInstallation(objectsOf(), WAIT));
   const policy = kube.get("/apis/networking.k8s.io/v1/namespaces/alasio-sessions/networkpolicies/alasio-sandboxes");
   assert.deepEqual((policy?.spec?.["ingress"] as Array<{ from: unknown[] }>)[0]?.from.length, 1);
-  const crd = kube.get("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/sandboxes.agents.x-k8s.io");
+  const crd = kube.get("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/scaledobjects.keda.sh");
   assert.match(JSON.stringify(crd), /"x-kubernetes-/u);
 });
 
@@ -304,7 +304,6 @@ test("removing an installation keeps what holds data, and with purge deletes it 
     "CustomResourceDefinition cloudeventsources.eventing.keda.sh",
     "CustomResourceDefinition clustercloudeventsources.eventing.keda.sh",
     "CustomResourceDefinition clustertriggerauthentications.keda.sh",
-    "CustomResourceDefinition sandboxes.agents.x-k8s.io",
     "CustomResourceDefinition scaledjobs.keda.sh",
     "CustomResourceDefinition scaledobjects.keda.sh",
     "CustomResourceDefinition triggerauthentications.keda.sh",
@@ -551,7 +550,7 @@ test("KEDA and VPA are installed where the cluster has none, refused where it ha
   const crd = (name: string) => kube.put("customresourcedefinitions", { apiVersion: "apiextensions.k8s.io/v1", kind: "CustomResourceDefinition", metadata: { name } });
   assert.equal(await check({}), "fits");
   assert.equal(await check(without("keda"), [scaledObject]), "this cluster has no KEDA, which scales alasio-lake-loader, alasio-lake-intake, sandboxes-none, sandboxes-full, alasio-grafana: install.autoscaling.keda.enabled true installs alasio's");
-  assert.match(await check(without("vpa")), /^this cluster has no VPA, which sizes alasio-agent-sandbox-controller, .*alasio-lake.*: install\.autoscaling\.vpa\.enabled true installs alasio's$/u);
+  assert.match(await check(without("vpa")), /^this cluster has no VPA, which sizes alasio-keda-operator, .*alasio-lake.*: install\.autoscaling\.vpa\.enabled true installs alasio's$/u);
   // The lake's intake and loader, which KEDA wakes, and the sandbox service's pools, each at a count of its own: nothing scaled.
   const fixed = { min: 1, max: 1 };
   assert.equal(await check({ ...without("keda"), lake: { intake: { scaling: fixed }, loader: { scaling: fixed } }, sessions: { pools: fixed } }), "fits");

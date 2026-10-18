@@ -8,17 +8,16 @@
  *   the eviction it blocks had happened. A drain on a cluster of several nodes stops it a
  *   moment, as the scheduler starts it elsewhere; two replicas, where it may run them, do
  *   not;
- * - a pod running a turn (alasio's own, while its harnesses run one; a session's; a folder
- *   workspace's bayma) is labelled busy by alasio for as long as it does
- *   (src/kube/busy.ts), and its namespace's budget of busy pods lets none of them be
- *   evicted: a drain waits until the turn is done. Of pods whose owner has no scale (a
- *   Sandbox's), the disruption controller cannot count how many there should be, and so
- *   allows none to be evicted, which is the rule all the same;
- * - a pod of the sandbox service's pools bound to a workspace holds what lives only in it
- *   until its release, its REPLs' state: its namespace's budget of bound pods lets none of
- *   them be evicted, so a drain waits until each is released, after it has been quiet
- *   for `sessions.releaseAfter`. Bound, it is out of its Deployment, and so of no owner the
- *   disruption controller counts, as a Sandbox's pod is.
+ * - alasio's pod, while its harnesses run a turn, is labelled busy by alasio for as long as
+ *   they do (src/kube/busy.ts), and its namespace's budget of busy pods lets none of them
+ *   be evicted: a drain waits until the turn is done;
+ * - a pod the sandbox service has bound, a pool's to a workspace or a folder conversation's
+ *   instance, holds what lives only in it until its release, its REPLs' state: its
+ *   namespace's budget of bound pods lets none of them be evicted, so a drain waits until
+ *   each is released, after it has been quiet for `sessions.releaseAfter` or
+ *   `host.releaseAfter`. Bound, it is of no owner the disruption controller counts (out of
+ *   its Deployment, or made by the gateway alone), which then allows none of them to be
+ *   evicted, the rule all the same.
  */
 import type { V1PodDisruptionBudget, V1TopologySpreadConstraint } from "@kubernetes/client-node";
 

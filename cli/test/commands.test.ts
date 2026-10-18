@@ -456,7 +456,6 @@ test("up replaces alasio's pod when the users its bot allows change, which alasi
   succeeded(await setup.alasio(["up"]));
   const widened = annotations();
   assert.notEqual(widened["checksum/telegram"], first["checksum/telegram"]);
-  assert.equal(widened["checksum/sandbox-templates"], first["checksum/sandbox-templates"]);
   // An HMAC with the bot's Secret's own key, kept as init writes the Secret again: no hash of what it sums alone.
   const key = secretValue(setup.kube, "alasio-telegram", "checksumKey") ?? "";
   assert.match(key, /^[\w-]{43}$/u);
@@ -1010,7 +1009,7 @@ test("logs prints a component's log, each line with its pod's name when it has s
   const log = await alasio(["logs", "log"]);
   succeeded(log);
   assert.deepEqual(log.stdout.split("\n").filter(Boolean).sort(), ["[access] applied", "[log] serving"]);
-  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has agent-sandbox-controller, alasio, collector, collector-scraper, grafana, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake-intake, lake-loader, lake-query, log, /u);
+  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has alasio, collector, collector-scraper, grafana, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake-intake, lake-loader, lake-query, log, /u);
 });
 
 test("restart rolls alasio's pod out again as a manager of its own, and waits until it runs", async (t) => {
@@ -2056,14 +2055,11 @@ test("branch list says each branch, what it is a branch of, its age, the release
   assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, made by alasio 0.0.0-development, its alasio ready, 1.8 GiB requested, 0 MiB used"]);
 });
 
-test("branch delete refuses while the branch's alasio has a turn running, or a workspace of its sessions is bound, unless --force, and deletes it whole: its alasio and lake, its sessions' workspaces, its compute, its branch of Neon, its namespaces, its Sandboxes' policy", async (t) => {
+test("branch delete refuses while the branch's alasio has a turn running, or a workspace of its sessions is bound, unless --force, and deletes it whole: its alasio and lake, its sessions' workspaces, its compute, its branch of Neon, its namespaces", async (t) => {
   const { alasio, gateway, home, kube, neon, telegram } = await branchable(t);
   telegram.bots.set("456:branch", "branch_bot");
   writeFileSync(join(home, "branch"), "456:branch");
   succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
-  const policy = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/alasio-branch-try-sandboxes";
-  const binding = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/alasio-branch-try-sandboxes";
-  assert.ok(kube.get(policy) && kube.get(binding));
   // Its sessions' workspaces, as the gateway serves them, one of them bound to a pod of its pool's; and main's, which it leaves be.
   gateway.workspaces.set("try", ["fs-abc123", "fs-def456"]);
   gateway.workspaces.set("main", ["fs-abc123"]);
@@ -2110,7 +2106,6 @@ test("branch delete refuses while the branch's alasio has a turn running, or a w
   assert.deepEqual(neon.branches.map(({ name }) => name), ["main"]);
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try"), undefined);
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try-sessions"), undefined);
-  assert.deepEqual([kube.get(policy), kube.get(binding)], [undefined, undefined]);
   // Its bot delivered nowhere, its route gone, its principal and topic forgotten.
   assert.equal(telegram.webhooks.get("456:branch"), undefined);
   assert.equal(secretValue(kube, ROUTES_SECRET, "try"), undefined);
@@ -2148,8 +2143,8 @@ test("a branch's configuration is main's with its overrides, and never the host 
   const container = (kube.get(BRANCH_DEPLOYMENT)?.spec as { template: { spec: { containers: { env: { name: string; value?: string }[]; resources: { requests: Record<string, string> } }[]; volumes: { name: string }[] } } }).template.spec;
   assert.equal(container.containers[0]?.env.find(({ name }) => name === "ALASIO_DEFAULT_HARNESS")?.value, "codex");
   assert.deepEqual(container.containers[0]?.resources.requests, { cpu: "250m", memory: "512Mi" });
-  const templates = JSON.parse((kube.get("/api/v1/namespaces/alasio-branch-try/configmaps/alasio-sandbox-templates")?.["data"] as Record<string, string>)["templates.json"] ?? "");
-  assert.equal(templates.host, undefined);
+  // No folder instances, which are main's alone.
+  assert.equal(container.containers[0]?.env.some(({ name }) => name === "ALASIO_GATEWAY_FOLDERS"), false);
   // The pull Secrets of its images, in its own namespace.
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try/secrets/registry")?.["type"], "kubernetes.io/dockerconfigjson");
   writeFileSync(join(home, "overrides.json"), JSON.stringify({ alasio: { telegram: { existingSecret: "mine" } } }));

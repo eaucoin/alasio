@@ -9,7 +9,6 @@ import { executeCodexTurn } from "../src/codex/runtime.ts";
 import type { CodexExecClient } from "../src/codex/transport.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { TurnPersistence } from "../src/harness/index.ts";
-import type { PodRef } from "../src/kube/busy.ts";
 import { type Hold, recordingBusyPods } from "./support/busy-pods.ts";
 import { ownTurnsOn } from "./support/persistence.ts";
 
@@ -56,12 +55,12 @@ function recordingPersistence(calls: string[], stored: unknown[][] = []): TurnPe
 
 /**
  * Runs a turn of `codexFactory`'s Codex on `persistence`, its response made complete once
- * `beforeResponseComplete` is done, in `workspacePod`, which it holds busy in `holds`.
+ * `beforeResponseComplete` is done, holding alasio's pod busy in `holds`.
  */
 const runTurn = (
   persistence: TurnPersistence,
   beforeResponseComplete: (sessionId: string | null | undefined) => Effect.Effect<void> = () => Effect.void,
-  { workspacePod, holds = [] }: { readonly workspacePod?: PodRef; readonly holds?: Hold[] } = {},
+  { holds = [] }: { readonly holds?: Hold[] } = {},
 ) =>
   Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     // The exec transport's turn, which no app-server serves.
@@ -80,17 +79,15 @@ const runTurn = (
       codexFactory,
       folderBayma: () => Effect.succeed({ type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }),
       beforeResponseComplete,
-      workspacePod,
     });
   })).pipe(Effect.provide([ActiveTurns.layer.pipe(Layer.provide(recordingBusyPods(holds).layer)), Logger.layer([])])));
 
-test("a turn holds the pod it works in busy until it ends", async () => {
+test("a turn holds alasio's pod busy until it ends", async () => {
   const holds: Hold[] = [];
-  const workspacePod = { namespace: "alasio-sessions", name: "s1" };
   let heldMeanwhile: readonly Hold[] = [];
-  await runTurn(recordingPersistence([]), () => Effect.sync(() => (heldMeanwhile = structuredClone(holds))), { workspacePod, holds });
-  assert.deepEqual(heldMeanwhile, [{ workspace: workspacePod, released: false }]);
-  assert.deepEqual(holds, [{ workspace: workspacePod, released: true }]);
+  await runTurn(recordingPersistence([]), () => Effect.sync(() => (heldMeanwhile = structuredClone(holds))), { holds });
+  assert.deepEqual(heldMeanwhile, [{ released: false }]);
+  assert.deepEqual(holds, [{ released: true }]);
 });
 
 test("a turn's response is marked complete only once beforeResponseComplete has finished", async () => {

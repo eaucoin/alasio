@@ -16,13 +16,13 @@ import type { AlasioConfig, BranchEnvironment } from "./config.ts";
 import { ActiveTurns } from "./harness/active-turns.ts";
 import type { ClaudeQueryFactory } from "./harness/claude/runtime.ts";
 import { Harnesses } from "./harness/index.ts";
-import type { KubeTemplates } from "./kube/config.ts";
 import { BusyPods } from "./kube/busy.ts";
 import { KubeClient } from "./kube/client.ts";
 import { type FolderBayma, HostBayma } from "./mcp/bayma.ts";
 import { Mounts } from "./operator/mounts.ts";
 import type { StoreError } from "./persistence/sql.ts";
 import { Store } from "./persistence/store.ts";
+import { makeGatewayWorkspaces } from "./sandbox/gateway-client.ts";
 import { type Inheritance, type NetMode, SessionInheritError, SessionSandboxes } from "./sandbox/index.ts";
 import { serveTelegram, type TelegramAppConfig, type TelegramAppError } from "./telegram/app.ts";
 import { Authorizer } from "./telegram/authorizer.ts";
@@ -40,7 +40,6 @@ export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog" | "lakeW
   readonly pool: Pool;
   /** The schema alasio's state is kept in: `state`, unless a test gives one of its own. */
   readonly stateSchema?: string | undefined;
-  readonly kubeTemplates?: KubeTemplates | null | undefined;
   /** Stand-ins for a folder workspace's bayma and for Claude Code, in the harnesses alasio makes. */
   readonly folderBayma?: FolderBayma | undefined;
   readonly claudeQueryFactory?: ClaudeQueryFactory | undefined;
@@ -103,11 +102,10 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
 /**
  * The services of the workspaces the deployment offers, each made only where it offers them:
  * session filesystems (SessionSandboxes), through the sandbox gateway it gives alasio, and
- * folder workspaces' bayma (HostBayma), where it renders their template, on a KubeClient. They
- * are not among AlasioServices, which are always there; what uses them asks whether they are.
+ * folder workspaces' bayma (HostBayma), the gateway's folder instances, where it serves them.
+ * They are not among AlasioServices, which are always there; what uses them asks whether they are.
  */
-function workspaceServices({ kubeTemplates, sessionsGateway, stateDir, branch }: AlasioOptions): Layer.Layer<never, never, Store> {
-  const host = kubeTemplates?.host ?? null;
+function workspaceServices({ folders, sessionsGateway, stateDir, branch }: AlasioOptions): Layer.Layer<never, never, Store> {
   return Layer.mergeAll(
     sessionsGateway
       ? Layer.unwrap(Effect.gen(function*() {
@@ -116,7 +114,7 @@ function workspaceServices({ kubeTemplates, sessionsGateway, stateDir, branch }:
         return SessionSandboxes.layer({ gateway: sessionsGateway, stateDir, netModeOf: netModeIn(store), inherit });
       }))
       : Layer.empty,
-    host ? HostBayma.layer(host).pipe(Layer.provide(KubeClient.layer)) : Layer.empty,
+    sessionsGateway && folders ? HostBayma.layer(makeGatewayWorkspaces(sessionsGateway).folders) : Layer.empty,
   );
 }
 
@@ -128,16 +126,13 @@ const netModeIn = (store: Store["Service"]) => (volumeId: string): Effect.Effect
   );
 
 /**
- * The turns running, which hold the pods they run in busy (./kube/busy.ts) where alasio
- * runs in Kubernetes, as the deployment's templates say it does, on a KubeClient of their
- * own: its own, and its workspaces', in the namespaces the templates say; elsewhere they
- * hold none.
+ * The turns running, which hold alasio's own pod busy (./kube/busy.ts) where alasio runs in
+ * Kubernetes, on a KubeClient of their own; elsewhere they hold none. The pods its workspaces
+ * run in are the gateway's, which holds each busy as it is bound.
  */
-function activeTurns({ kubeTemplates }: AlasioOptions): Layer.Layer<ActiveTurns> {
-  if (!kubeTemplates) return ActiveTurns.layer;
-  // A session filesystem's pod is the gateway's, which holds it busy as it is bound.
-  const namespaces = [kubeTemplates.host?.namespace].filter((namespace) => namespace !== undefined);
-  return ActiveTurns.layer.pipe(Layer.provide(Layer.orDie(BusyPods.layer({ namespaces })).pipe(Layer.provide(KubeClient.layer))));
+function activeTurns({ inKubernetes }: AlasioOptions): Layer.Layer<ActiveTurns> {
+  if (!inKubernetes) return ActiveTurns.layer;
+  return ActiveTurns.layer.pipe(Layer.provide(Layer.orDie(BusyPods.layer({})).pipe(Layer.provide(KubeClient.layer))));
 }
 
 /**

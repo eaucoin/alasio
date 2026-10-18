@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { ALASIO_GATEWAY_CALLER_KEY_VARIABLE, ALASIO_GATEWAY_ENVIRONMENT_VARIABLE, ALASIO_GATEWAY_URL_VARIABLE } from "./gateway/names.ts";
+import { ALASIO_GATEWAY_CALLER_KEY_VARIABLE, ALASIO_GATEWAY_ENVIRONMENT_VARIABLE, ALASIO_GATEWAY_FOLDERS_VARIABLE, ALASIO_GATEWAY_URL_VARIABLE } from "./gateway/names.ts";
 import { getDefaultHarness, type HarnessName } from "./harness/names.ts";
 import { type WakeLog, wakeLogOf } from "./neon/lake-wake.ts";
 import type { GatewayWorkspacesOptions } from "./sandbox/gateway-client.ts";
@@ -35,6 +35,10 @@ export interface AlasioConfig {
    * gives none, and offers no session filesystems.
    */
   readonly sessionsGateway: GatewayWorkspacesOptions | null;
+  /** Whether the sandbox gateway serves folder workspaces' instances (src/gateway/folders.ts), as the deployment renders the host profile. */
+  readonly folders: boolean;
+  /** Whether alasio runs in a pod of Kubernetes, which it holds busy while a turn runs (src/kube/busy.ts). */
+  readonly inKubernetes: boolean;
 }
 
 /** A branch environment: its name, and where it asks its parent to fork the sessions it inherited, with the token it is given. */
@@ -82,6 +86,8 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
         callerKey: Buffer.from(requireEnv(env, ALASIO_GATEWAY_CALLER_KEY_VARIABLE).trim()),
       }
       : null,
+    folders: env[ALASIO_GATEWAY_FOLDERS_VARIABLE] === "1",
+    inKubernetes: Boolean(env["ALASIO_POD"]?.trim()),
   };
 }
 

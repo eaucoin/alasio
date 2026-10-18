@@ -6,7 +6,7 @@
  * alongside them.
  */
 import { withReplyInstructions } from "../harness/reply-instructions.ts";
-import type { BaymaEndpoint } from "../kube/sandboxes.ts";
+import type { BaymaEndpoint } from "../sandbox/gateway-client.ts";
 import { BAYMA_SERVER_NAME, BAYMA_STARTUP_TIMEOUT_MS } from "../mcp/bayma.ts";
 import { operatorDeveloperInstructions } from "./config-toml.ts";
 import { type CodexEnv, codexHome } from "./env.ts";

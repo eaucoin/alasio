@@ -1,14 +1,13 @@
 /**
- * What alasio may do beyond what RBAC can say: ValidatingAdmissionPolicies of the
- * cluster's, each matching what alasio's ServiceAccount asks (main's, or a branch
- * environment's), and holding it to what alasio up renders:
+ * What alasio's components may do beyond what RBAC can say: ValidatingAdmissionPolicies of
+ * the cluster's, each matching what one of their ServiceAccounts asks, and holding it to
+ * what alasio up renders:
  *
- * - a Sandbox alasio makes, or moves onto another pod template, is a folder's bayma's, made
- *   from the template of its namespace's, but for what alasio adds to each (src/kube/
- *   sandbox-shape.ts): RBAC lets it make Sandboxes of any pod, as any ServiceAccount, under
- *   any runtime;
- * - a Secret alasio makes is a Sandbox's token: RBAC lets it make Secrets of any type, a
- *   ServiceAccount's token among them;
+ * - a pod made in the folder namespace is a folder instance's, which the sandbox gateway
+ *   alone makes, of the folder template, but for what the gateway adds to each
+ *   (src/gateway/names.ts folderPodSpec), and a Secret the gateway makes there is an
+ *   instance's token: RBAC lets it make pods of any spec, as any ServiceAccount, under any
+ *   runtime, and Secrets of any type, a ServiceAccount's token among them;
  * - a pod alasio patches changes its busy label and annotations alone (src/kube/busy.ts),
  *   and in alasio's own namespace is alasio's own: RBAC lets it patch its namespaces'
  *   pods whole, their images among it;
@@ -22,32 +21,13 @@
  */
 import { posix } from "node:path";
 
-import type { KubernetesObject, V1Container, V1PodSpec, V1PodTemplateSpec, V1Volume } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Container, V1PodSpec, V1PodTemplateSpec } from "@kubernetes/client-node";
 
 import { BINDING_LABEL, FREE_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../../src/binder/names.ts";
 import { branchNamespace, branchSessionsNamespace } from "../../../src/branch/names.ts";
-import { ATTACH_VOLUME, ownDirectory, SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
+import { ATTACH_VOLUME, FOLDER_KEY_PREFIX, FOLDER_POOL, FOLDER_POD, folderPodSpec, folderTokenSecret, ownDirectory, SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
 import { BUSY_ANNOTATIONS, BUSY_LABEL } from "../../../src/kube/busy-label.ts";
-import type { HostProfile } from "../../../src/kube/config.ts";
-import {
-  BAYMA_CONTAINER,
-  HARNESS_LABEL,
-  MANAGED_BY,
-  RESTORE_ANNOTATION,
-  RESTORE_PAUSED_ANNOTATION,
-  RESUMED_CONDITION,
-  SANDBOX_LABEL,
-  SNAPSHOT_CACHE_DIR,
-  SNAPSHOT_ID,
-  STATE_DIR_ARG,
-  TOKEN_DIR,
-  TOKEN_FILE_ARGS,
-  TOKEN_KEY,
-  TOKEN_MODE,
-  TOKEN_VOLUME,
-  tokenSecretName,
-  WORKLOAD_LABEL,
-} from "../../../src/kube/sandbox-shape.ts";
+import { RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SNAPSHOT_CACHE_DIR, SNAPSHOT_ID } from "../../../src/kube/sandbox-shape.ts";
 import { ATTACH_ROOT, RESTORE_POD } from "../../../src/node-agent/names.ts";
 import { componentName, labels, NAMESPACE, neonName, RELEASE } from "./common.ts";
 
@@ -72,16 +52,6 @@ const matching = (pattern: string) => new Check((expression) => `type(${expressi
 const sameAs = (value: string) => new Check((expression) => `${expression} == ${value}`);
 /** Any of `alternatives`. */
 const oneOf = (...alternatives: Pinned[]) => new Check((expression, depth) => `(${alternatives.map((each) => pinned(expression, each, depth)).join(" || ")})`);
-/** A list of `first`, then any number of items each `rest`. */
-const startingWith = (first: readonly Pinned[], rest: Pinned) =>
-  new Check((expression, depth) => {
-    const item = `item${depth}`;
-    return [
-      `size(${expression}) >= ${first.length}`,
-      ...first.map((each, index) => pinned(`${expression}[${index}]`, each, depth + 1)),
-      `${expression}.all(${item}, ${[...first, rest].map((each) => pinned(item, each, depth + 1)).join(" || ")})`,
-    ].join(" && ");
-  });
 /** Of a map's key: that it may be absent; where present, `value`. */
 class Optional extends Check {
   readonly value: Pinned;
@@ -237,58 +207,14 @@ export function computeRestartPolicy(): KubernetesObject[] {
   ]);
 }
 
-/** A container of a Sandbox's pod template as its CRD stores it: its ports' protocol defaulted. */
-const stored = (container: PinnedMap): PinnedMap => {
-  const ports = container["ports"];
-  return Array.isArray(ports) ? { ...container, ports: ports.map((port: PinnedMap) => defaulted(port, { protocol: "TCP" })) } : container;
-};
-
-/** The token Secret of the Sandbox asked about, as CEL. */
-const OWN_TOKEN = sameAs(`object.metadata.name + ${JSON.stringify(tokenSecretName(""))}`);
-
 /** A path segment as sanitizePathToken makes one. */
 const PATH_TOKEN = "[A-Za-z0-9_][A-Za-z0-9_.-]*";
 
 /** `text`, as a pattern that matches it alone. */
 const literally = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 
-/** A variable of the environment, set to a string. */
-const SET: Pinned = { name: ANY_STRING, value: ANY_STRING };
-
 /** A node's name: a DNS subdomain. */
 const NODE_NAME = "[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?";
-
-/**
- * The Sandbox of a folder's bayma alasio makes from `host`, its profile, with its state
- * root, as sandboxManifest and hostBaymaManifest make it: its template's, its token
- * mounted and its state directory under the state root, labelled its harness's.
- */
-function sandboxOf(host: HostProfile): Pinned {
-  const podTemplate: V1PodTemplateSpec = host.podTemplate as V1PodTemplateSpec;
-  const spec: V1PodSpec = podTemplate.spec ?? { containers: [] };
-  const tokenMount = { name: TOKEN_VOLUME, mountPath: TOKEN_DIR, readOnly: true };
-  // Under the state root as hostBaymaStateDir joins it: normalized, its one slash after it.
-  const stateDir = [STATE_DIR_ARG, matching(`${literally(posix.join(host.stateRoot, "/"))}${PATH_TOKEN}/${PATH_TOKEN}`)];
-  const container = (each: V1Container): Pinned =>
-    stored(
-      (each.name !== BAYMA_CONTAINER ? each : {
-        ...each,
-        args: [...(each.args ?? []), ...TOKEN_FILE_ARGS, ...stateDir],
-        volumeMounts: [...(each.volumeMounts ?? []), tokenMount],
-        env: optional(startingWith((each.env ?? []) as unknown as Pinned[], SET)),
-      }) as unknown as PinnedMap,
-    );
-  const initContainers = ((spec.initContainers ?? []) as unknown as PinnedMap[]).map(stored);
-  const volumes: Pinned[] = [...((spec.volumes ?? []) as V1Volume[] as unknown as Pinned[]), { name: TOKEN_VOLUME, secret: { secretName: OWN_TOKEN, defaultMode: TOKEN_MODE } }];
-  const own = { ...MANAGED_BY, [SANDBOX_LABEL]: sameAs("object.metadata.name"), [WORKLOAD_LABEL]: "folder", [HARNESS_LABEL]: matching(PATH_TOKEN) };
-  const podSpec = { ...spec, containers: spec.containers.map(container), ...(initContainers.length > 0 ? { initContainers } : {}), volumes };
-  // Its CRD defaults what is done with it at its shutdown time, which alasio gives none.
-  return defaulted({
-    operatingMode: oneOf("Running", "Suspended"),
-    service: true,
-    podTemplate: { ...podTemplate, metadata: { ...podTemplate.metadata, labels: { ...podTemplate.metadata?.labels, ...own } }, spec: podSpec },
-  } as unknown as PinnedMap, { shutdownPolicy: "Retain" });
-}
 
 /** Any number. */
 const ANY_NUMBER = new Check((expression) => `type(${expression}) == int || type(${expression}) == double`);
@@ -503,22 +429,140 @@ export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sess
   return [policy, binding];
 }
 
-/** The name of the Sandbox policy of the alasio of the namespace `namespace`. */
-export const sandboxPolicyName = (namespace: string): string => `${namespace}-sandboxes`;
+/** The folder pods' policy, which holds every pod of the folder namespace to the folder template (folderPodPolicy). */
+export const FOLDER_POD_POLICY = "alasio-folder-pods";
+
+/** What stands for a folder instance's pod's own name, and its state directory, in its spec as folderPodSpec makes it, which the policy pins by what they must be. */
+const POD_NAME = "\u0000pod";
+const STATE_DIR = "\u0000state-dir";
 
 /**
- * What alasio may make as a Sandbox, by `account`, the ServiceAccount of the alasio of
- * `name`: a folder's bayma's from `host`, in its namespace, and nothing where there is no
- * host profile. A Sandbox moved onto no other pod template, as alasio suspends and resumes
- * it, is left as it was made.
+ * The spec `spec` of a folder instance's pod, as the API server stores it: as a pool's pod's
+ * (poolPodSpec), and what the API server gives a pod that the folder template, unlike the
+ * pools', leaves out: its DNS policy, its Service links, and each of the machine's paths'
+ * type where its mount names none.
  */
-export function sandboxPolicy(name: string, account: string, host: HostProfile | null): KubernetesObject[] {
-  const made = host ? `(request.namespace == ${JSON.stringify(host.namespace)} && variables.host)` : "false";
-  const unmoved = "request.operation == \"UPDATE\" && object.spec.podTemplate == oldObject.spec.podTemplate && " +
-    "object.spec.?volumeClaimTemplates.orValue([]) == oldObject.spec.?volumeClaimTemplates.orValue([])";
-  return admissionPolicy(name, [{ apiGroups: ["agents.x-k8s.io"], resources: ["sandboxes"], operations: ["CREATE", "UPDATE"] }], `request.userInfo.username == "${account}"`, [
-    { expression: `${unmoved} || ${made}`, message: "alasio makes no Sandbox but from its folder workspaces' template, as alasio up renders it" },
-  ], host ? [{ name: "host", expression: pinned("object.spec", sandboxOf(host)) }] : []);
+function folderPodPinned(spec: V1PodSpec): Pinned {
+  const { map, defaults } = folderPodParts(spec);
+  return defaulted(map, defaults);
+}
+
+/** folderPodPinned's map and the defaults it is pinned with. */
+export function folderPodParts(spec: V1PodSpec): { readonly map: PinnedMap; readonly defaults: Readonly<Record<string, Pinned>> } {
+  const tolerations = (spec.tolerations ?? []) as unknown as Pinned[];
+  const volumes = (spec.volumes ?? []).map((volume) =>
+    volume.hostPath && volume.hostPath.type === undefined ? { ...(volume as unknown as PinnedMap), hostPath: defaulted(volume.hostPath as unknown as PinnedMap, { type: "" }) } : volume
+  ) as unknown as Pinned[];
+  return {
+    map: {
+      ...(spec as unknown as PinnedMap),
+      containers: spec.containers.map(poolContainer),
+      ...(spec.volumes ? { volumes } : {}),
+      tolerations: oneOf([...tolerations, ...DEFAULT_TOLERATIONS], [...tolerations, ...[...DEFAULT_TOLERATIONS].reverse()]),
+    },
+    defaults: {
+      ...POOL_POD_DEFAULTS.pod,
+      // The account the template names, as the API server copies it to the field it deprecated.
+      ...(spec.serviceAccountName ? { serviceAccountName: spec.serviceAccountName, serviceAccount: spec.serviceAccountName } : {}),
+      dnsPolicy: "ClusterFirst",
+      enableServiceLinks: true,
+    },
+  };
+}
+
+/** `value`, each string of it `stands` names the Check of, as that Check. */
+function standingFor(value: Pinned, stands: Readonly<Record<string, Check>>): Pinned {
+  if (typeof value === "string") return stands[value] ?? value;
+  if (value instanceof Check || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item: Pinned) => standingFor(item, stands));
+  return Object.fromEntries(Object.entries(value as PinnedMap).map(([key, item]) => [key, item === undefined ? undefined : standingFor(item, stands)]));
+}
+
+/**
+ * Every pod of the folder namespace, `namespace`, made or changed by anyone, held to what the
+ * folder template, `template`, makes (src/gateway/folders.ts): a folder instance's pod is the
+ * operator's, of the machine's own mounts and the capabilities bayma's process snapshots need,
+ * which no Pod Security level but privileged allows, as the namespace enforces, so this policy
+ * is its boundary.
+ *
+ * - A pod made is made by `maker`, the gateway, alone, and is the template's, as the API server
+ *   stores it (poolPodSpec), with what folderPodSpec adds, alone: its token's Secret, named for
+ *   it, and its state directory under `stateRoot`, of a harness's and a conversation's names;
+ *   bound from the first, to a folder instance's key, its node kept; and named as one.
+ * - A pod changed keeps its spec, its labels, and its owners, and of its annotations changes
+ *   those that keep its node alone.
+ * - No pod gets an ephemeral container.
+ *
+ * It fails closed: where it cannot say, the API server refuses.
+ */
+export function folderPodPolicy(template: V1PodTemplateSpec, { namespace, maker, stateRoot }: { readonly namespace: string; readonly maker: string; readonly stateRoot: string }): KubernetesObject[] {
+  const metadata = { name: FOLDER_POD_POLICY, labels: labels("folder-bayma") };
+  // The spec as folderPodSpec makes it, its own name's and state directory's places standing for what they must be, then pinned.
+  const spec = folderPodPinned(standingFor(folderPodSpec(template.spec ?? { containers: [] }, POD_NAME, STATE_DIR) as unknown as Pinned, {
+    [folderTokenSecret(POD_NAME)]: sameAs(`object.metadata.name + ${JSON.stringify(folderTokenSecret(""))}`),
+    [STATE_DIR]: matching(`${literally(posix.join(stateRoot, "/"))}${PATH_TOKEN}/${PATH_TOKEN}`),
+  }) as unknown as V1PodSpec);
+  const podLabels = { ...(template.metadata?.labels ?? {}), [POOL_LABEL]: FOLDER_POOL, [BINDING_LABEL]: matching("[0-9a-f]{40}") } as PinnedMap;
+  const podAnnotations = {
+    ...(template.metadata?.annotations ?? {}),
+    [KEY_ANNOTATION]: matching(`${literally(FOLDER_KEY_PREFIX)}[a-z][a-z0-9-]{0,30}:.{1,512}`),
+    ...BUSY_ANNOTATIONS,
+    vpaObservedContainers: optional(ANY_STRING),
+    vpaUpdates: optional(ANY_STRING),
+  } as PinnedMap;
+  const policy = {
+    apiVersion: "admissionregistration.k8s.io/v1",
+    kind: "ValidatingAdmissionPolicy",
+    metadata,
+    spec: {
+      failurePolicy: "Fail",
+      matchConstraints: {
+        resourceRules: [
+          { apiGroups: [""], apiVersions: ["*"], resources: ["pods"], operations: ["CREATE", "UPDATE"] },
+          { apiGroups: [""], apiVersions: ["*"], resources: ["pods/ephemeralcontainers"], operations: ["CREATE", "UPDATE"] },
+        ],
+      },
+      matchConditions: [{ name: "of-folders", expression: `request.namespace == ${JSON.stringify(namespace)}` }],
+      variables: [
+        { name: "oldAnnotations", expression: "request.operation == 'UPDATE' ? oldObject.metadata.?annotations.orValue({}) : {}" },
+        { name: "newAnnotations", expression: "object.metadata.?annotations.orValue({})" },
+        // Each pin a variable of its own, as CEL holds each expression to 100,000 code points.
+        { name: "folderSpec", expression: pinned("object.spec", spec) },
+        { name: "folderLabels", expression: pinned("object.metadata.?labels.orValue({})", podLabels) },
+        { name: "folderAnnotations", expression: pinned("object.metadata.?annotations.orValue({})", podAnnotations) },
+      ],
+      validations: [
+        { expression: "request.?subResource.orValue('') != 'ephemeralcontainers'", message: "no pod of the folder namespace gets an ephemeral container" },
+        { expression: `request.operation != 'CREATE' || request.userInfo.username == ${JSON.stringify(maker)}`, message: "no pod is made in the folder namespace but by the sandbox gateway" },
+        { expression: `request.operation != 'CREATE' || object.metadata.name.matches(${JSON.stringify(FOLDER_POD.source)})`, message: "a pod made in the folder namespace is named as a folder instance's" },
+        { expression: "request.operation != 'CREATE' || variables.folderSpec", message: "a pod made in the folder namespace is a folder instance's, of the folder template, as alasio up renders it" },
+        { expression: "request.operation != 'CREATE' || variables.folderLabels", message: "a pod made in the folder namespace is labelled as a folder instance bound" },
+        { expression: "request.operation != 'CREATE' || variables.folderAnnotations", message: "a pod made in the folder namespace is annotated with a folder instance's key, its node kept" },
+        { expression: "request.operation != 'UPDATE' || object.spec == oldObject.spec", message: "no pod's spec changes in the folder namespace" },
+        { expression: "request.operation != 'UPDATE' || object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({})", message: "no pod's labels change in the folder namespace" },
+        {
+          expression: `request.operation != 'UPDATE' || (${unchanged("Annotations", Object.keys(BUSY_ANNOTATIONS))})`,
+          message: "no annotation of a folder instance's pod changes but what keeps its node",
+        },
+        {
+          expression: "request.operation != 'UPDATE' || object.metadata.?ownerReferences.orValue([]).all(owner, owner in oldObject.metadata.?ownerReferences.orValue([]))",
+          message: "a pod of the folder namespace gets no owner it had not",
+        },
+      ],
+    },
+  };
+  const binding = { apiVersion: "admissionregistration.k8s.io/v1", kind: "ValidatingAdmissionPolicyBinding", metadata, spec: { policyName: FOLDER_POD_POLICY, validationActions: ["Deny"] } };
+  return [policy, binding];
+}
+
+/** What the sandbox gateway, `maker`, may make as a Secret in the folder namespace, `namespace`: a folder instance's token, of its one key, named for its pod. */
+export function folderSecretPolicy({ namespace, maker }: { readonly namespace: string; readonly maker: string }): KubernetesObject[] {
+  return admissionPolicy(componentName("folder-secrets"), [{ apiGroups: [""], resources: ["secrets"], operations: ["CREATE", "UPDATE"] }], `request.userInfo.username == ${JSON.stringify(maker)}`, [{
+    expression: `request.namespace == ${JSON.stringify(namespace)} && object.?type.orValue("Opaque") == "Opaque" && ` +
+      `object.metadata.name.matches(${JSON.stringify(`^${FOLDER_POD.source.slice(1, -1)}${literally(folderTokenSecret(""))}$`)}) && ` +
+      `object.?data.orValue({}).all(key, key == "token")`,
+    message: "the sandbox gateway makes no Secret but a folder instance's token, in the folder namespace",
+  }]);
 }
 
 /**
@@ -571,13 +615,4 @@ export function resumedConditionPolicy(name: string, account: string, namespace:
       message: "the sandbox gateway changes nothing of a pod's status but its conditions, nor its labels or annotations",
     },
   ]);
-}
-
-/** What alasio may make as a Secret: a Sandbox's token, of its one key, as tokenSecretManifest makes it. Main's alasio's and each branch environment's. */
-export function secretPolicy(): KubernetesObject[] {
-  return admissionPolicy(componentName("secrets"), [{ apiGroups: [""], resources: ["secrets"], operations: ["CREATE", "UPDATE"] }], BY_ANY_ALASIO, [{
-    expression: `object.?type.orValue("Opaque") == "Opaque" && object.metadata.name.endsWith(${JSON.stringify(tokenSecretName(""))}) && ` +
-      `object.?data.orValue({}).all(key, key == ${JSON.stringify(TOKEN_KEY)})`,
-    message: "alasio makes no Secret but a Sandbox's token",
-  }]);
 }

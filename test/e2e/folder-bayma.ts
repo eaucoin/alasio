@@ -1,7 +1,8 @@
 /**
  * Run inside alasio's pod, by node there (inAlasio in alasio.test.ts): a folder
- * conversation's bayma through alasio's own code, as the host profile makes it, with a
- * file written through it to the operator's home. Prints one JSON line of what it saw.
+ * conversation's bayma through alasio's own code, its instance bound through the sandbox
+ * gateway as a turn binds it, with a file written through it to the operator's home.
+ * Prints one JSON line of what it saw.
  *
  * alasio's modules are imported by their paths in the repository, which inAlasio in
  * alasio.test.ts rewrites to the image's as it pipes this in.
@@ -13,9 +14,9 @@ import type { CallToolResult, ContentBlock } from "@modelcontextprotocol/sdk/typ
 
 import { Effect } from "effect";
 
-import { KubeClient } from "../../src/kube/client.ts";
-import { loadKubeTemplates } from "../../src/kube/config.ts";
+import { loadAlasioConfig } from "../../src/config.ts";
 import { HostBayma } from "../../src/mcp/bayma.ts";
+import { makeGatewayWorkspaces } from "../../src/sandbox/gateway-client.ts";
 import type { BaymaExecResult, BaymaSessionCreated } from "./session-roundtrip.ts";
 
 /** What the folder's bayma saw, as the last line prints it. */
@@ -30,14 +31,12 @@ function text(part: ContentBlock | undefined): string {
   return part.text;
 }
 
-const bayma = await Effect.runPromise(Effect.gen(function*() {
-  const { host } = yield* loadKubeTemplates;
-  if (!host) return yield* Effect.die(new Error("the installation gives no host template"));
-  return yield* HostBayma.pipe(
-    Effect.flatMap((hostBayma) => hostBayma.ensure({ harness: "claude", threadKey: "e2e:folder" })),
-    Effect.provide(HostBayma.layer(host)),
-  );
-}).pipe(Effect.provide(KubeClient.layer)));
+const { sessionsGateway, folders } = loadAlasioConfig();
+if (!sessionsGateway || !folders) throw new Error("alasio is given no sandbox gateway that serves folder instances");
+const bayma = await Effect.runPromise(HostBayma.pipe(
+  Effect.flatMap((hostBayma) => hostBayma.ensure({ harness: "claude", threadKey: "e2e:folder" })),
+  Effect.provide(HostBayma.layer(makeGatewayWorkspaces(sessionsGateway).folders)),
+));
 const client = new Client({ name: "alasio-e2e", version: "1.0.0" });
 // The transport is one; the SDK declares its sessionId `string | undefined` where Transport has it optional.
 await client.connect(new StreamableHTTPClientTransport(new URL(bayma.url), { requestInit: { headers: bayma.headers } }) as Transport);

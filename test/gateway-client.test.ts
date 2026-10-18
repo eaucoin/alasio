@@ -105,3 +105,20 @@ test("a bind asked ahead is asked again while the gateway's pool has no pod for 
   const failed = await refused(elsewhere.workspaces.bind("fs-abc123", "none"));
   assert.deepEqual([failed.status, failed.reason, elsewhere.asked.length], [403, "there is no environment try of sessions", 1]);
 });
+
+test("a folder conversation's instance is reached, bound and released through the gateway by a caller's token of its folder key, of its environment alone", async (t) => {
+  let binds = 0;
+  const { asked, workspaces } = await gateway(t, ({ url }) => (url === "/bind" && (binds += 1) === 1 ? { status: 503, body: JSON.stringify({ error: "no pod yet" }) } : { status: 204 }));
+  const scope = { harness: "claude", threadKey: "telegram:42" };
+  const endpoint = await run(workspaces.folders.endpoint(scope));
+  const claims = verifyToken(environmentKey(master, "try"), String(endpoint.headers["Authorization"]).replace(/^Bearer /u, ""), Date.now());
+  assert.deepEqual({ ...claims, expires: undefined }, { key: "folder:claude:telegram:42", expires: undefined, options: { environment: "try" } });
+  // Asked again while the gateway has no pod for it.
+  await run(workspaces.folders.bind(scope));
+  await run(workspaces.folders.release(scope));
+  assert.deepEqual(asked.map(({ method, url, claims: of }) => `${method} ${url} ${of?.key}`), [
+    "POST /bind folder:claude:telegram:42",
+    "POST /bind folder:claude:telegram:42",
+    "POST /release folder:claude:telegram:42",
+  ]);
+});

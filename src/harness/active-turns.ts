@@ -10,7 +10,7 @@
  */
 import { Context, Deferred, Effect, HashMap, Layer, Option, Ref, Schedule, type Scope } from "effect";
 
-import { BusyPods, type PodRef } from "../kube/busy.ts";
+import { BusyPods } from "../kube/busy.ts";
 import type { HarnessError } from "./index.ts";
 
 /** Why the operator stops a running turn: /stop (or a panel's Stop), or a swerve to the prompt that came in meanwhile. */
@@ -34,8 +34,6 @@ export interface RunningTurn {
 export interface RegisterOptions {
   /** Registers the turn only if its conversation is not busy; otherwise the registration is a no-op. */
   readonly onlyIfIdle?: boolean | undefined;
-  /** The pod the turn works in, its workspace's: held busy while the turn runs, with alasio's own. */
-  readonly workspace?: PodRef | null | undefined;
 }
 
 /** How often a stop of a turn reserved, whose harness has not registered it yet, looks again. */
@@ -53,15 +51,15 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
    * Registers `turn` as `conversationId`'s running turn until the scope closes, over any
    * registered or reserved before it, which is the conversation's turn again once it
    * closes: whether it registered it, which it does unless `onlyIfIdle` and the
-   * conversation is busy. A turn registered holds its pods busy (BusyPods) for as long.
+   * conversation is busy. A turn registered holds alasio's pod busy (BusyPods) for as long.
    */
   readonly register: (conversationId: string, turn: RunningTurn, options?: RegisterOptions) => Effect.Effect<boolean, never, Scope.Scope>;
   /**
    * Registers `turn` as `conversationId`'s running turn until the scope closes, once the
-   * conversation is not busy, waiting for it as long as it is, its pods held busy as
-   * register holds them.
+   * conversation is not busy, waiting for it as long as it is, alasio's pod held busy as
+   * register holds it.
    */
-  readonly registerWhenIdle: (conversationId: string, turn: RunningTurn, options?: Omit<RegisterOptions, "onlyIfIdle">) => Effect.Effect<void, never, Scope.Scope>;
+  readonly registerWhenIdle: (conversationId: string, turn: RunningTurn) => Effect.Effect<void, never, Scope.Scope>;
   /** The conversation's running turn, if it has one. */
   readonly get: (conversationId: string) => Effect.Effect<Option.Option<RunningTurn>>;
   /**
@@ -87,8 +85,7 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
     const released = yield* Ref.make(yield* Deferred.make<void>());
     const letGo = Effect.flatMap(Deferred.make<void>(), (next) => Effect.flatMap(Ref.getAndSet(released, next), (done) => Deferred.succeed(done, undefined)));
     const busy = yield* Effect.serviceOption(BusyPods);
-    const holdBusy = (workspace: PodRef | null): Effect.Effect<void, never, Scope.Scope> =>
-      Option.match(busy, { onNone: () => Effect.void, onSome: (pods) => pods.hold(workspace) });
+    const holdBusy: Effect.Effect<void, never, Scope.Scope> = Option.match(busy, { onNone: () => Effect.void, onSome: (pods) => pods.hold });
 
     /**
      * Puts `turn` over the turns of each of the conversations until the scope closes, all
@@ -118,7 +115,7 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
 
     const register = (conversationId: string, turn: RunningTurn, options?: RegisterOptions): Effect.Effect<boolean, never, Scope.Scope> =>
       push([conversationId], turn, options?.onlyIfIdle ?? false).pipe(
-        Effect.tap((registered) => (registered ? holdBusy(options?.workspace ?? null) : Effect.void)),
+        Effect.tap((registered) => (registered ? holdBusy : Effect.void)),
       );
 
     return ActiveTurns.of({
@@ -149,12 +146,12 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
           return held;
         }),
       register,
-      registerWhenIdle: (conversationId, turn, options) =>
+      registerWhenIdle: (conversationId, turn) =>
         Effect.gen(function*() {
           for (;;) {
             // Read before the try, so a turn letting go after it is not missed.
             const free = yield* Ref.get(released);
-            if (yield* register(conversationId, turn, { ...options, onlyIfIdle: true })) return;
+            if (yield* register(conversationId, turn, { onlyIfIdle: true })) return;
             yield* Deferred.await(free);
           }
         }),
