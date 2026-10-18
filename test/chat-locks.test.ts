@@ -9,9 +9,10 @@ import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import type { Update } from "@grammyjs/types";
-import { Deferred, Duration, Effect, Exit, Fiber, Option } from "effect";
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Option } from "effect";
 import pg from "pg";
 
+import { poolDatabase } from "../src/persistence/sql.ts";
 import { LOCKED_STATEMENT_TIMEOUT, Store } from "../src/persistence/store.ts";
 import { holdChatLock, lockHolder, newSchema, testDatabaseUrl, testPool, testStore } from "./support/store.ts";
 
@@ -83,6 +84,22 @@ test("a delivery waiting for a connection of a pool that has none to give is sto
   } finally {
     await pool.end();
   }
+});
+
+test("a connection that comes just as its transaction is stopped is given back once, whatever ran with it", async () => {
+  let released = 0;
+  const client = { query: async () => ({ rows: [] }), release: () => void (released += 1) } as unknown as pg.PoolClient;
+  let transaction: Fiber.Fiber<unknown, unknown> | undefined;
+  let come: (() => void) | undefined;
+  // A pool whose connection comes when the test says, the transaction stopped as it does.
+  const pool = { connect: () => ({ then: (connected: (made: pg.PoolClient) => void) => void (come = () => (connected(client), transaction?.interruptUnsafe())) }) } as unknown as pg.Pool;
+  transaction = Effect.runFork(poolDatabase(pool).guardedTransaction(() => Effect.succeed(true), () => Effect.void));
+  while (!come) await sleep(5);
+  come();
+  const stopped = await Effect.runPromise(Fiber.await(transaction));
+  assert.ok(Exit.isFailure(stopped) && Cause.hasInterruptsOnly(stopped.cause));
+  await sleep(50);
+  assert.equal(released, 1);
 });
 
 test("a delivery whose mark is stuck behind a lock no one lets go of ends as its lock's statements are bounded, rather than holding the delivery", { timeout: 30_000 }, async () => {
