@@ -86,6 +86,8 @@ export type CodexItem =
 /** A question an agent asks the user through a tool, as the tool's arguments carry it. */
 export interface AskedQuestion {
   readonly header?: string;
+  /** The tool's own fields beyond its header, as it gives them. */
+  readonly [field: string]: unknown;
 }
 
 const ERROR_PREFIX = "Error: ";

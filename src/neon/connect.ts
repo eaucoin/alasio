@@ -137,6 +137,20 @@ const writtenOn = (pool: Pool, wake: LakeWake["Service"]): (() => void) => () =>
     return row.lsn;
   });
 
+/** A pool of connections to `databaseUrl`, whose idle connections lost are said with `onIdleError`. */
+function poolOf(databaseUrl: Redacted.Redacted, onIdleError: (error: Error) => void): Pool {
+  const pool = new pg.Pool({
+    connectionString: Redacted.value(databaseUrl),
+    max: 8,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
+  });
+  // An idle connection dies with the compute when it restarts; the pool
+  // replaces it on the next checkout.
+  pool.on("error", onIdleError);
+  return pool;
+}
+
 /**
  * Connects to a Neon that is already up and makes what alasio keeps in it: the session
  * and rollout stores' schemas, the lake's role and reads, and the lake reader's and
@@ -149,15 +163,7 @@ const openNeon = Effect.fnUntraced(function*(
   onIdleError: (error: Error) => void,
   wake: LakeWake["Service"],
 ): Effect.fn.Return<OpenNeon, NeonUnavailable> {
-  const pool = new pg.Pool({
-    connectionString: Redacted.value(databaseUrl),
-    max: 8,
-    idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
-  });
-  // An idle connection dies with the compute when it restarts; the pool
-  // replaces it on the next checkout.
-  pool.on("error", onIdleError);
+  const pool = poolOf(databaseUrl, onIdleError);
   const written = writtenOn(pool, wake);
   const sessionStore = new NeonSessionStore(pool, { written });
   const rollouts = new NeonRolloutStore(pool, { written });
@@ -238,3 +244,39 @@ const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope | LakeWak
  * files, and `lake` says whether the analytics lake runs.
  */
 export class Neon extends Context.Service<Neon, ConnectedNeon>()("alasio/neon/Neon", { make: connectNeon }) {}
+/** The harness host's connection to alasio's Neon: its pool, and the stores of Claude Code's transcripts and Codex's rollouts, which alasio made. */
+export interface HarnessNeonStores extends OpenNeon {
+  /** The session-filesystem Codex home's rollout store. */
+  readonly sessionFsRollouts: NeonRolloutStore;
+}
+
+/**
+ * Connects to the Neon the deployment provides as the harness host's role
+ * (`ALASIO_DATABASE_URL`, or its `_FILE` form), until the scope closes, waiting for it as
+ * alasio does; it makes nothing there, which alasio has made, and may not.
+ */
+const connectHarnessNeon: Effect.Effect<HarnessNeonStores, NeonError, Scope.Scope | LakeWake> = Effect.gen(function*() {
+  const databaseUrl = yield* deploymentSecret("ALASIO_DATABASE_URL");
+  const wake = yield* LakeWake;
+  const runFork = yield* FiberSet.makeRuntime();
+  const pool = yield* Effect.acquireRelease(
+    Effect.sync(() => poolOf(databaseUrl, (error) => void runFork(Effect.logWarning(`idle database connection lost: ${error.message}`)))),
+    (made) => Effect.promise(() => made.end()),
+  );
+  yield* onNeon(() => pool.query("select 1")).pipe(
+    Effect.retry(whileNeonStarts),
+    withAlasioSpan("alasio.neon.connect"),
+    Effect.interruptible,
+  );
+  yield* Effect.logInfo("connected to Neon");
+  const written = writtenOn(pool, wake);
+  return {
+    pool,
+    sessionStore: new NeonSessionStore(pool, { written }),
+    rollouts: new NeonRolloutStore(pool, { written }),
+    sessionFsRollouts: new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA, written }),
+  };
+}).pipe(withLogScope("neon"));
+
+/** The harness host's connection to alasio's Neon, open while the scope `HarnessNeon.make` is run in lasts. */
+export class HarnessNeon extends Context.Service<HarnessNeon, HarnessNeonStores>()("alasio/neon/HarnessNeon", { make: connectHarnessNeon }) {}
