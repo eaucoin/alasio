@@ -42,7 +42,10 @@
  * eviction: `kubectl drain` refuses a node holding one but with --force, and then waits for
  * the binding's release, as it idles, into its snapshot, which the session's next bind
  * restores on another node. A bound pod deleted outright, not evicted, is saved as its bayma
- * holds its stop (drain, below).
+ * holds its stop (drain, below). A lock a workspace's file held through the mount of a node
+ * that died holds for up to about seven minutes, until workspace storage cleans the sessions
+ * of its clients that died (cli/src/manifests/workspace-storage.ts staleSessions), and blocks
+ * the workspace restored elsewhere until then.
  *
  * Its metrics: how long each attach and detach took (ATTACH_DURATION, DETACH_DURATION), and
  * each binding released, by why (RELEASES): `idle`, released by its sweep; `asked`, by its

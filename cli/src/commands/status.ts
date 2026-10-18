@@ -424,7 +424,8 @@ export const status = Command.make("status", {}, () =>
         "waiting for a pod, as the sandbox gateway counts them; a bound pod is its pool's no more, so a node that holds one is drained only by " +
         "`kubectl drain --force`, which refuses it at once without --force, and whose eviction of it the bound pods' disruption budget refuses " +
         "while it is bound: the drain waits until the gateway releases the session, idle, into its snapshot, which its next bind restores on " +
-        "another node), waking (a compute or the loader whose pod starts, within " +
+        "another node; a lock a workspace's file held on a node that died, through that node's mount, holds for up to about seven minutes, " +
+        "until workspace storage cleans the sessions of its clients that died), waking (a compute or the loader whose pod starts, within " +
         "its Deployment's progress deadline), or what it is at and " +
         "why; its replicas, and its scale where KEDA moves it; and its pods' requests, beside " +
         "what VPA recommends once it has measured them; where sessions are snapshotted, the CPU baseline they are held to, and the nodes that lack it, and the gVisor releases kept, with the snapshots naming each. Of the bundled object store, the copies it keeps of each object, and of each " +
