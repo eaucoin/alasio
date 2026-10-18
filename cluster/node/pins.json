@@ -12,6 +12,10 @@
     "restoresFromBucketSince": "20260921.0-eaucoin.7",
     "releases": [
       {
+        "release": "20260921.0-eaucoin.9",
+        "sha512": "6afee5acd65536923f2ecf9a391fc4ea058834df5da4510361b47bfea4abf101a655997b0ff8ac42d30c951bf998a21251c8230173af1d6847be69741b684c76"
+      },
+      {
         "release": "20260921.0-eaucoin.8",
         "sha512": "5091e17365e49328af3f6fd79211ac645699db8cb4f39d940a2d140980dc6f9b11f1ff89944e1723c06a759617b8083d2de8d16ce848945a7f300ef8724db48b"
       },
