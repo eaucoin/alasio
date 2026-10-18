@@ -14,9 +14,9 @@
  *   `peers` names them; asked without a token, as KEDA's metrics-api trigger asks.
  * - `GET /waiting/<namespace>/<pool>`: `{ waiting }`, this replica's alone, as its peers ask.
  * - `GET /healthz`: 200 once it serves, asked without a token.
- * - `/workspace` and what is under it: what the front answers itself of the token's key,
- *   beyond binding it, as `operate` says, such as the files of what the key binds; its body
- *   of MAX_OPERATION_BYTES at most (413 past it).
+ * - `/workspace` and `/snapshots`, and what is under them: what the front answers itself of
+ *   the token's key, beyond binding it, or of its caller, as `operate` says, such as the files
+ *   of what the key binds; its body of MAX_OPERATION_BYTES at most (413 past it).
  * - anything else: passed to the pod the token's key is bound to, the key bound first where
  *   it is not (./proxy.ts), but for a request that says it must bind nothing (NO_BIND_HEADER
  *   `never`), as one that reads what a binding has, answered 409 `{ "bound": false }` where the
@@ -47,7 +47,10 @@ import { bindingToken, type TokenClaims, verifyToken } from "./tokens.ts";
 /** The most a request the front answers itself may carry: a file of a workspace's, as its node agent writes one, with room. */
 export const MAX_OPERATION_BYTES = 64 * 1024 ** 2;
 
-/** A caller's request the front answers itself (`operate`): its method, its path, under /workspace, its query, and its body. */
+/** The paths of the requests the front answers itself (`operate`): /workspace and /snapshots, and what is under them. */
+const OPERATED = /^\/(workspace|snapshots)(\/|$)/u;
+
+/** A caller's request the front answers itself (`operate`): its method, its path, under /workspace or /snapshots, its query, and its body. */
 export interface Operation {
   readonly method: string;
   readonly path: string;
@@ -97,7 +100,7 @@ export interface BinderServerOptions {
   readonly poolOf: (key: string, options: Readonly<Record<string, string>>) => Effect.Effect<Placement, PlacementRefused>;
   /** The addresses (`host:port`) of the binder's other replicas. */
   readonly peers?: () => Effect.Effect<readonly string[]>;
-  /** What the front answers itself of a caller's key, as its token says it, under /workspace; none where it answers nothing of it. */
+  /** What the front answers itself of a caller's key, or its caller, as its token says them, under /workspace and /snapshots; none where it answers nothing. */
   readonly operate?: (claims: TokenClaims, operation: Operation) => Effect.Effect<Answer>;
 }
 
@@ -193,7 +196,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       if (!claims || claims.expires === undefined || claims.binding !== undefined) return answer(outgoing, 401, { error: "no caller's token" });
       const { key } = claims;
       const [path = "", search = ""] = url.split("?", 2);
-      if (operate && (path === "/workspace" || path.startsWith("/workspace/"))) {
+      if (operate && OPERATED.test(path)) {
         const body = yield* Effect.promise(() => bodyOf(incoming, MAX_OPERATION_BYTES));
         if (body === null) return answer(outgoing, 413, { error: `a request answered here is ${MAX_OPERATION_BYTES} bytes at most` });
         const answered = yield* operate(claims, { method: incoming.method ?? "GET", path, query: new URLSearchParams(search), body });

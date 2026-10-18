@@ -498,7 +498,8 @@ export async function serveFakeKube(): Promise<FakeKube> {
     const portBytes = Buffer.from([port & 0xff, port >> 8]);
     socket.write(Buffer.concat([frame(Buffer.concat([Buffer.from([0]), portBytes])), frame(Buffer.concat([Buffer.from([1]), portBytes]))]));
     const close = () => socket.end(Buffer.from([0x88, 0]));
-    if (local === undefined) return void socket.end(Buffer.concat([channel(1, `no forward of ${pod}:${port}`), Buffer.from([0x88, 0])]));
+    // Of none, ended, what the client sends after read and dropped, so its socket closes once the client's end comes.
+    if (local === undefined) return void socket.resume().end(Buffer.concat([channel(1, `no forward of ${pod}:${port}`), Buffer.from([0x88, 0])]));
     const upstream = connect(local, "127.0.0.1");
     upstream.on("data", (chunk: Buffer) => socket.write(frame(Buffer.concat([Buffer.from([0]), chunk]))));
     upstream.on("end", close);

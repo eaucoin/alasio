@@ -2,59 +2,120 @@
  * The gVisor releases alasio keeps: those it pins (cluster/node/pins.json, the current
  * one first, which new sandboxes run), and every other one installed that a snapshot
  * still names, as only the release that took a snapshot restores it
- * (src/gateway/snapshots.ts). A session's Sandbox released into a snapshot names it, and
- * the release that took it (src/kube/sandboxes.ts snapshotBinding), so what the cluster's
- * Sandboxes name is every release a snapshot may be restored with.
+ * (src/gateway/snapshots.ts). The sandbox gateway says which those are, of every
+ * environment's workspaces, the snapshot each was released into and its current one, as
+ * main's token reads it (GET /snapshots/releases, src/gateway/sessions.ts), through a
+ * port-forward to a gateway pod of its own.
  *
- * Where what they name cannot be read (the cluster is down, or a Sandbox was bound before
- * the release was recorded), every release installed is kept. A release no snapshot
- * names, and that is not pinned, is removed, its RuntimeClass with it. On a cluster in
- * Docker, the releases are its node image's, the pinned ones: a snapshot naming another
- * falls back, as one whose release is not kept does. On a cluster of a kubeconfig, the
- * operator keeps the releases. A release before gvisor.restoresFromBucketSince, as the
- * fork's .6, does not end a restore it refuses, which stalls the next pod's teardown for
- * minutes before the fallback (progress/live-lazy.md); its snapshots, released again under
- * a later release, leave it unkept over time.
+ * Where the gateway cannot be read (the cluster is down, no gateway runs, or what it
+ * answers is not what it says), every release installed is kept, and it is said so. A
+ * release no snapshot names, and that is not pinned, is removed, its RuntimeClass with it.
+ * On a cluster in Docker, the releases are its node image's, the pinned ones: a snapshot
+ * naming another falls back, as one whose release is not kept does. On a cluster of a
+ * kubeconfig, the operator keeps the releases. A release before
+ * gvisor.restoresFromBucketSince, as the fork's .6, does not end a restore it refuses,
+ * which stalls the next pod's teardown for minutes before the fallback
+ * (progress/live-lazy.md); its snapshots, released again under a later release, leave it
+ * unkept over time.
  */
-import type { V1RuntimeClass } from "@kubernetes/client-node";
-import { Effect } from "effect";
+import { request } from "node:http";
+import { type AddressInfo, createServer, type Server, type Socket } from "node:net";
 
-import { SNAPSHOT_ANNOTATION, SNAPSHOT_RELEASE_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
+import type { V1RuntimeClass, V1Secret } from "@kubernetes/client-node";
+import { Clock, Effect, FiberSet, Schema } from "effect";
+
+import { MAIN_ENVIRONMENT_NAME } from "../../src/branch/names.ts";
+import { mintToken } from "../../src/binder/tokens.ts";
 import { GVISOR_RELEASE_ANNOTATION } from "./cluster/k3s.ts";
+import { runningPodIn } from "./commands/common.ts";
 import { kind, KubeApi } from "./kube/api.ts";
+import { NAMESPACE, SESSIONS_CALLER_SECRET } from "./manifests/common.ts";
+import { GATEWAY_COMPONENT, GATEWAY_PORT } from "./manifests/sandbox-gateway.ts";
 
-/** What the cluster's sessions are released into snapshots of: the snapshots each release names, by release. */
+/** The snapshots a workspace may be restored from, by the gVisor release that took each, as the gateway names them. */
 export type SnapshotReleases = ReadonlyMap<string, readonly string[]>;
 
-/** The Sandboxes of every namespace, of sessions, as `list` sees them: their annotations. */
-interface Bound {
-  readonly metadata?: { readonly namespace?: string; readonly name?: string; readonly annotations?: Readonly<Record<string, string>> };
-}
+/** What the gateway answers of the releases its snapshots name. */
+const ReleasesAnswer = Schema.Struct({ releases: Schema.Record(Schema.String, Schema.Array(Schema.String)) });
+
+/** How long reading what the gateway says may take. */
+const READ_TIMEOUT = "30 seconds";
 
 /**
- * The snapshots of the cluster's sessions, by the release that took each, as their
- * Sandboxes say; null where they cannot be read, or a Sandbox bound to a snapshot names
- * no release. Pure, for tests.
+ * What the snapshots name, as `asked`, what the gateway answered, says; null where it
+ * failed, or its answer is not one, which is said so, as every release installed is then
+ * kept.
  */
-export function snapshotReleasesOf(sandboxes: readonly Bound[]): SnapshotReleases | null {
-  const named = new Map<string, string[]>();
-  for (const { metadata } of sandboxes) {
-    const snapshot = metadata?.annotations?.[SNAPSHOT_ANNOTATION];
-    if (!snapshot) continue;
-    const release = metadata?.annotations?.[SNAPSHOT_RELEASE_ANNOTATION];
-    if (!release) return null;
-    named.set(release, [...(named.get(release) ?? []), `${metadata?.namespace}/${metadata?.name}`]);
+export const snapshotReleasesFrom = <R>(asked: Effect.Effect<unknown, { readonly message: string }, R>): Effect.Effect<SnapshotReleases | null, never, R> =>
+  asked.pipe(
+    Effect.flatMap(Schema.decodeUnknownEffect(ReleasesAnswer)),
+    Effect.map(({ releases }): SnapshotReleases => new Map(Object.entries(releases))),
+    Effect.timeout(READ_TIMEOUT),
+    Effect.catch((error) =>
+      Effect.as(Effect.logWarning(`what the snapshots name could not be read of the sandbox gateway, so every gVisor release installed is kept: ${error.message}`), null)
+    ),
+  );
+
+/** The gateway refused to say what the snapshots name, or main's caller key is not there to ask it with. */
+class GatewayUnread extends Schema.TaggedError<GatewayUnread>()("GatewayUnread", { reason: Schema.String }) {
+  override get message(): string {
+    return this.reason;
   }
-  return named;
 }
 
-/** What the cluster's Sandboxes name, as snapshotReleasesOf says; null where they cannot be read. */
-export const snapshotReleases: Effect.Effect<SnapshotReleases | null, never, KubeApi> = Effect.flatMap(KubeApi, (kube) =>
-  kube.list<Bound>(kind("Sandbox"), { labelSelector: "alasio.dev/workload=session" }).pipe(
-    Effect.map(snapshotReleasesOf),
-    Effect.timeout("15 seconds"),
-    Effect.catch((error) => Effect.logInfo(`what the cluster's snapshots name is not known, so every gVisor release installed is kept: ${error.message}`).pipe(Effect.as(null))),
-  ));
+/** A server on a free port of the loopback, open while the scope is, each connection forwarded by `forward`. */
+const loopback = (forward: (socket: Socket) => void) =>
+  Effect.acquireRelease(
+    Effect.callback<Server, GatewayUnread>((resume) => {
+      const server = createServer(forward);
+      server.once("error", (error) => resume(Effect.fail(new GatewayUnread({ reason: `no port of this machine could be listened on: ${error.message}` }))));
+      server.listen(0, "127.0.0.1", () => resume(Effect.succeed(server)));
+    }),
+    (server) => Effect.sync(() => server.close()),
+  );
+
+/** What the gateway answers of the releases its snapshots name, asked by main's token, through a port-forward to one of its pods. */
+const askGateway = Effect.gen(function*() {
+  const kube = yield* KubeApi;
+  const secret = yield* kube.get<V1Secret>({ ...kind("Secret"), namespace: NAMESPACE, name: SESSIONS_CALLER_SECRET });
+  const callerKey = secret?.data?.["caller-key"];
+  if (!callerKey) return yield* new GatewayUnread({ reason: `${SESSIONS_CALLER_SECRET} holds no caller key of main's` });
+  const pod = yield* runningPodIn(NAMESPACE, GATEWAY_COMPONENT);
+  const run = yield* FiberSet.makeRuntime<never>();
+  const server = yield* loopback((socket) => {
+    socket.on("error", () => socket.destroy());
+    run(kube.portForward({ namespace: NAMESPACE, pod }, GATEWAY_PORT, socket).pipe(Effect.catch(() => Effect.sync(() => socket.destroy()))));
+  });
+  // A server listening on a TCP port has an address of its own.
+  const { port } = server.address() as AddressInfo;
+  const token = mintToken(Buffer.from(callerKey, "base64"), { key: "snapshots", expires: (yield* Clock.currentTimeMillis) + 60_000, options: { environment: MAIN_ENVIRONMENT_NAME } });
+  // Asked on a connection of its own, closed once answered, so its forward ends with it.
+  return yield* Effect.tryPromise({
+    try: (signal) =>
+      new Promise<unknown>((resolve, reject) => {
+        const asked = request({ host: "127.0.0.1", port, path: "/snapshots/releases", headers: { authorization: `Bearer ${token}` }, agent: false, signal }, (response) => {
+          const chunks: Buffer[] = [];
+          response.on("data", (chunk: Buffer) => chunks.push(chunk));
+          response.on("error", reject);
+          response.on("end", () => {
+            const text = Buffer.concat(chunks).toString("utf8");
+            if (response.statusCode !== 200) return reject(new Error(`it answered ${response.statusCode}: ${text}`));
+            try {
+              resolve(JSON.parse(text));
+            } catch (error) {
+              reject(error);
+            }
+          });
+        });
+        asked.on("error", reject);
+        asked.end();
+      }),
+    catch: (error) => new GatewayUnread({ reason: error instanceof Error ? error.message : String(error) }),
+  });
+}).pipe(Effect.scoped);
+
+/** What the snapshots name, as the sandbox gateway says, by snapshotReleasesFrom; null where it cannot be read. */
+export const snapshotReleases: Effect.Effect<SnapshotReleases | null, never, KubeApi> = snapshotReleasesFrom(askGateway);
 
 /**
  * The releases kept, of those `installed`, beside the `pinned` ones, as what the

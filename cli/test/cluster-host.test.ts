@@ -14,7 +14,7 @@ import { NodeServices } from "@effect/platform-node";
 import { Effect, Layer, Logger } from "effect";
 
 import { HostCluster, kubeconfigState, planNode } from "../src/cluster/host.ts";
-import { describeKept, keptReleases, type SnapshotReleases, snapshotReleasesOf } from "../src/kept-releases.ts";
+import { describeKept, keptReleases, type SnapshotReleases, snapshotReleasesFrom } from "../src/kept-releases.ts";
 import { Machine } from "../src/cluster/machine.ts";
 import { gvisorReleases, NODE_PINS } from "../src/cluster/node.ts";
 import { Root } from "../src/cluster/root.ts";
@@ -73,18 +73,16 @@ test("planNode installs a newly pinned gVisor release beside the one before it, 
   assert.deepEqual(plan(["21010101.0", "21000101.0"], ["20990101.0", "21000101.0"]).gvisor, { install: ["21010101.0"], remove: ["20990101.0"] });
   assert.equal(plan(["21000101.0"], ["20990101.0", "21000101.0"]).k3s, "restart");
   // A release a snapshot names is kept, and every one where what they name is not known.
-  assert.deepEqual(plan(["21010101.0", "21000101.0"], ["20990101.0", "21000101.0"], new Map([["20990101.0", ["alasio-sessions/fs-abc"]]])).gvisor, { install: ["21010101.0"], remove: [] });
+  assert.deepEqual(plan(["21010101.0", "21000101.0"], ["20990101.0", "21000101.0"], new Map([["20990101.0", ["alasio-sessions/fs-abc/s-1"]]])).gvisor, { install: ["21010101.0"], remove: [] });
   assert.deepEqual(plan(["21010101.0"], ["20990101.0", "21000101.0"], null).gvisor, { install: ["21010101.0"], remove: [] });
 });
 
-test("the releases kept are the pinned ones first, then those installed that a snapshot names, as the cluster's Sandboxes say", () => {
-  const bound = (name: string, snapshot?: string, release?: string) => ({
-    metadata: { namespace: "alasio-sessions", name, annotations: { ...(snapshot ? { "alasio.dev/snapshot": snapshot } : {}), ...(release ? { "alasio.dev/snapshot-release": release } : {}) } },
-  });
-  const named = snapshotReleasesOf([bound("fs-a", "s-1", "20990101.0"), bound("fs-b"), bound("fs-c", "s-2", "20990101.0"), bound("fs-d", "s-3", "21000101.0")]);
-  assert.deepEqual(named, new Map([["20990101.0", ["alasio-sessions/fs-a", "alasio-sessions/fs-c"]], ["21000101.0", ["alasio-sessions/fs-d"]]]));
-  // One bound before its release was recorded makes what they name unknown.
-  assert.equal(snapshotReleasesOf([bound("fs-a", "s-1")]), null);
+test("the releases kept are the pinned ones first, then those installed that a snapshot names, as the sandbox gateway says, and every one installed where it cannot be read", async () => {
+  const read = (asked: Effect.Effect<unknown, { readonly message: string }>) => Effect.runPromise(snapshotReleasesFrom(asked).pipe(Effect.provide(Logger.layer([]))));
+  const named = await read(Effect.succeed({ releases: { "20990101.0": ["alasio-sessions/fs-a/s-1", "alasio-sessions/fs-c/s-2"], "21000101.0": ["alasio-branch-one-sessions/fs-d/s-3"] } }));
+  assert.deepEqual(named, new Map([["20990101.0", ["alasio-sessions/fs-a/s-1", "alasio-sessions/fs-c/s-2"]], ["21000101.0", ["alasio-branch-one-sessions/fs-d/s-3"]]]));
+  // The gateway not reached, refusing, or answering what is not what it says: unknown, every release installed kept.
+  for (const unread of [Effect.fail({ message: "no pod of sandbox-gateway runs" }), Effect.succeed({ releases: { "20990101.0": "fs-a" } }), Effect.succeed("not json")]) assert.equal(await read(unread), null);
   assert.deepEqual(keptReleases(["21010101.0"], ["20980101.0", "20990101.0", "21010101.0"], named), ["21010101.0", "20990101.0"]);
   assert.deepEqual(keptReleases(["21010101.0"], ["20980101.0", "20990101.0"], null), ["21010101.0", "20980101.0", "20990101.0"]);
   // As status says them: each kept, with the snapshots naming it, then those named and not kept.

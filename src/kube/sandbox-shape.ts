@@ -82,12 +82,6 @@ export const RESUMED_CONDITION = "alasio.dev/resumed";
  * from that snapshot or not, so a snapshot outlives no resume of its Sandbox's.
  */
 export const SNAPSHOT_ANNOTATION = "alasio.dev/snapshot";
-/**
- * The annotation naming the gVisor release that took the snapshot SNAPSHOT_ANNOTATION
- * names, beside it, the only one that restores it: `alasio up` keeps every release one
- * names (cli/src/kept-releases.ts).
- */
-export const SNAPSHOT_RELEASE_ANNOTATION = "alasio.dev/snapshot-release";
 /** Where a node agent keeps the snapshots it prepares, as `<environment>/<workspace>/<snapshot>` (../node-agent/cache.ts). */
 export const SNAPSHOT_CACHE_DIR = "/var/lib/alasio/snapshots";
 /**

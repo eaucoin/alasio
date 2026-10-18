@@ -18,6 +18,7 @@ import { Cause, Exit } from "effect";
 import { tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
 import { environmentKey } from "../../src/binder/names.ts";
+import { verifyToken } from "../../src/binder/tokens.ts";
 import { forkToken } from "../../src/branch/names.ts";
 import type { TenantView } from "../src/branches.ts";
 import { CODEX_LOGIN } from "../src/commands/login.ts";
@@ -1260,7 +1261,28 @@ test("up on k3s here asks root for nothing once all is as it should, gives CoreD
   assert.deepEqual(machine.commands().slice(ran), ["systemctl restart k3s"]);
 });
 
-test("upgrade installs this version's k3s and gVisor release beside the one before, then removes that once it is no longer pinned, and up after each nothing", async (t) => {
+/** Where a forward of the sandbox gateway's pod's port leads. */
+const GATEWAY_FORWARD = "alasio-sandbox-gateway-0:8080";
+
+/**
+ * The sandbox gateway's front, as `up` and `status` reach it through a port-forward to its
+ * pod: what its snapshots name, as `answer` says, to main's token alone, signed by main's own
+ * key, which alasio-sessions-caller holds, of the gateway's caller key `master`.
+ */
+async function gatewayReleases(t: TestContext, kube: FakeKube, answer: () => unknown): Promise<void> {
+  stackSecret(kube, "alasio-sessions-caller", { "caller-key": environmentKey(Buffer.from("master"), "main").toString() });
+  const front = createHttpServer((request, response) => {
+    const token = /^Bearer (.+)$/u.exec(request.headers.authorization ?? "")?.[1] ?? "";
+    const claims = verifyToken(({ options }) => (options?.["environment"] === undefined ? null : environmentKey(Buffer.from("master"), options["environment"])), token, Date.now());
+    if (claims?.options?.["environment"] !== "main" || request.url !== "/snapshots/releases") return void response.writeHead(403).end();
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(answer()));
+  });
+  await new Promise<void>((resolve) => front.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => (front.close(resolve), front.closeAllConnections())));
+  kube.forwarded.set(GATEWAY_FORWARD, (front.address() as AddressInfo).port);
+}
+
+test("upgrade installs this version's k3s and gVisor release beside the one before, then removes that once it is no longer pinned, as no snapshot the gateway says names it, and up after each nothing", async (t) => {
   const setup = await onHost(t);
   const { env, kube, machine } = setup;
   const handlers = () =>
@@ -1282,6 +1304,24 @@ test("upgrade installs this version's k3s and gVisor release beside the one befo
   assert.equal((await runAlasio(["status"], { env, machine, releases: newer })).printed[0], "k3s v1.100.0+k3s1 on this machine, with gVisor 20990101.0 and 21000101.0:");
 
   const latest = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0"] });
+  // A snapshot the gateway says names the release before: kept, though no longer pinned.
+  const named: { releases: Record<string, string[]> } = { releases: { "20990101.0": ["alasio-sessions/fs-abc123/s-1"] } };
+  await gatewayReleases(t, kube, () => named);
+  const keptForIt = await runAlasio(["upgrade"], { env, machine, releases: latest });
+  succeeded(keptForIt);
+  assert.deepEqual(rootSteps(keptForIt), []);
+  assert.equal(machine.read("/usr/local/lib/alasio/gvisor/20990101.0/runsc"), "runsc 20990101.0\n");
+  // As status says it, of the gateway's word.
+  const said = await runAlasio(["status"], { env, machine, releases: latest });
+  assert.ok(said.printed.includes("  gVisor 20990101.0, kept: 1 snapshot names it"), said.printed.join("\n"));
+  // Where the gateway cannot be read, every release installed is kept, and it is said so.
+  kube.forwarded.delete(GATEWAY_FORWARD);
+  const unread = await runAlasio(["upgrade"], { env, machine, releases: latest });
+  succeeded(unread);
+  assert.deepEqual(rootSteps(unread), []);
+  assert.ok(unread.progress.some((line) => line.startsWith("what the snapshots name could not be read of the sandbox gateway, so every gVisor release installed is kept")), unread.progress.join("\n"));
+  // Named by none, it is removed.
+  await gatewayReleases(t, kube, () => ({ releases: {} }));
   const pruned = await runAlasio(["upgrade"], { env, machine, releases: latest });
   succeeded(pruned);
   assert.deepEqual(rootSteps(pruned), [

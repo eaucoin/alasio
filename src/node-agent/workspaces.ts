@@ -137,6 +137,8 @@ export interface Workspaces {
   readonly quota: (ref: WorkspaceRef) => Effect.Effect<Quota | null, WorkspaceRefused | JuicefsError>;
   /** The workspaces of `environment` there are, by their names. */
   readonly list: (environment: string) => Effect.Effect<readonly string[], WorkspaceRefused>;
+  /** The environments any workspace is of, by their names, as workspace storage holds them. */
+  readonly environments: Effect.Effect<readonly string[], WorkspaceRefused>;
   /**
    * Attaches `ref`'s files into `pod`'s directory, its binding's `token` and the variables `env`
    * beside them: the directory kubelet made, or, `made`, one made now, for a restore's pod the
@@ -333,6 +335,12 @@ export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches
         const names = yield* onMount(`the workspaces of ${environment} could not be listed`, () => readdir(join(workspacesRoot, environment)).catch((error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? [] : Promise.reject(error))));
         return (names as string[]).filter(isValidVolumeId).sort();
       }),
+
+    environments: Effect.suspend(() =>
+      onMount("the environments of workspaces could not be listed", () => readdir(workspacesRoot).catch((error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? [] : Promise.reject(error)))).pipe(
+        Effect.map((names) => (names as string[]).filter((name) => ENVIRONMENT.test(name)).sort()),
+      )
+    ),
 
     quota: (ref) =>
       Effect.gen(function*() {

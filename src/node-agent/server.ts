@@ -78,6 +78,7 @@
  *   409 where `to` is.
  * - `DELETE /workspaces/<environment>/<workspace>`: deletes the workspace, its quota with it
  *   (204), as it does one that is not there.
+ * - `GET /workspaces`: `{ environments }`, the names of the environments any workspace is of.
  * - `GET /workspaces/<environment>`: `{ workspaces }`, the names of the environment's workspaces.
  * - `GET /workspaces/<environment>/<workspace>/released`: `{ snapshot, release }`, the snapshot
  *   it was last released into, as its record beside its files says (./workspaces.ts) (200);
@@ -333,6 +334,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     if (method === "POST" && url === "/workspaces/clones") {
       return body(CloneRequest).pipe(Effect.flatMap(({ from, to, quotaBytes }) => workspaces.clone(from, to, quotaBytes)), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }
+    if (method === "GET" && url === "/workspaces") return workspaces.environments.pipe(Effect.map((environments) => answer(200, { environments })));
     const listed = WORKSPACES.exec(url);
     if (method === "GET" && listed) {
       return workspaces.list(decodeURIComponent(listed[1] ?? "")).pipe(Effect.map((names) => answer(200, { workspaces: names })));

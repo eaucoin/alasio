@@ -94,7 +94,7 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
       // What is attached on its node is reachable, unless a test says otherwise.
       attachments: () => Effect.succeed([]),
       prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
-      readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, quota: unused,
+      readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, listEnvironments: unused(), quota: unused,
       checkpoint: (node, request) =>
         Effect.gen(function*() {
           asked.push(`checkpoint ${node} ${request.pod}${request.live ? " live" : ""}`);
@@ -409,6 +409,7 @@ function workspaceAgents(): {
           return source ? Effect.sync(() => void files.set(name(to), new Map(source))) : Effect.fail(missing("clone"));
         }),
       listWorkspaces: (environment) => Effect.sync(() => [...files.keys()].filter((each) => each.startsWith(`${environment}/`)).map((each) => each.slice(environment.length + 1))),
+      listEnvironments: Effect.sync(() => [...new Set([...files.keys()].map((each) => ofName(each).environment))].sort()),
       quota: (ref) => Effect.sync(() => (files.has(name(ref)) ? { capacityBytes: 2 * 1024 ** 3, usedBytes: 5 } : null)),
       readFile: (ref, path) => {
         const file = files.get(name(ref))?.get(path);
@@ -466,6 +467,43 @@ test("a caller makes, writes, reads, measures, lists and deletes its own environ
   assert.equal((await ask("POST", "/workspace", "", { ...claims, options: { environment: "nowhere", mode: "none" } })).status, 403);
   assert.equal((await ask("POST", "/workspace", "", { ...claims, key: "folder:claude:conversation" })).status, 403);
   assert.equal((await ask("PATCH", "/workspace")).status, 404);
+});
+
+test("main's token reads, of every environment workspace storage holds, by each gVisor release, the snapshots its workspaces may be restored from; another's is refused, and what cannot be read fails it whole", async () => {
+  const main: SessionsEnvironment = { name: "main", namespace: "releases-main-sessions", parent: null };
+  const one = { name: "one", namespace: "alasio-branch-one-sessions", parent: "main" };
+  const recorded = workspaceAgents();
+  await namespaced(main.namespace);
+  const { sessions } = await sessionsOf({ ...options(main, 7290), environments: found([main, one]) }, recorded.agents);
+  for (const each of ["releases-main-sessions/fs-moved01", "releases-main-sessions/fs-same001", "releases-main-sessions/fs-none001", "alasio-branch-one-sessions/fs-branch1", "gone-sessions/fs-left001"]) recorded.files.set(each, new Map());
+  // Its current snapshot taken under another release than the one it was released into; both are restored from.
+  recorded.snapshots.set("releases-main-sessions/fs-moved01", { snapshot: "s-2", release: "r2" });
+  recorded.records.set("releases-main-sessions/fs-moved01", { snapshot: "s-1", release: "r1" });
+  recorded.snapshots.set("releases-main-sessions/fs-same001", { snapshot: "s-3", release: "r2" });
+  recorded.records.set("releases-main-sessions/fs-same001", { snapshot: "s-3", release: "r2" });
+  recorded.snapshots.set("alasio-branch-one-sessions/fs-branch1", { snapshot: "s-4", release: "r3" });
+  // Of an environment found no more, its workspace still held; and in the bucket alone, of a workspace gone, which restores nothing.
+  recorded.records.set("gone-sessions/fs-left001", { snapshot: "s-5", release: "r1" });
+  recorded.snapshots.set("releases-main-sessions/fs-gone001", { snapshot: "s-6", release: "r4" });
+  const ask = (environment: string) =>
+    Effect.runPromise(sessions.operate({ key: "snapshots", expires: Date.now() + 60_000, options: { environment } }, { method: "GET", path: "/snapshots/releases", query: new URLSearchParams(), body: new Uint8Array() }));
+  assert.deepEqual(await ask("main"), {
+    status: 200,
+    json: {
+      releases: {
+        r1: ["gone-sessions/fs-left001/s-5", "releases-main-sessions/fs-moved01/s-1"],
+        r2: ["releases-main-sessions/fs-moved01/s-2", "releases-main-sessions/fs-same001/s-3"],
+        r3: ["alasio-branch-one-sessions/fs-branch1/s-4"],
+      },
+    },
+  });
+  assert.equal((await ask("one")).status, 403);
+  const failing = await sessionsOf({ ...options(main, 7290), environments: found([main]) }, {
+    ...recorded.agents,
+    released: () => Effect.fail(new NodeAgentError({ node: "node-a", call: "read a record", status: 503, reason: "workspace storage is not mounted" })),
+  });
+  const failed = await Effect.runPromise(failing.sessions.operate({ key: "snapshots", expires: Date.now() + 60_000, options: { environment: "main" } }, { method: "GET", path: "/snapshots/releases", query: new URLSearchParams(), body: new Uint8Array() }));
+  assert.equal(failed.status, 502);
 });
 
 test("main forks its workspace into a branch of its own, as the branch records main its parent, and a branch into itself, but never into main nor into a sibling", async () => {

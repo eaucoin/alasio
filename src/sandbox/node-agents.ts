@@ -54,6 +54,7 @@ const Attachments = Schema.Struct({ attachments: Schema.Array(Schema.Struct({ po
 const Quota = Schema.Struct({ capacityBytes: Schema.Number, usedBytes: Schema.Number });
 /** What an agent answers a listing of an environment's snapshots, a collection, and a discard, with. */
 const Listed = Schema.Struct({ workspaces: Schema.Array(Schema.String) });
+const ListedEnvironments = Schema.Struct({ environments: Schema.Array(Schema.String) });
 const Collected = Schema.Struct({ kept: Schema.Array(Schema.String) });
 const Discarded = Schema.Struct({ discarded: Schema.Boolean });
 /** What an agent answers an abandon with: the processes of runsc's it killed. */
@@ -131,6 +132,8 @@ export interface NodeAgents {
   readonly removeWorkspace: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** The workspaces of `environment` there are, by their names, through any agent. */
   readonly listWorkspaces: (environment: string) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
+  /** The environments any workspace is of, by their names, through any agent. */
+  readonly listEnvironments: Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
   /**
    * Has the bayma of the bound pod `request.pod`, on `node`, go on with the stop it holds,
    * by its hook `request.hook` (`sandbox-hook stop`), which its node's agent runs in its
@@ -282,6 +285,10 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
         ask(node, `list ${environment}'s workspaces`, { method: "GET", path: `/workspaces/${encodeURIComponent(environment)}`, timeout: SHORT_CALL }, Listed)).pipe(
           Effect.map(({ workspaces }) => workspaces),
         ),
+    listEnvironments: Effect.flatMap(anyNode, (node) =>
+      ask(node, "list the environments of workspaces", { method: "GET", path: "/workspaces", timeout: SHORT_CALL }, ListedEnvironments)).pipe(
+        Effect.map(({ environments }) => environments),
+      ),
     removeWorkspace: (workspace) =>
       Effect.flatMap(anyNode, (node) =>
         send(node, `delete ${workspace.environment}/${workspace.workspace}`, { method: "DELETE", path: `/workspaces/${encodeURIComponent(workspace.environment)}/${encodeURIComponent(workspace.workspace)}`, timeout: SHORT_CALL })).pipe(Effect.asVoid),

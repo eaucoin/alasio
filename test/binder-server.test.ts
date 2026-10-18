@@ -319,7 +319,7 @@ test("a key is bound where the gateway places it, by what its caller's token say
   }
 });
 
-test("a request under /workspace is answered by the front itself, as its operate says, of its caller's token's claims, binding nothing; one past the most it takes is refused", async () => {
+test("a request under /workspace or /snapshots is answered by the front itself, as its operate says, of its caller's token's claims, binding nothing; one past the most it takes is refused", async () => {
   const of = await pool();
   await freePods(of, 1);
   const stand = await pods();
@@ -337,16 +337,19 @@ test("a request under /workspace is answered by the front itself, as its operate
     assert.deepEqual([made.status, await made.json()], [201, { made: true }]);
     const read = await fetch(`http://127.0.0.1:${served.port}/workspace/files?path=workspace%2Fa`, { headers: { authorization: caller(key) } });
     assert.deepEqual([read.status, read.headers.get("content-type"), await read.text()], [200, "application/octet-stream", "bytes of a file"]);
+    const releases = await fetch(`http://127.0.0.1:${served.port}/snapshots/releases`, { headers: { authorization: caller(key) } });
+    assert.deepEqual([releases.status, await releases.json()], [201, { made: true }]);
     assert.deepEqual(asked.map(({ claims, ...rest }) => ({ ...rest, key: claims.key, options: claims.options })), [
       { method: "POST", path: "/workspace", query: "", body: "{\"a\":1}", key, options: { environment: "main" } },
       { method: "GET", path: "/workspace/files", query: "path=workspace%2Fa", body: "", key, options: undefined },
+      { method: "GET", path: "/snapshots/releases", query: "", body: "", key, options: undefined },
     ]);
     const over = await fetch(`http://127.0.0.1:${served.port}/workspace/files`, { method: "PUT", headers: { authorization: caller(key) }, body: Buffer.alloc(MAX_OPERATION_BYTES + 1) });
     assert.equal(over.status, 413);
-    assert.equal(asked.length, 2);
+    assert.equal(asked.length, 3);
     // Without a caller's token, nothing is asked.
     assert.equal((await fetch(`http://127.0.0.1:${served.port}/workspace`, { method: "POST" })).status, 401);
-    assert.deepEqual([await run(readLease(of, key)), stand.sent.length, asked.length], [null, 0, 2]);
+    assert.deepEqual([await run(readLease(of, key)), stand.sent.length, asked.length], [null, 0, 3]);
   } finally {
     await served.close();
     stand.close();

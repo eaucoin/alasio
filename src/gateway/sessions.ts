@@ -30,6 +30,10 @@
  *   one of a workspace bound is a clone of its files alone; 409 while the fork is bound, or
  *   being bound or released.
  * - `GET /workspace/all`: `{ workspaces }`, the names of the environment's workspaces (200).
+ * And of no workspace, to main's token alone (403 to any other environment's):
+ * - `GET /snapshots/releases`: `{ releases }`, by each gVisor release, the snapshots of every
+ *   environment's workspaces it took that they may be restored from, `<namespace>/<workspace>/
+ *   <snapshot>` (./snapshots.ts releasesNamed), as `alasio up` and `alasio status` read it (200).
  * What is refused is `{ error }` with its status; a node agent's refusal is its own, and
  * what failed otherwise 502.
  *
@@ -450,6 +454,10 @@ export const makeSessions = Effect.fnUntraced(function*(
       const named = claims.options?.["environment"];
       const environment = named === undefined ? null : yield* environments.named(named);
       if (!environment) return refused(403, `there is no environment ${named ?? "named"} of sessions`);
+      if (method === "GET" && path === "/snapshots/releases") {
+        if (environment.namespace !== mainNamespace) return refused(403, `what releases the snapshots name is main's to read, not ${environment.name}'s`);
+        return yield* answered(snapshots.releasesNamed, (releases) => ({ status: 200, json: { releases: Object.fromEntries(releases) } }));
+      }
       if (method === "GET" && path === "/workspace/all") return yield* answered(agents.listWorkspaces(environment.namespace), (workspaces) => ({ status: 200, json: { workspaces } }));
       const workspace = volumeIdOfKey(claims.key);
       if (!workspace) return refused(403, `${claims.key} is no session workspace's`);

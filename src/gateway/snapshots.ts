@@ -55,7 +55,9 @@
  * (forget); a fork of one released into a snapshot is given a copy of it (copy), which it is
  * recorded released into, so it restores as its source would; and what of main's snapshots no
  * workspace has a use for is collected (collect), as alasio's were: those of workspaces gone,
- * what no snapshot of a workspace needs, and what a node caches that none needs.
+ * what no snapshot of a workspace needs, and what a node caches that none needs. The gVisor
+ * releases the snapshots of every environment's workspaces were taken under are read whole
+ * (releasesNamed), as `alasio up` keeps those installed.
  */
 import { randomBytes } from "node:crypto";
 
@@ -205,6 +207,9 @@ class RestoreRefused extends Schema.TaggedError<RestoreRefused>()("RestoreRefuse
  */
 const UNSAVEABLE_STATUS = 410;
 
+/** How many workspaces' snapshots are read at once, as what releases they name is read. */
+const READS_AT_ONCE = 8;
+
 /** Whether `error`, a checkpoint's, says its sandbox can be saved no more. */
 const unsaveable = (error: NodeAgentError | KubeApiError): boolean => error._tag === "NodeAgentError" && error.status === UNSAVEABLE_STATUS;
 
@@ -298,6 +303,14 @@ export interface GatewaySnapshots {
    * node caches that none of them needs, but those a restore may be reading.
    */
   readonly collect: Effect.Effect<void>;
+  /**
+   * The snapshots a workspace may be restored from, by the gVisor release that took each, as
+   * a release kept is kept for them (cli/src/kept-releases.ts): of each workspace of every
+   * environment workspace storage holds, its current snapshot and the one it was recorded
+   * released into, each `<environment>/<workspace>/<snapshot>`; what cannot be read fails it
+   * whole, as a release named by what was not read would be unkept.
+   */
+  readonly releasesNamed: Effect.Effect<ReadonlyMap<string, readonly string[]>, NodeAgentError | KubeApiError>;
 }
 
 /** What bayma's /status says: its execs running and queued, since when none has run, if none does, and its state generation, which a snapshot taken of it live holds it at. */
@@ -886,5 +899,19 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
     withLogScope("snapshots"),
   );
 
-  return { save, saveStopping, endUnsaveable, keepLive, liveSnapshotOf, forgetLive, restoring, forget: forgetDeleted, copy, collect };
+  const releasesNamed: Effect.Effect<ReadonlyMap<string, readonly string[]>, NodeAgentError | KubeApiError> = Effect.gen(function*() {
+    const refs = (yield* Effect.forEach(yield* agents.listEnvironments, (environment) =>
+      Effect.map(agents.listWorkspaces(environment), (workspaces) => workspaces.map((workspace) => ({ environment, workspace }))), { concurrency: READS_AT_ONCE })).flat();
+    const named = yield* Effect.forEach(refs, (of) =>
+      Effect.map(Effect.all([agents.current(of), agents.released(of)], { concurrency: 2 }), (saved) =>
+        saved.flatMap((each) => (each ? [{ release: each.release, snapshot: `${of.environment}/${of.workspace}/${each.snapshot}` }] : []))), { concurrency: READS_AT_ONCE });
+    const releases = new Map<string, string[]>();
+    for (const { release, snapshot } of named.flat()) {
+      const of = releases.get(release) ?? [];
+      if (!of.includes(snapshot)) releases.set(release, [...of, snapshot]);
+    }
+    return releases;
+  });
+
+  return { save, saveStopping, endUnsaveable, keepLive, liveSnapshotOf, forgetLive, restoring, forget: forgetDeleted, copy, collect, releasesNamed };
 });
