@@ -5,7 +5,7 @@
  * gateway's identity there, which makes and deletes them and their tokens' Secrets; and the
  * budget that lets no drain evict a bound one.
  */
-import type { KubernetesObject, V1PodTemplateSpec } from "@kubernetes/client-node";
+import type { KubernetesObject, V1PodTemplateSpec, V1Volume } from "@kubernetes/client-node";
 
 import { FOLDER_TOKEN_FILE } from "../../../src/gateway/names.ts";
 import { sandboxBaymaTelemetryEnv } from "../../../src/sandbox/telemetry.ts";
@@ -35,8 +35,11 @@ export function hostPodTemplate(config: InstallConfig): V1PodTemplateSpec {
   return {
     metadata: { labels: { "app.kubernetes.io/part-of": "alasio", "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "folder-bayma" } },
     spec: {
-      // May restart alasio, by rolling out its Deployment, as an agent restarts it.
+      // May restart alasio, by rolling out its Deployment, as an agent restarts it; its token
+      // mounted by the template itself, where the API server would mount one, so the pod the
+      // folder pods' policy pins is the pod as made.
       serviceAccountName: componentName("host-agent"),
+      automountServiceAccountToken: false,
       ...priority("turn"),
       securityContext: {
         runAsUser: host.uid,
@@ -63,12 +66,27 @@ export function hostPodTemplate(config: InstallConfig): V1PodTemplateSpec {
           appArmorProfile: { type: "Unconfined" },
         },
         resources: host.resources,
-        ...given("volumeMounts", hostVolumeMounts(config)),
+        volumeMounts: [...hostVolumeMounts(config), { name: ACCOUNT_VOLUME, mountPath: ACCOUNT_DIRECTORY, readOnly: true }],
       }],
-      ...given("volumes", hostVolumes(config)),
+      volumes: [...hostVolumes(config), accountVolume],
     },
   };
 }
+
+/** The volume of the folder instances' account's token, and where it is mounted, as the API server mounts one. */
+const ACCOUNT_VOLUME = "alasio-host-agent-token";
+const ACCOUNT_DIRECTORY = "/var/run/secrets/kubernetes.io/serviceaccount";
+const accountVolume: V1Volume = {
+  name: ACCOUNT_VOLUME,
+  projected: {
+    defaultMode: 0o644,
+    sources: [
+      { serviceAccountToken: { expirationSeconds: 3607, path: "token" } },
+      { configMap: { name: "kube-root-ca.crt", items: [{ key: "ca.crt", path: "ca.crt" }] } },
+      { downwardAPI: { items: [{ path: "namespace", fieldRef: { apiVersion: "v1", fieldPath: "metadata.namespace" } }] } },
+    ],
+  },
+};
 
 /**
  * The folder instances' template, as the gateway's configuration carries it: the host

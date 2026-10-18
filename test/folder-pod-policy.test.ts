@@ -123,6 +123,8 @@ test("a folder instance's pod with any field the template pins changed, or widen
     "a capability more": (pod) => void (bayma(pod).securityContext!.capabilities!.add = [...(bayma(pod).securityContext?.capabilities?.add ?? []), "SYS_ADMIN"]),
     "privileged": (pod) => void (bayma(pod).securityContext!.privileged = true),
     "another of the machine's paths": (pod) => void pod.spec.volumes!.push({ name: "root", hostPath: { path: "/" } }),
+    "the account's token mounted again, as the API server would mount one": (pod) =>
+      void pod.spec.volumes!.push({ name: "kube-api-access-abcde", projected: { sources: [{ serviceAccountToken: { path: "token" } }] } }),
     "the machine's network": (pod) => void (pod.spec.hostNetwork = true),
     "another user": (pod) => void (pod.spec.securityContext!.runAsUser = 0),
     "an argument more": (pod) => void bayma(pod).args!.push("--unsafe"),

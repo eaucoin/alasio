@@ -3093,6 +3093,10 @@ describe("the sandbox service", () => {
     assert.equal(JSON.parse(one<V1ConfigMap>(install({ host: { enabled: true, releaseAfter: "4h" } }), "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}").folders.releaseAfterSeconds, 4 * 3600);
     // The host profile's bayma, as the operator, under the cluster's own runtime, exporting its telemetry to the receiver with its binding's token.
     assert.equal(config.folders.template.spec.serviceAccountName, "alasio-host-agent");
+    // Its account's token the template's own, where the API server would mount one, so the pod the policy pins is the pod as made.
+    assert.equal(config.folders.template.spec.automountServiceAccountToken, false);
+    assert.deepEqual((config.folders.template.spec.containers[0] as V1Container).volumeMounts?.at(-1), { name: "alasio-host-agent-token", mountPath: "/var/run/secrets/kubernetes.io/serviceaccount", readOnly: true });
+    assert.deepEqual(config.folders.template.spec.volumes.at(-1).projected.sources.map((source: object) => Object.keys(source)[0]), ["serviceAccountToken", "configMap", "downwardAPI"]);
     const [bayma] = config.folders.template.spec.containers as V1Container[];
     assert.equal(config.folders.template.spec.runtimeClassName, undefined);
     assert.deepEqual(bayma?.securityContext?.capabilities?.add, ["CHECKPOINT_RESTORE", "SYS_PTRACE"]);
