@@ -15,7 +15,8 @@ import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
 import { sessionSandboxManifest } from "../src/sandbox/index.ts";
 import { type Holdings, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
 import { CPU_FEATURES_ANNOTATION, RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION } from "../src/kube/sandbox-shape.ts";
-import { hookOf, makeSessionSnapshots, sessionTemplateHash, stopHookOf } from "../src/sandbox/snapshots.ts";
+import { hookOf, stopHookOf } from "../src/gateway/snapshots.ts";
+import { makeSessionSnapshots, sessionTemplateHash } from "../src/sandbox/snapshots.ts";
 
 const CURRENT = "20260921.0-eaucoin.4";
 const PREVIOUS = "20260921.0-eaucoin.3";

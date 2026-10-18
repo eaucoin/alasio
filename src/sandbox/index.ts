@@ -72,7 +72,8 @@ import { overLimitNote } from "../telegram/rich-media.ts";
 import type { OtlpForwarder } from "../telemetry/forward.ts";
 import { assertValidVolumeId, SessionToken } from "./names.ts";
 import { makeNodeAgents } from "./node-agents.ts";
-import { holdsStop, makeSessionSnapshots, type SessionSnapshots, sessionTemplateHash, stopHookOf } from "./snapshots.ts";
+import { holdsStop, stopHookOf } from "../gateway/snapshots.ts";
+import { makeSessionSnapshots, type SessionSnapshots, sessionTemplateHash } from "./snapshots.ts";
 import { sandboxBaymaTelemetryEnv, sandboxResource } from "./telemetry.ts";
 import { serveTelemetryReceiver } from "./telemetry-receiver.ts";
 

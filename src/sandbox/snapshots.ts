@@ -26,10 +26,11 @@
  * agent kills what runsc runs for the pod there, so that the pod's teardown, as its
  * Sandbox is suspended, waits on none of it.
  */
-import type { V1Container, V1LabelSelector, V1NetworkPolicy, V1Node, V1Pod, V1PodTemplateSpec, V1Taint, V1Toleration } from "@kubernetes/client-node";
+import type { V1NetworkPolicy, V1Node, V1Pod, V1PodTemplateSpec, V1Taint, V1Toleration } from "@kubernetes/client-node";
 import { Clock, Duration, Effect, FiberMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 import { FetchHttpClient } from "effect/http";
 
+import { type Fallback, holdsStop, hookOf, selects, stateDirOf } from "../gateway/snapshots.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { SessionsProfile } from "../kube/config.ts";
 import {
@@ -40,7 +41,6 @@ import {
   RESUMED_CONDITION,
   SANDBOX_LABEL,
   SESSION_TEMPLATE_ANNOTATION,
-  STOP_WAIT_ARG,
 } from "../kube/sandbox-shape.ts";
 import {
   podTemplateHash,
@@ -122,9 +122,6 @@ const UNSAVEABLE_STATUS = 410;
 /** Whether `error`, a checkpoint's, says its sandbox can be saved no more. */
 const unsaveable = (error: NodeAgentError | KubeApiError): boolean => error._tag === "NodeAgentError" && error.status === UNSAVEABLE_STATUS;
 
-/** Why a session with a snapshot was resumed without it. */
-export type Fallback = "release" | "template" | "stale" | "node" | "prepare" | "restore" | "unreadable";
-
 /** The profile's templates a snapshot restores into, by their hashes: the current one, and the one before it, if any. */
 export interface KeptTemplates {
   readonly current: string;
@@ -148,11 +145,6 @@ function tolerates(toleration: V1Toleration, taint: V1Taint): boolean {
  */
 const READINESS_TAINTS: ReadonlySet<string> = new Set(["node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable"]);
 
-/** Whether bayma's container `bayma` holds a stop it is given for a snapshot: one run with STOP_WAIT_ARG. Pure, for tests. */
-export function holdsStop(bayma: V1Container | undefined): boolean {
-  return bayma?.args?.includes(STOP_WAIT_ARG) ?? false;
-}
-
 /** A restored pod does not run its containers yet. */
 class PodNotRunning extends Schema.TaggedError<PodNotRunning>()("PodNotRunning", {}) {}
 
@@ -172,51 +164,6 @@ type BaymaStatus = typeof BaymaStatus.Type;
 /** The hash of the profile's template that `podTemplate` was made from, as it records it. */
 const sessionTemplateOf = (podTemplate: V1PodTemplateSpec | Readonly<Record<string, unknown>>): string | undefined =>
   (podTemplate as V1PodTemplateSpec).metadata?.annotations?.[SESSION_TEMPLATE_ANNOTATION];
-
-/**
- * The command that runs bayma's hook in bayma's container: bayma, as its container runs
- * it after the init that starts it (the arguments after its `--`), told the state
- * directory it serves. Null when the container runs no bayma with one. Pure, for tests.
- */
-export function hookOf(bayma: V1Container): string[] | null {
-  const command = bayma.command ?? [];
-  const program = command.includes("--") ? command.slice(command.indexOf("--") + 1) : command;
-  const stateDir = stateDirOf(bayma);
-  return program.length > 0 && stateDir ? [...program, "sandbox-hook", "--state-dir", stateDir] : null;
-}
-
-/**
- * bayma's hook, as hookOf says it, told to go on with the stop bayma holds (sandbox-hook
- * stop), or null where bayma has none. Pure, for tests.
- */
-export function stopHookOf(bayma: V1Container): string[] | null {
-  const hook = hookOf(bayma);
-  return hook ? [...hook.slice(0, -2), "stop", ...hook.slice(-2)] : null;
-}
-
-/** The state directory bayma's container runs bayma with, or null for none. Pure, for tests. */
-export function stateDirOf(bayma: V1Container): string | null {
-  const args = bayma.args ?? [];
-  return args.includes("--state-dir") ? (args[args.indexOf("--state-dir") + 1] ?? null) : null;
-}
-
-/**
- * Whether the label selector `selector` selects what has `labels`, as Kubernetes matches
- * one: every label it names, and every expression of it; none selects nothing, an empty one
- * everything.
- */
-export function selects(selector: V1LabelSelector | undefined, labels: Readonly<Record<string, string>>): boolean {
-  if (!selector) return false;
-  const named = Object.entries(selector.matchLabels ?? {}).every(([key, value]) => labels[key] === value);
-  return named && (selector.matchExpressions ?? []).every(({ key, operator, values = [] }) => {
-    const value = labels[key];
-    if (operator === "In") return value !== undefined && values.includes(value);
-    if (operator === "NotIn") return value === undefined || !values.includes(value);
-    if (operator === "Exists") return value !== undefined;
-    if (operator === "DoesNotExist") return value === undefined;
-    return false;
-  });
-}
 
 /** What a session's snapshots are given. */
 export interface SessionSnapshotsOptions {

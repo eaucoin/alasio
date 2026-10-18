@@ -55,7 +55,7 @@ import { goferOf, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
 import { apiServerUnconfined } from "../src/install.ts";
 import { carriedPools, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
 import { templateHash } from "../../src/gateway/names.ts";
-import { hookOf } from "../../src/sandbox/snapshots.ts";
+import { hookOf } from "../../src/gateway/snapshots.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
 /** A NetworkPolicy as rendered, its ingress rules' peers under `from`. */

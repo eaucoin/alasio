@@ -59,20 +59,72 @@
  */
 import { randomBytes } from "node:crypto";
 
-import type { V1Deployment, V1NetworkPolicy, V1Node, V1Pod, V1PodTemplateSpec, V1Toleration } from "@kubernetes/client-node";
+import type { V1Container, V1Deployment, V1LabelSelector, V1NetworkPolicy, V1Node, V1Pod, V1PodTemplateSpec, V1Toleration } from "@kubernetes/client-node";
 import { Clock, Effect, Schedule, Schema, Semaphore } from "effect";
 
 import { BindStepFailed, type MakePod } from "../binder/binder.ts";
 import { FREE_LABEL, type Pool } from "../binder/names.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
-import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION } from "../kube/sandbox-shape.ts";
+import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION, STOP_WAIT_ARG } from "../kube/sandbox-shape.ts";
 import type { SavedSnapshot } from "../kube/sandboxes.ts";
 import type { Manifest } from "../node-agent/agent.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
-import { type Fallback, holdsStop, hookOf, selects, stateDirOf, stopHookOf } from "../sandbox/snapshots.ts";
 import { withLogScope } from "../shared/log.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
 import { type GatewaySnapshots as SnapshotsConfig, ownDirectory, restorePodName } from "./names.ts";
+
+/** Why a session with a snapshot was resumed without it. */
+export type Fallback = "release" | "template" | "stale" | "node" | "prepare" | "restore" | "unreadable";
+
+/** Whether bayma's container `bayma` holds a stop it is given for a snapshot: one run with STOP_WAIT_ARG. Pure, for tests. */
+export function holdsStop(bayma: V1Container | undefined): boolean {
+  return bayma?.args?.includes(STOP_WAIT_ARG) ?? false;
+}
+
+/**
+ * The command that runs bayma's hook in bayma's container: bayma, as its container runs
+ * it after the init that starts it (the arguments after its `--`), told the state
+ * directory it serves. Null when the container runs no bayma with one. Pure, for tests.
+ */
+export function hookOf(bayma: V1Container): string[] | null {
+  const command = bayma.command ?? [];
+  const program = command.includes("--") ? command.slice(command.indexOf("--") + 1) : command;
+  const stateDir = stateDirOf(bayma);
+  return program.length > 0 && stateDir ? [...program, "sandbox-hook", "--state-dir", stateDir] : null;
+}
+
+/**
+ * bayma's hook, as hookOf says it, told to go on with the stop bayma holds (sandbox-hook
+ * stop), or null where bayma has none. Pure, for tests.
+ */
+export function stopHookOf(bayma: V1Container): string[] | null {
+  const hook = hookOf(bayma);
+  return hook ? [...hook.slice(0, -2), "stop", ...hook.slice(-2)] : null;
+}
+
+/** The state directory bayma's container runs bayma with, or null for none. Pure, for tests. */
+export function stateDirOf(bayma: V1Container): string | null {
+  const args = bayma.args ?? [];
+  return args.includes("--state-dir") ? (args[args.indexOf("--state-dir") + 1] ?? null) : null;
+}
+
+/**
+ * Whether the label selector `selector` selects what has `labels`, as Kubernetes matches
+ * one: every label it names, and every expression of it; none selects nothing, an empty one
+ * everything.
+ */
+export function selects(selector: V1LabelSelector | undefined, labels: Readonly<Record<string, string>>): boolean {
+  if (!selector) return false;
+  const named = Object.entries(selector.matchLabels ?? {}).every(([key, value]) => labels[key] === value);
+  return named && (selector.matchExpressions ?? []).every(({ key, operator, values = [] }) => {
+    const value = labels[key];
+    if (operator === "In") return value !== undefined && values.includes(value);
+    if (operator === "NotIn") return value === undefined || !values.includes(value);
+    if (operator === "Exists") return value !== undefined;
+    if (operator === "DoesNotExist") return value === undefined;
+    return false;
+  });
+}
 
 const releases = meter.createCounter("alasio.sandbox.releases", {
   description:
