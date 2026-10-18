@@ -553,6 +553,50 @@ test("up without a bot says to run init, and without the address Telegram delive
   assert.match(message, /container alasio of pod alasio-0 is waiting: ImagePullBackOff/u);
 });
 
+test("folder restart lets a conversation's instance of each harness go through the gateway, as main, and status lists the instances where the gateway serves them, with their binds' failures", async (t) => {
+  const { alasio, kube } = await installed(t);
+  kube.onExec = () => ({ exitCode: 0 });
+  stackSecret(kube, "alasio-sessions-caller", { "caller-key": environmentKey(Buffer.from("master"), "main").toString() });
+  const asked: string[] = [];
+  const now = Date.now();
+  const at = (ago: number) => new Date(now - ago).toISOString();
+  await gatewayFront(t, kube, (environment, key, method, path) => {
+    if (environment !== "main") return { status: 403 };
+    asked.push(`${method} ${path} ${key}`);
+    if (method === "POST" && path === "/release") return key.startsWith("folder:codex:") ? { status: 503, json: { error: "not now" } } : { status: 204 };
+    if (method === "GET" && path === "/folders") {
+      return { status: 200, json: { folders: [
+        { key: "folder:claude:telegram:42", harness: "claude", conversation: "telegram:42", pod: "bayma-0123456789abcdef-a1b2c", boundAt: at(3 * 3_600_000), lastExecAt: at(5 * 60_000), failing: null },
+        { key: "folder:codex:telegram:7", harness: "codex", conversation: "telegram:7", pod: null, boundAt: null, lastExecAt: null, failing: { reason: "its pod is pending: no node", at: at(10 * 60_000), times: 3, held: true } },
+      ] } };
+    }
+    return { status: 404 };
+  });
+  const restarted = await alasio(["folder", "restart", "telegram:42"]);
+  succeeded(restarted);
+  assert.deepEqual(restarted.printed, [
+    "Claude: its folder instance of telegram:42 is let go, its REPL sessions saved; the next message makes it anew",
+    "Codex: the sandbox gateway did not let it go (503): {\"error\":\"not now\"}",
+  ]);
+  assert.deepEqual(asked, ["POST /release folder:claude:telegram:42", "POST /release folder:codex:telegram:42"]);
+  // Of no folder instances, as alasio is told the gateway serves none: nothing of them.
+  const without = await alasio(["status"]);
+  succeeded(without);
+  assert.ok(!without.printed.some((line) => line.includes("folder instances")));
+  const deployment = kube.get(DEPLOYMENT) as { spec: { template: { spec: { containers: { env?: { name: string; value?: string }[] }[] } } } } | undefined;
+  deployment?.spec.template.spec.containers[0]?.env?.push({ name: "ALASIO_GATEWAY_FOLDERS", value: "1" });
+  const status = await alasio(["status"]);
+  succeeded(status);
+  const listed = status.printed;
+  const from = listed.indexOf("  folder instances:");
+  assert.ok(from > 0, listed.join("\n"));
+  assert.deepEqual(listed.slice(from, from + 3), [
+    "  folder instances:",
+    "    telegram:42 under Claude: bound to bayma-0123456789abcdef-a1b2c for 3h, its last exec 5m ago",
+    "    telegram:7 under Codex: released; its last bind failed 10m ago, 3 in a row, so it is bound again only as the operator asks (Retry now, or alasio folder restart): its pod is pending: no node",
+  ]);
+});
+
 test("status says each workload's state, and fails when one is not ready", async (t) => {
   const { alasio, kube, kubeconfig } = await installed(t);
   // The sandbox gateway's counts of each pool, as it answers them in its pod.

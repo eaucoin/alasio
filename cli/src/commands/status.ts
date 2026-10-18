@@ -26,10 +26,12 @@ import { describeReplication, describeVolumeServer, volumeServerDisk } from "../
 import { type ComputeTimes, computeTimes, type TenantView, tenantView } from "../branches.ts";
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
 import { branchNamespaces } from "../branches.ts";
+import { describeFolders, folderInstances } from "../folders.ts";
 import { installConfig } from "../install.ts";
 import { readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "../secrets.ts";
 import { describeBots, type EnvironmentBot } from "../webhook.ts";
 import { branchNamespace } from "../../../src/branch/names.ts";
+import { ALASIO_GATEWAY_FOLDERS_VARIABLE } from "../../../src/gateway/names.ts";
 import { notRunning, runIn, runningPodIn } from "./common.ts";
 
 /** Some of alasio's workloads do not run as they should. */
@@ -391,6 +393,11 @@ export const status = Command.make("status", {}, () =>
           const releases = describeKept(yield* clusterReleases(gvisorReleases(NODE_PINS)), yield* snapshotReleases);
           for (const line of releases) yield* Console.log(`  ${line}`);
         }
+        // Where the sandbox gateway serves folder instances, as alasio is told it does: each, and its binds' last failure.
+        const alasio = workloads.find((object) => object.kind === "Deployment" && object.metadata?.name === RELEASE) as V1Deployment | undefined;
+        if (alasio?.spec?.template.spec?.containers.some(({ env }) => env?.some(({ name, value }) => name === ALASIO_GATEWAY_FOLDERS_VARIABLE && value === "1"))) {
+          for (const line of describeFolders(yield* folderInstances, Date.now())) yield* Console.log(`  ${line}`);
+        }
         const tenant = yield* tenantView;
         if (tenant) for (const line of describeTenant(tenant)) yield* Console.log(line);
         if (listed.some(({ whole }) => !whole)) {
@@ -428,7 +435,8 @@ export const status = Command.make("status", {}, () =>
         "until workspace storage cleans the sessions of its clients that died), waking (a compute or the loader whose pod starts, within " +
         "its Deployment's progress deadline), or what it is at and " +
         "why; its replicas, and its scale where KEDA moves it; and its pods' requests, beside " +
-        "what VPA recommends once it has measured them; where sessions are snapshotted, the CPU baseline they are held to, and the nodes that lack it, and the gVisor releases kept, with the snapshots naming each. Of the bundled object store, the copies it keeps of each object, and of each " +
+        "what VPA recommends once it has measured them; where sessions are snapshotted, the CPU baseline they are held to, and the nodes that lack it, and the gVisor releases kept, with the snapshots naming each; where the sandbox gateway serves folder conversations' instances, each, " +
+        "bound or released, its pod, how long it has been bound, its bayma's last exec, and its binds' last failure, and whether three in a row hold it until asked. Of the bundled object store, the copies it keeps of each object, and of each " +
         "volume server, as its metrics say: what it may still fill of its disk before it takes no more writes, what it keeps " +
         "free (minFreeSpace), its volumes, and what they take, deleted and not yet compacted away. Then the memory the cluster's pods request and use, of what its nodes have " +
         "for pods, and whether a metrics server measures them, which VPA and what scales on CPU need; of these, what the kubeconfig's " +

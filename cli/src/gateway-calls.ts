@@ -27,7 +27,7 @@ export interface GatewayCall {
   readonly callerKey: Buffer;
   readonly environment: string;
   readonly key: string;
-  readonly method: "GET" | "DELETE";
+  readonly method: "GET" | "POST" | "DELETE";
   readonly path: string;
 }
 
