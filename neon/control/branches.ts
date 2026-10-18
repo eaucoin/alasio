@@ -14,7 +14,7 @@
  * A branch's compute has credentials of its own, which whoever asks for the branch makes
  * and neon-control is given only the hashes of: the SCRAM verifiers of the passwords of
  * the roles its clients connect as (alasio's, which its spec gives the role, and the
- * lake's, which its alasio sets), which neon-control answers Neon's proxy with, and the
+ * lake's and the harness host's, which its alasio sets), which neon-control answers Neon's proxy with, and the
  * SHA-256 of the token it fetches its spec with, which fetches its spec alone. So what a
  * branch is given reaches neither main's compute nor another branch's spec. main's
  * compute keeps the stack's.
@@ -22,7 +22,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 
 import type { JsonWebKeySet } from "./jwt.ts";
-import { DATABASE, LAKE_ROLE, ROLE } from "./secrets.ts";
+import { DATABASE, HARNESS_ROLE, LAKE_ROLE, ROLE } from "./secrets.ts";
 
 /** alasio's own branch: its first timeline, bootstrapped, never deleted. */
 export const MAIN = "main";
@@ -50,8 +50,8 @@ export interface Placement {
   ids: number[];
 }
 
-/** The roles a branch's clients connect as: alasio's, and its lake's. */
-export const BRANCH_ROLES = [ROLE, LAKE_ROLE] as const;
+/** The roles a branch's clients connect as: alasio's, its lake's, and its harness host's. */
+export const BRANCH_ROLES = [ROLE, LAKE_ROLE, HARNESS_ROLE] as const;
 
 /** A branch's compute's own credentials, as neon-control keeps them: hashes alone. */
 export interface ComputeCredentials {
@@ -158,10 +158,10 @@ function computeCredentials(value: unknown): ComputeCredentials {
     Object.keys(rest).length > 0 || Object.keys(given).length !== BRANCH_ROLES.length || !BRANCH_ROLES.every(verifier) ||
     typeof sha !== "string" || !/^[0-9a-f]{64}$/u.test(sha)
   ) {
-    throw new BranchError(400, `a branch's compute is given as { verifiers, tokenSha256 }: a SCRAM-SHA-256 verifier of each of ${BRANCH_ROLES.join(" and ")}, and a SHA-256 in hexadecimal`);
+    throw new BranchError(400, `a branch's compute is given as { verifiers, tokenSha256 }: a SCRAM-SHA-256 verifier of each of ${BRANCH_ROLES.join(", ")}, and a SHA-256 in hexadecimal`);
   }
   // Each checked above to be a verifier.
-  return { verifiers: { [ROLE]: given[ROLE] as string, [LAKE_ROLE]: given[LAKE_ROLE] as string }, tokenSha256: sha };
+  return { verifiers: { [ROLE]: given[ROLE] as string, [LAKE_ROLE]: given[LAKE_ROLE] as string, [HARNESS_ROLE]: given[HARNESS_ROLE] as string }, tokenSha256: sha };
 }
 
 /** The branch `body` asks for: `{ name, parent?, lsn?, compute }`, its parent main if not given. */

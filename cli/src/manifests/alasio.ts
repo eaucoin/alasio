@@ -424,6 +424,7 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     { name: "TELEGRAM_ALLOWED_USER_IDS", valueFrom: { secretKeyRef: { name: alasio.telegram.existingSecret, key: "allowedUserIds" } } },
     { name: "ALASIO_DATABASE_URL_FILE", value: "/run/alasio/database/url" },
     { name: "ALASIO_LAKE_VERIFIER_FILE", value: "/run/alasio/database/lake-verifier" },
+    { name: "ALASIO_HARNESS_VERIFIER_FILE", value: "/run/alasio/database/harness-verifier" },
     ...readerRoles(config, environment).map(({ key, variable }) => ({ name: variable, value: `/run/alasio/database/${key}` })),
     { name: "ALASIO_LAKE_ENABLED", value: config.lake.enabled && config.neon.enabled ? "1" : "0" },
     // Its Telegram updates: its environment's topic, read in its group as its principal.
@@ -524,7 +525,7 @@ function deployment(config: InstallConfig, templatesChecksum: string, botChecksu
               name: "database",
               secret: {
                 secretName: databaseSecret(config),
-                items: ["url", "lake-verifier", ...readerRoles(config, environment).map(({ key }) => key)].map((key) => ({ key, path: key })),
+                items: ["url", "lake-verifier", "harness-verifier", ...readerRoles(config, environment).map(({ key }) => key)].map((key) => ({ key, path: key })),
               },
             },
             { name: "log", secret: { secretName: environmentLogSecret(environment), items: [{ key: "password", path: "password" }] } },

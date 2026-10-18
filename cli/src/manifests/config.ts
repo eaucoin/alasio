@@ -404,7 +404,10 @@ const NeonService = (resources: Parameters<typeof Resources>[0]) => defaulted(Sc
 
 const Neon = Schema.Struct({
   enabled: defaulted(Schema.Boolean, true),
-  /** Without Neon, alasio's database: a Secret with `url` and `lake-verifier`, the SCRAM verifier of the lake role's password. */
+  /**
+   * Without Neon, alasio's database: a Secret with `url`, `lake-verifier` and `harness-verifier`, the SCRAM verifiers
+   * of the lake role's password and the harness host's.
+   */
   external: defaulted(Schema.Struct({ existingSecret: defaulted(OptionalSecretName, "") }), {}),
   image: Image({
     repository: "neondatabase/neon",

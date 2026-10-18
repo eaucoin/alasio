@@ -268,13 +268,21 @@ if (inShard("upgrade")) {
       (await kube.get(ref("PersistentVolumeClaim", `data-${componentName("log")}-0`, NAMESPACE)))?.metadata?.uid,
     ];
     let logBefore: (string | undefined)[];
-    /** The stack's secrets, as the root Secret's secrets.json and the log's Secret keep them: each key's value's hash, none of the values. */
+    /**
+     * The stack's secrets, as the root Secret's secrets.json and the log's Secret keep them:
+     * each key's value's hash, none of the values; the root's objects, its verifiers among
+     * them, key by key, so a secret a release adds to one changes none of those before it.
+     */
     const stackSecrets = async () => {
       const hash = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 12);
       const data = async (name: string) => (await kube.get<V1Secret>(ref("Secret", name, NAMESPACE)))?.data ?? {};
       const stored = JSON.parse(Buffer.from((await data(neonName("root")))["secrets.json"] ?? "", "base64").toString("utf8") || "{}") as Record<string, unknown>;
       return {
-        root: Object.fromEntries(Object.entries(stored).map(([key, value]) => [key, hash(JSON.stringify(value))])),
+        root: Object.fromEntries(Object.entries(stored).flatMap(([key, value]) =>
+          typeof value === "object" && value !== null && !Array.isArray(value)
+            ? Object.entries(value).map(([inner, held]) => [`${key}.${inner}`, hash(JSON.stringify(held))])
+            : [[key, hash(JSON.stringify(value))]]
+        )),
         log: Object.fromEntries(Object.entries(await data(componentName("log"))).map(([key, value]) => [key, hash(value)])),
       };
     };
@@ -355,13 +363,15 @@ if (inShard("upgrade")) {
         seeds: "the stack's secrets, the log's credentials among them",
         seed: async () => {
           secretsBefore = await stackSecrets();
-          assert.ok(Object.keys(secretsBefore.log).length > 0 && "log" in secretsBefore.root, JSON.stringify(secretsBefore));
+          assert.ok(Object.keys(secretsBefore.log).length > 0 && Object.keys(secretsBefore.root).some((key) => key === "log" || key.startsWith("log.")), JSON.stringify(secretsBefore));
         },
         keeps: "the stack's secrets, each kept, the log's credentials as its nodes were formatted with",
         check: async () => {
           const after = await stackSecrets();
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
+          // And the harness host's role's password and verifier, which this release adds to the stack's.
+          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), ["harnessPassword", "verifiers.harness"]);
         },
       },
       {

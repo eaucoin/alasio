@@ -35,6 +35,7 @@ import {
   completeSecrets,
   DATABASE,
   GRAFANA_ROLE,
+  HARNESS_ROLE,
   LAKE_READER_ROLE,
   LAKE_ROLE,
   LOG_PRINCIPALS,
@@ -67,6 +68,8 @@ export interface SecretNames {
   compute: string;
   proxy: string;
   database: string;
+  /** The harness host's database URL, as its own role (HARNESS_ROLE), for the harness pools to mount. */
+  harnessDatabase: string;
   lake: string;
   grafana: string;
   branches: string;
@@ -153,13 +156,13 @@ export interface SetupKubeOptions {
 }
 
 /**
- * The URL alasio reaches its database at, as its role with `password`, through Neon's proxy
- * at `host`, on the compute `endpoint`: named by the libpq option the proxy reads, as no
- * TLS carries a name in the cluster.
+ * The URL alasio's database is reached at, as `role` (alasio's own unless given) with
+ * `password`, through Neon's proxy at `host`, on the compute `endpoint`: named by the libpq
+ * option the proxy reads, as no TLS carries a name in the cluster.
  */
-export function databaseUrl(host: string, password: string, endpoint: string): string {
+export function databaseUrl(host: string, password: string, endpoint: string, role: string = ROLE): string {
   const url = new URL(`postgresql://${host}:5432/${DATABASE}`);
-  url.username = ROLE;
+  url.username = role;
   url.password = password;
   url.searchParams.set("options", `endpoint=${endpoint}`);
   return url.toString();
@@ -182,6 +185,7 @@ export function secretNames(prefix: string): SecretNames {
     compute: `${prefix}-neon-compute`,
     proxy: `${prefix}-neon-proxy`,
     database: `${prefix}-database`,
+    harnessDatabase: `${prefix}-harness-database`,
     lake: `${prefix}-lake`,
     grafana: `${prefix}-grafana`,
     branches: `${prefix}-branches`,
@@ -258,7 +262,10 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
       "lake-verifier": secrets.verifiers[LAKE_ROLE],
       "lake-reader-verifier": secrets.verifiers[LAKE_READER_ROLE],
       "grafana-verifier": secrets.verifiers[GRAFANA_ROLE],
+      "harness-verifier": secrets.verifiers[HARNESS_ROLE],
     },
+    // The harness host's, which reaches main's compute as its own role, and no further than that role may.
+    [names.harnessDatabase]: { url: databaseUrl(neon.proxyHost, secrets.harnessPassword, computeId(MAIN), HARNESS_ROLE) },
     // The lake service's, and its query endpoint's, which each read their own.
     [names.lake]: {
       LAKE_DATABASE_PASSWORD: secrets.lakePassword,

@@ -21,11 +21,13 @@ export const LAKE_ROLE = "lake";
 export const LAKE_READER_ROLE = "lake_reader";
 /** Grafana's (src/neon/grafana.ts), which alasio makes. */
 export const GRAFANA_ROLE = "grafana";
+/** The harness host's (src/neon/harness.ts), which writes a turn's part of alasio's state, and which alasio makes. */
+export const HARNESS_ROLE = "harness";
 /** neon-control's own (./computes.ts), which every compute's spec gives it, and no client connects as. */
 export const MONITOR_ROLE = "neon_control";
 
 /** The roles main's clients connect as, whose verifiers the stack keeps. */
-export const CLIENT_ROLES = [ROLE, LAKE_ROLE, LAKE_READER_ROLE, GRAFANA_ROLE] as const;
+export const CLIENT_ROLES = [ROLE, LAKE_ROLE, LAKE_READER_ROLE, GRAFANA_ROLE, HARNESS_ROLE] as const;
 export type ClientRole = (typeof CLIENT_ROLES)[number];
 
 /**
@@ -80,6 +82,8 @@ export interface StackSecrets {
   grafanaPassword: string;
   grafanaAdminPassword: string;
   grafanaSecretKey: string;
+  /** The harness host's role's (HARNESS_ROLE). */
+  harnessPassword: string;
   /** What alasio signs each branch environment's token to fork its sessions with (src/branch/names.ts). */
   branchForkKey: string;
   /**
@@ -188,6 +192,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
     lakePassword: kept(stored.lakePassword, () => secret()),
     lakeReaderPassword: kept(stored.lakeReaderPassword, () => secret()),
     grafanaPassword: kept(stored.grafanaPassword, () => secret()),
+    harnessPassword: kept(stored.harnessPassword, () => secret()),
   };
   const log: Partial<StackSecrets["log"]> = kept(stored.log, () => ({}));
   const secrets: StackSecrets = {
@@ -214,6 +219,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
     grafanaPassword: passwords.grafanaPassword,
     grafanaAdminPassword: kept(stored.grafanaAdminPassword, () => secret()),
     grafanaSecretKey: kept(stored.grafanaSecretKey, () => secret()),
+    harnessPassword: passwords.harnessPassword,
     branchForkKey: kept(stored.branchForkKey, () => secret()),
     filerStoreFilerPassword: kept(stored.filerStoreFilerPassword, () => secret()),
     filerStoreCollectorPassword: kept(stored.filerStoreCollectorPassword, () => secret()),
@@ -226,6 +232,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
       [LAKE_ROLE]: kept(verifiers[LAKE_ROLE], () => scramVerifier(passwords.lakePassword)),
       [LAKE_READER_ROLE]: kept(verifiers[LAKE_READER_ROLE], () => scramVerifier(passwords.lakeReaderPassword)),
       [GRAFANA_ROLE]: kept(verifiers[GRAFANA_ROLE], () => scramVerifier(passwords.grafanaPassword)),
+      [HARNESS_ROLE]: kept(verifiers[HARNESS_ROLE], () => scramVerifier(passwords.harnessPassword)),
     },
     nodeAgentToken: kept(stored.nodeAgentToken, () => secret()),
     logClusterId: kept(stored.logClusterId, () => clusterId()),

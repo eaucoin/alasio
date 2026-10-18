@@ -31,6 +31,7 @@ import { type DueOutboxEntry, NeonOutboxRepository, type NewOutboxStatus, type N
 import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState } from "./prompt-job-repository.ts";
 import { type CompletedResponse, NeonResponseRepository, type ResponseBlock } from "./response-repository.ts";
 import { NeonRestartRepository, type NewRestartEvent, type RestartEvent } from "./restart-repository.ts";
+import { grantHarness } from "./harness-grants.ts";
 import { ensureSchema } from "./schema.ts";
 import { type NewSessionWorkspace, NeonSessionWorkspaceRepository, type SessionWorkspace, type SessionWorkspaceNetMode } from "./session-workspace-repository.ts";
 import { poolDatabase, type Sql, StoreError } from "./sql.ts";
@@ -74,6 +75,14 @@ export interface StoreOptions {
   readonly handlingLockTimeout?: Duration.Input | undefined;
   /** How long a statement under a chat's lock may run (LOCKED_STATEMENT_TIMEOUT unless a test says). */
   readonly lockedStatementTimeout?: Duration.Input | undefined;
+  /**
+   * Whether it makes the schema: its tables where missing, a branch's state its own, and the
+   * harness host's grants. alasio's store does; the harness host's, of the schema alasio made,
+   * as a role that may make nothing, does none of it.
+   */
+  readonly makesSchema?: boolean | undefined;
+  /** The harness host's role, granted what it writes once the tables are made (./harness-grants.ts); none where no harness host writes. */
+  readonly harnessRole?: string | null | undefined;
 }
 
 /**
@@ -370,7 +379,7 @@ export class Store extends Context.Service<Store, {
    */
   readonly pruneTransient: (age: Duration.Input) => Stored<void>;
 }>()("alasio/persistence/Store") {
-  /** The store in `schema` of the pool's database, its tables made first where missing. */
+  /** The store in `schema` of the pool's database, made first as `makesSchema` says. */
   static readonly layer = (options: StoreOptions): Layer.Layer<Store, StoreError> => Layer.effect(Store, makeStore(options));
 }
 
@@ -381,14 +390,19 @@ const makeStore = Effect.fnUntraced(function*({
   branch = null,
   handlingLockTimeout = HANDLING_LOCK_TIMEOUT,
   lockedStatementTimeout = LOCKED_STATEMENT_TIMEOUT,
+  makesSchema = true,
+  harnessRole = null,
 }: StoreOptions) {
   const database = poolDatabase(pool);
   /** Bounds the statements of a chat's lock's transaction `sql` (LOCKED_STATEMENT_TIMEOUT), for that transaction alone. */
   const bounded = (sql: Sql): Effect.Effect<void, StoreError> =>
     Effect.asVoid(sql.query("select set_config('statement_timeout', $1, true)", [`${Duration.toMillis(lockedStatementTimeout)}ms`]));
-  yield* ensureSchema(database, schema);
-  if (branch && (yield* startBranch(database, schema, branch))) {
-    yield* Effect.logInfo(`made the state the branch ${branch}'s: what was in flight where it was branched from is gone`);
+  if (makesSchema) {
+    yield* ensureSchema(database, schema);
+    if (harnessRole) yield* grantHarness(database, schema, harnessRole);
+    if (branch && (yield* startBranch(database, schema, branch))) {
+      yield* Effect.logInfo(`made the state the branch ${branch}'s: what was in flight where it was branched from is gone`);
+    }
   }
   /** The repositories on `sql`: a transaction's. */
   const repositoriesOn = (sql: Sql) => repositories(sql, schema, workingDirectory);

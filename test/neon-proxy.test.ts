@@ -16,12 +16,13 @@ import { scramVerifier } from "../neon/control/scram.ts";
 import { startPostgres } from "./support/postgres.ts";
 
 /** dev's compute's own credentials, as its request gave them. */
-const dev: ComputeCredentials = { verifiers: { alasio: scramVerifier("dev-password"), lake: scramVerifier("dev-lake") }, tokenSha256: "0".repeat(64) };
+const dev: ComputeCredentials = { verifiers: { alasio: scramVerifier("dev-password"), lake: scramVerifier("dev-lake"), harness: scramVerifier("dev-harness") }, tokenSha256: "0".repeat(64) };
 const mainVerifiers = {
   alasio: scramVerifier("main-password"),
   lake: scramVerifier("main-lake"),
   lake_reader: scramVerifier("main-reader"),
   grafana: scramVerifier("main-grafana"),
+  harness: scramVerifier("main-harness"),
 };
 
 describe("the proxy's questions", () => {
@@ -38,6 +39,7 @@ describe("the proxy's questions", () => {
   test("are answered, on a branch's, with the verifiers its request gave, and nothing of main's", () => {
     assert.equal(roleSecret(dev, "alasio", mainVerifiers), dev.verifiers.alasio);
     assert.equal(roleSecret(dev, "lake", mainVerifiers), dev.verifiers.lake);
+    assert.equal(roleSecret(dev, "harness", mainVerifiers), dev.verifiers.harness);
     assert.equal(roleSecret(dev, "grafana", mainVerifiers), null);
     assert.equal(roleSecret(dev, "lake_reader", mainVerifiers), null);
   });
