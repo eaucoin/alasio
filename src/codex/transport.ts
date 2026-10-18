@@ -3,7 +3,7 @@
  * be steered and attached to, or through `codex exec` by the Codex SDK when
  * ALASIO_CODEX_TRANSPORT is `exec`. Either way a turn is a stream of events.
  */
-import { Codex, type Thread, type ThreadEvent, type ThreadOptions } from "@openai/codex-sdk";
+import { Codex, type CodexOptions, type Thread, type ThreadEvent, type ThreadOptions } from "@openai/codex-sdk";
 import { Effect, Schema, type Scope, Stream } from "effect";
 
 import { getCodexTransportMode } from "../config.ts";
@@ -15,6 +15,7 @@ import type { AppServerEvent } from "./app-server/protocol.ts";
 import type { AppServerRequestError, AppServerStartError } from "./app-server/rpc-client.ts";
 import type { NoActiveTurn, StaleTurnCleanupError, ThreadIdMissing } from "./app-server/thread-client.ts";
 import type { CodexEnv } from "./env.ts";
+import { disabledFeaturesConfig } from "./features.ts";
 import { ALASIO_CODEX_MODEL, resolveCodexModelChoice, withAlasioCodexModelConfig } from "./model.ts";
 import type { CodexThreadConfig } from "./thread-config.ts";
 import type { TurnTimer } from "./turn-timing.ts";
@@ -147,18 +148,16 @@ const createAttachedAppServerStream = Effect.fnUntraced(function*({ sessionId, t
   return stream;
 });
 
+/** The Codex SDK's options for the exec transport's `codex exec`: its env, and its config, without CODEX_DISABLED_FEATURES. */
+export const execCodexOptions = (codexEnv: CodexEnv, codexConfig: CodexThreadConfig): CodexOptions => ({
+  env: codexEnv,
+  config: { ...withAlasioCodexModelConfig(codexConfig), ...disabledFeaturesConfig() },
+});
+
 /** The exec transport's turn: a Codex SDK thread run with the prompt, stopped when the scope closes. */
 const createExecSdkStream = Effect.fnUntraced(function*({ resumeSession, workingDirectory, codexEnv, codexConfig, prompt, codexFactory, turnTimer, onPromptDispatched }: CodexStreamParams) {
   const codex = yield* Effect.try({
-    try: () => codexFactory
-      ? codexFactory()
-      : new Codex({
-        env: codexEnv,
-        config: {
-          ...withAlasioCodexModelConfig(codexConfig),
-          "features.plugins": false,
-        },
-      }),
+    try: () => (codexFactory ? codexFactory() : new Codex(execCodexOptions(codexEnv, codexConfig))),
     catch: (cause) => new CodexExecError({ cause }),
   });
   yield* turnTimer("codex.client.created");

@@ -211,7 +211,7 @@ test("a Codex turn: a status message, sent then edited, and the final answer alo
   const [edit] = telegram.callsTo("editMessageText", mark);
   assert.equal(edit?.params.message_id, status.messageId);
   // One app-server, started in the folder, as Codex's app-server over stdio.
-  assert.deepEqual(codex.processes.map(({ argv, cwd }) => ({ argv, cwd })), [{ argv: ["app-server", "--disable", "plugins", "--listen", "stdio://"], cwd: alpha }]);
+  assert.deepEqual(codex.processes.map(({ argv, cwd }) => ({ argv, cwd })), [{ argv: ["app-server", "--disable", "plugins", "--disable", "apps", "--listen", "stdio://"], cwd: alpha }]);
   assert.deepEqual(codex.notifications, [{ method: "initialized", params: null }]);
   assert.deepEqual(codex.unanswered(), []);
 });

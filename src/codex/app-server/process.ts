@@ -9,6 +9,7 @@ import { Deferred, Effect, Exit, Schema, type Scope, Stream } from "effect";
 import { getCodexBinaryOverride } from "../../config.ts";
 import { withLogScope } from "../../shared/log.ts";
 import type { CodexEnv } from "../env.ts";
+import { CODEX_DISABLED_FEATURES } from "../features.ts";
 import { codexTelemetryArgs, codexTelemetryEnv } from "./telemetry.ts";
 
 /** Where an app-server process is started, and with what environment. */
@@ -67,8 +68,9 @@ function codexBinPath() {
 }
 
 /**
- * The local codex binary's app-server, over stdio: its error output is logged as it
- * comes, and it is sent SIGTERM when its scope closes.
+ * The local codex binary's app-server, over stdio, without CODEX_DISABLED_FEATURES
+ * (../features.ts): its error output is logged as it comes, and it is sent SIGTERM when its
+ * scope closes.
  */
 export const spawnAppServer: SpawnAppServer = Effect.fnUntraced(function*({ cwd, env }: AppServerProcessOptions) {
   const binPath = codexBinPath();
@@ -78,7 +80,7 @@ export const spawnAppServer: SpawnAppServer = Effect.fnUntraced(function*({ cwd,
   const ended = yield* Deferred.make<never, AppServerEnded>();
   const child = yield* Effect.acquireRelease(
     Effect.try({
-      try: () => spawn(binPath, ["app-server", "--disable", "plugins", ...codexTelemetryArgs(), "--listen", "stdio://"], {
+      try: () => spawn(binPath, ["app-server", ...CODEX_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]), ...codexTelemetryArgs(), "--listen", "stdio://"], {
         cwd,
         env: { ...env, ...codexTelemetryEnv() },
         stdio: ["pipe", "pipe", "pipe"],
