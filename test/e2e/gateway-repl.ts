@@ -6,8 +6,8 @@
  *
  * - `hold <url> <token>`: a new session holding the workspace's files open: a writer appending
  *   a line a step to `held/counter` from a thread of its own, an SQLite database with a
- *   transaction under way, and `held/.git/index.lock`, as git holds it; prints its id and the
- *   step the writer is at.
+ *   transaction under way, and `held/.git/index.lock`, as git holds it; lets go of its control
+ *   of it, and prints its id and the step the writer is at.
  * - `check <url> <token> <sessionId>`: takes the session over, as a client that reconnected
  *   does, and prints what it holds of them: whether the writer runs on, at what step, whether
  *   every line it wrote is there in turn, whether the transaction under way commits whole,
@@ -118,6 +118,9 @@ try {
     const { session } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "python", title: "e2e", cwd: "/workspace" });
     const { stdout } = await exec(client, session.session_id, HOLD);
     const held: ReplHeld = { sessionId: session.session_id, step: Number(stdout.trim()) };
+    // Let go of, so the next client takes it over at once, as one that waited for this one's connections to end would not.
+    const released = (await client.callTool({ name: "session.release_controller", arguments: { session_id: session.session_id } })) as CallToolResult;
+    if (released.isError) throw new Error(`bayma's session.release_controller failed: ${text(released.content[0])}`);
     console.log(JSON.stringify(held));
   } else if (verb === "wait") {
     await call(client, "session.acquire_controller", { session_id: argument });
