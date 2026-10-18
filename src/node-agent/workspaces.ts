@@ -51,6 +51,7 @@
  * meanwhile, the one writer at a time: written whole or not at all, a file of its own synced
  * then renamed over it, the directory synced after.
  */
+import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { chown, lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, statfs, unlink, writeFile } from "node:fs/promises";
@@ -209,6 +210,8 @@ export interface WorkspacesOptions {
   readonly agentUid?: number;
   /** How long a fork's quota is left to settle after each repair before it is checked (QUOTA_SETTLE_MS), but for tests. */
   readonly quotaSettleMs?: number;
+  /** The agent's own mount namespace's mounts (OwnMounts), but for tests. */
+  readonly own?: OwnMounts;
 }
 
 /**
@@ -225,12 +228,26 @@ const QUOTA_REPAIRS = 5;
 /** What an attach writes into a pod's directory, beside its workspace's mount point (`ws`), and what its bayma marks there (`served`). */
 const ATTACHED_FILES: readonly string[] = ["token", "env", "served"];
 
-/** The mount points at or under `directory` as the agent's own mount namespace has them. */
-const ownMountsUnder = (directory: string): Promise<string[]> =>
-  readFile("/proc/self/mountinfo", "utf8").then(
-    (table) => mountPoints(table).filter((point) => point === directory || point.startsWith(`${directory}/`)),
-    () => [],
-  );
+/**
+ * The agent's own mount namespace: the mount points at or under a directory as it has them, and
+ * what unmounts one there, lazily. An agent started after a workspace was attached copied the
+ * node's mounts as its container was made, the attach's among them, which an unmount on the
+ * node does not take where the node's mounts do not propagate to it.
+ */
+export interface OwnMounts {
+  readonly under: (directory: string) => Promise<string[]>;
+  readonly unmount: (point: string) => Promise<void>;
+}
+
+const OWN_MOUNTS: OwnMounts = {
+  under: (directory) =>
+    readFile("/proc/self/mountinfo", "utf8").then(
+      (table) => mountPoints(table).filter((point) => point === directory || point.startsWith(`${directory}/`)),
+      () => [],
+    ),
+  unmount: (point) =>
+    new Promise((resolve, reject) => execFile("umount", ["-l", point], (error, _stdout, stderr) => (error ? reject(new Error(stderr.trim() || error.message)) : resolve()))),
+};
 
 /**
  * Removes a pod's directory, `directory`, nothing mounted under it: what an attach wrote into
@@ -285,7 +302,7 @@ export const lookOnNode = (host: HostCommands) => (point: string): Promise<void>
   });
 
 export function makeWorkspaces(
-  { host, runsc, juicefs, mounted = fuseAt, reaches = reaching(lookOnNode(host)), workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID, quotaSettleMs = QUOTA_SETTLE_MS }: WorkspacesOptions,
+  { host, runsc, juicefs, mounted = fuseAt, reaches = reaching(lookOnNode(host)), workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID, quotaSettleMs = QUOTA_SETTLE_MS, own = OWN_MOUNTS }: WorkspacesOptions,
 ): Workspaces {
   /** Where `ref`'s files are on the node, its names checked. */
   const filesOf = ({ environment, workspace }: WorkspaceRef): Effect.Effect<string, WorkspaceRefused> =>
@@ -447,8 +464,12 @@ export function makeWorkspaces(
         if (running.some(Boolean)) return yield* refused(409, `${pod}'s sandbox still runs: what is attached into it is detached once it can no longer act`);
         // `-l`, not `--lazy`, which the busybox of k3s's own binaries, first on the node's PATH, does not take.
         for (const point of yield* mountsUnder(directory)) yield* onNode(host, ["umount", "-l", point]);
+        // And as the agent's own namespace holds them, as one started after the attach does, deepest first.
+        for (const point of (yield* Effect.promise(() => own.under(directory))).toSorted((a, b) => b.length - a.length)) {
+          yield* Effect.tryPromise(() => own.unmount(point)).pipe(Effect.catch((error) => Effect.logWarning(`${point} was not unmounted as the agent sees it: ${error.message}`)));
+        }
         // Nothing removed where anything is mounted still, on the node or as the agent sees it, which a removal would walk into.
-        const still = [...(yield* mountsUnder(directory)), ...(yield* Effect.promise(() => ownMountsUnder(directory)))];
+        const still = [...(yield* mountsUnder(directory)), ...(yield* Effect.promise(() => own.under(directory)))];
         if (still.length > 0) return yield* refused(409, `${pod}'s directory holds ${[...new Set(still)].join(", ")} still, unmounted as it was: nothing of it is removed`);
         const left = yield* Effect.promise(() => removeAttached(directory));
         if (left.length > 0) yield* Effect.logWarning(`${pod}'s directory is left on the node, as it holds what no attach wrote: ${left.join(", ")}`);

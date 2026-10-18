@@ -360,7 +360,8 @@ export function sandboxService(): void {
         JSON.stringify(checked),
       );
       assert.ok(checked.step > held.step, JSON.stringify(checked));
-      assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
+      const released = await gatewayCall(token, "POST", "/release");
+      assert.equal(released.status, 204, `${released.said}\n${await serviceLogs(workspace)}`);
       await until("the gateway deleting the workspace", async () => ((await gatewayCall(token, "DELETE", "/workspace")).status === 204 ? true : undefined), 180_000);
     });
 

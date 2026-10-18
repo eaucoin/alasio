@@ -19,6 +19,8 @@ export function workspacesNode() {
   const workspacesRoot = join(root, "workspaces");
   const attachRoot = join(root, "attach");
   const mounts: string[] = [];
+  // The mounts the agent's own namespace holds, as one started after an attach copied them.
+  const ownMounts: string[] = [];
   // The mount points an unmount does not take, as one that did not.
   const stuck = new Set<string>();
   const ran: string[] = [];
@@ -86,6 +88,10 @@ export function workspacesNode() {
     attachRoot,
     agentUid: process.getuid?.() ?? 1000,
     quotaSettleMs: 0,
+    own: {
+      under: (directory) => Promise.resolve(ownMounts.filter((point) => point === directory || point.startsWith(`${directory}/`))),
+      unmount: (point) => Promise.resolve(void ownMounts.splice(ownMounts.indexOf(point), 1)),
+    },
   });
   /** Has the next `count` checks of a quota, without repair, find it off. */
   const inconsistentChecks = (count: number) => writeFileSync(join(root, "inconsistent"), `${count}\n`);
@@ -99,6 +105,6 @@ export function workspacesNode() {
   const pod = (name: string) => mkdirSync(join(attachRoot, name), { recursive: true });
   /** What JuiceFS's command was run with, a call a line. */
   const juicefsCalls = () => (existsSync(join(root, "juicefs.log")) ? readFileSync(join(root, "juicefs.log"), "utf8").trim().split("\n") : []);
-  return { root, workspacesRoot, attachRoot, mounts, stuck, ran, tokenAtMount, running, annotations, execs, hooks, storage, unreachable, workspaces, files, pod, juicefsCalls, inconsistentChecks, done: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, workspacesRoot, attachRoot, mounts, stuck, ran, tokenAtMount, running, annotations, execs, hooks, storage, unreachable, workspaces, files, pod, juicefsCalls, inconsistentChecks, ownMounts, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 

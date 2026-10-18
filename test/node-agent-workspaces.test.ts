@@ -238,6 +238,22 @@ test("a detach whose unmount did not take removes nothing of the pod's directory
   }
 });
 
+test("a detach, by an agent started after the attach, unmounts what its own namespace copied of the pod's directory too, and removes it", async () => {
+  const at = workspacesNode();
+  try {
+    at.files("fs-again");
+    at.pod("pool-0");
+    await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-again" }, "pool-0", "t", {}));
+    // Its own namespace's copy, as its container was made after the attach.
+    at.ownMounts.push(join(at.attachRoot, "pool-0", "ws"));
+    await Effect.runPromise(at.workspaces.detach("pool-0", []));
+    assert.deepEqual([at.mounts, at.ownMounts], [[], []]);
+    assert.equal(existsSync(join(at.attachRoot, "pool-0")), false);
+  } finally {
+    at.done();
+  }
+});
+
 test("a detach is refused while the pod's sandbox runs, and once it has ended unmounts lazily all under its directory, deepest first, and removes it", async () => {
   const at = workspacesNode();
   try {
