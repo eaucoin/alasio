@@ -124,6 +124,27 @@ const create = (profile: SessionsProfile) => Effect.gen(function*() {
   });
 });
 
+/**
+ * Takes the REPL `replId` over as `client`'s: bayma refuses while the client before still
+ * holds a connection, as the one a step before this closed may for a while once it closed
+ * it, and so is asked again, for up to ACQUIRE_WITHIN_MS.
+ */
+async function acquire(client: Client, replId: string): Promise<void> {
+  const deadline = Date.now() + ACQUIRE_WITHIN_MS;
+  for (;;) {
+    try {
+      await call(client, "session.acquire_controller", { session_id: replId });
+      return;
+    } catch (error) {
+      if (!(error instanceof Error && error.message.includes("controller lease already held")) || Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+}
+
+/** How long acquire asks again for a REPL the client before still holds. */
+const ACQUIRE_WITHIN_MS = 60_000;
+
 /** The session's REPL, as a new client that takes it over, given to `use`. */
 const inRepl = <A>(profile: SessionsProfile, volumeId: string, replId: string, use: (client: Client) => Promise<A>) => Effect.gen(function*() {
   const sandboxes = yield* makeSandboxes({ namespace: profile.namespace, port: profile.port });
@@ -135,7 +156,7 @@ const inRepl = <A>(profile: SessionsProfile, volumeId: string, replId: string, u
   return yield* Effect.promise(async () => {
     const client = await connect(bayma);
     try {
-      await call(client, "session.acquire_controller", { session_id: replId });
+      await acquire(client, replId);
       return await use(client);
     } finally {
       await client.close();
