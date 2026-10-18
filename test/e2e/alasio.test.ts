@@ -13,7 +13,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -266,6 +266,17 @@ if (inShard("upgrade")) {
       (await kube.get(ref("PersistentVolumeClaim", `data-${componentName("log")}-0`, NAMESPACE)))?.metadata?.uid,
     ];
     let logBefore: (string | undefined)[];
+    /** The stack's secrets, as the root Secret's secrets.json and the log's Secret keep them: each key's value's hash, none of the values. */
+    const stackSecrets = async () => {
+      const hash = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 12);
+      const data = async (name: string) => (await kube.get<V1Secret>(ref("Secret", name, NAMESPACE)))?.data ?? {};
+      const stored = JSON.parse(Buffer.from((await data(neonName("root")))["secrets.json"] ?? "", "base64").toString("utf8") || "{}") as Record<string, unknown>;
+      return {
+        root: Object.fromEntries(Object.entries(stored).map(([key, value]) => [key, hash(JSON.stringify(value))])),
+        log: Object.fromEntries(Object.entries(await data(componentName("log"))).map(([key, value]) => [key, hash(value)])),
+      };
+    };
+    let secretsBefore: Awaited<ReturnType<typeof stackSecrets>>;
     /** When the telemetry the lake held was counted, and how many of alasio's spans it held then; and when the cut-over was through. */
     let counted: number;
     let spans: number;
@@ -331,6 +342,19 @@ if (inShard("upgrade")) {
           await tg.say("through the replica");
           await tg.waitFor((call) => answered(call));
           await untilInLake("main's turn, loaded through its read replica", `select count(*) as n from codex.turns where epoch_ms(completed_at) >= ${since}`, 600_000);
+        },
+      },
+      {
+        seeds: "the stack's secrets, the log's credentials among them",
+        seed: async () => {
+          secretsBefore = await stackSecrets();
+          assert.ok(Object.keys(secretsBefore.log).length > 0 && "log" in secretsBefore.root, JSON.stringify(secretsBefore));
+        },
+        keeps: "the stack's secrets, each kept, the log's credentials as its nodes were formatted with",
+        check: async () => {
+          const after = await stackSecrets();
+          const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
+          assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
         },
       },
       {
@@ -425,7 +449,8 @@ if (inShard("upgrade")) {
       assert.ok(!(await recorded()).includes("point-of-no-return"));
       assert.equal(await alasioGeneration(), generation);
       assert.ok(await runs(RELEASE), "alasio runs as it did");
-      await alasioOk("branch", "delete", BRANCH);
+      // By the branch's Telegram, whose bot's webhook it deletes, as main's is another bot's.
+      await alasioOkWith({ TELEGRAM_API_ROOT: branchTelegram?.base }, "branch", "delete", BRANCH);
       // Main's alasio answers as it did, its branch gone.
       await tg.say("after the branch");
       await tg.waitFor((call) => answered(call));
