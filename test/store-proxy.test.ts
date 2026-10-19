@@ -411,23 +411,24 @@ test("a resumed token read back by a proxy that starts again lasts a window from
   withDirectory(async (directory) => {
     const tokensFile = join(directory, "node-agent", "tokens.json");
     const status = (proxy: StoreProxy, token: StoreToken) => Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token })).pipe(Effect.map(refusal));
-    const windows = { tokensFile, askedWindowMs: 200, keptEveryMs: 0 };
+    // Each window a second, so a request asked at once, on however loaded a machine, comes
+    // within it; the time away past both, as an agent down for twenty minutes is past two.
+    const windows = { tokensFile, askedWindowMs: 1000, keptEveryMs: 0 };
     const [away, capped] = await withProxy(({ proxy }) =>
       Effect.gen(function*() {
         const away = minted(proxy, "main/fs-a", "socket");
         const capped = minted(proxy, "main/fs-b", "socket");
-        proxy.resumed("main/fs-a", 100);
-        proxy.resumed("main/fs-b", 100);
+        proxy.resumed("main/fs-a", 1000);
+        proxy.resumed("main/fs-b", 1000);
         assert.equal(yield* status(proxy, away), "200 ");
         return [away, capped] as const;
       }), { ...windows, resumedCeilingMs: 60_000 });
-    // Away for ten times its window, as an agent down for twenty minutes is for two.
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await new Promise((resolve) => setTimeout(resolve, 3000));
     await withProxy(({ proxy }) =>
       Effect.gen(function*() {
         assert.equal(yield* status(proxy, away), "200 ");
-        // Asked of no more: a window later, it ends.
-        yield* sleep(400);
+        // Asked of no more: past a window later, it ends.
+        yield* sleep(2000);
         assert.equal(yield* status(proxy, away), "403 AccessDenied");
       }), { ...windows, resumedCeilingMs: 60_000 });
     // Past its ceiling, as an agent away longer than a restore's ceiling: refused.
