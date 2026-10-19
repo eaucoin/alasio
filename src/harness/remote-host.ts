@@ -18,6 +18,7 @@ import { HarnessHostError } from "./index.ts";
 import {
   Alive,
   BackgroundWorkAnswer,
+  DrainAnswer,
   type CrossingError,
   crossingErrorOf,
   decodeTurnAnswer,
@@ -148,6 +149,7 @@ function makeRemoteHost({ url, token, panels }: RemoteHostOptions): HarnessHost[
         Effect.mapError((error) => (error._tag === "HarnessHostError" ? error : new HarnessHostError({ reason: error.message }))),
       ),
     status: (conversationId) => call(HOST_PATHS.status, { conversationId }, StatusAnswer).pipe(Effect.mapError(asStatusError)),
+    drain: (conversationId) => call(HOST_PATHS.drain, { conversationId }, DrainAnswer).pipe(Effect.map(({ drained }) => drained), Effect.mapError(asStatusError)),
     backgroundWork: (conversationId) =>
       call(HOST_PATHS.backgroundWork, { conversationId }, BackgroundWorkAnswer).pipe(Effect.map(({ working }) => working), Effect.mapError(asStatusError)),
     startFreshSession: ({ conversationId, harness, workingDirectory }) =>

@@ -95,11 +95,22 @@ export class HarnessHost extends Context.Service<HarnessHost, {
   readonly status: (conversationId: string) => Effect.Effect<HarnessStatus, StoreError | HarnessHostError>;
   /**
    * Whether the conversation's harness has work of its own going on between the turns
-   * alasio runs (Harness.backgroundWork), which 14.3's release waits for: asked apart from
+   * alasio runs (Harness.backgroundWork), which a harness pool's pod's release waits for: asked apart from
    * status, as its harness may have to be asked, so what asks whether it is busy alone asks
    * no harness.
    */
   readonly backgroundWork: (conversationId: string) => Effect.Effect<boolean, StoreError | HarnessHostError>;
+  /**
+   * Readies the host to be let go of, as a harness pool's pod's release does before it deletes
+   * the pod, where nothing goes on in the conversation: no turn runs in it, or is about to
+   * (reserved), none of its harness's own, no hold keeps it, and its harness works on nothing of
+   * its own; whether it drained. Drained, no turn is started in it from then on (it reads as
+   * busy, and is reserved for none), and what its harness keeps of its session beside it is
+   * mirrored (Harness.mirror); not drained, as something goes on in it again, it is kept as it
+   * was, and its release is the caller's to give up, as nothing it waits on waits on the
+   * release. How long a mirror may take is the caller's to bound.
+   */
+  readonly drain: (conversationId: string) => Effect.Effect<boolean, StoreError | HarnessHostError>;
   /** A new, empty session of `harness` in `workingDirectory` for the conversation: its id. */
   readonly startFreshSession: (params: { readonly conversationId: string; readonly harness: HarnessName; readonly workingDirectory: string }) => Effect.Effect<string, HarnessError | HarnessUnavailable>;
   /** What the panels reach of the mount's harness in its folder; none until both are mounted. */
@@ -112,6 +123,14 @@ export class HarnessHost extends Context.Service<HarnessHost, {
     const store = yield* Store;
     const receivedFiles = yield* ReceivedFiles;
     const { tell } = yield* HostEvents;
+    /** The conversations let go of (drain), which no turn starts in again. */
+    const draining = new Set<string>();
+    /** A turn of none, which holds a conversation as it is drained, while its harness is mirrored. */
+    const drainTurn = { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false };
+    /** The conversation's mount's harness, if one serves it. */
+    const harnessOf = (conversationId: string) =>
+      Effect.flatMap(store.getMount(conversationId), (mount) =>
+        Effect.map(harnesses.forMount(mount).pipe(Effect.orElseSucceed(() => Option.none<Harness>())), (harness) => ({ mount, harness: Option.getOrNull(harness) })));
 
     /** How the conversation's harness claims it for a turn it starts on its own: as alasio's turns are claimed, ending under the epoch it claimed. */
     const ownTurnsOf = (conversationId: string, chatId: string, harness: HarnessName): OwnTurns => ({
@@ -129,7 +148,7 @@ export class HarnessHost extends Context.Service<HarnessHost, {
     return HarnessHost.of({
       reserve: (conversationId) =>
         Effect.gen(function*() {
-          if (!(yield* activeTurns.reserve(conversationId))) return false;
+          if (draining.has(conversationId) || !(yield* activeTurns.reserve(conversationId))) return false;
           return !(yield* store.isConversationHeld(conversationId));
         }),
       startTurn: (start) =>
@@ -175,7 +194,7 @@ export class HarnessHost extends Context.Service<HarnessHost, {
           const turn = yield* activeTurns.get(conversationId);
           const held = yield* store.isConversationHeld(conversationId);
           return {
-            busy: Option.isSome(turn) || held,
+            busy: Option.isSome(turn) || held || draining.has(conversationId),
             running: Option.isSome(turn),
             cliInitiated: Option.exists(turn, ({ cliInitiated }) => cliInitiated),
             held,
@@ -184,8 +203,22 @@ export class HarnessHost extends Context.Service<HarnessHost, {
         }),
       backgroundWork: (conversationId) =>
         Effect.gen(function*() {
-          const harness = Option.getOrNull(yield* harnesses.forMount(yield* store.getMount(conversationId)).pipe(Effect.orElseSucceed(() => Option.none<Harness>())));
+          const { harness } = yield* harnessOf(conversationId);
           return harness?.backgroundWork ? yield* harness.backgroundWork(conversationId) : false;
+        }),
+      drain: (conversationId) =>
+        Effect.gen(function*() {
+          // Held from a turn while its harness is mirrored, where none runs or is about to; drained only where nothing else goes on in it either.
+          const drained = yield* Effect.scoped(Effect.gen(function*() {
+            if (!(yield* activeTurns.register(conversationId, drainTurn, { onlyIfIdle: true }))) return false;
+            const { mount, harness } = yield* harnessOf(conversationId);
+            if ((yield* store.isConversationHeld(conversationId)) || (harness?.backgroundWork && (yield* harness.backgroundWork(conversationId)))) return false;
+            draining.add(conversationId);
+            if (harness?.mirror && mount.sessionId) yield* harness.mirror(mount.sessionId);
+            return true;
+          }));
+          yield* Effect.logInfo(drained ? `drained ${conversationId}: no turn is started in it again` : `${conversationId} was not drained, as something goes on in it`);
+          return drained;
         }),
       startFreshSession: ({ conversationId, harness, workingDirectory }) =>
         Effect.flatMap(harnesses.getFor(harness, workingDirectory), (found) => found.startFreshSession({ threadKey: conversationId, workingDirectory })),

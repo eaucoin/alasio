@@ -28,6 +28,8 @@ import type { HarnessUnavailable, TurnResult } from "./index.ts";
 import {
   BackgroundWorkAnswer,
   BackgroundWorkRequest,
+  DrainAnswer,
+  DrainRequest,
   encodeTurnAnswer,
   failureOf,
   FreshSessionAnswer,
@@ -179,6 +181,12 @@ export const serveHost = Effect.fnUntraced(function*(
         return Effect.flatMap(body(BackgroundWorkRequest), () =>
           host.backgroundWork(conversationId).pipe(
             Effect.map((working) => answer(200, Schema.encodeSync(BackgroundWorkAnswer)({ working }))),
+            Effect.mapError((error) => failed(422, error)),
+          ));
+      case HOST_PATHS.drain:
+        return Effect.flatMap(body(DrainRequest), () =>
+          host.drain(conversationId).pipe(
+            Effect.map((drained) => answer(200, Schema.encodeSync(DrainAnswer)({ drained }))),
             Effect.mapError((error) => failed(422, error)),
           ));
       case HOST_PATHS.freshSession:

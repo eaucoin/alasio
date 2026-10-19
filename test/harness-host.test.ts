@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { Array as Arr, Context, Effect, Layer, Logger, Option, PubSub, type Scope } from "effect";
+import { Array as Arr, Context, Deferred, Effect, Fiber, Layer, Logger, Option, PubSub, type Scope } from "effect";
 
 import { CodexAppServer, makeAppServer } from "../src/codex/app-server/client.ts";
 import { AppServerRequestTimeout } from "../src/codex/app-server/rpc-client.ts";
@@ -218,6 +218,42 @@ test("Codex has work of its own in a conversation as its app-server says, none w
   }).pipe(Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push(Arr.ensure(message).join(" ")))])))));
   assert.ok(logged.some((line) => line.includes("could not tell whether Codex works on its own in telegram:41, so it is taken to")), JSON.stringify(logged));
 });
+
+for (const [reach, reached] of Object.entries(REACHES)) {
+  test(`the host ${reach}, drained to be let go of, drains at once where nothing goes on in it, its harness's session mirrored, and starts no turn after; where a turn is about to run, or its harness works on its own, it drains nothing and keeps it as it was`, async () => {
+    const store = await testStore();
+    const conversationId = await run(store.upsertConversation({ chatId: "41", user: { id: 41 } }));
+    await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+    await run(store.setWorkingDirectory(conversationId, "/work"));
+    await run(store.setSessionId(conversationId, "session-1"));
+    const mirrored: string[] = [];
+    let working = false;
+    const harness: Harness = { ...recordingHarness([]), mirror: (sessionId) => Effect.sync(() => void mirrored.push(sessionId)), backgroundWork: () => Effect.sync(() => working) };
+    await withServices({ store, harnesses: { [CODEX_HARNESS]: harness }, turns: turnsStub({}) }, (alasio) =>
+      alasio.runPromise(Effect.scoped(Effect.gen(function*() {
+        const host = yield* reached(yield* HarnessHost, conversationId);
+        // A turn about to run, its reservation held until it is let go: not drained, and not waited for, so neither waits on the other.
+        const letGo = yield* Deferred.make<void>();
+        const turn = yield* Effect.forkChild(Effect.scoped(Effect.andThen(host.reserve(conversationId), Deferred.await(letGo))));
+        while (!(yield* host.status(conversationId)).running) yield* Effect.sleep("10 millis");
+        assert.deepEqual([yield* host.drain(conversationId), mirrored], [false, []]);
+        yield* Deferred.succeed(letGo, undefined);
+        yield* Fiber.join(turn);
+        // Kept as it was: a turn reserves it again, then lets it go.
+        assert.equal(yield* Effect.scoped(host.reserve(conversationId)), true);
+        // Its harness working on its own: not drained.
+        working = true;
+        assert.deepEqual([yield* host.drain(conversationId), mirrored], [false, []]);
+        working = false;
+        // Nothing going on: drained, mirrored, and no turn is started in it again.
+        assert.equal(yield* host.drain(conversationId), true);
+        assert.deepEqual(mirrored, ["session-1"]);
+        assert.equal((yield* host.status(conversationId)).busy, true);
+        assert.equal(yield* Effect.scoped(host.reserve(conversationId)), false);
+      })))
+    );
+  });
+}
 
 test("a host tells what its harness does on its own as the HostEvents it is given says, as a harness pool's pod tells it on the log", async () => {
   const store = await testStore();

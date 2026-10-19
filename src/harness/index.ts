@@ -194,6 +194,12 @@ export interface Harness {
    * where it keeps none. Where it cannot tell, it says so in alasio's log and has.
    */
   readonly backgroundWork?: ((threadKey: string) => Effect.Effect<boolean>) | undefined;
+  /**
+   * Mirrors what the harness keeps of the session `sessionId` where it is kept beside it, so
+   * a host let go of leaves none of it behind: Codex's rollouts, to Neon. None where its
+   * mirror keeps up as it writes (Claude Code's transcripts, through its session store).
+   */
+  readonly mirror?: ((sessionId: string) => Effect.Effect<void>) | undefined;
   readonly listModels: () => Effect.Effect<ModelOption[], HarnessError>;
   /** What a turn runs on when no /model choice is stored. */
   readonly defaultModelChoice: () => ModelChoice;

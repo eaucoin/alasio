@@ -29,6 +29,7 @@ export const HOST_PATHS = {
   interrupt: "/interrupt",
   status: "/status",
   backgroundWork: "/background-work",
+  drain: "/drain",
   freshSession: "/fresh-session",
 } as const;
 
@@ -110,6 +111,9 @@ export const StatusAnswer = Schema.Struct({
   held: Schema.Boolean,
   idleSince: Schema.NullOr(Schema.Number),
 });
+
+export const DrainRequest = Conversation;
+export const DrainAnswer = Schema.Struct({ drained: Schema.Boolean });
 
 export const BackgroundWorkRequest = Conversation;
 export const BackgroundWorkAnswer = Schema.Struct({ working: Schema.Boolean });

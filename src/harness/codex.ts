@@ -138,6 +138,7 @@ export const makeCodexHarness = Effect.fnUntraced(function*({
     startFreshSession: ({ threadKey }) => startFreshCodexSession({ threadKey, ...scopeParams }).pipe(scoped),
     warmSession: ({ sessionId, threadKey }) =>
       ensureRollouts(sessionId).pipe(Effect.andThen(warmCodexSession({ sessionId, threadKey, ...scopeParams })), scoped),
+    mirror: flushRollouts,
     runTurn: (params) =>
       ensureRollouts(params.resumeSession).pipe(
         Effect.andThen(executeCodexTurn({ ...params, ...scopeParams, beforeResponseComplete: flushRollouts })),
