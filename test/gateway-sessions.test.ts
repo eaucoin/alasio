@@ -627,7 +627,7 @@ test("each attach and detach is timed, and each binding released counted by why:
   })();
   const detached = await added(DETACH_DURATION, async () => {
     const asked = await added(RELEASES, async () => {
-      assert.equal(await Effect.runPromise(binder.release(placement.pool, key, placement.release)), true);
+      assert.equal(await Effect.runPromise(binder.release(placement.pool, key, placement.release)), "released");
     });
     assert.deepEqual(asked, { [`${of},alasio.gateway.release.reason=asked`]: 1 });
   });

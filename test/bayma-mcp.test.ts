@@ -71,9 +71,24 @@ test("a folder instance that did not start leaves the turn without bayma, told w
       // As the operator asks, bound again though held.
       failing = null;
       assert.equal(yield* host.retry(SCOPE), "Its bayma started: the next message works with its REPL tools.");
-      assert.equal(yield* host.restart(SCOPE), "Its folder instance stopped, its REPL sessions saved: the next message starts it anew.");
+      assert.equal(yield* host.restart(SCOPE), "Its folder instance is stopped, its REPL sessions saved, and its failed binds forgotten: the next message starts it anew.");
     }));
   assert.deepEqual(calls.filter((call) => !call.startsWith("bind claude")), ["bind retry claude telegram:42", "release claude telegram:42"]);
+});
+
+test("a restart of a folder instance being bound or released says its failed binds are forgotten but it was not restarted, and its chat is told again of it held", async () => {
+  const telegram = recordingTelegram();
+  let held = true;
+  const { folders } = fakeFolders(() => (held ? Effect.fail(new FolderBindFailed({ reason: "its last 3 binds failed", held: true })) : Effect.void));
+  const busy = { ...folders, release: () => Effect.fail(new GatewayError({ call: "release the folder instance of telegram:42 under claude", status: 409, reason: "being bound now" })) };
+  await withHostBayma(busy, telegram, (host) =>
+    Effect.gen(function*() {
+      yield* host.ensure({ ...SCOPE, chatId: "42" });
+      assert.equal(yield* host.restart(SCOPE), "Its failed binds are forgotten, but it is being started or stopped now, so it was not restarted: ask again in a moment.");
+      yield* host.ensure({ ...SCOPE, chatId: "42" });
+      held = false;
+    }));
+  assert.equal(telegram.calls.sendMessage.length, 2, "held, told again after the restart");
 });
 
 test("a retry that fails says why, and a restart the gateway refuses says it was not", async () => {

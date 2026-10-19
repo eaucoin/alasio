@@ -82,5 +82,7 @@ export const restartFolder = (conversation: string): Effect.Effect<string[], Gat
   Effect.forEach([CLAUDE_HARNESS, CODEX_HARNESS] as const, (harness) =>
     Effect.map(asMain(folderKey(harness, conversation), "POST", "/release"), ({ status, text }) =>
       status === 204
-        ? `${harnessDisplayName(harness)}: its folder instance of ${conversation} is let go, its REPL sessions saved; the next message makes it anew`
+        ? `${harnessDisplayName(harness)}: its folder instance of ${conversation} is let go, its REPL sessions saved, its failed binds forgotten; the next message makes it anew`
+        : status === 409
+        ? `${harnessDisplayName(harness)}: its failed binds of ${conversation} are forgotten, but it is being started or stopped now, so it was not let go: ask again in a moment`
         : `${harnessDisplayName(harness)}: the sandbox gateway did not let it go (${status}): ${text}`));

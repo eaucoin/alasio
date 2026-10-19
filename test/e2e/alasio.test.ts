@@ -703,7 +703,7 @@ if (inShard("upgrade")) {
       writeFileSync(configFile, JSON.stringify(config));
       await alasioOk("up", "--timeout", "20m");
       const conversation = folderBayma.key.slice(folderBayma.key.indexOf(":", "folder:".length) + 1);
-      assert.match(await alasioOk("folder", "restart", conversation), /its folder instance of [^\n]+ is let go, its REPL sessions saved; the next message makes it anew/u);
+      assert.match(await alasioOk("folder", "restart", conversation), /its folder instance of [^\n]+ is let go, its REPL sessions saved, its failed binds forgotten; the next message makes it anew/u);
       const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), folderRepls.python, folderRepls.bun);
       const kept = `kept by ${folderBayma.name}`;
       assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [null, kept, false, null, kept], JSON.stringify(seen));
@@ -904,7 +904,7 @@ if (inShard("sessions")) {
       const key = "folder:claude:e2e:folder";
       const set = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", GATEWAY_MCP, await mainKeyToken(key), "kept by e2e:folder");
       const [before] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
-      assert.match(await alasioOk("folder", "restart", "e2e:folder"), /^Claude: its folder instance of e2e:folder is let go, its REPL sessions saved; the next message makes it anew$/mu);
+      assert.match(await alasioOk("folder", "restart", "e2e:folder"), /^Claude: its folder instance of e2e:folder is let go, its REPL sessions saved, its failed binds forgotten; the next message makes it anew$/mu);
       const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(key), set.python, set.bun);
       assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], ["kept by e2e:folder", "kept by e2e:folder", true, "kept by e2e:folder", "kept by e2e:folder"], JSON.stringify(seen));
       assert.ok((seen.python.count ?? 0) > set.count, JSON.stringify(seen));

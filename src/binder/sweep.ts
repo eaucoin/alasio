@@ -12,6 +12,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Clock, Effect, Schema } from "effect";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
+import type { Released } from "./binder.ts";
 import { activeAt, type BindingLease, heldLeases } from "./bindings.ts";
 import { KEY_ANNOTATION, type Pool } from "./names.ts";
 import { bindingToken } from "./tokens.ts";
@@ -57,11 +58,11 @@ export const baymaIdleness = ({ podPort, releaseAfterMs, idlePollMs = IDLE_POLL_
     return now - since >= releaseAfterMs ? ({ idle: true } as const) : ({ idle: false, askAt: Math.max(now + idlePollMs, since + releaseAfterMs) } as const);
   });
 
-/** What makeSweep is given: the pools there are now, how a bound pod is found idle, and how a binding is released, whether it was. */
+/** What makeSweep is given: the pools there are now, how a bound pod is found idle, and how a binding is released, and how that went. */
 export interface SweepOptions<E> {
   readonly pools: Effect.Effect<readonly Pool[]>;
   readonly idleness: (lease: BindingLease, pod: V1Pod | null, now: number) => Effect.Effect<Idleness>;
-  readonly release: (pool: Pool, key: string, lease: BindingLease) => Effect.Effect<boolean, E>;
+  readonly release: (pool: Pool, key: string, lease: BindingLease) => Effect.Effect<Released, E>;
 }
 
 /** A sweep, as the module says: run, it releases each binding idle now, and says which keys; a release that fails is logged, and asked of again at the next. */
@@ -86,8 +87,8 @@ export const makeSweep = Effect.fnUntraced(function*<E extends { readonly messag
           continue;
         }
         due.delete(binding);
-        const done = yield* release(pool, key, lease).pipe(Effect.catch((error) => Effect.logWarning(`releasing ${key} failed: ${error.message}`).pipe(Effect.as(false))));
-        if (done) released.push(key);
+        const done = yield* release(pool, key, lease).pipe(Effect.catch((error) => Effect.logWarning(`releasing ${key} failed: ${error.message}`).pipe(Effect.as("busy" as const))));
+        if (done === "released") released.push(key);
       }
     }
     // Of a binding let go meanwhile, as by another replica, nothing more to ask.

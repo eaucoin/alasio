@@ -171,6 +171,24 @@ async function bindAs(of: Awaited<ReturnType<typeof foldersOf>>, key: string, st
   return { placement, result: await binding };
 }
 
+test("a held folder instance's restart, its caller's release, forgets its binds' failures, bound or not, so its next bind goes on", async () => {
+  const stand = await bayma();
+  try {
+    const of = await foldersOf(stand.port);
+    const key = folderKey("claude", "telegram:8");
+    const placed = await Effect.runPromise(of.folders.place(key, { environment: "main" }));
+    for (let n = 0; n < 3; n += 1) await Effect.runPromise(placed.settled?.("its pod is pending: no node") ?? Effect.void);
+    const heldNow = async () => Effect.runPromise((await Effect.runPromise(of.folders.place(key, { environment: "main" }))).held ?? Effect.succeed(null));
+    assert.notEqual(await heldNow(), null);
+    await Effect.runPromise(Effect.provide(placed.reset ?? Effect.void, Layer.fresh(KubeClient.layer)));
+    assert.equal(await heldNow(), null);
+    // Of none to forget, as it is reset again, none is refused.
+    await Effect.runPromise(Effect.provide(placed.reset ?? Effect.void, Layer.fresh(KubeClient.layer)));
+  } finally {
+    stand.close();
+  }
+});
+
 test("a folder instance's bind gives its pod its time to run and its bayma to answer, or deletes the pod and its Lease, saying why", async () => {
   const stand = await bayma();
   try {

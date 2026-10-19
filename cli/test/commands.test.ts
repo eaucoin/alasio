@@ -569,7 +569,10 @@ test("folder restart lets a conversation's instance of each harness go through t
   await gatewayFront(t, kube, (environment, key, method, path) => {
     if (environment !== "main") return { status: 403 };
     asked.push(`${method} ${path} ${key}`);
-    if (method === "POST" && path === "/release") return key.startsWith("folder:codex:") ? { status: 503, json: { error: "not now" } } : { status: 204 };
+    if (method === "POST" && path === "/release") {
+      if (key.endsWith(":telegram:9")) return { status: 503, json: { error: "not now" } };
+      return key.startsWith("folder:codex:") ? { status: 409, json: { error: "being bound now", busy: true } } : { status: 204 };
+    }
     if (method === "GET" && path === "/folders") {
       return { status: 200, json: { folders: [
         { key: "folder:claude:telegram:42", harness: "claude", conversation: "telegram:42", pod: "bayma-0123456789abcdef-a1b2c", boundAt: at(3 * 3_600_000), lastExecAt: at(5 * 60_000), failing: null },
@@ -581,10 +584,13 @@ test("folder restart lets a conversation's instance of each harness go through t
   const restarted = await alasio(["folder", "restart", "telegram:42"]);
   succeeded(restarted);
   assert.deepEqual(restarted.printed, [
-    "Claude: its folder instance of telegram:42 is let go, its REPL sessions saved; the next message makes it anew",
-    "Codex: the sandbox gateway did not let it go (503): {\"error\":\"not now\"}",
+    "Claude: its folder instance of telegram:42 is let go, its REPL sessions saved, its failed binds forgotten; the next message makes it anew",
+    "Codex: its failed binds of telegram:42 are forgotten, but it is being started or stopped now, so it was not let go: ask again in a moment",
   ]);
   assert.deepEqual(asked, ["POST /release folder:claude:telegram:42", "POST /release folder:codex:telegram:42"]);
+  const refused = await alasio(["folder", "restart", "telegram:9"]);
+  succeeded(refused);
+  assert.deepEqual(refused.printed, ["Claude: the sandbox gateway did not let it go (503): {\"error\":\"not now\"}", "Codex: the sandbox gateway did not let it go (503): {\"error\":\"not now\"}"]);
   // Of no folder instances, as alasio is told the gateway serves none: nothing of them.
   const without = await alasio(["status"]);
   succeeded(without);

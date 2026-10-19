@@ -7,8 +7,9 @@
  *   nothing waits on it, as the key is bound now, whatever route the front last knew of it;
  *   503 with a Retry-After where its pool had no pod for it in time.
  * - `POST /release`: releases the token's key's binding, as its placement says what comes
- *   before (204), as it does where it has none; 503 where it could not be released now, its
- *   binding kept.
+ *   before, and resets what its placement keeps of its binds (204), as it does where it has
+ *   none; 409 `{ "busy": true }` with a Retry-After where another bind or release of it is
+ *   under way, so none was released; 503 where it could not be released now, its binding kept.
  * - `GET /counts/<namespace>/<pool>`: `{ free, bound, waiting }`, the pool's free pods running,
  *   its bindings, and the binds waiting for a free pod in every replica of the binder, as
  *   `peers` names them; asked without a token, as KEDA's metrics-api trigger asks.
@@ -105,13 +106,15 @@ export class PlacementHeld extends Schema.TaggedError<PlacementHeld>()("Placemen
  * Where a key is bound: its pool, how its pod is made, where it is not claimed, and what comes
  * before its release; whether a bind of it is held, and why (`held`), as one that is is
  * refused; and what is told of each bind of it as it ends (`settled`): why it failed, or null
- * where it went through.
+ * where it went through; and what its caller's release resets of what is kept of its binds
+ * (`reset`), as their failures, whether or not it was bound.
  */
 export interface Placement extends BindOptions {
   readonly pool: Pool;
   readonly release?: ((bound: { readonly pod: string; readonly binding: string }) => Effect.Effect<void, { readonly message: string }>) | undefined;
   readonly held?: Effect.Effect<string | null> | undefined;
   readonly settled?: ((failure: string | null) => Effect.Effect<void>) | undefined;
+  readonly reset?: Effect.Effect<void, { readonly message: string }> | undefined;
 }
 
 /** What serveBinder is given; see the module. */
@@ -259,9 +262,12 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         incoming.resume();
         const released = yield* poolOf(key, claims.options ?? {}).pipe(
           Effect.tap(({ pool }) => Effect.sync(() => routes.delete(slot(pool, key)))),
-          Effect.flatMap(({ pool, release }) => binder.release(pool, key, release)),
+          Effect.flatMap(({ pool, release, reset }) => Effect.andThen(reset ?? Effect.void, binder.release(pool, key, release))),
           Effect.result,
         );
+        if (released._tag === "Success" && released.success === "busy") {
+          return answer(outgoing, 409, { error: `${key} is being bound or released now: none was released`, busy: true }, { "retry-after": String(RETRY_AFTER_S) });
+        }
         if (released._tag === "Success") return answer(outgoing, 204);
         if (released.failure instanceof PlacementRefused) return answer(outgoing, 403, { error: released.failure.message });
         yield* Effect.logWarning(`releasing ${key} failed: ${released.failure.message}`);

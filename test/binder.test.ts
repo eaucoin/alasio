@@ -308,7 +308,7 @@ test("a release runs what comes before it, its Lease renewed, then deletes the p
   );
   await new Promise((resolve) => setTimeout(resolve, 500));
   const again = bindIn(binderOf({ renewMs: 300, staleMs: 1_500 }), (each) => Effect.tap(each.bind(of, "sessionfs:workspace"), () => Effect.sync(() => void happened.push("bound again"))));
-  assert.equal(await releasing, true);
+  assert.equal(await releasing, "released");
   const bound = await again;
   assert.deepEqual(happened, [`before ${first.pod} true`, "checkpointed", "bound again"]);
   assert.notEqual(bound.pod, first.pod);
@@ -326,9 +326,18 @@ test("of two releases of one binding at once one alone goes on, and one whose st
   assert.deepEqual([lease?.spec?.holderIdentity, lease?.metadata?.annotations?.["alasio.dev/releasing"]], [bound.pod, undefined]);
   let before = 0;
   const released = await Promise.all([binderOf(), binderOf()].map((each) => bindIn(each, (binderService) => binderService.release(of, "sessionfs:workspace", () => Effect.sleep(500).pipe(Effect.andThen(Effect.sync(() => void (before += 1))))))));
-  assert.deepEqual([released.toSorted(), before], [[false, true], 1]);
+  assert.deepEqual([released.toSorted(), before], [["busy", "released"], 1]);
   assert.equal(await run(binder(), readLease(of, "sessionfs:workspace")), null);
-  assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace")), false);
+  assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace")), "unbound");
+});
+
+test("a release of a key a bind is under way of releases none and says so, and one of a bind under way whose binder ended finds none to release", async () => {
+  const of = await pool();
+  await run(binder(), takeLease(of, "sessionfs:under-way", "binder"));
+  await run(binder(), takeLease(of, "sessionfs:ended", "ended", 1_000));
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  assert.equal(await bindIn(binderOf(), (each) => each.release(of, "sessionfs:under-way")), "busy");
+  assert.equal(await bindIn(binderOf({ staleMs: 1_000 }), (each) => each.release(of, "sessionfs:ended")), "unbound");
 });
 
 test("a bind of a key whose release was left unrenewed, its releaser ended, finishes the release and binds the key anew", async () => {

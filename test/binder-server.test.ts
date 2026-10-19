@@ -9,7 +9,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Context, Effect, Exit, Layer, Scope } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
-import { activeAt, readLease } from "../src/binder/bindings.ts";
+import { activeAt, readLease, takeLease } from "../src/binder/bindings.ts";
 import { LiveBindings } from "../src/binder/live.ts";
 import { environmentKey, freeLabels, type Pool } from "../src/binder/names.ts";
 import { type BinderServer, MAX_CALLER_TOKEN_MS, MAX_OPERATION_BYTES, NO_BIND_HEADER, type Operation, type Placement, PlacementRefused, serveBinder } from "../src/binder/server.ts";
@@ -68,7 +68,7 @@ async function front(
     peers = [] as string[],
     placed = [] as Readonly<Record<string, string>>[],
     release = undefined as Placement["release"],
-    told = {} as Pick<Placement, "held" | "settled">,
+    told = {} as Pick<Placement, "held" | "settled" | "reset">,
     keyOf = callerKey as Buffer | ((claims: TokenClaims) => Buffer | null),
     operate = undefined as ((claims: TokenClaims, operation: Operation) => Effect.Effect<{ status: number; json?: unknown; bytes?: Uint8Array }>) | undefined,
     watched = false,
@@ -269,6 +269,29 @@ test("a caller's release runs what its placement says comes before, then lets it
     assert.equal((await call("/release")).status, 204);
     assert.deepEqual(before, [bound?.spec?.holderIdentity, bound?.spec?.holderIdentity]);
     assert.equal(await run(readLease(of, key)), null);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a caller's release resets what its placement keeps of its binds, bound or not; one of a key a bind is under way of releases none, and says so", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  let resets = 0;
+  const served = await front(of, stand.port, { told: { reset: Effect.sync(() => void (resets += 1)) } });
+  try {
+    const call = (key: string) => fetch(`http://127.0.0.1:${served.port}/release`, { method: "POST", headers: { authorization: caller(key) } });
+    assert.equal((await call("sessionfs:unbound")).status, 204);
+    assert.equal(resets, 1);
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:bound") } })).status, 204);
+    assert.equal((await call("sessionfs:bound")).status, 204);
+    assert.deepEqual([resets, await run(readLease(of, "sessionfs:bound"))], [2, null]);
+    // A bind under way, as another replica's.
+    await run(takeLease(of, "sessionfs:under-way", "another"));
+    const busy = await call("sessionfs:under-way");
+    assert.deepEqual([busy.status, busy.headers.get("retry-after"), ((await busy.json()) as { busy?: boolean }).busy, resets], [409, "1", true, 3]);
   } finally {
     await served.close();
     stand.close();

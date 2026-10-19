@@ -128,9 +128,16 @@ export class HostBayma extends Context.Service<HostBayma, {
             ),
           restart: (scope) =>
             folders.release(scope).pipe(
+              Effect.as("Its folder instance is stopped, its REPL sessions saved, and its failed binds forgotten: the next message starts it anew."),
+              Effect.catch((error) =>
+                Effect.succeed(
+                  error.status === 409
+                    ? "Its failed binds are forgotten, but it is being started or stopped now, so it was not restarted: ask again in a moment."
+                    : `Its folder instance could not be restarted: ${error.message}`,
+                )
+              ),
+              // Its failures forgotten by the gateway before it answers, as a held chat is told so again.
               Effect.tap(() => Effect.sync(() => toldHeld.delete(folderKey(scope.harness, scope.threadKey)))),
-              Effect.as("Its folder instance stopped, its REPL sessions saved: the next message starts it anew."),
-              Effect.catch((error) => Effect.succeed(`Its folder instance could not be restarted: ${error.message}`)),
             ),
         });
       }),

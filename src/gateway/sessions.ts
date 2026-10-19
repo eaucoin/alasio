@@ -289,7 +289,7 @@ export const makeSessions = Effect.fnUntraced(function*(
     release: (pool: Pool, key: string, lease: BindingLease) =>
       binder.release(pool, key, ({ pod: name }) => endAndDetach(pool, volumeIdOfKey(key) ?? "", name)).pipe(
         Effect.tap((done) =>
-          done
+          done === "released"
             ? Effect.andThen(released(pool, "idle"), tell(pool, (environment) => ({ kind: "workspace.released", environment, source: "sandbox-gateway", subject: subject(key), binding: lease.metadata?.uid ?? "", reason: "idle" })))
             : Effect.void
         ),
@@ -327,7 +327,7 @@ export const makeSessions = Effect.fnUntraced(function*(
         let binding = "";
         yield* Effect.forkDetach(binder.release(pool, key, (bound) => (bound.pod === pod.metadata?.name ? ((binding = bound.binding), drained(pool, workspace, pod)) : Effect.void)).pipe(
           Effect.tap((done) =>
-            done
+            done === "released"
               ? Effect.andThen(released(pool, "deleted"), tell(pool, (environment) => ({ kind: "workspace.released", environment, source: "sandbox-gateway", subject: subject(key), binding, reason: "deleted" })))
               : Effect.void
           ),
@@ -358,7 +358,7 @@ export const makeSessions = Effect.fnUntraced(function*(
     let binding = "";
     return binder.release(pool, key, (bound) => (bound.pod === pod.metadata?.name ? ((binding = bound.binding), before(bound.pod)) : Effect.void)).pipe(
       Effect.tap((done) =>
-        done ? Effect.andThen(released(pool, reason), tell(pool, (environment) => ({ kind: "workspace.released", environment, source: "sandbox-gateway", subject: subject(key), binding, reason }))) : Effect.void
+        done === "released" ? Effect.andThen(released(pool, reason), tell(pool, (environment) => ({ kind: "workspace.released", environment, source: "sandbox-gateway", subject: subject(key), binding, reason }))) : Effect.void
       ),
       Effect.catch((error) => Effect.logWarning(`releasing ${key} failed: ${error.message}`)),
     );

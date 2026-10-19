@@ -240,13 +240,14 @@ export const makeFolders = Effect.fnUntraced(function*(
     return times._tag === "Some" ? times.value.filter((at) => now - at < FOLDER_FAILING_MS) : [];
   };
 
+  /** `key`'s binds' failures forgotten: its Lease of them gone, where it had one. */
+  const forgotten = (key: string): Effect.Effect<void, KubeApiError> =>
+    kube.remove("coordination.k8s.io/v1", "Lease", namespace, failingLease(key)).pipe(Effect.catchIf(hasStatus(404), () => Effect.void));
+
   /** Records how a bind of `key` ended: its failure, or, where it went through, none, its failures forgotten. */
   const settled = (key: string) => (failure: string | null): Effect.Effect<void> =>
     Effect.gen(function*() {
-      if (failure === null) {
-        yield* kube.remove("coordination.k8s.io/v1", "Lease", namespace, failingLease(key)).pipe(Effect.catchIf(hasStatus(404), () => Effect.void));
-        return;
-      }
+      if (failure === null) return yield* forgotten(key);
       const now = yield* Clock.currentTimeMillis;
       const lease = yield* failuresOf(key);
       const times = [...recent(lease, now), now].slice(-FOLDER_FAILURES);
@@ -278,6 +279,8 @@ export const makeFolders = Effect.fnUntraced(function*(
         // Bound again only as its caller asks, where its binds failed one after another.
         held: options["retry"] === "1" ? Effect.succeed(null) : heldBy(key),
         settled: settled(key),
+        // Its caller's restart forgets its binds' failures, so the next bind goes on, held or not.
+        reset: forgotten(key),
       };
     });
 
