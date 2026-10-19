@@ -68,7 +68,7 @@ if (import.meta.main) {
       inKubernetes: false,
       // Telegram's updates are the stand-in's, at the Bot API's root the environment names.
       updates: stubUpdates(process.env["TELEGRAM_API_ROOT"] ?? ""),
-      folderBayma: () => Effect.succeed({ server: config.folderBayma, binding: "binding-1", notice: null }),
+      folderBayma: () => Effect.succeed({ server: config.folderBayma, notice: null }),
       claudeQueryFactory: bridgedQueryFactory(config.claudeSocket),
     });
   });

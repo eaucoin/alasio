@@ -25,7 +25,7 @@ test("a deployment whose gateway serves no folder instances offers no folder bay
 function fakeFolders(binds: () => Effect.Effect<void, FolderBindFailed | GatewayError>) {
   const calls: string[] = [];
   const folders = {
-    bind: (scope: FolderScope, { retry = false }: { readonly retry?: boolean } = {}) => Effect.andThen(Effect.sync(() => void calls.push(`bind${retry ? " retry" : ""} ${scope.harness} ${scope.threadKey}`)), Effect.as(binds(), "binding-1")),
+    bind: (scope: FolderScope, { retry = false }: { readonly retry?: boolean } = {}) => Effect.andThen(Effect.sync(() => void calls.push(`bind${retry ? " retry" : ""} ${scope.harness} ${scope.threadKey}`)), binds()),
     release: (scope: FolderScope) => Effect.sync(() => void calls.push(`release ${scope.harness} ${scope.threadKey}`)),
     endpoint: (scope: FolderScope) => Effect.sync(() => (calls.push(`endpoint ${scope.harness} ${scope.threadKey}`), { url: BAYMA.url, headers: BAYMA.headers })),
   };
@@ -45,7 +45,7 @@ test("a folder conversation's bayma is its folder instance, bound through the ga
   const { calls, folders } = fakeFolders(() => Effect.void);
   const telegram = recordingTelegram();
   const outcome = await withHostBayma(folders, telegram, (host) => host.ensure({ ...SCOPE, chatId: "42" }));
-  assert.deepEqual(outcome, { server: BAYMA, binding: "binding-1", notice: null });
+  assert.deepEqual(outcome, { server: BAYMA, notice: null });
   assert.deepEqual(calls, ["bind claude telegram:42", "endpoint claude telegram:42"]);
   assert.deepEqual(telegram.calls.sendMessage, []);
 });
@@ -58,15 +58,15 @@ test("a folder instance that did not start leaves the turn without bayma, told w
   await withHostBayma(folders, telegram, (host) =>
     Effect.gen(function*() {
       const notice = "Folder workspace /home/op/repo: its bayma did not start (its pod is pending: no node). This turn runs without bayma's REPL tools; your REPL sessions are kept and come back when it starts.";
-      assert.deepEqual(yield* host.ensure({ ...SCOPE, chatId: "42" }), { server: null, binding: null, notice });
+      assert.deepEqual(yield* host.ensure({ ...SCOPE, chatId: "42" }), { server: null, notice });
       assert.deepEqual(told(), [[notice, ["Retry now", "Restart folder instance"]]]);
       // No chat given, none told: a call no operator waits on.
-      assert.deepEqual(yield* host.ensure(SCOPE), { server: null, binding: null, notice });
+      assert.deepEqual(yield* host.ensure(SCOPE), { server: null, notice });
       assert.equal(told().length, 1);
       failing = new FolderBindFailed({ reason: "its last 3 binds failed, the last as its pod is pending: no node", held: true });
       const held = "Folder workspace /home/op/repo: its bayma failed to start three times in a row (its last 3 binds failed, the last as its pod is pending: no node), so alasio tries no more until you ask. This turn runs without bayma's REPL tools; your REPL sessions are kept and come back when it starts.";
-      assert.deepEqual(yield* host.ensure({ ...SCOPE, chatId: "42" }), { server: null, binding: null, notice: held });
-      assert.deepEqual(yield* host.ensure({ ...SCOPE, chatId: "42" }), { server: null, binding: null, notice: held });
+      assert.deepEqual(yield* host.ensure({ ...SCOPE, chatId: "42" }), { server: null, notice: held });
+      assert.deepEqual(yield* host.ensure({ ...SCOPE, chatId: "42" }), { server: null, notice: held });
       assert.deepEqual(told().map(([text]) => text), [notice, held], "held, told once");
       // As the operator asks, bound again though held.
       failing = null;

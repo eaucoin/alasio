@@ -24,7 +24,7 @@ function gateway({ files = new Map<string, Uint8Array>(), there = new Set<string
   return {
     asked,
     endpoint: (volumeId, mode) => Effect.succeed({ url: "http://gateway:8080/mcp", headers: { Authorization: `Bearer ${volumeId}/${mode}` } }),
-    bind: (volumeId, mode) => Effect.andThen(Effect.sync(() => void asked.push(`bind ${volumeId} ${mode}`)), Effect.as(refused("bind"), `binding of ${volumeId}`)),
+    bind: (volumeId, mode) => Effect.andThen(Effect.sync(() => void asked.push(`bind ${volumeId} ${mode}`)), refused("bind")),
     release: (volumeId, mode) => Effect.andThen(Effect.sync(() => void asked.push(`release ${volumeId} ${mode}`)), refused("release")),
     create: (volumeId) => Effect.andThen(Effect.sync(() => (asked.push(`create ${volumeId}`), void there.add(volumeId))), refused("create")),
     remove: (volumeId) => Effect.andThen(Effect.sync(() => (asked.push(`remove ${volumeId}`), void there.delete(volumeId))), refused("remove")),
@@ -57,7 +57,7 @@ test("a session is brought up bound to a pod of the internet alasio records, non
   const stand = gateway();
   const modes = new Map<string, NetMode>([["fs-full01", "full"]]);
   const sessions = makeSessionSandboxes({ gateway: GATEWAY, stateDir: "/state", netModeOf: (volumeId) => Effect.succeed(modes.get(volumeId) ?? null), workspaces: stand });
-  assert.deepEqual(await run(sessions.ensureSession("fs-full01")), { bayma: { url: "http://gateway:8080/mcp", headers: { Authorization: "Bearer fs-full01/full" } }, binding: "binding of fs-full01" });
+  assert.deepEqual(await run(sessions.ensureSession("fs-full01")), { bayma: { url: "http://gateway:8080/mcp", headers: { Authorization: "Bearer fs-full01/full" } } });
   await run(sessions.ensureSession("fs-plain1"));
   assert.deepEqual(stand.asked, ["bind fs-full01 full", "bind fs-plain1 none"]);
   // One whose bind the gateway refuses: its refusal.

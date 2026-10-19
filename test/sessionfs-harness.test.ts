@@ -29,23 +29,21 @@ const DIRECTORY = "/state/sessionfs/workspaces/fs-abc123";
 const BAYMA: BaymaEndpoint = { url: "http://127.0.0.1:40000/mcp", headers: { Authorization: "Bearer forward-token" } };
 const CODEX_ENV = { CODEX_HOME: "/state/sessionfs/codex" };
 
-function fakeSandbox(): SessionSandboxes["Service"] & { readonly ensured: string[]; binding: string } {
+function fakeSandbox(): SessionSandboxes["Service"] & { readonly ensured: string[] } {
   const ensured: string[] = [];
   const unused = () => assert.fail("a harness only finds a session's directory and starts its host");
-  const sandbox: SessionSandboxes["Service"] & { readonly ensured: string[]; binding: string } = {
+  return {
     ensured,
-    binding: "binding-1",
     volumes: { create: unused, fork: unused, destroy: unused, list: Effect.sync(unused) },
     harnessDirectory: (volumeId) => `/state/sessionfs/workspaces/${volumeId}`,
     ensureSession: (volumeId) =>
       Effect.sync(() => {
         ensured.push(volumeId);
-        return { bayma: BAYMA, binding: sandbox.binding };
+        return { bayma: BAYMA };
       }),
     readFile: unused,
     writeFile: unused,
   };
-  return sandbox;
 }
 
 /** An app-server call a harness made: its method, and what it named. */
@@ -201,7 +199,7 @@ test("Codex on a session filesystem runs on its own app-server, in the harness d
   assert.deepEqual(started.args.config.mcp_servers["bayma"], codexMcpServer(BAYMA));
 });
 
-test("Claude Code on a session filesystem runs in the harness directory, confined to the session's bayma, in a process started anew where its binding was released since", async () => {
+test("Claude Code on a session filesystem runs in the harness directory, confined to the session's bayma", async () => {
   const sandbox = fakeSandbox();
   const seen: { options: Options | null; resumeAsked: string | null; processes: number } = { options: null, resumeAsked: null, processes: 0 };
   const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => {
@@ -229,27 +227,20 @@ test("Claude Code on a session filesystem runs in the harness directory, confine
     Scope.provide(scope),
   ));
   const persistence = forgetfulPersistence;
-  const turn = async (prompt: string) => {
-    const result = await Effect.runPromise(harness.runTurn({
-      prompt, resumeSession: "s1", threadKey: "telegram:1", chatId: "1", messageId: "2", workingDirectory: WORKSPACE, modelChoice: null, persistence, ownTurns: ownTurnsOn(persistence),
-    }));
-    assert.equal(result.responseCompleted, true);
-  };
-  let processes: number[] = [];
   try {
-    for (const prompt of ["hi", "again"]) await turn(prompt);
-    processes = [seen.processes];
-    // Released and bound anew since: a process started anew, its MCP client connecting afresh to the bayma that serves it now.
-    sandbox.binding = "binding-2";
-    await turn("anew");
-    processes.push(seen.processes);
+    for (const prompt of ["hi", "again"]) {
+      const result = await Effect.runPromise(harness.runTurn({
+        prompt, resumeSession: "s1", threadKey: "telegram:1", chatId: "1", messageId: "2", workingDirectory: WORKSPACE, modelChoice: null, persistence, ownTurns: ownTurnsOn(persistence),
+      }));
+      assert.equal(result.responseCompleted, true);
+    }
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
   }
-  // One live process serves both turns of one binding, and the session is bound before each:
-  // the gateway may have released it between them.
-  assert.deepEqual(processes, [1, 2]);
-  assert.deepEqual(sandbox.ensured, ["fs-abc123", "fs-abc123", "fs-abc123"]);
+  // One live process serves both turns, and the session is made sure of before each: its
+  // host may have stopped between them.
+  assert.equal(seen.processes, 1);
+  assert.deepEqual(sandbox.ensured, ["fs-abc123", "fs-abc123"]);
   assert.equal(seen.resumeAsked, "s1"); // resume is decided from its transcripts on this machine
   const { options } = seen;
   assert.ok(options, "Claude Code was started");

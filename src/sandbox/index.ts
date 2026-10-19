@@ -137,11 +137,10 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
   readonly harnessDirectory: (volumeId: string) => string;
   /**
    * Brings the session up: bound by the gateway to a pod of its internet's pool, its bayma
-   * serving; its bayma's endpoint, through the gateway, and the binding it is bound by, which
-   * a bind after its release names anew, as its bayma knows nothing of its clients before;
-   * one a branch inherited forked from its parent's first.
+   * serving, and its bayma's endpoint, through the gateway; one a branch inherited forked from
+   * its parent's first.
    */
-  readonly ensureSession: (volumeId: string) => Effect.Effect<{ readonly bayma: BaymaEndpoint; readonly binding: string }, SessionError>;
+  readonly ensureSession: (volumeId: string) => Effect.Effect<{ readonly bayma: BaymaEndpoint }, SessionError>;
   /** A file from the session, at `path` as it sees it (filesPath), of `maxBytes` at most: `{ bytes }`, or `{ note }` saying why not. */
   readonly readFile: (volumeId: string, path: string, maxBytes: number) => Effect.Effect<FileRead, SessionFileError>;
   /** Writes `bytes` into the session's file at `path` as it sees it (filesPath), its directories made. */
@@ -203,8 +202,8 @@ export function makeSessionSandboxes({ gateway, stateDir, netModeOf, inherit, wo
         const id = assertValidVolumeId(volumeId);
         yield* inherited(id);
         const mode = yield* modeOf(id);
-        const binding = yield* workspaces.bind(id, mode);
-        return { bayma: yield* workspaces.endpoint(id, mode), binding };
+        yield* workspaces.bind(id, mode);
+        return { bayma: yield* workspaces.endpoint(id, mode) };
       }).pipe(withLogScope("sandbox")),
 
     readFile: (volumeId, path, maxBytes) => {

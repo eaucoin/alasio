@@ -173,8 +173,6 @@ export interface ClaudeHost {
   readonly baymaUrl: string | null;
   /** Why it runs without its folder's bayma, which its turns' prompts are told, as its last bind said: none where it has it, or runs in a session filesystem. */
   baymaNotice: string | null;
-  /** The binding of its bayma, its session filesystem's or its folder's, it started with: none where it has none. */
-  readonly baymaBinding: string | null;
   sessionId: string | null;
   readonly channel: PromptChannel;
   /** Aborts the process; the Agent SDK is given it to stop the process with. */
@@ -208,8 +206,7 @@ export interface ClaudeLiveSessionsOptions {
   readonly workingDirectory: string;
   readonly sessions: Pick<ClaudeSessionApi, "sessionExists">;
   readonly sessionStore?: SessionStore | null;
-  /** A session filesystem's bayma, brought up: its endpoint, and the binding it is bound by. */
-  readonly sessionFsBayma?: Effect.Effect<{ readonly bayma: BaymaEndpoint; readonly binding: string }, SessionError> | null;
+  readonly sessionFsBayma?: Effect.Effect<BaymaEndpoint, SessionError> | null;
   readonly folderBayma?: (scope: Omit<FolderBaymaScope, "harness">) => Effect.Effect<FolderBaymaOutcome, NoFolderWorkspaces>;
   readonly queryFactory?: ClaudeQueryFactory | undefined;
 }
@@ -804,7 +801,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     return {};
   });
 
-  const startHost = Effect.fnUntraced(function*(params: TurnParams, key: string, bayma: BaymaEndpoint | null, binding: string | null, folder: FolderBaymaOutcome | null): Effect.fn.Return<ClaudeHost, ClaudeCodeError> {
+  const startHost = Effect.fnUntraced(function*(params: TurnParams, key: string, bayma: BaymaEndpoint | null, folder: FolderBaymaOutcome | null): Effect.fn.Return<ClaudeHost, ClaudeCodeError> {
     const { threadKey, resumeSession, persistence } = params;
     const claudeEnv = buildClaudeEnv();
     // A session filesystem's bayma runs in its sandbox; a folder's is the conversation's
@@ -841,7 +838,6 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       key,
       baymaUrl: bayma?.url ?? null,
       baymaNotice: folder?.notice ?? null,
-      baymaBinding: binding ?? folder?.binding ?? null,
       sessionId: resumeSession ?? null,
       channel,
       controller,
@@ -880,29 +876,27 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   const hostFor = Effect.fnUntraced(function*(params: TurnParams): Effect.fn.Return<ClaudeHost, ClaudeCodeError> {
     const key = modelKey(params.modelChoice);
     // A session filesystem is bound before every turn, not only when the process starts: the
-    // process outlives turns, and the gateway may have released its binding in between, its
-    // bayma's clients gone with it; one bound anew since starts anew, its MCP client
-    // connecting afresh. Its bayma is reached at the same address either way.
-    const session = sessionFsBayma ? yield* needed(sessionFsBayma) : null;
-    const bayma = session?.bayma ?? null;
+    // process outlives turns, and the gateway may have released its binding in between. Its
+    // bayma is reached at the same address either way, the process's MCP client initializing a
+    // session anew with the one bound since, which knows none of the one before's
+    // (test/bayma-reconnect.test.ts).
+    const bayma = sessionFsBayma ? yield* needed(sessionFsBayma) : null;
     const existing = hosts.get(params.threadKey);
-    const reusable = existing && !existing.closed && params.resumeSession && existing.sessionId === params.resumeSession && existing.key === key && existing.baymaUrl === (bayma?.url ?? null) &&
-      (session === null || existing.baymaBinding === session.binding);
-    // A folder's bayma bound as the process starts, and again before each turn, so it is bound
-    // before the turn asks it: a process that started without it starts anew once it has it,
-    // and one whose binding was released meanwhile, its bayma's clients gone with it, starts
-    // anew with the binding made since, its MCP client connecting afresh.
-    const folder = bayma || (reusable && existing.baymaNotice === null && existing.baymaBinding === null)
+    const reusable = existing && !existing.closed && params.resumeSession && existing.sessionId === params.resumeSession && existing.key === key && existing.baymaUrl === (bayma?.url ?? null);
+    // A folder's bayma bound as the process starts, and again before each turn of a process
+    // that started without it, which starts anew once it has it; one released meanwhile is
+    // bound anew by the turn's first request of it, its MCP client initializing a session anew.
+    const folder = bayma || (reusable && existing.baymaNotice === null)
       ? null
       : yield* needed(folderBayma({ threadKey: params.threadKey, workingDirectory, chatId: params.chatId }));
-    if (reusable && (folder === null || folder.server === null || folder.binding === existing.baymaBinding)) {
+    if (reusable && (folder === null || folder.server === null)) {
       if (folder) existing.baymaNotice = folder.notice;
       return existing;
     }
     if (existing && !existing.closed) {
-      yield* closeHost(existing, !reusable ? "mounted session, model, workspace door, or its bayma's binding changed" : existing.baymaBinding === null ? "its folder's bayma started" : "its folder's bayma was bound anew");
+      yield* closeHost(existing, reusable ? "its folder's bayma started" : "mounted session, model, or workspace door changed");
     }
-    const host = yield* startHost(params, key, bayma, session?.binding ?? null, folder);
+    const host = yield* startHost(params, key, bayma, folder);
     hosts.set(params.threadKey, host);
     return host;
   });

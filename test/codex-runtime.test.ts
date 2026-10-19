@@ -68,7 +68,7 @@ function recordingPersistence(calls: string[], stored: unknown[][] = []): TurnPe
 const runTurn = (
   persistence: TurnPersistence,
   beforeResponseComplete: (sessionId: string | null | undefined) => Effect.Effect<void> = () => Effect.void,
-  { holds = [], folderBayma = () => Effect.succeed({ server: { type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }, binding: "binding-1", notice: null }) }: { readonly holds?: Hold[]; readonly folderBayma?: FolderBayma } = {},
+  { holds = [], folderBayma = () => Effect.succeed({ server: { type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }, notice: null }) }: { readonly holds?: Hold[]; readonly folderBayma?: FolderBayma } = {},
 ) =>
   Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     // The exec transport's turn, which no app-server serves.
@@ -124,7 +124,7 @@ test("a turn whose folder's bayma did not start runs without it, its prompt told
   const asked: FolderBaymaScope[] = [];
   const notice = "Folder workspace /work: its bayma did not start (its pod is pending). This turn runs without bayma's REPL tools; your REPL sessions are kept and come back when it starts.";
   prompted.length = 0;
-  await runTurn(recordingPersistence([]), () => Effect.void, { folderBayma: (scope) => Effect.sync(() => (asked.push(scope), { server: null, binding: null, notice })) });
+  await runTurn(recordingPersistence([]), () => Effect.void, { folderBayma: (scope) => Effect.sync(() => (asked.push(scope), { server: null, notice })) });
   assert.deepEqual(prompted, [`${notice}\n\nhello`]);
   assert.deepEqual(asked.map(({ harness, threadKey, chatId }) => ({ harness, threadKey, chatId })), [{ harness: "codex", threadKey: "conversation-1", chatId: "1" }]);
 });
