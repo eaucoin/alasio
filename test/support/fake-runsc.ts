@@ -20,7 +20,7 @@
  *   beside it, what the fork's runsc says of its test image (./runsc-image-inspect.json, a
  *   copy of runsc/cmd/image/testdata/inspect.json: two layers, 45056 bytes of pages), as
  *   saved by the release's runsc, failing while there is none, and taking a minute while a
- *   file `hang-inspect` is;
+ *   file `hang-inspect` is; either read once no file `hold-inspect` is beside it;
  * - `image layers DIR`: its layers' digests, a line each;
  * - `image verify --host DIR`: says nothing of an image DIR holds whose layers are each in
  *   DIR/layers, of the digest it is named by, as runsc checks each layer's identity; fails
@@ -96,22 +96,32 @@ if (rest[0] === "checkpoint") {
     return;
   }
   checkpoint();
-} else if (rest[0] === "image" && rest[1] === "inspect" && existsSync(join(rest[rest.length - 1], "s3_opts.json"))) {
-  if (existsSync(join(here, "hang-inspect"))) { setTimeout(() => {}, 60000); return; }
-  if (!existsSync(join(here, "remote-inspect"))) { process.stderr.write("no image in the bucket to inspect\\n"); process.exit(1); }
-  const inspected = JSON.parse(${JSON.stringify(INSPECTED)});
-  inspected.state.metadata.runsc_version = read("saved-by", "release-" + basename(here));
-  process.stdout.write(JSON.stringify(inspected, null, 2) + "\\n");
 } else if (rest[0] === "image" && rest[1] === "inspect") {
   const image = rest[rest.length - 1];
-  const meta = readFileSync(join(image, "pages_meta.img"));
-  process.stdout.write(JSON.stringify({
-    digest: sha256(meta),
-    format: { major: 2, minor: 0 },
-    state: { size: 10, metadata: { runsc_version: read("saved-by", "release-" + basename(here)), cpu_features: read("image-cpu-features", "sse,avx"), platform: "systrap" } },
-    layers: [{ pages_size: 4096, path: join(image, "pages.img") }, ...JSON.parse(meta).layers.map((digest) => ({ digest, pages_size: 4096, path: join(image, "layers", digest, "pages.img") }))],
-    memory_files: [],
-  }, null, 2) + "\\n");
+  const inspect = () => {
+    if (existsSync(join(image, "s3_opts.json"))) {
+      if (existsSync(join(here, "hang-inspect"))) { setTimeout(() => {}, 60000); return; }
+      if (!existsSync(join(here, "remote-inspect"))) { process.stderr.write("no image in the bucket to inspect\\n"); process.exit(1); }
+      const inspected = JSON.parse(${JSON.stringify(INSPECTED)});
+      inspected.state.metadata.runsc_version = read("saved-by", "release-" + basename(here));
+      process.stdout.write(JSON.stringify(inspected, null, 2) + "\\n");
+      return;
+    }
+    const meta = readFileSync(join(image, "pages_meta.img"));
+    process.stdout.write(JSON.stringify({
+      digest: sha256(meta),
+      format: { major: 2, minor: 0 },
+      state: { size: 10, metadata: { runsc_version: read("saved-by", "release-" + basename(here)), cpu_features: read("image-cpu-features", "sse,avx"), platform: "systrap" } },
+      layers: [{ pages_size: 4096, path: join(image, "pages.img") }, ...JSON.parse(meta).layers.map((digest) => ({ digest, pages_size: 4096, path: join(image, "layers", digest, "pages.img") }))],
+      memory_files: [],
+    }, null, 2) + "\\n");
+  };
+  // Its image read once it is let go, as runsc reads it once it has started.
+  if (existsSync(join(here, "hold-inspect"))) {
+    const held = setInterval(() => { if (!existsSync(join(here, "hold-inspect"))) { clearInterval(held); inspect(); } }, 20);
+    return;
+  }
+  inspect();
 } else if (rest[0] === "image" && rest[1] === "layers") {
   const image = rest[rest.length - 1];
   for (const digest of JSON.parse(readFileSync(join(image, "pages_meta.img"), "utf8")).layers) process.stdout.write(digest + "\\n");

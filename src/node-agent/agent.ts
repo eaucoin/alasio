@@ -1226,17 +1226,21 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     );
 
   /**
-   * Tells the proxy how many bytes of pages the restore of the snapshot prepared at
-   * `imagePath`, read from the bucket by the token `accessKeyId`, reads through it, as runsc
-   * says of the image, so that the agent's stop waits for them all however its loader paces
-   * its reads: unknown until runsc has said, which it asks in the background, for as long as
-   * inspectTimeoutMs at most, its process killed past it; where runsc cannot say, the stop
-   * waits on the restore only while its reads go on, as the proxy's quiet tells.
+   * Tells the proxy how many bytes of pages the restore of the snapshot `snapshot` of the
+   * workspace, read from the bucket by the token `accessKeyId` as the gofer's `options` say,
+   * reads through it, as runsc says of the image, so that the agent's stop waits for them all
+   * however its loader paces its reads: unknown until runsc has said, which it asks in the
+   * background, for as long as inspectTimeoutMs at most, its process killed past it; where
+   * runsc cannot say, the stop waits on the restore only while its reads go on, as the proxy's
+   * quiet tells. runsc reads the image from a copy of the options of its own (remoteCopy), as
+   * the restore's are removed once it has resumed, which it may be before runsc has read them.
    */
-  const expectPages = (ref: WorkspaceRef, accessKeyId: string, release: string, imagePath: string): Effect.Effect<void> =>
+  const expectPages = (ref: WorkspaceRef, snapshot: string, accessKeyId: string, release: string, options: string): Effect.Effect<void> =>
     Effect.sync(() => storeProxy.expect(accessKeyId, Number.POSITIVE_INFINITY)).pipe(
       Effect.andThen(
-        runsc.inspect(release, imagePath).pipe(
+        cache.remoteCopy(ref.environment, ref.workspace, snapshot, GOFER_OPTIONS_FILE, options).pipe(
+          Effect.flatMap((copy) => runsc.inspect(release, copy)),
+          Effect.scoped,
           Effect.timeoutOrElse({ duration: inspectTimeoutMs, orElse: () => Effect.fail(new Error(`it did not answer within ${inspectTimeoutMs / 1000} s`)) }),
           Effect.tap(({ pageBytes }) => Effect.sync(() => storeProxy.expect(accessKeyId, pageBytes))),
           Effect.tapError((error) =>
@@ -1348,8 +1352,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           const transport: Transport = gofer?.transport === "socket" && storeProxy.socket !== null ? "socket" : "tcp";
           const token = storeProxy.mint(prefixOf(ref), `${prefixOf(ref)}/${LAYERS_DIR}/`, transport);
           if (token === null) return yield* new AgentStopping({ environment, workspace });
-          imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, goferOptions(ref, own.digest, token, transport, gofer?.pagesRetry ?? false));
-          yield* expectPages(ref, token.accessKeyId, release, imagePath);
+          const options = goferOptions(ref, own.digest, token, transport, gofer?.pagesRetry ?? false);
+          imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, options);
+          yield* expectPages(ref, snapshot, token.accessKeyId, release, options);
         }
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
         prepared.set(prefixOf(ref), manifest);

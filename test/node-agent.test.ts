@@ -43,7 +43,7 @@ import {
   STATE_FILE_BYTES,
   STATE_READ_TIMEOUT_MS,
 } from "../src/node-agent/agent.ts";
-import { makeSnapshotCache, RESERVE_BYTES, type SnapshotCache, type Spared } from "../src/node-agent/cache.ts";
+import { LAYERS_DIR, makeSnapshotCache, RESERVE_BYTES, type SnapshotCache, type Spared } from "../src/node-agent/cache.ts";
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
 import { egressGap } from "../src/node-agent/kube-router.ts";
 import { makeRunsc, type Runsc, runscFlags } from "../src/node-agent/runsc.ts";
@@ -238,10 +238,10 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
 /** Whether the cache of a node holds anything of a workspace. */
 const cachesAny = (node: Node, workspace: string): boolean => existsSync(join(node.cacheDir, "main", workspace));
 
-/** The images the cache of a node holds of a workspace, by digest, whole or not. */
+/** The images the cache of a node holds of a workspace, by digest, whole or not: not runsc's copy of a restore's options, beside them while runsc reads it. */
 const imagesOf = (node: Node, workspace: string): string[] => {
   const directory = join(node.cacheDir, "main", workspace, "layers");
-  return existsSync(directory) ? readdirSync(directory).sort() : [];
+  return existsSync(directory) ? readdirSync(directory).filter((name) => !/^\..*\.remote-/u.test(name)).sort() : [];
 };
 
 /** Resolves once the node's cache holds every image of `manifest`, stamped as checked, as the agent fetches them after a restore from the bucket began. */
@@ -1284,6 +1284,40 @@ test("a restore from the bucket is told the bytes of pages its image holds, of e
       const inspecting = execFileSync("ps", ["-eo", "args"], { encoding: "utf8" }).split("\n").filter((line) => line.includes(join(there.releases.releasesDir, RELEASE)) && line.includes("inspect"));
       assert.deepEqual(inspecting, []);
       said("hang-inspect", false);
+    })
+  ));
+
+test("runsc says how many bytes of pages a restore from the bucket reads from options of its own, however soon the restore is resumed and its own removed, and leaves none of them behind", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const taker = yield* node("node-1");
+      const manifest = yield* taker.agent.checkpoint(request("fs-abc"));
+      const own = `main/fs-abc/layers/${manifest.layers[0]?.digest}/pages.img`;
+      // Its image's pages and a layer's, 45056 bytes in all, as runsc says of the image.
+      const layer = `main/fs-abc/layers/${"b".repeat(64)}/pages.img`;
+      s3.objects.set(layer, Buffer.alloc(45056 - 4096, 7));
+      const there = yield* node("node-2", { quietMs: 100, inspectTimeoutMs: 5000 });
+      const beside = (name: string) => join(there.releases.releasesDir, RELEASE, name);
+      writeFileSync(beside("remote-inspect"), "");
+      writeFileSync(beside("hold-inspect"), "");
+      const prepared = yield* there.agent.prepare(workspace);
+      assert.equal(prepared.source, "bucket");
+      const token = tokenIn(prepared.imagePath);
+      // Resumed, its options removed, before runsc has read the image.
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
+      assert.equal(existsSync(join(prepared.imagePath, "s3_opts.json")), false);
+      rmSync(beside("hold-inspect"));
+      yield* Effect.sleep("400 millis");
+      // Told its bytes: reading past its quiet, until it was served them all.
+      assert.equal(there.storeProxy.reading(), 1);
+      assert.equal(yield* throughProxy(there, token, own), 200);
+      assert.equal(yield* throughProxy(there, token, layer), 200);
+      yield* Effect.sleep("50 millis");
+      assert.equal(there.storeProxy.reading(), 0);
+      const layers = join(there.cache.workspace("main", "fs-abc"), LAYERS_DIR);
+      assert.deepEqual(readdirSync(layers).filter((name) => name.startsWith(".")), []);
+      rmSync(beside("remote-inspect"));
     })
   ));
 
