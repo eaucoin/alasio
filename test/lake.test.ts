@@ -3059,8 +3059,12 @@ describe("the lake's reader", () => {
           // Two masters, the leader saying 2 of neon's volumes under-replicated, the other its stale 0.
           gauge({ "service.name": "seaweedfs" }, "SeaweedFS_master_under_replicated_volumes", 2, { pod: "leader-0", collection: "neon-gate", rp: "001" }),
           gauge({ "service.name": "seaweedfs" }, "SeaweedFS_master_under_replicated_volumes", 0, { pod: "follower-1", collection: "neon-gate", rp: "001" }),
-          // Two gateway replicas, each counting the one folder held.
+          // Two gateway replicas, each counting the one folder held; the other two one had held a minute before, restarted since.
           ...["gateway-0", "gateway-1"].map((instance) => gauge({ "service.name": "alasio-sandbox-gateway", "service.instance.id": instance }, "alasio.gateway.folders.failing", 1, { "k8s.namespace.name": "alasio-host" })),
+          {
+            resource: { attributes: strings({ "service.name": "alasio-sandbox-gateway", "service.instance.id": "gateway-1" }) },
+            scopeMetrics: [{ metrics: [{ name: "alasio.gateway.folders.failing", gauge: { dataPoints: [{ timeUnixNano: String(BigInt(Date.now() - 60_000) * 1_000_000n), asDouble: 3, attributes: strings({ "k8s.namespace.name": "alasio-host" }) }] } }] }],
+          },
         ],
       }));
     });
@@ -3079,7 +3083,7 @@ describe("the lake's reader", () => {
       assert.deepEqual([held["filer-store"], held["roomy-valkey"]], [95, 10]);
       const under = Object.fromEntries((await answer(reader.db, rule("The object store keeps fewer copies than it should"))).map((row) => [row["collection"], row["volumes"]]));
       assert.equal(under["neon-gate"], 2);
-      // The folders held, as every replica counts them: the greatest, not their sum.
+      // The folders held, as every replica last counted them: the greatest, not their sum, nor what one counted before.
       assert.deepEqual(await answer(reader.db, rule("Folder binds are failing")), [{ held: 1 }]);
     } finally {
       reader.close();

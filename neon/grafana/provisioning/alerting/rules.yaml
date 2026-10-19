@@ -459,7 +459,7 @@ groups:
       # The folder conversations held, their instances' binds having failed three times in a
       # row: each runs its turns without bayma's REPL tools until its operator asks again. One
       # stuck folder is one operator's whole workspace, so any held alerts. Every gateway
-      # replica counts the same record, so the greatest of their last counts.
+      # replica counts the same record, so the greatest of each one's last count.
       - uid: alasio-folder-binds-failing
         title: Folder binds are failing
         condition: failing
@@ -485,10 +485,14 @@ groups:
                 body_type: raw
                 body_content_type: text/plain
                 data: |
-                  select max(Value) as held
-                  from otel.metrics_gauge
-                  where MetricName = 'alasio.gateway.folders.failing' and ServiceName = 'alasio-sandbox-gateway'
-                    and TimeUnix > now()::timestamp - interval 3 minute
+                  select max(last) as held
+                  from (
+                    select arg_max(Value, TimeUnix) as last
+                    from otel.metrics_gauge
+                    where MetricName = 'alasio.gateway.folders.failing' and ServiceName = 'alasio-sandbox-gateway'
+                      and TimeUnix > now()::timestamp - interval 3 minute
+                    group by ResourceAttributes['service.instance.id']
+                  )
                   having count(*) > 0
               root_selector: ""
               columns:
