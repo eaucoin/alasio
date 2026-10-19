@@ -66,7 +66,6 @@ import { subnetAddress } from "../../cli/src/cluster/docker.ts";
 import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "../../cli/src/kube/api.ts";
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
-import { HOST_BAYMA_IMAGE } from "../../cli/src/manifests/config.ts";
 import { COMPONENTS as OBJECT_STORE_COMPONENTS } from "../../cli/src/manifests/object-store.ts";
 import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { BINDING_LABEL, environmentKey, keyHash } from "../../src/binder/names.ts";
@@ -177,14 +176,12 @@ const PUSHED = process.env["ALASIO_E2E_REGISTRY"] || undefined;
 export const ESTARGZ = PUSHED !== undefined;
 
 /**
- * The bayma the box's folders run on the release before, which the upgrade shard's install of
- * it is given: their REPLs come back whole across the upgrade where this release pins the same
- * (HOST_BAYMA_IMAGE), and from their checkpoints, once, where it pins another, whose instance
- * refuses a snapshot another bayma took.
+ * The bayma the box's folders run on the release before, as its configuration pins it
+ * (host.baymaImage), which the upgrade shard's install of it is given: the pin kept across the
+ * cut-over, as the configuration is, the folder instances run it too, so their REPLs come back
+ * whole, whatever this release would pin (cli/src/manifests/config.ts HOST_BAYMA_IMAGE).
  */
-export const FOLDER_BAYMA_BEFORE: { readonly repository: string; readonly tag: string; readonly digest: string } = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.3", digest: "sha256:add3c8ad2024f5dad077d2deac67fcda911722eee75be866946d17b17dd31be7" };
-/** Whether the upgrade keeps the folders' bayma, so their REPLs come back whole. */
-export const FOLDER_BAYMA_KEPT = FOLDER_BAYMA_BEFORE.digest === HOST_BAYMA_IMAGE.digest;
+export const FOLDER_BAYMA_BEFORE = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.3", digest: "sha256:add3c8ad2024f5dad077d2deac67fcda911722eee75be866946d17b17dd31be7" } as const;
 
 /** The run's registry: a container on the cluster's network, with a volume of its own, both of this name. */
 const REGISTRY = `${CLUSTER}-registry`;
