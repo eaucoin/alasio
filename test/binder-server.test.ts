@@ -160,6 +160,28 @@ test("environments sharing a key each reach their own binding of it, whichever b
   }
 });
 
+test("a branch's requests of a key stamp its own binding of it alone, never main's, which goes idle on its own requests' time", async () => {
+  const [main, branch] = [await pool(), await pool()];
+  await freePods(main, 1);
+  await freePods(branch, 1);
+  const stand = await pods();
+  const served = await front(main, stand.port, { elsewhere: { branch } });
+  try {
+    const key = "sessionfs:inherited";
+    const as = (environment: string) => ({ authorization: caller(key, Date.now() + 60_000, { environment }) });
+    // Main's binding, known to the front, which no request of main's has stamped yet.
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: as("main") })).status, 204);
+    for (let n = 0; n < 3; n += 1) assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: as("branch"), body: "{}" })).status, 200);
+    assert.equal(reachedNamespace(stand.sent), branch.namespace);
+    const [mains, branchs] = [await run(readLease(main, key)), await run(readLease(branch, key))];
+    assert.deepEqual([mains?.spec?.holderIdentity !== undefined, mains ? activeAt(mains) : "gone"], [true, null]);
+    assert.ok(branchs && activeAt(branchs) !== null, "the branch's own binding stamped");
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
 test("a caller whose placement refuses its key is refused, though the front knows another environment's route to it", async () => {
   const of = await pool();
   await freePods(of, 1);
