@@ -56,7 +56,7 @@ function updateOf(value: Buffer | undefined): Update | null {
 
 /** Joins `log`'s group on its topic, reading from where the group was last told, or from the topic's start. */
 async function joinUpdates(log: TelegramLog): Promise<UpdateFeed> {
-  const feed = await joinTopic(log);
+  const feed = await joinTopic(log, "earliest");
   return {
     next: () => feed.next().then(({ value, position, commit }) => ({ update: updateOf(value), position, commit })),
     close: feed.close,

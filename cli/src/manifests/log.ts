@@ -24,7 +24,7 @@
 import type { KubernetesObject, V1ConfigMap, V1Container, V1EnvVar, V1Service, V1StatefulSet } from "@kubernetes/client-node";
 
 import type { LogPrincipal, MainEnvironmentPrincipal } from "../../../neon/control/secrets.ts";
-import { eventsTopic } from "../../../src/events/names.ts";
+import { eventsGroup, eventsTopic } from "../../../src/events/names.ts";
 import { imageReference } from "../images.ts";
 import { claimLabels, claimSpec, componentName, type Environment, NAMESPACE, replicasOf, restrictedContainer, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
 import { type InstallConfig, LOG_SEGMENT_BYTES, telemetryRetentionBytes } from "./config.ts";
@@ -90,7 +90,7 @@ export const loaderGroup = (name: string): string => `lake-loader.${name}`;
  * topic in its group, `alasio.<name>`, and writing its wake topic, `lake.<name>`, as it
  * commits transcripts; its lake loader's, `loader-<name>`, reading the wake topic in its
  * group, `lake-loader.<name>`; and its events topic, `events.<name>` (src/events/), which the
- * gateways write and its alasio reads in its group; those topics, of one partition each, as
+ * gateways write and its alasio reads in its group, `alasio-events.<name>`; those topics, of one partition each, as
  * one alasio and one loader read them, a chat's updates in order, each keeping a segment
  * beside the one it writes at most: a week of a bot's updates, or of events, and a day of
  * wakes, is kilobytes. Each update, and each event, is flushed to the volume as it is
@@ -109,6 +109,7 @@ export function environmentAccess(name: string): EnvironmentLogAccess {
           { resource: "group", name: alasioGroup(name), pattern: "literal", operations: ["read"] },
           { resource: "topic", name: wake, pattern: "literal", operations: ["write", "describe"] },
           { resource: "topic", name: events, pattern: "literal", operations: ["read", "describe"] },
+          { resource: "group", name: eventsGroup(name), pattern: "literal", operations: ["read"] },
         ],
       },
       {

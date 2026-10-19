@@ -306,6 +306,15 @@ create table if not exists ${SCHEMA}.conversation_notices (
   primary key (conversation_id, notice)
 );
 
+-- Each event of the environment's events topic (src/events/) an alasio handled, by its id, recorded
+-- in the transaction of what its handling wrote: handled once, whichever alasio it was delivered to
+-- and however often (src/events/consume.ts). Kept as long as the topic keeps its records.
+create table if not exists ${SCHEMA}.events_handled (
+  id text primary key,
+  kind text not null,
+  handled_at timestamptz not null default now()
+);
+
 create table if not exists ${SCHEMA}.prompt_jobs (
   seq bigint generated always as identity,
   id text primary key,

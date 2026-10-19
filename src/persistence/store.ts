@@ -8,7 +8,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { Update } from "@grammyjs/types";
-import { Context, Duration, Effect, Layer, Schema } from "effect";
+import { Context, Duration, Effect, Layer, Option, Schema } from "effect";
 import type { Pool } from "pg";
 
 import type { HarnessName } from "../harness/names.ts";
@@ -27,6 +27,7 @@ import {
   type NewModelChoice,
   type WorkspaceConversation,
 } from "./conversation-repository.ts";
+import { NeonEventRepository } from "./event-repository.ts";
 import { type DueOutboxEntry, NeonOutboxRepository, type NewOutboxStatus, type NewOutboxText } from "./outbox-repository.ts";
 import { type KeptPress, NeonPressRepository, type NewKeptPress } from "./press-repository.ts";
 import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState } from "./prompt-job-repository.ts";
@@ -134,6 +135,7 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
   codexLogin: new NeonCodexLoginRepository(sql, schema),
   sessionWorkspaces: new NeonSessionWorkspaceRepository(sql, schema),
   presses: new NeonPressRepository(sql, schema),
+  events: new NeonEventRepository(sql, schema),
 });
 
 /** The record of bot_state that says when the store was last pruned (Store pruneTransientIfDue). */
@@ -166,6 +168,20 @@ export interface HandlingMarks extends UpdateMarks {
    * transaction, so an alasio that stops as it handles the album leaves it waiting.
    */
   readonly claimMediaGroup: (mediaGroupId: string, quietMs: number) => Stored<boolean>;
+}
+
+/**
+ * What an event's handling writes, in the transaction that records the event handled
+ * (Store.withEventHandled), so neither is kept without the other. Other writes of its, not
+ * among these, are its own to make once.
+ */
+export interface EventWrites {
+  /** Queues a reply: its id, or that of the one already queued for its pending response. */
+  readonly enqueueOutboxText: (text: NewOutboxText) => Stored<string>;
+  /** Queues a notice of the conversation's turns, unless it was told it already (Store.enqueueOutboxNotice): whether it was queued now. */
+  readonly enqueueOutboxNotice: (conversationId: string, notice: NewOutboxText) => Stored<boolean>;
+  /** Queues a prompt: the job queued, or the one already queued for its message. */
+  readonly enqueuePromptJob: (job: NewPromptJob) => Stored<PromptJob>;
 }
 
 /**
@@ -424,8 +440,17 @@ export class Store extends Context.Service<Store, {
   readonly setCodexLogin: (auth: string | null) => Stored<void>;
 
   /**
+   * Runs `work` as the handling of the environment's event `id`, of `kind`, given what it
+   * writes, in one transaction with the event's record as handled: what `work` gave, or none,
+   * without running it, where the event was handled already, by this alasio or another, as one
+   * delivered again is. `work` failing rolls back its writes and the record together, so the
+   * event is handled again when it is delivered again.
+   */
+  readonly withEventHandled: <A, E, R>(id: string, kind: string, work: (writes: EventWrites) => Effect.Effect<A, E, R>) => Effect.Effect<Option.Option<A>, E | StoreError, R>;
+
+  /**
    * Deletes what is only kept while it is in flight, `age` after it landed: updates
-   * processed, albums handled, and replies delivered.
+   * processed, albums handled, replies delivered, and events handled.
    */
   readonly pruneTransient: (age: Duration.Input) => Stored<void>;
   /**
@@ -467,11 +492,14 @@ const makeStore = Effect.fnUntraced(function*({
   }
   /** The repositories on `sql`: a transaction's. */
   const repositoriesOn = (sql: Sql) => repositories(sql, schema, workingDirectory);
-  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin, sessionWorkspaces, presses } = repositoriesOn(database);
+  /** `notice` queued to the conversation, recorded as told, on the transaction's repositories `on`, unless it was told already: whether it was queued now. */
+  const noticeOn = (on: ReturnType<typeof repositoriesOn>, conversationId: string, notice: NewOutboxText): Stored<boolean> =>
+    Effect.flatMap(on.outbox.recordNotice(conversationId, notice.text), (fresh) => (fresh ? Effect.as(on.outbox.enqueueText(notice), true) : Effect.succeed(false)));
+  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin, sessionWorkspaces, presses, events } = repositoriesOn(database);
 
   const pruneTransient = (age: Duration.Input): Stored<void> => {
     const ageMs = Duration.toMillis(age);
-    return Effect.all([telegramContent.pruneHandled(ageMs), outbox.pruneSent(ageMs)], { discard: true });
+    return Effect.all([telegramContent.pruneHandled(ageMs), outbox.pruneSent(ageMs), events.pruneHandled(ageMs)], { discard: true });
   };
 
   return Store.of({
@@ -597,11 +625,7 @@ const makeStore = Effect.fnUntraced(function*({
         const on = repositoriesOn(sql);
         return Effect.flatMap(on.callbacks.createCallbackActions(conversationId, actions), (ids) => on.outbox.enqueueText(compose(ids)));
       }),
-    enqueueOutboxNotice: (conversationId, notice) =>
-      database.transaction((sql) => {
-        const on = repositoriesOn(sql);
-        return Effect.flatMap(on.outbox.recordNotice(conversationId, notice.text), (fresh) => (fresh ? Effect.as(on.outbox.enqueueText(notice), true) : Effect.succeed(false)));
-      }),
+    enqueueOutboxNotice: (conversationId, notice) => database.transaction((sql) => noticeOn(repositoriesOn(sql), conversationId, notice)),
     enqueueOutboxStatus: (status) => outbox.enqueueStatus(status),
     enqueueOutboxEdit: (edits, edit) => outbox.enqueueEdit(edits, edit),
     getDueOutbox: (limit) => outbox.getDue(limit),
@@ -674,6 +698,21 @@ const makeStore = Effect.fnUntraced(function*({
     getCodexLogin: codexLogin.getCodexLogin(),
     setCodexLogin: (auth) => codexLogin.setCodexLogin(auth),
 
+    withEventHandled: (id, kind, work) =>
+      database.transaction((sql) => {
+        const on = repositoriesOn(sql);
+        return Effect.flatMap(on.events.recordHandled(id, kind), (fresh) =>
+          fresh
+            ? Effect.map(
+              work({
+                enqueueOutboxText: (text) => on.outbox.enqueueText(text),
+                enqueueOutboxNotice: (conversationId, notice) => noticeOn(on, conversationId, notice),
+                enqueuePromptJob: (job) => on.promptJobs.enqueue(job),
+              }),
+              Option.some,
+            )
+            : Effect.succeed(Option.none()));
+      }),
     pruneTransient,
     pruneTransientIfDue: (age, every) =>
       Effect.flatMap(state.claimUnlessWithin(PRUNED_KEY, "pruned", Duration.toMillis(every)), (claimed) => (claimed ? Effect.as(pruneTransient(age), true) : Effect.succeed(false))),

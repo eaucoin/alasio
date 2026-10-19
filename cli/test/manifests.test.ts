@@ -1907,6 +1907,7 @@ describe("the log", () => {
           { resource: "group", name: "alasio.main", pattern: "literal", operations: ["read"] },
           { resource: "topic", name: "lake.main", pattern: "literal", operations: ["write", "describe"] },
           { resource: "topic", name: "events.main", pattern: "literal", operations: ["read", "describe"] },
+          { resource: "group", name: "alasio-events.main", pattern: "literal", operations: ["read"] },
         ],
       },
       {

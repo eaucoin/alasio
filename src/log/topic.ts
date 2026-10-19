@@ -3,7 +3,7 @@
  * alasio's one Kafka client: its records in turn, each told to the group only once whoever
  * reads it says so (commit), so a member started again reads on from the last record told,
  * neither losing one nor skipping one. A group that has been told of none begins at the
- * topic's first record still kept.
+ * topic's first record still kept, or at the next written, as its reader asks.
  */
 import { readFileSync } from "node:fs";
 
@@ -28,8 +28,8 @@ export interface TopicRecord extends Received {
 /** A member of the group: the topic's records in turn, until it is closed. */
 export type TopicFeed = Feed<TopicRecord>;
 
-/** Joins `log`'s group on its topic, reading on from where the group was last told, or, of a group told of none, from the topic's first record still kept. */
-export async function joinTopic(log: TopicLog): Promise<TopicFeed> {
+/** Joins `log`'s group on its topic, reading on from where the group was last told, or, of a group told of none, from the topic's first record still kept (`earliest`) or the next written (`latest`). */
+export async function joinTopic(log: TopicLog, untold: "earliest" | "latest"): Promise<TopicFeed> {
   const consumer = new Consumer({
     clientId: log.username,
     groupId: log.group,
@@ -44,7 +44,7 @@ export async function joinTopic(log: TopicLog): Promise<TopicFeed> {
     stream = await consumer.consume({
       topics: [log.topic],
       mode: MessagesStreamModes.COMMITTED,
-      fallbackMode: MessagesStreamFallbackModes.EARLIEST,
+      fallbackMode: untold === "earliest" ? MessagesStreamFallbackModes.EARLIEST : MessagesStreamFallbackModes.LATEST,
       autocommit: false,
     });
   } catch (error) {
