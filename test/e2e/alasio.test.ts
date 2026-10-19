@@ -422,8 +422,9 @@ if (inShard("upgrade")) {
           const named = async (kind: KindName, name: string, namespace?: string) => (await kube.get(ref(kind, name, namespace))) !== null;
           assert.deepEqual(await Promise.all(PREVIOUS_ONLY.map(([kind, name, namespace]) => named(kind, name, namespace))), PREVIOUS_ONLY.map(() => false));
           assert.ok(!("agentSandbox" in (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: object }).install));
-          // The folder's state directory, as its bayma left it, which the folder instance runs on.
-          assert.ok(existsSync(folderBayma.state), folderBayma.state);
+          // The folder's state directory, as its bayma left it, which the folder instance runs on:
+          // the host user's, as root sees it.
+          assert.equal((await onNode("", `[ -d '${folderBayma.state}' ] && echo kept || echo gone`)).trim(), "kept", folderBayma.state);
         },
       },
       {
