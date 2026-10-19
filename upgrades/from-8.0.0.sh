@@ -53,6 +53,15 @@ NS=alasio
 k() { kubectl -n "$NS" "$@"; }
 # Whether UPGRADE_CHECK passes now, what it said in OUT/upgrade-check.log.
 accepted() { bash -c "$UPGRADE_CHECK" >"$OUT/upgrade-check.log" 2>&1; }
+# Whether alasio's namespace has no pod of the selector `$1` within `$2` seconds, looking every 5.
+gone() {
+  local waited=0
+  while [ -n "$(k get pod -l "$1" -o name)" ]; do
+    [ "$waited" -lt "$2" ] || return 1
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
 # Runs the SQL it is given on stdin on alasio's database, as alasio connects to it, from its
 # pod: the rows of what it answered, a line each, their values apart by tabs. Its pg is
 # alasio's, in its image, wherever the pod's working directory is (a folder workspace's home).
@@ -138,15 +147,6 @@ log_statefulset_restore() {
 REBOOT_REQUIRED=${REBOOT_REQUIRED:-/run/reboot-required}
 SANDBOXES=sandboxes.agents.x-k8s.io
 CONTROLLER=alasio-agent-sandbox-controller
-# Whether alasio's namespace has no pod of the selector `$1` within `$2` seconds, looking every 5.
-gone() {
-  local waited=0
-  while [ -n "$(k get pod -l "$1" -o name)" ]; do
-    [ "$waited" -lt "$2" ] || return 1
-    sleep 5
-    waited=$((waited + 5))
-  done
-}
 # Refuses, before anything changes, a session workspace of 8.0.0's left, and a reboot pending.
 sandbox_service_check() {
   local sessions left
@@ -246,9 +246,11 @@ sandbox_service_after() {
 # gVisor's processes killed, then containerd's whole state and the daemon's are removed while
 # nothing can use them, k3s starts again, and the upgrade applied again waits until alasio runs
 # on what it pulled. Every image is pulled again, from registries that are to answer meanwhile,
-# as no copy is left on the machine. A run again that finds the move begun (OUT/images-moving)
-# ends it first, as k3s is stopped then, and once they moved (OUT/images-moved), it applies the
-# upgrade again alone.
+# as no copy is left on the machine, and only while the node's disk keeps DISK_FLOOR_BYTES
+# free. Before k3s stops, alasio is stopped and each folder instance let go, saved whole. A
+# run again that finds the move begun (OUT/images-moving) ends it first, as k3s is stopped
+# then, and once they moved (OUT/images-moved), it applies the upgrade again alone.
+
 # Runs "$@" every 2 s until it succeeds, for at most $1 seconds; fails, saying it waited for
 # $2, if it never does.
 wait_for() {
@@ -280,12 +282,40 @@ kill_running() {
 }
 # Where a mount is, of those under the directory $1.
 mounted_under() { awk -v under="$1" '$2 == under || index($2, under "/") == 1 { print $2 }' "$NODE_ROOT/proc/self/mounts"; }
+# The least the node's disk keeps free as k3s pulls every image anew (09's sizing): below
+# it, the pulls are stopped, k3s with them, as a full disk turns even fetched reads into EIO.
+DISK_FLOOR_BYTES=${DISK_FLOOR_BYTES:-$((10 * 1024 * 1024 * 1024))}
+# Fails, k3s stopped, where the node's disk holds less than DISK_FLOOR_BYTES free, as the
+# images are pulled anew; a run again, once disk is freed, goes on with the move.
+disk_left() {
+  local free
+  free=$(df -P -B1 "$NODE_ROOT/var/lib" | awk 'NR == 2 { print $4 }')
+  [ "$free" -ge "$DISK_FLOOR_BYTES" ] && return 0
+  systemctl stop k3s
+  fail "the node's disk has $((free / 1024 / 1024)) MiB free, below the $((DISK_FLOOR_BYTES / 1024 / 1024)) MiB the pulls of the images anew keep: k3s is stopped; free the disk, then run the cut-over again, which goes on with the move"
+}
+# k3s answering, its disk kept free meanwhile.
+answering() { disk_left && kubectl get --raw=/readyz >/dev/null 2>&1; }
+# The release accepting the installation again, its disk kept free meanwhile.
+pulled() { disk_left && accepted; }
 # The node's images removed, with every snapshot of theirs, overlayfs's and the daemon's, and
 # pulled anew through the daemon by k3s started again; OUT/images-moving says it is begun, so
 # that a run again, which finds k3s stopped, ends it first, and OUT/images-moved that it ended.
+# Before k3s stops, alasio is stopped, so no turn binds a folder instance, and each folder
+# instance is let go, given its grace to save its REPL sessions whole, as stopping k3s would
+# kill it unsaved.
 move_images() {
-  local held
-  : >"$OUT/images-moving"
+  local held host
+  if [ ! -e "$OUT/images-moving" ]; then
+    log "stopping alasio, so no turn binds a folder instance as k3s stops"
+    k scale deployment alasio --replicas=0 >/dev/null || fail "alasio could not be stopped"
+    gone app.kubernetes.io/component=alasio 600 || fail "alasio did not stop within 10m"
+    host=$(jq -r '.install.host.namespace // "alasio-host"' "$CONFIG")
+    log "stopping each folder instance in $host, given 10m to save its REPL sessions whole"
+    kubectl -n "$host" delete pod -l alasio.dev/pool=folder --ignore-not-found --grace-period=600 --wait=true --timeout=11m >/dev/null ||
+      fail "the folder instances in $host did not stop within 11m"
+    : >"$OUT/images-moving"
+  fi
   # None, where a move run before removed it.
   held=$(du -shx "$CONTAINERD_STATE" 2>/dev/null | cut -f1) || held=none
   log "stopping k3s, to remove the node's images, unpacked by overlayfs under 8.0.0: $held of containerd's state"
@@ -301,10 +331,10 @@ move_images() {
   rm -rf "$CONTAINERD_STATE" "$STARGZ_ROOT" "$STARGZ_RUN"
   log "starting k3s, which pulls every image again through stargz-snapshotter's daemon"
   systemctl start k3s
-  wait_for 600 "k3s to answer" kubectl get --raw=/readyz
+  wait_for 600 "k3s to answer" answering
   # What the release checks before it applies anything, its storage controller and that
   # controller's database answering among it, back on the images pulled anew.
-  wait_for 900 "the release to accept the installation again, its pods started on the images pulled anew (upgrade-check.log)" accepted
+  wait_for 900 "the release to accept the installation again, its pods started on the images pulled anew (upgrade-check.log)" pulled
   mv "$OUT/images-moving" "$OUT/images-moved"
 }
 # END lazy pulling.

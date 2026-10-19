@@ -118,6 +118,8 @@ case "$*" in
   "delete crd sandboxes.agents.x-k8s.io --ignore-not-found --wait=true") rm -f '${crd}' ;;
   "-n alasio get deployment alasio-agent-sandbox-controller --ignore-not-found -o name") [ ! -e '${controller}' ] || echo deployment.apps/alasio-agent-sandbox-controller ;;
   "-n alasio scale deployment alasio-agent-sandbox-controller --replicas=0") [ -e '${controller}' ] || { echo 'Error from server (NotFound): deployments.apps "alasio-agent-sandbox-controller" not found' >&2; exit 1; } ;;
+  # What stops alasio and the folder instances before k3s stops, said beside what the node was asked.
+  "-n alasio scale deployment alasio --replicas=0"|"-n alasio-host delete pod -l alasio.dev/pool=folder "*) echo "kubectl $*" >>'${host}' ;;
   "-n alasio scale "*|"-n "*" delete pod "*|"-n "*" patch sandboxes.agents.x-k8s.io "*|"-n "*" delete sandboxes.agents.x-k8s.io "*) ;;
   "-n alasio delete "*" --ignore-not-found"|"delete clusterrole,"*" --ignore-not-found"|"-n alasio-host delete "*" --ignore-not-found"|"delete validatingadmissionpolicy,"*" --ignore-not-found") ;;
   "-n alasio exec -i deploy/alasio -c alasio -- node --input-type=module -e "*)
@@ -141,7 +143,7 @@ awk -v point="$2" '$2 != point' '${mounts}' >'${mounts}.next' && mv '${mounts}.n
 `, { mode: 0o755 });
   const out = join(root, "out");
   /** The cut-over, failing at `failAt` if given: what it came to. */
-  const cutOver = (failAt?: string) => {
+  const cutOver = (failAt?: string, env: Readonly<Record<string, string>> = {}) => {
     const run = spawnSync("bash", [SCRIPT], {
       encoding: "utf8",
       env: {
@@ -155,6 +157,7 @@ awk -v point="$2" '$2 != point' '${mounts}' >'${mounts}.next' && mv '${mounts}.n
         // Saying whether the configuration it checks says how to run agent-sandbox.
         UPGRADE_CHECK: `if jq -e '.install | has("agentSandbox")' '${config}' >/dev/null; then echo check of agentSandbox >>'${ran}'; else echo check >>'${ran}'; fi`,
         ...(failAt === undefined ? {} : { FAIL_AT: failAt }),
+        ...env,
       },
     });
     return { code: run.status, said: run.stderr };
@@ -443,7 +446,9 @@ test("past its point of no return, before the upgrade, the cut-over stops agent-
       `-n alasio-sessions patch sandboxes.agents.x-k8s.io fs-abc123 --type=merge -p {"metadata":{"finalizers":null}}`,
       "-n alasio-sessions delete sandboxes.agents.x-k8s.io fs-abc123 --ignore-not-found --wait=true",
     ]);
-    assert.equal(upgraded, 8);
+    // Then, the upgrade through, alasio and the folder instances stopped again as the node's images move.
+    assert.deepEqual(calls.slice(8, 10), ["-n alasio scale deployment alasio --replicas=0", "-n alasio-host delete pod -l alasio.dev/pool=folder --ignore-not-found --grace-period=600 --wait=true --timeout=11m"]);
+    assert.equal(upgraded, 10);
     assert.match(run.said, /stopping the folder's bayma alasio-host\/bayma-0123, given 10m to save its REPL sessions whole into \S+telegram-42, which stays[^]*saved the sessions sess_a sess_b whole[^]*deleting every Sandbox[^]*upgrading, from the cut-over/u);
     assert.ok(existsSync(join(state, "snapshots", "sess_a")));
     // Once its Sandboxes and CRD are gone, a run again does none of it.
@@ -536,6 +541,9 @@ test("once its upgrade has run, the cut-over moves the node's images onto stargz
     assert.equal(run.code, 0, run.said);
     assert.match(run.said, /upgrading, from the cut-over[^]*stopping k3s, to remove the node's images, unpacked by overlayfs under 8\.0\.0: \S+ of containerd's state\n[^]*starting k3s, which pulls every image again through stargz-snapshotter's daemon\n[^]*applying the upgrade again, which waits until alasio runs on the images pulled anew\n[^]*upgraded at /u);
     assert.deepEqual(at.host(), [
+      // alasio stopped, and the folder instances, before k3s is.
+      "kubectl -n alasio scale deployment alasio --replicas=0",
+      "kubectl -n alasio-host delete pod -l alasio.dev/pool=folder --ignore-not-found --grace-period=600 --wait=true --timeout=11m",
       "systemctl stop k3s",
       "k3s-killall.sh",
       `umount -l ${at.daemonSnapshot}/inner`,
@@ -708,9 +716,24 @@ test("the cut-over run again after its upgrade failed goes on with the upgrade, 
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
     assert.doesNotMatch(again.said, /stopping agent-sandbox's controller|waiting for alasio to run no turn|deleting every Sandbox/u);
-    assert.ok(!at.calls().some((call) => call.includes(" scale ")));
+    assert.ok(!at.calls().some((call) => call.includes("scale deployment alasio-agent-sandbox-controller")));
   } finally {
     at.remove();
   }
 });
 
+test("the move of the node's images stops k3s, and fails, where the node's disk keeps less free than the pulls anew keep, a run again going on with the move", () => {
+  const at = machine();
+  try {
+    const short = at.cutOver(undefined, { DISK_FLOOR_BYTES: String(2 ** 60) });
+    assert.notEqual(short.code, 0);
+    assert.match(short.said, /FAILED: the node's disk has \d+ MiB free, below the \d+ MiB the pulls of the images anew keep: k3s is stopped/u);
+    assert.deepEqual(at.host().slice(-2), ["systemctl start k3s", "systemctl stop k3s"]);
+    assert.deepEqual(at.imageMarks(), ["images-moving"]);
+    const again = at.cutOver(undefined, { DISK_FLOOR_BYTES: "1" });
+    assert.equal(again.code, 0, again.said);
+    assert.deepEqual(at.imageMarks(), ["images-moved"]);
+  } finally {
+    at.remove();
+  }
+});
