@@ -20,6 +20,7 @@ import { scramVerifier } from "../../neon/control/scram.ts";
 import { environmentKey } from "../../src/binder/names.ts";
 import { verifyToken } from "../../src/binder/tokens.ts";
 import { forkToken } from "../../src/branch/names.ts";
+import { BOT_COMMANDS } from "../../src/telegram/bot-commands.ts";
 import type { TenantView } from "../src/branches.ts";
 import { CODEX_LOGIN } from "../src/commands/login.ts";
 import { API_SERVER_UNCONFINED } from "../src/commands/up.ts";
@@ -431,6 +432,8 @@ test("up applies alasio, waits until it runs, and says what to do next", async (
     ipAddress: PUBLIC_ADDRESS,
   });
   assert.ok(run.progress.includes(`Telegram delivers @${BOT}'s updates to the webhook intake, for main`));
+  // Its menu offers alasio's commands, set here, as alasio sets nothing of the bot as it starts.
+  assert.deepEqual(setup.telegram.menus.get(BOT_TOKEN), { commands: BOT_COMMANDS, button: { type: "commands" } });
 
   // What reaches the API server alone reaches it where its Service's slices say.
   assert.deepEqual(receiverEgress(setup.kube).at(-1), { to: [{ ipBlock: { cidr: "172.18.0.2/32" } }], ports: [{ protocol: "TCP", port: 6443 }] });
@@ -2201,6 +2204,7 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   assert.deepEqual(route.allowedUserIds, ["42"]);
   assert.notEqual(route.path, (JSON.parse(secretValue(kube, ROUTES_SECRET, "main") ?? "") as { path: string }).path);
   assert.deepEqual([telegram.webhooks.get("456:branch")?.url, telegram.webhooks.get("456:branch")?.secretToken], [`https://${PUBLIC_ADDRESS}${route.path}`, route.secretToken]);
+  assert.deepEqual(telegram.menus.get("456:branch"), { commands: BOT_COMMANDS, button: { type: "commands" } });
   assert.equal(run.printed.at(-1), "The branch try runs, on a copy of alasio's data as it is now. Message @branch_bot on Telegram to talk to it; alasio branch delete try deletes it.");
   assert.equal(failure(await alasio(["branch", "create", "try", "--bot-token-file", token("branch", "456:branch")])), "there is a branch try already");
 });

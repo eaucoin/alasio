@@ -136,6 +136,9 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
   presses: new NeonPressRepository(sql, schema),
 });
 
+/** The record of bot_state that says when the store was last pruned (Store pruneTransientIfDue). */
+const PRUNED_KEY = "pruned";
+
 /** What alasio does with its store; each of it fails as Neon does. */
 type Stored<A> = Effect.Effect<A, StoreError>;
 
@@ -425,6 +428,14 @@ export class Store extends Context.Service<Store, {
    * processed, albums handled, and replies delivered.
    */
   readonly pruneTransient: (age: Duration.Input) => Stored<void>;
+  /**
+   * Prunes as pruneTransient does where the store was last pruned more than `every` ago, by
+   * any alasio on it: the day claimed first, in one statement, so of the alasios that look at
+   * once one alone prunes; whether this one did. An alasio that starts often, as one that
+   * sleeps does, so prunes no more often than `every`; a prune that fails, its day claimed,
+   * waits for the next.
+   */
+  readonly pruneTransientIfDue: (age: Duration.Input, every: Duration.Input) => Stored<boolean>;
 }>()("alasio/persistence/Store") {
   /** The store in `schema` of the pool's database, made first as `makesSchema` says. */
   static readonly layer = (options: StoreOptions): Layer.Layer<Store, StoreError> => Layer.effect(Store, makeStore(options));
@@ -457,6 +468,11 @@ const makeStore = Effect.fnUntraced(function*({
   /** The repositories on `sql`: a transaction's. */
   const repositoriesOn = (sql: Sql) => repositories(sql, schema, workingDirectory);
   const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin, sessionWorkspaces, presses } = repositoriesOn(database);
+
+  const pruneTransient = (age: Duration.Input): Stored<void> => {
+    const ageMs = Duration.toMillis(age);
+    return Effect.all([telegramContent.pruneHandled(ageMs), outbox.pruneSent(ageMs)], { discard: true });
+  };
 
   return Store.of({
     getState: (key) => state.getState(key),
@@ -658,9 +674,8 @@ const makeStore = Effect.fnUntraced(function*({
     getCodexLogin: codexLogin.getCodexLogin(),
     setCodexLogin: (auth) => codexLogin.setCodexLogin(auth),
 
-    pruneTransient: (age) => {
-      const ageMs = Duration.toMillis(age);
-      return Effect.all([telegramContent.pruneHandled(ageMs), outbox.pruneSent(ageMs)], { discard: true });
-    },
+    pruneTransient,
+    pruneTransientIfDue: (age, every) =>
+      Effect.flatMap(state.claimUnlessWithin(PRUNED_KEY, "pruned", Duration.toMillis(every)), (claimed) => (claimed ? Effect.as(pruneTransient(age), true) : Effect.succeed(false))),
   });
 });

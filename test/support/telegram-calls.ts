@@ -44,8 +44,6 @@ export function recordingTelegram(answers: Partial<Pick<Service, keyof TelegramC
     call: (method) => unused(method),
     callMultipart: (method) => unused(method),
     getMe: unused("getMe"),
-    setMyCommands: () => unused("setMyCommands"),
-    setChatMenuButton: () => unused("setChatMenuButton"),
     sendMessage: (...args) =>
       Effect.suspend(() => {
         calls.sendMessage.push(args);

@@ -1,11 +1,14 @@
 /**
  * Telegram's Bot API, as far as alasio's command line asks it: which bot a token is
- * (getMe), so a token is checked before it is kept; and where Telegram delivers a bot's
- * updates (setWebhook, deleteWebhook, getWebhookInfo), which the command line alone says,
- * as it registers each environment's bot (./webhook.ts). It never sends a message. The API
- * is at TELEGRAM_API_ROOT, as for alasio itself, or Telegram's own.
+ * (getMe), so a token is checked before it is kept; where Telegram delivers a bot's
+ * updates (setWebhook, deleteWebhook, getWebhookInfo), and what its menu offers
+ * (setMyCommands, setChatMenuButton), which the command line alone says, as it registers
+ * each environment's bot (./webhook.ts). It never sends a message. The API is at
+ * TELEGRAM_API_ROOT, as for alasio itself, or Telegram's own.
  */
 import { Config, Context, Effect, Layer, Redacted, Schema } from "effect";
+
+import { BOT_COMMANDS } from "../../src/telegram/bot-commands.ts";
 
 /** A Bot API answer of `result`'s shape, or its refusal. */
 const Answer = <S extends Schema.Top>(result: S) =>
@@ -63,6 +66,8 @@ export class TelegramBotApi extends Context.Service<TelegramBotApi, {
   /** Has Telegram deliver the bot's updates nowhere, keeping what it holds undelivered. */
   readonly deleteWebhook: (token: Redacted.Redacted) => Effect.Effect<void, WebhookError>;
   readonly getWebhookInfo: (token: Redacted.Redacted) => Effect.Effect<WebhookInfo, WebhookError>;
+  /** Has the bot's menu offer alasio's commands (../../src/telegram/bot-commands.ts), its menu button opening them. */
+  readonly setMenu: (token: Redacted.Redacted) => Effect.Effect<void, WebhookError>;
 }>()("alasio/TelegramBotApi") {
   static readonly layer: Layer.Layer<TelegramBotApi, Config.ConfigError> = Layer.effect(
     TelegramBotApi,
@@ -105,6 +110,17 @@ export class TelegramBotApi extends Context.Service<TelegramBotApi, {
           const form = new FormData();
           form.set("drop_pending_updates", "false");
           return call(token, "deleteWebhook", form, DoneAnswer, webhookError("deleteWebhook")).pipe(Effect.flatMap(done("deleteWebhook")));
+        },
+        setMenu: (token) => {
+          const commands = new FormData();
+          commands.set("commands", JSON.stringify(BOT_COMMANDS));
+          const button = new FormData();
+          button.set("menu_button", JSON.stringify({ type: "commands" }));
+          return call(token, "setMyCommands", commands, DoneAnswer, webhookError("setMyCommands")).pipe(
+            Effect.flatMap(done("setMyCommands")),
+            Effect.andThen(call(token, "setChatMenuButton", button, DoneAnswer, webhookError("setChatMenuButton"))),
+            Effect.flatMap(done("setChatMenuButton")),
+          );
         },
         getWebhookInfo: (token) =>
           call(token, "getWebhookInfo", null, WebhookInfoAnswer, webhookError("getWebhookInfo")).pipe(

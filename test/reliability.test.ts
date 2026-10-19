@@ -432,6 +432,22 @@ test("what is kept only in flight is pruned once it has landed long enough ago; 
   assert.notEqual(await run(store.consumeCallbackAction(button)), null, "a button not yet pressed acts however old it is");
 });
 
+test("the store is pruned once a day by whichever alasio looks when it is due, so an alasio that starts often prunes no more often", async () => {
+  const schema = newSchema();
+  const store = await testStore({ schema });
+  const other = await testStore({ schema });
+  assert.equal(await run(store.pruneTransientIfDue("7 days", "1 day")), true, "never pruned: due");
+  assert.equal(await run(other.pruneTransientIfDue("7 days", "1 day")), false, "pruned within the day, by another");
+  assert.equal(await run(store.pruneTransientIfDue("7 days", "1 day")), false);
+  await (await testPool()).query(`update ${schema}.bot_state set updated_at = now() - interval '25 hours' where key = 'pruned'`);
+  assert.equal(await run(other.pruneTransientIfDue("7 days", "1 day")), true, "due again a day after");
+  // Of alasios that look at once, as a day comes due, one alone prunes.
+  await (await testPool()).query(`update ${schema}.bot_state set updated_at = now() - interval '25 hours' where key = 'pruned'`);
+  const stores = await Promise.all(Array.from({ length: 6 }, () => testStore({ schema })));
+  const pruned = await Promise.all(stores.map((each) => run(each.pruneTransientIfDue("7 days", "1 day"))));
+  assert.equal(pruned.filter(Boolean).length, 1, String(pruned));
+});
+
 test("Telegram API error exposes retry_after", () => {
   const error = TelegramApiError.fromResponse("sendMessage", 429, {
     ok: false,

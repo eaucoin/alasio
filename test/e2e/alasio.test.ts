@@ -254,6 +254,9 @@ interface Scenario {
   readonly check: () => Promise<void>;
 }
 
+/** Whether `call` asks Telegram who the bot is, as alasio does as it starts, and nothing else of it does after. */
+const asksWhoItsBotIs = (call: RecordedCall) => call.method === "getMe";
+
 /** Whether `call` is the answer of a turn on Codex, the stand-in's, in the chat `chat`, the operator's unless given. */
 const answered = (call: RecordedCall, chat?: number) =>
   call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER && (chat === undefined || Number(call.payload.chat_id) === chat);
@@ -271,7 +274,7 @@ if (inShard("upgrade")) {
       telegram = await forward(TELEGRAM);
       branchTelegram = await forward(TELEGRAM_BRANCH);
       tg = operator(telegram.base);
-      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+      await tg.waitFor(asksWhoItsBotIs, 300_000).catch(() => {});
     });
 
     after(() => {
@@ -832,7 +835,7 @@ if (inShard("sessions")) {
     before(async () => {
       telegram = await forward(TELEGRAM);
       tg = operator(telegram.base);
-      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+      await tg.waitFor(asksWhoItsBotIs, 300_000).catch(() => {});
     });
 
     after(() => {
@@ -1002,7 +1005,7 @@ if (inShard("sessions")) {
 
     test("alasio comes back from alasio restart with its conversation's workspace", async () => {
       assert.equal(await alasioOk("restart"), "alasio restarted; a turn it was running continues.\n");
-      await tg.waitFor((call) => call.method === "setMyCommands", 300_000);
+      await tg.waitFor(asksWhoItsBotIs, 300_000);
       await tg.say("/workspace");
       const panel = await tg.waitFor((call) => /^Session workspace: /mu.test(call.payload.text ?? ""));
       assert.match(panel.payload.text ?? "", new RegExp(`^Session workspace: ${full}, full internet$`, "mu"));
@@ -1018,7 +1021,7 @@ if (inShard("sessions")) {
 
       const before = await kube.runningPod(NAMESPACE, RELEASE);
       await kube.remove(ref("Pod", before, NAMESPACE));
-      await tg.waitFor((call) => call.method === "setMyCommands", 300_000);
+      await tg.waitFor(asksWhoItsBotIs, 300_000);
       assert.notEqual(await kube.runningPod(NAMESPACE, RELEASE), before);
 
       // A button sent by the pod that is gone acts in the one that replaced it.
@@ -1442,7 +1445,7 @@ if (inShard("snapshots")) {
     before(async () => {
       telegram = await forward(TELEGRAM);
       tg = operator(telegram.base);
-      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+      await tg.waitFor(asksWhoItsBotIs, 300_000).catch(() => {});
       await tg.say("/service codex");
       await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
     });
@@ -1865,7 +1868,7 @@ if (inShard("workspaces")) {
     before(async () => {
       telegram = await forward(TELEGRAM);
       tg = operator(telegram.base);
-      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+      await tg.waitFor(asksWhoItsBotIs, 300_000).catch(() => {});
     });
 
     after(() => {
@@ -1909,7 +1912,7 @@ if (inShard("workspaces")) {
     before(async () => {
       telegram = await forward(TELEGRAM);
       tg = operator(telegram.base);
-      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+      await tg.waitFor(asksWhoItsBotIs, 300_000).catch(() => {});
     });
 
     after(() => {
@@ -2074,7 +2077,7 @@ if (inShard("telemetry")) {
       telegram = await forward(TELEGRAM);
       sink = await forward(OTLP);
       tg = operator(telegram.base);
-      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+      await tg.waitFor(asksWhoItsBotIs, 300_000).catch(() => {});
     });
 
     after(() => {
@@ -2641,7 +2644,7 @@ if (inShard("neon")) {
     before(async () => {
       telegram = await forward(TELEGRAM);
       tg = operator(telegram.base);
-      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+      await tg.waitFor(asksWhoItsBotIs, 300_000).catch(() => {});
     });
 
     after(() => {
@@ -2813,7 +2816,7 @@ if (inShard("scaling")) {
     before(async () => {
       telegram = await forward(TELEGRAM);
       tg = operator(telegram.base);
-      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+      await tg.waitFor(asksWhoItsBotIs, 300_000).catch(() => {});
       await kube.apply({ apiVersion: "v1", kind: "Namespace", metadata: { name: SCALING, labels: { "pod-security.kubernetes.io/enforce": "restricted" } } });
     });
 
@@ -3202,7 +3205,7 @@ if (inShard("branches")) {
       branchTelegram = await forward(TELEGRAM_BRANCH);
       tg = operator(telegram.base);
       branch = operator(branchTelegram.base);
-      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+      await tg.waitFor(asksWhoItsBotIs, 300_000).catch(() => {});
     });
 
     after(() => {
@@ -3220,6 +3223,7 @@ if (inShard("branches")) {
       // Its compute sleeps after a minute idle.
       await createBranch(branchTelegram?.base, { neon: { compute: { suspendAfter: "1m" } } });
       console.error(`# the branch ran ${((Date.now() - started) / 1000).toFixed(1)}s after alasio branch create was run`);
+      // Its bot's menu set by branch create, as it registers the bot.
       await branch.waitFor((call) => call.method === "setMyCommands", 300_000);
       assert.match(await alasioOk("branch", "list"), new RegExp(`^${BRANCH}: a branch of main, \\d+m old, made by alasio \\S+, its alasio ready, `, "mu"));
       await maintained("kept the files for the branch", (line) => line.includes(`"keptFilesFor":["${BRANCH}"]`));

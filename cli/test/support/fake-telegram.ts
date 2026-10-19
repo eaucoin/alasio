@@ -2,7 +2,8 @@
  * Telegram's Bot API in memory, as far as alasio's command line asks it: getMe, which
  * answers with the bot of a token it knows, and refuses any other as Telegram does; and
  * setWebhook, deleteWebhook and getWebhookInfo, which keep where each bot's updates are
- * delivered, as it was last told.
+ * delivered, as it was last told; and setMyCommands and setChatMenuButton, which keep each
+ * bot's menu.
  */
 import { once } from "node:events";
 import { createServer, type IncomingMessage } from "node:http";
@@ -28,6 +29,8 @@ export interface FakeTelegram {
   readonly lastErrors: Map<string, { readonly date: number; readonly message: string }>;
   /** How many of a bot's updates getWebhookInfo says wait, by its token, as the test sets it; none where it is not set. */
   readonly pending: Map<string, number>;
+  /** Each bot's menu, by its token: its commands, and its menu button, as it was last told. */
+  readonly menus: Map<string, { commands?: readonly { command: string; description: string }[]; button?: unknown }>;
   /** The paths it was asked for, which hold the tokens. */
   readonly requests: string[];
   readonly close: () => Promise<void>;
@@ -46,6 +49,7 @@ export async function serveFakeTelegram(): Promise<FakeTelegram> {
   const webhooks = new Map<string, FakeWebhook>();
   const lastErrors = new Map<string, { readonly date: number; readonly message: string }>();
   const pending = new Map<string, number>();
+  const menus: FakeTelegram["menus"] = new Map();
   const requests: string[] = [];
   const server = createServer((request, response) => {
     requests.push(request.url ?? "");
@@ -69,6 +73,13 @@ export async function serveFakeTelegram(): Promise<FakeTelegram> {
           ipAddress: form.has("ip_address") ? String(form.get("ip_address")) : undefined,
         });
         return answer(200, { ok: true, result: true, description: "Webhook was set" });
+      }
+      if (method === "setMyCommands" || method === "setChatMenuButton") {
+        const menu = menus.get(token) ?? {};
+        if (method === "setMyCommands") menu.commands = JSON.parse(String(form.get("commands") ?? "[]")) as { command: string; description: string }[];
+        else menu.button = JSON.parse(String(form.get("menu_button") ?? "null"));
+        menus.set(token, menu);
+        return answer(200, { ok: true, result: true });
       }
       if (method === "deleteWebhook") {
         webhooks.delete(token);
@@ -97,6 +108,7 @@ export async function serveFakeTelegram(): Promise<FakeTelegram> {
     webhooks,
     lastErrors,
     pending,
+    menus,
     requests,
     close: async () => {
       server.closeAllConnections();

@@ -6,8 +6,9 @@
  * once, undelivered responses are looked for every thirty seconds, what the store keeps
  * only in flight is pruned daily, linked sessions are warmed, and Telegram is asked how its
  * deliveries fare every five minutes (./delivery-watch.ts). All of it stops as its scope
- * closes, consuming first. Telegram is told where to deliver by alasio's command line,
- * never by alasio.
+ * closes, consuming first. Telegram is told where to deliver, and what the bot's menu
+ * offers, by alasio's command line, never by alasio: a start asks Telegram nothing but who
+ * the bot is.
  */
 import type { Update } from "@grammyjs/types";
 import { randomUUID } from "node:crypto";
@@ -52,19 +53,10 @@ const MEDIA_GROUPS_DUE_EVERY = "10 seconds";
  * prompts, responses and the actions of buttons not yet pressed are kept.
  */
 const TRANSIENT_RETENTION = "7 days";
-/** How often what outlived TRANSIENT_RETENTION is pruned. */
+/** How often what outlived TRANSIENT_RETENTION is pruned, by whichever alasio on the store looks when it is due. */
 const PRUNE_EVERY = "1 day";
-
-/** The bot's commands, as Telegram's menu offers them. */
-const NATIVE_COMMANDS = [
-  { command: "service", description: "Switch between Codex and Claude" },
-  { command: "model", description: "Choose the model and effort" },
-  { command: "workspace", description: "Choose, create or fork the workspace to work in" },
-  { command: "session", description: "Manage the mounted agent session" },
-  { command: "sessions", description: "Browse and mount agent sessions" },
-  { command: "goal", description: "View or set the mounted session goal (Codex)" },
-  { command: "stop", description: "Interrupt the active turn" },
-];
+/** How often alasio looks whether pruning is due, which costs a read. */
+const PRUNE_LOOKS_EVERY = "1 hour";
 
 /** What the app is made with: alasio's configuration, and what main keeps in Neon. */
 export interface TelegramAppConfig
@@ -258,10 +250,6 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   yield* Effect.logInfo(`  Default folder: ${config.workingDirectory ?? "none (operator chooses with /workspace)"}`);
   yield* Effect.logInfo(`  Default service: ${config.defaultHarness ?? "none (operator chooses with /service)"}`);
   yield* Effect.logInfo(`  Session filesystems: ${sandbox ? "enabled" : "off (the deployment renders no sessions template)"}`);
-  yield* client.setMyCommands(NATIVE_COMMANDS).pipe(
-    Effect.andThen(client.setChatMenuButton({ type: "commands" })),
-    Effect.catch((error) => Effect.logWarning(`Failed to configure Telegram native commands: ${error.message}`)),
-  );
   yield* turns.reconcilePersistentState;
   // Before anything can make another, the session filesystems a crash left unmade go.
   yield* Effect.flatMap(Mounts, (mounts) => mounts.reconcileSessionWorkspaces);
@@ -287,10 +275,10 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   yield* mediaGroups.flushDue.pipe(Effect.schedule(Schedule.spaced(MEDIA_GROUPS_DUE_EVERY)), Effect.forkScoped);
   // Presses kept whose alasio let go of them, or crashed, run again.
   yield* recoverPresses(handling).pipe(Effect.provideContext(services), Effect.schedule(Schedule.spaced(PRESSES_DUE_EVERY)), Effect.forkScoped);
-  // Pruned as alasio starts, and every day it runs after.
-  yield* store.pruneTransient(TRANSIENT_RETENTION).pipe(
-    Effect.catch((error) => Effect.logWarning(`Pruning the store failed: ${error.message}`)),
-    Effect.repeat(Schedule.spaced(PRUNE_EVERY)),
+  // Pruned once a day, by whichever alasio looks when it is due: as one starts, and every hour one runs.
+  yield* store.pruneTransientIfDue(TRANSIENT_RETENTION, PRUNE_EVERY).pipe(
+    Effect.catch((error) => Effect.logWarning(`Pruning the store failed: ${error.message}`).pipe(Effect.as(false))),
+    Effect.repeat(Schedule.spaced(PRUNE_LOOKS_EVERY)),
     Effect.forkScoped,
   );
   yield* Effect.forkScoped(warmLinkedSessions);

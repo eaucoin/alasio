@@ -6,10 +6,8 @@ import { setDefaultAutoSelectFamily } from "node:net";
 import type {
   ApiMethods,
   ApiResponse,
-  BotCommand,
   File,
   InputRichMessage,
-  MenuButton,
   Message,
   Opts,
 } from "@grammyjs/types";
@@ -248,8 +246,6 @@ export class TelegramClient extends Context.Service<TelegramClient, {
    */
   readonly callMultipart: <M extends BotMethod>(method: M, fields: BotParams<M>, files: readonly Upload[]) => Effect.Effect<BotResult<M>, TelegramError>;
   readonly getMe: Effect.Effect<BotResult<"getMe">, TelegramError>;
-  readonly setMyCommands: (commands: readonly BotCommand[]) => Effect.Effect<BotResult<"setMyCommands">, TelegramError>;
-  readonly setChatMenuButton: (menuButton?: MenuButton) => Effect.Effect<BotResult<"setChatMenuButton">, TelegramError>;
   /**
    * Sends text, after the messages sent or edited before it. `format` is "markdown" (the
    * default: a Markdown subset as Telegram HTML), "plain", or "rich": Markdown as Telegram
@@ -442,8 +438,6 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
     call,
     callMultipart,
     getMe: call("getMe"),
-    setMyCommands: (commands) => call("setMyCommands", { commands }),
-    setChatMenuButton: (menuButton = { type: "commands" }) => call("setChatMenuButton", { menu_button: menuButton }),
     sendMessage: (chatId, text, options = {}) =>
       Effect.suspend(() => {
         const message: MessageSending = { accepted: false };

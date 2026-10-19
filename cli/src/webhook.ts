@@ -6,7 +6,8 @@
  * sends with each delivery, and the users the environment allows, which the intake lets
  * through alone. Its bot is registered once the intake serves its route: Telegram is told
  * the route's URL on the intake's public address, the secret token, the updates alasio
- * acts on, and the intake's certificate, uploaded, which Telegram trusts alone. alasio up
+ * acts on, and the intake's certificate, uploaded, which Telegram trusts alone; and its
+ * menu is set to alasio's commands. alasio up
  * registers main's again each time, with the certificate the stack's setup keeps or has
  * just renewed (neon/control/certificate.ts); a branch environment's bot is registered as
  * the branch is made, and told to deliver nowhere as it is deleted.
@@ -157,7 +158,7 @@ const certificate: Effect.Effect<string, KubeApiError | WebhookNotServing, KubeA
   return cert;
 });
 
-/** Has Telegram deliver `bot`'s updates to `route`, once the intake serves it, with the intake's certificate. */
+/** Has Telegram deliver `bot`'s updates to `route`, once the intake serves it, with the intake's certificate, and its menu offer alasio's commands. */
 export const registerBot = Effect.fnUntraced(function*(
   config: InstallConfig,
   environment: string,
@@ -174,6 +175,8 @@ export const registerBot = Effect.fnUntraced(function*(
     secretToken: Redacted.make(route.secretToken),
     ipAddress: /^(\d{1,3}\.){3}\d{1,3}$/u.test(address) ? address : undefined,
   });
+  // Here, as each bot is registered, rather than as alasio starts, which would ask it of every start.
+  yield* telegram.setMenu(bot.token);
   yield* Effect.logInfo(`Telegram delivers ${bot.username ? `@${bot.username}` : "the bot"}'s updates to the webhook intake, for ${environment}`);
 });
 
