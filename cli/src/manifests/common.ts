@@ -115,6 +115,9 @@ export const ONE: Scale = { min: 1, max: 1 };
 /** Whether a scaler moves a component of `scale` between its min and max. */
 export const scaled = ({ min, max }: Scale): boolean => min !== max;
 
+/** Whether a component of `scale` sleeps, none of its pods running, until its scaler wakes it. */
+export const sleeps = ({ min }: Scale): boolean => min === 0;
+
 /**
  * The replicas of a workload of `scale`: the count it fixes; or none where its scaler
  * moves it, which then owns the field, as applying alasio would take it back otherwise.

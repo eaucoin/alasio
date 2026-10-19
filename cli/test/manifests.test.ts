@@ -825,6 +825,15 @@ describe("the lake's readers", () => {
 });
 
 describe("the lake's writers", () => {
+  test("have VPA size the memory alone of the loader and the intake while they sleep, woken from none, and their CPU too where they never do", () => {
+    const controlled = (objects: readonly KubernetesObject[], name: string) =>
+      one<VerticalPodAutoscaler>(objects, "VerticalPodAutoscaler", name).spec.resourcePolicy.containerPolicies.map((policy) => (policy as { controlledResources?: string[] }).controlledResources);
+    const asleep = install();
+    assert.deepEqual([controlled(asleep, "alasio-lake-loader"), controlled(asleep, "alasio-lake-intake")], [[["memory"]], [["memory"]]]);
+    const awake = install({ lake: { loader: { scaling: { min: 1, max: 1 } }, intake: { scaling: { min: 1, max: 2 } } } });
+    assert.deepEqual([controlled(awake, "alasio-lake-loader"), controlled(awake, "alasio-lake-intake")], [[undefined], [undefined]]);
+  });
+
   /** `workload`'s variables, by name: each's value, or the Secret's key it is from. */
   const variables = (from: V1Container) =>
     Object.fromEntries((from.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? `${valueFrom?.secretKeyRef?.name}/${valueFrom?.secretKeyRef?.key}`]));
@@ -2919,12 +2928,15 @@ describe("scaling", () => {
     for (const [name, mode] of modes) assert.equal(mode, recommended.includes(name.split("/")[1] ?? "") ? "Off" : "InPlace", name);
     // A branch's alasio runs turns as main's does.
     assert.equal(modes.get("alasio-branch-try/alasio"), "Off");
+    // Of the memory alone of what sleeps, woken from none: the lakes' loaders and the intake.
+    const sleeping = ["alasio-lake-loader", "alasio-lake-intake"];
     for (const vpa of sized) {
       const workload = workloads.find((each) => key(each) === key(vpa));
       assert.deepEqual(vpa.spec.targetRef, { apiVersion: workload?.apiVersion, kind: workload?.kind, name: workload?.metadata?.name });
       assert.equal(vpa.spec.updatePolicy.minReplicas, vpa.spec.updatePolicy.updateMode === "Off" ? undefined : 1);
       assert.deepEqual(vpa.spec.resourcePolicy.containerPolicies, (workload?.spec?.template.spec?.containers ?? []).map(({ name, resources }) => ({
         containerName: name,
+        ...(sleeping.includes(workload?.metadata?.name ?? "") ? { controlledResources: ["memory"] } : {}),
         minAllowed: { cpu: "5m", memory: "16Mi" },
         ...(resources?.limits?.["memory"] ? { maxAllowed: { memory: resources.limits["memory"] } } : {}),
         controlledValues: "RequestsOnly",

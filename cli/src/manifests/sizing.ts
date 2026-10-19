@@ -41,7 +41,11 @@ export interface VerticalPodAutoscaler extends KubernetesObject {
 /**
  * The VerticalPodAutoscaler of `workload`, sized as `sizing` says, of its `controlled`
  * resources: of memory alone where what scales it scales on its CPU, as the two would
- * chase each other.
+ * chase each other; and where it sleeps between bursts of work, as the lake's loader and
+ * intake do, woken from none: it uses CPU only while it bursts, which a recommendation of
+ * its CPU would request for each pod woken, as much as a core, a share of a small node's
+ * that its floor's pods hold already, keeping it from being scheduled. It takes what CPU
+ * is spare beside its request, which no limit bounds.
  */
 export function verticalPodAutoscaler(workload: V1Deployment | V1StatefulSet | V1DaemonSet, sizing: Sizing, controlled: readonly ("cpu" | "memory")[] = ["cpu", "memory"]): VerticalPodAutoscaler {
   const containers: readonly V1Container[] = workload.spec?.template.spec?.containers ?? [];
