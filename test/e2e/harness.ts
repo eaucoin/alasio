@@ -952,10 +952,12 @@ async function dumpNodes(which: ((node: string) => boolean) | undefined): Promis
       lastOf("containerd's last lines", await sudo("sh", "-c", containerdLog).then(({ stdout }) => stdout, failure));
       return said;
     }
+    // What the machine's kernel killed for its memory, as a node's container may be.
+    lastOf("the kernel's kills for memory", await sudo("dmesg", "--ctime").then(({ stdout: out }) => out.split("\n").filter((line) => /out of memory|oom-kill|killed process/iu.test(line)).join("\n"), failure));
     const { stdout } = await docker("ps", "--all", "--filter", `label=alasio.cluster=${CLUSTER}`, "--format", "{{.Names}}");
     for (const node of stdout.split("\n").filter(Boolean).sort()) {
       if (which && !which(node)) continue;
-      const state = await docker("inspect", "--format", "{{.State.Status}}, started {{.State.StartedAt}}, exit code {{.State.ExitCode}}{{if .State.Error}}, {{.State.Error}}{{end}}, restarted {{.RestartCount}} times", node)
+      const state = await docker("inspect", "--format", "{{.State.Status}}, started {{.State.StartedAt}}, exit code {{.State.ExitCode}}{{if .State.OOMKilled}}, killed for its memory{{end}}{{if .State.Error}}, {{.State.Error}}{{end}}, restarted {{.RestartCount}} times", node)
         .then(({ stdout: inspected }) => inspected.trim(), failure);
       say(`--- node ${node}: its container ${state}`);
       // k3s logs on stderr, which docker logs says as such.
@@ -1074,6 +1076,8 @@ export async function dumpClusterState(): Promise<void> {
     }
   } catch (error) {
     say(`the cluster's state could not be read: ${error instanceof Error ? error.message : String(error)}`);
+    // Its API gone, what its nodes say of themselves, their containers' state among it.
+    for (const line of await dumpNodes(undefined)) say(line);
   }
   say("::endgroup::");
   process.stderr.write(`${said.join("\n")}\n`);
