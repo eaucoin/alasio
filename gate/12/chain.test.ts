@@ -699,7 +699,7 @@ test("8. a restore from the bucket whose proxy goes away during its background r
           try {
             const directory = at(`bucket-${image}`);
             await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && umask 077 && printf '%s' ${q(goferOptions(`${layersPrefix}${own}/`, layersPrefix, relay.endpoint, { access_key_id: token.accessKeyId, secret_access_key: token.secretAccessKey }))} >${q(`${directory}/s3_opts.json`)}`);
-            if (how === "stopped") await debugOn();
+            await debugOn();
             const startedAt = Date.now();
             const restored = await restoreFrom(directory);
             outcome["restore"] = restored;
@@ -728,7 +728,7 @@ test("8. a restore from the bucket whose proxy goes away during its background r
             outcome["reads"] = await readsOf(relay, startedAt, 30_000);
           } finally {
             outcome["answered"] = Object.fromEntries(Object.entries(relay.answered()).map(([what, { count, lastAt }]) => [what, { count, last: new Date(lastAt).toISOString() }]));
-            if (how === "stopped") outcome["connections"] = relay.connections();
+            outcome["connections"] = relay.connections();
             relay.close();
           }
           outcome["pod"] = await podState();
@@ -740,7 +740,7 @@ test("8. a restore from the bucket whose proxy goes away during its background r
         } catch (error) {
           outcome["error"] = error instanceof Error ? error.stack : String(error);
         } finally {
-          if (how === "stopped") outcome["debugLogs"] = await within(debugOff(`outage-${name}`));
+          outcome["debugLogs"] = await within(debugOff(`outage-${name}`));
         }
       }
     });
