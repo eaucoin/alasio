@@ -319,7 +319,12 @@ if (inShard("upgrade")) {
       const data = async (name: string) => (await kube.get<V1Secret>(ref("Secret", name, NAMESPACE)))?.data ?? {};
       const stored = JSON.parse(Buffer.from((await data(neonName("root")))["secrets.json"] ?? "", "base64").toString("utf8") || "{}") as Record<string, unknown>;
       return {
-        root: Object.fromEntries(Object.entries(stored).map(([key, value]) => [key, hash(JSON.stringify(value))])),
+        // Each of the log's principals' passwords on its own, as a release adds principals of its own beside those kept.
+        root: Object.fromEntries(Object.entries(stored).flatMap(([key, value]) =>
+          key === "log" && typeof value === "object" && value !== null
+            ? Object.entries(value).map(([principal, password]) => [`log.${principal}`, hash(JSON.stringify(password))])
+            : [[key, hash(JSON.stringify(value))]]
+        )),
         log: Object.fromEntries(Object.entries(await data(componentName("log"))).map(([key, value]) => [key, hash(value)])),
       };
     };
@@ -399,6 +404,13 @@ if (inShard("upgrade")) {
         check: async () => {
           const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), folderRepls.python, folderRepls.bun);
           const kept = `kept by ${folderBayma.name}`;
+          if (seen.python.kept !== kept || seen.bun.live !== kept) {
+            // What the folder instance's bayma said of the sessions it restored, where it cannot be read.
+            for (const pod of await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" })) {
+              const name = pod.metadata?.name ?? "";
+              console.error(`# ${HOST_NAMESPACE}/${name}, bound to ${pod.metadata?.annotations?.["alasio.dev/binding-key"]}:\n${await kube.logs(HOST_NAMESPACE, name, "bayma").catch((error: unknown) => String(error))}`);
+            }
+          }
           assert.deepEqual([seen.python.kept, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, true, kept, kept], JSON.stringify(seen));
           assert.ok((seen.python.count ?? 0) > folderRepls.count, `the count went on from ${folderRepls.count}: ${JSON.stringify(seen)}`);
           for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
@@ -447,7 +459,7 @@ if (inShard("upgrade")) {
         seeds: "the stack's secrets, the log's credentials among them",
         seed: async () => {
           secretsBefore = await stackSecrets();
-          assert.ok(Object.keys(secretsBefore.log).length > 0 && "log" in secretsBefore.root, JSON.stringify(secretsBefore));
+          assert.ok(Object.keys(secretsBefore.log).length > 0 && "log.admin" in secretsBefore.root, JSON.stringify(secretsBefore));
         },
         keeps: "the stack's secrets, each kept, the log's credentials as its nodes were formatted with",
         check: async () => {
