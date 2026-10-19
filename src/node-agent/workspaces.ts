@@ -2,7 +2,8 @@
  * What a node agent does with workspaces: a workspace's files, on the node's mount of
  * workspace storage (WORKSPACES_ROOT, `<environment>/<workspace>/files`, holding
  * `workspace/` and `home/`), attached into the directory of a pod of a sandbox pool on its
- * node (`ATTACH_ROOT/<pod>`, which the pod mounts at /attach, its own by `subPathExpr`), at
+ * node (`ATTACH_ROOT/<namespace>/<pod>`, which the pod mounts at /attach, its own by
+ * `subPathExpr`, as pods of different namespaces may share a name), at
  * `ws/`, with its binding's token beside it at `token`, and what its bayma is to run with at
  * `env` (variables, each `NAME='value'`, as a shell reads them); detached once its sandbox can no
  * longer act; and a file of one read, or one received written into it, for what alasio does
@@ -155,8 +156,8 @@ export interface Workspaces {
    * gateway makes once its workspace is there.
    */
   readonly attach: (ref: WorkspaceRef, pod: string, token: string, env: Readonly<Record<string, string>>, options?: { readonly made?: boolean }) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
-  /** Detaches what is attached into `pod`'s directory, once none of `containerIds`, its sandbox's containers by their runtime's ids, runs. */
-  readonly detach: (pod: string, containerIds: readonly string[]) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
+  /** Detaches what is attached into the directory of `pod` of `namespace`, once none of `containerIds`, its sandbox's containers by their runtime's ids, runs. */
+  readonly detach: (namespace: string, pod: string, containerIds: readonly string[]) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
   /** The file at `path` of `ref`'s files, `workspace/...` or `home/...`, of `maxBytes` at most. */
   readonly read: (ref: WorkspaceRef, path: string, maxBytes: number) => Effect.Effect<Buffer, WorkspaceRefused>;
   /** Writes `bytes` as the file at `path` of `ref`'s files, its agent's, its directories made. */
@@ -166,7 +167,7 @@ export interface Workspaces {
    * reachable still: one whose node's mount of workspace storage ended under it, as a mount's
    * pod killed with no successor leaves it, is not, and its sandbox serves its workspace no more.
    */
-  readonly attachments: Effect.Effect<readonly { readonly pod: string; readonly reachable: boolean }[], HostCommandError>;
+  readonly attachments: Effect.Effect<readonly { readonly namespace: string; readonly pod: string; readonly reachable: boolean }[], HostCommandError>;
   /** Has the bayma of a bound pod go on with the stop it holds, as the module says. */
   readonly stop: (request: StopRequest) => Effect.Effect<void, WorkspaceRefused>;
   /** Has the sandbox of a bound pod's bayma write what it holds of its files through, as the module says. */
@@ -310,9 +311,11 @@ export function makeWorkspaces(
       ? Effect.fail(refused(400, `no workspace is named ${environment}/${workspace}`))
       : Effect.succeed(join(workspacesRoot, environment, workspace, "files"));
 
-  /** Where `pod`'s directory is on the node, its name checked. */
-  const podDirectory = (pod: string): Effect.Effect<string, WorkspaceRefused> =>
-    POD.test(pod) ? Effect.succeed(join(attachRoot, pod)) : Effect.fail(refused(400, `${pod} is no pod's name`));
+  /** Where the directory of `pod` of `namespace` is on the node, their names checked. */
+  const podDirectory = (namespace: string, pod: string): Effect.Effect<string, WorkspaceRefused> =>
+    !ENVIRONMENT.test(namespace) ? Effect.fail(refused(400, `${namespace} is no namespace's name`))
+    : POD.test(pod) ? Effect.succeed(join(attachRoot, namespace, pod))
+    : Effect.fail(refused(400, `${pod} is no pod's name`));
 
   /** The node's mount points at or under `directory`, deepest first. */
   const mountsUnder = (directory: string) =>
@@ -323,7 +326,7 @@ export function makeWorkspaces(
   /** The container `containerId`, where it is the bayma of the pod `namespace`/`pod` of a pool on this node, as the module says; refused otherwise. */
   const baymaOf = ({ namespace, pod, containerId }: SyncRequest) =>
     Effect.gen(function*() {
-      const directory = yield* podDirectory(pod);
+      const directory = yield* podDirectory(namespace, pod);
       const container = yield* runsc.container(containerId).pipe(Effect.mapError(() => refused(404, `no container ${containerId} runs on this node`)));
       const { annotations } = container;
       const of = `${annotations["io.kubernetes.cri.sandbox-namespace"] ?? "?"}/${annotations["io.kubernetes.cri.sandbox-name"] ?? "?"}`;
@@ -424,12 +427,13 @@ export function makeWorkspaces(
         const files = yield* filesOf(ref);
         const unnamed = Object.keys(env).find((name) => !VARIABLE.test(name));
         if (unnamed !== undefined) return yield* refused(400, `${unnamed} is no variable's name`);
-        const directory = yield* podDirectory(pod);
+        // The pod's namespace is its workspace's environment's, as the gateway attaches it.
+        const directory = yield* podDirectory(ref.environment, pod);
         if (made) {
           // A restore's pod's alone, made now, never one there already, whatever it is: no pod's that runs is ever attached into so.
           if (!RESTORE_POD.test(pod)) return yield* refused(400, `${pod} is no restore's pod: no directory is made for it`);
           yield* storage(`${ref.environment}/${ref.workspace} could not be attached`);
-          const making = yield* Effect.promise(() => mkdir(attachRoot, { recursive: true }).then(() => mkdir(directory)).then(() => null, (error: NodeJS.ErrnoException) => error.code ?? "failed"));
+          const making = yield* Effect.promise(() => mkdir(join(attachRoot, ref.environment), { recursive: true }).then(() => mkdir(directory)).then(() => null, (error: NodeJS.ErrnoException) => error.code ?? "failed"));
           if (making === "EEXIST") return yield* refused(409, `${pod} has a directory on this node already: a restore's pod's is made for it alone`);
           if (making !== null) return yield* refused(500, `${pod}'s directory could not be made: ${making}`);
         }
@@ -457,9 +461,9 @@ export function makeWorkspaces(
         });
       }),
 
-    detach: (pod, containerIds) =>
+    detach: (namespace, pod, containerIds) =>
       Effect.gen(function*() {
-        const directory = yield* podDirectory(pod);
+        const directory = yield* podDirectory(namespace, pod);
         const running = yield* Effect.forEach(containerIds, (id) => runsc.container(id).pipe(Effect.as(true), Effect.orElseSucceed(() => false)));
         if (running.some(Boolean)) return yield* refused(409, `${pod}'s sandbox still runs: what is attached into it is detached once it can no longer act`);
         // `-l`, not `--lazy`, which the busybox of k3s's own binaries, first on the node's PATH, does not take.
@@ -492,8 +496,9 @@ export function makeWorkspaces(
       }),
 
     attachments: Effect.gen(function*() {
-      const attached = (yield* mountsUnder(attachRoot)).filter((point) => point.endsWith("/ws") && point.split("/").length === attachRoot.split("/").length + 2);
-      return yield* Effect.forEach(attached, (point) => Effect.promise(() => reaches(point)).pipe(Effect.map((reachable) => ({ pod: point.split("/").at(-2) ?? "", reachable }))), { concurrency: 8 });
+      const attached = (yield* mountsUnder(attachRoot)).filter((point) => point.endsWith("/ws") && point.split("/").length === attachRoot.split("/").length + 3);
+      return yield* Effect.forEach(attached, (point) =>
+        Effect.promise(() => reaches(point)).pipe(Effect.map((reachable) => ({ namespace: point.split("/").at(-3) ?? "", pod: point.split("/").at(-2) ?? "", reachable }))), { concurrency: 8 });
     }),
 
     stop: (request) =>

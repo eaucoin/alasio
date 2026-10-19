@@ -197,7 +197,7 @@ test("no pod but a pool's is made in a namespace of sessions", async () => {
 /** A restore's pod of the pool's, as the gateway makes it of its template, of the workspace `workspace`, changed as `change` says. */
 let restores = 0;
 function restorePod(workspace = "fs-abc123", change: (pod: { metadata: Record<string, unknown>; spec: V1PodSpec }) => void = () => {}): V1Pod {
-  const own = ownDirectory(template?.spec as V1PodSpec, `sandboxes-none-restore-${String(restores + 1).padStart(7, "0")}`);
+  const own = ownDirectory(template?.spec as V1PodSpec, SESSIONS, `sandboxes-none-restore-${String(restores + 1).padStart(7, "0")}`);
   const { ["alasio.dev/free"]: _free, ...labels } = template?.metadata?.labels ?? {};
   const [release] = gvisorReleases(NODE_PINS);
   const pod = structuredClone({
@@ -241,12 +241,15 @@ test("a restore's pod of a pool's template is made by the sandbox gateway alone,
     "on any node": (pod) => void delete pod.spec.affinity,
     "another image": (pod) => void (pod.spec.containers[0]!.image = "busybox"),
     "an init container": (pod) => void (pod.spec.initContainers = [{ name: "first", image: "busybox", command: ["sh", "-c", "cat /attach/token"] }]),
-    "another pod's directory": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = "/var/lib/alasio/attach/sandboxes-none-0"),
+    "another pod's directory": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = `/var/lib/alasio/attach/${SESSIONS}/sandboxes-none-0`),
+    // Its own name's, but of another namespace, or of none, as pods of two namespaces may share a name.
+    "its name's directory of another namespace": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = `/var/lib/alasio/attach/alasio-branch-try-sessions/${String(pod.metadata["name"])}`),
+    "its name's directory of no namespace": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = `/var/lib/alasio/attach/${String(pod.metadata["name"])}`),
     "every pod's directory": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = "/var/lib/alasio/attach"),
     "a directory kubelet would make": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.type = "DirectoryOrCreate"),
     "named as no restore's pod": (pod) => {
       pod.metadata["name"] = "sandboxes-none-5d4f8b7c9-x2k8q";
-      pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = "/var/lib/alasio/attach/sandboxes-none-5d4f8b7c9-x2k8q";
+      pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = `/var/lib/alasio/attach/${SESSIONS}/sandboxes-none-5d4f8b7c9-x2k8q`;
     },
   };
   for (const [what, change] of Object.entries(changes)) {

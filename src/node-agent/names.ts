@@ -134,7 +134,7 @@ export const runscVersion = (release: string): string => `release-${release}`;
  */
 export const WORKSPACES_ROOT = "/var/lib/alasio/workspaces";
 
-/** Where a node keeps the directory of each pod of a sandbox pool, which the pod mounts by `subPathExpr` of its name. */
+/** Where a node keeps the directory of each pod of a sandbox pool, `<namespace>/<pod>`, which the pod mounts by `subPathExpr` of its namespace and its name. */
 export const ATTACH_ROOT = "/var/lib/alasio/attach";
 
 /** The root the gVisor shims run runsc with for Kubernetes' containers, under the node's /run. */

@@ -89,12 +89,13 @@
  * - `GET /workspaces/<environment>/<workspace>/quota`: `{ capacityBytes, usedBytes }`, its
  *   quota and what it holds (200); 404 where it has none.
  * - `POST /attach`, `{ environment, workspace, pod, token, env, made? }`: attaches the workspace's
- *   files into the directory of the sandbox pool pod `pod` on this node, its binding's `token`
+ *   files into the directory of the sandbox pool pod `pod` on this node, of the environment's
+ *   namespace, its binding's `token`
  *   and the variables its bayma runs with, `env`, beside them (./workspaces.ts) (204), the
  *   directory kubelet made, or, `made`, one made now for a restore's pod yet to be made; 409 when
  *   the pod's directory holds a mount, or, `made`, is there already, 404 when there is no such
  *   workspace.
- * - `GET /attachments`: `{ attachments: [{ pod, reachable }] }`, the pods of this node a
+ * - `GET /attachments`: `{ attachments: [{ namespace, pod, reachable }] }`, the pods of this node a
  *   workspace is attached into, each by whether what is attached is reachable still (./workspaces.ts).
  * - `POST /stop`, `{ namespace, pod, containerId, hook }`: has the bayma of the bound pod
  *   `namespace`/`pod` of a pool on this node, its container `containerId`, go on with the stop
@@ -104,7 +105,7 @@
  * - `POST /sync`, `{ namespace, pod, containerId }`: has the sandbox of that bayma write what it
  *   holds of its files through to the node's mount, by `sync` run in it (./workspaces.ts)
  *   (204); refused as a stop is, 502 where it fails.
- * - `POST /detach`, `{ pod, containerIds }`: detaches what is attached into `pod`'s directory
+ * - `POST /detach`, `{ namespace, pod, containerIds }`: detaches what is attached into the directory of `namespace`/`pod`
  *   (204); 409 while any of `containerIds`, its sandbox's containers, runs.
  * - `GET /files/<environment>/<workspace>?path=<path>&max=<bytes>`: the workspace's file at
  *   `path`, `workspace/...` or `home/...`, its bytes (200); 403 where any part of its path is
@@ -192,7 +193,7 @@ const CloneRequest = Schema.Struct({ from: WorkspaceRef, to: WorkspaceRef, quota
 /** What `POST /attach` is given. */
 const AttachRequest = Schema.Struct({ ...WorkspaceRef.fields, pod: Schema.NonEmptyString, token: Schema.NonEmptyString, env: Schema.Record(Schema.String, Schema.String), made: Schema.optional(Schema.Boolean) });
 /** What `POST /detach` is given. */
-const DetachRequest = Schema.Struct({ pod: Schema.NonEmptyString, containerIds: Schema.Array(Schema.NonEmptyString) });
+const DetachRequest = Schema.Struct({ namespace: Schema.NonEmptyString, pod: Schema.NonEmptyString, containerIds: Schema.Array(Schema.NonEmptyString) });
 /** What `POST /sync` is given. */
 const SyncRequest = Schema.Struct({ namespace: Schema.NonEmptyString, pod: Schema.NonEmptyString, containerId: Schema.NonEmptyString });
 /** What `POST /stop` is given. */
@@ -376,7 +377,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
       return body(StopRequest).pipe(Effect.flatMap(workspaces.stop), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }
     if (method === "POST" && url === "/detach") {
-      return body(DetachRequest).pipe(Effect.flatMap(({ pod, containerIds }) => workspaces.detach(pod, containerIds)), Effect.as(HttpServerResponse.empty({ status: 204 })));
+      return body(DetachRequest).pipe(Effect.flatMap(({ namespace, pod, containerIds }) => workspaces.detach(namespace, pod, containerIds)), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }
     const files = FILES.exec(url);
     if (files && (method === "GET" || method === "PUT")) {

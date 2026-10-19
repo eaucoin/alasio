@@ -2567,9 +2567,9 @@ test("the agent's API attaches, detaches, reads and writes a workspace's files a
       assert.equal((yield* call("GET", "/files/main/fs-abc123?path=home/.alasio/received/1/note.txt&max=2")).status, 413);
       assert.equal((yield* call("GET", "/files/main/fs-abc123?path=../../etc/passwd")).status, 400);
       at.running.add("container-0");
-      assert.equal((yield* call("POST", "/detach", json({ pod: "pool-0", containerIds: ["container-0"] }))).status, 409);
+      assert.equal((yield* call("POST", "/detach", json({ namespace: "main", pod: "pool-0", containerIds: ["container-0"] }))).status, 409);
       at.running.delete("container-0");
-      assert.equal((yield* call("POST", "/detach", json({ pod: "pool-0", containerIds: ["container-0"] }))).status, 204);
+      assert.equal((yield* call("POST", "/detach", json({ namespace: "main", pod: "pool-0", containerIds: ["container-0"] }))).status, 204);
       assert.deepEqual(at.mounts, []);
     })
   ));
@@ -2588,9 +2588,9 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       const again = yield* Effect.flip(agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding", env: {} }));
       assert.equal(again._tag === "NodeAgentError" && again.status, 409);
       // What is attached on it, through its node's agent, reachable until its mount is not.
-      assert.deepEqual(yield* agents.attachments("node-1"), [{ pod: "pool-0", reachable: true }]);
-      at.unreachable.add("pool-0");
-      assert.deepEqual(yield* agents.attachments("node-1"), [{ pod: "pool-0", reachable: false }]);
+      assert.deepEqual(yield* agents.attachments("node-1"), [{ namespace: "main", pod: "pool-0", reachable: true }]);
+      at.unreachable.add("main/pool-0");
+      assert.deepEqual(yield* agents.attachments("node-1"), [{ namespace: "main", pod: "pool-0", reachable: false }]);
       at.unreachable.delete("pool-0");
       const bytes = Uint8Array.from([0, 255, 10, 13, 128]);
       yield* agents.writeFile(ref, "home/.alasio/received/1/blob", bytes);
@@ -2598,17 +2598,19 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       const tooLarge = yield* Effect.flip(agents.readFile(ref, "home/.alasio/received/1/blob", 2));
       assert.equal(tooLarge._tag === "NodeAgentError" && tooLarge.status, 413);
       at.running.add("container-0");
-      // Its bayma told to go on with its stop, through its node's agent; another pod's bayma not.
+      // Its bayma told to go on with its stop, through its node's agent; another pod's bayma not:
+      // a pool's pod of the sessions' namespace, its directory kubelet made.
+      at.pod("pool-0", "alasio-sessions");
       at.annotations.set("container-0", { "io.kubernetes.cri.sandbox-namespace": "alasio-sessions", "io.kubernetes.cri.sandbox-name": "pool-0", "io.kubernetes.cri.container-name": "bayma" });
       const hook = ["bayma", "sandbox-hook", "stop", "--state-dir", "/home/agent/.bayma"];
       yield* agents.stop("node-1", { namespace: "alasio-sessions", pod: "pool-0", containerId: "container-0", hook });
       assert.deepEqual(at.execs, [`r container-0 ${hook.join(" ")}`]);
       const notItsPod = yield* Effect.flip(agents.stop("node-1", { namespace: "alasio-sessions", pod: "pool-1", containerId: "container-0", hook }));
       assert.equal(notItsPod._tag === "NodeAgentError" && notItsPod.status, 403);
-      const running = yield* Effect.flip(agents.detach("node-1", "pool-0", ["container-0"]));
+      const running = yield* Effect.flip(agents.detach("node-1", "main", "pool-0", ["container-0"]));
       assert.equal(running._tag === "NodeAgentError" && running.status, 409);
       at.running.delete("container-0");
-      yield* agents.detach("node-1", "pool-0", ["container-0"]);
+      yield* agents.detach("node-1", "main", "pool-0", ["container-0"]);
       assert.deepEqual(at.mounts, []);
       // A workspace made through any agent, its quota read back; one that has none, none.
       const made = { environment: "main", workspace: "fs-made" };

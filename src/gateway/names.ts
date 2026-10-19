@@ -58,13 +58,14 @@ export const restorePodName = (pool: string, suffix: string): string => `${pool}
 export const ATTACH_VOLUME = "attach";
 
 /**
- * The spec `spec`, a pool's template's, of a restore's pod named `name`: its own directory on its
- * node named by its volume's path, not by a subpath of the directory of every pod's. A subpath is
+ * The spec `spec`, a pool's template's, of a restore's pod named `name` in `namespace`: its own
+ * directory on its node named by its volume's path, not by a subpath of the directory of every
+ * pod's. A subpath is
  * bound into its container alone, without what is mounted beneath it, as kubelet binds one; a
  * volume's path is bound with it, so the workspace attached there before the pod is made is
  * there as its restore reopens the files it held open.
  */
-export function ownDirectory(spec: V1PodSpec, name: string): V1PodSpec {
+export function ownDirectory(spec: V1PodSpec, namespace: string, name: string): V1PodSpec {
   const unsubpathed = (container: V1Container): V1Container => ({
     ...container,
     ...(container.volumeMounts
@@ -82,7 +83,7 @@ export function ownDirectory(spec: V1PodSpec, name: string): V1PodSpec {
     containers: spec.containers.map(unsubpathed),
     ...(spec.initContainers ? { initContainers: spec.initContainers.map(unsubpathed) } : {}),
     // One there already, as its node's agent made it, its workspace attached; kubelet makes none, so the pod starts not where it is not there.
-    ...(spec.volumes ? { volumes: spec.volumes.map((volume) => (volume.name === ATTACH_VOLUME ? { name: ATTACH_VOLUME, hostPath: { path: `${ATTACH_ROOT}/${name}`, type: "Directory" } } : volume)) } : {}),
+    ...(spec.volumes ? { volumes: spec.volumes.map((volume) => (volume.name === ATTACH_VOLUME ? { name: ATTACH_VOLUME, hostPath: { path: `${ATTACH_ROOT}/${namespace}/${name}`, type: "Directory" } } : volume)) } : {}),
   };
 }
 

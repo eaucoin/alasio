@@ -113,9 +113,9 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
         Effect.sync(() => void asked.push(`stop ${node} ${request.pod} ${request.hook.join(" ")}`)).pipe(
           Effect.andThen(Effect.promise(() => end({ namespace: request.namespace, pod: request.pod, containerId: request.containerId } as CheckpointRequest))),
         ),
-      detach: (node, pod, containerIds) =>
+      detach: (node, namespace, pod, containerIds) =>
         Effect.sync(() => {
-          asked.push(`detach ${node} ${pod}`);
+          asked.push(`detach ${node} ${namespace}/${pod}`);
           detached.push(`${node} ${pod} ${containerIds.join(",")}`);
         }),
     },
@@ -225,7 +225,7 @@ test("a pod whose readying failed, its workspace not attached, is detached once 
   const [name] = ((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "")))) as V1Pod[]).filter(({ metadata }) => metadata?.deletionTimestamp).map(({ metadata }) => metadata?.name ?? "");
   assert.ok(name, "no pod was deleted");
   await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-x", state: { terminated: { exitCode: 0 } } }] } })));
-  for (const deadline = Date.now() + 10_000; !recorded.asked.includes(`detach node-a ${name}`); await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, recorded.asked.join("\n"));
+  for (const deadline = Date.now() + 10_000; !recorded.asked.includes(`detach node-a ${env.namespace}/${name}`); await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, recorded.asked.join("\n"));
 });
 
 test("a bound pod whose bayma runs an exec is kept, and its bayma asked again only once its poll comes round, with its binding's token", async () => {
@@ -301,7 +301,7 @@ test("a bound gVisor pod idle for its wait is saved whole by its node's agent fi
     stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 600_000 };
     assert.deepEqual(await Effect.runPromise(sessions.sweep), [key]);
     // Its release recorded with the workspace, for its next bind, before its workspace is detached.
-    assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-abc123 released into s-1`, `detach node-a ${bound.pod}`]);
+    assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-abc123 released into s-1`, `detach node-a ${env.namespace}/${bound.pod}`]);
     const [saved] = recorded.saved;
     assert.deepEqual([saved?.environment, saved?.workspace, saved?.namespace, saved?.containerId], [env.namespace, "fs-abc123", env.namespace, "c-0"]);
     assert.deepEqual(saved?.hook, ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"]);
@@ -330,7 +330,7 @@ test("a release whose save fails leaving the sandbox running keeps the binding, 
         assert.deepEqual(recorded.detached, [], outcome);
       } else {
         assert.equal(lease, null, outcome);
-        assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-abc123 released into none`, `detach node-a ${bound.pod}`], outcome);
+        assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-abc123 released into none`, `detach node-a ${env.namespace}/${bound.pod}`], outcome);
       }
     } finally {
       stand.close();
@@ -653,7 +653,7 @@ test("a release whose sandbox can be saved no more has its bayma go on with the 
       `checkpoint node-a ${bound.pod}`,
       `stop node-a ${bound.pod} node /opt/bayma/bayma.js sandbox-hook stop --state-dir /home/agent/.bayma`,
       `record ${env.namespace}/fs-abc123 released into none`,
-      `detach node-a ${bound.pod}`,
+      `detach node-a ${env.namespace}/${bound.pod}`,
     ]);
     assert.equal(await run(readLease(env.none, key)), null);
   } finally {
@@ -735,7 +735,7 @@ test("a workspace released into its snapshot is restored from it as it is next b
     assert.equal(restored.spec?.runtimeClassName, "gvisor-r1");
     const plain = (value: unknown) => JSON.parse(JSON.stringify(value)) as unknown;
     // Its own directory named by its volume's path, not a subpath, so its workspace, attached first, is bound into its container with it.
-    assert.deepEqual(plain(restored.spec?.volumes?.find(({ name }) => name === "attach")), { name: "attach", hostPath: { path: `/var/lib/alasio/attach/${name}`, type: "Directory" } });
+    assert.deepEqual(plain(restored.spec?.volumes?.find(({ name }) => name === "attach")), { name: "attach", hostPath: { path: `/var/lib/alasio/attach/${env.namespace}/${name}`, type: "Directory" } });
     assert.deepEqual(plain(restored.spec?.containers[0]?.volumeMounts), [{ name: "attach", mountPath: "/attach", mountPropagation: "HostToContainer" }]);
     assert.equal(restored.spec?.initContainers, undefined);
     assert.deepEqual(plain(restored.spec?.readinessGates), [{ conditionType: "alasio.dev/resumed" }]);
@@ -782,7 +782,7 @@ async function failedRestore(workspace: string, status: Record<string, unknown>)
     return binding;
   });
   // What was attached for it detached once its pod, which its binder deletes, has gone.
-  for (const deadline = Date.now() + 10_000; !recorded.asked.includes(`detach node-a ${name}`); await new Promise((resolve) => setTimeout(resolve, 100))) {
+  for (const deadline = Date.now() + 10_000; !recorded.asked.includes(`detach node-a ${env.namespace}/${name}`); await new Promise((resolve) => setTimeout(resolve, 100))) {
     assert.ok(Date.now() < deadline, `what was attached for ${name} was not detached: ${recorded.asked.join(", ")}`);
   }
   return { counted, recorded, abandoned, name, bindAgain: () => Effect.runPromise(Effect.result(binder.bind(placement.pool, key, placement))) };
@@ -876,7 +876,7 @@ test("a bound pod ended by other than the gateway, as a drain ends one, is saved
     }
   });
   assert.deepEqual(counted, { "alasio.sandbox.stop_release.outcome=snapshotted": 1 });
-  assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-drained released into s-1`, `detach node-a ${bound.pod}`]);
+  assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-drained released into s-1`, `detach node-a ${env.namespace}/${bound.pod}`]);
   assert.ok(told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "deleted" && event.binding === bound.binding));
 });
 
@@ -967,7 +967,7 @@ test("a bound pod whose bayma ended in it, or was started again, is released as 
   await Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
   await ending;
   for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its binding was not let go");
-  assert.deepEqual(recorded.asked, [`record ${env.namespace}/fs-broken released into s-live`, `detach node-a ${bound.pod}`]);
+  assert.deepEqual(recorded.asked, [`record ${env.namespace}/fs-broken released into s-live`, `detach node-a ${env.namespace}/${bound.pod}`]);
   assert.ok(told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "broken"));
   // One whose pod went: released into it as its Lease is let go.
   const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-gone", namespace: env.namespace, annotations: { "alasio.dev/binding-key": sessionKey("fs-gone") } }, spec: { holderIdentity: "none-9" } };
@@ -983,7 +983,7 @@ test("a bound pod whose workspace its node can reach no more, as its node's moun
   const live: NodeAgents = {
     ...recorded.agents,
     current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/home/agent/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null),
-    attachments: (node) => Effect.sync(() => (recorded.asked.push(`attachments ${node}`), [{ pod: unreachable, reachable: false }])),
+    attachments: (node) => Effect.sync(() => (recorded.asked.push(`attachments ${node}`), [{ namespace: env.namespace, pod: unreachable, reachable: false }])),
   };
   const { binder, sessions } = await sessionsOf(options(env, 7291), live);
   const key = sessionKey("fs-unreachable");
@@ -1012,7 +1012,7 @@ test("a bound pod whose workspace its node can reach no more, as its node's moun
     assert.ok(Date.now() < deadline, "its binding was not let go as broken");
   }
   // Its node was asked once, for both.
-  assert.deepEqual(recorded.asked, ["attachments node-a", `record ${env.namespace}/fs-unreachable released into s-live`, `detach node-a ${bound.pod}`]);
+  assert.deepEqual(recorded.asked, ["attachments node-a", `record ${env.namespace}/fs-unreachable released into s-live`, `detach node-a ${env.namespace}/${bound.pod}`]);
   assert.notEqual(await run(readLease(env.none, kept)), null);
   assert.ok(!told.some((event) => event.kind === "workspace.released" && event.subject.key === kept));
   assert.notEqual(other.pod, bound.pod);

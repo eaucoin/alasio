@@ -47,9 +47,31 @@ test("the pods a workspace is attached into are listed each by whether it is rea
     at.pod("pool-1");
     await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-a" }, "pool-0", "t", {}));
     await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-b" }, "pool-1", "t", {}));
-    at.mounts.push(join(at.attachRoot, "pool-1", "ws", "deeper"), join(at.root, "elsewhere", "ws"));
-    at.unreachable.add("pool-1");
-    assert.deepEqual(await Effect.runPromise(at.workspaces.attachments), [{ pod: "pool-0", reachable: true }, { pod: "pool-1", reachable: false }]);
+    at.mounts.push(join(at.attachRoot, "main", "pool-1", "ws", "deeper"), join(at.root, "elsewhere", "ws"));
+    at.unreachable.add("main/pool-1");
+    assert.deepEqual(await Effect.runPromise(at.workspaces.attachments), [{ namespace: "main", pod: "pool-0", reachable: true }, { namespace: "main", pod: "pool-1", reachable: false }]);
+  } finally {
+    at.done();
+  }
+});
+
+test("pods of two namespaces sharing a name each have a directory of their own, each attached into and detached from apart", async () => {
+  const at = workspacesNode();
+  try {
+    at.files("fs-a");
+    mkdirSync(join(at.workspacesRoot, "alasio-branch-try-sessions", "fs-a", "files", "workspace"), { recursive: true });
+    at.pod("pool-0");
+    at.pod("pool-0", "alasio-branch-try-sessions");
+    await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-a" }, "pool-0", "main-token", {}));
+    await Effect.runPromise(at.workspaces.attach({ environment: "alasio-branch-try-sessions", workspace: "fs-a" }, "pool-0", "branch-token", {}));
+    assert.deepEqual(at.mounts, [join(at.attachRoot, "main", "pool-0", "ws"), join(at.attachRoot, "alasio-branch-try-sessions", "pool-0", "ws")]);
+    assert.deepEqual(
+      ["main", "alasio-branch-try-sessions"].map((namespace) => readFileSync(join(at.attachRoot, namespace, "pool-0", "token"), "utf8")),
+      ["main-token", "branch-token"],
+    );
+    await Effect.runPromise(at.workspaces.detach("alasio-branch-try-sessions", "pool-0", []));
+    assert.deepEqual(at.mounts, [join(at.attachRoot, "main", "pool-0", "ws")]);
+    assert.deepEqual((await Effect.runPromise(at.workspaces.attachments)).map(({ namespace, pod }) => `${namespace}/${pod}`), ["main/pool-0"]);
   } finally {
     at.done();
   }
@@ -93,15 +115,15 @@ test("a workspace is attached into a pod's directory with its binding's token be
     at.files("fs-def456");
     at.pod("pool-0");
     await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-0", "binding-token", { OTEL_EXPORTER_OTLP_ENDPOINT: "http://10.43.0.9:4318", OTEL_NOTE: "it's quoted" }));
-    assert.deepEqual(at.mounts, [join(at.attachRoot, "pool-0", "ws")]);
-    assert.ok(at.ran.includes(`mount --bind ${files} ${join(at.attachRoot, "pool-0", "ws")}`));
+    assert.deepEqual(at.mounts, [join(at.attachRoot, "main", "pool-0", "ws")]);
+    assert.ok(at.ran.includes(`mount --bind ${files} ${join(at.attachRoot, "main", "pool-0", "ws")}`));
     // Its token written once its workspace is there, as its bayma starts, and a restore is restored, once it is.
     assert.deepEqual(at.tokenAtMount, [false]);
-    const token = join(at.attachRoot, "pool-0", "token");
+    const token = join(at.attachRoot, "main", "pool-0", "token");
     assert.equal(readFileSync(token, "utf8"), "binding-token");
     assert.equal(statSync(token).mode & 0o777, 0o400);
     // Its bayma's variables, as a shell reads them.
-    const env = execFileSync("sh", ["-c", `. ${join(at.attachRoot, "pool-0", "env")}; printf '%s|%s' "$OTEL_EXPORTER_OTLP_ENDPOINT" "$OTEL_NOTE"`], { encoding: "utf8" });
+    const env = execFileSync("sh", ["-c", `. ${join(at.attachRoot, "main", "pool-0", "env")}; printf '%s|%s' "$OTEL_EXPORTER_OTLP_ENDPOINT" "$OTEL_NOTE"`], { encoding: "utf8" });
     assert.equal(env, "http://10.43.0.9:4318|it's quoted");
     // Another workspace into the same pod: refused, nothing mounted over the first.
     assert.equal(await refusal(at.workspaces.attach({ environment: "main", workspace: "fs-def456" }, "pool-0", "other-token", {})), 409);
@@ -180,17 +202,17 @@ test("an attach for a restore's pod yet to be made makes its directory, and atta
     at.files("fs-abc123");
     const ref = { environment: "main", workspace: "fs-abc123" };
     await Effect.runPromise(at.workspaces.attach(ref, "sandboxes-none-restore-0abc123", "t", {}, { made: true }));
-    assert.deepEqual(at.mounts, [join(at.attachRoot, "sandboxes-none-restore-0abc123", "ws")]);
-    assert.equal(readFileSync(join(at.attachRoot, "sandboxes-none-restore-0abc123", "token"), "utf8"), "t");
+    assert.deepEqual(at.mounts, [join(at.attachRoot, "main", "sandboxes-none-restore-0abc123", "ws")]);
+    assert.equal(readFileSync(join(at.attachRoot, "main", "sandboxes-none-restore-0abc123", "token"), "utf8"), "t");
     // A pool's pod's, its directory kubelet's: refused by its name, nothing attached into it.
     at.pod("sandboxes-none-5d4f8b7c9-x2k8q");
     assert.equal(await refusal(at.workspaces.attach(ref, "sandboxes-none-5d4f8b7c9-x2k8q", "t", {}, { made: true })), 400);
     // A restore's there already, or a symlink to another's: refused, nothing attached.
     at.pod("sandboxes-none-restore-1abc123");
-    symlinkSync(join(at.attachRoot, "sandboxes-none-5d4f8b7c9-x2k8q"), join(at.attachRoot, "sandboxes-none-restore-2abc123"));
+    symlinkSync(join(at.attachRoot, "main", "sandboxes-none-5d4f8b7c9-x2k8q"), join(at.attachRoot, "main", "sandboxes-none-restore-2abc123"));
     for (const pod of ["sandboxes-none-restore-1abc123", "sandboxes-none-restore-2abc123"]) assert.equal(await refusal(at.workspaces.attach(ref, pod, "t", {}, { made: true })), 409, pod);
     assert.equal(at.mounts.length, 1);
-    assert.equal(existsSync(join(at.attachRoot, "sandboxes-none-5d4f8b7c9-x2k8q", "token")), false);
+    assert.equal(existsSync(join(at.attachRoot, "main", "sandboxes-none-5d4f8b7c9-x2k8q", "token")), false);
   } finally {
     at.done();
   }
@@ -201,12 +223,12 @@ test("an attach into a pod's directory kubelet has not made, or that is no direc
   try {
     at.files("fs-abc123");
     assert.equal(await refusal(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-0", "t", {})), 404);
-    assert.equal(existsSync(join(at.attachRoot, "pool-0")), false);
+    assert.equal(existsSync(join(at.attachRoot, "main", "pool-0")), false);
     // One whose name is a symlink, to a directory of another's.
     at.pod("pool-1");
-    symlinkSync(join(at.attachRoot, "pool-1"), join(at.attachRoot, "pool-2"));
+    symlinkSync(join(at.attachRoot, "main", "pool-1"), join(at.attachRoot, "main", "pool-2"));
     assert.equal(await refusal(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-2", "t", {})), 404);
-    assert.deepEqual([at.mounts, existsSync(join(at.attachRoot, "pool-1", "token"))], [[], false]);
+    assert.deepEqual([at.mounts, existsSync(join(at.attachRoot, "main", "pool-1", "token"))], [[], false]);
   } finally {
     at.done();
   }
@@ -219,20 +241,20 @@ test("a detach whose unmount did not take removes nothing of the pod's directory
     at.pod("pool-0");
     await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-0", "t", {}));
     // The workspace's files, as the pod's directory shows them through its mount.
-    const ws = join(at.attachRoot, "pool-0", "ws");
+    const ws = join(at.attachRoot, "main", "pool-0", "ws");
     mkdirSync(join(ws, "workspace"), { recursive: true });
     writeFileSync(join(ws, "workspace", "precious"), "the user's");
     at.stuck.add(ws);
-    assert.equal(await refusal(at.workspaces.detach("pool-0", [])), 409);
+    assert.equal(await refusal(at.workspaces.detach("main", "pool-0", [])), 409);
     assert.equal(readFileSync(join(ws, "workspace", "precious"), "utf8"), "the user's");
-    assert.ok(existsSync(join(at.attachRoot, "pool-0", "token")));
+    assert.ok(existsSync(join(at.attachRoot, "main", "pool-0", "token")));
     // Unmounted at last: what the attach wrote removed, what it did not left, and said.
     at.stuck.clear();
     rmSync(join(ws, "workspace"), { recursive: true });
-    writeFileSync(join(at.attachRoot, "pool-0", "stray"), "no attach wrote this");
-    await Effect.runPromise(at.workspaces.detach("pool-0", []));
-    assert.deepEqual(readdirSync(join(at.attachRoot, "pool-0")), ["stray"]);
-    assert.equal(readFileSync(join(at.attachRoot, "pool-0", "stray"), "utf8"), "no attach wrote this");
+    writeFileSync(join(at.attachRoot, "main", "pool-0", "stray"), "no attach wrote this");
+    await Effect.runPromise(at.workspaces.detach("main", "pool-0", []));
+    assert.deepEqual(readdirSync(join(at.attachRoot, "main", "pool-0")), ["stray"]);
+    assert.equal(readFileSync(join(at.attachRoot, "main", "pool-0", "stray"), "utf8"), "no attach wrote this");
   } finally {
     at.done();
   }
@@ -245,10 +267,10 @@ test("a detach, by an agent started after the attach, unmounts what its own name
     at.pod("pool-0");
     await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-again" }, "pool-0", "t", {}));
     // Its own namespace's copy, as its container was made after the attach.
-    at.ownMounts.push(join(at.attachRoot, "pool-0", "ws"));
-    await Effect.runPromise(at.workspaces.detach("pool-0", []));
+    at.ownMounts.push(join(at.attachRoot, "main", "pool-0", "ws"));
+    await Effect.runPromise(at.workspaces.detach("main", "pool-0", []));
     assert.deepEqual([at.mounts, at.ownMounts], [[], []]);
-    assert.equal(existsSync(join(at.attachRoot, "pool-0")), false);
+    assert.equal(existsSync(join(at.attachRoot, "main", "pool-0")), false);
   } finally {
     at.done();
   }
@@ -261,18 +283,18 @@ test("a detach is refused while the pod's sandbox runs, and once it has ended un
     at.pod("pool-0");
     await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-0", "t", {}));
     // A mount beneath, as a sandbox's own might leave one.
-    at.mounts.push(join(at.attachRoot, "pool-0", "ws", "workspace", "inner"));
+    at.mounts.push(join(at.attachRoot, "main", "pool-0", "ws", "workspace", "inner"));
     at.running.add("container-1");
-    assert.equal(await refusal(at.workspaces.detach("pool-0", ["container-0", "container-1"])), 409);
+    assert.equal(await refusal(at.workspaces.detach("main", "pool-0", ["container-0", "container-1"])), 409);
     assert.equal(at.mounts.length, 2);
     at.running.delete("container-1");
-    await Effect.runPromise(at.workspaces.detach("pool-0", ["container-0", "container-1"]));
+    await Effect.runPromise(at.workspaces.detach("main", "pool-0", ["container-0", "container-1"]));
     assert.deepEqual(at.ran.filter((command) => command.startsWith("umount")), [
-      `umount -l ${join(at.attachRoot, "pool-0", "ws", "workspace", "inner")}`,
-      `umount -l ${join(at.attachRoot, "pool-0", "ws")}`,
+      `umount -l ${join(at.attachRoot, "main", "pool-0", "ws", "workspace", "inner")}`,
+      `umount -l ${join(at.attachRoot, "main", "pool-0", "ws")}`,
     ]);
     assert.deepEqual(at.mounts, []);
-    assert.equal(existsSync(join(at.attachRoot, "pool-0")), false);
+    assert.equal(existsSync(join(at.attachRoot, "main", "pool-0")), false);
   } finally {
     at.done();
   }
@@ -388,7 +410,7 @@ test("nothing is made, cloned, attached or recorded where workspace storage is n
 test("bayma of a bound pod of a pool on this node is told to go on with its stop, by its hook run in its container, and no other container nor pod's is", async () => {
   const at = workspacesNode();
   try {
-    at.pod("pool-0");
+    at.pod("pool-0", "alasio-sessions");
     const pod = (name: string, container = "bayma", namespace = "alasio-sessions") => ({ "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": name, "io.kubernetes.cri.container-name": container });
     for (const [id, annotations] of [["c-bayma", pod("pool-0")], ["c-other", pod("pool-0", "sidecar")], ["c-elsewhere", pod("other-0")]] as const) {
       at.running.add(id);
@@ -416,7 +438,7 @@ test("bayma of a bound pod of a pool on this node is told to go on with its stop
 test("the sandbox of a bound pod's bayma of a pool on this node is told to write its files through, by sync run in its container, and no other container nor pod's is", async () => {
   const at = workspacesNode();
   try {
-    at.pod("pool-0");
+    at.pod("pool-0", "alasio-sessions");
     const pod = (name: string, container = "bayma", namespace = "alasio-sessions") => ({ "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": name, "io.kubernetes.cri.container-name": container });
     for (const [id, annotations] of [["c-bayma", pod("pool-0")], ["c-other", pod("pool-0", "sidecar")], ["c-elsewhere", pod("other-0")]] as const) {
       at.running.add(id);

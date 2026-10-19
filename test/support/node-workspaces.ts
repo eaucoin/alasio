@@ -68,7 +68,7 @@ export function workspacesNode() {
   chmodSync(juicefs, 0o755);
   // Workspace storage mounted at the root, unless a test says it is not.
   const storage = { mounted: true };
-  // The pods whose attached workspace is unreachable, as a test says.
+  // The pods whose attached workspace is unreachable, `<namespace>/<pod>` each, as a test says.
   const unreachable = new Set<string>();
   const workspaces = makeWorkspaces({
     host,
@@ -101,8 +101,8 @@ export function workspacesNode() {
     mkdirSync(join(directory, "home"), { recursive: true });
     return directory;
   };
-  /** `name`'s directory, as kubelet makes it as a pod of a pool starts. */
-  const pod = (name: string) => mkdirSync(join(attachRoot, name), { recursive: true });
+  /** The directory of `name` of `namespace`, as kubelet makes it as a pod of a pool starts. */
+  const pod = (name: string, namespace = "main") => mkdirSync(join(attachRoot, namespace, name), { recursive: true });
   /** What JuiceFS's command was run with, a call a line. */
   const juicefsCalls = () => (existsSync(join(root, "juicefs.log")) ? readFileSync(join(root, "juicefs.log"), "utf8").trim().split("\n") : []);
   return { root, workspacesRoot, attachRoot, mounts, stuck, ran, tokenAtMount, running, annotations, execs, hooks, storage, unreachable, workspaces, files, pod, juicefsCalls, inconsistentChecks, ownMounts, done: () => rmSync(root, { recursive: true, force: true }) };

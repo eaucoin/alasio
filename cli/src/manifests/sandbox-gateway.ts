@@ -13,7 +13,7 @@
  *   release's snapshot records; and it finds the node agents.
  * - A pool of each of a session's internets, `none` and `full`, in each environment: a
  *   Deployment in its sessions' namespace of pods of the agent image under the sessions' runtime, each its own directory
- *   on its node (src/node-agent/names.ts ATTACH_ROOT, by `subPathExpr` of its name) at /attach,
+ *   on its node (src/node-agent/names.ts ATTACH_ROOT, by `subPathExpr` of its namespace and its name) at /attach,
  *   where its workspace is attached once it is bound, its bayma started once its binding's
  *   token is beside it (sandbox/agent/start.sh). KEDA keeps `min` free, and makes more, to
  *   `max`, for the binds that wait; a bound pod is out of its Deployment, which replaces it.
@@ -231,6 +231,7 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
         workingDir: "/attach",
         env: [
           { name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
+          { name: "POD_NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
           { name: "HOME", value: "/home/agent" },
           { name: "USER", value: "agent" },
           { name: "BAYMA_PAYLOAD_DIR", value: "/opt/bayma/payload" },
@@ -240,8 +241,9 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
         securityContext: restrictedContainer(),
         resources: sessions.resources,
         volumeMounts: [
-          // Its own directory on its node, which its workspace is attached under once it is bound.
-          { name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAME)", mountPropagation: "HostToContainer" },
+          // Its own directory on its node, by its namespace and its name, as pods of two namespaces
+          // may share a name, which its workspace is attached under once it is bound.
+          { name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAMESPACE)/$(POD_NAME)", mountPropagation: "HostToContainer" },
           { name: "tmp", mountPath: "/tmp" },
         ],
       }],

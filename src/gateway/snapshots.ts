@@ -634,7 +634,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           // attached there first, so its sandbox, restored as its bayma starts, finds every file it held open.
           const name = restorePodName(pool.name, randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7));
           yield* attaching.attach(node, name, binding);
-          const spec = ownDirectory({ containers: [], ...base.spec }, name);
+          const spec = ownDirectory({ containers: [], ...base.spec }, pool.namespace, name);
           const pod = yield* kube.create<V1Pod>({
             apiVersion: "v1",
             kind: "Pod",

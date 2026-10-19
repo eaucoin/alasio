@@ -300,8 +300,8 @@ const restoredFromKey = (namespace: string) =>
     return `type(${expression}) == string && ${expression}.startsWith(${own}) && ${expression}.substring(size(${own})).matches(${JSON.stringify(`^${SNAPSHOT_ID}$`)})`;
   });
 
-/** A restore's pod's own directory on its node: its own name's, under every pod's, its name a restore's pod's, as its node's agent makes a directory for no other. */
-const OWN_DIRECTORY = new Check((expression) => `${expression} == ${JSON.stringify(`${ATTACH_ROOT}/`)} + object.metadata.name && object.metadata.name.matches(${JSON.stringify(RESTORE_POD.source)})`);
+/** A restore's pod's own directory on its node: its namespace's and its own name's, under every pod's, its name a restore's pod's, as its node's agent makes a directory for no other. */
+const OWN_DIRECTORY = new Check((expression) => `${expression} == ${JSON.stringify(`${ATTACH_ROOT}/`)} + object.metadata.namespace + "/" + object.metadata.name && object.metadata.name.matches(${JSON.stringify(RESTORE_POD.source)})`);
 
 /**
  * A restore's pod of the pool template `template`, as the gateway makes it (src/gateway/snapshots.ts)
@@ -311,7 +311,7 @@ const OWN_DIRECTORY = new Check((expression) => `${expression} == ${JSON.stringi
  */
 function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClasses: readonly string[]): string {
   // Its own directory named by its volume's path, its own name's (ownDirectory).
-  const owned = ownDirectory(template.spec ?? { containers: [] }, "");
+  const owned = ownDirectory(template.spec ?? { containers: [] }, "", "");
   const volumes = (owned.volumes ?? []).map((volume) => (volume.name === ATTACH_VOLUME ? { name: ATTACH_VOLUME, hostPath: { path: OWN_DIRECTORY, type: "Directory" } } : volume));
   const restoredOn: Pinned = {
     nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: [matching(NODE_NAME)] }] }] } },

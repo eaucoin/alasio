@@ -3193,8 +3193,12 @@ describe("the sandbox service", () => {
       assert.deepEqual([spec?.dnsPolicy, spec?.dnsConfig], ["None", { nameservers: mode === "full" ? ["1.1.1.1", "8.8.8.8"] : ["127.0.0.1"] }]);
       assert.deepEqual(spec?.volumes?.[0], { name: "attach", hostPath: { path: "/var/lib/alasio/attach", type: "DirectoryOrCreate" } });
       const [bayma] = spec?.containers ?? [];
-      assert.deepEqual(bayma?.volumeMounts?.[0], { name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAME)", mountPropagation: "HostToContainer" });
-      assert.deepEqual(bayma?.env?.[0], { name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } });
+      // Its directory by its namespace and its name, as pods of two namespaces may share a name.
+      assert.deepEqual(bayma?.volumeMounts?.[0], { name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAMESPACE)/$(POD_NAME)", mountPropagation: "HostToContainer" });
+      assert.deepEqual(bayma?.env?.slice(0, 2), [
+        { name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
+        { name: "POD_NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
+      ]);
       assert.deepEqual(bayma?.command, ["/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"]);
       assert.deepEqual(bayma?.args?.slice(-6, -2), ["--token-file", "/attach/token", "--telemetry-token-file", "/attach/token"]);
       // Its sessions snapshotted, as main's are by the gateway: held to the nodes' CPU baseline, its bayma holding a stop it is

@@ -48,7 +48,7 @@ export type Prepared = typeof Prepared.Type;
 const Refusal = Schema.Struct({ error: Schema.String });
 
 /** What an agent answers a look at what is attached on its node with. */
-const Attachments = Schema.Struct({ attachments: Schema.Array(Schema.Struct({ pod: Schema.String, reachable: Schema.Boolean })) });
+const Attachments = Schema.Struct({ attachments: Schema.Array(Schema.Struct({ namespace: Schema.String, pod: Schema.String, reachable: Schema.Boolean })) });
 
 /** What an agent answers a workspace's quota with. */
 const Quota = Schema.Struct({ capacityBytes: Schema.Number, usedBytes: Schema.Number });
@@ -121,7 +121,7 @@ export interface NodeAgents {
    * Detaches what is attached into `pod`'s directory on `node`. An agent refuses while any of
    * `containerIds`, the pod's sandbox's containers by their runtime's ids, runs, with 409.
    */
-  readonly detach: (node: string, pod: string, containerIds: readonly string[]) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  readonly detach: (node: string, namespace: string, pod: string, containerIds: readonly string[]) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** The workspace's file at `path`, `workspace/...` or `home/...`, of `maxBytes` at most, as any agent reads it. */
   readonly readFile: (workspace: WorkspaceRef, path: string, maxBytes: number) => Effect.Effect<Uint8Array, NodeAgentError | KubeApiError>;
   /** Makes the workspace, its directory and its quota of `quotaBytes`, through any agent, each sees workspace storage as another; again, sets its quota anew. */
@@ -147,7 +147,7 @@ export interface NodeAgents {
    */
   readonly sync: (node: string, request: SyncRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** The pods of `node` a workspace is attached into, each by whether what is attached is reachable still. */
-  readonly attachments: (node: string) => Effect.Effect<readonly { readonly pod: string; readonly reachable: boolean }[], NodeAgentError | KubeApiError>;
+  readonly attachments: (node: string) => Effect.Effect<readonly { readonly namespace: string; readonly pod: string; readonly reachable: boolean }[], NodeAgentError | KubeApiError>;
   /** The snapshot the workspace was last released into, as any agent reads its record of it; null where none is recorded. */
   readonly released: (workspace: WorkspaceRef) => Effect.Effect<Released | null, NodeAgentError | KubeApiError>;
   /** Records the snapshot the workspace is released into, or none, through any agent. */
@@ -278,7 +278,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
   return {
     nodes: Effect.map(addresses, (known) => [...known.keys()]),
     attach: (node, request) => send(node, `attach ${request.environment}/${request.workspace} into ${request.pod}`, { method: "POST", path: "/attach", body: request, timeout: SHORT_CALL }).pipe(Effect.asVoid),
-    detach: (node, pod, containerIds) => send(node, `detach what is attached into ${pod}`, { method: "POST", path: "/detach", body: { pod, containerIds }, timeout: SHORT_CALL }).pipe(Effect.asVoid),
+    detach: (node, namespace, pod, containerIds) => send(node, `detach what is attached into ${namespace}/${pod}`, { method: "POST", path: "/detach", body: { namespace, pod, containerIds }, timeout: SHORT_CALL }).pipe(Effect.asVoid),
     readFile: (workspace, path, maxBytes) =>
       Effect.flatMap(anyNode, (node) => send(node, `read ${path} of ${workspace.environment}/${workspace.workspace}`, { method: "GET", path: `${filePath(workspace, path)}&max=${maxBytes}`, timeout: SHORT_CALL })).pipe(
         Effect.map(({ bytes }) => bytes),

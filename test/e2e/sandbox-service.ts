@@ -64,8 +64,8 @@ function watchRestore(node: string): { readonly stop: () => void; readonly said:
   const said: string[] = [];
   let stopped = false;
   const look = [
-    "for d in /var/lib/alasio/attach/sandboxes-none-restore-*; do [ -d \"$d\" ] || continue; echo \"== $d\"; ls -la \"$d\" \"$d/ws\" 2>&1 | head -12; done",
-    "grep -E 'alasio/attach/sandboxes-none-restore|volume-subpaths/attach' /proc/1/mountinfo | head -12",
+    "for d in /var/lib/alasio/attach/*/sandboxes-none-restore-*; do [ -d \"$d\" ] || continue; echo \"== $d\"; ls -la \"$d\" \"$d/ws\" 2>&1 | head -12; done",
+    "grep -E 'alasio/attach/[^/]+/sandboxes-none-restore|volume-subpaths/attach' /proc/1/mountinfo | head -12",
     "for c in $(k3s crictl ps -a --name bayma -q 2>/dev/null | head -3); do k3s crictl inspect \"$c\" 2>/dev/null | grep -B1 -A2 '\"containerPath\": \"/attach\"' | head -8; done",
   ].join("; ");
   void (async () => {

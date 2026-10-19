@@ -244,7 +244,7 @@ export const makeSessions = Effect.fnUntraced(function*(
     Effect.asVoid(Effect.forkDetach(Effect.gen(function*() {
       yield* stopped(pool, name);
       const last = (yield* kube.read("v1", "Pod", pool.namespace, name)) as V1Pod | null;
-      yield* timed(detachDuration, pool, agents.detach(node, name, last ? containerIdsOf(last) : []));
+      yield* timed(detachDuration, pool, agents.detach(node, pool.namespace, name, last ? containerIdsOf(last) : []));
     }).pipe(Effect.catch((error) => Effect.logWarning(`could not detach what was attached into ${pool.namespace}/${name}, whose readying failed: ${error.message}`)))));
 
   /** Waits until `name`'s containers have all stopped, or it is gone. */
@@ -275,7 +275,7 @@ export const makeSessions = Effect.fnUntraced(function*(
       if ((yield* snapshots.save(pool, volumeId, name)) === "keep") return yield* new BindStepFailed({ reason: `its sandbox was not saved, and runs on` });
       yield* kube.remove("v1", "Pod", pool.namespace, name);
       yield* stopped(pool, name);
-      yield* timed(detachDuration, pool, agents.detach(node, name, containers));
+      yield* timed(detachDuration, pool, agents.detach(node, pool.namespace, name, containers));
     });
 
   /** Tells `pool`'s environment's alasio of what `of` says; where `pool`'s environment is gone, no one. */
@@ -308,7 +308,7 @@ export const makeSessions = Effect.fnUntraced(function*(
       const name = pod.metadata?.name ?? "";
       yield* snapshots.saveStopping(pool, workspace, pod);
       yield* stopped(pool, name);
-      yield* timed(detachDuration, pool, agents.detach(pod.spec?.nodeName ?? "", name, containerIdsOf(pod)));
+      yield* timed(detachDuration, pool, agents.detach(pod.spec?.nodeName ?? "", pool.namespace, name, containerIdsOf(pod)));
     });
   const drain: Effect.Effect<readonly string[], KubeApiError> = Effect.gen(function*() {
     const started: string[] = [];
@@ -370,7 +370,7 @@ export const makeSessions = Effect.fnUntraced(function*(
       const name = pod.metadata?.name ?? "";
       yield* kube.remove("v1", "Pod", pool.namespace, name);
       yield* stopped(pool, name);
-      yield* timed(detachDuration, pool, agents.detach(pod.spec?.nodeName ?? "", name, containerIdsOf(pod)));
+      yield* timed(detachDuration, pool, agents.detach(pod.spec?.nodeName ?? "", pool.namespace, name, containerIdsOf(pod)));
     });
 
   /**
@@ -390,7 +390,7 @@ export const makeSessions = Effect.fnUntraced(function*(
         const known = unreachableOn.get(node);
         if (known) return known;
         const pods = yield* agents.attachments(node).pipe(
-          Effect.map((attachments) => new Set(attachments.filter(({ reachable }) => !reachable).map(({ pod }) => pod))),
+          Effect.map((attachments) => new Set(attachments.filter(({ reachable }) => !reachable).map(({ namespace, pod }) => `${namespace}/${pod}`))),
           Effect.catch((error) => Effect.as(Effect.logWarning(`could not ask ${node} what is attached on it: ${error.message}`), new Set<string>())),
         );
         unreachableOn.set(node, pods);
@@ -407,7 +407,7 @@ export const makeSessions = Effect.fnUntraced(function*(
         bound.add(workspace);
         const bayma = pod.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER);
         const ended = bayma !== undefined && (bayma.restartCount > 0 || bayma.state?.terminated !== undefined);
-        if (ended || (yield* unreachable(pod.spec?.nodeName ?? "")).has(pod.metadata?.name ?? "")) {
+        if (ended || (yield* unreachable(pod.spec?.nodeName ?? "")).has(`${pool.namespace}/${pod.metadata?.name ?? ""}`)) {
           const why = ended ? "bayma ended in its pod" : "workspace is unreachable in its pod";
           yield* Effect.logWarning(`${key}'s ${why} ${pod.metadata?.name}, which serves its binding no more: it is released into the snapshot taken of it live, if any`);
           yield* Effect.forkDetach(releaseFor(pool, key, pod, "broken", () =>
