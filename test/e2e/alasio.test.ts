@@ -38,7 +38,8 @@ import { neonStack } from "../../neon/test/stack.ts";
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
-import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
+import { NODE_PINS } from "../../cli/src/cluster/node.ts";
+import { goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
 import { ANSWER } from "./codex-stand-in.ts";
@@ -1675,7 +1676,7 @@ if (inShard("snapshots")) {
       }
     });
 
-    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket comes back whole and is saved again, its node's agent stopped as its sandbox resumes, which stops once the restore has been served all its pages`, async (t) => {
+    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket comes back whole and is saved again, its node's agent stopped as its sandbox resumes, which stops once the restore over TCP has been served all its pages, or at once, the restore through its socket served the rest by the agent that comes back`, async (t) => {
       const big = await newSession("none");
       const { sessionId: held, sha256 } = await repl.fill(big, BIG_REPL_MEBIBYTES);
       await untilReleased(big, Date.now(), { savingMs: 480_000 });
@@ -1703,6 +1704,10 @@ if (inShard("snapshots")) {
       // there. Its stop waits on the restore while it reads, or found it had read every page
       // already; either way it was served every byte of pages runsc said its image holds,
       // which runsc did say, as the drain counts bytes and not its reads' quiet.
+      // A restore through the agent's socket, as the release it was taken on restores
+      // (./names.ts goferOf), waits instead for the agent that comes back at the same path,
+      // which takes its token back and serves it the rest: the agent stopped waits on none.
+      const throughSocket = goferOf(NODE_PINS.gvisor.releases[0]?.release ?? "", NODE_PINS.gvisor.restoresThroughSocketSince) !== null;
       const waits = following(NAMESPACE, agent, "node-agent", new RegExp(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: 1 read it now`, "u"));
       const servedAll = following(NAMESPACE, agent, "node-agent", new RegExp(`the restore of ${SESSIONS}/${big} has been served all [1-9]\\d* bytes of its pages through the node agent`, "u"));
       const unsaid = following(NAMESPACE, agent, "node-agent", new RegExp(`runsc does not say how many bytes of pages the restore of ${SESSIONS}/${big} reads`, "u"));
@@ -1716,9 +1721,14 @@ if (inShard("snapshots")) {
         const within = <A>(said: Promise<A>) => Promise.race([said, sleep(30_000).then(() => undefined)]);
         const [waited, all, warned] = await Promise.all([within(waits.said), within(servedAll.said), within(unsaid.said)]);
         assert.equal(warned, undefined, `the node agent ${agent} said runsc did not tell the bytes of pages of ${big}'s image: ${warned}`);
-        assert.ok(all, `the node agent ${agent} did not say it served ${big}'s restore all its pages`);
-        t.diagnostic(waited ?? `the node agent ${agent} stopped at once, its restore served whole before`);
-        t.diagnostic(all);
+        if (throughSocket) {
+          assert.equal(waited, undefined, `the node agent ${agent} waited on a restore through its socket: ${waited}`);
+          t.diagnostic(all ?? `the node agent ${agent} stopped at once, its restore through its socket left to the agent that comes back`);
+        } else {
+          assert.ok(all, `the node agent ${agent} did not say it served ${big}'s restore all its pages`);
+          t.diagnostic(waited ?? `the node agent ${agent} stopped at once, its restore served whole before`);
+          t.diagnostic(all);
+        }
         await answered;
         // What the gateway and the node agents said of it, where it cannot be read.
         const logged = async () => console.error(`# what the sandbox service logged of ${big}:\n${await serviceLogs(big)}`);
@@ -1732,6 +1742,11 @@ if (inShard("snapshots")) {
       } finally {
         log.stop();
         await until(`a node agent ready again on ${node}`, async () => ((await nodeAgents()).has(node) ? true : undefined), 300_000);
+      }
+      if (throughSocket) {
+        // The agent that came back took the restore's token back, as the one stopped kept it on the node.
+        const again = (await nodeAgents()).get(node) ?? "";
+        assert.match(await kube.logs(NAMESPACE, again, "node-agent"), /the node agent took back the tokens of [1-9]\d* restores reading the snapshots bucket through it/u, again);
       }
       // Saved again, as a sandbox whose background reads failed could be no more.
       await untilReleased(big, Date.now(), { savingMs: 480_000 });
