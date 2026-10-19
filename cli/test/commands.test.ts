@@ -1892,6 +1892,26 @@ test("up waits for the storage controller's database to run again, as after it r
   succeeded(await alasio(["up"]));
 });
 
+test("up asks the storage controller's database again while its pod's kubelet, started anew, has not taken it back, and goes on once it answers", async (t) => {
+  const { alasio, kube } = await branchable(t);
+  // Its pod running as its status says from before k3s restarted, its kubelet answering an exec of it 404.
+  kube.unserved.add("alasio/alasio-neon-controller-db-0");
+  const takenBack = setTimeout(() => kube.unserved.delete("alasio/alasio-neon-controller-db-0"), 1_500);
+  t.after(() => clearTimeout(takenBack));
+  succeeded(await alasio(["up"]));
+});
+
+test("up refuses to apply anything once the storage controller's database's pod has not been taken back within what it waits for", async (t) => {
+  const { alasio, kube } = await branchable(t);
+  kube.unserved.add("alasio/alasio-neon-controller-db-0");
+  kube.changes.length = 0;
+  assert.match(
+    failure(await alasio(["up", "--timeout", "2s"])),
+    /^alasio applies nothing it cannot check against Neon's storage, and the storage controller's database, which holds what it registered, did not answer \(Kubernetes could not be reached for GET \/api\/v1\/namespaces\/alasio\/pods\/alasio-neon-controller-db-0\/exec: Unexpected server response: 404\)/u,
+  );
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
+});
+
 test("up refuses to apply anything while the Secret that names Neon's tenant cannot be read", async (t) => {
   const { alasio, kube } = await branchable(t);
   stackSecret(kube, "alasio-neon-root", { "secrets.json": "{" });

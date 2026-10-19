@@ -10,15 +10,16 @@
  * release of alasio runs, so an upgrade is checked against the release it upgrades from as
  * well as against this one. As alasio is applied, the storage controller and its database,
  * where the installation has them, are waited for until they run first, as alasio may have
- * just restarted the cluster's k3s, its configuration changed, and their pods with it.
+ * just restarted the cluster's k3s, its configuration changed, and their pods with it; and
+ * each is asked again while its container does not answer yet (NOT_YET_ANSWERING_FOR).
  */
 import type { V1PersistentVolumeClaim, V1Secret } from "@kubernetes/client-node";
-import { Effect, Schema } from "effect";
+import { Duration, Effect, Schedule, Schema } from "effect";
 
 import type { DescribedShard, StorageNode } from "../../neon/control/branches.ts";
 import type { StackSecrets } from "../../neon/control/secrets.ts";
 import { runIn, runningPod } from "./commands/common.ts";
-import { kind, KubeApi, type KubeApiError, type ObjectRef } from "./kube/api.ts";
+import { type ContainerRef, kind, KubeApi, type KubeApiError, type KubeExecError, type ObjectRef } from "./kube/api.ts";
 import { awaitReady, type NotReadyInTime, type RolloutFailed, type WaitOptions } from "./kube/rollout.ts";
 import { NAMESPACE, neonName } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
@@ -51,14 +52,45 @@ export class StorageUnverified extends Schema.TaggedError<StorageUnverified>()("
 /** The storage controller's container, as its Deployment runs it. */
 const CONTAINER = "storage-controller";
 
+/**
+ * How long a container of Neon's storage that does not answer yet is asked again, at most, and
+ * never past what alasio waits for: one its kubelet has not taken back since the cluster's
+ * k3s started anew, which a status from before still says runs.
+ */
+export const NOT_YET_ANSWERING_FOR = Duration.minutes(2);
+
+/**
+ * Whether `error`, of an exec, is of its container's not answering yet, rather than of what it
+ * ran: its pod not yet taken back by its kubelet, which answers 404, its container not found,
+ * or its connection refused.
+ */
+const notYetAnswering = (error: KubeApiError | KubeExecError): boolean =>
+  error._tag === "KubeApiError" && (error.status === 404 || /\b404\b|container not found|ECONNREFUSED|connection refused/iu.test(error.reason));
+
+/**
+ * `command` run in `target`, as runIn runs it, asked again every `wait.poll` while its
+ * container does not answer yet, for NOT_YET_ANSWERING_FOR or `wait.timeout`, whichever is
+ * shorter; asked once where nothing is waited for.
+ */
+const runAnswered = (target: ContainerRef, command: readonly string[], wait: WaitOptions | undefined) =>
+  wait === undefined
+    ? runIn(target, command)
+    : runIn(target, command).pipe(
+      Effect.retry({
+        while: notYetAnswering,
+        schedule: Schedule.max([Schedule.spaced(wait.poll), Schedule.during(Duration.min(NOT_YET_ANSWERING_FOR, Duration.fromInputUnsafe(wait.timeout)))]),
+      }),
+    );
+
 /** Asks the storage controller for `path` of its API, in its pod: what it answered with, by its status. */
-const asked = <Body>(pod: string, path: string): Effect.Effect<{ readonly status: number; readonly body: Body | null }, KubeApiError | StorageUnverified, KubeApi> =>
-  runIn(
+const asked = <Body>(pod: string, path: string, wait: WaitOptions | undefined): Effect.Effect<{ readonly status: number; readonly body: Body | null }, KubeApiError | StorageUnverified, KubeApi> =>
+  runAnswered(
     { namespace: NAMESPACE, pod, container: CONTAINER },
     // The token is the container's own, which the shell's own printf gives curl on its
     // standard input, so it is on no command line; and a storage controller that does not
     // answer holds up for 10 s at most.
     ["sh", "-c", 'printf "authorization: Bearer %s\\n" "$CONTROL_PLANE_JWT_TOKEN" | curl -sS --max-time 10 -H @- -w "\\n%{http_code}" "http://127.0.0.1:1234$0"', path],
+    wait,
   ).pipe(
     Effect.catch((error) => Effect.fail(new StorageUnverified({ reason: error.message }))),
     Effect.flatMap(({ exitCode, stdout, stderr }) => {
@@ -93,8 +125,8 @@ export class StorageDatabaseUnread extends Schema.TaggedError<StorageDatabaseUnr
 }
 
 /** Asks the storage controller's database `sql`, as its own role, in its pod: what it printed. */
-const askedDatabase = (sql: string): Effect.Effect<string, KubeApiError | StorageDatabaseUnread, KubeApi> =>
-  runIn({ namespace: NAMESPACE, pod: DATABASE_POD, container: "postgres" }, ["psql", "-U", "storage_controller", "-d", "storage_controller", "-Atc", sql]).pipe(
+const askedDatabase = (sql: string, wait: WaitOptions | undefined): Effect.Effect<string, KubeApiError | StorageDatabaseUnread, KubeApi> =>
+  runAnswered({ namespace: NAMESPACE, pod: DATABASE_POD, container: "postgres" }, ["psql", "-U", "storage_controller", "-d", "storage_controller", "-Atc", sql], wait).pipe(
     Effect.catch((error) => Effect.fail(new StorageDatabaseUnread({ reason: error.message }))),
     Effect.flatMap(({ exitCode, stdout, stderr }) =>
       exitCode === 0 ? Effect.succeed(stdout.trim()) : Effect.fail(new StorageDatabaseUnread({ reason: `psql exited with ${exitCode}: ${stderr.trim() || stdout.trim()}` }))
@@ -107,12 +139,12 @@ const askedDatabase = (sql: string): Effect.Effect<string, KubeApiError | Storag
  * runs, or where it holds no table of nodes, or no node in it; then there is nothing to check
  * a configuration against. One whose claim is bound is asked, and must answer.
  */
-const registered: Effect.Effect<boolean, KubeApiError | StorageDatabaseUnread, KubeApi> = Effect.gen(function*() {
+const registered = (wait: WaitOptions | undefined): Effect.Effect<boolean, KubeApiError | StorageDatabaseUnread, KubeApi> => Effect.gen(function*() {
   const kube = yield* KubeApi;
   const claim = yield* kube.get<V1PersistentVolumeClaim>({ ...kind("PersistentVolumeClaim"), namespace: NAMESPACE, name: DATABASE_CLAIM });
   if (claim?.status?.phase !== "Bound" && claim?.status?.phase !== "Lost") return false;
-  if ((yield* askedDatabase("select to_regclass('nodes') is not null")) !== "t") return false;
-  return (yield* askedDatabase("select exists (select from nodes)")) === "t";
+  if ((yield* askedDatabase("select to_regclass('nodes') is not null", wait)) !== "t") return false;
+  return (yield* askedDatabase("select exists (select from nodes)", wait)) === "t";
 });
 
 /**
@@ -120,11 +152,11 @@ const registered: Effect.Effect<boolean, KubeApiError | StorageDatabaseUnread, K
  * registered no pageserver; StorageUnverified where it has but does not say, as a
  * configuration it would refuse must not slip through then.
  */
-const storageHeld: Effect.Effect<StorageHeld | null, KubeApiError | StorageDatabaseUnread | StorageUnverified, KubeApi> = Effect.gen(function*() {
+const storageHeld = (wait: WaitOptions | undefined): Effect.Effect<StorageHeld | null, KubeApiError | StorageDatabaseUnread | StorageUnverified, KubeApi> => Effect.gen(function*() {
   const kube = yield* KubeApi;
-  if (!(yield* registered)) return null;
+  if (!(yield* registered(wait))) return null;
   const pod = yield* runningPod("neon-storage-controller").pipe(Effect.catch((error) => Effect.fail(new StorageUnverified({ reason: error.message }))));
-  const nodes = yield* asked<StorageNode[]>(pod, "/control/v1/node");
+  const nodes = yield* asked<StorageNode[]>(pod, "/control/v1/node", wait);
   if (nodes.status !== 200 || !nodes.body) return yield* new StorageUnverified({ reason: `it answered its pageservers with ${nodes.status}` });
   const pageservers = nodes.body.length;
   // The tenant, which the stack's setup names before neon-control makes it.
@@ -134,7 +166,7 @@ const storageHeld: Effect.Effect<StorageHeld | null, KubeApiError | StorageDatab
     catch: () => new StorageUnverified({ reason: `the Secret ${neonName("root")}'s secrets.json, which names Neon's tenant, is no JSON` }),
   }));
   if (!tenantId) return { shards: 0, pageservers };
-  const tenant = yield* asked<{ readonly shards: readonly DescribedShard[] }>(pod, `/control/v1/tenant/${tenantId}`);
+  const tenant = yield* asked<{ readonly shards: readonly DescribedShard[] }>(pod, `/control/v1/tenant/${tenantId}`, wait);
   if (tenant.status === 404) return { shards: 0, pageservers };
   if (tenant.status !== 200 || !tenant.body) return yield* new StorageUnverified({ reason: `it answered Neon's tenant with ${tenant.status}` });
   return { shards: tenant.body.shards.length, pageservers };
@@ -160,7 +192,7 @@ const running = (wait: WaitOptions): Effect.Effect<void, KubeApiError | NotReady
 export const checkNeonStorage = Effect.fnUntraced(function*(settings: InstallConfig, wait?: WaitOptions): Effect.fn.Return<void, KubeApiError | NotReadyInTime | RolloutFailed | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified, KubeApi> {
   if (!settings.neon.enabled) return;
   if (wait) yield* running(wait);
-  const held = yield* storageHeld;
+  const held = yield* storageHeld(wait);
   if (!held) return;
   if (held.shards > settings.neon.shards) return yield* new ShardsLowered({ configured: settings.neon.shards, current: held.shards });
   const pageservers = settings.neon.pageserver.scaling.min;
