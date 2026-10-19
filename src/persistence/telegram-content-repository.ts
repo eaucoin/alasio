@@ -185,8 +185,28 @@ export class NeonTelegramContentRepository {
     ));
   }
 
-  markMediaGroupFlushed(mediaGroupId: string): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(`update ${this.#schema}.media_groups set status = 'flushed', flushed_at = now() where id = $1`, [mediaGroupId]));
+  /**
+   * Claims the album to be handled, marking it handled, where it is still waiting and none
+   * of its messages was kept within `quietMs`: whether it did. Run in its chat's handling
+   * lock's transaction (./store.ts HandlingMarks), as its messages are kept, so none of it
+   * comes as it is claimed, and one handling it that stops before its transaction commits
+   * leaves it waiting.
+   */
+  claimMediaGroup(mediaGroupId: string, quietMs: number): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `update ${this.#schema}.media_groups waiting set status = 'flushed', flushed_at = now()
+       where waiting.id = $1 and waiting.status = 'pending' and ${this.#quiet("waiting.id", "$2")}
+       returning id`,
+      [mediaGroupId, quietMs / 1000],
+    ).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
+  /** Whether none of the album `group`'s messages was kept within the seconds the parameter `seconds` says. */
+  #quiet(group: string, seconds: string): string {
+    return `not exists (
+         select 1 from ${this.#schema}.messages kept
+         where kept.media_group_id = ${group} and kept.created_at > now() - make_interval(secs => ${seconds})
+       )`;
   }
 
   getMediaGroupMessages(mediaGroupId: string): Effect.Effect<StoredMessage[], StoreError> {
@@ -214,13 +234,13 @@ export class NeonTelegramContentRepository {
     ));
   }
 
-  /** The albums still waiting that arrived at least `ageMs` ago, oldest first. */
-  getPendingMediaGroupsDue(ageMs: number): Effect.Effect<MediaGroup[], StoreError> {
+  /** The albums still waiting none of whose messages was kept within `quietMs`, oldest first. */
+  getPendingMediaGroupsDue(quietMs: number): Effect.Effect<MediaGroup[], StoreError> {
     return this.#sql.query<MediaGroup>(
-      `select * from ${this.#schema}.media_groups
-       where status = 'pending' and created_at <= now() - make_interval(secs => $1)
-       order by created_at`,
-      [ageMs / 1000],
+      `select waiting.* from ${this.#schema}.media_groups waiting
+       where waiting.status = 'pending' and waiting.created_at <= now() - make_interval(secs => $1) and ${this.#quiet("waiting.id", "$1")}
+       order by waiting.created_at`,
+      [quietMs / 1000],
     );
   }
 }

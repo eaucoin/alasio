@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import type { RunningAlasio } from "./support/alasio.ts";
+import { codexThread, threadStartResponse } from "./support/codex-protocol.ts";
 import {
   answerLoadedThreads,
   answerThreadStart,
@@ -62,6 +63,24 @@ test("two photos of one album are one turn, whose prompt is the caption and both
   answerTurn(codex, "thread-1", "turn-1", "Two photos.");
   await telegram.waitFor("sendRichMessage", () => true, { mark });
   assert.equal(codex.requests("turn/start").length, 1);
+});
+
+test("an album another alasio kept, and left waiting as it stopped, is handled by this one as it looks for albums due, with no restart", { timeout: 60_000 }, async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { codex, stateSchema } = alasio;
+  await mount(alasio, "codex", "alpha");
+  // Kept by the other a moment ago, its wait gone with it.
+  await (await testPool()).query(
+    `with album as (
+       insert into ${stateSchema}.media_groups (id, conversation_id, first_update_id, created_at) values ('left', $1, 9001, now() - interval '5 seconds')
+     )
+     insert into ${stateSchema}.messages (id, conversation_id, direction, kind, transport_message_id, text, media_group_id, created_at)
+     values ('left-1', $1, 'in', 'text', '9001', 'What is left?', 'left', now() - interval '5 seconds')`,
+    [`telegram:${OPERATOR_ID}`],
+  );
+  // Within one look for albums due, every ten seconds.
+  codex.answer(await codex.next("thread/start", { timeoutMs: 15_000 }), threadStartResponse(codexThread("thread-1", { cwd: alasio.folder("alpha") })));
+  assert.equal(inputText(await answerTurnStart(codex, "thread-1", "turn-1")), "What is left?");
 });
 
 test("an update whose processing fails is skipped, and the updates after it are processed", async (t) => {

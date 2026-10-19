@@ -23,7 +23,7 @@ import { CLAUDE_HARNESS, CODEX_HARNESS } from "../harness/names.ts";
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
 import { Mounts } from "../operator/mounts.ts";
 import type { StoreError } from "../persistence/sql.ts";
-import { type HandlingMarks, Store } from "../persistence/store.ts";
+import { Store, type UpdateMarks } from "../persistence/store.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import { withLogScope } from "../shared/log.ts";
 import { SpanKind, withAlasioSpan } from "../telemetry/index.ts";
@@ -38,6 +38,9 @@ import { consumeUpdates, type TelegramUpdates } from "./update-consumer.ts";
 
 /** How often completed responses that were never delivered are looked for. */
 const COMPLETED_RESPONSE_RECOVERY = "30 seconds";
+
+/** How often albums due are looked for, besides the wait of the alasio that kept their last message. */
+const MEDIA_GROUPS_DUE_EVERY = "10 seconds";
 
 /**
  * How long the store keeps what it holds only while in flight (updates processed, albums
@@ -182,7 +185,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
     Effect.suspend(() => {
       const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
       // Its marks made in the lock's transaction, where it has a chat's: a lock lost rolls them back.
-      const underLock = <A, E, R>(handle: (marks: HandlingMarks) => Effect.Effect<A, E, R>) => chatId === undefined ? handle(store) : store.withHandlingLock(chatId, handle);
+      const underLock = <A, E, R>(handle: (marks: UpdateMarks) => Effect.Effect<A, E, R>) => chatId === undefined ? handle(store) : store.withHandlingLock(chatId, handle);
       return underLock((marks) => Effect.gen(function*() {
         if (!(yield* marks.recordTelegramUpdate(update))) {
           return yield* Effect.logInfo(`Skipping update ${update.update_id}, processed already`);
@@ -252,6 +255,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
     Effect.schedule(Schedule.spaced(COMPLETED_RESPONSE_RECOVERY)),
     Effect.forkScoped,
   );
+  // Albums due, which no alasio's wait is for (it stopped, or their chat's updates went to another).
+  yield* mediaGroups.flushDue.pipe(Effect.schedule(Schedule.spaced(MEDIA_GROUPS_DUE_EVERY)), Effect.forkScoped);
   // Pruned as alasio starts, and every day it runs after.
   yield* store.pruneTransient(TRANSIENT_RETENTION).pipe(
     Effect.catch((error) => Effect.logWarning(`Pruning the store failed: ${error.message}`)),

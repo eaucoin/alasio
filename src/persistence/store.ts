@@ -143,10 +143,20 @@ type Stored<A> = Effect.Effect<A, StoreError>;
  * store, and let go of however what holds it ends; so a lock lost, as its connection is,
  * rolls back the marks made under it: none outlives its lock.
  */
-export interface HandlingMarks {
+export interface UpdateMarks {
   /** Keeps an update, unless it is kept already: whether it is yet to be processed. */
   readonly recordTelegramUpdate: (update: Update) => Stored<boolean>;
   readonly markTelegramUpdateProcessed: (updateId: number) => Stored<void>;
+}
+
+/** What a chat's handling lock's holder marks, in the lock's transaction: an update's handling, and an album's. */
+export interface HandlingMarks extends UpdateMarks {
+  /**
+   * Claims the chat's album to be handled, marking it handled, where it still waits and none
+   * of its messages was kept within `quietMs`: whether it did. Committed with the lock's
+   * transaction, so an alasio that stops as it handles the album leaves it waiting.
+   */
+  readonly claimMediaGroup: (mediaGroupId: string, quietMs: number) => Stored<boolean>;
 }
 
 /**
@@ -259,10 +269,10 @@ export class Store extends Context.Service<Store, {
   /** The files `ids` name, with their content. */
   readonly getFileContents: (ids: readonly string[]) => Stored<FileContent[]>;
   readonly upsertMediaGroup: (arrival: MediaGroupArrival) => Stored<void>;
-  readonly markMediaGroupFlushed: (mediaGroupId: string) => Stored<void>;
   readonly getMediaGroupMessages: (mediaGroupId: string) => Stored<StoredMessage[]>;
   readonly getFilesForMessages: (messageIds: readonly string[]) => Stored<StoredFile[]>;
-  readonly getPendingMediaGroupsDue: (ageMs: number) => Stored<MediaGroup[]>;
+  /** The albums still waiting none of whose messages was kept within `quietMs`, oldest first. */
+  readonly getPendingMediaGroupsDue: (quietMs: number) => Stored<MediaGroup[]>;
 
   /** Claims the conversation for a turn starting: the turn's epoch, which its writes hold under (turnPersistence). */
   readonly claimTurn: (turn: ActiveTurn) => Stored<number>;
@@ -465,6 +475,7 @@ const makeStore = Effect.fnUntraced(function*({
             return work({
               recordTelegramUpdate: (update) => locked.recordTelegramUpdate(update),
               markTelegramUpdateProcessed: (updateId) => locked.markTelegramUpdateProcessed(updateId),
+              claimMediaGroup: (mediaGroupId, quietMs) => locked.claimMediaGroup(mediaGroupId, quietMs),
             });
           })),
         )
@@ -474,10 +485,9 @@ const makeStore = Effect.fnUntraced(function*({
     insertFile: (file) => telegramContent.insertFile(file),
     getFileContents: (ids) => telegramContent.getFileContents(ids),
     upsertMediaGroup: (arrival) => telegramContent.upsertMediaGroup(arrival),
-    markMediaGroupFlushed: (mediaGroupId) => telegramContent.markMediaGroupFlushed(mediaGroupId),
     getMediaGroupMessages: (mediaGroupId) => telegramContent.getMediaGroupMessages(mediaGroupId),
     getFilesForMessages: (messageIds) => telegramContent.getFilesForMessages(messageIds),
-    getPendingMediaGroupsDue: (ageMs) => telegramContent.getPendingMediaGroupsDue(ageMs),
+    getPendingMediaGroupsDue: (quietMs) => telegramContent.getPendingMediaGroupsDue(quietMs),
 
     claimTurn: (turn) => turns.claim(turn),
     turnPersistence: (conversationId, epoch) => {
