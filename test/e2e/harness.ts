@@ -388,7 +388,9 @@ export const kube = {
   /** The newest pod of the Deployment that runs ready. */
   runningPod: async (namespace: string, deployment: string): Promise<string> => {
     const workload = await kube.get<V1Deployment>(ref("Deployment", deployment, namespace));
-    const pods = await kube.list<V1Pod>("Pod", { namespace, labelSelector: selectorOf(workload?.spec?.selector.matchLabels ?? {}) });
+    // No selector would be every pod of the namespace.
+    if (!workload?.spec?.selector.matchLabels) throw new Error(`the deployment ${namespace}/${deployment} selects no pod by its labels: ${workload ? "it has no matchLabels" : "there is none"}`);
+    const pods = await kube.list<V1Pod>("Pod", { namespace, labelSelector: selectorOf(workload.spec.selector.matchLabels) });
     const running = pods
       .filter((pod) => pod.status?.phase === "Running" && !pod.metadata?.deletionTimestamp && podProblems(pod).length === 0)
       .sort((a, b) => new Date(b.metadata?.creationTimestamp ?? 0).getTime() - new Date(a.metadata?.creationTimestamp ?? 0).getTime());

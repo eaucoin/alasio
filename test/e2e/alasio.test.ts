@@ -752,7 +752,7 @@ if (inShard("sessions")) {
       const sessionName = session.metadata?.name ?? "";
       const pods: [string, string][] = [
         [NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)],
-        [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("lake"))],
+        [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("lake-query"))],
         [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("grafana"))],
         [SESSIONS, sessionName],
       ];
