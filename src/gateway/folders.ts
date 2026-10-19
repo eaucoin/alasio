@@ -27,7 +27,8 @@
  * (failingLease), so every replica of the gateway holds it alike, and they are counted, of
  * every key held so (alasio.gateway.folders.failing), and listed (`GET /folders`) with each
  * instance: its key, its pod, since when it is bound, when its bayma last ran an exec, and its
- * binds' last failure.
+ * binds' last failure. What a bind of a key under way waits on, its pods say, is answered of
+ * the key a caller's token names (`GET /folders/starting`), as alasio tells the turn it waits.
  */
 import { randomBytes } from "node:crypto";
 
@@ -37,7 +38,7 @@ import { Clock, Effect, Schema, type Scope } from "effect";
 
 import { type Binder, BindStepFailed } from "../binder/binder.ts";
 import { heldLeases } from "../binder/bindings.ts";
-import { KEY_ANNOTATION, keyHash, type Pool } from "../binder/names.ts";
+import { BINDING_LABEL, KEY_ANNOTATION, keyHash, type Pool } from "../binder/names.ts";
 import { type Answer, type Operation, type Placement, PlacementRefused } from "../binder/server.ts";
 import type { TokenClaims } from "../binder/tokens.ts";
 import { baymaIdleness, IDLE_POLL_MS, makeSweep } from "../binder/sweep.ts";
@@ -368,12 +369,35 @@ export const makeFolders = Effect.fnUntraced(function*(
     return [...bound, ...released].sort((a, b) => a.key.localeCompare(b.key));
   });
 
+  /**
+   * What a bind of `key` under way waits on, as its pods say, worded to follow "its folder's
+   * bayma": its instance before saving its REPL sessions, its image being pulled, its pod
+   * pending, or its bayma starting; null where its pod serves, or it has none.
+   */
+  const startingOf = (key: string): Effect.Effect<string | null, KubeApiError> =>
+    Effect.gen(function*() {
+      const pods = ((yield* kube.list("v1", "Pod", namespace, `${BINDING_LABEL}=${keyHash(key)}`)) as V1Pod[]).filter((pod) => pod.metadata?.annotations?.[KEY_ANNOTATION] === key);
+      if (pods.some((pod) => pod.metadata?.deletionTimestamp !== undefined)) return "whose instance before is saving its REPL sessions";
+      const [pod] = pods;
+      if (!pod || pod.status?.conditions?.some(({ type, status }) => type === "Ready" && status === "True")) return null;
+      const bayma = pod.status?.containerStatuses?.find(({ name }) => name === BAYMA_CONTAINER);
+      if (bayma?.state?.running !== undefined) return "whose bayma is starting";
+      const scheduled = pod.status?.conditions?.find(({ type }) => type === "PodScheduled");
+      if (scheduled?.status === "False") return `whose pod is pending: ${scheduled.message ?? scheduled.reason ?? "not scheduled"}`;
+      if (bayma?.state?.waiting?.reason === "ContainerCreating" || (bayma === undefined && scheduled?.status === "True")) return "whose image is being pulled";
+      return "whose pod is starting";
+    });
+
   const operate = (claims: TokenClaims, { method, path }: Operation): Effect.Effect<Answer> =>
     Effect.gen(function*() {
       if (claims.options?.["environment"] !== main) return { status: 403, json: { error: `the folder instances are main's alone, not ${claims.options?.["environment"] ?? "unsaid"}'s` } };
+      if (method === "GET" && path === "/folders/starting") {
+        if (!folderOfKey(claims.key)) return { status: 404, json: { error: `${claims.key} is no folder instance's` } };
+        return { status: 200, json: { starting: yield* startingOf(claims.key) } };
+      }
       if (method !== "GET" || path !== "/folders") return { status: 404, json: { error: `no ${method} ${path}` } };
       return { status: 200, json: { folders: yield* list } };
-    }).pipe(Effect.catch((error) => Effect.succeed({ status: 503, json: { error: `the folder instances could not be listed: ${error.message}` } })));
+    }).pipe(Effect.catch((error) => Effect.succeed({ status: 503, json: { error: `the folder instances could not be read: ${error.message}` } })));
 
   /** Counts the keys held, for the gauge. */
   const countHeld = Effect.gen(function*() {

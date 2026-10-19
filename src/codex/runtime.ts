@@ -75,6 +75,8 @@ export interface CodexScopeParams {
   readonly folderBayma?: FolderBayma | undefined;
   /** The chat to tell of a folder's bayma that did not start: a turn's; none for a call no operator waits on. */
   readonly noticeChatId?: string | undefined;
+  /** What says in a turn's status what its folder's bayma's long bind waits on: a turn's; none for a call no operator waits on. */
+  readonly waiting?: ((what: string | null) => Effect.Effect<void>) | undefined;
 }
 
 export interface ForkCodexSessionParams extends CodexScopeParams {
@@ -123,8 +125,9 @@ const folderCodexScope = ({
   appServer,
   folderBayma = noFolderBayma,
   noticeChatId,
+  waiting,
 }: Omit<CodexScopeParams, "scope">): Effect.Effect<CodexScope, CodexScopeError> =>
-  folderBayma({ harness: CODEX_HARNESS, threadKey, workingDirectory, chatId: noticeChatId }).pipe(
+  folderBayma({ harness: CODEX_HARNESS, threadKey, workingDirectory, chatId: noticeChatId, waiting }).pipe(
     Effect.mapError((cause) => new CodexScopeError({ cause })),
     Effect.map(({ server, notice }) => {
       const codexEnv = buildCodexEnv();
@@ -283,7 +286,9 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
 
   /** The turn's events, read to their end, in a scope the transport keeps what it runs in. */
   const readEvents = Effect.scoped(Effect.gen(function*() {
-    const { cwd, codexEnv, codexConfig, appServer, baymaNotice } = yield* codexScope({ ...params, noticeChatId: params.chatId });
+    const waiting = (what: string | null) =>
+      persistence.setWaiting(what).pipe(Effect.catch((error) => Effect.logWarning(`could not say thread=${threadKey} waits on ${what ?? "nothing"}: ${error.message}`)));
+    const { cwd, codexEnv, codexConfig, appServer, baymaNotice } = yield* codexScope({ ...params, noticeChatId: params.chatId, waiting });
     yield* turnTimer("env.built");
     yield* turnTimer("bayma.ready");
     const streamParams: CodexStreamParams = {

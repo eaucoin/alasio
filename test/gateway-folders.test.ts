@@ -249,6 +249,39 @@ test("binds of a folder instance failing at once, as on two replicas, are each c
   }
 });
 
+test("what a folder instance's bind under way waits on is answered of the key a token of main's names, as its pods say", async () => {
+  const stand = await bayma();
+  try {
+    const of = await foldersOf(stand.port);
+    const asked = async (key: string, environment = "main") => {
+      const answered = await Effect.runPromise(Effect.provide(of.folders.operate({ key, expires: Date.now() + 60_000, options: { environment } }, { method: "GET", path: "/folders/starting", query: new URLSearchParams(), body: new Uint8Array() }), Layer.fresh(KubeClient.layer)));
+      return answered.status === 200 ? (answered.json as { starting: string | null }).starting : answered.status;
+    };
+    const podOf = async (key: string, name: string, status: object | null, deleting = false) => {
+      const labels = { "alasio.dev/pool": FOLDER_POOL, [BINDING_LABEL]: keyHash(key) };
+      await run(withKube((kube) => kube.create({ apiVersion: "v1", kind: "Pod", metadata: { name, namespace: of.namespace, labels, annotations: { [KEY_ANNOTATION]: key }, ...(deleting ? { finalizers: ["alasio.dev/test"] } : {}) }, spec: { containers: [{ name: "bayma", image: "bayma" }] } })));
+      if (status) await run(withKube((kube) => kube.patchPodStatus(of.namespace, name, { status })));
+      if (deleting) await run(withKube((kube) => kube.remove("v1", "Pod", of.namespace, name)));
+    };
+    const container = (ready: boolean, state: object) => ({ name: "bayma", image: "bayma", imageID: "", ready, restartCount: 0, containerID: "containerd://c-0", state });
+    const key = (name: string) => folderKey("claude", `telegram:${name}`);
+    await podOf(key("saving"), "bayma-saving", null, true);
+    await podOf(key("pulling"), "bayma-pulling", { phase: "Pending", conditions: [{ type: "PodScheduled", status: "True" }], containerStatuses: [container(false, { waiting: { reason: "ContainerCreating" } })] });
+    await podOf(key("pending"), "bayma-pending", { phase: "Pending", conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: "0/1 nodes are available" }] });
+    await podOf(key("starting"), "bayma-starting", { phase: "Running", conditions: [{ type: "PodScheduled", status: "True" }], containerStatuses: [container(false, { running: {} })] });
+    await podOf(key("serving"), "bayma-serving", { phase: "Running", conditions: [{ type: "Ready", status: "True" }], containerStatuses: [container(true, { running: {} })] });
+    assert.deepEqual(
+      [await asked(key("saving")), await asked(key("pulling")), await asked(key("pending")), await asked(key("starting")), await asked(key("serving")), await asked(key("none"))],
+      ["whose instance before is saving its REPL sessions", "whose image is being pulled", "whose pod is pending: 0/1 nodes are available", "whose bayma is starting", null, null],
+    );
+    // Main's alone, of a folder's key alone.
+    assert.deepEqual([await asked(key("pulling"), "try"), await asked("sessionfs:fs-1")], [403, 404]);
+    await run(withKube((kube) => kube.patch("v1", "Pod", of.namespace, "bayma-saving", { metadata: { finalizers: null } })));
+  } finally {
+    stand.close();
+  }
+});
+
 test("a held folder instance's restart, its caller's release, forgets its binds' failures, bound or not, so its next bind goes on", async () => {
   const stand = await bayma();
   try {

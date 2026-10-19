@@ -109,6 +109,7 @@ test("a bind asked ahead is asked again while the gateway's pool has no pod for 
 test("a folder conversation's instance is reached, bound and released through the gateway by a caller's token of its folder key, of its environment alone; a bind that failed is not asked again, saying why, and whether it is held", async (t) => {
   let binds = 0;
   const { asked, workspaces } = await gateway(t, ({ url }) => {
+    if (url === "/folders/starting") return { status: 200, body: JSON.stringify({ starting: "whose image is being pulled" }) };
     if (url !== "/bind") return { status: 204 };
     binds += 1;
     if (binds === 1) return { status: 503, body: JSON.stringify({ error: "folder:claude:telegram:42 could not be bound now", reason: "its pod is pending: no node" }) };
@@ -126,10 +127,13 @@ test("a folder conversation's instance is reached, bound and released through th
   // As the operator asks, its token saying so.
   await run(workspaces.folders.bind(scope, { retry: true }));
   await run(workspaces.folders.release(scope));
+  // What a bind of it under way waits on, as the gateway answers it.
+  assert.equal(await run(workspaces.folders.starting(scope)), "whose image is being pulled");
   assert.deepEqual(asked.map(({ method, url, claims: of }) => `${method} ${url} ${of?.key} ${of?.options?.["retry"] ?? ""}`), [
     "POST /bind folder:claude:telegram:42 ",
     "POST /bind folder:claude:telegram:42 ",
     "POST /bind folder:claude:telegram:42 1",
     "POST /release folder:claude:telegram:42 ",
+    "GET /folders/starting folder:claude:telegram:42 ",
   ]);
 });

@@ -1240,7 +1240,10 @@ test("a turn whose folder's bayma did not start runs without it, told so before 
   assert.equal(cli.state.created, 2);
   // Its folder and its chat given, so a turn's failed bind is told there; bound before every turn.
   assert.equal(asked.length, 4);
-  assert.deepEqual(asked[0], { threadKey: "telegram:1", workingDirectory: "/work", chatId: turnParams(persistence).chatId });
+  const [first] = asked;
+  assert.deepEqual({ threadKey: first?.threadKey, workingDirectory: first?.workingDirectory, chatId: first?.chatId }, { threadKey: "telegram:1", workingDirectory: "/work", chatId: turnParams(persistence).chatId });
+  // And what says in the turn's status what a long bind of it waits on.
+  assert.equal(typeof first?.waiting, "function");
   await closeAll();
 });
 
@@ -1255,7 +1258,12 @@ test("a reused process's folder bayma is bound before each of its turns, and a t
     workingDirectory: "/work",
     sessions: { sessionExists: () => Effect.succeed(true) },
     queryFactory: cli.queryFactory,
-    folderBayma: (scope) => Effect.sync((): FolderBaymaOutcome => ((asked += 1), failing ? { server: null, notice } : { server: folderServer(scope), notice: null })),
+    // A long bind says what it waits on in the turn's status, then that it waits no more.
+    folderBayma: (scope) =>
+      Effect.andThen(
+        failing ? Effect.void : Effect.andThen(scope.waiting?.("its folder's bayma, whose image is being pulled") ?? Effect.void, scope.waiting?.(null) ?? Effect.void),
+        Effect.sync((): FolderBaymaOutcome => ((asked += 1), failing ? { server: null, notice } : { server: folderServer(scope), notice: null })),
+      ),
   }, activeTurns);
   const run = async (prompt: string) => {
     const turn = runTurn(liveSessions, turnParams(persistence, { prompt }));
@@ -1272,6 +1280,7 @@ test("a reused process's folder bayma is bound before each of its turns, and a t
   failing = false;
   assert.equal(await run("three"), "three");
   assert.deepEqual([asked, cli.state.created], [3, 1], "bound before each turn, the process kept");
+  assert.deepEqual(persistence.state.waits.slice(0, 2), ["its folder's bayma, whose image is being pulled", null], "said in the turn's status");
   await closeAll();
 });
 

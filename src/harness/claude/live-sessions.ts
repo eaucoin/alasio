@@ -256,6 +256,10 @@ const attempt = <A>(evaluate: () => Promise<A>): Effect.Effect<A, ClaudeCodeErro
 const needed = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, ClaudeCodeError> =>
   Effect.mapError(effect, (cause) => new ClaudeCodeError({ cause }));
 
+/** What says, in the status of the turn of `params`, what its folder's bayma's bind waits on, as a long one does, and that it waits no more (null). */
+const waitingOf = (params: TurnParams) => (what: string | null): Effect.Effect<void> =>
+  params.persistence.setWaiting(what).pipe(Effect.catch((error) => Effect.logWarning(`could not say thread=${params.threadKey} waits on ${what ?? "nothing"}: ${error.message}`)));
+
 /** Now, as a log line gives it. */
 const now = Effect.map(Clock.currentTimeMillis, (millis) => new Date(millis).toISOString());
 
@@ -915,7 +919,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     // reused finds its bayma bound anew at the same address, its MCP client initializing a
     // session anew (test/bayma-reconnect.test.ts); one that started without it starts anew once
     // it has it.
-    const folder = bayma ? null : yield* needed(folderBayma({ threadKey: params.threadKey, workingDirectory, chatId: params.chatId }));
+    const folder = bayma ? null : yield* needed(folderBayma({ threadKey: params.threadKey, workingDirectory, chatId: params.chatId, waiting: waitingOf(params) }));
     if (reusable && folder !== null && folder.server === null) {
       existing.baymaNotice = folder.notice;
       return existing;

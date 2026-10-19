@@ -28,15 +28,16 @@ function fakeFolders(binds: () => Effect.Effect<void, FolderBindFailed | Gateway
     bind: (scope: FolderScope, { retry = false }: { readonly retry?: boolean } = {}) => Effect.andThen(Effect.sync(() => void calls.push(`bind${retry ? " retry" : ""} ${scope.harness} ${scope.threadKey}`)), binds()),
     release: (scope: FolderScope) => Effect.sync(() => void calls.push(`release ${scope.harness} ${scope.threadKey}`)),
     endpoint: (scope: FolderScope) => Effect.sync(() => (calls.push(`endpoint ${scope.harness} ${scope.threadKey}`), { url: BAYMA.url, headers: BAYMA.headers })),
+    starting: (_scope: FolderScope) => Effect.succeed<string | null>(null),
   };
   return { calls, folders };
 }
 
 /** Runs `use` of HostBayma on `folders`, on a store holding the conversation telegram:42 and Telegram recording into `telegram`. */
-async function withHostBayma<A>(folders: GatewayWorkspaces["folders"], telegram: RecordingTelegram, use: (host: HostBayma["Service"]) => Effect.Effect<A>): Promise<A> {
+async function withHostBayma<A>(folders: GatewayWorkspaces["folders"], telegram: RecordingTelegram, use: (host: HostBayma["Service"]) => Effect.Effect<A>, timing: Parameters<typeof HostBayma.layer>[1] = {}): Promise<A> {
   const store = await testStore();
   await run(store.upsertConversation({ chatId: 42, user: { id: 1 } }));
-  return Effect.runPromise(Effect.flatMap(HostBayma, use).pipe(Effect.provide(HostBayma.layer(folders).pipe(Layer.provide(Layer.merge(Layer.succeed(Store, store), telegram.layer))))));
+  return Effect.runPromise(Effect.flatMap(HostBayma, use).pipe(Effect.provide(HostBayma.layer(folders, timing).pipe(Layer.provide(Layer.merge(Layer.succeed(Store, store), telegram.layer))))));
 }
 
 const SCOPE = { harness: "claude", threadKey: "telegram:42", workingDirectory: "/home/op/repo" } as const;
@@ -89,6 +90,32 @@ test("a restart of a folder instance being bound or released says its failed bin
       held = false;
     }));
   assert.equal(telegram.calls.sendMessage.length, 2, "held, told again after the restart");
+});
+
+test("a bind that waits long says in its turn's status what it waits on, as the gateway answers it, until it goes through, and degrades nothing; a quick one says nothing", async () => {
+  const telegram = recordingTelegram();
+  let bindFor = 300;
+  const answers = ["whose instance before is saving its REPL sessions", "whose instance before is saving its REPL sessions", "whose image is being pulled"];
+  const folders = {
+    ...fakeFolders(() => Effect.void).folders,
+    bind: () => Effect.as(Effect.sleep(bindFor), "binding-1"),
+    starting: () => Effect.sync(() => answers.shift() ?? "whose bayma is starting"),
+  };
+  const said: (string | null)[] = [];
+  const waiting = (what: string | null) => Effect.sync(() => void said.push(what));
+  const [slow, quick] = await withHostBayma(folders, telegram, (host) =>
+    Effect.gen(function*() {
+      const slow = yield* host.ensure({ ...SCOPE, chatId: "42", waiting });
+      bindFor = 10;
+      const quick = yield* host.ensure({ ...SCOPE, chatId: "42", waiting });
+      return [slow, quick];
+    }), { toldAfterMs: 100, askedEveryMs: 50 });
+  assert.deepEqual([slow?.server, quick?.server], [BAYMA, BAYMA]);
+  // Each change said once, then that it waits no more.
+  assert.deepEqual(said.slice(0, 2), ["its folder's bayma, whose instance before is saving its REPL sessions", "its folder's bayma, whose image is being pulled"]);
+  assert.equal(said.at(-1), null);
+  assert.equal(said.filter((what) => what === null).length, 1, "the quick bind said nothing");
+  assert.deepEqual(telegram.calls.sendMessage, [], "nothing degraded, so the chat told nothing");
 });
 
 test("a retry that fails says why, and a restart the gateway refuses says it was not", async () => {

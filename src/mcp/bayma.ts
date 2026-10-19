@@ -15,8 +15,13 @@
  * buttons to bind it again now and to restart it (FOLDER_RETRY, FOLDER_RESTART). Three binds
  * failing in a row hold the instance, as the gateway says: its binds are refused at once until
  * the operator asks again, which the chat says once.
+ *
+ * A bind waits as long as the gateway gives it, as an instance before it saves its REPL
+ * sessions, or its image is pulled. One that has waited BIND_TOLD_AFTER_MS says what it waits
+ * on in the turn's status, as the gateway answers it (`waiting`), asked again every
+ * BIND_ASKED_EVERY_MS, until it ends; it degrades the turn only where it fails.
  */
-import { Context, Effect, Layer, Option, Schema } from "effect";
+import { Context, Effect, Fiber, Layer, Option, Ref, Schema } from "effect";
 
 import { type ButtonDraft, keepPanel, sendPanel } from "../operator/panel.ts";
 import { Store } from "../persistence/store.ts";
@@ -34,11 +39,20 @@ export interface BaymaMcpServer extends BaymaEndpoint {
 /** One conversation under one harness, whose bayma it is. */
 export type HostBaymaScope = FolderScope;
 
-/** A conversation's folder under a harness, as a harness asks for its bayma: the folder, and the chat to tell of a bind that fails, where a turn asks. */
+/**
+ * A conversation's folder under a harness, as a harness asks for its bayma: the folder, and
+ * the chat to tell of a bind that fails, where a turn asks; and, where a turn asks, what says
+ * in its status what a long bind waits on, and that it waits no more (null).
+ */
 export interface FolderBaymaScope extends FolderScope {
   readonly workingDirectory: string;
   readonly chatId?: string | undefined;
+  readonly waiting?: ((what: string | null) => Effect.Effect<void>) | undefined;
 }
+
+/** How long a bind waits before the turn's status says what it waits on, and how often it is asked again after. */
+export const BIND_TOLD_AFTER_MS = 120_000;
+export const BIND_ASKED_EVERY_MS = 15_000;
 
 /** A folder workspace's bayma for a turn: its server; or none, the turn running without it, and why, for the harness to put before the turn's prompt. */
 export type FolderBaymaOutcome =
@@ -77,12 +91,38 @@ export class HostBayma extends Context.Service<HostBayma, {
   /** Lets the instance go, saved whole as it stops, so the next bind makes it anew: what to tell the operator. */
   readonly restart: (scope: HostBaymaScope) => Effect.Effect<string>;
 }>()("alasio/mcp/HostBayma") {
-  static readonly layer = (folders: GatewayWorkspaces["folders"]): Layer.Layer<HostBayma, never, Store | TelegramClient> =>
+  static readonly layer = (
+    folders: GatewayWorkspaces["folders"],
+    { toldAfterMs = BIND_TOLD_AFTER_MS, askedEveryMs = BIND_ASKED_EVERY_MS }: { readonly toldAfterMs?: number; readonly askedEveryMs?: number } = {},
+  ): Layer.Layer<HostBayma, never, Store | TelegramClient> =>
     Layer.effect(
       HostBayma,
       Effect.gen(function*() {
         const store = yield* Store;
         const telegram = yield* TelegramClient;
+
+        /**
+         * `binding`, the bind of `scope`'s folder instance, said in its turn's status, once it has
+         * waited `toldAfterMs`, to wait on what the gateway says it waits on, asked again every
+         * `askedEveryMs`; and to wait no more as it ends, where it was said to.
+         */
+        const told = <A, E>(scope: FolderBaymaScope, binding: Effect.Effect<A, E>): Effect.Effect<A, E> => {
+          const waiting = scope.waiting;
+          if (waiting === undefined) return binding;
+          return Effect.gen(function*() {
+            const said = yield* Ref.make<string | null>(null);
+            const saying = yield* Effect.forkChild(Effect.gen(function*() {
+              yield* Effect.sleep(toldAfterMs);
+              for (;;) {
+                const starting = yield* folders.starting(scope).pipe(Effect.orElseSucceed(() => null));
+                const what = `its folder's bayma, ${starting ?? "which is starting"}`;
+                if ((yield* Ref.getAndSet(said, what)) !== what) yield* waiting(what);
+                yield* Effect.sleep(askedEveryMs);
+              }
+            }));
+            return yield* binding.pipe(Effect.ensuring(Effect.andThen(Fiber.interrupt(saying), Effect.flatMap(Ref.get(said), (was) => (was === null ? Effect.void : waiting(null))))));
+          });
+        };
         /** The folder instances whose chat was told they are held, until a bind of one goes through. */
         const toldHeld = new Set<string>();
         const server = (scope: HostBaymaScope) => Effect.map(folders.endpoint(scope), (endpoint): BaymaMcpServer => ({ type: "http", ...endpoint }));
@@ -105,7 +145,7 @@ export class HostBayma extends Context.Service<HostBayma, {
           ensure: (scope) =>
             Effect.gen(function*() {
               const key = folderKey(scope.harness, scope.threadKey);
-              const bound = yield* Effect.result(folders.bind(scope));
+              const bound = yield* Effect.result(told(scope, folders.bind(scope)));
               if (bound._tag === "Success") {
                 toldHeld.delete(key);
                 return { server: yield* server(scope), notice: null };

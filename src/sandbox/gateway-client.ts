@@ -69,6 +69,9 @@ export class FolderBindFailed extends Schema.TaggedError<FolderBindFailed>()("Fo
 /** What the gateway says of a failed bind: why, and whether it holds the key. */
 const BindRefusal = Schema.Struct({ reason: Schema.optional(Schema.String), held: Schema.optional(Schema.Boolean) });
 
+/** What the gateway says a folder instance's bind under way waits on. */
+const StartingAnswer = Schema.Struct({ starting: Schema.NullOr(Schema.String) });
+
 /** A bind refused as its pool had no pod for it in time, to be asked again after what it said. */
 class NotYet extends Schema.TaggedError<NotYet>()("NotYet", { reason: Schema.String }) {}
 
@@ -103,6 +106,8 @@ export interface GatewayWorkspaces {
     /** Its bind, once, as its pod is made and its bayma starts: refused, saying why, where it failed, or the gateway holds it; `retry` binds one held. */
     readonly bind: (scope: FolderScope, options?: { readonly retry?: boolean }) => Effect.Effect<void, GatewayError | FolderBindFailed>;
     readonly release: (scope: FolderScope) => Effect.Effect<void, GatewayError>;
+    /** What a bind of it under way waits on, worded to follow "its folder's bayma" (whose image is being pulled); null where none is. */
+    readonly starting: (scope: FolderScope) => Effect.Effect<string | null, GatewayError>;
   };
 }
 
@@ -208,6 +213,14 @@ export function makeGatewayWorkspaces({ url, environment, callerKey }: GatewayWo
       release: ({ harness, threadKey }) => {
         const what = `release the folder instance of ${threadKey} under ${harness}`;
         return askAs(what, tokenFor(folderKey(harness, threadKey), {}), "POST", "/release", { timeoutMs: FOLDER_CALL_TIMEOUT_MS }).pipe(Effect.flatMap(expect(what, [204])), Effect.asVoid);
+      },
+      starting: ({ harness, threadKey }) => {
+        const what = `say what the bind of the folder instance of ${threadKey} under ${harness} waits on`;
+        return askAs(what, tokenFor(folderKey(harness, threadKey), {}), "GET", "/folders/starting").pipe(
+          Effect.flatMap(expect(what, [200])),
+          Effect.flatMap(({ bytes }) => json(what, StartingAnswer)(bytes)),
+          Effect.map(({ starting }) => starting),
+        );
       },
     },
     release: (volumeId, mode) => {

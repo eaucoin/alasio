@@ -39,7 +39,7 @@ function gateway({ files = new Map<string, Uint8Array>(), there = new Set<string
       }),
     writeFile: (volumeId, path, bytes) => Effect.sync(() => (asked.push(`write ${volumeId} ${path}`), void files.set(path, bytes))),
     fork: (volumeId, into) => Effect.andThen(Effect.sync(() => void asked.push(`fork ${volumeId} ${into.environment}/${into.workspace}`)), refused("fork")),
-    folders: { endpoint: () => Effect.die("no folder"), bind: () => Effect.die("no folder"), release: () => Effect.die("no folder") },
+    folders: { endpoint: () => Effect.die("no folder"), bind: () => Effect.die("no folder"), release: () => Effect.die("no folder"), starting: () => Effect.die("no folder") },
   };
 }
 
