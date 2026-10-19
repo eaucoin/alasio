@@ -10,25 +10,17 @@
  * it, handling it or marking it processed, is not: the group is left without being told
  * of it, and joined again, so it is handed over again, and handled, once the store answers.
  */
-import { readFileSync } from "node:fs";
-
 import type { Update } from "@grammyjs/types";
-import { Consumer, MessagesStreamFallbackModes, MessagesStreamModes } from "@platformatic/kafka";
 import { Context, Effect, Layer, Schema } from "effect";
 
+import { joinTopic, type TopicLog } from "../log/topic.ts";
 import { withLogScope } from "../shared/log.ts";
 
 /** How long consuming waits after its member of the group failed before it joins again. */
 const REJOIN_BACKOFF = "3 seconds";
 
 /** Where the environment's updates are: the log's brokers, its principal on them, its topic and its group. */
-export interface TelegramLog {
-  readonly brokers: readonly string[];
-  readonly username: string;
-  readonly passwordFile: string;
-  readonly topic: string;
-  readonly group: string;
-}
+export type TelegramLog = TopicLog;
 
 /** A record of the topic: its update (null for one that is none), where it is, and what tells the group it is handled. */
 export interface ReceivedUpdate {
@@ -57,7 +49,7 @@ export class TelegramUpdates extends Context.Service<TelegramUpdates, {
   /** The environment's group on the log, as `log` says it, with @platformatic/kafka, alasio's one Kafka client. */
   static readonly layer = (log: TelegramLog): Layer.Layer<TelegramUpdates> =>
     Layer.succeed(TelegramUpdates, TelegramUpdates.of({
-      join: Effect.tryPromise({ try: () => joinTopic(log), catch: (error) => new UpdateFeedError({ message: `joining ${log.group} on ${log.topic}: ${errorText(error)}` }) }),
+      join: Effect.tryPromise({ try: () => joinUpdates(log), catch: (error) => new UpdateFeedError({ message: `joining ${log.group} on ${log.topic}: ${errorText(error)}` }) }),
     }));
 }
 
@@ -72,35 +64,11 @@ function updateOf(value: Buffer | undefined): Update | null {
 }
 
 /** Joins `log`'s group on its topic, reading from where the group was last told, or from the topic's start. */
-async function joinTopic(log: TelegramLog): Promise<UpdateFeed> {
-  const consumer = new Consumer({
-    clientId: log.username,
-    groupId: log.group,
-    bootstrapBrokers: [...log.brokers],
-    // Read at each join, as the kubelet keeps the Secret's file.
-    sasl: { mechanism: "SCRAM-SHA-512", username: log.username, password: readFileSync(log.passwordFile, "utf8").trim() },
-    autocommit: false,
-    maxWaitTime: 1_000,
-  });
-  let stream;
-  try {
-    stream = await consumer.consume({ topics: [log.topic], mode: MessagesStreamModes.COMMITTED, fallbackMode: MessagesStreamFallbackModes.EARLIEST, autocommit: false });
-  } catch (error) {
-    await consumer.close(true).catch(() => {});
-    throw error;
-  }
-  const records = stream[Symbol.asyncIterator]();
+async function joinUpdates(log: TelegramLog): Promise<UpdateFeed> {
+  const feed = await joinTopic(log, "earliest");
   return {
-    async next() {
-      const read = await records.next();
-      if (read.done) throw new Error("the topic's stream of records ended");
-      const record = read.value;
-      return { update: updateOf(record.value), position: `${record.topic}/${record.partition}/${record.offset}`, commit: () => record.commit() as Promise<void> };
-    },
-    async close() {
-      await stream.close().catch(() => {});
-      await consumer.close(true);
-    },
+    next: () => feed.next().then(({ value, position, commit }) => ({ update: updateOf(value), position, commit })),
+    close: feed.close,
   };
 }
 
