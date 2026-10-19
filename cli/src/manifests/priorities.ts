@@ -6,12 +6,14 @@
  * and the log), whose claims a local disk binds to its node. Then, two classes of one value:
  * the rest of the floor, what never sleeps (Neon's proxy and neon-control, and main's
  * compute while it runs, the object store's filers and gateways, workspace storage's
- * metadata and each node's mount of it, main's lake, Grafana, the collector and the controllers); and the pods that
+ * metadata and each node's mount of it, main's lake, Grafana, the collector and the controllers,
+ * and the Jobs applying alasio waits for, which alasio up fails without); and the pods that
  * run turns, alasio's own, sessions' and folder workspaces' bayma. Of one value, neither
  * takes the other's place: no Grafana scaled up, nor a pod of the floor recreated, ends a
  * turn. Then alasio's other components, which sleep or run once (branch environments'
- * computes and lakes, Jobs); and last the headroom's placeholders, which take no pod's
- * place and any pod takes theirs. Kubelet, short of memory, evicts the lowest first.
+ * computes and lakes, the Jobs of schedules and of alasio's other commands); and last the
+ * headroom's placeholders, which take no pod's place and any pod takes theirs. Kubelet,
+ * short of memory, evicts the lowest first.
  *
  * A pod of a class above another's takes its place to be scheduled where there is no
  * room for it (autoscaling.preemption), alasio's and, where alasio shares the cluster,

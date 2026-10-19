@@ -1,8 +1,8 @@
 /**
  * Each workload's VerticalPodAutoscaler, beside it in its component's manifest: VPA
  * (./vpa.ts) recommends every container's requests from what it uses, between a floor as
- * small as alasio's smallest components use and the container's memory limit, and leaves
- * limits as they are. How it applies them is the workload's sizing:
+ * small as alasio's smallest components use and a ceiling, half a core of CPU and the
+ * container's memory limit, and leaves limits as they are. How it applies them is the workload's sizing:
  *
  * - `InPlace`, for what keeps no state and runs no turn: its running pods resized in place
  *   where the cluster resizes pods (Kubernetes' in-place pod resize), and never recreated
@@ -27,6 +27,15 @@ const UPDATE_MODES: Readonly<Record<Sizing, string>> = { InPlace: "InPlace", Rec
 
 /** The least any container is recommended: a little under what alasio's smallest components use (a storage broker's 13 MiB, a Valkey's 6). */
 const MIN_ALLOWED = { cpu: "5m", memory: "16Mi" };
+/**
+ * The most CPU any container is recommended. alasio's containers have no CPU limit, and use
+ * what is spare beside their requests; a recommendation follows what one used, bursts and
+ * all, and each workload's is made alone. On a node of 3.5 CPU (CI), the lake's reader came
+ * to request 977m and the object store's gateway 832m, and the stack 3.8 CPU in all, so
+ * that nothing more was scheduled, not even a Job of alasio up's. Half a core at most each,
+ * those two, and the rest as they were, request 3.0.
+ */
+const MAX_ALLOWED_CPU = "500m";
 
 /** A VerticalPodAutoscaler, as far as alasio writes and reads one: its target, how it applies its recommendation, and its recommendation. */
 export interface VerticalPodAutoscaler extends KubernetesObject {
@@ -64,7 +73,7 @@ export function verticalPodAutoscaler(workload: V1Deployment | V1StatefulSet | V
             containerName: name,
             ...(controlled.length < 2 ? { controlledResources: controlled } : {}),
             minAllowed: MIN_ALLOWED,
-            ...(memory ? { maxAllowed: { memory } } : {}),
+            maxAllowed: { cpu: MAX_ALLOWED_CPU, ...(memory ? { memory } : {}) },
             controlledValues: "RequestsOnly",
           };
         }),
