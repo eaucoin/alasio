@@ -2041,7 +2041,7 @@ describe("workspace storage", () => {
   test("keeps its metadata in a Valkey configured as JuiceFS's Redis best practices say", () => {
     const objects = install({ workspaceStorage: { valkey: { maxmemory: "256mb" } } });
     const conf = one<V1ConfigMap>(objects, "ConfigMap", "alasio-valkey").data?.["valkey.conf"]?.split("\n") ?? [];
-    for (const line of ["appendonly yes", "appendfsync everysec", "aof-use-rdb-preamble yes", "save 3600 1 300 100 60 10000", "stop-writes-on-bgsave-error yes"]) {
+    for (const line of ["appendonly yes", "appendfsync always", "aof-use-rdb-preamble yes", "save 3600 1 300 100 60 10000", "stop-writes-on-bgsave-error yes"]) {
       assert.ok(conf.includes(line), line);
     }
     assert.ok(conf.includes("maxmemory 256mb"));

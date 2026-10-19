@@ -5,9 +5,12 @@
  * practices (administration/metadata/redis_best_practices.md at juicedata/juicefs v1.4.1)
  * say, which suit both:
  *
- * - durability: snapshots and an append-only file together, the file fsynced every second
- *   and written with a snapshot as its preamble, so a rewrite is a snapshot; at a start the
- *   file is loaded, as the more complete, and the server is ready only once it has been;
+ * - durability: snapshots and an append-only file together, the file fsynced before each
+ *   write is answered (`appendfsync always`), as a client's fsync, JuiceFS's of a file
+ *   among them, is answered only once its metadata is written, and a server killed then
+ *   loses none of it, where once a second loses what it answered in the second before; and
+ *   written with a snapshot as its preamble, so a rewrite is a snapshot; at a start the file
+ *   is loaded, as the more complete, and the server is ready only once it has been;
  * - memory: a `maxmemory` under the container's limit, leaving room for the fork that
  *   writes snapshots and for deletions once it is reached, and the policy `noeviction`, as
  *   an evicted key is lost metadata.
@@ -70,7 +73,7 @@ export function valkeyConf(maxmemory: string): string {
     `port ${VALKEY_PORT}`,
     "dir /data",
     "appendonly yes",
-    "appendfsync everysec",
+    "appendfsync always",
     "aof-use-rdb-preamble yes",
     "save 3600 1 300 100 60 10000",
     // Writes stop, rather than go unsaved, when a snapshot cannot be written.
