@@ -23,6 +23,7 @@ export interface AppServerRequests {
   initialize: { params: InitializeRequestParams; result: InitializeResponse };
   "thread/loaded/list": { params: ProtocolParams<"thread/loaded/list">; result: v2.ThreadLoadedListResponse };
   "thread/resume": { params: ProtocolParams<"thread/resume">; result: v2.ThreadResumeResponse };
+  "thread/unsubscribe": { params: ProtocolParams<"thread/unsubscribe">; result: v2.ThreadUnsubscribeResponse };
   "thread/start": { params: ProtocolParams<"thread/start">; result: v2.ThreadStartResponse };
   "thread/fork": { params: ProtocolParams<"thread/fork">; result: v2.ThreadForkResponse };
   "thread/list": { params: ProtocolParams<"thread/list">; result: v2.ThreadListResponse };

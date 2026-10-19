@@ -62,7 +62,7 @@ import {
   storeBlocks,
 } from "../../codex/event-projection.ts";
 import { createTurnTimer, type TurnTimer } from "../../codex/turn-timing.ts";
-import type { BaymaEndpoint } from "../../sandbox/gateway-client.ts";
+import { type BaymaEndpoint, TOKEN_TTL_MS } from "../../sandbox/gateway-client.ts";
 import type { ModelChoice } from "../../persistence/conversation-repository.ts";
 import type { StoreError } from "../../persistence/sql.ts";
 import type { TurnFenced } from "../../persistence/store.ts";
@@ -173,6 +173,8 @@ export interface ClaudeHost {
   readonly baymaUrl: string | null;
   /** Why it runs without its folder's bayma, which its turns' prompts are told, as its last bind said: none where it has it, or runs in a session filesystem. */
   baymaNotice: string | null;
+  /** When its bayma's server was given it, with its bearer, which is good for TOKEN_TTL_MS from then. */
+  baymaGivenAt: number;
   sessionId: string | null;
   readonly channel: PromptChannel;
   /** Aborts the process; the Agent SDK is given it to stop the process with. */
@@ -209,7 +211,15 @@ export interface ClaudeLiveSessionsOptions {
   readonly sessionFsBayma?: Effect.Effect<BaymaEndpoint, SessionError> | null;
   readonly folderBayma?: (scope: Omit<FolderBaymaScope, "harness">) => Effect.Effect<FolderBaymaOutcome, NoFolderWorkspaces>;
   readonly queryFactory?: ClaudeQueryFactory | undefined;
+  /** How long a process keeps its bayma's server as it was given it before a turn gives it the server anew, its bearer fresh: BAYMA_BEARER_LIFE_MS unless said. */
+  readonly baymaBearerLifeMs?: number | undefined;
 }
+
+/**
+ * How long a process keeps its bayma's server as it was given it: an hour less than the
+ * bearer in it is good for, so a turn of it never reaches bayma with a bearer that lapsed.
+ */
+export const BAYMA_BEARER_LIFE_MS = TOKEN_TTL_MS - 60 * 60_000;
 
 /** The live Claude Code processes of one working directory, one per conversation, for as long as their scope is open. */
 export interface ClaudeLiveSessions {
@@ -289,6 +299,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   sessionFsBayma = null,
   folderBayma = defaultFolderBayma,
   queryFactory = query,
+  baymaBearerLifeMs = BAYMA_BEARER_LIFE_MS,
 }: ClaudeLiveSessionsOptions): Effect.fn.Return<ClaudeLiveSessions, never, Scope.Scope | ActiveTurns> {
   const scope = yield* Effect.scope;
   const activeTurns = yield* ActiveTurns;
@@ -838,6 +849,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       key,
       baymaUrl: bayma?.url ?? null,
       baymaNotice: folder?.notice ?? null,
+      baymaGivenAt: yield* Clock.currentTimeMillis,
       sessionId: resumeSession ?? null,
       channel,
       controller,
@@ -883,12 +895,25 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     const bayma = sessionFsBayma ? yield* needed(sessionFsBayma) : null;
     const existing = hosts.get(params.threadKey);
     const reusable = existing && !existing.closed && params.resumeSession && existing.sessionId === params.resumeSession && existing.key === key && existing.baymaUrl === (bayma?.url ?? null);
+    const now = yield* Clock.currentTimeMillis;
+    // Its bayma's bearer, as the process was given it, about to lapse: given it anew below.
+    const lapsing = reusable && now - existing.baymaGivenAt >= baymaBearerLifeMs;
     // A folder's bayma bound as the process starts, and again before each turn of a process
-    // that started without it, which starts anew once it has it; one released meanwhile is
-    // bound anew by the turn's first request of it, its MCP client initializing a session anew.
-    const folder = bayma || (reusable && existing.baymaNotice === null)
+    // that started without it, which starts anew once it has it, or whose bearer is about to
+    // lapse; one released meanwhile is bound anew by the turn's first request of it, its MCP
+    // client initializing a session anew.
+    const folder = bayma || (reusable && existing.baymaNotice === null && !lapsing)
       ? null
       : yield* needed(folderBayma({ threadKey: params.threadKey, workingDirectory, chatId: params.chatId }));
+    // A process that has its bayma is given its server anew, its bearer fresh, the process
+    // kept: its MCP client connects to it afresh, as the Agent SDK replaces a server it is given.
+    const renewed = !reusable || !lapsing ? null : bayma ? { bayma: { type: "http" as const, url: bayma.url, headers: bayma.headers } } : existing.baymaNotice === null && folder?.server ? claudeMcpServers(folder.server) : null;
+    if (reusable && renewed) {
+      const set = yield* attempt(() => existing.sdkQuery.setMcpServers(renewed));
+      if (Object.keys(set.errors).length > 0) yield* Effect.logWarning(`giving thread=${params.threadKey} its bayma anew failed: ${JSON.stringify(set.errors)}`);
+      existing.baymaGivenAt = now;
+      return existing;
+    }
     if (reusable && (folder === null || folder.server === null)) {
       if (folder) existing.baymaNotice = folder.notice;
       return existing;

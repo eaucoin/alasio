@@ -725,6 +725,8 @@ interface FakeCliState {
   /** How many of the prompts it received the test has read. */
   consumed: number;
   readonly options: Options[];
+  /** The MCP servers each process was given anew, in turn. */
+  readonly serversGiven: Record<string, unknown>[];
 }
 
 /**
@@ -736,7 +738,7 @@ function createFakeCli() {
   let wake: (() => void) | null = null;
   const prompts: SDKUserMessage[] = [];
   const promptWaiters: ((message: SDKUserMessage) => void)[] = [];
-  const state: FakeCliState = { created: 0, closed: 0, interrupts: 0, consumed: 0, options: [] };
+  const state: FakeCliState = { created: 0, closed: 0, interrupts: 0, consumed: 0, options: [], serversGiven: [] };
   function emit(message: SDKMessage): void {
     outbox.push(message);
     wake?.();
@@ -792,6 +794,10 @@ function createFakeCli() {
       interrupt: async () => {
         state.interrupts += 1;
         return undefined;
+      },
+      setMcpServers: async (servers) => {
+        state.serversGiven.push(servers);
+        return { added: Object.keys(servers), removed: [], errors: {} };
       },
     });
   };
@@ -1214,6 +1220,45 @@ test("a turn whose folder's bayma did not start runs without it, told so before 
   assert.equal(asked.length, 3);
   assert.deepEqual(asked[0], { threadKey: "telegram:1", workingDirectory: "/work", chatId: turnParams(persistence).chatId });
   await closeAll();
+});
+
+test("a process whose bayma's bearer is about to lapse is given its bayma anew before its next turn, its bearer fresh, the process kept, its folder's or its session filesystem's", async () => {
+  for (const workspace of ["folder", "session filesystem"] as const) {
+    const persistence = createPersistence();
+    const activeTurns = makeActiveTurns();
+    const cli = createFakeCli();
+    // Each endpoint given with a bearer minted anew, as the gateway's client mints one.
+    let minted = 0;
+    const endpoint = () => ({ url: "http://alasio-sandbox-gateway.alasio.svc:8080/mcp", headers: { Authorization: `Bearer ${(minted += 1)}` } });
+    const { liveSessions, closeAll } = openLiveSessions({
+      workingDirectory: "/work",
+      sessions: { sessionExists: () => Effect.succeed(true) },
+      queryFactory: cli.queryFactory,
+      baymaBearerLifeMs: 300,
+      ...(workspace === "folder"
+        ? { folderBayma: () => Effect.sync((): FolderBaymaOutcome => ({ server: { type: "http", ...endpoint() }, notice: null })) }
+        : { sessionFsBayma: Effect.sync(endpoint) }),
+    }, activeTurns);
+    const run = async (prompt: string) => {
+      const turn = runTurn(liveSessions, turnParams(persistence, { prompt }));
+      const received = await cli.nextPrompt();
+      cli.emit(successResult({ result: "done", session_id: "s-1", user_message_uuids: [received.uuid] }));
+      await turn;
+    };
+    cli.emit(initMessage("s-1"));
+    await run("one");
+    const first = minted;
+    await run("two");
+    assert.deepEqual(cli.state.serversGiven, [], `${workspace}: its bearer good still`);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await run("three");
+    assert.equal(cli.state.created, 1, `${workspace}: the process kept`);
+    assert.deepEqual(cli.state.serversGiven.map((servers) => (servers["bayma"] as { headers: Record<string, string> }).headers["Authorization"]), [`Bearer ${minted}`], workspace);
+    assert.ok(minted > first, workspace);
+    await run("four");
+    assert.equal(cli.state.serversGiven.length, 1, `${workspace}: given anew once, its bearer fresh since`);
+    await closeAll();
+  }
 });
 
 test("steering a Claude-started turn is answered in that turn's own reply", async () => {

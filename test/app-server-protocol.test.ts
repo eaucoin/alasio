@@ -377,6 +377,41 @@ test("app-server thread start and resume carry alasio model config", () =>
     }
   })));
 
+test("app-server thread loaded keeps its config for its time, then its next turn's ensure lets it go and resumes it with the config given now, but for one whose turn runs", () =>
+  withNotifications((queue) => Effect.gen(function*() {
+    const asked: string[] = [];
+    const loadedThreads = new Set<string>();
+    const thread = makeAppServerThreads(answeringRpc({
+      "thread/loaded/list": () => Effect.succeed({ data: [...loadedThreads], nextCursor: null }),
+      "thread/unsubscribe": (params) => Effect.sync(() => (asked.push(`unsubscribe ${params.threadId}`), { status: "unsubscribed" as const })),
+      "thread/resume": (params) => Effect.sync(() => {
+        asked.push(`resume ${params.threadId} ${JSON.stringify(params.config?.["mcp_servers"])}`);
+        loadedThreads.add(params.threadId);
+        return threadLoaded(codexThread(params.threadId));
+      }),
+      "thread/start": () => Effect.sync(() => {
+        loadedThreads.add("thread-1");
+        return threadLoaded(codexThread("thread-1"));
+      }),
+    }), queue, apart, 200);
+    const config = (bearer: string) => ({ project_doc_max_bytes: 32768, developer_instructions: "", mcp_servers: { bayma: { url: "http://gateway/mcp", http_headers: { Authorization: bearer }, startup_timeout_sec: 60 } } });
+    const ensure = (bearer: string) => thread.ensureThread({ threadId: "thread-1", threadKey: "conversation-1", cwd: "/repo", env: {}, config: config(bearer) });
+    yield* thread.startThread({ threadKey: "conversation-1", cwd: "/repo", env: {}, config: config("Bearer 1") });
+    yield* ensure("Bearer 2");
+    assert.deepEqual(asked, [], "loaded with its config, within its time");
+    yield* Effect.sleep("300 millis");
+    // Its turn running, as a goal's: left as it is.
+    yield* queue.observe({ method: "turn/started", params: { threadId: "thread-1", turn: codexTurn("goal-turn") } });
+    yield* ensure("Bearer 3");
+    assert.deepEqual(asked, []);
+    yield* queue.observe({ method: "turn/completed", params: { threadId: "thread-1", turn: codexTurn("goal-turn", { status: "completed" }) } });
+    yield* ensure("Bearer 4");
+    assert.deepEqual(asked, ["unsubscribe thread-1", `resume thread-1 ${JSON.stringify(config("Bearer 4").mcp_servers)}`]);
+    // Loaded anew: its time counted from then.
+    yield* ensure("Bearer 5");
+    assert.equal(asked.length, 2);
+  })));
+
 /** The log lines `effect` writes. */
 function loggedBy<A, E>(effect: Effect.Effect<A, E>): Effect.Effect<{ readonly result: Exit.Exit<A, E>; readonly lines: string[] }> {
   const lines: string[] = [];
