@@ -485,8 +485,17 @@ if (inShard("upgrade")) {
           const after = await stackSecrets();
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
-          // And the harness host's role's password and verifier, which this release adds to the stack's.
-          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), ["harnessPassword", "verifiers.harness"]);
+          // And what this release adds to the stack's: the harness host's role's password and
+          // verifier; the sandbox gateway's keys, its principal on the log, and the password of
+          // its workspaces' quotas.
+          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), [
+            "gatewayBindingKey",
+            "gatewayCallerKey",
+            "harnessPassword",
+            "log.sandbox-gateway",
+            "valkeyQuotasPassword",
+            "verifiers.harness",
+          ]);
         },
       },
       {
