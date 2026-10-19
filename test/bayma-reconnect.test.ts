@@ -16,6 +16,7 @@
  * that asks for it, and answers with what it returned.
  */
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -137,7 +138,9 @@ function messagesApi(): Server {
 
 /**
  * OpenAI's Responses API, as Codex asks it: a prompt saying PING calls bayma's ping, in the
- * namespace Codex offers its tools in; its output is answered with; anything else, with "ok".
+ * namespace Codex offers its tools in; one saying `BG <mark>` runs a command that goes on in
+ * the background, its terminal left running, `<mark>` in its command line; their output is
+ * answered with; anything else, with "ok".
  */
 function responsesApi(): Server {
   return createServer(async (incoming, outgoing) => {
@@ -151,7 +154,10 @@ function responsesApi(): Server {
     const message = (text: string) => ({ type: "message", role: "assistant", id: `msg_${randomUUID()}`, content: [{ type: "output_text", text }] });
     send("response.created", { response: { id } });
     if (last?.type === "function_call_output") send("response.output_item.done", { item: message(`RESULT ${JSON.stringify(last)}`) });
-    else if (JSON.stringify(last).includes("PING") && offered) send("response.output_item.done", { item: { type: "function_call", id: `fc_${randomUUID()}`, namespace: "mcp__bayma", name: "ping", arguments: "{}", call_id: `call_${randomUUID()}` } });
+    else if (/BG (\S+)/u.test(JSON.stringify(last))) {
+      const mark = /BG ([\w-]+)/u.exec(JSON.stringify(last))?.[1] ?? "";
+      send("response.output_item.done", { item: { type: "function_call", id: `fc_${randomUUID()}`, name: "exec_command", arguments: JSON.stringify({ cmd: `sleep 600; echo ${mark}`, yield_time_ms: 1000 }), call_id: `call_${randomUUID()}` } });
+    } else if (JSON.stringify(last).includes("PING") && offered) send("response.output_item.done", { item: { type: "function_call", id: `fc_${randomUUID()}`, namespace: "mcp__bayma", name: "ping", arguments: "{}", call_id: `call_${randomUUID()}` } });
     else send("response.output_item.done", { item: message("ok") });
     send("response.completed", { response: { id, usage: { input_tokens: 1, input_tokens_details: null, output_tokens: 1, output_tokens_details: null, total_tokens: 2 } } });
     outgoing.end();
@@ -238,6 +244,8 @@ async function codexThread(url: string, bearer: string, configLifeMs?: number) {
         const events = yield* Stream.runCollect(appServer.eventsForTurn(threadId, turnId));
         return [...events].flatMap((event: AppServerEvent) => (event.type === "item.completed" && event.item.type === "mcp_tool_call" ? [JSON.stringify(event.item)] : [])).join("\n");
       })),
+    /** Whether the conversation has Codex working in it on its own, as alasio asks between turns. */
+    backgroundWork: () => Effect.runPromise(appServer.backgroundWork("telegram:1")),
     close: async () => {
       await Effect.runPromise(Scope.close(scope, Exit.void));
       api.close();
@@ -302,6 +310,36 @@ test("Codex's thread past its config's time is loaded anew by its next turn, wit
     assert.match(await codex.turn("PING", "Bearer fresh"), /pong from pod 1/u);
     assert.ok(stand.asked.includes("initialize of pod 1 with Bearer fresh"), JSON.stringify(stand.asked));
   } finally {
+    await codex.close();
+    stand.close();
+  }
+});
+
+/** The processes whose command line holds `mark`. */
+const marked = (mark: string): number[] =>
+  execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" }).split("\n").flatMap((line) => {
+    const [pid = "", ...args] = line.trim().split(/\s+/u);
+    return args.join(" ").includes(mark) && !args.join(" ").startsWith("ps ") ? [Number(pid)] : [];
+  });
+
+test("Codex's thread past its config's time that left commands running in the background is kept as it is, as letting it go ends them, and loaded anew with the bearer its turn gives once they end", { timeout: 120_000 }, async () => {
+  const stand = await bayma();
+  const codex = await codexThread(stand.url, BEARER, 1_000);
+  const mark = `alasio-background-${randomUUID().slice(0, 8)}`;
+  try {
+    await codex.turn(`BG ${mark}`);
+    assert.equal(await codex.backgroundWork(), true, "its terminal left running");
+    stand.take("Bearer fresh");
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    // Its config past its time, but its command running: kept, its bearer before kept with it.
+    assert.doesNotMatch(await codex.turn("PING", "Bearer fresh"), /pong/u);
+    assert.deepEqual([await codex.backgroundWork(), marked(mark).length], [true, 1], "its command running on");
+    // Its command ended: its next turn loads it anew, with the bearer that turn gives.
+    for (const pid of marked(mark)) process.kill(pid, "SIGKILL");
+    for (const deadline = Date.now() + 30_000; await codex.backgroundWork(); await new Promise((resolve) => setTimeout(resolve, 200))) assert.ok(Date.now() < deadline, "its terminal still listed");
+    assert.match(await codex.turn("PING", "Bearer fresh"), /pong from pod 1/u);
+  } finally {
+    for (const pid of marked(mark)) process.kill(pid, "SIGKILL");
     await codex.close();
     stand.close();
   }

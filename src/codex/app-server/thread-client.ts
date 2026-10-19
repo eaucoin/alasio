@@ -40,7 +40,9 @@ const LISTED_SOURCE_KINDS: v2.ThreadSourceKind[] = ["cli", "vscode", "exec"];
  * How long a thread alasio loaded keeps the config it was loaded with: an hour less than the
  * bearer of its bayma in it is good for (its MCP servers' headers, which the app-server keeps
  * as a thread is loaded), so a turn of it never reaches bayma with a bearer that lapsed. Past
- * it, the thread's next turn loads it anew with the config that turn gives.
+ * it, the thread's next turn loads it anew with the config that turn gives, but where commands
+ * it left run in the background, which letting it go ends (test/bayma-reconnect.test.ts): it
+ * keeps its bearer then, which may lapse, until its first turn once they have ended.
  */
 export const THREAD_CONFIG_LIFE_MS = TOKEN_TTL_MS - 60 * 60_000;
 
@@ -250,6 +252,22 @@ export function makeAppServerThreads(
         : Effect.logWarning(`the app-server refused to interrupt the turn stopped as it started, which may run on thread=${threadId.slice(0, 8)} turn=${turnId} error=${error.message}`);
     });
 
+  // A command Codex backgrounds runs on, its terminal listed, until its process exits,
+  // whatever becomes of its turn: its item completes only then (codex-rs 0.153.3
+  // core/src/unified_exec/async_watcher.rs spawn_exit_watcher), and an interrupt does not
+  // end it (app-server/README.md, turn/interrupt). So the app-server's own list is read,
+  // not the items it told of. A thread it has not loaded, as one an app-server gone had,
+  // it answers as not found (app-server/src/request_processors/thread_processor.rs
+  // load_thread), and it is asked of no more.
+  const terminalsOf = (threadKey: string, threadId: string): Effect.Effect<number, AppServerRequestError> =>
+    listAll("thread/backgroundTerminals/list", { threadId }).pipe(
+      Effect.catchIf(
+        (error) => error._tag === "AppServerRequestFailed" && error.message.startsWith("thread not found"),
+        () => Effect.as(notifications.forgetThread(threadKey, threadId), []),
+      ),
+      Effect.map((terminals) => terminals.length),
+    );
+
   return {
     ensureThread: Effect.fnUntraced(function*({ threadId, threadKey, cwd, env, config }) {
       yield* rpc.start({ env, cwd });
@@ -262,6 +280,15 @@ export function makeAppServerThreads(
         // One whose turn runs, as a goal's, is left as it is: its next turn loads it anew.
         if (fresh || (yield* notifications.currentTurnId(threadId))) {
           yield* Effect.logInfo(`thread already loaded thread=${threadId.slice(0, 8)} key=${JSON.stringify(threadKey)} ms=${yield* millisSince(startedAt)}`);
+          yield* notifications.recordThread(threadKey, threadId);
+          return threadId;
+        }
+        // One that left commands running in the background is left as it is too, as letting it
+        // go ends them: its MCP servers keep the bearer they were given, which may lapse, until
+        // its first turn once they have ended loads it anew.
+        const running = yield* terminalsOf(threadKey, threadId);
+        if (running > 0) {
+          yield* Effect.logWarning(`thread keeps its config past its time, as ${running} commands it left run in the background thread=${threadId.slice(0, 8)} key=${JSON.stringify(threadKey)}`);
           yield* notifications.recordThread(threadKey, threadId);
           return threadId;
         }
@@ -353,24 +380,11 @@ export function makeAppServerThreads(
         return yield* Deferred.await(listing.models);
       }),
 
-    // A command Codex backgrounds runs on, its terminal listed, until its process exits,
-    // whatever becomes of its turn: its item completes only then (codex-rs 0.153.3
-    // core/src/unified_exec/async_watcher.rs spawn_exit_watcher), and an interrupt does not
-    // end it (app-server/README.md, turn/interrupt). So the app-server's own list is read,
-    // not the items it told of. A thread it has not loaded, as one an app-server gone had,
-    // it answers as not found (app-server/src/request_processors/thread_processor.rs
-    // load_thread), and it is asked of no more.
     backgroundWork: (threadKey) =>
       Effect.gen(function*() {
         for (const threadId of yield* notifications.threadsOf(threadKey)) {
           if (yield* notifications.currentTurnId(threadId)) return true;
-          const terminals = yield* listAll("thread/backgroundTerminals/list", { threadId }).pipe(
-            Effect.catchIf(
-              (error) => error._tag === "AppServerRequestFailed" && error.message.startsWith("thread not found"),
-              () => Effect.as(notifications.forgetThread(threadKey, threadId), []),
-            ),
-          );
-          if (terminals.length > 0) return true;
+          if ((yield* terminalsOf(threadKey, threadId)) > 0) return true;
         }
         return false;
       }).pipe(
