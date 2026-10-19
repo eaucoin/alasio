@@ -36,6 +36,7 @@ import type {
 import { Result } from "effect";
 
 import { LOG_PRINCIPALS } from "../../neon/control/secrets.ts";
+import { DRAIN_WITHIN_MS } from "../../neon/lake/src/drain.ts";
 import { memoryBytes } from "../src/capacity.ts";
 import { NODE_PINS } from "../src/cluster/node.ts";
 import { installConfigOf } from "../src/config.ts";
@@ -767,6 +768,14 @@ describe("the lake's readers", () => {
     assert.deepEqual(one<V1Service>(objects, "Service", "alasio-lake").spec, { selector, ports: [{ name: "query", port: 8090 }] });
     assert.deepEqual(one<V1Service>(objects, "Service", "alasio-lake-query-peers").spec, { clusterIP: "None", selector, ports: [{ name: "query", port: 8090 }] });
     assert.deepEqual(query.env?.find(({ name }) => name === "LAKE_QUERY_PEERS"), { name: "LAKE_QUERY_PEERS", value: "alasio-lake-query-peers.alasio.svc.cluster.local" });
+  });
+
+  test("wait, as they stop, for the queries under way in them, alasio lake's among them, within their grace to stop", () => {
+    const readers = one<V1Deployment>(install(), "Deployment", "alasio-lake-query");
+    assert.deepEqual(container(readers).lifecycle, { preStop: { exec: { command: ["node", "src/drain.ts"] } } });
+    // The drain at its longest, and then the endpoint's own stop.
+    const grace = readers.spec?.template.spec?.terminationGracePeriodSeconds ?? 30;
+    assert.ok(grace * 1000 >= DRAIN_WITHIN_MS + 10_000, `a reader has ${grace} s to stop, its drain ${DRAIN_WITHIN_MS / 1000} s`);
   });
 
   test("scale on the queries the pool has not answered, as any reader sums them, two to a reader, never below one", () => {
@@ -3296,8 +3305,13 @@ describe("the sandbox service", () => {
       // Main's sessions snapshotted as alasio's own were, under the releases kept, each pool's template as the pool runs it, none carried before it.
       snapshots: {
         liveEverySeconds: 600,
-        // Each restored through the checkpoint gofer as it restores best: over TCP, the agent's own way, as every release kept is before the first that restores through a socket.
-        releases: NOTHING_KEPT.gvisorReleases.map((release) => ({ release, runtimeClassName: `gvisor-${release.split(".").join("-")}`, gofer: null })),
+        // Each restored through the checkpoint gofer as it restores best: through the agent's socket, its reads of pages
+        // retried, from eaucoin.9 on, as .11 does; over TCP, the agent's own way, before, as .8 does.
+        releases: NOTHING_KEPT.gvisorReleases.map((release) => ({
+          release,
+          runtimeClassName: `gvisor-${release.split(".").join("-")}`,
+          gofer: release === "20260921.0-eaucoin.8" ? null : { transport: "socket", pagesRetry: true },
+        })),
         templates: Object.fromEntries((["none", "full"] as const).map((mode) => [mode, { current: JSON.parse(JSON.stringify(one<V1Deployment>(objects, "Deployment", `sandboxes-${mode}`).spec?.template)), previous: null }])),
       },
     });

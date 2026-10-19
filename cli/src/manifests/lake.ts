@@ -20,8 +20,10 @@
  *   (neon/lake/src/endpoint.ts), each with only the reader's credentials, from
  *   lake.query's least, never below one for Grafana's alert rules, to its most, which KEDA
  *   scales on the queries the pool has taken and not answered (its /pool, read through
- *   their Service, which keeps the lake's name); a branch environment has none, as it has
- *   no Grafana: what it sends is read in main's lake, tagged;
+ *   their Service, which keeps the lake's name); each, as a scale-in stops it, first waits
+ *   for the queries under way in it, alasio lake's among them (neon/lake/src/drain.ts); a
+ *   branch environment has none, as it has no Grafana: what it sends is read in main's
+ *   lake, tagged;
  * - its intake, main's alone, `lake-intake`, the log's consumer group of that name
  *   (neon/lake/src/intake-service.ts), which KEDA scales on how far the group is behind on
  *   the telemetry topics, as it reads that as a principal of its own that may read none of
@@ -77,6 +79,12 @@ const MERGE_SCHEDULE = "47 * * * *";
  * another: one running and one waiting, as a dashboard opened asks a few at once.
  */
 const QUERIES_PER_READER = 2;
+
+/**
+ * How long a reader has to stop: its drain, which waits for the queries under way in it for
+ * DRAIN_WITHIN_MS at most (neon/lake/src/drain.ts, 75 s), then its endpoint's stop.
+ */
+export const LAKE_QUERY_STOP_SECONDS = 90;
 
 /**
  * How far behind the intake's group may be on each partition, in records, before KEDA
@@ -333,6 +341,7 @@ function queryObjects(config: InstallConfig): KubernetesObject[] {
           ...priority("floor"),
           ...stackPodSpec(config),
           ...spread(QUERY_COMPONENT, scaling),
+          terminationGracePeriodSeconds: LAKE_QUERY_STOP_SECONDS,
           containers: [{
             name: "query",
             image: imageReference(config.images.lake),
@@ -350,6 +359,8 @@ function queryObjects(config: InstallConfig): KubernetesObject[] {
             // Ready once it has the lake open, so its Service sends no query to one that cannot read it.
             readinessProbe: { httpGet: { path: "/readyz", port: "query" }, periodSeconds: 10 },
             livenessProbe: { httpGet: { path: "/healthz", port: "query" }, periodSeconds: 30, failureThreshold: 3 },
+            // Stopping, it answers the queries under way in it first, which its stop would end.
+            lifecycle: { preStop: { exec: { command: ["node", "src/drain.ts"] } } },
             securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
             resources,
             volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],

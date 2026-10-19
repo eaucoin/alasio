@@ -182,7 +182,7 @@ export const ESTARGZ = PUSHED !== undefined;
  * (HOST_BAYMA_IMAGE), and from their checkpoints, once, where it pins another, whose instance
  * refuses a snapshot another bayma took.
  */
-export const FOLDER_BAYMA_BEFORE = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.3", digest: "sha256:add3c8ad2024f5dad077d2deac67fcda911722eee75be866946d17b17dd31be7" } as const;
+export const FOLDER_BAYMA_BEFORE: { readonly repository: string; readonly tag: string; readonly digest: string } = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.3", digest: "sha256:add3c8ad2024f5dad077d2deac67fcda911722eee75be866946d17b17dd31be7" };
 /** Whether the upgrade keeps the folders' bayma, so their REPLs come back whole. */
 export const FOLDER_BAYMA_KEPT = FOLDER_BAYMA_BEFORE.digest === HOST_BAYMA_IMAGE.digest;
 
