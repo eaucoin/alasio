@@ -3,10 +3,10 @@
  * REPL sessions in its bayma, at `url`, with `token`, whichever of alasio's releases made
  * the bayma, so that what brings them back across an upgrade is what is proven.
  *
- * - `set <url> <token> <value>`: a Python session holding `value` in a global, which its
- *   checkpoint keeps, beside a thread counting in it that none keeps, and a Bun session holding
- *   `value` live and in its `$checkpoint`; lets go of its control of both, and prints their ids
- *   and the count.
+ * - `set <url> <token> <value>`: a Python session holding `value` live, in a global, and in
+ *   its checkpoint (bayma_write_checkpoint), beside a thread counting in it that no checkpoint
+ *   keeps, and a Bun session holding `value` live and in its `$checkpoint`; lets go of its
+ *   control of both, and prints their ids and the count.
  * - `read <url> <token> <python> <bun>`: takes both over, as a client that reconnected does,
  *   and prints what each holds, the count and whether the thread counts on, and what bayma told
  *   each exec of how its session came back.
@@ -27,7 +27,7 @@ export interface FolderReplsSet {
 
 /** What `read` saw of each session, and bayma's notice to each exec, if any. */
 export interface FolderReplsRead {
-  readonly python: { readonly kept: string | null; readonly count: number | null; readonly counting: boolean; readonly notice: string | null };
+  readonly python: { readonly live: string | null; readonly checkpointed: string | null; readonly count: number | null; readonly counting: boolean; readonly notice: string | null };
   readonly bun: { readonly live: string | null; readonly checkpointed: string | null; readonly notice: string | null };
 }
 
@@ -76,6 +76,7 @@ try {
     const counted = await exec(client, python.session_id, [
       "import threading, time",
       `kept = ${value}`,
+      `bayma_write_checkpoint({"kept": ${value}})`,
       'state = {"count": 0}',
       "def count():",
       "    while True:",
@@ -98,7 +99,7 @@ try {
     const seen = await exec(client, python, [
       "import json, time",
       "time.sleep(0.5)",
-      'print(json.dumps({"kept": globals().get("kept"), "count": globals().get("state", {}).get("count"), "counting": "counter" in globals() and counter.is_alive()}))',
+      'print(json.dumps({"live": globals().get("kept"), "checkpointed": (bayma_read_checkpoint() or {}).get("kept"), "count": globals().get("state", {}).get("count"), "counting": "counter" in globals() and counter.is_alive()}))',
     ].join("\n"));
     const live = await exec(client, bun, "console.log(JSON.stringify({ live: globalThis.kept ?? null, checkpointed: $checkpoint?.kept ?? null }))");
     const read: FolderReplsRead = { python: { ...JSON.parse(seen.stdout), notice: seen.notice }, bun: { ...JSON.parse(live.stdout), notice: live.notice } };

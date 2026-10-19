@@ -414,7 +414,7 @@ if (inShard("upgrade")) {
         check: async () => {
           const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), folderRepls.python, folderRepls.bun);
           const kept = `kept by ${folderBayma.name}`;
-          if (seen.python.kept !== kept || seen.bun.live !== kept) {
+          if (seen.python.live !== kept || seen.bun.live !== kept) {
             // What the folder instance's bayma said of the sessions it restored, where it cannot be read.
             for (const pod of await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" })) {
               const name = pod.metadata?.name ?? "";
@@ -425,12 +425,12 @@ if (inShard("upgrade")) {
             // Whole, its thread counting on. A first session's whole restore can fail on bayma
             // 0.14.3, its server's own threads taking the PIDs its snapshot needs, as one of six
             // upgrade shards did: bayma 0.14.4 gives sessions PIDs above them.
-            assert.deepEqual([seen.python.kept, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, true, kept, kept], JSON.stringify(seen));
+            assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, kept, true, kept, kept], JSON.stringify(seen));
             assert.ok((seen.python.count ?? 0) > folderRepls.count, `the count went on from ${folderRepls.count}: ${JSON.stringify(seen)}`);
             for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
           } else {
             // From its checkpoint, what that keeps intact, as this release's bayma refuses a snapshot another took.
-            assert.deepEqual([seen.python.kept, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, false, null, kept], JSON.stringify(seen));
+            assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [null, kept, false, null, kept], JSON.stringify(seen));
             for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", CAME_BACK_FROM_CHECKPOINT);
           }
           // The gateway's pod of the folder pool, bound to the conversation's key, on the state directory the Sandbox's bayma had.
@@ -699,7 +699,7 @@ if (inShard("upgrade")) {
       assert.match(await alasioOk("folder", "restart", conversation), /its folder instance of [^\n]+ is let go, its REPL sessions saved; the next message makes it anew/u);
       const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), folderRepls.python, folderRepls.bun);
       const kept = `kept by ${folderBayma.name}`;
-      assert.deepEqual([seen.python.kept, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, false, null, kept], JSON.stringify(seen));
+      assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [null, kept, false, null, kept], JSON.stringify(seen));
       for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", CAME_BACK_FROM_CHECKPOINT);
       const instance = (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" }))
         .find((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"] === folderBayma.key);
@@ -899,7 +899,7 @@ if (inShard("sessions")) {
       const [before] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
       assert.match(await alasioOk("folder", "restart", "e2e:folder"), /^Claude: its folder instance of e2e:folder is let go, its REPL sessions saved; the next message makes it anew$/mu);
       const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(key), set.python, set.bun);
-      assert.deepEqual([seen.python.kept, seen.python.counting, seen.bun.live, seen.bun.checkpointed], ["kept by e2e:folder", true, "kept by e2e:folder", "kept by e2e:folder"], JSON.stringify(seen));
+      assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], ["kept by e2e:folder", "kept by e2e:folder", true, "kept by e2e:folder", "kept by e2e:folder"], JSON.stringify(seen));
       assert.ok((seen.python.count ?? 0) > set.count, JSON.stringify(seen));
       for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
       // A pod of its own, made anew.
