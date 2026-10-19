@@ -476,6 +476,12 @@ export const JUICEFS_BIN = "/var/lib/alasio/bin";
 export const JUICEFS_CACHE = "/var/lib/alasio/juicefs-cache";
 /** What JuiceFS's mount says once it has handed its FUSE session over to another mount of the same mount point, and ends. */
 export const HANDED_OVER = "transfer FUSE session to others";
+/**
+ * What JuiceFS's mount says once its own process serves the mount point: mounted afresh, or
+ * having taken another's FUSE session over, as it waits until the mount point names its process
+ * and no longer the one before.
+ */
+export const SERVING = "is ready at";
 
 /**
  * The Services the nodes' mount of workspace storage reaches by the addresses it resolves them to
@@ -600,15 +606,18 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
 }
 
 /**
- * The readiness of a workspace mount's pod: its own juicefs runs, it has not handed its mount
- * over, and the node's mount table holds JuiceFS's mount at `root`: this pod's juicefs serves the
- * node's mount point.
+ * The readiness of a workspace mount's pod: its own juicefs runs, has said it serves the mount
+ * point (SERVING), and has not handed its mount over, and the node's mount table holds JuiceFS's
+ * mount at `root`: this pod's juicefs serves the node's mount point. The table alone holds the
+ * mount of the pod it replaces as its juicefs starts, before it takes that mount over, which the
+ * pod it replaces would be deleted for, its mount with it.
  */
 export function workspaceMountReady(root: string, paths: Pick<MountPaths, "run" | "mountinfo"> = MOUNT_PATHS): string {
   const { run, mountinfo } = paths;
   return [
     `[ ! -e ${run}/handed-over ]`,
     `kill -0 "$(cat ${run}/juicefs.pid)" 2>/dev/null`,
+    `grep -qF '${SERVING}' ${run}/juicefs.log`,
     `awk -v root=${root} '$5 == root { for (i = 6; i < NF; i += 1) if ($i == "-") { if ($(i + 1) == "fuse.juicefs") found = 1; break } } END { exit !found }' ${mountinfo}`,
   ].join(" && ");
 }

@@ -18,11 +18,11 @@ import { Effect } from "effect";
 
 import { readMountServices } from "../src/install.ts";
 import { KubeApi } from "../src/kube/api.ts";
-import { HANDED_OVER, type MountPaths, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
+import { HANDED_OVER, type MountPaths, SERVING, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
 import { serveFakeKube } from "./support/fake-kube.ts";
 
-/** What juicefs's stand-in does: serve until it is ended, hand its mount over, or fail. */
-type Juicefs = "serves" | "hands over" | "fails";
+/** What juicefs's stand-in does: serve until it is ended, take a mount over once told to and serve it, hand its mount over, or fail. */
+type Juicefs = "serves" | "takes over" | "hands over" | "fails";
 
 interface Mount {
   readonly paths: MountPaths;
@@ -40,17 +40,23 @@ interface Mount {
  * line while it serves; where `left`, the table holds a mount of a juicefs gone at the root
  * already, which reads as nothing until it is unmounted.
  */
-function mount(t: TestContext, juicefs: Juicefs, { left = false, env: given = {} as Record<string, string> } = {}): Mount {
+function mount(t: TestContext, juicefs: Juicefs, { left = false, env: given = {} as Record<string, string> } = {}): Mount & { readonly takeOver: () => void } {
   const directory = mkdtempSync(join(tmpdir(), "alasio-workspace-mount-"));
   const root = join(directory, "workspaces");
   const mountinfo = join(directory, "mountinfo");
   const ran = join(directory, "in-node");
   const dead = join(directory, "dead");
   const line = `36 1 0:50 / ${root} rw,relatime shared:9 - fuse.juicefs JuiceFS:workspaces rw`;
-  writeFileSync(mountinfo, left ? `${line}\n` : "");
+  // The mount of the pod a mount that takes over replaces, served still.
+  writeFileSync(mountinfo, left || juicefs === "takes over" ? `${line}\n` : "");
   if (left) writeFileSync(dead, "");
+  // Served, it reads as a directory.
+  if (juicefs === "takes over") mkdirSync(root);
+  const told = join(directory, "take-over");
+  const serving = `echo 'juicefs[7] <INFO>: OK, workspaces ${SERVING} "${root}" [checkMountpoint@mount_unix.go:327]'`;
   const what: Record<Juicefs, string> = {
-    serves: `echo '${line}' >> ${mountinfo}; echo mounted; trap 'exit 0' TERM; while :; do sleep 0.1; done`,
+    serves: `echo '${line}' >> ${mountinfo}; echo mounted; ${serving}; trap 'exit 0' TERM; while :; do sleep 0.1; done`,
+    "takes over": `trap 'exit 0' TERM; while [ ! -e ${told} ]; do sleep 0.05; done; ${serving}; while :; do sleep 0.1; done`,
     "hands over": `echo 'juicefs[7] <INFO>: ${HANDED_OVER} [launchMount@mount_unix.go:1057]'; exit 1`,
     fails: "echo 'juicefs[7] <FATAL>: the metadata engine refused us'; exit 3",
   };
@@ -99,6 +105,7 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, env: given = {}
     child,
     out: () => out,
     ended,
+    takeOver: () => writeFileSync(told, ""),
     ready: () => spawnSync("sh", ["-c", workspaceMountReady(root, paths)], { env }).status === 0,
     inNode: () => (existsSync(ran) ? readFileSync(ran, "utf8").trim().split("\n") : []),
   };
@@ -125,6 +132,15 @@ test("a mount that serves runs its image's juicefs, copied to the node under its
   serving.child.kill("SIGTERM");
   assert.notEqual(await serving.ended, 0);
   assert.equal(existsSync(join(serving.paths.run, "handed-over")), false);
+});
+
+test("a mount whose juicefs runs is not ready while the node's table holds the mount of the pod it replaces, before its juicefs says it serves the mount point itself, as that pod is deleted, its mount with it, once it is", async (t) => {
+  const taking = mount(t, "takes over");
+  await until(() => existsSync(join(taking.paths.run, "juicefs.pid")));
+  await sleep(500);
+  assert.equal(taking.ready(), false);
+  taking.takeOver();
+  await until(() => taking.ready());
 });
 
 test("a mount that hands its session over idles, not ready, until its pod is deleted", async (t) => {
