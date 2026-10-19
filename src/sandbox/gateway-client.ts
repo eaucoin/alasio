@@ -21,7 +21,7 @@
 import { Clock, Duration, Effect, Schedule, Schema } from "effect";
 
 import { mintToken } from "../binder/tokens.ts";
-import { folderKey } from "../gateway/names.ts";
+import { folderBindMs, folderKey } from "../gateway/names.ts";
 import { sessionKey } from "./names.ts";
 
 /** Where an instance's bayma serves MCP, through the gateway, and the bearer to reach it with. */
@@ -41,6 +41,8 @@ export const BIND_WAIT_MS = 5 * 60_000;
 const CALL_TIMEOUT_MS = 60_000;
 /** How long a bind or a release may take, in ms: a restore's, or a save's, with room. */
 const LONG_CALL_TIMEOUT_MS = 10 * 60_000;
+/** How long a folder instance's bind or release may take, in ms: as long as the gateway gives a bind of it, with room. */
+export const FOLDER_CALL_TIMEOUT_MS = folderBindMs() + 60_000;
 
 /** What the gateway refused, or what failed reaching it. */
 export class GatewayError extends Schema.TaggedError<GatewayError>()("GatewayError", {
@@ -193,7 +195,7 @@ export function makeGatewayWorkspaces({ url, environment, callerKey }: GatewayWo
       // Once: its bind waits as its pod is made and its bayma starts, and one asked again would fail as it did.
       bind: ({ harness, threadKey }, { retry = false } = {}) => {
         const what = `bind the folder instance of ${threadKey} under ${harness}`;
-        return askAs(what, tokenFor(folderKey(harness, threadKey), retry ? { retry: "1" } : {}), "POST", "/bind", { timeoutMs: LONG_CALL_TIMEOUT_MS }).pipe(
+        return askAs(what, tokenFor(folderKey(harness, threadKey), retry ? { retry: "1" } : {}), "POST", "/bind", { timeoutMs: FOLDER_CALL_TIMEOUT_MS }).pipe(
           Effect.flatMap(({ status, bytes }): Effect.Effect<void, GatewayError | FolderBindFailed> => {
             if (status === 204) return Effect.void;
             if (status !== 503) return Effect.fail(new GatewayError({ call: what, status, reason: said(bytes) }));
@@ -205,7 +207,7 @@ export function makeGatewayWorkspaces({ url, environment, callerKey }: GatewayWo
       },
       release: ({ harness, threadKey }) => {
         const what = `release the folder instance of ${threadKey} under ${harness}`;
-        return askAs(what, tokenFor(folderKey(harness, threadKey), {}), "POST", "/release", { timeoutMs: LONG_CALL_TIMEOUT_MS }).pipe(Effect.flatMap(expect(what, [204])), Effect.asVoid);
+        return askAs(what, tokenFor(folderKey(harness, threadKey), {}), "POST", "/release", { timeoutMs: FOLDER_CALL_TIMEOUT_MS }).pipe(Effect.flatMap(expect(what, [204])), Effect.asVoid);
       },
     },
     release: (volumeId, mode) => {

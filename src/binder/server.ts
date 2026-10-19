@@ -212,7 +212,8 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         if (reason !== null) return yield* new PlacementHeld({ reason });
       }
       const bound = unbound ? yield* binder.bound(pool, key) : yield* binder.bind(pool, key, placed).pipe(
-        Effect.tapError((error) => settled?.(error.message) ?? Effect.void),
+        // One that waited out another's bind or release of the key failed of none of its own: that one tells of its own end.
+        Effect.tapError((error) => (error._tag === "BindTimeout" && error.waited === "binding" ? Effect.void : settled?.(error.message) ?? Effect.void)),
         Effect.tap(() => settled?.(null) ?? Effect.void),
       );
       if (!bound) return null;

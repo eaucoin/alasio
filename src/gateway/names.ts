@@ -134,6 +134,19 @@ export const FOLDER_TOKEN_FILE = `${FOLDER_TOKEN_DIRECTORY}/token`;
  */
 export const FOLDER_STOP_SECONDS = 600;
 
+/** How long a folder instance's release, or its next bind, waits for its pod to be gone, past its stop. */
+export const FOLDER_GONE_MS = (FOLDER_STOP_SECONDS + 60) * 1000;
+/** How long a folder instance's bind gives its pod to run, and its bayma, once it runs, to answer. */
+export const FOLDER_START_MS = 120_000;
+/** How long it gives its pod to run while its image is still being pulled, as a node that has never run it pulls it first. */
+export const FOLDER_PULL_MS = 8 * 60_000;
+/**
+ * How long a folder instance's bind may take in all, given `pullMs` and `startMs`: a release
+ * of it under way, or its pod before, gone first; then its pod run, its image pulled; then its
+ * bayma answering. A bind of the key meanwhile waits as long for it.
+ */
+export const folderBindMs = (pullMs = FOLDER_PULL_MS, startMs = FOLDER_START_MS): number => FOLDER_GONE_MS + pullMs + startMs;
+
 /**
  * The spec of a folder instance's pod, `pod`, of the folder template's `spec`: its bayma
  * given its binding's token, from its Secret, and its state directory, `stateDir`; stopped

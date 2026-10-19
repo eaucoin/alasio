@@ -16,10 +16,12 @@
  * the same state directory, restores them; nothing of the node agents', nor of the bucket's. A
  * pod whose bayma ended is released as broken, the next bind making another.
  *
- * A bind gives its pod FOLDER_START_MS to run (FOLDER_PULL_MS while its image is being
- * pulled), and its bayma as long again to answer once it runs, or deletes it and its Lease,
- * saying why: its pod pending, as unscheduled; its image not pulled; its bayma ended; or its
- * bayma not answering. FOLDER_FAILURES binds of a key failing one after another within
+ * A bind makes its pod once no pod of the key before it is left, as one being deleted still
+ * dumps its REPL sessions. It gives its pod FOLDER_START_MS to run (FOLDER_PULL_MS while its
+ * image is being pulled), and its bayma as long again to answer once it runs, or deletes it
+ * and its Lease, saying why: its pod pending, as unscheduled; its image not pulled; its bayma
+ * ended; or its bayma not answering. A bind of a key another bind or a release of it is under
+ * way of waits for it as long as a bind may take (./names.ts folderBindMs). FOLDER_FAILURES binds of a key failing one after another within
  * FOLDER_FAILING_MS hold it: it is bound again only as its caller asks (its token's `retry`),
  * until a bind goes through. Its failures are a Lease's of their own in the folder namespace
  * (failingLease), so every replica of the gateway holds it alike, and they are counted, of
@@ -43,15 +45,8 @@ import { bindingToken } from "../binder/tokens.ts";
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
 import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import { meter } from "../telemetry/index.ts";
-import { FOLDER_POOL, FOLDER_STOP_SECONDS, folderOfKey, folderPodName, folderPodSpec, folderStateDir, folderTokenSecret } from "./names.ts";
+import { FOLDER_GONE_MS, FOLDER_POOL, FOLDER_PULL_MS, FOLDER_START_MS, folderBindMs, folderOfKey, folderPodName, folderPodSpec, folderStateDir, folderTokenSecret } from "./names.ts";
 
-/** How long a folder instance's release waits for its pod to be gone, past its stop. */
-const GONE_WAIT_MS = (FOLDER_STOP_SECONDS + 60) * 1000;
-
-/** How long a folder instance's bind gives its pod to run, and its bayma, once it runs, to answer. */
-export const FOLDER_START_MS = 120_000;
-/** How long it gives its pod to run while its image is still being pulled, as a node that has never run it pulls it first. */
-export const FOLDER_PULL_MS = 8 * 60_000;
 /** How many binds of a key failing one after another, within FOLDER_FAILING_MS, hold it. */
 export const FOLDER_FAILURES = 3;
 export const FOLDER_FAILING_MS = 10 * 60_000;
@@ -140,9 +135,9 @@ export const makeFolders = Effect.fnUntraced(function*(
   const removed = (name: string): Effect.Effect<void, KubeApiError | BindStepFailed> =>
     Effect.gen(function*() {
       yield* kube.remove("v1", "Pod", namespace, name);
-      const deadline = (yield* Clock.currentTimeMillis) + GONE_WAIT_MS;
+      const deadline = (yield* Clock.currentTimeMillis) + FOLDER_GONE_MS;
       while ((yield* kube.read("v1", "Pod", namespace, name)) !== null) {
-        if ((yield* Clock.currentTimeMillis) >= deadline) return yield* new BindStepFailed({ reason: `the folder instance's pod ${name} was not gone within ${GONE_WAIT_MS / 1000} s` });
+        if ((yield* Clock.currentTimeMillis) >= deadline) return yield* new BindStepFailed({ reason: `the folder instance's pod ${name} was not gone within ${FOLDER_GONE_MS / 1000} s` });
         yield* Effect.sleep(1_000);
       }
     });
@@ -155,12 +150,12 @@ export const makeFolders = Effect.fnUntraced(function*(
   const alone = (key: string, labels: Readonly<Record<string, string>>): Effect.Effect<void, KubeApiError | BindStepFailed> =>
     Effect.gen(function*() {
       const selector = Object.entries(labels).map(([label, value]) => `${label}=${value}`).join(",");
-      const deadline = (yield* Clock.currentTimeMillis) + GONE_WAIT_MS;
+      const deadline = (yield* Clock.currentTimeMillis) + FOLDER_GONE_MS;
       for (;;) {
         const left = ((yield* kube.list("v1", "Pod", namespace, selector)) as V1Pod[]).filter((pod) => pod.metadata?.annotations?.[KEY_ANNOTATION] === key);
         if (left.length === 0) return;
         for (const pod of left) if (pod.metadata?.deletionTimestamp === undefined) yield* kube.remove("v1", "Pod", namespace, pod.metadata?.name ?? "").pipe(Effect.catchIf(hasStatus(404), () => Effect.void));
-        if ((yield* Clock.currentTimeMillis) >= deadline) return yield* new BindStepFailed({ reason: `the folder instance's pod before, ${left.map((pod) => pod.metadata?.name).join(", ")}, was not gone within ${GONE_WAIT_MS / 1000} s` });
+        if ((yield* Clock.currentTimeMillis) >= deadline) return yield* new BindStepFailed({ reason: `the folder instance's pod before, ${left.map((pod) => pod.metadata?.name).join(", ")}, was not gone within ${FOLDER_GONE_MS / 1000} s` });
         yield* Effect.sleep(1_000);
       }
     });
@@ -301,6 +296,8 @@ export const makeFolders = Effect.fnUntraced(function*(
         // Bound again only as its caller asks, where its binds failed one after another.
         held: options["retry"] === "1" ? Effect.succeed(null) : heldBy(key),
         settled: settled(key),
+        // As long as its pod takes to get, so a bind of it waits out another's, or a release, of none of its own failing.
+        waitMs: folderBindMs(pullMs, startMs),
         // Its caller's restart forgets its binds' failures, so the next bind goes on, held or not.
         reset: forgotten(key),
       };

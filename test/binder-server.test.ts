@@ -298,6 +298,23 @@ test("a caller's release resets what its placement keeps of its binds, bound or 
   }
 });
 
+test("a bind that waited out another's bind of its key in vain tells of no failure of its own", async () => {
+  const of = await pool();
+  const stand = await pods();
+  const told: (string | null)[] = [];
+  const served = await front(of, stand.port, { waitMs: 1_000, told: { settled: (failure) => Effect.sync(() => void told.push(failure)) } });
+  try {
+    await run(takeLease(of, "sessionfs:under-way", "another"));
+    const bind = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:under-way") } });
+    assert.equal(bind.status, 503);
+    assert.match(((await bind.json()) as { reason: string }).reason, /another binder's binding of it/u);
+    assert.deepEqual(told, []);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
 test("a no-bind request, of a front that never bound its key, is served by the binding another front made", async () => {
   const of = await pool();
   await freePods(of, 1);

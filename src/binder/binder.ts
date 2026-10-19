@@ -84,10 +84,15 @@ export type MakePod = (labels: Readonly<Record<string, string>>, annotations: Re
  */
 export type PreparePod = (pod: V1Pod, binding: string) => Effect.Effect<void, BindStepFailed>;
 
-/** What a bind is given beyond its pool and key: a pod's maker, where it makes its own, and what readies the pod. */
+/**
+ * What a bind is given beyond its pool and key: a pod's maker, where it makes its own, and
+ * what readies the pod; and how long it may take in all, waiting for another's bind or
+ * release of its key among it, where its pod takes longer to get than the binder's `waitMs`.
+ */
 export interface BindOptions {
   readonly make?: MakePod | undefined;
   readonly prepare?: PreparePod | undefined;
+  readonly waitMs?: number | undefined;
 }
 
 /** A step of a bind its caller gives, making or readying its pod, failed: why. */
@@ -265,7 +270,7 @@ export class Binder extends Context.Service<Binder, {
         const bind = (pool: Pool, key: string, options: BindOptions = {}): Effect.Effect<Bound, KubeApiError | BindTimeout | BindStepFailed> =>
           Effect.gen(function*() {
             const asked = yield* Clock.currentTimeMillis;
-            const deadline = asked + waitMs;
+            const deadline = asked + (options.waitMs ?? waitMs);
             for (;;) {
               const taken = yield* provide(takeLease(pool, key, binder, staleMs));
               if (taken.taken) {

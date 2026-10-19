@@ -50,7 +50,7 @@ async function bayma(): Promise<{ port: number; status: { execsRunning: number; 
 let namespaces = 0;
 
 /** The gateway's folder instances in a namespace of the test's own, their bayma the stand-in's, idle ones kept `releaseAfterMs`. */
-async function foldersOf(port: number, releaseAfterMs = 60_000, startMs = 10_000, pullMs = 3_000, refusingSecretPatches = false) {
+async function foldersOf(port: number, releaseAfterMs = 60_000, startMs = 10_000, pullMs = 3_000, { refusingSecretPatches = false, binderWaitMs = 10_000 } = {}) {
   const namespace = `folders-${(namespaces += 1)}`;
   const kubeLayer = refusingSecretPatches
     ? Layer.effect(KubeClient, Effect.map(KubeClient, (kube) => KubeClient.of({ ...kube, patch: (apiVersion, kind, ...rest) => (kind === "Secret" ? Effect.fail(new KubeApiError({ status: 500, cause: "refused" })) : kube.patch(apiVersion, kind, ...rest)) }))).pipe(Layer.provide(Layer.fresh(KubeClient.layer)))
@@ -60,7 +60,7 @@ async function foldersOf(port: number, releaseAfterMs = 60_000, startMs = 10_000
     const binder = yield* Binder;
     const folders = yield* makeFolders({ namespace, template: TEMPLATE, stateRoot: "/home/operator/.alasio/bayma", releaseAfterMs, main: "main", podPort: port, bindingKey, idlePollMs: 50, startMs, pullMs }, binder);
     return { namespace, binder, folders };
-  }).pipe(Scope.provide(Scope.makeUnsafe())), Layer.provideMerge(Binder.layer({ waitMs: 10_000 }), kubeLayer)));
+  }).pipe(Scope.provide(Scope.makeUnsafe())), Layer.provideMerge(Binder.layer({ waitMs: binderWaitMs }), kubeLayer)));
 }
 
 /** Binds `key` as the gateway's front does, its pod run, as kubelet would run it, and ready. */
@@ -159,7 +159,7 @@ test("a folder instance's bind makes its pod only once the pod of it before is g
 test("a folder instance's pod whose token's Secret it cannot own is deleted with it, as nothing would delete the Secret after", async () => {
   const stand = await bayma();
   try {
-    const of = await foldersOf(stand.port, 60_000, 10_000, 3_000, true);
+    const of = await foldersOf(stand.port, 60_000, 10_000, 3_000, { refusingSecretPatches: true });
     const key = folderKey("claude", "telegram:44");
     const placement = await Effect.runPromise(of.folders.place(key, { environment: "main" }));
     const failed = await Effect.runPromise(Effect.flip(of.binder.bind(placement.pool, key, placement)));
@@ -267,6 +267,67 @@ test("a folder instance's bind gives its pod its time to run and its bayma to an
         assert.ok(Date.now() < deadline, `the pod of ${conversation} was not deleted`);
       }
     }
+  } finally {
+    stand.close();
+  }
+});
+
+test("a folder instance's bind whose image is pulled for longer than the gateway's binds wait goes through, and a bind of it meanwhile waits for it", async () => {
+  const stand = await bayma();
+  try {
+    const of = await foldersOf(stand.port, 60_000, 2_000, 6_000, { binderWaitMs: 1_000 });
+    const key = folderKey("claude", "telegram:45");
+    const placement = await Effect.runPromise(of.folders.place(key, { environment: "main" }));
+    const bind = () => Effect.runPromise(Effect.result(of.binder.bind(placement.pool, key, placement)));
+    const first = bind();
+    let made = "";
+    while (!made) {
+      [made = ""] = ((await run(withKube((kube) => kube.list("v1", "Pod", of.namespace, `${BINDING_LABEL}=${keyHash(key)}`)))) as V1Pod[]).map((pod) => pod.metadata?.name ?? "");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const container = (ready: boolean, state: object) => ({ name: "bayma", image: "bayma", imageID: "", ready, restartCount: 0, containerID: "containerd://c-0", state });
+    await run(withKube((kube) => kube.patchPodStatus(of.namespace, made, { status: { phase: "Pending", conditions: [{ type: "PodScheduled", status: "True" }], containerStatuses: [container(false, { waiting: { reason: "ContainerCreating" } })] } })));
+    const second = bind();
+    // Pulled for three times as long as the gateway's binds wait.
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    await run(withKube((kube) =>
+      kube.patchPodStatus(of.namespace, made, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], conditions: [{ type: "Ready", status: "True" }], containerStatuses: [container(true, { running: {} })] } })
+    ));
+    const pods = (result: Awaited<ReturnType<typeof bind>>) => (result._tag === "Success" ? result.success.pod : String(result.failure));
+    assert.deepEqual([pods(await first), pods(await second)], [made, made]);
+  } finally {
+    stand.close();
+  }
+});
+
+test("a folder instance's bind while it is being released waits for its release, for longer than the gateway's binds wait, then makes its pod anew", async () => {
+  const stand = await bayma();
+  try {
+    const of = await foldersOf(stand.port, 60_000, 10_000, 3_000, { binderWaitMs: 1_000 });
+    const key = folderKey("codex", "telegram:46");
+    const before = (await bound(of, key)).metadata?.name ?? "";
+    // Held as its kubelet holds it while its bayma stops.
+    await run(withKube((kube) => kube.patch("v1", "Pod", of.namespace, before, { metadata: { finalizers: ["alasio.dev/test"] } })));
+    const placement = await Effect.runPromise(of.folders.place(key, { environment: "main" }));
+    const releasing = Effect.runPromise(of.binder.release(placement.pool, key, placement.release));
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const again = Effect.runPromise(Effect.result(of.binder.bind(placement.pool, key, placement)));
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    await run(withKube((kube) => kube.patch("v1", "Pod", of.namespace, before, { metadata: { finalizers: null } })));
+    assert.equal(await releasing, "released");
+    let made = "";
+    for (let tries = 0; !made; tries += 1) {
+      assert.ok(tries < 100, `no pod made after the release: ${String(await Promise.race([again, Promise.resolve("binding")]))}`);
+      [made = ""] = ((await run(withKube((kube) => kube.list("v1", "Pod", of.namespace, `${BINDING_LABEL}=${keyHash(key)}`)))) as V1Pod[]).map((pod) => pod.metadata?.name ?? "").filter((name) => name !== before);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    await run(withKube((kube) =>
+      kube.patchPodStatus(of.namespace, made, {
+        status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], conditions: [{ type: "Ready", status: "True" }], containerStatuses: [{ name: "bayma", image: "bayma", imageID: "", ready: true, restartCount: 0, containerID: "containerd://c-1", state: { running: {} } }] },
+      })
+    ));
+    const result = await again;
+    assert.equal(result._tag === "Success" ? result.success.pod : String(result.failure), made);
   } finally {
     stand.close();
   }
