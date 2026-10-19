@@ -9,7 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 
-import { type Cluster, KubeConfig, type User, type V1Node, type V1RuntimeClass } from "@kubernetes/client-node";
+import { type Cluster, KubeConfig, type User, type V1Node, type V1Pod, type V1RuntimeClass } from "@kubernetes/client-node";
 import { Duration, Effect, FileSystem, type PlatformError, Schedule, Schema } from "effect";
 
 import { CONTAINERD, gvisorDirectory, gvisorHandler, gvisorRuntimeClass } from "../../../src/node-agent/names.ts";
@@ -214,6 +214,21 @@ export const readySince = (node: V1Node, started: number): boolean =>
   node.status?.conditions?.some(({ type, status, lastHeartbeatTime }) =>
     type === "Ready" && status === "True" && lastHeartbeatTime !== undefined && new Date(lastHeartbeatTime).getTime() >= Math.floor(started / 1000) * 1000
   ) ?? false;
+
+/**
+ * Of the pods the API server has bound to a node (`bound`), those its kubelet does not serve
+ * yet (`served`, the pods it lists as its own), by their namespace and name: each that has
+ * not ended, nor is being deleted. A node reports itself ready before its kubelet, started
+ * anew, has taken its pods back; until it has, what is asked of one through the API server, an
+ * exec or its logs, is answered 404, though the pod's own status, from before, says it runs.
+ */
+export function unservedPods(bound: readonly V1Pod[], served: readonly V1Pod[]): string[] {
+  const serving = new Set(served.map((pod) => pod.metadata?.uid));
+  return bound
+    .filter((pod) => pod.status?.phase !== "Succeeded" && pod.status?.phase !== "Failed" && pod.metadata?.deletionTimestamp === undefined)
+    .filter((pod) => !serving.has(pod.metadata?.uid))
+    .map((pod) => `${pod.metadata?.namespace}/${pod.metadata?.name}`);
+}
 
 /**
  * The kubeconfig k3s wrote (`k3sYaml`), named `cluster`, and pointed at `server` when

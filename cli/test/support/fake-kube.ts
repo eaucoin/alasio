@@ -124,6 +124,12 @@ export interface FakeKube {
   readonly finalizers: Map<string, string>;
   /** The paths it refuses to read, as a kubeconfig's rights may not reach them: 403. */
   readonly forbidden: Set<string>;
+  /**
+   * The pods, by `<namespace>/<name>`, their node's kubelet does not serve yet, as one started
+   * anew has not taken them back: it lists every other pod bound to it, and answers an exec of
+   * one of these 404.
+   */
+  readonly unserved: Set<string>;
   readonly execs: KubeExec[];
   /** How the test answers a command run in a container; exit 0, saying nothing, unless it says. */
   onExec: (exec: KubeExec) => KubeExecResult;
@@ -250,6 +256,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
   const logReads: URLSearchParams[] = [];
   const finalizers = new Map<string, string>();
   const forbidden = new Set<string>();
+  const unserved = new Set<string>();
   const execs: KubeExec[] = [];
   const forwards: KubeForward[] = [];
   const forwarded = new Map<string, number>();
@@ -410,6 +417,14 @@ export async function serveFakeKube(): Promise<FakeKube> {
     if (!target) return refuse(response, 404, `the server could not find the requested resource (${url.pathname})`);
     const path = url.pathname;
     if (method === "GET" && forbidden.has(path)) return refuse(response, 403, `${target.plural} is forbidden`);
+    // A node's kubelet's own pods, through the API server's proxy of it.
+    const kubelet = /^\/api\/v1\/nodes\/([^/]+)\/proxy\/pods$/u.exec(path);
+    if (method === "GET" && kubelet) {
+      const items = [...objects.values()].filter((object) =>
+        object.kind === "Pod" && (object.spec?.["nodeName"] as string | undefined) === kubelet[1] && !unserved.has(`${object.metadata.namespace}/${object.metadata.name}`)
+      );
+      return json(response, 200, { kind: "PodList", apiVersion: "v1", metadata: {}, items });
+    }
     if (method === "GET" && target.sub === "log") {
       logReads.push(url.searchParams);
       const text = logs.get(`${target.name}/${url.searchParams.get("container")}`) ?? logs.get(target.name ?? "");
@@ -528,6 +543,8 @@ export async function serveFakeKube(): Promise<FakeKube> {
     if (request.headers.authorization !== `Bearer ${TOKEN}` || (target?.sub !== "exec" && target?.sub !== "portforward")) {
       return void socket.end("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
     }
+    // Of a pod its node's kubelet has not taken back, as the kubelet answers.
+    if (unserved.has(`${target.namespace}/${target.name}`)) return void socket.end("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
     const accept = createHash("sha1").update(`${request.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
     socket.write(
       ["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade", `Sec-WebSocket-Accept: ${accept}`, "Sec-WebSocket-Protocol: v4.channel.k8s.io", "", ""].join("\r\n"),
@@ -572,6 +589,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
     logReads,
     finalizers,
     forbidden,
+    unserved,
     execs,
     onExec: () => ({ exitCode: 0 }),
     forwards,
