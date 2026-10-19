@@ -56,6 +56,9 @@ const START_POLL_MS = 1_000;
 /** How long an ask of a starting bayma's status may take. */
 const STATUS_TIMEOUT_MS = 5_000;
 
+/** How many times a failure is added again to its key's Lease that another replica changed meanwhile. */
+const SETTLE_TRIES = 5;
+
 /** The label of a key's failures' Lease, and its annotations: the times its binds failed, and why the last did. */
 const FAILING_LABEL = "alasio.dev/folder-failing";
 const FAILURES_ANNOTATION = "alasio.dev/failures";
@@ -262,17 +265,25 @@ export const makeFolders = Effect.fnUntraced(function*(
   const forgotten = (key: string): Effect.Effect<void, KubeApiError> =>
     kube.remove("coordination.k8s.io/v1", "Lease", namespace, failingLease(key)).pipe(Effect.catchIf(hasStatus(404), () => Effect.void));
 
-  /** Records how a bind of `key` ended: its failure, or, where it went through, none, its failures forgotten. */
+  /**
+   * Records how a bind of `key` ended: its failure, or, where it went through, none, its
+   * failures forgotten. A failure is added to the Lease as it was read, read again where
+   * another replica's changed it meanwhile (409), so each is counted.
+   */
   const settled = (key: string) => (failure: string | null): Effect.Effect<void> =>
     Effect.gen(function*() {
       if (failure === null) return yield* forgotten(key);
-      const now = yield* Clock.currentTimeMillis;
-      const lease = yield* failuresOf(key);
-      const times = [...recent(lease, now), now].slice(-FOLDER_FAILURES);
-      const annotations = { [KEY_ANNOTATION]: key, [FAILURES_ANNOTATION]: JSON.stringify(times), [REASON_ANNOTATION]: failure };
-      yield* Effect.logWarning(`binding the folder instance of ${key} failed, ${times.length} in a row: ${failure}`);
-      if (lease) yield* kube.replace({ ...lease, metadata: { ...lease.metadata, annotations: { ...lease.metadata?.annotations, ...annotations } } });
-      else yield* kube.create({ apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { name: failingLease(key), namespace, labels: { [FAILING_LABEL]: "true" }, annotations } });
+      const added = Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis;
+        const lease = yield* failuresOf(key);
+        const times = [...recent(lease, now), now].slice(-FOLDER_FAILURES);
+        const annotations = { [KEY_ANNOTATION]: key, [FAILURES_ANNOTATION]: JSON.stringify(times), [REASON_ANNOTATION]: failure };
+        if (lease) yield* kube.replace({ ...lease, metadata: { ...lease.metadata, annotations: { ...lease.metadata?.annotations, ...annotations } } });
+        else yield* kube.create({ apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { name: failingLease(key), namespace, labels: { [FAILING_LABEL]: "true" }, annotations } });
+        return times.length;
+      });
+      const times = yield* added.pipe(Effect.retry({ while: hasStatus(409), times: SETTLE_TRIES }));
+      yield* Effect.logWarning(`binding the folder instance of ${key} failed, ${times} in a row: ${failure}`);
     }).pipe(Effect.catch((error) => Effect.logWarning(`recording how a bind of ${key} ended failed: ${error.message}`)));
 
   /** Why `key` is held, where its binds failed FOLDER_FAILURES times in a row within FOLDER_FAILING_MS; null where it is not. */

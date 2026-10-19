@@ -235,6 +235,20 @@ async function bindAs(of: Awaited<ReturnType<typeof foldersOf>>, key: string, st
   return { placement, result: await binding };
 }
 
+test("binds of a folder instance failing at once, as on two replicas, are each counted", async () => {
+  const stand = await bayma();
+  try {
+    const of = await foldersOf(stand.port);
+    const key = folderKey("codex", "telegram:47");
+    const placed = await Effect.runPromise(of.folders.place(key, { environment: "main" }));
+    await Promise.all([1, 2, 3].map((n) => Effect.runPromise(placed.settled?.(`its pod is pending: no node (${n})`) ?? Effect.void)));
+    const held = await Effect.runPromise((await Effect.runPromise(of.folders.place(key, { environment: "main" }))).held ?? Effect.succeed(null));
+    assert.match(held ?? "", /^its last 3 binds failed/u);
+  } finally {
+    stand.close();
+  }
+});
+
 test("a held folder instance's restart, its caller's release, forgets its binds' failures, bound or not, so its next bind goes on", async () => {
   const stand = await bayma();
   try {
