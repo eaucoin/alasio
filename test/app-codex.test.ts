@@ -5,7 +5,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { agentMessage, codexThread, codexTurn, commandExecution, threadResumeResponse, turnCompleted, turnError, turnStarted } from "./support/codex-protocol.ts";
+import { ALASIO_CODEX_MODEL } from "../src/codex/model.ts";
+import { agentMessage, codexModel, codexThread, codexTurn, commandExecution, threadResumeResponse, turnCompleted, turnError, turnStarted } from "./support/codex-protocol.ts";
 import type { RunningAlasio } from "./support/alasio.ts";
 import {
   WORKING,
@@ -158,7 +159,7 @@ test("a message before any service is mounted gets the service picker and is not
   assert.equal(inputText(turnStart), "Now fix it");
   answerTurn(codex, "thread-1", "turn-1", "Fixed.");
   await telegram.waitFor("sendRichMessage");
-  assert.deepEqual(codex.methods(), ["initialize", "thread/start", "turn/start"]);
+  assert.deepEqual(codex.methods(), ["initialize", "thread/start", "model/list", "turn/start"]);
 });
 
 test("a Codex turn: a status message, sent then edited, and the final answer alone as the reply; what alasio asks of the app-server", async (t) => {
@@ -572,5 +573,34 @@ test("the app-server exiting mid-turn fails the turn visibly, and the next promp
   answerTurn(codex, "thread-1", "turn-2", "Done.");
   await telegram.waitFor("sendRichMessage", () => true, { mark });
   assert.equal(codex.processes.length, 2);
-  assert.deepEqual(codex.methods(), ["initialize", "thread/start", "turn/start", "initialize", "thread/loaded/list", "thread/resume", "turn/start"]);
+  assert.deepEqual(codex.methods(), ["initialize", "thread/start", "model/list", "turn/start", "initialize", "thread/loaded/list", "thread/resume", "model/list", "turn/start"]);
+});
+
+test("a turn on a Codex login without the model chosen runs on the login's default, the operator told once, after its reply", async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex } = alasio;
+  // A login whose plan has not alasio's pinned model.
+  codex.answerEvery("model/list", () => ({ data: [codexModel("gpt-5.6-terra", { isDefault: true })], nextCursor: null }));
+  await mount(alasio, "codex", "alpha");
+  let mark = telegram.mark();
+  telegram.say("Fix the build");
+  await answerThreadStart(codex, "thread-1", alasio.folder("alpha"));
+  assert.equal((await answerTurnStart(codex, "thread-1", "turn-1")).params.model, "gpt-5.6-terra");
+  answerTurn(codex, "thread-1", "turn-1", "Fixed.");
+  const NOTICE = `This Codex login doesn't offer ${ALASIO_CODEX_MODEL}, so Codex used gpt-5.6-terra, the login's default (at medium effort). Use /model to choose another.`;
+  await telegram.waitFor("sendMessage", (call) => call.params.text === NOTICE, { mark });
+  assert.deepEqual(timeless(telegram.shown(mark)).filter(({ method, text }) => method === "sendRichMessage" || text === NOTICE), [
+    { method: "sendRichMessage", text: "Fixed." },
+    { method: "sendMessage", text: NOTICE },
+  ]);
+
+  // Told once: the next turn runs on it too, saying nothing of it, its app-server's models listed once.
+  mark = telegram.mark();
+  telegram.say("Next");
+  await answerLoadedThreads(codex, ["thread-1"]);
+  assert.equal((await answerTurnStart(codex, "thread-1", "turn-2")).params.model, "gpt-5.6-terra");
+  answerTurn(codex, "thread-1", "turn-2", "Done.");
+  await telegram.waitFor("sendRichMessage", (call) => call.params.rich_message.markdown === "Done.", { mark });
+  assert.equal(telegram.shown(mark).some(({ text }) => text === NOTICE), false);
+  assert.equal(codex.methods().filter((method) => method === "model/list").length, 1);
 });

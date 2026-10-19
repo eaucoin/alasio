@@ -263,6 +263,16 @@ create table if not exists ${SCHEMA}.outbox_media (
   primary key (outbox_id, position)
 );
 
+-- What a conversation was told of its turns besides their replies (TurnResult.notice), as
+-- each was queued with it, in one transaction: told once, whichever alasio told it, and
+-- whether or not it has restarted since.
+create table if not exists ${SCHEMA}.conversation_notices (
+  conversation_id text not null references ${SCHEMA}.conversations (id) on delete cascade,
+  notice text not null,
+  told_at timestamptz not null default now(),
+  primary key (conversation_id, notice)
+);
+
 create table if not exists ${SCHEMA}.prompt_jobs (
   seq bigint generated always as identity,
   id text primary key,

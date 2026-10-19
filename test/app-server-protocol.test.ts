@@ -23,7 +23,7 @@ import { type AppServerApart, makeAppServerThreads } from "../src/codex/app-serv
 import { mapItemToBlocks, responseProjection } from "../src/codex/event-projection.ts";
 import type { CodexThreadConfig } from "../src/codex/thread-config.ts";
 import { appServerProcess } from "./support/app-server-process.ts";
-import { agentMessage, codexThread, codexTurn } from "./support/codex-protocol.ts";
+import { agentMessage, codexModel, codexThread, codexTurn } from "./support/codex-protocol.ts";
 
 /** An active goal as Codex reports it. */
 function activeGoal(threadId: string, objective: string): v2.ThreadGoal {
@@ -67,7 +67,7 @@ type AppServerAnswers = {
 /** What the threads' work runs apart, here detached. */
 const apart: AppServerApart = (work) => Effect.forkDetach(work);
 
-function answeringRpc(answers: AppServerAnswers): Pick<AppServerRpc, "start" | "request" | "stop" | "whenGone"> {
+function answeringRpc(answers: AppServerAnswers): Pick<AppServerRpc, "start" | "request" | "stop" | "whenGone" | "running"> {
   return {
     start: () => Effect.void,
     stop: Effect.void,
@@ -76,6 +76,7 @@ function answeringRpc(answers: AppServerAnswers): Pick<AppServerRpc, "start" | "
       return answer ? answer(params) : Effect.sync(() => assert.fail(`unexpected app-server request ${method}`));
     },
     whenGone: Effect.succeed(Effect.never),
+    running: Effect.succeed(1),
   };
 }
 
@@ -476,3 +477,40 @@ test("a file change shows a deletion as one, from the app-server and from exec",
   ]), ["Delete", "Edit", "Edit"]);
   assert.deepEqual(names([{ path: "a", kind: "delete" }, { path: "b", kind: "update" }]), ["Delete", "Edit"]);
 });
+
+test("the login's models are listed hidden ones too, once an app-server, and again for the next app-server", () =>
+  withNotifications((queue) => Effect.gen(function*() {
+    const asked: unknown[] = [];
+    let running = 1;
+    const thread = makeAppServerThreads({
+      ...answeringRpc({
+        "model/list": (params) => Effect.sync(() => (asked.push(params), { data: [codexModel(`gpt-of-${running}`, { hidden: true })], nextCursor: null })),
+      }),
+      running: Effect.sync(() => running),
+    }, queue, apart);
+    const scope = { cwd: "/tmp", env: {} };
+    const listed = yield* Effect.all([thread.loginModels(scope), thread.loginModels(scope)], { concurrency: "unbounded" });
+    assert.deepEqual([listed.map((models) => models.map(({ id }) => id)), asked.length], [[["gpt-of-1"], ["gpt-of-1"]], 1]);
+    assert.equal((asked[0] as { readonly includeHidden?: boolean }).includeHidden, true);
+    // The app-server replaced: its models listed anew.
+    running = 2;
+    assert.deepEqual([(yield* thread.loginModels(scope)).map(({ id }) => id), asked.length], [["gpt-of-2"], 2]);
+  })));
+
+test("the login's models not listed within ten seconds are none for the turn that asked, which runs on the model chosen, and asked for again by the next", () =>
+  withNotifications((queue) => Effect.gen(function*() {
+    let asked = 0;
+    // The first list never comes; the next does.
+    const thread = makeAppServerThreads(answeringRpc({
+      "model/list": () => Effect.suspend(() => ((asked += 1) === 1 ? Effect.never : Effect.succeed({ data: [codexModel("gpt-5.6-terra")], nextCursor: null }))),
+    }), queue, apart);
+    const scope = { cwd: "/tmp", env: {} };
+    const listing = yield* Effect.forkChild(thread.loginModels(scope));
+    yield* TestClock.adjust("9 seconds");
+    assert.equal(listing.pollUnsafe(), undefined);
+    yield* TestClock.adjust("1 second");
+    assert.deepEqual(yield* Fiber.join(listing), []);
+    // Not kept: the next turn asks again, and keeps the list that came.
+    assert.deepEqual([(yield* thread.loginModels(scope)).map(({ id }) => id), asked], [["gpt-5.6-terra"], 2]);
+    assert.deepEqual([(yield* thread.loginModels(scope)).map(({ id }) => id), asked], [["gpt-5.6-terra"], 2]);
+  }).pipe(Effect.provide(TestClock.layer()))));

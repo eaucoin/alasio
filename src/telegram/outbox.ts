@@ -70,6 +70,12 @@ export class Outbox extends Context.Service<Outbox, {
    * buttons' actions kept with it, in one transaction: neither is kept without the other.
    */
   readonly enqueuePanel: (panel: OutboxPanel) => Effect.Effect<string, StoreError>;
+  /**
+   * Queues a notice of the conversation's turns besides their replies, as enqueueText does,
+   * unless the conversation was told it already, by this alasio or another (the store's
+   * enqueueOutboxNotice): whether it was queued now.
+   */
+  readonly enqueueNotice: (notice: { readonly conversationId: string; readonly chatId: number | string; readonly text: string }) => Effect.Effect<boolean, StoreError>;
   /** Queues a turn's status message and wakes delivery: its id, which an edit of it names. */
   readonly enqueueStatus: (status: OutboxStatus) => Effect.Effect<string, StoreError>;
   /** Queues an edit of the status message `edits` and wakes delivery. */
@@ -213,7 +219,7 @@ export class Outbox extends Context.Service<Outbox, {
     );
 
     /** Queues with the trace it is queued in, and wakes delivery. */
-    const queued = (enqueue: (traceparent: string | null) => Effect.Effect<string, StoreError>) =>
+    const queued = <A>(enqueue: (traceparent: string | null) => Effect.Effect<A, StoreError>) =>
       Effect.suspend(() => enqueue(currentTraceparent())).pipe(Effect.tap(() => Effect.sync(() => wakeup.openUnsafe())));
 
     return Outbox.of({
@@ -222,6 +228,7 @@ export class Outbox extends Context.Service<Outbox, {
         queued((traceparent) =>
           store.enqueueOutboxPanel(conversationId, keyboard.flat(), (ids) => ({ chatId, text, options: { reply_markup: inlineKeyboard(keyboard, ids) }, traceparent }))
         ),
+      enqueueNotice: ({ conversationId, chatId, text }) => queued((traceparent) => store.enqueueOutboxNotice(conversationId, { chatId, text, traceparent })),
       enqueueStatus: (status) => queued((traceparent) => store.enqueueOutboxStatus({ ...status, traceparent })),
       enqueueEdit: (edits, edit) => queued((traceparent) => store.enqueueOutboxEdit(edits, { ...edit, traceparent })),
       deliverDue,

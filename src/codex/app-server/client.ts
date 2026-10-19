@@ -91,6 +91,7 @@ function inLogScope(appServer: AppServer): AppServer {
     listThreads: (scope) => scoped(appServer.listThreads(scope)),
     listTurns: (scope) => scoped(appServer.listTurns(scope)),
     listModels: (scope) => scoped(appServer.listModels(scope)),
+    loginModels: (scope) => scoped(appServer.loginModels(scope)),
     startTurn: (options) => scoped(appServer.startTurn(options)),
     claimTurn: (threadId, turnId) => scoped(appServer.claimTurn(threadId, turnId)),
     waitForTurnId: (threadId, timeout) => scoped(appServer.waitForTurnId(threadId, timeout)),

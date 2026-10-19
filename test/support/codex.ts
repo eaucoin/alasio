@@ -11,7 +11,8 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import type { ClientNotification, ClientRequest, InitializeResponse, RequestId, ServerNotification, v2 } from "../../.types/codex/index.js";
-import { initializeResponse } from "./codex-protocol.ts";
+import { ALASIO_CODEX_MODEL } from "../../src/codex/model.ts";
+import { codexModel, initializeResponse } from "./codex-protocol.ts";
 import type { FakeCodexCommand, FakeCodexReport } from "./fake-codex-app-server.ts";
 import { eventually } from "./wait.ts";
 
@@ -89,6 +90,8 @@ export class FakeCodexAppServer {
     this.server = server;
     this.bin = bin;
     this.answerEvery("initialize", () => initializeResponse());
+    // The login's models, as a turn asks for them: alasio's pinned one, its default, unless a test says otherwise.
+    this.answerEvery("model/list", () => ({ data: [codexModel(ALASIO_CODEX_MODEL, { isDefault: true })], nextCursor: null }));
   }
 
   /** A stand-in whose socket and binary are in `directory`. */

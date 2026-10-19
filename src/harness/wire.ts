@@ -86,10 +86,12 @@ export const TurnAnswer = Schema.Struct({
   pendingResponseId: Schema.String,
   interrupted: Schema.Boolean,
   responseCompleted: Schema.Boolean,
+  notice: Schema.NullOr(Schema.String),
 });
 
-/** A turn's result as it crosses: what the harness did not say of its session is said to be none. */
-export const encodeTurnAnswer = (result: TurnResult): typeof TurnAnswer.Encoded => Schema.encodeSync(TurnAnswer)({ ...result, sessionId: result.sessionId ?? null });
+/** A turn's result as it crosses: what the harness did not say of its session, or had no notice of, is said to be none. */
+export const encodeTurnAnswer = (result: TurnResult): typeof TurnAnswer.Encoded =>
+  Schema.encodeSync(TurnAnswer)({ ...result, sessionId: result.sessionId ?? null, notice: result.notice ?? null });
 /** The turn's result an answer carries. */
 export const decodeTurnAnswer = (body: unknown) => Schema.decodeUnknownEffect(TurnAnswer)(body).pipe(Effect.map((answer): TurnResult => ({ ...answer, blockSequence: [...answer.blockSequence] })));
 

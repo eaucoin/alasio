@@ -316,6 +316,12 @@ export class Store extends Context.Service<Store, {
    * other. Its id.
    */
   readonly enqueueOutboxPanel: (conversationId: string, actions: readonly NewCallbackAction[], compose: (ids: readonly string[]) => NewOutboxText) => Stored<string>;
+  /**
+   * Queues `notice`, a reply that tells the conversation of its turns besides their replies,
+   * unless it was told it already, recording it as told in the same transaction, so that it
+   * is told once, by any alasio: whether it was queued now.
+   */
+  readonly enqueueOutboxNotice: (conversationId: string, notice: NewOutboxText) => Stored<boolean>;
   /** Queues a turn's status message: its id, which an edit of it names. */
   readonly enqueueOutboxStatus: (status: NewOutboxStatus) => Stored<string>;
   /** Queues an edit of the status message `edits`. */
@@ -539,6 +545,11 @@ const makeStore = Effect.fnUntraced(function*({
       database.transaction((sql) => {
         const on = repositoriesOn(sql);
         return Effect.flatMap(on.callbacks.createCallbackActions(conversationId, actions), (ids) => on.outbox.enqueueText(compose(ids)));
+      }),
+    enqueueOutboxNotice: (conversationId, notice) =>
+      database.transaction((sql) => {
+        const on = repositoriesOn(sql);
+        return Effect.flatMap(on.outbox.recordNotice(conversationId, notice.text), (fresh) => (fresh ? Effect.as(on.outbox.enqueueText(notice), true) : Effect.succeed(false)));
       }),
     enqueueOutboxStatus: (status) => outbox.enqueueStatus(status),
     enqueueOutboxEdit: (edits, edit) => outbox.enqueueEdit(edits, edit),

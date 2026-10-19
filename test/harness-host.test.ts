@@ -24,6 +24,9 @@ import { TurnFenced } from "../src/persistence/store.ts";
 import { holdsIn, newSchema, run, testStore } from "./support/store.ts";
 import { turnsStub, withServices } from "./support/turns.ts";
 
+/** What the recording harness tells of each turn besides its reply. */
+const NOTICE = "This Codex login doesn't offer gpt-5.6-sol, so Codex used gpt-5.6-terra, the login's default (at high effort). Use /model to choose another.";
+
 /**
  * A Codex harness whose turn hands what it was given to `seen`, writes its answer, and acts
  * as a harness that runs on between prompts would; `onRun` says what it finds as it runs.
@@ -57,7 +60,7 @@ function recordingHarness(seen: TurnParams[], onRun: () => void = () => {}): Har
         yield* params.persistence.markPendingResponseComplete(pendingResponseId);
         yield* params.onBackgroundResponse ?? Effect.void;
         yield* params.onIdle ?? Effect.void;
-        const result: TurnResult = { blockSequence, sessionId: "session-1", pendingResponseId, interrupted: false, responseCompleted: true };
+        const result: TurnResult = { blockSequence, sessionId: "session-1", pendingResponseId, interrupted: false, responseCompleted: true, notice: NOTICE };
         return result;
       }),
     listModels: unused("listModels"),
@@ -128,7 +131,7 @@ for (const [reach, reached] of Object.entries(REACHES)) {
         assert.deepEqual(yield* Effect.promise(() => holdsIn(schema)), []);
 
         const result = yield* host.startTurn(start("10", epoch, job.id));
-        assert.deepEqual([result.blockSequence, result.sessionId, result.interrupted, result.responseCompleted], [[{ type: "text", content: "Done." }], "session-1", false, true]);
+        assert.deepEqual([result.blockSequence, result.sessionId, result.interrupted, result.responseCompleted, result.notice], [[{ type: "text", content: "Done." }], "session-1", false, true, NOTICE]);
         assert.ok((yield* store.getCompletedResponsesPendingDelivery).some(({ id }) => id === result.pendingResponseId));
         assert.deepEqual([yield* PubSub.take(events), yield* PubSub.take(events)], [
           { kind: "background-response", conversationId },

@@ -38,7 +38,7 @@ function reporterFor(store: Store["Service"], enqueue: (text: OutboxText) => Eff
   return Effect.runSync(makeStatusReporter().pipe(Effect.provide(Layer.mergeAll(
     Layer.succeed(Store, store),
     unusedClient.layer,
-    Layer.succeed(Outbox, Outbox.of({ enqueueText: enqueue, enqueuePanel: () => Effect.die("no panel is queued"), enqueueStatus: () => Effect.succeed("status-1"), enqueueEdit: () => Effect.succeed("edit-1"), deliverDue: Effect.void, deliverChat: () => Effect.void })),
+    Layer.succeed(Outbox, Outbox.of({ enqueueText: enqueue, enqueuePanel: () => Effect.die("no panel is queued"), enqueueNotice: () => Effect.die("no notice is queued"), enqueueStatus: () => Effect.succeed("status-1"), enqueueEdit: () => Effect.succeed("edit-1"), deliverDue: Effect.void, deliverChat: () => Effect.void })),
   ))));
 }
 
@@ -87,6 +87,7 @@ test("failed app-server interrupt forgets local turn ownership", async () => {
       request: () => Effect.fail(new AppServerRequestTimeout({ method: "turn/interrupt" })),
       stop: Effect.void,
       whenGone: Effect.succeed(Effect.never),
+      running: Effect.succeed(1),
     }, notifications, (work) => Effect.forkDetach(work));
     const interrupted = yield* Effect.flip(client.interrupt("thread", "stream-error"));
     assert.equal(interrupted.message, "Codex app-server request timed out: turn/interrupt");

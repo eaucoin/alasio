@@ -4,7 +4,7 @@ import { test } from "node:test";
 import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@grammyjs/types";
 import { Effect, Layer } from "effect";
 
-import { resolveCodexModelChoice, ALASIO_CODEX_MODEL, ALASIO_CODEX_REASONING_EFFORT } from "../src/codex/model.ts";
+import { choiceForLogin, resolveCodexModelChoice, ALASIO_CODEX_MODEL, ALASIO_CODEX_REASONING_EFFORT } from "../src/codex/model.ts";
 import { getClaudeEffort, getClaudeModel, ALASIO_CLAUDE_MODEL } from "../src/harness/claude/model.ts";
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS } from "../src/harness/names.ts";
@@ -13,6 +13,7 @@ import { buildModelPanel, handleModelControlCallback, isModelControlAction, type
 import type { CallbackAction } from "../src/persistence/callback-repository.ts";
 import { Store } from "../src/persistence/store.ts";
 import type { TelegramClient } from "../src/telegram/client.ts";
+import { codexModel } from "./support/codex-protocol.ts";
 import { run, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 
@@ -138,4 +139,20 @@ test("a model without effort control is chosen in one step", async () => {
   const haiku = callbackData(panel.options.reply_markup, "Haiku");
   await runControl(handleModelControlCallback({ action: await consume(store, haiku), callbackQueryId: "q", chatId: 42, messageId: 7 }), store);
   assert.deepEqual(await run(store.getModelChoice(CONVERSATION, CLAUDE_HARNESS)), { model: "haiku", effort: null });
+});
+
+test("a Codex turn runs on the model chosen where the login has it, and on the login's default, saying so, where it has not", () => {
+  const terra = codexModel("gpt-5.6-terra", { isDefault: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "" }, { reasoningEffort: "high", description: "" }] });
+  const mini = codexModel("gpt-5.6-mini", { supportedReasoningEfforts: [{ reasoningEffort: "low", description: "" }] });
+  // The login has it: as chosen.
+  assert.deepEqual(choiceForLogin({ model: "gpt-5.6-mini", effort: "low" }, [terra, mini]), { choice: { model: "gpt-5.6-mini", effort: "low" }, notice: null });
+  // It has not: the login's default, at the effort chosen, which that model has.
+  const pinned = resolveCodexModelChoice(null);
+  const fallback = choiceForLogin(pinned, [mini, terra]);
+  assert.deepEqual(fallback.choice, { model: "gpt-5.6-terra", effort: "high" });
+  assert.equal(fallback.notice, `This Codex login doesn't offer ${pinned.model}, so Codex used gpt-5.6-terra, the login's default (at high effort). Use /model to choose another.`);
+  // At its own default effort, where it has not the one chosen.
+  assert.deepEqual(choiceForLogin({ model: "gpt-5.6-sol", effort: "xhigh" }, [terra]).choice, { model: "gpt-5.6-terra", effort: "medium" });
+  // Nothing offered, as where the list could not be read: as chosen.
+  assert.deepEqual(choiceForLogin(pinned, []), { choice: pinned, notice: null });
 });
