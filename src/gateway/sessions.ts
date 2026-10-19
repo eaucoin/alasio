@@ -49,7 +49,7 @@
  * the workspace restored elsewhere until then.
  *
  * Its metrics: how long each attach and detach took (ATTACH_DURATION, DETACH_DURATION), and
- * each binding released, by why (RELEASES): `idle`, released by its sweep; `asked`, by its
+ * each binding released, by why (./releases.ts RELEASES): `idle`, released by its sweep; `asked`, by its
  * caller; `lost`, its pod gone while it was bound; `deleted`, its pod ended by other than the
  * gateway, as a drain ends one, saved first where its bayma holds its stop (./snapshots.ts
  * saveStopping), its workspace detached once its containers stopped (drain). Each of its pool's
@@ -74,19 +74,14 @@ import type { Events, EventInput } from "../events/events.ts";
 import { meter } from "../telemetry/index.ts";
 import type { Environments } from "./environments.ts";
 import type { GatewaySnapshots as GatewaySnapshotsConfig } from "./names.ts";
+import { released } from "./releases.ts";
 import { BaymaStatus, makeGatewaySnapshots } from "./snapshots.ts";
 
 /** The metrics of the gateway's sessions, as the module says. */
 export const ATTACH_DURATION = "alasio.gateway.attach.duration";
 export const DETACH_DURATION = "alasio.gateway.detach.duration";
-export const RELEASES = "alasio.gateway.releases";
 const attachDuration = meter.createHistogram(ATTACH_DURATION, { description: "How long a node agent took to attach a workspace into its bound pod", unit: "s" });
 const detachDuration = meter.createHistogram(DETACH_DURATION, { description: "How long a node agent took to detach a workspace from its released pod", unit: "s" });
-const releases = meter.createCounter(RELEASES, { description: "Bindings released, by why: idle, asked by their caller, lost as their pod went, or deleted as their pod was ended by other than the gateway" });
-
-/** Why a binding was released. */
-type ReleaseReason = "idle" | "asked" | "lost" | "deleted" | "broken";
-const released = (pool: Pool, reason: ReleaseReason) => Effect.sync(() => releases.add(1, { "k8s.namespace.name": pool.namespace, "alasio.gateway.release.reason": reason }));
 
 /** `effect`, its duration, when it succeeds, recorded on `histogram` of `pool`'s namespace. */
 const timed = <A, E, R>(histogram: typeof attachDuration, pool: Pool, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>

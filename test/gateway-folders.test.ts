@@ -8,11 +8,13 @@ import { before, test } from "node:test";
 import type { V1Pod, V1Secret } from "@kubernetes/client-node";
 import { Effect, Layer, Scope } from "effect";
 
+import { added } from "./support/metrics.ts";
 import { Binder } from "../src/binder/binder.ts";
 import { readLease } from "../src/binder/bindings.ts";
 import { BINDING_LABEL, KEY_ANNOTATION, keyHash } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
 import { makeFolders } from "../src/gateway/folders.ts";
+import { RELEASES } from "../src/gateway/releases.ts";
 import { FOLDER_POOL, FOLDER_STOP_SECONDS, folderKey, folderTokenSecret } from "../src/gateway/names.ts";
 import { KubeApiError, KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
@@ -171,7 +173,7 @@ test("a folder instance's pod whose token's Secret it cannot own is deleted with
   }
 });
 
-test("a folder instance idle for its time is released, its pod gone before its Lease, and one whose bayma ended released as broken", async () => {
+test("a folder instance idle for its time is released, its pod gone before its Lease, one whose bayma ended released as broken, and one its caller lets go, each release counted", async () => {
   const stand = await bayma();
   try {
     const of = await foldersOf(stand.port, 200);
@@ -180,27 +182,37 @@ test("a folder instance idle for its time is released, its pod gone before its L
     const pod = await bound(of, key);
     // Busy: kept.
     assert.deepEqual(await Effect.runPromise(Effect.provide(of.folders.sweep, Layer.fresh(KubeClient.layer))), []);
-    // Idle past its time: released, its pod gone, and its Lease.
-    stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: 0 };
-    let released: readonly string[] = [];
-    for (const deadline = Date.now() + 10_000; released.length === 0 && Date.now() < deadline; await new Promise((resolve) => setTimeout(resolve, 100))) {
-      released = await Effect.runPromise(Effect.provide(of.folders.sweep, Layer.fresh(KubeClient.layer)));
-    }
-    assert.deepEqual(released, [key]);
-    assert.equal(await run(withKube((kube) => kube.read("v1", "Pod", of.namespace, pod.metadata?.name ?? ""))), null);
-    assert.equal(await run(readLease(pool, key)), null);
-    // One whose bayma ended: released, the next bind making another.
-    stand.status = { execsRunning: 1, execsQueued: 0, idleSinceMs: null };
-    const broken = await bound(of, folderKey("claude", "telegram:broken"));
-    await run(withKube((kube) => kube.patchPodStatus(of.namespace, broken.metadata?.name ?? "", {
-      status: { containerStatuses: [{ name: "bayma", image: "bayma", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated: { exitCode: 1 } } }] },
-    })));
-    await Effect.runPromise(Effect.provide(of.folders.live, Layer.fresh(KubeClient.layer)));
-    for (const deadline = Date.now() + 10_000; ; await new Promise((resolve) => setTimeout(resolve, 100))) {
-      if ((await run(readLease(pool, folderKey("claude", "telegram:broken")))) === null) break;
-      assert.ok(Date.now() < deadline, "the broken folder instance was not released");
-    }
-    assert.equal(await run(withKube((kube) => kube.read("v1", "Pod", of.namespace, broken.metadata?.name ?? ""))), null);
+    const counted = await added(RELEASES, async () => {
+      // Idle past its time: released, its pod gone, and its Lease.
+      stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: 0 };
+      let released: readonly string[] = [];
+      for (const deadline = Date.now() + 10_000; released.length === 0 && Date.now() < deadline; await new Promise((resolve) => setTimeout(resolve, 100))) {
+        released = await Effect.runPromise(Effect.provide(of.folders.sweep, Layer.fresh(KubeClient.layer)));
+      }
+      assert.deepEqual(released, [key]);
+      assert.equal(await run(withKube((kube) => kube.read("v1", "Pod", of.namespace, pod.metadata?.name ?? ""))), null);
+      assert.equal(await run(readLease(pool, key)), null);
+      // One whose bayma ended: released, the next bind making another.
+      stand.status = { execsRunning: 1, execsQueued: 0, idleSinceMs: null };
+      const broken = await bound(of, folderKey("claude", "telegram:broken"));
+      await run(withKube((kube) => kube.patchPodStatus(of.namespace, broken.metadata?.name ?? "", {
+        status: { containerStatuses: [{ name: "bayma", image: "bayma", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated: { exitCode: 1 } } }] },
+      })));
+      await Effect.runPromise(Effect.provide(of.folders.live, Layer.fresh(KubeClient.layer)));
+      for (const deadline = Date.now() + 10_000; ; await new Promise((resolve) => setTimeout(resolve, 100))) {
+        if ((await run(readLease(pool, folderKey("claude", "telegram:broken")))) === null) break;
+        assert.ok(Date.now() < deadline, "the broken folder instance was not released");
+      }
+      assert.equal(await run(withKube((kube) => kube.read("v1", "Pod", of.namespace, broken.metadata?.name ?? ""))), null);
+      // One its caller lets go, as a restart does.
+      const asked = await bound(of, folderKey("claude", "telegram:asked"));
+      const placement = await Effect.runPromise(of.folders.place(folderKey("claude", "telegram:asked"), { environment: "main" }));
+      assert.equal(await Effect.runPromise(of.binder.release(pool, folderKey("claude", "telegram:asked"), placement.release)), "released");
+      assert.equal(await run(withKube((kube) => kube.read("v1", "Pod", of.namespace, asked.metadata?.name ?? ""))), null);
+    });
+    // Each counted, by why, as a session workspace's release is.
+    const reason = (why: string) => `k8s.namespace.name=${of.namespace},alasio.gateway.release.reason=${why}`;
+    assert.deepEqual(counted, { [reason("idle")]: 1, [reason("broken")]: 1, [reason("asked")]: 1 });
   } finally {
     stand.close();
   }

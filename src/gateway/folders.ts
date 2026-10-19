@@ -46,6 +46,7 @@ import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
 import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import { meter } from "../telemetry/index.ts";
 import { FOLDER_GONE_MS, FOLDER_POOL, FOLDER_PULL_MS, FOLDER_START_MS, folderBindMs, folderOfKey, folderPodName, folderPodSpec, folderStateDir, folderTokenSecret } from "./names.ts";
+import { released } from "./releases.ts";
 
 /** How many binds of a key failing one after another, within FOLDER_FAILING_MS, hold it. */
 export const FOLDER_FAILURES = 3;
@@ -292,7 +293,7 @@ export const makeFolders = Effect.fnUntraced(function*(
         make: make(key, folder.harness, folder.conversation),
         prepare: prepare(key),
         // Released as it is when idle: its pod gone, its REPL sessions dumped as it stopped.
-        release: ({ pod }) => removed(pod),
+        release: ({ pod }) => removed(pod).pipe(Effect.tap(() => released(pool, "asked"))),
         // Bound again only as its caller asks, where its binds failed one after another.
         held: options["retry"] === "1" ? Effect.succeed(null) : heldBy(key),
         settled: settled(key),
@@ -306,7 +307,7 @@ export const makeFolders = Effect.fnUntraced(function*(
   const sweep = yield* makeSweep({
     pools: Effect.succeed([pool]),
     idleness: baymaIdleness({ podPort, releaseAfterMs, idlePollMs, bindingKey }),
-    release: (_pool: Pool, key: string) => binder.release(pool, key, ({ pod }) => removed(pod)),
+    release: (_pool: Pool, key: string) => binder.release(pool, key, ({ pod }) => removed(pod)).pipe(Effect.tap((done) => (done === "released" ? released(pool, "idle") : Effect.void))),
   });
 
   const live: Effect.Effect<void, KubeApiError> = Effect.gen(function*() {
@@ -318,6 +319,7 @@ export const makeFolders = Effect.fnUntraced(function*(
       if (bayma?.state?.terminated === undefined && pod.status?.phase !== "Failed" && pod.status?.phase !== "Succeeded") continue;
       yield* Effect.logWarning(`${key}'s bayma ended in its folder instance ${pod.metadata?.name}, which serves its binding no more: it is released, the next bind making another`);
       yield* Effect.forkDetach(binder.release(pool, key, ({ pod: name }) => removed(name)).pipe(
+        Effect.tap((done) => (done === "released" ? released(pool, "broken") : Effect.void)),
         Effect.catch((error) => Effect.logWarning(`releasing ${key}, whose bayma ended, failed: ${error.message}`)),
       ));
     }
