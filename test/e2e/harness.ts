@@ -69,7 +69,7 @@ import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src
 import { COMPONENTS as OBJECT_STORE_COMPONENTS } from "../../cli/src/manifests/object-store.ts";
 import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { BINDING_LABEL, environmentKey, keyHash } from "../../src/binder/names.ts";
-import { NO_BIND_HEADER } from "../../src/binder/server.ts";
+import { NO_BIND_HEADER } from "../../src/binder/names.ts";
 import { mintToken } from "../../src/binder/tokens.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { installCli, packCli } from "../../tooling/cli-package.ts";

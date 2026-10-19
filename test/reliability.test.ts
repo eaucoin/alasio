@@ -299,6 +299,7 @@ test("alasio's services wire the durable outbox into final response delivery", a
       branchForkKeyFile: null,
       sessionsGateway: null,
       folders: false,
+      harnessPools: null,
       inKubernetes: false,
       // No update comes: the stand-in is refused as Telegram is.
       updates: stubUpdates("http://127.0.0.1:9"),

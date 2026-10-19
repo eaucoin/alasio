@@ -15,6 +15,8 @@ import { makeStatusReporter } from "../src/codex/status-reporter.ts";
 import { Turns } from "../src/codex/turns.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { discardHeld, queueHeld, steerWithHeld, swerveTo } from "../src/harness/commands.ts";
+import { HarnessHost } from "../src/harness/host.ts";
+import { HARNESS_BINDING } from "../src/harness/pooled-host.ts";
 import type { Harness, OwnTurns, TurnParams, TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { StoreError } from "../src/persistence/sql.ts";
@@ -295,6 +297,48 @@ test("a turn that fails as it starts, after its status message is queued, ends t
     assert.deepEqual(queued.edits.map(({ edits, text }) => [edits, text]), [[queued.statuses[0]?.id, "Codex hit an error."]]);
   });
   assert.equal((await run(store.getTurn(conversationId)))?.outcome, "failed");
+});
+
+test("a turn whose host is readied before it can hold the conversation shows its status message from the first, saying what it waits on, and takes it on as it starts; one then refused says why on it", async () => {
+  const { store, conversationId } = await conversation();
+  const outbox = recordingOutbox();
+  const bound = Effect.runSync(Deferred.make<void>());
+  let refuse = false;
+  // As a pooled host's reservation binds ahead: what it waits on told, then held, or refused.
+  const readied = (host: HarnessHost["Service"]): HarnessHost["Service"] => ({
+    ...host,
+    reserve: (id, waiting = () => Effect.void) =>
+      Effect.gen(function*() {
+        yield* waiting(HARNESS_BINDING);
+        yield* Deferred.await(bound);
+        yield* waiting(null);
+        return refuse ? false : yield* host.reserve(id);
+      }),
+  });
+  const harness = scriptedHarness((params) => answered(params, "Done."));
+  const shown = () => outbox.queued.statuses.map(({ text }) => text.replace(/ · started .*$/u, ""));
+  await withServices({ store, harnesses: { [CODEX_HARNESS]: harness }, outbox: outbox.layer, host: readied }, async (alasio) => {
+    const turn = alasio.runFork(turnOf(conversationId, "first"));
+    await until("the status message posted ahead", () => outbox.queued.statuses.length === 1);
+    assert.deepEqual(shown(), ["Codex is waiting on its harness, whose pod is being readied"]);
+    assert.equal(await run(store.getActiveTurn(conversationId)), null, "a turn claimed before its host held the conversation");
+    await alasio.runPromise(Deferred.succeed(bound, undefined));
+    assert.equal(await alasio.runPromise(Fiber.join(turn)), true);
+    // Taken on by the turn: no other posted, recorded on its row, and edited as it went.
+    assert.equal(outbox.queued.statuses.length, 1);
+    assert.equal((await run(store.getTurn(conversationId)))?.status_outbox_id, outbox.queued.statuses[0]?.id);
+    const edits = outbox.queued.edits.filter(({ edits }) => edits === outbox.queued.statuses[0]?.id).map(({ text }) => text.replace(/ · started .*$/u, ""));
+    assert.equal(edits[0], "Codex is working");
+    assert.match(edits.at(-1) ?? "", /^Codex worked for /u);
+    // Refused once readied, as another turn took the conversation meanwhile: said on its message.
+    refuse = true;
+    const refused = await alasio.runPromise(Effect.flip(turnOf(conversationId, "second")));
+    assert.equal(refused._tag, "ConversationBusy");
+    assert.deepEqual(outbox.queued.edits.filter(({ edits }) => edits === outbox.queued.statuses[1]?.id).map(({ text }) => text.replace(/ · started .*$/u, "")), [
+      "Codex is working",
+      "Codex is already working in this conversation; this message waits for it.",
+    ]);
+  });
 });
 
 test("a turn's status message says what its row says it does, as the row changes, and is recorded on it", async () => {

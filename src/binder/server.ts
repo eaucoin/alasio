@@ -58,7 +58,7 @@ import { withLogScope } from "../shared/log.ts";
 import { BearerToken } from "../shared/tokens.ts";
 import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
 import { counts, touchLease } from "./bindings.ts";
-import { NOT_PASSED_HEADER, type Pool } from "./names.ts";
+import { NO_BIND_HEADER, NOT_PASSED_HEADER, type Pool } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
 import type { Held } from "./live.ts";
 import { bindingToken, type HeldTo, type TokenClaims, verifyToken } from "./tokens.ts";
@@ -75,7 +75,6 @@ export const MAX_OPERATION_BYTES = 64 * 1024 ** 2;
 
 /** The paths of the requests the front answers itself (`operate`): /workspace, /snapshots and /folders, and what is under them. */
 const OPERATED = /^\/(workspace|snapshots|folders)(\/|$)/u;
-
 /** Where a caller asks the front to bind its token's key ahead of any request. */
 const BIND_PATH = "/bind";
 /** Where a caller asks the front to release its token's key's binding. */
@@ -110,9 +109,6 @@ export interface Answer {
   readonly bytes?: Uint8Array;
   readonly headers?: Readonly<Record<string, string>>;
 }
-
-/** The header of a request that binds nothing: passed on where its key is bound, and otherwise answered as unbound. */
-export const NO_BIND_HEADER = "x-alasio-bind";
 
 /**
  * The longest a caller's token may stay good for, from now: alasio's (src/sandbox/gateway-client.ts
@@ -356,7 +352,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         if (answered.bytes !== undefined) return void outgoing.writeHead(answered.status, { ...answered.headers, "content-type": "application/octet-stream" }).end(answered.bytes);
         return answer(outgoing, answered.status, answered.json, answered.headers);
       }
-      if (incoming.method === "POST" && url === "/release") {
+      if (incoming.method === "POST" && url === RELEASE_PATH) {
         incoming.resume();
         const released = yield* poolOf(key, claims.options ?? {}).pipe(
           Effect.tap(({ pool }) => Effect.sync(() => routes.delete(slot(pool, key)))),
@@ -386,13 +382,13 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
           yield* Effect.logWarning(`binding ${key} failed: ${failure.message}`);
           return answer(outgoing, 503, { error: `${key} could not be bound now`, reason: failure.message }, { "retry-after": String(RETRY_AFTER_S) });
         });
-      const routed = yield* routeOf(key, options, { unbound, anew: unbound || (incoming.method === "POST" && url === "/bind") }).pipe(Effect.result);
+      const routed = yield* routeOf(key, options, { unbound, anew: unbound || (incoming.method === "POST" && url === BIND_PATH) }).pipe(Effect.result);
       if (routed._tag === "Failure") return yield* refused(routed.failure);
       if (!routed.success) {
         incoming.resume();
         return answer(outgoing, 409, { bound: false });
       }
-      if (incoming.method === "POST" && url === "/bind") {
+      if (incoming.method === "POST" && url === BIND_PATH) {
         incoming.resume();
         const { binding, pool } = routed.success.route;
         return answer(outgoing, 200, { binding, namespace: pool.namespace });

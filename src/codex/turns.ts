@@ -29,7 +29,7 @@ import { parseWorkspace } from "../workspace/kind.ts";
 import { truncateText } from "../operator/text.ts";
 import { makeReplyMedia } from "./reply-media.ts";
 import { recoverInterruptedTurns } from "./restart-recovery.ts";
-import { makeStatusReporter } from "./status-reporter.ts";
+import { makeStatusReporter, type StatusAhead } from "./status-reporter.ts";
 import { withLogScope } from "../shared/log.ts";
 import { currentTraceparent, meter, withAlasioSpan } from "../telemetry/index.ts";
 
@@ -212,6 +212,7 @@ const makeTurns = Effect.fnUntraced(function*() {
     harness: Harness,
     mount: Mount,
     { conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null, fileIds = [] }: Omit<SessionTurn, "traceparent">,
+    ahead: StatusAhead,
   ): Effect.fn.Return<{ readonly outcome: TurnOutcome; readonly completed: boolean }, GoalTurnsUnsupported | NoWorkspaceMounted | HarnessUnavailable | StoreError | TurnFenced | ReceivedFileError> {
     if (attachedTurn && !harness.supportsGoals) {
       return yield* new GoalTurnsUnsupported({ harness: harness.displayName });
@@ -237,7 +238,7 @@ const makeTurns = Effect.fnUntraced(function*() {
       });
       const persistence = store.turnPersistence(conversationId, epoch);
       let responseCompleted: boolean | null = null;
-      const posted = yield* status.statusUpdates({ chatId, conversationId, epoch, harnessName: harness.displayName });
+      const posted = yield* status.statusUpdates({ chatId, conversationId, epoch, harnessName: harness.displayName, ahead });
 
       /** Leaves the turn, as alasio stops, for after the restart. */
       const leaveForRestart = Effect.gen(function*() {
@@ -349,22 +350,34 @@ const makeTurns = Effect.fnUntraced(function*() {
     const harness = yield* harnesses.requireForMount(mount);
     const labels = { "alasio.harness": harness.name };
     // Held busy before it claims the conversation, as one decision, and until it has let go
-    // of it; refused where another turn holds it, before it is a turn at all. Once it has
-    // let go, the conversation's worker is scheduled, for what waits on it.
+    // of it; refused where another turn holds it, before it is a turn at all. What it waits on
+    // before its host can hold it (a harness pool's pod readied for it) said from the first,
+    // on its status message, posted ahead and taken on by the turn; said too, where it then
+    // does not start, why. Once it has let go, the conversation's worker is scheduled, for what
+    // waits on it.
     return yield* Effect.scoped(Effect.gen(function*() {
-      if (!(yield* host.reserve(turn.conversationId))) {
+      const ahead = yield* status.ahead(turn.chatId, harness.displayName);
+      const held = yield* host.reserve(turn.conversationId, ahead.waiting).pipe(
+        Effect.onExit((exit) =>
+          Exit.isSuccess(exit) ? Effect.void
+          : Cause.hasInterruptsOnly(exit.cause) ? Effect.flatMap(ahead.posted, (shown) => status.restarting(turn.chatId, shown, harness.displayName))
+          : ahead.end(`${harness.displayName} hit an error.`)
+        ),
+      );
+      if (!held) {
+        yield* ahead.end(`${harness.displayName} is already working in this conversation; this message waits for it.`);
         return yield* new ConversationBusy({ message: `${harness.displayName} is already working in this conversation.` });
       }
-      return yield* measuredTurn(harness, mount, turn, labels);
+      return yield* measuredTurn(harness, mount, turn, labels, ahead);
     })).pipe(Effect.ensuring(schedule(turn.conversationId)));
   }, withLogScope(LOG_SCOPE));
 
   /** A turn of `harness`'s, as the span `alasio.turn`, and counted and timed by its outcome. */
-  const measuredTurn = Effect.fnUntraced(function*(harness: Harness, mount: Mount, turn: SessionTurn, labels: { readonly "alasio.harness": string }): Effect.fn.Return<boolean, TurnError> {
+  const measuredTurn = Effect.fnUntraced(function*(harness: Harness, mount: Mount, turn: SessionTurn, labels: { readonly "alasio.harness": string }, ahead: StatusAhead): Effect.fn.Return<boolean, TurnError> {
     const startedAt = yield* Clock.currentTimeMillis;
     let outcome: TurnOutcome = "failed";
     runningTurns.add(1, labels);
-    const { completed } = yield* runTurn(harness, mount, turn).pipe(
+    const { completed } = yield* runTurn(harness, mount, turn, ahead).pipe(
       Effect.tap((settled) => Effect.sync(() => {
         outcome = settled.outcome;
       })),

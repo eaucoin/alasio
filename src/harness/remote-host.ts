@@ -7,13 +7,27 @@
  * decides by them refuses, saying why. A call that lasts (./wire.ts) skips what says only
  * that it does.
  *
+ * Each call bears the token its options make as it is made, as one minted for a while. A host
+ * reached through the sandbox gateway's front, which binds a pod to the conversation as a call
+ * reaches it, is asked what a binding has, its status, its background work, its turn steered or
+ * stopped, its drain, a hold of it let go of, binding nothing
+ * (NO_BIND_HEADER), so a hold let go of as its pod went binds no other: where it is bound nowhere,
+ * the front says so (409, `{ bound: false }`), and the call answers as of a conversation
+ * nothing runs in, its status as `unbound` says. What the front refuses itself, a token or a
+ * bind, fails as the host's not being reached, saying what it said. Each call carries the trace
+ * context of the span it is made in (traceCarrier), so what the host does for it, its turn and
+ * its harness's calls among it, joins the caller's trace.
+ *
  * Its events are not heard here: it tells them as its HostEvents says (./host-events.ts), on
  * the log, where the control plane hears them. The operator's panels are reached where the
- * control plane says, as the host elsewhere does not serve them yet (14.6).
+ * control plane says, as the host elsewhere does not serve them yet.
  */
 import { Effect, Layer, Option, Schema } from "effect";
 
-import { HarnessHost } from "./host.ts";
+import { NO_BIND_HEADER } from "../binder/names.ts";
+import type { StoreError } from "../persistence/sql.ts";
+import { traceCarrier } from "../telemetry/index.ts";
+import { HarnessHost, type HarnessStatus } from "./host.ts";
 import { HarnessHostError } from "./index.ts";
 import {
   Alive,
@@ -35,11 +49,19 @@ import {
 
 /** Where the host elsewhere is, the token it takes, and what the panels reach instead. */
 export interface RemoteHostOptions {
-  /** The host's address, `http://<host>:<port>`. */
+  /** The host's address, `http://<host>:<port>`, or the front's it is reached through. */
   readonly url: string;
-  readonly token: string;
+  /** The token each call bears, made as the call is. */
+  readonly token: Effect.Effect<string, HarnessHostError>;
   readonly panels: HarnessHost["Service"]["panels"];
+  /** Where it is reached through the sandbox gateway's front: the status of a conversation bound nowhere, as the module says; none where the host is reached itself. */
+  readonly unbound?: ((conversationId: string) => Effect.Effect<HarnessStatus, StoreError | HarnessHostError>) | undefined;
 }
+
+/** What the front answers of a call that binds nothing, of a key bound nowhere. */
+const Unbound = Schema.Struct({ bound: Schema.Literal(false) });
+/** What the front answers where it refuses a call itself: why, and, of a bind, what failed. */
+const Refused = Schema.Struct({ error: Schema.String, reason: Schema.optional(Schema.String) });
 
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -76,35 +98,48 @@ function linesOf(body: ReadableStream<Uint8Array>, what: string): { readonly nex
 }
 
 /** The harness host at `url`, as the module says. */
-export function remoteHost({ url, token, panels }: RemoteHostOptions): HarnessHost["Service"] {
-  const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+export function remoteHost({ url, token, panels, unbound }: RemoteHostOptions): HarnessHost["Service"] {
+  /** The host's answer to `path` with `body`, binding nothing where `bindsNothing`: its status and what it said, or a HarnessHostError where it was not reached. */
+  const post = (path: string, body: object, { signal, bindsNothing = false }: { readonly signal?: AbortSignal; readonly bindsNothing?: boolean } = {}) =>
+    Effect.flatMap(Effect.all([token, Effect.sync(traceCarrier)]), ([bearer, trace]) =>
+      Effect.tryPromise({
+        try: (interrupted) =>
+          fetch(`${url}${path}`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json", ...trace, ...(bindsNothing && unbound ? { [NO_BIND_HEADER]: "never" } : {}) },
+            body: JSON.stringify(body),
+            signal: signal ?? interrupted,
+          }),
+        catch: (cause) => new HarnessHostError({ reason: errorText(cause) }),
+      }));
 
-  /** The host's answer to `path` with `body`: its status and what it said, or a HarnessHostError where it was not reached. */
-  const post = (path: string, body: object, signal?: AbortSignal) =>
-    Effect.tryPromise({
-      try: (interrupted) => fetch(`${url}${path}`, { method: "POST", headers, body: JSON.stringify(body), signal: signal ?? interrupted }),
-      catch: (cause) => new HarnessHostError({ reason: errorText(cause) }),
-    });
+  /** What a failed answer, of `status`, saying `said`, failed with: the host's error, as it failed with it; or the front's refusal, as the host not reached. */
+  const failed = (status: number, said: unknown): Effect.Effect<never, CrossingError | HarnessHostError> => {
+    if (Schema.is(Refused)(said)) return Effect.fail(new HarnessHostError({ reason: `the sandbox gateway answered ${status}: ${said.error}${said.reason ? ` (${said.reason})` : ""}` }));
+    return Effect.flatMap(read(Failure, said), (failure) => Effect.fail(crossingErrorOf(failure) ?? new HarnessHostError({ reason: failure.error.message })));
+  };
 
-  /** What a call answered, as `schema` reads it; what it failed with, as the host failed with it. */
-  const call = <A>(path: string, body: object, schema: Schema.ConstraintDecoder<A, never>): Effect.Effect<A, CrossingError | HarnessHostError> =>
+  /**
+   * What a call answered, as `schema` reads it; what it failed with, as the host failed with
+   * it. One of what a binding has (`bindsNothing`) answers `none` of a conversation the front binds nowhere.
+   */
+  const call = <A>(path: string, body: object, schema: Schema.ConstraintDecoder<A, never>, bindsNothing?: { readonly none: Effect.Effect<A, StoreError | HarnessHostError> }): Effect.Effect<A, CrossingError | HarnessHostError> =>
     Effect.gen(function*() {
-      const response = yield* post(path, body);
+      const response = yield* post(path, body, { bindsNothing: bindsNothing !== undefined });
       const said = yield* Effect.tryPromise({ try: () => response.json() as Promise<unknown>, catch: (cause) => new HarnessHostError({ reason: errorText(cause) }) });
       if (response.status === 200) return yield* read(schema, said);
-      const failure = yield* read(Failure, said);
-      return yield* Effect.fail(crossingErrorOf(failure) ?? new HarnessHostError({ reason: failure.error.message }));
+      if (bindsNothing && unbound && response.status === 409 && Schema.is(Unbound)(said)) return yield* bindsNothing.none;
+      return yield* failed(response.status, said);
     });
 
   /** An answer that lasts: its lines, where the host answered with them; what it failed with otherwise, as the host failed with it. */
   const lasting = (path: string, body: object, what: string, signal?: AbortSignal) =>
     Effect.gen(function*() {
-      const response = yield* post(path, body, signal);
+      const response = yield* post(path, body, signal ? { signal } : {});
       const answer = response.body;
       if (response.status === 200 && answer !== null) return linesOf(answer, what);
       const said = yield* Effect.tryPromise({ try: () => response.json() as Promise<unknown>, catch: (cause) => new HarnessHostError({ reason: errorText(cause) }) });
-      const failure = yield* read(Failure, said);
-      return yield* Effect.fail(crossingErrorOf(failure) ?? new HarnessHostError({ reason: failure.error.message }));
+      return yield* failed(response.status, said);
     });
 
   /** `error`, if the host's status may fail with it, as its reservation may: the store's, or else as the host's not reaching it. */
@@ -125,7 +160,7 @@ export function remoteHost({ url, token, panels }: RemoteHostOptions): HarnessHo
         // Let go of as the scope closes, and so let go of by then, as the host in alasio's process lets go.
         if (id !== null) {
           yield* Effect.addFinalizer(() =>
-            call(HOST_PATHS.release, { conversationId, id }, ReleaseAnswer).pipe(
+            call(HOST_PATHS.release, { conversationId, id }, ReleaseAnswer, { none: Effect.succeed({ released: false }) }).pipe(
               Effect.catch((error) => Effect.logWarning(`the harness host's hold of ${conversationId} was left to its connection: ${error.message}`)),
             )
           );
@@ -140,19 +175,19 @@ export function remoteHost({ url, token, panels }: RemoteHostOptions): HarnessHo
         return yield* Effect.mapError(decodeTurnAnswer(answer), (error) => new HarnessHostError({ reason: `it answered as no harness host does: ${error.message}` }));
       }),
     steer: (conversationId, prompt, fileIds) =>
-      call(HOST_PATHS.steer, { conversationId, prompt, fileIds }, SteerAnswer).pipe(
+      call(HOST_PATHS.steer, { conversationId, prompt, fileIds }, SteerAnswer, { none: Effect.succeed({ taken: null }) }).pipe(
         Effect.map(({ taken }) => (taken === null ? Option.none() : Option.some(taken))),
         Effect.mapError(asSteerError),
       ),
     interrupt: (conversationId, reason) =>
-      call(HOST_PATHS.interrupt, { conversationId, reason }, InterruptAnswer).pipe(
+      call(HOST_PATHS.interrupt, { conversationId, reason }, InterruptAnswer, { none: Effect.succeed({ interrupted: false }) }).pipe(
         Effect.map(({ interrupted }) => interrupted),
         Effect.mapError((error) => (error._tag === "HarnessHostError" ? error : new HarnessHostError({ reason: error.message }))),
       ),
-    status: (conversationId) => call(HOST_PATHS.status, { conversationId }, StatusAnswer).pipe(Effect.mapError(asStatusError)),
-    drain: (conversationId) => call(HOST_PATHS.drain, { conversationId }, DrainAnswer).pipe(Effect.map(({ drained }) => drained), Effect.mapError(asStatusError)),
+    status: (conversationId) => call(HOST_PATHS.status, { conversationId }, StatusAnswer, unbound ? { none: unbound(conversationId) } : undefined).pipe(Effect.mapError(asStatusError)),
+    drain: (conversationId) => call(HOST_PATHS.drain, { conversationId }, DrainAnswer, { none: Effect.succeed({ drained: true }) }).pipe(Effect.map(({ drained }) => drained), Effect.mapError(asStatusError)),
     backgroundWork: (conversationId) =>
-      call(HOST_PATHS.backgroundWork, { conversationId }, BackgroundWorkAnswer).pipe(Effect.map(({ working }) => working), Effect.mapError(asStatusError)),
+      call(HOST_PATHS.backgroundWork, { conversationId }, BackgroundWorkAnswer, { none: Effect.succeed({ working: false }) }).pipe(Effect.map(({ working }) => working), Effect.mapError(asStatusError)),
     startFreshSession: ({ conversationId, harness, workingDirectory }) =>
       call(HOST_PATHS.freshSession, { conversationId, harness, workingDirectory }, FreshSessionAnswer).pipe(
         Effect.map(({ sessionId }) => sessionId),

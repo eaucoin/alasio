@@ -273,6 +273,49 @@ test("Codex app-server requests carry their span's trace context", async () => {
   assert.equal(sent.trace?.traceparent, `00-${request.spanContext().traceId}-${request.spanContext().spanId}-01`);
 });
 
+test("a call of a harness host elsewhere carries its span's trace context, and the turn the host runs for it continues that trace", async () => {
+  const { serveHost } = await import("../src/harness/serve.ts");
+  const { remoteHost } = await import("../src/harness/remote-host.ts");
+  const { HarnessHost } = await import("../src/harness/host.ts");
+  const { Option, Scope, Exit } = await import("effect");
+  // The host's turn: where the trace it runs in goes on, as its harness's calls would carry it.
+  let handedOn: string | undefined;
+  const host = HarnessHost.of({
+    reserve: () => Effect.succeed(true),
+    startTurn: () => Effect.sync(() => void (handedOn = traceparentHere())).pipe(Effect.as({ blockSequence: [], sessionId: "thread-1", pendingResponseId: "pending-1", interrupted: false, responseCompleted: true })),
+    steer: () => Effect.succeed(Option.none()),
+    interrupt: () => Effect.succeed(false),
+    status: () => Effect.succeed({ busy: false, running: false, cliInitiated: false, held: false, idleSince: 0 }),
+    backgroundWork: () => Effect.succeed(false),
+    drain: () => Effect.succeed(true),
+    startFreshSession: () => Effect.succeed("thread-2"),
+    panels: () => Effect.succeedNone,
+  });
+  const scope = Effect.runSync(Scope.make());
+  try {
+    const { port } = await Effect.runPromise(serveHost({ port: 0, host: "127.0.0.1", conversationId: "telegram:7", token: "host-token" }).pipe(Effect.provideService(HarnessHost, host), Scope.provide(scope), Effect.provide(TracingLayer)));
+    const reached = remoteHost({ url: `http://127.0.0.1:${port}`, token: Effect.succeed("host-token"), panels: () => Effect.succeedNone });
+    const start = { conversationId: "telegram:7", chatId: "7", messageId: "1", harness: CODEX_HARNESS as typeof CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch: 1, jobId: null, attachedTurn: null, bayma: null, codex: null };
+    await Effect.runPromise(reached.startTurn(start).pipe(withAlasioSpan("test.pooled-turn"), Effect.provide(TracingLayer)));
+    const turn = finishedSpan("test.pooled-turn");
+    // The server's span ends once its answer is sent whole, a moment after its caller read it.
+    for (const deadline = Date.now() + 5_000; !spans.getFinishedSpans().some(({ name }) => name === "harness-host /turns"); await new Promise((resolve) => setTimeout(resolve, 20))) {
+      assert.ok(Date.now() < deadline, spans.getFinishedSpans().map(({ name }) => name).join(", "));
+    }
+    const served = finishedSpan("harness-host /turns");
+    assert.equal(served.kind, SpanKind.SERVER);
+    assert.equal(served.spanContext().traceId, turn.spanContext().traceId);
+    assert.equal(handedOn?.split("-")[1], turn.spanContext().traceId);
+    // What carries no trace context, as the gateway's asking whether the host is idle, is in no trace.
+    const before = spans.getFinishedSpans().length;
+    await Effect.runPromise(reached.status("telegram:7"));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(spans.getFinishedSpans().slice(before).map(({ name }) => name), []);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+});
+
 test("a prompt's update, turn, and reply delivery are one trace, however long the prompt waits, the turn naming its session and workspace", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-telemetry-"));
   const store = await testStore();

@@ -81,7 +81,7 @@ const REACHES: Readonly<Record<string, (host: HarnessHost["Service"], conversati
   "elsewhere, over HTTP": (host, conversationId) =>
     Effect.gen(function*() {
       const { port } = yield* Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token" }), HarnessHost, host);
-      const remote = yield* Layer.build(remoteHarnessHost({ url: `http://127.0.0.1:${port}`, token: "host-token", panels: host.panels }));
+      const remote = yield* Layer.build(remoteHarnessHost({ url: `http://127.0.0.1:${port}`, token: Effect.succeed("host-token"), panels: host.panels }));
       return Context.get(remote, HarnessHost);
     }),
 };
@@ -281,7 +281,7 @@ test("a host elsewhere not reached says nothing of its conversation and stops no
   const conversationId = await run(store.upsertConversation({ chatId: "41", user: { id: 41 } }));
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     // A port no host listens on: a partition, as the control plane sees one.
-    const host = Context.get(yield* Layer.build(remoteHarnessHost({ url: "http://127.0.0.1:1", token: "host-token", panels: () => Effect.succeedNone })), HarnessHost);
+    const host = Context.get(yield* Layer.build(remoteHarnessHost({ url: "http://127.0.0.1:1", token: Effect.succeed("host-token"), panels: () => Effect.succeedNone })), HarnessHost);
     assert.equal((yield* Effect.flip(host.status(conversationId)))._tag, "HarnessHostError");
     assert.equal((yield* Effect.flip(host.interrupt(conversationId, "interrupt")))._tag, "HarnessHostError");
     assert.equal((yield* Effect.flip(Effect.scoped(host.reserve(conversationId))))._tag, "HarnessHostError");

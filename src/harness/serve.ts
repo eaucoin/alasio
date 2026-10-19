@@ -9,14 +9,16 @@
  * the turn does, or as the host stops; asked for again under its epoch, as a caller that
  * lost its answer asks again, it is the turn running that answers, not another. A
  * reservation lasts until its caller releases it, or lets go of the connection, as a
- * caller that is gone does.
+ * caller that is gone does. A call that carries a trace context is served in a span of it, its
+ * turn and its harness's calls within it, so they join its caller's trace; one that carries
+ * none, as the sandbox gateway's asking whether the host is idle, is in no trace.
  */
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 
 import { NodeHttpServer } from "@effect/platform-node";
 import { Deferred, Effect, Fiber, Option, Schema, type Scope, Stream } from "effect";
-import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { HttpMiddleware, type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import type { StoreError } from "../persistence/sql.ts";
 import type { TurnFenced } from "../persistence/store.ts";
@@ -209,7 +211,12 @@ export const serveHost = Effect.fnUntraced(function*(
 
   const listening = createServer();
   const server = yield* NodeHttpServer.make(() => listening, { port, host: hostname });
-  yield* server.serve(handle);
+  // Its server's span of each call continues the trace context it carries; one that carries
+  // none is in no trace.
+  yield* server.serve(handle).pipe(
+    Effect.provideService(HttpMiddleware.TracerDisabledWhen, (request) => request.headers["traceparent"] === undefined),
+    Effect.provideService(HttpMiddleware.SpanNameGenerator, (request) => `harness-host ${new URL(request.url, "http://host").pathname}`),
+  );
   // What it serves ends as the host stops, rather than holding its stop until each caller
   // lets go: a reservation's, which its caller holds for as long as its turn runs.
   yield* Effect.addFinalizer(() => Effect.sync(() => {

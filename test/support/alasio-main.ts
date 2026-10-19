@@ -65,6 +65,7 @@ if (import.meta.main) {
       branchForkKeyFile: null,
       sessionsGateway: null,
       folders: false,
+      harnessPools: null,
       inKubernetes: false,
       // Telegram's updates are the stand-in's, at the Bot API's root the environment names.
       updates: stubUpdates(process.env["TELEGRAM_API_ROOT"] ?? ""),

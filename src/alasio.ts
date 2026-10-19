@@ -16,7 +16,9 @@ import type { AlasioConfig, BranchEnvironment } from "./config.ts";
 import { ActiveTurns } from "./harness/active-turns.ts";
 import type { ClaudeQueryFactory } from "./harness/claude/runtime.ts";
 import { HarnessHost } from "./harness/host.ts";
-import { type HarnessEvents, HostEvents } from "./harness/host-events.ts";
+import { HarnessEvents, HostEvents } from "./harness/host-events.ts";
+import { pooledHarnessHost } from "./harness/pooled-host.ts";
+import { EnvironmentEvents, EventsConsumer } from "./events/consume.ts";
 import { Harnesses } from "./harness/index.ts";
 import { BusyPods } from "./kube/busy.ts";
 import { KubeClient } from "./kube/client.ts";
@@ -69,19 +71,19 @@ export type AlasioServices =
 /**
  * alasio's services, made for `options`: each made after what it runs on, and stopped
  * before it. The turns are made after the harnesses, Telegram and the store they report
- * to, so that stopping alasio interrupts the turns running while those are still there.
+ * to, so that stopping alasio interrupts the turns running while those are still there. The
+ * environment's events are read last, by one member of their group, once every part has added
+ * its handling of them (EventsConsumer).
  */
 export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServices, StoreError | CodexLoginError> {
-  return MediaGroups.layer().pipe(
+  return Layer.effectDiscard(Effect.flatMap(EventsConsumer, (consumer) => consumer.start)).pipe(Layer.provideMerge(MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(
       Mounts.layer({ workspaceRoot: options.workspaceRoot, branch: options.branch?.name }),
       Authorizer.layer(options.allowedUserIds),
       branchForks(options),
     )),
     Layer.provideMerge(Turns.layer()),
-    Layer.provideMerge(HarnessHost.layer),
-    // Its harnesses' events, told and heard in its process.
-    Layer.provideMerge(HostEvents.inProcess),
+    Layer.provideMerge(harnessHost(options)),
     Layer.provideMerge(Harnesses.layer({
       branch: options.branch?.name,
       sessionStore: options.sessionStore,
@@ -100,11 +102,38 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       codexServices(options),
       activeTurns(options),
     )),
+    Layer.provideMerge(eventsConsumer(options)),
     Layer.provideMerge(Layer.mergeAll(
       Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory, branch: options.branch?.name, harnessRole: options.harnessRole }),
       TelegramClient.layer(options.telegramBotToken),
     )),
-  );
+  )));
+}
+
+/**
+ * The one member of the environment's events' group every part of alasio adds its handling
+ * to: on its events topic where the installation names one, as where its harnesses run in
+ * pools; elsewhere none, which reads nothing, and to which a part adding a handling is a defect.
+ */
+function eventsConsumer({ harnessPools }: AlasioOptions): Layer.Layer<EventsConsumer, never, Store> {
+  if (harnessPools) return EventsConsumer.layer.pipe(Layer.provide(EnvironmentEvents.layer(harnessPools.events)));
+  return Layer.succeed(EventsConsumer, EventsConsumer.of({
+    handle: (handlers) => Effect.die(new Error(`alasio reads no events topic here, as its installation names none, so it handles no event of ${Object.keys(handlers).join(", ")}`)),
+    start: Effect.void,
+  }));
+}
+
+/**
+ * The harness host alasio's turns run on, and where it hears what their harnesses do on their
+ * own: where its harnesses run in pools of their own, each conversation's, bound in its
+ * harness's pool through the sandbox gateway, heard on its environment's events topic; and
+ * otherwise its own, in its process, told and heard there.
+ */
+function harnessHost({ harnessPools, sessionsGateway }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | Harnesses | ActiveTurns | ReceivedFiles | EventsConsumer> {
+  if (harnessPools && sessionsGateway) {
+    return Layer.merge(pooledHarnessHost(sessionsGateway), HarnessEvents.fromLog);
+  }
+  return HarnessHost.layer.pipe(Layer.provideMerge(HostEvents.inProcess));
 }
 
 /**
@@ -135,12 +164,13 @@ const netModeIn = (store: Store["Service"]) => (volumeId: string): Effect.Effect
 
 /**
  * The turns running, which hold alasio's own pod busy (./kube/busy.ts) where alasio runs in
- * Kubernetes, on a KubeClient of their own; elsewhere they hold none. The pods its workspaces
- * run in are the gateway's, which holds each busy as it is bound.
+ * Kubernetes, on a KubeClient of their own, as the turns it drives in its harness pools do
+ * (./harness/pooled-host.ts); elsewhere they hold none. The pods its workspaces run in are the
+ * gateway's, which holds each busy as it is bound.
  */
-function activeTurns({ inKubernetes }: AlasioOptions): Layer.Layer<ActiveTurns> {
+function activeTurns({ inKubernetes }: AlasioOptions): Layer.Layer<ActiveTurns> | Layer.Layer<ActiveTurns | BusyPods> {
   if (!inKubernetes) return ActiveTurns.layer;
-  return ActiveTurns.layer.pipe(Layer.provide(Layer.orDie(BusyPods.layer({})).pipe(Layer.provide(KubeClient.layer))));
+  return ActiveTurns.layer.pipe(Layer.provideMerge(Layer.orDie(BusyPods.layer({})).pipe(Layer.provide(KubeClient.layer))));
 }
 
 /**

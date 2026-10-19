@@ -89,9 +89,11 @@ export class HarnessHost extends Context.Service<HarnessHost, {
    * Holds the conversation for a turn the control plane is about to start, until the scope
    * closes, unless it is busy, a hold of the store's among what keeps it so: whether it
    * holds it. The host held first and the store read after, as a hold is made the other way
-   * round (../harness/holds.ts), so a hold and a turn begun at once do not both go on.
+   * round (../harness/holds.ts), so a hold and a turn begun at once do not both go on. What
+   * it waits on before it can hold it, as a host elsewhere is bound to the conversation first,
+   * its pod readied, it tells `waiting`, and null once it waits on it no more.
    */
-  readonly reserve: (conversationId: string) => Effect.Effect<boolean, StoreError | HarnessHostError, Scope.Scope>;
+  readonly reserve: (conversationId: string, waiting?: (what: string | null) => Effect.Effect<void>) => Effect.Effect<boolean, StoreError | HarnessHostError, Scope.Scope>;
   /**
    * Runs a turn to its end, its conversation busy meanwhile. It fails only as alasio's
    * store does, with TurnFenced where another turn has claimed the conversation since,

@@ -1,4 +1,4 @@
-import { Clock, Deferred, Effect, Fiber, Schedule, type Scope } from "effect";
+import { Clock, Deferred, Effect, Fiber, Schedule, type Scope, Semaphore } from "effect";
 
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
@@ -57,12 +57,26 @@ export interface PostedStatus {
   readonly startTime: number;
 }
 
-/** The turn whose status message to queue and keep current: the conversation's of `epoch`, in the chat. */
+/** The turn whose status message to queue and keep current: the conversation's of `epoch`, in the chat; its message the one posted `ahead` of it, where one was. */
 export interface StatusUpdates {
   readonly chatId: ChatId;
   readonly conversationId: string;
   readonly epoch: number;
   readonly harnessName?: string;
+  readonly ahead?: StatusAhead | undefined;
+}
+
+/**
+ * A turn's status message posted ahead of the turn, while what it runs on is readied before it
+ * can start, as a harness pool's pod is bound to its conversation (StatusReporter.ahead).
+ */
+export interface StatusAhead {
+  /** Says on the message what the turn waits on, posting it the first time it waits on anything; null once it waits on nothing. */
+  readonly waiting: (what: string | null) => Effect.Effect<void>;
+  /** The message, once posted; null while none was. */
+  readonly posted: Effect.Effect<PostedStatus | null>;
+  /** Says `text` on the message, where one was posted, as the turn it was posted for does not start. */
+  readonly end: (text: string) => Effect.Effect<void>;
 }
 
 export interface PostedResponse {
@@ -94,6 +108,13 @@ export interface StatusReporter {
    * once queued; null if it could not be.
    */
   readonly statusUpdates: (updates: StatusUpdates) => Effect.Effect<Deferred.Deferred<PostedStatus | null>, never, Scope.Scope>;
+  /**
+   * A status message of `harnessName`'s turn in the chat, posted ahead of it as soon as it
+   * waits on anything before it starts, so the operator sees it waits from the first, and taken
+   * on as its status message once it starts (StatusUpdates.ahead); none posted where it waits
+   * on nothing.
+   */
+  readonly ahead: (chatId: ChatId, harnessName: string) => Effect.Effect<StatusAhead>;
   readonly postResponse: (response: PostedResponse) => Effect.Effect<void, StoreError>;
   readonly finishWithoutResponse: (turn: UnansweredTurn) => Effect.Effect<void, StoreError>;
   /** Says on the status message that alasio is restarting and the turn continues after it. */
@@ -157,14 +178,16 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
   };
 
   const statusUpdates = Effect.fnUntraced(function*(updates: StatusUpdates) {
-    const { chatId, conversationId, epoch, harnessName = "Codex" } = updates;
+    const { chatId, conversationId, epoch, harnessName = "Codex", ahead } = updates;
     const posted = yield* Deferred.make<PostedStatus | null>();
-    const startTime = yield* Clock.currentTimeMillis;
+    const early = ahead ? yield* ahead.posted : null;
+    const startTime = early?.startTime ?? (yield* Clock.currentTimeMillis);
     const statusHtml = (waitingOn: string | null) => workingStatusHtml({ harnessName, startedAtMs: startTime, waitingOn });
     const shown = statusHtml(null);
-    // The message is queued, and recorded on the turn's row for a start after a crash to
-    // edit, whole however soon the turn ends; only keeping it current is interrupted.
-    const post = outbox.enqueueStatus({ chatId, text: shown, options: { parse_mode: "HTML" } }).pipe(
+    // The message is queued, or the one posted ahead taken on, which says what it shows now,
+    // and recorded on the turn's row for a start after a crash to edit, whole however soon the
+    // turn ends; only keeping it current is interrupted.
+    const post = (early ? Effect.succeed(early.outboxId) : outbox.enqueueStatus({ chatId, text: shown, options: { parse_mode: "HTML" } })).pipe(
       Effect.tap((outboxId) =>
         store.setTurnStatusMessage(conversationId, epoch, outboxId).pipe(
           Effect.catch((error) => Effect.logWarning(`Failed to record the status message on turn ${conversationId}: ${error.message}`)),
@@ -182,6 +205,34 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
     );
     return posted;
   });
+
+  const ahead = (chatId: ChatId, harnessName: string): Effect.Effect<StatusAhead> =>
+    Effect.gen(function*() {
+      const startTime = yield* Clock.currentTimeMillis;
+      const statusHtml = (waitingOn: string | null) => workingStatusHtml({ harnessName, startedAtMs: startTime, waitingOn });
+      const oneAtATime = yield* Semaphore.make(1);
+      let posted: PostedStatus | null = null;
+      let shown = statusHtml(null);
+      return {
+        waiting: (what) =>
+          Effect.gen(function*() {
+            const next = statusHtml(what);
+            if (posted === null) {
+              if (what === null) return;
+              const outboxId = yield* outbox.enqueueStatus({ chatId, text: next, options: { parse_mode: "HTML" } }).pipe(
+                Effect.catch((error) => Effect.as(Effect.logWarning(`Failed to queue the status message: ${error.message}`), null)),
+              );
+              if (outboxId !== null) [posted, shown] = [{ outboxId, startTime }, next];
+              return;
+            }
+            if (next === shown) return;
+            shown = next;
+            yield* edit(chatId, posted, next, { parse_mode: "HTML" });
+          }).pipe(Semaphore.withPermit(oneAtATime)),
+        posted: Effect.sync(() => posted),
+        end: (text) => Effect.suspend(() => (posted ? edit(chatId, posted, text) : Effect.void)).pipe(Semaphore.withPermit(oneAtATime)),
+      };
+    });
 
   const postResponse = Effect.fnUntraced(function*({ chatId, response, pendingResponseId, status, harnessName = "Codex" }: PostedResponse) {
     const trimmedResponse = response.trim();
@@ -210,6 +261,7 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
   return {
     enqueueFinalResponse,
     statusUpdates,
+    ahead,
     postResponse,
     finishWithoutResponse,
     restarting: (chatId, status, harnessName) =>

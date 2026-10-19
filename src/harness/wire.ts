@@ -20,10 +20,10 @@ import type { TurnStart } from "./host.ts";
 import { FolderOnBranch, type HarnessUnavailable, NoWorkspaceMounted, type TurnResult, UnknownHarness } from "./index.ts";
 import { HARNESS_NAMES } from "./names.ts";
 
-/** Where each of the host's calls is served, all of them POSTs. */
+/** Where each of the host's calls is served, all of them POSTs, none where the sandbox gateway's front answers itself (../binder/server.ts answeredByFront). */
 export const HOST_PATHS = {
   reserve: "/reserve",
-  release: "/release",
+  release: "/release-hold",
   turns: "/turns",
   steer: "/steer",
   interrupt: "/interrupt",

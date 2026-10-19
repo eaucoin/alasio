@@ -5,6 +5,7 @@ import { ALASIO_GATEWAY_CALLER_KEY_VARIABLE, ALASIO_GATEWAY_ENVIRONMENT_VARIABLE
 import { getDefaultHarness, type HarnessName } from "./harness/names.ts";
 import { type WakeLog, wakeLogOf } from "./neon/lake-wake.ts";
 import type { GatewayWorkspacesOptions } from "./sandbox/gateway-client.ts";
+import type { TopicLog } from "./log/topic.ts";
 import { type TelegramLog, telegramLogOf } from "./telegram/update-consumer.ts";
 
 /** alasio's configuration, as its environment sets it. */
@@ -37,6 +38,13 @@ export interface AlasioConfig {
   readonly sessionsGateway: GatewayWorkspacesOptions | null;
   /** Whether the sandbox gateway serves folder workspaces' instances (src/gateway/folders.ts), as the deployment renders the host profile. */
   readonly folders: boolean;
+  /**
+   * Where alasio's conversations' harnesses run in pools of their own, through the sandbox
+   * gateway (src/harness/pooled-host.ts), as the deployment says (`ALASIO_HARNESS_POOLS`): its
+   * environment's events topic, which it hears their hosts on, and the group it reads it in;
+   * null where they run in alasio's process.
+   */
+  readonly harnessPools: { readonly events: TopicLog } | null;
   /** Whether alasio runs in a pod of Kubernetes, which it holds busy while a turn runs (src/kube/busy.ts). */
   readonly inKubernetes: boolean;
 }
@@ -100,6 +108,17 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
       }
       : null,
     folders: env[ALASIO_GATEWAY_FOLDERS_VARIABLE] === "1",
+    harnessPools: env["ALASIO_HARNESS_POOLS"] === "1"
+      ? {
+        events: {
+          brokers: requireEnv(env, "ALASIO_LOG_BROKERS").split(","),
+          username: requireEnv(env, "ALASIO_LOG_USERNAME"),
+          passwordFile: requireEnv(env, "ALASIO_LOG_PASSWORD_FILE"),
+          topic: requireEnv(env, "ALASIO_EVENTS_TOPIC"),
+          group: requireEnv(env, "ALASIO_EVENTS_GROUP"),
+        },
+      }
+      : null,
     inKubernetes: Boolean(env["ALASIO_POD"]?.trim()),
   };
 }

@@ -16,6 +16,9 @@ export const BINDING_LABEL = "alasio.dev/binding";
 /** The annotation of a bound pod, and of its Lease: its key. */
 export const KEY_ANNOTATION = "alasio.dev/binding-key";
 
+/** The header of a request that binds nothing: passed on where its key is bound, and otherwise answered as unbound (./server.ts). */
+export const NO_BIND_HEADER = "x-alasio-bind";
+
 /** A pool: its name and namespace. */
 export interface Pool {
   readonly name: string;

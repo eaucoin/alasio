@@ -45,7 +45,7 @@ export type NetMode = "none" | "full";
 /** How long a caller's token alasio mints is good for: past any one call of the gateway's, as each call, and each request a harness makes of its bayma (../mcp/bayma-proxy.ts), mints its own. */
 export const TOKEN_TTL_MS = 6 * 60 * 60_000;
 /** How long a bind asked ahead is asked again for, while the gateway's pool has no pod for it. */
-const BIND_WAIT_MS = 5 * 60_000;
+export const BIND_WAIT_MS = 5 * 60_000;
 /**
  * How long a file's write is asked again for, while the gateway answers it 503: past a node's
  * mount of workspace storage's handover to its successor, and two of JuiceFS's heartbeats
