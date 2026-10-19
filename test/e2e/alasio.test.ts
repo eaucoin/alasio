@@ -2220,17 +2220,16 @@ if (inShard("telemetry")) {
           if ((await running(name)) > 0) stopped = name;
         }
       }
+      // All the reader logs until it has stopped, its drain's word among it: a stopped pod's log goes with it.
+      const logged = kube.followedLogs(NAMESPACE, stopped, "query");
       await kube.remove(ref("Pod", stopped, NAMESPACE));
       assert.ok(!answered, "the query ended before its reader was stopped: make it longer");
       const ran = await asked;
       assert.equal(ran.code, 0, `the query ended with ${ran.code} as its reader stopped: ${ran.stderr}`);
       // Its drain ended once the query had, as no other query was under way in it, Grafana's alert rules' among them.
-      let drain: { message: string; ms: number; withinMs: number } | undefined;
-      for (const deadline = Date.now() + 120_000; !drain; await sleep(1000)) {
-        const logged: string = await kube.logs(NAMESPACE, stopped, "query").catch(() => "");
-        drain = logged.split("\n").filter((line) => line.includes('"withinMs"')).map((line) => JSON.parse(line) as { message: string; ms: number; withinMs: number }).at(-1);
-        if (!drain && Date.now() > deadline) assert.fail(`the stopped reader logged no drain:\n${logged}`);
-      }
+      const lines = (await Promise.race([logged, sleep(150_000).then(() => "")])).split("\n");
+      const drain = lines.filter((line) => line.includes('"withinMs"')).map((line) => JSON.parse(line) as { message: string; ms: number; withinMs: number }).at(-1);
+      assert.ok(drain, `the stopped reader logged no drain:\n${lines.slice(-20).join("\n")}`);
       t.diagnostic(`the reader drained in ${drain.ms} ms, of ${drain.withinMs} ms at most`);
       assert.equal(drain.message, "drained");
       assert.deepEqual(ran.stdout.trim().split("\n").map((line) => Number((JSON.parse(line) as { n: unknown }).n)), [285714286]);
