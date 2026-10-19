@@ -12,7 +12,7 @@ import { Binder } from "../src/binder/binder.ts";
 import { activeAt, readLease } from "../src/binder/bindings.ts";
 import { LiveBindings } from "../src/binder/live.ts";
 import { environmentKey, freeLabels, type Pool } from "../src/binder/names.ts";
-import { type BinderServer, MAX_OPERATION_BYTES, NO_BIND_HEADER, type Operation, type Placement, PlacementRefused, serveBinder } from "../src/binder/server.ts";
+import { type BinderServer, MAX_CALLER_TOKEN_MS, MAX_OPERATION_BYTES, NO_BIND_HEADER, type Operation, type Placement, PlacementRefused, serveBinder } from "../src/binder/server.ts";
 import { bindingToken, mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
@@ -197,6 +197,24 @@ test("an environment's release lets go of its own binding of a key alone, anothe
     assert.equal((await run(readLease(main, key)))?.metadata?.uid, held?.metadata?.uid);
     assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: as("main"), body: "{}" })).status, 200);
     assert.equal(reachedNamespace(stand.sent), main.namespace);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a caller's token good for longer than alasio's, as a key leaked would mint, is refused; one good for as long is taken", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  const served = await front(of, stand.port);
+  try {
+    const key = "sessionfs:lasting";
+    const ask = (expires: number) => fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key, expires) }, body: "{}" });
+    assert.equal((await ask(Date.now() + MAX_CALLER_TOKEN_MS + 60_000)).status, 401);
+    assert.equal((await ask(Date.now() + 365 * 24 * 60 * 60_000)).status, 401);
+    assert.equal(stand.sent.length, 0);
+    assert.equal((await ask(Date.now() + 6 * 60 * 60_000)).status, 200);
   } finally {
     await served.close();
     stand.close();

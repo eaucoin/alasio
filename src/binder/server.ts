@@ -28,7 +28,8 @@
  *   its token says it is bound; and 503 `{ "held": true }`, with no Retry-After, where its binds
  *   failed one after another, so it is bound again only as its caller asks.
  *
- * A token that is no caller's, or has stopped, is answered 401. The gateway that serves on
+ * A token that is no caller's, has stopped, or is good for longer than MAX_CALLER_TOKEN_MS, is
+ * answered 401. The gateway that serves on
  * it says which pool each key is bound in, and how its pod is made where it makes its own
  * (`poolOf`), as each request's token is asked first: what the front keeps of a binding, its
  * route, its stamps and its requests under way, is by its pool and key, never its key alone,
@@ -73,6 +74,13 @@ export interface Answer {
 
 /** The header of a request that binds nothing: passed on where its key is bound, and otherwise answered as unbound. */
 export const NO_BIND_HEADER = "x-alasio-bind";
+
+/**
+ * The longest a caller's token may stay good for, from now: alasio's (src/sandbox/gateway-client.ts
+ * TOKEN_TTL_MS, six hours), with room for clocks a few minutes apart. One good for longer, as a
+ * key leaked would mint, is answered 401.
+ */
+export const MAX_CALLER_TOKEN_MS = 6 * 60 * 60_000 + 5 * 60_000;
 
 /** What a Retry-After asks a caller to wait, in seconds, before it asks again. */
 const RETRY_AFTER_S = 1;
@@ -234,9 +242,10 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         return answer(outgoing, 200, yield* countsOf(pool));
       }
       const bearer = Schema.decodeUnknownOption(BearerToken)(incoming.headers.authorization);
-      const claims = Option.isSome(bearer) ? verifyToken(callerKey, bearer.value[1], yield* Clock.currentTimeMillis) : null;
-      // A caller's token, which stops; a binding's, which a bound pod takes requests with, is none.
-      if (!claims || claims.expires === undefined || claims.binding !== undefined) return answer(outgoing, 401, { error: "no caller's token" });
+      const now = yield* Clock.currentTimeMillis;
+      const claims = Option.isSome(bearer) ? verifyToken(callerKey, bearer.value[1], now) : null;
+      // A caller's token, which stops within MAX_CALLER_TOKEN_MS; a binding's, which a bound pod takes requests with, is none.
+      if (!claims || claims.expires === undefined || claims.expires > now + MAX_CALLER_TOKEN_MS || claims.binding !== undefined) return answer(outgoing, 401, { error: "no caller's token" });
       const { key } = claims;
       const [path = "", search = ""] = url.split("?", 2);
       if (operate && OPERATED.test(path)) {
