@@ -123,6 +123,14 @@ create table if not exists ${SCHEMA}.media_groups (
   flushed_at timestamptz
 );
 
+-- How many times handling each album failed, as its files could not be written: one that
+-- fails as often as alasio tries is given up on, and its chat told (src/telegram/media-group-buffer.ts).
+create table if not exists ${SCHEMA}.media_group_failures (
+  media_group_id text primary key references ${SCHEMA}.media_groups (id) on delete cascade,
+  failures integer not null default 1,
+  failed_at timestamptz not null default now()
+);
+
 -- Each conversation's latest turn, its id the conversation's.
 create table if not exists ${SCHEMA}.turns (
   id text primary key,

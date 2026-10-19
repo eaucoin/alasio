@@ -157,6 +157,8 @@ export interface HandlingMarks extends UpdateMarks {
    * transaction, so an alasio that stops as it handles the album leaves it waiting.
    */
   readonly claimMediaGroup: (mediaGroupId: string, quietMs: number) => Stored<boolean>;
+  /** Queues a reply to the chat, committed with what else the lock's holder marks. */
+  readonly enqueueOutboxText: (text: NewOutboxText) => Stored<string>;
 }
 
 /**
@@ -268,7 +270,10 @@ export class Store extends Context.Service<Store, {
   readonly insertFile: (file: NewFile) => Stored<string>;
   /** The files `ids` name, with their content. */
   readonly getFileContents: (ids: readonly string[]) => Stored<FileContent[]>;
-  readonly upsertMediaGroup: (arrival: MediaGroupArrival) => Stored<void>;
+  /** Keeps the album a message arrived in, unless it is kept already: whether it still waits, or was handled before the message came. */
+  readonly upsertMediaGroup: (arrival: MediaGroupArrival) => Stored<boolean>;
+  /** Records that handling the album failed once more: how many times it has. */
+  readonly recordMediaGroupFailure: (mediaGroupId: string) => Stored<number>;
   readonly getMediaGroupMessages: (mediaGroupId: string) => Stored<StoredMessage[]>;
   readonly getFilesForMessages: (messageIds: readonly string[]) => Stored<StoredFile[]>;
   /** The albums still waiting none of whose messages was kept within `quietMs`, oldest first. */
@@ -471,11 +476,12 @@ const makeStore = Effect.fnUntraced(function*({
           Effect.andThen(sql.query("select set_config('lock_timeout', $1, true)", [`${Duration.toMillis(handlingLockTimeout)}ms`])),
           Effect.andThen(sql.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [handlingLockName(schema, chatId)])),
           Effect.andThen(Effect.suspend(() => {
-            const { telegramContent: locked } = repositoriesOn(sql);
+            const { telegramContent: locked, outbox: lockedOutbox } = repositoriesOn(sql);
             return work({
               recordTelegramUpdate: (update) => locked.recordTelegramUpdate(update),
               markTelegramUpdateProcessed: (updateId) => locked.markTelegramUpdateProcessed(updateId),
               claimMediaGroup: (mediaGroupId, quietMs) => locked.claimMediaGroup(mediaGroupId, quietMs),
+              enqueueOutboxText: (text) => lockedOutbox.enqueueText(text),
             });
           })),
         )
@@ -485,6 +491,7 @@ const makeStore = Effect.fnUntraced(function*({
     insertFile: (file) => telegramContent.insertFile(file),
     getFileContents: (ids) => telegramContent.getFileContents(ids),
     upsertMediaGroup: (arrival) => telegramContent.upsertMediaGroup(arrival),
+    recordMediaGroupFailure: (mediaGroupId) => telegramContent.recordMediaGroupFailure(mediaGroupId),
     getMediaGroupMessages: (mediaGroupId) => telegramContent.getMediaGroupMessages(mediaGroupId),
     getFilesForMessages: (messageIds) => telegramContent.getFilesForMessages(messageIds),
     getPendingMediaGroupsDue: (quietMs) => telegramContent.getPendingMediaGroupsDue(quietMs),

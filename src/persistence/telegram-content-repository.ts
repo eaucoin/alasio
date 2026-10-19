@@ -178,11 +178,27 @@ export class NeonTelegramContentRepository {
     return this.#sql.query<FileContent>(`select id, name, content from ${this.#schema}.files where id = any($1)`, [ids]);
   }
 
-  upsertMediaGroup({ mediaGroupId, conversationId, updateId }: MediaGroupArrival): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(
-      `insert into ${this.#schema}.media_groups (id, conversation_id, first_update_id) values ($1, $2, $3) on conflict (id) do nothing`,
+  /** Keeps the album a message arrived in, unless it is kept already: whether it still waits, or was handled before the message came. */
+  upsertMediaGroup({ mediaGroupId, conversationId, updateId }: MediaGroupArrival): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query<{ status: MediaGroupStatus }>(
+      `with arrived as (
+         insert into ${this.#schema}.media_groups (id, conversation_id, first_update_id) values ($1, $2, $3) on conflict (id) do nothing returning status
+       )
+       select status from arrived
+       union all
+       select status from ${this.#schema}.media_groups where id = $1`,
       [mediaGroupId, conversationId, updateId],
-    ));
+    ).pipe(Effect.map(([row]) => row?.status === "pending"));
+  }
+
+  /** Records that handling the album failed once more: how many times it has. */
+  recordMediaGroupFailure(mediaGroupId: string): Effect.Effect<number, StoreError> {
+    return this.#sql.query<{ failures: number }>(
+      `insert into ${this.#schema}.media_group_failures (media_group_id) values ($1)
+       on conflict (media_group_id) do update set failures = media_group_failures.failures + 1, failed_at = now()
+       returning failures`,
+      [mediaGroupId],
+    ).pipe(Effect.map(([row]) => row?.failures ?? 1));
   }
 
   /**
