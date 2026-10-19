@@ -315,6 +315,8 @@ if (inShard("upgrade")) {
       (await kube.get(ref("PersistentVolumeClaim", `data-${componentName("log")}-0`, NAMESPACE)))?.metadata?.uid,
     ];
     let logBefore: (string | undefined)[];
+    /** The records otel.spans held before the upgrade. */
+    let spansBefore: number;
     /**
      * The stack's secrets, as the root Secret's secrets.json and the log's Secret keep them:
      * each key's value's hash, none of the values; the root's objects, its verifiers among
@@ -488,6 +490,22 @@ if (inShard("upgrade")) {
             "valkeyQuotasPassword",
             "verifiers.harness",
           ]);
+        },
+      },
+      {
+        seeds: "the telemetry topics as the release before made them, uncompressed, and what they hold",
+        seed: async () => {
+          const { topics } = await logConfigs();
+          assert.deepEqual(Object.values(topics).map((configs) => configs["compression.type"]), ["producer", "producer", "producer"]);
+          for (const deadline = Date.now() + 180_000; (spansBefore = (await logSizes("otel.spans")).records) === 0; await sleep(5000)) {
+            if (Date.now() > deadline) assert.fail("otel.spans held nothing within 3 minutes");
+          }
+        },
+        keeps: "the telemetry topics, each kept compressed with zstd from then on, in place, with what they held",
+        check: async () => {
+          const { topics } = await logConfigs();
+          assert.deepEqual(Object.values(topics).map((configs) => configs["compression.type"]), ["zstd", "zstd", "zstd"]);
+          assert.ok((await logSizes("otel.spans")).records >= spansBefore, "otel.spans lost records it held before the upgrade");
         },
       },
       {
@@ -2454,10 +2472,23 @@ if (inShard("telemetry")) {
       };
 
       test("the log flushes each telemetry topic to its volume within a second, its flusher looking each second", async () => {
-        const script = readFileSync(join(import.meta.dirname, "log-configs.ts"), "utf8");
-        const said = await kube.execOk(NAMESPACE, `${componentName("log")}-0`, ["sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", "0"], { container: "access", stdin: script });
-        const { node, topic }: { node: Record<string, string | null>; topic: Record<string, string | null> } = JSON.parse(said.trim().split("\n").at(-1) ?? "");
-        assert.deepEqual([node["log.flush.scheduler.interval.ms"], topic["flush.ms"]], ["1000", "1000"]);
+        const { node, topics } = await logConfigs();
+        assert.deepEqual([node["log.flush.scheduler.interval.ms"], ...Object.values(topics).map((configs) => configs["flush.ms"])], ["1000", "1000", "1000", "1000"]);
+      });
+
+      test("the log keeps each telemetry topic compressed with zstd, the stack's metrics in a fraction of their bytes, and the intake says how long it is to keep them", async (t) => {
+        const { topics } = await logConfigs();
+        assert.deepEqual(Object.values(topics).map((configs) => configs["compression.type"]), ["zstd", "zstd", "zstd"]);
+        // What otel.metrics holds on the volume, against the bytes of its exports, uncompressed, as the log gives them back.
+        const sizes = await logSizes("otel.metrics");
+        assert.ok(sizes.records > 0 && sizes.firstMs !== null && sizes.lastMs !== null && sizes.lastMs > sizes.firstMs, JSON.stringify(sizes));
+        const hours = (sizes.lastMs - sizes.firstMs) / 3_600_000;
+        const ratio = sizes.valueBytes / sizes.diskBytes;
+        const perHour = (bytes: number) => `${(bytes / hours / 2 ** 20).toFixed(2)} MiB/h`;
+        t.diagnostic(`otel.metrics: ${sizes.records} exports in ${(hours * 60).toFixed(1)} min, ${perHour(sizes.valueBytes)} uncompressed, ${perHour(sizes.diskBytes)} on the volume: ${ratio.toFixed(1)}x`);
+        assert.ok(ratio >= 3, `otel.metrics holds ${sizes.diskBytes} bytes on its volume of ${sizes.valueBytes} bytes of exports: ${ratio.toFixed(2)}x`);
+        // The intake says how long the log is to keep them, beside how long it does once it deletes any.
+        await untilInLake("the intake's word of the log's retention", "select count(*) as n from otel.metrics_gauge where ServiceName = 'lake-intake' and MetricName = 'lake_telemetry_log_retention_seconds' and Value > 0");
       });
 
       test("a broker's crash loses nothing the gateway answered as taken, which it answers once the log is back", async () => {
@@ -2582,6 +2613,20 @@ if (inShard("neon")) {
       await untilInLake("Codex's turn, mirrored to Neon", "select count(*) as n from codex.turns where completed_at is not null", 600_000);
     });
   });
+}
+
+/** The configuration of the log's first node and of its telemetry topics, as it answers for them (./log-configs.ts). */
+async function logConfigs(): Promise<{ node: Record<string, string | null>; topics: Record<string, Record<string, string | null>> }> {
+  const script = readFileSync(join(import.meta.dirname, "log-configs.ts"), "utf8");
+  const said = await kube.execOk(NAMESPACE, `${componentName("log")}-0`, ["sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", "0"], { container: "access", stdin: script });
+  return JSON.parse(said.trim().split("\n").at(-1) ?? "");
+}
+
+/** How compactly the log keeps `topic` (./log-sizes.ts). */
+async function logSizes(topic: string): Promise<{ partitions: number; diskBytes: number; valueBytes: number; records: number; firstMs: number | null; lastMs: number | null }> {
+  const script = readFileSync(join(import.meta.dirname, "log-sizes.ts"), "utf8");
+  const said = await kube.execOk(NAMESPACE, `${componentName("log")}-0`, ["sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", topic], { container: "access", stdin: script });
+  return JSON.parse(said.trim().split("\n").at(-1) ?? "");
 }
 
 /** The namespace of the scaling suite's own workloads. */

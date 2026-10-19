@@ -55,6 +55,9 @@
  *                                           as above
  *   LOG_BROKERS                             the log's brokers, comma-separated host:port
  *   LOG_USERNAME, LOG_PASSWORD              its principal on the log, `intake`
+ *   LOG_RETENTION_MS                        how long the log keeps the telemetry topics'
+ *                                           records (log.retention), which it says beside
+ *                                           how long they keep them in fact; none if unset
  *
  * The lake's query endpoint (./endpoint.ts), which only reads it, as its reader:
  *
@@ -152,6 +155,8 @@ export interface StoreParts {
 export interface IntakeConfig extends LakeAccess {
   httpPort: number;
   log: LogConfig;
+  /** How long the log keeps the telemetry topics' records, as log.retention says; null where it is not said. */
+  logRetentionMs: number | null;
 }
 
 export interface EndpointConfig extends LakeAccess {
@@ -261,7 +266,12 @@ function storeParts(env: NodeJS.ProcessEnv): StoreParts | null {
 
 /** The telemetry intake's configuration. */
 export function loadIntakeConfig(env: NodeJS.ProcessEnv = process.env): IntakeConfig {
-  return { ...writerAccess(env, "256MB"), httpPort: positive(env, "LAKE_HTTP_PORT", 9464), log: logConfig(env) };
+  return {
+    ...writerAccess(env, "256MB"),
+    httpPort: positive(env, "LAKE_HTTP_PORT", 9464),
+    log: logConfig(env),
+    logRetentionMs: env["LOG_RETENTION_MS"]?.trim() ? positive(env, "LOG_RETENTION_MS", 0) : null,
+  };
 }
 
 /** The query endpoint's configuration. */

@@ -25,6 +25,8 @@ const METRICS = {
   lake_telemetry_reread_gaps_total: { type: "counter", help: "Rereads of what the lake lost, by signal, that the log no longer held all of, its retention past it" },
   lake_telemetry_reread_gap_seconds: { type: "gauge", help: "The time the last such reread could not refill, by signal, in seconds" },
   lake_telemetry_lag_records: { type: "gauge", help: "Records the telemetry intake's group has yet to read, by topic, as a member last asked the log" },
+  lake_telemetry_log_kept_seconds: { type: "gauge", help: "How long the log keeps a telemetry partition's records in fact, the age of the first it holds, by topic and partition, of those it has deleted any of" },
+  lake_telemetry_log_retention_seconds: { type: "gauge", help: "How long the log is to keep the telemetry topics' records, as log.retention says" },
   lake_query_queue: { type: "gauge", help: "Queries the query endpoint has taken and not answered yet, running and waiting" },
   lake_queries_total: { type: "counter", help: "Queries the query endpoint answered, by status" },
   lake_resident_memory_bytes: { type: "gauge", help: "The process's resident memory, what its container's memory limit counts" },

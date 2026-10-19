@@ -186,13 +186,16 @@ export interface LogAccess {
 }
 
 /** The hours of a retention as log.retention says it. */
-const retentionMs = (retention: string): number => Number(retention.slice(0, -1)) * 3_600_000;
+export const retentionMs = (retention: string): number => Number(retention.slice(0, -1)) * 3_600_000;
 
 /**
  * What the log's access is: the telemetry topics, of as many partitions as the intake
  * runs replicas at most, so each has one to read, each partition keeping its share of the
  * volume at most (telemetryRetentionBytes), each flushed to its volume within a second
- * (flush.ms); the gateway's writing them, the intake's reading them in its group, and
+ * (flush.ms), and each kept compressed with zstd (compression.type), as the gateway
+ * produces it, whatever produces it: an export of OTLP's protobuf repeats its resources'
+ * and attributes' text, which compresses to a fraction of it, so a partition's share
+ * holds the retention's hours of what the stack sends; the gateway's writing them, the intake's reading them in its group, and
  * KEDA's reading how far the group is behind on them, and each environment's lake loader on
  * its wake topic, which asks to describe both and to read neither; the webhook intake's
  * writing every environment's Telegram topic, a branch's among them, and nothing else; the
@@ -230,7 +233,7 @@ export function logAccess(config: InstallConfig): LogAccess {
   };
   const retention = { retentionMs: retentionMs(config.log.retention), retentionBytes: telemetryRetentionBytes(config) };
   return {
-    topics: [...Object.values(TELEMETRY_TOPICS).map((name) => ({ name, partitions, ...retention, configs: { "flush.ms": "1000" } })), ...main.topics],
+    topics: [...Object.values(TELEMETRY_TOPICS).map((name) => ({ name, partitions, ...retention, configs: { "flush.ms": "1000", "compression.type": "zstd" } })), ...main.topics],
     principals: [...Object.entries(services).map(([name, acls]) => ({ name, acls })), ...main.principals],
   };
 }
