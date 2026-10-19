@@ -260,8 +260,10 @@ test("a caller's release runs what its placement says comes before, then lets it
     const call = (path: string) => fetch(`http://127.0.0.1:${served.port}${path}`, { method: "POST", headers: { authorization: caller(key) } });
     assert.equal((await call("/release")).status, 204);
     assert.deepEqual(before, []);
-    assert.equal((await call("/bind")).status, 204);
+    const asked = await call("/bind");
     const bound = await run(readLease(of, key));
+    // Its binding named, its Lease's uid.
+    assert.deepEqual([asked.status, asked.headers.get("x-alasio-binding")], [204, bound?.metadata?.uid]);
     const failed = await call("/release");
     assert.deepEqual([failed.status, failed.headers.get("retry-after")], [503, "1"]);
     assert.equal((await run(readLease(of, key)))?.metadata?.uid, bound?.metadata?.uid);

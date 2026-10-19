@@ -3,8 +3,9 @@
  * naming the key it may reach, as `Authorization: Bearer <token>`; and what KEDA asks how
  * many each pool waits for.
  *
- * - `POST /bind`: binds the token's key ahead of any request (204), so its pod is got while
- *   nothing waits on it, as the key is bound now, whatever route the front last knew of it;
+ * - `POST /bind`: binds the token's key ahead of any request (204, BINDING_HEADER naming its
+ *   binding), so its pod is got while nothing waits on it, as the key is bound now, whatever
+ *   route the front last knew of it;
  *   503 with a Retry-After where its pool had no pod for it in time.
  * - `POST /release`: releases the token's key's binding, as its placement says what comes
  *   before, and resets what its placement keeps of its binds (204), as it does where it has
@@ -47,7 +48,7 @@ import { withLogScope } from "../shared/log.ts";
 import { BearerToken } from "../shared/tokens.ts";
 import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
 import { counts, touchLease } from "./bindings.ts";
-import { type Pool } from "./names.ts";
+import { BINDING_HEADER, type Pool } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
 import type { Held } from "./live.ts";
 import { bindingToken, type TokenClaims, verifyToken } from "./tokens.ts";
@@ -200,7 +201,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
    * where it is to be asked `anew`, or its pod bound now; or, where it is to bind nothing
    * (`unbound`), its pod as its binding is now, null where none serves.
    */
-  const routeOf = (key: string, options: Readonly<Record<string, string>>, { unbound, anew }: { readonly unbound: boolean; readonly anew: boolean }): Effect.Effect<(Route & { readonly pool: Pool }) | null, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused | PlacementHeld> =>
+  const routeOf = (key: string, options: Readonly<Record<string, string>>, { unbound, anew }: { readonly unbound: boolean; readonly anew: boolean }): Effect.Effect<(Route & { readonly pool: Pool; readonly binding: string }) | null, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused | PlacementHeld> =>
     Effect.gen(function*() {
       const { pool, held, settled, ...placed } = yield* poolOf(key, options);
       const known = anew ? undefined : routes.get(slot(pool, key));
@@ -294,7 +295,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       }
       if (incoming.method === "POST" && url === "/bind") {
         incoming.resume();
-        return answer(outgoing, 204);
+        return answer(outgoing, 204, undefined, { [BINDING_HEADER]: route.binding });
       }
       yield* active(key, route.pool);
       const flight = slot(route.pool, key);

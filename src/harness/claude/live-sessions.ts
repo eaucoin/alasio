@@ -173,6 +173,8 @@ export interface ClaudeHost {
   readonly baymaUrl: string | null;
   /** Why it runs without its folder's bayma, which its turns' prompts are told, as its last bind said: none where it has it, or runs in a session filesystem. */
   baymaNotice: string | null;
+  /** The binding of its folder's bayma it started with: none where it has none. */
+  readonly folderBinding: string | null;
   sessionId: string | null;
   readonly channel: PromptChannel;
   /** Aborts the process; the Agent SDK is given it to stop the process with. */
@@ -838,6 +840,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       key,
       baymaUrl: bayma?.url ?? null,
       baymaNotice: folder?.notice ?? null,
+      folderBinding: folder?.binding ?? null,
       sessionId: resumeSession ?? null,
       channel,
       controller,
@@ -881,17 +884,19 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     const bayma = sessionFsBayma ? yield* needed(sessionFsBayma) : null;
     const existing = hosts.get(params.threadKey);
     const reusable = existing && !existing.closed && params.resumeSession && existing.sessionId === params.resumeSession && existing.key === key && existing.baymaUrl === (bayma?.url ?? null);
-    // A folder's bayma bound as the process starts, and again before each turn of a process
-    // that started without it, which starts anew once it has it.
-    const folder = bayma || (reusable && existing.baymaNotice === null)
+    // A folder's bayma bound as the process starts, and again before each turn, so it is bound
+    // before the turn asks it: a process that started without it starts anew once it has it,
+    // and one whose binding was released meanwhile, its bayma's clients gone with it, starts
+    // anew with the binding made since, its MCP client connecting afresh.
+    const folder = bayma || (reusable && existing.baymaNotice === null && existing.folderBinding === null)
       ? null
       : yield* needed(folderBayma({ threadKey: params.threadKey, workingDirectory, chatId: params.chatId }));
-    if (reusable && (folder === null || folder.server === null)) {
+    if (reusable && (folder === null || folder.server === null || folder.binding === existing.folderBinding)) {
       if (folder) existing.baymaNotice = folder.notice;
       return existing;
     }
     if (existing && !existing.closed) {
-      yield* closeHost(existing, reusable ? "its folder's bayma started" : "mounted session, model, or workspace door changed");
+      yield* closeHost(existing, !reusable ? "mounted session, model, or workspace door changed" : existing.folderBinding === null ? "its folder's bayma started" : "its folder's bayma was bound anew");
     }
     const host = yield* startHost(params, key, bayma, folder);
     hosts.set(params.threadKey, host);

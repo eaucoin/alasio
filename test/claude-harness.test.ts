@@ -145,7 +145,7 @@ const folderServer = ({ threadKey }: Pick<HostBaymaScope, "threadKey">): BaymaMc
   url: `http://alasio-sandbox-gateway.alasio.svc:8080/mcp`,
   headers: { Authorization: `Bearer ${threadKey}` },
 });
-const folderBayma = (scope: Pick<HostBaymaScope, "threadKey">) => Effect.succeed<FolderBaymaOutcome>({ server: folderServer(scope), notice: null });
+const folderBayma = (scope: Pick<HostBaymaScope, "threadKey">) => Effect.succeed<FolderBaymaOutcome>({ server: folderServer(scope), binding: "binding-1", notice: null });
 
 /** A turn for runClaudeTurn: the turn, what its live sessions are made with, and the running turns they register in. */
 interface ClaudeTurnRun extends Omit<TurnParams, "modelChoice" | "ownTurns"> {
@@ -1189,7 +1189,7 @@ test("a turn whose folder's bayma did not start runs without it, told so before 
     workingDirectory: "/work",
     sessions: { sessionExists: () => Effect.succeed(true) },
     queryFactory: cli.queryFactory,
-    folderBayma: (scope) => Effect.sync((): FolderBaymaOutcome => (asked.push(scope), started ? { server: folderServer(scope), notice: null } : { server: null, notice })),
+    folderBayma: (scope) => Effect.sync((): FolderBaymaOutcome => (asked.push(scope), started ? { server: folderServer(scope), binding: "binding-1", notice: null } : { server: null, binding: null, notice })),
   }, activeTurns);
   const run = async (prompt: string) => {
     const turn = runTurn(liveSessions, turnParams(persistence, { prompt }));
@@ -1210,9 +1210,41 @@ test("a turn whose folder's bayma did not start runs without it, told so before 
   assert.deepEqual(Object.keys(cli.state.options[1]?.mcpServers ?? {}), ["bayma"]);
   assert.equal(await run("four"), "four");
   assert.equal(cli.state.created, 2);
-  // Its folder and its chat given, so a turn's failed bind is told there.
-  assert.equal(asked.length, 3);
+  // Its folder and its chat given, so a turn's failed bind is told there; bound before every turn.
+  assert.equal(asked.length, 4);
   assert.deepEqual(asked[0], { threadKey: "telegram:1", workingDirectory: "/work", chatId: turnParams(persistence).chatId });
+  await closeAll();
+});
+
+test("a turn whose folder's bayma was released and bound anew since the last runs in a process started anew, resuming its session, so its MCP client connects afresh", async () => {
+  const persistence = createPersistence();
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  let binding = "binding-1";
+  const { liveSessions, closeAll } = openLiveSessions({
+    workingDirectory: "/work",
+    sessions: { sessionExists: () => Effect.succeed(true) },
+    queryFactory: cli.queryFactory,
+    folderBayma: (scope) => Effect.sync((): FolderBaymaOutcome => ({ server: folderServer(scope), binding, notice: null })),
+  }, activeTurns);
+  const run = async (prompt: string) => {
+    const turn = runTurn(liveSessions, turnParams(persistence, { prompt }));
+    const received = await cli.nextPrompt();
+    cli.emit(successResult({ result: "done", session_id: "s-1", user_message_uuids: [received.uuid] }));
+    await turn;
+  };
+  cli.emit(initMessage("s-1"));
+  await run("one");
+  await run("two");
+  assert.equal(cli.state.created, 1, "the same binding: the same process");
+  binding = "binding-2";
+  cli.emit(initMessage("s-1"));
+  await run("three");
+  assert.equal(cli.state.created, 2, "bound anew: a process started anew");
+  assert.equal(cli.state.options[1]?.resume, "s-1");
+  assert.deepEqual(Object.keys(cli.state.options[1]?.mcpServers ?? {}), ["bayma"]);
+  await run("four");
+  assert.equal(cli.state.created, 2);
   await closeAll();
 });
 

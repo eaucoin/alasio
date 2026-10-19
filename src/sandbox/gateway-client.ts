@@ -20,6 +20,7 @@
  */
 import { Clock, Duration, Effect, Schedule, Schema } from "effect";
 
+import { BINDING_HEADER } from "../binder/names.ts";
 import { mintToken } from "../binder/tokens.ts";
 import { folderBindMs, folderKey } from "../gateway/names.ts";
 import { sessionKey } from "./names.ts";
@@ -100,8 +101,12 @@ export interface GatewayWorkspaces {
   /** Folder conversations' instances (../gateway/folders.ts), each of a conversation under a harness: its bayma's endpoint, its bind ahead of any request, and its release. */
   readonly folders: {
     readonly endpoint: (scope: FolderScope) => Effect.Effect<BaymaEndpoint>;
-    /** Its bind, once, as its pod is made and its bayma starts: refused, saying why, where it failed, or the gateway holds it; `retry` binds one held. */
-    readonly bind: (scope: FolderScope, options?: { readonly retry?: boolean }) => Effect.Effect<void, GatewayError | FolderBindFailed>;
+    /**
+     * Its bind, once, as its pod is made and its bayma starts: its binding, which a bind after
+     * a release of it names anew; refused, saying why, where it failed, or the gateway holds
+     * it; `retry` binds one held.
+     */
+    readonly bind: (scope: FolderScope, options?: { readonly retry?: boolean }) => Effect.Effect<string, GatewayError | FolderBindFailed>;
     readonly release: (scope: FolderScope) => Effect.Effect<void, GatewayError>;
   };
 }
@@ -148,7 +153,7 @@ export function makeGatewayWorkspaces({ url, environment, callerKey }: GatewayWo
             signal,
           });
           const bytes = new Uint8Array(await response.arrayBuffer());
-          return { status: response.status, bytes };
+          return { status: response.status, headers: response.headers, bytes };
         },
         catch: (error) => new GatewayError({ call: what, reason: error instanceof Error ? error.message : String(error) }),
       }).pipe(Effect.timeoutOrElse({ duration: Duration.millis(timeoutMs), orElse: () => Effect.fail(new GatewayError({ call: what, reason: `it did not answer within ${timeoutMs / 1000} s` })) }));
@@ -196,8 +201,8 @@ export function makeGatewayWorkspaces({ url, environment, callerKey }: GatewayWo
       bind: ({ harness, threadKey }, { retry = false } = {}) => {
         const what = `bind the folder instance of ${threadKey} under ${harness}`;
         return askAs(what, tokenFor(folderKey(harness, threadKey), retry ? { retry: "1" } : {}), "POST", "/bind", { timeoutMs: FOLDER_CALL_TIMEOUT_MS }).pipe(
-          Effect.flatMap(({ status, bytes }): Effect.Effect<void, GatewayError | FolderBindFailed> => {
-            if (status === 204) return Effect.void;
+          Effect.flatMap(({ status, headers, bytes }): Effect.Effect<string, GatewayError | FolderBindFailed> => {
+            if (status === 204) return Effect.succeed(headers.get(BINDING_HEADER) ?? "");
             if (status !== 503) return Effect.fail(new GatewayError({ call: what, status, reason: said(bytes) }));
             const refusal = Schema.decodeUnknownOption(Schema.fromJsonString(BindRefusal))(Buffer.from(bytes).toString("utf8"));
             const { reason, held } = refusal._tag === "Some" ? refusal.value : {};

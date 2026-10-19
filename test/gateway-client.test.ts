@@ -106,14 +106,14 @@ test("a bind asked ahead is asked again while the gateway's pool has no pod for 
   assert.deepEqual([failed.status, failed.reason, elsewhere.asked.length], [403, "there is no environment try of sessions", 1]);
 });
 
-test("a folder conversation's instance is reached, bound and released through the gateway by a caller's token of its folder key, of its environment alone; a bind that failed is not asked again, saying why, and whether it is held", async (t) => {
+test("a folder conversation's instance is reached, bound, its binding named, and released through the gateway by a caller's token of its folder key, of its environment alone; a bind that failed is not asked again, saying why, and whether it is held", async (t) => {
   let binds = 0;
   const { asked, workspaces } = await gateway(t, ({ url }) => {
     if (url !== "/bind") return { status: 204 };
     binds += 1;
     if (binds === 1) return { status: 503, body: JSON.stringify({ error: "folder:claude:telegram:42 could not be bound now", reason: "its pod is pending: no node" }) };
     if (binds === 2) return { status: 503, body: JSON.stringify({ error: "folder:claude:telegram:42 is bound again only as its caller asks", reason: "its last 3 binds failed", held: true }) };
-    return { status: 204 };
+    return { status: 204, headers: { "x-alasio-binding": "binding-1" } };
   });
   const scope = { harness: "claude", threadKey: "telegram:42" };
   const endpoint = await run(workspaces.folders.endpoint(scope));
@@ -124,7 +124,8 @@ test("a folder conversation's instance is reached, bound and released through th
   const held = await run(Effect.flip(workspaces.folders.bind(scope)));
   assert.deepEqual([held.message, held._tag === "FolderBindFailed" && held.held], ["its last 3 binds failed", true]);
   // As the operator asks, its token saying so.
-  await run(workspaces.folders.bind(scope, { retry: true }));
+  // Its binding named, as a bind after a release names another.
+  assert.equal(await run(workspaces.folders.bind(scope, { retry: true })), "binding-1");
   await run(workspaces.folders.release(scope));
   assert.deepEqual(asked.map(({ method, url, claims: of }) => `${method} ${url} ${of?.key} ${of?.options?.["retry"] ?? ""}`), [
     "POST /bind folder:claude:telegram:42 ",

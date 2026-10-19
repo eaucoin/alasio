@@ -40,10 +40,14 @@ export interface FolderBaymaScope extends FolderScope {
   readonly chatId?: string | undefined;
 }
 
-/** A folder workspace's bayma for a turn: its server; or none, the turn running without it, and why, for the harness to put before the turn's prompt. */
+/**
+ * A folder workspace's bayma for a turn: its server, and the binding it is bound by, which a
+ * bind after its release names anew, as its bayma knows nothing of its clients before; or
+ * none, the turn running without it, and why, for the harness to put before the turn's prompt.
+ */
 export type FolderBaymaOutcome =
-  | { readonly server: BaymaMcpServer; readonly notice: null }
-  | { readonly server: null; readonly notice: string };
+  | { readonly server: BaymaMcpServer; readonly binding: string; readonly notice: null }
+  | { readonly server: null; readonly binding: null; readonly notice: string };
 
 /** The workspace panel's kinds of the buttons a failed bind's notice carries: bind it again now, and restart it. */
 export const FOLDER_RETRY = "workspace:folder_retry";
@@ -108,7 +112,7 @@ export class HostBayma extends Context.Service<HostBayma, {
               const bound = yield* Effect.result(folders.bind(scope));
               if (bound._tag === "Success") {
                 toldHeld.delete(key);
-                return { server: yield* server(scope), notice: null };
+                return { server: yield* server(scope), binding: bound.success, notice: null };
               }
               const notice = degradedNotice(scope.workingDirectory, bound.failure);
               yield* Effect.logWarning(`the folder instance of ${key} did not start, its turn running without it: ${bound.failure.message}`);
@@ -118,7 +122,7 @@ export class HostBayma extends Context.Service<HostBayma, {
                 if (held) toldHeld.add(key);
                 yield* tell(scope, scope.chatId, notice);
               }
-              return { server: null, notice };
+              return { server: null, binding: null, notice };
             }),
           retry: (scope) =>
             folders.bind(scope, { retry: true }).pipe(
