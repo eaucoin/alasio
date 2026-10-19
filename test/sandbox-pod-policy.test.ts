@@ -103,14 +103,45 @@ before(async () => {
       yield* kube.create({ apiVersion: "rbac.authorization.k8s.io/v1", kind: "RoleBinding", metadata: { name: "pod-maker", namespace: SESSIONS }, roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: "pod-maker" }, subjects: [{ kind: "User", name: "system:serviceaccount:alasio:alasio" }] } as never);
     })
   );
-  // The policy in force, as the API server takes a while to: a pod it refuses refused.
-  for (const deadline = Date.now() + 30_000; ; await new Promise((resolve) => setTimeout(resolve, 200))) {
-    const tried = await made(poolPod((pod) => void (pod.spec.hostNetwork = true)));
-    if ("refused" in tried) break;
-    await withKube((kube) => kube.remove("v1", "Pod", SESSIONS, tried.name));
-    assert.ok(Date.now() < deadline, "the policy never came into force");
-  }
+  // Each policy in force, as the API server takes a while to: what it refuses refused. One that
+  // is not within the bound says what the API server holds of it and what it last said.
+  const inForce = async (policy: string, refuses: () => Promise<{ readonly name: string } | { readonly refused: string }>, undo: (name: string) => Promise<void>) => {
+    let last: unknown;
+    for (const deadline = Date.now() + 30_000; ; await new Promise((resolve) => setTimeout(resolve, 200))) {
+      const tried = await refuses();
+      if ("refused" in tried) return;
+      last = tried;
+      await undo(tried.name);
+      if (Date.now() > deadline) assert.fail(`the ${policy} policy never came into force:\n${await evidence(policy, last, started.output())}`);
+    }
+  };
+  await inForce("alasio-sandbox-pods", () => made(poolPod((pod) => void (pod.spec.hostNetwork = true))), (name) => withKube((kube) => kube.remove("v1", "Pod", SESSIONS, name)));
+  // A restore's pod of the gateway's, whose address the gateway may not set.
+  const probe = await madeAs(GATEWAY_USER, restorePod("fs-probe"));
+  assert.ok("name" in probe, JSON.stringify(probe));
+  await inForce("alasio-resumed-condition", () => statusPatchedAs(GATEWAY_USER, probe.name, { status: { podIP: "10.0.0.9" } }), async () => {});
+  await withKube((kube) => kube.remove("v1", "Pod", SESSIONS, probe.name));
 });
+
+/** What the API server holds of the admission policy `policy` and its binding, what was last answered of what it is to refuse (`last`), and what the server last wrote (`output`). */
+async function evidence(policy: string, last: unknown, output: string): Promise<string> {
+  const read = (path: string) =>
+    new Promise<string>((resolve) => {
+      const asked = request(new URL(`${api.server}${path}`), { ca: api.ca, headers: { authorization: `Bearer ${api.token}` } }, (response) => {
+        let text = "";
+        response.on("data", (chunk: Buffer) => (text += chunk.toString()));
+        response.on("end", () => resolve(text));
+      });
+      asked.on("error", (error) => resolve(String(error)));
+      asked.end();
+    });
+  return [
+    `policy: ${await read(`/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/${policy}`)}`,
+    `binding: ${await read(`/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/${policy}`)}`,
+    `last answered: ${JSON.stringify(last)}`,
+    `kube-apiserver said last:\n${output}`,
+  ].join("\n");
+}
 
 test("a pool's pod, as its ReplicaSet makes it from its template, is made", async () => {
   const pod = await made(poolPod());
@@ -267,11 +298,6 @@ test("the sandbox gateway sets a restore's pod's resumed condition true, and not
   const free = await made(poolPod());
   assert.ok("name" in free, JSON.stringify(free));
   const resumed = { status: { conditions: [{ type: "alasio.dev/resumed", status: "True", lastTransitionTime: new Date().toISOString() }] } };
-  // In force once the API server refuses what it says it refuses, as it takes a while to.
-  for (const deadline = Date.now() + 30_000; ; await new Promise((resolve) => setTimeout(resolve, 200))) {
-    if ("refused" in (await statusPatchedAs(GATEWAY_USER, restore.name, { status: { podIP: "10.0.0.9" } }))) break;
-    assert.ok(Date.now() < deadline, "the resumed-condition policy never came into force");
-  }
   const refused = (answer: { readonly name: string } | { readonly refused: string }) => "refused" in answer && /resumed-condition/u.test(answer.refused);
   assert.ok("name" in (await statusPatchedAs(GATEWAY_USER, restore.name, resumed)));
   const changes: Record<string, unknown> = {

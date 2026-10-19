@@ -23,11 +23,12 @@ const RELEASE = "v1.37.0";
 const ARCHIVE = `https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-${RELEASE}/envtest-${RELEASE}-linux-amd64.tar.gz`;
 const ARCHIVE_SHA256 = "f03faedfc68d2a78cee5cb02618bb44e7f67044f4c5fc957f72d3307fda61a9c";
 
-/** A running API server: its address, a kubeconfig of its administrator, and that administrator's token. */
+/** A running API server: its address, a kubeconfig of its administrator, and that administrator's token; and the last it wrote, for a test to say what it did. */
 export interface TestKubeApiServer {
   readonly server: string;
   readonly kubeconfig: string;
   readonly token: string;
+  readonly output: () => string;
 }
 
 let started: Promise<{ readonly api: TestKubeApiServer; readonly stop: () => Promise<void> }> | undefined;
@@ -152,7 +153,7 @@ async function start(): Promise<{ readonly api: TestKubeApiServer; readonly stop
       contexts: [{ name: "test", context: { cluster: "test", user: "admin" } }],
       "current-context": "test",
     }));
-    return { api: { server, kubeconfig, token }, stop };
+    return { api: { server, kubeconfig, token, output: apiServer.output }, stop };
   } catch (error) {
     await stop();
     throw error;
