@@ -69,6 +69,8 @@ function machine() {
   const statefulSet = join(root, "statefulset.json");
   const calls = join(root, "calls");
   const crd = join(root, "crd");
+  // agent-sandbox's controller's Deployment, there while this is.
+  const controller = join(root, "controller");
   const folders = join(root, "folders.json");
   const sandboxes = join(root, "sandboxes.tsv");
   const config = join(root, "config.json");
@@ -114,6 +116,8 @@ case "$*" in
   "get pod -A -l alasio.dev/workload=folder -o json") cat '${folders}' ;;
   "get sandboxes.agents.x-k8s.io -A -o jsonpath="*) cat '${sandboxes}' ;;
   "delete crd sandboxes.agents.x-k8s.io --ignore-not-found --wait=true") rm -f '${crd}' ;;
+  "-n alasio get deployment alasio-agent-sandbox-controller --ignore-not-found -o name") [ ! -e '${controller}' ] || echo deployment.apps/alasio-agent-sandbox-controller ;;
+  "-n alasio scale deployment alasio-agent-sandbox-controller --replicas=0") [ -e '${controller}' ] || { echo 'Error from server (NotFound): deployments.apps "alasio-agent-sandbox-controller" not found' >&2; exit 1; } ;;
   "-n alasio scale "*|"-n "*" delete pod "*|"-n "*" patch sandboxes.agents.x-k8s.io "*|"-n "*" delete sandboxes.agents.x-k8s.io "*) ;;
   "-n alasio delete "*" --ignore-not-found"|"delete clusterrole,"*" --ignore-not-found"|"-n alasio-host delete "*" --ignore-not-found"|"delete validatingadmissionpolicy,"*" --ignore-not-found") ;;
   "-n alasio exec -i deploy/alasio -c alasio -- node --input-type=module -e "*)
@@ -146,7 +150,8 @@ awk -v point="$2" '$2 != point' '${mounts}' >'${mounts}.next' && mv '${mounts}.n
         CONFIG: config,
         REBOOT_REQUIRED: reboot,
         NODE_ROOT: node,
-        UPGRADE: `echo upgrade >>'${ran}' && [ ! -e '${upgradeFails}' ] && printf '%s' '${JSON.stringify(logStatefulSet())}' >'${statefulSet}'`,
+        // Its apply prunes agent-sandbox's controller, the CRD kept, before it waits, and may fail.
+        UPGRADE: `echo upgrade >>'${ran}' && rm -f '${controller}' && [ ! -e '${upgradeFails}' ] && printf '%s' '${JSON.stringify(logStatefulSet())}' >'${statefulSet}'`,
         // Saying whether the configuration it checks says how to run agent-sandbox.
         UPGRADE_CHECK: `if jq -e '.install | has("agentSandbox")' '${config}' >/dev/null; then echo check of agentSandbox >>'${ran}'; else echo check >>'${ran}'; fi`,
         ...(failAt === undefined ? {} : { FAIL_AT: failAt }),
@@ -194,6 +199,7 @@ awk -v point="$2" '$2 != point' '${mounts}' >'${mounts}.next' && mv '${mounts}.n
     /** Gives the cluster 8.0.0's agent-sandbox: its CRD, the folders' bayma pods, `<namespace> <pod> <state dir>` each, and its Sandboxes, `<namespace> <name>` each. */
     hasAgentSandbox: (pods: readonly (readonly [string, string, string])[], listed: readonly (readonly [string, string])[]) => {
       writeFileSync(crd, "");
+      writeFileSync(controller, "");
       writeFileSync(folders, JSON.stringify({
         items: pods.map(([namespace, name, state]) => ({ metadata: { namespace, name }, spec: { containers: [{ name: "bayma", args: ["mcp-http", "--state-dir", state, "--token-file", "/run/alasio/bayma/token"] }] } })),
       }));
@@ -201,6 +207,8 @@ awk -v point="$2" '$2 != point' '${mounts}' >'${mounts}.next' && mv '${mounts}.n
     },
     /** Whether the cluster has the Sandboxes' CRD still. */
     hasCrd: () => existsSync(crd),
+    /** Whether the cluster has agent-sandbox's controller's Deployment still. */
+    hasController: () => existsSync(controller),
     /** The configuration's file, and what it holds. */
     config,
     configured: () => JSON.parse(readFileSync(config, "utf8")) as { install: Record<string, unknown> },
@@ -378,6 +386,8 @@ test("the cut-over removes install.agentSandbox from the configuration before th
     assert.match(failed.said, /removing install\.agentSandbox from [^\n]*config\.json, as this release runs no agent-sandbox[^]*checking that the upgrade can run[^]*putting install\.agentSandbox back in /u);
     assert.deepEqual(at.ran(), ["check"]);
     assert.deepEqual(at.configured().install, install);
+    // What it kept of the configuration, whole, gone once put back.
+    assert.throws(() => at.recorded("config.json"), /ENOENT/u);
     const run = at.cutOver();
     assert.equal(run.code, 0, run.said);
     assert.deepEqual(at.ran(), ["check", "upgrade", "check", "upgrade"]);
@@ -427,7 +437,7 @@ test("past its point of no return, before the upgrade, the cut-over stops agent-
       "-n alasio delete statefulset alasio-log --cascade=orphan --wait=true",
       "-n alasio scale deployment alasio-agent-sandbox-controller --replicas=0",
       "-n alasio scale deployment alasio --replicas=0",
-      "-n alasio-host delete pod bayma-0123 --grace-period=600 --wait=true --timeout=11m",
+      "-n alasio-host delete pod bayma-0123 --ignore-not-found --grace-period=600 --wait=true --timeout=11m",
       `-n alasio-host patch sandboxes.agents.x-k8s.io bayma-0123 --type=merge -p {"metadata":{"finalizers":null}}`,
       "-n alasio-host delete sandboxes.agents.x-k8s.io bayma-0123 --ignore-not-found --wait=true",
       `-n alasio-sessions patch sandboxes.agents.x-k8s.io fs-abc123 --type=merge -p {"metadata":{"finalizers":null}}`,
@@ -683,3 +693,24 @@ test("the cut-over gives 8.0.0's forks' holds their holder and expiry past its p
     await holdsOf800();
   }
 });
+
+test("the cut-over run again after its upgrade failed goes on with the upgrade, though the upgrade pruned agent-sandbox's controller, stopping nothing again", () => {
+  const at = machine();
+  try {
+    at.hasAgentSandbox([], [["alasio-host", "bayma-0123"]]);
+    at.upgradeFails(true);
+    const failed = at.cutOver();
+    assert.notEqual(failed.code, 0);
+    assert.match(failed.said, /FAILED: the upgrade failed \(upgrade\.log\)/u);
+    assert.ok(!at.hasController() && at.hasCrd(), "the upgrade pruned the controller, the CRD kept");
+    at.calls();
+    at.upgradeFails(false);
+    const again = at.cutOver();
+    assert.equal(again.code, 0, again.said);
+    assert.doesNotMatch(again.said, /stopping agent-sandbox's controller|waiting for alasio to run no turn|deleting every Sandbox/u);
+    assert.ok(!at.calls().some((call) => call.includes(" scale ")));
+  } finally {
+    at.remove();
+  }
+});
+

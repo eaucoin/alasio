@@ -176,16 +176,23 @@ sandbox_service_restore() {
   if [ -e "$OUT/config.json" ] && ! jq -e '.install | has("agentSandbox")' "$CONFIG" >/dev/null 2>&1; then
     log "putting install.agentSandbox back in $CONFIG, as 8.0.0 had it"
     # Written over, not replaced, so the file keeps its owner and mode.
-    cat "$OUT/config.json" >"$CONFIG" || log "FAILED: $CONFIG could not be written as it was: it is in $OUT/config.json"
+    # Gone once put back, as it holds the configuration whole.
+    cat "$OUT/config.json" >"$CONFIG" && rm -f "$OUT/config.json" || log "FAILED: $CONFIG could not be written as it was: it is in $OUT/config.json"
   fi
 }
 # Past the point of no return, before the upgrade: agent-sandbox's controller, alasio, each
-# folder's bayma and every Sandbox stopped; nothing, where the CRD is gone already.
+# folder's bayma and every Sandbox stopped; nothing, where the CRD is gone already. Once,
+# as OUT/sandbox-service-stopped says it was: a run again after the upgrade failed finds what
+# it stopped gone, its controller's Deployment pruned by the upgrade, alasio the release's.
+# Each step acts on what it finds, so a run again after one failed goes on.
 sandbox_service_past() {
   local namespace pod state saved name
+  [ ! -e "$OUT/sandbox-service-stopped" ] || return 0
   if [ -n "$(kubectl get crd "$SANDBOXES" --ignore-not-found -o name)" ]; then
-    log "stopping agent-sandbox's controller, so no Sandbox's pod is made again"
-    k scale deployment "$CONTROLLER" --replicas=0 >/dev/null || fail "agent-sandbox's controller could not be stopped"
+    if [ -n "$(k get deployment "$CONTROLLER" --ignore-not-found -o name)" ]; then
+      log "stopping agent-sandbox's controller, so no Sandbox's pod is made again"
+      k scale deployment "$CONTROLLER" --replicas=0 >/dev/null || fail "agent-sandbox's controller could not be stopped"
+    fi
     gone app.kubernetes.io/name=agent-sandbox-controller 300 || fail "agent-sandbox's controller did not stop within 5m"
     log "waiting for alasio to run no turn, then stopping it, so none starts until the upgrade starts it again"
     gone app.kubernetes.io/component=alasio,alasio.dev/busy=true 1800 || fail "alasio ran a turn for 30m on: let it end, and run the cut-over again"
@@ -197,7 +204,7 @@ sandbox_service_past() {
       fail "the folders' bayma could not be listed"
     while IFS="$(printf '\t')" read -r namespace pod state; do
       log "stopping the folder's bayma $namespace/$pod, given 10m to save its REPL sessions whole into $state, which stays for the gateway's folder instance"
-      kubectl -n "$namespace" delete pod "$pod" --grace-period=600 --wait=true --timeout=11m >/dev/null || fail "the folder's bayma $namespace/$pod did not stop within 11m"
+      kubectl -n "$namespace" delete pod "$pod" --ignore-not-found --grace-period=600 --wait=true --timeout=11m >/dev/null || fail "the folder's bayma $namespace/$pod did not stop within 11m"
       saved=$({ ls -1 "$state/snapshots" 2>/dev/null || true; } | paste -sd ' ' -)
       if [ -n "$saved" ]; then
         log "the folder's bayma $namespace/$pod saved the sessions $saved whole; any other comes back from its checkpoint"
@@ -212,6 +219,7 @@ sandbox_service_past() {
         kubectl -n "$namespace" delete "$SANDBOXES" "$name" --ignore-not-found --wait=true >/dev/null || fail "the Sandbox $namespace/$name could not be deleted"
     done <"$OUT/sandboxes.tsv"
   fi
+  : >"$OUT/sandbox-service-stopped"
 }
 # Once the upgrade is through: what of 8.0.0's this release has no use for.
 sandbox_service_after() {
