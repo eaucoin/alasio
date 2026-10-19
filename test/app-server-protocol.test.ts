@@ -377,11 +377,13 @@ test("app-server thread start and resume carry alasio model config", () =>
     }
   })));
 
-test("app-server thread loaded keeps its config for its time, then its next turn's ensure lets it go and resumes it with the config given now, but for one whose turn runs", () =>
+test("app-server thread loaded keeps its config for its time, then its next turn's ensure lets it go and resumes it with the config given now, but for one whose turn runs, or that left commands running in the background", () =>
   withNotifications((queue) => Effect.gen(function*() {
     const asked: string[] = [];
     const loadedThreads = new Set<string>();
+    let terminals = 0;
     const thread = makeAppServerThreads(answeringRpc({
+      "thread/backgroundTerminals/list": () => Effect.succeed({ data: Array.from({ length: terminals }, () => ({ itemId: "item", processId: "1", command: "sleep 600", cwd: "/repo", osPid: null, cpuPercent: null, rssKb: null })), nextCursor: null }),
       "thread/loaded/list": () => Effect.succeed({ data: [...loadedThreads], nextCursor: null }),
       "thread/unsubscribe": (params) => Effect.sync(() => (asked.push(`unsubscribe ${params.threadId}`), { status: "unsubscribed" as const })),
       "thread/resume": (params) => Effect.sync(() => {
@@ -405,6 +407,11 @@ test("app-server thread loaded keeps its config for its time, then its next turn
     yield* ensure("Bearer 3");
     assert.deepEqual(asked, []);
     yield* queue.observe({ method: "turn/completed", params: { threadId: "thread-1", turn: codexTurn("goal-turn", { status: "completed" }) } });
+    // A command it left running in the background, which letting it go would end: left as it is.
+    terminals = 1;
+    yield* ensure("Bearer 4");
+    assert.deepEqual(asked, []);
+    terminals = 0;
     yield* ensure("Bearer 4");
     assert.deepEqual(asked, ["unsubscribe thread-1", `resume thread-1 ${JSON.stringify(config("Bearer 4").mcp_servers)}`]);
     // Loaded anew: its time counted from then.
