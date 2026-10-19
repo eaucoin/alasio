@@ -18,7 +18,7 @@ import { describeRef, hasStatus, KubeApi, type KubeApiError, refOf } from "./kub
 import { type ApplyError, applyInstallation, labelled } from "./kube/apply.ts";
 import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts";
 import { checkObjectStoreLayout, checkObjectStoreScale, type ObjectStoreScaleRefused } from "./kube/object-store-scale.ts";
-import type { WaitOptions } from "./kube/rollout.ts";
+import type { NotReadyInTime, RolloutFailed, WaitOptions } from "./kube/rollout.ts";
 import type { CpuBaseline } from "./manifests/alasio.ts";
 import { labels, NAMESPACE, nodeAgentRuns } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
@@ -141,9 +141,10 @@ interface Checked {
  */
 export const checkInstallation = Effect.fnUntraced(function*(
   config: OperatorConfig,
+  wait?: WaitOptions,
 ): Effect.fn.Return<
   Checked,
-  KubeApiError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused,
+  KubeApiError | NotReadyInTime | RolloutFailed | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused,
   KubeApi
 > {
   const bot = yield* readTelegramBot;
@@ -160,7 +161,7 @@ export const checkInstallation = Effect.fnUntraced(function*(
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
-  yield* checkNeonStorage(settings);
+  yield* checkNeonStorage(settings, wait);
   yield* checkApplicable(objects);
   return { bot, settings, objects, live, recorded, gvisorReleases, checksum };
 });
@@ -180,7 +181,7 @@ export const install = Effect.fnUntraced(function*(
   KubeApi | TelegramBotApi
 > {
   yield* ensureBotChecksumKey;
-  const { bot, settings, objects, live, recorded, gvisorReleases, checksum } = yield* checkInstallation(config);
+  const { bot, settings, objects, live, recorded, gvisorReleases, checksum } = yield* checkInstallation(config, options);
   const route = yield* ensureRoute("main", bot.allowedUserIds);
   yield* applyInstallation(objects, options);
   yield* registerBot(settings, "main", bot, route, options);

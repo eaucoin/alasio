@@ -8,7 +8,9 @@
  * asked in its own pod, with the token it calls neon-control with, once its database says
  * it has registered a pageserver. Its API and its database are Neon's own, which every
  * release of alasio runs, so an upgrade is checked against the release it upgrades from as
- * well as against this one.
+ * well as against this one. As alasio is applied, the storage controller and its database,
+ * where the installation has them, are waited for until they run first, as alasio may have
+ * just restarted the cluster's k3s, its configuration changed, and their pods with it.
  */
 import type { V1PersistentVolumeClaim, V1Secret } from "@kubernetes/client-node";
 import { Effect, Schema } from "effect";
@@ -16,7 +18,8 @@ import { Effect, Schema } from "effect";
 import type { DescribedShard, StorageNode } from "../../neon/control/branches.ts";
 import type { StackSecrets } from "../../neon/control/secrets.ts";
 import { runIn, runningPod } from "./commands/common.ts";
-import { kind, KubeApi, type KubeApiError } from "./kube/api.ts";
+import { kind, KubeApi, type KubeApiError, type ObjectRef } from "./kube/api.ts";
+import { awaitReady, type NotReadyInTime, type RolloutFailed, type WaitOptions } from "./kube/rollout.ts";
 import { NAMESPACE, neonName } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 
@@ -137,9 +140,26 @@ const storageHeld: Effect.Effect<StorageHeld | null, KubeApiError | StorageDatab
   return { shards: tenant.body.shards.length, pageservers };
 });
 
-/** Refuses `settings` where they ask for fewer of Neon's shards or pageservers than its storage holds, as the module says. */
-export const checkNeonStorage = Effect.fnUntraced(function*(settings: InstallConfig): Effect.fn.Return<void, KubeApiError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified, KubeApi> {
+/** The storage controller and its database, where the installation has them, waited for until they run, within `wait`. */
+const running = (wait: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
+  Effect.gen(function*() {
+    const kube = yield* KubeApi;
+    const refs: ObjectRef[] = [
+      { ...kind("StatefulSet"), namespace: NAMESPACE, name: neonName("controller-db") },
+      { ...kind("Deployment"), namespace: NAMESPACE, name: neonName("storage-controller") },
+    ];
+    const there = (yield* Effect.forEach(refs, (ref) => Effect.map(kube.get(ref), (object) => (object === null ? [] : [ref])))).flat();
+    yield* awaitReady(there, wait);
+  });
+
+/**
+ * Refuses `settings` where they ask for fewer of Neon's shards or pageservers than its storage
+ * holds, as the module says; the storage controller and its database waited for first, within
+ * `wait`, where it is given, as alasio is applied.
+ */
+export const checkNeonStorage = Effect.fnUntraced(function*(settings: InstallConfig, wait?: WaitOptions): Effect.fn.Return<void, KubeApiError | NotReadyInTime | RolloutFailed | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified, KubeApi> {
   if (!settings.neon.enabled) return;
+  if (wait) yield* running(wait);
   const held = yield* storageHeld;
   if (!held) return;
   if (held.shards > settings.neon.shards) return yield* new ShardsLowered({ configured: settings.neon.shards, current: held.shards });
