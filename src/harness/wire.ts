@@ -28,6 +28,7 @@ export const HOST_PATHS = {
   steer: "/steer",
   interrupt: "/interrupt",
   status: "/status",
+  backgroundWork: "/background-work",
   freshSession: "/fresh-session",
   events: "/events",
 } as const;
@@ -108,9 +109,11 @@ export const StatusAnswer = Schema.Struct({
   running: Schema.Boolean,
   cliInitiated: Schema.Boolean,
   held: Schema.Boolean,
-  backgroundWork: Schema.Boolean,
   idleSince: Schema.NullOr(Schema.Number),
 });
+
+export const BackgroundWorkRequest = Conversation;
+export const BackgroundWorkAnswer = Schema.Struct({ working: Schema.Boolean });
 
 export const FreshSessionRequest = Schema.Struct({ conversationId: Schema.String, harness: Harness, workingDirectory: Schema.String });
 export const FreshSessionAnswer = Schema.Struct({ sessionId: Schema.String });

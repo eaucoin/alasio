@@ -121,6 +121,8 @@ export interface AppServerRpcOptions {
   readonly spawn: SpawnAppServer;
   /** What is done with each notification the app-server sends, in order. */
   readonly onNotification: (message: AppServerNotification) => Effect.Effect<void>;
+  /** What is done once an app-server ends on its own, exited or crashed, rather than stopped: none, unless given. */
+  readonly onEnded?: Effect.Effect<void> | undefined;
 }
 
 /**
@@ -131,7 +133,7 @@ export interface AppServerRpcOptions {
  * of the call that needs it, where an RcRef acquires with one fixed effect, and because
  * alasio stops and replaces it on its own terms, not when no one holds it.
  */
-export const makeAppServerRpc = Effect.fnUntraced(function*({ spawn, onNotification }: AppServerRpcOptions): Effect.fn.Return<AppServerRpc, never, Scope.Scope> {
+export const makeAppServerRpc = Effect.fnUntraced(function*({ spawn, onNotification, onEnded = Effect.void }: AppServerRpcOptions): Effect.fn.Return<AppServerRpc, never, Scope.Scope> {
   const current = yield* ScopedRef.make(Option.none<Connection>);
   // One start at a time: whoever comes while one runs finds its app-server.
   const starting = yield* Semaphore.make(1);
@@ -213,7 +215,7 @@ export const makeAppServerRpc = Effect.fnUntraced(function*({ spawn, onNotificat
       Effect.catch((ended) => (ended._tag === "AppServerExited"
         ? Effect.logWarning(`app-server exited code=${ended.code} signal=${ended.signal}`)
         : Effect.logError(`app-server spawn failed: ${ended.message}`)
-      ).pipe(Effect.andThen(Deferred.fail(connection.gone, ended)))),
+      ).pipe(Effect.andThen(Deferred.fail(connection.gone, ended)), Effect.andThen(onEnded))),
       Effect.forkScoped,
     );
     const init = yield* call(Effect.succeed(connection), "initialize", {

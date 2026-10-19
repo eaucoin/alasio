@@ -187,7 +187,12 @@ export interface Harness {
    * stops and steers it.
    */
   readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult, StoreError | TurnFenced>;
-  /** Whether it has work of its own going on in the conversation between turns, as Claude Code's background tasks; none where it keeps none. */
+  /**
+   * Whether it has work of its own going on in the conversation between the turns alasio
+   * runs: Claude Code's background tasks; Codex's turns it did not start (a goal's), and
+   * the terminals its commands leave running, in any of the conversation's threads. None
+   * where it keeps none. Where it cannot tell, it says so in alasio's log and has.
+   */
   readonly backgroundWork?: ((threadKey: string) => Effect.Effect<boolean>) | undefined;
   readonly listModels: () => Effect.Effect<ModelOption[], HarnessError>;
   /** What a turn runs on when no /model choice is stored. */

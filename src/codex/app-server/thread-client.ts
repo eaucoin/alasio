@@ -10,7 +10,7 @@ import { TOKEN_TTL_MS } from "../../sandbox/gateway-client.ts";
 import type { CodexThreadConfig } from "../thread-config.ts";
 import type { AppServerNotifications } from "./notification-queue.ts";
 import type { AppServerParams, AppServerResult } from "./protocol.ts";
-import type { AppServerGone, AppServerRequestError, AppServerRpc, AppServerScope, AppServerStartError } from "./rpc-client.ts";
+import { type AppServerGone, type AppServerRequestError, AppServerRequestTimeout, type AppServerRpc, type AppServerScope, type AppServerStartError } from "./rpc-client.ts";
 
 const INTERRUPT_TIMEOUT = "5 seconds";
 /** How long a turn's start stopped as it waited is waited for still, so that the turn it starts is interrupted. */
@@ -25,6 +25,8 @@ class StoppedStartUnanswered extends Schema.TaggedError<StoppedStartUnanswered>(
 
 /** Threads or turns one list request asks for. */
 const LIST_PAGE_SIZE = 100;
+/** How long the app-server is given to say whether a conversation has Codex working in it (backgroundWork). */
+const BACKGROUND_WORK_TIMEOUT = "5 seconds";
 /** How long a turn waits for the login's models (loginModels) before it runs on the model chosen. */
 const LOGIN_MODELS_TIMEOUT = "10 seconds";
 /**
@@ -43,7 +45,7 @@ const LISTED_SOURCE_KINDS: v2.ThreadSourceKind[] = ["cli", "vscode", "exec"];
 export const THREAD_CONFIG_LIFE_MS = TOKEN_TTL_MS - 60 * 60_000;
 
 /** The app-server's paginated lists alasio reads whole, each a page of its items at a time. */
-type ListMethod = "thread/list" | "thread/turns/list" | "model/list";
+type ListMethod = "thread/list" | "thread/turns/list" | "model/list" | "thread/backgroundTerminals/list";
 
 /** A thread alasio loads in the app-server, under the conversation's thread key. */
 export interface ThreadOptions extends AppServerScope {
@@ -137,6 +139,17 @@ export interface AppServerThreads {
    * turn asks again.
    */
   readonly loginModels: (scope: AppServerScope) => Effect.Effect<readonly v2.Model[], AppServerStartError>;
+  /**
+   * Whether the conversation `threadKey` has Codex working in it on its own: a turn of one
+   * of its threads running in the app-server, whoever started it (a goal's, as its
+   * thread/goal/updated names it), or a terminal one's commands left running in the
+   * background, as the app-server running lists them (thread/backgroundTerminals/list).
+   * Each thread loaded, started or forked for the conversation is asked of, not only its
+   * session's, as one left by a fresh session or a fork stays loaded, its terminals running.
+   * Asked only of an app-server that runs, none started to ask, and within
+   * BACKGROUND_WORK_TIMEOUT, failing with AppServerRequestTimeout past it.
+   */
+  readonly backgroundWork: (threadKey: string) => Effect.Effect<boolean, AppServerRequestError>;
   /** Starts a turn of the prompt, interrupting one left running first; the turn's id. */
   readonly startTurn: (options: StartTurnOptions) => Effect.Effect<string, AppServerRequestError | StaleTurnCleanupError>;
   /** Takes the turn `turnId`, which the app-server runs on its own (a goal's), as the thread's. */
@@ -172,7 +185,7 @@ export type AppServerApart = (work: Effect.Effect<void>) => Effect.Effect<Fiber.
 /**
  * A thread's work in the app-server `rpc` talks to, its turns followed by `notifications`;
  * what outlasts what asked for it run `apart`; a thread's config kept `configLifeMs` from its
- * load (THREAD_CONFIG_LIFE_MS).
+ * load (THREAD_CONFIG_LIFE_MS), as `notifications` record when each was loaded.
  */
 export function makeAppServerThreads(
   rpc: Pick<AppServerRpc, "start" | "request" | "stop" | "whenGone" | "running">,
@@ -180,10 +193,6 @@ export function makeAppServerThreads(
   apart: AppServerApart,
   configLifeMs: number = THREAD_CONFIG_LIFE_MS,
 ): AppServerThreads {
-  /** When each thread was loaded with its config, by the app-server it was loaded in and its id. */
-  const loadedAt = new Map<string, number>();
-  const loadedKey = (threadId: string) => Effect.map(rpc.running, (running) => `${running}/${threadId}`);
-  const loaded = (threadId: string) => Effect.flatMap(Effect.all([loadedKey(threadId), Clock.currentTimeMillis]), ([key, now]) => Effect.sync(() => void loadedAt.set(key, now)));
   /** Every page of one of the app-server's paginated lists. */
   const listAll = Effect.fnUntraced(function*<M extends ListMethod>(method: M, params: AppServerParams<M>): Effect.fn.Return<AppServerResult<M>["data"][number][], AppServerRequestError> {
     const all: AppServerResult<M>["data"][number][] = [];
@@ -247,11 +256,13 @@ export function makeAppServerThreads(
       const startedAt = yield* Clock.currentTimeNanos;
       const listed = yield* rpc.request("thread/loaded/list", {});
       if (Array.isArray(listed?.data) && listed.data.includes(threadId)) {
-        const at = loadedAt.get(yield* loadedKey(threadId));
-        const fresh = at !== undefined && (yield* Clock.currentTimeMillis) - at < configLifeMs;
+        // One the app-server loaded unasked has its config's time counted from now, as it is recorded.
+        const now = yield* Clock.currentTimeMillis;
+        const fresh = now - ((yield* notifications.loadedAt(threadId)) ?? now) < configLifeMs;
         // One whose turn runs, as a goal's, is left as it is: its next turn loads it anew.
         if (fresh || (yield* notifications.currentTurnId(threadId))) {
           yield* Effect.logInfo(`thread already loaded thread=${threadId.slice(0, 8)} key=${JSON.stringify(threadKey)} ms=${yield* millisSince(startedAt)}`);
+          yield* notifications.recordThread(threadKey, threadId);
           return threadId;
         }
         // Its config as it was loaded about to lapse, its bayma's bearer among it: let go of, so
@@ -265,8 +276,8 @@ export function makeAppServerThreads(
         ...threadOverrides({ cwd, config }),
       });
       const resumedId = response?.thread?.id ?? threadId;
-      yield* loaded(resumedId);
       yield* Effect.logInfo(`thread resumed thread=${resumedId.slice(0, 8)} key=${JSON.stringify(threadKey)} turns=${response?.thread?.turns?.length ?? "?"} ms=${yield* millisSince(startedAt)}`);
+      yield* notifications.recordLoad(threadKey, resumedId);
       return resumedId;
     }),
 
@@ -278,8 +289,8 @@ export function makeAppServerThreads(
       if (!threadId) {
         return yield* new ThreadIdMissing({ method: "thread/start" });
       }
-      yield* loaded(threadId);
       yield* Effect.logInfo(`thread started thread=${threadId.slice(0, 8)} key=${JSON.stringify(threadKey)} ms=${yield* millisSince(startedAt)}`);
+      yield* notifications.recordLoad(threadKey, threadId);
       return threadId;
     }),
 
@@ -296,8 +307,8 @@ export function makeAppServerThreads(
       if (!forkedId) {
         return yield* new ThreadIdMissing({ method: "thread/fork" });
       }
-      yield* loaded(forkedId);
       yield* Effect.logInfo(`thread forked thread=${forkedId.slice(0, 8)} from=${threadId.slice(0, 8)} before_turn=${beforeTurnId} key=${JSON.stringify(threadKey)} ms=${yield* millisSince(startedAt)}`);
+      yield* notifications.recordLoad(threadKey, forkedId);
       return forkedId;
     }),
 
@@ -341,6 +352,31 @@ export function makeAppServerThreads(
         }
         return yield* Deferred.await(listing.models);
       }),
+
+    // A command Codex backgrounds runs on, its terminal listed, until its process exits,
+    // whatever becomes of its turn: its item completes only then (codex-rs 0.153.3
+    // core/src/unified_exec/async_watcher.rs spawn_exit_watcher), and an interrupt does not
+    // end it (app-server/README.md, turn/interrupt). So the app-server's own list is read,
+    // not the items it told of. A thread it has not loaded, as one an app-server gone had,
+    // it answers as not found (app-server/src/request_processors/thread_processor.rs
+    // load_thread), and it is asked of no more.
+    backgroundWork: (threadKey) =>
+      Effect.gen(function*() {
+        for (const threadId of yield* notifications.threadsOf(threadKey)) {
+          if (yield* notifications.currentTurnId(threadId)) return true;
+          const terminals = yield* listAll("thread/backgroundTerminals/list", { threadId }).pipe(
+            Effect.catchIf(
+              (error) => error._tag === "AppServerRequestFailed" && error.message.startsWith("thread not found"),
+              () => Effect.as(notifications.forgetThread(threadKey, threadId), []),
+            ),
+          );
+          if (terminals.length > 0) return true;
+        }
+        return false;
+      }).pipe(
+        Effect.catchTag("AppServerNotRunning", () => Effect.succeed(false)),
+        Effect.timeoutOrElse({ duration: BACKGROUND_WORK_TIMEOUT, orElse: () => Effect.fail(new AppServerRequestTimeout({ method: "thread/backgroundTerminals/list" })) }),
+      ),
 
     startTurn: Effect.fnUntraced(function*({ threadId, prompt, cwd, model = ALASIO_CODEX_MODEL, effort = ALASIO_CODEX_REASONING_EFFORT, onPromptDispatched }) {
       const previousTurnId = yield* notifications.currentTurnId(threadId);

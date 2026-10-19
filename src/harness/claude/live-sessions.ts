@@ -226,10 +226,17 @@ export interface ClaudeLiveSessions {
   readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult, StoreError | TurnFenced>;
   /** The live process serving a conversation, if any (for tests and diagnostics). */
   readonly get: (threadKey: string) => ClaudeHost | null;
+  /** Whether Claude Code has background tasks going on in the conversation that are activity (activeTasks). */
+  readonly backgroundWork: (threadKey: string) => boolean;
 }
 
 function modelKey(choice: ModelChoice | null): string {
   return JSON.stringify({ model: getClaudeModel(process.env, choice) ?? null, effort: getClaudeEffort(process.env, choice) ?? null });
+}
+
+/** Of a process's background tasks, those that are activity: an ambient one (a skip_transcript task, a live-update watcher) is not, as the Agent SDK says. */
+function activeTasks(tasks: readonly BackgroundTask[]): BackgroundTask[] {
+  return tasks.filter((task) => !task.ambient);
 }
 
 function describeTasks(tasks: readonly BackgroundTask[]): string {
@@ -322,7 +329,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     if (hosts.get(host.threadKey) === host) {
       hosts.delete(host.threadKey);
     }
-    const live = host.backgroundTasks.filter((task) => !task.ambient);
+    const live = activeTasks(host.backgroundTasks);
     yield* Effect.logInfo(
       `closing thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)} reason=${JSON.stringify(reason)}`
         + (live.length > 0 ? ` stopping_background_tasks=${JSON.stringify(describeTasks(live))}` : ""),
@@ -1081,5 +1088,6 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   return {
     runTurn,
     get: (threadKey) => hosts.get(threadKey) ?? null,
+    backgroundWork: (threadKey) => activeTasks(hosts.get(threadKey)?.backgroundTasks ?? []).length > 0,
   };
 }, withLogScope(LOG_SCOPE));

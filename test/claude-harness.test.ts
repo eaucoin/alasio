@@ -821,6 +821,28 @@ function turnParams(persistence: TurnPersistence, extra: Partial<TurnParams> = {
   };
 }
 
+test("Claude Code's background tasks are work of its own between turns, but its ambient ones, which are no activity", async () => {
+  const persistence = createPersistence();
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const turn = runTurn(liveSessions, turnParams(persistence));
+  const first = await cli.nextPrompt();
+  cli.emit(initMessage("s-1"));
+  cli.emit(successResult({ result: "Done.", session_id: "s-1", user_message_uuids: [first.uuid] }));
+  await turn;
+  assert.equal(liveSessions.backgroundWork("telegram:1"), false);
+  // A live-update watcher alone: ambient, no activity.
+  cli.emit(backgroundTasksChanged([{ task_id: "w1", task_type: "monitor", description: "watch the PR", ambient: true }]));
+  await settle();
+  assert.equal(liveSessions.backgroundWork("telegram:1"), false);
+  cli.emit(backgroundTasksChanged([{ task_id: "w1", task_type: "monitor", description: "watch the PR", ambient: true }, { task_id: "b1", task_type: "local_bash", description: "bun run test" }]));
+  await settle();
+  assert.equal(liveSessions.backgroundWork("telegram:1"), true);
+  assert.equal(liveSessions.backgroundWork("telegram:2"), false);
+  await closeAll();
+});
+
 test("background work keeps running after the answer and its report is delivered as its own reply", async () => {
   const persistence = createPersistence();
   const activeTurns = makeActiveTurns();

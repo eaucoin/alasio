@@ -155,6 +155,26 @@ test("neither harness serves a session filesystem where the deployment does not 
   }
 });
 
+test("Codex on a session filesystem says whether its commands run on in the background from its own app-server, starting neither it nor its login relay to ask", async (t) => {
+  const scope = Effect.runSync(Scope.make());
+  t.after(() => Effect.runPromise(Scope.close(scope, Exit.void)));
+  const idle = await Effect.runPromise(idleAppServer.pipe(Scope.provide(scope)));
+  const asked: string[] = [];
+  const sessionFsCodex = SessionFsCodex.of({
+    home: "/state/sessionfs/codex",
+    scope: () => Effect.sync(() => assert.fail("a status starts no relay")),
+    listingScope: () => Effect.sync(() => assert.fail("a status starts no relay")),
+    appServer: { ...idle, backgroundWork: (threadKey) => Effect.sync(() => (asked.push(threadKey), threadKey === "telegram:1")) },
+    stop: Effect.void,
+  });
+  const harness = await Effect.runPromise(makeCodexHarness({ workingDirectory: WORKSPACE, sandbox: fakeSandbox(), sessionFsCodex, folderBayma: noFolderBayma }).pipe(
+    Effect.provideService(CodexAppServer, { ...idle, backgroundWork: () => Effect.sync(() => assert.fail("the operator's app-server is not asked")) }),
+    Effect.provide(ActiveTurns.layer),
+  ));
+  const working = (threadKey: string) => Effect.runPromise(harness.backgroundWork?.(threadKey) ?? Effect.succeed(false));
+  assert.deepEqual([await working("telegram:1"), await working("telegram:2"), asked], [true, false, ["telegram:1", "telegram:2"]]);
+});
+
 test("Codex on a session filesystem runs on its own app-server, in the harness directory, with the session's bayma", async (t) => {
   const sandbox = fakeSandbox();
   const scope = Effect.runSync(Scope.make());
@@ -170,6 +190,7 @@ test("Codex on a session filesystem runs on its own app-server, in the harness d
       return { cwd: directory, codexEnv: CODEX_ENV, codexConfig: { developer_instructions: "", mcp_servers: { bayma: codexMcpServer(bayma) } }, appServer: client };
     }),
     listingScope: ({ directory }) => Effect.succeed({ cwd: directory, codexEnv: CODEX_ENV, appServer: client }),
+    appServer: client,
     stop: Effect.void,
   });
   const harness = await Effect.runPromise(makeCodexHarness({ workingDirectory: WORKSPACE, sandbox, sessionFsCodex, folderBayma: noFolderBayma }).pipe(

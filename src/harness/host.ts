@@ -70,8 +70,6 @@ export interface HarnessStatus {
   readonly cliInitiated: boolean;
   /** Whether a hold of the store's keeps it busy, as no turn (a fork). */
   readonly held: boolean;
-  /** Whether its harness has work of its own going on between turns: Claude Code's background tasks. */
-  readonly backgroundWork: boolean;
   /** Since when, in milliseconds since the epoch, no turn has run in it; null while one runs. */
   readonly idleSince: number | null;
 }
@@ -100,6 +98,13 @@ export class HarnessHost extends Context.Service<HarnessHost, {
   readonly interrupt: (conversationId: string, reason: StopReason) => Effect.Effect<boolean, HarnessHostError>;
   /** What the host says of the conversation; failing where it cannot say, a host elsewhere not reached. */
   readonly status: (conversationId: string) => Effect.Effect<HarnessStatus, StoreError | HarnessHostError>;
+  /**
+   * Whether the conversation's harness has work of its own going on between the turns
+   * alasio runs (Harness.backgroundWork), which 14.3's release waits for: asked apart from
+   * status, as its harness may have to be asked, so what asks whether it is busy alone asks
+   * no harness.
+   */
+  readonly backgroundWork: (conversationId: string) => Effect.Effect<boolean, StoreError | HarnessHostError>;
   /** A new, empty session of `harness` in `workingDirectory` for the conversation: its id. */
   readonly startFreshSession: (params: { readonly conversationId: string; readonly harness: HarnessName; readonly workingDirectory: string }) => Effect.Effect<string, HarnessError | HarnessUnavailable>;
   /** What the panels reach of the mount's harness in its folder; none until both are mounted. */
@@ -177,17 +182,18 @@ export class HarnessHost extends Context.Service<HarnessHost, {
         Effect.gen(function*() {
           const turn = yield* activeTurns.get(conversationId);
           const held = yield* store.isConversationHeld(conversationId);
-          const mount = yield* store.getMount(conversationId);
-          const harness = Option.getOrNull(yield* harnesses.forMount(mount).pipe(Effect.orElseSucceed(() => Option.none<Harness>())));
-          const backgroundWork = harness?.backgroundWork ? yield* harness.backgroundWork(conversationId) : false;
           return {
             busy: Option.isSome(turn) || held,
             running: Option.isSome(turn),
             cliInitiated: Option.exists(turn, ({ cliInitiated }) => cliInitiated),
             held,
-            backgroundWork,
             idleSince: yield* activeTurns.idleSince(conversationId),
           };
+        }),
+      backgroundWork: (conversationId) =>
+        Effect.gen(function*() {
+          const harness = Option.getOrNull(yield* harnesses.forMount(yield* store.getMount(conversationId)).pipe(Effect.orElseSucceed(() => Option.none<Harness>())));
+          return harness?.backgroundWork ? yield* harness.backgroundWork(conversationId) : false;
         }),
       startFreshSession: ({ conversationId, harness, workingDirectory }) =>
         Effect.flatMap(harnesses.getFor(harness, workingDirectory), (found) => found.startFreshSession({ threadKey: conversationId, workingDirectory })),

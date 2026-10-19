@@ -42,3 +42,20 @@ test("an app-server that is gone already is answered as gone to whoever asks aft
     assert.equal(after._tag === "Some" ? after.value._tag : "waited", "AppServerExited");
   })));
 });
+
+test("an app-server that ends on its own is told of, as what it ran goes with it, and one stopped is not", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    let ended = 0;
+    const exit = yield* Deferred.make<void>();
+    const rpc = yield* makeAppServerRpc({ spawn: standIn(exit), onNotification: () => Effect.void, onEnded: Effect.sync(() => void (ended += 1)) });
+    yield* rpc.start({ env: {}, cwd: "/" });
+    yield* rpc.stop;
+    assert.equal(ended, 0, "a stop is no end of its own");
+    yield* rpc.start({ env: {}, cwd: "/" });
+    const gone = yield* rpc.whenGone;
+    yield* Deferred.succeed(exit, undefined);
+    yield* Effect.flip(gone);
+    for (let waited = 0; ended === 0 && waited < 2000; waited += 20) yield* Effect.sleep("20 millis");
+    assert.equal(ended, 1);
+  })));
+});

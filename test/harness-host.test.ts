@@ -11,15 +11,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { Context, Effect, Layer, Option, PubSub, type Scope } from "effect";
+import { Array as Arr, Context, Effect, Layer, Logger, Option, PubSub, type Scope } from "effect";
 
+import { CodexAppServer, makeAppServer } from "../src/codex/app-server/client.ts";
+import { AppServerRequestTimeout } from "../src/codex/app-server/rpc-client.ts";
 import type { ResponseBlock } from "../src/codex/event-projection.ts";
+import { ActiveTurns } from "../src/harness/active-turns.ts";
+import { makeCodexHarness } from "../src/harness/codex.ts";
 import { whileHeld } from "../src/harness/holds.ts";
 import { HarnessHost, type TurnStart } from "../src/harness/host.ts";
 import { type Harness, NoWorkspaceMounted, type TurnParams, type TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { remoteHarnessHost } from "../src/harness/remote-host.ts";
 import { serveHost } from "../src/harness/serve.ts";
+import { noFolderBayma } from "../src/mcp/bayma.ts";
 import { TurnFenced } from "../src/persistence/store.ts";
 import { holdsIn, newSchema, run, testStore } from "./support/store.ts";
 import { turnsStub, withServices } from "./support/turns.ts";
@@ -112,11 +117,11 @@ for (const [reach, reached] of Object.entries(REACHES)) {
         // Held for one turn at a time, until the scope it is held in closes.
         yield* Effect.scoped(Effect.gen(function*() {
           assert.equal(yield* host.reserve(conversationId), true);
-          assert.deepEqual(yield* host.status(conversationId), { busy: true, running: true, cliInitiated: false, held: false, backgroundWork: false, idleSince: null });
+          assert.deepEqual(yield* host.status(conversationId), { busy: true, running: true, cliInitiated: false, held: false, idleSince: null });
           assert.equal(yield* Effect.scoped(host.reserve(conversationId)), false);
         }));
         const { idleSince, ...idle } = yield* host.status(conversationId);
-        assert.deepEqual(idle, { busy: false, running: false, cliInitiated: false, held: false, backgroundWork: false });
+        assert.deepEqual(idle, { busy: false, running: false, cliInitiated: false, held: false });
         assert.ok(idleSince !== null && idleSince <= Date.now());
         // A fork's hold, a row of the store, keeps it busy as no turn, which no turn starts under.
         assert.ok(Option.isSome(yield* whileHeld(host, store, [conversationId], "forking session fs-a into fs-b", () => Effect.gen(function*() {
@@ -163,6 +168,54 @@ for (const [reach, reached] of Object.entries(REACHES)) {
     assert.ok((await run(store.getPromptJob(job.id)))?.upstream_dispatched_at);
   });
 }
+
+for (const [reach, reached] of Object.entries(REACHES)) {
+  test(`the host ${reach} says whether the conversation's harness has work of its own going on between turns, asked apart from its status, which asks no harness`, async () => {
+    const store = await testStore();
+    const conversationId = await run(store.upsertConversation({ chatId: "41", user: { id: 41 } }));
+    await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+    await run(store.setWorkingDirectory(conversationId, "/work"));
+    const asked: string[] = [];
+    let working = true;
+    const harness: Harness = {
+      ...recordingHarness([]),
+      backgroundWork: (threadKey) => Effect.sync(() => (asked.push(threadKey), working)),
+    };
+    await withServices({ store, harnesses: { [CODEX_HARNESS]: harness }, turns: turnsStub({}) }, (alasio) =>
+      alasio.runPromise(Effect.scoped(Effect.gen(function*() {
+        const host = yield* reached(yield* HarnessHost, conversationId);
+        const status = yield* host.status(conversationId);
+        assert.deepEqual([status.busy, status.running, asked], [false, false, []]);
+        assert.equal(yield* host.backgroundWork(conversationId), true);
+        working = false;
+        assert.equal(yield* host.backgroundWork(conversationId), false);
+      })))
+    );
+    assert.deepEqual(asked, [conversationId, conversationId]);
+  });
+}
+
+test("Codex has work of its own in a conversation as its app-server says, none where it runs none, and where that cannot be told, in time or at all, has, as alasio's log says", async () => {
+  const logged: string[] = [];
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    // An app-server that has not started, which runs nothing.
+    const appServer = yield* makeAppServer({ spawn: () => Effect.sync(() => assert.fail("no app-server is started to ask")) });
+    let work = appServer.backgroundWork;
+    const harness = yield* makeCodexHarness({ workingDirectory: "/work", sandbox: null, sessionFsCodex: null, folderBayma: noFolderBayma }).pipe(
+      Effect.provideService(CodexAppServer, { ...appServer, backgroundWork: (threadKey) => work(threadKey) }),
+      Effect.provide(ActiveTurns.layer),
+    );
+    const working = (threadKey: string) => harness.backgroundWork?.(threadKey) ?? Effect.succeed(false);
+    assert.equal(yield* working("telegram:41"), false);
+    const asked: string[] = [];
+    work = (threadKey: string) => Effect.sync(() => (asked.push(threadKey), threadKey === "telegram:41"));
+    assert.deepEqual([yield* working("telegram:41"), yield* working("telegram:42"), asked], [true, false, ["telegram:41", "telegram:42"]]);
+    // Not told in time: taken as work going on, which no release goes on under.
+    work = () => Effect.fail(new AppServerRequestTimeout({ method: "thread/backgroundTerminals/list" }));
+    assert.equal(yield* working("telegram:41"), true);
+  }).pipe(Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push(Arr.ensure(message).join(" ")))])))));
+  assert.ok(logged.some((line) => line.includes("could not tell whether Codex works on its own in telegram:41, so it is taken to")), JSON.stringify(logged));
+});
 
 test("a host elsewhere not reached says nothing of its conversation and stops nothing, failing as not reached, so that no hold is made on what it cannot say", async () => {
   const schema = newSchema();

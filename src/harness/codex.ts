@@ -151,5 +151,14 @@ export const makeCodexHarness = Effect.fnUntraced(function*({
       ),
     /** What a turn runs on when no /model choice is stored. */
     defaultModelChoice: () => resolveCodexModelChoice(null),
+    // A turn of the conversation's threads running, or a terminal their commands left
+    // running, as the app-server that runs its turns says, started for no question (a
+    // session filesystem's listing scope would start its login relay); where it cannot
+    // tell, in time or at all, it has, so nothing is let go of under it.
+    backgroundWork: (threadKey) =>
+      (sessionFs ? sessionFs.sessionFsCodex.appServer : appServer).backgroundWork(threadKey).pipe(
+        Effect.catch((error) => Effect.as(Effect.logWarning(`could not tell whether Codex works on its own in ${threadKey}, so it is taken to: ${error.message}`), true)),
+        scoped,
+      ),
   };
 });
