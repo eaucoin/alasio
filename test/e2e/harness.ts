@@ -347,6 +347,20 @@ export const kube = {
   logs: (namespace: string, pod: string, container: string, { previous = false }: { readonly previous?: boolean } = {}): Promise<string> =>
     Effect.runPromise(kubeApi().logs(namespace, pod, { container, previous }).pipe(Stream.decodeText(), Stream.mkString)),
 
+  /**
+   * All the container logs until it ends, as one that stops logs as it does, whose log goes
+   * with its pod: what it had logged when its log ended, however it ended.
+   */
+  followedLogs: async (namespace: string, pod: string, container: string): Promise<string> => {
+    let logged = "";
+    await Effect.runPromise(kubeApi().logs(namespace, pod, { container, follow: true }).pipe(
+      Stream.decodeText(),
+      Stream.runForEach((text) => Effect.sync(() => (logged += text))),
+      Effect.ignore,
+    ));
+    return logged;
+  },
+
   /** Runs `command` in the pod. */
   exec: async (namespace: string, pod: string, command: readonly string[], { container, stdin }: ExecOptions = {}): Promise<Ran> => {
     const name = container ?? (await kube.get<V1Pod>(ref("Pod", pod, namespace)))?.spec?.containers[0]?.name ?? "";
