@@ -11,9 +11,9 @@
  * renews nothing, so it pins no conversation past HOLD_TTL. One whose work is stuck in an
  * await would renew it for as long as that work runs, so the work has a deadline,
  * HOLD_DEADLINE, from when it begins (a fork, once it has its turn at forking), past which
- * it is stopped and the hold let go of. A hold found expired, or
- * taken, as it is renewed is the work's no longer: the work is stopped, with HoldLost,
- * before it touches the workspace again. The letting go is tried until it is through, in
+ * it is stopped and the hold let go of. A hold found expired, or taken, as it is renewed
+ * is the work's no longer: the work is stopped, with HoldLost, before it touches the
+ * workspace again. The letting go is tried until it is through, in
  * the background, the hold expiring meanwhile if it never is.
  *
  * Clearing every row as alasio starts (Turns.reconcilePersistentState) is safe because

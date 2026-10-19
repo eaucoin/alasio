@@ -13,6 +13,7 @@ import { HarnessHost } from "../../src/harness/host.ts";
 import { type Harness, Harnesses } from "../../src/harness/index.ts";
 import type { HarnessName } from "../../src/harness/names.ts";
 import { Mounts } from "../../src/operator/mounts.ts";
+import { inlineKeyboard } from "../../src/operator/panel.ts";
 import { StoreError } from "../../src/persistence/sql.ts";
 import { Store } from "../../src/persistence/store.ts";
 import type { AlasioServices } from "../../src/alasio.ts";
@@ -61,10 +62,7 @@ export function recordingOutbox({ failedPanels = 0 }: { readonly failedPanels?: 
       enqueuePanel: ({ conversationId, chatId, text, keyboard }) =>
         (panels += 1) <= failedPanels
           ? Effect.fail(new StoreError({ cause: new Error("the store is down") }))
-          : Effect.flatMap(store.createCallbackActions(conversationId, keyboard.flat()), (actionIds) => {
-            let next = 0;
-            return record({ chatId, text, options: { reply_markup: { inline_keyboard: keyboard.map((row) => row.map((button) => ({ text: button.text, callback_data: actionIds[next++]! }))) } } });
-          }),
+          : Effect.flatMap(store.createCallbackActions(conversationId, keyboard.flat()), (actionIds) => record({ chatId, text, options: { reply_markup: inlineKeyboard(keyboard, actionIds) } })),
       enqueueStatus: (status) => Effect.sync(() => queued.statuses[queued.statuses.push({ ...status, id: id() }) - 1]!.id),
       enqueueEdit: (edits, edit) => Effect.sync(() => (queued.edits.push({ ...edit, edits }), id())),
       deliverDue: Effect.void,
