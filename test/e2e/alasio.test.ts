@@ -257,6 +257,11 @@ interface Scenario {
 const answered = (call: RecordedCall, chat?: number) =>
   call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER && (chat === undefined || Number(call.payload.chat_id) === chat);
 
+/** Whether `call` delivers something of a turn: its reply, which is rich, or its status message, or an edit of it, which says the harness works or waits. */
+const deliversATurn = (call: RecordedCall) =>
+  call.method === "sendRichMessage" ||
+  ((call.method === "sendMessage" || call.method === "editMessageText") && / is (working|waiting on) /u.test(String(call.payload.text ?? "")));
+
 if (inShard("upgrade")) {
   describe(`alasio upgraded from ${PREVIOUS}`, () => {
     let branchTelegram: Forward | undefined;
@@ -3204,7 +3209,10 @@ if (inShard("branches")) {
       // Main's database, and its bot, as they were.
       assert.equal(await onDatabase(NAMESPACE, "select count(*) from state.messages"), messages);
       assert.equal(await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'"), mounted);
-      assert.deepEqual((await tg.calls()).filter((call) => call.method !== "getUpdates" && call.method !== "answerCallbackQuery"), []);
+      // Nothing of the branch's turn through main's bot: no reply, and no status message of a turn,
+      // nor an edit of one. Main's bot goes on with its own meanwhile (its deliveries looked at
+      // every five minutes, Grafana's alerts to its operator), which are not the branch's.
+      assert.deepEqual((await tg.calls()).filter(deliversATurn), []);
       // The branch's database has the turn main's does not.
       assert.ok(Number(await onDatabase(BRANCH_NAMESPACE, "select count(*) from state.messages")) > Number(messages));
     });
