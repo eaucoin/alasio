@@ -17,7 +17,7 @@ import { buffer } from "node:stream/consumers";
 import { inspect } from "node:util";
 
 import { NodeStream } from "@effect/platform-node";
-import { Exec, KubeConfig, type KubernetesObject, PortForward, type V1Status } from "@kubernetes/client-node";
+import { Exec, KubeConfig, type KubernetesObject, PortForward, type V1Pod, type V1Status } from "@kubernetes/client-node";
 import { Context, Effect, Layer, Predicate, Schema, type Scope, Stream } from "effect";
 
 /** A kind of object: its API version and kind, as an object of it says them. */
@@ -210,6 +210,8 @@ export class KubeApi extends Context.Service<KubeApi, {
   readonly exec: (target: ContainerRef, command: readonly string[], streams: ExecStreams) => Effect.Effect<number, KubeApiError | KubeExecError>;
   /** Forwards `connection` to `port` of the pod, as the API server's port-forward does, until either end closes it; interrupting it closes both. */
   readonly portForward: (target: PodRef, port: number, connection: Duplex) => Effect.Effect<void, KubeApiError>;
+  /** The pods the kubelet of `node` lists as its own, as the API server's proxy of it answers. */
+  readonly nodePods: (node: string) => Effect.Effect<readonly V1Pod[], KubeApiError>;
 }>()("alasio/kube/KubeApi") {
   /** The API `kubeconfig` reaches. */
   static readonly layer = (kubeconfig: KubeconfigRef): Layer.Layer<KubeApi, KubeconfigUnusable> =>
@@ -395,6 +397,8 @@ function makeKubeApi(kubeConfig: KubeConfig): KubeApi["Service"] {
       }),
     get: <T extends KubernetesObject>(ref: ObjectRef) =>
       json<T>({ method: "GET", path: objectPath(ref) }).pipe(Effect.catchIf(hasStatus(404), () => Effect.succeed(null))),
+    nodePods: (node) =>
+      json<{ readonly items?: readonly V1Pod[] | null }>({ method: "GET", path: `/api/v1/nodes/${encodeURIComponent(node)}/proxy/pods` }).pipe(Effect.map(({ items }) => items ?? [])),
     list: <T extends KubernetesObject>(kind: Kind, { namespace, labelSelector, fieldSelector }: ListOptions = {}) =>
       json<{ readonly items: readonly T[] }>({ method: "GET", path: collectionPath(kind, namespace), query: { labelSelector, fieldSelector } }).pipe(
         Effect.map(({ items }) => items.map((item) => ({ ...item, apiVersion: kind.apiVersion, kind: kind.kind }))),

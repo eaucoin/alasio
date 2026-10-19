@@ -20,7 +20,7 @@
 import { spawn } from "node:child_process";
 import { X509Certificate } from "node:crypto";
 
-import { KubeConfig, type V1ConfigMap, type V1Node, type V1RuntimeClass } from "@kubernetes/client-node";
+import { KubeConfig, type V1ConfigMap, type V1Node, type V1Pod, type V1RuntimeClass } from "@kubernetes/client-node";
 import { Context, type Duration, Effect, FileSystem, Layer, type PlatformError, Schema } from "effect";
 
 import type { Registries } from "../config.ts";
@@ -35,6 +35,7 @@ import {
   nodeHostsWith,
   NotYet,
   readySince,
+  unservedPods,
   staleRuntimeClasses,
   WAITS,
   writeKubeconfig,
@@ -345,6 +346,19 @@ const makeHostCluster = Effect.fnUntraced(function*({
       }),
     );
 
+  /** Each of `nodes`' kubelet serving every pod bound to it that has not ended (unservedPods), as an exec of one is to reach it. */
+  const podsServed = (nodes: readonly V1Node[]): Effect.Effect<void, KubeApiError | NotYet, KubeApi> =>
+    Effect.gen(function*() {
+      const kube = yield* KubeApi;
+      const waiting: string[] = [];
+      for (const node of nodes) {
+        const name = node.metadata?.name ?? "";
+        const bound = yield* kube.list<V1Pod>(kind("Pod"), { fieldSelector: `spec.nodeName=${name}` });
+        waiting.push(...unservedPods(bound, yield* kube.nodePods(name)));
+      }
+      if (waiting.length > 0) return yield* new NotYet({ message: `its kubelet serves ${waiting.length} of its pods not yet: ${waiting.slice(0, 5).join(", ")}${waiting.length > 5 ? ", …" : ""}` });
+    });
+
   /** CoreDNS's NodeHosts with the host aliases, patched only when they differ, and only over the version read. */
   const applyHostAliases = (nodes: readonly V1Node[]): Effect.Effect<void, KubeApiError | NotYet, KubeApi> =>
     Effect.gen(function*() {
@@ -421,6 +435,8 @@ const makeHostCluster = Effect.fnUntraced(function*({
     }
     yield* Effect.gen(function*() {
       const nodes = yield* waitFor("its node", nodeReady(started));
+      // Started anew, its kubelet takes its pods back after it reports itself ready.
+      if (started > 0) yield* waitFor("its node's pods", podsServed(nodes));
       yield* waitFor("CoreDNS's NodeHosts", applyHostAliases(nodes));
       yield* waitFor("gVisor's RuntimeClasses", applyRuntimeClasses(kept));
     }).pipe(Effect.provide(KubeApi.layer({ path: kubeconfig })));

@@ -1,8 +1,8 @@
 /**
  * k3s on this machine (cli/src/cluster/host.ts): what it asks root for, by what alasio
  * installed, the files that set it, its service and the operator's kubeconfig; and up,
- * which waits for the node reported ready since k3s started anew, and which, when root's
- * work failed halfway, does the rest of it the next time.
+ * which waits for the node reported ready since k3s started anew, and its kubelet serving
+ * its pods, and which, when root's work failed halfway, does the rest of it the next time.
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -179,6 +179,28 @@ test("up waits for the node reported ready since k3s started anew, not before", 
   assert.match(await up() ?? "", /^k3s on this machine was not ready within 0\.3s, waiting for its node: not reported ready since started: machine$/u);
   ready.since = true;
   assert.equal(await up(), null);
+});
+
+test("up waits, once k3s started anew, for its node's kubelet to serve every pod bound to it that has not ended, as an exec of one is answered 404 until it does", async (t) => {
+  /** k3s about to start anew, a pod bound to its node, Running as its status says from before k3s stopped, which its kubelet has not taken back, and one ended. */
+  const rigged = async () => {
+    const rigging = await rig(t, { since: true });
+    const pod = (name: string, phase: string) =>
+      rigging.kube.put("pods", { apiVersion: "v1", kind: "Pod", metadata: { name, namespace: "alasio", uid: `uid-${name}` }, spec: { nodeName: "machine" }, status: { phase } });
+    pod("alasio-neon-controller-db-0", "Running");
+    pod("ended", "Succeeded");
+    rigging.kube.unserved.add("alasio/alasio-neon-controller-db-0");
+    rigging.kube.unserved.add("alasio/ended");
+    return rigging;
+  };
+  const never = await rigged();
+  assert.match(await never.up() ?? "", /^k3s on this machine was not ready within 0\.3s, waiting for its node's pods: its kubelet serves 1 of its pods not yet: alasio\/alasio-neon-controller-db-0$/u);
+  // Taken back as up waits.
+  const later = await rigged();
+  setTimeout(() => later.kube.unserved.delete("alasio/alasio-neon-controller-db-0"), 100);
+  const asked = Date.now();
+  assert.equal(await later.up(), null);
+  assert.ok(Date.now() - asked >= 100, "up went on before the kubelet served the pod");
 });
 
 test("up applies gVisor's RuntimeClasses, deleting first alasio's of releases no longer kept, and one whose handler is another, which cannot change", async (t) => {

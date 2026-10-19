@@ -11,7 +11,7 @@ import { test } from "node:test";
 import { KubeConfig } from "@kubernetes/client-node";
 
 import { runscFlags } from "../../src/node-agent/runsc.ts";
-import { clusterKubeconfig, containerdFiles, gvisorRuntimeClasses, nodeHostsWith, readySince, registriesYaml, staleRuntimeClasses } from "../src/cluster/k3s.ts";
+import { clusterKubeconfig, containerdFiles, gvisorRuntimeClasses, nodeHostsWith, readySince, registriesYaml, staleRuntimeClasses, unservedPods } from "../src/cluster/k3s.ts";
 import { SNAPSHOTTER, STARGZ_ROOT, STARGZ_SOCKET } from "../src/cluster/stargz.ts";
 
 /** The kubeconfig k3s writes. */
@@ -123,6 +123,16 @@ test("the RuntimeClasses deleted are alasio's of releases no longer kept, and an
   // One not labelled as alasio's, of a name alasio's has.
   assert.deepEqual(staleRuntimeClasses([{ metadata: { name: "gvisor" }, handler: "runsc" }, others], desired), ["gvisor"]);
   assert.deepEqual(staleRuntimeClasses(desired, desired), []);
+});
+
+test("unservedPods names the pods bound to a node that its kubelet does not list, but those ended or being deleted", () => {
+  const pod = (name: string, extra: { phase?: string; deleting?: boolean } = {}) => ({
+    metadata: { name, namespace: "alasio", uid: `uid-${name}`, ...(extra.deleting ? { deletionTimestamp: new Date() } : {}) },
+    status: { phase: extra.phase ?? "Running" },
+  });
+  const bound = [pod("served"), pod("taken-back-not-yet"), pod("pending", { phase: "Pending" }), pod("ended", { phase: "Failed" }), pod("deleting", { deleting: true })];
+  assert.deepEqual(unservedPods(bound, [pod("served")]), ["alasio/taken-back-not-yet", "alasio/pending"]);
+  assert.deepEqual(unservedPods(bound, bound), []);
 });
 
 test("readySince takes a Ready condition reported since the node started, to the second, and no other", () => {
