@@ -3,10 +3,13 @@
  * and as it is answered, streamed both ways with nothing buffered and no time limit of its
  * own, as MCP's Streamable HTTP holds a POST open for as long as a call runs and a GET open
  * for its events. The caller's credentials stay here: the pod is sent the binding's token in
- * their place. A caller that goes away ends the request to the pod, and a pod that goes away
- * ends the caller's.
+ * their place, and what the front alone says of a request, that it passed it to no pod
+ * (NOT_PASSED_HEADER), is no pod's to say of its answer. A caller that goes away ends the
+ * request to the pod, and a pod that goes away ends the caller's.
  */
 import { type IncomingHttpHeaders, type IncomingMessage, type OutgoingHttpHeaders, request, type ServerResponse } from "node:http";
+
+import { NOT_PASSED_HEADER } from "./names.ts";
 
 /** Where a key's requests go: its pod's address and port, and the binding's token the pod takes them with. */
 export interface Route {
@@ -57,7 +60,9 @@ export function proxy(incoming: IncomingMessage, outgoing: ServerResponse, route
     });
     upstream.on("response", (response) => {
       answered = true;
-      outgoing.writeHead(response.statusCode ?? 502, endToEnd(response.headers));
+      // What the front alone says of a request, that it passed it to no pod, no pod says of its own.
+      const { [NOT_PASSED_HEADER]: _passed, ...headers } = endToEnd(response.headers);
+      outgoing.writeHead(response.statusCode ?? 502, headers);
       outgoing.flushHeaders();
       response.pipe(outgoing);
       response.on("error", () => outgoing.destroy());

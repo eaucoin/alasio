@@ -62,6 +62,10 @@ export const TurnStartRequest = Schema.Struct({
   epoch: Schema.Number,
   jobId: Schema.NullOr(Schema.String),
   attachedTurn: Schema.NullOr(Schema.Struct({ sessionId: Schema.String, turnId: Schema.String })),
+  bayma: Schema.NullOr(Schema.Union([
+    Schema.Struct({ endpoint: Schema.Struct({ url: Schema.String, headers: Schema.Record(Schema.String, Schema.String) }), notice: Schema.Null }),
+    Schema.Struct({ endpoint: Schema.Null, notice: Schema.String }),
+  ])),
 });
 // What the request carries is what the host's start is, field for field.
 export const turnStartOf = (request: typeof TurnStartRequest.Type): TurnStart => request;

@@ -279,6 +279,8 @@ const makeTurns = Effect.fnUntraced(function*() {
           epoch,
           jobId,
           attachedTurn,
+          // Brought up by the harness itself, in alasio's process; by alasio for a host elsewhere (../harness/hosts.ts).
+          bayma: null,
         });
         const { blockSequence, sessionId: newSessionId, pendingResponseId, interrupted } = queryResult;
         responseCompleted = queryResult.responseCompleted;

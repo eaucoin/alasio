@@ -76,7 +76,7 @@ const workspaces = makeGatewayWorkspaces(gateway);
 
 const seen = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
   // Its bayma reached as a harness's is, at a loopback of this process's.
-  const sessions = makeSessionSandboxes({ gateway, stateDir: "/tmp/roundtrip", netModeOf: () => Effect.succeed("none"), proxy: yield* makeBaymaProxy, workspaces });
+  const sessions = makeSessionSandboxes({ workspaces, environment: gateway.environment, stateDir: "/tmp/roundtrip", netModeOf: () => Effect.succeed("none"), proxy: yield* makeBaymaProxy });
   const seen: Partial<RoundtripSeen> = {};
   const read = (path: string, maxBytes: number) => sessions.readFile(volumeId, path, maxBytes);
   const { bayma } = yield* sessions.ensureSession(volumeId);

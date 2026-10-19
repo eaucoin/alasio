@@ -154,7 +154,7 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
     mkdirSync(attach);
     const bindingFile = join(attach, "binding.json");
     const starting = await inScope(startHarness(
-      { bindingFile, port: 0, stateDir: stateDir!, branch: null, lakeWake: null },
+      { bindingFile, port: 0, stateDir: stateDir!, branch: null, lakeWake: null, gatewayUrl: null },
       { overrides: { [CODEX_HARNESS]: answeringHarness(() => held) } },
     ).pipe(Effect.provide(neonEnv(as(HARNESS_ROLE, "harness-password"))), Effect.provideService(Events, telling), Effect.forkScoped));
     await new Promise((resolve) => setTimeout(resolve, 600));
@@ -165,7 +165,7 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
     // Its binding's directory read alone, its node's agent's to write: served, as it marks it, in a directory of its own.
     assert.deepEqual(readdirSync(attach), ["binding.json"]);
     // Its pod's binding served once: a host started again in it, as its container restarted, binds it no more.
-    const again = await Effect.runPromise(Effect.flip(Effect.scoped(startHarness({ bindingFile, port: 0, stateDir: stateDir!, branch: null, lakeWake: null }))).pipe(Effect.provideService(Events, telling)));
+    const again = await Effect.runPromise(Effect.flip(Effect.scoped(startHarness({ bindingFile, port: 0, stateDir: stateDir!, branch: null, lakeWake: null, gatewayUrl: null }))).pipe(Effect.provideService(Events, telling)));
     assert.equal((again as { readonly _tag?: string })._tag, "BindingServed");
     // Bound: the conversation's session's rollout written back, whole, where Codex reads it.
     assert.equal(readFileSync(join(home!, ROLLOUT), "utf8"), ROLLOUT_TEXT);
@@ -214,6 +214,7 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
       epoch,
       jobId: null,
       attachedTurn: null,
+      bayma: null,
     });
     const claim = (messageId: string) => Effect.runPromise(alasio.claimTurn({ conversationId, chatId: "41", messageId, sessionId: THREAD, harness: CODEX_HARNESS, prompt: messageId }));
     const first = await claim("first");

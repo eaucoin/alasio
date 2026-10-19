@@ -25,6 +25,7 @@
 import { Context, Effect, Fiber, Layer, Option, Ref, Schema } from "effect";
 
 import { type ButtonDraft, keepPanel, sendPanel } from "../operator/panel.ts";
+import type { HeldTo } from "../binder/tokens.ts";
 import { Store } from "../persistence/store.ts";
 import type { BaymaEndpoint, FolderBindFailed, FolderScope, GatewayError, GatewayWorkspaces } from "../sandbox/gateway-client.ts";
 import { folderKey } from "../gateway/names.ts";
@@ -43,13 +44,15 @@ export type HostBaymaScope = FolderScope;
 
 /**
  * A conversation's folder under a harness, as a harness asks for its bayma: the folder, and
- * the chat to tell of a bind that fails, where a turn asks; and, where a turn asks, what says
- * in its status what a long bind waits on, and that it waits no more (null).
+ * the chat to tell of a bind that fails, where a turn asks; where a turn asks, what says in its
+ * status what a long bind waits on, and that it waits no more (null); and, where the harness is
+ * bound in a pool, which reaches its bayma from there, the binding its bearer is held to.
  */
 export interface FolderBaymaScope extends FolderScope {
   readonly workingDirectory: string;
   readonly chatId?: string | undefined;
   readonly waiting?: ((what: string | null) => Effect.Effect<void>) | undefined;
+  readonly held?: HeldTo | undefined;
 }
 
 /** How long a bind waits before the turn's status says what it waits on, and how often it is asked again after. */
@@ -128,8 +131,12 @@ export class HostBayma extends Context.Service<HostBayma, {
         };
         /** The folder instances whose chat was told they are held, until a bind of one goes through. */
         const toldHeld = new Set<string>();
-        const server = (scope: HostBaymaScope) =>
-          Effect.map(proxy.reach(folderKey(scope.harness, scope.threadKey), folders.endpoint(scope)), (endpoint): BaymaMcpServer => ({ type: "http", ...endpoint }));
+        /** Its server: at alasio's loopback; or, for a harness bound in a pool, the gateway's own, its bearer held to that harness's binding. */
+        const server = (scope: FolderBaymaScope) =>
+          Effect.map(
+            scope.held ? folders.endpoint(scope, scope.held) : proxy.reach(folderKey(scope.harness, scope.threadKey), folders.endpoint(scope)),
+            (endpoint): BaymaMcpServer => ({ type: "http", ...endpoint }),
+          );
 
         /** Tells the chat `chatId` of the conversation of `scope` the notice, with its buttons. */
         const tell = (scope: FolderBaymaScope, chatId: string, notice: string): Effect.Effect<void> => {
@@ -149,10 +156,10 @@ export class HostBayma extends Context.Service<HostBayma, {
           ensure: (scope) =>
             Effect.gen(function*() {
               const key = folderKey(scope.harness, scope.threadKey);
-              const bound = yield* Effect.result(told(scope, folders.bind(scope)));
+              const bound = yield* Effect.result(Effect.andThen(told(scope, folders.bind(scope)), server(scope)));
               if (bound._tag === "Success") {
                 toldHeld.delete(key);
-                return { server: yield* server(scope), notice: null };
+                return { server: bound.success, notice: null };
               }
               const notice = degradedNotice(scope.workingDirectory, bound.failure);
               yield* Effect.logWarning(`the folder instance of ${key} did not start, its turn running without it: ${bound.failure.message}`);

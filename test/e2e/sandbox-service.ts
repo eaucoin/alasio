@@ -51,7 +51,7 @@ async function bindThrough(token: string, workspace: string, what: string, timeo
   let last = { status: 0, said: "" };
   await until(what, async () => {
     last = await gatewayCall(token, "POST", "/bind");
-    return last.status === 204 ? true : undefined;
+    return last.status === 200 ? true : undefined;
   }, timeoutMs, async () => `; it last answered ${last.status} ${last.said}\n${await serviceLogs(workspace)}`);
 }
 
@@ -133,7 +133,7 @@ export async function bindInBranch(branch: string): Promise<{ readonly namespace
   const token = await branchToken(branch, workspace);
   const made = await gatewayCall(token, "POST", "/workspace");
   assert.equal(made.status, 204, made.said);
-  await until("the gateway binding the branch's workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 300_000);
+  await until("the gateway binding the branch's workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 200 ? true : undefined), 300_000);
   const sessions = `alasio-branch-${branch}-sessions`;
   const [bound] = await kube.list<V1Pod>("Pod", { namespace: sessions, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` });
   assert.ok(bound?.metadata?.name, "no pod of the branch's is bound to its workspace");
@@ -145,7 +145,7 @@ export async function bindInBranch(branch: string): Promise<{ readonly namespace
 /** Binds the workspace `workspace` of the branch environment `branch` through main's gateway, by the branch's own key, as its alasio would: the pod it is bound to. */
 export async function bindBranchSession(branch: string, workspace: string): Promise<string> {
   const token = await branchToken(branch, workspace);
-  await until(`the gateway binding the branch's ${workspace}`, async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 300_000);
+  await until(`the gateway binding the branch's ${workspace}`, async () => ((await gatewayCall(token, "POST", "/bind")).status === 200 ? true : undefined), 300_000);
   const [bound] = await kube.list<V1Pod>("Pod", { namespace: `alasio-branch-${branch}-sessions`, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` });
   assert.ok(bound?.metadata?.name, `no pod of the branch's is bound to its ${workspace}`);
   return bound.metadata.name;
@@ -230,7 +230,7 @@ export function sandboxService(): void {
       await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
       const made = await agentCall("GET", `/workspaces/${SESSIONS}/${workspace}/quota`);
       assert.equal(made.status, 200, made.said);
-      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 200 ? true : undefined), 180_000);
       const { name: pod, node } = await boundPod(workspace);
       // Written into all through the handover, each write's outcome said.
       const writing = kube.exec(SESSIONS, pod, ["sh", "-c", WRITER("/workspace/takeover", 75)], { container: "bayma" });
@@ -283,7 +283,7 @@ export function sandboxService(): void {
       const workspace = "fs-e2ereboot";
       const token = await mainToken(workspace);
       await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
-      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 200 ? true : undefined), 180_000);
       const bound = await boundPod(workspace);
       await kube.execOk(SESSIONS, bound.name, ["sh", "-c", "printf 'kept through it' > /workspace/before && sync"], { container: "bayma" });
       const mountPods = async () =>
@@ -310,7 +310,7 @@ export function sandboxService(): void {
       const workspace = "fs-e2eheld";
       const token = await mainToken(workspace);
       await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
-      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 200 ? true : undefined), 180_000);
       const first = await boundPod(workspace);
       const pod = await kube.get<V1Pod>(ref("Pod", first.name, SESSIONS));
       if (pod?.spec?.runtimeClassName === undefined) return t.skip("the pools run under no gVisor here, so nothing is snapshotted");
@@ -341,7 +341,7 @@ export function sandboxService(): void {
       const workspace = "fs-e2eagentagain";
       const token = await mainToken(workspace);
       await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
-      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 200 ? true : undefined), 180_000);
       const first = await boundPod(workspace);
       const url = `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`;
       const held = await inAlasio<ReplHeld>("./gateway-repl.ts", "hold", url, token);
@@ -369,7 +369,7 @@ export function sandboxService(): void {
       const workspace = "fs-e2egatewayagain";
       const token = await mainToken(workspace);
       await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
-      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 200 ? true : undefined), 180_000);
       const first = await boundPod(workspace);
       const url = `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`;
       const held = await inAlasio<ReplHeld>("./gateway-repl.ts", "hold", url, token);
@@ -409,7 +409,7 @@ export function sandboxService(): void {
       }, 60_000);
       assert.equal(received.status, 204, received.said);
       // Claimed: a pool's pod bound to it, the file in its sandbox.
-      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 200 ? true : undefined), 180_000);
       const claimed = await boundPod(workspace);
       const claimedGvisor = (await kube.get<V1Pod>(ref("Pod", claimed.name, SESSIONS)))?.spec?.runtimeClassName !== undefined;
       assert.equal(await inSandbox("cat /workspace/received/note.txt"), "a file received on Telegram\n");

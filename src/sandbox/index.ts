@@ -31,9 +31,10 @@ import { join } from "node:path";
 
 import { Context, Effect, Layer, Schema } from "effect";
 
+import type { HeldTo } from "../binder/tokens.ts";
 import { BaymaProxy } from "../mcp/bayma-proxy.ts";
 import { withLogScope } from "../shared/log.ts";
-import { type BaymaEndpoint, type GatewayError, type GatewayWorkspaces, type GatewayWorkspacesOptions, makeGatewayWorkspaces, type NetMode } from "./gateway-client.ts";
+import type { BaymaEndpoint, GatewayError, GatewayWorkspaces, NetMode } from "./gateway-client.ts";
 import { assertValidVolumeId, sessionKey } from "./names.ts";
 
 export type { NetMode } from "./gateway-client.ts";
@@ -87,8 +88,9 @@ export interface Inheritance {
 
 /** What SessionSandboxes is made with; see there. */
 interface SessionSandboxesOptions {
-  /** The gateway, and alasio's environment's name and key to it. */
-  readonly gateway: GatewayWorkspacesOptions;
+  /** The gateway's workspaces (./gateway-client.ts), and alasio's environment's name, which a fork is of unless told. */
+  readonly workspaces: GatewayWorkspaces;
+  readonly environment: string;
   /** alasio's state directory, under which each session's harness directory lives. */
   readonly stateDir: string;
   /** The internet the session `volumeId` was made with, as alasio's store records it; null for one it records not. */
@@ -97,8 +99,6 @@ interface SessionSandboxesOptions {
   readonly inherit?: Inheritance | undefined;
   /** Where a session's harness reaches its bayma: the loopback's endpoint of its workspace. */
   readonly proxy: BaymaProxy["Service"];
-  /** The gateway's workspaces, but for tests, made of `gateway` otherwise. */
-  readonly workspaces?: GatewayWorkspaces | undefined;
 }
 
 /**
@@ -141,10 +141,11 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
   readonly harnessDirectory: (volumeId: string) => string;
   /**
    * Brings the session up: bound by the gateway to a pod of its internet's pool, its bayma
-   * serving, and its bayma's endpoint, at the loopback, which reaches it through the gateway;
-   * one a branch inherited forked from its parent's first.
+   * serving, and its bayma's endpoint, at the loopback, which reaches it through the gateway; or,
+   * for a harness bound in a pool, which reaches it from there, the gateway's own, its bearer
+   * held to that harness's binding (`held`). One a branch inherited forked from its parent's first.
    */
-  readonly ensureSession: (volumeId: string) => Effect.Effect<{ readonly bayma: BaymaEndpoint }, SessionError>;
+  readonly ensureSession: (volumeId: string, held?: HeldTo) => Effect.Effect<{ readonly bayma: BaymaEndpoint }, SessionError>;
   /** A file from the session, at `path` as it sees it (filesPath), of `maxBytes` at most: `{ bytes }`, or `{ note }` saying why not. */
   readonly readFile: (volumeId: string, path: string, maxBytes: number) => Effect.Effect<FileRead, SessionFileError>;
   /** Writes `bytes` into the session's file at `path` as it sees it (filesPath), its directories made. */
@@ -157,7 +158,7 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
 }
 
 /** The session filesystems of `options`, as SessionSandboxes says. */
-export function makeSessionSandboxes({ gateway, stateDir, netModeOf, inherit, proxy, workspaces = makeGatewayWorkspaces(gateway) }: SessionSandboxesOptions): SessionSandboxes["Service"] {
+export function makeSessionSandboxes({ workspaces, environment: own, stateDir, netModeOf, inherit, proxy }: SessionSandboxesOptions): SessionSandboxes["Service"] {
   /** The internet a session was made with, as alasio records it; none for one it records not, as a session is by default. */
   const modeOf = (volumeId: string): Effect.Effect<NetMode> => Effect.map(netModeOf(volumeId), (mode) => mode ?? "none");
 
@@ -182,7 +183,7 @@ export function makeSessionSandboxes({ gateway, stateDir, netModeOf, inherit, pr
           Effect.as({ volumeId, netMode }),
           withLogScope("sandbox"),
         ),
-      fork: (sourceVolumeId, volumeId, environment = gateway.environment) =>
+      fork: (sourceVolumeId, volumeId, environment = own) =>
         Effect.gen(function*() {
           const netMode = yield* modeOf(assertValidVolumeId(sourceVolumeId));
           yield* workspaces.fork(sourceVolumeId, { environment, workspace: assertValidVolumeId(volumeId) });
@@ -204,13 +205,13 @@ export function makeSessionSandboxes({ gateway, stateDir, netModeOf, inherit, pr
       return directory;
     },
 
-    ensureSession: (volumeId) =>
+    ensureSession: (volumeId, held) =>
       Effect.gen(function*() {
         const id = assertValidVolumeId(volumeId);
         yield* inherited(id);
         const mode = yield* modeOf(id);
         yield* workspaces.bind(id, mode);
-        return { bayma: yield* proxy.reach(sessionKey(id), workspaces.endpoint(id, mode)) };
+        return { bayma: yield* (held ? workspaces.endpoint(id, mode, held) : proxy.reach(sessionKey(id), workspaces.endpoint(id, mode))) };
       }).pipe(withLogScope("sandbox")),
 
     readFile: (volumeId, path, maxBytes) => {

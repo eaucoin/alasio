@@ -83,6 +83,7 @@ const START = {
   epoch: 3,
   jobId: null,
   attachedTurn: null,
+  bayma: null,
 };
 
 /** Runs `use` with `host` served, its calls that last kept alive every `keepAliveMs`, on the port given it. */

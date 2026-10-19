@@ -16,20 +16,35 @@
  * (server-sent events): its method, path below the endpoint, query, headers and body, but its
  * Authorization, which the gateway's bearer replaces, and the headers of the hop alone. One
  * of a path no key has is answered 404; one without its key's bearer, 401; one whose bayma is
- * not reached, 502. A caller that goes stops its request on, and a bayma that goes mid-answer
- * ends the caller's, as the binder's proxy does (../binder/proxy.ts).
+ * not reached, 502. One the gateway answers 503 saying it passed it to no pod
+ * (../binder/names.ts NOT_PASSED_HEADER), as it answers a bearer held to a binding it has not
+ * heard of yet, is passed again after its Retry-After, for RETRY_WITHIN_MS, where its body
+ * could be read whole first; any other is answered as the gateway answered it, as an MCP call
+ * a pod was given may have run. A caller that goes stops its request on, and a
+ * bayma that goes mid-answer ends the caller's, as the binder's proxy does (../binder/proxy.ts).
  */
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { createServer, type IncomingHttpHeaders, type IncomingMessage, request as httpRequest, type ServerResponse } from "node:http";
+import { type ClientRequest, createServer, type IncomingHttpHeaders, type IncomingMessage, request as httpRequest, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { AddressInfo } from "node:net";
 
 import { Context, Effect, Layer, type Scope } from "effect";
 
+import { NOT_PASSED_HEADER } from "../binder/names.ts";
 import type { BaymaEndpoint } from "../sandbox/gateway-client.ts";
 
 /** The path the loopback's endpoints are below, as an MCP server over HTTP is reached. */
 const BAYMA_PROXY_PATH = "/mcp";
+
+/**
+ * The largest body of a request the loopback reads whole before it passes it on, so it may pass
+ * it again: an MCP call's, with room. One larger, or of no stated length, is passed once, as it
+ * comes.
+ */
+const REPLAYED_BYTES = 1024 ** 2;
+
+/** How long a request answered 503 with a Retry-After is passed again for, from when it came. */
+const RETRY_WITHIN_MS = 30_000;
 
 /** The headers of one hop, which go no further than it (RFC 9110 7.6.1), and the Authorization the loopback is reached with. */
 const HOP_HEADERS = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade", "host", "authorization"]);
@@ -38,7 +53,7 @@ const HOP_HEADERS = new Set(["connection", "keep-alive", "proxy-connection", "tr
 interface Route {
   readonly path: string;
   readonly authorization: Buffer;
-  upstream: Effect.Effect<BaymaEndpoint>;
+  upstream: Effect.Effect<BaymaEndpoint, { readonly message: string }>;
 }
 
 /** The headers of `incoming` to pass on, with `given` in place of its Authorization. */
@@ -74,28 +89,49 @@ export const makeBaymaProxy: Effect.Effect<BaymaProxy["Service"], never, Scope.S
     const route = asked.pathname.startsWith(`${BAYMA_PROXY_PATH}/`) ? paths.get(path) : undefined;
     if (route === undefined) return answer(404, "no workspace's bayma is served here");
     if (!authorized(route, incoming.headers.authorization)) return answer(401, "not this workspace's bearer");
-    // Got as the request goes, so its bearer is fresh however long its process has lived.
     // bayma not reached: answered so; gone once its answer began: the caller's request ends with
     // it, never as if it were answered whole.
     const failed = (error: Error) => (outgoing.headersSent ? outgoing.destroy(error) : answer(502, `bayma was not reached: ${error.message}`));
-    run(route.upstream).then((endpoint) => {
-      const target = new URL(endpoint.url);
-      target.pathname = [target.pathname.replace(/\/$/u, ""), ...below].join("/");
-      target.search = asked.search;
-      const send = target.protocol === "https:" ? httpsRequest : httpRequest;
-      const upstream = send(target, { method: incoming.method ?? "GET", headers: passedOn(incoming.headers, endpoint.headers) }, (answered) => {
-        outgoing.writeHead(answered.statusCode ?? 502, passedOn(answered.headers, {}));
-        outgoing.flushHeaders();
-        answered.on("error", failed);
-        answered.pipe(outgoing);
-      });
-      upstream.on("error", failed);
-      // A caller that goes stops its request on, as a stream it no longer reads.
-      outgoing.on("close", () => {
-        if (!outgoing.writableFinished) upstream.destroy();
-      });
-      incoming.pipe(upstream);
-    }, (error: unknown) => answer(502, `bayma was not reached: ${String(error)}`));
+    const until = Date.now() + RETRY_WITHIN_MS;
+    let current: ClientRequest | null = null;
+    // A caller that goes stops its request on, as a stream it no longer reads.
+    outgoing.on("close", () => {
+      if (!outgoing.writableFinished) current?.destroy();
+    });
+    /**
+     * Passes the request on, its body `body` where it was read whole first: then, answered 503
+     * by a gateway that says it passed it to no pod (NOT_PASSED_HEADER), as it answers a bearer
+     * held to a binding it does not know of yet, passed again after its Retry-After, until
+     * RETRY_WITHIN_MS; otherwise as answered, as a pod given it may have run it.
+     */
+    const pass = (body: Buffer | null): void =>
+      // Got as the request goes, so its bearer is fresh however long its process has lived.
+      void run(route.upstream).then((endpoint) => {
+        if (outgoing.destroyed) return;
+        const target = new URL(endpoint.url);
+        target.pathname = [target.pathname.replace(/\/$/u, ""), ...below].join("/");
+        target.search = asked.search;
+        const send = target.protocol === "https:" ? httpsRequest : httpRequest;
+        current = send(target, { method: incoming.method ?? "GET", headers: passedOn(incoming.headers, endpoint.headers) }, (answered) => {
+          const after = Number(answered.headers["retry-after"] ?? 1);
+          if (answered.statusCode === 503 && answered.headers[NOT_PASSED_HEADER] !== undefined && body !== null && Number.isFinite(after) && Date.now() + after * 1000 < until) {
+            answered.resume();
+            return void setTimeout(() => pass(body), after * 1000);
+          }
+          outgoing.writeHead(answered.statusCode ?? 502, passedOn(answered.headers, {}));
+          outgoing.flushHeaders();
+          answered.on("error", failed);
+          answered.pipe(outgoing);
+        });
+        current.on("error", failed);
+        if (body === null) incoming.pipe(current);
+        else current.end(body);
+      }, (error: { readonly message: string }) => answer(502, `bayma was not reached: ${error.message}`));
+    // One whose body may be read whole first, as an MCP call's, may be passed again; another is passed once, as it comes.
+    if (incoming.headers["transfer-encoding"] !== undefined || Number(incoming.headers["content-length"] ?? 0) > REPLAYED_BYTES) return pass(null);
+    const chunks: Buffer[] = [];
+    incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+    incoming.on("end", () => pass(Buffer.concat(chunks)));
   };
 
   const server = createServer(handle);
@@ -134,7 +170,7 @@ export class BaymaProxy extends Context.Service<BaymaProxy, {
    * to the endpoint `upstream` gives as the request goes: the same address and bearer each
    * time it is asked for, its requests passed on by the `upstream` given last.
    */
-  readonly reach: (key: string, upstream: Effect.Effect<BaymaEndpoint>) => Effect.Effect<BaymaEndpoint>;
+  readonly reach: (key: string, upstream: Effect.Effect<BaymaEndpoint, { readonly message: string }>) => Effect.Effect<BaymaEndpoint>;
 }>()("alasio/mcp/BaymaProxy") {
   static readonly layer: Layer.Layer<BaymaProxy> = Layer.effect(BaymaProxy, makeBaymaProxy);
 }

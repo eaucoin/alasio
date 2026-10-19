@@ -8,7 +8,9 @@
  * pool as it is reached, and lets it go once it is idle.
  *
  * - `endpoint`: bayma's, the gateway's /mcp, which it passes to the bound pod, binding it first,
- *   with a caller's token good for TOKEN_TTL_MS.
+ *   with a caller's token good for TOKEN_TTL_MS; or, for a harness bound in a pool, which is
+ *   given it with a turn and may reach it for hours on, with no turn of alasio's, held to that
+ *   harness's binding, good for as long as that is held (../binder/server.ts).
  * - `bind`: binds the workspace ahead of any request (POST /bind), asked again every few seconds
  *   while the gateway's pool has no pod for it (503), until BIND_WAIT_MS.
  * - `release`: lets its binding go (POST /release), saved whole first where it is snapshotted.
@@ -20,10 +22,14 @@
  *   until FILE_WRITE_WAIT_MS.
  *
  * What the gateway refuses is a GatewayError with its status and what it said.
+ *
+ * A harness pool's pod has no key to mint tokens by: it reaches its conversation's
+ * workspace by the tokens its turns give it (GivenTokens), the latest of each key's, and none
+ * of a key no turn gave.
  */
 import { Clock, Duration, Effect, Schedule, Schema } from "effect";
 
-import { mintToken } from "../binder/tokens.ts";
+import { type HeldTo, mintToken } from "../binder/tokens.ts";
 import { folderBindMs, folderKey } from "../gateway/names.ts";
 import { sessionKey } from "./names.ts";
 
@@ -93,7 +99,8 @@ export interface Quota {
 
 /** The gateway's session workspaces, as the module says. */
 export interface GatewayWorkspaces {
-  readonly endpoint: (volumeId: string, mode: NetMode) => Effect.Effect<BaymaEndpoint>;
+  /** bayma's endpoint, its bearer good for TOKEN_TTL_MS; or, for a harness bound in a pool, held to that harness's binding `held` instead, good for as long as it is. */
+  readonly endpoint: (volumeId: string, mode: NetMode, held?: HeldTo) => Effect.Effect<BaymaEndpoint, GatewayError>;
   readonly bind: (volumeId: string, mode: NetMode) => Effect.Effect<void, GatewayError>;
   readonly release: (volumeId: string, mode: NetMode) => Effect.Effect<void, GatewayError>;
   /** Makes the workspace, of the gateway's quota; again, its quota set anew. */
@@ -112,7 +119,7 @@ export interface GatewayWorkspaces {
   readonly fork: (volumeId: string, into: { readonly environment: string; readonly workspace: string }) => Effect.Effect<void, GatewayError>;
   /** Folder conversations' instances (../gateway/folders.ts), each of a conversation under a harness: its bayma's endpoint, its bind ahead of any request, and its release. */
   readonly folders: {
-    readonly endpoint: (scope: FolderScope) => Effect.Effect<BaymaEndpoint>;
+    readonly endpoint: (scope: FolderScope, held?: HeldTo) => Effect.Effect<BaymaEndpoint, GatewayError>;
     /** Its bind, once, as its pod is made and its bayma starts: refused, saying why, where it failed, or the gateway holds it; `retry` binds one held. */
     readonly bind: (scope: FolderScope, options?: { readonly retry?: boolean }) => Effect.Effect<void, GatewayError | FolderBindFailed>;
     readonly release: (scope: FolderScope) => Effect.Effect<void, GatewayError>;
@@ -127,31 +134,44 @@ export interface FolderScope {
   readonly threadKey: string;
 }
 
-/** What makeGatewayWorkspaces is given: the gateway's address, alasio's environment's name, and its own key of the gateway's caller key. */
+/** What makeGatewayWorkspaces is given: the gateway's address, alasio's environment's name, and its own key of the gateway's caller key, which it mints its tokens by. */
 export interface GatewayWorkspacesOptions {
   readonly url: string;
   readonly environment: string;
   readonly callerKey: Buffer;
 }
 
+/** The gateway as a harness pool's pod reaches it: its address, and the caller's token of a key, as a turn gave it; failing where none did. */
+export interface GivenTokens {
+  readonly url: string;
+  readonly given: (key: string) => Effect.Effect<string, GatewayError>;
+}
+
 const QuotaAnswer = Schema.Struct({ capacityBytes: Schema.Number, usedBytes: Schema.Number });
 const AllAnswer = Schema.Struct({ workspaces: Schema.Array(Schema.String) });
 
-/** The gateway's session workspaces, as the module says, by alasio's environment's key. */
-export function makeGatewayWorkspaces({ url, environment, callerKey }: GatewayWorkspacesOptions): GatewayWorkspaces {
-  const base = url.replace(/\/+$/u, "");
-  /** A caller's token of the key `key`, good for TOKEN_TTL_MS from now, of alasio's environment and what `options` say beside it. */
-  const tokenFor = (key: string, options: Readonly<Record<string, string>>) =>
-    Effect.map(Clock.currentTimeMillis, (now) => mintToken(callerKey, { key, expires: now + TOKEN_TTL_MS, options: { environment, ...options } }));
+/** The gateway's session workspaces, as the module says, by alasio's environment's key, or by the tokens given. */
+export function makeGatewayWorkspaces(options: GatewayWorkspacesOptions | GivenTokens): GatewayWorkspaces {
+  const base = options.url.replace(/\/+$/u, "");
+  /**
+   * A caller's token of the key `key`: minted, of alasio's environment and what `said` says
+   * beside it, good for TOKEN_TTL_MS from now, or held to the binding `held` instead; or as given.
+   */
+  const tokenFor = (key: string, said: Readonly<Record<string, string>>, held?: HeldTo): Effect.Effect<string, GatewayError> => {
+    if ("given" in options) return options.given(key);
+    const { callerKey, environment } = options;
+    return Effect.map(Clock.currentTimeMillis, (now) =>
+      mintToken(callerKey, held ? { key, held, issued: now, options: { environment, ...said } } : { key, expires: now + TOKEN_TTL_MS, options: { environment, ...said } }));
+  };
   /** A caller's token of `volumeId`'s key, its internet `mode`. */
-  const tokenOf = (volumeId: string, mode: NetMode) => tokenFor(sessionKey(volumeId), { mode });
+  const tokenOf = (volumeId: string, mode: NetMode, held?: HeldTo) => tokenFor(sessionKey(volumeId), { mode }, held);
 
   /** Asks the gateway `method path` of `volumeId`'s, with `body`: its status and its body. */
   const ask = (what: string, volumeId: string, mode: NetMode, method: string, path: string, options: { readonly body?: Uint8Array | string; readonly timeoutMs?: number } = {}) =>
     askAs(what, tokenOf(volumeId, mode), method, path, options);
 
   /** Asks the gateway `method path` by the token `tokenOf` makes, with `body`: its status and its body. */
-  const askAs = (what: string, tokenOf: Effect.Effect<string>, method: string, path: string, { body, timeoutMs = CALL_TIMEOUT_MS }: { readonly body?: Uint8Array | string; readonly timeoutMs?: number } = {}) =>
+  const askAs = (what: string, tokenOf: Effect.Effect<string, GatewayError>, method: string, path: string, { body, timeoutMs = CALL_TIMEOUT_MS }: { readonly body?: Uint8Array | string; readonly timeoutMs?: number } = {}) =>
     Effect.gen(function*() {
       const token = yield* tokenOf;
       return yield* Effect.tryPromise({
@@ -188,10 +208,10 @@ export function makeGatewayWorkspaces({ url, environment, callerKey }: GatewayWo
     );
 
   /** Binds the key of the token `tokenOf` makes ahead of any request, asked again while the gateway has no pod for it, until BIND_WAIT_MS. */
-  const bindBy = (what: string, tokenOf: Effect.Effect<string>): Effect.Effect<void, GatewayError> =>
+  const bindBy = (what: string, tokenOf: Effect.Effect<string, GatewayError>): Effect.Effect<void, GatewayError> =>
     askAs(what, tokenOf, "POST", "/bind", { timeoutMs: LONG_CALL_TIMEOUT_MS }).pipe(
       Effect.flatMap((answer): Effect.Effect<void, GatewayError | NotYet> => {
-        if (answer.status === 204) return Effect.void;
+        if (answer.status === 200) return Effect.void;
         if (answer.status === 503) return Effect.fail(new NotYet({ reason: said(answer.bytes) }));
         return Effect.fail(new GatewayError({ call: what, status: answer.status, reason: said(answer.bytes) }));
       }),
@@ -203,16 +223,16 @@ export function makeGatewayWorkspaces({ url, environment, callerKey }: GatewayWo
     );
 
   return {
-    endpoint: (volumeId, mode) => Effect.map(tokenOf(volumeId, mode), (token) => ({ url: `${base}/mcp`, headers: { Authorization: `Bearer ${token}` } })),
+    endpoint: (volumeId, mode, held) => Effect.map(tokenOf(volumeId, mode, held), (token) => ({ url: `${base}/mcp`, headers: { Authorization: `Bearer ${token}` } })),
     bind: (volumeId, mode) => bindBy(`bind ${volumeId}`, tokenOf(volumeId, mode)),
     folders: {
-      endpoint: ({ harness, threadKey }) => Effect.map(tokenFor(folderKey(harness, threadKey), {}), (token) => ({ url: `${base}/mcp`, headers: { Authorization: `Bearer ${token}` } })),
+      endpoint: ({ harness, threadKey }, held) => Effect.map(tokenFor(folderKey(harness, threadKey), {}, held), (token) => ({ url: `${base}/mcp`, headers: { Authorization: `Bearer ${token}` } })),
       // Once: its bind waits as its pod is made and its bayma starts, and one asked again would fail as it did.
       bind: ({ harness, threadKey }, { retry = false } = {}) => {
         const what = `bind the folder instance of ${threadKey} under ${harness}`;
         return askAs(what, tokenFor(folderKey(harness, threadKey), retry ? { retry: "1" } : {}), "POST", "/bind", { timeoutMs: FOLDER_CALL_TIMEOUT_MS }).pipe(
           Effect.flatMap(({ status, bytes }): Effect.Effect<void, GatewayError | FolderBindFailed> => {
-            if (status === 204) return Effect.void;
+            if (status === 200) return Effect.void;
             if (status !== 503) return Effect.fail(new GatewayError({ call: what, status, reason: said(bytes) }));
             const refusal = Schema.decodeUnknownOption(Schema.fromJsonString(BindRefusal))(Buffer.from(bytes).toString("utf8"));
             const { reason, held } = refusal._tag === "Some" ? refusal.value : {};

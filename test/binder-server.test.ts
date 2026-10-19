@@ -12,9 +12,10 @@ import { Binder } from "../src/binder/binder.ts";
 import { ACTIVE_ANNOTATION, activeAt, readLease, takeLease, touchLease } from "../src/binder/bindings.ts";
 import { baymaIdleness } from "../src/binder/sweep.ts";
 import { LiveBindings } from "../src/binder/live.ts";
-import { environmentKey, freeLabels, type Pool } from "../src/binder/names.ts";
-import { type BinderServer, MAX_CALLER_TOKEN_MS, MAX_OPERATION_BYTES, NO_BIND_HEADER, type Operation, type Placement, PlacementRefused, serveBinder } from "../src/binder/server.ts";
+import { environmentKey, freeLabels, NOT_PASSED_HEADER, type Pool } from "../src/binder/names.ts";
+import { type BinderServer, type BinderServerOptions, MAX_CALLER_TOKEN_MS, MAX_OPERATION_BYTES, NO_BIND_HEADER, type Operation, type Placement, PlacementRefused, serveBinder } from "../src/binder/server.ts";
 import { bindingToken, mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
+import { heldToHarness } from "../src/gateway/names.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
 
@@ -73,6 +74,8 @@ async function front(
     keyOf = callerKey as Buffer | ((claims: TokenClaims) => Buffer | null),
     operate = undefined as ((claims: TokenClaims, operation: Operation) => Effect.Effect<{ status: number; json?: unknown; bytes?: Uint8Array; headers?: Record<string, string> }>) | undefined,
     watched = false,
+    holds = undefined as BinderServerOptions["routeHeld"],
+    grants = undefined as BinderServerOptions["grants"],
     elsewhere = {} as Readonly<Record<string, Pool>>,
   } = {},
 ): Promise<BinderServer & { close: () => Promise<void> }> {
@@ -85,8 +88,9 @@ async function front(
       Scope.provide(scope),
     ))
     : null;
+  const routeHeld = holds ?? live?.holds;
   const served = await Effect.runPromise(
-    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), ...(live ? { routeHeld: live.holds } : {}), poolOf: (_key, options) =>
+    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), ...(routeHeld ? { routeHeld } : {}), ...(grants ? { grants } : {}), poolOf: (_key, options) =>
       options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: elsewhere[options["environment"] ?? ""] ?? of, release, ...told })), peers: () => Effect.succeed(peers) }).pipe(
       Effect.provide(layer),
       Scope.provide(scope),
@@ -187,7 +191,7 @@ test("a branch's requests of a key stamp its own binding of it alone, never main
     const key = "sessionfs:inherited";
     const as = (environment: string) => ({ authorization: caller(key, Date.now() + 60_000, { environment }) });
     // Main's binding, known to the front, stamped as it was bound, which no request of main's has stamped since.
-    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: as("main") })).status, 204);
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: as("main") })).status, 200);
     const bound = await run(readLease(main, key));
     const boundAt = bound ? activeAt(bound) : null;
     assert.ok(boundAt !== null, "main's binding stamped as it was bound");
@@ -325,7 +329,7 @@ test("a caller's release runs what its placement says comes before, then lets it
     const call = (path: string) => fetch(`http://127.0.0.1:${served.port}${path}`, { method: "POST", headers: { authorization: caller(key) } });
     assert.equal((await call("/release")).status, 204);
     assert.deepEqual(before, []);
-    assert.equal((await call("/bind")).status, 204);
+    assert.equal((await call("/bind")).status, 200);
     const bound = await run(readLease(of, key));
     const failed = await call("/release");
     assert.deepEqual([failed.status, failed.headers.get("retry-after")], [503, "1"]);
@@ -350,7 +354,7 @@ test("a caller's release resets what its placement keeps of its binds, bound or 
     const call = (key: string) => fetch(`http://127.0.0.1:${served.port}/release`, { method: "POST", headers: { authorization: caller(key) } });
     assert.equal((await call("sessionfs:unbound")).status, 204);
     assert.equal(resets, 1);
-    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:bound") } })).status, 204);
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:bound") } })).status, 200);
     assert.equal((await call("sessionfs:bound")).status, 204);
     assert.deepEqual([resets, await run(readLease(of, "sessionfs:bound"))], [2, null]);
     // A bind under way, as another replica's.
@@ -387,7 +391,7 @@ test("a no-bind request, of a front that never bound its key, is served by the b
   const [binding, reading] = [await front(of, stand.port), await front(of, stand.port)];
   try {
     const key = "sessionfs:elsewhere";
-    assert.equal((await fetch(`http://127.0.0.1:${binding.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
+    assert.equal((await fetch(`http://127.0.0.1:${binding.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 200);
     const read = await fetch(`http://127.0.0.1:${reading.port}/status`, { headers: { authorization: caller(key), [NO_BIND_HEADER]: "never" } });
     assert.equal(read.status, 200);
   } finally {
@@ -432,7 +436,7 @@ test("a bind asked ahead binds the key; one whose pool has no pod in time is ans
   const served = await front(of, stand.port, { waitMs: 1_000 });
   try {
     const bound = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:first") } });
-    assert.equal(bound.status, 204);
+    assert.equal(bound.status, 200);
     assert.ok((await run(readLease(of, "sessionfs:first")))?.spec?.holderIdentity);
     assert.deepEqual(stand.sent, []);
     const late = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:second") } });
@@ -451,7 +455,7 @@ test("a bind tells its placement how it ended, and the 503 of one that failed sa
   let holding: string | null = null;
   const served = await front(of, stand.port, { waitMs: 1_000, told: { held: Effect.sync(() => holding), settled: (failure) => Effect.sync(() => void settled.push(failure)) } });
   try {
-    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:first") } })).status, 204);
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:first") } })).status, 200);
     const late = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:second") } });
     const said = (await late.json()) as { reason: string };
     assert.equal(late.status, 503);
@@ -479,14 +483,14 @@ test("a bind asked ahead, and a no-bind request, of a key whose binding another 
   const other = await front(of, stand.port);
   try {
     const key = "sessionfs:let-go";
-    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 200);
     const first = (await run(readLease(of, key)))?.spec?.holderIdentity;
     assert.ok(first);
     // Let go through another front, as the gateway's sweep, or its look at broken bindings, lets one go.
     assert.equal((await fetch(`http://127.0.0.1:${other.port}/release`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
     const unbound = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key), [NO_BIND_HEADER]: "never" }, body: "{}" });
     assert.deepEqual([unbound.status, await unbound.json()], [409, { bound: false }]);
-    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 200);
     const again = (await run(readLease(of, key)))?.spec?.holderIdentity;
     assert.ok(again && again !== first, `${first} then ${again}`);
   } finally {
@@ -531,7 +535,8 @@ test("a key whose pod is not reached is answered 503, and its next request binds
   try {
     const key = "sessionfs:workspace";
     const unreached = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" });
-    assert.deepEqual([unreached.status, unreached.headers.get("retry-after")], [503, "1"]);
+    // Its connection never made, nothing of it sent: to be sent again, as the front says.
+    assert.deepEqual([unreached.status, unreached.headers.get("retry-after"), unreached.headers.get(NOT_PASSED_HEADER)], [503, "1", "true"]);
     // Its pod gone, as one evicted, and another free.
     await run(withKube((kube) => kube.remove("v1", "Pod", of.namespace, "free-0")));
     await freePods(of, 1, 1);
@@ -555,7 +560,7 @@ test("a pool's counts are its free pods, its bindings, and the binds waiting in 
     const counts = await (await fetch(`http://127.0.0.1:${counting.port}/counts/${of.namespace}/${of.name}`)).json();
     assert.deepEqual(counts, { free: 0, bound: 0, waiting: 2 });
     await freePods(of, 3);
-    assert.deepEqual((await Promise.all(waiting)).map(({ status }) => status), [204, 204]);
+    assert.deepEqual((await Promise.all(waiting)).map(({ status }) => status), [200, 200]);
     assert.deepEqual(await (await fetch(`http://127.0.0.1:${counting.port}/counts/${of.namespace}/${of.name}`)).json(), { free: 1, bound: 2, waiting: 0 });
   } finally {
     await Promise.all([one.close(), two.close(), counting.close()]);
@@ -571,7 +576,7 @@ test("a key is bound where the gateway places it, by what its caller's token say
   const served = await front(of, stand.port, { placed });
   try {
     const bound = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:workspace", Date.now() + 60_000, { environment: "main", mode: "none" }) } });
-    assert.equal(bound.status, 204);
+    assert.equal(bound.status, 200);
     assert.deepEqual(placed, [{ environment: "main", mode: "none" }]);
     const nowhere = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:other", Date.now() + 60_000, { environment: "nowhere" }) } });
     assert.equal(nowhere.status, 403);
@@ -671,7 +676,7 @@ test("a binding is stamped active as its bind is through, so one whose bind took
   const served = await front(of, statusPort);
   try {
     const key = "sessionfs:restored";
-    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 200);
     const lease = await run(readLease(of, key));
     assert.ok(lease);
     const boundAt = activeAt(lease);
@@ -746,7 +751,8 @@ test("a request on a route of a binding gone that reached its pod before its con
     await freePods(of, 1, 1, "127.0.0.1");
     dropping = true;
     const second = await asked("second");
-    assert.equal(second.status, 503);
+    // Its pod may have run it: not to be sent again, as the front says by neither header.
+    assert.deepEqual([second.status, second.headers.get("retry-after"), second.headers.get(NOT_PASSED_HEADER)], [503, null, null]);
     assert.deepEqual(await second.json(), { error: `the pod of ${key} was not reached` });
     assert.deepEqual(taken, ["first", "second"]);
     assert.deepEqual(next.bodies, [], "passed again");
@@ -787,5 +793,113 @@ test("a request that may bind, of a key another replica bound anew within the st
   } finally {
     await served.close();
     stand.close();
+  }
+});
+
+test("a caller's token that stops at no time is good only held to a binding of another key the gateway lets it be, for as long as that binding is held; one held to none is no caller's", async () => {
+  const of = await pool();
+  await freePods(of, 3);
+  const stand = await pods();
+  const served = await front(of, stand.port, { watched: true, grants: (key, held) => heldToHarness(key, held.key) });
+  try {
+    const at = (path: string, authorization: string) => fetch(`http://127.0.0.1:${served.port}${path}`, { method: "POST", headers: { authorization }, body: "{}" });
+    const harness = "harness:telegram:1";
+    const bound = await at("/bind", caller(harness));
+    assert.equal(bound.status, 200);
+    const { binding, namespace } = (await bound.json()) as { binding: string; namespace: string };
+    assert.deepEqual([binding, namespace], [(await run(readLease(of, harness)))?.metadata?.uid, of.namespace]);
+    const heldTo = (key: string, held = { key: harness, binding, namespace }) => `Bearer ${mintToken(callerKey, { key, held, options: { environment: "main", mode: "none" } })}`;
+    // Its conversation's session's, and its own folder instance's: passed on.
+    assert.equal((await at("/mcp", heldTo("sessionfs:workspace"))).status, 200);
+    assert.equal((await at("/mcp", heldTo("folder:claude:telegram:1"))).status, 200);
+    // Another conversation's folder instance's, another key's than a workspace's, a binding not held, or held to none: refused.
+    assert.equal((await at("/mcp", heldTo("folder:claude:telegram:2"))).status, 401);
+    assert.equal((await at("/mcp", heldTo("harness:telegram:2"))).status, 401);
+    assert.equal((await at("/mcp", heldTo("sessionfs:workspace", { key: harness, binding: "another-binding", namespace }))).status, 401);
+    // Held to a binding in another namespace, the watch knowing none of it: refused.
+    assert.equal((await at("/mcp", heldTo("sessionfs:workspace", { key: harness, binding, namespace: "another-namespace" }))).status, 401);
+    // Held to one not heard of yet, minted since the watch last heard anything: not known yet, to be asked again.
+    const unseen = `Bearer ${mintToken(callerKey, { key: "sessionfs:workspace", held: { key: harness, binding: "not-heard-of-yet", namespace }, issued: Date.now() + 60_000, options: { environment: "main", mode: "none" } })}`;
+    const notYet = await at("/mcp", unseen);
+    assert.deepEqual([notYet.status, notYet.headers.get("retry-after")], [503, "1"]);
+    // Minted a minute before the front's clock says, as a clock of alasio's behind the front's: not known yet either.
+    const behind = `Bearer ${mintToken(callerKey, { key: "sessionfs:workspace", held: { key: harness, binding: "not-heard-of-yet", namespace }, issued: Date.now() - 60_000, options: { environment: "main", mode: "none" } })}`;
+    assert.equal((await at("/mcp", behind)).status, 503);
+    // Minted well before the watch last heard of its namespace, its binding not held: refused.
+    const stale = `Bearer ${mintToken(callerKey, { key: "sessionfs:workspace", held: { key: harness, binding: "not-heard-of-yet", namespace }, issued: Date.now() - 60 * 60_000, options: { environment: "main", mode: "none" } })}`;
+    assert.equal((await at("/mcp", stale)).status, 401);
+    assert.equal((await at("/mcp", `Bearer ${mintToken(callerKey, { key: "sessionfs:workspace", options: { environment: "main", mode: "none" } })}`)).status, 401);
+    // Its binding released: refused once its Lease's deletion is seen.
+    assert.equal((await at("/release", caller(harness))).status, 204);
+    for (const deadline = Date.now() + 10_000; (await at("/mcp", heldTo("sessionfs:workspace"))).status !== 401; await new Promise((resolve) => setTimeout(resolve, 100))) {
+      assert.ok(Date.now() < deadline, "a token held to a binding released was taken still");
+    }
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a caller's token held to a binding whether held is not known yet is answered 503, to be asked again, nothing passed on", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  const served = await front(of, stand.port, { holds: () => Effect.succeed("unknown"), grants: () => true });
+  try {
+    const held = `Bearer ${mintToken(callerKey, { key: "sessionfs:workspace", held: { key: "harness:telegram:1", binding: "binding-1", namespace: of.namespace } })}`;
+    const answered = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: held }, body: "{}" });
+    assert.deepEqual([answered.status, answered.headers.get("retry-after"), answered.headers.get(NOT_PASSED_HEADER), await answered.json()], [503, "1", "true", { error: "whether harness:telegram:1's binding is held is not known yet" }]);
+    assert.deepEqual(stand.sent, []);
+    assert.equal(await run(readLease(of, "sessionfs:workspace")), null, "nothing bound");
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a caller's token held to a binding asks its key's pod and its workspace's files alone, nothing else the front answers itself", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  const operated: string[] = [];
+  const served = await front(of, stand.port, {
+    holds: () => Effect.succeed("held"),
+    grants: () => true,
+    operate: (_claims, { method, path }) => Effect.sync(() => (operated.push(`${method} ${path}`), { status: 200, json: {} })),
+  });
+  try {
+    const held = `Bearer ${mintToken(callerKey, { key: "sessionfs:workspace", held: { key: "harness:telegram:1", binding: "binding-1", namespace: of.namespace }, options: { environment: "main", mode: "none" } })}`;
+    const at = (method: string, path: string) => fetch(`http://127.0.0.1:${served.port}${path}`, { method, headers: { authorization: held }, ...(method === "GET" || method === "DELETE" ? {} : { body: "{}" }) });
+    for (const [method, path] of [["DELETE", "/workspace"], ["POST", "/workspace"], ["POST", "/workspace/forks"], ["GET", "/workspace/all"], ["GET", "/workspace/quota"], ["POST", "/bind"], ["POST", "/release"], ["GET", "/snapshots"], ["GET", "/folders/starting"], ["DELETE", "/workspace/files?path=workspace%2Fa"]] as const) {
+      assert.equal((await at(method, path)).status, 403, `${method} ${path}`);
+    }
+    assert.deepEqual([operated, stand.sent.length], [[], 0], "none answered, none passed on");
+    assert.equal((await at("GET", "/workspace/files?path=workspace%2Fa")).status, 200);
+    assert.equal((await at("PUT", "/workspace/files?path=workspace%2Fa")).status, 200);
+    assert.equal((await at("POST", "/mcp")).status, 200);
+    assert.deepEqual([operated, stand.sent.length], [["GET /workspace/files", "PUT /workspace/files"], 1]);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a pod's answer that says the front passed its request to no pod is passed on without saying so, as the front alone says it", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  // A pod that answers as the front answers a request it passed nowhere.
+  const pretending = createServer((incoming, outgoing) => {
+    incoming.resume();
+    incoming.on("end", () => outgoing.writeHead(503, { "retry-after": "1", [NOT_PASSED_HEADER]: "true" }).end("not yet"));
+  });
+  pretending.listen(0, "127.0.0.1");
+  await once(pretending, "listening");
+  const served = await front(of, (pretending.address() as AddressInfo).port);
+  try {
+    const answered = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller("sessionfs:pretends") }, body: "{}" });
+    assert.deepEqual([answered.status, answered.headers.get("retry-after"), answered.headers.get(NOT_PASSED_HEADER), await answered.text()], [503, "1", null, "not yet"]);
+  } finally {
+    await served.close();
+    pretending.close();
   }
 });

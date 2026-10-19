@@ -120,7 +120,7 @@ function workspaceServices({ folders, sessionsGateway, stateDir, branch }: Alasi
     Layer.unwrap(Effect.gen(function*() {
       const store = yield* Store;
       const inherit = branch ? inheritance(branch, store) : undefined;
-      return SessionSandboxes.layer({ gateway: sessionsGateway, stateDir, netModeOf: netModeIn(store), inherit });
+      return SessionSandboxes.layer({ workspaces: makeGatewayWorkspaces(sessionsGateway), environment: sessionsGateway.environment, stateDir, netModeOf: netModeIn(store), inherit });
     })),
     folders ? HostBayma.layer(makeGatewayWorkspaces(sessionsGateway).folders) : Layer.empty,
   ).pipe(Layer.provide(BaymaProxy.layer));

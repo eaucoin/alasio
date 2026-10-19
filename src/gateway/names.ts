@@ -14,6 +14,7 @@ import { keyHash } from "../binder/names.ts";
 import { HARNESS_NAMES } from "../harness/names.ts";
 import { sanitizePathToken } from "../kube/sandbox-shape.ts";
 import { ATTACH_ROOT } from "../node-agent/names.ts";
+import { volumeIdOfKey } from "../sandbox/names.ts";
 
 export { RESTORE_POD } from "../node-agent/names.ts";
 
@@ -179,6 +180,18 @@ export const harnessKey = (conversation: string): string => `${HARNESS_KEY_PREFI
 export function conversationOfHarnessKey(key: string): string | null {
   const conversation = key.startsWith(HARNESS_KEY_PREFIX) ? key.slice(HARNESS_KEY_PREFIX.length) : "";
   return conversation.length > 0 && conversation.length <= 512 ? conversation : null;
+}
+
+/**
+ * Whether a caller's token of `key` may be held to the binding of `heldKey` in place of a time
+ * it stops (../binder/server.ts grants): a workspace's held to its conversation's harness's, as
+ * alasio gives a harness bound in a pool its workspace's bayma: a session's, or the
+ * conversation's own folder instance's, and no other key's.
+ */
+export function heldToHarness(key: string, heldKey: string): boolean {
+  const conversation = conversationOfHarnessKey(heldKey);
+  if (conversation === null) return false;
+  return volumeIdOfKey(key) !== null || folderOfKey(key)?.conversation === conversation;
 }
 
 /** A pod template, as the gateway's configuration holds one: an object, as the API server takes it. */

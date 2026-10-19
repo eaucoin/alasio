@@ -51,8 +51,12 @@ export interface BindingNamespaces {
 }
 
 export class LiveBindings extends Context.Service<LiveBindings, {
-  /** Whether `binding`, a Lease's uid in `namespace`, is a binding of `key` now. */
-  readonly holds: (key: string, binding: string, namespace: string) => Effect.Effect<Held>;
+  /**
+   * Whether `binding`, a Lease's uid in `namespace`, is a binding of `key` now: not known, where
+   * it has not been seen and its namespace's watch has heard nothing since `since`, as a binding
+   * made then may not have been heard of yet.
+   */
+  readonly holds: (key: string, binding: string, namespace: string, since?: number) => Effect.Effect<Held>;
 }>()("alasio/binder/LiveBindings") {
   /** On the KubeClient, the bindings of `namespaces`, each watched as the module says, for as long as the layer lives. */
   static readonly layer = (
@@ -128,7 +132,7 @@ export class LiveBindings extends Context.Service<LiveBindings, {
         yield* Effect.forkScoped(Effect.repeat(refresh, Schedule.spaced(refreshMs)));
 
         return LiveBindings.of({
-          holds: (key, binding, namespace) =>
+          holds: (key, binding, namespace, since) =>
             Effect.gen(function*() {
               if (!watched.has(namespace)) {
                 if (!(yield* namespaces.known(namespace))) return "gone";
@@ -136,7 +140,8 @@ export class LiveBindings extends Context.Service<LiveBindings, {
               }
               const known = live.get(namespace);
               if (!known || (yield* Clock.currentTimeMillis) - known.heard >= knownForMs) return "unknown";
-              return known.bindings.get(binding) === key ? "held" : "gone";
+              if (known.bindings.get(binding) === key) return "held";
+              return since !== undefined && known.heard < since ? "unknown" : "gone";
             }),
         });
       }),

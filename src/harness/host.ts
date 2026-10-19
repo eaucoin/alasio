@@ -18,6 +18,7 @@
 import { Context, Effect, Layer, Option, type Scope } from "effect";
 
 import type { ModelChoice, Mount } from "../persistence/conversation-repository.ts";
+import type { BaymaEndpoint } from "../sandbox/gateway-client.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { type ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
 import { Store, type TurnFenced } from "../persistence/store.ts";
@@ -47,7 +48,21 @@ export interface TurnStart {
   readonly jobId: string | null;
   /** A turn already running upstream (a Codex goal's) that it attaches to instead of starting one. */
   readonly attachedTurn: AttachedTurn | null;
+  /**
+   * The bayma of the turn's workspace, as the control plane brought it up for a host
+   * elsewhere, which has no key to reach it by of its own; null for the host in alasio's
+   * process, whose harnesses bring it up themselves.
+   */
+  readonly bayma: TurnBayma | null;
 }
+
+/**
+ * A turn's workspace's bayma, as the control plane gives it a host elsewhere: its endpoint,
+ * through the sandbox gateway, a caller's token of the workspace's key (a session's, or a
+ * folder instance's) its bearer, held to the host's binding (../binder/tokens.ts HeldTo); or
+ * none, its bind having failed, and why, which the harness puts before the turn's prompt.
+ */
+export type TurnBayma = { readonly endpoint: BaymaEndpoint; readonly notice: null } | { readonly endpoint: null; readonly notice: string };
 
 /**
  * What the operator's panels reach of a mount's harness, through its host: what it is,

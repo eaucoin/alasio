@@ -111,6 +111,7 @@ for (const [reach, reached] of Object.entries(REACHES)) {
       epoch: claimed,
       jobId,
       attachedTurn: null,
+      bayma: null,
     });
     await withServices({ store, harnesses: { [CODEX_HARNESS]: recordingHarness(seen) }, turns: turnsStub({}) }, (alasio) =>
       alasio.runPromise(Effect.scoped(Effect.gen(function*() {
@@ -269,7 +270,7 @@ test("a host tells what its harness does on its own as the HostEvents it is give
       Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: "/nonexistent-state-dir" }))),
       Layer.provideMerge(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(HostEvents, telling))),
     )), HarnessHost);
-    yield* host.startTurn({ conversationId, chatId: "41", messageId: "10", harness: CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null });
+    yield* host.startTurn({ conversationId, chatId: "41", messageId: "10", harness: CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null, bayma: null });
   })));
   assert.deepEqual(told, [{ kind: "background-response", conversationId }, { kind: "idle", conversationId }]);
 });
@@ -331,6 +332,7 @@ test("the files a turn's prompt names, and a steer's, are written where the harn
           epoch,
           jobId: null,
           attachedTurn: null,
+          bayma: null,
         });
         assert.equal(found, "a report", "the harness found the file as it ran");
         // No turn runs to take the steer, but its file is written all the same, for the turn it is queued for.

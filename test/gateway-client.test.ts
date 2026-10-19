@@ -59,6 +59,20 @@ test("bayma's endpoint is the gateway's /mcp, with a caller's token of the works
   assert.equal(verifyToken(master, String(endpoint.headers["Authorization"]).replace(/^Bearer /u, ""), Date.now()), null);
 });
 
+test("bayma's endpoint for a harness bound in a pool bears a caller's token held to that harness's binding, which stops at no time, a session's and a folder instance's", async (t) => {
+  const { workspaces } = await gateway(t, () => ({ status: 200 }));
+  const held = { key: "harness:telegram:42", binding: "binding-1", namespace: "alasio" };
+  const claimsOf = (endpoint: { readonly headers: Readonly<Record<string, string>> }) =>
+    verifyToken(environmentKey(master, "try"), String(endpoint.headers["Authorization"]).replace(/^Bearer /u, ""), Date.now() + 10 * TOKEN_TTL_MS);
+  const before = Date.now();
+  const session = claimsOf(await run(workspaces.endpoint("fs-abc123", "full", held)));
+  assert.deepEqual({ ...session, issued: undefined }, { key: "sessionfs:fs-abc123", held, issued: undefined, options: { environment: "try", mode: "full" } });
+  // Its minting said, as a binding made then may not be heard of yet where it is taken.
+  assert.ok((session?.issued ?? 0) >= before && (session?.issued ?? 0) <= Date.now());
+  const folder = claimsOf(await run(workspaces.folders.endpoint({ harness: "claude", threadKey: "telegram:42" }, held)));
+  assert.deepEqual({ ...folder, issued: undefined }, { key: "folder:claude:telegram:42", held, issued: undefined, options: { environment: "try" } });
+});
+
 test("a workspace is made, measured, read, written, listed, forked and deleted as the gateway answers each, what it refuses its status and what it said", async (t) => {
   const { asked, workspaces } = await gateway(t, ({ method, url }) => {
     if (method === "GET" && url.startsWith("/workspace/quota")) return { status: 200, body: JSON.stringify({ capacityBytes: 10, usedBytes: 2 }) };
@@ -95,6 +109,7 @@ test("a bind asked ahead is asked again while the gateway's pool has no pod for 
   let refusals = 2;
   const { asked, workspaces } = await gateway(t, ({ url }) => {
     if (url === "/bind" && refusals > 0) return ((refusals -= 1), { status: 503, body: JSON.stringify({ error: "no pod came free in time" }), headers: { "retry-after": "1" } });
+    if (url === "/bind") return { status: 200, body: JSON.stringify({ binding: "binding-1", namespace: "alasio-sessions" }) };
     return { status: 204 };
   });
   await run(workspaces.bind("fs-abc123", "none"));
@@ -127,7 +142,7 @@ test("a folder conversation's instance is reached, bound and released through th
     binds += 1;
     if (binds === 1) return { status: 503, body: JSON.stringify({ error: "folder:claude:telegram:42 could not be bound now", reason: "its pod is pending: no node" }) };
     if (binds === 2) return { status: 503, body: JSON.stringify({ error: "folder:claude:telegram:42 is bound again only as its caller asks", reason: "its last 3 binds failed", held: true }) };
-    return { status: 204 };
+    return { status: 200, body: JSON.stringify({ binding: "binding-1", namespace: "alasio" }) };
   });
   const scope = { harness: "claude", threadKey: "telegram:42" };
   const endpoint = await run(workspaces.folders.endpoint(scope));

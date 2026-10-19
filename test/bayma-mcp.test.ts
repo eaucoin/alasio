@@ -9,6 +9,7 @@ import { claudeMcpServers } from "../src/harness/claude/mcp.ts";
 import { type BaymaMcpServer, folderBayma, HostBayma, noFolderBayma } from "../src/mcp/bayma.ts";
 import { BaymaProxy } from "../src/mcp/bayma-proxy.ts";
 import { Store } from "../src/persistence/store.ts";
+import type { HeldTo } from "../src/binder/tokens.ts";
 import { type BaymaEndpoint, FolderBindFailed, type FolderScope, GatewayError, type GatewayWorkspaces } from "../src/sandbox/gateway-client.ts";
 import { run, testStore } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
@@ -18,7 +19,7 @@ const BAYMA: BaymaMcpServer = { type: "http", url: "http://alasio-sandbox-gatewa
 const LOOPBACK: BaymaMcpServer = { type: "http", url: "http://127.0.0.1:1/mcp/folder:claude:telegram:42", headers: { Authorization: "Bearer loopback" } };
 
 /** alasio's loopback, as a stand-in: each workspace's endpoint at its key, its upstream kept. */
-const upstreams = new Map<string, Effect.Effect<BaymaEndpoint>>();
+const upstreams = new Map<string, Effect.Effect<BaymaEndpoint, { readonly message: string }>>();
 const loopback = Layer.succeed(BaymaProxy, BaymaProxy.of({
   reach: (key, upstream) => Effect.sync(() => (upstreams.set(key, upstream), { url: `http://127.0.0.1:1/mcp/${key}`, headers: { Authorization: "Bearer loopback" } })),
 }));
@@ -36,7 +37,7 @@ function fakeFolders(binds: () => Effect.Effect<void, FolderBindFailed | Gateway
   const folders = {
     bind: (scope: FolderScope, { retry = false }: { readonly retry?: boolean } = {}) => Effect.andThen(Effect.sync(() => void calls.push(`bind${retry ? " retry" : ""} ${scope.harness} ${scope.threadKey}`)), binds()),
     release: (scope: FolderScope) => Effect.sync(() => void calls.push(`release ${scope.harness} ${scope.threadKey}`)),
-    endpoint: (scope: FolderScope) => Effect.sync(() => (calls.push(`endpoint ${scope.harness} ${scope.threadKey}`), { url: BAYMA.url, headers: BAYMA.headers })),
+    endpoint: (scope: FolderScope, held?: HeldTo) => Effect.sync(() => (calls.push(`endpoint ${scope.harness} ${scope.threadKey}${held ? ` held to ${held.binding}` : ""}`), { url: BAYMA.url, headers: BAYMA.headers })),
     starting: (_scope: FolderScope) => Effect.succeed<string | null>(null),
   };
   return { calls, folders };
@@ -60,6 +61,10 @@ test("a folder conversation's bayma is its folder instance, bound through the ga
   const { type: _, ...endpoint } = BAYMA;
   assert.deepEqual(await Effect.runPromise(upstreams.get("folder:claude:telegram:42") ?? Effect.die("not reached")), endpoint);
   assert.deepEqual(calls, ["bind claude telegram:42", "endpoint claude telegram:42"]);
+  // For a harness bound in a pool, which reaches it from there: the gateway's own, its bearer held to that harness's binding.
+  const held = await withHostBayma(folders, telegram, (host) => host.ensure({ ...SCOPE, held: { key: "harness:telegram:42", binding: "binding-1", namespace: "alasio" } }));
+  assert.deepEqual(held, { server: BAYMA, notice: null });
+  assert.equal(calls.at(-1), "endpoint claude telegram:42 held to binding-1");
   assert.deepEqual(telegram.calls.sendMessage, []);
 });
 

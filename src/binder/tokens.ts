@@ -5,7 +5,9 @@
  * key, base64url, compared in constant time.
  *
  * A caller's token names the key it may reach, when it stops, and what its key is bound with:
- * what the binder's callers present, which the binder checks and never forwards. A binding's
+ * what the binder's callers present, which the binder checks and never forwards; or, held to a
+ * binding of another key (`held`), as a harness elsewhere is given its workspace's, no time it
+ * stops, but good only for as long as that binding is held. A binding's
  * token names the key, the binding, its Lease's uid, so one minted for a binding is no
  * other's, even of the same key, and the namespace its Lease is in: what the bound pod is
  * given, to take its calls, and its telemetry, by (bindingToken).
@@ -16,18 +18,22 @@ import { Option, Schema } from "effect";
 
 /**
  * What a token says: the key it is for; the binding, and its Lease's namespace, for a
- * binding's; and, for a caller's, the time it stops, in ms, and what its key is bound with
- * where it is not bound yet, which the binder's gateway reads (as a session's environment and
- * internet).
+ * binding's; and, for a caller's, the time it stops, in ms, or the binding it is held to in its
+ * place (HeldTo) and when it was minted, in ms, and what its key is bound with where it is not
+ * bound yet, which the binder's gateway reads (as a session's environment and internet).
  */
 export const TokenClaims = Schema.Struct({
   key: Schema.String,
   binding: Schema.optional(Schema.String),
   namespace: Schema.optional(Schema.String),
   expires: Schema.optional(Schema.Number),
+  held: Schema.optional(Schema.Struct({ key: Schema.String, binding: Schema.String, namespace: Schema.String })),
+  issued: Schema.optional(Schema.Number),
   options: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 });
 export type TokenClaims = typeof TokenClaims.Type;
+/** The binding a caller's token is held to: its key's, its Lease's uid, and the namespace that is in. */
+export type HeldTo = NonNullable<TokenClaims["held"]>;
 
 const decodeClaims = Schema.decodeUnknownOption(Schema.fromJsonString(TokenClaims));
 

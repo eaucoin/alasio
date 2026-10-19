@@ -11,6 +11,7 @@
 import { Effect } from "effect";
 
 import { loadAlasioConfig } from "../../src/config.ts";
+import { makeGatewayWorkspaces } from "../../src/sandbox/gateway-client.ts";
 import { makeSessionSandboxes, type NetMode } from "../../src/sandbox/index.ts";
 
 /** The session made, or deleted. */
@@ -28,7 +29,7 @@ if (!first || !second || !(((verb === "create" || verb === "destroy") && mode(se
 const { sessionsGateway: gateway } = loadAlasioConfig();
 if (!gateway) throw new Error("the installation gives alasio no sandbox gateway");
 // The internet alasio records of each session: the one it is told of here, none of a fork's source unless told.
-const sessions = makeSessionSandboxes({ gateway, stateDir: "/tmp/volumes", netModeOf: () => Effect.succeed(mode(second)), proxy: { reach: () => Effect.die("no session is brought up here") } });
+const sessions = makeSessionSandboxes({ workspaces: makeGatewayWorkspaces(gateway), environment: gateway.environment, stateDir: "/tmp/volumes", netModeOf: () => Effect.succeed(mode(second)), proxy: { reach: () => Effect.die("no session is brought up here") } });
 
 const made = await Effect.runPromise(Effect.gen(function*() {
   if (verb === "create") return yield* sessions.volumes.create(first, mode(second) ?? "none");

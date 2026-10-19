@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { Context, Effect, Exit, Layer, Scope } from "effect";
 import { TestClock } from "effect/testing";
 
-import { environmentKey } from "../src/binder/names.ts";
+import { environmentKey, NOT_PASSED_HEADER } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
 import { makeBaymaProxy } from "../src/mcp/bayma-proxy.ts";
 import { makeGatewayWorkspaces, TOKEN_TTL_MS } from "../src/sandbox/gateway-client.ts";
@@ -130,6 +130,57 @@ test("a workspace's bayma at the loopback ends its caller's answer where bayma g
   } finally {
     await close();
     await new Promise<void>((resolve) => dropping.close(() => resolve()));
+  }
+});
+
+test("a request the gateway answers 503 saying it passed it to no pod is passed again after its Retry-After, its body whole; one it may have passed on, too large to read first or of no stated length, or past the bound, is answered as the gateway answered it, sent once", async () => {
+  const asked: string[] = [];
+  let refusals: { readonly retryAfter?: string; readonly notPassed?: boolean }[] = [];
+  const bayma = createServer(async (incoming, outgoing) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of incoming as AsyncIterable<Buffer>) chunks.push(chunk);
+    asked.push(Buffer.concat(chunks).toString());
+    const refusal = refusals.shift();
+    if (refusal) return void outgoing.writeHead(503, { ...(refusal.retryAfter ? { "retry-after": refusal.retryAfter } : {}), ...(refusal.notPassed ? { [NOT_PASSED_HEADER]: "true" } : {}) }).end("not yet");
+    outgoing.writeHead(200).end("answered");
+  });
+  await new Promise<void>((resolve) => bayma.listen(0, "127.0.0.1", resolve));
+  const { proxy, close } = await loopback();
+  try {
+    const endpoint = await Effect.runPromise(proxy.reach("sessionfs:fs-one", Effect.succeed({ url: `http://127.0.0.1:${(bayma.address() as AddressInfo).port}/mcp`, headers: {} })));
+    const call = async (body: string) => {
+      const answered = await ask(endpoint, { body });
+      return [answered.status, await answered.text()];
+    };
+    // As the gateway answers a bearer held to a binding it has not heard of yet.
+    refusals = [{ retryAfter: "1", notPassed: true }, { retryAfter: "1", notPassed: true }];
+    assert.deepEqual(await call('{"id":1}'), [200, "answered"]);
+    assert.deepEqual(asked, ['{"id":1}', '{"id":1}', '{"id":1}']);
+    // As it answers a pod not reached that may have taken it, with a Retry-After or none: sent once.
+    refusals = [{ retryAfter: "1" }];
+    assert.deepEqual(await call('{"id":2}'), [503, "not yet"]);
+    refusals = [{}];
+    assert.deepEqual(await call('{"id":3}'), [503, "not yet"]);
+    // Past the bound: as answered.
+    refusals = [{ retryAfter: "60", notPassed: true }];
+    assert.deepEqual(await call('{"id":4}'), [503, "not yet"]);
+    assert.deepEqual(asked.slice(3), ['{"id":2}', '{"id":3}', '{"id":4}']);
+    // One too large to read whole first, or of no stated length: sent once, as it comes, never read for another.
+    refusals = [{ retryAfter: "1", notPassed: true }];
+    const large = "x".repeat(1024 ** 2 + 1);
+    assert.deepEqual(await call(large), [503, "not yet"]);
+    refusals = [{ retryAfter: "1", notPassed: true }];
+    const chunked = await fetch(endpoint.url, {
+      method: "POST",
+      headers: { authorization: endpoint.headers["Authorization"] ?? "" },
+      body: new ReadableStream({ start: (controller) => (controller.enqueue(new TextEncoder().encode('{"id":5}')), controller.close()) }),
+      duplex: "half",
+    } as RequestInit);
+    assert.deepEqual([chunked.status, await chunked.text()], [503, "not yet"]);
+    assert.deepEqual(asked.slice(6).map((body) => (body.length > 100 ? `${body.length} bytes` : body)), [`${large.length} bytes`, '{"id":5}']);
+  } finally {
+    await close();
+    await new Promise<void>((resolve) => bayma.close(() => resolve()));
   }
 });
 

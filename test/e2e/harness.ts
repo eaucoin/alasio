@@ -542,7 +542,7 @@ export async function bindSession(volumeId: string, timeoutMs = 300_000): Promis
   let last = { status: 0, said: "" };
   for (const deadline = Date.now() + timeoutMs; ; await new Promise((resolve) => setTimeout(resolve, 2_000))) {
     last = await gatewayCall(token, "POST", "/bind");
-    const bound = last.status === 204 ? await boundPodOf(volumeId) : null;
+    const bound = last.status === 200 ? await boundPodOf(volumeId) : null;
     if (bound) return bound;
     if (Date.now() >= deadline) throw new Error(`the gateway did not bind ${volumeId} within ${timeoutMs / 1000}s: it last answered ${last.status} ${last.said}`);
   }

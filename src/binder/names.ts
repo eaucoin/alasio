@@ -45,3 +45,10 @@ export const boundLabels = (pool: Pool, key: string): Readonly<Record<string, st
 
 /** The annotations of a pod bound to `key`: the key, and what keeps its node from being removed while it is. */
 export const boundAnnotations = (key: string): Readonly<Record<string, string>> => ({ [KEY_ANNOTATION]: key, ...BUSY_ANNOTATIONS });
+
+/**
+ * The header of an answer the front gives a request it passed to no pod, nothing of it sent
+ * past the front (./server.ts), so that its caller may send it again, after its Retry-After: an
+ * MCP call's among them, which a pod given it may have run.
+ */
+export const NOT_PASSED_HEADER = "x-alasio-not-passed";

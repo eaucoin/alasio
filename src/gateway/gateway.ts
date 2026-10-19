@@ -28,6 +28,7 @@ import { type BindingNamespaces, LiveBindings } from "../binder/live.ts";
 import { reconcile } from "../binder/bindings.ts";
 import { environmentKey } from "../binder/names.ts";
 import { serveBinder } from "../binder/server.ts";
+import type { HeldTo } from "../binder/tokens.ts";
 import { Events } from "../events/events.ts";
 import { KubeClient } from "../kube/client.ts";
 import { makeNodeAgents } from "../sandbox/node-agents.ts";
@@ -42,6 +43,7 @@ import {
   folderOfKey,
   GATEWAY_CONFIG_VARIABLE,
   GatewayConfig,
+  heldToHarness,
 } from "./names.ts";
 import { makeFolders } from "./folders.ts";
 import { makeHarnesses } from "./harnesses.ts";
@@ -204,6 +206,8 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       // The folder instances' listing, where there are folder instances; the rest, the sessions'.
       operate: (claims, operation) => (folders && /^\/folders(\/|$)/u.test(operation.path) ? folders.operate(claims, operation) : sessions.operate(claims, operation)),
       routeHeld: live.holds,
+      // Where harnesses are bound in pools: a workspace's token held to its conversation's harness's binding, as alasio gives one.
+      ...(harnesses ? { grants: (key: string, held: HeldTo) => heldToHarness(key, held.key) } : {}),
       // Every replica's address but its own, which answers its own waiting.
       peers: () =>
         Effect.tryPromise(() => lookup(config.peers, { all: true })).pipe(

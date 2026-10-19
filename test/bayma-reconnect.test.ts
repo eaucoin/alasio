@@ -106,7 +106,7 @@ async function bayma() {
     /** Its endpoint as a process is given it: alasio's loopback, which mints each request's bearer by alasio's clock. */
     endpoint: await run(proxy.reach("folder:claude:telegram:1", folders.endpoint(FOLDER))),
     /** A bearer minted now, as the first request's is. */
-    first: await run(folders.endpoint(FOLDER)),
+    first: await run(Effect.orDie(folders.endpoint(FOLDER))),
     asked,
     rebind: async () => {
       for (const session of sessions.values()) await session.close();

@@ -33,9 +33,11 @@
  * its harness does on its own between prompts it tells on its environment's events topic
  * (./host-events.ts HostEvents.onLog), as Events tells them, which alasio reads.
  *
- * A session workspace's harness needs the sandbox gateway's binding of the workspace,
- * which the harness gateway brings (14.3); until then this host serves folder workspaces,
- * and refuses a session's turn, as alasio without session filesystems does.
+ * Its turns' workspaces' bayma is the control plane's to bring up, as it mints the tokens:
+ * each turn gives the host its endpoint through the sandbox gateway, ALASIO_GATEWAY_URL, which
+ * its harness reaches at a loopback of the host's, and its session's files are reached by
+ * (./given-bayma.ts). Without the gateway's address, it serves no session workspace, and
+ * no folder's bayma, as alasio without them does.
  */
 import { access, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -45,13 +47,18 @@ import { Clock, Context, Duration, Effect, Layer, Result, Schema, type Scope } f
 import { MAIN_ENVIRONMENT_NAME } from "../branch/names.ts";
 import { CodexAppServer } from "../codex/app-server/client.ts";
 import { codexHome } from "../codex/env.ts";
-import { CodexRollouts } from "../codex/rollouts/index.ts";
+import { CodexRollouts, SessionFsCodexRollouts } from "../codex/rollouts/index.ts";
+import { SessionFsCodex, sessionFsCodexHome } from "../codex/sessionfs.ts";
 import { Events } from "../events/events.ts";
 import { HarnessNeon } from "../neon/connect.ts";
 import { LakeWake, type WakeLog, wakeLogOf } from "../neon/lake-wake.ts";
+import { ALASIO_GATEWAY_URL_VARIABLE } from "../gateway/names.ts";
 import { Store } from "../persistence/store.ts";
+import { SessionSandboxes } from "../sandbox/index.ts";
+import { isSessionFs } from "../workspace/kind.ts";
 import { ReceivedFiles } from "../telegram/files.ts";
 import { ActiveTurns } from "./active-turns.ts";
+import { makeGivenBayma } from "./given-bayma.ts";
 import { HarnessHost } from "./host.ts";
 import { HostEvents } from "./host-events.ts";
 import { Harnesses, type HarnessesOptions } from "./index.ts";
@@ -139,6 +146,8 @@ export interface HarnessConfig {
   readonly branch: string | null;
   /** Where it tells the lake's loader it wrote transcripts and rollouts; null where the lake does not run. */
   readonly lakeWake: WakeLog | null;
+  /** The sandbox gateway's address, its turns' workspaces' bayma reached through: `ALASIO_GATEWAY_URL`; null where it has none. */
+  readonly gatewayUrl: string | null;
 }
 
 /** `key` of `env`, which must be set. */
@@ -158,6 +167,7 @@ export function loadHarnessConfig(env: NodeJS.ProcessEnv = process.env): Harness
     stateDir: required(env, "ALASIO_STATE_DIR"),
     branch: env["ALASIO_BRANCH"]?.trim() || null,
     lakeWake: wakeLogOf(env),
+    gatewayUrl: env[ALASIO_GATEWAY_URL_VARIABLE]?.trim() || null,
   };
 }
 
@@ -177,18 +187,30 @@ export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, s
   const neon = yield* Effect.provideService(HarnessNeon.make, LakeWake, wake);
   const stores = yield* Layer.build(Store.layer({ pool: neon.pool, makesSchema: false }));
   const store = Context.get(stores, Store);
-  const home = codexHome();
-  const codexRollouts = yield* CodexRollouts.make({ store: neon.rollouts, home });
+  const codexRollouts = yield* CodexRollouts.make({ store: neon.rollouts, home: codexHome() });
+  // Its session workspaces' Codex's, from a home of their own, where it serves them, as alasio's are.
+  const sessionFsCodexRollouts = config.gatewayUrl ? yield* SessionFsCodexRollouts.make({ store: neon.sessionFsRollouts, home: sessionFsCodexHome(config.stateDir) }) : null;
   const conversation = yield* store.getConversation(conversationId);
-  const written = yield* codexRollouts.restore(conversation?.codex_session_id ? [conversation.codex_session_id] : []);
+  const rollouts = isSessionFs(conversation?.working_directory) ? sessionFsCodexRollouts : codexRollouts;
+  const written = rollouts ? yield* rollouts.restore(conversation?.codex_session_id ? [conversation.codex_session_id] : []) : [];
   yield* Effect.logInfo(`bound ${conversationId}: wrote back ${written.length} Codex rollout file(s)`);
 
-  const host = yield* Layer.build(HarnessHost.layer.pipe(
-    Layer.provideMerge(Harnesses.layer({ ...standIns, branch: config.branch, sessionStore: neon.sessionStore, codexRollouts })),
-    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: config.stateDir }), HostEvents.onLog(config.branch ?? MAIN_ENVIRONMENT_NAME))),
+  const environment = config.branch ?? MAIN_ENVIRONMENT_NAME;
+  // Its turns' workspaces' bayma, as they give it, through the gateway, where it has one.
+  const given = config.gatewayUrl ? yield* makeGivenBayma({ gatewayUrl: config.gatewayUrl, environment, stateDir: config.stateDir }) : null;
+  const sessions = given
+    ? Layer.merge(Layer.succeed(SessionSandboxes, given.sessions), SessionFsCodex.layer({ home: sessionFsCodexHome(config.stateDir) }))
+    : Layer.empty;
+  const built = yield* Layer.build(HarnessHost.layer.pipe(
+    Layer.provideMerge(Harnesses.layer({ ...standIns, ...(given ? { folderBayma: given.folderBayma } : {}), branch: config.branch, sessionStore: neon.sessionStore, codexRollouts, sessionFsCodexRollouts })),
+    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: config.stateDir }), HostEvents.onLog(environment))),
+    Layer.provideMerge(sessions),
     Layer.provideMerge(Layer.succeedContext(stores)),
   ));
-  const served = yield* Effect.provide(serveHost({ port: config.port, conversationId, token }), host);
+  // Each turn's workspace's bayma taken as it starts, before it runs.
+  const host = Context.get(built, HarnessHost);
+  const giving = given ? HarnessHost.of({ ...host, startTurn: (start) => Effect.andThen(given.give(start), host.startTurn(start)) }) : host;
+  const served = yield* Effect.provideService(serveHost({ port: config.port, conversationId, token }), HarnessHost, giving);
   yield* Effect.logInfo(`serving the harness host of ${conversationId} on port ${served.port}`);
   return served;
 });

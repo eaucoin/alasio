@@ -3,9 +3,11 @@
  * naming the key it may reach, as `Authorization: Bearer <token>`; and what KEDA asks how
  * many each pool waits for.
  *
- * - `POST /bind`: binds the token's key ahead of any request (204), so its pod is got while
- *   nothing waits on it, as the key is bound now, whatever route the front last knew of it;
- *   503 with a Retry-After where its pool had no pod for it in time.
+ * - `POST /bind`: binds the token's key ahead of any request, so its pod is got while nothing
+ *   waits on it, as the key is bound now, whatever route the front last knew of it: 200
+ *   `{ binding, namespace }`, its binding, its Lease's uid, and the namespace that is in, which
+ *   a token may be held to (`grants`); 503 with a Retry-After where its pool had no pod for it
+ *   in time.
  * - `POST /release`: releases the token's key's binding, as its placement says what comes
  *   before, and resets what its placement keeps of its binds (204), as it does where it has
  *   none; 409 `{ "busy": true }` with a Retry-After where another bind or release of it is
@@ -34,7 +36,12 @@
  *   failed one after another, so it is bound again only as its caller asks.
  *
  * A token that is no caller's, has stopped, or is good for longer than MAX_CALLER_TOKEN_MS, is
- * answered 401. The gateway that serves on
+ * answered 401; so is one that stops at no time, but where it is held to a binding of another
+ * key that `grants` lets it be, and that binding is held, as the bindings' Leases are watched
+ * (`routeHeld`): it is good for as long as that is, 503 with a Retry-After meanwhile where
+ * whether it is held is not known yet, and only for what a harness bound elsewhere asks
+ * (heldMayAsk): what its key's pod serves, and its workspace's files, 403 for the rest. The
+ * gateway that serves on
  * it says which pool each key is bound in, and how its pod is made where it makes its own
  * (`poolOf`), as each request's token is asked first: what the front keeps of a binding, its
  * route, its stamps and its requests under way, is by its pool and key, never its key alone,
@@ -51,16 +58,42 @@ import { withLogScope } from "../shared/log.ts";
 import { BearerToken } from "../shared/tokens.ts";
 import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
 import { counts, touchLease } from "./bindings.ts";
-import { type Pool } from "./names.ts";
+import { NOT_PASSED_HEADER, type Pool } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
 import type { Held } from "./live.ts";
-import { bindingToken, type TokenClaims, verifyToken } from "./tokens.ts";
+import { bindingToken, type HeldTo, type TokenClaims, verifyToken } from "./tokens.ts";
+
+/**
+ * How far apart the clocks of the front and of what mints its callers' tokens may be: room in
+ * the time a token may stay good for, and in when one held to a binding was minted, which the
+ * bindings' watch is asked of, so a front whose clock runs ahead refuses no new binding's.
+ */
+const CLOCKS_APART_MS = 5 * 60_000;
 
 /** The most a request the front answers itself may carry: a file of a workspace's, as its node agent writes one, with room. */
 export const MAX_OPERATION_BYTES = 64 * 1024 ** 2;
 
 /** The paths of the requests the front answers itself (`operate`): /workspace, /snapshots and /folders, and what is under them. */
 const OPERATED = /^\/(workspace|snapshots|folders)(\/|$)/u;
+
+/** Where a caller asks the front to bind its token's key ahead of any request. */
+const BIND_PATH = "/bind";
+/** Where a caller asks the front to release its token's key's binding. */
+const RELEASE_PATH = "/release";
+
+/** Whether the front answers a request to `path` itself, passing none to a pod: what a bound pod serves is at none of them. */
+export const answeredByFront = (path: string): boolean => path === BIND_PATH || path === RELEASE_PATH || OPERATED.test(path);
+
+/** Where a workspace's files are read and written, as the front answers them (`operate`). */
+const FILES_PATH = "/workspace/files";
+
+/**
+ * Whether a token held to a binding may ask `method path`: what its key's pod serves, as its
+ * bayma, and its workspace's files read and written, as a harness bound elsewhere asks them;
+ * none of what only its caller's control plane asks, a bind or release of it, a listing, or a
+ * workspace made, forked or deleted.
+ */
+const heldMayAsk = (method: string, path: string): boolean => !answeredByFront(path) || (path === FILES_PATH && (method === "GET" || method === "PUT"));
 
 /** A caller's request the front answers itself (`operate`): its method, its path, under /workspace, /snapshots or /folders, its query, and its body. */
 export interface Operation {
@@ -83,10 +116,10 @@ export const NO_BIND_HEADER = "x-alasio-bind";
 
 /**
  * The longest a caller's token may stay good for, from now: alasio's (src/sandbox/gateway-client.ts
- * TOKEN_TTL_MS, six hours), with room for clocks a few minutes apart. One good for longer, as a
- * key leaked would mint, is answered 401.
+ * TOKEN_TTL_MS, six hours), with room for clocks apart (CLOCKS_APART_MS). One good for
+ * longer, as a key leaked would mint, is answered 401.
  */
-export const MAX_CALLER_TOKEN_MS = 6 * 60 * 60_000 + 5 * 60_000;
+export const MAX_CALLER_TOKEN_MS = 6 * 60 * 60_000 + CLOCKS_APART_MS;
 
 /** What a Retry-After asks a caller to wait, in seconds, before it asks again. */
 const RETRY_AFTER_S = 1;
@@ -157,9 +190,16 @@ export interface BinderServerOptions {
    * Whether the binding `binding` of `key`, its Lease's uid in `namespace`, is held now, as the
    * bindings' Leases are watched (./live.ts): a route the front knew of a binding gone, as
    * another replica released it, is forgotten before a request is passed by it, and the key
-   * bound anew. None where routes are trusted until a request finds their pod unreached.
+   * bound anew. None where routes are trusted until a request finds their pod unreached. Not
+   * known, for one not seen, where nothing has been heard of the bindings since `since`.
    */
-  readonly routeHeld?: (key: string, binding: string, namespace: string) => Effect.Effect<Held>;
+  readonly routeHeld?: (key: string, binding: string, namespace: string, since?: number) => Effect.Effect<Held>;
+  /**
+   * Whether a caller's token of `key` may be held to the binding `held` in place of a time it
+   * stops (TokenClaims.held), as a harness bound elsewhere is given its workspace's; none may
+   * where none is given, nor where the bindings are not watched (`routeHeld`).
+   */
+  readonly grants?: (key: string, held: HeldTo) => boolean;
 }
 
 /** A listening front: its port, and how many requests of each key of each pool it is passing on now. */
@@ -202,7 +242,7 @@ const Waiting = Schema.Struct({ waiting: Schema.Number });
 const decodeWaiting = Schema.decodeUnknownOption(Waiting);
 
 /** Serves the front on `port` until the scope closes, as the module says. */
-export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]), operate, routeHeld }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
+export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]), operate, routeHeld, grants }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
   const binder = yield* Binder;
   const kube = yield* KubeClient;
   const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
@@ -288,8 +328,25 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       const bearer = Schema.decodeUnknownOption(BearerToken)(incoming.headers.authorization);
       const now = yield* Clock.currentTimeMillis;
       const claims = Option.isSome(bearer) ? verifyToken(callerKey, bearer.value[1], now) : null;
-      // A caller's token, which stops within MAX_CALLER_TOKEN_MS; a binding's, which a bound pod takes requests with, is none.
-      if (!claims || claims.expires === undefined || claims.expires > now + MAX_CALLER_TOKEN_MS || claims.binding !== undefined) return answer(outgoing, 401, { error: "no caller's token" });
+      // A caller's token, which stops within MAX_CALLER_TOKEN_MS, or is held to a binding; a binding's, which a bound pod takes requests with, is none.
+      if (!claims || claims.binding !== undefined || (claims.expires !== undefined && claims.expires > now + MAX_CALLER_TOKEN_MS)) return answer(outgoing, 401, { error: "no caller's token" });
+      if (claims.expires === undefined) {
+        const { held } = claims;
+        if (!held || !routeHeld || !grants?.(claims.key, held)) return answer(outgoing, 401, { error: "no caller's token" });
+        const asked = url.split("?", 1)[0] ?? "";
+        if (!heldMayAsk(incoming.method ?? "GET", asked)) return answer(outgoing, 403, { error: `a token held to a binding is for its workspace's bayma and files alone, not ${incoming.method} ${asked}` });
+        // Good for as long as the binding it is held to is: a harness's token of a workspace it was
+        // given, a session's its conversation has switched from among them, which stays good until
+        // that binding is released, as the same conversation's own. As the watch says it: a binding
+        // not seen where the watch has heard nothing since the token was minted, its clock allowed
+        // for (CLOCKS_APART_MS), is not known, as one made then may not be heard of yet, and one
+        // released within that time is refused so too, 503 for 401; and one whose Lease was
+        // deleted while the watch was cut is held still until the watch, resumed, hears of it, or
+        // it has heard nothing for its silence's bound (../kube/client.ts WATCH_SILENCE_MS).
+        const holding = yield* routeHeld(held.key, held.binding, held.namespace, claims.issued === undefined ? undefined : claims.issued + CLOCKS_APART_MS);
+        if (holding === "unknown") return answer(outgoing, 503, { error: `whether ${held.key}'s binding is held is not known yet` }, { "retry-after": String(RETRY_AFTER_S), [NOT_PASSED_HEADER]: "true" });
+        if (holding === "gone") return answer(outgoing, 401, { error: `the binding of ${held.key} the token is held to is gone` });
+      }
       const { key } = claims;
       const [path = "", search = ""] = url.split("?", 2);
       if (operate && OPERATED.test(path)) {
@@ -337,7 +394,8 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       }
       if (incoming.method === "POST" && url === "/bind") {
         incoming.resume();
-        return answer(outgoing, 204);
+        const { binding, pool } = routed.success.route;
+        return answer(outgoing, 200, { binding, namespace: pool.namespace });
       }
       const { known } = routed.success;
       let { route } = routed.success;
@@ -374,7 +432,9 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       if (proxied.reached) return;
       routes.delete(slot(route.pool, key));
       yield* Effect.logWarning(`the pod of ${key} was not reached: ${proxied.error}`);
-      answer(outgoing, 503, { error: `the pod of ${key} was not reached` }, { "retry-after": String(RETRY_AFTER_S) });
+      // Asked again only where the pod had nothing of it: one whose connection was made may have run it.
+      const unsent = !proxied.connected && NEVER_CONNECTED.has(proxied.code ?? "");
+      answer(outgoing, 503, { error: `the pod of ${key} was not reached` }, unsent ? { "retry-after": String(RETRY_AFTER_S), [NOT_PASSED_HEADER]: "true" } : {});
     }).pipe(
       Effect.catchCause((cause) => Effect.logWarning("answering a request failed", cause).pipe(Effect.andThen(Effect.sync(() => {
         if (!outgoing.headersSent) answer(outgoing, 500, { error: "answering the request failed" });
