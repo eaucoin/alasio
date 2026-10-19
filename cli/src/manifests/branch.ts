@@ -12,7 +12,9 @@
  * main's alasio asks the gateway to fork into it the sessions the branch inherited
  * (src/branch/fork.ts). Its sessions' sandboxes are main's sandbox service's, in pools of its
  * own in its sessions' namespace, which the service finds by its label
- * (src/gateway/environments.ts), so nothing of main's changes as a branch comes or goes. Its
+ * (src/gateway/environments.ts), so nothing of main's changes as a branch comes or goes; and
+ * its conversations' harnesses, where they run in pools, main's gateway's too, in pools of its
+ * own in its own namespace (./harness-pools.ts). Its
  * Secrets are the command's to write: the database's, the
  * lake's and the compute's, as main's (the data is a copy, its roles and passwords main's);
  * its own bot's; Claude Code's token, when main has one; and its token to ask main to fork
@@ -25,6 +27,7 @@ import { alasioObjects, type CpuBaseline } from "./alasio.ts";
 import { BRANCH_LABEL, type Environment } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { lakeObjects } from "./lake.ts";
+import { harnessPoolObjects } from "./harness-pools.ts";
 import { compute, computeScaling } from "./neon.ts";
 import { networkPolicyObjects } from "./network-policies.ts";
 import { sandboxPoolObjects } from "./sandbox-gateway.ts";
@@ -51,5 +54,6 @@ export function branchObjects(config: InstallConfig, name: string, cpuBaseline: 
     ...lakeObjects(config, environment),
     ...networkPolicyObjects(config, environment),
     ...sandboxPoolObjects(config, environment, cpuBaseline),
+    ...harnessPoolObjects(config, environment),
   ].map((object) => branchLabelled(object, name));
 }

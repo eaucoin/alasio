@@ -16,10 +16,13 @@
  * is deleted first, and waited for, while the controller runs to let go of it, or let go of
  * here where it has not within a minute, as it does not run.
  */
-import type { KubernetesObject } from "@kubernetes/client-node";
-import { Duration, Effect } from "effect";
+import type { KubernetesObject, V1Deployment } from "@kubernetes/client-node";
+import { Duration, Effect, Schedule, Schema } from "effect";
 
+import { POOL_LABEL } from "../../../src/binder/names.ts";
+import { harnessPoolPodPolicyName } from "../manifests/admission.ts";
 import { RELEASE } from "../manifests/common.ts";
+import { FOLDER_HARNESS_POOLS, HARNESS_POOLS } from "../manifests/harness-pools.ts";
 import { describeRef, FIELD_MANAGER, hasStatus, type Kind, kind, type KindName, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./api.ts";
 import { awaitGone, awaitReady, type NotReadyInTime, type RolloutFailed, selectorOf, type WaitOptions } from "./rollout.ts";
 
@@ -85,7 +88,7 @@ const LET_GO = Duration.minutes(1);
  * gone. One its controller has not let go of within LET_GO, as where it does not run (KEDA
  * gone, or failing), is let go of here: nothing else would.
  */
-const removeFinalized = Effect.fnUntraced(function*(objects: readonly KubernetesObject[], options: WaitOptions): Effect.fn.Return<void, ApplyError, KubeApi> {
+const removeFinalized = Effect.fnUntraced(function*(objects: readonly KubernetesObject[], options: WaitOptions): Effect.fn.Return<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> {
   const kube = yield* KubeApi;
   const finalized = objects.filter((object) => FINALIZED.has(object.kind ?? "")).map(refOf);
   if (finalized.length === 0) return;
@@ -120,7 +123,52 @@ export function labelled(object: KubernetesObject): KubernetesObject {
 const key = (ref: ObjectRef): string => `${ref.apiVersion}/${ref.kind}/${ref.namespace ?? ""}/${ref.name}`;
 
 /** How applying an installation fails. */
-export type ApplyError = KubeApiError | NotReadyInTime | RolloutFailed;
+export type ApplyError = KubeApiError | NotReadyInTime | RolloutFailed | PolicyNotInForce;
+
+/** How long the harness pools' pods' policy is waited for to come into force before their pools are made, at most. */
+const POLICY_IN_FORCE_MS = 60_000;
+/** How often whether it is in force is asked. */
+const POLICY_PROBE_EVERY = "200 millis";
+
+/** The harness pools' pods' policy was not in force in time, so none of their pools was made. */
+export class PolicyNotInForce extends Schema.TaggedError<PolicyNotInForce>()("PolicyNotInForce", { policy: Schema.String, reason: Schema.String }) {
+  override get message(): string {
+    return `the policy that holds the harness pools' pods to their templates, ${this.policy}, was not in force within ${POLICY_IN_FORCE_MS / 1000} s (${this.reason}), so none of their pools was made`;
+  }
+}
+
+/** A dry run's pod the policy did not refuse, as it was made, or refused for another reason: why. */
+class NotYetInForce extends Schema.TaggedError<NotYetInForce>()("NotYetInForce", { reason: Schema.String }) {}
+
+/**
+ * Waits, where `objects` hold an environment's harness pools and the policy that holds their
+ * pods to their templates (../manifests/admission.ts harnessPoolPodPolicy), until the API server
+ * holds pods to it, as a policy comes into force a moment after it is applied, and a pool's pod
+ * made before would be held to none: in force once it refuses a pod of a pool's labels but of
+ * none of its template, made as a dry run. One made, or refused for another reason, as by a
+ * namespace whose ServiceAccount is not made yet, is asked again, for POLICY_IN_FORCE_MS at most.
+ */
+const harnessPoolPolicyInForce = Effect.fnUntraced(function*(objects: readonly KubernetesObject[]): Effect.fn.Return<void, PolicyNotInForce, KubeApi> {
+  const kube = yield* KubeApi;
+  const pools: readonly string[] = [...Object.values(HARNESS_POOLS), ...Object.values(FOLDER_HARNESS_POOLS)];
+  const policy = objects.find(({ kind: of, metadata }) => of === "ValidatingAdmissionPolicy" && metadata?.name?.startsWith(harnessPoolPodPolicyName(null)))?.metadata?.name;
+  const pool = (objects.filter(({ kind: of }) => of === "Deployment") as V1Deployment[]).find((deployment) => pools.includes(deployment.spec?.template.metadata?.labels?.[POOL_LABEL] ?? ""));
+  if (!policy || !pool) return;
+  const probe = {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: "alasio-policy-probe", namespace: pool.metadata?.namespace ?? "", labels: { ...pool.spec?.template.metadata?.labels } },
+    spec: { containers: [{ name: "probe", image: "alasio-policy-probe" }] },
+  };
+  yield* kube.dryApply(probe).pipe(
+    Effect.matchEffect({
+      onFailure: (error) => (error.reason.includes(policy) ? Effect.void : Effect.fail(new NotYetInForce({ reason: error.reason }))),
+      onSuccess: () => Effect.fail(new NotYetInForce({ reason: "a pod of none of its templates was made" })),
+    }),
+    Effect.retry({ schedule: Schedule.max([Schedule.spaced(POLICY_PROBE_EVERY), Schedule.during(POLICY_IN_FORCE_MS)]) }),
+    Effect.mapError(({ reason }) => new PolicyNotInForce({ policy, reason })),
+  );
+});
 
 /** The installation's objects of `kinds`, as it has them now: none of a kind whose CRD the cluster lacks. */
 const installed = (kinds: readonly Kind[]): Effect.Effect<KubernetesObject[], KubeApiError, KubeApi> =>
@@ -239,7 +287,11 @@ const applyPhases = Effect.fnUntraced(function*(objects: readonly KubernetesObje
       continue;
     }
     if (phase.includes("PriorityClass")) yield* replaceChangedClasses(batch, options);
-    if (phase.includes("Deployment")) yield* handOverReplicas(batch);
+    if (phase.includes("Deployment")) {
+      // No pool's pod made before its policy holds it.
+      yield* harnessPoolPolicyInForce(objects);
+      yield* handOverReplicas(batch);
+    }
     yield* Effect.forEach(batch, (object) => kube.apply(object), { concurrency: 8, discard: true });
     if (phase.includes("CustomResourceDefinition")) yield* awaitReady(batch.map(refOf), options);
   }

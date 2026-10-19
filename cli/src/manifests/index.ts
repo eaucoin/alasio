@@ -11,6 +11,7 @@ import { MAIN_ENVIRONMENT } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { folderObjects } from "./folders.ts";
 import { grafanaObjects } from "./grafana.ts";
+import { harnessPoolObjects } from "./harness-pools.ts";
 import { headroomObjects } from "./headroom.ts";
 import { kedaObjects } from "./keda.ts";
 import { lakeObjects } from "./lake.ts";
@@ -33,7 +34,7 @@ export { NAMESPACE } from "./common.ts";
  * The objects of the installation `config` describes: the PriorityClasses its pods run
  * under, KEDA's, VPA's, alasio's, Neon's, the object store's, the log's, the webhook
  * intake's, the lake's, Grafana's, the telemetry collector's, workspace storage's, the node
- * agents', the sandbox service's, its folder instances', the NetworkPolicies, and the
+ * agents', the sandbox service's, its folder instances', its harness pools', the NetworkPolicies, and the
  * headroom's; with what alasio
  * carries forward from the installation it replaces (./alasio.ts carriedFrom).
  */
@@ -54,6 +55,7 @@ export function manifests(config: InstallConfig, carried: Carried = NOTHING_CARR
     ...nodeAgentObjects(config),
     ...sandboxServiceObjects(config, carried),
     ...folderObjects(config),
+    ...harnessPoolObjects(config, MAIN_ENVIRONMENT),
     ...networkPolicyObjects(config, MAIN_ENVIRONMENT, carried.apiServer),
     ...headroomObjects(config),
   ];

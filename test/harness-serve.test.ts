@@ -109,6 +109,15 @@ test("a turn longer than a client waits on a quiet connection is answered, kept 
   assert.equal(quiet.gaveUp, true);
 });
 
+test("a host says it serves to anyone, as a pool's pod is ready only once it is bound, and nothing else but to its token's bearer", async () => {
+  await serving(slowHost(0, { count: 0 }), 100, async (port) => {
+    const health = await fetch(`http://127.0.0.1:${port}/healthz`);
+    assert.deepEqual([health.status, await health.json()], [200, { ok: true }]);
+    const status = await fetch(`http://127.0.0.1:${port}${HOST_PATHS.status}`, { method: "POST", body: JSON.stringify({ conversationId: CONVERSATION }) });
+    assert.equal(status.status, 401);
+  });
+});
+
 test("a reservation, quiet for longer than a client waits, is kept alive", { timeout: 30_000 }, async () => {
   await serving(slowHost(0, { count: 0 }), 100, async (port) => {
     const held = await called(port, HOST_PATHS.reserve, { conversationId: CONVERSATION }, 500, 1_500);

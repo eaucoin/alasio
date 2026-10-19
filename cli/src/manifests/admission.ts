@@ -8,6 +8,9 @@
  *   (src/gateway/names.ts folderPodSpec), and a Secret the gateway makes there is an
  *   instance's token: RBAC lets it make pods of any spec, as any ServiceAccount, under any
  *   runtime, and Secrets of any type, a ServiceAccount's token among them;
+ * - a pod the sandbox gateway updates or deletes in an environment's own namespace is one of
+ *   its harness pools', which it binds and releases, and a Lease it writes there one of their
+ *   bindings': RBAC lets it update and delete every pod there, and write every Lease;
  * - a pod alasio patches changes its busy label and annotations alone (src/kube/busy.ts),
  *   and in alasio's own namespace is alasio's own: RBAC lets it patch its namespaces'
  *   pods whole, their images among it;
@@ -24,7 +27,7 @@
  */
 import { posix } from "node:path";
 
-import type { KubernetesObject, V1Container, V1PodSpec, V1PodTemplateSpec, V1ResourceRequirements } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Container, V1LabelSelector, V1PodSpec, V1PodTemplateSpec, V1ResourceRequirements } from "@kubernetes/client-node";
 
 import { SERVING_LABEL } from "../../../neon/control/endpoints.ts";
 import { BINDING_LABEL, FREE_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../../src/binder/names.ts";
@@ -128,6 +131,7 @@ function admissionPolicy(
   by: string,
   validations: readonly { readonly expression: string; readonly message: string }[],
   variables?: readonly { readonly name: string; readonly expression: string }[],
+  namespaceSelector?: V1LabelSelector,
 ): KubernetesObject[] {
   const metadata = { name, labels: labels("alasio") };
   const policy = {
@@ -136,7 +140,7 @@ function admissionPolicy(
     metadata,
     spec: {
       failurePolicy: "Fail",
-      matchConstraints: { resourceRules: rules.map((rule) => ({ ...rule, apiVersions: ["*"] })) },
+      matchConstraints: { resourceRules: rules.map((rule) => ({ ...rule, apiVersions: ["*"] })), ...(namespaceSelector ? { namespaceSelector } : {}) },
       matchConditions: [{ name: "by-alasio", expression: by }],
       ...(variables ? { variables } : {}),
       validations,
@@ -473,6 +477,173 @@ export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sess
         {
           expression: "request.operation != 'UPDATE' || object.metadata.?ownerReferences.orValue([]).all(owner, owner in oldObject.metadata.?ownerReferences.orValue([]))",
           message: "a pod of a namespace of sessions gets no owner it had not",
+        },
+      ],
+    },
+  };
+  const binding = { apiVersion: "admissionregistration.k8s.io/v1", kind: "ValidatingAdmissionPolicyBinding", metadata, spec: { policyName: name, validationActions: ["Deny"] } };
+  return [policy, binding];
+}
+
+/**
+ * What the sandbox gateway, `gateway`, its ServiceAccount, may do to a pod or a Lease of an
+ * environment's own namespace, main's or a branch's, where RBAC lets it update and delete pods
+ * and write Leases to bind and release its harness pools' (./harness-pools.ts): a pod of one
+ * of `pools` alone, which it makes none of, of no other workload beside it; and a Lease of a
+ * binding of one of them alone, by its pool's label, as it was and as it is to be, of none of
+ * what else keeps Leases there (KEDA's, VPA's, their leaders'). How a pool's pod may change, by
+ * anyone, its pool's own policy says (harnessPoolPodPolicy).
+ */
+export function harnessPodPolicy(gateway: string, pools: readonly string[]): KubernetesObject[] {
+  // An environment's own namespace, main's or a branch's: not a branch's sessions' namespace,
+  // whose name may be of the same form, whose sandbox pods the gateway binds, as its labels say.
+  const environments = `request.namespace == ${JSON.stringify(NAMESPACE)} || request.namespace.startsWith(${JSON.stringify(branchNamespace(""))})`;
+  const ofNoSessions = { matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: ["session"] }] };
+  const ofPools = (labels: string) => `${JSON.stringify(POOL_LABEL)} in ${labels} && ${labels}[${JSON.stringify(POOL_LABEL)}] in ${JSON.stringify(pools)}`;
+  return admissionPolicy(componentName("harness-pods"), [
+    { apiGroups: [""], resources: ["pods"], operations: ["UPDATE", "DELETE"] },
+    { apiGroups: ["coordination.k8s.io"], resources: ["leases"], operations: ["CREATE", "UPDATE", "DELETE"] },
+  ], `request.userInfo.username == ${JSON.stringify(gateway)} && (${environments})`, [
+    {
+      expression: `request.resource.resource != 'pods' || (${ofPools("variables.oldLabels")})`,
+      message: "the sandbox gateway changes and deletes no pod of an environment's namespace but its harness pools'",
+    },
+    {
+      expression: `request.resource.resource != 'leases' || ((request.operation == 'CREATE' || (${ofPools("variables.oldLabels")})) && (request.operation == 'DELETE' || (${ofPools("variables.newLabels")})))`,
+      message: "the sandbox gateway writes no Lease of an environment's namespace but its harness pools' bindings'",
+    },
+  ], [
+    { name: "oldLabels", expression: "request.operation == 'CREATE' ? {} : oldObject.metadata.?labels.orValue({})" },
+    { name: "newLabels", expression: "request.operation == 'DELETE' ? {} : object.metadata.?labels.orValue({})" },
+  ], ofNoSessions);
+}
+
+/**
+ * The spec of a pod of the harness pool template `template`, as the API server stores it: as a
+ * sandbox pool's pod's (poolPodSpec), and what the API server gives a pod that a harness
+ * pool's template leaves out: its DNS policy, the mode of each Secret's volume, each of the
+ * machine's paths' type where its mount names none, and the scheme of its readiness probe's
+ * request.
+ */
+function harnessPodSpec(template: V1PodTemplateSpec): Pinned {
+  const spec = template.spec ?? { containers: [] };
+  const container = (each: V1Container): Pinned => {
+    const probe = each.readinessProbe;
+    const httpGet = probe?.httpGet as unknown as PinnedMap | undefined;
+    return poolContainer({ ...each, ...(probe && httpGet ? { readinessProbe: { ...probe, httpGet: defaulted(httpGet, { scheme: "HTTP" }) } } : {}) } as unknown as V1Container);
+  };
+  const volumes = (spec.volumes ?? []).map((volume) =>
+    volume.secret
+      ? { ...(volume as unknown as PinnedMap), secret: defaulted(volume.secret as unknown as PinnedMap, { defaultMode: 420 }) }
+      : volume.hostPath && volume.hostPath.type === undefined
+      ? { ...(volume as unknown as PinnedMap), hostPath: defaulted(volume.hostPath as unknown as PinnedMap, { type: "" }) }
+      : volume
+  ) as unknown as Pinned[];
+  const tolerations = (spec.tolerations ?? []) as unknown as Pinned[];
+  return defaulted({
+    ...(spec as unknown as PinnedMap),
+    containers: spec.containers.map(container),
+    ...(spec.volumes ? { volumes } : {}),
+    tolerations: oneOf([...tolerations, ...DEFAULT_TOLERATIONS], [...tolerations, ...[...DEFAULT_TOLERATIONS].reverse()]),
+  }, { ...POOL_POD_DEFAULTS.pod, dnsPolicy: "ClusterFirst" });
+}
+
+/** Templates of pools that differ in their pool's label alone: one of them, and the pools of each. */
+interface TemplateKind {
+  readonly template: V1PodTemplateSpec;
+  readonly pools: string[];
+}
+
+/** `templates` by what each is but for its pool's label, in their order. */
+function kindsOf(templates: readonly V1PodTemplateSpec[]): TemplateKind[] {
+  const kinds = new Map<string, TemplateKind>();
+  for (const template of templates) {
+    const { [POOL_LABEL]: pool = "", ...others } = template.metadata?.labels ?? {};
+    const key = JSON.stringify({ ...template, metadata: { ...template.metadata, labels: others } });
+    const kind = kinds.get(key) ?? { template, pools: [] };
+    kind.pools.push(pool);
+    kinds.set(key, kind);
+  }
+  return [...kinds.values()];
+}
+
+/** The name of the policy that holds the harness pools' pods of main's environment (`branch` null) or of the branch environment `branch` to their templates. */
+export const harnessPoolPodPolicyName = (branch: string | null): string => (branch === null ? componentName("harness-pool-pods") : `${componentName("harness-pool-pods")}-${branch}`);
+
+/**
+ * Every pod of a harness pool (./harness-pools.ts) made in the environment's own namespace
+ * `namespace`, held to its pool's template, `templates` as `alasio up` renders them for main
+ * (`branch` null) or `alasio branch create` for the branch `branch`, of its own
+ * configuration, its overrides among it: main's folder conversations' among them, which run
+ * as the operator with the machine's mounts, so none is made of another user, other mounts, or
+ * capabilities beyond the template's. Each environment's policy is its own, made and deleted
+ * with it, as main's alasio up cannot render a branch's templates, whose configuration is the
+ * branch's. A pod is made by its Deployment's ReplicaSet, of its template, as the API server
+ * stores it (harnessPodSpec), free, of its pool's labels and the template hash alone; a pod
+ * labelled of no harness pool is no harness pool's, and is left to what else holds the
+ * namespace. A pool's pod changed by anyone, as it was or as it is to be, keeps its spec whole
+ * (its resources change by pods/resize, as VPA resizes it, which this does not match), of its
+ * labels and annotations changes those a binding has alone and those that keep its node, and
+ * of its owners lets go alone; and none gets an ephemeral container, as a sandbox pool's pod
+ * gets none (sandboxPodPolicy).
+ *
+ * It fails closed: where it cannot say, the API server refuses.
+ */
+export function harnessPoolPodPolicy({ namespace, branch, templates }: { readonly namespace: string; readonly branch: string | null; readonly templates: readonly V1PodTemplateSpec[] }): KubernetesObject[] {
+  const name = harnessPoolPodPolicyName(branch);
+  const metadata = { name, labels: labels("harness") };
+  const pinOf = ({ template, pools }: TemplateKind) => {
+    const podLabels = { ...(template.metadata?.labels ?? {}), [POOL_LABEL]: oneOf(...pools), "pod-template-hash": ANY_STRING } as PinnedMap;
+    const annotations = { ...(template.metadata?.annotations ?? {}), vpaObservedContainers: optional(ANY_STRING), vpaUpdates: optional(ANY_STRING) } as PinnedMap;
+    return `${pinned("object.spec", harnessPodSpec(template))} && ${pinned("variables.labels", podLabels)} && ${pinned("variables.annotations", annotations)}`;
+  };
+  // Each kind of template's pin a variable of its own, as CEL holds each expression to 100,000
+  // code points; the templates of pools that differ in their pool's label alone pinned once, so
+  // the policy stays one the API server compiles in time.
+  const pins = kindsOf(templates).map((kind, index) => ({ name: `pin${index}`, expression: pinOf(kind) }));
+  const pools = [...new Set(templates.map((template) => template.metadata?.labels?.[POOL_LABEL] ?? ""))];
+  const ofPools = (pod: string) => `has(${pod}.metadata.labels) && ${JSON.stringify(POOL_LABEL)} in ${pod}.metadata.labels && ${pod}.metadata.labels[${JSON.stringify(POOL_LABEL)}] in ${JSON.stringify(pools)}`;
+  const bound = [BINDING_LABEL, FREE_LABEL];
+  const policy = {
+    apiVersion: "admissionregistration.k8s.io/v1",
+    kind: "ValidatingAdmissionPolicy",
+    metadata,
+    spec: {
+      failurePolicy: "Fail",
+      matchConstraints: {
+        resourceRules: [
+          { apiGroups: [""], apiVersions: ["*"], resources: ["pods"], operations: ["CREATE", "UPDATE"] },
+          { apiGroups: [""], apiVersions: ["*"], resources: ["pods/ephemeralcontainers"], operations: ["CREATE", "UPDATE"] },
+        ],
+      },
+      matchConditions: [
+        { name: "of-the-environment", expression: `request.namespace == ${JSON.stringify(namespace)}` },
+        { name: "of-harness-pools", expression: `(${ofPools("object")}) || (request.operation == 'UPDATE' && ${ofPools("oldObject")})` },
+      ],
+      variables: [
+        { name: "labels", expression: "object.metadata.?labels.orValue({})" },
+        { name: "annotations", expression: "object.metadata.?annotations.orValue({})" },
+        { name: "oldLabels", expression: "request.operation == 'UPDATE' ? oldObject.metadata.?labels.orValue({}) : {}" },
+        { name: "newLabels", expression: "object.metadata.?labels.orValue({})" },
+        { name: "oldAnnotations", expression: "request.operation == 'UPDATE' ? oldObject.metadata.?annotations.orValue({}) : {}" },
+        { name: "newAnnotations", expression: "object.metadata.?annotations.orValue({})" },
+        ...pins,
+      ],
+      validations: [
+        { expression: "request.?subResource.orValue('') != 'ephemeralcontainers'", message: "no pod of a harness pool gets an ephemeral container" },
+        {
+          expression: `request.operation != 'CREATE' || ${pins.map(({ name: each }) => `variables.${each}`).join(" || ") || "false"}`,
+          message: "a pod of a harness pool is its pool's template, as alasio up renders it, and nothing else",
+        },
+        { expression: "request.operation != 'UPDATE' || object.spec == oldObject.spec", message: "no harness pool's pod's spec changes" },
+        { expression: `request.operation != 'UPDATE' || (${unchanged("Labels", bound)})`, message: `no label of a harness pool's pod changes but ${bound.join(" and ")}, as it is bound` },
+        {
+          expression: `request.operation != 'UPDATE' || (${unchanged("Annotations", [KEY_ANNOTATION, ...Object.keys(BUSY_ANNOTATIONS)])})`,
+          message: `no annotation of a harness pool's pod changes but ${KEY_ANNOTATION} and what keeps its node, as it is bound`,
+        },
+        {
+          expression: "request.operation != 'UPDATE' || object.metadata.?ownerReferences.orValue([]).all(owner, owner in oldObject.metadata.?ownerReferences.orValue([]))",
+          message: "a harness pool's pod gets no owner it had not",
         },
       ],
     },

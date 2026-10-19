@@ -65,6 +65,7 @@ import { imageReference } from "../images.ts";
 import { READY_ONCE_BOUND_ANNOTATION } from "../kube/rollout.ts";
 import { type Carried, type CpuBaseline, type Kept, type PreviousPools, sessionsNamespace, stopWaitSeconds } from "./alasio.ts";
 import { folderTemplate, foldersRun } from "./folders.ts";
+import { harnessesConfig } from "./harness-pools.ts";
 import {
   accountRole,
   componentName,
@@ -308,7 +309,8 @@ function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
     folders: foldersRun(config)
       ? { namespace: config.host.namespace, template: { ...folderTemplate(config) }, stateRoot: config.host.stateRoot, releaseAfterSeconds: durationSeconds(config.host.releaseAfter) ?? 0 }
       : null,
-    harnesses: null,
+    // Conversations' harnesses' pools, where they run in pools of their own.
+    harnesses: harnessesConfig(config),
   };
 }
 

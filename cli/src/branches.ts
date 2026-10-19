@@ -47,7 +47,8 @@ import { gatewayCalls } from "./gateway-calls.ts";
 import { kind, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./kube/api.ts";
 import { applyObjects } from "./kube/apply.ts";
 import { awaitGone, awaitReady, readiness, selectorOf, type WaitOptions } from "./kube/rollout.ts";
-import { alasioPrincipal, environmentAccess, type EnvironmentLogAccess, environmentLogSecret, LOG, loaderLogSecret, loaderPrincipal, logPrincipalSecret } from "./manifests/log.ts";
+import { alasioPrincipal, environmentAccess, type EnvironmentLogAccess, environmentLogSecret, harnessLogSecret, harnessPrincipal, LOG, loaderLogSecret, loaderPrincipal, logPrincipalSecret } from "./manifests/log.ts";
+import { harnessPoolPodPolicyName } from "./manifests/admission.ts";
 import { branchObjects } from "./manifests/branch.ts";
 import { REPLICA_NAME } from "./manifests/neon.ts";
 import { BRANCH_FORK_SECRET, BRANCH_LABEL, componentName, NAMESPACE, neonName, RELEASE, selectorLabels, SESSIONS_CALLER_SECRET } from "./manifests/common.ts";
@@ -297,12 +298,12 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
 
   // The branch's own, as the module says: none of main's passwords or tokens of its Neon.
   const own = () => randomBytes(24).toString("base64url");
-  const credentials = { alasio: own(), lake: own(), harness: own(), compute: own(), log: own(), loader: own() };
+  const credentials = { alasio: own(), lake: own(), harness: own(), compute: own(), log: own(), loader: own(), harnessLog: own() };
   // Their verifiers, each made once and given to whatever sets the role or answers for it.
   const verifiers = { [ROLE]: scramVerifier(credentials.alasio), [LAKE_ROLE]: scramVerifier(credentials.lake), [HARNESS_ROLE]: scramVerifier(credentials.harness) };
   // Each of its principals on the log a password of its own, its alasio's the one in its Secret.
   const access = environmentAccess(name);
-  const passwords: Readonly<Record<string, string>> = { [alasioPrincipal(name)]: credentials.log, [loaderPrincipal(name)]: credentials.loader };
+  const passwords: Readonly<Record<string, string>> = { [alasioPrincipal(name)]: credentials.log, [loaderPrincipal(name)]: credentials.loader, [harnessPrincipal(name)]: credentials.harnessLog };
   const log = { ...access, principals: access.principals.map((principal) => ({ ...principal, password: passwords[principal.name] ?? own() })) };
   // Main's URL, through the proxy, with the branch's password, on the branch's compute.
   const url = new URL(yield* requiredSecret(componentName("database"), "url"));
@@ -328,6 +329,8 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
       ? [branchSecret(name, SESSIONS_CALLER_SECRET, { "caller-key": environmentKey(Buffer.from(yield* requiredSecret(GATEWAY, "caller-key")), name).toString() })]
       : []),
     branchSecret(name, environmentLogSecret({ namespace: branchNamespace(name), branch: name }), { username: alasioPrincipal(name), password: credentials.log }),
+    // Its harness pools' hosts', which write its events topic alone.
+    branchSecret(name, harnessLogSecret({ namespace: branchNamespace(name), branch: name }), { username: harnessPrincipal(name), password: credentials.harnessLog }),
     // Its lake loader's, which reads its wake topic alone; and KEDA's, which may describe
     // how far behind that is and read nothing, which its loader's scaler reads as.
     ...(lake
@@ -554,7 +557,8 @@ export const deleteBranch = Effect.fnUntraced(function*(name: string, { force }:
     );
   }
   yield* removed([namespace, sessions].map((each) => ({ ...NAMESPACE_KIND, name: each })), options);
-  // What of its is the cluster's: its route, its topic and its principal.
+  // What of its is the cluster's: its harness pools' pods' policy, its route, its topic and its principal.
+  yield* removed([kind("ValidatingAdmissionPolicyBinding"), kind("ValidatingAdmissionPolicy")].map((each) => ({ ...each, name: harnessPoolPodPolicyName(name) })), options);
   yield* removeRoute(name);
   yield* changeEnvironment("forget", environmentAccess(name));
 });

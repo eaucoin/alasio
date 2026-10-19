@@ -90,10 +90,10 @@ export class BindingServed extends Schema.TaggedError<BindingServed>()("BindingS
   }
 }
 
-/** `file`'s text, or null where it is not there yet. */
+/** `file`'s text, or null where it is not there yet: nor where its directory is not its pod's user's yet, as kubelet makes it, until its node's agent writes its binding there. */
 const readIfThere = (file: string): Effect.Effect<string | null, BindingUnreadable> =>
   Effect.tryPromise({
-    try: () => readFile(file, "utf8").then((text) => text, (error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? null : Promise.reject(error))),
+    try: () => readFile(file, "utf8").then((text) => text, (error: NodeJS.ErrnoException) => (error.code === "ENOENT" || error.code === "EACCES" ? null : Promise.reject(error))),
     catch: (cause) => new BindingUnreadable({ file, reason: cause instanceof Error ? cause.message : String(cause) }),
   });
 

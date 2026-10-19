@@ -6,7 +6,7 @@
  * file of its own, as the role is the server's.
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -20,7 +20,7 @@ import { makeCodexRollouts } from "../src/codex/rollouts/index.ts";
 import { Events, type EventInput } from "../src/events/events.ts";
 import { type Harness, type TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
-import { awaitBinding, startHarness } from "../src/harness/program.ts";
+import { awaitBinding, loadHarnessConfig, startHarness } from "../src/harness/program.ts";
 import { HOST_PATHS } from "../src/harness/wire.ts";
 import { Neon } from "../src/neon/connect.ts";
 import { LakeWake } from "../src/neon/lake-wake.ts";
@@ -255,6 +255,44 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     await database.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a pool's host is configured from its environment: its binding's file, its state, the gateway, and the wake topic it tells its lake's loader of each write on, as alasio does", () => {
+  const base = { ALASIO_HARNESS_BINDING_FILE: "/attach/binding.json", ALASIO_STATE_DIR: "/var/lib/alasio/state" };
+  assert.deepEqual(loadHarnessConfig(base), { bindingFile: "/attach/binding.json", port: 8080, stateDir: "/var/lib/alasio/state", branch: null, lakeWake: null, gatewayUrl: null });
+  const pooled = loadHarnessConfig({
+    ...base,
+    ALASIO_BRANCH: "try",
+    ALASIO_GATEWAY_URL: "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080",
+    ALASIO_LAKE_WAKE_TOPIC: "lake.try",
+    ALASIO_LOG_BROKERS: "alasio-log.alasio.svc:9092",
+    ALASIO_LOG_USERNAME: "harness-try",
+    ALASIO_LOG_PASSWORD_FILE: "/run/alasio/log/password",
+  });
+  assert.deepEqual([pooled.branch, pooled.gatewayUrl, pooled.lakeWake], [
+    "try",
+    "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080",
+    { brokers: ["alasio-log.alasio.svc:9092"], username: "harness-try", passwordFile: "/run/alasio/log/password", topic: "lake.try" },
+  ]);
+  assert.throws(() => loadHarnessConfig({ ALASIO_STATE_DIR: "/state" }), /ALASIO_HARNESS_BINDING_FILE/u);
+});
+
+test("a free host waits out its directory as kubelet makes it, not its user's, until its binding is written there and the directory given to it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "alasio-harness-binding-"));
+  const attach = join(dir, "attach");
+  try {
+    mkdirSync(attach, { mode: 0o000 });
+    const file = join(attach, "binding.json");
+    const waiting = Effect.runFork(awaitBinding(file));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(waiting.pollUnsafe(), undefined, "a directory it cannot read yet stopped it");
+    chmodSync(attach, 0o700);
+    writeFileSync(file, JSON.stringify({ conversationId: "telegram:41", token: "harness-token" }));
+    assert.deepEqual(await Effect.runPromise(Fiber.join(waiting)), { conversationId: "telegram:41", token: "harness-token" });
+  } finally {
+    chmodSync(attach, 0o700);
     rmSync(dir, { recursive: true, force: true });
   }
 });

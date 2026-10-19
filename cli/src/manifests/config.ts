@@ -383,6 +383,25 @@ const Sessions = Schema.Struct({
   receiver: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "256Mi" } }) }), {}),
 });
 
+/**
+ * Conversations' harnesses (cli/src/manifests/harness-pools.ts): where `pools.enabled`, each
+ * conversation's harness host runs in a pod of its harness's pool, bound to it by the sandbox
+ * gateway while it has work and let go of once it has had none for `pools.releaseAfter`,
+ * rather than in alasio's process; each pool keeps `pools.scaling.min` free, and makes more,
+ * to its max, for the binds that wait for one.
+ */
+const Harness = Schema.Struct({
+  pools: defaulted(
+    Schema.Struct({
+      enabled: defaulted(Schema.Boolean, false),
+      scaling: Scaling({ min: 1, max: 5 }, { floor: false, scaled: true }),
+      releaseAfter: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 5m")), "5m"),
+    }),
+    {},
+  ),
+  resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "4Gi" } }),
+});
+
 /** The bayma the host profile's folder instances run, as this release pins it. */
 export const HOST_BAYMA_IMAGE = {
   repository: "ghcr.io/eaucoin/bayma",
@@ -830,6 +849,9 @@ const Autoscaling = Schema.Struct({
   ),
 });
 
+/** The variables of its homes a harness pool's pod sets itself, its own (./harness-pools.ts), which alasio.env, given to its pods too, may not set while they run. */
+const HARNESS_POD_HOMES =["HOME", "CODEX_HOME"] as const;
+
 /** What a configuration must also hold, given what it turns off: the issue of the first it lacks. */
 function completeness(config: typeof InstallStruct.Type): { readonly path: ReadonlyArray<string>; readonly issue: string } | undefined {
   if (!config.neon.enabled && !config.neon.external.existingSecret) {
@@ -851,6 +873,13 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
   }
   if (config.workspaceStorage.enabled && !config.sessions.enabled) {
     return { path: ["workspaceStorage", "enabled"], issue: "must be false when sessions.enabled is false, as its volumes are sessions' workspaces" };
+  }
+  if (config.harness.pools.enabled && !(config.workspaceStorage.enabled && config.sessions.enabled && config.sessions.runtimeClassName !== "" && config.neon.enabled)) {
+    return { path: ["harness", "pools", "enabled"], issue: "must be false unless the sandbox service runs, on workspace storage and Neon, which binds the pools' pods" };
+  }
+  const homes = config.harness.pools.enabled ? HARNESS_POD_HOMES.find((name) => name in config.alasio.env) : undefined;
+  if (homes !== undefined) {
+    return { path: ["alasio", "env", homes], issue: "must not be set while harness.pools.enabled: a harness pool's pod has a home and a Codex home of its own, which it sets itself" };
   }
   if (config.workspaceStorage.enabled && !config.neon.enabled) {
     return { path: ["workspaceStorage", "enabled"], issue: "must be false when neon.enabled is false, as its data is in the object store that runs with Neon" };
@@ -920,6 +949,7 @@ const InstallStruct = Schema.Struct({
   telemetry: defaulted(Telemetry, {}),
   sessions: defaulted(Sessions, {}),
   host: defaulted(Host, {}),
+  harness: defaulted(Harness, {}),
   neon: defaulted(Neon, {}),
   objectStore: defaulted(ObjectStore, {}),
   workspaceStorage: defaulted(WorkspaceStorage, {}),

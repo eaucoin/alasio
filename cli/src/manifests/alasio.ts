@@ -26,6 +26,8 @@ import { busyLabelPolicy } from "./admission.ts";
 import { foldersRun } from "./folders.ts";
 import { carriedPools, GATEWAY, GATEWAY_PORT, sandboxServiceRuns } from "./sandbox-gateway.ts";
 import { alasioGroup, environmentLogSecret, environmentName, lakeWakeTopic, LOG_BROKERS, telegramTopic } from "./log.ts";
+import { harnessPoolsRun } from "./harness-pools.ts";
+import { eventsGroup, eventsTopic } from "../../../src/events/names.ts";
 import {
   BRANCH_FORK_SECRET,
   BRANCH_LABEL,
@@ -204,6 +206,14 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
       : []),
     // Main's folder workspaces, the gateway's folder instances, where the host profile renders them.
     ...(environment.branch === null && foldersRun(config) ? [{ name: ALASIO_GATEWAY_FOLDERS_VARIABLE, value: "1" }] : []),
+    // Its conversations' harnesses, in pools of their own, where they run so, heard on its events topic in its group.
+    ...(harnessPoolsRun(config)
+      ? [
+        { name: "ALASIO_HARNESS_POOLS", value: "1" },
+        { name: "ALASIO_EVENTS_TOPIC", value: eventsTopic(environmentName(environment)) },
+        { name: "ALASIO_EVENTS_GROUP", value: eventsGroup(environmentName(environment)) },
+      ]
+      : []),
     ...branchEnv(config, environment),
     ...otelEnv(config, environment),
     ...envOf(alasio.env),

@@ -9,9 +9,10 @@
  * the turn does, or as the host stops; asked for again under its epoch, as a caller that
  * lost its answer asks again, it is the turn running that answers, not another. A
  * reservation lasts until its caller releases it, or lets go of the connection, as a
- * caller that is gone does. A call that carries a trace context is served in a span of it, its
- * turn and its harness's calls within it, so they join its caller's trace; one that carries
- * none, as the sandbox gateway's asking whether the host is idle, is in no trace.
+ * caller that is gone does. `GET /healthz` answers 200 to anyone once it serves, as a harness
+ * pool's pod is ready only once bound. A call that carries a trace context is served in a span
+ * of it, its turn and its harness's calls within it, so they join its caller's trace; one that
+ * carries none, as the sandbox gateway's asking whether the host is idle, is in no trace.
  */
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
@@ -204,6 +205,7 @@ export const serveHost = Effect.fnUntraced(function*(
 
   const handle = Effect.gen(function*() {
     const request = yield* HttpServerRequest.HttpServerRequest;
+    if (request.method === "GET" && request.url === "/healthz") return answer(200, { ok: true });
     const bearer = Schema.decodeUnknownOption(BearerToken)(request.headers["authorization"]);
     if (Option.isNone(bearer) || !sameToken(bearer.value[1], token)) return failed(401, { _tag: "Unauthorized", message: "the request bears no token of this host's" });
     return yield* route(request.method, new URL(request.url, "http://host").pathname).pipe(Effect.catch(Effect.succeed));

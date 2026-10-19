@@ -1,7 +1,7 @@
 /**
- * The NetworkPolicies confining sessions, folder workspaces' bayma, alasio, Neon, the
- * object store's parts and its filer store, the log, the telemetry collector, Grafana,
- * workspace storage, the node agents and the sandbox service, which need a cluster that
+ * The NetworkPolicies confining sessions, folder workspaces' bayma, alasio, its harness
+ * pools, Neon, the object store's parts and its filer store, the log, the telemetry
+ * collector, Grafana, workspace storage, the node agents and the sandbox service, which need a cluster that
  * enforces NetworkPolicy, as session filesystems do; and branch environments' (./branch.ts),
  * whose namespaces main's policies admit by the label each has, to what they share alone.
  */
@@ -53,6 +53,7 @@ import {
 import { PROXY_PORT } from "./neon.ts";
 import { VALKEY_PORT } from "./valkey.ts";
 import { FOLDER_PORT, foldersRun } from "./folders.ts";
+import { HARNESS_COMPONENT, HARNESS_POD_PORT, HARNESS_POOLS, harnessPoolsRun } from "./harness-pools.ts";
 import { JUICEFS_ADMIN } from "./workspace-storage.ts";
 import {
   GATEWAY as SANDBOX_GATEWAY_NAME,
@@ -152,7 +153,7 @@ function neonPolicies({ namespace }: Environment): NetworkPolicy[] {
  * main's (neonPolicies), alasio, and branch environments' alasio (their lakes reach it as
  * what branches share, branchStoragePolicy; Grafana as grafanaPolicies admit it).
  */
-function proxyPolicy(): NetworkPolicy {
+function proxyPolicy(config: InstallConfig): NetworkPolicy {
   return policy(componentName("neon-proxy"), NAMESPACE, "neon", {
     podSelector: { matchLabels: selectorLabels("neon-proxy") },
     policyTypes: ["Ingress"],
@@ -160,6 +161,8 @@ function proxyPolicy(): NetworkPolicy {
       from: [
         { podSelector: { matchLabels: selectorLabels("alasio") } },
         { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } },
+        // Its harness pools' hosts, as the harness host's role, main's and branch environments'.
+        ...harnessPeers(config),
       ],
       ports: [{ protocol: "TCP", port: PROXY_PORT }],
     }],
@@ -332,6 +335,8 @@ function logPolicy(config: InstallConfig): NetworkPolicy {
           of(LOADER_COMPONENT),
           { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } },
           { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels(LOADER_COMPONENT) } },
+          // Harness pools' hosts, which write their environment's events.
+          ...harnessPeers(config),
         ],
         ports: [{ protocol: "TCP", port: LOG_PORT }],
       },
@@ -385,6 +390,7 @@ function collectorPolicy(config: InstallConfig): NetworkPolicy {
         { podSelector: { matchLabels: selectorLabels("alasio") } },
         ...(nodeAgentRuns(config) ? [NODE_AGENT] : []),
         ...(sandboxServiceRuns(config) ? [SANDBOX_GATEWAY, SANDBOX_RECEIVER] : []),
+        ...harnessPeers(config),
         { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } },
         { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: STACK } },
       ],
@@ -475,6 +481,49 @@ function nodeAgentPolicies(config: InstallConfig): NetworkPolicy[] {
   ];
 }
 
+/** Every environment's harness pools' pods (./harness-pools.ts), main's and branch environments', as peers, where they run; none where they do not. */
+const harnessPeers = (config: InstallConfig): V1NetworkPolicyPeer[] =>
+  harnessPoolsRun(config)
+    ? [
+      { namespaceSelector: namespaceNamed(NAMESPACE), podSelector: { matchLabels: selectorLabels(HARNESS_COMPONENT) } },
+      { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels(HARNESS_COMPONENT) } },
+    ]
+    : [];
+
+/**
+ * The harness pools' pods of `environment` (./harness-pools.ts), free or bound: they take main's
+ * sandbox gateway alone, on their host's port, which it reaches them through. A session
+ * conversation's reaches the cluster's DNS, the gateway (its bayma and its files through it),
+ * Neon's proxy (its database, as the harness host's role), the log's brokers (its events), the
+ * collector where it runs, and the internet's HTTPS port, its harness's model's API, none of
+ * the cluster's or its network's private addresses, as a session with internet; nothing else.
+ * A folder conversation's, main's, reaches what alasio's own pod reaches, as the operator's agents do.
+ */
+function harnessPolicies(config: InstallConfig, environment: Environment): NetworkPolicy[] {
+  const harnesses = { podSelector: { matchLabels: selectorLabels(HARNESS_COMPONENT) } };
+  const sessionPools = { matchLabels: selectorLabels(HARNESS_COMPONENT), matchExpressions: [{ key: POOL_LABEL, operator: "In", values: Object.values(HARNESS_POOLS) }] };
+  const ofMainNamespace = (component: string): V1NetworkPolicyPeer => ({ namespaceSelector: namespaceNamed(NAMESPACE), podSelector: { matchLabels: selectorLabels(component) } });
+  return [
+    policy(componentName("harnesses"), environment.namespace, HARNESS_COMPONENT, {
+      ...harnesses,
+      policyTypes: ["Ingress"],
+      ingress: [{ from: [{ namespaceSelector: namespaceNamed(NAMESPACE), ...SANDBOX_GATEWAY }], ports: [{ protocol: "TCP", port: HARNESS_POD_PORT }] }],
+    }),
+    policy(componentName("harnesses-of-sessions"), environment.namespace, HARNESS_COMPONENT, {
+      podSelector: sessionPools,
+      policyTypes: ["Egress"],
+      egress: [
+        CLUSTER_DNS,
+        { to: [{ namespaceSelector: namespaceNamed(NAMESPACE), ...SANDBOX_GATEWAY }], ports: [{ protocol: "TCP", port: SANDBOX_GATEWAY_PORT }] },
+        { to: [ofMainNamespace("neon-proxy")], ports: [{ protocol: "TCP", port: PROXY_PORT }] },
+        { to: [ofMainNamespace(LOG_COMPONENT)], ports: [{ protocol: "TCP", port: LOG_PORT }] },
+        ...(collectorRuns(config) ? [{ to: [ofMainNamespace(GATEWAY_COMPONENT)], ports: [{ protocol: "TCP", port: COLLECTOR_PORT }] }] : []),
+        { to: [{ ipBlock: { cidr: "0.0.0.0/0", except: [...config.sessions.blockedCidrs] } }], ports: [{ protocol: "TCP", port: 443 }] },
+      ],
+    }),
+  ];
+}
+
 /** The pods of the sandbox service's pools (./sandbox-gateway.ts), free or bound, as a selector: by the label each has of its pool. */
 const POOLED = { matchExpressions: [{ key: POOL_LABEL, operator: "Exists" }] };
 
@@ -521,9 +570,10 @@ function poolPolicies(config: InstallConfig, environment: Environment): NetworkP
  * what they need of the cluster alone:
  *
  * - the gateway takes main's alasio and each branch environment's, which bind through it, its own replicas, which pass each
- *   other what is bound on the pods each holds, and KEDA's operator (kedaOperator), which asks
- *   it how many binds wait for a pool, on its port alone; it reaches the cluster's DNS, the
- *   pools' pods of every environment on bayma's port, the node agents, its replicas, the
+ *   other what is bound on the pods each holds, KEDA's operator (kedaOperator), which asks
+ *   it how many binds wait for a pool, and the harness pools' hosts, which reach their turns'
+ *   bayma and files through it, on its port alone; it reaches the cluster's DNS, the
+ *   pools' pods of every environment on bayma's port, the harness pools' on their host's, the node agents, its replicas, the
  *   log, which it writes each environment's events to, the collector where it runs, and the
  *   API server;
  * - the receiver takes the pools' pods alone, of main's sessions and of branch environments',
@@ -547,12 +597,14 @@ function sandboxServicePolicies(config: InstallConfig, apiServer: ApiServer | nu
       ...SANDBOX_GATEWAY,
       policyTypes: ["Ingress", "Egress"],
       ingress: [{
-        from: [{ podSelector: { matchLabels: selectorLabels("alasio") } }, { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } }, SANDBOX_GATEWAY, kedaOperator(config)],
+        from: [{ podSelector: { matchLabels: selectorLabels("alasio") } }, { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } }, SANDBOX_GATEWAY, kedaOperator(config), ...harnessPeers(config)],
         ports: [{ protocol: "TCP", port: SANDBOX_GATEWAY_PORT }],
       }],
       egress: [
         CLUSTER_DNS,
         { to: [...pools, ...folders], ports: [{ protocol: "TCP", port: POOL_POD_PORT }] },
+        // Each environment's harness pools' hosts, which it binds and passes conversations' calls on to.
+        ...(harnessPoolsRun(config) ? [{ to: harnessPeers(config), ports: [{ protocol: "TCP", port: HARNESS_POD_PORT }] }] : []),
         { to: [NODE_AGENT], ports: [{ protocol: "TCP", port: NODE_AGENT_PORT }] },
         { to: [SANDBOX_GATEWAY], ports: [{ protocol: "TCP", port: SANDBOX_GATEWAY_PORT }] },
         // The log, its events written to it.
@@ -601,6 +653,7 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
     return [
       ...(sessions.enabled ? sessionPolicies(config, environment) : []),
       ...(sandboxServiceRuns(config) ? poolPolicies(config, environment) : []),
+      ...(harnessPoolsRun(config) ? harnessPolicies(config, environment) : []),
       alasioPolicy(config, environment),
       ...neonPolicies(environment),
     ];
@@ -617,7 +670,8 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
       })]
       : []),
     alasioPolicy(config, environment),
-    ...(config.neon.enabled ? [...neonPolicies(environment), proxyPolicy(), branchStoragePolicy(config)] : []),
+    ...(harnessPoolsRun(config) ? harnessPolicies(config, environment) : []),
+    ...(config.neon.enabled ? [...neonPolicies(environment), proxyPolicy(config), branchStoragePolicy(config)] : []),
     ...(config.objectStore.bundled.enabled ? [gatewayPolicy(), ...partPolicies(), ...filerStorePolicies()] : []),
     logPolicy(config),
     webhookPolicy(config),
