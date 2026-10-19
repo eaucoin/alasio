@@ -87,11 +87,10 @@ export const uninstall = Command.make(
 ).pipe(
   Command.withShortDescription("Remove alasio"),
   Command.withDescription(
-    "Removes alasio's objects from its cluster, after confirmation, keeping what holds data: volumes, namespaces (with alasio's Secrets " +
-      "and its workspaces), and the CRDs (Sandboxes', KEDA's and VPA's), so alasio up installs it again as it was; and what serves volumes that remain, " +
-      "their StorageClasses and CSI drivers. With --purge it removes those too, workspaces and their volumes before the drivers " +
-      "that delete their data, and when alasio runs in the cluster it made on this machine, that cluster with all it keeps: k3s " +
-      "on the machine itself, with its own uninstall script, and gVisor, or the cluster in Docker; and the file of " +
+    "Removes alasio's objects from its cluster, after confirmation, keeping what holds data: volumes, namespaces (with alasio's Secrets), " +
+      "and the CRDs (KEDA's and VPA's), so alasio up installs it again as it was. With --purge it removes those too, workspaces with " +
+      "them, and when alasio runs in the cluster it made on this machine, that cluster with all it keeps: k3s " +
+      "on the machine itself, with its own uninstall script, gVisor and stargz-snapshotter, or the cluster in Docker; and the file of " +
       "/etc/sysctl.d/ it raised the machine's inotify limits in. What it removes as root it removes through sudo, at once, " +
       "after saying what. The config file is kept either way.",
   ),

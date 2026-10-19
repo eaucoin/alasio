@@ -10,7 +10,7 @@
  * it, holds the wait past its timeout until it is gone, and the timeout after: the wait says
  * so, with what the pod last logged.
  */
-import type { CoreV1Event, KubernetesObject, V1ContainerStatus, V1Deployment, V1PersistentVolume, V1Pod, V1StatefulSet } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ContainerStatus, V1Deployment, V1Pod, V1StatefulSet } from "@kubernetes/client-node";
 import { Clock, Duration, Effect, Schedule, Schema, Stream } from "effect";
 
 import { describeRef, kind, KubeApi, type KubeApiError, type ObjectRef } from "./api.ts";
@@ -86,19 +86,6 @@ export function readiness(object: KubernetesObject): Readiness {
     default:
       return READY;
   }
-}
-
-/**
- * Where a volume whose claim was deleted is: let go of once it is deleted, or released
- * and kept as its reclaim policy says; failed when it could not be reclaimed; else still
- * bound, or released while its data is deleted.
- */
-export function reclamation(volume: V1PersistentVolume): Readiness {
-  const phase = volume.status?.phase ?? "Pending";
-  if (phase === "Failed") return { _tag: "Failed", reason: volume.status?.message ?? "it could not be reclaimed" };
-  if (phase === "Released") return volume.spec?.persistentVolumeReclaimPolicy === "Retain" ? READY : waiting("released, its data being deleted");
-  const claim = volume.spec?.claimRef;
-  return waiting(phase === "Bound" && claim ? `bound to ${claim.namespace}/${claim.name}` : phase.toLowerCase());
 }
 
 /**
@@ -373,12 +360,3 @@ export const awaitGone = (refs: readonly ObjectRef[], options: WaitOptions): Eff
 /** Waits until every Job ref has ended, complete or failed, or is gone. */
 export const awaitEnded = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
   awaitAll(refs, (ref) => Effect.map(current(ref), (job) => (job === null || readiness(job)._tag !== "Waiting" ? READY : waiting("running"))), diagnose, options);
-
-/** Waits until every volume ref, its claim deleted, is let go of (reclamation). */
-export const awaitReclaimed = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
-  awaitAll(
-    refs,
-    (ref) => Effect.flatMap(KubeApi, (kube) => Effect.map(kube.get<V1PersistentVolume>(ref), (volume) => (volume ? reclamation(volume) : READY))),
-    diagnose,
-    options,
-  );

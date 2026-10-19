@@ -9,16 +9,15 @@
  *   to be, as VPA's InPlaceOrRecreate would where it does not, or where a node lacks the
  *   room: a pod not resized keeps its requests until it is next made, which VPA sizes;
  * - `Recommended`, for what keeps state (Neon's storage, the object store, workspace
- *   storage's metadata and its CSI driver), whose recreation would stop the floor; for
+ *   storage's metadata), whose recreation would stop the floor; for
  *   what alasio's turns cannot do without a moment (alasio's pod, which runs them in its
  *   harnesses; its database, the compute; and the storage controller, which the compute's
- *   start needs); recommended alone, which `alasio status` shows beside its requests.
+ *   start needs); and for a sandbox pool's pods, whose resources change only as a new pod is
+ *   made; recommended alone, which `alasio status` shows beside its requests.
  *
- * Sessions' pods have none: agent-sandbox makes each, a pod of its own.
+ * Folder instances' pods have none: the sandbox gateway makes each, of the folder template.
  */
 import type { KubernetesObject, V1Container, V1DaemonSet, V1Deployment, V1StatefulSet } from "@kubernetes/client-node";
-
-import { VOLUME_DRIVER_LABEL } from "../kube/apply.ts";
 
 /** How a workload's requests follow its recommendation. */
 export type Sizing = "InPlace" | "Recommended";
@@ -28,11 +27,6 @@ const UPDATE_MODES: Readonly<Record<Sizing, string>> = { InPlace: "InPlace", Rec
 
 /** The least any container is recommended: a little under what alasio's smallest components use (a storage broker's 13 MiB, a Valkey's 6). */
 const MIN_ALLOWED = { cpu: "5m", memory: "16Mi" };
-
-/** The labels of a workload's VerticalPodAutoscaler: the workload's, but that no volume needs it kept (VOLUME_DRIVER_LABEL). */
-function sizingLabels(labels: Readonly<Record<string, string>>): Record<string, string> {
-  return Object.fromEntries(Object.entries(labels).filter(([key]) => key !== VOLUME_DRIVER_LABEL));
-}
 
 /** A VerticalPodAutoscaler, as far as alasio writes and reads one: its target, how it applies its recommendation, and its recommendation. */
 export interface VerticalPodAutoscaler extends KubernetesObject {
@@ -54,7 +48,7 @@ export function verticalPodAutoscaler(workload: V1Deployment | V1StatefulSet | V
   return {
     apiVersion: "autoscaling.k8s.io/v1",
     kind: "VerticalPodAutoscaler",
-    metadata: { name: workload.metadata?.name ?? "", namespace: workload.metadata?.namespace ?? "", labels: sizingLabels(workload.metadata?.labels ?? {}) },
+    metadata: { name: workload.metadata?.name ?? "", namespace: workload.metadata?.namespace ?? "", labels: { ...workload.metadata?.labels } },
     spec: {
       targetRef: { apiVersion: workload.apiVersion, kind: workload.kind, name: workload.metadata?.name },
       // A workload of one replica, as most of alasio's are, is resized too.
