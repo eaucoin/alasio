@@ -1253,7 +1253,9 @@ async function gatewayTemplates(): Promise<{ readonly current: V1PodTemplateSpec
 /**
  * What a node agent's cgroup says of its memory: its limit, what it holds now, and of that,
  * what is anonymous, cached, dirty and being written back, and the two last together (what
- * is written and not yet on the disk); and how often it was OOM-killed.
+ * is written and not yet on the disk); how often it was OOM-killed; and how long, since it
+ * was first read, some of its tasks, and all of them at once, stalled waiting on memory, as
+ * its memory.pressure says (reclaim at its limit among them).
  */
 interface AgentMemory {
   readonly max: string;
@@ -1264,6 +1266,8 @@ interface AgentMemory {
   readonly writeback: number;
   readonly unsynced: number;
   readonly oomKills: number;
+  readonly stalledMs: number;
+  readonly allStalledMs: number;
 }
 
 /**
@@ -1288,6 +1292,7 @@ interface AgentsMemory {
  */
 function profileNodeAgents(): { readonly stop: () => void; readonly said: () => Promise<AgentsMemory> } {
   const peaks = new Map<string, AgentMemory>();
+  const stalledFrom = new Map<string, { readonly some: number; readonly full: number }>();
   const agents = () => kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("node-agent")) });
   const restartsOf = (pods: readonly V1Pod[]) =>
     pods.reduce((sum, { status }) => sum + (status?.containerStatuses?.find(({ name }) => name === "node-agent")?.restartCount ?? 0), 0);
@@ -1299,7 +1304,7 @@ function profileNodeAgents(): { readonly stop: () => void; readonly said: () => 
   const readCgroup = [
     "own=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)",
     "[ -f \"$own/memory.max\" ] || own=/sys/fs/cgroup",
-    "cat \"$own/memory.max\" \"$own/memory.current\" \"$own/memory.stat\" \"$own/memory.events\"",
+    "cat \"$own/memory.max\" \"$own/memory.current\" \"$own/memory.stat\" \"$own/memory.events\" \"$own/memory.pressure\"",
   ].join("; ");
   const sample = async () => {
     for (const [node, pod] of await nodeAgents()) {
@@ -1310,9 +1315,24 @@ function profileNodeAgents(): { readonly stop: () => void; readonly said: () => 
       if (read === null) continue;
       const [max = "", current = "0", ...rest] = read.trim().split("\n");
       const field = (name: string) => Number(rest.find((line) => line.startsWith(`${name} `))?.split(" ")[1] ?? 0);
+      // Its pressure's totals, in microseconds, counted from the first read.
+      const stalled = (kind: "some" | "full") => Number(rest.find((line) => line.startsWith(`${kind} avg10=`))?.match(/ total=(\d+)$/u)?.[1] ?? 0);
+      const first = stalledFrom.get(node) ?? { some: stalled("some"), full: stalled("full") };
+      stalledFrom.set(node, first);
       const dirty = field("file_dirty");
       const writeback = field("file_writeback");
-      const seen: AgentMemory = { max, current: Number(current), anon: field("anon"), file: field("file"), dirty, writeback, unsynced: dirty + writeback, oomKills: field("oom_kill") };
+      const seen: AgentMemory = {
+        max,
+        current: Number(current),
+        anon: field("anon"),
+        file: field("file"),
+        dirty,
+        writeback,
+        unsynced: dirty + writeback,
+        oomKills: field("oom_kill"),
+        stalledMs: (stalled("some") - first.some) / 1000,
+        allStalledMs: (stalled("full") - first.full) / 1000,
+      };
       const peak = peaks.get(node);
       peaks.set(node, peak ? {
         max,
@@ -1323,6 +1343,8 @@ function profileNodeAgents(): { readonly stop: () => void; readonly said: () => 
         writeback: Math.max(peak.writeback, seen.writeback),
         unsynced: Math.max(peak.unsynced, seen.unsynced),
         oomKills: Math.max(peak.oomKills, seen.oomKills),
+        stalledMs: Math.max(peak.stalledMs, seen.stalledMs),
+        allStalledMs: Math.max(peak.allStalledMs, seen.allStalledMs),
       } : seen);
     }
   };
@@ -1346,8 +1368,8 @@ function profileNodeAgents(): { readonly stop: () => void; readonly said: () => 
         const ended = status?.lastState?.terminated;
         return `${status?.restartCount ?? 0} restarts${ended ? `, last ended ${ended.reason} (exit ${ended.exitCode}) at ${ended.finishedAt}` : ""}`;
       };
-      const seen = [...peaks].map(([node, { max, current, anon, file, dirty, writeback, unsynced, oomKills }]) =>
-        `${node}: limit ${max === "max" ? max : mib(Number(max))}, peak ${mib(current)} (anon ${mib(anon)}, file ${mib(file)}, dirty ${mib(dirty)}, writeback ${mib(writeback)}, not yet on the disk ${mib(unsynced)}), ${oomKills} OOM kills, ${restarts(node)}`
+      const seen = [...peaks].map(([node, { max, current, anon, file, dirty, writeback, unsynced, oomKills, stalledMs, allStalledMs }]) =>
+        `${node}: limit ${max === "max" ? max : mib(Number(max))}, peak ${mib(current)} (anon ${mib(anon)}, file ${mib(file)}, dirty ${mib(dirty)}, writeback ${mib(writeback)}, not yet on the disk ${mib(unsynced)}), stalled on memory ${Math.round(stalledMs)} ms (all its tasks ${Math.round(allStalledMs)} ms), ${oomKills} OOM kills, ${restarts(node)}`
       );
       const unseen = pods.filter(({ spec }) => !peaks.has(spec?.nodeName ?? "")).map(({ spec }) => `${spec?.nodeName}: not read (${unread ?? "no sample"}), ${restarts(spec?.nodeName)}`);
       return {
