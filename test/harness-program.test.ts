@@ -6,12 +6,12 @@
  * file of its own, as the role is the server's.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { ConfigProvider, Context, Deferred, Effect, Exit, Layer, Scope } from "effect";
+import { ConfigProvider, Context, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect";
 import pg from "pg";
 
 import { HARNESS_ROLE } from "../neon/control/secrets.ts";
@@ -19,7 +19,7 @@ import { scramVerifier } from "../neon/control/scram.ts";
 import { makeCodexRollouts } from "../src/codex/rollouts/index.ts";
 import { type Harness, type TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
-import { startHarness } from "../src/harness/program.ts";
+import { awaitBinding, startHarness } from "../src/harness/program.ts";
 import { HOST_PATHS } from "../src/harness/wire.ts";
 import { Neon } from "../src/neon/connect.ts";
 import { LakeWake } from "../src/neon/lake-wake.ts";
@@ -145,10 +145,24 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
     }).pipe(Effect.provideService(LakeWake, LakeWake.none)));
 
     let held: Held | null = null;
-    const { port } = await inScope(startHarness(
-      { conversationId, port: 0, token: "harness-token", stateDir: stateDir!, branch: null, lakeWake: null },
+    // Free, of no conversation, until its binding is beside it.
+    const attach = join(dir, "attach");
+    mkdirSync(attach);
+    const bindingFile = join(attach, "binding.json");
+    const starting = await inScope(startHarness(
+      { bindingFile, port: 0, stateDir: stateDir!, branch: null, lakeWake: null },
       { overrides: { [CODEX_HARNESS]: answeringHarness(() => held) } },
-    ).pipe(Effect.provide(neonEnv(as(HARNESS_ROLE, "harness-password")))));
+    ).pipe(Effect.provide(neonEnv(as(HARNESS_ROLE, "harness-password"))), Effect.forkScoped));
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(starting.pollUnsafe(), undefined, "a free host serves nothing");
+    assert.equal(existsSync(join(home!, ROLLOUT)), false, "a free host writes back nothing");
+    writeFileSync(bindingFile, JSON.stringify({ conversationId, token: "harness-token" }));
+    const { port } = await Effect.runPromise(Fiber.join(starting));
+    // Its binding's directory read alone, its node's agent's to write: served, as it marks it, in a directory of its own.
+    assert.deepEqual(readdirSync(attach), ["binding.json"]);
+    // Its pod's binding served once: a host started again in it, as its container restarted, binds it no more.
+    const again = await Effect.runPromise(Effect.flip(Effect.scoped(startHarness({ bindingFile, port: 0, stateDir: stateDir!, branch: null, lakeWake: null }))));
+    assert.equal((again as { readonly _tag?: string })._tag, "BindingServed");
     // Bound: the conversation's session's rollout written back, whole, where Codex reads it.
     assert.equal(readFileSync(join(home!, ROLLOUT), "utf8"), ROLLOUT_TEXT);
 
@@ -235,6 +249,32 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     await database.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a harness host's binding is read once its file is there whole, and one that is no binding for long stops it, saying why", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "alasio-harness-binding-"));
+  try {
+    const file = join(dir, "binding.json");
+    const waiting = Effect.runFork(awaitBinding(file));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(waiting.pollUnsafe(), undefined);
+    writeFileSync(file, JSON.stringify({ conversationId: "telegram:41", token: "harness-token" }));
+    assert.deepEqual(await Effect.runPromise(Fiber.join(waiting)), { conversationId: "telegram:41", token: "harness-token" });
+    // Half written, as one written in place may be read: read again until it is whole.
+    writeFileSync(file, `{"conversationId": "telegram:42", "tok`);
+    const reading = Effect.runFork(awaitBinding(file, "5 seconds"));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(reading.pollUnsafe(), undefined);
+    writeFileSync(file, JSON.stringify({ conversationId: "telegram:42", token: "harness-token" }));
+    assert.deepEqual(await Effect.runPromise(Fiber.join(reading)), { conversationId: "telegram:42", token: "harness-token" });
+    // No binding for longer than that: it stops, saying why.
+    writeFileSync(file, JSON.stringify({ conversationId: "telegram:41" }));
+    const refused = await Effect.runPromise(Effect.flip(awaitBinding(file, "300 millis")));
+    assert.equal(refused._tag, "BindingUnreadable");
+    assert.match(refused.message, /binding\.json is no binding: /u);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
