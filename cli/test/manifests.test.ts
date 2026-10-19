@@ -37,6 +37,7 @@ import type {
 import { Result } from "effect";
 
 import { LOG_PRINCIPALS } from "../../neon/control/secrets.ts";
+import { DRAIN_WITHIN_MS } from "../../neon/lake/src/drain.ts";
 import type { HostProfile, SessionsProfile } from "../../src/kube/config.ts";
 import { hostBaymaStateDir } from "../../src/mcp/bayma.ts";
 import { memoryBytes } from "../src/capacity.ts";
@@ -760,6 +761,14 @@ describe("the lake's readers", () => {
     assert.deepEqual(one<V1Service>(objects, "Service", "alasio-lake").spec, { selector, ports: [{ name: "query", port: 8090 }] });
     assert.deepEqual(one<V1Service>(objects, "Service", "alasio-lake-query-peers").spec, { clusterIP: "None", selector, ports: [{ name: "query", port: 8090 }] });
     assert.deepEqual(query.env?.find(({ name }) => name === "LAKE_QUERY_PEERS"), { name: "LAKE_QUERY_PEERS", value: "alasio-lake-query-peers.alasio.svc.cluster.local" });
+  });
+
+  test("wait, as they stop, for the queries under way in them, alasio lake's among them, within their grace to stop", () => {
+    const readers = one<V1Deployment>(install(), "Deployment", "alasio-lake-query");
+    assert.deepEqual(container(readers).lifecycle, { preStop: { exec: { command: ["node", "src/drain.ts"] } } });
+    // The drain at its longest, and then the endpoint's own stop.
+    const grace = readers.spec?.template.spec?.terminationGracePeriodSeconds ?? 30;
+    assert.ok(grace * 1000 >= DRAIN_WITHIN_MS + 10_000, `a reader has ${grace} s to stop, its drain ${DRAIN_WITHIN_MS / 1000} s`);
   });
 
   test("scale on the queries the pool has not answered, as any reader sums them, two to a reader, never below one", () => {

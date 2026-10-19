@@ -1952,6 +1952,45 @@ if (inShard("telemetry")) {
       assert.equal((JSON.parse(asked) as { readers: number }).readers, 2);
     });
 
+    test("a reader the pool stops as alasio lake's query runs in it answers the query before it stops", async (t) => {
+      // Some seconds long, as the readers' scale-in may come as one runs.
+      const slow = "select count(*) as n from range(2000000000) t(i) where i % 7 = 3";
+      // How many of alasio lake's queries run in the reader, as its drain counts them (neon/lake/src/drain.ts).
+      const count = String.raw`const fs = require("node:fs");
+        console.log(fs.readdirSync("/proc").filter((pid) => /^\d+$/.test(pid)).filter((pid) => {
+          try { return fs.readFileSync("/proc/" + pid + "/cmdline", "utf8").split("\0").some((arg) => /(^|\/)src\/query\.ts$/.test(arg)); } catch { return false; }
+        }).length);`;
+      const running = (pod: string) => kube.execOk(NAMESPACE, pod, ["node", "-e", count], { container: "query" }).then(Number, () => 0);
+      const asked = alasio("lake", "--format", "json", slow);
+      let answered = false;
+      void asked.finally(() => {
+        answered = true;
+      });
+      const readers = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "app.kubernetes.io/component=lake-query" });
+      let stopped: string | undefined;
+      for (const deadline = Date.now() + 30_000; !stopped; await sleep(200)) {
+        if (answered || Date.now() > deadline) assert.fail("the query ended before a reader ran it, or no reader ran it");
+        for (const pod of readers) {
+          const name = pod.metadata?.name ?? "";
+          if ((await running(name)) > 0) stopped = name;
+        }
+      }
+      await kube.remove(ref("Pod", stopped, NAMESPACE));
+      assert.ok(!answered, "the query ended before its reader was stopped: make it longer");
+      const ran = await asked;
+      assert.equal(ran.code, 0, `the query ended with ${ran.code} as its reader stopped: ${ran.stderr}`);
+      // Its drain ended once the query had, as no other query was under way in it, Grafana's alert rules' among them.
+      let drain: { message: string; ms: number; withinMs: number } | undefined;
+      for (const deadline = Date.now() + 120_000; !drain; await sleep(1000)) {
+        const logged: string = await kube.logs(NAMESPACE, stopped, "query").catch(() => "");
+        drain = logged.split("\n").filter((line) => line.includes('"withinMs"')).map((line) => JSON.parse(line) as { message: string; ms: number; withinMs: number }).at(-1);
+        if (!drain && Date.now() > deadline) assert.fail(`the stopped reader logged no drain:\n${logged}`);
+      }
+      t.diagnostic(`the reader drained in ${drain.ms} ms, of ${drain.withinMs} ms at most`);
+      assert.equal(drain.message, "drained");
+      assert.deepEqual(ran.stdout.trim().split("\n").map((line) => Number((JSON.parse(line) as { n: unknown }).n)), [285714286]);
+    });
+
     test("the stack's telemetry is in the lake, the compute's and the lake's own among it", async () => {
       // What the collector scrapes is named for its job; the lake's readers export their events themselves.
       await untilInLake("metric of the compute's", metricRows("ServiceName = 'compute'"));
