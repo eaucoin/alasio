@@ -220,6 +220,8 @@ async function recorded(name: string, run: (seen: Record<string, unknown>) => Pr
 
 before(async () => {
   assert.equal(TARGET, "host", "12's gates on k3s run on the host target");
+  // Made by this process, so that the evidence it writes there goes beside what root keeps in it (debugOff).
+  mkdirSync(OUT, { recursive: true });
   try {
     await setUp();
     // 12's options for the sessions' runtime, as alasio installs them, which each new shim reads as it starts.
