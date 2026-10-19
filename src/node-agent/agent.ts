@@ -536,8 +536,24 @@ const StateGenerationFile = Schema.fromJsonString(Schema.Struct({ schemaVersion:
 const LastSaveFile = Schema.fromJsonString(Schema.Struct({ schemaVersion: Schema.Literal(1), generation: Count, running: Running }));
 /** How the agent reads a state file's bytes as text: those that are not UTF-8 fail it. */
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
-/** How long the hook may take to ready the sandbox for its save. */
-const HOOK_TIMEOUT = "30s";
+/**
+ * How long bayma's hook may take to ready the sandbox for its save, and to go on after one
+ * taken live, as it bounds itself in those (sandbox/agent/start.sh).
+ */
+export const SAVE_HOOK_SECONDS = 30;
+/**
+ * How long bayma's hook may take as runsc bounds it, of a sandbox whose restore from the
+ * bucket reads its pages through the agent for up to `backgroundReadMs`: runsc keeps the
+ * bound the save gave the hook with the sandbox's state, and holds the hook to it as the
+ * sandbox is restored, when the hook starts while its pages are still read lazily, each
+ * page its process touches read as slowly as the background reads may be. So as long as
+ * those may take, and the hook's own work beside; a save, and the resume after one taken
+ * live, the hook bounds within SAVE_HOOK_SECONDS itself. A hook that hangs as its sandbox is
+ * restored is killed only past all of it, its restore held meanwhile: bounded still, as the
+ * background reads' budget is of the largest sandbox's memory (./names.ts
+ * backgroundReadSeconds).
+ */
+export const restoreHookSeconds = (backgroundReadMs: number): number => Math.ceil(backgroundReadMs / 1000) + SAVE_HOOK_SECONDS;
 /** How often the cache is looked at for what to evict, besides as checkpoints and prepares write to it. */
 const EVICT_POLL: Duration.Input = "1 minute";
 /** How often a resume looks for a restored pod's rules. */
@@ -864,7 +880,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         containerId,
         imagePath: staged,
         hook,
-        hookTimeout: HOOK_TIMEOUT,
+        hookTimeout: `${restoreHookSeconds(backgroundReadMs)}s`,
         ...(own === undefined ? {} : { parentImagePath: cache.image(environment, workspace, own.digest) }),
         live: live !== undefined,
       }));

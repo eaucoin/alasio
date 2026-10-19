@@ -356,7 +356,8 @@ test("a checkpoint saves the sandbox with its release's runsc, uploads its image
           `--image-path=${staged}`,
           "--compression=none",
           "--save-restore-exec-argv=node /opt/bayma/bayma.js sandbox-hook --state-dir /home/agent/.bayma",
-          "--save-restore-exec-timeout=30s",
+          // As long as a restore of it may take to read its pages (BACKGROUND_READ_MS), and the hook's own 30 s.
+          "--save-restore-exec-timeout=1830s",
           CONTAINER,
         ],
         [`--root=${RUNSC_ROOT}`, "--systemd-cgroup=true", "image", "inspect", "--json", staged],
