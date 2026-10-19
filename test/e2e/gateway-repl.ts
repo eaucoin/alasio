@@ -76,12 +76,14 @@ const HOLD = [
 const CHECK = [
   "import json, os, time",
   "time.sleep(1)",
+  // The step read before the lines, so the file holds every line of it but one being written.
+  'step = state["step"]',
   'lines = open("/workspace/held/counter").read().split()',
   'db.execute("insert into t values (2)")',
   'db.execute("commit")',
   "print(json.dumps({",
   '    "writing": writer.is_alive(),',
-  '    "step": state["step"],',
+  '    "step": step,',
   '    "lines": len(lines),',
   '    "whole": all(int(line) == n + 1 for n, line in enumerate(lines)),',
   '    "committed": db.execute("select count(*) from t").fetchone()[0],',
