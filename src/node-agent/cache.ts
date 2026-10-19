@@ -6,7 +6,8 @@
  * reads it: its image's files, linked to the cache's, and in its `layers/<digest>/` each
  * image it holds pages of besides its own, its layers, linked to the cache's too, as runsc
  * finds an image's layers; or, for one read from the bucket, the checkpoint gofer's options
- * file alone, until its restore has read it. An image is written in a directory of its own beside the layers,
+ * file alone, until its restore has read it, and which runsc describes it from a copy of
+ * (remoteCopy). An image is written in a directory of its own beside the layers,
  * whose name begins with ".", and moved among them once it is whole and its digest known, so
  * what the cache holds is always whole; what a stopped agent left half written is removed as
  * the next one starts.
@@ -28,10 +29,10 @@
  * than RESERVE_BYTES free: room is made first, workspaces evicted as they would be over the
  * budget, and what it cannot be made for is refused.
  */
-import { link, mkdir, readdir, readFile, rename, rm, stat, statfs, symlink, utimes, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, statfs, symlink, utimes, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 
-import { Clock, Effect, Schema } from "effect";
+import { Clock, Effect, Schema, type Scope } from "effect";
 
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 
@@ -141,6 +142,15 @@ export interface SnapshotCache {
   readonly prepareRemote: (environment: string, workspace: string, snapshot: string, name: string, options: string) => Effect.Effect<string, CacheError>;
   /** Removes the options file `name` of each snapshot prepared of the workspace from the bucket, as prepareRemote wrote it. */
   readonly unprepareRemote: (environment: string, workspace: string, name: string) => Effect.Effect<void, CacheError>;
+  /**
+   * A directory of its own holding the checkpoint gofer's options file `name`, holding
+   * `options`, as prepareRemote writes it, from which runsc reads the snapshot from the bucket
+   * as its restore does, whatever becomes of the restore's directory meanwhile: its options
+   * removed once its restore has read them, or the directory made anew for the next restore.
+   * Written beside the images being written, so that one a stopped agent left is removed as
+   * the next starts; removed as the scope ends.
+   */
+  readonly remoteCopy: (environment: string, workspace: string, snapshot: string, name: string, options: string) => Effect.Effect<string, CacheError, Scope.Scope>;
   /** Removes everything of the workspace. */
   readonly clear: (environment: string, workspace: string) => Effect.Effect<void, CacheError>;
   /**
@@ -362,6 +372,22 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
         // Owner-only from its making: it holds the restore's token.
         await writeFile(join(directory, name), options, { mode: 0o600, flag: "wx" });
       }).pipe(Effect.andThen(use(environment, workspace)), Effect.as(directory));
+    },
+
+    remoteCopy: (environment, workspace, snapshot, name, options) => {
+      checked(environment, workspace, snapshot);
+      if (!/^[a-z0-9_]+\.json$/u.test(name)) throw new Error(`the snapshot cache writes no options file ${JSON.stringify(name)}`);
+      const layers = join(workspaceDir(environment, workspace), LAYERS_DIR);
+      return Effect.acquireRelease(
+        attempt(async () => {
+          await mkdir(layers, { recursive: true });
+          // One of its own however many are made of the snapshot at once, owner-only from its making.
+          const directory = await mkdtemp(join(layers, staged(`${snapshot}.remote-`)));
+          await writeFile(join(directory, name), options, { mode: 0o600, flag: "wx" });
+          return directory;
+        }),
+        (directory) => attempt(() => rm(directory, { recursive: true, force: true })).pipe(Effect.ignore),
+      );
     },
 
     unprepareRemote: (environment, workspace, name) => {
