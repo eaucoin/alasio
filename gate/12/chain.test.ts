@@ -212,6 +212,9 @@ async function recorded(name: string, run: (seen: Record<string, unknown>) => Pr
     seen["baymaLogs"] = (await kube.logs(SESSIONS, session.volumeId, "bayma").catch((failed: unknown) => String(failed))).trimEnd().split("\n").slice(-80);
     await dumpClusterState();
     throw error;
+  } finally {
+    // Kept as each gate ends, so that a run cut short keeps what the gates before saw.
+    writeFileSync(join(OUT, "evidence.json"), `${JSON.stringify(evidence, null, 2)}\n`);
   }
 }
 
@@ -305,6 +308,8 @@ interface Relay {
   readonly endpoint: string;
   /** What it carried back, and when it last did. */
   readonly carried: () => { readonly bytes: number; readonly lastAt: number };
+  /** How the store answered: each connection's first status, and the errors of those it could not carry, by their codes, with when each was last seen. */
+  readonly answered: () => Readonly<Record<string, { readonly count: number; readonly lastAt: number }>>;
   /** Ends what it carries and listens no more, as a proxy that stops does: its port refuses. */
   readonly cut: () => Promise<void>;
   /** Listens again on its port, as a proxy that came back there would. */
@@ -325,14 +330,23 @@ async function relayTo(target: string, { bytesPerSecond }: { readonly bytesPerSe
   let lastAt = 0;
   const startedAt = Date.now();
   const carrying = new Set<Socket>();
+  const answers: Record<string, { count: number; lastAt: number }> = {};
+  const answer = (what: string) => {
+    const seen = (answers[what] ??= { count: 0, lastAt: 0 });
+    seen.count += 1;
+    seen.lastAt = Date.now();
+  };
   const server = createServer((client) => {
     const upstream = connect({ host: url.hostname, port: Number(url.port) || 80 });
+    let first = true;
     for (const socket of [client, upstream]) {
       carrying.add(socket);
       socket.once("close", () => carrying.delete(socket));
     }
     client.pipe(upstream);
     upstream.on("data", (chunk: Buffer) => {
+      if (first) answer(/^HTTP\/1\.[01] (\d{3})/u.exec(chunk.toString("latin1", 0, 16))?.[1] ?? "unparsed");
+      first = false;
       bytes += chunk.length;
       lastAt = Date.now();
       // Ahead of its rate: held until it is not.
@@ -343,7 +357,10 @@ async function relayTo(target: string, { bytesPerSecond }: { readonly bytesPerSe
       }
     });
     upstream.pipe(client);
-    upstream.on("error", () => client.destroy());
+    upstream.on("error", (error: NodeJS.ErrnoException) => {
+      answer(error.code ?? "error");
+      client.destroy();
+    });
     client.on("error", () => upstream.destroy());
   });
   const listen = (port: number) => new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
@@ -352,6 +369,7 @@ async function relayTo(target: string, { bytesPerSecond }: { readonly bytesPerSe
   return {
     endpoint: `http://127.0.0.1:${port}`,
     carried: () => ({ bytes, lastAt }),
+    answered: () => structuredClone(answers),
     cut: () => {
       const closed = new Promise<void>((resolve) => server.close(() => resolve()));
       for (const socket of carrying) socket.destroy();
@@ -669,6 +687,7 @@ test("8. a restore from the bucket whose proxy goes away during its background r
             }
             outcome["reads"] = await readsOf(relay, startedAt, 30_000);
           } finally {
+            outcome["answered"] = Object.fromEntries(Object.entries(relay.answered()).map(([what, { count, lastAt }]) => [what, { count, last: new Date(lastAt).toISOString() }]));
             relay.close();
           }
           outcome["pod"] = await podState();

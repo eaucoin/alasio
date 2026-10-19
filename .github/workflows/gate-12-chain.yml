@@ -70,7 +70,7 @@ jobs:
   chain:
     needs: images
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 240
     steps:
       # As ci.yml's end-to-end jobs free it: the cluster holds far more than a runner
       # starts with free.
