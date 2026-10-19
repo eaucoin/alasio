@@ -2,7 +2,7 @@ import type { CallbackQuery } from "@grammyjs/types";
 import { Effect, Option } from "effect";
 
 import type { ConcurrentPromptPayload } from "../codex/turns.ts";
-import { discardHeld, isBusy, queueHeld, steerWithHeld, swerveTo } from "../harness/commands.ts";
+import { discardHeld, queueHeld, shownBusy, steerWithHeld, swerveTo } from "../harness/commands.ts";
 import { HarnessHost } from "../harness/host.ts";
 import { harnessLabelOf, NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, isHarnessName } from "../harness/index.ts";
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
@@ -129,7 +129,7 @@ const handlePress = Effect.fnUntraced(function*(callbackQuery: CallbackQuery, ac
     }
     if (action.kind === "queue") {
       // Asked again once its turn ended (Run it), it runs now, unless another turn has begun meanwhile.
-      const busy = yield* isBusy(conversationId);
+      const busy = yield* shownBusy(conversationId);
       if (!(yield* queueHeld(jobId))) return yield* gone;
       yield* client.answerCallbackQuery(callbackQuery.id, busy ? "Queued." : "Running.");
       yield* client.editMessageText(chatId, messageId, busy ? `Queued. ${label} will process this after the current task.` : `${label} is running this now.`);

@@ -43,7 +43,7 @@ import {
   type SDKResultMessage,
   type SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
-import { Clock, Deferred, Effect, Exit, Fiber, FiberSet, Scope, Stream } from "effect";
+import { Clock, Deferred, Effect, Exit, Fiber, FiberSet, Schedule, Scope, Stream } from "effect";
 
 import {
   buildDbGuardrailFallbackText,
@@ -99,6 +99,9 @@ const LOG_SCOPE = "claude-live";
 
 /** How long a turn waits for a steered prompt the CLI has not answered once its own prompt is answered. */
 const UNANSWERED_PROMPT_GRACE = "15 seconds";
+
+/** How often a CLI turn waiting on a fork's hold of its conversation looks again. */
+const HOLD_RECHECK = "1 second";
 
 /** The pending response of a CLI turn that has not claimed its conversation: none yet. */
 const UNCLAIMED = "";
@@ -420,6 +423,36 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   /** The options a CLI turn holds the conversation busy with. */
   const cliTurnRegistration = (host: ClaudeHost) => ({ onlyIfIdle: true, workspace: workspacePod?.(host.threadKey) });
 
+  /** Whether no hold that is no turn's (a fork's) keeps the conversation; where that cannot be told, one does, as said in alasio's log. */
+  const freeOfHolds = (host: ClaudeHost): Effect.Effect<boolean> =>
+    host.ownTurns.held.pipe(
+      Effect.map((held) => !held),
+      Effect.catch((error) => Effect.as(Effect.logWarning(`could not tell whether a fork holds thread=${host.threadKey}, so a CLI turn waits: ${error.message}`), false)),
+    );
+
+  /**
+   * Holds the conversation busy for a CLI turn, as its running turn, unless another turn
+   * holds it, or a hold that is no turn's does: whether it holds it. The hold is asked of
+   * once the turn is registered, as a hold asks whether a turn runs once it is made, so
+   * that of the two begun at once one sees the other; where one holds it, the turn's
+   * registration is let go of.
+   */
+  const holdForCliTurn = (host: ClaudeHost, cliTurn: CliTurn, register: (scope: Scope.Scope) => Effect.Effect<boolean>): Effect.Effect<boolean> =>
+    Effect.gen(function*() {
+      const attempt = yield* Scope.fork(cliTurn.registration);
+      if (!(yield* register(attempt))) return false;
+      if (yield* freeOfHolds(host)) return true;
+      yield* Scope.close(attempt, Exit.void);
+      return false;
+    });
+
+  /** Holds the conversation busy for a CLI turn once neither another turn nor a hold that is no turn's does, waiting as long as either does. */
+  const holdForCliTurnWhenFree = (host: ClaudeHost, cliTurn: CliTurn): Effect.Effect<void> =>
+    holdForCliTurn(host, cliTurn, (attempt) => Effect.as(activeTurns.registerWhenIdle(host.threadKey, cliTurn.running, cliTurnRegistration(host)).pipe(Scope.provide(attempt)), true)).pipe(
+      Effect.repeat({ until: (held) => held, schedule: Schedule.spaced(HOLD_RECHECK) }),
+      Effect.asVoid,
+    );
+
   /**
    * Delivers a CLI turn's reply, once it has claimed its conversation: its response
    * completed and its claim ended, then the conversation let go of, however that went,
@@ -475,14 +508,14 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     };
     host.cliTurn = cliTurn;
     const held = host.reportsWaiting === null
-      && (yield* activeTurns.register(host.threadKey, cliTurn.running, cliTurnRegistration(host)).pipe(Scope.provide(cliTurn.registration)));
+      && (yield* holdForCliTurn(host, cliTurn, (attempt) => activeTurns.register(host.threadKey, cliTurn.running, cliTurnRegistration(host)).pipe(Scope.provide(attempt))));
     if (held) {
       yield* claimCliTurn(host, cliTurn).pipe(
         Effect.onError(() => Effect.sync(() => void (host.cliTurn = null)).pipe(Effect.andThen(releaseCliTurn(host, cliTurn)))),
       );
       yield* Effect.logInfo(`cli-turn.started thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)}`);
     } else {
-      yield* Effect.logInfo(`cli-turn.started thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)} unclaimed: another turn holds the conversation, or a report waits to`);
+      yield* Effect.logInfo(`cli-turn.started thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)} unclaimed: another turn holds the conversation, or a fork's hold does, or a report waits to`);
     }
     return cliTurn;
   });
@@ -514,7 +547,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     const delivered = yield* Deferred.make<void>();
     host.reportsWaiting = delivered;
     yield* (before ? Deferred.await(before) : Effect.void).pipe(
-      Effect.andThen(activeTurns.registerWhenIdle(host.threadKey, cliTurn.running, cliTurnRegistration(host)).pipe(Scope.provide(cliTurn.registration))),
+      Effect.andThen(holdForCliTurnWhenFree(host, cliTurn)),
       Effect.andThen(claimCliTurn(host, cliTurn)),
       Effect.flatMap(() => (cliTurn.claim ? deliverCliTurn(host, cliTurn, cliTurn.claim.own) : Effect.void)),
       Effect.catch((error) =>

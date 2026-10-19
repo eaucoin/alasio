@@ -72,6 +72,13 @@ export interface OwnTurn {
 export interface OwnTurns {
   /** Claims the conversation for a turn its harness started on its own, as of the message `messageId`, in the session `sessionId`. */
   readonly claim: (messageId: string, sessionId: string | null) => Effect.Effect<OwnTurn, StoreError>;
+  /**
+   * Whether a hold that is no turn's keeps the conversation busy (../harness/holds.ts), which
+   * no turn of its own may run under: asked once the turn holds the conversation, as a hold
+   * asks whether a turn runs once it is made, so that of the two begun at once, one sees
+   * the other.
+   */
+  readonly held: Effect.Effect<boolean, StoreError>;
 }
 
 /** A turn to run: the operator's prompt, the session it resumes, and where it reports. */
@@ -179,6 +186,8 @@ export interface Harness {
    * stops and steers it.
    */
   readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult, StoreError | TurnFenced>;
+  /** Whether it has work of its own going on in the conversation between turns, as Claude Code's background tasks; none where it keeps none. */
+  readonly backgroundWork?: ((threadKey: string) => Effect.Effect<boolean>) | undefined;
   readonly listModels: () => Effect.Effect<ModelOption[], HarnessError>;
   /** What a turn runs on when no /model choice is stored. */
   readonly defaultModelChoice: () => ModelChoice;

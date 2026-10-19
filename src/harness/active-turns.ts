@@ -4,11 +4,12 @@
  * reserved by alasio as it decides to start it, before it claims the conversation in the
  * store, so that deciding and holding are one change; then registered by its harness,
  * with how it is stopped and steered, for as long as the harness runs it. Whatever asks
- * whether a conversation is busy, or stops or steers its turn, asks here. Where alasio
- * runs in a pod (BusyPods), its pod and the one the turn works in are held busy while it
- * runs, so no drain stops either.
+ * whether a turn runs, or stops or steers it, asks here; whether its conversation is busy,
+ * the holds of the store among what keeps it so, its harness host says (./host.ts). Where
+ * alasio runs in a pod (BusyPods), its pod and the one the turn works in are held busy
+ * while it runs, so no drain stops either.
  */
-import { Context, Deferred, Effect, HashMap, Layer, Option, Ref, Schedule, type Scope } from "effect";
+import { Clock, Context, Deferred, Effect, HashMap, Layer, Option, Ref, Schedule, type Scope } from "effect";
 
 import { BusyPods, type PodRef } from "../kube/busy.ts";
 import type { HarnessError } from "./index.ts";
@@ -65,12 +66,10 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
   /** The conversation's running turn, if it has one. */
   readonly get: (conversationId: string) => Effect.Effect<Option.Option<RunningTurn>>;
   /**
-   * Holds the conversations busy until the scope closes, as a running turn would, for what
-   * no turn may start under (a fork, which suspends the workspace they run in): whether it
-   * holds them, which it does only where none is busy, and then all at once. A hold is not
-   * stopped: stopping it is done once it ends.
+   * Since when, in milliseconds since the epoch, no turn has run in the conversation: since
+   * its last let go of it, or since these turns were first kept; null while one runs.
    */
-  readonly hold: (conversationIds: readonly string[]) => Effect.Effect<boolean, never, Scope.Scope>;
+  readonly idleSince: (conversationId: string) => Effect.Effect<number | null>;
   /** Whether the conversation has a running turn. */
   readonly isBusy: (conversationId: string) => Effect.Effect<boolean>;
   /** Stops the conversation's running turn for `reason`, once it has let go; whether there was one. */
@@ -82,6 +81,9 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
     // Each busy conversation's turns, the one running last: a reservation, and the
     // registration of its harness over it.
     const running = yield* Ref.make(HashMap.empty<string, readonly RunningTurn[]>());
+    // When each conversation's last turn let go of it; since these were first kept for one none ran in.
+    const kept = yield* Clock.currentTimeMillis;
+    const freedAt = yield* Ref.make(HashMap.empty<string, number>());
     const get = (conversationId: string) => Effect.map(Ref.get(running), (turns) => Option.flatMap(HashMap.get(turns, conversationId), (stack) => Option.fromNullishOr(stack.at(-1))));
     // Done, and made anew, each time a turn lets go of a conversation, for what waits for one to be free.
     const released = yield* Ref.make(yield* Deferred.make<void>());
@@ -105,11 +107,19 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
           pushed
             ? Effect.as(
               Effect.addFinalizer(() =>
-                Ref.update(running, (turns) =>
-                  conversationIds.reduce((all, conversationId) => {
-                    const left = Option.getOrElse(HashMap.get(all, conversationId), () => []).filter((each) => each !== turn);
-                    return left.length > 0 ? HashMap.set(all, conversationId, left) : HashMap.remove(all, conversationId);
-                  }, turns)).pipe(Effect.andThen(letGo))
+                Effect.flatMap(Clock.currentTimeMillis, (now) =>
+                  Ref.modify(running, (turns) => {
+                    const freed: string[] = [];
+                    const after = conversationIds.reduce((all, conversationId) => {
+                      const left = Option.getOrElse(HashMap.get(all, conversationId), () => []).filter((each) => each !== turn);
+                      if (left.length > 0) return HashMap.set(all, conversationId, left);
+                      freed.push(conversationId);
+                      return HashMap.remove(all, conversationId);
+                    }, turns);
+                    return [freed, after] as const;
+                  }).pipe(
+                    Effect.flatMap((freed) => Ref.update(freedAt, (all) => freed.reduce((at, conversationId) => HashMap.set(at, conversationId, now), all))),
+                  )).pipe(Effect.andThen(letGo))
               ),
               true,
             )
@@ -159,12 +169,10 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
           }
         }),
       get,
-      hold: (conversationIds) =>
+      idleSince: (conversationId) =>
         Effect.gen(function*() {
-          const ended = yield* Deferred.make<void>();
-          const hold: RunningTurn = { stop: () => Deferred.await(ended), steer: () => Effect.succeed(false), cliInitiated: false };
-          yield* Effect.addFinalizer(() => Deferred.succeed(ended, undefined));
-          return yield* push(conversationIds, hold, true);
+          if (HashMap.has(yield* Ref.get(running), conversationId)) return null;
+          return Option.getOrElse(HashMap.get(yield* Ref.get(freedAt), conversationId), () => kept);
         }),
       isBusy: (conversationId) => Effect.map(get(conversationId), Option.isSome),
       // The turn on top stops, and the stop is done once every turn under it, its reservation

@@ -60,6 +60,7 @@ test("a turn started through the host runs on its harness under the turn's claim
     alasio.runPromise(Effect.scoped(Effect.gen(function*() {
       const host = yield* HarnessHost;
       const events = yield* host.events;
+      const before = Date.now();
       const result = yield* host.startTurn({
         conversationId,
         chatId: "41",
@@ -80,8 +81,16 @@ test("a turn started through the host runs on its harness under the turn's claim
       ]);
       // A fresh session of the harness, through the host.
       assert.equal(yield* host.startFreshSession({ conversationId, harness: CODEX_HARNESS, workingDirectory: "/work" }), `fresh-of-${conversationId}`);
-      // No turn of it runs once it has ended.
-      assert.deepEqual(yield* host.status(conversationId), { busy: false });
+      // No turn of it runs once it has ended; nor did one start on its own, nor does the harness work on.
+      const { idleSince, ...status } = yield* host.status(conversationId);
+      assert.deepEqual(status, { busy: false, running: false, cliInitiated: false, held: false, backgroundWork: false });
+      assert.ok(idleSince !== null && idleSince <= Date.now());
+      // While it is held for a turn, it runs one, of alasio's; idle again since that let go.
+      yield* Effect.scoped(Effect.gen(function*() {
+        assert.equal(yield* host.reserve(conversationId), true);
+        assert.deepEqual(yield* host.status(conversationId), { busy: true, running: true, cliInitiated: false, held: false, backgroundWork: false, idleSince: null });
+      }));
+      assert.ok(((yield* host.status(conversationId)).idleSince ?? 0) >= before);
       // The panels reach the mount's harness through the host.
       const panels = Option.getOrNull(yield* host.panels(yield* store.getMount(conversationId)));
       assert.equal(panels?.displayName, harnessDisplayName(CODEX_HARNESS));

@@ -37,9 +37,16 @@ export type Steered =
 export const stopTurn = (conversationId: string, reason: StopReason): Effect.Effect<boolean, never, HarnessHost> =>
   Effect.flatMap(HarnessHost, (host) => host.interrupt(conversationId, reason));
 
-/** Whether a bound harness runs a turn in the conversation. */
-export const isBusy = (conversationId: string): Effect.Effect<boolean, never, HarnessHost> =>
+/** Whether no turn may start in the conversation, as its harness host says (HarnessStatus.busy). */
+export const isBusy = (conversationId: string): Effect.Effect<boolean, StoreError, HarnessHost> =>
   Effect.flatMap(HarnessHost, (host) => Effect.map(host.status(conversationId), ({ busy }) => busy));
+
+/**
+ * Whether the operator's panels show the conversation working, and refuse what it would
+ * change: as isBusy says, or working where that cannot be told, said in alasio's log.
+ */
+export const shownBusy = (conversationId: string): Effect.Effect<boolean, never, HarnessHost> =>
+  isBusy(conversationId).pipe(Effect.catch((error) => Effect.as(Effect.logWarning(`could not tell whether ${conversationId} is busy: ${error.message}`), true)));
 
 /**
  * Steers the conversation's running turn with the prompt held as the job `jobId`, or

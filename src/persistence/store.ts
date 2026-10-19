@@ -160,6 +160,9 @@ export class TurnFenced extends Schema.TaggedError<TurnFenced>()("TurnFenced", {
   }
 }
 
+/** A hold of conversations that could not hold them all, as another holds one: its transaction rolled back, so it holds none. */
+class HeldAlready extends Schema.TaggedError<HeldAlready>()("HeldAlready", {}) {}
+
 /** A turn's write: failing as the store does, or with TurnFenced where the turn no longer holds its conversation. */
 export type TurnWrite<A> = Effect.Effect<A, StoreError | TurnFenced>;
 
@@ -277,8 +280,13 @@ export class Store extends Context.Service<Store, {
   readonly getActiveTurn: (conversationId: string) => Stored<Turn | null>;
   /** The conversation's latest turn, active or ended: what its harness said it did, and how it ended. */
   readonly getTurn: (conversationId: string) => Stored<Turn | null>;
-  /** Holds the conversations busy for `reason`, as no turn does (a fork). */
-  readonly holdConversations: (conversationIds: readonly string[], reason: string) => Stored<void>;
+  /**
+   * Holds the conversations busy for `reason`, as no turn does (a fork), all at once where
+   * none is held already, or none at all: whether it held them.
+   */
+  readonly holdConversations: (conversationIds: readonly string[], reason: string) => Stored<boolean>;
+  /** Whether the conversation is held busy, as no turn (holdConversations). */
+  readonly isConversationHeld: (conversationId: string) => Stored<boolean>;
   /** Lets go of the conversations' holds; of every one, for null. */
   readonly releaseConversations: (conversationIds: readonly string[] | null) => Stored<void>;
 
@@ -492,8 +500,14 @@ const makeStore = Effect.fnUntraced(function*({
     getActiveTurns: turns.getActiveTurns(),
     getActiveTurn: (conversationId) => turns.getActiveTurn(conversationId),
     getTurn: (conversationId) => turns.getTurn(conversationId),
-    holdConversations: (conversationIds, reason) => turns.hold(conversationIds, reason),
+    // One that made fewer than all, as another held one of them, or held it as this ran, keeps none.
+    holdConversations: (conversationIds, reason) =>
+      database.transaction((sql) =>
+        Effect.flatMap(repositoriesOn(sql).turns.holdEach(conversationIds, reason), (made) =>
+          made === new Set(conversationIds).size ? Effect.succeed(true) : Effect.fail(new HeldAlready()))
+      ).pipe(Effect.catchTag("HeldAlready", () => Effect.succeed(false))),
     releaseConversations: (conversationIds) => turns.release(conversationIds),
+    isConversationHeld: (conversationId) => turns.isHeld(conversationId),
 
     markPendingAsPosted: (pendingResponseId) => Effect.asVoid(responses.markPendingAsPosted(pendingResponseId)),
     getCompletedResponsesPendingDelivery: responses.getCompletedResponsesPendingDelivery(),

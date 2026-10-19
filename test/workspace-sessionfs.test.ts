@@ -8,6 +8,7 @@ import type { InlineKeyboardMarkup } from "@grammyjs/types";
 import { Effect } from "effect";
 
 import { ActiveTurns } from "../src/harness/active-turns.ts";
+import { HarnessHost } from "../src/harness/host.ts";
 import { Mounts } from "../src/operator/mounts.ts";
 import { buildWorkspacePanel, handleWorkspaceControlCallback, handleWorkspaceTextCommand } from "../src/operator/workspace-control.ts";
 import type { Store } from "../src/persistence/store.ts";
@@ -252,7 +253,7 @@ test("Fork holds every conversation on the workspace busy while it clones, and i
     const source = await mountedVolume(store);
     const other = await run(store.upsertConversation({ chatId: "2", user: { id: 2 } }));
     await run(store.setWorkingDirectory(other, `sessionfs:${source}`));
-    const busy = (conversationId: string) => alasio.runPromise(Effect.flatMap(ActiveTurns, (active) => active.isBusy(conversationId)));
+    const busy = (conversationId: string) => alasio.runPromise(Effect.flatMap(HarnessHost, (host) => Effect.map(host.status(conversationId), (status) => status.busy)));
 
     // A turn in another conversation on the workspace, which the fork would suspend.
     const turnEnds = Promise.withResolvers<void>();

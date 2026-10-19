@@ -6,7 +6,7 @@ import { Effect, Option } from "effect";
 
 import { type TurnError, Turns } from "../codex/turns.ts";
 import { HarnessHost } from "../harness/host.ts";
-import { isBusy, stopTurn } from "../harness/commands.ts";
+import { shownBusy, stopTurn } from "../harness/commands.ts";
 import { type HarnessError, harnessLabelOf, Harnesses, type HarnessUnavailable } from "../harness/index.ts";
 import { Store } from "../persistence/store.ts";
 import type { ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
@@ -61,7 +61,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
   const mount = yield* store.getMount(conversationId);
   // What changes the mount, or stops a turn, needs no harness, which the mount may have none of.
   if (cmd.type === "stop") {
-    if (!(yield* isBusy(conversationId))) {
+    if (!(yield* shownBusy(conversationId))) {
       yield* client.sendMessage(chatId, "No active query to stop.");
       return true;
     }
@@ -123,7 +123,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     return true;
   }
   if (cmd.type === "sessions_new") {
-    if (yield* isBusy(conversationId)) {
+    if (yield* shownBusy(conversationId)) {
       yield* client.sendMessage(chatId, `${harness.displayName} is currently working. Use /stop first, then /sessions new.`);
       return true;
     }

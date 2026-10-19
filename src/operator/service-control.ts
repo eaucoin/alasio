@@ -2,7 +2,7 @@ import { Effect } from "effect";
 
 import type { ConversationChat } from "../codex/turns.ts";
 import { HarnessHost } from "../harness/host.ts";
-import { isBusy } from "../harness/commands.ts";
+import { shownBusy } from "../harness/commands.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS, HARNESS_NAMES, harnessDisplayName, normalizeHarnessName } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
@@ -80,7 +80,7 @@ export function buildServicePanel({ conversation, working, notice = "" }: Servic
 
 /** The conversation's service panel as it stands, with `notice` under it. */
 const servicePanel = Effect.fnUntraced(function*(conversationId: string, notice?: string): Effect.fn.Return<ControlPanel, StoreError, Store | HarnessHost> {
-  const working = yield* isBusy(conversationId);
+  const working = yield* shownBusy(conversationId);
   const conversation = yield* Effect.flatMap(Store, (store) => store.getConversation(conversationId));
   return yield* keepPanel(conversationId, buildServicePanel({ conversation, working, notice }));
 });

@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { Effect, Exit } from "effect";
+import { Effect, Exit, Layer } from "effect";
 
+import { CodexAppServer } from "../src/codex/app-server/client.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { holdConversations } from "../src/harness/holds.ts";
+import { HarnessHost } from "../src/harness/host.ts";
+import { Harnesses } from "../src/harness/index.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
-import { TurnFenced } from "../src/persistence/store.ts";
+import { Store, TurnFenced } from "../src/persistence/store.ts";
 import { holdsIn, newSchema, run, testPool, testStore } from "./support/store.ts";
 
 /** A conversation of Codex's in a new store, in `schema`, and a turn claim of it. */
@@ -166,18 +169,42 @@ test("a fork's hold is a row of the store while it lasts, held only where no tur
   const reasons = () => holdsIn(schema);
   await Effect.runPromise(Effect.gen(function*() {
     const activeTurns = yield* ActiveTurns;
+    const host = yield* HarnessHost;
     yield* Effect.scoped(Effect.gen(function*() {
-      assert.equal(yield* holdConversations(activeTurns, store, [conversationId], "forking session fs-a into fs-b"), true);
+      assert.equal(yield* holdConversations(host, store, [conversationId], "forking session fs-a into fs-b"), true);
       assert.deepEqual(yield* Effect.promise(reasons), [[conversationId, "forking session fs-a into fs-b"]]);
-      assert.equal(yield* activeTurns.isBusy(conversationId), true);
-      assert.equal(yield* activeTurns.reserve(conversationId), false);
+      assert.deepEqual([(yield* host.status(conversationId)).busy, (yield* host.status(conversationId)).held], [true, true]);
+      assert.equal(yield* Effect.scoped(host.reserve(conversationId)), false);
+      // A second hold of it, while the first lasts, is none.
+      assert.equal(yield* Effect.scoped(holdConversations(host, store, [conversationId], "forking again")), false);
+      assert.deepEqual(yield* Effect.promise(reasons), [[conversationId, "forking session fs-a into fs-b"]]);
     }));
     assert.deepEqual(yield* Effect.promise(reasons), []);
     // A turn runs: no hold, and no row.
     yield* Effect.scoped(Effect.gen(function*() {
       yield* activeTurns.register(conversationId, { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false });
-      assert.equal(yield* holdConversations(activeTurns, store, [conversationId], "forking"), false);
+      assert.equal(yield* holdConversations(host, store, [conversationId], "forking"), false);
       assert.deepEqual(yield* Effect.promise(reasons), []);
     }));
-  }).pipe(Effect.provide(ActiveTurns.layer)));
+  }).pipe(Effect.provide(HarnessHost.layer.pipe(
+    Layer.provideMerge(Harnesses.layer({})),
+    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, Layer.succeed(Store, store))),
+  ))));
+});
+
+test("holds of conversations some of which are the same, made at once, are each all of their conversations or none, leaving no row of one that held none", async () => {
+  const { store, schema } = await conversation();
+  const [a, b, c] = await Promise.all(["11", "12", "13"].map((chatId) => run(store.upsertConversation({ chatId, user: { id: Number(chatId) } }))));
+  if (!a || !b || !c) throw new Error("the conversations were not made");
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const hold = (ids: readonly string[]): Promise<boolean> => run(store.holdConversations(ids, `forking ${ids.join(" and ")}`));
+    const held: readonly boolean[] = await Promise.all([hold([a, b]), hold([b, c])]);
+    const first = held[0] === true;
+    const second = held[1] === true;
+    const rows = (await holdsIn(schema)).map(([conversationId]) => conversationId).sort();
+    // b is one's or the other's: the one that has it holds all of its, and the other none.
+    assert.ok(first !== second, `attempt ${attempt}: ${first} and ${second}`);
+    assert.deepEqual(rows, (first ? [a, b] : [b, c]).sort(), `attempt ${attempt}`);
+    await run(store.releaseConversations(null));
+  }
 });

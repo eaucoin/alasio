@@ -3,7 +3,7 @@ import { Effect } from "effect";
 import { type ConversationBusy, Turns } from "../codex/turns.ts";
 import type { ListedSession } from "../harness/claude/sessions.ts";
 import { HarnessHost } from "../harness/host.ts";
-import { isBusy, stopTurn } from "../harness/commands.ts";
+import { shownBusy, stopTurn } from "../harness/commands.ts";
 import type { Harness, HarnessError, HarnessUnavailable, NoServiceMounted } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
@@ -170,7 +170,7 @@ const buildCurrentSessionPanel = Effect.fnUntraced(function*({ harness, conversa
   }
   const lastMessage = yield* harness.sessions.getSessionLastMessage(sessionId);
   const tokens = yield* sessionTokens(sessionId);
-  const active = yield* isBusy(conversationId);
+  const active = yield* shownBusy(conversationId);
   const lines = [
     `Current Session (${harness.displayName})`,
     "",
@@ -354,7 +354,7 @@ export const handleSessionControlCallback = Effect.fnUntraced(function*({
   } else if (kind === "current") {
     panel = yield* current;
   } else if (kind === "new") {
-    if (yield* isBusy(conversationId)) {
+    if (yield* shownBusy(conversationId)) {
       notice = `${harness.displayName} is currently working.`;
     } else {
       const sessionId = yield* Effect.flatMap(Turns, (turns) => turns.startNewSession(conversationId));
