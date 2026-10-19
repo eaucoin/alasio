@@ -18,12 +18,10 @@ import { isAbsolute, join, resolve } from "node:path";
 import { Effect, Schema } from "effect";
 
 import type { StoreError } from "../persistence/sql.ts";
-import type { FileRead, SessionSandboxes } from "../sandbox/index.ts";
+import { type FileRead, SANDBOX_HOME, type SessionSandboxes } from "../sandbox/index.ts";
 import type { ChatId, MediaAttachment, SendMessageOptions } from "../telegram/client.ts";
 import { MEDIA_LIMITS, type ResolvedEmbed, findMediaEmbeds, overLimitNote, placeMedia, sniffMedia } from "../telegram/rich-media.ts";
 import { parseWorkspace, type Workspace } from "../workspace/kind.ts";
-
-const SANDBOX_HOME = "/home/agent";
 
 /** What makeReplyMedia is given; see there. */
 export interface ReplyMediaOptions {

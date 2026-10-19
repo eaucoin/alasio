@@ -1,13 +1,12 @@
 /**
- * Whole-sandbox snapshots of the sandbox gateway's session workspaces, as alasio's own
- * Sandboxes' were, of a bound pool pod rather than of a Sandbox: a workspace, of an
- * environment's sessions' namespace, released is saved whole by the node agent on its pod's node
- * (../sandbox/node-agents.ts), bayma told first (`bayma sandbox-hook`), which ends it; and the
+ * Whole-sandbox snapshots of the sandbox gateway's session workspaces, each of a bound pool
+ * pod: a workspace, of an environment's sessions' namespace, released is saved whole by the
+ * node agent on its pod's node (../sandbox/node-agents.ts), bayma told first (`bayma sandbox-hook`), which ends it; and the
  * snapshot it was released into is recorded with the workspace (its node agents' record of it,
  * ../node-agent/workspaces.ts Released), while the gateway holds its binding's Lease, as every
  * read and write of the record is, for its next bind to restore it.
  *
- * A save comes to an outcome, each counted (alasio.sandbox.releases), as alasio's did:
+ * A save comes to an outcome, each counted (alasio.sandbox.releases):
  * snapshotted, into the snapshot it took; kept, as its pod runs no bayma under gVisor, which
  * the gateway then releases unsaved, its pod deleted, as a pool's pods are for it to reuse;
  * lost, its sandbox ended by a save that failed, its REPLs with it; unsaveable, as the agent

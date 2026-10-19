@@ -25,7 +25,7 @@
  * sync's rules or none.
  *
  * Nothing of the rules names the pod but its name and namespace, which a pod before it of
- * the same Sandbox shares, and its address, which that pod may have had: until a sync
+ * the same name shares, and its address, which that pod may have had: until a sync
  * after the new pod has its address, the old one's rules hold it, run through the network
  * policies that selected the old one. They are the new one's only where the same
  * policies select it, which the jumps' comments name: a pod's are held to name those

@@ -112,7 +112,7 @@ export function folderOfKey(key: string): { readonly harness: string; readonly c
  * Where the folder instance of `conversation` under `harness` keeps its state, under
  * `stateRoot`: bayma leases its state directory to a single server, and a Codex thread keeps
  * its server alive after the conversation switches to Claude, so the directory is keyed by
- * harness as well as conversation, as a folder's Sandbox kept it.
+ * harness as well as conversation.
  */
 export const folderStateDir = (stateRoot: string, harness: string, conversation: string): string =>
   posix.join(stateRoot, sanitizePathToken(harness), sanitizePathToken(conversation));
@@ -123,8 +123,8 @@ export const FOLDER_POD = /^bayma-[0-9a-f]{16}-[0-9a-z]{5}$/u;
 
 /** The Secret of a folder instance's pod `pod`'s binding's token, which its bayma takes requests with, mounted where FOLDER_TOKEN_FILE is. */
 export const folderTokenSecret = (pod: string): string => `${pod}-bayma-token`;
-export const FOLDER_TOKEN_VOLUME = "alasio-bayma-token";
-export const FOLDER_TOKEN_DIRECTORY = "/run/alasio/bayma";
+const FOLDER_TOKEN_VOLUME = "alasio-bayma-token";
+const FOLDER_TOKEN_DIRECTORY = "/run/alasio/bayma";
 export const FOLDER_TOKEN_FILE = `${FOLDER_TOKEN_DIRECTORY}/token`;
 
 /**

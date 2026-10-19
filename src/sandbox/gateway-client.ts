@@ -37,13 +37,13 @@ export type NetMode = "none" | "full";
 /** How long a caller's token alasio mints is good for: past any turn, as a turn's bayma is reached by one minted as it starts. */
 export const TOKEN_TTL_MS = 6 * 60 * 60_000;
 /** How long a bind asked ahead is asked again for, while the gateway's pool has no pod for it. */
-export const BIND_WAIT_MS = 5 * 60_000;
+const BIND_WAIT_MS = 5 * 60_000;
 /** How long a call of the gateway's may take, in ms, but a bind's and a release's, which wait for a pod and a save. */
 const CALL_TIMEOUT_MS = 60_000;
 /** How long a bind or a release may take, in ms: a restore's, or a save's, with room. */
 const LONG_CALL_TIMEOUT_MS = 10 * 60_000;
 /** How long a folder instance's bind or release may take, in ms: as long as the gateway gives a bind of it, with room. */
-export const FOLDER_CALL_TIMEOUT_MS = folderBindMs() + 60_000;
+const FOLDER_CALL_TIMEOUT_MS = folderBindMs() + 60_000;
 
 /** What the gateway refused, or what failed reaching it. */
 export class GatewayError extends Schema.TaggedError<GatewayError>()("GatewayError", {

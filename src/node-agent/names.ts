@@ -71,7 +71,7 @@ export function restoresFromBucket(release: string, since: string): boolean {
  * Whether gVisor's `release` is the fork's `since` or one past it, by its base's date and
  * patch, then its own number; never where either names no release of the fork's.
  */
-export function releaseAtOrPast(release: string, since: string): boolean {
+function releaseAtOrPast(release: string, since: string): boolean {
   const parts = (named: string) => {
     const matched = /^(\d{8})\.(\d+)-eaucoin\.(\d+)$/u.exec(named);
     return matched ? matched.slice(1).map(Number) : null;

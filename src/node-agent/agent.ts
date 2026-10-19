@@ -26,7 +26,7 @@
  * is compacted, after its commit and beside whatever else the agent does, one at a time on
  * the node at its lowest priority: its images into one, the image of a new snapshot
  * `compactedFrom` it, committed as the current one only if the workspace has not moved on
- * from it meanwhile. It is the same sandbox at the same moment, so a Sandbox released into
+ * from it meanwhile. It is the same sandbox at the same moment, so a workspace released into
  * the one is restored from the other, which is the next delta's base. A snapshot taken live
  * is never compacted, its sandbox running on from it: one whose parent's chain would be due
  * with it is taken whole instead, which cuts the chain the sandbox goes on extending.
@@ -84,7 +84,7 @@ import type { S3Bucket, S3Error } from "./s3.ts";
 import type { StoreProxy, StoreToken, Transport } from "./store-proxy.ts";
 import { hostPathOf, readUnder, type UnderRoot } from "./volume.ts";
 
-/** An environment's or a workspace's name: a DNS label, as their namespaces' and Sandboxes' names are. */
+/** An environment's or a workspace's name: a DNS label, as their namespaces' names are. */
 const Name = Schema.String.check(Schema.isPattern(NAME));
 
 /** A snapshot's id, as snapshotId makes one. */
@@ -173,7 +173,7 @@ export const Manifest = Schema.Struct({
   /** For a snapshot taken live, what it caught: it holds the session only while bayma's state generation is that one. */
   live: Schema.optional(Caught),
   /**
-   * For a snapshot of a compacted image, the snapshot whose memory it holds, as a Sandbox
+   * For a snapshot of a compacted image, the snapshot whose memory it holds, as a workspace
    * released into that one names it: the same sandbox, at the same moment, in one image.
    */
   compactedFrom: Schema.optional(SnapshotId),

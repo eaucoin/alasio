@@ -37,7 +37,7 @@ import { assertValidVolumeId } from "./names.ts";
 export type { NetMode } from "./gateway-client.ts";
 
 /** Where a session sees its workspace's files, and its home's, as a pool's pod lays them out (cli/src/manifests/sandbox-gateway.ts poolTemplate). */
-export const SANDBOX_WORKSPACE = "/workspace";
+const SANDBOX_WORKSPACE = "/workspace";
 export const SANDBOX_HOME = "/home/agent";
 
 /** A file read to attach to a reply: its bytes, or a note saying why it is not attached. */
@@ -84,7 +84,7 @@ export interface Inheritance {
 }
 
 /** What SessionSandboxes is made with; see there. */
-export interface SessionSandboxesOptions {
+interface SessionSandboxesOptions {
   /** The gateway, and alasio's environment's name and key to it. */
   readonly gateway: GatewayWorkspacesOptions;
   /** alasio's state directory, under which each session's harness directory lives. */

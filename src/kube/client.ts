@@ -115,7 +115,7 @@ const call = <A>(request: () => Promise<A>): Effect.Effect<A, KubeApiError> =>
 
 /**
  * The Kubernetes API, as alasio calls it. Objects are addressed by `apiVersion`, `kind`,
- * namespace and name, so one set of calls serves core objects and agent-sandbox's alike.
+ * namespace and name, so one set of calls serves every kind alike.
  */
 export class KubeClient extends Context.Service<KubeClient, {
   /** The object, or null when there is none. */

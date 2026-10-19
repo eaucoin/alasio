@@ -54,7 +54,7 @@ create table if not exists ${SCHEMA}.workspace_sessions (
 );
 
 -- The session filesystems alasio made, and those it is making: a fork is recorded before
--- its Sandbox is made, and made only once it is cloned, so one a crash cut short is known.
+-- its workspace is made, and made only once it is cloned, so one a crash cut short is known.
 create table if not exists ${SCHEMA}.session_workspaces (
   volume_id text primary key,
   -- the session filesystem it is a fork of; null for one made empty
