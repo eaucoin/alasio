@@ -48,6 +48,7 @@ import {
   restrictedContainer,
   s3Endpoint,
   selectorLabels,
+  sleeps,
   stackLabels,
   stackPodSpec,
 } from "./common.ts";
@@ -191,7 +192,11 @@ function loaderObjects(config: InstallConfig, environment: Environment): Kuberne
     },
   };
   const scaledObjects = scaledObject(deployment, scaling, [lagTrigger(group, topic, 1, name)]);
-  return [deployment, ...(scaledObjects.length > 0 ? [logAuthentication(name, namespace, LOADER_COMPONENT), ...scaledObjects] : []), verticalPodAutoscaler(deployment, "InPlace")];
+  return [
+    deployment,
+    ...(scaledObjects.length > 0 ? [logAuthentication(name, namespace, LOADER_COMPONENT), ...scaledObjects] : []),
+    verticalPodAutoscaler(deployment, "InPlace", sleeps(scaling) ? ["memory"] : undefined),
+  ];
 }
 
 /**
@@ -436,7 +441,7 @@ function intakeObjects(config: InstallConfig): KubernetesObject[] {
     deployment,
     ...(scaledObjects.length > 0 ? [logAuthentication(name, NAMESPACE, INTAKE_COMPONENT), ...scaledObjects] : []),
     ...replicaBudget(INTAKE_COMPONENT, NAMESPACE, scaling),
-    verticalPodAutoscaler(deployment, "InPlace"),
+    verticalPodAutoscaler(deployment, "InPlace", sleeps(scaling) ? ["memory"] : undefined),
   ];
 }
 
