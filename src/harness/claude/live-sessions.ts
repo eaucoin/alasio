@@ -260,6 +260,10 @@ const needed = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, ClaudeCodeE
 const waitingOf = (params: TurnParams) => (what: string | null): Effect.Effect<void> =>
   params.persistence.setWaiting(what).pipe(Effect.catch((error) => Effect.logWarning(`could not say thread=${params.threadKey} waits on ${what ?? "nothing"}: ${error.message}`)));
 
+/** What a turn is told before its prompt where its process could not be given its bayma anew, its bearer lapsing. */
+const renewalNotice = (workspace: string, reason: string): string =>
+  `Workspace ${workspace}: its bayma could not be given its credentials anew (${reason}). This turn may run without bayma's REPL tools; your REPL sessions are kept and come back on a later turn.`;
+
 /** Now, as a log line gives it. */
 const now = Effect.map(Clock.currentTimeMillis, (millis) => new Date(millis).toISOString());
 
@@ -929,10 +933,18 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       // Its bearer about to lapse: given its server anew, the bearer fresh, the process kept,
       // its MCP client connecting to it afresh, as the Agent SDK replaces a server it is given.
       const renewed = !lapsing ? null : bayma ? { bayma: { type: "http" as const, url: bayma.url, headers: bayma.headers } } : folder?.server ? claudeMcpServers(folder.server) : null;
+      // Given anew only where it took it: one that did not, or whose update failed, is given it
+      // again the next turn, and one whose update failed runs this turn told so, without it.
       if (renewed) {
-        const set = yield* attempt(() => existing.sdkQuery.setMcpServers(renewed));
-        if (Object.keys(set.errors).length > 0) yield* Effect.logWarning(`giving thread=${params.threadKey} its bayma anew failed: ${JSON.stringify(set.errors)}`);
-        existing.baymaGivenAt = now;
+        const set = yield* Effect.result(attempt(() => existing.sdkQuery.setMcpServers(renewed)));
+        if (set._tag === "Failure") {
+          yield* Effect.logWarning(`giving thread=${params.threadKey} its bayma anew failed: ${set.failure.message}`);
+          existing.baymaNotice = renewalNotice(workingDirectory, set.failure.message);
+        } else if (Object.keys(set.success.errors).length > 0) {
+          yield* Effect.logWarning(`giving thread=${params.threadKey} its bayma anew failed: ${JSON.stringify(set.success.errors)}`);
+        } else {
+          existing.baymaGivenAt = now;
+        }
       }
       return existing;
     }

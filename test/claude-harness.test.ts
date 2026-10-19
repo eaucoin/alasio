@@ -727,6 +727,8 @@ interface FakeCliState {
   readonly options: Options[];
   /** The MCP servers each process was given anew, in turn. */
   readonly serversGiven: Record<string, unknown>[];
+  /** How the process answers being given them: taking them, saying they failed to connect, or failing. */
+  serversTaken: "taken" | "errors" | "throws";
 }
 
 /**
@@ -738,7 +740,7 @@ function createFakeCli() {
   let wake: (() => void) | null = null;
   const prompts: SDKUserMessage[] = [];
   const promptWaiters: ((message: SDKUserMessage) => void)[] = [];
-  const state: FakeCliState = { created: 0, closed: 0, interrupts: 0, consumed: 0, options: [], serversGiven: [] };
+  const state: FakeCliState = { created: 0, closed: 0, interrupts: 0, consumed: 0, options: [], serversGiven: [], serversTaken: "taken" };
   function emit(message: SDKMessage): void {
     outbox.push(message);
     wake?.();
@@ -797,7 +799,8 @@ function createFakeCli() {
       },
       setMcpServers: async (servers) => {
         state.serversGiven.push(servers);
-        return { added: Object.keys(servers), removed: [], errors: {} };
+        if (state.serversTaken === "throws") throw new Error("the CLI is gone");
+        return { added: Object.keys(servers), removed: [], errors: state.serversTaken === "errors" ? { bayma: "connection refused" } : {} };
       },
     });
   };
@@ -1281,6 +1284,40 @@ test("a reused process's folder bayma is bound before each of its turns, and a t
   assert.equal(await run("three"), "three");
   assert.deepEqual([asked, cli.state.created], [3, 1], "bound before each turn, the process kept");
   assert.deepEqual(persistence.state.waits.slice(0, 2), ["its folder's bayma, whose image is being pulled", null], "said in the turn's status");
+  await closeAll();
+});
+
+test("a process not given its bayma anew, as the update said its server failed, is given it again the next turn; one whose update failed runs the turn told so, the process kept", async () => {
+  const persistence = createPersistence();
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const { liveSessions, closeAll } = openLiveSessions({
+    workingDirectory: "/work",
+    sessions: { sessionExists: () => Effect.succeed(true) },
+    queryFactory: cli.queryFactory,
+    baymaBearerLifeMs: 300,
+    folderBayma: (scope) => Effect.succeed<FolderBaymaOutcome>({ server: folderServer(scope), notice: null }),
+  }, activeTurns);
+  const run = async (prompt: string) => {
+    const turn = runTurn(liveSessions, turnParams(persistence, { prompt }));
+    const received = await cli.nextPrompt();
+    cli.emit(successResult({ result: "done", session_id: "s-1", user_message_uuids: [received.uuid] }));
+    await turn;
+    return received.message.content;
+  };
+  cli.emit(initMessage("s-1"));
+  await run("one");
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  cli.state.serversTaken = "errors";
+  assert.equal(await run("two"), "two");
+  // Asked again, as it was not given it.
+  cli.state.serversTaken = "throws";
+  assert.match(String(await run("three")), /^Workspace \/work: its bayma could not be given its credentials anew \(.*the CLI is gone.*\)\. [^]*\n\nthree$/u);
+  cli.state.serversTaken = "taken";
+  assert.equal(await run("four"), "four");
+  // Given it at last: not again until its bearer nears its end anew.
+  assert.equal(await run("five"), "five");
+  assert.deepEqual([cli.state.serversGiven.length, cli.state.created], [3, 1]);
   await closeAll();
 });
 
