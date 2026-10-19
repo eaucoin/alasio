@@ -370,7 +370,8 @@ export const handleGoalTextCommand = Effect.fnUntraced(function*({ conversationI
   const store = yield* Store;
   const client = yield* TelegramClient;
   const isTurnActive = yield* shownBusy(conversationId);
-  const stopActiveTurn = stopTurn(conversationId, "interrupt");
+  // The goal's change is made whether or not a host elsewhere stops its turn, which is said.
+  const stopActiveTurn = stopTurn(conversationId, "interrupt").pipe(Effect.catch((error) => Effect.logWarning(`could not stop ${conversationId}'s turn: ${error.message}`)));
   const trimmed = String(args ?? "").trim();
   if (!trimmed) {
     return yield* sendGoalPanel({ conversationId, chatId, isTurnActive, goals });
@@ -446,7 +447,8 @@ export const handleGoalControlCallback = Effect.fnUntraced(function*({
   const client = yield* TelegramClient;
   const { conversationId } = action;
   const isTurnActive = yield* shownBusy(conversationId);
-  const stopActiveTurn = stopTurn(conversationId, "interrupt");
+  // The goal's change is made whether or not a host elsewhere stops its turn, which is said.
+  const stopActiveTurn = stopTurn(conversationId, "interrupt").pipe(Effect.catch((error) => Effect.logWarning(`could not stop ${conversationId}'s turn: ${error.message}`)));
   const kind = action.kind.slice(GOAL_KIND_PREFIX.length);
   const payload = action.payload ?? {};
   const edit = (draft: PanelDraft) => Effect.flatMap(keepPanel(conversationId, draft), (panel) => editPanel(chatId, messageId, panel));

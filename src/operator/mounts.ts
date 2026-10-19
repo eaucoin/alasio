@@ -124,7 +124,10 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
 
   /** Refuses a change while a turn runs in the conversation or prompts wait for its service; `doing` is the change, as the operator is told. */
   const unblocked = Effect.fnUntraced(function*(conversationId: string, doing = "switching services"): Effect.fn.Return<void, MountRefused | StoreError> {
-    if ((yield* host.status(conversationId)).busy) {
+    const status = yield* host.status(conversationId).pipe(
+      Effect.catchTag("HarnessHostError", (error) => Effect.fail(new MountRefused({ message: `${error.message}, so whether it is working cannot be told. Try again once it answers.` }))),
+    );
+    if (status.busy) {
       const mount = yield* store.getMount(conversationId);
       return yield* new MountRefused({ message: `${harnessLabelOf(mount)} is currently working. Stop the active turn before ${doing}.` });
     }
@@ -234,6 +237,7 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
       const volumeId = newVolumeId();
       const forked = yield* whileHeld(host, store, [...mounting], `forking session ${source.volumeId} into ${volumeId}`, (begun) =>
         recorded(volumeId, source.volumeId, sandbox.volumes.fork(source.volumeId, volumeId, { permitted: begun }))).pipe(
+        Effect.catchTag("HarnessHostError", (error) => Effect.fail(new MountRefused({ message: `${error.message}, so whether a turn runs on this session workspace cannot be told. Fork it once it answers.` }))),
         Effect.catchTag(["HoldLost", "HoldOverran"], (error) => Effect.fail(new MountRefused({ message: `The fork stopped: ${error.message}. Fork it again.` }))),
         Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })),
       );

@@ -169,8 +169,7 @@ const makeTurns = Effect.fnUntraced(function*() {
   const host = yield* HarnessHost;
   /**
    * Whether no turn may start in the conversation, as its host says; where it cannot say,
-   * the store it reads the holds of failing, not busy, said so: what would start then
-   * fails as the store does, saying why.
+   * a host elsewhere not reached, not busy, said so: what would start then fails, saying why.
    */
   const isBusy = (conversationId: string): Effect.Effect<boolean> =>
     host.status(conversationId).pipe(

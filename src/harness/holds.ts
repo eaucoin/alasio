@@ -28,6 +28,7 @@ import { Deferred, Duration, Effect, Option, Schedule, Schema } from "effect";
 import type { StoreError } from "../persistence/sql.ts";
 import type { Store } from "../persistence/store.ts";
 import type { HarnessHost } from "./host.ts";
+import type { HarnessHostError } from "./index.ts";
 
 /** How long a hold lasts unless its holder renews it. */
 export const HOLD_TTL = Duration.minutes(2);
@@ -101,7 +102,7 @@ export const whileHeld = <A, E, R>(
   reason: string,
   work: (begun: Effect.Effect<void>) => Effect.Effect<A, E, R>,
   { ttl = HOLD_TTL, renewal = HOLD_RENEWAL, deadline = HOLD_DEADLINE, letGoAgain = LET_GO_AGAIN }: HoldTiming = {},
-): Effect.Effect<Option.Option<A>, E | StoreError | HoldLost | HoldOverran, R> =>
+): Effect.Effect<Option.Option<A>, E | StoreError | HarnessHostError | HoldLost | HoldOverran, R> =>
   Effect.uninterruptibleMask((restore) =>
     Effect.gen(function*() {
       const ttlMs = Duration.toMillis(Duration.fromInputUnsafe(ttl));

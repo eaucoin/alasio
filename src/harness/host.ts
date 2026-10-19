@@ -20,7 +20,7 @@ import type { ModelChoice, Mount } from "../persistence/conversation-repository.
 import type { StoreError } from "../persistence/sql.ts";
 import { Store, type TurnFenced } from "../persistence/store.ts";
 import { ActiveTurns, type StopReason } from "./active-turns.ts";
-import { type AttachedTurn, type Harness, type HarnessError, Harnesses, type HarnessUnavailable, type OwnTurn, type OwnTurns, type TurnResult } from "./index.ts";
+import { type AttachedTurn, type Harness, type HarnessError, Harnesses, type HarnessHostError, type HarnessUnavailable, type OwnTurn, type OwnTurns, type TurnResult } from "./index.ts";
 import type { HarnessName } from "./names.ts";
 
 /** A turn for the host to run: where, on what, and as which claim of the conversation. */
@@ -79,7 +79,7 @@ export class HarnessHost extends Context.Service<HarnessHost, {
    * holds it. The host held first and the store read after, as a hold is made the other way
    * round (../harness/holds.ts), so a hold and a turn begun at once do not both go on.
    */
-  readonly reserve: (conversationId: string) => Effect.Effect<boolean, StoreError, Scope.Scope>;
+  readonly reserve: (conversationId: string) => Effect.Effect<boolean, StoreError | HarnessHostError, Scope.Scope>;
   /**
    * Runs a turn to its end, its conversation busy meanwhile. It fails only as alasio's
    * store does, with TurnFenced where another turn has claimed the conversation since, or
@@ -88,10 +88,10 @@ export class HarnessHost extends Context.Service<HarnessHost, {
   readonly startTurn: (start: TurnStart) => Effect.Effect<TurnResult, StoreError | TurnFenced | HarnessUnavailable>;
   /** Sends the conversation's running turn more guidance: whether it took it, or none when no turn runs. */
   readonly steer: (conversationId: string, prompt: string) => Effect.Effect<Option.Option<boolean>, HarnessError>;
-  /** Stops the conversation's running turn for `reason`, once it has let go: whether one ran. */
-  readonly interrupt: (conversationId: string, reason: StopReason) => Effect.Effect<boolean>;
-  /** What the host says of the conversation, failing where the store it reads the holds of does. */
-  readonly status: (conversationId: string) => Effect.Effect<HarnessStatus, StoreError>;
+  /** Stops the conversation's running turn for `reason`, once it has let go: whether one ran; failing where a host elsewhere is not reached. */
+  readonly interrupt: (conversationId: string, reason: StopReason) => Effect.Effect<boolean, HarnessHostError>;
+  /** What the host says of the conversation; failing where it cannot say, a host elsewhere not reached. */
+  readonly status: (conversationId: string) => Effect.Effect<HarnessStatus, StoreError | HarnessHostError>;
   /** A new, empty session of `harness` in `workingDirectory` for the conversation: its id. */
   readonly startFreshSession: (params: { readonly conversationId: string; readonly harness: HarnessName; readonly workingDirectory: string }) => Effect.Effect<string, HarnessError | HarnessUnavailable>;
   /** What the panels reach of the mount's harness in its folder; none until both are mounted. */

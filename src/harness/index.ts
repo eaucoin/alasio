@@ -137,7 +137,7 @@ export interface ModelOption {
 }
 
 /** What a harness's call failed with, its message the one the operator is shown. */
-export type HarnessError = CodexSessionError | NoActiveTurn | ClaudeCodeError;
+export type HarnessError = CodexSessionError | NoActiveTurn | ClaudeCodeError | HarnessHostError;
 
 /** A harness's sessions of one working directory, as the operator's panels list, rewind, and resume them. */
 export interface HarnessSessions {
@@ -260,8 +260,23 @@ export const folderRefusedOnBranch = (branch: string): string =>
   `This is the branch environment ${branch}, which works on copies of alasio's data. A folder is this machine's own files, ` +
   "which cannot be copied on write, so a branch never works in one: use /workspace for a session workspace.";
 
-/** Why there is no harness to give: none of that name, no folder, or a workspace the deployment cannot serve, or a branch must not. */
-export type HarnessUnavailable = UnknownHarness | NoWorkspaceMounted | SessionFilesystemsDisabled | FolderOnBranch;
+/**
+ * The conversation's harness host, elsewhere, not reached, or failing a call with what no
+ * host of alasio's fails with, as `reason` says.
+ */
+export class HarnessHostError extends Schema.TaggedError<HarnessHostError>()("HarnessHostError", {
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return `The conversation's harness could not be reached: ${this.reason}`;
+  }
+}
+
+/**
+ * Why there is no harness to give: none of that name, no folder, a workspace the
+ * deployment cannot serve or a branch must not, or a host elsewhere not reached.
+ */
+export type HarnessUnavailable = UnknownHarness | NoWorkspaceMounted | SessionFilesystemsDisabled | FolderOnBranch | HarnessHostError;
 
 /** What Harnesses.layer is given: what harnesses are made with, and test doubles. */
 export interface HarnessesOptions extends Partial<Pick<HarnessOptions, "sessionStore" | "codexRollouts" | "sessionFsCodexRollouts" | "claudeQueryFactory">> {

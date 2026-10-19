@@ -6,7 +6,7 @@ import { Effect, Option } from "effect";
 
 import { type TurnError, Turns } from "../codex/turns.ts";
 import { HarnessHost } from "../harness/host.ts";
-import { shownBusy, stopTurn } from "../harness/commands.ts";
+import { shownBusy, stopTurnSaying } from "../harness/commands.ts";
 import { type HarnessError, harnessLabelOf, Harnesses, type HarnessUnavailable } from "../harness/index.ts";
 import { Store } from "../persistence/store.ts";
 import type { ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
@@ -67,8 +67,8 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     }
     const label = harnessLabelOf(mount);
     const [status] = yield* client.sendMessage(chatId, `Stopping ${label}...`);
-    const interrupted = yield* stopTurn(conversationId, "interrupt");
-    const text = interrupted ? `${label} stopped.` : "No active query to stop.";
+    const interrupted = yield* stopTurnSaying(conversationId, "interrupt");
+    const text = typeof interrupted === "string" ? interrupted : interrupted ? `${label} stopped.` : "No active query to stop.";
     if (status?.message_id) {
       yield* client.editMessageText(chatId, status.message_id, text, { format: "plain" }).pipe(Effect.ignore);
     } else {

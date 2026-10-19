@@ -62,7 +62,10 @@ export const takeCallbackQuery = Effect.fnUntraced(function*(callbackQuery: Call
   // Every button alasio sends carries callback_data; a query without it is no action of alasio's.
   const action = callbackQuery.data === undefined ? null : yield* store.consumeCallbackAction(callbackQuery.data);
   if (!action) return answering(callbackQuery.id, "This action is no longer available.");
-  return handlePress(callbackQuery, action, yield* store.getMount(action.conversationId));
+  return handlePress(callbackQuery, action, yield* store.getMount(action.conversationId)).pipe(
+    // A control its harness host is not reached for says so, as the press is answered.
+    Effect.catchTag("HarnessHostError", (error) => answering(callbackQuery.id, error.message)),
+  );
 });
 
 /** Handles a press taken from the store (takeCallbackQuery): its action, of the conversation `mount` is the mount of. */
