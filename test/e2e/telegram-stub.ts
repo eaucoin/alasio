@@ -15,6 +15,8 @@
  *   GET  /file/bot<token>/<path>     a file the test gave, as getFile names it
  *   POST /control/message            { text, chatId?, userId? } queues a message
  *   POST /control/callback           { data, chatId?, userId?, messageId? } queues a press
+ *   POST /control/file               { fileId, content }: a file, its content base64, which a
+ *                                    photo then names and the file route serves
  *   GET  /control/calls?since=<n>    what alasio has called since the nth call
  *   GET  /control/updates?after=<id> the queued updates after update <id>, waiting a while
  *                                    for one: alasio's tests' alasio takes them so, as it
@@ -396,6 +398,12 @@ export function createTelegramStub({ state }: { readonly state?: string } = {}):
         const sentMessage = message((await readJson(request)) as ControlMessage); // the test posts one
         queue({ message: sentMessage });
         return reply(200, { ok: true, message: sentMessage });
+      }
+      if (url.pathname === "/control/file" && request.method === "POST") {
+        const { fileId, content } = (await readJson(request)) as { fileId?: string; content?: string }; // the test posts one
+        if (!fileId || content === undefined) return reply(400, { ok: false });
+        files.set(fileId, Buffer.from(content, "base64"));
+        return reply(200, { ok: true });
       }
       if (url.pathname === "/control/callback" && request.method === "POST") {
         const press = callback((await readJson(request)) as ControlCallback); // the test posts one

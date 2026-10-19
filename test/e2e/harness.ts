@@ -116,7 +116,7 @@ export function targetOf(value: string | undefined): "host" | "docker" {
 }
 
 /** The shards of the suites, each run on a cluster of its own. */
-export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade"] as const;
+export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents"] as const;
 export type Shard = (typeof SHARDS)[number];
 
 /** The shard `value` names, or none, when it is unset or empty. */
@@ -132,23 +132,29 @@ export function shardOf(value: string | undefined): Shard | undefined {
  * Kubernetes; `workspaces`, workspaces on JuiceFS, on sessions of its own; `neon`,
  * alasio's Neon; `telemetry`, where alasio's telemetry goes, on a session of its own;
  * `branches`, branch environments; `scaling`, how alasio is scaled, sized and drained,
- * with Grafana highly available; `snapshots`, sessions released into whole-sandbox
- * snapshots and restored from them, on an installation that releases them within
- * RELEASE_AFTER_SECONDS; or `upgrade`, what alasio keeps upgraded from the release before;
- * every suite but those two shards' unless set, as each needs an installation of its own.
+ * with Grafana highly available; `agents`, conversations' harnesses in pools of their own,
+ * on an installation that releases an idle one within HARNESS_RELEASE_AFTER_SECONDS;
+ * `snapshots`, sessions released into whole-sandbox snapshots and restored from them, on an
+ * installation that releases them within RELEASE_AFTER_SECONDS; or `upgrade`, what alasio keeps upgraded from the release before;
+ * every suite but those three shards' unless set, as each needs an installation of its own.
  * Each shard runs the command line's suite, and uninstall's, as well.
  */
 export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
 
-/** Whether a run of the shard `selected`, or of none, runs the suites of `shard`: the snapshots and upgrade shards' only when selected. */
-export const runsShard = (selected: Shard | undefined, shard: Shard): boolean =>
-  selected === shard || (selected === undefined && shard !== "snapshots" && shard !== "upgrade");
+/** The shards whose suites need an installation of their own, run only when selected. */
+const OWN_INSTALLATION: readonly Shard[] = ["snapshots", "upgrade", "agents"];
+
+/** Whether a run of the shard `selected`, or of none, runs the suites of `shard`: the snapshots, upgrade and agents shards' only when selected. */
+export const runsShard = (selected: Shard | undefined, shard: Shard): boolean => selected === shard || (selected === undefined && !OWN_INSTALLATION.includes(shard));
 
 /** Whether the run runs the suites of `shard`. */
 export const inShard = (shard: Shard): boolean => runsShard(SHARD, shard);
 
 /** The release the upgrade shard upgrades from, as `<major>.<minor>.<patch>`. */
 export const PREVIOUS = process.env["ALASIO_E2E_PREVIOUS"] || undefined;
+
+/** How long a conversation's harness of the agents shard does nothing before the gateway releases it. */
+export const HARNESS_RELEASE_AFTER_SECONDS = 45;
 
 /** How long a session of the snapshots and upgrade shards runs no exec, and no turn, before alasio releases it. */
 export const RELEASE_AFTER_SECONDS = 60;
@@ -664,6 +670,16 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
     // release before's agent-sandbox sized, as the box's configuration may say, which the
     // cut-over removes.
     host: { resources: { requests: { cpu: "20m", memory: "128Mi" } }, ...(of === "previous" ? { baymaImage: FOLDER_BAYMA_BEFORE } : {}) },
+    // Conversations' harnesses in pools of their own, as 10.0.0's are, of this checkout's alone, as the release before has none:
+    // released within the run in the agents shard alone, as the other suites' turns are not written to wait on a pool's pod.
+    ...(of === "release"
+      ? {
+        harness: {
+          pools: { enabled: true, scaling: { min: 1, max: 2 }, releaseAfter: SHARD === "agents" ? `${HARNESS_RELEASE_AFTER_SECONDS}s` : "24h" },
+          resources: { requests: { cpu: "20m", memory: "128Mi" } },
+        },
+      }
+      : {}),
     sessions: {
       storage: { size: "1Gi" },
       // The snapshots shard's sessions hold a REPL of BIG_REPL_MEBIBYTES live, with room for bayma and gVisor.
@@ -1132,6 +1148,24 @@ export async function dumpClusterState(): Promise<void> {
         say(`--- ${NAMESPACE}/${name}: its last lines of ${scopes.join(" and ")}`);
         for (const line of logged.trimEnd().split("\n").filter((each) => scopes.some((scope) => each.startsWith(scope))).slice(-80)) say(`  ${line}`);
       }
+    }
+    // The gateway and alasio log why a harness was not bound, reached, or released: each line of
+    // theirs naming a harness's key, and the gateway's own, its binder's said above.
+    for (const component of [GATEWAY_COMPONENT, "alasio"] as const) {
+      for (const pod of await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels(component)) })) {
+        const name = pod.metadata?.name ?? "";
+        const logged = await kube.logs(NAMESPACE, name, component).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        say(`--- ${NAMESPACE}/${name}: its last lines of harnesses`);
+        const told = (each: string) => each.includes("harness:") || each.includes("harness's") || each.startsWith("[sandbox-gateway]");
+        for (const line of logged.trimEnd().split("\n").filter(told).slice(-60)) say(`  ${line}`);
+      }
+    }
+    // And each bound harness pod's own last lines, which a pod ready as it serves shows nowhere else.
+    for (const pod of pods.filter((each) => each.metadata?.annotations?.["alasio.dev/binding-key"]?.startsWith("harness:") && podProblems(each).length === 0)) {
+      const { namespace = "", name = "" } = pod.metadata ?? {};
+      const logged = await kube.logs(namespace, name, "harness").catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+      say(`--- ${namespace}/${name}: the last lines of its harness host`);
+      for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
     }
   } catch (error) {
     say(`the cluster's state could not be read: ${error instanceof Error ? error.message : String(error)}`);

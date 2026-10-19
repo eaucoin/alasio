@@ -6,7 +6,11 @@
  * Codex does, as far as alasio's turns go: threads start, resume and are listed, and each
  * turn is answered with ANSWER as its final answer: at once, or, for a prompt `wait N`, N
  * seconds after it starts, as a turn whose tools run that long; for a prompt `show <path>`,
- * beside the file at `path` of its workspace, shown as an image is. Every request is a server
+ * beside the file at `path` of its workspace, shown as an image is; for a prompt
+ * `bayma later N`, at once, a command left running in the background, its terminal listed,
+ * which N seconds on asks the thread's bayma, as its config names it, to initialize, as Codex's
+ * MCP client does, and says what bayma answered on its standard error (`bayma later: <status>`),
+ * then ends. Every request is a server
  * span named by its method, of the trace alasio sends it in when it does, with the name
  * the client initialized with, exported where alasio's `-c otel.trace_exporter=` says,
  * from the service codex-app-server, as Codex's own are. Each thread's rollout is written
@@ -116,6 +120,31 @@ async function serve(args: readonly string[]): Promise<void> {
   const tracer = trace.getTracer("codex-app-server");
 
   const threads = new Map<string, v2.Thread>();
+  /** Each thread's bayma, as its config named it as it was started or resumed. */
+  const baymaOf = new Map<string, { readonly url: string; readonly http_headers?: Record<string, string> }>();
+  /** Each thread's commands left running in the background, by their item's id. */
+  const background = new Map<string, Set<string>>();
+  /** Remembers the bayma `params`' config names for the thread `threadId`, where it names one. */
+  const keepBayma = (threadId: string, params: { readonly config?: { readonly [key: string]: unknown } | null }) => {
+    const bayma = (params.config?.["mcp_servers"] as { readonly bayma?: { readonly url: string; readonly http_headers?: Record<string, string> } } | undefined)?.bayma;
+    if (bayma) baymaOf.set(threadId, bayma);
+  };
+  /** What the thread's bayma answers an initialize, as Codex's MCP client sends it: its status, or why none. */
+  const initializeBayma = async (threadId: string): Promise<string> => {
+    const bayma = baymaOf.get(threadId);
+    if (!bayma) return "no bayma";
+    try {
+      const response = await fetch(bayma.url, {
+        method: "POST",
+        headers: { ...bayma.http_headers, "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "codex-stand-in", version: "1.0.0" } } }),
+      });
+      await response.body?.cancel();
+      return String(response.status);
+    } catch (error) {
+      return `unreached: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  };
   /** The client's name, once it has initialized. */
   let client: string | undefined;
   const write = (message: object) => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -144,12 +173,16 @@ async function serve(args: readonly string[]): Promise<void> {
       client = clientInfo.name;
       return { ...initializeResponse(), codexHome: process.env["CODEX_HOME"] ?? "" };
     },
-    "thread/start": ({ cwd }) => {
-      const thread = newThread(randomUUID(), cwd ?? process.cwd());
+    "thread/start": (params) => {
+      const thread = newThread(randomUUID(), params.cwd ?? process.cwd());
+      keepBayma(thread.id, params);
       notify({ method: "thread/started", params: { thread } });
       return threadStartResponse(thread);
     },
-    "thread/resume": ({ threadId, cwd }) => threadResumeResponse(threads.get(threadId) ?? newThread(threadId, cwd ?? process.cwd())),
+    "thread/resume": (params) => {
+      keepBayma(params.threadId, params);
+      return threadResumeResponse(threads.get(params.threadId) ?? newThread(params.threadId, params.cwd ?? process.cwd()));
+    },
     "thread/loaded/list": () => ({ data: [...threads.keys()], nextCursor: null }),
     "thread/list": ({ cwd }) => ({
       data: [...threads.values()].filter((thread) => cwd == null || thread.cwd === cwd).map((thread) => ({ ...thread, turns: [] })),
@@ -159,6 +192,11 @@ async function serve(args: readonly string[]): Promise<void> {
     "thread/turns/list": ({ threadId }) => ({ data: [...(threads.get(threadId)?.turns ?? [])].reverse(), nextCursor: null, backwardsCursor: null }),
     "model/list": () => ({ data: [codexModel(ALASIO_CODEX_MODEL, { isDefault: true })], nextCursor: null }),
     "thread/goal/get": () => ({ goal: null }),
+    // A thread's commands left running in the background, which a `bayma later` turn leaves; none of the others'.
+    "thread/backgroundTerminals/list": ({ threadId }) => ({
+      data: [...(background.get(threadId) ?? [])].map((itemId) => ({ itemId, processId: itemId, command: "bayma later", cwd: threads.get(threadId)?.cwd ?? "", osPid: null, cpuPercent: null, rssKb: null })),
+      nextCursor: null,
+    }),
     "turn/interrupt": () => ({}),
     "turn/start": ({ threadId, input }, span) => {
       const thread = threads.get(threadId);
@@ -177,6 +215,18 @@ async function serve(args: readonly string[]): Promise<void> {
       record(threadId, "response_item", { type: "message", role: "assistant", content: [{ type: "output_text", text: said }] });
       record(threadId, "event_msg", { type: "task_complete", turn_id: turn.id, last_agent_message: said, duration_ms: 0 });
       threads.set(threadId, { ...thread, preview: thread.preview || text, updatedAt: now(), turns: [...thread.turns, done] });
+      // Its command left running in the background, which asks bayma once its time is over, and ends.
+      const later = /^bayma later (\d+)$/u.exec(text)?.[1];
+      if (later !== undefined) {
+        const itemId = randomUUID();
+        background.set(threadId, (background.get(threadId) ?? new Set()).add(itemId));
+        setTimeout(() => {
+          void initializeBayma(threadId).then((status) => {
+            console.error(`bayma later: ${status}`);
+            background.get(threadId)?.delete(itemId);
+          });
+        }, Number(later) * 1000);
+      }
       // After the answer to turn/start, as Codex reports a turn once it has accepted it.
       const seconds = Number(/^wait (\d+)$/u.exec(text)?.[1] ?? 0);
       setImmediate(() => {

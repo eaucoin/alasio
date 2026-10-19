@@ -36,6 +36,7 @@ import { environmentAccess } from "../../cli/src/manifests/log.ts";
 import { WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
+import { TOKEN_TTL_MS } from "../../src/sandbox/gateway-client.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
 import { SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
@@ -493,12 +494,13 @@ if (inShard("upgrade")) {
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
           // And what this release adds to the stack's: the harness host's role's password and
-          // verifier; the sandbox gateway's keys, its principal on the log, and the password of
-          // its workspaces' quotas.
+          // verifier, and main's harness pools' principal on the log; the sandbox gateway's keys,
+          // its principal on the log, and the password of its workspaces' quotas.
           assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), [
             "gatewayBindingKey",
             "gatewayCallerKey",
             "harnessPassword",
+            "log.harness-main",
             "log.sandbox-gateway",
             "valkeyQuotasPassword",
             "verifiers.harness",
@@ -1085,6 +1087,14 @@ if (inShard("sessions")) {
       const panel = await tg.waitFor((call) => /^Session workspace: /mu.test(call.payload.text ?? ""));
       const refresh = tg.buttons(panel).find((button) => button.text === "Refresh");
       assert.ok(refresh && "callback_data" in refresh, "the panel has a Refresh button");
+      /** The pods bound to conversations' harnesses, by their uids. */
+      const harnessPods = async () =>
+        (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: BINDING_LABEL }))
+          .filter(({ metadata }) => metadata?.annotations?.["alasio.dev/binding-key"]?.startsWith("harness:") && metadata.deletionTimestamp === undefined)
+          .map(({ metadata }) => metadata?.uid)
+          .sort();
+      const harnesses = await harnessPods();
+      assert.notDeepEqual(harnesses, [], "no pod is bound to the conversation's harness");
 
       const before = await kube.runningPod(NAMESPACE, RELEASE);
       await kube.remove(ref("Pod", before, NAMESPACE));
@@ -1096,11 +1106,11 @@ if (inShard("sessions")) {
       const refreshed = await tg.waitFor((call) => call.method === "editMessageText" && /^Session workspace: /mu.test(call.payload.text ?? ""));
       assert.match(refreshed.payload.text ?? "", new RegExp(`^Session workspace: ${full}, full internet$`, "mu"));
 
-      // The next message goes on in the session the conversation had, which the new pod's
-      // Codex, not having run it, is asked to resume.
+      // The next message goes on in the session the conversation had, on its harness's pod,
+      // which alasio's going left bound: its Codex runs it still.
       await tg.say("again");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
-      await untilInLake("resumed thread of Codex's", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'thread/resume'");
+      assert.deepEqual(await harnessPods(), harnesses);
     });
 
     test("a message runs a turn on Claude Code, the run's stand-in for it, whose answer reaches the operator, and its transcript the lake", async () => {
@@ -3387,6 +3397,128 @@ async function maintained(what: string, passes: (line: string) => boolean): Prom
   assert.ok(logged.split("\n").some((line) => line.includes('"message":"maintained"') && passes(line)), `main's lake's maintenance ${what}: it logged ${logged}`);
 }
 
+if (inShard("agents")) {
+  describe("conversations' harnesses, in pools of their own", () => {
+    let session: string;
+
+    before(async () => {
+      telegram = await forward(TELEGRAM);
+      tg = operator(telegram.base);
+      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+    });
+
+    after(() => {
+      telegram?.close();
+    });
+
+    /** The pods of alasio's namespace bound to a conversation's harness, but those being deleted. */
+    const harnessPods = async (): Promise<V1Pod[]> =>
+      (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: BINDING_LABEL })).filter(({ metadata }) =>
+        metadata?.annotations?.["alasio.dev/binding-key"]?.startsWith("harness:") && metadata.deletionTimestamp === undefined
+      );
+    /** The one pod bound to the operator's conversation's harness, once there is one. */
+    const harnessPod = async (): Promise<V1Pod> => {
+      for (const deadline = Date.now() + 120_000; ; await sleep(1_000)) {
+        const [pod, ...others] = await harnessPods();
+        assert.deepEqual(others, []);
+        if (pod) return pod;
+        assert.ok(Date.now() < deadline, "no pod was bound to the conversation's harness");
+      }
+    };
+    /** What alasio's pod logged. */
+    const alasioLogged = async () => kube.logs(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), "alasio").catch(String);
+
+    test("a session conversation's turn runs on a pod of its harness's pool, bound to it through the gateway, and the next on the same", async () => {
+      session = await newSession("none");
+      await tg.say("/service codex");
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      await tg.say("hello");
+      await tg.waitFor((call) => answered(call));
+      const bound = await harnessPod();
+      assert.equal(bound.metadata?.labels?.["alasio.dev/pool"], "harness-codex");
+      assert.match(bound.metadata?.annotations?.["alasio.dev/binding-key"] ?? "", /^harness:telegram:/u);
+      // Its host started free, and bound the conversation once its binding was beside it.
+      assert.match(await kube.logs(NAMESPACE, bound.metadata?.name ?? "", "harness"), /bound telegram:\S+: wrote back \d+ Codex rollout file\(s\)/u);
+      await tg.say("again");
+      await tg.waitFor((call) => answered(call));
+      assert.equal((await harnessPod()).metadata?.uid, bound.metadata?.uid);
+      // Its turns' spans, from the pod's Codex, in the lake; and its turns, from the rollouts the pod mirrored, loaded as it woke the lake's loader, as alasio, which writes none of them, does not.
+      await untilInLake("span of a pooled Codex's app-server", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'turn/start'");
+      await untilInLake("a pooled Codex's turn, loaded as its pod woke the loader", "select count(*) as n from codex.turns", 600_000);
+    });
+
+    test("a picture the prompt sends lands in the session's workspace, written through the gateway by the conversation's harness's pod", async () => {
+      const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+      await throughForward("POST", `${telegram?.base}/control/file`, { fileId: "e2e-picture", content: png });
+      await throughForward("POST", `${telegram?.base}/control/message`, { photo: "e2e-picture" });
+      await tg.waitFor((call) => answered(call));
+      const received = await inSession(session, 'console.log(require("fs").readdirSync("/home/agent/.alasio/received", { recursive: true }).join("\\n"))');
+      const [name] = received.split("\n").filter((line) => /\.(jpg|png)$/u.test(line));
+      assert.ok(name, `nothing received in the session: ${received}`);
+      assert.equal((await inSession(session, `console.log(require("fs").readFileSync("/home/agent/.alasio/received/${name}").toString("base64"))`)).trim(), png);
+    });
+
+    test("an idle harness is released once its wait has passed, alasio told on its events topic, and the next prompt binds another, its session resumed", { timeout: 15 * 60_000 }, async () => {
+      const before = await harnessPod();
+      for (const deadline = Date.now() + 10 * 60_000; (await harnessPods()).length > 0; await sleep(5_000)) assert.ok(Date.now() < deadline, "the idle harness was not released");
+      for (const deadline = Date.now() + 120_000; !/telegram:\S+'s harness was released \(idle\)/u.test(await alasioLogged()); await sleep(2_000)) {
+        assert.ok(Date.now() < deadline, "alasio was not told its harness was released");
+      }
+      await tg.say("back");
+      await tg.waitFor((call) => answered(call));
+      assert.notEqual((await harnessPod()).metadata?.uid, before.metadata?.uid);
+      await untilInLake("resumed thread of a pooled Codex's", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'thread/resume'");
+    });
+
+    /** The pod bound to the conversation's harness, bound by a prompt now, as one idle since the last is released within HARNESS_RELEASE_AFTER_SECONDS. */
+    const boundNow = async (): Promise<V1Pod> => {
+      await tg.say("here");
+      await tg.waitFor((call) => answered(call));
+      return await harnessPod();
+    };
+
+    test("a bound harness's pod deleted is let go of, and the next prompt binds another", async () => {
+      const bound = await boundNow();
+      await kube.remove(ref("Pod", bound.metadata?.name ?? "", NAMESPACE));
+      for (const deadline = Date.now() + 300_000; (await harnessPods()).some(({ metadata }) => metadata?.uid === bound.metadata?.uid); await sleep(2_000)) {
+        assert.ok(Date.now() < deadline, "the deleted pod's binding was not let go of");
+      }
+      await tg.say("after");
+      await tg.waitFor((call) => answered(call));
+      assert.notEqual((await harnessPod()).metadata?.uid, bound.metadata?.uid);
+    });
+
+    test("a pool's free pod has no binding and serves nothing; no one but the gateway reaches a bound one", async () => {
+      const free = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "alasio.dev/free=true,alasio.dev/pool=harness-codex" }))[0];
+      assert.ok(free?.status?.podIP, "the pool has no free pod");
+      assert.match(await inAlasioContainer(["node", "-e", tcp(JSON.stringify(free.status.podIP), 8080)]), /blocked/u);
+      const bound = await boundNow();
+      assert.ok(bound.status?.podIP);
+      assert.match(await inAlasioContainer(["node", "-e", tcp(JSON.stringify(bound.status.podIP), 8080)]), /blocked/u);
+    });
+
+    test("what a pooled harness leaves going on reaches its bayma past any caller's token's time, with alasio stopped, its bearer held to its pod's binding", { timeout: 20 * 60_000 }, async () => {
+      const bound = await boundNow();
+      const later = Math.ceil(TOKEN_TTL_MS / 1000) + 60;
+      await tg.say(`bayma later ${later}`);
+      await tg.waitFor((call) => answered(call));
+      const alasio = ref("Deployment", RELEASE, NAMESPACE);
+      await kube.patch(alasio, { spec: { replicas: 0 } });
+      try {
+        for (const deadline = Date.now() + 180_000; await kube.runningPod(NAMESPACE, RELEASE).then(() => true, () => false); await sleep(2_000)) assert.ok(Date.now() < deadline, "alasio did not stop");
+        // Its command running on in the background keeps the pod bound, past the time of every token alasio gave it, as the gateway's watch of the bindings is cut and resumed.
+        const logged = () => kube.logs(NAMESPACE, bound.metadata?.name ?? "", "harness").catch(String);
+        for (const deadline = Date.now() + (later + 180) * 1000; !/bayma later: \d+/u.test(await logged()); await sleep(5_000)) assert.ok(Date.now() < deadline, "the harness's command in the background never asked its bayma");
+        assert.match(await logged(), /bayma later: 200/u);
+        assert.equal((await harnessPod()).metadata?.uid, bound.metadata?.uid);
+      } finally {
+        await kube.patch(alasio, { spec: { replicas: 1 } });
+        for (const deadline = Date.now() + 300_000; !(await kube.runningPod(NAMESPACE, RELEASE).then(() => true, () => false)); await sleep(2_000)) assert.ok(Date.now() < deadline, "alasio did not start again");
+      }
+    });
+  });
+}
+
 if (inShard("branches")) {
   describe("branch environments", () => {
     let branchTelegram: Forward | undefined;
@@ -3583,6 +3715,8 @@ if (inShard("branches")) {
       await alasioOkWith({ TELEGRAM_API_ROOT: branchTelegram?.base }, "branch", "delete", BRANCH, "--force");
       assert.equal(await alasioOk("branch", "list"), "alasio has no branch environments.\n");
       for (const namespace of [BRANCH_NAMESPACE, BRANCH_SESSIONS]) assert.equal(await kube.get(ref("Namespace", namespace)), null);
+      // Nor the policy that held its harness pools' pods to its templates, the cluster's.
+      for (const kind of ["ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"] as const) assert.equal(await kube.get(ref(kind, `alasio-harness-pool-pods-${BRANCH}`)), null, kind);
       // Nothing of its sessions' workspaces is left in workspace storage, as each node mounts it.
       for (const agent of (await nodeAgents()).values()) {
         assert.equal(await kube.execOk(NAMESPACE, agent, ["sh", "-c", `ls -A "$0" 2>/dev/null || true`, `${WORKSPACES_ROOT}/${BRANCH_SESSIONS}`], { container: "node-agent" }), "");
