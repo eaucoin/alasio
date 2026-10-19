@@ -288,7 +288,8 @@ move_images() {
     fail "k3s-killall.sh left mounts of containerd's: $(mounted_under "$CONTAINERD_STATE"; mounted_under "$NODE_ROOT/run/k3s/containerd")"
   # The daemon stopped with k3s; its FUSE manager, which serves its mounts, stops now.
   kill_running "$NODE_ROOT/usr/local/bin/stargz-fuse-manager"
-  mounted_under "$STARGZ_ROOT" | sort -r | while read -r point; do umount --lazy "$point"; done
+  # `-l`, not `--lazy`, which the busybox of k3s's own binaries, first on the node's PATH, does not take.
+  mounted_under "$STARGZ_ROOT" | sort -r | while read -r point; do umount -l "$point"; done
   rm -rf "$CONTAINERD_STATE" "$STARGZ_ROOT" "$STARGZ_RUN"
   log "starting k3s, which pulls every image again through stargz-snapshotter's daemon"
   systemctl start k3s

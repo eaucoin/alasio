@@ -129,7 +129,9 @@ echo "systemctl $*" >>'${host}'
 `, { mode: 0o755 });
   // Unmounting it of the node's mount table, as the kernel does.
   const mounts = join(node, "proc/self/mounts");
+  // As the busybox of k3s's own binaries, first on the node's PATH, it takes -l, not --lazy.
   writeFileSync(join(bin, "umount"), `#!/bin/sh
+[ "$1" = -l ] || { echo "umount: unrecognized option $1" >&2; exit 1; }
 echo "umount $*" >>'${host}'
 awk -v point="$2" '$2 != point' '${mounts}' >'${mounts}.next' && mv '${mounts}.next' '${mounts}'
 `, { mode: 0o755 });
@@ -526,8 +528,8 @@ test("once its upgrade has run, the cut-over moves the node's images onto stargz
     assert.deepEqual(at.host(), [
       "systemctl stop k3s",
       "k3s-killall.sh",
-      `umount --lazy ${at.daemonSnapshot}/inner`,
-      `umount --lazy ${at.daemonSnapshot}`,
+      `umount -l ${at.daemonSnapshot}/inner`,
+      `umount -l ${at.daemonSnapshot}`,
       "systemctl start k3s",
     ]);
     // The check the move waits for, between the upgrade and its applying again.
