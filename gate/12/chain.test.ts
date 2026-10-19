@@ -726,6 +726,9 @@ test("8. a restore from the bucket whose proxy goes away during its background r
               outcome["probe"] = await probe(relay.endpoint, token, `${layersPrefix}${own}/pages.img`);
             }
             outcome["reads"] = await readsOf(relay, startedAt, 30_000);
+            // Whether its pages were all loaded, as its Sentry says once they are: what of them it needed, which pages the
+            // sandbox let go of meanwhile are not, so its relay carries less than the pages file holds now and then.
+            outcome["loaded"] = await loadedOf(`outage-${name}`);
           } finally {
             outcome["answered"] = Object.fromEntries(Object.entries(relay.answered()).map(([what, { count, lastAt }]) => [what, { count, last: new Date(lastAt).toISOString() }]));
             outcome["connections"] = relay.connections();
@@ -748,15 +751,25 @@ test("8. a restore from the bucket whose proxy goes away during its background r
       const outcome = seen[name] as Record<string, unknown>;
       const said = `${name}: ${JSON.stringify(outcome)}`;
       // Each outage cut the restore mid-background, or the gate saw nothing; the restore then
-      // read the rest of its pages, the sandbox's memory is what it was, and it saves again.
+      // loaded the rest of its pages, as its Sentry says, the sandbox's memory is what it was,
+      // and it saves again.
       assert.ok(outcome["cutAt"] && !outcome["error"], said);
-      assert.ok((outcome["reads"] as { readonly bytes: number }).bytes >= (outcome["pagesBytes"] as number), said);
+      assert.ok(typeof outcome["loaded"] === "string" && outcome["loaded"].includes("Async page loading completed"), said);
       assert.equal((outcome["touched"] as { readonly result: string }).result, JSON.stringify("intact"), said);
       const read = outcome["read"] as Read | string;
       assert.equal(typeof read === "string" ? read : read.marker, "42", said);
       assert.equal(typeof outcome["saved"], "object", said);
     }
   }));
+
+/** What the Sentry of the restore whose runsc debug logs are under DEBUG_LOGS/`name` said once its pages were all loaded, within a minute, or null. */
+async function loadedOf(name: string): Promise<string | null> {
+  for (const deadline = Date.now() + 60_000; Date.now() < deadline; await sleep(2000)) {
+    const said = (await node(`grep -h 'Async page loading completed' ${q(`${DEBUG_LOGS}/${name}`)}/*.boot.txt 2>/dev/null | tail -n 1 || true`)).trim();
+    if (said) return said;
+  }
+  return null;
+}
 
 /** Where runsc writes its debug logs while the gate has it (debugOn), in a directory of each name's. */
 const DEBUG_LOGS = "/var/log/gate-12-runsc";
