@@ -71,7 +71,7 @@ export function restoresFromBucket(release: string, since: string): boolean {
  * Whether gVisor's `release` is the fork's `since` or one past it, by its base's date and
  * patch, then its own number; never where either names no release of the fork's.
  */
-export function releaseAtOrPast(release: string, since: string): boolean {
+function releaseAtOrPast(release: string, since: string): boolean {
   const parts = (named: string) => {
     const matched = /^(\d{8})\.(\d+)-eaucoin\.(\d+)$/u.exec(named);
     return matched ? matched.slice(1).map(Number) : null;
@@ -100,6 +100,13 @@ export interface Gofer {
  */
 export const goferOf = (release: string, since: string): Gofer | null => (releaseAtOrPast(release, since) ? { transport: "socket", pagesRetry: true } : null);
 
+/**
+ * The name of a restore's pod, as the gateway makes it (../gateway/names.ts restorePodName): its
+ * pool's, `-restore-`, then seven of base 36's digits; the one name whose directory the node
+ * agent makes for it, before the pod is made.
+ */
+export const RESTORE_POD = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?-restore-[0-9a-z]{7}$/u;
+
 /** The variable that gives the node agent the first gVisor release that restores straight from the bucket (restoresFromBucket). */
 export const RESTORES_FROM_BUCKET_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_FROM_BUCKET_SINCE";
 
@@ -127,7 +134,7 @@ export const runscVersion = (release: string): string => `release-${release}`;
  */
 export const WORKSPACES_ROOT = "/var/lib/alasio/workspaces";
 
-/** Where a node keeps the directory of each pod of a sandbox pool, which the pod mounts by `subPathExpr` of its name. */
+/** Where a node keeps the directory of each pod of a sandbox pool, `<namespace>/<pod>`, which the pod mounts by `subPathExpr` of its namespace and its name. */
 export const ATTACH_ROOT = "/var/lib/alasio/attach";
 
 /** The root the gVisor shims run runsc with for Kubernetes' containers, under the node's /run. */
@@ -177,7 +184,7 @@ export const NODE_AGENT_OWN_BYTES = 160 * 1024 ** 2;
 /** The least memory limit a node agent runs under: its own, and a download's budget beside it. */
 export const NODE_AGENT_MEMORY_FLOOR = NODE_AGENT_OWN_BYTES + UNSYNCED_DOWNLOAD_BYTES;
 
-/** The variable holding the token alasio presents to a node agent. */
+/** The variable holding the token the sandbox gateway presents to a node agent. */
 export const NODE_AGENT_TOKEN_VARIABLE = "ALASIO_NODE_AGENT_TOKEN";
 
 /** The variable holding workspace storage's metadata engine's address, its password in it, which the agent sets workspaces' quotas on alone. */
@@ -196,7 +203,7 @@ export const OPERATION_LIMIT_SECONDS = 15 * 60;
 /**
  * How long a restore from the bucket may take from its prepare to its resume, which its token
  * lasts unless resumed before (./store-proxy.ts): the longest it takes, alasio waiting 3
- * minutes for its pod to run (POD_RUNNING_TIMEOUT in src/sandbox/snapshots.ts), then for the
+ * minutes for its pod to run (POD_RUNNING_TIMEOUT_MS in src/gateway/snapshots.ts), then for the
  * agent's resume, and a margin.
  */
 export const RESTORE_PREPARED_FOR_SECONDS = 5 * 60;
