@@ -12,7 +12,7 @@ import { sandboxBaymaTelemetryEnv } from "../../../src/sandbox/telemetry.ts";
 import { imageReference } from "../images.ts";
 import { accountRole, componentName, envOf, given, hostVolumeMounts, hostVolumes, imagePullSecrets, NAMESPACE, nodeAgentRuns, otelEnv, RELEASE } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
-import { folderPodPolicy, folderSecretPolicy } from "./admission.ts";
+import { folderDeletionPolicy, folderPodPolicy, folderSecretPolicy } from "./admission.ts";
 import { boundBudget } from "./disruption.ts";
 import { priority } from "./priorities.ts";
 
@@ -134,6 +134,8 @@ export function folderObjects(config: InstallConfig): KubernetesObject[] {
     // Every pod of the folder namespace held to the folder template, as Pod Security cannot, and the gateway's Secrets there to their tokens.
     ...folderPodPolicy(folderTemplate(config), { ...scope, stateRoot: config.host.stateRoot }),
     ...folderSecretPolicy(scope),
+    // And what it deletes there, its own instances' pods and tokens alone.
+    ...folderDeletionPolicy(scope),
     // A bound instance holds its REPLs live until its release: no drain evicts it, as none does a bound pool pod.
     boundBudget(config.host.namespace),
   ];

@@ -5,7 +5,8 @@
  * field it pins changed, or made by anyone else, is refused; no other pod is made in the folder
  * namespace; a pod's spec and labels never change, nor its annotations but what keeps its
  * node; no pod gets an ephemeral container. And the folder Secrets' policy: the gateway makes
- * no Secret there but a folder instance's token.
+ * no Secret there but a folder instance's token, and deletes none but its instances' pods and
+ * tokens.
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -60,7 +61,9 @@ let api: { readonly server: string; readonly token: string; readonly ca: Buffer 
 /** Whether the API server takes `body` at `path` by `method`, asked by `user`, as the administrator impersonates it: its name, or why not. */
 const askedAs = (user: string, method: string, path: string, type: string, body: unknown): Promise<{ readonly name: string } | { readonly refused: string }> =>
   new Promise((resolve, reject) => {
-    const asked = request(new URL(`${api.server}${path}`), { method, ca: api.ca, headers: { authorization: `Bearer ${api.token}`, "content-type": type, "impersonate-user": user, "impersonate-group": "system:authenticated" } }, (response) => {
+    const sent = JSON.stringify(body);
+    // Its length said, as a DELETE's body is otherwise sent chunked, which the API server's connection then refuses the next request on.
+    const asked = request(new URL(`${api.server}${path}`), { method, ca: api.ca, headers: { authorization: `Bearer ${api.token}`, "content-type": type, "content-length": Buffer.byteLength(sent), "impersonate-user": user, "impersonate-group": "system:authenticated" } }, (response) => {
       let text = "";
       response.on("data", (chunk: Buffer) => (text += chunk.toString()));
       response.on("end", () => {
@@ -69,7 +72,7 @@ const askedAs = (user: string, method: string, path: string, type: string, body:
       });
     });
     asked.on("error", reject);
-    asked.end(JSON.stringify(body));
+    asked.end(sent);
   });
 
 const madeAs = (user: string, pod: V1Pod) => askedAs(user, "POST", `/api/v1/namespaces/${FOLDERS}/pods`, "application/json", pod);
@@ -87,7 +90,7 @@ before(async () => {
       // A runtime there is, which a folder instance's pod may not run under.
       yield* kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor" }, handler: "runsc" });
       yield* kube.create({ apiVersion: "v1", kind: "ServiceAccount", metadata: { name: "alasio-host-agent", namespace: FOLDERS } });
-      for (const object of objects.filter(({ metadata }) => metadata?.name === "alasio-folder-pods" || metadata?.name === "alasio-folder-secrets")) yield* kube.create(object);
+      for (const object of objects.filter(({ metadata }) => ["alasio-folder-pods", "alasio-folder-secrets", "alasio-folder-deletions"].includes(metadata?.name ?? ""))) yield* kube.create(object);
       // What the gateway may do in the folder namespace, as alasio up gives it; and alasio, which may make pods there too, for its policy to refuse.
       for (const object of objects.filter(({ kind, metadata }) => (kind === "Role" || kind === "RoleBinding") && metadata?.namespace === FOLDERS && metadata.name === "alasio-sandbox-gateway")) yield* kube.create(object);
       yield* kube.create({ apiVersion: "rbac.authorization.k8s.io/v1", kind: "Role", metadata: { name: "pod-maker", namespace: FOLDERS }, rules: [{ apiGroups: [""], resources: ["pods", "pods/ephemeralcontainers", "secrets"], verbs: ["create", "patch"] }] } as never);
@@ -169,4 +172,26 @@ test("the gateway makes no Secret in the folder namespace but a folder instance'
   assert.ok("name" in await asked(secret(name, { token: "t" })));
   assert.ok(refusedByPolicy(await asked(secret("anything", { token: "t" })), "alasio-folder-secrets"));
   assert.ok(refusedByPolicy(await asked(secret(folderTokenSecret(folderPodName(folderKey("claude", "telegram:43"), "secrt")), { token: "t", more: "x" })), "alasio-folder-secrets"));
+});
+
+test("the gateway deletes no Secret in the folder namespace but a folder instance's token, and deletes its instances' pods", async () => {
+  const deletedAs = (user: string, kind: "pods" | "secrets", name: string) => askedAs(user, "DELETE", `/api/v1/namespaces/${FOLDERS}/${kind}/${name}`, "application/json", { apiVersion: "v1", kind: "DeleteOptions" });
+  // The operator's Secret there, which no one but the gateway's policy guards.
+  await withKube((kube) => kube.create({ apiVersion: "v1", kind: "Secret", metadata: { name: "operators-own", namespace: FOLDERS }, type: "Opaque", stringData: { key: "v" } }));
+  // The deletions' policy in force, as the API server takes a while to.
+  for (const deadline = Date.now() + 30_000; ; await new Promise((resolve) => setTimeout(resolve, 200))) {
+    const tried = await deletedAs(GATEWAY_USER, "secrets", "operators-own");
+    if ("refused" in tried) {
+      assert.ok(tried.refused.includes("alasio-folder-deletions"), tried.refused);
+      break;
+    }
+    await withKube((kube) => kube.create({ apiVersion: "v1", kind: "Secret", metadata: { name: "operators-own", namespace: FOLDERS }, type: "Opaque", stringData: { key: "v" } }));
+    assert.ok(Date.now() < deadline, "the deletions' policy never came into force");
+  }
+  const pod = await madeAs(GATEWAY_USER, folderPod("telegram:deleted"));
+  assert.ok("name" in pod, JSON.stringify(pod));
+  const token = await askedAs(GATEWAY_USER, "POST", `/api/v1/namespaces/${FOLDERS}/secrets`, "application/json", { apiVersion: "v1", kind: "Secret", metadata: { name: folderTokenSecret(pod.name), namespace: FOLDERS }, type: "Opaque", stringData: { token: "t" } });
+  assert.ok("name" in token, JSON.stringify(token));
+  assert.ok(!("refused" in await deletedAs(GATEWAY_USER, "secrets", folderTokenSecret(pod.name))));
+  assert.ok(!("refused" in await deletedAs(GATEWAY_USER, "pods", pod.name)));
 });

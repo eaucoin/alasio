@@ -566,6 +566,25 @@ export function folderSecretPolicy({ namespace, maker }: { readonly namespace: s
 }
 
 /**
+ * What the sandbox gateway, `maker`, may delete in the folder namespace, `namespace`, as RBAC
+ * lets it delete any pod and Secret there: a folder instance's pod, of the folder pool, and a
+ * folder instance's token's Secret, alone.
+ */
+export function folderDeletionPolicy({ namespace, maker }: { readonly namespace: string; readonly maker: string }): KubernetesObject[] {
+  const pool = `oldObject.metadata.?labels.orValue({})`;
+  return admissionPolicy(componentName("folder-deletions"), [{ apiGroups: [""], resources: ["pods", "secrets"], operations: ["DELETE"] }], `request.userInfo.username == ${JSON.stringify(maker)} && request.namespace == ${JSON.stringify(namespace)}`, [
+    {
+      expression: `request.resource.resource != "pods" || (oldObject.metadata.name.matches(${JSON.stringify(FOLDER_POD.source)}) && ${JSON.stringify(POOL_LABEL)} in ${pool} && ${pool}[${JSON.stringify(POOL_LABEL)}] == ${JSON.stringify(FOLDER_POOL)})`,
+      message: "the sandbox gateway deletes no pod in the folder namespace but a folder instance's",
+    },
+    {
+      expression: `request.resource.resource != "secrets" || oldObject.metadata.name.matches(${JSON.stringify(`^${FOLDER_POD.source.slice(1, -1)}${literally(folderTokenSecret(""))}$`)})`,
+      message: "the sandbox gateway deletes no Secret in the folder namespace but a folder instance's token",
+    },
+  ]);
+}
+
+/**
  * The fields of a pod's status but its conditions that every Kubernetes alasio runs on
  * has (1.28 on), as CEL refuses a field its schema lacks: its addresses, its node's, and
  * its containers' and its own state.
