@@ -13,8 +13,8 @@
     "restoresThroughSocketSince": "20260921.0-eaucoin.9",
     "releases": [
       {
-        "release": "20260921.0-eaucoin.10",
-        "sha512": "3fd096f8012808a90b8a8eac16a4acb82e57309d404db47dc0901fe619a49c81f5d51d7a9e9ae36bfb9caeb436bc3d468a93da761afacd34e48e2bd42f2bdea7"
+        "release": "20260921.0-eaucoin.11",
+        "sha512": "c577093a1230fe89910ff151e92b03e1042ae95440190311901ffc50a8deb00f3db9c1e6c149959eb5da30dcce2e42858757b0f47a179f2c6e8bce622e148307"
       },
       {
         "release": "20260921.0-eaucoin.8",
