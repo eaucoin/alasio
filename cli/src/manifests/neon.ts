@@ -110,7 +110,9 @@ function setup(config: InstallConfig): KubernetesObject[] {
         spec: {
           serviceAccountName: name,
           restartPolicy: "Never",
-          ...priority("component"),
+          // Of the floor, as applying alasio waits for it: it takes what sleeps' place
+          // rather than fail alasio up where the node is full (./priorities.ts).
+          ...priority("floor"),
           ...stackPodSpec(config),
           containers: [{
             name: "setup",

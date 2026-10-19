@@ -254,7 +254,9 @@ function certgen(config: InstallConfig): KubernetesObject[] {
         spec: {
           serviceAccountName: CERTGEN,
           restartPolicy: "Never",
-          ...priority("component"),
+          // Of the floor, as applying alasio waits for it: it takes what sleeps' place
+          // rather than fail alasio up where the node is full (./priorities.ts).
+          ...priority("floor"),
           securityContext: restrictedPod(65532, 65532),
           ...imagePullSecrets(config),
           initContainers: [step("create", ["create", `--host=${WEBHOOK_SERVICE},${WEBHOOK_SERVICE}.${NAMESPACE}.svc`, `--namespace=${NAMESPACE}`, `--secret-name=${TLS}`])],

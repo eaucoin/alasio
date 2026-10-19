@@ -2864,7 +2864,8 @@ describe("scaling", () => {
     assert.equal(tiers.get("alasio-neon-compute"), "alasio-floor");
     // Its read replica serves the lake's loads, which may wait.
     assert.equal(tiers.get("alasio-neon-compute-ro"), "alasio-component");
-    assert.deepEqual(["alasio-neon-setup", "alasio-neon-backup"].map((name) => tiers.get(name)), Array(2).fill("alasio-component"));
+    // The Jobs alasio up waits for are of the floor, taking what sleeps' place where the node is full; a backup waits.
+    assert.deepEqual(["alasio-neon-setup", "alasio-vpa-certgen", "alasio-neon-backup"].map((name) => tiers.get(name)), ["alasio-floor", "alasio-floor", "alasio-component"]);
     assert.deepEqual(["alasio", "sandboxes-none", "sandboxes-full", "folder-bayma"].map((name) => tiers.get(name)), Array(4).fill("alasio-turn"));
     // A branch's alasio runs turns; its lake's loader and its compute sleep.
     const branch = new Map(podSpecs(branchObjects(configOf(), "try", BASELINE)).map(([name, spec]) => [name, spec.priorityClassName]));
@@ -2891,7 +2892,7 @@ describe("scaling", () => {
     assert.ok(Result.isFailure(refused) && refused.failure.message === "autoscaling.headroom.scaling must be 0 when autoscaling.preemption is false, as no pod takes a placeholder's place then");
   });
 
-  test("sizes every workload by a VerticalPodAutoscaler beside it: in place what keeps no state and runs no turn, the rest recommended alone, from a small floor to its memory limit", () => {
+  test("sizes every workload by a VerticalPodAutoscaler beside it: in place what keeps no state and runs no turn, the rest recommended alone, from a small floor to half a core and its memory limit", () => {
     const objects = [...install({ host: { enabled: true } }), ...branchObjects(configOf(), "try", BASELINE)];
     const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet"), ...all<V1DaemonSet>(objects, "DaemonSet")];
     const sized = all<VerticalPodAutoscaler>(objects, "VerticalPodAutoscaler");
@@ -2930,7 +2931,7 @@ describe("scaling", () => {
         containerName: name,
         ...(sleeping.includes(workload?.metadata?.name ?? "") ? { controlledResources: ["memory"] } : {}),
         minAllowed: { cpu: "5m", memory: "16Mi" },
-        ...(resources?.limits?.["memory"] ? { maxAllowed: { memory: resources.limits["memory"] } } : {}),
+        maxAllowed: { cpu: "500m", ...(resources?.limits?.["memory"] ? { memory: resources.limits["memory"] } : {}) },
         controlledValues: "RequestsOnly",
       })));
     }
