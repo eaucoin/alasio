@@ -336,10 +336,18 @@ describe("alasio", () => {
     assert.match(decoded.failure.message, /telegram\.existingSecret/u);
   });
 
-  test("runs one alasio at a time, never two", () => {
-    const deployment = one<V1Deployment>(install(), "Deployment", "alasio");
-    assert.equal(deployment.spec?.replicas, 1);
-    assert.equal(deployment.spec?.strategy?.type, "Recreate");
+  // One alasio at a time, never two, on main and on a branch, a rollout's new one starting
+  // only once the old is gone: alasio still runs its turns in its own process, and its start
+  // settles what the last left (it lets go of every hold and ends every active turn), so a
+  // second, or a rollout's surge, would end the turns the first runs. Until conversations'
+  // workers are claimed from the store and recovery comes from the harnesses' lost bindings
+  // alone, nothing may run two.
+  test("runs one alasio at a time, never two, on main and on a branch", () => {
+    for (const objects of [install(), branchObjects(configOf(), "try", BASELINE)]) {
+      const deployment = one<V1Deployment>(objects, "Deployment", "alasio");
+      assert.equal(deployment.spec?.replicas, 1);
+      assert.equal(deployment.spec?.strategy?.type, "Recreate");
+    }
   });
 
   test("keeps no volume: its state is in Neon, its home and what it writes on emptyDirs", () => {
