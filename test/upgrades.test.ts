@@ -71,6 +71,8 @@ function machine() {
   const crd = join(root, "crd");
   // agent-sandbox's controller's Deployment, there while this is.
   const controller = join(root, "controller");
+  // A turn alasio runs, there until the cut-over has looked for it once.
+  const busy = join(root, "busy");
   const folders = join(root, "folders.json");
   const sandboxes = join(root, "sandboxes.tsv");
   const config = join(root, "config.json");
@@ -112,6 +114,8 @@ case "$*" in
   "get crd sandboxes.agents.x-k8s.io --ignore-not-found -o name") [ ! -e '${crd}' ] || echo customresourcedefinition.apiextensions.k8s.io/sandboxes.agents.x-k8s.io ;;
   "-n alasio-sessions get sandboxes.agents.x-k8s.io -o name") cat '${sessionSandboxes}' ;;
   "-n alasio-sessions get pvc -o name") cat '${sessionClaims}' ;;
+  # A turn alasio runs, said beside what the node was asked, gone once looked at.
+  "-n alasio get pod -l app.kubernetes.io/component=alasio,alasio.dev/busy=true -o name") [ ! -e '${busy}' ] || { echo "kubectl $* (a turn runs)" >>'${host}'; rm '${busy}'; echo pod/alasio-0; } ;;
   "-n alasio get pod -l "*" -o name") ;;
   "get pod -A -l alasio.dev/workload=folder -o json") cat '${folders}' ;;
   "get sandboxes.agents.x-k8s.io -A -o jsonpath="*) cat '${sandboxes}' ;;
@@ -208,6 +212,8 @@ awk -v point="$2" '$2 != point' '${mounts}' >'${mounts}.next' && mv '${mounts}.n
       }));
       writeFileSync(sandboxes, listed.map((each) => `${each.join("\t")}\n`).join(""));
     },
+    /** Has alasio run a turn, until the cut-over has looked for one once. */
+    turnRuns: () => writeFileSync(busy, ""),
     /** Whether the cluster has the Sandboxes' CRD still. */
     hasCrd: () => existsSync(crd),
     /** Whether the cluster has agent-sandbox's controller's Deployment still. */
@@ -537,11 +543,13 @@ test("once its upgrade has run, the cut-over moves the node's images onto stargz
   const manager = running(join(at.node, "usr/local/bin/stargz-fuse-manager"));
   const other = running("/usr/bin/sleep");
   try {
+    at.turnRuns();
     const run = at.cutOver();
     assert.equal(run.code, 0, run.said);
     assert.match(run.said, /upgrading, from the cut-over[^]*stopping k3s, to remove the node's images, unpacked by overlayfs under 8\.0\.0: \S+ of containerd's state\n[^]*starting k3s, which pulls every image again through stargz-snapshotter's daemon\n[^]*applying the upgrade again, which waits until alasio runs on the images pulled anew\n[^]*upgraded at /u);
     assert.deepEqual(at.host(), [
-      // alasio stopped, and the folder instances, before k3s is.
+      // alasio stopped once it runs no turn, and the folder instances, before k3s is.
+      "kubectl -n alasio get pod -l app.kubernetes.io/component=alasio,alasio.dev/busy=true -o name (a turn runs)",
       "kubectl -n alasio scale deployment alasio --replicas=0",
       "kubectl -n alasio-host delete pod -l alasio.dev/pool=folder --ignore-not-found --grace-period=600 --wait=true --timeout=11m",
       "systemctl stop k3s",
@@ -715,7 +723,7 @@ test("the cut-over run again after its upgrade failed goes on with the upgrade, 
     at.upgradeFails(false);
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
-    assert.doesNotMatch(again.said, /stopping agent-sandbox's controller|waiting for alasio to run no turn|deleting every Sandbox/u);
+    assert.doesNotMatch(again.said, /stopping agent-sandbox's controller|so none starts until the upgrade starts it again|deleting every Sandbox/u);
     assert.ok(!at.calls().some((call) => call.includes("scale deployment alasio-agent-sandbox-controller")));
   } finally {
     at.remove();

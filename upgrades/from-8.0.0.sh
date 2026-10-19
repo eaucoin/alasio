@@ -301,13 +301,14 @@ pulled() { disk_left && accepted; }
 # The node's images removed, with every snapshot of theirs, overlayfs's and the daemon's, and
 # pulled anew through the daemon by k3s started again; OUT/images-moving says it is begun, so
 # that a run again, which finds k3s stopped, ends it first, and OUT/images-moved that it ended.
-# Before k3s stops, alasio is stopped, so no turn binds a folder instance, and each folder
-# instance is let go, given its grace to save its REPL sessions whole, as stopping k3s would
-# kill it unsaved.
+# Before k3s stops, alasio is stopped once no turn runs, so none is cut short and none binds a
+# folder instance, and each folder instance is let go, given its grace to save its REPL
+# sessions whole, as stopping k3s would kill it unsaved.
 move_images() {
   local held host
   if [ ! -e "$OUT/images-moving" ]; then
-    log "stopping alasio, so no turn binds a folder instance as k3s stops"
+    log "waiting for alasio to run no turn, then stopping it, so none binds a folder instance as k3s stops"
+    gone app.kubernetes.io/component=alasio,alasio.dev/busy=true 1800 || fail "alasio ran a turn for 30m on: let it end, and run the cut-over again"
     k scale deployment alasio --replicas=0 >/dev/null || fail "alasio could not be stopped"
     gone app.kubernetes.io/component=alasio 600 || fail "alasio did not stop within 10m"
     host=$(jq -r '.install.host.namespace // "alasio-host"' "$CONFIG")
