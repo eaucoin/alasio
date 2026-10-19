@@ -332,7 +332,11 @@ test("Codex's thread past its config's time that left commands running in the ba
     stand.take("Bearer fresh");
     await new Promise((resolve) => setTimeout(resolve, 1_200));
     // Its config past its time, but its command running: kept, its bearer before kept with it.
-    assert.doesNotMatch(await codex.turn("PING", "Bearer fresh"), /pong/u);
+    // Its tool call answered, failed, as bayma refused the bearer that lapsed: no wait without end.
+    const refused = await codex.turn("PING", "Bearer fresh");
+    assert.doesNotMatch(refused, /pong/u);
+    assert.match(refused, /"status":"failed".*HTTP 401/u);
+    assert.ok(stand.asked.includes(`refused ${BEARER}`), JSON.stringify(stand.asked));
     assert.deepEqual([await codex.backgroundWork(), marked(mark).length], [true, 1], "its command running on");
     // Its command ended: its next turn loads it anew, with the bearer that turn gives.
     for (const pid of marked(mark)) process.kill(pid, "SIGKILL");
