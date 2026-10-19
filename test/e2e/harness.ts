@@ -61,6 +61,7 @@ import {
 } from "@kubernetes/client-node";
 import { type Duration, Effect, Stream } from "effect";
 
+import { cpuMillis, cpuText } from "../../cli/src/capacity.ts";
 import { subnetAddress } from "../../cli/src/cluster/docker.ts";
 import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "../../cli/src/kube/api.ts";
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
@@ -886,8 +887,9 @@ async function dumpNodes(which: ((node: string) => boolean) | undefined): Promis
 }
 
 /**
- * What the cluster is doing, said on stderr, folded in GitHub's log: its nodes, pods (each
- * container's restarts with them) and latest events, why each pod that is not ready is
+ * What the cluster is doing, said on stderr, folded in GitHub's log: its nodes (with how
+ * much of each one's CPU its pods request, of what it has), pods (with what each requests,
+ * and each container's restarts) and latest events, why each pod that is not ready is
  * not, with its logs, and the latest logs of the pods a compute's wake goes through, its
  * proxy's, neon-control's and each compute's, ready or not: a compute's Postgres restarting
  * within its container leaves its pod ready, and says why in its log alone; the lake's and
@@ -909,19 +911,29 @@ export async function dumpClusterState(): Promise<void> {
     conditions?.find(({ type }) => type === "Ready")?.status === "True";
   try {
     const nodes = await kube.list<V1Node>("Node");
+    const pods = await kube.list<V1Pod>("Pod");
+    // What a pod asks of its node's CPU, as the scheduler counts it: its containers' requests
+    // summed, or its largest init container's where that is more; none once it has ended.
+    const requested = (pod: V1Pod): number => {
+      if (pod.status?.phase === "Succeeded" || pod.status?.phase === "Failed") return 0;
+      const of = (containers: readonly { readonly resources?: { readonly requests?: Record<string, string> } }[] | undefined) =>
+        (containers ?? []).map(({ resources }) => cpuMillis(resources?.requests?.["cpu"] ?? "0"));
+      return Math.max(of(pod.spec?.containers).reduce((sum, each) => sum + each, 0), ...of(pod.spec?.initContainers));
+    };
     for (const node of nodes) {
       const condition = node.status?.conditions?.find(({ type }) => type === "Ready");
-      say(`node ${node.metadata?.name}: ${ready(node.status?.conditions) ? "ready" : `not ready${condition ? ` (${condition.reason}: ${condition.message})` : ""}`}`);
+      const asked = pods.filter((pod) => pod.spec?.nodeName === node.metadata?.name).reduce((sum, pod) => sum + requested(pod), 0);
+      const allocatable = cpuMillis(node.status?.allocatable?.["cpu"] ?? "0");
+      say(`node ${node.metadata?.name}: ${ready(node.status?.conditions) ? "ready" : `not ready${condition ? ` (${condition.reason}: ${condition.message})` : ""}`}, ${cpuText(asked)} of ${cpuText(allocatable)} requested`);
     }
     const notReady = new Set(nodes.filter((node) => !ready(node.status?.conditions)).map((node) => node.metadata?.name ?? ""));
     for (const line of await dumpNodes((node) => notReady.has(node) || !nodes.some((each) => each.metadata?.name === node))) say(line);
-    const pods = await kube.list<V1Pod>("Pod");
     for (const pod of pods) {
       const { namespace, name } = pod.metadata ?? {};
       const restarts = (pod.status?.containerStatuses ?? []).filter(({ restartCount }) => restartCount > 0).map(({ name: container, restartCount, lastState }) =>
         `${container} restarted ${restartCount} times${lastState?.terminated ? `, last exiting with ${lastState.terminated.exitCode}${lastState.terminated.reason ? ` (${lastState.terminated.reason})` : ""}` : ""}`
       );
-      say(`pod ${namespace}/${name} on ${pod.spec?.nodeName ?? "no node"}: ${pod.status?.phase}${ready(pod.status?.conditions) ? ", ready" : ""}${restarts.map((each) => `, ${each}`).join("")}`);
+      say(`pod ${namespace}/${name} on ${pod.spec?.nodeName ?? "no node"}: ${pod.status?.phase}${ready(pod.status?.conditions) ? ", ready" : ""}, requesting ${cpuText(requested(pod))}${restarts.map((each) => `, ${each}`).join("")}`);
     }
     const events = [...(await kube.list<CoreV1Event>("Event"))]
       .sort((a, b) => new Date(a.lastTimestamp ?? a.eventTime ?? 0).getTime() - new Date(b.lastTimestamp ?? b.eventTime ?? 0).getTime());
