@@ -1434,8 +1434,8 @@ describe("telemetry", () => {
         traces: { topic: "otel.spans", encoding: "otlp_proto" },
         logs: { topic: "otel.logs", encoding: "otlp_proto" },
         metrics: { topic: "otel.metrics", encoding: "otlp_proto" },
-        // Acked by the log, as large a record as it takes, and neither queued nor retried here.
-        producer: { required_acks: -1, max_message_bytes: 8_388_608 },
+        // Acked by the log, as large a record as it takes, compressed as the log keeps it, and neither queued nor retried here.
+        producer: { required_acks: -1, max_message_bytes: 8_388_608, compression: "zstd" },
         timeout: "10s",
         sending_queue: { enabled: false },
         retry_on_failure: { enabled: false },
@@ -1794,9 +1794,9 @@ describe("the log", () => {
 
   test("gives each principal what it does alone: the gateway writes the telemetry topics, the intake reads them in its group, KEDA describes both and the wake topics, the webhook intake writes the Telegram topics, main's alasio reads its own and writes its wake topic, main's loader reads that", () => {
     const access = JSON.parse(logConfig(install())["access.json"] ?? "");
-    // Each telemetry topic flushed to the volume within a second, so a host's crash loses a second of what it acknowledged at most.
+    // Each telemetry topic flushed to the volume within a second, so a host's crash loses a second of what it acknowledged at most, and kept compressed.
     assert.deepEqual(access.topics, [
-      ...["otel.spans", "otel.logs", "otel.metrics"].map((name) => ({ name, partitions: 2, retentionMs: 259_200_000, retentionBytes: 448 * 1024 * 1024, configs: { "flush.ms": "1000" } })),
+      ...["otel.spans", "otel.logs", "otel.metrics"].map((name) => ({ name, partitions: 2, retentionMs: 259_200_000, retentionBytes: 448 * 1024 * 1024, configs: { "flush.ms": "1000", "compression.type": "zstd" } })),
       // A week of main's Telegram updates, on one partition, as its one alasio reads them, within a segment beside the one it writes, each flushed as it is written.
       { name: "telegram.main", partitions: 1, retentionMs: 604_800_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
       // A day of main's wake records, on one partition, as its one loader reads them, within a segment beside the one it writes.

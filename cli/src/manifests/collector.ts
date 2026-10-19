@@ -182,7 +182,8 @@ const SERVICE = { extensions: ["health_check"], telemetry: { metrics: { level: "
 /**
  * The gateway's configuration: every signal from its OTLP receiver straight to the log,
  * each to its topic, acked by every replica the log keeps of it, unbatched and unqueued,
- * so its producer's export is answered by the log's; and to the external endpoint.
+ * so its producer's export is answered by the log's, compressed with zstd, as the log keeps
+ * it (./log.ts logAccess); and to the external endpoint.
  */
 function gatewayConfig(config: InstallConfig): object {
   const exporters = {
@@ -195,7 +196,7 @@ function gatewayConfig(config: InstallConfig): object {
           traces: { topic: TELEMETRY_TOPICS.traces, encoding: "otlp_proto" },
           logs: { topic: TELEMETRY_TOPICS.logs, encoding: "otlp_proto" },
           metrics: { topic: TELEMETRY_TOPICS.metrics, encoding: "otlp_proto" },
-          producer: { required_acks: -1, max_message_bytes: LOG_RECORD_BYTES },
+          producer: { required_acks: -1, max_message_bytes: LOG_RECORD_BYTES, compression: "zstd" },
           timeout: "10s",
           sending_queue: { enabled: false },
           retry_on_failure: { enabled: false },
