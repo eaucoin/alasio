@@ -124,7 +124,7 @@ export interface CheckpointOptions {
   readonly imagePath: string;
   /** The program runsc runs in the container before it saves, which it splits at spaces. */
   readonly hook: readonly string[];
-  /** How long the hook may take. */
+  /** How long the hook may take, as it saves the sandbox and as runsc keeps it to restore it with. */
   readonly hookTimeout: string;
   /**
    * The directory of the image the sandbox was last saved to or restored from, its pages
