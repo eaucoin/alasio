@@ -761,13 +761,14 @@ if (inShard("sessions")) {
       const node = session.spec?.nodeName ?? "";
       const limits = await onNode(node, `for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = stargz-fuse-man ] && tr '\\0' '\\n' <"$p/environ" | grep '^GOMEMLIMIT='; done; true`);
       assert.match(limits, /^GOMEMLIMIT=128MiB$/mu);
-      // The agent's image was on no node before the first session: kubelet says how long it took.
-      const events = await kube.list<CoreV1Event>("Event", { namespace: SESSIONS, fieldSelector: `involvedObject.name=${sessionName},reason=Pulled` });
-      const pulled = events.map(({ message }) => /^Successfully pulled image "[^"]*alasio-agent[^"]*" in (\S+) /u.exec(message ?? "")?.[1]).find((took) => took !== undefined);
-      assert.ok(pulled, `kubelet said nothing of pulling the agent's image: ${events.map(({ message }) => message).join("; ")}`);
-      console.error(`# the agent's image, on no node before, pulled lazily in ${goSeconds(pulled)} s`);
+      // The agent's image was on no node before the gateway's pools first ran a pod there, which
+      // the session's may not be, its pool's pods made ahead: kubelet says how long each pull took.
+      const events = await kube.list<CoreV1Event>("Event", { namespace: SESSIONS, fieldSelector: "reason=Pulled" });
+      const pulls = events.flatMap(({ message }) => /^Successfully pulled image "[^"]*alasio-agent[^"]*" in (\S+) /u.exec(message ?? "")?.[1] ?? []);
+      assert.ok(pulls.length > 0, `kubelet said nothing of pulling the agent's image: ${events.map(({ message }) => message).join("; ")}`);
+      console.error(`# the agent's image, on no node before, pulled lazily in ${pulls.map(goSeconds).join(", ")} s`);
       // Whole, it took 44 to 58 s on a runner; lazily, 2 to 4 s.
-      assert.ok(goSeconds(pulled) < 30, `the agent's image took ${pulled} to pull`);
+      for (const pulled of pulls) assert.ok(goSeconds(pulled) < 30, `the agent's image took ${pulled} to pull`);
     });
 
     test("a new workspace with internet reaches the internet and nothing private", async () => {
