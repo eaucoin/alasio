@@ -797,12 +797,19 @@ export function neonStack(): void {
       });
 
       test("an upgrade that changes nothing restarts nothing of the stack", async () => {
-        // Its workloads' pods: not a Job's, which a CronJob starts at its minute whatever an upgrade
-        // does, nor the lake loader's, which wakes and sleeps as alasio writes.
+        // Its workloads' pods, by name and uid: not a Job's, which a CronJob starts at its minute
+        // whatever an upgrade does, nor the lake loader's, which wakes and sleeps as alasio
+        // writes, nor one stopping already, as a rollout or a scale-down before left it (its
+        // Deployment is ready once it is deleted, though it runs out its grace), which goes
+        // whatever an upgrade does.
         const pods = async () =>
           (await runningPods())
-            .filter(({ metadata }) => !metadata?.ownerReferences?.some(({ kind }) => kind === "Job") && metadata?.labels?.["app.kubernetes.io/component"] !== "lake-loader")
-            .map((pod) => pod.metadata?.uid).sort();
+            .filter(({ metadata }) =>
+              metadata?.deletionTimestamp === undefined
+              && !metadata?.ownerReferences?.some(({ kind }) => kind === "Job")
+              && metadata?.labels?.["app.kubernetes.io/component"] !== "lake-loader"
+            )
+            .map((pod) => `${pod.metadata?.name} ${pod.metadata?.uid}`).sort();
         const before = await pods();
         await alasioOk("upgrade", "--timeout", "10m");
         assert.deepEqual(await pods(), before);
