@@ -19,8 +19,8 @@
  * in a namespace by default; a cluster whose admission defaults otherwise must exempt it.
  *
  * Its bucket and the identity it is reached as are the Secret Neon's setup makes for it
- * (neon/control/kube-setup.ts), taken whole as its environment, and the token alasio
- * presents, the Secret both are given.
+ * (neon/control/kube-setup.ts), taken whole as its environment, and the token the sandbox
+ * gateway presents, the Secret both are given.
  */
 import type { KubernetesObject, V1DaemonSet, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
 
@@ -52,7 +52,7 @@ import { WORKSPACE_QUOTAS } from "./workspace-storage.ts";
 
 /** The Secret of the snapshots bucket, its endpoint, region and name and the agents' keys to it. */
 const SNAPSHOTS_SECRET = componentName("snapshots");
-/** The Secret of the token alasio presents to the node agents, under `token`. */
+/** The Secret of the token the sandbox gateway presents to the node agents, under `token`. */
 const NODE_AGENT_SECRET = componentName("node-agent");
 
 /** The node's paths the agent has at the same paths: each one's volume, what must be there, and whether the agent only reads it. */

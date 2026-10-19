@@ -6,8 +6,9 @@
  *
  * The gofer holds none of the bucket's credentials. Each restore from the bucket is given a
  * token of its own (mint): an access key naming it and a secret of 256 random bits, which
- * the gofer signs its requests with, as Signature Version 4 signs; kept in the agent's memory
- * alone, so that none outlives the agent. A token lasts as long as a restore takes from its
+ * the gofer signs its requests with, as Signature Version 4 signs; kept in the agent's memory,
+ * and, where it is told (tokensFile), in a file on the node's tmpfs, which an agent that starts
+ * again reads back, as the module says below. A token lasts as long as a restore takes from its
  * prepare to its resume (PREPARED_FOR_MS), and from its resume as long as the agent says its
  * background reads may take (resumed), and for as long after as its restore keeps asking:
  * each request signed by it, whatever the bucket answers, or whether it answers, has it last

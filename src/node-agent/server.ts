@@ -1,6 +1,6 @@
 /**
- * The node agent's API, which alasio calls on the agent's pod's address, with the token
- * both are given (`Authorization: Bearer <token>`): every request but `GET /healthz`
+ * The node agent's API, which the sandbox gateway calls on the agent's pod's address, with
+ * the token both are given (`Authorization: Bearer <token>`): every request but `GET /healthz`
  * without it is answered 401. It speaks JSON; a refusal or a failure is
  * `{ "error": "<why>" }` with its status, 400 for a request that is not one, 404 for a
  * route there is not.
@@ -437,7 +437,7 @@ const EVICTION_GRACE_MS = 10 * 60_000;
 
 /**
  * The node agent of the node it runs on (NODE_NAME), as its environment configures it:
- * the bucket (BucketConfig), the token alasio presents (NODE_AGENT_TOKEN_VARIABLE), the
+ * the bucket (BucketConfig), the token the sandbox gateway presents (NODE_AGENT_TOKEN_VARIABLE), the
  * cache's budget in bytes (SNAPSHOT_CACHE_BYTES_VARIABLE), the first gVisor release that
  * restores straight from the bucket (RESTORES_FROM_BUCKET_SINCE_VARIABLE; none unless given,
  * every snapshot then fetched into the cache first), its pod's address (POD_IP_VARIABLE),

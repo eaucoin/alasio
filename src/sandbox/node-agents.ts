@@ -1,5 +1,5 @@
 /**
- * The node agents (../node-agent/), as alasio calls them: each node's, found by its pod
+ * The node agents (../node-agent/), as the sandbox gateway calls them: each node's, found by its pod
  * there, as the profile's `snapshots.agents` select them, reached on its pod's address,
  * with the token alasio and they are given (ALASIO_NODE_AGENT_TOKEN).
  */

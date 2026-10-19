@@ -184,7 +184,7 @@ export const NODE_AGENT_OWN_BYTES = 160 * 1024 ** 2;
 /** The least memory limit a node agent runs under: its own, and a download's budget beside it. */
 export const NODE_AGENT_MEMORY_FLOOR = NODE_AGENT_OWN_BYTES + UNSYNCED_DOWNLOAD_BYTES;
 
-/** The variable holding the token alasio presents to a node agent. */
+/** The variable holding the token the sandbox gateway presents to a node agent. */
 export const NODE_AGENT_TOKEN_VARIABLE = "ALASIO_NODE_AGENT_TOKEN";
 
 /** The variable holding workspace storage's metadata engine's address, its password in it, which the agent sets workspaces' quotas on alone. */
