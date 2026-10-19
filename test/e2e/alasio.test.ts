@@ -2237,7 +2237,7 @@ if (inShard("telemetry")) {
         assert.deepEqual([node["log.flush.scheduler.interval.ms"], ...Object.values(topics).map((configs) => configs["flush.ms"])], ["1000", "1000", "1000", "1000"]);
       });
 
-      test("the log keeps each telemetry topic compressed with zstd, the stack's metrics in a fraction of their bytes", async (t) => {
+      test("the log keeps each telemetry topic compressed with zstd, the stack's metrics in a fraction of their bytes, and the intake says how long it is to keep them", async (t) => {
         const { topics } = await logConfigs();
         assert.deepEqual(Object.values(topics).map((configs) => configs["compression.type"]), ["zstd", "zstd", "zstd"]);
         // What otel.metrics holds on the volume, against the bytes of its exports, uncompressed, as the log gives them back.
@@ -2248,6 +2248,8 @@ if (inShard("telemetry")) {
         const perHour = (bytes: number) => `${(bytes / hours / 2 ** 20).toFixed(2)} MiB/h`;
         t.diagnostic(`otel.metrics: ${sizes.records} exports in ${(hours * 60).toFixed(1)} min, ${perHour(sizes.valueBytes)} uncompressed, ${perHour(sizes.diskBytes)} on the volume: ${ratio.toFixed(1)}x`);
         assert.ok(ratio >= 3, `otel.metrics holds ${sizes.diskBytes} bytes on its volume of ${sizes.valueBytes} bytes of exports: ${ratio.toFixed(2)}x`);
+        // The intake says how long the log is to keep them, beside how long it does once it deletes any.
+        await untilInLake("the intake's word of the log's retention", "select count(*) as n from otel.metrics_gauge where ServiceName = 'lake-intake' and MetricName = 'lake_telemetry_log_retention_seconds' and Value > 0");
       });
 
       test("a broker's crash loses nothing the gateway answered as taken, which it answers once the log is back", async () => {

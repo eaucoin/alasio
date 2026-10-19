@@ -177,7 +177,7 @@ export interface LogAccess {
 }
 
 /** The hours of a retention as log.retention says it. */
-const retentionMs = (retention: string): number => Number(retention.slice(0, -1)) * 3_600_000;
+export const retentionMs = (retention: string): number => Number(retention.slice(0, -1)) * 3_600_000;
 
 /**
  * What the log's access is: the telemetry topics, of as many partitions as the intake

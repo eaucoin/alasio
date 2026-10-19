@@ -35,7 +35,7 @@ import type { KubernetesObject, V1CronJob, V1Deployment, V1EnvVar, V1Job, V1JobS
 import { computeId, MAIN, replicaId } from "../../../neon/control/branches.ts";
 import { memoryBytes } from "../capacity.ts";
 import { imageReference } from "../images.ts";
-import { environmentName, INTAKE_GROUP, lakeWakeTopic, LOG_BROKERS, loaderGroup, loaderLogSecret, logPrincipalSecret, TELEMETRY_TOPICS } from "./log.ts";
+import { environmentName, INTAKE_GROUP, lakeWakeTopic, LOG_BROKERS, loaderGroup, loaderLogSecret, logPrincipalSecret, retentionMs, TELEMETRY_TOPICS } from "./log.ts";
 import {
   componentName,
   type Environment,
@@ -413,6 +413,8 @@ function intakeObjects(config: InstallConfig): KubernetesObject[] {
               { name: "LOG_BROKERS", value: LOG_BROKERS },
               fromSecret("LOG_USERNAME", intake, "username"),
               fromSecret("LOG_PASSWORD", intake, "password"),
+              // How long the log is to keep what it reads, which it says beside how long it does.
+              { name: "LOG_RETENTION_MS", value: String(retentionMs(config.log.retention)) },
               ...otelEnv(config),
               { name: "OTEL_SERVICE_NAME", value: "alasio-lake-intake" },
             ],

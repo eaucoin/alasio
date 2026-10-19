@@ -63,7 +63,7 @@ async function open(): Promise<IntakeLake> {
 }
 
 const metrics = createMetrics();
-const intake = startIntake({ open, join: () => joinLog(config.log, GROUP, Object.keys(TOPICS), hostname()), metrics, log });
+const intake = startIntake({ open, join: () => joinLog(config.log, GROUP, Object.keys(TOPICS), hostname()), metrics, log, logRetentionMs: config.logRetentionMs });
 
 const server = createServer((request, response) => {
   if (request.method === "GET" && request.url === "/healthz") {

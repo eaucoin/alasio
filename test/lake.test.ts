@@ -593,6 +593,10 @@ describe("telemetry", () => {
       async lag() {
         return new Map([["otel.logs", batches.flat().length], ["otel.spans", 0]]);
       },
+      async kept() {
+        // otel.logs' second partition deleted its first records, its first none.
+        return new Map([["otel.logs", [null, 30 * 3_600_000]], ["otel.spans", [null]]]);
+      },
       async close() {
         closed = true;
       },
@@ -628,7 +632,7 @@ describe("telemetry", () => {
     assert.equal((await large({ ms: 1000, records: 10, bytes: 2 * MiB })).length, 1);
   });
 
-  test("the intake writes each batch it consumes in one commit with its offsets, queryable from another DuckDB, skips a record that does not decode, only then tells the group, and says how far behind it is", async () => {
+  test("the intake writes each batch it consumes in one commit with its offsets, queryable from another DuckDB, skips a record that does not decode, only then tells the group, and says how far behind it is and how long the log keeps each partition", async () => {
     const spans = new InMemorySpanExporter();
     const tracer = new BasicTracerProvider({ resource: resourceFromAttributes({ "service.name": "intake-test" }), spanProcessors: [new SimpleSpanProcessor(spans)] }).getTracer("t");
     tracer.startSpan("alasio.turn", { attributes: { "alasio.conversation.id": "telegram:7" } }).end();
@@ -636,7 +640,7 @@ describe("telemetry", () => {
     assert.ok(traces);
     const group = member([[record("otel.spans", 0, 0, traces), logRecord(1, 0, "intake-test", NOW, NOW + 1n), record("otel.logs", 1, 1, Uint8Array.from([0x0a, 0x05, 0x01]))]]);
     const metrics = createMetrics();
-    const intake = startIntake({ open: openForIntake, join: async () => group.source, metrics, log: () => {}, batch: { ...BATCH, ms: 10 } });
+    const intake = startIntake({ open: openForIntake, join: async () => group.source, metrics, log: () => {}, batch: { ...BATCH, ms: 10 }, logRetentionMs: 72 * 3_600_000 });
     try {
       await until("the batch's commit to the group", () => group.committed.length > 0);
       assert.deepEqual(group.committed[0]?.toSorted((a, b) => a.topic.localeCompare(b.topic)), [{ topic: "otel.logs", partition: 1, offset: 2n }, { topic: "otel.spans", partition: 0, offset: 1n }]);
@@ -655,6 +659,10 @@ describe("telemetry", () => {
       // How far behind the group is, as the member asked once the batch was written.
       assert.match(text, /^lake_telemetry_lag_records\{topic="otel.logs"\} 0$/m);
       assert.match(text, /^lake_telemetry_lag_records\{topic="otel.spans"\} 0$/m);
+      // How long the log keeps each partition it has deleted any of, beside how long it is to.
+      await until("how long the log keeps its partitions", () => metrics.render().includes("lake_telemetry_log_retention_seconds"));
+      const kept = metrics.render().split("\n").filter((line) => line.startsWith("lake_telemetry_log_"));
+      assert.deepEqual(kept, ['lake_telemetry_log_kept_seconds{topic="otel.logs",partition="1"} 108000', "lake_telemetry_log_retention_seconds 259200"]);
     } finally {
       await intake.stop();
     }
@@ -1321,6 +1329,9 @@ describe("telemetry", () => {
         return 0n;
       },
       async lag() {
+        return new Map();
+      },
+      async kept() {
         return new Map();
       },
       async close() {
@@ -3016,6 +3027,56 @@ describe("the lake's reader", () => {
     } finally {
       reader.close();
     }
+  });
+
+  test("the log's retention alert says how much less than its retention the log keeps a telemetry partition that deleted by size, and nothing of a young log or one deleting by age", async () => {
+    const strings = (values: Record<string, string>) => Object.entries(values).map(([key, value]) => ({ key, value: { stringValue: value } }));
+    // As the scraper names what it scrapes of the intake, a minute apart, each later than the one before.
+    let minutes = 10;
+    const gauges = (points: readonly [string, number, Record<string, string>][]) => ({
+      resourceMetrics: [{
+        resource: { attributes: strings({ "service.name": "lake-intake" }) },
+        scopeMetrics: [{
+          metrics: points.map(([name, value, attributes]) => ({
+            name,
+            gauge: { dataPoints: [{ timeUnixNano: String(BigInt(Date.now() - minutes * 60_000) * 1_000_000n), asDouble: value, attributes: strings(attributes) }] },
+          })),
+        }],
+      }],
+    });
+    const hours = 3600;
+    const retention: [string, number, Record<string, string>] = ["lake_telemetry_log_retention_seconds", 72 * hours, {}];
+    const kept = (topic: string, partition: string, seconds: number): [string, number, Record<string, string>] => ["lake_telemetry_log_kept_seconds", seconds, { topic, partition }];
+    const rules = readFileSync(new URL("../neon/grafana/provisioning/alerting/rules.yaml", import.meta.url), "utf8");
+    const [, indent = "", block = ""] = /^ *title: .*\n[\s\S]*?^( *)data: \|\n((?:\1 {2}.*\n)+)/mu.exec(rules.slice(rules.indexOf("title: The log keeps less telemetry than its retention"))) ?? [];
+    const query = block.replaceAll(`\n${indent}  `, "\n").trim();
+    const threshold = Number(/refId: shorter[\s\S]*?params: \[(\d+)\]/u.exec(rules.slice(rules.indexOf("title: The log keeps less telemetry than its retention")))?.[1]);
+    const short = async () => {
+      const reader = await openReader(readerConfig);
+      try {
+        return (await answer(reader.db, query)).map((row) => row["short"]);
+      } finally {
+        reader.close();
+      }
+    };
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      // A young log, which has deleted nothing: the intake says its retention alone.
+      await writeTelemetry(db, telemetryRows("metrics", gauges([retention])));
+    });
+    assert.deepEqual(await short(), []);
+    // One deleting by age keeps its retention, but for the hour a segment closes within.
+    minutes = 5;
+    await withLake((db) => writeTelemetry(db, telemetryRows("metrics", gauges([retention, kept("otel.metrics", "0", 71.5 * hours), kept("otel.spans", "1", 72.4 * hours)]))));
+    const byAge = await short();
+    assert.deepEqual(byAge, [0.5]);
+    assert.ok(Number(byAge[0]) <= threshold);
+    // otel.metrics' first partition, its share of the volume run out first, deletes by size: 30 hours kept of 72.
+    minutes = 1;
+    await withLake((db) => writeTelemetry(db, telemetryRows("metrics", gauges([retention, kept("otel.metrics", "0", 30 * hours), kept("otel.spans", "1", 72.4 * hours)]))));
+    const bySize = await short();
+    assert.deepEqual(bySize, [42]);
+    assert.ok(Number(bySize[0]) > threshold);
   });
 
   test("the alert rules count the lake's passes that failed on a file the store does not hold, and no other failure of theirs", async () => {

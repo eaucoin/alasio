@@ -1878,6 +1878,8 @@ describe("the log", () => {
       [env["LOG_BROKERS"], env["LOG_USERNAME"], env["LOG_PASSWORD"], env["LAKE_DATABASE_PASSWORD"], env["LAKE_S3_KEY"], env["OTEL_SERVICE_NAME"]],
       ["alasio-log.alasio.svc:9092", "alasio-log-intake/username", "alasio-log-intake/password", "alasio-lake/LAKE_DATABASE_PASSWORD", "alasio-lake/LAKE_S3_KEY", "alasio-lake-intake"],
     );
+    // How long the log is to keep what it reads, log.retention, which it says beside how long it does.
+    assert.equal(env["LOG_RETENTION_MS"], String(72 * 3_600_000));
     // None of the reader's credentials, nor the lake's other Secrets.
     assert.equal(container(intake).envFrom, undefined);
     const scaled = one<ScaledObject>(objects, "ScaledObject", "alasio-lake-intake");

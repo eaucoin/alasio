@@ -137,6 +137,15 @@ export async function joinLog(access: LogConfig, group: string, topics: readonly
         return behind + Number(end - (at >= 0n ? at : (starts.get(topic)?.[partition] ?? 0n)));
       }, 0)]));
     },
+    async kept() {
+      // Each partition's start, and its first record's time: the earliest whose time is that of the epoch or later.
+      const [starts, firsts] = await Promise.all([consumer.listOffsets({ topics: [...topics], timestamp: -2n }), consumer.listOffsetsWithTimestamps({ topics: [...topics], timestamp: 0n })]);
+      const now = Date.now();
+      return new Map([...starts].map(([topic, offsets]) => [topic, offsets.map((start, partition) => {
+        const first = firsts.get(topic)?.get(partition);
+        return start > 0n && first !== undefined && first.offset >= 0n ? now - Number(first.timestamp) : null;
+      })]));
+    },
     async close() {
       await stream.close().catch(() => {});
       await consumer.close(true);

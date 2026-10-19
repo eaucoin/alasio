@@ -121,6 +121,12 @@ export interface IntakeSource {
   start(topic: string, partition: number): Promise<bigint>;
   /** How many records the group has yet to read of each topic. */
   lag(): Promise<ReadonlyMap<string, number>>;
+  /**
+   * How long each partition of each topic keeps its records in fact: the age of the first it
+   * still holds, in milliseconds, by partition; null of one the log has yet to delete any of,
+   * which holds all it was ever given.
+   */
+  kept(): Promise<ReadonlyMap<string, readonly (number | null)[]>>;
   close(): Promise<void>;
 }
 
@@ -146,6 +152,8 @@ export interface IntakeOptions {
   failingMs?: number;
   /** The clock its health is told by, in milliseconds: when its loop came round, and since when its batches have failed (Date.now). */
   now?: () => number;
+  /** How long the log is to keep the telemetry topics' records (log.retention), which it says beside how long it does; not said where not given. */
+  logRetentionMs?: number | null;
 }
 
 /** Whether the intake is well, and what it says of that: where its batches keep failing, the last failure. */
@@ -267,7 +275,7 @@ export function unreachable(reread: Reread, partitions: readonly PartitionAt[], 
 }
 
 /** Starts the intake: it opens the lake and joins the group now, and consumes until stopped. */
-export function startIntake({ open, join, metrics, log, batch: bounds = BATCH, retryMs = RETRY_MS, stallMs = STALL_MS, failingMs = FAILING_MS, now = Date.now }: IntakeOptions): Intake {
+export function startIntake({ open, join, metrics, log, batch: bounds = BATCH, retryMs = RETRY_MS, stallMs = STALL_MS, failingMs = FAILING_MS, now = Date.now, logRetentionMs = null }: IntakeOptions): Intake {
   const stopped = new AbortController();
   let lake: IntakeLake | null = null;
   let source: IntakeSource | null = null;
@@ -378,12 +386,26 @@ export function startIntake({ open, join, metrics, log, batch: bounds = BATCH, r
   }
 
   let lagAt = 0;
-  /** Says how far behind the group is, at most each LAG_EVERY_MS; a failure to ask is the log's, which the next batch meets. */
+  /**
+   * Says how far behind the group is, and how long the log keeps each partition's records,
+   * beside how long it is to (logRetentionMs), at most each LAG_EVERY_MS: a partition whose
+   * share of the log's volume runs out before its retention keeps less, which an alert says
+   * (neon/grafana, "The log keeps less telemetry than its retention"). A failure to ask is the
+   * log's, which the next batch meets.
+   */
   async function measureLag(member: IntakeSource): Promise<void> {
     if (Date.now() - lagAt < LAG_EVERY_MS) return;
     lagAt = Date.now();
     const lag = await member.lag().catch(() => null);
     for (const [topic, records] of lag ?? []) metrics.set("lake_telemetry_lag_records", { topic }, records);
+    const kept = await member.kept().catch((error: unknown) => {
+      log("telemetry intake could not ask how long the log keeps its records", { error: errorText(error) });
+      return null;
+    });
+    for (const [topic, partitions] of kept ?? []) {
+      for (const [partition, ms] of partitions.entries()) if (ms !== null) metrics.set("lake_telemetry_log_kept_seconds", { topic, partition: String(partition) }, ms / 1000);
+    }
+    if (logRetentionMs !== null) metrics.set("lake_telemetry_log_retention_seconds", {}, logRetentionMs / 1000);
   }
 
   /**
