@@ -688,8 +688,11 @@ test("a spend of a snapshot spends the one compacted from it, which a compaction
       const { manifest } = yield* there.agent.prepare(workspace);
       yield* there.agent.spend(workspace, manifest.snapshot);
       yield* there.agent.resume(resumeRequest(manifest.snapshot));
+      // Its images in the node's cache, so that its checkpoint is a delta of them, whose chain is due.
+      yield* fetched(there, manifest);
       writeFileSync(join(there.releases.dirOf(RELEASE), "delta-pages-bytes"), "4096");
       const delta = yield* there.agent.checkpoint(request("fs-abc"));
+      assert.equal(delta.layers.length, 2);
       // A restore reads the delta as current, and prepares it; meanwhile its compaction commits.
       const third = yield* node("node-3");
       const restoring = yield* third.agent.prepare(workspace);
@@ -1122,15 +1125,15 @@ test("a restore from the bucket reads its own images through the agent by a toke
       const others = (yield* taker.agent.checkpoint(request("fs-other", OTHER_CONTAINER))).layers[0]?.digest;
       const other = yield* node("node-2");
       /** Prepared from the bucket, as a node whose cache holds none of it does, once what a prepare before fetched is cleared: the token it was given. */
-      let fetching = false;
+      let fetching: Manifest | null = null;
       /** The gofer's options file of the last prepared, which holds its token. */
       let options = "";
       const preparedRemote = Effect.gen(function*() {
-        if (fetching) yield* fetched(other, manifest);
-        fetching = true;
+        if (fetching) yield* fetched(other, fetching);
         yield* other.cache.clear("main", "fs-abc");
         const prepared = yield* other.agent.prepare(workspace);
         assert.equal(prepared.source, "bucket");
+        fetching = prepared.manifest;
         options = join(prepared.imagePath, "s3_opts.json");
         return tokenIn(prepared.imagePath);
       });
