@@ -12,6 +12,7 @@ import { Context, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect";
 
 import { consumeEvents, EnvironmentEvents, type EventHandlers, EventsConsumer } from "../src/events/consume.ts";
 import { eventRecord, type EventInput } from "../src/events/events.ts";
+import { EVENTS_HANDLED_KEPT_MS, EVENTS_RETENTION_MS } from "../src/events/names.ts";
 import { StoreError } from "../src/persistence/sql.ts";
 import { Store } from "../src/persistence/store.ts";
 import { newSchema, run, testPool, testStore } from "./support/store.ts";
@@ -89,13 +90,17 @@ test("a record alasio cannot read, of a later version, of a kind it does not kno
   assert.deepEqual((await (await testPool()).query<{ id: string }>(`select id from ${schema}.events_handled order by id`)).rows.map(({ id }) => id), [idOf(3)]);
 });
 
-test("the events handled are forgotten with what else is kept only in flight, once their topic keeps them no more", async () => {
+test("the events handled are forgotten with what else is kept only in flight once their topic can hold them no more, however young what else is pruned at", async () => {
   const schema = newSchema();
-  await consume(schema, [eventRecord(RELEASED, 1, idOf(4)).value], replying([]));
+  await consume(schema, [eventRecord(RELEASED, 1, idOf(4)).value, eventRecord(RELEASED, 1, idOf(5)).value], replying([]));
   const store = await testStore({ schema });
-  await (await testPool()).query(`update ${schema}.events_handled set handled_at = now() - interval '8 days'`);
-  await run(store.pruneTransient("7 days"));
-  assert.equal((await (await testPool()).query(`select 1 from ${schema}.events_handled`)).rowCount, 0);
+  const pool = await testPool();
+  const handledAgo = (id: string, ms: number) => pool.query(`update ${schema}.events_handled set handled_at = now() - make_interval(secs => $1) where id = $2`, [ms / 1000, id]);
+  // One older than its topic keeps, but still in a segment closed within the hour before; one older than that may be.
+  await handledAgo(idOf(5), EVENTS_RETENTION_MS + 3_600_000);
+  await handledAgo(idOf(4), EVENTS_HANDLED_KEPT_MS + 60_000);
+  await run(store.pruneTransient(0));
+  assert.deepEqual((await pool.query<{ id: string }>(`select id from ${schema}.events_handled order by id`)).rows.map(({ id }) => id), [idOf(5)]);
 });
 
 test("the environment's one member hands each event to the part of alasio that added its kind's handling, once every part's handling is ready, and refuses a kind added twice or a handling added once it reads", async () => {

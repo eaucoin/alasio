@@ -149,7 +149,8 @@ const harnessesOf = (env: SessionsEnvironment & { home: string }, config: Harnes
   Effect.runPromise(Effect.provide(Effect.gen(function*() {
     const binder = yield* Binder;
     const environments = found([env, { name: "try", namespace: "alasio-branch-try-sessions", parent: "main" }]);
-    const events = { tell: (event: EventInput) => Effect.sync(() => void told.push(event)) };
+    const tell = (event: EventInput) => Effect.sync(() => void told.push(event));
+    const events = { tell, send: tell };
     return { binder, harnesses: yield* makeHarnesses({ config, environments, main: "main", bindingKey, events, ...(idlePollMs === undefined ? {} : { idlePollMs }), ...(unreachedMs === undefined ? {} : { unreachedMs }) }, nodeAgents, binder) };
   }), Layer.provideMerge(Binder.layer({ waitMs: 5_000 }), Layer.fresh(KubeClient.layer))));
 

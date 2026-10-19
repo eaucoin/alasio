@@ -2,8 +2,10 @@
  * An environment's events (./events.ts), as its alasio reads them: its events topic, as a
  * member of its group, `alasio-events.<environment>`, a group of its own beside Telegram's so
  * neither holds the other back (../log/consume.ts). A group told of none, as the first alasio
- * to read it, reads from the next written, as what was told before it began is no one's to
- * act on.
+ * to read it, reads main's from the next written, as what was told before it began is no
+ * one's to act on, and a branch's from its first, as its topic is made with the branch, and
+ * all on it was told for it: its parent's answers to its forks (../branch/fork.ts) among them,
+ * which may be written before its first alasio has joined.
  *
  * Each event is handled once, whichever alasio it is delivered to and however often: its
  * handling runs in a transaction that records it handled (Store.withEventHandled), with what
@@ -16,7 +18,7 @@
 import { Context, Effect, Layer, Option, Schema, type Scope } from "effect";
 
 import { consumeGroup, errorText } from "../log/consume.ts";
-import { joinTopic, type TopicFeed, type TopicLog, type TopicRecord } from "../log/topic.ts";
+import { type JoinTopic, joinTopic, type TopicFeed, type TopicLog, type TopicRecord } from "../log/topic.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { type EventWrites, Store } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
@@ -29,10 +31,10 @@ export class EventsFeedError extends Schema.TaggedError<EventsFeedError>()("Even
 export class EnvironmentEvents extends Context.Service<EnvironmentEvents, {
   readonly join: Effect.Effect<TopicFeed, EventsFeedError>;
 }>()("alasio/events/EnvironmentEvents") {
-  /** The group on the log, as `log` says it. */
-  static readonly layer = (log: TopicLog): Layer.Layer<EnvironmentEvents> =>
+  /** The group on the log, as `log` says it, of main's events or a branch's (`branch`), read from where the module says; joined by `join`, the log's but in tests. */
+  static readonly layer = (log: TopicLog, { branch }: { readonly branch: boolean }, join: JoinTopic = joinTopic): Layer.Layer<EnvironmentEvents> =>
     Layer.succeed(EnvironmentEvents, EnvironmentEvents.of({
-      join: Effect.tryPromise({ try: () => joinTopic(log, "latest"), catch: (error) => new EventsFeedError({ message: `joining ${log.group} on ${log.topic}: ${errorText(error)}` }) }),
+      join: Effect.tryPromise({ try: () => join(log, branch ? "earliest" : "latest"), catch: (error) => new EventsFeedError({ message: `joining ${log.group} on ${log.topic}: ${errorText(error)}` }) }),
     }));
 }
 

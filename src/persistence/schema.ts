@@ -315,6 +315,31 @@ create table if not exists ${SCHEMA}.events_handled (
   handled_at timestamptz not null default now()
 );
 
+-- Each request a branch's alasio made of this one, its parent, to fork a session for it
+-- (src/branch/fork.ts), by the branch and the id it gave it, with the session it asked for and
+-- how it was answered: one delivered again is answered as it was, not forked twice.
+create table if not exists ${SCHEMA}.fork_requests (
+  branch text not null,
+  id text not null,
+  volume_id text not null,
+  outcome text not null,
+  net_mode text,
+  reason text,
+  answered_at timestamptz not null default now(),
+  primary key (branch, id)
+);
+
+-- How this alasio's parent answered each request it made of it to fork a session, by the
+-- request's id, as whichever of its replicas read the answer recorded it.
+create table if not exists ${SCHEMA}.fork_answers (
+  request text primary key,
+  volume_id text not null,
+  outcome text not null,
+  net_mode text,
+  reason text,
+  answered_at timestamptz not null default now()
+);
+
 create table if not exists ${SCHEMA}.prompt_jobs (
   seq bigint generated always as identity,
   id text primary key,

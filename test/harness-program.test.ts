@@ -148,7 +148,8 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
     let held: Held | null = null;
     // What it tells, as the log would be told it.
     const told: EventInput[] = [];
-    const telling = Events.of({ tell: (event) => Effect.sync(() => void told.push(event)) });
+    const tell = (event: EventInput) => Effect.sync(() => void told.push(event));
+    const telling = Events.of({ tell, send: tell });
     // Free, of no conversation, until its binding is beside it.
     const attach = join(dir, "attach");
     mkdirSync(attach);

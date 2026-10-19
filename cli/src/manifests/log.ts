@@ -24,7 +24,8 @@
 import type { KubernetesObject, V1ConfigMap, V1Container, V1EnvVar, V1Service, V1StatefulSet } from "@kubernetes/client-node";
 
 import type { LogPrincipal, MainEnvironmentPrincipal } from "../../../neon/control/secrets.ts";
-import { eventsGroup, eventsTopic } from "../../../src/events/names.ts";
+import { forksGroup, forksTopic, MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
+import { EVENTS_RETENTION_MS, EVENTS_TOPIC_PREFIX, eventsGroup, eventsTopic } from "../../../src/events/names.ts";
 import { imageReference } from "../images.ts";
 import { claimLabels, claimSpec, componentName, type Environment, NAMESPACE, replicasOf, restrictedContainer, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
 import { type InstallConfig, LOG_SEGMENT_BYTES, telemetryRetentionBytes } from "./config.ts";
@@ -75,8 +76,8 @@ export const harnessPrincipal = (name: string): string => `harness-${name}`;
 
 /** How long an environment's wake records are kept: a day, long past its lake loader's waking at the first. */
 export const WAKE_RETENTION_MS = 86_400_000;
-/** How long an environment's events are kept: as long as its Telegram updates, past any wait of its alasio's to read them. */
-export const EVENTS_RETENTION_MS = TELEGRAM_RETENTION_MS;
+/** How long main's forks topic keeps a branch's request: a day, long past the wait for its answer, after which its parent refuses it (src/branch/fork.ts). */
+export const FORKS_RETENTION_MS = 86_400_000;
 
 /** The topic the environment `name`'s alasio writes as it commits transcripts, which wakes its lake loader. */
 export const lakeWakeTopic = (name: string): string => `lake.${name}`;
@@ -94,16 +95,21 @@ export const loaderGroup = (name: string): string => `lake-loader.${name}`;
  * group, `lake-loader.<name>`; its harness pools' hosts', `harness-<name>`, writing its events
  * topic, `events.<name>` (src/events/), and its wake topic, as they commit transcripts and
  * rollouts, as alasio does, and nothing else; the events topic, which the sandbox gateway writes too
- * and its alasio reads in its group, `alasio-events.<name>`; those topics, of one partition each, as
- * one alasio and one loader read them, a chat's updates in order, each keeping a segment
- * beside the one it writes at most: a week of a bot's updates, or of events, and a day of
- * wakes, is kilobytes. Each update, and each event, is flushed to the volume as it is
+ * and its alasio reads in its group, `alasio-events.<name>`. Branches ask main to fork the
+ * sessions they inherited on main's forks topic, `forks.main` (src/branch/fork.ts), which a
+ * branch's alasio writes and main's reads in its group, `alasio-forks.main`, answering on the
+ * branches' events topics, which it may write. Those topics are of one partition each, as one
+ * alasio and one loader read them, a chat's updates in order, each keeping a segment beside the
+ * one it writes at most: a week of a bot's updates, or of events, and a day of wakes or of
+ * requests, is kilobytes. Each update, event and request is flushed to the volume as it is
  * written, as what told of it does not tell again; a wake, lost, costs nothing.
  */
 export function environmentAccess(name: string): EnvironmentLogAccess {
   const topic = telegramTopic(name);
   const wake = lakeWakeTopic(name);
   const events = eventsTopic(name);
+  const main = name === MAIN_ENVIRONMENT_NAME;
+  const forks = forksTopic(MAIN_ENVIRONMENT_NAME);
   return {
     principals: [
       {
@@ -114,6 +120,14 @@ export function environmentAccess(name: string): EnvironmentLogAccess {
           { resource: "topic", name: wake, pattern: "literal", operations: ["write", "describe"] },
           { resource: "topic", name: events, pattern: "literal", operations: ["read", "describe"] },
           { resource: "group", name: eventsGroup(name), pattern: "literal", operations: ["read"] },
+          ...(main
+            ? [
+              { resource: "topic", name: forks, pattern: "literal", operations: ["read", "describe"] },
+              { resource: "group", name: forksGroup(MAIN_ENVIRONMENT_NAME), pattern: "literal", operations: ["read"] },
+              // Its answers, on each branch's events topic.
+              { resource: "topic", name: EVENTS_TOPIC_PREFIX, pattern: "prefixed", operations: ["write", "describe"] },
+            ] as const
+            : [{ resource: "topic", name: forks, pattern: "literal", operations: ["write", "describe"] }] as const),
         ],
       },
       {
@@ -130,6 +144,7 @@ export function environmentAccess(name: string): EnvironmentLogAccess {
       { name: topic, partitions: 1, retentionMs: TELEGRAM_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: { "flush.messages": "1" } },
       { name: wake, partitions: 1, retentionMs: WAKE_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: {} },
       { name: events, partitions: 1, retentionMs: EVENTS_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: { "flush.messages": "1" } },
+      ...(main ? [{ name: forks, partitions: 1, retentionMs: FORKS_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: { "flush.messages": "1" } }] : []),
     ],
   };
 }
@@ -241,7 +256,7 @@ export function logAccess(config: InstallConfig): LogAccess {
     ],
     webhook: [{ resource: "topic", name: "telegram.", pattern: "prefixed", operations: ["write", "describe"] }],
     // Every environment's events, a branch's among them, and nothing else.
-    "sandbox-gateway": [{ resource: "topic", name: "events.", pattern: "prefixed", operations: ["write", "describe"] }],
+    "sandbox-gateway": [{ resource: "topic", name: EVENTS_TOPIC_PREFIX, pattern: "prefixed", operations: ["write", "describe"] }],
   };
   const retention = { retentionMs: retentionMs(config.log.retention), retentionBytes: telemetryRetentionBytes(config) };
   return {

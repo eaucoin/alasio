@@ -8,13 +8,12 @@
 import type { V1NetworkPolicy, V1NetworkPolicyEgressRule, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, V1NetworkPolicySpec } from "@kubernetes/client-node";
 
 import { COMPUTE_CTL_PORT, COMPUTE_PORT } from "../../../neon/control/branches.ts";
-import { BRANCH_FORK_PORT } from "../../../src/branch/names.ts";
 import type { ApiServer } from "../api-server.ts";
 import { POOL_LABEL } from "../../../src/binder/names.ts";
 import { NET_MODE_LABEL } from "../../../src/kube/sandbox-shape.ts";
 import { NODE_AGENT_PORT } from "../../../src/node-agent/names.ts";
 import { CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
-import { forksForBranches, sessionsNamespace } from "./alasio.ts";
+import { sessionsNamespace } from "./alasio.ts";
 import { GATEWAY_COMPONENT, SCRAPER_COMPONENT } from "./collector.ts";
 import {
   BRANCH_LABEL,
@@ -626,16 +625,12 @@ function sandboxServicePolicies(config: InstallConfig, apiServer: ApiServer | nu
 }
 
 /**
- * alasio takes no connections but, main, where it forks sessions for branch environments,
- * their alasio's asking it to (src/branch/fork.ts); and, where its harnesses run in pools, its
- * own pools' pods, on its relay of its Codex login.
+ * alasio takes no connections but, where its harnesses run in pools, its own pools' pods', on
+ * its relay of its Codex login: a branch environment's asks main to fork the sessions it
+ * inherited on the log (src/branch/fork.ts).
  */
 function alasioPolicy(config: InstallConfig, environment: Environment): NetworkPolicy {
-  const forks = environment.branch === null && forksForBranches(config);
   const ingress: IngressRule[] = [
-    ...(forks
-      ? [{ from: [{ namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } }], ports: [{ protocol: "TCP", port: BRANCH_FORK_PORT }] }]
-      : []),
     // Its own harness pools' pods, its relay of its Codex login: none of another environment's.
     ...(harnessPoolsRun(config) ? [{ from: [{ podSelector: { matchLabels: selectorLabels(HARNESS_COMPONENT) } }], ports: [{ protocol: "TCP", port: CODEX_LOGIN_PORT }] }] : []),
   ];

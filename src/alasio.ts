@@ -8,19 +8,20 @@ import { join } from "node:path";
 import { Effect, Layer, Option, type Scope } from "effect";
 import type { Pool } from "pg";
 
-import { parentForks, serveBranchForks } from "./branch/fork.ts";
+import { ForkAsks, forkAnswered, ForkRequests, parentForks, serveBranchForks } from "./branch/fork.ts";
 import { CodexAppServer } from "./codex/app-server/client.ts";
 import { codexHome } from "./codex/env.ts";
 import { type CodexLoginError, keepCodexLogin } from "./codex/login.ts";
 import { SessionFsCodex, sessionFsCodexHome } from "./codex/sessionfs.ts";
 import { Turns } from "./codex/turns.ts";
 import type { AlasioConfig, BranchEnvironment } from "./config.ts";
+import { type EnvironmentEvents, EventsConsumer } from "./events/consume.ts";
+import type { Events } from "./events/events.ts";
 import { ActiveTurns } from "./harness/active-turns.ts";
 import type { ClaudeQueryFactory } from "./harness/claude/runtime.ts";
 import { HarnessHost } from "./harness/host.ts";
 import { HarnessEvents, HostEvents } from "./harness/host-events.ts";
 import { pooledHarnessHost } from "./harness/pooled-host.ts";
-import { EnvironmentEvents, EventsConsumer } from "./events/consume.ts";
 import { CODEX_LOGIN_PORT, poolLoginKey, poolLoginRefusal, startLoginRelay } from "./codex/login-relay.ts";
 import { Harnesses } from "./harness/index.ts";
 import { BusyPods } from "./kube/busy.ts";
@@ -41,9 +42,22 @@ import { Outbox } from "./telegram/outbox.ts";
 import type { TelegramUpdates } from "./telegram/update-consumer.ts";
 
 /** What alasio is made with: its configuration, its Neon and what main keeps there, what the deployment's templates offer, and where its updates come from. */
-export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog" | "lakeWake">, TelegramAppConfig {
+export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog" | "log" | "events" | "lakeWake">, TelegramAppConfig {
   /** Telegram's updates: its environment's topic in the log (TelegramUpdates.layer), or a stand-in's in alasio's tests. */
   readonly updates: Layer.Layer<TelegramUpdates>;
+  /**
+   * In a branch, what it asks its parent to fork the sessions it inherited with (ForkAsks), on
+   * the log, or a stand-in in tests; a branch given none inherits no session.
+   */
+  readonly parentLog?: Layer.Layer<ForkAsks> | undefined;
+  /**
+   * The environment's events, read in its group (EnvironmentEvents), where alasio reads them:
+   * where its harnesses run in pools, and in a branch, whose parent answers its forks there; on
+   * the log, or a stand-in in tests.
+   */
+  readonly events?: Layer.Layer<EnvironmentEvents> | undefined;
+  /** Where alasio forks its sessions for branches, the requests they make (ForkRequests) and what it answers on (Events), on the log, or stand-ins in tests. */
+  readonly branchesLog?: Layer.Layer<ForkRequests | Events> | undefined;
   /** The pool of alasio's Neon database, which its state is kept in. */
   readonly pool: Pool;
   /** The schema alasio's state is kept in: `state`, unless a test gives one of its own. */
@@ -84,6 +98,7 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       Mounts.layer({ workspaceRoot: options.workspaceRoot, branch: options.branch?.name }),
       Authorizer.layer(options.allowedUserIds),
       branchForks(options),
+      branchEvents(options),
     )),
     Layer.provideMerge(Turns.layer()),
     Layer.provideMerge(harnessHost(options)),
@@ -115,13 +130,13 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
 
 /**
  * The one member of the environment's events' group every part of alasio adds its handling
- * to: on its events topic where the installation names one, as where its harnesses run in
- * pools; elsewhere none, which reads nothing, and to which a part adding a handling is a defect.
+ * to: on its events topic where alasio reads it (AlasioOptions.events); elsewhere none, which
+ * reads nothing, and to which a part adding a handling is a defect.
  */
-function eventsConsumer({ harnessPools }: AlasioOptions): Layer.Layer<EventsConsumer, never, Store> {
-  if (harnessPools) return EventsConsumer.layer.pipe(Layer.provide(EnvironmentEvents.layer(harnessPools.events)));
+function eventsConsumer({ events }: AlasioOptions): Layer.Layer<EventsConsumer, never, Store> {
+  if (events) return EventsConsumer.layer.pipe(Layer.provide(events));
   return Layer.succeed(EventsConsumer, EventsConsumer.of({
-    handle: (handlers) => Effect.die(new Error(`alasio reads no events topic here, as its installation names none, so it handles no event of ${Object.keys(handlers).join(", ")}`)),
+    handle: (handlers) => Effect.die(new Error(`alasio reads no events topic here, so it handles no event of ${Object.keys(handlers).join(", ")}`)),
     start: Effect.void,
   }));
 }
@@ -157,14 +172,15 @@ function harnessHost({ harnessPools, sessionsGateway }: AlasioOptions): Layer.La
  * both reached by the harnesses at one loopback of alasio's (BaymaProxy). They are not among
  * AlasioServices, which are always there; what uses them asks whether they are.
  */
-function workspaceServices({ folders, sessionsGateway, stateDir, branch }: AlasioOptions): Layer.Layer<never, never, Store | TelegramClient> {
+function workspaceServices({ folders, sessionsGateway, stateDir, branch, parentLog }: AlasioOptions): Layer.Layer<never, never, Store | TelegramClient> {
   if (!sessionsGateway) return Layer.empty;
   return Layer.mergeAll(
     Layer.unwrap(Effect.gen(function*() {
       const store = yield* Store;
-      const inherit = branch ? inheritance(branch, store) : undefined;
+      const asks = Option.getOrUndefined(yield* Effect.serviceOption(ForkAsks));
+      const inherit = branch && asks ? inheritance(branch, store, asks) : undefined;
       return SessionSandboxes.layer({ workspaces: makeGatewayWorkspaces(sessionsGateway), environment: sessionsGateway.environment, stateDir, netModeOf: netModeIn(store), inherit });
-    })),
+    })).pipe(Layer.provide(parentLog ?? Layer.empty)),
     folders ? HostBayma.layer(makeGatewayWorkspaces(sessionsGateway).folders) : Layer.empty,
   ).pipe(Layer.provide(BaymaProxy.layer));
 }
@@ -191,9 +207,10 @@ function activeTurns({ inKubernetes }: AlasioOptions): Layer.Layer<ActiveTurns> 
  * A branch environment's sessions it inherited: forked by its parent, which it asks
  * (./branch/fork.ts), and recorded as made in its own store, as it records those it makes.
  */
-function inheritance(branch: BranchEnvironment, store: Store["Service"]): Inheritance {
+function inheritance(branch: BranchEnvironment, store: Store["Service"], asks: ForkAsks["Service"]): Inheritance {
+  const fork = parentForks({ branch: branch.name, tokenFile: branch.tokenFile });
   return {
-    fork: parentForks({ url: branch.parentForks, branch: branch.name, tokenFile: branch.tokenFile }),
+    fork: (volumeId) => fork(volumeId).pipe(Effect.provideService(ForkAsks, asks), Effect.provideService(Store, store)),
     record: (volumeId, netMode) =>
       store.recordInheritedSessionWorkspace(volumeId, netMode).pipe(
         Effect.mapError((error) => new SessionInheritError({ message: `the session ${volumeId} forked from the alasio this branch was branched from could not be recorded: ${error.message}` })),
@@ -203,21 +220,29 @@ function inheritance(branch: BranchEnvironment, store: Store["Service"]): Inheri
 
 /**
  * Where the deployment gives alasio the key branch environments' tokens are signed with,
- * and it has sessions, the server they ask to fork the sessions they inherited
- * (./branch/fork.ts), for as long as alasio runs; a server that cannot listen stops
- * alasio as it starts.
+ * and it has sessions, its answers to their requests to fork the sessions they inherited
+ * (./branch/fork.ts), for as long as alasio runs.
  */
-function branchForks({ branchForkKeyFile }: AlasioOptions): Layer.Layer<never, never, Store | HarnessHost | Turns> {
-  if (!branchForkKeyFile) return Layer.empty;
+function branchForks({ branchForkKeyFile, branchesLog }: AlasioOptions): Layer.Layer<never, never, Store | HarnessHost | Turns> {
+  if (!branchForkKeyFile || !branchesLog) return Layer.empty;
   return Layer.effectDiscard(
     Effect.serviceOption(SessionSandboxes).pipe(
       Effect.flatMap(Option.match({
         onNone: () => Effect.void,
-        onSome: (sandboxes) => Effect.provideService(serveBranchForks({ keyFile: branchForkKeyFile }), SessionSandboxes, sandboxes),
+        onSome: (sandboxes) => Effect.asVoid(Effect.forkScoped(Effect.provideService(serveBranchForks({ keyFile: branchForkKeyFile }), SessionSandboxes, sandboxes))),
       })),
-      Effect.orDie,
     ),
-  );
+  ).pipe(Layer.provide(branchesLog));
+}
+
+/**
+ * In a branch that asks its parent to fork the sessions it inherited, its parent's answers
+ * (./branch/fork.ts), handled by the environment's one member of its events' group
+ * (EventsConsumer).
+ */
+function branchEvents({ branch, parentLog }: AlasioOptions): Layer.Layer<never, never, EventsConsumer | Store> {
+  if (!branch || !parentLog) return Layer.empty;
+  return Layer.effectDiscard(Effect.flatMap(EventsConsumer, (consumer) => consumer.handle({ "workspace.fork-answered": forkAnswered({ branch: branch.name, tokenFile: branch.tokenFile }) })));
 }
 
 /**

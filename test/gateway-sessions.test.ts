@@ -174,7 +174,7 @@ const options = (env: SessionsEnvironment & { template?: V1PodTemplateSpec }, po
   podPort,
   quotaBytes: 2 * 1024 ** 3,
   bindingKey,
-  events: { tell: (event) => Effect.sync(() => void told.push(event)) },
+  events: { tell: (event) => Effect.sync(() => void told.push(event)), send: (event) => Effect.sync(() => void told.push(event)) },
 });
 
 /** The gateway's sessions and its Binder, on clients of their own. */

@@ -28,6 +28,9 @@ export interface TopicRecord extends Received {
 /** A member of the group: the topic's records in turn, until it is closed. */
 export type TopicFeed = Feed<TopicRecord>;
 
+/** What joins a group on its topic: the log's (joinTopic), or a stand-in's in tests. */
+export type JoinTopic = (log: TopicLog, untold: "earliest" | "latest") => Promise<TopicFeed>;
+
 /** Joins `log`'s group on its topic, reading on from where the group was last told, or, of a group told of none, from the topic's first record still kept (`earliest`) or the next written (`latest`). */
 export async function joinTopic(log: TopicLog, untold: "earliest" | "latest"): Promise<TopicFeed> {
   const consumer = new Consumer({

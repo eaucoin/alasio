@@ -608,6 +608,17 @@ if (inShard("upgrade")) {
       upgraded = Date.now();
     });
 
+    test(`upgraded: what ${PREVIOUS} served branch environments their sessions' forks on is gone, as branches ask on the log now: its Service pruned, and alasio's port and the rule admitting them to it applied away`, async () => {
+      assert.equal(await kube.get(ref("Service", componentName("branches"), NAMESPACE)), null);
+      const alasio = await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE));
+      assert.ok(alasio, "alasio's Deployment is gone");
+      assert.deepEqual(alasio.spec?.template.spec?.containers.flatMap(({ ports }) => ports ?? []).filter(({ name }) => name === "branch-forks"), []);
+      const policy = await kube.get<KubernetesObject & { readonly spec?: { readonly ingress?: readonly { readonly from?: readonly { readonly namespaceSelector?: object }[] }[] } }>(ref("NetworkPolicy", componentName("alasio"), NAMESPACE));
+      assert.ok(policy, "alasio's NetworkPolicy is gone");
+      // What it admits, if anything, is of its own namespace's: no branch environment's.
+      assert.deepEqual((policy.spec?.ingress ?? []).filter(({ from }) => from?.some(({ namespaceSelector }) => namespaceSelector !== undefined)), []);
+    });
+
     for (const { keeps, check } of scenarios) test(`upgraded: ${keeps}`, check);
 
     // On this release's bayma, the folder conversation's REPL sessions, its instance let go, as

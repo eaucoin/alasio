@@ -17,7 +17,7 @@ import type {
   V1Volume,
 } from "@kubernetes/client-node";
 
-import { BRANCH_FORK_PORT, BRANCH_PARENT_LABEL, branchSessionsNamespace, MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
+import { BRANCH_PARENT_LABEL, branchSessionsNamespace, MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
 import { ALASIO_GATEWAY_CALLER_KEY_VARIABLE, ALASIO_GATEWAY_ENVIRONMENT_VARIABLE, ALASIO_GATEWAY_FOLDERS_VARIABLE, ALASIO_GATEWAY_URL_VARIABLE } from "../../../src/gateway/names.ts";
 import type { ApiServer } from "../api-server.ts";
 import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
@@ -27,7 +27,6 @@ import { foldersRun } from "./folders.ts";
 import { carriedPools, GATEWAY, GATEWAY_PORT, sandboxServiceRuns } from "./sandbox-gateway.ts";
 import { alasioGroup, environmentLogSecret, environmentName, lakeWakeTopic, LOG_BROKERS, telegramTopic } from "./log.ts";
 import { harnessPoolsRun } from "./harness-pools.ts";
-import { eventsGroup, eventsTopic } from "../../../src/events/names.ts";
 import { CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
 import {
   BRANCH_FORK_SECRET,
@@ -132,14 +131,13 @@ const BRANCH_SECRETS = "/run/alasio/branch";
 /**
  * What alasio is told of branch environments: main, where it forks sessions, where the
  * key their tokens are signed with is, from the stack's Secret, which may be made after
- * it starts; a branch, which it is, and where its parent forks the sessions it inherited
- * for it, with its token (src/branch/fork.ts).
+ * it starts; a branch, which it is, and its token to ask its parent to fork the sessions it
+ * inherited with, on the log (src/branch/fork.ts).
  */
 function branchEnv(config: InstallConfig, { branch }: Environment): V1EnvVar[] {
   if (branch) {
     return [
       { name: "ALASIO_BRANCH", value: branch },
-      { name: "ALASIO_PARENT_FORKS_URL", value: `http://${componentName("branches")}.${NAMESPACE}.svc:${BRANCH_FORK_PORT}` },
       { name: "ALASIO_BRANCH_FORK_TOKEN_FILE", value: `${BRANCH_SECRETS}/token` },
     ];
   }
@@ -211,8 +209,6 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     ...(harnessPoolsRun(config)
       ? [
         { name: "ALASIO_HARNESS_POOLS", value: "1" },
-        { name: "ALASIO_EVENTS_TOPIC", value: eventsTopic(environmentName(environment)) },
-        { name: "ALASIO_EVENTS_GROUP", value: eventsGroup(environmentName(environment)) },
         // Where its pools' pods reach its relay of its Codex login, which only it holds.
         { name: "ALASIO_CODEX_LOGIN_URL", value: `http://${CODEX_LOGIN}.${environment.namespace}.svc.cluster.local:${CODEX_LOGIN_PORT}/v1` },
       ]
@@ -272,10 +268,7 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
             workingDir: home,
             env: alasioEnv(config, home, operatorHome, environment),
             ...given("envFrom", [...alasio.envFrom]),
-            ...given("ports", [
-              ...(environment.branch === null && forksForBranches(config) ? [{ name: "branch-forks", containerPort: BRANCH_FORK_PORT }] : []),
-              ...(harnessPoolsRun(config) ? [{ name: "codex-login", containerPort: CODEX_LOGIN_PORT }] : []),
-            ]),
+            ...given("ports", [...(harnessPoolsRun(config) ? [{ name: "codex-login", containerPort: CODEX_LOGIN_PORT }] : [])]),
             securityContext: restrictedContainer(),
             resources: alasio.resources,
             volumeMounts: [
@@ -307,16 +300,6 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
         },
       },
     },
-  };
-}
-
-/** Where branch environments ask main to fork the sessions they inherited (src/branch/fork.ts). */
-function branchForksService(): V1Service {
-  return {
-    apiVersion: "v1",
-    kind: "Service",
-    metadata: { name: componentName("branches"), namespace: NAMESPACE, labels: labels("alasio") },
-    spec: { selector: selectorLabels("alasio"), ports: [{ name: "branch-forks", port: BRANCH_FORK_PORT, targetPort: "branch-forks" }] },
   };
 }
 
@@ -440,7 +423,6 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
     verticalPodAutoscaler(alasio, "AtStart"),
     // A drain waits for the turns running in its pod to end.
     busyBudget(environment.namespace),
-    ...(environment.branch === null && forksForBranches(config) ? [branchForksService()] : []),
     ...(harnessPoolsRun(config) ? [codexLoginService(environment)] : []),
     // What alasio may do beyond what RBAC can say: the cluster's, made with main's.
     ...(environment.branch === null ? busyLabelPolicy() : []),

@@ -1,6 +1,9 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { MAIN_ENVIRONMENT_NAME } from "./branch/names.ts";
+import type { EventsLog } from "./events/events.ts";
+import { eventsGroup, eventsTopic } from "./events/names.ts";
 import { ALASIO_GATEWAY_CALLER_KEY_VARIABLE, ALASIO_GATEWAY_ENVIRONMENT_VARIABLE, ALASIO_GATEWAY_FOLDERS_VARIABLE, ALASIO_GATEWAY_URL_VARIABLE } from "./gateway/names.ts";
 import { getDefaultHarness, type HarnessName } from "./harness/names.ts";
 import { type WakeLog, wakeLogOf } from "./neon/lake-wake.ts";
@@ -14,6 +17,10 @@ export interface AlasioConfig {
   readonly allowedUserIds: string;
   /** Where the bot's updates are: its environment's topic in the log, which alasio consumes. */
   readonly telegramLog: TelegramLog;
+  /** The log alasio's environment's events and its branches' forks are on: its brokers, and alasio's principal on them. */
+  readonly log: EventsLog;
+  /** Its environment's events topic on the log, and the group it reads it in (src/events/consume.ts), where it reads it. */
+  readonly events: TopicLog;
   /** Where alasio tells the lake's loader it wrote transcripts: its environment's wake topic in the log; null where the lake does not run. */
   readonly lakeWake: WakeLog | null;
   readonly workingDirectory: string | null;
@@ -40,20 +47,19 @@ export interface AlasioConfig {
   readonly folders: boolean;
   /**
    * Where alasio's conversations' harnesses run in pools of their own, through the sandbox
-   * gateway (src/harness/pooled-host.ts), as the deployment says (`ALASIO_HARNESS_POOLS`): its
-   * environment's events topic, which it hears their hosts on, and the group it reads it in; and
-   * where its pools' pods reach the relay of its Codex login it serves them
-   * (src/codex/login-relay.ts); null where they run in alasio's process.
+   * gateway (src/harness/pooled-host.ts), as the deployment says (`ALASIO_HARNESS_POOLS`), their
+   * hosts heard on its environment's events (`events`): where its pools' pods reach the relay of
+   * its Codex login it serves them (src/codex/login-relay.ts); null where they run in alasio's
+   * process.
    */
-  readonly harnessPools: { readonly events: TopicLog; readonly codexLoginUrl: string } | null;
+  readonly harnessPools: { readonly codexLoginUrl: string } | null;
   /** Whether alasio runs in a pod of Kubernetes, which it holds busy while a turn runs (src/kube/busy.ts). */
   readonly inKubernetes: boolean;
 }
 
-/** A branch environment: its name, and where it asks its parent to fork the sessions it inherited, with the token it is given. */
+/** A branch environment: its name, and the token it is given to ask its parent to fork the sessions it inherited with (src/branch/fork.ts). */
 export interface BranchEnvironment {
   readonly name: string;
-  readonly parentForks: string;
   readonly tokenFile: string;
 }
 
@@ -82,10 +88,15 @@ function requireEnv(env: NodeJS.ProcessEnv, key: string): string {
 }
 
 export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioConfig {
+  const log: EventsLog = { brokers: requireEnv(env, "ALASIO_LOG_BROKERS").split(","), username: requireEnv(env, "ALASIO_LOG_USERNAME"), passwordFile: requireEnv(env, "ALASIO_LOG_PASSWORD_FILE") };
+  const branch = env["ALASIO_BRANCH"]?.trim() || null;
+  const environment = branch ?? MAIN_ENVIRONMENT_NAME;
   return {
     telegramBotToken: requireEnv(env, "TELEGRAM_BOT_TOKEN"),
     allowedUserIds: env["TELEGRAM_ALLOWED_USER_IDS"] ?? "",
     telegramLog: telegramLogOf(env),
+    log,
+    events: { ...log, topic: eventsTopic(environment), group: eventsGroup(environment) },
     lakeWake: wakeLogOf(env),
     // Optional pre-mount for new conversations; unset means the operator picks a folder in Telegram.
     workingDirectory: env["WORKING_DIRECTORY"]?.trim() || null,
@@ -97,9 +108,7 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
     keepCodexLogin: env["ALASIO_KEEP_CODEX_LOGIN"] === "1",
     warmLinkedSessions: env["ALASIO_WARM_LINKED_SESSIONS"] === "1",
     defaultHarness: getDefaultHarness(env),
-    branch: env["ALASIO_BRANCH"]?.trim()
-      ? { name: env["ALASIO_BRANCH"].trim(), parentForks: requireEnv(env, "ALASIO_PARENT_FORKS_URL"), tokenFile: requireEnv(env, "ALASIO_BRANCH_FORK_TOKEN_FILE") }
-      : null,
+    branch: branch ? { name: branch, tokenFile: requireEnv(env, "ALASIO_BRANCH_FORK_TOKEN_FILE") } : null,
     branchForkKeyFile: env["ALASIO_BRANCH_FORK_KEY_FILE"]?.trim() || null,
     sessionsGateway: env[ALASIO_GATEWAY_URL_VARIABLE]?.trim()
       ? {
@@ -110,17 +119,8 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
       : null,
     folders: env[ALASIO_GATEWAY_FOLDERS_VARIABLE] === "1",
     harnessPools: env["ALASIO_HARNESS_POOLS"] === "1"
-      ? {
-        events: {
-          brokers: requireEnv(env, "ALASIO_LOG_BROKERS").split(","),
-          username: requireEnv(env, "ALASIO_LOG_USERNAME"),
-          passwordFile: requireEnv(env, "ALASIO_LOG_PASSWORD_FILE"),
-          topic: requireEnv(env, "ALASIO_EVENTS_TOPIC"),
-          group: requireEnv(env, "ALASIO_EVENTS_GROUP"),
-        },
-        // Where its pools' pods reach its relay of its Codex login.
-        codexLoginUrl: requireEnv(env, "ALASIO_CODEX_LOGIN_URL"),
-      }
+      // Where its pools' pods reach its relay of its Codex login.
+      ? { codexLoginUrl: requireEnv(env, "ALASIO_CODEX_LOGIN_URL") }
       : null,
     inKubernetes: Boolean(env["ALASIO_POD"]?.trim()),
   };

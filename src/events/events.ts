@@ -21,7 +21,9 @@
  * - `harness.lost`, `harness.released`: likewise of a conversation's harness's binding;
  * - `harness.background-response`: a conversation's harness, running on between prompts, has
  *   a reply of its own completed in the store, to deliver;
- * - `harness.idle`: it let go of the conversation, which may run what waits on it.
+ * - `harness.idle`: it let go of the conversation, which may run what waits on it;
+ * - `workspace.fork-answered`: a branch's alasio's request to fork one of its parent's
+ *   sessions into it (src/branch/fork.ts), as its parent's alasio answered it.
  */
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -38,8 +40,8 @@ export const EVENTS_VERSION = 1;
 /** What an event is about: a session's workspace, by its key, or a conversation, by its. */
 const Subject = Schema.Struct({ kind: Schema.Literals(["workspace", "conversation"]), key: Schema.String });
 
-/** What tells of events: the sandbox gateway, of what it binds; a harness pool's host, of what its harness does on its own. */
-export const EVENT_SOURCES = ["sandbox-gateway", "harness"] as const;
+/** What tells of events: the sandbox gateway, of what it binds; a harness pool's host, of what its harness does on its own; a parent's alasio, of its branches' forks it answered. */
+export const EVENT_SOURCES = ["sandbox-gateway", "harness", "alasio"] as const;
 
 const envelope = {
   v: Schema.Literal(EVENTS_VERSION),
@@ -63,8 +65,25 @@ const HarnessReleased = Schema.Struct({ ...envelope, kind: Schema.Literal("harne
 const HarnessBackgroundResponse = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.background-response") });
 const HarnessIdle = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.idle") });
 
+/**
+ * What became of a branch's request to fork its parent's session `volumeId`, the request's id
+ * `request`: forked, with the internet it was made with; not the parent's to give; a turn
+ * running in it; or refused, saying why; signed by the parent with the branch's token, as no one
+ * else who may write the branch's events holds it (../branch/fork.ts).
+ */
+const WorkspaceForkAnswered = Schema.Struct({
+  ...envelope,
+  kind: Schema.Literal("workspace.fork-answered"),
+  request: Schema.String,
+  volumeId: Schema.String,
+  outcome: Schema.Literals(["forked", "unknown", "busy", "refused"]),
+  netMode: Schema.NullOr(Schema.Literals(["none", "full"])),
+  reason: Schema.NullOr(Schema.String),
+  signature: Schema.String,
+});
+
 /** An event, of any kind this release knows. */
-export const Event = Schema.Union([WorkspaceExecEnded, WorkspaceLost, WorkspaceReleased, HarnessLost, HarnessReleased, HarnessBackgroundResponse, HarnessIdle]);
+export const Event = Schema.Union([WorkspaceExecEnded, WorkspaceLost, WorkspaceReleased, HarnessLost, HarnessReleased, HarnessBackgroundResponse, HarnessIdle, WorkspaceForkAnswered]);
 export type Event = typeof Event.Type;
 
 /** The kinds this release knows. */
@@ -106,13 +125,18 @@ export interface EventsLog {
   readonly passwordFile: string;
 }
 
+/** An event the log did not take. */
+export class EventNotTold extends Schema.TaggedError<EventNotTold>()("EventNotTold", { message: Schema.String }) {}
+
 /** What tells of events: on the log, or nothing, as in tests. */
 export class Events extends Context.Service<Events, {
   /** Tells of `event`, on its environment's topic; never fails: one not written is logged. */
   readonly tell: (event: EventInput) => Effect.Effect<void>;
+  /** Tells of `event`, on its environment's topic, failing where the log did not take it, for what tells to tell again. */
+  readonly send: (event: EventInput) => Effect.Effect<void, EventNotTold>;
 }>()("alasio/events/Events") {
   /** Nothing told. */
-  static readonly none = Layer.succeed(Events, Events.of({ tell: () => Effect.void }));
+  static readonly none = Layer.succeed(Events, Events.of({ tell: () => Effect.void, send: () => Effect.void }));
 
   /** On the log, as `log` says, with @platformatic/kafka, alasio's one Kafka client, until the scope closes; each record written once every node has it. */
   static readonly make = (log: EventsLog): Effect.Effect<Events["Service"], never, Scope.Scope> =>
@@ -128,15 +152,17 @@ export class Events extends Context.Service<Events, {
         ),
         (made) => Effect.promise(() => made.close().catch(() => {})),
       );
+      const send = (event: EventInput): Effect.Effect<void, EventNotTold> =>
+        Effect.gen(function*() {
+          const record = eventRecord(event, yield* Clock.currentTimeMillis);
+          yield* Effect.tryPromise({
+            try: () => producer.send({ messages: [{ topic: record.topic, key: Buffer.from(record.key), value: Buffer.from(record.value) }] }),
+            catch: (error) => new EventNotTold({ message: `could not tell of ${event.kind} of ${event.subject.key}: ${error instanceof Error ? error.message : String(error)}` }),
+          });
+        });
       return Events.of({
-        tell: (event) =>
-          Effect.gen(function*() {
-            const record = eventRecord(event, yield* Clock.currentTimeMillis);
-            yield* Effect.tryPromise(() => producer.send({ messages: [{ topic: record.topic, key: Buffer.from(record.key), value: Buffer.from(record.value) }] }));
-          }).pipe(
-            Effect.catch((error) => Effect.logWarning(`could not tell of ${event.kind} of ${event.subject.key}: ${error.message}`)),
-            withLogScope("events"),
-          ),
+        send,
+        tell: (event) => send(event).pipe(Effect.catch((error) => Effect.logWarning(error.message)), withLogScope("events")),
       });
     });
 

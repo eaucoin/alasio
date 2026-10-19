@@ -5,8 +5,8 @@
  * bot's; prompts queued and turns running, which a restart's recovery
  * would run again; replies on their way, which would be sent again, by this bot; buttons,
  * which this bot never sent, and presses of them under way; Codex's login, whose refresh
- * token works once, so that using it here would log the other out; and the events it
- * handled, another environment's. All of it goes, once, in one transaction; the
+ * token works once, so that using it here would log the other out; and the events and
+ * forks it handled, another environment's. All of it goes, once, in one transaction; the
  * conversations, what they mount, and their history stay.
  */
 import { Effect } from "effect";
@@ -43,6 +43,8 @@ export const startBranch = (database: Database, schema: string, branch: string):
         delete from ${schema}.press_jobs;
         delete from ${schema}.codex_login;
         delete from ${schema}.events_handled;
+        delete from ${schema}.fork_requests;
+        delete from ${schema}.fork_answers;
       `);
       return true;
     })

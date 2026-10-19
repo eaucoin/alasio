@@ -11,6 +11,7 @@ import type { Update } from "@grammyjs/types";
 import { Context, Duration, Effect, Layer, Option, Schema } from "effect";
 import type { Pool } from "pg";
 
+import { EVENTS_HANDLED_KEPT_MS } from "../events/names.ts";
 import type { HarnessName } from "../harness/names.ts";
 import type { MediaAttachment } from "../telegram/client.ts";
 import { startBranch } from "./branch-start.ts";
@@ -28,6 +29,7 @@ import {
   type WorkspaceConversation,
 } from "./conversation-repository.ts";
 import { NeonEventRepository } from "./event-repository.ts";
+import { type ForkAnswer, type ForkRequestAnswered, NeonForkRepository } from "./fork-repository.ts";
 import { type DueOutboxEntry, NeonOutboxRepository, type NewOutboxStatus, type NewOutboxText } from "./outbox-repository.ts";
 import { type KeptPress, NeonPressRepository, type NewKeptPress } from "./press-repository.ts";
 import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState } from "./prompt-job-repository.ts";
@@ -136,6 +138,7 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
   sessionWorkspaces: new NeonSessionWorkspaceRepository(sql, schema),
   presses: new NeonPressRepository(sql, schema),
   events: new NeonEventRepository(sql, schema),
+  forks: new NeonForkRepository(sql, schema),
 });
 
 /** The record of bot_state that says when the store was last pruned (Store pruneTransientIfDue). */
@@ -182,6 +185,8 @@ export interface EventWrites {
   readonly enqueueOutboxNotice: (conversationId: string, notice: NewOutboxText) => Stored<boolean>;
   /** Queues a prompt: the job queued, or the one already queued for its message. */
   readonly enqueuePromptJob: (job: NewPromptJob) => Stored<PromptJob>;
+  /** Records the answer this alasio's parent gave its request `request` to fork `volumeId` for it (src/branch/fork.ts), unless it was already. */
+  readonly recordForkAnswer: (request: string, volumeId: string, answer: ForkAnswer) => Stored<void>;
 }
 
 /**
@@ -448,9 +453,18 @@ export class Store extends Context.Service<Store, {
    */
   readonly withEventHandled: <A, E, R>(id: string, kind: string, work: (writes: EventWrites) => Effect.Effect<A, E, R>) => Effect.Effect<Option.Option<A>, E | StoreError, R>;
 
+  /** The session its branch `branch`'s fork request `id` asked this alasio, as a parent, for, and how it answered it; null where it has yet to. */
+  readonly forkRequestAnswered: (branch: string, id: string) => Stored<ForkRequestAnswered | null>;
+  /** Records `branch`'s fork request `id` for `volumeId`, answered as `answer`, unless it was answered already: what it holds, which is told again. */
+  readonly recordForkRequest: (branch: string, id: string, volumeId: string, answer: ForkAnswer) => Stored<ForkRequestAnswered>;
+  /** The answer this alasio's parent gave its own fork request `request`, or null where none has come yet. */
+  readonly forkAnswerTo: (request: string) => Stored<ForkAnswer | null>;
+
   /**
    * Deletes what is only kept while it is in flight, `age` after it landed: updates
-   * processed, albums handled, replies delivered, and events handled.
+   * processed, albums handled, replies delivered, and forks' requests and answers; and the
+   * events handled once their topic can hold them no more, EVENTS_HANDLED_KEPT_MS after,
+   * however young `age` is (../events/names.ts).
    */
   readonly pruneTransient: (age: Duration.Input) => Stored<void>;
   /**
@@ -495,11 +509,11 @@ const makeStore = Effect.fnUntraced(function*({
   /** `notice` queued to the conversation, recorded as told, on the transaction's repositories `on`, unless it was told already: whether it was queued now. */
   const noticeOn = (on: ReturnType<typeof repositoriesOn>, conversationId: string, notice: NewOutboxText): Stored<boolean> =>
     Effect.flatMap(on.outbox.recordNotice(conversationId, notice.text), (fresh) => (fresh ? Effect.as(on.outbox.enqueueText(notice), true) : Effect.succeed(false)));
-  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin, sessionWorkspaces, presses, events } = repositoriesOn(database);
+  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin, sessionWorkspaces, presses, events, forks } = repositoriesOn(database);
 
   const pruneTransient = (age: Duration.Input): Stored<void> => {
     const ageMs = Duration.toMillis(age);
-    return Effect.all([telegramContent.pruneHandled(ageMs), outbox.pruneSent(ageMs), events.pruneHandled(ageMs)], { discard: true });
+    return Effect.all([telegramContent.pruneHandled(ageMs), outbox.pruneSent(ageMs), events.pruneHandled(EVENTS_HANDLED_KEPT_MS), forks.prune(ageMs)], { discard: true });
   };
 
   return Store.of({
@@ -708,11 +722,15 @@ const makeStore = Effect.fnUntraced(function*({
                 enqueueOutboxText: (text) => on.outbox.enqueueText(text),
                 enqueueOutboxNotice: (conversationId, notice) => noticeOn(on, conversationId, notice),
                 enqueuePromptJob: (job) => on.promptJobs.enqueue(job),
+                recordForkAnswer: (request, volumeId, answer) => on.forks.recordAnswer(request, volumeId, answer),
               }),
               Option.some,
             )
             : Effect.succeed(Option.none()));
       }),
+    forkRequestAnswered: (branch, id) => forks.requestAnswered(branch, id),
+    recordForkRequest: (branch, id, volumeId, answer) => forks.recordRequest(branch, id, volumeId, answer),
+    forkAnswerTo: (request) => forks.answerTo(request),
     pruneTransient,
     pruneTransientIfDue: (age, every) =>
       Effect.flatMap(state.claimUnlessWithin(PRUNED_KEY, "pruned", Duration.toMillis(every)), (claimed) => (claimed ? Effect.as(pruneTransient(age), true) : Effect.succeed(false))),

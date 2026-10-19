@@ -50,6 +50,7 @@ import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHIN
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { goferOf, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
 import { apiServerUnconfined } from "../src/install.ts";
+import { environmentAccess } from "../src/manifests/log.ts";
 import { carriedPools, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
 import { folderStateDir, templateHash } from "../../src/gateway/names.ts";
 import { hookOf } from "../../src/gateway/snapshots.ts";
@@ -1872,7 +1873,7 @@ describe("the log", () => {
     assert.match(refusal({ log: { storage: { size: "1Gi" } }, lake: { intake: { scaling: { max: 4 } } } }), /^log\.storage\.size must be at least 2\.0 GiB: each of the telemetry topics' 12 partitions /u);
   });
 
-  test("gives each principal what it does alone: the gateway writes the telemetry topics, the intake reads them in its group, KEDA describes both and the wake topics, the webhook intake writes the Telegram topics, the sandbox gateway the events topics, main's alasio reads its own and its events, each in its group, and writes its wake topic, main's loader reads that, and main's harness pools' hosts write its events and its wake topic alone", () => {
+  test("gives each principal what it does alone: the gateway writes the telemetry topics, the intake reads them in its group, KEDA describes both and the wake topics, the webhook intake writes the Telegram topics, the sandbox gateway the events topics, main's alasio reads its own and its events, each in its group, writes its wake topic, reads the branches' requests to fork its sessions and answers on their events, main's loader reads that, and main's harness pools' hosts write its events and its wake topic alone", () => {
     const access = JSON.parse(logConfig(install())["access.json"] ?? "");
     // Each telemetry topic flushed to the volume within a second, so a host's crash loses a second of what it acknowledged at most, and kept compressed.
     assert.deepEqual(access.topics, [
@@ -1883,6 +1884,8 @@ describe("the log", () => {
       { name: "lake.main", partitions: 1, retentionMs: 86_400_000, retentionBytes: 64 * 1024 * 1024, configs: {} },
       // A week of main's events, on one partition, as its one alasio reads them, each flushed as it is written, as what told of it tells no more.
       { name: "events.main", partitions: 1, retentionMs: 604_800_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
+      // A day of the branches' requests to fork main's sessions, past the wait for an answer, each flushed as it is written, as a branch waits for its answer.
+      { name: "forks.main", partitions: 1, retentionMs: 86_400_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
     ]);
     const telemetry = { resource: "topic", name: "otel.", pattern: "prefixed" };
     const group = { resource: "group", name: "lake-intake", pattern: "literal" };
@@ -1908,6 +1911,9 @@ describe("the log", () => {
           { resource: "topic", name: "lake.main", pattern: "literal", operations: ["write", "describe"] },
           { resource: "topic", name: "events.main", pattern: "literal", operations: ["read", "describe"] },
           { resource: "group", name: "alasio-events.main", pattern: "literal", operations: ["read"] },
+          { resource: "topic", name: "forks.main", pattern: "literal", operations: ["read", "describe"] },
+          { resource: "group", name: "alasio-forks.main", pattern: "literal", operations: ["read"] },
+          { resource: "topic", name: "events.", pattern: "prefixed", operations: ["write", "describe"] },
         ],
       },
       {
@@ -2653,10 +2659,9 @@ describe("branch environments", () => {
     assert.deepEqual(all<V1Service>(branch, "Service").map(({ metadata }) => metadata?.name).sort(), ["alasio-neon-compute", "alasio-neon-compute-ro"]);
   });
 
-  test("run an alasio that knows it is the branch, asks main to fork what it inherited with its token, and sends its telemetry tagged with the branch", () => {
+  test("run an alasio that knows it is the branch, asks main to fork what it inherited with its token, on the log, and sends its telemetry tagged with the branch", () => {
     const alasio = of<V1Deployment>("Deployment", "alasio");
     assert.equal(variable(alasio, "ALASIO_BRANCH"), "try");
-    assert.equal(variable(alasio, "ALASIO_PARENT_FORKS_URL"), "http://alasio-branches.alasio.svc:4319");
     assert.equal(variable(alasio, "ALASIO_BRANCH_FORK_TOKEN_FILE"), "/run/alasio/branch/token");
     assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "branch"), { name: "branch", secret: { secretName: "alasio-branch-fork", items: [{ key: "token", path: "token" }] } });
     // Its sessions' telemetry is the sandbox service's receiver's, never its own.
@@ -2677,6 +2682,20 @@ describe("branch environments", () => {
     }
     const tagged = branchObjects(configOf({ telemetry: { resourceAttributes: "deployment.environment.name=prod" } }), "try", BASELINE);
     assert.equal(variable(one<V1Deployment>(tagged, "Deployment", "alasio"), "OTEL_RESOURCE_ATTRIBUTES"), "deployment.environment.name=prod,alasio.branch=try");
+  });
+
+  test("have an alasio principal on the log that reads its own topics in its groups, writes its wake topic, and asks main to fork its sessions on main's forks topic, which it reads not, beside topics of their own alone", () => {
+    const access = environmentAccess("try");
+    assert.deepEqual(access.principals.find(({ name }) => name === "alasio-try")?.acls, [
+      { resource: "topic", name: "telegram.try", pattern: "literal", operations: ["read", "describe"] },
+      { resource: "group", name: "alasio.try", pattern: "literal", operations: ["read"] },
+      { resource: "topic", name: "lake.try", pattern: "literal", operations: ["write", "describe"] },
+      { resource: "topic", name: "events.try", pattern: "literal", operations: ["read", "describe"] },
+      { resource: "group", name: "alasio-events.try", pattern: "literal", operations: ["read"] },
+      { resource: "topic", name: "forks.main", pattern: "literal", operations: ["write", "describe"] },
+    ]);
+    // Main's forks topic is main's, made and forgotten with it alone.
+    assert.deepEqual(access.topics.map(({ name }) => name), ["telegram.try", "lake.try", "events.try"]);
   });
 
   test("make no session of its alasio's, its sessions main's sandbox service's in the branch's own namespace", () => {
@@ -2744,7 +2763,7 @@ describe("branch environments", () => {
     assert.ok(policy("alasio-neon-compute", "alasio-branch-try"));
   });
 
-  test("reach none of main's compute, alasio (but its fork of their sessions, from their alasio) or lake, as the policies of both admit them", () => {
+  test("reach none of main's compute, alasio or lake, as the policies of both admit them, asking main to fork their sessions on the log", () => {
     const main = install();
     const policies = [...all<NetworkPolicyObject>(main, "NetworkPolicy"), ...all<NetworkPolicyObject>(branch, "NetworkPolicy")];
     const namespaces = new Map(all<V1Namespace>(branch, "Namespace").map(({ metadata }) => [metadata?.name ?? "", metadata?.labels ?? {}]));
@@ -2762,14 +2781,14 @@ describe("branch environments", () => {
     };
     const targets: [string, Pod, number][] = [
       ["main's compute", podOf(main, "alasio-neon-compute", "alasio"), 55433],
-      ...[4318, 4319].map((port): [string, Pod, number] => [`main's alasio on ${port}`, podOf(main, "alasio", "alasio"), port]),
+      ["main's alasio on 4318", podOf(main, "alasio", "alasio"), 4318],
       [`main's lake's readers`, podOf(main, "alasio-lake-query", "alasio"), 8090],
       [`main's lake's loader`, podOf(main, "alasio-lake-loader", "alasio"), 9464],
     ];
     const reached = Object.entries(branchPods).flatMap(([from, pod]) =>
       targets.filter(([, target, port]) => admits(policies, pod, target, port)).map(([to]) => `${from} → ${to}`)
     );
-    assert.deepEqual(reached, ["alasio → main's alasio on 4319"]);
+    assert.deepEqual(reached, []);
   });
 
   test("reach every compute through main's Neon proxy alone, which with main's neon-control alone reaches one, and main's collector's scraper main's metrics alone", () => {
@@ -2818,7 +2837,7 @@ describe("branch environments", () => {
     assert.ok(!admits(policies, podIn("alasio-branch-try-sessions", { "alasio.dev/workload": "session" }), proxy, 5432));
   });
 
-  test("are admitted by main to what they share of its storage alone, and to its fork of their sessions, which only main forks", () => {
+  test("are admitted by main to what they share of its storage alone, and have their sessions forked by main alone, which is given the key their tokens are signed with", () => {
     const main = install();
     const policy = (name: string) => one<KubernetesObject & { spec: Record<string, unknown> }>(main, "NetworkPolicy", name).spec;
     const branches = { matchExpressions: [{ key: "alasio.dev/branch", operator: "Exists" }] };
@@ -2833,21 +2852,18 @@ describe("branch environments", () => {
         ports: [6400, 5454, 8080, 5432, 8333].map((port) => ({ protocol: "TCP", port })),
       }],
     });
-    assert.deepEqual((policy("alasio-alasio")["ingress"] as unknown[]).at(-1), {
-      from: [{ namespaceSelector: branches, podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "alasio" } } }],
-      ports: [{ protocol: "TCP", port: 4319 }],
-    });
+    // alasio takes no connections, theirs asking main's to fork their sessions on the log.
+    assert.equal(policy("alasio-alasio")["ingress"], undefined);
     const alasio = one<V1Deployment>(main, "Deployment", "alasio");
     assert.equal(container(alasio).env?.find(({ name }) => name === "ALASIO_BRANCH_FORK_KEY_FILE")?.value, "/run/alasio/branch/fork-key");
     assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "branch"), {
       name: "branch",
       secret: { secretName: "alasio-branches", items: [{ key: "fork-key", path: "fork-key" }], optional: true },
     });
-    assert.deepEqual(one<V1Service>(main, "Service", "alasio-branches").spec?.ports, [{ name: "branch-forks", port: 4319, targetPort: "branch-forks" }]);
-    // Where main forks no session, it serves no fork.
+    assert.equal(container(alasio).ports, undefined);
+    // Where main forks no session, it is given no key.
     const unforked = install({ workspaceStorage: { enabled: false } });
     assert.equal(container(one<V1Deployment>(unforked, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_BRANCH_FORK_KEY_FILE"), undefined);
-    assert.deepEqual(all(unforked, "Service").filter(({ metadata }) => metadata?.name === "alasio-branches"), []);
   });
 });
 
@@ -3750,11 +3766,11 @@ describe("conversations' harnesses' pools", () => {
     }
     // No folder conversation's, of no host profile.
     assert.deepEqual(all<V1Deployment>(objects, "Deployment").filter(({ metadata }) => metadata?.name?.startsWith("harness-folder-")), []);
-    // The gateway configured with them, and alasio told they run so, hearing its events in its group.
+    // The gateway configured with them, and alasio told they run so.
     const config = JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}");
     assert.deepEqual(config.harnesses, { namespace: "alasio", pools: { codex: "harness-codex", claude: "harness-claude" }, podPort: 8080, owner: { uid: 1000, gid: 1000 }, releaseAfterSeconds: 300, drainSeconds: 120, folders: null });
     const alasio = Object.fromEntries((container(one<V1Deployment>(objects, "Deployment", "alasio")).env ?? []).map(({ name, value }) => [name, value]));
-    assert.deepEqual([alasio["ALASIO_HARNESS_POOLS"], alasio["ALASIO_EVENTS_TOPIC"], alasio["ALASIO_EVENTS_GROUP"]], ["1", "events.main", "alasio-events.main"]);
+    assert.equal(alasio["ALASIO_HARNESS_POOLS"], "1");
     // Its Codex login relayed to its pools' pods, on its pod's port, through a Service of its own.
     assert.equal(alasio["ALASIO_CODEX_LOGIN_URL"], "http://alasio-codex-login.alasio.svc.cluster.local:4320/v1");
     assert.deepEqual(container(one<V1Deployment>(objects, "Deployment", "alasio")).ports?.find(({ name }) => name === "codex-login")?.containerPort, 4320);
@@ -3813,7 +3829,6 @@ describe("conversations' harnesses' pools", () => {
       assert.equal(connects(policies, pod, internet, 443), true);
       assert.equal(connects(policies, pod, privateAddress, 443), false);
       assert.equal(connects(policies, pod, agent, 8484), false);
-      assert.equal(connects(policies, pod, alasio, 4319), false);
       // Its alasio's relay of its Codex login.
       assert.equal(connects(policies, pod, alasio, 4320), true);
     }

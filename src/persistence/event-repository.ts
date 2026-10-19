@@ -20,7 +20,7 @@ export class NeonEventRepository {
     ).pipe(Effect.map((rows) => rows.length > 0));
   }
 
-  /** Forgets the events handled more than `ageMs` ago, which their topic no longer keeps. */
+  /** Forgets the events handled more than `ageMs` ago. */
   pruneHandled(ageMs: number): Effect.Effect<void, StoreError> {
     return Effect.asVoid(this.#sql.query(`delete from ${this.#schema}.events_handled where handled_at < now() - make_interval(secs => $1)`, [ageMs / 1000]));
   }

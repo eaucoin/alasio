@@ -3,10 +3,14 @@
  * when the process is told to stop (SIGTERM, SIGINT) or what it runs fails, after which
  * the telemetry it holds is flushed and the process exits.
  */
-import { Cause, Effect } from "effect";
+import { Cause, Effect, Layer } from "effect";
 
 import { HARNESS_ROLE } from "../neon/control/secrets.ts";
+import { ForkAsks, ForkRequests } from "./branch/fork.ts";
+import { forksGroup, forksTopic, MAIN_ENVIRONMENT_NAME } from "./branch/names.ts";
 import { loadAlasioConfig } from "./config.ts";
+import { EnvironmentEvents } from "./events/consume.ts";
+import { Events } from "./events/events.ts";
 import { codexHome } from "./codex/env.ts";
 import { CodexRollouts, SessionFsCodexRollouts } from "./codex/rollouts/index.ts";
 import { sessionFsCodexHome } from "./codex/sessionfs.ts";
@@ -32,9 +36,19 @@ const alasio = Effect.gen(function*() {
   const sessionFsCodexRollouts = config.sessionsGateway
     ? yield* SessionFsCodexRollouts.make({ store: yield* neon.sessionFsRollouts, home: sessionFsCodexHome(config.stateDir) })
     : null;
+  // A branch asks main to fork the sessions it inherited, on main's forks topic, and hears
+  // its answers among its own events; main reads its forks topic and answers on theirs.
   yield* serveAlasio({
     ...config,
     updates: TelegramUpdates.layer(config.telegramLog),
+    parentLog: config.branch ? Layer.effect(ForkAsks, ForkAsks.make({ ...config.log, topic: forksTopic(MAIN_ENVIRONMENT_NAME) })) : undefined,
+    events: config.harnessPools || config.branch ? EnvironmentEvents.layer(config.events, { branch: config.branch !== null }) : undefined,
+    branchesLog: config.branch === null && config.branchForkKeyFile
+      ? Layer.merge(
+        ForkRequests.layer({ ...config.log, topic: forksTopic(MAIN_ENVIRONMENT_NAME), group: forksGroup(MAIN_ENVIRONMENT_NAME) }),
+        Layer.effect(Events, Events.make(config.log)),
+      )
+      : undefined,
     pool: neon.pool,
     harnessRole: HARNESS_ROLE,
     sessionStore: neon.sessionStore,
