@@ -42,9 +42,16 @@ function text(part: ContentBlock | undefined): string {
   return part.text;
 }
 
+/**
+ * How long a request waits for its answer: the gateway binds the folder instance as the first
+ * one comes, its pod's image pulled first where its node has none, as a bayma of another
+ * release's is, for as long as the gateway waits on a pull.
+ */
+const ANSWER_MS = 10 * 60_000;
+
 /** Calls bayma's tool `name`, which must succeed: what it answered, as JSON, where it answers any. */
 async function call<T>(client: Client, name: string, args: Record<string, unknown>): Promise<T> {
-  const result = (await client.callTool({ name, arguments: args })) as CallToolResult;
+  const result = (await client.callTool({ name, arguments: args }, undefined, { timeout: ANSWER_MS })) as CallToolResult;
   if (result.isError) throw new Error(`bayma's ${name} failed: ${text(result.content[0])}`);
   if (result.structuredContent) return result.structuredContent as T;
   const said = result.content.find((part) => part.type === "text");
@@ -60,7 +67,7 @@ async function exec(client: Client, sessionId: string, code: string): Promise<{ 
 
 const client = new Client({ name: "alasio-e2e", version: "1.0.0" });
 // The transport is one; the SDK declares its sessionId `string | undefined` where Transport has it optional.
-await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }) as Transport);
+await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }) as Transport, { timeout: ANSWER_MS });
 try {
   if (verb === "set") {
     const value = JSON.stringify(rest[0]);
