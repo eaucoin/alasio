@@ -842,6 +842,13 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
     stdio: ["ignore", "pipe", "pipe"],
   }));
   if (ran.code === 0) current().bin = release;
+  // What the upgrade and its check said, which the cut-over keeps in its record alone: a failure of theirs says only where to look.
+  else {
+    for (const name of ["upgrade-check.log", "upgrade.log"]) {
+      const kept = await inCutOverRecord(`if [ -f ${name} ]; then tail -n 80 ${name}; else echo "(none)"; fi`).catch((error: unknown) => `could not be read: ${String(error)}`);
+      console.error(`# the cut-over's ${name}, its last lines:\n${kept.trimEnd()}`);
+    }
+  }
   return ran;
 }
 
