@@ -699,7 +699,7 @@ test("8. a restore from the bucket whose proxy goes away during its background r
           try {
             const directory = at(`bucket-${image}`);
             await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && umask 077 && printf '%s' ${q(goferOptions(`${layersPrefix}${own}/`, layersPrefix, relay.endpoint, { access_key_id: token.accessKeyId, secret_access_key: token.secretAccessKey }))} >${q(`${directory}/s3_opts.json`)}`);
-            await debugOn();
+            await debugOn(`outage-${name}`);
             const startedAt = Date.now();
             const restored = await restoreFrom(directory);
             outcome["restore"] = restored;
@@ -758,19 +758,24 @@ test("8. a restore from the bucket whose proxy goes away during its background r
     }
   }));
 
-/** Where runsc writes its debug logs while the gate has it (debugOn). */
+/** Where runsc writes its debug logs while the gate has it (debugOn), in a directory of each name's. */
 const DEBUG_LOGS = "/var/log/gate-12-runsc";
 
-/** Has every runsc the shim runs from now write its debug logs, of each of its commands, the sandbox's and gofers' among them, under DEBUG_LOGS. */
-async function debugOn(): Promise<void> {
-  await node(`rm -rf ${q(DEBUG_LOGS)} && mkdir -p ${q(DEBUG_LOGS)} && cp ${q(OPTIONS)} ${q(`${OPTIONS}.gate-12`)} && printf '%s\\n' '  debug = "true"' '  debug-log = "${DEBUG_LOGS}/"' >>${q(OPTIONS)}`);
+/**
+ * Has every runsc the shim runs from now write its debug logs, of each of its commands, the
+ * sandbox's and gofers' among them, under DEBUG_LOGS/`name`: a directory of its own, as the
+ * sandboxes of a name before write theirs on into theirs for as long as they run.
+ */
+async function debugOn(name: string): Promise<void> {
+  const logs = `${DEBUG_LOGS}/${name}`;
+  await node(`mkdir -p ${q(logs)} && cp ${q(OPTIONS)} ${q(`${OPTIONS}.gate-12`)} && printf '%s\\n' '  debug = "true"' '  debug-log = "${logs}/"' >>${q(OPTIONS)}`);
 }
 
 /** Has runsc write no debug logs again, and keeps those it wrote in $OUT/`name`-runsc, the evidence's: where they are, and how many bytes. */
 async function debugOff(name: string): Promise<{ readonly at: string; readonly bytes: number }> {
   const at = join(OUT, `${name}-runsc`);
   await node(`mv ${q(`${OPTIONS}.gate-12`)} ${q(OPTIONS)}`);
-  const bytes = Number((await node(`rm -rf ${q(at)} && mkdir -p ${q(at)} && cp -r ${q(DEBUG_LOGS)}/. ${q(at)}/ && chmod -R a+rX ${q(at)} && du -sb ${q(at)} | cut -f1`)).trim());
+  const bytes = Number((await node(`rm -rf ${q(at)} && mkdir -p ${q(at)} && cp -r ${q(`${DEBUG_LOGS}/${name}`)}/. ${q(at)}/ && chmod -R a+rX ${q(at)} && du -sb ${q(at)} | cut -f1`)).trim());
   return { at, bytes };
 }
 
