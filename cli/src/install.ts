@@ -19,7 +19,7 @@ import { describeRef, hasStatus, kind, KubeApi, type KubeApiError, refOf } from 
 import { type ApplyError, applyInstallation, labelled } from "./kube/apply.ts";
 import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts";
 import { checkObjectStoreLayout, checkObjectStoreScale, type ObjectStoreScaleRefused } from "./kube/object-store-scale.ts";
-import type { WaitOptions } from "./kube/rollout.ts";
+import type { NotReadyInTime, RolloutFailed, WaitOptions } from "./kube/rollout.ts";
 import type { CpuBaseline, Kept } from "./manifests/alasio.ts";
 import { labels, NAMESPACE, nodeAgentRuns } from "./manifests/common.ts";
 import { mountServices as mountServicesOf, sandboxServiceRuns } from "./manifests/sandbox-gateway.ts";
@@ -196,9 +196,10 @@ interface Checked {
  */
 export const checkInstallation = Effect.fnUntraced(function*(
   config: OperatorConfig,
+  wait?: WaitOptions,
 ): Effect.fn.Return<
   Checked,
-  KubeApiError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused | SessionWorkspacesLeft,
+  KubeApiError | NotReadyInTime | RolloutFailed | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused | SessionWorkspacesLeft,
   KubeApi
 > {
   const bot = yield* readTelegramBot;
@@ -217,7 +218,7 @@ export const checkInstallation = Effect.fnUntraced(function*(
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
-  yield* checkNeonStorage(settings);
+  yield* checkNeonStorage(settings, wait);
   if (settings.sessions.enabled) yield* checkSessionWorkspacesGone(settings.sessions.namespace);
   yield* checkApplicable(objects);
   return { bot, settings, objects, liveGateway, recorded, gvisorReleases, checksum, apiServer, mountServices };
@@ -238,7 +239,7 @@ export const install = Effect.fnUntraced(function*(
   KubeApi | TelegramBotApi
 > {
   yield* ensureBotChecksumKey;
-  const { bot, settings, objects, liveGateway, recorded, gvisorReleases, checksum, apiServer, mountServices } = yield* checkInstallation(config);
+  const { bot, settings, objects, liveGateway, recorded, gvisorReleases, checksum, apiServer, mountServices } = yield* checkInstallation(config, options);
   const route = yield* ensureRoute("main", bot.allowedUserIds);
   yield* applyInstallation(objects, options);
   yield* registerBot(settings, "main", bot, route, options);

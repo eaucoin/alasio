@@ -1873,6 +1873,25 @@ test("up refuses to apply anything while the storage controller's database, its 
   succeeded(await alasio(["up"]));
 });
 
+test("up waits for the storage controller's database to run again, as after it restarted the cluster's k3s, before it asks it what Neon's storage holds", async (t) => {
+  const { alasio, kube, neon } = await branchable(t);
+  // Its pod starting again, as k3s restarted: not yet ready, nor answering.
+  const database = kube.get("/apis/apps/v1/namespaces/alasio/statefulsets/alasio-neon-controller-db");
+  const pod = kube.get("/api/v1/namespaces/alasio/pods/alasio-neon-controller-db-0");
+  assert.ok(database && pod);
+  const [ready, running] = [database["status"], pod["status"]];
+  database["status"] = { ...(ready as object), readyReplicas: 0, availableReplicas: 0 };
+  pod["status"] = { phase: "Pending", conditions: [{ type: "Ready", status: "False" }] };
+  neon.storage.databaseAnswering = false;
+  const started = setTimeout(() => {
+    database["status"] = ready as Record<string, unknown>;
+    pod["status"] = running as Record<string, unknown>;
+    neon.storage.databaseAnswering = true;
+  }, 1_500);
+  t.after(() => clearTimeout(started));
+  succeeded(await alasio(["up"]));
+});
+
 test("up refuses to apply anything while the Secret that names Neon's tenant cannot be read", async (t) => {
   const { alasio, kube } = await branchable(t);
   stackSecret(kube, "alasio-neon-root", { "secrets.json": "{" });
