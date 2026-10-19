@@ -91,3 +91,23 @@ test("a bound pod's bayma is told to export each signal the gateway exports, in 
   // Its endpoint, and its token, the sandbox's own.
   assert.ok(!Object.keys(settings).some((name) => name === "OTEL_EXPORTER_OTLP_ENDPOINT" || name.includes("HEADERS")), JSON.stringify(settings));
 });
+
+test("a session's rate is its own in each environment, as a branch's fork of main's session keeps its volume id", async () => {
+  const live = Layer.succeed(LiveBindings, LiveBindings.of({ holds: () => Effect.succeed("held") }));
+  const forwarder = { protocols: { traces: "http/protobuf" }, export: async (): Promise<ForwardResult> => ({ ok: true }) };
+  const authenticate = authenticateBinding(bindingKey, (volumeId) => Effect.succeed(sessionResource(volumeId, null, {})));
+  const body = traceRequest();
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    // A budget of one request, refilled slower than the test runs.
+    const receiver = yield* serveTelemetryReceiver({ port: 0, host: "127.0.0.1", forwarder, authenticate: (token) => Effect.provide(authenticate(token), live), limiter: yield* makeRateLimiter({ rate: 1, burst: body.length }) });
+    yield* Effect.promise(async () => {
+      const key = sessionKey("fs-shared");
+      const post = (namespace: string) =>
+        fetch(`http://127.0.0.1:${receiver.port}/v1/traces`, { method: "POST", headers: { "content-type": "application/x-protobuf", authorization: `Bearer ${bindingToken(bindingKey, { key, binding: "uid", namespace })}` }, body });
+      assert.equal((await post("alasio-sessions")).status, 200);
+      assert.equal((await post("alasio-sessions")).status, 429);
+      // The branch's, of the same volume id, on its own budget.
+      assert.equal((await post("alasio-branch-try-sessions")).status, 200);
+    });
+  })));
+});

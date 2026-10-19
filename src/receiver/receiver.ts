@@ -38,8 +38,8 @@ const MAIN = "main";
 /**
  * The session whose binding's token `token` is, signed with `bindingKey`, where its binding
  * is held now: a session workspace's, stamped as `stampFor` says of its volume id and its
- * binding's namespace, its rate its own; or a folder conversation's instance's, stamped as
- * folderResource says, its rate its key's; null where it is no binding's, or its binding is
+ * binding's namespace, its rate its own, by both; or a folder conversation's instance's,
+ * stamped as folderResource says, its rate its key's; null where it is no binding's, or its binding is
  * gone; AuthenticationUnknown where the bindings are not known now.
  */
 export const authenticateBinding = (bindingKey: Buffer, stampFor: (volumeId: string, namespace: string) => Effect.Effect<ResourceStamp>, env: Readonly<NodeJS.ProcessEnv> = process.env) =>
@@ -53,7 +53,9 @@ export const authenticateBinding = (bindingKey: Buffer, stampFor: (volumeId: str
     const held = yield* (yield* LiveBindings).holds(claims.key, claims.binding, claims.namespace);
     if (held === "unknown") return yield* new AuthenticationUnknown();
     if (held !== "held") return null;
-    return volumeId ? { session: volumeId, stamp: yield* stampFor(volumeId, claims.namespace) } : { session: claims.key, stamp: folderResource(folder?.harness ?? "", folder?.conversation ?? "", env) };
+    // Its rate its own by its binding's namespace too, as environments share volume ids.
+    const session = `${claims.namespace}/${volumeId ?? claims.key}`;
+    return volumeId ? { session, stamp: yield* stampFor(volumeId, claims.namespace) } : { session, stamp: folderResource(folder?.harness ?? "", folder?.conversation ?? "", env) };
   });
 
 /**

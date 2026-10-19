@@ -101,7 +101,7 @@ export interface TelemetryReceiverOptions {
   readonly maxSessionHeldBytes?: number;
 }
 
-/** The session a token is of: its volume id, which its rate and what its requests hold are counted by, and what its resources are stamped with. */
+/** The session a token is of: its binding's namespace and its volume id, which its rate and what its requests hold are counted by, and what its resources are stamped with. */
 export interface Authenticated {
   readonly session: string;
   readonly stamp: ResourceStamp;
