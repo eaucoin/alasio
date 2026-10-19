@@ -229,6 +229,20 @@ create table if not exists ${SCHEMA}.callback_actions (
   created_at timestamptz not null default now()
 );
 
+-- Each press whose control runs on past its update (src/telegram/presses.ts), by its query's
+-- id, kept as its update is told handled until the control is done: held by the alasio
+-- running it, by its token, until held_until, which that alasio renews as it runs, so one
+-- left by an alasio that stopped is run again by another.
+create table if not exists ${SCHEMA}.press_jobs (
+  id text primary key,
+  conversation_id text not null references ${SCHEMA}.conversations (id) on delete cascade,
+  callback_query jsonb not null,
+  action jsonb not null,
+  holder text not null,
+  held_until timestamptz not null,
+  created_at timestamptz not null default now()
+);
+
 -- What alasio sends to Telegram, in each chat's order: a reply ('text'), a turn's status
 -- message ('status'), whose Telegram message id is recorded once it is sent, and an edit of
 -- one ('edit', of the entry its edits column names).

@@ -4,7 +4,7 @@
  * point, and so holds what was in flight there: Telegram's updates, which are another
  * bot's; prompts queued and turns running, which a restart's recovery
  * would run again; replies on their way, which would be sent again, by this bot; buttons,
- * which this bot never sent; and Codex's login, whose refresh token works once, so that
+ * which this bot never sent, and presses of them under way; and Codex's login, whose refresh token works once, so that
  * using it here would log the other out. All of it goes, once, in one transaction; the
  * conversations, what they mount, and their history stay.
  */
@@ -39,6 +39,7 @@ export const startBranch = (database: Database, schema: string, branch: string):
         update ${schema}.responses set posted = true where not posted;
         delete from ${schema}.telegram_outbox;
         delete from ${schema}.callback_actions;
+        delete from ${schema}.press_jobs;
         delete from ${schema}.codex_login;
       `);
       return true;

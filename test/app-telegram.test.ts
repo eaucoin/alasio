@@ -223,7 +223,73 @@ test("a press whose control waits on its harness holds back no later update", { 
   telegram.say("/start");
   await telegram.waitFor("sendMessage", (call) => call.params.text === "Alasio is ready.", { mark, timeoutMs: 10_000 });
   codex.answer(steer, { turnId: "turn-1" });
-  await telegram.waitFor("answerCallbackQuery", (call) => call.params.text === "Steered.");
+  // Answered to its query, or, kept past PRESS_AWAITED, through the outbox.
+  await eventually("the steer answered", async () =>
+    telegram.callsTo("answerCallbackQuery").some((call) => call.params.text === "Steered.") || telegram.shown(mark).some((shown) => shown.text === "Steered.") ? true : undefined);
+});
+
+/** Has the operator press Steer on a prompt held while Codex's first turn runs, its app-server not answering the steer: the steer's request, and the last update told handled before the press. */
+async function steerUnanswered(alasio: RunningAlasio) {
+  const { telegram, codex } = alasio;
+  await mount(alasio, "codex", "alpha");
+  telegram.say("First");
+  await answerThreadStart(codex, "thread-1", alasio.folder("alpha"));
+  await answerTurnStart(codex, "thread-1", "turn-1");
+  const mark = telegram.mark();
+  telegram.say("Second");
+  await telegram.waitFor("sendMessage", (call) => call.params.text.startsWith("Codex is currently working."), { mark });
+  const before = await eventually("Second's update told handled", async () => {
+    const committed = await telegram.committed();
+    return committed > 0 && (await sleep(300), committed === (await telegram.committed())) ? committed : undefined;
+  });
+  telegram.press("Steer");
+  return { steer: await codex.next("turn/steer"), before };
+}
+
+/** The presses kept in alasio's store, each with whether its hold is past. */
+async function keptPresses(alasio: RunningAlasio): Promise<{ id: string; lapsed: boolean }[]> {
+  return (await (await testPool()).query<{ id: string; lapsed: boolean }>(`select id, held_until <= now() as lapsed from ${alasio.stateSchema}.press_jobs`)).rows;
+}
+
+/** Once alasio has shown the operator `text` after `mark`. */
+const shownText = (alasio: RunningAlasio, text: string | RegExp, mark: number) =>
+  eventually(`alasio to show ${text}`, async () => alasio.telegram.shown(mark).find((shown) => (typeof text === "string" ? shown.text === text : text.test(shown.text))));
+
+test("a press's update is told handled once what the press does is done, or once PRESS_AWAITED has passed, its press then kept, its query answered Working..., and its answer sent through the outbox", { timeout: 30_000 }, async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex } = alasio;
+  const mark = telegram.mark();
+  const { steer, before } = await steerUnanswered(alasio);
+  await sleep(1000);
+  assert.equal(await telegram.committed(), before, "not told handled while its steer is under way");
+  assert.deepEqual(await keptPresses(alasio), []);
+  await eventually("the press's update told handled past PRESS_AWAITED", async () => ((await telegram.committed()) > before ? true : undefined), { timeoutMs: 5_000 });
+  // Kept, and held by this alasio, before its update was told handled.
+  assert.deepEqual((await keptPresses(alasio)).map(({ lapsed }) => lapsed), [false]);
+  await telegram.waitFor("answerCallbackQuery", (call) => call.params.text === "Working...", { mark });
+  codex.answer(steer, { turnId: "turn-1" });
+  await shownText(alasio, "Steered.", mark);
+  assert.deepEqual(telegram.callsTo("answerCallbackQuery", mark).map((call) => call.params.text), ["Working..."]);
+  await eventually("the press forgotten once done", async () => ((await keptPresses(alasio)).length === 0 ? true : undefined));
+});
+
+test("a press kept as alasio stops is let go of, and run again from its action once alasio starts, its answer through the outbox", { timeout: 60_000 }, async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex } = alasio;
+  const { before } = await steerUnanswered(alasio);
+  await eventually("the press's update told handled past PRESS_AWAITED", async () => ((await telegram.committed()) > before ? true : undefined), { timeoutMs: 5_000 });
+  assert.deepEqual((await keptPresses(alasio)).map(({ lapsed }) => lapsed), [false]);
+  assert.deepEqual(await alasio.stop(), { code: 0, signal: null });
+  // Let go of as alasio stopped, for the next to run at once.
+  assert.deepEqual((await keptPresses(alasio)).map(({ lapsed }) => lapsed), [true]);
+  const mark = telegram.mark();
+  await alasio.start();
+  // Run again as alasio starts: steering the turn recovered from the restart, or queued where none runs to take it.
+  const steered = codex.next("turn/steer").then((steer) => codex.answer(steer, { turnId: "turn-2" }));
+  void steered.catch(() => {});
+  await answerLoadedThreads(codex, []).catch(() => {});
+  await shownText(alasio, /^(Steered|Queued)\.$/u, mark);
+  await eventually("the press forgotten once run again", async () => ((await keptPresses(alasio)).length === 0 ? true : undefined));
 });
 
 test("a reply Telegram rate-limits is sent again after the wait it asks for, once, and the reply after it follows it", async (t) => {

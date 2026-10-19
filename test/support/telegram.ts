@@ -116,6 +116,11 @@ export class TelegramStandIn {
     throw new Error(`alasio has shown no button labelled ${JSON.stringify(label)}; it showed ${JSON.stringify(this.calls().flatMap((call) => keyboardOf(call).flat().map((button) => button.text)))}`);
   }
 
+  /** The update alasio's group was told of last, as it is told once each is handled. */
+  async committed(): Promise<number> {
+    return ((await (await fetch(`${this.apiRoot}/control/committed`)).json()) as { updateId: number }).updateId;
+  }
+
   /** Has the next call to `method` fail as `failure` says. */
   fail(method: BotMethod, failure: StubFailure): void {
     this.stub.fail(method, failure);

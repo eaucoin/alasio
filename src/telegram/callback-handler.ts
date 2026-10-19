@@ -45,29 +45,52 @@ export type PressHandling = Effect.Effect<void, CommandError, OperatorServices>;
 const answering = (callbackQueryId: string, text: string): PressHandling =>
   Effect.asVoid(Effect.flatMap(TelegramClient, (client) => client.answerCallbackQuery(callbackQueryId, text)));
 
+/** A press taken from the store (takePress): what it then does, and the action it took, which it was taken for; none where it took none. */
+export interface TakenPress {
+  readonly handling: PressHandling;
+  readonly action: CallbackAction | null;
+}
+
 /**
  * Takes a press of one of alasio's buttons from the store: whether its user may press it,
  * its action, consumed, and the conversation's mount; and gives what it then does, its answer
- * and its control, to run apart (handlePress). The store failing fails it, and the press is
- * taken again; its action is consumed only where the store answers.
+ * and its control, to run apart (handlePress), with the action, which a press kept past its
+ * update is run again from (replayPress). The store failing fails it, and the press is taken
+ * again; its action is consumed only where the store answers.
  */
-export const takeCallbackQuery = Effect.fnUntraced(function*(callbackQuery: CallbackQuery): Effect.fn.Return<
-  PressHandling,
+export const takePress = Effect.fnUntraced(function*(callbackQuery: CallbackQuery): Effect.fn.Return<
+  TakenPress,
   StoreError,
   Authorizer | Store
 > {
   const store = yield* Store;
   if (!(yield* Effect.flatMap(Authorizer, (authorizer) => authorizer.isAuthorizedCallbackQuery(callbackQuery)))) {
-    return answering(callbackQuery.id, "This action is not authorized for this Telegram user.");
+    return { handling: answering(callbackQuery.id, "This action is not authorized for this Telegram user."), action: null };
   }
   // Every button alasio sends carries callback_data; a query without it is no action of alasio's.
   const action = callbackQuery.data === undefined ? null : yield* store.consumeCallbackAction(callbackQuery.data);
-  if (!action) return answering(callbackQuery.id, "This action is no longer available.");
-  return handlePress(callbackQuery, action, yield* store.getMount(action.conversationId)).pipe(
+  if (!action) return { handling: answering(callbackQuery.id, "This action is no longer available."), action: null };
+  return { handling: pressing(callbackQuery, action, yield* store.getMount(action.conversationId)), action };
+});
+
+/** What a press does, as takePress gives it: its handling alone. */
+export const takeCallbackQuery = (callbackQuery: CallbackQuery): Effect.Effect<PressHandling, StoreError, Authorizer | Store> =>
+  Effect.map(takePress(callbackQuery), ({ handling }) => handling);
+
+/**
+ * A press taken before, and kept as its control ran on past its update (./presses.ts), run
+ * again from its action, as the alasio that ran it stopped first: its user was let press it,
+ * and its action consumed, as it was taken; the conversation's mount is read anew.
+ */
+export const replayPress = (callbackQuery: CallbackQuery, action: CallbackAction): PressHandling =>
+  Effect.flatMap(Store, (store) => store.getMount(action.conversationId)).pipe(Effect.flatMap((mount) => pressing(callbackQuery, action, mount)));
+
+/** The press of `action`, of the conversation `mount` is the mount of. */
+const pressing = (callbackQuery: CallbackQuery, action: CallbackAction, mount: Mount): PressHandling =>
+  handlePress(callbackQuery, action, mount).pipe(
     // A control its harness host is not reached for says so, as the press is answered.
     Effect.catchTag("HarnessHostError", (error) => answering(callbackQuery.id, error.message)),
   );
-});
 
 /** Handles a press taken from the store (takeCallbackQuery): its action, of the conversation `mount` is the mount of. */
 const handlePress = Effect.fnUntraced(function*(callbackQuery: CallbackQuery, action: CallbackAction, mount: Mount): Effect.fn.Return<

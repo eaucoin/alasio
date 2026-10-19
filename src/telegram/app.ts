@@ -10,7 +10,9 @@
  * never by alasio.
  */
 import type { Update } from "@grammyjs/types";
-import { Effect, FiberSet, Layer, Option, Schedule, type Scope } from "effect";
+import { randomUUID } from "node:crypto";
+
+import { Duration, Effect, Fiber, FiberSet, Layer, Option, Schedule, type Scope } from "effect";
 
 import { Turns } from "../codex/turns.ts";
 import type { KeptCodexRollouts } from "../codex/rollouts/index.ts";
@@ -29,11 +31,13 @@ import { withLogScope } from "../shared/log.ts";
 import { SpanKind, withAlasioSpan } from "../telemetry/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { Authorizer } from "./authorizer.ts";
-import { takeCallbackQuery } from "./callback-handler.ts";
+import { takePress } from "./callback-handler.ts";
 import { TelegramClient, type TelegramError } from "./client.ts";
 import { watchDeliveries } from "./delivery-watch.ts";
 import { MediaGroups } from "./media-group-buffer.ts";
 import { handleMessage, processIncomingPrompt } from "./message-handler.ts";
+import type { Outbox } from "./outbox.ts";
+import { chatOfPress, holdWhileRunning, PRESS_AWAITED, PRESS_HOLD, PRESSES_DUE_EVERY, pressAnswers, recoverPresses } from "./presses.ts";
 import { consumeUpdates, type TelegramUpdates } from "./update-consumer.ts";
 
 /** How often completed responses that were never delivered are looked for. */
@@ -74,7 +78,7 @@ export interface TelegramAppConfig
 }
 
 /** What the app runs on. */
-export type TelegramAppServices = Authorizer | MediaGroups | TelegramUpdates | OperatorServices;
+export type TelegramAppServices = Authorizer | MediaGroups | Outbox | TelegramUpdates | OperatorServices;
 
 /** How the app fails to start. */
 export type TelegramAppError = TelegramError | CommandError | TranscriptAdoptionError | RolloutRestoreError | StoreError;
@@ -175,7 +179,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
    * one that waits for it too long fails as the store does, and is taken again.
    * Each update starts a trace of its own, which everything it leads to joins: the
    * turn its prompt queues, however much later it runs, and the reply's delivery.
-   * What it leads to runs on after it, so that consuming goes on meanwhile. One the store
+   * What it leads to runs on after it, so that consuming goes on meanwhile: a prompt's
+   * turn, and what a press does past PRESS_AWAITED. One the store
    * has as processed already, handed over again after a restart, is skipped; one kept but
    * not processed is handled again. It fails where the store failed, keeping it, handling
    * it or marking it processed, so that it is taken again; Telegram failing its handling
@@ -186,6 +191,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
       const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
       // Its marks made in the lock's transaction, where it has a chat's: a lock lost rolls them back.
       const underLock = <A, E, R>(handle: (marks: UpdateMarks) => Effect.Effect<A, E, R>) => chatId === undefined ? handle(store) : store.withHandlingLock(chatId, handle);
+      // A press kept as its update is marked processed, held, once that is committed, while it runs on.
+      let kept: { readonly id: string; readonly holder: string; readonly pressing: Fiber.Fiber<void> } | null = null;
       return underLock((marks) => Effect.gen(function*() {
         if (!(yield* marks.recordTelegramUpdate(update))) {
           return yield* Effect.logInfo(`Skipping update ${update.update_id}, processed already`);
@@ -193,15 +200,25 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
         const callbackQuery = update.callback_query;
         if (callbackQuery) {
           // Taken from the store before the update is marked processed, as a message is: the
-          // store failing that fails the update, taken again. What the press then does runs on
-          // after it, as a prompt's turn does, so that a control that takes a while, a steer
-          // or a workspace's, holds back no later update; its failing is said.
-          const press = yield* takeCallbackQuery(callbackQuery).pipe(Effect.provideContext(services));
-          yield* FiberSet.run(handling, press.pipe(
+          // store failing that fails the update, taken again. What the press then does is
+          // awaited for PRESS_AWAITED, so a control that is quick, as most are, is done before
+          // its update is told handled; one that takes longer, a steer or a workspace's, is
+          // kept, as the update is marked processed, and runs on after it (./presses.ts), as a
+          // prompt's turn does, so it holds back no later update for longer; its failing is said.
+          const { handling: press, action } = yield* takePress(callbackQuery).pipe(Effect.provideContext(services));
+          const answers = pressAnswers(callbackQuery);
+          const pressing = yield* FiberSet.run(handling, answers.through(press).pipe(
             Effect.catch((error) => Effect.logError(`Failed to process callback ${callbackQuery.id}: ${error.message}`)),
             Effect.provideContext(services),
             Effect.interruptible,
           ));
+          const done = yield* Fiber.await(pressing).pipe(Effect.timeoutOption(PRESS_AWAITED));
+          if (Option.isNone(done) && action !== null && chatOfPress(callbackQuery) !== undefined) {
+            const holder = randomUUID();
+            yield* marks.keepPress({ callbackQuery, action, holder, holdMs: Duration.toMillis(PRESS_HOLD) });
+            yield* answers.kept.pipe(Effect.provideContext(services));
+            kept = { id: callbackQuery.id, holder, pressing };
+          }
         } else if (update.message) {
           const prompt = yield* handleMessage(update.message, update.update_id, marks).pipe(
             Effect.provideContext(services),
@@ -213,6 +230,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
         }
         yield* marks.markTelegramUpdateProcessed(update.update_id);
       })).pipe(
+        Effect.andThen(Effect.suspend(() => (kept === null ? Effect.void : Effect.asVoid(FiberSet.run(handling, holdWhileRunning(kept.id, kept.holder, kept.pressing).pipe(Effect.provideService(Store, store))))))),
         Effect.tapError((error) => Effect.logError(`Failed to keep update ${update.update_id}: ${error}`)),
         withAlasioSpan("alasio.update", {
           kind: SpanKind.CONSUMER,
@@ -247,6 +265,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   yield* restoreCodexRollouts();
   yield* turns.recoverInterruptedTurns;
   yield* turns.resumePendingPrompts;
+  // Presses kept as an alasio before stopped, run again before updates come.
+  yield* recoverPresses(handling).pipe(Effect.provideContext(services));
   yield* consumeUpdates(processUpdate).pipe(Effect.forkScoped);
   // Responses completed but never delivered (their delivery failed, or alasio stopped first) go out.
   yield* turns.flushCompletedResponses.pipe(
@@ -257,6 +277,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   );
   // Albums due, which no alasio's wait is for (it stopped, or their chat's updates went to another).
   yield* mediaGroups.flushDue.pipe(Effect.schedule(Schedule.spaced(MEDIA_GROUPS_DUE_EVERY)), Effect.forkScoped);
+  // Presses kept whose alasio let go of them, or crashed, run again.
+  yield* recoverPresses(handling).pipe(Effect.provideContext(services), Effect.schedule(Schedule.spaced(PRESSES_DUE_EVERY)), Effect.forkScoped);
   // Pruned as alasio starts, and every day it runs after.
   yield* store.pruneTransient(TRANSIENT_RETENTION).pipe(
     Effect.catch((error) => Effect.logWarning(`Pruning the store failed: ${error.message}`)),
