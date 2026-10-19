@@ -45,10 +45,11 @@ import { join } from "node:path";
 import { Clock, Context, Duration, Effect, Layer, Result, Schema, type Scope } from "effect";
 
 import { MAIN_ENVIRONMENT_NAME } from "../branch/names.ts";
-import { CodexAppServer } from "../codex/app-server/client.ts";
+import { CodexAppServer, makeAppServer } from "../codex/app-server/client.ts";
+import { spawnAppServer } from "../codex/app-server/process.ts";
 import { codexHome } from "../codex/env.ts";
 import { CodexRollouts, SessionFsCodexRollouts } from "../codex/rollouts/index.ts";
-import { SessionFsCodex, sessionFsCodexHome } from "../codex/sessionfs.ts";
+import { LOGIN_BEARER_ENV, loginRelayOverrides, SessionFsCodex, sessionFsCodexHome } from "../codex/sessionfs.ts";
 import { Events } from "../events/events.ts";
 import { HarnessNeon } from "../neon/connect.ts";
 import { LakeWake, type WakeLog, wakeLogOf } from "../neon/lake-wake.ts";
@@ -59,6 +60,7 @@ import { isSessionFs } from "../workspace/kind.ts";
 import { ReceivedFiles } from "../telegram/files.ts";
 import { ActiveTurns } from "./active-turns.ts";
 import { makeGivenBayma } from "./given-bayma.ts";
+import { makeGivenCodexLogin } from "./given-codex-login.ts";
 import { HarnessHost } from "./host.ts";
 import { HostEvents } from "./host-events.ts";
 import { Harnesses, type HarnessesOptions } from "./index.ts";
@@ -198,18 +200,33 @@ export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, s
   const environment = config.branch ?? MAIN_ENVIRONMENT_NAME;
   // Its turns' workspaces' bayma, as they give it, through the gateway, where it has one.
   const given = config.gatewayUrl ? yield* makeGivenBayma({ gatewayUrl: config.gatewayUrl, environment, stateDir: config.stateDir }) : null;
-  const sessions = given
-    ? Layer.merge(Layer.succeed(SessionSandboxes, given.sessions), SessionFsCodex.layer({ home: sessionFsCodexHome(config.stateDir) }))
+  // Its Codex's login, alasio's, relayed to it, where it is of a pool: none on its disk.
+  const login = config.gatewayUrl ? yield* makeGivenCodexLogin({ home: codexHome() }) : null;
+  const sessions = given && login
+    ? Layer.merge(Layer.succeed(SessionSandboxes, given.sessions), SessionFsCodex.layer({ home: sessionFsCodexHome(config.stateDir), startRelay: () => Effect.succeed(login.relay) }))
     : Layer.empty;
+  // Its folder conversations' Codex, of the operator's configuration, calling the model through the loopback alone.
+  const appServer = login
+    ? Layer.effect(CodexAppServer, makeAppServer({ spawn: (options) => spawnAppServer({ ...options, env: { ...options.env, [LOGIN_BEARER_ENV]: login.relay.bearer }, config: loginRelayOverrides(login.relay.url) }) }))
+    : CodexAppServer.layer;
   const built = yield* Layer.build(HarnessHost.layer.pipe(
     Layer.provideMerge(Harnesses.layer({ ...standIns, ...(given ? { folderBayma: given.folderBayma } : {}), branch: config.branch, sessionStore: neon.sessionStore, codexRollouts, sessionFsCodexRollouts })),
-    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: config.stateDir }), HostEvents.onLog(environment))),
+    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, appServer, ReceivedFiles.layer({ stateDir: config.stateDir }), HostEvents.onLog(environment))),
     Layer.provideMerge(sessions),
     Layer.provideMerge(Layer.succeedContext(stores)),
   ));
   // Each turn's workspace's bayma taken as it starts, before it runs.
   const host = Context.get(built, HarnessHost);
-  const giving = given ? HarnessHost.of({ ...host, startTurn: (start) => Effect.andThen(given.give(start), host.startTurn(start)) }) : host;
+  const giving = given && login
+    ? HarnessHost.of({
+      ...host,
+      startTurn: (start) => given.give(start).pipe(
+        Effect.andThen(login.give(start).pipe(Effect.catch((error) => Effect.logWarning(`the operator's Codex configuration could not be written for its turn, which runs on what it had: ${error.message}`)))),
+        Effect.andThen(host.startTurn(start)),
+      ),
+      renewCodexLogin: (_conversationId, renewed) => login.renew(renewed),
+    })
+    : host;
   const served = yield* Effect.provideService(serveHost({ port: config.port, conversationId, token }), HarnessHost, giving);
   yield* Effect.logInfo(`serving the harness host of ${conversationId} on port ${served.port}`);
   return served;

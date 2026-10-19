@@ -36,10 +36,22 @@ import type { CodexThreadConfig } from "./thread-config.ts";
 import { CodexTransportRefused } from "./transport.ts";
 
 /** The env var the relay's bearer is in, the model provider's `env_key`. */
-const LOGIN_BEARER_ENV = "ALASIO_CODEX_LOGIN";
+export const LOGIN_BEARER_ENV = "ALASIO_CODEX_LOGIN";
 const PROVIDER = "alasio_login_relay";
 
 const toml = (value: string): string => JSON.stringify(value);
+
+/**
+ * The relay at `relayUrl` as a Codex app-server's one model provider, given over whatever its
+ * home's config.toml says (`-c`), as a harness pool's pod's folder conversations' Codex is
+ * given it: the operator's configuration theirs, but for whose login it calls the model with.
+ */
+export function loginRelayOverrides(relayUrl: string): string[] {
+  return [
+    `model_provider=${toml(PROVIDER)}`,
+    `model_providers.${PROVIDER}={ name = "the operator's Codex login, through alasio", base_url = ${toml(relayUrl)}, env_key = ${toml(LOGIN_BEARER_ENV)}, wire_api = "responses" }`,
+  ];
+}
 
 /** Where the session-filesystem Codex keeps its home, under alasio's state directory. */
 export function sessionFsCodexHome(stateDir: string): string {

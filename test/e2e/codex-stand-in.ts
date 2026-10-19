@@ -6,7 +6,9 @@
  * Codex does, as far as alasio's turns go: threads start, resume and are listed, and each
  * turn is answered with ANSWER as its final answer: at once, or, for a prompt `wait N`, N
  * seconds after it starts, as a turn whose tools run that long; for a prompt `show <path>`,
- * beside the file at `path` of its workspace, shown as an image is; for a prompt
+ * beside the file at `path` of its workspace, shown as an image is; for a prompt `login`, after a
+ * request of its model provider's Responses API, as Codex calls it, with the bearer its
+ * provider's env_key names, beside what the provider answered (`login <status>`); for a prompt
  * `bayma later N`, at once, a command left running in the background, its terminal listed,
  * which N seconds on asks the thread's bayma, as its config names it, to initialize, as Codex's
  * MCP client does, and says what bayma answered on its standard error (`bayma later: <status>`),
@@ -23,7 +25,7 @@
  *   codex-stand-in.ts app-server [-c key=value]... --listen stdio://
  */
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -104,6 +106,36 @@ export function traceExportEnv(exporter: TraceExporter): Record<string, string> 
     OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: http ? (http.protocol === "json" ? "http/json" : "http/protobuf") : "grpc",
     OTEL_EXPORTER_OTLP_TRACES_HEADERS: Object.entries(headers).map(([key, value]) => `${key}=${value}`).join(","),
   };
+}
+
+/**
+ * What the model provider Codex would call answers a request of the Responses API, as its
+ * configuration names it: by `-c` (`settings`), or its home's config.toml; its base URL, and the
+ * bearer in the variable its env_key names. The status, or why none.
+ */
+async function providerStatus(settings: ReadonlyMap<string, string>): Promise<string> {
+  const unquote = (value: string | undefined) => (value === undefined ? undefined : (JSON.parse(value) as string));
+  const toml = (() => {
+    try {
+      return readFileSync(join(process.env["CODEX_HOME"] ?? "", "config.toml"), "utf8");
+    } catch {
+      return "";
+    }
+  })();
+  const name = unquote(settings.get("model_provider")) ?? /^model_provider = (".*")$/mu.exec(toml)?.[1]?.replace(/^"|"$/gu, "");
+  if (!name) return "no provider";
+  // Its table, as `-c` gives it inline, or as its home's config.toml has it, each field a string.
+  const table = settings.get(`model_providers.${name}`) ?? toml.split(`[model_providers.${name}]`)[1] ?? "";
+  const field = (key: string) => new RegExp(`\\b${key} = "([^"]*)"`, "u").exec(table)?.[1];
+  const baseUrl = field("base_url");
+  const envKey = field("env_key");
+  if (!baseUrl || !envKey) return "no base URL";
+  try {
+    const response = await fetch(`${baseUrl}/responses`, { method: "POST", headers: { authorization: `Bearer ${process.env[envKey] ?? ""}`, "content-type": "application/json" }, body: "{}" });
+    return String(response.status);
+  } catch (error) {
+    return `unreached: ${error instanceof Error ? error.message : String(error)}`;
+  }
 }
 
 /** Runs the app-server stand-in, given Codex's arguments after `app-server`, until alasio closes its input or stops it. */
@@ -208,6 +240,8 @@ async function serve(args: readonly string[]): Promise<void> {
       const shown = /^show (\S+)$/u.exec(text)?.[1];
       const said = shown ? `${ANSWER}\n\n![shown](${shown})` : ANSWER;
       const answer = agentMessage(randomUUID(), said, "final_answer");
+      // Its model provider asked, as Codex asks it, and what it answered said after the answer.
+      const asked = text === "login" ? providerStatus(settings).then((status) => agentMessage(randomUUID(), `${ANSWER}\n\nlogin ${status}`, "final_answer")) : Promise.resolve(answer);
       const done = codexTurn(turn.id, { items: [userMessage(randomUUID(), input), answer], itemsView: "full", status: "completed", startedAt, completedAt: now(), durationMs: 0 });
       record(threadId, "turn_context", { turn_id: turn.id, cwd: thread.cwd, model: ALASIO_CODEX_MODEL });
       record(threadId, "event_msg", { type: "task_started", turn_id: turn.id });
@@ -232,8 +266,10 @@ async function serve(args: readonly string[]): Promise<void> {
       setImmediate(() => {
         notify(turnStarted(threadId, turn));
         setTimeout(() => {
-          notify(itemCompleted(threadId, turn.id, answer));
-          notify(turnCompleted(threadId, { ...done, items: [answer], itemsView: "summary" }));
+          void asked.then((final) => {
+            notify(itemCompleted(threadId, turn.id, final));
+            notify(turnCompleted(threadId, { ...done, items: [final], itemsView: "summary" }));
+          });
         }, seconds * 1000);
       });
       return { turn };

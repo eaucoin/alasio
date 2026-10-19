@@ -14,6 +14,9 @@ export const CODEX_HARNESS = "codex";
 export const CLAUDE_HARNESS = "claude";
 export const HARNESS_NAMES = Object.freeze([CODEX_HARNESS, CLAUDE_HARNESS] as const);
 
+/** The port alasio relays its Codex login to its harness pools' pods on (../codex/login-relay.ts). */
+export const CODEX_LOGIN_PORT = 4320;
+
 /** The name of a harness alasio can drive. */
 export type HarnessName = (typeof HARNESS_NAMES)[number];
 

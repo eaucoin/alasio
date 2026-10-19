@@ -3447,6 +3447,15 @@ if (inShard("agents")) {
       await untilInLake("a pooled Codex's turn, loaded as its pod woke the loader", "select count(*) as n from codex.turns", 600_000);
     });
 
+    test("a pooled Codex turn calls the model through alasio's relay of its login, its token taken there, its pod's own Codex home holding no login", async () => {
+      await tg.say("login");
+      // Refused nowhere on its way, it finds no login in the run's alasio, which has none: 503, not 401.
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === `${ANSWER}\n\nlogin 503`);
+      const pod = await harnessPod();
+      const home = await kube.execOk(NAMESPACE, pod.metadata?.name ?? "", ["sh", "-c", 'test -e "$CODEX_HOME/auth.json" && echo login || echo none'], { container: "harness" });
+      assert.equal(home.trim(), "none");
+    });
+
     test("a picture the prompt sends lands in the session's workspace, written through the gateway by the conversation's harness's pod", async () => {
       const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
       await throughForward("POST", `${telegram?.base}/control/file`, { fileId: "e2e-picture", content: png });

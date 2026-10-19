@@ -141,6 +141,7 @@ test("a turn run through the harness host as its own role writes all a turn writ
         jobId: job.id,
         attachedTurn: null,
         bayma: null,
+        codex: null,
       });
       assert.deepEqual((yield* alasio.getCompletedResponsesPendingDelivery).map(({ id, blocks }) => ({ id, blocks })), [{ id: result.pendingResponseId, blocks: [{ type: "text", content: "Fixed." }] }]);
       assert.equal((yield* alasio.getConversation(conversationId))?.codex_session_id, "thread-1");

@@ -40,6 +40,7 @@ const start = (workingDirectory: string, bayma: TurnStart["bayma"]): TurnStart =
   jobId: null,
   attachedTurn: null,
   bayma,
+  codex: null,
 });
 
 test("a turn's start carries its workspace's bayma, or why it has none, across to a host elsewhere, as it was", () => {

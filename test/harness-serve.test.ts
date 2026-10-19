@@ -28,6 +28,7 @@ function slowHost(turnMs: number, started: { count: number }): HarnessHost["Serv
     status: () => Effect.succeed({ busy: false, running: false, cliInitiated: false, held: false, idleSince: 0 }),
     backgroundWork: () => Effect.succeed(false),
     drain: () => Effect.succeed(true),
+    renewCodexLogin: () => Effect.void,
     startFreshSession: () => Effect.succeed("thread-2"),
     panels: () => Effect.succeed(Option.none()),
   });
@@ -84,6 +85,7 @@ const START = {
   jobId: null,
   attachedTurn: null,
   bayma: null,
+  codex: null,
 };
 
 /** Runs `use` with `host` served, its calls that last kept alive every `keepAliveMs`, on the port given it. */

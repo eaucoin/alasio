@@ -12,10 +12,11 @@ import type { CodexEnv } from "../env.ts";
 import { CODEX_DISABLED_FEATURES } from "../features.ts";
 import { codexTelemetryArgs, codexTelemetryEnv } from "./telemetry.ts";
 
-/** Where an app-server process is started, and with what environment. */
+/** Where an app-server process is started, with what environment, and with what of Codex's configuration given over its home's (`-c key=value`, the value TOML). */
 export interface AppServerProcessOptions {
   readonly cwd: string;
   readonly env: CodexEnv;
+  readonly config?: readonly string[] | undefined;
 }
 
 /** The codex binary alasio runs is not where alasio looks for it. */
@@ -72,7 +73,7 @@ function codexBinPath() {
  * (../features.ts): its error output is logged as it comes, and it is sent SIGTERM when its
  * scope closes.
  */
-export const spawnAppServer: SpawnAppServer = Effect.fnUntraced(function*({ cwd, env }: AppServerProcessOptions) {
+export const spawnAppServer: SpawnAppServer = Effect.fnUntraced(function*({ cwd, env, config = [] }: AppServerProcessOptions) {
   const binPath = codexBinPath();
   if (!existsSync(binPath)) {
     return yield* new CodexBinaryMissing({ path: binPath });
@@ -80,7 +81,7 @@ export const spawnAppServer: SpawnAppServer = Effect.fnUntraced(function*({ cwd,
   const ended = yield* Deferred.make<never, AppServerEnded>();
   const child = yield* Effect.acquireRelease(
     Effect.try({
-      try: () => spawn(binPath, ["app-server", ...CODEX_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]), ...codexTelemetryArgs(), "--listen", "stdio://"], {
+      try: () => spawn(binPath, ["app-server", ...CODEX_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]), ...codexTelemetryArgs(), ...config.flatMap((each) => ["-c", each]), "--listen", "stdio://"], {
         cwd,
         env: { ...env, ...codexTelemetryEnv() },
         stdio: ["pipe", "pipe", "pipe"],

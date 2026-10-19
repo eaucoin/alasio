@@ -35,6 +35,7 @@ export interface AppServerRequests {
   "thread/goal/get": { params: ProtocolParams<"thread/goal/get">; result: v2.ThreadGoalGetResponse };
   "thread/goal/set": { params: ProtocolParams<"thread/goal/set">; result: v2.ThreadGoalSetResponse };
   "thread/goal/clear": { params: ProtocolParams<"thread/goal/clear">; result: v2.ThreadGoalClearResponse };
+  "account/read": { params: ProtocolParams<"account/read">; result: v2.GetAccountResponse };
 }
 
 export type AppServerMethod = keyof AppServerRequests;

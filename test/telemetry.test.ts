@@ -288,6 +288,7 @@ test("a call of a harness host elsewhere carries its span's trace context, and t
     status: () => Effect.succeed({ busy: false, running: false, cliInitiated: false, held: false, idleSince: 0 }),
     backgroundWork: () => Effect.succeed(false),
     drain: () => Effect.succeed(true),
+    renewCodexLogin: () => Effect.void,
     startFreshSession: () => Effect.succeed("thread-2"),
     panels: () => Effect.succeedNone,
   });

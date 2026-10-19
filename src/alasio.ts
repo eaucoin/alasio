@@ -3,6 +3,8 @@
  * src/main.ts runs it in production, as ./shared/run.ts runs a process,
  * test/support/alasio-main.ts against the tests' stand-ins.
  */
+import { join } from "node:path";
+
 import { Effect, Layer, Option, type Scope } from "effect";
 import type { Pool } from "pg";
 
@@ -19,6 +21,7 @@ import { HarnessHost } from "./harness/host.ts";
 import { HarnessEvents, HostEvents } from "./harness/host-events.ts";
 import { pooledHarnessHost } from "./harness/pooled-host.ts";
 import { EnvironmentEvents, EventsConsumer } from "./events/consume.ts";
+import { CODEX_LOGIN_PORT, poolLoginKey, poolLoginRefusal, startLoginRelay } from "./codex/login-relay.ts";
 import { Harnesses } from "./harness/index.ts";
 import { BusyPods } from "./kube/busy.ts";
 import { KubeClient } from "./kube/client.ts";
@@ -129,9 +132,20 @@ function eventsConsumer({ harnessPools }: AlasioOptions): Layer.Layer<EventsCons
  * harness's pool through the sandbox gateway, heard on its environment's events topic; and
  * otherwise its own, in its process, told and heard there.
  */
-function harnessHost({ harnessPools, sessionsGateway }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | Harnesses | ActiveTurns | ReceivedFiles | EventsConsumer> {
+function harnessHost({ harnessPools, sessionsGateway }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | Harnesses | ActiveTurns | ReceivedFiles | EventsConsumer | CodexAppServer> {
   if (harnessPools && sessionsGateway) {
-    return Layer.merge(pooledHarnessHost(sessionsGateway), HarnessEvents.fromLog);
+    const home = codexHome();
+    // Its Codex login relayed to its pools' pods, on its pod's port, to each Codex turn's token alone; held by none of them.
+    const relay = Layer.effectDiscard(Effect.ignore(startLoginRelay({
+      authFile: join(home, "auth.json"),
+      listen: { host: "0.0.0.0", port: CODEX_LOGIN_PORT },
+      authorize: poolLoginRefusal(poolLoginKey(sessionsGateway.callerKey), Date.now),
+    }).pipe(Effect.tapError((error) => Effect.logError(`the Codex login could not be relayed to the harness pools: ${error.message}`)))));
+    return Layer.mergeAll(
+      pooledHarnessHost({ ...sessionsGateway, codexLogin: { url: harnessPools.codexLoginUrl, home } }),
+      HarnessEvents.fromLog,
+      relay,
+    );
   }
   return HarnessHost.layer.pipe(Layer.provideMerge(HostEvents.inProcess));
 }

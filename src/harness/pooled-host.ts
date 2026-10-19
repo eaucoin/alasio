@@ -20,14 +20,27 @@
  * bearer stops at no time, but is held to the binding of the conversation's harness the bind
  * ahead answers with, good for as long as that is held (../binder/server.ts): the pod's
  * harness, and the work it leaves going on, reach bayma for as long as the pod is bound, with no
- * turn of alasio's to renew it, and alasio asleep. alasio's
- * own pod is held busy for as long as it drives a turn (../kube/busy.ts), as where the turn
- * runs in its process, since it is alasio that takes the turn's answer to its chat. The
- * operator's panels are alasio's own harnesses', as the hosts do not serve them yet.
+ * turn of alasio's to renew it, and alasio asleep.
+ *
+ * Each Codex turn is given a token for alasio's relay of its Codex login (../codex/login-relay.ts),
+ * good for CODEX_LOGIN_TTL_MS, renewed every `renewMs` for as long as the turn runs
+ * (HarnessHost.renewCodexLogin), and, a folder conversation's, the operator's Codex
+ * configuration, as only alasio holds the login; and alasio, the one refresher of the login,
+ * keeps it fresh before the turn and as it renews its token (../codex/login-refresh.ts), by its
+ * own app-server. alasio's own pod is held busy for as long as it drives a turn (../kube/busy.ts),
+ * as where the turn runs in its process, since it is alasio that takes the turn's answer to its
+ * chat. The operator's panels are alasio's own harnesses', as the hosts do not serve them yet.
  */
+import { join } from "node:path";
+
 import { Clock, Effect, Layer, Option, Schedule, Schema } from "effect";
 
 import { type HeldTo, mintToken } from "../binder/tokens.ts";
+import { CodexAppServer } from "../codex/app-server/client.ts";
+import { codexConfiguration } from "../codex/configuration.ts";
+import { buildCodexEnv } from "../codex/env.ts";
+import { makeLoginFreshness } from "../codex/login-refresh.ts";
+import { poolLoginKey } from "../codex/login-relay.ts";
 import { harnessKey } from "../gateway/names.ts";
 import { BusyPods } from "../kube/busy.ts";
 import { HostBayma } from "../mcp/bayma.ts";
@@ -35,15 +48,19 @@ import { Store } from "../persistence/store.ts";
 import { BIND_WAIT_MS, TOKEN_TTL_MS } from "../sandbox/gateway-client.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
-import { HarnessHost, type TurnBayma, type TurnStart } from "./host.ts";
+import { HarnessHost, type TurnBayma, type TurnCodex, type TurnStart } from "./host.ts";
 import { Harnesses, HarnessHostError } from "./index.ts";
-import type { HarnessName } from "./names.ts";
+import { CODEX_HARNESS, type HarnessName } from "./names.ts";
 import { remoteHost } from "./remote-host.ts";
 
 /** How often a harness the front cannot bind yet is asked to be bound again. */
 const BIND_RETRY = "2 seconds";
 /** What a turn says it waits on while its conversation's harness is being bound. */
 export const HARNESS_BINDING = "its harness, whose pod is being readied";
+/** How long a Codex turn's token for alasio's relay of its login is good for: minutes, so one taken from a pod is of little use. */
+const CODEX_LOGIN_TTL_MS = 10 * 60_000;
+/** How often a running Codex turn's token is renewed, by default: well within its time. */
+const CODEX_LOGIN_RENEW_MS = 3 * 60_000;
 
 /** What the front says as it refuses a bind: why, and whether it holds the key, bound again only as its caller asks. */
 const BindRefusal = Schema.Struct({ error: Schema.String, reason: Schema.optional(Schema.String), held: Schema.optional(Schema.Boolean) });
@@ -54,20 +71,28 @@ const Bound = Schema.Struct({ binding: Schema.String, namespace: Schema.String }
 /** The front cannot bind the conversation's harness yet, saying why. */
 class BindNotYet extends Schema.TaggedError<BindNotYet>()("BindNotYet", { reason: Schema.String }) {}
 
-/** The front alasio reaches its pools' hosts through: its address, and alasio's environment's name and its own key of the gateway's caller key. */
+/**
+ * The front alasio reaches its pools' hosts through: its address, and alasio's environment's
+ * name and its own key of the gateway's caller key; where its Codex login is relayed to its
+ * pools' pods (../codex/login-relay.ts), its Codex home, whose login it keeps fresh and whose
+ * configuration a folder conversation's Codex is given, and how often a running Codex turn's
+ * token is renewed (CODEX_LOGIN_RENEW_MS unless a test says).
+ */
 export interface PooledHostOptions {
   readonly url: string;
   readonly environment: string;
   readonly callerKey: Buffer;
+  readonly codexLogin: { readonly url: string; readonly home: string; readonly renewMs?: number };
 }
 
 /** The host of each conversation, bound in its harness's pool, as the module says. */
-export const pooledHarnessHost = ({ url, environment, callerKey }: PooledHostOptions): Layer.Layer<HarnessHost, never, Store | Harnesses> =>
+export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin }: PooledHostOptions): Layer.Layer<HarnessHost, never, Store | Harnesses | CodexAppServer> =>
   Layer.effect(
     HarnessHost,
     Effect.gen(function*() {
       const store = yield* Store;
       const harnesses = yield* Harnesses;
+      const appServer = yield* CodexAppServer;
       const sandboxes = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
       const hostBayma = Option.getOrNull(yield* Effect.serviceOption(HostBayma));
       const busyPods = Option.getOrNull(yield* Effect.serviceOption(BusyPods));
@@ -161,6 +186,30 @@ export const pooledHarnessHost = ({ url, environment, callerKey }: PooledHostOpt
           return outcome.server ? { endpoint: { url: outcome.server.url, headers: outcome.server.headers }, notice: null } : { endpoint: null, notice: outcome.notice };
         });
 
+      const loginKey = poolLoginKey(callerKey);
+      // Refreshed by alasio's own app-server, as Codex refreshes it, where its access token is about to stop; said, and the turn run on what there is, where it cannot be.
+      const loginFresh = (yield* makeLoginFreshness(join(codexLogin.home, "auth.json"), appServer.refreshLogin({ env: buildCodexEnv(), cwd: codexLogin.home }))).pipe(
+        Effect.catch((error) => Effect.logWarning(`the Codex login could not be refreshed: ${error.message}`)),
+      );
+      /** A token of the conversation's Codex turn for alasio's relay of its login, good for CODEX_LOGIN_TTL_MS, the login kept fresh first. */
+      const loginOf = (conversationId: string): Effect.Effect<TurnCodex["login"]> =>
+        Effect.andThen(loginFresh, Effect.map(Clock.currentTimeMillis, (now) => ({ url: codexLogin.url, token: mintToken(loginKey, { key: harnessKey(conversationId), expires: now + CODEX_LOGIN_TTL_MS }) })));
+      /** What a Codex turn of `start`'s is given of its login, a token of the turn's for alasio's relay, and, a folder conversation's, the operator's Codex configuration; none for another harness's. */
+      const codexOf = (start: TurnStart): Effect.Effect<TurnCodex | null> =>
+        Effect.gen(function*() {
+          if (start.harness !== CODEX_HARNESS) return null;
+          const login = yield* loginOf(start.conversationId);
+          const home = parseWorkspace(start.workingDirectory)?.kind === "sessionfs" ? null : yield* codexConfiguration(codexLogin.home);
+          return { login, home };
+        });
+      /** The token of the Codex turn `start`'s renewed on `host` every renewMs, for as long as it runs, as the module says. */
+      const renewing = (host: HarnessHost["Service"], start: TurnStart): Effect.Effect<void> =>
+        Effect.flatMap(loginOf(start.conversationId), (login) => host.renewCodexLogin(start.conversationId, login)).pipe(
+          Effect.catch((error) => Effect.logWarning(`thread=${start.conversationId}'s Codex login could not be renewed: ${error.message}`)),
+          Effect.delay(codexLogin.renewMs ?? CODEX_LOGIN_RENEW_MS),
+          Effect.forever,
+        );
+
       return HarnessHost.of({
         // The binding it bound ahead kept for as long as it is reserved, which its turn's bayma is
         // held to: by a reservation the host made alone, and let go of by that one alone, so a
@@ -184,7 +233,10 @@ export const pooledHarnessHost = ({ url, environment, callerKey }: PooledHostOpt
             const held = reserved.get(start.conversationId);
             if (!held) return yield* new HarnessHostError({ reason: `a turn of ${start.conversationId} was started with its harness reserved for none` });
             const bayma = yield* baymaOf(start, held);
-            return yield* hostBy(tokenOf(start.conversationId, start.harness, start.workingDirectory)).startTurn({ ...start, bayma });
+            const codex = yield* codexOf(start);
+            const host = hostBy(tokenOf(start.conversationId, start.harness, start.workingDirectory));
+            if (codex) yield* Effect.forkScoped(renewing(host, start));
+            return yield* host.startTurn({ ...start, bayma, codex });
           }).pipe(Effect.scoped),
         steer: (conversationId, prompt, fileIds) => onHost(conversationId, (host) => host.steer(conversationId, prompt, fileIds), Effect.succeedNone),
         interrupt: (conversationId, reason) =>
@@ -194,6 +246,10 @@ export const pooledHarnessHost = ({ url, environment, callerKey }: PooledHostOpt
         status: (conversationId) => onHost(conversationId, (host) => host.status(conversationId), unbound(conversationId)),
         backgroundWork: (conversationId) => onHost(conversationId, (host) => host.backgroundWork(conversationId), Effect.succeed(false)),
         drain: (conversationId) => onHost(conversationId, (host) => host.drain(conversationId), Effect.succeed(true)),
+        renewCodexLogin: (conversationId, login) =>
+          onHost(conversationId, (host) => host.renewCodexLogin(conversationId, login), Effect.void).pipe(
+            Effect.catchTag("StoreError", (error) => Effect.fail(new HarnessHostError({ reason: error.message }))),
+          ),
         startFreshSession: (params) => hostBy(tokenOf(params.conversationId, params.harness, params.workingDirectory)).startFreshSession(params),
         panels: harnesses.forMount,
       });

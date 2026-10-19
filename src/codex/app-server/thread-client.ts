@@ -131,6 +131,12 @@ export interface AppServerThreads {
    */
   readonly loginModels: (scope: AppServerScope) => Effect.Effect<readonly v2.Model[], AppServerStartError>;
   /**
+   * Refreshes this machine's Codex login now, as Codex refreshes it (account/read, its refresh
+   * token asked for): its access token, and its refresh token, which works once, rotated in its
+   * home's auth.json.
+   */
+  readonly refreshLogin: (scope: AppServerScope) => Effect.Effect<void, AppServerStartError>;
+  /**
    * Whether the conversation `threadKey` has Codex working in it on its own: a turn of one
    * of its threads running in the app-server, whoever started it (a goal's, as its
    * thread/goal/updated names it), or a terminal one's commands left running in the
@@ -319,6 +325,8 @@ export function makeAppServerThreads(
     listTurns: ({ threadId, env, cwd }) => rpc.start({ env, cwd }).pipe(Effect.andThen(listAll("thread/turns/list", { threadId }))),
 
     listModels: ({ env, cwd }) => rpc.start({ env, cwd }).pipe(Effect.andThen(listAll("model/list", { includeHidden: false }))),
+
+    refreshLogin: ({ env, cwd }) => rpc.start({ env, cwd }).pipe(Effect.andThen(rpc.request("account/read", { refreshToken: true })), Effect.asVoid),
 
     loginModels: ({ env, cwd }) =>
       Effect.gen(function*() {

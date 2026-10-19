@@ -14,8 +14,17 @@
  * A ChatGPT login is sent to the ChatGPT Codex backend, which serves the Responses API
  * under /backend-api/codex, with the login's account id; an API-key login is sent to the
  * OpenAI API as it is.
+ *
+ * Where alasio's harnesses run in pools of their own, alasio serves the same relay to its
+ * environment's harness pools' pods, on a port of its pod's (CODEX_LOGIN_PORT), each request
+ * bearing a token alasio gives each Codex turn it starts there, signed by its pools' key
+ * (poolLoginKey), good for minutes and renewed as the turn runs (../harness/pooled-host.ts),
+ * checked in constant time, its refusal said why in alasio's log alone; and a pod relays on
+ * its own loopback to it, with the latest token given (../harness/given-codex-login.ts), so
+ * only alasio ever holds or refreshes the login (./login-refresh.ts), as a ChatGPT refresh
+ * token is single-use.
  */
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import httpClient, { createServer, type IncomingMessage, type OutgoingHttpHeaders, type RequestOptions } from "node:http";
 import httpsClient from "node:https";
@@ -23,6 +32,9 @@ import type { AddressInfo } from "node:net";
 
 import { Effect, Schema, type Scope } from "effect";
 
+import { verifyToken } from "../binder/tokens.ts";
+import { conversationOfHarnessKey } from "../gateway/names.ts";
+export { CODEX_LOGIN_PORT } from "../harness/names.ts";
 import { withLogScope } from "../shared/log.ts";
 
 /** Codex's `auth.json`, as the relay reads it: any of its fields may be missing or of another type. */
@@ -41,8 +53,29 @@ export interface LoginUpstream {
 export interface LoginRelayOptions {
   readonly authFile: string;
   readonly bearer?: string;
+  /** What a request's Authorization must be: why it is refused, or null where it may go on; the bearer's alone unless given. */
+  readonly authorize?: ((authorization: string | undefined) => string | null) | undefined;
+  /** Where it listens: alasio's loopback, on a port of its own, unless given. */
+  readonly listen?: { readonly host: string; readonly port: number } | undefined;
   readonly upstreamFor?: (authFile: string, path: string) => LoginUpstream | null;
 }
+
+/** The key alasio's pool login tokens are signed with: its environment's own key of the gateway's caller key's, made apart, so a token of one is never the other. */
+export const poolLoginKey = (environmentKey: Buffer): Buffer => createHmac("sha256", environmentKey).update("codex-login").digest();
+
+/**
+ * Why a request of a harness pool's pod bearing `authorization` is refused, or null where it
+ * may go on: its bearer a token signed by `key` (poolLoginKey), compared in constant time, of a
+ * conversation's harness's turn, not stopped by `now`.
+ */
+export const poolLoginRefusal = (key: Buffer, now: () => number) => (authorization: string | undefined): string | null => {
+  const bearer = /^Bearer (\S+)$/u.exec(authorization ?? "")?.[1];
+  if (!bearer) return "it bears no token";
+  const claims = verifyToken(key, bearer, now());
+  if (!claims) return "its token is none of alasio's, or has stopped";
+  if (claims.expires === undefined || conversationOfHarnessKey(claims.key) === null) return `its token is of ${claims.key}, no conversation's turn's`;
+  return null;
+};
 
 /** A running relay: the base URL a Codex model provider is given, and the bearer it presents. */
 export interface LoginRelay {
@@ -105,11 +138,25 @@ export type StartLoginRelay = (options: LoginRelayOptions) => Effect.Effect<Logi
  * a Codex model provider is given (its `/v1` included), and the bearer it must present.
  * `upstreamFor` resolves the upstream request, for tests.
  */
-export const startLoginRelay: StartLoginRelay = Effect.fnUntraced(function*({ authFile, bearer = randomBytes(32).toString("hex"), upstreamFor = loginUpstream }: LoginRelayOptions) {
+export const startLoginRelay: StartLoginRelay = Effect.fnUntraced(function*({
+  authFile,
+  bearer = randomBytes(32).toString("hex"),
+  authorize,
+  listen = { host: "127.0.0.1", port: 0 },
+  upstreamFor = loginUpstream,
+}: LoginRelayOptions) {
   const request = (options: RequestOptions, onResponse: (response: IncomingMessage) => void) => (options.protocol === "http:" ? httpClient : httpsClient).request(options, onResponse);
   const expected = `Bearer ${bearer}`;
+  const refusalOf = authorize ?? ((authorization: string | undefined) => (sameSecret(authorization, expected) ? null : "unknown bearer"));
+  const runFork = Effect.runForkWith(yield* Effect.context<never>());
   const server = createServer((req, res) => {
-    if (!sameSecret(req.headers.authorization, expected)) { res.writeHead(401).end("unknown bearer"); return; }
+    const refusal = refusalOf(req.headers.authorization);
+    if (refusal !== null) {
+      // Why, to alasio's log alone: the caller is told it is refused, and nothing of why.
+      runFork(Effect.logWarning(`refused a request of ${req.url ?? "/"}: ${refusal}`).pipe(withLogScope("codex-login-relay")));
+      res.writeHead(401).end("refused");
+      return;
+    }
     // A request an http.Server receives always has a url.
     const url = req.url!;
     if (!ALLOWED_PATHS.some((re) => re.test(url))) { res.writeHead(403).end("path not allowed"); return; }
@@ -133,7 +180,7 @@ export const startLoginRelay: StartLoginRelay = Effect.fnUntraced(function*({ au
   yield* Effect.acquireRelease(
     Effect.callback<void, LoginRelayError>((resume) => {
       server.once("error", (cause) => resume(Effect.fail(new LoginRelayError({ cause }))));
-      server.listen(0, "127.0.0.1", () => resume(Effect.void));
+      server.listen(listen.port, listen.host, () => resume(Effect.void));
     }),
     () => Effect.callback<void>((resume) => {
       server.close(() => resume(Effect.void));
@@ -141,6 +188,6 @@ export const startLoginRelay: StartLoginRelay = Effect.fnUntraced(function*({ au
   );
   // A server listening on a TCP port has an AddressInfo address.
   const { port } = server.address() as AddressInfo;
-  yield* Effect.logInfo(`relaying the Codex login in ${authFile} on 127.0.0.1:${port}`);
-  return { url: `http://127.0.0.1:${port}/v1`, bearer };
+  yield* Effect.logInfo(`relaying the Codex login in ${authFile} on ${listen.host}:${port}`);
+  return { url: `http://${listen.host}:${port}/v1`, bearer };
 }, withLogScope("codex-login-relay"));

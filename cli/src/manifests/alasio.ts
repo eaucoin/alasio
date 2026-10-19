@@ -28,6 +28,7 @@ import { carriedPools, GATEWAY, GATEWAY_PORT, sandboxServiceRuns } from "./sandb
 import { alasioGroup, environmentLogSecret, environmentName, lakeWakeTopic, LOG_BROKERS, telegramTopic } from "./log.ts";
 import { harnessPoolsRun } from "./harness-pools.ts";
 import { eventsGroup, eventsTopic } from "../../../src/events/names.ts";
+import { CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
 import {
   BRANCH_FORK_SECRET,
   BRANCH_LABEL,
@@ -212,6 +213,8 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
         { name: "ALASIO_HARNESS_POOLS", value: "1" },
         { name: "ALASIO_EVENTS_TOPIC", value: eventsTopic(environmentName(environment)) },
         { name: "ALASIO_EVENTS_GROUP", value: eventsGroup(environmentName(environment)) },
+        // Where its pools' pods reach its relay of its Codex login, which only it holds.
+        { name: "ALASIO_CODEX_LOGIN_URL", value: `http://${CODEX_LOGIN}.${environment.namespace}.svc.cluster.local:${CODEX_LOGIN_PORT}/v1` },
       ]
       : []),
     ...branchEnv(config, environment),
@@ -269,7 +272,10 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
             workingDir: home,
             env: alasioEnv(config, home, operatorHome, environment),
             ...given("envFrom", [...alasio.envFrom]),
-            ...(environment.branch === null && forksForBranches(config) ? { ports: [{ name: "branch-forks", containerPort: BRANCH_FORK_PORT }] } : {}),
+            ...given("ports", [
+              ...(environment.branch === null && forksForBranches(config) ? [{ name: "branch-forks", containerPort: BRANCH_FORK_PORT }] : []),
+              ...(harnessPoolsRun(config) ? [{ name: "codex-login", containerPort: CODEX_LOGIN_PORT }] : []),
+            ]),
             securityContext: restrictedContainer(),
             resources: alasio.resources,
             volumeMounts: [
@@ -411,6 +417,18 @@ function hostAgentIdentity(config: InstallConfig): KubernetesObject[] {
   return [serviceAccount, role, binding];
 }
 
+/** The Service of its relay of its Codex login, which its harness pools' pods reach it by (src/codex/login-relay.ts). */
+export const CODEX_LOGIN = componentName("codex-login");
+
+function codexLoginService(environment: Environment): V1Service {
+  return {
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: { name: CODEX_LOGIN, namespace: environment.namespace, labels: labels("alasio") },
+    spec: { selector: selectorLabels("alasio"), ports: [{ name: "codex-login", port: CODEX_LOGIN_PORT, targetPort: "codex-login" }] },
+  };
+}
+
 /** The objects of the alasio of `environment`, main's unless a branch environment's, with what main's carries forward. */
 export function alasioObjects(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT, carried: Carried = NOTHING_CARRIED): KubernetesObject[] {
   const alasio = deployment(config, carried.botChecksum, environment);
@@ -423,6 +441,7 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
     // A drain waits for the turns running in its pod to end.
     busyBudget(environment.namespace),
     ...(environment.branch === null && forksForBranches(config) ? [branchForksService()] : []),
+    ...(harnessPoolsRun(config) ? [codexLoginService(environment)] : []),
     // What alasio may do beyond what RBAC can say: the cluster's, made with main's.
     ...(environment.branch === null ? busyLabelPolicy() : []),
   ];

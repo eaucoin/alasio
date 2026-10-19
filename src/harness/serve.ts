@@ -31,6 +31,8 @@ import type { HarnessUnavailable, TurnResult } from "./index.ts";
 import {
   BackgroundWorkAnswer,
   BackgroundWorkRequest,
+  CodexLoginAnswer,
+  CodexLoginRequest,
   DrainAnswer,
   DrainRequest,
   encodeTurnAnswer,
@@ -190,6 +192,12 @@ export const serveHost = Effect.fnUntraced(function*(
         return Effect.flatMap(body(DrainRequest), () =>
           host.drain(conversationId).pipe(
             Effect.map((drained) => answer(200, Schema.encodeSync(DrainAnswer)({ drained }))),
+            Effect.mapError((error) => failed(422, error)),
+          ));
+      case HOST_PATHS.codexLogin:
+        return Effect.flatMap(body(CodexLoginRequest), ({ login }) =>
+          host.renewCodexLogin(conversationId, login).pipe(
+            Effect.map(() => answer(200, Schema.encodeSync(CodexLoginAnswer)({ renewed: true }))),
             Effect.mapError((error) => failed(422, error)),
           ));
       case HOST_PATHS.freshSession:

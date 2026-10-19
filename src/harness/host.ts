@@ -54,6 +54,21 @@ export interface TurnStart {
    * process, whose harnesses bring it up themselves.
    */
   readonly bayma: TurnBayma | null;
+  /** A Codex turn's login and configuration, as the control plane gives a host elsewhere (TurnCodex); null for the host in alasio's process, or a turn of no Codex. */
+  readonly codex: TurnCodex | null;
+}
+
+/**
+ * A Codex turn's login and configuration, as the control plane gives a host elsewhere, which
+ * holds no login: the relay of alasio's login it calls the model through, and a token of the
+ * turn's for it, good for minutes, which alasio renews as the turn runs (renewCodexLogin);
+ * and, of a folder conversation's, the operator's Codex
+ * configuration (its config.toml, AGENTS.md, prompts and skills), by path under their Codex
+ * home, which the host's own Codex home is given anew each turn, and never their login.
+ */
+export interface TurnCodex {
+  readonly login: { readonly url: string; readonly token: string };
+  readonly home: Readonly<Record<string, string>> | null;
 }
 
 /**
@@ -128,6 +143,13 @@ export class HarnessHost extends Context.Service<HarnessHost, {
    * release. How long a mirror may take is the caller's to bound.
    */
   readonly drain: (conversationId: string) => Effect.Effect<boolean, StoreError | HarnessHostError>;
+  /**
+   * Gives the conversation's Codex `login`, a fresh token for alasio's relay of its login, as
+   * a turn alasio drives runs on past the last token's time, which is minutes (TurnCodex): a
+   * host elsewhere relays with it from then on; the host in alasio's process, whose Codex reads
+   * alasio's login itself, takes none.
+   */
+  readonly renewCodexLogin: (conversationId: string, login: TurnCodex["login"]) => Effect.Effect<void, HarnessHostError>;
   /** A new, empty session of `harness` in `workingDirectory` for the conversation: its id. */
   readonly startFreshSession: (params: { readonly conversationId: string; readonly harness: HarnessName; readonly workingDirectory: string }) => Effect.Effect<string, HarnessError | HarnessUnavailable>;
   /** What the panels reach of the mount's harness in its folder; none until both are mounted. */
@@ -237,6 +259,7 @@ export class HarnessHost extends Context.Service<HarnessHost, {
           yield* Effect.logInfo(drained ? `drained ${conversationId}: no turn is started in it again` : `${conversationId} was not drained, as something goes on in it`);
           return drained;
         }),
+      renewCodexLogin: () => Effect.void,
       startFreshSession: ({ conversationId, harness, workingDirectory }) =>
         Effect.flatMap(harnesses.getFor(harness, workingDirectory), (found) => found.startFreshSession({ threadKey: conversationId, workingDirectory })),
       panels: (mount) => harnesses.forMount(mount),

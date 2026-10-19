@@ -13,6 +13,7 @@ import type { ApiServer } from "../api-server.ts";
 import { POOL_LABEL } from "../../../src/binder/names.ts";
 import { NET_MODE_LABEL } from "../../../src/kube/sandbox-shape.ts";
 import { NODE_AGENT_PORT } from "../../../src/node-agent/names.ts";
+import { CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
 import { forksForBranches, sessionsNamespace } from "./alasio.ts";
 import { GATEWAY_COMPONENT, SCRAPER_COMPONENT } from "./collector.ts";
 import {
@@ -494,8 +495,8 @@ const harnessPeers = (config: InstallConfig): V1NetworkPolicyPeer[] =>
  * The harness pools' pods of `environment` (./harness-pools.ts), free or bound: they take main's
  * sandbox gateway alone, on their host's port, which it reaches them through. A session
  * conversation's reaches the cluster's DNS, the gateway (its bayma and its files through it),
- * Neon's proxy (its database, as the harness host's role), the log's brokers (its events), the
- * collector where it runs, and the internet's HTTPS port, its harness's model's API, none of
+ * Neon's proxy (its database, as the harness host's role), the log's brokers (its events), its
+ * alasio's relay of its Codex login, the collector where it runs, and the internet's HTTPS port, its harness's model's API, none of
  * the cluster's or its network's private addresses, as a session with internet; nothing else.
  * A folder conversation's, main's, reaches what alasio's own pod reaches, as the operator's agents do.
  */
@@ -517,6 +518,8 @@ function harnessPolicies(config: InstallConfig, environment: Environment): Netwo
         { to: [{ namespaceSelector: namespaceNamed(NAMESPACE), ...SANDBOX_GATEWAY }], ports: [{ protocol: "TCP", port: SANDBOX_GATEWAY_PORT }] },
         { to: [ofMainNamespace("neon-proxy")], ports: [{ protocol: "TCP", port: PROXY_PORT }] },
         { to: [ofMainNamespace(LOG_COMPONENT)], ports: [{ protocol: "TCP", port: LOG_PORT }] },
+        // Its environment's alasio, its relay of its Codex login.
+        { to: [{ podSelector: { matchLabels: selectorLabels("alasio") } }], ports: [{ protocol: "TCP", port: CODEX_LOGIN_PORT }] },
         ...(collectorRuns(config) ? [{ to: [ofMainNamespace(GATEWAY_COMPONENT)], ports: [{ protocol: "TCP", port: COLLECTOR_PORT }] }] : []),
         { to: [{ ipBlock: { cidr: "0.0.0.0/0", except: [...config.sessions.blockedCidrs] } }], ports: [{ protocol: "TCP", port: 443 }] },
       ],
@@ -624,7 +627,8 @@ function sandboxServicePolicies(config: InstallConfig, apiServer: ApiServer | nu
 
 /**
  * alasio takes no connections but, main, where it forks sessions for branch environments,
- * their alasio's asking it to (src/branch/fork.ts).
+ * their alasio's asking it to (src/branch/fork.ts); and, where its harnesses run in pools, its
+ * own pools' pods, on its relay of its Codex login.
  */
 function alasioPolicy(config: InstallConfig, environment: Environment): NetworkPolicy {
   const forks = environment.branch === null && forksForBranches(config);
@@ -632,6 +636,8 @@ function alasioPolicy(config: InstallConfig, environment: Environment): NetworkP
     ...(forks
       ? [{ from: [{ namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } }], ports: [{ protocol: "TCP", port: BRANCH_FORK_PORT }] }]
       : []),
+    // Its own harness pools' pods, its relay of its Codex login: none of another environment's.
+    ...(harnessPoolsRun(config) ? [{ from: [{ podSelector: { matchLabels: selectorLabels(HARNESS_COMPONENT) } }], ports: [{ protocol: "TCP", port: CODEX_LOGIN_PORT }] }] : []),
   ];
   return policy(componentName("alasio"), environment.namespace, "alasio", {
     podSelector: { matchLabels: selectorLabels("alasio") },

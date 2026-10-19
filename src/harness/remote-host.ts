@@ -10,7 +10,7 @@
  * Each call bears the token its options make as it is made, as one minted for a while. A host
  * reached through the sandbox gateway's front, which binds a pod to the conversation as a call
  * reaches it, is asked what a binding has, its status, its background work, its turn steered or
- * stopped, its drain, a hold of it let go of, binding nothing
+ * stopped, its drain, its Codex's login renewed, a hold of it let go of, binding nothing
  * (NO_BIND_HEADER), so a hold let go of as its pod went binds no other: where it is bound nowhere,
  * the front says so (409, `{ bound: false }`), and the call answers as of a conversation
  * nothing runs in, its status as `unbound` says. What the front refuses itself, a token or a
@@ -32,6 +32,7 @@ import { HarnessHostError } from "./index.ts";
 import {
   Alive,
   BackgroundWorkAnswer,
+  CodexLoginAnswer,
   DrainAnswer,
   type CrossingError,
   crossingErrorOf,
@@ -188,6 +189,11 @@ export function remoteHost({ url, token, panels, unbound }: RemoteHostOptions): 
     drain: (conversationId) => call(HOST_PATHS.drain, { conversationId }, DrainAnswer, { none: Effect.succeed({ drained: true }) }).pipe(Effect.map(({ drained }) => drained), Effect.mapError(asStatusError)),
     backgroundWork: (conversationId) =>
       call(HOST_PATHS.backgroundWork, { conversationId }, BackgroundWorkAnswer, { none: Effect.succeed({ working: false }) }).pipe(Effect.map(({ working }) => working), Effect.mapError(asStatusError)),
+    renewCodexLogin: (conversationId, login) =>
+      call(HOST_PATHS.codexLogin, { conversationId, login }, CodexLoginAnswer, { none: Effect.succeed({ renewed: false }) }).pipe(
+        Effect.asVoid,
+        Effect.mapError((error) => (error._tag === "HarnessHostError" ? error : new HarnessHostError({ reason: error.message }))),
+      ),
     startFreshSession: ({ conversationId, harness, workingDirectory }) =>
       call(HOST_PATHS.freshSession, { conversationId, harness, workingDirectory }, FreshSessionAnswer).pipe(
         Effect.map(({ sessionId }) => sessionId),

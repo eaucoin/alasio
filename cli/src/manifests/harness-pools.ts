@@ -39,6 +39,8 @@
  * secrets of its own (an MCP server's token among them). Never Codex's login, which alasio
  * alone holds and relays to it, each turn's token good for minutes (src/codex/login-relay.ts).
  */
+import { posix } from "node:path";
+
 import type { KubernetesObject, V1Deployment, V1EnvVar, V1PodTemplateSpec, V1Role, V1RoleBinding, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
 
 import { freeLabels, type Pool } from "../../../src/binder/names.ts";
@@ -86,6 +88,8 @@ export const FOLDER_HARNESS_POOLS: Readonly<Record<HarnessName, string>> = { cod
 
 /** Where a harness pool's pod keeps what it writes as it runs (received files, its session filesystems' Codex home): alasio's own, so a session's harness directory is where alasio's would be. */
 const STATE_DIR = "/var/lib/alasio/state";
+/** Where a pool's pod's Codex has its home, of its own: no login in it, alasio's relayed to it (src/harness/given-codex-login.ts). */
+const CODEX_HOME = "/var/lib/alasio/codex";
 /** Where a session pool's pod's harnesses have their home, of their own. */
 const SESSION_HOME = "/var/lib/alasio/home";
 
@@ -115,6 +119,8 @@ function harnessTemplate(config: InstallConfig, environment: Environment, pool: 
     { name: "ALASIO_HARNESS_PORT", value: String(HARNESS_POD_PORT) },
     { name: "ALASIO_STATE_DIR", value: STATE_DIR },
     { name: "HOME", value: home },
+    // Its Codex's home, its own, which holds no login: a folder conversation's is given the operator's configuration each turn.
+    { name: "CODEX_HOME", value: CODEX_HOME },
     { name: "ALASIO_DATABASE_URL_FILE", value: "/run/alasio/database/url" },
     ...(environment.branch ? [{ name: "ALASIO_BRANCH", value: environment.branch }] : []),
     // Its turns' workspaces' bayma, and its session's files, through the gateway, by what each turn gives.
@@ -139,14 +145,17 @@ function harnessTemplate(config: InstallConfig, environment: Environment, pool: 
     // Its own directory on its node, by its namespace and its name, as pods of two namespaces may share a name, where its binding is written: its to read alone, so it fills nothing of its node's.
     { name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAMESPACE)/$(POD_NAME)", readOnly: true },
     { name: "state", mountPath: STATE_DIR },
-    ...(folder ? hostVolumeMounts(config) : [{ name: "home", mountPath: home }]),
+    { name: "codex", mountPath: CODEX_HOME },
+    // The operator's own Codex home, their login in it, hidden where the machine's mounts would show it.
+    ...(folder ? [...hostVolumeMounts(config), { name: "codex-hidden", mountPath: posix.join(home, ".codex"), readOnly: true }] : [{ name: "home", mountPath: home }]),
     { name: "database", mountPath: "/run/alasio/database", readOnly: true },
     { name: "log", mountPath: "/run/alasio/log", readOnly: true },
   ];
   const volumes: V1Volume[] = [
     { name: "attach", hostPath: { path: ATTACH_ROOT, type: "DirectoryOrCreate" } },
     { name: "state", emptyDir: {} },
-    ...(folder ? hostVolumes(config) : [{ name: "home", emptyDir: {} }]),
+    { name: "codex", emptyDir: {} },
+    ...(folder ? [...hostVolumes(config), { name: "codex-hidden", emptyDir: {} }] : [{ name: "home", emptyDir: {} }]),
     { name: "database", secret: { secretName: componentName("harness-database"), items: [{ key: "url", path: "url" }] } },
     { name: "log", secret: { secretName: harnessLogSecret(environment), items: [{ key: "password", path: "password" }] } },
   ];

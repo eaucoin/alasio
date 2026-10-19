@@ -3759,6 +3759,10 @@ describe("conversations' harnesses' pools", () => {
     assert.deepEqual(config.harnesses, { namespace: "alasio", pools: { codex: "harness-codex", claude: "harness-claude" }, podPort: 8080, owner: { uid: 1000, gid: 1000 }, releaseAfterSeconds: 300, drainSeconds: 120, folders: null });
     const alasio = Object.fromEntries((container(one<V1Deployment>(objects, "Deployment", "alasio")).env ?? []).map(({ name, value }) => [name, value]));
     assert.deepEqual([alasio["ALASIO_HARNESS_POOLS"], alasio["ALASIO_EVENTS_TOPIC"], alasio["ALASIO_EVENTS_GROUP"]], ["1", "events.main", "alasio-events.main"]);
+    // Its Codex login relayed to its pools' pods, on its pod's port, through a Service of its own.
+    assert.equal(alasio["ALASIO_CODEX_LOGIN_URL"], "http://alasio-codex-login.alasio.svc.cluster.local:4320/v1");
+    assert.deepEqual(container(one<V1Deployment>(objects, "Deployment", "alasio")).ports?.find(({ name }) => name === "codex-login")?.containerPort, 4320);
+    assert.deepEqual(one<V1Service>(objects, "Service", "alasio-codex-login").spec?.ports, [{ name: "codex-login", port: 4320, targetPort: "codex-login" }]);
   });
 
   test("of main's folder conversations, beside its alasio, as the operator with the machine's mounts, where the host profile renders folder workspaces", () => {
@@ -3767,6 +3771,10 @@ describe("conversations' harnesses' pools", () => {
     assert.equal(pool.metadata?.namespace, "alasio");
     assert.deepEqual([pool.spec?.template.spec?.securityContext?.runAsUser, pool.spec?.template.spec?.securityContext?.runAsGroup], [1001, 1002]);
     assert.ok(container(pool).volumeMounts?.some(({ name, mountPath }) => name === "home" && mountPath === "/home/op"));
+    // Its Codex's home its own, the operator's, with their login, hidden under the mount that would show it.
+    assert.equal(container(pool).env?.find(({ name }) => name === "CODEX_HOME")?.value, "/var/lib/alasio/codex");
+    const hidden = container(pool).volumeMounts?.find(({ mountPath }) => mountPath === "/home/op/.codex");
+    assert.deepEqual(pool.spec?.template.spec?.volumes?.find(({ name }) => name === hidden?.name), { name: "codex-hidden", emptyDir: {} });
     assert.equal(container(pool).env?.find(({ name }) => name === "HOME")?.value, "/home/op");
     const config = JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}");
     assert.deepEqual(config.harnesses.folders, { pools: { codex: "harness-folder-codex", claude: "harness-folder-claude" }, owner: { uid: 1001, gid: 1002 } });
@@ -3810,7 +3818,13 @@ describe("conversations' harnesses' pools", () => {
       assert.equal(connects(policies, pod, privateAddress, 443), false);
       assert.equal(connects(policies, pod, agent, 8484), false);
       assert.equal(connects(policies, pod, alasio, 4319), false);
+      // Its alasio's relay of its Codex login.
+      assert.equal(connects(policies, pod, alasio, 4320), true);
     }
+    // None of another environment's.
+    const elsewhere = podOf("harness", "alasio-branch-try", { "alasio.dev/pool": "harness-codex" }, { "alasio.dev/branch": "try" });
+    assert.equal(connects(policies, elsewhere, alasio, 4320), false);
+    assert.equal(connects(policies, gateway, alasio, 4320), false);
     // A branch environment's, by the gateway, which reaches its pods.
     const branchPod = podOf("harness", "alasio-branch-try", { "alasio.dev/pool": "harness-codex" }, { "alasio.dev/branch": "try" });
     const both = [...policies, ...all<NetworkPolicyObject>(branchObjects(configOf(pooling), "try", BASELINE), "NetworkPolicy")];

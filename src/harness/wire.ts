@@ -31,6 +31,7 @@ export const HOST_PATHS = {
   backgroundWork: "/background-work",
   drain: "/drain",
   freshSession: "/fresh-session",
+  codexLogin: "/codex-login",
 } as const;
 
 /** What names the conversation a call is about, which a host serving another refuses. */
@@ -66,6 +67,10 @@ export const TurnStartRequest = Schema.Struct({
     Schema.Struct({ endpoint: Schema.Struct({ url: Schema.String, headers: Schema.Record(Schema.String, Schema.String) }), notice: Schema.Null }),
     Schema.Struct({ endpoint: Schema.Null, notice: Schema.String }),
   ])),
+  codex: Schema.NullOr(Schema.Struct({
+    login: Schema.Struct({ url: Schema.String, token: Schema.String }),
+    home: Schema.NullOr(Schema.Record(Schema.String, Schema.String)),
+  })),
 });
 // What the request carries is what the host's start is, field for field.
 export const turnStartOf = (request: typeof TurnStartRequest.Type): TurnStart => request;
@@ -124,6 +129,10 @@ export const BackgroundWorkAnswer = Schema.Struct({ working: Schema.Boolean });
 
 export const FreshSessionRequest = Schema.Struct({ conversationId: Schema.String, harness: Harness, workingDirectory: Schema.String });
 export const FreshSessionAnswer = Schema.Struct({ sessionId: Schema.String });
+
+/** A fresh token of alasio's relay of its Codex login, as a turn alasio drives runs (HarnessHost.renewCodexLogin). */
+export const CodexLoginRequest = Schema.Struct({ conversationId: Schema.String, login: Schema.Struct({ url: Schema.String, token: Schema.String }) });
+export const CodexLoginAnswer = Schema.Struct({ renewed: Schema.Boolean });
 
 /**
  * How often, at most, a call that lasts says it does: well under the five minutes Node's

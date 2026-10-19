@@ -41,10 +41,11 @@ export interface AlasioConfig {
   /**
    * Where alasio's conversations' harnesses run in pools of their own, through the sandbox
    * gateway (src/harness/pooled-host.ts), as the deployment says (`ALASIO_HARNESS_POOLS`): its
-   * environment's events topic, which it hears their hosts on, and the group it reads it in;
-   * null where they run in alasio's process.
+   * environment's events topic, which it hears their hosts on, and the group it reads it in; and
+   * where its pools' pods reach the relay of its Codex login it serves them
+   * (src/codex/login-relay.ts); null where they run in alasio's process.
    */
-  readonly harnessPools: { readonly events: TopicLog } | null;
+  readonly harnessPools: { readonly events: TopicLog; readonly codexLoginUrl: string } | null;
   /** Whether alasio runs in a pod of Kubernetes, which it holds busy while a turn runs (src/kube/busy.ts). */
   readonly inKubernetes: boolean;
 }
@@ -117,6 +118,8 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
           topic: requireEnv(env, "ALASIO_EVENTS_TOPIC"),
           group: requireEnv(env, "ALASIO_EVENTS_GROUP"),
         },
+        // Where its pools' pods reach its relay of its Codex login.
+        codexLoginUrl: requireEnv(env, "ALASIO_CODEX_LOGIN_URL"),
       }
       : null,
     inKubernetes: Boolean(env["ALASIO_POD"]?.trim()),

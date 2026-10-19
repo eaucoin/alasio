@@ -215,6 +215,7 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
       jobId: null,
       attachedTurn: null,
       bayma: null,
+      codex: null,
     });
     const claim = (messageId: string) => Effect.runPromise(alasio.claimTurn({ conversationId, chatId: "41", messageId, sessionId: THREAD, harness: CODEX_HARNESS, prompt: messageId }));
     const first = await claim("first");
