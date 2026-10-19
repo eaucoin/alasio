@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import test from "node:test";
 
 import { Array as Arr, Deferred, Effect, Exit, Fiber, Layer, Logger as EffectLogger, Scope } from "effect";
@@ -196,9 +197,15 @@ test("a reply waiting to be retried holds back the replies queued after it to it
   await run(store.enqueueOutboxText({ chatId: "2", text: "elsewhere" }));
   const due = async () => (await run(store.getDueOutbox())).map((reply) => reply.text);
   assert.deepEqual(await due(), ["first", "elsewhere"]);
-  await run(store.rescheduleOutbox(first, new Error("Bad Gateway"), 60_000));
+  const deferred = await run(store.claimOutboxOf("1", "deferring", "1 minute"));
+  assert.equal(deferred?.entry.id, first);
+  assert.equal(await run(store.rescheduleOutbox(deferred, new Error("Bad Gateway"), 300)), true);
   assert.deepEqual(await due(), ["elsewhere"]);
-  await run(store.markOutboxSent(first));
+  await sleep(400);
+  assert.deepEqual(await due(), ["first", "elsewhere"]);
+  const sent = await run(store.claimOutboxOf("1", "sending", "1 minute"));
+  assert.equal(sent?.entry.id, first);
+  assert.equal(await run(store.markOutboxSent(sent)), true);
   assert.deepEqual(await due(), ["second", "elsewhere"]);
 });
 
@@ -411,8 +418,10 @@ test("callback actions capture the mounted session generation", async () => {
 
 test("what is kept only in flight is pruned once it has landed long enough ago; what is still in flight is not", async () => {
   const store = await codexConversation();
-  const sent = await run(store.enqueueOutboxText({ chatId: "123", text: "delivered" }));
-  await run(store.markOutboxSent(sent));
+  await run(store.enqueueOutboxText({ chatId: "123", text: "delivered" }));
+  const claim = await run(store.claimOutboxOf("123", "delivering", "1 minute"));
+  assert.ok(claim);
+  await run(store.markOutboxSent(claim));
   await run(store.enqueueOutboxText({ chatId: "123", text: "waiting" }));
   await run(store.pruneTransient("1 hour"));
   assert.equal(await run(store.getPendingOutboxCount), 1);

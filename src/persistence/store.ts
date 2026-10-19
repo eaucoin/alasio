@@ -8,7 +8,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { Update } from "@grammyjs/types";
-import { Context, Duration, Effect, Layer, Option, Schema } from "effect";
+import { Context, Duration, Effect, Layer, Schema } from "effect";
 import type { Pool } from "pg";
 
 import type { HarnessName } from "../harness/names.ts";
@@ -73,8 +73,8 @@ export interface StoreOptions {
   readonly branch?: string | null | undefined;
   /** How long handling a chat's update waits for the chat's handling lock (withHandlingLock): HANDLING_LOCK_TIMEOUT unless a test says. */
   readonly handlingLockTimeout?: Duration.Input | undefined;
-  /** How long a statement under a chat's lock may run (LOCKED_STATEMENT_TIMEOUT unless a test says). */
-  readonly lockedStatementTimeout?: Duration.Input | undefined;
+  /** How long a statement of a chat's handling or delivery may run (CHAT_STATEMENT_TIMEOUT unless a test says). */
+  readonly chatStatementTimeout?: Duration.Input | undefined;
   /**
    * Whether it makes the schema: its tables where missing, a branch's state its own, and the
    * harness host's grants. alasio's store does; the harness host's, of the schema alasio made,
@@ -93,14 +93,30 @@ export interface StoreOptions {
 export const HANDLING_LOCK_TIMEOUT = Duration.seconds(30);
 
 /**
- * How long a statement made under a chat's lock, in its transaction, may run before
- * Postgres ends it: far longer than any of them takes (a mark, a read of the chat's next
- * entry), and less than the grace alasio's pod stops with (60 s), so one that never
- * returns, as of a compute frozen under it, holds no delivery, which alasio does not cut
- * short as it stops, past its stopping. Set on the locks' transactions alone: alasio's
- * other statements, its schema's setup and its pruning among them, are not bounded by it.
+ * How long a statement of a chat's handling (under its handling lock) or of its delivery (a
+ * claim of its next reply, and its marks) may run before Postgres ends it: far longer than
+ * any of them takes, and less than the grace alasio's pod stops with (60 s), so one that
+ * never returns, as of a compute frozen under it, holds no delivery, which alasio does not
+ * cut short as it stops, past its stopping. Set on those statements' transactions alone:
+ * alasio's other statements, its schema's setup and its pruning among them, are not
+ * bounded by it.
  */
-export const LOCKED_STATEMENT_TIMEOUT = Duration.seconds(45);
+export const CHAT_STATEMENT_TIMEOUT = Duration.seconds(45);
+
+/**
+ * A delivery pass's claim on the outbox entry it sends (Store.claimOutboxOf): the entry, and
+ * the token that pass alone holds, which its renewals and marks name.
+ */
+export interface OutboxClaim {
+  readonly entry: DueOutboxEntry;
+  readonly token: string;
+}
+
+/** What an entry delivered was: a status message with its message's id, one given up on with why. */
+export interface OutboxDelivered {
+  readonly telegramMessageId?: number | null;
+  readonly refused?: string | null;
+}
 
 /** Each of alasio's repositories, on one connection or transaction. */
 const repositories = (sql: Sql, schema: string, workingDirectory: string | null) => ({
@@ -122,41 +138,22 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
 type Stored<A> = Effect.Effect<A, StoreError>;
 
 /**
- * A chat's locks, each held by one at a time of all the alasios on the store: its updates'
- * handling, and its replies' delivery, apart, so a reply Telegram is slow to take holds
- * back no update. Each is a transaction's advisory lock, the transaction open on a
- * connection of its own, let go of however what holds it ends. What its holder marks of
- * its work is written in that transaction (HandlingMarks, DeliveryMarks), so a lock lost,
- * as its connection is, rolls back the marks made under it: none outlives its lock.
+ * What a chat's handling lock's holder marks of an update, in the lock's transaction. The
+ * lock is the transaction's advisory lock, held by one at a time of all the alasios on the
+ * store, and let go of however what holds it ends; so a lock lost, as its connection is,
+ * rolls back the marks made under it: none outlives its lock.
  */
-export type ChatLock = "handling" | "delivery";
-
-/** What a chat's handling lock's holder marks of an update, in the lock's transaction. */
 export interface HandlingMarks {
   /** Keeps an update, unless it is kept already: whether it is yet to be processed. */
   readonly recordTelegramUpdate: (update: Update) => Stored<boolean>;
   readonly markTelegramUpdateProcessed: (updateId: number) => Stored<void>;
 }
 
-/** What a chat's delivery lock's holder reads and marks of the chat's outbox, in the lock's transaction. */
-export interface DeliveryMarks {
-  /** The chat's next entry, if it is due. */
-  readonly getDueOutboxOf: (chatId: string) => Stored<DueOutboxEntry | null>;
-  /** Marks an entry delivered: a status message with its message's id, one given up on with why. */
-  readonly markOutboxSent: (id: string, delivered?: { readonly telegramMessageId?: number | null; readonly refused?: string | null }) => Stored<void>;
-  readonly rescheduleOutbox: (id: string, error: unknown, delayMs: number) => Stored<void>;
-  /**
-   * A round trip on the lock's connection: it fails where the connection, and so the lock,
-   * is lost, for its holder to send nothing it may no longer send.
-   */
-  readonly fence: Stored<void>;
-}
-
 /**
- * What names a chat's lock to Postgres, whose advisory locks are numbers: its text, of the
- * store's schema, the lock and the chat, which Postgres hashes to one (hashtextextended).
+ * What names a chat's handling lock to Postgres, whose advisory locks are numbers: its text,
+ * of the store's schema and the chat, which Postgres hashes to one (hashtextextended).
  */
-export const chatLockName = (schema: string, lock: ChatLock, chatId: string | number): string => `${schema}:${lock}:${chatId}`;
+export const handlingLockName = (schema: string, chatId: string | number): string => `${schema}:handling:${chatId}`;
 
 /**
  * A turn's write refused, as another turn has claimed its conversation since
@@ -250,19 +247,12 @@ export class Store extends Context.Service<Store, {
   /** Keeps an update, unless it is kept already: whether it is yet to be processed. */
   readonly recordTelegramUpdate: (update: Update) => Stored<boolean>;
   /**
-   * Runs `work` holding the chat's handling lock (ChatLock), given the marks it makes in
-   * the lock's transaction, waiting while another holds it, as an update waits its turn,
+   * Runs `work` holding the chat's handling lock (HandlingMarks), given the marks it makes
+   * in the lock's transaction, waiting while another holds it, as an update waits its turn,
    * but for the store's handling lock timeout at most: past it, it fails as the store does,
    * without running `work`.
    */
   readonly withHandlingLock: <A, E, R>(chatId: string | number, work: (marks: HandlingMarks) => Effect.Effect<A, E, R>) => Effect.Effect<A, E | StoreError, R>;
-  /**
-   * Runs `work` holding the chat's delivery lock (ChatLock), given the reads and marks it
-   * makes in the lock's transaction, where no other holds it: what it gave, or none,
-   * without running `work`, where another does, which is delivering the chat's replies, so
-   * nothing waits on it holding a connection.
-   */
-  readonly withDeliveryLock: <A, E, R>(chatId: string | number, work: (marks: DeliveryMarks) => Effect.Effect<A, E, R>) => Effect.Effect<Option.Option<A>, E | StoreError, R>;
   readonly markTelegramUpdateProcessed: (updateId: number) => Stored<void>;
   readonly insertMessage: (message: NewMessage) => Stored<string>;
   readonly insertFile: (file: NewFile) => Stored<string>;
@@ -326,14 +316,33 @@ export class Store extends Context.Service<Store, {
   readonly enqueueOutboxStatus: (status: NewOutboxStatus) => Stored<string>;
   /** Queues an edit of the status message `edits`. */
   readonly enqueueOutboxEdit: (edits: string, edit: NewOutboxStatus) => Stored<string>;
+  /** What is due, each chat's next entry, claimed or not. */
   readonly getDueOutbox: (limit?: number) => Stored<DueOutboxEntry[]>;
-  /** The chat's next entry, if it is due. */
+  /** The chat's next entry, if it is due, claimed or not. */
   readonly getDueOutboxOf: (chatId: string) => Stored<DueOutboxEntry | null>;
+  /**
+   * Claims the chat's next entry for a delivery pass, `token` its own, if it is due and no
+   * other pass's claim on it holds, for `life`: the claim, or null. A claim that lapsed, its
+   * pass taken to be gone, is taken over. The claim is kept in the store, not by a
+   * connection, so it holds whatever becomes of the connection it was made on, until its
+   * pass marks the entry (markOutboxSent, rescheduleOutbox) or lets it lapse. Waiting for a
+   * connection, and the claim, may be interrupted, nothing claimed; once claimed it is the
+   * caller's.
+   */
+  readonly claimOutboxOf: (chatId: string, token: string, life: Duration.Input) => Stored<OutboxClaim | null>;
+  /** Keeps the claim for `life` from now: whether it still held. */
+  readonly renewOutboxClaim: (claim: OutboxClaim, life: Duration.Input) => Stored<boolean>;
+  /** Lets go of the claim of `token`, where it holds one, leaving its entry due. */
+  readonly releaseOutboxClaim: (token: string) => Stored<void>;
   /** The media a queued reply shows, kept with it until it is sent. */
   readonly getOutboxMedia: (id: string) => Stored<MediaAttachment[]>;
-  /** Marks an entry delivered: a status message with its message's id, one given up on with why. */
-  readonly markOutboxSent: (id: string, delivered?: { readonly telegramMessageId?: number | null; readonly refused?: string | null }) => Stored<void>;
-  readonly rescheduleOutbox: (id: string, error: unknown, delayMs: number) => Stored<void>;
+  /**
+   * Marks the claim's entry delivered and lets go of the claim: whether it still held. One
+   * that lapsed, and that another pass claimed since, marks nothing: the entry is that pass's.
+   */
+  readonly markOutboxSent: (claim: OutboxClaim, delivered?: OutboxDelivered) => Stored<boolean>;
+  /** Defers the claim's entry by `delayMs`, saying why, and lets go of the claim: whether it still held, as markOutboxSent says. */
+  readonly rescheduleOutbox: (claim: OutboxClaim, error: unknown, delayMs: number) => Stored<boolean>;
   readonly getPendingOutboxCount: Stored<number>;
 
   /** Queues a prompt: the job queued, or the one already queued for its message. */
@@ -395,14 +404,17 @@ const makeStore = Effect.fnUntraced(function*({
   workingDirectory = null,
   branch = null,
   handlingLockTimeout = HANDLING_LOCK_TIMEOUT,
-  lockedStatementTimeout = LOCKED_STATEMENT_TIMEOUT,
+  chatStatementTimeout = CHAT_STATEMENT_TIMEOUT,
   makesSchema = true,
   harnessRole = null,
 }: StoreOptions) {
   const database = poolDatabase(pool);
-  /** Bounds the statements of a chat's lock's transaction `sql` (LOCKED_STATEMENT_TIMEOUT), for that transaction alone. */
+  /** Bounds the statements of a chat's handling or delivery transaction `sql` (CHAT_STATEMENT_TIMEOUT), for that transaction alone. */
   const bounded = (sql: Sql): Effect.Effect<void, StoreError> =>
-    Effect.asVoid(sql.query("select set_config('statement_timeout', $1, true)", [`${Duration.toMillis(lockedStatementTimeout)}ms`]));
+    Effect.asVoid(sql.query("select set_config('statement_timeout', $1, true)", [`${Duration.toMillis(chatStatementTimeout)}ms`]));
+  /** `work`'s statements of a chat's delivery, in a transaction of their own, bounded. */
+  const delivering = <A>(work: (outbox: NeonOutboxRepository) => Stored<A>): Stored<A> =>
+    database.transaction((sql) => bounded(sql).pipe(Effect.andThen(work(repositoriesOn(sql).outbox))));
   if (makesSchema) {
     yield* ensureSchema(database, schema);
     if (harnessRole) yield* grantHarness(database, schema, harnessRole);
@@ -447,7 +459,7 @@ const makeStore = Effect.fnUntraced(function*({
         // Past the timeout, Postgres fails the wait (lock_not_available), and the transaction with it.
         bounded(sql).pipe(
           Effect.andThen(sql.query("select set_config('lock_timeout', $1, true)", [`${Duration.toMillis(handlingLockTimeout)}ms`])),
-          Effect.andThen(sql.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [chatLockName(schema, "handling", chatId)])),
+          Effect.andThen(sql.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [handlingLockName(schema, chatId)])),
           Effect.andThen(Effect.suspend(() => {
             const { telegramContent: locked } = repositoriesOn(sql);
             return work({
@@ -456,25 +468,6 @@ const makeStore = Effect.fnUntraced(function*({
             });
           })),
         )
-      ),
-    // Waiting for a connection, and for the lock, may be cut short, as alasio stops; the
-    // delivery under it, once the lock is taken, and its commit, are not.
-    withDeliveryLock: (chatId, work) =>
-      database.guardedTransaction(
-        (sql) =>
-          bounded(sql).pipe(
-            Effect.andThen(sql.query<{ taken: boolean }>("select pg_try_advisory_xact_lock(hashtextextended($1, 0)) as taken", [chatLockName(schema, "delivery", chatId)])),
-            Effect.map(([row]) => row?.taken ?? false),
-          ),
-        (sql) => {
-          const { outbox: locked } = repositoriesOn(sql);
-          return work({
-            getDueOutboxOf: (chat) => locked.getDueOf(chat),
-            markOutboxSent: (id, delivered) => locked.markSent(id, delivered),
-            rescheduleOutbox: (id, error, delayMs) => locked.reschedule(id, error, delayMs),
-            fence: Effect.asVoid(sql.query("select 1")),
-          });
-        },
       ),
     markTelegramUpdateProcessed: (updateId) => telegramContent.markTelegramUpdateProcessed(updateId),
     insertMessage: (message) => telegramContent.insertMessage(message),
@@ -555,9 +548,19 @@ const makeStore = Effect.fnUntraced(function*({
     enqueueOutboxEdit: (edits, edit) => outbox.enqueueEdit(edits, edit),
     getDueOutbox: (limit) => outbox.getDue(limit),
     getDueOutboxOf: (chatId) => outbox.getDueOf(chatId),
+    claimOutboxOf: (chatId, token, life) =>
+      database.interruptibleTransaction((sql) =>
+        bounded(sql).pipe(
+          Effect.andThen(repositoriesOn(sql).outbox.claimNextOf(chatId, token, Duration.toMillis(life))),
+          Effect.map((entry) => (entry === null ? null : { entry, token })),
+        )
+      ),
+    renewOutboxClaim: ({ entry, token }, life) => delivering((on) => on.renewClaim(entry.id, token, Duration.toMillis(life))),
+    releaseOutboxClaim: (token) => delivering((on) => on.releaseClaim(token)),
     getOutboxMedia: (id) => outbox.getMedia(id),
-    markOutboxSent: (id, delivered) => outbox.markSent(id, delivered),
-    rescheduleOutbox: (id, error, delayMs) => outbox.reschedule(id, error, delayMs),
+    // The entry's row locked before its claim's, as a claim of it locks them.
+    markOutboxSent: ({ entry, token }, delivered) => delivering((on) => Effect.andThen(on.lock(entry.id), on.markSent(entry.id, token, delivered))),
+    rescheduleOutbox: ({ entry, token }, error, delayMs) => delivering((on) => Effect.andThen(on.lock(entry.id), on.reschedule(entry.id, token, error, delayMs))),
     getPendingOutboxCount: outbox.getPendingCount(),
 
     enqueuePromptJob: (job) => promptJobs.enqueue(job),

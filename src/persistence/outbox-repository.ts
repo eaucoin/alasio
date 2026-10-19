@@ -168,26 +168,80 @@ export class NeonOutboxRepository {
   }
 
   /**
-   * Marks the entry delivered, its media deleted with it: of a status message, with its
-   * message's id; of one given up on, as Telegram refused it for good, with why.
+   * Claims the chat's next entry, if it is due and no other claim on it holds, as `token`'s
+   * for `lifeMs`: the entry, or null. A claim that lapsed is taken over. The entry's row is
+   * locked as it is claimed, and read again where another changed it meanwhile, so one marked
+   * since this statement began is not claimed, and its mark waits for this claim.
    */
-  markSent(id: string, { telegramMessageId = null, refused = null }: { readonly telegramMessageId?: number | null; readonly refused?: string | null } = {}): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(
-      `with media as (
-         delete from ${this.#schema}.outbox_media where outbox_id = $1
+  claimNextOf(chatId: string, token: string, lifeMs: number): Effect.Effect<DueOutboxEntry | null, StoreError> {
+    return this.#sql.query<DueOutboxEntry>(
+      `with next as (${this.#due("reply.chat_id = $1")} for update of reply skip locked), claimed as (
+         insert into ${this.#schema}.outbox_claims (outbox_id, token, until)
+         select id, $2, now() + make_interval(secs => $3) from next
+         on conflict (outbox_id) do update set token = excluded.token, until = excluded.until where outbox_claims.until <= now()
+         returning outbox_id
        )
-       update ${this.#schema}.telegram_outbox set state = 'sent', sent_at = now(), telegram_message_id = $2, last_error = $3 where id = $1`,
-      [id, telegramMessageId, refused === null ? null : refused.slice(0, 2000)],
-    ));
+       select next.* from next join claimed on claimed.outbox_id = next.id`,
+      [chatId, token, lifeMs / 1000],
+    ).pipe(Effect.map(([entry]) => entry ?? null));
   }
 
-  reschedule(id: string, error: unknown, delayMs: number): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(
-      `update ${this.#schema}.telegram_outbox
-       set state = 'pending', attempts = attempts + 1, available_at = now() + make_interval(secs => $2), last_error = $3
-       where id = $1`,
-      [id, delayMs / 1000, String(error).slice(0, 2000)],
-    ));
+  /** Keeps `token`'s claim on the entry for `lifeMs` from now: whether it still held it. */
+  renewClaim(id: string, token: string, lifeMs: number): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `update ${this.#schema}.outbox_claims set until = now() + make_interval(secs => $3) where outbox_id = $1 and token = $2 returning outbox_id`,
+      [id, token, lifeMs / 1000],
+    ).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
+  /** Lets go of `token`'s claim, where it holds one, leaving its entry as it is. */
+  releaseClaim(token: string): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(`delete from ${this.#schema}.outbox_claims where token = $1`, [token]));
+  }
+
+  /**
+   * Locks the entry's row, as a claim of it does (claimNextOf) before its claim's row: so a mark
+   * of it, taken in that order too, waits for a claim under way rather than deadlocking with it.
+   */
+  lock(id: string): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(`select 1 from ${this.#schema}.telegram_outbox where id = $1 for update`, [id]));
+  }
+
+  /**
+   * Marks the entry delivered, its media deleted with it, and `token`'s claim on it let go
+   * of: of a status message, with its message's id; of one given up on, as Telegram refused
+   * it for good, with why. Whether `token` still held it: where another claimed it since,
+   * the entry is that one's to mark, and nothing is marked.
+   */
+  markSent(id: string, token: string, { telegramMessageId = null, refused = null }: { readonly telegramMessageId?: number | null; readonly refused?: string | null } = {}): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `with claim as (
+         delete from ${this.#schema}.outbox_claims where outbox_id = $1 and token = $2 returning outbox_id
+       ), media as (
+         delete from ${this.#schema}.outbox_media where outbox_id in (select outbox_id from claim)
+       )
+       update ${this.#schema}.telegram_outbox set state = 'sent', sent_at = now(), telegram_message_id = $3, last_error = $4
+       where id in (select outbox_id from claim)
+       returning id`,
+      [id, token, telegramMessageId, refused === null ? null : refused.slice(0, 2000)],
+    ).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
+  /**
+   * Defers the entry by `delayMs`, saying why, and lets go of `token`'s claim on it: whether
+   * `token` still held it, as markSent says.
+   */
+  reschedule(id: string, token: string, error: unknown, delayMs: number): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `with claim as (
+         delete from ${this.#schema}.outbox_claims where outbox_id = $1 and token = $2 returning outbox_id
+       )
+       update ${this.#schema}.telegram_outbox
+       set state = 'pending', attempts = attempts + 1, available_at = now() + make_interval(secs => $3), last_error = $4
+       where id in (select outbox_id from claim)
+       returning id`,
+      [id, token, delayMs / 1000, String(error).slice(0, 2000)],
+    ).pipe(Effect.map((rows) => rows.length > 0));
   }
 
   /** Deletes the replies Telegram accepted more than `ageMs` ago. */

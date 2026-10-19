@@ -1,27 +1,27 @@
 /**
- * A chat's locks, which every alasio on the store takes (src/persistence/store.ts): its
- * handling lock waited for while another holds it, but not for ever, and the marks made
- * under it rolled back where it is lost; its delivery lock's taking cut short as alasio
- * stops, and the statements under each bounded in time.
+ * A chat's handling and delivery as every alasio on the store holds them
+ * (src/persistence/store.ts): its handling lock waited for while another holds it, but not
+ * for ever, and the marks made under it rolled back where it is lost; its next reply's
+ * claiming cut short as alasio stops; and the statements of each bounded in time.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import type { Update } from "@grammyjs/types";
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Option, type Scheduler } from "effect";
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, type Scheduler } from "effect";
 import pg from "pg";
 
 import { poolDatabase } from "../src/persistence/sql.ts";
-import { LOCKED_STATEMENT_TIMEOUT, Store } from "../src/persistence/store.ts";
-import { holdChatLock, lockHolder, newSchema, testDatabaseUrl, testPool, testStore } from "./support/store.ts";
+import { CHAT_STATEMENT_TIMEOUT, Store } from "../src/persistence/store.ts";
+import { handlingLockHolder, holdHandlingLock, newSchema, testDatabaseUrl, testPool, testStore } from "./support/store.ts";
 
 test("handling waits for the chat's handling lock another holds, and fails, its work not run, past the store's timeout", { timeout: 20_000 }, async () => {
   const schema = newSchema();
   const store = await testStore({ schema, handlingLockTimeout: "300 millis" });
   let handled = 0;
   const handle = store.withHandlingLock(42, () => Effect.sync(() => void (handled += 1)));
-  const letGo = await holdChatLock(schema, "handling", 42);
+  const letGo = await holdHandlingLock(schema, 42);
   try {
     const started = Date.now();
     const timedOut = await Effect.runPromiseExit(handle);
@@ -54,23 +54,23 @@ test("an update's marks made under a handling lock that is lost, its connection 
     })
   ));
   await Effect.runPromise(Deferred.await(marked));
-  await (await testPool()).query("select pg_terminate_backend($1)", [await lockHolder(schema, "handling", 42)]);
+  await (await testPool()).query("select pg_terminate_backend($1)", [await handlingLockHolder(schema, 42)]);
   await Effect.runPromise(Deferred.succeed(killed, undefined));
   assert.ok(Exit.isFailure(await Effect.runPromise(Fiber.await(handling))));
   // Nothing of it kept: kept again, it is yet to be processed.
   assert.equal(await Effect.runPromise(store.recordTelegramUpdate(update)), true);
 });
 
-test("a delivery waiting for a connection of a pool that has none to give is stopped at once, not after the connection's timeout, and the connection that comes later is given back", { timeout: 30_000 }, async () => {
+test("a claim of a chat's next reply waiting for a connection of a pool that has none to give is stopped at once, not after the connection's timeout, nothing claimed, and the connection that comes later is given back", { timeout: 30_000 }, async () => {
   const schema = newSchema();
   const pool = new pg.Pool({ connectionString: await testDatabaseUrl(), max: 1, connectionTimeoutMillis: 10_000 });
   try {
     const store = await Effect.runPromise(Effect.provide(Store, Store.layer({ pool, schema })));
+    await Effect.runPromise(store.enqueueOutboxText({ chatId: 42, text: "waiting" }));
     // The pool's one connection, held elsewhere.
     const held = await pool.connect();
-    let ran = false;
     try {
-      const waiting = Effect.runFork(store.withDeliveryLock(42, () => Effect.sync(() => void (ran = true))));
+      const waiting = Effect.runFork(store.claimOutboxOf("42", "stopped", "1 minute"));
       await sleep(300);
       const started = Date.now();
       await Effect.runPromise(Fiber.interrupt(waiting));
@@ -78,9 +78,9 @@ test("a delivery waiting for a connection of a pool that has none to give is sto
     } finally {
       held.release();
     }
-    assert.equal(ran, false);
-    // The connection the stopped wait would have had is the pool's again.
-    assert.deepEqual(await Effect.runPromise(store.withDeliveryLock(42, () => Effect.succeed("delivered")).pipe(Effect.timeout("5 seconds"))), Option.some("delivered"));
+    // The connection the stopped wait would have had is the pool's again, and the reply is claimed by the next.
+    const claimed = await Effect.runPromise(store.claimOutboxOf("42", "next", "1 minute").pipe(Effect.timeout("5 seconds")));
+    assert.deepEqual([claimed?.token, claimed?.entry.text], ["next", "waiting"]);
   } finally {
     await pool.end();
   }
@@ -101,7 +101,7 @@ test("a connection that comes as its transaction is stopped, the transaction sto
     shouldYield: () => held,
     makeDispatcher: () => ({ scheduleTask: (step) => void (held ? steps.push(step) : queueMicrotask(step)), flush: () => {} }),
   };
-  const transaction = Effect.runFork(poolDatabase(pool).guardedTransaction(() => Effect.succeed(true), () => Effect.void), { scheduler });
+  const transaction = Effect.runFork(poolDatabase(pool).interruptibleTransaction(() => Effect.void), { scheduler });
   while (!come) await sleep(5);
   held = true;
   come();
@@ -114,17 +114,19 @@ test("a connection that comes as its transaction is stopped, the transaction sto
   assert.equal(released, 1);
 });
 
-test("a delivery whose mark is stuck behind a lock no one lets go of ends as its lock's statements are bounded, rather than holding the delivery", { timeout: 30_000 }, async () => {
+test("a delivery whose mark is stuck behind a lock no one lets go of ends as its statements are bounded, rather than holding the delivery", { timeout: 30_000 }, async () => {
   const schema = newSchema();
   const other = await (await testPool()).connect();
   try {
-    const store = await testStore({ schema, lockedStatementTimeout: "500 millis" });
+    const store = await testStore({ schema, chatStatementTimeout: "500 millis" });
     const id = await Effect.runPromise(store.enqueueOutboxText({ chatId: 42, text: "stuck" }));
+    const claim = await Effect.runPromise(store.claimOutboxOf("42", "stuck", "1 minute"));
+    assert.ok(claim);
     // The entry's row held by another, as a statement of a frozen compute would hold it.
     await other.query("begin");
     await other.query(`select 1 from ${schema}.telegram_outbox where id = $1 for update`, [id]);
     const started = Date.now();
-    const marked = await Effect.runPromiseExit(store.withDeliveryLock(42, (marks) => marks.markOutboxSent(id)));
+    const marked = await Effect.runPromiseExit(store.markOutboxSent(claim));
     assert.ok(Exit.isFailure(marked));
     assert.match(String(Exit.isFailure(marked) && marked.cause), /statement timeout/u);
     assert.ok(Date.now() - started < 5000, "ended by the statement timeout");
@@ -134,6 +136,30 @@ test("a delivery whose mark is stuck behind a lock no one lets go of ends as its
   }
 });
 
-test("a statement under a chat's lock is ended by Postgres well within the grace alasio's pod is stopped with", () => {
-  assert.ok(Duration.isLessThan(LOCKED_STATEMENT_TIMEOUT, Duration.seconds(60)));
+test("a statement of a chat's handling or delivery is ended by Postgres well within the grace alasio's pod is stopped with", () => {
+  assert.ok(Duration.isLessThan(CHAT_STATEMENT_TIMEOUT, Duration.seconds(60)));
+});
+
+test("passes claiming a chat's entries and marking them at once, as many alasios' do, never deadlock, and mark each once", { timeout: 60_000 }, async () => {
+  const schema = newSchema();
+  const store = await testStore({ schema });
+  const entries = 40;
+  for (let n = 0; n < entries; n += 1) await Effect.runPromise(store.enqueueOutboxText({ chatId: 42, text: `entry ${n}` }));
+  let marked = 0;
+  // A pass: the chat's next entry claimed and marked sent, until none is due.
+  const pass = (name: string) =>
+    Effect.gen(function*() {
+      for (let round = 0; ; round += 1) {
+        const claim = yield* store.claimOutboxOf("42", `${name}-${round}`, "1 minute");
+        if (claim === null) {
+          if ((yield* store.getDueOutboxOf("42")) === null) return;
+          yield* Effect.sleep("1 millis");
+          continue;
+        }
+        if (yield* store.markOutboxSent(claim)) marked += 1;
+      }
+    });
+  await Effect.runPromise(Effect.all(["a", "b", "c", "d"].map(pass), { concurrency: "unbounded", discard: true }));
+  assert.equal(marked, entries);
+  assert.equal(await Effect.runPromise(store.getPendingOutboxCount), 0);
 });

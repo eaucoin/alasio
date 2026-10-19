@@ -3,7 +3,7 @@
  * transactions, whose statements run on one connection between `begin` and `commit`.
  * A transaction whose work fails, or is interrupted, is rolled back.
  */
-import { Effect, Exit, Option, Schema } from "effect";
+import { Effect, Exit, Schema } from "effect";
 import type { Pool, PoolClient } from "pg";
 
 /** What alasio's store failed with, as Postgres or the driver said it. */
@@ -25,13 +25,11 @@ export interface Database extends Sql {
   /** Runs `work`'s statements in one transaction: committed if it succeeds, rolled back if not. */
   readonly transaction: <A, E, R>(work: (sql: Sql) => Effect.Effect<A, E, R>) => Effect.Effect<A, E | StoreError, R>;
   /**
-   * Runs, in one transaction, `take`'s statements, then, where they say so, `work`'s: what
-   * `work` gave, or none where `take` said not, and `work` was not run. Waiting for a
-   * connection and `take` may be interrupted, as nothing is done yet; `work`, and the
-   * commit after it, are not, once `take` has said so, so what `work` did is committed with
-   * it. Rolled back where it fails.
+   * Runs `work`'s statements in one transaction, as `transaction` does, but for what may cut
+   * it short: waiting for a connection, and `work`, may be interrupted, the transaction
+   * rolled back, so nothing it did is kept; its commit may not.
    */
-  readonly guardedTransaction: <A, E, R>(take: (sql: Sql) => Effect.Effect<boolean, StoreError>, work: (sql: Sql) => Effect.Effect<A, E, R>) => Effect.Effect<Option.Option<A>, E | StoreError, R>;
+  readonly interruptibleTransaction: <A>(work: (sql: Sql) => Effect.Effect<A, StoreError>) => Effect.Effect<A, StoreError>;
 }
 
 const onPostgres = <A>(run: () => Promise<A>): Effect.Effect<A, StoreError> =>
@@ -95,18 +93,14 @@ export function poolDatabase(pool: Pool): Database {
         },
         releasing,
       ),
-    guardedTransaction: (take, work) =>
+    interruptibleTransaction: (work) =>
       Effect.acquireUseRelease(
         connection(pool),
         (client) => {
           const sql = sqlOn(client);
           return sql.query("begin").pipe(
-            Effect.andThen(take(sql)),
-            Effect.flatMap((taken) =>
-              taken
-                ? Effect.uninterruptible(work(sql).pipe(Effect.tap(() => sql.query("commit")))).pipe(Effect.map(Option.some))
-                : sql.query("commit").pipe(Effect.as(Option.none()))
-            ),
+            Effect.andThen(work(sql)),
+            Effect.tap(() => Effect.uninterruptible(sql.query("commit"))),
           );
         },
         releasing,

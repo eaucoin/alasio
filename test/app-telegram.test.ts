@@ -17,7 +17,7 @@ import {
   mount,
   alasioFor,
 } from "./support/scenarios.ts";
-import { holdChatLock, testPool } from "./support/store.ts";
+import { holdHandlingLock, testPool } from "./support/store.ts";
 import { OPERATOR_ID } from "./support/telegram.ts";
 
 /** Mounts Codex on alpha and has the operator send `first`, then `second` while it runs, queued behind it. */
@@ -87,7 +87,7 @@ test("a chat's update waits for its handling lock, which another alasio on the s
   const alasio = await alasioFor(t);
   const { telegram, stateSchema } = alasio;
   // Another alasio, handling the operator's chat.
-  const letGo = await holdChatLock(stateSchema, "handling", OPERATOR_ID);
+  const letGo = await holdHandlingLock(stateSchema, OPERATOR_ID);
   try {
     telegram.say("/stop");
     await sleep(1500);

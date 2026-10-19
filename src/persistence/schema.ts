@@ -251,6 +251,15 @@ create index if not exists telegram_outbox_due on ${SCHEMA}.telegram_outbox (sta
 create unique index if not exists telegram_outbox_pending_response
   on ${SCHEMA}.telegram_outbox (pending_response_id) where pending_response_id is not null;
 
+-- The claim of the delivery pass sending an entry, until it marks the entry or the claim lapses:
+-- no other pass sends the entry while the claim holds, whatever becomes of the connection it was
+-- made on. Its token is the pass's own, which its marks name.
+create table if not exists ${SCHEMA}.outbox_claims (
+  outbox_id text primary key references ${SCHEMA}.telegram_outbox (id) on delete cascade,
+  token text not null,
+  until timestamptz not null
+);
+
 -- The media a reply shows, kept with it until it is sent.
 create table if not exists ${SCHEMA}.outbox_media (
   outbox_id text not null references ${SCHEMA}.telegram_outbox (id) on delete cascade,

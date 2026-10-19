@@ -9,7 +9,7 @@ import { type Duration, Effect } from "effect";
 import pg from "pg";
 
 import type { StoreError } from "../../src/persistence/sql.ts";
-import { type ChatLock, chatLockName, Store, type TurnFenced, type TurnPersistence } from "../../src/persistence/store.ts";
+import { handlingLockName, Store, type TurnFenced, type TurnPersistence } from "../../src/persistence/store.ts";
 import { CODEX_HARNESS } from "../../src/harness/names.ts";
 import { startPostgres, type TestPostgres } from "./postgres.ts";
 
@@ -57,41 +57,41 @@ export function newSchema(): string {
 /**
  * The store in `schema` (a new one unless given), made empty where it was not made, a
  * branch environment's when `branch` names one, waiting for a chat's handling lock as long
- * as `handlingLockTimeout` says, and bounding a statement under a chat's lock as
- * `lockedStatementTimeout` does, where they say.
+ * as `handlingLockTimeout` says, and bounding a statement of a chat's handling or delivery
+ * as `chatStatementTimeout` does, where they say.
  */
-export async function testStore({ schema = newSchema(), workingDirectory = null, branch = null, handlingLockTimeout, lockedStatementTimeout }: {
+export async function testStore({ schema = newSchema(), workingDirectory = null, branch = null, handlingLockTimeout, chatStatementTimeout }: {
   readonly schema?: string | undefined;
   readonly workingDirectory?: string | null | undefined;
   readonly branch?: string | null | undefined;
   readonly handlingLockTimeout?: Duration.Input | undefined;
-  readonly lockedStatementTimeout?: Duration.Input | undefined;
+  readonly chatStatementTimeout?: Duration.Input | undefined;
 } = {}): Promise<Store["Service"]> {
   const { pool } = await database();
-  return Effect.runPromise(Effect.provide(Store, Store.layer({ pool, schema, workingDirectory, branch, handlingLockTimeout, lockedStatementTimeout })));
+  return Effect.runPromise(Effect.provide(Store, Store.layer({ pool, schema, workingDirectory, branch, handlingLockTimeout, chatStatementTimeout })));
 }
 
-/** The backend that holds the chat's `lock` of the store in `schema`, by its pid, for a test to end it as a lost connection is. */
-export async function lockHolder(schema: string, lock: ChatLock, chatId: string | number): Promise<number> {
+/** The backend that holds the chat's handling lock of the store in `schema`, by its pid, for a test to end it as a lost connection is. */
+export async function handlingLockHolder(schema: string, chatId: string | number): Promise<number> {
   // A bigint advisory lock is listed by its key's halves: classid the high, objid the low.
   const { rows: [row] } = await (await database()).pool.query<{ pid: number }>(
     `select pid from pg_locks, (select hashtextextended($1, 0) as key) as named
      where locktype = 'advisory' and granted and objsubid = 1
        and classid::bigint = ((named.key >> 32) & 4294967295) and objid::bigint = (named.key & 4294967295)`,
-    [chatLockName(schema, lock, chatId)],
+    [handlingLockName(schema, chatId)],
   );
-  if (!row) throw new Error(`no backend holds ${chatLockName(schema, lock, chatId)}`);
+  if (!row) throw new Error(`no backend holds ${handlingLockName(schema, chatId)}`);
   return row.pid;
 }
 
 /**
- * Holds the chat's `lock` of the store in `schema` as another alasio does, until what it
- * gives is called, which lets go of it, the first time.
+ * Holds the chat's handling lock of the store in `schema` as another alasio does, until
+ * what it gives is called, which lets go of it, the first time.
  */
-export async function holdChatLock(schema: string, lock: ChatLock, chatId: string | number): Promise<() => Promise<void>> {
+export async function holdHandlingLock(schema: string, chatId: string | number): Promise<() => Promise<void>> {
   const other = await (await database()).pool.connect();
   await other.query("begin");
-  await other.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [chatLockName(schema, lock, chatId)]);
+  await other.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [handlingLockName(schema, chatId)]);
   let held = true;
   return async () => {
     if (!held) return;
