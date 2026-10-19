@@ -314,18 +314,25 @@ test("a proxy that starts again takes back from its tokens file the tokens of th
     }
   }));
 
-test("a proxy that drains waits on no restore through its socket, which waits for the agent that comes back, only on those over TCP", () =>
+test("a proxy that drains waits on no restore through its socket, which waits for the agent that comes back, however many bytes of its pages it has yet to be served; only on those over TCP, until they have been", () =>
   withProxy(({ proxy }) =>
     Effect.gen(function*() {
-      minted(proxy, "main/fs-socket", "socket");
+      const socket = minted(proxy, "main/fs-socket", "socket");
       const tcp = minted(proxy, "main/fs-tcp");
       assert.equal(proxy.reading(), 1);
-      proxy.revoke("main/fs-tcp");
+      // Both resumed, each told the 4096 bytes of pages it reads, served none, and quiet for longer than their quiet.
+      for (const [holder, token] of [["main/fs-socket", socket], ["main/fs-tcp", tcp]] as const) {
+        proxy.resumed(holder, 60_000);
+        proxy.expect(token.accessKeyId, 4096);
+      }
+      yield* sleep(300);
+      assert.equal(proxy.reading(), 1);
+      // Over TCP, served them all: done.
+      assert.equal(refusal(yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token: tcp, range: "bytes=0-4095" }))), "206 ");
+      yield* sleep(50);
       assert.equal(proxy.reading(), 0);
       yield* proxy.drained.pipe(Effect.timeout("2 seconds"));
-      assert.ok(tcp);
-    })
-  ));
+    }), { quietMs: 100 }));
 
 const SERVED_ALL = "the restore of main/fs-abc has been served all 4096 bytes of its pages through the node agent";
 
