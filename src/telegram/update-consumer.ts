@@ -13,34 +13,25 @@
 import type { Update } from "@grammyjs/types";
 import { Context, Effect, Layer, Schema } from "effect";
 
+import { consumeGroup, errorText, type Feed, type Received } from "../log/consume.ts";
 import { joinTopic, type TopicLog } from "../log/topic.ts";
 import { withLogScope } from "../shared/log.ts";
-
-/** How long consuming waits after its member of the group failed before it joins again. */
-const REJOIN_BACKOFF = "3 seconds";
 
 /** Where the environment's updates are: the log's brokers, its principal on them, its topic and its group. */
 export type TelegramLog = TopicLog;
 
-/** A record of the topic: its update (null for one that is none), where it is, and what tells the group it is handled. */
-export interface ReceivedUpdate {
+/** A record of the topic, as its group's member reads it (../log/consume.ts): its update besides, null for one that is none. */
+export interface ReceivedUpdate extends Received {
   readonly update: Update | null;
-  readonly position: string;
-  readonly commit: () => Promise<void>;
 }
 
 /** The environment's member of its group: its records in turn, until it is closed. */
-export interface UpdateFeed {
-  readonly next: () => Promise<ReceivedUpdate>;
-  readonly close: () => Promise<void>;
-}
+export type UpdateFeed = Feed<ReceivedUpdate>;
 
 /** The log could not be joined, or its member failed. */
 export class UpdateFeedError extends Schema.TaggedError<UpdateFeedError>()("UpdateFeedError", {
   message: Schema.String,
 }) {}
-
-const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /** What joins the environment's group: the log's, or a stand-in's in alasio's tests. */
 export class TelegramUpdates extends Context.Service<TelegramUpdates, {
@@ -65,7 +56,7 @@ function updateOf(value: Buffer | undefined): Update | null {
 
 /** Joins `log`'s group on its topic, reading from where the group was last told, or from the topic's start. */
 async function joinUpdates(log: TelegramLog): Promise<UpdateFeed> {
-  const feed = await joinTopic(log, "earliest");
+  const feed = await joinTopic(log);
   return {
     next: () => feed.next().then(({ value, position, commit }) => ({ update: updateOf(value), position, commit })),
     close: feed.close,
@@ -86,40 +77,24 @@ function describeDefect(defect: unknown): string {
 
 /**
  * Hands each update of the environment's topic to `processUpdate` in turn, telling the
- * group of each once it is handled, until it is interrupted: an update being handled then
- * is finished first. A member that fails, or whose update the store could not keep, is
- * left, and the group joined again, after a backoff, from where it was last told.
+ * group of each once it is handled, until it is interrupted, as a member of its group does
+ * (../log/consume.ts). An update whose handling dies is skipped, said; one the store failed
+ * leaves the member, which joins again from where it was last told.
  */
-export const consumeUpdates = Effect.fnUntraced(
-  function*(processUpdate: ProcessUpdate): Effect.fn.Return<never, never, TelegramUpdates> {
-    const { join } = yield* TelegramUpdates;
-
-    const handle = (received: ReceivedUpdate): Effect.Effect<void, UpdateFeedError> =>
-      (received.update === null
-        ? Effect.logError(`Skipping ${received.position}, which is no update of Telegram's`)
-        : processUpdate(received.update).pipe(
-          Effect.catchDefect((defect) => Effect.logError(`Skipping update ${received.update?.update_id} after processing failure: ${describeDefect(defect)}`)),
-          Effect.mapError((error) => new UpdateFeedError({ message: `keeping update ${received.update?.update_id}: ${errorText(error)}` })),
-        )).pipe(
-          Effect.andThen(Effect.tryPromise({ try: () => received.commit(), catch: (error) => new UpdateFeedError({ message: `telling the group of ${received.position}: ${errorText(error)}` }) })),
-          Effect.uninterruptible,
-        );
-
-    const member = Effect.acquireRelease(join, (feed) => Effect.promise(() => feed.close().catch(() => {}))).pipe(
-      Effect.flatMap((feed) =>
-        Effect.forever(Effect.tryPromise({ try: () => feed.next(), catch: (error) => new UpdateFeedError({ message: errorText(error) }) }).pipe(Effect.flatMap(handle)))
-      ),
-      Effect.scoped,
-    );
-
-    return yield* member.pipe(
-      Effect.catch((error) => Effect.logError(`Consuming Telegram's updates failed: ${error.message}`)),
-      Effect.andThen(Effect.sleep(REJOIN_BACKOFF)),
-      Effect.forever,
-    );
-  },
-  withLogScope("telegram-app"),
-);
+export const consumeUpdates = (processUpdate: ProcessUpdate): Effect.Effect<never, never, TelegramUpdates> =>
+  Effect.flatMap(TelegramUpdates, ({ join }) =>
+    consumeGroup({
+      name: "Telegram's updates",
+      join,
+      handle: (received: ReceivedUpdate) =>
+        received.update === null
+          ? Effect.logError(`Skipping ${received.position}, which is no update of Telegram's`)
+          : processUpdate(received.update).pipe(
+            Effect.catchDefect((defect) => Effect.logError(`Skipping update ${received.update?.update_id} after processing failure: ${describeDefect(defect)}`)),
+            Effect.mapError((error) => `keeping update ${received.update?.update_id}: ${errorText(error)}`),
+          ),
+    })
+  ).pipe(withLogScope("telegram-app"));
 
 /** The environment's updates' log, from alasio's environment. */
 export function telegramLogOf(env: NodeJS.ProcessEnv): TelegramLog {

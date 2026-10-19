@@ -3,11 +3,13 @@
  * alasio's one Kafka client: its records in turn, each told to the group only once whoever
  * reads it says so (commit), so a member started again reads on from the last record told,
  * neither losing one nor skipping one. A group that has been told of none begins at the
- * topic's first record still kept, or at the next written, as its reader asks.
+ * topic's first record still kept.
  */
 import { readFileSync } from "node:fs";
 
 import { Consumer, MessagesStreamFallbackModes, MessagesStreamModes } from "@platformatic/kafka";
+
+import type { Feed, Received } from "./consume.ts";
 
 /** Where a topic is read: the log's brokers, the principal read as, the file of its password, the topic, and the group read in. */
 export interface TopicLog {
@@ -18,21 +20,16 @@ export interface TopicLog {
   readonly group: string;
 }
 
-/** A record of the topic: its value, where it is, and what tells the group it is read. */
-export interface TopicRecord {
+/** A record of the topic, as its group's member reads it (../log/consume.ts): its value besides. */
+export interface TopicRecord extends Received {
   readonly value: Buffer | undefined;
-  readonly position: string;
-  readonly commit: () => Promise<void>;
 }
 
 /** A member of the group: the topic's records in turn, until it is closed. */
-export interface TopicFeed {
-  readonly next: () => Promise<TopicRecord>;
-  readonly close: () => Promise<void>;
-}
+export type TopicFeed = Feed<TopicRecord>;
 
-/** Joins `log`'s group on its topic, reading on from where the group was last told, or, of a group told of none, from the topic's first record still kept (`earliest`) or the next written (`latest`). */
-export async function joinTopic(log: TopicLog, untold: "earliest" | "latest"): Promise<TopicFeed> {
+/** Joins `log`'s group on its topic, reading on from where the group was last told, or, of a group told of none, from the topic's first record still kept. */
+export async function joinTopic(log: TopicLog): Promise<TopicFeed> {
   const consumer = new Consumer({
     clientId: log.username,
     groupId: log.group,
@@ -47,7 +44,7 @@ export async function joinTopic(log: TopicLog, untold: "earliest" | "latest"): P
     stream = await consumer.consume({
       topics: [log.topic],
       mode: MessagesStreamModes.COMMITTED,
-      fallbackMode: untold === "earliest" ? MessagesStreamFallbackModes.EARLIEST : MessagesStreamFallbackModes.LATEST,
+      fallbackMode: MessagesStreamFallbackModes.EARLIEST,
       autocommit: false,
     });
   } catch (error) {
