@@ -3377,6 +3377,8 @@ describe("the sandbox service", () => {
       receiver: { host: "alasio-receiver.alasio.svc.cluster.local", port: 4318 },
       // No folder workspaces, of no host profile.
       folders: null,
+      // Conversations' harnesses in alasio's process, of no pools.
+      harnesses: null,
       // Main's sessions snapshotted as alasio's own were, under the releases kept, each pool's template as the pool runs it, none carried before it.
       snapshots: {
         liveEverySeconds: 600,

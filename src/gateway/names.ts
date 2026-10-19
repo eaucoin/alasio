@@ -11,6 +11,7 @@ import type { V1Container, V1PodSpec } from "@kubernetes/client-node";
 import { Schema } from "effect";
 
 import { keyHash } from "../binder/names.ts";
+import { HARNESS_NAMES } from "../harness/names.ts";
 import { sanitizePathToken } from "../kube/sandbox-shape.ts";
 import { ATTACH_ROOT } from "../node-agent/names.ts";
 
@@ -165,6 +166,21 @@ export function folderPodSpec(spec: V1PodSpec, pod: string, stateDir: string): V
   };
 }
 
+/** The container of a harness pool's pod that runs its host, `alasio harness` (cli/src/manifests/harness-pools.ts). */
+export const HARNESS_CONTAINER = "harness";
+
+/** What a conversation's harness's key begins with: `harness:<conversation>` (./harnesses.ts). */
+const HARNESS_KEY_PREFIX = "harness:";
+
+/** The key of the harness of the conversation `conversation`, which its caller's token says the harness and workspace of. */
+export const harnessKey = (conversation: string): string => `${HARNESS_KEY_PREFIX}${conversation}`;
+
+/** The conversation whose harness `key` is; null where it is no harness's. */
+export function conversationOfHarnessKey(key: string): string | null {
+  const conversation = key.startsWith(HARNESS_KEY_PREFIX) ? key.slice(HARNESS_KEY_PREFIX.length) : "";
+  return conversation.length > 0 && conversation.length <= 512 ? conversation : null;
+}
+
 /** A pod template, as the gateway's configuration holds one: an object, as the API server takes it. */
 const Template = Schema.Record(Schema.String, Schema.Unknown);
 
@@ -189,6 +205,9 @@ export const GatewaySnapshots = Schema.Struct({
   }),
 });
 export type GatewaySnapshots = typeof GatewaySnapshots.Type;
+
+/** The user and group a pod runs as, as the node agents write its binding (../node-agent/workspaces.ts PodOwner). */
+const PodOwner = Schema.Struct({ uid: Schema.Number, gid: Schema.Number });
 
 /** The sandbox pods' policy, which holds every pod of a sessions' namespace to its pools' templates (cli/src/manifests/admission.ts sandboxPodPolicy). */
 export const SANDBOX_POD_POLICY = "alasio-sandbox-pods";
@@ -222,5 +241,22 @@ export const GatewayConfig = Schema.Struct({
    * folder workspaces.
    */
   folders: Schema.NullOr(Schema.Struct({ namespace: Schema.String, template: Template, stateRoot: Schema.String, releaseAfterSeconds: Schema.Number })),
+  /**
+   * Conversations' harnesses' pools (./harnesses.ts): each harness's pool's name, in each
+   * environment's own namespace, main's `namespace`, a branch's its own; the port and user
+   * their pods' hosts run on; how long an idle one is kept, and how long its host is given to
+   * drain as it is let go of; and, main's alone, each harness's pool of folder conversations,
+   * in main's namespace too, and their pods' user, the host profile's. None where the
+   * installation's harnesses run in alasio's process.
+   */
+  harnesses: Schema.NullOr(Schema.Struct({
+    namespace: Schema.String,
+    pools: Schema.Record(Schema.Literals(HARNESS_NAMES), Schema.String),
+    podPort: Schema.Number,
+    owner: PodOwner,
+    releaseAfterSeconds: Schema.Number,
+    drainSeconds: Schema.Number,
+    folders: Schema.NullOr(Schema.Struct({ pools: Schema.Record(Schema.Literals(HARNESS_NAMES), Schema.String), owner: PodOwner })),
+  })),
 });
 export type GatewayConfig = typeof GatewayConfig.Type;

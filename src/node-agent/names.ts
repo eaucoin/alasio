@@ -134,8 +134,11 @@ export const runscVersion = (release: string): string => `release-${release}`;
  */
 export const WORKSPACES_ROOT = "/var/lib/alasio/workspaces";
 
-/** Where a node keeps the directory of each pod of a sandbox pool, `<namespace>/<pod>`, which the pod mounts by `subPathExpr` of its namespace and its name. */
+/** Where a node keeps the directory of each pod of a sandbox pool, or of a harness pool, `<namespace>/<pod>`, which the pod mounts by `subPathExpr` of its namespace and its name. */
 export const ATTACH_ROOT = "/var/lib/alasio/attach";
+
+/** The file of a harness pool's pod's binding in its directory, which its node's agent writes as the gateway binds it, and the pod serves once it is there (src/harness/program.ts). */
+export const BINDING_FILE = "binding.json";
 
 /** The root the gVisor shims run runsc with for Kubernetes' containers, under the node's /run. */
 export const RUNSC_ROOT = "/run/containerd/runsc/k8s.io";

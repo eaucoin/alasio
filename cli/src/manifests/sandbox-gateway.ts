@@ -308,6 +308,7 @@ function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
     folders: foldersRun(config)
       ? { namespace: config.host.namespace, template: { ...folderTemplate(config) }, stateRoot: config.host.stateRoot, releaseAfterSeconds: durationSeconds(config.host.releaseAfter) ?? 0 }
       : null,
+    harnesses: null,
   };
 }
 

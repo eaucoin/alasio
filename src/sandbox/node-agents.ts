@@ -11,7 +11,7 @@ import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { Gofer } from "../node-agent/names.ts";
 import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, POLICY_WAIT_MS, type ResumeRequest, type WorkspaceRef } from "../node-agent/agent.ts";
 import { NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
-import { Released, type StopRequest, type SyncRequest } from "../node-agent/workspaces.ts";
+import { type PodOwner, Released, type StopRequest, type SyncRequest } from "../node-agent/workspaces.ts";
 
 /** Where the node agents are: their pods' namespace and labels, and the port they serve on. */
 export interface NodeAgentsLocation {
@@ -119,6 +119,11 @@ export interface NodeAgents {
    */
   readonly attach: (node: string, request: AttachRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /**
+   * Gives the free pod `request.pod` of a harness pool, on `node`, its binding, its user's and
+   * group's. An agent refuses one that has a binding already, as a pod serves one, with 409.
+   */
+  readonly bindFree: (node: string, request: BindingRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /**
    * Detaches what is attached into `pod`'s directory on `node`. An agent refuses while any of
    * `containerIds`, the pod's sandbox's containers by their runtime's ids, runs, with 409.
    */
@@ -166,6 +171,13 @@ export interface AttachRequest extends WorkspaceRef {
   readonly env: Readonly<Record<string, string>>;
   /** Whether the pod's directory is made now, for a restore's pod made once its workspace is there, not one kubelet made. */
   readonly made?: boolean;
+}
+
+/** What a free pod's binding is: the pod, its user and group, and the text of its binding's file. */
+export interface BindingRequest extends PodOwner {
+  readonly namespace: string;
+  readonly pod: string;
+  readonly binding: string;
 }
 
 /** How long a checkpoint, a prepare or a copy may take. */
@@ -280,6 +292,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
   return {
     nodes: Effect.map(addresses, (known) => [...known.keys()]),
     attach: (node, request) => send(node, `attach ${request.environment}/${request.workspace} into ${request.pod}`, { method: "POST", path: "/attach", body: request, timeout: SHORT_CALL }).pipe(Effect.asVoid),
+    bindFree: (node, request) => send(node, `give ${request.namespace}/${request.pod} its binding`, { method: "POST", path: "/bindings", body: request, timeout: SHORT_CALL }).pipe(Effect.asVoid),
     detach: (node, namespace, pod, containerIds) => send(node, `detach what is attached into ${namespace}/${pod}`, { method: "POST", path: "/detach", body: { namespace, pod, containerIds }, timeout: SHORT_CALL }).pipe(Effect.asVoid),
     readFile: (workspace, path, maxBytes) =>
       Effect.flatMap(anyNode, (node) => send(node, `read ${path} of ${workspace.environment}/${workspace.workspace}`, { method: "GET", path: `${filePath(workspace, path)}&max=${maxBytes}`, timeout: SHORT_CALL })).pipe(

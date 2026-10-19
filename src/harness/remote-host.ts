@@ -75,7 +75,8 @@ function linesOf(body: ReadableStream<Uint8Array>, what: string): { readonly nex
   };
 }
 
-function makeRemoteHost({ url, token, panels }: RemoteHostOptions): HarnessHost["Service"] {
+/** The harness host at `url`, as the module says. */
+export function remoteHost({ url, token, panels }: RemoteHostOptions): HarnessHost["Service"] {
   const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 
   /** The host's answer to `path` with `body`: its status and what it said, or a HarnessHostError where it was not reached. */
@@ -161,5 +162,5 @@ function makeRemoteHost({ url, token, panels }: RemoteHostOptions): HarnessHost[
   });
 }
 
-/** The harness host at `url`, as the module says. */
-export const remoteHarnessHost = (options: RemoteHostOptions): Layer.Layer<HarnessHost> => Layer.succeed(HarnessHost, makeRemoteHost(options));
+/** The harness host at `url`, as remoteHost is, as HarnessHost. */
+export const remoteHarnessHost = (options: RemoteHostOptions): Layer.Layer<HarnessHost> => Layer.succeed(HarnessHost, remoteHost(options));

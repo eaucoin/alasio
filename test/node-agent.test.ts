@@ -2088,6 +2088,7 @@ const unusedWorkspaces: Workspaces = {
   quota: () => Effect.die("no workspace's quota is read"),
   attachments: Effect.die("no attachment is looked at"),
   attach: () => Effect.die("no workspace is attached"),
+  bindFree: () => Effect.die("no free pod is bound"),
   detach: () => Effect.die("no workspace is detached"),
   read: () => Effect.die("no workspace's file is read"),
   write: () => Effect.die("no workspace's file is written"),
@@ -2652,6 +2653,13 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       yield* agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding", env: {} });
       const again = yield* Effect.flip(agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding", env: {} }));
       assert.equal(again._tag === "NodeAgentError" && again.status, 409);
+      // A free pod of a harness pool given its binding through its node's agent, once.
+      at.pod("harness-codex-0", "alasio");
+      const binding = { namespace: "alasio", pod: "harness-codex-0", uid: process.getuid?.() ?? 1000, gid: process.getgid?.() ?? 1000, binding: "{\"conversationId\":\"telegram:41\"}" };
+      yield* agents.bindFree("node-1", binding);
+      assert.equal(readFileSync(join(at.attachRoot, "alasio", "harness-codex-0", "binding.json"), "utf8"), binding.binding);
+      const bound = yield* Effect.flip(agents.bindFree("node-1", binding));
+      assert.equal(bound._tag === "NodeAgentError" && bound.status, 409);
       // What is attached on it, through its node's agent, reachable until its mount is not.
       assert.deepEqual(yield* agents.attachments("node-1"), [{ namespace: "main", pod: "pool-0", reachable: true }]);
       at.unreachable.add("main/pool-0");

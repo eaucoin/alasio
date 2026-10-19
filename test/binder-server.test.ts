@@ -9,7 +9,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Context, Effect, Exit, Layer, Scope } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
-import { ACTIVE_ANNOTATION, activeAt, readLease, takeLease } from "../src/binder/bindings.ts";
+import { ACTIVE_ANNOTATION, activeAt, readLease, takeLease, touchLease } from "../src/binder/bindings.ts";
 import { baymaIdleness } from "../src/binder/sweep.ts";
 import { LiveBindings } from "../src/binder/live.ts";
 import { environmentKey, freeLabels, type Pool } from "../src/binder/names.ts";
@@ -69,7 +69,7 @@ async function front(
     peers = [] as string[],
     placed = [] as Readonly<Record<string, string>>[],
     release = undefined as Placement["release"],
-    told = {} as Pick<Placement, "held" | "settled" | "reset">,
+    told = {} as Pick<Placement, "held" | "settled" | "reset" | "port">,
     keyOf = callerKey as Buffer | ((claims: TokenClaims) => Buffer | null),
     operate = undefined as ((claims: TokenClaims, operation: Operation) => Effect.Effect<{ status: number; json?: unknown; bytes?: Uint8Array; headers?: Record<string, string> }>) | undefined,
     watched = false,
@@ -132,6 +132,22 @@ test("a caller's request binds its key and reaches the key's pod with the bindin
 /** The namespace of the binding whose token the stand-in for its pods was last sent. */
 const reachedNamespace = (sent: readonly IncomingHttpHeaders[]): string | undefined =>
   verifyToken(bindingKey, String(sent.at(-1)?.authorization).slice("Bearer ".length), Date.now())?.namespace;
+
+test("a key whose placement says its pod serves on a port of its own is passed on there, not on the front's", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  // Nothing serves on the front's port of pods: its placement's alone is reached.
+  const served = await front(of, 1, { told: { port: stand.port } });
+  try {
+    const response = await fetch(`http://127.0.0.1:${served.port}/turns`, { method: "POST", headers: { authorization: caller("harness:telegram:41") }, body: "{}" });
+    assert.equal(response.status, 200);
+    assert.equal(stand.sent.length, 1);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
 
 test("environments sharing a key each reach their own binding of it, whichever binds first, their requests interleaved, as a branch's forks of main's sessions keep their ids", async () => {
   const [main, branch] = [await pool(), await pool()];
@@ -268,6 +284,29 @@ test("a no-bind request for an unbound key takes no Lease and claims no pod; one
     assert.deepEqual(stand.sent.map((headers) => headers[NO_BIND_HEADER]), [undefined, undefined]);
   } finally {
     await served.close();
+    stand.close();
+  }
+});
+
+test("a no-bind request reads what a binding has, and keeps it no longer: its Lease is stamped active by the requests that may bind alone", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  const key = "harness:telegram:42";
+  const bound = await front(of, stand.port);
+  // Another replica, which has stamped nothing yet, so stamps whatever request it may.
+  const other = await front(of, stand.port);
+  try {
+    assert.equal((await fetch(`http://127.0.0.1:${bound.port}/turns`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" })).status, 200);
+    await run(touchLease(of, key, 1_000));
+    const read = await fetch(`http://127.0.0.1:${other.port}/status`, { method: "POST", headers: { authorization: caller(key), [NO_BIND_HEADER]: "never" }, body: "{}" });
+    assert.equal(read.status, 200);
+    assert.equal(activeAt((await run(readLease(of, key)))!), 1_000);
+    assert.equal((await fetch(`http://127.0.0.1:${other.port}/turns`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" })).status, 200);
+    assert.ok((activeAt((await run(readLease(of, key)))!) ?? 0) > 1_000);
+  } finally {
+    await bound.close();
+    await other.close();
     stand.close();
   }
 });
@@ -718,7 +757,7 @@ test("a request on a route of a binding gone that reached its pod before its con
   }
 });
 
-test("a request that binds nothing, of a key another replica bound anew within the stamp's interval, stamps the new binding, whose stamps are its own", async () => {
+test("a request that may bind, of a key another replica bound anew within the stamp's interval, stamps the new binding, whose stamps are its own", async () => {
   const of = await pool();
   await freePods(of, 2);
   const stand = await pods();
@@ -735,7 +774,12 @@ test("a request that binds nothing, of a key another replica bound anew within t
     const rebound = await run(readLease(of, key));
     assert.ok(rebound && rebound.metadata?.uid !== first.metadata?.uid, "bound anew");
     assert.equal(activeAt(rebound), null);
-    const passed = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key), [NO_BIND_HEADER]: "never" }, body: "{}" });
+    // A request that binds nothing asks how the key is bound now, and so routes it to the new binding, stamping nothing.
+    const read = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key), [NO_BIND_HEADER]: "never" }, body: "{}" });
+    assert.equal(read.status, 200);
+    assert.equal(activeAt((await run(readLease(of, key)))!), null, "a request that binds nothing stamped");
+    // The next, which may bind, on that route, within the stamp's interval of the binding gone.
+    const passed = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" });
     assert.equal(passed.status, 200);
     const stamped = await run(readLease(of, key));
     assert.equal(stamped?.metadata?.uid, rebound.metadata?.uid);

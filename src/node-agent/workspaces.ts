@@ -46,6 +46,14 @@
  * name at a time as ./volume.ts walks one: one any part of whose path is a symlink, or that
  * is not a regular file, is refused, and so is one not reached in time.
  *
+ * A free pod of a harness pool is given its binding (bindFree): the conversation it serves and
+ * the token its caller bears, a file of JSON (BINDING_FILE) in its directory, which kubelet
+ * made, written whole or not at all, and only where none is there, as a pod serves one
+ * binding: a file of its own, its pod's user's alone, synced, then linked to its name, which
+ * fails where the name is taken, the directory synced after, and one its pod's user may pass
+ * through to its binding alone, as the pod mounts it to read. Detached, what it wrote is
+ * removed as an attach's is.
+ *
  * A bound pod's bayma that holds its stop for a save is told to go on with it (stop): its
  * hook, `sandbox-hook stop`, run in its container under the gVisor release that runs it, as
  * a checkpoint runs its hook, and in no container but the bayma of a pod of a pool on this
@@ -63,7 +71,7 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { constants, type StatsFs } from "node:fs";
-import { chown, lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, statfs, unlink, writeFile } from "node:fs/promises";
+import { chmod, chown, link, lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, statfs, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Effect, Schedule, Schema } from "effect";
@@ -72,7 +80,7 @@ import { isValidVolumeId } from "../sandbox/names.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import type { Juicefs, JuicefsError, Quota } from "./juicefs.ts";
 import { BAYMA_CONTAINER, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
-import { ATTACH_ROOT, RESTORE_POD, WORKSPACES_ROOT } from "./names.ts";
+import { ATTACH_ROOT, BINDING_FILE, RESTORE_POD, WORKSPACES_ROOT } from "./names.ts";
 import type { Runsc } from "./runsc.ts";
 import { readUnder, writeUnder } from "./volume.ts";
 
@@ -138,6 +146,12 @@ export interface StopRequest {
 /** How long bayma's hook may take to go on with its stop. */
 const STOP_TIMEOUT_MS = 30_000;
 
+/** The user and group a pod runs as, whose what is written for it is. */
+export interface PodOwner {
+  readonly uid: number;
+  readonly gid: number;
+}
+
 /** What a sync asks: the bound pod, by its namespace and name, and its bayma's container by its runtime's id. */
 export type SyncRequest = Omit<StopRequest, "hook">;
 
@@ -164,6 +178,12 @@ export interface Workspaces {
    * gateway makes once its workspace is there.
    */
   readonly attach: (ref: WorkspaceRef, pod: string, token: string, env: Readonly<Record<string, string>>, options?: { readonly made?: boolean }) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
+  /**
+   * Gives the free pod `pod` of `namespace`, of a harness pool, its `binding`, as the module
+   * says, its user's and group's, `owner`; refused where kubelet made it no directory, or it
+   * has a binding already.
+   */
+  readonly bindFree: (namespace: string, pod: string, owner: PodOwner, binding: string) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
   /** Detaches what is attached into the directory of `pod` of `namespace`, once none of `containerIds`, its sandbox's containers by their runtime's ids, runs. */
   readonly detach: (namespace: string, pod: string, containerIds: readonly string[]) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
   /** The file at `path` of `ref`'s files, `workspace/...` or `home/...`, of `maxBytes` at most. */
@@ -247,8 +267,8 @@ const QUOTA_HELD_WITHIN_MS = 2 * 12_000 * 1.05;
 const QUOTA_LOOK_MS = 500;
 
 /** The agent's workspaces, as the module says. */
-/** What an attach writes into a pod's directory, beside its workspace's mount point (`ws`), and what its bayma marks there (`served`). */
-const ATTACHED_FILES: readonly string[] = ["token", "env", "served"];
+/** What an attach writes into a pod's directory, beside its workspace's mount point (`ws`), and a free pod's binding; and what its bayma marks there (`served`). */
+const ATTACHED_FILES: readonly string[] = ["token", "env", BINDING_FILE, "served"];
 
 /**
  * The agent's own mount namespace: the mount points at or under a directory as it has them, and
@@ -506,6 +526,42 @@ export function makeWorkspaces(
           await writeFile(join(directory, "token"), token, { mode: 0o400 });
           await chown(join(directory, "token"), agentUid, agentUid);
         });
+      }),
+
+    bindFree: (namespace, pod, { uid, gid }, binding) =>
+      Effect.gen(function*() {
+        if (![uid, gid].every((id) => Number.isSafeInteger(id) && id > 0)) return yield* refused(400, `${uid}:${gid} is no user a harness pool's pod runs as: none runs as root`);
+        const directory = yield* podDirectory(namespace, pod);
+        const there = yield* Effect.promise(() => lstat(directory).then((stats) => stats.isDirectory(), () => false));
+        if (!there) return yield* refused(404, `no pod of a pool on this node is named ${pod}: kubelet has made it no directory`);
+        const held = yield* mountsUnder(directory);
+        if (held.length > 0) return yield* refused(409, `${pod}'s directory holds ${held.join(", ")}: it is no free pod of a harness pool`);
+        const file = join(directory, BINDING_FILE);
+        const written = yield* Effect.tryPromise({ catch: (error) => refused(500, `${pod}'s binding could not be written: ${error instanceof Error ? error.message : String(error)}`), try: async () => {
+          const staged = `${file}.${randomBytes(8).toString("hex")}`;
+          const handle = await open(staged, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o400);
+          try {
+            await handle.writeFile(binding);
+            await handle.chown(uid, gid);
+            await handle.sync();
+          } finally {
+            await handle.close();
+          }
+          // Linked to its name, which fails where a binding has it: a pod serves one.
+          const linked = await link(staged, file).then(() => null, (error: NodeJS.ErrnoException) => error.code ?? "failed");
+          await unlink(staged);
+          if (linked !== null) return linked;
+          await chmod(directory, 0o711);
+          const parent = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
+          try {
+            await parent.sync();
+          } finally {
+            await parent.close();
+          }
+          return null;
+        } });
+        if (written === "EEXIST") return yield* refused(409, `${pod} has its binding already: a pod serves one`);
+        if (written !== null) return yield* refused(500, `${pod}'s binding could not be written: ${written}`);
       }),
 
     detach: (namespace, pod, containerIds) =>

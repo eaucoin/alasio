@@ -134,6 +134,42 @@ test("a workspace is attached into a pod's directory with its binding's token be
   }
 });
 
+test("a free pod of a harness pool is given its binding once, whole, its user's, beside nothing mounted; and detached, what was written for it goes", async () => {
+  const at = workspacesNode();
+  try {
+    const owner = { uid: process.getuid?.() ?? 1000, gid: process.getgid?.() ?? 1000 };
+    at.pod("harness-codex-0", "alasio");
+    const directory = join(at.attachRoot, "alasio", "harness-codex-0");
+    const binding = JSON.stringify({ conversationId: "telegram:41", token: "binding-token" });
+    await Effect.runPromise(at.workspaces.bindFree("alasio", "harness-codex-0", owner, binding));
+    const file = join(directory, "binding.json");
+    assert.equal(readFileSync(file, "utf8"), binding);
+    // Its directory one its user may pass through to its binding alone: listed, or written, by none but the agent.
+    assert.deepEqual([statSync(file).mode & 0o777, statSync(file).uid, statSync(directory).mode & 0o777], [0o400, owner.uid, 0o711]);
+    // Nothing staged left beside it.
+    assert.deepEqual(readdirSync(directory), ["binding.json"]);
+    // A pod serves one binding: another refused, the first kept.
+    assert.equal(await refusal(at.workspaces.bindFree("alasio", "harness-codex-0", owner, "{}")), 409);
+    assert.equal(readFileSync(file, "utf8"), binding);
+    assert.deepEqual(readdirSync(directory), ["binding.json"]);
+    // None where kubelet made no directory, nor where one holds a mount, nor as root, nor by names that are none.
+    assert.equal(await refusal(at.workspaces.bindFree("alasio", "harness-codex-1", owner, binding)), 404);
+    assert.equal(existsSync(join(at.attachRoot, "alasio", "harness-codex-1")), false);
+    at.pod("harness-codex-2", "alasio");
+    at.mounts.push(join(at.attachRoot, "alasio", "harness-codex-2", "ws"));
+    assert.equal(await refusal(at.workspaces.bindFree("alasio", "harness-codex-2", owner, binding)), 409);
+    assert.equal(existsSync(join(at.attachRoot, "alasio", "harness-codex-2", "binding.json")), false);
+    at.pod("harness-codex-3", "alasio");
+    assert.equal(await refusal(at.workspaces.bindFree("alasio", "harness-codex-3", { uid: 0, gid: 0 }, binding)), 400);
+    assert.equal(await refusal(at.workspaces.bindFree("alasio", "../pool", owner, binding)), 400);
+    // Detached once its pod is gone, it goes, and its directory.
+    await Effect.runPromise(at.workspaces.detach("alasio", "harness-codex-0", []));
+    assert.equal(existsSync(directory), false);
+  } finally {
+    at.done();
+  }
+});
+
 test("an attach of a workspace there is not, or by names that are none, is refused", async () => {
   const at = workspacesNode();
   try {

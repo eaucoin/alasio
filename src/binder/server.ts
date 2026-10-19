@@ -22,8 +22,8 @@
  *   it is not (./proxy.ts), but for a request that says it must bind nothing (NO_BIND_HEADER
  *   `never`), as one that reads what a binding has, answered 409 `{ "bound": false }` where the
  *   key has no binding serving, its Lease untaken and no pod claimed; with the binding's token for the caller's, the key's Lease
- *   stamped active as each bind of it is through and as its requests come, now and then, as
- *   what releases it reads; passed again, where a route the front knew of was of a binding
+ *   stamped active as each bind of it is through and as its requests that may bind come, now and
+ *   then, as what releases it reads; passed again, where a route the front knew of was of a binding
  *   gone, released by another replica or its sweep before its watch said so, to the key
  *   bound anew, within its bind's own wait, where the request's body was one the front could
  *   read whole first and its connection to the gone pod was never made (NEVER_CONNECTED), so
@@ -129,6 +129,8 @@ export class PlacementHeld extends Schema.TaggedError<PlacementHeld>()("Placemen
  */
 export interface Placement extends BindOptions {
   readonly pool: Pool;
+  /** The port its pod serves on, where its pool's pods serve on another than the front's `podPort`. */
+  readonly port?: number | undefined;
   readonly release?: ((bound: { readonly pod: string; readonly binding: string }) => Effect.Effect<void, { readonly message: string }>) | undefined;
   readonly held?: Effect.Effect<string | null> | undefined;
   readonly settled?: ((failure: string | null) => Effect.Effect<void>) | undefined;
@@ -143,7 +145,7 @@ export interface BinderServerOptions {
   readonly callerKey: Buffer | ((claims: TokenClaims) => Buffer | null);
   /** The key the binding's tokens, which bound pods take requests with, are signed with. */
   readonly bindingKey: Buffer;
-  /** The port bound pods serve on. */
+  /** The port bound pods serve on, unless their placement says another. */
   readonly podPort: number;
   /** Where `key` is bound, with what its caller's token says it is bound with; refused where it is bound nowhere. */
   readonly poolOf: (key: string, options: Readonly<Record<string, string>>) => Effect.Effect<Placement, PlacementRefused>;
@@ -238,7 +240,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
    */
   const routeOf = (key: string, options: Readonly<Record<string, string>>, { unbound, anew }: { readonly unbound: boolean; readonly anew: boolean }): Effect.Effect<{ readonly route: Routed; readonly known: boolean } | null, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused | PlacementHeld> =>
     Effect.gen(function*() {
-      const { pool, held, settled, ...placed } = yield* poolOf(key, options);
+      const { pool, held, settled, port, ...placed } = yield* poolOf(key, options);
       const known = anew ? undefined : routes.get(slot(pool, key));
       // One whose binding is gone, as its watch says, is bound anew; one not yet known of is used as it is.
       if (known && (!routeHeld || (yield* routeHeld(key, known.binding, known.pool.namespace)) !== "gone")) return { route: known, known: true };
@@ -253,7 +255,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         Effect.tap(() => settled?.(null) ?? Effect.void),
       );
       if (!bound) return null;
-      const route = { address: bound.address, port: podPort, token: bindingToken(bindingKey, { key, binding: bound.binding, namespace: pool.namespace }), pool, binding: bound.binding };
+      const route = { address: bound.address, port: port ?? podPort, token: bindingToken(bindingKey, { key, binding: bound.binding, namespace: pool.namespace }), pool, binding: bound.binding };
       routes.set(slot(pool, key), route);
       // Bound now, as a bind of it is through: idle from now at the earliest.
       if (!unbound) yield* active(key, pool, bound.binding, { bound: true });
@@ -344,7 +346,8 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       const body = known && replayable(incoming, REPLAYED_BYTES) ? (yield* Effect.promise(() => bodyOf(incoming, REPLAYED_BYTES))) ?? undefined : undefined;
       const passed = (to: Routed) =>
         Effect.gen(function*() {
-          yield* active(key, to.pool, to.binding);
+          // One that binds nothing only reads what the binding has, as whether it is idle, and so keeps it no longer.
+          if (!unbound) yield* active(key, to.pool, to.binding);
           const flight = slot(to.pool, key);
           flights.set(flight, (flights.get(flight) ?? 0) + 1);
           return yield* Effect.promise(() => proxy(incoming, outgoing, to, body)).pipe(

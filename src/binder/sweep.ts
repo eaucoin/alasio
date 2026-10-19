@@ -6,7 +6,8 @@
  *
  * How bayma says it is idle (baymaIdleness): its `GET /status`, with the binding's token, at
  * most once every `idlePollMs` a pod, and not before it could be idle for long enough, as the
- * last exec it ran, the last request of it (the Lease's active stamp), and its binding say.
+ * last exec it ran, the last request of it (the Lease's active stamp), and its binding say
+ * (lingered, which whatever else binds through the binder asks its pods by too).
  */
 import type { V1Pod } from "@kubernetes/client-node";
 import { Clock, Effect, Schema } from "effect";
@@ -28,6 +29,22 @@ const STATUS_TIMEOUT_MS = 5_000;
 /** What bayma's /status says: its execs running and queued, and since when none has run, if none does. */
 const BaymaStatus = Schema.Struct({ execsRunning: Schema.Number, execsQueued: Schema.Number, idleSinceMs: Schema.NullOr(Schema.Number) });
 
+/** Not idle now: asked again once `idlePollMs` from `now` has passed. */
+export const notIdle = (now: number, idlePollMs: number): Idleness => ({ idle: false, askAt: now + idlePollMs });
+
+/**
+ * Whether the binding `lease`, of its pod `pod`, which says nothing goes on in it since
+ * `idleSinceMs`, is idle at `now`: once nothing has gone on in it for `releaseAfterMs`, as
+ * that, the last request of it (the Lease's active stamp), and its binding (its pod's making)
+ * say, whichever was last; where not, asked again no sooner than `idlePollMs` from now, nor
+ * than it could be idle.
+ */
+export function lingered(idleSinceMs: number, lease: BindingLease, pod: V1Pod | null, now: number, { releaseAfterMs, idlePollMs }: { readonly releaseAfterMs: number; readonly idlePollMs: number }): Idleness {
+  const bound = Date.parse(String(pod?.metadata?.creationTimestamp ?? "")) || 0;
+  const since = Math.max(idleSinceMs, activeAt(lease) ?? 0, bound);
+  return now - since >= releaseAfterMs ? { idle: true } : { idle: false, askAt: Math.max(now + idlePollMs, since + releaseAfterMs) };
+}
+
 /** What baymaIdleness is given: the port bound pods' bayma serves on, how long one is kept idle, how often it is asked at most, and the key its binding's token is signed with. */
 export interface BaymaIdlenessOptions {
   readonly podPort: number;
@@ -42,20 +59,15 @@ export const baymaIdleness = ({ podPort, releaseAfterMs, idlePollMs = IDLE_POLL_
   Effect.gen(function*() {
     const key = lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
     const address = pod?.status?.podIP;
-    if (!address) return { idle: false, askAt: now + idlePollMs } as const;
+    if (!address) return notIdle(now, idlePollMs);
     const token = bindingToken(bindingKey, { key, binding: lease.metadata?.uid ?? "", namespace: lease.metadata?.namespace ?? "" });
     const status = yield* Effect.tryPromise(async (signal) => {
       const response = await fetch(`http://${address}:${podPort}/status`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.any([signal, AbortSignal.timeout(STATUS_TIMEOUT_MS)]) });
       if (!response.ok) throw new Error(`it answered ${response.status}`);
       return await response.text();
     }).pipe(Effect.flatMap((text) => Schema.decodeUnknownEffect(Schema.fromJsonString(BaymaStatus))(text)), Effect.option);
-    if (status._tag === "None" || status.value.execsRunning > 0 || status.value.execsQueued > 0 || status.value.idleSinceMs === null) {
-      return { idle: false, askAt: now + idlePollMs } as const;
-    }
-    // Idle since its last exec, its last request, or its binding, whichever was last.
-    const bound = Date.parse(String(pod?.metadata?.creationTimestamp ?? "")) || 0;
-    const since = Math.max(status.value.idleSinceMs, activeAt(lease) ?? 0, bound);
-    return now - since >= releaseAfterMs ? ({ idle: true } as const) : ({ idle: false, askAt: Math.max(now + idlePollMs, since + releaseAfterMs) } as const);
+    if (status._tag === "None" || status.value.execsRunning > 0 || status.value.execsQueued > 0 || status.value.idleSinceMs === null) return notIdle(now, idlePollMs);
+    return lingered(status.value.idleSinceMs, lease, pod, now, { releaseAfterMs, idlePollMs });
   });
 
 /** What makeSweep is given: the pools there are now, how a bound pod is found idle, and how a binding is released, and how that went. */

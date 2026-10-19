@@ -97,6 +97,10 @@
  *   directory kubelet made, or, `made`, one made now for a restore's pod yet to be made; 409 when
  *   the pod's directory holds a mount, or, `made`, is there already, 404 when there is no such
  *   workspace.
+ * - `POST /bindings`, `{ namespace, pod, uid, gid, binding }`: gives the free pod `pod` of a
+ *   harness pool on this node, of `namespace`, its `binding`, the text of the file its host
+ *   serves once it is there, its user's and group's (./workspaces.ts bindFree) (204); 404 where
+ *   kubelet made it no directory, 409 where it has a binding already, or a mount.
  * - `GET /attachments`: `{ attachments: [{ namespace, pod, reachable }] }`, the pods of this node a
  *   workspace is attached into, each by whether what is attached is reachable still (./workspaces.ts).
  * - `POST /stop`, `{ namespace, pod, containerId, hook }`: has the bayma of the bound pod
@@ -187,6 +191,8 @@ export interface NodeAgentServerOptions {
 
 /** The most a file written into a workspace may be: a received file's, Telegram's largest a bot gets, with room. */
 export const MAX_WRITE_BYTES = 64 * 1024 ** 2;
+/** The most a free pod's binding may be: a conversation's id and a token, with room. */
+const MAX_BINDING_BYTES = 16 * 1024;
 
 /** What `POST /workspaces` is given. */
 const CreateRequest = Schema.Struct({ ...WorkspaceRef.fields, quotaBytes: Schema.Number });
@@ -195,6 +201,14 @@ const CloneRequest = Schema.Struct({ from: WorkspaceRef, to: WorkspaceRef, quota
 
 /** What `POST /attach` is given. */
 const AttachRequest = Schema.Struct({ ...WorkspaceRef.fields, pod: Schema.NonEmptyString, token: Schema.NonEmptyString, env: Schema.Record(Schema.String, Schema.String), made: Schema.optional(Schema.Boolean) });
+/** What `POST /bindings` is given: a binding's text of MAX_BINDING_BYTES at most. */
+const BindingRequest = Schema.Struct({
+  namespace: Schema.NonEmptyString,
+  pod: Schema.NonEmptyString,
+  uid: Schema.Number,
+  gid: Schema.Number,
+  binding: Schema.NonEmptyString.check(Schema.isMaxLength(MAX_BINDING_BYTES)),
+});
 /** What `POST /detach` is given. */
 const DetachRequest = Schema.Struct({ namespace: Schema.NonEmptyString, pod: Schema.NonEmptyString, containerIds: Schema.Array(Schema.NonEmptyString) });
 /** What `POST /sync` is given. */
@@ -375,6 +389,9 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     }
     if (method === "POST" && url === "/attach") {
       return body(AttachRequest).pipe(Effect.flatMap(({ pod, token: binding, env, made, ...ref }) => workspaces.attach(ref, pod, binding, env, { made: made === true })), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    }
+    if (method === "POST" && url === "/bindings") {
+      return body(BindingRequest).pipe(Effect.flatMap(({ namespace, pod, uid, gid, binding }) => workspaces.bindFree(namespace, pod, { uid, gid }, binding)), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }
     if (method === "GET" && url === "/attachments") return workspaces.attachments.pipe(Effect.map((attachments) => answer(200, { attachments })));
     if (method === "POST" && url === "/sync") {
