@@ -19,6 +19,7 @@ import pg, { type Pool } from "pg";
 import { isScramVerifier } from "../../neon/control/scram.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../codex/rollouts/store.ts";
 import { NeonSessionStore } from "../harness/claude/session-store.ts";
+import { hearingConnections } from "../persistence/sql.ts";
 import { withLogScope } from "../shared/log.ts";
 import { withAlasioSpan } from "../telemetry/index.ts";
 import { ensureGrafanaRole } from "./grafana.ts";
@@ -148,7 +149,7 @@ function poolOf(databaseUrl: Redacted.Redacted, onIdleError: (error: Error) => v
   // An idle connection dies with the compute when it restarts; the pool
   // replaces it on the next checkout.
   pool.on("error", onIdleError);
-  return pool;
+  return hearingConnections(pool);
 }
 
 /**

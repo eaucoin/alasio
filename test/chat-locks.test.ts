@@ -61,6 +61,21 @@ test("an update's marks made under a handling lock that is lost, its connection 
   assert.equal(await Effect.runPromise(store.recordTelegramUpdate(update)), true);
 });
 
+test("a handling lock's connection lost while its holder waits on other work fails that handling, and nothing else of alasio's", { timeout: 20_000 }, async () => {
+  const schema = newSchema();
+  const store = await testStore({ schema });
+  const holding = Effect.runSync(Deferred.make<void>());
+  const handling = Effect.runFork(store.withHandlingLock(42, () =>
+    // Its holder at other work, a call of Telegram's, say, as the lock's connection goes.
+    Deferred.succeed(holding, undefined).pipe(Effect.andThen(Effect.sleep("1 second")))
+  ));
+  await Effect.runPromise(Deferred.await(holding));
+  await (await testPool()).query("select pg_terminate_backend($1)", [await handlingLockHolder(schema, 42)]);
+  assert.ok(Exit.isFailure(await Effect.runPromise(Fiber.await(handling))));
+  // The chat's next update is handled.
+  await Effect.runPromise(store.withHandlingLock(42, () => Effect.void));
+});
+
 test("a claim of a chat's next reply waiting for a connection of a pool that has none to give is stopped at once, not after the connection's timeout, nothing claimed, and the connection that comes later is given back", { timeout: 30_000 }, async () => {
   const schema = newSchema();
   const pool = new pg.Pool({ connectionString: await testDatabaseUrl(), max: 1, connectionTimeoutMillis: 10_000 });

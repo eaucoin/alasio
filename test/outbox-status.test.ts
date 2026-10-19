@@ -14,7 +14,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect";
 import pg from "pg";
 
-import { StoreError } from "../src/persistence/sql.ts";
+import { hearingConnections, StoreError } from "../src/persistence/sql.ts";
 import { Store } from "../src/persistence/store.ts";
 import { Outbox } from "../src/telegram/outbox.ts";
 import { TelegramClient } from "../src/telegram/client.ts";
@@ -157,7 +157,8 @@ test("an entry whose pass loses every connection it has as Telegram takes the en
     return { message_id: 500, date: 0, chat: { id: 42, type: "private", first_name: "Operator" } };
   });
   // The first alasio on a pool of its own, whose connections the test ends; the second on the test's.
-  const pool = new pg.Pool({ connectionString: await testDatabaseUrl(), application_name: "losing", max: 2 });
+  // Its connections heard as alasio's pool's are (src/neon/connect.ts poolOf), its idle ones too.
+  const pool = hearingConnections(new pg.Pool({ connectionString: await testDatabaseUrl(), application_name: "losing", max: 2 }));
   pool.on("error", () => {});
   try {
     const losing = await Effect.runPromise(Effect.provide(Store, Store.layer({ pool, schema })));

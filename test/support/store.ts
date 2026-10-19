@@ -1,14 +1,14 @@
 /**
  * alasio's store in tests: on the test file's one throwaway Postgres (./postgres.ts),
  * started as its first test needs it and stopped after its last, each store in a
- * schema of its own.
+ * schema of its own, its pool's connections heard as alasio's are.
  */
 import { after } from "node:test";
 
 import { type Duration, Effect } from "effect";
 import pg from "pg";
 
-import type { StoreError } from "../../src/persistence/sql.ts";
+import { hearingConnections, type StoreError } from "../../src/persistence/sql.ts";
 import { handlingLockName, Store, type TurnFenced, type TurnPersistence } from "../../src/persistence/store.ts";
 import { CODEX_HARNESS } from "../../src/harness/names.ts";
 import { startPostgres, type TestPostgres } from "./postgres.ts";
@@ -23,7 +23,7 @@ let started: Promise<TestDatabase> | undefined;
 let schemas = 0;
 
 const database = (): Promise<TestDatabase> =>
-  started ??= startPostgres().then((postgres) => ({ postgres, pool: new pg.Pool({ connectionString: postgres.url, max: 4 }) }));
+  started ??= startPostgres().then((postgres) => ({ postgres, pool: hearingConnections(new pg.Pool({ connectionString: postgres.url, max: 4 })) }));
 
 after(async () => {
   if (!started) return;

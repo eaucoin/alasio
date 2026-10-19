@@ -77,6 +77,20 @@ const releasing = (client: PoolClient, exit: Exit.Exit<unknown, unknown>): Effec
     ? Effect.sync(() => client.release())
     : Effect.promise(() => client.query("rollback").then(() => client.release(), (error: Error) => client.release(error)));
 
+/**
+ * `pool`, each of its connections heard when it fails, whoever holds it. pg fails the
+ * statements of a connection that dies, and tells the connection's 'error' listeners of it as
+ * well, whether a statement of it was running or none was; the pool listens only while the
+ * connection is idle, so one held, by a transaction above all, its holder at a statement or
+ * at other work between its statements, would fail unheard, which Node takes as the
+ * process's to die of. Heard, it fails no more than its holder's statements, as pg makes the
+ * connection unqueryable, and the pool ends it as it is given back.
+ */
+export function hearingConnections<P extends Pool>(pool: P): P {
+  pool.on("connect", (client) => void client.on("error", () => {}));
+  return pool;
+}
+
 /** The database `pool` connects to. */
 export function poolDatabase(pool: Pool): Database {
   return {

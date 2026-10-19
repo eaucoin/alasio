@@ -152,6 +152,23 @@ describe("Neon, answering", () => {
       }), wake));
   });
 
+  test("a connection of alasio's pool lost as its holder works between its statements fails its holder's next statement, and nothing else", async () => {
+    assert.ok(database);
+    const env = { ALASIO_DATABASE_URL: database.url, ALASIO_LAKE_VERIFIER: LAKE_VERIFIER, ALASIO_HARNESS_VERIFIER: HARNESS_VERIFIER };
+    await Effect.runPromise(connecting(env, [], (neon) =>
+      Effect.promise(async () => {
+        const held = await neon.pool.connect();
+        await held.query("begin");
+        const { rows: [{ pid } = { pid: 0 }] } = await held.query<{ pid: number }>("select pg_backend_pid() as pid");
+        // Lost as its holder works elsewhere, as Neon's proxy drops it: unheard, Node would end the test's process.
+        await admin.query("select pg_terminate_backend($1)", [pid]);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        await assert.rejects(held.query("select 1"));
+        held.release(true);
+        assert.equal((await neon.pool.query<{ one: number }>("select 1 as one")).rows[0]?.one, 1);
+      })));
+  });
+
   test("with the lake off, revokes its reads", async () => {
     assert.ok(database);
     const env = { ALASIO_DATABASE_URL: database.url, ALASIO_LAKE_VERIFIER: LAKE_VERIFIER, ALASIO_HARNESS_VERIFIER: HARNESS_VERIFIER };
