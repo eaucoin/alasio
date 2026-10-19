@@ -10,6 +10,9 @@ import { createHash } from "node:crypto";
 
 import type {
   V1Container,
+  V1PolicyRule,
+  V1Role,
+  V1RoleBinding,
   V1EnvVar,
   V1LocalObjectReference,
   V1PersistentVolumeClaimSpec,
@@ -50,8 +53,7 @@ export interface Environment {
 /** main: alasio's own environment. */
 export const MAIN_ENVIRONMENT: Environment = { namespace: NAMESPACE, branch: null };
 
-/** The label of a branch environment's objects and namespaces, whose value is its name. */
-export const BRANCH_LABEL = "alasio.dev/branch";
+export { BRANCH_LABEL } from "../../../src/branch/names.ts";
 
 /** A component's name: `alasio-<component>`. */
 export function componentName(component: string): string {
@@ -60,6 +62,13 @@ export function componentName(component: string): string {
 
 /** The Secret of a branch environment's token, which its parent forks the sessions it inherited for (src/branch/fork.ts). */
 export const BRANCH_FORK_SECRET = componentName("branch-fork");
+
+/**
+ * The Secret of an environment's callers' key to the sandbox gateway, of the gateway's
+ * (src/binder/names.ts environmentKey), in its alasio's namespace: main's, as Neon's setup
+ * renders it, and a branch environment's, as `alasio branch create` writes it.
+ */
+export const SESSIONS_CALLER_SECRET = componentName("sessions-caller");
 
 /** A Neon service's name: `alasio-neon-<component>`. */
 export function neonName(component: string): string {
@@ -289,4 +298,19 @@ export function goJson(value: unknown, indent?: string): string {
 /** The sha256 of `text`, in hex. */
 export function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
+}
+
+/** A Role in `namespace` of `rules`, named for the ServiceAccount `account` of alasio's namespace, and its binding to it. */
+export function accountRole(account: string, component: string, namespace: string, rules: V1PolicyRule[]): [V1Role, V1RoleBinding] {
+  const metadata = { name: account, namespace, labels: labels(component) };
+  return [
+    { apiVersion: "rbac.authorization.k8s.io/v1", kind: "Role", metadata, rules },
+    {
+      apiVersion: "rbac.authorization.k8s.io/v1",
+      kind: "RoleBinding",
+      metadata,
+      roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: account },
+      subjects: [{ kind: "ServiceAccount", name: account, namespace: NAMESPACE }],
+    },
+  ];
 }

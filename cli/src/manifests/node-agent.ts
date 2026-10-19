@@ -2,8 +2,11 @@
  * The node agent (src/node-agent/): one pod on every node sessions run on, which takes
  * whole-sandbox snapshots of their sandboxes and prepares them for restores there, kept
  * in the object store's snapshots bucket, and resumes a restored one once its pod's
- * network policies are in force there. It runs where sandboxes are snapshotted
- * (common.ts nodeAgentRuns).
+ * network policies are in force there; and attaches session workspaces into the sandbox
+ * pools' pods on its node, from its node's mount of workspace storage (./sandbox-gateway.ts),
+ * makes their directories there, and sets their quotas on workspace storage's metadata
+ * engine, with JuiceFS's own command, of its image.
+ * It runs where sandboxes are snapshotted (common.ts nodeAgentRuns).
  *
  * It is the one component that runs runsc on a node, beside containerd's shims, as they
  * run it, so it runs as the node does: privileged, as root, in the node's PID namespace
@@ -16,17 +19,19 @@
  * in a namespace by default; a cluster whose admission defaults otherwise must exempt it.
  *
  * Its bucket and the identity it is reached as are the Secret Neon's setup makes for it
- * (neon/control/kube-setup.ts), taken whole as its environment, and the token alasio
- * presents, the Secret both are given.
+ * (neon/control/kube-setup.ts), taken whole as its environment, and the token the sandbox
+ * gateway presents, the Secret both are given.
  */
 import type { KubernetesObject, V1DaemonSet, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
 
 import {
+  ATTACH_ROOT,
   BACKGROUND_READ_SECONDS_VARIABLE,
   backgroundReadSeconds,
   CONTAINERD,
   CPU_FEATURES_CONTAINER,
   GVISOR_RELEASES,
+  META_URL_VARIABLE,
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
   nodeAgentStopSeconds,
@@ -34,6 +39,7 @@ import {
   RESTORES_FROM_BUCKET_SINCE_VARIABLE,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
+  WORKSPACES_ROOT,
 } from "../../../src/node-agent/names.ts";
 import { memoryBytes } from "../capacity.ts";
 import { currentGvisorRelease, NODE_PINS } from "../cluster/node.ts";
@@ -42,10 +48,11 @@ import { componentName, given, imagePullSecrets, labels, NAMESPACE, nodeAgentRun
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
+import { WORKSPACE_QUOTAS } from "./workspace-storage.ts";
 
 /** The Secret of the snapshots bucket, its endpoint, region and name and the agents' keys to it. */
 const SNAPSHOTS_SECRET = componentName("snapshots");
-/** The Secret of the token alasio presents to the node agents, under `token`. */
+/** The Secret of the token the sandbox gateway presents to the node agents, under `token`. */
 const NODE_AGENT_SECRET = componentName("node-agent");
 
 /** The node's paths the agent has at the same paths: each one's volume, what must be there, and whether the agent only reads it. */
@@ -55,6 +62,10 @@ const HOST_PATHS: readonly { readonly name: string; readonly path: string; reado
   { name: "gvisor", path: GVISOR_RELEASES, type: "DirectoryOrCreate", readOnly: true },
   { name: "containerd", path: CONTAINERD, type: "DirectoryOrCreate", readOnly: true },
   { name: "snapshots", path: SNAPSHOT_CACHE_DIR, type: "DirectoryOrCreate" },
+  // Workspace storage, as the node's mount of it holds it, and the pool pods' directories,
+  // which it attaches workspaces into and writes their tokens beside.
+  { name: "workspaces", path: WORKSPACES_ROOT, type: "DirectoryOrCreate" },
+  { name: "attach", path: ATTACH_ROOT, type: "DirectoryOrCreate" },
 ];
 
 /** What each suffix of a size multiplies it by, as Kubernetes counts a quantity. */
@@ -77,8 +88,8 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
     name,
     mountPath: path,
     ...(readOnly ? { readOnly } : {}),
-    // What is mounted under the node's /run after the agent starts is the agent's too.
-    ...(name === "run" ? { mountPropagation: "HostToContainer" } : {}),
+    // What is mounted under the node's /run, and its mount of workspace storage, after the agent starts are the agent's too.
+    ...(name === "run" || name === "workspaces" ? { mountPropagation: "HostToContainer" } : {}),
   }));
   return {
     apiVersion: "apps/v1",
@@ -130,6 +141,8 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
               { name: SNAPSHOT_CACHE_BYTES_VARIABLE, value: String(sizeBytes(sessions.snapshots.nodeCache)) },
               { name: RESTORES_FROM_BUCKET_SINCE_VARIABLE, value: NODE_PINS.gvisor.restoresFromBucketSince },
               { name: BACKGROUND_READ_SECONDS_VARIABLE, value: String(backgroundReadSeconds(sandboxBytes)) },
+              // Workspace storage's metadata engine, which it sets workspaces' quotas on alone, as a user of its own there: no key of its object store.
+              ...(config.workspaceStorage.enabled ? [{ name: META_URL_VARIABLE, valueFrom: { secretKeyRef: { name: WORKSPACE_QUOTAS, key: "metaurl" } } }] : []),
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: "alasio-node-agent" }, ...otelEnv(config)] : []),
             ],
             envFrom: [{ secretRef: { name: SNAPSHOTS_SECRET } }],

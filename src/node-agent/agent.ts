@@ -26,7 +26,7 @@
  * is compacted, after its commit and beside whatever else the agent does, one at a time on
  * the node at its lowest priority: its images into one, the image of a new snapshot
  * `compactedFrom` it, committed as the current one only if the workspace has not moved on
- * from it meanwhile. It is the same sandbox at the same moment, so a Sandbox released into
+ * from it meanwhile. It is the same sandbox at the same moment, so a workspace released into
  * the one is restored from the other, which is the next delta's base. A snapshot taken live
  * is never compacted, its sandbox running on from it: one whose parent's chain would be due
  * with it is taken whole instead, which cuts the chain the sandbox goes on extending.
@@ -78,13 +78,13 @@ import { withLogScope } from "../shared/log.ts";
 import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCache } from "./cache.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { egressGap, type PodAddress } from "./kube-router.ts";
-import { restoresFromBucket, runscVersion } from "./names.ts";
+import { restoresFromBucket, runscVersion, STORE_SOCKET_ENDPOINT } from "./names.ts";
 import { type ReleaseNotInstalled, type Runsc, type RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
 import type { S3Bucket, S3Error } from "./s3.ts";
-import type { StoreProxy, StoreToken } from "./store-proxy.ts";
+import type { StoreProxy, StoreToken, Transport } from "./store-proxy.ts";
 import { hostPathOf, readUnder, type UnderRoot } from "./volume.ts";
 
-/** An environment's or a workspace's name: a DNS label, as their namespaces' and Sandboxes' names are. */
+/** An environment's or a workspace's name: a DNS label, as their namespaces' names are. */
 const Name = Schema.String.check(Schema.isPattern(NAME));
 
 /** A snapshot's id, as snapshotId makes one. */
@@ -173,7 +173,7 @@ export const Manifest = Schema.Struct({
   /** For a snapshot taken live, what it caught: it holds the session only while bayma's state generation is that one. */
   live: Schema.optional(Caught),
   /**
-   * For a snapshot of a compacted image, the snapshot whose memory it holds, as a Sandbox
+   * For a snapshot of a compacted image, the snapshot whose memory it holds, as a workspace
    * released into that one names it: the same sandbox, at the same moment, in one image.
    */
   compactedFrom: Schema.optional(SnapshotId),
@@ -216,6 +216,17 @@ export function compactionDue(layers: readonly Layer[], adding = 0): string | nu
 /** A workspace, as each request names it. */
 export const WorkspaceRef = Schema.Struct({ environment: Name, workspace: Name });
 export type WorkspaceRef = typeof WorkspaceRef.Type;
+
+/** How a restore's checkpoint gofer reads the snapshots bucket, as alasio asks it (./names.ts Gofer, goferOf). */
+export const GoferRequest = Schema.Struct({ transport: Schema.Literals(["socket", "tcp"]), pagesRetry: Schema.Boolean });
+
+/**
+ * A request to prepare a workspace's current snapshot for a restore, and how its checkpoint
+ * gofer reads the bucket, if it does: over TCP, its reads tried as many times as the gofer
+ * tries them, unless asked otherwise.
+ */
+export const PrepareRequest = Schema.Struct({ ...WorkspaceRef.fields, gofer: Schema.optional(GoferRequest) });
+export type PrepareRequest = typeof PrepareRequest.Type;
 
 /** A request to copy a workspace's current snapshot to another. */
 export const CopyRequest = Schema.Struct({ from: WorkspaceRef, to: WorkspaceRef });
@@ -432,7 +443,7 @@ export interface NodeAgent {
   /** Checkpoints a workspace's sandbox and makes it the workspace's snapshot: its manifest. */
   readonly checkpoint: (request: CheckpointRequest) => Effect.Effect<Manifest, CheckpointFailed | SandboxUnsaveable>;
   /** The workspace's current snapshot in this node's cache, checked against its manifest, for a restore on this node. */
-  readonly prepare: (workspace: WorkspaceRef) => Effect.Effect<Prepared, PrepareError>;
+  readonly prepare: (request: PrepareRequest) => Effect.Effect<Prepared, PrepareError>;
   /** The manifest of the workspace's current snapshot, or null. */
   readonly current: (workspace: WorkspaceRef) => Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt>;
   /** Makes the current snapshot of `from` that of `to` too: `to`'s manifest. One that fails as it writes leaves `to` without a snapshot. */
@@ -1157,17 +1168,20 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   /**
    * The checkpoint gofer's options for the image `own` of the workspace's, its layers under
    * its own prefix of them, as the bucket keeps them, read through the agent's proxy of the
-   * bucket with `token`, the restore's own, which reads that prefix alone.
+   * bucket with `token`, the restore's own, which reads that prefix alone: by the agent's
+   * pod's address, or by the proxy's socket on the node, as `transport` says; reading again,
+   * for as long as the sandbox runs, the pages a read of failed, where `pagesRetry`.
    */
-  const goferOptions = (ref: WorkspaceRef, own: string, { accessKeyId, secretAccessKey }: StoreToken): string =>
+  const goferOptions = (ref: WorkspaceRef, own: string, { accessKeyId, secretAccessKey }: StoreToken, transport: Transport, pagesRetry: boolean): string =>
     JSON.stringify({
-      endpoint: storeProxy.endpoint,
+      ...(transport === "socket" && storeProxy.socket !== null ? { endpoint: STORE_SOCKET_ENDPOINT, socket: storeProxy.socket } : { endpoint: storeProxy.endpoint }),
       region: storeProxy.region,
       bucket: storeProxy.bucket,
       object_prefix: `${prefixOf(ref)}/${LAYERS_DIR}/${own}/`,
       layers_prefix: `${prefixOf(ref)}/${LAYERS_DIR}/`,
       addressing: "path",
       credentials: { access_key_id: accessKeyId, secret_access_key: secretAccessKey },
+      ...(pagesRetry ? { pages_retry: "while-running" } : {}),
     });
 
   /**
@@ -1242,9 +1256,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * The snapshot of the workspace, prepared for a restore on this node: from the node's cache
    * where it holds every image of it intact and this node's runsc restores it there, as
    * `runsc image verify --host` says; otherwise from the bucket, which the restore reads as it
-   * goes, through the checkpoint gofer, its images fetched into the cache meanwhile.
+   * goes, through the checkpoint gofer, as the request says it reads it, its images fetched
+   * into the cache meanwhile.
    */
-  const prepare = (ref: WorkspaceRef): Effect.Effect<Prepared, PrepareError> =>
+  const prepare = ({ gofer, ...ref }: PrepareRequest): Effect.Effect<Prepared, PrepareError> =>
     exclusive(
       [ref],
       Effect.gen(function*() {
@@ -1328,9 +1343,12 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           }
         }
         if (imagePath === null) {
-          const token = storeProxy.mint(prefixOf(ref), `${prefixOf(ref)}/${LAYERS_DIR}/`);
+          // Through the socket where asked and the proxy serves one; over TCP otherwise.
+          if (gofer?.transport === "socket" && storeProxy.socket === null) yield* Effect.logWarning(`the restore of ${prefixOf(ref)} asks to read the snapshots bucket through the node agent's socket, which it does not serve: it reads it over TCP`);
+          const transport: Transport = gofer?.transport === "socket" && storeProxy.socket !== null ? "socket" : "tcp";
+          const token = storeProxy.mint(prefixOf(ref), `${prefixOf(ref)}/${LAYERS_DIR}/`, transport);
           if (token === null) return yield* new AgentStopping({ environment, workspace });
-          imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, goferOptions(ref, own.digest, token));
+          imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, goferOptions(ref, own.digest, token, transport, gofer?.pagesRetry ?? false));
           yield* expectPages(ref, token.accessKeyId, release, imagePath);
         }
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));

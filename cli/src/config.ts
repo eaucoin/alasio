@@ -49,7 +49,10 @@ const Url = matching(/^https?:\/\/.+$/u, "must be an http(s) URL");
  * them, its keys in camel case: a registry's mirrors, by its host (`*` for every one), and
  * its TLS, whose files are the nodes', as `mounts` mounts them. A registry's login is a
  * secret, which the config does not hold, so there is none: the registries are ones that
- * ask for none.
+ * ask for none. stargz-snapshotter's daemon, which the nodes pull through, reads an eStargz
+ * layer lazily through a mirror it can reach as it is (no `*`, no rewrite, no path), which
+ * should answer range requests: from one that does not, a layer is fetched whole at its
+ * first read.
  */
 export const Registries = Schema.Struct({
   mirrors: defaulted(

@@ -172,6 +172,8 @@ export interface Runsc {
    * reading it directly needs, which ends the sandbox unless it is saved live.
    */
   readonly checkpoint: (release: string, options: CheckpointOptions) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
+  /** Runs `argv` in a container, by its runtime's id, under `release`, as a process of its own, for `timeoutMs` at most, failing where it fails. */
+  readonly exec: (release: string, containerId: string, argv: readonly string[], timeoutMs: number) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   /** Resumes a container, by its runtime's id, of a sandbox restored paused; one that runs already is left so. */
   readonly resume: (release: string, containerId: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   readonly inspect: (release: string, imagePath: string) => Effect.Effect<InspectedImage, RunscError | ReleaseNotInstalled>;
@@ -360,6 +362,12 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
       ]).pipe(Effect.asVoid),
 
     resume: (release, containerId) => run(release, ["resume"], [containerId]).pipe(Effect.asVoid),
+
+    exec: (release, containerId, argv, timeoutMs) =>
+      run(release, ["exec"], [containerId, ...argv]).pipe(
+        Effect.timeoutOrElse({ duration: timeoutMs, orElse: () => Effect.fail(new RunscError({ release, command: `exec ${argv.join(" ")}`, reason: `it did not end within ${timeoutMs / 1000} s` })) }),
+        Effect.asVoid,
+      ),
 
     inspect: (release, imagePath) =>
       run(release, ["image", "inspect"], ["--json", imagePath]).pipe(

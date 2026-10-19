@@ -12,6 +12,7 @@ import { ActiveTurns } from "../../src/harness/active-turns.ts";
 import { HarnessHost } from "../../src/harness/host.ts";
 import { type Harness, Harnesses } from "../../src/harness/index.ts";
 import type { HarnessName } from "../../src/harness/names.ts";
+import { HostBayma } from "../../src/mcp/bayma.ts";
 import { Mounts } from "../../src/operator/mounts.ts";
 import { inlineKeyboard } from "../../src/operator/panel.ts";
 import { StoreError } from "../../src/persistence/sql.ts";
@@ -116,6 +117,8 @@ export interface TestServicesOptions {
   readonly outbox?: Layer.Layer<Outbox, never, Store> | undefined;
   /** Session filesystems, where a test offers them. */
   readonly sandbox?: SessionSandboxes["Service"] | undefined;
+  /** Folder workspaces' bayma, the gateway's folder instances, where a test offers them. */
+  readonly hostBayma?: HostBayma["Service"] | undefined;
   /** The branch environment alasio is, if it is one. */
   readonly branch?: string | undefined;
   /** What the harness host is made into, for a test that stands in for part of it: as made unless given. */
@@ -133,6 +136,7 @@ function testServices({
   allowedUserIds = "",
   outbox = unusedOutbox,
   sandbox,
+  hostBayma,
   branch,
   host,
 }: TestServicesOptions): Layer.Layer<AlasioServices> {
@@ -141,14 +145,15 @@ function testServices({
     Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer()),
     Layer.provideMerge(host ? Layer.effect(HarnessHost, Effect.map(HarnessHost, host)).pipe(Layer.provide(HarnessHost.layer)) : HarnessHost.layer),
     Layer.provideMerge(Harnesses.layer({ overrides: harnesses, branch })),
+    // Received files are written nowhere a test does not say; into a session through the test's session filesystems.
+    Layer.provideMerge(ReceivedFiles.layer({ stateDir: stateDir ?? "/nonexistent-state-dir" })),
     Layer.provideMerge(Layer.mergeAll(
       ActiveTurns.layer,
-      // Received files are written nowhere a test does not say.
-      ReceivedFiles.layer({ stateDir: stateDir ?? "/nonexistent-state-dir" }),
       outbox,
       // Started only by a turn on alasio's own Codex harness, which a test stands in for.
       CodexAppServer.layer,
       sandbox ? Layer.succeed(SessionSandboxes, sandbox) : Layer.empty,
+      hostBayma ? Layer.succeed(HostBayma, hostBayma) : Layer.empty,
     )),
     Layer.provideMerge(Layer.mergeAll(Layer.succeed(Store, store), telegram)),
   );

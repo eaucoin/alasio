@@ -178,7 +178,7 @@ const Telemetry = Schema.Struct({
   headersSecret: defaulted(OptionalSecretName, ""),
   headersKey: defaulted(NonEmpty, "headers"),
   resourceAttributes: defaulted(Schema.String, ""),
-  /** The port alasio receives session sandboxes' telemetry on. */
+  /** The port the sandbox service's receiver takes session sandboxes' telemetry on. */
   receiverPort: defaulted(Schema.Int.check(Schema.isBetween({ minimum: 1024, maximum: 65535 }, { message: "must be a port from 1024 to 65535" })), 4318),
   /** How many days of telemetry the lake keeps. */
   retentionDays: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be at least 1" })), 30),
@@ -208,7 +208,12 @@ const Telemetry = Schema.Struct({
  * (sessions.runtimeClassName), by the node agent on each node sessions run on.
  */
 const Snapshots = Schema.Struct({
-  /** How long a session's bayma runs no exec before its sandbox is snapshotted and its pod let go: a duration such as 5m. */
+  /**
+   * How long a session's bayma runs no exec before its sandbox is snapshotted and its pod let
+   * go: a duration such as 5m. Until then its pod is evicted by no drain, and its node is
+   * removed by no node autoscaler (cli/src/manifests/disruption.ts boundBudget), so a drain
+   * waits this long after a session's last exec, and longer for a session that goes on working.
+   */
   releaseAfter: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 5m")), "5m"),
   /**
    * How often a session whose execs run is snapshotted live, its sandbox running on, from
@@ -232,8 +237,9 @@ const Snapshots = Schema.Struct({
    * back from its live snapshot while that still holds it, and otherwise from bayma's
    * checkpoints. A pod deleted outright, as kubectl delete --force or the removal of its Node
    * deletes it, or one ended that alasio is not running to see, as on a single node that a
-   * drain empties of alasio too, agent-sandbox makes again: its bayma starts from its
-   * checkpoints, moving on from its live snapshot, which no restore takes after. A duration
+   * drain empties of alasio too, the gateway releases as broken, and the next turn binds
+   * another, whose bayma starts from its checkpoints, moving on from its live snapshot, which
+   * no restore takes after. A duration
    * such as 60s.
    */
   stopWait: defaulted(
@@ -346,11 +352,9 @@ const Sessions = Schema.Struct({
   createNamespace: defaulted(Schema.Boolean, true),
   /** The RuntimeClass sessions run under; empty runs them under the cluster's default runtime. */
   runtimeClassName: defaulted(Schema.String, "gvisor"),
-  /** A new session's volume; its class, when empty, is workspace storage's, or the cluster's default without it. */
-  storage: Storage("10Gi"),
+  /** A new session's workspace: its quota, of workspace storage. */
+  storage: defaulted(Schema.Struct({ size: defaulted(Size, "10Gi") }), {}),
   resources: Resources({ requests: { cpu: "250m", memory: "512Mi" }, limits: { cpu: "2", memory: "2Gi" } }),
-  /** Whether a session's pod waits until NetworkPolicy confines it. */
-  egressGate: defaulted(Schema.Boolean, true),
   /** The resolvers sessions with internet access use. */
   fullModeNameservers: defaulted(
     Schema.Array(Schema.String.check(Schema.makeFilter((address) => isIPv4(address) || "must be an IPv4 address"))).check(
@@ -367,18 +371,31 @@ const Sessions = Schema.Struct({
   nodeSelector: NodeSelector,
   tolerations: Tolerations,
   snapshots: defaulted(Snapshots, {}),
+  /**
+   * The sandbox pools' free pods, of each of a session's internets (cli/src/manifests/
+   * sandbox-gateway.ts): `min` kept running before any is bound, more made, to `max`, for
+   * the binds that wait for one.
+   */
+  pools: Scaling({ min: 1, max: 10 }, { floor: false, scaled: true }),
+  /** The sandbox gateway, which binds a session's workspace to a pool's pod. */
+  gateway: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "256Mi" } }) }), {}),
+  /** The session telemetry receiver, which bound pods' bayma exports to. */
+  receiver: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "256Mi" } }) }), {}),
 });
+
+/** The bayma the host profile's folder instances run, as this release pins it. */
+export const HOST_BAYMA_IMAGE = {
+  repository: "ghcr.io/eaucoin/bayma",
+  tag: "0.14.4",
+  digest: "sha256:954741cd4a43330620e3e57d29429691bc41edd6e9f2231105f0f99b3f9deddf",
+} as const;
 
 const Host = Schema.Struct({
   /** The host profile: folder workspaces on the machine's own files. Privileged, for a single-node cluster the operator owns. */
   enabled: defaulted(Schema.Boolean, false),
   namespace: defaulted(Namespace, "alasio-host"),
   createNamespace: defaulted(Schema.Boolean, true),
-  baymaImage: Image({
-    repository: "ghcr.io/eaucoin/bayma",
-    tag: "0.14.4",
-    digest: "sha256:954741cd4a43330620e3e57d29429691bc41edd6e9f2231105f0f99b3f9deddf",
-  }),
+  baymaImage: Image(HOST_BAYMA_IMAGE),
   /** The operator's user and home, which alasio and each folder's bayma run as and in. */
   uid: defaulted(Id, 1000),
   gid: defaulted(Id, 1000),
@@ -386,6 +403,8 @@ const Host = Schema.Struct({
   home: defaulted(AbsolutePath, "/home/operator"),
   /** Where folder workspaces' bayma keeps its state, under a mount. */
   stateRoot: defaulted(AbsolutePath, "/home/operator/.alasio/bayma"),
+  /** How long a folder conversation's instance runs no exec before it is released, its REPL sessions saved whole as it stops (src/gateway/folders.ts). */
+  releaseAfter: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 1h")), "1h"),
   mounts: defaulted(Schema.Array(HostMount), []),
   /** The directory folder workspaces are created under, a path of the mounts; empty leaves alasio's default. */
   workspaceRoot: defaulted(matching(/^(|\/.*)$/u, "must be an absolute path, or empty"), ""),
@@ -670,51 +689,20 @@ export function durationSeconds(duration: string): number | null {
   return Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3] ?? 0);
 }
 
-/** A component of JuiceFS's CSI driver: its resources. */
-const CsiComponent = (resources: Parameters<typeof Resources>[0]) => defaulted(Schema.Struct({ resources: Resources(resources) }), {});
-
 /**
- * JuiceFS's CSI driver (juicedata/juicefs-csi-driver v0.33.0), which makes each session's
- * claim a directory of the file system, its size the directory's quota; off where the
- * cluster already has the driver. Its images are those that release names.
+ * The cron schedule of something done every `duration`: of whole minutes, 5 or more, that
+ * divide an hour, at those minutes of each hour; of whole hours that divide a day, on the
+ * hour, at those hours of each day; null for another, which no cron line keeps evenly. Pure, for tests.
  */
-const Csi = Schema.Struct({
-  enabled: defaulted(Schema.Boolean, true),
-  /** Where the driver and its mount pods run, as upstream installs them. */
-  namespace: defaulted(Namespace, "kube-system"),
-  image: Image({
-    repository: "juicedata/juicefs-csi-driver",
-    tag: "v0.33.0",
-    digest: "sha256:f918e7331c055ec7efb5a13ff4f81def57620defb003f7379c28fa97822ff44d",
-  }),
-  /** The JuiceFS client mount pods run, Community Edition. */
-  mountImage: Image({
-    repository: "juicedata/mount",
-    tag: "ce-v1.4.1",
-    digest: "sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673",
-  }),
-  registrarImage: Image({
-    repository: "registry.k8s.io/sig-storage/csi-node-driver-registrar",
-    tag: "v2.9.0",
-    digest: "sha256:cd21e19cd8bbd5bc56f1b4f1398a436e7897da2995d6d036c9729be3f4e456e6",
-  }),
-  resizerImage: Image({
-    repository: "registry.k8s.io/sig-storage/csi-resizer",
-    tag: "v1.9.0",
-    digest: "sha256:f1f352df97874442624fcef23eab04aa038f66cb0e361212f6ec09e92998184d",
-  }),
-  livenessProbeImage: Image({
-    repository: "registry.k8s.io/sig-storage/livenessprobe",
-    tag: "v2.11.0",
-    digest: "sha256:82adbebdf5d5a1f40f246aef8ddbee7f89dea190652aefe83336008e69f9a89f",
-  }),
-  controller: CsiComponent({ requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "512Mi" } }),
-  node: CsiComponent({ requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "512Mi" } }),
-  /** Each mount pod's: no CPU limit, which JuiceFS advises against below 4, and memory for its buffer and cache index. */
-  mountPod: CsiComponent({ requests: { cpu: "20m", memory: "128Mi" }, limits: { memory: "1Gi" } }),
-  /** One mount pod per node for every workspace rather than one per workspace: less memory, and a crash reaches each workspace on the node. */
-  shareMountPod: defaulted(Schema.Boolean, false),
-});
+export function everyIntervalCron(duration: string): string | null {
+  const seconds = durationSeconds(duration);
+  if (seconds === null || seconds < 300 || seconds % 60 !== 0) return null;
+  const minutes = seconds / 60;
+  if (minutes < 60) return 60 % minutes === 0 ? `*/${minutes} * * * *` : null;
+  const hours = minutes / 60;
+  if (!Number.isInteger(hours) || 24 % hours !== 0) return null;
+  return hours === 24 ? "0 0 * * *" : `0 */${hours} * * *`;
+}
 
 /** Valkey, the file system's metadata engine. */
 const Valkey = Schema.Struct({
@@ -727,47 +715,33 @@ const Valkey = Schema.Struct({
 });
 
 /**
- * Workspace storage: each new session's workspace a volume of one JuiceFS file system,
- * its metadata in a Valkey of alasio's own and its data in the object store's
- * `workspaces` bucket. Without it, new workspaces are volumes of sessions.storage's
- * class, the cluster's default unless it names one; a workspace keeps the volume it was
- * made with either way.
+ * Workspace storage: each session's workspace a directory of one JuiceFS file system, its
+ * metadata in a Valkey of alasio's own and its data in the object store's `workspaces`
+ * bucket, which each node mounts whole (./sandbox-gateway.ts workspaceMount). The sandbox
+ * service runs on it alone.
  */
 const WorkspaceStorage = Schema.Struct({
   enabled: defaulted(Schema.Boolean, true),
   /** The file system's name, which its data is kept under in the bucket. */
   name: defaulted(matching(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/u, "must be a JuiceFS file system name"), "workspaces"),
-  /** The StorageClass of its volumes, which sessions' claims are of unless sessions.storage names another. */
-  storageClassName: defaulted(matching(NAME, "must be a StorageClass name"), "alasio-workspaces"),
   /** How many days a deleted file is kept in the file system's trash, 0 for none; set as the file system is first made. */
   trashDays: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0, { message: "must be 0 or more" })), 1),
-  /** How often JuiceFS dumps the file system's metadata to its bucket's meta/: a duration of 5m or more, the least it takes. */
+  /** How often the file system's metadata is dumped to its bucket's meta/ (./workspace-storage.ts metadataDump): a schedule a cron line keeps, as everyIntervalCron says. */
   backupInterval: defaulted(
-    Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) >= 300 || "must be a duration of 5m or more, such as 1h")),
+    Schema.String.check(Schema.makeFilter((duration) => everyIntervalCron(duration) !== null || "must be 5m or more, of whole minutes that divide an hour or whole hours that divide a day, such as 1h")),
     "1h",
   ),
   /** Each mount's read cache on its node's disk, in MiB. */
   cacheSizeMiB: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0, { message: "must be 0 or more" })), 1024),
-  csi: defaulted(Csi, {}),
+  /** JuiceFS's command line, Community Edition, which its admin jobs run: of the version the nodes' mount is (../../../Dockerfile). */
+  image: Image({
+    repository: "juicedata/mount",
+    tag: "ce-v1.4.1",
+    digest: "sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673",
+  }),
   valkey: defaulted(Valkey, {}),
-});
-
-/** agent-sandbox's controller, installed once per cluster; off where the cluster already has it. */
-const AgentSandbox = Schema.Struct({
-  enabled: defaulted(Schema.Boolean, true),
-  image: defaulted(
-    Schema.Struct({
-      repository: defaulted(NonEmpty, "registry.k8s.io/agent-sandbox/agent-sandbox-controller"),
-      tag: defaulted(Schema.String, "v1.0.5"),
-      digest: defaulted(Digest, "sha256:28a9cbdbfd6ac0a4e5c7e9261ace1aa30ee2da681cb640dccdfed98e8dd9d98b"),
-      pullPolicy: defaulted(PullPolicy, "IfNotPresent"),
-    }),
-    {},
-  ),
-  resources: Resources({ requests: { cpu: "20m", memory: "32Mi" }, limits: { memory: "256Mi" } }),
-  nodeSelector: NodeSelector,
-  tolerations: Tolerations,
-  affinity: Affinity,
+  /** Each node's mount of the file system, which the node agent attaches session workspaces from (./sandbox-gateway.ts). */
+  mount: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "1Gi" } }) }), {}),
 });
 
 /** A container of a controller alasio installs: its pinned image and its resources. */
@@ -1008,7 +982,6 @@ const InstallStruct = Schema.Struct({
   ),
   /** NetworkPolicies confining sessions, folder workspaces' bayma and Neon. */
   networkPolicies: defaulted(Schema.Struct({ enabled: defaulted(Schema.Boolean, true) }), {}),
-  agentSandbox: defaulted(AgentSandbox, {}),
   autoscaling: defaulted(Autoscaling, {}),
 });
 

@@ -1,7 +1,7 @@
 /**
  * Exports OTLP requests that something else encoded, as they are, over OTLP/HTTP to
- * where alasio exports its own signals: what alasio relays from inside a session's sandbox
- * (src/sandbox/telemetry.ts). Each signal goes to its endpoint with its headers,
+ * where alasio exports its own signals: what the sandbox service's receiver relays from
+ * inside a session's sandbox (src/receiver/receiver.ts). Each signal goes to its endpoint with its headers,
  * timeout, compression, and TLS files from the standard variables, as OpenTelemetry's
  * own exporters send alasio's, and is retried as they retry: on 429, 502, 503, and 504
  * and on a failed connection, after the server's Retry-After or a jittered backoff,

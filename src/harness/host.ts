@@ -20,6 +20,7 @@ import type { ModelChoice, Mount } from "../persistence/conversation-repository.
 import type { StoreError } from "../persistence/sql.ts";
 import { type ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
 import { Store, type TurnFenced } from "../persistence/store.ts";
+import { parseWorkspace } from "../workspace/kind.ts";
 import { ActiveTurns, type StopReason } from "./active-turns.ts";
 import { type AttachedTurn, type Harness, type HarnessError, Harnesses, type HarnessHostError, type HarnessUnavailable, type OwnTurn, type OwnTurns, type TurnResult } from "./index.ts";
 import type { HarnessName } from "./names.ts";
@@ -142,7 +143,7 @@ export class HarnessHost extends Context.Service<HarnessHost, {
       startTurn: (start) =>
         Effect.gen(function*() {
           const harness = yield* harnesses.getFor(start.harness, start.workingDirectory);
-          yield* receivedFiles.materialize(start.fileIds);
+          yield* receivedFiles.materialize(start.fileIds, parseWorkspace(start.workingDirectory));
           /**
            * What the job's turn records of its progress, for a restart to know what became of
            * its prompt. The turn dies on a record it cannot make: so a prompt whose dispatch is
@@ -171,7 +172,11 @@ export class HarnessHost extends Context.Service<HarnessHost, {
             onIdle: tell({ kind: "idle", conversationId: start.conversationId }),
           });
         }),
-      steer: (conversationId, prompt, fileIds) => Effect.andThen(receivedFiles.materialize(fileIds), activeTurns.steer(conversationId, prompt)),
+      steer: (conversationId, prompt, fileIds) =>
+        store.getMount(conversationId).pipe(
+          Effect.flatMap(({ workingDirectory }) => receivedFiles.materialize(fileIds, parseWorkspace(workingDirectory))),
+          Effect.andThen(activeTurns.steer(conversationId, prompt)),
+        ),
       interrupt: (conversationId, reason) => activeTurns.stop(conversationId, reason),
       status: (conversationId) =>
         Effect.gen(function*() {

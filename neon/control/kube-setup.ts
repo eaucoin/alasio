@@ -16,9 +16,7 @@
  * for the snapshots bucket alone, which nothing but it may write: the setup refuses a main
  * key that can (refuseMainKeyOnSnapshots). With workspace storage on, WORKSPACES_NAME (its JuiceFS
  * file system's), WORKSPACES_BUCKET and WORKSPACES_BUCKET_URL (its bucket's name
- * and URL), WORKSPACES_TRASH_DAYS, VALKEY_ADDRESS (its metadata engine's host:port), and
- * WORKSPACES_SECRET_LABELS (a JSON object of the labels its Secrets carry, by which
- * alasio keeps them while its volumes remain). With session sandboxes snapshotted,
+ * and URL), WORKSPACES_TRASH_DAYS, and VALKEY_ADDRESS (its metadata engine's host:port). With session sandboxes snapshotted,
  * SNAPSHOTS_BUCKET (the bucket their snapshots are kept in). WEBHOOK_ADDRESS, the address
  * Telegram delivers to, which the webhook intake's certificate is made for
  * (./certificate.ts).
@@ -26,6 +24,8 @@
 import type { KubernetesObject, V1ObjectMeta, V1Secret } from "@kubernetes/client-node";
 import { Cause, Effect, Exit } from "effect";
 
+import { environmentKey } from "../../src/binder/names.ts";
+import { MAIN_ENVIRONMENT_NAME } from "../../src/branch/names.ts";
 import { makeS3Bucket, type S3Bucket, S3Error } from "../../src/node-agent/s3.ts";
 
 import { BRANCHES_SCOPE, computeId, MAIN, PROXY_SCOPE } from "./branches.ts";
@@ -48,6 +48,7 @@ import {
   type S3Identity,
   type StackSecrets,
   type StoredSecrets,
+  WORKSPACE_QUOTAS_USER,
 } from "./secrets.ts";
 
 const PUBLIC_KEY = "auth_public_key.pem";
@@ -75,8 +76,11 @@ export interface SecretNames {
   branches: string;
   valkey: string;
   workspaces: string;
+  workspaceQuotas: string;
   snapshots: string;
   nodeAgent: string;
+  sandboxGateway: string;
+  sessionsCaller: string;
   /** The log's own (its cluster's id and its admin's password), its access applier's (every principal's password), and each principal's. */
   log: string;
   logAccess: string;
@@ -92,7 +96,6 @@ export interface WorkspacesConfig {
   bucketUrl: string;
   trashDays: string;
   valkeyAddress: string;
-  secretLabels: Record<string, string>;
 }
 
 /** The deployment's configuration, from the environment the module comment lists. */
@@ -191,8 +194,11 @@ export function secretNames(prefix: string): SecretNames {
     branches: `${prefix}-branches`,
     valkey: `${prefix}-valkey`,
     workspaces: `${prefix}-workspaces-juicefs`,
+    workspaceQuotas: `${prefix}-workspaces-quotas`,
     snapshots: `${prefix}-snapshots`,
     nodeAgent: `${prefix}-node-agent`,
+    sandboxGateway: `${prefix}-sandbox-gateway`,
+    sessionsCaller: `${prefix}-sessions-caller`,
     log: `${prefix}-log`,
     logAccess: `${prefix}-log-access`,
     logPrincipals: Object.fromEntries(LOG_PRINCIPALS.map((principal) => [principal, `${prefix}-log-${principal}`])) as Record<LogPrincipal, string>,
@@ -320,8 +326,8 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
   Object.assign(rendered, neonSecrets(neon));
   if (workspaces) {
     rendered[names.valkey] = { password: secrets.valkeyPassword };
-    // The file system's volume credentials, as JuiceFS's CSI driver reads them; the
-    // format options are applied as the file system is first made.
+    // The file system's credentials, as alasio's JuiceFS clients read them (the nodes'
+    // mount and the admin jobs); the format options are applied as it is first made.
     rendered[names.workspaces] = {
       name: workspaces.name,
       // Its database 1, leaving the others free for a restore to be loaded into.
@@ -331,6 +337,12 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
       "access-key": s3("workspaces").accessKey,
       "secret-key": s3("workspaces").secretKey,
       "format-options": `trash-days=${workspaces.trashDays}`,
+    };
+    // The node agents', which set workspaces' quotas on its metadata as a Valkey user of their
+    // own, of no command Valkey calls dangerous but what JuiceFS asks, and no key of the object store.
+    rendered[names.workspaceQuotas] = {
+      password: secrets.valkeyQuotasPassword,
+      metaurl: `redis://${WORKSPACE_QUOTAS_USER}:${encodeURIComponent(secrets.valkeyQuotasPassword)}@${workspaces.valkeyAddress}/1`,
     };
   }
   const { snapshotsBucket } = config;
@@ -345,6 +357,10 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
     };
     // The token alasio presents to the node agents, which they check: both read it here.
     rendered[names.nodeAgent] = { token: secrets.nodeAgentToken };
+    // The sandbox gateway's keys, beside the node agents it attaches workspaces through.
+    rendered[names.sandboxGateway] = { "caller-key": secrets.gatewayCallerKey, "binding-key": secrets.gatewayBindingKey };
+    // main's alasio's key to it, its own of the gateway's caller key, which signs main's sessions' tokens alone; a branch's is `alasio branch create`'s to write.
+    rendered[names.sessionsCaller] = { "caller-key": environmentKey(Buffer.from(secrets.gatewayCallerKey), MAIN_ENVIRONMENT_NAME).toString() };
   }
   if (!config.external) {
     const buckets = { neon: config.neonBucket, lake: config.lakeBucket, backups: config.backupsBucket, workspaces: workspaces?.bucket ?? null, snapshots: snapshotsBucket };
@@ -390,7 +406,6 @@ export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
         bucketUrl: required("WORKSPACES_BUCKET_URL"),
         trashDays: required("WORKSPACES_TRASH_DAYS"),
         valkeyAddress: required("VALKEY_ADDRESS"),
-        secretLabels: JSON.parse(required("WORKSPACES_SECRET_LABELS")),
       }
       : null,
     snapshotsBucket: env["SNAPSHOTS_BUCKET"]?.trim() || null,
@@ -436,12 +451,11 @@ export async function setupKube({ kube, config, log = console.log }: SetupKubeOp
   const { certificate: webhookTls, made } = webhookCertificate(config.webhookAddress, current);
   if (made) log(`making the webhook intake's certificate for ${config.webhookAddress}`);
 
-  const workspaceSecrets = new Set([names.valkey, names.workspaces]);
   for (const [name, stringData] of Object.entries(renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, webhookTls }))) {
     const object = {
       apiVersion: "v1",
       kind: "Secret",
-      metadata: { name, namespace: config.namespace, labels: { ...labels, ...(workspaceSecrets.has(name) ? config.workspaces?.secretLabels : {}) } },
+      metadata: { name, namespace: config.namespace, labels },
       type: "Opaque",
       stringData,
     } satisfies V1Secret;

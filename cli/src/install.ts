@@ -10,17 +10,19 @@
 import type { KubernetesObject, V1Namespace } from "@kubernetes/client-node";
 import { Effect, Result, Schema } from "effect";
 
+import { type ApiServer, readApiServer } from "./api-server.ts";
 import { gvisorReleases as gvisorReleasesOf, NODE_PINS } from "./cluster/node.ts";
 import { installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
 import { type BaselineDecision, decideCpuBaseline, recordedBaseline, sameBaseline, surveyCpu } from "./cpu-baseline.ts";
 import { clusterReleases } from "./kept-releases.ts";
-import { describeRef, hasStatus, KubeApi, type KubeApiError, refOf } from "./kube/api.ts";
+import { describeRef, hasStatus, kind, KubeApi, type KubeApiError, refOf } from "./kube/api.ts";
 import { type ApplyError, applyInstallation, labelled } from "./kube/apply.ts";
 import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts";
 import { checkObjectStoreLayout, checkObjectStoreScale, type ObjectStoreScaleRefused } from "./kube/object-store-scale.ts";
 import type { NotReadyInTime, RolloutFailed, WaitOptions } from "./kube/rollout.ts";
-import type { CpuBaseline } from "./manifests/alasio.ts";
+import type { CpuBaseline, Kept } from "./manifests/alasio.ts";
 import { labels, NAMESPACE, nodeAgentRuns } from "./manifests/common.ts";
+import { mountServices as mountServicesOf, sandboxServiceRuns } from "./manifests/sandbox-gateway.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { type Carried, carriedFrom, manifests, NOTHING_CARRIED } from "./manifests/index.ts";
 import { checkNeonStorage, type PageserversLowered, type ShardsLowered, type StorageDatabaseUnread, type StorageUnverified } from "./neon-storage.ts";
@@ -30,6 +32,14 @@ import { ensureRoute, registerBot, type WebhookNotServing } from "./webhook.ts";
 
 /** alasio's namespace. */
 const NAMESPACE_OBJECT: V1Namespace = { apiVersion: "v1", kind: "Namespace", metadata: { name: NAMESPACE, labels: labels("alasio") } };
+
+/** The UIDs of the Services `names` of alasio's namespace, as the nodes' mount reaches them by address (../manifests/sandbox-gateway.ts mountServices), each by its name, null where it is not there. */
+export const readMountServices = (names: readonly string[]) =>
+  Effect.gen(function*() {
+    const api = yield* KubeApi;
+    const read = yield* Effect.forEach(names, (name) => Effect.map(api.get({ ...kind("Service"), namespace: NAMESPACE, name }), (service) => [name, service?.metadata?.uid ?? null] as const));
+    return Object.fromEntries(read) as Kept["mountServices"];
+  });
 
 /** The objects of the installation `config` describes, with what it carries forward from the one it replaces. */
 export function installationObjects(config: InstallConfig, carried: Carried = NOTHING_CARRIED): readonly KubernetesObject[] {
@@ -70,12 +80,21 @@ export const installConfig = Effect.fnUntraced(function*(config: OperatorConfig)
   return install.success;
 });
 
-/** What an installation came to: its bot, whether Claude Code has a token, and, where sessions are snapshotted, their CPU baseline. */
+/**
+ * What an installation came to: its bot, whether Claude Code has a token, where sessions are
+ * snapshotted their CPU baseline, and whether what is to reach the API server alone reaches
+ * any address, as where the API server is could not be read.
+ */
 export interface Installed {
   readonly bot: TelegramBot;
   readonly claude: boolean;
   readonly cpuBaseline: BaselineDecision | null;
+  readonly apiServerUnconfined: boolean;
 }
+
+/** Whether the installation `settings` confines what reaches its API server to it, by NetworkPolicies, but could not, as `apiServer` was not read. */
+export const apiServerUnconfined = (settings: InstallConfig, apiServer: ApiServer | null): boolean =>
+  apiServer === null && settings.networkPolicies.enabled && sandboxServiceRuns(settings);
 
 /** An object the cluster has that cannot take this release's of it, and why, as a dry run of its apply said. */
 const Refusal = Schema.Struct({ object: Schema.String, reason: Schema.String });
@@ -118,33 +137,69 @@ const checkApplicable = (objects: readonly KubernetesObject[]): Effect.Effect<vo
       }),
     ));
 
+/**
+ * The sessions' namespace holds session workspaces of the release before: its Sandboxes, and
+ * their workspaces' claims, which this release runs no session on and moves nothing of. alasio
+ * applies nothing while one remains, saying how to delete each, which deletes its files.
+ */
+export class SessionWorkspacesLeft extends Schema.TaggedError<SessionWorkspacesLeft>()("SessionWorkspacesLeft", {
+  namespace: Schema.String,
+  sandboxes: Schema.Array(Schema.String),
+  claims: Schema.Array(Schema.String),
+}) {
+  override get message(): string {
+    const deletions = [
+      ...this.sandboxes.map((name) => `kubectl -n ${this.namespace} delete sandboxes.agents.x-k8s.io ${name}`),
+      ...this.claims.map((name) => `kubectl -n ${this.namespace} delete pvc ${name}`),
+    ];
+    return `${this.namespace} holds session workspaces of the release before (${[...this.sandboxes.map((name) => `Sandbox ${name}`), ...this.claims.map((name) => `claim ${name}`)].join(", ")}), ` +
+      `which this release runs no session on and moves nothing of, so alasio applies nothing: delete each first, its files with it (${deletions.join("; ")})`;
+  }
+}
+
+/** Refuses a cluster whose sessions' namespace, `namespace`, holds the release before's session workspaces (SessionWorkspacesLeft); none where its Sandboxes' CRD is gone. */
+const checkSessionWorkspacesGone = (namespace: string): Effect.Effect<void, KubeApiError | SessionWorkspacesLeft, KubeApi> =>
+  Effect.gen(function*() {
+    const kube = yield* KubeApi;
+    const names = (objects: readonly KubernetesObject[]) => objects.map(({ metadata }) => metadata?.name ?? "").sort();
+    const sandboxes = names(yield* kube.list(kind("Sandbox"), { namespace }).pipe(Effect.catchIf(hasStatus(404), () => Effect.succeed([]))));
+    // This release claims no volume there: each claim is a workspace of the release before's.
+    const claims = names(yield* kube.list(kind("PersistentVolumeClaim"), { namespace }));
+    if (sandboxes.length > 0 || claims.length > 0) return yield* new SessionWorkspacesLeft({ namespace, sandboxes, claims });
+  });
+
 /** The installation `config` describes, as checkInstallation finds it, with what its objects carry forward. */
 interface Checked {
   readonly bot: TelegramBot;
   readonly settings: InstallConfig;
   readonly objects: readonly KubernetesObject[];
-  /** The templates the cluster runs, as their ConfigMap records them, and the CPU baseline they hold sessions to. */
-  readonly live: string | undefined;
+  /** The sandbox gateway's configuration the cluster runs, as its ConfigMap holds it, which carries its pools' templates before the current ones and the CPU baseline they hold sessions to. */
+  readonly liveGateway: string | undefined;
   readonly recorded: CpuBaseline;
   /** The releases the cluster keeps, as its RuntimeClasses say, which the sessions' snapshots restore with. */
   readonly gvisorReleases: readonly string[];
   /** The checksum of the bot's Secret alasio's pod carries (../secrets.ts botChecksum), null where the Secret has no key for it yet. */
   readonly checksum: string | null;
+  /** Where the cluster's API server is, null where it cannot be read (./api-server.ts). */
+  readonly apiServer: ApiServer | null;
+  /** The UIDs of the Services the nodes' mount reaches by address, as the cluster has them before this up (Kept mountServices). */
+  readonly mountServices: Kept["mountServices"];
 }
 
 /**
  * The installation `config` describes, with its bot, refused where applying it would not do:
  * with no bot set, or one that allows no user, with no address for Telegram to deliver to,
  * against the cluster's own autoscalers, its object store's layout and scale, or Neon's
- * storage (./neon-storage.ts), or where an object the cluster has cannot take this release's
- * of it. Its objects carry forward what the installation they replace recorded.
+ * storage (./neon-storage.ts), where the sessions' namespace holds the release before's session
+ * workspaces (SessionWorkspacesLeft), or where an object the cluster has cannot take this
+ * release's of it. Its objects carry forward what the installation they replace recorded.
  */
 export const checkInstallation = Effect.fnUntraced(function*(
   config: OperatorConfig,
   wait?: WaitOptions,
 ): Effect.fn.Return<
   Checked,
-  KubeApiError | NotReadyInTime | RolloutFailed | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused,
+  KubeApiError | NotReadyInTime | RolloutFailed | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused | SessionWorkspacesLeft,
   KubeApi
 > {
   const bot = yield* readTelegramBot;
@@ -152,18 +207,21 @@ export const checkInstallation = Effect.fnUntraced(function*(
   if (bot.allowedUserIds.length === 0) return yield* new NoUserAllowed();
   const settings = yield* installConfig(config);
   if (!settings.webhook.publicAddress) return yield* new PublicAddressNotSet();
-  const { live, baseline: recorded } = yield* recordedBaseline;
+  const { liveGateway, baseline: recorded } = yield* recordedBaseline;
   const gvisorReleases = yield* clusterReleases(gvisorReleasesOf(NODE_PINS));
   // None where the bot's Secret has no key for it yet, as up gives it one before it checks (ensureBotChecksumKey).
   const key = yield* readBotChecksumKey;
   const checksum = key === null ? null : botChecksum(bot, key);
-  const objects = installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: recorded, gvisorReleases, botChecksum: checksum }));
+  const apiServer = yield* readApiServer;
+  const mountServices = yield* readMountServices(mountServicesOf(settings));
+  const objects = installationObjects(settings, carriedFrom(settings, { cpuBaseline: recorded, gvisorReleases, botChecksum: checksum, apiServer, mountServices }, liveGateway));
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
   yield* checkNeonStorage(settings, wait);
+  if (settings.sessions.enabled) yield* checkSessionWorkspacesGone(settings.sessions.namespace);
   yield* checkApplicable(objects);
-  return { bot, settings, objects, live, recorded, gvisorReleases, checksum };
+  return { bot, settings, objects, liveGateway, recorded, gvisorReleases, checksum, apiServer, mountServices };
 });
 
 /**
@@ -177,20 +235,20 @@ export const install = Effect.fnUntraced(function*(
   options: WaitOptions,
 ): Effect.fn.Return<
   Installed,
-  ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused | WebhookNotServing | WebhookError,
+  ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused | SessionWorkspacesLeft | WebhookNotServing | WebhookError,
   KubeApi | TelegramBotApi
 > {
   yield* ensureBotChecksumKey;
-  const { bot, settings, objects, live, recorded, gvisorReleases, checksum } = yield* checkInstallation(config, options);
+  const { bot, settings, objects, liveGateway, recorded, gvisorReleases, checksum, apiServer, mountServices } = yield* checkInstallation(config, options);
   const route = yield* ensureRoute("main", bot.allowedUserIds);
   yield* applyInstallation(objects, options);
   yield* registerBot(settings, "main", bot, route, options);
-  const installed = { bot, claude: settings.alasio.claude.existingSecret !== "" };
+  const installed = { bot, claude: settings.alasio.claude.existingSecret !== "", apiServerUnconfined: apiServerUnconfined(settings, apiServer) };
   if (!nodeAgentRuns(settings)) return { ...installed, cpuBaseline: null };
   const decision = decideCpuBaseline(yield* surveyCpu, recorded);
   // Carried from the installation before this one, as the first apply carried it.
   if (!sameBaseline(decision.baseline, recorded)) {
-    yield* applyInstallation(installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: decision.baseline, gvisorReleases, botChecksum: checksum })), options);
+    yield* applyInstallation(installationObjects(settings, carriedFrom(settings, { cpuBaseline: decision.baseline, gvisorReleases, botChecksum: checksum, apiServer, mountServices }, liveGateway)), options);
   }
   return { ...installed, cpuBaseline: decision };
 });

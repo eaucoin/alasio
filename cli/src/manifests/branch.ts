@@ -7,23 +7,27 @@
  * by those namespaces and BRANCH_LABEL.
  *
  * Its configuration is main's, with the operator's overrides, and never the host
- * profile: a folder is the machine's own files, which a branch cannot copy. Its alasio's
- * identity reaches its own sessions alone; main's alasio may make Sandboxes there, and
- * read their claims, to fork into it the sessions the branch inherited
- * (src/branch/fork.ts). Its Secrets are the command's to write: the database's, the
+ * profile: a folder is the machine's own files, which a branch cannot copy. Its alasio
+ * reaches its sessions through main's sandbox gateway alone, by the branch's own key, and
+ * main's alasio asks the gateway to fork into it the sessions the branch inherited
+ * (src/branch/fork.ts). Its sessions' sandboxes are main's sandbox service's, in pools of its
+ * own in its sessions' namespace, which the service finds by its label
+ * (src/gateway/environments.ts), so nothing of main's changes as a branch comes or goes. Its
+ * Secrets are the command's to write: the database's, the
  * lake's and the compute's, as main's (the data is a copy, its roles and passwords main's);
  * its own bot's; Claude Code's token, when main has one; and its token to ask main to fork
  * with.
  */
-import type { KubernetesObject, V1Role, V1RoleBinding } from "@kubernetes/client-node";
+import type { KubernetesObject } from "@kubernetes/client-node";
 
 import { branchNamespace } from "../../../src/branch/names.ts";
-import { alasioObjects, sessionsNamespace } from "./alasio.ts";
-import { BRANCH_LABEL, componentName, type Environment, labels, NAMESPACE, RELEASE } from "./common.ts";
+import { alasioObjects, type CpuBaseline } from "./alasio.ts";
+import { BRANCH_LABEL, type Environment } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { lakeObjects } from "./lake.ts";
 import { compute, computeScaling } from "./neon.ts";
 import { networkPolicyObjects } from "./network-policies.ts";
+import { sandboxPoolObjects } from "./sandbox-gateway.ts";
 
 /** The environment of the branch `name`. */
 export const branchEnvironment = (name: string): Environment => ({ namespace: branchNamespace(name), branch: name });
@@ -33,30 +37,12 @@ function branchLabelled(object: KubernetesObject, name: string): KubernetesObjec
   return { ...object, metadata: { ...object.metadata, labels: { ...object.metadata?.labels, [BRANCH_LABEL]: name } } };
 }
 
-/** What main's alasio may do in the branch's sessions' namespace: make the forks of the sessions the branch inherited, and wait for their claims. */
-function parentAccess(config: InstallConfig, environment: Environment): KubernetesObject[] {
-  const metadata = { name: componentName("parent"), namespace: sessionsNamespace(config, environment), labels: labels("alasio") };
-  const role: V1Role = {
-    apiVersion: "rbac.authorization.k8s.io/v1",
-    kind: "Role",
-    metadata,
-    rules: [
-      { apiGroups: ["agents.x-k8s.io"], resources: ["sandboxes"], verbs: ["create", "delete"] },
-      { apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get"] },
-    ],
-  };
-  const binding: V1RoleBinding = {
-    apiVersion: "rbac.authorization.k8s.io/v1",
-    kind: "RoleBinding",
-    metadata,
-    subjects: [{ kind: "ServiceAccount", name: RELEASE, namespace: NAMESPACE }],
-    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: metadata.name },
-  };
-  return [role, binding];
-}
-
-/** The objects of the branch environment `name`, of the configuration `config` (main's, overridden, without the host profile). */
-export function branchObjects(config: InstallConfig, name: string): KubernetesObject[] {
+/**
+ * The objects of the branch environment `name`, of the configuration `config` (main's,
+ * overridden, without the host profile), its sandbox pools main's, held to the CPU baseline
+ * `cpuBaseline` main's are.
+ */
+export function branchObjects(config: InstallConfig, name: string, cpuBaseline: CpuBaseline): KubernetesObject[] {
   const environment = branchEnvironment(name);
   return [
     ...alasioObjects(config, environment),
@@ -64,6 +50,6 @@ export function branchObjects(config: InstallConfig, name: string): KubernetesOb
     ...computeScaling(environment.namespace),
     ...lakeObjects(config, environment),
     ...networkPolicyObjects(config, environment),
-    ...(config.sessions.enabled ? parentAccess(config, environment) : []),
+    ...sandboxPoolObjects(config, environment, cpuBaseline),
   ].map((object) => branchLabelled(object, name));
 }

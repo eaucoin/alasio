@@ -5,6 +5,7 @@ import type { ConcurrentPromptPayload } from "../codex/turns.ts";
 import { discardHeld, queueHeld, shownBusy, steerWithHeld, swerveTo } from "../harness/commands.ts";
 import { HarnessHost } from "../harness/host.ts";
 import { harnessLabelOf, NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, isHarnessName } from "../harness/index.ts";
+import { FOLDER_RESTART, FOLDER_RETRY } from "../mcp/bayma.ts";
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
 import { handleGoalControlCallback, isGoalControlAction } from "../operator/goal-control.ts";
 import { handleModelControlCallback, isModelControlAction } from "../operator/model-control.ts";
@@ -78,12 +79,15 @@ const handlePress = Effect.fnUntraced(function*(callbackQuery: CallbackQuery, ac
   const { conversationId } = action;
   const closes = action.kind.endsWith(":close");
   const heldPrompt = HELD_PROMPT_ACTIONS.has(action.kind);
-  if (!closes && !heldPrompt && mount.sessionId !== action.payload["expectedSessionId"]) {
+  // A folder instance's buttons are of its harness's instance, whatever the conversation mounts now.
+  const ofFolder = action.kind === FOLDER_RETRY || action.kind === FOLDER_RESTART;
+  if (!closes && !heldPrompt && !ofFolder && mount.sessionId !== action.payload["expectedSessionId"]) {
     yield* client.answerCallbackQuery(callbackQuery.id, "This panel is stale. Open it again.");
     return;
   }
   if (!closes
     && !heldPrompt
+    && !ofFolder
     && !isServiceControlAction(action.kind)
     && isHarnessName(action.payload["expectedHarness"])
     && mount.harness !== action.payload["expectedHarness"]) {

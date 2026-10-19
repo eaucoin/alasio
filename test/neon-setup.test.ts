@@ -9,6 +9,7 @@ import { generateKeyPair, verifyToken } from "../neon/control/jwt.ts";
 import { refuseMainKeyOnSnapshots, renderSecrets, secretNames, setupConfig, setupKube, type StoredSecret } from "../neon/control/kube-setup.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
 import { clusterId, type SeaweedS3Config, type StackSecrets, type StoredSecrets } from "../neon/control/secrets.ts";
+import { environmentKey } from "../src/binder/names.ts";
 import { makeS3Bucket } from "../src/node-agent/s3.ts";
 import { startFakeS3 } from "./support/fake-s3.ts";
 
@@ -31,7 +32,6 @@ const ENV = {
   WORKSPACES_BUCKET_URL: "http://q-seaweedfs.alasio.svc.cluster.local:8333/workspaces",
   WORKSPACES_TRASH_DAYS: "1",
   VALKEY_ADDRESS: "q-valkey.alasio.svc.cluster.local:6379",
-  WORKSPACES_SECRET_LABELS: '{"alasio.dev/volume-driver":"csi.juicefs.com"}',
   SNAPSHOTS_BUCKET: "snapshots",
   WEBHOOK_ADDRESS: "203.0.113.10",
 };
@@ -145,12 +145,13 @@ test("the stack's secrets are made once, and every service's rendered from them 
   // access applier; and each principal's, KEDA's with its mechanism.
   assert.match(value(kube, names.log, "KAFKA_CLUSTER_ID"), /^[\w-]{22}$/u);
   assert.equal(value(kube, names.log, "LOG_ADMIN_PASSWORD"), root.log.admin);
-  assert.deepEqual(Object.keys(kube.secrets.get(names.logAccess)?.data ?? {}).sort(), ["alasio-main", "gateway", "intake", "loader-main", "scaler", "webhook"]);
+  assert.deepEqual(Object.keys(kube.secrets.get(names.logAccess)?.data ?? {}).sort(), ["alasio-main", "gateway", "intake", "loader-main", "sandbox-gateway", "scaler", "webhook"]);
   assert.deepEqual(names.logPrincipals, {
     "gateway": "q-log-gateway",
     "intake": "q-log-intake",
     "scaler": "q-log-scaler",
     "webhook": "q-log-webhook",
+    "sandbox-gateway": "q-log-sandbox-gateway",
     "alasio-main": "q-log-alasio-main",
     "loader-main": "q-log-loader-main",
   });
@@ -161,7 +162,7 @@ test("the stack's secrets are made once, and every service's rendered from them 
   }
   assert.equal(value(kube, names.logPrincipals.scaler, "sasl"), "scram_sha512");
   assert.equal(kube.secrets.get(names.logPrincipals.gateway)?.data?.["sasl"], undefined);
-  assert.equal(new Set(Object.values(root.log)).size, 7);
+  assert.equal(new Set(Object.values(root.log)).size, 8);
   // The filers' store's users' passwords, each its own: the filers', the collector's and the backups'.
   assert.equal(value(kube, names.filerStoreFiler, "password"), root.filerStoreFilerPassword);
   assert.equal(value(kube, names.filerStoreCollector, "password"), root.filerStoreCollectorPassword);
@@ -201,16 +202,16 @@ test("the stack's secrets are made once, and every service's rendered from them 
   // Workspace storage's JuiceFS reaches Valkey with its password, and its own bucket alone.
   assert.equal(value(kube, names.valkey, "password"), root.valkeyPassword);
   assert.equal(value(kube, names.workspaces, "metaurl"), `redis://:${encodeURIComponent(root.valkeyPassword)}@q-valkey.alasio.svc.cluster.local:6379/1`);
+  // The node agents', a Valkey user of their own, of a password of its own.
+  assert.equal(value(kube, names.workspaceQuotas, "password"), root.valkeyQuotasPassword);
+  assert.equal(value(kube, names.workspaceQuotas, "metaurl"), `redis://quotas:${encodeURIComponent(root.valkeyQuotasPassword)}@q-valkey.alasio.svc.cluster.local:6379/1`);
+  assert.notEqual(root.valkeyQuotasPassword, root.valkeyPassword);
   assert.equal(value(kube, names.workspaces, "name"), "workspaces");
   assert.equal(value(kube, names.workspaces, "storage"), "s3");
   assert.equal(value(kube, names.workspaces, "bucket"), "http://q-seaweedfs.alasio.svc.cluster.local:8333/workspaces");
   assert.equal(value(kube, names.workspaces, "access-key"), root.s3.workspaces.accessKey);
   assert.equal(value(kube, names.workspaces, "secret-key"), root.s3.workspaces.secretKey);
   assert.equal(value(kube, names.workspaces, "format-options"), "trash-days=1");
-  const driverOf = (name: string) => kube.secrets.get(name)?.metadata.labels?.["alasio.dev/volume-driver"];
-  assert.equal(driverOf(names.valkey), "csi.juicefs.com");
-  assert.equal(driverOf(names.workspaces), "csi.juicefs.com");
-  assert.equal(driverOf(names.database), undefined);
   assert.deepEqual(seaweed.identities.find((identity) => identity.name === "workspaces")?.actions, [
     "Read:workspaces",
     "List:workspaces",
@@ -252,6 +253,12 @@ test("the stack's secrets are made once, and every service's rendered from them 
   // alasio and the node agents read the token alasio presents them from one Secret.
   assert.equal(value(kube, names.nodeAgent, "token"), root.nodeAgentToken);
   assert.match(root.nodeAgentToken, /^[\w-]{32}$/u);
+  // The sandbox gateway's keys, each its own.
+  assert.deepEqual([value(kube, names.sandboxGateway, "caller-key"), value(kube, names.sandboxGateway, "binding-key")], [root.gatewayCallerKey, root.gatewayBindingKey]);
+  assert.notEqual(root.gatewayCallerKey, root.gatewayBindingKey);
+  // main's alasio's key to it, of the caller key, not the caller key itself.
+  assert.equal(value(kube, names.sessionsCaller, "caller-key"), environmentKey(Buffer.from(root.gatewayCallerKey), "main").toString());
+  assert.notEqual(value(kube, names.sessionsCaller, "caller-key"), root.gatewayCallerKey);
 
   // A second run keeps every secret and the key, and rewrites what derives from them.
   await setupKube({ kube, config, log: () => {} });
@@ -341,6 +348,7 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     alasioPassword: "q",
     lakePassword: "l",
     computeControlToken: "t",
+    valkeyQuotasPassword: "vq",
     valkeyPassword: "v",
     lakeReaderPassword: "r",
     lakeQueryToken: "k",
@@ -355,8 +363,10 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     monitorKey: "m",
     verifiers: { alasio: "SCRAM-SHA-256$q", lake: "SCRAM-SHA-256$l", lake_reader: "SCRAM-SHA-256$r", grafana: "SCRAM-SHA-256$g", harness: "SCRAM-SHA-256$h" },
     nodeAgentToken: "n",
+    gatewayCallerKey: "gc",
+    gatewayBindingKey: "gb",
     logClusterId: "cluster",
-    log: { "admin": "la", "gateway": "lg", "intake": "li", "scaler": "ls", "webhook": "lw", "alasio-main": "lm", "loader-main": "ll" },
+    log: { "admin": "la", "gateway": "lg", "intake": "li", "scaler": "ls", "webhook": "lw", "sandbox-gateway": "lb", "alasio-main": "lm", "loader-main": "ll" },
   };
 }
 

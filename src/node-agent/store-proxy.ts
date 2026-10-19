@@ -6,12 +6,17 @@
  *
  * The gofer holds none of the bucket's credentials. Each restore from the bucket is given a
  * token of its own (mint): an access key naming it and a secret of 256 random bits, which
- * the gofer signs its requests with, as Signature Version 4 signs; kept in the agent's memory
- * alone, so that none outlives the agent. A token lasts as long as a restore takes from its
+ * the gofer signs its requests with, as Signature Version 4 signs; kept in the agent's memory,
+ * and, where it is told (tokensFile), in a file on the node's tmpfs, which an agent that starts
+ * again reads back, as the module says below. A token lasts as long as a restore takes from its
  * prepare to its resume (PREPARED_FOR_MS), and from its resume as long as the agent says its
- * background reads may take (resumed); it is revoked before as the workspace's restore is
- * done with (revoke). A request the proxy takes is a GET of an object under that restore's
- * layers prefix, in the snapshots bucket, signed by its token, as the official signer
+ * background reads may take (resumed), and for as long after as its restore keeps asking:
+ * each request signed by it, whatever the bucket answers, or whether it answers, has it last
+ * at least ASKED_WINDOW_MS from then, so that a bucket away for a while delays the restore's
+ * reads, which its gofer retries, rather than ending its token under them; never past
+ * RESUMED_CEILING_MS from its resume. It is revoked before as the workspace's restore is done
+ * with (revoke). A request the proxy takes is a GET of an object under that restore's layers
+ * prefix, in the snapshots bucket, signed by its token, as the official signer
  * (@smithy/signature-v4) signs it, within SKEW_MS of now, its host, its date, its payload's
  * hash, its range and every header of Amazon's it sends among what it signs, for the
  * bucket's region and S3. Anything else is refused, as S3 refuses it. What it takes, it asks
@@ -19,30 +24,48 @@
  * as the bucket gives it, its status and its body, a request its client ends ending the
  * bucket's too.
  *
+ * The proxy listens on the agent's pod's address, as a restore over TCP reaches it, and,
+ * where told, on a Unix domain socket on the node (socket), which a restore of a release that
+ * can (./names.ts goferOf) dials instead, by its path, whatever pod the agent runs in.
+ *
  * A restore reads through the proxy until its sandbox has every page it was saved with,
- * which it reads in the background once it is resumed: an agent that stopped meanwhile would
- * leave it without the rest, for good (gate 8 of program/12-live-lazy.md). So the agent's stop
- * waits on the proxy's drain, which mints no token more, and ends once no restore reads
- * through it, within each token's time: none prepared and not resumed yet, none whose
- * request is under way, and none resumed that has not been served the bytes of pages its
- * image holds, where the agent told them (expect), counted once each, however they were
- * read, or, where it did not, whose last request ended within QUIET_MS. A background
- * load's reads may be spaced as long as its loader paces them, longer than any quiet: the
- * bytes say when it is done. A pages file's bytes are counted as they are handed to the
- * gofer's connection, from where the bucket's answer says they begin (its Content-Range, or
- * 0 for the whole object), an answer cut short counting what it gave, as the gofer keeps
- * those bytes and asks only for the rest.
+ * which it reads in the background once it is resumed. One over TCP whose agent stopped
+ * meanwhile would be left without the rest, for good (gate 8 of program/12-live-lazy.md), as
+ * the agent that comes back is at another address. So the agent's stop waits on the proxy's
+ * drain, which mints no token more, and ends once no restore over TCP reads through it,
+ * within each token's time: none prepared and not resumed yet, none whose request is under
+ * way, and none resumed that has not been served the bytes of pages its image holds, where
+ * the agent told them (expect), counted once each, however they were read, or, where it did
+ * not, whose last request ended within QUIET_MS. A background load's reads may be spaced as
+ * long as its loader paces them, longer than any quiet: the bytes say when it is done. A
+ * pages file's bytes are counted as they are handed to the gofer's connection, from where
+ * the bucket's answer says they begin (its Content-Range, or 0 for the whole object), an
+ * answer cut short counting what it gave, as the gofer keeps those bytes and asks only for
+ * the rest. One whose bucket is away keeps asking, and so keeps its token and the drain,
+ * until the agent's grace ends it (./names.ts nodeAgentStopSeconds). One through the socket
+ * waits instead for the agent that comes back, at the same path, its reads retried as long as
+ * its sandbox runs: the tokens are kept, where told, in a file on the node's tmpfs
+ * (tokensFile), which an agent that starts again reads back. A restore cannot ask while its
+ * agent is away, so a resumed token's window counts from its restore's last request or the
+ * agent's start, whichever is later: one read back within its ceiling lasts ASKED_WINDOW_MS
+ * from the start at least, however long the agent was away; one not resumed yet, and one
+ * past its ceiling, are dropped once ended. The time a token's requests lengthened is kept
+ * within KEPT_EVERY_MS of them. A file that cannot be read gives none, said loudly, and stops
+ * nothing. What is left: an agent away longer than a restore's RESUMED_CEILING_MS from its
+ * resume ends that restore, whose reads are then refused, as no token outlives its ceiling.
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, request as httpRequest, type Server, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { AddressInfo } from "node:net";
+import { dirname } from "node:path";
 
 import { Hash } from "@smithy/hash-node";
 import { SignatureV4 } from "@smithy/signature-v4";
-import { Effect, FiberSet, Schedule, Schema, type Scope } from "effect";
+import { Cause, Effect, FiberSet, Schedule, Schema, type Scope } from "effect";
 
-import { RESTORE_PREPARED_FOR_SECONDS } from "./names.ts";
+import { type Gofer, RESTORE_PREPARED_FOR_SECONDS } from "./names.ts";
 
 /** The bucket the proxy reads, and as whom. */
 export interface ProxiedStore {
@@ -60,22 +83,32 @@ export interface StoreToken {
   readonly secretAccessKey: string;
 }
 
+/** How a restore's gofer reaches the proxy: by its pod's address, or by the socket on the node. */
+export type Transport = Gofer["transport"];
+
 /** The snapshots bucket through the node agent, as the module says. */
 export interface StoreProxy {
-  /** The proxy's URL, `http://<address>:<port>`, which the gofer is given as its endpoint. */
+  /** The proxy's URL, `http://<address>:<port>`, which the gofer is given as its endpoint over TCP. */
   readonly endpoint: string;
+  /** The path of the socket it listens on too, on the node, if told one. */
+  readonly socket: string | null;
   /** The bucket's region, which the gofer signs for. */
   readonly region: string;
   /** The bucket, which the gofer names. */
   readonly bucket: string;
   /**
    * A token for the restore `holder` names, of the objects under `prefix` alone, for
-   * PREPARED_FOR_MS; one it held before is revoked. None once the proxy drains.
+   * PREPARED_FOR_MS, whose gofer reaches the proxy by `transport`; one it held before is
+   * revoked. None once the proxy drains.
    */
-  readonly mint: (holder: string, prefix: string) => StoreToken | null;
+  readonly mint: (holder: string, prefix: string, transport?: Transport) => StoreToken | null;
   /** Revokes the token `holder` holds, if any: a request signed with it is refused from now. */
   readonly revoke: (holder: string) => void;
-  /** The token `holder` holds, if any, lasts `ms` from now, as its restore's sandbox, resumed, reads the rest of its pages. */
+  /**
+   * The token `holder` holds, if any, lasts `ms` from now, as its restore's sandbox, resumed,
+   * reads the rest of its pages, and ASKED_WINDOW_MS past each request of it after, at most
+   * RESUMED_CEILING_MS from now.
+   */
   readonly resumed: (holder: string, ms: number) => void;
   /**
    * The restore of the token `accessKeyId`, if the proxy holds it still, reads `bytes` bytes
@@ -86,9 +119,9 @@ export interface StoreProxy {
    * is never taken for a later one's of the same workspace.
    */
   readonly expect: (accessKeyId: string, bytes: number | null) => void;
-  /** Mints no token more, and ends once no restore reads through the proxy, as the module says. */
+  /** Mints no token more, and ends once no restore over TCP reads through the proxy, as the module says. */
   readonly drained: Effect.Effect<void>;
-  /** How many restores read through the proxy, as its drain waits on them. */
+  /** How many restores over TCP read through the proxy, as its drain waits on them. */
   readonly reading: () => number;
 }
 
@@ -110,6 +143,17 @@ export const PREPARED_FOR_MS = RESTORE_PREPARED_FOR_SECONDS * 1000;
  * done: longer than the gofer waits between two attempts of a read, 20 s at most.
  */
 export const QUIET_MS = 60_000;
+/**
+ * How long a resumed token lasts past each request of its restore's: longer than its gofer
+ * waits between two attempts of a read (20 s at most, its pages' reads 10 s) and than a node
+ * agent takes to come back (14 s, gate 8 of program/12-live-lazy.md), as a restore through
+ * the socket asks again of the agent that comes back.
+ */
+export const ASKED_WINDOW_MS = 2 * 60_000;
+/** How long, from its resume, a token lasts at most, however its restore keeps asking. */
+export const RESUMED_CEILING_MS = 6 * 60 * 60_000;
+/** How often, at most, the tokens file is written again for the time a token's requests lengthened alone. */
+export const KEPT_EVERY_MS = 30_000;
 /** How often the drain looks at what reads through the proxy. */
 const DRAIN_POLL = "1 second";
 
@@ -159,14 +203,21 @@ export function keyOf(path: string, bucket: string): string | null {
   return named === bucket ? key.join("/") : null;
 }
 
-/** What makeStoreProxy is given: the store, where it listens, and, unless told, PREPARED_FOR_MS and QUIET_MS (for a restore whose bytes the agent did not tell). */
+/** What makeStoreProxy is given: the store, where it listens, and, unless told, PREPARED_FOR_MS, QUIET_MS (for a restore whose bytes the agent did not tell), ASKED_WINDOW_MS, RESUMED_CEILING_MS and KEPT_EVERY_MS. */
 export interface StoreProxyOptions {
   readonly store: ProxiedStore;
   readonly host: string;
   /** Its port; 0 for any. */
   readonly port: number;
+  /** The path of a Unix domain socket it listens on too, only root's, its directory made where it is not: none if not given. */
+  readonly socket?: string;
+  /** The file it keeps its tokens in, only root's, read back as it starts: none if not given. */
+  readonly tokensFile?: string;
   readonly preparedForMs?: number;
   readonly quietMs?: number;
+  readonly askedWindowMs?: number;
+  readonly resumedCeilingMs?: number;
+  readonly keptEveryMs?: number;
 }
 
 /** A restore's token, as the proxy holds it, and how its reads go. */
@@ -174,10 +225,13 @@ interface HeldToken {
   readonly secretAccessKey: string;
   readonly prefix: string;
   readonly holder: string;
+  readonly transport: Transport;
   /** When it ends, in milliseconds since the epoch. */
   until: number;
   /** Whether its restore's sandbox is resumed, reading the rest of its pages in the background. */
   resumed: boolean;
+  /** When it ends at the latest, however its restore keeps asking: its prepare's end, and once resumed, RESUMED_CEILING_MS from then. */
+  ceiling: number;
   /** How many of its requests are under way. */
   under: number;
   /** When its last request began or ended, or it was resumed. */
@@ -190,6 +244,45 @@ interface HeldToken {
   servedBytes: number;
   /** Whether it has been served every byte it was expected to, as the proxy logs once. */
   servedAll: boolean;
+}
+
+/** The tokens file's contents (tokensFile): each token, by its access key, and how long it lasts. */
+const TokensFile = Schema.fromJsonString(Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  tokens: Schema.Array(Schema.Struct({
+    accessKeyId: Schema.String,
+    secretAccessKey: Schema.String,
+    prefix: Schema.String,
+    holder: Schema.String,
+    transport: Schema.Literals(["socket", "tcp"]),
+    until: Schema.Number,
+    resumed: Schema.Boolean,
+    ceiling: Schema.Number,
+  })),
+}));
+
+/**
+ * The tokens `file` keeps, as an agent that starts again at `now` takes them back, none of
+ * their requests under way: each resumed and within its ceiling, lasting `askedWindowMs`
+ * from `now` at least, as its restore could not ask while the agent was away; and each other
+ * that has not ended. None where there is no file, or, with `why`, where it cannot be read.
+ */
+function tokensKept(file: string, now: number, askedWindowMs: number): { readonly tokens: ReadonlyMap<string, HeldToken>; readonly why?: string } {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { tokens: new Map() };
+    return { tokens: new Map(), why: error instanceof Error ? error.message : String(error) };
+  }
+  const decoded = Schema.decodeUnknownExit(TokensFile)(text);
+  if (decoded._tag === "Failure") return { tokens: new Map(), why: Cause.pretty(decoded.cause) };
+  return {
+    tokens: new Map(decoded.value.tokens.flatMap(({ accessKeyId, ...token }) => {
+      const until = token.resumed && now < token.ceiling ? Math.max(token.until, Math.min(token.ceiling, now + askedWindowMs)) : token.until;
+      return until > now ? [[accessKeyId, { ...token, until, under: 0, lastAt: now, expected: null, served: new Map(), servedBytes: 0, servedAll: false }] as const] : [];
+    })),
+  };
 }
 
 /** Whether `key` is a pages file of an image's, as a restore's background load reads them. */
@@ -224,12 +317,49 @@ export function withRange(ranges: readonly [number, number][], start: number, en
 /** How many bytes `ranges` hold. */
 const bytesOf = (ranges: readonly [number, number][]): number => ranges.reduce((sum, [a, b]) => sum + b - a, 0);
 
-/** The proxy of `store`, as the module says, listening on `host`:`port` for as long as the scope lasts. */
-export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, preparedForMs = PREPARED_FOR_MS, quietMs = QUIET_MS }: StoreProxyOptions): Effect.fn.Return<StoreProxy, StoreProxyError, Scope.Scope> {
+/** The proxy of `store`, as the module says, listening on `host`:`port`, and on `socket` if told, for as long as the scope lasts. */
+export const makeStoreProxy = Effect.fnUntraced(function*({
+  store,
+  host,
+  port,
+  socket,
+  tokensFile,
+  preparedForMs = PREPARED_FOR_MS,
+  quietMs = QUIET_MS,
+  askedWindowMs = ASKED_WINDOW_MS,
+  resumedCeilingMs = RESUMED_CEILING_MS,
+  keptEveryMs = KEPT_EVERY_MS,
+}: StoreProxyOptions): Effect.fn.Return<StoreProxy, StoreProxyError, Scope.Scope> {
   const tokens = new Map<string, HeldToken>();
   const runFork = yield* FiberSet.makeRuntime();
+  /** When the tokens file was last written. */
+  let keptAt = 0;
   let draining = false;
   const held = new Map<string, string>();
+  // What the agent's logger says, from the proxy's plain callbacks.
+  const runSync = Effect.runSyncWith(yield* Effect.context<never>());
+  if (tokensFile !== undefined) {
+    const kept = tokensKept(tokensFile, Date.now(), askedWindowMs);
+    if (kept.why !== undefined) runSync(Effect.logError(`the node agent cannot read back the tokens of the restores reading the snapshots bucket through it, ${tokensFile}: those restores are refused from now (${kept.why})`));
+    for (const [accessKeyId, token] of kept.tokens) {
+      tokens.set(accessKeyId, token);
+      held.set(token.holder, accessKeyId);
+    }
+    if (kept.tokens.size > 0) runSync(Effect.logInfo(`the node agent took back the tokens of ${kept.tokens.size} restores reading the snapshots bucket through it`));
+  }
+  /** Writes the tokens to tokensFile, if told one, whole or not at all: one not written is said, and changes nothing else. */
+  const keep = (): void => {
+    if (tokensFile === undefined) return;
+    keptAt = Date.now();
+    const written = JSON.stringify({ schemaVersion: 1, tokens: [...tokens].map(([accessKeyId, { secretAccessKey, prefix, holder, transport, until, resumed, ceiling }]) => ({ accessKeyId, secretAccessKey, prefix, holder, transport, until, resumed, ceiling })) });
+    try {
+      mkdirSync(dirname(tokensFile), { recursive: true, mode: 0o700 });
+      writeFileSync(`${tokensFile}.new`, written, { mode: 0o600 });
+      renameSync(`${tokensFile}.new`, tokensFile);
+    } catch (error) {
+      runSync(Effect.logWarning(`the node agent could not keep the tokens of its restores in ${tokensFile}, which an agent that starts again would read back: ${error instanceof Error ? error.message : String(error)}`));
+    }
+  };
   const upstream = new URL(store.endpoint);
   const upstreamSigner = new SignatureV4({
     credentials: { accessKeyId: store.accessKeyId, secretAccessKey: store.secretAccessKey },
@@ -239,10 +369,23 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
     uriEscapePath: false,
   });
 
+  /**
+   * `token`, resumed, asked of again: it lasts askedWindowMs from now, never past its
+   * ceiling; kept, if it was not within keptEveryMs.
+   */
+  const asked = (token: HeldToken): void => {
+    const now = Date.now();
+    const until = Math.min(token.ceiling, now + askedWindowMs);
+    if (until <= token.until) return;
+    token.until = until;
+    if (now - keptAt >= keptEveryMs) keep();
+  };
+
   /** Forgets the token `accessKeyId`, `token`, its holder's no more. */
   const forget = (accessKeyId: string, token: HeldToken): void => {
     tokens.delete(accessKeyId);
     if (held.get(token.holder) === accessKeyId) held.delete(token.holder);
+    keep();
   };
 
   /** Whether `request`, signed as its Authorization says, is signed by the token it names, as the official signer signs: the token's grant, or why not. */
@@ -355,6 +498,8 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
       if ("refused" in grant) return refuse(response, 403, "AccessDenied", grant.refused);
       const { token } = grant;
       if (!key.startsWith(token.prefix)) return refuse(response, 403, "AccessDenied", "the object is not one the restore reads");
+      // Its restore asking still, it lasts the longer, whatever the bucket answers.
+      if (token.resumed) asked(token);
       // Under way until its answer ends, however it ends; the bytes of a pages file it gave
       // counted as served then, from where the bucket said they begin, however much of it was
       // given, as its gofer asks again for the rest alone.
@@ -378,17 +523,38 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
     });
   };
 
-  const server: Server = yield* Effect.acquireRelease(
-    Effect.callback<Server, StoreProxyError>((resume) => {
-      const made = createServer(handle);
-      made.once("error", (error) => resume(Effect.fail(new StoreProxyError({ reason: `${host}:${port}: ${error.message}` }))));
-      made.listen(port, host, () => resume(Effect.succeed(made)));
-    }),
-    (made) => Effect.callback<void>((resume) => {
-      made.closeAllConnections();
-      made.close(() => resume(Effect.void));
-    }),
-  );
+  /** A server of the proxy's, listening where `listen` says, `where` in what it says of it, closed as the scope ends. */
+  const serving = (where: string, listen: (made: Server, listening: () => void) => void, closed: () => void = () => {}) =>
+    Effect.acquireRelease(
+      Effect.callback<Server, StoreProxyError>((resume) => {
+        const made = createServer(handle);
+        made.once("error", (error) => resume(Effect.fail(new StoreProxyError({ reason: `${where}: ${error.message}` }))));
+        listen(made, () => resume(Effect.succeed(made)));
+      }),
+      (made) => Effect.callback<void>((resume) => {
+        made.closeAllConnections();
+        made.close(() => {
+          closed();
+          resume(Effect.void);
+        });
+      }),
+    );
+  const server = yield* serving(`${host}:${port}`, (made, listening) => made.listen(port, host, listening));
+  if (socket !== undefined) {
+    yield* Effect.try({
+      // The socket an agent before left goes, as no other process listens there.
+      try: () => {
+        mkdirSync(dirname(socket), { recursive: true, mode: 0o700 });
+        rmSync(socket, { force: true });
+      },
+      catch: (error) => new StoreProxyError({ reason: `${socket}: ${error instanceof Error ? error.message : String(error)}` }),
+    });
+    yield* serving(socket, (made, listening) =>
+      made.listen(socket, () => {
+        chmodSync(socket, 0o600);
+        listening();
+      }), () => rmSync(socket, { force: true }));
+  }
   const address = server.address() as AddressInfo;
   const shown = address.family === "IPv6" ? `[${address.address}]` : address.address;
 
@@ -411,27 +577,29 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
     runFork(Effect.logInfo(`the restore of ${token.holder} has been served all ${token.expected} bytes of its pages through the node agent`));
   };
 
-  /** How many restores read through the proxy now, as the module says. */
+  /** How many restores over TCP read through the proxy now, as the module says. */
   const reading = (): number => {
     const now = Date.now();
     return [...tokens.values()].filter((token) =>
-      now < token.until && (!token.resumed || token.under > 0 || (token.expected === null ? now - token.lastAt < quietMs : token.servedBytes < token.expected))
+      token.transport === "tcp" && now < token.until && (!token.resumed || token.under > 0 || (token.expected === null ? now - token.lastAt < quietMs : token.servedBytes < token.expected))
     ).length;
   };
 
   return {
     endpoint: `http://${shown}:${address.port}`,
+    socket: socket ?? null,
     region: store.region,
     bucket: store.bucket,
-    mint: (holder, prefix) => {
+    mint: (holder, prefix, transport = "tcp") => {
       if (draining) return null;
       const before = held.get(holder);
       if (before !== undefined) tokens.delete(before);
       const accessKeyId = `ALASIO${randomBytes(10).toString("hex").toUpperCase()}`;
       const secretAccessKey = randomBytes(32).toString("base64url");
       const now = Date.now();
-      tokens.set(accessKeyId, { secretAccessKey, prefix, holder, until: now + preparedForMs, resumed: false, under: 0, lastAt: now, expected: null, served: new Map(), servedBytes: 0, servedAll: false });
+      tokens.set(accessKeyId, { secretAccessKey, prefix, holder, transport, until: now + preparedForMs, resumed: false, ceiling: now + preparedForMs, under: 0, lastAt: now, expected: null, served: new Map(), servedBytes: 0, servedAll: false });
       held.set(holder, accessKeyId);
+      keep();
       return { accessKeyId, secretAccessKey };
     },
     revoke: (holder) => {
@@ -439,14 +607,17 @@ export const makeStoreProxy = Effect.fnUntraced(function*({ store, host, port, p
       if (accessKeyId === undefined) return;
       tokens.delete(accessKeyId);
       held.delete(holder);
+      keep();
     },
     resumed: (holder, ms) => {
       const token = tokens.get(held.get(holder) ?? "");
       if (!token) return;
       const now = Date.now();
-      token.until = now + ms;
+      token.ceiling = now + resumedCeilingMs;
+      token.until = Math.min(token.ceiling, now + ms);
       token.resumed = true;
       token.lastAt = now;
+      keep();
     },
     expect: (accessKeyId, bytes) => {
       const token = tokens.get(accessKeyId);

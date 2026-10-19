@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
-import { Cause, ConfigProvider, Effect, Exit, Fiber, Layer, Option, Schedule, Scope } from "effect";
+import { Cause, ConfigProvider, Effect, Exit, Fiber, Layer, Option, Schedule, Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
@@ -53,6 +53,8 @@ import { NODE_PINS } from "../cli/src/cluster/node.ts";
 import { NODE_AGENT_PORT, restoresFromBucket, STORE_PROXY_PORT } from "../src/node-agent/names.ts";
 import { makeOperations } from "../src/node-agent/operations.ts";
 import { serveNodeAgent } from "../src/node-agent/server.ts";
+import type { Workspaces } from "../src/node-agent/workspaces.ts";
+import { workspacesNode } from "./support/node-workspaces.ts";
 import { makeNodeAgents } from "../src/sandbox/node-agents.ts";
 import { type FakeReleases, fakeReleases, POD_UID } from "./support/fake-runsc.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
@@ -195,6 +197,8 @@ interface NodeOptions {
   readonly releases?: readonly string[];
   readonly budget?: number;
   readonly runsc?: (runsc: Runsc, releases: FakeReleases) => Runsc;
+  /** Whether its agent's proxy listens on a socket too, as on a node. */
+  readonly socket?: boolean;
   /** How long its proxy takes a resumed restore told no bytes of pages to be done once its reads are quiet. */
   readonly quietMs?: number;
   /** How long its runsc may take to describe an image in the bucket. */
@@ -206,7 +210,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, quietMs, inspectTimeoutMs }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, inspectTimeoutMs }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -216,7 +220,10 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
       const [running] = installed;
       if (running !== undefined) for (const id of [CONTAINER, OTHER_CONTAINER]) releases.runs(id, running, SESSIONS, POD);
       const host = fakeHost();
-      const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, ...(quietMs === undefined ? {} : { quietMs }) }).pipe(Effect.orDie);
+      // Its socket in /tmp, short enough for a socket's path, whatever TMPDIR is.
+      const sockets = socket ? mkdtempSync(join("/tmp", "alasio-agent-")) : null;
+      if (sockets !== null) yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(sockets, { recursive: true, force: true })));
+      const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, ...(sockets === null ? {} : { socket: join(sockets, "store.sock") }), ...(quietMs === undefined ? {} : { quietMs }) }).pipe(Effect.orDie);
       const restarted = makeNodeAgent({ node: name, nodeRoot: "/", runsc, cache, bucket, storeProxy, host: host.host, restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince, backgroundReadMs: BACKGROUND_READ_MS, ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }) });
       return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted };
     });
@@ -318,6 +325,21 @@ test("a runtime's options file gives runsc its shim's flags", () => {
     ["--systemd-cgroup=true", "--restore-validate-files=all"],
   );
   assert.throws(() => runscFlags("[runsc_config]\n  debug = true\n"), /\[runsc_config\] holds what is not a string flag: debug = true/u);
+});
+
+test("a command is run in a container by its release's runsc's exec, its failure said", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-runsc-exec-"));
+  try {
+    const releases = fakeReleases(root, [RELEASE]);
+    const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot });
+    await Effect.runPromise(runsc.exec(RELEASE, "container-0", ["bayma", "sandbox-hook", "stop"], 10_000));
+    assert.deepEqual(releases.calls(RELEASE).at(-1)?.filter((arg) => !arg.startsWith("--")), ["exec", "container-0", "bayma", "sandbox-hook", "stop"]);
+    writeFileSync(join(releases.dirOf(RELEASE), "fail-exec"), "");
+    const failed = await Effect.runPromise(Effect.flip(runsc.exec(RELEASE, "container-0", ["bayma", "sandbox-hook", "stop"], 10_000)));
+    assert.match(failed.message, /the hook exited 1/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a checkpoint saves the sandbox with its release's runsc, uploads its image under its digest, checks the bucket holds it as put, then writes its manifest and commits it", () =>
@@ -1156,6 +1178,61 @@ test("a restore from the bucket reads its own images through the agent by a toke
     })
   ));
 
+test("a restore that asks for its checkpoint gofer through the agent's socket, reading again pages a read of failed, is given options that say so, its token one the agent's drain does not wait on; one that asks for none reads over TCP as before", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const here = yield* node("node-1");
+      const manifest = yield* here.agent.checkpoint(request("fs-abc"));
+      const [own] = manifest.layers;
+      assert.ok(own);
+      const there = yield* node("node-2", { socket: true });
+      const where = (options: Record<string, unknown>) => {
+        const { credentials: _, ...rest } = options;
+        return rest;
+      };
+      const through = yield* there.agent.prepare({ ...workspace, gofer: { transport: "socket", pagesRetry: true } });
+      assert.equal(through.source, "bucket");
+      assert.deepEqual(where(goferOptionsOf(through.imagePath).options), {
+        endpoint: "http://alasio-node-agent",
+        socket: there.storeProxy.socket,
+        region: "us-east-1",
+        bucket: "snapshots",
+        object_prefix: `main/fs-abc/layers/${own.digest}/`,
+        layers_prefix: "main/fs-abc/layers/",
+        addressing: "path",
+        pages_retry: "while-running",
+      });
+      // Through the socket, its restore waits for the agent that comes back: the drain does not wait on it.
+      assert.equal(there.storeProxy.reading(), 0);
+      // Over TCP, as a release before the first that restores through the socket asks, or none.
+      for (const gofer of [{ transport: "tcp", pagesRetry: false } as const, undefined]) {
+        const over = yield* there.agent.prepare({ ...workspace, ...(gofer === undefined ? {} : { gofer }) });
+        assert.deepEqual(where(goferOptionsOf(over.imagePath).options), {
+          endpoint: there.storeProxy.endpoint,
+          region: "us-east-1",
+          bucket: "snapshots",
+          object_prefix: `main/fs-abc/layers/${own.digest}/`,
+          layers_prefix: "main/fs-abc/layers/",
+          addressing: "path",
+        });
+        assert.equal(there.storeProxy.reading(), 1);
+      }
+      // Asked for the socket of an agent that serves none, it reads over TCP, said so.
+      const plain = yield* node("node-3");
+      const asked = yield* plain.agent.prepare({ ...workspace, gofer: { transport: "socket", pagesRetry: true } });
+      assert.deepEqual(where(goferOptionsOf(asked.imagePath).options), {
+        endpoint: plain.storeProxy.endpoint,
+        region: "us-east-1",
+        bucket: "snapshots",
+        object_prefix: `main/fs-abc/layers/${own.digest}/`,
+        layers_prefix: "main/fs-abc/layers/",
+        addressing: "path",
+        pages_retry: "while-running",
+      });
+    })
+  ));
+
 test("a restore from the bucket is told the bytes of pages its image holds, of every layer, as runsc says, and its agent's stop waits for them all, however quiet its reads; told none, or not in time, its quiet", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
@@ -1942,11 +2019,30 @@ test("commands run on the node enter its mounts and network from its PID 1, with
   }
 });
 
+/** Workspaces no test of snapshots reaches. */
+const unusedWorkspaces: Workspaces = {
+  create: () => Effect.die("no workspace is made"),
+  clone: () => Effect.die("no workspace is cloned"),
+  remove: () => Effect.die("no workspace is deleted"),
+  list: () => Effect.die("no workspace is listed"),
+  environments: Effect.die("no environment is listed"),
+  quota: () => Effect.die("no workspace's quota is read"),
+  attachments: Effect.die("no attachment is looked at"),
+  attach: () => Effect.die("no workspace is attached"),
+  detach: () => Effect.die("no workspace is detached"),
+  read: () => Effect.die("no workspace's file is read"),
+  write: () => Effect.die("no workspace's file is written"),
+  stop: () => Effect.die("no bayma is told to stop"),
+  sync: () => Effect.die("no sandbox is told to write its files through"),
+  released: () => Effect.die("no workspace's release is read"),
+  setReleased: () => Effect.die("no workspace's release is recorded"),
+};
+
 test("the agent's API takes alasio's token alone, and answers each route as it says", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
       const here = yield* node("node-1");
-      const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent });
+      const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent, workspaces: unusedWorkspaces });
       const call = (method: string, path: string, body?: unknown, token = "the token") =>
         Effect.promise(async () => {
           const response = await fetch(`http://127.0.0.1:${port}${path}`, {
@@ -1969,7 +2065,7 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
           Effect.repeat({ schedule: Schedule.spaced("20 millis"), while: ({ status, body }) => status === 200 && (body as { readonly state: string }).state === "running" }),
         );
       /** Starts the `operation` of `request`, which the agent answers it has, and how it ended. */
-      const run = (operation: string, request: { readonly environment: string; readonly workspace: string }) =>
+      const run = (operation: string, request: { readonly environment: string; readonly workspace: string; readonly [field: string]: unknown }) =>
         Effect.gen(function*() {
           assert.deepEqual(yield* call("POST", `/${operation === "checkpoints" ? "checkpoints" : "prepare"}`, request), { status: 202, body: { state: "running" } });
           return yield* ended(operation, request.workspace);
@@ -2018,6 +2114,10 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
         body: { state: "done", value: { manifest, imagePath: join(here.cacheDir, "main", "fs-abc", manifest.snapshot), source: "cache" } },
       });
       failed(404, "main/fs-none has no snapshot")(yield* run("prepare", { environment: "main", workspace: "fs-none" }));
+      // How its checkpoint gofer reads the bucket, as alasio asks it, or a bad request.
+      assert.equal((yield* run("prepare", { environment: "main", workspace: "fs-abc", gofer: { transport: "socket", pagesRetry: true } })).status, 200);
+      error(400, /transport/u)(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc", gofer: { transport: "udp", pagesRetry: true } }));
+      error(400, /pagesRetry/u)(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc", gofer: { transport: "socket" } }));
 
       const holdings = yield* call("GET", "/holdings");
       assert.equal(holdings.status, 200);
@@ -2096,16 +2196,16 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
   ));
 
 /** alasio's client of the agents, of which there is `agent`, of node-1, served until the scope closes. */
-const agentsOf = (agent: NodeAgent) =>
+const agentsOf = (agent: NodeAgent, workspaces: Workspaces = unusedWorkspaces) =>
   Effect.gen(function*() {
-    const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent });
+    const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent, workspaces });
     const pod: V1Pod = {
       metadata: { name: "node-agent-1", namespace: "alasio" },
       spec: { nodeName: "node-1", containers: [] },
       status: { podIP: "127.0.0.1", conditions: [{ type: "Ready", status: "True" }] },
     };
     const unreachable = () => Effect.die("only pods are listed");
-    const kube = KubeClient.of({ read: unreachable, list: () => Effect.succeed([pod]), create: unreachable, replace: unreachable, patch: unreachable, patchPodStatus: unreachable, remove: unreachable, exec: unreachable });
+    const kube = KubeClient.of({ read: unreachable, list: () => Effect.succeed([pod]), create: unreachable, replace: unreachable, patch: unreachable, patchPodStatus: unreachable, remove: unreachable, exec: unreachable, watch: () => Stream.die("nothing is watched") });
     return yield* makeNodeAgents({ namespace: "alasio", selector: "app.kubernetes.io/component=node-agent", port }).pipe(
       Effect.provide(Layer.merge(Layer.succeed(KubeClient, kube), ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ALASIO_NODE_AGENT_TOKEN: "the token" } })))),
     );
@@ -2331,7 +2431,10 @@ test("as the agent stops, an operation it runs is let end before what it runs in
 
 test("the agent runs as its own process from its environment, and stops when told", async () => {
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  // Its socket and tokens in /tmp, as the node's /run is not the test's to write.
+  const runDir = mkdtempSync(join("/tmp", "alasio-agent-"));
   const env = {
+    ALASIO_NODE_AGENT_RUN_DIR: runDir,
     PATH: process.env["PATH"],
     NODE_NAME: "node-1",
     POD_IP: "127.0.0.1",
@@ -2370,11 +2473,15 @@ test("the agent runs as its own process from its environment, and stops when tol
     const unsigned = await fetch(`http://127.0.0.1:${STORE_PROXY_PORT}/snapshots/main/fs-abc/current.json`);
     assert.equal(unsigned.status, 403);
     assert.match(await unsigned.text(), /<Code>AccessDenied<\/Code>/u);
+    // And on its socket, only root's.
+    assert.equal((statSync(join(runDir, "store.sock")).mode & 0o777).toString(8), "600");
     running.agent.kill("SIGTERM");
     assert.equal(await running.exited, 0);
     assert.match(running.output(), /\[node-agent\] the node agent of node-1 serves on port 8484, and the snapshots bucket to its node on 127\.0\.0\.1:8485, its cache within 5368709120 bytes/u);
+    assert.ok(!existsSync(join(runDir, "store.sock")));
   } finally {
     await s3.close();
+    rmSync(runDir, { recursive: true, force: true });
   }
 });
 
@@ -2436,5 +2543,98 @@ test("a checkpoint is taken under the release that runs the container, whatever 
       assert.match(failure(yield* Effect.exit(here.agent.checkpoint(request("fs-abc", OTHER_CONTAINER)))), /is not of the pod alasio-sessions\/fs-abc123, but of alasio-sessions\/fs-other/u);
       assert.match(failure(yield* Effect.exit(here.agent.resume(resumeRequest(RELEASED)))), /is not of the pod alasio-sessions\/fs-abc123/u);
       assert.match(failure(yield* Effect.exit(here.agent.checkpoint(request("fs-abc", "c".repeat(64))))), /container does not exist/u);
+    })
+  ));
+
+test("the agent's API attaches, detaches, reads and writes a workspace's files as its workspaces say, refusing as they refuse", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const at = workspacesNode();
+      yield* Effect.addFinalizer(() => Effect.sync(at.done));
+      at.files("fs-abc123");
+      at.pod("pool-0");
+      const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent, workspaces: at.workspaces });
+      const call = (method: string, path: string, body?: string) =>
+        Effect.promise(() => fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { authorization: "Bearer the token" }, ...(body === undefined ? {} : { body }) }));
+      const json = (value: unknown) => JSON.stringify(value);
+      assert.equal((yield* call("POST", "/attach", json({ environment: "main", workspace: "fs-abc123", pod: "pool-0", token: "binding", env: {} }))).status, 204);
+      assert.equal((yield* call("POST", "/attach", json({ environment: "main", workspace: "fs-abc123", pod: "pool-0", token: "binding", env: {} }))).status, 409);
+      assert.equal((yield* call("POST", "/attach", json({ environment: "main", workspace: "fs-abc123" }))).status, 400);
+      assert.equal((yield* call("PUT", "/files/main/fs-abc123?path=home/.alasio/received/1/note.txt", "hello")).status, 204);
+      const read = yield* call("GET", "/files/main/fs-abc123?path=home/.alasio/received/1/note.txt&max=100");
+      assert.deepEqual([read.status, yield* Effect.promise(() => read.text())], [200, "hello"]);
+      assert.equal((yield* call("GET", "/files/main/fs-abc123?path=home/.alasio/received/1/note.txt&max=2")).status, 413);
+      assert.equal((yield* call("GET", "/files/main/fs-abc123?path=../../etc/passwd")).status, 400);
+      at.running.add("container-0");
+      assert.equal((yield* call("POST", "/detach", json({ namespace: "main", pod: "pool-0", containerIds: ["container-0"] }))).status, 409);
+      at.running.delete("container-0");
+      assert.equal((yield* call("POST", "/detach", json({ namespace: "main", pod: "pool-0", containerIds: ["container-0"] }))).status, 204);
+      assert.deepEqual(at.mounts, []);
+    })
+  ));
+
+test("alasio attaches and detaches a workspace through the node's agent, and reads and writes its files through any, the bytes as they are", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const at = workspacesNode();
+      yield* Effect.addFinalizer(() => Effect.sync(at.done));
+      at.files("fs-abc123");
+      at.pod("pool-0");
+      const agents = yield* agentsOf(here.agent, at.workspaces);
+      const ref = { environment: "main", workspace: "fs-abc123" };
+      yield* agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding", env: {} });
+      const again = yield* Effect.flip(agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding", env: {} }));
+      assert.equal(again._tag === "NodeAgentError" && again.status, 409);
+      // What is attached on it, through its node's agent, reachable until its mount is not.
+      assert.deepEqual(yield* agents.attachments("node-1"), [{ namespace: "main", pod: "pool-0", reachable: true }]);
+      at.unreachable.add("main/pool-0");
+      assert.deepEqual(yield* agents.attachments("node-1"), [{ namespace: "main", pod: "pool-0", reachable: false }]);
+      at.unreachable.delete("pool-0");
+      const bytes = Uint8Array.from([0, 255, 10, 13, 128]);
+      yield* agents.writeFile(ref, "home/.alasio/received/1/blob", bytes);
+      assert.deepEqual(yield* agents.readFile(ref, "home/.alasio/received/1/blob", 100), bytes);
+      const tooLarge = yield* Effect.flip(agents.readFile(ref, "home/.alasio/received/1/blob", 2));
+      assert.equal(tooLarge._tag === "NodeAgentError" && tooLarge.status, 413);
+      at.running.add("container-0");
+      // Its bayma told to go on with its stop, through its node's agent; another pod's bayma not:
+      // a pool's pod of the sessions' namespace, its directory kubelet made.
+      at.pod("pool-0", "alasio-sessions");
+      at.annotations.set("container-0", { "io.kubernetes.cri.sandbox-namespace": "alasio-sessions", "io.kubernetes.cri.sandbox-name": "pool-0", "io.kubernetes.cri.container-name": "bayma" });
+      const hook = ["bayma", "sandbox-hook", "stop", "--state-dir", "/home/agent/.bayma"];
+      yield* agents.stop("node-1", { namespace: "alasio-sessions", pod: "pool-0", containerId: "container-0", hook });
+      assert.deepEqual(at.execs, [`r container-0 ${hook.join(" ")}`]);
+      const notItsPod = yield* Effect.flip(agents.stop("node-1", { namespace: "alasio-sessions", pod: "pool-1", containerId: "container-0", hook }));
+      assert.equal(notItsPod._tag === "NodeAgentError" && notItsPod.status, 403);
+      const running = yield* Effect.flip(agents.detach("node-1", "main", "pool-0", ["container-0"]));
+      assert.equal(running._tag === "NodeAgentError" && running.status, 409);
+      at.running.delete("container-0");
+      yield* agents.detach("node-1", "main", "pool-0", ["container-0"]);
+      assert.deepEqual(at.mounts, []);
+      // A workspace made through any agent, its quota read back; one that has none, none.
+      const made = { environment: "main", workspace: "fs-made" };
+      yield* agents.createWorkspace(made, 5 * 1024 ** 3);
+      assert.deepEqual(yield* agents.quota(made), { capacityBytes: 5 * 1024 ** 3, usedBytes: 12 * 1024 ** 2 });
+      const refusedMade = yield* Effect.flip(agents.createWorkspace({ environment: "main", workspace: "../etc" }, 1024));
+      assert.equal(refusedMade._tag === "NodeAgentError" && refusedMade.status, 400);
+      // Cloned, and deleted, through any agent.
+      const fork = { environment: "main", workspace: "fs-fork" };
+      yield* agents.cloneWorkspace(made, fork, 1024 ** 3);
+      assert.deepEqual((yield* agents.quota(fork))?.capacityBytes, 1024 ** 3);
+      assert.deepEqual(yield* agents.listWorkspaces("main"), ["fs-abc123", "fs-fork", "fs-made"]);
+      // The environments it holds workspaces of, through any agent.
+      assert.deepEqual(yield* agents.listEnvironments, ["main"]);
+      yield* agents.removeWorkspace(fork);
+      assert.equal(yield* agents.quota(fork), null);
+      // The snapshot one was released into, recorded and read back through any agent, and cleared.
+      const into = { snapshot: "20261017T120000000Z-0000000a", release: "20260921.0-eaucoin.8" };
+      assert.equal(yield* agents.released(made), null);
+      yield* agents.setReleased(made, into);
+      assert.deepEqual(yield* agents.released(made), into);
+      yield* agents.setReleased(made, null);
+      assert.equal(yield* agents.released(made), null);
+      const unrecorded = yield* Effect.flip(agents.setReleased(fork, into));
+      assert.equal(unrecorded._tag === "NodeAgentError" && unrecorded.status, 404);
     })
   ));

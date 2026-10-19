@@ -16,7 +16,7 @@ import { makeClaudeHarness } from "../src/harness/claude/index.ts";
 import type { ClaudeQueryFactory } from "../src/harness/claude/runtime.ts";
 import { SESSION_FS_CLAUDE_TOOLS } from "../src/harness/claude/sessionfs.ts";
 import { createClaudeSessionApi } from "../src/harness/claude/sessions.ts";
-import type { BaymaEndpoint } from "../src/kube/sandboxes.ts";
+import type { BaymaEndpoint } from "../src/sandbox/gateway-client.ts";
 import { noFolderBayma } from "../src/mcp/bayma.ts";
 import type { SessionSandboxes } from "../src/sandbox/index.ts";
 import { fakeQuery, initMessage, stamped, successResult } from "./support/claude-sdk.ts";
@@ -34,16 +34,15 @@ function fakeSandbox(): SessionSandboxes["Service"] & { readonly ensured: string
   const unused = () => assert.fail("a harness only finds a session's directory and starts its host");
   return {
     ensured,
-    volumes: { create: unused, fork: unused, destroy: unused, forks: Effect.sync(unused) },
+    volumes: { create: unused, fork: unused, destroy: unused, list: Effect.sync(unused) },
     harnessDirectory: (volumeId) => `/state/sessionfs/workspaces/${volumeId}`,
-    pod: (volumeId) => ({ namespace: "alasio-sessions", name: volumeId }),
     ensureSession: (volumeId) =>
       Effect.sync(() => {
         ensured.push(volumeId);
         return { bayma: BAYMA };
       }),
     readFile: unused,
-    holding: () => Effect.void,
+    writeFile: unused,
   };
 }
 

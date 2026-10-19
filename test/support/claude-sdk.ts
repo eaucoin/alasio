@@ -6,6 +6,8 @@ import assert from "node:assert/strict";
 import { randomUUID, type UUID } from "node:crypto";
 
 import type {
+  McpServerConfig,
+  McpSetServersResult,
   NonNullableUsage,
   SDKAssistantMessage,
   SDKBackgroundTasksChangedMessage,
@@ -159,14 +161,19 @@ export function backgroundTasksChanged(tasks: SDKBackgroundTasksChangedMessage["
 }
 
 /**
- * A query streaming `messages`, with the close and interrupt given. Without an interrupt
- * of its own it cannot interrupt a turn, and live-sessions.ts closes its process instead.
+ * A query streaming `messages`, with the close, interrupt and MCP servers' update given.
+ * Without an interrupt of its own it cannot interrupt a turn, and live-sessions.ts closes its
+ * process instead; without an update of its own it takes any, adding them all.
  */
 export function fakeQuery(
   messages: AsyncGenerator<SDKMessage, void>,
-  { close = () => undefined, interrupt = cannotInterrupt }: Partial<Pick<ClaudeQuery, "close" | "interrupt">> = {},
+  { close = () => undefined, interrupt = cannotInterrupt, setMcpServers = takeServers }: Partial<Pick<ClaudeQuery, "close" | "interrupt" | "setMcpServers">> = {},
 ): ClaudeQuery {
-  return Object.assign(messages, { close, interrupt });
+  return Object.assign(messages, { close, interrupt, setMcpServers });
+}
+
+async function takeServers(servers: Record<string, McpServerConfig>): Promise<McpSetServersResult> {
+  return { added: Object.keys(servers), removed: [], errors: {} };
 }
 
 async function cannotInterrupt(): Promise<undefined> {

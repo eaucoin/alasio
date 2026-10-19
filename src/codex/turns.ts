@@ -236,8 +236,6 @@ const makeTurns = Effect.fnUntraced(function*() {
       });
       const persistence = store.turnPersistence(conversationId, epoch);
       let responseCompleted: boolean | null = null;
-      // Its session is not released under it, however long it thinks between tool calls.
-      if (workspace?.kind === "sessionfs" && sandbox) yield* sandbox.holding(workspace.volumeId);
       const posted = yield* status.statusUpdates({ chatId, conversationId, epoch, harnessName: harness.displayName });
 
       /** Leaves the turn, as alasio stops, for after the restart. */

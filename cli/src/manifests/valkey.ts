@@ -5,15 +5,19 @@
  * practices (administration/metadata/redis_best_practices.md at juicedata/juicefs v1.4.1)
  * say, which suit both:
  *
- * - durability: snapshots and an append-only file together, the file fsynced every second
- *   and written with a snapshot as its preamble, so a rewrite is a snapshot; at a start the
- *   file is loaded, as the more complete, and the server is ready only once it has been;
+ * - durability: snapshots and an append-only file together, the file fsynced before each
+ *   write is answered (`appendfsync always`), as a client's fsync, JuiceFS's of a file
+ *   among them, is answered only once its metadata is written, and a server killed then
+ *   loses none of it, where once a second loses what it answered in the second before; and
+ *   written with a snapshot as its preamble, so a rewrite is a snapshot; at a start the file
+ *   is loaded, as the more complete, and the server is ready only once it has been;
  * - memory: a `maxmemory` under the container's limit, leaving room for the fork that
  *   writes snapshots and for deletions once it is reached, and the policy `noeviction`, as
  *   an evicted key is lost metadata.
  *
- * Its clients log in as its default user, with the password in a Secret of its name; or, of
- * one with users of its own, as each of those, with the password in a Secret of that
+ * Its clients log in as its default user, with the password in a Secret of its name, and,
+ * beside it, any user of its own as narrow as its rules say; or, of one with users of its own
+ * alone, as each of those, with the password in a Secret of that
  * user's, its default user turned off. The stack's setup makes each (./neon.ts). None is of
  * the data stack, whose pods reach each other: each one's NetworkPolicy
  * (./network-policies.ts) admits its own clients alone, and the collector.
@@ -58,6 +62,8 @@ export interface ValkeyInstance {
   readonly maxmemory: string;
   /** Its users, its default user turned off; none, its clients log in as its default user, with the password of the Secret of its name. */
   readonly users?: readonly ValkeyUser[];
+  /** Of one whose clients log in as its default user, its users beside it, each as narrow as its rules say. */
+  readonly besideDefault?: readonly ValkeyUser[];
 }
 
 /** The configuration file of a Valkey that may hold `maxmemory`. */
@@ -67,7 +73,7 @@ export function valkeyConf(maxmemory: string): string {
     `port ${VALKEY_PORT}`,
     "dir /data",
     "appendonly yes",
-    "appendfsync everysec",
+    "appendfsync always",
     "aof-use-rdb-preamble yes",
     "save 3600 1 300 100 60 10000",
     // Writes stop, rather than go unsaved, when a snapshot cannot be written.
@@ -94,10 +100,16 @@ const userVariable = (name: string) => `VALKEY_${name.toUpperCase().replaceAll("
  * default user's password; or its users, each with its password and rules, the default
  * user turned off, and the probe as the user that probes.
  */
-function access({ name, users = [] }: ValkeyInstance): { readonly args: string[]; readonly env: V1EnvVar[]; readonly cli: string } {
+function access({ name, users = [], besideDefault = [] }: ValkeyInstance): { readonly args: string[]; readonly env: V1EnvVar[]; readonly cli: string } {
+  const userArgs = (each: readonly ValkeyUser[]) => each.flatMap(({ name: user, rules }) => ["--user", user, "on", `>$(${userVariable(user)})`, ...rules]);
+  const userEnv = (each: readonly ValkeyUser[]) => each.map(({ name: user, secret }) => ({ name: userVariable(user), valueFrom: valkeyPassword(secret) }));
   if (users.length === 0) {
     const password = valkeyPassword(name);
-    return { args: ["--requirepass", "$(VALKEY_PASSWORD)"], env: [{ name: "VALKEY_PASSWORD", valueFrom: password }, { name: "VALKEYCLI_AUTH", valueFrom: password }], cli: "valkey-cli" };
+    return {
+      args: ["--requirepass", "$(VALKEY_PASSWORD)", ...userArgs(besideDefault)],
+      env: [{ name: "VALKEY_PASSWORD", valueFrom: password }, { name: "VALKEYCLI_AUTH", valueFrom: password }, ...userEnv(besideDefault)],
+      cli: "valkey-cli",
+    };
   }
   const probing = users.find(({ probes }) => probes) ?? users[0];
   return {
@@ -106,10 +118,10 @@ function access({ name, users = [] }: ValkeyInstance): { readonly args: string[]
       "--user",
       "default",
       "off",
-      ...users.flatMap(({ name: user, rules }) => ["--user", user, "on", `>$(${userVariable(user)})`, ...rules]),
+      ...userArgs(users),
     ],
     env: [
-      ...users.map(({ name: user, secret }) => ({ name: userVariable(user), valueFrom: valkeyPassword(secret) })),
+      ...userEnv(users),
       ...(probing ? [{ name: "VALKEYCLI_AUTH", valueFrom: valkeyPassword(probing.secret) }] : []),
     ],
   };

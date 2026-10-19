@@ -27,7 +27,6 @@ const MAX_BUFFER = 16 * 1024 * 1024;
  */
 export const REQUIRED = [
   "dist/cli/src/main.js",
-  "dist/cli/src/manifests/sandboxes.agents.x-k8s.io.json",
   "dist/cli/src/manifests/scaledobjects.keda.sh.json",
   "dist/cli/src/manifests/scaledjobs.keda.sh.json",
   "dist/cli/src/manifests/triggerauthentications.keda.sh.json",

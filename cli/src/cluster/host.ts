@@ -52,6 +52,7 @@ import {
   type Firewall,
   gvisorReleases,
   InstallGvisor,
+  InstallStargz,
   InstallK3s,
   NODE_PINS,
   type NodeConfig,
@@ -65,6 +66,7 @@ import {
   RemoveNode,
   RemoveStorage,
   SERVICE,
+  STARGZ_SERVICE,
   StartK3s,
   StopK3s,
 } from "./node.ts";
@@ -131,7 +133,7 @@ export class DownloadFailed extends Schema.TaggedError<DownloadFailed>()("Downlo
   }
 }
 
-/** The releases of k3s and gVisor a node is made of: those pinned, and how what they pin is downloaded. */
+/** The releases of k3s, gVisor and stargz-snapshotter a node is made of: those pinned, and how what they pin is downloaded. */
 export class NodeReleases extends Context.Service<NodeReleases, {
   readonly pins: NodePins;
   readonly fetch: (url: string) => Effect.Effect<Uint8Array, DownloadFailed>;
@@ -197,13 +199,14 @@ export function kubeconfigState(text: string | null, now: Date): KubeconfigState
 
 /**
  * What the node needs of root: the cluster's networks let in through the active firewall,
- * its files written, gVisor's releases installed and removed, k3s installed, restarted or
- * started, and its kubeconfig read, after renewing it.
+ * its files written, gVisor's releases installed and removed, stargz-snapshotter installed,
+ * k3s installed, restarted or started, and its kubeconfig read, after renewing it.
  */
 export interface NodePlan {
   readonly firewall: Firewall | null;
   readonly configure: boolean;
   readonly gvisor: { readonly install: readonly string[]; readonly remove: readonly string[] };
+  readonly stargz: boolean;
   readonly k3s: "install" | "restart" | "start" | null;
   readonly kubeconfig: boolean;
   readonly renew: boolean;
@@ -229,20 +232,30 @@ export function planNode(pins: NodePins, { stamp, config, unit, kubeconfig, fire
   const pinned = gvisorReleases(pins);
   const installed = stamp?.gvisor ?? [];
   const gvisor = { install: pinned.filter((release) => !installed.includes(release)), remove: installed.filter((release) => !kept.includes(release)) };
+  const stargz = stamp?.stargz !== pins.stargz.version;
   const k3s = stamp?.k3s !== pins.k3s.version || !unit.loaded
     ? "install"
-    : configure || gvisor.install.length > 0 || gvisor.remove.length > 0
+    : configure || gvisor.install.length > 0 || gvisor.remove.length > 0 || stargz
     ? "restart"
     : unit.active !== "active" || !unit.enabled
     ? "start"
     : null;
   const startsAnew = k3s === "install" || k3s === "restart";
-  return { firewall: firewall !== null && !opened ? firewall : null, configure, gvisor, k3s, kubeconfig: k3s !== null || kubeconfig !== "current", renew: kubeconfig === "expiring" && !startsAnew };
+  return {
+    firewall: firewall !== null && !opened ? firewall : null,
+    configure,
+    gvisor,
+    stargz,
+    k3s,
+    kubeconfig: k3s !== null || kubeconfig !== "current",
+    renew: kubeconfig === "expiring" && !startsAnew,
+  };
 }
 
-/** k3s's service, and what alasio installed, when anything. */
+/** k3s's service, stargz-snapshotter's daemon's, which k3s's starts, and what alasio installed, when anything. */
 export interface HostClusterStatus {
   readonly unit: UnitState;
+  readonly snapshotter: UnitState;
   readonly installed: NodeStamp | null;
 }
 
@@ -269,8 +282,8 @@ export class HostCluster extends Context.Service<HostCluster, {
   /** Stops k3s, as root, keeping everything; nothing when it is not installed. */
   readonly down: Effect.Effect<void, SystemdUnavailable | ForeignK3s | RootError | PlatformError.PlatformError>;
   /**
-   * Removes k3s and gVisor, as root, and the file the inotify limits are raised in; with
-   * `storage`, its storage directory too.
+   * Removes k3s, gVisor and stargz-snapshotter, as root, and the file the inotify limits
+   * are raised in; with `storage`, its storage directory too.
    */
   readonly remove: (options: { readonly storage: boolean }) => Effect.Effect<void, SystemdUnavailable | ForeignK3s | RootError | PlatformError.PlatformError>;
   /** k3s's service and what alasio installed, refusing a k3s alasio did not install. */
@@ -379,12 +392,13 @@ const makeHostCluster = Effect.fnUntraced(function*({
     const started = plan.k3s === null && !plan.renew ? 0 : Date.now();
     const outcome = yield* Effect.scoped(Effect.gen(function*() {
       // Downloaded as the operator, and read by root, which checks them again.
-      const directory = plan.gvisor.install.length > 0 || plan.k3s === "install" ? yield* fs.makeTempDirectoryScoped({ prefix: "alasio-node-" }) : "";
+      const directory = plan.gvisor.install.length > 0 || plan.stargz || plan.k3s === "install" ? yield* fs.makeTempDirectoryScoped({ prefix: "alasio-node-" }) : "";
       const from = downloads(pins);
       const installs = yield* Effect.forEach(
         [...from.gvisor].filter(([release]) => plan.gvisor.install.includes(release)),
         ([release, download]) => Effect.map(fetched(directory, `gvisor-${release}.tar.zstd`, download), (archive) => InstallGvisor.make({ release, archive })),
       );
+      const stargz = plan.stargz ? yield* fetched(directory, "stargz-snapshotter.tar.gz", from.stargz) : null;
       const binary = plan.k3s === "install" ? yield* fetched(directory, "k3s", from.k3s) : null;
       const script = plan.k3s === "install" ? yield* fetched(directory, "install.sh", from.installScript) : null;
       const steps: RootStep[] = [
@@ -393,6 +407,7 @@ const makeHostCluster = Effect.fnUntraced(function*({
         ...(plan.configure ? [ConfigureNode.make({ config })] : []),
         ...installs,
         ...plan.gvisor.remove.map((release) => RemoveGvisor.make({ release })),
+        ...(stargz ? [InstallStargz.make({ version: pins.stargz.version, ...(stamp?.stargz ? { previous: stamp.stargz } : {}), archive: stargz })] : []),
         ...(binary && script ? [InstallK3s.make({ version: pins.k3s.version, ...(stamp?.k3s ? { previous: stamp.k3s } : {}), role: config.role, binary, script })] : []),
         ...(plan.k3s === "restart" || plan.k3s === "start" ? [StartK3s.make({ restart: plan.k3s === "restart" })] : []),
         ...(plan.kubeconfig ? [ReadKubeconfig.make({ renew: plan.renew })] : []),
@@ -432,6 +447,6 @@ const makeHostCluster = Effect.fnUntraced(function*({
         ]);
       }),
 
-    status: Effect.map(installed, ({ unit, stamp }) => ({ unit, installed: stamp })),
+    status: Effect.map(Effect.all([installed, systemd.unit(STARGZ_SERVICE)]), ([{ unit, stamp }, snapshotter]) => ({ unit, snapshotter, installed: stamp })),
   });
 });

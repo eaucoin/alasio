@@ -1,15 +1,17 @@
 /**
- * The node agents (../node-agent/), as alasio calls them: each node's, found by its pod
- * there, as the profile's `snapshots.agents` select them, reached on its pod's address,
- * with the token alasio and they are given (ALASIO_NODE_AGENT_TOKEN).
+ * The node agents (../node-agent/), as the sandbox gateway calls them: each node's, found by
+ * its pod there, as the profile's `snapshots.agents` select them, reached on its pod's
+ * address, with the token the gateway and they are given (ALASIO_NODE_AGENT_TOKEN).
  */
 import type { V1Pod } from "@kubernetes/client-node";
 import { Config, Duration, Effect, Redacted, Schedule, Schema } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
+import type { Gofer } from "../node-agent/names.ts";
 import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, POLICY_WAIT_MS, type ResumeRequest, type WorkspaceRef } from "../node-agent/agent.ts";
 import { NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
+import { Released, type StopRequest, type SyncRequest } from "../node-agent/workspaces.ts";
 
 /** Where the node agents are: their pods' namespace and labels, and the port they serve on. */
 export interface NodeAgentsLocation {
@@ -45,8 +47,14 @@ export type Prepared = typeof Prepared.Type;
 /** What an agent answers a call that fails with. */
 const Refusal = Schema.Struct({ error: Schema.String });
 
+/** What an agent answers a look at what is attached on its node with. */
+const Attachments = Schema.Struct({ attachments: Schema.Array(Schema.Struct({ namespace: Schema.String, pod: Schema.String, reachable: Schema.Boolean })) });
+
+/** What an agent answers a workspace's quota with. */
+const Quota = Schema.Struct({ capacityBytes: Schema.Number, usedBytes: Schema.Number });
 /** What an agent answers a listing of an environment's snapshots, a collection, and a discard, with. */
 const Listed = Schema.Struct({ workspaces: Schema.Array(Schema.String) });
+const ListedEnvironments = Schema.Struct({ environments: Schema.Array(Schema.String) });
 const Collected = Schema.Struct({ kept: Schema.Array(Schema.String) });
 const Discarded = Schema.Struct({ discarded: Schema.Boolean });
 /** What an agent answers an abandon with: the processes of runsc's it killed. */
@@ -66,8 +74,11 @@ export interface NodeAgents {
   readonly nodes: Effect.Effect<readonly string[], KubeApiError>;
   /** Snapshots the sandbox of the container `request` names, on `node`, and commits it: its manifest. The sandbox ends. */
   readonly checkpoint: (node: string, request: CheckpointRequest) => Effect.Effect<Manifest, NodeAgentError | KubeApiError>;
-  /** The workspace's current snapshot, prepared on `node` for a restore there. */
-  readonly prepare: (node: string, workspace: WorkspaceRef) => Effect.Effect<Prepared, NodeAgentError | KubeApiError>;
+  /**
+   * The workspace's current snapshot, prepared on `node` for a restore there, its checkpoint
+   * gofer as `gofer` says, where it says; the agent's own way where not.
+   */
+  readonly prepare: (node: string, workspace: WorkspaceRef, gofer?: Gofer) => Effect.Effect<Prepared, NodeAgentError | KubeApiError>;
   /** The workspace's current snapshot, or null when it has none, as an agent reads it. */
   readonly current: (workspace: WorkspaceRef) => Effect.Effect<Manifest | null, NodeAgentError | KubeApiError>;
   /** Makes the current snapshot of `from` that of `to` too: `to`'s manifest. An agent refuses one of `from` without a snapshot with 404. */
@@ -100,6 +111,60 @@ export interface NodeAgents {
   readonly workspaces: (environment: string) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
   /** Has `node`'s cache discard the workspace's images but `keep`, unless a restore there may be reading them: whether it did. */
   readonly discard: (node: string, workspace: WorkspaceRef, keep: readonly string[]) => Effect.Effect<boolean, NodeAgentError | KubeApiError>;
+  /**
+   * Attaches the workspace's files into the directory of the sandbox pool pod `pod` on
+   * `node`, its binding's `token` and the variables `env` beside them. An agent refuses one
+   * whose directory holds a mount with 409.
+   */
+  readonly attach: (node: string, request: AttachRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /**
+   * Detaches what is attached into `pod`'s directory on `node`. An agent refuses while any of
+   * `containerIds`, the pod's sandbox's containers by their runtime's ids, runs, with 409.
+   */
+  readonly detach: (node: string, namespace: string, pod: string, containerIds: readonly string[]) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** The workspace's file at `path`, `workspace/...` or `home/...`, of `maxBytes` at most, as any agent reads it. */
+  readonly readFile: (workspace: WorkspaceRef, path: string, maxBytes: number) => Effect.Effect<Uint8Array, NodeAgentError | KubeApiError>;
+  /** Makes the workspace, its directory and its quota of `quotaBytes`, through any agent, each sees workspace storage as another; again, sets its quota anew. */
+  readonly createWorkspace: (workspace: WorkspaceRef, quotaBytes: number) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** Makes the workspace `to` a clone of `from`, of `quotaBytes`, through any agent. */
+  readonly cloneWorkspace: (from: WorkspaceRef, to: WorkspaceRef, quotaBytes: number) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** Deletes the workspace, its quota with it, through any agent; one not there is not an error. */
+  readonly removeWorkspace: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** The workspaces of `environment` there are, by their names, through any agent. */
+  readonly listWorkspaces: (environment: string) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
+  /** The environments any workspace is of, by their names, through any agent. */
+  readonly listEnvironments: Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
+  /**
+   * Has the bayma of the bound pod `request.pod`, on `node`, go on with the stop it holds,
+   * by its hook `request.hook` (`sandbox-hook stop`), which its node's agent runs in its
+   * container; an agent refuses one that is not the bayma of a pool's pod there with 403.
+   */
+  readonly stop: (node: string, request: StopRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /**
+   * Has the sandbox of the bound pod `request.pod`'s bayma, on `node`, write what it holds of
+   * its files through to the node's mount, by `sync`, which its node's agent runs in its
+   * container; refused as a stop is.
+   */
+  readonly sync: (node: string, request: SyncRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** The pods of `node` a workspace is attached into, each by whether what is attached is reachable still. */
+  readonly attachments: (node: string) => Effect.Effect<readonly { readonly namespace: string; readonly pod: string; readonly reachable: boolean }[], NodeAgentError | KubeApiError>;
+  /** The snapshot the workspace was last released into, as any agent reads its record of it; null where none is recorded. */
+  readonly released: (workspace: WorkspaceRef) => Effect.Effect<Released | null, NodeAgentError | KubeApiError>;
+  /** Records the snapshot the workspace is released into, or none, through any agent. */
+  readonly setReleased: (workspace: WorkspaceRef, released: Released | null) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** The workspace's quota, and what it holds, through any agent; null where it has none. */
+  readonly quota: (workspace: WorkspaceRef) => Effect.Effect<{ readonly capacityBytes: number; readonly usedBytes: number } | null, NodeAgentError | KubeApiError>;
+  /** Writes `bytes` as the workspace's file at `path`, as any agent writes it. */
+  readonly writeFile: (workspace: WorkspaceRef, path: string, bytes: Uint8Array) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+}
+
+/** What an attach is of: the workspace, the pool pod it goes into, and the binding's token and the variables its bayma runs with beside it. */
+export interface AttachRequest extends WorkspaceRef {
+  readonly pod: string;
+  readonly token: string;
+  readonly env: Readonly<Record<string, string>>;
+  /** Whether the pod's directory is made now, for a restore's pod made once its workspace is there, not one kubelet made. */
+  readonly made?: boolean;
 }
 
 /** How long a checkpoint, a prepare or a copy may take. */
@@ -110,12 +175,15 @@ const OPERATION_POLL: Duration.Input = "500 millis";
 const RESUME_CALL: Duration.Input = Duration.sum(Duration.millis(POLICY_WAIT_MS), Duration.seconds(30));
 /** How long any other call may take. */
 const SHORT_CALL: Duration.Input = "30 seconds";
+/** How long a sandbox's sync may take: what it writes through, which the agent waits a minute for. */
+const SYNC_CALL: Duration.Input = "90 seconds";
 
-/** A call of an agent: what, with what, for how long; with `absent`, a 404 is an answer, not a failure. */
+/** A call of an agent: what, with what (JSON, or bytes as they are), for how long; with `absent`, a 404 is an answer, not a failure. */
 interface AgentCall {
-  readonly method: "GET" | "POST" | "DELETE";
+  readonly method: "GET" | "POST" | "PUT" | "DELETE";
   readonly path: string;
   readonly body?: unknown;
+  readonly bytes?: Uint8Array;
   readonly timeout: Duration.Input;
   readonly absent?: true;
 }
@@ -141,25 +209,29 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     ),
   );
 
-  /** A call of the agent of `node`, `what` it is asked as a sentence ends: its answer's status and text, or why it failed. */
-  const send = (node: string, what: string, request: AgentCall): Effect.Effect<{ readonly status: number; readonly text: string }, NodeAgentError | KubeApiError> =>
+  /** A call of the agent of `node`, `what` it is asked as a sentence ends: its answer's status, bytes and text, or why it failed. */
+  const send = (node: string, what: string, request: AgentCall): Effect.Effect<{ readonly status: number; readonly bytes: Uint8Array; readonly text: string }, NodeAgentError | KubeApiError> =>
     Effect.gen(function*() {
       const failed = (reason: string, status?: number) => new NodeAgentError({ node, call: what, reason, ...(status === undefined ? {} : { status }) });
       const base = (yield* addresses).get(node);
       if (!base) return yield* failed("no agent is ready there");
-      const { status, ok, text } = yield* Effect.tryPromise({
+      const { status, ok, bytes } = yield* Effect.tryPromise({
         try: async (signal) => {
           const response = await fetch(`${base}${request.path}`, {
             method: request.method,
-            headers: { authorization: `Bearer ${Redacted.value(token)}`, ...(request.body === undefined ? {} : { "content-type": "application/json" }) },
-            ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
+            headers: {
+              authorization: `Bearer ${Redacted.value(token)}`,
+              ...(request.body !== undefined ? { "content-type": "application/json" } : request.bytes !== undefined ? { "content-type": "application/octet-stream" } : {}),
+            },
+            ...(request.body !== undefined ? { body: JSON.stringify(request.body) } : request.bytes !== undefined ? { body: request.bytes } : {}),
             signal: AbortSignal.any([signal, AbortSignal.timeout(Duration.toMillis(request.timeout))]),
           });
-          return { status: response.status, ok: response.ok, text: await response.text() };
+          return { status: response.status, ok: response.ok, bytes: new Uint8Array(await response.arrayBuffer()) };
         },
         catch: (cause) => failed(cause instanceof Error ? cause.message : String(cause)),
       });
-      if (ok || (status === 404 && request.absent)) return { status, text };
+      const text = new TextDecoder().decode(bytes);
+      if (ok || (status === 404 && request.absent)) return { status, bytes, text };
       const refusal = Schema.decodeUnknownOption(Schema.fromJsonString(Refusal))(text);
       return yield* failed(refusal._tag === "Some" ? refusal.value.error : `it answered ${status}`, status);
     });
@@ -179,7 +251,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
    * prepare) of the workspace `request` names, which it runs whatever becomes of this
    * call: started, then asked how it stands until it has ended, within LONG_CALL.
    */
-  const operate = <A, I>(node: string, what: string, path: string, request: WorkspaceRef, value: Schema.Codec<A, I>): Effect.Effect<A, NodeAgentError | KubeApiError> =>
+  const operate = <A, I>(node: string, what: string, path: string, request: WorkspaceRef & { readonly gofer?: Gofer }, value: Schema.Codec<A, I>): Effect.Effect<A, NodeAgentError | KubeApiError> =>
     Effect.gen(function*() {
       yield* send(node, what, { method: "POST", path, body: request, timeout: SHORT_CALL });
       const standing = { method: "GET", path: `${path}/${encodeURIComponent(request.environment)}/${encodeURIComponent(request.workspace)}`, timeout: SHORT_CALL } as const;
@@ -199,10 +271,73 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     return first === undefined ? Effect.fail(new NodeAgentError({ node: "any node", call: "be reached", reason: "no agent is ready" })) : Effect.succeed(first);
   });
 
+  /** The path of a workspace's file. */
+  const releasedPath = ({ environment, workspace }: WorkspaceRef) => `/workspaces/${encodeURIComponent(environment)}/${encodeURIComponent(workspace)}/released`;
+  const filePath = ({ environment, workspace }: WorkspaceRef, path: string) => `/files/${encodeURIComponent(environment)}/${encodeURIComponent(workspace)}?path=${encodeURIComponent(path)}`;
+
   return {
     nodes: Effect.map(addresses, (known) => [...known.keys()]),
+    attach: (node, request) => send(node, `attach ${request.environment}/${request.workspace} into ${request.pod}`, { method: "POST", path: "/attach", body: request, timeout: SHORT_CALL }).pipe(Effect.asVoid),
+    detach: (node, namespace, pod, containerIds) => send(node, `detach what is attached into ${namespace}/${pod}`, { method: "POST", path: "/detach", body: { namespace, pod, containerIds }, timeout: SHORT_CALL }).pipe(Effect.asVoid),
+    readFile: (workspace, path, maxBytes) =>
+      Effect.flatMap(anyNode, (node) => send(node, `read ${path} of ${workspace.environment}/${workspace.workspace}`, { method: "GET", path: `${filePath(workspace, path)}&max=${maxBytes}`, timeout: SHORT_CALL })).pipe(
+        Effect.map(({ bytes }) => bytes),
+      ),
+    createWorkspace: (workspace, quotaBytes) =>
+      Effect.flatMap(anyNode, (node) => send(node, `make ${workspace.environment}/${workspace.workspace}`, { method: "POST", path: "/workspaces", body: { ...workspace, quotaBytes }, timeout: SHORT_CALL })).pipe(Effect.asVoid),
+    cloneWorkspace: (from, to, quotaBytes) =>
+      Effect.flatMap(anyNode, (node) =>
+        send(node, `clone ${from.environment}/${from.workspace} into ${to.environment}/${to.workspace}`, { method: "POST", path: "/workspaces/clones", body: { from, to, quotaBytes }, timeout: LONG_CALL })).pipe(Effect.asVoid),
+    listWorkspaces: (environment) =>
+      Effect.flatMap(anyNode, (node) =>
+        ask(node, `list ${environment}'s workspaces`, { method: "GET", path: `/workspaces/${encodeURIComponent(environment)}`, timeout: SHORT_CALL }, Listed)).pipe(
+          Effect.map(({ workspaces }) => workspaces),
+        ),
+    listEnvironments: Effect.flatMap(anyNode, (node) =>
+      ask(node, "list the environments of workspaces", { method: "GET", path: "/workspaces", timeout: SHORT_CALL }, ListedEnvironments)).pipe(
+        Effect.map(({ environments }) => environments),
+      ),
+    removeWorkspace: (workspace) =>
+      Effect.flatMap(anyNode, (node) =>
+        send(node, `delete ${workspace.environment}/${workspace.workspace}`, { method: "DELETE", path: `/workspaces/${encodeURIComponent(workspace.environment)}/${encodeURIComponent(workspace.workspace)}`, timeout: SHORT_CALL })).pipe(Effect.asVoid),
+    attachments: (node) =>
+      ask(node, "say what is attached on it", { method: "GET", path: "/attachments", timeout: SHORT_CALL }, Attachments).pipe(Effect.map(({ attachments }) => attachments)),
+    stop: (node, request) => send(node, `tell ${request.namespace}/${request.pod}'s bayma to go on with its stop`, { method: "POST", path: "/stop", body: request, timeout: SHORT_CALL }).pipe(Effect.asVoid),
+    sync: (node, request) =>
+      send(node, `have ${request.namespace}/${request.pod}'s sandbox write its files through`, { method: "POST", path: "/sync", body: request, timeout: SYNC_CALL }).pipe(Effect.asVoid),
+    released: (workspace) =>
+      Effect.gen(function*() {
+        const node = yield* anyNode;
+        const what = `read ${workspace.environment}/${workspace.workspace}'s release`;
+        const { status, text } = yield* send(node, what, { method: "GET", path: releasedPath(workspace), timeout: SHORT_CALL, absent: true });
+        if (status === 404) return null;
+        return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Released))(text).pipe(
+          Effect.mapError((error) => new NodeAgentError({ node, call: what, reason: `its answer is not one: ${error.message}` })),
+        );
+      }),
+    setReleased: (workspace, released) =>
+      Effect.flatMap(anyNode, (node) =>
+        send(node, `record ${workspace.environment}/${workspace.workspace}'s release into ${released?.snapshot ?? "none"}`, {
+          method: released === null ? "DELETE" : "PUT",
+          path: releasedPath(workspace),
+          ...(released === null ? {} : { body: released }),
+          timeout: SHORT_CALL,
+        })).pipe(Effect.asVoid),
+    quota: (workspace) =>
+      Effect.gen(function*() {
+        const node = yield* anyNode;
+        const what = `read ${workspace.environment}/${workspace.workspace}'s quota`;
+        const path = `/workspaces/${encodeURIComponent(workspace.environment)}/${encodeURIComponent(workspace.workspace)}/quota`;
+        const { status, text } = yield* send(node, what, { method: "GET", path, timeout: SHORT_CALL, absent: true });
+        if (status === 404) return null;
+        return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Quota))(text).pipe(
+          Effect.mapError((error) => new NodeAgentError({ node, call: what, reason: `its answer is not one: ${error.message}` })),
+        );
+      }),
+    writeFile: (workspace, path, bytes) =>
+      Effect.flatMap(anyNode, (node) => send(node, `write ${path} of ${workspace.environment}/${workspace.workspace}`, { method: "PUT", path: filePath(workspace, path), bytes, timeout: SHORT_CALL })).pipe(Effect.asVoid),
     checkpoint: (node, request) => operate(node, `snapshot ${request.environment}/${request.workspace}`, "/checkpoints", request, Manifest),
-    prepare: (node, workspace) => operate(node, `prepare ${workspace.environment}/${workspace.workspace}'s snapshot`, "/prepare", workspace, Prepared),
+    prepare: (node, workspace, gofer) => operate(node, `prepare ${workspace.environment}/${workspace.workspace}'s snapshot`, "/prepare", gofer ? { ...workspace, gofer } : workspace, Prepared),
     current: (workspace) =>
       Effect.gen(function*() {
         const node = yield* anyNode;

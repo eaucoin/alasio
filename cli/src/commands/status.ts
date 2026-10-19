@@ -7,29 +7,32 @@ import { DockerCluster } from "../cluster/docker.ts";
 import { HostCluster } from "../cluster/host.ts";
 import { readySince } from "../cluster/k3s.ts";
 import { describeShortfall, InotifyLimitsTooLow, inotifyShortfalls, requireLocalMachine } from "../cluster/machine.ts";
-import { gvisorReleases, NODE_PINS, SERVICE } from "../cluster/node.ts";
+import { gvisorReleases, NODE_PINS, SERVICE, STARGZ_SERVICE } from "../cluster/node.ts";
 import { loadConfig } from "../config.ts";
 import { describeBaseline, recordedBaseline, standingOf, surveyCpu } from "../cpu-baseline.ts";
 import { clusterReleases, describeKept, snapshotReleases } from "../kept-releases.ts";
 import { describeMemory, describeScale, describeSizing, memoryBytes, memoryText, type ScaledWorkload } from "../capacity.ts";
 import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
-import { diagnose, readiness, selectorOf, starting } from "../kube/rollout.ts";
+import { diagnose, READY_ONCE_BOUND_ANNOTATION, readinessOf, selectorOf, starting } from "../kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE } from "../manifests/common.ts";
 import { LOADER_COMPONENT } from "../manifests/lake.ts";
 import { REPLICA_NAME } from "../manifests/neon.ts";
 import { MASTER, METRICS_PORT, VOLUME_SERVER } from "../manifests/object-store.ts";
+import { GATEWAY_COMPONENT, GATEWAY_PORT } from "../manifests/sandbox-gateway.ts";
 import type { ScaledObject } from "../manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../manifests/sizing.ts";
 import { describeReplication, describeVolumeServer, volumeServerDisk } from "../object-store.ts";
 import { type ComputeTimes, computeTimes, type TenantView, tenantView } from "../branches.ts";
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
 import { branchNamespaces } from "../branches.ts";
+import { describeFolders, folderInstances } from "../folders.ts";
 import { installConfig } from "../install.ts";
 import { readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "../secrets.ts";
 import { describeBots, type EnvironmentBot } from "../webhook.ts";
 import { branchNamespace } from "../../../src/branch/names.ts";
-import { notRunning, runIn } from "./common.ts";
+import { ALASIO_GATEWAY_FOLDERS_VARIABLE } from "../../../src/gateway/names.ts";
+import { notRunning, runIn, runningPodIn } from "./common.ts";
 
 /** Some of alasio's workloads do not run as they should. */
 export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", {
@@ -144,6 +147,44 @@ const objectStore = (workloads: readonly KubernetesObject[]): Effect.Effect<stri
     return [describeReplication(replication), ...disks.map((line) => `  ${line}`)];
   });
 
+/** Whether `workload` is a sandbox pool's, ready once its pods run, each ready only once bound. */
+const isPool = (workload: KubernetesObject): boolean => workload.metadata?.annotations?.[READY_ONCE_BOUND_ANNOTATION] === "true";
+
+/** A pool's counts, as the sandbox gateway says them (src/binder/server.ts `/counts`). */
+const PoolCounts = Schema.fromJsonString(Schema.Struct({ free: Schema.Number, bound: Schema.Number, waiting: Schema.Number }));
+
+/**
+ * What each sandbox pool of `workloads` holds, as the gateway counts it, asked in its pod: its
+ * free pods running (warm), its bindings, and the binds waiting for a free pod in every replica
+ * of the gateway; by the pool's `namespace/name`, or why it is not seen, the same for every pool.
+ */
+type Counted = { readonly counted: string } | { readonly unseen: string };
+const poolCounts = (workloads: readonly KubernetesObject[]): Effect.Effect<ReadonlyMap<string, Counted>, KubeApiError, KubeApi> =>
+  Effect.gen(function*() {
+    const pools = workloads.filter(isPool);
+    if (pools.length === 0) return new Map();
+    const unseen = (why: string) => new Map<string, Counted>(pools.map(({ metadata }) => [`${metadata?.namespace}/${metadata?.name}`, { unseen: why }]));
+    const gateway = yield* runningPodIn(NAMESPACE, GATEWAY_COMPONENT).pipe(Effect.option);
+    if (Option.isNone(gateway)) return unseen("the sandbox gateway does not run");
+    const said = yield* Effect.forEach(pools, ({ metadata }) => {
+      const pool = `${metadata?.namespace}/${metadata?.name}`;
+      return runIn({ namespace: NAMESPACE, pod: gateway.value, container: GATEWAY_COMPONENT }, ["curl", "-sS", "--max-time", "5", `http://127.0.0.1:${GATEWAY_PORT}/counts/${pool}`]).pipe(
+        Effect.map(({ exitCode, stdout, stderr }) => {
+          const counted = exitCode === 0 ? Schema.decodeUnknownOption(PoolCounts)(stdout) : Option.none();
+          return [pool, Option.match(counted, {
+            onNone: (): Counted => ({ unseen: `the sandbox gateway did not count them: ${(stderr || stdout).trim() || `exit ${exitCode}`}` }),
+            onSome: ({ free, bound, waiting }): Counted => ({ counted: `${free} warm, ${bound} bound, ${waiting} waiting` }),
+          })] as const;
+        }),
+      );
+    }).pipe(
+      Effect.map((each) => new Map<string, Counted>(each)),
+      Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(403)(error), () => Effect.succeed(unseen("this kubeconfig may not run commands in the sandbox gateway's pods"))),
+      Effect.catch((error) => Effect.succeed(unseen(`asking the sandbox gateway failed: ${error.message}`))),
+    );
+    return said;
+  });
+
 /**
  * A compute that is ready, a primary or a read replica: asleep at no replica, as
  * neon-control puts one no client has used for a while, until the next connection wakes
@@ -194,7 +235,13 @@ function unwakeable(scaler: ScaledObject | undefined): string | null {
  * The loader asleep is ready only while its ScaledObject would wake it (unwakeable): what
  * it says, and whether it is ready.
  */
-function describeReady(workload: ScaledWorkload, computes: ReadonlyMap<string, ComputeTimes>, scaler: ScaledObject | undefined): { said: string; ready: boolean } {
+function describeReady(workload: ScaledWorkload, computes: ReadonlyMap<string, ComputeTimes>, scaler: ScaledObject | undefined, pools: ReadonlyMap<string, Counted>): { said: string; ready: boolean } {
+  // A sandbox pool's, ready as its pods run, each ready only once bound: what it holds, as the gateway counts it.
+  if (isPool(workload)) {
+    const counted = pools.get(`${workload.metadata?.namespace}/${workload.metadata?.name}`);
+    const replicas = `${workload.spec?.replicas ?? 1} warm`;
+    return { said: `pool, ${counted && "counted" in counted ? counted.counted : `${replicas}${counted ? `, its bindings not seen, as ${counted.unseen}` : ""}`}`, ready: true };
+  }
   switch (workload.metadata?.name) {
     case neonName("compute"):
     case REPLICA_NAME:
@@ -283,15 +330,20 @@ export const status = Command.make("status", {}, () =>
     if (target._tag === "Docker") {
       const { docker, nodes } = yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.status), dockerCluster(target.cluster));
       yield* Console.log(`cluster ${target.cluster.name}, in Docker ${docker}:`);
-      yield* Console.log(nodes.length > 0 ? nodes.map(({ name, state }) => `  ${name}: ${state}`).join("\n") : "  not made");
+      yield* Console.log(nodes.length > 0 ? nodes.map(({ name, state, snapshotter }) =>
+        `  ${name}: ${state}${snapshotter === null ? "" : `\n    stargz-snapshotter's daemon, which k3s pulls images through: ${snapshotter ? "running" : "not running"}`}`
+      ).join("\n") : "  not made");
       yield* sayShortfalls;
       const server = nodes.find(({ role }) => role === "server");
       if (server?.state !== "running") return yield* notRunning(target, server !== undefined);
     }
     if (target._tag === "Host") {
-      const { unit, installed } = yield* Effect.provide(Effect.flatMap(HostCluster, (cluster) => cluster.status), HostCluster.layer(target.cluster));
-      yield* Console.log(`k3s${installed?.k3s ? ` ${installed.k3s}` : ""} on this machine${installed?.gvisor?.length ? `, with gVisor ${installed.gvisor.join(" and ")}` : ""}:`);
+      const { unit, snapshotter, installed } = yield* Effect.provide(Effect.flatMap(HostCluster, (cluster) => cluster.status), HostCluster.layer(target.cluster));
+      const beside = [...(installed?.gvisor?.length ? [`gVisor ${installed.gvisor.join(" and ")}`] : []), ...(installed?.stargz ? [`stargz-snapshotter ${installed.stargz}`] : [])];
+      yield* Console.log(`k3s${installed?.k3s ? ` ${installed.k3s}` : ""} on this machine${beside.length > 0 ? `, with ${beside.join(", ")}` : ""}:`);
       yield* Console.log(unit.loaded ? `  service ${SERVICE}: ${unit.active}, ${unit.enabled ? "enabled" : "disabled"}` : "  not installed");
+      // Started by k3s's service, and stopped with it: whether it runs, not whether it is enabled.
+      if (snapshotter.loaded) yield* Console.log(`  service ${STARGZ_SERVICE}, which k3s pulls images through: ${snapshotter.active}`);
       if (unit.active === "active") {
         const nodes = yield* Effect.provide(Effect.flatMap(KubeApi, (kube) => kube.list<V1Node>(kind("Node"))), kubeApi(target));
         for (const node of nodes) yield* Console.log(`  node ${node.metadata?.name}: ${readySince(node, 0) ? "ready" : "not ready"}`);
@@ -309,15 +361,16 @@ export const status = Command.make("status", {}, () =>
         const sizings = (yield* installedOf<VerticalPodAutoscaler>(kind("VerticalPodAutoscaler"))).objects;
         yield* Console.log(`alasio${version ? ` ${version}` : ""}, in ${describeTarget(target)} (${kube.server}):`);
         const computes = yield* computeTimes;
+        const pools = yield* poolCounts(workloads);
         let notReady = 0;
         for (const workload of workloads as readonly ScaledWorkload[]) {
-          const state = readiness(workload);
+          const state = yield* readinessOf(workload);
           // A DaemonSet runs a pod on every node it schedules to, of no scale of its own.
           const scaler = of(scaledObjects, workload, ({ spec }) => spec.scaleTargetRef.name);
           const scale = workload.kind === "DaemonSet" ? "" : `${describeScale(workload, scaler)}; `;
           const sizing = `    ${scale}${describeSizing(workload, of(sizings, workload, ({ spec }) => spec.targetRef.name))}`;
           if (state._tag === "Ready") {
-            const { said, ready } = describeReady(workload, computes, scaler);
+            const { said, ready } = describeReady(workload, computes, scaler, pools);
             if (!ready) notReady += 1;
             yield* Console.log(`  ${describeRef(refOf(workload))}: ${said}`);
             yield* Console.log(sizing);
@@ -345,6 +398,11 @@ export const status = Command.make("status", {}, () =>
           const releases = describeKept(yield* clusterReleases(gvisorReleases(NODE_PINS)), yield* snapshotReleases);
           for (const line of releases) yield* Console.log(`  ${line}`);
         }
+        // Where the sandbox gateway serves folder instances, as alasio is told it does: each, and its binds' last failure.
+        const alasio = workloads.find((object) => object.kind === "Deployment" && object.metadata?.name === RELEASE) as V1Deployment | undefined;
+        if (alasio?.spec?.template.spec?.containers.some(({ env }) => env?.some(({ name, value }) => name === ALASIO_GATEWAY_FOLDERS_VARIABLE && value === "1"))) {
+          for (const line of describeFolders(yield* folderInstances, Date.now())) yield* Console.log(`  ${line}`);
+        }
         const tenant = yield* tenantView;
         if (tenant) for (const line of describeTenant(tenant)) yield* Console.log(line);
         if (listed.some(({ whole }) => !whole)) {
@@ -371,13 +429,21 @@ export const status = Command.make("status", {}, () =>
   })).pipe(
     Command.withShortDescription("Say what runs, and whether it is healthy"),
     Command.withDescription(
-      "Says where alasio runs (and, for the cluster on this machine, k3s's service and node, or its nodes in Docker, and this " +
+      "Says where alasio runs (and, for the cluster on this machine, k3s's service and node, with the stargz-snapshotter release " +
+        "k3s pulls images through and whether its daemon's service runs, as no image is pulled while it does not; or its nodes in Docker, " +
+        "each with whether that daemon runs in it; and this " +
         "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready (a compute awake, or " +
         "asleep, as one no client has used for a while is until the next connection wakes it, and when it was last woken; the lake's loader " +
-        "awake, or asleep with nothing left to load until alasio writes again), waking (a compute or the loader whose pod starts, within " +
+        "awake, or asleep with nothing left to load until alasio writes again; a sandbox pool with its warm pods, its bindings and the binds " +
+        "waiting for a pod, as the sandbox gateway counts them; a bound pod is its pool's no more, so a node that holds one is drained only by " +
+        "`kubectl drain --force`, which refuses it at once without --force, and whose eviction of it the bound pods' disruption budget refuses " +
+        "while it is bound: the drain waits until the gateway releases the session, idle, into its snapshot, which its next bind restores on " +
+        "another node; a lock a workspace's file held on a node that died, through that node's mount, holds for up to about seven minutes, " +
+        "until workspace storage cleans the sessions of its clients that died), waking (a compute or the loader whose pod starts, within " +
         "its Deployment's progress deadline), or what it is at and " +
         "why; its replicas, and its scale where KEDA moves it; and its pods' requests, beside " +
-        "what VPA recommends once it has measured them; where sessions are snapshotted, the CPU baseline they are held to, and the nodes that lack it, and the gVisor releases kept, with the snapshots naming each. Of the bundled object store, the copies it keeps of each object, and of each " +
+        "what VPA recommends once it has measured them; where sessions are snapshotted, the CPU baseline they are held to, and the nodes that lack it, and the gVisor releases kept, with the snapshots naming each; where the sandbox gateway serves folder conversations' instances, each, " +
+        "bound or released, its pod, how long it has been bound, its bayma's last exec, and its binds' last failure, and whether three in a row hold it until asked. Of the bundled object store, the copies it keeps of each object, and of each " +
         "volume server, as its metrics say: what it may still fill of its disk before it takes no more writes, what it keeps " +
         "free (minFreeSpace), its volumes, and what they take, deleted and not yet compacted away. Then the memory the cluster's pods request and use, of what its nodes have " +
         "for pods, and whether a metrics server measures them, which VPA and what scales on CPU need; of these, what the kubeconfig's " +

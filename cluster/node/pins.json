@@ -10,6 +10,7 @@
   },
   "gvisor": {
     "restoresFromBucketSince": "20260921.0-eaucoin.7",
+    "restoresThroughSocketSince": "20260921.0-eaucoin.9",
     "releases": [
       {
         "release": "20260921.0-eaucoin.11",
@@ -20,5 +21,9 @@
         "sha512": "5091e17365e49328af3f6fd79211ac645699db8cb4f39d940a2d140980dc6f9b11f1ff89944e1723c06a759617b8083d2de8d16ce848945a7f300ef8724db48b"
       }
     ]
+  },
+  "stargz": {
+    "version": "v0.19.0",
+    "sha256": "696487c151b275bfc7818dcaba4eaadd40b8c4a8f87a60af919d8967f2e31ea1"
   }
 }

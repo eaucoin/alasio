@@ -50,15 +50,19 @@ export type MainEnvironmentPrincipal = (typeof MAIN_ENVIRONMENT_PRINCIPALS)[numb
  * The log's principals besides its admin, each with a password of its own: the collector's
  * gateway, which writes the stack's telemetry to it; the lake's intake, which reads that;
  * KEDA, which reads how much the intake has yet to; the webhook intake, which writes each
- * environment's Telegram updates to it; and main's environment's (MAIN_ENVIRONMENT_PRINCIPALS).
+ * environment's Telegram updates to it; the sandbox gateway, which writes each environment's
+ * events; and main's environment's (MAIN_ENVIRONMENT_PRINCIPALS).
  */
-export const LOG_PRINCIPALS = ["gateway", "intake", "scaler", "webhook", ...MAIN_ENVIRONMENT_PRINCIPALS] as const;
+export const LOG_PRINCIPALS = ["gateway", "intake", "scaler", "webhook", "sandbox-gateway", ...MAIN_ENVIRONMENT_PRINCIPALS] as const;
 export type LogPrincipal = (typeof LOG_PRINCIPALS)[number];
 
 export interface S3Credentials {
   accessKey: string;
   secretKey: string;
 }
+
+/** The Valkey user of workspace storage's metadata the node agents set quotas as (cli/src/manifests/workspace-storage.ts). */
+export const WORKSPACE_QUOTAS_USER = "quotas";
 
 /** The stack's secrets, as the root Secret's secrets.json keeps them. */
 export interface StackSecrets {
@@ -69,8 +73,9 @@ export interface StackSecrets {
   alasioPassword: string;
   lakePassword: string;
   computeControlToken: string;
-  /** Workspace storage's Valkey's. */
+  /** Workspace storage's Valkey's, and its user the node agents set quotas as. */
   valkeyPassword: string;
+  valkeyQuotasPassword: string;
   /** The bundled object store's filer store's, its filers' Valkey: its users', the filers', the collector's and the backups'. */
   filerStoreFilerPassword: string;
   filerStoreCollectorPassword: string;
@@ -101,6 +106,13 @@ export interface StackSecrets {
   verifiers: Record<ClientRole, string>;
   /** What alasio presents to the node agents, which keep session sandboxes' snapshots, and they check. */
   nodeAgentToken: string;
+  /**
+   * The sandbox gateway's keys: what callers' tokens are signed with, which alasio mints and
+   * the gateway checks, and what bindings' tokens are, which the gateway mints and bound
+   * instances, the session telemetry receiver and the node agents take.
+   */
+  gatewayCallerKey: string;
+  gatewayBindingKey: string;
   /** The log's: the id KRaft formats its nodes with, and each principal's password, its admin's among them. */
   logClusterId: string;
   log: Record<"admin" | LogPrincipal, string>;
@@ -214,6 +226,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
     lakePassword: passwords.lakePassword,
     computeControlToken: kept(stored.computeControlToken, () => secret()),
     valkeyPassword: kept(stored.valkeyPassword, () => secret()),
+    valkeyQuotasPassword: kept(stored.valkeyQuotasPassword, () => secret()),
     lakeReaderPassword: passwords.lakeReaderPassword,
     lakeQueryToken: kept(stored.lakeQueryToken, () => secret()),
     grafanaPassword: passwords.grafanaPassword,
@@ -235,6 +248,8 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
       [HARNESS_ROLE]: kept(verifiers[HARNESS_ROLE], () => scramVerifier(passwords.harnessPassword)),
     },
     nodeAgentToken: kept(stored.nodeAgentToken, () => secret()),
+    gatewayCallerKey: kept(stored.gatewayCallerKey, () => secret()),
+    gatewayBindingKey: kept(stored.gatewayBindingKey, () => secret()),
     logClusterId: kept(stored.logClusterId, () => clusterId()),
     log: {
       ...log,

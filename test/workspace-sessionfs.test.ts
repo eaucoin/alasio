@@ -5,14 +5,15 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import type { InlineKeyboardMarkup } from "@grammyjs/types";
-import { Effect } from "effect";
+import { Effect, Logger } from "effect";
 
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { HarnessHost } from "../src/harness/host.ts";
 import { Mounts } from "../src/operator/mounts.ts";
 import { buildWorkspacePanel, handleWorkspaceControlCallback, handleWorkspaceTextCommand } from "../src/operator/workspace-control.ts";
 import type { Store } from "../src/persistence/store.ts";
-import { type NetMode, SessionForkError, type SessionSandboxes } from "../src/sandbox/index.ts";
+import { GatewayError } from "../src/sandbox/gateway-client.ts";
+import type { NetMode, SessionSandboxes } from "../src/sandbox/index.ts";
 import { parseWorkspace } from "../src/workspace/kind.ts";
 import { run, testStore } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
@@ -83,12 +84,14 @@ interface VolumeCalls {
 
 /**
  * Session filesystems that make, fork and destroy the volumes asked for, recording each;
- * a fork fails when `forkFails`, and lasts until `forking` ends; the forks' Sandboxes are `forks`.
+ * a fork fails when `forkFails`, and lasts until `forking` ends; a deletion fails when
+ * `destroyFails`; the gateway lists `listed`.
  */
-function fakeVolumes({ forkFails = false, forking = Effect.void, forks = [] }: {
+function fakeVolumes({ forkFails = false, forking = Effect.void, listed = [], destroyFails = false }: {
   readonly forkFails?: boolean;
   readonly forking?: Effect.Effect<void>;
-  readonly forks?: readonly string[];
+  readonly listed?: readonly string[];
+  readonly destroyFails?: boolean;
 } = {}): SessionSandboxes["Service"] & VolumeCalls {
   const calls: VolumeCalls = { created: [], forked: [], destroyed: [] };
   return {
@@ -101,16 +104,19 @@ function fakeVolumes({ forkFails = false, forking = Effect.void, forks = [] }: {
       fork: (sourceVolumeId, volumeId) =>
         Effect.suspend(() => {
           calls.forked.push([sourceVolumeId, volumeId]);
-          return Effect.andThen(forking, forkFails ? Effect.fail(new SessionForkError({ message: "the clone failed" })) : Effect.succeed({ volumeId, netMode: "full" as const }));
+          return Effect.andThen(forking, forkFails ? Effect.fail(new GatewayError({ call: "fork", status: 502, reason: "the clone failed" })) : Effect.succeed({ volumeId, netMode: "full" as const }));
         }),
-      destroy: (volumeId) => Effect.sync(() => void calls.destroyed.push(volumeId)),
-      forks: Effect.succeed(forks),
+      destroy: (volumeId) =>
+        Effect.suspend(() => {
+          calls.destroyed.push(volumeId);
+          return destroyFails ? Effect.fail(new GatewayError({ call: `delete the workspace ${volumeId}`, status: 502, reason: "its node agent failed" })) : Effect.void;
+        }),
+      list: Effect.succeed(listed),
     },
     harnessDirectory: () => assert.fail("harnessDirectory"),
-    pod: () => assert.fail("pod"),
     ensureSession: () => Effect.die(new Error("no session is ensured")),
     readFile: () => Effect.die(new Error("no file is read")),
-    holding: () => Effect.void,
+    writeFile: () => Effect.die(new Error("no file is written")),
   };
 }
 
@@ -215,7 +221,7 @@ test("a fork that fails is not recorded, leaves its source mounted, and says why
     const source = await mountedVolume(store);
     await alasio.runPromise(press("fork"));
     const [[, fork] = []] = sandbox.forked;
-    assert.equal(calls.sendMessage.at(-1)?.[1], "the clone failed");
+    assert.equal(calls.sendMessage.at(-1)?.[1], "the sandbox gateway did not fork (502): the clone failed");
     assert.deepEqual(sandbox.destroyed, [fork]);
     assert.equal(await mountedVolume(store), source);
     assert.deepEqual((await run(store.listSessionWorkspaces)).map(({ volumeId }) => volumeId), [source]);
@@ -230,15 +236,36 @@ test("only a session workspace alasio made is switched to", async () => {
   });
 });
 
-test("as alasio starts, the session workspaces a crash left unmade go: those recorded unmade, and forks no record made", async () => {
-  const sandbox = fakeVolumes({ forks: ["fs-made", "fs-unmade", "fs-orphan"] });
+test("as alasio starts, what the gateway holds and alasio records are set against each other, each that differs said, and nothing deleted", async () => {
+  const sandbox = fakeVolumes({ listed: ["fs-made", "fs-unmade", "fs-orphan"] });
   await withWorkspaceControls(sandbox, async (alasio, _telegram, store) => {
     await run(store.recordSessionWorkspace({ volumeId: "fs-made", forkedFrom: "fs-source" }));
     await run(store.markSessionWorkspaceMade("fs-made", "none"));
     await run(store.recordSessionWorkspace({ volumeId: "fs-unmade", forkedFrom: "fs-source" }));
-    await alasio.runPromise(Effect.flatMap(Mounts, (mounts) => mounts.reconcileSessionWorkspaces));
-    assert.deepEqual(sandbox.destroyed, ["fs-unmade", "fs-orphan"]);
-    assert.deepEqual((await run(store.listSessionWorkspaces)).map(({ volumeId }) => volumeId), ["fs-made"]);
+    await run(store.recordSessionWorkspace({ volumeId: "fs-missing", forkedFrom: null }));
+    await run(store.markSessionWorkspaceMade("fs-missing", "full"));
+    const logged: string[] = [];
+    await alasio.runPromise(Effect.flatMap(Mounts, (mounts) => mounts.reconcileSessionWorkspaces).pipe(Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push(String(message)))]))));
+    assert.deepEqual(sandbox.destroyed, []);
+    assert.deepEqual((await run(store.listSessionWorkspaces)).map(({ volumeId }) => volumeId).sort(), ["fs-made", "fs-missing", "fs-unmade"]);
+    assert.deepEqual(logged.map((line) => line.split(":")[0]).sort(), [
+      "workspace.missing.sessionfs volume=fs-missing",
+      "workspace.orphan.sessionfs volume=fs-orphan",
+      "workspace.unmade.sessionfs volume=fs-unmade",
+    ]);
+  });
+});
+
+test("a session workspace's record is forgotten only once the gateway has deleted it, and kept where it could not", async () => {
+  const sandbox = fakeVolumes({ forkFails: true, destroyFails: true });
+  await withWorkspaceControls(sandbox, async (alasio, _telegram, store) => {
+    await alasio.runPromise(press("sessionfs_create", { net: "none" }));
+    const source = await mountedVolume(store);
+    // A fork that fails is discarded, which the gateway refuses here: its record kept, to be deleted later.
+    await alasio.runPromise(press("fork"));
+    const [[, fork] = []] = sandbox.forked;
+    assert.deepEqual(sandbox.destroyed, [fork]);
+    assert.deepEqual((await run(store.listSessionWorkspaces)).map(({ volumeId }) => volumeId).sort(), [fork, source].sort());
   });
 });
 
@@ -263,7 +290,7 @@ test("Fork holds every conversation on the workspace busy while it clones, and i
     })));
     await eventually("the other conversation's turn to run", async () => (await busy(other)) || undefined);
     await alasio.runPromise(press("fork"));
-    assert.equal(calls.sendMessage.at(-1)?.[1], "A turn runs on this session workspace now, which a fork would suspend. Fork it once that turn ends.");
+    assert.equal(calls.sendMessage.at(-1)?.[1], "A turn runs on this session workspace now, which would write into it as it is cloned. Fork it once that turn ends.");
     assert.deepEqual(sandbox.forked, []);
     turnEnds.resolve();
     await turn;

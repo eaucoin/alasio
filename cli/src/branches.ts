@@ -23,31 +23,35 @@
  * would read a token from; and a compute this works in, which may sleep, it wakes first.
  *
  * A branch is deleted in the order nothing of it outlives what it runs on: its alasio and
- * lake stopped, its Sandboxes and their claims deleted (JuiceFS keeps every chunk main
- * still uses), its computes stopped, its branch of Neon's deleted, and its namespaces
+ * lake stopped, its sessions' workspaces deleted through the sandbox gateway, their bound
+ * pods first (JuiceFS keeps every chunk a fork shares with main's), its computes stopped, its branch of Neon's deleted, and its namespaces
  * with all that is left in them; its bot told to deliver nowhere first, its route, its
  * topics and its principals gone last.
  */
 import { randomBytes } from "node:crypto";
 
-import type { KubernetesObject, V1Deployment, V1Namespace, V1Node, V1PersistentVolume, V1Pod, V1Secret } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Deployment, V1Namespace, V1Node, V1Pod, V1Secret } from "@kubernetes/client-node";
 import { Console, Effect, Predicate, Redacted, Result, Schedule, Schema } from "effect";
 
 import { type BranchView, COMPUTE_PORT, computeId, MAIN, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
 import { HARNESS_ROLE, LAKE_ROLE, ROLE } from "../../neon/control/secrets.ts";
+import { BINDING_LABEL, environmentKey, KEY_ANNOTATION } from "../../src/binder/names.ts";
+import { sessionKey, volumeIdOfKey } from "../../src/sandbox/names.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
 import { memoryBytes, memoryText } from "./capacity.ts";
 import { installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
+import { recordedBaseline } from "./cpu-baseline.ts";
 import { type Ran, runIn, runningPod, runningPodIn } from "./commands/common.ts";
-import { hasStatus, kind, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./kube/api.ts";
+import { gatewayCalls } from "./gateway-calls.ts";
+import { kind, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./kube/api.ts";
 import { applyObjects } from "./kube/apply.ts";
-import { awaitGone, awaitReady, awaitReclaimed, readiness, selectorOf, type WaitOptions } from "./kube/rollout.ts";
-import { sandboxPolicyName } from "./manifests/admission.ts";
+import { awaitGone, awaitReady, readiness, selectorOf, type WaitOptions } from "./kube/rollout.ts";
 import { alasioPrincipal, environmentAccess, type EnvironmentLogAccess, environmentLogSecret, LOG, loaderLogSecret, loaderPrincipal, logPrincipalSecret } from "./manifests/log.ts";
 import { branchObjects } from "./manifests/branch.ts";
 import { REPLICA_NAME } from "./manifests/neon.ts";
-import { BRANCH_FORK_SECRET, BRANCH_LABEL, componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "./manifests/common.ts";
+import { BRANCH_FORK_SECRET, BRANCH_LABEL, componentName, NAMESPACE, neonName, RELEASE, selectorLabels, SESSIONS_CALLER_SECRET } from "./manifests/common.ts";
+import { GATEWAY, sandboxServiceRuns } from "./manifests/sandbox-gateway.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { LOADER_COMPONENT } from "./manifests/lake.ts";
 import { CLAUDE_SECRET, readClaudeToken, readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "./secrets.ts";
@@ -319,6 +323,10 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
     ...(yield* Effect.forEach(settings.imagePullSecrets, (secret) => copiedSecret(name, secret))),
     branchSecret(name, TELEGRAM_SECRET, { token: Redacted.value(bot.token), allowedUserIds: bot.allowedUserIds.join(",") }),
     branchSecret(name, BRANCH_FORK_SECRET, { token: forkToken(yield* requiredSecret(componentName("branches"), "fork-key"), name) }),
+    // Its callers' key to the sandbox gateway, its own of the gateway's, which signs its own sessions' tokens alone.
+    ...(sandboxServiceRuns(settings)
+      ? [branchSecret(name, SESSIONS_CALLER_SECRET, { "caller-key": environmentKey(Buffer.from(yield* requiredSecret(GATEWAY, "caller-key")), name).toString() })]
+      : []),
     branchSecret(name, environmentLogSecret({ namespace: branchNamespace(name), branch: name }), { username: alasioPrincipal(name), password: credentials.log }),
     // Its lake loader's, which reads its wake topic alone; and KEDA's, which may describe
     // how far behind that is and read nothing, which its loader's scaler reads as.
@@ -345,7 +353,9 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   yield* changeEnvironment("environment", log);
   const route = yield* ensureRoute(name, bot.allowedUserIds);
 
-  const objects = branchObjects(settings, name);
+  // Its sandbox pools main's, held to the CPU baseline main's are.
+  const { baseline } = yield* recordedBaseline;
+  const objects = branchObjects(settings, name, baseline);
   yield* Effect.forEach(objects.filter((object) => object.kind === "Namespace"), (namespace) => kube.apply(namespace), { discard: true });
   yield* Effect.forEach(secrets, (secret) => kube.apply(secret), { discard: true });
   yield* applyObjects(objects, options);
@@ -455,10 +465,53 @@ const stopped = Effect.fnUntraced(function*(namespace: string, names: readonly s
   yield* removed([...workloads, ...pods].map(refOf), options);
 });
 
+/** The workspaces of the sessions of `sessions`, a branch's sessions' namespace, bound now, by their pods: their names. */
+const boundWorkspaces = (sessions: string): Effect.Effect<string[], KubeApiError, KubeApi> =>
+  Effect.flatMap(KubeApi, (kube) => kube.list<V1Pod>(POD, { namespace: sessions, labelSelector: BINDING_LABEL })).pipe(
+    Effect.map((pods) => pods.flatMap(({ metadata }) => volumeIdOfKey(metadata?.annotations?.[KEY_ANNOTATION] ?? "") ?? [])),
+  );
+
+/** What the sandbox gateway answers of an environment's workspaces. */
+const WorkspacesAnswer = Schema.fromJsonString(Schema.Struct({ workspaces: Schema.Array(Schema.String) }));
+
+/**
+ * Deletes the workspaces of the branch `name`'s sessions through the sandbox gateway, as the
+ * branch's own key signs its calls, of the gateway's caller key: their directories in
+ * workspace storage, and their snapshots, in the bucket and every node's cache
+ * (src/gateway/sessions.ts). The pods bound to them now are deleted first, which the gateway
+ * releases them on; one the gateway still holds, bound or being released, is asked again
+ * until it is deleted, within the timeout. Nothing where there is no sandbox service, as
+ * there is then no caller key of its.
+ */
+const deleteWorkspaces = Effect.fnUntraced(
+  function*(name: string, options: WaitOptions) {
+    const master = yield* mainSecret(GATEWAY, "caller-key");
+    if (master === null) return;
+    const kube = yield* KubeApi;
+    yield* removed((yield* kube.list<V1Pod>(POD, { namespace: branchSessionsNamespace(name), labelSelector: BINDING_LABEL })).map(refOf), options);
+    const call = yield* gatewayCalls;
+    const callerKey = environmentKey(Buffer.from(master), name);
+    const listed = yield* call({ callerKey, environment: name, key: "workspaces", method: "GET", path: "/workspace/all" });
+    if (listed.status !== 200) return yield* new BranchRefused({ message: `the sandbox gateway did not list its workspaces: it answered ${listed.status}: ${listed.text}` });
+    const { workspaces } = yield* Schema.decodeUnknownEffect(WorkspacesAnswer)(listed.text).pipe(
+      Effect.mapError((error) => new BranchRefused({ message: `the sandbox gateway's list of its workspaces is not one: ${error.message}` })),
+    );
+    yield* Effect.forEach(workspaces, (workspace) =>
+      call({ callerKey, environment: name, key: sessionKey(workspace), method: "DELETE", path: "/workspace" }).pipe(
+        Effect.flatMap(({ status, text }) =>
+          status === 204 ? Effect.void : Effect.fail(new BranchRefused({ message: `the sandbox gateway did not delete its workspace ${workspace}: it answered ${status}: ${text}` }))
+        ),
+        Effect.retry({ while: (error) => error.message.includes("answered 409"), schedule: Schedule.max([Schedule.spaced(options.poll), Schedule.during(options.timeout)]) }),
+      ), { discard: true });
+  },
+  Effect.scoped,
+  Effect.catchTag("GatewayUnreached", (error) => Effect.fail(new BranchRefused({ message: `its workspaces could not be deleted through the sandbox gateway: ${error.message}` }))),
+);
+
 /**
  * Deletes the branch environment `name`, as the module says. Unless `force`, refuses
  * while its alasio has a turn running, as its database says, or when that cannot be
- * read.
+ * read, and while a workspace of its sessions is bound.
  */
 export const deleteBranch = Effect.fnUntraced(function*(name: string, { force }: { readonly force: boolean }, options: WaitOptions) {
   const kube = yield* KubeApi;
@@ -475,6 +528,10 @@ export const deleteBranch = Effect.fnUntraced(function*(name: string, { force }:
       Effect.catch((error) => Effect.fail(new BranchRefused({ message: `whether its alasio has a turn running cannot be read: ${error.message}; --force deletes it all the same` }))),
     );
     if (Number(turns) > 0) return yield* new BranchRefused({ message: `its alasio has ${turns} turn${turns === "1" ? "" : "s"} running; --force deletes it all the same` });
+    const bound = yield* boundWorkspaces(sessions);
+    if (bound.length > 0) {
+      return yield* new BranchRefused({ message: `its session${bound.length === 1 ? "'s workspace" : "s' workspaces"} ${bound.join(", ")} ${bound.length === 1 ? "is" : "are"} bound; --force deletes it all the same` });
+    }
   }
 
   if (made) {
@@ -482,11 +539,7 @@ export const deleteBranch = Effect.fnUntraced(function*(name: string, { force }:
     const token = (yield* kube.get<V1Secret>({ ...SECRET, namespace, name: TELEGRAM_SECRET }))?.data?.["token"];
     if (token) yield* Effect.flatMap(TelegramBotApi, (telegram) => telegram.deleteWebhook(Redacted.make(Buffer.from(token, "base64").toString("utf8"))));
     yield* stopped(namespace, [RELEASE, componentName(LOADER_COMPONENT)], options);
-    const sandboxes = yield* kube.list(kind("Sandbox"), { namespace: sessions }).pipe(Effect.catchIf(hasStatus(404), () => Effect.succeed([])));
-    yield* removed(sandboxes.map(refOf), options);
-    const claimed = (yield* kube.list<V1PersistentVolume>(kind("PersistentVolume"))).filter(({ spec }) => spec?.claimRef?.namespace === sessions);
-    yield* removed((yield* kube.list(kind("PersistentVolumeClaim"), { namespace: sessions })).map(refOf), options);
-    yield* awaitReclaimed(claimed.map(refOf), options);
+    yield* deleteWorkspaces(name, options);
     yield* stopped(namespace, [neonName("compute"), REPLICA_NAME], options);
   }
   if (branch) {
@@ -501,8 +554,7 @@ export const deleteBranch = Effect.fnUntraced(function*(name: string, { force }:
     );
   }
   yield* removed([namespace, sessions].map((each) => ({ ...NAMESPACE_KIND, name: each })), options);
-  // What of its is the cluster's: its Sandboxes' admission policy, its route, its topic and its principal.
-  yield* removed([kind("ValidatingAdmissionPolicyBinding"), kind("ValidatingAdmissionPolicy")].map((each) => ({ ...each, name: sandboxPolicyName(namespace) })), options);
+  // What of its is the cluster's: its route, its topic and its principal.
   yield* removeRoute(name);
   yield* changeEnvironment("forget", environmentAccess(name));
 });

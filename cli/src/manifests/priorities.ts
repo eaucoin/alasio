@@ -6,7 +6,7 @@
  * and the log), whose claims a local disk binds to its node. Then, two classes of one value:
  * the rest of the floor, what never sleeps (Neon's proxy and neon-control, and main's
  * compute while it runs, the object store's filers and gateways, workspace storage's
- * metadata, main's lake, Grafana, the collector and the controllers); and the pods that
+ * metadata and each node's mount of it, main's lake, Grafana, the collector and the controllers); and the pods that
  * run turns, alasio's own, sessions' and folder workspaces' bayma. Of one value, neither
  * takes the other's place: no Grafana scaled up, nor a pod of the floor recreated, ends a
  * turn. Then alasio's other components, which sleep or run once (branch environments'
@@ -25,8 +25,6 @@
  * Above the floor is above the turns too, of one value with it, so where no lower pod's
  * place is enough it may take a turn's, which ends: that is only where the storage cannot
  * run without it, and every turn fails while it does not.
- *
- * JuiceFS's mount pods keep a class of their own, above these all (./juicefs-csi.ts).
  */
 import type { V1PriorityClass } from "@kubernetes/client-node";
 

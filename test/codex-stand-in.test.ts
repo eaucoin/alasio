@@ -119,6 +119,18 @@ test("alasio's app-server client runs a turn on the stand-in, which answers it w
   ]);
 });
 
+test("the stand-in shows the file a prompt `show <path>` names beside its answer, as an image is shown", async () => {
+  const answered = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const client = yield* makeAppServer();
+    const thread = { cwd: home, env: buildCodexEnv(), threadKey: "conversation-2", config: { developer_instructions: "", mcp_servers: {} } };
+    const threadId = yield* client.startThread(thread);
+    const turnId = yield* client.startTurn({ ...thread, threadId, prompt: "show /workspace/shown.png" });
+    const seen = yield* Stream.runCollect(client.eventsForTurn(threadId, turnId).pipe(Stream.takeUntil((event) => event.type === "turn.completed")));
+    return seen.flatMap((event: AppServerEvent) => (event.type === "item.completed" && event.item.type === "agent_message" ? [event.item.text] : []));
+  })).pipe(Effect.provideService(Logger.CurrentLoggers, new Set())));
+  assert.deepEqual(answered, [`${ANSWER}\n\n![shown](/workspace/shown.png)`]);
+});
+
 test("each request is a server span of the trace it is sent in, exported as alasio tells Codex to, from codex-app-server", async () => {
   const traceId = "0af7651916cd43dd8448eb211c80319c";
   const parentId = "b7ad6b7169203331";

@@ -18,13 +18,13 @@ import type {
   V1ConfigMap,
   V1Container,
   V1CronJob,
-  V1CSIDriver,
   V1DaemonSet,
   V1Deployment,
   V1Job,
   V1LabelSelector,
   V1Namespace,
   V1PersistentVolumeClaim,
+  V1PodDisruptionBudget,
   V1PodSpec,
   V1PriorityClass,
   V1Role,
@@ -32,14 +32,11 @@ import type {
   V1Service,
   V1ServiceAccount,
   V1StatefulSet,
-  V1StorageClass,
 } from "@kubernetes/client-node";
 import { Result } from "effect";
 
 import { LOG_PRINCIPALS } from "../../neon/control/secrets.ts";
 import { DRAIN_WITHIN_MS } from "../../neon/lake/src/drain.ts";
-import type { HostProfile, SessionsProfile } from "../../src/kube/config.ts";
-import { hostBaymaStateDir } from "../../src/mcp/bayma.ts";
 import { memoryBytes } from "../src/capacity.ts";
 import { NODE_PINS } from "../src/cluster/node.ts";
 import { installConfigOf } from "../src/config.ts";
@@ -48,10 +45,14 @@ import { MAIN_ENVIRONMENT } from "../src/manifests/common.ts";
 import { lakeReconcile } from "../src/manifests/lake.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
-import { filerStoreBackupHours } from "../src/manifests/config.ts";
+import { everyIntervalCron, filerStoreBackupHours } from "../src/manifests/config.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
-import { STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
+import { goferOf, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
+import { apiServerUnconfined } from "../src/install.ts";
+import { carriedPools, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
+import { folderStateDir, templateHash } from "../../src/gateway/names.ts";
+import { hookOf } from "../../src/gateway/snapshots.ts";
 import { VERSION } from "../src/release.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
@@ -61,6 +62,7 @@ interface NetworkPolicyObject extends KubernetesObject {
     readonly podSelector: V1LabelSelector;
     readonly policyTypes?: readonly string[];
     readonly ingress?: readonly { readonly from?: readonly Peer[]; readonly ports?: readonly { readonly port?: number | string }[] }[];
+    readonly egress?: readonly { readonly to?: readonly Peer[]; readonly ports?: readonly { readonly port?: number | string }[] }[];
   };
 }
 
@@ -68,14 +70,26 @@ interface NetworkPolicyObject extends KubernetesObject {
 interface Peer {
   readonly namespaceSelector?: V1LabelSelector;
   readonly podSelector?: V1LabelSelector;
-  readonly ipBlock?: object;
+  readonly ipBlock?: { readonly cidr: string; readonly except?: readonly string[] };
 }
 
-/** A pod, as NetworkPolicies select it: by its labels, and its namespace's. */
+/** A pod, as NetworkPolicies select it: by its labels, and its namespace's; and its address, a pod's of the cluster's unless it says. */
 interface Pod {
   readonly namespace: string;
   readonly namespaceLabels: Readonly<Record<string, string>>;
   readonly labels: Readonly<Record<string, string>>;
+  readonly address?: string;
+}
+
+/** A pod's address, where it says none: the cluster's, private. */
+const POD_ADDRESS = "10.42.0.9";
+
+/** Whether the IPv4 `address` is in `cidr`. */
+function within(address: string, cidr: string): boolean {
+  const [network = "", bits = "32"] = cidr.split("/");
+  const value = (each: string) => each.split(".").reduce((sum, octet) => sum * 256 + Number(octet), 0);
+  const size = 2 ** (32 - Number(bits));
+  return Math.floor(value(address) / size) === Math.floor(value(network) / size);
 }
 
 /** Whether `selector` selects what has `labels`. */
@@ -111,6 +125,33 @@ function admits(policies: readonly NetworkPolicyObject[], from: Pod, to: Pod, po
     )
   );
 }
+
+/**
+ * Whether `policies` let `from` connect to `to` on `port` on its way out, as Kubernetes
+ * reads them: anywhere, where none of them selects `from` for egress; otherwise where a rule
+ * of one that does reaches, an address block reaching what its address is in, and not in
+ * what it excepts.
+ */
+function reaches(policies: readonly NetworkPolicyObject[], from: Pod, to: Pod, port: number): boolean {
+  const selecting = policies.filter(({ metadata, spec }) =>
+    metadata?.namespace === from.namespace && (spec.policyTypes ?? []).includes("Egress") && selects(spec.podSelector, from.labels)
+  );
+  const peerReaches = (peer: Peer, namespace: string) =>
+    peer.ipBlock !== undefined
+      ? within(to.address ?? POD_ADDRESS, peer.ipBlock.cidr) && !(peer.ipBlock.except ?? []).some((cidr) => within(to.address ?? POD_ADDRESS, cidr))
+      : (peer.namespaceSelector ? selects(peer.namespaceSelector, to.namespaceLabels) : to.namespace === namespace) &&
+        (peer.podSelector ? selects(peer.podSelector, to.labels) : true);
+  return selecting.length === 0 || selecting.some(({ metadata, spec }) =>
+    (spec.egress ?? []).some((rule) =>
+      (rule.ports === undefined || rule.ports.some((allowed) => allowed.port === undefined || allowed.port === port)) &&
+      (rule.to === undefined || rule.to.some((peer) => peerReaches(peer, metadata?.namespace ?? "")))
+    )
+  );
+}
+
+/** Whether `policies` let `from` connect to `to` on `port`: out of the one, and into the other. */
+const connects = (policies: readonly NetworkPolicyObject[], from: Pod, to: Pod, port: number): boolean =>
+  reaches(policies, from, to, port) && admits(policies, from, to, port);
 
 function configOf(file: Record<string, unknown> = {}): InstallConfig {
   const { alasio, ...rest } = file;
@@ -161,11 +202,6 @@ function runScript(workload: { readonly command?: string[] | undefined }, env: R
   const run = (more: Readonly<Record<string, string>> = {}): string =>
     execFileSync("/bin/sh", ["-c", text ?? ""], { env: { ...env, ...more, ROOT: root, PATH: `${bin}:${process.env["PATH"]}` }, encoding: "utf8" });
   return { root, run, remove: () => rmSync(root, { recursive: true, force: true }) };
-}
-
-/** The templates alasio makes its workspaces' Sandboxes from, as its ConfigMap holds them. */
-function templates(objects: readonly KubernetesObject[]): string {
-  return one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-templates").data?.["templates.json"] ?? "";
 }
 
 describe("configuration", () => {
@@ -275,23 +311,21 @@ describe("configuration", () => {
     assert.ok(Result.isSuccess(decoded));
     const { workspaceStorage, objectStore } = decoded.success;
     assert.equal(workspaceStorage.enabled, true);
-    assert.equal(workspaceStorage.storageClassName, "alasio-workspaces");
     assert.equal(workspaceStorage.backupInterval, "1h");
     assert.equal(workspaceStorage.valkey.maxmemory, "384mb");
-    assert.equal(workspaceStorage.csi.shareMountPod, false);
+    assert.equal(workspaceStorage.image.repository, "juicedata/mount");
     assert.equal(objectStore.buckets.workspaces, "workspaces");
     assert.equal(objectStore.buckets.snapshots, "snapshots");
     const refused = (given: Record<string, unknown>) => {
       const result = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, workspaceStorage: given });
       return Result.isFailure(result) ? result.failure.message : "";
     };
-    assert.equal(refused({ backupInterval: "4m59s" }), "workspaceStorage.backupInterval must be a duration of 5m or more, such as 1h");
-    assert.equal(refused({ backupInterval: "0" }), "workspaceStorage.backupInterval must be a duration of 5m or more, such as 1h");
-    assert.equal(refused({ backupInterval: "1h30m" }), "");
+    for (const interval of ["4m59s", "0", "7m", "1h30m"]) assert.equal(refused({ backupInterval: interval }), "workspaceStorage.backupInterval must be 5m or more, of whole minutes that divide an hour or whole hours that divide a day, such as 1h", interval);
+    assert.equal(refused({ backupInterval: "30m" }), "");
     assert.equal(refused({ trashDays: -1 }), "workspaceStorage.trashDays must be 0 or more");
     assert.equal(refused({ name: "Workspaces" }), "workspaceStorage.name must be a JuiceFS file system name");
     assert.equal(refused({ valkey: { maxmemory: "384MB" } }), "workspaceStorage.valkey.maxmemory must be an amount of memory such as 384mb");
-    assert.equal(refused({ csi: { mountImage: { digest: "latest" } } }), "workspaceStorage.csi.mountImage.digest must be a sha256 digest, or empty");
+    assert.equal(refused({ image: { digest: "latest" } }), "workspaceStorage.image.digest must be a sha256 digest, or empty");
   });
 });
 
@@ -308,11 +342,10 @@ describe("alasio", () => {
     assert.equal(deployment.spec?.strategy?.type, "Recreate");
   });
 
-  test("drives Kubernetes from the rendered templates, and keeps no volume: its state is in Neon, its home and what it writes on emptyDirs", () => {
+  test("keeps no volume: its state is in Neon, its home and what it writes on emptyDirs", () => {
     const objects = install();
     const deployment = one<V1Deployment>(objects, "Deployment", "alasio");
     const env = container(deployment).env;
-    assert.deepEqual(env?.find(({ name }) => name === "ALASIO_KUBE_TEMPLATES"), { name: "ALASIO_KUBE_TEMPLATES", value: "/etc/alasio/templates.json" });
     assert.deepEqual(env?.find(({ name }) => name === "ALASIO_STATE_DIR"), { name: "ALASIO_STATE_DIR", value: "/var/lib/alasio/state" });
     assert.deepEqual(env?.find(({ name }) => name === "HOME"), { name: "HOME", value: "/var/lib/alasio/home" });
     assert.deepEqual(env?.find(({ name }) => name === "ALASIO_KEEP_CODEX_LOGIN"), { name: "ALASIO_KEEP_CODEX_LOGIN", value: "1" });
@@ -367,42 +400,16 @@ describe("alasio", () => {
     assert.equal(spec?.volumes?.find(({ name }) => name === "alasio-home"), undefined);
   });
 
-  test("renders sessions under gVisor with the egress gate, and no host profile by default", () => {
-    const json = templates(install());
-    assert.match(json, /"runtimeClassName": "gvisor"/u);
-    assert.match(json, /"egressGate": true/u);
-    assert.doesNotMatch(json, /"host":/u);
-  });
-
-  test("renders sessions' pods never restarted, their /tmp a tmpfs of gVisor's own, held to the CPU baseline", () => {
-    const { podTemplate } = JSON.parse(templates(install())).sessions as SessionsProfile;
-    assert.equal(podTemplate.spec?.restartPolicy, "Never");
-    assert.deepEqual(podTemplate.metadata?.annotations, {
-      "dev.gvisor.spec.mount.tmp.share": "container",
-      "dev.gvisor.spec.mount.tmp.type": "tmpfs",
-      "dev.gvisor.spec.mount.tmp.options": "rw",
-      "dev.gvisor.internal.cpufeatures": "avx,avx2,sse",
-    });
-    assert.deepEqual(podTemplate.spec?.volumes, [{ name: "tmp", emptyDir: { sizeLimit: "2Gi" } }]);
-  });
-
-  test("renders sessions under the cluster's default runtime when asked", () => {
-    assert.doesNotMatch(templates(install({ sessions: { runtimeClassName: "" } })), /runtimeClassName/u);
-  });
-
-  test("renders the host profile's bayma with what it needs to snapshot its sessions", () => {
-    const json = templates(install({ host: { enabled: true, stateRoot: "/home/op/.alasio/bayma" } }));
-    assert.match(json, /"CHECKPOINT_RESTORE"/u);
-    assert.match(json, /"stateRoot": "\/home\/op\/\.alasio\/bayma"/u);
-    assert.match(json, /"serviceAccountName": "alasio-host-agent"/u);
-  });
-
-  test("restarts alasio when the templates change", () => {
-    const checksum = (objects: readonly KubernetesObject[]) =>
-      one<V1Deployment>(objects, "Deployment", "alasio").spec?.template.metadata?.annotations?.["checksum/sandbox-templates"];
-    assert.match(checksum(install()) ?? "", /^[0-9a-f]{64}$/u);
-    assert.equal(checksum(install()), checksum(install()));
-    assert.notEqual(checksum(install()), checksum(install({ sessions: { egressGate: false } })));
+  test("gives alasio no template of workspaces, whose pods are the sandbox gateway's, and tells main's alone that the gateway serves folder instances, where it does", () => {
+    for (const objects of [install(), install({ host: { enabled: true } })]) {
+      assert.equal(all<V1ConfigMap>(objects, "ConfigMap").some(({ metadata }) => metadata?.name === "alasio-sandbox-templates"), false);
+      const deployment = one<V1Deployment>(objects, "Deployment", "alasio");
+      assert.equal(deployment.spec?.template.metadata?.annotations?.["checksum/sandbox-templates"], undefined);
+      assert.equal(container(deployment).env?.some(({ name }) => name === "ALASIO_KUBE_TEMPLATES"), false);
+    }
+    const folders = (objects: readonly KubernetesObject[]) => container(one<V1Deployment>(objects, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_GATEWAY_FOLDERS");
+    assert.equal(folders(install()), undefined);
+    assert.deepEqual(folders(install({ host: { enabled: true } })), { name: "ALASIO_GATEWAY_FOLDERS", value: "1" });
   });
 });
 
@@ -415,11 +422,11 @@ describe("neon", () => {
     assert.equal(setup?.env?.find(({ name }) => name === "S3_EXTERNAL"), undefined);
   });
 
-  test("runs each workload at the count its scale fixes: one, but for the safekeepers, the compute, whose count neon-control owns, and the lake's intake and loader, which KEDA scales", () => {
+  test("runs each workload at the count its scale fixes: one, but for the safekeepers, the compute, whose count neon-control owns, and the lake's intake and loader and the sandbox pools, which KEDA scales", () => {
     const objects = install({ host: { enabled: true } });
     const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet")];
     assert.ok(workloads.length > 10);
-    const counts: Record<string, number | undefined> = { "alasio-neon-safekeeper": 3, "alasio-neon-compute": undefined, "alasio-neon-compute-ro": undefined, "alasio-lake-intake": undefined, "alasio-lake-loader": undefined };
+    const counts: Record<string, number | undefined> = { "alasio-neon-safekeeper": 3, "alasio-neon-compute": undefined, "alasio-neon-compute-ro": undefined, "alasio-lake-intake": undefined, "alasio-lake-loader": undefined, "sandboxes-none": undefined, "sandboxes-full": undefined };
     for (const { metadata, spec } of workloads) assert.equal(spec?.replicas, Object.hasOwn(counts, metadata?.name ?? "") ? counts[metadata?.name ?? ""] : 1, metadata?.name);
   });
 
@@ -1182,10 +1189,10 @@ describe("object store", () => {
       { name: "VALKEY_BACKUP_PASSWORD", valueFrom: secret("alasio-seaweedfs-filer-store-backup") },
       { name: "VALKEYCLI_AUTH", valueFrom: secret("alasio-seaweedfs-filer-store-collector") },
     ]);
-    // Its readiness probe logs in as the collector; workspace storage's Valkey, of no users of its own, as its default user.
+    // Its readiness probe logs in as the collector; workspace storage's Valkey, whose clients log in as its default user, the node agents' beside it, as its default user.
     assert.match(store.readinessProbe?.exec?.command?.[2] ?? "", /^persistence=\$\(valkey-cli --user collector info persistence\)/u);
     const valkey = container(one<V1StatefulSet>(objects, "StatefulSet", "alasio-valkey"));
-    assert.deepEqual(valkey.command, ["valkey-server", "/etc/valkey/valkey.conf", "--requirepass", "$(VALKEY_PASSWORD)"]);
+    assert.deepEqual(valkey.command?.slice(0, 4), ["valkey-server", "/etc/valkey/valkey.conf", "--requirepass", "$(VALKEY_PASSWORD)"]);
     assert.match(valkey.readinessProbe?.exec?.command?.[2] ?? "", /^persistence=\$\(valkey-cli info persistence\)/u);
   });
 
@@ -1400,19 +1407,29 @@ describe("telemetry", () => {
 
   test("builds into its collector image every component and provider its gateway's and its scraper's configurations name", () => {
     const builder = readFileSync(new URL("../../neon/collector/builder.yaml", import.meta.url), "utf8");
-    const built = new Set([...builder.matchAll(/^ {2}- gomod: (\S+) v\S+$/gmu)].map(([, path]) => path?.split("/").at(-1)));
+    // Each module's component, its last segment, of the kind its path names, as receiver/receivercreator's receivercreatorreceiver.
+    const built = new Set([...builder.matchAll(/^ {2}- gomod: (\S+) v\S+$/gmu)].map(([, path = ""]) => {
+      const segments = path.split("/");
+      const name = segments.at(-1) ?? "";
+      const kind = segments.find((segment) => ["receiver", "processor", "exporter", "extension", "provider"].includes(segment)) ?? "";
+      return name.endsWith(kind) ? name : `${name}${kind}`;
+    }));
     const named = new Set<string>();
     for (const external of [{ otlpEndpoint: "https://otlp.example.com", otlpProtocol: "grpc", headersSecret: "headers" }, { otlpEndpoint: "https://otlp.example.com" }]) {
       const objects = install({ telemetry: external });
       for (const config of [collectorConfig(objects), scraperConfig(objects)]) {
         for (const kind of ["receivers", "processors", "exporters", "extensions"] as const) {
           for (const id of Object.keys(config[kind] ?? {})) named.add(`${id.split("/")[0]?.replaceAll("_", "")}${kind.slice(0, -1)}`);
+          // The receivers a receiver creator makes, as it finds what they read.
+          for (const created of Object.values<{ receivers?: object }>(config[kind] ?? {})) {
+            if (kind === "receivers") for (const id of Object.keys(created.receivers ?? {})) named.add(`${id.split("/")[0]}receiver`);
+          }
         }
         // The providers of the variables it reads, as ${env:...} and ${file:...}.
         for (const [, scheme] of JSON.stringify(config).matchAll(/\$\{(\w+):/gu)) named.add(`${scheme}provider`);
       }
     }
-    assert.ok(named.has("kafkaexporter") && named.has("redisreceiver") && named.has("fileprovider"), [...named].join(", "));
+    assert.ok(named.has("kafkaexporter") && named.has("redisreceiver") && named.has("kubeletstatsreceiver") && named.has("fileprovider"), [...named].join(", "));
     assert.deepEqual([...named].filter((component) => !built.has(component)), []);
   });
 
@@ -1451,7 +1468,10 @@ describe("telemetry", () => {
     // Its scraper sends what it scrapes to it, a minute's at a time, as the stack's.
     const scraper = scraperConfig(objects);
     assert.deepEqual(scraper.exporters, { "otlphttp/gateway": { endpoint: "http://alasio-collector:4318" } });
-    assert.deepEqual(scraper.service.pipelines, { metrics: { receivers: ["prometheus", "redis", "redis/filer-store"], processors: ["resource/stack", "batch"], exporters: ["otlphttp/gateway"] } });
+    assert.deepEqual(scraper.service.pipelines, {
+      "metrics/nodes": { receivers: ["receiver_creator/nodes"], processors: ["batch"], exporters: ["otlphttp/gateway"] },
+      metrics: { receivers: ["prometheus", "redis", "redis/filer-store"], processors: ["resource/stack", "batch"], exporters: ["otlphttp/gateway"] },
+    });
     assert.deepEqual(scraper.processors.batch, { send_batch_size: 10_000, send_batch_max_size: 10_000, timeout: "60s" });
     assert.equal(scraper.receivers.otlp, undefined);
     assert.equal(all(objects, "Service").find(({ metadata }) => metadata?.name === "alasio-collector-scraper"), undefined);
@@ -1478,6 +1498,30 @@ describe("telemetry", () => {
     const single = install();
     assert.equal(one<V1Deployment>(single, "Deployment", "alasio-collector").spec?.replicas, 1);
     assert.deepEqual(all(single, "ScaledObject").filter(({ metadata }) => metadata?.name === "alasio-collector"), []);
+  });
+
+  test("reads each node's filesystem from its kubelet, as a node the cluster lists, with its scraper's ServiceAccount, which may read nodes and their stats alone", () => {
+    const objects = install();
+    const config = scraperConfig(objects);
+    assert.deepEqual(config.extensions.k8s_observer, { auth_type: "serviceAccount", observe_nodes: true, observe_pods: false });
+    assert.deepEqual(config.service.extensions, ["health_check", "k8s_observer"]);
+    assert.deepEqual(config.receivers["receiver_creator/nodes"], {
+      watch_observers: ["k8s_observer"],
+      receivers: {
+        kubeletstats: {
+          rule: 'type == "k8s.node"',
+          config: { auth_type: "serviceAccount", endpoint: "`endpoint`:`kubelet_endpoint_port`", insecure_skip_verify: true, collection_interval: "60s", metric_groups: ["node"] },
+        },
+      },
+    });
+    assert.equal(one<V1Deployment>(objects, "Deployment", "alasio-collector-scraper").spec?.template.spec?.serviceAccountName, "alasio-collector-scraper");
+    assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-collector-scraper").rules, [
+      { apiGroups: [""], resources: ["nodes"], verbs: ["get", "list", "watch"] },
+      { apiGroups: [""], resources: ["nodes/stats"], verbs: ["get"] },
+    ]);
+    assert.deepEqual(one<V1ClusterRoleBinding>(objects, "ClusterRoleBinding", "alasio-collector-scraper").subjects, [{ kind: "ServiceAccount", name: "alasio-collector-scraper", namespace: "alasio" }]);
+    // The gateway reads none.
+    assert.equal(collectorConfig(objects).receivers["receiver_creator/nodes"], undefined);
   });
 
   test("sends it all to telemetry.otlpEndpoint too when one is set, in its protocol, the headers going there alone", () => {
@@ -1517,11 +1561,12 @@ describe("telemetry", () => {
     assert.deepEqual(variable(one<V1Deployment>(without, "Deployment", "alasio-neon-compute"), "OTEL_SDK_DISABLED"), { name: "OTEL_SDK_DISABLED", value: "true" });
   });
 
-  test("admits alasio, the node agents, folder workspaces' bayma, and branch environments' alasio, compute and lake to the collector, beside the stack", () => {
+  test("admits alasio, the node agents, the sandbox service's gateway and receiver, and branch environments' alasio, compute and lake to the collector, beside the stack, and folder instances not at all, whose telemetry the receiver takes", () => {
     const ingress = (objects: readonly KubernetesObject[]) =>
       one<KubernetesObject & { spec: { podSelector: unknown; ingress: unknown } }>(objects, "NetworkPolicy", "alasio-collector").spec;
     const alasio = { podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "alasio" } } };
     const nodeAgents = { podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "node-agent" } } };
+    const sandboxService = ["sandbox-gateway", "receiver"].map((component) => ({ podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component } } }));
     const branches = { matchExpressions: [{ key: "alasio.dev/branch", operator: "Exists" }] };
     const ofBranches = [
       { namespaceSelector: branches, ...alasio },
@@ -1530,12 +1575,10 @@ describe("telemetry", () => {
     assert.deepEqual(ingress(install()), {
       podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "collector" } },
       policyTypes: ["Ingress"],
-      ingress: [{ from: [alasio, nodeAgents, ...ofBranches], ports: [{ protocol: "TCP", port: 4318 }] }],
+      ingress: [{ from: [alasio, nodeAgents, ...sandboxService, ...ofBranches], ports: [{ protocol: "TCP", port: 4318 }] }],
     });
-    assert.deepEqual(ingress(install({ host: { enabled: true }, sessions: { runtimeClassName: "" } })).ingress, [{
-      from: [alasio, { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio-host" } } }, ...ofBranches],
-      ports: [{ protocol: "TCP", port: 4318 }],
-    }]);
+    assert.deepEqual(ingress(install({ host: { enabled: true } })), ingress(install()));
+    assert.deepEqual(ingress(install({ host: { enabled: true }, sessions: { runtimeClassName: "" } })).ingress, [{ from: [alasio, ...ofBranches], ports: [{ protocol: "TCP", port: 4318 }] }]);
     // A pod of the stack's, as the compute and the lake are, which the stack's own policy admits.
     assert.equal(one<V1Deployment>(install(), "Deployment", "alasio-collector").spec?.template.metadata?.labels?.["alasio.dev/stack"], "neon");
   });
@@ -1543,7 +1586,7 @@ describe("telemetry", () => {
   test("scrapes each pod of every service of the stack, every minute, found in its namespace, so one that sleeps is not scraped", () => {
     const config = scraperConfig(install());
     const jobs: { job_name: string; scrape_interval: string }[] = config.receivers.prometheus.config.scrape_configs;
-    assert.deepEqual(jobs.map(({ job_name }) => job_name), ["compute", "lake-intake", "lake-loader", "lake-query", "log", "neon-control", "pageserver", "proxy", "safekeeper", "storage-broker", "storage-controller", "webhook", "seaweedfs", "juicefs", "juicefs-csi"]);
+    assert.deepEqual(jobs.map(({ job_name }) => job_name), ["compute", "lake-intake", "lake-loader", "lake-query", "log", "neon-control", "pageserver", "proxy", "safekeeper", "storage-broker", "storage-controller", "webhook", "seaweedfs", "juicefs"]);
     assert.deepEqual(jobs.find(({ job_name }) => job_name === "safekeeper"), {
       job_name: "safekeeper",
       scrape_interval: "60s",
@@ -1568,26 +1611,25 @@ describe("telemetry", () => {
     assert.deepEqual(without.filter(({ job_name }) => job_name.startsWith("lake") || job_name === "log").map(({ job_name }) => job_name), ["log"]);
   });
 
-  test("scrapes JuiceFS's pods, found in the driver's namespace, and Valkey, with its password, when workspace storage is on", () => {
+  test("scrapes each node's mount of workspace storage, JuiceFS's client, on the port it serves its metrics on, and Valkey, with its password, when workspace storage is on", () => {
     const objects = install();
     const config = scraperConfig(objects);
-    // Mount pods serve their metrics on 9567, the driver's pods theirs on 8080.
-    for (const [job, name, port] of [["juicefs", "juicefs-mount", 9567], ["juicefs-csi", "juicefs-csi-driver", 8080]] as const) {
-      assert.deepEqual(config.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === job), {
-        job_name: job,
-        scrape_interval: "60s",
-        kubernetes_sd_configs: [{
-          role: "pod",
-          namespaces: { names: ["kube-system"] },
-          selectors: [{ role: "pod", label: `app.kubernetes.io/name=${name}` }],
-        }],
-        relabel_configs: [
-          { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
-          { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: `$$1:${port}` },
-          { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
-        ],
-      }, job);
-    }
+    assert.deepEqual(config.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === "juicefs"), {
+      job_name: "juicefs",
+      scrape_interval: "60s",
+      kubernetes_sd_configs: [{ role: "pod", namespaces: { names: ["alasio"] } }],
+      relabel_configs: [
+        { source_labels: ["__meta_kubernetes_pod_label_app_kubernetes_io_component"], regex: "workspace-mount", action: "keep" },
+        { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
+        { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: "$$1:9567" },
+        { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
+      ],
+    });
+    // Which the mount serves on every address of its pod, not the loopback alone, by the port it names.
+    const mount = one<V1DaemonSet>(objects, "DaemonSet", "alasio-workspace-mount");
+    const mountContainer = mount.spec?.template.spec?.containers.find(({ name }) => name === "workspace-mount");
+    assert.match(mountContainer?.command?.join("\n") ?? "", / mount --no-bgjob --metrics 0\.0\.0\.0:9567 /u);
+    assert.deepEqual(mountContainer?.ports, [{ name: "metrics", containerPort: 9567 }]);
     assert.deepEqual(config.receivers.redis, {
       endpoint: "alasio-valkey:6379",
       password: "${env:VALKEY_PASSWORD}",
@@ -1602,22 +1644,19 @@ describe("telemetry", () => {
       { name: "VALKEY_PASSWORD", valueFrom: { secretKeyRef: { name: "alasio-valkey", key: "password" } } },
       { name: "FILER_STORE_PASSWORD", valueFrom: { secretKeyRef: { name: "alasio-seaweedfs-filer-store-collector", key: "password" } } },
     ]);
-    // It finds the stack's pods in its own namespace, and JuiceFS's in the driver's.
+    // It finds the pods it scrapes in its own namespace, where they all are.
     const roles = all<V1Role>(objects, "Role").filter(({ metadata }) => metadata?.name === "alasio-collector-scraper");
-    assert.deepEqual(roles.map(({ metadata }) => metadata?.namespace), ["alasio", "kube-system"]);
+    assert.deepEqual(roles.map(({ metadata }) => metadata?.namespace), ["alasio"]);
     for (const role of roles) assert.deepEqual(role.rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"] }]);
     const bindings = all<V1RoleBinding>(objects, "RoleBinding").filter(({ metadata }) => metadata?.name === "alasio-collector-scraper");
-    assert.deepEqual(bindings.map(({ metadata, subjects }) => [metadata?.namespace, subjects]), ["alasio", "kube-system"].map((namespace) => [namespace, [{ kind: "ServiceAccount", name: "alasio-collector-scraper", namespace: "alasio" }]]));
+    assert.deepEqual(bindings.map(({ metadata, subjects }) => [metadata?.namespace, subjects]), [["alasio", [{ kind: "ServiceAccount", name: "alasio-collector-scraper", namespace: "alasio" }]]]);
     assert.ok(one(objects, "ServiceAccount", "alasio-collector-scraper"));
 
     const off = install({ workspaceStorage: { enabled: false } });
     const offConfig = scraperConfig(off);
     assert.equal(offConfig.receivers.redis, undefined);
     assert.deepEqual(offConfig.service.pipelines.metrics.receivers, ["prometheus", "redis/filer-store"]);
-    for (const job of ["juicefs", "juicefs-csi"]) {
-      assert.equal(offConfig.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === job), undefined, job);
-    }
-    assert.deepEqual(all<V1Role>(off, "Role").filter(({ metadata }) => metadata?.name === "alasio-collector-scraper").map(({ metadata }) => metadata?.namespace), ["alasio"]);
+    assert.equal(offConfig.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === "juicefs"), undefined);
   });
 
   test("scrapes each pod of each of the object store's parts, found in its own namespace, and reads the filer store, with its password", () => {
@@ -1792,7 +1831,7 @@ describe("the log", () => {
     assert.match(refusal({ log: { storage: { size: "1Gi" } }, lake: { intake: { scaling: { max: 4 } } } }), /^log\.storage\.size must be at least 2\.0 GiB: each of the telemetry topics' 12 partitions /u);
   });
 
-  test("gives each principal what it does alone: the gateway writes the telemetry topics, the intake reads them in its group, KEDA describes both and the wake topics, the webhook intake writes the Telegram topics, main's alasio reads its own and writes its wake topic, main's loader reads that", () => {
+  test("gives each principal what it does alone: the gateway writes the telemetry topics, the intake reads them in its group, KEDA describes both and the wake topics, the webhook intake writes the Telegram topics, the sandbox gateway the events topics, main's alasio reads its own and its events, and writes its wake topic, main's loader reads that", () => {
     const access = JSON.parse(logConfig(install())["access.json"] ?? "");
     // Each telemetry topic flushed to the volume within a second, so a host's crash loses a second of what it acknowledged at most, and kept compressed.
     assert.deepEqual(access.topics, [
@@ -1801,6 +1840,8 @@ describe("the log", () => {
       { name: "telegram.main", partitions: 1, retentionMs: 604_800_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
       // A day of main's wake records, on one partition, as its one loader reads them, within a segment beside the one it writes.
       { name: "lake.main", partitions: 1, retentionMs: 86_400_000, retentionBytes: 64 * 1024 * 1024, configs: {} },
+      // A week of main's events, on one partition, as its one alasio reads them, each flushed as it is written, as what told of it tells no more.
+      { name: "events.main", partitions: 1, retentionMs: 604_800_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
     ]);
     const telemetry = { resource: "topic", name: "otel.", pattern: "prefixed" };
     const group = { resource: "group", name: "lake-intake", pattern: "literal" };
@@ -1817,12 +1858,14 @@ describe("the log", () => {
         ],
       },
       { name: "webhook", acls: [{ resource: "topic", name: "telegram.", pattern: "prefixed", operations: ["write", "describe"] }] },
+      { name: "sandbox-gateway", acls: [{ resource: "topic", name: "events.", pattern: "prefixed", operations: ["write", "describe"] }] },
       {
         name: "alasio-main",
         acls: [
           { resource: "topic", name: "telegram.main", pattern: "literal", operations: ["read", "describe"] },
           { resource: "group", name: "alasio.main", pattern: "literal", operations: ["read"] },
           { resource: "topic", name: "lake.main", pattern: "literal", operations: ["write", "describe"] },
+          { resource: "topic", name: "events.main", pattern: "literal", operations: ["read", "describe"] },
         ],
       },
       {
@@ -1836,7 +1879,7 @@ describe("the log", () => {
     assert.equal(JSON.parse(logConfig(install({ lake: { intake: { scaling: { max: 5 } } } }))["access.json"] ?? "").topics[0].partitions, 5);
   });
 
-  test("admits the gateway, the intake, KEDA's operator, the webhook intake, alasio and the lake's loader alone as its clients, its own nodes to its controllers, and the scraper to its metrics", () => {
+  test("admits the gateway, the intake, KEDA's operator, the webhook intake, the sandbox gateway, alasio and the lake's loader alone as its clients, its own nodes to its controllers, and the scraper to its metrics", () => {
     const objects = install();
     const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
     const labelsOf = (kind: string, name: string) => one<V1Deployment | V1StatefulSet>(objects, kind, name).spec?.template.metadata?.labels ?? {};
@@ -1851,11 +1894,15 @@ describe("the log", () => {
         reach("alasio-webhook", 9092),
         reach("alasio", 9092),
         reach("alasio-lake-loader", 9092),
+        reach("alasio-sandbox-gateway", 9092),
         reach("alasio-log", 9093, "StatefulSet"),
         reach("alasio-collector-scraper", 9464),
       ],
-      [true, true, true, true, true, true, true, true],
+      [true, true, true, true, true, true, true, true, true],
     );
+    // The sandbox gateway reaches it, as it writes each environment's events; the receiver it takes not.
+    assert.equal(reaches(policies, pod(labelsOf("Deployment", "alasio-sandbox-gateway")), node, 9092), true);
+    assert.equal(reach("alasio-receiver", 9092), false);
     // Not the lake's readers, Neon, nor the scraper as a client, nor a client to the controllers.
     assert.deepEqual(
       [reach("alasio-lake-query", 9092), reach("alasio-neon-pageserver", 9092, "StatefulSet"), reach("alasio-collector-scraper", 9092), reach("alasio-collector", 9093), reach("alasio-webhook", 9093)],
@@ -1962,7 +2009,7 @@ describe("the webhook intake", () => {
       [admits(policies, pod(labelsOf("alasio-collector-scraper")), webhook, 8080), admits(policies, pod(labelsOf("alasio")), webhook, 8080), admits(policies, pod({}), webhook, 443)],
       [true, false, true],
     );
-    const egress = (one<NetworkPolicyObject>(objects, "NetworkPolicy", "alasio-webhook").spec as { egress?: { to: Peer[]; ports: { port: number }[] }[] }).egress;
+    const egress = (one<NetworkPolicyObject>(objects, "NetworkPolicy", "alasio-webhook").spec as { egress?: readonly { readonly to: readonly Peer[]; readonly ports: readonly { readonly port: number }[] }[] }).egress;
     assert.deepEqual(egress?.map(({ to, ports }) => [to.map(({ podSelector }) => podSelector?.matchLabels), ports.map(({ port }) => port)]), [
       [[{ "k8s-app": "kube-dns" }], [53, 53]],
       [[{ "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "log" }], [9092]],
@@ -1989,38 +2036,14 @@ describe("the webhook intake", () => {
 });
 
 describe("workspace storage", () => {
-  /** The sessions template, as alasio reads it. */
-  const sessions = (objects: readonly KubernetesObject[]): SessionsProfile => JSON.parse(templates(objects)).sessions;
-
   /** The setup Job's variable of `name`, if it has one. */
   const setupVariable = (objects: readonly KubernetesObject[], name: string) =>
     one<V1Job>(objects, "Job", "alasio-neon-setup").spec?.template.spec?.containers[0]?.env?.find((variable) => variable.name === name)?.value;
 
-  /** Every container's image of `objects`' workloads. */
-  const images = (objects: readonly KubernetesObject[]) =>
-    objects
-      .flatMap((object) => (object as V1StatefulSet | V1DaemonSet).spec?.template?.spec?.containers ?? [])
-      .map(({ image }) => image ?? "");
-
-  test("makes new sessions' volumes of its class, mounted as JuiceFS's are", () => {
-    const profile = sessions(install());
-    assert.equal(profile.volumeClaimTemplates?.[0]?.spec?.storageClassName, "alasio-workspaces");
-    assert.equal(profile.podTemplate.spec?.securityContext?.fsGroupChangePolicy, "OnRootMismatch");
-    assert.equal(profile.podTemplate.spec?.securityContext?.fsGroup, 1000);
-    const mounts = profile.podTemplate.spec?.containers.find(({ name }) => name === "bayma")?.volumeMounts;
-    assert.deepEqual(mounts?.filter(({ name }) => name === "data").map(({ mountPropagation }) => mountPropagation), ["HostToContainer", "HostToContainer"]);
-  });
-
-  test("keeps the class sessions name, and without it, the cluster's default", () => {
-    assert.equal(sessions(install({ sessions: { storage: { storageClassName: "fast" } } })).volumeClaimTemplates?.[0]?.spec?.storageClassName, "fast");
-    const off = templates(install({ workspaceStorage: { enabled: false } }));
-    assert.doesNotMatch(off, /storageClassName|fsGroupChangePolicy|mountPropagation/u);
-  });
-
   test("keeps its metadata in a Valkey configured as JuiceFS's Redis best practices say", () => {
     const objects = install({ workspaceStorage: { valkey: { maxmemory: "256mb" } } });
     const conf = one<V1ConfigMap>(objects, "ConfigMap", "alasio-valkey").data?.["valkey.conf"]?.split("\n") ?? [];
-    for (const line of ["appendonly yes", "appendfsync everysec", "aof-use-rdb-preamble yes", "save 3600 1 300 100 60 10000", "stop-writes-on-bgsave-error yes"]) {
+    for (const line of ["appendonly yes", "appendfsync always", "aof-use-rdb-preamble yes", "save 3600 1 300 100 60 10000", "stop-writes-on-bgsave-error yes"]) {
       assert.ok(conf.includes(line), line);
     }
     assert.ok(conf.includes("maxmemory 256mb"));
@@ -2079,67 +2102,19 @@ describe("workspace storage", () => {
     }
   });
 
-  test("installs JuiceFS's CSI driver, its images pinned by digest, provisioning volumes itself", () => {
+  test("installs no CSI driver nor StorageClass, nothing that a driver would need kept: each node's mount serves the workspaces", () => {
     const objects = install();
-    assert.deepEqual(one<V1CSIDriver>(objects, "CSIDriver", "csi.juicefs.com").spec, { attachRequired: false, podInfoOnMount: true });
-    const controller = one<V1StatefulSet>(objects, "StatefulSet", "juicefs-csi-controller");
-    const node = one<V1DaemonSet>(objects, "DaemonSet", "juicefs-csi-node");
-    assert.equal(controller.metadata?.namespace, "kube-system");
-    assert.equal(controller.spec?.replicas, 1);
-    assert.deepEqual(controller.spec?.template.spec?.containers.map(({ name }) => name), ["juicefs-plugin", "csi-resizer", "liveness-probe"]);
-    assert.ok(container(controller).args?.includes("--provisioner=true"));
-    // One controller, without the elections whose renewals, after a fixed 10 s, would end it at a slow API server.
-    assert.deepEqual(controller.spec?.template.spec?.containers.filter(({ args }) => args?.includes("--leader-election")), []);
-    const provisioner = one<V1ClusterRole>(objects, "ClusterRole", "juicefs-external-provisioner-role");
-    assert.ok(!(provisioner.rules ?? []).some(({ resources }) => resources?.includes("leases")));
-    assert.deepEqual(node.spec?.template.spec?.containers.map(({ name }) => name), ["juicefs-plugin", "node-driver-registrar", "liveness-probe"]);
-    for (const image of images([controller, node])) assert.match(image, /:v[0-9.]+@sha256:[0-9a-f]{64}$/u, image);
-    for (const plugin of [container(controller), node.spec?.template.spec?.containers[0]]) {
-      assert.deepEqual(plugin?.env?.find(({ name }) => name === "JUICEFS_MOUNT_PRIORITY_NAME"), { name: "JUICEFS_MOUNT_PRIORITY_NAME", value: "alasio-juicefs-mount" });
-      assert.deepEqual(plugin?.env?.find(({ name }) => name === "JUICEFS_MOUNT_PREEMPTION_POLICY"), { name: "JUICEFS_MOUNT_PREEMPTION_POLICY", value: "Never" });
-      assert.equal(plugin?.env?.find(({ name }) => name === "FS_SHARE_MOUNT"), undefined);
-    }
-    const shared = one<V1DaemonSet>(install({ workspaceStorage: { csi: { shareMountPod: true } } }), "DaemonSet", "juicefs-csi-node");
-    assert.deepEqual(shared.spec?.template.spec?.containers[0]?.env?.find(({ name }) => name === "FS_SHARE_MOUNT"), { name: "FS_SHARE_MOUNT", value: "true" });
+    for (const kind of ["CSIDriver", "StorageClass"]) assert.deepEqual(all(objects, kind), [], kind);
+    assert.deepEqual(objects.filter(({ metadata }) => metadata?.labels?.["alasio.dev/volume-driver"] !== undefined).map(({ kind, metadata }) => `${kind} ${metadata?.name}`), []);
+    // In the driver's namespace, kube-system, only what lets KEDA read the API server's authentication.
+    assert.deepEqual(objects.filter(({ metadata }) => metadata?.namespace === "kube-system").map(({ kind, metadata }) => `${kind} ${metadata?.name}`), ["RoleBinding alasio-keda-auth-reader"]);
+    assert.deepEqual(all(objects, "PriorityClass").filter(({ metadata }) => metadata?.name === "alasio-juicefs-mount"), []);
+    assert.ok(one(objects, "DaemonSet", "alasio-workspace-mount"));
   });
 
-  test("runs every pod of the driver's on a pinned client, sized as mount pods are, and mount pods of its class with their cache bounded, their metadata backed up, ready once the mount answers", () => {
-    const objects = install({ workspaceStorage: { cacheSizeMiB: 2048, backupInterval: "30m" } });
-    const config = JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "juicefs-csi-driver-config").data?.["config.yaml"] ?? "");
-    // Every pod of the driver's on the pinned client, sized: a volume's delete Job, of no claim, among them.
-    assert.deepEqual(config.mountPodPatch, [{
-      ceMountImage: "juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673",
-      resources: { requests: { cpu: "20m", memory: "128Mi" }, limits: { memory: "1Gi" } },
-    }, {
-      pvcSelector: { matchStorageClassName: "alasio-workspaces" },
-      mountOptions: ["cache-size=2048", "free-space-ratio=0.2", "backup-meta=30m"],
-      readinessProbe: { exec: { command: ["sh", "-c", 'test "$(stat --file-system --format=%T ${MOUNT_POINT})" = fuseblk'] }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 3 },
-    }]);
-  });
-
-  test("runs mount pods under a PriorityClass that never preempts", () => {
-    const priority = one<V1PriorityClass>(install(), "PriorityClass", "alasio-juicefs-mount");
-    assert.equal(priority.preemptionPolicy, "Never");
-    assert.equal(priority.globalDefault, false);
-    assert.equal(priority.value, 1_000_000_000);
-  });
-
-  test("makes each volume of its class a directory of the file system, named after its claim, deleted with it and grown with it", () => {
-    const storageClass = one<V1StorageClass>(install(), "StorageClass", "alasio-workspaces");
-    assert.equal(storageClass.provisioner, "csi.juicefs.com");
-    assert.equal(storageClass.reclaimPolicy, "Delete");
-    assert.equal(storageClass.allowVolumeExpansion, true);
-    assert.equal(storageClass.parameters?.["pathPattern"], "${.pvc.namespace}-${.pvc.name}");
-    for (const use of ["provisioner", "node-publish", "controller-expand"]) {
-      assert.equal(storageClass.parameters?.[`csi.storage.k8s.io/${use}-secret-name`], "alasio-workspaces-juicefs", use);
-      assert.equal(storageClass.parameters?.[`csi.storage.k8s.io/${use}-secret-namespace`], "alasio", use);
-    }
-  });
-
-  test("checks each volume's quota daily and repairs it, as a JuiceFS admin on the pinned client, kept as the driver is", () => {
+  test("checks each workspace's quota daily and repairs it, as a JuiceFS admin on the pinned client", () => {
     const quotaCheck = one<V1CronJob>(install(), "CronJob", "alasio-juicefs-quota-check");
     assert.equal(quotaCheck.metadata?.namespace, "alasio");
-    assert.equal(quotaCheck.metadata?.labels?.["alasio.dev/volume-driver"], "csi.juicefs.com");
     assert.equal(quotaCheck.spec?.schedule, "47 3 * * *");
     assert.equal(quotaCheck.spec?.concurrencyPolicy, "Forbid");
     const pod = quotaCheck.spec?.jobTemplate.spec?.template;
@@ -2150,7 +2125,8 @@ describe("workspace storage", () => {
     assert.equal(check.image, "juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673");
     assert.deepEqual(check.env, [{ name: "META_URL", valueFrom: { secretKeyRef: { name: "alasio-workspaces-juicefs", key: "metaurl" } } }]);
     // `juicefs quota list` as JuiceFS 1.4.1 tables quotas: directories' by path (a deleted
-    // one's in the trash, or by inode once it has none), users' and groups' by id.
+    // one's in the trash, or by inode once it has none), users' and groups' by id. A
+    // workspace's is its directory's in its environment's, /<environment>/<workspace>.
     const juicefs = [
       'echo "$@" >> "$ROOT/calls"',
       '[ "$2" = list ] || exit 0',
@@ -2158,9 +2134,11 @@ describe("workspace storage", () => {
       "+-------------------------------------------------+---------+---------+------+-----------+-------+-------+",
       "|                     Path/ID                     |   Size  |   Used  | Use% |   Inodes  | IUsed | IUse% |",
       "+-------------------------------------------------+---------+---------+------+-----------+-------+-------+",
-      "| /.trash/2026-10-05-03/1-77-alasio-sessions-data | 1.0 GiB | 8.0 KiB |   0% | unchanged |     2 |       |",
-      "| /alasio-sessions-data-fs-abc123                 | 1.0 GiB | 1.6 MiB |   0% | unchanged |   314 |       |",
-      "| /alasio-sessions-data-fs-def456                 | 2.0 GiB |     0 B |   0% | unchanged |     0 |       |",
+      "| /.trash/2026-10-05-03/1-77-fs-old               | 1.0 GiB | 8.0 KiB |   0% | unchanged |     2 |       |",
+      "| /main/fs-abc123                                 | 1.0 GiB | 1.6 MiB |   0% | unchanged |   314 |       |",
+      "| /main/fs-abc123/files                           | 1.0 GiB |     0 B |   0% | unchanged |     0 |       |",
+      "| /try/fs-def456                                  | 2.0 GiB |     0 B |   0% | unchanged |     0 |       |",
+      "| /stray                                          | 1.0 GiB | 4.0 KiB |   0% | unchanged |     3 |       |",
       "| inode:42                                        | 1.0 GiB |     0 B |   0% | unchanged |     0 |       |",
       "| uid:1000                                        | 4.0 GiB | 1.6 MiB |   0% | unchanged |   314 |       |",
       "+-------------------------------------------------+---------+---------+------+-----------+-------+-------+",
@@ -2172,18 +2150,105 @@ describe("workspace storage", () => {
       run();
       assert.deepEqual(readFileSync(join(root, "calls"), "utf8").trim().split("\n"), [
         `quota list ${metaUrl}`,
-        `quota check ${metaUrl} --path /alasio-sessions-data-fs-abc123 --repair`,
-        `quota check ${metaUrl} --path /alasio-sessions-data-fs-def456 --repair`,
+        `quota check ${metaUrl} --path /main/fs-abc123 --repair`,
+        `quota check ${metaUrl} --path /try/fs-def456 --repair`,
       ]);
     } finally {
       remove();
     }
   });
 
-  test("collects the file system daily, as a JuiceFS admin on the pinned client, kept as the driver is", () => {
+  test("dumps the file system's metadata every backupInterval, one at a time, into its bucket's meta/ as JuiceFS names its dumps, read back the same, the newest kept", () => {
+    assert.deepEqual(["5m", "15m", "30m", "1h", "6h", "24h", "4m", "7m", "90m", "5h", "1h30m", "10s"].map(everyIntervalCron), ["*/5 * * * *", "*/15 * * * *", "*/30 * * * *", "0 */1 * * *", "0 */6 * * *", "0 0 * * *", null, null, null, null, null, null]);
+    const dumping = one<V1CronJob>(install({ workspaceStorage: { backupInterval: "15m" } }), "CronJob", "alasio-juicefs-dump");
+    assert.equal(dumping.spec?.schedule, "*/15 * * * *");
+    assert.equal(dumping.spec?.concurrencyPolicy, "Forbid");
+    const pod = dumping.spec?.jobTemplate.spec?.template;
+    assert.equal(pod?.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
+    assert.equal(pod?.spec?.securityContext?.runAsNonRoot, true);
+    const [dump] = pod?.spec?.initContainers ?? [];
+    assert.ok(dump);
+    // Dumped by JuiceFS, its keys left out, of bounded memory.
+    assert.match(dump.command?.[2] ?? "", /^juicefs dump "\$META_URL" \/dump\/dump\.json\.gz$/mu);
+    assert.deepEqual(dump.resources?.limits, { memory: "1Gi" });
+    const [upload] = pod?.spec?.containers ?? [];
+    assert.ok(upload);
+    const env = Object.fromEntries((upload.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? `${valueFrom?.secretKeyRef?.name}/${valueFrom?.secretKeyRef?.key}`]));
+    assert.deepEqual([env["AWS_ACCESS_KEY_ID"], env["AWS_SECRET_ACCESS_KEY"], env["WORKSPACES_BUCKET"], env["WORKSPACES_NAME"]], ["alasio-workspaces-juicefs/access-key", "alasio-workspaces-juicefs/secret-key", "workspaces", "workspaces"]);
+    // The object store, a directory of buckets, as aws s3 lists, reads, writes and deletes from it; a write it corrupts, where CORRUPT says.
+    const aws = [
+      "shift 3; verb=$1; shift",
+      'at() { case $1 in s3://*) printf "%s/%s" "$ROOT/store" "${1#s3://}" ;; *) printf "%s" "$1" ;; esac; }',
+      "case $verb in",
+      '  ls) [ -d "$(at "$1")" ] || exit 1; for f in "$(at "$1")"*; do [ -e "$f" ] && echo "2026-10-05 03:17:00 1 ${f##*/}"; done; true ;;',
+      '  cp) mkdir -p "$(dirname "$(at "$2")")"; cp "$(at "$1")" "$(at "$2")"',
+      '      case $2 in s3://*) [ -n "${CORRUPT:-}" ] && printf x >> "$(at "$2")" ;; esac; true ;;',
+      '  rm) rm "$(at "$1")" ;;',
+      "esac",
+    ].join("\n");
+    const { root, run: runIn, remove } = runScript(upload, Object.fromEntries((upload.env ?? []).flatMap(({ name, value }) => (value === undefined ? [] : [[name, value]]))), { aws });
+    const run = (more: Readonly<Record<string, string>> = {}) => runIn({ DUMP: join(root, "dump"), ...more });
+    try {
+      const meta = join(root, "store", "workspaces", "workspaces", "meta");
+      mkdirSync(meta, { recursive: true });
+      mkdirSync(join(root, "dump"));
+      // More than it keeps, of before.
+      const older = Array.from({ length: 25 }, (_, hour) => `dump-2026-10-04-${String(hour % 24).padStart(2, "0")}${hour >= 24 ? "3" : "0"}0000.json.gz`);
+      for (const name of older) writeFileSync(join(meta, name), gzipSync("older"));
+      writeFileSync(join(root, "dump", "dump.json.gz"), gzipSync("the metadata"));
+      const said = run();
+      const put = /dumped the metadata of workspaces to s3:\/\/workspaces\/workspaces\/meta\/(dump-\d{4}-\d{2}-\d{2}-\d{6}\.json\.gz)$/mu.exec(said)?.[1];
+      assert.ok(put, said);
+      assert.equal(gunzipSync(readFileSync(join(meta, put))).toString(), "the metadata");
+      // The newest 24 kept, the one put among them.
+      const kept = readdirSync(meta).sort();
+      assert.equal(kept.length, 24);
+      assert.ok(kept.includes(put) && !kept.includes(older.toSorted()[0] ?? ""), kept.join(", "));
+      // One the store keeps wrong fails it, saying so; as does a dump that is no whole gzip.
+      assert.throws(() => run({ CORRUPT: "1" }), /in the bucket is not of the dump's size/u);
+      writeFileSync(join(root, "dump", "dump.json.gz"), gzipSync("cut short").subarray(0, 12));
+      assert.throws(() => run(), /the dump is no whole gzip/u);
+    } finally {
+      remove();
+    }
+  });
+
+  test("cleans the sessions of clients that died every five minutes, one run at a time, by a client of background jobs run past two of its refreshes, on no mount, of no backup of its own", () => {
+    const cleaning = one<V1CronJob>(install(), "CronJob", "alasio-juicefs-sessions");
+    assert.equal(cleaning.spec?.schedule, "*/5 * * * *");
+    assert.equal(cleaning.spec?.concurrencyPolicy, "Forbid");
+    const pod = cleaning.spec?.jobTemplate.spec?.template;
+    assert.equal(pod?.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
+    assert.equal(pod?.spec?.securityContext?.runAsNonRoot, true);
+    const [client] = pod?.spec?.containers ?? [];
+    assert.ok(client);
+    // Unprivileged, as it mounts nothing.
+    assert.deepEqual(client.securityContext, { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } });
+    const juicefs = [
+      'echo "$@" >> "$ROOT/calls"',
+      'if [ "$1" = status ]; then echo \'{"Sessions": [\'; echo \'{"Sid": 1,\'; echo \'{"Sid": 2,\'; echo "]}"; exit 0; fi',
+      '[ -n "$MINIO_ROOT_PASSWORD" ] && [ "${#MINIO_ROOT_PASSWORD}" -ge 8 ] || exit 3',
+      "trap 'echo stopped >> \"$ROOT/calls\"; exit 0' TERM",
+      "while :; do sleep 0.1; done",
+    ].join("\n");
+    const metaUrl = "redis://:secret@alasio-valkey.alasio.svc.cluster.local:6379/1";
+    const { root, run, remove } = runScript(client, { META_URL: metaUrl }, { juicefs, sleep: 'if [ "$1" = 40 ]; then echo "slept $1" >> "$ROOT/calls"; /bin/sleep 1; else /bin/sleep "$1"; fi' });
+    try {
+      const said = run();
+      assert.match(said, /^sessions as it begins: 2$/mu);
+      assert.match(said, /^sessions as it ends: 2$/mu);
+      const calls = readFileSync(join(root, "calls"), "utf8").trim().split("\n").filter((call) => !call.startsWith("0.1"));
+      // The sessions counted, the client started beside the wait, stopped once it is through, and the sessions counted again.
+      assert.deepEqual([calls[0], calls.at(-1), calls.at(-2)], [`status ${metaUrl}`, `status ${metaUrl}`, "stopped"]);
+      assert.deepEqual(calls.slice(1, -2).sort(), [`gateway --no-usage-report --backup-meta 0 --cache-dir /tmp/cache --cache-size 0 ${metaUrl} 127.0.0.1:9000`, "slept 40"]);
+    } finally {
+      remove();
+    }
+  });
+
+  test("collects the file system daily, as a JuiceFS admin on the pinned client", () => {
     const collection = one<V1CronJob>(install(), "CronJob", "alasio-juicefs-gc");
     assert.equal(collection.metadata?.namespace, "alasio");
-    assert.equal(collection.metadata?.labels?.["alasio.dev/volume-driver"], "csi.juicefs.com");
     assert.equal(collection.spec?.schedule, "17 4 * * *");
     assert.equal(collection.spec?.concurrencyPolicy, "Forbid");
     const pod = collection.spec?.jobTemplate.spec?.template;
@@ -2197,102 +2262,23 @@ describe("workspace storage", () => {
     const { root, run, remove } = runScript(gc, { META_URL: metaUrl }, { juicefs: 'echo "$@" >> "$ROOT/calls"' });
     try {
       run();
-      assert.deepEqual(readFileSync(join(root, "calls"), "utf8").trim().split("\n"), [`gc ${metaUrl} --delete`]);
+      assert.deepEqual(readFileSync(join(root, "calls"), "utf8").trim().split("\n"), [`gc ${metaUrl} --compact --delete`]);
     } finally {
       remove();
     }
   });
 
-  test("clones a session's volume into a new one's directory once its quota is set, counts its usage anew after and gives it its source's owner, privileged on a mount of the whole file system, as a JuiceFS admin", () => {
-    const { clone } = sessions(install());
-    assert.ok(clone);
-    assert.equal(clone.claimTemplate, "data");
-    const { job } = clone;
-    assert.deepEqual(job.metadata, {
-      generateName: "alasio-workspace-clone-",
-      namespace: "alasio",
-      labels: { ...job.metadata?.labels, "app.kubernetes.io/component": "workspace-clone" },
-    });
-    assert.equal(job.spec?.backoffLimit, 0);
-    const pod = job.spec?.template;
-    assert.equal(pod?.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
-    assert.equal(pod?.spec?.restartPolicy, "Never");
-    assert.equal(pod?.spec?.securityContext, undefined);
-    const cloner = pod?.spec?.containers[0];
-    assert.ok(cloner);
-    assert.equal(cloner.image, "juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673");
-    assert.deepEqual(cloner.securityContext, { privileged: true });
-    assert.deepEqual(cloner.env, [{ name: "META_URL", valueFrom: { secretKeyRef: { name: "alasio-workspaces-juicefs", key: "metaurl" } } }]);
-    // The destination's directory has no quota at first, then the driver's. The mount, run
-    // in the background, takes a while to answer, as on the box; it is up once it has, and
-    // its client runs until it is unmounted.
-    const juicefs = [
-      '[ "$1" = mount ] && /bin/sleep 0.3',
-      'echo "$@" >> "$ROOT/calls"',
-      '[ "$1" = mount ] && : > "$ROOT/mounted"',
-      '[ "$1" = mount ] && until [ -e "$ROOT/unmounted" ]; do /bin/sleep 0.05; done',
-      'if [ "$1 $2" = "quota get" ]; then [ -e "$ROOT/quota" ] && echo "| /alasio-sessions-data-fs-def456 | 1.0 GiB |"; : > "$ROOT/quota"; fi',
-      "true",
-    ].join("\n");
-    const recorded = (name: string) => `echo "${name} $*" >> "$ROOT/calls"`;
-    // /jfs a FUSE mount once the mount is up, and a source directory the pod's group's, as kubelet made it.
-    const stat = 'case $1 in --file-system) if [ -e "$ROOT/mounted" ]; then echo fuseblk; else echo overlay; fi ;; --format=%a) echo 2775 ;; *) echo 1000:1000 ;; esac';
-    const env = {
-      META_URL: "redis://valkey/1",
-      SOURCE_NAMESPACE: "alasio-sessions",
-      SOURCE_CLAIM: "data-fs-abc123",
-      DESTINATION_NAMESPACE: "alasio-sessions",
-      DESTINATION_CLAIM: "data-fs-def456",
-    };
-    const commands = { juicefs, mkdir: recorded("mkdir"), stat: stat, sleep: recorded("sleep"), umount: `${recorded("umount")}; : > "$ROOT/unmounted"`, chown: recorded("chown"), chmod: recorded("chmod") };
-    const { root, run, remove } = runScript(cloner, env, commands);
-    try {
-      run();
-      const calls = readFileSync(join(root, "calls"), "utf8").trim().split("\n");
-      // It waited for the mount, a second at a time, as long as the mount took.
-      assert.ok(calls.includes("sleep 1"), calls.join("\n"));
-      assert.deepEqual(calls.filter((call) => call !== "sleep 1"), [
-        "quota get redis://valkey/1 --path /alasio-sessions-data-fs-def456",
-        "sleep 2",
-        "quota get redis://valkey/1 --path /alasio-sessions-data-fs-def456",
-        "mkdir -p /jfs",
-        "mount --no-bgjob --cache-size 0 redis://valkey/1 /jfs",
-        "clone --preserve /jfs/alasio-sessions-data-fs-abc123/workspace /jfs/alasio-sessions-data-fs-def456/workspace",
-        "clone --preserve /jfs/alasio-sessions-data-fs-abc123/home /jfs/alasio-sessions-data-fs-def456/home",
-        "chown 1000:1000 /jfs/alasio-sessions-data-fs-def456",
-        "chmod 2775 /jfs/alasio-sessions-data-fs-def456",
-        "umount /jfs",
-        "quota check redis://valkey/1 --path /alasio-sessions-data-fs-def456 --repair",
-      ]);
-    } finally {
-      remove();
-    }
-  });
-
-  test("forks sessions only where their volumes are its class's", () => {
-    assert.equal(sessions(install({ sessions: { storage: { storageClassName: "alasio-workspaces" } } })).clone?.claimTemplate, "data");
-    assert.equal(sessions(install({ sessions: { storage: { storageClassName: "fast" } } })).clone, undefined);
-    assert.equal(sessions(install({ workspaceStorage: { enabled: false } })).clone, undefined);
-  });
-
-  test("admits JuiceFS's pods and its driver's Jobs' alone to Valkey, but for the collector's scraper reading its metrics, and to the object store's S3 port, with Valkey's, which formats the file system", () => {
+  test("admits JuiceFS's clients alone, alasio's JuiceFS admins and the nodes' mount, to Valkey, but for the node agents setting quotas and the collector's scraper reading its metrics, and to the object store's S3 port, with Valkey's, which formats the file system", () => {
     const objects = install();
     const policy = (name: string) =>
       one<KubernetesObject & { spec: { podSelector: unknown; ingress: Array<{ from: unknown[]; ports: unknown }> } }>(objects, "NetworkPolicy", name).spec;
-    const driver = { matchLabels: { "kubernetes.io/metadata.name": "kube-system" } };
-    const peers = [
-      { namespaceSelector: driver, podSelector: { matchLabels: { "app.kubernetes.io/name": "juicefs-mount" } } },
-      {
-        namespaceSelector: driver,
-        podSelector: { matchLabels: { app: "juicefs-csi-controller", "app.kubernetes.io/name": "juicefs-csi-driver", "app.kubernetes.io/instance": "juicefs-csi-driver" } },
-      },
-      { namespaceSelector: driver, podSelector: { matchLabels: { app: "juicefs-csi-node", "app.kubernetes.io/name": "juicefs-csi-driver", "app.kubernetes.io/instance": "juicefs-csi-driver" } } },
-      { namespaceSelector: driver, podSelector: { matchExpressions: [{ key: "batch.kubernetes.io/job-name", operator: "Exists" }] } },
-      { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio" } }, podSelector: { matchLabels: { "alasio.dev/workload": "juicefs-admin" } } },
-    ];
+    const peers = [{ podSelector: { matchLabels: { "alasio.dev/workload": "juicefs-admin" } } }];
+    // The nodes' mount is one of them.
+    assert.equal(one<V1DaemonSet>(objects, "DaemonSet", "alasio-workspace-mount").spec?.template.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
     assert.deepEqual(policy("alasio-valkey").podSelector, { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "valkey" } });
+    const agents = { podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "node-agent" } } };
     assert.deepEqual(policy("alasio-valkey").ingress, [
-      { from: peers, ports: [{ protocol: "TCP", port: 6379 }] },
+      { from: [...peers, agents], ports: [{ protocol: "TCP", port: 6379 }] },
       {
         from: [{ podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "collector-scraper" } } }],
         ports: [{ protocol: "TCP", port: 6379 }],
@@ -2313,36 +2299,6 @@ describe("workspace storage", () => {
     assert.equal(setupVariable(objects, "VALKEY_ADDRESS"), "alasio-valkey.alasio.svc.cluster.local:6379");
   });
 
-  test("marks everything the driver needs to delete its volumes' data, so it is kept while they remain", () => {
-    const objects = install();
-    const needed = objects.filter(
-      ({ metadata }) => metadata?.labels?.["app.kubernetes.io/name"] === "juicefs-csi-driver" || metadata?.labels?.["app.kubernetes.io/component"] === "valkey",
-    );
-    // What confines and sizes them is not needed for that.
-    const kept = needed.filter(({ kind }) => kind !== "NetworkPolicy" && kind !== "VerticalPodAutoscaler");
-    assert.deepEqual(kept.map(({ kind, metadata }) => `${kind} ${metadata?.name}`), [
-      "ConfigMap alasio-valkey",
-      "Service alasio-valkey",
-      "StatefulSet alasio-valkey",
-      "CSIDriver csi.juicefs.com",
-      "PriorityClass alasio-juicefs-mount",
-      "ServiceAccount juicefs-csi-controller-sa",
-      "ServiceAccount juicefs-csi-node-sa",
-      "ClusterRole juicefs-external-provisioner-role",
-      "ClusterRole juicefs-csi-external-node-service-role",
-      "ClusterRoleBinding juicefs-csi-provisioner-binding",
-      "ClusterRoleBinding juicefs-csi-node-service-binding",
-      "ConfigMap juicefs-csi-driver-config",
-      "StatefulSet juicefs-csi-controller",
-      "DaemonSet juicefs-csi-node",
-    ]);
-    for (const object of needed) {
-      assert.equal(object.metadata?.labels?.["alasio.dev/volume-driver"], kept.includes(object) ? "csi.juicefs.com" : undefined, `${object.kind} ${object.metadata?.name}`);
-    }
-    // The Secrets the setup makes: Valkey's password and the file system's credentials.
-    assert.deepEqual(JSON.parse(setupVariable(objects, "WORKSPACES_SECRET_LABELS") ?? ""), { "alasio.dev/volume-driver": "csi.juicefs.com" });
-  });
-
   test("keeps its data in the operator's object store, with its keys, when it is theirs", () => {
     const objects = install({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com/", existingSecret: "s3", snapshotsSecret: "s3-snapshots" } } });
     assert.equal(setupVariable(objects, "WORKSPACES_BUCKET_URL"), "https://s3.example.com/workspaces");
@@ -2351,19 +2307,9 @@ describe("workspace storage", () => {
     assert.ok(one(objects, "NetworkPolicy", "alasio-valkey"));
   });
 
-  test("leaves the driver to the cluster when told", () => {
-    const objects = install({ workspaceStorage: { csi: { enabled: false } } });
-    assert.deepEqual([...all(objects, "CSIDriver"), ...all(objects, "DaemonSet").filter(({ metadata }) => metadata?.name !== "alasio-node-agent")], []);
-    assert.deepEqual(objects.filter((object) => /^(alasio-)?juicefs-(csi|mount)/u.test(object.metadata?.name ?? "")), []);
-    assert.ok(one(objects, "StorageClass", "alasio-workspaces"));
-    assert.ok(one(objects, "StatefulSet", "alasio-valkey"));
-  });
-
   test("installs nothing of it when it is off", () => {
     const objects = install({ workspaceStorage: { enabled: false } });
-    for (const kind of ["CSIDriver", "StorageClass"]) assert.deepEqual(all(objects, kind), [], kind);
     assert.deepEqual(all(objects, "DaemonSet").filter(({ metadata }) => metadata?.name !== "alasio-node-agent"), []);
-    assert.deepEqual(all(objects, "PriorityClass").filter(({ metadata }) => metadata?.name === "alasio-juicefs-mount"), []);
     assert.deepEqual(objects.filter(({ metadata }) => /valkey|juicefs|workspaces/u.test(metadata?.name ?? "")), []);
     assert.equal(setupVariable(objects, "WORKSPACES_NAME"), undefined);
     const buckets = one<V1Deployment>(objects, "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "buckets");
@@ -2407,6 +2353,8 @@ describe("node agents", () => {
       { name: "gvisor", hostPath: { path: "/usr/local/lib/alasio/gvisor", type: "DirectoryOrCreate" } },
       { name: "containerd", hostPath: { path: "/var/lib/rancher/k3s/agent/etc/containerd", type: "DirectoryOrCreate" } },
       { name: "snapshots", hostPath: { path: "/var/lib/alasio/snapshots", type: "DirectoryOrCreate" } },
+      { name: "workspaces", hostPath: { path: "/var/lib/alasio/workspaces", type: "DirectoryOrCreate" } },
+      { name: "attach", hostPath: { path: "/var/lib/alasio/attach", type: "DirectoryOrCreate" } },
     ]);
     const [container] = pod?.containers ?? [];
     assert.equal(container?.image, one<V1Deployment>(objects, "Deployment", "alasio").spec?.template.spec?.containers[0]?.image);
@@ -2417,6 +2365,9 @@ describe("node agents", () => {
       { name: "gvisor", mountPath: "/usr/local/lib/alasio/gvisor", readOnly: true },
       { name: "containerd", mountPath: "/var/lib/rancher/k3s/agent/etc/containerd", readOnly: true },
       { name: "snapshots", mountPath: "/var/lib/alasio/snapshots" },
+      // The node's mount of workspace storage, made after the agent starts, is the agent's too.
+      { name: "workspaces", mountPath: "/var/lib/alasio/workspaces", mountPropagation: "HostToContainer" },
+      { name: "attach", mountPath: "/var/lib/alasio/attach" },
     ]);
     assert.deepEqual(container?.ports, [{ name: "api", containerPort: 8484 }]);
     assert.deepEqual(container?.readinessProbe, { httpGet: { path: "/healthz", port: "api" }, periodSeconds: 10 });
@@ -2431,7 +2382,7 @@ describe("node agents", () => {
     assert.deepEqual(features?.volumeMounts, container?.volumeMounts?.filter(({ name }) => name !== "snapshots"));
   });
 
-  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their pod's address, their cache's budget in bytes, the first gVisor release that restores from the bucket, and how long a resumed restore may read it through them", () => {
+  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their pod's address, their cache's budget in bytes, the first gVisor release that restores from the bucket, how long a resumed restore may read it through them, and workspace storage's metadata engine", () => {
     const container = (file: Record<string, unknown> = {}) => agentOf(install(file)).spec?.template.spec?.containers[0];
     const env = (file: Record<string, unknown> = {}) => Object.fromEntries((container(file)?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
     assert.deepEqual(container()?.envFrom, [{ secretRef: { name: "alasio-snapshots" } }]);
@@ -2443,6 +2394,7 @@ describe("node agents", () => {
       ALASIO_GVISOR_RESTORES_FROM_BUCKET_SINCE: "20260921.0-eaucoin.7",
       // A session's 2 GiB, at 4 MiB/s.
       ALASIO_BACKGROUND_READ_SECONDS: "512",
+      META_URL: { secretKeyRef: { name: "alasio-workspaces-quotas", key: "metaurl" } },
       OTEL_SERVICE_NAME: "alasio-node-agent",
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://alasio-collector.alasio.svc:4318",
       OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf",
@@ -2452,8 +2404,9 @@ describe("node agents", () => {
     assert.equal(env({ sessions: { resources: { limits: { memory: "8Gi" } } } })["ALASIO_BACKGROUND_READ_SECONDS"], "2048");
     // A minute at least, however small a session.
     assert.equal(env({ sessions: { resources: { limits: { memory: "64Mi" } } } })["ALASIO_BACKGROUND_READ_SECONDS"], "60");
-    // Without a collector, it exports nothing.
+    // Without a collector, it exports nothing; without workspace storage, it sets no quota.
     assert.deepEqual(Object.keys(env({ lake: { enabled: false } })).filter((name) => name.startsWith("OTEL_")), []);
+    assert.equal(env({ workspaceStorage: { enabled: false } })["META_URL"], undefined);
   });
 
   test("run only where sessions run under gVisor, beside Neon, whose setup makes their Secrets", () => {
@@ -2491,7 +2444,7 @@ describe("node agents", () => {
     }
   });
 
-  test("take alasio's calls alone, and reach the cluster's DNS, the object store's S3 port and the collector alone", () => {
+  test("take the sandbox gateway's calls alone, and reach the cluster's DNS, the object store's S3 port, workspace storage's metadata engine and the collector alone", () => {
     const objects = install();
     const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
     const podOf = (component: string, namespace = "alasio") => ({
@@ -2500,11 +2453,15 @@ describe("node agents", () => {
       labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component },
     });
     const agent = podOf("node-agent");
-    assert.equal(admits(policies, podOf("alasio"), agent, 8484), true);
+    assert.equal(admits(policies, podOf("sandbox-gateway"), agent, 8484), true);
+    assert.equal(admits(policies, podOf("alasio"), agent, 8484), false);
     assert.equal(admits(policies, podOf("collector"), agent, 8484), false);
     assert.equal(admits(policies, podOf("alasio", "alasio-branch-try"), agent, 8484), false);
     assert.equal(admits(policies, { ...podOf("session", "alasio-sessions"), labels: { "alasio.dev/workload": "session" } }, agent, 8484), false);
-    assert.equal(admits(policies, podOf("alasio"), agent, 8485), false);
+    assert.equal(admits(policies, podOf("sandbox-gateway"), agent, 8485), false);
+    // Where no gateway runs, as without workspace storage, none.
+    const ungated = all<NetworkPolicyObject>(install({ workspaceStorage: { enabled: false } }), "NetworkPolicy");
+    assert.equal(admits(ungated, podOf("sandbox-gateway"), agent, 8484), false);
     assert.equal(admits(policies, agent, podOf("seaweedfs"), 8333), true);
     assert.equal(admits(policies, agent, podOf("collector"), 4318), true);
     const egress = (file: Record<string, unknown>) =>
@@ -2515,38 +2472,51 @@ describe("node agents", () => {
     };
     const selected = (component: string) => ({ podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component } } });
     assert.deepEqual(egress({}).policyTypes, ["Ingress", "Egress"]);
+    const metadata = { to: [selected("valkey")], ports: [{ protocol: "TCP", port: 6379 }] };
     assert.deepEqual(egress({}).egress, [
       dns,
       { to: [selected("seaweedfs")], ports: [{ protocol: "TCP", port: 8333 }] },
+      metadata,
       { to: [selected("collector")], ports: [{ protocol: "TCP", port: 4318 }] },
     ]);
     // An operator's object store, on its endpoint's port at any address, and no collector to reach without one.
     const external = (endpoint: string) => ({ objectStore: { bundled: { enabled: false }, external: { endpoint, existingSecret: "s3", snapshotsSecret: "s3-snapshots" } }, lake: { enabled: false } });
-    assert.deepEqual(egress(external("https://s3.example.com")).egress, [dns, { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: 443 }] }]);
-    assert.deepEqual(egress(external("http://minio.lan:9000")).egress, [dns, { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: 9000 }] }]);
+    assert.deepEqual(egress(external("https://s3.example.com")).egress, [dns, { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: 443 }] }, metadata]);
+    assert.deepEqual(egress(external("http://minio.lan:9000")).egress, [dns, { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: 9000 }] }, metadata]);
     assert.deepEqual(all(install(external("http://minio.lan:9000")), "NetworkPolicy").filter(({ metadata }) => metadata?.name === "alasio-seaweedfs-snapshots"), []);
   });
 
-  test("are found by alasio, which watches pods in its own namespace where they run, and nowhere else", () => {
-    const own = (file: Record<string, unknown>) =>
-      all<V1Role>(install(file), "Role").find(({ metadata }) => metadata?.name === "alasio" && metadata.namespace === "alasio")?.rules ?? [];
-    const pods = (...verbs: string[]) => ({ apiGroups: [""], resources: ["pods"], verbs });
-    assert.deepEqual(own({}), [pods("list", "watch", "patch"), { apiGroups: ["batch"], resources: ["jobs"], verbs: ["create", "get", "delete"] }]);
-    assert.deepEqual(own({ workspaceStorage: { enabled: false } }), [pods("list", "watch", "patch")]);
-    assert.deepEqual(own({ workspaceStorage: { enabled: false }, sessions: { runtimeClassName: "" } }), [pods("list", "patch")]);
-    const binding = one<V1RoleBinding>(install({ workspaceStorage: { enabled: false } }).filter(({ metadata }) => metadata?.namespace === "alasio"), "RoleBinding", "alasio");
-    assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
-    // A branch environment's alasio calls none.
-    const branchRules = all<V1Role>(branchObjects(configOf(), "try"), "Role").flatMap(({ rules }) => rules ?? []);
+  test("are reached by the sandbox gateway, not alasio, which watches no pod", () => {
+    for (const file of [{}, { workspaceStorage: { enabled: false } }, { sessions: { runtimeClassName: "" } }]) {
+      const own = all<V1Role>(install(file), "Role").find(({ metadata }) => metadata?.name === "alasio" && metadata.namespace === "alasio")?.rules;
+      assert.deepEqual(own, [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }], JSON.stringify(file));
+    }
+    const branchRules = all<V1Role>(branchObjects(configOf(), "try", BASELINE), "Role").filter(({ metadata }) => metadata?.name === "alasio").flatMap(({ rules }) => rules ?? []);
     assert.ok(!branchRules.some(({ resources, verbs }) => resources?.includes("pods") && verbs.includes("watch")));
   });
 });
 
 describe("security", () => {
-  test("enforces Pod Security restricted in the sessions namespace", () => {
-    const namespaces = all<V1Namespace>(install(), "Namespace");
-    assert.equal(namespaces.length, 1);
-    assert.equal(namespaces[0]?.metadata?.labels?.["pod-security.kubernetes.io/enforce"], "restricted");
+  test("enforces Pod Security restricted in the sessions namespace, and, where the sandbox service's pools mount their directories, warns and audits of it, its pods held to the pools' templates instead", () => {
+    const levels = (file: Record<string, unknown>) => {
+      const namespaces = all<V1Namespace>(install(file), "Namespace");
+      assert.equal(namespaces.length, 1);
+      return Object.fromEntries(Object.entries(namespaces[0]?.metadata?.labels ?? {}).filter(([label]) => label.startsWith("pod-security.kubernetes.io/")));
+    };
+    assert.deepEqual(levels({}), {
+      "pod-security.kubernetes.io/enforce": "privileged",
+      "pod-security.kubernetes.io/audit": "restricted",
+      "pod-security.kubernetes.io/audit-version": "latest",
+      "pod-security.kubernetes.io/warn": "restricted",
+      "pod-security.kubernetes.io/warn-version": "latest",
+    });
+    assert.equal(one(install(), "ValidatingAdmissionPolicy", "alasio-sandbox-pods").kind, "ValidatingAdmissionPolicy");
+    assert.deepEqual(levels({ workspaceStorage: { enabled: false } }), {
+      "pod-security.kubernetes.io/enforce": "restricted",
+      "pod-security.kubernetes.io/enforce-version": "latest",
+      "pod-security.kubernetes.io/warn": "restricted",
+      "pod-security.kubernetes.io/warn-version": "latest",
+    });
   });
 
   test("makes the privileged host namespace only with the host profile", () => {
@@ -2555,20 +2525,23 @@ describe("security", () => {
     assert.equal(namespaces[1]?.metadata?.labels?.["pod-security.kubernetes.io/enforce"], "privileged");
   });
 
-  test("denies everything in the sessions namespace but bayma from alasio and telemetry to it", () => {
+  test("denies everything in the sessions namespace but what the pools' policies admit, alasio reaching none of it and taking nothing of it", () => {
     const objects = install();
     const policy = (name: string) => one<KubernetesObject & { spec: Record<string, unknown> }>(objects, "NetworkPolicy", name).spec;
     assert.deepEqual(policy("default-deny")["policyTypes"], ["Ingress", "Egress"]);
     assert.deepEqual(policy("default-deny")["podSelector"], {});
-    assert.deepEqual((policy("bayma-from-alasio")["ingress"] as Array<{ ports: unknown }>)[0]?.ports, [{ protocol: "TCP", port: 7290 }]);
-    assert.deepEqual((policy("telemetry-to-alasio")["egress"] as Array<{ ports: unknown }>)[0]?.ports, [{ protocol: "TCP", port: 4318 }]);
+    const inSessions = all<KubernetesObject>(objects, "NetworkPolicy").filter(({ metadata }) => metadata?.namespace === "alasio-sessions").map(({ metadata }) => metadata?.name).sort();
+    assert.deepEqual(inSessions, ["alasio-sandboxes", "alasio-sandboxes-full-internet", "default-deny"]);
+    // alasio takes none of its sessions' telemetry: no rule of its admits its port.
+    const ports = ((policy("alasio-alasio")["ingress"] ?? []) as Array<{ ports?: Array<{ port: number }> }>).flatMap((rule) => rule.ports ?? []).map(({ port }) => port);
+    assert.ok(!ports.includes(4318), String(ports));
   });
 
   test("keeps a session with internet off private, link-local and metadata addresses", () => {
     const policy = one<KubernetesObject & { spec: { podSelector: { matchLabels: Record<string, string> }; egress: Array<{ to: Array<{ ipBlock: { except: string[] } }> }> } }>(
       install(),
       "NetworkPolicy",
-      "full-internet",
+      "alasio-sandboxes-full-internet",
     );
     assert.equal(policy.spec.podSelector.matchLabels["alasio.dev/net-mode"], "full");
     const except = policy.spec.egress[0]?.to[0]?.ipBlock.except;
@@ -2579,106 +2552,30 @@ describe("security", () => {
     assert.deepEqual(all(install({ networkPolicies: { enabled: false } }), "NetworkPolicy"), []);
   });
 
-  test("lets alasio manage only Sandboxes, their token Secrets, exec and their pods' busy labels in its namespaces, and its own pod's in its own", () => {
-    const roles = all<V1Role>(install({ workspaceStorage: { enabled: false }, sessions: { runtimeClassName: "" } }), "Role").filter((role) => role.metadata?.name === "alasio");
-    assert.deepEqual(Object.fromEntries(roles.map(({ metadata, rules }) => [metadata?.namespace, rules])), {
-      "alasio-sessions": [
-        { apiGroups: ["agents.x-k8s.io"], resources: ["sandboxes"], verbs: ["get", "list", "watch", "create", "patch", "delete"] },
-        { apiGroups: [""], resources: ["secrets"], verbs: ["get", "create"] },
-        { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "patch"] },
-        { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
-      ],
-      alasio: [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }],
-    });
-    // Where node agents run, alasio finds each by its pod on the node.
-    const withAgents = all<V1Role>(install({ workspaceStorage: { enabled: false } }), "Role").find(({ metadata }) => metadata?.name === "alasio" && metadata.namespace === "alasio");
-    assert.deepEqual(withAgents?.rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "watch", "patch"] }]);
-  });
-
-  test("lets alasio read sessions' claims and run the Jobs that clone them in its own namespace, only where it forks sessions", () => {
+  test("lets alasio label its own pod busy in its own namespace and nothing else, nothing of its sessions or folder instances, which are the sandbox gateway's", () => {
     const rolesOf = (objects: readonly KubernetesObject[]) =>
       Object.fromEntries(all<V1Role>(objects, "Role").filter((role) => role.metadata?.name === "alasio").map(({ metadata, rules }) => [metadata?.namespace, rules]));
-    const objects = install({ host: { enabled: true }, sessions: { runtimeClassName: "" } });
-    const roles = rolesOf(objects);
-    assert.deepEqual(roles["alasio"]?.at(-1), { apiGroups: ["batch"], resources: ["jobs"], verbs: ["create", "get", "delete"] });
-    assert.deepEqual(roles["alasio-sessions"]?.at(-1), { apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get"] });
-    assert.ok(!JSON.stringify(roles["alasio-host"]).includes("persistentvolumeclaims"));
+    const own = [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }];
+    const objects = install({ host: { enabled: true } });
+    assert.deepEqual(rolesOf(objects), { alasio: own });
     const binding = one<V1RoleBinding>(objects.filter(({ metadata }) => metadata?.namespace === "alasio"), "RoleBinding", "alasio");
     assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
     assert.deepEqual(binding.roleRef, { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: "alasio" });
-    const unforked = rolesOf(install({ sessions: { storage: { storageClassName: "fast" } } }));
-    assert.ok(!JSON.stringify(unforked["alasio"]).includes("jobs"));
-    assert.ok(!JSON.stringify(unforked["alasio-sessions"]).includes("persistentvolumeclaims"));
-  });
-
-  test("lets alasio list and delete pods in JuiceFS's driver's namespace, its mount pods, only where it installs the driver, and tells it where", () => {
-    const mountPodRoles = (objects: readonly KubernetesObject[]) => all<V1Role>(objects, "Role").filter((role) => role.metadata?.name === "alasio" && role.metadata.namespace === "kube-system");
-    const sessions = (objects: readonly KubernetesObject[]): SessionsProfile => JSON.parse(templates(objects)).sessions;
-    const objects = install();
-    assert.deepEqual(mountPodRoles(objects).map(({ rules }) => rules), [[{ apiGroups: [""], resources: ["pods"], verbs: ["list", "delete"] }]]);
-    const binding = one<V1RoleBinding>(objects.filter(({ metadata }) => metadata?.namespace === "kube-system"), "RoleBinding", "alasio");
-    assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
-    assert.deepEqual(binding.roleRef, { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: "alasio" });
-    assert.equal(sessions(objects).mountPodNamespace, "kube-system");
-    for (const off of [{ enabled: false }, { csi: { enabled: false } }]) {
-      const without = install({ workspaceStorage: off });
-      assert.deepEqual(mountPodRoles(without), []);
-      assert.equal(sessions(without).mountPodNamespace, undefined);
-    }
-  });
-
-  test("snapshots main's sessions where the node agents run: after releaseAfter, live every liveEvery, under the kept gVisor releases, by the agents alasio presents its token to", () => {
-    const sessions = (objects: readonly KubernetesObject[]): SessionsProfile => JSON.parse(templates(objects)).sessions;
-    const sessionsRole = (objects: readonly KubernetesObject[]) =>
-      all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio" && metadata.namespace === "alasio-sessions")?.rules ?? [];
-    const tokenOf = (objects: readonly KubernetesObject[]) => container(one<V1Deployment>(objects, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_NODE_AGENT_TOKEN");
-    const objects = install({ sessions: { snapshots: { releaseAfter: "10m", liveEvery: "15m", stopWait: "45s" } } });
-    assert.deepEqual(sessions(objects).snapshots, {
-      releaseAfterSeconds: 600,
-      liveEverySeconds: 900,
-      releases: NODE_PINS.gvisor.releases.map(({ release }) => ({ release, runtimeClassName: `gvisor-${release.split(".").join("-")}` })),
-      agents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", port: 8484 },
-    });
-    assert.deepEqual(tokenOf(objects), { name: "ALASIO_NODE_AGENT_TOKEN", valueFrom: { secretKeyRef: { name: "alasio-node-agent", key: "token" } } });
-    // The nodes, read alone, for a restore to go to one that takes the session's pod.
-    assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-nodes").rules, [{ apiGroups: [""], resources: ["nodes"], verbs: ["get"] }]);
-    assert.deepEqual(one<V1ClusterRoleBinding>(objects, "ClusterRoleBinding", "alasio-nodes").subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
-    assert.equal(one<V1ClusterRoleBinding>(objects, "ClusterRoleBinding", "alasio-nodes").roleRef.name, "alasio-nodes");
-    assert.ok(sessionsRole(objects).some(({ resources, verbs }) => resources?.includes("pods/status") && verbs.join() === "patch"));
-    assert.ok(sessionsRole(objects).some(({ apiGroups, resources, verbs }) => apiGroups?.join() === "networking.k8s.io" && resources?.join() === "networkpolicies" && verbs.join() === "list"));
-    // The templates its snapshots restore into are alasio up's to carry forward, not alasio's to record: no role of its own lets it write a ConfigMap.
-    const bound = new Set(all<V1RoleBinding>(objects, "RoleBinding").filter(({ subjects }) => subjects?.some(({ kind, name, namespace }) => kind === "ServiceAccount" && name === "alasio" && namespace === "alasio")).map(({ metadata, roleRef }) => `${metadata?.namespace}/${roleRef.name}`));
+    // Of no cluster's, but what the gateway reads of the nodes is the gateway's.
+    const main = install();
+    assert.deepEqual(rolesOf(main), { alasio: own });
     const ofAlasio = ({ subjects }: V1RoleBinding) => subjects?.some(({ kind, name, namespace }) => kind === "ServiceAccount" && name === "alasio" && namespace === "alasio");
-    const clusterBound = new Set(all<V1RoleBinding>(objects, "ClusterRoleBinding").filter(ofAlasio).map(({ roleRef }) => roleRef.name));
-    const alasioRoles = [
-      ...all<V1Role>(objects, "Role").filter(({ metadata }) => bound.has(`${metadata?.namespace}/${metadata?.name}`)),
-      ...all<V1Role>(objects, "ClusterRole").filter(({ metadata }) => clusterBound.has(metadata?.name ?? "")),
-    ];
+    assert.deepEqual(all<V1RoleBinding>(main, "ClusterRoleBinding").filter(ofAlasio), []);
+    assert.deepEqual(one<V1ClusterRoleBinding>(main, "ClusterRoleBinding", "alasio-sandbox-gateway-nodes").subjects, [{ kind: "ServiceAccount", name: "alasio-sandbox-gateway", namespace: "alasio" }]);
+    assert.deepEqual(one<V1ClusterRole>(main, "ClusterRole", "alasio-sandbox-gateway-nodes").rules, [{ apiGroups: [""], resources: ["nodes"], verbs: ["get"] }]);
+    // No node agent's token, nor JuiceFS's mount pods, which are the gateway's and the nodes' mount's.
+    assert.equal(container(one<V1Deployment>(main, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_NODE_AGENT_TOKEN"), undefined);
+    assert.deepEqual(all<V1RoleBinding>(main, "RoleBinding").filter((each) => ofAlasio(each) && each.metadata?.namespace !== "alasio").map(({ metadata }) => metadata?.namespace), []);
+    // Its templates are alasio up's to render, not alasio's to write: no role of its own lets it write a ConfigMap.
+    const bound = all<V1RoleBinding>(objects, "RoleBinding").filter(ofAlasio).map(({ metadata, roleRef }) => `${metadata?.namespace}/${roleRef.name}`);
+    const alasioRoles = all<V1Role>(objects, "Role").filter(({ metadata }) => bound.includes(`${metadata?.namespace}/${metadata?.name}`));
     assert.ok(alasioRoles.length > 0);
     assert.ok(!alasioRoles.some(({ rules }) => rules?.some(({ resources, verbs }) => resources?.includes("configmaps") && verbs.some((verb) => verb !== "get" && verb !== "list" && verb !== "watch"))));
-    // A release the cluster keeps for snapshots that name it, beside the pinned ones, restores them, its RuntimeClass admitted.
-    const kept = manifests(configOf({}), { ...NOTHING_CARRIED, cpuBaseline: BASELINE, gvisorReleases: [...NODE_PINS.gvisor.releases.map(({ release }) => release), "20990101.0"] });
-    assert.deepEqual(sessions(kept).snapshots?.releases.at(-1), { release: "20990101.0", runtimeClassName: "gvisor-20990101-0" });
-    assert.ok(JSON.stringify(one(kept, "ValidatingAdmissionPolicy", "alasio-sandboxes")).includes('\\"gvisor-20990101-0\\"'));
-    // Its bayma holds a stop alasio did not make for that long, its pod given that and 30 s more.
-    const spec = sessions(objects).podTemplate.spec;
-    assert.equal(spec?.terminationGracePeriodSeconds, 75);
-    assert.deepEqual(spec?.containers[0]?.args?.slice(-2), ["--stop-wait-ms", "45000"]);
-    // Until alasio up records a CPU baseline, nothing is snapshotted, though the agents run to say what their nodes have.
-    const unheld = install({}, null);
-    assert.equal(sessions(unheld).snapshots, undefined);
-    assert.equal(sessions(unheld).podTemplate.spec?.terminationGracePeriodSeconds, undefined);
-    assert.ok(!sessions(unheld).podTemplate.spec?.containers[0]?.args?.includes("--stop-wait-ms"));
-    assert.equal(sessions(unheld).podTemplate.metadata?.annotations?.["dev.gvisor.internal.cpufeatures"], undefined);
-    const variables = one<KubernetesObject & { spec: { variables: unknown } }>(unheld, "ValidatingAdmissionPolicy", "alasio-sandboxes").spec.variables;
-    assert.ok(!JSON.stringify(variables).includes("dev.gvisor.internal"));
-    assert.equal(all(unheld, "DaemonSet").filter(({ metadata }) => metadata?.name === "alasio-node-agent").length, 1);
-    // Under the cluster's default runtime, nothing is snapshotted.
-    const unsnapshotted = install({ sessions: { runtimeClassName: "" } });
-    assert.equal(sessions(unsnapshotted).snapshots, undefined);
-    assert.equal(tokenOf(unsnapshotted), undefined);
-    assert.ok(!sessionsRole(unsnapshotted).some(({ resources }) => resources?.includes("pods/status") || resources?.includes("networkpolicies")));
-    assert.deepEqual(all(unsnapshotted, "ClusterRole").filter(({ metadata }) => metadata?.name === "alasio-nodes"), []);
   });
 
   test("lets the host profile's agents restart alasio's own Deployment and nothing else", () => {
@@ -2688,7 +2585,7 @@ describe("security", () => {
 });
 
 describe("branch environments", () => {
-  const branch = branchObjects(configOf(), "try");
+  const branch = branchObjects(configOf(), "try", BASELINE);
   const variable = (workload: V1Deployment, name: string) => container(workload).env?.find((env) => env.name === name)?.value;
   /** An object of the branch's, of `kind` and `name`, in `namespace`. */
   const of = <T extends KubernetesObject>(kind: string, name: string, namespace = "alasio-branch-try") =>
@@ -2699,16 +2596,19 @@ describe("branch environments", () => {
       ["alasio-branch-try", "try"],
       ["alasio-branch-try-sessions", "try"],
     ]);
-    assert.equal(of<V1Namespace>("Namespace", "alasio-branch-try-sessions").metadata?.labels?.["pod-security.kubernetes.io/enforce"], "restricted");
+    // Its pods held to the sandbox pools' templates, as main's are (./admission.ts sandboxPodPolicy).
+    assert.equal(of<V1Namespace>("Namespace", "alasio-branch-try-sessions").metadata?.labels?.["pod-security.kubernetes.io/enforce"], "privileged");
+    assert.equal(of<V1Namespace>("Namespace", "alasio-branch-try-sessions").metadata?.labels?.["pod-security.kubernetes.io/warn"], "restricted");
+    // Its sessions' namespace records main its parent, as the sandbox gateway forks main's sessions into it for that alone; its alasio's, and main's, record none.
+    assert.deepEqual(all<V1Namespace>(branch, "Namespace").map(({ metadata }) => metadata?.labels?.["alasio.dev/branch-parent"]), [undefined, "main"]);
+    assert.deepEqual(all<V1Namespace>(install(), "Namespace").map(({ metadata }) => metadata?.labels?.["alasio.dev/branch-parent"]).filter((parent) => parent !== undefined), []);
     assert.deepEqual(branch.filter(({ metadata }) => metadata?.labels?.["alasio.dev/branch"] !== "try"), []);
-    // But its Sandboxes' admission policy, which is the cluster's.
-    assert.deepEqual(branch.filter(({ kind, metadata }) => kind !== "Namespace" && !metadata?.namespace?.startsWith("alasio-branch-try")).map(({ kind, metadata }) => [kind, metadata?.name]), [
-      ["ValidatingAdmissionPolicy", "alasio-branch-try-sandboxes"],
-      ["ValidatingAdmissionPolicyBinding", "alasio-branch-try-sandboxes"],
-    ]);
-    assert.deepEqual(all<V1Deployment>(branch, "Deployment").map(({ metadata }) => metadata?.name).sort(), ["alasio", "alasio-lake-loader", "alasio-neon-compute", "alasio-neon-compute-ro"]);
+    // Nothing of the cluster's.
+    assert.deepEqual(branch.filter(({ kind, metadata }) => kind !== "Namespace" && !metadata?.namespace?.startsWith("alasio-branch-try")).map(({ kind, metadata }) => [kind, metadata?.name]), []);
+    // Its sessions' pools beside, the sandbox service's (main's binds in them).
+    assert.deepEqual(all<V1Deployment>(branch, "Deployment").map(({ metadata }) => metadata?.name).sort(), ["alasio", "alasio-lake-loader", "alasio-neon-compute", "alasio-neon-compute-ro", "sandboxes-full", "sandboxes-none"]);
     // Named as main's are, as each namespace is the branch's own.
-    assert.deepEqual(all<V1Service>(branch, "Service").map(({ metadata }) => metadata?.name).sort(), ["alasio-neon-compute", "alasio-neon-compute-ro", "alasio-telemetry"]);
+    assert.deepEqual(all<V1Service>(branch, "Service").map(({ metadata }) => metadata?.name).sort(), ["alasio-neon-compute", "alasio-neon-compute-ro"]);
   });
 
   test("run an alasio that knows it is the branch, asks main to fork what it inherited with its token, and sends its telemetry tagged with the branch", () => {
@@ -2717,43 +2617,38 @@ describe("branch environments", () => {
     assert.equal(variable(alasio, "ALASIO_PARENT_FORKS_URL"), "http://alasio-branches.alasio.svc:4319");
     assert.equal(variable(alasio, "ALASIO_BRANCH_FORK_TOKEN_FILE"), "/run/alasio/branch/token");
     assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "branch"), { name: "branch", secret: { secretName: "alasio-branch-fork", items: [{ key: "token", path: "token" }] } });
-    assert.equal(variable(alasio, "ALASIO_TELEMETRY_RECEIVER_SERVICE"), "alasio-telemetry.alasio-branch-try.svc");
+    // Its sessions' telemetry is the sandbox service's receiver's, never its own.
+    assert.equal(variable(alasio, "ALASIO_TELEMETRY_RECEIVER_SERVICE"), undefined);
+    assert.equal(container(alasio).ports, undefined);
+    // Its sessions through main's gateway, as the branch, by the branch's own key of the gateway's, in its own namespace.
+    assert.equal(variable(alasio, "ALASIO_GATEWAY_URL"), "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080");
+    assert.equal(variable(alasio, "ALASIO_GATEWAY_ENVIRONMENT"), "try");
+    assert.deepEqual(container(alasio).env?.find(({ name }) => name === "ALASIO_GATEWAY_CALLER_KEY")?.valueFrom, { secretKeyRef: { name: "alasio-sessions-caller", key: "caller-key" } });
     assert.equal(variable(alasio, "ALASIO_BRANCH_FORK_KEY_FILE"), undefined);
     // It makes no role for what reads main's Neon beside it, which a branch has none of.
     assert.equal(variable(alasio, "ALASIO_LAKE_READER_VERIFIER_FILE"), undefined);
     assert.equal(variable(alasio, "ALASIO_GRAFANA_VERIFIER_FILE"), undefined);
     assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "database")?.secret?.items?.map(({ key }) => key), ["url", "lake-verifier", "harness-verifier"]);
-    for (const workload of all<V1Deployment>(branch, "Deployment")) {
+    // Its sandboxes' telemetry is tagged by main's receiver, as each binding's token names its namespace.
+    for (const workload of all<V1Deployment>(branch, "Deployment").filter(({ metadata }) => !metadata?.name?.startsWith("sandboxes-"))) {
       assert.equal(variable(workload, "OTEL_RESOURCE_ATTRIBUTES"), "alasio.branch=try", workload.metadata?.name);
     }
-    const tagged = branchObjects(configOf({ telemetry: { resourceAttributes: "deployment.environment.name=prod" } }), "try");
+    const tagged = branchObjects(configOf({ telemetry: { resourceAttributes: "deployment.environment.name=prod" } }), "try", BASELINE);
     assert.equal(variable(one<V1Deployment>(tagged, "Deployment", "alasio"), "OTEL_RESOURCE_ATTRIBUTES"), "deployment.environment.name=prod,alasio.branch=try");
   });
 
-  test("make sessions in the branch's namespace alone, which it neither clones nor reaches JuiceFS's mount pods for", () => {
-    const templates = JSON.parse(of<V1ConfigMap>("ConfigMap", "alasio-sandbox-templates").data?.["templates.json"] ?? "");
-    assert.equal(templates.sessions.namespace, "alasio-branch-try-sessions");
-    assert.equal(templates.sessions.clone, undefined);
-    assert.equal(templates.sessions.mountPodNamespace, undefined);
-    assert.equal(templates.host, undefined);
+  test("make no session of its alasio's, its sessions main's sandbox service's in the branch's own namespace", () => {
     const roles = all<V1Role>(branch, "Role");
     assert.deepEqual(roles.map(({ metadata }) => [metadata?.namespace, metadata?.name]), [
-      ["alasio-branch-try-sessions", "alasio"],
       // Its own pod, which it labels busy as main's does.
       ["alasio-branch-try", "alasio"],
       // main's neon-control, which wakes its compute and puts it to sleep.
       ["alasio-branch-try", "alasio-neon-control"],
-      ["alasio-branch-try-sessions", "alasio-parent"],
+      // main's sandbox gateway and receiver, which bind in its pools and watch their Leases.
+      ["alasio-branch-try-sessions", "alasio-sandbox-gateway"],
+      ["alasio-branch-try-sessions", "alasio-receiver"],
     ]);
     assert.deepEqual(of<V1Role>("Role", "alasio", "alasio-branch-try").rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }]);
-    const binding = of<V1RoleBinding>("RoleBinding", "alasio", "alasio-branch-try-sessions");
-    assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio-branch-try" }]);
-    // main's alasio, which forks the sessions the branch inherited into it.
-    assert.deepEqual(of<V1Role>("Role", "alasio-parent", "alasio-branch-try-sessions").rules, [
-      { apiGroups: ["agents.x-k8s.io"], resources: ["sandboxes"], verbs: ["create", "delete"] },
-      { apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get"] },
-    ]);
-    assert.deepEqual(of<V1RoleBinding>("RoleBinding", "alasio-parent", "alasio-branch-try-sessions").subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
   });
 
   test("run a compute on the branch's timeline, from main's neon-control, which alone scales it, and a lake's loader woken on the branch's wake topic, and never maintained", () => {
@@ -2797,15 +2692,12 @@ describe("branch environments", () => {
     assert.ok(of<KubernetesObject>("NetworkPolicy", "alasio-neon-compute-ro"));
   });
 
-  test("confine the branch's sessions to its alasio, and have a policy of its compute's", () => {
+  test("confine the branch's sessions to what the pools' policies admit, its alasio reached by nothing, and have a policy of its compute's", () => {
     const policy = (name: string, namespace: string) => of<KubernetesObject & { spec: Record<string, unknown> }>("NetworkPolicy", name, namespace).spec;
-    const alasio = { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio-branch-try" } }, podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "alasio" } } };
-    assert.deepEqual(policy("bayma-from-alasio", "alasio-branch-try-sessions")["ingress"], [{ from: [alasio], ports: [{ protocol: "TCP", port: 7290 }] }]);
-    assert.deepEqual(policy("telemetry-to-alasio", "alasio-branch-try-sessions")["egress"], [{ to: [alasio], ports: [{ protocol: "TCP", port: 4318 }] }]);
-    assert.deepEqual(policy("alasio-alasio", "alasio-branch-try")["ingress"], [{
-      from: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio-branch-try-sessions" } }, podSelector: { matchLabels: { "alasio.dev/workload": "session" } } }],
-      ports: [{ protocol: "TCP", port: 4318 }],
-    }]);
+    assert.deepEqual(policy("default-deny", "alasio-branch-try-sessions")["podSelector"], {});
+    assert.deepEqual(all<KubernetesObject>(branch, "NetworkPolicy").filter(({ metadata }) => metadata?.namespace === "alasio-branch-try-sessions").map(({ metadata }) => metadata?.name).sort(), ["alasio-sandboxes", "alasio-sandboxes-full-internet", "default-deny"]);
+    // Its alasio takes no connection, its sessions' telemetry the sandbox service's receiver's.
+    assert.equal(policy("alasio-alasio", "alasio-branch-try")["ingress"], undefined);
     assert.ok(policy("alasio-neon-compute", "alasio-branch-try"));
   });
 
@@ -2910,22 +2802,21 @@ describe("branch environments", () => {
     });
     assert.deepEqual(one<V1Service>(main, "Service", "alasio-branches").spec?.ports, [{ name: "branch-forks", port: 4319, targetPort: "branch-forks" }]);
     // Where main forks no session, it serves no fork.
-    const unforked = install({ sessions: { storage: { storageClassName: "fast" } } });
+    const unforked = install({ workspaceStorage: { enabled: false } });
     assert.equal(container(one<V1Deployment>(unforked, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_BRANCH_FORK_KEY_FILE"), undefined);
     assert.deepEqual(all(unforked, "Service").filter(({ metadata }) => metadata?.name === "alasio-branches"), []);
   });
 });
 
-/** Every pod spec of `objects`, by what makes it: its workload's, Job's or CronJob's name, or the templates' Sandboxes'. */
+/** Every pod spec of `objects`, by what makes it: its workload's, Job's or CronJob's name, or the folder template's, of the folder instances the gateway makes. */
 function podSpecs(objects: readonly KubernetesObject[]): [string, V1PodSpec][] {
   const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet"), ...all<V1DaemonSet>(objects, "DaemonSet"), ...all<V1Job>(objects, "Job")];
-  const parsed = JSON.parse(templates(objects)) as { sessions?: SessionsProfile & { clone?: { job: V1Job } }; host?: { podTemplate: { spec: V1PodSpec } } };
+  const gateway = all<V1ConfigMap>(objects, "ConfigMap").find(({ metadata }) => metadata?.name === "alasio-sandbox-gateway");
+  const parsed = JSON.parse(gateway?.data?.["config.json"] ?? "{}") as { folders?: { template: { spec: V1PodSpec } } | null };
   return [
     ...workloads.map(({ metadata, spec }): [string, V1PodSpec] => [metadata?.name ?? "", spec?.template.spec ?? { containers: [] }]),
     ...all<V1CronJob>(objects, "CronJob").map(({ metadata, spec }): [string, V1PodSpec] => [metadata?.name ?? "", spec?.jobTemplate.spec?.template.spec ?? { containers: [] }]),
-    ...(parsed.sessions ? [["session", parsed.sessions.podTemplate.spec as V1PodSpec] as [string, V1PodSpec]] : []),
-    ...(parsed.sessions?.clone ? [["clone", parsed.sessions.clone.job.spec?.template.spec ?? { containers: [] }] as [string, V1PodSpec]] : []),
-    ...(parsed.host ? [["folder-bayma", parsed.host.podTemplate.spec] as [string, V1PodSpec]] : []),
+    ...(parsed.folders ? [["folder-bayma", parsed.folders.template.spec] as [string, V1PodSpec]] : []),
   ];
 }
 
@@ -2935,12 +2826,11 @@ describe("scaling", () => {
     const classes = new Map(all<V1PriorityClass>(objects, "PriorityClass").map((each) => [each.metadata?.name ?? "", each]));
     const value = (name: string) => classes.get(name)?.value ?? Number.NaN;
     assert.equal(value("alasio-floor"), value("alasio-turn"));
-    assert.ok(value("alasio-bound") > value("alasio-floor") && value("alasio-juicefs-mount") > value("alasio-bound"));
+    assert.ok(value("alasio-bound") > value("alasio-floor"));
     assert.ok(value("alasio-turn") > value("alasio-component") && value("alasio-component") > value("alasio-headroom"));
-    assert.ok(value("alasio-juicefs-mount") > value("alasio-floor"));
-    assert.deepEqual([...classes.values()].filter(({ preemptionPolicy }) => preemptionPolicy === "Never").map(({ metadata }) => metadata?.name).sort(), ["alasio-headroom", "alasio-juicefs-mount"]);
+    assert.deepEqual([...classes.values()].filter(({ preemptionPolicy }) => preemptionPolicy === "Never").map(({ metadata }) => metadata?.name), ["alasio-headroom"]);
     const tiers = new Map(podSpecs(objects).map(([name, spec]) => [name, spec.priorityClassName]));
-    for (const [name, priorityClassName] of [...tiers, ...podSpecs(branchObjects(configOf(), "try")).map(([name, spec]) => [name, spec.priorityClassName])]) {
+    for (const [name, priorityClassName] of [...tiers, ...podSpecs(branchObjects(configOf(), "try", BASELINE)).map(([name, spec]) => [name, spec.priorityClassName])]) {
       assert.ok(priorityClassName && (classes.has(priorityClassName) || priorityClassName.startsWith("system-")), name);
     }
     assert.deepEqual(["alasio-seaweedfs", "alasio-grafana", "alasio-collector", "alasio-lake-query"].map((name) => tiers.get(name)), Array(4).fill("alasio-floor"));
@@ -2960,21 +2850,21 @@ describe("scaling", () => {
       "alasio-valkey",
     ]);
     assert.deepEqual([...tiers].filter(([, priorityClassName]) => priorityClassName === "alasio-bound").map(([name]) => name).sort(), held(objects));
-    assert.deepEqual(held(branchObjects(configOf(), "try")), []);
+    assert.deepEqual(held(branchObjects(configOf(), "try", BASELINE)), []);
     // Main's compute is alasio's database, which every turn needs.
     assert.equal(tiers.get("alasio-neon-compute"), "alasio-floor");
     // Its read replica serves the lake's loads, which may wait.
     assert.equal(tiers.get("alasio-neon-compute-ro"), "alasio-component");
-    assert.deepEqual(["alasio-neon-setup", "alasio-neon-backup", "clone"].map((name) => tiers.get(name)), Array(3).fill("alasio-component"));
-    assert.deepEqual(["alasio", "session", "folder-bayma"].map((name) => tiers.get(name)), Array(3).fill("alasio-turn"));
+    assert.deepEqual(["alasio-neon-setup", "alasio-neon-backup"].map((name) => tiers.get(name)), Array(2).fill("alasio-component"));
+    assert.deepEqual(["alasio", "sandboxes-none", "sandboxes-full", "folder-bayma"].map((name) => tiers.get(name)), Array(4).fill("alasio-turn"));
     // A branch's alasio runs turns; its lake's loader and its compute sleep.
-    const branch = new Map(podSpecs(branchObjects(configOf(), "try")).map(([name, spec]) => [name, spec.priorityClassName]));
+    const branch = new Map(podSpecs(branchObjects(configOf(), "try", BASELINE)).map(([name, spec]) => [name, spec.priorityClassName]));
     assert.deepEqual(["alasio", "alasio-lake-loader", "alasio-neon-compute"].map((name) => branch.get(name)), ["alasio-turn", "alasio-component", "alasio-component"]);
   });
 
   test("lets alasio's pods take others' places only on a cluster it makes, unless told, and keeps no headroom where they may not", () => {
     const policies = (objects: readonly KubernetesObject[]) =>
-      all<V1PriorityClass>(objects, "PriorityClass").filter(({ metadata }) => metadata?.name !== "alasio-juicefs-mount").map(({ metadata, preemptionPolicy }) => [metadata?.name, preemptionPolicy]);
+      all<V1PriorityClass>(objects, "PriorityClass").map(({ metadata, preemptionPolicy }) => [metadata?.name, preemptionPolicy]);
     assert.deepEqual(policies(install()), [
       ["alasio-bound", "PreemptLowerPriority"],
       ["alasio-floor", "PreemptLowerPriority"],
@@ -2993,7 +2883,7 @@ describe("scaling", () => {
   });
 
   test("sizes every workload by a VerticalPodAutoscaler beside it: in place what keeps no state and runs no turn, the rest recommended alone, from a small floor to its memory limit", () => {
-    const objects = [...install({ host: { enabled: true } }), ...branchObjects(configOf(), "try")];
+    const objects = [...install({ host: { enabled: true } }), ...branchObjects(configOf(), "try", BASELINE)];
     const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet"), ...all<V1DaemonSet>(objects, "DaemonSet")];
     const sized = all<VerticalPodAutoscaler>(objects, "VerticalPodAutoscaler");
     const key = ({ metadata }: KubernetesObject) => `${metadata?.namespace}/${metadata?.name}`;
@@ -3014,8 +2904,9 @@ describe("scaling", () => {
       "alasio-seaweedfs-filer-store",
       "alasio-log",
       "alasio-valkey",
-      "juicefs-csi-controller",
-      "juicefs-csi-node",
+      "sandboxes-none",
+      "sandboxes-full",
+      "alasio-workspace-mount",
     ];
     for (const [name, mode] of modes) assert.equal(mode, recommended.includes(name.split("/")[1] ?? "") ? "Off" : "InPlace", name);
     // A branch's alasio runs turns as main's does.
@@ -3033,10 +2924,10 @@ describe("scaling", () => {
     }
   });
 
-  test("lets no busy pod of alasio's be evicted, in its namespace and each of its workspaces', and tells alasio its pod's name to label", () => {
-    const objects = [...install({ host: { enabled: true } }), ...branchObjects(configOf(), "try")];
+  test("lets no busy pod of alasio's be evicted, in its namespace, and tells alasio its pod's name to label", () => {
+    const objects = [...install({ host: { enabled: true } }), ...branchObjects(configOf(), "try", BASELINE)];
     const budgets = all<KubernetesObject & { spec: object }>(objects, "PodDisruptionBudget").filter(({ metadata }) => metadata?.name === "alasio-busy");
-    assert.deepEqual(budgets.map(({ metadata }) => metadata?.namespace).sort(), ["alasio", "alasio-branch-try", "alasio-branch-try-sessions", "alasio-host", "alasio-sessions"]);
+    assert.deepEqual(budgets.map(({ metadata }) => metadata?.namespace).sort(), ["alasio", "alasio-branch-try"]);
     // But one not ready, whose label a turn that may never end holds.
     for (const { spec } of budgets) assert.deepEqual(spec, { maxUnavailable: 0, selector: { matchLabels: { "alasio.dev/busy": "true" } }, unhealthyPodEvictionPolicy: "AlwaysAllow" });
     assert.deepEqual(container(one<V1Deployment>(install(), "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_POD"), {
@@ -3069,8 +2960,8 @@ describe("scaling", () => {
     assert.ok(policy.spec.validations[1]?.expression.includes("object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([])"));
     assert.ok(policy.spec.validations[3]?.expression.includes('key in ["alasio.dev/busy"]'));
     assert.deepEqual(one<KubernetesObject & { spec: object }>(objects, "ValidatingAdmissionPolicyBinding", "alasio-busy-label").spec, { policyName: "alasio-busy-label", validationActions: ["Deny"] });
-    // The cluster's, made with main's alone; a branch makes its Sandboxes' alone.
-    assert.deepEqual(all(branchObjects(configOf(), "try"), "ValidatingAdmissionPolicy").map(({ metadata }) => metadata?.name), ["alasio-branch-try-sandboxes"]);
+    // The cluster's, made with main's alone.
+    assert.deepEqual(all(branchObjects(configOf(), "try", BASELINE), "ValidatingAdmissionPolicy"), []);
   });
 
   test("lets neon-control change no more of a compute's Deployment than its pod template's restartedAt, which restarts it", () => {
@@ -3195,150 +3086,473 @@ describe("admission", () => {
   /** The expression of the variable `name` of the policy `policy` of `objects`. */
   const variableOf = (objects: readonly KubernetesObject[], policy: string, name: string): string =>
     one<Policy>(objects, "ValidatingAdmissionPolicy", policy).spec.variables?.find((variable) => variable.name === name)?.expression ?? "";
-  /** The keys the pin of `field` in `expression` allows, of its last pin where `last`. */
-  const keysOf = (expression: string, field: string, last = false) => {
-    const pin = `${field}.all(key, key in [`;
-    const at = last ? expression.lastIndexOf(pin) : expression.indexOf(pin);
-    return at < 0 ? null : JSON.parse(expression.slice(at + pin.length - 1, expression.indexOf("]", at + pin.length) + 1));
-  };
   const binding = (objects: readonly KubernetesObject[], name: string) => one<KubernetesObject & { spec: object }>(objects, "ValidatingAdmissionPolicyBinding", name).spec;
 
-  test("lets alasio restore a Sandbox only paused and gated on its resume, and set of a pod's status a restored session's resumed condition alone, true", () => {
+  test("lets the sandbox gateway set of a pod's status a restore's resumed condition alone, true, where main's sessions are snapshotted", () => {
     const objects = install();
-    const restore = one<Policy>(objects, "ValidatingAdmissionPolicy", "alasio-sandboxes").spec.validations[1]?.expression;
-    assert.equal(
-      restore,
-      '("dev.gvisor.internal.restore.host-image-path" in object.spec.podTemplate.?metadata.?annotations.orValue({})) == ' +
-        '("dev.gvisor.internal.restore.paused" in object.spec.podTemplate.?metadata.?annotations.orValue({})) && ' +
-        '(!("dev.gvisor.internal.restore.host-image-path" in object.spec.podTemplate.?metadata.?annotations.orValue({})) || ' +
-        'object.spec.podTemplate.?spec.?readinessGates.orValue([]).exists(gate, gate.conditionType == "alasio.dev/resumed"))',
-    );
     const resumed = one<Policy>(objects, "ValidatingAdmissionPolicy", "alasio-resumed-condition");
     assert.deepEqual(resumed.spec.matchConstraints, { resourceRules: [{ apiGroups: [""], resources: ["pods/status"], operations: ["UPDATE"], apiVersions: ["*"] }] });
-    assert.deepEqual(resumed.spec.matchConditions.map(({ expression }) => expression), ['request.userInfo.username == "system:serviceaccount:alasio:alasio"']);
+    assert.deepEqual(resumed.spec.matchConditions.map(({ expression }) => expression), ['request.userInfo.username == "system:serviceaccount:alasio:alasio-sandbox-gateway"']);
     const [which, conditions, rest] = resumed.spec.validations.map(({ expression }) => expression);
-    assert.ok(which?.startsWith('request.namespace == "alasio-sessions" && '));
+    assert.ok(which?.startsWith('request.namespace == "alasio-sessions" && "alasio.dev/pool" in object.metadata.?labels.orValue({}) && '));
     assert.ok(which?.endsWith('object.spec.?readinessGates.orValue([]).exists(gate, gate.conditionType == "alasio.dev/resumed")'));
     assert.ok(conditions?.includes('object.status.?conditions.orValue([]).all(condition, condition.type != "alasio.dev/resumed" || condition.status == "True")'));
     for (const field of ["podIP", "podIPs", "hostIP", "phase", "containerStatuses"]) assert.ok(rest?.includes(`object.status.${field} == oldObject.status.${field}`), field);
     assert.deepEqual(binding(objects, "alasio-resumed-condition"), { policyName: "alasio-resumed-condition", validationActions: ["Deny"] });
-    // None where no session is snapshotted, as alasio patches no pod's status there.
+    // None where no session is snapshotted, as the gateway restores none there.
     assert.ok(!all(install({ sessions: { runtimeClassName: "" } }), "ValidatingAdmissionPolicy").some(({ metadata }) => metadata?.name === "alasio-resumed-condition"));
   });
 
-  test("lets alasio run no Job but its clone's, as rendered but for the claims it is told, each a name, where it forks sessions", () => {
-    const objects = install();
-    const clone = one<Policy>(objects, "ValidatingAdmissionPolicy", "alasio-clone-job");
-    assert.deepEqual(clone.spec.matchConstraints, { resourceRules: [{ apiGroups: ["batch"], resources: ["jobs"], operations: ["CREATE", "UPDATE"], apiVersions: ["*"] }] });
-    assert.deepEqual(clone.spec.matchConditions.map(({ expression }) => expression), ['request.userInfo.username == "system:serviceaccount:alasio:alasio"']);
-    const job = clone.spec.validations[0]?.expression ?? "";
-    // The Job's keys, its template's and its pod's are the clone's and what the API server defaults: no ServiceAccount, volume or host namespace of another's.
-    assert.deepEqual(keysOf(job, "object.spec"), ["backoffLimit", "activeDeadlineSeconds", "ttlSecondsAfterFinished", "template", "completions", "parallelism", "completionMode", "suspend", "manualSelector", "podReplacementPolicy", "selector"]);
-    assert.deepEqual(keysOf(job, 'object.spec["template"]["spec"]'), ["restartPolicy", "priorityClassName", "containers", "dnsPolicy", "schedulerName", "terminationGracePeriodSeconds", "securityContext"]);
-    const rendered = (JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-templates").data?.["templates.json"] ?? "{}") as { sessions: SessionsProfile }).sessions.clone?.job;
-    assert.ok(job.includes(`object.spec["template"]["spec"]["containers"][0]["image"] == ${JSON.stringify(rendered?.spec?.template.spec?.containers[0]?.image)}`));
-    for (const variable of ["SOURCE_NAMESPACE", "SOURCE_CLAIM", "DESTINATION_NAMESPACE", "DESTINATION_CLAIM"]) assert.ok(job.includes(JSON.stringify(variable)), variable);
-    assert.ok(job.includes('.matches("^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$")'), "each claim's a DNS label");
-    assert.deepEqual(binding(objects, "alasio-clone-job"), { policyName: "alasio-clone-job", validationActions: ["Deny"] });
-    // None where alasio forks no session, which runs no Job.
-    assert.ok(!all(install({ workspaceStorage: { enabled: false } }), "ValidatingAdmissionPolicy").some(({ metadata }) => metadata?.name === "alasio-clone-job"));
-  });
-
-  test("lets alasio make no Sandbox but from its namespace's template, its own as a branch's, and no Secret but a Sandbox's token", () => {
+  test("lets no one make a pod in the folder namespace but the sandbox gateway, of the folder template alone, nor a Secret there but an instance's token, and alasio make neither", () => {
     const objects = install({ host: { enabled: true } });
-    const sandboxes = one<Policy>(objects, "ValidatingAdmissionPolicy", "alasio-sandboxes");
-    assert.deepEqual(sandboxes.spec.matchConditions.map(({ expression }) => expression), ['request.userInfo.username == "system:serviceaccount:alasio:alasio"']);
-    const sandbox = sandboxes.spec.validations[0]?.expression ?? "";
-    // A Sandbox not moved onto another template is left be; one made, or moved, is its namespace's template's.
-    assert.ok(sandbox.startsWith('request.operation == "UPDATE" && object.spec.podTemplate == oldObject.spec.podTemplate'));
-    assert.ok(sandbox.endsWith(' || (request.namespace == "alasio-host" ? variables.host : (variables.sessions))'));
-    // A session's pod is as no one, under the sessions' runtime; a folder's bayma's as its own account alone.
-    const session = variableOf(objects, "alasio-sandboxes", "sessions");
-    const sessionKeys = keysOf(session, 'object.spec["podTemplate"]["spec"]');
-    for (const key of ["serviceAccountName", "hostNetwork", "hostPID", "nodeName", "ephemeralContainers"]) assert.ok(!sessionKeys.includes(key), key);
-    assert.ok(session.includes('object.spec["podTemplate"]["spec"]["runtimeClassName"] == "gvisor"'));
-    assert.ok(session.includes('object.spec["podTemplate"]["spec"]["automountServiceAccountToken"] == false'));
-    assert.ok(variableOf(objects, "alasio-sandboxes", "host").includes('object.spec["podTemplate"]["spec"]["serviceAccountName"] == "alasio-host-agent"'));
-    assert.deepEqual(binding(objects, "alasio-sandboxes"), { policyName: "alasio-sandboxes", validationActions: ["Deny"] });
-    // A branch's is its own, of its own templates, by its own ServiceAccount.
-    const branch = one<Policy>(branchObjects(configOf(), "try"), "ValidatingAdmissionPolicy", "alasio-branch-try-sandboxes");
-    assert.deepEqual(branch.spec.matchConditions.map(({ expression }) => expression), ['request.userInfo.username == "system:serviceaccount:alasio-branch-try:alasio"']);
-
-    const secrets = one<Policy>(objects, "ValidatingAdmissionPolicy", "alasio-secrets");
-    assert.ok(secrets.spec.matchConditions[0]?.expression.includes("^system:serviceaccount:(alasio|alasio-branch-[a-z0-9-]+):alasio$"));
-    assert.deepEqual(secrets.spec.validations.map(({ expression }) => expression), [
-      'object.?type.orValue("Opaque") == "Opaque" && object.metadata.name.endsWith("-bayma-token") && object.?data.orValue({}).all(key, key == "token")',
-    ]);
-    assert.deepEqual(binding(objects, "alasio-secrets"), { policyName: "alasio-secrets", validationActions: ["Deny"] });
+    const pods = one<Policy>(objects, "ValidatingAdmissionPolicy", "alasio-folder-pods");
+    // Of anyone, in the folder namespace: none is made there but by the gateway.
+    assert.deepEqual(pods.spec.matchConditions.map(({ expression }) => expression), ['request.namespace == "alasio-host"']);
+    assert.ok(pods.spec.validations.some(({ expression }) => expression === `request.operation != 'CREATE' || request.userInfo.username == "system:serviceaccount:alasio:alasio-sandbox-gateway"`));
+    assert.deepEqual(pods.spec.variables?.map(({ name }) => name), ["oldAnnotations", "newAnnotations", "folderSpec", "folderLabels", "folderAnnotations"]);
+    // As the folder template's account alone, of nothing a restore adds.
+    const spec = variableOf(objects, "alasio-folder-pods", "folderSpec");
+    assert.ok(spec.includes('object.spec["serviceAccountName"] == "alasio-host-agent"'), spec.slice(0, 400));
+    for (const key of ["dev.gvisor.internal.restore", "alasio.dev/resumed", "alasio.dev/session-template"]) assert.ok(!spec.includes(key), key);
+    assert.deepEqual(binding(objects, "alasio-folder-pods"), { policyName: "alasio-folder-pods", validationActions: ["Deny"] });
+    const secrets = one<Policy>(objects, "ValidatingAdmissionPolicy", "alasio-folder-secrets");
+    assert.deepEqual(secrets.spec.matchConditions.map(({ expression }) => expression), ['request.userInfo.username == "system:serviceaccount:alasio:alasio-sandbox-gateway"']);
+    assert.ok(secrets.spec.validations[0]?.expression.startsWith('request.namespace == "alasio-host" && object.?type.orValue("Opaque") == "Opaque" && '));
+    assert.deepEqual(binding(objects, "alasio-folder-secrets"), { policyName: "alasio-folder-secrets", validationActions: ["Deny"] });
+    // Nothing of alasio's own, which makes neither.
+    for (const name of ["alasio-sandboxes", "alasio-secrets", "alasio-clone-job"]) assert.ok(!all(objects, "ValidatingAdmissionPolicy").some(({ metadata }) => metadata?.name === name), name);
   });
 
-  test("holds a folder's bayma's state directory under its template's state root as alasio joins it, however the root is written", () => {
+  test("holds a folder instance's state directory under the state root as the gateway joins it, however the root is written", () => {
     for (const stateRoot of ["/home/op/state", "/home/op//state/", "/"]) {
-      const sandbox = variableOf(install({ host: { enabled: true, stateRoot } }), "alasio-sandboxes", "host");
+      const spec = variableOf(install({ host: { enabled: true, stateRoot } }), "alasio-folder-pods", "folderSpec");
       // The patterns of path segments: the state directory's.
-      const patterns = [...sandbox.matchAll(/\.matches\(("(?:[^"\\]|\\.)*")\)/gu)]
+      const patterns = [...spec.matchAll(/\.matches\(("(?:[^"\\]|\\.)*")\)/gu)]
         .map(([, quoted = '""']) => JSON.parse(quoted) as string)
         .filter((pattern) => pattern.includes("[A-Za-z0-9_][A-Za-z0-9_.-]*/"))
         .map((pattern) => new RegExp(pattern, "u"));
       assert.equal(patterns.length, 1, stateRoot);
-      const profile = { stateRoot } as HostProfile;
-      assert.match(hostBaymaStateDir(profile, "claude", "telegram:1"), patterns[0] ?? /^$/u, stateRoot);
+      assert.match(folderStateDir(stateRoot, "claude", "telegram:1"), patterns[0] ?? /^$/u, stateRoot);
+      assert.match(folderStateDir(stateRoot, "claude", "../x"), patterns[0] ?? /^$/u, stateRoot);
       assert.doesNotMatch("/elsewhere/claude/telegram-1", patterns[0] ?? /^$/u, stateRoot);
     }
   });
+});
 
-  test("lets a session's Sandbox carry what its snapshots add, and be restored from one with no more than a restore adds, each as alasio adds it", () => {
-    const session = variableOf(install(), "alasio-sandboxes", "sessions");
-    const annotation = (key: string) => `object.spec["podTemplate"]["metadata"]["annotations"][${JSON.stringify(key)}]`;
-    // Each may be left out: a session's template hash, and the restore's two.
-    for (const key of ["alasio.dev/session-template", "dev.gvisor.internal.restore.host-image-path", "dev.gvisor.internal.restore.paused"]) {
-      assert.ok(session.includes(`(!(${JSON.stringify(key)} in object.spec["podTemplate"]["metadata"]["annotations"]) || `), key);
-    }
-    assert.ok(session.includes(`${annotation("alasio.dev/session-template")}.matches("^([0-9a-f]{64})$")`));
-    assert.ok(session.includes(`${annotation("dev.gvisor.internal.restore.paused")} == "true"`));
-    // The CPU features it is held to are the template's, as alasio up recorded them: no fewer, no others.
-    assert.ok(session.includes(`${annotation("dev.gvisor.internal.cpufeatures")} == "avx,avx2,sse"`));
-    assert.ok(!session.includes(`(!("dev.gvisor.internal.cpufeatures" in `));
-    // The image is the Sandbox's own, of a snapshot its node prepared in its cache.
-    const image = annotation("dev.gvisor.internal.restore.host-image-path");
-    const own = '"/var/lib/alasio/snapshots/alasio-sessions/" + object.metadata.name + "/"';
-    assert.ok(session.includes(`${image}.startsWith(${own}) && ${image}.substring(size(${own})).matches("^[0-9]{8}T[0-9]{9}Z-[0-9a-f]{8}$")`));
-    // Under the sessions' runtime or a kept release's, on one node, ready once resumed.
-    for (const { release } of NODE_PINS.gvisor.releases) assert.ok(session.includes(`["runtimeClassName"] == "gvisor-${release.split(".").join("-")}"`), release);
-    assert.ok(session.includes('["conditionType"] == "alasio.dev/resumed"'));
-    assert.ok(session.includes('["matchFields"][0]["key"] == "metadata.name" && '));
-    assert.ok(session.includes('["matchFields"][0]["operator"] == "In" && '));
-    // Where sessions are not snapshotted, nothing of a restore.
-    const unsnapshotted = variableOf(install({ sessions: { runtimeClassName: "" } }), "alasio-sandboxes", "sessions");
-    assert.ok(unsnapshotted.includes('"alasio.dev/session-template"'));
-    for (const key of ["dev.gvisor.internal.cpufeatures", "dev.gvisor.internal.restore", "alasio.dev/resumed", "matchFields"]) assert.ok(!unsnapshotted.includes(key), key);
+describe("the sandbox service", () => {
+  test("makes folder conversations' instances of the host profile, which the gateway alone makes and reaches, each on its conversation's state directory, released after an hour idle", () => {
+    const objects = install({ host: { enabled: true, stateRoot: "/home/operator/.alasio/bayma" } });
+    const config = JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}");
+    assert.deepEqual([config.folders.namespace, config.folders.stateRoot, config.folders.releaseAfterSeconds], ["alasio-host", "/home/operator/.alasio/bayma", 3600]);
+    assert.equal(JSON.parse(one<V1ConfigMap>(install({ host: { enabled: true, releaseAfter: "4h" } }), "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}").folders.releaseAfterSeconds, 4 * 3600);
+    // The host profile's bayma, as the operator, under the cluster's own runtime, exporting its telemetry to the receiver with its binding's token.
+    assert.equal(config.folders.template.spec.serviceAccountName, "alasio-host-agent");
+    // Its account's token the template's own, where the API server would mount one, so the pod the policy pins is the pod as made.
+    assert.equal(config.folders.template.spec.automountServiceAccountToken, false);
+    assert.deepEqual((config.folders.template.spec.containers[0] as V1Container).volumeMounts?.at(-1), { name: "alasio-host-agent-token", mountPath: "/var/run/secrets/kubernetes.io/serviceaccount", readOnly: true });
+    assert.deepEqual(config.folders.template.spec.volumes.at(-1).projected.sources.map((source: object) => Object.keys(source)[0]), ["serviceAccountToken", "configMap", "downwardAPI"]);
+    const [bayma] = config.folders.template.spec.containers as V1Container[];
+    assert.equal(config.folders.template.spec.runtimeClassName, undefined);
+    assert.deepEqual(bayma?.securityContext?.capabilities?.add, ["CHECKPOINT_RESTORE", "SYS_PTRACE"]);
+    assert.deepEqual(bayma?.args?.slice(-2), ["--telemetry-token-file", "/run/alasio/bayma/token"]);
+    assert.equal(bayma?.env?.find(({ name }) => name === "OTEL_EXPORTER_OTLP_ENDPOINT")?.value, "http://alasio-receiver.alasio.svc.cluster.local:4318");
+    // The gateway's identity there: pods, their tokens' Secrets, and the bindings' Leases; the receiver's, which watches the Leases.
+    const role = (name: string) => all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === name && metadata.namespace === "alasio-host")?.rules;
+    assert.deepEqual(role("alasio-sandbox-gateway"), [
+      { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch", "create", "update", "delete"] },
+      { apiGroups: [""], resources: ["secrets"], verbs: ["create", "patch", "delete"] },
+      { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] },
+    ]);
+    assert.deepEqual(role("alasio-receiver"), [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]);
+    assert.deepEqual(container(one<V1Deployment>(objects, "Deployment", "alasio-receiver")).env?.find(({ name }) => name === "FOLDERS_NAMESPACE"), { name: "FOLDERS_NAMESPACE", value: "alasio-host" });
+    for (const name of ["alasio-folder-pods", "alasio-folder-secrets"]) assert.ok(one(objects, "ValidatingAdmissionPolicy", name), name);
+    // No drain evicts a bound one, whose REPLs live in it until its release.
+    const bound = all<KubernetesObject & { spec: object }>(objects, "PodDisruptionBudget").find(({ metadata }) => metadata?.name === "alasio-bound" && metadata.namespace === "alasio-host");
+    assert.deepEqual(bound?.spec, { maxUnavailable: 0, selector: { matchExpressions: [{ key: "alasio.dev/binding", operator: "Exists" }] }, unhealthyPodEvictionPolicy: "AlwaysAllow" });
+    // Reached by the gateway alone on bayma's port, as the gateway reaches it, and its telemetry taken by the receiver.
+    const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
+    const pod = (component: string, namespace = "alasio", extra: Record<string, string> = {}): Pod => ({
+      namespace,
+      namespaceLabels: { "kubernetes.io/metadata.name": namespace },
+      labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component, ...extra },
+    });
+    const folder = pod("folder-bayma", "alasio-host", { "alasio.dev/pool": "folder" });
+    assert.equal(admits(policies, pod("sandbox-gateway"), folder, 7290), true);
+    assert.equal(reaches(policies, pod("sandbox-gateway"), folder, 7290), true);
+    assert.equal(admits(policies, folder, pod("receiver"), 4318), true);
+    assert.equal(admits(policies, pod("collector"), folder, 7290), false);
+    // None without the host profile.
+    const off = install();
+    assert.deepEqual(all(off, "ValidatingAdmissionPolicy").filter(({ metadata }) => /folder/u.test(metadata?.name ?? "")), []);
+    assert.equal(all<V1Role>(off, "Role").some(({ metadata }) => metadata?.namespace === "alasio-host"), false);
   });
 
-  test("pins the sessions' template before the current one, which alasio up carries forward whole for one change of the template, beside it", () => {
-    const templatesOf = (objects: readonly KubernetesObject[]) => one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-templates").data?.["templates.json"];
-    const cpu = (cpu: string) => ({ sessions: { resources: { requests: { cpu } } } });
-    // Installed first, nothing is carried.
-    const first = install(cpu("101m"));
-    assert.deepEqual(carriedFrom(configOf(cpu("101m")), undefined, { ...NOTHING_KEPT, cpuBaseline: BASELINE }), { ...NOTHING_CARRIED, cpuBaseline: BASELINE });
-    assert.equal(JSON.parse(templatesOf(first) ?? "{}").previousSessions, undefined);
-    assert.equal(variableOf(first, "alasio-sandboxes", "previousSessions"), "");
-    // The template changed: what ran before is carried, its own image and resources pinned whole beside the current one.
-    const carried = carriedFrom(configOf(cpu("102m")), templatesOf(first), { ...NOTHING_KEPT, cpuBaseline: BASELINE });
-    assert.deepEqual(carried.previousSessions, JSON.parse(templatesOf(first) ?? "{}").sessions);
-    const second = manifests(configOf(cpu("102m")), carried);
-    assert.deepEqual(JSON.parse(templatesOf(second) ?? "{}").previousSessions, carried.previousSessions);
-    const previous = variableOf(second, "alasio-sandboxes", "previousSessions");
-    assert.ok(previous.includes('== "101m"') && !previous.includes('== "102m"'));
-    assert.ok(variableOf(second, "alasio-sandboxes", "sessions").includes('== "102m"'));
-    assert.ok(one<Policy>(second, "ValidatingAdmissionPolicy", "alasio-sandboxes").spec.validations[0]?.expression.endsWith(" || (variables.sessions || variables.previousSessions)"));
-    // Brought up again on the same template, it is still carried; changed again, the one after it is, and it is gone.
-    assert.deepEqual(carriedFrom(configOf(cpu("102m")), templatesOf(second), { ...NOTHING_KEPT, cpuBaseline: BASELINE }), carried);
-    const third = carriedFrom(configOf(cpu("103m")), templatesOf(second), { ...NOTHING_KEPT, cpuBaseline: BASELINE });
-    assert.deepEqual(third.previousSessions, JSON.parse(templatesOf(second) ?? "{}").sessions);
-    assert.ok(!JSON.stringify(third).includes('"101m"'));
-    // Templates it cannot read carry nothing, nor does an installation without sessions.
-    assert.deepEqual(carriedFrom(configOf(cpu("102m")), "{ not JSON", { ...NOTHING_KEPT, cpuBaseline: BASELINE }).previousSessions, null);
-    assert.deepEqual(carriedFrom(configOf({ sessions: { enabled: false }, workspaceStorage: { enabled: false }, host: { enabled: true } }), templatesOf(first), { ...NOTHING_KEPT, cpuBaseline: BASELINE }).previousSessions, null);
+  test("pools each internet's sessions as pods of the agent image under gVisor, resolving names as its internet says, each mounting its own directory on its node, its bayma started on its binding's token, kept free by KEDA", () => {
+    const objects = install();
+    for (const mode of ["none", "full"] as const) {
+      const pool = one<V1Deployment>(objects, "Deployment", `sandboxes-${mode}`);
+      assert.equal(pool.metadata?.namespace, "alasio-sessions");
+      assert.deepEqual(pool.spec?.selector.matchLabels, { "alasio.dev/pool": `sandboxes-${mode}`, "alasio.dev/free": "true" });
+      // None is ready before it is bound: the old free pods go as the new come.
+      assert.deepEqual(pool.spec?.strategy, { type: "Recreate" });
+      assert.equal(pool.spec?.replicas, undefined);
+      const template = pool.spec?.template;
+      assert.equal(template?.metadata?.labels?.["alasio.dev/net-mode"], mode);
+      const spec = template?.spec;
+      assert.deepEqual([spec?.runtimeClassName, spec?.automountServiceAccountToken, spec?.enableServiceLinks], ["gvisor", false, false]);
+      // Names resolved as its internet says: by the public resolvers, or by none but itself.
+      assert.deepEqual([spec?.dnsPolicy, spec?.dnsConfig], ["None", { nameservers: mode === "full" ? ["1.1.1.1", "8.8.8.8"] : ["127.0.0.1"] }]);
+      assert.deepEqual(spec?.volumes?.[0], { name: "attach", hostPath: { path: "/var/lib/alasio/attach", type: "DirectoryOrCreate" } });
+      const [bayma] = spec?.containers ?? [];
+      // Its directory by its namespace and its name, as pods of two namespaces may share a name.
+      assert.deepEqual(bayma?.volumeMounts?.[0], { name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAMESPACE)/$(POD_NAME)", mountPropagation: "HostToContainer" });
+      assert.deepEqual(bayma?.env?.slice(0, 2), [
+        { name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
+        { name: "POD_NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
+      ]);
+      assert.deepEqual(bayma?.command, ["/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"]);
+      assert.deepEqual(bayma?.args?.slice(-6, -2), ["--token-file", "/attach/token", "--telemetry-token-file", "/attach/token"]);
+      // Its sessions snapshotted, as main's are by the gateway: held to the nodes' CPU baseline, its bayma holding a stop it is
+      // not given for the gateway's save, and its template named by its own hash, which a snapshot taken on it records.
+      assert.deepEqual(bayma?.args?.slice(-2), ["--stop-wait-ms", "60000"]);
+      assert.equal(spec?.terminationGracePeriodSeconds, 60 + 30);
+      const { ["alasio.dev/session-template"]: hash, ...annotations } = template?.metadata?.annotations ?? {};
+      assert.equal(annotations["dev.gvisor.internal.cpufeatures"], BASELINE.join(","));
+      assert.equal(hash, templateHash({ ...template, metadata: { ...template?.metadata, annotations } }));
+      // Its hook, as a release's snapshot runs it, through the same start.
+      assert.deepEqual(hookOf(bayma ?? { name: "" }), ["/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"]);
+      const scaled = one<ScaledObject>(objects, "ScaledObject", `sandboxes-${mode}`);
+      assert.deepEqual([scaled.spec.minReplicaCount, scaled.spec.maxReplicaCount], [1, 10]);
+      assert.deepEqual(scaled.spec.triggers, [{
+        type: "metrics-api",
+        metadata: { url: `http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio-sessions/sandboxes-${mode}`, valueLocation: "waiting", targetValue: "1" },
+      }]);
+    }
+  });
+
+  test("pins each pool's template, and each a restore is made onto, the one before the current carried, in a variable of its own, each within CEL's size limit of an expression", () => {
+    const kept = { ...NOTHING_KEPT, cpuBaseline: BASELINE };
+    const cpu = (request: string) => ({ sessions: { resources: { requests: { cpu: request } } } });
+    const first = manifests(configOf(cpu("101m")), carriedFrom(configOf(cpu("101m")), kept));
+    const gateway = one<V1ConfigMap>(first, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"];
+    const objects = manifests(configOf(cpu("102m")), carriedFrom(configOf(cpu("102m")), kept, gateway));
+    const policy = one<KubernetesObject & { spec: { variables: { name: string; expression: string }[]; validations: { expression: string }[] } }>(objects, "ValidatingAdmissionPolicy", "alasio-sandbox-pods");
+    const named = (prefix: string) => policy.spec.variables.filter(({ name }) => name.startsWith(prefix));
+    assert.equal(named("made").length, 2);
+    // Each pool's current template and the one before it.
+    assert.equal(named("restored").length, 4);
+    assert.equal(new Set(named("restored").map(({ expression }) => expression)).size, 4);
+    for (const { expression } of [...policy.spec.variables, ...policy.spec.validations]) assert.ok([...expression].length <= 100_000, `an expression of ${[...expression].length} code points`);
+  });
+
+  test("carries each pool's template before the current one, as the gateway's configuration it replaces held it, for one change of it and no more", () => {
+    const kept = { ...NOTHING_KEPT, cpuBaseline: BASELINE };
+    const gatewayOf = (objects: readonly KubernetesObject[]) => one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"];
+    const templateOf = (objects: readonly KubernetesObject[], mode: string) => JSON.parse(JSON.stringify(one<V1Deployment>(objects, "Deployment", `sandboxes-${mode}`).spec?.template)) as unknown;
+    const cpu = (request: string) => ({ sessions: { resources: { requests: { cpu: request } } } });
+    const first = manifests(configOf(cpu("101m")), carriedFrom(configOf(cpu("101m")), kept));
+    assert.deepEqual(carriedPools(configOf(cpu("101m")), undefined, kept), { none: null, full: null });
+    // Unchanged: none carried; changed: the one before.
+    assert.deepEqual(carriedPools(configOf(cpu("101m")), gatewayOf(first), kept), { none: null, full: null });
+    const carried = carriedPools(configOf(cpu("102m")), gatewayOf(first), kept);
+    assert.deepEqual(carried, { none: templateOf(first, "none"), full: templateOf(first, "full") });
+    const second = manifests(configOf(cpu("102m")), { ...NOTHING_CARRIED, ...kept, previousPools: carried });
+    assert.deepEqual(JSON.parse(gatewayOf(second) ?? "{}").snapshots.templates.none, { current: templateOf(second, "none"), previous: templateOf(first, "none") });
+    // Unchanged since: carried on; changed again: the second, the first no more.
+    assert.deepEqual(carriedPools(configOf(cpu("102m")), gatewayOf(second), kept), carried);
+    assert.deepEqual(carriedPools(configOf(cpu("103m")), gatewayOf(second), kept).none, templateOf(second, "none"));
+    // Of a configuration that is none, or of sessions not snapshotted, none.
+    assert.deepEqual(carriedPools(configOf(cpu("102m")), "{ not JSON", kept), { none: null, full: null });
+    assert.deepEqual(carriedPools(configOf(cpu("102m")), gatewayOf(first), { ...kept, cpuBaseline: null }), { none: null, full: null });
+  });
+
+  test("a restore of a snapshot taken under a release at or past the first that restores through a socket asks for its checkpoint gofer through a socket, reading again pages a read of failed; one before it, or where none is named, the agent's own way", () => {
+    assert.deepEqual(
+      ["20260921.0-eaucoin.8", "20260921.0-eaucoin.9", "20260921.1-eaucoin.1"].map((release) => goferOf(release, "20260921.0-eaucoin.9")),
+      [null, { transport: "socket", pagesRetry: true }, { transport: "socket", pagesRetry: true }],
+    );
+    assert.equal(goferOf("20260921.0-eaucoin.9", ""), null);
+  });
+
+  test("binds through a gateway of alasio's image, configured with its pools and the node agents, its keys the stack's, which may claim and delete its pools' pods and hold their Leases alone", () => {
+    const objects = install();
+    const gateway = one<V1Deployment>(objects, "Deployment", "alasio-sandbox-gateway");
+    const [container] = gateway.spec?.template.spec?.containers ?? [];
+    assert.deepEqual(container?.command, ["node", "/opt/alasio/src/gateway/main.ts"]);
+    const env = Object.fromEntries((container?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom?.secretKeyRef ?? valueFrom?.fieldRef]));
+    assert.deepEqual([env["CALLER_KEY"], env["BINDING_KEY"], env["ALASIO_NODE_AGENT_TOKEN"]], [
+      { name: "alasio-sandbox-gateway", key: "caller-key" },
+      { name: "alasio-sandbox-gateway", key: "binding-key" },
+      { name: "alasio-node-agent", key: "token" },
+    ]);
+    // Every environment's events, written as its principal on the log.
+    assert.deepEqual([env["EVENTS_BROKERS"], env["EVENTS_USERNAME"], env["EVENTS_PASSWORD_FILE"]], ["alasio-log.alasio.svc:9092", { name: "alasio-log-sandbox-gateway", key: "username" }, "/run/alasio/log/password"]);
+    assert.deepEqual(gateway.spec?.template.spec?.volumes?.find(({ name }) => name === "log"), { name: "log", secret: { secretName: "alasio-log-sandbox-gateway", items: [{ key: "password", path: "password" }] } });
+    const config = JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}");
+    assert.deepEqual(config, {
+      port: 8080,
+      peers: "alasio-sandbox-gateway-peers.alasio.svc.cluster.local",
+      podPort: 7290,
+      waitSeconds: 120,
+      releaseAfterSeconds: 300,
+      environment: { name: "main", namespace: "alasio-sessions" },
+      // A new session's volume's size, 10Gi by default.
+      quotaBytes: 10 * 1024 ** 3,
+      pools: { none: "sandboxes-none", full: "sandboxes-full" },
+      nodeAgents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", port: 8484 },
+      // Where bound pods' bayma exports its telemetry: the receiver's Service.
+      receiver: { host: "alasio-receiver.alasio.svc.cluster.local", port: 4318 },
+      // No folder workspaces, of no host profile.
+      folders: null,
+      // Main's sessions snapshotted as alasio's own were, under the releases kept, each pool's template as the pool runs it, none carried before it.
+      snapshots: {
+        liveEverySeconds: 600,
+        // Each restored through the checkpoint gofer as it restores best: through the agent's socket, its reads of pages
+        // retried, from eaucoin.9 on, as .11 does; over TCP, the agent's own way, before, as .8 does.
+        releases: NOTHING_KEPT.gvisorReleases.map((release) => ({
+          release,
+          runtimeClassName: `gvisor-${release.split(".").join("-")}`,
+          gofer: release === "20260921.0-eaucoin.8" ? null : { transport: "socket", pagesRetry: true },
+        })),
+        templates: Object.fromEntries((["none", "full"] as const).map((mode) => [mode, { current: JSON.parse(JSON.stringify(one<V1Deployment>(objects, "Deployment", `sandboxes-${mode}`).spec?.template)), previous: null }])),
+      },
+    });
+    // Not snapshotted without the nodes' CPU baseline.
+    assert.equal(JSON.parse(one<V1ConfigMap>(install({}, null), "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}").snapshots, null);
+    const sessions = all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio-sandbox-gateway" && metadata.namespace === "alasio-sessions");
+    assert.deepEqual(sessions?.rules, [
+      // A restore's pod made too, its readiness set, and the policies that select it read.
+      { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch", "create", "update", "delete"] },
+      { apiGroups: [""], resources: ["pods/status"], verbs: ["patch"] },
+      { apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], verbs: ["list"] },
+      { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] },
+      { apiGroups: ["apps"], resources: ["deployments"], verbs: ["get"], resourceNames: ["sandboxes-none", "sandboxes-full"] },
+      // The Events of the pods the sandbox pods' policy refused, which it counts.
+      { apiGroups: [""], resources: ["events"], verbs: ["list"] },
+    ]);
+    assert.equal(one<V1Service>(objects, "Service", "alasio-sandbox-gateway-peers").spec?.clusterIP, "None");
+    // Of the cluster, the nodes it reads whether a restore's pod may be scheduled onto, alone.
+    assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-sandbox-gateway-nodes").rules, [{ apiGroups: [""], resources: ["nodes"], verbs: ["get"] }]);
+  });
+
+  test("has alasio reach main's sessions through the gateway, as main, by main's own key of the gateway's, and not where the sandbox service runs not", () => {
+    const env = (objects: readonly KubernetesObject[]) => container(one<V1Deployment>(objects, "Deployment", "alasio")).env ?? [];
+    const of = (objects: readonly KubernetesObject[], name: string) => env(objects).find((each) => each.name === name);
+    const objects = install();
+    assert.equal(of(objects, "ALASIO_GATEWAY_URL")?.value, "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080");
+    assert.equal(of(objects, "ALASIO_GATEWAY_ENVIRONMENT")?.value, "main");
+    assert.deepEqual(of(objects, "ALASIO_GATEWAY_CALLER_KEY")?.valueFrom, { secretKeyRef: { name: "alasio-sessions-caller", key: "caller-key" } });
+    const without = install({ sessions: { enabled: false }, workspaceStorage: { enabled: false } });
+    assert.ok(!env(without).some(({ name }) => name.startsWith("ALASIO_GATEWAY_")));
+  });
+
+  test("receives sessions' telemetry in a receiver of its own, which watches its pools' Leases, and mounts workspace storage on each node, in the node's own mount namespace, from a pod of its own, whose replacement takes its mount over first", () => {
+    const objects = install();
+    const receiver = one<V1Deployment>(objects, "Deployment", "alasio-receiver");
+    const env = Object.fromEntries((receiver.spec?.template.spec?.containers[0]?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom?.secretKeyRef]));
+    assert.deepEqual([env["SESSIONS_NAMESPACE"], env["BINDING_KEY"]], ["alasio-sessions", { name: "alasio-sandbox-gateway", key: "binding-key" }]);
+    const watching = all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio-receiver");
+    assert.deepEqual([watching?.metadata?.namespace, watching?.rules], ["alasio-sessions", [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]]);
+    const mount = one<V1DaemonSet>(objects, "DaemonSet", "alasio-workspace-mount");
+    // The new pod beside the old, which it takes the mount over from, by the node's PIDs and mount namespace.
+    assert.deepEqual(mount.spec?.updateStrategy, { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } });
+    assert.equal(mount.spec?.template.spec?.hostPID, true);
+    const [juicefs] = mount.spec?.template.spec?.containers ?? [];
+    // Of alasio's image, for JuiceFS's static release, which runs in the node's namespace as it is; of the node's mount, no mount of its own.
+    assert.equal(juicefs?.image, one<V1Deployment>(objects, "Deployment", "alasio").spec?.template.spec?.containers[0]?.image);
+    assert.deepEqual(juicefs?.securityContext, { privileged: true });
+    assert.deepEqual(juicefs?.volumeMounts, [
+      { name: "bin", mountPath: "/var/lib/alasio/bin" },
+      { name: "state", mountPath: "/var/lib/alasio/juicefs-state" },
+      { name: "cache", mountPath: "/var/lib/alasio/juicefs-cache" },
+      { name: "run", mountPath: "/run/alasio" },
+    ]);
+    assert.deepEqual(mount.spec?.template.spec?.volumes?.[1], { name: "state", hostPath: { path: "/var/lib/alasio/juicefs-state", type: "DirectoryOrCreate" } });
+    assert.deepEqual(juicefs?.command, ["sh", "-c", workspaceMountScript("/var/lib/alasio/workspaces", 1024)]);
+    assert.match(juicefs?.command?.[2] ?? "", /nsenter -t 1 -m -- "\$node_juicefs" mount --no-bgjob --metrics 0\.0\.0\.0:9567 --bucket "\$bucket" --cache-dir \/var\/lib\/alasio\/juicefs-cache --cache-size 1024 "\$meta" \/var\/lib\/alasio\/workspaces /u);
+    assert.deepEqual(juicefs?.readinessProbe?.exec?.command, ["sh", "-c", workspaceMountReady("/var/lib/alasio/workspaces")]);
+    // Given the metadata engine's URL and the bucket's, which it resolves by the pod's DNS, and the bucket's keys.
+    assert.deepEqual(juicefs?.env?.map(({ name, valueFrom }) => `${name}=${valueFrom?.secretKeyRef?.key}`), ["META_URL=metaurl", "BUCKET=bucket", "ACCESS_KEY=access-key", "SECRET_KEY=secret-key"]);
+    assert.equal(mount.spec?.template.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
+  });
+
+  test("rolls the nodes' mount where a Service it reaches by address is made anew, or its bucket is another, and not otherwise", () => {
+    const annotation = (objects: readonly KubernetesObject[]) => one<V1DaemonSet>(objects, "DaemonSet", "alasio-workspace-mount").spec?.template.metadata?.annotations?.["checksum/storage-services"];
+    const reaching = (mountServices: Record<string, string | null>, file: Record<string, unknown> = {}) => annotation(manifests(configOf(file), { ...NOTHING_CARRIED, cpuBaseline: BASELINE, mountServices }));
+    const before = reaching({ "alasio-valkey": "uid-1", "alasio-seaweedfs": "uid-2" });
+    assert.match(before ?? "", /^[0-9a-f]{16}$/u);
+    assert.equal(reaching({ "alasio-valkey": "uid-1", "alasio-seaweedfs": "uid-2" }), before);
+    // Valkey made anew, the object store's Service, or one not there yet, as up makes it.
+    for (const remade of [{ "alasio-valkey": "uid-3", "alasio-seaweedfs": "uid-2" }, { "alasio-valkey": "uid-1", "alasio-seaweedfs": "uid-4" }, { "alasio-valkey": null, "alasio-seaweedfs": "uid-2" }]) {
+      assert.notEqual(reaching(remade), before, JSON.stringify(remade));
+    }
+    // Another bucket.
+    assert.notEqual(reaching({ "alasio-valkey": "uid-1", "alasio-seaweedfs": "uid-2" }, { objectStore: { buckets: { workspaces: "elsewhere" } } }), before);
+  });
+
+  test("confines a pool's pods to the gateway in and the receiver out, with internet to the public internet beside, and admits every environment's alasio, its replicas and KEDA to the gateway, and the gateway to the node agents", () => {
+    const policies = all<NetworkPolicyObject>(install(), "NetworkPolicy");
+    const podOf = (component: string, namespace = "alasio", labels: Record<string, string> = {}): Pod => ({
+      namespace,
+      namespaceLabels: { "kubernetes.io/metadata.name": namespace },
+      labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component, ...labels },
+    });
+    const pooled = (mode: "none" | "full", bound: boolean) =>
+      podOf("session", "alasio-sessions", { "alasio.dev/pool": `sandboxes-${mode}`, "alasio.dev/net-mode": mode, ...(bound ? { "alasio.dev/binding": "0".repeat(40) } : { "alasio.dev/free": "true" }) });
+    const [gateway, receiver, alasio, agent, collector, keda] = ["sandbox-gateway", "receiver", "alasio", "node-agent", "collector", "keda-operator"].map((component) => podOf(component));
+    assert.ok(gateway && receiver && alasio && agent && collector && keda);
+    for (const pod of [pooled("none", false), pooled("none", true), pooled("full", false), pooled("full", true)]) {
+      assert.equal(connects(policies, gateway, pod, 7290), true);
+      assert.equal(connects(policies, alasio, pod, 7290), false);
+      assert.equal(connects(policies, pooled("none", true), pod, 7290), false);
+      assert.equal(connects(policies, gateway, pod, 7291), false);
+      assert.equal(connects(policies, pod, receiver, 4318), true);
+      assert.equal(connects(policies, pod, alasio, 4318), false);
+      assert.equal(connects(policies, pod, collector, 4318), false);
+      assert.equal(connects(policies, pod, gateway, 8080), false);
+      assert.equal(connects(policies, pod, agent, 8484), false);
+      assert.equal(connects(policies, pod, pooled("full", true), 7290), false);
+    }
+    // The public internet, for a pod with internet alone, none of the private networks.
+    const internet = policies.filter(({ spec }) => (spec.egress ?? []).some(({ to }) => (to ?? []).some(({ ipBlock }) => ipBlock?.cidr === "0.0.0.0/0")));
+    const sandboxes = internet.filter(({ metadata, spec }) => metadata?.namespace === "alasio-sessions" && selects(spec.podSelector, pooled("full", true).labels));
+    assert.deepEqual(sandboxes.map(({ metadata, spec }) => [metadata?.name, spec.egress]), [["alasio-sandboxes-full-internet", [{
+      to: [{ ipBlock: { cidr: "0.0.0.0/0", except: ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4"] } }],
+    }]]]);
+    assert.deepEqual(internet.filter(({ metadata, spec }) => metadata?.namespace === "alasio-sessions" && selects(spec.podSelector, pooled("none", true).labels)), []);
+    // The gateway, from main's alasio and a branch environment's, its replicas and KEDA's operator, on its port alone; not an alasio of a namespace of no branch's.
+    const branchAlasio: Pod = { ...podOf("alasio", "alasio-branch-try"), namespaceLabels: { "kubernetes.io/metadata.name": "alasio-branch-try", "alasio.dev/branch": "try" } };
+    for (const [from, admitted] of [[alasio, true], [branchAlasio, true], [gateway, true], [keda, true], [receiver, false], [collector, false], [podOf("alasio", "elsewhere"), false]] as const) {
+      assert.equal(connects(policies, from, gateway, 8080), admitted, from.labels["app.kubernetes.io/component"]);
+    }
+    assert.equal(connects(policies, alasio, gateway, 8081), false);
+    assert.equal(connects(policies, alasio, receiver, 4318), false);
+    assert.equal(connects(policies, gateway, agent, 8484), true);
+    assert.equal(connects(policies, gateway, collector, 4318), true);
+    assert.equal(connects(policies, receiver, collector, 4318), true);
+  });
+
+  test("lets no drain evict a pod bound to a workspace, but one not ready", () => {
+    const budget = one<V1PodDisruptionBudget>(install(), "PodDisruptionBudget", "alasio-bound");
+    assert.deepEqual([budget.metadata?.namespace, budget.spec], ["alasio-sessions", {
+      maxUnavailable: 0,
+      selector: { matchExpressions: [{ key: "alasio.dev/binding", operator: "Exists" }] },
+      unhealthyPodEvictionPolicy: "AlwaysAllow",
+    }]);
+  });
+
+  test("lets the gateway and the receiver reach the cluster's DNS, what each talks to, and the API server alone, where up finds it, and anywhere where it cannot, which up warns of", () => {
+    const apiServer = { addresses: ["172.18.0.2", "172.18.0.3"], ports: [6443] };
+    const policies = all<NetworkPolicyObject>(manifests(configOf({}), { ...NOTHING_CARRIED, cpuBaseline: BASELINE, apiServer }), "NetworkPolicy");
+    const podOf = (component: string, namespace = "alasio", labels: Record<string, string> = {}): Pod => ({
+      namespace,
+      namespaceLabels: { "kubernetes.io/metadata.name": namespace },
+      labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component, ...labels },
+    });
+    const elsewhere = (address: string): Pod => ({ namespace: "", namespaceLabels: {}, labels: {}, address });
+    const dns: Pod = { namespace: "kube-system", namespaceLabels: { "kubernetes.io/metadata.name": "kube-system" }, labels: { "k8s-app": "kube-dns" } };
+    const pooled = podOf("session", "alasio-sessions", { "alasio.dev/pool": "sandboxes-none", "alasio.dev/net-mode": "none", "alasio.dev/binding": "0".repeat(40) });
+    const branchPooled = {
+      ...pooled,
+      namespace: "alasio-branch-try-sessions",
+      namespaceLabels: { "kubernetes.io/metadata.name": "alasio-branch-try-sessions", "alasio.dev/branch": "try" },
+    };
+    const [gateway, receiver, alasio, agent, collector, proxy] = ["sandbox-gateway", "receiver", "alasio", "node-agent", "collector", "neon-proxy"].map((component) => podOf(component));
+    assert.ok(gateway && receiver && alasio && agent && collector && proxy);
+    const [api, apiToo, notApi, internet] = [elsewhere("172.18.0.2"), elsewhere("172.18.0.3"), elsewhere("172.18.0.9"), elsewhere("1.1.1.1")];
+    assert.ok(api && apiToo && notApi && internet);
+    const reached = (from: Pod) =>
+      ([[dns, 53], [api, 6443], [apiToo, 6443], [api, 443], [notApi, 6443], [internet, 443], [collector, 4318], [alasio, 4318], [proxy, 6432], [pooled, 7290], [branchPooled, 7290], [agent, 8484], [gateway, 8080]] as const)
+        .filter(([to, port]) => reaches(policies, from, to, port))
+        .map(([to, port]) => `${to.labels["app.kubernetes.io/component"] ?? to.labels["k8s-app"] ?? to.address}:${port}`);
+    assert.deepEqual(reached(receiver), ["kube-dns:53", "172.18.0.2:6443", "172.18.0.3:6443", "collector:4318"]);
+    assert.deepEqual(reached(gateway), ["kube-dns:53", "172.18.0.2:6443", "172.18.0.3:6443", "collector:4318", "session:7290", "session:7290", "node-agent:8484", "sandbox-gateway:8080"]);
+    // A branch environment's pool pods reach the receiver as main's do; a pod of a namespace of no environment's, none.
+    assert.equal(connects(policies, branchPooled, receiver, 4318), true);
+    assert.equal(admits(policies, { ...pooled, namespace: "elsewhere", namespaceLabels: { "kubernetes.io/metadata.name": "elsewhere" } }, receiver, 4318), false);
+    // Where up could not read where the API server is: anywhere, as up says.
+    const unread = all<NetworkPolicyObject>(install(), "NetworkPolicy");
+    assert.deepEqual([reaches(unread, receiver, notApi, 6443), reaches(unread, gateway, internet, 443)], [true, true]);
+    assert.deepEqual([
+      apiServerUnconfined(configOf({}), null),
+      apiServerUnconfined(configOf({}), apiServer),
+      apiServerUnconfined(configOf({ networkPolicies: { enabled: false } }), null),
+      apiServerUnconfined(configOf({ workspaceStorage: { enabled: false } }), null),
+    ], [true, false, false, false]);
+  });
+
+  test("finds the branch environments by their namespaces, which the gateway and the receiver may read, and nothing else of the cluster", () => {
+    const objects = install();
+    for (const account of ["alasio-sandbox-gateway", "alasio-receiver"]) {
+      assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", account).rules, [{ apiGroups: [""], resources: ["namespaces"], verbs: ["get", "list", "watch"] }]);
+      const binding = one<V1ClusterRoleBinding>(objects, "ClusterRoleBinding", account);
+      assert.deepEqual([binding.roleRef.name, binding.subjects], [account, [{ kind: "ServiceAccount", name: account, namespace: "alasio" }]]);
+    }
+  });
+
+  test("binds a branch environment's sessions in pools of its own, in its sessions' namespace, through main's gateway and receiver, which nothing of a branch changes", () => {
+    const main = install();
+    const branch = branchObjects(configOf(), "try", BASELINE);
+    const namespace = "alasio-branch-try-sessions";
+    const ofBranch = <T extends KubernetesObject>(kind: string, name: string) => one<T>(branch.filter(({ metadata }) => metadata?.namespace === namespace), kind, name);
+    for (const mode of ["none", "full"] as const) {
+      const pool = ofBranch<V1Deployment>("Deployment", `sandboxes-${mode}`);
+      assert.deepEqual(pool.spec?.selector.matchLabels, { "alasio.dev/pool": `sandboxes-${mode}`, "alasio.dev/free": "true" });
+      assert.deepEqual(ofBranch<ScaledObject>("ScaledObject", `sandboxes-${mode}`).spec.triggers[0]?.metadata["url"], `http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/${namespace}/sandboxes-${mode}`);
+    }
+    assert.deepEqual(ofBranch<V1Role>("Role", "alasio-sandbox-gateway").rules, one<V1Role>(main.filter(({ metadata }) => metadata?.namespace === "alasio-sessions"), "Role", "alasio-sandbox-gateway").rules);
+    assert.deepEqual(ofBranch<V1Role>("Role", "alasio-receiver").rules, [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]);
+    assert.deepEqual(ofBranch<V1RoleBinding>("RoleBinding", "alasio-receiver").subjects, [{ kind: "ServiceAccount", name: "alasio-receiver", namespace: "alasio" }]);
+    assert.ok(ofBranch("PodDisruptionBudget", "alasio-bound"));
+    // Main's gateway reaches its pools, and they its receiver, as main's do.
+    const policies = [...all<NetworkPolicyObject>(main, "NetworkPolicy"), ...all<NetworkPolicyObject>(branch, "NetworkPolicy")];
+    const pod = (component: string, at: string, labels: Record<string, string> = {}, namespaceLabels: Record<string, string> = {}): Pod => ({
+      namespace: at,
+      namespaceLabels: { "kubernetes.io/metadata.name": at, ...namespaceLabels },
+      labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component, ...labels },
+    });
+    const pooled = pod("session", namespace, { "alasio.dev/pool": "sandboxes-none", "alasio.dev/net-mode": "none", "alasio.dev/free": "true" }, { "alasio.dev/branch": "try" });
+    assert.equal(connects(policies, pod("sandbox-gateway", "alasio"), pooled, 7290), true);
+    assert.equal(connects(policies, pod("alasio", "alasio-branch-try"), pooled, 7290), false);
+    assert.equal(connects(policies, pooled, pod("receiver", "alasio"), 4318), true);
+    assert.equal(connects(policies, pooled, pod("alasio", "alasio-branch-try"), 4318), false);
+    // Nothing of main's is a branch's, so a branch made or deleted changes, and restarts, nothing of main's.
+    const named = ({ kind, metadata }: KubernetesObject) => `${kind}/${metadata?.namespace ?? ""}/${metadata?.name ?? ""}`;
+    const mains = new Set(main.map(named));
+    assert.deepEqual(branch.map(named).filter((each) => mains.has(each)), []);
+    assert.deepEqual(branch.filter(({ metadata }) => metadata?.namespace === "alasio").map(named), []);
+  });
+
+  test("gives the node agent the metadata engine alone, which it sets quotas on with JuiceFS's own command, of the release the nodes mount with", () => {
+    const objects = install();
+    const [agent] = one<V1DaemonSet>(objects, "DaemonSet", "alasio-node-agent").spec?.template.spec?.containers ?? [];
+    // As a Valkey user of its own, of no command Valkey calls dangerous but INFO, and no key of workspace storage's object store.
+    assert.deepEqual(agent?.env?.find(({ name }) => name === "META_URL")?.valueFrom?.secretKeyRef, { name: "alasio-workspaces-quotas", key: "metaurl" });
+    assert.deepEqual((agent?.env ?? []).filter(({ valueFrom }) => valueFrom?.secretKeyRef?.name === "alasio-workspaces-juicefs"), []);
+    const [server] = one<V1StatefulSet>(objects, "StatefulSet", "alasio-valkey").spec?.template.spec?.containers ?? [];
+    const args = server?.command ?? [];
+    assert.deepEqual(args.slice(args.indexOf("--user")), ["--user", "quotas", "on", ">$(VALKEY_QUOTAS_PASSWORD)", "~*", "&*", "+@all", "-@dangerous", "+info"]);
+    assert.ok(args.includes("--requirepass"));
+    assert.deepEqual(server?.env?.find(({ name }) => name === "VALKEY_QUOTAS_PASSWORD")?.valueFrom?.secretKeyRef, { name: "alasio-workspaces-quotas", key: "password" });
+    // JuiceFS's own release of the mount image's version, pinned by its checksum, checked to be that version as the image is built.
+    const { tag } = configOf().workspaceStorage.image;
+    const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
+    assert.equal(/^ARG JUICEFS_VERSION=(.+)$/mu.exec(dockerfile)?.[1], tag.replace(/^ce-v/u, ""));
+    assert.match(dockerfile, /^ARG JUICEFS_SHA256=[0-9a-f]{64}$/mu);
+    assert.match(dockerfile, /sha256sum -c -/u);
+    assert.match(dockerfile, /juicefs version \| grep -F "juicefs version \$\{JUICEFS_VERSION\}\+"/u);
+    // And the metadata engine takes them, as they reach it.
+    const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
+    const pod = (component: string): Pod => ({ namespace: "alasio", namespaceLabels: { "kubernetes.io/metadata.name": "alasio" }, labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component } });
+    assert.equal(connects(policies, pod("node-agent"), pod("valkey"), 6379), true);
+    assert.equal(connects(policies, pod("sandbox-gateway"), pod("valkey"), 6379), false);
+  });
+
+  test("runs none of it without workspace storage, or where sandboxes are not snapshotted, as the node agents attach its workspaces", () => {
+    for (const file of [{ workspaceStorage: { enabled: false } }, { sessions: { runtimeClassName: "" } }]) {
+      const objects = install(file);
+      assert.deepEqual(objects.filter(({ metadata }) => /sandbox-gateway|sandboxes-|alasio-receiver|workspace-mount/u.test(metadata?.name ?? "")).map(({ kind, metadata }) => `${kind}/${metadata?.name}`), [], JSON.stringify(file));
+    }
   });
 });
 
@@ -3369,7 +3583,7 @@ test("no field Kubernetes changes of no object once made carries the release's v
         return [];
     }
   };
-  for (const objects of [install(), branchObjects(configOf(), "try")]) {
+  for (const objects of [install(), branchObjects(configOf(), "try", BASELINE)]) {
     for (const object of objects) {
       for (const [field, value] of immutable(object)) {
         const said = JSON.stringify(value ?? null);

@@ -15,7 +15,6 @@ import { InMemorySpanExporter, type ReadableSpan, SimpleSpanProcessor } from "@o
 import type { ClaudeQueryFactory } from "../src/harness/claude/runtime.ts";
 import type { Harness } from "../src/harness/index.ts";
 import type { HarnessName } from "../src/harness/names.ts";
-import type { HostProfile } from "../src/kube/config.ts";
 import type { Store as StoreService } from "../src/persistence/store.ts";
 // Types only: effect itself is loaded once the SDK is registered, below.
 import type { Effect as EffectTypes } from "effect";
@@ -52,7 +51,6 @@ const { buildCodexEnv } = await import("../src/codex/env.ts");
 const { codexTelemetryArgs, codexTelemetryEnv } = await import("../src/codex/app-server/telemetry.ts");
 const { makeAppServerRpc } = await import("../src/codex/app-server/rpc-client.ts");
 const { appServerProcess } = await import("./support/app-server-process.ts");
-const { hostBaymaManifest } = await import("../src/mcp/bayma.ts");
 const { withServices } = await import("./support/turns.ts");
 const { recordingTelegram, sentMessage } = await import("./support/telegram-calls.ts");
 const { processPrompt } = await import("../src/operator/prompts.ts");
@@ -197,20 +195,6 @@ test("Claude Code exports each signal alasio exports, labelled with its conversa
     OTEL_LOGS_EXPORTER: "none",
     OTEL_LOG_USER_PROMPTS: "1",
   });
-});
-
-test("a folder's bayma exports where alasio does, labelled with its conversation", () => {
-  const profile: HostProfile = { namespace: "alasio-host", port: 7290, stateRoot: "/s", podTemplate: { spec: { containers: [{ name: "bayma", args: [] }] } } };
-  const envOf = (env: NodeJS.ProcessEnv) => {
-    const [bayma] = hostBaymaManifest({ harness: CLAUDE_HARNESS, threadKey: "telegram:7", profile, env }).spec.podTemplate.spec?.containers ?? [];
-    assert.ok(bayma?.env);
-    return Object.fromEntries(bayma.env.map(({ name, value }) => [name, value]));
-  };
-  assert.deepEqual(envOf({ PATH: "/bin" }), {});
-  const env = envOf({ ...ENDPOINT, OTEL_METRICS_EXPORTER: "none" });
-  assert.equal(env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"], "http://collector:4318/v1/traces");
-  assert.equal(env["OTEL_METRICS_EXPORTER"], "none");
-  assert.equal(env["OTEL_RESOURCE_ATTRIBUTES"], "alasio.conversation.id=telegram%3A7");
 });
 
 test("Codex's app-server exports each signal alasio exports through its own config", () => {
@@ -495,7 +479,7 @@ test("Claude Code's process does not join the turn's trace, and its hooks and re
         workingDirectory: "/work",
         sessions: { sessionExists: () => Effect.succeed(false) },
         queryFactory,
-        folderBayma: () => Effect.succeed({ type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }),
+        folderBayma: () => Effect.succeed({ server: { type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }, notice: null }),
       });
       const result = yield* liveSessions.runTurn({
         prompt: "hello",

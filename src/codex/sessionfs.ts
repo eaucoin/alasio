@@ -14,8 +14,8 @@
  *   operator's login is used without being copied here.
  *
  * Per thread, sent with every start, resume, fork, and turn (Codex merges it over
- * config.toml): the workspace's bayma, at its Sandbox with its token, as the `bayma` MCP
- * server, and alasio's instructions. A thread runs in the workspace's harness directory
+ * config.toml): the workspace's bayma, through the sandbox gateway with its token, as the
+ * `bayma` MCP server, and alasio's instructions. A thread runs in the workspace's harness directory
  * in alasio, which keeps each workspace's thread list apart.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -25,7 +25,7 @@ import { Context, Effect, Layer, RcRef, type Scope } from "effect";
 
 import { getCodexTransportMode } from "../config.ts";
 import { SESSION_FS_AGENT_INSTRUCTIONS } from "../harness/workspace-instructions.ts";
-import type { BaymaEndpoint } from "../kube/sandboxes.ts";
+import type { BaymaEndpoint } from "../sandbox/gateway-client.ts";
 import { type AppServer, makeAppServer } from "./app-server/client.ts";
 import { type SpawnAppServer, spawnAppServer } from "./app-server/process.ts";
 import { type CodexEnv, codexHome } from "./env.ts";

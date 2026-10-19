@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { packageProblems, REQUIRED } from "../../tooling/cli-package.ts";
 
 test("a package of the built command line alone has no problem", () => {
-  assert.deepEqual(packageProblems(["package.json", ...REQUIRED, "dist/cli/src/main.js.map", "dist/src/kube/config.js"]), []);
+  assert.deepEqual(packageProblems(["package.json", ...REQUIRED, "dist/cli/src/main.js.map", "dist/src/kube/client.js"]), []);
 });
 
 test("sources, tests and what is not built are refused, and what it needs is required", () => {
@@ -17,7 +17,6 @@ test("sources, tests and what is not built are refused, and what it needs is req
     "src/main.ts is not of the built command line",
     "dist/cli/src/config.d.ts is not of the built command line",
     "dist/cli/test/commands.test.js is a test's",
-    "dist/cli/src/manifests/sandboxes.agents.x-k8s.io.json is missing",
     "dist/cli/src/manifests/scaledobjects.keda.sh.json is missing",
     "dist/cli/src/manifests/scaledjobs.keda.sh.json is missing",
     "dist/cli/src/manifests/triggerauthentications.keda.sh.json is missing",

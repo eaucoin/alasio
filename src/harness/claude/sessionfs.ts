@@ -10,12 +10,12 @@
  *   machine, which would reach its loopback.
  * - `settingSources: []` and `strictMcpConfig` keep the operator's settings, hooks,
  *   skills, plugins, and MCP servers out.
- * - bayma, reached at the session's Sandbox with its token (sandbox/index.ts), is the one
+ * - bayma, reached through the sandbox gateway with its token (sandbox/index.ts), is the one
  *   MCP server, and so the agent's only way into the workspace.
  */
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 
-import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
+import type { BaymaEndpoint } from "../../sandbox/gateway-client.ts";
 import { SESSION_FS_AGENT_INSTRUCTIONS } from "../workspace-instructions.ts";
 
 /** The query options that confine Claude Code to a session filesystem. */

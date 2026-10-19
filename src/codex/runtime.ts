@@ -32,7 +32,6 @@ import type { AppServerStartError } from "./app-server/rpc-client.ts";
 import type { ThreadIdMissing } from "./app-server/thread-client.ts";
 import type { CodexListingScope } from "./sessions.ts";
 import type { CodexStreamParams } from "./transport.ts";
-import type { PodRef } from "../kube/busy.ts";
 import { type FolderBayma, noFolderBayma } from "../mcp/bayma.ts";
 import { withLogScope } from "../shared/log.ts";
 import { ActiveTurns, type RunningTurn, stopReasonText } from "../harness/active-turns.ts";
@@ -48,6 +47,8 @@ function getErrorMessage(error: unknown): string {
 /** What a call runs against: a listing scope, with the config its threads run with. */
 export interface CodexScope extends CodexListingScope {
   readonly codexConfig: CodexThreadConfig;
+  /** Why the call runs without its folder's bayma, which a turn's prompt is told: none where it has it, or runs in a session filesystem. */
+  readonly baymaNotice?: string | null | undefined;
 }
 
 /** What a call could not be run against: the workspace's bayma, its session's host, or its Codex did not come up. */
@@ -72,6 +73,10 @@ export interface CodexScopeParams {
   readonly scope?: CodexScopeProvider | null | undefined;
   /** The conversation's bayma in a folder workspace; none unless the deployment, or a test, gives one. */
   readonly folderBayma?: FolderBayma | undefined;
+  /** The chat to tell of a folder's bayma that did not start: a turn's; none for a call no operator waits on. */
+  readonly noticeChatId?: string | undefined;
+  /** What says in a turn's status what its folder's bayma's long bind waits on: a turn's; none for a call no operator waits on. */
+  readonly waiting?: ((what: string | null) => Effect.Effect<void>) | undefined;
 }
 
 export interface ForkCodexSessionParams extends CodexScopeParams {
@@ -90,8 +95,6 @@ export interface CodexTurnParams extends TurnParams, CodexScopeParams {
   readonly codexFactory?: CodexStreamParams["codexFactory"];
   /** How many times the DB guardrail has already sent the turn back to Codex. */
   readonly guardrailRecoveryDepth?: number | undefined;
-  /** The pod the turn works in, which it holds busy while it runs (ActiveTurns). */
-  readonly workspacePod?: PodRef | null | undefined;
 }
 
 /** The operator stopped a turn, with /stop or a swerve. */
@@ -121,12 +124,14 @@ const folderCodexScope = ({
   threadKey,
   appServer,
   folderBayma = noFolderBayma,
+  noticeChatId,
+  waiting,
 }: Omit<CodexScopeParams, "scope">): Effect.Effect<CodexScope, CodexScopeError> =>
-  folderBayma({ harness: CODEX_HARNESS, threadKey }).pipe(
+  folderBayma({ harness: CODEX_HARNESS, threadKey, workingDirectory, chatId: noticeChatId, waiting }).pipe(
     Effect.mapError((cause) => new CodexScopeError({ cause })),
-    Effect.map((bayma) => {
+    Effect.map(({ server, notice }) => {
       const codexEnv = buildCodexEnv();
-      return { cwd: workingDirectory, codexEnv, codexConfig: buildCodexThreadConfig({ codexEnv, bayma }), appServer };
+      return { cwd: workingDirectory, codexEnv, codexConfig: buildCodexThreadConfig({ codexEnv, bayma: server }), appServer, baymaNotice: notice };
     }),
   );
 
@@ -281,7 +286,9 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
 
   /** The turn's events, read to their end, in a scope the transport keeps what it runs in. */
   const readEvents = Effect.scoped(Effect.gen(function*() {
-    const { cwd, codexEnv, codexConfig, appServer } = yield* codexScope(params);
+    const waiting = (what: string | null) =>
+      persistence.setWaiting(what).pipe(Effect.catch((error) => Effect.logWarning(`could not say thread=${threadKey} waits on ${what ?? "nothing"}: ${error.message}`)));
+    const { cwd, codexEnv, codexConfig, appServer, baymaNotice } = yield* codexScope({ ...params, noticeChatId: params.chatId, waiting });
     yield* turnTimer("env.built");
     yield* turnTimer("bayma.ready");
     const streamParams: CodexStreamParams = {
@@ -290,7 +297,8 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
       workingDirectory: cwd,
       codexEnv,
       codexConfig,
-      prompt,
+      // Told, where it runs without its folder's bayma, that its REPL tools are gone.
+      prompt: baymaNotice ? `${baymaNotice}\n\n${prompt}` : prompt,
       modelChoice: params.modelChoice,
       persistence,
       pendingResponseId,
@@ -322,7 +330,7 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
   // interrupts the reading, which interrupts it upstream. The reading is a fiber of its
   // own, which interrupting this one leaves be.
   const reader = yield* Effect.forkDetach(readEvents);
-  const read = yield* Effect.scoped(activeTurns.register(threadKey, running, { workspace: params.workspacePod }).pipe(
+  const read = yield* Effect.scoped(activeTurns.register(threadKey, running).pipe(
     Effect.andThen(Fiber.join(reader).pipe(
       Effect.raceFirst(Deferred.await(stopped)),
       // Stopped, the reading is interrupted, and with it the turn upstream.

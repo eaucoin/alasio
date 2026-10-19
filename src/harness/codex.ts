@@ -36,7 +36,7 @@ function toModelOption(model: v2.Model): ModelOption {
   };
 }
 
-/** A session-filesystem workspace's volume, with the Sandbox and the app-server that serve it. */
+/** A session-filesystem workspace's volume, with the session sandboxes and the app-server that serve it. */
 interface ServedSessionFs {
   readonly volumeId: string;
   readonly sandbox: SessionSandboxes["Service"];
@@ -68,7 +68,6 @@ export const makeCodexHarness = Effect.fnUntraced(function*({
   sessionFsCodex,
   sessionFsCodexRollouts = null,
   folderBayma,
-  workspacePod,
 }: CodexHarnessOptions): Effect.fn.Return<Harness, SessionFilesystemsDisabled, CodexAppServer | ActiveTurns> {
   const appServer = yield* CodexAppServer;
   const activeTurns = yield* ActiveTurns;
@@ -84,9 +83,9 @@ export const makeCodexHarness = Effect.fnUntraced(function*({
   const directory = sessionFs ? sessionFs.sandbox.harnessDirectory(sessionFs.volumeId) : workingDirectory;
   const scoped = withLogScope("codex-harness");
 
-  // What each call runs against: `scope` for a thread's work (a session filesystem's
-  // brings its Sandbox up; a folder's is built by the runtime), `listingScope` for
-  // thread and model lists and goals, which need no Sandbox.
+  // What each call runs against: `scope` for a thread's work (a session filesystem's binds
+  // its workspace; a folder's is built by the runtime), `listingScope` for thread and model
+  // lists and goals, which need no workspace bound.
   const scope: CodexScopeProvider | null = sessionFs
     ? sessionFs.sandbox.ensureSession(sessionFs.volumeId).pipe(
       Effect.mapError((cause) => new CodexScopeError({ cause })),
@@ -141,7 +140,7 @@ export const makeCodexHarness = Effect.fnUntraced(function*({
       ensureRollouts(sessionId).pipe(Effect.andThen(warmCodexSession({ sessionId, threadKey, ...scopeParams })), scoped),
     runTurn: (params) =>
       ensureRollouts(params.resumeSession).pipe(
-        Effect.andThen(executeCodexTurn({ ...params, ...scopeParams, workspacePod: workspacePod?.(params.threadKey), beforeResponseComplete: flushRollouts })),
+        Effect.andThen(executeCodexTurn({ ...params, ...scopeParams, beforeResponseComplete: flushRollouts })),
         Effect.provideService(ActiveTurns, activeTurns),
         scoped,
       ),

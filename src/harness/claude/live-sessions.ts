@@ -62,13 +62,12 @@ import {
   storeBlocks,
 } from "../../codex/event-projection.ts";
 import { createTurnTimer, type TurnTimer } from "../../codex/turn-timing.ts";
-import type { PodRef } from "../../kube/busy.ts";
-import type { BaymaEndpoint, SandboxError } from "../../kube/sandboxes.ts";
+import { type BaymaEndpoint, TOKEN_TTL_MS } from "../../sandbox/gateway-client.ts";
 import type { ModelChoice } from "../../persistence/conversation-repository.ts";
 import type { StoreError } from "../../persistence/sql.ts";
 import type { TurnFenced } from "../../persistence/store.ts";
 import type { TurnOutcome } from "../../persistence/turn-repository.ts";
-import { type BaymaMcpServer, type HostBaymaScope, type NoFolderWorkspaces, noFolderBayma } from "../../mcp/bayma.ts";
+import { type FolderBaymaOutcome, type FolderBaymaScope, type NoFolderWorkspaces, noFolderBayma } from "../../mcp/bayma.ts";
 import { isBlockedDbCommand } from "../../policy/db-guardrail.ts";
 import { extractShellCommands } from "../../policy/embedded-shell.ts";
 import { looksLikeSelfRestartCommand } from "../../policy/restart-command.ts";
@@ -172,6 +171,12 @@ export interface ClaudeHost {
   /** The model and effort it runs on, as modelKey renders them. */
   readonly key: string;
   readonly baymaUrl: string | null;
+  /** Why it runs without its folder's bayma, which its turns' prompts are told, as its last bind said: none where it has it, or runs in a session filesystem. */
+  baymaNotice: string | null;
+  /** When its bayma's server was given it, with its bearer, which is good for TOKEN_TTL_MS from then. */
+  baymaGivenAt: number;
+  /** Whether it was started with its folder's bayma among its MCP servers. */
+  readonly withFolderBayma: boolean;
   sessionId: string | null;
   readonly channel: PromptChannel;
   /** Aborts the process; the Agent SDK is given it to stop the process with. */
@@ -206,11 +211,17 @@ export interface ClaudeLiveSessionsOptions {
   readonly sessions: Pick<ClaudeSessionApi, "sessionExists">;
   readonly sessionStore?: SessionStore | null;
   readonly sessionFsBayma?: Effect.Effect<BaymaEndpoint, SessionError> | null;
-  readonly folderBayma?: (scope: Pick<HostBaymaScope, "threadKey">) => Effect.Effect<BaymaMcpServer, SandboxError | NoFolderWorkspaces>;
-  /** The pod a conversation's turns work in, which each holds busy while it runs (ActiveTurns). */
-  readonly workspacePod?: ((threadKey: string) => PodRef | null) | undefined;
+  readonly folderBayma?: (scope: Omit<FolderBaymaScope, "harness">) => Effect.Effect<FolderBaymaOutcome, NoFolderWorkspaces>;
   readonly queryFactory?: ClaudeQueryFactory | undefined;
+  /** How long a process keeps its bayma's server as it was given it before a turn gives it the server anew, its bearer fresh: BAYMA_BEARER_LIFE_MS unless said. */
+  readonly baymaBearerLifeMs?: number | undefined;
 }
+
+/**
+ * How long a process keeps its bayma's server as it was given it: an hour less than the
+ * bearer in it is good for, so a turn of it never reaches bayma with a bearer that lapsed.
+ */
+export const BAYMA_BEARER_LIFE_MS = TOKEN_TTL_MS - 60 * 60_000;
 
 /** The live Claude Code processes of one working directory, one per conversation, for as long as their scope is open. */
 export interface ClaudeLiveSessions {
@@ -235,7 +246,7 @@ function describeTasks(tasks: readonly BackgroundTask[]): string {
 }
 
 /** A folder conversation's bayma where none is given: a deployment's without folder workspaces. */
-const defaultFolderBayma = ({ threadKey }: Pick<HostBaymaScope, "threadKey">) => noFolderBayma({ harness: CLAUDE_HARNESS, threadKey });
+const defaultFolderBayma = (scope: Omit<FolderBaymaScope, "harness">) => noFolderBayma({ ...scope, harness: CLAUDE_HARNESS });
 
 /** A promise of the Agent SDK's, failing as Claude Code failed it. */
 const attempt = <A>(evaluate: () => Promise<A>): Effect.Effect<A, ClaudeCodeError> =>
@@ -244,6 +255,10 @@ const attempt = <A>(evaluate: () => Promise<A>): Effect.Effect<A, ClaudeCodeErro
 /** What starting Claude Code needs from alasio's services, failing as starting it fails. */
 const needed = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, ClaudeCodeError> =>
   Effect.mapError(effect, (cause) => new ClaudeCodeError({ cause }));
+
+/** What says, in the status of the turn of `params`, what its folder's bayma's bind waits on, as a long one does, and that it waits no more (null). */
+const waitingOf = (params: TurnParams) => (what: string | null): Effect.Effect<void> =>
+  params.persistence.setWaiting(what).pipe(Effect.catch((error) => Effect.logWarning(`could not say thread=${params.threadKey} waits on ${what ?? "nothing"}: ${error.message}`)));
 
 /** Now, as a log line gives it. */
 const now = Effect.map(Clock.currentTimeMillis, (millis) => new Date(millis).toISOString());
@@ -287,8 +302,8 @@ const endCliTurn = (host: ClaudeHost, cliTurn: CliTurn, outcome: TurnOutcome): E
  * The live processes of `workingDirectory`, for as long as the scope they are made in
  * is open. `workingDirectory` is where the CLI runs: a folder workspace itself, with
  * the conversation's bayma from `folderBayma()`, or a session filesystem's harness
- * directory, when `sessionFsBayma()` gives the workspace's bayma endpoint (bringing its
- * Sandbox up) and the CLI is confined to it (sessionfs.ts).
+ * directory, when `sessionFsBayma()` gives the workspace's bayma endpoint (binding the
+ * workspace) and the CLI is confined to it (sessionfs.ts).
  */
 export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   workingDirectory,
@@ -296,8 +311,8 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   sessionStore = null,
   sessionFsBayma = null,
   folderBayma = defaultFolderBayma,
-  workspacePod,
   queryFactory = query,
+  baymaBearerLifeMs = BAYMA_BEARER_LIFE_MS,
 }: ClaudeLiveSessionsOptions): Effect.fn.Return<ClaudeLiveSessions, never, Scope.Scope | ActiveTurns> {
   const scope = yield* Effect.scope;
   const activeTurns = yield* ActiveTurns;
@@ -451,9 +466,6 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
    */
   const stopTaking = (cliTurn: CliTurn): Effect.Effect<void> => (cliTurn.taking ? Effect.asVoid(Fiber.interrupt(cliTurn.taking.fiber)) : Effect.void);
 
-  /** The options a CLI turn holds the conversation busy with. */
-  const cliTurnRegistration = (host: ClaudeHost) => ({ onlyIfIdle: true, workspace: workspacePod?.(host.threadKey) });
-
   /** Whether no hold that is no turn's (a fork's) keeps the conversation; where that cannot be told, one does, as said in alasio's log. */
   const freeOfHolds = (host: ClaudeHost): Effect.Effect<boolean> =>
     host.ownTurns.held.pipe(
@@ -479,7 +491,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
 
   /** Holds the conversation busy for a CLI turn once neither another turn nor a hold that is no turn's does, waiting as long as either does. */
   const holdForCliTurnWhenFree = (host: ClaudeHost, cliTurn: CliTurn): Effect.Effect<void> =>
-    holdForCliTurn(host, cliTurn, (attempt) => Effect.as(activeTurns.registerWhenIdle(host.threadKey, cliTurn.running, cliTurnRegistration(host)).pipe(Scope.provide(attempt)), true)).pipe(
+    holdForCliTurn(host, cliTurn, (attempt) => Effect.as(activeTurns.registerWhenIdle(host.threadKey, cliTurn.running).pipe(Scope.provide(attempt)), true)).pipe(
       Effect.repeat({ until: (held) => held, schedule: Schedule.spaced(HOLD_RECHECK) }),
       Effect.asVoid,
     );
@@ -541,7 +553,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     };
     host.cliTurn = cliTurn;
     const held = host.reportsWaiting === null
-      && (yield* holdForCliTurn(host, cliTurn, (attempt) => activeTurns.register(host.threadKey, cliTurn.running, cliTurnRegistration(host)).pipe(Scope.provide(attempt))));
+      && (yield* holdForCliTurn(host, cliTurn, (attempt) => activeTurns.register(host.threadKey, cliTurn.running, { onlyIfIdle: true }).pipe(Scope.provide(attempt))));
     if (held) {
       yield* claimCliTurn(host, cliTurn).pipe(
         Effect.onError(() => Effect.sync(() => void (host.cliTurn = null)).pipe(Effect.andThen(releaseCliTurn(host, cliTurn)))),
@@ -813,14 +825,12 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     return {};
   });
 
-  const startHost = Effect.fnUntraced(function*(params: TurnParams, key: string, bayma: BaymaEndpoint | null): Effect.fn.Return<ClaudeHost, ClaudeCodeError> {
+  const startHost = Effect.fnUntraced(function*(params: TurnParams, key: string, bayma: BaymaEndpoint | null, folder: FolderBaymaOutcome | null): Effect.fn.Return<ClaudeHost, ClaudeCodeError> {
     const { threadKey, resumeSession, persistence } = params;
     const claudeEnv = buildClaudeEnv();
     // A session filesystem's bayma runs in its sandbox; a folder's is the conversation's
-    // own, in a host-profile Sandbox of its own.
-    const mcpServers = bayma
-      ? undefined
-      : claudeMcpServers(yield* needed(folderBayma({ threadKey })));
+    // own, the gateway's folder instance, where it started.
+    const mcpServers = folder?.server ? claudeMcpServers(folder.server) : undefined;
     const resumeExists = resumeSession ? yield* sessions.sessionExists(resumeSession) : false;
     const controller = new AbortController();
     const channel = instrumentPromptChannel(yield* makePromptChannel, threadKey);
@@ -851,6 +861,9 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       threadKey,
       key,
       baymaUrl: bayma?.url ?? null,
+      baymaNotice: folder?.notice ?? null,
+      baymaGivenAt: yield* Clock.currentTimeMillis,
+      withFolderBayma: folder?.server != null,
       sessionId: resumeSession ?? null,
       channel,
       controller,
@@ -888,18 +901,45 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
    */
   const hostFor = Effect.fnUntraced(function*(params: TurnParams): Effect.fn.Return<ClaudeHost, ClaudeCodeError> {
     const key = modelKey(params.modelChoice);
-    // A session filesystem's Sandbox is made sure of before every turn, not only when the
-    // process starts: the process outlives turns, and the Sandbox may have been suspended
-    // in between. Its bayma is reached at the same address either way.
+    // A session filesystem is bound before every turn, not only when the process starts: the
+    // process outlives turns, and the gateway may have released its binding in between. Its
+    // bayma is reached at the same address either way, the process's MCP client initializing a
+    // session anew with the one bound since, which knows none of the one before's
+    // (test/bayma-reconnect.test.ts).
     const bayma = sessionFsBayma ? yield* needed(sessionFsBayma) : null;
     const existing = hosts.get(params.threadKey);
-    if (existing && !existing.closed) {
-      if (params.resumeSession && existing.sessionId === params.resumeSession && existing.key === key && existing.baymaUrl === (bayma?.url ?? null)) {
-        return existing;
-      }
-      yield* closeHost(existing, "mounted session, model, or workspace door changed");
+    const reusable = existing && !existing.closed && params.resumeSession && existing.sessionId === params.resumeSession && existing.key === key && existing.baymaUrl === (bayma?.url ?? null);
+    const now = yield* Clock.currentTimeMillis;
+    // Its bayma's bearer, as the process was given it, about to lapse: given it anew below.
+    const lapsing = reusable && now - existing.baymaGivenAt >= baymaBearerLifeMs;
+    // A folder's bayma bound before every turn, a process's first and those of a process
+    // reused alike, as one released since is bound anew before the turn rather than by its
+    // first tool call: one that does not start leaves the turn without it, told so before its
+    // prompt, and the chat told with its buttons (../../mcp/bayma.ts HostBayma). A process
+    // reused finds its bayma bound anew at the same address, its MCP client initializing a
+    // session anew (test/bayma-reconnect.test.ts); one that started without it starts anew once
+    // it has it.
+    const folder = bayma ? null : yield* needed(folderBayma({ threadKey: params.threadKey, workingDirectory, chatId: params.chatId, waiting: waitingOf(params) }));
+    if (reusable && folder !== null && folder.server === null) {
+      existing.baymaNotice = folder.notice;
+      return existing;
     }
-    const host = yield* startHost(params, key, bayma);
+    if (reusable && (folder === null || existing.withFolderBayma)) {
+      existing.baymaNotice = null;
+      // Its bearer about to lapse: given its server anew, the bearer fresh, the process kept,
+      // its MCP client connecting to it afresh, as the Agent SDK replaces a server it is given.
+      const renewed = !lapsing ? null : bayma ? { bayma: { type: "http" as const, url: bayma.url, headers: bayma.headers } } : folder?.server ? claudeMcpServers(folder.server) : null;
+      if (renewed) {
+        const set = yield* attempt(() => existing.sdkQuery.setMcpServers(renewed));
+        if (Object.keys(set.errors).length > 0) yield* Effect.logWarning(`giving thread=${params.threadKey} its bayma anew failed: ${JSON.stringify(set.errors)}`);
+        existing.baymaGivenAt = now;
+      }
+      return existing;
+    }
+    if (existing && !existing.closed) {
+      yield* closeHost(existing, reusable ? "its folder's bayma started" : "mounted session, model, or workspace door changed");
+    }
+    const host = yield* startHost(params, key, bayma, folder);
     hosts.set(params.threadKey, host);
     return host;
   });
@@ -1003,7 +1043,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     });
     // Registered before the process is made sure of, so the conversation reads as busy at
     // once; the registration ends with the turn, or with this fiber if it is interrupted.
-    yield* activeTurns.register(threadKey, { cliInitiated: false, stop, steer }, { workspace: workspacePod?.(threadKey) }).pipe(Scope.provide(current.registration));
+    yield* activeTurns.register(threadKey, { cliInitiated: false, stop, steer }).pipe(Scope.provide(current.registration));
     return yield* Effect.gen(function*() {
       yield* turnTimer("env.built");
       const started = yield* hostFor(params).pipe(
@@ -1039,7 +1079,8 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       // Stopped as its dispatch was recorded, the turn pushes nothing; past this, a stop interrupts its process.
       if (stoppedFor !== null) return yield* stoppedBeforePush(started, stoppedFor);
       pushed = true;
-      yield* started.channel.push(buildClaudeUserMessage(prompt, uuid));
+      // Told, where it runs without its folder's bayma, that its REPL tools are gone.
+      yield* started.channel.push(buildClaudeUserMessage(started.baymaNotice ? `${started.baymaNotice}\n\n${prompt}` : prompt, uuid));
       for (const steerPrompt of current.earlySteers.splice(0)) {
         yield* steer(steerPrompt);
       }

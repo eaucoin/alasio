@@ -22,7 +22,7 @@ import type {
   SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
 import { Effect, Schema } from "effect";
-import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
+import type { BaymaEndpoint } from "../../sandbox/gateway-client.ts";
 import type { ModelChoice } from "../../persistence/conversation-repository.ts";
 import { withLogScope } from "../../shared/log.ts";
 import { sessionFsQueryOptions } from "./sessionfs.ts";
@@ -37,7 +37,7 @@ export interface ClaudeQueryParams {
 }
 
 /** A running Claude Code query, as alasio drives it: its messages, an interrupt, and a close. */
-export type ClaudeQuery = AsyncIterable<SDKMessage> & Pick<Query, "interrupt" | "close">;
+export type ClaudeQuery = AsyncIterable<SDKMessage> & Pick<Query, "interrupt" | "close" | "setMcpServers">;
 
 /** Starts a Claude Code query: the SDK's `query`, or a test's stand-in. */
 export type ClaudeQueryFactory = (params: ClaudeQueryParams) => ClaudeQuery;

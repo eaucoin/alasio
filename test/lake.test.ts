@@ -2859,11 +2859,11 @@ describe("the lake's reader", () => {
     }
   });
 
-  test("the Sandboxes row counts what alasio's running totals added in each interval, and the fallback and release alerts main's failures alone", async () => {
+  test("the Sandboxes row counts what the sandbox gateway's running totals added in each interval, and the fallback and release alerts the gateway's failures alone", async () => {
     const minute = 60_000;
     const now = Math.floor(Date.now() / minute) * minute;
     const keyValues = (attributes: Readonly<Record<string, string>>) => Object.entries(attributes).map(([key, value]) => ({ key, value: { stringValue: value } }));
-    const resource = (instance: string, branch?: string) => ({ attributes: keyValues({ "service.name": "alasio", "service.instance.id": instance, ...(branch ? { "alasio.branch": branch } : {}) }) });
+    const resource = (instance: string, service = "alasio-sandbox-gateway") => ({ attributes: keyValues({ "service.name": service, "service.instance.id": instance }) });
     const nanos = (ms: number) => String(BigInt(ms) * 1_000_000n);
     /**
      * A point a minute of a series, as alasio's SDK exports one, from the minute after its
@@ -2896,8 +2896,8 @@ describe("the lake's reader", () => {
     });
     const outcome = (restore: string, fallback?: string) => ({ "alasio.sandbox.restore.outcome": restore, ...(fallback ? { "alasio.sandbox.restore.fallback": fallback } : {}) });
     const restores = "alasio.sandbox.restores";
-    // One alasio up for three hours, which counted before the last hour too; one started
-    // fifty minutes ago, counting from zero; a branch's, which pages no one.
+    // One gateway up for three hours, which counted before the last hour too; one started
+    // fifty minutes ago, counting from zero; another service's, which pages no one.
     const metrics: MetricsRequest = {
       resourceMetrics: [
         {
@@ -2917,7 +2917,7 @@ describe("the lake's reader", () => {
           }],
         },
         { resource: resource("restarted"), scopeMetrics: [{ metrics: [counter(restores, 50, outcome("restored"), [45, 5]), counter(restores, 50, outcome("fallback", "restore"), [15])] }] },
-        { resource: resource("branch", "try"), scopeMetrics: [{ metrics: [counter(restores, 120, outcome("fallback", "node"), [25, 24, 23, 22])] }] },
+        { resource: resource("elsewhere", "alasio"), scopeMetrics: [{ metrics: [counter(restores, 120, outcome("fallback", "node"), [25, 24, 23, 22])] }] },
       ],
     };
     await withLake(async (db) => {
@@ -2959,7 +2959,85 @@ describe("the lake's reader", () => {
     }
   });
 
-  test("the alert rules say which volume server is filling its disk, which Valkey nears its memory limit, and which collection keeps too few copies", async () => {
+  test("the Sandbox gateway row times its binds by how their pod came and its attaches and detaches, counts its releases by why and the pods the policy refused, and the alerts page on refusals and slow warm binds", async () => {
+    const minute = 60_000;
+    const now = Math.floor(Date.now() / minute) * minute;
+    const keyValues = (attributes: Readonly<Record<string, string>>) => Object.entries(attributes).map(([key, value]) => ({ key, value: { stringValue: value } }));
+    const nanos = (ms: number) => String(BigInt(ms) * 1_000_000n);
+    /** A point a minute of a series begun `startedAgo` minutes ago, of the values `at` (minutes before now) by each. */
+    const points = <Point extends object>(startedAgo: number, at: readonly (readonly [number, number])[], point: (seen: readonly number[]) => Point) =>
+      Array.from({ length: Math.max(...at.map(([ago]) => ago)) + 1 }, (_, index) => Math.max(...at.map(([ago]) => ago)) - index).map((ago) => ({
+        startTimeUnixNano: nanos(now - startedAgo * minute),
+        timeUnixNano: nanos(now - ago * minute),
+        ...point(at.filter(([happened]) => happened >= ago).map(([, value]) => value)),
+      }));
+    const counter = (name: string, attributes: Readonly<Record<string, string>>, at: readonly number[]) => ({
+      name,
+      sum: { aggregationTemporality: 2, isMonotonic: true, dataPoints: points(180, at.map((ago) => [ago, 1]), (seen) => ({ asDouble: seen.length, attributes: keyValues(attributes) })) },
+    });
+    const histogram = (name: string, attributes: Readonly<Record<string, string>>, at: readonly (readonly [number, number])[]) => ({
+      name,
+      histogram: {
+        aggregationTemporality: 2,
+        dataPoints: points(180, at, (seen) => ({ count: String(seen.length), sum: seen.reduce((total, value) => total + value, 0), bucketCounts: [String(seen.length)], explicitBounds: [], attributes: keyValues(attributes) })),
+      },
+    });
+    const main = { "k8s.namespace.name": "alasio-sessions" };
+    const bind = (start: string) => ({ ...main, "alasio.binder.pool": "sandboxes-none", "alasio.binder.start": start });
+    const reason = (why: string) => ({ ...main, "alasio.gateway.release.reason": why });
+    // The gateway up for three hours, which timed and counted before the last hour too.
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      await writeTelemetry(db, telemetryRows("metrics", {
+        resourceMetrics: [{
+          resource: { attributes: keyValues({ "service.name": "alasio-sandbox-gateway", "service.instance.id": "gateway-0" }) },
+          scopeMetrics: [{
+            metrics: [
+              histogram("alasio.binder.bind.duration", bind("warm"), [[150, 99], [20, 12], [10, 14]]),
+              histogram("alasio.binder.bind.duration", bind("cold"), [[20, 90]]),
+              histogram("alasio.binder.bind.duration", bind("made"), [[5, 40]]),
+              histogram("alasio.gateway.attach.duration", main, [[20, 2], [10, 4]]),
+              histogram("alasio.gateway.detach.duration", main, [[5, 1]]),
+              counter("alasio.gateway.releases", reason("idle"), [150, 40, 30]),
+              counter("alasio.gateway.releases", reason("asked"), [20]),
+              counter("alasio.gateway.releases", reason("lost"), [10]),
+              counter("alasio.gateway.pod_policy.refusals", { "k8s.namespace.name": "alasio-branch-try-sessions" }, [100, 5, 4]),
+            ],
+          }],
+        }],
+      }));
+    });
+    const dashboard: { panels: { title: string; targets?: { url_options: { data: string } }[] }[] } =
+      JSON.parse(readFileSync(new URL("../neon/grafana/dashboards/stack-health.json", import.meta.url), "utf8"));
+    const panel = (title: string) => {
+      const sql = dashboard.panels.find((found) => found.title === title)?.targets?.[0]?.url_options.data;
+      assert.ok(sql, title);
+      return [["${__from}", String(now - 60 * minute)], ["${__to}", String(now + minute)], ["${__interval_ms}", String(minute)]]
+        .reduce((text, [variable = "", value = ""]) => text.replaceAll(variable, value), sql);
+    };
+    const rules = readFileSync(new URL("../neon/grafana/provisioning/alerting/rules.yaml", import.meta.url), "utf8");
+    const alertQuery = (title: string) => {
+      const [, indent = "", block = ""] = /^ *title: .*\n[\s\S]*?^( *)data: \|\n((?:\1 {2}.*\n)+)/mu.exec(rules.slice(rules.indexOf(`title: ${title}`))) ?? [];
+      return block.replaceAll(`\n${indent}  `, "\n").trim();
+    };
+    const reader = await openReader(readerConfig);
+    try {
+      const rows = async (title: string, label: string, value: string) =>
+        (await answer(reader.db, panel(title))).map((row) => `${String(row[label])} ${Number(row[value])}`).sort();
+      // Each bind of the last hour, by how its pod came; the one before it, not.
+      assert.deepEqual(await rows("Bind time", "start", "seconds"), ["cold 90", "made 40", "warm 12", "warm 14"]);
+      assert.deepEqual(await rows("Attach and detach time", "phase", "seconds"), ["attach 2", "attach 4", "detach 1"]);
+      assert.deepEqual(await rows("Bindings released", "reason", "releases"), ["asked 1", "idle 1", "idle 1", "lost 1"]);
+      assert.deepEqual(await rows("Pods the policy refused", "namespace", "refused"), ["alasio-branch-try-sessions 1", "alasio-branch-try-sessions 1"]);
+      // Two refused in the last fifteen minutes; the warm binds of the last half hour, 13 s on average.
+      assert.deepEqual(await answer(reader.db, alertQuery("The sandbox pods' policy refuses pods")), [{ refused: 2 }]);
+      assert.deepEqual(await answer(reader.db, alertQuery("Binds are slow")), [{ seconds: 13 }]);
+    } finally {
+      reader.close();
+    }
+  });
+
+  test("the alert rules say which volume server is filling its disk, which node's disk is nearly full, which Valkey nears its memory limit, which collection keeps too few copies, and how many folders are held", async () => {
     const now = String(BigInt(Date.now()) * 1_000_000n);
     const strings = (values: Record<string, string>) => Object.entries(values).map(([key, value]) => ({ key, value: { stringValue: value } }));
     const gauge = (resource: Record<string, string>, name: string, value: number, attributes: Record<string, string> = {}) => ({
@@ -2968,6 +3046,11 @@ describe("the lake's reader", () => {
     });
     // Two volume servers' disks of 1000 bytes, one with 50 to fill, the other 500; as the collector names what it scrapes for its job.
     const disk = (pod: string, type: string, bytes: number) => gauge({ "service.name": "seaweedfs" }, "SeaweedFS_volumeServer_resource", bytes, { pod, type, name: "/data" });
+    // Two nodes' filesystems of 100 GB, as their kubelets say them, one with 5 GB left, the other 80.
+    const node = (name: string, available: number) => [
+      gauge({ "k8s.node.name": name }, "k8s.node.filesystem.available", available),
+      gauge({ "k8s.node.name": name }, "k8s.node.filesystem.capacity", 100e9),
+    ];
     // Two Valkeys, one holding 95% of its limit, the other 10%, each named by its receiver.
     const valkey = (address: string, name: string, bytes: number) => gauge({ "service.name": "redis", "server.address": address }, name, bytes);
     await withLake(async (db) => {
@@ -2978,6 +3061,8 @@ describe("the lake's reader", () => {
           disk("filling-0", "avail", 50),
           disk("roomy-0", "all", 1000),
           disk("roomy-0", "avail", 500),
+          ...node("full", 5e9),
+          ...node("roomy", 80e9),
           valkey("filer-store", "redis.memory.used", 950),
           valkey("filer-store", "redis.maxmemory", 1000),
           valkey("roomy-valkey", "redis.memory.used", 100),
@@ -2985,6 +3070,12 @@ describe("the lake's reader", () => {
           // Two masters, the leader saying 2 of neon's volumes under-replicated, the other its stale 0.
           gauge({ "service.name": "seaweedfs" }, "SeaweedFS_master_under_replicated_volumes", 2, { pod: "leader-0", collection: "neon-gate", rp: "001" }),
           gauge({ "service.name": "seaweedfs" }, "SeaweedFS_master_under_replicated_volumes", 0, { pod: "follower-1", collection: "neon-gate", rp: "001" }),
+          // Two gateway replicas, each counting the one folder held; the other two one had held a minute before, restarted since.
+          ...["gateway-0", "gateway-1"].map((instance) => gauge({ "service.name": "alasio-sandbox-gateway", "service.instance.id": instance }, "alasio.gateway.folders.failing", 1, { "k8s.namespace.name": "alasio-host" })),
+          {
+            resource: { attributes: strings({ "service.name": "alasio-sandbox-gateway", "service.instance.id": "gateway-1" }) },
+            scopeMetrics: [{ metrics: [{ name: "alasio.gateway.folders.failing", gauge: { dataPoints: [{ timeUnixNano: String(BigInt(Date.now() - 60_000) * 1_000_000n), asDouble: 3, attributes: strings({ "k8s.namespace.name": "alasio-host" }) }] } }] }],
+          },
         ],
       }));
     });
@@ -2997,10 +3088,14 @@ describe("the lake's reader", () => {
     try {
       const left = Object.fromEntries((await answer(reader.db, rule("The object store is filling its disk"))).map((row) => [row["server"], row["left"]]));
       assert.deepEqual([left["filling-0"], left["roomy-0"]], [5, 50]);
+      const used = Object.fromEntries((await answer(reader.db, rule("A node's disk is nearly full"))).map((row) => [row["node"], row["used"]]));
+      assert.deepEqual([used["full"], used["roomy"]], [95, 20]);
       const held = Object.fromEntries((await answer(reader.db, rule("A Valkey nears its memory limit"))).map((row) => [row["valkey"], row["held"]]));
       assert.deepEqual([held["filer-store"], held["roomy-valkey"]], [95, 10]);
       const under = Object.fromEntries((await answer(reader.db, rule("The object store keeps fewer copies than it should"))).map((row) => [row["collection"], row["volumes"]]));
       assert.equal(under["neon-gate"], 2);
+      // The folders held, as every replica last counted them: the greatest, not their sum, nor what one counted before.
+      assert.deepEqual(await answer(reader.db, rule("Folder binds are failing")), [{ held: 1 }]);
     } finally {
       reader.close();
     }

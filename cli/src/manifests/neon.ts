@@ -53,7 +53,6 @@ import {
 } from "./common.ts";
 import { durationSeconds, type InstallConfig } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
-import { VOLUME_DRIVER } from "./juicefs-csi.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 import { VALKEY_ADDRESS, workspacesBucketUrl } from "./workspace-storage.ts";
@@ -142,7 +141,6 @@ function setup(config: InstallConfig): KubernetesObject[] {
                   { name: "WORKSPACES_BUCKET_URL", value: workspacesBucketUrl(config) },
                   { name: "WORKSPACES_TRASH_DAYS", value: String(workspaceStorage.trashDays) },
                   { name: "VALKEY_ADDRESS", value: VALKEY_ADDRESS },
-                  { name: "WORKSPACES_SECRET_LABELS", value: JSON.stringify(VOLUME_DRIVER) },
                 ]
                 : []),
               ...(sandboxSnapshots(config) ? [{ name: "SNAPSHOTS_BUCKET", value: objectStore.buckets.snapshots }] : []),

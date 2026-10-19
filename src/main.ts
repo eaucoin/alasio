@@ -11,7 +11,6 @@ import { codexHome } from "./codex/env.ts";
 import { CodexRollouts, SessionFsCodexRollouts } from "./codex/rollouts/index.ts";
 import { sessionFsCodexHome } from "./codex/sessionfs.ts";
 import { indexTranscripts } from "./harness/claude/search/index.ts";
-import { loadKubeTemplates } from "./kube/config.ts";
 import { Neon } from "./neon/connect.ts";
 import { LakeWake } from "./neon/lake-wake.ts";
 import { serveAlasio } from "./alasio.ts";
@@ -21,8 +20,6 @@ import { TelegramUpdates } from "./telegram/update-consumer.ts";
 
 const alasio = Effect.gen(function*() {
   const config = loadAlasioConfig();
-  // What the deployment makes workspaces from, checked before anything else starts.
-  const kubeTemplates = yield* loadKubeTemplates;
   // alasio's state, Claude Code's transcripts and Codex's rollouts are kept in alasio's
   // Neon, which the deployment runs, and Codex's are mirrored from the start so no turn
   // runs unmirrored; the lake's loader is told of each write, where the lake runs. Neon
@@ -30,9 +27,9 @@ const alasio = Effect.gen(function*() {
   const neon = yield* Neon.make.pipe(Effect.provideServiceEffect(LakeWake, config.lakeWake ? LakeWake.make(config.lakeWake) : Effect.succeed(LakeWake.none)));
   const codexRollouts = yield* CodexRollouts.make({ store: neon.rollouts, home: codexHome() });
   // Session filesystems (an empty, isolated workspace per session) are on when the
-  // deployment renders their template. Their Codex runs from a home of its own,
+  // deployment gives alasio a sandbox gateway. Their Codex runs from a home of its own,
   // mirrored the same way into a schema of its own.
-  const sessionFsCodexRollouts = kubeTemplates.sessions
+  const sessionFsCodexRollouts = config.sessionsGateway
     ? yield* SessionFsCodexRollouts.make({ store: yield* neon.sessionFsRollouts, home: sessionFsCodexHome(config.stateDir) })
     : null;
   yield* serveAlasio({
@@ -43,7 +40,6 @@ const alasio = Effect.gen(function*() {
     sessionStore: neon.sessionStore,
     codexRollouts,
     sessionFsCodexRollouts,
-    kubeTemplates,
   });
   yield* Effect.logInfo("Telegram Alasio bot is running");
   // Once the bot serves: the indexer's first pass reads every stored entry.

@@ -67,13 +67,19 @@ export const refuseFirst = <E>(target: ResolvedTarget, check: Effect.Effect<void
     yield* Effect.provide(checked, kubeApi(target)).pipe(Effect.catchTag("KubeconfigUnusable", () => Effect.void));
   });
 
+/** What up says where it could not read where the API server is, and so confines nothing to it. */
+export const API_SERVER_UNCONFINED =
+  "Warning: the cluster's API server could not be found (the default namespace's kubernetes Service has no EndpointSlice alasio can read), " +
+  "so the sandbox gateway and the session telemetry receiver may reach any address, not that alone beside their own peers. alasio up confines them once it can read it.";
+
 /** Where alasio runs, and what the operator does next. */
-export const announce = (target: ResolvedTarget, { bot, claude, cpuBaseline }: Installed): Effect.Effect<void> =>
+export const announce = (target: ResolvedTarget, { bot, claude, cpuBaseline, apiServerUnconfined }: Installed): Effect.Effect<void> =>
   Console.log(
     [
       `alasio ${VERSION} runs in ${describeTarget(target)}.`,
       // What keeps sessions from being snapshotted, or restored on a node, if anything.
       ...(cpuBaseline ? baselineShortfalls(cpuBaseline) : []),
+      ...(apiServerUnconfined ? [API_SERVER_UNCONFINED] : []),
       "",
       `Message ${bot.username ? `@${bot.username}` : "your bot"} on Telegram to talk to it.`,
       ...(claude ? [] : ["Claude Code has no token yet: alasio init asks for one, which `claude setup-token` makes."]),
@@ -95,8 +101,12 @@ export const up = Command.make("up", { timeout: timeoutFlag }, ({ timeout }) => 
   Command.withShortDescription("Start alasio, installing or updating it"),
   Command.withDescription(
     "Makes the cluster on this machine, or starts it, when that is where alasio runs, once this machine is one it runs on, " +
-      "Linux on x86-64: k3s on the machine itself, installing or upgrading k3s and gVisor and setting k3s as the config says, or " +
-      "a cluster in Docker; for either, raising its inotify limits where they are too low for it. What it changes on the machine " +
+      "Linux on x86-64: k3s on the machine itself, installing or upgrading k3s, gVisor and stargz-snapshotter and setting k3s as the config says, or " +
+      "a cluster in Docker; for either, raising its inotify limits where they are too low for it. Its nodes pull images through " +
+      "stargz-snapshotter: an eStargz image's layers are read from its registry, or a mirror, as its pods read them, which " +
+      "needs both to answer range requests, and fetched whole meanwhile; any other image is pulled whole. So a machine that " +
+      "boots again while a registry it pulled from so is out of reach runs no pod until it answers, as the daemon mounts those " +
+      "layers from it again before it serves any. What it changes on the machine " +
       "it changes as root, through sudo, at once, after saying what. Then it applies alasio as the config says, " +
       "with this version's images, and with KEDA and VPA, which scale and size its components, unless the cluster has its own, " +
       "which the config then says to use; and waits until it runs, saying what it waits for. Run it again after changing the config. " +

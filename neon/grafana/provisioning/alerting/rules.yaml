@@ -175,6 +175,50 @@ groups:
               expression: left
               conditions: [{evaluator: {type: lt, params: [10]}}]
 
+      - uid: alasio-node-disk-full
+        title: A node's disk is nearly full
+        condition: full
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.node }}'s disk is {{ $values.used }}% full. Images, the caches of those stargz-snapshotter's daemon pulls lazily, which kubelet's image GC does not see, and the stack's volumes share it; a full one fails what reads them."
+        data:
+          - refId: used
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: lake
+            model:
+              refId: used
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select ResourceAttributes['k8s.node.name'] as node,
+                    round(100 * (1 - arg_max(Value, TimeUnix) filter (where MetricName = 'k8s.node.filesystem.available')
+                      / arg_max(Value, TimeUnix) filter (where MetricName = 'k8s.node.filesystem.capacity')), 1) as used
+                  from otel.metrics_gauge
+                  where MetricName in ('k8s.node.filesystem.available', 'k8s.node.filesystem.capacity')
+                    and TimeUnix > now()::timestamp - interval 10 minute
+                  group by 1
+              root_selector: ""
+              columns:
+                - {selector: node, text: node, type: string}
+                - {selector: used, text: used, type: number}
+          - refId: full
+            datasourceUid: __expr__
+            model:
+              refId: full
+              type: threshold
+              expression: used
+              conditions: [{evaluator: {type: gt, params: [90]}}]
+
       - uid: alasio-valkey-memory
         title: A Valkey nears its memory limit
         condition: near
@@ -309,9 +353,9 @@ groups:
       # template or gVisor release is no longer kept falls back as designed, after an
       # upgrade, and counts neither way. A session is restored at most once each time it
       # comes back from idle, so restores are few, and the window an hour: one failure among
-      # four or fewer pages, as each costs a session its REPLs.
-      # alasio's counts are running totals, since its process started, exported every
-      # minute: what a series added is each point less the one before it, its first counted
+      # four or fewer pages, as each costs a session its REPLs. The sandbox gateway counts
+      # them, which snapshots main's sessions alone: its counts are running totals, since
+      # its process started, exported every minute: what a series added is each point less the one before it, its first counted
       # from zero, the hour before the window giving each its point before.
       - uid: alasio-restores-falling-back
         title: Restores are falling back
@@ -343,7 +387,7 @@ groups:
                     select TimeUnix, Attributes['alasio.sandbox.restore.fallback'] as fallback,
                       Value - coalesce(lag(Value) over (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix), 0) as added
                     from otel.metrics_sum
-                    where MetricName = 'alasio.sandbox.restores' and ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] is null
+                    where MetricName = 'alasio.sandbox.restores' and ServiceName = 'alasio-sandbox-gateway'
                       and TimeUnix > now()::timestamp - interval 2 hour
                   )
                   where TimeUnix > now()::timestamp - interval 1 hour and coalesce(fallback not in ('template', 'release'), true)
@@ -362,8 +406,8 @@ groups:
       # Of the sessions released in the last hour, the share whose release failed: its
       # sandbox's checkpoint failed while it runs on ("failed", tried again later), or once
       # it had ended it ("lost": its REPLs' live state is gone, the session resumed from
-      # bayma's checkpoints), or the release failed beside it ("error", as a Sandbox that
-      # could not be suspended, whose snapshot is then stale). One not snapshotted, as it
+      # bayma's checkpoints), or the release failed beside it ("error", as a release whose
+      # record could not be written, whose snapshot is then stale). One not snapshotted, as it
       # runs under no gVisor, is kept as designed and counts neither way. Counted as the
       # restores' alert counts.
       - uid: alasio-releases-failing
@@ -396,7 +440,7 @@ groups:
                     select TimeUnix, Attributes['alasio.sandbox.release.outcome'] as outcome,
                       Value - coalesce(lag(Value) over (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix), 0) as added
                     from otel.metrics_sum
-                    where MetricName = 'alasio.sandbox.releases' and ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] is null
+                    where MetricName = 'alasio.sandbox.releases' and ServiceName = 'alasio-sandbox-gateway'
                       and TimeUnix > now()::timestamp - interval 2 hour
                   )
                   where TimeUnix > now()::timestamp - interval 1 hour and outcome != 'kept'
@@ -411,6 +455,55 @@ groups:
               type: threshold
               expression: failed
               conditions: [{evaluator: {type: gt, params: [0.2]}}]
+
+      # The folder conversations held, their instances' binds having failed three times in a
+      # row: each runs its turns without bayma's REPL tools until its operator asks again. One
+      # stuck folder is one operator's whole workspace, so any held alerts. Every gateway
+      # replica counts the same record, so the greatest of each one's last count.
+      - uid: alasio-folder-binds-failing
+        title: Folder binds are failing
+        condition: failing
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $values.held.Value }} folder conversations' bayma failed to start three times in a row: their turns run without its REPL tools until they are restarted (alasio status says why)."
+        data:
+          - refId: held
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: lake
+            model:
+              refId: held
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select max(last) as held
+                  from (
+                    select arg_max(Value, TimeUnix) as last
+                    from otel.metrics_gauge
+                    where MetricName = 'alasio.gateway.folders.failing' and ServiceName = 'alasio-sandbox-gateway'
+                      and TimeUnix > now()::timestamp - interval 3 minute
+                    group by ResourceAttributes['service.instance.id']
+                  )
+                  having count(*) > 0
+              root_selector: ""
+              columns:
+                - {selector: held, text: held, type: number}
+          - refId: failing
+            datasourceUid: __expr__
+            model:
+              refId: failing
+              type: threshold
+              expression: held
+              conditions: [{evaluator: {type: gt, params: [0]}}]
 
       - uid: alasio-replica-lagging
         title: A read replica trails its primary
@@ -674,3 +767,104 @@ groups:
               type: threshold
               expression: failed
               conditions: [{evaluator: {type: gt, params: [0]}}]
+
+      # Pods the sandbox pods' policy refused to let be made in a sessions' namespace in the
+      # last fifteen minutes, as the sandbox gateway counts them: a pool's template the policy
+      # no longer admits, as after an upgrade that changed one and not the other, so its pool
+      # never warms and no session binds.
+      - uid: alasio-pod-policy-refusing
+        title: The sandbox pods' policy refuses pods
+        condition: refusing
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical}
+        annotations:
+          summary: "The sandbox pods' policy refused {{ $values.refused.Value }} pods in the last fifteen minutes: a pool whose pods it refuses never warms, and its sessions bind nowhere."
+        data:
+          - refId: refused
+            relativeTimeRange: {from: 7200, to: 0}
+            datasourceUid: lake
+            model:
+              refId: refused
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select coalesce(sum(added), 0) as refused
+                  from (
+                    select TimeUnix, Value - coalesce(lag(Value) over (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix), 0) as added
+                    from otel.metrics_sum
+                    where MetricName = 'alasio.gateway.pod_policy.refusals' and ServiceName = 'alasio-sandbox-gateway'
+                      and TimeUnix > now()::timestamp - interval 2 hour
+                  )
+                  where TimeUnix > now()::timestamp - interval 15 minute
+              root_selector: ""
+              columns:
+                - {selector: refused, text: refused, type: number}
+          - refId: refusing
+            datasourceUid: __expr__
+            model:
+              refId: refusing
+              type: threshold
+              expression: refused
+              conditions: [{evaluator: {type: gt, params: [0]}}]
+
+      # How long the sandbox gateway's warm binds took in the last half hour, on average: a
+      # free pod claimed at once, its workspace attached, and its bayma serving. Slow, the node
+      # agents' attaches or bayma's start keep every session's first request waiting. Cold
+      # binds, which wait for their pool to scale, and those whose pod is made, as a restore,
+      # count neither way.
+      - uid: alasio-binds-slow
+        title: Binds are slow
+        condition: slow
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "The sandbox gateway's binds of a free pod took {{ humanizeDuration $values.seconds.Value }} on average in the last half hour: each session's first request waits that long."
+        data:
+          - refId: seconds
+            relativeTimeRange: {from: 7200, to: 0}
+            datasourceUid: lake
+            model:
+              refId: seconds
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select sum(added_sum) / sum(added_count) as seconds
+                  from (
+                    select TimeUnix, Attributes['alasio.binder.start'] as start,
+                      Sum - coalesce(lag(Sum) over series, 0) as added_sum,
+                      Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count
+                    from otel.metrics_histogram
+                    where MetricName = 'alasio.binder.bind.duration' and ServiceName = 'alasio-sandbox-gateway'
+                      and TimeUnix > now()::timestamp - interval 2 hour
+                    window series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)
+                  )
+                  where TimeUnix > now()::timestamp - interval 30 minute and start = 'warm'
+                  having sum(added_count) > 0
+              root_selector: ""
+              columns:
+                - {selector: seconds, text: seconds, type: number}
+          - refId: slow
+            datasourceUid: __expr__
+            model:
+              refId: slow
+              type: threshold
+              expression: seconds
+              conditions: [{evaluator: {type: gt, params: [10]}}]

@@ -1,17 +1,18 @@
 /**
- * What bayma inside a session's sandbox exports its telemetry with, and what alasio
- * stamps on it. The sandbox's one way out without internet is alasio's OTLP receiver
- * (./telemetry-receiver.ts), so bayma exports there, with its session's token, each
- * signal alasio exports; the receiver stamps what arrives with what alasio knows about
- * the session and exports it where alasio exports its own.
+ * What bayma inside a session's sandbox exports its telemetry with, and what is stamped on
+ * it. A pool's pod's one way out without internet is the sandbox service's receiver
+ * (../receiver/receiver.ts), so its bayma exports there, with its binding's token, each signal
+ * the sandbox gateway exports, as the gateway tells the node agent attaching the workspace
+ * (../gateway/sessions.ts); the receiver stamps what arrives with what is known of the session
+ * and exports it where the stack's telemetry goes.
  */
-import { parseKeyValueList, resolveTelemetry, sharedResourceAttributes, SIGNALS, telemetryEnabled } from "../telemetry/index.ts";
+import { parseKeyValueList, resolveTelemetry, sharedResourceAttributes, SIGNALS, telemetryEnabled } from "../telemetry/config.ts";
 import type { ResourceStamp } from "./otlp-resource.ts";
 
 /**
- * The standard variables bayma inside a sandbox exports with, but for the endpoint and
- * the token it sends, which are the sandbox's own: each signal alasio exports, in the
- * protocol alasio exports it in, and no other. Empty when alasio exports nothing.
+ * The standard variables bayma inside a sandbox exports with, but for the endpoint and the
+ * token it sends, which are the sandbox's own: each signal `env`, the gateway's, exports, in
+ * the protocol it exports it in, and no other. Empty where it exports nothing.
  */
 export function sandboxBaymaTelemetryEnv(env: Readonly<NodeJS.ProcessEnv> = process.env): Record<string, string> {
   const telemetry = resolveTelemetry(env);
@@ -30,3 +31,14 @@ export function sandboxBaymaTelemetryEnv(env: Readonly<NodeJS.ProcessEnv> = proc
 export function sandboxResource(volumeId: string, env: Readonly<NodeJS.ProcessEnv> = process.env): ResourceStamp {
   return { ...parseKeyValueList(sharedResourceAttributes(env)), "service.name": "bayma", "alasio.volume.id": volumeId };
 }
+
+/**
+ * What a folder conversation's instance's telemetry is stamped with: bayma's, of the
+ * conversation, as alasio's own of the conversation is, and the harness it is under.
+ */
+export const folderResource = (harness: string, conversation: string, env: Readonly<NodeJS.ProcessEnv> = process.env): ResourceStamp => ({
+  ...parseKeyValueList(sharedResourceAttributes(env)),
+  "service.name": "bayma",
+  "alasio.conversation.id": conversation,
+  "alasio.harness": harness,
+});

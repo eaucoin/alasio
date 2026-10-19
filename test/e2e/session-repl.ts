@@ -1,7 +1,8 @@
 /**
  * Run inside alasio's pod, by node there (inAlasio in harness.ts): a REPL of a session's
- * bayma, reached as alasio reaches it, with the session's token, and never brought up
- * here, so that whatever brings the session back is what is proven.
+ * bayma, a session without internet, reached as alasio reaches it, through the sandbox
+ * gateway by alasio's environment's key, which binds it as it is reached, so that whatever
+ * brings the session back is what is proven.
  *
  * - `set <volumeId> <value>`: a new Bun session holding `value` live, in a global, and in
  *   its `$checkpoint`, which bayma commits at the end of the exec; prints its id.
@@ -27,9 +28,8 @@ import type { CallToolResult, ContentBlock } from "@modelcontextprotocol/sdk/typ
 
 import { Effect } from "effect";
 
-import { KubeClient } from "../../src/kube/client.ts";
-import { loadKubeTemplates } from "../../src/kube/config.ts";
-import { type BaymaEndpoint, makeSandboxes } from "../../src/kube/sandboxes.ts";
+import { loadAlasioConfig } from "../../src/config.ts";
+import { makeGatewayWorkspaces } from "../../src/sandbox/gateway-client.ts";
 import type { BaymaExecResult, BaymaSessionCreated } from "./session-roundtrip.ts";
 
 /** The REPL session `set` made. */
@@ -89,14 +89,9 @@ async function exec(client: Client, sessionId: string, code: string): Promise<{ 
   return { stdout: done.stdout_text ?? "", notice: done.notice ?? null };
 }
 
-const bayma = await Effect.runPromise(Effect.gen(function*() {
-  const { sessions } = yield* loadKubeTemplates;
-  if (!sessions) return yield* Effect.die(new Error("the installation gives no sessions template"));
-  const token = yield* (yield* makeSandboxes({ namespace: sessions.namespace, port: sessions.port })).token(volumeId);
-  if (!token) return yield* Effect.die(new Error(`the session ${volumeId} has no token`));
-  const endpoint: BaymaEndpoint = { url: `http://${volumeId}.${sessions.namespace}.svc.cluster.local:${sessions.port}/mcp`, headers: { Authorization: `Bearer ${token}` } };
-  return endpoint;
-}).pipe(Effect.scoped, Effect.provide(KubeClient.layer)));
+const { sessionsGateway } = loadAlasioConfig();
+if (!sessionsGateway) throw new Error("the installation gives alasio no sandbox gateway");
+const bayma = await Effect.runPromise(makeGatewayWorkspaces(sessionsGateway).endpoint(volumeId, "none"));
 
 const client = new Client({ name: "alasio-e2e", version: "1.0.0" });
 // The transport is one; the SDK declares its sessionId `string | undefined` where Transport has it optional.

@@ -17,15 +17,18 @@ import { Cause, Exit } from "effect";
 
 import { tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
+import { environmentKey } from "../../src/binder/names.ts";
+import { verifyToken } from "../../src/binder/tokens.ts";
 import { forkToken } from "../../src/branch/names.ts";
 import type { TenantView } from "../src/branches.ts";
 import { CODEX_LOGIN } from "../src/commands/login.ts";
+import { API_SERVER_UNCONFINED } from "../src/commands/up.ts";
 import { SYSCTL_FILE } from "../src/cluster/machine.ts";
 import { currentGvisorRelease, downloads } from "../src/cluster/node.ts";
 import { ROUTES_SECRET, TLS_SECRET, WEBHOOK, WEBHOOK_HEALTH_PORT } from "../src/manifests/webhook.ts";
 import { type CliRun, runAlasio } from "./support/cli.ts";
 import type { FakeDocker } from "./support/fake-docker.ts";
-import { serveK3sInDocker } from "./support/fake-k3s.ts";
+import { type FakeK3s, serveK3sInDocker } from "./support/fake-k3s.ts";
 import { type FakeKube, serveFakeKube } from "./support/fake-kube.ts";
 import { FakeMachine } from "./support/fake-machine.ts";
 import { fakeReleases } from "./support/fake-releases.ts";
@@ -35,7 +38,7 @@ import { DOWN, ENTER, pressed, replaced, typed } from "./support/fake-terminal.t
 const BOT_TOKEN = "123:valid";
 const BOT = "alasio_test_bot";
 const DEPLOYMENT = "/apis/apps/v1/namespaces/alasio/deployments/alasio";
-const TEMPLATES = "/api/v1/namespaces/alasio/configmaps/alasio-sandbox-templates";
+const GATEWAY_CONFIG = "/api/v1/namespaces/alasio/configmaps/alasio-sandbox-gateway";
 
 /** Where the node agent's pod says its node's CPU features, as the fake API keeps what it says. */
 const CPU_FEATURES = "alasio-node-agent/cpu-features";
@@ -93,6 +96,8 @@ interface Rig {
   readonly kube: FakeKube;
   readonly telegram: FakeTelegram;
   readonly docker: FakeDocker;
+  /** k3s in the fake Docker's nodes. */
+  readonly k3s: FakeK3s;
   readonly machine: FakeMachine;
   readonly home: string;
   /** A kubeconfig that reaches the fake API. */
@@ -113,7 +118,7 @@ async function rig(t: TestContext): Promise<Rig> {
   const telegram = await serveFakeTelegram();
   telegram.bots.set(BOT_TOKEN, BOT);
   // The server node of the cluster in Docker writes a kubeconfig that reaches the fake API, at the port the config gives it.
-  const { fake: docker } = await serveK3sInDocker(kube.kubeconfig);
+  const { fake: docker, k3s } = await serveK3sInDocker(kube.kubeconfig);
   // The storage controller, once installed, says what Neon's storage holds, which alasio up
   // checks the configuration against: one pageserver, before the tenant is made.
   const storage: FakeStorage = { pageservers: 1, shards: null, answering: true, databaseAnswering: true };
@@ -149,6 +154,7 @@ async function rig(t: TestContext): Promise<Rig> {
     kube,
     telegram,
     docker,
+    k3s,
     machine,
     home,
     kubeconfig,
@@ -301,7 +307,7 @@ test("init asks where alasio runs on a first run, and runs it in the cluster a k
   assert.equal(kube.get("/api/v1/namespaces/alasio/secrets/alasio-claude"), undefined);
 });
 
-test("init installs k3s and gVisor here unless told otherwise, as root at once, after saying what, its volumes under XDG_DATA_HOME", async (t) => {
+test("init installs k3s, gVisor and stargz-snapshotter here unless told otherwise, as root at once, after saying what, its volumes under XDG_DATA_HOME", async (t) => {
   const { alasio, config, configFile, env, kube, machine } = await rig(t);
   const run = await alasio(["init", "--no-up"], [[ENTER], typed(BOT_TOKEN), typed("42"), [ENTER], pressed("n"), [ENTER], replaced(PUBLIC_ADDRESS)]);
   succeeded(run);
@@ -309,15 +315,18 @@ test("init installs k3s and gVisor here unless told otherwise, as root at once, 
   assert.deepEqual(config(), { target: { host: { storagePath } }, install: { webhook: { publicAddress: PUBLIC_ADDRESS } } });
   assert.ok(run.progress.includes([
     "alasio changes this machine as root:",
-    "  write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd",
+    "  write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd, and stargz-snapshotter's daemon's, as the service stargz-snapshotter, which k3s's starts",
     "  install gVisor 20990101.0 in /usr/local/lib/alasio/gvisor/20990101.0: runsc, containerd-shim-runsc-v1, gvisor-bin",
+    "  install stargz-snapshotter v9.9.0 in /usr/local/bin: containerd-stargz-grpc, stargz-fuse-manager",
     "  install k3s v1.99.0+k3s1 in /usr/local/bin, with its own install script, as the systemd service k3s, enabled and started anew",
     "  read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
   ].join("\n")), run.progress.join("\n"));
   assert.equal(machine.read("/usr/local/bin/k3s"), "k3s v1.99.0+k3s1\n");
   assert.equal(machine.read("/usr/local/lib/alasio/gvisor/20990101.0/gvisor-bin/gvisor_sentry"), "gvisor_sentry 20990101.0\n");
-  assert.equal(machine.ran.length, 1);
-  assert.deepEqual(machine.ran[0]?.env, {
+  assert.equal(machine.read("/usr/local/bin/containerd-stargz-grpc"), "containerd-stargz-grpc v9.9.0\n");
+  // systemd reads the daemon's service and k3s's drop-in, which k3s's install script then starts with it.
+  assert.deepEqual(machine.commands().map((command) => command.replace(/\/\S+\/install\.sh/u, "install.sh")), ["systemctl daemon-reload", "sh install.sh"]);
+  assert.deepEqual(machine.ran[1]?.env, {
     INSTALL_K3S_SKIP_DOWNLOAD: "true",
     INSTALL_K3S_SKIP_SELINUX_RPM: "true",
     INSTALL_K3S_SELINUX_WARN: "true",
@@ -377,9 +386,25 @@ test("init without what it needs, and nothing to ask, says how to give it; a tok
   assert.equal(kube.get("/api/v1/namespaces/alasio/secrets/alasio-telegram"), undefined);
 });
 
+/** The `kubernetes` Service's EndpointSlice, as a cluster's API server's: where it is, as up reads it (cli/src/api-server.ts). */
+const API_SERVER_SLICE = {
+  apiVersion: "discovery.k8s.io/v1",
+  kind: "EndpointSlice",
+  metadata: { name: "kubernetes", namespace: "default", labels: { "kubernetes.io/service-name": "kubernetes" } },
+  addressType: "IPv4",
+  endpoints: [{ addresses: ["172.18.0.2"] }],
+  ports: [{ name: "https", port: 6443, protocol: "TCP" }],
+};
+const API_SERVER_SLICE_PATH = "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices/kubernetes";
+
+/** The egress rules of the sandbox service's receiver's NetworkPolicy, as applied. */
+const receiverEgress = (kube: FakeKube): unknown[] =>
+  (kube.get("/apis/networking.k8s.io/v1/namespaces/alasio/networkpolicies/alasio-receiver")?.spec as { egress?: unknown[] } | undefined)?.egress ?? [];
+
 test("up applies alasio, waits until it runs, and says what to do next", async (t) => {
   const setup = await rig(t);
   await initialize(setup);
+  setup.kube.put("endpointslices", API_SERVER_SLICE);
   const run = await setup.alasio(["up"]);
   succeeded(run);
   assert.deepEqual(run.printed, [
@@ -407,11 +432,21 @@ test("up applies alasio, waits until it runs, and says what to do next", async (
   });
   assert.ok(run.progress.includes(`Telegram delivers @${BOT}'s updates to the webhook intake, for main`));
 
+  // What reaches the API server alone reaches it where its Service's slices say.
+  assert.deepEqual(receiverEgress(setup.kube).at(-1), { to: [{ ipBlock: { cidr: "172.18.0.2/32" } }], ports: [{ protocol: "TCP", port: 6443 }] });
+
   // Run again, it keeps the route, and registers the bot again.
   setup.telegram.webhooks.clear();
   succeeded(await setup.alasio(["up"]));
   assert.equal(secretValue(setup.kube, ROUTES_SECRET, "main"), JSON.stringify(route));
   assert.equal(setup.telegram.webhooks.get(BOT_TOKEN)?.url, `https://${PUBLIC_ADDRESS}${route.path}`);
+
+  // Where it cannot read them, up confines nothing to the API server, and says so.
+  setup.kube.objects.delete(API_SERVER_SLICE_PATH);
+  const unread = await setup.alasio(["up"]);
+  succeeded(unread);
+  assert.ok(unread.printed[0]?.split("\n").includes(API_SERVER_UNCONFINED));
+  assert.deepEqual(receiverEgress(setup.kube).at(-1), {});
 });
 
 test("up replaces alasio's pod when the users its bot allows change, which alasio reads as it starts, and not when they stay", async (t) => {
@@ -427,7 +462,6 @@ test("up replaces alasio's pod when the users its bot allows change, which alasi
   succeeded(await setup.alasio(["up"]));
   const widened = annotations();
   assert.notEqual(widened["checksum/telegram"], first["checksum/telegram"]);
-  assert.equal(widened["checksum/sandbox-templates"], first["checksum/sandbox-templates"]);
   // An HMAC with the bot's Secret's own key, kept as init writes the Secret again: no hash of what it sums alone.
   const key = secretValue(setup.kube, "alasio-telegram", "checksumKey") ?? "";
   assert.match(key, /^[\w-]{43}$/u);
@@ -447,19 +481,21 @@ test("up replaces alasio's pod when the users its bot allows change, which alasi
   assert.equal(annotations()["checksum/telegram"], createHmac("sha256", given).update(JSON.stringify([BOT_TOKEN, "42,43"])).digest("hex"));
 });
 
-test("up holds sessions to the CPU features every node agent says its node has, recorded in their template, and to none, unsnapshotted, until each has", async (t) => {
+/** The sandbox gateway's configuration, as up applied it: the pools' templates, and how main's sessions are snapshotted. */
+function gatewayConfigOf(kube: FakeKube): {
+  readonly snapshots: { readonly templates: Record<"none" | "full", { readonly current: { readonly metadata: { readonly annotations: Record<string, string> } }; readonly previous: { readonly metadata: { readonly annotations: Record<string, string> } } | null }> } | null;
+} {
+  return JSON.parse(String((kube.get(GATEWAY_CONFIG)?.["data"] as Record<string, string>)["config.json"]));
+}
+
+test("up holds sessions to the CPU features every node agent says its node has, recorded in their pools' template, and to none, unsnapshotted, until each has", async (t) => {
   const setup = await rig(t);
   await initialize(setup);
-  const sessions = () => JSON.parse(String((setup.kube.get(TEMPLATES)?.["data"] as Record<string, string>)["templates.json"])) as {
-    readonly sessions: { readonly podTemplate: { readonly metadata: { readonly annotations: Record<string, string> } }; readonly snapshots?: unknown };
-    readonly previousSessions?: { readonly podTemplate: { readonly metadata: { readonly annotations: Record<string, string> } } };
-  };
-  const applied = () => setup.kube.changes.filter(({ path }) => path === TEMPLATES).length;
-  const cpuFeatures = () => sessions().sessions.podTemplate.metadata.annotations["dev.gvisor.internal.cpufeatures"];
+  const applied = () => setup.kube.changes.filter(({ path }) => path === GATEWAY_CONFIG).length;
+  const cpuFeatures = () => gatewayConfigOf(setup.kube).snapshots?.templates.none.current.metadata.annotations["dev.gvisor.internal.cpufeatures"];
   // Installed first, sessions are held to none until the agents have said: then up records what they said, applying it again.
   succeeded(await setup.alasio(["up"]));
   assert.equal(cpuFeatures(), "avx,avx2,sse");
-  assert.ok(sessions().sessions.snapshots);
   assert.equal(applied(), 2);
   // The same again changes nothing.
   succeeded(await setup.alasio(["up"]));
@@ -476,7 +512,7 @@ test("up holds sessions to the CPU features every node agent says its node has, 
   setup.kube.said.set(CPU_FEATURES, cpuReport(["sse", "avx"]));
   succeeded(await setup.alasio(["up"]));
   assert.equal(cpuFeatures(), "avx,sse");
-  assert.equal(sessions().previousSessions?.podTemplate.metadata.annotations["dev.gvisor.internal.cpufeatures"], "avx,avx2,sse");
+  assert.equal(gatewayConfigOf(setup.kube).snapshots?.templates.none.previous?.metadata.annotations["dev.gvisor.internal.cpufeatures"], "avx,avx2,sse");
   // Features said under another release are not the current one's: the baseline stays.
   setup.kube.said.set(CPU_FEATURES, cpuReport(["sse"], "20000101.0"));
   const stale = await setup.alasio(["up"]);
@@ -492,11 +528,7 @@ test("up records no CPU baseline the nodes do not share: sessions are not snapsh
   const run = await setup.alasio(["up"]);
   succeeded(run);
   assert.ok(run.printed[0]?.includes("\nsessions are not snapshotted: they are held to no CPU baseline, as the nodes share no CPU feature under gVisor\n"), run.printed[0]);
-  const { sessions } = JSON.parse(String((setup.kube.get(TEMPLATES)?.["data"] as Record<string, string>)["templates.json"])) as {
-    readonly sessions: { readonly podTemplate: { readonly metadata: { readonly annotations: Record<string, string> } }; readonly snapshots?: unknown };
-  };
-  assert.equal(sessions.podTemplate.metadata.annotations["dev.gvisor.internal.cpufeatures"], undefined);
-  assert.equal(sessions.snapshots, undefined);
+  assert.equal(gatewayConfigOf(setup.kube).snapshots, null);
 });
 
 test("up without a bot says to run init, and without the address Telegram delivers to that init asks it; up past its timeout says what still waits, and why", async (t) => {
@@ -527,16 +559,81 @@ test("up without a bot says to run init, and without the address Telegram delive
   assert.match(message, /container alasio of pod alasio-0 is waiting: ImagePullBackOff/u);
 });
 
+test("folder restart lets a conversation's instance of each harness go through the gateway, as main, and status lists the instances where the gateway serves them, with their binds' failures", async (t) => {
+  const { alasio, kube } = await installed(t);
+  kube.onExec = () => ({ exitCode: 0 });
+  stackSecret(kube, "alasio-sessions-caller", { "caller-key": environmentKey(Buffer.from("master"), "main").toString() });
+  const asked: string[] = [];
+  const now = Date.now();
+  const at = (ago: number) => new Date(now - ago).toISOString();
+  await gatewayFront(t, kube, (environment, key, method, path) => {
+    if (environment !== "main") return { status: 403 };
+    asked.push(`${method} ${path} ${key}`);
+    if (method === "POST" && path === "/release") {
+      if (key.endsWith(":telegram:9")) return { status: 503, json: { error: "not now" } };
+      return key.startsWith("folder:codex:") ? { status: 409, json: { error: "being bound now", busy: true } } : { status: 204 };
+    }
+    if (method === "GET" && path === "/folders") {
+      return { status: 200, json: { folders: [
+        { key: "folder:claude:telegram:42", harness: "claude", conversation: "telegram:42", pod: "bayma-0123456789abcdef-a1b2c", boundAt: at(3 * 3_600_000), lastExecAt: at(5 * 60_000), failing: null },
+        { key: "folder:codex:telegram:7", harness: "codex", conversation: "telegram:7", pod: null, boundAt: null, lastExecAt: null, failing: { reason: "its pod is pending: no node", at: at(10 * 60_000), times: 3, held: true } },
+      ] } };
+    }
+    return { status: 404 };
+  });
+  const restarted = await alasio(["folder", "restart", "telegram:42"]);
+  succeeded(restarted);
+  assert.deepEqual(restarted.printed, [
+    "Claude: its folder instance of telegram:42 is let go, its REPL sessions saved, its failed binds forgotten; the next message makes it anew",
+    "Codex: its failed binds of telegram:42 are forgotten, but it is being started or stopped now, so it was not let go: ask again in a moment",
+  ]);
+  assert.deepEqual(asked, ["POST /release folder:claude:telegram:42", "POST /release folder:codex:telegram:42"]);
+  const refused = await alasio(["folder", "restart", "telegram:9"]);
+  succeeded(refused);
+  assert.deepEqual(refused.printed, ["Claude: the sandbox gateway did not let it go (503): {\"error\":\"not now\"}", "Codex: the sandbox gateway did not let it go (503): {\"error\":\"not now\"}"]);
+  // Of no folder instances, as alasio is told the gateway serves none: nothing of them.
+  const without = await alasio(["status"]);
+  succeeded(without);
+  assert.ok(!without.printed.some((line) => line.includes("folder instances")));
+  const deployment = kube.get(DEPLOYMENT) as { spec: { template: { spec: { containers: { env?: { name: string; value?: string }[] }[] } } } } | undefined;
+  deployment?.spec.template.spec.containers[0]?.env?.push({ name: "ALASIO_GATEWAY_FOLDERS", value: "1" });
+  const status = await alasio(["status"]);
+  succeeded(status);
+  const listed = status.printed;
+  const from = listed.indexOf("  folder instances:");
+  assert.ok(from > 0, listed.join("\n"));
+  assert.deepEqual(listed.slice(from, from + 3), [
+    "  folder instances:",
+    "    telegram:42 under Claude: bound to bayma-0123456789abcdef-a1b2c for 3h, its last exec 5m ago",
+    "    telegram:7 under Codex: released; its last bind failed 10m ago, 3 in a row, so it is bound again only as the operator asks (Retry now, or alasio folder restart): its pod is pending: no node",
+  ]);
+});
+
 test("status says each workload's state, and fails when one is not ready", async (t) => {
   const { alasio, kube, kubeconfig } = await installed(t);
+  // The sandbox gateway's counts of each pool, as it answers them in its pod.
+  kube.onExec = ({ container, command }) =>
+    container === "sandbox-gateway" && command[0] === "curl"
+      ? { exitCode: 0, stdout: JSON.stringify(command.at(-1)?.endsWith("/sandboxes-none") ? { free: 2, bound: 1, waiting: 0 } : { free: 0, bound: 3, waiting: 2 }) }
+      : { exitCode: 0 };
   const healthy = await alasio(["status"]);
   succeeded(healthy);
   assert.equal(healthy.printed[0], `alasio 0.0.0-development, in the cluster of the current context of ${kubeconfig} (${kube.server}):`);
   assert.ok(healthy.printed.includes("  Deployment alasio/alasio: ready"));
-  // Workspace storage's: JuiceFS's driver, in its own namespace, and Valkey.
-  for (const line of ["  StatefulSet kube-system/juicefs-csi-controller: ready", "  DaemonSet kube-system/juicefs-csi-node: ready", "  StatefulSet alasio/alasio-valkey: ready"]) {
+  // Workspace storage's: each node's mount, and Valkey.
+  for (const line of ["  DaemonSet alasio/alasio-workspace-mount: ready", "  StatefulSet alasio/alasio-valkey: ready"]) {
     assert.ok(healthy.printed.includes(line), line);
   }
+  // A sandbox pool's, ready once its pods run, ready or not: what it holds, as the gateway counts it.
+  assert.ok(healthy.printed.includes("  Deployment alasio-sessions/sandboxes-none: pool, 2 warm, 1 bound, 0 waiting"), healthy.printed.join("\n"));
+  assert.ok(healthy.printed.includes("  Deployment alasio-sessions/sandboxes-full: pool, 0 warm, 3 bound, 2 waiting"), healthy.printed.join("\n"));
+  assert.ok(kube.execs.some(({ namespace, container, command }) => namespace === "alasio" && container === "sandbox-gateway" && command.at(-1) === "http://127.0.0.1:8080/counts/alasio-sessions/sandboxes-none"));
+  // Where the gateway does not count them, as many warm as its Deployment says, and why not.
+  kube.onExec = () => ({ exitCode: 7, stderr: "curl: (7) Failed to connect to 127.0.0.1 port 8080" });
+  const uncounted = await alasio(["status"]);
+  succeeded(uncounted);
+  assert.ok(uncounted.printed.includes("  Deployment alasio-sessions/sandboxes-none: pool, 1 warm, its bindings not seen, as the sandbox gateway did not count them: curl: (7) Failed to connect to 127.0.0.1 port 8080"), uncounted.printed.join("\n"));
+  kube.onExec = () => ({ exitCode: 0 });
   // A compute neon-control has put to sleep sleeps, and is not unready.
   const compute = kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio-neon-compute");
   assert.ok(compute?.spec);
@@ -544,6 +641,14 @@ test("status says each workload's state, and fails when one is not ready", async
   const sleeping = await alasio(["status"]);
   succeeded(sleeping);
   assert.ok(sleeping.printed.includes("  Deployment alasio/alasio-neon-compute: asleep"), sleeping.printed.join("\n"));
+  // A pool whose pods do not run, as none can be scheduled, is not ready, nor waking, as never a pod of it starts: it says so.
+  const pools = [...kube.objects.entries()].filter(([path, object]) => path.startsWith("/api/v1/namespaces/alasio-sessions/pods/") && object.metadata.labels?.["alasio.dev/pool"] === "sandboxes-none");
+  assert.ok(pools.length > 0);
+  for (const [, pod] of pools) pod.status = { ...pod.status, phase: "Pending", conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable" }] };
+  const unstarted = await alasio(["status"]);
+  assert.match(failure(unstarted), /^1 of alasio's \d+ workloads are not ready$/u);
+  assert.ok(unstarted.printed.includes("  Deployment alasio-sessions/sandboxes-none: 0 of 1 running"), unstarted.printed.join("\n"));
+  for (const [, pod] of pools) pod.status = { ...pod.status, phase: "Running" };
   const deployment = kube.get(DEPLOYMENT);
   assert.ok(deployment?.status);
   deployment.status["availableReplicas"] = 0;
@@ -599,7 +704,7 @@ test("status says each workload's replicas and scale, its requests beside VPA's 
   const after = (printed: readonly string[], line: string) => printed[printed.indexOf(line) + 1];
   let printed = await lines();
   assert.equal(after(printed, "  Deployment alasio/alasio: ready"), "    1 replica; requests 250m CPU and 768 MiB");
-  assert.equal(after(printed, "  DaemonSet kube-system/juicefs-csi-node: ready"), "    requests 30m CPU and 96 MiB");
+  assert.equal(after(printed, "  DaemonSet alasio/alasio-workspace-mount: ready"), "    requests 50m CPU and 128 MiB");
   assert.equal(printed.at(-1), "the cluster has no metrics server: VPA recommends nothing");
 
   const vpa = kube.get("/apis/autoscaling.k8s.io/v1/namespaces/alasio/verticalpodautoscalers/alasio");
@@ -910,7 +1015,11 @@ test("init and up raise inotify limits too low for the cluster here as root, now
   machine.sysctl("fs.inotify.max_user_instances", 128);
   const status = await alasio(["status"]);
   assert.equal(failure(status), ["this machine's inotify limits are too low for the cluster alasio makes on it:", `  ${shortfall}`, "alasio up raises them, as root."].join("\n"));
-  assert.deepEqual(status.printed.slice(0, 3), ["cluster dev, in Docker 29.0.0:", "  dev-server-0: running", `  this machine's ${shortfall}`]);
+  assert.deepEqual(status.printed.slice(0, 3), [
+    "cluster dev, in Docker 29.0.0:",
+    "  dev-server-0: running\n    stargz-snapshotter's daemon, which k3s pulls images through: running",
+    `  this machine's ${shortfall}`,
+  ]);
   assert.ok(status.printed.includes("  Deployment alasio/alasio: ready"));
 });
 
@@ -927,6 +1036,18 @@ test("init, up and status refuse to make a cluster on a machine other than Linux
   const status = await runAlasio(["status"], { env: remote.env, machine: remote.machine, kind: mac });
   succeeded(status);
   assert.ok(status.printed.includes("  Deployment alasio/alasio: ready"));
+});
+
+test("status of the cluster in Docker says whether stargz-snapshotter's daemon runs in each running node, which k3s pulls images through", async (t) => {
+  const { alasio, configure, home, k3s, kube } = await rig(t);
+  configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
+  const tokenFile = join(home, "bot-token");
+  writeFileSync(tokenFile, BOT_TOKEN);
+  succeeded(await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--up"]));
+  k3s.stargzStopped.add("dev-server-0");
+  const status = await alasio(["status"]);
+  succeeded(status);
+  assert.equal(status.printed[1], "  dev-server-0: running\n    stargz-snapshotter's daemon, which k3s pulls images through: not running");
 });
 
 test("status of a stopped cluster here says that up starts it", async (t) => {
@@ -960,7 +1081,7 @@ test("logs prints a component's log, each line with its pod's name when it has s
   const log = await alasio(["logs", "log"]);
   succeeded(log);
   assert.deepEqual(log.stdout.split("\n").filter(Boolean).sort(), ["[access] applied", "[log] serving"]);
-  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has agent-sandbox-controller, alasio, collector, collector-scraper, grafana, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake-intake, lake-loader, lake-query, log, /u);
+  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has alasio, collector, collector-scraper, grafana, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake-intake, lake-loader, lake-query, log, /u);
 });
 
 test("restart rolls alasio's pod out again as a manager of its own, and waits until it runs", async (t) => {
@@ -1170,7 +1291,7 @@ async function upOnHost({ alasio, home }: Rig): Promise<CliRun> {
   return run;
 }
 
-/** alasio initialized and up in k3s on this machine, k3s and gVisor installed from `releases`. */
+/** alasio initialized and up in k3s on this machine, k3s, gVisor and stargz-snapshotter installed from `releases`. */
 async function onHost(t: TestContext): Promise<Rig> {
   const setup = await rig(t);
   await upOnHost(setup);
@@ -1201,40 +1322,98 @@ test("up on k3s here asks root for nothing once all is as it should, gives CoreD
   const mirrored = await alasio(["up"]);
   succeeded(mirrored);
   assert.deepEqual(rootSteps(mirrored), [
-    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd",
+    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd, and stargz-snapshotter's daemon's, as the service stargz-snapshotter, which k3s's starts",
     "restart the service k3s, with its new configuration",
     "read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
   ]);
   assert.match(machine.read("/etc/rancher/k3s/registries.yaml") ?? "", /"mirrors":\{"docker\.io":\{"endpoint":\["https:\/\/mirror\.lan"\]\}\}/u);
-  assert.deepEqual(machine.commands().slice(ran), ["systemctl restart k3s"]);
+  assert.deepEqual(machine.commands().slice(ran), ["systemctl daemon-reload", "systemctl restart k3s"]);
 });
 
-test("upgrade installs this version's k3s and gVisor release beside the one before, then removes that once it is no longer pinned, and up after each nothing", async (t) => {
+/** Where a forward of the sandbox gateway's pod's port leads. */
+const GATEWAY_FORWARD = "alasio-sandbox-gateway-0:8080";
+
+/** What the sandbox gateway's front answers a call: its status, and its JSON, if any. */
+interface FrontAnswer {
+  readonly status: number;
+  readonly json?: unknown;
+}
+
+/**
+ * The sandbox gateway's front, as the command line reaches it through a port-forward to its
+ * pod: `answer` answers each call whose token an environment's key, of the gateway's caller
+ * key `master`, signed, as the environment and key it names; any other is refused, 403.
+ */
+async function gatewayFront(t: TestContext, kube: FakeKube, answer: (environment: string, key: string, method: string, path: string) => FrontAnswer): Promise<void> {
+  const front = createHttpServer((request, response) => {
+    const token = /^Bearer (.+)$/u.exec(request.headers.authorization ?? "")?.[1] ?? "";
+    const claims = verifyToken(({ options }) => (options?.["environment"] === undefined ? null : environmentKey(Buffer.from("master"), options["environment"])), token, Date.now());
+    const environment = claims?.options?.["environment"];
+    const { status, json } = claims && environment ? answer(environment, claims.key, request.method ?? "", request.url ?? "") : { status: 403 };
+    response.writeHead(status, json === undefined ? {} : { "content-type": "application/json" }).end(json === undefined ? undefined : JSON.stringify(json));
+  });
+  await new Promise<void>((resolve) => front.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => (front.close(resolve), front.closeAllConnections())));
+  kube.forwarded.set(GATEWAY_FORWARD, (front.address() as AddressInfo).port);
+}
+
+/**
+ * The sandbox gateway's front, as `up` and `status` reach it: what its snapshots name, as
+ * `answer` says, to main's token alone, signed by main's own key, which alasio-sessions-caller
+ * holds.
+ */
+async function gatewayReleases(t: TestContext, kube: FakeKube, answer: () => unknown): Promise<void> {
+  stackSecret(kube, "alasio-sessions-caller", { "caller-key": environmentKey(Buffer.from("master"), "main").toString() });
+  await gatewayFront(t, kube, (environment, _key, method, path) =>
+    environment === "main" && method === "GET" && path === "/snapshots/releases" ? { status: 200, json: answer() } : { status: 403 });
+}
+
+test("upgrade installs this version's k3s, its gVisor release beside the one before and its stargz-snapshotter in place of the one installed, then removes that gVisor release once it is no longer pinned, as no snapshot the gateway says names it, and up after each nothing", async (t) => {
   const setup = await onHost(t);
   const { env, kube, machine } = setup;
   const handlers = () =>
     [...kube.objects].filter(([path]) => path.startsWith("/apis/node.k8s.io/v1/runtimeclasses/")).map(([, { metadata, handler }]) => `${metadata.name} ${String(handler)}`).sort();
-  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0", "20990101.0"] });
+  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0", "20990101.0"], stargz: "v10.0.0" });
   const upgraded = await runAlasio(["upgrade"], { env, machine, releases: newer });
   succeeded(upgraded);
   assert.deepEqual(rootSteps(upgraded), [
-    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtimes runsc-21000101-0 and runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd",
+    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtimes runsc-21000101-0 and runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd, and stargz-snapshotter's daemon's, as the service stargz-snapshotter, which k3s's starts",
     "install gVisor 21000101.0 in /usr/local/lib/alasio/gvisor/21000101.0: runsc, containerd-shim-runsc-v1, gvisor-bin",
+    "install stargz-snapshotter v10.0.0, in place of v9.9.0, in /usr/local/bin: containerd-stargz-grpc, stargz-fuse-manager",
     "install k3s v1.100.0+k3s1, in place of v1.99.0+k3s1, in /usr/local/bin, with its own install script, as the systemd service k3s, enabled and started anew",
     "read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
   ]);
   assert.equal(machine.read("/usr/local/lib/alasio/gvisor/21000101.0/runsc"), "runsc 21000101.0\n");
   assert.equal(machine.read("/usr/local/lib/alasio/gvisor/20990101.0/runsc"), "runsc 20990101.0\n");
   assert.equal(machine.read("/usr/local/bin/k3s"), "k3s v1.100.0+k3s1\n");
+  assert.equal(machine.read("/usr/local/bin/stargz-fuse-manager"), "stargz-fuse-manager v10.0.0\n");
   assert.deepEqual(handlers(), ["gvisor runsc-21000101-0", "gvisor-20990101-0 runsc-20990101-0", "gvisor-21000101-0 runsc-21000101-0"]);
   assert.deepEqual(rootSteps(await runAlasio(["up"], { env, machine, releases: newer })), []);
-  assert.equal((await runAlasio(["status"], { env, machine, releases: newer })).printed[0], "k3s v1.100.0+k3s1 on this machine, with gVisor 20990101.0 and 21000101.0:");
+  assert.equal((await runAlasio(["status"], { env, machine, releases: newer })).printed[0], "k3s v1.100.0+k3s1 on this machine, with gVisor 20990101.0 and 21000101.0, stargz-snapshotter v10.0.0:");
 
-  const latest = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0"] });
+  const latest = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0"], stargz: "v10.0.0" });
+  // A snapshot the gateway says names the release before: kept, though no longer pinned.
+  const named: { releases: Record<string, string[]> } = { releases: { "20990101.0": ["alasio-sessions/fs-abc123/s-1"] } };
+  await gatewayReleases(t, kube, () => named);
+  const keptForIt = await runAlasio(["upgrade"], { env, machine, releases: latest });
+  succeeded(keptForIt);
+  assert.deepEqual(rootSteps(keptForIt), []);
+  assert.equal(machine.read("/usr/local/lib/alasio/gvisor/20990101.0/runsc"), "runsc 20990101.0\n");
+  // As status says it, of the gateway's word.
+  const said = await runAlasio(["status"], { env, machine, releases: latest });
+  assert.ok(said.printed.includes("  gVisor 20990101.0, kept: 1 snapshot names it"), said.printed.join("\n"));
+  // Where the gateway cannot be read, every release installed is kept, and it is said so.
+  kube.forwarded.delete(GATEWAY_FORWARD);
+  const unread = await runAlasio(["upgrade"], { env, machine, releases: latest });
+  succeeded(unread);
+  assert.deepEqual(rootSteps(unread), []);
+  assert.ok(unread.progress.some((line) => line.startsWith("what the snapshots name could not be read of the sandbox gateway, so every gVisor release installed is kept")), unread.progress.join("\n"));
+  // Named by none, it is removed.
+  await gatewayReleases(t, kube, () => ({ releases: {} }));
   const pruned = await runAlasio(["upgrade"], { env, machine, releases: latest });
   succeeded(pruned);
   assert.deepEqual(rootSteps(pruned), [
-    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-21000101-0, in /var/lib/rancher/k3s/agent/etc/containerd",
+    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-21000101-0, in /var/lib/rancher/k3s/agent/etc/containerd, and stargz-snapshotter's daemon's, as the service stargz-snapshotter, which k3s's starts",
     "stop the sandboxes of gVisor 20990101.0, which alasio no longer keeps, and remove /usr/local/lib/alasio/gvisor/20990101.0",
     "restart the service k3s, with its new configuration",
     "read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
@@ -1317,7 +1496,12 @@ test("status of k3s here says its versions, its service and node, and that up st
   const { alasio, machine } = await onHost(t);
   const healthy = await alasio(["status"]);
   succeeded(healthy);
-  assert.deepEqual(healthy.printed.slice(0, 3), ["k3s v1.99.0+k3s1 on this machine, with gVisor 20990101.0:", "  service k3s: active, enabled", "  node machine: ready"]);
+  assert.deepEqual(healthy.printed.slice(0, 4), [
+    "k3s v1.99.0+k3s1 on this machine, with gVisor 20990101.0, stargz-snapshotter v9.9.0:",
+    "  service k3s: active, enabled",
+    "  service stargz-snapshotter, which k3s pulls images through: active",
+    "  node machine: ready",
+  ]);
   assert.ok(healthy.printed.includes("  Deployment alasio/alasio: ready"));
 
   const down = await alasio(["down"]);
@@ -1328,7 +1512,11 @@ test("status of k3s here says its versions, its service and node, and that up st
   assert.deepEqual(machine.killed.at(-1), [`${installed}/runsc`, `${installed}/containerd-shim-runsc-v1`, `${installed}/gvisor-bin/gvisor_sentry`]);
   const stopped = await alasio(["status"]);
   assert.equal(failure(stopped), "k3s on this machine is stopped: alasio up starts it");
-  assert.deepEqual(stopped.printed, ["k3s v1.99.0+k3s1 on this machine, with gVisor 20990101.0:", "  service k3s: inactive, disabled"]);
+  assert.deepEqual(stopped.printed, [
+    "k3s v1.99.0+k3s1 on this machine, with gVisor 20990101.0, stargz-snapshotter v9.9.0:",
+    "  service k3s: inactive, disabled",
+    "  service stargz-snapshotter, which k3s pulls images through: inactive",
+  ]);
   assert.equal(failure(await alasio(["logs"])), "k3s on this machine is stopped: alasio up starts it");
 
   const up = await alasio(["up"]);
@@ -1355,25 +1543,56 @@ test("uninstall --purge removes k3s, gVisor, JuiceFS's directories, the storage,
   const tokenFile = join(env.HOME, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
   succeeded(await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--up"]));
-  machine.write("/proc/self/mounts", "proc /proc proc rw 0 0\nJuiceFS:workspaces /var/lib/juicefs/volume/pvc\\040one fuse.juicefs rw 0 0\n");
-  machine.write("/var/lib/juicefs/volume/pvc one/file", "data");
+  machine.write(
+    "/proc/self/mounts",
+    "proc /proc proc rw 0 0\nJuiceFS:workspaces /var/lib/alasio/workspaces fuse.juicefs rw 0 0\nJuiceFS:workspaces /var/lib/alasio/attach/pod\\040one fuse.juicefs rw 0 0\nstargz /var/lib/containerd-stargz-grpc/snapshotter/snapshots/1/fs fuse.rawBridge rw 0 0\n",
+  );
+  machine.write("/var/lib/alasio/workspaces/main/one/files/file", "data");
+  machine.write("/var/lib/alasio/attach/pod one/file", "data");
+  machine.write("/var/lib/containerd-stargz-grpc/stargz/httpcache/layer", "cached");
+  machine.write("/run/containerd-stargz-grpc/fuse-manager.sock", "");
   const storagePath = join(env.XDG_DATA_HOME, "alasio", "storage");
   const run = await alasio(["uninstall", "--purge"], [pressed("y")]);
   succeeded(run);
-  assert.match(run.prompts, /Remove alasio and all its data from k3s on this machine, and k3s and gVisor themselves\? This cannot be undone/u);
+  assert.match(run.prompts, /Remove alasio and all its data from k3s on this machine, and k3s, gVisor and stargz-snapshotter themselves\? This cannot be undone/u);
   assert.deepEqual(rootSteps(run), [
-    "stop the cluster's gVisor pods, uninstall k3s with k3s-uninstall.sh, which removes its service, /etc/rancher/k3s and its data, and remove what it leaves, its node's password in /etc/rancher/node, gVisor's releases in /usr/local/lib/alasio/gvisor, and JuiceFS's mounts and directories, /var/lib/juicefs and /run/juicefs-csi",
+    "stop the cluster's gVisor pods, uninstall k3s with k3s-uninstall.sh, which removes its service, /etc/rancher/k3s and its data, and remove what it leaves, its node's password in /etc/rancher/node, gVisor's releases in /usr/local/lib/alasio/gvisor, stargz-snapshotter from /usr/local/bin, " +
+      "stargz-snapshotter's service, its mounts and its images in /var/lib/containerd-stargz-grpc and its sockets in /run/containerd-stargz-grpc, and alasio's mounts and directory, /var/lib/alasio",
     `remove ${storagePath}, the cluster's volumes`,
     `remove ${SYSCTL_FILE}, which raises the inotify limits at every boot`,
   ]);
-  assert.deepEqual(machine.commands().slice(-3), ["systemctl stop k3s", "/usr/local/bin/k3s-uninstall.sh", "umount --lazy /var/lib/juicefs/volume/pvc one"]);
-  for (const path of ["/usr/local/bin/k3s", "/usr/local/lib/alasio", "/etc/rancher", "/var/lib/rancher", "/var/lib/juicefs", SYSCTL_FILE]) {
+  assert.deepEqual(machine.commands().slice(-6), [
+    "systemctl stop k3s",
+    "/usr/local/bin/k3s-uninstall.sh",
+    "umount --lazy /var/lib/containerd-stargz-grpc/snapshotter/snapshots/1/fs",
+    "umount --lazy /var/lib/alasio/workspaces",
+    "umount --lazy /var/lib/alasio/attach/pod one",
+    "systemctl daemon-reload",
+  ]);
+  // The daemon stopped with k3s; its FUSE manager, which outlives it, is stopped by alasio.
+  assert.deepEqual(machine.killed.at(-1), ["/usr/local/bin/stargz-fuse-manager"]);
+  const removed = [
+    "/usr/local/bin/k3s",
+    "/usr/local/lib/alasio",
+    "/usr/local/bin/containerd-stargz-grpc",
+    "/usr/local/bin/stargz-fuse-manager",
+    "/etc/systemd/system/stargz-snapshotter.service",
+    "/etc/systemd/system/k3s.service.d",
+    "/etc/containerd-stargz-grpc",
+    "/var/lib/containerd-stargz-grpc",
+    "/run/containerd-stargz-grpc",
+    "/etc/rancher",
+    "/var/lib/rancher",
+    "/var/lib/alasio",
+    SYSCTL_FILE,
+  ];
+  for (const path of removed) {
     assert.ok(!machine.has(path), `${path} is left`);
   }
   assert.ok(!existsSync(storagePath));
   assert.ok(!existsSync(join(configFile, "..", "kubeconfig")));
   assert.ok(existsSync(configFile));
-  assert.equal(run.printed.at(-1), `alasio and k3s on this machine are removed, with gVisor and all their data; the config at ${configFile} is kept.`);
+  assert.equal(run.printed.at(-1), `alasio and k3s on this machine are removed, with gVisor, stargz-snapshotter and all their data; the config at ${configFile} is kept.`);
   const status = await alasio(["status"]);
   assert.equal(failure(status), "there is no k3s on this machine yet: alasio up installs it");
   assert.deepEqual(status.printed, ["k3s on this machine:", "  not installed"]);
@@ -1455,7 +1674,36 @@ function verifies(verifier: string | undefined, password: string): boolean {
  * computes answering in their pods as they do: neon-control's API through curl, the
  * databases through psql.
  */
-async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNeon }> {
+/** The workspaces the sandbox gateway serves, of each environment, and those deleted through it, `<environment>/<workspace>`. */
+interface FakeGateway {
+  readonly workspaces: Map<string, string[]>;
+  readonly deleted: string[];
+}
+
+/**
+ * The sandbox gateway's front for workspaces: lists an environment's, and deletes one, 409
+ * while a pod of its environment's sessions' namespace is bound to it, as its annotation
+ * says, as the gateway holds its binding until its pod is gone.
+ */
+async function workspacesGateway(t: TestContext, kube: FakeKube): Promise<FakeGateway> {
+  const gateway: FakeGateway = { workspaces: new Map(), deleted: [] };
+  const sessions = (environment: string) => `/api/v1/namespaces/alasio-branch-${environment}-sessions/pods/`;
+  const bound = (environment: string, key: string) =>
+    [...kube.objects].some(([path, pod]) => path.startsWith(sessions(environment)) && (pod.metadata["annotations"] as Record<string, string> | undefined)?.["alasio.dev/binding-key"] === key);
+  await gatewayFront(t, kube, (environment, key, method, path) => {
+    const of = gateway.workspaces.get(environment) ?? [];
+    if (method === "GET" && path === "/workspace/all") return { status: 200, json: { workspaces: of } };
+    const workspace = key.startsWith("sessionfs:") ? key.slice("sessionfs:".length) : "";
+    if (method !== "DELETE" || path !== "/workspace" || !workspace) return { status: 404 };
+    if (bound(environment, key)) return { status: 409, json: { error: `${workspace} is bound, or being bound or released; it is deleted once released` } };
+    gateway.workspaces.set(environment, of.filter((each) => each !== workspace));
+    gateway.deleted.push(`${environment}/${workspace}`);
+    return { status: 204 };
+  });
+  return gateway;
+}
+
+async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNeon; readonly gateway: FakeGateway }> {
   const setup = await installed(t);
   stackSecret(setup.kube, "alasio-database", {
     url: "postgresql://alasio:p@alasio-neon-proxy.alasio.svc:5432/alasio?options=endpoint%3Dalasio",
@@ -1478,6 +1726,7 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
   stackSecret(setup.kube, "alasio-neon-compute", { NEON_CONTROL_PLANE_TOKEN: "c" });
   stackSecret(setup.kube, "alasio-log-scaler", { sasl: "scram_sha512", username: "scaler", password: "s" });
   stackSecret(setup.kube, "alasio-branches", { "control-token": "admin", "fork-key": "key" });
+  stackSecret(setup.kube, "alasio-sandbox-gateway", { "caller-key": "master", "binding-key": "binding" });
   const neon: FakeNeon = { branches: [{ name: "main", parent: null, state: "ready", createdAt: "2026-10-07T00:00:00Z" }], asked: [], turns: "0", computes: [],
     tenant: ONE_SHARD,
     storage: { pageservers: 1, shards: 1, answering: true, databaseAnswering: true },
@@ -1515,7 +1764,7 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
     }
     return { exitCode: 0 };
   };
-  return { ...setup, neon };
+  return { ...setup, neon, gateway: await workspacesGateway(t, setup.kube) };
 }
 
 /** The value of `key` of the Secret `name` in `namespace`. */
@@ -1667,6 +1916,26 @@ test("up applies nothing where an object the cluster has cannot take this releas
     );
   }
   assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
+});
+
+test("up and upgrade apply nothing while the sessions' namespace holds the release before's session workspaces, naming each and how to delete it", async (t) => {
+  const { alasio, kube } = await installed(t);
+  kube.put("sandboxes", { apiVersion: "agents.x-k8s.io/v1beta1", kind: "Sandbox", metadata: { name: "fs-abc123", namespace: "alasio-sessions" }, spec: {} });
+  kube.put("persistentvolumeclaims", { apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: { name: "workspace-fs-abc123", namespace: "alasio-sessions" }, spec: {}, status: { phase: "Bound" } });
+  kube.changes.length = 0;
+  for (const command of [["up"], ["upgrade", "--check"]]) {
+    assert.equal(
+      failure(await alasio(command)),
+      "alasio-sessions holds session workspaces of the release before (Sandbox fs-abc123, claim workspace-fs-abc123), which this release runs no session on and moves nothing of, " +
+        "so alasio applies nothing: delete each first, its files with it " +
+        "(kubectl -n alasio-sessions delete sandboxes.agents.x-k8s.io fs-abc123; kubectl -n alasio-sessions delete pvc workspace-fs-abc123)",
+    );
+  }
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
+  // Once they are deleted, it applies.
+  kube.objects.delete("/apis/agents.x-k8s.io/v1beta1/namespaces/alasio-sessions/sandboxes/fs-abc123");
+  kube.objects.delete("/api/v1/namespaces/alasio-sessions/persistentvolumeclaims/workspace-fs-abc123");
+  succeeded(await alasio(["up"]));
 });
 
 test("up applies nothing where objects the cluster has cannot take this release's of them, telling every one refused at once, as a dry run of each says", async (t) => {
@@ -1897,6 +2166,8 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   assert.deepEqual(keys("alasio-lake"), ["LAKE_DATABASE_PASSWORD", "LAKE_S3_KEY", "LAKE_S3_SECRET"]);
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-claude", "token"), "sk-ant-oat01-claude");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branch-fork", "token"), forkToken("key", "try"));
+  // Its own key to the sandbox gateway, of the gateway's caller key, which signs its own sessions' tokens alone.
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-sessions-caller", "caller-key"), environmentKey(Buffer.from("master"), "try").toString());
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branches", "control-token"), undefined);
   // KEDA's principal on the log, which its loader's scaler reads as, and which may only describe how far behind it is.
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-log-scaler", "username"), "scaler");
@@ -1968,27 +2239,50 @@ test("branch list says each branch, what it is a branch of, its age, the release
   assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, made by alasio 0.0.0-development, its alasio ready, 1.8 GiB requested, 0 MiB used"]);
 });
 
-test("branch delete refuses while the branch's alasio has a turn running unless --force, and deletes it whole: its alasio and lake, its sessions, its compute, its branch of Neon, its namespaces, its Sandboxes' policy", async (t) => {
-  const { alasio, home, kube, neon, telegram } = await branchable(t);
+test("branch delete refuses while the branch's alasio has a turn running, or a workspace of its sessions is bound, unless --force, and deletes it whole: its alasio and lake, its sessions' workspaces, its compute, its branch of Neon, its namespaces", async (t) => {
+  const { alasio, gateway, home, kube, neon, telegram } = await branchable(t);
   telegram.bots.set("456:branch", "branch_bot");
   writeFileSync(join(home, "branch"), "456:branch");
   succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
-  const policy = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/alasio-branch-try-sandboxes";
-  const binding = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/alasio-branch-try-sandboxes";
-  assert.ok(kube.get(policy) && kube.get(binding));
+  // Its sessions' workspaces, as the gateway serves them, one of them bound to a pod of its pool's; and main's, which it leaves be.
+  gateway.workspaces.set("try", ["fs-abc123", "fs-def456"]);
+  gateway.workspaces.set("main", ["fs-abc123"]);
+  const boundPod = "/api/v1/namespaces/alasio-branch-try-sessions/pods/sandboxes-none-7d9f8-x2v5q";
+  kube.put("pods", {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: {
+      name: "sandboxes-none-7d9f8-x2v5q",
+      namespace: "alasio-branch-try-sessions",
+      labels: { "alasio.dev/pool": "sandboxes-none", "alasio.dev/binding": "0123abcd" },
+      annotations: { "alasio.dev/binding-key": "sessionfs:fs-def456" },
+    },
+    spec: { containers: [{ name: "bayma", image: "bayma" }] },
+    status: { phase: "Running" },
+  });
   neon.turns = "1";
   neon.asked.length = 0;
   assert.equal(failure(await alasio(["branch", "delete", "try"])), "its alasio has 1 turn running; --force deletes it all the same");
   // Its compute, which may sleep, woken to be asked.
   assert.deepEqual(neon.asked.filter(({ method }) => method === "POST").map(({ path }) => path), ["/computes/branch-try/wake"]);
+  neon.turns = "0";
+  kube.changes.length = 0;
+  assert.equal(failure(await alasio(["branch", "delete", "try"])), "its session's workspace fs-def456 is bound; --force deletes it all the same");
+  // Refused before anything changed.
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET").map(({ path }) => path).filter((path) => !path.includes("/exec")), []);
+  assert.deepEqual(gateway.deleted, []);
   assert.ok(kube.get(BRANCH_DEPLOYMENT));
   kube.changes.length = 0;
   const run = await alasio(["branch", "delete", "try", "--force"]);
   succeeded(run);
   assert.equal(run.printed.at(-1), "The branch try is deleted, with all it had; main's data is as it was.");
+  // Each of its workspaces deleted through the gateway, by the branch's own key, the bound one once its pod is gone; main's left be.
+  assert.deepEqual(gateway.deleted, ["try/fs-abc123", "try/fs-def456"]);
+  assert.deepEqual(gateway.workspaces.get("main"), ["fs-abc123"]);
   const deleted = kube.changes.filter(({ method }) => method === "DELETE").map(({ path }) => path);
   const at = (path: string) => deleted.indexOf(path);
-  assert.ok(at(BRANCH_DEPLOYMENT) >= 0 && at(BRANCH_DEPLOYMENT) < at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute"), deleted.join("\n"));
+  assert.ok(at(BRANCH_DEPLOYMENT) >= 0 && at(BRANCH_DEPLOYMENT) < at(boundPod), deleted.join("\n"));
+  assert.ok(at(boundPod) < at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute"), deleted.join("\n"));
   // Its read replica too, before its branch of Neon is deleted.
   assert.ok(at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute-ro") >= 0, deleted.join("\n"));
   const loader = at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-lake-loader");
@@ -1996,7 +2290,6 @@ test("branch delete refuses while the branch's alasio has a turn running unless 
   assert.deepEqual(neon.branches.map(({ name }) => name), ["main"]);
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try"), undefined);
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try-sessions"), undefined);
-  assert.deepEqual([kube.get(policy), kube.get(binding)], [undefined, undefined]);
   // Its bot delivered nowhere, its route gone, its principal and topic forgotten.
   assert.equal(telegram.webhooks.get("456:branch"), undefined);
   assert.equal(secretValue(kube, ROUTES_SECRET, "try"), undefined);
@@ -2034,8 +2327,8 @@ test("a branch's configuration is main's with its overrides, and never the host 
   const container = (kube.get(BRANCH_DEPLOYMENT)?.spec as { template: { spec: { containers: { env: { name: string; value?: string }[]; resources: { requests: Record<string, string> } }[]; volumes: { name: string }[] } } }).template.spec;
   assert.equal(container.containers[0]?.env.find(({ name }) => name === "ALASIO_DEFAULT_HARNESS")?.value, "codex");
   assert.deepEqual(container.containers[0]?.resources.requests, { cpu: "250m", memory: "512Mi" });
-  const templates = JSON.parse((kube.get("/api/v1/namespaces/alasio-branch-try/configmaps/alasio-sandbox-templates")?.["data"] as Record<string, string>)["templates.json"] ?? "");
-  assert.equal(templates.host, undefined);
+  // No folder instances, which are main's alone.
+  assert.equal(container.containers[0]?.env.some(({ name }) => name === "ALASIO_GATEWAY_FOLDERS"), false);
   // The pull Secrets of its images, in its own namespace.
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try/secrets/registry")?.["type"], "kubernetes.io/dockerconfigjson");
   writeFileSync(join(home, "overrides.json"), JSON.stringify({ alasio: { telegram: { existingSecret: "mine" } } }));

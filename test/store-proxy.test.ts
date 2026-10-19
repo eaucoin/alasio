@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { Effect, Fiber, Logger, type Scope } from "effect";
@@ -21,8 +22,8 @@ const PREFIX = "main/fs-abc/layers/";
 const KEY = `${PREFIX}${"a".repeat(64)}/pages.img`;
 const EMPTY = createHash("sha256").update("").digest("hex");
 
-/** How long a proxy's tokens and quiet last, unless told: as the proxy has them. */
-type Times = Pick<StoreProxyOptions, "preparedForMs" | "quietMs">;
+/** How long a proxy's tokens and quiet last, and how often it keeps its tokens, unless told: as the proxy has them; and its socket and tokens file, if any. */
+type Times = Pick<StoreProxyOptions, "preparedForMs" | "quietMs" | "askedWindowMs" | "resumedCeilingMs" | "keptEveryMs" | "socket" | "tokensFile">;
 
 /** `effect` with a proxy of a fake bucket holding KEY, of `times`, run to its end; what it logs, put in `logged`. */
 function withProxy<A>(effect: (context: { readonly proxy: StoreProxy; readonly s3: FakeS3 }) => Effect.Effect<A, unknown, Scope.Scope>, times: Times = {}, logged: string[] = []): Promise<A> {
@@ -37,9 +38,9 @@ function withProxy<A>(effect: (context: { readonly proxy: StoreProxy; readonly s
   })).pipe(Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push(String(message)))]))));
 }
 
-/** The token `proxy` mints for `holder`, of PREFIX, which it must. */
-function minted(proxy: StoreProxy, holder = "main/fs-abc"): StoreToken {
-  const token = proxy.mint(holder, PREFIX);
+/** The token `proxy` mints for `holder`, of PREFIX, reached by `transport`, which it must. */
+function minted(proxy: StoreProxy, holder = "main/fs-abc", transport: "socket" | "tcp" = "tcp"): StoreToken {
+  const token = proxy.mint(holder, PREFIX, transport);
   assert.ok(token, `the proxy minted no token for ${holder}`);
   return token;
 }
@@ -69,7 +70,8 @@ interface Signing {
 
 const amzDate = (at: Date) => at.toISOString().replace(/[-:]|\.\d{3}/gu, "");
 
-function ask(endpoint: string, path: string, signing: Signing | null): Promise<Asked> {
+/** What a GET of `path` through `endpoint`, or through the socket at `socketPath` naming `endpoint`, came to, signed with `token` as `signing` says. */
+function ask(endpoint: string, path: string, signing: Signing | null, socketPath?: string): Promise<Asked> {
   const url = new URL(endpoint);
   const headers: Record<string, string> = { host: url.host, "x-amz-date": amzDate(signing?.at ?? new Date()), "x-amz-content-sha256": EMPTY, ...signing?.extra };
   if (signing?.range !== undefined) headers["range"] = signing.range;
@@ -84,7 +86,7 @@ function ask(endpoint: string, path: string, signing: Signing | null): Promise<A
     );
   }
   return new Promise((resolve, reject) => {
-    const asked = httpRequest({ host: url.hostname, port: url.port, method: signing?.method ?? "GET", path: search === "" ? path : `${path}?${search}`, headers }, (response) => {
+    const asked = httpRequest({ ...(socketPath === undefined ? { host: url.hostname, port: url.port } : { socketPath }), method: signing?.method ?? "GET", path: search === "" ? path : `${path}?${search}`, headers }, (response) => {
       const chunks: Buffer[] = [];
       response.on("data", (chunk: Buffer) => chunks.push(chunk));
       response.on("end", () => resolve({ status: response.statusCode ?? 0, headers: response.headers, body: Buffer.concat(chunks) }));
@@ -205,6 +207,98 @@ test("a token lasts as long as a restore takes to its resume, and from its resum
       assert.equal(proxy.reading(), 0);
     }), { preparedForMs: 300 }));
 
+test("a resumed token lasts while its restore keeps asking, through a bucket away for ten times its window, failing or not answering; once it asks no more, a window later it ends", () =>
+  withProxy(({ proxy, s3 }) =>
+    Effect.gen(function*() {
+      const status = (token: StoreToken, through = proxy) => Effect.promise(() => ask(through.endpoint, `/snapshots/${KEY}`, { token })).pipe(Effect.map(refusal));
+      const token = minted(proxy);
+      proxy.resumed("main/fs-abc", 100);
+      // The bucket failing every read for ten windows, its restore asking again every 50 ms,
+      // as its gofer does: each answered as the bucket answers, the token lasting.
+      s3.refuse = (method) => (method === "GET" ? 503 : null);
+      for (const startedAt = Date.now(); Date.now() - startedAt < 2000;) {
+        assert.equal(yield* status(token), "503 InternalError");
+        yield* sleep(50);
+      }
+      // Back, it reads.
+      s3.refuse = () => null;
+      assert.equal(yield* status(token), "200 ");
+      // Asked no more, it ends a window after its last request.
+      yield* sleep(100);
+      assert.equal(yield* status(token), "200 ");
+      yield* sleep(300);
+      assert.equal(yield* status(token), "403 AccessDenied");
+      // A bucket that does not answer at all, likewise.
+      yield* Effect.scoped(Effect.gen(function*() {
+        const away = yield* makeStoreProxy({ store: { endpoint: "http://127.0.0.1:1", region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, askedWindowMs: 200 });
+        const unanswered = away.mint("main/fs-abc", PREFIX);
+        assert.ok(unanswered);
+        away.resumed("main/fs-abc", 100);
+        for (const startedAt = Date.now(); Date.now() - startedAt < 2000;) {
+          assert.equal(yield* status(unanswered, away), "502 BadGateway");
+          yield* sleep(50);
+        }
+        yield* sleep(300);
+        assert.equal(yield* status(unanswered, away), "403 AccessDenied");
+      }));
+      // Never resumed, its requests lengthen it not: it ends as a prepare's does.
+      const prepared = minted(proxy, "main/fs-prepared");
+      for (let asked = 0; asked < 4; asked++) {
+        yield* status(prepared);
+        yield* sleep(100);
+      }
+      assert.equal(yield* status(prepared), "403 AccessDenied");
+    }), { askedWindowMs: 200, preparedForMs: 300 }));
+
+test("a resumed token ends at its ceiling from its resume, however its restore keeps asking", () =>
+  withProxy(({ proxy }) =>
+    Effect.gen(function*() {
+      const token = minted(proxy);
+      proxy.resumed("main/fs-abc", 100);
+      const startedAt = Date.now();
+      let refused = 0;
+      while (refused === 0 && Date.now() - startedAt < 3000) {
+        const said = refusal(yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token })));
+        if (said !== "200 ") refused = Date.now() - startedAt;
+        yield* sleep(50);
+      }
+      assert.ok(refused >= 1000 && refused < 1400, `refused ${refused} ms after its resume`);
+    }), { askedWindowMs: 200, resumedCeilingMs: 1000 }));
+
+test("a proxy that starts again takes back the time its tokens' requests lengthened, kept at most every so often", () =>
+  withDirectory(async (directory) => {
+    const tokensFile = join(directory, "node-agent", "tokens.json");
+    const status = (proxy: StoreProxy, token: StoreToken) => Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token })).pipe(Effect.map(refusal));
+    const until = () => (JSON.parse(readFileSync(tokensFile, "utf8")) as { tokens: { until: number }[] }).tokens[0]?.until ?? 0;
+    const token = await withProxy(({ proxy }) =>
+      Effect.gen(function*() {
+        const token = minted(proxy, "main/fs-a", "socket");
+        proxy.resumed("main/fs-a", 100);
+        const resumedUntil = until();
+        // Asked of, its lengthened time kept.
+        assert.equal(yield* status(proxy, token), "200 ");
+        const asked = until();
+        assert.ok(asked >= resumedUntil + 50_000, `${asked} kept, ${resumedUntil} on its resume`);
+        return token;
+      }), { tokensFile, askedWindowMs: 60_000, keptEveryMs: 0 });
+    // Past its resume's time, taken back, it reads, as its requests lengthened it.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await withProxy(({ proxy }) => Effect.gen(function*() {
+      assert.equal(yield* status(proxy, token), "200 ");
+    }), { tokensFile });
+    // Written at most every keptEveryMs: a request within it lengthens the token, not the file.
+    await withProxy(({ proxy }) =>
+      Effect.gen(function*() {
+        const again = minted(proxy, "main/fs-b", "socket");
+        proxy.resumed("main/fs-b", 100);
+        const written = readFileSync(tokensFile, "utf8");
+        assert.equal(yield* status(proxy, again), "200 ");
+        assert.equal(readFileSync(tokensFile, "utf8"), written);
+        yield* sleep(300);
+        assert.equal(yield* status(proxy, again), "200 ");
+      }), { tokensFile, askedWindowMs: 60_000, keptEveryMs: 60_000 });
+  }));
+
 test("a proxy that drains mints no token, and ends once no restore reads through it: none prepared and not yet resumed, none whose read is under way, none resumed whose reads have been quiet for less than its quiet", () =>
   withProxy(({ proxy, s3 }) =>
     Effect.gen(function*() {
@@ -234,6 +328,137 @@ test("a proxy that drains mints no token, and ends once no restore reads through
       proxy.revoke("main/fs-a");
       assert.equal(refusal(yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token: prepared }))), "403 AccessDenied");
     }), { quietMs: 300 }));
+
+/** A directory of the test's, in /tmp, short enough for a socket's path, whatever TMPDIR is, removed after `body`. */
+async function withDirectory<A>(body: (directory: string) => Promise<A>): Promise<A> {
+  const directory = mkdtempSync(join("/tmp", "alasio-proxy-"));
+  try {
+    return await body(directory);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+/** `effect`, and what it logged, each line with its level. */
+function logging<A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<{ readonly value: A; readonly logged: readonly string[] }, E, R> {
+  const logged: string[] = [];
+  const logger = Logger.make(({ logLevel, message }) => logged.push(`${logLevel} ${Array.isArray(message) ? message.join(" ") : String(message)}`));
+  return effect.pipe(Effect.map((value) => ({ value, logged })), Effect.provide(Logger.layer([logger])));
+}
+
+test("the proxy serves a restore's token through its socket too, only root's, by the path alone, whatever host its requests name, and removes the socket as it ends", () =>
+  withDirectory(async (directory) => {
+    const socket = join(directory, "node-agent", "store.sock");
+    await withProxy(({ proxy, s3 }) =>
+      Effect.gen(function*() {
+        assert.equal(proxy.socket, socket);
+        assert.equal((statSync(socket).mode & 0o777).toString(8), "600");
+        assert.equal((statSync(join(directory, "node-agent")).mode & 0o777).toString(8), "700");
+        const token = minted(proxy, "main/fs-abc", "socket");
+        const asked = yield* Effect.promise(() => ask("http://alasio-node-agent", `/snapshots/${KEY}`, { token, range: "bytes=10-19" }, socket));
+        assert.deepEqual([asked.status, asked.body], [206, s3.objects.get(KEY)?.subarray(10, 20)]);
+        // As it refuses over TCP, it refuses there.
+        assert.equal(refusal(yield* Effect.promise(() => ask("http://alasio-node-agent", `/snapshots/${KEY}`, null, socket))), "403 AccessDenied");
+      }), { socket });
+    assert.ok(!existsSync(socket));
+    // A socket an agent before left, killed, is no obstacle to the next.
+    writeFileSync(socket, "");
+    await withProxy(() => Effect.sync(() => assert.equal((statSync(socket).mode & 0o777).toString(8), "600")), { socket });
+  }));
+
+test("a proxy that starts again takes back from its tokens file the tokens of the restores before it, a resumed one whose window ended while it was away among them, but those revoked; one whose file cannot be read takes none, says so, and starts", () =>
+  withDirectory(async (directory) => {
+    const tokensFile = join(directory, "node-agent", "tokens.json");
+    const status = (proxy: StoreProxy, token: StoreToken) => Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token })).pipe(Effect.map(refusal));
+    const [resumed, prepared, lapsed, revoked] = await withProxy(({ proxy }) =>
+      Effect.gen(function*() {
+        const tokens = [minted(proxy, "main/fs-a", "socket"), minted(proxy, "main/fs-b", "socket"), minted(proxy, "main/fs-c"), minted(proxy, "main/fs-d", "socket")] as const;
+        proxy.resumed("main/fs-a", 60_000);
+        proxy.resumed("main/fs-c", 1);
+        proxy.revoke("main/fs-d");
+        assert.equal((statSync(tokensFile).mode & 0o777).toString(8), "600");
+        return tokens;
+      }), { tokensFile });
+    await withProxy(({ proxy }) =>
+      Effect.gen(function*() {
+        // Kept again as it mints one, the one revoked no more among them.
+        minted(proxy, "main/fs-e", "socket");
+        const kept = JSON.parse(readFileSync(tokensFile, "utf8")) as { tokens: { holder: string }[] };
+        assert.deepEqual(kept.tokens.map(({ holder }) => holder).sort(), ["main/fs-a", "main/fs-b", "main/fs-c", "main/fs-e"]);
+        assert.equal(yield* status(proxy, resumed), "200 ");
+        assert.equal(yield* status(proxy, prepared), "200 ");
+        // Its window ended while no agent ran, which its restore could not ask of.
+        assert.equal(yield* status(proxy, lapsed), "200 ");
+        assert.equal(yield* status(proxy, revoked), "403 AccessDenied");
+        // Its holder's still: minted anew, the one before reads nothing.
+        minted(proxy, "main/fs-a", "socket");
+        assert.equal(yield* status(proxy, resumed), "403 AccessDenied");
+
+      }), { tokensFile });
+    // A file that is not one, as a crash mid-write would not leave, but a disk might.
+    for (const corrupt of ["{ not json", JSON.stringify({ schemaVersion: 2, tokens: [] }), JSON.stringify({ schemaVersion: 1, tokens: [{ accessKeyId: prepared.accessKeyId }] })]) {
+      writeFileSync(tokensFile, corrupt);
+      const { value: read, logged } = await Effect.runPromise(logging(Effect.scoped(Effect.gen(function*() {
+        const proxy = yield* makeStoreProxy({ store: { endpoint: "http://127.0.0.1:1", region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, tokensFile });
+        return yield* status(proxy, prepared);
+      }))));
+      assert.equal(read, "403 AccessDenied");
+      assert.ok(logged.some((line) => line.startsWith("Error ") && line.includes(`cannot read back the tokens of the restores reading the snapshots bucket through it, ${tokensFile}`)), logged.join("\n"));
+    }
+  }));
+
+test("a resumed token read back by a proxy that starts again lasts a window from its start, however long it was away, a window later ends once its restore asks no more, and past its ceiling is not taken back", () =>
+  withDirectory(async (directory) => {
+    const tokensFile = join(directory, "node-agent", "tokens.json");
+    const status = (proxy: StoreProxy, token: StoreToken) => Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token })).pipe(Effect.map(refusal));
+    const windows = { tokensFile, askedWindowMs: 200, keptEveryMs: 0 };
+    const [away, capped] = await withProxy(({ proxy }) =>
+      Effect.gen(function*() {
+        const away = minted(proxy, "main/fs-a", "socket");
+        const capped = minted(proxy, "main/fs-b", "socket");
+        proxy.resumed("main/fs-a", 100);
+        proxy.resumed("main/fs-b", 100);
+        assert.equal(yield* status(proxy, away), "200 ");
+        return [away, capped] as const;
+      }), { ...windows, resumedCeilingMs: 60_000 });
+    // Away for ten times its window, as an agent down for twenty minutes is for two.
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await withProxy(({ proxy }) =>
+      Effect.gen(function*() {
+        assert.equal(yield* status(proxy, away), "200 ");
+        // Asked of no more: a window later, it ends.
+        yield* sleep(400);
+        assert.equal(yield* status(proxy, away), "403 AccessDenied");
+      }), { ...windows, resumedCeilingMs: 60_000 });
+    // Past its ceiling, as an agent away longer than a restore's ceiling: refused.
+    const file = JSON.parse(readFileSync(tokensFile, "utf8")) as { tokens: { holder: string; ceiling: number }[] };
+    for (const token of file.tokens) if (token.holder === "main/fs-b") token.ceiling = Date.now() - 1;
+    writeFileSync(tokensFile, JSON.stringify(file));
+    await withProxy(({ proxy }) =>
+      Effect.gen(function*() {
+        assert.equal(yield* status(proxy, capped), "403 AccessDenied");
+      }), windows);
+  }));
+
+test("a proxy that drains waits on no restore through its socket, which waits for the agent that comes back, however many bytes of its pages it has yet to be served; only on those over TCP, until they have been", () =>
+  withProxy(({ proxy }) =>
+    Effect.gen(function*() {
+      const socket = minted(proxy, "main/fs-socket", "socket");
+      const tcp = minted(proxy, "main/fs-tcp");
+      assert.equal(proxy.reading(), 1);
+      // Both resumed, each told the 4096 bytes of pages it reads, served none, and quiet for longer than their quiet.
+      for (const [holder, token] of [["main/fs-socket", socket], ["main/fs-tcp", tcp]] as const) {
+        proxy.resumed(holder, 60_000);
+        proxy.expect(token.accessKeyId, 4096);
+      }
+      yield* sleep(300);
+      assert.equal(proxy.reading(), 1);
+      // Over TCP, served them all: done.
+      assert.equal(refusal(yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token: tcp, range: "bytes=0-4095" }))), "206 ");
+      yield* sleep(50);
+      assert.equal(proxy.reading(), 0);
+      yield* proxy.drained.pipe(Effect.timeout("2 seconds"));
+    }), { quietMs: 100 }));
 
 const SERVED_ALL = "the restore of main/fs-abc has been served all 4096 bytes of its pages through the node agent";
 

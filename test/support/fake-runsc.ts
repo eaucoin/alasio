@@ -34,6 +34,7 @@
  *   nice value it ran at; or it fails, saying so, while a file
  *   `fail-compact` is beside it, or waits while one `hold-compact` is;
  * - `resume ID`: says nothing; or fails, saying so, while a file `fail-resume` is beside it;
+ * - `exec ID ARGV...`: says nothing; or fails, saying so, while a file `fail-exec` is beside it;
  * - `cpu-features`: the node's, from `cpu-features`, comma-separated;
  * - `state ID`: the container's sandbox's process and its pod's annotations, as
  *   `containers.json` beside the releases says (FakeReleases.runs), or fails for one it
@@ -153,6 +154,8 @@ if (rest[0] === "checkpoint") {
   compact();
 } else if (rest[0] === "resume") {
   if (existsSync(join(here, "fail-resume"))) { process.stderr.write("resume failed: the container is gone\\n"); process.exit(128); }
+} else if (rest[0] === "exec") {
+  if (existsSync(join(here, "fail-exec"))) { process.stderr.write("exec failed: the hook exited 1\\n"); process.exit(1); }
 } else if (rest[0] === "state") {
   const running = containers()[rest[rest.length - 1]];
   if (!running) { process.stderr.write("container does not exist\\n"); process.exit(1); }

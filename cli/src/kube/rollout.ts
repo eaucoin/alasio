@@ -1,6 +1,7 @@
 /**
  * Waiting for what was applied to run: a CRD until it is established, a Job until it
- * completes, a Deployment, StatefulSet or DaemonSet until its rollout is done, and a
+ * completes, a Deployment, StatefulSet or DaemonSet until its rollout is done (a sandbox
+ * pool's Deployment, whose pods are ready only once each is bound, until they run), and a
  * StatefulSet until its pods are scheduled; waiting for what was deleted to be gone; and
  * for volumes let go of to be deleted. A wait says
  * what it still waits for as that changes, and when it gives up, why each thing is not
@@ -9,7 +10,7 @@
  * it, holds the wait past its timeout until it is gone, and the timeout after: the wait says
  * so, with what the pod last logged.
  */
-import type { CoreV1Event, KubernetesObject, V1ContainerStatus, V1PersistentVolume, V1Pod, V1StatefulSet } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ContainerStatus, V1Deployment, V1Pod, V1StatefulSet } from "@kubernetes/client-node";
 import { Clock, Duration, Effect, Schedule, Schema, Stream } from "effect";
 
 import { describeRef, kind, KubeApi, type KubeApiError, type ObjectRef } from "./api.ts";
@@ -88,17 +89,30 @@ export function readiness(object: KubernetesObject): Readiness {
 }
 
 /**
- * Where a volume whose claim was deleted is: let go of once it is deleted, or released
- * and kept as its reclaim policy says; failed when it could not be reclaimed; else still
- * bound, or released while its data is deleted.
+ * The annotation of a Deployment whose pods are ready only once each is bound, a sandbox
+ * pool's (../manifests/sandbox-gateway.ts), each then out of the Deployment: it is ready once
+ * a pod of each of its replicas runs, ready or not (readinessOf).
  */
-export function reclamation(volume: V1PersistentVolume): Readiness {
-  const phase = volume.status?.phase ?? "Pending";
-  if (phase === "Failed") return { _tag: "Failed", reason: volume.status?.message ?? "it could not be reclaimed" };
-  if (phase === "Released") return volume.spec?.persistentVolumeReclaimPolicy === "Retain" ? READY : waiting("released, its data being deleted");
-  const claim = volume.spec?.claimRef;
-  return waiting(phase === "Bound" && claim ? `bound to ${claim.namespace}/${claim.name}` : phase.toLowerCase());
-}
+export const READY_ONCE_BOUND_ANNOTATION = "alasio.dev/ready-once-bound";
+
+/**
+ * Where `object` is, as readiness says; but a Deployment annotated READY_ONCE_BOUND_ANNOTATION,
+ * once its rollout has made a pod of each of its replicas and none of before, ready once each
+ * runs, its containers started, as its pods say.
+ */
+export const readinessOf = Effect.fnUntraced(function*(object: KubernetesObject): Effect.fn.Return<Readiness, KubeApiError, KubeApi> {
+  if (object.kind !== "Deployment" || object.metadata?.annotations?.[READY_ONCE_BOUND_ANNOTATION] !== "true") return readiness(object);
+  const { metadata, spec, status } = object as V1Deployment;
+  const replicas = spec?.replicas ?? 1;
+  const updated = status?.updatedReplicas ?? 0;
+  if ((status?.observedGeneration ?? 0) < (metadata?.generation ?? 0)) return waiting("not yet rolled out");
+  if (updated < replicas) return waiting(`${updated} of ${replicas} updated`);
+  if ((status?.replicas ?? 0) > updated) return waiting(`${(status?.replicas ?? 0) - updated} old pods stopping`);
+  const kube = yield* KubeApi;
+  const pods = yield* kube.list<V1Pod>(POD, { namespace: metadata?.namespace, labelSelector: selectorOf(spec?.selector?.matchLabels ?? {}) });
+  const runs = pods.filter((pod) => !pod.metadata?.deletionTimestamp && pod.status?.phase === "Running" && (pod.status.containerStatuses ?? []).every(({ state }) => state?.running)).length;
+  return runs < replicas ? waiting(`${runs} of ${replicas} running`) : READY;
+});
 
 /** Something waited for that is not ready, as people read it: the object, and what it is at. */
 const NotReadyObject = Schema.Struct({
@@ -283,12 +297,12 @@ const lastLogged = (pod: V1Pod): Effect.Effect<string, never, KubeApi> =>
     ));
 
 /**
- * Where `object`, a workload, is (readiness), and, while it waits, which of its pods stop,
+ * Where `object`, a workload, is (readinessOf), and, while it waits, which of its pods stop,
  * each as it may until its grace ends, and what it last logged.
  */
 const workloadReadiness = (object: KubernetesObject & { spec?: { selector?: { matchLabels?: Record<string, string> } } }): Effect.Effect<Readiness, KubeApiError, KubeApi> =>
   Effect.gen(function*() {
-    const state = readiness(object);
+    const state = yield* readinessOf(object);
     const matchLabels = object.spec?.selector?.matchLabels;
     if (state._tag !== "Waiting" || !matchLabels) return state;
     const kube = yield* KubeApi;
@@ -346,12 +360,3 @@ export const awaitGone = (refs: readonly ObjectRef[], options: WaitOptions): Eff
 /** Waits until every Job ref has ended, complete or failed, or is gone. */
 export const awaitEnded = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
   awaitAll(refs, (ref) => Effect.map(current(ref), (job) => (job === null || readiness(job)._tag !== "Waiting" ? READY : waiting("running"))), diagnose, options);
-
-/** Waits until every volume ref, its claim deleted, is let go of (reclamation). */
-export const awaitReclaimed = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
-  awaitAll(
-    refs,
-    (ref) => Effect.flatMap(KubeApi, (kube) => Effect.map(kube.get<V1PersistentVolume>(ref), (volume) => (volume ? reclamation(volume) : READY))),
-    diagnose,
-    options,
-  );

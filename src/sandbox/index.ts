@@ -1,130 +1,51 @@
 /**
  * Session filesystems: the empty, isolated workspace per session an operator may choose
- * instead of a folder. Each is an agent-sandbox Sandbox (../kube/sandboxes.ts) in the
- * sessions namespace, made from the deployment's `sessions` template, whose volume claim
- * is the workspace and whose pod runs bayma under the sandboxing runtime the template
- * names (gVisor by default). The harness runs in alasio and reaches the session through
- * one door, bayma, with the session's token; nothing of the harness, and no credential,
- * is ever inside a session.
+ * instead of a folder. Each is a workspace of the sandbox gateway's (../gateway/sessions.ts),
+ * of alasio's environment, reached through it alone (./gateway-client.ts): made, forked and
+ * deleted by it, and bound by it to a pod of its pool of the session's internet as the session
+ * is brought up, whose bayma the harness, which runs in alasio, reaches through the gateway
+ * with a caller's token of the workspace's key. Nothing of the harness, and no credential, is
+ * ever inside a session; what a session may reach is the pool's to say (its NetworkPolicies
+ * and DNS), and when it is let go, saved whole first where it is snapshotted, the gateway's.
  *
- * What a session may reach is NetworkPolicy's to enforce, by the labels set here: the
- * installation's policies admit alasio alone in, and let a session out to alasio's
- * telemetry receiver only ("none") or to the internet's public addresses too ("full").
- * DNS is set to match: public resolvers in "full", and none at all in "none", so a name
- * cannot carry anything out through the cluster's resolver.
+ * A session's internet is alasio's to keep, as its store records it (`netModeOf`), and it
+ * travels in each token, which the gateway places the session by.
  *
- * Policies reach a new pod asynchronously, so a session's pod first waits, in an init
- * container, until its egress is confined: until the cluster's API server, a private
- * address both modes refuse, no longer answers. Where NetworkPolicy is not enforced at
- * all a session therefore never starts, rather than starting open.
- *
- * A session is forked where its volume can be cloned (the template's `clone`): the fork is
- * a new session with the same internet, whose workspace and home are a copy-on-write
- * clone of the source's, made by a Job of the installation's in alasio's namespace. Its
- * Sandbox is made suspended, so its volume is provisioned but no pod of it starts, and
- * prepares its workspace, before the clone is whole; the source is suspended while it is
- * cloned, so nothing in it writes meanwhile, and resumed after. A fork carries nothing
- * but the files: no conversation, no harness session, nothing of the source's processes.
+ * A session is forked by the gateway: the fork, a new workspace, is a clone of the source's
+ * files, given the snapshot the source was released into where it was, so it restores as the
+ * source would; the fork of one bound carries its files alone. A fork carries nothing but
+ * that: no conversation, no harness session.
  *
  * A branch environment's alasio (../branch/fork.ts) has sessions of its own, in its own
- * namespace, and none of its parent's: a session its conversations inherited is forked
- * from the parent's, by the parent, under the same id, as it is first brought up here.
+ * environment, and none of its parent's: a session its conversations inherited is forked from
+ * the parent's, by the parent, into the branch, under the same id, as it is first brought up
+ * here.
+ *
+ * A file a reply shows is read through the gateway, confined to the session's files, as a
+ * received file is written into them: by the path the session sees it at, under its workspace
+ * (SANDBOX_WORKSPACE) or its home (SANDBOX_HOME).
  */
-import { createHash } from "node:crypto";
-import type { LookupAddress } from "node:dns";
-import { lookup } from "node:dns/promises";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import type { V1EnvVar, V1Job, V1JobCondition, V1PersistentVolumeClaim, V1Pod } from "@kubernetes/client-node";
-import { Clock, Config, Context, Duration, Effect, FiberSet, Layer, Option, RcRef, Schedule, Schema, type Scope, Semaphore } from "effect";
+import { Context, Effect, Layer, Schema } from "effect";
 
-import type { PodRef } from "../kube/busy.ts";
-import { type KubeApiError, KubeClient, type KubeExecError } from "../kube/client.ts";
-import { CLONE_VARIABLES, type SessionsProfile } from "../kube/config.ts";
-import {
-  BAYMA_CONTAINER,
-  DEFAULT_FULL_MODE_NAMESERVERS,
-  EGRESS_GATE,
-  EGRESS_GATE_SCRIPT,
-  NET_MODE_LABEL,
-  SESSION_TEMPLATE_ANNOTATION,
-  TELEMETRY_TOKEN_FILE_ARGS,
-  WORKLOAD_LABEL,
-} from "../kube/sandbox-shape.ts";
-import {
-  type BaymaEndpoint,
-  claimName,
-  makeSandboxes,
-  SANDBOX_API_VERSION,
-  SANDBOX_KIND,
-  type Sandbox,
-  type SandboxError,
-  type SandboxFault,
-  type SandboxOperatingMode,
-  sandboxManifest,
-  snapshotBinding,
-  type StoredSandbox,
-} from "../kube/sandboxes.ts";
 import { withLogScope } from "../shared/log.ts";
-import { sameToken } from "../shared/tokens.ts";
-import { overLimitNote } from "../telegram/rich-media.ts";
-import type { OtlpForwarder } from "../telemetry/forward.ts";
-import { assertValidVolumeId, SessionToken } from "./names.ts";
-import { makeNodeAgents } from "./node-agents.ts";
-import { holdsStop, makeSessionSnapshots, type SessionSnapshots, sessionTemplateHash, stopHookOf } from "./snapshots.ts";
-import { sandboxBaymaTelemetryEnv, sandboxResource } from "./telemetry.ts";
-import { serveTelemetryReceiver } from "./telemetry-receiver.ts";
+import { type BaymaEndpoint, type GatewayError, type GatewayWorkspaces, type GatewayWorkspacesOptions, makeGatewayWorkspaces, type NetMode } from "./gateway-client.ts";
+import { assertValidVolumeId } from "./names.ts";
 
-/** A session's internet: none, or the internet's public addresses. */
-export type NetMode = "none" | "full";
+export type { NetMode } from "./gateway-client.ts";
 
-/** Where a session's bayma exports its telemetry: alasio's receiver, and the variables that say so. */
-export interface SessionTelemetry {
-  readonly endpoint: string;
-  readonly env: Readonly<Record<string, string>>;
-}
-
-/** What sessionSandboxManifest is given. */
-export interface SessionSandboxManifestOptions {
-  readonly volumeId: string;
-  readonly netMode: NetMode;
-  readonly profile: SessionsProfile;
-  readonly telemetry: SessionTelemetry | null;
-  /** Where the Sandbox is made: the profile's namespace unless told. */
-  readonly namespace?: string;
-  /** Whether it is made running, as it is unless told, or suspended. */
-  readonly operatingMode?: SandboxOperatingMode;
-  /** The session it is a fork of, which its Sandbox records, for a fork. */
-  readonly forkedFrom?: string | undefined;
-}
-
-/** A volume claim, by its namespace and name. */
-export interface ClaimRef {
-  readonly namespace: string;
-  readonly name: string;
-}
+/** Where a session sees its workspace's files, and its home's, as a pool's pod lays them out (cli/src/manifests/sandbox-gateway.ts poolTemplate). */
+const SANDBOX_WORKSPACE = "/workspace";
+export const SANDBOX_HOME = "/home/agent";
 
 /** A file read to attach to a reply: its bytes, or a note saying why it is not attached. */
 export type FileRead =
   | { readonly bytes: Buffer; readonly note?: never }
   | { readonly note: string; readonly bytes?: never };
 
-/** Sessions' telemetry could not be received: its forwarder or its receiver did not start, or the receiver's address is unknown. */
-export class SessionTelemetryUnavailable extends Schema.TaggedError<SessionTelemetryUnavailable>()("SessionTelemetryUnavailable", {
-  cause: Schema.Defect(),
-}) {
-  override get message(): string {
-    return this.cause instanceof Error ? this.cause.message : String(this.cause);
-  }
-}
-
-/** A session's lost mount could not be made anew: why. */
-class SessionMountError extends Schema.TaggedError<SessionMountError>()("SessionMountError", {
-  message: Schema.String,
-}) {}
-
-/** Reading a file in a session came to neither its bytes nor a reason it has none. */
+/** Reading or writing a file of a session came to neither what was asked nor a reason it is not. */
 export class SessionFileError extends Schema.TaggedError<SessionFileError>()("SessionFileError", {
   message: Schema.String,
 }) {}
@@ -137,33 +58,14 @@ export class SessionInheritError extends Schema.TaggedError<SessionInheritError>
   message: Schema.String,
 }) {}
 
-/** How making a session's Sandbox and reaching its bayma fails. */
-export type SessionError = SandboxError | SessionTelemetryUnavailable | SessionInheritError;
+/** How bringing a session up, or making, forking or deleting its workspace, fails. */
+export type SessionError = GatewayError | SessionInheritError;
 
-/** A session could not be forked: why. */
-export class SessionForkError extends Schema.TaggedError<SessionForkError>()("SessionForkError", {
-  message: Schema.String,
-}) {}
-
-/** A conversation's workspace is a session filesystem, and the deployment renders no sessions template. */
+/** A conversation's workspace is a session filesystem, and the deployment gives alasio no sandbox gateway. */
 export class SessionFilesystemsDisabled extends Schema.TaggedError<SessionFilesystemsDisabled>()("SessionFilesystemsDisabled", {}) {
   override get message(): string {
     return "this conversation's workspace is a session filesystem, which this deployment does not enable";
   }
-}
-
-/** What SessionSandboxes is made with; see there. */
-export interface SessionSandboxesOptions {
-  readonly profile: SessionsProfile;
-  readonly stateDir: string;
-  /** The standard OpenTelemetry variables alasio exports its own telemetry with. */
-  readonly env?: Readonly<NodeJS.ProcessEnv>;
-  readonly createForwarder?: (env: Readonly<NodeJS.ProcessEnv>, warn: (message: string) => void) => Promise<OtlpForwarder>;
-  readonly resolve?: (hostname: string) => Promise<LookupAddress>;
-  /** Where alasio is a branch environment, how it comes by the sessions it inherited. */
-  readonly inherit?: Inheritance | undefined;
-  /** The sessions' template before the current one, which `alasio up` carried forward, that their snapshots may restore onto (./snapshots.ts). */
-  readonly previous?: SessionsProfile | null | undefined;
 }
 
 /**
@@ -172,172 +74,59 @@ export interface SessionSandboxesOptions {
  */
 export interface Inheritance {
   /**
-   * Forks the session `volumeId` of the alasio it was branched from into its own sessions,
-   * suspended: whether it did, which it does not for a session that one never had, made
-   * again empty here as a session that is gone is.
+   * Forks the session `volumeId` of the alasio it was branched from into its own sessions:
+   * the internet it was made with, where it did; null for a session that one never had,
+   * which is then made here, empty, as a session that is gone is.
    */
-  readonly fork: (volumeId: string) => Effect.Effect<boolean, SessionInheritError>;
+  readonly fork: (volumeId: string) => Effect.Effect<NetMode | null, SessionInheritError>;
   /** Records a session so forked as made, with its internet, as alasio records those it makes. */
   readonly record: (volumeId: string, netMode: NetMode) => Effect.Effect<void, SessionInheritError>;
 }
 
-/**
- * What a lost FUSE mount answers, in the C locale: its client gone (ENOTCONN), its
- * connection aborted (ECONNABORTED), or its I/O failing (EIO).
- */
-const BROKEN_MOUNT = /Transport endpoint is not connected|Software caused connection abort|Input\/output error/u;
-/** How long a look at a session's workspace mount may take; a mount that hangs is not one a new pod mends. */
-const MOUNT_CHECK_TIMEOUT: Duration.Input = "10 seconds";
-/** How long bayma's hook may take to tell bayma to go on with its stop: it asks bayma and returns. */
-const STOP_NOW_TIMEOUT: Duration.Input = "10 seconds";
-
-/**
- * JuiceFS's mount pods, by the labels its CSI driver (v0.33.0, pkg/common/common.go)
- * gives them, and the label naming the volume one mounts, by its id (its volume handle).
- */
-const MOUNT_POD_SELECTOR = "app.kubernetes.io/name=juicefs-mount";
-const MOUNT_POD_VOLUME_LABEL = "volume-id";
-/** How long a restarted session's pod is waited for to go, and how often it is looked at. */
-const POD_GONE_TIMEOUT: Duration.Input = "2 minutes";
-const POLL: Duration.Input = "1 second";
-/** How long a fork's claim is waited for to be bound to its volume; its clone, as long as the Job's own deadline gives it. */
-const CLAIM_BOUND_TIMEOUT: Duration.Input = "5 minutes";
-
-/**
- * Whether the annotation `key: value` of a mount pod is the driver's reference to a target
- * path it serves, `value`: "juicefs-" and the path's SHA-256, cut to 63 characters
- * (GetReferenceKey in pkg/util/util.go).
- */
-function isTargetReference(key: string, value: string): boolean {
-  return key === `juicefs-${createHash("sha256").update(value).digest("hex")}`.slice(0, 63);
-}
-
-/** The target paths a mount pod serves, as its annotations reference them. */
-const targetsOf = (mountPod: V1Pod): string[] =>
-  Object.entries(mountPod.metadata?.annotations ?? {}).filter(([key, value]) => isTargetReference(key, value)).map(([, value]) => value);
-
-/** Whether a target path is one of `pod`'s volumes, under kubelet's directory of the pod. */
-const ofPod = (pod: V1Pod) => (target: string): boolean => target.includes(`/pods/${pod.metadata?.uid}/volumes/`);
-
-/** The annotation of a fork's Sandbox that names the session it was forked from. */
-const FORKED_FROM_ANNOTATION = "alasio.dev/forked-from";
-
-/** Where sessions' telemetry is received: the receiver's Service, when sessions export any, and its port. */
-const ReceiverService = Config.String("ALASIO_TELEMETRY_RECEIVER_SERVICE").pipe(Config.map((service) => service.trim()), Config.withDefault(""));
-const ReceiverPort = Config.Port("ALASIO_TELEMETRY_RECEIVER_PORT").pipe(Config.withDefault(4318));
-
-/**
- * The Sandbox for a session on `volumeId` with internet mode `netMode`, from the
- * `profile` (ALASIO_KUBE_TEMPLATES `sessions`). `telemetry` is `{ endpoint, env }`, or
- * null when alasio exports none. Pure, for tests.
- */
-export function sessionSandboxManifest({
-  volumeId,
-  netMode,
-  profile,
-  telemetry,
-  namespace = profile.namespace,
-  operatingMode,
-  forkedFrom,
-}: SessionSandboxManifestOptions): Sandbox {
-  const full = netMode === "full";
-  const { podTemplate } = profile;
-  return sandboxManifest({
-    name: assertValidVolumeId(volumeId),
-    namespace,
-    // What the pod is made from, as its snapshots record it (./snapshots.ts).
-    template: {
-      ...profile,
-      podTemplate: { ...podTemplate, metadata: { ...podTemplate.metadata, annotations: { ...podTemplate.metadata?.annotations, [SESSION_TEMPLATE_ANNOTATION]: sessionTemplateHash(profile) } } },
-    },
-    labels: { [WORKLOAD_LABEL]: "session", [NET_MODE_LABEL]: full ? "full" : "none" },
-    ...(operatingMode === undefined ? {} : { operatingMode }),
-    ...(forkedFrom === undefined ? {} : { annotations: { [FORKED_FROM_ANNOTATION]: forkedFrom } }),
-    configure(spec, bayma) {
-      if (telemetry) {
-        bayma.args = [...(bayma.args ?? []), ...TELEMETRY_TOKEN_FILE_ARGS];
-        bayma.env = [
-          ...(bayma.env ?? []),
-          ...Object.entries({ ...telemetry.env, OTEL_EXPORTER_OTLP_ENDPOINT: telemetry.endpoint }).map(([name, value]) => ({ name, value })),
-        ];
-      }
-      return {
-        ...spec,
-        // Nothing in a session speaks to the cluster as anyone, or learns its services.
-        automountServiceAccountToken: false,
-        enableServiceLinks: false,
-        dnsPolicy: "None",
-        dnsConfig: { nameservers: full ? [...(profile.fullModeNameservers ?? DEFAULT_FULL_MODE_NAMESERVERS)] : ["127.0.0.1"] },
-        initContainers: [
-          ...(profile.egressGate === false ? [] : [{
-            name: EGRESS_GATE.name,
-            ...(bayma.image === undefined ? {} : { image: bayma.image }),
-            command: ["node", "-e", EGRESS_GATE_SCRIPT],
-            ...(bayma.securityContext === undefined ? {} : { securityContext: bayma.securityContext }),
-            resources: structuredClone(EGRESS_GATE.resources),
-          }]),
-          ...(spec.initContainers ?? []),
-        ],
-      };
-    },
-  });
+/** What SessionSandboxes is made with; see there. */
+interface SessionSandboxesOptions {
+  /** The gateway, and alasio's environment's name and key to it. */
+  readonly gateway: GatewayWorkspacesOptions;
+  /** alasio's state directory, under which each session's harness directory lives. */
+  readonly stateDir: string;
+  /** The internet the session `volumeId` was made with, as alasio's store records it; null for one it records not. */
+  readonly netModeOf: (volumeId: string) => Effect.Effect<NetMode | null>;
+  /** Where alasio is a branch environment, how it comes by the sessions it inherited. */
+  readonly inherit?: Inheritance | undefined;
+  /** The gateway's workspaces, but for tests, made of `gateway` otherwise. */
+  readonly workspaces?: GatewayWorkspaces | undefined;
 }
 
 /**
- * The Job, of the installation's `job`, that clones the claim `source` into the claim
- * `destination`, as its containers are told. Pure, for tests.
+ * The path in a session's files, as the gateway names it (`workspace/...` or `home/...`), of
+ * `path` as the session sees it: under its workspace, as one relative to it is, or under its
+ * home; null for one outside both.
  */
-export function cloneJobManifest(job: V1Job, source: ClaimRef, destination: ClaimRef): V1Job {
-  const values: Record<(typeof CLONE_VARIABLES)[number], string> = {
-    SOURCE_NAMESPACE: source.namespace,
-    SOURCE_CLAIM: source.name,
-    DESTINATION_NAMESPACE: destination.namespace,
-    DESTINATION_CLAIM: destination.name,
-  };
-  const env: V1EnvVar[] = CLONE_VARIABLES.map((name) => ({ name, value: values[name] }));
-  const made = structuredClone(job);
-  for (const container of made.spec?.template.spec?.containers ?? []) container.env = [...(container.env ?? []), ...env];
-  return made;
-}
-
-/** The Job's condition that says it has ended, Complete or Failed, if it has. */
-const jobEnded = (job: V1Job): V1JobCondition | undefined =>
-  job.status?.conditions?.find(({ type, status }) => (type === "Complete" || type === "Failed") && status === "True");
-
-/** The forwarder sessions' telemetry is exported through, loaded only once it is needed. */
-async function loadForwarder(env: Readonly<NodeJS.ProcessEnv>, warn: (message: string) => void): Promise<OtlpForwarder> {
-  const { createOtlpForwarder } = await import("../telemetry/forward.ts");
-  return createOtlpForwarder(env, { warn });
+export function filesPath(path: string): string | null {
+  const under = (root: string) => (path === root ? "" : path.startsWith(`${root}/`) ? path.slice(root.length + 1) : null);
+  const named = (rest: string | null, top: string) => (rest === null || rest === "" || rest.split("/").some((part) => part === ".." || part === "") ? null : `${top}/${rest}`);
+  if (path.startsWith("/")) return named(under(SANDBOX_WORKSPACE), "workspace") ?? named(under(SANDBOX_HOME), "home");
+  return named(path.replace(/^\.\/+/u, ""), "workspace");
 }
 
 /**
- * Session filesystems, on the KubeClient, for a deployment that renders the `sessions`
- * template (../kube/config.ts); without one there is no such service, and callers offer
- * only folders. `stateDir` is alasio's state directory, under which each session's
- * harness directory lives. Sessions' telemetry is received, while the service lasts,
- * when alasio exports any (`env`'s standard OpenTelemetry variables) and
- * `ALASIO_TELEMETRY_RECEIVER_SERVICE` (and `_PORT`) say where.
+ * Session filesystems, through the sandbox gateway, for a deployment that gives alasio one;
+ * without one there is no such service, and callers offer only folders.
  */
 export class SessionSandboxes extends Context.Service<SessionSandboxes, {
   readonly volumes: {
-    /** A new session's Sandbox, made now so its volume is ready by its first turn. */
+    /** A new session's workspace, made now, with its internet, which alasio records. */
     readonly create: (volumeId: string, netMode?: NetMode) => Effect.Effect<{ readonly volumeId: string; readonly netMode: NetMode }, SessionError>;
     /**
-     * A new session `volumeId`, in `namespace` (the sessions' unless told), with the
-     * internet of the session `sourceVolumeId` and a clone of its files, as the module
-     * says; suspended, so its pod starts as it is first brought up. The source must be
-     * between turns, as it is suspended meanwhile, and one fork runs at a time: `permitted`
-     * is run as this one's turn comes, before it changes anything. A fork that fails leaves
-     * no session, and the source as it was.
+     * A new session `volumeId`, in the environment `environment` (alasio's own unless told),
+     * with the internet of the session `sourceVolumeId` and a clone of its files, as the
+     * module says.
      */
-    readonly fork: (
-      sourceVolumeId: string,
-      volumeId: string,
-      options?: { readonly namespace?: string | undefined; readonly permitted?: Effect.Effect<void> | undefined },
-    ) => Effect.Effect<{ readonly volumeId: string; readonly netMode: NetMode }, SessionError | SessionForkError>;
-    readonly destroy: (volumeId: string) => Effect.Effect<void, KubeApiError>;
-    /** The sessions that are forks, made or not, as their Sandboxes say. */
-    readonly forks: Effect.Effect<readonly string[], KubeApiError>;
+    readonly fork: (sourceVolumeId: string, volumeId: string, environment?: string) => Effect.Effect<{ readonly volumeId: string; readonly netMode: NetMode }, SessionError>;
+    /** Deletes the session's workspace, its snapshots with it: its binding let go first, saved whole where it is snapshotted. */
+    readonly destroy: (volumeId: string) => Effect.Effect<void, SessionError>;
+    /** The workspaces of alasio's environment there are, as the gateway lists them. */
+    readonly list: Effect.Effect<readonly string[], SessionError>;
   };
   /**
    * The directory in alasio a session's harness runs in: empty, the session's own, and
@@ -346,422 +135,96 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
    * is asked for; synchronous, as making a directory is.
    */
   readonly harnessDirectory: (volumeId: string) => string;
-  /** The session's pod, which agent-sandbox names after its Sandbox: where its turns work. */
-  readonly pod: (volumeId: string) => PodRef;
   /**
-   * Makes sure the session's Sandbox runs and bayma answers in it, resuming one that
-   * was suspended; one that is gone is made again, empty, with no internet.
+   * Brings the session up: bound by the gateway to a pod of its internet's pool, its bayma
+   * serving, and its bayma's endpoint, through the gateway; one a branch inherited forked from
+   * its parent's first.
    */
   readonly ensureSession: (volumeId: string) => Effect.Effect<{ readonly bayma: BaymaEndpoint }, SessionError>;
-  /**
-   * A file from the session as its agent sees it: read by the agent's own user in its
-   * container, relative to the workspace, so its path and symlinks reach only the
-   * session's files. `{ bytes }`, or `{ note }` saying why not.
-   */
-  readonly readFile: (volumeId: string, path: string, maxBytes: number) => Effect.Effect<FileRead, KubeApiError | KubeExecError | SessionFileError>;
-  /**
-   * Holds the session as one a turn runs on, for as long as the scope lasts: a session is
-   * released only once none has run on it, as no exec has, for its profile's
-   * `snapshots.releaseAfterSeconds`, so a turn that thinks between its tool calls finds
-   * its session where it left it.
-   */
-  readonly holding: (volumeId: string) => Effect.Effect<void, never, Scope.Scope>;
+  /** A file from the session, at `path` as it sees it (filesPath), of `maxBytes` at most: `{ bytes }`, or `{ note }` saying why not. */
+  readonly readFile: (volumeId: string, path: string, maxBytes: number) => Effect.Effect<FileRead, SessionFileError>;
+  /** Writes `bytes` into the session's file at `path` as it sees it (filesPath), its directories made. */
+  readonly writeFile: (volumeId: string, path: string, bytes: Uint8Array) => Effect.Effect<void, SessionFileError>;
 }>()("alasio/sandbox/SessionSandboxes") {
-  static readonly layer = (options: SessionSandboxesOptions): Layer.Layer<SessionSandboxes, Config.ConfigError, KubeClient> =>
-    Layer.effect(SessionSandboxes, makeSessionSandboxes(options));
+  static readonly layer = (options: SessionSandboxesOptions): Layer.Layer<SessionSandboxes> => Layer.succeed(SessionSandboxes, makeSessionSandboxes(options));
 }
 
-/**
- * How the sessions of `profile` are snapshotted (./snapshots.ts), where they are: with the
- * node agents, onto `profile`'s template and `previous`'s, the one `alasio up` carried
- * forward.
- */
-const sessionSnapshots = Effect.fnUntraced(function*(profile: SessionsProfile, previous: SessionsProfile | null): Effect.fn.Return<SessionSnapshots | null, Config.ConfigError, KubeClient> {
-  const { snapshots } = profile;
-  if (!snapshots) return null;
-  const agents = yield* makeNodeAgents(snapshots.agents);
-  const templates = { current: sessionTemplateHash(profile), previous: previous ? sessionTemplateHash(previous) : null };
-  return yield* makeSessionSnapshots({ profile, snapshots, agents, templates });
-});
+/** The session filesystems of `options`, as SessionSandboxes says. */
+export function makeSessionSandboxes({ gateway, stateDir, netModeOf, inherit, workspaces = makeGatewayWorkspaces(gateway) }: SessionSandboxesOptions): SessionSandboxes["Service"] {
+  /** The internet a session was made with, as alasio records it; none for one it records not, as a session is by default. */
+  const modeOf = (volumeId: string): Effect.Effect<NetMode> => Effect.map(netModeOf(volumeId), (mode) => mode ?? "none");
 
-const makeSessionSandboxes = Effect.fnUntraced(function*({
-  profile,
-  previous = null,
-  stateDir,
-  env = process.env,
-  createForwarder = loadForwarder,
-  resolve = lookup,
-  inherit,
-}: SessionSandboxesOptions) {
-  const kube = yield* KubeClient;
-  const snapshots = yield* sessionSnapshots(profile, previous);
-
-  /**
-   * The ids of the volumes JuiceFS's mount pods in `mountPodNamespace` serve `pod`, as
-   * their references to its target paths say. Looked up while the pod runs: the driver
-   * drops a pod's references as the pod goes.
-   */
-  const servedVolumes = (mountPodNamespace: string, pod: V1Pod): Effect.Effect<readonly string[], KubeApiError> =>
-    kube.list("v1", "Pod", mountPodNamespace, MOUNT_POD_SELECTOR).pipe(
-      // Pods, as the API server lists them.
-      Effect.map((mountPods) =>
-        [...new Set((mountPods as readonly V1Pod[]).filter((mountPod) => targetsOf(mountPod).some(ofPod(pod))).flatMap(({ metadata }) => metadata?.labels?.[MOUNT_POD_VOLUME_LABEL] ?? []))]
-      ),
-    );
-
-  /**
-   * Removes the mount pods of `volumes` that served the session's pod `pod` on its node,
-   * once that pod is gone, and serve no other pod: the driver then makes the volume's
-   * mount anew, in a mount pod of its own, as the session's next pod is started on it,
-   * rather than reusing the broken one or one made in its place on its mount point. What
-   * is removed, or that nothing is, is logged; a removal that fails is logged and leaves
-   * the session to resume as it is.
-   */
-  const removeMountPods = (mountPodNamespace: string, volumeId: string, pod: V1Pod, volumes: readonly string[]): Effect.Effect<void> =>
-    Effect.gen(function*() {
-      yield* kube.read("v1", "Pod", profile.namespace, volumeId).pipe(
-        Effect.repeat({ schedule: Schedule.spaced(POLL), while: (current) => current?.metadata?.uid === pod.metadata?.uid }),
-        Effect.timeoutOrElse({ duration: POD_GONE_TIMEOUT, orElse: () => Effect.fail(new SessionMountError({ message: `the pod of session ${volumeId} is not gone` })) }),
-      );
-      const listed = yield* Effect.forEach(volumes, (volume) => kube.list("v1", "Pod", mountPodNamespace, `${MOUNT_POD_SELECTOR},${MOUNT_POD_VOLUME_LABEL}=${volume}`));
-      // Pods, as the API server lists them.
-      const broken = (listed.flat() as V1Pod[]).filter((mountPod) =>
-        mountPod.spec?.nodeName === pod.spec?.nodeName && !mountPod.metadata?.deletionTimestamp && targetsOf(mountPod).every(ofPod(pod))
-      );
-      if (broken.length === 0) {
-        yield* Effect.logInfo(`found no JuiceFS mount pod of session ${volumeId}'s volume to remove; resuming it`);
-        return;
-      }
-      for (const { metadata } of broken) {
-        yield* kube.remove("v1", "Pod", mountPodNamespace, metadata?.name ?? "");
-        yield* Effect.logInfo(`removed JuiceFS mount pod ${mountPodNamespace}/${metadata?.name} of volume ${metadata?.labels?.[MOUNT_POD_VOLUME_LABEL]}, whose mount session ${volumeId} lost`);
-      }
-    }).pipe(
-      Effect.catch((error) => Effect.logWarning(`could not remove the JuiceFS mount pods of session ${volumeId}'s volume: ${error.message}; resuming it`)),
-    );
-
-  /**
-   * What is wrong with a running session's workspace, or null: gVisor does not follow
-   * mount propagation, so a JuiceFS mount lost and made anew under a session is never seen
-   * in it again, and only a new pod mends it, on a mount made anew (removeMountPods). One
-   * exec, reading the workspace's file system statistics in bayma's container; a look that
-   * cannot be taken is logged, and finds nothing.
-   */
-  const brokenMount = (volumeId: string): Effect.Effect<SandboxFault | null> =>
-    kube.exec(profile.namespace, volumeId, BAYMA_CONTAINER, ["env", "LC_ALL=C", "stat", "--file-system", "--format=%T", profile.workspaceDir]).pipe(
-      Effect.timeout(MOUNT_CHECK_TIMEOUT),
-      Effect.flatMap(({ exitCode, stderr }): Effect.Effect<SandboxFault | null> => {
-        if (exitCode === 0) return Effect.succeed(null);
-        const broken = BROKEN_MOUNT.exec(stderr)?.[0];
-        if (broken) return lostMount(volumeId, `workspace mount is broken (${broken})`);
-        return Effect.logWarning(`could not look at the workspace mount of session ${volumeId} (exit ${exitCode}): ${stderr.trim()}`).pipe(Effect.as(null));
-      }),
-      Effect.catch((error) => Effect.logWarning(`could not look at the workspace mount of session ${volumeId}: ${error.message}`).pipe(Effect.as(null))),
-    );
-
-  /**
-   * Has the session's bayma go on with the stop it would hold for a snapshot, before alasio
-   * ends its pod for its own reasons, or as alasio takes none of a pod ending: its bayma, as
-   * its pod runs it, where it holds a stop at all. What it cannot is said, and its stop is
-   * then held.
-   */
-  const stopNow = (sandbox: StoredSandbox): Effect.Effect<void> => {
-    const name = sandbox.metadata.name;
-    return Effect.gen(function*() {
-      // A core Pod, as the API server returns one.
-      const pod = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
-      const bayma = pod?.spec?.containers.find((container) => container.name === BAYMA_CONTAINER);
-      const command = bayma && holdsStop(bayma) ? stopHookOf(bayma) : null;
-      if (!command) return;
-      const { exitCode, stderr } = yield* kube.exec(profile.namespace, name, BAYMA_CONTAINER, command).pipe(Effect.timeout(STOP_NOW_TIMEOUT));
-      if (exitCode !== 0) yield* Effect.logWarning(`could not have session ${name}'s bayma stop at once (exit ${exitCode}): ${stderr.trim()}`);
-    }).pipe(Effect.catch((error) => Effect.logWarning(`could not have session ${name}'s bayma stop at once: ${error.message}`)));
-  };
-
-  /** The fault of a session whose mount is lost: `why`, and, where alasio's JuiceFS driver runs, its mount pods removed before it resumes. */
-  const lostMount = (volumeId: string, why: string): Effect.Effect<SandboxFault> => {
-    const mountPodNamespace = profile.mountPodNamespace;
-    if (!mountPodNamespace) return Effect.succeed({ why, beforeResume: Effect.void });
-    return Effect.gen(function*() {
-      // A core Pod, as the API server returns one.
-      const pod = (yield* kube.read("v1", "Pod", profile.namespace, volumeId)) as V1Pod | null;
-      const volumes = pod ? yield* servedVolumes(mountPodNamespace, pod) : [];
-      return { why, beforeResume: pod ? removeMountPods(mountPodNamespace, volumeId, pod, volumes) : Effect.void };
-    }).pipe(
-      Effect.catch((error) =>
-        Effect.logWarning(`could not find the JuiceFS mount pods of session ${volumeId}'s volume: ${error.message}`).pipe(Effect.as({ why, beforeResume: Effect.void }))
-      ),
-    );
-  };
-
-  const sandboxes = yield* makeSandboxes({
-    namespace: profile.namespace,
-    port: profile.port,
-    fault: brokenMount,
-    ...(snapshots ? { keeps: snapshots.keeps, restore: snapshots.restore, live: snapshots.live, stopNow, saveStopping: snapshots.saveStopping } : {}),
-  });
-  /** The turns running on each session, and when its last ended. */
-  const turns = new Map<string, { readonly running: number; readonly endedAt: number }>();
-  const lastTurn = (volumeId: string): number | null => {
-    const known = turns.get(volumeId);
-    return known === undefined ? null : known.running > 0 ? Infinity : known.endedAt;
-  };
-  if (snapshots) yield* snapshots.watch(sandboxes, lastTurn);
-  const telemetryEnv = sandboxBaymaTelemetryEnv(env);
-  const receiverPort = yield* ReceiverPort;
-  const receiverService = yield* ReceiverService;
-  const exportsTelemetry = Object.keys(telemetryEnv).length > 0 && Boolean(receiverService);
-  if (Object.keys(telemetryEnv).length > 0 && !receiverService) {
-    yield* Effect.logWarning("sessions' telemetry is not received: ALASIO_TELEMETRY_RECEIVER_SERVICE is not set");
-  }
-  // The forwarder's warnings, which it gives as it is made, logged here.
-  const runFork = yield* FiberSet.makeRuntime();
-  const warn = (message: string): void => {
-    runFork(Effect.logWarning(message).pipe(withLogScope("sandbox")));
-  };
-
-  /**
-   * The receiver, and the forwarder it exports through, started once they are first
-   * needed and kept until the service stops; a start that fails is tried again by the
-   * next session that needs them. Sessions keep running past alasio, and their exporters
-   * retry what they could not send meanwhile.
-   */
-  const receiving = yield* RcRef.make({
-    acquire: Effect.gen(function*() {
-      const forwarder = yield* Effect.acquireRelease(
-        Effect.tryPromise({ try: () => createForwarder(env, warn), catch: (cause) => new SessionTelemetryUnavailable({ cause }) }),
-        (forwarder) => Effect.sync(() => forwarder.close()),
-      );
-      yield* serveTelemetryReceiver({
-        port: receiverPort,
-        forwarder,
-        stampFor: (volumeId) => sandboxResource(volumeId, env),
-        authenticate: (token) =>
-          Option.match(Schema.decodeUnknownOption(SessionToken)(token), {
-            onNone: () => Effect.succeed(null),
-            onSome: ([volumeId]) =>
-              sandboxes.token(volumeId).pipe(
-                Effect.map((expected) => (expected && sameToken(token, expected) ? volumeId : null)),
-                Effect.orElseSucceed(() => null),
-              ),
-          }),
-      }).pipe(Effect.mapError((cause) => new SessionTelemetryUnavailable({ cause })));
-    }),
-    idleTimeToLive: Duration.infinity,
-  });
-  const receive = Effect.scoped(RcRef.get(receiving));
-
-  // Sessions that outlived the last alasio export as soon as this one is up.
-  if (exportsTelemetry) {
-    yield* receive.pipe(
-      Effect.catchTag("SessionTelemetryUnavailable", (error) => Effect.logWarning(`cannot receive sessions' telemetry: ${error.message}`)),
-      Effect.forkScoped,
-    );
-  }
-
-  /** Where a session's bayma exports, by IP since "none" has no DNS; null when alasio exports nothing. */
-  const telemetry: Effect.Effect<SessionTelemetry | null, SessionTelemetryUnavailable> = exportsTelemetry
-    ? receive.pipe(
-      Effect.andThen(Effect.tryPromise({ try: () => resolve(receiverService), catch: (cause) => new SessionTelemetryUnavailable({ cause }) })),
-      Effect.map(({ address }) => ({ endpoint: `http://${address}:${receiverPort}`, env: telemetryEnv })),
-    )
-    : Effect.succeed(null);
-
-  /** Makes the Sandbox, with what it is made from resolved first. */
-  const ensure = (volumeId: string, netMode: NetMode): Effect.Effect<BaymaEndpoint, SessionError> =>
-    telemetry.pipe(
-      Effect.map((telemetry) => sessionSandboxManifest({ volumeId, netMode, profile, telemetry })),
-      Effect.flatMap((made) => sandboxes.ensure(volumeId, () => made)),
-    );
-
-  /** The internet a session was made with, as its Sandbox says; none for one not made, as a session is by default. */
-  const netModeOf = (volumeId: string): Effect.Effect<NetMode, KubeApiError> =>
-    kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, volumeId).pipe(
-      Effect.map((sandbox) => (sandbox?.metadata?.labels?.[NET_MODE_LABEL] === "full" ? "full" : "none")),
-    );
-
-  /**
-   * A session there is no Sandbox of, forked from the parent's where alasio is a branch
-   * environment and the parent has it, and recorded as made.
-   */
-  const inherited = (volumeId: string): Effect.Effect<void, KubeApiError | SessionInheritError> =>
+  /** A session of the branch's its conversations inherited, not yet here: forked from the parent's, which has it, and recorded as made. */
+  const inherited = (volumeId: string): Effect.Effect<void, SessionError> =>
     inherit
-      ? sandboxes.exists(volumeId).pipe(
-        Effect.flatMap((exists) => (exists ? Effect.succeed(false) : inherit.fork(volumeId))),
-        Effect.flatMap((forked) =>
-          forked
-            ? netModeOf(volumeId).pipe(
-              Effect.flatMap((netMode) => inherit.record(volumeId, netMode)),
-              Effect.andThen(Effect.logInfo(`forked session ${volumeId} from the alasio this branch was branched from`)),
-            )
-            : Effect.void
+      ? workspaces.quota(volumeId).pipe(
+        Effect.flatMap((there) => (there ? Effect.succeed(null) : inherit.fork(volumeId))),
+        Effect.flatMap((netMode) =>
+          netMode === null
+            ? Effect.void
+            : inherit.record(volumeId, netMode).pipe(Effect.andThen(Effect.logInfo(`forked session ${volumeId} from the alasio this branch was branched from`)))
         ),
       )
       : Effect.void;
 
-  const readFile = Effect.fnUntraced(function*(volumeId: string, path: string, maxBytes: number): Effect.fn.Return<FileRead, KubeApiError | KubeExecError | SessionFileError> {
-    // A Sandbox, as the API server returns one.
-    const sandbox = (yield* kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, assertValidVolumeId(volumeId))) as Sandbox | null;
-    if (!sandbox || sandbox.spec?.operatingMode === "Suspended") return { note: "the session is not running" };
-    const script = 'cd "$3" || exit 3; f="$1"; [ -f "$f" ] || exit 3; s=$(stat -L -c %s -- "$f") || exit 3; [ "$s" -le "$2" ] || { printf %s "$s" >&2; exit 4; }; exec cat -- "$f"';
-    const { exitCode, stdout, stderr } = yield* kube.exec(
-      profile.namespace,
-      volumeId,
-      BAYMA_CONTAINER,
-      ["sh", "-c", script, "sh", path, String(maxBytes), profile.workspaceDir],
-      { maxBytes: maxBytes + 1 },
-    );
-    if (exitCode === 0) return { bytes: stdout };
-    if (exitCode === 3) return { note: "file not found" };
-    if (exitCode === 4) return { note: overLimitNote(Number(stderr.trim()), maxBytes) };
-    return yield* new SessionFileError({ message: `reading ${path} in session ${volumeId} failed (exit ${exitCode}): ${stderr.trim()}` });
-  });
-
-  /** Waits until the claim is bound to its volume, which its storage has provisioned. */
-  const awaitBound = (claim: ClaimRef): Effect.Effect<void, KubeApiError | SessionForkError> =>
-    kube.read("v1", "PersistentVolumeClaim", claim.namespace, claim.name).pipe(
-      // A core claim, as the API server returns one.
-      Effect.repeat({ schedule: Schedule.spaced(POLL), until: (made) => (made as V1PersistentVolumeClaim | null)?.status?.phase === "Bound" }),
-      Effect.timeoutOrElse({
-        duration: CLAIM_BOUND_TIMEOUT,
-        orElse: () => Effect.fail(new SessionForkError({ message: `the claim ${claim.namespace}/${claim.name} was not bound to a volume within ${Duration.toSeconds(CLAIM_BOUND_TIMEOUT)}s` })),
-      }),
-      Effect.asVoid,
-    );
-
-  /**
-   * Clones the claim `source` into `destination` in a Job of the installation's `job`,
-   * waiting until it has ended, and deletes the Job, with its pod, once it has, or once it
-   * is no longer waited for.
-   */
-  const runClone = (job: V1Job, source: ClaimRef, destination: ClaimRef): Effect.Effect<void, KubeApiError | SessionForkError> =>
-    Effect.acquireUseRelease(
-      kube.create(cloneJobManifest(job, source, destination)),
-      ({ metadata }) =>
-        kube.read("batch/v1", "Job", metadata?.namespace ?? "", metadata?.name ?? "").pipe(
-          // A Job, as the API server returns one.
-          Effect.map((read) => (read ? jobEnded(read as V1Job) : undefined)),
-          Effect.repeat({ schedule: Schedule.spaced(POLL), until: (ended) => ended !== undefined }),
-          Effect.flatMap((ended) =>
-            ended?.type === "Complete" ? Effect.void : Effect.fail(new SessionForkError({ message: `the clone of ${source.namespace}/${source.name} failed: ${ended?.message || ended?.reason}` }))
-          ),
-        ),
-      ({ metadata }) =>
-        kube.remove("batch/v1", "Job", metadata?.namespace ?? "", metadata?.name ?? "").pipe(
-          Effect.catch((error) => Effect.logWarning(`could not delete the clone's Job ${metadata?.namespace}/${metadata?.name}: ${error.message}`)),
-        ),
-    );
-
-  /**
-   * Suspends the running session: released into a snapshot where sessions are
-   * snapshotted, so it resumes whole, and suspended plain where they are not, or where it
-   * is not ready to be.
-   */
-  const suspendWhole = (volumeId: string): Effect.Effect<void, SandboxError> =>
-    snapshots
-      ? snapshots.release(sandboxes, volumeId).pipe(Effect.flatMap((released) => (released ? Effect.void : sandboxes.suspend(volumeId))))
-      : sandboxes.suspend(volumeId);
-
-  /**
-   * `use` run while the session, `running` as it is, is suspended: nothing in it runs, and
-   * it is resumed with `netMode` afterwards. A session that cannot be resumed now is left
-   * for its next bring-up to resume, saying why.
-   */
-  const whileSuspended = <A, E>(volumeId: string, netMode: NetMode, running: boolean, use: Effect.Effect<A, E>): Effect.Effect<A, E | SessionError> =>
-    running
-      ? Effect.acquireUseRelease(
-        suspendWhole(volumeId),
-        () => use,
-        () => ensure(volumeId, netMode).pipe(Effect.catch((error) => Effect.logWarning(`could not resume session ${volumeId}: ${error.message}; it resumes as it is next brought up`))),
-      )
-      : use;
-
-  // One fork at a time, so no source is resumed while another fork of it is cloned.
-  const forking = yield* Semaphore.make(1);
-
-  const fork = Effect.fnUntraced(function*(sourceVolumeId: string, volumeId: string, namespace: string): Effect.fn.Return<{ readonly volumeId: string; readonly netMode: NetMode }, SessionError | SessionForkError> {
-    const { clone } = profile;
-    if (!clone) return yield* new SessionForkError({ message: "this deployment's session filesystems cannot be cloned" });
-    // A Sandbox, as the API server returns one.
-    const source = (yield* kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, assertValidVolumeId(sourceVolumeId))) as Sandbox | null;
-    if (!source) return yield* new SessionForkError({ message: `there is no session ${sourceVolumeId} to fork` });
-    const netMode: NetMode = source.metadata.labels?.[NET_MODE_LABEL] === "full" ? "full" : "none";
-    const made = sessionSandboxManifest({ volumeId, netMode, profile, telemetry: yield* telemetry, namespace, operatingMode: "Suspended", forkedFrom: sourceVolumeId });
-    yield* kube.create(made);
-    const claimOf = (claimNamespace: string, sandbox: string): ClaimRef => ({ namespace: claimNamespace, name: claimName(clone.claimTemplate, sandbox) });
-    const destination = claimOf(namespace, volumeId);
-    yield* awaitBound(destination).pipe(
-      Effect.andThen(whileSuspended(
-        sourceVolumeId,
-        netMode,
-        source.spec.operatingMode !== "Suspended",
-        runClone(clone.job, claimOf(profile.namespace, sourceVolumeId), destination).pipe(
-          // Its files and its snapshot from the same moment, which it restores from as its source does, bound to it.
-          Effect.andThen(snapshots && namespace === profile.namespace ? snapshots.copy(sourceVolumeId, volumeId) : Effect.succeed(null)),
-          Effect.tap((snapshot) =>
-            snapshot === null
-              ? Effect.void
-              : kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, volumeId, { metadata: { annotations: snapshotBinding(snapshot) } })
-          ),
-        ),
-      )),
-      Effect.onError(() =>
-        kube.remove(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, volumeId).pipe(
-          Effect.catch((error) => Effect.logWarning(`could not delete the failed fork ${namespace}/${volumeId}: ${error.message}`)),
-          Effect.andThen(snapshots && namespace === profile.namespace ? snapshots.forget(volumeId) : Effect.void),
-        )
-      ),
-    );
-    yield* Effect.logInfo(`forked session ${sourceVolumeId} into ${namespace}/${volumeId} (${netMode} internet)`);
-    return { volumeId, netMode };
-  });
-
   return SessionSandboxes.of({
     volumes: {
       create: (volumeId, netMode = "none") =>
-        Effect.suspend(() => ensure(volumeId, netMode)).pipe(
+        Effect.suspend(() => workspaces.create(assertValidVolumeId(volumeId))).pipe(
           Effect.andThen(Effect.logInfo(`created session ${volumeId} (${netMode} internet)`)),
           Effect.as({ volumeId, netMode }),
           withLogScope("sandbox"),
         ),
-      fork: (sourceVolumeId, volumeId, { namespace = profile.namespace, permitted = Effect.void } = {}) =>
-        forking.withPermit(Effect.andThen(permitted, fork(sourceVolumeId, volumeId, namespace))).pipe(withLogScope("sandbox")),
-      // Its snapshot goes with it: an image of what it held.
+      fork: (sourceVolumeId, volumeId, environment = gateway.environment) =>
+        Effect.gen(function*() {
+          const netMode = yield* modeOf(assertValidVolumeId(sourceVolumeId));
+          yield* workspaces.fork(sourceVolumeId, { environment, workspace: assertValidVolumeId(volumeId) });
+          yield* Effect.logInfo(`forked session ${sourceVolumeId} into ${environment}'s ${volumeId} (${netMode} internet)`);
+          return { volumeId, netMode };
+        }).pipe(withLogScope("sandbox")),
       destroy: (volumeId) =>
-        Effect.suspend(() => sandboxes.remove(assertValidVolumeId(volumeId))).pipe(
-          Effect.andThen(snapshots ? snapshots.forget(volumeId) : Effect.void),
-        ),
-      forks: kube.list(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, `${WORKLOAD_LABEL}=session`).pipe(
-        Effect.map((listed) => listed.filter(({ metadata }) => metadata?.annotations?.[FORKED_FROM_ANNOTATION] !== undefined).map(({ metadata }) => metadata?.name ?? "")),
-      ),
+        Effect.gen(function*() {
+          const id = assertValidVolumeId(volumeId);
+          yield* workspaces.release(id, yield* modeOf(id));
+          yield* workspaces.remove(id);
+        }).pipe(withLogScope("sandbox")),
+      list: workspaces.list,
     },
 
-    pod: (volumeId) => ({ namespace: profile.namespace, name: assertValidVolumeId(volumeId) }),
     harnessDirectory: (volumeId) => {
       const directory = join(stateDir, "sessionfs", "workspaces", assertValidVolumeId(volumeId));
       mkdirSync(directory, { recursive: true });
       return directory;
     },
 
-    // Brought up as it was made: a pod of another template would be replaced by this one.
     ensureSession: (volumeId) =>
-      Effect.suspend(() => {
+      Effect.gen(function*() {
         const id = assertValidVolumeId(volumeId);
-        return inherited(id).pipe(Effect.andThen(netModeOf(id)), Effect.flatMap((netMode) => ensure(id, netMode)));
-      }).pipe(Effect.map((bayma) => ({ bayma }))),
+        yield* inherited(id);
+        const mode = yield* modeOf(id);
+        yield* workspaces.bind(id, mode);
+        return { bayma: yield* workspaces.endpoint(id, mode) };
+      }).pipe(withLogScope("sandbox")),
 
-    readFile,
-
-    holding: (volumeId) =>
-      Effect.acquireRelease(
-        Effect.sync(() => {
-          const known = turns.get(volumeId);
-          turns.set(volumeId, { running: (known?.running ?? 0) + 1, endedAt: known?.endedAt ?? 0 });
+    readFile: (volumeId, path, maxBytes) => {
+      const named = filesPath(path);
+      if (named === null) return Effect.succeed({ note: "not in the session's files" });
+      return workspaces.readFile(assertValidVolumeId(volumeId), named, maxBytes).pipe(
+        Effect.map((bytes): FileRead => ({ bytes: Buffer.from(bytes) })),
+        Effect.catch((error): Effect.Effect<FileRead, SessionFileError> => {
+          if (error.status === 404 || error.status === 403 || error.status === 400) return Effect.succeed({ note: "file not found" });
+          if (error.status === 413) return Effect.succeed({ note: `over Telegram's ${Math.round(maxBytes / (1024 * 1024))} MB limit` });
+          return Effect.fail(new SessionFileError({ message: `reading ${path} in session ${volumeId} failed: ${error.message}` }));
         }),
-        () =>
-          Effect.map(Clock.currentTimeMillis, (endedAt) => {
-            turns.set(volumeId, { running: (turns.get(volumeId)?.running ?? 1) - 1, endedAt });
-          }),
-      ),
+      );
+    },
+
+    writeFile: (volumeId, path, bytes) => {
+      const named = filesPath(path);
+      if (named === null) return Effect.fail(new SessionFileError({ message: `${path} is not in session ${volumeId}'s files` }));
+      return workspaces.writeFile(assertValidVolumeId(volumeId), named, bytes).pipe(
+        Effect.mapError((error) => new SessionFileError({ message: `writing ${path} into session ${volumeId} failed: ${error.message}` })),
+      );
+    },
   });
-}, withLogScope("sandbox"));
+}

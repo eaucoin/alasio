@@ -2,10 +2,12 @@
  * This machine made a node of k3s, as the cluster alasio makes on it outside Docker is
  * (./host.ts): k3s installed by its own install script, as the systemd service `k3s`, from
  * the binary cluster/node/pins.json pins, with each gVisor release it pins beside it, each
- * a runtime of containerd's (./k3s.ts), and set in /etc/rancher/k3s/config.yaml. The node
- * image (cluster/node) is built from the same pins, its gVisor releases where the machine
- * has them, and its k3s reads the same containerd files, so a node in Docker and one on a
- * machine run the same k3s and gVisor alike.
+ * a runtime of containerd's (./k3s.ts), and stargz-snapshotter's daemon, the service
+ * `stargz-snapshotter`, its snapshotter (./stargz.ts), and set in
+ * /etc/rancher/k3s/config.yaml. The node image (cluster/node) is built from the same pins,
+ * its gVisor releases where the machine has them, and its k3s reads the same containerd
+ * files, so a node in Docker and one on a machine run the same k3s, gVisor and snapshotter
+ * alike.
  *
  * Every download is checked against its pin as the operator downloads it, and again as
  * root before it is installed. What alasio installed, and the digest of the files that
@@ -19,21 +21,23 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { dirname } from "node:path";
-import { zstdDecompressSync } from "node:zlib";
+import { gunzipSync, zstdDecompressSync } from "node:zlib";
 
 import { Duration, Effect, FileSystem, Option, type PlatformError, Schedule, Schema } from "effect";
 
 import pins from "../../../cluster/node/pins.json" with { type: "json" };
 import { CONTAINERD, GVISOR_RELEASES, gvisorDirectory, gvisorHandler } from "../../../src/node-agent/names.ts";
 import { Registries } from "../config.ts";
-import { clusterKubeconfig, gvisorRuntimeFiles, KUBELET_ARGS, NotYet, registriesYaml } from "./k3s.ts";
+import { clusterKubeconfig, containerdFiles, KUBELET_ARGS, NotYet, registriesYaml } from "./k3s.ts";
 import { Machine, type RootCommandFailed, RootSystem, under } from "./machine.ts";
+import { STARGZ_CONFIG, STARGZ_EXECUTABLES, STARGZ_MEMORY_LIMIT, STARGZ_ROOT, STARGZ_SOCKET, stargzConfig } from "./stargz.ts";
 import { tarEntries } from "./tar.ts";
 
 /**
- * The k3s and gVisor a node runs, pinned: k3s's release, and the gVisor releases alasio
- * keeps, the current one first, which new sandboxes run, then at most the one before it,
- * which sandboxes snapshotted under it are restored with.
+ * The k3s, gVisor and stargz-snapshotter a node runs, pinned: k3s's release, the gVisor
+ * releases alasio keeps, the current one first, which new sandboxes run, then at most the
+ * one before it, which sandboxes snapshotted under it are restored with, and
+ * stargz-snapshotter's release.
  */
 export type NodePins = typeof pins;
 
@@ -59,13 +63,14 @@ export interface Download {
 
 /**
  * Where what `pins` pins is downloaded from: k3s's binary and install script from its
- * repository, and each gVisor release, by its name, from alasio's fork of it,
- * github.com/eaucoin/gvisor.
+ * repository, each gVisor release, by its name, from alasio's fork of it,
+ * github.com/eaucoin/gvisor, and stargz-snapshotter's from its repository.
  */
-export const downloads = ({ k3s, gvisor }: NodePins): {
+export const downloads = ({ k3s, gvisor, stargz }: NodePins): {
   readonly k3s: Download;
   readonly installScript: Download;
   readonly gvisor: ReadonlyMap<string, Download>;
+  readonly stargz: Download;
 } => ({
   k3s: { url: `https://github.com/k3s-io/k3s/releases/download/${encodeURIComponent(k3s.version)}/k3s`, algorithm: "sha256", digest: k3s.sha256 },
   installScript: { url: `https://raw.githubusercontent.com/k3s-io/k3s/${k3s.installScript.commit}/install.sh`, algorithm: "sha256", digest: k3s.installScript.sha256 },
@@ -73,6 +78,11 @@ export const downloads = ({ k3s, gvisor }: NodePins): {
     release,
     { url: `https://github.com/eaucoin/gvisor/releases/download/release-${encodeURIComponent(release)}/gvisor-x86_64.tar.zstd`, algorithm: "sha512", digest: sha512 },
   ])),
+  stargz: {
+    url: `https://github.com/containerd/stargz-snapshotter/releases/download/${encodeURIComponent(stargz.version)}/stargz-snapshotter-${encodeURIComponent(stargz.version)}-linux-amd64.tar.gz`,
+    algorithm: "sha256",
+    digest: stargz.sha256,
+  },
 });
 
 const BIN = "/usr/local/bin";
@@ -107,10 +117,19 @@ const SERVICE_CIDR = "10.43.0.0/16";
  * (cli/src/manifests/network-policies.ts).
  */
 export const CLUSTER_NETWORKS: readonly string[] = [CLUSTER_CIDR, SERVICE_CIDR];
-/** The directories JuiceFS's CSI driver keeps on the node, its mounts in them, which nothing of k3s's removes. */
-const JUICEFS = ["/var/lib/juicefs", "/run/juicefs-csi"] as const;
+/**
+ * The directory alasio's pods keep on the node, which nothing of k3s's removes: the workspaces'
+ * JuiceFS mount and its state and cache, its juicefs, and the attachments bound into sessions'
+ * pods, mounts all (cli/src/manifests/sandbox-gateway.ts, src/node-agent/names.ts).
+ */
+const NODE_DIRECTORY = "/var/lib/alasio";
 /** What alasio installs of a gVisor release, in the release's directory: runsc and its shim, and the binaries runsc runs beside it. */
 const GVISOR = ["runsc", "containerd-shim-runsc-v1", "gvisor-bin"] as const;
+/** stargz-snapshotter's daemon's systemd service, which k3s's wants, and with which it stops and restarts. */
+export const STARGZ_SERVICE = "stargz-snapshotter";
+const STARGZ_UNIT = `/etc/systemd/system/${STARGZ_SERVICE}.service`;
+/** What k3s's service is given beside its install script's: the daemon, started before it. */
+const K3S_DROP_IN = `/etc/systemd/system/${SERVICE}.service.d/alasio-stargz.conf`;
 
 /**
  * How a node is made: a server, its volumes in `storagePath`, pulling through
@@ -127,9 +146,11 @@ export type NodeConfig = typeof NodeConfig.Type;
 
 /**
  * The files that make k3s and its containerd a node of `config`, by their paths: k3s's
- * config.yaml, written as JSON, which YAML reads as it is, the registries, and the files
- * that make each gVisor release a runtime of containerd's, where systemd runs the
- * machine. Pure, for tests.
+ * config.yaml, written as JSON, which YAML reads as it is, its snapshotter none, as
+ * containerd's files say the daemon's; the registries; the files that make containerd pull
+ * through stargz-snapshotter's daemon and run each gVisor release, where systemd runs the
+ * machine; and the daemon's configuration and service, which k3s's service wants, and
+ * with which it stops and restarts. Pure, for tests.
  */
 export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
   const k3s = {
@@ -138,11 +159,35 @@ export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
     "service-cidr": SERVICE_CIDR,
     "default-local-storage-path": config.storagePath,
     "kubelet-arg": KUBELET_ARGS,
+    "snapshotter": "",
   };
   return new Map([
     [CONFIG_YAML, `# k3s as alasio's cluster runs it: alasio up writes this file.\n${JSON.stringify(k3s)}\n`],
     ...(config.registries ? [[REGISTRIES_YAML, `${registriesYaml(config.registries)}\n`] as const] : []),
-    ...gvisorRuntimeFiles(config.gvisor, { systemd: true }),
+    ...containerdFiles(config.gvisor, { systemd: true }),
+    [STARGZ_CONFIG, stargzConfig(config.registries)],
+    [STARGZ_UNIT, [
+      "# stargz-snapshotter's daemon, the snapshotter of k3s's containerd: alasio up writes this file.",
+      "[Unit]",
+      "Description=stargz-snapshotter's daemon, which k3s's containerd pulls images through",
+      `PartOf=${SERVICE}.service`,
+      "",
+      "[Service]",
+      "# Go's soft limit on its heap and its FUSE manager's (./stargz.ts's STARGZ_MEMORY_LIMIT).",
+      `Environment=GOMEMLIMIT=${STARGZ_MEMORY_LIMIT}`,
+      `ExecStart=${BIN}/containerd-stargz-grpc --address=${STARGZ_SOCKET} --config=${STARGZ_CONFIG} --root=${STARGZ_ROOT}`,
+      "Restart=always",
+      "# Its FUSE manager keeps the mounts of the images running pods read, through the daemon's restarts.",
+      "KillMode=process",
+      "",
+    ].join("\n")],
+    [K3S_DROP_IN, [
+      "# k3s's service, its images pulled through stargz-snapshotter's daemon: alasio up writes this file.",
+      "[Unit]",
+      `Wants=${STARGZ_SERVICE}.service`,
+      `After=${STARGZ_SERVICE}.service`,
+      "",
+    ].join("\n")],
   ]);
 }
 
@@ -155,13 +200,14 @@ export type Firewall = typeof Firewall.Type;
 
 /**
  * What alasio installed on this machine, as STAMP records it: k3s's version, gVisor's
- * releases, the digest of the files that configure the node, and the firewall it opened
- * the cluster's networks in, with those it added a rule for itself, which are all it
- * removes.
+ * releases, stargz-snapshotter's version, the digest of the files that configure the node,
+ * and the firewall it opened the cluster's networks in, with those it added a rule for
+ * itself, which are all it removes.
  */
 export const NodeStamp = Schema.Struct({
   k3s: Schema.optionalKey(Schema.String),
   gvisor: Schema.optionalKey(Schema.Array(Schema.String)),
+  stargz: Schema.optionalKey(Schema.String),
   config: Schema.optionalKey(Schema.String),
   firewall: Schema.optionalKey(Schema.Struct({ tool: Firewall, networks: Schema.Array(Schema.String), added: Schema.Array(Schema.String) })),
 });
@@ -235,6 +281,8 @@ export const ConfigureNode = Schema.TaggedStruct("ConfigureNode", { config: Node
 export const InstallGvisor = Schema.TaggedStruct("InstallGvisor", { release: Schema.String, archive: Artifact });
 /** The step that stops a gVisor release's sandboxes, and removes it. */
 export const RemoveGvisor = Schema.TaggedStruct("RemoveGvisor", { release: Schema.String });
+/** The step that installs stargz-snapshotter's daemon and its FUSE manager, from its release's archive, in place of `previous`. */
+export const InstallStargz = Schema.TaggedStruct("InstallStargz", { version: Schema.String, previous: Schema.optionalKey(Schema.String), archive: Artifact });
 /** The step that installs k3s's binary, with its install script, which makes its service, enables it, and starts it anew. */
 export const InstallK3s = Schema.TaggedStruct("InstallK3s", {
   version: Schema.String,
@@ -254,7 +302,7 @@ export const RemoveStorage = Schema.TaggedStruct("RemoveStorage", { path: Schema
 /** The step that reads k3s's kubeconfig, after restarting k3s, which renews its certificates, when `renew`. */
 export const ReadKubeconfig = Schema.TaggedStruct("ReadKubeconfig", { renew: Schema.Boolean });
 
-export const NodeStep = Schema.Union([OpenFirewall, ConfigureNode, InstallGvisor, RemoveGvisor, InstallK3s, StartK3s, StopK3s, RemoveNode, RemoveStorage, ReadKubeconfig]);
+export const NodeStep = Schema.Union([OpenFirewall, ConfigureNode, InstallGvisor, RemoveGvisor, InstallStargz, InstallK3s, StartK3s, StopK3s, RemoveNode, RemoveStorage, ReadKubeconfig]);
 export type NodeStep = typeof NodeStep.Type;
 
 /** What `step` does, as alasio says it will. */
@@ -266,12 +314,15 @@ export function describeNodeStep(step: NodeStep): string {
         "nothing else is opened, k3s's API server's port 6443 staying closed to the rest";
     case "ConfigureNode": {
       const runtimes = step.config.gvisor.map(gvisorHandler);
-      return `write k3s's configuration in ${K3S_ETC}, and its containerd's, with gVisor as the runtime${runtimes.length > 1 ? "s" : ""} ${runtimes.join(" and ")}, in ${CONTAINERD}`;
+      return `write k3s's configuration in ${K3S_ETC}, and its containerd's, with gVisor as the runtime${runtimes.length > 1 ? "s" : ""} ${runtimes.join(" and ")}, in ${CONTAINERD}, ` +
+        `and stargz-snapshotter's daemon's, as the service ${STARGZ_SERVICE}, which k3s's starts`;
     }
     case "InstallGvisor":
       return `install gVisor ${step.release} in ${gvisorDirectory(step.release)}: ${GVISOR.join(", ")}`;
     case "RemoveGvisor":
       return `stop the sandboxes of gVisor ${step.release}, which alasio no longer keeps, and remove ${gvisorDirectory(step.release)}`;
+    case "InstallStargz":
+      return `install stargz-snapshotter ${step.version}${replacing(step.previous)} in ${BIN}: ${STARGZ_EXECUTABLES.join(", ")}`;
     case "InstallK3s":
       return `install k3s ${step.version}${replacing(step.previous)} in ${BIN}, with its own install script, as the systemd service ${SERVICE}, enabled and started anew`;
     case "StartK3s":
@@ -282,8 +333,8 @@ export function describeNodeStep(step: NodeStep): string {
       return `stop the cluster's gVisor pods, ` +
         (step.firewall && step.firewall.added.length > 0 ? `remove the rules alasio added to ${step.firewall.tool} for ${step.firewall.added.join(" and ")}, ` : "") +
         `uninstall k3s with k3s-uninstall.sh, which removes its service, ${K3S_ETC} and its data, ` +
-        `and remove what it leaves, its node's password in ${NODE_PASSWORD}, gVisor's releases in ${GVISOR_RELEASES}, and JuiceFS's mounts and directories, ` +
-        JUICEFS.join(" and ");
+        `and remove what it leaves, its node's password in ${NODE_PASSWORD}, gVisor's releases in ${GVISOR_RELEASES}, stargz-snapshotter from ${BIN}, ` +
+        `stargz-snapshotter's service, its mounts and its images in ${STARGZ_ROOT} and its sockets in ${dirname(STARGZ_SOCKET)}, and alasio's mounts and directory, ${NODE_DIRECTORY}`;
     case "RemoveStorage":
       return `remove ${step.path}, the cluster's volumes`;
     case "ReadKubeconfig":
@@ -321,19 +372,20 @@ const killGvisor = Effect.fnUntraced(function*(releases: readonly string[]): Eff
 });
 
 /**
- * Unmounts what is mounted in JUICEFS, at once, as their FUSE clients are gone with the
- * cluster's pods, then removes them. A mount point's spaces and the like are octal
- * escapes in /proc/self/mounts.
+ * Unmounts what is mounted in `directories`, at once, as their FUSE servers are gone with
+ * the cluster's pods and stargz-snapshotter's FUSE manager, then removes them. A mount
+ * point's spaces and the like are octal escapes in /proc/self/mounts.
  */
-const removeJuicefs = Effect.gen(function*() {
-  const fs = yield* FileSystem.FileSystem;
-  const { root } = yield* Machine;
-  const table = under(root, "/proc/self/mounts");
-  const mounts = (yield* fs.exists(table)) ? (yield* fs.readFileString(table)).split("\n").map((line) => (line.split(" ")[1] ?? "").replace(/\\(\d{3})/gu, (_, code: string) => String.fromCharCode(Number.parseInt(code, 8)))) : [];
-  const inside = mounts.filter((point) => JUICEFS.some((directory) => point === directory || point.startsWith(`${directory}/`))).toSorted().toReversed();
-  for (const point of inside) yield* (yield* RootSystem).run("umount", ["--lazy", point]);
-  for (const directory of JUICEFS) yield* fs.remove(under(root, directory), { recursive: true, force: true });
-});
+const removeMounted = (directories: readonly string[]) =>
+  Effect.gen(function*() {
+    const fs = yield* FileSystem.FileSystem;
+    const { root } = yield* Machine;
+    const table = under(root, "/proc/self/mounts");
+    const mounts = (yield* fs.exists(table)) ? (yield* fs.readFileString(table)).split("\n").map((line) => (line.split(" ")[1] ?? "").replace(/\\(\d{3})/gu, (_, code: string) => String.fromCharCode(Number.parseInt(code, 8)))) : [];
+    const inside = mounts.filter((point) => directories.some((directory) => point === directory || point.startsWith(`${directory}/`))).toSorted().toReversed();
+    for (const point of inside) yield* (yield* RootSystem).run("umount", ["--lazy", point]);
+    for (const directory of directories) yield* fs.remove(under(root, directory), { recursive: true, force: true });
+  });
 
 /** What a firewall alasio opens the cluster's networks in is asked, and told, as root. */
 const FIREWALLS: Readonly<Record<Firewall, {
@@ -423,6 +475,8 @@ export const performNodeStep = (step: NodeStep): Effect.Effect<string | void, No
           const path = `${CONTAINERD}/${name}`;
           if (name.startsWith("runsc") && name.endsWith(".toml") && !files.has(path)) yield* fs.remove(under(root, path));
         }
+        // The daemon's service and k3s's drop-in, as systemd reads them anew.
+        yield* systemctl("daemon-reload");
         yield* recordStamp({ config: filesDigest(files) });
         return yield* Effect.logInfo(`wrote ${[...files.keys()].join(", ")}`);
       }
@@ -441,6 +495,14 @@ export const performNodeStep = (step: NodeStep): Effect.Effect<string | void, No
         yield* fs.remove(under(root, gvisorDirectory(step.release)), { recursive: true, force: true });
         yield* recordStamp({ gvisor: ((yield* readStamp)?.gvisor ?? []).filter((release) => release !== step.release) });
         return yield* Effect.logInfo(`removed gVisor ${step.release}`);
+      }
+      case "InstallStargz": {
+        const entries = tarEntries(gunzipSync(yield* verified(step.archive)));
+        for (const entry of entries.filter(({ name }) => STARGZ_EXECUTABLES.some((executable) => name === executable))) {
+          yield* writeFile(under(root, `${BIN}/${entry.name}`), entry.content, entry.mode);
+        }
+        yield* recordStamp({ stargz: step.version });
+        return yield* Effect.logInfo(`installed stargz-snapshotter ${step.version}`);
       }
       case "InstallK3s": {
         yield* writeFile(under(root, `${BIN}/k3s`), yield* verified(step.binary), 0o755);
@@ -474,17 +536,32 @@ export const performNodeStep = (step: NodeStep): Effect.Effect<string | void, No
         yield* killGvisor(yield* installedGvisor);
         if (step.firewall) yield* closeFirewall(step.firewall);
         if (yield* fs.exists(under(root, UNINSTALL))) yield* system.run(UNINSTALL, []);
-        yield* removeJuicefs;
+        // stargz-snapshotter's daemon stopped with k3s; its FUSE manager, which keeps its mounts, stops now.
+        yield* system.kill([`${BIN}/stargz-fuse-manager`]);
+        yield* removeMounted([NODE_DIRECTORY, STARGZ_ROOT]);
         // alasio's own, and the node's password, which k3s keeps and its uninstall script leaves.
-        for (const path of [GVISOR_RELEASES, CONFIG_YAML, REGISTRIES_YAML, STAMP, CONTAINERD, NODE_PASSWORD]) {
-          yield* fs.remove(under(root, path), { recursive: true, force: true });
-        }
+        const owned = [
+          GVISOR_RELEASES,
+          ...STARGZ_EXECUTABLES.map((name) => `${BIN}/${name}`),
+          CONFIG_YAML,
+          REGISTRIES_YAML,
+          STAMP,
+          CONTAINERD,
+          NODE_PASSWORD,
+          STARGZ_UNIT,
+          dirname(K3S_DROP_IN),
+          dirname(STARGZ_CONFIG),
+          // Its FUSE manager's socket among them: the daemon starts no manager where that is, and fails to reach one.
+          dirname(STARGZ_SOCKET),
+        ];
+        for (const path of owned) yield* fs.remove(under(root, path), { recursive: true, force: true });
+        yield* systemctl("daemon-reload");
         // What k3s's uninstall script leaves of the directories it made, and of alasio's, when it is empty.
         for (const path of [K3S_ETC, "/etc/rancher", "/var/lib/rancher/k3s", "/var/lib/rancher", dirname(GVISOR_RELEASES)]) {
           const at = under(root, path);
           if ((yield* fs.exists(at)) && (yield* fs.readDirectory(at)).length === 0) yield* fs.remove(at, { recursive: true });
         }
-        return yield* Effect.logInfo("removed k3s and gVisor");
+        return yield* Effect.logInfo("removed k3s, gVisor and stargz-snapshotter");
       }
       case "RemoveStorage":
         // A path of the operator's, which they made, as the rest of their own paths.

@@ -6,6 +6,7 @@ import {
   ALASIO_CODEX_REASONING_EFFORT,
   withAlasioCodexModelConfig,
 } from "../model.ts";
+import { TOKEN_TTL_MS } from "../../sandbox/gateway-client.ts";
 import type { CodexThreadConfig } from "../thread-config.ts";
 import type { AppServerNotifications } from "./notification-queue.ts";
 import type { AppServerParams, AppServerResult } from "./protocol.ts";
@@ -34,6 +35,14 @@ const LOGIN_MODELS_TIMEOUT = "10 seconds";
  * Sub-agent threads are left out.
  */
 const LISTED_SOURCE_KINDS: v2.ThreadSourceKind[] = ["cli", "vscode", "exec"];
+
+/**
+ * How long a thread alasio loaded keeps the config it was loaded with: an hour less than the
+ * bearer of its bayma in it is good for (its MCP servers' headers, which the app-server keeps
+ * as a thread is loaded), so a turn of it never reaches bayma with a bearer that lapsed. Past
+ * it, the thread's next turn loads it anew with the config that turn gives.
+ */
+export const THREAD_CONFIG_LIFE_MS = TOKEN_TTL_MS - 60 * 60_000;
 
 /** The app-server's paginated lists alasio reads whole, each a page of its items at a time. */
 type ListMethod = "thread/list" | "thread/turns/list" | "model/list" | "thread/backgroundTerminals/list";
@@ -175,12 +184,14 @@ export type AppServerApart = (work: Effect.Effect<void>) => Effect.Effect<Fiber.
 
 /**
  * A thread's work in the app-server `rpc` talks to, its turns followed by `notifications`;
- * what outlasts what asked for it run `apart`.
+ * what outlasts what asked for it run `apart`; a thread's config kept `configLifeMs` from its
+ * load (THREAD_CONFIG_LIFE_MS), as `notifications` record when each was loaded.
  */
 export function makeAppServerThreads(
   rpc: Pick<AppServerRpc, "start" | "request" | "stop" | "whenGone" | "running">,
   notifications: AppServerNotifications,
   apart: AppServerApart,
+  configLifeMs: number = THREAD_CONFIG_LIFE_MS,
 ): AppServerThreads {
   /** Every page of one of the app-server's paginated lists. */
   const listAll = Effect.fnUntraced(function*<M extends ListMethod>(method: M, params: AppServerParams<M>): Effect.fn.Return<AppServerResult<M>["data"][number][], AppServerRequestError> {
@@ -243,11 +254,21 @@ export function makeAppServerThreads(
     ensureThread: Effect.fnUntraced(function*({ threadId, threadKey, cwd, env, config }) {
       yield* rpc.start({ env, cwd });
       const startedAt = yield* Clock.currentTimeNanos;
-      const loaded = yield* rpc.request("thread/loaded/list", {});
-      if (Array.isArray(loaded?.data) && loaded.data.includes(threadId)) {
-        yield* Effect.logInfo(`thread already loaded thread=${threadId.slice(0, 8)} key=${JSON.stringify(threadKey)} ms=${yield* millisSince(startedAt)}`);
-        yield* notifications.recordThread(threadKey, threadId);
-        return threadId;
+      const listed = yield* rpc.request("thread/loaded/list", {});
+      if (Array.isArray(listed?.data) && listed.data.includes(threadId)) {
+        // One the app-server loaded unasked has its config's time counted from now, as it is recorded.
+        const now = yield* Clock.currentTimeMillis;
+        const fresh = now - ((yield* notifications.loadedAt(threadId)) ?? now) < configLifeMs;
+        // One whose turn runs, as a goal's, is left as it is: its next turn loads it anew.
+        if (fresh || (yield* notifications.currentTurnId(threadId))) {
+          yield* Effect.logInfo(`thread already loaded thread=${threadId.slice(0, 8)} key=${JSON.stringify(threadKey)} ms=${yield* millisSince(startedAt)}`);
+          yield* notifications.recordThread(threadKey, threadId);
+          return threadId;
+        }
+        // Its config as it was loaded about to lapse, its bayma's bearer among it: let go of, so
+        // the resume loads it anew with the config given now, its MCP servers connected afresh.
+        yield* rpc.request("thread/unsubscribe", { threadId });
+        yield* Effect.logInfo(`thread loaded anew, its config kept past its time thread=${threadId.slice(0, 8)} key=${JSON.stringify(threadKey)}`);
       }
       const response = yield* rpc.request("thread/resume", {
         threadId,
@@ -256,7 +277,7 @@ export function makeAppServerThreads(
       });
       const resumedId = response?.thread?.id ?? threadId;
       yield* Effect.logInfo(`thread resumed thread=${resumedId.slice(0, 8)} key=${JSON.stringify(threadKey)} turns=${response?.thread?.turns?.length ?? "?"} ms=${yield* millisSince(startedAt)}`);
-      yield* notifications.recordThread(threadKey, resumedId);
+      yield* notifications.recordLoad(threadKey, resumedId);
       return resumedId;
     }),
 
@@ -269,7 +290,7 @@ export function makeAppServerThreads(
         return yield* new ThreadIdMissing({ method: "thread/start" });
       }
       yield* Effect.logInfo(`thread started thread=${threadId.slice(0, 8)} key=${JSON.stringify(threadKey)} ms=${yield* millisSince(startedAt)}`);
-      yield* notifications.recordThread(threadKey, threadId);
+      yield* notifications.recordLoad(threadKey, threadId);
       return threadId;
     }),
 
@@ -287,7 +308,7 @@ export function makeAppServerThreads(
         return yield* new ThreadIdMissing({ method: "thread/fork" });
       }
       yield* Effect.logInfo(`thread forked thread=${forkedId.slice(0, 8)} from=${threadId.slice(0, 8)} before_turn=${beforeTurnId} key=${JSON.stringify(threadKey)} ms=${yield* millisSince(startedAt)}`);
-      yield* notifications.recordThread(threadKey, forkedId);
+      yield* notifications.recordLoad(threadKey, forkedId);
       return forkedId;
     }),
 

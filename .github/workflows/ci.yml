@@ -88,9 +88,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      # Pushes alasio's own images as eStargz (tooling/push-estargz.sh), which the clusters
+      # the end-to-end runs make pull lazily.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # All seven at once, each line said with its image's name, the node image with its pins
-      # (tooling/node-image.ts), and on alasio's, alasio-harness-stand-ins, which the end-to-end
-      # runs install (test/e2e/harness-stand-ins.Dockerfile); and the stand-ins again, as
+      # (tooling/node-image.ts), whole, as Docker runs it, and on alasio's,
+      # alasio-harness-stand-ins, which the end-to-end runs install
+      # (test/e2e/harness-stand-ins.Dockerfile); and the stand-ins again, as
       # alasio-harness-stand-ins-previous, on the published alasio image of the release the
       # upgrade shard upgrades from; the step fails if any did.
       - id: push
@@ -104,18 +108,21 @@ jobs:
           declare -A pids
           for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-log:neon/log" "alasio-collector:neon/collector" "alasio-webhook:webhook" "alasio-node:cluster/node" "alasio-harness-stand-ins-previous:test"; do
             name=${image%%:*}
-            args=()
-            [ "$name" != alasio-node ] || mapfile -t args < <(node tooling/node-image.ts)
-            [ "$name" != alasio-harness-stand-ins-previous ] ||
-              args=(--file test/e2e/harness-stand-ins.Dockerfile --build-arg "ALASIO=ghcr.io/eaucoin/alasio:$PREVIOUS")
             {
-              docker build "${args[@]}" --tag "$PUSH_TO/$name:e2e" --label "org.opencontainers.image.source=$SOURCE" "${image#*:}" &&
-                docker push "$PUSH_TO/$name:e2e" &&
-                if [ "$name" = alasio ]; then
-                  docker build --file test/e2e/harness-stand-ins.Dockerfile --build-arg "ALASIO=$PUSH_TO/alasio:e2e" \
-                    --tag "$PUSH_TO/alasio-harness-stand-ins:e2e" --label "org.opencontainers.image.source=$SOURCE" test &&
-                    docker push "$PUSH_TO/alasio-harness-stand-ins:e2e"
-                fi
+              if [ "$name" = alasio-node ]; then
+                mapfile -t args < <(node tooling/node-image.ts)
+                docker build "${args[@]}" --tag "$PUSH_TO/$name:e2e" --label "org.opencontainers.image.source=$SOURCE" "${image#*:}" &&
+                  docker push "$PUSH_TO/$name:e2e"
+              elif [ "$name" = alasio-harness-stand-ins-previous ]; then
+                tooling/push-estargz.sh "$PUSH_TO/$name:e2e" test --file test/e2e/harness-stand-ins.Dockerfile \
+                  --build-arg "ALASIO=ghcr.io/eaucoin/alasio:$PREVIOUS" --label "org.opencontainers.image.source=$SOURCE"
+              else
+                tooling/push-estargz.sh "$PUSH_TO/$name:e2e" "${image#*:}" --label "org.opencontainers.image.source=$SOURCE" &&
+                  if [ "$name" = alasio ]; then
+                    tooling/push-estargz.sh "$PUSH_TO/alasio-harness-stand-ins:e2e" test --file test/e2e/harness-stand-ins.Dockerfile \
+                      --build-arg "ALASIO=$PUSH_TO/alasio:e2e" --label "org.opencontainers.image.source=$SOURCE"
+                  fi
+              fi
             } 2>&1 | sed -u "s/^/$name: /" &
             pids[$name]=$!
           done

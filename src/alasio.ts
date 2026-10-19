@@ -17,14 +17,14 @@ import { ActiveTurns } from "./harness/active-turns.ts";
 import type { ClaudeQueryFactory } from "./harness/claude/runtime.ts";
 import { HarnessHost } from "./harness/host.ts";
 import { Harnesses } from "./harness/index.ts";
-import type { KubeTemplates } from "./kube/config.ts";
 import { BusyPods } from "./kube/busy.ts";
 import { KubeClient } from "./kube/client.ts";
 import { type FolderBayma, HostBayma } from "./mcp/bayma.ts";
 import { Mounts } from "./operator/mounts.ts";
 import type { StoreError } from "./persistence/sql.ts";
 import { Store } from "./persistence/store.ts";
-import { type Inheritance, SessionInheritError, SessionSandboxes } from "./sandbox/index.ts";
+import { makeGatewayWorkspaces } from "./sandbox/gateway-client.ts";
+import { type Inheritance, type NetMode, SessionInheritError, SessionSandboxes } from "./sandbox/index.ts";
 import { serveTelegram, type TelegramAppConfig, type TelegramAppError } from "./telegram/app.ts";
 import { Authorizer } from "./telegram/authorizer.ts";
 import { TelegramClient } from "./telegram/client.ts";
@@ -43,7 +43,6 @@ export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog" | "lakeW
   readonly stateSchema?: string | undefined;
   /** The harness host's role, which Neon has (../neon/harness.ts), granted its part of the state; none in a test without one. */
   readonly harnessRole?: string | undefined;
-  readonly kubeTemplates?: KubeTemplates | null | undefined;
   /** Stand-ins for a folder workspace's bayma and for Claude Code, in the harnesses alasio makes. */
   readonly folderBayma?: FolderBayma | undefined;
   readonly claudeQueryFactory?: ClaudeQueryFactory | undefined;
@@ -86,9 +85,10 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       folderBayma: options.folderBayma,
       claudeQueryFactory: options.claudeQueryFactory,
     })),
+    // After the session filesystems, which it writes a session's files into.
+    Layer.provideMerge(ReceivedFiles.layer(options)),
     Layer.provideMerge(Layer.mergeAll(
       Outbox.layer,
-      ReceivedFiles.layer(options),
       // Before Codex is first started, which is not before a turn needs it.
       options.keepCodexLogin ? Layer.effectDiscard(keepCodexLogin(codexHome())) : Layer.empty,
       workspaceServices(options),
@@ -103,37 +103,39 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
 }
 
 /**
- * The services of the workspaces the deployment's templates offer, each made only where
- * its template is rendered, on one KubeClient: session filesystems (SessionSandboxes)
- * and folder workspaces' bayma (HostBayma). They are not among AlasioServices, which are
- * always there; what uses them asks whether they are.
+ * The services of the workspaces the deployment offers, each made only where it offers them:
+ * session filesystems (SessionSandboxes), through the sandbox gateway it gives alasio, and
+ * folder workspaces' bayma (HostBayma), the gateway's folder instances, where it serves them.
+ * They are not among AlasioServices, which are always there; what uses them asks whether they are.
  */
-function workspaceServices({ kubeTemplates, stateDir, branch }: AlasioOptions): Layer.Layer<never, never, Store> {
-  const sessions = kubeTemplates?.sessions ?? null;
-  const host = kubeTemplates?.host ?? null;
-  if (!sessions && !host) return Layer.empty;
+function workspaceServices({ folders, sessionsGateway, stateDir, branch }: AlasioOptions): Layer.Layer<never, never, Store | TelegramClient> {
   return Layer.mergeAll(
-    // Settings the deployment gives wrongly stop alasio as it starts.
-    sessions
+    sessionsGateway
       ? Layer.unwrap(Effect.gen(function*() {
-        const inherit = branch ? inheritance(branch, yield* Store) : undefined;
-        return Layer.orDie(SessionSandboxes.layer({ profile: sessions, previous: kubeTemplates?.previousSessions ?? null, stateDir, inherit }));
+        const store = yield* Store;
+        const inherit = branch ? inheritance(branch, store) : undefined;
+        return SessionSandboxes.layer({ gateway: sessionsGateway, stateDir, netModeOf: netModeIn(store), inherit });
       }))
       : Layer.empty,
-    host ? HostBayma.layer(host) : Layer.empty,
-  ).pipe(Layer.provide(KubeClient.layer));
+    sessionsGateway && folders ? HostBayma.layer(makeGatewayWorkspaces(sessionsGateway).folders) : Layer.empty,
+  );
 }
 
+/** The internet each session filesystem was made with, as `store` records it; null for one it records not, or cannot read. */
+const netModeIn = (store: Store["Service"]) => (volumeId: string): Effect.Effect<NetMode | null> =>
+  store.listSessionWorkspaces.pipe(
+    Effect.map((workspaces) => workspaces.find((workspace) => workspace.volumeId === volumeId)?.netMode ?? null),
+    Effect.catch((error) => Effect.as(Effect.logWarning(`could not read the internet session ${volumeId} was made with: ${error.message}`), null)),
+  );
+
 /**
- * The turns running, which hold the pods they run in busy (./kube/busy.ts) where alasio
- * runs in Kubernetes, as the deployment's templates say it does, on a KubeClient of their
- * own: its own, and its workspaces', in the namespaces the templates say; elsewhere they
- * hold none.
+ * The turns running, which hold alasio's own pod busy (./kube/busy.ts) where alasio runs in
+ * Kubernetes, on a KubeClient of their own; elsewhere they hold none. The pods its workspaces
+ * run in are the gateway's, which holds each busy as it is bound.
  */
-function activeTurns({ kubeTemplates }: AlasioOptions): Layer.Layer<ActiveTurns> {
-  if (!kubeTemplates) return ActiveTurns.layer;
-  const namespaces = [kubeTemplates.sessions?.namespace, kubeTemplates.host?.namespace].filter((namespace) => namespace !== undefined);
-  return ActiveTurns.layer.pipe(Layer.provide(Layer.orDie(BusyPods.layer({ namespaces })).pipe(Layer.provide(KubeClient.layer))));
+function activeTurns({ inKubernetes }: AlasioOptions): Layer.Layer<ActiveTurns> {
+  if (!inKubernetes) return ActiveTurns.layer;
+  return ActiveTurns.layer.pipe(Layer.provide(Layer.orDie(BusyPods.layer({})).pipe(Layer.provide(KubeClient.layer))));
 }
 
 /**
@@ -175,8 +177,8 @@ function branchForks({ branchForkKeyFile }: AlasioOptions): Layer.Layer<never, n
  * from a Codex home of alasio's own; that one is not among AlasioServices, and what uses
  * it asks whether it is.
  */
-function codexServices({ kubeTemplates, stateDir }: AlasioOptions): Layer.Layer<CodexAppServer> {
-  return kubeTemplates?.sessions
+function codexServices({ sessionsGateway, stateDir }: AlasioOptions): Layer.Layer<CodexAppServer> {
+  return sessionsGateway
     ? Layer.merge(CodexAppServer.layer, SessionFsCodex.layer({ home: sessionFsCodexHome(stateDir) }))
     : CodexAppServer.layer;
 }

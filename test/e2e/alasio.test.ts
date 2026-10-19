@@ -23,24 +23,29 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1Node, V1PersistentVolume, V1Pod, V1Secret, V1StatefulSet, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1Secret, V1StatefulSet, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
+import type { KindName } from "../../cli/src/kube/api.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
-import { environmentAccess } from "../../cli/src/manifests/log.ts";
+import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { pageserverName } from "../../cli/src/manifests/neon.ts";
+import { environmentAccess } from "../../cli/src/manifests/log.ts";
 import { WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { neonStack } from "../../neon/test/stack.ts";
-import { SNAPSHOT_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
-import { POD_TEMPLATE_ANNOTATION, type Sandbox } from "../../src/kube/sandboxes.ts";
+import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
+import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
-import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES } from "../../src/node-agent/names.ts";
+import { NODE_PINS } from "../../cli/src/cluster/node.ts";
+import { goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
 import { ANSWER } from "./codex-stand-in.ts";
+import { bindBranchSession, bindInBranch, mainSandboxService, sandboxService, serviceLogs, servesBranch } from "./sandbox-service.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
+import type { FolderReplsRead, FolderReplsSet } from "./folder-repl.ts";
 import {
   AGENTS,
   alasio,
@@ -48,10 +53,14 @@ import {
   alasioOk,
   alasioOkWith,
   alasioRunning,
+  bindSession,
+  boundPodOf,
   CLUSTER,
   cutOver,
+  gatewayCall,
   inCutOverRecord,
   dumpClusterState,
+  ESTARGZ,
   type Forward,
   HOST_PROFILE,
   HOST_USER,
@@ -63,11 +72,14 @@ import {
   KEEP,
   kube,
   lakeQuery,
+  mainKeyToken,
+  mainToken,
   nodeAgents,
   onNode,
   OTHER_OPERATOR,
   paths,
   PREVIOUS,
+  recordSession,
   ref,
   RELEASE_AFTER_SECONDS,
   runCronJob,
@@ -88,6 +100,32 @@ import { workspaceStorage } from "./workspace-storage.ts";
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /** The host profile's namespace, where folder workspaces' bayma run. */
+/** A Sandbox of the release upgraded from, whose bayma agent-sandbox ran: its metadata alone is read. */
+interface Sandbox extends KubernetesObject {
+  readonly metadata: V1ObjectMeta;
+}
+/** The bayma the release upgraded from pins for folders: one other than this release's, whose instance refuses a snapshot this release's took. */
+const PREVIOUS_BAYMA = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.2", digest: "sha256:5a9a731371d083cae815c6f27c5eb0147e1e77fac400544285f8416047ba4109" } as const;
+/** A folder conversation's bayma's Sandbox of the release upgraded from: its pod template, which its bayma's state directory is an argument of. */
+interface FolderSandbox extends Sandbox {
+  readonly spec: { readonly podTemplate: V1PodTemplateSpec };
+}
+/**
+ * What of the release upgraded from's this release has no use for, which the cut-over
+ * removes, by kind, name and namespace: agent-sandbox's controller and CRD, alasio's templates
+ * of its Sandboxes, its role and network policy in the folders' namespace, and its admission
+ * policies of Sandboxes and their Secrets.
+ */
+const PREVIOUS_ONLY: readonly (readonly [KindName, string, string?])[] = [
+  ["CustomResourceDefinition", "sandboxes.agents.x-k8s.io"],
+  ["Deployment", "alasio-agent-sandbox-controller", "alasio"],
+  ["ClusterRole", "alasio-agent-sandbox-controller"],
+  ["ConfigMap", "alasio-sandbox-templates", "alasio"],
+  ["Role", "alasio", "alasio-host"],
+  ["NetworkPolicy", "bayma-from-alasio", "alasio-host"],
+  ["ValidatingAdmissionPolicy", "alasio-sandboxes"],
+  ["ValidatingAdmissionPolicy", "alasio-secrets"],
+];
 const HOST_NAMESPACE = "alasio-host";
 
 // What the cluster was doing is said as something of the run fails, while the cluster is
@@ -235,6 +273,9 @@ if (inShard("upgrade")) {
       branchTelegram?.close();
     });
 
+    /** The snapshots overlayfs holds on the node, one a line, as k3s's containerd lists them under its heading. */
+    const overlayfsSnapshots = async () => (await onNode("", "k3s ctr -n k8s.io snapshots --snapshotter overlayfs ls | tail -n +2")).trim();
+
     /** Whether the Deployment `name` of main's runs its replicas, ready. */
     const runs = async (name: string) => {
       const deployment = await kube.get<V1Deployment>(ref("Deployment", name, NAMESPACE));
@@ -245,8 +286,14 @@ if (inShard("upgrade")) {
     /** The files of the cut-over's record, which its markers are among. */
     const recorded = async () => (await inCutOverRecord("ls -1")).split("\n").filter(Boolean);
 
+    /** The folder chat's bayma's Sandbox, on the release before: its name, the key of its folder instance on this release, and its state directory. */
+    let folderBayma: { readonly name: string; readonly key: string; readonly state: string };
+    /** The folder chat's REPL sessions in its bayma. */
+    let folderRepls: FolderReplsSet;
+    /** Main's session workspace, made on the release before, then left for a folder. */
     let volumeId: string;
-    /** The folder mounted in the other chat, and what it holds. */
+    /** The folders mounted in main's chat and the other, which hold a file each. */
+    let main: string;
     let folder: string;
     let messages: number;
     /** Runs `sql` on the storage controller's database, neon-control's record among it: what psql printed. */
@@ -319,30 +366,90 @@ if (inShard("upgrade")) {
         },
       },
       {
-        seeds: "main at work, in a session workspace and in a folder, a file in each",
+        seeds: "main at work in a folder, a session workspace of its left from before it, and the folder chat at work in a folder of its own, a file in each folder",
         seed: async () => {
-          volumeId = await workInMain();
+          volumeId = await workInMainOnPrevious();
+          main = await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'");
+          assert.ok(main.startsWith(paths().home), `main mounts ${main}`);
           await tg.say("hello", FOLDER_CHAT);
           await tg.waitFor((call) => answered(call, FOLDER_CHAT));
           folder = await onDatabase(NAMESPACE, `select working_directory from state.conversations where id = 'telegram:${FOLDER_CHAT}'`);
           assert.ok(folder.startsWith(paths().home), `the folder chat mounts ${folder}`);
-          await onNode("", `printf %s 'written by main' >'${folder}/proof' && chown ${HOST_USER}:${HOST_USER} '${folder}/proof'`);
+          for (const each of [main, folder]) await onNode("", `printf %s 'written by main' >'${each}/proof' && chown ${HOST_USER}:${HOST_USER} '${each}/proof'`);
           messages = Number(await onDatabase(NAMESPACE, "select count(*) from state.messages"));
         },
-        keeps: "main's conversations go on where they were mounted, in the session workspace and in the folder, each file as it was",
+        keeps: "main's conversations go on in their folders, each file as it was",
         check: async () => {
           // What status says of the compute alone: the lake's intake, which KEDA scales from none as the log
           // fills, may be starting as it runs, not yet ready.
           assert.match((await alasio("status")).stdout, new RegExp(`^ {2}Deployment ${NAMESPACE}/alasio-neon-compute: awake`, "mu"));
-          assert.equal(await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'"), `sessionfs:${volumeId}`);
+          assert.equal(await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'"), main);
           assert.equal(await onDatabase(NAMESPACE, `select working_directory from state.conversations where id = 'telegram:${FOLDER_CHAT}'`), folder);
           await tg.say("again");
           await tg.waitFor((call) => answered(call));
-          assert.equal(await inSession(volumeId, 'process.stdout.write(require("fs").readFileSync("/workspace/proof", "utf8"))'), "written by main");
           await tg.say("again", FOLDER_CHAT);
           await tg.waitFor((call) => answered(call, FOLDER_CHAT));
-          assert.equal(readFileSync(`${folder}/proof`, "utf8"), "written by main");
+          for (const each of [main, folder]) assert.equal(readFileSync(`${each}/proof`, "utf8"), "written by main");
           assert.ok(Number(await onDatabase(NAMESPACE, "select count(*) from state.messages")) > messages);
+        },
+      },
+      {
+        seeds: "the folder conversation's REPL sessions live in its bayma's Sandbox, a Python one counting in a thread of its own, and a Bun one",
+        seed: async () => {
+          // Main's folder has a bayma of its own beside it.
+          const [sandbox, ...others] = (await kube.list<FolderSandbox>("Sandbox", { namespace: HOST_NAMESPACE })).filter(({ metadata }) =>
+            metadata.labels?.["alasio.dev/workload"] === "folder" && metadata.annotations?.["alasio.dev/conversation"] === `telegram:${FOLDER_CHAT}`
+          );
+          assert.ok(sandbox && others.length === 0, "the folder chat's bayma is one Sandbox");
+          const args = sandbox.spec.podTemplate.spec?.containers.find(({ name }) => name === "bayma")?.args ?? [];
+          folderBayma = {
+            name: sandbox.metadata.name ?? "",
+            key: `folder:${sandbox.spec.podTemplate.metadata?.labels?.["alasio.dev/harness"]}:${sandbox.metadata.annotations?.["alasio.dev/conversation"]}`,
+            state: args[args.indexOf("--state-dir") + 1] ?? "",
+          };
+          assert.match(folderBayma.key, new RegExp(`^folder:[a-z]+:telegram:${FOLDER_CHAT}$`, "u"));
+          const token = await kube.secret(HOST_NAMESPACE, `${folderBayma.name}-bayma-token`, "token");
+          folderRepls = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", `http://${folderBayma.name}.${HOST_NAMESPACE}.svc:7290/mcp`, token, `kept by ${folderBayma.name}`);
+          assert.ok(folderRepls.count > 0, JSON.stringify(folderRepls));
+        },
+        keeps: "the folder conversation's REPL sessions, each back whole, in the gateway's folder instance of the conversation, on its bayma's state directory, left in place, the bayma its configuration pins kept",
+        check: async () => {
+          const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), folderRepls.python, folderRepls.bun);
+          const kept = `kept by ${folderBayma.name}`;
+          if (seen.python.live !== kept || seen.bun.live !== kept) {
+            // What the folder instance's bayma said of the sessions it restored, where it cannot be read.
+            for (const pod of await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" })) {
+              const name = pod.metadata?.name ?? "";
+              console.error(`# ${HOST_NAMESPACE}/${name}, bound to ${pod.metadata?.annotations?.["alasio.dev/binding-key"]}:\n${await kube.logs(HOST_NAMESPACE, name, "bayma").catch((error: unknown) => String(error))}`);
+            }
+          }
+          // Whole, its thread counting on.
+          assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, kept, true, kept, kept], JSON.stringify(seen));
+          assert.ok((seen.python.count ?? 0) > folderRepls.count, `the count went on from ${folderRepls.count}: ${JSON.stringify(seen)}`);
+          for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
+          // The gateway's pod of the folder pool, bound to the conversation's key, on the state directory the Sandbox's bayma had.
+          const [instance, ...others] = (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" }))
+            .filter((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"] === folderBayma.key);
+          assert.ok(instance && others.length === 0, `the folder chat's folder instance is one pod, bound to ${folderBayma.key}`);
+          const args = instance?.spec?.containers.find(({ name }) => name === "bayma")?.args ?? [];
+          assert.equal(args[args.indexOf("--state-dir") + 1], folderBayma.state);
+        },
+      },
+      {
+        seeds: "agent-sandbox, the folder's bayma's Sandbox, alasio's templates of it, its role and network policy in the folders' namespace, its policies of Sandboxes and their Secrets, and the configuration sizing agent-sandbox",
+        seed: async () => {
+          const named = async (kind: KindName, name: string, namespace?: string) => (await kube.get(ref(kind, name, namespace))) !== null;
+          assert.deepEqual(await Promise.all(PREVIOUS_ONLY.map(([kind, name, namespace]) => named(kind, name, namespace))), PREVIOUS_ONLY.map(() => true));
+          assert.ok("agentSandbox" in (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: object }).install);
+        },
+        keeps: "none of them: the cut-over removed each, and the configuration's agent-sandbox, which the release runs none of",
+        check: async () => {
+          const named = async (kind: KindName, name: string, namespace?: string) => (await kube.get(ref(kind, name, namespace))) !== null;
+          assert.deepEqual(await Promise.all(PREVIOUS_ONLY.map(([kind, name, namespace]) => named(kind, name, namespace))), PREVIOUS_ONLY.map(() => false));
+          assert.ok(!("agentSandbox" in (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: object }).install));
+          // The folder's state directory, as its bayma left it, which the folder instance runs on:
+          // the host user's, as root sees it.
+          assert.equal((await onNode("", `[ -d '${folderBayma.state}' ] && echo kept || echo gone`)).trim(), "kept", folderBayma.state);
         },
       },
       {
@@ -372,8 +479,17 @@ if (inShard("upgrade")) {
           const after = await stackSecrets();
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
-          // And the harness host's role's password and verifier, which this release adds to the stack's.
-          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), ["harnessPassword", "verifiers.harness"]);
+          // And what this release adds to the stack's: the harness host's role's password and
+          // verifier; the sandbox gateway's keys, its principal on the log, and the password of
+          // its workspaces' quotas.
+          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), [
+            "gatewayBindingKey",
+            "gatewayCallerKey",
+            "harnessPassword",
+            "log.sandbox-gateway",
+            "valkeyQuotasPassword",
+            "verifiers.harness",
+          ]);
         },
       },
       {
@@ -457,6 +573,18 @@ if (inShard("upgrade")) {
         },
       },
       {
+        seeds: "the node's images, unpacked by overlayfs",
+        seed: async () => {
+          assert.notEqual(await overlayfsSnapshots(), "");
+        },
+        keeps: "none of them, every image pulled anew through stargz-snapshotter's daemon, alasio's own lazily",
+        check: async () => {
+          assert.equal(await overlayfsSnapshots(), "");
+          assert.match(await alasioOk("status"), /^ {2}service stargz-snapshotter, which k3s pulls images through: active$/mu);
+          if (ESTARGZ) assert.ok(await onRemoteSnapshot(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)), "alasio's pod runs on no remote snapshot");
+        },
+      },
+      {
         seeds: "a Telegram message kept twice, as two of main's alasios could keep it as they handed over",
         seed: async () => {
           // The operator's first, which nothing of the run reads again.
@@ -486,25 +614,24 @@ if (inShard("upgrade")) {
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
 
-    /**
-     * Main's session's REPL, live as the session is released, and the snapshot it is last
-     * released into on PREVIOUS: each turn the tests have main answer before the upgrade
-     * restores the session, which is released again into a snapshot of its own.
-     */
-    let releasedRepl: string;
-    let releasedAs: string;
-
-    /** Waits for main's session, its turn answered, to be released into a snapshot, which it takes as the one the upgrade is to restore. */
-    const released = async () => {
-      await untilReleased(volumeId, Date.now());
-      releasedAs = (await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS)))?.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? "";
-      assert.ok(releasedAs, `the session ${volumeId} was released into no snapshot`);
-      assert.equal((await snapshotOf(volumeId))?.snapshot, releasedAs);
-    };
-
-    test(`on ${PREVIOUS}: main's session released into a snapshot, a REPL live in it`, { timeout: 30 * 60_000 }, async () => {
-      ({ sessionId: releasedRepl } = await repl.set(volumeId, `released by ${volumeId}`));
-      await released();
+    // A session workspace another release made is one this release runs no session on and
+    // moves nothing of, so the cut-over refuses while one is left, before it changes anything.
+    test(`on ${PREVIOUS}: main's session workspace, which the cut-over refuses to go past, before it changes anything, naming it, until it is deleted`, { timeout: 30 * 60_000 }, async () => {
+      const generation = await alasioGeneration();
+      const claims = (await kube.list<KubernetesObject>("PersistentVolumeClaim", { namespace: SESSIONS })).map(({ metadata }) => metadata?.name ?? "");
+      assert.ok(claims.length > 0, "main's session workspace has its claim");
+      const refused = await cutOver();
+      assert.notEqual(refused.code, 0, refused.stdout);
+      assert.match(refused.stderr, new RegExp(`FAILED: ${SESSIONS} holds session workspaces of ${(PREVIOUS ?? "").replaceAll(".", "\\.")}'s[^\\n]*kubectl -n ${SESSIONS} delete sandbox\\.agents\\.x-k8s\\.io/${volumeId}`, "u"));
+      for (const claim of claims) assert.ok(refused.stderr.includes(`kubectl -n ${SESSIONS} delete persistentvolumeclaim/${claim}`), refused.stderr);
+      assert.doesNotMatch(refused.stderr, /checking that the upgrade can run|upgrading, from the cut-over/u);
+      assert.ok(!(await recorded()).includes("point-of-no-return"));
+      assert.equal(await alasioGeneration(), generation);
+      // Deleted as the refusal says, its files with it.
+      await kube.remove(ref("Sandbox", volumeId, SESSIONS));
+      for (const claim of claims) await kube.remove(ref("PersistentVolumeClaim", claim, SESSIONS));
+      await until("main's session workspace gone", async () =>
+        (await kube.list("PersistentVolumeClaim", { namespace: SESSIONS })).length === 0 && (await kube.list("Sandbox", { namespace: SESSIONS })).length === 0 ? true : undefined, 300_000);
     });
 
     // A branch environment another release made does not run on what an upgrade changes,
@@ -530,8 +657,10 @@ if (inShard("upgrade")) {
       const generation = await alasioGeneration();
       const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
       assert.notEqual(failed.code, 0, failed.stdout);
-      assert.match(failed.stderr, /deleting the log's StatefulSet, its pod and claim kept[^]*checking that the upgrade can run [^\n]*\n[^]*FAILED: a failure injected before the point of no return\n[^\n]* making the log's StatefulSet again, as [^\n]* had it\n$/u);
+      assert.match(failed.stderr, /deleting the log's StatefulSet, its pod and claim kept[^]*checking that the upgrade can run [^\n]*\n[^]*FAILED: a failure injected before the point of no return\n[^\n]* making the log's StatefulSet again, as [^\n]* had it\n[^\n]* putting install\.agentSandbox back in [^\n]*, as [^\n]* had it\n$/u);
       assert.ok(!(await recorded()).includes("point-of-no-return"));
+      // The configuration as the release before reads it, its agent-sandbox's sizing put back.
+      assert.ok("agentSandbox" in (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: object }).install);
       // Made again as the release before had it, its pod and claim taken back as they were.
       const [statefulSet, pod, claim] = await logHeld();
       assert.ok(statefulSet && statefulSet !== logBefore[0], "the log's StatefulSet is not made again");
@@ -547,8 +676,6 @@ if (inShard("upgrade")) {
         console.error(`# the log's pod's restarts: ${JSON.stringify(restarts)}\n# its first lines:\n${said.slice(0, 60).join("\n")}\n# its last:\n${said.slice(-40).join("\n")}`);
         throw error;
       });
-      // The last turn before the upgrade, whose session the release before releases again.
-      await released();
     });
 
     test(`the cut-over from ${PREVIOUS}, failing past its point of no return, before the upgrade, goes on with it when run again, its checks not run again`, { timeout: 60 * 60_000 }, async () => {
@@ -571,21 +698,32 @@ if (inShard("upgrade")) {
       const again = await cutOver();
       assert.equal(again.code, 0, `${again.stdout}${again.stderr}`);
       assert.doesNotMatch(again.stderr, /checking that|upgrading, from the cut-over begun at /u);
-      assert.match(again.stderr, /upgraded at \S+\n[^\n]* through\n$/u);
+      assert.doesNotMatch(again.stderr, /stopping k3s, to remove the node's images/u);
+      assert.match(again.stderr, /upgraded at \S+\n[^\n]* removing what of [^\n]* this release has no use for[^\n]*\n[^\n]* through\n$/u);
       assert.equal(await alasioGeneration(), generation);
       upgraded = Date.now();
     });
 
-    test(`upgraded: main's session restored from the snapshot it was released into on ${PREVIOUS}, with its REPL whole`, { timeout: 30 * 60_000 }, async () => {
-      assert.equal((await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS)))?.metadata.annotations?.[SNAPSHOT_ANNOTATION], releasedAs);
-      await tg.say("from the snapshot");
-      await tg.waitFor((call) => answered(call));
-      const seen = await repl.read(volumeId, releasedRepl);
-      assert.deepEqual([seen.live, seen.checkpointed], [`released by ${volumeId}`, `released by ${volumeId}`]);
-      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
-    });
-
     for (const { keeps, check } of scenarios) test(`upgraded: ${keeps}`, check);
+
+    // A later bump of the folders' bayma, a release of its own: a snapshot holds its bayma's
+    // version, which another refuses, so the folder's REPLs come back from their checkpoints.
+    test("upgraded: the folders' bayma changed and the folder's instance restarted, its REPLs come back from their checkpoints, what those keep intact", { timeout: 30 * 60_000 }, async () => {
+      const { configFile } = paths();
+      const config = JSON.parse(readFileSync(configFile, "utf8"));
+      config.install.host = { ...config.install.host, baymaImage: PREVIOUS_BAYMA };
+      writeFileSync(configFile, JSON.stringify(config));
+      await alasioOk("up", "--timeout", "20m");
+      const conversation = folderBayma.key.slice(folderBayma.key.indexOf(":", "folder:".length) + 1);
+      assert.match(await alasioOk("folder", "restart", conversation), /its folder instance of [^\n]+ is let go, its REPL sessions saved, its failed binds forgotten; the next message makes it anew/u);
+      const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), folderRepls.python, folderRepls.bun);
+      const kept = `kept by ${folderBayma.name}`;
+      assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [null, kept, false, null, kept], JSON.stringify(seen));
+      for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+      const instance = (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" }))
+        .find((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"] === folderBayma.key);
+      assert.match(instance?.spec?.containers.find(({ name }) => name === "bayma")?.image ?? "", new RegExp(`@${PREVIOUS_BAYMA.digest}$`, "u"));
+    });
   });
 }
 
@@ -593,11 +731,14 @@ describe("alasio's command line, on the alasio it installed", () => {
   test("status says the cluster's nodes run, and each of alasio's workloads is ready", async () => {
     const said = await alasioOk("status");
     if (TARGET === "host") {
-      assert.match(said, /^k3s v\S+ on this machine, with gVisor \S+( and \S+)?:\n {2}service k3s: active, enabled\n {2}node \S+: ready\n/u);
+      assert.match(
+        said,
+        /^k3s v\S+ on this machine, with gVisor \S+( and \S+)?, stargz-snapshotter v\S+:\n {2}service k3s: active, enabled\n {2}service stargz-snapshotter, which k3s pulls images through: active\n {2}node \S+: ready\n/u,
+      );
     } else {
       assert.match(said, new RegExp(`^cluster ${CLUSTER}, in Docker `, "u"));
       const nodes = [`${CLUSTER}-server-0`, ...Array.from({ length: AGENTS }, (_, index) => `${CLUSTER}-agent-${index}`)];
-      for (const node of nodes) assert.ok(said.includes(`\n  ${node}: running\n`), said);
+      for (const node of nodes) assert.ok(said.includes(`\n  ${node}: running\n    stargz-snapshotter's daemon, which k3s pulls images through: running\n`), said);
     }
     assert.ok(said.includes(`  Deployment ${NAMESPACE}/${RELEASE}: ready\n`), said);
     assert.ok(said.includes(`  StatefulSet ${NAMESPACE}/${RELEASE}-neon-pageserver: ready\n`), said);
@@ -627,7 +768,7 @@ let telegram: Forward | undefined;
 let sink: Forward | undefined;
 let tg: ReturnType<typeof operator>;
 
-/** Creates a session filesystem through /workspace, as the operator does: its volume id. */
+/** Creates a session filesystem through /workspace, as the operator does, and binds it through the gateway, as its first turn would: its volume id. */
 async function newSession(net: NetMode) {
   await tg.calls();
   await tg.say("/workspace");
@@ -636,7 +777,18 @@ async function newSession(net: NetMode) {
   const created = await tg.waitFor((call) => /Created and mounted session workspace/u.test(call.payload.text ?? ""));
   const volumeId = /fs-[0-9a-f]+/u.exec(created.payload.text ?? "")?.[0];
   assert.ok(volumeId, `alasio named no workspace: ${created.payload.text}`);
+  recordSession(volumeId, net);
+  await bindSession(volumeId);
   return volumeId;
+}
+
+/** The pod main's session `volumeId` is bound to now, which there must be. */
+async function sessionPod(volumeId: string): Promise<V1Pod> {
+  const bound = await boundPodOf(volumeId);
+  assert.ok(bound, `no pod is bound to the session ${volumeId}`);
+  const pod = await kube.get<V1Pod>(ref("Pod", bound.name, SESSIONS));
+  assert.ok(pod, `the pod ${bound.name} of the session ${volumeId} is gone`);
+  return pod;
 }
 
 const probe = (target: string) => `fetch(${JSON.stringify(target)},{signal:AbortSignal.timeout(5000)}).then(r=>console.log("open"),e=>console.log("blocked"))`;
@@ -665,89 +817,145 @@ if (inShard("sessions")) {
       telegram?.close();
     });
 
-    test("a new empty workspace without internet is a session of its own, confined", async () => {
+    test("a new empty workspace without internet is a session of its own, in a pool's pod, confined", async () => {
       none = await newSession("none");
-      const pod = await kube.get<V1Pod>(ref("Pod", none, SESSIONS));
-      if (pod?.spec?.runtimeClassName === "gvisor") assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/version","utf8"))'), /gvisor/u);
+      const pod = await sessionPod(none);
+      assert.equal(pod.metadata?.labels?.["alasio.dev/pool"], "sandboxes-none");
+      if (pod.spec?.runtimeClassName === "gvisor") assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/version","utf8"))'), /gvisor/u);
       await assertNoInternet(none);
       assert.match(await inSession(none, 'console.log(require("fs").existsSync("/var/run/secrets/kubernetes.io/serviceaccount"))'), /false/u);
-      const gate = (await kube.get<V1Pod>(ref("Pod", none, SESSIONS)))?.status?.initContainerStatuses?.find(({ name }) => name === "egress-gate");
-      assert.equal(gate?.state?.terminated?.exitCode, 0);
+    });
+
+    test("runs each of alasio's images on remote snapshots, the first session's pulled lazily in seconds", { skip: !ESTARGZ && "the run's own images are built whole" }, async () => {
+      const session = await sessionPod(none);
+      const sessionName = session.metadata?.name ?? "";
+      const pods: [string, string][] = [
+        [NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)],
+        [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("lake-query"))],
+        [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("grafana"))],
+        [SESSIONS, sessionName],
+      ];
+      for (const [namespace, name] of pods) assert.ok(await onRemoteSnapshot(namespace, name), `${namespace}/${name} runs on no remote snapshot`);
+      // Its FUSE manager under Go's soft memory limit, inherited from the daemon.
+      const node = session.spec?.nodeName ?? "";
+      const limits = await onNode(node, `for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = stargz-fuse-man ] && tr '\\0' '\\n' <"$p/environ" | grep '^GOMEMLIMIT='; done; true`);
+      assert.match(limits, /^GOMEMLIMIT=128MiB$/mu);
+      // The agent's image was on no node before the gateway's pools first ran a pod there, which
+      // the session's may not be, its pool's pods made ahead: kubelet says how long each pull took.
+      const events = await kube.list<CoreV1Event>("Event", { namespace: SESSIONS, fieldSelector: "reason=Pulled" });
+      const pulls = events.flatMap(({ message }) => /^Successfully pulled image "[^"]*alasio-agent[^"]*" in (\S+) /u.exec(message ?? "")?.[1] ?? []);
+      assert.ok(pulls.length > 0, `kubelet said nothing of pulling the agent's image: ${events.map(({ message }) => message).join("; ")}`);
+      console.error(`# the agent's image, on no node before, pulled lazily in ${pulls.map(goSeconds).join(", ")} s`);
+      // Whole, it took 44 to 58 s on a runner; lazily, 2 to 4 s, alone. Its pools' pods pull it as
+      // alasio comes up, beside every other image of alasio's, which some pulls wait behind.
+      const fastest = Math.min(...pulls.map(goSeconds));
+      assert.ok(fastest < 30, `the agent's image took ${pulls.join(", ")} to pull`);
     });
 
     test("a new workspace with internet reaches the internet and nothing private", async () => {
       full = await newSession("full");
+      assert.equal((await sessionPod(full)).metadata?.labels?.["alasio.dev/pool"], "sandboxes-full");
       assert.equal((await inSession(full, probe("https://example.com"))).trim(), "open");
       assert.equal((await inSession(full, tcp("process.env.KUBERNETES_SERVICE_HOST", 443))).trim(), "blocked");
-      const other = (await kube.get<V1Pod>(ref("Pod", none, SESSIONS)))?.status?.podIP;
+      const other = (await sessionPod(none)).status?.podIP;
       assert.ok(other, `the session ${none} has no address`);
       assert.equal((await inSession(full, probe(`http://${other}:7290/mcp`))).trim(), "blocked");
-      assert.match(await inSession(full, `require("dns").promises.lookup("${none}.${SESSIONS}.svc.cluster.local").then(()=>console.log("resolved"),()=>console.log("unresolved"))`), /unresolved/u);
+      assert.match(await inSession(full, `require("dns").promises.lookup("${GATEWAY}.${NAMESPACE}.svc.cluster.local").then(()=>console.log("resolved"),()=>console.log("unresolved"))`), /unresolved/u);
     });
 
-    test("a session's bayma answers alasio alone, and only with the session's token", async () => {
-      const url = `http://${none}.${SESSIONS}.svc.cluster.local:7290/mcp`;
-      const token = await kube.secret(SESSIONS, `${none}-bayma-token`, "token");
-      const fromAlasio = async (headers: string[]) => (await inAlasioContainer(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", ...headers, url])).trim();
-      assert.equal(await fromAlasio([]), "401");
-      assert.equal(await fromAlasio(["-H", "Authorization: Bearer wrong"]), "401");
-      assert.equal(await fromAlasio(["-H", `Authorization: Bearer ${token}`]), "400");
+    test("a session's bayma answers the gateway alone, which passes it a request only with a token of its own environment's key", async () => {
+      const gateway = `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`;
+      const status = async (url: string, headers: string[]) => (await inAlasioContainer(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", ...headers, url])).trim();
+      assert.equal(await status(gateway, []), "401");
+      assert.equal(await status(gateway, ["-H", "Authorization: Bearer wrong"]), "401");
+      // bayma's answer, through the gateway, to what is no MCP session's.
+      assert.equal(await status(gateway, ["-H", `Authorization: Bearer ${await mainToken(none)}`]), "400");
+      // Not alasio, which reaches the gateway alone, nor anything else.
+      const address = (await sessionPod(none)).status?.podIP;
+      assert.ok(address, `the session ${none} has no address`);
+      assert.equal((await inAlasioContainer(["node", "-e", tcp(JSON.stringify(address), 7290)])).trim(), "blocked");
       const stub = await kube.runningPod(STAND_INS, TELEGRAM.name);
-      const fromStub = (await kube.execOk(STAND_INS, stub, ["node", "-e", probe(url)], { container: TELEGRAM.container })).trim();
-      assert.equal(fromStub, "blocked");
+      for (const url of [gateway, `http://${address}:7290/mcp`]) assert.equal((await kube.execOk(STAND_INS, stub, ["node", "-e", probe(url)], { container: TELEGRAM.container })).trim(), "blocked", url);
     });
 
-    test("alasio reads a session's files as its agent, a suspended session resumes with them, and one recorded of another pod template is moved onto the current one with them", async () => {
+    test("alasio reaches a session's bayma and reads its files through the gateway, none outside them, and a session released is read still and brought up again with them", async () => {
       const seen = await roundtrip(none);
       assert.equal(seen.exec, '"written"');
       assert.match(seen.read ?? "", /^hello from /u);
       assert.equal(seen.missing, "file not found");
-      assert.equal(seen.suspendedPod, "gone");
-      assert.equal(seen.whileSuspended, "the session is not running");
-      assert.equal(seen.afterResume, seen.read);
-      assert.equal(seen.execAfterResume, JSON.stringify(seen.read));
-      assert.equal(seen.podReplaced, true);
-      assert.equal(seen.execAfterMove, JSON.stringify(seen.read));
+      assert.equal(seen.outside, "not in the session's files");
+      assert.equal(seen.whileReleased, seen.read);
+      assert.equal(seen.execAfterBind, JSON.stringify(seen.read));
     });
 
-    test("a folder conversation's bayma works on the machine as the operator, in their home", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
+    test("a folder conversation's bayma is its instance, bound through the gateway, working on the machine as the operator, in their home", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
       const { home } = paths();
-      const { url, seen } = await inAlasio<FolderBaymaSeen>("./folder-bayma.ts");
-      assert.match(url, /^http:\/\/bayma-[0-9a-f]{20}\.alasio-host\.svc/u);
+      const { url, seen } = await inAlasio<FolderBaymaSeen>("./folder-bayma.ts").catch(async (error: unknown) => {
+        // What the gateway said of the folder's binds, and the pods there are of them.
+        const gateway = await kube.runningPod(NAMESPACE, GATEWAY);
+        const said = (await kube.logs(NAMESPACE, gateway, GATEWAY_COMPONENT).catch(String)).split("\n").filter((line) => /folder/u.test(line)).slice(-40);
+        const pods = (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE })).map(({ metadata, status }) => ({ name: metadata?.name, phase: status?.phase, containers: status?.containerStatuses?.map(({ state }) => state) }));
+        console.error(`# the gateway of the folder's binds:\n${said.join("\n")}\n# the folders' pods: ${JSON.stringify(pods)}`);
+        throw error;
+      });
+      assert.equal(url, `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`);
       assert.deepEqual(seen, { uid: HOST_USER, home });
+      // The gateway's pod of the folder pool, bound, on the conversation's state directory, never started again.
+      const [instance, ...others] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+      assert.deepEqual(others, []);
+      assert.match(instance?.metadata?.name ?? "", /^bayma-[0-9a-f]{16}-[0-9a-z]{5}$/u);
+      assert.equal(instance?.metadata?.annotations?.["alasio.dev/binding-key"], "folder:claude:e2e:folder");
+      assert.equal(instance?.spec?.restartPolicy, "Never");
+      assert.match(instance?.spec?.containers[0]?.args?.join(" ") ?? "", /--state-dir \/\S+\/claude\/e2e-folder$/u);
       // The operator's home is the machine's, shared between alasio and the folder's bayma.
       assert.equal(readFileSync(`${home}/e2e-folder-proof`, "utf8"), `written by ${HOST_USER}`);
       assert.equal(await inAlasioContainer(["cat", `${home}/e2e-folder-proof`]), `written by ${HOST_USER}`);
     });
 
-    test("alasio may make a folder's bayma's Sandbox from its template alone, and no Secret but a Sandbox's token", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
-      const made = (await kube.list<Sandbox>("Sandbox", { namespace: HOST_NAMESPACE })).find(({ metadata }) => metadata?.name?.startsWith("bayma-"));
-      assert.ok(made?.metadata?.name, "the folder's bayma's Sandbox is made");
-      const name = made.metadata.name;
-      // As the folder's, under another name and suspended; with `args` after its bayma's.
-      const copied = (as: string, args: readonly string[] = []) => {
-        const sandbox: Sandbox = JSON.parse(JSON.stringify({ apiVersion: made.apiVersion, kind: made.kind, metadata: { name, namespace: HOST_NAMESPACE }, spec: { ...made.spec, operatingMode: "Suspended" } }).replaceAll(name, as));
-        const bayma = sandbox.spec.podTemplate.spec?.containers.find((container) => container.name === "bayma");
-        if (bayma) bayma.args = [...(bayma.args ?? []), ...args];
-        return sandbox;
+    test("a folder conversation's instance restarted saves its REPL sessions whole as it stops, and the next bind's restores them", { skip: !HOST_PROFILE && "folder workspaces are for a single node", timeout: 20 * 60_000 }, async () => {
+      const key = "folder:claude:e2e:folder";
+      const set = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", GATEWAY_MCP, await mainKeyToken(key), "kept by e2e:folder");
+      const [before] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+      assert.match(await alasioOk("folder", "restart", "e2e:folder"), /^Claude: its folder instance of e2e:folder is let go, its REPL sessions saved, its failed binds forgotten; the next message makes it anew$/mu);
+      const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(key), set.python, set.bun);
+      assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], ["kept by e2e:folder", "kept by e2e:folder", true, "kept by e2e:folder", "kept by e2e:folder"], JSON.stringify(seen));
+      assert.ok((seen.python.count ?? 0) > set.count, JSON.stringify(seen));
+      for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
+      // A pod of its own, made anew.
+      const [after] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+      assert.notEqual(after?.metadata?.uid, before?.metadata?.uid);
+    });
+
+    test("no one makes a pod in the folders' namespace but the gateway, which makes none but of the folder template, nor a Secret there but an instance's token", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
+      const [instance] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+      assert.ok(instance?.metadata?.name && instance.spec, "the folder's instance is made");
+      const name = instance.metadata.name;
+      // As the instance was asked for, under another name, of what the API server adds as it
+      // makes a pod and schedules it: with `args` after its bayma's.
+      const added = (volume: string) => volume.startsWith("kube-api-access-");
+      const copied = (args: readonly string[] = []): V1Pod => {
+        const { nodeName: _scheduled, tolerations: _defaulted, ...spec } = structuredClone(instance.spec) as V1PodSpec;
+        spec.volumes = (spec.volumes ?? []).filter((volume) => !added(volume.name));
+        spec.containers = spec.containers.map((container) => ({
+          ...container,
+          volumeMounts: (container.volumeMounts ?? []).filter((mount) => !added(mount.name)),
+          ...(container.name === "bayma" ? { args: [...(container.args ?? []), ...args] } : {}),
+        }));
+        return { apiVersion: "v1", kind: "Pod", metadata: { name: name.replace(/.{5}$/u, "e2e00"), labels: instance.metadata?.labels ?? {}, annotations: instance.metadata?.annotations ?? {} }, spec };
       };
-      const sandboxes = `/apis/agents.x-k8s.io/v1beta1/namespaces/${HOST_NAMESPACE}/sandboxes`;
-      assert.equal(await asAlasio("POST", sandboxes, "application/json", copied("e2e-folder-other", ["--listen", "0.0.0.0:1"])), 422);
+      const pods = `/api/v1/namespaces/${HOST_NAMESPACE}/pods`;
+      assert.equal(await asAlasio("POST", pods, "application/json", copied()), 403);
+      assert.equal(await asGateway("POST", pods, "application/json", copied(["--listen", "0.0.0.0:1"])), 422);
       // Its state anywhere but under the template's state root.
-      const elsewhere = copied("e2e-folder-elsewhere");
-      const args = elsewhere.spec.podTemplate.spec?.containers.find((container) => container.name === "bayma")?.args ?? [];
-      const at = args.indexOf("--state-dir") + 1;
-      assert.ok(at > 0, "the folder's bayma has a state directory");
-      args[at] = "/tmp/claude/e2e";
-      assert.equal(await asAlasio("POST", sandboxes, "application/json", elsewhere), 422);
-      assert.equal(await asAlasio("POST", sandboxes, "application/json", copied("e2e-folder-made")), 201);
-      await kube.remove(ref("Sandbox", "e2e-folder-made", HOST_NAMESPACE));
-      // An Opaque Secret named as a token's, holding more than a token; and one holding the token alone, which is made.
+      const elsewhere = copied();
+      const args = elsewhere.spec?.containers.find((container) => container.name === "bayma")?.args ?? [];
+      args[args.indexOf("--state-dir") + 1] = "/tmp/claude/e2e";
+      assert.equal(await asGateway("POST", pods, "application/json", elsewhere), 422);
+      // An Opaque Secret named as a token's, holding more than a token; and none of alasio's at all.
       const secrets = `/api/v1/namespaces/${HOST_NAMESPACE}/secrets`;
       const secret = (data: Record<string, string>) => ({ apiVersion: "v1", kind: "Secret", metadata: { name: "e2e-folder-bayma-token" }, type: "Opaque", data });
-      assert.equal(await asAlasio("POST", secrets, "application/json", secret({ token: "dG9rZW4=", other: "b3RoZXI=" })), 422);
-      assert.equal(await asAlasio("POST", secrets, "application/json", secret({ token: "dG9rZW4=" })), 201);
-      await kube.remove(ref("Secret", "e2e-folder-bayma-token", HOST_NAMESPACE));
+      assert.equal(await asGateway("POST", secrets, "application/json", secret({ token: "dG9rZW4=", other: "b3RoZXI=" })), 422);
+      assert.equal(await asAlasio("POST", secrets, "application/json", secret({ token: "dG9rZW4=" })), 403);
     });
 
     test("a message runs a turn on Codex, the run's stand-in for it, whose answer reaches the operator, and its spans the lake", async () => {
@@ -757,6 +965,17 @@ if (inShard("sessions")) {
       await tg.say("hello");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
       await untilInLake("span of Codex's app-server", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'turn/start'");
+    });
+
+    test("an image a reply shows from a session workspace is read through the gateway and sent with it", async () => {
+      // A PNG of one pixel, written in the session's workspace as its agent would write one.
+      const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+      await inSession(full, `require("fs").writeFileSync("/workspace/shown.png", Buffer.from(${JSON.stringify(png)}, "base64"))`);
+      await tg.calls();
+      await tg.say("show /workspace/shown.png");
+      // The reply as a rich message, its image uploaded with it.
+      const shown = await tg.waitFor((call) => call.method === "sendRichMessage" && Number(call.payload.multipartBytes ?? 0) > 0);
+      assert.ok(Number(shown.payload.multipartBytes) >= Buffer.from(png, "base64").length, JSON.stringify(shown.payload));
     });
 
     test("alasio comes back from alasio restart with its conversation's workspace", async () => {
@@ -798,6 +1017,22 @@ if (inShard("sessions")) {
       await tg.say("hello, Claude");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === CLAUDE_ANSWER);
       await untilInLake("Claude Code's answer in its transcript", "select count(*) as n from claude.entries where type = 'assistant'");
+    });
+
+    // Last, as a restart of k3s ends the port forwards the tests before it reach the stand-ins through.
+    test("keeps pods pulled lazily running through a restart of k3s, and of stargz-snapshotter's daemon with it", { skip: (TARGET !== "host" || !ESTARGZ) && "k3s is restarted on its own where it is a service of the machine's, and its pods pulled lazily" }, async () => {
+      const session = await newSession("none");
+      const sessionName = (await sessionPod(session)).metadata?.name ?? "";
+      const watched: [string, string][] = [[NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)], [SESSIONS, sessionName]];
+      const restarts = () => Promise.all(watched.map(async ([namespace, name]) => (await kube.get<V1Pod>(ref("Pod", name, namespace)))?.status?.containerStatuses?.map(({ restartCount }) => restartCount)));
+      const before = await restarts();
+      // The daemon's service is part of k3s's, so it restarts with it; its FUSE manager keeps the mounts.
+      await onNode("", "systemctl restart k3s");
+      // The session's bayma runs a program from its image, once kubelet takes an exec again.
+      const ran = () => inSession(session, 'console.log(require("node:fs").readdirSync("/usr/lib").length > 0)').then((said) => said.trim(), () => undefined);
+      assert.equal(await until("the session's bayma reached again", async () => await ran(), 300_000), "true");
+      assert.deepEqual(await restarts(), before);
+      assert.ok(await onRemoteSnapshot(SESSIONS, sessionName));
     });
   });
 
@@ -971,27 +1206,44 @@ const repl = {
 /** What bayma tells the first exec of a session that came back whole with its sandbox, and of one that came back from its checkpoint. */
 const CAME_BACK_WHOLE = /^bayma: this session came back whole with bayma's sandbox, restored from a snapshot taken at /u;
 const CAME_BACK_FROM_CHECKPOINT = /^bayma: this session came back from its checkpoint /u;
+/** What bayma tells the first exec of a folder's session that came back whole, its processes restored as they were. */
+const FOLDER_CAME_BACK_WHOLE = /^bayma: this session came back whole/u;
+/** The sandbox gateway's MCP endpoint, as alasio reaches it from its pod. */
+const GATEWAY_MCP = `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`;
 
 /**
- * Waits until alasio has released the session, last used at `since`: its Sandbox suspended,
- * and its pod gone. How long after `since` it was.
+ * Waits until the sandbox gateway has released the session, last used at `since`: no pod
+ * bound to it, nor one bound to it ending. How long after `since` it was.
  */
-async function untilReleased(volumeId: string, since: number): Promise<number> {
-  // releaseAfter, and a look at the sessions every 15 seconds, then the save.
-  const within = (RELEASE_AFTER_SECONDS + 15) * 1000 + 180_000;
-  await until(`the release of the session ${volumeId}`, async () => {
-    const sandbox = await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS));
-    return sandbox?.spec.operatingMode === "Suspended" && (await kube.get(ref("Pod", volumeId, SESSIONS))) === null ? true : undefined;
-  }, within);
+async function untilReleased(volumeId: string, since: number, { savingMs = 180_000 } = {}): Promise<number> {
+  // releaseAfter, and a look at the bound pods every few seconds, then the save, of `savingMs` at most.
+  const within = (RELEASE_AFTER_SECONDS + 15) * 1000 + savingMs;
+  await until(`the release of the session ${volumeId}`, async () =>
+    (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(volumeId))}` })).length === 0 ? true : undefined, within);
   return Date.now() - since;
 }
 
-/** Patches the status of the session `volumeId`'s pod with `status` as alasio does, merged as kubelet's patches are, its conditions by their type: the API server's answer. */
-const podStatusAsAlasio = (volumeId: string, status: unknown): Promise<number> =>
-  asAlasio("PATCH", `/api/v1/namespaces/${SESSIONS}/pods/${volumeId}/status`, "application/strategic-merge-patch+json", { status });
+/** Patches the status of the pod `pod` of main's sessions with `status` as alasio would, merged as kubelet's patches are, its conditions by their type: the API server's answer. */
+const podStatusAsAlasio = (pod: string, status: unknown): Promise<number> =>
+  asAlasio("PATCH", `/api/v1/namespaces/${SESSIONS}/pods/${pod}/status`, "application/strategic-merge-patch+json", { status });
 
 /** The resumed condition of a restored session's pod, set to `value`. */
 const resumedCondition = (value: string) => ({ conditions: [{ type: "alasio.dev/resumed", status: value }] });
+
+/** What the sandbox gateway's pods logged, every replica's, a line each. */
+async function gatewayLogs(): Promise<string[]> {
+  const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("sandbox-gateway")) });
+  return (await Promise.all(pods.map((pod) => kube.logs(NAMESPACE, pod.metadata?.name ?? "", "sandbox-gateway").catch(() => "")))).flatMap((logged) => logged.split("\n"));
+}
+
+/** The sandbox gateway's configuration, as alasio up rendered it: the pools' templates, the current and the one before, as main's sessions are snapshotted onto them. */
+async function gatewayTemplates(): Promise<{ readonly current: V1PodTemplateSpec; readonly previous: V1PodTemplateSpec | null }> {
+  const config = JSON.parse((await kube.get<V1ConfigMap>(ref("ConfigMap", GATEWAY, NAMESPACE)))?.data?.["config.json"] ?? "{}") as {
+    readonly snapshots?: { readonly templates: { readonly none: { readonly current: V1PodTemplateSpec; readonly previous: V1PodTemplateSpec | null } } } | null;
+  };
+  assert.ok(config.snapshots, "the gateway snapshots no session");
+  return config.snapshots.templates.none;
+}
 
 /**
  * What a node agent's cgroup says of its memory: its limit, what it holds now, and of that,
@@ -1164,13 +1416,14 @@ if (inShard("snapshots")) {
       return Date.now() - asked;
     }
 
-    test("a session that runs no exec and no turn for releaseAfter is released: its Sandbox suspended, holding no pod, its snapshot in the bucket", async (t) => {
+    test("a session that runs no exec and no turn for releaseAfter is released by the sandbox gateway: its pod gone, its snapshot in the bucket", async (t) => {
       session = await newSession("none");
       ({ sessionId } = await repl.set(session, `held by ${session}`));
       const since = Date.now();
-      ran = await kube.get<V1Pod>(ref("Pod", session, SESSIONS));
+      ran = await sessionPod(session);
       const waited = await untilReleased(session, since);
       assert.ok(waited >= (RELEASE_AFTER_SECONDS - 10) * 1000, `the session was released ${waited} ms after its last exec`);
+      assert.equal(await kube.get(ref("Pod", ran.metadata?.name ?? "", SESSIONS)), null);
       const snapshot = await snapshotOf(session);
       assert.ok(snapshot, `the session ${session} was released with no snapshot`);
       assert.deepEqual([snapshot.environment, snapshot.workspace], [SESSIONS, session]);
@@ -1178,7 +1431,7 @@ if (inShard("snapshots")) {
       t.diagnostic(`released ${(waited / 1000).toFixed(1)}s after its last exec: ${saved.bytes} bytes, its sandbox paused ${saved.pauseMs} ms, uploaded in ${saved.uploadMs} ms`);
     });
 
-    test("the session's pod was held to the CPU features every node's agent said, which alasio up recorded in the sessions' template, as alasio status says", async () => {
+    test("the session's pod was held to the CPU features every node's agent said, which alasio up recorded in the pools' template, as alasio status says", async () => {
       const agents = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("node-agent")) });
       const said = agents.map((pod) => {
         const message = pod.status?.initContainerStatuses?.find(({ name }) => name === "cpu-features")?.state?.terminated?.message;
@@ -1187,32 +1440,30 @@ if (inShard("snapshots")) {
       const [first = []] = said;
       const baseline = first.filter((feature) => said.every((features) => features.includes(feature))).toSorted().join(",");
       assert.notEqual(baseline, "", JSON.stringify(said));
-      const templates = JSON.parse((await kube.get<V1ConfigMap>(ref("ConfigMap", componentName("sandbox-templates"), NAMESPACE)))?.data?.["templates.json"] ?? "{}");
-      assert.equal(templates.sessions.podTemplate.metadata.annotations["dev.gvisor.internal.cpufeatures"], baseline);
+      assert.equal((await gatewayTemplates()).current.metadata?.annotations?.["dev.gvisor.internal.cpufeatures"], baseline);
       assert.equal(ran?.metadata?.annotations?.["dev.gvisor.internal.cpufeatures"], baseline);
       const status = await alasioOk("status");
       assert.ok(status.includes(`\n  sessions are held to ${baseline.split(",").length} CPU features, those every node had as alasio up last surveyed them\n`), status);
     });
 
-    test("the session's next turn restores it from its snapshot, which is spent, and its REPL is whole, as bayma tells the next exec", async (t) => {
+    test("the session's next turn restores it from its snapshot, by a pod of its own, the snapshot spent, and its REPL whole, as bayma tells the next exec", async (t) => {
       const answered = await turn("hello again");
-      const pod = await kube.get<V1Pod>(ref("Pod", session, SESSIONS));
-      assert.equal(pod?.spec?.runtimeClassName, gvisorRuntimeClass(saved.release));
+      const pod = await sessionPod(session);
+      assert.match(pod.metadata?.name ?? "", /^sandboxes-none-restore-/u);
+      assert.equal(pod.spec?.runtimeClassName, gvisorRuntimeClass(saved.release));
       const seen = await repl.read(session, sessionId);
       assert.deepEqual([seen.live, seen.checkpointed], [`held by ${session}`, `held by ${session}`]);
       assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
       assert.equal(await snapshotOf(session), null);
-      t.diagnostic(`the turn's answer came ${answered} ms after its prompt, the session restored meanwhile on ${pod?.spec?.nodeName}`);
-      // As alasio, of its pod's status: its resumed condition, true, alone; not its addresses, nor another condition.
-      assert.equal(await podStatusAsAlasio(session, resumedCondition("True")), 200);
-      assert.equal(await podStatusAsAlasio(session, resumedCondition("False")), 422);
-      assert.equal(await podStatusAsAlasio(session, { conditions: [{ type: "Ready", status: "False" }] }), 422);
-      assert.equal(await podStatusAsAlasio(session, { podIPs: [{ ip: "10.42.250.250" }], podIP: "10.42.250.250" }), 422);
+      t.diagnostic(`the turn's answer came ${answered} ms after its prompt, the session restored meanwhile on ${pod.spec?.nodeName}`);
+      // Its readiness the gateway's to set, never alasio's.
+      assert.equal(await podStatusAsAlasio(pod.metadata?.name ?? "", resumedCondition("True")), 403);
+      assert.ok(pod.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True"), JSON.stringify(pod.status?.conditions));
     });
 
     test("the session's pods hold no capability, before its release and after its restore, and the restored one reaches nothing without internet", async () => {
       assertNoCapability(ran);
-      assertNoCapability(await kube.get<V1Pod>(ref("Pod", session, SESSIONS)));
+      assertNoCapability(await sessionPod(session));
       // Those of a process in the restored sandbox, as gVisor gives them: each set empty.
       const held = await inSession(session, 'process.stdout.write(require("fs").readFileSync("/proc/self/status","utf8"))');
       const capabilities = held.split("\n").filter((line) => line.startsWith("Cap"));
@@ -1221,109 +1472,7 @@ if (inShard("snapshots")) {
       await assertNoInternet(session);
     });
 
-    test("a session saved on one node is restored on another, from the bucket, its REPL whole", { skip: AGENTS < 2 && "one node" }, async (t) => {
-      ({ sessionId } = await repl.set(session, `moved by ${session}`));
-      const since = Date.now();
-      const node = (await kube.get<V1Pod>(ref("Pod", session, SESSIONS)))?.spec?.nodeName;
-      assert.ok(node, `the session ${session} runs on no node`);
-      await untilReleased(session, since);
-      // Its node takes no pod of the session's, and has no agent to prepare its snapshot,
-      // which another node's agent then reads from the bucket.
-      const taints = (await kube.get<V1Node>(ref("Node", node)))?.spec?.taints ?? [];
-      await kube.patch(ref("Node", node), { spec: { taints: [...taints, { key: "alasio.dev/e2e-away", effect: "NoSchedule" }] } });
-      try {
-        const agent = (await nodeAgents()).get(node);
-        assert.ok(agent, `no node agent runs on ${node}`);
-        await kube.remove(ref("Pod", agent, NAMESPACE));
-        await until(`the node agent ${agent} gone`, async () => ((await kube.get(ref("Pod", agent, NAMESPACE))) === null ? true : undefined), 300_000);
-        const answered = await turn("hello from elsewhere");
-        const restoredOn = (await kube.get<V1Pod>(ref("Pod", session, SESSIONS)))?.spec?.nodeName;
-        assert.ok(restoredOn && restoredOn !== node, `the session was restored on ${restoredOn}, where it was saved`);
-        const seen = await repl.read(session, sessionId);
-        assert.deepEqual([seen.live, seen.checkpointed], [`moved by ${session}`, `moved by ${session}`]);
-        assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
-        t.diagnostic(`the turn's answer came ${answered} ms after its prompt, the session restored meanwhile on ${restoredOn}, saved on ${node}`);
-      } finally {
-        await kube.patch(ref("Node", node), { spec: { taints } });
-        await until(`a node agent ready again on ${node}`, async () => ((await nodeAgents()).has(node) ? true : undefined), 300_000);
-      }
-    });
-
-    test("a session whose node is drained while it idles is released into a snapshot as its bayma holds its stop, and comes back on another node, its REPL whole", { skip: AGENTS < 2 && "a drain of the cluster's one node stops all of it" }, async (t) => {
-      const drained = await newSession("none");
-      const { sessionId: held } = await repl.set(drained, `drained with ${drained}`);
-      const node = (await kube.get<V1Pod>(ref("Pod", drained, SESSIONS)))?.spec?.nodeName;
-      assert.ok(node, `the session ${drained} runs on no node`);
-      const began = Date.now();
-      try {
-        // kubectl drain, of the session's pods alone, as the node's other pods are not this test's.
-        assert.match(await onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=app.kubernetes.io/component=session --delete-emptydir-data --timeout=300s`), /evicted/u);
-        const bound = await until("the drained session released into a snapshot", async () => {
-          const sandbox = await kube.get<KubernetesObject & { spec?: { operatingMode?: string } }>(ref("Sandbox", drained, SESSIONS));
-          const snapshot = sandbox?.metadata?.annotations?.[SNAPSHOT_ANNOTATION];
-          return sandbox?.spec?.operatingMode === "Suspended" && snapshot ? snapshot : undefined;
-        }, 180_000);
-        const manifest = await snapshotOf(drained);
-        assert.equal(manifest?.snapshot, bound);
-        // A release's snapshot, its sandbox ended by it, not one taken live.
-        assert.equal(manifest?.live, undefined);
-        t.diagnostic(`released ${Date.now() - began} ms after the drain began: ${manifest?.bytes} bytes, its sandbox paused ${manifest?.pauseMs} ms`);
-        await turn("hello after the drain");
-        const restoredOn = (await kube.get<V1Pod>(ref("Pod", drained, SESSIONS)))?.spec?.nodeName;
-        assert.ok(restoredOn && restoredOn !== node, `the session was restored on ${restoredOn}, the node drained`);
-        // The drained node, cordoned, alone held the snapshot: the node it was restored on read it from the bucket.
-        const agent = (await nodeAgents()).get(restoredOn);
-        assert.ok(agent, `no node agent runs ready on ${restoredOn}`);
-        const prepared = (await kube.logs(NAMESPACE, agent, "node-agent")).split("\n").filter((line) => line.includes(`prepared the snapshot ${bound} of ${SESSIONS}/${drained} from the `));
-        assert.ok(prepared.length > 0 && prepared.every((line) => line.includes(" from the bucket")), `${restoredOn}'s agent prepared ${bound} so: ${prepared.join(" | ") || "not at all"}`);
-        const seen = await repl.read(drained, held);
-        assert.deepEqual([seen.live, seen.checkpointed], [`drained with ${drained}`, `drained with ${drained}`]);
-        assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
-      } finally {
-        await onNode(`${CLUSTER}-server-0`, `kubectl uncordon ${node}`);
-      }
-    });
-
-    test("a session alasio moves onto its template has its bayma go on with its stop, its pod ending well within the time its bayma holds a stop alasio did not make", async (t) => {
-      const moving = await newSession("none");
-      const { sessionId: kept } = await repl.set(moving, `checkpointed by ${moving}`);
-      const pod = await kube.get<V1Pod>(ref("Pod", moving, SESSIONS));
-      const uid = pod?.metadata?.uid;
-      assert.ok(uid && !pod.metadata?.deletionTimestamp, `the session ${moving} runs no pod`);
-      // As though made from another template: its next bring-up moves it onto alasio's, ending its pod.
-      await kube.patch(ref("Sandbox", moving, SESSIONS), { metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: "another" } } });
-      const replied = turn("hello after the move");
-      const current = async () => {
-        const now = await kube.get<V1Pod>(ref("Pod", moving, SESSIONS));
-        return now?.metadata?.uid === uid ? now : null;
-      };
-      const asked = await until(`the pod ${uid} of ${moving} ending`, async () => {
-        const now = await current();
-        return now === null || now.metadata?.deletionTimestamp !== undefined ? Date.now() : undefined;
-      }, 120_000);
-      const gone = await until(`the pod ${uid} of ${moving} gone`, async () => ((await current()) === null ? Date.now() : undefined), 120_000);
-      t.diagnostic(`its pod ended ${gone - asked} ms after it was seen ending`);
-      // Its bayma holds a stop alasio did not make for 60 s (sessions.snapshots.stopWait).
-      assert.ok(gone - asked < 20_000, `the pod of ${moving} took ${gone - asked} ms to end, as its bayma held its stop`);
-      await replied;
-      const seen = await repl.read(moving, kept);
-      assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${moving}`]);
-    });
-
-    test("a session whose pod is deleted outright, as kubectl delete --force or the removal of its Node deletes one, takes no snapshot, and comes back from bayma's checkpoints", async () => {
-      const killed = await newSession("none");
-      const { sessionId: kept } = await repl.set(killed, `checkpointed by ${killed}`);
-      const node = (await kube.get<V1Pod>(ref("Pod", killed, SESSIONS)))?.spec?.nodeName ?? "";
-      const deleted = kubectl(["delete", "pod", killed, "--namespace", SESSIONS, "--grace-period=0", "--force"]);
-      assert.ok(deleted.ok, deleted.said);
-      await turn("hello after the kill");
-      const seen = await repl.read(killed, kept);
-      assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${killed}`]);
-      assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
-      assert.equal(await snapshotOf(killed), null, `a snapshot of ${killed} was taken as its pod on ${node} was killed`);
-    });
-
-    test("a session whose snapshot's image is corrupted comes back from bayma's checkpoints, as alasio logs and bayma tells the next exec", async () => {
+    test("a session whose snapshot's image is corrupted comes back from bayma's checkpoints, as the gateway logs and bayma tells the next exec, which the alert on restores falling back says", async () => {
       const corrupt = await newSession("none");
       const { sessionId: kept } = await repl.set(corrupt, `checkpointed by ${corrupt}`);
       await untilReleased(corrupt, Date.now());
@@ -1333,18 +1482,15 @@ if (inShard("snapshots")) {
       const [node = ""] = agents.keys();
       const corrupted = await inNodeAgent<Corrupted>(node, "./snapshot-bucket.ts", "corrupt", SESSIONS, corrupt);
       await turn("hello after the rot");
-      const logged = (await kube.logs(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), "alasio"))
-        .split("\n")
-        .find((line) => line.includes(`session ${corrupt} is resumed from bayma's checkpoints, not from its snapshot: `));
-      assert.ok(logged?.includes(`is corrupt: its image ${corrupted.image} is not in the bucket as it was put`), `alasio logged no fallback for its corrupted image ${corrupted.image}'s file ${corrupted.path}: ${logged}`);
+      const logged = (await gatewayLogs()).find((line) => line.includes(`${SESSIONS}/${corrupt} is bound from bayma's checkpoints, not from its snapshot: `));
+      assert.ok(logged?.includes(`is corrupt: its image ${corrupted.image} is not in the bucket as it was put`), `the gateway logged no fallback for its corrupted image ${corrupted.image}'s file ${corrupted.path}: ${logged}`);
       const seen = await repl.read(corrupt, kept);
       assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${corrupt}`]);
       assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
       assert.equal(await snapshotOf(corrupt), null);
-      // Of a pod not restored, as alasio, nothing of its status.
-      assert.equal(await podStatusAsAlasio(corrupt, resumedCondition("True")), 422);
       // A restore that fell back for a failure, as this one did, is what the alert on
-      // restores falling back is for: it fires, whenever its message came during the turn.
+      // restores falling back is for: it fires, whenever its message came during the turn,
+      // as one of the shard's first restores, more than a fifth of those of the hour.
       const stub = telegram?.base;
       assert.ok(stub, "the Telegram stand-in is not forwarded");
       const deadline = Date.now() + 420_000;
@@ -1358,30 +1504,122 @@ if (inShard("snapshots")) {
       }
     });
 
+    test("a session saved on one node is restored on another, from the bucket, its REPL whole and its workspace's files with it, as a directory of the file system is no node's", { skip: AGENTS < 2 && "one node" }, async (t) => {
+      const written = (await inSession(session, 'const f=require("fs");f.writeFileSync("/workspace/moving",require("crypto").randomBytes(1<<20));process.stdout.write(require("crypto").createHash("sha256").update(f.readFileSync("/workspace/moving")).digest("hex"))')).trim();
+      ({ sessionId } = await repl.set(session, `moved by ${session}`));
+      const since = Date.now();
+      const node = (await sessionPod(session)).spec?.nodeName;
+      assert.ok(node, `the session ${session} runs on no node`);
+      await untilReleased(session, since);
+      // Its node takes no pod of the session's, and has no agent to prepare its snapshot,
+      // which another node's agent then reads from the bucket.
+      const taints = (await kube.get<V1Node>(ref("Node", node)))?.spec?.taints ?? [];
+      await kube.patch(ref("Node", node), { spec: { taints: [...taints, { key: "alasio.dev/e2e-away", effect: "NoSchedule" }] } });
+      try {
+        const agent = (await nodeAgents()).get(node);
+        assert.ok(agent, `no node agent runs on ${node}`);
+        await kube.remove(ref("Pod", agent, NAMESPACE));
+        await until(`the node agent ${agent} gone`, async () => ((await kube.get(ref("Pod", agent, NAMESPACE))) === null ? true : undefined), 300_000);
+        // Bound as alasio binds it, whichever session the chat's conversation is in now.
+        const binding = Date.now();
+        const restoredOn = (await bindSession(session)).node;
+        const answered = Date.now() - binding;
+        assert.ok(restoredOn && restoredOn !== node, `the session was restored on ${restoredOn}, where it was saved`);
+        const seen = await repl.read(session, sessionId);
+        assert.deepEqual([seen.live, seen.checkpointed], [`moved by ${session}`, `moved by ${session}`]);
+        assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+        assert.equal((await inSession(session, 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync("/workspace/moving")).digest("hex"))')).trim(), written);
+        t.diagnostic(`the session was bound ${answered} ms after it was asked for, restored meanwhile on ${restoredOn}, saved on ${node}`);
+      } finally {
+        await kube.patch(ref("Node", node), { spec: { taints } });
+        await until(`a node agent ready again on ${node}`, async () => ((await nodeAgents()).has(node) ? true : undefined), 300_000);
+      }
+    });
+
+    test("a session whose node is drained while it idles is evicted only once the gateway has released it into a snapshot, and comes back on another node, its REPL whole", { skip: AGENTS < 2 && "a drain of the cluster's one node stops all of it" }, async (t) => {
+      const drained = await newSession("none");
+      const { sessionId: held } = await repl.set(drained, `drained with ${drained}`);
+      const node = (await sessionPod(drained)).spec?.nodeName;
+      assert.ok(node, `the session ${drained} runs on no node`);
+      const began = Date.now();
+      try {
+        // kubectl drain, of the session's bound pod alone, as the node's other pods are not this test's, which waits for its release:
+        // forced, as a bound pod is its ReplicaSet's no more.
+        await onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=${BINDING_LABEL}=${keyHash(sessionKey(drained))} --force --delete-emptydir-data --timeout=420s`);
+        const manifest = await snapshotOf(drained);
+        assert.ok(manifest, `the drained session ${drained} has no snapshot`);
+        // A release's snapshot, its sandbox ended by it, not one taken live.
+        assert.equal(manifest.live, undefined);
+        t.diagnostic(`drained ${Date.now() - began} ms after the drain began: ${manifest.bytes} bytes, its sandbox paused ${manifest.pauseMs} ms`);
+        await turn("hello after the drain");
+        const restoredOn = (await sessionPod(drained)).spec?.nodeName;
+        assert.ok(restoredOn && restoredOn !== node, `the session was restored on ${restoredOn}, the node drained`);
+        // The drained node, cordoned, alone held the snapshot: the node it was restored on read it from the bucket.
+        const agent = (await nodeAgents()).get(restoredOn);
+        assert.ok(agent, `no node agent runs ready on ${restoredOn}`);
+        const prepared = (await kube.logs(NAMESPACE, agent, "node-agent")).split("\n").filter((line) => line.includes(`prepared the snapshot ${manifest.snapshot} of ${SESSIONS}/${drained} from the `));
+        assert.ok(prepared.length > 0 && prepared.every((line) => line.includes(" from the bucket")), `${restoredOn}'s agent prepared ${manifest.snapshot} so: ${prepared.join(" | ") || "not at all"}`);
+        const seen = await repl.read(drained, held);
+        assert.deepEqual([seen.live, seen.checkpointed], [`drained with ${drained}`, `drained with ${drained}`]);
+        assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+      } finally {
+        await onNode(`${CLUSTER}-server-0`, `kubectl uncordon ${node}`);
+      }
+    });
+
+    test("a session whose bound pod is deleted through the API server, as an eviction or a deletion by hand ends one, is saved as its bayma holds its stop, well within the time it holds it, and comes back whole", async (t) => {
+      const ended = await newSession("none");
+      const { sessionId: kept } = await repl.set(ended, `saved as ${ended} ended`);
+      const pod = await sessionPod(ended);
+      const name = pod.metadata?.name ?? "";
+      const deleted = kubectl(["delete", "pod", name, "--namespace", SESSIONS, "--wait=false"]);
+      assert.ok(deleted.ok, deleted.said);
+      const asked = Date.now();
+      const gone = await until(`the pod ${name} of ${ended} gone`, async () => ((await kube.get(ref("Pod", name, SESSIONS))) === null ? Date.now() : undefined), 120_000);
+      t.diagnostic(`its pod ended ${gone - asked} ms after it was deleted`);
+      // Its bayma holds a stop it is not given for 60 s (sessions.snapshots.stopWait), which the gateway's save ends sooner.
+      assert.ok(gone - asked < 45_000, `the pod of ${ended} took ${gone - asked} ms to end, as its bayma held its stop`);
+      const snapshot = await snapshotOf(ended);
+      assert.ok(snapshot && snapshot.live === undefined, `the session ${ended} was not saved as its pod ended: ${JSON.stringify(snapshot)}`);
+      await turn("hello after the deletion");
+      const seen = await repl.read(ended, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [`saved as ${ended} ended`, `saved as ${ended} ended`]);
+      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+    });
+
+    test("a session whose pod is deleted outright, as kubectl delete --force or the removal of its Node deletes one, takes no snapshot, and comes back from bayma's checkpoints", async () => {
+      const killed = await newSession("none");
+      const { sessionId: kept } = await repl.set(killed, `checkpointed by ${killed}`);
+      const pod = await sessionPod(killed);
+      const deleted = kubectl(["delete", "pod", pod.metadata?.name ?? "", "--namespace", SESSIONS, "--grace-period=0", "--force"]);
+      assert.ok(deleted.ok, deleted.said);
+      await turn("hello after the kill");
+      const seen = await repl.read(killed, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${killed}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+      assert.equal(await snapshotOf(killed), null, `a snapshot of ${killed} was taken as its pod on ${pod.spec?.nodeName} was killed`);
+    });
+
     test("a session whose snapshot was taken by a gVisor release no longer kept comes back from bayma's checkpoints, said so, as status says it will", async () => {
       const unkept = await newSession("none");
       const { sessionId: kept } = await repl.set(unkept, `checkpointed by ${unkept}`);
       await untilReleased(unkept, Date.now());
-      // Taken, as far as anything says, by a release alasio up no longer keeps.
+      // Taken, as far as its manifest says, by a release alasio up no longer keeps.
       const removed = "20990101.0-removed";
       const [node = ""] = (await nodeAgents()).keys();
       const released = await inNodeAgent<Released>(node, "./snapshot-bucket.ts", "release", SESSIONS, unkept, removed);
-      await kube.patch(ref("Sandbox", unkept, SESSIONS), { metadata: { annotations: { "alasio.dev/snapshot-release": removed } } });
+      // As the gateway says what the snapshots name.
       const status = await alasioOk("status");
       assert.ok(status.includes(`\n  gVisor ${removed}, not kept: 1 snapshot names it, restored from bayma's checkpoints instead\n`), status);
-      // Restored from no snapshot, as alasio logs, counting it a fallback by design, which pages no one.
-      const fallbacks = await turn("hello after the release went").then(async () =>
-        (await kube.logs(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), "alasio"))
-          .split("\n")
-          .find((line) => line.includes(`session ${unkept} is resumed from bayma's checkpoints, not from its snapshot: gVisor ${removed}, which took it, is no longer kept`))
-      );
-      assert.ok(fallbacks, `alasio logged no fallback of ${unkept}'s snapshot ${released.snapshot} for its release`);
+      // Restored from no snapshot, as the gateway logs, counting it a fallback by design, which pages no one.
+      await turn("hello after the release went");
+      const fallback = (await gatewayLogs()).find((line) => line.includes(`${SESSIONS}/${unkept} is bound from bayma's checkpoints, not from its snapshot: gVisor ${removed}, which took it, is no longer kept`));
+      assert.ok(fallback, `the gateway logged no fallback of ${unkept}'s snapshot ${released.snapshot} for its release`);
       const seen = await repl.read(unkept, kept);
       assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${unkept}`]);
       assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
       assert.equal(await snapshotOf(unkept), null);
-      const after = await kube.get<Sandbox>(ref("Sandbox", unkept, SESSIONS));
-      assert.equal(after?.metadata?.annotations?.["alasio.dev/snapshot-release"], undefined);
+      assert.ok(!(await alasioOk("status")).includes(`gVisor ${removed}`), "a snapshot still names the release no longer kept");
     });
 
     test("a fork of a released session restores its source's REPL", async () => {
@@ -1412,7 +1650,7 @@ if (inShard("snapshots")) {
         return "not logged";
       };
       for (const from of ["cache", "bucket"] as const) {
-        const released = await untilReleased(big, Date.now());
+        const released = await untilReleased(big, Date.now(), { savingMs: 480_000 });
         const snapshot = await snapshotOf(big);
         assert.ok(snapshot, `the session ${big} was released with no snapshot`);
         assert.ok(snapshot.bytes >= BIG_REPL_MEBIBYTES * 1024 * 1024, `its image is ${snapshot.bytes} bytes`);
@@ -1449,10 +1687,10 @@ if (inShard("snapshots")) {
       }
     });
 
-    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket comes back whole and is saved again, its node's agent stopped as its sandbox resumes, which stops once the restore has been served all its pages`, async (t) => {
+    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket comes back whole and is saved again, its node's agent stopped as its sandbox resumes, which stops once the restore over TCP has been served all its pages, or at once, the restore through its socket served the rest by the agent that comes back`, async (t) => {
       const big = await newSession("none");
       const { sessionId: held, sha256 } = await repl.fill(big, BIG_REPL_MEBIBYTES);
-      await untilReleased(big, Date.now());
+      await untilReleased(big, Date.now(), { savingMs: 480_000 });
       const agents = await nodeAgents();
       for (const pod of agents.values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
       // Every node agent's log followed from its start, for the one that resumes the sandbox.
@@ -1477,6 +1715,10 @@ if (inShard("snapshots")) {
       // there. Its stop waits on the restore while it reads, or found it had read every page
       // already; either way it was served every byte of pages runsc said its image holds,
       // which runsc did say, as the drain counts bytes and not its reads' quiet.
+      // A restore through the agent's socket, as the release it was taken on restores
+      // (./names.ts goferOf), waits instead for the agent that comes back at the same path,
+      // which takes its token back and serves it the rest: the agent stopped waits on none.
+      const throughSocket = goferOf(NODE_PINS.gvisor.releases[0]?.release ?? "", NODE_PINS.gvisor.restoresThroughSocketSince) !== null;
       const waits = following(NAMESPACE, agent, "node-agent", new RegExp(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: 1 read it now`, "u"));
       const servedAll = following(NAMESPACE, agent, "node-agent", new RegExp(`the restore of ${SESSIONS}/${big} has been served all [1-9]\\d* bytes of its pages through the node agent`, "u"));
       const unsaid = following(NAMESPACE, agent, "node-agent", new RegExp(`runsc does not say how many bytes of pages the restore of ${SESSIONS}/${big} reads`, "u"));
@@ -1490,99 +1732,90 @@ if (inShard("snapshots")) {
         const within = <A>(said: Promise<A>) => Promise.race([said, sleep(30_000).then(() => undefined)]);
         const [waited, all, warned] = await Promise.all([within(waits.said), within(servedAll.said), within(unsaid.said)]);
         assert.equal(warned, undefined, `the node agent ${agent} said runsc did not tell the bytes of pages of ${big}'s image: ${warned}`);
-        assert.ok(all, `the node agent ${agent} did not say it served ${big}'s restore all its pages`);
-        t.diagnostic(waited ?? `the node agent ${agent} stopped at once, its restore served whole before`);
-        t.diagnostic(all);
+        if (throughSocket) {
+          assert.equal(waited, undefined, `the node agent ${agent} waited on a restore through its socket: ${waited}`);
+          t.diagnostic(all ?? `the node agent ${agent} stopped at once, its restore through its socket left to the agent that comes back`);
+        } else {
+          assert.ok(all, `the node agent ${agent} did not say it served ${big}'s restore all its pages`);
+          t.diagnostic(waited ?? `the node agent ${agent} stopped at once, its restore served whole before`);
+          t.diagnostic(all);
+        }
         await answered;
-        const summed = await repl.sum(big, held);
-        assert.equal(summed.sha256, sha256);
+        // What the gateway and the node agents said of it, where it cannot be read.
+        const logged = async () => console.error(`# what the sandbox service logged of ${big}:\n${await serviceLogs(big)}`);
+        const summed = await repl.sum(big, held).catch(async (error: unknown) => {
+          await logged();
+          throw error;
+        });
+        if (summed.sha256 !== sha256) await logged();
+        assert.equal(summed.sha256, sha256, summed.notice ?? "bayma told the exec nothing");
         assert.match(summed.notice ?? "", CAME_BACK_WHOLE);
       } finally {
         log.stop();
         await until(`a node agent ready again on ${node}`, async () => ((await nodeAgents()).has(node) ? true : undefined), 300_000);
       }
+      if (throughSocket) {
+        // The agent that came back took the restore's token back, as the one stopped kept it on the node.
+        const again = (await nodeAgents()).get(node) ?? "";
+        assert.match(await kube.logs(NAMESPACE, again, "node-agent"), /the node agent took back the tokens of [1-9]\d* restores reading the snapshots bucket through it/u, again);
+      }
       // Saved again, as a sandbox whose background reads failed could be no more.
-      await untilReleased(big, Date.now());
+      await untilReleased(big, Date.now(), { savingMs: 480_000 });
       assert.ok(await snapshotOf(big), `the session ${big} was released with no snapshot`);
     });
 
-    test("a session released before alasio up changes the sessions' template is restored onto the one it was taken on, which the admission policy pins whole beside the new one, and admits no variant of", async (t) => {
+    test("a session released before alasio up changes the pools' template is restored onto the one it was taken on, which the gateway's configuration carries beside the new one", async (t) => {
       const taken = await newSession("none");
       const { sessionId: kept } = await repl.set(taken, `taken on the template before by ${taken}`);
-      const cpuOf = (sandbox: Sandbox | null) => sandbox?.spec.podTemplate.spec?.containers.find(({ name }) => name === "bayma")?.resources?.requests?.["cpu"];
-      const before = cpuOf(await kube.get<Sandbox>(ref("Sandbox", taken, SESSIONS)));
+      const cpuOf = (spec: V1PodTemplateSpec["spec"] | undefined) => spec?.containers.find(({ name }) => name === "bayma")?.resources?.requests?.["cpu"];
+      const before = cpuOf((await sessionPod(taken)).spec);
       assert.ok(before, `the session ${taken} asks for no CPU`);
       await untilReleased(taken, Date.now());
-      // alasio up, the sessions' pods asking for other CPU: their template changes.
+      // alasio up, the sessions' pods asking for other CPU: their pools' template changes.
       const { configFile } = paths();
       const config = JSON.parse(readFileSync(configFile, "utf8"));
       const after = before === "37m" ? "41m" : "37m";
       config.install.sessions = { ...config.install.sessions, resources: { ...config.install.sessions?.resources, requests: { ...config.install.sessions?.resources?.requests, cpu: after } } };
       writeFileSync(configFile, JSON.stringify(config));
       await alasioOk("up", "--timeout", "20m");
-      const templates = JSON.parse((await kube.get<V1ConfigMap>(ref("ConfigMap", componentName("sandbox-templates"), NAMESPACE)))?.data?.["templates.json"] ?? "{}");
-      const cpuIn = (profile: { podTemplate: V1Pod }) => profile.podTemplate.spec?.containers.find(({ name }) => name === "bayma")?.resources?.requests?.["cpu"];
-      assert.deepEqual([cpuIn(templates.sessions), cpuIn(templates.previousSessions)], [after, before]);
+      const templates = await gatewayTemplates();
+      assert.deepEqual([cpuOf(templates.current.spec), cpuOf(templates.previous?.spec)], [after, before]);
 
       // Its next turn restores it onto the template it was taken on, its REPL whole.
       const answered = await turn("hello across the change");
-      const restored = await kube.get<Sandbox>(ref("Sandbox", taken, SESSIONS));
-      assert.equal(cpuOf(restored), before);
+      const restored = await sessionPod(taken);
+      assert.match(restored.metadata?.name ?? "", /^sandboxes-none-restore-/u);
+      assert.equal(cpuOf(restored.spec), before);
       const seen = await repl.read(taken, kept);
       assert.deepEqual([seen.live, seen.checkpointed], [`taken on the template before by ${taken}`, `taken on the template before by ${taken}`]);
       assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
       t.diagnostic(`the turn's answer came ${answered} ms after its prompt, the session restored onto the template before the current one`);
 
-      // As alasio: a Sandbox as it, on the template before, is made; one of another image on it, or restored from another's image, is not.
-      assert.ok(restored);
-      const sandboxes = `/apis/agents.x-k8s.io/v1beta1/namespaces/${SESSIONS}/sandboxes`;
-      const copied = (name: string, change: (sandbox: Sandbox) => void = () => {}) => {
-        const sandbox: Sandbox = JSON.parse(
-          JSON.stringify({ apiVersion: restored.apiVersion, kind: restored.kind, metadata: { name, namespace: SESSIONS }, spec: { ...restored.spec, operatingMode: "Suspended" } }).replaceAll(taken, name),
-        );
-        change(sandbox);
-        return sandbox;
-      };
-      const bayma = (sandbox: Sandbox) => sandbox.spec.podTemplate.spec?.containers.find(({ name }) => name === "bayma");
-      // A restore's, of its own image, left paused and ready once resumed, or not.
-      const restoringFrom = (workspace: string, { paused = true, gated = true } = {}) => (sandbox: Sandbox) => {
-        sandbox.spec.podTemplate.metadata = {
-          ...sandbox.spec.podTemplate.metadata,
-          annotations: {
-            ...sandbox.spec.podTemplate.metadata?.annotations,
-            "dev.gvisor.internal.restore.host-image-path": `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/20261013T000000000Z-0123abcd`,
-            ...(paused ? { "dev.gvisor.internal.restore.paused": "true" } : {}),
-          },
-        };
-        if (gated && sandbox.spec.podTemplate.spec) sandbox.spec.podTemplate.spec.readinessGates = [{ conditionType: "alasio.dev/resumed" }];
-      };
-      const pausedAlone = (sandbox: Sandbox) => {
-        sandbox.spec.podTemplate.metadata = { ...sandbox.spec.podTemplate.metadata, annotations: { ...sandbox.spec.podTemplate.metadata?.annotations, "dev.gvisor.internal.restore.paused": "true" } };
-      };
-      for (const [name, change, status] of [
-        ["e2e-before", undefined, 201],
-        ["e2e-before-image", (sandbox: Sandbox) => {
-          const container = bayma(sandbox);
-          if (container) container.image = `${container.image?.split("@")[0]}@sha256:${"0".repeat(64)}`;
-        }, 422],
-        ["e2e-before-own", restoringFrom("e2e-before-own"), 201],
-        ["e2e-before-other", restoringFrom(taken), 422],
-        ["e2e-before-running", restoringFrom("e2e-before-running", { paused: false }), 422],
-        ["e2e-before-ungated", restoringFrom("e2e-before-ungated", { gated: false }), 422],
-        ["e2e-before-paused", pausedAlone, 422],
-      ] as const) {
-        assert.equal(await asAlasio("POST", sandboxes, "application/json", copied(name, change)), status, name);
-        if (status === 201) await kube.remove(ref("Sandbox", name, SESSIONS));
-      }
-
       // A session made now is on the new template.
       const made = await newSession("none");
-      assert.equal(cpuOf(await kube.get<Sandbox>(ref("Sandbox", made, SESSIONS))), after);
+      assert.equal(cpuOf((await sessionPod(made)).spec), after);
     });
   });
 }
 
 if (inShard("workspaces")) {
+  describe("workspace storage's usage", () => {
+    before(async () => {
+      sink = await forward(OTLP);
+    });
+
+    after(() => {
+      sink?.close();
+    });
+
+    test("each node agent reports what workspace storage uses and has, as its node's mount counts them, which the stack's collector sends on", async () => {
+      // The nodes' mount runs no background job, so JuiceFS reports no usage of its own.
+      for (const name of ["alasio.workspace_storage.used", "alasio.workspace_storage.capacity", "alasio.workspace_storage.inodes.used", "alasio.workspace_storage.inodes"]) {
+        assert.ok(await untilExported("metrics", name, 240_000), `no ${name} arrived`);
+      }
+    });
+  });
+
   describe("the node agents' proxy of the snapshots bucket", () => {
     // A session is made as the operator makes one, in Telegram.
     before(async () => {
@@ -1616,9 +1849,12 @@ if (inShard("workspaces")) {
           if (other === node) continue;
           assert.doesNotMatch(await fromNode(other, address), /HTTP\/1\.1 \d+/u, `${other} reached ${node}'s agent's proxy`);
         }
-        // A pod, alasio's, which reaches the agent's own API: not its proxy.
+        // The gateway's pod, which reaches the agent's own API: not its proxy; and alasio's, neither.
+        const fromGateway = async (port: number) =>
+          (await kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, componentName("sandbox-gateway")), ["node", "-e", tcp(JSON.stringify(address), port)], { container: "sandbox-gateway" })).trim();
+        assert.equal(await fromGateway(STORE_PROXY_PORT), "blocked", `the gateway's pod reached ${node}'s agent's proxy`);
+        assert.equal(await fromGateway(NODE_AGENT_PORT), "open", `the gateway's pod did not reach ${node}'s agent`);
         assert.equal((await inAlasioContainer(["node", "-e", tcp(JSON.stringify(address), STORE_PROXY_PORT)])).trim(), "blocked", `alasio's pod reached ${node}'s agent's proxy`);
-        assert.equal((await inAlasioContainer(["node", "-e", tcp(JSON.stringify(address), NODE_AGENT_PORT)])).trim(), "open");
         // Nor a session's, which a restore from the bucket runs in.
         assert.equal((await inSession(session, tcp(JSON.stringify(address), STORE_PROXY_PORT))).trim(), "blocked", `the session ${session} reached ${node}'s agent's proxy`);
       }
@@ -1638,7 +1874,7 @@ if (inShard("workspaces")) {
 
     test("Fork in the workspace panel switches the conversation to a clone of its session workspace, where a turn runs in a session of its own, the source untouched", async () => {
       const source = await newSession("none");
-      const inWorkspace = (volumeId: string, script: string) => kube.execOk(SESSIONS, volumeId, ["sh", "-c", script], { container: "bayma" });
+      const inWorkspace = async (volumeId: string, script: string) => kube.execOk(SESSIONS, (await bindSession(volumeId)).name, ["sh", "-c", script], { container: "bayma" });
       await inWorkspace(source, "echo from the source > /workspace/kept");
       await tg.say("/service codex");
       await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
@@ -1653,9 +1889,8 @@ if (inShard("workspaces")) {
       const fork = new RegExp(`^Forked session workspace ${source} into session workspace (fs-[0-9a-f]+) and switched to it`, "mu").exec(panel.payload.text ?? "")?.[1];
       assert.ok(fork, panel.payload.text);
       assert.match(panel.payload.text ?? "", new RegExp(`^Session workspace: ${fork}, no internet, fork of ${source}$`, "mu"));
-      // The fork waits, suspended, for its first turn; the source runs again.
-      assert.equal(await kube.get<V1Pod>(ref("Pod", fork, SESSIONS)), null);
-      assert.ok(await kube.get<V1Pod>(ref("Pod", source, SESSIONS)));
+      // The fork waits, bound to no pod, for its first turn.
+      assert.equal(await boundPodOf(fork), null);
 
       await tg.say("hello from the fork");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
@@ -1672,6 +1907,7 @@ if (inShard("workspaces")) {
   });
 
   workspaceStorage();
+  sandboxService();
 }
 
 /** How many rows of the lake's `otel` metric tables `condition` selects, as SQL. */
@@ -1811,6 +2047,8 @@ if (inShard("telemetry")) {
 
     test("a session's bayma's telemetry is in the lake, stamped with its session, and reaches the installation's backend too", async () => {
       const volumeId = await newSession("none");
+      // An exec of its bayma's, through the gateway, which bayma traces.
+      await repl.set(volumeId, "traced");
       await untilInLake("trace of the session's bayma", `select count(*) as n from otel.traces where ServiceName = 'bayma' and ResourceAttributes['alasio.volume.id'] = '${volumeId}'`);
       assert.ok(await untilExported("traces", volumeId, 120_000), "no trace of the session's bayma arrived at the backend stamped with it");
     });
@@ -2022,6 +2260,8 @@ if (inShard("telemetry")) {
       // The log's, its brokers' among them, and its intake's, how far behind it is.
       await untilInLake("metric of the log's", metricRows("ServiceName = 'log' and MetricName = 'kafka_server_broker_state'"));
       await untilInLake("metric of the lake's intake's", metricRows("ServiceName = 'lake-intake' and MetricName = 'lake_telemetry_lag_records'"));
+      // Each node's filesystem, as its kubelet says it, which the disk alert reads.
+      await untilInLake("filesystem of a node's", metricRows("MetricName = 'k8s.node.filesystem.available'"));
     });
 
     describe("Grafana", () => {
@@ -2103,10 +2343,9 @@ if (inShard("telemetry")) {
     });
 
     test("the stack's collector sends JuiceFS's metrics and Valkey's to the installation's backend too", async () => {
-      // JuiceFS's are its own Prometheus metrics, scraped from its clients and from its
-      // driver, whose provisioning errors only its controller counts; Valkey's, the
-      // collector's redis receiver's.
-      const names = ["juicefs_", "juicefs_provision_errors", "redis.memory.used"];
+      // JuiceFS's are its own Prometheus metrics, scraped from each node's mount, its client's
+      // operations among them; Valkey's, the collector's redis receiver's.
+      const names = ["juicefs_fuse_ops", "redis.memory.used"];
       const arrived = await Promise.all(names.map((name) => untilExported("metrics", name, 180_000)));
       assert.deepEqual(names.filter((_, index) => !arrived[index]), [], "no metric of these names arrived");
     });
@@ -2471,7 +2710,18 @@ function kedaHpa(): V2HorizontalPodAutoscaler | null {
 
 /** Asks the API server `method` of `path`, with `body` as `contentType`, as alasio's ServiceAccount, from its pod: the status it answered. */
 async function asAlasio(method: string, path: string, contentType: string, body: unknown): Promise<number> {
-  const said = await inAlasioContainer([
+  return asAccountIn(inAlasioContainer, method, path, contentType, body);
+}
+
+/** Asks the API server as asAlasio does, as the sandbox gateway's ServiceAccount, from its pod. */
+async function asGateway(method: string, path: string, contentType: string, body: unknown): Promise<number> {
+  const gateway = await kube.runningPod(NAMESPACE, GATEWAY);
+  return asAccountIn((command, stdin) => kube.execOk(NAMESPACE, gateway, command, { container: GATEWAY_COMPONENT, ...(stdin === undefined ? {} : { stdin }) }), method, path, contentType, body);
+}
+
+/** Asks the API server `method` of `path`, with `body` as `contentType`, by curl `run` in a pod, as the pod's ServiceAccount: the status it answered. */
+async function asAccountIn(run: (command: readonly string[], stdin?: string) => Promise<string>, method: string, path: string, contentType: string, body: unknown): Promise<number> {
+  const said = await run([
     "sh",
     "-c",
     'cd /var/run/secrets/kubernetes.io/serviceaccount && curl -sS -o /dev/null -w "%{http_code}" --cacert ca.crt -H "Authorization: Bearer $(cat token)" ' +
@@ -2481,6 +2731,34 @@ async function asAlasio(method: string, path: string, contentType: string, body:
     contentType,
   ], JSON.stringify(body));
   return Number(said);
+}
+
+/**
+ * Whether the container of the pod `name` in `namespace` runs on remote snapshots: a lower
+ * directory of its rootfs's overlay, on its node, is one of stargz-snapshotter's FUSE
+ * mounts, which reads its layer from the registry as it is read.
+ */
+async function onRemoteSnapshot(namespace: string, name: string): Promise<boolean> {
+  const pod = await kube.get<V1Pod>(ref("Pod", name, namespace));
+  const id = pod?.status?.containerStatuses?.[0]?.containerID?.replace(/^containerd:\/\//u, "");
+  assert.ok(pod?.spec?.nodeName && id, `${namespace}/${name} runs no container`);
+  // Each line: its id, its parent's, its device, its root, where it is mounted, its options, "-", its type, its source, its own options.
+  const mounts = (await onNode(pod.spec.nodeName, "cat /proc/self/mountinfo")).split("\n").map((line) => {
+    const [before = "", after = ""] = line.split(" - ");
+    const [type = "", , options = ""] = after.split(" ");
+    return { at: before.split(" ")[4] ?? "", type, options };
+  });
+  const remote = new Set(mounts.filter(({ type }) => type.startsWith("fuse.")).map(({ at }) => at));
+  const rootfs = mounts.find(({ at, type }) => type === "overlay" && at.endsWith(`/${id}/rootfs`));
+  assert.ok(rootfs, `${namespace}/${name}'s rootfs is no overlay on its node`);
+  const lower = /(?:^|,)lowerdir=([^,]+)/u.exec(rootfs.options)?.[1] ?? "";
+  return lower.split(":").some((directory) => remote.has(directory));
+}
+
+/** A duration as Go prints it, as kubelet's events do, `1m2.5s` or `850ms`, in seconds. */
+function goSeconds(text: string): number {
+  const units: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 1e-3, "µs": 1e-6, us: 1e-6, ns: 1e-9 };
+  return [...text.matchAll(/([\d.]+)(h|ms|m|s|µs|us|ns)/gu)].reduce((sum, [, value, unit]) => sum + Number(value) * (units[unit ?? ""] ?? 0), 0);
 }
 
 /** Whether the pod's label says it runs a turn. */
@@ -2603,112 +2881,98 @@ if (inShard("scaling")) {
       }
     });
 
-    test("a turn holds alasio's pod and its session's busy until it ends", async () => {
+    test("a turn holds alasio's pod busy until it ends, its session's pod bound throughout", async () => {
       const volumeId = await newSession("none");
       await tg.say("/service codex");
       await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
       const alasioPod = await kube.runningPod(NAMESPACE, RELEASE);
+      const bound = await sessionPod(volumeId);
       await tg.say("wait 30");
-      await until("both pods busy", async () => ((await labelledBusy(NAMESPACE, alasioPod)) && (await labelledBusy(SESSIONS, volumeId)) ? true : undefined), 60_000);
+      await until("alasio's pod busy", async () => ((await labelledBusy(NAMESPACE, alasioPod)) ? true : undefined), 60_000);
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER, 120_000);
-      await until("neither pod busy", async () => (!(await labelledBusy(NAMESPACE, alasioPod)) && !(await labelledBusy(SESSIONS, volumeId)) ? true : undefined), 60_000);
+      await until("alasio's pod no longer busy", async () => (!(await labelledBusy(NAMESPACE, alasioPod)) ? true : undefined), 60_000);
+      // Bound, as the gateway keeps it until its release: of its binding, and kept on its node.
+      const now = await sessionPod(volumeId);
+      assert.equal(now.metadata?.uid, bound.metadata?.uid);
+      assert.equal(now.metadata?.annotations?.["karpenter.sh/do-not-disrupt"], "true");
     });
 
-    test("alasio may change no more of a pod than its busy label and annotations, of its own namespace's its own alone, and make no Job, Sandbox or Secret but as it renders them", async () => {
+    test("alasio may change no more of a pod than its busy label and annotations, of its own namespace's its own alone, and nothing of its sessions, which are the gateway's", async () => {
       const volumeId = await newSession("none");
+      const session = (await sessionPod(volumeId)).metadata?.name ?? "";
       const grafana = await kube.runningPod(NAMESPACE, componentName("grafana"));
       const imageOf = async (namespace: string, name: string) => (await kube.get<V1Pod>(ref("Pod", name, namespace)))?.spec?.containers[0]?.image;
-      const images = [await imageOf(SESSIONS, volumeId), await imageOf(NAMESPACE, grafana)];
+      const images = [await imageOf(SESSIONS, session), await imageOf(NAMESPACE, grafana)];
       const merged = "application/merge-patch+json";
       const patched = "application/json-patch+json";
       const pod = (namespace: string, name: string) => `/api/v1/namespaces/${namespace}/pods/${name}`;
       // An image the API server lets a pod's container be changed to, but for the policy.
       const otherImage = [{ op: "replace", path: "/spec/containers/0/image", value: "registry.k8s.io/pause:3.10.1" }];
-      assert.equal(await asAlasio("PATCH", pod(SESSIONS, volumeId), merged, { metadata: { labels: { "alasio.dev/busy": "true" }, annotations: { "karpenter.sh/do-not-disrupt": "true" } } }), 200);
-      assert.equal(await asAlasio("PATCH", pod(SESSIONS, volumeId), merged, { metadata: { labels: { "alasio.dev/busy": null }, annotations: { "karpenter.sh/do-not-disrupt": null } } }), 200);
-      assert.equal(await asAlasio("PATCH", pod(SESSIONS, volumeId), patched, otherImage), 422);
-      assert.equal(await asAlasio("PATCH", pod(NAMESPACE, grafana), patched, otherImage), 422);
-      assert.equal(await asAlasio("PATCH", pod(SESSIONS, volumeId), merged, { metadata: { labels: { "app.kubernetes.io/component": "other" } } }), 422);
-      assert.equal(await asAlasio("PATCH", pod(SESSIONS, volumeId), merged, { metadata: { finalizers: ["e2e.alasio.dev/held"] } }), 422);
-      assert.equal(await asAlasio("PATCH", pod(SESSIONS, volumeId), merged, { metadata: { ownerReferences: null } }), 422);
-      assert.deepEqual([await imageOf(SESSIONS, volumeId), await imageOf(NAMESPACE, grafana)], images);
-      // Of its own namespace's pods, its own alone: not the floor's beside it.
+      // Of its own namespace's pods, its own alone: not the floor's beside it, nor its own but for its busy label.
       const busyLabel = (busy: boolean) => ({ metadata: { labels: { "alasio.dev/busy": busy ? "true" : null } } });
       const own = await kube.runningPod(NAMESPACE, RELEASE);
       assert.equal(await asAlasio("PATCH", pod(NAMESPACE, grafana), merged, busyLabel(true)), 422);
+      assert.equal(await asAlasio("PATCH", pod(NAMESPACE, grafana), patched, otherImage), 422);
       assert.equal(await asAlasio("PATCH", pod(NAMESPACE, own), merged, busyLabel(false)), 200);
-      // A Sandbox as its session's, but under runc rather than the sessions' runtime; and as it, which is made.
-      const session = await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS));
-      assert.ok(session);
-      const copied = (name: string, runtime: boolean) => {
-        const text = JSON.stringify({ apiVersion: session.apiVersion, kind: session.kind, metadata: { name, namespace: SESSIONS }, spec: { ...session.spec, operatingMode: "Suspended" } })
-          .replaceAll(volumeId, name);
-        const sandbox: Sandbox = JSON.parse(text);
-        if (!runtime) delete sandbox.spec.podTemplate.spec?.runtimeClassName;
-        return sandbox;
-      };
-      const sandboxes = `/apis/agents.x-k8s.io/v1beta1/namespaces/${SESSIONS}/sandboxes`;
-      assert.equal(await asAlasio("POST", sandboxes, "application/json", copied("e2e-runc", false)), 422);
-      assert.equal(await asAlasio("POST", sandboxes, "application/json", copied("e2e-made", true)), 201);
-      await kube.remove(ref("Sandbox", "e2e-made", SESSIONS));
-      // A Secret that would be a ServiceAccount's token.
-      const token = { apiVersion: "v1", kind: "Secret", metadata: { name: "e2e-bayma-token", annotations: { "kubernetes.io/service-account.name": "default" } }, type: "kubernetes.io/service-account-token" };
-      assert.equal(await asAlasio("POST", `/api/v1/namespaces/${SESSIONS}/secrets`, "application/json", token), 422);
-      // The clone's Job, as the installation gives it alasio, but as KEDA's operator, whose rights reach the whole cluster.
-      const templates = await kube.get<V1ConfigMap>(ref("ConfigMap", componentName("sandbox-templates"), NAMESPACE));
-      const job: V1Job = JSON.parse(templates?.data?.["templates.json"] ?? "{}").sessions.clone.job;
-      const borrowed: V1Job = { ...job, metadata: { ...job.metadata, generateName: "e2e-borrowed-" } };
-      if (borrowed.spec?.template.spec) borrowed.spec.template.spec.serviceAccountName = componentName("keda-operator");
-      assert.equal(await asAlasio("POST", `/apis/batch/v1/namespaces/${NAMESPACE}/jobs`, "application/json", borrowed), 422);
-      const jobs = await kube.list<V1Job>("Job", { namespace: NAMESPACE });
-      assert.deepEqual(jobs.filter(({ metadata }) => metadata?.name?.startsWith("e2e-borrowed-")), []);
+      assert.equal(await asAlasio("PATCH", pod(NAMESPACE, own), merged, { metadata: { labels: { "app.kubernetes.io/component": "other" } } }), 422);
+      // Of its sessions, nothing: their pods, Secrets and Jobs are none of its.
+      assert.equal(await asAlasio("PATCH", pod(SESSIONS, session), merged, busyLabel(true)), 403);
+      assert.equal(await asAlasio("PATCH", pod(SESSIONS, session), patched, otherImage), 403);
+      const made = { apiVersion: "v1", kind: "Pod", metadata: { name: "e2e-made" }, spec: { containers: [{ name: "bayma", image: "busybox" }] } };
+      assert.equal(await asAlasio("POST", `/api/v1/namespaces/${SESSIONS}/pods`, "application/json", made), 403);
+      const token = { apiVersion: "v1", kind: "Secret", metadata: { name: "e2e-bayma-token" }, type: "Opaque", data: { token: "dG9rZW4=" } };
+      assert.equal(await asAlasio("POST", `/api/v1/namespaces/${SESSIONS}/secrets`, "application/json", token), 403);
+      const job = { apiVersion: "batch/v1", kind: "Job", metadata: { generateName: "e2e-borrowed-" }, spec: { template: { spec: { restartPolicy: "Never", serviceAccountName: componentName("keda-operator"), containers: [{ name: "x", image: "busybox" }] } } } };
+      assert.equal(await asAlasio("POST", `/apis/batch/v1/namespaces/${NAMESPACE}/jobs`, "application/json", job), 403);
+      assert.deepEqual([await imageOf(SESSIONS, session), await imageOf(NAMESPACE, grafana)], images);
     });
 
-    test("a session's pod is not evicted while a turn runs in it, and is once the turn ends", async () => {
+    test("a bound session's pod is not evicted, and is gone once the gateway has released it, as its caller asks", async () => {
       const volumeId = await newSession("none");
-      await tg.say("/service codex");
-      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
-      await tg.say("wait 30");
-      await until("the session busy", async () => ((await labelledBusy(SESSIONS, volumeId)) ? true : undefined), 60_000);
+      const name = (await sessionPod(volumeId)).metadata?.name ?? "";
       // An eviction, as a drain or a node autoscaler asks one: what the API server said.
       const evict = () => {
-        const eviction = { apiVersion: "policy/v1", kind: "Eviction", metadata: { name: volumeId, namespace: SESSIONS } };
-        return kubectl(["create", "--raw", `/api/v1/namespaces/${SESSIONS}/pods/${volumeId}/eviction`, "-f", "-"], JSON.stringify(eviction)).said;
+        const eviction = { apiVersion: "policy/v1", kind: "Eviction", metadata: { name, namespace: SESSIONS } };
+        return kubectl(["create", "--raw", `/api/v1/namespaces/${SESSIONS}/pods/${name}/eviction`, "-f", "-"], JSON.stringify(eviction)).said;
       };
       assert.match(evict(), /disruption budget/u);
-      const uid = (await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS)))?.metadata?.uid;
-      assert.ok(uid, "the session's pod is not evicted");
-      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER, 120_000);
-      await until("the session no longer busy", async () => (!(await labelledBusy(SESSIONS, volumeId)) ? true : undefined), 60_000);
-      assert.doesNotMatch(evict(), /disruption budget|Error/u);
-      // Gone, or going, or made anew by its Sandbox.
-      await until("the session's pod evicted", async () => {
-        const pod = await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS));
-        return pod === null || pod.metadata?.deletionTimestamp !== undefined || pod.metadata?.uid !== uid ? true : undefined;
-      }, 60_000);
+      assert.ok(await kube.get<V1Pod>(ref("Pod", name, SESSIONS)), "the session's pod is evicted");
+      // Released, as its idleness would release it past releaseAfter, which this shard's is not: its pod deleted by the gateway.
+      const released = await gatewayCall(await mainToken(volumeId), "POST", "/release");
+      assert.equal(released.status, 204, released.said);
+      await until("the session's pod gone, released", async () => ((await kube.get(ref("Pod", name, SESSIONS))) === null ? true : undefined), 180_000);
     });
 
-    test("a node's drain waits until the turn running in a session there ends, then evicts it", { skip: AGENTS < 2 && "a drain of the cluster's one node stops all of it" }, async () => {
+    test("a node's drain waits until the session bound there is released, once its turn has ended, then drains", { skip: AGENTS < 2 && "a drain of the cluster's one node stops all of it" }, async () => {
       const volumeId = await newSession("none");
-      const node = (await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS)))?.spec?.nodeName ?? "";
+      const node = (await sessionPod(volumeId)).spec?.nodeName ?? "";
       await tg.say("/service codex");
       await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
       await tg.say("wait 60");
-      await until("the session busy", async () => ((await labelledBusy(SESSIONS, volumeId)) ? true : undefined), 60_000);
-      // kubectl drain, of the session's pods alone, as the node's other pods are not this test's.
+      await until("alasio's pod busy", async () => ((await labelledBusy(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE))) ? true : undefined), 60_000);
+      // kubectl drain refuses a node holding a bound pod at once, unless forced, as a bound pod is its ReplicaSet's no more.
+      const selector = `${BINDING_LABEL}=${keyHash(sessionKey(volumeId))}`;
+      const began = Date.now();
+      const unforced = await onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=${selector} --delete-emptydir-data --timeout=60s`).then(() => "drained", (error: unknown) => String(error));
+      assert.match(unforced, /cannot delete Pods that declare no controller \(use --force to override\)/u);
+      assert.ok(Date.now() - began < 30_000, `the unforced drain took ${Date.now() - began} ms to refuse`);
+      // Forced, of the session's bound pod alone, as the node's other pods are not this test's.
       let drained = 0;
-      const draining = onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=app.kubernetes.io/component=session --delete-emptydir-data --timeout=300s`).then((said) => {
+      const draining = onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=${BINDING_LABEL}=${keyHash(sessionKey(volumeId))} --force --delete-emptydir-data --timeout=600s`).then((said) => {
         drained = Date.now();
         return said;
       });
       try {
         await sleep(20_000);
         assert.equal(drained, 0, "the drain waits while the turn runs");
-        assert.ok(await kube.get(ref("Pod", volumeId, SESSIONS)), "the session's pod is not evicted");
+        assert.ok(await boundPodOf(volumeId), "the session's pod is evicted");
         await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER, 120_000);
         const answered = Date.now();
-        assert.match(await draining, /evicted/u);
-        assert.ok(drained >= answered, "the session was evicted once its turn had answered");
+        // Released, as its idleness would release it past releaseAfter, which this shard's is not.
+        assert.equal((await gatewayCall(await mainToken(volumeId), "POST", "/release")).status, 204);
+        await draining;
+        assert.ok(drained >= answered, "the session's pod was drained once its turn had answered");
+        assert.equal(await boundPodOf(volumeId), null);
       } finally {
         await draining.catch(() => undefined);
         await onNode(`${CLUSTER}-server-0`, `kubectl uncordon ${node}`);
@@ -2805,6 +3069,35 @@ const FOLDER_CHAT = OTHER_OPERATOR;
  * written in it, and a turn on Codex there, in the operator's chat; and, where folder
  * workspaces are on, a folder mounted in another chat, on Codex. The session's volume id.
  */
+/**
+ * Main at work on the release before, as the upgrade shard seeds it: in a session workspace,
+ * made from the panel and run a turn in on Codex, as that release runs them, then in a folder
+ * of its own, which it goes on in; and the other chat in a folder of its own. Main's session
+ * workspace, which the cut-over refuses while it is left.
+ */
+async function workInMainOnPrevious(): Promise<string> {
+  await tg.calls();
+  await tg.say("/workspace");
+  await tg.choose(/New empty workspace/u);
+  await tg.choose(/No internet/u);
+  const created = await tg.waitFor((call) => /Created and mounted session workspace/u.test(call.payload.text ?? ""));
+  const volumeId = /fs-[0-9a-f]+/u.exec(created.payload.text ?? "")?.[0];
+  assert.ok(volumeId, `alasio named no workspace: ${created.payload.text}`);
+  await tg.say("/service codex");
+  await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+  await tg.say("hello");
+  await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+  await tg.say("/workspace new e2e-main");
+  await tg.waitFor((call) => /e2e-main/u.test(call.payload.text ?? ""));
+  await tg.say("hello");
+  await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+  await tg.say("/workspace new e2e-folder", FOLDER_CHAT);
+  await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /e2e-folder/u.test(call.payload.text ?? ""));
+  await tg.say("/service codex", FOLDER_CHAT);
+  await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /^Active: Codex$/mu.test(call.payload.text ?? ""));
+  return volumeId;
+}
+
 async function workInMain(): Promise<string> {
   const volumeId = await newSession("none");
   await inSession(volumeId, 'require("fs").writeFileSync("/workspace/proof", "written by main")');
@@ -2857,6 +3150,8 @@ if (inShard("branches")) {
     let branchTelegram: Forward | undefined;
     let branch: ReturnType<typeof operator>;
     let volumeId: string;
+    /** Main's sandbox service, as it ran before the branch was made. */
+    let mainService: string[];
 
     before(async () => {
       telegram = await forward(TELEGRAM);
@@ -2876,6 +3171,7 @@ if (inShard("branches")) {
     });
 
     test("alasio branch create makes the branch, serving its own bot, and main's lake keeps its files while it is", async () => {
+      mainService = await mainSandboxService();
       const started = Date.now();
       // Its compute sleeps after a minute idle.
       await createBranch(branchTelegram?.base, { neon: { compute: { suspendAfter: "1m" } } });
@@ -2885,6 +3181,12 @@ if (inShard("branches")) {
       await maintained("kept the files for the branch", (line) => line.includes(`"keptFilesFor":["${BRANCH}"]`));
     });
 
+    test("main's sandbox gateway binds the branch's sessions in the branch's own pools, by the branch's own key, and nothing of main's sandbox service restarted", async () => {
+      assert.equal((await servesBranch(BRANCH)).status, 409);
+      assert.deepEqual(await bindInBranch(BRANCH), { namespace: BRANCH_SESSIONS });
+      assert.deepEqual(await mainSandboxService(), mainService);
+    });
+
     test("a turn on the branch goes on in main's conversation in a fork of its workspace, which main made, and nothing of main's changes", async () => {
       const messages = await onDatabase(NAMESPACE, "select count(*) from state.messages");
       const mounted = await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'");
@@ -2892,9 +3194,10 @@ if (inShard("branches")) {
       await tg.calls();
       await branch.say("again");
       await branch.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
-      // Forked into the branch's own sessions, under the same id, with main's files.
-      assert.ok(await kube.get(ref("Sandbox", volumeId, BRANCH_SESSIONS)));
-      const inBranch = (code: string) => kube.execOk(BRANCH_SESSIONS, volumeId, ["node", "-e", code], { container: "bayma" });
+      // Forked into the branch's own sessions, under the same id, with main's files, bound in the branch's own pools.
+      const bound = await boundPodOf(volumeId, BRANCH_SESSIONS);
+      assert.ok(bound, `the branch's ${volumeId} is bound to no pod of its own pools`);
+      const inBranch = (code: string) => kube.execOk(BRANCH_SESSIONS, bound.name, ["node", "-e", code], { container: "bayma" });
       assert.equal(await inBranch('process.stdout.write(require("fs").readFileSync("/workspace/proof", "utf8"))'), "written by main");
       await inBranch('require("fs").writeFileSync("/workspace/proof", "written by the branch")');
       assert.equal(await inSession(volumeId, 'process.stdout.write(require("fs").readFileSync("/workspace/proof", "utf8"))'), "written by main");
@@ -3013,21 +3316,41 @@ if (inShard("branches")) {
       assert.equal((await kube.get<V1Deployment>(compute))?.spec?.replicas, 1);
     });
 
-    test("alasio branch delete leaves nothing of the branch, and main's lake maintenance deletes files again", async () => {
+    test("alasio branch delete refuses while a workspace of the branch's sessions is bound, and with --force leaves nothing of the branch, its workspaces deleted, and main's lake maintenance deletes files again", async () => {
       const { branches } = JSON.parse(await neonControl("/branches")) as { branches: { name: string; timelineId: string }[] };
       const timeline = branches.find(({ name }) => name === BRANCH)?.timelineId;
       assert.ok(timeline);
+      // Its session's workspace bound, as its alasio, stopped since, would bind it.
+      await bindBranchSession(BRANCH, volumeId);
+      const refused = await alasio("branch", "delete", BRANCH);
+      assert.notEqual(refused.code, 0, refused.stdout);
+      assert.match(refused.stderr, new RegExp(`its sessions?'s? workspaces? [^\\n]*\\b${volumeId}\\b[^\\n]* bound; --force deletes it all the same`, "u"));
+      assert.ok(await kube.get(ref("Namespace", BRANCH_SESSIONS)));
       // Its bot told to deliver nowhere, as the branch's stand-in is told.
-      await alasioOkWith({ TELEGRAM_API_ROOT: branchTelegram?.base }, "branch", "delete", BRANCH);
+      await alasioOkWith({ TELEGRAM_API_ROOT: branchTelegram?.base }, "branch", "delete", BRANCH, "--force");
       assert.equal(await alasioOk("branch", "list"), "alasio has no branch environments.\n");
       for (const namespace of [BRANCH_NAMESPACE, BRANCH_SESSIONS]) assert.equal(await kube.get(ref("Namespace", namespace)), null);
-      const volumes = await kube.list<V1PersistentVolume>("PersistentVolume");
-      assert.deepEqual(volumes.filter(({ spec }) => spec?.claimRef?.namespace === BRANCH_SESSIONS).map(({ metadata }) => metadata?.name), []);
+      // Nothing of its sessions' workspaces is left in workspace storage, as each node mounts it.
+      for (const agent of (await nodeAgents()).values()) {
+        assert.equal(await kube.execOk(NAMESPACE, agent, ["sh", "-c", `ls -A "$0" 2>/dev/null || true`, `${WORKSPACES_ROOT}/${BRANCH_SESSIONS}`], { container: "node-agent" }), "");
+      }
       const { tenantId } = JSON.parse(await kube.secret(NAMESPACE, "alasio-neon-root", "secrets.json")) as { tenantId: string };
       const controller = await kube.runningPod(NAMESPACE, "alasio-neon-storage-controller");
       const found = await kube.execOk(NAMESPACE, controller, ["sh", "-c", 'curl -sS -o /dev/null -w "%{http_code}" -H "authorization: Bearer $CONTROL_PLANE_JWT_TOKEN" "$0"', `http://127.0.0.1:1234/v1/tenant/${tenantId}/timeline/${timeline}`]);
       assert.equal(found, "404");
       await maintained("deleted files again", (line) => !line.includes("keptFilesFor"));
+      // Main's sandbox gateway serves the branch no more, and nothing of it restarted.
+      // Let go of as the gateway finds its environments anew, within its refresh (src/gateway/environments.ts).
+      for (const deadline = Date.now() + 120_000; ; await sleep(5000)) {
+        const served = await servesBranch(BRANCH);
+        if (served.status === 403) {
+          assert.match(served.said, new RegExp(`there is no environment ${BRANCH} of sessions`, "u"));
+          break;
+        }
+        assert.equal(served.status, 409, served.said);
+        assert.ok(Date.now() < deadline, "main's gateway still serves the deleted branch");
+      }
+      assert.deepEqual(await mainSandboxService(), mainService);
       // Main goes on as it was.
       await tg.say("and main?");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
@@ -3040,11 +3363,17 @@ const INSTALLED_HERE = [
   "/usr/local/bin/k3s",
   "/usr/local/bin/k3s-uninstall.sh",
   "/usr/local/lib/alasio",
+  "/usr/local/bin/containerd-stargz-grpc",
+  "/usr/local/bin/stargz-fuse-manager",
   "/etc/systemd/system/k3s.service",
+  "/etc/systemd/system/k3s.service.d",
+  "/etc/systemd/system/stargz-snapshotter.service",
+  "/etc/containerd-stargz-grpc",
+  "/var/lib/containerd-stargz-grpc",
   "/etc/rancher",
   "/var/lib/rancher",
   "/var/lib/kubelet",
-  "/var/lib/juicefs",
+  "/var/lib/alasio",
   "/etc/sysctl.d/60-alasio-inotify.conf",
 ];
 
@@ -3054,7 +3383,7 @@ describe("alasio uninstall --purge", { skip: KEEP && "the run keeps the cluster"
     assert.equal(
       await alasioOk("uninstall", "--purge", "--yes"),
       TARGET === "host"
-        ? `alasio and k3s on this machine are removed, with gVisor and all their data; the config at ${configFile} is kept.\n`
+        ? `alasio and k3s on this machine are removed, with gVisor, stargz-snapshotter and all their data; the config at ${configFile} is kept.\n`
         : `alasio and the cluster ${CLUSTER} are removed, with all their data; the config at ${configFile} is kept.\n`,
     );
     assert.ok(!existsSync(storage), `${storage} is left`);

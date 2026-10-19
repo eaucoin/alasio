@@ -11,6 +11,7 @@ import { TelegramClient, type TelegramError } from "./client.ts";
 import { type ReceivedFile, ReceivedFiles } from "./files.ts";
 import { MediaGroups } from "./media-group-buffer.ts";
 import { type IncomingFile, getMessageFiles, getMessageText } from "./message.ts";
+import { parseWorkspace } from "../workspace/kind.ts";
 
 /** Bot API getFile refuses anything larger than this, regardless of plan. */
 export const TELEGRAM_BOT_FILE_LIMIT_BYTES = 20 * 1024 * 1024;
@@ -73,6 +74,8 @@ export const handleMessage = Effect.fnUntraced(function*(message: Message, updat
 
   const received: ReceivedFile[] = [];
   const failures: string[] = [];
+  // Written where the agent of the conversation's workspace reads them.
+  const workspace = files.length > 0 ? parseWorkspace((yield* store.getMount(conversationId)).workingDirectory) : null;
   for (const file of files) {
     // A file the Bot API refuses must not poison the update: report it and carry on
     // with whatever else the message carried.
@@ -89,7 +92,7 @@ export const handleMessage = Effect.fnUntraced(function*(message: Message, updat
         onFailure: failed,
         // Kept in the store, or the update fails; then written for the agent to read.
         onSuccess: ({ name, content, sha256 }) =>
-          receivedFiles.keep({ conversationId, messageId, file, name, content, sha256 }).pipe(
+          receivedFiles.keep({ conversationId, messageId, file, name, content, sha256 }, workspace).pipe(
             Effect.flatMap((kept) => Effect.sync(() => received.push(kept))),
             Effect.catchTag("ReceivedFileError", failed),
           ),

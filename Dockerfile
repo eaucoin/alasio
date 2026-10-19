@@ -1,4 +1,6 @@
-# alasio's image: the bot, neon-control, and the Neon setup job, on Node.
+# alasio's image: the bot, neon-control, and the Neon setup job, on Node; and the node agent,
+# which sets workspaces' quotas with JuiceFS's own command, of the release of JuiceFS the
+# nodes mount workspace storage with (cli/src/manifests/config.ts mountImage).
 #
 # The base is a full Ubuntu userland rather than a slim one because, with the host
 # profile, the harnesses work on the operator's own machine from inside this
@@ -29,6 +31,16 @@ RUN curl -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-
  && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
  && rm /tmp/node.tar.xz \
  && node --version
+
+# JuiceFS's command, its own release's static build, of the mount image's version, verified
+# against the release's published checksum, and checked to be that version.
+ARG JUICEFS_VERSION=1.4.1
+ARG JUICEFS_SHA256=01ee09a21a9351a465e09906f113845e1c6a19bea70f530e5e2b2125b2dd3b82
+RUN curl -fsSLo /tmp/juicefs.tar.gz "https://github.com/juicedata/juicefs/releases/download/v${JUICEFS_VERSION}/juicefs-${JUICEFS_VERSION}-linux-amd64.tar.gz" \
+ && echo "${JUICEFS_SHA256}  /tmp/juicefs.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/juicefs.tar.gz -C /usr/local/bin --no-same-owner juicefs \
+ && rm /tmp/juicefs.tar.gz \
+ && HOME=/tmp juicefs version | grep -F "juicefs version ${JUICEFS_VERSION}+"
 
 WORKDIR /opt/alasio
 COPY package.json package-lock.json ./

@@ -17,14 +17,30 @@
  *   lake's loader's, readers' and intake's, the log's, the webhook intake's, each of SeaweedFS's parts' and, with workspace
  *   storage, JuiceFS's Prometheus metrics, each pod of each found among the pods of its
  *   namespace, which it may list, so a component's replicas are each scraped and one that
- *   sleeps is not; and it reads the Valkeys', the object store's filer store's and
- *   workspace storage's, each with its password. It sends what it scrapes to the gateway.
+ *   sleeps is not; it reads the Valkeys', the object store's filer store's and workspace
+ *   storage's, each with its password; and each node's filesystem, as its kubelet says it
+ *   (a receiver of each node the cluster lists, which the scraper may read), as a full disk
+ *   fails what it holds, the images stargz-snapshotter's daemon caches among it, which
+ *   kubelet's image GC does not see. It sends what it scrapes to the gateway.
  *
  * They run whenever the lake does, or an endpoint is set; with neither, nothing exports
  * anything. Each pod carries its configuration's checksum, so it is replaced when that
  * changes.
  */
-import type { KubernetesObject, V1ConfigMap, V1Container, V1Deployment, V1EnvVar, V1Role, V1RoleBinding, V1Service, V1ServiceAccount, V1Volume } from "@kubernetes/client-node";
+import type {
+  KubernetesObject,
+  V1ClusterRole,
+  V1ClusterRoleBinding,
+  V1ConfigMap,
+  V1Container,
+  V1Deployment,
+  V1EnvVar,
+  V1Role,
+  V1RoleBinding,
+  V1Service,
+  V1ServiceAccount,
+  V1Volume,
+} from "@kubernetes/client-node";
 
 import { COMPUTE_CTL_PORT } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
@@ -32,7 +48,7 @@ import { COLLECTOR_PORT, collectorRuns, componentName, given, goJson, lakeRuns, 
 import type { InstallConfig } from "./config.ts";
 import { LOG_BROKERS, LOG_METRICS_PORT, LOG_RECORD_BYTES, logPrincipalSecret, TELEMETRY_TOPICS } from "./log.ts";
 import { replicaBudget, spread } from "./disruption.ts";
-import { DRIVER_METRICS_PORT, DRIVER_POD_NAME, JUICEFS_METRICS_PORT, MOUNT_POD_NAME } from "./juicefs-csi.ts";
+import { JUICEFS_METRICS_PORT, sandboxServiceRuns, WORKSPACE_MOUNT_COMPONENT } from "./sandbox-gateway.ts";
 import { INTAKE_COMPONENT, LAKE_METRICS_PORT, LAKE_QUERY_PORT, LOADER_COMPONENT, QUERY_COMPONENT } from "./lake.ts";
 import { COMPONENTS, FILER_STORE, FILER_STORE_USERS, METRICS_PORT as SEAWEEDFS_METRICS_PORT } from "./object-store.ts";
 import { priority } from "./priorities.ts";
@@ -61,6 +77,27 @@ const SCRAPE_INTERVAL = "60s";
  * 8 MiB (./log.ts) and the intake writes in one commit, a file of each kind's.
  */
 const METRICS_BATCH = { send_batch_size: 10_000, send_batch_max_size: 10_000, timeout: "60s" };
+
+/**
+ * Each node's filesystem, read from its kubelet's stats (k8s.node.filesystem.available and
+ * .capacity): a kubeletstats receiver of each node the Kubernetes observer lists, with the
+ * scraper's ServiceAccount, whose serving certificate is the node's own.
+ */
+const NODE_STATS = {
+  watch_observers: ["k8s_observer"],
+  receivers: {
+    kubeletstats: {
+      rule: 'type == "k8s.node"',
+      config: {
+        auth_type: "serviceAccount",
+        endpoint: "`endpoint`:`kubelet_endpoint_port`",
+        insecure_skip_verify: true,
+        collection_interval: SCRAPE_INTERVAL,
+        metric_groups: ["node"],
+      },
+    },
+  },
+};
 
 /** Whether the bundled object store runs, whose parts it scrapes and whose filer store it reads. */
 const seaweedfsRuns = ({ neon, objectStore }: InstallConfig): boolean => neon.enabled && objectStore.bundled.enabled;
@@ -109,27 +146,9 @@ function podJob(job: string, namespace: string, components: readonly string[], p
   };
 }
 
-/** JuiceFS's pods of the name `name` in the driver's namespace, on the port `port` they serve their metrics on. */
-function juicefsJob(config: InstallConfig, job: string, name: string, port: number): object {
-  return {
-    job_name: job,
-    scrape_interval: SCRAPE_INTERVAL,
-    kubernetes_sd_configs: [{
-      role: "pod",
-      namespaces: { names: [config.workspaceStorage.csi.namespace] },
-      selectors: [{ role: "pod", label: `app.kubernetes.io/name=${name}` }],
-    }],
-    relabel_configs: [
-      { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
-      { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: `$$1:${port}` },
-      { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
-    ],
-  };
-}
-
 /** What it scrapes, a job of each component's pods, by the job's name, which its metrics' service is named. */
 function scrapes(config: InstallConfig): object[] {
-  const { neon, workspaceStorage } = config;
+  const { neon } = config;
   const stack: Record<string, readonly [components: readonly string[], port: number]> = {
     ...(neon.enabled
       ? {
@@ -157,10 +176,8 @@ function scrapes(config: InstallConfig): object[] {
     }),
     // The object store's parts, each labelled with its part.
     ...(seaweedfsRuns(config) ? [podJob("seaweedfs", NAMESPACE, SEAWEEDFS_SCRAPED, SEAWEEDFS_METRICS_PORT, true)] : []),
-    // The mount pods, the clients, and the controller's and node service's, the driver.
-    ...(workspaceStorage.enabled
-      ? [juicefsJob(config, "juicefs", MOUNT_POD_NAME, JUICEFS_METRICS_PORT), juicefsJob(config, "juicefs-csi", DRIVER_POD_NAME, DRIVER_METRICS_PORT)]
-      : []),
+    // Each node's mount of workspace storage, JuiceFS's client.
+    ...(sandboxServiceRuns(config) ? [podJob("juicefs", NAMESPACE, [WORKSPACE_MOUNT_COMPONENT], JUICEFS_METRICS_PORT)] : []),
   ];
 }
 
@@ -211,11 +228,13 @@ function gatewayConfig(config: InstallConfig): object {
   return { ...BASE, exporters, service: { ...SERVICE, pipelines: { traces: sent, logs: sent, metrics: sent } } };
 }
 
-/** The scraper's configuration: what it scrapes and reads, of the stack's, batched a minute's at a time, to the gateway. */
+/** The scraper's configuration: what it scrapes and reads, of the stack's, and of each node's filesystem, batched a minute's at a time, to the gateway. */
 function scraperConfig(scraped: readonly object[], read: readonly ReadValkey[]): object {
+  const stack = [...(scraped.length > 0 ? ["prometheus"] : []), ...read.map(({ receiver }) => receiver)];
   return {
-    extensions: BASE.extensions,
+    extensions: { ...BASE.extensions, k8s_observer: { auth_type: "serviceAccount", observe_nodes: true, observe_pods: false } },
     receivers: {
+      "receiver_creator/nodes": NODE_STATS,
       ...(scraped.length > 0 ? { prometheus: { config: { scrape_configs: scraped } } } : {}),
       ...Object.fromEntries(read.map(({ receiver, name, username, variable }) => [receiver, {
         endpoint: `${name}:${VALKEY_PORT}`,
@@ -236,12 +255,10 @@ function scraperConfig(scraped: readonly object[], read: readonly ReadValkey[]):
     exporters: { "otlphttp/gateway": { endpoint: `http://${COLLECTOR}:${COLLECTOR_PORT}` } },
     service: {
       ...SERVICE,
+      extensions: [...SERVICE.extensions, "k8s_observer"],
       pipelines: {
-        metrics: {
-          receivers: [...(scraped.length > 0 ? ["prometheus"] : []), ...read.map(({ receiver }) => receiver)],
-          processors: ["resource/stack", "batch"],
-          exporters: ["otlphttp/gateway"],
-        },
+        "metrics/nodes": { receivers: ["receiver_creator/nodes"], processors: ["batch"], exporters: ["otlphttp/gateway"] },
+        ...(stack.length > 0 ? { metrics: { receivers: stack, processors: ["resource/stack", "batch"], exporters: ["otlphttp/gateway"] } } : {}),
       },
     },
   };
@@ -339,12 +356,10 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
   ];
 }
 
-/** The scraper's objects, when it scrapes or reads anything: who it is, that it may list the pods it scrapes, its configuration and its Deployment. */
+/** The scraper's objects: who it is, that it may list the nodes and read their kubelets' stats, and the pods it scrapes, its configuration and its Deployment. */
 function scraperObjects(config: InstallConfig): KubernetesObject[] {
-  const { workspaceStorage } = config;
   const scraped = scrapes(config);
   const read = valkeys(config);
-  if (scraped.length === 0 && read.length === 0) return [];
   const configuration = scraperConfig(scraped, read);
   const metadata = { name: SCRAPER, namespace: NAMESPACE, labels: stackLabels(SCRAPER_COMPONENT) };
   const configMap: V1ConfigMap = { apiVersion: "v1", kind: "ConfigMap", metadata, data: { "config.yaml": goJson(configuration, "  ") } };
@@ -358,7 +373,7 @@ function scraperObjects(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels(SCRAPER_COMPONENT), annotations: { "checksum/config": sha256(goJson(configuration)) } },
         spec: {
-          ...(scraped.length > 0 ? { serviceAccountName: SCRAPER } : {}),
+          serviceAccountName: SCRAPER,
           ...priority("floor"),
           ...stackPodSpec(config),
           containers: [
@@ -375,10 +390,25 @@ function scraperObjects(config: InstallConfig): KubernetesObject[] {
     },
   };
   const sized = [configMap, deployment, verticalPodAutoscaler(deployment, "InPlace")];
-  if (scraped.length === 0) return sized;
-  // Who the scraper is, and that it may find the pods it scrapes in the namespaces they are in: its own, and JuiceFS's driver's.
-  const listed = [NAMESPACE, ...(workspaceStorage.enabled ? [workspaceStorage.csi.namespace] : [])];
+  // Who the scraper is, and that it may list the nodes and read their kubelets' stats.
   const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata };
+  const clusterMetadata = { name: SCRAPER, labels: metadata.labels };
+  const nodeReader: V1ClusterRole = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "ClusterRole",
+    metadata: clusterMetadata,
+    rules: [{ apiGroups: [""], resources: ["nodes"], verbs: ["get", "list", "watch"] }, { apiGroups: [""], resources: ["nodes/stats"], verbs: ["get"] }],
+  };
+  const nodeReading: V1ClusterRoleBinding = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "ClusterRoleBinding",
+    metadata: clusterMetadata,
+    subjects: [{ kind: "ServiceAccount", name: SCRAPER, namespace: NAMESPACE }],
+    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "ClusterRole", name: SCRAPER },
+  };
+  if (scraped.length === 0) return [serviceAccount, nodeReader, nodeReading, ...sized];
+  // And that it may find the pods it scrapes in its own namespace, where they are.
+  const listed = [NAMESPACE];
   const podLister = (namespace: string): KubernetesObject[] => {
     const inNamespace = { ...metadata, namespace };
     const role: V1Role = {
@@ -396,7 +426,7 @@ function scraperObjects(config: InstallConfig): KubernetesObject[] {
     };
     return [role, binding];
   };
-  return [serviceAccount, ...listed.flatMap(podLister), ...sized];
+  return [serviceAccount, nodeReader, nodeReading, ...listed.flatMap(podLister), ...sized];
 }
 
 /** The collector's objects, when it runs: its gateway's, and its scraper's. */

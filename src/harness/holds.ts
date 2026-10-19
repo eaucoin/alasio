@@ -1,6 +1,6 @@
 /**
  * A conversation held busy as no turn holds it, for what no turn may start under: a fork,
- * which suspends the workspace it mounts. Held as a row of alasio's store, which its
+ * which clones the workspace it mounts, which a turn would write into meanwhile. Held as a row of alasio's store, which its
  * harness host reads wherever it runs (./host.ts): it says the conversation is busy, and
  * reserves it for no turn, while the row is there. So a hold is made where no turn runs,
  * the row first and the host asked after, as the host reserves first and reads the row
@@ -10,10 +10,10 @@
  * at a time, renewed every HOLD_RENEWAL. A holder whose process stopped, or is stuck,
  * renews nothing, so it pins no conversation past HOLD_TTL. One whose work is stuck in an
  * await would renew it for as long as that work runs, so the work has a deadline,
- * HOLD_DEADLINE, from when it begins (a fork, once it has its turn at forking), past which
- * it is stopped and the hold let go of. A hold found expired, or taken, as it is renewed
- * is the work's no longer: the work is stopped, with HoldLost, before it touches the
- * workspace again. The letting go is tried until it is through, in
+ * HOLD_DEADLINE, from when it begins, past which it is stopped and the hold let go of. A
+ * hold found expired, or taken, as it is renewed is the work's no longer: the work is
+ * stopped, with HoldLost, before it touches the workspace again. The letting go is tried
+ * until it is through, in
  * the background, the hold expiring meanwhile if it never is.
  *
  * Clearing every row as alasio starts (Turns.reconcilePersistentState) is safe because
@@ -35,27 +35,13 @@ export const HOLD_TTL = Duration.minutes(2);
 /** How often a holder renews its hold, well within HOLD_TTL. */
 export const HOLD_RENEWAL = Duration.seconds(30);
 /**
- * How long the work a hold is made for may run once it begins: a fork, once it has its turn
- * at forking (src/sandbox/index.ts, which forks one at a time, so one waiting on another is
- * not overrun as it waits). Past all a fork waits on, each bounded on its own, so no fork
- * that could still finish is stopped by it, and one stuck in an await holds its
- * conversations no longer than this:
- *
- * - its claim bound to a volume, 5 minutes (src/sandbox/index.ts CLAIM_BOUND_TIMEOUT);
- * - its source released into a snapshot, the node agent's checkpoint, 15 minutes
- *   (src/node-agent/names.ts OPERATION_LIMIT_SECONDS), then suspended, 5 minutes
- *   (src/kube/sandboxes.ts READY_TIMEOUT), or suspended plain;
- * - the clone, a Job Kubernetes stops at an hour (cli/src/manifests/workspace-storage.ts
- *   cloneJob, activeDeadlineSeconds);
- * - the source's snapshot copied for the fork (snapshots.copy), the node agent's copy, 15
- *   minutes;
- * - the source resumed, restored from its snapshot: the node agent's prepare, 15 minutes,
- *   its pod running, 3 (src/sandbox/snapshots.ts POD_RUNNING_TIMEOUT), its resume, a minute
- *   (src/sandbox/node-agents.ts RESUME_CALL), and its Sandbox ready, 5.
- *
- * That is 2 hours 4 minutes at most; with room over it, two and a half hours.
+ * How long the work a hold is made for may run once it begins: a fork, one call of the
+ * sandbox gateway's (src/sandbox/gateway-client.ts fork), which clones the workspace and
+ * answers within the minute alasio waits for any call of its but a bind's and a release's
+ * (CALL_TIMEOUT_MS). So no fork that could still finish is stopped by it, and one stuck in
+ * an await holds its conversations no longer than this: the minute, with room over it.
  */
-export const HOLD_DEADLINE = Duration.minutes(150);
+export const HOLD_DEADLINE = Duration.minutes(5);
 /** How a letting go that failed is tried again, until it is through. */
 const LET_GO_AGAIN = Schedule.min([Schedule.exponential(Duration.seconds(1)), Schedule.spaced(Duration.minutes(1))]);
 
@@ -91,9 +77,7 @@ export interface HoldTiming {
  * Runs `work` holding the conversations busy for `reason`, as the module says: what it
  * gave, or none where it could not hold them, as one is busy, and then holds none. The hold
  * is let go of once the work is done, however it ended. `work` is given what it runs as it
- * begins, which starts its deadline (HOLD_DEADLINE): a fork runs it once it has its turn at
- * forking (SessionSandboxes' volumes.fork, permitted), so the wait for its turn is not
- * counted against it, as the fork it waits on has its own deadline.
+ * begins, which starts its deadline (HOLD_DEADLINE): a fork runs it as it asks the gateway.
  */
 export const whileHeld = <A, E, R>(
   host: HarnessHost["Service"],

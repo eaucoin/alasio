@@ -146,13 +146,12 @@ const unusedSandbox: SessionSandboxes["Service"] = {
     create: () => Effect.die(new Error("no volume is made")),
     fork: () => Effect.die(new Error("no volume is forked")),
     destroy: () => Effect.die(new Error("no volume is destroyed")),
-    forks: Effect.die(new Error("no fork is listed")),
+    list: Effect.die(new Error("no workspace is listed")),
   },
   harnessDirectory: () => assert.fail("harnessDirectory"),
-  pod: () => assert.fail("pod"),
   ensureSession: () => Effect.die(new Error("no session is ensured")),
   readFile: () => Effect.die(new Error("no file is read")),
-  holding: () => Effect.void,
+  writeFile: () => Effect.die(new Error("no file is written")),
 };
 
 /** The buttons of a message's inline keyboard. */

@@ -6,7 +6,8 @@
  * - a **folder**: an absolute path on the machine the deployment's host profile mounts,
  *   a trusted workspace with the operator's own access;
  * - a **session filesystem**: the sentinel `sessionfs:<volumeId>`, an empty isolated
- *   volume in a sandboxed Sandbox of its own (see ../sandbox/).
+ *   volume in a gVisor sandbox of its own, a pod the sandbox gateway binds it to (see
+ *   ../sandbox/).
  *
  * Every place that must tell them apart parses the string here rather than testing the
  * prefix itself, so the vocabulary lives in one module.
@@ -21,7 +22,7 @@ export interface FolderWorkspace {
   readonly path: string;
 }
 
-/** A session-filesystem workspace: the volume of its own Sandbox. */
+/** A session-filesystem workspace: the volume of its own sandbox. */
 export interface SessionFsWorkspace {
   readonly kind: "sessionfs";
   readonly volumeId: string;
