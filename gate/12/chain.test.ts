@@ -38,6 +38,8 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 
 import type { CoreV1Event, V1PersistentVolume, V1Pod, V1Secret, V1Service } from "@kubernetes/client-node";
+import { Hash } from "@smithy/hash-node";
+import { SignatureV4 } from "@smithy/signature-v4";
 import { Effect } from "effect";
 
 import pins from "../../cluster/node/pins.json" with { type: "json" };
@@ -312,6 +314,8 @@ interface Relay {
   readonly carried: () => { readonly bytes: number; readonly lastAt: number };
   /** How the store answered: each connection's first status, and the errors of those it could not carry, by their codes, with when each was last seen. */
   readonly answered: () => Readonly<Record<string, { readonly count: number; readonly lastAt: number }>>;
+  /** What became of its last connections, each in a line: when it was taken, reached the store, was answered, failed or closed, and how much it carried. */
+  readonly connections: () => readonly string[];
   /** Ends what it carries and listens no more, as a proxy that stops does: its port refuses. */
   readonly cut: () => Promise<void>;
   /** Listens again on its port, as a proxy that came back there would. */
@@ -338,17 +342,36 @@ async function relayTo(target: string, { bytesPerSecond }: { readonly bytesPerSe
     seen.count += 1;
     seen.lastAt = Date.now();
   };
+  const lines: string[] = [];
+  let taken = 0;
   const server = createServer((client) => {
     const upstream = connect({ host: url.hostname, port: Number(url.port) || 80 });
     let first = true;
+    // When each thing befell it, in ms since it was taken.
+    const id = (taken += 1);
+    const at0 = Date.now();
+    const seen: string[] = [];
+    const befell = (what: string) => seen.push(`${what} +${Date.now() - at0}`);
+    let carried = 0;
+    upstream.once("connect", () => befell("reached"));
+    client.once("close", () => {
+      befell("closed");
+      lines.push(`${new Date(at0).toISOString()} #${id} ${seen.join(", ")}, ${carried} bytes`);
+      if (lines.length > 400) lines.shift();
+    });
     for (const socket of [client, upstream]) {
       carrying.add(socket);
       socket.once("close", () => carrying.delete(socket));
     }
     client.pipe(upstream);
     upstream.on("data", (chunk: Buffer) => {
-      if (first) answer(/^HTTP\/1\.[01] (\d{3})/u.exec(chunk.toString("latin1", 0, 16))?.[1] ?? "unparsed");
+      if (first) {
+        const status = /^HTTP\/1\.[01] (\d{3})/u.exec(chunk.toString("latin1", 0, 16))?.[1] ?? "unparsed";
+        answer(status);
+        befell(`answered ${status}`);
+      }
       first = false;
+      carried += chunk.length;
       bytes += chunk.length;
       lastAt = Date.now();
       // Ahead of its rate: held until it is not.
@@ -361,6 +384,7 @@ async function relayTo(target: string, { bytesPerSecond }: { readonly bytesPerSe
     upstream.pipe(client);
     upstream.on("error", (error: NodeJS.ErrnoException) => {
       answer(error.code ?? "error");
+      befell(error.code ?? "error");
       client.destroy();
     });
     client.on("error", () => upstream.destroy());
@@ -372,6 +396,7 @@ async function relayTo(target: string, { bytesPerSecond }: { readonly bytesPerSe
     endpoint: `http://127.0.0.1:${port}`,
     carried: () => ({ bytes, lastAt }),
     answered: () => structuredClone(answers),
+    connections: () => [...lines, ...(carrying.size > 0 ? [`${carrying.size / 2} still open`] : [])],
     cut: () => {
       const closed = new Promise<void>((resolve) => server.close(() => resolve()));
       for (const socket of carrying) socket.destroy();
@@ -383,6 +408,16 @@ async function relayTo(target: string, { bytesPerSecond }: { readonly bytesPerSe
       server.close();
     },
   };
+}
+
+/** A read of the first byte of `key` through `endpoint`, signed by `token` as a restore's gofer signs it: its status and what it said, or why it got none. */
+async function probe(endpoint: string, token: StoreToken, key: string): Promise<string> {
+  const url = new URL(`${endpoint}/${s3.bucket}/${key}`);
+  const signer = new SignatureV4({ credentials: { accessKeyId: token.accessKeyId, secretAccessKey: token.secretAccessKey }, region: s3.region, service: "s3", sha256: Hash.bind(null, "sha256"), uriEscapePath: false });
+  const headers = { host: url.host, range: "bytes=0-0", "x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" };
+  const signed = await signer.sign({ method: "GET", protocol: "http:", hostname: url.hostname, port: Number(url.port), path: url.pathname, query: {}, headers });
+  return fetch(url, { headers: signed.headers as Record<string, string>, signal: AbortSignal.timeout(30_000) })
+    .then(async (answer) => `${answer.status} ${(await answer.text()).slice(0, 200)}`, (error: unknown) => `no answer: ${error instanceof Error ? error.message : String(error)}`);
 }
 
 /** How long a restore that began at `startedAt` read through `relay`, once its reads have stopped for `quietMs`: to its working set, and to its end. */
@@ -686,10 +721,14 @@ test("8. a restore from the bucket whose proxy goes away during its background r
               await relay.back();
             } else {
               proxy = await restart(outageMs);
+              // Whether a read signed by the restore's token goes through the relay and the proxy come back, as the gofer's would.
+              await sleep(15_000);
+              outcome["probe"] = await probe(relay.endpoint, token, `${layersPrefix}${own}/pages.img`);
             }
             outcome["reads"] = await readsOf(relay, startedAt, 30_000);
           } finally {
             outcome["answered"] = Object.fromEntries(Object.entries(relay.answered()).map(([what, { count, lastAt }]) => [what, { count, last: new Date(lastAt).toISOString() }]));
+            if (how === "stopped") outcome["connections"] = relay.connections();
             relay.close();
           }
           outcome["pod"] = await podState();
