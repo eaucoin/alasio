@@ -1,7 +1,7 @@
 /**
- * The node agents (../node-agent/), as the sandbox gateway calls them: each node's, found by its pod
- * there, as the profile's `snapshots.agents` select them, reached on its pod's address,
- * with the token alasio and they are given (ALASIO_NODE_AGENT_TOKEN).
+ * The node agents (../node-agent/), as the sandbox gateway calls them: each node's, found by
+ * its pod there, as the profile's `snapshots.agents` select them, reached on its pod's
+ * address, with the token the gateway and they are given (ALASIO_NODE_AGENT_TOKEN).
  */
 import type { V1Pod } from "@kubernetes/client-node";
 import { Config, Duration, Effect, Redacted, Schedule, Schema } from "effect";
