@@ -41,7 +41,7 @@ export const makeClaudeHarness = Effect.fnUntraced(function*({
   }
   // `sandbox` is there whenever `sessionFs` is, as just checked.
   const directory = sessionFs && sandbox ? sandbox.harnessDirectory(sessionFs.volumeId) : workingDirectory;
-  const sessionFsBayma = sessionFs && sandbox ? Effect.map(sandbox.ensureSession(sessionFs.volumeId), ({ bayma }) => bayma) : null;
+  const sessionFsBayma = sessionFs && sandbox ? sandbox.ensureSession(sessionFs.volumeId) : null;
   const sessions = sessionApi ?? createClaudeSessionApi({ workingDirectory: directory, store: sessionStore });
   const liveSessions = yield* makeClaudeLiveSessions({
     workingDirectory: directory,

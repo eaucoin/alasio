@@ -82,7 +82,7 @@ export interface Quota {
 /** The gateway's session workspaces, as the module says. */
 export interface GatewayWorkspaces {
   readonly endpoint: (volumeId: string, mode: NetMode) => Effect.Effect<BaymaEndpoint>;
-  readonly bind: (volumeId: string, mode: NetMode) => Effect.Effect<void, GatewayError>;
+  readonly bind: (volumeId: string, mode: NetMode) => Effect.Effect<string, GatewayError>;
   readonly release: (volumeId: string, mode: NetMode) => Effect.Effect<void, GatewayError>;
   /** Makes the workspace, of the gateway's quota; again, its quota set anew. */
   readonly create: (volumeId: string) => Effect.Effect<void, GatewayError>;
@@ -177,11 +177,14 @@ export function makeGatewayWorkspaces({ url, environment, callerKey }: GatewayWo
       Effect.mapError((error) => new GatewayError({ call: what, reason: `its answer is not one: ${error.message}` })),
     );
 
-  /** Binds the key of the token `tokenOf` makes ahead of any request, asked again while the gateway has no pod for it, until BIND_WAIT_MS. */
-  const bindBy = (what: string, tokenOf: Effect.Effect<string>): Effect.Effect<void, GatewayError> =>
+  /**
+   * Binds the key of the token `tokenOf` makes ahead of any request, asked again while the
+   * gateway has no pod for it, until BIND_WAIT_MS: its binding, as the gateway names it.
+   */
+  const bindBy = (what: string, tokenOf: Effect.Effect<string>): Effect.Effect<string, GatewayError> =>
     askAs(what, tokenOf, "POST", "/bind", { timeoutMs: LONG_CALL_TIMEOUT_MS }).pipe(
-      Effect.flatMap((answer): Effect.Effect<void, GatewayError | NotYet> => {
-        if (answer.status === 204) return Effect.void;
+      Effect.flatMap((answer): Effect.Effect<string, GatewayError | NotYet> => {
+        if (answer.status === 204) return Effect.succeed(answer.headers.get(BINDING_HEADER) ?? "");
         if (answer.status === 503) return Effect.fail(new NotYet({ reason: said(answer.bytes) }));
         return Effect.fail(new GatewayError({ call: what, status: answer.status, reason: said(answer.bytes) }));
       }),
