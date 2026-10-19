@@ -55,7 +55,7 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, env: given = {}
   const told = join(directory, "take-over");
   const serving = `echo 'juicefs[7] <INFO>: OK, workspaces ${SERVING} "${root}" [checkMountpoint@mount_unix.go:327]'`;
   const what: Record<Juicefs, string> = {
-    serves: `echo '${line}' >> ${mountinfo}; echo mounted; ${serving}; trap 'exit 0' TERM; while :; do sleep 0.1; done`,
+    serves: `printf %s "$META_PASSWORD" > ${join(directory, "meta-password")}; echo '${line}' >> ${mountinfo}; echo mounted; ${serving}; trap 'exit 0' TERM; while :; do sleep 0.1; done`,
     "takes over": `trap 'exit 0' TERM; while [ ! -e ${told} ]; do sleep 0.05; done; ${serving}; while :; do sleep 0.1; done`,
     "hands over": `echo 'juicefs[7] <INFO>: ${HANDED_OVER} [launchMount@mount_unix.go:1057]'; exit 1`,
     fails: "echo 'juicefs[7] <FATAL>: the metadata engine refused us'; exit 3",
@@ -128,7 +128,10 @@ test("a mount that serves runs its image's juicefs, copied to the node under its
   assert.ok(serving.inNode().at(-1)?.includes(`--cache-dir ${serving.paths.cache}`));
   // The cluster's names, which the node's namespace resolves none of, given as their addresses, by the pod's DNS.
   assert.ok(serving.inNode().at(-1)?.includes("--bucket http://10.43.0.8:8333/workspaces"), serving.inNode().at(-1));
-  assert.ok(serving.inNode().at(-1)?.endsWith(`redis://:a%40secret@10.43.0.7:6379/1 ${serving.root}`), serving.inNode().at(-1));
+  // The metadata engine's password in META_PASSWORD, not on the command line.
+  assert.ok(serving.inNode().at(-1)?.endsWith(`redis://10.43.0.7:6379/1 ${serving.root}`), serving.inNode().at(-1));
+  assert.ok(!serving.inNode().some((command) => command.includes("secret")), serving.inNode().join("\n"));
+  assert.equal(readFileSync(join(serving.paths.run, "..", "meta-password"), "utf8"), "a@secret");
   serving.child.kill("SIGTERM");
   assert.notEqual(await serving.ended, 0);
   assert.equal(existsSync(join(serving.paths.run, "handed-over")), false);
@@ -186,7 +189,7 @@ test("a mount whose metadata engine or bucket is no Service of the cluster's is 
   const outside = mount(t, "serves", { env: { META_URL: "rediss://:pw@valkey.example.com:6380/1", BUCKET: "https://s3.example.com/workspaces" } });
   await until(() => outside.ready());
   assert.ok(outside.inNode().at(-1)?.includes("--bucket https://s3.example.com/workspaces "), outside.inNode().at(-1));
-  assert.ok(outside.inNode().at(-1)?.includes(" rediss://:pw@valkey.example.com:6380/1 "), outside.inNode().at(-1));
+  assert.ok(outside.inNode().at(-1)?.includes(" rediss://valkey.example.com:6380/1 "), outside.inNode().at(-1));
   const unresolved = mount(t, "serves", { env: { META_URL: "redis://:pw@alasio-gone.alasio.svc.cluster.local:6379/1" } });
   assert.equal(await unresolved.ended, 1);
   assert.match(unresolved.out(), /alasio-gone\.alasio\.svc\.cluster\.local resolves to no address/u);

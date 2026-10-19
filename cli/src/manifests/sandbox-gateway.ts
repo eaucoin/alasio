@@ -568,7 +568,11 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     "  esac",
     `  printf '%s://%s%s%s\n' "$scheme" "$auth" "$address" "$tail"`,
     "}",
-    'meta=$(resolved "$META_URL") || exit 1',
+    // The metadata engine's password given in META_PASSWORD, which JuiceFS reads, not in its
+    // address on the command line, which every process of the node's PIDs could read.
+    `META_PASSWORD=$(node -e 'process.stdout.write(decodeURIComponent(new URL(process.env.META_URL).password))') || exit 1`,
+    "export META_PASSWORD",
+    `meta=$(resolved "$(node -e 'const url = new URL(process.env.META_URL); url.password = ""; process.stdout.write(url.href)')") || exit 1`,
     'bucket=$(resolved "$BUCKET") || exit 1',
     `run=${run}`,
     `mkdir -p "$run" ${bin} ${state} ${cache}`,
