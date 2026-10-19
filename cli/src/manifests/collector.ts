@@ -52,7 +52,7 @@ import { JUICEFS_METRICS_PORT, sandboxServiceRuns, WORKSPACE_MOUNT_COMPONENT } f
 import { INTAKE_COMPONENT, LAKE_METRICS_PORT, LAKE_QUERY_PORT, LOADER_COMPONENT, QUERY_COMPONENT } from "./lake.ts";
 import { COMPONENTS, FILER_STORE, FILER_STORE_USERS, METRICS_PORT as SEAWEEDFS_METRICS_PORT } from "./object-store.ts";
 import { priority } from "./priorities.ts";
-import { cpuUtilization, scaledObject } from "./scalers.ts";
+import { cpuScaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 import { VALKEY_PORT, valkeyPassword } from "./valkey.ts";
 import { WEBHOOK_HEALTH_PORT } from "./webhook.ts";
@@ -347,7 +347,9 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
     configMap,
     service,
     deployment,
-    ...scaledObject(deployment, scaling, [cpuUtilization(80)]),
+    // Its start is its configuration read and its exporters connected, in seconds; then the
+    // batches its clients held while it was not ready, a minute's at most.
+    ...cpuScaledObject(deployment, scaling, { percent: 80, startUpSeconds: 60 }),
     ...replicaBudget(GATEWAY_COMPONENT, NAMESPACE, scaling),
     verticalPodAutoscaler(deployment, "InPlace", scaled(scaling) ? ["memory"] : undefined),
   ];

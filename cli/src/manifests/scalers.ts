@@ -30,6 +30,8 @@ export interface ScaledObject extends KubernetesObject {
     readonly minReplicaCount: number;
     readonly maxReplicaCount: number;
     readonly triggers: readonly Trigger[];
+    /** How the HorizontalPodAutoscaler KEDA makes of it scales: here, how long it holds off scaling up. */
+    readonly advanced?: { readonly horizontalPodAutoscalerConfig: { readonly behavior: { readonly scaleUp: { readonly stabilizationWindowSeconds: number } } } };
   };
   /** As KEDA reports it: whether it is ready, active or paused, and when it last became active. */
   readonly status?: {
@@ -38,14 +40,25 @@ export interface ScaledObject extends KubernetesObject {
   };
 }
 
-/**
- * The CPU's use, averaged over a workload's pods, as a share of what they request: which
- * the cluster's metrics server measures, and which KEDA keeps at `percent`.
- */
-export const cpuUtilization = (percent: number): Trigger => ({ type: "cpu", metricType: "Utilization", metadata: { value: String(percent) } });
-
 /** The ScaledObject of `workload`, of `scale`, on `triggers`: none where the scale is a fixed count. */
 export function scaledObject(workload: V1Deployment | V1StatefulSet, scale: Scale, triggers: readonly Trigger[]): ScaledObject[] {
+  return scaledOn(workload, scale, triggers, undefined);
+}
+
+/**
+ * The ScaledObject of `workload`, of `scale`, on its CPU's use, averaged over its pods, as
+ * a share of what they request, which the cluster's metrics server measures and KEDA keeps
+ * at `percent`: none where the scale is a fixed count. A pod starting uses more CPU than
+ * it will, which would scale it up as each rolls out, a replica more for each; so KEDA
+ * scales it up only on a use that has lasted `startUpSeconds`, longer than its start-up's
+ * burst.
+ */
+export function cpuScaledObject(workload: V1Deployment | V1StatefulSet, scale: Scale, { percent, startUpSeconds }: { readonly percent: number; readonly startUpSeconds: number }): ScaledObject[] {
+  const cpu: Trigger = { type: "cpu", metricType: "Utilization", metadata: { value: String(percent) } };
+  return scaledOn(workload, scale, [cpu], { horizontalPodAutoscalerConfig: { behavior: { scaleUp: { stabilizationWindowSeconds: startUpSeconds } } } });
+}
+
+function scaledOn(workload: V1Deployment | V1StatefulSet, scale: Scale, triggers: readonly Trigger[], advanced: ScaledObject["spec"]["advanced"]): ScaledObject[] {
   if (!scaled(scale)) return [];
   const { name = "", namespace = "", labels = {} } = workload.metadata ?? {};
   return [{
@@ -57,6 +70,7 @@ export function scaledObject(workload: V1Deployment | V1StatefulSet, scale: Scal
       minReplicaCount: scale.min,
       maxReplicaCount: scale.max,
       triggers,
+      ...(advanced ? { advanced } : {}),
     },
   }];
 }

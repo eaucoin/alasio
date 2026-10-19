@@ -32,8 +32,9 @@
  * it is ever removed here.
  *
  * Environment: LOG_BROKERS (its node's address), LOG_CONTROLLERS (every voter's
- * controllers' listener, comma-separated), LOG_ADMIN_PASSWORD, LOG_ACCESS (the file of what it applies), LOG_PASSWORDS
- * (the directory of each principal's password, a file of its name), LOG_ACCESS_PORT.
+ * controllers' listener, comma-separated), LOG_ADMIN_PASSWORD, LOG_ACCESS (the file of
+ * what it applies), LOG_PASSWORDS (the directory of each principal's password, a file of
+ * its name), LOG_ACCESS_PORT.
  *
  * alasio's command line runs it in the applier's container for each branch environment it
  * makes or deletes, with what it is given on its input (EnvironmentLogAccess):
@@ -181,7 +182,11 @@ export function credentialWriter(address: string, sasl?: ConnectionOptions["sasl
       const connection = new Connection("log-access", sasl === undefined ? {} : { sasl });
       try {
         await connection.connect(host, Number(port));
-        const { results } = await alterUserScramCredentialsV0.api.async(connection, [], [{ name, mechanism: ScramMechanisms.SCRAM_SHA_512, iterations: ITERATIONS, salt, saltedPassword }]);
+        // The client library throws a response's refusal, of the response it holds.
+        const { results } = await alterUserScramCredentialsV0.api.async(connection, [], [{ name, mechanism: ScramMechanisms.SCRAM_SHA_512, iterations: ITERATIONS, salt, saltedPassword }]).catch((error: unknown) => {
+          const refused = (error as { response?: Awaited<ReturnType<typeof alterUserScramCredentialsV0.api.async>> }).response?.results.find(({ errorCode }) => errorCode !== 0);
+          throw refused ? new CredentialRefused(refused.user, refused.errorCode, refused.errorMessage ?? `error ${refused.errorCode}`) : error;
+        });
         const failed = results.find(({ errorCode }) => errorCode !== 0);
         if (failed) throw new CredentialRefused(failed.user, failed.errorCode, failed.errorMessage ?? `error ${failed.errorCode}`);
       } finally {
@@ -202,7 +207,8 @@ type ConnectionOptions = NonNullable<ConstructorParameters<typeof Connection>[1]
  * one, fails it too.
  */
 export function controllersWriter(addresses: readonly string[], writerOf: (address: string) => CredentialWriter = credentialWriter): CredentialWriter {
-  const writers = addresses.map(writerOf);
+  // Each of its address alone, as credentialWriter would take map's index for its sasl.
+  const writers = addresses.map((address) => writerOf(address));
   let active = 0;
   return {
     async credential(name, password) {
@@ -265,7 +271,9 @@ export function logAdmin(brokers: readonly string[], password: string): LogAdmin
   };
 }
 
-const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+/** What `error` says, with what caused it, each in turn. */
+const errorText = (error: unknown): string =>
+  error instanceof Error ? (error.cause === undefined ? error.message : `${error.message} (${errorText(error.cause)})`) : String(error);
 
 function log(message: string, fields: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ time: new Date().toISOString(), message, ...fields }));

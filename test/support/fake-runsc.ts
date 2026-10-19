@@ -15,7 +15,12 @@
  *   minute while one `hang-checkpoint` is, or waits while one `hold-checkpoint` is;
  * - `image inspect --json DIR`: describes the image, as saved by the release's runsc, whose
  *   version is `release-RELEASE` (or what a file `saved-by` beside it says), with the CPU
- *   features of `image-cpu-features`, its digest that of its pages metadata, as runsc's;
+ *   features of `image-cpu-features`, its digest that of its pages metadata, as runsc's; or,
+ *   of an image in the bucket (DIR holding s3_opts.json), while a file `remote-inspect` is
+ *   beside it, what the fork's runsc says of its test image (./runsc-image-inspect.json, a
+ *   copy of runsc/cmd/image/testdata/inspect.json: two layers, 45056 bytes of pages), as
+ *   saved by the release's runsc, failing while there is none, and taking a minute while a
+ *   file `hang-inspect` is;
  * - `image layers DIR`: its layers' digests, a line each;
  * - `image verify --host DIR`: says nothing of an image DIR holds whose layers are each in
  *   DIR/layers, of the digest it is named by, as runsc checks each layer's identity; fails
@@ -48,6 +53,9 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, wr
 import { join } from "node:path";
 
 import { gvisorHandler } from "../../src/node-agent/names.ts";
+
+/** What the fork's runsc says of its test image, which an image in the bucket is described as. */
+const INSPECTED = readFileSync(new URL("./runsc-image-inspect.json", import.meta.url), "utf8");
 
 const SCRIPT = `#!/usr/bin/env node
 const { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } = require("node:fs");
@@ -88,6 +96,12 @@ if (rest[0] === "checkpoint") {
     return;
   }
   checkpoint();
+} else if (rest[0] === "image" && rest[1] === "inspect" && existsSync(join(rest[rest.length - 1], "s3_opts.json"))) {
+  if (existsSync(join(here, "hang-inspect"))) { setTimeout(() => {}, 60000); return; }
+  if (!existsSync(join(here, "remote-inspect"))) { process.stderr.write("no image in the bucket to inspect\\n"); process.exit(1); }
+  const inspected = JSON.parse(${JSON.stringify(INSPECTED)});
+  inspected.state.metadata.runsc_version = read("saved-by", "release-" + basename(here));
+  process.stdout.write(JSON.stringify(inspected, null, 2) + "\\n");
 } else if (rest[0] === "image" && rest[1] === "inspect") {
   const image = rest[rest.length - 1];
   const meta = readFileSync(join(image, "pages_meta.img"));

@@ -147,14 +147,19 @@ test("every credential held is written again, the admin's among them, each of it
 function controllers(active: () => string, unreached: readonly string[] = []) {
   const asked: string[] = [];
   const written: string[] = [];
-  const writerOf = (address: string): CredentialWriter => ({
-    async credential(name, password) {
-      asked.push(`${address} ${name}`);
-      if (unreached.includes(address)) throw new Error(`connect ECONNREFUSED ${address}`);
-      if (address !== active()) throw new CredentialRefused(name, NOT_CONTROLLER, "This is not the correct controller for this cluster.");
-      written.push(`${address} ${name} ${password}`);
-    },
-  });
+  const writerOf = (...given: unknown[]): CredentialWriter => {
+    // Each made of its address alone, as credentialWriter takes no index for its sign-in.
+    assert.equal(given.length, 1, JSON.stringify(given));
+    const [address] = given as [string];
+    return {
+      async credential(name, password) {
+        asked.push(`${address} ${name}`);
+        if (unreached.includes(address)) throw new Error(`connect ECONNREFUSED ${address}`);
+        if (address !== active()) throw new CredentialRefused(name, NOT_CONTROLLER, "This is not the correct controller for this cluster.");
+        written.push(`${address} ${name} ${password}`);
+      },
+    };
+  };
   return { asked, written, writerOf };
 }
 

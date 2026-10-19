@@ -56,6 +56,8 @@ export class ReleaseNotInstalled extends Schema.TaggedError<ReleaseNotInstalled>
 const ImageInspection = Schema.Struct({
   digest: Schema.NonEmptyString,
   state: Schema.Struct({ metadata: Schema.Record(Schema.String, Schema.String) }),
+  // Each MemoryFile's bytes of pages, by the layer that holds them, as a restore loads them.
+  memory_files: Schema.optional(Schema.Array(Schema.Struct({ layer_bytes: Schema.Array(Schema.Number) }))),
 });
 
 /** What `runsc state` says of a container, as far as the agent reads it: its sandbox's process, its bundle, and its spec's annotations. */
@@ -108,6 +110,8 @@ export interface InspectedImage {
   readonly digest: string;
   readonly version: string;
   readonly cpuFeatures: readonly string[];
+  /** The bytes of pages a restore of it loads, of every MemoryFile and layer, where runsc says them; null where it does not. */
+  readonly pageBytes: number | null;
 }
 
 /**
@@ -373,11 +377,12 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
             catch: (cause) => new RunscError({ release, command: "image inspect", reason: `its description is not one: ${cause instanceof Error ? cause.message : String(cause)}` }),
           })
         ),
-        Effect.map(({ digest, state: { metadata } }) => ({
+        Effect.map(({ digest, state: { metadata }, memory_files }) => ({
           digest,
           // The metadata keys runsc saves an image with (runsc/boot/restore.go).
           version: metadata["runsc_version"] ?? "",
           cpuFeatures: (metadata["cpu_features"] ?? "").split(",").filter(Boolean),
+          pageBytes: memory_files === undefined ? null : memory_files.reduce((sum, { layer_bytes }) => sum + layer_bytes.reduce((each, bytes) => each + bytes, 0), 0),
         })),
       ),
 

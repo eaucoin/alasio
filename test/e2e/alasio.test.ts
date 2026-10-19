@@ -1598,32 +1598,50 @@ if (inShard("snapshots")) {
       }
     });
 
-    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket comes back whole and is saved again, its node's agent stopped as its sandbox reads the rest of it, which the agent's stop waits on`, async (t) => {
+    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket comes back whole and is saved again, its node's agent stopped as its sandbox resumes, which stops once the restore has been served all its pages`, async (t) => {
       const big = await newSession("none");
       const { sessionId: held, sha256 } = await repl.fill(big, BIG_REPL_MEBIBYTES);
       await untilReleased(big, Date.now(), { savingMs: 480_000 });
-      for (const pod of (await nodeAgents()).values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
+      const agents = await nodeAgents();
+      for (const pod of agents.values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
+      // Every node agent's log followed from its start, for the one that resumes the sandbox.
+      const resuming = [...agents.entries()].map(([node, pod]) => ({ node, pod, log: following(NAMESPACE, pod, "node-agent", new RegExp(`resumed the sandbox of ${SESSIONS}/${big} in `, "u")) }));
       const answered = turn(`hello with ${BIG_REPL_MEBIBYTES} MiB, its node's agent stopped`);
-      // Its sandbox resumed, reading the rest of it in the background: its node's agent stopped, as a rollout stops it.
-      const node = await until(`the restored pod of ${big} resumed`, async () => {
-        const bound = await boundPodOf(big);
-        const pod = bound ? await kube.get<V1Pod>(ref("Pod", bound.name, SESSIONS)) : null;
-        return pod?.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True") ? pod.spec?.nodeName : undefined;
-      }, 600_000);
-      const agent = (await nodeAgents()).get(node);
-      assert.ok(agent, `no node agent runs ready on ${node}`);
-      // What it says as it stops, followed from before its stop: once its container is gone,
-      // its log can no more be read, though its pod is still there.
-      const log = following(NAMESPACE, agent, "node-agent", new RegExp(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: 1 read it now`, "u"));
-      await log.started;
+      // Its sandbox resumed, reading the rest of it in the background: its node's agent stopped
+      // at once, as a rollout stops it.
+      const { node, pod: agent } = await new Promise<(typeof resuming)[number]>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`no node agent resumed the sandbox of ${big} within 600 s`)), 600_000);
+        for (const each of resuming) {
+          void each.log.said.then((line) => {
+            if (line === undefined) return;
+            clearTimeout(timer);
+            resolve(each);
+          });
+        }
+      }).finally(() => {
+        for (const { log } of resuming) log.stop();
+      });
+      // What it says before and as it stops, followed from its start and from before its stop:
+      // once its container is gone, its log can no more be read, though its pod is still
+      // there. Its stop waits on the restore while it reads, or found it had read every page
+      // already; either way it was served every byte of pages runsc said its image holds,
+      // which runsc did say, as the drain counts bytes and not its reads' quiet.
+      const waits = following(NAMESPACE, agent, "node-agent", new RegExp(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: 1 read it now`, "u"));
+      const servedAll = following(NAMESPACE, agent, "node-agent", new RegExp(`the restore of ${SESSIONS}/${big} has been served all [1-9]\\d* bytes of its pages through the node agent`, "u"));
+      const unsaid = following(NAMESPACE, agent, "node-agent", new RegExp(`runsc does not say how many bytes of pages the restore of ${SESSIONS}/${big} reads`, "u"));
+      const log = { stop: () => [waits, servedAll, unsaid].forEach((each) => each.stop()) };
+      await Promise.all([waits.started, servedAll.started, unsaid.started]);
       const stoppedAt = Date.now();
       await kube.remove(ref("Pod", agent, NAMESPACE));
       try {
         await until(`the node agent ${agent} gone`, async () => ((await kube.get(ref("Pod", agent, NAMESPACE))) === null ? true : undefined), 1_800_000);
         t.diagnostic(`the node agent ${agent} was gone ${Date.now() - stoppedAt} ms after it was stopped`);
-        const said = await Promise.race([log.said, sleep(30_000).then(() => undefined)]);
-        assert.ok(said, `the node agent ${agent} did not say, as it stopped, that it waits on the restore reading the bucket through it`);
-        t.diagnostic(said);
+        const within = <A>(said: Promise<A>) => Promise.race([said, sleep(30_000).then(() => undefined)]);
+        const [waited, all, warned] = await Promise.all([within(waits.said), within(servedAll.said), within(unsaid.said)]);
+        assert.equal(warned, undefined, `the node agent ${agent} said runsc did not tell the bytes of pages of ${big}'s image: ${warned}`);
+        assert.ok(all, `the node agent ${agent} did not say it served ${big}'s restore all its pages`);
+        t.diagnostic(waited ?? `the node agent ${agent} stopped at once, its restore served whole before`);
+        t.diagnostic(all);
         await answered;
         // What the gateway and the node agents said of it, where it cannot be read.
         const logged = async () => console.error(`# what the sandbox service logged of ${big}:\n${await serviceLogs(big)}`);
@@ -1797,9 +1815,16 @@ const metricRows = (condition: string) =>
  * Waits until `sql`, a count as `n`, counts some of the lake's rows, as the collector
  * sends them within seconds, and the loader loads transcripts within its interval. Should
  * none arrive, the failure says what each of `parts` of what `sql` joins answers then as
- * `n`, a count or what it lists, so one failure names the part that is missing.
+ * `n`, a count or what it lists, so one failure names the part that is missing, and what
+ * each of `elsewhere` says of what is not in the lake, as Neon's rows.
  */
-async function untilInLake(what: string, sql: string, timeoutMs = 240_000, parts: Readonly<Record<string, string>> = {}): Promise<void> {
+async function untilInLake(
+  what: string,
+  sql: string,
+  timeoutMs = 240_000,
+  parts: Readonly<Record<string, string>> = {},
+  elsewhere: Readonly<Record<string, () => Promise<string>>> = {},
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   const answer = (query: string) => lakeQuery(query).then(([row]) => row?.["n"] ?? 0, (error: unknown) => error);
   const said = (answered: unknown) => (answered instanceof Error ? answered.message : typeof answered === "string" && Number.isNaN(Number(answered)) ? answered : `${String(answered)} rows`);
@@ -1811,7 +1836,8 @@ async function untilInLake(what: string, sql: string, timeoutMs = 240_000, parts
     await sleep(5000);
   }
   const counted = await Promise.all(Object.entries(parts).map(async ([part, query]) => `\n  ${part}: ${said(await answer(query))}`));
-  assert.fail(`no ${what} arrived in the lake: ${said(last)}${counted.join("")}`);
+  const found = await Promise.all(Object.entries(elsewhere).map(async ([part, ask]) => `\n  ${part}: ${await ask().catch((error: unknown) => (error instanceof Error ? error.message : String(error))) || "none"}`));
+  assert.fail(`no ${what} arrived in the lake: ${said(last)}${counted.join("")}${found.join("")}`);
 }
 
 /** Waits until the stand-in backend has received an export of `signal` that contains `needle`. */
@@ -1950,6 +1976,19 @@ if (inShard("telemetry")) {
             where turn.SpanName = 'alasio.turn' and codex.completed_at is not null`,
           "the threads alasio's turns name": "select coalesce(string_agg(distinct SpanAttributes['alasio.session.id'], ', '), 'none') as n from otel.traces where SpanName = 'alasio.turn'",
           "the transcripts' threads": "select coalesce(string_agg(distinct thread_id, ', '), 'none') as n from codex.turns",
+          // Whether the loader loaded the rollout's bytes, and what each of its loads said.
+          "the rollout files the lake has, with the bytes it loaded of each":
+            "select coalesce(string_agg(home || '/' || name || ' ' || loaded_bytes || ' of ' || size, ', '), 'none') as n from codex.files",
+          "the loader's loads": `select coalesce(string_agg(strftime(Timestamp, '%H:%M:%S') || ' ' || Body || ' ' || cast(LogAttributes as varchar), '; ' order by Timestamp), 'none') as n
+            from otel.logs where ServiceName = 'alasio-lake-loader'`,
+          "alasio's wakes of the loader and its rollouts' mirroring": `select coalesce(string_agg(strftime(Timestamp, '%H:%M:%S') || ' ' || Body, '; ' order by Timestamp), 'none') as n
+            from otel.logs where ServiceName = 'alasio' and (Body ilike '%wake%' or Body ilike '%rollout%' or Body ilike '%mirror%')`,
+        },
+        {
+          // Whether alasio mirrored the rollout to Neon at all, and when, in either Codex home's store.
+          "the rollouts Neon keeps": () =>
+            onDatabase(NAMESPACE, `select string_agg(home || name || ' ' || size || ' bytes', ', ') from (
+              select 'folder/' as home, name, size from codex_sessions.rollouts union all select 'sessionfs/', name, size from codex_sessionfs_sessions.rollouts) kept`),
         },
       );
     });
@@ -2833,8 +2872,8 @@ if (inShard("scaling")) {
         assert.ok(scaledObject);
         const hpa = kedaHpa();
         assert.deepEqual(
-          [hpa?.spec?.minReplicas, hpa?.spec?.maxReplicas, hpa?.spec?.metrics?.map(({ type, resource }) => [type, resource?.name, resource?.target.averageUtilization])],
-          [2, 4, [["Resource", "cpu", 80]]],
+          [hpa?.spec?.minReplicas, hpa?.spec?.maxReplicas, hpa?.spec?.metrics?.map(({ type, resource }) => [type, resource?.name, resource?.target.averageUtilization]), hpa?.spec?.behavior?.scaleUp?.stabilizationWindowSeconds],
+          [2, 4, [["Resource", "cpu", 80]], 180],
         );
       });
 

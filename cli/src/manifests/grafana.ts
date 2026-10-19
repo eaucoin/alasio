@@ -45,7 +45,7 @@ import { replicaBudget, replicated, spread } from "./disruption.ts";
 import { LAKE_QUERY_PORT } from "./lake.ts";
 import { PROXY_HOST, PROXY_PORT } from "./neon.ts";
 import { priority } from "./priorities.ts";
-import { cpuUtilization, scaledObject } from "./scalers.ts";
+import { cpuScaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 
 /** Grafana's name, its Secret's, and its pods' component. */
@@ -171,7 +171,9 @@ export function grafanaObjects(config: InstallConfig): KubernetesObject[] {
     service,
     ...(ha ? [peers] : []),
     deployment,
-    ...scaledObject(deployment, scaling, [cpuUtilization(80)]),
+    // Its start (its plugins loaded, its database migrated, its alert rules first evaluated)
+    // keeps its CPU above 80 % of its request for up to two minutes or so.
+    ...cpuScaledObject(deployment, scaling, { percent: 80, startUpSeconds: 180 }),
     ...replicaBudget("grafana", NAMESPACE, scaling),
     verticalPodAutoscaler(deployment, "InPlace", scaled(scaling) ? ["memory"] : undefined),
   ];
