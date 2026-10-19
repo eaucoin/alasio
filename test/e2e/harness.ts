@@ -176,6 +176,16 @@ const PUSHED = process.env["ALASIO_E2E_REGISTRY"] || undefined;
  */
 export const ESTARGZ = PUSHED !== undefined;
 
+/**
+ * The bayma the box's folders run on the release before, which the upgrade shard's install of
+ * it is given: their REPLs come back whole across the upgrade where this release pins the same
+ * (HOST_BAYMA_IMAGE), and from their checkpoints, once, where it pins another, whose instance
+ * refuses a snapshot another bayma took.
+ */
+export const FOLDER_BAYMA_BEFORE = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.3", digest: "sha256:add3c8ad2024f5dad077d2deac67fcda911722eee75be866946d17b17dd31be7" } as const;
+/** Whether the upgrade keeps the folders' bayma, so their REPLs come back whole. */
+export const FOLDER_BAYMA_KEPT = FOLDER_BAYMA_BEFORE.digest === HOST_BAYMA_IMAGE.digest;
+
 /** The run's registry: a container on the cluster's network, with a volume of its own, both of this name. */
 const REGISTRY = `${CLUSTER}-registry`;
 /** Distribution's registry. */
@@ -638,10 +648,10 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       resources: { requests: { cpu: "50m", memory: "256Mi" } },
       ...on("agent-1"),
     },
-    // The release before's folders running this release's bayma, as the box's do, so their REPLs
-    // come back whole across the upgrade; and the release before's agent-sandbox sized, as the
-    // box's configuration may say, which the cut-over removes.
-    host: { resources: { requests: { cpu: "20m", memory: "128Mi" } }, ...(of === "previous" ? { baymaImage: HOST_BAYMA_IMAGE } : {}) },
+    // The release before's folders running the bayma the box's do (FOLDER_BAYMA_BEFORE); and the
+    // release before's agent-sandbox sized, as the box's configuration may say, which the
+    // cut-over removes.
+    host: { resources: { requests: { cpu: "20m", memory: "128Mi" } }, ...(of === "previous" ? { baymaImage: FOLDER_BAYMA_BEFORE } : {}) },
     sessions: {
       storage: { size: "1Gi" },
       // The snapshots shard's sessions hold a REPL of BIG_REPL_MEBIBYTES live, with room for bayma and gVisor.

@@ -60,6 +60,7 @@ import {
   inCutOverRecord,
   dumpClusterState,
   ESTARGZ,
+  FOLDER_BAYMA_KEPT,
   type Forward,
   HOST_PROFILE,
   HOST_USER,
@@ -409,7 +410,7 @@ if (inShard("upgrade")) {
           folderRepls = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", `http://${folderBayma.name}.${HOST_NAMESPACE}.svc:7290/mcp`, token, `kept by ${folderBayma.name}`);
           assert.ok(folderRepls.count > 0, JSON.stringify(folderRepls));
         },
-        keeps: "the folder conversation's REPL sessions, each back whole in the gateway's folder instance of the conversation, on its bayma's state directory, left in place",
+        keeps: `the folder conversation's REPL sessions, each back ${FOLDER_BAYMA_KEPT ? "whole" : "from its checkpoint, as the folders' bayma changed,"} in the gateway's folder instance of the conversation, on its bayma's state directory, left in place`,
         check: async () => {
           const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), folderRepls.python, folderRepls.bun);
           const kept = `kept by ${folderBayma.name}`;
@@ -420,9 +421,18 @@ if (inShard("upgrade")) {
               console.error(`# ${HOST_NAMESPACE}/${name}, bound to ${pod.metadata?.annotations?.["alasio.dev/binding-key"]}:\n${await kube.logs(HOST_NAMESPACE, name, "bayma").catch((error: unknown) => String(error))}`);
             }
           }
-          assert.deepEqual([seen.python.kept, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, true, kept, kept], JSON.stringify(seen));
-          assert.ok((seen.python.count ?? 0) > folderRepls.count, `the count went on from ${folderRepls.count}: ${JSON.stringify(seen)}`);
-          for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
+          if (FOLDER_BAYMA_KEPT) {
+            // Whole, its thread counting on. A first session's whole restore can fail on bayma
+            // 0.14.3, its server's own threads taking the PIDs its snapshot needs, as one of six
+            // upgrade shards did: bayma 0.14.4 gives sessions PIDs above them.
+            assert.deepEqual([seen.python.kept, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, true, kept, kept], JSON.stringify(seen));
+            assert.ok((seen.python.count ?? 0) > folderRepls.count, `the count went on from ${folderRepls.count}: ${JSON.stringify(seen)}`);
+            for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
+          } else {
+            // From its checkpoint, what that keeps intact, as this release's bayma refuses a snapshot another took.
+            assert.deepEqual([seen.python.kept, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, false, null, kept], JSON.stringify(seen));
+            for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+          }
           // The gateway's pod of the folder pool, bound to the conversation's key, on the state directory the Sandbox's bayma had.
           const [instance, ...others] = (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" }))
             .filter((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"] === folderBayma.key);
