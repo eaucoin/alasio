@@ -103,8 +103,10 @@ export class Mounts extends Context.Service<Mounts, {
    */
   readonly forkSessionWorkspace: (conversationId: string) => Effect.Effect<WorkspaceChange, MountRefused | SessionError | StoreError>;
   /**
-   * Deletes the session filesystems a failure or a crash left unmade: those recorded but
-   * not made, and forks' Sandboxes no record made. As alasio starts, before any is made.
+   * Sets the session workspaces the gateway holds against those alasio's store records, and
+   * says each where they differ: one whose making never ended, one recorded as made the
+   * gateway holds none of, and one the gateway holds no record names; nothing is deleted.
+   * As alasio starts, before any is made.
    */
   readonly reconcileSessionWorkspaces: Effect.Effect<void, StoreError>;
 }>()("alasio/operator/Mounts") {

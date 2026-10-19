@@ -18,7 +18,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -197,6 +197,7 @@ async function claudeProcess(url: string, bearer: string) {
       controller.abort();
       await reading.catch(() => undefined);
       api.close();
+      rmSync(home, { recursive: true, force: true });
     },
   };
 }
@@ -240,6 +241,7 @@ async function codexThread(url: string, bearer: string, configLifeMs?: number) {
     close: async () => {
       await Effect.runPromise(Scope.close(scope, Exit.void));
       api.close();
+      rmSync(home, { recursive: true, force: true });
     },
   };
 }
