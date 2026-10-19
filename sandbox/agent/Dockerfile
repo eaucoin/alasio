@@ -4,7 +4,7 @@
 # workspace attached at /attach/ws once it is bound, by the node agent of its node
 # (src/node-agent/workspaces.ts): /workspace and /home/agent are links to the workspace's
 # own, and its bayma starts once its binding's token is beside it (start.sh).
-ARG BAYMA_IMAGE=ghcr.io/eaucoin/bayma:0.14.2@sha256:5a9a731371d083cae815c6f27c5eb0147e1e77fac400544285f8416047ba4109
+ARG BAYMA_IMAGE=ghcr.io/eaucoin/bayma:0.14.5@sha256:94fa2ec63f8e5894f61162c79134e793287fe207d87d5402130052f0a86b8fe4
 FROM ${BAYMA_IMAGE}
 LABEL org.opencontainers.image.source=https://github.com/eaucoin/alasio \
       org.opencontainers.image.description="alasio's session sandboxes: bayma, run as the unprivileged agent"
