@@ -8,12 +8,12 @@
 import { Clock, Context, Duration, Effect, FiberMap, FiberSet, Layer } from "effect";
 
 import type { OperatorServices } from "../operator/command-handler.ts";
-import { processPrompt } from "../operator/prompts.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { ReceivedFiles } from "./files.ts";
+import { processIncomingPrompt } from "./message-handler.ts";
 
 /** How long a media group waits for more of its messages before it is handled. */
 const DEFAULT_FLUSH_AFTER: Duration.Input = "1500 millis";
@@ -55,8 +55,9 @@ const makeMediaGroups = Effect.fnUntraced(function*(flushAfter: Duration.Input) 
    * messages are kept under too, so none of it comes meanwhile: claimed in the lock's
    * transaction, where it still waits and its last message has been quiet for its moment,
    * so of all the alasios on the store one handles it, once. Its files are written first;
-   * where that fails, the claim is rolled back with the lock's transaction, and the group
-   * waits for the next look. Its prompt failing is said, and the group is handled.
+   * where that fails, as of a workspace not answering for a while, the claim is rolled back
+   * with the lock's transaction, and the group waits for the next look. Its prompt failing
+   * is said in the chat, as a single message's is, and the group is handled.
    */
   const flush = (mediaGroupId: string, conversationId: string, chatId: number | string) =>
     store.withHandlingLock(chatId, (marks) =>
@@ -70,12 +71,8 @@ const makeMediaGroups = Effect.fnUntraced(function*(flushAfter: Duration.Input) 
         const workspace = parseWorkspace((yield* store.getMount(conversationId)).workingDirectory);
         yield* receivedFiles.materialize(files.map((file) => file.id), workspace);
         const received = files.map((file) => ({ id: file.id, path: receivedFiles.pathOf(file, workspace) }));
-        const promptFailed = (error: unknown) => Effect.logError(`Media group ${mediaGroupId}'s prompt failed: ${error}`);
-        yield* processPrompt({ conversationId, chatId, messageId, text, files: received }).pipe(
-          Effect.provideContext(services),
-          Effect.catch(promptFailed),
-          Effect.catchDefect(promptFailed),
-        );
+        // As a single message's prompt is: one that fails is said in the chat, and the album is handled.
+        yield* processIncomingPrompt({ conversationId, chatId, messageId, text, files: received }).pipe(Effect.provideContext(services));
       })
     ).pipe(
       Effect.catch((error) => Effect.logError(`Failed to flush media group ${mediaGroupId}: ${error}`)),

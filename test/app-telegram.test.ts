@@ -65,6 +65,24 @@ test("two photos of one album are one turn, whose prompt is the caption and both
   assert.equal(codex.requests("turn/start").length, 1);
 });
 
+test("an album whose prompt fails is said to have failed in its chat, as a single message's is", { timeout: 60_000 }, async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, stateSchema } = alasio;
+  await mount(alasio, "codex", "alpha");
+  // The store refuses the album's prompt as its job is queued.
+  await (await testPool()).query(`
+    create function ${stateSchema}.refuse_prompts() returns trigger language plpgsql as $$
+      begin raise exception 'the store is down'; end
+    $$;
+    create trigger refuse_prompts before insert on ${stateSchema}.prompt_jobs for each row execute function ${stateSchema}.refuse_prompts();
+  `);
+  const mark = telegram.mark();
+  telegram.sendPhoto("photo-a", Buffer.from("first photo"), { caption: "What is in these?", mediaGroupId: "album-1" });
+  telegram.sendPhoto("photo-b", Buffer.from("second photo"), { mediaGroupId: "album-1" });
+  const said = await telegram.waitFor("sendMessage", (call) => call.params.text.startsWith("Codex hit an error"), { mark, timeoutMs: 15_000 });
+  assert.match(said.params.text, /the store is down/u);
+});
+
 test("an album another alasio kept, and left waiting as it stopped, is handled by this one as it looks for albums due, with no restart", { timeout: 60_000 }, async (t) => {
   const alasio = await alasioFor(t, { folders: ["alpha"] });
   const { codex, stateSchema } = alasio;
