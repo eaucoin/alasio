@@ -5,6 +5,7 @@
  */
 import { Cause, Effect } from "effect";
 
+import { HARNESS_ROLE } from "../neon/control/secrets.ts";
 import { loadAlasioConfig } from "./config.ts";
 import { codexHome } from "./codex/env.ts";
 import { CodexRollouts, SessionFsCodexRollouts } from "./codex/rollouts/index.ts";
@@ -35,6 +36,7 @@ const alasio = Effect.gen(function*() {
     ...config,
     updates: TelegramUpdates.layer(config.telegramLog),
     pool: neon.pool,
+    harnessRole: HARNESS_ROLE,
     sessionStore: neon.sessionStore,
     codexRollouts,
     sessionFsCodexRollouts,

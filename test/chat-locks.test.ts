@@ -9,9 +9,10 @@ import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import type { Update } from "@grammyjs/types";
-import { Deferred, Duration, Effect, Exit, Fiber, Option } from "effect";
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Option, type Scheduler } from "effect";
 import pg from "pg";
 
+import { poolDatabase } from "../src/persistence/sql.ts";
 import { LOCKED_STATEMENT_TIMEOUT, Store } from "../src/persistence/store.ts";
 import { holdChatLock, lockHolder, newSchema, testDatabaseUrl, testPool, testStore } from "./support/store.ts";
 
@@ -83,6 +84,34 @@ test("a delivery waiting for a connection of a pool that has none to give is sto
   } finally {
     await pool.end();
   }
+});
+
+test("a connection that comes as its transaction is stopped, the transaction stopped before it holds the connection, is given back once", async () => {
+  let released = 0;
+  const client = { query: async () => ({ rows: [] }), release: () => void (released += 1) } as unknown as pg.PoolClient;
+  let come: (() => void) | undefined;
+  // A pool whose connection comes when the test says.
+  const pool = { connect: () => ({ then: (connected: (made: pg.PoolClient) => void) => void (come = () => connected(client)) }) } as unknown as pg.Pool;
+  // A scheduler that, once held, has the transaction yield at its next step and keeps that step
+  // for the test to run: the connection has come, and nothing yet holds it to give back.
+  let held = false;
+  const steps: Array<() => void> = [];
+  const scheduler: Scheduler.Scheduler = {
+    executionMode: "async",
+    shouldYield: () => held,
+    makeDispatcher: () => ({ scheduleTask: (step) => void (held ? steps.push(step) : queueMicrotask(step)), flush: () => {} }),
+  };
+  const transaction = Effect.runFork(poolDatabase(pool).guardedTransaction(() => Effect.succeed(true), () => Effect.void), { scheduler });
+  while (!come) await sleep(5);
+  held = true;
+  come();
+  assert.equal(steps.length, 1, "the transaction yields as its connection comes");
+  held = false;
+  transaction.interruptUnsafe();
+  for (const step of steps.splice(0)) step();
+  const stopped = await Effect.runPromise(Fiber.await(transaction));
+  assert.ok(Exit.isFailure(stopped) && Cause.hasInterruptsOnly(stopped.cause), String(stopped));
+  assert.equal(released, 1);
 });
 
 test("a delivery whose mark is stuck behind a lock no one lets go of ends as its lock's statements are bounded, rather than holding the delivery", { timeout: 30_000 }, async () => {

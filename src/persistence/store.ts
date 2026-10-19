@@ -5,6 +5,8 @@
  * a table or a few each; the store is what alasio uses of them, and the few changes that
  * span them, each in one transaction.
  */
+import { randomUUID } from "node:crypto";
+
 import type { Update } from "@grammyjs/types";
 import { Context, Duration, Effect, Layer, Option, Schema } from "effect";
 import type { Pool } from "pg";
@@ -26,9 +28,10 @@ import {
   type WorkspaceConversation,
 } from "./conversation-repository.ts";
 import { type DueOutboxEntry, NeonOutboxRepository, type NewOutboxStatus, type NewOutboxText } from "./outbox-repository.ts";
-import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState, type QueuedPromptJob } from "./prompt-job-repository.ts";
+import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState } from "./prompt-job-repository.ts";
 import { type CompletedResponse, NeonResponseRepository, type ResponseBlock } from "./response-repository.ts";
 import { NeonRestartRepository, type NewRestartEvent, type RestartEvent } from "./restart-repository.ts";
+import { grantHarness } from "./harness-grants.ts";
 import { ensureSchema } from "./schema.ts";
 import { type NewSessionWorkspace, NeonSessionWorkspaceRepository, type SessionWorkspace, type SessionWorkspaceNetMode } from "./session-workspace-repository.ts";
 import { poolDatabase, type Sql, StoreError } from "./sql.ts";
@@ -72,6 +75,14 @@ export interface StoreOptions {
   readonly handlingLockTimeout?: Duration.Input | undefined;
   /** How long a statement under a chat's lock may run (LOCKED_STATEMENT_TIMEOUT unless a test says). */
   readonly lockedStatementTimeout?: Duration.Input | undefined;
+  /**
+   * Whether it makes the schema: its tables where missing, a branch's state its own, and the
+   * harness host's grants. alasio's store does; the harness host's, of the schema alasio made,
+   * as a role that may make nothing, does none of it.
+   */
+  readonly makesSchema?: boolean | undefined;
+  /** The harness host's role, granted what it writes once the tables are made (./harness-grants.ts); none where no harness host writes. */
+  readonly harnessRole?: string | null | undefined;
 }
 
 /**
@@ -160,6 +171,9 @@ export class TurnFenced extends Schema.TaggedError<TurnFenced>()("TurnFenced", {
   }
 }
 
+/** A hold of conversations that could not hold them all, as another holds one: its transaction rolled back, so it holds none. */
+class HeldAlready extends Schema.TaggedError<HeldAlready>()("HeldAlready", {}) {}
+
 /** A turn's write: failing as the store does, or with TurnFenced where the turn no longer holds its conversation. */
 export type TurnWrite<A> = Effect.Effect<A, StoreError | TurnFenced>;
 
@@ -230,6 +244,8 @@ export class Store extends Context.Service<Store, {
   readonly createCallbackActions: (conversationId: string, actions: readonly NewCallbackAction[]) => Stored<string[]>;
   /** The action of a button pressed for the first time; null for one pressed before, or unknown. */
   readonly consumeCallbackAction: (id: string) => Stored<CallbackAction | null>;
+  /** Whether buttons that settle the held prompt job `jobId` are kept, as asking about it keeps them until it is settled. */
+  readonly hasCallbackActionsOfJob: (jobId: string) => Stored<boolean>;
 
   /** Keeps an update, unless it is kept already: whether it is yet to be processed. */
   readonly recordTelegramUpdate: (update: Update) => Stored<boolean>;
@@ -275,10 +291,18 @@ export class Store extends Context.Service<Store, {
   readonly getActiveTurn: (conversationId: string) => Stored<Turn | null>;
   /** The conversation's latest turn, active or ended: what its harness said it did, and how it ended. */
   readonly getTurn: (conversationId: string) => Stored<Turn | null>;
-  /** Holds the conversations busy for `reason`, as no turn does (a fork). */
-  readonly holdConversations: (conversationIds: readonly string[], reason: string) => Stored<void>;
-  /** Lets go of the conversations' holds; of every one, for null. */
-  readonly releaseConversations: (conversationIds: readonly string[] | null) => Stored<void>;
+  /**
+   * Holds the conversations busy for `reason`, as no turn does (a fork), for `ttlMs` unless
+   * renewed, all at once where none is held already, or none at all: the holder they are
+   * held as, or null where it held none.
+   */
+  readonly holdConversations: (conversationIds: readonly string[], reason: string, ttlMs: number) => Stored<string | null>;
+  /** Keeps the holds of `holder` (holdConversations) for `ttlMs` more: how many it still has. */
+  readonly renewHolds: (holder: string, ttlMs: number) => Stored<number>;
+  /** Whether the conversation is held busy, as no turn, by a hold not expired (holdConversations). */
+  readonly isConversationHeld: (conversationId: string) => Stored<boolean>;
+  /** Lets go of the holds of `holder`; of every hold, for null. */
+  readonly releaseHolds: (holder: string | null) => Stored<void>;
 
   /** Lets go of a response, as delivered or never to be. */
   readonly markPendingAsPosted: (pendingResponseId: string) => Stored<void>;
@@ -286,6 +310,12 @@ export class Store extends Context.Service<Store, {
 
   /** Queues a reply: its id, or that of the one already queued for its pending response. */
   readonly enqueueOutboxText: (text: NewOutboxText) => Stored<string>;
+  /**
+   * Queues a reply with buttons, `compose` making it of their actions' ids, in order: the
+   * actions kept and the reply queued in one transaction, so that neither is without the
+   * other. Its id.
+   */
+  readonly enqueueOutboxPanel: (conversationId: string, actions: readonly NewCallbackAction[], compose: (ids: readonly string[]) => NewOutboxText) => Stored<string>;
   /** Queues a turn's status message: its id, which an edit of it names. */
   readonly enqueueOutboxStatus: (status: NewOutboxStatus) => Stored<string>;
   /** Queues an edit of the status message `edits`. */
@@ -301,7 +331,7 @@ export class Store extends Context.Service<Store, {
   readonly getPendingOutboxCount: Stored<number>;
 
   /** Queues a prompt: the job queued, or the one already queued for its message. */
-  readonly enqueuePromptJob: (job: NewPromptJob) => Stored<QueuedPromptJob>;
+  readonly enqueuePromptJob: (job: NewPromptJob) => Stored<PromptJob>;
   readonly hasOpenPromptJobs: (conversationId: string) => Stored<boolean>;
   readonly getPromptJob: (id: string) => Stored<PromptJob | null>;
   /** Starts the conversation's next pending job: the job, or null when none waits. */
@@ -349,7 +379,7 @@ export class Store extends Context.Service<Store, {
    */
   readonly pruneTransient: (age: Duration.Input) => Stored<void>;
 }>()("alasio/persistence/Store") {
-  /** The store in `schema` of the pool's database, its tables made first where missing. */
+  /** The store in `schema` of the pool's database, made first as `makesSchema` says. */
   static readonly layer = (options: StoreOptions): Layer.Layer<Store, StoreError> => Layer.effect(Store, makeStore(options));
 }
 
@@ -360,14 +390,19 @@ const makeStore = Effect.fnUntraced(function*({
   branch = null,
   handlingLockTimeout = HANDLING_LOCK_TIMEOUT,
   lockedStatementTimeout = LOCKED_STATEMENT_TIMEOUT,
+  makesSchema = true,
+  harnessRole = null,
 }: StoreOptions) {
   const database = poolDatabase(pool);
   /** Bounds the statements of a chat's lock's transaction `sql` (LOCKED_STATEMENT_TIMEOUT), for that transaction alone. */
   const bounded = (sql: Sql): Effect.Effect<void, StoreError> =>
     Effect.asVoid(sql.query("select set_config('statement_timeout', $1, true)", [`${Duration.toMillis(lockedStatementTimeout)}ms`]));
-  yield* ensureSchema(database, schema);
-  if (branch && (yield* startBranch(database, schema, branch))) {
-    yield* Effect.logInfo(`made the state the branch ${branch}'s: what was in flight where it was branched from is gone`);
+  if (makesSchema) {
+    yield* ensureSchema(database, schema);
+    if (harnessRole) yield* grantHarness(database, schema, harnessRole);
+    if (branch && (yield* startBranch(database, schema, branch))) {
+      yield* Effect.logInfo(`made the state the branch ${branch}'s: what was in flight where it was branched from is gone`);
+    }
   }
   /** The repositories on `sql`: a transaction's. */
   const repositoriesOn = (sql: Sql) => repositories(sql, schema, workingDirectory);
@@ -398,6 +433,7 @@ const makeStore = Effect.fnUntraced(function*({
 
     createCallbackActions: (conversationId, actions) => callbacks.createCallbackActions(conversationId, actions),
     consumeCallbackAction: (id) => callbacks.consumeCallbackAction(id),
+    hasCallbackActionsOfJob: (jobId) => callbacks.hasActionsOfJob(jobId),
 
     recordTelegramUpdate: (update) => telegramContent.recordTelegramUpdate(update),
     withHandlingLock: (chatId, work) =>
@@ -483,13 +519,27 @@ const makeStore = Effect.fnUntraced(function*({
     getActiveTurns: turns.getActiveTurns(),
     getActiveTurn: (conversationId) => turns.getActiveTurn(conversationId),
     getTurn: (conversationId) => turns.getTurn(conversationId),
-    holdConversations: (conversationIds, reason) => turns.hold(conversationIds, reason),
-    releaseConversations: (conversationIds) => turns.release(conversationIds),
+    holdConversations: (conversationIds, reason, ttlMs) => {
+      const holder = randomUUID();
+      // One that made fewer than all, as another held one of them, or held it as this ran, keeps none.
+      return database.transaction((sql) =>
+        Effect.flatMap(repositoriesOn(sql).turns.holdEach(conversationIds, reason, holder, ttlMs), (made) =>
+          made === new Set(conversationIds).size ? Effect.succeed(holder) : Effect.fail(new HeldAlready()))
+      ).pipe(Effect.catchTag("HeldAlready", () => Effect.succeed(null)));
+    },
+    renewHolds: (holder, ttlMs) => turns.renew(holder, ttlMs),
+    releaseHolds: (holder) => turns.release(holder),
+    isConversationHeld: (conversationId) => turns.isHeld(conversationId),
 
     markPendingAsPosted: (pendingResponseId) => Effect.asVoid(responses.markPendingAsPosted(pendingResponseId)),
     getCompletedResponsesPendingDelivery: responses.getCompletedResponsesPendingDelivery(),
 
     enqueueOutboxText: (text) => outbox.enqueueText(text),
+    enqueueOutboxPanel: (conversationId, actions, compose) =>
+      database.transaction((sql) => {
+        const on = repositoriesOn(sql);
+        return Effect.flatMap(on.callbacks.createCallbackActions(conversationId, actions), (ids) => on.outbox.enqueueText(compose(ids)));
+      }),
     enqueueOutboxStatus: (status) => outbox.enqueueStatus(status),
     enqueueOutboxEdit: (edits, edit) => outbox.enqueueEdit(edits, edit),
     getDueOutbox: (limit) => outbox.getDue(limit),

@@ -46,7 +46,7 @@ const DEV_TIMELINE = "22222222222222222222222222222222";
 
 /** dev's compute's own credentials: its roles' passwords' verifiers, and its token's hash. */
 const DEV_COMPUTE = {
-  verifiers: { alasio: scramVerifier("dev-password"), lake: scramVerifier("dev-lake-password") },
+  verifiers: { alasio: scramVerifier("dev-password"), lake: scramVerifier("dev-lake-password"), harness: scramVerifier("dev-harness-password") },
   tokenSha256: tokenSha256("dev-token"),
 };
 
@@ -125,6 +125,7 @@ describe("a branch asked for", () => {
         { name: "dev", compute: { ...compute, password: "dev-password" } },
         { name: "dev", compute: { ...compute, verifiers: { ...compute.verifiers, alasio: "dev-password" } } },
         { name: "dev", compute: { ...compute, verifiers: { alasio: compute.verifiers.alasio } } },
+        { name: "dev", compute: { ...compute, verifiers: { alasio: compute.verifiers.alasio, lake: compute.verifiers.lake } } },
         { name: "dev", compute: { ...compute, verifiers: { ...compute.verifiers, grafana: compute.verifiers.lake } } },
         { name: "dev", compute: { ...compute, tokenSha256: "dev-token" } },
       ]

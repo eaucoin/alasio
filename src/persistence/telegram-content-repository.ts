@@ -117,26 +117,21 @@ export class NeonTelegramContentRepository {
 
   /**
    * Keeps a message: its id, or, for one of a Telegram message kept already, as an update
-   * handled again keeps it again (one whose handling lock was lost), that one's id, so it is
-   * kept once. A chat's updates are handled one at a time (its handling lock), so the
-   * check and the keeping are not raced. A Telegram message is known by its id and the
+   * handled again keeps it again (one whose handling lock was lost, by this alasio or
+   * another, at once), that one's id, so it is kept once (messages_telegram_once). A
+   * Telegram message is known by its id and the
    * time it was sent: its id is its bot's alone, and a branch environment's state holds its
    * parent's messages, whose bot's ids its own bot gives again, but each sent before the
    * branch was made, and so before any of its own.
    */
   insertMessage({ conversationId, direction, kind, transportMessageId, text, mediaGroupId, raw, sessionId, turnId }: NewMessage): Effect.Effect<string, StoreError> {
     return this.#sql.query<{ id: string }>(
-      `with kept as (
-         select id from ${this.#schema}.messages
-         where $5::text is not null and conversation_id = $2 and direction = $3 and transport_message_id = $5
-           and (raw->>'date') is not distinct from ($8::json->>'date')
-         limit 1
-       ), made as (
-         insert into ${this.#schema}.messages (id, conversation_id, direction, kind, transport_message_id, text, media_group_id, raw, session_id, turn_id)
-         select $1::text, $2::text, $3::text, $4::text, $5::text, $6::text, $7::text, $8::json, $9::text, $10::text where not exists (select 1 from kept)
-         returning id
-       )
-       select id from kept union all select id from made`,
+      // The no-op update makes the message kept already the one returned.
+      `insert into ${this.#schema}.messages (id, conversation_id, direction, kind, transport_message_id, text, media_group_id, raw, session_id, turn_id)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       on conflict (conversation_id, direction, transport_message_id, (raw->>'date')) where transport_message_id is not null
+         do update set conversation_id = excluded.conversation_id
+       returning id`,
       [
         newId(),
         conversationId,
@@ -152,20 +147,15 @@ export class NeonTelegramContentRepository {
     ).pipe(Effect.map(([row]) => row!.id));
   }
 
-  /** Keeps a file a message carried: its id, or that of the one kept already of the message, as insertMessage keeps a message once. */
+  /** Keeps a file a message carried: its id, or that of the one kept already of the message (files_telegram_once), as insertMessage keeps a message once. */
   insertFile({ conversationId, messageId, file, name, content, sha256 }: NewFile): Effect.Effect<string, StoreError> {
     return this.#sql.query<{ id: string }>(
-      `with kept as (
-         select id from ${this.#schema}.files
-         where $5::text is not null and message_id = $2 and telegram_file_unique_id = $5
-         limit 1
-       ), made as (
-         insert into ${this.#schema}.files
-           (id, message_id, conversation_id, telegram_file_id, telegram_file_unique_id, file_name, name, mime_type, file_size, sha256, content, raw)
-         select $1::text, $2::text, $3::text, $4::text, $5::text, $6::text, $7::text, $8::text, $9::integer, $10::text, $11::bytea, $12::json where not exists (select 1 from kept)
-         returning id
-       )
-       select id from kept union all select id from made`,
+      `insert into ${this.#schema}.files
+         (id, message_id, conversation_id, telegram_file_id, telegram_file_unique_id, file_name, name, mime_type, file_size, sha256, content, raw)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       on conflict (message_id, telegram_file_unique_id) where telegram_file_unique_id is not null
+         do update set message_id = excluded.message_id
+       returning id`,
       [
         newId(),
         messageId,

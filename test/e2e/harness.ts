@@ -5,8 +5,8 @@
  * pushed to a registry of the run's own beside the cluster, which the cluster's
  * `registries` have its nodes pull from, the stand-ins it talks to instead of Telegram
  * and a telemetry backend applied (./stand-ins.ts), and alasio started by `alasio up`,
- * running a stand-in for Codex in its place (./codex-stand-in.ts), as the run has no
- * Codex login, its Grafana then made to take the Telegram stand-in for Telegram
+ * running stand-ins for Codex and Claude Code in their place (./codex-stand-in.ts,
+ * ./claude-stand-in.ts), as the run has no login of either, its Grafana then made to take the Telegram stand-in for Telegram
  * (trustTelegramStandIn). The tests then drive it through its command line (`alasio`), the stand-ins, and the
  * cluster's API (`kube`); the run is torn down by `alasio uninstall --purge`, after what
  * the cluster was doing is said, when something of the run failed.
@@ -30,8 +30,8 @@
  *
  * The `upgrade` shard sets alasio up as the release before set it up, on the host target,
  * as the box is: by the published package of the release ALASIO_E2E_PREVIOUS names, with
- * that release's images, but for alasio's, which is the stand-in for Codex built on that
- * release's alasio image, pushed as alasio-codex-stand-in-previous. Its suite upgrades it to
+ * that release's images, but for alasio's, which is the stand-ins' built on that
+ * release's alasio image, pushed as alasio-harness-stand-ins-previous. Its suite upgrades it to
  * this checkout by the cut-over the box runs (cutOver).
  */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
@@ -61,6 +61,7 @@ import {
 } from "@kubernetes/client-node";
 import { type Duration, Effect, Stream } from "effect";
 
+import { cpuMillis, cpuText } from "../../cli/src/capacity.ts";
 import { subnetAddress } from "../../cli/src/cluster/docker.ts";
 import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "../../cli/src/kube/api.ts";
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
@@ -157,13 +158,14 @@ export const BIG_REPL_MEBIBYTES = 1024;
 
 /**
  * The images built here: their names, and what they are built from. alasio's runs in
- * the run as alasio-codex-stand-in, alasio's with the stand-in for Codex in it
- * (./codex-stand-in.Dockerfile), built on it.
+ * the run as alasio-harness-stand-ins, alasio's with the stand-ins for its harnesses in
+ * it (./harness-stand-ins.Dockerfile), built on it.
  */
-const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-grafana": "neon/grafana", "alasio-log": "neon/log", "alasio-collector": "neon/collector", "alasio-webhook": "webhook", "alasio-node": "cluster/node", "alasio-codex-stand-in": "test" } as const;
+const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-grafana": "neon/grafana", "alasio-log": "neon/log", "alasio-collector": "neon/collector", "alasio-webhook": "webhook", "alasio-node": "cluster/node", "alasio-harness-stand-ins": "test" } as const;
 
-/** Where alasio runs the stand-in for Codex from, in alasio-codex-stand-in. */
+/** Where alasio runs the stand-ins for Codex and Claude Code from, in alasio-harness-stand-ins. */
 const CODEX_STAND_IN = "/opt/alasio/test/e2e/codex-stand-in.ts";
+const CLAUDE_STAND_IN = "/opt/alasio/test/e2e/claude-stand-in.ts";
 
 /** The registry the images were pushed to already, when the run builds none. */
 const PUSHED = process.env["ALASIO_E2E_REGISTRY"] || undefined;
@@ -625,12 +627,13 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
   const on = (node: string) => (AGENTS >= 2 ? { nodeSelector: { "kubernetes.io/hostname": `${CLUSTER}-${node}` } } : {});
   return {
     images: of === "previous"
-      ? { alasio: { repository: `${PUSHED}/alasio-codex-stand-in-previous`, tag: "e2e", digest: "" }, pullPolicy: "IfNotPresent" }
-      : { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), grafana: pushed("alasio-grafana"), log: pushed("alasio-log"), collector: pushed("alasio-collector"), webhook: pushed("alasio-webhook"), pullPolicy: "IfNotPresent" },
+      ? { alasio: { repository: `${PUSHED}/alasio-harness-stand-ins-previous`, tag: "e2e", digest: "" }, pullPolicy: "IfNotPresent" }
+      : { alasio: pushed("alasio-harness-stand-ins"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), grafana: pushed("alasio-grafana"), log: pushed("alasio-log"), collector: pushed("alasio-collector"), webhook: pushed("alasio-webhook"), pullPolicy: "IfNotPresent" },
     alasio: {
       env: {
         TELEGRAM_API_ROOT: urlOf(TELEGRAM),
         ALASIO_CODEX_BIN: CODEX_STAND_IN,
+        ALASIO_CLAUDE_BIN: CLAUDE_STAND_IN,
       },
       resources: { requests: { cpu: "50m", memory: "256Mi" } },
       ...on("agent-1"),
@@ -789,7 +792,7 @@ export async function setUp(): Promise<void> {
     const pushHost = await startRegistry();
     for (const name of ["alasio", "alasio-agent", "alasio-lake", "alasio-grafana", "alasio-log", "alasio-collector", "alasio-webhook"] as const) await push(pushHost, name);
     // On alasio's image, which its build pulls back from the registry.
-    await push(pushHost, "alasio-codex-stand-in", ["--file", "test/e2e/codex-stand-in.Dockerfile", "--build-arg", `ALASIO=${pushHost}/${imageOf("alasio")}`]);
+    await push(pushHost, "alasio-harness-stand-ins", ["--file", "test/e2e/harness-stand-ins.Dockerfile", "--build-arg", `ALASIO=${pushHost}/${imageOf("alasio")}`]);
   }
 
   console.error("# applying the stand-ins");
@@ -958,8 +961,9 @@ async function dumpNodes(which: ((node: string) => boolean) | undefined): Promis
 }
 
 /**
- * What the cluster is doing, said on stderr, folded in GitHub's log: its nodes, pods (each
- * container's restarts with them) and latest events, why each pod that is not ready is
+ * What the cluster is doing, said on stderr, folded in GitHub's log: its nodes (with how
+ * much of each one's CPU its pods request, of what it has), pods (with what each requests,
+ * and each container's restarts) and latest events, why each pod that is not ready is
  * not, with its logs, and the latest logs of the pods a compute's wake goes through, its
  * proxy's, neon-control's and each compute's, ready or not: a compute's Postgres restarting
  * within its container leaves its pod ready, and says why in its log alone; the lake's and
@@ -981,19 +985,29 @@ export async function dumpClusterState(): Promise<void> {
     conditions?.find(({ type }) => type === "Ready")?.status === "True";
   try {
     const nodes = await kube.list<V1Node>("Node");
+    const pods = await kube.list<V1Pod>("Pod");
+    // What a pod asks of its node's CPU, as the scheduler counts it: its containers' requests
+    // summed, or its largest init container's where that is more; none once it has ended.
+    const requested = (pod: V1Pod): number => {
+      if (pod.status?.phase === "Succeeded" || pod.status?.phase === "Failed") return 0;
+      const of = (containers: readonly { readonly resources?: { readonly requests?: Record<string, string> } }[] | undefined) =>
+        (containers ?? []).map(({ resources }) => cpuMillis(resources?.requests?.["cpu"] ?? "0"));
+      return Math.max(of(pod.spec?.containers).reduce((sum, each) => sum + each, 0), ...of(pod.spec?.initContainers));
+    };
     for (const node of nodes) {
       const condition = node.status?.conditions?.find(({ type }) => type === "Ready");
-      say(`node ${node.metadata?.name}: ${ready(node.status?.conditions) ? "ready" : `not ready${condition ? ` (${condition.reason}: ${condition.message})` : ""}`}`);
+      const asked = pods.filter((pod) => pod.spec?.nodeName === node.metadata?.name).reduce((sum, pod) => sum + requested(pod), 0);
+      const allocatable = cpuMillis(node.status?.allocatable?.["cpu"] ?? "0");
+      say(`node ${node.metadata?.name}: ${ready(node.status?.conditions) ? "ready" : `not ready${condition ? ` (${condition.reason}: ${condition.message})` : ""}`}, ${cpuText(asked)} of ${cpuText(allocatable)} requested`);
     }
     const notReady = new Set(nodes.filter((node) => !ready(node.status?.conditions)).map((node) => node.metadata?.name ?? ""));
     for (const line of await dumpNodes((node) => notReady.has(node) || !nodes.some((each) => each.metadata?.name === node))) say(line);
-    const pods = await kube.list<V1Pod>("Pod");
     for (const pod of pods) {
       const { namespace, name } = pod.metadata ?? {};
       const restarts = (pod.status?.containerStatuses ?? []).filter(({ restartCount }) => restartCount > 0).map(({ name: container, restartCount, lastState }) =>
         `${container} restarted ${restartCount} times${lastState?.terminated ? `, last exiting with ${lastState.terminated.exitCode}${lastState.terminated.reason ? ` (${lastState.terminated.reason})` : ""}` : ""}`
       );
-      say(`pod ${namespace}/${name} on ${pod.spec?.nodeName ?? "no node"}: ${pod.status?.phase}${ready(pod.status?.conditions) ? ", ready" : ""}${restarts.map((each) => `, ${each}`).join("")}`);
+      say(`pod ${namespace}/${name} on ${pod.spec?.nodeName ?? "no node"}: ${pod.status?.phase}${ready(pod.status?.conditions) ? ", ready" : ""}, requesting ${cpuText(requested(pod))}${restarts.map((each) => `, ${each}`).join("")}`);
     }
     const events = [...(await kube.list<CoreV1Event>("Event"))]
       .sort((a, b) => new Date(a.lastTimestamp ?? a.eventTime ?? 0).getTime() - new Date(b.lastTimestamp ?? b.eventTime ?? 0).getTime());

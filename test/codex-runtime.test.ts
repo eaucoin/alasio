@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
-import type { Thread, ThreadEvent } from "@openai/codex-sdk";
+import { Codex, type Thread, type ThreadEvent } from "@openai/codex-sdk";
 import { Effect, Layer, Logger } from "effect";
 
 import { makeAppServer } from "../src/codex/app-server/client.ts";
 import { executeCodexTurn } from "../src/codex/runtime.ts";
-import type { CodexExecClient } from "../src/codex/transport.ts";
+import { type CodexExecClient, execCodexOptions } from "../src/codex/transport.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { TurnPersistence } from "../src/harness/index.ts";
 import type { FolderBayma, FolderBaymaScope } from "../src/mcp/bayma.ts";
@@ -124,4 +127,22 @@ test("a turn whose folder's bayma did not start runs without it, its prompt told
   await runTurn(recordingPersistence([]), () => Effect.void, { folderBayma: (scope) => Effect.sync(() => (asked.push(scope), { server: null, notice })) });
   assert.deepEqual(prompted, [`${notice}\n\nhello`]);
   assert.deepEqual(asked.map(({ harness, threadKey, chatId }) => ({ harness, threadKey, chatId })), [{ harness: "codex", threadKey: "conversation-1", chatId: "1" }]);
+});
+
+test("codex exec, which the exec transport runs, is run without the login's apps nor plugins", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "alasio-codex-exec-"));
+  try {
+    // A codex that records how it was run, reads its prompt, and runs nothing.
+    const codex = join(directory, "codex");
+    writeFileSync(codex, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(directory, "argv"))}\ncat > /dev/null\nexit 1\n`);
+    chmodSync(codex, 0o755);
+    const client = new Codex({ ...execCodexOptions({ PATH: process.env["PATH"] ?? "" }, { developer_instructions: "", mcp_servers: {} }), codexPathOverride: codex });
+    await client.startThread({ skipGitRepoCheck: true }).run("hello").then(() => assert.fail("the recording codex runs nothing"), () => undefined);
+    const argv = readFileSync(join(directory, "argv"), "utf8").split("\n");
+    const configs = argv.flatMap((arg, index) => (arg === "--config" ? [argv[index + 1]] : []));
+    assert.equal(argv[0], "exec");
+    for (const feature of ["features.apps=false", "features.plugins=false"]) assert.ok(configs.includes(feature), `${feature} in ${JSON.stringify(configs)}`);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

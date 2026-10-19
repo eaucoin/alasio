@@ -178,22 +178,45 @@ export class NeonTurnRepository {
     return this.#sql.query<Turn>(`select * from ${this.#schema}.turns where state = 'active' order by started_at`);
   }
 
-  /** Holds the conversations busy for `reason`, as no turn: a fork's. */
-  hold(conversationIds: readonly string[], reason: string): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(
-      `insert into ${this.#schema}.conversation_holds (conversation_id, reason)
-       select id, $2 from unnest($1::text[]) as held (id)
-       on conflict (conversation_id) do update set reason = excluded.reason, held_at = now()`,
-      [conversationIds, reason],
-    ));
+  /**
+   * Holds each of the conversations busy for `reason`, as no turn (a fork), as `holder`'s,
+   * until `ttlMs` from now unless renewed, where none is held, or its hold has expired: the
+   * rows made, of those it could. Run in a transaction (hold), which keeps them only where
+   * it made every one.
+   */
+  holdEach(conversationIds: readonly string[], reason: string, holder: string, ttlMs: number): Effect.Effect<number, StoreError> {
+    return this.#sql.query<{ made: string }>(
+      `with made as (
+         insert into ${this.#schema}.conversation_holds as held (conversation_id, reason, holder, expires_at)
+         select id, $2, $3, now() + $4 * interval '1 millisecond' from unnest($1::text[]) as wanted (id)
+         on conflict (conversation_id) do update
+           set reason = excluded.reason, holder = excluded.holder, held_at = now(), expires_at = excluded.expires_at
+           where held.expires_at <= now()
+         returning conversation_id
+       )
+       select count(*) as made from made`,
+      [conversationIds, reason, holder, ttlMs],
+    ).pipe(Effect.map(([row]) => Number(row?.made ?? 0)));
   }
 
-  /** Lets go of the conversations' holds; none is left by the alasio that held them, with `null`. */
-  release(conversationIds: readonly string[] | null): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(
-      `delete from ${this.#schema}.conversation_holds where $1::text[] is null or conversation_id = any($1::text[])`,
-      [conversationIds],
-    ));
+  /** Keeps `holder`'s holds until `ttlMs` from now, those that have not expired: how many it still had. */
+  renew(holder: string, ttlMs: number): Effect.Effect<number, StoreError> {
+    return this.#sql.query(
+      `update ${this.#schema}.conversation_holds set expires_at = now() + $2 * interval '1 millisecond' where holder = $1 and expires_at > now() returning conversation_id`,
+      [holder, ttlMs],
+    ).pipe(Effect.map((rows) => rows.length));
+  }
+
+  /** Whether the conversation is held busy, as no turn, by a hold that has not expired. */
+  isHeld(conversationId: string): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(`select 1 from ${this.#schema}.conversation_holds where conversation_id = $1 and expires_at > now()`, [conversationId]).pipe(
+      Effect.map((rows) => rows.length > 0),
+    );
+  }
+
+  /** Lets go of `holder`'s holds; of every hold, held by any, with `null`, as the alasio that held them is gone. */
+  release(holder: string | null): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(`delete from ${this.#schema}.conversation_holds where $1::text is null or holder = $1`, [holder]));
   }
 
   /** The conversation's latest turn, active or ended, or null when none has run. */

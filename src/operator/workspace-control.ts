@@ -1,8 +1,8 @@
 import { Effect, Option } from "effect";
 
 import type { ConversationChat } from "../codex/turns.ts";
-import { ActiveTurns } from "../harness/active-turns.ts";
-import { isBusy } from "../harness/commands.ts";
+import { HarnessHost } from "../harness/host.ts";
+import { shownBusy } from "../harness/commands.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS, harnessDisplayName, type HarnessName } from "../harness/names.ts";
 import { HostBayma } from "../mcp/bayma.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
@@ -22,7 +22,7 @@ import { type ButtonDraft, type ControlCallback, type ControlPanel, closePanel, 
 import { truncateText } from "./text.ts";
 
 /** What the workspace controls run on. */
-export type WorkspaceControlServices = Store | TelegramClient | ActiveTurns | Mounts;
+export type WorkspaceControlServices = Store | TelegramClient | HarnessHost | Mounts;
 
 const WORKSPACE_KIND_PREFIX = "workspace:";
 
@@ -156,9 +156,9 @@ const listWorkspaces = (workspaceRoot: string): Effect.Effect<WorkspaceListing> 
   );
 
 /** The conversation's workspace panel as it stands, with `notice` under it. */
-const workspacePanel = Effect.fnUntraced(function*(conversationId: string, notice = ""): Effect.fn.Return<ControlPanel, StoreError, Store | ActiveTurns | Mounts> {
+const workspacePanel = Effect.fnUntraced(function*(conversationId: string, notice = ""): Effect.fn.Return<ControlPanel, StoreError, Store | HarnessHost | Mounts> {
   const mounts = yield* Mounts;
-  const working = yield* isBusy(conversationId);
+  const working = yield* shownBusy(conversationId);
   const store = yield* Store;
   const { workingDirectory } = yield* store.getMount(conversationId);
   return yield* keepPanel(conversationId, buildWorkspacePanel({

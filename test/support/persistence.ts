@@ -22,7 +22,8 @@ export const forgetfulPersistence: TurnPersistence = {
   recordRestartEvent: () => Effect.void,
 };
 
-/** The turns a harness starts on its own, each claimed onto `persistence`, its end recorded in `ended` where given. */
-export const ownTurnsOn = (persistence: TurnPersistence, ended: string[] = []): OwnTurns => ({
+/** The turns a harness starts on its own, each claimed onto `persistence`, its end recorded in `ended` where given, under no hold of a fork's unless `held` says. */
+export const ownTurnsOn = (persistence: TurnPersistence, ended: string[] = [], held: Effect.Effect<boolean> = Effect.succeed(false)): OwnTurns => ({
   claim: () => Effect.succeed({ persistence, end: (outcome) => Effect.sync(() => void ended.push(outcome)) }),
+  held,
 });

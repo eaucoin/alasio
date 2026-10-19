@@ -6,7 +6,7 @@
  * main has made: a branch of Neon's at that position, by neon-control, and the branch's
  * objects on it, with Secrets of its own: credentials of its own for what it runs (the
  * password of alasio's role on its compute, which neon-control gives the role there, the
- * lake's role's, which its alasio gives it, and its compute's token, which fetches its
+ * lake's role's and the harness host's, which its alasio gives them, and its compute's token, which fetches its
  * spec alone), none of which reaches main's compute or another branch's; its bot's;
  * Claude Code's token when main has one; the pull Secrets of its images; its token to ask
  * main to fork with; and its principals on the log, its alasio's, which reads its own
@@ -35,7 +35,7 @@ import { Console, Effect, Predicate, Redacted, Result, Schedule, Schema } from "
 
 import { type BranchView, COMPUTE_PORT, computeId, MAIN, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
-import { LAKE_ROLE, ROLE } from "../../neon/control/secrets.ts";
+import { HARNESS_ROLE, LAKE_ROLE, ROLE } from "../../neon/control/secrets.ts";
 import { BINDING_LABEL, environmentKey, KEY_ANNOTATION } from "../../src/binder/names.ts";
 import { sessionKey, volumeIdOfKey } from "../../src/sandbox/names.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
@@ -297,9 +297,9 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
 
   // The branch's own, as the module says: none of main's passwords or tokens of its Neon.
   const own = () => randomBytes(24).toString("base64url");
-  const credentials = { alasio: own(), lake: own(), compute: own(), log: own(), loader: own() };
+  const credentials = { alasio: own(), lake: own(), harness: own(), compute: own(), log: own(), loader: own() };
   // Their verifiers, each made once and given to whatever sets the role or answers for it.
-  const verifiers = { [ROLE]: scramVerifier(credentials.alasio), [LAKE_ROLE]: scramVerifier(credentials.lake) };
+  const verifiers = { [ROLE]: scramVerifier(credentials.alasio), [LAKE_ROLE]: scramVerifier(credentials.lake), [HARNESS_ROLE]: scramVerifier(credentials.harness) };
   // Each of its principals on the log a password of its own, its alasio's the one in its Secret.
   const access = environmentAccess(name);
   const passwords: Readonly<Record<string, string>> = { [alasioPrincipal(name)]: credentials.log, [loaderPrincipal(name)]: credentials.loader };
@@ -308,9 +308,14 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   const url = new URL(yield* requiredSecret(componentName("database"), "url"));
   url.password = credentials.alasio;
   url.searchParams.set("options", `endpoint=${computeId(name)}`);
+  // The harness host's, the same as its own role.
+  const harnessUrl = new URL(url);
+  harnessUrl.username = HARNESS_ROLE;
+  harnessUrl.password = credentials.harness;
   const lake = settings.lake.enabled ? yield* copiedSecret(name, componentName("lake"), ["LAKE_S3_KEY", "LAKE_S3_SECRET"]) : null;
   const secrets = [
-    branchSecret(name, componentName("database"), { url: url.toString(), "lake-verifier": verifiers[LAKE_ROLE] }),
+    branchSecret(name, componentName("database"), { url: url.toString(), "lake-verifier": verifiers[LAKE_ROLE], "harness-verifier": verifiers[HARNESS_ROLE] }),
+    branchSecret(name, componentName("harness-database"), { url: harnessUrl.toString() }),
     branchSecret(name, neonName("compute"), { NEON_CONTROL_PLANE_TOKEN: credentials.compute }),
     // The lake service's: main's object store identity, the one thing of main's a branch is given (see the module), and its role's password.
     ...(lake ? [{ ...lake, data: { ...lake.data, LAKE_DATABASE_PASSWORD: Buffer.from(credentials.lake, "utf8").toString("base64") } }] : []),

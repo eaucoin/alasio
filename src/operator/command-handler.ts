@@ -5,8 +5,8 @@
 import { Effect, Option } from "effect";
 
 import { type TurnError, Turns } from "../codex/turns.ts";
-import { ActiveTurns } from "../harness/active-turns.ts";
-import { isBusy, stopTurn } from "../harness/commands.ts";
+import { HarnessHost } from "../harness/host.ts";
+import { shownBusy, stopTurnSaying } from "../harness/commands.ts";
 import { type HarnessError, harnessLabelOf, Harnesses, type HarnessUnavailable } from "../harness/index.ts";
 import { Store } from "../persistence/store.ts";
 import type { ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
@@ -22,7 +22,7 @@ import { truncateText } from "./text.ts";
 import { handleWorkspaceTextCommand, sendChooseWorkspacePanel } from "./workspace-control.ts";
 
 /** What the operator's commands and controls run on. */
-export type OperatorServices = Store | TelegramClient | ActiveTurns | Harnesses | Turns | Mounts | ReceivedFiles;
+export type OperatorServices = Store | TelegramClient | HarnessHost | Harnesses | Turns | Mounts | ReceivedFiles;
 
 /** How a command fails: the operator is told why. Turns' errors include alasio's store's. */
 export type CommandError = TelegramError | HarnessError | HarnessUnavailable | NewSessionError | TurnError | ReceivedFileError;
@@ -61,14 +61,14 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
   const mount = yield* store.getMount(conversationId);
   // What changes the mount, or stops a turn, needs no harness, which the mount may have none of.
   if (cmd.type === "stop") {
-    if (!(yield* isBusy(conversationId))) {
+    if (!(yield* shownBusy(conversationId))) {
       yield* client.sendMessage(chatId, "No active query to stop.");
       return true;
     }
     const label = harnessLabelOf(mount);
     const [status] = yield* client.sendMessage(chatId, `Stopping ${label}...`);
-    const interrupted = yield* stopTurn(conversationId, "interrupt");
-    const text = interrupted ? `${label} stopped.` : "No active query to stop.";
+    const interrupted = yield* stopTurnSaying(conversationId, "interrupt");
+    const text = typeof interrupted === "string" ? interrupted : interrupted ? `${label} stopped.` : "No active query to stop.";
     if (status?.message_id) {
       yield* client.editMessageText(chatId, status.message_id, text, { format: "plain" }).pipe(Effect.ignore);
     } else {
@@ -84,7 +84,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     yield* handleWorkspaceTextCommand({ ...conversation, args: cmd.args });
     return true;
   }
-  const harness = Option.getOrNull(yield* Effect.flatMap(Harnesses, (harnesses) => harnesses.forMount(mount)));
+  const harness = Option.getOrNull(yield* Effect.flatMap(HarnessHost, (host) => host.panels(mount)));
   if (cmd.type === "model") {
     yield* sendModelPanel({ harness, ...conversation });
     return true;
@@ -123,7 +123,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     return true;
   }
   if (cmd.type === "sessions_new") {
-    if (yield* isBusy(conversationId)) {
+    if (yield* shownBusy(conversationId)) {
       yield* client.sendMessage(chatId, `${harness.displayName} is currently working. Use /stop first, then /sessions new.`);
       return true;
     }

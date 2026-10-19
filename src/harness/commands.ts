@@ -2,9 +2,9 @@
  * The commands an operator sends a conversation's running turn, as its binding takes
  * them: stop it, steer it with a prompt held while it runs, queue that prompt for after
  * it, swerve to it, or discard it. alasio runs every turn in its own process for now, so
- * each command is a call of the turn's (ActiveTurns) and of its prompt jobs (Turns);
+ * each command is a call of its harness host (HarnessHost) and of its prompt jobs (Turns);
  * where a harness runs elsewhere, these are what reach it there, and what calls them
- * stays as it is. Busy is a bound harness running a turn: ActiveTurns.isBusy.
+ * stays as it is. Busy is a bound harness running a turn: the host's status.
  *
  * A held prompt is settled once: the first of its buttons pressed settles it, only while
  * it is held, and forgets the others; a press after that finds it gone.
@@ -14,9 +14,9 @@ import { Effect, Option, Result } from "effect";
 import { Turns } from "../codex/turns.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
-import { type ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
-import { parseWorkspace } from "../workspace/kind.ts";
-import { ActiveTurns, type StopReason } from "./active-turns.ts";
+import type { StopReason } from "./active-turns.ts";
+import { HarnessHost } from "./host.ts";
+import type { HarnessHostError } from "./index.ts";
 
 /** What became of a prompt held while a turn ran, sent to steer it. */
 export type Steered =
@@ -34,12 +34,23 @@ export type Steered =
   | { readonly outcome: "gone" };
 
 /** Stops the conversation's running turn for `reason`, once it has let go: whether one ran. */
-export const stopTurn = (conversationId: string, reason: StopReason): Effect.Effect<boolean, never, ActiveTurns> =>
-  Effect.flatMap(ActiveTurns, (activeTurns) => activeTurns.stop(conversationId, reason));
+export const stopTurn = (conversationId: string, reason: StopReason): Effect.Effect<boolean, HarnessHostError, HarnessHost> =>
+  Effect.flatMap(HarnessHost, (host) => host.interrupt(conversationId, reason));
 
-/** Whether a bound harness runs a turn in the conversation. */
-export const isBusy = (conversationId: string): Effect.Effect<boolean, never, ActiveTurns> =>
-  Effect.flatMap(ActiveTurns, (activeTurns) => activeTurns.isBusy(conversationId));
+/** Whether no turn may start in the conversation, as its harness host says (HarnessStatus.busy). */
+export const isBusy = (conversationId: string): Effect.Effect<boolean, StoreError | HarnessHostError, HarnessHost> =>
+  Effect.flatMap(HarnessHost, (host) => Effect.map(host.status(conversationId), ({ busy }) => busy));
+
+/**
+ * Whether the operator's panels show the conversation working, and refuse what it would
+ * change: as isBusy says, or working where that cannot be told, said in alasio's log.
+ */
+export const shownBusy = (conversationId: string): Effect.Effect<boolean, never, HarnessHost> =>
+  isBusy(conversationId).pipe(Effect.catch((error) => Effect.as(Effect.logWarning(`could not tell whether ${conversationId} is busy: ${error.message}`), true)));
+
+/** Stops the conversation's running turn, as stopTurn does, saying what the operator is told where its host is not reached: whether one ran, or what to say. */
+export const stopTurnSaying = (conversationId: string, reason: StopReason): Effect.Effect<boolean | string, never, HarnessHost> =>
+  stopTurn(conversationId, reason).pipe(Effect.catchTag("HarnessHostError", (error) => Effect.succeed(error.message)));
 
 /**
  * Steers the conversation's running turn with the prompt held as the job `jobId`, or
@@ -49,17 +60,14 @@ export const isBusy = (conversationId: string): Effect.Effect<boolean, never, Ac
  * restart finds steering, the turn may or may not have taken: the operator is asked what
  * to do with it (Turns.reconcilePersistentState), rather than it run again or lost unsaid.
  */
-export const steerWithHeld = (conversationId: string, jobId: string): Effect.Effect<Steered, StoreError | ReceivedFileError, ActiveTurns | Turns | Store | ReceivedFiles> =>
+export const steerWithHeld = (conversationId: string, jobId: string): Effect.Effect<Steered, StoreError, HarnessHost | Turns | Store> =>
   Effect.gen(function*() {
     const store = yield* Store;
     const turns = yield* Turns;
     const job = yield* store.settleHeldPromptJob(jobId, "steering");
     if (!job) return { outcome: "gone" } as const;
     const queued = turns.setPromptDisposition(job.id, "pending");
-    // The files the prompt names, written again if a restart came since.
-    const workspace = parseWorkspace((yield* store.getMount(conversationId)).workingDirectory);
-    yield* (yield* ReceivedFiles).materialize(job.file_ids, workspace).pipe(Effect.tapError(() => queued));
-    const steered = yield* (yield* ActiveTurns).steer(conversationId, job.prompt).pipe(Effect.result);
+    const steered = yield* (yield* HarnessHost).steer(conversationId, job.prompt, job.file_ids).pipe(Effect.result);
     if (Result.isSuccess(steered) && Option.getOrElse(steered.success, () => false)) {
       yield* store.setPromptJobDisposition(job.id, "completed");
       return { outcome: "steered" } as const;
@@ -82,10 +90,11 @@ export const discardHeld = (jobId: string): Effect.Effect<boolean, StoreError, S
   Effect.map(Effect.flatMap(Store, (store) => store.settleHeldPromptJob(jobId, "cancelled")), (job) => job !== null);
 
 /** Stops the conversation's running turn for the prompt held as the job `jobId`, which runs next, first in line: whether it was held. */
-export const swerveTo = (conversationId: string, jobId: string): Effect.Effect<boolean, StoreError, ActiveTurns | Turns | Store> =>
+export const swerveTo = (conversationId: string, jobId: string): Effect.Effect<boolean, StoreError, HarnessHost | Turns | Store> =>
   Effect.gen(function*() {
     if (!(yield* (yield* Store).settleHeldPromptJob(jobId, "pending", 1))) return false;
-    yield* stopTurn(conversationId, "swerve");
+    // Where a host elsewhere stops no turn, the prompt runs once the turn ends, which is said.
+    yield* stopTurn(conversationId, "swerve").pipe(Effect.catch((error) => Effect.logWarning(`could not swerve ${conversationId}'s turn: ${error.message}`)));
     yield* (yield* Turns).schedule(conversationId);
     return true;
   });

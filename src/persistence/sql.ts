@@ -44,18 +44,33 @@ const sqlOn = (client: Pool | PoolClient): Sql => ({
 
 /**
  * A connection of `pool`, waited for as long as it takes, or until interrupted: one that
- * comes after its wait was interrupted is given back to the pool, not lost to it.
+ * comes after its wait was interrupted is given back to the pool, not lost to it, and so is
+ * one that came as it was interrupted, before it was handed on. Only the wait may be
+ * interrupted: run where nothing else may be, as an acquisition is, the connection is
+ * handed on once it has come. The fiber may yield between the two, as its scheduler has it,
+ * and a stop may land there.
  */
 const connection = (pool: Pool): Effect.Effect<PoolClient, StoreError> =>
-  Effect.callback<PoolClient, StoreError>((resume) => {
-    let abandoned = false;
-    pool.connect().then(
-      (client) => (abandoned ? client.release() : resume(Effect.succeed(client))),
-      (cause: unknown) => abandoned || resume(Effect.fail(new StoreError({ cause }))),
+  Effect.suspend(() => {
+    /** The connection that came, until it is handed on. */
+    let came: PoolClient | null = null;
+    return Effect.callback<PoolClient, StoreError>((resume) => {
+      let abandoned = false;
+      pool.connect().then(
+        (client) => {
+          if (abandoned) return client.release();
+          came = client;
+          resume(Effect.succeed(client));
+        },
+        (cause: unknown) => abandoned || resume(Effect.fail(new StoreError({ cause }))),
+      );
+      return Effect.sync(() => {
+        abandoned = true;
+      });
+    }).pipe(
+      Effect.interruptible,
+      Effect.onInterrupt(() => Effect.sync(() => came?.release())),
     );
-    return Effect.sync(() => {
-      abandoned = true;
-    });
   });
 
 /** Gives a transaction's connection back: as it is where it committed, rolled back first where not; one that cannot roll back is ended. */
@@ -82,7 +97,7 @@ export function poolDatabase(pool: Pool): Database {
       ),
     guardedTransaction: (take, work) =>
       Effect.acquireUseRelease(
-        Effect.interruptible(connection(pool)),
+        connection(pool),
         (client) => {
           const sql = sqlOn(client);
           return sql.query("begin").pipe(

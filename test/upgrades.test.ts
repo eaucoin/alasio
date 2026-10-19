@@ -13,9 +13,31 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { testDatabaseUrl, testPool, testStore } from "./support/store.ts";
+
 const SCRIPT = fileURLToPath(new URL("../upgrades/from-8.0.0.sh", import.meta.url));
 /** Where the jq the cut-over needs is, on this machine. */
 const JQ = dirname(spawnSync("sh", ["-c", "command -v jq"], { encoding: "utf8" }).stdout.trim() || "/usr/bin/jq");
+/** The repository, where alasio's pod runs what the cut-over runs in it, as alasio's image is. */
+const REPOSITORY = fileURLToPath(new URL("..", import.meta.url));
+
+/**
+ * alasio's database as 8.0.0 keeps it, in its schema, `state`: this release's schema, but the
+ * indexes that keep a Telegram message, and a file it carried, once, which 8.0.0 had not.
+ */
+const pool = await testPool();
+await testStore({ schema: "state" });
+await pool.query("drop index state.messages_telegram_once; drop index state.files_telegram_once");
+/** Makes the forks' holds as 8.0.0's table keeps them: without their holder and expiry. */
+const holdsOf800 = () =>
+  pool.query(`drop table state.conversation_holds;
+    create table state.conversation_holds (
+      conversation_id text primary key references state.conversations (id) on delete cascade,
+      reason text not null,
+      held_at timestamptz not null default now()
+    )`);
+await holdsOf800();
+const DATABASE_URL = await testDatabaseUrl();
 
 /** The log's StatefulSet, its claims labelled with `version` if given, as the cluster has it. */
 const logStatefulSet = (version?: string) => ({
@@ -31,10 +53,12 @@ const logStatefulSet = (version?: string) => ({
  * `namespaces` names, `<name>\t<branch label>` each, and keeps the log's StatefulSet in
  * `statefulSet`, getting, deleting and creating it; an UPGRADE that makes the log's
  * StatefulSet this release's, with no version on its claims, and an UPGRADE_CHECK, each saying
- * it ran, UPGRADE failing while `upgradeFails` is there; and a node, in `node`, whose
- * containerd and stargz-snapshotter's daemon hold images, one of the daemon's snapshots mounted
- * in another, and whose systemctl, umount and k3s-killall.sh say what they were asked, umount unmounting, its
- * systemctl failing to start k3s while `startFails` is there.
+ * it ran, UPGRADE failing while `upgradeFails` is there; a node, in `node`, whose containerd
+ * and stargz-snapshotter's daemon hold images, one of the daemon's snapshots mounted in
+ * another, and whose systemctl, umount and k3s-killall.sh say what they were asked, umount
+ * unmounting, its systemctl failing to start k3s while `startFails` is there. What the
+ * cut-over runs in alasio's pod runs here, on the test's database, as 8.0.0's alasio reaches
+ * its own.
  */
 function machine() {
   const root = mkdtempSync(join(tmpdir(), "alasio-cut-over-"));
@@ -65,11 +89,13 @@ function machine() {
   const daemonSnapshot = join(node, "var/lib/containerd-stargz-grpc/snapshotter/snapshots/1/fs");
   writeFileSync(join(node, "proc/self/mounts"), `proc /proc proc rw 0 0\nstargz ${daemonSnapshot} fuse.rawBridge rw 0 0\nstargz ${daemonSnapshot}/inner fuse.rawBridge rw 0 0\n`);
   writeFileSync(join(node, "usr/local/bin/k3s-killall.sh"), `#!/bin/sh\necho k3s-killall.sh >>'${host}'\n`, { mode: 0o755 });
+  const databaseUrl = join(root, "database-url");
   writeFileSync(namespaces, "");
   writeFileSync(folders, JSON.stringify({ items: [] }));
   writeFileSync(sandboxes, "");
   writeFileSync(config, JSON.stringify({ target: { host: {} }, install: { host: { enabled: true } } }), { mode: 0o600 });
   writeFileSync(statefulSet, JSON.stringify(logStatefulSet("8.0.0")));
+  writeFileSync(databaseUrl, DATABASE_URL);
   spawnSync("mkdir", [bin]);
   writeFileSync(join(bin, "kubectl"), `#!/bin/sh
 printf '%s' "$*" | tr '\\n' ' ' >>'${calls}' && echo >>'${calls}'
@@ -90,6 +116,10 @@ case "$*" in
   "delete crd sandboxes.agents.x-k8s.io --ignore-not-found --wait=true") rm -f '${crd}' ;;
   "-n alasio scale "*|"-n "*" delete pod "*|"-n "*" patch sandboxes.agents.x-k8s.io "*|"-n "*" delete sandboxes.agents.x-k8s.io "*) ;;
   "-n alasio delete "*" --ignore-not-found"|"delete clusterrole,"*" --ignore-not-found"|"-n alasio-host delete "*" --ignore-not-found"|"delete validatingadmissionpolicy,"*" --ignore-not-found") ;;
+  "-n alasio exec -i deploy/alasio -c alasio -- node --input-type=module -e "*)
+    shift 11
+    # Elsewhere than alasio's modules, as a folder workspace's pod is; its image's, here.
+    cd '${root}' && ALASIO_DATABASE_URL_FILE='${databaseUrl}' exec '${process.execPath}' --input-type=module -e "$(printf '%s' "$1" | sed 's#/opt/alasio/#${REPOSITORY}#g')" ;;
   *) echo "kubectl $* is not the cut-over's" >&2; exit 2 ;;
 esac
 `, { mode: 0o755 });
@@ -130,6 +160,8 @@ awk -v point="$2" '$2 != point' '${mounts}' >'${mounts}.next' && mv '${mounts}.n
       rmSync(ran, { force: true });
       return lines;
     },
+    /** What the cut-over recorded in `name`. */
+    recorded: (name: string) => readFileSync(join(out, name), "utf8"),
     /** The cut-over's markers, of what it recorded. */
     marks: () => (existsSync(out) ? readdirSync(out).filter((name) => ["point-of-no-return", "upgraded"].includes(name)).sort() : []),
     /** The cut-over's markers of the move of the node's images. */
@@ -151,9 +183,9 @@ awk -v point="$2" '$2 != point' '${mounts}' >'${mounts}.next' && mv '${mounts}.n
     /** What the cut-over kept of the log's StatefulSet, in its record. */
     kept: () => (existsSync(join(out, "log-statefulset.json")) ? JSON.parse(readFileSync(join(out, "log-statefulset.json"), "utf8")) as unknown : null),
     upgradeFails: (fails: boolean) => (fails ? writeFileSync(upgradeFails, "") : rmSync(upgradeFails, { force: true })),
-    /** The kubectl commands the cut-over ran, in order, since the last time it was asked, but for what reads alone. */
+    /** The kubectl commands the cut-over ran, in order, since the last time it was asked, but for what reads alone and what it runs on alasio's database (on_database), which the database's own tests read. */
     calls: () => {
-      const lines = existsSync(calls) ? readFileSync(calls, "utf8").split("\n").filter((line) => line && !/^(-n \S+ )?get /u.test(line)) : [];
+      const lines = existsSync(calls) ? readFileSync(calls, "utf8").split("\n").filter((line) => line && !/^(-n \S+ )?get /u.test(line) && !line.startsWith("-n alasio exec -i deploy/alasio ")) : [];
       rmSync(calls, { force: true });
       return lines;
     },
@@ -529,5 +561,123 @@ test("a cut-over that stopped in the move of the node's images ends it first whe
     assert.deepEqual([at.ran(), at.marks(), at.imageMarks()], [["check", "upgrade"], ["point-of-no-return", "upgraded"], ["images-moved"]]);
   } finally {
     at.remove();
+  }
+});
+
+/** The conversation 8.0.0's alasio kept the messages of these tests in. */
+const CONVERSATION = "telegram:7";
+
+/**
+ * Keeps a Telegram message in the conversation as 8.0.0's alasio did, by its id `id`: Telegram's
+ * `messageId`, sent at `date`, saying `text`, kept `at`.
+ */
+async function kept(id: string, { messageId = 10, date = 1_700_000_000, text = "hello", at }: { readonly messageId?: number; readonly date?: number; readonly text?: string; readonly at: string }): Promise<void> {
+  await pool.query("insert into state.conversations (id, transport, chat_id) values ($1, 'telegram', '7') on conflict do nothing", [CONVERSATION]);
+  await pool.query(
+    "insert into state.messages (id, conversation_id, direction, kind, transport_message_id, text, raw, created_at) values ($1, $2, 'inbound', 'text', $3, $4, $5, $6)",
+    [id, CONVERSATION, String(messageId), text, JSON.stringify({ message_id: messageId, date, text }), at],
+  );
+}
+
+/** Keeps a file, by its id `id`, as the message `messageId` carried it, Telegram's `uniqueId`. */
+async function carried(id: string, messageId: string, uniqueId: string): Promise<void> {
+  await pool.query(
+    "insert into state.files (id, message_id, conversation_id, telegram_file_id, telegram_file_unique_id, name, file_size, sha256, content, raw) values ($1, $2, $3, 'file-id', $4, 'photo.jpg', 1, 'sha', '\\x00', '{}')",
+    [id, messageId, CONVERSATION, uniqueId],
+  );
+}
+
+/** The messages kept, by their ids; and the files, by theirs, with the message each is of. */
+const messages = async () => (await pool.query<{ id: string }>("select id from state.messages order by id")).rows.map(({ id }) => id);
+const files = async () => (await pool.query<{ id: string; message_id: string | null }>("select id, message_id from state.files order by id")).rows.map(({ id, message_id }) => [id, message_id]);
+
+/** Forgets what a test kept, its conversation, its messages and their files with it. */
+const forget = () => pool.query("delete from state.conversations");
+
+test("the cut-over says which Telegram messages 8.0.0 kept twice before it changes anything, and past its point of no return removes their exact copies, the first kept kept, its files given it, so this release's schema is made", async () => {
+  const at = machine();
+  try {
+    await kept("first", { at: "2026-10-01T00:00:00Z" });
+    await kept("second", { at: "2026-10-01T00:00:01Z" });
+    await carried("photo", "second", "unique-photo");
+    await kept("other", { messageId: 11, at: "2026-10-01T00:00:00Z" });
+    await kept("other-again", { messageId: 11, at: "2026-10-01T00:00:01Z" });
+    await carried("document", "other", "unique-document");
+    await carried("document-again", "other-again", "unique-document");
+    // Telegram's id again, sent at another time, as a branch's bot gives its own: another message.
+    await kept("later", { date: 1_700_000_100, at: "2026-10-01T00:00:02Z" });
+    const failed = at.cutOver("before-the-point-of-no-return");
+    assert.notEqual(failed.code, 0);
+    assert.match(failed.said, /finding the Telegram messages[^\n]*\n[^\n]* 2 exact copies of Telegram messages kept twice, removed past the point of no return\n/u);
+    assert.equal(at.recorded("telegram-duplicates.tsv"), `message\t${CONVERSATION}\tinbound\t10\t1700000000\t2\t1\nmessage\t${CONVERSATION}\tinbound\t11\t1700000000\t2\t1\n`);
+    // Nothing is removed before the point of no return.
+    assert.deepEqual(await messages(), ["first", "later", "other", "other-again", "second"]);
+    const run = at.cutOver();
+    assert.equal(run.code, 0, run.said);
+    assert.match(run.said, /past the point of no return[^\n]*\n[^\n]* removed 2 exact copies of Telegram messages kept twice\n[^]* upgrading, from the cut-over/u);
+    assert.deepEqual(await messages(), ["first", "later", "other"]);
+    // The copy's file goes to the message kept, which had none; a file the message kept has already is let go of, kept.
+    assert.deepEqual(await files(), [["document", "other"], ["document-again", null], ["photo", "first"]]);
+    // This release's schema, which keeps each once, is made on what it left.
+    await testStore({ schema: "state" });
+  } finally {
+    at.remove();
+    await forget();
+    await pool.query("drop index if exists state.messages_telegram_once; drop index if exists state.files_telegram_once");
+  }
+});
+
+test("the cut-over refuses a Telegram message 8.0.0 kept twice whose copies differ, or a file a message carried kept twice, before it changes anything, saying which", async () => {
+  const at = machine();
+  try {
+    await kept("first", { at: "2026-10-01T00:00:00Z" });
+    await kept("edited", { text: "hello again", at: "2026-10-01T00:00:01Z" });
+    const refused = at.cutOver();
+    assert.notEqual(refused.code, 0);
+    assert.match(refused.said, new RegExp(`FAILED: alasio kept these twice[^\\n]*: message 10 of ${CONVERSATION} \\(2 kept, 2 different\\)\\. Put them right by hand`, "u"));
+    assert.deepEqual([at.ran(), at.marks(), at.statefulSet(), await messages()], [[], [], logStatefulSet("8.0.0"), ["edited", "first"]]);
+    await pool.query("delete from state.messages where id = 'edited'");
+    await carried("photo", "first", "unique-photo");
+    await carried("photo-again", "first", "unique-photo");
+    const again = at.cutOver();
+    assert.notEqual(again.code, 0);
+    assert.match(again.said, /: file unique-photo of first \(2 kept, 1 different\)\. Put them right by hand/u);
+    assert.deepEqual([at.ran(), at.marks(), await files()], [[], [], [["photo", "first"], ["photo-again", "first"]]]);
+  } finally {
+    at.remove();
+    await forget();
+  }
+});
+
+/** The forks' holds' columns, each with whether it may be null and its default. */
+const holdColumns = async () =>
+  (await pool.query<{ column_name: string; is_nullable: string; column_default: string | null }>(
+    "select column_name, is_nullable, column_default from information_schema.columns where table_schema = 'state' and table_name = 'conversation_holds' order by ordinal_position",
+  )).rows.map(({ column_name, is_nullable, column_default }) => [column_name, is_nullable, column_default]);
+
+test("the cut-over gives 8.0.0's forks' holds their holder and expiry past its point of no return, with defaults 8.0.0's holds need, and takes those off once the upgrade is through", async () => {
+  await holdsOf800();
+  const at = machine();
+  try {
+    // 8.0.0 holds a conversation, as it does without either.
+    await pool.query("insert into state.conversations (id, transport, chat_id) values ('telegram:8', 'telegram', '8') on conflict do nothing");
+    await pool.query("insert into state.conversation_holds (conversation_id, reason) values ('telegram:8', 'forking')");
+    // Failing once its upgrade is through, the defaults are kept, as 8.0.0's holds, made until the upgrade, needed them.
+    const failed = at.cutOver("after-the-upgrade");
+    assert.notEqual(failed.code, 0);
+    assert.match(failed.said, /past the point of no return[^]*gave the forks' holds their holder and expiry[^]*upgrading, from the cut-over/u);
+    const given = await holdColumns();
+    assert.ok(given.slice(3).every(([, , fallback]) => fallback !== null), "8.0.0's holds are made with defaults until the upgrade");
+    const run = at.cutOver();
+    assert.equal(run.code, 0, run.said);
+    assert.deepEqual(given.map(([name, nullable]) => [name, nullable]), [["conversation_id", "NO"], ["reason", "NO"], ["held_at", "NO"], ["holder", "NO"], ["expires_at", "NO"]]);
+    // 8.0.0's hold, expired as alasio starts.
+    assert.equal((await pool.query("select 1 from state.conversation_holds where expires_at > now()")).rows.length, 0);
+    assert.match(run.said, /made the forks' holds as this release makes them, without the defaults 8\.0\.0's needed\n[^\n]* upgraded at /u);
+    assert.deepEqual((await holdColumns()).slice(3), [["holder", "NO", null], ["expires_at", "NO", null]]);
+  } finally {
+    at.remove();
+    await pool.query("delete from state.conversations");
+    await holdsOf800();
   }
 });

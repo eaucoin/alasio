@@ -11,7 +11,7 @@
  * answers `{ volumeId, netMode }`, the internet it was made with. It forks only a session it
  * made, or one of its conversations knows, and none while a turn runs in it, so no turn
  * writes into it as it is cloned: the conversations that mount it are held busy while it
- * forks (ActiveTurns' hold), so none starts a turn under it, and their prompts that came
+ * forks (../harness/holds.ts), so none starts a turn under it, and their prompts that came
  * meanwhile run after. 401 without the branch's token, 404 for a session it does not know,
  * 409 while a turn runs in it, 502 when the fork failed. A session forked already is
  * answered as forked.
@@ -34,8 +34,8 @@ import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "eff
 
 import { nameProblem } from "../../neon/control/branches.ts";
 import { Turns } from "../codex/turns.ts";
-import { ActiveTurns } from "../harness/active-turns.ts";
-import { holdConversations } from "../harness/holds.ts";
+import { whileHeld } from "../harness/holds.ts";
+import { HarnessHost } from "../harness/host.ts";
 import { Store } from "../persistence/store.ts";
 import { type NetMode, SessionInheritError, SessionSandboxes } from "../sandbox/index.ts";
 import { isValidVolumeId } from "../sandbox/names.ts";
@@ -63,9 +63,9 @@ export const serveBranchForks = Effect.fnUntraced(function*({
   port = BRANCH_FORK_PORT,
   host = "0.0.0.0",
   keyFile,
-}: BranchForksOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope | Store | ActiveTurns | Turns | SessionSandboxes> {
+}: BranchForksOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope | Store | HarnessHost | Turns | SessionSandboxes> {
   const store = yield* Store;
-  const activeTurns = yield* ActiveTurns;
+  const harnessHost = yield* HarnessHost;
   const turns = yield* Turns;
   const sandboxes = yield* SessionSandboxes;
 
@@ -85,16 +85,22 @@ export const serveBranchForks = Effect.fnUntraced(function*({
     if (knowing.length === 0 && !made) return answer(404, { error: `alasio has no session ${volumeId}` });
     const netMode: NetMode = made?.netMode ?? "none";
     const mounting = knowing.filter(({ mounted }) => mounted).map(({ conversationId }) => conversationId);
-    const forked = yield* Effect.scoped(Effect.gen(function*() {
-      if (!(yield* holdConversations(activeTurns, store, mounting, `forking session ${volumeId} for the branch ${branch}`))) return false;
-      yield* sandboxes.volumes.fork(volumeId, volumeId, branch).pipe(
-        // Forked already, by an earlier request of the branch's.
-        Effect.catchIf((error) => error._tag === "GatewayError" && error.status === 409, () => Effect.void),
-      );
-      return true;
-    })).pipe(Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })));
-    if (!forked) {
-      return answer(409, { error: `a turn runs in the session ${volumeId} now, which a fork would suspend: send again once it ends` });
+    const forked = yield* whileHeld(
+      harnessHost,
+      store,
+      mounting,
+      `forking session ${volumeId} for the branch ${branch}`,
+      (begun) =>
+        Effect.andThen(
+          begun,
+          sandboxes.volumes.fork(volumeId, volumeId, branch).pipe(
+            // Forked already, by an earlier request of the branch's.
+            Effect.catchIf((error) => error._tag === "GatewayError" && error.status === 409, () => Effect.void),
+          ),
+        ),
+    ).pipe(Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })));
+    if (Option.isNone(forked)) {
+      return answer(409, { error: `a turn runs in the session ${volumeId} now, which would write into it as it is cloned: send again once it ends` });
     }
     yield* Effect.logInfo(`forked session ${volumeId} for the branch ${branch}`);
     return answer(200, { volumeId, netMode });

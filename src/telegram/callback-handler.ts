@@ -2,8 +2,9 @@ import type { CallbackQuery } from "@grammyjs/types";
 import { Effect, Option } from "effect";
 
 import type { ConcurrentPromptPayload } from "../codex/turns.ts";
-import { discardHeld, isBusy, queueHeld, steerWithHeld, swerveTo } from "../harness/commands.ts";
-import { Harnesses, harnessLabelOf, NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, isHarnessName } from "../harness/index.ts";
+import { discardHeld, queueHeld, shownBusy, steerWithHeld, swerveTo } from "../harness/commands.ts";
+import { HarnessHost } from "../harness/host.ts";
+import { harnessLabelOf, NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, isHarnessName } from "../harness/index.ts";
 import { FOLDER_RESTART, FOLDER_RETRY } from "../mcp/bayma.ts";
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
 import { handleGoalControlCallback, isGoalControlAction } from "../operator/goal-control.ts";
@@ -62,7 +63,10 @@ export const takeCallbackQuery = Effect.fnUntraced(function*(callbackQuery: Call
   // Every button alasio sends carries callback_data; a query without it is no action of alasio's.
   const action = callbackQuery.data === undefined ? null : yield* store.consumeCallbackAction(callbackQuery.data);
   if (!action) return answering(callbackQuery.id, "This action is no longer available.");
-  return handlePress(callbackQuery, action, yield* store.getMount(action.conversationId));
+  return handlePress(callbackQuery, action, yield* store.getMount(action.conversationId)).pipe(
+    // A control its harness host is not reached for says so, as the press is answered.
+    Effect.catchTag("HarnessHostError", (error) => answering(callbackQuery.id, error.message)),
+  );
 });
 
 /** Handles a press taken from the store (takeCallbackQuery): its action, of the conversation `mount` is the mount of. */
@@ -132,7 +136,7 @@ const handlePress = Effect.fnUntraced(function*(callbackQuery: CallbackQuery, ac
     }
     if (action.kind === "queue") {
       // Asked again once its turn ended (Run it), it runs now, unless another turn has begun meanwhile.
-      const busy = yield* isBusy(conversationId);
+      const busy = yield* shownBusy(conversationId);
       if (!(yield* queueHeld(jobId))) return yield* gone;
       yield* client.answerCallbackQuery(callbackQuery.id, busy ? "Queued." : "Running.");
       yield* client.editMessageText(chatId, messageId, busy ? `Queued. ${label} will process this after the current task.` : `${label} is running this now.`);
@@ -150,7 +154,7 @@ const handlePress = Effect.fnUntraced(function*(callbackQuery: CallbackQuery, ac
     return;
   }
   // Every remaining action is the mounted harness's, which the mount may have none of.
-  const harness = Option.getOrNull(yield* Effect.flatMap(Harnesses, (harnesses) => harnesses.forMount(mount)));
+  const harness = Option.getOrNull(yield* Effect.flatMap(HarnessHost, (host) => host.panels(mount)));
   if (!harness) {
     const reason = mount.harness ? NO_WORKSPACE_MOUNTED : NO_SERVICE_MOUNTED;
     yield* client.answerCallbackQuery(callbackQuery.id, reason);

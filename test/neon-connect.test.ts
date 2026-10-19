@@ -14,8 +14,9 @@ import { Neon, type NeonError } from "../src/neon/connect.ts";
 import { LakeWake } from "../src/neon/lake-wake.ts";
 import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 
-/** The lake's verifier, as the deployment gives it. */
+/** The lake's verifier and the harness host's, as the deployment gives them. */
 const LAKE_VERIFIER = scramVerifier("lake-password");
+const HARNESS_VERIFIER = scramVerifier("harness-password");
 
 /** Neon as alasio connects to it, with `env` for its environment, its log lines kept in `lines`, and `wake` told of its stores' writes. */
 function connecting<A, E>(
@@ -34,7 +35,7 @@ function connecting<A, E>(
 }
 
 test("Neon's settings name what is missing", async () => {
-  const exit = await Effect.runPromiseExit(connecting({ ALASIO_LAKE_VERIFIER: LAKE_VERIFIER }, [], () => Effect.void));
+  const exit = await Effect.runPromiseExit(connecting({ ALASIO_LAKE_VERIFIER: LAKE_VERIFIER, ALASIO_HARNESS_VERIFIER: HARNESS_VERIFIER }, [], () => Effect.void));
   assert.ok(Exit.isFailure(exit));
   const error = Exit.findErrorOption(exit);
   assert.equal(error._tag, "Some");
@@ -42,16 +43,23 @@ test("Neon's settings name what is missing", async () => {
   // A password where a role's verifier belongs is refused, never set as a role's password, as is
   // anything but a whole verifier, which alasio writes into the statement that sets it.
   const forged = `${LAKE_VERIFIER.slice(0, -1)}'; drop role alasio; --`;
-  for (const env of [{ ALASIO_LAKE_VERIFIER: "lake-password" }, { ALASIO_LAKE_VERIFIER: LAKE_VERIFIER, ALASIO_GRAFANA_VERIFIER: "grafana-password" }, { ALASIO_LAKE_VERIFIER: forged }]) {
+  for (
+    const env of [
+      { ALASIO_LAKE_VERIFIER: "lake-password", ALASIO_HARNESS_VERIFIER: HARNESS_VERIFIER },
+      { ALASIO_LAKE_VERIFIER: LAKE_VERIFIER, ALASIO_HARNESS_VERIFIER: "harness-password" },
+      { ALASIO_LAKE_VERIFIER: LAKE_VERIFIER, ALASIO_HARNESS_VERIFIER: HARNESS_VERIFIER, ALASIO_GRAFANA_VERIFIER: "grafana-password" },
+      { ALASIO_LAKE_VERIFIER: forged, ALASIO_HARNESS_VERIFIER: HARNESS_VERIFIER },
+    ]
+  ) {
     const refused = Exit.findErrorOption(await Effect.runPromiseExit(connecting({ ALASIO_DATABASE_URL: "postgresql://alasio@127.0.0.1:1/alasio", ...env }, [], () => Effect.void)));
     assert.equal(refused._tag, "Some");
-    assert.match(refused.value.message, /^ALASIO_(LAKE|GRAFANA)_VERIFIER must be a SCRAM-SHA-256 verifier, as Postgres stores one, not a password$/u);
+    assert.match(refused.value.message, /^ALASIO_(LAKE|HARNESS|GRAFANA)_VERIFIER must be a SCRAM-SHA-256 verifier, as Postgres stores one, not a password$/u);
   }
 });
 
 test("a Neon that does not answer is waited for ten minutes, saying why once a minute", async () => {
   const lines: string[] = [];
-  const env = { ALASIO_DATABASE_URL: "postgresql://alasio:secret@127.0.0.1:1/alasio", ALASIO_LAKE_VERIFIER: LAKE_VERIFIER };
+  const env = { ALASIO_DATABASE_URL: "postgresql://alasio:secret@127.0.0.1:1/alasio", ALASIO_LAKE_VERIFIER: LAKE_VERIFIER, ALASIO_HARNESS_VERIFIER: HARNESS_VERIFIER };
   const waited = await Effect.runPromise(Effect.gen(function*() {
     const connect = yield* Effect.forkChild(Effect.flip(connecting(env, lines, () => Effect.void)));
     let minutes = 0;
@@ -96,13 +104,15 @@ describe("Neon, answering", () => {
     )).rows.map((row) => row.name);
   const lakeReads = async (table: string) =>
     (await admin.query<{ reads: boolean }>("select has_table_privilege('lake', $1, 'select') as reads", [table])).rows[0]?.reads;
+  const harnessWrites = async (table: string) =>
+    (await admin.query<{ writes: boolean }>("select has_table_privilege('harness', $1, 'select, insert, update, delete') as writes", [table])).rows[0]?.writes;
 
-  test("connects from the deployment's files, makes what alasio keeps, and ends its pool as its scope closes", async () => {
+  test("connects from the deployment's files, makes what alasio keeps, the harness host's role granted its stores, and ends its pool as its scope closes", async () => {
     assert.ok(database && secrets, "set up before the tests");
     const urlFile = join(secrets, "database-url");
     writeFileSync(urlFile, `${database.url}\n`);
     const lines: string[] = [];
-    const env = { ALASIO_DATABASE_URL_FILE: urlFile, ALASIO_DATABASE_URL: "ignored for the file", ALASIO_LAKE_VERIFIER: scramVerifier("lake-password"), ALASIO_LAKE_ENABLED: "1" };
+    const env = { ALASIO_DATABASE_URL_FILE: urlFile, ALASIO_DATABASE_URL: "ignored for the file", ALASIO_LAKE_VERIFIER: LAKE_VERIFIER, ALASIO_HARNESS_VERIFIER: HARNESS_VERIFIER, ALASIO_LAKE_ENABLED: "1" };
     const pool = await Effect.runPromise(connecting(env, lines, (neon) =>
       Effect.gen(function*() {
         assert.equal(neon.lake, true);
@@ -113,10 +123,13 @@ describe("Neon, answering", () => {
           "codex_sessions.rollouts",
         ]);
         assert.equal(yield* Effect.promise(() => lakeReads("codex_sessions.rollouts")), true);
-        // The session-filesystem home's store, made when asked for, and readable by the lake.
+        // The harness host reads and writes every table of the transcripts' and rollouts' stores.
+        for (const table of yield* Effect.promise(tables)) assert.equal(yield* Effect.promise(() => harnessWrites(table)), true, table);
+        // The session-filesystem home's store, made when asked for, readable by the lake and the harness host's.
         const sessionFs = yield* neon.sessionFsRollouts;
         assert.deepEqual(yield* Effect.promise(() => sessionFs.list()), []);
         assert.equal(yield* Effect.promise(() => lakeReads("codex_sessionfs_sessions.rollouts")), true);
+        assert.equal(yield* Effect.promise(() => harnessWrites("codex_sessionfs_sessions.rollouts")), true);
         assert.equal(neon.pool.ended, false);
         return neon.pool;
       })
@@ -127,7 +140,7 @@ describe("Neon, answering", () => {
 
   test("tells the lake's loader of each store's writes, with the primary's WAL position as its record is written, past the writes", async () => {
     assert.ok(database);
-    const env = { ALASIO_DATABASE_URL: database.url, ALASIO_LAKE_VERIFIER: scramVerifier("lake-password"), ALASIO_LAKE_ENABLED: "1" };
+    const env = { ALASIO_DATABASE_URL: database.url, ALASIO_LAKE_VERIFIER: LAKE_VERIFIER, ALASIO_HARNESS_VERIFIER: HARNESS_VERIFIER, ALASIO_LAKE_ENABLED: "1" };
     const told: (() => Promise<string>)[] = [];
     const wake = LakeWake.of({ written: (lsn) => void told.push(lsn) });
     await Effect.runPromise(connecting(env, [], (neon) =>
@@ -141,7 +154,7 @@ describe("Neon, answering", () => {
 
   test("with the lake off, revokes its reads", async () => {
     assert.ok(database);
-    const env = { ALASIO_DATABASE_URL: database.url, ALASIO_LAKE_VERIFIER: scramVerifier("lake-password") };
+    const env = { ALASIO_DATABASE_URL: database.url, ALASIO_LAKE_VERIFIER: LAKE_VERIFIER, ALASIO_HARNESS_VERIFIER: HARNESS_VERIFIER };
     await Effect.runPromise(connecting(env, [], (neon) =>
       Effect.gen(function*() {
         assert.equal(neon.lake, false);

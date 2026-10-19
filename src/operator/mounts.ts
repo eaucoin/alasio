@@ -16,8 +16,8 @@ import { Context, Effect, Layer, Option, Schema } from "effect";
 
 import type { AlasioConfig } from "../config.ts";
 import { Turns } from "../codex/turns.ts";
-import { ActiveTurns } from "../harness/active-turns.ts";
-import { holdConversations } from "../harness/holds.ts";
+import { HarnessHost } from "../harness/host.ts";
+import { whileHeld } from "../harness/holds.ts";
 import { folderRefusedOnBranch, harnessLabelOf, isHarnessName } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
 import type { StoreError } from "../persistence/sql.ts";
@@ -98,8 +98,8 @@ export class Mounts extends Context.Service<Mounts, {
    * mounts the fork, with no session of its own yet. Refused for a folder, and while a
    * turn runs in the conversation, or in another that mounts the source, or prompts wait
    * in it, as the source is suspended while it is cloned: those conversations are held
-   * busy until it is (ActiveTurns' hold), so no turn starts under the clone, and what was
-   * asked of them meanwhile runs after.
+   * busy until it is (../harness/holds.ts), so no turn starts under the clone, and what
+   * was asked of them meanwhile runs after.
    */
   readonly forkSessionWorkspace: (conversationId: string) => Effect.Effect<WorkspaceChange, MountRefused | SessionError | StoreError>;
   /**
@@ -109,13 +109,13 @@ export class Mounts extends Context.Service<Mounts, {
   readonly reconcileSessionWorkspaces: Effect.Effect<void, StoreError>;
 }>()("alasio/operator/Mounts") {
   /** The mounts of an alasio of `workspaceRoot`, the branch environment `branch` unless it is none, main. */
-  static readonly layer = ({ workspaceRoot, branch = null }: Pick<AlasioConfig, "workspaceRoot"> & { readonly branch?: string | null | undefined }): Layer.Layer<Mounts, never, Store | ActiveTurns | Turns> =>
+  static readonly layer = ({ workspaceRoot, branch = null }: Pick<AlasioConfig, "workspaceRoot"> & { readonly branch?: string | null | undefined }): Layer.Layer<Mounts, never, Store | HarnessHost | Turns> =>
     Layer.effect(Mounts, makeMounts(workspaceRoot, branch));
 }
 
-const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: string | null): Effect.fn.Return<Mounts["Service"], never, Store | ActiveTurns | Turns> {
+const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: string | null): Effect.fn.Return<Mounts["Service"], never, Store | HarnessHost | Turns> {
   const store = yield* Store;
-  const activeTurns = yield* ActiveTurns;
+  const host = yield* HarnessHost;
   const turns = yield* Turns;
   const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
 
@@ -124,7 +124,10 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
 
   /** Refuses a change while a turn runs in the conversation or prompts wait for its service; `doing` is the change, as the operator is told. */
   const unblocked = Effect.fnUntraced(function*(conversationId: string, doing = "switching services"): Effect.fn.Return<void, MountRefused | StoreError> {
-    if (yield* activeTurns.isBusy(conversationId)) {
+    const status = yield* host.status(conversationId).pipe(
+      Effect.catchTag("HarnessHostError", (error) => Effect.fail(new MountRefused({ message: `${error.message}, so whether it is working cannot be told. Try again once it answers.` }))),
+    );
+    if (status.busy) {
       const mount = yield* store.getMount(conversationId);
       return yield* new MountRefused({ message: `${harnessLabelOf(mount)} is currently working. Stop the active turn before ${doing}.` });
     }
@@ -232,12 +235,15 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
         ...(yield* store.listWorkspaceConversations(sessionFsWorkspace(source.volumeId))).filter(({ mounted }) => mounted).map(({ conversationId }) => conversationId),
       ]);
       const volumeId = newVolumeId();
-      yield* Effect.scoped(Effect.gen(function*() {
-        if (!(yield* holdConversations(activeTurns, store, [...mounting], `forking session ${source.volumeId} into ${volumeId}`))) {
-          return yield* new MountRefused({ message: "A turn runs on this session workspace now, which a fork would suspend. Fork it once that turn ends." });
-        }
-        yield* recorded(volumeId, source.volumeId, sandbox.volumes.fork(source.volumeId, volumeId));
-      })).pipe(Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })));
+      const forked = yield* whileHeld(host, store, [...mounting], `forking session ${source.volumeId} into ${volumeId}`, (begun) =>
+        recorded(volumeId, source.volumeId, Effect.andThen(begun, sandbox.volumes.fork(source.volumeId, volumeId)))).pipe(
+        Effect.catchTag("HarnessHostError", (error) => Effect.fail(new MountRefused({ message: `${error.message}, so whether a turn runs on this session workspace cannot be told. Fork it once it answers.` }))),
+        Effect.catchTag(["HoldLost", "HoldOverran"], (error) => Effect.fail(new MountRefused({ message: `The fork stopped: ${error.message}. Fork it again.` }))),
+        Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })),
+      );
+      if (Option.isNone(forked)) {
+        return yield* new MountRefused({ message: "A turn runs on this session workspace now, which would write into it as it is cloned. Fork it once that turn ends." });
+      }
       const change = yield* mountCreated(
         conversationId,
         sessionFsWorkspace(volumeId),

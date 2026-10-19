@@ -60,6 +60,11 @@ export class NeonCallbackRepository {
     ).pipe(Effect.as(ids));
   }
 
+  /** Whether buttons that settle the held prompt job `jobId` are kept: whether it was asked about, and is not settled. */
+  hasActionsOfJob(jobId: string): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(`select 1 from ${this.#schema}.callback_actions where payload->>'jobId' = $1 limit 1`, [jobId]).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
   /** Forgets the actions of the buttons that settle the held prompt job `jobId`, one of which has. */
   forgetActionsOfJob(jobId: string): Effect.Effect<void, StoreError> {
     return Effect.asVoid(this.#sql.query(`delete from ${this.#schema}.callback_actions where payload->>'jobId' = $1`, [jobId]));

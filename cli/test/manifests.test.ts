@@ -793,13 +793,15 @@ describe("the lake's readers", () => {
 
   test("has alasio make the lake reader's role while the lake runs", () => {
     const alasio = (file: Record<string, unknown>) => one<V1Deployment>(install(file), "Deployment", "alasio");
-    assert.deepEqual(verifierFiles(alasio({}))?.slice(0, 2), [
+    assert.deepEqual(verifierFiles(alasio({}))?.slice(0, 3), [
       ["ALASIO_LAKE_VERIFIER_FILE", "/run/alasio/database/lake-verifier"],
+      ["ALASIO_HARNESS_VERIFIER_FILE", "/run/alasio/database/harness-verifier"],
       ["ALASIO_LAKE_READER_VERIFIER_FILE", "/run/alasio/database/lake-reader-verifier"],
     ]);
     const database = alasio({}).spec?.template.spec?.volumes?.find(({ name }) => name === "database");
-    assert.deepEqual(database?.secret?.items?.map(({ key }) => key).slice(0, 3), ["url", "lake-verifier", "lake-reader-verifier"]);
-    assert.deepEqual(verifierFiles(alasio({ lake: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_VERIFIER_FILE"]);
+    assert.deepEqual(database?.secret?.items?.map(({ key }) => key).slice(0, 4), ["url", "lake-verifier", "harness-verifier", "lake-reader-verifier"]);
+    // The lake's role and the harness host's alasio makes whatever runs.
+    assert.deepEqual(verifierFiles(alasio({ lake: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_VERIFIER_FILE", "ALASIO_HARNESS_VERIFIER_FILE"]);
     // The log's password beside them, as alasio reaches its Telegram topic.
     assert.equal(container(alasio({})).env?.find(({ name }) => name === "ALASIO_LOG_PASSWORD_FILE")?.value, "/run/alasio/log/password");
   });
@@ -1382,8 +1384,8 @@ describe("Grafana", () => {
     const alasio = (file: Record<string, unknown>) => one<V1Deployment>(install(file), "Deployment", "alasio");
     assert.deepEqual(verifierFiles(alasio({}))?.at(-1), ["ALASIO_GRAFANA_VERIFIER_FILE", "/run/alasio/database/grafana-verifier"]);
     const database = alasio({}).spec?.template.spec?.volumes?.find(({ name }) => name === "database");
-    assert.deepEqual(database?.secret?.items?.map(({ key }) => key), ["url", "lake-verifier", "lake-reader-verifier", "grafana-verifier"]);
-    assert.deepEqual(verifierFiles(alasio({ grafana: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_VERIFIER_FILE", "ALASIO_LAKE_READER_VERIFIER_FILE"]);
+    assert.deepEqual(database?.secret?.items?.map(({ key }) => key), ["url", "lake-verifier", "harness-verifier", "lake-reader-verifier", "grafana-verifier"]);
+    assert.deepEqual(verifierFiles(alasio({ grafana: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_VERIFIER_FILE", "ALASIO_HARNESS_VERIFIER_FILE", "ALASIO_LAKE_READER_VERIFIER_FILE"]);
   });
 });
 
@@ -2615,7 +2617,7 @@ describe("branch environments", () => {
     // It makes no role for what reads main's Neon beside it, which a branch has none of.
     assert.equal(variable(alasio, "ALASIO_LAKE_READER_VERIFIER_FILE"), undefined);
     assert.equal(variable(alasio, "ALASIO_GRAFANA_VERIFIER_FILE"), undefined);
-    assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "database")?.secret?.items?.map(({ key }) => key), ["url", "lake-verifier"]);
+    assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "database")?.secret?.items?.map(({ key }) => key), ["url", "lake-verifier", "harness-verifier"]);
     // Its sandboxes' telemetry is tagged by main's receiver, as each binding's token names its namespace.
     for (const workload of all<V1Deployment>(branch, "Deployment").filter(({ metadata }) => !metadata?.name?.startsWith("sandboxes-"))) {
       assert.equal(variable(workload, "OTEL_RESOURCE_ATTRIBUTES"), "alasio.branch=try", workload.metadata?.name);

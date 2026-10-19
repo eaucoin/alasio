@@ -93,9 +93,9 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       # All seven at once, each line said with its image's name, the node image with its pins
       # (tooling/node-image.ts), whole, as Docker runs it, and on alasio's,
-      # alasio-codex-stand-in, which the end-to-end runs install
-      # (test/e2e/codex-stand-in.Dockerfile); and the stand-in again, as
-      # alasio-codex-stand-in-previous, on the published alasio image of the release the
+      # alasio-harness-stand-ins, which the end-to-end runs install
+      # (test/e2e/harness-stand-ins.Dockerfile); and the stand-ins again, as
+      # alasio-harness-stand-ins-previous, on the published alasio image of the release the
       # upgrade shard upgrades from; the step fails if any did.
       - id: push
         name: Build and push the images
@@ -106,20 +106,20 @@ jobs:
           PREVIOUS: ${{ steps.previous.outputs.previous }}
         run: |
           declare -A pids
-          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-log:neon/log" "alasio-collector:neon/collector" "alasio-webhook:webhook" "alasio-node:cluster/node" "alasio-codex-stand-in-previous:test"; do
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-log:neon/log" "alasio-collector:neon/collector" "alasio-webhook:webhook" "alasio-node:cluster/node" "alasio-harness-stand-ins-previous:test"; do
             name=${image%%:*}
             {
               if [ "$name" = alasio-node ]; then
                 mapfile -t args < <(node tooling/node-image.ts)
                 docker build "${args[@]}" --tag "$PUSH_TO/$name:e2e" --label "org.opencontainers.image.source=$SOURCE" "${image#*:}" &&
                   docker push "$PUSH_TO/$name:e2e"
-              elif [ "$name" = alasio-codex-stand-in-previous ]; then
-                tooling/push-estargz.sh "$PUSH_TO/$name:e2e" test --file test/e2e/codex-stand-in.Dockerfile \
+              elif [ "$name" = alasio-harness-stand-ins-previous ]; then
+                tooling/push-estargz.sh "$PUSH_TO/$name:e2e" test --file test/e2e/harness-stand-ins.Dockerfile \
                   --build-arg "ALASIO=ghcr.io/eaucoin/alasio:$PREVIOUS" --label "org.opencontainers.image.source=$SOURCE"
               else
                 tooling/push-estargz.sh "$PUSH_TO/$name:e2e" "${image#*:}" --label "org.opencontainers.image.source=$SOURCE" &&
                   if [ "$name" = alasio ]; then
-                    tooling/push-estargz.sh "$PUSH_TO/alasio-codex-stand-in:e2e" test --file test/e2e/codex-stand-in.Dockerfile \
+                    tooling/push-estargz.sh "$PUSH_TO/alasio-harness-stand-ins:e2e" test --file test/e2e/harness-stand-ins.Dockerfile \
                       --build-arg "ALASIO=$PUSH_TO/alasio:e2e" --label "org.opencontainers.image.source=$SOURCE"
                   fi
               fi
@@ -269,7 +269,7 @@ jobs:
         run: |
           failed=0
           for attempt in $(seq "$GITHUB_RUN_ATTEMPT"); do
-            for name in alasio alasio-agent alasio-lake alasio-grafana alasio-log alasio-collector alasio-webhook alasio-node alasio-codex-stand-in alasio-codex-stand-in-previous; do
+            for name in alasio alasio-agent alasio-lake alasio-grafana alasio-log alasio-collector alasio-webhook alasio-node alasio-harness-stand-ins alasio-harness-stand-ins-previous; do
               image="$REGISTRY/run-$GITHUB_RUN_ID-$attempt/$name"
               package="alasio-ci/run-$GITHUB_RUN_ID-$attempt/$name"
               if said=$(gh api --method DELETE "/users/eaucoin/packages/container/${package//\//%2F}" 2>&1); then

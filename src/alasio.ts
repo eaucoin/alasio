@@ -15,6 +15,7 @@ import { Turns } from "./codex/turns.ts";
 import type { AlasioConfig, BranchEnvironment } from "./config.ts";
 import { ActiveTurns } from "./harness/active-turns.ts";
 import type { ClaudeQueryFactory } from "./harness/claude/runtime.ts";
+import { HarnessHost } from "./harness/host.ts";
 import { Harnesses } from "./harness/index.ts";
 import { BusyPods } from "./kube/busy.ts";
 import { KubeClient } from "./kube/client.ts";
@@ -40,6 +41,8 @@ export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog" | "lakeW
   readonly pool: Pool;
   /** The schema alasio's state is kept in: `state`, unless a test gives one of its own. */
   readonly stateSchema?: string | undefined;
+  /** The harness host's role, which Neon has (../neon/harness.ts), granted its part of the state; none in a test without one. */
+  readonly harnessRole?: string | undefined;
   /** Stand-ins for a folder workspace's bayma and for Claude Code, in the harnesses alasio makes. */
   readonly folderBayma?: FolderBayma | undefined;
   readonly claudeQueryFactory?: ClaudeQueryFactory | undefined;
@@ -53,6 +56,7 @@ export type AlasioServices =
   | Outbox
   | CodexAppServer
   | ActiveTurns
+  | HarnessHost
   | Harnesses
   | Turns
   | Mounts
@@ -72,18 +76,17 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       branchForks(options),
     )),
     Layer.provideMerge(Turns.layer()),
-    Layer.provideMerge(Layer.mergeAll(
-      Harnesses.layer({
-        branch: options.branch?.name,
-        sessionStore: options.sessionStore,
-        codexRollouts: options.codexRollouts,
-        sessionFsCodexRollouts: options.sessionFsCodexRollouts,
-        folderBayma: options.folderBayma,
-        claudeQueryFactory: options.claudeQueryFactory,
-      }),
-      // After the session filesystems, which it writes a session's files into.
-      ReceivedFiles.layer(options),
-    )),
+    Layer.provideMerge(HarnessHost.layer),
+    Layer.provideMerge(Harnesses.layer({
+      branch: options.branch?.name,
+      sessionStore: options.sessionStore,
+      codexRollouts: options.codexRollouts,
+      sessionFsCodexRollouts: options.sessionFsCodexRollouts,
+      folderBayma: options.folderBayma,
+      claudeQueryFactory: options.claudeQueryFactory,
+    })),
+    // After the session filesystems, which it writes a session's files into.
+    Layer.provideMerge(ReceivedFiles.layer(options)),
     Layer.provideMerge(Layer.mergeAll(
       Outbox.layer,
       // Before Codex is first started, which is not before a turn needs it.
@@ -93,7 +96,7 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       activeTurns(options),
     )),
     Layer.provideMerge(Layer.mergeAll(
-      Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory, branch: options.branch?.name }),
+      Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory, branch: options.branch?.name, harnessRole: options.harnessRole }),
       TelegramClient.layer(options.telegramBotToken),
     )),
   );
@@ -155,7 +158,7 @@ function inheritance(branch: BranchEnvironment, store: Store["Service"]): Inheri
  * (./branch/fork.ts), for as long as alasio runs; a server that cannot listen stops
  * alasio as it starts.
  */
-function branchForks({ branchForkKeyFile }: AlasioOptions): Layer.Layer<never, never, Store | ActiveTurns | Turns> {
+function branchForks({ branchForkKeyFile }: AlasioOptions): Layer.Layer<never, never, Store | HarnessHost | Turns> {
   if (!branchForkKeyFile) return Layer.empty;
   return Layer.effectDiscard(
     Effect.serviceOption(SessionSandboxes).pipe(

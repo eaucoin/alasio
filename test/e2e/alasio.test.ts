@@ -40,6 +40,7 @@ import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
+import { ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
 import { ANSWER } from "./codex-stand-in.ts";
 import { bindBranchSession, bindInBranch, mainSandboxService, sandboxService, serviceLogs, servesBranch } from "./sandbox-service.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
@@ -313,16 +314,19 @@ if (inShard("upgrade")) {
       (await kube.get(ref("PersistentVolumeClaim", `data-${componentName("log")}-0`, NAMESPACE)))?.metadata?.uid,
     ];
     let logBefore: (string | undefined)[];
-    /** The stack's secrets, as the root Secret's secrets.json and the log's Secret keep them: each key's value's hash, none of the values. */
+    /**
+     * The stack's secrets, as the root Secret's secrets.json and the log's Secret keep them:
+     * each key's value's hash, none of the values; the root's objects, its verifiers among
+     * them, key by key, so a secret a release adds to one changes none of those before it.
+     */
     const stackSecrets = async () => {
       const hash = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 12);
       const data = async (name: string) => (await kube.get<V1Secret>(ref("Secret", name, NAMESPACE)))?.data ?? {};
       const stored = JSON.parse(Buffer.from((await data(neonName("root")))["secrets.json"] ?? "", "base64").toString("utf8") || "{}") as Record<string, unknown>;
       return {
-        // Each of the log's principals' passwords on its own, as a release adds principals of its own beside those kept.
         root: Object.fromEntries(Object.entries(stored).flatMap(([key, value]) =>
-          key === "log" && typeof value === "object" && value !== null
-            ? Object.entries(value).map(([principal, password]) => [`log.${principal}`, hash(JSON.stringify(password))])
+          typeof value === "object" && value !== null && !Array.isArray(value)
+            ? Object.entries(value).map(([inner, held]) => [`${key}.${inner}`, hash(JSON.stringify(held))])
             : [[key, hash(JSON.stringify(value))]]
         )),
         log: Object.fromEntries(Object.entries(await data(componentName("log"))).map(([key, value]) => [key, hash(value)])),
@@ -339,6 +343,11 @@ if (inShard("upgrade")) {
     /** The lines of Codex's rollouts the lake holds, and how many it had loaded on the release before. */
     const lakeLines = async () => Number((await lakeQuery("select count(*) as n from codex.lines"))[0]?.["n"] ?? 0);
     let loaded: number;
+    /** The forks' holds' columns: each one's name, whether it may be null, and its default. */
+    const HOLD_COLUMNS = "select column_name, is_nullable, coalesce(column_default, '') from information_schema.columns where table_schema = 'state' and table_name = 'conversation_holds' order by ordinal_position";
+    /** The Telegram message kept twice on the release before, by the id of the one kept first; and Telegram's id of it. */
+    let keptOnce: string;
+    let sentAs: string;
     const scenarios: readonly Scenario[] = [
       {
         seeds: "main's bot allowing the users its owner gave it",
@@ -459,13 +468,15 @@ if (inShard("upgrade")) {
         seeds: "the stack's secrets, the log's credentials among them",
         seed: async () => {
           secretsBefore = await stackSecrets();
-          assert.ok(Object.keys(secretsBefore.log).length > 0 && "log.admin" in secretsBefore.root, JSON.stringify(secretsBefore));
+          assert.ok(Object.keys(secretsBefore.log).length > 0 && Object.keys(secretsBefore.root).some((key) => key === "log" || key.startsWith("log.")), JSON.stringify(secretsBefore));
         },
         keeps: "the stack's secrets, each kept, the log's credentials as its nodes were formatted with",
         check: async () => {
           const after = await stackSecrets();
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
+          // And the harness host's role's password and verifier, which this release adds to the stack's.
+          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), ["harnessPassword", "verifiers.harness"]);
         },
       },
       {
@@ -542,6 +553,32 @@ if (inShard("upgrade")) {
           assert.equal(await overlayfsSnapshots(), "");
           assert.match(await alasioOk("status"), /^ {2}service stargz-snapshotter, which k3s pulls images through: active$/mu);
           if (ESTARGZ) assert.ok(await onRemoteSnapshot(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)), "alasio's pod runs on no remote snapshot");
+        },
+      },
+      {
+        seeds: "a Telegram message kept twice, as two of main's alasios could keep it as they handed over",
+        seed: async () => {
+          // The operator's first, which nothing of the run reads again.
+          [keptOnce, sentAs] = (await onDatabase(NAMESPACE, "select id, transport_message_id from state.messages where transport_message_id is not null and kind = 'text' order by created_at limit 1")).split("|") as [string, string];
+          await onDatabase(NAMESPACE, `insert into state.messages (id, conversation_id, direction, kind, transport_message_id, text, media_group_id, raw, session_id, turn_id, created_at)
+            select id || '-again', conversation_id, direction, kind, transport_message_id, text, media_group_id, raw, session_id, turn_id, created_at + interval '1 second'
+            from state.messages where id = '${keptOnce}'`);
+        },
+        keeps: "the message once, as it was kept first, its copy told of before the cut-over changed anything and removed past its point of no return",
+        check: async () => {
+          assert.equal(await onDatabase(NAMESPACE, `select string_agg(id, ',' order by id) from state.messages where id in ('${keptOnce}', '${keptOnce}-again')`), keptOnce);
+          assert.match((await inCutOverRecord("cat telegram-duplicates.tsv")).trim(), new RegExp(`^message\\t[^\\t]+\\t[^\\t]+\\t${sentAs}\\t[^\\t]*\\t2\\t1$`, "u"));
+          assert.equal((await inCutOverRecord("cat telegram-copies-removed")).trim(), "1");
+        },
+      },
+      {
+        seeds: "the forks' holds, as 8.0.0's table keeps them, without a holder or an expiry",
+        seed: async () => {
+          assert.equal(await onDatabase(NAMESPACE, HOLD_COLUMNS), "conversation_id|NO|\nreason|NO|\nheld_at|NO|now()");
+        },
+        keeps: "the forks' holds as this release makes them, each with its holder and expiry, which no default gives",
+        check: async () => {
+          assert.equal(await onDatabase(NAMESPACE, HOLD_COLUMNS), "conversation_id|NO|\nreason|NO|\nheld_at|NO|now()\nholder|NO|\nexpires_at|NO|");
         },
       },
     ];
@@ -943,6 +980,14 @@ if (inShard("sessions")) {
       await tg.say("again");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
       await untilInLake("resumed thread of Codex's", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'thread/resume'");
+    });
+
+    test("a message runs a turn on Claude Code, the run's stand-in for it, whose answer reaches the operator, and its transcript the lake", async () => {
+      await tg.say("/service claude");
+      await tg.waitFor((call) => /^Active: Claude$/mu.test(call.payload.text ?? ""));
+      await tg.say("hello, Claude");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === CLAUDE_ANSWER);
+      await untilInLake("Claude Code's answer in its transcript", "select count(*) as n from claude.entries where type = 'assistant'");
     });
 
     // Last, as a restart of k3s ends the port forwards the tests before it reach the stand-ins through.
