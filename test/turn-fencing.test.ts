@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { Effect, Exit, Layer } from "effect";
+import { Effect, Exit, Layer, Option, Schedule } from "effect";
 
 import { CodexAppServer } from "../src/codex/app-server/client.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
-import { holdConversations } from "../src/harness/holds.ts";
+import { whileHeld } from "../src/harness/holds.ts";
 import { HarnessHost } from "../src/harness/host.ts";
 import { Harnesses } from "../src/harness/index.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
+import { StoreError } from "../src/persistence/sql.ts";
 import { Store, TurnFenced } from "../src/persistence/store.ts";
 import { holdsIn, newSchema, run, testPool, testStore } from "./support/store.ts";
 
@@ -170,20 +171,20 @@ test("a fork's hold is a row of the store while it lasts, held only where no tur
   await Effect.runPromise(Effect.gen(function*() {
     const activeTurns = yield* ActiveTurns;
     const host = yield* HarnessHost;
-    yield* Effect.scoped(Effect.gen(function*() {
-      assert.equal(yield* holdConversations(host, store, [conversationId], "forking session fs-a into fs-b"), true);
+    const forked = yield* whileHeld(host, store, [conversationId], "forking session fs-a into fs-b", () => Effect.gen(function*() {
       assert.deepEqual(yield* Effect.promise(reasons), [[conversationId, "forking session fs-a into fs-b"]]);
       assert.deepEqual([(yield* host.status(conversationId)).busy, (yield* host.status(conversationId)).held], [true, true]);
       assert.equal(yield* Effect.scoped(host.reserve(conversationId)), false);
       // A second hold of it, while the first lasts, is none.
-      assert.equal(yield* Effect.scoped(holdConversations(host, store, [conversationId], "forking again")), false);
+      assert.deepEqual(yield* whileHeld(host, store, [conversationId], "forking again", () => Effect.void), Option.none());
       assert.deepEqual(yield* Effect.promise(reasons), [[conversationId, "forking session fs-a into fs-b"]]);
+      return "forked";
     }));
-    assert.deepEqual(yield* Effect.promise(reasons), []);
+    assert.deepEqual([forked, yield* Effect.promise(reasons)], [Option.some("forked"), []]);
     // A turn runs: no hold, and no row.
     yield* Effect.scoped(Effect.gen(function*() {
       yield* activeTurns.register(conversationId, { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false });
-      assert.equal(yield* holdConversations(host, store, [conversationId], "forking"), false);
+      assert.deepEqual(yield* whileHeld(host, store, [conversationId], "forking", () => Effect.die(new Error("no fork runs under a turn"))), Option.none());
       assert.deepEqual(yield* Effect.promise(reasons), []);
     }));
   }).pipe(Effect.provide(HarnessHost.layer.pipe(
@@ -192,19 +193,99 @@ test("a fork's hold is a row of the store while it lasts, held only where no tur
   ))));
 });
 
+/** Runs `body` with the harness host of `store`, in alasio's process, and its running turns. */
+const withHost = <A>(store: Store["Service"], body: (host: HarnessHost["Service"]) => Effect.Effect<A, unknown>) =>
+  Effect.runPromise(Effect.flatMap(HarnessHost, body).pipe(Effect.provide(HarnessHost.layer.pipe(
+    Layer.provideMerge(Harnesses.layer({})),
+    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, Layer.succeed(Store, store))),
+  ))));
+
+test("a fork's hold whose letting go fails is let go of once the store takes it, tried until it is through", async () => {
+  const { store, schema, conversationId } = await conversation();
+  let refusals = 2;
+  const refusing: Store["Service"] = {
+    ...store,
+    releaseHolds: (holder) =>
+      Effect.suspend(() => (refusals > 0 ? ((refusals -= 1), Effect.fail(new StoreError({ cause: new Error("Neon is not reached") }))) : store.releaseHolds(holder))),
+  };
+  await withHost(refusing, (host) =>
+    whileHeld(host, refusing, [conversationId], "forking", () => Effect.void, { letGoAgain: Schedule.spaced("20 millis") }).pipe(
+      Effect.tap((held) => Effect.sync(() => assert.ok(Option.isSome(held)))),
+    ));
+  for (let waited = 0; (await holdsIn(schema)).length > 0 && waited < 2000; waited += 20) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual([await holdsIn(schema), refusals], [[], 0]);
+  assert.equal(await run(store.isConversationHeld(conversationId)), false);
+});
+
+test("a fork's hold lasts as long as its fork, renewed while it runs, and no longer than it lasts unrenewed, so a holder whose process stopped pins no conversation", async () => {
+  const { store, conversationId } = await conversation();
+  await withHost(store, (host) =>
+    Effect.gen(function*() {
+      // Renewed every 100 ms, it outlasts its 300 ms many times over.
+      yield* whileHeld(host, store, [conversationId], "forking", () => Effect.gen(function*() {
+        yield* Effect.sleep("900 millis");
+        assert.equal((yield* host.status(conversationId)).held, true);
+      }), { ttl: "300 millis", renewal: "100 millis" });
+      // A holder that never lets go, nor renews (its process stopped): its hold ends as it expires.
+      assert.notEqual(yield* store.holdConversations([conversationId], "forking, then stopped", 300), null);
+      assert.deepEqual([(yield* host.status(conversationId)).held, yield* Effect.scoped(host.reserve(conversationId))], [true, false]);
+      yield* Effect.sleep("500 millis");
+      assert.deepEqual([(yield* host.status(conversationId)).busy, yield* Effect.scoped(host.reserve(conversationId))], [false, true]);
+      // And another hold takes its place.
+      assert.ok(Option.isSome(yield* whileHeld(host, store, [conversationId], "forking again", () => Effect.void)));
+    }));
+});
+
+test("a fork's hold that expired is renewed no more, and its fork, which no longer holds the conversation, is stopped before it touches the workspace again", async () => {
+  const { store, conversationId } = await conversation();
+  // Expired, by the store's clock, as of the first renewal.
+  const holder = await run(store.holdConversations([conversationId], "forking", 1));
+  assert.ok(holder);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(await run(store.renewHolds(holder, 60_000)), 0);
+  assert.equal(await run(store.isConversationHeld(conversationId)), false);
+  await run(store.releaseHolds(null));
+  // A fork whose renewals come only after its hold expired.
+  let touched = false;
+  const stopped = await withHost(store, (host) =>
+    Effect.flip(whileHeld(host, store, [conversationId], "forking session fs-a into fs-b", () => Effect.sleep("1 second").pipe(Effect.andThen(Effect.sync(() => (touched = true)))), { ttl: "100 millis", renewal: "300 millis" })));
+  assert.equal(stopped._tag, "HoldLost");
+  assert.match(stopped.message, /forking session fs-a into fs-b expired before it was renewed/u);
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  assert.equal(touched, false);
+});
+
+test("a fork's work that runs past its deadline, as one stuck in an await would, is stopped and its hold let go of", async () => {
+  const { store, schema, conversationId } = await conversation();
+  const stopped = await withHost(store, (host) =>
+    Effect.flip(whileHeld(host, store, [conversationId], "forking session fs-a into fs-b", (begun) => Effect.andThen(begun, Effect.never), { renewal: "50 millis", deadline: "300 millis" })));
+  assert.equal(stopped._tag, "HoldOverran");
+  assert.deepEqual(await holdsIn(schema), []);
+  assert.equal(await run(store.isConversationHeld(conversationId)), false);
+});
+
+test("a fork waiting its turn at forking, as another forks, is not stopped at its deadline, which it is given from when its turn comes", async () => {
+  const { store, conversationId } = await conversation();
+  const forked = await withHost(store, (host) =>
+    whileHeld(host, store, [conversationId], "forking session fs-a into fs-b", (begun) =>
+      // Its turn comes after twice its deadline, and its fork then takes half of it.
+      Effect.sleep("600 millis").pipe(Effect.andThen(begun), Effect.andThen(Effect.sleep("150 millis")), Effect.as("forked")), { renewal: "50 millis", deadline: "300 millis" }));
+  assert.deepEqual(forked, Option.some("forked"));
+});
+
 test("holds of conversations some of which are the same, made at once, are each all of their conversations or none, leaving no row of one that held none", async () => {
   const { store, schema } = await conversation();
   const [a, b, c] = await Promise.all(["11", "12", "13"].map((chatId) => run(store.upsertConversation({ chatId, user: { id: Number(chatId) } }))));
   if (!a || !b || !c) throw new Error("the conversations were not made");
   for (let attempt = 0; attempt < 200; attempt += 1) {
-    const hold = (ids: readonly string[]): Promise<boolean> => run(store.holdConversations(ids, `forking ${ids.join(" and ")}`));
-    const held: readonly boolean[] = await Promise.all([hold([a, b]), hold([b, c])]);
-    const first = held[0] === true;
-    const second = held[1] === true;
+    const hold = (ids: readonly string[]): Promise<string | null> => run(store.holdConversations(ids, `forking ${ids.join(" and ")}`, 60_000));
+    const held: (string | null)[] = await Promise.all([hold([a, b]), hold([b, c])]);
+    const first: string | null = held[0] ?? null;
+    const second: string | null = held[1] ?? null;
     const rows = (await holdsIn(schema)).map(([conversationId]) => conversationId).sort();
     // b is one's or the other's: the one that has it holds all of its, and the other none.
-    assert.ok(first !== second, `attempt ${attempt}: ${first} and ${second}`);
-    assert.deepEqual(rows, (first ? [a, b] : [b, c]).sort(), `attempt ${attempt}`);
-    await run(store.releaseConversations(null));
+    assert.ok((first === null) !== (second === null), `attempt ${attempt}: ${first} and ${second}`);
+    assert.deepEqual(rows, (first !== null ? [a, b] : [b, c]).sort(), `attempt ${attempt}`);
+    await run(store.releaseHolds(null));
   }
 });

@@ -165,6 +165,41 @@ telegram_once_past() {
 }
 # END the Telegram messages kept once.
 
+# BEGIN the forks' holds: a holder and an expiry for each.
+#
+# The forks' holds, a table of 8.0.0's, have a holder and an expiry in this release, which
+# alasio's schema defines as the table is now, and evolves no table it has. Past the point of
+# no return, the cut-over gives 8.0.0's table the two, with defaults, as 8.0.0 still holds
+# without them until the upgrade; once the upgrade is through, it takes the defaults off, as
+# this release makes every hold with both. A hold of 8.0.0's comes out expired, and alasio
+# lets go of every hold as it starts anyway.
+
+# The holder and the expiry of each of the forks' holds (src/persistence/schema.ts
+# conversation_holds), with the defaults 8.0.0's holds are made with until the upgrade.
+HOLD_COLUMNS="
+alter table state.conversation_holds
+  add column if not exists holder text not null default '',
+  add column if not exists expires_at timestamptz not null default now();"
+# The forks' holds as this release makes them: without the defaults 8.0.0's needed.
+HOLD_DEFAULTS="
+alter table state.conversation_holds
+  alter column holder drop default,
+  alter column expires_at drop default;"
+# Past the point of no return, before the upgrade: the holder and the expiry given, once.
+holds_past() {
+  if [ ! -e "$OUT/holds-columns" ]; then
+    on_database <<<"$HOLD_COLUMNS" >/dev/null || fail "the forks' holds could not be given their holder and expiry: the cut-over run again goes on with it"
+    touch "$OUT/holds-columns"
+    log "gave the forks' holds their holder and expiry, which this release keeps"
+  fi
+}
+# Once the upgrade is through: the defaults taken off.
+holds_after() {
+  on_database <<<"$HOLD_DEFAULTS" >/dev/null || fail "the forks' holds could not be made as this release makes them: the cut-over run again goes on with it"
+  log "made the forks' holds as this release makes them, without the defaults 8.0.0's needed"
+}
+# END the forks' holds.
+
 for tool in jq kubectl; do command -v "$tool" >/dev/null || fail "$tool is not on root's PATH"; done
 kubectl get --raw=/readyz >/dev/null 2>&1 || fail "kubectl does not reach the cluster: give it k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
 
@@ -199,12 +234,15 @@ fi
 if [ ! -e "$OUT/upgraded" ]; then
   [ "${FAIL_AT:-}" != past-the-point-of-no-return ] || fail "a failure injected past the point of no return, before the upgrade"
   telegram_once_past
+  holds_past
   log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
   printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
   bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" || fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it"
   date -u +%FT%TZ >"$OUT/upgraded"
 fi
 [ "${FAIL_AT:-}" != after-the-upgrade ] || fail "a failure injected once the upgrade was through"
+
+holds_after
 
 log "upgraded at $(cat "$OUT/upgraded")"
 log "through"

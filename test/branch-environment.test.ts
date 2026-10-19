@@ -78,7 +78,7 @@ test("an alasio forks a session one of its conversations knows for the branch wh
   const sandboxes = SessionSandboxes.of({
     volumes: {
       create: () => Effect.die("the parent makes no session for a branch"),
-      fork: (source, volumeId, namespace = "alasio-sessions") =>
+      fork: (source, volumeId, { namespace = "alasio-sessions" } = {}) =>
         Effect.sync(() => forked.push([source, volumeId, namespace])).pipe(Effect.andThen(outcome), Effect.as({ volumeId, netMode: "none" as const })),
       destroy: () => Effect.die("the parent deletes no session for a branch"),
       forks: Effect.die("the parent lists no fork for a branch"),

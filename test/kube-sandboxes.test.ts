@@ -1398,7 +1398,7 @@ test("a fork goes into the namespace it is asked into, and leaves a suspended so
     yield* sessions.volumes.create("fs-abc123");
     yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis" }).pipe(Effect.flatMap((sandboxes) => sandboxes.suspend("fs-abc123")));
     kube.calls.length = 0;
-    assert.deepEqual(yield* sessions.volumes.fork("fs-abc123", "fs-def456", "alasio-branch-x-sessions"), { volumeId: "fs-def456", netMode: "none" });
+    assert.deepEqual(yield* sessions.volumes.fork("fs-abc123", "fs-def456", { namespace: "alasio-branch-x-sessions" }), { volumeId: "fs-def456", netMode: "none" });
   })).finally(cluster.stop);
   assert.deepEqual(cluster.clones.map(({ env, source, destination }) => [env["DESTINATION_NAMESPACE"], env["DESTINATION_CLAIM"], source, destination]), [
     ["alasio-branch-x-sessions", "data-fs-def456", "Suspended", "Suspended"],
@@ -1406,6 +1406,32 @@ test("a fork goes into the namespace it is asked into, and leaves a suspended so
   assert.equal(kube.peek("Sandbox", "alasio-branch-x-sessions", "fs-def456")?.metadata.namespace, "alasio-branch-x-sessions");
   assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch"), []);
   assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode, "Suspended");
+});
+
+test("a fork is told its turn at forking as it comes, before it changes anything, one waiting on the fork before it until that one ends", async () => {
+  const kube = fakeKube();
+  const cluster = forkCluster(kube, [["alasio-sessions", "fs-abc123"], ["alasio-sessions", "fs-def456"]], "Complete");
+  const told: string[] = [];
+  await onSessions(kube, profile({ clone: { claimTemplate: "data", job: cloneJob } }), Effect.gen(function*() {
+    const sessions = yield* SessionSandboxes;
+    yield* sessions.volumes.create("fs-abc123");
+    kube.calls.length = 0;
+    // The first holds its turn until let go, then finds no source to fork.
+    const letGo = yield* Deferred.make<void>();
+    const first = yield* Effect.forkChild(Effect.flip(sessions.volumes.fork("fs-gone00", "fs-ghi789", {
+      permitted: Effect.sync(() => void told.push("first")).pipe(Effect.andThen(Deferred.await(letGo))),
+    })));
+    while (told.length === 0) yield* Effect.sleep("5 millis");
+    const second = yield* Effect.forkChild(sessions.volumes.fork("fs-abc123", "fs-def456", {
+      permitted: Effect.sync(() => void told.push(`second, ${kube.calls.filter(([verb]) => verb === "create").length} made`)),
+    }));
+    yield* Effect.sleep("50 millis");
+    assert.deepEqual(told, ["first"]);
+    yield* Deferred.succeed(letGo, undefined);
+    assert.equal((yield* Fiber.join(first)).message, "there is no session fs-gone00 to fork");
+    assert.deepEqual(yield* Fiber.join(second), { volumeId: "fs-def456", netMode: "none" });
+  })).finally(cluster.stop);
+  assert.deepEqual(told, ["first", "second, 0 made"]);
 });
 
 test("a fork whose clone fails leaves no session, and its source resumed", async () => {

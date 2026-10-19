@@ -326,13 +326,14 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
      * A new session `volumeId`, in `namespace` (the sessions' unless told), with the
      * internet of the session `sourceVolumeId` and a clone of its files, as the module
      * says; suspended, so its pod starts as it is first brought up. The source must be
-     * between turns, as it is suspended meanwhile, and one fork runs at a time. A fork
-     * that fails leaves no session, and the source as it was.
+     * between turns, as it is suspended meanwhile, and one fork runs at a time: `permitted`
+     * is run as this one's turn comes, before it changes anything. A fork that fails leaves
+     * no session, and the source as it was.
      */
     readonly fork: (
       sourceVolumeId: string,
       volumeId: string,
-      namespace?: string,
+      options?: { readonly namespace?: string | undefined; readonly permitted?: Effect.Effect<void> | undefined },
     ) => Effect.Effect<{ readonly volumeId: string; readonly netMode: NetMode }, SessionError | SessionForkError>;
     readonly destroy: (volumeId: string) => Effect.Effect<void, KubeApiError>;
     /** The sessions that are forks, made or not, as their Sandboxes say. */
@@ -723,7 +724,8 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
           Effect.as({ volumeId, netMode }),
           withLogScope("sandbox"),
         ),
-      fork: (sourceVolumeId, volumeId, namespace = profile.namespace) => forking.withPermit(fork(sourceVolumeId, volumeId, namespace)).pipe(withLogScope("sandbox")),
+      fork: (sourceVolumeId, volumeId, { namespace = profile.namespace, permitted = Effect.void } = {}) =>
+        forking.withPermit(Effect.andThen(permitted, fork(sourceVolumeId, volumeId, namespace))).pipe(withLogScope("sandbox")),
       // Its snapshot goes with it: an image of what it held.
       destroy: (volumeId) =>
         Effect.suspend(() => sandboxes.remove(assertValidVolumeId(volumeId))).pipe(

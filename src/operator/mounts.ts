@@ -17,7 +17,7 @@ import { Context, Effect, Layer, Option, Schema } from "effect";
 import type { AlasioConfig } from "../config.ts";
 import { Turns } from "../codex/turns.ts";
 import { HarnessHost } from "../harness/host.ts";
-import { holdConversations } from "../harness/holds.ts";
+import { whileHeld } from "../harness/holds.ts";
 import { folderRefusedOnBranch, harnessLabelOf, isHarnessName } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
 import type { StoreError } from "../persistence/sql.ts";
@@ -232,12 +232,14 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
         ...(yield* store.listWorkspaceConversations(sessionFsWorkspace(source.volumeId))).filter(({ mounted }) => mounted).map(({ conversationId }) => conversationId),
       ]);
       const volumeId = newVolumeId();
-      yield* Effect.scoped(Effect.gen(function*() {
-        if (!(yield* holdConversations(host, store, [...mounting], `forking session ${source.volumeId} into ${volumeId}`))) {
-          return yield* new MountRefused({ message: "A turn runs on this session workspace now, which a fork would suspend. Fork it once that turn ends." });
-        }
-        yield* recorded(volumeId, source.volumeId, sandbox.volumes.fork(source.volumeId, volumeId));
-      })).pipe(Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })));
+      const forked = yield* whileHeld(host, store, [...mounting], `forking session ${source.volumeId} into ${volumeId}`, (begun) =>
+        recorded(volumeId, source.volumeId, sandbox.volumes.fork(source.volumeId, volumeId, { permitted: begun }))).pipe(
+        Effect.catchTag(["HoldLost", "HoldOverran"], (error) => Effect.fail(new MountRefused({ message: `The fork stopped: ${error.message}. Fork it again.` }))),
+        Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })),
+      );
+      if (Option.isNone(forked)) {
+        return yield* new MountRefused({ message: "A turn runs on this session workspace now, which a fork would suspend. Fork it once that turn ends." });
+      }
       const change = yield* mountCreated(
         conversationId,
         sessionFsWorkspace(volumeId),

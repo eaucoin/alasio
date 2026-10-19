@@ -6,6 +6,16 @@
  * the row first and the host asked after, as the host reserves first and reads the row
  * after: of a hold and a turn begun at once, one sees the other.
  *
+ * A hold is made for a piece of work (whileHeld), and lasts while that work runs: HOLD_TTL
+ * at a time, renewed every HOLD_RENEWAL. A holder whose process stopped, or is stuck,
+ * renews nothing, so it pins no conversation past HOLD_TTL. One whose work is stuck in an
+ * await would renew it for as long as that work runs, so the work has a deadline,
+ * HOLD_DEADLINE, from when it begins (a fork, once it has its turn at forking), past which
+ * it is stopped and the hold let go of. A hold found expired, or
+ * taken, as it is renewed is the work's no longer: the work is stopped, with HoldLost,
+ * before it touches the workspace again. The letting go is tried until it is through, in
+ * the background, the hold expiring meanwhile if it never is.
+ *
  * Clearing every row as alasio starts (Turns.reconcilePersistentState) is safe because
  * one alasio runs on its store at a time: its Deployment has one replica and replaces it
  * by Recreate (cli/src/manifests/alasio.ts), so the alasio starting is the only one, and
@@ -13,27 +23,103 @@
  * once (more replicas, or a rolling update) would make it unsafe: the one starting would
  * clear the holds of forks the other still runs.
  */
-import { Effect, type Scope } from "effect";
+import { Deferred, Duration, Effect, Option, Schedule, Schema } from "effect";
 
 import type { StoreError } from "../persistence/sql.ts";
 import type { Store } from "../persistence/store.ts";
 import type { HarnessHost } from "./host.ts";
 
+/** How long a hold lasts unless its holder renews it. */
+export const HOLD_TTL = Duration.minutes(2);
+/** How often a holder renews its hold, well within HOLD_TTL. */
+export const HOLD_RENEWAL = Duration.seconds(30);
 /**
- * Holds the conversations busy for `reason` until the scope closes: whether it holds them,
- * which it does only where none is busy, and then all at once.
+ * How long the work a hold is made for may run once it begins: a fork, once it has its turn
+ * at forking (src/sandbox/index.ts, which forks one at a time, so one waiting on another is
+ * not overrun as it waits). Past all a fork waits on, each bounded on its own, so no fork
+ * that could still finish is stopped by it, and one stuck in an await holds its
+ * conversations no longer than this:
+ *
+ * - its claim bound to a volume, 5 minutes (src/sandbox/index.ts CLAIM_BOUND_TIMEOUT);
+ * - its source released into a snapshot, the node agent's checkpoint, 15 minutes
+ *   (src/node-agent/names.ts OPERATION_LIMIT_SECONDS), then suspended, 5 minutes
+ *   (src/kube/sandboxes.ts READY_TIMEOUT), or suspended plain;
+ * - the clone, a Job Kubernetes stops at an hour (cli/src/manifests/workspace-storage.ts
+ *   cloneJob, activeDeadlineSeconds);
+ * - the source's snapshot copied for the fork (snapshots.copy), the node agent's copy, 15
+ *   minutes;
+ * - the source resumed, restored from its snapshot: the node agent's prepare, 15 minutes,
+ *   its pod running, 3 (src/sandbox/snapshots.ts POD_RUNNING_TIMEOUT), its resume, a minute
+ *   (src/sandbox/node-agents.ts RESUME_CALL), and its Sandbox ready, 5.
+ *
+ * That is 2 hours 4 minutes at most; with room over it, two and a half hours.
  */
-export const holdConversations = (
+export const HOLD_DEADLINE = Duration.minutes(150);
+/** How a letting go that failed is tried again, until it is through. */
+const LET_GO_AGAIN = Schedule.min([Schedule.exponential(Duration.seconds(1)), Schedule.spaced(Duration.minutes(1))]);
+
+/** The work a hold was made for, stopped: the hold expired, or another took it, as it was renewed. */
+export class HoldLost extends Schema.TaggedError<HoldLost>()("HoldLost", {
+  conversationIds: Schema.Array(Schema.String),
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return `the hold of ${this.conversationIds.join(", ")} for ${this.reason} expired before it was renewed, so what it was held for was stopped`;
+  }
+}
+
+/** The work a hold was made for, stopped as it ran past its deadline (HOLD_DEADLINE). */
+export class HoldOverran extends Schema.TaggedError<HoldOverran>()("HoldOverran", {
+  reason: Schema.String,
+  deadline: Schema.String,
+}) {
+  override get message(): string {
+    return `${this.reason} ran past its ${this.deadline}, so it was stopped and its hold let go of`;
+  }
+}
+
+/** How a hold lasts: its ttl, how often it is renewed, its work's deadline, and how its letting go is tried again. */
+export interface HoldTiming {
+  readonly ttl?: Duration.Input;
+  readonly renewal?: Duration.Input;
+  readonly deadline?: Duration.Input;
+  readonly letGoAgain?: Schedule.Schedule<unknown>;
+}
+
+/**
+ * Runs `work` holding the conversations busy for `reason`, as the module says: what it
+ * gave, or none where it could not hold them, as one is busy, and then holds none. The hold
+ * is let go of once the work is done, however it ended. `work` is given what it runs as it
+ * begins, which starts its deadline (HOLD_DEADLINE): a fork runs it once it has its turn at
+ * forking (SessionSandboxes' volumes.fork, permitted), so the wait for its turn is not
+ * counted against it, as the fork it waits on has its own deadline.
+ */
+export const whileHeld = <A, E, R>(
   host: HarnessHost["Service"],
   store: Store["Service"],
   conversationIds: readonly string[],
   reason: string,
-): Effect.Effect<boolean, StoreError, Scope.Scope> =>
+  work: (begun: Effect.Effect<void>) => Effect.Effect<A, E, R>,
+  { ttl = HOLD_TTL, renewal = HOLD_RENEWAL, deadline = HOLD_DEADLINE, letGoAgain = LET_GO_AGAIN }: HoldTiming = {},
+): Effect.Effect<Option.Option<A>, E | StoreError | HoldLost | HoldOverran, R> =>
   Effect.uninterruptibleMask((restore) =>
     Effect.gen(function*() {
-      if (!(yield* store.holdConversations(conversationIds, reason))) return false;
-      const letGo = store.releaseConversations(conversationIds).pipe(
-        Effect.catch((error) => Effect.logWarning(`could not let go of the holds of ${conversationIds.join(", ")}: ${error.message}`)),
+      const ttlMs = Duration.toMillis(Duration.fromInputUnsafe(ttl));
+      const holder = yield* store.holdConversations(conversationIds, reason, ttlMs);
+      if (holder === null) return Option.none();
+      // Tried until it is through: where the first try fails, apart from what lets go, which goes on meanwhile.
+      const letGo = store.releaseHolds(holder).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning(`could not let go of the holds of ${conversationIds.join(", ")}, trying again: ${error.message}`).pipe(
+            Effect.andThen(store.releaseHolds(holder).pipe(
+              Effect.tapError((again) => Effect.logWarning(`could not let go of the holds of ${conversationIds.join(", ")}, trying again: ${again.message}`)),
+              Effect.retry(letGoAgain),
+              Effect.ignore,
+              Effect.forkDetach,
+            )),
+          )
+        ),
+        Effect.asVoid,
       );
       // Held: let go of at once where a turn runs, or that cannot be told.
       const running = yield* restore(Effect.forEach(conversationIds, (conversationId) => Effect.map(host.status(conversationId), ({ running }) => running))).pipe(
@@ -41,9 +127,28 @@ export const holdConversations = (
       );
       if (running.some(Boolean)) {
         yield* letGo;
-        return false;
+        return Option.none();
       }
-      yield* Effect.addFinalizer(() => letGo);
-      return true;
+      const held = new Set(conversationIds).size;
+      // Renewed while the work runs, only where it has not expired; one renewal that fails
+      // is tried again at the next, the hold expiring if none is through in time.
+      const renewing: Effect.Effect<never, HoldLost> = Effect.sleep(renewal).pipe(
+        Effect.andThen(store.renewHolds(holder, ttlMs).pipe(
+          Effect.catch((error) => Effect.as(Effect.logWarning(`could not renew the holds of ${conversationIds.join(", ")}: ${error.message}`), held)),
+        )),
+        Effect.flatMap((renewed) => (renewed < held ? Effect.fail(new HoldLost({ conversationIds: [...conversationIds], reason })) : Effect.void)),
+        Effect.forever,
+      );
+      // Stopped once it has run past its deadline, counted from when it began.
+      const begun = yield* Deferred.make<void>();
+      const overrunning: Effect.Effect<never, HoldOverran> = Deferred.await(begun).pipe(
+        Effect.andThen(Effect.sleep(deadline)),
+        Effect.andThen(Effect.fail(new HoldOverran({ reason, deadline: Duration.format(Duration.fromInputUnsafe(deadline)) }))),
+      );
+      return yield* restore(work(Effect.asVoid(Deferred.succeed(begun, undefined))).pipe(
+        Effect.raceFirst(renewing),
+        Effect.raceFirst(overrunning),
+        Effect.map(Option.some),
+      )).pipe(Effect.ensuring(letGo));
     })
   );

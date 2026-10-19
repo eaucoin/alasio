@@ -33,7 +33,7 @@ import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "eff
 
 import { nameProblem } from "../../neon/control/branches.ts";
 import { Turns } from "../codex/turns.ts";
-import { holdConversations } from "../harness/holds.ts";
+import { whileHeld } from "../harness/holds.ts";
 import { HarnessHost } from "../harness/host.ts";
 import { hasStatus } from "../kube/client.ts";
 import { Store } from "../persistence/store.ts";
@@ -84,15 +84,18 @@ export const serveBranchForks = Effect.fnUntraced(function*({
     const made = (yield* store.listSessionWorkspaces).some((workspace) => workspace.volumeId === volumeId && workspace.madeAt !== null);
     if (knowing.length === 0 && !made) return answer(404, { error: `alasio has no session ${volumeId}` });
     const mounting = knowing.filter(({ mounted }) => mounted).map(({ conversationId }) => conversationId);
-    const forked = yield* Effect.scoped(Effect.gen(function*() {
-      if (!(yield* holdConversations(harnessHost, store, mounting, `forking session ${volumeId} for the branch ${branch}`))) return false;
-      yield* sandboxes.volumes.fork(volumeId, volumeId, branchSessionsNamespace(branch)).pipe(
-        // Forked already, by an earlier request of the branch's.
-        Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(409)(error), () => Effect.void),
-      );
-      return true;
-    })).pipe(Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })));
-    if (!forked) {
+    const forked = yield* whileHeld(
+      harnessHost,
+      store,
+      mounting,
+      `forking session ${volumeId} for the branch ${branch}`,
+      (begun) =>
+        sandboxes.volumes.fork(volumeId, volumeId, { namespace: branchSessionsNamespace(branch), permitted: begun }).pipe(
+          // Forked already, by an earlier request of the branch's.
+          Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(409)(error), () => Effect.void),
+        ),
+    ).pipe(Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })));
+    if (Option.isNone(forked)) {
       return answer(409, { error: `a turn runs in the session ${volumeId} now, which a fork would suspend: send again once it ends` });
     }
     yield* Effect.logInfo(`forked session ${volumeId} for the branch ${branch}`);

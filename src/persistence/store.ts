@@ -5,6 +5,8 @@
  * a table or a few each; the store is what alasio uses of them, and the few changes that
  * span them, each in one transaction.
  */
+import { randomUUID } from "node:crypto";
+
 import type { Update } from "@grammyjs/types";
 import { Context, Duration, Effect, Layer, Option, Schema } from "effect";
 import type { Pool } from "pg";
@@ -281,14 +283,17 @@ export class Store extends Context.Service<Store, {
   /** The conversation's latest turn, active or ended: what its harness said it did, and how it ended. */
   readonly getTurn: (conversationId: string) => Stored<Turn | null>;
   /**
-   * Holds the conversations busy for `reason`, as no turn does (a fork), all at once where
-   * none is held already, or none at all: whether it held them.
+   * Holds the conversations busy for `reason`, as no turn does (a fork), for `ttlMs` unless
+   * renewed, all at once where none is held already, or none at all: the holder they are
+   * held as, or null where it held none.
    */
-  readonly holdConversations: (conversationIds: readonly string[], reason: string) => Stored<boolean>;
-  /** Whether the conversation is held busy, as no turn (holdConversations). */
+  readonly holdConversations: (conversationIds: readonly string[], reason: string, ttlMs: number) => Stored<string | null>;
+  /** Keeps the holds of `holder` (holdConversations) for `ttlMs` more: how many it still has. */
+  readonly renewHolds: (holder: string, ttlMs: number) => Stored<number>;
+  /** Whether the conversation is held busy, as no turn, by a hold not expired (holdConversations). */
   readonly isConversationHeld: (conversationId: string) => Stored<boolean>;
-  /** Lets go of the conversations' holds; of every one, for null. */
-  readonly releaseConversations: (conversationIds: readonly string[] | null) => Stored<void>;
+  /** Lets go of the holds of `holder`; of every hold, for null. */
+  readonly releaseHolds: (holder: string | null) => Stored<void>;
 
   /** Lets go of a response, as delivered or never to be. */
   readonly markPendingAsPosted: (pendingResponseId: string) => Stored<void>;
@@ -500,13 +505,16 @@ const makeStore = Effect.fnUntraced(function*({
     getActiveTurns: turns.getActiveTurns(),
     getActiveTurn: (conversationId) => turns.getActiveTurn(conversationId),
     getTurn: (conversationId) => turns.getTurn(conversationId),
-    // One that made fewer than all, as another held one of them, or held it as this ran, keeps none.
-    holdConversations: (conversationIds, reason) =>
-      database.transaction((sql) =>
-        Effect.flatMap(repositoriesOn(sql).turns.holdEach(conversationIds, reason), (made) =>
-          made === new Set(conversationIds).size ? Effect.succeed(true) : Effect.fail(new HeldAlready()))
-      ).pipe(Effect.catchTag("HeldAlready", () => Effect.succeed(false))),
-    releaseConversations: (conversationIds) => turns.release(conversationIds),
+    holdConversations: (conversationIds, reason, ttlMs) => {
+      const holder = randomUUID();
+      // One that made fewer than all, as another held one of them, or held it as this ran, keeps none.
+      return database.transaction((sql) =>
+        Effect.flatMap(repositoriesOn(sql).turns.holdEach(conversationIds, reason, holder, ttlMs), (made) =>
+          made === new Set(conversationIds).size ? Effect.succeed(holder) : Effect.fail(new HeldAlready()))
+      ).pipe(Effect.catchTag("HeldAlready", () => Effect.succeed(null)));
+    },
+    renewHolds: (holder, ttlMs) => turns.renew(holder, ttlMs),
+    releaseHolds: (holder) => turns.release(holder),
     isConversationHeld: (conversationId) => turns.isHeld(conversationId),
 
     markPendingAsPosted: (pendingResponseId) => Effect.asVoid(responses.markPendingAsPosted(pendingResponseId)),
