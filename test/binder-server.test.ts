@@ -59,7 +59,7 @@ async function pods(): Promise<{ port: number; sent: IncomingHttpHeaders[]; clos
   return { port: (server.address() as AddressInfo).port, sent, close: () => server.close() };
 }
 
-/** A front on its own client and Binder, binds waiting up to `waitMs`, every key in `of`; and how to stop it. */
+/** A front on its own client and Binder, binds waiting up to `waitMs`, every key in `of` but those of an environment `elsewhere` names; and how to stop it. */
 async function front(
   of: Pool,
   podPort: number,
@@ -72,6 +72,7 @@ async function front(
     keyOf = callerKey as Buffer | ((claims: TokenClaims) => Buffer | null),
     operate = undefined as ((claims: TokenClaims, operation: Operation) => Effect.Effect<{ status: number; json?: unknown; bytes?: Uint8Array }>) | undefined,
     watched = false,
+    elsewhere = {} as Readonly<Record<string, Pool>>,
   } = {},
 ): Promise<BinderServer & { close: () => Promise<void> }> {
   const scope = await Effect.runPromise(Scope.make());
@@ -85,7 +86,7 @@ async function front(
     : null;
   const served = await Effect.runPromise(
     serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), ...(live ? { routeHeld: live.holds } : {}), poolOf: (_key, options) =>
-      options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: of, release, ...told })), peers: () => Effect.succeed(peers) }).pipe(
+      options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: elsewhere[options["environment"] ?? ""] ?? of, release, ...told })), peers: () => Effect.succeed(peers) }).pipe(
       Effect.provide(layer),
       Scope.provide(scope),
     ),
@@ -120,7 +121,82 @@ test("a caller's request binds its key and reaches the key's pod with the bindin
     assert.equal(stamps[1], stamps[0]);
     const tokens = stand.sent.map(({ authorization }) => verifyToken(bindingKey, String(authorization).slice("Bearer ".length), Date.now()));
     assert.deepEqual(tokens, Array(2).fill({ key, binding: lease.metadata?.uid, namespace: lease.metadata?.namespace }));
-    assert.equal(served.inFlight(key), 0);
+    assert.equal(served.inFlight(of, key), 0);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+/** The namespace of the binding whose token the stand-in for its pods was last sent. */
+const reachedNamespace = (sent: readonly IncomingHttpHeaders[]): string | undefined =>
+  verifyToken(bindingKey, String(sent.at(-1)?.authorization).slice("Bearer ".length), Date.now())?.namespace;
+
+test("environments sharing a key each reach their own binding of it, whichever binds first, their requests interleaved, as a branch's forks of main's sessions keep their ids", async () => {
+  const [main, branch] = [await pool(), await pool()];
+  await freePods(main, 2);
+  await freePods(branch, 2);
+  const stand = await pods();
+  const served = await front(main, stand.port, { elsewhere: { branch } });
+  try {
+    const key = "sessionfs:inherited";
+    const ask = async (environment: string) => {
+      const response = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key, Date.now() + 60_000, { environment }) }, body: "{}" });
+      assert.equal(response.status, 200, environment);
+      return reachedNamespace(stand.sent);
+    };
+    // The branch first, then main, then each again, in turn.
+    for (const environment of ["branch", "main", "branch", "main", "main", "branch"]) {
+      assert.equal(await ask(environment), environment === "main" ? main.namespace : branch.namespace, environment);
+    }
+    // Each binding of its own, each stamped active by its own requests.
+    for (const each of [main, branch]) {
+      const lease = await run(readLease(each, key));
+      assert.ok(lease?.spec?.holderIdentity && activeAt(lease) !== null, each.namespace);
+    }
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a caller whose placement refuses its key is refused, though the front knows another environment's route to it", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  const served = await front(of, stand.port);
+  try {
+    const key = "folder:codex:telegram:1001";
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key, Date.now() + 60_000, { environment: "main" }) }, body: "{}" })).status, 200);
+    const sent = stand.sent.length;
+    // As a branch's harness would ask of main's folder: placed nowhere for it, so refused, by any request.
+    for (const [method, path] of [["POST", "/mcp"], ["GET", "/status"]] as const) {
+      const refused = await fetch(`http://127.0.0.1:${served.port}${path}`, { method, headers: { authorization: caller(key, Date.now() + 60_000, { environment: "nowhere" }) }, ...(method === "POST" ? { body: "{}" } : {}) });
+      assert.equal(refused.status, 403, `${method} ${path}`);
+    }
+    assert.equal(stand.sent.length, sent);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("an environment's release lets go of its own binding of a key alone, another's of it bound and reached still", async () => {
+  const [main, branch] = [await pool(), await pool()];
+  await freePods(main, 1);
+  await freePods(branch, 1);
+  const stand = await pods();
+  const served = await front(main, stand.port, { elsewhere: { branch } });
+  try {
+    const key = "sessionfs:shared";
+    const as = (environment: string) => ({ authorization: caller(key, Date.now() + 60_000, { environment }) });
+    for (const environment of ["main", "branch"]) assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: as(environment), body: "{}" })).status, 200);
+    const held = await run(readLease(main, key));
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/release`, { method: "POST", headers: as("branch") })).status, 204);
+    assert.equal(await run(readLease(branch, key)), null);
+    assert.equal((await run(readLease(main, key)))?.metadata?.uid, held?.metadata?.uid);
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: as("main"), body: "{}" })).status, 200);
+    assert.equal(reachedNamespace(stand.sent), main.namespace);
   } finally {
     await served.close();
     stand.close();

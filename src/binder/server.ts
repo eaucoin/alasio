@@ -30,7 +30,10 @@
  *
  * A token that is no caller's, or has stopped, is answered 401. The gateway that serves on
  * it says which pool each key is bound in, and how its pod is made where it makes its own
- * (`poolOf`).
+ * (`poolOf`), as each request's token is asked first: what the front keeps of a binding, its
+ * route, its stamps and its requests under way, is by its pool and key, never its key alone,
+ * as environments share keys (a branch's forks of main's sessions keep their ids), each
+ * binding its own.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -128,10 +131,10 @@ export interface BinderServerOptions {
   readonly routeHeld?: (key: string, binding: string, namespace: string) => Effect.Effect<Held>;
 }
 
-/** A listening front: its port, and how many requests of each key it is passing on now. */
+/** A listening front: its port, and how many requests of each key of each pool it is passing on now. */
 export interface BinderServer {
   readonly port: number;
-  readonly inFlight: (key: string) => number;
+  readonly inFlight: (pool: Pool, key: string) => number;
 }
 
 const answer = (outgoing: ServerResponse, status: number, body?: unknown, headers: Record<string, string> = {}): void => {
@@ -162,30 +165,37 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
   const binder = yield* Binder;
   const kube = yield* KubeClient;
   const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
+  // What the front knows of each binding, by its pool's namespace and its key, never the key
+  // alone: environments share keys (a branch's sessions are forks of main's, under their ids),
+  // and each binds its own, which a caller of one never reaches by another's.
   const routes = new Map<string, Route & { readonly pool: Pool; readonly binding: string }>();
   const flights = new Map<string, number>();
   const stamped = new Map<string, number>();
+  /** The key of `key`, as `pool` binds it, in what the front keeps: a namespace has no slash. */
+  const slot = (pool: Pool, key: string): string => `${pool.namespace}/${key}`;
 
-  /** Stamps `key`'s Lease with a request now, at most every ACTIVE_STAMP_MS from this replica, so whatever releases it sees it active. */
+  /** Stamps `key`'s Lease in `pool` with a request now, at most every ACTIVE_STAMP_MS from this replica, so whatever releases it sees it active. */
   const active = (key: string, pool: Pool): Effect.Effect<void> =>
     Effect.gen(function*() {
       const now = yield* Clock.currentTimeMillis;
-      if (now - (stamped.get(key) ?? 0) < ACTIVE_STAMP_MS) return;
-      stamped.set(key, now);
+      if (now - (stamped.get(slot(pool, key)) ?? 0) < ACTIVE_STAMP_MS) return;
+      stamped.set(slot(pool, key), now);
       yield* Effect.provideService(touchLease(pool, key, now), KubeClient, kube).pipe(Effect.catch((error) => Effect.logDebug(`stamping ${key}'s binding active failed: ${error.message}`)));
     });
 
   /**
-   * The route to `key`'s pod: the one known, or its pod bound now, with `options`; or, where
-   * it is to bind nothing (`unbound`), its pod as its binding is now, null where none serves.
+   * The route to `key`'s pod, where `options` place it, as they are asked first, so a caller
+   * is refused what they refuse, and reaches no route of another pool's: the one known, but
+   * where it is to be asked `anew`, or its pod bound now; or, where it is to bind nothing
+   * (`unbound`), its pod as its binding is now, null where none serves.
    */
-  const routeOf = (key: string, options: Readonly<Record<string, string>>, unbound: boolean): Effect.Effect<(Route & { readonly pool: Pool }) | null, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused | PlacementHeld> =>
+  const routeOf = (key: string, options: Readonly<Record<string, string>>, { unbound, anew }: { readonly unbound: boolean; readonly anew: boolean }): Effect.Effect<(Route & { readonly pool: Pool }) | null, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused | PlacementHeld> =>
     Effect.gen(function*() {
-      const known = routes.get(key);
+      const { pool, held, settled, ...placed } = yield* poolOf(key, options);
+      const known = anew ? undefined : routes.get(slot(pool, key));
       // One whose binding is gone, as its watch says, is bound anew; one not yet known of is used as it is.
       if (known && (!routeHeld || (yield* routeHeld(key, known.binding, known.pool.namespace)) !== "gone")) return known;
-      routes.delete(key);
-      const { pool, held, settled, ...placed } = yield* poolOf(key, options);
+      routes.delete(slot(pool, key));
       if (!unbound && held) {
         const reason = yield* held;
         if (reason !== null) return yield* new PlacementHeld({ reason });
@@ -196,7 +206,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       );
       if (!bound) return null;
       const route = { address: bound.address, port: podPort, token: bindingToken(bindingKey, { key, binding: bound.binding, namespace: pool.namespace }), pool, binding: bound.binding };
-      routes.set(key, route);
+      routes.set(slot(pool, key), route);
       return route;
     });
 
@@ -238,8 +248,8 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       }
       if (incoming.method === "POST" && url === "/release") {
         incoming.resume();
-        routes.delete(key);
         const released = yield* poolOf(key, claims.options ?? {}).pipe(
+          Effect.tap(({ pool }) => Effect.sync(() => routes.delete(slot(pool, key)))),
           Effect.flatMap(({ pool, release }) => binder.release(pool, key, release)),
           Effect.result,
         );
@@ -253,8 +263,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       // A bind asked ahead, and a request that binds nothing, asks how the key is bound now, not
       // the route this front last knew, which a release by another, as an idle or broken binding's,
       // leaves behind.
-      if (unbound || (incoming.method === "POST" && url === "/bind")) routes.delete(key);
-      const routed = yield* routeOf(key, claims.options ?? {}, unbound).pipe(Effect.result);
+      const routed = yield* routeOf(key, claims.options ?? {}, { unbound, anew: unbound || (incoming.method === "POST" && url === "/bind") }).pipe(Effect.result);
       if (routed._tag === "Failure") {
         if (routed.failure._tag === "PlacementRefused") return answer(outgoing, 403, { error: routed.failure.message });
         // Held, it is bound again only as its caller asks: no Retry-After.
@@ -272,12 +281,13 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         return answer(outgoing, 204);
       }
       yield* active(key, route.pool);
-      flights.set(key, (flights.get(key) ?? 0) + 1);
+      const flight = slot(route.pool, key);
+      flights.set(flight, (flights.get(flight) ?? 0) + 1);
       const proxied = yield* Effect.promise(() => proxy(incoming, outgoing, route)).pipe(
-        Effect.ensuring(Effect.sync(() => void flights.set(key, (flights.get(key) ?? 1) - 1))),
+        Effect.ensuring(Effect.sync(() => void flights.set(flight, (flights.get(flight) ?? 1) - 1))),
       );
       if (proxied.reached) return;
-      routes.delete(key);
+      routes.delete(flight);
       yield* Effect.logWarning(`the pod of ${key} was not reached: ${proxied.error}`);
       answer(outgoing, 503, { error: `the pod of ${key} was not reached` }, { "retry-after": String(RETRY_AFTER_S) });
     }).pipe(
@@ -301,6 +311,6 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
   return {
     // Listening on a TCP port, its address is an internet one.
     port: (server.address() as AddressInfo).port,
-    inFlight: (key) => flights.get(key) ?? 0,
+    inFlight: (pool, key) => flights.get(slot(pool, key)) ?? 0,
   };
 });
