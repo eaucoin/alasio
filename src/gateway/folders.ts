@@ -147,10 +147,32 @@ export const makeFolders = Effect.fnUntraced(function*(
       }
     });
 
-  /** The pod of the folder instance `key`, of `harness` and `conversation`, made with its binding's token's Secret first, which it then owns. */
+  /**
+   * Waits until no other pod of `key`, its pods' `labels`, is left: each deleted, where it is
+   * not being deleted already, and waited for, as its bayma still runs, dumping its REPL
+   * sessions to the state directory the next pod restores them from, until its grace ends.
+   */
+  const alone = (key: string, labels: Readonly<Record<string, string>>): Effect.Effect<void, KubeApiError | BindStepFailed> =>
+    Effect.gen(function*() {
+      const selector = Object.entries(labels).map(([label, value]) => `${label}=${value}`).join(",");
+      const deadline = (yield* Clock.currentTimeMillis) + GONE_WAIT_MS;
+      for (;;) {
+        const left = ((yield* kube.list("v1", "Pod", namespace, selector)) as V1Pod[]).filter((pod) => pod.metadata?.annotations?.[KEY_ANNOTATION] === key);
+        if (left.length === 0) return;
+        for (const pod of left) if (pod.metadata?.deletionTimestamp === undefined) yield* kube.remove("v1", "Pod", namespace, pod.metadata?.name ?? "").pipe(Effect.catchIf(hasStatus(404), () => Effect.void));
+        if ((yield* Clock.currentTimeMillis) >= deadline) return yield* new BindStepFailed({ reason: `the folder instance's pod before, ${left.map((pod) => pod.metadata?.name).join(", ")}, was not gone within ${GONE_WAIT_MS / 1000} s` });
+        yield* Effect.sleep(1_000);
+      }
+    });
+
+  /**
+   * The pod of the folder instance `key`, of `harness` and `conversation`, made once no pod of
+   * it before is left (alone), with its binding's token's Secret first, which it then owns.
+   */
   const make = (key: string, harness: string, conversation: string) =>
   (labels: Readonly<Record<string, string>>, annotations: Readonly<Record<string, string>>, binding: string): Effect.Effect<V1Pod, KubeApiError | BindStepFailed> =>
     Effect.gen(function*() {
+      yield* alone(key, labels);
       const name = folderPodName(key, randomBytes(4).readUInt32BE().toString(36).padStart(5, "0").slice(-5));
       const secret: V1Secret = {
         apiVersion: "v1",
@@ -167,10 +189,10 @@ export const makeFolders = Effect.fnUntraced(function*(
         metadata: { name, namespace, labels: { ...template.metadata?.labels, ...labels }, annotations: { ...template.metadata?.annotations, ...annotations } },
         spec,
       }).pipe(Effect.tapError(() => kube.remove("v1", "Secret", namespace, folderTokenSecret(name)).pipe(Effect.ignore)));
-      // Owned by its pod, so it goes as the pod goes.
+      // Owned by its pod, so it goes as the pod goes; where it cannot be, both deleted, as nothing would delete it after.
       yield* kube.patch("v1", "Secret", namespace, folderTokenSecret(name), {
         metadata: { ownerReferences: [{ apiVersion: "v1", kind: "Pod", name, uid: pod.metadata?.uid ?? "", blockOwnerDeletion: false, controller: false }] },
-      });
+      }).pipe(Effect.tapError(() => Effect.andThen(kube.remove("v1", "Pod", namespace, name).pipe(Effect.ignore), kube.remove("v1", "Secret", namespace, folderTokenSecret(name)).pipe(Effect.ignore))));
       yield* Effect.logInfo(`made the folder instance ${name} of ${key}, on the state directory ${folderStateDir(stateRoot, harness, conversation)}`);
       return pod;
     });

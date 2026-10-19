@@ -10,11 +10,11 @@ import { Effect, Layer, Scope } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
 import { readLease } from "../src/binder/bindings.ts";
-import { BINDING_LABEL, keyHash } from "../src/binder/names.ts";
+import { BINDING_LABEL, KEY_ANNOTATION, keyHash } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
 import { makeFolders } from "../src/gateway/folders.ts";
 import { FOLDER_POOL, FOLDER_STOP_SECONDS, folderKey, folderTokenSecret } from "../src/gateway/names.ts";
-import { KubeClient } from "../src/kube/client.ts";
+import { KubeApiError, KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
 
 // The gateway's folder instances on a real API server: each bound to a pod the gateway makes
@@ -50,14 +50,17 @@ async function bayma(): Promise<{ port: number; status: { execsRunning: number; 
 let namespaces = 0;
 
 /** The gateway's folder instances in a namespace of the test's own, their bayma the stand-in's, idle ones kept `releaseAfterMs`. */
-async function foldersOf(port: number, releaseAfterMs = 60_000, startMs = 10_000, pullMs = 3_000) {
+async function foldersOf(port: number, releaseAfterMs = 60_000, startMs = 10_000, pullMs = 3_000, refusingSecretPatches = false) {
   const namespace = `folders-${(namespaces += 1)}`;
+  const kubeLayer = refusingSecretPatches
+    ? Layer.effect(KubeClient, Effect.map(KubeClient, (kube) => KubeClient.of({ ...kube, patch: (apiVersion, kind, ...rest) => (kind === "Secret" ? Effect.fail(new KubeApiError({ status: 500, cause: "refused" })) : kube.patch(apiVersion, kind, ...rest)) }))).pipe(Layer.provide(Layer.fresh(KubeClient.layer)))
+    : Layer.fresh(KubeClient.layer);
   await run(withKube((kube) => kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: namespace } })));
   return Effect.runPromise(Effect.provide(Effect.gen(function*() {
     const binder = yield* Binder;
     const folders = yield* makeFolders({ namespace, template: TEMPLATE, stateRoot: "/home/operator/.alasio/bayma", releaseAfterMs, main: "main", podPort: port, bindingKey, idlePollMs: 50, startMs, pullMs }, binder);
     return { namespace, binder, folders };
-  }).pipe(Scope.provide(Scope.makeUnsafe())), Layer.provideMerge(Binder.layer({ waitMs: 10_000 }), Layer.fresh(KubeClient.layer))));
+  }).pipe(Scope.provide(Scope.makeUnsafe())), Layer.provideMerge(Binder.layer({ waitMs: 10_000 }), kubeLayer)));
 }
 
 /** Binds `key` as the gateway's front does, its pod run, as kubelet would run it, and ready. */
@@ -114,6 +117,55 @@ test("a folder instance is a pod the gateway makes at its bind, of the template,
     assert.deepEqual(secret.metadata?.ownerReferences?.map(({ kind, name: owner, uid }) => ({ kind, owner, uid })), [{ kind: "Pod", owner: name, uid: pod.metadata?.uid }]);
     // Bound again: the same pod.
     assert.equal((await Effect.runPromise(of.binder.bound({ name: FOLDER_POOL, namespace: of.namespace }, key)))?.pod, name);
+  } finally {
+    stand.close();
+  }
+});
+
+test("a folder instance's bind makes its pod only once the pod of it before is gone, as that one's bayma still dumps its REPL sessions", async () => {
+  const stand = await bayma();
+  try {
+    const of = await foldersOf(stand.port);
+    const key = folderKey("claude", "telegram:43");
+    const labels = { "alasio.dev/pool": FOLDER_POOL, [BINDING_LABEL]: keyHash(key) };
+    const pods = async () => ((await run(withKube((kube) => kube.list("v1", "Pod", of.namespace, `${BINDING_LABEL}=${keyHash(key)}`)))) as V1Pod[]).map((pod) => pod.metadata?.name);
+    // The pod before, being deleted, held as its kubelet holds it while its bayma stops.
+    await run(withKube((kube) =>
+      kube.create({ apiVersion: "v1", kind: "Pod", metadata: { name: "bayma-before", namespace: of.namespace, labels, annotations: { [KEY_ANNOTATION]: key }, finalizers: ["alasio.dev/test"] }, spec: { containers: [{ name: "bayma", image: "bayma" }] } })
+    ));
+    await run(withKube((kube) => kube.remove("v1", "Pod", of.namespace, "bayma-before")));
+    const placement = await Effect.runPromise(of.folders.place(key, { environment: "main" }));
+    const binding = Effect.runPromise(Effect.result(of.binder.bind(placement.pool, key, placement)));
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    assert.deepEqual(await pods(), ["bayma-before"]);
+    await run(withKube((kube) => kube.patch("v1", "Pod", of.namespace, "bayma-before", { metadata: { finalizers: null } })));
+    for (let tries = 0; (await pods()).length !== 1 || (await pods())[0] === "bayma-before"; tries += 1) {
+      assert.ok(tries < 100, `no pod made after the one before was gone: ${(await pods()).join(", ")}`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const [made = ""] = await pods();
+    await run(withKube((kube) =>
+      kube.patchPodStatus(of.namespace, made, {
+        status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], conditions: [{ type: "Ready", status: "True" }], containerStatuses: [{ name: "bayma", image: "bayma", imageID: "", ready: true, restartCount: 0, containerID: "containerd://c-0", state: { running: {} } }] },
+      })
+    ));
+    const done = await binding;
+    assert.equal(done._tag === "Success" ? done.success.pod : String(done.failure), made);
+  } finally {
+    stand.close();
+  }
+});
+
+test("a folder instance's pod whose token's Secret it cannot own is deleted with it, as nothing would delete the Secret after", async () => {
+  const stand = await bayma();
+  try {
+    const of = await foldersOf(stand.port, 60_000, 10_000, 3_000, true);
+    const key = folderKey("claude", "telegram:44");
+    const placement = await Effect.runPromise(of.folders.place(key, { environment: "main" }));
+    const failed = await Effect.runPromise(Effect.flip(of.binder.bind(placement.pool, key, placement)));
+    assert.equal(failed._tag, "KubeApiError");
+    const left = async (kind: string) => ((await run(withKube((kube) => kube.list("v1", kind, of.namespace, "")))) as V1Pod[]).map(({ metadata }) => metadata?.name);
+    assert.deepEqual([await left("Pod"), await left("Secret")], [[], []]);
   } finally {
     stand.close();
   }
