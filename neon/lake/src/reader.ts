@@ -10,9 +10,8 @@
  * which runs for at most QUERY_TIMEOUT_MS and returns at most MAX_ROWS rows.
  */
 import { type DuckDBConnection, type DuckDBResultReader, type DuckDBType, DuckDBTypeId, type Json } from "@duckdb/node-api";
-import type pg from "pg";
 
-import { type LakeAccess, READER_ROLE } from "./config.ts";
+import type { LakeAccess } from "./config.ts";
 import { type Lake, LAKE, literal, openLake } from "./lake.ts";
 
 /** The most rows a query returns: more than a panel shows, or a terminal. */
@@ -25,17 +24,6 @@ export class QueryRefused extends Error {}
 
 /** A row as the reader answers it: its columns' values as JSON. */
 export type AnsweredRow = Record<string, Json>;
-
-/**
- * Lets the reader's role read the catalog, as the lake's role, which owns it: its
- * schema, every table in it, and every table it makes from now on, as DuckLake makes
- * one for each table's inlined rows. Idempotent.
- */
-export async function grantReads(catalog: pg.ClientBase): Promise<void> {
-  await catalog.query(`grant usage on schema ducklake to ${READER_ROLE}`);
-  await catalog.query(`grant select on all tables in schema ducklake to ${READER_ROLE}`);
-  await catalog.query(`alter default privileges in schema ducklake grant select on tables to ${READER_ROLE}`);
-}
 
 /**
  * Opens the lake for reading, as its reader: read-only, its tables named as from inside

@@ -24,7 +24,7 @@ import { type EndpointConfig, type LakeConfig, loadConfig, loadEndpointConfig, l
 import { startEndpoint } from "../neon/lake/src/endpoint.ts";
 import { EXTENSIONS } from "../neon/lake/src/extensions.ts";
 import { BATCH, DUCKDB_MEMORY, type IntakeSource, type LogRecord, type PartitionAt, REREAD_SKEW_MS, startIntake, unreachable } from "../neon/lake/src/intake.ts";
-import { conninfo, LAKE, type Lake, openLake, type Row, rows, takeLoaderLock, transaction, writeLock, WriteLockLost } from "../neon/lake/src/lake.ts";
+import { conninfo, grantReads, LAKE, type Lake, openLake, type Row, rows, takeLoaderLock, transaction, writeLock, WriteLockLost } from "../neon/lake/src/lake.ts";
 import { gathering, type Read } from "../neon/lake/src/log.ts";
 import { furthestWrite, type LoaderLake, type Log, lsnValue, openLoaderLake, readUpTo, sourceReplayed, startLoader, type WakeRecord, type WakeSource } from "../neon/lake/src/loader.ts";
 import { type PassOptions, runPass } from "../neon/lake/src/maintain.ts";
@@ -33,7 +33,7 @@ import { lakeModelVersion, MODEL_VERSION, ROW_GROUP_ROWS } from "../neon/lake/sr
 import { askReread, ensureOtel, type Held, LakeSetBack, mergeTelemetry, type Position, readAgainFrom, rereadGaps, rereadsAsked, type TelemetryRows, telemetryRows, telemetryTime, writeConsumed } from "../neon/lake/src/otel.ts";
 import { encodeRequest, type LogsRequest, type MetricsRequest, PART_ITEMS, REQUEST_ROW_BYTES, requestParts, requestRowBytes } from "../neon/lake/src/otlp.ts";
 import { format } from "../neon/lake/src/query.ts";
-import { answer, grantReads, openReader } from "../neon/lake/src/reader.ts";
+import { answer, openReader } from "../neon/lake/src/reader.ts";
 import { readable, StoreUndecided, stored } from "../neon/lake/src/reconcile.ts";
 import { type LakeSyncOptions, maintainLake, prepareLake, syncLake } from "../neon/lake/src/sync.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../src/codex/rollouts/store.ts";
@@ -112,15 +112,8 @@ before(async () => {
   const env = { LAKE_DATABASE_HOST: url.hostname, LAKE_DATABASE_PORT: url.port, LAKE_DATA_PATH: `${dataDir}/` };
   config = loadConfig({ ...env, ...LOADER_LOG, LAKE_DATABASE_PASSWORD: LAKE_PASSWORD });
   readerConfig = loadEndpointConfig({ ...env, LAKE_READER_PASSWORD: READER_PASSWORD, LAKE_QUERY_TOKEN: QUERY_TOKEN });
-  // As the intake does as it opens the lake (neon/lake/src/service.ts): the first open makes the catalog.
+  // As a writer opens the lake: the first open makes the catalog, which it lets the reader read.
   (await openLake(config)).close();
-  const catalog = new pg.Client({ ...config.catalog });
-  await catalog.connect();
-  try {
-    await grantReads(catalog);
-  } finally {
-    await catalog.end();
-  }
 });
 
 after(async () => {
@@ -3196,6 +3189,56 @@ describe("the lake's reader", () => {
       assert.deepEqual(await answer(reader.db, block.replaceAll(`\n${indent}  `, "\n").trim()), [{ failed: 1 }]);
     } finally {
       reader.close();
+    }
+  });
+
+  test("a writer lets the reader read every table it will make before every table there is, so that one made meanwhile is granted either way", async () => {
+    const asked: string[] = [];
+    await grantReads({ query: async (sql: string) => void asked.push(sql) } as unknown as pg.ClientBase);
+    const by = (start: string) => asked.findIndex((sql) => sql.startsWith(start));
+    assert.ok(by("grant usage on schema ducklake") === 0, asked.join("\n"));
+    assert.ok(by("alter default privileges in schema ducklake grant select") < by("grant select on all tables in schema ducklake"), asked.join("\n"));
+  });
+
+  test("a table a writer makes once the reader has the lake open, its rows inlined in the catalog, is the reader's to read, whichever writer opened the lake first", async (t) => {
+    // A catalog of its own, as alasio makes the lake's (src/neon/lake.ts): no writer has let the reader read it yet.
+    const database = "lake_later";
+    const server = new pg.Client({ connectionString: postgres?.url });
+    await server.connect();
+    try {
+      await server.query(`create database ${database}`);
+      await server.query(`revoke all on database ${database} from public`);
+      await server.query(`grant connect, create, temporary on database ${database} to ${LAKE_ROLE}`);
+      await server.query(`grant connect on database ${database} to ${LAKE_READER_ROLE}`);
+    } finally {
+      await server.end();
+    }
+    const data = mkdtempSync(join(tmpdir(), "alasio-lake-later-"));
+    t.after(() => rmSync(data, { recursive: true, force: true }));
+    const writing: LakeConfig = { ...config, catalog: { ...config.catalog, database }, dataPath: `${data}/` };
+    const reading: EndpointConfig = { ...readerConfig, catalog: { ...readerConfig.catalog, database }, dataPath: `${data}/` };
+    const writer = await openLake(writing);
+    try {
+      const reader = await openReader(reading);
+      try {
+        // Made and written once the reader has the lake open, its few rows inlined in a table of the catalog's DuckLake makes for them.
+        await writer.db.run(`create table ${LAKE}.later (x integer)`);
+        await writer.db.run(`call ${LAKE}.set_option('data_inlining_row_limit', 1000, table_name => 'later')`);
+        await writer.db.run(`insert into ${LAKE}.later values (1), (2), (3)`);
+        const catalog = new pg.Client({ ...writing.catalog });
+        await catalog.connect();
+        try {
+          const inlined = await catalog.query("select tablename from pg_tables where schemaname = 'ducklake' and tablename like 'ducklake_inlined_data_%'");
+          assert.ok(inlined.rows.length > 0, "DuckLake inlined no rows in the catalog");
+        } finally {
+          await catalog.end();
+        }
+        assert.deepEqual(await answer(reader.db, "select count(*) as n from later"), [{ n: 3 }]);
+      } finally {
+        reader.close();
+      }
+    } finally {
+      writer.close();
     }
   });
 

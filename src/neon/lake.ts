@@ -59,7 +59,7 @@ export const LAKE_READER_LIMITS = { statement_timeout: "25s", lock_timeout: "5s"
  * Makes the lake's reader's role, a login that is a member of no other role, its password
  * stored as `verifier`, which may connect to the catalog's database and nothing more,
  * within LAKE_READER_LIMITS there: the lake's role, which owns the catalog, lets it read
- * that (neon/lake/src/reader.ts's grantReads). Idempotent; after ensureLakeRole, which
+ * that (neon/lake/src/lake.ts's grantReads). Idempotent; after ensureLakeRole, which
  * makes the database.
  */
 export async function ensureLakeReaderRole(pool: Pool, verifier: string): Promise<void> {

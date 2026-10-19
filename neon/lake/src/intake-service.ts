@@ -10,15 +10,12 @@
 import { createServer } from "node:http";
 import { hostname } from "node:os";
 
-import pg from "pg";
-
 import { loadIntakeConfig } from "./config.ts";
 import { DUCKDB_MEMORY, type IntakeLake, startIntake, TOPICS } from "./intake.ts";
-import { CONNECT_TIMEOUT_MS, type Lake, openLake, writeLock } from "./lake.ts";
+import { type Lake, openLake, writeLock } from "./lake.ts";
 import { joinLog } from "./log.ts";
 import { createMetrics, sampleMemory } from "./metrics.ts";
 import { ensureOtel } from "./otel.ts";
-import { grantReads } from "./reader.ts";
 import { startTelemetry } from "./telemetry.ts";
 
 /** The consumer group every replica is a member of. */
@@ -35,22 +32,14 @@ writeLock(config.catalog);
 
 const opened: Record<"intake", Lake | null> = { intake: null };
 
-/**
- * Opens the lake for the intake: the telemetry's schema made ready, and the catalog,
- * which the first open of all makes, readable by the query endpoint's reader.
- */
+/** Opens the lake for the intake, the telemetry's schema made ready. */
 async function open(): Promise<IntakeLake> {
   const lake = await openLake(config, { memoryLimit: DUCKDB_MEMORY });
-  const catalog = new pg.Client({ ...config.catalog, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
   try {
     await ensureOtel(lake.db);
-    await catalog.connect();
-    await grantReads(catalog);
   } catch (error) {
     lake.close();
     throw error;
-  } finally {
-    await catalog.end().catch(() => {});
   }
   opened.intake = lake;
   return {

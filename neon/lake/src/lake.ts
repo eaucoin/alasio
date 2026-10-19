@@ -11,7 +11,8 @@
  * run out), so every write to the lake is made through `transaction`, one at a time in a
  * process and, once `writeLock` is set, under a Postgres advisory lock of the catalog's
  * across processes, committed only while that is held, so none ever races another. The
- * query endpoint opens it read-only, in a process of its own (./endpoint.ts).
+ * query endpoint opens it read-only, in a process of its own (./endpoint.ts), as the
+ * reader's role, which each writer lets read the catalog as it opens it (grantReads).
  */
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,7 +21,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { type DuckDBConnection, DuckDBInstance, type DuckDBValue, type JS } from "@duckdb/node-api";
 import pg from "pg";
 
-import type { DatabaseConfig, LakeAccess, SourceConfig } from "./config.ts";
+import { type DatabaseConfig, type LakeAccess, READER_ROLE, type SourceConfig } from "./config.ts";
 import { EXTENSIONS } from "./extensions.ts";
 
 /** The names the lake and its source are attached under. */
@@ -64,9 +65,24 @@ export function conninfo(database: string, options = ""): string {
 }
 
 /**
+ * Lets the reader's role read the catalog, as the lake's role, which owns it: its schema,
+ * every table it makes from now on, as DuckLake makes one for each table's inlined rows
+ * whenever a table's rows are first inlined or its columns change, and every table in it
+ * now, in that order, so that a table a writer makes as this runs is either granted with
+ * the rest or made under the default. Idempotent.
+ */
+export async function grantReads(catalog: pg.ClientBase): Promise<void> {
+  await catalog.query(`grant usage on schema ducklake to ${READER_ROLE}`);
+  await catalog.query(`alter default privileges in schema ducklake grant select on tables to ${READER_ROLE}`);
+  await catalog.query(`grant select on all tables in schema ducklake to ${READER_ROLE}`);
+}
+
+/**
  * Opens the lake. `readOnly` attaches it read-only, for queries; `source` also
  * attaches alasio's database of that name read-only, for loading; `memoryLimit` replaces the
- * configuration's. Returns `{ db, memory, close }`, `db` a DuckDB connection.
+ * configuration's. Returns `{ db, memory, close }`, `db` a DuckDB connection. A writer's open
+ * lets the reader's role read the catalog (grantReads) before it writes anything: each table a
+ * writer makes is then the reader's to read, whichever writer opened the lake first.
  */
 export async function openLake(config: LakeAccess, { readOnly = false, source, memoryLimit = config.memoryLimit }: OpenLakeOptions = {}): Promise<Lake> {
   const options: Record<string, string> = {
@@ -115,6 +131,15 @@ export async function openLake(config: LakeAccess, { readOnly = false, source, m
           (data_path ${literal(config.dataPath)}, metadata_schema 'ducklake'${readOnly ? ", read_only" : ""})`,
       )
     );
+    if (!readOnly) {
+      const catalog = new pg.Client({ ...config.catalog, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
+      await catalog.connect();
+      try {
+        await grantReads(catalog);
+      } finally {
+        await catalog.end().catch(() => {});
+      }
+    }
     return { db, memory, close };
   } catch (error) {
     close();
