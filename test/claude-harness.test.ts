@@ -1238,9 +1238,40 @@ test("a turn whose folder's bayma did not start runs without it, told so before 
   assert.deepEqual(Object.keys(cli.state.options[1]?.mcpServers ?? {}), ["bayma"]);
   assert.equal(await run("four"), "four");
   assert.equal(cli.state.created, 2);
-  // Its folder and its chat given, so a turn's failed bind is told there.
-  assert.equal(asked.length, 3);
+  // Its folder and its chat given, so a turn's failed bind is told there; bound before every turn.
+  assert.equal(asked.length, 4);
   assert.deepEqual(asked[0], { threadKey: "telegram:1", workingDirectory: "/work", chatId: turnParams(persistence).chatId });
+  await closeAll();
+});
+
+test("a reused process's folder bayma is bound before each of its turns, and a turn whose bind fails, as one of a folder released since, runs without it, told so before its prompt, the process kept", async () => {
+  const persistence = createPersistence();
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const notice = "Folder workspace /work: its bayma did not start (its pod is pending). This turn runs without bayma's REPL tools; your REPL sessions are kept and come back when it starts.";
+  let failing = false;
+  let asked = 0;
+  const { liveSessions, closeAll } = openLiveSessions({
+    workingDirectory: "/work",
+    sessions: { sessionExists: () => Effect.succeed(true) },
+    queryFactory: cli.queryFactory,
+    folderBayma: (scope) => Effect.sync((): FolderBaymaOutcome => ((asked += 1), failing ? { server: null, notice } : { server: folderServer(scope), notice: null })),
+  }, activeTurns);
+  const run = async (prompt: string) => {
+    const turn = runTurn(liveSessions, turnParams(persistence, { prompt }));
+    const received = await cli.nextPrompt();
+    cli.emit(successResult({ result: "done", session_id: "s-1", user_message_uuids: [received.uuid] }));
+    await turn;
+    return received.message.content;
+  };
+  cli.emit(initMessage("s-1"));
+  assert.equal(await run("one"), "one");
+  // Released since, and its bind fails now.
+  failing = true;
+  assert.equal(await run("two"), `${notice}\n\ntwo`);
+  failing = false;
+  assert.equal(await run("three"), "three");
+  assert.deepEqual([asked, cli.state.created], [3, 1], "bound before each turn, the process kept");
   await closeAll();
 });
 

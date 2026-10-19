@@ -175,6 +175,8 @@ export interface ClaudeHost {
   baymaNotice: string | null;
   /** When its bayma's server was given it, with its bearer, which is good for TOKEN_TTL_MS from then. */
   baymaGivenAt: number;
+  /** Whether it was started with its folder's bayma among its MCP servers. */
+  readonly withFolderBayma: boolean;
   sessionId: string | null;
   readonly channel: PromptChannel;
   /** Aborts the process; the Agent SDK is given it to stop the process with. */
@@ -857,6 +859,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       baymaUrl: bayma?.url ?? null,
       baymaNotice: folder?.notice ?? null,
       baymaGivenAt: yield* Clock.currentTimeMillis,
+      withFolderBayma: folder?.server != null,
       sessionId: resumeSession ?? null,
       channel,
       controller,
@@ -905,24 +908,28 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     const now = yield* Clock.currentTimeMillis;
     // Its bayma's bearer, as the process was given it, about to lapse: given it anew below.
     const lapsing = reusable && now - existing.baymaGivenAt >= baymaBearerLifeMs;
-    // A folder's bayma bound as the process starts, and again before each turn of a process
-    // that started without it, which starts anew once it has it, or whose bearer is about to
-    // lapse; one released meanwhile is bound anew by the turn's first request of it, its MCP
-    // client initializing a session anew.
-    const folder = bayma || (reusable && existing.baymaNotice === null && !lapsing)
-      ? null
-      : yield* needed(folderBayma({ threadKey: params.threadKey, workingDirectory, chatId: params.chatId }));
-    // A process that has its bayma is given its server anew, its bearer fresh, the process
-    // kept: its MCP client connects to it afresh, as the Agent SDK replaces a server it is given.
-    const renewed = !reusable || !lapsing ? null : bayma ? { bayma: { type: "http" as const, url: bayma.url, headers: bayma.headers } } : existing.baymaNotice === null && folder?.server ? claudeMcpServers(folder.server) : null;
-    if (reusable && renewed) {
-      const set = yield* attempt(() => existing.sdkQuery.setMcpServers(renewed));
-      if (Object.keys(set.errors).length > 0) yield* Effect.logWarning(`giving thread=${params.threadKey} its bayma anew failed: ${JSON.stringify(set.errors)}`);
-      existing.baymaGivenAt = now;
+    // A folder's bayma bound before every turn, a process's first and those of a process
+    // reused alike, as one released since is bound anew before the turn rather than by its
+    // first tool call: one that does not start leaves the turn without it, told so before its
+    // prompt, and the chat told with its buttons (../../mcp/bayma.ts HostBayma). A process
+    // reused finds its bayma bound anew at the same address, its MCP client initializing a
+    // session anew (test/bayma-reconnect.test.ts); one that started without it starts anew once
+    // it has it.
+    const folder = bayma ? null : yield* needed(folderBayma({ threadKey: params.threadKey, workingDirectory, chatId: params.chatId }));
+    if (reusable && folder !== null && folder.server === null) {
+      existing.baymaNotice = folder.notice;
       return existing;
     }
-    if (reusable && (folder === null || folder.server === null)) {
-      if (folder) existing.baymaNotice = folder.notice;
+    if (reusable && (folder === null || existing.withFolderBayma)) {
+      existing.baymaNotice = null;
+      // Its bearer about to lapse: given its server anew, the bearer fresh, the process kept,
+      // its MCP client connecting to it afresh, as the Agent SDK replaces a server it is given.
+      const renewed = !lapsing ? null : bayma ? { bayma: { type: "http" as const, url: bayma.url, headers: bayma.headers } } : folder?.server ? claudeMcpServers(folder.server) : null;
+      if (renewed) {
+        const set = yield* attempt(() => existing.sdkQuery.setMcpServers(renewed));
+        if (Object.keys(set.errors).length > 0) yield* Effect.logWarning(`giving thread=${params.threadKey} its bayma anew failed: ${JSON.stringify(set.errors)}`);
+        existing.baymaGivenAt = now;
+      }
       return existing;
     }
     if (existing && !existing.closed) {
