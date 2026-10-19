@@ -712,11 +712,14 @@ test("a GiB read through the proxy is streamed, the agent's memory not growing w
       asked.end();
     });
     assert.equal(read, 1 << 30);
-    // What it held of the GiB at most, beside what it held before: what a stream of it at the
-    // speed of the loopback leaves for its collector, a fraction of the GiB and of the agent's
-    // limit (512 MiB), as no answer is held whole.
+    // What it held of the GiB at most, beside what it held before: the chunks streamed that its
+    // collector has yet to free, as no answer is held whole. V8 frees them as it collects, which
+    // it starts once some tens of MiB more are held outside its heap and finishes later on a
+    // loaded machine: some 100 MiB on a quiet machine, 145 MiB seen on a runner, and no more for 4 GiB than
+    // for one. A quarter of the GiB leaves that room and is far from the GiB, and within the
+    // agent's limit (512 MiB).
     const grown = memory("VmHWM") - before;
-    assert.ok(grown < 128 * 1024 ** 2, `the proxy's process grew by ${Math.round(grown / 1024 ** 2)} MiB as it streamed a GiB`);
+    assert.ok(grown < 256 * 1024 ** 2, `the proxy's process grew by ${Math.round(grown / 1024 ** 2)} MiB as it streamed a GiB`);
   } finally {
     proxied.kill();
     await bucket.close();
