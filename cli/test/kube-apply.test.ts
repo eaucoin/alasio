@@ -115,6 +115,8 @@ test("an installation is applied as alasio, in the order what runs needs it, eve
   const last = (change: string) => changes.lastIndexOf(change);
   assert.equal(changes[0], "PATCH customresourcedefinitions");
   assert.ok(last("PATCH customresourcedefinitions") < first("PATCH namespaces"));
+  // The admission policies, which hold the pods of the namespaces that admit privileged pods, before those namespaces.
+  assert.ok(first("PATCH validatingadmissionpolicies") > 0 && last("PATCH validatingadmissionpolicybindings") < first("PATCH namespaces"));
   assert.ok(last("PATCH namespaces") < first("PATCH serviceaccounts"));
   assert.ok(last("PATCH networkpolicies") < first("PATCH jobs"));
   // Where the API server reaches KEDA, with what pods run as and with; KEDA itself with the workloads.

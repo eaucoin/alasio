@@ -41,6 +41,9 @@ export const VOLUME_DRIVER_LABEL = "alasio.dev/volume-driver";
 /** The kinds alasio makes, in the order it applies them; each phase's objects are applied together. */
 const PHASES: readonly (readonly KindName[])[] = [
   ["CustomResourceDefinition"],
+  // The admission policies before the namespaces, as a sessions' or the folders' namespace
+  // admits privileged pods, which the policies alone hold to their templates.
+  ["ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"],
   ["Namespace", "PriorityClass", "StorageClass", "CSIDriver"],
   [
     "ServiceAccount",
@@ -56,8 +59,6 @@ const PHASES: readonly (readonly KindName[])[] = [
     "APIService",
     "MutatingWebhookConfiguration",
     "ValidatingWebhookConfiguration",
-    "ValidatingAdmissionPolicy",
-    "ValidatingAdmissionPolicyBinding",
   ],
   ["Job"],
   ["Deployment", "StatefulSet", "DaemonSet", "CronJob"],
