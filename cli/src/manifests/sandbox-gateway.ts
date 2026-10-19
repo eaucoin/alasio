@@ -44,13 +44,11 @@ import type {
 import { Schema } from "effect";
 
 import { freeLabels, type Pool } from "../../../src/binder/names.ts";
+import { EVENTS_BROKERS_VARIABLE, EVENTS_PASSWORD_FILE_VARIABLE, EVENTS_USERNAME_VARIABLE } from "../../../src/events/names.ts";
 import { MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
 import {
   BINDING_KEY_VARIABLE,
   CALLER_KEY_VARIABLE,
-  EVENTS_BROKERS_VARIABLE,
-  EVENTS_PASSWORD_FILE_VARIABLE,
-  EVENTS_USERNAME_VARIABLE,
   GATEWAY_CONFIG_VARIABLE,
   GatewayConfig as GatewayConfigSchema,
   type GatewayConfig,

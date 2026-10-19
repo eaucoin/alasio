@@ -1,13 +1,13 @@
 /**
  * The harness host's interface as it crosses a process (./host.ts HarnessHost): the
  * paths `alasio harness` serves it on (./serve.ts), and what each takes and answers, as
- * JSON. A call answers once, but for three that last, a line of JSON each, begun at once
+ * JSON. A call answers once, but for two that last, a line of JSON each, begun at once
  * and kept alive by a line that says nothing else (Alive) at least every KEEP_ALIVE_MS, so
  * that neither the caller's client nor a proxy between gives up on one that is quiet: a
- * turn, answered once it ends; holding a conversation (reserve), answered once it is held
- * and held until its caller lets go of it (release), or of the connection, as a caller
- * that is gone does; and the host's events, once it says it listens, for as long as the
- * caller listens. What fails is answered as the error it is, by its tag and what it
+ * turn, answered once it ends; and holding a conversation (reserve), answered once it is
+ * held and held until its caller lets go of it (release), or of the connection, as a caller
+ * that is gone does. The host's events do not cross here: it tells them as its HostEvents
+ * says (./host-events.ts), on the log. What fails is answered as the error it is, by its tag and what it
  * carries, so that the caller fails with the same error.
  */
 import { Effect, Schema } from "effect";
@@ -16,11 +16,11 @@ import { StoreError } from "../persistence/sql.ts";
 import { TurnFenced } from "../persistence/store.ts";
 import { SessionFilesystemsDisabled } from "../sandbox/index.ts";
 import { ReceivedFileError } from "../telegram/files.ts";
-import type { HostEvent, TurnStart } from "./host.ts";
+import type { TurnStart } from "./host.ts";
 import { FolderOnBranch, type HarnessUnavailable, NoWorkspaceMounted, type TurnResult, UnknownHarness } from "./index.ts";
 import { HARNESS_NAMES } from "./names.ts";
 
-/** Where each of the host's calls is served, all of them POSTs but the events'. */
+/** Where each of the host's calls is served, all of them POSTs. */
 export const HOST_PATHS = {
   reserve: "/reserve",
   release: "/release",
@@ -30,7 +30,6 @@ export const HOST_PATHS = {
   status: "/status",
   backgroundWork: "/background-work",
   freshSession: "/fresh-session",
-  events: "/events",
 } as const;
 
 /** What names the conversation a call is about, which a host serving another refuses. */
@@ -126,13 +125,6 @@ export const KEEP_ALIVE_MS = 30_000;
 
 /** A line of an answer that lasts which says only that it does, which the caller skips. */
 export const Alive = Schema.Struct({ alive: Schema.Literal(true) });
-
-/** The first line of the events' answer: the host listens for them, and each told from now on follows. */
-export const Listening = Schema.Struct({ listening: Schema.Literal(true) });
-
-/** One of the host's events, a line of the events' answer after the first. */
-export const Event = Schema.Struct({ kind: Schema.Literals(["background-response", "idle"]), conversationId: Schema.String });
-export const eventOf = (event: typeof Event.Type): HostEvent => event;
 
 /**
  * What a call failed with, as the host says it: an error of its own by its tag, with what

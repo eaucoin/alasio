@@ -10,6 +10,7 @@ import { CodexAppServer } from "../../src/codex/app-server/client.ts";
 import { Turns } from "../../src/codex/turns.ts";
 import { ActiveTurns } from "../../src/harness/active-turns.ts";
 import { HarnessHost } from "../../src/harness/host.ts";
+import { HostEvents } from "../../src/harness/host-events.ts";
 import { type Harness, Harnesses } from "../../src/harness/index.ts";
 import type { HarnessName } from "../../src/harness/names.ts";
 import { HostBayma } from "../../src/mcp/bayma.ts";
@@ -147,6 +148,7 @@ function testServices({
     Layer.provideMerge(Harnesses.layer({ overrides: harnesses, branch })),
     // Received files are written nowhere a test does not say; into a session through the test's session filesystems.
     Layer.provideMerge(ReceivedFiles.layer({ stateDir: stateDir ?? "/nonexistent-state-dir" })),
+    Layer.provideMerge(HostEvents.inProcess),
     Layer.provideMerge(Layer.mergeAll(
       ActiveTurns.layer,
       outbox,

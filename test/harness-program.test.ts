@@ -17,6 +17,7 @@ import pg from "pg";
 import { HARNESS_ROLE } from "../neon/control/secrets.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
 import { makeCodexRollouts } from "../src/codex/rollouts/index.ts";
+import { Events, type EventInput } from "../src/events/events.ts";
 import { type Harness, type TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { awaitBinding, startHarness } from "../src/harness/program.ts";
@@ -145,6 +146,9 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
     }).pipe(Effect.provideService(LakeWake, LakeWake.none)));
 
     let held: Held | null = null;
+    // What it tells, as the log would be told it.
+    const told: EventInput[] = [];
+    const telling = Events.of({ tell: (event) => Effect.sync(() => void told.push(event)) });
     // Free, of no conversation, until its binding is beside it.
     const attach = join(dir, "attach");
     mkdirSync(attach);
@@ -152,7 +156,7 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
     const starting = await inScope(startHarness(
       { bindingFile, port: 0, stateDir: stateDir!, branch: null, lakeWake: null },
       { overrides: { [CODEX_HARNESS]: answeringHarness(() => held) } },
-    ).pipe(Effect.provide(neonEnv(as(HARNESS_ROLE, "harness-password"))), Effect.forkScoped));
+    ).pipe(Effect.provide(neonEnv(as(HARNESS_ROLE, "harness-password"))), Effect.provideService(Events, telling), Effect.forkScoped));
     await new Promise((resolve) => setTimeout(resolve, 600));
     assert.equal(starting.pollUnsafe(), undefined, "a free host serves nothing");
     assert.equal(existsSync(join(home!, ROLLOUT)), false, "a free host writes back nothing");
@@ -161,7 +165,7 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
     // Its binding's directory read alone, its node's agent's to write: served, as it marks it, in a directory of its own.
     assert.deepEqual(readdirSync(attach), ["binding.json"]);
     // Its pod's binding served once: a host started again in it, as its container restarted, binds it no more.
-    const again = await Effect.runPromise(Effect.flip(Effect.scoped(startHarness({ bindingFile, port: 0, stateDir: stateDir!, branch: null, lakeWake: null }))));
+    const again = await Effect.runPromise(Effect.flip(Effect.scoped(startHarness({ bindingFile, port: 0, stateDir: stateDir!, branch: null, lakeWake: null }))).pipe(Effect.provideService(Events, telling)));
     assert.equal((again as { readonly _tag?: string })._tag, "BindingServed");
     // Bound: the conversation's session's rollout written back, whole, where Codex reads it.
     assert.equal(readFileSync(join(home!, ROLLOUT), "utf8"), ROLLOUT_TEXT);
@@ -196,10 +200,7 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
 
-    // A turn, claimed by alasio, run to its end; what its harness does on its own after it told as the host's events.
-    // Listened to until the host stops, as alasio listens, which its stop ends rather than waits on.
-    const events = linesOf(await call(HOST_PATHS.events, null));
-    assert.deepEqual(await events.next(), { listening: true });
+    // A turn, claimed by alasio, run to its end; what its harness does on its own after it told on main's events topic.
     const start = (prompt: string, epoch: number) => ({
       conversationId,
       chatId: "41",
@@ -218,7 +219,11 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
     const first = await claim("first");
     const turn = await linesOf(await call(HOST_PATHS.turns, start("first", first))).next() as { readonly answer: Readonly<Record<string, unknown>> };
     assert.deepEqual([turn.answer["blockSequence"], turn.answer["sessionId"], turn.answer["responseCompleted"]], [[{ type: "text", content: "Answered first." }], THREAD, true]);
-    assert.deepEqual([await events.next(), await events.next()], [{ kind: "background-response", conversationId }, { kind: "idle", conversationId }]);
+    const subject = { kind: "conversation", key: conversationId } as const;
+    assert.deepEqual(told, [
+      { kind: "harness.background-response", environment: "main", source: "harness", subject },
+      { kind: "harness.idle", environment: "main", source: "harness", subject },
+    ]);
     // One of a claim since overtaken fails as the store says, whole.
     const second = await claim("second");
     const fenced = new TurnFenced({ threadKey: conversationId, epoch: first });

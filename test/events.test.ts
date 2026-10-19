@@ -25,6 +25,15 @@ test("an event is written on its environment's topic, keyed by its subject, in t
   assert.deepEqual(decodeEvent(record.value), { _tag: "Known", event: value });
 });
 
+test("what a harness pool's host tells of its conversation is read as it was told", () => {
+  for (const kind of ["harness.background-response", "harness.idle"] as const) {
+    const told: EventInput = { kind, environment: "main", source: "harness", subject: { kind: "conversation", key: "telegram:41" } };
+    const record = eventRecord(told, 0);
+    assert.deepEqual([record.topic, record.key], ["events.main", "telegram:41"]);
+    assert.deepEqual(decodeEvent(record.value), { _tag: "Known", event: JSON.parse(record.value) });
+  }
+});
+
 test("a record of a higher version, of a kind not known, or not as its kind says, is skipped, saying why, and none fails", () => {
   const record = (fields: Record<string, unknown>) => JSON.stringify({ ...JSON.parse(eventRecord(lost, 0).value), ...fields });
   const skipped = (value: string) => {

@@ -33,11 +33,6 @@ export const ALASIO_GATEWAY_CALLER_KEY_VARIABLE = "ALASIO_GATEWAY_CALLER_KEY";
 /** The variable that says the gateway serves alasio's folder workspaces' instances too: "1" where it does. */
 export const ALASIO_GATEWAY_FOLDERS_VARIABLE = "ALASIO_GATEWAY_FOLDERS";
 
-/** The variables of where the gateway tells of events (../events/events.ts): the log's brokers, its principal's name, and the file of its password. */
-export const EVENTS_BROKERS_VARIABLE = "EVENTS_BROKERS";
-export const EVENTS_USERNAME_VARIABLE = "EVENTS_USERNAME";
-export const EVENTS_PASSWORD_FILE_VARIABLE = "EVENTS_PASSWORD_FILE";
-
 /** The variables of the receiver's port, and of main's sessions' namespace, beside which it takes branch environments' bindings. */
 export const RECEIVER_PORT_VARIABLE = "RECEIVER_PORT";
 export const SESSIONS_NAMESPACE_VARIABLE = "SESSIONS_NAMESPACE";

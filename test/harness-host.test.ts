@@ -20,12 +20,14 @@ import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { makeCodexHarness } from "../src/harness/codex.ts";
 import { whileHeld } from "../src/harness/holds.ts";
 import { HarnessHost, type TurnStart } from "../src/harness/host.ts";
-import { type Harness, NoWorkspaceMounted, type TurnParams, type TurnResult } from "../src/harness/index.ts";
+import { HarnessEvents, type HostEvent, HostEvents } from "../src/harness/host-events.ts";
+import { type Harness, Harnesses, NoWorkspaceMounted, type TurnParams, type TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { remoteHarnessHost } from "../src/harness/remote-host.ts";
 import { serveHost } from "../src/harness/serve.ts";
 import { noFolderBayma } from "../src/mcp/bayma.ts";
-import { TurnFenced } from "../src/persistence/store.ts";
+import { Store, TurnFenced } from "../src/persistence/store.ts";
+import { ReceivedFiles } from "../src/telegram/files.ts";
 import { holdsIn, newSchema, run, testStore } from "./support/store.ts";
 import { turnsStub, withServices } from "./support/turns.ts";
 
@@ -85,7 +87,7 @@ const REACHES: Readonly<Record<string, (host: HarnessHost["Service"], conversati
 };
 
 for (const [reach, reached] of Object.entries(REACHES)) {
-  test(`a turn started through the host ${reach} runs on its harness under the turn's claim, its job's progress recorded, what the harness does on its own told as the host's events, and what fails failing as it does`, async () => {
+  test(`a turn started through the host ${reach} runs on its harness under the turn's claim, its job's progress recorded, what the harness does on its own heard as its host tells it, and what fails failing as it does`, async () => {
     const schema = newSchema();
     const store = await testStore({ schema });
     const conversationId = await run(store.upsertConversation({ chatId: "41", user: { id: 41 } }));
@@ -113,7 +115,7 @@ for (const [reach, reached] of Object.entries(REACHES)) {
     await withServices({ store, harnesses: { [CODEX_HARNESS]: recordingHarness(seen) }, turns: turnsStub({}) }, (alasio) =>
       alasio.runPromise(Effect.scoped(Effect.gen(function*() {
         const host = yield* reached(yield* HarnessHost, conversationId);
-        const events = yield* host.events;
+        const events = yield* (yield* HarnessEvents).subscribe;
         // Held for one turn at a time, until the scope it is held in closes.
         yield* Effect.scoped(Effect.gen(function*() {
           assert.equal(yield* host.reserve(conversationId), true);
@@ -215,6 +217,25 @@ test("Codex has work of its own in a conversation as its app-server says, none w
     assert.equal(yield* working("telegram:41"), true);
   }).pipe(Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push(Arr.ensure(message).join(" ")))])))));
   assert.ok(logged.some((line) => line.includes("could not tell whether Codex works on its own in telegram:41, so it is taken to")), JSON.stringify(logged));
+});
+
+test("a host tells what its harness does on its own as the HostEvents it is given says, as a harness pool's pod tells it on the log", async () => {
+  const store = await testStore();
+  const conversationId = await run(store.upsertConversation({ chatId: "41", user: { id: 41 } }));
+  await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+  await run(store.setWorkingDirectory(conversationId, "/work"));
+  const epoch = await run(store.claimTurn({ conversationId, chatId: "41", messageId: "10", sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));
+  const told: HostEvent[] = [];
+  const telling = HostEvents.of({ tell: (event) => Effect.sync(() => void told.push(event)) });
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const host = Context.get(yield* Layer.build(HarnessHost.layer.pipe(
+      Layer.provideMerge(Harnesses.layer({ overrides: { [CODEX_HARNESS]: recordingHarness([]) } })),
+      Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: "/nonexistent-state-dir" }))),
+      Layer.provideMerge(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(HostEvents, telling))),
+    )), HarnessHost);
+    yield* host.startTurn({ conversationId, chatId: "41", messageId: "10", harness: CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null });
+  })));
+  assert.deepEqual(told, [{ kind: "background-response", conversationId }, { kind: "idle", conversationId }]);
 });
 
 test("a host elsewhere not reached says nothing of its conversation and stops nothing, failing as not reached, so that no hold is made on what it cannot say", async () => {

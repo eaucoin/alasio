@@ -10,11 +10,12 @@
  * control plane claimed the turn under, as are the claims of the turns its harness starts
  * on its own, and the progress of the prompt job it runs.
  *
- * HarnessHost.layer is the host in alasio's process, over Harnesses and ActiveTurns;
- * ./remote-host.ts is one elsewhere, an `alasio harness` (./program.ts) the control plane
+ * HarnessHost.layer is the host over Harnesses and ActiveTurns, telling its events as
+ * HostEvents does (./host-events.ts): in alasio's process, or on the log, as a harness pool's
+ * pod does; ./remote-host.ts is one elsewhere, an `alasio harness` (./program.ts) the control plane
  * reaches over HTTP (./serve.ts) as it does this one.
  */
-import { Context, Effect, Layer, Option, PubSub, type Scope } from "effect";
+import { Context, Effect, Layer, Option, type Scope } from "effect";
 
 import type { ModelChoice, Mount } from "../persistence/conversation-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
@@ -23,6 +24,7 @@ import { Store, type TurnFenced } from "../persistence/store.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { ActiveTurns, type StopReason } from "./active-turns.ts";
 import { type AttachedTurn, type Harness, type HarnessError, Harnesses, type HarnessHostError, type HarnessUnavailable, type OwnTurn, type OwnTurns, type TurnResult } from "./index.ts";
+import { HostEvents } from "./host-events.ts";
 import type { HarnessName } from "./names.ts";
 
 /** A turn for the host to run: where, on what, and as which claim of the conversation. */
@@ -46,13 +48,6 @@ export interface TurnStart {
   /** A turn already running upstream (a Codex goal's) that it attaches to instead of starting one. */
   readonly attachedTurn: AttachedTurn | null;
 }
-
-/** What a harness running on between prompts did on its own, for the control plane to act on. */
-export type HostEvent =
-  /** It has a reply of its own completed in the store, to deliver. */
-  | { readonly kind: "background-response"; readonly conversationId: string }
-  /** It let go of the conversation, which may run what waits on it. */
-  | { readonly kind: "idle"; readonly conversationId: string };
 
 /**
  * What the operator's panels reach of a mount's harness, through its host: what it is,
@@ -109,17 +104,14 @@ export class HarnessHost extends Context.Service<HarnessHost, {
   readonly startFreshSession: (params: { readonly conversationId: string; readonly harness: HarnessName; readonly workingDirectory: string }) => Effect.Effect<string, HarnessError | HarnessUnavailable>;
   /** What the panels reach of the mount's harness in its folder; none until both are mounted. */
   readonly panels: (mount: Mount) => Effect.Effect<Option.Option<HarnessPanels>, HarnessUnavailable>;
-  /** Subscribes to the host's events, for as long as the scope lasts. */
-  readonly events: Effect.Effect<PubSub.Subscription<HostEvent>, never, Scope.Scope>;
 }>()("alasio/harness/HarnessHost") {
-  /** The host in alasio's process, over its harnesses, its running turns, and the files received. */
-  static readonly layer: Layer.Layer<HarnessHost, never, Harnesses | ActiveTurns | Store | ReceivedFiles> = Layer.effect(HarnessHost, Effect.gen(function*() {
+  /** A host over its harnesses, its running turns, and the files received, telling its events as HostEvents does. */
+  static readonly layer: Layer.Layer<HarnessHost, never, Harnesses | ActiveTurns | Store | ReceivedFiles | HostEvents> = Layer.effect(HarnessHost, Effect.gen(function*() {
     const harnesses = yield* Harnesses;
     const activeTurns = yield* ActiveTurns;
     const store = yield* Store;
     const receivedFiles = yield* ReceivedFiles;
-    const events = yield* PubSub.unbounded<HostEvent>();
-    const tell = (event: HostEvent): Effect.Effect<void> => Effect.asVoid(PubSub.publish(events, event));
+    const { tell } = yield* HostEvents;
 
     /** How the conversation's harness claims it for a turn it starts on its own: as alasio's turns are claimed, ending under the epoch it claimed. */
     const ownTurnsOf = (conversationId: string, chatId: string, harness: HarnessName): OwnTurns => ({
@@ -198,7 +190,6 @@ export class HarnessHost extends Context.Service<HarnessHost, {
       startFreshSession: ({ conversationId, harness, workingDirectory }) =>
         Effect.flatMap(harnesses.getFor(harness, workingDirectory), (found) => found.startFreshSession({ threadKey: conversationId, workingDirectory })),
       panels: (mount) => harnesses.forMount(mount),
-      events: PubSub.subscribe(events),
     });
   }));
 }

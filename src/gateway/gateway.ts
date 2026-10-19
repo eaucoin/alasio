@@ -37,9 +37,6 @@ import { makeRefusalCount } from "./refusals.ts";
 import {
   BINDING_KEY_VARIABLE,
   CALLER_KEY_VARIABLE,
-  EVENTS_BROKERS_VARIABLE,
-  EVENTS_PASSWORD_FILE_VARIABLE,
-  EVENTS_USERNAME_VARIABLE,
   folderOfKey,
   GATEWAY_CONFIG_VARIABLE,
   GatewayConfig,
@@ -63,14 +60,6 @@ const loadConfig = Effect.gen(function*() {
   return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(GatewayConfig))(text);
 });
 
-/** What tells of events, on the log its variables name (./names.ts). */
-const eventsOf = Effect.gen(function*() {
-  const brokers = yield* Config.String(EVENTS_BROKERS_VARIABLE);
-  const username = yield* Config.String(EVENTS_USERNAME_VARIABLE);
-  const passwordFile = yield* Config.String(EVENTS_PASSWORD_FILE_VARIABLE);
-  return yield* Events.make({ brokers: brokers.split(","), username, passwordFile });
-});
-
 /** A key, its text, from the variable `name`. */
 const keyFrom = (name: string) => Effect.map(Config.Redacted(name), (key) => Buffer.from(Redacted.value(key)));
 
@@ -91,7 +80,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       known: (namespace) => namespace === foldersNamespace ? Effect.succeed(true) : Effect.map(environments.ofNamespace(namespace), (environment) => environment !== null),
     };
     const live = Context.get(yield* Layer.build(LiveBindings.layer({ namespaces })), LiveBindings);
-    const events = yield* eventsOf;
+    const events = yield* Events.fromEnvironment;
     const baymaTelemetry = sandboxBaymaTelemetryEnv();
     const sessions = yield* makeSessions(
       {

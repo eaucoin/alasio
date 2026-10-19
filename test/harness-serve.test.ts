@@ -7,9 +7,9 @@ import assert from "node:assert/strict";
 import { request } from "node:http";
 import { test } from "node:test";
 
-import { Effect, Exit, Option, PubSub, Scope } from "effect";
+import { Effect, Exit, Option, Scope } from "effect";
 
-import { HarnessHost, type HostEvent } from "../src/harness/host.ts";
+import { HarnessHost } from "../src/harness/host.ts";
 import type { TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { serveHost } from "../src/harness/serve.ts";
@@ -17,7 +17,7 @@ import { HOST_PATHS } from "../src/harness/wire.ts";
 
 const CONVERSATION = "telegram:41";
 
-/** A host whose turns take `turnMs`, counted in `started`, and whose reservations and events say nothing. */
+/** A host whose turns take `turnMs`, counted in `started`, and whose reservations say nothing. */
 function slowHost(turnMs: number, started: { count: number }): HarnessHost["Service"] {
   const result: TurnResult = { blockSequence: [], sessionId: "thread-1", pendingResponseId: "pending-1", interrupted: false, responseCompleted: true };
   return HarnessHost.of({
@@ -29,7 +29,6 @@ function slowHost(turnMs: number, started: { count: number }): HarnessHost["Serv
     backgroundWork: () => Effect.succeed(false),
     startFreshSession: () => Effect.succeed("thread-2"),
     panels: () => Effect.succeed(Option.none()),
-    events: Effect.flatMap(PubSub.unbounded<HostEvent>(), PubSub.subscribe),
   });
 }
 
@@ -108,16 +107,12 @@ test("a turn longer than a client waits on a quiet connection is answered, kept 
   assert.equal(quiet.gaveUp, true);
 });
 
-test("a reservation and the events, quiet for longer than a client waits, are kept alive", { timeout: 30_000 }, async () => {
+test("a reservation, quiet for longer than a client waits, is kept alive", { timeout: 30_000 }, async () => {
   await serving(slowHost(0, { count: 0 }), 100, async (port) => {
-    const [held, events] = await Promise.all([
-      called(port, HOST_PATHS.reserve, { conversationId: CONVERSATION }, 500, 1_500),
-      called(port, HOST_PATHS.events, null, 500, 1_500),
-    ]);
-    assert.deepEqual([held.gaveUp, events.gaveUp], [false, false]);
+    const held = await called(port, HOST_PATHS.reserve, { conversationId: CONVERSATION }, 500, 1_500);
+    assert.equal(held.gaveUp, false);
     assert.ok(held.lines.some((line) => (line as { readonly held?: boolean }).held === true));
-    assert.ok(events.lines.some((line) => (line as { readonly listening?: boolean }).listening === true));
-    assert.ok([held, events].every(({ lines }) => lines.filter((line) => (line as { readonly alive?: boolean }).alive === true).length >= 5));
+    assert.ok(held.lines.filter((line) => (line as { readonly alive?: boolean }).alive === true).length >= 5);
   });
 });
 

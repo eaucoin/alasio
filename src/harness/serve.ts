@@ -9,8 +9,7 @@
  * the turn does, or as the host stops; asked for again under its epoch, as a caller that
  * lost its answer asks again, it is the turn running that answers, not another. A
  * reservation lasts until its caller releases it, or lets go of the connection, as a
- * caller that is gone does; a caller's listening to the events, as long as the caller
- * holds the connection.
+ * caller that is gone does.
  */
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
@@ -138,9 +137,6 @@ export const serveHost = Effect.fnUntraced(function*(
     );
 
   const route = (method: string, path: string): Effect.Effect<HttpServerResponse.HttpServerResponse, HttpServerResponse.HttpServerResponse, HttpServerRequest.HttpServerRequest> => {
-    if (method === "GET" && path === HOST_PATHS.events) {
-      return Effect.succeed(lines(Stream.unwrap(Effect.map(host.events, (events) => Stream.concat(Stream.make<[object]>({ listening: true }), Stream.fromSubscription(events)))), keepAliveMs));
-    }
     if (method !== "POST") return Effect.fail(failed(405, { _tag: "BadRequest", message: `${method} ${path} is no call of the host's` }));
     switch (path) {
       case HOST_PATHS.reserve:
@@ -207,7 +203,7 @@ export const serveHost = Effect.fnUntraced(function*(
   const server = yield* NodeHttpServer.make(() => listening, { port, host: hostname });
   yield* server.serve(handle);
   // What it serves ends as the host stops, rather than holding its stop until each caller
-  // lets go: a listener's above all, which alasio holds for as long as it runs.
+  // lets go: a reservation's, which its caller holds for as long as its turn runs.
   yield* Effect.addFinalizer(() => Effect.sync(() => {
     listening.close();
     listening.closeAllConnections();

@@ -19,6 +19,7 @@ import { Mounts } from "../src/operator/mounts.ts";
 import { buildWorkspacePanel } from "../src/operator/workspace-control.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { HarnessHost } from "../src/harness/host.ts";
+import { HostEvents } from "../src/harness/host-events.ts";
 import { Harnesses } from "../src/harness/index.ts";
 import { Store } from "../src/persistence/store.ts";
 import { GatewayError } from "../src/sandbox/gateway-client.ts";
@@ -98,7 +99,7 @@ test("an alasio forks a session one of its conversations knows for the branch wh
       Layer.buildWithScope(Layer.mergeAll(Layer.succeed(SessionSandboxes, sandboxes), Layer.succeed(Turns, turns)).pipe(
         Layer.provideMerge(HarnessHost.layer),
         Layer.provideMerge(Harnesses.layer({})),
-        Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: "/nonexistent-state-dir" }).pipe(Layer.provideMerge(Layer.succeed(Store, store))))),
+        Layer.provideMerge(Layer.mergeAll(HostEvents.inProcess, ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: "/nonexistent-state-dir" }).pipe(Layer.provideMerge(Layer.succeed(Store, store))))),
       ), scope),
     );
     const { port } = await Effect.runPromise(Effect.provide(serveBranchForks({ port: 0, host: "127.0.0.1", keyFile }), services).pipe(Scope.provide(scope)));

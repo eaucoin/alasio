@@ -7,15 +7,13 @@
  * decides by them refuses, saying why. A call that lasts (./wire.ts) skips what says only
  * that it does.
  *
- * Its events are listened to for as long as the layer lasts, which is made once the host
- * listens, or could not be listened to; again a second after the host is lost. What the
- * host tells while it is not listened to is not told here. The operator's panels are
- * reached where the control plane says, as the host elsewhere does not serve them yet
- * (14.6).
+ * Its events are not heard here: it tells them as its HostEvents says (./host-events.ts), on
+ * the log, where the control plane hears them. The operator's panels are reached where the
+ * control plane says, as the host elsewhere does not serve them yet (14.6).
  */
-import { Deferred, Effect, Layer, Option, PubSub, Schedule, Schema, type Scope, Stream } from "effect";
+import { Effect, Layer, Option, Schema } from "effect";
 
-import { HarnessHost, type HostEvent } from "./host.ts";
+import { HarnessHost } from "./host.ts";
 import { HarnessHostError } from "./index.ts";
 import {
   Alive,
@@ -23,12 +21,10 @@ import {
   type CrossingError,
   crossingErrorOf,
   decodeTurnAnswer,
-  Event,
   Failure,
   FreshSessionAnswer,
   HOST_PATHS,
   InterruptAnswer,
-  Listening,
   ReleaseAnswer,
   Reserved,
   StatusAnswer,
@@ -44,17 +40,11 @@ export interface RemoteHostOptions {
   readonly panels: HarnessHost["Service"]["panels"];
 }
 
-/** How long the host's events wait to be listened to again, once the host is lost. */
-const LISTEN_AGAIN = "1 second";
-
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /** `body`, as `schema` reads it, or a HarnessHostError where the host answered as none of alasio's does. */
 const read = <A>(schema: Schema.ConstraintDecoder<A, never>, body: unknown): Effect.Effect<A, HarnessHostError> =>
   Schema.decodeUnknownEffect(schema)(body).pipe(Effect.mapError((error) => new HarnessHostError({ reason: `it answered as no harness host does: ${error.message}` })));
-
-/** A line of the events' answer: the host's saying it listens, or that it does still, or one of its events. */
-const EventsLine = Schema.Union([Listening, Alive, Event]);
 
 /**
  * The lines of an answer that lasts, read as they come, but those that say only that it
@@ -84,7 +74,7 @@ function linesOf(body: ReadableStream<Uint8Array>, what: string): { readonly nex
   };
 }
 
-const makeRemoteHost = Effect.fnUntraced(function*({ url, token, panels }: RemoteHostOptions): Effect.fn.Return<HarnessHost["Service"], never, Scope.Scope> {
+function makeRemoteHost({ url, token, panels }: RemoteHostOptions): HarnessHost["Service"] {
   const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 
   /** The host's answer to `path` with `body`: its status and what it said, or a HarnessHostError where it was not reached. */
@@ -121,33 +111,6 @@ const makeRemoteHost = Effect.fnUntraced(function*({ url, token, panels }: Remot
   /** `error`, if a steer may fail with it, or else as the host's not reaching it. */
   const asSteerError = (error: CrossingError | HarnessHostError) =>
     error._tag === "StoreError" || error._tag === "ReceivedFileError" || error._tag === "HarnessHostError" ? error : new HarnessHostError({ reason: error.message });
-
-  const events = yield* PubSub.unbounded<HostEvent>();
-  /** Done once the host first says it listens, or could not be listened to. */
-  const begun = yield* Deferred.make<void>();
-  const listen = Effect.gen(function*() {
-    const response = yield* Effect.tryPromise({
-      try: (signal) => fetch(`${url}${HOST_PATHS.events}`, { headers, signal }),
-      catch: (cause) => new HarnessHostError({ reason: errorText(cause) }),
-    });
-    const body = response.body;
-    if (response.status !== 200 || body === null) return yield* new HarnessHostError({ reason: `it answered ${response.status} to a listener` });
-    yield* Stream.fromReadableStream({ evaluate: () => body, onError: (cause) => new HarnessHostError({ reason: errorText(cause) }) }).pipe(
-      Stream.decodeText,
-      Stream.splitLines,
-      Stream.mapEffect((line) => Effect.flatMap(Effect.try({ try: (): unknown => JSON.parse(line), catch: (cause) => new HarnessHostError({ reason: errorText(cause) }) }), (value) => read(EventsLine, value))),
-      Stream.runForEach((said) => ("kind" in said ? PubSub.publish(events, said) : "listening" in said ? Deferred.succeed(begun, undefined) : Effect.void)),
-    );
-    return yield* new HarnessHostError({ reason: "it stopped telling its events" });
-  });
-  yield* listen.pipe(
-    Effect.tapError((error) =>
-      Effect.logWarning(`listening to the harness host's events failed, and is begun again: ${error.message}`).pipe(Effect.andThen(Deferred.succeed(begun, undefined)))
-    ),
-    Effect.retry(Schedule.spaced(LISTEN_AGAIN)),
-    Effect.forkScoped,
-  );
-  yield* Deferred.await(begun);
 
   return HarnessHost.of({
     reserve: (conversationId) =>
@@ -193,9 +156,8 @@ const makeRemoteHost = Effect.fnUntraced(function*({ url, token, panels }: Remot
         Effect.mapError((error) => (error._tag === "HarnessHostError" || error._tag === "UnknownHarness" || error._tag === "NoWorkspaceMounted" || error._tag === "SessionFilesystemsDisabled" || error._tag === "FolderOnBranch" ? error : new HarnessHostError({ reason: error.message }))),
       ),
     panels,
-    events: PubSub.subscribe(events),
   });
-});
+}
 
-/** The harness host at `url`, as the module says, for as long as the layer lasts. */
-export const remoteHarnessHost = (options: RemoteHostOptions): Layer.Layer<HarnessHost> => Layer.effect(HarnessHost, makeRemoteHost(options));
+/** The harness host at `url`, as the module says. */
+export const remoteHarnessHost = (options: RemoteHostOptions): Layer.Layer<HarnessHost> => Layer.succeed(HarnessHost, makeRemoteHost(options));

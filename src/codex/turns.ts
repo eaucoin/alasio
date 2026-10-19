@@ -12,6 +12,7 @@ import {
   harnessLabelOf,
 } from "../harness/index.ts";
 import { HarnessHost } from "../harness/host.ts";
+import { HarnessEvents } from "../harness/host-events.ts";
 import { errorsIn, type ResponseBlock } from "./event-projection.ts";
 import { finalResponseToMarkdown } from "./response-markdown.ts";
 import type { GoalTurnRequest } from "../operator/goal-control.ts";
@@ -160,7 +161,7 @@ export class Turns extends Context.Service<Turns, {
   static readonly layer = (): Layer.Layer<
     Turns,
     never,
-    Store | Outbox | Harnesses | HarnessHost
+    Store | Outbox | Harnesses | HarnessHost | HarnessEvents
   > => Layer.effect(Turns, makeTurns());
 }
 
@@ -556,7 +557,7 @@ const makeTurns = Effect.fnUntraced(function*() {
   // What a harness running on between prompts does on its own, as its host tells it: a
   // reply of its own, delivered; its letting go of the conversation, which may run what
   // waits on it.
-  const hostEvents = yield* host.events;
+  const hostEvents = yield* (yield* HarnessEvents).subscribe;
   yield* PubSub.take(hostEvents).pipe(
     Effect.flatMap((event) =>
       event.kind === "idle"

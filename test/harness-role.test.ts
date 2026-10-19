@@ -20,6 +20,7 @@ import { scramVerifier } from "../neon/control/scram.ts";
 import { CodexAppServer } from "../src/codex/app-server/client.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { HarnessHost } from "../src/harness/host.ts";
+import { HostEvents } from "../src/harness/host-events.ts";
 import { type Harness, Harnesses, type OwnTurns, type TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { Neon } from "../src/neon/connect.ts";
@@ -122,7 +123,7 @@ test("a turn run through the harness host as its own role writes all a turn writ
       // The host, on a store of the harness's role, of the state alasio made: it makes none of it.
       const services = yield* Layer.build(HarnessHost.layer.pipe(
         Layer.provideMerge(Harnesses.layer({ overrides: { [CODEX_HARNESS]: writingHarness(own) } })),
-        Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir }))),
+        Layer.provideMerge(Layer.mergeAll(HostEvents.inProcess, ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir }))),
         Layer.provideMerge(Store.layer({ pool: harnessPool, makesSchema: false })),
       ));
       const harness = { host: Context.get(services, HarnessHost), store: Context.get(services, Store) };

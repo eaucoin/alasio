@@ -1,13 +1,14 @@
 /**
- * An environment's events: what the gateways that bind for it tell its alasio of what
- * happens to what they bind, on its events topic in the log, `events.<environment>`
+ * An environment's events: what the sandbox gateway tells its alasio of what happens to what
+ * it binds for it, and what the harness hosts of its harness pools tell of what their
+ * harnesses do on their own, on its events topic in the log, `events.<environment>`
  * (eventsTopic), which its alasio reads in its group (cli/src/manifests/log.ts).
  *
  * A record's key is its subject's key, the workspace's or the conversation's, so one
  * subject's events keep their order on a partition. Its value is JSON, an envelope of
  * EVENTS_VERSION: `{ v, id, kind, at, environment, source, subject: { kind, key } }`, a
  * UUID per record so a consumer can drop one delivered twice, the time it was made (ms),
- * which gateway made it, and what its kind says beside. A consumer skips a record of a
+ * what made it, and what its kind says beside. A consumer skips a record of a
  * higher version, or of a kind it does not know, saying why, and never fails on one
  * (decodeEvent): a writer can add kinds, or move to a new version, before every reader can
  * read them.
@@ -17,16 +18,19 @@
  * - `workspace.lost`: a session's binding whose pod, or the mount it served from, went while
  *   it was bound;
  * - `workspace.released`: a session's binding let go: idle, its pod deleted, or broken;
- * - `harness.lost`, `harness.released`: likewise of a conversation's harness's binding.
+ * - `harness.lost`, `harness.released`: likewise of a conversation's harness's binding;
+ * - `harness.background-response`: a conversation's harness, running on between prompts, has
+ *   a reply of its own completed in the store, to deliver;
+ * - `harness.idle`: it let go of the conversation, which may run what waits on it.
  */
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 import { ProduceAcks, Producer } from "@platformatic/kafka";
-import { Clock, Context, Effect, Exit, Layer, Schema, type Scope } from "effect";
+import { Clock, Config, Context, Effect, Exit, Layer, Schema, type Scope } from "effect";
 
 import { withLogScope } from "../shared/log.ts";
-import { eventsTopic } from "./names.ts";
+import { EVENTS_BROKERS_VARIABLE, EVENTS_PASSWORD_FILE_VARIABLE, EVENTS_USERNAME_VARIABLE, eventsTopic } from "./names.ts";
 
 /** The envelope's version this release writes, and reads up to. */
 export const EVENTS_VERSION = 1;
@@ -34,8 +38,8 @@ export const EVENTS_VERSION = 1;
 /** What an event is about: a session's workspace, by its key, or a conversation, by its. */
 const Subject = Schema.Struct({ kind: Schema.Literals(["workspace", "conversation"]), key: Schema.String });
 
-/** The gateways that tell of events. */
-export const EVENT_SOURCES = ["sandbox-gateway", "harness-gateway"] as const;
+/** What tells of events: the sandbox gateway, of what it binds; a harness pool's host, of what its harness does on its own. */
+export const EVENT_SOURCES = ["sandbox-gateway", "harness"] as const;
 
 const envelope = {
   v: Schema.Literal(EVENTS_VERSION),
@@ -56,13 +60,15 @@ const WorkspaceLost = Schema.Struct({ ...envelope, kind: Schema.Literal("workspa
 const WorkspaceReleased = Schema.Struct({ ...envelope, kind: Schema.Literal("workspace.released"), binding: Schema.String, reason: Schema.Literals(["idle", "deleted", "broken"]) });
 const HarnessLost = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.lost"), binding: Schema.String, pod: Schema.String, reason: Schema.String });
 const HarnessReleased = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.released"), binding: Schema.String, reason: Schema.String });
+const HarnessBackgroundResponse = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.background-response") });
+const HarnessIdle = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.idle") });
 
 /** An event, of any kind this release knows. */
-export const Event = Schema.Union([WorkspaceExecEnded, WorkspaceLost, WorkspaceReleased, HarnessLost, HarnessReleased]);
+export const Event = Schema.Union([WorkspaceExecEnded, WorkspaceLost, WorkspaceReleased, HarnessLost, HarnessReleased, HarnessBackgroundResponse, HarnessIdle]);
 export type Event = typeof Event.Type;
 
 /** The kinds this release knows. */
-export const EVENT_KINDS: ReadonlySet<string> = new Set(["workspace.exec-ended", "workspace.lost", "workspace.released", "harness.lost", "harness.released"]);
+export const EVENT_KINDS: ReadonlySet<string> = new Set(Event.members.map((member) => member.fields.kind.literal));
 
 /** An event as its writer gives it: all but what each record has of its own, its version, id and time. */
 export type EventInput = Event extends infer Each ? (Each extends Event ? Omit<Each, "v" | "id" | "at"> : never) : never;
@@ -133,4 +139,12 @@ export class Events extends Context.Service<Events, {
           ),
       });
     });
+
+  /** On the log its variables name (./names.ts), as `make` is. */
+  static readonly fromEnvironment: Effect.Effect<Events["Service"], Config.ConfigError, Scope.Scope> = Effect.gen(function*() {
+    const brokers = yield* Config.String(EVENTS_BROKERS_VARIABLE);
+    const username = yield* Config.String(EVENTS_USERNAME_VARIABLE);
+    const passwordFile = yield* Config.String(EVENTS_PASSWORD_FILE_VARIABLE);
+    return yield* Events.make({ brokers: brokers.split(","), username, passwordFile });
+  });
 }

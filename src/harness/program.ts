@@ -29,7 +29,9 @@
  * it back (../harness/claude/sessions.ts sessionExists): a resume runs from the local
  * transcript, the store given it mirroring alone (G14.1 found its own load would serve
  * too). The Codex login is not kept here: one relay keeps it (14.5), as two refreshing it
- * would end it. The files a prompt names are written as each turn starts (./host.ts).
+ * would end it. The files a prompt names are written as each turn starts (./host.ts). What
+ * its harness does on its own between prompts it tells on its environment's events topic
+ * (./host-events.ts HostEvents.onLog), as Events tells them, which alasio reads.
  *
  * A session workspace's harness needs the sandbox gateway's binding of the workspace,
  * which the harness gateway brings (14.3); until then this host serves folder workspaces,
@@ -40,15 +42,18 @@ import { join } from "node:path";
 
 import { Clock, Context, Duration, Effect, Layer, Result, Schema, type Scope } from "effect";
 
+import { MAIN_ENVIRONMENT_NAME } from "../branch/names.ts";
 import { CodexAppServer } from "../codex/app-server/client.ts";
 import { codexHome } from "../codex/env.ts";
 import { CodexRollouts } from "../codex/rollouts/index.ts";
+import { Events } from "../events/events.ts";
 import { HarnessNeon } from "../neon/connect.ts";
 import { LakeWake, type WakeLog, wakeLogOf } from "../neon/lake-wake.ts";
 import { Store } from "../persistence/store.ts";
 import { ReceivedFiles } from "../telegram/files.ts";
 import { ActiveTurns } from "./active-turns.ts";
 import { HarnessHost } from "./host.ts";
+import { HostEvents } from "./host-events.ts";
 import { Harnesses, type HarnessesOptions } from "./index.ts";
 import { serveHost } from "./serve.ts";
 
@@ -161,9 +166,10 @@ export type HarnessStandIns = Pick<HarnessesOptions, "overrides" | "claudeQueryF
 
 /**
  * Waits for its binding, then binds the conversation it names, as the module says, and
- * serves its harness host until the scope closes: the port it serves on.
+ * serves its harness host until the scope closes, telling its events as Events does: the
+ * port it serves on.
  */
-export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, standIns: HarnessStandIns = {}): Effect.fn.Return<{ readonly port: number }, unknown, Scope.Scope> {
+export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, standIns: HarnessStandIns = {}): Effect.fn.Return<{ readonly port: number }, unknown, Scope.Scope | Events> {
   yield* Effect.logInfo(`free: serving once bound, as ${config.bindingFile} says`);
   const { conversationId, token } = yield* awaitBinding(config.bindingFile);
   yield* markServed(config.stateDir);
@@ -179,7 +185,7 @@ export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, s
 
   const host = yield* Layer.build(HarnessHost.layer.pipe(
     Layer.provideMerge(Harnesses.layer({ ...standIns, branch: config.branch, sessionStore: neon.sessionStore, codexRollouts })),
-    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: config.stateDir }))),
+    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: config.stateDir }), HostEvents.onLog(config.branch ?? MAIN_ENVIRONMENT_NAME))),
     Layer.provideMerge(Layer.succeedContext(stores)),
   ));
   const served = yield* Effect.provide(serveHost({ port: config.port, conversationId, token }), host);
@@ -188,4 +194,7 @@ export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, s
 });
 
 /** `alasio harness`, as ./main.ts runs it: the host, from its environment, until it is stopped. */
-export const harness: Effect.Effect<never, unknown, Scope.Scope> = Effect.suspend(() => startHarness(loadHarnessConfig())).pipe(Effect.andThen(Effect.never));
+export const harness: Effect.Effect<never, unknown, Scope.Scope> = Effect.suspend(() => startHarness(loadHarnessConfig())).pipe(
+  Effect.provideServiceEffect(Events, Events.fromEnvironment),
+  Effect.andThen(Effect.never),
+);
