@@ -203,7 +203,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
             Effect.interruptible,
           ));
         } else if (update.message) {
-          const prompt = yield* handleMessage(update.message, update.update_id).pipe(
+          const prompt = yield* handleMessage(update.message, update.update_id, marks).pipe(
             Effect.provideContext(services),
             Effect.catchTag(["TelegramApiError", "TelegramTransportError"], Effect.die),
           );

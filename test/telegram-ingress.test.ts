@@ -23,13 +23,17 @@ import { newSchema, run, testPool, testStore } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { withServices } from "./support/turns.ts";
 
+/** A message handled as an update's handling handles it, its marks the store's own. */
+const handled = (message: Message, updateId: number) => Effect.flatMap(Store, (store) => handleMessage(message, updateId, store));
+
+
 const CHAT = { id: 5, type: "private", first_name: "Operator" } as const;
 const OPERATOR = { id: 5, is_bot: false, first_name: "Operator" };
 
 /** Handles `message` from the operator, as update `updateId`, on `store` and `telegram`: the prompt it carries. */
 function handleOperatorMessage(store: Store["Service"], telegram: RecordingTelegram, message: Message, updateId: number) {
   return withServices({ store, telegram: telegram.layer, allowedUserIds: String(OPERATOR.id) }, (alasio) =>
-    alasio.runPromise(handleMessage(message, updateId)));
+    alasio.runPromise(handled(message, updateId)));
 }
 
 test("oversized documents are reported instead of failing the update", async () => {
@@ -77,7 +81,7 @@ test("a file a message carries is kept in the store, and written where its promp
   });
   try {
     await withServices({ store, telegram: telegram.layer, allowedUserIds: String(OPERATOR.id), stateDir }, async (alasio) => {
-      const prompt = await alasio.runPromise(handleMessage({
+      const prompt = await alasio.runPromise(handled({
         message_id: 12,
         date: 0,
         chat: CHAT,
@@ -118,7 +122,7 @@ test("a file sent to a conversation on a session workspace is written into its s
     const conversationId = await run(store.upsertConversation({ chatId: CHAT.id, user: OPERATOR }));
     await run(store.setWorkingDirectory(conversationId, "sessionfs:fs-abc123"));
     await withServices({ store, telegram: telegram.layer, allowedUserIds: String(OPERATOR.id), stateDir, sandbox }, async (alasio) => {
-      const prompt = await alasio.runPromise(handleMessage({ message_id: 12, date: 0, chat: CHAT, from: OPERATOR, photo: [{ file_id: "photo", file_unique_id: "photo", width: 1, height: 1 }] }, 3));
+      const prompt = await alasio.runPromise(handled({ message_id: 12, date: 0, chat: CHAT, from: OPERATOR, photo: [{ file_id: "photo", file_unique_id: "photo", width: 1, height: 1 }] }, 3));
       const [file] = prompt?.files ?? [];
       assert.ok(file);
       // Where the session's agent reads it, which its prompt names.
@@ -147,8 +151,8 @@ test("a message handled again, as an update whose handling lock was lost is, is 
   const message: Message = { message_id: 14, date: 0, chat: CHAT, from: OPERATOR, caption: "look", photo: [{ file_id: "photo", file_unique_id: "photo", width: 1, height: 1 }] };
   try {
     await withServices({ store, telegram: telegram.layer, allowedUserIds: String(OPERATOR.id), stateDir }, async (alasio) => {
-      const first = await alasio.runPromise(handleMessage(message, 4));
-      const again = await alasio.runPromise(handleMessage(message, 4));
+      const first = await alasio.runPromise(handled(message, 4));
+      const again = await alasio.runPromise(handled(message, 4));
       assert.deepEqual(again?.files.map(({ id }) => id), first?.files.map(({ id }) => id));
     });
     const count = async (table: string) => Number((await (await testPool()).query<{ n: string }>(`select count(*) as n from ${schema}.${table}`)).rows[0]?.n);
@@ -230,8 +234,8 @@ test("a message whose id one sent earlier had, as a branch's bot's has one its p
   try {
     await withServices({ store, allowedUserIds: String(OPERATOR.id), stateDir }, async (alasio) => {
       // The parent's, sent to its own bot before the branch was made; the branch's bot numbers its chat's messages from 1 again.
-      await alasio.runPromise(handleMessage({ message_id: 1, date: 1_000, chat: CHAT, from: OPERATOR, text: "hello" }, 1));
-      await alasio.runPromise(handleMessage({ message_id: 1, date: 2_000, chat: CHAT, from: OPERATOR, text: "again" }, 1));
+      await alasio.runPromise(handled({ message_id: 1, date: 1_000, chat: CHAT, from: OPERATOR, text: "hello" }, 1));
+      await alasio.runPromise(handled({ message_id: 1, date: 2_000, chat: CHAT, from: OPERATOR, text: "again" }, 1));
     });
     const { rows } = await (await testPool()).query<{ text: string }>(`select text from ${schema}.messages order by created_at`);
     assert.deepEqual(rows.map(({ text }) => text), ["hello", "again"]);

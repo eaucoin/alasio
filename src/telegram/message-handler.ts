@@ -5,7 +5,7 @@ import { harnessLabelOf } from "../harness/index.ts";
 import type { OperatorServices } from "../operator/command-handler.ts";
 import { type IncomingPrompt, processPrompt, sendNextSetupStep } from "../operator/prompts.ts";
 import type { StoreError } from "../persistence/sql.ts";
-import { Store } from "../persistence/store.ts";
+import { Store, type UpdateMarks } from "../persistence/store.ts";
 import { Authorizer } from "./authorizer.ts";
 import { TelegramClient, type TelegramError } from "./client.ts";
 import { type ReceivedFile, ReceivedFiles } from "./files.ts";
@@ -32,9 +32,10 @@ function describeDownloadFailure(file: IncomingFile, message: string): string {
  * Records a message from Telegram and keeps its files: the prompt it carries, for
  * processIncomingPrompt, or null when it carries none to process now (it was not the
  * operator's, it was /start, it carried nothing, or it is part of an album, which is
- * handled as one prompt once all of it has arrived).
+ * handled as one prompt once all of it has arrived). What it tells the chat of an album is
+ * queued with `marks`, the update's, so it is told once however often the update is handled.
  */
-export const handleMessage = Effect.fnUntraced(function*(message: Message, updateId: number): Effect.fn.Return<
+export const handleMessage = Effect.fnUntraced(function*(message: Message, updateId: number, marks: Pick<UpdateMarks, "enqueueOutboxText">): Effect.fn.Return<
   IncomingPrompt | null,
   TelegramError | StoreError,
   MessageServices
@@ -109,7 +110,7 @@ export const handleMessage = Effect.fnUntraced(function*(message: Message, updat
 
   const mediaGroupId = message.media_group_id;
   if (mediaGroupId) {
-    yield* Effect.flatMap(MediaGroups, (mediaGroups) => mediaGroups.buffer({ mediaGroupId, conversationId, updateId, chatId: message.chat.id }));
+    yield* Effect.flatMap(MediaGroups, (mediaGroups) => mediaGroups.buffer({ mediaGroupId, conversationId, updateId, chatId: message.chat.id }, marks));
     return null;
   }
 

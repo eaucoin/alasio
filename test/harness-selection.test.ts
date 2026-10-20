@@ -35,7 +35,7 @@ import {
   handleServiceTextCommand,
 } from "../src/operator/service-control.ts";
 import { harnessSessionOf } from "../src/persistence/conversation-repository.ts";
-import type { Store } from "../src/persistence/store.ts";
+import { Store } from "../src/persistence/store.ts";
 import type { SessionSandboxes } from "../src/sandbox/index.ts";
 import { takeCallbackQuery } from "../src/telegram/callback-handler.ts";
 import type { TextMessageOptions } from "../src/telegram/client.ts";
@@ -44,6 +44,10 @@ import { listWorkspaceCandidates } from "../src/workspace/policy.ts";
 import { run, testStore, writerOf } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { type TestAlasio, type TestServicesOptions, withServices } from "./support/turns.ts";
+
+/** A message handled as an update's handling handles it, its marks the store's own. */
+const handled = (message: Message, updateId: number) => Effect.flatMap(Store, (store) => handleMessage(message, updateId, store));
+
 
 /** A press taken from the store, then handled, as alasio handles one, its handling run in turn. */
 const handleCallbackQuery = (query: Parameters<typeof takeCallbackQuery>[0]) => Effect.flatten(takeCallbackQuery(query));
@@ -602,7 +606,7 @@ test("/start offers the pickers until a service and folder are mounted", async (
         from: { id: 13, is_bot: false, first_name: "Operator" },
         text: "/start",
       };
-      const handle = (messageId: number) => alasio.runPromise(handleMessage({ ...message, message_id: messageId }, messageId));
+      const handle = (messageId: number) => alasio.runPromise(handled({ ...message, message_id: messageId }, messageId));
       assert.equal(await handle(1), null, "/start is no prompt");
       assert.match(sent[0]?.[1] ?? "", /Active: none/);
 

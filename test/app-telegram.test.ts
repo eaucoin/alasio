@@ -19,7 +19,9 @@ import {
   alasioFor,
 } from "./support/scenarios.ts";
 import { holdHandlingLock, testPool } from "./support/store.ts";
+import { LATE_ALBUM_PART } from "../src/telegram/media-group-buffer.ts";
 import { OPERATOR_ID } from "./support/telegram.ts";
+import { eventually } from "./support/wait.ts";
 
 /** Mounts Codex on alpha and has the operator send `first`, then `second` while it runs, queued behind it. */
 async function twoQueuedPrompts(alasio: RunningAlasio, first: string, second: string): Promise<void> {
@@ -63,6 +65,34 @@ test("two photos of one album are one turn, whose prompt is the caption and both
   answerTurn(codex, "thread-1", "turn-1", "Two photos.");
   await telegram.waitFor("sendRichMessage", () => true, { mark });
   assert.equal(codex.requests("turn/start").length, 1);
+});
+
+test("a photo of an album that comes once the album was handled is told of in its chat, once, though its update is handled again", { timeout: 60_000 }, async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex, stateSchema } = alasio;
+  await mount(alasio, "codex", "alpha");
+  telegram.sendPhoto("photo-a", Buffer.from("first photo"), { caption: "What is in these?", mediaGroupId: "album-1" });
+  telegram.sendPhoto("photo-b", Buffer.from("second photo"), { mediaGroupId: "album-1" });
+  await answerThreadStart(codex, "thread-1", alasio.folder("alpha"));
+  await answerTurnStart(codex, "thread-1", "turn-1");
+  // The store refuses the first update it marks processed from now: the late photo's, which is handled again.
+  await (await testPool()).query(`
+    create sequence ${stateSchema}.updates_marked;
+    create function ${stateSchema}.refuse_first_mark() returns trigger language plpgsql as $$
+      begin
+        if old.processed_at is null and new.processed_at is not null and nextval('${stateSchema}.updates_marked') = 1 then raise exception 'the store is down'; end if;
+        return new;
+      end
+    $$;
+    create trigger refuse_first_mark before update on ${stateSchema}.telegram_updates for each row execute function ${stateSchema}.refuse_first_mark();
+  `);
+  const mark = telegram.mark();
+  telegram.sendPhoto("photo-c", Buffer.from("late photo"), { mediaGroupId: "album-1" });
+  await telegram.waitFor("sendMessage", (call) => call.params.text === LATE_ALBUM_PART, { mark });
+  await eventually("the late photo's update handled again", async () => (Number((await (await testPool()).query<{ n: string }>(`select last_value as n from ${stateSchema}.updates_marked`)).rows[0]?.n) >= 2 ? true : undefined));
+  await sleep(1000);
+  const told = (await (await testPool()).query<{ text: string }>(`select text from ${stateSchema}.telegram_outbox where text = $1`, [LATE_ALBUM_PART])).rows;
+  assert.equal(told.length, 1);
 });
 
 test("an album whose prompt fails is said to have failed in its chat, as a single message's is", { timeout: 60_000 }, async (t) => {

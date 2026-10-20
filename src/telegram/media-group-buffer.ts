@@ -11,7 +11,7 @@ import { Clock, Context, Duration, Effect, FiberMap, FiberSet, Layer, Semaphore 
 import type { OperatorServices } from "../operator/command-handler.ts";
 import type { IncomingPrompt } from "../operator/prompts.ts";
 import type { StoreError } from "../persistence/sql.ts";
-import { Store } from "../persistence/store.ts";
+import { Store, type UpdateMarks } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { type ReceivedFileError, ReceivedFiles } from "./files.ts";
@@ -38,14 +38,17 @@ export interface MediaGroupMessage {
 export class MediaGroups extends Context.Service<MediaGroups, {
   /**
    * Keeps a message of its group, and handles the group once no more of it arrive for a
-   * moment; tells the chat of one that came once its group had been handled.
+   * moment; tells the chat of one that came once its group had been handled, with `marks`,
+   * those of the message's update, so the chat is told once.
    */
-  readonly buffer: (message: MediaGroupMessage) => Effect.Effect<void, StoreError>;
+  readonly buffer: (message: MediaGroupMessage, marks: Pick<UpdateMarks, "enqueueOutboxText">) => Effect.Effect<void, StoreError>;
   /**
    * Handles every group of any alasio's that waits and has been quiet for its moment: one
    * whose wait ended as alasio stopped, or as its chat's updates went to another alasio,
-   * which saw none of it. One that fails is said, and looked at again by the next, until it
-   * has failed MEDIA_GROUP_TRIES times.
+   * which saw none of it. One that fails is said, and looked at again by the next: one whose
+   * files could not be written is given up on once that has failed MEDIA_GROUP_TRIES times;
+   * one the store failed, its lock not had in time or a statement of it failing, waits for
+   * the store to answer, however long.
    */
   readonly flushDue: Effect.Effect<void>;
 }>()("alasio/telegram/MediaGroups") {
@@ -113,28 +116,32 @@ const makeMediaGroups = Effect.fnUntraced(function*(flushAfter: Duration.Input) 
    * The group handled, as `claimed` says, its prompt then run on after its chat's handling
    * lock is let go of, as a single message's prompt is (./app.ts), so that a prompt that
    * takes a while holds back none of its chat's updates; one that fails is said in the
-   * chat, and the group is handled. A handling that fails is said, and counted.
+   * chat, and the group is handled. As a single message's, an album whose claim is committed
+   * and whose prompt is not yet queued as alasio stops is lost: its prompt, forked once the
+   * lock's transaction commits, queues its job within moments of it.
    */
   const flush = (mediaGroupId: string, conversationId: string, chatId: number | string): Effect.Effect<void> =>
     claimed(mediaGroupId, conversationId, chatId).pipe(
       Effect.flatMap((prompt) =>
         prompt === null ? Effect.void : Effect.asVoid(FiberSet.run(prompts, processIncomingPrompt(prompt).pipe(Effect.provideContext(services), Effect.interruptible)))
       ),
-      Effect.catch((error) =>
-        Effect.logError(`Failed to flush media group ${mediaGroupId}: ${error.message}`).pipe(
+      // Its files not written: counted, and given up on at MEDIA_GROUP_TRIES.
+      Effect.catchTag("ReceivedFileError", (error) =>
+        Effect.logError(`Failed to write the files of media group ${mediaGroupId}: ${error.message}`).pipe(
           Effect.andThen(store.recordMediaGroupFailure(mediaGroupId)),
           Effect.flatMap((failures) => givenUp(mediaGroupId, chatId, failures, error.message)),
           Effect.catch((counting) => Effect.logError(`Failed to count the failure of media group ${mediaGroupId}: ${counting.message}`)),
-        )
-      ),
+        )),
+      // The store not answering, or its lock not had in time: nothing of the album's own, which waits for the next look.
+      Effect.catch((error) => Effect.logWarning(`Could not flush media group ${mediaGroupId} now, which waits for the next look: ${error.message}`)),
       Effect.catchDefect((defect) => Effect.logError(`Failed to flush media group ${mediaGroupId}: ${defect}`)),
       withLogScope("telegram-app"),
     );
 
   return MediaGroups.of({
-    buffer: Effect.fnUntraced(function*({ mediaGroupId, conversationId, updateId, chatId }) {
+    buffer: Effect.fnUntraced(function*({ mediaGroupId, conversationId, updateId, chatId }, marks) {
       if (!(yield* store.upsertMediaGroup({ mediaGroupId, conversationId, updateId }))) {
-        yield* store.enqueueOutboxText({ chatId, text: LATE_ALBUM_PART });
+        yield* marks.enqueueOutboxText({ chatId, text: LATE_ALBUM_PART });
         return;
       }
       yield* FiberMap.run(waits, mediaGroupId, Effect.sleep(flushAfter).pipe(Effect.andThen(FiberSet.run(flushing, flush(mediaGroupId, conversationId, chatId)))));

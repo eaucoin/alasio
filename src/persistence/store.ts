@@ -147,6 +147,8 @@ export interface UpdateMarks {
   /** Keeps an update, unless it is kept already: whether it is yet to be processed. */
   readonly recordTelegramUpdate: (update: Update) => Stored<boolean>;
   readonly markTelegramUpdateProcessed: (updateId: number) => Stored<void>;
+  /** Queues a reply to the chat, committed with what else the update marks, so an update handled again tells the chat once. */
+  readonly enqueueOutboxText: (text: NewOutboxText) => Stored<string>;
 }
 
 /** What a chat's handling lock's holder marks, in the lock's transaction: an update's handling, and an album's. */
@@ -157,8 +159,6 @@ export interface HandlingMarks extends UpdateMarks {
    * transaction, so an alasio that stops as it handles the album leaves it waiting.
    */
   readonly claimMediaGroup: (mediaGroupId: string, quietMs: number) => Stored<boolean>;
-  /** Queues a reply to the chat, committed with what else the lock's holder marks. */
-  readonly enqueueOutboxText: (text: NewOutboxText) => Stored<string>;
 }
 
 /**

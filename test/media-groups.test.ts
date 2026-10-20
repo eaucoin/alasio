@@ -13,19 +13,20 @@ import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { Deferred, Duration, Effect, Exit, Fiber } from "effect";
+import pg from "pg";
 
-import type { Store } from "../src/persistence/store.ts";
+import { StoreError } from "../src/persistence/sql.ts";
+import { Store } from "../src/persistence/store.ts";
 import { SessionFileError, SessionSandboxes } from "../src/sandbox/index.ts";
 import { LATE_ALBUM_PART, MEDIA_GROUP_TRIES, MediaGroups } from "../src/telegram/media-group-buffer.ts";
-import { newSchema, run, testPool, testStore } from "./support/store.ts";
+import { newSchema, run, testDatabaseUrl, testPool, testStore } from "./support/store.ts";
 import { turnsStub, withServices } from "./support/turns.ts";
 
 const CHAT = 42;
 const QUIET_MS = 1500;
 
 /** A store whose chat has an album of `messages` messages, kept `agoMs` ago, the album waiting. */
-async function albumWaiting(messages: number, agoMs: number): Promise<{ readonly store: Store["Service"]; readonly schema: string; readonly conversationId: string }> {
-  const schema = newSchema();
+async function albumWaiting(messages: number, agoMs: number, schema = newSchema()): Promise<{ readonly store: Store["Service"]; readonly schema: string; readonly conversationId: string }> {
   const store = await testStore({ schema });
   const conversationId = await run(store.upsertConversation({ chatId: CHAT, user: { id: CHAT } }));
   for (let n = 1; n <= messages; n += 1) {
@@ -212,9 +213,79 @@ test("a message of an album that comes once the album was handled is told of in 
   assert.equal(await run(claim(store)), true);
   const { prompts, turns } = promptsTaken();
   await withServices({ store, turns, workspaceRoot: tmpdir() }, async (alasio) => {
-    await alasio.runPromise(Effect.flatMap(MediaGroups, (groups) => groups.buffer({ mediaGroupId: "album", conversationId, updateId: 3, chatId: CHAT })));
+    await alasio.runPromise(Effect.flatMap(MediaGroups, (groups) => Effect.flatMap(Store, (store) => groups.buffer({ mediaGroupId: "album", conversationId, updateId: 3, chatId: CHAT }, store))));
     await sleep(QUIET_MS + 500);
   });
   assert.deepEqual(prompts, []);
   assert.deepEqual(await queued(schema), [LATE_ALBUM_PART]);
+});
+
+test("an album its store fails to handle once its chat's lock is had, however often, is not given up on, and is handled once the store answers", { timeout: 60_000 }, async () => {
+  const { store, schema, conversationId } = await albumWaiting(2, 10_000);
+  await setUp(store, conversationId);
+  // The store failing as the album's messages are read under the lock, past the tries a failed write of its files is given.
+  let failing = MEDIA_GROUP_TRIES + 1;
+  const failingStore: Store["Service"] = {
+    ...store,
+    getMediaGroupMessages: (mediaGroupId) => (failing-- > 0 ? Effect.fail(new StoreError({ cause: new Error("Neon is away") })) : store.getMediaGroupMessages(mediaGroupId)),
+  };
+  const { prompts, turns } = promptsTaken();
+  const { sandbox } = sessionWrites(() => false);
+  await withServices({ store: failingStore, turns, sandbox, workspaceRoot: tmpdir() }, async (alasio) => {
+    for (let look = 0; look <= MEDIA_GROUP_TRIES; look += 1) await alasio.runPromise(flushDue);
+    assert.deepEqual(prompts, []);
+    assert.deepEqual((await run(store.getPendingMediaGroupsDue(QUIET_MS))).map(({ id }) => id), ["album"], "still waiting");
+    await alasio.runPromise(flushDue);
+    await until("the album's prompt runs", () => prompts.length > 0);
+  });
+  assert.equal(prompts.length, 1);
+  assert.deepEqual(await queued(schema), [], "its chat told nothing of its files");
+});
+
+test("albums in more chats than the pool has connections, their files slow to write, hold at most two of its connections, so the store still answers", { timeout: 60_000 }, async () => {
+  const schema = newSchema();
+  // A pool of three, fewer than the chats: a flush for each at once, each holding its chat's lock, would starve the rest.
+  const pool = new pg.Pool({ connectionString: await testDatabaseUrl(), max: 3 });
+  try {
+    const store = await Effect.runPromise(Effect.provide(Store, Store.layer({ pool, schema })));
+    const chats = [201, 202, 203, 204, 205, 206];
+    const conversations = new Map<number, string>();
+    for (const chat of chats) {
+      const conversationId = await run(store.upsertConversation({ chatId: chat, user: { id: chat } }));
+      conversations.set(chat, conversationId);
+      await setUp(store, conversationId);
+      const messageId = await run(store.insertMessage({ conversationId, direction: "in", kind: "file", transportMessageId: 1, mediaGroupId: `album-${chat}`, text: "caption" }));
+      await run(store.insertFile({ conversationId, messageId, file: { kind: "photo", file_id: `photo-${chat}`, file_unique_id: `photo-${chat}`, width: 1, height: 1, file_name: `photo-${chat}.jpg`, mime_type: "image/jpeg" }, name: `photo-${chat}.jpg`, content: Buffer.from("photo"), sha256: `sha-${chat}` }));
+      await run(store.upsertMediaGroup({ mediaGroupId: `album-${chat}`, conversationId, updateId: chat }));
+    }
+    await (await testPool()).query(`update ${schema}.messages set created_at = now() - interval '10 seconds'`);
+    const { prompts, turns } = promptsTaken();
+    const writing = Effect.runSync(Deferred.make<void>());
+    let inFlight = 0;
+    let most = 0;
+    const sandbox = SessionSandboxes.of({
+      ...sessionWrites(() => false).sandbox,
+      writeFile: () =>
+        Effect.acquireUseRelease(
+          Effect.sync(() => void (most = Math.max(most, ++inFlight))),
+          () => Deferred.await(writing),
+          () => Effect.sync(() => void inFlight--),
+        ),
+    });
+    await withServices({ store, turns, sandbox, workspaceRoot: tmpdir() }, async (alasio) => {
+      for (const chat of chats) {
+        await alasio.runPromise(Effect.flatMap(MediaGroups, (groups) => groups.buffer({ mediaGroupId: `album-${chat}`, conversationId: conversations.get(chat) ?? "", updateId: chat, chatId: chat }, store)));
+      }
+      await until("two albums' files being written", () => inFlight === 2);
+      await sleep(500);
+      // The store answers, its pool not taken by the albums waiting for their turn.
+      assert.equal(await Effect.runPromise(store.getPendingOutboxCount.pipe(Effect.timeout("2 seconds"))), 0);
+      assert.equal(most, 2);
+      await Effect.runPromise(Deferred.succeed(writing, undefined));
+      await until("every album's prompt runs", () => prompts.length === chats.length);
+    });
+    assert.equal(most, 2);
+  } finally {
+    await pool.end();
+  }
 });
