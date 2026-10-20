@@ -593,6 +593,11 @@ export async function inNodeAgent<Seen>(node: string, script: string, ...args: s
   return scriptIn(NAMESPACE, pod, "node-agent", script, args);
 }
 
+/** Restarts the container of the node `node`, in Docker, as the machine it stands for restarts: every process of it ended, what its volumes hold kept. */
+export async function restartNodeContainer(node: string): Promise<void> {
+  await docker("restart", node);
+}
+
 /**
  * Runs `script` with sh as root on the cluster's node `node`, which must succeed: what it
  * printed. A node in Docker is a container of this machine's Docker; on the host, this

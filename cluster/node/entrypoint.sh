@@ -50,8 +50,15 @@ mount --make-rshared /
 # FUSE manager's, is the node's (ALASIO_STARGZ_MEMORY_LIMIT), for the daemon alone.
 mkdir -p /etc/containerd-stargz-grpc /run/containerd-stargz-grpc
 printf '%s\n' "$ALASIO_STARGZ_CONFIG" >/etc/containerd-stargz-grpc/config.toml
-# A socket left from the container's last start is no daemon listening.
-rm -f /run/containerd-stargz-grpc/containerd-stargz-grpc.sock
+# Sockets left from the container's last start are no daemon and no FUSE manager listening:
+# both ended with it, the manager's mounts with it. The daemon starts a manager only where
+# none's socket is, and mounts its snapshots' layers again only through one it started, so
+# a manager's socket left would have every pod run on the daemon's snapshots empty. So
+# would the manager's record of its mounts, kept on the daemon's volume: the new manager
+# mounts what it records as it starts, and skips each as the daemon, having unmounted it,
+# asks for it again (cli/src/cluster/stargz.ts FUSE_MANAGER_STORE).
+rm -f /run/containerd-stargz-grpc/containerd-stargz-grpc.sock /run/containerd-stargz-grpc/fuse-manager.sock \
+  /var/lib/containerd-stargz-grpc/fusestore.db
 (
   while :; do
     GOMEMLIMIT="$ALASIO_STARGZ_MEMORY_LIMIT" /usr/local/bin/containerd-stargz-grpc --address=/run/containerd-stargz-grpc/containerd-stargz-grpc.sock \

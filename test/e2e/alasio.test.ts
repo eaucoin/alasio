@@ -33,7 +33,7 @@ import { componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "../
 import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT, WORKSPACE_MOUNT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { pageserverName } from "../../cli/src/manifests/neon.ts";
 import { environmentAccess } from "../../cli/src/manifests/log.ts";
-import { WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
+import { WEBHOOK, WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
 import { TOKEN_TTL_MS } from "../../src/sandbox/gateway-client.ts";
@@ -83,6 +83,7 @@ import {
   PREVIOUS,
   recordSession,
   ref,
+  restartNodeContainer,
   RELEASE_AFTER_SECONDS,
   runCronJob,
   SESSIONS,
@@ -1012,10 +1013,26 @@ if (inShard("sessions")) {
       // The node's workspace mount, run from its image lazily too, ready again on the mount it kept.
       await kube.awaitReady([ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE)], "5 minutes");
     });
+
+    // Last, as a restart of a node's container ends the port forwards the tests before it reach the stand-ins through.
+    test("runs pods pulled lazily again after their node's container restarts, as a machine does, stargz-snapshotter's daemon mounting their layers again", { skip: (TARGET !== "docker" || !ESTARGZ) && "a node restarts so where it is a container, its pods pulled lazily" }, async () => {
+      const name = await kube.runningPod(NAMESPACE, RELEASE);
+      const restarts = async () => (await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))?.status?.containerStatuses?.find((status) => status.name === "alasio")?.restartCount ?? 0;
+      const before = await restarts();
+      await restartNodeContainer((await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))?.spec?.nodeName ?? "");
+      // Every container of the node ended with it; kubelet starts each again, on the layers the daemon mounts again.
+      // Its API server, where it is the node's, answers nothing until the node is back.
+      await until("alasio started again on its node", async () => ((await restarts().catch(() => before)) > before ? true : undefined), 600_000);
+      await kube.awaitReady([ref("Deployment", RELEASE, NAMESPACE), ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE)], "10 minutes");
+      assert.equal(await inAlasioContainer(["node", "-e", "process.stdout.write('ran')"]), "ran");
+      assert.ok(await onRemoteSnapshot(NAMESPACE, name), `${name} runs on no remote snapshot`);
+    });
   });
 
   describe("Telegram's deliveries, through the webhook intake", () => {
     before(async () => {
+      // The tests before end and start the node's containers again: the intake, the log it writes to and alasio ready first.
+      await kube.awaitReady([ref("Deployment", WEBHOOK, NAMESPACE), ref("StatefulSet", componentName("log"), NAMESPACE), ref("Deployment", RELEASE, NAMESPACE)], "10 minutes");
       telegram = await forward(TELEGRAM);
       tg = operator(telegram.base);
     });
@@ -1165,10 +1182,13 @@ if (inShard("sessions")) {
       const mark = (await (await fetch(`${telegram?.base}/control/calls`)).json() as CallsListing).total;
       const twice = update(9_000_005, 1001, "/service codex");
       for (let delivered = 0; delivered < 2; delivered += 1) assert.equal(await post(route.path, { "x-telegram-bot-api-secret-token": route.secretToken }, twice), 200);
-      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      // Answered since the mark alone, as earlier tests switched to Codex too; within the minutes alasio's group may take to
+      // give its partition to its new member, the member before it, of a node restarted, gone without leaving it.
+      const answered = async () =>
+        ((await (await fetch(`${telegram?.base}/control/calls?since=${mark}`)).json()) as CallsListing).calls.filter(({ payload }) => /^Active: Codex$/mu.test(payload.text ?? "")).length;
+      await until("the update answered", async () => ((await answered()) > 0 ? true : undefined), 300_000);
       await sleep(15_000);
-      const since = (await (await fetch(`${telegram?.base}/control/calls?since=${mark}`)).json()) as CallsListing;
-      assert.equal(since.calls.filter(({ payload }) => /^Active: Codex$/mu.test(payload.text ?? "")).length, 1);
+      assert.equal(await answered(), 1);
     });
   });
 }
