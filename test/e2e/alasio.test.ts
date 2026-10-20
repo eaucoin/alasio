@@ -976,6 +976,27 @@ if (inShard("sessions")) {
       assert.notEqual(after?.metadata?.uid, before?.metadata?.uid);
     });
 
+    test("a folder conversation's next instance requests the memory its instances came to use, as the gateway kept it of the folder's own", { skip: !HOST_PROFILE && "folder workspaces are for a single node", timeout: 20 * 60_000 }, async () => {
+      const key = "folder:claude:e2e:folder";
+      const instance = async () => (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" })).find(({ metadata }) => metadata?.deletionTimestamp === undefined);
+      const requested = (pod: V1Pod | undefined) => memoryBytes(pod?.spec?.containers.find(({ name }) => name === "bayma")?.resources?.requests?.["memory"] ?? "0");
+      // Its instance holding 800 MiB more than it requests, until the metrics server measures it, and the gateway has looked once since.
+      await inAlasio<string>("./folder-repl.ts", "hold", GATEWAY_MCP, await mainKeyToken(key), "800");
+      const before = await instance();
+      const asked = requested(before);
+      await until("the folder instance measured holding it", async () => {
+        const [measured] = await kube.list<KubernetesObject & { containers?: { name: string; usage?: { memory?: string } }[] }>("PodMetrics", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+        return memoryBytes(measured?.containers?.find(({ name }) => name === "bayma")?.usage?.memory ?? "0") > 800 * 2 ** 20 ? true : undefined;
+      }, 300_000);
+      await sleep(15_000);
+      assert.match(await alasioOk("folder", "restart", "e2e:folder"), /its folder instance of e2e:folder is let go/u);
+      // Its next instance, made as the next request comes, requesting what it held, with a margin.
+      await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", GATEWAY_MCP, await mainKeyToken(key), "after its sizing");
+      const after = await instance();
+      assert.notEqual(after?.metadata?.uid, before?.metadata?.uid);
+      assert.ok(requested(after) > 800 * 2 ** 20 && requested(after) > asked, `requests ${requested(after)} bytes, its instance before ${asked}`);
+    });
+
     test("no one makes a pod in the folders' namespace but the gateway, which makes none but of the folder template, nor a Secret there but an instance's token", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
       const [instance] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
       assert.ok(instance?.metadata?.name && instance.spec, "the folder's instance is made");

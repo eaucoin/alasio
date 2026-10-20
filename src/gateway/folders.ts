@@ -29,21 +29,29 @@
  * instance: its key, its pod, since when it is bound, when its bayma last ran an exec, and its
  * binds' last failure. What a bind of a key under way waits on, its pods say, is answered of
  * the key a caller's token names (`GET /folders/starting`), as alasio tells the turn it waits.
+ *
+ * Its pod requests the memory its folder's instances came to use, as VPA sizes alasio's
+ * workloads (cli/src/manifests/vpa.ts), which it cannot size, as no workload makes it (SIZING):
+ * the gateway keeps the peak of each hour its instances run, of their working set as the
+ * metrics server measures it, in a Lease of the folder's own (sizingLease), so that no other
+ * conversation's instance, nor a branch's, is sized by them; and its next pod requests their
+ * 90th percentile with a margin.
  */
 import { randomBytes } from "node:crypto";
 
-import type { V1Lease, V1Pod, V1PodSpec, V1PodTemplateSpec, V1Secret } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Lease, V1Pod, V1PodSpec, V1PodTemplateSpec, V1Secret } from "@kubernetes/client-node";
 import type { ObservableResult } from "@opentelemetry/api";
 import { Clock, Effect, Schema, type Scope } from "effect";
 
 import { type Binder, BindStepFailed } from "../binder/binder.ts";
-import { heldLeases } from "../binder/bindings.ts";
+import { heldLeases, RELEASING_ANNOTATION } from "../binder/bindings.ts";
 import { BINDING_LABEL, KEY_ANNOTATION, keyHash, type Pool } from "../binder/names.ts";
 import { type Answer, type Operation, type Placement, PlacementRefused } from "../binder/server.ts";
 import type { TokenClaims } from "../binder/tokens.ts";
 import { baymaIdleness, IDLE_POLL_MS, makeSweep } from "../binder/sweep.ts";
 import { bindingToken } from "../binder/tokens.ts";
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
+import { quantityOf } from "../kube/quantity.ts";
 import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import { meter } from "../telemetry/index.ts";
 import { FOLDER_GONE_MS, FOLDER_POOL, FOLDER_PULL_MS, FOLDER_START_MS, folderBindMs, folderOfKey, folderPodName, folderPodSpec, folderStateDir, folderTokenSecret } from "./names.ts";
@@ -57,6 +65,9 @@ const START_POLL_MS = 1_000;
 /** How long an ask of a starting bayma's status may take. */
 const STATUS_TIMEOUT_MS = 5_000;
 
+/** How long a look at what the folder instances use may take, the metrics server not answering: past it, no peak is kept of that look. */
+const METRICS_TIMEOUT_MS = 10_000;
+
 /** How many times a failure is added again to its key's Lease that another replica changed meanwhile. */
 const SETTLE_TRIES = 5;
 
@@ -66,6 +77,46 @@ const FAILURES_ANNOTATION = "alasio.dev/failures";
 const REASON_ANNOTATION = "alasio.dev/reason";
 /** The name of the Lease of `key`'s binds' failures. */
 export const failingLease = (key: string): string => `folder-failing-${keyHash(key)}`;
+
+/**
+ * How a folder instance's memory request is sized as its pod is made, as VPA's recommender
+ * sizes alasio's workloads: of the peaks of the hours its folder's instances ran, over eight
+ * days, each a day older weighing half as much, the 90th percentile, with a margin of 15%,
+ * within its template's request and limit; a folder of none, as one the metrics server never
+ * measured, its template's request.
+ */
+export const SIZING = { intervalMs: 3_600_000, intervals: 192, halfLifeIntervals: 24, percentile: 0.9, margin: 0.15 } as const;
+
+/** A folder's memory peaks: of each interval its instances ran, its start, and the most they held in it, in bytes. */
+export type MemoryPeaks = readonly (readonly [at: number, bytes: number])[];
+
+/**
+ * The memory request, in bytes, of a folder instance whose folder's instances held `peaks`, as
+ * of `now`, each the peak of an interval of `intervalMs`, as SIZING says: in whole MiB, between
+ * `floor` and `ceiling`, which it is where it would be past it, whole MiB or not.
+ */
+export function memoryRequestOf(peaks: MemoryPeaks, now: number, intervalMs: number, floor: number, ceiling: number): number {
+  const weighed = peaks
+    .filter(([at]) => now - at < SIZING.intervals * intervalMs)
+    .map(([at, bytes]) => ({ bytes, weight: 0.5 ** ((now - at) / (SIZING.halfLifeIntervals * intervalMs)) }))
+    .toSorted((one, other) => one.bytes - other.bytes);
+  const total = weighed.reduce((sum, { weight }) => sum + weight, 0);
+  let under = 0;
+  const peak = weighed.find(({ weight }) => (under += weight) >= SIZING.percentile * total)?.bytes;
+  if (peak === undefined) return floor;
+  return Math.floor(Math.min(ceiling, Math.max(floor, Math.ceil((peak * (1 + SIZING.margin)) / 2 ** 20) * 2 ** 20)));
+}
+
+/** The label of a folder's Lease of its memory peaks, and its annotation of them, as JSON. */
+const SIZING_LABEL = "alasio.dev/folder-sizing";
+const PEAKS_ANNOTATION = "alasio.dev/memory-peaks";
+/** The name of the Lease of `key`'s instances' memory peaks. */
+export const sizingLease = (key: string): string => `folder-sizing-${keyHash(key)}`;
+
+/** What the metrics server says a pod's containers use now, as the gateway reads it. */
+interface PodMetrics extends KubernetesObject {
+  readonly containers?: readonly { readonly name: string; readonly usage?: Readonly<Record<string, string>> }[];
+}
 
 /** The keys held, their binds having failed one after another, of a folder namespace's: each replica's count of the one record, so read the greatest. */
 const failingGauge = meter.createObservableGauge("alasio.gateway.folders.failing", {
@@ -104,6 +155,9 @@ export interface FoldersOptions {
   /** How long a bind gives its pod to run and its bayma to answer: FOLDER_START_MS unless said; and its pod to run while its image is pulled: FOLDER_PULL_MS unless said. */
   readonly startMs?: number;
   readonly pullMs?: number;
+  /** How long each memory peak kept of a folder's instances is the peak of: SIZING's hour unless said; and how long a look at what they use may take: METRICS_TIMEOUT_MS unless said. */
+  readonly sizingIntervalMs?: number;
+  readonly metricsTimeoutMs?: number;
 }
 
 /** The gateway's folder instances; see makeFolders. */
@@ -116,6 +170,8 @@ export interface Folders {
   readonly sweep: Effect.Effect<readonly string[], KubeApiError>;
   /** Releases, as broken, each folder instance whose bayma ended, as the module says; and counts the keys held. */
   readonly live: Effect.Effect<void, KubeApiError>;
+  /** Keeps the memory peak of each folder instance bound, as the metrics server measures it, and forgets each folder's peaks once all are past SIZING's days. */
+  readonly measure: Effect.Effect<void>;
   /** Every folder instance bound, or whose last bind failed, as the module says. */
   readonly list: Effect.Effect<readonly FolderInstance[], KubeApiError>;
   /** What the front answers of `/folders`, for main's callers alone: `GET /folders`, the list. */
@@ -126,7 +182,7 @@ export interface Folders {
 
 /** The gateway's folder instances, as the module says, on the binder and the KubeClient. */
 export const makeFolders = Effect.fnUntraced(function*(
-  { namespace, template, stateRoot, releaseAfterMs, main, podPort, bindingKey, idlePollMs = IDLE_POLL_MS, startMs = FOLDER_START_MS, pullMs = FOLDER_PULL_MS }: FoldersOptions,
+  { namespace, template, stateRoot, releaseAfterMs, main, podPort, bindingKey, idlePollMs = IDLE_POLL_MS, startMs = FOLDER_START_MS, pullMs = FOLDER_PULL_MS, sizingIntervalMs = SIZING.intervalMs, metricsTimeoutMs = METRICS_TIMEOUT_MS }: FoldersOptions,
   binder: Binder["Service"],
 ): Effect.fn.Return<Folders, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
@@ -146,6 +202,106 @@ export const makeFolders = Effect.fnUntraced(function*(
         yield* Effect.sleep(1_000);
       }
     });
+
+  /** The template's bayma's memory request and limit, in bytes: the least and the most a folder instance requests. */
+  const resources = template.spec?.containers.find(({ name }) => name === BAYMA_CONTAINER)?.resources;
+  const [floor, ceiling] = [quantityOf(resources?.requests?.["memory"]), quantityOf(resources?.limits?.["memory"])];
+  /** Of each folder bound, its instance's memory peak in the interval under way, not kept yet: the interval's start, and the bytes. */
+  const peaking = new Map<string, { readonly at: number; readonly bytes: number }>();
+
+  /** The Lease of `key`'s instances' memory peaks, where it has one. */
+  const peaksLeaseOf = (key: string): Effect.Effect<V1Lease | null, KubeApiError> =>
+    Effect.map(kube.read("coordination.k8s.io/v1", "Lease", namespace, sizingLease(key)), (lease) => lease as V1Lease | null);
+  /** The memory peaks `lease` keeps, none where it keeps none that are. */
+  const peaksOf = (lease: V1Lease | null): MemoryPeaks => {
+    const peaks = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Array(Schema.Tuple([Schema.Number, Schema.Number]))))(lease?.metadata?.annotations?.[PEAKS_ANNOTATION] ?? "[]");
+    return peaks._tag === "Some" ? peaks.value : [];
+  };
+
+  /**
+   * Keeps the peak of `key`'s instance in the interval under way, where one is not kept yet, in
+   * its folder's Lease: the greater of it and what another replica kept of the interval, those
+   * past SIZING's eight days left out; read again where another replica changed it meanwhile.
+   */
+  const kept = (key: string): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      const peak = peaking.get(key);
+      if (!peak) return;
+      peaking.delete(key);
+      const written = Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis;
+        const lease = yield* peaksLeaseOf(key);
+        const peaks = new Map(peaksOf(lease).filter(([at]) => now - at < SIZING.intervals * sizingIntervalMs));
+        peaks.set(peak.at, Math.max(peaks.get(peak.at) ?? 0, peak.bytes));
+        const annotations = { [KEY_ANNOTATION]: key, [PEAKS_ANNOTATION]: JSON.stringify([...peaks].toSorted(([one], [other]) => one - other)) };
+        if (lease) yield* kube.replace({ ...lease, metadata: { ...lease.metadata, annotations: { ...lease.metadata?.annotations, ...annotations } } });
+        else yield* kube.create({ apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { name: sizingLease(key), namespace, labels: { [SIZING_LABEL]: "true" }, annotations } });
+      });
+      yield* written.pipe(Effect.retry({ while: hasStatus(409), times: SETTLE_TRIES }));
+    }).pipe(Effect.catch((error) => Effect.logWarning(`keeping the memory peak of ${key}'s folder instance failed: ${error.message}`)));
+
+  /** That `key`'s instance holds `bytes` now: the peak of the interval under way, the one before kept as it is over. */
+  const peaked = (key: string, bytes: number): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      const at = Math.floor((yield* Clock.currentTimeMillis) / sizingIntervalMs) * sizingIntervalMs;
+      const peak = peaking.get(key);
+      if (peak && peak.at !== at) yield* kept(key);
+      peaking.set(key, { at, bytes: Math.max(peak?.at === at ? peak.bytes : 0, bytes) });
+    });
+
+  /** What the bayma of each pod of the folder namespace holds now, by its pod's name, as the metrics server measures it; none where it does not answer, nor in time, so no peak is kept. */
+  const workingSets: Effect.Effect<ReadonlyMap<string, number>> = kube.list("metrics.k8s.io/v1beta1", "PodMetrics", namespace, "").pipe(
+    Effect.map((items): ReadonlyMap<string, number> =>
+      new Map((items as PodMetrics[]).flatMap(({ metadata, containers }) => {
+        const bytes = quantityOf(containers?.find(({ name }) => name === BAYMA_CONTAINER)?.usage?.["memory"]);
+        return metadata?.name && Number.isFinite(bytes) ? [[metadata.name, bytes] as const] : [];
+      }))
+    ),
+    Effect.timeoutOrElse({ duration: metricsTimeoutMs, orElse: () => Effect.succeed(new Map()) }),
+    Effect.orElseSucceed(() => new Map()),
+  );
+
+  /** When the folders' peaks were last looked at for those all past SIZING's days. */
+  let collectedAt = 0;
+  /** Deletes, once an interval, the Lease of each folder whose peaks are all past SIZING's days, its instance keeping none under way. */
+  const collected: Effect.Effect<void> = Effect.gen(function*() {
+    const now = yield* Clock.currentTimeMillis;
+    if (now - collectedAt < sizingIntervalMs) return;
+    collectedAt = now;
+    for (const lease of (yield* kube.list("coordination.k8s.io/v1", "Lease", namespace, `${SIZING_LABEL}=true`)) as V1Lease[]) {
+      const key = lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
+      if (peaking.has(key) || peaksOf(lease).some(([at]) => now - at < SIZING.intervals * sizingIntervalMs)) continue;
+      yield* kube.remove("coordination.k8s.io/v1", "Lease", namespace, lease.metadata?.name ?? "").pipe(Effect.catchIf(hasStatus(404), () => Effect.void));
+    }
+  }).pipe(Effect.catch((error) => Effect.logWarning(`forgetting folders' memory peaks past their days failed: ${error.message}`)));
+
+  /** Keeps each bound instance's memory, as the metrics server measures it, its folder's peak, apart from the release of those whose bayma ended (live), so that a slow metrics server holds up no release. */
+  const measure: Effect.Effect<void> = Effect.gen(function*() {
+    const used = yield* workingSets;
+    for (const lease of yield* Effect.provideService(heldLeases(pool), KubeClient, kube).pipe(Effect.orElseSucceed(() => []))) {
+      // Not one being released, whose release keeps its peak: one measured after would be kept by none.
+      if (lease.metadata?.annotations?.[RELEASING_ANNOTATION]) continue;
+      const bytes = used.get(lease.spec?.holderIdentity ?? "");
+      if (bytes !== undefined) yield* peaked(lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "", bytes);
+    }
+    yield* collected;
+  });
+
+  /**
+   * The memory request of `key`'s next instance, in bytes, as SIZING says, of its folder's
+   * peaks; null where its template's stands: the template's bayma requests none, or the folder
+   * has no peaks that raise it.
+   */
+  const requestOf = (key: string): Effect.Effect<number | null> =>
+    Effect.gen(function*() {
+      if (!Number.isFinite(floor)) return null;
+      const peaks = peaksOf(yield* peaksLeaseOf(key).pipe(Effect.orElseSucceed(() => null)));
+      const bytes = memoryRequestOf(peaks, yield* Clock.currentTimeMillis, sizingIntervalMs, floor, Number.isFinite(ceiling) ? ceiling : Number.POSITIVE_INFINITY);
+      return bytes > floor ? bytes : null;
+    });
+
+  /** Its peak kept, then the pod `name` of `key` deleted and waited for until it is gone (removed). */
+  const releasedPod = (key: string, name: string): Effect.Effect<void, KubeApiError | BindStepFailed> => Effect.andThen(kept(key), removed(name));
 
   /**
    * Waits until no other pod of `key`, its pods' `labels`, is left: each deleted, where it is
@@ -182,7 +338,15 @@ export const makeFolders = Effect.fnUntraced(function*(
         stringData: { token: bindingToken(bindingKey, { key, binding, namespace }) },
       };
       yield* kube.create(secret);
-      const spec = folderPodSpec((template.spec ?? { containers: [] }) as V1PodSpec, name, folderStateDir(stateRoot, harness, conversation));
+      const request = yield* requestOf(key);
+      const made = folderPodSpec((template.spec ?? { containers: [] }) as V1PodSpec, name, folderStateDir(stateRoot, harness, conversation));
+      // Its bayma requesting what its folder's instances came to use, where they used more than its template's, in bytes, as its limit may be no whole MiB.
+      const spec: V1PodSpec = request === null ? made : {
+        ...made,
+        containers: made.containers.map((container) =>
+          container.name === BAYMA_CONTAINER ? { ...container, resources: { ...container.resources, requests: { ...container.resources?.requests, memory: String(request) } } } : container
+        ),
+      };
       const pod = yield* kube.create<V1Pod>({
         apiVersion: "v1",
         kind: "Pod",
@@ -193,7 +357,7 @@ export const makeFolders = Effect.fnUntraced(function*(
       yield* kube.patch("v1", "Secret", namespace, folderTokenSecret(name), {
         metadata: { ownerReferences: [{ apiVersion: "v1", kind: "Pod", name, uid: pod.metadata?.uid ?? "", blockOwnerDeletion: false, controller: false }] },
       }).pipe(Effect.tapError(() => Effect.andThen(kube.remove("v1", "Pod", namespace, name).pipe(Effect.ignore), kube.remove("v1", "Secret", namespace, folderTokenSecret(name)).pipe(Effect.ignore))));
-      yield* Effect.logInfo(`made the folder instance ${name} of ${key}, on the state directory ${folderStateDir(stateRoot, harness, conversation)}`);
+      yield* Effect.logInfo(`made the folder instance ${name} of ${key}, on the state directory ${folderStateDir(stateRoot, harness, conversation)}${request === null ? "" : `, requesting ${Math.round(request / 2 ** 20)} MiB, as its folder's instances came to use`}`);
       return pod;
     });
 
@@ -305,7 +469,7 @@ export const makeFolders = Effect.fnUntraced(function*(
         make: make(key, folder.harness, folder.conversation),
         prepare: prepare(key),
         // Released as it is when idle: its pod gone, its REPL sessions dumped as it stopped.
-        release: ({ pod }) => removed(pod).pipe(Effect.tap(() => released(pool, "asked"))),
+        release: ({ pod }) => releasedPod(key, pod).pipe(Effect.tap(() => released(pool, "asked"))),
         // Bound again only as its caller asks, where its binds failed one after another.
         held: options["retry"] === "1" ? Effect.succeed(null) : heldBy(key),
         settled: settled(key),
@@ -319,7 +483,7 @@ export const makeFolders = Effect.fnUntraced(function*(
   const sweep = yield* makeSweep({
     pools: Effect.succeed([pool]),
     idleness: baymaIdleness({ podPort, releaseAfterMs, idlePollMs, bindingKey }),
-    release: (_pool: Pool, key: string) => binder.release(pool, key, ({ pod }) => removed(pod)).pipe(Effect.tap((done) => (done === "released" ? released(pool, "idle") : Effect.void))),
+    release: (_pool: Pool, key: string) => binder.release(pool, key, ({ pod }) => releasedPod(key, pod)).pipe(Effect.tap((done) => (done === "released" ? released(pool, "idle") : Effect.void))),
   });
 
   const live: Effect.Effect<void, KubeApiError> = Effect.gen(function*() {
@@ -330,7 +494,7 @@ export const makeFolders = Effect.fnUntraced(function*(
       const bayma = pod.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER);
       if (bayma?.state?.terminated === undefined && pod.status?.phase !== "Failed" && pod.status?.phase !== "Succeeded") continue;
       yield* Effect.logWarning(`${key}'s bayma ended in its folder instance ${pod.metadata?.name}, which serves its binding no more: it is released, the next bind making another`);
-      yield* Effect.forkDetach(binder.release(pool, key, ({ pod: name }) => removed(name), pod.metadata?.name ?? "").pipe(
+      yield* Effect.forkDetach(binder.release(pool, key, ({ pod: name }) => releasedPod(key, name), pod.metadata?.name ?? "").pipe(
         Effect.tap((done) => (done === "released" ? released(pool, "broken") : Effect.void)),
         Effect.catch((error) => Effect.logWarning(`releasing ${key}, whose bayma ended, failed: ${error.message}`)),
       ));
@@ -406,5 +570,5 @@ export const makeFolders = Effect.fnUntraced(function*(
     held = leases.filter((lease) => recent(lease, now).length >= FOLDER_FAILURES).length;
   });
 
-  return { pool, place, sweep, live: Effect.andThen(live, countHeld), list, operate, failing: () => held };
+  return { pool, place, sweep, live: Effect.andThen(live, countHeld), measure, list, operate, failing: () => held };
 });

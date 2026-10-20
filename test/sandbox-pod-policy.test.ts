@@ -146,9 +146,12 @@ async function evidence(policy: string, last: unknown, output: string): Promise<
   ].join("\n");
 }
 
-test("a pool's pod, as its ReplicaSet makes it from its template, is made", async () => {
+test("a pool's pod, as its ReplicaSet makes it from its template, is made, VPA's resources its own", async () => {
   const pod = await made(poolPod());
   assert.ok("name" in pod, JSON.stringify(pod));
+  // As VPA sizes it as it is made, unlike its template's.
+  const sized = await made(poolPod((each) => void (each.spec.containers[0]!.resources = { requests: { cpu: "37m", memory: "777Mi" }, limits: { memory: "3Gi" } })));
+  assert.ok("name" in sized, JSON.stringify(sized));
 });
 
 test("a pool's pod with any field its template pins changed is refused", async () => {

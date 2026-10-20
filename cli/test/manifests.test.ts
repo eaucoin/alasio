@@ -3185,12 +3185,13 @@ describe("the sandbox service", () => {
     assert.deepEqual(bayma?.securityContext?.capabilities?.add, ["CHECKPOINT_RESTORE", "SYS_PTRACE"]);
     assert.deepEqual(bayma?.args?.slice(-2), ["--telemetry-token-file", "/run/alasio/bayma/token"]);
     assert.equal(bayma?.env?.find(({ name }) => name === "OTEL_EXPORTER_OTLP_ENDPOINT")?.value, "http://alasio-receiver.alasio.svc.cluster.local:4318");
-    // The gateway's identity there: pods, their tokens' Secrets, and the bindings' Leases; the receiver's, which watches the Leases.
+    // The gateway's identity there: pods, their tokens' Secrets, the bindings' Leases and what the pods use; the receiver's, which watches the Leases.
     const role = (name: string) => all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === name && metadata.namespace === "alasio-host")?.rules;
     assert.deepEqual(role("alasio-sandbox-gateway"), [
       { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch", "create", "update", "delete"] },
       { apiGroups: [""], resources: ["secrets"], verbs: ["create", "patch", "delete"] },
       { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] },
+      { apiGroups: ["metrics.k8s.io"], resources: ["pods"], verbs: ["list"] },
     ]);
     assert.deepEqual(role("alasio-receiver"), [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]);
     assert.deepEqual(container(one<V1Deployment>(objects, "Deployment", "alasio-receiver")).env?.find(({ name }) => name === "FOLDERS_NAMESPACE"), { name: "FOLDERS_NAMESPACE", value: "alasio-host" });

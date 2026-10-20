@@ -162,6 +162,8 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
         folders.live.pipe(Effect.catch((error) => Effect.logWarning(`looking at folder instances' bayma failed: ${error.message}`))),
         Schedule.spaced(SWEEP_MS),
       ));
+      // And, apart from those, what each uses, its folder's peaks kept.
+      yield* Effect.forkScoped(Effect.repeat(folders.measure, Schedule.spaced(SWEEP_MS)));
     }
     // As often, the bound pods ending though the gateway did not end them, each released in the background as its bayma holds its stop.
     yield* Effect.forkScoped(Effect.repeat(
