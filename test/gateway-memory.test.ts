@@ -108,8 +108,8 @@ async function withStore<A>(gateway: Gateway, use: (endpoint: string, s3: string
   try {
     const run = (part: string, ...rest: string[]) => docker("run", "-d", "--name", name(part), "--network", network, "--network-alias", part, ...rest);
     run("master", image, "master", "-ip=master", "-port=9333", "-mdir=/tmp", "-volumeSizeLimitMB=1024");
-    run("volume", image, "volume", "-ip=volume", "-port=8080", "-mserver=master:9333", "-dir=/tmp", "-max=40");
-    run("filer", image, "filer", "-ip=filer", "-master=master:9333", "-defaultStoreDir=/tmp");
+    run("volume", image, "volume", "-debug", "-debug.port=6060", "-ip=volume", "-port=8080", "-mserver=master:9333", "-dir=/tmp", "-max=40");
+    run("filer", image, "filer", "-debug", "-debug.port=6060", "-ip=filer", "-master=master:9333", "-defaultStoreDir=/tmp");
     // Its own arguments but where it reaches its filer, and no identities: anyone may ask.
     const own = args.filter((arg) => arg !== "s3" && !arg.startsWith("-filer=") && !arg.startsWith("-config="));
     const environment = (of: Container["env"]) => of.flatMap(({ name: key, value }) => ["-e", `${key}=${value ?? ""}`]);
@@ -132,6 +132,14 @@ async function withStore<A>(gateway: Gateway, use: (endpoint: string, s3: string
     }
     return await use(endpoint, name("s3"), gateway.limiter ? name("limiter") : null);
   } finally {
+    const diag = process.env["ALASIO_GATEWAY_DIAG"];
+    if (diag !== undefined) {
+      for (const part of ["s3", "limiter", "volume", "filer", "master"]) {
+        try {
+          execFileSync("bash", ["-c", `docker logs ${name(part)} > ${join(diag, `${name(part)}.log`)} 2>&1`]);
+        } catch {}
+      }
+    }
     rmSync(profileOf(name("s3")), { force: true });
     for (const part of [...(gateway.limiter ? ["limiter"] : []), "s3", "filer", "volume", "master"]) {
       try {
@@ -181,6 +189,8 @@ interface Timings {
 
 const noTimings = (): Timings => ({ gapMs: 0, gap: "", rates: [], leastRate: Number.POSITIVE_INFINITY, least: "", slowestMs: 0, slowest: "" });
 let timings = noTimings();
+/** The requests under way, and when each began. */
+const underWay = new Set<{ readonly named: string; readonly started: number }>();
 
 /**
  * `method` of `url`, with `body` and `headers`: its status, its ETag, its body's text if
@@ -194,6 +204,8 @@ function ask(url: string, { method = "GET", headers = {}, body, text = false }: 
   // When something last moved: the request sent whole, then each piece of its answer.
   let movedAt = started;
   let gapMs = 0;
+  const own = { named, started };
+  underWay.add(own);
   const moved = () => {
     const now = Date.now();
     gapMs = Math.max(gapMs, now - movedAt);
@@ -232,6 +244,7 @@ function ask(url: string, { method = "GET", headers = {}, body, text = false }: 
     asked.on("error", (error) => reject(error.message.startsWith(method) ? error : new Error(`${method} ${url}: ${error.message} after ${Date.now() - started} ms`)));
     asked.end(body);
   }).finally(() => {
+    underWay.delete(own);
     moved();
     if (gapMs > timings.gapMs) {
       timings.gapMs = gapMs;
@@ -330,10 +343,22 @@ interface Loaded {
   readonly timings: { readonly gapMs: number; readonly gap: string; readonly gets: number; readonly leastMiBps: number; readonly least: string; readonly p1MiBps: number; readonly medianMiBps: number; readonly floorMiBps: number; readonly slowestMs: number; readonly slowest: string };
   readonly mostMiB: Record<string, number>;
   readonly limiter: { readonly oomKilled: boolean; readonly peakMiB: number | null; readonly mostMiB: Record<string, number> } | null;
+  /** Where the load was given up after `afterMs`, its gateway stopped: how many requests were under way still, and the oldest. */
+  readonly gaveUp: { readonly afterMs: number; readonly underWay: number; readonly oldest: string } | null;
 }
 
-/** The load, with `restores` restores, on a store whose `weed s3` is `gateway` and whose limiter is `limiter`. */
-async function load(restores: number, endpoint: string, gateway: string, limiter: string | null): Promise<Loaded> {
+/**
+ * How long the load may go on SeaweedFS's gateway as it leaves it before it is given up, its
+ * gateway stopped: a GET of it starved took up to 28 minutes, which the job need not wait
+ * on to say so. As alasio runs it, the load takes a minute or two.
+ */
+const GIVE_UP_MS = 5 * 60_000;
+
+/**
+ * The load, with `restores` restores, on a store whose `weed s3` is `gateway` and whose
+ * limiter is `limiter`, given up after `giveUpMs` if given.
+ */
+async function load(restores: number, endpoint: string, gateway: string, limiter: string | null, giveUpMs?: number): Promise<Loaded> {
   await upload(endpoint, "image", IMAGE_BYTES);
   timings = noTimings();
   const failed: string[] = [];
@@ -350,6 +375,40 @@ async function load(restores: number, endpoint: string, gateway: string, limiter
     if (failed.length < 5) failed.push(error instanceof Error ? `${error.message}${error.cause instanceof Error ? `: ${error.cause.message}` : ""}` : String(error));
     return false;
   }))).then((all) => all.every(Boolean));
+  let gaveUp: Loaded["gaveUp"] = null;
+  const begun = Date.now();
+  const giving = giveUpMs === undefined ? undefined : setTimeout(() => {
+    const oldest = [...underWay].reduce<{ readonly named: string; readonly started: number } | undefined>((first, each) => (first && first.started <= each.started ? first : each), undefined);
+    gaveUp = { afterMs: Date.now() - begun, underWay: underWay.size, oldest: oldest ? `${oldest.named}, under way for ${Date.now() - oldest.started} ms` : "" };
+    try {
+      docker("kill", gateway);
+    } catch {}
+  }, giveUpMs);
+  void loading.finally(() => clearTimeout(giving));
+  // Diagnostics (not to land): where a request under way 60 s waits, every 60 s while one is.
+  const diag = process.env["ALASIO_GATEWAY_DIAG"];
+  let dumped = 0;
+  let dumpedAt = 0;
+  const watching = diag === undefined ? undefined : setInterval(() => {
+    const now = Date.now();
+    const old = [...underWay].filter((each) => now - each.started > 60_000);
+    if (old.length === 0 || now - dumpedAt < 60_000 || dumped >= 12) return;
+    dumped += 1;
+    dumpedAt = now;
+    const at = join(diag, `${gateway}-${String(dumped).padStart(2, "0")}-${Math.round((now - begun) / 1000)}s`);
+    execFileSync("mkdir", ["-p", at]);
+    writeFileSync(join(at, "under-way.txt"), [...underWay].map((each) => `${now - each.started} ms ${each.named}`).toSorted().join("\n"));
+    const network = gateway.slice(0, -"-s3".length);
+    for (const [part, host] of [["s3", "127.0.0.1"], ["volume", "volume"], ["filer", "filer"]] as const) {
+      for (const [file, path] of [["goroutines-2.txt", "goroutine?debug=2"], ["goroutines-1.txt", "goroutine?debug=1"]] as const) {
+        void dockerAsync("exec", gateway, "wget", "-q", "-O", "-", `http://${host}:6060/debug/pprof/${path}`).then((dump) => writeFileSync(join(at, `${part}-${file}`), dump), (error: unknown) => writeFileSync(join(at, `${part}-${file}`), String(error)));
+      }
+    }
+    for (const part of ["s3", "limiter", "volume"]) {
+      void promisify(execFile)("bash", ["-c", `pid=$(docker inspect -f '{{.State.Pid}}' ${network}-${part}) && sudo nsenter -t "$pid" -n ss -tinmoe`], { maxBuffer: 64 * MiB }).then(({ stdout }) => writeFileSync(join(at, `${part}-ss.txt`), stdout), (error: unknown) => writeFileSync(join(at, `${part}-ss.txt`), String(error)));
+    }
+  }, 5000);
+  void loading.finally(() => clearInterval(watching));
   // What its memory goes to, at most: its Go heap and stacks (anon), the page cache (file),
   // and its connections' buffers (sock), all of them charged to its cgroup.
   const fields = ["anon", "file", "sock", "kernel"];
@@ -369,7 +428,7 @@ async function load(restores: number, endpoint: string, gateway: string, limiter
   const at = (share: number) => Math.round(rate(share) * 10) / 10;
   const { gapMs, gap, leastRate, least, slowestMs, slowest } = timings;
   const timed = { gapMs, gap, gets: rates.length, leastMiBps: Math.round(leastRate * 100) / 100, least, p1MiBps: at(0.01), medianMiBps: at(0.5), floorMiBps: Math.round(rate(0.5) * LEAST_SHARE_OF_MEDIAN * 100) / 100, slowestMs, slowest };
-  return { answered, failed, ...outcome(gateway), timings: timed, mostMiB, limiter: limiter === null || limiterMostMiB === null ? null : { ...outcome(limiter), mostMiB: limiterMostMiB } };
+  return { answered, failed, ...outcome(gateway), timings: timed, mostMiB, limiter: limiter === null || limiterMostMiB === null ? null : { ...outcome(limiter), mostMiB: limiterMostMiB }, gaveUp };
 }
 
 /** How many GETs the load has under way at once with `restores` restores: eight a restore, and the node agent's four. */
@@ -401,15 +460,15 @@ test(`an S3 gateway as alasio runs it serves snapshots put and restores read at 
   // runtime unaware of the limit and its GETs unbounded, for comparison: killed at 1 GiB under
   // this load (CI), as the box's was, and at 2 GiB a GET at times of minutes; said, not asserted.
   const unbounded: Gateway = { s3: { ...gateway.s3, args: gateway.s3.args.filter((arg) => !/^-concurrentUploadLimitMB=/u.test(arg)), env: [] }, sysctls: [] };
-  t.diagnostic(`as SeaweedFS leaves it: ${said(await withStore(unbounded, (...on) => load(8, ...on)), unbounded)}`);
-  const loaded = await withStore(gateway, (...on) => load(8, ...on));
+  t.diagnostic(`as SeaweedFS leaves it: ${said(await withStore(unbounded, (...on) => load(8, ...on, GIVE_UP_MS)), unbounded)}`);
+  const loaded = await withStore(gateway, (...on) => load(8, ...on, process.env["ALASIO_GATEWAY_DIAG"] === undefined ? undefined : 10 * 60_000));
   t.diagnostic(`as alasio runs it: ${said(loaded, gateway)}`);
   assertHeld(loaded, gateway);
 });
 
 test(`an S3 gateway as alasio runs it serves ${streams(15)} GETs at once, past where they would take each other's reads, within its memory, no GET starved and no request still for 30 s`, { skip: !RUN && "ALASIO_GATEWAY_LOAD is not set: the load is several GiB" }, async (t) => {
   const gateway = gatewayContainer();
-  const loaded = await withStore(gateway, (...on) => load(15, ...on));
+  const loaded = await withStore(gateway, (...on) => load(15, ...on, process.env["ALASIO_GATEWAY_DIAG"] === undefined ? undefined : 10 * 60_000));
   t.diagnostic(`as alasio runs it: ${said(loaded, gateway)}`);
   assertHeld(loaded, gateway);
 });
