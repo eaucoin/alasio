@@ -119,7 +119,10 @@ before(async () => {
   // A restore's pod of the gateway's, whose address the gateway may not set.
   const probe = await madeAs(GATEWAY_USER, restorePod("fs-probe"));
   assert.ok("name" in probe, JSON.stringify(probe));
-  await inForce("alasio-resumed-condition", () => statusPatchedAs(GATEWAY_USER, probe.name, { status: { podIP: "10.0.0.9" } }), async () => {});
+  // An address of its own each time: one patched before the policy was in force is the pod's
+  // after, and the same again changes nothing, which the policy rightly lets through.
+  let tries = 0;
+  await inForce("alasio-resumed-condition", () => statusPatchedAs(GATEWAY_USER, probe.name, { status: { podIP: `10.0.0.${(tries++ % 250) + 1}` } }), async () => {});
   await withKube((kube) => kube.remove("v1", "Pod", SESSIONS, probe.name));
 });
 
