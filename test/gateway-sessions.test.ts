@@ -878,7 +878,11 @@ test("a bound pod ended by other than the gateway, as a drain ends one, is saved
   });
   assert.deepEqual(counted, { "alasio.sandbox.stop_release.outcome=snapshotted": 1 });
   assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-drained released into s-1`, `detach node-a ${env.namespace}/${bound.pod}`]);
-  assert.ok(told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "deleted" && event.binding === bound.binding));
+  // Told once its release is through, which lets its binding go first.
+  const toldReleased = () => told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "deleted" && event.binding === bound.binding);
+  for (const deadline = Date.now() + 10_000; !toldReleased(); await new Promise((resolve) => setTimeout(resolve, 50))) {
+    assert.ok(Date.now() < deadline, "its release was not told");
+  }
 });
 
 test("a bound pod ending whose binding another releases, as a broken one's is, is begun released once, however long its pod takes to go", async () => {
