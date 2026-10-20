@@ -76,6 +76,8 @@ function gatewayContainer(): Gateway {
   const port = s3Port(s3.args);
   // It reaches `weed s3` across the pod, as here across the containers' network.
   assert.equal(valueOf(limiter.env ?? [], "GET_LIMITER_UPSTREAM"), `127.0.0.1:${port}`);
+  // Diagnostics: weed s3 as alasio runs it, but with no GET limiter in front of it.
+  if (process.env["ALASIO_GATEWAY_NO_LIMITER"]) return { s3: { image: s3.image, args: s3.args, env: s3.env ?? [], limit: s3.resources?.limits?.["memory"] ?? "" }, sysctls: deployment.spec?.template.spec?.securityContext?.sysctls ?? [] };
   return {
     s3: { image: s3.image, args: s3.args, env: s3.env ?? [], limit: s3.resources?.limits?.["memory"] ?? "" },
     sysctls: deployment.spec?.template.spec?.securityContext?.sysctls ?? [],
@@ -119,13 +121,13 @@ async function withStore<A>(gateway: Gateway, use: (endpoint: string, s3: string
     // connections' buffers as its pod's.
     const { limiter } = gateway;
     if (limiter) {
-      run("limiter", "--memory", memoryOf(limiter.limit), "--memory-swap", memoryOf(limiter.limit), "-p", `127.0.0.1::${valueOf(limiter.env, "GET_LIMITER_PORT")}`, ...sysctls, ...environment(limiter.env),
+      // Diagnostics: in weed s3's network namespace, as in its pod, reaching it on 127.0.0.1.
+      docker("run", "-d", "--name", name("limiter"), "--network", `container:${name("s3")}`, "--memory", memoryOf(limiter.limit), "--memory-swap", memoryOf(limiter.limit), ...environment(limiter.env.map((each) => (each.name === "GET_LIMITER_UPSTREAM" ? { name: each.name, value: `127.0.0.1:${s3Port(args)}` } : each))),
         "-v", `${join(ROOT, "src")}:/opt/alasio/src:ro`, "-v", `${join(ROOT, "package.json")}:/opt/alasio/package.json:ro`, limiter.image, ...limiter.args);
     }
-    const port = limiter ? docker("port", name("limiter"), valueOf(limiter.env, "GET_LIMITER_PORT")).split(":").at(-1) : docker("port", name("s3"), s3Port(args)).split(":").at(-1);
+    const port = process.env["ALASIO_GATEWAY_DIRECT"] ? "" : limiter ? docker("port", name("limiter"), valueOf(limiter.env, "GET_LIMITER_PORT")).split(":").at(-1) : docker("port", name("s3"), s3Port(args)).split(":").at(-1);
     // Diagnostics: straight to the container's address on its network, past Docker's userland proxy.
-    const front = limiter ? name("limiter") : name("s3");
-    const endpoint = !process.env["ALASIO_GATEWAY_DIRECT"] ? `http://127.0.0.1:${port}` : `http://${docker("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", front)}:${limiter ? valueOf(limiter.env, "GET_LIMITER_PORT") : s3Port(args)}`;
+    const endpoint = !process.env["ALASIO_GATEWAY_DIRECT"] ? `http://127.0.0.1:${port}` : `http://${docker("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name("s3"))}:${limiter ? valueOf(limiter.env, "GET_LIMITER_PORT") : s3Port(args)}`;
     console.log(`# the load's endpoint: ${endpoint}`);
     for (let tries = 0; ; tries += 1) {
       const answered = await ask(`${endpoint}/load`, { method: "PUT" }).then(({ status }) => status, () => 0);
@@ -452,7 +454,7 @@ function assertHeld(loaded: Loaded, gateway: Gateway): void {
   assert.ok(loaded.timings.gapMs < CLIENT_IDLE_MS, `${loaded.timings.gap} went ${loaded.timings.gapMs} ms with nothing moving`);
   assert.ok(loaded.timings.gets > 0 && loaded.timings.leastMiBps >= loaded.timings.floorMiBps, `${loaded.timings.least}: ${loaded.timings.leastMiBps} MiB/s, under ${loaded.timings.floorMiBps}`);
   assert.ok(loaded.peakMiB !== null && loaded.peakMiB < mebibytes(gateway.s3.limit), `weed s3's peak: ${loaded.peakMiB} MiB of ${gateway.s3.limit}`);
-  assert.ok(gateway.limiter && loaded.limiter?.peakMiB != null && loaded.limiter.peakMiB < mebibytes(gateway.limiter.limit), `its limiter's peak: ${loaded.limiter?.peakMiB} MiB of ${gateway.limiter?.limit}`);
+  if (!process.env["ALASIO_GATEWAY_NO_LIMITER"]) assert.ok(gateway.limiter && loaded.limiter?.peakMiB != null && loaded.limiter.peakMiB < mebibytes(gateway.limiter.limit), `its limiter's peak: ${loaded.limiter?.peakMiB} MiB of ${gateway.limiter?.limit}`);
 }
 
 /** What `loaded` came to, and how far under its limits. */

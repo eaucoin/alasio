@@ -20,9 +20,8 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      max-parallel: 8
       matrix:
-        run: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        run: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -30,11 +29,12 @@ jobs:
           node-version: 24.14.0
           cache: npm
       - run: npm ci
-      - run: mkdir -p "$RUNNER_TEMP/diag" && node --test test/gateway-memory.test.ts
+      - run: mkdir -p "$RUNNER_TEMP/diag" && node --test --test-name-pattern='S3 gateway' test/gateway-memory.test.ts
         env:
           ALASIO_GATEWAY_LOAD: "1"
           ALASIO_GATEWAY_DIAG: ${{ runner.temp }}/diag
-          ALASIO_GATEWAY_DIRECT: ${{ matrix.run > 3 && '1' || '' }}
+          ALASIO_GATEWAY_DIRECT: "1"
+          ALASIO_GATEWAY_NO_LIMITER: ${{ matrix.run > 4 && '1' || '' }}
       - if: always()
         uses: actions/upload-artifact@v4
         with:
