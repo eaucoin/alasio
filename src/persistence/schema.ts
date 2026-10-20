@@ -7,7 +7,7 @@
  */
 import { Effect } from "effect";
 
-import { type Sql, StoreError } from "./sql.ts";
+import type { Sql, StoreError } from "./sql.ts";
 
 const ddl = (SCHEMA: string): string => `
 create schema if not exists ${SCHEMA};
@@ -350,44 +350,5 @@ create table if not exists ${SCHEMA}.prompt_jobs (
 create index if not exists prompt_jobs_ready on ${SCHEMA}.prompt_jobs (conversation_id, state, priority desc, seq);
 `;
 
-/**
- * What a unique index of the schema's could not be made over: rows of an installation
- * that kept twice what this release keeps once (a Telegram message, or a file it carried,
- * which 8.0.0 could keep twice as two of its pods handed over). alasio puts nothing right
- * here; the cut-over from 8.0.0 removes them.
- */
-export class DuplicatesKept extends Error {
-  readonly table: string;
-  readonly key: string;
-  constructor(table: string, key: string) {
-    super(`alasio's schema cannot be made: ${table} holds rows this release keeps once, kept twice (${key}). upgrades/from-8.0.0.sh removes them before the upgrade; run the cut-over, then start alasio again`);
-    this.table = table;
-    this.key = key;
-  }
-}
-
-/** The unique indexes that keep a Telegram message, and a file it carried, once, which rows kept twice refuse. */
-const ONCE_INDEXES: ReadonlySet<string> = new Set(["messages_telegram_once", "files_telegram_once"]);
-
-/** Postgres's error, if `error` is one, as its fields are named. */
-const postgresError = (error: StoreError): { readonly code?: unknown; readonly constraint?: unknown; readonly table?: unknown; readonly detail?: unknown } | null =>
-  typeof error.cause === "object" && error.cause !== null ? error.cause : null;
-
-/**
- * Makes alasio's tables in `schema` where they are missing. Where an index keeping a Telegram
- * message, or a file it carried, once cannot be made over rows kept twice already, it fails
- * saying which (DuplicatesKept), and changes nothing.
- */
-export const ensureSchema = (sql: Sql, schema: string): Effect.Effect<void, StoreError> =>
-  sql.query(ddl(schema)).pipe(
-    Effect.mapError((error) => {
-      const refused = postgresError(error);
-      // Of these indexes' builds alone: two alasios making the schema at once may refuse each
-      // other's `create … if not exists` with the same code, on Postgres's own catalog
-      // (pg_type, pg_namespace), which is no row kept twice.
-      return refused?.code === "23505" && typeof refused.constraint === "string" && ONCE_INDEXES.has(refused.constraint)
-        ? new StoreError({ cause: new DuplicatesKept(`${schema}.${String(refused.table ?? "a table")}`, String(refused.detail ?? "a key")) })
-        : error;
-    }),
-    Effect.asVoid,
-  );
+/** Makes alasio's tables in `schema` where they are missing. */
+export const ensureSchema = (sql: Sql, schema: string): Effect.Effect<void, StoreError> => Effect.asVoid(sql.query(ddl(schema)));

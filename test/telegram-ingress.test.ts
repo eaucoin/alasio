@@ -10,7 +10,6 @@ import type { Message } from "@grammyjs/types";
 import { Array as Arr, Effect, Fiber, Layer, Logger } from "effect";
 import type pg from "pg";
 
-import { DuplicatesKept } from "../src/persistence/schema.ts";
 import { StoreError } from "../src/persistence/sql.ts";
 import type { SessionSandboxes } from "../src/sandbox/index.ts";
 import { Store } from "../src/persistence/store.ts";
@@ -160,46 +159,6 @@ test("a message handled again, as an update whose handling lock was lost is, is 
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
-});
-
-test("a store whose messages hold one kept twice, as 8.0.0 could keep one, refuses to start, naming the table and the key kept twice and the cut-over that removes them", async () => {
-  const schema = newSchema();
-  await testStore({ schema });
-  const pool = await testPool();
-  // As 8.0.0 kept them: no index keeping a message once, and one kept twice.
-  await pool.query(`drop index ${schema}.messages_telegram_once`);
-  await pool.query(`insert into ${schema}.conversations (id, transport, chat_id) values ('telegram:43', 'telegram', '43')`);
-  for (const id of ["first", "again"]) {
-    await pool.query(
-      `insert into ${schema}.messages (id, conversation_id, direction, kind, transport_message_id, text, raw) values ($1, 'telegram:43', 'inbound', 'text', '10', 'hello', '{"date": 1700000000}')`,
-      [id],
-    );
-  }
-  const refused = await testStore({ schema }).then(() => null, (error: unknown) => error);
-  assert.ok(refused instanceof StoreError, String(refused));
-  assert.match(refused.message, new RegExp(`^alasio's schema cannot be made: ${schema}\\.messages holds rows this release keeps once, kept twice \\(Key \\(conversation_id, direction, transport_message_id, \\(raw ->> 'date'::text\\)\\)=\\(telegram:43, inbound, 10, 1700000000\\) is duplicated\\.\\)\\. upgrades/from-8\\.0\\.0\\.sh removes them`, "u"));
-  // Nothing was put right: both are kept, and no index made.
-  assert.equal((await pool.query(`select 1 from ${schema}.messages`)).rows.length, 2);
-  assert.equal((await pool.query("select 1 from pg_indexes where schemaname = $1 and indexname = 'messages_telegram_once'", [schema])).rows.length, 0);
-});
-
-test("a store refusing another unique index than those keeping a Telegram message once fails with Postgres's refusal as it came, naming no rows of 8.0.0's", async () => {
-  const schema = newSchema();
-  await testStore({ schema });
-  const pool = await testPool();
-  // Rows kept twice that 8.0.0 never kept: two replies to one pending response.
-  await pool.query(`drop index ${schema}.telegram_outbox_pending_response`);
-  for (const id of ["first", "again"]) {
-    await pool.query(
-      `insert into ${schema}.telegram_outbox (id, chat_id, kind, text, options, pending_response_id) values ($1, '43', 'text', 'hello', '{}', 'pending-1')`,
-      [id],
-    );
-  }
-  const refused = await testStore({ schema }).then(() => null, (error: unknown) => error);
-  assert.ok(refused instanceof StoreError, String(refused));
-  assert.ok(!(refused.cause instanceof DuplicatesKept), String(refused.cause));
-  assert.equal((refused.cause as { readonly code?: unknown }).code, "23505");
-  assert.equal((refused.cause as { readonly constraint?: unknown }).constraint, "telegram_outbox_pending_response");
 });
 
 test("a message two alasios keep at once, as a rebalance mid-handling has them, is kept once, the second given the first's", async () => {
