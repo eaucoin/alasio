@@ -232,7 +232,8 @@ create table if not exists ${SCHEMA}.callback_actions (
 -- Each press whose control runs on past its update (src/telegram/presses.ts), by its query's
 -- id, kept as its update is told handled until the control is done: held by the alasio
 -- running it, by its token, until held_until, which that alasio renews as it runs, so one
--- left by an alasio that stopped is run again by another.
+-- left by an alasio that stopped is run again by another; and its answer, where its control
+-- was done but the answer could not be queued, which the next look queues alone.
 create table if not exists ${SCHEMA}.press_jobs (
   id text primary key,
   conversation_id text not null references ${SCHEMA}.conversations (id) on delete cascade,
@@ -240,6 +241,7 @@ create table if not exists ${SCHEMA}.press_jobs (
   action jsonb not null,
   holder text not null,
   held_until timestamptz not null,
+  answer text,
   created_at timestamptz not null default now()
 );
 

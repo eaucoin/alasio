@@ -4,14 +4,19 @@ import { Effect } from "effect";
 import type { CallbackAction } from "./callback-repository.ts";
 import type { Sql, StoreError } from "./sql.ts";
 
-/** A press kept while its control runs on past its update (src/telegram/presses.ts): the query, and the action it took. */
-export interface KeptPress {
+/** A press to keep (src/telegram/presses.ts): the query, and the action it took. */
+export interface PressToKeep {
   readonly callbackQuery: CallbackQuery;
   readonly action: CallbackAction;
 }
 
+/** A press kept while its control runs on past its update: what it is, and its answer, where its control was done but its answer kept unsent. */
+export interface KeptPress extends PressToKeep {
+  readonly answer: string | null;
+}
+
 /** A press to keep: what it is, and the hold of the alasio running it, by its token, for `holdMs`. */
-export interface NewKeptPress extends KeptPress {
+export interface NewKeptPress extends PressToKeep {
   readonly holder: string;
   readonly holdMs: number;
 }
@@ -19,12 +24,14 @@ export interface NewKeptPress extends KeptPress {
 interface PressRow {
   readonly callback_query: CallbackQuery;
   readonly action: CallbackAction;
+  readonly answer: string | null;
 }
 
 /**
  * The presses whose controls run on past their updates (`press_jobs`), each held by the
  * alasio running it, by a token of its own, until its hold lapses, which that alasio renews
- * as it runs: a press whose hold lapsed, or was let go of, is another's to run again.
+ * as it runs: a press whose hold lapsed, or was let go of, is another's to run again, or,
+ * where its control was done and its answer kept unsent, to queue its answer.
  */
 export class NeonPressRepository {
   readonly #sql: Sql;
@@ -58,6 +65,11 @@ export class NeonPressRepository {
     return Effect.asVoid(this.#sql.query(`update ${this.#schema}.press_jobs set held_until = now() where id = $1 and holder = $2`, [id, holder]));
   }
 
+  /** Keeps `answer` with the press `id`, its control done, where `holder` holds it, and lets go of it, for another to queue its answer at once. */
+  pendAnswer(id: string, holder: string, answer: string): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(`update ${this.#schema}.press_jobs set answer = $3, held_until = now() where id = $1 and holder = $2`, [id, holder, answer]));
+  }
+
   /** Forgets the press `id`, its control done, where `holder` holds it. */
   forget(id: string, holder: string): Effect.Effect<void, StoreError> {
     return Effect.asVoid(this.#sql.query(`delete from ${this.#schema}.press_jobs where id = $1 and holder = $2`, [id, holder]));
@@ -70,8 +82,8 @@ export class NeonPressRepository {
        where taken.id in (
          select lapsed.id from ${this.#schema}.press_jobs lapsed where lapsed.held_until <= now() for update skip locked
        )
-       returning taken.callback_query, taken.action`,
+       returning taken.callback_query, taken.action, taken.answer`,
       [holder, holdMs / 1000],
-    ).pipe(Effect.map((rows) => rows.map(({ callback_query, action }) => ({ callbackQuery: callback_query, action }))));
+    ).pipe(Effect.map((rows) => rows.map(({ callback_query, action, answer }) => ({ callbackQuery: callback_query, action, answer }))));
   }
 }

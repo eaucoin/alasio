@@ -37,7 +37,7 @@ import { watchDeliveries } from "./delivery-watch.ts";
 import { MediaGroups } from "./media-group-buffer.ts";
 import { handleMessage, processIncomingPrompt } from "./message-handler.ts";
 import type { Outbox } from "./outbox.ts";
-import { chatOfPress, holdWhileRunning, PRESS_AWAITED, PRESS_HOLD, PRESSES_DUE_EVERY, pressAnswers, recoverPresses } from "./presses.ts";
+import { chatOfPress, holdWhileRunning, PRESS_AWAITED, PRESS_HOLD, type PressAnswers, PRESSES_DUE_EVERY, pressAnswers, recoverPresses } from "./presses.ts";
 import { consumeUpdates, type TelegramUpdates } from "./update-consumer.ts";
 
 /** How often completed responses that were never delivered are looked for. */
@@ -192,7 +192,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
       // Its marks made in the lock's transaction, where it has a chat's: a lock lost rolls them back.
       const underLock = <A, E, R>(handle: (marks: UpdateMarks) => Effect.Effect<A, E, R>) => chatId === undefined ? handle(store) : store.withHandlingLock(chatId, handle);
       // A press kept as its update is marked processed, held, once that is committed, while it runs on.
-      let kept: { readonly id: string; readonly holder: string; readonly pressing: Fiber.Fiber<void> } | null = null;
+      let kept: { readonly id: string; readonly holder: string; readonly pressing: Fiber.Fiber<void>; readonly answers: PressAnswers } | null = null;
       return underLock((marks) => Effect.gen(function*() {
         if (!(yield* marks.recordTelegramUpdate(update))) {
           return yield* Effect.logInfo(`Skipping update ${update.update_id}, processed already`);
@@ -216,8 +216,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
           if (Option.isNone(done) && action !== null && chatOfPress(callbackQuery) !== undefined) {
             const holder = randomUUID();
             yield* marks.keepPress({ callbackQuery, action, holder, holdMs: Duration.toMillis(PRESS_HOLD) });
-            yield* answers.kept.pipe(Effect.provideContext(services));
-            kept = { id: callbackQuery.id, holder, pressing };
+            yield* answers.keep;
+            kept = { id: callbackQuery.id, holder, pressing, answers };
           }
         } else if (update.message) {
           const prompt = yield* handleMessage(update.message, update.update_id, marks).pipe(
@@ -230,7 +230,15 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
         }
         yield* marks.markTelegramUpdateProcessed(update.update_id);
       })).pipe(
-        Effect.andThen(Effect.suspend(() => (kept === null ? Effect.void : Effect.asVoid(FiberSet.run(handling, holdWhileRunning(kept.id, kept.holder, kept.pressing).pipe(Effect.provideService(Store, store))))))),
+        // Once the update is through: the press held while it runs, and its query answered.
+        Effect.andThen(Effect.suspend(() => {
+          if (kept === null) return Effect.void;
+          const { id, holder, pressing, answers } = kept;
+          return Effect.asVoid(Effect.all([
+            FiberSet.run(handling, holdWhileRunning(id, holder, pressing, answers.unsent).pipe(Effect.provideService(Store, store))),
+            FiberSet.run(handling, answers.acknowledge.pipe(Effect.provideContext(services))),
+          ]));
+        })),
         Effect.tapError((error) => Effect.logError(`Failed to keep update ${update.update_id}: ${error}`)),
         withAlasioSpan("alasio.update", {
           kind: SpanKind.CONSUMER,

@@ -273,6 +273,33 @@ test("a press's update is told handled once what the press does is done, or once
   await eventually("the press forgotten once done", async () => ((await keptPresses(alasio)).length === 0 ? true : undefined));
 });
 
+test("a kept press's query is answered Working... once its update is told handled: Telegram rate-limiting that answer holds the update back no longer than PRESS_AWAITED", { timeout: 60_000 }, async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex } = alasio;
+  await mount(alasio, "codex", "alpha");
+  telegram.say("First");
+  await answerThreadStart(codex, "thread-1", alasio.folder("alpha"));
+  await answerTurnStart(codex, "thread-1", "turn-1");
+  const mark = telegram.mark();
+  telegram.say("Second");
+  await telegram.waitFor("sendMessage", (call) => call.params.text.startsWith("Codex is currently working."), { mark });
+  const before = await eventually("Second's update told handled", async () => {
+    const committed = await telegram.committed();
+    return committed > 0 && (await sleep(300), committed === (await telegram.committed())) ? committed : undefined;
+  });
+  // The press's query's first answer asked to wait 8 s, as Telegram asks a bot that answers too fast.
+  telegram.fail("answerCallbackQuery", { status: 429, description: "Too Many Requests: retry after 8", retryAfter: 8 });
+  telegram.press("Steer");
+  const pressed = Date.now();
+  const steer = await codex.next("turn/steer");
+  await eventually("the press's update told handled", async () => ((await telegram.committed()) > before ? true : undefined), { timeoutMs: 15_000 });
+  const handledAfter = Date.now() - pressed;
+  assert.ok(handledAfter < 7_000, `told handled ${handledAfter} ms after the press, its answer's wait among it`);
+  await telegram.waitFor("answerCallbackQuery", (call) => call.params.text === "Working..." && call.status === 200, { mark, timeoutMs: 20_000 });
+  codex.answer(steer, { turnId: "turn-1" });
+  await shownText(alasio, "Steered.", mark);
+});
+
 test("a press kept as alasio stops is let go of, and run again from its action once alasio starts, its answer through the outbox", { timeout: 60_000 }, async (t) => {
   const alasio = await alasioFor(t, { folders: ["alpha"] });
   const { telegram, codex } = alasio;
@@ -290,6 +317,30 @@ test("a press kept as alasio stops is let go of, and run again from its action o
   await answerLoadedThreads(codex, []).catch(() => {});
   await shownText(alasio, /^(Steered|Queued)\.$/u, mark);
   await eventually("the press forgotten once run again", async () => ((await keptPresses(alasio)).length === 0 ? true : undefined));
+});
+
+test("a press kept by an alasio that crashed, its hold lapsed, is run again by the next look of one that runs, its answer through the outbox", { timeout: 90_000 }, async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, stateSchema } = alasio;
+  await mount(alasio, "codex", "alpha");
+  const mark = telegram.mark();
+  // As an alasio that crashed as it ran the press left it: held by it, its hold past.
+  const callbackQuery = {
+    id: "lapsed-press",
+    from: { id: OPERATOR_ID, is_bot: false, first_name: "Operator" },
+    chat_instance: "1",
+    data: "gone",
+    message: { message_id: 1, date: 0, chat: { id: OPERATOR_ID, type: "private", first_name: "Operator" } },
+  };
+  const action = { id: "gone", conversationId: `telegram:${OPERATOR_ID}`, kind: "workspace:refresh", payload: { expectedSessionId: null, expectedHarness: "codex" } };
+  await (await testPool()).query(
+    `insert into ${stateSchema}.press_jobs (id, conversation_id, callback_query, action, holder, held_until) values ($1, $2, $3, $4, 'crashed', now() - interval '1 second')`,
+    [callbackQuery.id, action.conversationId, JSON.stringify(callbackQuery), JSON.stringify(action)],
+  );
+  // Within a look, every thirty seconds.
+  await eventually("the lapsed press run again", async () => telegram.shown(mark).find((shown) => shown.text === "Refreshed."), { timeoutMs: 45_000 });
+  await eventually("the press forgotten once run again", async () => ((await keptPresses(alasio)).length === 0 ? true : undefined));
+  assert.deepEqual(telegram.callsTo("answerCallbackQuery", mark), []);
 });
 
 test("a reply Telegram rate-limits is sent again after the wait it asks for, once, and the reply after it follows it", async (t) => {

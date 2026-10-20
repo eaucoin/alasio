@@ -266,6 +266,8 @@ export class Store extends Context.Service<Store, {
   readonly renewPress: (id: string, holder: string, holdMs: number) => Stored<boolean>;
   /** Lets go of the kept press `id`, where `holder` holds it, for another to run again at once. */
   readonly releasePress: (id: string, holder: string) => Stored<void>;
+  /** Keeps `answer` with the kept press `id`, its control done, where `holder` holds it, and lets go of it, for the next look to queue its answer alone. */
+  readonly pendPressAnswer: (id: string, holder: string, answer: string) => Stored<void>;
   /** Forgets the kept press `id`, its control done, where `holder` holds it. */
   readonly forgetPress: (id: string, holder: string) => Stored<void>;
   /** Takes the kept presses whose holds lapsed, or were let go of, held by `holder` for `holdMs`; none another takes at once. */
@@ -486,6 +488,7 @@ const makeStore = Effect.fnUntraced(function*({
     keepPress: (press) => presses.keep(press),
     renewPress: (id, holder, holdMs) => presses.renew(id, holder, holdMs),
     releasePress: (id, holder) => presses.release(id, holder),
+    pendPressAnswer: (id, holder, answer) => presses.pendAnswer(id, holder, answer),
     forgetPress: (id, holder) => presses.forget(id, holder),
     takeLapsedPresses: (holder, holdMs) => presses.takeLapsed(holder, holdMs),
 

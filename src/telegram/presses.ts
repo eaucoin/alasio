@@ -6,15 +6,16 @@
  * by the alasio running it, by a token of its own, which renews the hold as the control runs,
  * forgets the press once it is done, and lets go of it as alasio stops. From then on its
  * answers go through the outbox, as replies in its chat, which are sent once whichever alasio
- * sends them, the query itself answered "Working..." as the press is kept, where nothing
- * answered it before. A press let go of, or whose hold lapsed as its alasio crashed, is run
+ * sends them, the query itself answered "Working..." once the update is through, where
+ * nothing answered it before; an answer the store does not take is kept with its press, once
+ * its control is done, for the next look to queue, its control never run again. A press let go of, or whose hold lapsed as its alasio crashed, is run
  * again from its action by whichever alasio looks for presses next (recoverPresses), as alasio
  * starts and every PRESSES_DUE_EVERY: so each kept press runs to its end at least once.
  */
 import { randomUUID } from "node:crypto";
 
 import type { CallbackQuery } from "@grammyjs/types";
-import { Duration, Effect, Exit, Fiber, FiberSet } from "effect";
+import { Duration, Effect, Exit, Fiber, FiberSet, Schedule } from "effect";
 
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
 import type { KeptPress } from "../persistence/press-repository.ts";
@@ -39,18 +40,29 @@ export const PRESSES_DUE_EVERY = "30 seconds";
 /** The chat a press was made in: none for a button of an inline message, which alasio sends none of. */
 export const chatOfPress = (callbackQuery: CallbackQuery): number | undefined => callbackQuery.message?.chat.id;
 
+/** How a kept press's answer is queued again where the store does not take it: a few times, within a few seconds. */
+const ANSWER_QUEUED = Schedule.max([Schedule.exponential("200 millis"), Schedule.recurs(4)]);
+
 /** A press's answers: to its query, until it is kept; then through the outbox, in its chat. */
 export interface PressAnswers {
   /** `handling`, its answers given as the press is. */
   readonly through: (handling: PressHandling) => Effect.Effect<void, CommandError, OperatorServices | Outbox>;
-  /** Has its answers from now go through the outbox, its query answered "Working..." where nothing answered it before. */
-  readonly kept: Effect.Effect<void, never, TelegramClient>;
+  /** Has its answers from now go through the outbox, as it is kept, in its update's transaction. */
+  readonly keep: Effect.Effect<void>;
+  /**
+   * Answers its query "Working...", where nothing answered it before: once its update's
+   * transaction is through, as Telegram may take its time, which no update should wait for.
+   */
+  readonly acknowledge: Effect.Effect<void, never, TelegramClient>;
+  /** The answers of it that could not be queued, the store not taking them, in order: none where every one was. */
+  readonly unsent: () => readonly string[];
 }
 
 /** The answers of the press `callbackQuery`, kept from the first where `kept` says, as a press run again is. */
 export function pressAnswers(callbackQuery: CallbackQuery, { kept: keptFirst = false }: { readonly kept?: boolean } = {}): PressAnswers {
   let kept = keptFirst;
   let answered = false;
+  const unsent: string[] = [];
   const chatId = chatOfPress(callbackQuery);
   return {
     through: (handling) =>
@@ -64,13 +76,23 @@ export function pressAnswers(callbackQuery: CallbackQuery, { kept: keptFirst = f
                   answered = true;
                   return client.answerCallbackQuery(id, text);
                 }
-                // A store that does not take it fails the press, as one whose answer is lost.
-                return text ? outbox.enqueueText({ chatId, text }).pipe(Effect.orDie, Effect.as(null)) : Effect.succeed(null);
+                if (!text) return Effect.succeed(null);
+                // Queued again a few times; where the store still does not take it, kept with the press, to be queued by the next look.
+                return outbox.enqueueText({ chatId, text }).pipe(
+                  Effect.retry(ANSWER_QUEUED),
+                  Effect.as(null),
+                  Effect.catch((error) =>
+                    Effect.sync(() => void unsent.push(text)).pipe(
+                      Effect.andThen(Effect.logError(`Could not queue an answer of kept press ${callbackQuery.id}, which is kept to be queued again: ${error.message}`)),
+                      Effect.as(null),
+                    )
+                  ),
+                );
               }),
           })
         ))),
-    kept: Effect.suspend(() => {
-      kept = true;
+    keep: Effect.sync(() => void (kept = true)),
+    acknowledge: Effect.suspend(() => {
       if (answered) return Effect.void;
       answered = true;
       return Effect.flatMap(TelegramClient, (client) => client.answerCallbackQuery(callbackQuery.id, "Working...")).pipe(
@@ -78,15 +100,17 @@ export function pressAnswers(callbackQuery: CallbackQuery, { kept: keptFirst = f
         Effect.asVoid,
       );
     }),
+    unsent: () => [...unsent],
   };
 }
 
 /**
  * Holds the kept press `id` for `holder` while `pressing` runs, renewing its hold; then
- * forgets it, its control done, or lets go of it, where its control was cut short, as alasio
- * stops, or the holding itself is.
+ * forgets it, its control done; or lets go of it, to be run again, where its control was cut
+ * short, as alasio stops, or the holding itself is; or, its control done but answers of it
+ * `unsent`, keeps those with it, to be queued by the next look, its control never run again.
  */
-export const holdWhileRunning = (id: string, holder: string, pressing: Fiber.Fiber<void>): Effect.Effect<void, never, Store> =>
+export const holdWhileRunning = (id: string, holder: string, pressing: Fiber.Fiber<void>, unsent: () => readonly string[]): Effect.Effect<void, never, Store> =>
   Effect.flatMap(Store, (store) => {
     const holdMs = Duration.toMillis(PRESS_HOLD);
     const said = (what: string) => (error: { readonly message: string }) => Effect.logWarning(`Could not ${what} kept press ${id}: ${error.message}`);
@@ -98,14 +122,20 @@ export const holdWhileRunning = (id: string, holder: string, pressing: Fiber.Fib
     ));
     return Fiber.await(pressing).pipe(
       Effect.raceFirst(renewing),
-      Effect.flatMap((exit) => (Exit.hasInterrupts(exit) ? release : store.forgetPress(id, holder).pipe(Effect.catch(said("forget"))))),
+      Effect.flatMap((exit) => {
+        if (Exit.hasInterrupts(exit)) return release;
+        const answers = unsent();
+        if (answers.length > 0) return store.pendPressAnswer(id, holder, answers.join("\n\n")).pipe(Effect.catch(said("keep the answer of")));
+        return store.forgetPress(id, holder).pipe(Effect.catch(said("forget")));
+      }),
       Effect.onInterrupt(() => release),
     );
   });
 
 /**
  * Runs each kept press let go of, or whose hold lapsed, again from its action, its answers
- * through the outbox, each held while it runs, in `handling`, which outlasts the look.
+ * through the outbox, each held while it runs, in `handling`, which outlasts the look; or,
+ * one whose control was done but whose answer was kept unsent, queues its answer alone.
  */
 export const recoverPresses = (handling: FiberSet.FiberSet): Effect.Effect<void, never, Store | OperatorServices | Outbox> =>
   Effect.gen(function*() {
@@ -115,14 +145,28 @@ export const recoverPresses = (handling: FiberSet.FiberSet): Effect.Effect<void,
     yield* Effect.forEach(presses, (press) => runAgain(handling, press, holder), { discard: true });
   }).pipe(Effect.catch((error) => Effect.logError(`Looking for kept presses failed: ${error.message}`)));
 
-/** Runs the kept press `press` again, held by `holder` while it runs. */
-const runAgain = (handling: FiberSet.FiberSet, { callbackQuery, action }: KeptPress, holder: string) =>
+/** Runs the kept press `press` again, held by `holder` while it runs; or queues its answer, where its control was done. */
+const runAgain = (handling: FiberSet.FiberSet, { callbackQuery, action, answer }: KeptPress, holder: string) =>
   Effect.gen(function*() {
+    const chatId = chatOfPress(callbackQuery);
+    if (answer !== null && chatId !== undefined) {
+      const store = yield* Store;
+      const outbox = yield* Outbox;
+      yield* Effect.logInfo(`Queuing the answer of kept press ${callbackQuery.id} of ${action.conversationId}, its control done`);
+      return yield* outbox.enqueueText({ chatId, text: answer }).pipe(
+        Effect.andThen(store.forgetPress(callbackQuery.id, holder)),
+        Effect.catch((error) =>
+          Effect.logWarning(`Could not queue the answer of kept press ${callbackQuery.id}, kept for the next look: ${error.message}`).pipe(
+            Effect.andThen(store.releasePress(callbackQuery.id, holder).pipe(Effect.ignore)),
+          )
+        ),
+      );
+    }
     yield* Effect.logInfo(`Running kept press ${callbackQuery.id} of ${action.conversationId} again`);
     const answers = pressAnswers(callbackQuery, { kept: true });
     const pressing = yield* FiberSet.run(handling, answers.through(replayPress(callbackQuery, action)).pipe(
       Effect.catch((error) => Effect.logError(`Failed to process kept press ${callbackQuery.id}: ${error.message}`)),
       Effect.interruptible,
     ));
-    yield* FiberSet.run(handling, holdWhileRunning(callbackQuery.id, holder, pressing));
+    yield* FiberSet.run(handling, holdWhileRunning(callbackQuery.id, holder, pressing, answers.unsent));
   });
