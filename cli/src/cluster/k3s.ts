@@ -80,9 +80,9 @@ export function normalizedReference(reference: string): string {
  * nothing. Unpinned, it is deleted while pods run on its snapshot, as no container is of it,
  * and pulled again by the next pod onto that snapshot, which containerd fetches no layer of:
  * recorded without its layer's content, which a node whose snapshotter changes cannot make a
- * pod without (upgrades/from-8.0.0.sh, lazy pulling). So it is no check of an image's content
- * that keeps a node sound: an image stargz-snapshotter's daemon pulls lazily is recorded
- * without its layers' content by design.
+ * pod without, as one moved onto stargz-snapshotter's daemon could not. So it is no check of
+ * an image's content that keeps a node sound: an image stargz-snapshotter's daemon pulls
+ * lazily is recorded without its layers' content by design.
  */
 export const SANDBOX_IMAGE = normalizedReference(pins.k3s.pauseImage);
 

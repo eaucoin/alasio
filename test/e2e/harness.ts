@@ -948,14 +948,16 @@ export async function inCutOverRecord(script: string): Promise<string> {
   return (await sudo("sh", "-c", `cd ${shellWord(cutOverRecord())} && ${script}`)).stdout;
 }
 
-/** A line k3s, containerd or kubelet logs as an error: logrus's level, or klog's E or F. */
-export const LOGGED_ERROR = /level=(?:error|fatal)|[EF]\d{4} \d{2}:/u;
+/** A line k3s, containerd, stargz-snapshotter's daemon or kubelet logs as an error: logrus's level, as text or JSON, or klog's E or F. */
+export const LOGGED_ERROR = /level=(?:error|fatal)|"level":"(?:error|fatal)"|[EF]\d{4} \d{2}:/u;
 
 /**
  * What each of the cluster's nodes that `which` names, or each when it names none, says of
  * itself, which the API cannot say of a node that never joined: its container's state, in
  * Docker, the errors k3s logged (its agent's kubelet's among them) and its last lines, and
- * the last lines of its containerd's log, where gVisor's shim logs too.
+ * the last lines of its containerd's log, where gVisor's shim logs too; on the machine, also
+ * stargz-snapshotter's daemon's errors and last lines and its FUSE manager's, which serve the
+ * layers pods read lazily.
  */
 async function dumpNodes(which: ((node: string) => boolean) | undefined): Promise<string[]> {
   const said: string[] = [];
@@ -975,6 +977,10 @@ async function dumpNodes(which: ((node: string) => boolean) | undefined): Promis
       lastOf("k3s's errors", logged, true);
       lastOf("k3s's last lines", logged);
       lastOf("containerd's last lines", await sudo("sh", "-c", containerdLog).then(({ stdout }) => stdout, failure));
+      const daemon = await sudo("journalctl", "--unit=stargz-snapshotter", "--no-pager", "--lines=2000").then(({ stdout }) => stdout, failure);
+      lastOf("stargz-snapshotter's errors", daemon, true);
+      lastOf("stargz-snapshotter's last lines", daemon);
+      lastOf("its FUSE manager's last lines", await sudo("tail", "-n", "30", "/var/lib/containerd-stargz-grpc/stargz-fuse-manager.log").then(({ stdout }) => stdout, failure));
       return said;
     }
     // What the machine's kernel killed for its memory, as a node's container may be.
@@ -1038,7 +1044,8 @@ export async function dumpClusterState(): Promise<void> {
       say(`node ${node.metadata?.name}: ${ready(node.status?.conditions) ? "ready" : `not ready${condition ? ` (${condition.reason}: ${condition.message})` : ""}`}, ${cpuText(asked)} of ${cpuText(allocatable)} requested`);
     }
     const notReady = new Set(nodes.filter((node) => !ready(node.status?.conditions)).map((node) => node.metadata?.name ?? ""));
-    for (const line of await dumpNodes((node) => notReady.has(node) || !nodes.some((each) => each.metadata?.name === node))) say(line);
+    // The machine's always, whose services serve its pods' layers and mounts as no API says.
+    for (const line of await dumpNodes((node) => TARGET === "host" || notReady.has(node) || !nodes.some((each) => each.metadata?.name === node))) say(line);
     for (const pod of pods) {
       const { namespace, name } = pod.metadata ?? {};
       const restarts = (pod.status?.containerStatuses ?? []).filter(({ restartCount }) => restartCount > 0).map(({ name: container, restartCount, lastState }) =>
@@ -1060,7 +1067,34 @@ export async function dumpClusterState(): Promise<void> {
         const logged = await kube.logs(namespace, name, container.name).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
         say(`logs of ${container.name}:`);
         for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
+        // A readiness command run again, each step it takes said, and how long it took, as kubelet's says only that it failed.
+        const [shell, flag, script] = container.readinessProbe?.exec?.command ?? [];
+        if (shell === "sh" && flag === "-c" && script !== undefined) {
+          const started = Date.now();
+          const ran = await Promise.race([
+            kube.exec(namespace, name, ["sh", "-xc", script], { container: container.name }).then(({ code, stdout, stderr }) => `exited with ${code}\n${stderr}${stdout}`, (error: unknown) => String(error)),
+            new Promise<string>((resolve) => setTimeout(() => resolve("still running after 30 s"), 30_000)),
+          ]);
+          say(`its readiness command, run again, in ${Date.now() - started} ms: ${ran.trimEnd()}`);
+        }
       }
+    }
+    // Ready or not, each node's mount of workspace storage and its agent: what the mount's juicefs said, its container
+    // before it restarted too, and what each, the agent among them, which every bind reaches the mount through, sees
+    // of alasio's directory of the node's: the workspaces' root's file system, and every mount under it, with its
+    // propagation.
+    const view = 'stat -f -c "%T" /var/lib/alasio/workspaces 2>&1; grep " /var/lib/alasio" /proc/self/mountinfo || echo "no mount there"';
+    for (const pod of pods.filter((each) => each.status?.phase === "Running" && ["workspace-mount", "node-agent"].includes(each.metadata?.labels?.["app.kubernetes.io/component"] ?? ""))) {
+      const { namespace = "", name = "" } = pod.metadata ?? {};
+      const container = pod.spec?.containers[0]?.name ?? "";
+      const restarted = (pod.status?.containerStatuses?.[0]?.restartCount ?? 0) > 0;
+      for (const previous of restarted ? [true, false] : [false]) {
+        const logged = await kube.logs(namespace, name, container, { previous }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        say(`--- logs of ${container} of ${namespace}/${name}${previous ? ", before it restarted" : ""}:`);
+        for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
+      }
+      const seen = await kube.exec(namespace, name, ["sh", "-c", view], { container }).then(({ stdout, stderr }) => `${stdout}${stderr}`, (error: unknown) => String(error));
+      say(`--- alasio's directory of the node's as ${namespace}/${name} sees it:\n${seen.trimEnd()}`);
     }
     const waking = new Set(["neon-proxy", "neon-control", "neon-compute", "lake-loader", "lake-query", "lake-intake"]);
     const restarts = (pod: V1Pod) => (pod.status?.containerStatuses ?? []).some(({ restartCount }) => restartCount > 0);

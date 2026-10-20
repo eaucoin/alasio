@@ -30,7 +30,7 @@ import { memoryBytes } from "../../cli/src/capacity.ts";
 import type { KindName } from "../../cli/src/kube/api.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
-import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
+import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT, WORKSPACE_MOUNT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { pageserverName } from "../../cli/src/manifests/neon.ts";
 import { environmentAccess } from "../../cli/src/manifests/log.ts";
 import { WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
@@ -996,7 +996,7 @@ if (inShard("sessions")) {
     });
 
     // Last, as a restart of k3s ends the port forwards the tests before it reach the stand-ins through.
-    test("keeps pods pulled lazily running through a restart of k3s, and of stargz-snapshotter's daemon with it", { skip: (TARGET !== "host" || !ESTARGZ) && "k3s is restarted on its own where it is a service of the machine's, and its pods pulled lazily" }, async () => {
+    test("keeps pods pulled lazily running through a restart of k3s, and of stargz-snapshotter's daemon with it, the node's workspace mount ready again", { skip: (TARGET !== "host" || !ESTARGZ) && "k3s is restarted on its own where it is a service of the machine's, and its pods pulled lazily" }, async () => {
       const session = await newSession("none");
       const sessionName = (await sessionPod(session)).metadata?.name ?? "";
       const watched: [string, string][] = [[NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)], [SESSIONS, sessionName]];
@@ -1009,6 +1009,8 @@ if (inShard("sessions")) {
       assert.equal(await until("the session's bayma reached again", async () => await ran(), 300_000), "true");
       assert.deepEqual(await restarts(), before);
       assert.ok(await onRemoteSnapshot(SESSIONS, sessionName));
+      // The node's workspace mount, run from its image lazily too, ready again on the mount it kept.
+      await kube.awaitReady([ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE)], "5 minutes");
     });
   });
 

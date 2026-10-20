@@ -37,12 +37,13 @@ test("a run of a shard runs its suites alone, and a run of none every suite but 
   assert.deepEqual(SHARDS.filter((shard) => runsShard(undefined, shard)), ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling"]);
 });
 
-test("a node's logs are read for its errors as k3s, containerd and kubelet log them, and for no other line", () => {
+test("a node's logs are read for its errors as k3s, containerd, stargz-snapshotter's daemon and kubelet log them, and for no other line", () => {
   const errors = [
     `time="2026-10-16T13:20:01Z" level=error msg="failed to get CA certs: Get \\"https://172.30.0.2:6443/cacerts\\": dial tcp 172.30.0.2:6443: connect: connection refused"`,
     `time="2026-10-16T13:20:01Z" level=fatal msg="Error: failed to start containerd"`,
     "E1016 13:20:01.123456     118 kubelet.go:2412] \"Container runtime network not ready\"",
     "F1016 13:20:01.123456     118 server.go:310] failed to run Kubelet",
+    `{"error":"connection refused","level":"error","msg":"failed to restore remote snapshot","time":"2026-10-20T21:35:40Z"}`,
   ];
   const others = [
     `time="2026-10-16T13:20:01Z" level=info msg="Waiting for control-plane node to register"`,
@@ -50,6 +51,7 @@ test("a node's logs are read for its errors as k3s, containerd and kubelet log t
     "I1016 13:20:01.123456     118 kubelet.go:2412] \"Starting kubelet\"",
     "W1016 13:20:01.123456     118 sysinfo.go:203] Nodes topology is not available",
     "I1016 13:20:01.123456     118 kuberuntime_manager.go:1050] \"Pulled\" image=\"registry.local/app:E2024\"",
+    `{"level":"info","msg":"remote snapshot restored","time":"2026-10-20T21:35:41Z"}`,
   ];
   assert.deepEqual(errors.filter((line) => !LOGGED_ERROR.test(line)), []);
   assert.deepEqual(others.filter((line) => LOGGED_ERROR.test(line)), []);
