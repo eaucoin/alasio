@@ -216,9 +216,8 @@ export const BACKGROUND_READ_SECONDS_VARIABLE = "ALASIO_BACKGROUND_READ_SECONDS"
 
 /**
  * The slowest a resumed restore is taken to read the rest of its sandbox through the node
- * agent, in the background: half of what gate 4 measured on a runner's bundled SeaweedFS,
- * 8.7 MB/s through the agent's proxy from the restore's start to its last read
- * (program/progress/live-lazy.md).
+ * agent, in the background: half of what was measured on a runner's bundled SeaweedFS,
+ * 8.7 MB/s through the agent's proxy from the restore's start to its last read.
  */
 export const BACKGROUND_READ_BYTES_PER_SECOND = 4 * 1024 ** 2;
 

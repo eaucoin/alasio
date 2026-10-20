@@ -1,7 +1,7 @@
 /**
  * The harness host of one conversation, served over HTTP as ./wire.ts says, to the caller
  * that bears its token: `alasio harness`'s interface (./main.ts), which the control plane
- * reaches through 14.3's harness gateway.
+ * reaches through the sandbox gateway's front where its harnesses run in pools.
  *
  * A turn the host starts runs in the server's scope, not the request's: its caller may let
  * go of the call, as alasio does when it stops, and the turn goes on, its writes in the

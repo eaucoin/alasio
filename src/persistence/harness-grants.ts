@@ -5,9 +5,10 @@
  * session, its usage, what it waits on, a restart it causes, and its end, which lets go
  * of a restart recorded for it), and its job's progress; it reads the files a prompt
  * names, and the holds that keep a conversation busy as no turn. Telegram's updates, the
- * buttons, the outbox, making holds, the workspaces and the Codex login, which one relay
- * keeps (14.5) as two refreshing it would end it, are the control plane's alone. How much
- * less each pool's instances may do, a session's than a folder's, is 14.3's to decide.
+ * buttons, the outbox, making holds, the workspaces and the Codex login, which alasio alone
+ * keeps and refreshes, as two refreshing it would end it, are the control plane's alone.
+ * Every harness pool's pods, a session conversation's and a folder conversation's, write as
+ * this one role.
  */
 import { Effect } from "effect";
 

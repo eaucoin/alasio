@@ -127,7 +127,7 @@ export const FOLDER_TOKEN_FILE = `${FOLDER_TOKEN_DIRECTORY}/token`;
 /**
  * How long a folder instance's pod is given to stop: its bayma's CRIU dumps of its idle REPL
  * sessions, one at a time, each within bayma's own 120 s; a state of the box's size is dumped
- * in well under a minute (gate G8, program/13.4-folder-instances.md).
+ * in well under a minute.
  */
 export const FOLDER_STOP_SECONDS = 600;
 

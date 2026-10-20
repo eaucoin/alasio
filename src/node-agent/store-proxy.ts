@@ -30,7 +30,7 @@
  *
  * A restore reads through the proxy until its sandbox has every page it was saved with,
  * which it reads in the background once it is resumed. One over TCP whose agent stopped
- * meanwhile would be left without the rest, for good (gate 8 of program/12-live-lazy.md), as
+ * meanwhile would be left without the rest, for good, as
  * the agent that comes back is at another address. So the agent's stop waits on the proxy's
  * drain, which mints no token more, and ends once no restore over TCP reads through it,
  * within each token's time: none prepared and not resumed yet, none whose request is under
@@ -146,7 +146,7 @@ export const QUIET_MS = 60_000;
 /**
  * How long a resumed token lasts past each request of its restore's: longer than its gofer
  * waits between two attempts of a read (20 s at most, its pages' reads 10 s) and than a node
- * agent takes to come back (14 s, gate 8 of program/12-live-lazy.md), as a restore through
+ * agent takes to come back (14 s), as a restore through
  * the socket asks again of the agent that comes back.
  */
 export const ASKED_WINDOW_MS = 2 * 60_000;

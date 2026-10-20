@@ -27,9 +27,9 @@
  * written back from there, so the session resumes where its last instance left it. Claude
  * Code's transcript is written back as its session is resumed, as alasio's harness writes
  * it back (../harness/claude/sessions.ts sessionExists): a resume runs from the local
- * transcript, the store given it mirroring alone (G14.1 found its own load would serve
- * too). The Codex login is not kept here: one relay keeps it (14.5), as two refreshing it
- * would end it. The files a prompt names are written as each turn starts (./host.ts). What
+ * transcript, the store given it mirroring alone (its own load would serve too).
+ * The Codex login is not kept here: alasio alone keeps it, and relays it, as two refreshing
+ * it would end it. The files a prompt names are written as each turn starts (./host.ts). What
  * its harness does on its own between prompts it tells on its environment's events topic
  * (./host-events.ts HostEvents.onLog), as Events tells them, which alasio reads.
  *
