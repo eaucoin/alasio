@@ -138,15 +138,35 @@ import {
   computeActivity,
   computeDeployment,
   computeLsn,
+  type ComputePod,
   computePods,
+  computePodsLeft,
   type ComputeRef,
   computeCtlStatus,
   computeRuns,
   configureCompute,
+  reaches,
   restartCompute,
+  routedPods,
   scaleCompute,
+  setServing,
 } from "./computes.ts";
-import { type Activity, computeAddress, controlPlaneError, type Idleness, idleness, lsnDistance, proxyQuery, roleSecret, suspendDue, type Use, wakeCompute, woken } from "./endpoints.ts";
+import {
+  type Activity,
+  computeAddress,
+  controlPlaneError,
+  type Idleness,
+  idleness,
+  lsnDistance,
+  proxyQuery,
+  roleSecret,
+  suspendCompute,
+  suspendDue,
+  type Use,
+  wakeCompute,
+  withdrawCompute,
+  woken,
+} from "./endpoints.ts";
 import { bearsScope, computeCtlToken, publicJwks, signToken } from "./jwt.ts";
 import { createControlMetrics } from "./metrics.ts";
 import { reconcile, type Reconfigured, reconfigure, settledLayout, tookLayout } from "./reconfigure.ts";
@@ -214,6 +234,8 @@ const LEAD_INTERVAL_MS = 30_000;
 const WAKE_PATIENCE_MS = 180_000;
 /** How long a compute put to sleep is waited for to be gone. */
 const SUSPEND_PATIENCE_MS = 120_000;
+/** How long a compute's Service is waited for to reach none of the pods a sleep took off it. */
+const WITHDRAW_PATIENCE_MS = 15_000;
 /** How often a wake or a sleep looks again at what it waits for. */
 const POLL_MS = 250;
 /** How long a call of the storage controller may take: longer than its own waits for the pageserver. */
@@ -592,11 +614,11 @@ const hostOf = (compute: Compute): string => {
 
 /**
  * What the clients of the compute are doing, counted as neon-control's own role there
- * (./computes.ts), with its primary's password, which a replica has of its primary; fails
- * while it cannot log in.
+ * (./computes.ts), with its primary's password, which a replica has of its primary, at
+ * `host`, its Service unless given; fails while it cannot log in.
  */
-function activityOn(compute: Compute): Promise<Activity> {
-  return computeActivity(hostOf(compute), COMPUTE_PORT, MONITOR_ROLE, monitorPassword(computeId(compute.name)));
+function activityOn(compute: Compute, host = hostOf(compute)): Promise<Activity> {
+  return computeActivity(host, COMPUTE_PORT, MONITOR_ROLE, monitorPassword(computeId(compute.name)));
 }
 
 /** Waits until the compute has no pod, one stopping included, by `deadline`. */
@@ -607,19 +629,58 @@ async function untilGone(ref: ComputeRef, deployment: ComputeDeployment, deadlin
   }
 }
 
+/**
+ * Takes the compute's pods off its Service (./endpoints.ts's withdrawCompute), and waits
+ * until its EndpointSlices list none of them, and a connection to its address, as Neon's
+ * proxy makes one, is refused, by WITHDRAW_PATIENCE_MS: those pods, each at its own
+ * address, which neon-control counts it on.
+ */
+function withdraw(compute: Compute, deployment: ComputeDeployment): Promise<readonly ComputePod[]> {
+  const ref = computeOf(compute);
+  const deadline = Date.now() + WITHDRAW_PATIENCE_MS;
+  return withdrawCompute({
+    pods: () => computePodsLeft(ref, deployment),
+    takeOff: async (pod) => {
+      if (pod.serving) await setServing(ref, pod.name, false);
+    },
+    listed: async (pods) => {
+      const routed = await routedPods(ref);
+      return pods.some(({ name }) => routed.has(name));
+    },
+    reached: () => reaches(hostOf(compute), COMPUTE_PORT),
+    pause: async (still) => {
+      if (Date.now() > deadline) throw new Error(`${ref.namespace}'s ${ref.name}: ${still}`);
+      await sleep(POLL_MS);
+    },
+  });
+}
+
+/** Gives the compute's pods left back to its Service: those a sleep took off it. */
+async function giveBack(ref: ComputeRef): Promise<void> {
+  const deployment = await computeDeployment(ref);
+  if (!deployment) return;
+  for (const pod of await computePodsLeft(ref, deployment)) if (!pod.serving) await setServing(ref, pod.name, true);
+}
+
+/** Ends the compute's stop: its pods given back to its Service, and it recorded stopping no longer. */
+async function resume(compute: Compute): Promise<void> {
+  await giveBack(computeOf(compute));
+  await record.endedStopping(idOf(compute));
+}
+
 /** The wakes under way, by compute: concurrent wakes of one compute share one. */
 const waking = new Map<string, Promise<boolean>>();
 
 /**
  * Wakes the compute (wakeCompute), and records it asked to wake, which keeps it awake a
  * while longer (suspendIdle), where the record can be written, as a compute that runs
- * needs nothing of it to be reached. One that sleeps it scales to one under the
- * compute's lock, waited for as long as the wake may take, longer than a sleep holds it,
- * so it never finds the pod a sleep is stopping, once the pod put to sleep is gone, so no
- * two serve the timeline at once. Then it waits until neon-control logs in to it, so its
- * clients may (./computes.ts), for as long as WAKE_PATIENCE_MS in all. Whether it slept.
- * A wake asked again, by the proxy after a restart of neon-control, finds it scaling,
- * and waits again.
+ * needs nothing of it to be reached. One that sleeps, or that a sleep is stopping, it
+ * scales to one under the compute's lock, waited for as long as the wake may take, longer
+ * than a sleep holds it, so it never finds the pod a sleep is stopping, once the pod put to
+ * sleep is gone, so no two serve the timeline at once. Then it waits until neon-control
+ * logs in to it, so its clients may (./computes.ts), for as long as WAKE_PATIENCE_MS in
+ * all. Whether it slept. A wake asked again, by the proxy after a restart of neon-control,
+ * finds it scaling, and waits again.
  */
 function wake(compute: Compute): Promise<boolean> {
   const id = idOf(compute);
@@ -636,8 +697,13 @@ function wake(compute: Compute): Promise<boolean> {
   const woke = wakeCompute({
     deployment,
     asked: () => record.woke(id).catch((error: unknown) => log("wake not recorded", { compute: id, error: errorText(error) })),
+    stopping: () => record.stopping().then((stopping) => stopping.has(id), () => false),
     locked: (scaling) => record.computeLocked(id, scaling, deadline - Date.now()),
     untilGone: (now) => untilGone(ref, now, deadline),
+    resume: async () => {
+      await resume(compute);
+      log("compute's stop ended by a wake, its sleep never finished", { compute: id });
+    },
     scaleUp: () => scaleCompute(ref, 1),
     accepts: () =>
       activityOn(compute).then(() => true, (error: unknown) => {
@@ -662,28 +728,37 @@ function wake(compute: Compute): Promise<boolean> {
 /** Each running compute's idleness, as the replica that leads last counted it. */
 const idle = new Map<string, Idleness>();
 
-/** What the compute's clients have done, and when it was last asked to wake. */
-async function useOf(compute: Compute): Promise<Use> {
+/** What the compute's clients have done, counted at `host`, its Service unless given, and when it was last asked to wake. */
+async function useOf(compute: Compute, host?: string): Promise<Use> {
   const id = idOf(compute);
-  const [activity, computes] = await Promise.all([activityOn(compute), record.computes()]);
+  const [activity, computes] = await Promise.all([activityOn(compute, host), record.computes()]);
   return { ...activity, wokenAt: computes.find((compute) => compute.id === id)?.wokenAt ?? null };
 }
 
 /**
  * Puts to sleep each running compute that has had no client session, nor been asked to
- * wake, for as long as its Deployment says: under the compute's lock, counted again
- * first, so a session opened since is not cut, nor a wake asked for since undone, and
- * waiting until its pod is gone, so a wake after finds it gone. One whose lock a wake
- * holds is left until the next round. Says how many replicas each compute runs.
+ * wake, for as long as its Deployment says, as ./endpoints.ts's suspendCompute does: under
+ * the compute's lock, marked stopping and taken off its Service, until a connection to it is
+ * refused, then counted again on its pod, so a session opened since is not cut, nor a wake
+ * asked for since undone, and waiting until its pod is gone, so a wake after finds it gone.
+ * One whose lock a wake holds is left until the next round. A stop no sleep is under way
+ * in, its neon-control stopped in it, is ended first. Says how many replicas each compute
+ * runs.
  */
 async function suspendIdle(computes: readonly Compute[]): Promise<void> {
   const replicas = new Map<string, number>();
   // A compute deleted since is counted no more.
   const ids = new Set(computes.map(idOf));
   for (const id of idle.keys()) if (!ids.has(id)) idle.delete(id);
+  // None read where the record cannot be, as no compute's lock can be taken then either.
+  const stopping = await record.stopping().catch(() => new Set<string>());
   for (const compute of computes) {
     const id = idOf(compute);
     try {
+      if (stopping.has(id)) {
+        const ended = await record.tryComputeLocked(id, () => resume(compute));
+        if (ended) log("compute's stop ended by the leader's round, its sleep never finished", { compute: id });
+      }
       const ref = computeOf(compute);
       const deployment = await computeDeployment(ref);
       if (deployment) replicas.set(id, deployment.replicas);
@@ -696,16 +771,27 @@ async function suspendIdle(computes: readonly Compute[]): Promise<void> {
       if (!suspendDue(counted, Date.now(), deployment.suspendAfterMs)) continue;
       const suspendAfterMs = deployment.suspendAfterMs;
       const slept = await record.tryComputeLocked(id, async () => {
-        const recounted = idleness(counted, await useOf(compute), Date.now());
-        if (recounted.since === null) {
-          idle.set(id, recounted);
-          return false;
-        }
-        await scaleCompute(ref, 0);
-        idle.delete(id);
-        await untilGone(ref, deployment, Date.now() + SUSPEND_PATIENCE_MS);
-        await record.suspended(id);
-        return true;
+        const asleep = await suspendCompute({
+          mark: () => record.beganStopping(id),
+          withdraw: () => withdraw(compute, deployment),
+          used: async (pods) => {
+            // One, as it runs one replica, its pod made anew only once the last is gone.
+            const [pod, ...others] = pods;
+            if (!pod?.ip || others.length > 0) throw new Error(`${ref.namespace}'s ${ref.name} has ${pods.length} pods left, not one with an address, to count it on`);
+            const recounted = idleness(counted, await useOf(compute, pod.ip), Date.now());
+            idle.set(id, recounted);
+            return recounted.since === null;
+          },
+          restore: () => resume(compute),
+          scaleDown: async () => {
+            await scaleCompute(ref, 0);
+            idle.delete(id);
+          },
+          untilGone: () => untilGone(ref, deployment, Date.now() + SUSPEND_PATIENCE_MS),
+          unmark: () => record.endedStopping(id),
+        });
+        if (asleep) await record.suspended(id);
+        return asleep;
       });
       if (!slept?.value) continue;
       replicas.set(id, 0);

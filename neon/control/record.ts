@@ -2,9 +2,9 @@
  * neon-control's record, in the storage controller's Postgres, in a schema of its own
  * (`neon_control`), so that it outlives any replica of neon-control and is shared by all
  * of them: a row of each branch, its name and its record as ./branches.ts has it; a row
- * of each compute woken or put to sleep, and when; where the tenant's shards are, as the
- * storage controller last said, which every compute's spec names; and of each compute,
- * where its spec last said they were.
+ * of each compute woken or put to sleep, and when; of each a sleep is stopping; where the
+ * tenant's shards are, as the storage controller last said, which every compute's spec
+ * names; and of each compute, where its spec last said they were.
  *
  * What changes branches runs under one lock, a session's advisory lock on the database,
  * so two replicas never change them at once, nor repair a timeline whose deletion one of
@@ -39,7 +39,7 @@ const LEADER_LOCK = 0x6e65_6f6e_5f6c_6472n;
 const LAYOUT_LOCK = 0x6e65_6f6e_5f6c_6179n;
 
 /** The first of the two keys of each compute's advisory lock, the second its id's hash: `neon`, its bytes read as a number. */
-const COMPUTE_LOCKS = 0x6e65_6f6e;
+export const COMPUTE_LOCKS = 0x6e65_6f6e;
 
 /** What every connection is made with: a bound on connecting, and keepalives, the client's and the server's. */
 const CONNECTION = {
@@ -108,6 +108,7 @@ export class BranchRecord {
       await client.query("create table if not exists neon_control.computes (id text primary key, woken_at timestamptz, suspended_at timestamptz)");
       await client.query("create table if not exists neon_control.layout (tenant_id text primary key, layout jsonb not null)");
       await client.query("create table if not exists neon_control.compute_layouts (id text primary key, layout jsonb not null)");
+      await client.query("create table if not exists neon_control.compute_stops (id text primary key, since timestamptz not null default now())");
     });
   }
 
@@ -159,6 +160,22 @@ export class BranchRecord {
       "insert into neon_control.computes (id, suspended_at) values ($1, now()) on conflict (id) do update set suspended_at = excluded.suspended_at",
       [id],
     );
+  }
+
+  /** Records the compute `id` stopping: a sleep has begun to stop it (./endpoints.ts's suspendCompute). */
+  async beganStopping(id: string): Promise<void> {
+    await this.#pool.query("insert into neon_control.compute_stops (id) values ($1) on conflict (id) do nothing", [id]);
+  }
+
+  /** Records the compute `id` no longer stopping: its sleep done, or given up. */
+  async endedStopping(id: string): Promise<void> {
+    await this.#pool.query("delete from neon_control.compute_stops where id = $1", [id]);
+  }
+
+  /** The computes recorded stopping, by their ids. */
+  async stopping(): Promise<Set<string>> {
+    const { rows } = await this.#pool.query<{ id: string }>("select id from neon_control.compute_stops");
+    return new Set(rows.map(({ id }) => id));
   }
 
   /** Where the shards of the tenant `tenantId` are, as recorded; null before the first record of it. */
@@ -258,7 +275,15 @@ export class BranchRecord {
   /**
    * Runs `work` on a connection of its own holding the advisory lock `key` (one key, or
    * two: a class and a name hashed), waited for as long as the record's patience
-   * (RecordBusy after that). The lock ends with the connection.
+   * (RecordBusy after that). The lock ends with the connection, and nothing tells `work`
+   * that connection is lost while it runs (the server restarted, or the network gone for
+   * longer than the keepalives allow): `work` goes on without the lock, which another
+   * replica may take. A sleep that loses a compute's lock so (#trying's, as
+   * ./service.ts's suspendIdle takes it) may scale the compute to none after a wake has
+   * taken the lock, found the compute running and marked stopping, ended that stop as one
+   * a sleep left, and let its client through: that client's session is cut, and its next
+   * connection wakes the compute again, once the pod put to sleep is gone, as every wake
+   * waits for, so no two pods serve it at once even then.
    */
   async #holding<T>(key: bigint | readonly [number, string], lock: RecordLock, what: string, work: (client: pg.Client) => Promise<T>, patienceMs = this.#patienceMs): Promise<T> {
     const client = this.#client();

@@ -13,7 +13,10 @@
  *   pods whole, their images among it;
  * - a compute's Deployment neon-control patches changes its pod template's restartedAt
  *   annotation alone, which restarts it (neon/control/computes.ts): RBAC lets it patch the
- *   Deployment whole, its image and command among it.
+ *   Deployment whole, its image and command among it;
+ * - a pod neon-control patches is a compute's, and changes its serving label alone, which
+ *   takes it off its Service as a sleep stops it: RBAC lets it patch any pod of a
+ *   compute's namespace whole.
  *
  * Where a policy holds an object to a rendered one, `pinned` makes the CEL that says so:
  * the object's fields are the rendered ones', key for key and item for item, but for what
@@ -23,6 +26,7 @@ import { posix } from "node:path";
 
 import type { KubernetesObject, V1Container, V1PodSpec, V1PodTemplateSpec } from "@kubernetes/client-node";
 
+import { SERVING_LABEL } from "../../../neon/control/endpoints.ts";
 import { BINDING_LABEL, FREE_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../../src/binder/names.ts";
 import { branchNamespace, branchSessionsNamespace } from "../../../src/branch/names.ts";
 import { ATTACH_VOLUME, FOLDER_KEY_PREFIX, FOLDER_POOL, FOLDER_POD, folderPodSpec, folderTokenSecret, ownDirectory, SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
@@ -204,6 +208,41 @@ export function computeRestartPolicy(): KubernetesObject[] {
   ], [
     { name: "oldAnnotations", expression: "oldObject.spec.template.metadata.?annotations.orValue({})" },
     { name: "newAnnotations", expression: "object.spec.template.metadata.?annotations.orValue({})" },
+  ]);
+}
+
+/** The components of the computes' pods: a primary's, and a read replica's. */
+const COMPUTE_COMPONENTS = ["neon-compute", "neon-compute-ro"];
+
+/**
+ * What neon-control may change of a pod, which RBAC lets it patch whole, of any in a
+ * compute's namespace (./neon.ts's computeScaling): of a compute's pod, its serving label
+ * (neon/control/endpoints.ts's SERVING_LABEL), which takes it off its Service as a sleep
+ * stops it, or gives it back, and nothing else.
+ */
+export function computeServingPolicy(): KubernetesObject[] {
+  const component = "app.kubernetes.io/component";
+  const account = `system:serviceaccount:${NAMESPACE}:${neonName("control")}`;
+  return admissionPolicy(componentName("compute-serving"), [{ apiGroups: [""], resources: ["pods"], operations: ["UPDATE"] }], `request.userInfo.username == "${account}"`, [
+    { expression: "object.spec == oldObject.spec", message: "neon-control changes no pod's spec" },
+    {
+      expression: `"${component}" in variables.oldLabels && variables.oldLabels["${component}"] in ${JSON.stringify(COMPUTE_COMPONENTS)}`,
+      message: "neon-control labels no pod but a compute's",
+    },
+    {
+      expression: "object.metadata.?annotations.orValue({}) == oldObject.metadata.?annotations.orValue({}) && " +
+        "object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) && " +
+        "object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([])",
+      message: "neon-control changes no pod's annotations, finalizers or owners",
+    },
+    { expression: unchanged("Labels", [SERVING_LABEL]), message: `neon-control changes no label of a pod's but ${SERVING_LABEL}` },
+    {
+      expression: `!("${SERVING_LABEL}" in variables.newLabels) || variables.newLabels["${SERVING_LABEL}"] == "true"`,
+      message: `neon-control sets ${SERVING_LABEL} to true alone, or takes it off`,
+    },
+  ], [
+    { name: "oldLabels", expression: "oldObject.metadata.?labels.orValue({})" },
+    { name: "newLabels", expression: "object.metadata.?labels.orValue({})" },
   ]);
 }
 

@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Node, V1Pod, V1PodSpec, V1PriorityClass, V1StatefulSet } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1CronJob, V1Deployment, V1EndpointSlice, V1Job, V1Node, V1Pod, V1PodSpec, V1PriorityClass, V1StatefulSet } from "@kubernetes/client-node";
 import pg, { type QueryResultRow } from "pg";
 
 import { cpuMillis } from "../../cli/src/capacity.ts";
@@ -30,8 +30,9 @@ import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { AGENTS, alasioOk, type Forward, kube, lakeQuery, paths, ref, runCronJob, tcp } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
 import { type Branch, type BranchView, COMPUTE_PORT, computeId, MAIN, type ReadyBranch, replicaId, tokenSha256 } from "../control/branches.ts";
-import { SUSPEND_AFTER } from "../control/endpoints.ts";
+import { SERVING_LABEL, SUSPEND_AFTER } from "../control/endpoints.ts";
 import { computeCtlToken, signToken } from "../control/jwt.ts";
+import { COMPUTE_LOCKS } from "../control/record.ts";
 import { scramVerifier } from "../control/scram.ts";
 import type { StackSecrets } from "../control/secrets.ts";
 import { GATHER_MS } from "../lake/src/loader.ts";
@@ -201,10 +202,12 @@ async function patchedAsNeonControl(path: string, patch: unknown): Promise<{ sta
 /** The tenant of alasio's timelines; set by the suite's first hook. */
 let tenantId: string;
 
+/** Runs `sql` on neon-control's record, in the storage controller's Postgres: what psql printed. */
+const onRecord = (sql: string) => kube.execOk(NAMESPACE, `${neonName("controller-db")}-0`, ["psql", "-U", "storage_controller", "-d", "storage_controller", "-Atc", sql], { container: "postgres" });
+
 /** The branches as neon-control recorded them, in the storage controller's Postgres, read there. */
 async function recorded(): Promise<Branch[]> {
-  const pod = `${neonName("controller-db")}-0`;
-  const rows = await kube.execOk(NAMESPACE, pod, ["psql", "-U", "storage_controller", "-d", "storage_controller", "-Atc", "select branch from neon_control.branches"], { container: "postgres" });
+  const rows = await onRecord("select branch from neon_control.branches");
   return rows.trim().split("\n").filter(Boolean).map((row) => JSON.parse(row) as Branch);
 }
 
@@ -652,7 +655,7 @@ export function neonStack(): void {
         const set = ref("StatefulSet", neonName("pageserver"), NAMESPACE);
         /** Where neon-control's record has the tenant's shards: their pageservers' Services, in shard order. */
         const recorded = async () => {
-          const layout = (await kube.execOk(NAMESPACE, `${neonName("controller-db")}-0`, ["psql", "-U", "storage_controller", "-d", "storage_controller", "-Atc", `select layout from neon_control.layout where tenant_id = '${tenantId}'`], { container: "postgres" })).trim();
+          const layout = (await onRecord(`select layout from neon_control.layout where tenant_id = '${tenantId}'`)).trim();
           return (JSON.parse(layout) as { pageservers: string[] }).pageservers.map((address) => address.split(".")[0]);
         };
         const before = await computePod();
@@ -681,8 +684,6 @@ export function neonStack(): void {
 
       explainedTest("restarts a compute that started on shards placed before, which never comes to run, once the storage controller notifies where they are, and gives a running one its spec live", async () => {
         const COMPUTE = ref("Deployment", neonName("compute"), NAMESPACE);
-        /** Runs `sql` on neon-control's record, in the storage controller's Postgres. */
-        const onRecord = (sql: string) => kube.execOk(NAMESPACE, `${neonName("controller-db")}-0`, ["psql", "-U", "storage_controller", "-d", "storage_controller", "-Atc", sql], { container: "postgres" });
         // What the storage controller notifies of where the shards are.
         const located = await controller<{ shards: { node_id: number }[]; shard_params: { stripe_size: number } }>("GET", `/debug/v1/tenant/${tenantId}/locate`);
         const notification = { tenant_id: tenantId, stripe_size: located.shard_params.stripe_size, shards: located.shards.map(({ node_id }, shard_number) => ({ node_id, shard_number })) };
@@ -793,6 +794,24 @@ export function neonStack(): void {
         } finally {
           // The restart it let through rolled the compute: done, its old pod gone, before the tests after it count the stack's pods.
           await kube.awaitReady([ref("Deployment", neonName("compute"), NAMESPACE)], "5 minutes");
+        }
+      });
+
+      test("lets neon-control change no more of a pod than a compute's serving label, which takes it off its Service as a sleep stops it", async () => {
+        const pathOf = (pod: string) => `/api/v1/namespaces/${NAMESPACE}/pods/${pod}`;
+        const compute = pathOf(await kube.runningPod(NAMESPACE, neonName("compute")));
+        const labelled = (labels: Record<string, string | null>) => ({ metadata: { labels } });
+        for (const serving of [null, "true"]) assert.equal((await patchedAsNeonControl(compute, labelled({ [SERVING_LABEL]: serving }))).status, 200, String(serving));
+        const refused: [string, unknown][] = [
+          [compute, labelled({ [SERVING_LABEL]: "false" })],
+          [compute, labelled({ "e2e.alasio.dev/other": "x" })],
+          [compute, { metadata: { annotations: { "e2e.alasio.dev/other": "x" } } }],
+          [compute, { spec: { activeDeadlineSeconds: 60 } }],
+          [pathOf(await kube.runningPod(NAMESPACE, neonName("proxy"))), labelled({ [SERVING_LABEL]: "true" })],
+        ];
+        for (const [path, patch] of refused) {
+          const { status, text } = await patchedAsNeonControl(path, patch);
+          assert.ok(status === 422 && text.includes("ValidatingAdmissionPolicy 'alasio-compute-serving'"), `${path} ${JSON.stringify(patch)}: ${status} ${text}`);
         }
       });
 
@@ -1591,6 +1610,75 @@ export function neonStack(): void {
         }
       }
 
+      /** A client of main's compute, through the proxy, connecting, with alasio's patience: whether it connected, or why not. */
+      function connecting(): { client: pg.Client; connected: Promise<true | unknown> } {
+        const client = new pg.Client({ connectionString: databaseUrl, connectionTimeoutMillis: 120_000 });
+        client.on("error", () => {});
+        return { client, connected: client.connect().then(() => true, (error: unknown) => error) };
+      }
+
+      /** Main's compute's pod that runs, once it is ready: its name, and its address. */
+      async function runningCompute(): Promise<{ name: string; ip: string }> {
+        await kube.awaitReady([COMPUTE_DEPLOYMENT], "5 minutes");
+        const name = await kube.runningPod(NAMESPACE, neonName("compute"));
+        const ip = (await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))?.status?.podIP;
+        assert.ok(ip, `${name} has no address`);
+        return { name, ip };
+      }
+
+      /** Whether main's compute's pod `pod` is its Service's (SERVING_LABEL). */
+      const serving = async (pod: string) => (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.metadata?.labels?.[SERVING_LABEL] === "true";
+
+      /** Whether neon-control's record has main's compute stopping, as a sleep marks it (neon/control/endpoints.ts's suspendCompute). */
+      const markedStopping = async () => (await onRecord("select count(*) from neon_control.compute_stops where id = 'alasio'")).trim() === "1";
+
+      /** How many of the computes' locks in neon-control's record are held (`granted`), or waited for. */
+      const computeLocks = async (granted: boolean) =>
+        Number((await onRecord(`select count(*) from pg_locks where locktype = 'advisory' and classid = ${COMPUTE_LOCKS} and granted = ${granted}`)).trim());
+
+      /** Waits until a wake waits for a compute's lock, which another holds, for as long as `timeoutMs`. */
+      async function untilWakeWaits(timeoutMs: number): Promise<void> {
+        const deadline = Date.now() + timeoutMs;
+        while ((await computeLocks(false)) === 0) {
+          assert.ok(Date.now() < deadline, "no wake waited for the compute's lock");
+          await sleep(200);
+        }
+      }
+
+      /**
+       * Waits until the EndpointSlices the cluster keeps of main's compute's Service list its
+       * pod `pod` no more, and then for as long as kube-proxy, on every node, takes to route by
+       * them: a connection to the Service is refused from then on.
+       */
+      async function untilUnrouted(pod: string): Promise<void> {
+        const sliced = async () =>
+          (await kube.list<V1EndpointSlice>("EndpointSlice", { namespace: NAMESPACE, labelSelector: selectorOf({ "kubernetes.io/service-name": neonName("compute"), "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io" }) }))
+            .some(({ endpoints }) => (endpoints ?? []).some(({ targetRef }) => targetRef?.name === pod));
+        const deadline = Date.now() + 30_000;
+        while (await sliced()) {
+          assert.ok(Date.now() < deadline, `the compute's Service routes to ${pod} still`);
+          await sleep(200);
+        }
+        // Its sync, a second at least.
+        await sleep(3000);
+      }
+
+      /**
+       * Leaves a stop of main's compute behind, as a sleep whose neon-control was stopped in
+       * it leaves one: the compute marked stopping in neon-control's record, and its pod `pod`
+       * taken off its Service. The function that ends it, if a test has not: the pod given
+       * back, and the mark cleared.
+       */
+      async function stopLeft(pod: string): Promise<() => Promise<void>> {
+        const labelled = (value: string | null) => kube.patch(ref("Pod", pod, NAMESPACE), { metadata: { labels: { [SERVING_LABEL]: value } } });
+        await onRecord("insert into neon_control.compute_stops (id) values ('alasio') on conflict (id) do nothing");
+        await labelled(null);
+        return async () => {
+          await labelled("true");
+          await onRecord("delete from neon_control.compute_stops where id = 'alasio'");
+        };
+      }
+
       after(async () => {
         if (installedSuspend !== undefined) await kube.patch(COMPUTE_DEPLOYMENT, { metadata: { annotations: { [SUSPEND_AFTER]: installedSuspend } } });
         for (const pass of PASSES) await suspend(pass, false);
@@ -1726,8 +1814,63 @@ export function neonStack(): void {
         }
       });
 
-      test("is put to sleep by neon-control once idle as long as its Deployment says, a client connecting as it stops finding it awake again, and never two of it at once", async () => {
+      test("ends a stop its neon-control was stopped in at the next wake, which gives the compute's pod back to its Service and lets the client through to it", async () => {
+        await connected();
+        const pod = await runningCompute();
+        // The compute's lock held, as a sleep holds it, until a wake waits for it: the leader's
+        // round, which ends a stop it finds too, finds it held meanwhile, and the wake, waiting,
+        // takes it as it is let go.
+        const held = onRecord(`select pg_advisory_lock(${COMPUTE_LOCKS}, hashtext('alasio')); select pg_sleep(20)`);
+        let ended = async () => {};
+        try {
+          const deadline = Date.now() + 10_000;
+          while ((await computeLocks(true)) === 0) {
+            assert.ok(Date.now() < deadline, "the compute's lock was not taken");
+            await sleep(200);
+          }
+          ended = await stopLeft(pod.name);
+          await untilUnrouted(pod.name);
+          const { client, connected: through } = connecting();
+          try {
+            await untilWakeWaits(10_000);
+            await held;
+            assert.equal(await through, true);
+            const served = await client.query<{ address: string }>("select host(inet_server_addr()) as address");
+            assert.equal(served.rows[0]?.address, pod.ip, "served by the compute's pod given back");
+            assert.ok(await serving(pod.name), "the compute's pod is its Service's again");
+            assert.ok(!(await markedStopping()), "the compute is recorded stopping still");
+            assert.ok((await controlLogs()).some((line) => line.includes('"compute\'s stop ended by a wake, its sleep never finished"') && line.includes('"compute":"alasio"')));
+          } finally {
+            await client.end().catch(() => {});
+          }
+        } finally {
+          await held.catch(() => {});
+          await ended();
+        }
+      });
+
+      test("ends a stop its neon-control was stopped in at the leader's next round, where no wake comes first, which gives the compute's pod back to its Service", async () => {
+        await connected();
+        const pod = await runningCompute();
+        const ended = await stopLeft(pod.name);
+        try {
+          // Three of the leader's rounds.
+          const deadline = Date.now() + 90_000;
+          while (!(await serving(pod.name)) || (await markedStopping())) {
+            assert.ok(Date.now() < deadline, "the leader's round did not end the compute's stop");
+            await sleep(1000);
+          }
+          assert.ok((await controlLogs()).some((line) => line.includes('"compute\'s stop ended by the leader\'s round, its sleep never finished"') && line.includes('"compute":"alasio"')));
+          assert.equal((await runningCompute()).name, pod.name);
+          assert.ok((await connected()) < 60_000);
+        } finally {
+          await ended();
+        }
+      });
+
+      test("is put to sleep by neon-control once idle as long as its Deployment says, a client connecting as it stops, its pod not yet gone, finding it woken, and never two of it at once", async () => {
         await suspendingAfter(60);
+        // The proxy keeps the compute's address from now on, for longer than the compute stays awake.
         await connected();
         // Every compute pod whose containers may run, a stopping one too, counted all the while:
         // one deleted whose containers all ended is in a terminal phase until it is gone.
@@ -1747,14 +1890,25 @@ export function neonStack(): void {
           const deadline = Date.now() + 240_000;
           while ((await kube.get<V1Deployment>(COMPUTE_DEPLOYMENT))?.spec?.replicas !== 0) {
             assert.ok(Date.now() < deadline, "neon-control did not put the compute to sleep");
-            await sleep(200);
+            await sleep(100);
           }
-          // As it stops: a connection may yet reach the pod stopping, which ends it; asked again, as
-          // alasio's pool asks, one gets through to the compute woken once that pod is gone.
-          const asked = Date.now();
-          while (!(await connected().then(() => true, () => false)) || (await kube.get<V1Deployment>(COMPUTE_DEPLOYMENT))?.spec?.replicas !== 1) {
-            assert.ok(Date.now() - asked < 120_000, "no connection got through to the compute woken again");
-            await sleep(1000);
+          // As it stops, its pod not yet gone: one connection, through the address the proxy keeps,
+          // asked once, is not let through to that pod, which would end it, but gets through to the
+          // compute woken once that pod is gone, and keeps its session.
+          const stopping = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: COMPUTE_PODS });
+          assert.ok(stopping.length > 0, "the compute's pod was gone before a connection was made as it stopped");
+          const client = new pg.Client({ connectionString: databaseUrl, connectionTimeoutMillis: 120_000 });
+          client.on("error", () => {});
+          try {
+            await client.connect();
+            const served = await client.query<{ address: string }>("select host(inet_server_addr()) as address");
+            const left = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: COMPUTE_PODS });
+            assert.deepEqual(left.filter(({ metadata }) => stopping.some((pod) => pod.metadata?.uid === metadata?.uid)), [], "the pod stopping is gone");
+            assert.ok(!stopping.some(({ status }) => status?.podIP === served.rows[0]?.address), `served by the pod stopping, at ${served.rows[0]?.address}`);
+            assert.equal((await kube.get<V1Deployment>(COMPUTE_DEPLOYMENT))?.spec?.replicas, 1);
+            assert.deepEqual((await client.query<{ one: number }>("select 1 as one")).rows, [{ one: 1 }]);
+          } finally {
+            await client.end().catch(() => {});
           }
         } finally {
           counting = false;
@@ -1762,6 +1916,56 @@ export function neonStack(): void {
         }
         assert.equal(most, 1, `two compute pods ran at once: ${seen}`);
         assert.ok((await controlLogs()).some((line) => line.includes('"compute suspended"') && line.includes('"compute":"alasio"')));
+      });
+
+      test("lets a client connecting as a sleep stops the compute, its pod taken off its Service and not yet counted again, not through to that pod, but through a wake, which the sleep counts and keeps the compute awake for", async () => {
+        await suspendingAfter(60);
+        // The proxy keeps the compute's address from now on, for longer than the compute stays awake.
+        await connected();
+        const pod = await runningCompute();
+        // An EndpointSlice of the compute's Service of the test's own, listing its pod, not
+        // ready, at an address no pod has (TEST-NET-1's), so kube-proxy, which takes an endpoint
+        // by its address, routes nothing by it, and the sleep, which waits until no slice lists
+        // the pod it takes off the Service, waits on it: the sleep held there, between the pod
+        // taken off and the compute counted again, while the slice is listed.
+        const slice = ref("EndpointSlice", `${neonName("compute")}-e2e-held`, NAMESPACE);
+        const holding: V1EndpointSlice = {
+          apiVersion: slice.apiVersion,
+          kind: slice.kind,
+          metadata: { name: slice.name, namespace: NAMESPACE, labels: { "kubernetes.io/service-name": neonName("compute"), "endpointslice.kubernetes.io/managed-by": "e2e.alasio.dev" } },
+          addressType: "IPv4",
+          endpoints: [{ addresses: ["192.0.2.1"], conditions: { ready: false, serving: false, terminating: false }, targetRef: { kind: "Pod", name: pod.name, namespace: NAMESPACE } }],
+          ports: [{ name: "postgres", port: COMPUTE_PORT, protocol: "TCP" }],
+        };
+        await kube.apply(holding);
+        try {
+          const deadline = Date.now() + 240_000;
+          while (await serving(pod.name)) {
+            assert.ok(Date.now() < deadline, "neon-control did not begin to put the compute to sleep");
+            await sleep(100);
+          }
+          assert.ok(await markedStopping(), "the compute taken off its Service is not recorded stopping");
+          await untilUnrouted(pod.name);
+          const { client, connected: through } = connecting();
+          try {
+            await untilWakeWaits(8000);
+            await kube.remove(slice);
+            assert.equal(await through, true);
+            const served = await client.query<{ address: string }>("select host(inet_server_addr()) as address");
+            assert.equal(served.rows[0]?.address, pod.ip, "served by the compute's pod, kept awake");
+            assert.equal((await runningCompute()).name, pod.name);
+            assert.equal((await kube.get<V1Deployment>(COMPUTE_DEPLOYMENT))?.spec?.replicas, 1);
+            assert.ok(await serving(pod.name), "the compute's pod is its Service's again");
+            assert.ok(!(await markedStopping()), "the compute is recorded stopping still");
+            assert.deepEqual((await client.query<{ one: number }>("select 1 as one")).rows, [{ one: 1 }]);
+          } finally {
+            await client.end().catch(() => {});
+          }
+          // Given up as it counted the wake, not as it waited on the slice past its patience.
+          assert.deepEqual((await controlLogs()).filter((line) => line.includes("its EndpointSlices list its pods taken off it")), []);
+        } finally {
+          await kube.remove(slice);
+        }
       });
 
       test("keeps a compute awake while a client's idle session holds an advisory lock, and puts it to sleep once that ends", async () => {

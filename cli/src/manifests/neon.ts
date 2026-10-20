@@ -21,10 +21,10 @@ import type {
 } from "@kubernetes/client-node";
 
 import { COMPUTE_CTL_PORT, COMPUTE_PORT, computeId, MAIN, REPLICA_SUFFIX, replicaId } from "../../../neon/control/branches.ts";
-import { SUSPEND_AFTER } from "../../../neon/control/endpoints.ts";
+import { SERVING_LABEL, SUSPEND_AFTER } from "../../../neon/control/endpoints.ts";
 import { DATABASE, PAGESERVER_ZONE, ROLE } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
-import { computeRestartPolicy } from "./admission.ts";
+import { computeRestartPolicy, computeServingPolicy } from "./admission.ts";
 import {
   claimSpec,
   collectorRuns,
@@ -505,9 +505,11 @@ export const PROXY_PORT = 5432;
  * What neon-control may do to the compute of `namespace`, main's or a branch
  * environment's, and to its read replica: read its Deployment, and restart it, to start on
  * a spec anew, and scale it, waking it and putting it to sleep, and list its pods, to see
- * one put to sleep gone before it wakes it; a Role there, bound to neon-control's
- * ServiceAccount in main's. Of a Deployment it patches, it may change the restart's
- * annotation alone (./admission.ts's computeRestartPolicy).
+ * one put to sleep gone before it wakes it, and label them, taking one off its Service as
+ * it puts it to sleep, and list the Service's EndpointSlices, to see it taken off; a Role
+ * there, bound to neon-control's ServiceAccount in main's. Of a Deployment it patches, it
+ * may change the restart's annotation alone (./admission.ts's computeRestartPolicy), and
+ * of a pod, a compute's, its serving label alone (computeServingPolicy).
  */
 export function computeScaling(namespace: string): KubernetesObject[] {
   const name = neonName("control");
@@ -519,8 +521,9 @@ export function computeScaling(namespace: string): KubernetesObject[] {
     rules: [
       { apiGroups: ["apps"], resources: ["deployments"], resourceNames: [neonName("compute"), REPLICA_NAME], verbs: ["get", "patch"] },
       { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: [neonName("compute"), REPLICA_NAME], verbs: ["patch"] },
-      // A list is of a namespace's pods, as no name narrows it.
-      { apiGroups: [""], resources: ["pods"], verbs: ["list"] },
+      // Of a namespace's pods, as no name narrows a list, nor names a pod made of a template.
+      { apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] },
+      { apiGroups: ["discovery.k8s.io"], resources: ["endpointslices"], verbs: ["list"] },
     ],
   };
   const binding: V1RoleBinding = {
@@ -607,6 +610,7 @@ function control(config: InstallConfig): KubernetesObject[] {
     serviceAccount,
     ...computeScaling(NAMESPACE),
     ...computeRestartPolicy(),
+    ...computeServingPolicy(),
     deployment,
     ...replicaBudget(component, NAMESPACE, scaling),
     verticalPodAutoscaler(deployment, "Recommended"),
@@ -621,8 +625,8 @@ function control(config: InstallConfig): KubernetesObject[] {
  * client against it, has neon-control wake the compute if it sleeps, and then passes the
  * session through, whole, so session state such as advisory locks holds. It keeps where
  * each compute is for four minutes, and asks again when a connection there fails, as one
- * to a compute that has gone to sleep since does. It cancels no query: that needs a Redis
- * of its own, and alasio cancels none.
+ * to a compute that has gone to sleep since does, or that a sleep is stopping. It cancels
+ * no query: that needs a Redis of its own, and alasio cancels none.
  */
 function proxy(config: InstallConfig): KubernetesObject[] {
   const name = neonName("proxy");
@@ -686,7 +690,9 @@ function proxy(config: InstallConfig): KubernetesObject[] {
  * neon-control wakes it and puts it to sleep, scaling its Deployment between one replica
  * and none: so applying alasio gives it none, as it would take the count back, and a
  * compute made anew starts at one. Its Service takes connections before its pod is ready,
- * so a wake is answered as soon as Postgres takes them.
+ * so a wake is answered as soon as Postgres takes them, and none once a sleep has taken
+ * its pod off it, before stopping it, so the proxy asks for a wake rather than reach the
+ * pod stopping.
  *
  * Beside it, where the lake runs, its read replica (REPLICA_NAME), which the lake loads
  * from: a compute of its own, on the same timeline, streaming its WAL from the
@@ -722,7 +728,8 @@ function computeObjects(config: InstallConfig, environment: Environment, replica
       strategy: { type: "Recreate" },
       selector: { matchLabels: selectorLabels(component) },
       template: {
-        metadata: { labels: stackLabels(component) },
+        // Its Service's while no sleep has taken it off it (neon/control/endpoints.ts's SERVING_LABEL).
+        metadata: { labels: { ...stackLabels(component), [SERVING_LABEL]: "true" } },
         spec: {
           // Main's primary is alasio's database, which every turn needs; a branch's, and every
           // read replica, serve what may wait.
@@ -772,7 +779,7 @@ function computeObjects(config: InstallConfig, environment: Environment, replica
     apiVersion: "v1",
     kind: "Service",
     metadata: { name, namespace: environment.namespace, labels: stackLabels(component) },
-    spec: { selector: selectorLabels(component), publishNotReadyAddresses: true, ports: [{ name: "postgres", port: COMPUTE_PORT }, { name: "http", port: COMPUTE_CTL_PORT }] },
+    spec: { selector: { ...selectorLabels(component), [SERVING_LABEL]: "true" }, publishNotReadyAddresses: true, ports: [{ name: "postgres", port: COMPUTE_PORT }, { name: "http", port: COMPUTE_CTL_PORT }] },
   };
   return [service, deployment, verticalPodAutoscaler(deployment, "Recommended")];
 }

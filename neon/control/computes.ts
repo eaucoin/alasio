@@ -3,7 +3,8 @@
  * one replica, or none, that a branch environment's objects (or main's) run it as, which
  * neon-control scales through its scale subresource, and restarts when it must start on
  * another spec, with its ServiceAccount's token, and reaches at its Service, which takes
- * connections before its pod is ready.
+ * connections before its pod is ready, and never to a pod a sleep has taken off it
+ * (./endpoints.ts's SERVING_LABEL), which neon-control then reaches at its own address.
  *
  * It logs in to each compute as a role of its own, which every compute's spec gives a
  * password of that compute's own (./branches.ts): so it logs in once compute_ctl has
@@ -21,11 +22,12 @@
  */
 import { readFileSync } from "node:fs";
 import { request } from "node:https";
+import { connect } from "node:net";
 
 import pg from "pg";
 
 import { COMPUTE_CTL_PORT, type ComputeConfig } from "./branches.ts";
-import { type Activity, SUSPEND_AFTER } from "./endpoints.ts";
+import { type Activity, SERVING_LABEL, SUSPEND_AFTER } from "./endpoints.ts";
 
 const SERVICE_ACCOUNT = "/var/run/secrets/kubernetes.io/serviceaccount";
 /** The container of a compute's pod that runs compute_ctl, and Postgres under it. */
@@ -104,11 +106,84 @@ export async function computeDeployment(ref: ComputeRef): Promise<ComputeDeploym
   };
 }
 
-/** How many pods the compute's Deployment has that run, or may (livePods), as the API lists them. */
-export async function computePods({ namespace }: ComputeRef, { selector }: ComputeDeployment): Promise<number> {
+/** The pods of the compute's Deployment, as the API lists them. */
+async function podsOf({ namespace }: ComputeRef, { selector }: ComputeDeployment): Promise<ListedPod[]> {
   const { status, json } = await kube("GET", `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods?labelSelector=${encodeURIComponent(selector)}`);
   if (status !== 200) throw new Error(`listing the pods of ${namespace}'s compute: ${status} ${JSON.stringify(json)}`);
-  return livePods((json["items"] as { status?: { phase?: string } }[] | undefined) ?? []);
+  return (json["items"] as ListedPod[] | undefined) ?? [];
+}
+
+/** How many pods the compute's Deployment has that run, or may (livePods), as the API lists them. */
+export async function computePods(ref: ComputeRef, deployment: ComputeDeployment): Promise<number> {
+  return livePods(await podsOf(ref, deployment));
+}
+
+/** A pod of a compute's, as a sleep takes it off its Service, and gives it back: its name, its address, and whether its Service selects it. */
+export interface ComputePod {
+  name: string;
+  ip: string | null;
+  serving: boolean;
+}
+
+/**
+ * Of a compute's pods `items`, those that run, or may (livePods), but none being deleted
+ * already, as the one a sleep scaled down is: so a sleep never waits on one, nor a stop
+ * ended after its scale gives one back to its Service.
+ */
+export const podsLeft = (items: readonly ListedPod[]): ComputePod[] =>
+  items
+    .filter((pod) => !pod.metadata?.deletionTimestamp && livePods([pod]) === 1)
+    .map(({ metadata, status }) => ({ name: metadata?.name ?? "", ip: status?.podIP ?? null, serving: metadata?.labels?.[SERVING_LABEL] === "true" }));
+
+/** The compute's pods left (podsLeft), as the API lists them. */
+export async function computePodsLeft(ref: ComputeRef, deployment: ComputeDeployment): Promise<ComputePod[]> {
+  return podsLeft(await podsOf(ref, deployment));
+}
+
+/** Has the compute's Service select its pod `pod` (SERVING_LABEL), or not; one gone meanwhile is left be. */
+export async function setServing({ namespace }: ComputeRef, pod: string, serving: boolean): Promise<void> {
+  const { status, json } = await kube("PATCH", `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods/${encodeURIComponent(pod)}`, { metadata: { labels: { [SERVING_LABEL]: serving ? "true" : null } } });
+  if (status !== 200 && status !== 404) throw new Error(`${serving ? "giving" : "taking"} ${namespace}'s ${pod} ${serving ? "to" : "off"} its Service: ${status} ${JSON.stringify(json)}`);
+}
+
+/** An EndpointSlice as the API lists one, as far as neon-control reads it. */
+interface ListedSlice {
+  endpoints?: { targetRef?: { name?: string } }[] | null;
+}
+
+/**
+ * The pods a Service's EndpointSlices `slices` list, by name: each endpoint's, whatever its
+ * conditions, as kube-proxy routes to one not ready too, terminating, where none is ready.
+ */
+export const slicedPods = (slices: readonly ListedSlice[]): Set<string> =>
+  new Set(slices.flatMap(({ endpoints }) => (endpoints ?? []).flatMap(({ targetRef }) => (targetRef?.name ? [targetRef.name] : []))));
+
+/** The pods the compute's Service routes to, by name, as its EndpointSlices list them (slicedPods). */
+export async function routedPods({ namespace, name }: ComputeRef): Promise<Set<string>> {
+  const { status, json } = await kube("GET", `/apis/discovery.k8s.io/v1/namespaces/${encodeURIComponent(namespace)}/endpointslices?labelSelector=${encodeURIComponent(`kubernetes.io/service-name=${name}`)}`);
+  if (status !== 200) throw new Error(`listing the EndpointSlices of ${namespace}'s ${name}: ${status} ${JSON.stringify(json)}`);
+  return slicedPods((json["items"] as ListedSlice[] | undefined) ?? []);
+}
+
+/** How long a connection to a compute's Service may take to be taken or refused. */
+const REACH_PATIENCE_MS = 5_000;
+
+/**
+ * Whether a connection to `host`:`port`, a compute's Service, is let through to a pod, as
+ * kube-proxy routes it on neon-control's node: not where it is refused, as kube-proxy
+ * refuses one to a Service that routes to no pod. Fails otherwise, as where nothing
+ * answers in time.
+ */
+export function reaches(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const socket = connect({ host, port, timeout: REACH_PATIENCE_MS });
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once("timeout", () => socket.destroy(new Error(`${host}:${port} neither took nor refused a connection in ${REACH_PATIENCE_MS} ms`)));
+    socket.once("error", (error: NodeJS.ErrnoException) => (error.code === "ECONNREFUSED" ? resolve(false) : reject(error)));
+  });
 }
 
 /**
@@ -118,10 +193,10 @@ export async function computePods({ namespace }: ComputeRef, { selector }: Compu
 export const livePods = (items: readonly { status?: { phase?: string } }[]): number =>
   items.filter(({ status }) => status?.phase !== "Failed" && status?.phase !== "Succeeded").length;
 
-/** A pod as the API lists it, as far as whether its container runs is read. */
+/** A pod as the API lists it, as far as neon-control reads it. */
 interface ListedPod {
-  metadata?: { deletionTimestamp?: string };
-  status?: { containerStatuses?: { name: string; state?: { running?: object } }[] };
+  metadata?: { name?: string; labels?: Record<string, string>; deletionTimestamp?: string };
+  status?: { phase?: string; podIP?: string; containerStatuses?: { name: string; state?: { running?: object } }[] };
 }
 
 /** Whether any of `items`, not being deleted, runs its container `container`. */
@@ -129,10 +204,8 @@ export const containerRuns = (items: readonly ListedPod[], container: string): b
   items.some(({ metadata, status }) => !metadata?.deletionTimestamp && (status?.containerStatuses ?? []).some(({ name, state }) => name === container && state?.running !== undefined));
 
 /** Whether a pod of the compute's Deployment runs its compute's container, compute_ctl in it (containerRuns). */
-export async function computeRuns({ namespace }: ComputeRef, { selector }: ComputeDeployment): Promise<boolean> {
-  const { status, json } = await kube("GET", `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods?labelSelector=${encodeURIComponent(selector)}`);
-  if (status !== 200) throw new Error(`listing the pods of ${namespace}'s compute: ${status} ${JSON.stringify(json)}`);
-  return containerRuns((json["items"] as ListedPod[] | undefined) ?? [], COMPUTE_CONTAINER);
+export async function computeRuns(ref: ComputeRef, deployment: ComputeDeployment): Promise<boolean> {
+  return containerRuns(await podsOf(ref, deployment), COMPUTE_CONTAINER);
 }
 
 /** Restarts the compute, as `kubectl rollout restart` does: its pod made anew, which fetches its spec as it is now. */

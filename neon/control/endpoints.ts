@@ -112,16 +112,28 @@ export function idleness(previous: Idleness | undefined, use: Use, now: number):
 /** Whether a compute idle as `idle` says has been idle for `suspendAfterMs` by `now`. */
 export const suspendDue = ({ since }: Idleness, now: number, suspendAfterMs: number): boolean => since !== null && now - since >= suspendAfterMs;
 
+/**
+ * The label of a compute's pod that its Service selects it by, which its Deployment's
+ * selector does not name: a sleep takes it off the pod before it stops it, so connections
+ * stop reaching the pod before it stops, and the proxy, finding the address it keeps of
+ * the compute refusing, asks for a wake (suspendCompute).
+ */
+export const SERVING_LABEL = "alasio.dev/serving";
+
 /** What a wake reads of and does to one compute, and to its record (wakeCompute). */
 export interface Waking<D extends { readonly replicas: number }> {
   /** The compute's Deployment, or a failure where it is not deployed. */
   readonly deployment: () => Promise<D>;
   /** Records that it was asked to wake, which keeps it awake a while longer. */
   readonly asked: () => Promise<void>;
+  /** Whether a sleep has begun to stop it (suspendCompute's mark), and not ended; not where that cannot be read, as no sleep can then begin. */
+  readonly stopping: () => Promise<boolean>;
   /** Runs `scaling` under the compute's lock, which a sleep holds while it stops the compute. */
   readonly locked: <T>(scaling: () => Promise<T>) => Promise<T>;
   /** Waits until no pod of the compute, `deployment` as read, is left. */
   readonly untilGone: (deployment: D) => Promise<void>;
+  /** Ends a stop a sleep began and never finished, neon-control stopped in it: the compute's pods, if any, its Service's again, and the mark cleared. */
+  readonly resume: () => Promise<void>;
   /** Scales the compute to one replica. */
   readonly scaleUp: () => Promise<void>;
   /** Whether the compute takes connections now; a failure once the wake is out of time. */
@@ -131,31 +143,124 @@ export interface Waking<D extends { readonly replicas: number }> {
 }
 
 /**
- * Wakes a compute, as `steps` read it and act: records the wake asked for, and scales a
- * compute that sleeps to one under its lock, once the pod put to sleep is gone, read
- * again under it, as a sleep may have ended meanwhile; then waits until it takes
- * connections. One found running needs no lock, but a sleep may then have scaled it
- * down: one that counted it again before the wake was recorded, its scale to none
- * landing after the compute was read. So while it takes none, the compute is read again,
- * and one found asleep woken likewise. Whether it slept.
+ * Wakes a compute, as `steps` read it and act: records the wake asked for, and wakes a
+ * compute that sleeps, or that a sleep is stopping, under its lock, which that sleep holds
+ * until its pod is gone: read again under it, as a sleep may have ended meanwhile, or been
+ * given up, it is scaled to one once the pod put to sleep is gone; then waits until it
+ * takes connections. A stop found begun but no longer under way, its sleep's neon-control
+ * stopped in it, is ended (Waking's resume). One found running, and not stopping, after
+ * the wake was recorded needs no lock: a sleep marks the compute stopping before it counts
+ * it again (suspendCompute), so one that has not, by then, counts this wake, and lets it
+ * be. While it takes no connection, the compute is read again, and one found asleep or
+ * stopping woken likewise. Whether it slept.
  */
 export async function wakeCompute<D extends { readonly replicas: number }>(steps: Waking<D>): Promise<boolean> {
   const first = await steps.deployment();
   await steps.asked();
+  const sleeps = async (deployment: D) => deployment.replicas === 0 || await steps.stopping();
   const scaled = () =>
     steps.locked(async () => {
       const now = await steps.deployment();
-      if (now.replicas > 0) return false;
+      if (now.replicas > 0) {
+        if (await steps.stopping()) await steps.resume();
+        return false;
+      }
       await steps.untilGone(now);
+      if (await steps.stopping()) await steps.resume();
       await steps.scaleUp();
       return true;
     });
-  let slept = first.replicas === 0 && await scaled();
+  let slept = (await sleeps(first)) && await scaled();
   while (!(await steps.accepts())) {
-    if ((await steps.deployment()).replicas === 0) slept = (await scaled()) || slept;
+    if (await sleeps(await steps.deployment())) slept = (await scaled()) || slept;
     await steps.pause();
   }
   return slept;
+}
+
+/** What taking a compute's pods off its Service reads of it and does (withdrawCompute). */
+export interface Withdrawing<Pod> {
+  /** Its pods that run, or may, none being deleted already. */
+  readonly pods: () => Promise<readonly Pod[]>;
+  /** Takes `pod` off its Service (SERVING_LABEL), where its Service selects it. */
+  readonly takeOff: (pod: Pod) => Promise<void>;
+  /** Whether its Service's EndpointSlices list any of `pods` still. */
+  readonly listed: (pods: readonly Pod[]) => Promise<boolean>;
+  /** Whether a connection to its Service's address, as Neon's proxy connects to it (computeAddress), is let through still, not refused. */
+  readonly reached: () => Promise<boolean>;
+  /** Waits before it is asked again; a failure, saying `still` is so, once out of time. */
+  readonly pause: (still: string) => Promise<void>;
+}
+
+/**
+ * Takes a compute's pods off its Service, as `steps` act, and waits until its Service
+ * reaches none of them: until its EndpointSlices list none, and then until a connection to
+ * its address is refused, as kube-proxy writes the rules that route one from those slices a
+ * moment later (its sync, a second at least). Those pods. Only the rules of the node that
+ * connection is made from are seen so: on a cluster of several nodes, kube-proxy on Neon's
+ * proxy's may write them later, and a connection the proxy makes there in that moment, after
+ * the sleep has counted the compute again, is let through to its pod, and cut with it. Nor
+ * is a client's connection still authenticating as the sleep counts the compute again seen
+ * by the count, as Postgres lists a session only once it has authenticated, milliseconds
+ * after its connection. Where the cluster's network drops a connection to a Service that
+ * routes to no pod rather than refuse it, none is ever refused, and the sleep, out of time,
+ * gives up: the compute never sleeps, rather than cut a client.
+ */
+export async function withdrawCompute<Pod>(steps: Withdrawing<Pod>): Promise<readonly Pod[]> {
+  const pods = await steps.pods();
+  for (const pod of pods) await steps.takeOff(pod);
+  while (await steps.listed(pods)) await steps.pause("its EndpointSlices list its pods taken off it");
+  while (await steps.reached()) await steps.pause("a connection to it is let through to its pods taken off it");
+  return pods;
+}
+
+/** What a sleep does to one compute, under its lock, once it has counted it idle long enough (suspendCompute). */
+export interface Suspending<Pods> {
+  /** Records the compute stopping, which a wake reads (Waking's stopping). */
+  readonly mark: () => Promise<void>;
+  /** Takes the compute's pods off its Service, and waits until it reaches none of them (withdrawCompute): those pods. */
+  readonly withdraw: () => Promise<Pods>;
+  /** Whether a client has used the compute since it was counted idle, counted again on `pods`, as its Service no longer reaches them. */
+  readonly used: (pods: Pods) => Promise<boolean>;
+  /** Gives the compute's pods back to its Service, and clears the mark: the sleep given up. */
+  readonly restore: () => Promise<void>;
+  /** Scales the compute to none. */
+  readonly scaleDown: () => Promise<void>;
+  /** Waits until no pod of the compute is left. */
+  readonly untilGone: () => Promise<void>;
+  /** Clears the mark. */
+  readonly unmark: () => Promise<void>;
+}
+
+/**
+ * Puts a compute to sleep, as `steps` act: marks it stopping, takes its pods off its
+ * Service, counts it again on them, and, still idle, scales it to none and waits until its
+ * pod is gone. Marked first, so a wake recorded before the count is counted, and the
+ * sleep given up, and one recorded after finds the mark, and waits for the sleep
+ * (wakeCompute). Taken off its Service before the count, so a connection made after it is
+ * refused, not let through to a pod about to stop, wherever kube-proxy routes as on
+ * neon-control's node (withdrawCompute): Neon's proxy, refused at the address it keeps of
+ * the compute, forgets it and asks for a wake, which waits for the sleep and wakes the
+ * compute. A sleep given up, or failing before it scales, gives the pods back,
+ * as one used gives them back; one failing after leaves the mark, which the next wake
+ * ends. Whether it slept.
+ */
+export async function suspendCompute<Pods>(steps: Suspending<Pods>): Promise<boolean> {
+  await steps.mark();
+  try {
+    if (await steps.used(await steps.withdraw())) {
+      await steps.restore();
+      return false;
+    }
+  } catch (error) {
+    // Its own failure is the one to tell; one restoring is the next wake's to end.
+    await steps.restore().catch(() => {});
+    throw error;
+  }
+  await steps.scaleDown();
+  await steps.untilGone();
+  await steps.unmark();
+  return true;
 }
 
 /** The bytes from LSN `from` to LSN `to` (each `<high>/<low>` in hexadecimal, as Postgres writes one), 0 where `to` is not past `from`. */
