@@ -1,65 +1,29 @@
 /**
- * The cut-over of an installation of the release before (upgrades/from-8.0.0.sh), in how it
+ * The cut-over of an installation of the release before (upgrades/from-9.0.0.sh), in how it
  * runs, without a cluster: its checks and refusals, its point of no return, and how a run
  * again goes on from where one before stopped. The end-to-end run's upgrade shard runs it on
  * an installation of that release (test/e2e/alasio.test.ts).
  */
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
-import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { testDatabaseUrl, testPool, testStore } from "./support/store.ts";
+const SCRIPT = fileURLToPath(new URL("../upgrades/from-9.0.0.sh", import.meta.url));
 
-const SCRIPT = fileURLToPath(new URL("../upgrades/from-8.0.0.sh", import.meta.url));
-/** Where the jq the cut-over needs is, on this machine. */
-const JQ = dirname(spawnSync("sh", ["-c", "command -v jq"], { encoding: "utf8" }).stdout.trim() || "/usr/bin/jq");
-/** The repository, where alasio's pod runs what the cut-over runs in it, as alasio's image is. */
-const REPOSITORY = fileURLToPath(new URL("..", import.meta.url));
+/** The sandbox image's digest, as containerd records it. */
+const PAUSE = `sha256:${"a".repeat(64)}`;
 
 /**
- * alasio's database as 8.0.0 keeps it, in its schema, `state`: this release's schema, but the
- * indexes that keep a Telegram message, and a file it carried, once, which 8.0.0 had not.
- */
-const pool = await testPool();
-await testStore({ schema: "state" });
-await pool.query("drop index state.messages_telegram_once; drop index state.files_telegram_once");
-/** Makes the forks' holds as 8.0.0's table keeps them: without their holder and expiry. */
-const holdsOf800 = () =>
-  pool.query(`drop table state.conversation_holds;
-    create table state.conversation_holds (
-      conversation_id text primary key references state.conversations (id) on delete cascade,
-      reason text not null,
-      held_at timestamptz not null default now()
-    )`);
-await holdsOf800();
-const DATABASE_URL = await testDatabaseUrl();
-
-/** The log's StatefulSet, its claims labelled with `version` if given, as the cluster has it. */
-const logStatefulSet = (version?: string) => ({
-  apiVersion: "apps/v1",
-  kind: "StatefulSet",
-  metadata: { name: "alasio-log", namespace: "alasio", uid: "uid-of-8.0.0", resourceVersion: "41", generation: 2 },
-  spec: { volumeClaimTemplates: [{ metadata: { name: "data", labels: { "app.kubernetes.io/component": "log", ...(version === undefined ? {} : { "app.kubernetes.io/version": version }) } } }] },
-  status: { replicas: 1 },
-});
-
-/**
- * A machine for the cut-over: a kubectl that reaches its cluster, lists the namespaces
- * `namespaces` names, `<name>\t<branch label>` each, and keeps the log's StatefulSet in
- * `statefulSet`, getting, deleting and creating it; an UPGRADE that makes the log's
- * StatefulSet this release's, with no version on its claims, and an UPGRADE_CHECK, each saying
- * it ran, UPGRADE failing while `upgradeFails` is there; a node, in `node`, whose containerd
- * and stargz-snapshotter's daemon hold images, one of the daemon's snapshots mounted in
- * another, whose containerd records the images `images` lists, and whose systemctl, umount,
- * k3s-killall.sh and k3s's ctr say what they were asked, umount unmounting, ctr fetching what
- * no registry answers for failing, its systemctl failing to start k3s while `startFails` is
- * there. What the cut-over runs in alasio's pod runs here, on the test's database, as 8.0.0's
- * alasio reaches its own.
+ * A machine for the cut-over: a kubectl that reaches its cluster and lists the namespaces
+ * `namespaces` names, `<name>\t<branch label>` each; an UPGRADE and an UPGRADE_CHECK, each
+ * saying it ran, UPGRADE failing while `upgradeFails` is there; and a node, in `node`, whose
+ * containerd pins the sandbox image k3s gives it, and records the images `images` lists, and
+ * whose k3s's ctr says what it was asked to fetch, fetching what no registry answers for
+ * failing, and what `unfetched` names fetched to no end.
  */
 function machine() {
   const root = mkdtempSync(join(tmpdir(), "alasio-cut-over-"));
@@ -67,153 +31,80 @@ function machine() {
   const ran = join(root, "ran");
   const namespaces = join(root, "namespaces");
   const upgradeFails = join(root, "upgrade-fails");
-  const statefulSet = join(root, "statefulset.json");
-  const calls = join(root, "calls");
-  const crd = join(root, "crd");
-  // agent-sandbox's controller's Deployment, there while this is.
-  const controller = join(root, "controller");
-  // A turn alasio runs, there until the cut-over has looked for it once.
-  const busy = join(root, "busy");
-  const folders = join(root, "folders.json");
-  const sandboxes = join(root, "sandboxes.tsv");
   const config = join(root, "config.json");
-  const reboot = join(root, "reboot-required");
-  const sessionSandboxes = join(root, "session-sandboxes");
-  const sessionClaims = join(root, "session-claims");
-  writeFileSync(sessionSandboxes, "");
-  writeFileSync(sessionClaims, "");
   const node = join(root, "node");
-  const host = join(root, "host");
-  const startFails = join(root, "start-fails");
-  for (const held of ["var/lib/rancher/k3s/agent/containerd/snapshots/1", "var/lib/containerd-stargz-grpc/snapshotter/snapshots/1/fs", "run/containerd-stargz-grpc", "proc/self", "usr/local/bin"]) {
-    mkdirSync(join(node, held), { recursive: true });
-  }
-  writeFileSync(join(node, "var/lib/rancher/k3s/agent/containerd/snapshots/1/layer"), "unpacked by overlayfs");
-  writeFileSync(join(node, "var/lib/containerd-stargz-grpc/snapshotter/snapshots/1/fs/layer"), "fetched lazily");
-  writeFileSync(join(node, "run/containerd-stargz-grpc/fuse-manager.sock"), "");
-  const daemonSnapshot = join(node, "var/lib/containerd-stargz-grpc/snapshotter/snapshots/1/fs");
-  writeFileSync(join(node, "proc/self/mounts"), `proc /proc proc rw 0 0\nstargz ${daemonSnapshot} fuse.rawBridge rw 0 0\nstargz ${daemonSnapshot}/inner fuse.rawBridge rw 0 0\n`);
-  writeFileSync(join(node, "usr/local/bin/k3s-killall.sh"), `#!/bin/sh\necho k3s-killall.sh >>'${host}'\n`, { mode: 0o755 });
-  // The images containerd records, `<name> <digest> <complete|incomplete>` each, as its
-  // check says them, and the digests no registry answers for.
+  const fetched = join(root, "fetched");
+  // The images containerd records, `<name> <digest> <complete|incomplete>` each, as its check says them, the digests no registry
+  // answers for, and those a fetch of leaves lacking still.
   const images = join(root, "images");
   const unreachable = join(root, "unreachable");
-  writeFileSync(images, `docker.io/rancher/mirrored-pause:3.10.2 sha256:${"1".repeat(64)} complete\n`);
+  const unfetched = join(root, "unfetched");
+  const containerd = join(node, "var/lib/rancher/k3s/agent/etc/containerd");
+  for (const made of [bin, containerd, join(node, "usr/local/bin")]) mkdirSync(made, { recursive: true });
+  writeFileSync(namespaces, "");
+  writeFileSync(config, JSON.stringify({ target: { host: {} }, install: { host: { enabled: true } } }), { mode: 0o600 });
+  writeFileSync(images, `docker.io/rancher/mirrored-pause:3.10.2 ${PAUSE} complete\n`);
   writeFileSync(unreachable, "");
-  // Its fetches, which complete each image of the digest fetched, and its removals, said beside what the node was asked.
+  writeFileSync(unfetched, "");
+  // As k3s writes it, from its --pause-image.
+  const pins = (sandbox: string) => writeFileSync(join(containerd, "config.toml"), `version = 3\n\n[plugins.'io.containerd.cri.v1.images'.pinned_images]\n  sandbox = "${sandbox}"\n`);
+  pins("rancher/mirrored-pause:3.10.2");
+  writeFileSync(join(bin, "kubectl"), `#!/bin/sh
+case "$*" in
+  "get --raw=/readyz") exit 0 ;;
+  "get namespace -l alasio.dev/branch -o jsonpath="*) cat '${namespaces}' ;;
+  *) echo "kubectl $* is not the cut-over's" >&2; exit 2 ;;
+esac
+`, { mode: 0o755 });
+  // Its check of the images its filter names, and its fetches, which complete each image of the digest fetched.
   writeFileSync(join(node, "usr/local/bin/k3s"), `#!/bin/sh
 [ "$1 $2 $3" = "ctr --namespace k8s.io" ] || { echo "k3s $* is not the cut-over's" >&2; exit 2; }
 shift 3
 case "$1 $2" in
   "images check")
     echo "REF TYPE DIGEST STATUS SIZE UNPACKED"
-    awk '{ print $1, "application/vnd.oci.image.index.v1+json", $2, ($3 == "complete" ? "complete (2/2)" : "incomplete (1/2)"), "1.0 MiB/1.0 MiB", "true" }' '${images}' ;;
+    awk -v filter="$3" '"name==" $1 == filter { print $1, "application/vnd.oci.image.index.v1+json", $2, ($3 == "complete" ? "complete (2/2)" : "incomplete (1/2)"), "1.0 MiB/1.0 MiB", "true" }' '${images}' ;;
   "content fetch")
-    echo "k3s ctr content fetch $3 $4 $5" >>'${host}'
+    echo "$3 $4 $5" >>'${fetched}'
     digest=\${5##*@}
     ! grep -qx "$digest" '${unreachable}' || { echo "ctr: failed to resolve $5" >&2; exit 1; }
+    ! grep -qx "$digest" '${unfetched}' || exit 0
     awk -v digest="$digest" '$2 == digest { $3 = "complete" } { print }' '${images}' >'${images}.next' && mv '${images}.next' '${images}' ;;
-  "images rm")
-    shift 2
-    echo "k3s ctr images rm $*" >>'${host}'
-    for name in "$@"; do awk -v name="$name" '$1 != name' '${images}' >'${images}.next' && mv '${images}.next' '${images}'; done ;;
   *) echo "k3s ctr $* is not the cut-over's" >&2; exit 2 ;;
 esac
 `, { mode: 0o755 });
-  const databaseUrl = join(root, "database-url");
-  writeFileSync(namespaces, "");
-  writeFileSync(folders, JSON.stringify({ items: [] }));
-  writeFileSync(sandboxes, "");
-  writeFileSync(config, JSON.stringify({ target: { host: {} }, install: { host: { enabled: true } } }), { mode: 0o600 });
-  writeFileSync(statefulSet, JSON.stringify(logStatefulSet("8.0.0")));
-  writeFileSync(databaseUrl, DATABASE_URL);
-  spawnSync("mkdir", [bin]);
-  writeFileSync(join(bin, "kubectl"), `#!/bin/sh
-printf '%s' "$*" | tr '\\n' ' ' >>'${calls}' && echo >>'${calls}'
-case "$*" in
-  "get --raw=/readyz") exit 0 ;;
-  "get namespace -l alasio.dev/branch -o jsonpath="*) cat '${namespaces}' ;;
-  "-n alasio get statefulset alasio-log --ignore-not-found -o json") [ ! -e '${statefulSet}' ] || cat '${statefulSet}' ;;
-  "-n alasio get statefulset alasio-log --ignore-not-found -o name") [ ! -e '${statefulSet}' ] || echo statefulset.apps/alasio-log ;;
-  "-n alasio get statefulset alasio-log -o json") cat '${statefulSet}' ;;
-  "-n alasio delete statefulset alasio-log --cascade=orphan --wait=true") rm '${statefulSet}' ;;
-  "-n alasio create -f -") cat >'${statefulSet}' ;;
-  "get crd sandboxes.agents.x-k8s.io --ignore-not-found -o name") [ ! -e '${crd}' ] || echo customresourcedefinition.apiextensions.k8s.io/sandboxes.agents.x-k8s.io ;;
-  "-n alasio-sessions get sandboxes.agents.x-k8s.io -o name") cat '${sessionSandboxes}' ;;
-  "-n alasio-sessions get pvc -o name") cat '${sessionClaims}' ;;
-  # A turn alasio runs, said beside what the node was asked, gone once looked at.
-  "-n alasio get pod -l app.kubernetes.io/component=alasio,alasio.dev/busy=true -o name") [ ! -e '${busy}' ] || { echo "kubectl $* (a turn runs)" >>'${host}'; rm '${busy}'; echo pod/alasio-0; } ;;
-  "-n alasio get pod -l "*" -o name") ;;
-  "get pod -A -l alasio.dev/workload=folder -o json") cat '${folders}' ;;
-  "get sandboxes.agents.x-k8s.io -A -o jsonpath="*) cat '${sandboxes}' ;;
-  "delete crd sandboxes.agents.x-k8s.io --ignore-not-found --wait=true") rm -f '${crd}' ;;
-  "-n alasio get deployment alasio-agent-sandbox-controller --ignore-not-found -o name") [ ! -e '${controller}' ] || echo deployment.apps/alasio-agent-sandbox-controller ;;
-  "-n alasio scale deployment alasio-agent-sandbox-controller --replicas=0") [ -e '${controller}' ] || { echo 'Error from server (NotFound): deployments.apps "alasio-agent-sandbox-controller" not found' >&2; exit 1; } ;;
-  # What stops alasio and the folder instances before k3s stops, said beside what the node was asked.
-  "-n alasio scale deployment alasio --replicas=0"|"-n alasio-host delete pod -l alasio.dev/pool=folder "*) echo "kubectl $*" >>'${host}' ;;
-  "-n alasio scale "*|"-n "*" delete pod "*|"-n "*" patch sandboxes.agents.x-k8s.io "*|"-n "*" delete sandboxes.agents.x-k8s.io "*) ;;
-  "-n alasio delete "*" --ignore-not-found"|"delete clusterrole,"*" --ignore-not-found"|"-n alasio-host delete "*" --ignore-not-found"|"delete validatingadmissionpolicy,"*" --ignore-not-found") ;;
-  "-n alasio exec -i deploy/alasio -c alasio -- node --input-type=module -e "*)
-    shift 11
-    # Elsewhere than alasio's modules, as a folder workspace's pod is; its image's, here.
-    cd '${root}' && ALASIO_DATABASE_URL_FILE='${databaseUrl}' exec '${process.execPath}' --input-type=module -e "$(printf '%s' "$1" | sed 's#/opt/alasio/#${REPOSITORY}#g')" ;;
-  *) echo "kubectl $* is not the cut-over's" >&2; exit 2 ;;
-esac
-`, { mode: 0o755 });
-  writeFileSync(join(bin, "systemctl"), `#!/bin/sh
-echo "systemctl $*" >>'${host}'
-[ "$*" != "start k3s" ] || [ ! -e '${startFails}' ]
-`, { mode: 0o755 });
-  // Unmounting it of the node's mount table, as the kernel does.
-  const mounts = join(node, "proc/self/mounts");
-  // As the busybox of k3s's own binaries, first on the node's PATH, it takes -l, not --lazy.
-  writeFileSync(join(bin, "umount"), `#!/bin/sh
-[ "$1" = -l ] || { echo "umount: unrecognized option $1" >&2; exit 1; }
-echo "umount $*" >>'${host}'
-awk -v point="$2" '$2 != point' '${mounts}' >'${mounts}.next' && mv '${mounts}.next' '${mounts}'
-`, { mode: 0o755 });
   const out = join(root, "out");
   /** The cut-over, failing at `failAt` if given: what it came to. */
-  const cutOver = (failAt?: string, env: Readonly<Record<string, string>> = {}) => {
+  const cutOver = (failAt?: string) => {
     const run = spawnSync("bash", [SCRIPT], {
       encoding: "utf8",
       env: {
-        PATH: `${bin}:${JQ}:/usr/bin:/bin`,
+        PATH: `${bin}:/usr/bin:/bin`,
         OUT: out,
         CONFIG: config,
-        REBOOT_REQUIRED: reboot,
         NODE_ROOT: node,
-        // Its apply prunes agent-sandbox's controller, the CRD kept, before it waits, and may fail.
-        UPGRADE: `echo upgrade >>'${ran}' && rm -f '${controller}' && [ ! -e '${upgradeFails}' ] && printf '%s' '${JSON.stringify(logStatefulSet())}' >'${statefulSet}'`,
-        // Saying whether the configuration it checks says how to run agent-sandbox.
-        UPGRADE_CHECK: `if jq -e '.install | has("agentSandbox")' '${config}' >/dev/null; then echo check of agentSandbox >>'${ran}'; else echo check >>'${ran}'; fi`,
+        UPGRADE: `echo upgrade >>'${ran}' && [ ! -e '${upgradeFails}' ]`,
+        UPGRADE_CHECK: `echo check >>'${ran}'`,
         ...(failAt === undefined ? {} : { FAIL_AT: failAt }),
-        ...env,
       },
     });
     return { code: run.status, said: run.stderr };
   };
+  const lines = (file: string) => {
+    const read = existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean) : [];
+    rmSync(file, { force: true });
+    return read;
+  };
   return {
     cutOver,
     /** What UPGRADE and UPGRADE_CHECK ran, in order, since the last time it was asked. */
-    ran: () => {
-      const lines = existsSync(ran) ? readFileSync(ran, "utf8").split("\n").filter(Boolean) : [];
-      rmSync(ran, { force: true });
-      return lines;
-    },
-    /** What the cut-over recorded in `name`. */
-    recorded: (name: string) => readFileSync(join(out, name), "utf8"),
+    ran: () => lines(ran),
     /** The cut-over's markers, of what it recorded. */
     marks: () => (existsSync(out) ? readdirSync(out).filter((name) => ["point-of-no-return", "upgraded"].includes(name)).sort() : []),
-    /** The cut-over's markers of the move of the node's images. */
-    imageMarks: () => (existsSync(out) ? readdirSync(out).filter((name) => name.startsWith("images-")).sort() : []),
-    /** What the node's systemctl, umount and k3s-killall.sh were asked, in order, since the last time it was asked. */
-    host: () => {
-      const lines = existsSync(host) ? readFileSync(host, "utf8").split("\n").filter(Boolean) : [];
-      rmSync(host, { force: true });
-      return lines;
-    },
-    startFails: (fails: boolean) => (fails ? writeFileSync(startFails, "") : rmSync(startFails, { force: true })),
+    namespaces: (listed: string) => writeFileSync(namespaces, listed),
+    upgradeFails: (fails: boolean) => (fails ? writeFileSync(upgradeFails, "") : rmSync(upgradeFails, { force: true })),
+    /** Has containerd pin `sandbox` as the sandbox image, as k3s writes it. */
+    pins,
     /** Has containerd record the images `recorded`, `[name, digest, whether it holds all their content]` each. */
     hasImages: (recorded: readonly (readonly [string, string, boolean])[]) =>
       writeFileSync(images, recorded.map(([name, digest, whole]) => `${name} ${digest} ${whole ? "complete" : "incomplete"}\n`).join("")),
@@ -222,50 +113,13 @@ awk -v point="$2" '$2 != point' '${mounts}' >'${mounts}.next' && mv '${mounts}.n
       const [name = "", digest = "", status] = line.split(" ");
       return [name, digest, status === "complete"] as const;
     }),
+    /** What k3s's ctr was asked to fetch, `--hosts-dir <dir> <reference>` each, since the last time it was asked. */
+    fetched: () => lines(fetched),
     /** Has no registry answer for the digests `digests`. */
     unreachable: (digests: readonly string[]) => writeFileSync(unreachable, digests.map((digest) => `${digest}\n`).join("")),
-    node,
-    daemonSnapshot,
-    namespaces: (listed: string) => writeFileSync(namespaces, listed),
-    /** The log's StatefulSet, as the cluster has it, or null where it has none. */
-    statefulSet: () => (existsSync(statefulSet) ? JSON.parse(readFileSync(statefulSet, "utf8")) as ReturnType<typeof logStatefulSet> : null),
-    /** Gives the cluster the log's StatefulSet, its claims of `version` if given. */
-    hasStatefulSet: (version?: string) => writeFileSync(statefulSet, JSON.stringify(logStatefulSet(version))),
-    /** What the cut-over kept of the log's StatefulSet, in its record. */
-    kept: () => (existsSync(join(out, "log-statefulset.json")) ? JSON.parse(readFileSync(join(out, "log-statefulset.json"), "utf8")) as unknown : null),
-    upgradeFails: (fails: boolean) => (fails ? writeFileSync(upgradeFails, "") : rmSync(upgradeFails, { force: true })),
-    /** The kubectl commands the cut-over ran, in order, since the last time it was asked, but for what reads alone and what it runs on alasio's database (on_database), which the database's own tests read. */
-    calls: () => {
-      const lines = existsSync(calls) ? readFileSync(calls, "utf8").split("\n").filter((line) => line && !/^(-n \S+ )?get /u.test(line) && !line.startsWith("-n alasio exec -i deploy/alasio ")) : [];
-      rmSync(calls, { force: true });
-      return lines;
-    },
-    /** Gives the cluster 8.0.0's agent-sandbox: its CRD, the folders' bayma pods, `<namespace> <pod> <state dir>` each, and its Sandboxes, `<namespace> <name>` each. */
-    hasAgentSandbox: (pods: readonly (readonly [string, string, string])[], listed: readonly (readonly [string, string])[]) => {
-      writeFileSync(crd, "");
-      writeFileSync(controller, "");
-      writeFileSync(folders, JSON.stringify({
-        items: pods.map(([namespace, name, state]) => ({ metadata: { namespace, name }, spec: { containers: [{ name: "bayma", args: ["mcp-http", "--state-dir", state, "--token-file", "/run/alasio/bayma/token"] }] } })),
-      }));
-      writeFileSync(sandboxes, listed.map((each) => `${each.join("\t")}\n`).join(""));
-    },
-    /** Has alasio run a turn, until the cut-over has looked for one once. */
-    turnRuns: () => writeFileSync(busy, ""),
-    /** Whether the cluster has the Sandboxes' CRD still. */
-    hasCrd: () => existsSync(crd),
-    /** Whether the cluster has agent-sandbox's controller's Deployment still. */
-    hasController: () => existsSync(controller),
-    /** The configuration's file, and what it holds. */
-    config,
-    configured: () => JSON.parse(readFileSync(config, "utf8")) as { install: Record<string, unknown> },
-    /** Gives the sessions' namespace the release before's session workspaces: Sandboxes and claims, by name. */
-    hasSessionWorkspaces: (sandboxes: readonly string[], claims: readonly string[]) => {
-      writeFileSync(sessionSandboxes, sandboxes.map((name) => `sandbox.agents.x-k8s.io/${name}\n`).join(""));
-      writeFileSync(sessionClaims, claims.map((name) => `persistentvolumeclaim/${name}\n`).join(""));
-    },
-    /** Leaves this machine a reboot pending, or none. */
-    rebootPending: (pending: boolean) => (pending ? writeFileSync(reboot, "") : rmSync(reboot, { force: true })),
-    root,
+    /** Has a fetch of the digests `digests` leave them lacking still, as a registry answering with another's would. */
+    unfetched: (digests: readonly string[]) => writeFileSync(unfetched, digests.map((digest) => `${digest}\n`).join("")),
+    containerd,
     remove: () => rmSync(root, { recursive: true, force: true }),
   };
 }
@@ -275,9 +129,9 @@ test("the cut-over checks, upgrades past its point of no return, and says it is 
   try {
     const run = at.cutOver();
     assert.equal(run.code, 0, run.said);
-    assert.deepEqual(at.ran(), ["check", "upgrade", "check", "upgrade"]);
+    assert.deepEqual(at.ran(), ["check", "upgrade"]);
     assert.deepEqual(at.marks(), ["point-of-no-return", "upgraded"]);
-    assert.match(run.said, /checking that no branch environment exists[^]*checking that the upgrade can run[^]*past the point of no return[^]*upgrading, from the cut-over begun at [^]*stopping k3s, to remove the node's images[^]*applying the upgrade again[^]*upgraded at \S+\n[^\n]* removing what of 8\.0\.0's this release has no use for[^\n]*\n[^\n]* through\n$/u);
+    assert.match(run.said, /cutting over from 9\.0\.0[^]*checking that no branch environment exists[^]*checking that the upgrade can run[^]*past the point of no return[^]*upgrading, from the cut-over begun at [^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
   } finally {
     at.remove();
   }
@@ -289,7 +143,7 @@ test("the cut-over refuses a branch environment before it changes anything, nami
     at.namespaces("alasio-branch-one\tone\nalasio-branch-two\ttwo\nalasio-sessions\tone\nother\t\n");
     const refused = at.cutOver();
     assert.notEqual(refused.code, 0);
-    assert.match(refused.said, /FAILED: alasio upgrades main alone[^\n]*\(alasio branch delete one, alasio branch delete two\)/u);
+    assert.match(refused.said, /FAILED: alasio upgrades main alone, and the branch environments 9\.0\.0 made [^\n]*\(alasio branch delete one, alasio branch delete two\)/u);
     assert.deepEqual([at.ran(), at.marks()], [[], []]);
     // A namespace labelled for a branch that is not that branch's own is no branch environment.
     at.namespaces("alasio-sessions\tone\n");
@@ -304,10 +158,12 @@ test("the cut-over failing before its point of no return leaves none, and a run 
   try {
     const failed = at.cutOver("before-the-point-of-no-return");
     assert.notEqual(failed.code, 0);
-    assert.match(failed.said, /FAILED: a failure injected before the point of no return\n/u);
+    assert.match(failed.said, /checking that the upgrade can run[^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
     assert.deepEqual([at.ran(), at.marks()], [["check"], []]);
-    assert.equal(at.cutOver().code, 0);
-    assert.deepEqual([at.ran(), at.marks()], [["check", "upgrade", "check", "upgrade"], ["point-of-no-return", "upgraded"]]);
+    const again = at.cutOver();
+    assert.equal(again.code, 0, again.said);
+    assert.match(again.said, /checking that no branch environment exists/u);
+    assert.deepEqual([at.ran(), at.marks()], [["check", "upgrade"], ["point-of-no-return", "upgraded"]]);
   } finally {
     at.remove();
   }
@@ -329,7 +185,7 @@ test("the cut-over failing past its point of no return, or in its upgrade, goes 
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
     assert.doesNotMatch(again.said, /checking that/u);
-    assert.deepEqual([at.ran(), at.marks()], [["upgrade", "check", "upgrade"], ["point-of-no-return", "upgraded"]]);
+    assert.deepEqual([at.ran(), at.marks()], [["upgrade"], ["point-of-no-return", "upgraded"]]);
   } finally {
     at.remove();
   }
@@ -341,13 +197,12 @@ test("the cut-over failing once its upgrade is through goes on with what follows
     const failed = at.cutOver("after-the-upgrade");
     assert.notEqual(failed.code, 0);
     assert.match(failed.said, /FAILED: a failure injected once the upgrade was through\n$/u);
-    assert.deepEqual([at.ran(), at.marks()], [["check", "upgrade", "check", "upgrade"], ["point-of-no-return", "upgraded"]]);
-    at.host();
+    assert.deepEqual([at.ran(), at.marks()], [["check", "upgrade"], ["point-of-no-return", "upgraded"]]);
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
-    assert.doesNotMatch(again.said, /checking that|upgrading, from the cut-over|stopping k3s|applying the upgrade again/u);
-    assert.match(again.said, /upgraded at \S+\n[^\n]* removing what of 8\.0\.0's this release has no use for[^\n]*\n[^\n]* through\n$/u);
-    assert.deepEqual([at.ran(), at.host()], [[], []]);
+    assert.doesNotMatch(again.said, /checking that|upgrading, from the cut-over/u);
+    assert.match(again.said, /^[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+    assert.deepEqual(at.ran(), []);
   } finally {
     at.remove();
   }
@@ -359,13 +214,13 @@ test("the cut-over refuses to run without what it needs, or a cluster to reach, 
     const run = spawnSync("bash", [SCRIPT], { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } });
     assert.notEqual(run.status, 0);
     assert.match(run.stderr, /UPGRADE: the upgrade of the release/u);
-    // A kubectl that reaches no cluster.
-    spawnSync("mkdir", [join(root, "bin")]);
-    writeFileSync(join(root, "bin", "kubectl"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
-    const needs = { PATH: `${join(root, "bin")}:${JQ}:/usr/bin:/bin`, OUT: join(root, "out"), UPGRADE: "true", UPGRADE_CHECK: "true" };
+    const needs = { PATH: `${join(root, "bin")}:/usr/bin:/bin`, OUT: join(root, "out"), UPGRADE: "true", UPGRADE_CHECK: "true" };
     const unconfigured = spawnSync("bash", [SCRIPT], { encoding: "utf8", env: needs });
     assert.notEqual(unconfigured.status, 0);
     assert.match(unconfigured.stderr, /CONFIG: the file of the configuration/u);
+    // A kubectl that reaches no cluster.
+    mkdirSync(join(root, "bin"));
+    writeFileSync(join(root, "bin", "kubectl"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
     const unread = spawnSync("bash", [SCRIPT], { encoding: "utf8", env: { ...needs, CONFIG: join(root, "none.json") } });
     assert.notEqual(unread.status, 0);
     assert.match(unread.stderr, /FAILED: CONFIG \S+none\.json cannot be read/u);
@@ -379,472 +234,85 @@ test("the cut-over refuses to run without what it needs, or a cluster to reach, 
   }
 });
 
-test("the cut-over deletes 8.0.0's log StatefulSet, whose claims carry its version, its pod and claim kept, for the upgrade to make anew, and leaves one of this release's", () => {
+test("before anything changes, the cut-over fetches what containerd lacks of the sandbox image, by its name as containerd records it and the digest it names, and of no other image", () => {
   const at = machine();
   try {
-    const run = at.cutOver();
-    assert.equal(run.code, 0, run.said);
-    assert.match(run.said, /deleting the log's StatefulSet, its pod and claim kept, for the upgrade to make it anew without 8\.0\.0 on its claims[^]*checking that the upgrade can run/u);
-    assert.deepEqual(at.kept(), logStatefulSet("8.0.0"));
-    // Made anew by the upgrade, as this release's.
-    assert.deepEqual(at.statefulSet(), logStatefulSet());
-    // One whose claims carry no version, or none at all, is left as it is.
-    const again = machine();
+    // As the box's was: pruned, and pulled again onto its snapshot, its layer's blob never fetched; beside an image pulled lazily.
+    const lazy = `sha256:${"b".repeat(64)}`;
+    at.hasImages([["docker.io/rancher/mirrored-pause:3.10.2", PAUSE, false], [`ghcr.io/eaucoin/alasio@${lazy}`, lazy, false]]);
+    const run = at.cutOver("before-the-point-of-no-return");
+    assert.notEqual(run.code, 0);
+    assert.match(run.said, /checking that no branch environment exists[^\n]*\n[^\n]* fetching what containerd lacks of the sandbox image docker\.io\/rancher\/mirrored-pause:3\.10\.2, recorded without it[^\n]*\n[^\n]* checking that the upgrade can run/u);
+    assert.deepEqual(at.fetched(), [`--hosts-dir ${at.containerd}/certs.d docker.io/rancher/mirrored-pause@${PAUSE}`]);
+    assert.deepEqual(at.images(), [["docker.io/rancher/mirrored-pause:3.10.2", PAUSE, true], [`ghcr.io/eaucoin/alasio@${lazy}`, lazy, false]]);
+    // Whole, it fetches nothing; nor where none is recorded, the CRI pulling it whole; nor where a run again finds it whole.
+    const again = at.cutOver();
+    assert.equal(again.code, 0, again.said);
+    assert.doesNotMatch(again.said, /fetching/u);
+    assert.deepEqual(at.fetched(), []);
+    const none = machine();
     try {
-      again.hasStatefulSet();
-      const left = again.cutOver();
-      assert.equal(left.code, 0, left.said);
-      assert.doesNotMatch(left.said, /deleting the log's StatefulSet/u);
-      assert.equal(again.kept(), null);
+      none.hasImages([]);
+      const unrecorded = none.cutOver();
+      assert.equal(unrecorded.code, 0, unrecorded.said);
+      assert.deepEqual(none.fetched(), []);
     } finally {
-      again.remove();
+      none.remove();
     }
   } finally {
     at.remove();
   }
 });
 
-test("the cut-over failing before its point of no return makes the log's StatefulSet again as 8.0.0 had it, which takes its pod back, and a run again deletes it anew", () => {
-  const at = machine();
-  try {
-    const failed = at.cutOver("before-the-point-of-no-return");
-    assert.notEqual(failed.code, 0);
-    assert.match(failed.said, /deleting the log's StatefulSet[^]*FAILED: a failure injected before the point of no return\n[^\n]* making the log's StatefulSet again, as 8\.0\.0 had it\n$/u);
-    // As 8.0.0 had it, but what the cluster gives an object it makes.
-    const { metadata: { uid: _uid, resourceVersion: _version, generation: _generation, ...metadata }, status: _status, ...made } = logStatefulSet("8.0.0");
-    assert.deepEqual(at.statefulSet(), { ...made, metadata });
-    const again = at.cutOver();
-    assert.equal(again.code, 0, again.said);
-    assert.match(again.said, /deleting the log's StatefulSet/u);
-    assert.deepEqual(at.statefulSet(), logStatefulSet());
-  } finally {
-    at.remove();
-  }
-});
-
-test("the cut-over removes install.agentSandbox from the configuration before the check reads it, the file's mode kept, and a failure before its point of no return puts it back", () => {
-  const at = machine();
-  try {
-    const install = { host: { enabled: true }, agentSandbox: { resources: { requests: { cpu: "10m" } } } };
-    writeFileSync(at.config, JSON.stringify({ target: { host: {} }, install }), { mode: 0o600 });
-    const failed = at.cutOver("before-the-point-of-no-return");
-    assert.notEqual(failed.code, 0);
-    assert.match(failed.said, /removing install\.agentSandbox from [^\n]*config\.json, as this release runs no agent-sandbox[^]*checking that the upgrade can run[^]*putting install\.agentSandbox back in /u);
-    assert.deepEqual(at.ran(), ["check"]);
-    assert.deepEqual(at.configured().install, install);
-    // What it kept of the configuration, whole, gone once put back.
-    assert.throws(() => at.recorded("config.json"), /ENOENT/u);
-    const run = at.cutOver();
-    assert.equal(run.code, 0, run.said);
-    assert.deepEqual(at.ran(), ["check", "upgrade", "check", "upgrade"]);
-    assert.deepEqual(at.configured(), { target: { host: {} }, install: { host: { enabled: true } } });
-    assert.equal(statSync(at.config).mode & 0o777, 0o600);
-    // One without it is left as it is.
-    const again = machine();
+test("the sandbox image is fetched by the name containerd records it by, whichever name k3s pins it by", () => {
+  for (const [pinned, recorded, fetched] of [
+    ["docker.io/rancher/mirrored-pause:3.10.2", "docker.io/rancher/mirrored-pause:3.10.2", "docker.io/rancher/mirrored-pause"],
+    ["pause:3.10", "docker.io/library/pause:3.10", "docker.io/library/pause"],
+    ["registry.k8s.io/pause:3.10", "registry.k8s.io/pause:3.10", "registry.k8s.io/pause"],
+    ["localhost:5000/pause:3.10", "localhost:5000/pause:3.10", "localhost:5000/pause"],
+  ] as const) {
+    const at = machine();
     try {
-      const left = again.cutOver();
-      assert.equal(left.code, 0, left.said);
-      assert.doesNotMatch(left.said, /agentSandbox/u);
-      assert.deepEqual(again.configured(), { target: { host: {} }, install: { host: { enabled: true } } });
+      at.pins(pinned);
+      at.hasImages([[recorded, PAUSE, false]]);
+      const run = at.cutOver();
+      assert.equal(run.code, 0, run.said);
+      assert.deepEqual(at.fetched(), [`--hosts-dir ${at.containerd}/certs.d ${fetched}@${PAUSE}`]);
     } finally {
-      again.remove();
+      at.remove();
     }
-  } finally {
-    at.remove();
   }
 });
 
-test("the cut-over refuses a machine with a reboot pending before it changes anything", () => {
-  const at = machine();
-  try {
-    at.rebootPending(true);
-    const refused = at.cutOver();
-    assert.notEqual(refused.code, 0);
-    assert.match(refused.said, /FAILED: this machine has a reboot pending [^\n]*: reboot it first, then cut over/u);
-    assert.deepEqual([at.ran(), at.marks()], [[], []]);
-    assert.deepEqual(at.statefulSet(), logStatefulSet("8.0.0"));
-  } finally {
-    at.remove();
-  }
-});
-
-test("past its point of no return, before the upgrade, the cut-over stops agent-sandbox's controller and alasio, then each folder's bayma with ten minutes to save its REPLs into its state directory, which it leaves, then deletes every Sandbox", () => {
-  const at = machine();
-  try {
-    const state = join(at.root, "home", ".alasio", "bayma", "claude", "telegram-42");
-    mkdirSync(join(state, "snapshots", "sess_a"), { recursive: true });
-    mkdirSync(join(state, "snapshots", "sess_b"));
-    at.hasAgentSandbox([["alasio-host", "bayma-0123", state]], [["alasio-host", "bayma-0123"], ["alasio-sessions", "fs-abc123"]]);
-    const run = at.cutOver();
-    assert.equal(run.code, 0, run.said);
-    const calls = at.calls();
-    const upgraded = calls.indexOf("delete crd sandboxes.agents.x-k8s.io --ignore-not-found --wait=true");
-    assert.deepEqual(calls.slice(0, 8), [
-      "-n alasio delete statefulset alasio-log --cascade=orphan --wait=true",
-      "-n alasio scale deployment alasio-agent-sandbox-controller --replicas=0",
-      "-n alasio scale deployment alasio --replicas=0",
-      "-n alasio-host delete pod bayma-0123 --ignore-not-found --grace-period=600 --wait=true --timeout=11m",
-      `-n alasio-host patch sandboxes.agents.x-k8s.io bayma-0123 --type=merge -p {"metadata":{"finalizers":null}}`,
-      "-n alasio-host delete sandboxes.agents.x-k8s.io bayma-0123 --ignore-not-found --wait=true",
-      `-n alasio-sessions patch sandboxes.agents.x-k8s.io fs-abc123 --type=merge -p {"metadata":{"finalizers":null}}`,
-      "-n alasio-sessions delete sandboxes.agents.x-k8s.io fs-abc123 --ignore-not-found --wait=true",
-    ]);
-    // Then, the upgrade through, alasio and the folder instances stopped again as the node's images move.
-    assert.deepEqual(calls.slice(8, 10), ["-n alasio scale deployment alasio --replicas=0", "-n alasio-host delete pod -l alasio.dev/pool=folder --ignore-not-found --grace-period=600 --wait=true --timeout=11m"]);
-    assert.equal(upgraded, 10);
-    assert.match(run.said, /stopping the folder's bayma alasio-host\/bayma-0123, given 10m to save its REPL sessions whole into \S+telegram-42, which stays[^]*saved the sessions sess_a sess_b whole[^]*deleting every Sandbox[^]*upgrading, from the cut-over/u);
-    assert.ok(existsSync(join(state, "snapshots", "sess_a")));
-    // Once its Sandboxes and CRD are gone, a run again does none of it.
-    const after = machine();
-    try {
-      const plain = after.cutOver();
-      assert.equal(plain.code, 0, plain.said);
-      assert.doesNotMatch(plain.said, /agent-sandbox's controller|folder's bayma|every Sandbox/u);
-    } finally {
-      after.remove();
-    }
-  } finally {
-    at.remove();
-  }
-});
-
-test("a folder's bayma that saved no session whole is said to bring each back from its checkpoint", () => {
-  const at = machine();
-  try {
-    at.hasAgentSandbox([["alasio-host", "bayma-4567", join(at.root, "nothing-saved")]], [["alasio-host", "bayma-4567"]]);
-    const run = at.cutOver();
-    assert.equal(run.code, 0, run.said);
-    assert.match(run.said, /the folder's bayma alasio-host\/bayma-4567 saved no session whole: each comes back from its checkpoint/u);
-  } finally {
-    at.remove();
-  }
-});
-
-test("once upgraded, the cut-over deletes what of 8.0.0's this release has no use for, the Sandboxes' CRD last of agent-sandbox's, each idempotently, as a run again does it again", () => {
-  const at = machine();
-  try {
-    at.hasAgentSandbox([], []);
-    const failed = at.cutOver("after-the-upgrade");
-    assert.notEqual(failed.code, 0);
-    at.calls();
-    assert.ok(at.hasCrd(), "nothing deleted before what follows the upgrade");
-    const removed = [
-      "delete crd sandboxes.agents.x-k8s.io --ignore-not-found --wait=true",
-      "-n alasio delete deployment,serviceaccount,role,rolebinding alasio-agent-sandbox-controller --ignore-not-found",
-      "delete clusterrole,clusterrolebinding alasio-agent-sandbox-controller --ignore-not-found",
-      "-n alasio delete configmap alasio-sandbox-templates --ignore-not-found",
-      "-n alasio-host delete role,rolebinding alasio --ignore-not-found",
-      "-n alasio-host delete networkpolicy bayma-from-alasio --ignore-not-found",
-      "delete validatingadmissionpolicy,validatingadmissionpolicybinding alasio-sandboxes alasio-secrets --ignore-not-found",
-    ];
-    const run = at.cutOver();
-    assert.equal(run.code, 0, run.said);
-    assert.deepEqual(at.calls(), removed);
-    assert.ok(!at.hasCrd());
-    const again = at.cutOver();
-    assert.equal(again.code, 0, again.said);
-    assert.deepEqual(at.calls(), removed);
-  } finally {
-    at.remove();
-  }
-});
-
-test("the cut-over refuses session workspaces of 8.0.0's before it changes anything, naming each with how to delete it, and goes on once they are deleted", () => {
-  const at = machine();
-  try {
-    at.hasAgentSandbox([], []);
-    at.hasSessionWorkspaces(["fs-abc123"], ["workspace-fs-abc123"]);
-    const refused = at.cutOver();
-    assert.notEqual(refused.code, 0);
-    assert.match(refused.said, /FAILED: alasio-sessions holds session workspaces of 8\.0\.0's, which this release runs no session on and moves nothing of: delete each first, its files with it \(kubectl -n alasio-sessions delete sandbox\.agents\.x-k8s\.io\/fs-abc123; kubectl -n alasio-sessions delete persistentvolumeclaim\/workspace-fs-abc123\), and run the cut-over again\n$/u);
-    assert.deepEqual([at.ran(), at.marks(), at.calls()], [[], [], []]);
-    assert.deepEqual(at.statefulSet(), logStatefulSet("8.0.0"));
-    at.hasSessionWorkspaces([], []);
-    const again = at.cutOver();
-    assert.equal(again.code, 0, again.said);
-  } finally {
-    at.remove();
-  }
-});
-
-test("once its upgrade has run, the cut-over moves the node's images onto stargz-snapshotter's daemon: k3s stopped, gVisor's processes and the daemon's FUSE manager killed, the daemon's mounts unmounted, deepest first, containerd's state and the daemon's removed, k3s started, and the upgrade applied again once the release accepts the installation", async () => {
-  const at = machine();
-  // Processes of the node's, each by its executable, as /proc says it.
-  const running = (executable: string) => {
-    const child = spawn("sleep", ["300"], { stdio: "ignore" });
-    mkdirSync(join(at.node, "proc", String(child.pid)), { recursive: true });
-    symlinkSync(executable, join(at.node, "proc", String(child.pid), "exe"));
-    return child;
-  };
-  const sandbox = running(join(at.node, "usr/local/lib/alasio/gvisor/20990101.0/runsc"));
-  const manager = running(join(at.node, "usr/local/bin/stargz-fuse-manager"));
-  const other = running("/usr/bin/sleep");
-  try {
-    at.turnRuns();
-    const run = at.cutOver();
-    assert.equal(run.code, 0, run.said);
-    assert.match(run.said, /upgrading, from the cut-over[^]*stopping k3s, to remove the node's images, unpacked by overlayfs under 8\.0\.0: \S+ of containerd's state\n[^]*starting k3s, which pulls every image again through stargz-snapshotter's daemon\n[^]*applying the upgrade again, which waits until alasio runs on the images pulled anew\n[^]*upgraded at /u);
-    assert.deepEqual(at.host(), [
-      // alasio stopped once it runs no turn, and the folder instances, before k3s is.
-      "kubectl -n alasio get pod -l app.kubernetes.io/component=alasio,alasio.dev/busy=true -o name (a turn runs)",
-      "kubectl -n alasio scale deployment alasio --replicas=0",
-      "kubectl -n alasio-host delete pod -l alasio.dev/pool=folder --ignore-not-found --grace-period=600 --wait=true --timeout=11m",
-      "systemctl stop k3s",
-      "k3s-killall.sh",
-      `umount -l ${at.daemonSnapshot}/inner`,
-      `umount -l ${at.daemonSnapshot}`,
-      "systemctl start k3s",
-    ]);
-    // The check the move waits for, between the upgrade and its applying again.
-    assert.deepEqual(at.ran(), ["check", "upgrade", "check", "upgrade"]);
-    for (const removed of ["var/lib/rancher/k3s/agent/containerd", "var/lib/containerd-stargz-grpc", "run/containerd-stargz-grpc"]) {
-      assert.ok(!existsSync(join(at.node, removed)), `${removed} is left`);
-    }
-    assert.deepEqual(at.imageMarks(), ["images-moved"]);
-    assert.deepEqual((await Promise.all([once(sandbox, "exit"), once(manager, "exit")])).map(([, signal]) => signal), ["SIGKILL", "SIGKILL"]);
-    assert.equal(other.exitCode ?? other.signalCode, null);
-  } finally {
-    for (const child of [sandbox, manager, other]) child.kill("SIGKILL");
-    at.remove();
-  }
-});
-
-test("a cut-over that stopped in the move of the node's images ends it first when run again, k3s stopped, then applies the upgrade again alone", () => {
-  const at = machine();
-  try {
-    at.startFails(true);
-    const stopped = at.cutOver();
-    assert.notEqual(stopped.code, 0);
-    assert.deepEqual([at.ran(), at.marks(), at.imageMarks()], [["check", "upgrade"], ["point-of-no-return"], ["images-moving"]]);
-    assert.deepEqual(at.host().slice(-1), ["systemctl start k3s"]);
-    at.startFails(false);
-    const again = at.cutOver();
-    assert.equal(again.code, 0, again.said);
-    assert.match(again.said, /^[^\n]* stopping k3s, to remove the node's images, unpacked by overlayfs under 8\.0\.0: none of containerd's state\n[^]*starting k3s[^]*applying the upgrade again[^]*through\n$/u);
-    assert.doesNotMatch(again.said, /checking that|upgrading, from the cut-over/u);
-    assert.deepEqual(at.host(), ["systemctl stop k3s", "k3s-killall.sh", "systemctl start k3s"]);
-    assert.deepEqual([at.ran(), at.marks(), at.imageMarks()], [["check", "upgrade"], ["point-of-no-return", "upgraded"], ["images-moved"]]);
-  } finally {
-    at.remove();
-  }
-});
-
-/** Digests of images containerd records, by the image's name. */
-const PAUSE = `sha256:${"a".repeat(64)}`;
-const ALASIO = `sha256:${"b".repeat(64)}`;
-const PULLED = `sha256:${"c".repeat(64)}`;
-const WHOLE = `sha256:${"d".repeat(64)}`;
-const UNNAMED = `sha256:${"e".repeat(64)}`;
-
-test("past its point of no return, before the upgrade restarts k3s onto stargz-snapshotter's daemon, the cut-over fetches what containerd lacks of each image it records, by the digest its name names, and forgets one only its id names", () => {
-  const at = machine();
-  try {
-    // As the box's were: the sandbox image pulled again onto overlayfs's snapshots, its layer's blob never fetched.
-    at.hasImages([
-      ["docker.io/rancher/mirrored-pause:3.10.2", PAUSE, false],
-      [`sha256:${"f".repeat(64)}`, PAUSE, false],
-      [`ghcr.io/eaucoin/alasio@${ALASIO}`, ALASIO, false],
-      ["localhost:5000/eaucoin/alasio-ci:run-1", PULLED, false],
-      ["docker.io/library/busybox:1.37", WHOLE, true],
-      [`sha256:${"9".repeat(64)}`, UNNAMED, false],
-    ]);
-    at.upgradeFails(true);
-    const failed = at.cutOver();
-    assert.notEqual(failed.code, 0);
-    assert.match(failed.said, /fetching what containerd lacks of images it records, for k3s on stargz-snapshotter's daemon to unpack them from: docker\.io\/rancher\/mirrored-pause:3\.10\.2 sha256:f+ ghcr\.io\/eaucoin\/alasio@sha256:b+ localhost:5000\/eaucoin\/alasio-ci:run-1 sha256:9+\n[^\n]* forgetting the images only their ids name, which lack content: sha256:9+\n[^\n]* upgrading, from the cut-over/u);
-    const hosts = join(at.node, "var/lib/rancher/k3s/agent/etc/containerd/certs.d");
-    assert.deepEqual(at.host(), [
-      `k3s ctr content fetch --hosts-dir ${hosts} docker.io/rancher/mirrored-pause@${PAUSE}`,
-      `k3s ctr content fetch --hosts-dir ${hosts} ghcr.io/eaucoin/alasio@${ALASIO}`,
-      `k3s ctr content fetch --hosts-dir ${hosts} localhost:5000/eaucoin/alasio-ci@${PULLED}`,
-      `k3s ctr images rm sha256:${"9".repeat(64)}`,
-    ]);
-    assert.deepEqual(at.images().map(([name, , whole]) => [name, whole]), [
-      ["docker.io/rancher/mirrored-pause:3.10.2", true],
-      [`sha256:${"f".repeat(64)}`, true],
-      [`ghcr.io/eaucoin/alasio@${ALASIO}`, true],
-      ["localhost:5000/eaucoin/alasio-ci:run-1", true],
-      ["docker.io/library/busybox:1.37", true],
-    ]);
-    // A run again, the upgrade having restarted k3s onto the daemon, finds none lacking.
-    at.upgradeFails(false);
-    const again = at.cutOver();
-    assert.equal(again.code, 0, again.said);
-    assert.doesNotMatch(again.said, /fetching what containerd lacks/u);
-    assert.ok(!at.host().some((asked) => asked.startsWith("k3s ")));
-  } finally {
-    at.remove();
-  }
-});
-
-test("the cut-over fails before its upgrade where what containerd lacks of an image cannot be fetched, and a run again fetches it", () => {
+test("the cut-over fails before its point of no return where what containerd lacks of the sandbox image cannot be fetched, and a run again fetches it", () => {
   const at = machine();
   try {
     at.hasImages([["docker.io/rancher/mirrored-pause:3.10.2", PAUSE, false]]);
     at.unreachable([PAUSE]);
     const failed = at.cutOver();
     assert.notEqual(failed.code, 0);
-    assert.match(failed.said, /FAILED: what containerd lacks of the image docker\.io\/rancher\/mirrored-pause:3\.10\.2 could not be fetched: the cut-over run again goes on with it\n$/u);
-    assert.deepEqual([at.ran(), at.marks()], [["check"], ["point-of-no-return"]]);
+    assert.match(failed.said, /FAILED: what containerd lacks of the sandbox image docker\.io\/rancher\/mirrored-pause:3\.10\.2 could not be fetched from its registry\n$/u);
+    assert.deepEqual([at.ran(), at.marks()], [[], []]);
     at.unreachable([]);
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
     assert.deepEqual(at.images(), [["docker.io/rancher/mirrored-pause:3.10.2", PAUSE, true]]);
-    assert.deepEqual([at.ran(), at.marks()], [["upgrade", "check", "upgrade"], ["point-of-no-return", "upgraded"]]);
+    assert.deepEqual([at.ran(), at.marks()], [["check", "upgrade"], ["point-of-no-return", "upgraded"]]);
   } finally {
     at.remove();
   }
 });
 
-/** The conversation 8.0.0's alasio kept the messages of these tests in. */
-const CONVERSATION = "telegram:7";
-
-/**
- * Keeps a Telegram message in the conversation as 8.0.0's alasio did, by its id `id`: Telegram's
- * `messageId`, sent at `date`, saying `text`, kept `at`.
- */
-async function kept(id: string, { messageId = 10, date = 1_700_000_000, text = "hello", at }: { readonly messageId?: number; readonly date?: number; readonly text?: string; readonly at: string }): Promise<void> {
-  await pool.query("insert into state.conversations (id, transport, chat_id) values ($1, 'telegram', '7') on conflict do nothing", [CONVERSATION]);
-  await pool.query(
-    "insert into state.messages (id, conversation_id, direction, kind, transport_message_id, text, raw, created_at) values ($1, $2, 'inbound', 'text', $3, $4, $5, $6)",
-    [id, CONVERSATION, String(messageId), text, JSON.stringify({ message_id: messageId, date, text }), at],
-  );
-}
-
-/** Keeps a file, by its id `id`, as the message `messageId` carried it, Telegram's `uniqueId`. */
-async function carried(id: string, messageId: string, uniqueId: string): Promise<void> {
-  await pool.query(
-    "insert into state.files (id, message_id, conversation_id, telegram_file_id, telegram_file_unique_id, name, file_size, sha256, content, raw) values ($1, $2, $3, 'file-id', $4, 'photo.jpg', 1, 'sha', '\\x00', '{}')",
-    [id, messageId, CONVERSATION, uniqueId],
-  );
-}
-
-/** The messages kept, by their ids; and the files, by theirs, with the message each is of. */
-const messages = async () => (await pool.query<{ id: string }>("select id from state.messages order by id")).rows.map(({ id }) => id);
-const files = async () => (await pool.query<{ id: string; message_id: string | null }>("select id, message_id from state.files order by id")).rows.map(({ id, message_id }) => [id, message_id]);
-
-/** Forgets what a test kept, its conversation, its messages and their files with it. */
-const forget = () => pool.query("delete from state.conversations");
-
-test("the cut-over says which Telegram messages 8.0.0 kept twice before it changes anything, and past its point of no return removes their exact copies, the first kept kept, its files given it, so this release's schema is made", async () => {
+test("the cut-over fails before its point of no return where containerd lacks content of the sandbox image still, fetched", () => {
   const at = machine();
   try {
-    await kept("first", { at: "2026-10-01T00:00:00Z" });
-    await kept("second", { at: "2026-10-01T00:00:01Z" });
-    await carried("photo", "second", "unique-photo");
-    await kept("other", { messageId: 11, at: "2026-10-01T00:00:00Z" });
-    await kept("other-again", { messageId: 11, at: "2026-10-01T00:00:01Z" });
-    await carried("document", "other", "unique-document");
-    await carried("document-again", "other-again", "unique-document");
-    // Telegram's id again, sent at another time, as a branch's bot gives its own: another message.
-    await kept("later", { date: 1_700_000_100, at: "2026-10-01T00:00:02Z" });
-    const failed = at.cutOver("before-the-point-of-no-return");
-    assert.notEqual(failed.code, 0);
-    assert.match(failed.said, /finding the Telegram messages[^\n]*\n[^\n]* 2 exact copies of Telegram messages kept twice, removed past the point of no return\n/u);
-    assert.equal(at.recorded("telegram-duplicates.tsv"), `message\t${CONVERSATION}\tinbound\t10\t1700000000\t2\t1\nmessage\t${CONVERSATION}\tinbound\t11\t1700000000\t2\t1\n`);
-    // Nothing is removed before the point of no return.
-    assert.deepEqual(await messages(), ["first", "later", "other", "other-again", "second"]);
-    const run = at.cutOver();
-    assert.equal(run.code, 0, run.said);
-    assert.match(run.said, /past the point of no return[^\n]*\n[^\n]* removed 2 exact copies of Telegram messages kept twice\n[^]* upgrading, from the cut-over/u);
-    assert.deepEqual(await messages(), ["first", "later", "other"]);
-    // The copy's file goes to the message kept, which had none; a file the message kept has already is let go of, kept.
-    assert.deepEqual(await files(), [["document", "other"], ["document-again", null], ["photo", "first"]]);
-    // This release's schema, which keeps each once, is made on what it left.
-    await testStore({ schema: "state" });
-  } finally {
-    at.remove();
-    await forget();
-    await pool.query("drop index if exists state.messages_telegram_once; drop index if exists state.files_telegram_once");
-  }
-});
-
-test("the cut-over refuses a Telegram message 8.0.0 kept twice whose copies differ, or a file a message carried kept twice, before it changes anything, saying which", async () => {
-  const at = machine();
-  try {
-    await kept("first", { at: "2026-10-01T00:00:00Z" });
-    await kept("edited", { text: "hello again", at: "2026-10-01T00:00:01Z" });
-    const refused = at.cutOver();
-    assert.notEqual(refused.code, 0);
-    assert.match(refused.said, new RegExp(`FAILED: alasio kept these twice[^\\n]*: message 10 of ${CONVERSATION} \\(2 kept, 2 different\\)\\. Put them right by hand`, "u"));
-    assert.deepEqual([at.ran(), at.marks(), at.statefulSet(), await messages()], [[], [], logStatefulSet("8.0.0"), ["edited", "first"]]);
-    await pool.query("delete from state.messages where id = 'edited'");
-    await carried("photo", "first", "unique-photo");
-    await carried("photo-again", "first", "unique-photo");
-    const again = at.cutOver();
-    assert.notEqual(again.code, 0);
-    assert.match(again.said, /: file unique-photo of first \(2 kept, 1 different\)\. Put them right by hand/u);
-    assert.deepEqual([at.ran(), at.marks(), await files()], [[], [], [["photo", "first"], ["photo-again", "first"]]]);
-  } finally {
-    at.remove();
-    await forget();
-  }
-});
-
-/** The forks' holds' columns, each with whether it may be null and its default. */
-const holdColumns = async () =>
-  (await pool.query<{ column_name: string; is_nullable: string; column_default: string | null }>(
-    "select column_name, is_nullable, column_default from information_schema.columns where table_schema = 'state' and table_name = 'conversation_holds' order by ordinal_position",
-  )).rows.map(({ column_name, is_nullable, column_default }) => [column_name, is_nullable, column_default]);
-
-test("the cut-over gives 8.0.0's forks' holds their holder and expiry past its point of no return, with defaults 8.0.0's holds need, and takes those off once the upgrade is through", async () => {
-  await holdsOf800();
-  const at = machine();
-  try {
-    // 8.0.0 holds a conversation, as it does without either.
-    await pool.query("insert into state.conversations (id, transport, chat_id) values ('telegram:8', 'telegram', '8') on conflict do nothing");
-    await pool.query("insert into state.conversation_holds (conversation_id, reason) values ('telegram:8', 'forking')");
-    // Failing once its upgrade is through, the defaults are kept, as 8.0.0's holds, made until the upgrade, needed them.
-    const failed = at.cutOver("after-the-upgrade");
-    assert.notEqual(failed.code, 0);
-    assert.match(failed.said, /past the point of no return[^]*gave the forks' holds their holder and expiry[^]*upgrading, from the cut-over/u);
-    const given = await holdColumns();
-    assert.ok(given.slice(3).every(([, , fallback]) => fallback !== null), "8.0.0's holds are made with defaults until the upgrade");
-    const run = at.cutOver();
-    assert.equal(run.code, 0, run.said);
-    assert.deepEqual(given.map(([name, nullable]) => [name, nullable]), [["conversation_id", "NO"], ["reason", "NO"], ["held_at", "NO"], ["holder", "NO"], ["expires_at", "NO"]]);
-    // 8.0.0's hold, expired as alasio starts.
-    assert.equal((await pool.query("select 1 from state.conversation_holds where expires_at > now()")).rows.length, 0);
-    assert.match(run.said, /made the forks' holds as this release makes them, without the defaults 8\.0\.0's needed\n[^\n]* upgraded at /u);
-    assert.deepEqual((await holdColumns()).slice(3), [["holder", "NO", null], ["expires_at", "NO", null]]);
-  } finally {
-    at.remove();
-    await pool.query("delete from state.conversations");
-    await holdsOf800();
-  }
-});
-
-test("the cut-over run again after its upgrade failed goes on with the upgrade, though the upgrade pruned agent-sandbox's controller, stopping nothing again", () => {
-  const at = machine();
-  try {
-    at.hasAgentSandbox([], [["alasio-host", "bayma-0123"]]);
-    at.upgradeFails(true);
+    at.hasImages([["docker.io/rancher/mirrored-pause:3.10.2", PAUSE, false]]);
+    at.unfetched([PAUSE]);
     const failed = at.cutOver();
     assert.notEqual(failed.code, 0);
-    assert.match(failed.said, /FAILED: the upgrade failed \(upgrade\.log\)/u);
-    assert.ok(!at.hasController() && at.hasCrd(), "the upgrade pruned the controller, the CRD kept");
-    at.calls();
-    at.upgradeFails(false);
-    const again = at.cutOver();
-    assert.equal(again.code, 0, again.said);
-    assert.doesNotMatch(again.said, /stopping agent-sandbox's controller|so none starts until the upgrade starts it again|deleting every Sandbox/u);
-    assert.ok(!at.calls().some((call) => call.includes("scale deployment alasio-agent-sandbox-controller")));
-  } finally {
-    at.remove();
-  }
-});
-
-test("the move of the node's images stops k3s, and fails, where the node's disk keeps less free than the pulls anew keep, a run again going on with the move", () => {
-  const at = machine();
-  try {
-    const short = at.cutOver(undefined, { DISK_FLOOR_BYTES: String(2 ** 60) });
-    assert.notEqual(short.code, 0);
-    assert.match(short.said, /FAILED: the node's disk has \d+ MiB free, below the \d+ MiB the pulls of the images anew keep: k3s is stopped/u);
-    assert.deepEqual(at.host().slice(-2), ["systemctl start k3s", "systemctl stop k3s"]);
-    assert.deepEqual(at.imageMarks(), ["images-moving"]);
-    const again = at.cutOver(undefined, { DISK_FLOOR_BYTES: "1" });
-    assert.equal(again.code, 0, again.said);
-    assert.deepEqual(at.imageMarks(), ["images-moved"]);
+    assert.match(failed.said, /FAILED: containerd lacks content of the sandbox image docker\.io\/rancher\/mirrored-pause:3\.10\.2 still, fetched\n$/u);
+    assert.equal(at.fetched().length, 1);
+    assert.deepEqual([at.ran(), at.marks()], [[], []]);
   } finally {
     at.remove();
   }

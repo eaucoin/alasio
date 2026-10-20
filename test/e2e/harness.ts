@@ -181,15 +181,6 @@ const PUSHED = process.env["ALASIO_E2E_REGISTRY"] || undefined;
  */
 export const ESTARGZ = PUSHED !== undefined;
 
-/**
- * The bayma the box's folders run on the release before, as its configuration pins it
- * (host.baymaImage), which the upgrade shard's install of it is given. The cut-over's
- * configuration step removes the pin (boxConfiguration), as the box's does, so the folder
- * instances run this release's bayma (cli/src/manifests/config.ts HOST_BAYMA_IMAGE), which
- * refuses a snapshot this one took: their REPLs come back from their checkpoints, once.
- */
-export const FOLDER_BAYMA_BEFORE = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.3", digest: "sha256:add3c8ad2024f5dad077d2deac67fcda911722eee75be866946d17b17dd31be7" } as const;
-
 /** The run's registry: a container on the cluster's network, with a volume of its own, both of this name. */
 const REGISTRY = `${CLUSTER}-registry`;
 /** Distribution's registry. */
@@ -548,7 +539,8 @@ export async function bindSession(volumeId: string, timeoutMs = 300_000): Promis
   let last = { status: 0, said: "" };
   for (const deadline = Date.now() + timeoutMs; ; await new Promise((resolve) => setTimeout(resolve, 2_000))) {
     last = await gatewayCall(token, "POST", "/bind");
-    const bound = last.status === 200 ? await boundPodOf(volumeId) : null;
+    // 200 and the binding from this release's gateway; 204 from 9.0.0's, which the upgrade shard seeds its sessions through.
+    const bound = last.status === 200 || last.status === 204 ? await boundPodOf(volumeId) : null;
     if (bound) return bound;
     if (Date.now() >= deadline) throw new Error(`the gateway did not bind ${volumeId} within ${timeoutMs / 1000}s: it last answered ${last.status} ${last.said}`);
   }
@@ -647,7 +639,7 @@ async function push(pushHost: string, name: keyof typeof IMAGES, args: readonly 
  * previous release, its own images, which its package pins, but for alasio's, the stand-in
  * built on it, and the settings it has, as its alasio init writes them. A setting the
  * previous release does not have is given to this checkout's alone, as that release refuses
- * a configuration with a setting it does not know: 8.0.0 has every setting this checkout
+ * a configuration with a setting it does not know: 9.0.0 has every setting this checkout
  * has, so far.
  */
 function installation(of: "previous" | "release"): Record<string, unknown> {
@@ -663,13 +655,12 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
         ALASIO_CODEX_BIN: CODEX_STAND_IN,
         ALASIO_CLAUDE_BIN: CLAUDE_STAND_IN,
       },
-      resources: { requests: { cpu: "50m", memory: "256Mi" } },
+      // The release before's as much as the box's asks for.
+      resources: { requests: { cpu: "50m", memory: of === "previous" ? "2560Mi" : "256Mi" } },
       ...on("agent-1"),
     },
-    // The release before's folders running the bayma the box's do (FOLDER_BAYMA_BEFORE); and the
-    // release before's agent-sandbox sized, as the box's configuration may say, which the
-    // cut-over removes.
-    host: { resources: { requests: { cpu: "20m", memory: "128Mi" } }, ...(of === "previous" ? { baymaImage: FOLDER_BAYMA_BEFORE } : {}) },
+    // The release before's folder instances let go after four hours idle, as the box's configuration says.
+    host: { resources: { requests: { cpu: "20m", memory: "128Mi" } }, ...(of === "previous" ? { releaseAfter: "4h" } : {}) },
     // Conversations' harnesses in pools of their own, as 10.0.0's are, of this checkout's alone, as the release before has none:
     // released within the run in the agents shard alone, as the other suites' turns are not written to wait on a pool's pod.
     ...(of === "release"
@@ -694,6 +685,8 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
     // Three, where the run proves the log a quorum: each node's access applier writes the
     // credentials through whichever is KRaft's active controller, and its node is ready.
     ...(AGENTS >= 2 && inShard("telemetry") ? { log: { scaling: { min: 3, max: 3 } } } : {}),
+    // The release before's log as much as the box's asks for, on the one node the upgrade shard runs.
+    ...(of === "previous" ? { log: { resources: { requests: { memory: "1Gi" } } } } : {}),
     neon: {
       safekeepers: { storage: { size: "2Gi" }, resources: { requests: { cpu: "20m", memory: "64Mi" } } },
       // Two, where the run proves Neon's storage scaled out: its tenant split across them.
@@ -752,7 +745,6 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
     grafana: { ...(inShard("scaling") ? { scaling: { min: 2, max: 2 } } : {}), resources: { requests: { cpu: "40m", memory: "192Mi" } } },
     // JuiceFS's metadata dumped as often as it allows, so one lands within the run.
     workspaceStorage: { backupInterval: "5m" },
-    ...(of === "previous" ? { agentSandbox: { resources: { requests: { cpu: "10m", memory: "32Mi" } } } } : {}),
   };
 }
 
@@ -912,15 +904,6 @@ const shellWord = (word: string): string => `'${word.replaceAll("'", `'\\''`)}'`
 export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Promise<Ran> {
   const { work, env, kubeconfig, release } = current();
   const configHome = env["XDG_CONFIG_HOME"] ?? "";
-  const configFile = join(configHome, "alasio", "config.json");
-  // The box's configuration step, before the script: once, kept as it was, and put back as it was where the script refuses or fails before its point of no return.
-  const before = join(work, "config.before-cut-over.json");
-  if (!existsSync(before)) {
-    const config = readFileSync(configFile, "utf8");
-    writeFileSync(before, config, { mode: 0o600 });
-    // Written over, so the file keeps its owner and mode.
-    writeFileSync(configFile, JSON.stringify(boxConfiguration(JSON.parse(config) as Configuration)));
-  }
   const script = join(root, "upgrades", `from-${PREVIOUS}.sh`);
   if (!existsSync(script)) throw new Error(`no upgrades/from-${PREVIOUS}.sh says how an installation of ${PREVIOUS} upgrades to this release: write one, if only to run UPGRADE`);
   const installFile = join(work, "release-install.json");
@@ -947,44 +930,12 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
     stdio: ["ignore", "pipe", "pipe"],
   }));
   if (ran.code === 0) current().bin = release;
-  if (ran.code !== 0 && (await inCutOverRecord("test -e point-of-no-return && echo past || true")).trim() !== "past") {
-    writeFileSync(configFile, readFileSync(before, "utf8"));
-    rmSync(before);
-  }
   // What the upgrade and its check said, which the cut-over keeps in its record alone: a failure of theirs says only where to look.
-  else {
-    for (const name of ["upgrade-check.log", "upgrade.log"]) {
-      const kept = await inCutOverRecord(`if [ -f ${name} ]; then tail -n 80 ${name}; else echo "(none)"; fi`).catch((error: unknown) => `could not be read: ${String(error)}`);
-      console.error(`# the cut-over's ${name}, its last lines:\n${kept.trimEnd()}`);
-    }
+  for (const name of ["upgrade-check.log", "upgrade.log"]) {
+    const kept = await inCutOverRecord(`if [ -f ${name} ]; then tail -n 80 ${name}; else echo "(none)"; fi`).catch((error: unknown) => `could not be read: ${String(error)}`);
+    console.error(`# the cut-over's ${name}, its last lines:\n${kept.trimEnd()}`);
   }
   return ran;
-}
-
-/** alasio's configuration, as far as the cut-over's configuration step reads it. */
-interface Configuration {
-  readonly install?: {
-    readonly host?: Record<string, unknown>;
-    readonly alasio?: { readonly resources?: { readonly requests?: Record<string, unknown> } & Record<string, unknown> } & Record<string, unknown>;
-    readonly log?: { readonly resources?: { readonly requests?: Record<string, unknown> } & Record<string, unknown> } & Record<string, unknown>;
-  } & Record<string, unknown>;
-}
-
-/**
- * `config` as the box's cut-over makes its configuration before it runs the script: the
- * folders' bayma pin removed, for this release's; a folder instance let go after four hours
- * idle; and alasio's memory request 2560Mi and the log's 1Gi, as the box's use more than their
- * defaults request. The run's own install configuration, laid over it as UPGRADE runs, sizes
- * alasio and the log down again, to the runner's.
- */
-export function boxConfiguration(config: Configuration): Configuration {
-  const install = config.install ?? {};
-  const { baymaImage: _pinned, ...host } = install.host ?? {};
-  const requesting = (part: { readonly resources?: { readonly requests?: Record<string, unknown> } } | undefined, memory: string) => ({
-    ...part,
-    resources: { ...part?.resources, requests: { ...part?.resources?.requests, memory } },
-  });
-  return { ...config, install: { ...install, host: { ...host, releaseAfter: "4h" }, alasio: requesting(install.alasio, "2560Mi"), log: requesting(install.log, "1Gi") } };
 }
 
 /** Where the upgrade shard's cut-over keeps its record (its OUT), which root owns. */

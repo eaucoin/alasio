@@ -23,7 +23,7 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1Secret, V1StatefulSet, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1Secret, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
@@ -59,7 +59,6 @@ import {
   boundPodOf,
   CLUSTER,
   cutOver,
-  FOLDER_BAYMA_BEFORE,
   gatewayCall,
   inCutOverRecord,
   dumpClusterState,
@@ -102,33 +101,9 @@ import { workspaceStorage } from "./workspace-storage.ts";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** A bayma for folders other than this release's, as a later release may pin, whose instance refuses a snapshot this release's took. */
+const OTHER_BAYMA = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.2", digest: "sha256:5a9a731371d083cae815c6f27c5eb0147e1e77fac400544285f8416047ba4109" } as const;
 /** The host profile's namespace, where folder workspaces' bayma run. */
-/** A Sandbox of the release upgraded from, whose bayma agent-sandbox ran: its metadata alone is read. */
-interface Sandbox extends KubernetesObject {
-  readonly metadata: V1ObjectMeta;
-}
-/** The bayma the release upgraded from pins for folders: one other than this release's, whose instance refuses a snapshot this release's took. */
-const PREVIOUS_BAYMA = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.2", digest: "sha256:5a9a731371d083cae815c6f27c5eb0147e1e77fac400544285f8416047ba4109" } as const;
-/** A folder conversation's bayma's Sandbox of the release upgraded from: its pod template, which its bayma's state directory is an argument of. */
-interface FolderSandbox extends Sandbox {
-  readonly spec: { readonly podTemplate: V1PodTemplateSpec };
-}
-/**
- * What of the release upgraded from's this release has no use for, which the cut-over
- * removes, by kind, name and namespace: agent-sandbox's controller and CRD, alasio's templates
- * of its Sandboxes, its role and network policy in the folders' namespace, and its admission
- * policies of Sandboxes and their Secrets.
- */
-const PREVIOUS_ONLY: readonly (readonly [KindName, string, string?])[] = [
-  ["CustomResourceDefinition", "sandboxes.agents.x-k8s.io"],
-  ["Deployment", "alasio-agent-sandbox-controller", "alasio"],
-  ["ClusterRole", "alasio-agent-sandbox-controller"],
-  ["ConfigMap", "alasio-sandbox-templates", "alasio"],
-  ["Role", "alasio", "alasio-host"],
-  ["NetworkPolicy", "bayma-from-alasio", "alasio-host"],
-  ["ValidatingAdmissionPolicy", "alasio-sandboxes"],
-  ["ValidatingAdmissionPolicy", "alasio-secrets"],
-];
 const HOST_NAMESPACE = "alasio-host";
 
 // What the cluster was doing is said as something of the run fails, while the cluster is
@@ -284,9 +259,6 @@ if (inShard("upgrade")) {
       branchTelegram?.close();
     });
 
-    /** The snapshots overlayfs holds on the node, one a line, as k3s's containerd lists them under its heading. */
-    const overlayfsSnapshots = async () => (await onNode("", "k3s ctr -n k8s.io snapshots --snapshotter overlayfs ls | tail -n +2")).trim();
-
     /** Whether the Deployment `name` of main's runs its replicas, ready. */
     const runs = async (name: string) => {
       const deployment = await kube.get<V1Deployment>(ref("Deployment", name, NAMESPACE));
@@ -297,14 +269,13 @@ if (inShard("upgrade")) {
     /** The files of the cut-over's record, which its markers are among. */
     const recorded = async () => (await inCutOverRecord("ls -1")).split("\n").filter(Boolean);
 
-    /** The folder chat's bayma's Sandbox, on the release before: its name, the key of its folder instance on this release, and its state directory. */
-    let folderBayma: { readonly name: string; readonly key: string; readonly state: string };
-    /** The folder chat's REPL sessions in its bayma. */
+    /** The folder chat's folder instance, on the release before: its pod's name, its binding's key, its state directory, and the bayma it ran. */
+    let folderInstance: { readonly name: string; readonly key: string; readonly state: string; readonly image: string };
+    /** The folder chat's REPL sessions in its folder instance. */
     let folderRepls: FolderReplsSet;
-    /** Main's session workspace, made on the release before, then left for a folder. */
+    /** Main's session workspace, made on the release before, which holds a file. */
     let volumeId: string;
-    /** The folders mounted in main's chat and the other, which hold a file each. */
-    let main: string;
+    /** The folder mounted in the other chat, which holds a file. */
     let folder: string;
     let messages: number;
     /** Runs `sql` on the storage controller's database, neon-control's record among it: what psql printed. */
@@ -357,11 +328,17 @@ if (inShard("upgrade")) {
     /** The lines of Codex's rollouts the lake holds, and how many it had loaded on the release before. */
     const lakeLines = async () => Number((await lakeQuery("select count(*) as n from codex.lines"))[0]?.["n"] ?? 0);
     let loaded: number;
-    /** The forks' holds' columns: each one's name, whether it may be null, and its default. */
-    const HOLD_COLUMNS = "select column_name, is_nullable, coalesce(column_default, '') from information_schema.columns where table_schema = 'state' and table_name = 'conversation_holds' order by ordinal_position";
-    /** The Telegram message kept twice on the release before, by the id of the one kept first; and Telegram's id of it. */
-    let keptOnce: string;
-    let sentAs: string;
+    /** The folder chat's folder instances, by its binding's key, as the gateway makes them in the folders' namespace. */
+    const folderInstances = async () =>
+      (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" }))
+        .filter((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"]?.endsWith(`:telegram:${FOLDER_CHAT}`));
+    /** containerd's check of the content of the pods' sandbox image, as it records it by `name`: its digest, and whether it holds all of it. */
+    const sandboxImageChecked = async (name: string) => {
+      const [, , digest = "", status = ""] = (await onNode("", `k3s ctr -n k8s.io images check 'name==${name}' | tail -n +2`)).trim().split(/\s+/u);
+      return { digest, whole: status === "complete" };
+    };
+    /** The pods' sandbox image, by the name containerd records it by. */
+    let sandboxImage: string;
     const scenarios: readonly Scenario[] = [
       {
         seeds: "main's bot allowing the users its owner gave it",
@@ -377,93 +354,65 @@ if (inShard("upgrade")) {
         },
       },
       {
-        seeds: "main at work in a folder, a session workspace of its left from before it, and the folder chat at work in a folder of its own, a file in each folder",
+        seeds: "main at work in a session workspace, a file written in it and a turn on Codex there, and the folder chat at work in a folder of its own, a file in it",
         seed: async () => {
-          volumeId = await workInMainOnPrevious();
-          main = await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'");
-          assert.ok(main.startsWith(paths().home), `main mounts ${main}`);
+          volumeId = await workInMain();
           await tg.say("hello", FOLDER_CHAT);
           await tg.waitFor((call) => answered(call, FOLDER_CHAT));
           folder = await onDatabase(NAMESPACE, `select working_directory from state.conversations where id = 'telegram:${FOLDER_CHAT}'`);
           assert.ok(folder.startsWith(paths().home), `the folder chat mounts ${folder}`);
-          for (const each of [main, folder]) await onNode("", `printf %s 'written by main' >'${each}/proof' && chown ${HOST_USER}:${HOST_USER} '${each}/proof'`);
+          await onNode("", `printf %s 'written by the folder chat' >'${folder}/proof' && chown ${HOST_USER}:${HOST_USER} '${folder}/proof'`);
           messages = Number(await onDatabase(NAMESPACE, "select count(*) from state.messages"));
         },
-        keeps: "main's conversations go on in their folders, each file as it was",
+        keeps: "main's conversation goes on in its session workspace, and the folder chat's in its folder, each file as it was",
         check: async () => {
           // What status says of the compute alone: the lake's intake, which KEDA scales from none as the log
           // fills, may be starting as it runs, not yet ready.
           assert.match((await alasio("status")).stdout, new RegExp(`^ {2}Deployment ${NAMESPACE}/alasio-neon-compute: awake`, "mu"));
-          assert.equal(await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'"), main);
           assert.equal(await onDatabase(NAMESPACE, `select working_directory from state.conversations where id = 'telegram:${FOLDER_CHAT}'`), folder);
           await tg.say("again");
           await tg.waitFor((call) => answered(call));
+          assert.equal(await inSession(volumeId, 'process.stdout.write(require("fs").readFileSync("/workspace/proof", "utf8"))'), "written by main");
           await tg.say("again", FOLDER_CHAT);
           await tg.waitFor((call) => answered(call, FOLDER_CHAT));
-          for (const each of [main, folder]) assert.equal(readFileSync(`${each}/proof`, "utf8"), "written by main");
+          assert.equal(readFileSync(`${folder}/proof`, "utf8"), "written by the folder chat");
           assert.ok(Number(await onDatabase(NAMESPACE, "select count(*) from state.messages")) > messages);
         },
       },
       {
-        seeds: "the folder conversation's REPL sessions live in its bayma's Sandbox, a Python one counting in a thread of its own, and a Bun one",
+        seeds: "the folder conversation's REPL sessions live in its folder instance, a Python one counting in a thread of its own, and a Bun one",
         seed: async () => {
-          // Main's folder has a bayma of its own beside it.
-          const [sandbox, ...others] = (await kube.list<FolderSandbox>("Sandbox", { namespace: HOST_NAMESPACE })).filter(({ metadata }) =>
-            metadata.labels?.["alasio.dev/workload"] === "folder" && metadata.annotations?.["alasio.dev/conversation"] === `telegram:${FOLDER_CHAT}`
-          );
-          assert.ok(sandbox && others.length === 0, "the folder chat's bayma is one Sandbox");
-          const args = sandbox.spec.podTemplate.spec?.containers.find(({ name }) => name === "bayma")?.args ?? [];
-          folderBayma = {
-            name: sandbox.metadata.name ?? "",
-            key: `folder:${sandbox.spec.podTemplate.metadata?.labels?.["alasio.dev/harness"]}:${sandbox.metadata.annotations?.["alasio.dev/conversation"]}`,
+          const [instance, ...others] = await folderInstances();
+          assert.ok(instance && others.length === 0, "the folder chat's folder instance is one pod");
+          const bayma = instance.spec?.containers.find(({ name }) => name === "bayma");
+          const args = bayma?.args ?? [];
+          folderInstance = {
+            name: instance.metadata?.name ?? "",
+            key: instance.metadata?.annotations?.["alasio.dev/binding-key"] ?? "",
             state: args[args.indexOf("--state-dir") + 1] ?? "",
+            image: bayma?.image ?? "",
           };
-          assert.match(folderBayma.key, new RegExp(`^folder:[a-z]+:telegram:${FOLDER_CHAT}$`, "u"));
-          const token = await kube.secret(HOST_NAMESPACE, `${folderBayma.name}-bayma-token`, "token");
-          folderRepls = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", `http://${folderBayma.name}.${HOST_NAMESPACE}.svc:7290/mcp`, token, `kept by ${folderBayma.name}`);
+          assert.match(folderInstance.key, new RegExp(`^folder:[a-z]+:telegram:${FOLDER_CHAT}$`, "u"));
+          folderRepls = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", GATEWAY_MCP, await mainKeyToken(folderInstance.key), `kept by ${folderInstance.name}`);
           assert.ok(folderRepls.count > 0, JSON.stringify(folderRepls));
         },
-        keeps: "the folder conversation's REPL sessions, back from their checkpoints, in the gateway's folder instance of the conversation, on its bayma's state directory, left in place, as the cut-over's configuration step unpins the folders' bayma for this release's, which refuses a snapshot the one before took",
+        keeps: "the folder conversation's REPL sessions in its folder instance, on its state directory: whole where this release's folders run the bayma the release before's did, else back from their checkpoints",
         check: async () => {
-          const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), folderRepls.python, folderRepls.bun);
-          const kept = `kept by ${folderBayma.name}`;
-          if (seen.python.live !== kept || seen.bun.live !== kept) {
-            // What the folder instance's bayma said of the sessions it restored, where it cannot be read.
-            for (const pod of await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" })) {
-              const name = pod.metadata?.name ?? "";
-              console.error(`# ${HOST_NAMESPACE}/${name}, bound to ${pod.metadata?.annotations?.["alasio.dev/binding-key"]}:\n${await kube.logs(HOST_NAMESPACE, name, "bayma").catch((error: unknown) => String(error))}`);
-            }
+          const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderInstance.key), folderRepls.python, folderRepls.bun);
+          const [instance, ...others] = await folderInstances();
+          assert.ok(instance && others.length === 0, `the folder chat's folder instance is one pod, bound to ${folderInstance.key}`);
+          const bayma = instance.spec?.containers.find(({ name }) => name === "bayma");
+          assert.equal(bayma?.args?.[bayma.args.indexOf("--state-dir") + 1], folderInstance.state);
+          const kept = `kept by ${folderInstance.name}`;
+          if (bayma?.image === folderInstance.image) {
+            // Live, or saved whole as its instance stopped and restored so.
+            assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, kept, true, kept, kept], JSON.stringify(seen));
+            for (const notice of [seen.python.notice, seen.bun.notice]) assert.doesNotMatch(notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+          } else {
+            // A snapshot holds its bayma's version, which another refuses.
+            assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [null, kept, false, null, kept], JSON.stringify(seen));
+            for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", CAME_BACK_FROM_CHECKPOINT);
           }
-          // From their checkpoints, what those keep intact, as this release's bayma refuses the snapshots the one before took.
-          assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [null, kept, false, null, kept], JSON.stringify(seen));
-          for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", CAME_BACK_FROM_CHECKPOINT);
-          // The configuration as the box's cut-over left it: the pin gone, a folder let go after four hours idle.
-          const host = (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: { host: Record<string, unknown> } }).install.host;
-          assert.deepEqual([host["baymaImage"], host["releaseAfter"]], [undefined, "4h"]);
-          // The gateway's pod of the folder pool, bound to the conversation's key, on the state directory the Sandbox's bayma had.
-          const [instance, ...others] = (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" }))
-            .filter((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"] === folderBayma.key);
-          assert.ok(instance && others.length === 0, `the folder chat's folder instance is one pod, bound to ${folderBayma.key}`);
-          const bayma = instance?.spec?.containers.find(({ name }) => name === "bayma");
-          assert.equal(bayma?.args?.[bayma.args.indexOf("--state-dir") + 1], folderBayma.state);
-          assert.doesNotMatch(bayma?.image ?? "", new RegExp(`@${FOLDER_BAYMA_BEFORE.digest}$`, "u"), "the folder instance runs this release's bayma");
-        },
-      },
-      {
-        seeds: "agent-sandbox, the folder's bayma's Sandbox, alasio's templates of it, its role and network policy in the folders' namespace, its policies of Sandboxes and their Secrets, and the configuration sizing agent-sandbox",
-        seed: async () => {
-          const named = async (kind: KindName, name: string, namespace?: string) => (await kube.get(ref(kind, name, namespace))) !== null;
-          assert.deepEqual(await Promise.all(PREVIOUS_ONLY.map(([kind, name, namespace]) => named(kind, name, namespace))), PREVIOUS_ONLY.map(() => true));
-          assert.ok("agentSandbox" in (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: object }).install);
-        },
-        keeps: "none of them: the cut-over removed each, and the configuration's agent-sandbox, which the release runs none of",
-        check: async () => {
-          const named = async (kind: KindName, name: string, namespace?: string) => (await kube.get(ref(kind, name, namespace))) !== null;
-          assert.deepEqual(await Promise.all(PREVIOUS_ONLY.map(([kind, name, namespace]) => named(kind, name, namespace))), PREVIOUS_ONLY.map(() => false));
-          assert.ok(!("agentSandbox" in (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: object }).install));
-          // The folder's state directory, as its bayma left it, which the folder instance runs on:
-          // the host user's, as root sees it.
-          assert.equal((await onNode("", `[ -d '${folderBayma.state}' ] && echo kept || echo gone`)).trim(), "kept", folderBayma.state);
         },
       },
       {
@@ -493,30 +442,20 @@ if (inShard("upgrade")) {
           const after = await stackSecrets();
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
-          // And what this release adds to the stack's: the harness host's role's password and
-          // verifier, and main's harness pools' principal on the log; the sandbox gateway's keys,
-          // its principal on the log, and the password of its workspaces' quotas.
-          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), [
-            "gatewayBindingKey",
-            "gatewayCallerKey",
-            "harnessPassword",
-            "log.harness-main",
-            "log.sandbox-gateway",
-            "valkeyQuotasPassword",
-            "verifiers.harness",
-          ]);
+          // And what this release adds to the stack's: main's harness pools' principal on the log.
+          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), ["log.harness-main"]);
         },
       },
       {
-        seeds: "the telemetry topics as the release before made them, uncompressed, and what they hold",
+        seeds: "the telemetry topics, compressed with zstd, and what they hold",
         seed: async () => {
           const { topics } = await logConfigs();
-          assert.deepEqual(Object.values(topics).map((configs) => configs["compression.type"]), ["producer", "producer", "producer"]);
+          assert.deepEqual(Object.values(topics).map((configs) => configs["compression.type"]), ["zstd", "zstd", "zstd"]);
           for (const deadline = Date.now() + 180_000; (spansBefore = (await logSizes("otel.spans")).records) === 0; await sleep(5000)) {
             if (Date.now() > deadline) assert.fail("otel.spans held nothing within 3 minutes");
           }
         },
-        keeps: "the telemetry topics, each kept compressed with zstd from then on, in place, with what they held",
+        keeps: "the telemetry topics, each compressed with zstd still, with what they held",
         check: async () => {
           const { topics } = await logConfigs();
           assert.deepEqual(Object.values(topics).map((configs) => configs["compression.type"]), ["zstd", "zstd", "zstd"]);
@@ -524,20 +463,15 @@ if (inShard("upgrade")) {
         },
       },
       {
-        seeds: "the log on its claim, its StatefulSet's claims labelled with its version",
+        seeds: "the log on its claim",
         seed: async () => {
           logBefore = await logHeld();
           assert.ok(logBefore.every(Boolean), JSON.stringify(logBefore));
-          const statefulSet = await kube.get<V1StatefulSet>(ref("StatefulSet", componentName("log"), NAMESPACE));
-          assert.equal(statefulSet?.spec?.volumeClaimTemplates?.[0]?.metadata?.labels?.["app.kubernetes.io/version"], PREVIOUS);
         },
-        keeps: "the log on its claim, its StatefulSet made anew, which no release's version labels the claims of",
+        keeps: "the log on its claim, its StatefulSet the one it was",
         check: async () => {
           const [statefulSet, , claim] = await logHeld();
-          assert.notEqual(statefulSet, logBefore[0]);
-          assert.equal(claim, logBefore[2]);
-          const made = await kube.get<V1StatefulSet>(ref("StatefulSet", componentName("log"), NAMESPACE));
-          assert.equal(made?.spec?.volumeClaimTemplates?.[0]?.metadata?.labels?.["app.kubernetes.io/version"], undefined);
+          assert.deepEqual([statefulSet, claim], [logBefore[0], logBefore[2]]);
         },
       },
       {
@@ -588,80 +522,34 @@ if (inShard("upgrade")) {
         },
       },
       {
-        seeds: "the node's images, unpacked by overlayfs, the pods' sandbox image recorded without its layer's content, as the box's was",
+        seeds: "the pods' sandbox image recorded without its layer's content, as the box's was",
         seed: async () => {
-          assert.notEqual(await overlayfsSnapshots(), "");
-          // The box's sandbox image was deleted by a prune of the node's images, which takes it, as no
-          // container is of it and the CRI holds it unpinned, by another name than k3s pins; then
-          // pulled again by the next pod, onto overlayfs's snapshot of its layer, which the pods run
-          // on still, so containerd fetched no blob of that layer.
-          const sandbox = (await onNode("", `sed -n 's/^ *sandbox = "\\(.*\\)"$/\\1/p' /var/lib/rancher/k3s/agent/etc/containerd/config.toml`)).trim();
-          const { status } = JSON.parse(await onNode("", `k3s crictl inspecti -o json '${sandbox}'`)) as { status: { repoTags: string[]; pinned: boolean } };
-          const [name = ""] = status.repoTags;
-          assert.equal(status.pinned, false, `the CRI holds ${name} pinned, which no prune takes`);
-          const records = async () => (await onNode("", "k3s ctr -n k8s.io images check | tail -n +2")).split("\n").map((line) => line.split(/\s+/u));
-          const digest = (await records()).find(([recorded]) => recorded === name)?.[2] ?? "";
-          await onNode("", `k3s crictl rmi '${sandbox}'`);
-          await until(`${name}'s content let go of`, async () => (await onNode("", "k3s ctr -n k8s.io content ls -q")).split("\n").includes(digest) ? undefined : true, 120_000);
-          await onNode("", `k3s crictl pull '${sandbox}'`);
-          assert.equal((await records()).find(([recorded]) => recorded === name)?.[3], "incomplete", `${name} is recorded with all its content`);
+          // The box's was deleted by a prune of the node's images, which takes it, as no container is
+          // of it and the CRI holds it unpinned, by another name than k3s pins; then pulled again by
+          // the next pod, onto the snapshot of its layer the pods run on still, so containerd fetched
+          // no blob of that layer.
+          const pinned = (await onNode("", `sed -n 's/^ *sandbox = "\\(.*\\)"$/\\1/p' /var/lib/rancher/k3s/agent/etc/containerd/config.toml`)).trim();
+          const { status } = JSON.parse(await onNode("", `k3s crictl inspecti -o json '${pinned}'`)) as { status: { repoTags: string[]; pinned?: boolean } };
+          sandboxImage = status.repoTags[0] ?? "";
+          assert.equal(status.pinned ?? false, false, `the CRI holds ${sandboxImage} pinned, which no prune takes`);
+          const { digest } = await sandboxImageChecked(sandboxImage);
+          await onNode("", `k3s crictl rmi '${pinned}'`);
+          await until(`${sandboxImage}'s content let go of`, async () => (await onNode("", "k3s ctr -n k8s.io content ls -q")).split("\n").includes(digest) ? undefined : true, 120_000);
+          await onNode("", `k3s crictl pull '${pinned}'`);
+          assert.equal((await sandboxImageChecked(sandboxImage)).whole, false, `${sandboxImage} is recorded with all its content`);
         },
-        keeps: "none of them, every image pulled anew through stargz-snapshotter's daemon, alasio's own lazily",
+        keeps: "the sandbox image whole, what containerd lacked of it fetched before anything changed, and pinned, so no prune takes it again",
         check: async () => {
-          assert.equal(await overlayfsSnapshots(), "");
-          assert.match(await alasioOk("status"), /^ {2}service stargz-snapshotter, which k3s pulls images through: active$/mu);
-          if (ESTARGZ) assert.ok(await onRemoteSnapshot(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)), "alasio's pod runs on no remote snapshot");
-        },
-      },
-      {
-        seeds: "a Telegram message kept twice, as two of main's alasios could keep it as they handed over",
-        seed: async () => {
-          // The operator's first, which nothing of the run reads again.
-          [keptOnce, sentAs] = (await onDatabase(NAMESPACE, "select id, transport_message_id from state.messages where transport_message_id is not null and kind = 'text' order by created_at limit 1")).split("|") as [string, string];
-          await onDatabase(NAMESPACE, `insert into state.messages (id, conversation_id, direction, kind, transport_message_id, text, media_group_id, raw, session_id, turn_id, created_at)
-            select id || '-again', conversation_id, direction, kind, transport_message_id, text, media_group_id, raw, session_id, turn_id, created_at + interval '1 second'
-            from state.messages where id = '${keptOnce}'`);
-        },
-        keeps: "the message once, as it was kept first, its copy told of before the cut-over changed anything and removed past its point of no return",
-        check: async () => {
-          assert.equal(await onDatabase(NAMESPACE, `select string_agg(id, ',' order by id) from state.messages where id in ('${keptOnce}', '${keptOnce}-again')`), keptOnce);
-          assert.match((await inCutOverRecord("cat telegram-duplicates.tsv")).trim(), new RegExp(`^message\\t[^\\t]+\\t[^\\t]+\\t${sentAs}\\t[^\\t]*\\t2\\t1$`, "u"));
-          assert.equal((await inCutOverRecord("cat telegram-copies-removed")).trim(), "1");
-        },
-      },
-      {
-        seeds: "the forks' holds, as 8.0.0's table keeps them, without a holder or an expiry",
-        seed: async () => {
-          assert.equal(await onDatabase(NAMESPACE, HOLD_COLUMNS), "conversation_id|NO|\nreason|NO|\nheld_at|NO|now()");
-        },
-        keeps: "the forks' holds as this release makes them, each with its holder and expiry, which no default gives",
-        check: async () => {
-          assert.equal(await onDatabase(NAMESPACE, HOLD_COLUMNS), "conversation_id|NO|\nreason|NO|\nheld_at|NO|now()\nholder|NO|\nexpires_at|NO|");
+          assert.equal((await sandboxImageChecked(sandboxImage)).whole, true, `${sandboxImage} is recorded without all its content`);
+          // Pinned as the CRI read this release's pin again, its k3s restarted on it.
+          const { status } = JSON.parse(await onNode("", `crictl inspecti -o json '${SANDBOX_IMAGE}'`)) as { status: { pinned?: boolean } };
+          assert.equal(status.pinned, true, `the CRI holds ${SANDBOX_IMAGE} unpinned`);
+          assert.match(await inCutOverRecord("cat events.log"), new RegExp(`fetching what containerd lacks of the sandbox image ${sandboxImage.replaceAll(".", "\\.")}, `, "u"));
         },
       },
     ];
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
-
-    // A session workspace another release made is one this release runs no session on and
-    // moves nothing of, so the cut-over refuses while one is left, before it changes anything.
-    test(`on ${PREVIOUS}: main's session workspace, which the cut-over refuses to go past, before it changes anything, naming it, until it is deleted`, { timeout: 30 * 60_000 }, async () => {
-      const generation = await alasioGeneration();
-      const claims = (await kube.list<KubernetesObject>("PersistentVolumeClaim", { namespace: SESSIONS })).map(({ metadata }) => metadata?.name ?? "");
-      assert.ok(claims.length > 0, "main's session workspace has its claim");
-      const refused = await cutOver();
-      assert.notEqual(refused.code, 0, refused.stdout);
-      assert.match(refused.stderr, new RegExp(`FAILED: ${SESSIONS} holds session workspaces of ${(PREVIOUS ?? "").replaceAll(".", "\\.")}'s[^\\n]*kubectl -n ${SESSIONS} delete sandbox\\.agents\\.x-k8s\\.io/${volumeId}`, "u"));
-      for (const claim of claims) assert.ok(refused.stderr.includes(`kubectl -n ${SESSIONS} delete persistentvolumeclaim/${claim}`), refused.stderr);
-      assert.doesNotMatch(refused.stderr, /checking that the upgrade can run|upgrading, from the cut-over/u);
-      assert.ok(!(await recorded()).includes("point-of-no-return"));
-      assert.equal(await alasioGeneration(), generation);
-      // Deleted as the refusal says, its files with it.
-      await kube.remove(ref("Sandbox", volumeId, SESSIONS));
-      for (const claim of claims) await kube.remove(ref("PersistentVolumeClaim", claim, SESSIONS));
-      await until("main's session workspace gone", async () =>
-        (await kube.list("PersistentVolumeClaim", { namespace: SESSIONS })).length === 0 && (await kube.list("Sandbox", { namespace: SESSIONS })).length === 0 ? true : undefined, 300_000);
-    });
 
     // A branch environment another release made does not run on what an upgrade changes,
     // so the cut-over refuses while one exists, as its first checks find it.
@@ -686,25 +574,12 @@ if (inShard("upgrade")) {
       const generation = await alasioGeneration();
       const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
       assert.notEqual(failed.code, 0, failed.stdout);
-      assert.match(failed.stderr, /deleting the log's StatefulSet, its pod and claim kept[^]*checking that the upgrade can run [^\n]*\n[^]*FAILED: a failure injected before the point of no return\n[^\n]* making the log's StatefulSet again, as [^\n]* had it\n[^\n]* putting install\.agentSandbox back in [^\n]*, as [^\n]* had it\n$/u);
+      assert.match(failed.stderr, /checking that the upgrade can run [^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
       assert.ok(!(await recorded()).includes("point-of-no-return"));
-      // The configuration as the release before reads it, its agent-sandbox's sizing put back.
-      assert.ok("agentSandbox" in (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: object }).install);
-      // Made again as the release before had it, its pod and claim taken back as they were.
-      const [statefulSet, pod, claim] = await logHeld();
-      assert.ok(statefulSet && statefulSet !== logBefore[0], "the log's StatefulSet is not made again");
-      assert.deepEqual([pod, claim], [logBefore[1], logBefore[2]]);
-      await kube.awaitReady([ref("StatefulSet", componentName("log"), NAMESPACE)], "10 minutes");
       assert.equal(await alasioGeneration(), generation);
       assert.ok(await runs(RELEASE), "alasio runs as it did");
       await tg.say("between the cut-overs");
-      await tg.waitFor((call) => answered(call)).catch(async (error: unknown) => {
-        // What the log said, as nothing answered: its pod's restarts, and its node's last lines.
-        const restarts = (await kube.get<V1Pod>(ref("Pod", `${componentName("log")}-0`, NAMESPACE)))?.status?.containerStatuses?.map(({ name, restartCount }) => `${name} ${restartCount}`);
-        const said = (await kube.logs(NAMESPACE, `${componentName("log")}-0`, "log").catch(String)).split("\n");
-        console.error(`# the log's pod's restarts: ${JSON.stringify(restarts)}\n# its first lines:\n${said.slice(0, 60).join("\n")}\n# its last:\n${said.slice(-40).join("\n")}`);
-        throw error;
-      });
+      await tg.waitFor((call) => answered(call));
     });
 
     test(`the cut-over from ${PREVIOUS}, failing past its point of no return, before the upgrade, goes on with it when run again, its checks not run again`, { timeout: 60 * 60_000 }, async () => {
@@ -727,8 +602,7 @@ if (inShard("upgrade")) {
       const again = await cutOver();
       assert.equal(again.code, 0, `${again.stdout}${again.stderr}`);
       assert.doesNotMatch(again.stderr, /checking that|upgrading, from the cut-over begun at /u);
-      assert.doesNotMatch(again.stderr, /stopping k3s, to remove the node's images/u);
-      assert.match(again.stderr, /upgraded at \S+\n[^\n]* removing what of [^\n]* this release has no use for[^\n]*\n[^\n]* through\n$/u);
+      assert.match(again.stderr, /^[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
       assert.equal(await alasioGeneration(), generation);
       upgraded = Date.now();
     });
@@ -738,11 +612,11 @@ if (inShard("upgrade")) {
     // On this release's bayma, the folder conversation's REPL sessions, its instance let go, as
     // an idle one is, come back whole: the box's path once its folders run what this release pins.
     test("upgraded, on this release's bayma: the folder conversation's REPL sessions, its instance let go, come back whole, its thread counting on", { timeout: 30 * 60_000 }, async () => {
-      const value = `kept on this release by ${folderBayma.name}`;
-      const set = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", GATEWAY_MCP, await mainKeyToken(folderBayma.key), value);
-      const conversation = folderBayma.key.slice(folderBayma.key.indexOf(":", "folder:".length) + 1);
+      const value = `kept on this release by ${folderInstance.name}`;
+      const set = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", GATEWAY_MCP, await mainKeyToken(folderInstance.key), value);
+      const conversation = folderInstance.key.slice(folderInstance.key.indexOf(":", "folder:".length) + 1);
       assert.match(await alasioOk("folder", "restart", conversation), /its folder instance of [^\n]+ is let go, its REPL sessions saved, its failed binds forgotten; the next message makes it anew/u);
-      const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), set.python, set.bun);
+      const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderInstance.key), set.python, set.bun);
       assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [value, value, true, value, value], JSON.stringify(seen));
       assert.ok((seen.python.count ?? 0) > set.count, `the count went on from ${set.count}: ${JSON.stringify(seen)}`);
       for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
@@ -753,18 +627,18 @@ if (inShard("upgrade")) {
     test("upgraded: the folders' bayma changed and the folder's instance restarted, its REPLs come back from their checkpoints, what those keep intact", { timeout: 30 * 60_000 }, async () => {
       const { configFile } = paths();
       const config = JSON.parse(readFileSync(configFile, "utf8"));
-      config.install.host = { ...config.install.host, baymaImage: PREVIOUS_BAYMA };
+      config.install.host = { ...config.install.host, baymaImage: OTHER_BAYMA };
       writeFileSync(configFile, JSON.stringify(config));
       await alasioOk("up", "--timeout", "20m");
-      const conversation = folderBayma.key.slice(folderBayma.key.indexOf(":", "folder:".length) + 1);
+      const conversation = folderInstance.key.slice(folderInstance.key.indexOf(":", "folder:".length) + 1);
       assert.match(await alasioOk("folder", "restart", conversation), /its folder instance of [^\n]+ is let go, its REPL sessions saved, its failed binds forgotten; the next message makes it anew/u);
-      const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), folderRepls.python, folderRepls.bun);
-      const kept = `kept by ${folderBayma.name}`;
+      const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderInstance.key), folderRepls.python, folderRepls.bun);
+      const kept = `kept by ${folderInstance.name}`;
       assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [null, kept, false, null, kept], JSON.stringify(seen));
       for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", CAME_BACK_FROM_CHECKPOINT);
       const instance = (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" }))
-        .find((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"] === folderBayma.key);
-      assert.match(instance?.spec?.containers.find(({ name }) => name === "bayma")?.image ?? "", new RegExp(`@${PREVIOUS_BAYMA.digest}$`, "u"));
+        .find((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"] === folderInstance.key);
+      assert.match(instance?.spec?.containers.find(({ name }) => name === "bayma")?.image ?? "", new RegExp(`@${OTHER_BAYMA.digest}$`, "u"));
     });
   });
 }
@@ -3321,35 +3195,6 @@ const FOLDER_CHAT = OTHER_OPERATOR;
  * written in it, and a turn on Codex there, in the operator's chat; and, where folder
  * workspaces are on, a folder mounted in another chat, on Codex. The session's volume id.
  */
-/**
- * Main at work on the release before, as the upgrade shard seeds it: in a session workspace,
- * made from the panel and run a turn in on Codex, as that release runs them, then in a folder
- * of its own, which it goes on in; and the other chat in a folder of its own. Main's session
- * workspace, which the cut-over refuses while it is left.
- */
-async function workInMainOnPrevious(): Promise<string> {
-  await tg.calls();
-  await tg.say("/workspace");
-  await tg.choose(/New empty workspace/u);
-  await tg.choose(/No internet/u);
-  const created = await tg.waitFor((call) => /Created and mounted session workspace/u.test(call.payload.text ?? ""));
-  const volumeId = /fs-[0-9a-f]+/u.exec(created.payload.text ?? "")?.[0];
-  assert.ok(volumeId, `alasio named no workspace: ${created.payload.text}`);
-  await tg.say("/service codex");
-  await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
-  await tg.say("hello");
-  await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
-  await tg.say("/workspace new e2e-main");
-  await tg.waitFor((call) => /e2e-main/u.test(call.payload.text ?? ""));
-  await tg.say("hello");
-  await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
-  await tg.say("/workspace new e2e-folder", FOLDER_CHAT);
-  await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /e2e-folder/u.test(call.payload.text ?? ""));
-  await tg.say("/service codex", FOLDER_CHAT);
-  await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /^Active: Codex$/mu.test(call.payload.text ?? ""));
-  return volumeId;
-}
-
 async function workInMain(): Promise<string> {
   const volumeId = await newSession("none");
   await inSession(volumeId, 'require("fs").writeFileSync("/workspace/proof", "written by main")');
