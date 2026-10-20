@@ -87,6 +87,19 @@ export interface LoginRelay {
 const ALLOWED_PATHS = [/^\/v1\/responses(?:[/?]|$)/, /^\/v1\/models(?:[/?]|$)/];
 
 /**
+ * Whether the request of `url` is one a Codex model provider makes, as it is written and so as
+ * it is sent on: of ALLOWED_PATHS, its path with no segment `.` or `..`, and no dot, slash or
+ * backslash encoded, nor a backslash, which a server further on may read as one, so that
+ * `/v1/responses/../../backend-api/…` goes nowhere but where it says.
+ */
+function allowedPath(url: string): boolean {
+  const query = url.indexOf("?");
+  const path = query < 0 ? url : url.slice(0, query);
+  if (/%2e|%2f|%5c|\\/iu.test(path) || path.split("/").some((segment) => segment === "." || segment === "..")) return false;
+  return ALLOWED_PATHS.some((re) => re.test(url));
+}
+
+/**
  * The upstream request for the login in `authFile`, read now: `{ origin, path, headers }`
  * for a request to `path`, or null when there is no usable login.
  */
@@ -159,7 +172,7 @@ export const startLoginRelay: StartLoginRelay = Effect.fnUntraced(function*({
     }
     // A request an http.Server receives always has a url.
     const url = req.url!;
-    if (!ALLOWED_PATHS.some((re) => re.test(url))) { res.writeHead(403).end("path not allowed"); return; }
+    if (!allowedPath(url)) { res.writeHead(403).end("path not allowed"); return; }
     const upstream = upstreamFor(authFile, url);
     if (!upstream) { res.writeHead(503).end(`no Codex login in ${authFile}`); return; }
     const origin = new URL(upstream.origin);

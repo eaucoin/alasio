@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type Server } from "node:http";
+import { createServer, request, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,30 @@ import { makeGivenCodexLogin } from "../src/harness/given-codex-login.ts";
 import type { TurnStart } from "../src/harness/host.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "alasio-login-relay-"));
+
+/** Paths of the model API's that leave it, as written, dotted or encoded, which fetch would have made plain before sending. */
+const LEAVING = [
+  "/v1/responses/../../backend-api/accounts",
+  "/v1/responses/./../../backend-api/accounts",
+  "/v1/models/..",
+  "/v1/responses/%2e%2e/%2E%2E/backend-api/accounts",
+  "/v1/responses/..%2f..%2Fbackend-api/accounts",
+  "/v1/responses%2F..%2F..%2Fbackend-api",
+  "/v1/responses/..%5c..%5Cbackend-api",
+  "/v1/responses/..\\..\\backend-api",
+];
+
+/** The status the server at `origin` answers a POST of `path` with, its path sent as written, bearing `bearer`. */
+const statusOf = (origin: string, path: string, bearer: string): Promise<number> =>
+  new Promise((resolve, reject) => {
+    const { hostname, port } = new URL(origin);
+    const asked = request({ hostname, port, path, method: "POST", headers: { authorization: `Bearer ${bearer}` } }, (response) => {
+      response.resume();
+      resolve(response.statusCode ?? 0);
+    });
+    asked.on("error", reject);
+    asked.end("{}");
+  });
 const authFile = join(dir, "auth.json");
 const writeAuth = (auth: unknown) => writeFileSync(authFile, JSON.stringify(auth));
 
@@ -97,6 +121,8 @@ test("the relay takes only its own bearer and the model API's paths, and reads t
     assert.equal((await call("/v1/responses")).status, 401);
     assert.equal((await call("/v1/files", "relay-bearer")).status, 403);
     assert.equal((await call("/backend-api/codex/responses", "relay-bearer")).status, 403);
+    // A path of the model API's that leaves it, dotted or encoded, as it would be sent on.
+    for (const path of LEAVING) assert.equal(await statusOf(relay.url, path, "relay-bearer"), 403, path);
     assert.equal(seen.length, before); // none of those reached the upstream
     writeAuth({});
     assert.equal((await call("/v1/responses", "relay-bearer")).status, 503);
@@ -146,6 +172,13 @@ test("alasio's relay to its harness pools takes a token of a conversation's turn
     await Effect.runPromise(pod.give(turn({ "config.toml": 'model = "gpt-5"\n', "skills/review/SKILL.md": "Review it.\n", "auth.json": "{}", "../outside": "x" })));
     assert.equal((await viaPod()).status, 200);
     assert.deepEqual(seen.at(-1), { path: "/backend-api/codex/responses", auth: "Bearer alasio-token", accountId: "acct-1", body: '{"input":"hi"}' });
+    // Neither relay sends on a path that leaves the model API's: the pod's refuses it, and alasio's, asked with the turn's token, too.
+    const reached = seen.length;
+    for (const path of LEAVING) {
+      assert.equal(await statusOf(pod.relay.url, path, pod.relay.bearer), 403, path);
+      assert.equal(await statusOf(alasios.url, path, token({ key: "harness:telegram:41", expires: Date.now() + 60_000 })), 403, path);
+    }
+    assert.equal(seen.length, reached);
     assert.deepEqual([readFileSync(join(home, "config.toml"), "utf8"), readFileSync(join(home, "skills/review/SKILL.md"), "utf8")], ['model = "gpt-5"\n', "Review it.\n"]);
     assert.deepEqual([existsSync(join(home, "auth.json")), existsSync(join(home, "..", "outside"))], [false, false]);
     // The next turn's configuration in place of the last, what the operator removed removed; and its token, the last's stopped.
