@@ -1401,6 +1401,23 @@ function profileNodeAgents(): { readonly stop: () => void; readonly said: () => 
   };
 }
 
+/**
+ * The object store's gateways' memory: each one's s3 container's peak since it started, its
+ * limit, how often its cgroup OOM-killed, and how often it restarted.
+ */
+async function gatewaysMemory(): Promise<{ readonly text: string; readonly peakOverLimit: boolean; readonly oomKills: number; readonly restarts: number }> {
+  const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("seaweedfs")) });
+  const seen = await Promise.all(pods.map(async (pod) => {
+    const name = pod.metadata?.name ?? "";
+    const restarts = pod.status?.containerStatuses?.find((status) => status.name === "s3")?.restartCount ?? 0;
+    const read = await kube.execOk(NAMESPACE, name, ["sh", "-c", "cat /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.max; sed -n 's/^oom_kill //p' /sys/fs/cgroup/memory.events"], { container: "s3" }).catch((error: unknown) => `unread: ${error instanceof Error ? error.message : String(error)}`);
+    const [peak = "", max = "", kills = "0"] = read.trim().split("\n");
+    const mib = (bytes: string) => (/^\d+$/u.test(bytes) ? `${Math.round(Number(bytes) / 1024 ** 2)} MiB` : bytes);
+    return { text: `${name}: peak ${mib(peak)} of ${mib(max)}, ${kills} OOM kills, ${restarts} restarts`, over: /^\d+$/u.test(peak) && /^\d+$/u.test(max) && Number(peak) >= Number(max), kills: Number(kills) || 0, restarts };
+  }));
+  return { text: seen.map(({ text }) => text).join("; "), peakOverLimit: seen.some(({ over }) => over), oomKills: seen.reduce((sum, { kills }) => sum + kills, 0), restarts: seen.reduce((sum, { restarts }) => sum + restarts, 0) };
+}
+
 /** The session's current snapshot, as a node agent's API gives it to alasio, from the bucket; null when it has none. */
 async function snapshotOf(volumeId: string): Promise<Manifest | null> {
   const [pod] = (await nodeAgents()).values();
@@ -1696,6 +1713,8 @@ if (inShard("snapshots")) {
         }
         return "not logged";
       };
+      // The object store's gateways, which its images go through, both ways, as on the box.
+      const gatewaysBefore = await gatewaysMemory();
       for (const from of ["cache", "bucket"] as const) {
         const released = await untilReleased(big, Date.now(), { savingMs: 480_000 });
         const snapshot = await snapshotOf(big);
@@ -1731,6 +1750,10 @@ if (inShard("snapshots")) {
         const line = await prepared(snapshot.snapshot);
         assert.ok(line.includes(` from the ${from}: `), line);
         t.diagnostic(`restored from the ${from}: the turn's answer came ${answered} ms after its prompt; ${line}`);
+        // Its gateways held what it put and got within their memory, never killed for it.
+        const gateways = await gatewaysMemory();
+        t.diagnostic(`the object store's gateways' memory as it was saved and restored from the ${from}: ${gateways.text}`);
+        assert.deepEqual([gateways.oomKills, gateways.restarts - gatewaysBefore.restarts, gateways.peakOverLimit], [gatewaysBefore.oomKills, 0, false], gateways.text);
       }
     });
 
