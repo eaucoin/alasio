@@ -44,6 +44,23 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+  # The object store's S3 gateway under the load the box puts it under, in Docker, as
+  # SeaweedFS leaves it and as alasio runs it (test/gateway-memory.test.ts): several GiB,
+  # on a runner of its own.
+  gateway-memory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      - run: node --test test/gateway-memory.test.ts
+        env:
+          ALASIO_GATEWAY_LOAD: "1"
+
   package:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
