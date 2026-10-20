@@ -70,11 +70,12 @@ export interface Operation {
   readonly body: Uint8Array;
 }
 
-/** How the front answers an Operation: its status, and its body, as JSON or as bytes. */
+/** How the front answers an Operation: its status, its body, as JSON or as bytes, and any headers beside. */
 export interface Answer {
   readonly status: number;
   readonly json?: unknown;
   readonly bytes?: Uint8Array;
+  readonly headers?: Readonly<Record<string, string>>;
 }
 
 /** The header of a request that binds nothing: passed on where its key is bound, and otherwise answered as unbound. */
@@ -293,8 +294,8 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         const body = yield* Effect.promise(() => bodyOf(incoming, MAX_OPERATION_BYTES));
         if (body === null) return answer(outgoing, 413, { error: `a request answered here is ${MAX_OPERATION_BYTES} bytes at most` });
         const answered = yield* operate(claims, { method: incoming.method ?? "GET", path, query: new URLSearchParams(search), body });
-        if (answered.bytes !== undefined) return void outgoing.writeHead(answered.status, { "content-type": "application/octet-stream" }).end(answered.bytes);
-        return answer(outgoing, answered.status, answered.json);
+        if (answered.bytes !== undefined) return void outgoing.writeHead(answered.status, { ...answered.headers, "content-type": "application/octet-stream" }).end(answered.bytes);
+        return answer(outgoing, answered.status, answered.json, answered.headers);
       }
       if (incoming.method === "POST" && url === "/release") {
         incoming.resume();

@@ -446,13 +446,20 @@ export const makeSessions = Effect.fnUntraced(function*(
 
   /** A refusal of `status`, saying `error`. */
   const refused = (status: number, error: string): Answer => ({ status, json: { error } });
-  /** What an agent's call answers; its refusal its own, what failed otherwise 502. */
+  /**
+   * What an agent's call answers: its refusal its own, as its 503 that says when to ask again
+   * is, with its Retry-After, as what it refuses so is of a moment (../node-agent/server.ts);
+   * what failed otherwise 502.
+   */
   const answered = <A>(call: Effect.Effect<A, NodeAgentError | KubeApiError>, answer: (value: A) => Answer): Effect.Effect<Answer> =>
     call.pipe(
       Effect.map(answer),
-      Effect.catch((error) =>
-        Effect.succeed(error._tag === "NodeAgentError" && error.status !== undefined && error.status >= 400 && error.status < 500 ? refused(error.status, error.message) : refused(502, error.message))
-      ),
+      Effect.catch((error) => {
+        if (error._tag !== "NodeAgentError" || error.status === undefined) return Effect.succeed(refused(502, error.message));
+        if (error.status >= 400 && error.status < 500) return Effect.succeed(refused(error.status, error.message));
+        if (error.status === 503 && error.retryAfter !== undefined) return Effect.succeed({ ...refused(503, error.message), headers: { "retry-after": error.retryAfter } });
+        return Effect.succeed(refused(502, error.message));
+      }),
     );
   const done: Answer = { status: 204 };
 

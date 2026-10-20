@@ -444,6 +444,17 @@ test("a caller makes, writes, reads, measures, lists and deletes its own environ
   assert.equal((await ask("GET", "/workspace/files?path=workspace/note.txt&max=many")).status, 400);
   assert.deepEqual(await ask("GET", "/workspace/quota"), { status: 200, json: { capacityBytes: 2 * 1024 ** 3, usedBytes: 5 } });
   assert.deepEqual(await ask("GET", "/workspace/all"), { status: 200, json: { workspaces: ["fs-own123"] } });
+  // An agent's refusal of a moment passed on, saying when to ask again; any other failure of it 502.
+  const notYet = new NodeAgentError({ node: "node-a", call: "write", status: 503, retryAfter: "2", reason: "workspace storage is not mounted on this node now" });
+  const failures: Readonly<Record<string, NodeAgentError>> = {
+    "workspace/not-yet": notYet,
+    "workspace/unsaid": new NodeAgentError({ node: "node-a", call: "write", status: 503, reason: "it said no Retry-After" }),
+    "workspace/failed": new NodeAgentError({ node: "node-a", call: "write", status: 500, reason: "it failed" }),
+  };
+  const refusing = await sessionsOf({ ...options(env, 7290), environments: found([env]) }, { ...recorded.agents, writeFile: (_ref, path) => Effect.fail(failures[path] ?? notYet) });
+  const write = (path: string) => Effect.runPromise(refusing.sessions.operate(claims, { method: "PUT", path: "/workspace/files", query: new URLSearchParams({ path }), body: Buffer.from("later") }));
+  assert.deepEqual(await write("workspace/not-yet"), { status: 503, json: { error: notYet.message }, headers: { "retry-after": "2" } });
+  assert.deepEqual([(await write("workspace/unsaid")).status, (await write("workspace/failed")).status], [502, 502]);
   // Made in its own environment's namespace, of the gateway's quota; another's lists none of it.
   assert.deepEqual(recorded.calls, [`create ${env.namespace}/fs-own123 ${2 * 1024 ** 3}`]);
   assert.deepEqual(await ask("GET", "/workspace/all", "", { ...claims, options: { environment: "other", mode: "none" } }), { status: 200, json: { workspaces: [] } });

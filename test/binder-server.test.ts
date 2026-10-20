@@ -71,7 +71,7 @@ async function front(
     release = undefined as Placement["release"],
     told = {} as Pick<Placement, "held" | "settled" | "reset">,
     keyOf = callerKey as Buffer | ((claims: TokenClaims) => Buffer | null),
-    operate = undefined as ((claims: TokenClaims, operation: Operation) => Effect.Effect<{ status: number; json?: unknown; bytes?: Uint8Array }>) | undefined,
+    operate = undefined as ((claims: TokenClaims, operation: Operation) => Effect.Effect<{ status: number; json?: unknown; bytes?: Uint8Array; headers?: Record<string, string> }>) | undefined,
     watched = false,
     elsewhere = {} as Readonly<Record<string, Pool>>,
   } = {},
@@ -552,7 +552,8 @@ test("a request under /workspace or /snapshots is answered by the front itself, 
     operate: (claims, { method, path, query, body }) =>
       Effect.sync(() => {
         asked.push({ claims, method, path, query: query.toString(), body: Buffer.from(body).toString() });
-        return path === "/workspace/files" ? { status: 200, bytes: Buffer.from("bytes of a file") } : { status: 201, json: { made: true } };
+        if (path === "/workspace/files") return method === "PUT" ? { status: 503, json: { error: "not yet" }, headers: { "retry-after": "2" } } : { status: 200, bytes: Buffer.from("bytes of a file") };
+        return { status: 201, json: { made: true } };
       }),
   });
   try {
@@ -563,17 +564,21 @@ test("a request under /workspace or /snapshots is answered by the front itself, 
     assert.deepEqual([read.status, read.headers.get("content-type"), await read.text()], [200, "application/octet-stream", "bytes of a file"]);
     const releases = await fetch(`http://127.0.0.1:${served.port}/snapshots/releases`, { headers: { authorization: caller(key) } });
     assert.deepEqual([releases.status, await releases.json()], [201, { made: true }]);
+    // Refused for a moment, saying when to ask again, as its operate says.
+    const later = await fetch(`http://127.0.0.1:${served.port}/workspace/files?path=workspace%2Fb`, { method: "PUT", headers: { authorization: caller(key) }, body: "b" });
+    assert.deepEqual([later.status, later.headers.get("retry-after"), await later.json()], [503, "2", { error: "not yet" }]);
     assert.deepEqual(asked.map(({ claims, ...rest }) => ({ ...rest, key: claims.key, options: claims.options })), [
       { method: "POST", path: "/workspace", query: "", body: "{\"a\":1}", key, options: { environment: "main" } },
       { method: "GET", path: "/workspace/files", query: "path=workspace%2Fa", body: "", key, options: undefined },
       { method: "GET", path: "/snapshots/releases", query: "", body: "", key, options: undefined },
+      { method: "PUT", path: "/workspace/files", query: "path=workspace%2Fb", body: "b", key, options: undefined },
     ]);
     const over = await fetch(`http://127.0.0.1:${served.port}/workspace/files`, { method: "PUT", headers: { authorization: caller(key) }, body: Buffer.alloc(MAX_OPERATION_BYTES + 1) });
     assert.equal(over.status, 413);
-    assert.equal(asked.length, 3);
+    assert.equal(asked.length, 4);
     // Without a caller's token, nothing is asked.
     assert.equal((await fetch(`http://127.0.0.1:${served.port}/workspace`, { method: "POST" })).status, 401);
-    assert.deepEqual([await run(readLease(of, key)), stand.sent.length, asked.length], [null, 0, 3]);
+    assert.deepEqual([await run(readLease(of, key)), stand.sent.length, asked.length], [null, 0, 4]);
   } finally {
     await served.close();
     stand.close();

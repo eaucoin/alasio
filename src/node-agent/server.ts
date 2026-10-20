@@ -3,7 +3,9 @@
  * the token both are given (`Authorization: Bearer <token>`): every request but `GET /healthz`
  * without it is answered 401. It speaks JSON; a refusal or a failure is
  * `{ "error": "<why>" }` with its status, 400 for a request that is not one, 404 for a
- * route there is not.
+ * route there is not. A 503 says, by its Retry-After, when to ask again (RETRY_AFTER_S):
+ * what it refuses so is of a moment, as while workspace storage's mount is handed over to its
+ * successor.
  *
  * - `POST /checkpoints`, `{ environment, workspace, namespace, pod, containerId, hook,
  *   podTemplate, live? }`: starts checkpointing the sandbox of the container
@@ -225,7 +227,11 @@ const RELEASED = /^\/workspaces\/([^/]+)\/([^/]+)\/released$/u;
 const WORKSPACE = /^\/workspaces\/([^/]+)\/([^/]+)$/u;
 const WORKSPACES = /^\/workspaces\/([^/]+)$/u;
 
-const answer = (status: number, body: unknown): HttpServerResponse.HttpServerResponse => HttpServerResponse.jsonUnsafe(body, { status });
+/** How long a 503 asks its caller to wait before it asks again, in seconds. */
+const RETRY_AFTER_S = 2;
+
+const answer = (status: number, body: unknown): HttpServerResponse.HttpServerResponse =>
+  HttpServerResponse.jsonUnsafe(body, { status, ...(status === 503 ? { headers: { "retry-after": String(RETRY_AFTER_S) } } : {}) });
 
 /** The key of a workspace's operations. */
 const keyOf = ({ environment, workspace }: WorkspaceRef): string => `${environment}/${workspace}`;

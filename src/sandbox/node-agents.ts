@@ -20,11 +20,12 @@ export interface NodeAgentsLocation {
   readonly port: number;
 }
 
-/** A node agent could not be asked, or refused: which node's, what, the status it answered with, and why. */
+/** A node agent could not be asked, or refused: which node's, what, the status it answered with, when it asked to be asked again (its Retry-After), and why. */
 export class NodeAgentError extends Schema.TaggedError<NodeAgentError>()("NodeAgentError", {
   node: Schema.String,
   call: Schema.String,
   status: Schema.optional(Schema.Number),
+  retryAfter: Schema.optional(Schema.String),
   reason: Schema.String,
 }) {
   override get message(): string {
@@ -212,10 +213,11 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
   /** A call of the agent of `node`, `what` it is asked as a sentence ends: its answer's status, bytes and text, or why it failed. */
   const send = (node: string, what: string, request: AgentCall): Effect.Effect<{ readonly status: number; readonly bytes: Uint8Array; readonly text: string }, NodeAgentError | KubeApiError> =>
     Effect.gen(function*() {
-      const failed = (reason: string, status?: number) => new NodeAgentError({ node, call: what, reason, ...(status === undefined ? {} : { status }) });
+      const failed = (reason: string, status?: number, retryAfter?: string | null) =>
+        new NodeAgentError({ node, call: what, reason, ...(status === undefined ? {} : { status }), ...(retryAfter === undefined || retryAfter === null ? {} : { retryAfter }) });
       const base = (yield* addresses).get(node);
       if (!base) return yield* failed("no agent is ready there");
-      const { status, ok, bytes } = yield* Effect.tryPromise({
+      const { status, ok, bytes, retryAfter } = yield* Effect.tryPromise({
         try: async (signal) => {
           const response = await fetch(`${base}${request.path}`, {
             method: request.method,
@@ -226,14 +228,14 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
             ...(request.body !== undefined ? { body: JSON.stringify(request.body) } : request.bytes !== undefined ? { body: request.bytes } : {}),
             signal: AbortSignal.any([signal, AbortSignal.timeout(Duration.toMillis(request.timeout))]),
           });
-          return { status: response.status, ok: response.ok, bytes: new Uint8Array(await response.arrayBuffer()) };
+          return { status: response.status, ok: response.ok, bytes: new Uint8Array(await response.arrayBuffer()), retryAfter: response.headers.get("retry-after") };
         },
         catch: (cause) => failed(cause instanceof Error ? cause.message : String(cause)),
       });
       const text = new TextDecoder().decode(bytes);
       if (ok || (status === 404 && request.absent)) return { status, bytes, text };
       const refusal = Schema.decodeUnknownOption(Schema.fromJsonString(Refusal))(text);
-      return yield* failed(refusal._tag === "Some" ? refusal.value.error : `it answered ${status}`, status);
+      return yield* failed(refusal._tag === "Some" ? refusal.value.error : `it answered ${status}`, status, retryAfter);
     });
 
   /** What the agent of `node` answers `request` with, as `schema` reads it. */

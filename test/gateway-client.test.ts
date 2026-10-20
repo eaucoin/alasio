@@ -106,6 +106,19 @@ test("a bind asked ahead is asked again while the gateway's pool has no pod for 
   assert.deepEqual([failed.status, failed.reason, elsewhere.asked.length], [403, "there is no environment try of sessions", 1]);
 });
 
+test("a file's write is asked again while the gateway answers it 503, as a node's mount is not there for it, then written; one refused otherwise fails at once", async (t) => {
+  let refusals = 2;
+  const { asked, workspaces } = await gateway(t, ({ method }) => {
+    if (method === "PUT" && refusals > 0) return ((refusals -= 1), { status: 503, body: JSON.stringify({ error: "workspace storage is not mounted on this node now" }), headers: { "retry-after": "2" } });
+    return { status: 204 };
+  });
+  await run(workspaces.writeFile("fs-abc123", "home/.alasio/received/1/note.txt", Buffer.from("hello")));
+  assert.deepEqual(asked.map(({ method, body }) => `${method} ${body}`), ["PUT hello", "PUT hello", "PUT hello"]);
+  const failing = await gateway(t, () => ({ status: 502, body: JSON.stringify({ error: "the node agent of node-a could not write it" }) }));
+  const failed = await refused(failing.workspaces.writeFile("fs-abc123", "home/.alasio/received/1/note.txt", Buffer.from("hello")));
+  assert.deepEqual([failed.status, failed.reason, failing.asked.length], [502, "the node agent of node-a could not write it", 1]);
+});
+
 test("a folder conversation's instance is reached, bound and released through the gateway by a caller's token of its folder key, of its environment alone; a bind that failed is not asked again, saying why, and whether it is held", async (t) => {
   let binds = 0;
   const { asked, workspaces } = await gateway(t, ({ url }) => {

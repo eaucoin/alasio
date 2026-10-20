@@ -14,7 +14,9 @@
  * - `release`: lets its binding go (POST /release), saved whole first where it is snapshotted.
  * - `create`, `remove`, `quota`, `list`, `readFile`, `writeFile`, `fork`: the workspace itself,
  *   as the gateway answers them, through its node agents (POST and DELETE /workspace,
- *   GET /workspace/quota, GET /workspace/all, GET and PUT /workspace/files, POST /workspace/forks).
+ *   GET /workspace/quota, GET /workspace/all, GET and PUT /workspace/files, POST /workspace/forks);
+ *   a file's write asked again every few seconds while the gateway answers it 503, as while a
+ *   node's mount of workspace storage is handed over, until FILE_WRITE_WAIT_MS.
  *
  * What the gateway refuses is a GatewayError with its status and what it said.
  */
@@ -37,6 +39,8 @@ export type NetMode = "none" | "full";
 export const TOKEN_TTL_MS = 6 * 60 * 60_000;
 /** How long a bind asked ahead is asked again for, while the gateway's pool has no pod for it. */
 const BIND_WAIT_MS = 5 * 60_000;
+/** How long a file's write is asked again for, while the gateway answers it 503: past a node's mount of workspace storage's handover to its successor, with room. */
+const FILE_WRITE_WAIT_MS = 60_000;
 /** How long a call of the gateway's may take, in ms, but a bind's and a release's, which wait for a pod and a save. */
 const CALL_TIMEOUT_MS = 60_000;
 /** How long a bind or a release may take, in ms: a restore's, or a save's, with room. */
@@ -72,7 +76,7 @@ const BindRefusal = Schema.Struct({ reason: Schema.optional(Schema.String), held
 /** What the gateway says a folder instance's bind under way waits on. */
 const StartingAnswer = Schema.Struct({ starting: Schema.NullOr(Schema.String) });
 
-/** A bind refused as its pool had no pod for it in time, to be asked again after what it said. */
+/** A bind refused as its pool had no pod for it in time, or a write as its workspace's mount was not there for it, to be asked again after what it said. */
 class NotYet extends Schema.TaggedError<NotYet>()("NotYet", { reason: Schema.String }) {}
 
 /** A workspace's quota, as the gateway reads it back. */
@@ -260,7 +264,18 @@ export function makeGatewayWorkspaces({ url, environment, callerKey }: GatewayWo
     },
     writeFile: (volumeId, path, bytes) => {
       const what = `write ${path} of ${volumeId}`;
-      return ask(what, volumeId, "none", "PUT", `/workspace/files?${new URLSearchParams({ path })}`, { body: bytes }).pipe(Effect.flatMap(expect(what, [204])), Effect.asVoid);
+      return ask(what, volumeId, "none", "PUT", `/workspace/files?${new URLSearchParams({ path })}`, { body: bytes }).pipe(
+        Effect.flatMap((answer): Effect.Effect<void, GatewayError | NotYet> => {
+          if (answer.status === 204) return Effect.void;
+          if (answer.status === 503) return Effect.fail(new NotYet({ reason: said(answer.bytes) }));
+          return Effect.fail(new GatewayError({ call: what, status: answer.status, reason: said(answer.bytes) }));
+        }),
+        Effect.retry({
+          while: (error) => error._tag === "NotYet",
+          schedule: Schedule.max([Schedule.spaced("2 seconds"), Schedule.during(FILE_WRITE_WAIT_MS)]),
+        }),
+        Effect.catchTag("NotYet", (error) => Effect.fail(new GatewayError({ call: what, status: 503, reason: error.reason }))),
+      );
     },
     fork: (volumeId, into) => {
       const what = `fork ${volumeId} into ${into.environment}'s ${into.workspace}`;

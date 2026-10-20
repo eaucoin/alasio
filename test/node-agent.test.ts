@@ -2601,6 +2601,12 @@ test("the agent's API attaches, detaches, reads and writes a workspace's files a
       assert.deepEqual([read.status, yield* Effect.promise(() => read.text())], [200, "hello"]);
       assert.equal((yield* call("GET", "/files/main/fs-abc123?path=home/.alasio/received/1/note.txt&max=2")).status, 413);
       assert.equal((yield* call("GET", "/files/main/fs-abc123?path=../../etc/passwd")).status, 400);
+      // Refused for a moment, as while its node's mount is handed over, saying when to ask again.
+      at.pod("pool-1");
+      at.storage.mounted = false;
+      const notYet = yield* call("POST", "/attach", json({ environment: "main", workspace: "fs-abc123", pod: "pool-1", token: "binding", env: {} }));
+      assert.deepEqual([notYet.status, notYet.headers.get("retry-after")], [503, "2"]);
+      at.storage.mounted = true;
       at.running.add("container-0");
       assert.equal((yield* call("POST", "/detach", json({ namespace: "main", pod: "pool-0", containerIds: ["container-0"] }))).status, 409);
       at.running.delete("container-0");
@@ -2632,6 +2638,11 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       assert.deepEqual(yield* agents.readFile(ref, "home/.alasio/received/1/blob", 100), bytes);
       const tooLarge = yield* Effect.flip(agents.readFile(ref, "home/.alasio/received/1/blob", 2));
       assert.equal(tooLarge._tag === "NodeAgentError" && tooLarge.status, 413);
+      // Refused for a moment, as while its node's mount is handed over: its status, and when the agent asked to be asked again.
+      at.storage.mounted = false;
+      const notYet = yield* Effect.flip(agents.createWorkspace({ environment: "main", workspace: "fs-later" }, 1024 ** 3));
+      assert.deepEqual(notYet._tag === "NodeAgentError" && [notYet.status, notYet.retryAfter], [503, "2"]);
+      at.storage.mounted = true;
       at.running.add("container-0");
       // Its bayma told to go on with its stop, through its node's agent; another pod's bayma not:
       // a pool's pod of the sessions' namespace, its directory kubelet made.
