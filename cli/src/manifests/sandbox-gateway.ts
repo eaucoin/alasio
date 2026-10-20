@@ -542,8 +542,8 @@ export const MOUNT_PATHS: MountPaths = {
  *
  * Its juicefs is JuiceFS's static release, of alasio's image, which runs as it is in the node's
  * namespace: copied to the node, under its digest, never over the one a mount runs. A mount left
- * at `root` whose juicefs is gone, as a pod killed with no successor leaves one, is unmounted
- * first, lazily, so the next mounts afresh.
+ * at `root` whose juicefs is gone, as a pod killed with no successor leaves one, which the kernel
+ * answers as not connected, is unmounted first, lazily, so the next mounts afresh.
  *
  * In the node's mount namespace its juicefs reads the node's resolv.conf, which resolves none of
  * the cluster's names, its network the pod's still: so the metadata engine's and the bucket's,
@@ -584,8 +584,10 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     `: > "$run/juicefs.log"`,
     `node_juicefs="${bin}/juicefs-$(sha256sum ${juicefs} | cut -c1-16)"`,
     `if [ ! -x "$node_juicefs" ]; then cp ${juicefs} "$node_juicefs.$$" && chmod 755 "$node_juicefs.$$" && mv "$node_juicefs.$$" "$node_juicefs"; fi`,
-    // A mount of a juicefs gone, which reads as nothing: unmounted, so this one mounts afresh.
-    `if awk -v root=${root} '$5 == root { found = 1 } END { exit !found }' ${mountinfo} && ! ${inNode} ls ${root} >/dev/null 2>&1; then`,
+    // A mount of a juicefs gone, which its kernel answers as no longer connected: unmounted, so this
+    // one mounts afresh. Not one that fails otherwise, as a juicefs that serves does while its
+    // metadata engine is unreachable, which this one takes over.
+    `if awk -v root=${root} '$5 == root { found = 1 } END { exit !found }' ${mountinfo} && ${inNode} ls ${root} 2>&1 >/dev/null | grep -qi 'not connected'; then`,
     `  ${inNode} umount -l ${root} && echo "unmounted the node's mount its juicefs left, which served nothing"`,
     "fi",
     `${inNode} mkdir -p ${root}`,

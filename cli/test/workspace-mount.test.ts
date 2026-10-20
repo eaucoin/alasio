@@ -3,7 +3,8 @@
  * run by sh with stand-ins for juicefs, for the node's mount table and for entering the node's
  * mount namespace: its juicefs copied to the node and run there; idle once its mount is handed
  * over, a failure once it ends any other way, ready only while its own mount serves the node's
- * mount point; and a mount left by a juicefs gone unmounted before it mounts. And the Services
+ * mount point; and a mount left by a juicefs gone unmounted before it mounts, one that serves
+ * though it fails its reads taken over. And the Services
  * it reaches by address, as up reads them, which roll it as they are made anew.
  */
 import assert from "node:assert/strict";
@@ -38,18 +39,21 @@ interface Mount {
 /**
  * The mount's script, its juicefs doing as `juicefs` says, its mount the node's mount table's
  * line while it serves; where `left`, the table holds a mount of a juicefs gone at the root
- * already, which reads as nothing until it is unmounted.
+ * already, which the kernel answers as not connected until it is unmounted; where
+ * `unreachable`, the mount it takes over fails its reads, as one whose metadata engine is down.
  */
-function mount(t: TestContext, juicefs: Juicefs, { left = false, env: given = {} as Record<string, string> } = {}): Mount & { readonly takeOver: () => void } {
+function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = false, env: given = {} as Record<string, string> } = {}): Mount & { readonly takeOver: () => void } {
   const directory = mkdtempSync(join(tmpdir(), "alasio-workspace-mount-"));
   const root = join(directory, "workspaces");
   const mountinfo = join(directory, "mountinfo");
   const ran = join(directory, "in-node");
   const dead = join(directory, "dead");
+  const failing = join(directory, "failing");
   const line = `36 1 0:50 / ${root} rw,relatime shared:9 - fuse.juicefs JuiceFS:workspaces rw`;
   // The mount of the pod a mount that takes over replaces, served still.
   writeFileSync(mountinfo, left || juicefs === "takes over" ? `${line}\n` : "");
   if (left) writeFileSync(dead, "");
+  if (unreachable) writeFileSync(failing, "");
   // Served, it reads as a directory.
   if (juicefs === "takes over") mkdirSync(root);
   const told = join(directory, "take-over");
@@ -62,12 +66,14 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, env: given = {}
   };
   const image = join(directory, "image-juicefs");
   writeFileSync(image, `#!/bin/sh\n${what[juicefs]}\n`);
-  // The node's namespace, the test's own: each command logged, a dead mount's ls failing, its umount taking it out of the table.
+  // The node's namespace, the test's own: each command logged, a dead mount's ls not connected and a failing one's ls an I/O error, as
+  // the kernel and juicefs answer, its umount taking it out of the table.
   const inNode = join(directory, "nsenter");
   writeFileSync(inNode, [
     "#!/bin/sh",
     `echo "$*" >> ${ran}`,
-    `if [ "$1" = ls ] && [ -e ${dead} ]; then exit 2; fi`,
+    `if [ "$1" = ls ] && [ -e ${dead} ]; then echo "ls: cannot access '$2': Transport endpoint is not connected" >&2; exit 2; fi`,
+    `if [ "$1" = ls ] && [ -e ${failing} ]; then echo "ls: reading directory '$2': Input/output error" >&2; exit 2; fi`,
     `if [ "$1" = umount ]; then rm -f ${dead}; : > ${mountinfo}; exit 0; fi`,
     'exec "$@"',
   ].join("\n"));
@@ -176,6 +182,15 @@ test("a mount left at the root by a juicefs gone, as a pod killed with no succes
   const whole = mount(t, "serves");
   await until(() => whole.ready());
   assert.ok(!whole.inNode().some((command) => command.startsWith("umount")));
+});
+
+test("a mount whose juicefs serves but fails its reads, as its metadata engine restarts, is taken over, not unmounted", async (t) => {
+  const taking = mount(t, "takes over", { unreachable: true });
+  await until(() => existsSync(join(taking.paths.run, "juicefs.pid")));
+  taking.takeOver();
+  await until(() => taking.ready());
+  assert.ok(!taking.inNode().some((command) => command.startsWith("umount")), taking.inNode().join("\n"));
+  assert.doesNotMatch(taking.out(), /unmounted the node's mount/u);
 });
 
 test("a mount is not ready while the node's table holds no mount of JuiceFS's at the root, as when its juicefs serves none", async (t) => {
