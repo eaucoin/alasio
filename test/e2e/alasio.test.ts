@@ -57,6 +57,7 @@ import {
   boundPodOf,
   CLUSTER,
   cutOver,
+  FOLDER_BAYMA_BEFORE,
   gatewayCall,
   inCutOverRecord,
   dumpClusterState,
@@ -417,7 +418,7 @@ if (inShard("upgrade")) {
           folderRepls = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", `http://${folderBayma.name}.${HOST_NAMESPACE}.svc:7290/mcp`, token, `kept by ${folderBayma.name}`);
           assert.ok(folderRepls.count > 0, JSON.stringify(folderRepls));
         },
-        keeps: "the folder conversation's REPL sessions, each back whole, in the gateway's folder instance of the conversation, on its bayma's state directory, left in place, the bayma its configuration pins kept",
+        keeps: "the folder conversation's REPL sessions, back from their checkpoints, in the gateway's folder instance of the conversation, on its bayma's state directory, left in place, as the cut-over's configuration step unpins the folders' bayma for this release's, which refuses a snapshot the one before took",
         check: async () => {
           const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), folderRepls.python, folderRepls.bun);
           const kept = `kept by ${folderBayma.name}`;
@@ -428,16 +429,19 @@ if (inShard("upgrade")) {
               console.error(`# ${HOST_NAMESPACE}/${name}, bound to ${pod.metadata?.annotations?.["alasio.dev/binding-key"]}:\n${await kube.logs(HOST_NAMESPACE, name, "bayma").catch((error: unknown) => String(error))}`);
             }
           }
-          // Whole, its thread counting on.
-          assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [kept, kept, true, kept, kept], JSON.stringify(seen));
-          assert.ok((seen.python.count ?? 0) > folderRepls.count, `the count went on from ${folderRepls.count}: ${JSON.stringify(seen)}`);
-          for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
+          // From their checkpoints, what those keep intact, as this release's bayma refuses the snapshots the one before took.
+          assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [null, kept, false, null, kept], JSON.stringify(seen));
+          for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+          // The configuration as the box's cut-over left it: the pin gone, a folder let go after four hours idle.
+          const host = (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: { host: Record<string, unknown> } }).install.host;
+          assert.deepEqual([host["baymaImage"], host["releaseAfter"]], [undefined, "4h"]);
           // The gateway's pod of the folder pool, bound to the conversation's key, on the state directory the Sandbox's bayma had.
           const [instance, ...others] = (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" }))
             .filter((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"] === folderBayma.key);
           assert.ok(instance && others.length === 0, `the folder chat's folder instance is one pod, bound to ${folderBayma.key}`);
-          const args = instance?.spec?.containers.find(({ name }) => name === "bayma")?.args ?? [];
-          assert.equal(args[args.indexOf("--state-dir") + 1], folderBayma.state);
+          const bayma = instance?.spec?.containers.find(({ name }) => name === "bayma");
+          assert.equal(bayma?.args?.[bayma.args.indexOf("--state-dir") + 1], folderBayma.state);
+          assert.doesNotMatch(bayma?.image ?? "", new RegExp(`@${FOLDER_BAYMA_BEFORE.digest}$`, "u"), "the folder instance runs this release's bayma");
         },
       },
       {
@@ -710,6 +714,19 @@ if (inShard("upgrade")) {
     });
 
     for (const { keeps, check } of scenarios) test(`upgraded: ${keeps}`, check);
+
+    // On this release's bayma, the folder conversation's REPL sessions, its instance let go, as
+    // an idle one is, come back whole: the box's path once its folders run what this release pins.
+    test("upgraded, on this release's bayma: the folder conversation's REPL sessions, its instance let go, come back whole, its thread counting on", { timeout: 30 * 60_000 }, async () => {
+      const value = `kept on this release by ${folderBayma.name}`;
+      const set = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", GATEWAY_MCP, await mainKeyToken(folderBayma.key), value);
+      const conversation = folderBayma.key.slice(folderBayma.key.indexOf(":", "folder:".length) + 1);
+      assert.match(await alasioOk("folder", "restart", conversation), /its folder instance of [^\n]+ is let go, its REPL sessions saved, its failed binds forgotten; the next message makes it anew/u);
+      const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderBayma.key), set.python, set.bun);
+      assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [value, value, true, value, value], JSON.stringify(seen));
+      assert.ok((seen.python.count ?? 0) > set.count, `the count went on from ${set.count}: ${JSON.stringify(seen)}`);
+      for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
+    });
 
     // A later bump of the folders' bayma, a release of its own: a snapshot holds its bayma's
     // version, which another refuses, so the folder's REPLs come back from their checkpoints.

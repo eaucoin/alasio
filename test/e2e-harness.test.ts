@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { LOGGED_ERROR, runsShard, shardOf, SHARDS, targetOf } from "./e2e/harness.ts";
+import { boxConfiguration, LOGGED_ERROR, runsShard, shardOf, SHARDS, targetOf } from "./e2e/harness.ts";
 import { overlaid } from "./e2e/release-config.ts";
 import { createTelegramStub } from "./e2e/telegram-stub.ts";
 
@@ -68,6 +68,24 @@ test("the upgrade shard's install configuration is laid over the one alasio init
     sessions: { storage: { size: "1Gi" } },
   });
   assert.deepEqual(overlaid({ list: [1, 2] }, { list: [3] }), { list: [3] });
+});
+
+test("the cut-over's configuration step makes the configuration as the box's does: the folders' bayma unpinned, folders let go after four hours, alasio's and the log's memory as the box's need", () => {
+  const written = {
+    version: 1,
+    install: {
+      host: { user: "1000:1000", baymaImage: { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.3", digest: "sha256:0" }, resources: { requests: { cpu: "20m" } } },
+      alasio: { env: { A: "1" }, resources: { requests: { cpu: "50m", memory: "256Mi" } } },
+    },
+  };
+  assert.deepEqual(boxConfiguration(written), {
+    version: 1,
+    install: {
+      host: { user: "1000:1000", resources: { requests: { cpu: "20m" } }, releaseAfter: "4h" },
+      alasio: { env: { A: "1" }, resources: { requests: { cpu: "50m", memory: "2560Mi" } } },
+      log: { resources: { requests: { memory: "1Gi" } } },
+    },
+  });
 });
 
 test("ALASIO_E2E_TARGET makes the cluster in Docker unless it names the host, and refuses another", () => {

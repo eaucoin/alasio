@@ -177,9 +177,10 @@ export const ESTARGZ = PUSHED !== undefined;
 
 /**
  * The bayma the box's folders run on the release before, as its configuration pins it
- * (host.baymaImage), which the upgrade shard's install of it is given: the pin kept across the
- * cut-over, as the configuration is, the folder instances run it too, so their REPLs come back
- * whole, whatever this release would pin (cli/src/manifests/config.ts HOST_BAYMA_IMAGE).
+ * (host.baymaImage), which the upgrade shard's install of it is given. The cut-over's
+ * configuration step removes the pin (boxConfiguration), as the box's does, so the folder
+ * instances run this release's bayma (cli/src/manifests/config.ts HOST_BAYMA_IMAGE), which
+ * refuses a snapshot this one took: their REPLs come back from their checkpoints, once.
  */
 export const FOLDER_BAYMA_BEFORE = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.3", digest: "sha256:add3c8ad2024f5dad077d2deac67fcda911722eee75be866946d17b17dd31be7" } as const;
 
@@ -894,6 +895,16 @@ const shellWord = (word: string): string => `'${word.replaceAll("'", `'\\''`)}'`
  */
 export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Promise<Ran> {
   const { work, env, kubeconfig, release } = current();
+  const configHome = env["XDG_CONFIG_HOME"] ?? "";
+  const configFile = join(configHome, "alasio", "config.json");
+  // The box's configuration step, before the script: once, kept as it was, and put back as it was where the script refuses or fails before its point of no return.
+  const before = join(work, "config.before-cut-over.json");
+  if (!existsSync(before)) {
+    const config = readFileSync(configFile, "utf8");
+    writeFileSync(before, config, { mode: 0o600 });
+    // Written over, so the file keeps its owner and mode.
+    writeFileSync(configFile, JSON.stringify(boxConfiguration(JSON.parse(config) as Configuration)));
+  }
   const script = join(root, "upgrades", `from-${PREVIOUS}.sh`);
   if (!existsSync(script)) throw new Error(`no upgrades/from-${PREVIOUS}.sh says how an installation of ${PREVIOUS} upgrades to this release: write one, if only to run UPGRADE`);
   const installFile = join(work, "release-install.json");
@@ -905,7 +916,6 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
   const command = (...words: string[]) => words.map(shellWord).join(" ");
   const configured = (configHome: string) =>
     command(...owner(configHome), process.execPath, join(root, "test", "e2e", "release-config.ts"), join(configHome, "alasio", "config.json"), installFile);
-  const configHome = env["XDG_CONFIG_HOME"] ?? "";
   const upgrade = `${configured(configHome)} && ${command(...owner(configHome), release, "upgrade", "--timeout", "30m")}`;
   const copy = join(work, "check-config");
   const check = [
@@ -921,6 +931,10 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
     stdio: ["ignore", "pipe", "pipe"],
   }));
   if (ran.code === 0) current().bin = release;
+  if (ran.code !== 0 && (await inCutOverRecord("test -e point-of-no-return && echo past || true")).trim() !== "past") {
+    writeFileSync(configFile, readFileSync(before, "utf8"));
+    rmSync(before);
+  }
   // What the upgrade and its check said, which the cut-over keeps in its record alone: a failure of theirs says only where to look.
   else {
     for (const name of ["upgrade-check.log", "upgrade.log"]) {
@@ -929,6 +943,32 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
     }
   }
   return ran;
+}
+
+/** alasio's configuration, as far as the cut-over's configuration step reads it. */
+interface Configuration {
+  readonly install?: {
+    readonly host?: Record<string, unknown>;
+    readonly alasio?: { readonly resources?: { readonly requests?: Record<string, unknown> } & Record<string, unknown> } & Record<string, unknown>;
+    readonly log?: { readonly resources?: { readonly requests?: Record<string, unknown> } & Record<string, unknown> } & Record<string, unknown>;
+  } & Record<string, unknown>;
+}
+
+/**
+ * `config` as the box's cut-over makes its configuration before it runs the script: the
+ * folders' bayma pin removed, for this release's; a folder instance let go after four hours
+ * idle; and alasio's memory request 2560Mi and the log's 1Gi, as the box's use more than their
+ * defaults request. The run's own install configuration, laid over it as UPGRADE runs, sizes
+ * alasio and the log down again, to the runner's.
+ */
+export function boxConfiguration(config: Configuration): Configuration {
+  const install = config.install ?? {};
+  const { baymaImage: _pinned, ...host } = install.host ?? {};
+  const requesting = (part: { readonly resources?: { readonly requests?: Record<string, unknown> } } | undefined, memory: string) => ({
+    ...part,
+    resources: { ...part?.resources, requests: { ...part?.resources?.requests, memory } },
+  });
+  return { ...config, install: { ...install, host: { ...host, releaseAfter: "4h" }, alasio: requesting(install.alasio, "2560Mi"), log: requesting(install.log, "1Gi") } };
 }
 
 /** Where the upgrade shard's cut-over keeps its record (its OUT), which root owns. */
