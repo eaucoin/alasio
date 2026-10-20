@@ -2900,15 +2900,17 @@ describe("scaling", () => {
     assert.ok(Result.isFailure(refused) && refused.failure.message === "autoscaling.headroom.scaling must be 0 when autoscaling.preemption is false, as no pod takes a placeholder's place then");
   });
 
-  test("sizes every workload by a VerticalPodAutoscaler beside it: in place what keeps no state and runs no turn, the rest recommended alone, from a small floor to half a core and its memory limit", () => {
+  test("sizes every workload by a VerticalPodAutoscaler beside it: in place what keeps no state and runs no turn, as it is made alasio's pod and the log, the rest recommended alone, from a small floor to half a core and its memory limit", () => {
     const objects = [...install({ host: { enabled: true } }), ...branchObjects(configOf(), "try", BASELINE)];
     const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet"), ...all<V1DaemonSet>(objects, "DaemonSet")];
     const sized = all<VerticalPodAutoscaler>(objects, "VerticalPodAutoscaler");
     const key = ({ metadata }: KubernetesObject) => `${metadata?.namespace}/${metadata?.name}`;
     assert.deepEqual(sized.map(key).sort(), workloads.map(key).sort());
     const modes = new Map(sized.map((vpa) => [key(vpa), vpa.spec.updatePolicy.updateMode]));
+    // Sized as each pod is made: alasio's pod and the log, which come to use more than they are given.
+    const atStart = ["alasio", "alasio-log"];
+    // Recommended alone: what keeps state, and the sandbox pools, whose snapshots restore onto their templates, among them.
     const recommended = [
-      "alasio",
       "alasio-neon-compute",
       "alasio-neon-compute-ro",
       "alasio-neon-storage-controller",
@@ -2920,21 +2922,21 @@ describe("scaling", () => {
       "alasio-seaweedfs-master",
       "alasio-seaweedfs-volume",
       "alasio-seaweedfs-filer-store",
-      "alasio-log",
       "alasio-valkey",
       "sandboxes-none",
       "sandboxes-full",
       "alasio-workspace-mount",
     ];
-    for (const [name, mode] of modes) assert.equal(mode, recommended.includes(name.split("/")[1] ?? "") ? "Off" : "InPlace", name);
+    const modeOf = (name: string) => (atStart.includes(name) ? "Initial" : recommended.includes(name) ? "Off" : "InPlace");
+    for (const [name, mode] of modes) assert.equal(mode, modeOf(name.split("/")[1] ?? ""), name);
     // A branch's alasio runs turns as main's does.
-    assert.equal(modes.get("alasio-branch-try/alasio"), "Off");
+    assert.equal(modes.get("alasio-branch-try/alasio"), "Initial");
     // Of the memory alone of what sleeps, woken from none: the lakes' loaders and the intake.
     const sleeping = ["alasio-lake-loader", "alasio-lake-intake"];
     for (const vpa of sized) {
       const workload = workloads.find((each) => key(each) === key(vpa));
       assert.deepEqual(vpa.spec.targetRef, { apiVersion: workload?.apiVersion, kind: workload?.kind, name: workload?.metadata?.name });
-      assert.equal(vpa.spec.updatePolicy.minReplicas, vpa.spec.updatePolicy.updateMode === "Off" ? undefined : 1);
+      assert.equal(vpa.spec.updatePolicy.minReplicas, vpa.spec.updatePolicy.updateMode === "InPlace" ? 1 : undefined);
       assert.deepEqual(vpa.spec.resourcePolicy.containerPolicies, (workload?.spec?.template.spec?.containers ?? []).map(({ name, resources }) => ({
         containerName: name,
         ...(sleeping.includes(workload?.metadata?.name ?? "") ? { controlledResources: ["memory"] } : {}),

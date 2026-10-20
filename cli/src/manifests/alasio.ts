@@ -409,7 +409,7 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
     ...identity(config, environment),
     alasio,
     // It runs turns, in its harnesses, which a recreation would end.
-    verticalPodAutoscaler(alasio, "Recommended"),
+    verticalPodAutoscaler(alasio, "AtStart"),
     // A drain waits for the turns running in its pod to end.
     busyBudget(environment.namespace),
     ...(environment.branch === null && forksForBranches(config) ? [branchForksService()] : []),

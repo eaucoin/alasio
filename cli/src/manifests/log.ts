@@ -462,5 +462,5 @@ export function logObjects(config: InstallConfig): KubernetesObject[] {
       volumeClaimTemplates: [{ metadata: { name: "data", labels: claimLabels(stackLabels(LOG_COMPONENT)) }, spec: claimSpec(log.storage) }],
     },
   };
-  return [configMap, service, statefulSet, ...replicaBudget(LOG_COMPONENT, NAMESPACE, log.scaling), verticalPodAutoscaler(statefulSet, "Recommended")];
+  return [configMap, service, statefulSet, ...replicaBudget(LOG_COMPONENT, NAMESPACE, log.scaling), verticalPodAutoscaler(statefulSet, "AtStart")];
 }
