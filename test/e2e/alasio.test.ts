@@ -3337,8 +3337,15 @@ if (inShard("branches")) {
       await kube.patch(ref("ScaledObject", "alasio-lake-loader", BRANCH_NAMESPACE), { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": "0" } } });
       for (const name of ["alasio", "alasio-lake-loader"]) await kube.patch(ref("Deployment", name, BRANCH_NAMESPACE), { spec: { replicas: 0 } });
       const compute = ref("Deployment", "alasio-neon-compute", BRANCH_NAMESPACE);
+      // Asleep once its sleep is through: scaled to none, and its pod gone, which serves on
+      // until it is, so a connection meanwhile reaches the pod its sleep is stopping.
+      const asleep = async () => {
+        const deployment = await kube.get<V1Deployment>(compute);
+        if (deployment?.spec?.replicas !== 0) return false;
+        return (await kube.list<V1Pod>("Pod", { namespace: BRANCH_NAMESPACE, labelSelector: selectorOf(deployment.spec.selector.matchLabels ?? {}) })).length === 0;
+      };
       const deadline = Date.now() + 300_000;
-      while ((await kube.get<V1Deployment>(compute))?.spec?.replicas !== 0) {
+      while (!(await asleep())) {
         assert.ok(Date.now() < deadline, "the branch's compute did not sleep");
         await sleep(5000);
       }
