@@ -8,14 +8,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { Effect, Fiber, Layer } from "effect";
+import { Context, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect";
 
-import { consumeEvents, EnvironmentEvents, type EventHandlers } from "../src/events/consume.ts";
+import { consumeEvents, EnvironmentEvents, type EventHandlers, EventsConsumer } from "../src/events/consume.ts";
 import { eventRecord, type EventInput } from "../src/events/events.ts";
-import type { TopicRecord } from "../src/log/topic.ts";
 import { StoreError } from "../src/persistence/sql.ts";
 import { Store } from "../src/persistence/store.ts";
 import { newSchema, run, testPool, testStore } from "./support/store.ts";
+import { memoryTopic } from "./support/topics.ts";
 
 /** The record id `n`, a UUID as the gateways make one. */
 const idOf = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}` as const;
@@ -29,38 +29,11 @@ const RELEASED: EventInput = {
   reason: "idle",
 };
 
-/** A topic of `values`, its group told of each committed, a member joining again reading on from there. */
-function topicOf(values: readonly string[]): { readonly layer: Layer.Layer<EnvironmentEvents>; readonly committed: () => number } {
-  let committed = 0;
-  const layer = Layer.succeed(EnvironmentEvents, EnvironmentEvents.of({
-    join: Effect.sync(() => {
-      let next = committed;
-      let closed = false;
-      return {
-        async next(): Promise<TopicRecord> {
-          for (;;) {
-            if (closed) throw new Error("the member was closed");
-            if (next < values.length) {
-              const at = next++;
-              return { value: Buffer.from(values[at] ?? ""), position: `events.main/0/${at}`, commit: async () => void (committed = Math.max(committed, at + 1)) };
-            }
-            await sleep(20);
-          }
-        },
-        async close() {
-          closed = true;
-        },
-      };
-    }),
-  }));
-  return { layer, committed: () => committed };
-}
-
 /** Runs `handlers` on `values` with the store in `schema` until every record is told, then stops. */
 async function consume(schema: string, values: readonly string[], handlers: EventHandlers): Promise<void> {
   const store = await testStore({ schema });
-  const topic = topicOf(values);
-  const consumer = Effect.runFork(consumeEvents(handlers).pipe(Effect.provide(Layer.mergeAll(topic.layer, Layer.succeed(Store, store)))));
+  const topic = memoryTopic("events.main", values);
+  const consumer = Effect.runFork(consumeEvents(handlers).pipe(Effect.provide(Layer.mergeAll(Layer.succeed(EnvironmentEvents, EnvironmentEvents.of({ join: topic.join })), Layer.succeed(Store, store)))));
   for (const deadline = Date.now() + 15_000; topic.committed() < values.length; await sleep(20)) {
     if (Date.now() > deadline) assert.fail(`${topic.committed()} of ${values.length} records told`);
   }
@@ -123,4 +96,35 @@ test("the events handled are forgotten with what else is kept only in flight, on
   await (await testPool()).query(`update ${schema}.events_handled set handled_at = now() - interval '8 days'`);
   await run(store.pruneTransient("7 days"));
   assert.equal((await (await testPool()).query(`select 1 from ${schema}.events_handled`)).rowCount, 0);
+});
+
+test("the environment's one member hands each event to the part of alasio that added its kind's handling, once every part's handling is ready, and refuses a kind added twice or a handling added once it reads", async () => {
+  const schema = newSchema();
+  const store = await testStore({ schema });
+  const LOST: EventInput = { kind: "workspace.lost", environment: "main", source: "sandbox-gateway", subject: { kind: "workspace", key: "sessionfs:fs-1" }, binding: "binding-1", pod: "pod-1", reason: "gone" };
+  const topic = memoryTopic("events.main", [eventRecord(RELEASED, 1, idOf(5)).value, eventRecord(LOST, 1, idOf(6)).value]);
+  const scope = Effect.runSync(Scope.make());
+  try {
+    const consumer = await Effect.runPromise(Effect.map(Layer.build(EventsConsumer.layer), (built) => Context.get(built, EventsConsumer)).pipe(
+      Effect.provide(Layer.mergeAll(Layer.succeed(EnvironmentEvents, EnvironmentEvents.of({ join: topic.join })), Layer.succeed(Store, store))),
+      Scope.provide(scope),
+    ));
+    const heard: string[] = [];
+    const listening = Effect.runSync(Deferred.make<void>());
+    await Effect.runPromise(consumer.handle({ "workspace.released": (event) => Effect.sync(() => void heard.push(`released ${event.id}`)) }));
+    await Effect.runPromise(consumer.handle({ "workspace.lost": (event) => Effect.sync(() => void heard.push(`lost ${event.id}`)) }, Deferred.await(listening)));
+    const twice = await Effect.runPromiseExit(consumer.handle({ "workspace.released": () => Effect.void }));
+    assert.ok(Exit.isFailure(twice), "a kind handled twice");
+    await Effect.runPromise(consumer.start.pipe(Scope.provide(scope)));
+    // Nothing read before every part listens.
+    await sleep(300);
+    assert.deepEqual([heard, topic.committed()], [[], 0]);
+    await Effect.runPromise(Deferred.succeed(listening, undefined));
+    for (const deadline = Date.now() + 15_000; topic.committed() < 2; await sleep(20)) assert.ok(Date.now() < deadline, `${topic.committed()} of 2 told`);
+    assert.deepEqual(heard, [`released ${idOf(5)}`, `lost ${idOf(6)}`]);
+    const late = await Effect.runPromiseExit(consumer.handle({ "workspace.exec-ended": () => Effect.void }));
+    assert.ok(Exit.isFailure(late), "a handling added once it reads");
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
 });
