@@ -67,7 +67,7 @@ import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { COMPONENTS as OBJECT_STORE_COMPONENTS } from "../../cli/src/manifests/object-store.ts";
-import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
+import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { BINDING_LABEL, environmentKey, keyHash } from "../../src/binder/names.ts";
 import { NO_BIND_HEADER } from "../../src/binder/server.ts";
 import { mintToken } from "../../src/binder/tokens.ts";
@@ -1122,14 +1122,15 @@ export async function dumpClusterState(): Promise<void> {
         for (const line of logged.trimEnd().split("\n").filter((each) => /^[EW]\d{4} /u.test(each)).slice(-40)) say(`  ${line}`);
       }
     }
-    // Ready as they may be, alasio and the node agents log why a snapshot was not taken or
-    // a session not restored from one: alasio in its scope "snapshots", the agents in theirs.
-    for (const [component, scope] of [["alasio", "[snapshots]"], ["node-agent", "[node-agent]"]] as const) {
+    // Ready as they may be, the sandbox gateway and the node agents log why a snapshot was not
+    // taken, a session not restored from one, or a bound pod not reached: the gateway in its
+    // scopes "snapshots" and "binder", the agents in theirs.
+    for (const [component, scopes] of [[GATEWAY_COMPONENT, ["[snapshots]", "[binder]"]], ["node-agent", ["[node-agent]"]]] as const) {
       for (const pod of await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels(component)) })) {
         const name = pod.metadata?.name ?? "";
         const logged = await kube.logs(NAMESPACE, name, component).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
-        say(`--- ${NAMESPACE}/${name}: its last lines of ${scope}`);
-        for (const line of logged.trimEnd().split("\n").filter((each) => each.startsWith(scope)).slice(-40)) say(`  ${line}`);
+        say(`--- ${NAMESPACE}/${name}: its last lines of ${scopes.join(" and ")}`);
+        for (const line of logged.trimEnd().split("\n").filter((each) => scopes.some((scope) => each.startsWith(scope))).slice(-80)) say(`  ${line}`);
       }
     }
   } catch (error) {
