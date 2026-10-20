@@ -305,6 +305,26 @@ test("a release of a key's binding of one pod releases none the key was bound to
   assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace", () => Effect.void, again.pod)), "released");
 });
 
+test("reconciling a pool leaves a binding being released to its releaser, its pod gone first, unless its releaser stopped renewing it", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  const layer = binderOf();
+  const releasing = await Promise.all(["sessionfs:releasing", "sessionfs:left"].map((key) => bindIn(layer, (each) => each.bind(of, key))));
+  for (const key of ["sessionfs:releasing", "sessionfs:left"]) {
+    const lease = await run(binder(), readLease(of, key));
+    assert.ok(lease);
+    await run(binder(), markReleasing(lease, "releaser"));
+  }
+  // Its releaser's: its pod deleted, as a release deletes it before its Lease. The other's releaser ended a while ago.
+  const old = `${new Date(Date.now() - 61_000).toISOString().slice(0, -1)}000Z`;
+  await run(binder(), withKube((client) => client.patch("coordination.k8s.io/v1", "Lease", of.namespace, leaseName("sessionfs:left"), { spec: { renewTime: old } })));
+  for (const { pod } of releasing) await run(binder(), withKube((client) => client.remove("v1", "Pod", of.namespace, pod)));
+  const told: string[] = [];
+  const set = await run(binder(), reconcile(of, (lease) => Effect.sync(() => void told.push(lease.metadata?.annotations?.[KEY_ANNOTATION] ?? ""))));
+  assert.deepEqual([set.leases, told], [[leaseName("sessionfs:left")], ["sessionfs:left"]]);
+  assert.ok(await run(binder(), readLease(of, "sessionfs:releasing")));
+});
+
 test("a release runs what comes before it, its Lease renewed, then deletes the pod and its Lease; a bind meanwhile waits for it, and binds anew after", async () => {
   const of = await pool();
   await freePods(of, 2);

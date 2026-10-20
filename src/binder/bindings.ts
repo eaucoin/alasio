@@ -221,7 +221,9 @@ export const counts = Effect.fnUntraced(function*(pool: Pool): Effect.fn.Return<
  * record of it, then told of (`letGo`), as a binding whose pod went while it was bound, which
  * what binds may say lost. A pod being deleted is not gone while it is there, as its binder may
  * be saving it as it ends. A binding under way, its pod not yet named, is left to its binder,
- * or to the next to take it over. What was set right, as names.
+ * or to the next to take it over; and so is one being released, whose releaser deletes its pod
+ * before its Lease, and tells of its release itself, unless it has stopped renewing it, so a
+ * binding released is never told of as lost too. What was set right, as names.
  */
 export const reconcile = Effect.fnUntraced(function*(
   pool: Pool,
@@ -238,10 +240,12 @@ export const reconcile = Effect.fnUntraced(function*(
     const lease = held.get(metadata?.labels?.[BINDING_LABEL] ?? "");
     return !lease || (lease.spec?.holderIdentity && lease.spec.holderIdentity !== metadata?.name);
   });
-  const stale = leases.filter(({ spec }) => spec?.holderIdentity && !running.has(spec.holderIdentity));
+  const now = yield* Clock.currentTimeMillis;
+  const released = (lease: BindingLease) => lease.metadata?.annotations?.[RELEASING_ANNOTATION] !== undefined && !stale(lease, BINDING_TIMEOUT_MS, now);
+  const gone = leases.filter((lease) => lease.spec?.holderIdentity && !running.has(lease.spec.holderIdentity) && !released(lease));
   yield* Effect.forEach(orphans, ({ metadata }) => kube.remove("v1", "Pod", pool.namespace, metadata?.name ?? ""), { discard: true });
   // One changed since it was read, as by its binder, is no more this one's to let go, nor to tell of.
-  const released = yield* Effect.forEach(stale, (lease) => before(lease).pipe(Effect.andThen(releaseLease(lease)), Effect.as(true), Effect.catchIf(hasStatus(409), () => Effect.succeed(false))));
-  yield* Effect.forEach(stale.filter((_, n) => released[n]), letGo, { discard: true });
-  return { pods: orphans.map(({ metadata }) => metadata?.name ?? ""), leases: stale.filter((_, n) => released[n]).map(({ metadata }) => metadata?.name ?? "") };
+  const letGone = yield* Effect.forEach(gone, (lease) => before(lease).pipe(Effect.andThen(releaseLease(lease)), Effect.as(true), Effect.catchIf(hasStatus(409), () => Effect.succeed(false))));
+  yield* Effect.forEach(gone.filter((_, n) => letGone[n]), letGo, { discard: true });
+  return { pods: orphans.map(({ metadata }) => metadata?.name ?? ""), leases: gone.filter((_, n) => letGone[n]).map(({ metadata }) => metadata?.name ?? "") };
 });
