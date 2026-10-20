@@ -3077,8 +3077,14 @@ describe("scaling", () => {
       assert.match(container(deployment).image ?? "", /^registry\.k8s\.io\/autoscaling\/vpa-[-a-z]+:1\.8\.0@sha256:[0-9a-f]{64}$/u, name);
       assert.ok(memoryBytes(container(deployment).resources?.requests?.["memory"] ?? "") <= 64 * 2 ** 20, name);
     }
-    // It tracks what has a VerticalPodAutoscaler alone, recommends as little as a small component uses, and resizes a workload of one replica.
-    assert.deepEqual(args("alasio-vpa-recommender"), ["--memory-saver", "--pod-recommendation-min-cpu-millicores=10", "--pod-recommendation-min-memory-mb=16"]);
+    // It tracks what has a VerticalPodAutoscaler alone, recommends as little as a small component uses, of memory each hour's peak over eight days, and resizes a workload of one replica.
+    assert.deepEqual(args("alasio-vpa-recommender"), [
+      "--memory-saver",
+      "--pod-recommendation-min-cpu-millicores=10",
+      "--pod-recommendation-min-memory-mb=16",
+      "--memory-aggregation-interval=1h",
+      "--memory-aggregation-interval-count=192",
+    ]);
     // Both take the InPlace update mode, which resizes in place and never recreates.
     assert.deepEqual(args("alasio-vpa-updater"), ["--min-replicas=1", "--feature-gates=InPlace=true"]);
     assert.deepEqual(args("alasio-vpa-admission-controller"), ["--register-webhook=false", "--webhook-service=alasio-vpa-webhook", "--feature-gates=InPlace=true"]);

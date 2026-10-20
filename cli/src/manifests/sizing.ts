@@ -22,13 +22,11 @@
  *   controller, which the compute's start needs; neon-control; each node's agent and its
  *   mount of workspace storage), and for a sandbox pool's pods, whose template their
  *   snapshots are restored onto by its hash, so that a pod made of it is as it says:
- *   recommended alone, which `alasio status` shows beside its requests. VPA recommends of
- *   memory the 90th percentile of each day's peak working set, with a margin of 15%: of
- *   what reads and writes files as Neon's storage and the volume servers do, the page cache
- *   they keep active counts, and their peaks come as each starts and catches up, so it is
- *   two to seven times what they hold of their own (on the box, the pageserver 776 MiB
- *   against 140, each safekeeper 237 against 27): given as each pod is made, it would
- *   request more than the box has to spare, and evict, by priority, what wakes to work.
+ *   recommended alone, which `alasio status` shows beside its requests. Of what reads and
+ *   writes files as Neon's storage and the volume servers do, VPA's working set counts the
+ *   page cache they keep active, and given as each pod is made, its recommendation would
+ *   request more than a small node has to spare, and evict, by priority, what wakes to
+ *   work.
  *
  * Folder instances' pods have none: the sandbox gateway makes each, of the folder template.
  */

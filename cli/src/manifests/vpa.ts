@@ -16,7 +16,13 @@
  *   its webhook registered by alasio rather than by itself, so it may change no webhook;
  *   the webhook sees alasio's pods alone, and is ignored while it does not answer;
  * - the recommender tracks the pods of VerticalPodAutoscalers alone, and recommends as
- *   little as alasio's smallest components use rather than 250 MB a pod;
+ *   little as alasio's smallest components use rather than 250 MB a pod; and of memory, the
+ *   90th percentile of each hour's peak (MEMORY_AGGREGATION), not each day's: a day's peak is
+ *   its worst minute, as a component starts and catches up, or a burst of queries or
+ *   restores its limit bounds, which the 90th percentile of the days then is. Each peak
+ *   weighs half as much as one a day newer (upstream's half-life, kept), some 35 hours'
+ *   weight in all, so a burst of an hour or two sets no request, and one of three hours or
+ *   more within a day still does;
  * - the updater resizes a workload of one replica, as most of alasio's are, and it and the
  *   admission controller take the InPlace update mode, alpha in this release, which
  *   resizes a pod in place and never recreates it;
@@ -108,6 +114,12 @@ const ACTOR: V1PolicyRule[] = [
   rule(["autoscaling.k8s.io"], ["verticalpodautoscalers"], ["get", "list", "watch"]),
 ];
 
+/**
+ * How the recommender aggregates a container's memory: the peak of each interval of this
+ * length, so many of them kept, eight days of hours, as upstream keeps eight days of days.
+ */
+export const MEMORY_AGGREGATION = { interval: "1h", count: 192 } as const;
+
 /** The recommender: each workload's recommended requests, from its pods' use, which the metrics server measures, kept in checkpoints. */
 function recommender(config: InstallConfig): KubernetesObject[] {
   const { recommender } = config.autoscaling.vpa;
@@ -122,7 +134,13 @@ function recommender(config: InstallConfig): KubernetesObject[] {
     ...sizedController(config, "vpa-recommender", RECOMMENDER, {
       name: "recommender",
       image: imageReference(recommender.image),
-      args: ["--memory-saver", "--pod-recommendation-min-cpu-millicores=10", "--pod-recommendation-min-memory-mb=16"],
+      args: [
+        "--memory-saver",
+        "--pod-recommendation-min-cpu-millicores=10",
+        "--pod-recommendation-min-memory-mb=16",
+        `--memory-aggregation-interval=${MEMORY_AGGREGATION.interval}`,
+        `--memory-aggregation-interval-count=${MEMORY_AGGREGATION.count}`,
+      ],
       ports: [{ name: "prometheus", containerPort: 8942 }],
       livenessProbe: { httpGet: { path: "/health-check", port: "prometheus" }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 3 },
       readinessProbe: { httpGet: { path: "/health-check", port: "prometheus" }, periodSeconds: 10, failureThreshold: 3 },

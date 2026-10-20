@@ -2953,6 +2953,111 @@ if (inShard("scaling")) {
       }
     });
 
+    test("a minute's burst of a workload's memory among its steady use sets no request, as VPA's recommender takes the 90th percentile of each hour's peak (here each half minute's), where each day's would", async (t) => {
+      const recommender = await kube.get<V1Deployment>(ref("Deployment", componentName("vpa-recommender"), NAMESPACE));
+      const template = recommender?.spec?.template ?? assert.fail("no recommender of alasio's");
+      const args = template.spec?.containers[0]?.args ?? [];
+      assert.ok(args.includes("--memory-aggregation-interval=1h") && args.includes("--memory-aggregation-interval-count=192"), args.join(" "));
+      // Two recommenders of the suite's own, of its VPAs alone: alasio's, its hour scaled to a
+      // half minute, so that a run holds enough of them, its half-life of a day not, which a
+      // run's half hour weighs nothing against; and one of upstream's days.
+      const kinds = {
+        hourly: args.map((arg) => (arg.startsWith("--memory-aggregation-interval=") ? "--memory-aggregation-interval=30s" : arg)),
+        daily: args.filter((arg) => !arg.startsWith("--memory-aggregation-interval")),
+      };
+      const account = "e2e-recommender";
+      const image = (await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE)))?.spec?.template.spec?.containers[0]?.image ?? assert.fail("no image of alasio's");
+      // 96 MiB held throughout, and 288 more for a minute, half a minute in, then given back.
+      const burst = "const steady = Buffer.alloc(96 << 20, 1); setTimeout(() => { let held = Buffer.alloc(288 << 20, 1); setTimeout(() => { held = null; globalThis.gc(); }, 60_000); }, 30_000); setInterval(() => steady[0]++, 1 << 30);";
+      const objects: (KubernetesObject & { kind: KindName; metadata: V1ObjectMeta & { name: string } })[] = [
+        { apiVersion: "v1", kind: "ServiceAccount", metadata: { name: account, namespace: SCALING } },
+        {
+          apiVersion: "rbac.authorization.k8s.io/v1",
+          kind: "ClusterRoleBinding",
+          metadata: { name: account },
+          subjects: [{ kind: "ServiceAccount", name: account, namespace: SCALING }],
+          roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "ClusterRole", name: componentName("vpa-recommender") },
+        } as KubernetesObject & { kind: "ClusterRoleBinding"; metadata: { name: string } },
+        ...Object.entries(kinds).flatMap(([kind, flags]) => [
+          {
+            apiVersion: "apps/v1",
+            kind: "Deployment" as const,
+            metadata: { name: `e2e-recommender-${kind}`, namespace: SCALING },
+            spec: {
+              replicas: 1,
+              selector: { matchLabels: { app: `e2e-recommender-${kind}` } },
+              template: {
+                metadata: { labels: { app: `e2e-recommender-${kind}` } },
+                spec: {
+                  ...template.spec,
+                  serviceAccountName: account,
+                  containers: (template.spec?.containers ?? []).map((container) => ({ ...container, args: [...flags, `--recommender-name=e2e-${kind}`, "--recommender-interval=10s", `--vpa-object-namespace=${SCALING}`] })),
+                },
+              },
+            },
+          },
+          {
+            apiVersion: "apps/v1",
+            kind: "Deployment" as const,
+            metadata: { name: `e2e-burst-${kind}`, namespace: SCALING },
+            spec: {
+              replicas: 1,
+              selector: { matchLabels: { app: `e2e-burst-${kind}` } },
+              template: {
+                metadata: { labels: { app: `e2e-burst-${kind}` } },
+                spec: {
+                  securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: { type: "RuntimeDefault" } },
+                  containers: [{
+                    name: "burst",
+                    image,
+                    command: ["node", "--expose-gc", "-e", burst],
+                    securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] }, readOnlyRootFilesystem: true },
+                    resources: { requests: { cpu: "5m", memory: "64Mi" }, limits: { memory: "512Mi" } },
+                  }],
+                },
+              },
+            },
+          },
+          {
+            apiVersion: "autoscaling.k8s.io/v1",
+            kind: "VerticalPodAutoscaler" as const,
+            metadata: { name: `e2e-burst-${kind}`, namespace: SCALING },
+            spec: {
+              targetRef: { apiVersion: "apps/v1", kind: "Deployment", name: `e2e-burst-${kind}` },
+              recommenders: [{ name: `e2e-${kind}` }],
+              updatePolicy: { updateMode: "Off" },
+              resourcePolicy: { containerPolicies: [{ containerName: "burst", minAllowed: { cpu: "5m", memory: "16Mi" }, controlledValues: "RequestsOnly" }] },
+            },
+          },
+        ]),
+      ];
+      try {
+        for (const object of objects) await kube.apply(object);
+        await kube.awaitReady(Object.keys(kinds).flatMap((kind) => [ref("Deployment", `e2e-recommender-${kind}`, SCALING), ref("Deployment", `e2e-burst-${kind}`, SCALING)]), "5 minutes");
+        // The burst over, then thirty half minutes of steady use: its two the top 6% of them,
+        // under the 90th percentile; and of the one day, the peak.
+        await sleep(90_000 + 15 * 60_000);
+        const target = async (kind: string) => {
+          const vpa = await kube.get<KubernetesObject & { status?: { recommendation?: { containerRecommendations?: { target?: { memory?: string } }[] } } }>(ref("VerticalPodAutoscaler", `e2e-burst-${kind}`, SCALING));
+          const memory = vpa?.status?.recommendation?.containerRecommendations?.[0]?.target?.memory;
+          return memory === undefined ? undefined : memoryBytes(memory);
+        };
+        const [hourly = Number.POSITIVE_INFINITY, daily = 0] = await until("both recommended", async () => {
+          const both = [await target("hourly"), await target("daily")];
+          return both.every((each) => each !== undefined) ? both as number[] : undefined;
+        }, 300_000);
+        // What it holds steadily, as the metrics server measures it now.
+        const [measured] = await kube.list<KubernetesObject & { containers?: { usage?: { memory?: string } }[] }>("PodMetrics", { namespace: SCALING, labelSelector: "app=e2e-burst-hourly" });
+        const steady = memoryBytes(measured?.containers?.[0]?.usage?.memory ?? "0");
+        const mib = (bytes: number) => Math.round(bytes / 2 ** 20);
+        t.diagnostic(`recommended: ${mib(hourly)} MiB by each half minute's peak, ${mib(daily)} MiB by each day's, of ${mib(steady)} MiB held steadily`);
+        assert.ok(daily >= 384 * 2 ** 20, "by each day's peak, the burst sets the request");
+        assert.ok(steady >= 96 * 2 ** 20 && hourly >= steady && hourly <= steady * 1.15 * 1.25, "by each hour's, what it holds steadily, with VPA's margin, does");
+      } finally {
+        for (const object of objects.toReversed()) await kube.remove(ref(object.kind, object.metadata.name, object.metadata.namespace)).catch(() => {});
+      }
+    });
+
     test("a turn holds alasio's pod busy until it ends, its session's pod bound throughout", async () => {
       const volumeId = await newSession("none");
       await tg.say("/service codex");
