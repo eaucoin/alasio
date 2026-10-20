@@ -971,6 +971,24 @@ describe("object store", () => {
     assert.deepEqual(modes, { "alasio-seaweedfs-master": "Off", "alasio-seaweedfs-volume": "Off", "alasio-seaweedfs-filer-store": "Off", "alasio-seaweedfs-filer": "InPlace", "alasio-seaweedfs": "InPlace" });
   });
 
+  test("bounds what an S3 gateway holds of uploads under way, not of GETs, holds its connections' buffers small, and has Go collect before its memory limit", () => {
+    const gateway = (objects: readonly KubernetesObject[]) => container(one<V1Deployment>(objects, "Deployment", "alasio-seaweedfs"));
+    const s3 = gateway(install());
+    // Its limit 2Gi by default, an eighth of it for uploads; no budget of its GETs, which livelocks one (./object-store.ts).
+    assert.equal(s3.resources?.limits?.["memory"], "2Gi");
+    assert.deepEqual(s3.args?.filter((arg) => /^-(readerCacheSizeMB|concurrentUploadLimitMB)=/u.test(arg)), ["-concurrentUploadLimitMB=256"]);
+    // Three fifths of its limit for Go.
+    assert.deepEqual(s3.env, [{ name: "GOMEMLIMIT", value: "1228MiB" }]);
+    // Its connections' kernel buffers at most 1 MiB each.
+    assert.deepEqual(one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs").spec?.template.spec?.securityContext?.sysctls, [
+      { name: "net.ipv4.tcp_rmem", value: "4096 131072 1048576" },
+      { name: "net.ipv4.tcp_wmem", value: "4096 16384 1048576" },
+    ]);
+    const smaller = gateway(install({ objectStore: { bundled: { gateways: { resources: { limits: { memory: "1Gi" } } } } } }));
+    assert.deepEqual(smaller.args?.filter((arg) => /^-concurrentUploadLimitMB=/u.test(arg)), ["-concurrentUploadLimitMB=128"]);
+    assert.deepEqual(smaller.env, [{ name: "GOMEMLIMIT", value: "614MiB" }]);
+  });
+
   test("keeps objects on the volume servers' volumes, a fixed count of volumes each, in one rack, so a copy goes to another server", () => {
     const objects = install({ objectStore: { bundled: { volumeServers: { volumes: 40, storage: { size: "50Gi" } } } } });
     const volume = one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs-volume");

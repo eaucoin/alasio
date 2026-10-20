@@ -614,7 +614,9 @@ const ObjectStore = Schema.Struct({
       gateways: defaulted(
         Schema.Struct({
           scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: true }),
-          resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "1Gi" } }),
+          // Room for what its GETs hold in flight, 1 GiB at most, beside the rest
+          // (./object-store.ts gatewayUploadBufferMiB).
+          resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "2Gi" } }),
         }),
         {},
       ),
