@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { before, test } from "node:test";
 
-import type { V1Pod, V1Secret } from "@kubernetes/client-node";
+import type { V1Lease, V1Pod, V1Secret } from "@kubernetes/client-node";
 import { Effect, Layer, Scope } from "effect";
 
 import { added } from "./support/metrics.ts";
@@ -13,7 +13,7 @@ import { Binder } from "../src/binder/binder.ts";
 import { readLease } from "../src/binder/bindings.ts";
 import { BINDING_LABEL, KEY_ANNOTATION, keyHash } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
-import { makeFolders } from "../src/gateway/folders.ts";
+import { makeFolders, type MemoryPeaks, memoryRequestOf, SIZING, sizingLease } from "../src/gateway/folders.ts";
 import { RELEASES } from "../src/gateway/releases.ts";
 import { FOLDER_POOL, FOLDER_STOP_SECONDS, folderKey, folderTokenSecret } from "../src/gateway/names.ts";
 import { KubeApiError, KubeClient } from "../src/kube/client.ts";
@@ -51,16 +51,33 @@ async function bayma(): Promise<{ port: number; status: { execsRunning: number; 
 
 let namespaces = 0;
 
-/** The gateway's folder instances in a namespace of the test's own, their bayma the stand-in's, idle ones kept `releaseAfterMs`. */
-async function foldersOf(port: number, releaseAfterMs = 60_000, startMs = 10_000, pullMs = 3_000, { refusingSecretPatches = false, binderWaitMs = 10_000 } = {}) {
+/**
+ * The gateway's folder instances in a namespace of the test's own, their bayma the stand-in's, idle ones kept `releaseAfterMs`;
+ * of `template`, where given, and what the metrics server says each pod's bayma uses, `used`, where given: it answers nothing otherwise, as an API server alone does.
+ */
+async function foldersOf(
+  port: number,
+  releaseAfterMs = 60_000,
+  startMs = 10_000,
+  pullMs = 3_000,
+  { refusingSecretPatches = false, binderWaitMs = 10_000, template = TEMPLATE, used, sizingIntervalMs, metricsHang = false }: { refusingSecretPatches?: boolean; binderWaitMs?: number; template?: typeof TEMPLATE; used?: Map<string, string>; sizingIntervalMs?: number; metricsHang?: boolean } = {},
+) {
   const namespace = `folders-${(namespaces += 1)}`;
-  const kubeLayer = refusingSecretPatches
-    ? Layer.effect(KubeClient, Effect.map(KubeClient, (kube) => KubeClient.of({ ...kube, patch: (apiVersion, kind, ...rest) => (kind === "Secret" ? Effect.fail(new KubeApiError({ status: 500, cause: "refused" })) : kube.patch(apiVersion, kind, ...rest)) }))).pipe(Layer.provide(Layer.fresh(KubeClient.layer)))
-    : Layer.fresh(KubeClient.layer);
+  const kubeLayer = Layer.effect(KubeClient, Effect.map(KubeClient, (kube) =>
+    KubeClient.of({
+      ...kube,
+      patch: (apiVersion, kind, ...rest) => (refusingSecretPatches && kind === "Secret" ? Effect.fail(new KubeApiError({ status: 500, cause: "refused" })) : kube.patch(apiVersion, kind, ...rest)),
+      list: (apiVersion, kind, ...rest) =>
+        kind !== "PodMetrics" ? kube.list(apiVersion, kind, ...rest)
+        : metricsHang ? Effect.never
+        : used ? Effect.sync(() => [...used].map(([name, memory]) => ({ metadata: { name }, containers: [{ name: "bayma", usage: { memory } }] })))
+        : Effect.fail(new KubeApiError({ status: 404, cause: "the metrics server does not answer" })),
+    })
+  )).pipe(Layer.provide(Layer.fresh(KubeClient.layer)));
   await run(withKube((kube) => kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: namespace } })));
   return Effect.runPromise(Effect.provide(Effect.gen(function*() {
     const binder = yield* Binder;
-    const folders = yield* makeFolders({ namespace, template: TEMPLATE, stateRoot: "/home/operator/.alasio/bayma", releaseAfterMs, main: "main", podPort: port, bindingKey, idlePollMs: 50, startMs, pullMs }, binder);
+    const folders = yield* makeFolders({ namespace, template, stateRoot: "/home/operator/.alasio/bayma", releaseAfterMs, main: "main", podPort: port, bindingKey, idlePollMs: 50, startMs, pullMs, metricsTimeoutMs: 500, ...(sizingIntervalMs ? { sizingIntervalMs } : {}) }, binder);
     return { namespace, binder, folders };
   }).pipe(Scope.provide(Scope.makeUnsafe())), Layer.provideMerge(Binder.layer({ waitMs: binderWaitMs }), kubeLayer)));
 }
@@ -432,6 +449,144 @@ test("three binds of a folder instance failing in a row hold it, bound again onl
     assert.deepEqual(after.map(({ pod: name, failing, lastExecAt }) => ({ name, failing, lastExecAt })), [{ name: pod.metadata?.name, failing: null, lastExecAt: "2026-10-18T12:00:00.000Z" }]);
     await Effect.runPromise(Effect.provide(of.folders.live, Layer.fresh(KubeClient.layer)));
     assert.equal(of.folders.failing(), 0);
+  } finally {
+    stand.close();
+  }
+});
+
+test("a folder instance requests the 90th percentile of its folder's hours' memory peaks with a margin, older ones weighing less, within its template's request and limit", () => {
+  const hour = SIZING.intervalMs;
+  const MiB = 2 ** 20;
+  const now = 1000 * hour;
+  const request = (peaks: MemoryPeaks) => memoryRequestOf(peaks, now, hour, 512 * MiB, 8192 * MiB) / MiB;
+  // None: its template's.
+  assert.equal(request([]), 512);
+  // Ten hours of 1 GiB and one of 4: the 90th percentile is 1 GiB, with its margin, in whole MiB.
+  assert.equal(request([...Array.from({ length: 10 }, (_, n) => [now - n * hour, 1024 * MiB] as const), [now - hour, 4096 * MiB]]), Math.ceil(1024 * 1.15));
+  // One big session a week ago, beside a day of small ones: it weighs too little to set it.
+  assert.equal(request([[now - 7 * 24 * hour, 6144 * MiB], ...Array.from({ length: 3 }, (_, n) => [now - n * hour, 600 * MiB] as const)]), Math.ceil(600 * 1.15));
+  // The same a day ago: it does.
+  assert.equal(request([[now - 24 * hour, 6144 * MiB], ...Array.from({ length: 3 }, (_, n) => [now - n * hour, 600 * MiB] as const)]), Math.ceil(6144 * 1.15));
+  // Past its eight days: none.
+  assert.equal(request([[now - SIZING.intervals * hour, 6144 * MiB]]), 512);
+  // Never under its template's request, nor over its limit, which it is in bytes where it is no whole MiB.
+  assert.equal(request([[now, 100 * MiB]]), 512);
+  assert.equal(request([[now, 16384 * MiB]]), 8192);
+  assert.equal(memoryRequestOf([[now, 16384 * MiB]], now, hour, 512 * MiB, 2e9), 2e9);
+  // And in whole bytes, where the limit is of none, as 0.1Gi is.
+  assert.equal(memoryRequestOf([[now, 16384 * MiB]], now, hour, 16 * MiB, 0.1 * 2 ** 30), Math.floor(0.1 * 2 ** 30));
+});
+
+test("a folder instance's next pod requests what its folder's instances came to use, kept in a Lease of the folder's own, which no other folder's pod is sized by", async () => {
+  const stand = await bayma();
+  try {
+    const MiB = 2 ** 20;
+    const used = new Map<string, string>();
+    const template = { ...TEMPLATE, spec: { ...TEMPLATE.spec, containers: TEMPLATE.spec.containers.map((container) => ({ ...container, resources: { requests: { memory: "512Mi" }, limits: { memory: "8Gi" } } })) } };
+    const of = await foldersOf(stand.port, 60_000, 10_000, 3_000, { template, used, sizingIntervalMs: 100 });
+    const measure = () => Effect.runPromise(of.folders.measure);
+    const key = folderKey("claude", "telegram:sized");
+    const requested = (pod: V1Pod) => pod.spec?.containers.find(({ name }) => name === "bayma")?.resources?.requests?.["memory"];
+    const first = await bound(of, key);
+    assert.equal(requested(first), "512Mi");
+    // Its bayma holding 1.5 GiB over some thirty intervals, then more for a moment, as the metrics server says.
+    used.set(first.metadata?.name ?? "", `${1536 * 1024}Ki`);
+    for (let n = 0; n < 30; n += 1) {
+      if (n === 29) used.set(first.metadata?.name ?? "", "3Gi");
+      await measure();
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    }
+    const placement = await Effect.runPromise(of.folders.place(key, { environment: "main" }));
+    assert.equal(await Effect.runPromise(of.binder.release(placement.pool, key, placement.release)), "released");
+    const lease = (await run(withKube((kube) => kube.read("coordination.k8s.io/v1", "Lease", of.namespace, sizingLease(key))))) as V1Lease | null;
+    const peaks = JSON.parse(lease?.metadata?.annotations?.["alasio.dev/memory-peaks"] ?? "[]") as [number, number][];
+    assert.ok(peaks.length >= 4 && peaks.every(([, bytes]) => bytes === 1536 * MiB || bytes === 3 * 1024 * MiB), JSON.stringify(peaks));
+    // Its next instance: the 90th percentile, 1.5 GiB, with its margin; the moment's 3 GiB one interval of some thirty.
+    assert.equal(requested(await bound(of, key)), String(Math.ceil(1536 * 1.15) * MiB));
+    // Another conversation's instance: its template's.
+    assert.equal(requested(await bound(of, folderKey("claude", "telegram:other"))), "512Mi");
+  } finally {
+    stand.close();
+  }
+});
+
+test("a folder instance is made of its template's request where the metrics server does not answer", async () => {
+  const stand = await bayma();
+  try {
+    await unmeasured(stand.port, {});
+  } finally {
+    stand.close();
+  }
+});
+
+test("a folder instance is made of its template's request where the metrics server never answers, its look cut short", { timeout: 60_000 }, async () => {
+  const stand = await bayma();
+  try {
+    await unmeasured(stand.port, { metricsHang: true });
+  } finally {
+    stand.close();
+  }
+});
+
+/** A folder template's, its bayma requesting 512Mi, up to 2 GB, a limit of no whole MiB. */
+const SIZED = { ...TEMPLATE, spec: { ...TEMPLATE.spec, containers: TEMPLATE.spec.containers.map((container) => ({ ...container, resources: { requests: { memory: "512Mi" }, limits: { memory: "2G" } } })) } };
+const requestedOf = (pod: V1Pod) => pod.spec?.containers.find(({ name }) => name === "bayma")?.resources?.requests?.["memory"];
+/** Releases `key`, as its caller asks. */
+async function release(of: Awaited<ReturnType<typeof foldersOf>>, key: string) {
+  const placement = await Effect.runPromise(of.folders.place(key, { environment: "main" }));
+  assert.equal(await Effect.runPromise(of.binder.release(placement.pool, key, placement.release)), "released");
+}
+
+/** That an instance measured, as `options` have the metrics server answer, keeps nothing: its next pod of its template's request. */
+async function unmeasured(port: number, options: { readonly metricsHang?: boolean }) {
+  const of = await foldersOf(port, 60_000, 10_000, 3_000, { template: SIZED, sizingIntervalMs: 100, ...options });
+  const key = folderKey("claude", "telegram:unmeasured");
+  await bound(of, key);
+  await Effect.runPromise(of.folders.measure);
+  await release(of, key);
+  assert.equal(requestedOf(await bound(of, key)), "512Mi");
+}
+
+test("a folder instance measured over its limit of no whole MiB requests the limit, in bytes, as the API server takes it; and its folder's peaks are forgotten once all are past their days", async () => {
+  const stand = await bayma();
+  try {
+    const used = new Map<string, string>();
+    const of = await foldersOf(stand.port, 60_000, 10_000, 3_000, { template: SIZED, used, sizingIntervalMs: 100 });
+    const key = folderKey("claude", "telegram:capped");
+    used.set((await bound(of, key)).metadata?.name ?? "", "4Gi");
+    await Effect.runPromise(of.folders.measure);
+    await release(of, key);
+    assert.equal(requestedOf(await bound(of, key)), "2G");
+    // A folder's Lease whose peaks are all past their days: forgotten; one with a peak of these days: kept.
+    const sizingOf = (name: string) => run(withKube((kube) => kube.read("coordination.k8s.io/v1", "Lease", of.namespace, name)));
+    const old = folderKey("claude", "telegram:old");
+    await run(withKube((kube) =>
+      kube.create({ apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { name: sizingLease(old), namespace: of.namespace, labels: { "alasio.dev/folder-sizing": "true" }, annotations: { [KEY_ANNOTATION]: old, "alasio.dev/memory-peaks": JSON.stringify([[Date.now() - 200 * 100, 2 ** 30]]) } } })
+    ));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await Effect.runPromise(of.folders.measure);
+    assert.equal(await sizingOf(sizingLease(old)), null);
+    assert.notEqual(await sizingOf(sizingLease(key)), null);
+  } finally {
+    stand.close();
+  }
+});
+
+test("a folder instance being released is not measured, as its release keeps its peak, and none after would be", async () => {
+  const stand = await bayma();
+  try {
+    const used = new Map<string, string>();
+    const of = await foldersOf(stand.port, 60_000, 10_000, 3_000, { template: SIZED, used, sizingIntervalMs: 100 });
+    const key = folderKey("claude", "telegram:releasing");
+    used.set((await bound(of, key)).metadata?.name ?? "", "1Gi");
+    const pool = { name: FOLDER_POOL, namespace: of.namespace };
+    // Marked releasing, as a binder marks it as its release begins.
+    const lease = await run(readLease(pool, key));
+    await run(withKube((kube) => kube.patch("coordination.k8s.io/v1", "Lease", of.namespace, lease?.metadata?.name ?? "", { metadata: { annotations: { "alasio.dev/releasing": "another-binder" } } })));
+    await Effect.runPromise(of.folders.measure);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await Effect.runPromise(of.folders.measure);
+    assert.equal(await run(withKube((kube) => kube.read("coordination.k8s.io/v1", "Lease", of.namespace, sizingLease(key)))), null);
   } finally {
     stand.close();
   }

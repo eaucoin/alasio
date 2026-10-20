@@ -24,7 +24,7 @@
  */
 import { posix } from "node:path";
 
-import type { KubernetesObject, V1Container, V1PodSpec, V1PodTemplateSpec } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Container, V1PodSpec, V1PodTemplateSpec, V1ResourceRequirements } from "@kubernetes/client-node";
 
 import { SERVING_LABEL } from "../../../neon/control/endpoints.ts";
 import { BINDING_LABEL, FREE_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../../src/binder/names.ts";
@@ -54,6 +54,13 @@ const ANY_STRING = new Check((expression) => `type(${expression}) == string`);
 const matching = (pattern: string) => new Check((expression) => `type(${expression}) == string && ${expression}.matches(${JSON.stringify(`^(${pattern})$`)})`);
 /** What the CEL `value` is, of the object asked about. */
 const sameAs = (value: string) => new Check((expression) => `${expression} == ${value}`);
+/** A quantity, as the API server writes one, of the amount `value` is. */
+const quantityOf = (value: string) => new Check((expression) => `isQuantity(${expression}) && quantity(${expression}).compareTo(quantity(${JSON.stringify(value)})) == 0`);
+/** A quantity, as the API server writes one, of at least `least`'s amount, and at most `most`'s where given. */
+const quantityWithin = (least: string, most: string | undefined) =>
+  new Check((expression) =>
+    [`isQuantity(${expression})`, `quantity(${expression}).compareTo(quantity(${JSON.stringify(least)})) >= 0`, ...(most ? [`quantity(${expression}).compareTo(quantity(${JSON.stringify(most)})) <= 0`] : [])].join(" && ")
+  );
 /** Any of `alternatives`. */
 const oneOf = (...alternatives: Pinned[]) => new Check((expression, depth) => `(${alternatives.map((each) => pinned(expression, each, depth)).join(" || ")})`);
 /** Of a map's key: that it may be absent; where present, `value`. */
@@ -282,14 +289,20 @@ const POOL_POD_DEFAULTS = {
   probe: { timeoutSeconds: 1, successThreshold: 1, failureThreshold: 3 },
 } satisfies Record<string, Record<string, Pinned>>;
 
-/** `container` of a pool's template, as the API server stores it in a pod (POOL_POD_DEFAULTS). */
-function poolContainer(container: V1Container): Pinned {
+/**
+ * `container` of a pool's template, as the API server stores it in a pod (POOL_POD_DEFAULTS):
+ * its resources any, as VPA sizes a pool's pod as it is made, and resizes it after
+ * (pods/resize).
+ */
+const poolContainer = (container: V1Container): Pinned => templateContainer(container, ANY);
+
+/** `container` of a template, as the API server stores it in a pod (POOL_POD_DEFAULTS), its resources as `resources` says. */
+function templateContainer(container: V1Container, resources: Pinned): Pinned {
   const each = container as unknown as PinnedMap;
   const probe = each["readinessProbe"] as PinnedMap | undefined;
   return defaulted({
     ...each,
-    // Its resources are VPA's, as it sizes the pod as it is made, and resizes it after (pods/resize).
-    resources: ANY,
+    resources,
     ...(container.ports ? { ports: container.ports.map((port) => defaulted(port as unknown as PinnedMap, { protocol: "TCP" })) } : {}),
     ...(container.env
       ? {
@@ -486,6 +499,21 @@ function folderPodPinned(spec: V1PodSpec): Pinned {
   return defaulted(map, defaults);
 }
 
+/**
+ * A folder instance's container's `resources`, its template's: its limits theirs, its CPU
+ * request its, and its memory request, where it has one, the gateway's, as it sizes each pod
+ * of its folder's instances' use (src/gateway/folders.ts SIZING), between its template's and
+ * its limit.
+ */
+function folderResources(resources: V1ResourceRequirements | undefined): Pinned {
+  const quantities = (of: Readonly<Record<string, string>> | undefined) => Object.fromEntries(Object.entries(of ?? {}).map(([name, value]) => [name, quantityOf(value)]));
+  const memory = resources?.requests?.["memory"];
+  return {
+    ...(resources?.limits ? { limits: quantities(resources.limits) } : {}),
+    ...(resources?.requests ? { requests: { ...quantities(resources.requests), ...(memory ? { memory: quantityWithin(memory, resources.limits?.["memory"]) } : {}) } } : {}),
+  };
+}
+
 /** folderPodPinned's map and the defaults it is pinned with. */
 export function folderPodParts(spec: V1PodSpec): { readonly map: PinnedMap; readonly defaults: Readonly<Record<string, Pinned>> } {
   const tolerations = (spec.tolerations ?? []) as unknown as Pinned[];
@@ -495,7 +523,7 @@ export function folderPodParts(spec: V1PodSpec): { readonly map: PinnedMap; read
   return {
     map: {
       ...(spec as unknown as PinnedMap),
-      containers: spec.containers.map(poolContainer),
+      containers: spec.containers.map((container) => templateContainer(container, folderResources(container.resources))),
       ...(spec.volumes ? { volumes } : {}),
       tolerations: oneOf([...tolerations, ...DEFAULT_TOLERATIONS], [...tolerations, ...[...DEFAULT_TOLERATIONS].reverse()]),
     },
@@ -527,7 +555,9 @@ function standingFor(value: Pinned, stands: Readonly<Record<string, Check>>): Pi
  * - A pod made is made by `maker`, the gateway, alone, and is the template's, as the API server
  *   stores it (poolPodSpec), with what folderPodSpec adds, alone: its token's Secret, named for
  *   it, and its state directory under `stateRoot`, of a harness's and a conversation's names;
- *   bound from the first, to a folder instance's key, its node kept; and named as one.
+ *   its bayma's memory request the gateway's, between its template's and its limit
+ *   (folderResources); bound from the first, to a folder instance's key, its node kept; and
+ *   named as one.
  * - A pod changed keeps its spec, its labels, and its owners, and of its annotations changes
  *   those that keep its node alone.
  * - No pod gets an ephemeral container.

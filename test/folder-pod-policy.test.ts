@@ -116,6 +116,11 @@ before(async () => {
 test("a folder instance's pod, as the gateway makes it of the folder template, is made by the gateway, and by no one else", async () => {
   const pod = await madeAs(GATEWAY_USER, folderPod());
   assert.ok("name" in pod, JSON.stringify(pod));
+  // Its bayma's memory request the gateway's, as its folder's instances came to use, as many bytes as it says, up to its limit.
+  for (const memory of ["1853882368", "8Gi"]) {
+    const sized = await madeAs(GATEWAY_USER, folderPod("telegram:sized", (made) => void (made.spec.containers[0]!.resources!.requests!["memory"] = memory)));
+    assert.ok("name" in sized, `${memory}: ${JSON.stringify(sized)}`);
+  }
   assert.ok(refusedByPolicy(await madeAs("system:serviceaccount:alasio:alasio", folderPod())));
 });
 
@@ -137,6 +142,13 @@ test("a folder instance's pod with any field the template pins changed, or widen
     "started again": (pod) => void (pod.spec.restartPolicy = "Always"),
     "a runtime class": (pod) => void (pod.spec.runtimeClassName = "gvisor"),
     "an init container": (pod) => void (pod.spec.initContainers = [{ name: "first", image: "busybox" }]),
+    "a memory request under its template's": (pod) => void (bayma(pod).resources!.requests!["memory"] = "256Mi"),
+    // Past its limit, it is the API server that refuses it.
+    "a limit more, and a request past the template's": (pod) => {
+      bayma(pod).resources!.limits!["memory"] = "16Gi";
+      bayma(pod).resources!.requests!["memory"] = "9Gi";
+    },
+    "a CPU request more": (pod) => void (bayma(pod).resources!.requests!["cpu"] = "4"),
     "bound to nothing": (pod) => void delete (pod.metadata["labels"] as Record<string, string>)["alasio.dev/binding"],
     "of no folder's key": (pod) => void ((pod.metadata["annotations"] as Record<string, string>)["alasio.dev/binding-key"] = "sessionfs:fs-abc123"),
     "named as no folder instance": (pod) => void (pod.metadata["name"] = "bayma-elsewhere"),

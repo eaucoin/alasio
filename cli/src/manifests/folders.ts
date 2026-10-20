@@ -117,8 +117,9 @@ export function folderTemplate(config: InstallConfig): V1PodTemplateSpec {
 
 /**
  * The gateway's identity in the folder namespace: it makes and deletes the folder instances'
- * pods, reads their status, and holds their bindings' Leases there; and makes the Secret of
- * each one's token, which the pod then owns. A bound one no drain evicts.
+ * pods, reads their status and what the metrics server says they use, and holds their
+ * bindings' Leases there, and its folders' records beside them; and makes the Secret of each
+ * one's token, which the pod then owns. A bound one no drain evicts.
  */
 export function folderObjects(config: InstallConfig): KubernetesObject[] {
   if (!foldersRun(config)) return [];
@@ -128,6 +129,8 @@ export function folderObjects(config: InstallConfig): KubernetesObject[] {
       { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch", "create", "update", "delete"] },
       { apiGroups: [""], resources: ["secrets"], verbs: ["create", "patch", "delete"] },
       { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] },
+      // What each instance's bayma uses, which its folder's next instance requests (src/gateway/folders.ts SIZING).
+      { apiGroups: ["metrics.k8s.io"], resources: ["pods"], verbs: ["list"] },
     ]),
     // The receiver, which takes the telemetry of folder instances' bindings, watching their Leases.
     ...accountRole(RECEIVER, "receiver", config.host.namespace, [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]),

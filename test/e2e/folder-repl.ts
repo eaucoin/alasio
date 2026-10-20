@@ -10,6 +10,8 @@
  * - `read <url> <token> <python> <bun>`: takes both over, as a client that reconnected does,
  *   and prints what each holds, the count and whether the thread counts on, and what bayma told
  *   each exec of how its session came back.
+ * - `hold <url> <token> <mib>`: a Python session holding `mib` MiB, each page of it written;
+ *   lets go of its control, and prints its id.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -32,8 +34,8 @@ export interface FolderReplsRead {
 }
 
 const [verb, url, token, ...rest] = process.argv.slice(2);
-if (!url || !token || !((verb === "set" && rest.length === 1) || (verb === "read" && rest.length === 2))) {
-  throw new Error("usage: folder-repl.ts set <url> <token> <value> | read <url> <token> <python> <bun>");
+if (!url || !token || !(((verb === "set" || verb === "hold") && rest.length === 1) || (verb === "read" && rest.length === 2))) {
+  throw new Error("usage: folder-repl.ts set <url> <token> <value> | read <url> <token> <python> <bun> | hold <url> <token> <mib>");
 }
 
 /** The text of a part of a tool's answer, where bayma gives its JSON. */
@@ -93,6 +95,11 @@ try {
     for (const session of [python, bun]) await call(client, "session.release_controller", { session_id: session.session_id });
     const set: FolderReplsSet = { python: python.session_id, bun: bun.session_id, count: Number(counted.stdout.trim()) };
     console.log(JSON.stringify(set));
+  } else if (verb === "hold") {
+    const { session } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "python", title: "e2e", cwd: "/tmp" });
+    await exec(client, session.session_id, `held = bytearray(${Number(rest[0])} << 20)\nfor at in range(0, len(held), 4096): held[at] = 1\nprint("held")`);
+    await call(client, "session.release_controller", { session_id: session.session_id });
+    console.log(JSON.stringify(session.session_id));
   } else {
     const [python = "", bun = ""] = rest;
     for (const session of [python, bun]) await call(client, "session.acquire_controller", { session_id: session });
