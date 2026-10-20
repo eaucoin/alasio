@@ -880,16 +880,37 @@ if (inShard("sessions")) {
       const node = session.spec?.nodeName ?? "";
       const limits = await onNode(node, `for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = stargz-fuse-man ] && tr '\\0' '\\n' <"$p/environ" | grep '^GOMEMLIMIT='; done; true`);
       assert.match(limits, /^GOMEMLIMIT=128MiB$/mu);
-      // The agent's image was on no node before the gateway's pools first ran a pod there, which
-      // the session's may not be, its pool's pods made ahead: kubelet says how long each pull took.
-      const events = await kube.list<CoreV1Event>("Event", { namespace: SESSIONS, fieldSelector: "reason=Pulled" });
-      const pulls = events.flatMap(({ message }) => /^Successfully pulled image "[^"]*alasio-agent[^"]*" in (\S+) /u.exec(message ?? "")?.[1] ?? []);
-      assert.ok(pulls.length > 0, `kubelet said nothing of pulling the agent's image: ${events.map(({ message }) => message).join("; ")}`);
-      console.error(`# the agent's image, on no node before, pulled lazily in ${pulls.map(goSeconds).join(", ")} s`);
-      // Whole, it took 44 to 58 s on a runner; lazily, 2 to 4 s, alone. Its pools' pods pull it as
-      // alasio comes up, beside every other image of alasio's, which some pulls wait behind.
-      const fastest = Math.min(...pulls.map(goSeconds));
-      assert.ok(fastest < 30, `the agent's image took ${pulls.join(", ")} to pull`);
+      // The release before's agent image, on no node yet, pulled alone, once alasio is up: its
+      // pools' pods pulled this release's as alasio came up, beside every other image of
+      // alasio's, which some pulls waited behind, 12 to 36 s. kubelet says how long it took,
+      // lazily, its pod on remote snapshots, but for the layers this release's shares with it
+      // where they did not change. Whole, an agent's image took 44 to 58 s on a runner, alone.
+      const image = `ghcr.io/eaucoin/alasio-agent:${PREVIOUS ?? assert.fail("the run names no release before")}`;
+      const PULLING = "alasio-e2e-pull";
+      await kube.apply({ apiVersion: "v1", kind: "Namespace", metadata: { name: PULLING, labels: { "pod-security.kubernetes.io/enforce": "restricted" } } });
+      try {
+        const pod: V1Pod = {
+          apiVersion: "v1",
+          kind: "Pod",
+          metadata: { name: "agent", namespace: PULLING },
+          spec: {
+            nodeName: node,
+            securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: { type: "RuntimeDefault" } },
+            containers: [{ name: "agent", image, command: ["sleep", "infinity"], securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] }, readOnlyRootFilesystem: true } }],
+          },
+        };
+        await kube.apply(pod);
+        const pulled = await until("the agent's image pulled alone", async () => {
+          const events = await kube.list<CoreV1Event>("Event", { namespace: PULLING, fieldSelector: "reason=Pulled,involvedObject.name=agent" });
+          return events.flatMap(({ message }) => /^Successfully pulled image "[^"]*" in (\S+) /u.exec(message ?? "")?.[1] ?? [])[0];
+        }, 300_000);
+        await until("the agent's image's pod running", async () => ((await kube.get<V1Pod>(ref("Pod", "agent", PULLING)))?.status?.containerStatuses?.[0]?.state?.running ? true : undefined), 300_000);
+        console.error(`# ${image}, on no node before, pulled lazily alone in ${goSeconds(pulled)} s`);
+        assert.ok(await onRemoteSnapshot(PULLING, "agent"), `${image} runs on no remote snapshot`);
+        assert.ok(goSeconds(pulled) < 30, `${image} took ${pulled} to pull alone`);
+      } finally {
+        await kube.remove(ref("Namespace", PULLING)).catch(() => {});
+      }
     });
 
     test("pins the pods' sandbox image, k3s's own, by the name containerd's CRI pulls it by, so neither a prune of the node's images nor kubelet's collection deletes it", async () => {
