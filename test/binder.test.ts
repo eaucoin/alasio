@@ -290,6 +290,21 @@ test("reconciling a pool deletes a bound pod no Lease names and lets go a Lease 
   assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [whole.pod]);
 });
 
+test("a release of a key's binding of one pod releases none the key was bound to anew since, of another pod", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  const layer = binderOf();
+  const first = await bindIn(layer, (each) => each.bind(of, "sessionfs:workspace"));
+  await run(binder(), withKube((client) => client.remove("v1", "Pod", of.namespace, first.pod)));
+  const again = await bindIn(layer, (each) => each.bind(of, "sessionfs:workspace"));
+  let before = 0;
+  assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace", () => Effect.sync(() => void (before += 1)), first.pod)), "unbound");
+  assert.equal(before, 0);
+  assert.equal((await run(binder(), readLease(of, "sessionfs:workspace")))?.spec?.holderIdentity, again.pod);
+  assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [again.pod]);
+  assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace", () => Effect.void, again.pod)), "released");
+});
+
 test("a release runs what comes before it, its Lease renewed, then deletes the pod and its Lease; a bind meanwhile waits for it, and binds anew after", async () => {
   const of = await pool();
   await freePods(of, 2);
