@@ -712,3 +712,31 @@ test("a request on a route of a binding gone that reached its pod before its con
     old.close();
   }
 });
+
+test("a request that binds nothing, of a key another replica bound anew within the stamp's interval, stamps the new binding, whose stamps are its own", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  const stand = await pods();
+  const served = await front(of, stand.port);
+  const elsewhere = Layer.provideMerge(Binder.layer({ waitMs: 5_000 }), Layer.fresh(KubeClient.layer));
+  try {
+    const key = "sessionfs:rebound";
+    // Bound and stamped by this front.
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" })).status, 200);
+    const first = await run(readLease(of, key));
+    assert.ok(first && activeAt(first) !== null);
+    // Released and bound anew by another replica, which stamps nothing of it, within this one's stamp's interval.
+    await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (binder) => Effect.andThen(binder.release(of, key), binder.bind(of, key))), elsewhere));
+    const rebound = await run(readLease(of, key));
+    assert.ok(rebound && rebound.metadata?.uid !== first.metadata?.uid, "bound anew");
+    assert.equal(activeAt(rebound), null);
+    const passed = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key), [NO_BIND_HEADER]: "never" }, body: "{}" });
+    assert.equal(passed.status, 200);
+    const stamped = await run(readLease(of, key));
+    assert.equal(stamped?.metadata?.uid, rebound.metadata?.uid);
+    assert.ok(stamped && activeAt(stamped) !== null, "the new binding's first request stamped");
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
