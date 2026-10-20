@@ -398,24 +398,28 @@ export function sandboxService(): void {
       const token = await mainToken(workspace);
       const inSandbox = async (script: string) => kube.execOk(SESSIONS, (await boundPod(workspace)).name, ["sh", "-c", script], { container: "bayma" });
       await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
-      // A received file, as alasio writes one into the workspace before the turn that names it.
-      const received = await gatewayCall(token, "PUT", "/workspace/files?path=workspace/received/note.txt", "a file received on Telegram\n");
+      // A received file, as alasio writes one into the workspace before the turn that names it:
+      // asked again while the gateway answers 503, as the node's mount does not hold the
+      // workspace's new quota yet (src/sandbox/gateway-client.ts writeFile).
+      const received = await until("the gateway writing the received file", async () => {
+        const answer = await gatewayCall(token, "PUT", "/workspace/files?path=workspace/received/note.txt", "a file received on Telegram\n");
+        if (answer.status !== 503) return answer;
+        assert.equal(answer.retryAfter, "2", `a write refused for a moment says when to ask again: ${answer.said}`);
+        return undefined;
+      }, 60_000);
       assert.equal(received.status, 204, received.said);
       // Claimed: a pool's pod bound to it, the file in its sandbox.
       await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
       const claimed = await boundPod(workspace);
       const claimedGvisor = (await kube.get<V1Pod>(ref("Pod", claimed.name, SESSIONS)))?.spec?.runtimeClassName !== undefined;
       assert.equal(await inSandbox("cat /workspace/received/note.txt"), "a file received on Telegram\n");
-      // Held to its quota, the pool's sessions' size, 1Gi in the run, once the node's mount has read it, as JuiceFS's client reads its quotas anew every few seconds.
-      const fill = () =>
-        inSandbox([
-          "cd /workspace",
-          'fallocate -l 900M quota-a && echo "took 900M"',
-          'fallocate -l 300M quota-b 2>&1 && echo "took 300M more"',
-          "rm -f quota-a quota-b",
-        ].join("; "));
-      let quota = await fill();
-      for (const deadline = Date.now() + 60_000; !/quota exceeded/iu.test(quota) && Date.now() < deadline; quota = await fill()) await new Promise((resolve) => setTimeout(resolve, 5_000));
+      // Held to its quota, the pool's sessions' size, 1Gi in the run, from its first write: its node's mount held the quota before it was attached.
+      const quota = await inSandbox([
+        "cd /workspace",
+        'fallocate -l 900M quota-a && echo "took 900M"',
+        'fallocate -l 300M quota-b 2>&1 && echo "took 300M more"',
+        "rm -f quota-a quota-b",
+      ].join("; "));
       assert.match(quota, /^took 900M$/mu);
       assert.match(quota, /quota exceeded/iu);
       assert.doesNotMatch(quota, /took 300M more/u);

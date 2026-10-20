@@ -28,6 +28,14 @@
  * mount of it is not there, as for the moment its mount's pod hands it over, the agent
  * refuses (503), rather than write into the directory beneath it.
  *
+ * And each is attached, or written into, only once the node's mount holds its quota: JuiceFS's
+ * client counts what is written under a directory against the directory's quota only from when
+ * it has loaded the quota, as it does every heartbeat, and takes off what is deleted after, so
+ * what a workspace's sandbox wrote and deleted before would leave its quota counting less than
+ * it holds, short by as much, until the daily quota check repairs it. An attach waits for it,
+ * up to QUOTA_HELD_WITHIN_MS; a write, which its file's own bytes may take a while to, does
+ * not: where the mount does not hold it, the agent refuses (503), to be asked again.
+ *
  * A workspace is made as its session is (create): its directory, with its files' `workspace/`
  * and `home/`, its agent's, and its quota set on the directory (./juicefs.ts), at once; made
  * again, it is as it was, its quota set anew. Its quota is read back as it is asked for. One
@@ -54,11 +62,11 @@
  */
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, type StatsFs } from "node:fs";
 import { chown, lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, statfs, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { Effect, Schema } from "effect";
+import { Effect, Schedule, Schema } from "effect";
 
 import { isValidVolumeId } from "../sandbox/names.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
@@ -211,6 +219,10 @@ export interface WorkspacesOptions {
   readonly agentUid?: number;
   /** How long a fork's quota is left to settle after each repair before it is checked (QUOTA_SETTLE_MS), but for tests. */
   readonly quotaSettleMs?: number;
+  /** Whether the node's mount holds the quota of a directory under its root: as holdsQuota says of statfs, but for tests. */
+  readonly holds?: (directory: string, root: string) => Promise<boolean>;
+  /** How long an attach waits for a workspace's quota to be held by the node's mount (QUOTA_HELD_WITHIN_MS), but for tests. */
+  readonly quotaHeldWithinMs?: number;
   /** The agent's own mount namespace's mounts (OwnMounts), but for tests. */
   readonly own?: OwnMounts;
 }
@@ -224,6 +236,15 @@ export interface WorkspacesOptions {
  */
 const QUOTA_SETTLE_MS = 2_000;
 const QUOTA_REPAIRS = 5;
+
+/**
+ * How long an attach waits for a workspace's quota to be held by the node's mount once it is
+ * set: two of JuiceFS's heartbeats, at which its client loads quotas anew (12 s each, and as
+ * much as a twentieth more, pkg/meta base.go refresh, pkg/utils JitterIt), under the 30 s the
+ * gateway gives an attach. And how often the mount is looked at meanwhile.
+ */
+const QUOTA_HELD_WITHIN_MS = 2 * 12_000 * 1.05;
+const QUOTA_LOOK_MS = 500;
 
 /** The agent's workspaces, as the module says. */
 /** What an attach writes into a pod's directory, beside its workspace's mount point (`ws`), and what its bayma marks there (`served`). */
@@ -273,6 +294,15 @@ async function removeAttached(directory: string): Promise<string[]> {
 /** Linux's magic number of FUSE's file systems (statfs(2)), JuiceFS's mount's. */
 const FUSE_SUPER_MAGIC = 0x65735546;
 
+/**
+ * Whether the mount at `root` holds the quota of `directory`, under it, as `read` (statfs) says:
+ * JuiceFS's client answers a statfs of a directory under a quota it has loaded with the quota,
+ * its size what the quota allows (pkg/meta base.go StatFS), and with its file system's
+ * otherwise, as of the root. Neither read, it does not.
+ */
+export const holdsQuota = (read: (path: string) => Promise<StatsFs> = statfs) => (directory: string, root: string): Promise<boolean> =>
+  Promise.all([read(directory), read(root)]).then(([under, whole]) => under.blocks * under.bsize !== whole.blocks * whole.bsize, () => false);
+
 /** Whether `root` is FUSE's, as its file system says. */
 const fuseAt = (root: string): Promise<boolean> => statfs(root).then(({ type }) => type === FUSE_SUPER_MAGIC, () => false);
 
@@ -303,7 +333,7 @@ export const lookOnNode = (host: HostCommands) => (point: string): Promise<void>
   });
 
 export function makeWorkspaces(
-  { host, runsc, juicefs, mounted = fuseAt, reaches = reaching(lookOnNode(host)), workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID, quotaSettleMs = QUOTA_SETTLE_MS, own = OWN_MOUNTS }: WorkspacesOptions,
+  { host, runsc, juicefs, mounted = fuseAt, reaches = reaching(lookOnNode(host)), workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID, quotaSettleMs = QUOTA_SETTLE_MS, holds = holdsQuota(), quotaHeldWithinMs = QUOTA_HELD_WITHIN_MS, own = OWN_MOUNTS }: WorkspacesOptions,
 ): Workspaces {
   /** Where `ref`'s files are on the node, its names checked. */
   const filesOf = ({ environment, workspace }: WorkspaceRef): Effect.Effect<string, WorkspaceRefused> =>
@@ -350,6 +380,22 @@ export function makeWorkspaces(
       Effect.filterOrFail((is) => is, () => refused(503, `${what}: workspace storage is not mounted at ${workspacesRoot} on this node now`)),
       Effect.asVoid,
     );
+  /**
+   * `ref`'s quota held by the node's mount, as the module says, `ref`'s files at `files`,
+   * waited for up to `withinMs`; refused, saying `what` cannot be done, where it is not. Of a
+   * workspace not there, nothing is looked at: what is done of it says it is not.
+   */
+  const quotaHeld = (ref: WorkspaceRef, files: string, what: string, withinMs: number) =>
+    Effect.gen(function*() {
+      const directory = join(files, "..");
+      if (!(yield* there(directory))) return;
+      const looked = Effect.promise(() => holds(directory, workspacesRoot));
+      const held = withinMs === 0 ? yield* looked : yield* looked.pipe(
+        Effect.repeat({ schedule: Schedule.spaced(QUOTA_LOOK_MS), until: (is) => is }),
+        Effect.timeoutOrElse({ duration: withinMs, orElse: () => Effect.succeed(false) }),
+      );
+      if (!held) return yield* refused(503, `${what}: the node's mount of workspace storage does not hold ${ref.environment}/${ref.workspace}'s quota yet`);
+    });
   /** `work` done on the node's mount, there, a failure of it refused as workspace storage's not answering. */
   const onMount = <A>(what: string, work: () => Promise<A>) =>
     storage(what).pipe(Effect.andThen(Effect.tryPromise({ try: work, catch: (error) => refused(503, `${what}: ${error instanceof Error ? error.message : String(error)}`) })));
@@ -444,6 +490,7 @@ export function makeWorkspaces(
         yield* storage(`${ref.environment}/${ref.workspace} could not be attached`);
         const found = yield* host.run(["test", "-d", files]);
         if (found.exitCode !== 0) return yield* refused(404, `there is no workspace ${ref.environment}/${ref.workspace}`);
+        yield* quotaHeld(ref, files, `${ref.environment}/${ref.workspace} could not be attached`, quotaHeldWithinMs);
         const ws = join(directory, "ws");
         yield* Effect.promise(async () => {
           await mkdir(ws);
@@ -492,6 +539,7 @@ export function makeWorkspaces(
         const names = namesOf(path);
         if (!names) return yield* refused(400, `${path} is not a path of a workspace's files`);
         const root = yield* filesOf(ref);
+        yield* quotaHeld(ref, root, `${path} could not be written`, 0);
         yield* confined(path, () => writeUnder({ root, names }, bytes, { uid: agentUid, gid: agentUid }));
       }),
 

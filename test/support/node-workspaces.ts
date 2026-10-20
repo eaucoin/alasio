@@ -1,11 +1,12 @@
 /**
  * A node agent's workspaces on directories of a test's own, the node's mount table a
  * stand-in's: what its commands mount and unmount, in order; which of its sandboxes'
- * containers run; and its pods' directories, as kubelet makes them.
+ * containers run; its pods' directories, as kubelet makes them; and the workspaces whose quota
+ * the node's mount does not hold yet, for as long as `quotaHeldWithinMs` is waited for one.
  */
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { Effect } from "effect";
 
@@ -14,7 +15,7 @@ import { makeJuicefs } from "../../src/node-agent/juicefs.ts";
 import { RunscError } from "../../src/node-agent/runsc.ts";
 import { makeWorkspaces } from "../../src/node-agent/workspaces.ts";
 
-export function workspacesNode() {
+export function workspacesNode({ quotaHeldWithinMs = 1_000 }: { readonly quotaHeldWithinMs?: number } = {}) {
   const root = mkdtempSync(join(tmpdir(), "alasio-workspaces-"));
   const workspacesRoot = join(root, "workspaces");
   const attachRoot = join(root, "attach");
@@ -70,10 +71,18 @@ export function workspacesNode() {
   const storage = { mounted: true };
   // The pods whose attached workspace is unreachable, `<namespace>/<pod>` each, as a test says.
   const unreachable = new Set<string>();
+  // The workspaces whose quota the node's mount does not hold, by name, as a test says; and each look at one, `<directory> <root>`.
+  const unheld = new Set<string>();
+  const looks: string[] = [];
   const workspaces = makeWorkspaces({
     host,
     mounted: () => Promise.resolve(storage.mounted),
     reaches: (point) => Promise.resolve(![...unreachable].some((pod) => point === join(attachRoot, pod, "ws"))),
+    holds: (directory, at) => {
+      looks.push(`${directory} ${at}`);
+      return Promise.resolve(!unheld.has(basename(directory)));
+    },
+    quotaHeldWithinMs,
     juicefs: makeJuicefs({ metaUrl: "redis://:the%20password@valkey.alasio.svc:6379/1", juicefs }),
     runsc: {
       container: (id) =>
@@ -105,6 +114,6 @@ export function workspacesNode() {
   const pod = (name: string, namespace = "main") => mkdirSync(join(attachRoot, namespace, name), { recursive: true });
   /** What JuiceFS's command was run with, a call a line. */
   const juicefsCalls = () => (existsSync(join(root, "juicefs.log")) ? readFileSync(join(root, "juicefs.log"), "utf8").trim().split("\n") : []);
-  return { root, workspacesRoot, attachRoot, mounts, stuck, ran, tokenAtMount, running, annotations, execs, hooks, storage, unreachable, workspaces, files, pod, juicefsCalls, inconsistentChecks, ownMounts, done: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, workspacesRoot, attachRoot, mounts, stuck, ran, tokenAtMount, running, annotations, execs, hooks, storage, unreachable, unheld, looks, workspaces, files, pod, juicefsCalls, inconsistentChecks, ownMounts, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 

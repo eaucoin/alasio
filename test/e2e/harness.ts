@@ -515,19 +515,19 @@ export async function mainKeyToken(key: string): Promise<string> {
   return mintToken(environmentKey(Buffer.from(callerKey), "main"), { key, expires: Date.now() + 600_000, options: { environment: "main" } });
 }
 
-/** What the gateway answers `method path` with, asked as alasio asks it, from its pod, with `token`, `body` sent as it is: its status, and what it said. */
-export async function gatewayCall(token: string, method: string, path: string, body?: string, { bind = true } = {}): Promise<{ readonly status: number; readonly said: string }> {
+/** What the gateway answers `method path` with, asked as alasio asks it, from its pod, with `token`, `body` sent as it is: its status, what it said, and when it asked to be asked again (its Retry-After), if it did. */
+export async function gatewayCall(token: string, method: string, path: string, body?: string, { bind = true } = {}): Promise<{ readonly status: number; readonly said: string; readonly retryAfter: string }> {
   const alasioPod = await kube.runningPod(NAMESPACE, RELEASE);
   const printed = await kube.execOk(NAMESPACE, alasioPod, [
     "sh",
     "-c",
-    `curl -sS -w '\n%{http_code}' -X ${method} -H "authorization: Bearer $1"${bind ? "" : ` -H '${NO_BIND_HEADER}: never'`}${body === undefined ? "" : " --data-binary @-"} "http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}$2"`,
+    `curl -sS -w '\n%header{retry-after}\n%{http_code}' -X ${method} -H "authorization: Bearer $1"${bind ? "" : ` -H '${NO_BIND_HEADER}: never'`}${body === undefined ? "" : " --data-binary @-"} "http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}$2"`,
     "sh",
     token,
     path,
   ], { container: "alasio", ...(body === undefined ? {} : { stdin: body }) });
   const lines = printed.split("\n");
-  return { status: Number(lines.at(-1)), said: lines.slice(0, -1).join("\n") };
+  return { status: Number(lines.at(-1)), said: lines.slice(0, -2).join("\n"), retryAfter: lines.at(-2) ?? "" };
 }
 
 /** The pod of `namespace`'s sessions, main's unless said, bound to `workspace`, not one being deleted: its name and node; null where none is. */

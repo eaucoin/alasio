@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, type StatsFs, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 
 import { Effect } from "effect";
 
-import { lookOnNode, mountPoints, reaching, WorkspaceRefused } from "../src/node-agent/workspaces.ts";
+import { holdsQuota, lookOnNode, mountPoints, reaching, WorkspaceRefused } from "../src/node-agent/workspaces.ts";
 import { workspacesNode } from "./support/node-workspaces.ts";
 
 const refusal = <A>(effect: Effect.Effect<A, unknown>) => Effect.runPromise(Effect.flip(effect)).then((error) => (error instanceof WorkspaceRefused ? error.status : error));
@@ -145,6 +145,63 @@ test("an attach of a workspace there is not, or by names that are none, is refus
       assert.equal(await refusal(at.workspaces.attach({ environment, workspace }, pod, "t", {})), 400, `${environment}/${workspace} into ${pod}`);
     }
     assert.deepEqual(at.mounts, []);
+  } finally {
+    at.done();
+  }
+});
+
+test("a mount holds a directory's quota where a statfs of the directory says another size than of its root, as JuiceFS's client answers once it has loaded the quota", async () => {
+  const sized = (sizes: Readonly<Record<string, number>>) => (path: string) =>
+    sizes[path] === undefined ? Promise.reject(Object.assign(new Error(`${path}: no such file`), { code: "ENOENT" })) : Promise.resolve({ blocks: sizes[path], bsize: 4096 } as StatsFs);
+  // Loaded: the directory's size is its quota's, 1 GiB, the root's its file system's, 1 PiB.
+  assert.equal(await holdsQuota(sized({ "/w/main/fs-a": 262_144, "/w": 2 ** 38 }))("/w/main/fs-a", "/w"), true);
+  // Not yet: the directory's is the root's.
+  assert.equal(await holdsQuota(sized({ "/w/main/fs-a": 2 ** 38, "/w": 2 ** 38 }))("/w/main/fs-a", "/w"), false);
+  // Neither read: not held.
+  assert.equal(await holdsQuota(sized({ "/w": 2 ** 38 }))("/w/main/fs-a", "/w"), false);
+});
+
+test("a workspace is attached only once the node's mount holds its quota, waited for, and refused where it does not in time, nothing mounted", async () => {
+  const at = workspacesNode({ quotaHeldWithinMs: 1_200 });
+  try {
+    const files = at.files("fs-abc123");
+    at.files("fs-def456");
+    at.pod("pool-0");
+    at.pod("pool-1");
+    at.unheld.add("fs-abc123");
+    assert.equal(await refusal(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-0", "t", {})), 503);
+    assert.deepEqual(at.mounts, []);
+    assert.equal(existsSync(join(at.attachRoot, "main", "pool-0", "token")), false);
+    // The mount's own look, at the workspace's directory, which the quota is set on, beside the root.
+    assert.equal(at.looks[0], `${join(files, "..")} ${at.workspacesRoot}`);
+    // Held a moment after the attach began: attached then.
+    at.unheld.add("fs-def456");
+    setTimeout(() => at.unheld.delete("fs-def456"), 150);
+    await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-def456" }, "pool-1", "t", {}));
+    assert.deepEqual(at.mounts, [join(at.attachRoot, "main", "pool-1", "ws")]);
+  } finally {
+    at.done();
+  }
+});
+
+test("a file is written into a workspace only once the node's mount holds its quota, and refused at once where it does not, nothing written, to be asked again", async () => {
+  const at = workspacesNode({ quotaHeldWithinMs: 1_200 });
+  try {
+    const files = at.files("fs-abc123");
+    const ref = { environment: "main", workspace: "fs-abc123" };
+    at.unheld.add("fs-abc123");
+    const asked = Date.now();
+    assert.equal(await refusal(at.workspaces.write(ref, "home/.alasio/received/1/photo.jpg", Buffer.from("jpg"))), 503);
+    assert.ok(Date.now() - asked < 1_200);
+    assert.equal(existsSync(join(files, "home", ".alasio")), false);
+    at.unheld.delete("fs-abc123");
+    await Effect.runPromise(at.workspaces.write(ref, "home/.alasio/received/1/photo.jpg", Buffer.from("jpg")));
+    assert.equal(readFileSync(join(files, "home", ".alasio", "received", "1", "photo.jpg"), "utf8"), "jpg");
+    // Into one not there, nothing waited for: refused as one not there is.
+    at.unheld.add("fs-missing");
+    const started = Date.now();
+    assert.equal(await refusal(at.workspaces.write({ environment: "main", workspace: "fs-missing" }, "home/note", Buffer.from("x"))), 403);
+    assert.ok(Date.now() - started < 1_200);
   } finally {
     at.done();
   }

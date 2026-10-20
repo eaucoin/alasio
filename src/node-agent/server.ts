@@ -4,8 +4,8 @@
  * without it is answered 401. It speaks JSON; a refusal or a failure is
  * `{ "error": "<why>" }` with its status, 400 for a request that is not one, 404 for a
  * route there is not. A 503 says, by its Retry-After, when to ask again (RETRY_AFTER_S):
- * what it refuses so is of a moment, as while workspace storage's mount is handed over to its
- * successor.
+ * what it refuses so is of a moment, as workspace storage's mount is handed over to its
+ * successor, or has not loaded a workspace's quota yet.
  *
  * - `POST /checkpoints`, `{ environment, workspace, namespace, pod, containerId, hook,
  *   podTemplate, live? }`: starts checkpointing the sandbox of the container
@@ -114,7 +114,8 @@
  *   a symlink or it is no file, 404 where there is none, 413 where it is over `max` bytes.
  * - `PUT /files/<environment>/<workspace>?path=<path>`: writes the body, of MAX_WRITE_BYTES at
  *   most, as the workspace's file at `path`, its directories made (204); 403 where any part of
- *   its path is a symlink, 413 where the body is over MAX_WRITE_BYTES.
+ *   its path is a symlink, 413 where the body is over MAX_WRITE_BYTES, 503 where the node's
+ *   mount does not hold the workspace's quota yet.
  * - `GET /healthz`: 200 once it serves.
  *
  * A manifest is ./agent.ts Manifest.

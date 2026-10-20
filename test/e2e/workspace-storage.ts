@@ -190,17 +190,6 @@ async function release(volumeId: string): Promise<void> {
   await until(`the release of ${volumeId}`, async () => ((await boundPodOf(volumeId)) === null ? true : undefined), 180_000);
 }
 
-/**
- * What `script`, which fills the session's workspace past its quota, said, once the quota
- * holds: JuiceFS's client reads quotas anew every few seconds, so a mount may not hold one
- * just set for a while; asked again for up to a minute.
- */
-async function untilQuotaHeld(volumeId: string, script: string): Promise<string> {
-  let said = await inWorkspaceOk(volumeId, script);
-  for (const deadline = Date.now() + 60_000; !/quota exceeded/iu.test(said) && Date.now() < deadline; said = await inWorkspaceOk(volumeId, script)) await sleep(5_000);
-  return said;
-}
-
 /** The directory of the file system that is the session's workspace, as a node agent makes it, of its environment's. */
 const directoryOf = (volumeId: string) => `${SESSIONS}/${volumeId}`;
 
@@ -316,7 +305,7 @@ export function workspaceStorage(): void {
     });
 
     test("a workspace takes no more than its quota", async () => {
-      const said = await untilQuotaHeld(none, [
+      const said = await inWorkspaceOk(none, [
         `cd ${WORKDIR}`,
         'fallocate -l 900M quota-a && echo "took 900M"',
         'fallocate -l 300M quota-b 2>&1 && echo "took 300M more"',
@@ -408,7 +397,7 @@ export function workspaceStorage(): void {
     });
 
     test("a fork takes no more than its own quota", async () => {
-      const said = await untilQuotaHeld(forked, [
+      const said = await inWorkspaceOk(forked, [
         `cd ${WORKDIR}`,
         'fallocate -l 900M quota-a && echo "took 900M"',
         'fallocate -l 300M quota-b 2>&1 && echo "took 300M more"',

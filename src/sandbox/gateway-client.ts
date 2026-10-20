@@ -15,8 +15,9 @@
  * - `create`, `remove`, `quota`, `list`, `readFile`, `writeFile`, `fork`: the workspace itself,
  *   as the gateway answers them, through its node agents (POST and DELETE /workspace,
  *   GET /workspace/quota, GET /workspace/all, GET and PUT /workspace/files, POST /workspace/forks);
- *   a file's write asked again every few seconds while the gateway answers it 503, as while a
- *   node's mount of workspace storage is handed over, until FILE_WRITE_WAIT_MS.
+ *   a file's write asked again every few seconds while the gateway answers it 503, as a node's
+ *   mount of workspace storage does not hold its workspace's quota yet, or is handed over,
+ *   until FILE_WRITE_WAIT_MS.
  *
  * What the gateway refuses is a GatewayError with its status and what it said.
  */
@@ -39,7 +40,12 @@ export type NetMode = "none" | "full";
 export const TOKEN_TTL_MS = 6 * 60 * 60_000;
 /** How long a bind asked ahead is asked again for, while the gateway's pool has no pod for it. */
 const BIND_WAIT_MS = 5 * 60_000;
-/** How long a file's write is asked again for, while the gateway answers it 503: past a node's mount of workspace storage's handover to its successor, with room. */
+/**
+ * How long a file's write is asked again for, while the gateway answers it 503: past a node's
+ * mount of workspace storage's handover to its successor, and two of JuiceFS's heartbeats
+ * (12 s), at which the mount loads a workspace's new quota (../node-agent/workspaces.ts), with
+ * room.
+ */
 const FILE_WRITE_WAIT_MS = 60_000;
 /** How long a call of the gateway's may take, in ms, but a bind's and a release's, which wait for a pod and a save. */
 const CALL_TIMEOUT_MS = 60_000;
@@ -76,7 +82,7 @@ const BindRefusal = Schema.Struct({ reason: Schema.optional(Schema.String), held
 /** What the gateway says a folder instance's bind under way waits on. */
 const StartingAnswer = Schema.Struct({ starting: Schema.NullOr(Schema.String) });
 
-/** A bind refused as its pool had no pod for it in time, or a write as its workspace's mount was not there for it, to be asked again after what it said. */
+/** A bind refused as its pool had no pod for it in time, or a write as its workspace's mount was not ready for it, to be asked again after what it said. */
 class NotYet extends Schema.TaggedError<NotYet>()("NotYet", { reason: Schema.String }) {}
 
 /** A workspace's quota, as the gateway reads it back. */
