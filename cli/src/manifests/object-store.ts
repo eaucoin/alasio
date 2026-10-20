@@ -42,6 +42,7 @@ import type {
 } from "@kubernetes/client-node";
 
 import { HISTORY_DAYS } from "../../../neon/control/branches.ts";
+import { memoryBytes } from "../capacity.ts";
 import { imageReference } from "../images.ts";
 import { claimSpec, componentName, labels, NAMESPACE, neonName, replicasOf, restrictedContainer, sandboxSnapshots, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import { filerStoreMaxmemoryBytes, type InstallConfig, type Scale } from "./config.ts";
@@ -402,6 +403,50 @@ function filerStoreObjects(config: InstallConfig): KubernetesObject[] {
 }
 
 /**
+ * How many MiB an S3 gateway of `resources` holds at most of the uploads under way: a request
+ * past it waits for room, its part held whole as it is read. An eighth of its memory limit,
+ * 256 MiB of 2 GiB; 256 where it has no limit.
+ *
+ * SeaweedFS 4.48 waits for room (s3api_circuit_breaker.go Limit) on a sync.Cond, which an
+ * upload that ends signals once it has given back its bytes, by an atomic and without the
+ * Cond's lock: a request between its look and its wait misses that signal and sleeps on
+ * until the next upload ends. A request woken that finds no room waits again behind those
+ * waiting, while one that comes and finds room goes in at once, so one may wait as others
+ * pass it; and it looks before it adds its own, so the uploads under way may go past the
+ * bound by one request's. Under the load job (test/gateway-memory.test.ts) a PUT waited
+ * 22 s at the most.
+ */
+export function gatewayUploadBufferMiB(resources: { readonly limits?: { readonly memory?: string } }): number {
+  const limit = resources.limits?.memory;
+  return limit === undefined ? 256 : Math.max(16, Math.floor(memoryBytes(limit) / 8 / 2 ** 20));
+}
+
+/**
+ * The sizes, at least, by default and at most, of each of a gateway's connections' kernel
+ * buffers, received and sent: at most 1 MiB, of the 6 and 4 MiB a node allows by default. A
+ * request waiting for the gateway's budgets keeps its connection, its client's bytes filling
+ * the buffer it receives into, all charged to the gateway's cgroup: 243 MiB of them, beside
+ * 766 MiB of its own, as it was killed at its 1 GiB limit under the box's load (CI). Safe
+ * sysctls since Kubernetes 1.32, namespaced to the pod.
+ */
+export const GATEWAY_SYSCTLS = [
+  { name: "net.ipv4.tcp_rmem", value: "4096 131072 1048576" },
+  { name: "net.ipv4.tcp_wmem", value: "4096 16384 1048576" },
+] as const;
+
+/**
+ * The Go runtime's soft memory limit of a container of `resources`, GOMEMLIMIT: three fifths
+ * of its memory limit, so that its collector runs before the kernel's OOM killer would,
+ * rather than once its heap has doubled, beside what the kernel charges the container that
+ * Go does not count, its connections' buffers among it; none where it has no limit. Its
+ * live heap under the load job was 130 to 330 MiB of the 620 to 770 MiB it held (CI).
+ */
+export function goMemoryLimit(resources: { readonly limits?: { readonly memory?: string } }): { env?: V1EnvVar[] } {
+  const limit = resources.limits?.memory;
+  return limit === undefined ? {} : { env: [{ name: "GOMEMLIMIT", value: `${Math.floor((memoryBytes(limit) * 0.6) / 2 ** 20)}MiB` }] };
+}
+
+/**
  * The S3 gateways, on the filers, each making the buckets and their lifecycle rules as
  * it starts, in sidecars, and ready only once they are made.
  */
@@ -436,6 +481,9 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
         spec: {
           ...priority("floor"),
           ...stackPodSpec(config),
+          // Its connections' buffers held small: the kernel's are charged to its cgroup,
+          // and it holds a connection for each request under way or waiting (GATEWAY_SYSCTLS).
+          securityContext: { ...stackPodSpec(config).securityContext, sysctls: [...GATEWAY_SYSCTLS] },
           ...spread(COMPONENTS.gateway, scaling),
           terminationGracePeriodSeconds: 30,
           containers: [
@@ -451,7 +499,19 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
                 "-allowDeleteBucketNotEmpty=false",
                 "-autoCreateBucket=false",
                 `-metricsPort=${METRICS_PORT}`,
+                // What it holds of uploads under way, bounded (gatewayUploadBufferMiB), as
+                // SeaweedFS holds none, part by part, whole.
+                `-concurrentUploadLimitMB=${gatewayUploadBufferMiB(bundled.gateways.resources)}`,
+                // What its GETs hold is not budgeted (no -readerCacheSizeMB): SeaweedFS's
+                // reader budget, short of room, takes back the oldest chunk held, even one a
+                // GET is reading, which that GET then reads again. Each GET holds its chunk
+                // and four ahead, of the filers' 4 MiB, so the box's clients' GETs at once, 86
+                // with eight restores of images of their own, want 1.2 GiB, and 2 with
+                // fifteen, more than a budget a gateway can afford. Unbudgeted, they hold at most SeaweedFS's 256
+                // chunks in flight, 1 GiB, which its limit (2 GiB) has room for beside the
+                // rest: under the load job it held 1.6 GiB at most.
               ],
+              ...goMemoryLimit(bundled.gateways.resources),
               ports: [...PORTS.gateway.map(({ name, port }) => ({ name, containerPort: port })), { name: "metrics", containerPort: METRICS_PORT }],
               readinessProbe: { httpGet: { path: "/healthz", port: "s3" }, periodSeconds: 5 },
               livenessProbe: { httpGet: { path: "/healthz", port: "s3" }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 6 },
