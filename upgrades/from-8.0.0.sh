@@ -250,6 +250,22 @@ sandbox_service_after() {
 # free. Before k3s stops, alasio is stopped and each folder instance let go, saved whole. A
 # run again that finds the move begun (OUT/images-moving) ends it first, as k3s is stopped
 # then, and once they moved (OUT/images-moved), it applies the upgrade again alone.
+#
+# The upgrade itself restarts k3s onto the daemon first, the images 8.0.0 pulled still
+# recorded, and the CRI unpacks an image it starts a pod or container of into the daemon's
+# snapshots from containerd's content, as the daemon has none of overlayfs's. containerd
+# records an image without some of its content where overlayfs had its layers unpacked as it
+# was pulled, as its unpacker fetches no layer whose snapshot is there already: an image
+# deleted while pods of it run, as a prune of the node's images deletes the pods' sandbox
+# image, which no container is of, and pulled again by the next pod. overlayfs runs such an
+# image on its snapshots; the daemon has nothing to unpack it from, so no pod of it starts,
+# and, the sandbox image's, no pod at all. So, past the point of no return, before the
+# upgrade, what containerd lacks of the images it records is fetched, each by the digest its
+# name names: fetched, not forgotten, as a pod started before k3s restarts would pull an image
+# forgotten again onto overlayfs's snapshots, lacking its content anew. An image only its id
+# names, which no pod is pulled by, is forgotten. A check for a move between snapshotters, not
+# for any node: on the one snapshotter, an image recorded so runs on its snapshots, and an image
+# stargz-snapshotter's daemon pulls lazily is recorded without its layers' content by design.
 
 # Runs "$@" every 2 s until it succeeds, for at most $1 seconds; fails, saying it waited for
 # $2, if it never does.
@@ -298,6 +314,39 @@ disk_left() {
 answering() { disk_left && kubectl get --raw=/readyz >/dev/null 2>&1; }
 # The release accepting the installation again, its disk kept free meanwhile.
 pulled() { disk_left && accepted; }
+# k3s's containerd's command line, on the CRI's images.
+images_ctr() { "$NODE_ROOT/usr/local/bin/k3s" ctr --namespace k8s.io "$@"; }
+# Where k3s tells its containerd how to reach each registry (registries.yaml), as the CRI pulls.
+REGISTRY_HOSTS=$NODE_ROOT/var/lib/rancher/k3s/agent/etc/containerd/certs.d
+# The images containerd records lacking any of their content for the node's platform: each
+# one's name and the digest it names, a line each.
+images_lacking() { images_ctr images check | awk 'NR > 1 && $4 != "complete" { print $1, $3 }'; }
+# Past the point of no return, before the upgrade: what containerd lacks of each image it
+# records fetched, by its name's repository and the digest it names; an image only its id
+# names forgotten.
+lazy_pulling_past() {
+  local lacking name digest repository named unnamed
+  lacking=$(images_lacking) || fail "the images containerd records could not be checked for their content"
+  [ -n "$lacking" ] || return 0
+  log "fetching what containerd lacks of images it records, for k3s on stargz-snapshotter's daemon to unpack them from: $(awk '{ print $1 }' <<<"$lacking" | paste -sd ' ' -)"
+  while read -r name digest; do
+    [[ $name != sha256:* ]] || continue
+    repository=${name%@*}
+    # Its tag, where it has one: what follows a colon in its last part.
+    [[ ${repository##*/} != *:* ]] || repository=${repository%:*}
+    images_ctr content fetch --hosts-dir "$REGISTRY_HOSTS" "$repository@$digest" >/dev/null ||
+      fail "what containerd lacks of the image $name could not be fetched: the cut-over run again goes on with it"
+  done <<<"$lacking"
+  lacking=$(images_lacking) || fail "the images containerd records could not be checked for their content"
+  named=$(awk '$1 !~ /^sha256:/ { print $1 }' <<<"$lacking" | paste -sd ' ' -)
+  [ -z "$named" ] || fail "containerd lacks content still of the images $named, fetched: the cut-over run again goes on with it"
+  unnamed=$(awk '$1 ~ /^sha256:/ { print $1 }' <<<"$lacking")
+  if [ -n "$unnamed" ]; then
+    log "forgetting the images only their ids name, which lack content: $(paste -sd ' ' - <<<"$unnamed")"
+    # Unquoted, a word each.
+    images_ctr images rm $unnamed >/dev/null || fail "the images only their ids name could not be forgotten"
+  fi
+}
 # The node's images removed, with every snapshot of theirs, overlayfs's and the daemon's, and
 # pulled anew through the daemon by k3s started again; OUT/images-moving says it is begun, so
 # that a run again, which finds k3s stopped, ends it first, and OUT/images-moved that it ended.
@@ -491,6 +540,8 @@ if [ ! -e "$OUT/upgraded" ]; then
     telegram_once_past
     holds_past
     sandbox_service_past
+    # As the upgrade restarts k3s onto stargz-snapshotter's daemon (lazy pulling).
+    lazy_pulling_past
     log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
     printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
     bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" || fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it"

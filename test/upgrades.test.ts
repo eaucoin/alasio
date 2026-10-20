@@ -55,10 +55,11 @@ const logStatefulSet = (version?: string) => ({
  * StatefulSet this release's, with no version on its claims, and an UPGRADE_CHECK, each saying
  * it ran, UPGRADE failing while `upgradeFails` is there; a node, in `node`, whose containerd
  * and stargz-snapshotter's daemon hold images, one of the daemon's snapshots mounted in
- * another, and whose systemctl, umount and k3s-killall.sh say what they were asked, umount
- * unmounting, its systemctl failing to start k3s while `startFails` is there. What the
- * cut-over runs in alasio's pod runs here, on the test's database, as 8.0.0's alasio reaches
- * its own.
+ * another, whose containerd records the images `images` lists, and whose systemctl, umount,
+ * k3s-killall.sh and k3s's ctr say what they were asked, umount unmounting, ctr fetching what
+ * no registry answers for failing, its systemctl failing to start k3s while `startFails` is
+ * there. What the cut-over runs in alasio's pod runs here, on the test's database, as 8.0.0's
+ * alasio reaches its own.
  */
 function machine() {
   const root = mkdtempSync(join(tmpdir(), "alasio-cut-over-"));
@@ -93,6 +94,32 @@ function machine() {
   const daemonSnapshot = join(node, "var/lib/containerd-stargz-grpc/snapshotter/snapshots/1/fs");
   writeFileSync(join(node, "proc/self/mounts"), `proc /proc proc rw 0 0\nstargz ${daemonSnapshot} fuse.rawBridge rw 0 0\nstargz ${daemonSnapshot}/inner fuse.rawBridge rw 0 0\n`);
   writeFileSync(join(node, "usr/local/bin/k3s-killall.sh"), `#!/bin/sh\necho k3s-killall.sh >>'${host}'\n`, { mode: 0o755 });
+  // The images containerd records, `<name> <digest> <complete|incomplete>` each, as its
+  // check says them, and the digests no registry answers for.
+  const images = join(root, "images");
+  const unreachable = join(root, "unreachable");
+  writeFileSync(images, `docker.io/rancher/mirrored-pause:3.10.2 sha256:${"1".repeat(64)} complete\n`);
+  writeFileSync(unreachable, "");
+  // Its fetches, which complete each image of the digest fetched, and its removals, said beside what the node was asked.
+  writeFileSync(join(node, "usr/local/bin/k3s"), `#!/bin/sh
+[ "$1 $2 $3" = "ctr --namespace k8s.io" ] || { echo "k3s $* is not the cut-over's" >&2; exit 2; }
+shift 3
+case "$1 $2" in
+  "images check")
+    echo "REF TYPE DIGEST STATUS SIZE UNPACKED"
+    awk '{ print $1, "application/vnd.oci.image.index.v1+json", $2, ($3 == "complete" ? "complete (2/2)" : "incomplete (1/2)"), "1.0 MiB/1.0 MiB", "true" }' '${images}' ;;
+  "content fetch")
+    echo "k3s ctr content fetch $3 $4 $5" >>'${host}'
+    digest=\${5##*@}
+    ! grep -qx "$digest" '${unreachable}' || { echo "ctr: failed to resolve $5" >&2; exit 1; }
+    awk -v digest="$digest" '$2 == digest { $3 = "complete" } { print }' '${images}' >'${images}.next' && mv '${images}.next' '${images}' ;;
+  "images rm")
+    shift 2
+    echo "k3s ctr images rm $*" >>'${host}'
+    for name in "$@"; do awk -v name="$name" '$1 != name' '${images}' >'${images}.next' && mv '${images}.next' '${images}'; done ;;
+  *) echo "k3s ctr $* is not the cut-over's" >&2; exit 2 ;;
+esac
+`, { mode: 0o755 });
   const databaseUrl = join(root, "database-url");
   writeFileSync(namespaces, "");
   writeFileSync(folders, JSON.stringify({ items: [] }));
@@ -187,6 +214,16 @@ awk -v point="$2" '$2 != point' '${mounts}' >'${mounts}.next' && mv '${mounts}.n
       return lines;
     },
     startFails: (fails: boolean) => (fails ? writeFileSync(startFails, "") : rmSync(startFails, { force: true })),
+    /** Has containerd record the images `recorded`, `[name, digest, whether it holds all their content]` each. */
+    hasImages: (recorded: readonly (readonly [string, string, boolean])[]) =>
+      writeFileSync(images, recorded.map(([name, digest, whole]) => `${name} ${digest} ${whole ? "complete" : "incomplete"}\n`).join("")),
+    /** The images containerd records, as hasImages gives them. */
+    images: () => readFileSync(images, "utf8").split("\n").filter(Boolean).map((line) => {
+      const [name = "", digest = "", status] = line.split(" ");
+      return [name, digest, status === "complete"] as const;
+    }),
+    /** Has no registry answer for the digests `digests`. */
+    unreachable: (digests: readonly string[]) => writeFileSync(unreachable, digests.map((digest) => `${digest}\n`).join("")),
     node,
     daemonSnapshot,
     namespaces: (listed: string) => writeFileSync(namespaces, listed),
@@ -587,6 +624,73 @@ test("a cut-over that stopped in the move of the node's images ends it first whe
     assert.doesNotMatch(again.said, /checking that|upgrading, from the cut-over/u);
     assert.deepEqual(at.host(), ["systemctl stop k3s", "k3s-killall.sh", "systemctl start k3s"]);
     assert.deepEqual([at.ran(), at.marks(), at.imageMarks()], [["check", "upgrade"], ["point-of-no-return", "upgraded"], ["images-moved"]]);
+  } finally {
+    at.remove();
+  }
+});
+
+/** Digests of images containerd records, by the image's name. */
+const PAUSE = `sha256:${"a".repeat(64)}`;
+const ALASIO = `sha256:${"b".repeat(64)}`;
+const PULLED = `sha256:${"c".repeat(64)}`;
+const WHOLE = `sha256:${"d".repeat(64)}`;
+const UNNAMED = `sha256:${"e".repeat(64)}`;
+
+test("past its point of no return, before the upgrade restarts k3s onto stargz-snapshotter's daemon, the cut-over fetches what containerd lacks of each image it records, by the digest its name names, and forgets one only its id names", () => {
+  const at = machine();
+  try {
+    // As the box's were: the sandbox image pulled again onto overlayfs's snapshots, its layer's blob never fetched.
+    at.hasImages([
+      ["docker.io/rancher/mirrored-pause:3.10.2", PAUSE, false],
+      [`sha256:${"f".repeat(64)}`, PAUSE, false],
+      [`ghcr.io/eaucoin/alasio@${ALASIO}`, ALASIO, false],
+      ["localhost:5000/eaucoin/alasio-ci:run-1", PULLED, false],
+      ["docker.io/library/busybox:1.37", WHOLE, true],
+      [`sha256:${"9".repeat(64)}`, UNNAMED, false],
+    ]);
+    at.upgradeFails(true);
+    const failed = at.cutOver();
+    assert.notEqual(failed.code, 0);
+    assert.match(failed.said, /fetching what containerd lacks of images it records, for k3s on stargz-snapshotter's daemon to unpack them from: docker\.io\/rancher\/mirrored-pause:3\.10\.2 sha256:f+ ghcr\.io\/eaucoin\/alasio@sha256:b+ localhost:5000\/eaucoin\/alasio-ci:run-1 sha256:9+\n[^\n]* forgetting the images only their ids name, which lack content: sha256:9+\n[^\n]* upgrading, from the cut-over/u);
+    const hosts = join(at.node, "var/lib/rancher/k3s/agent/etc/containerd/certs.d");
+    assert.deepEqual(at.host(), [
+      `k3s ctr content fetch --hosts-dir ${hosts} docker.io/rancher/mirrored-pause@${PAUSE}`,
+      `k3s ctr content fetch --hosts-dir ${hosts} ghcr.io/eaucoin/alasio@${ALASIO}`,
+      `k3s ctr content fetch --hosts-dir ${hosts} localhost:5000/eaucoin/alasio-ci@${PULLED}`,
+      `k3s ctr images rm sha256:${"9".repeat(64)}`,
+    ]);
+    assert.deepEqual(at.images().map(([name, , whole]) => [name, whole]), [
+      ["docker.io/rancher/mirrored-pause:3.10.2", true],
+      [`sha256:${"f".repeat(64)}`, true],
+      [`ghcr.io/eaucoin/alasio@${ALASIO}`, true],
+      ["localhost:5000/eaucoin/alasio-ci:run-1", true],
+      ["docker.io/library/busybox:1.37", true],
+    ]);
+    // A run again, the upgrade having restarted k3s onto the daemon, finds none lacking.
+    at.upgradeFails(false);
+    const again = at.cutOver();
+    assert.equal(again.code, 0, again.said);
+    assert.doesNotMatch(again.said, /fetching what containerd lacks/u);
+    assert.ok(!at.host().some((asked) => asked.startsWith("k3s ")));
+  } finally {
+    at.remove();
+  }
+});
+
+test("the cut-over fails before its upgrade where what containerd lacks of an image cannot be fetched, and a run again fetches it", () => {
+  const at = machine();
+  try {
+    at.hasImages([["docker.io/rancher/mirrored-pause:3.10.2", PAUSE, false]]);
+    at.unreachable([PAUSE]);
+    const failed = at.cutOver();
+    assert.notEqual(failed.code, 0);
+    assert.match(failed.said, /FAILED: what containerd lacks of the image docker\.io\/rancher\/mirrored-pause:3\.10\.2 could not be fetched: the cut-over run again goes on with it\n$/u);
+    assert.deepEqual([at.ran(), at.marks()], [["check"], ["point-of-no-return"]]);
+    at.unreachable([]);
+    const again = at.cutOver();
+    assert.equal(again.code, 0, again.said);
+    assert.deepEqual(at.images(), [["docker.io/rancher/mirrored-pause:3.10.2", PAUSE, true]]);
+    assert.deepEqual([at.ran(), at.marks()], [["upgrade", "check", "upgrade"], ["point-of-no-return", "upgraded"]]);
   } finally {
     at.remove();
   }

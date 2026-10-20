@@ -585,9 +585,23 @@ if (inShard("upgrade")) {
         },
       },
       {
-        seeds: "the node's images, unpacked by overlayfs",
+        seeds: "the node's images, unpacked by overlayfs, the pods' sandbox image recorded without its layer's content, as the box's was",
         seed: async () => {
           assert.notEqual(await overlayfsSnapshots(), "");
+          // The box's sandbox image was deleted by a prune of the node's images, which takes it, as no
+          // container is of it and the CRI holds it unpinned, by another name than k3s pins; then
+          // pulled again by the next pod, onto overlayfs's snapshot of its layer, which the pods run
+          // on still, so containerd fetched no blob of that layer.
+          const sandbox = (await onNode("", `sed -n 's/^ *sandbox = "\\(.*\\)"$/\\1/p' /var/lib/rancher/k3s/agent/etc/containerd/config.toml`)).trim();
+          const { status } = JSON.parse(await onNode("", `k3s crictl inspecti -o json '${sandbox}'`)) as { status: { repoTags: string[]; pinned: boolean } };
+          const [name = ""] = status.repoTags;
+          assert.equal(status.pinned, false, `the CRI holds ${name} pinned, which no prune takes`);
+          const records = async () => (await onNode("", "k3s ctr -n k8s.io images check | tail -n +2")).split("\n").map((line) => line.split(/\s+/u));
+          const digest = (await records()).find(([recorded]) => recorded === name)?.[2] ?? "";
+          await onNode("", `k3s crictl rmi '${sandbox}'`);
+          await until(`${name}'s content let go of`, async () => (await onNode("", "k3s ctr -n k8s.io content ls -q")).split("\n").includes(digest) ? undefined : true, 120_000);
+          await onNode("", `k3s crictl pull '${sandbox}'`);
+          assert.equal((await records()).find(([recorded]) => recorded === name)?.[3], "incomplete", `${name} is recorded with all its content`);
         },
         keeps: "none of them, every image pulled anew through stargz-snapshotter's daemon, alasio's own lazily",
         check: async () => {
