@@ -157,7 +157,7 @@ export const STALE_SESSIONS_SCHEDULE = "*/5 * * * *";
 
 /**
  * How long staleSessions runs its client, in seconds: past two of its refreshes, a
- * heartbeat's each (12 s, ±10%), as its first may come before the cleanups' last mark has
+ * heartbeat's each (12 s, ±5%), as its first may come before the cleanups' last mark has
  * aged past 0.9 of a heartbeat, which the cleanup waits for (JuiceFS's pkg/meta base.go
  * refresh and CleanStaleSessions).
  */
