@@ -9,7 +9,8 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Context, Effect, Exit, Layer, Scope } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
-import { activeAt, readLease, takeLease } from "../src/binder/bindings.ts";
+import { ACTIVE_ANNOTATION, activeAt, readLease, takeLease } from "../src/binder/bindings.ts";
+import { baymaIdleness } from "../src/binder/sweep.ts";
 import { LiveBindings } from "../src/binder/live.ts";
 import { environmentKey, freeLabels, type Pool } from "../src/binder/names.ts";
 import { type BinderServer, MAX_CALLER_TOKEN_MS, MAX_OPERATION_BYTES, NO_BIND_HEADER, type Operation, type Placement, PlacementRefused, serveBinder } from "../src/binder/server.ts";
@@ -169,12 +170,15 @@ test("a branch's requests of a key stamp its own binding of it alone, never main
   try {
     const key = "sessionfs:inherited";
     const as = (environment: string) => ({ authorization: caller(key, Date.now() + 60_000, { environment }) });
-    // Main's binding, known to the front, which no request of main's has stamped yet.
+    // Main's binding, known to the front, stamped as it was bound, which no request of main's has stamped since.
     assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: as("main") })).status, 204);
+    const bound = await run(readLease(main, key));
+    const boundAt = bound ? activeAt(bound) : null;
+    assert.ok(boundAt !== null, "main's binding stamped as it was bound");
     for (let n = 0; n < 3; n += 1) assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: as("branch"), body: "{}" })).status, 200);
     assert.equal(reachedNamespace(stand.sent), branch.namespace);
     const [mains, branchs] = [await run(readLease(main, key)), await run(readLease(branch, key))];
-    assert.deepEqual([mains?.spec?.holderIdentity !== undefined, mains ? activeAt(mains) : "gone"], [true, null]);
+    assert.deepEqual([mains?.spec?.holderIdentity !== undefined, mains ? activeAt(mains) : "gone"], [true, boundAt]);
     assert.ok(branchs && activeAt(branchs) !== null, "the branch's own binding stamped");
   } finally {
     await served.close();
@@ -593,5 +597,118 @@ test("a front that checks each environment's callers by its own key takes a toke
   } finally {
     await served.close();
     stand.close();
+  }
+});
+
+/** A stand-in for a bound pod at `host`, on `port` or one of its own: the bodies it was sent, in order, and how to stop it. */
+async function podAt(host: string, port = 0): Promise<{ port: number; bodies: string[]; close: () => Promise<void> }> {
+  const bodies: string[] = [];
+  const server = createServer((incoming, outgoing) => {
+    let body = "";
+    incoming.on("data", (chunk: Buffer) => (body += chunk.toString()));
+    incoming.on("end", () => {
+      bodies.push(body);
+      outgoing.writeHead(200, { "content-type": "application/json" }).end("{}");
+    });
+  });
+  server.listen(port, host);
+  await once(server, "listening");
+  return { port: (server.address() as AddressInfo).port, bodies, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+}
+
+test("a binding is stamped active as its bind is through, so one whose bind took longer than the wait to release it, as a restore's may, is not idle as its first request comes", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  // Its pod's bayma, idle since long before, as a sandbox restored from a snapshot says it is.
+  const status = createServer((_incoming, outgoing) => void outgoing.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 300_000 })));
+  status.listen(0, "127.0.0.1");
+  await once(status, "listening");
+  const statusPort = (status.address() as AddressInfo).port;
+  const served = await front(of, statusPort);
+  try {
+    const key = "sessionfs:restored";
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
+    const lease = await run(readLease(of, key));
+    assert.ok(lease);
+    const boundAt = activeAt(lease);
+    assert.ok(boundAt !== null && Math.abs(Date.now() - boundAt) < 10_000, `stamped as it was bound: ${boundAt}`);
+    const pod = await run(withKube((kube) => kube.read("v1", "Pod", of.namespace, lease.spec?.holderIdentity ?? ""))) as V1Pod;
+    // Its pod made two minutes before its bind was through, as a restore's is, which takes that long.
+    const madeEarlier: V1Pod = { ...pod, metadata: { ...pod.metadata, creationTimestamp: new Date(boundAt - 120_000) } };
+    const idleness = baymaIdleness({ podPort: statusPort, releaseAfterMs: 60_000, bindingKey });
+    const asked = await Effect.runPromise(idleness(lease, madeEarlier, boundAt + 10_000));
+    assert.equal(asked.idle, false, "released as its first request comes");
+    // Unstamped, as before, it would have been.
+    const unstamped = { ...lease, metadata: { ...lease.metadata, annotations: Object.fromEntries(Object.entries(lease.metadata?.annotations ?? {}).filter(([name]) => name !== ACTIVE_ANNOTATION)) } };
+    assert.equal(activeAt(unstamped), null);
+    assert.equal((await Effect.runPromise(idleness(unstamped, madeEarlier, boundAt + 10_000))).idle, true);
+  } finally {
+    await served.close();
+    status.close();
+  }
+});
+
+test("a request on a route the front knew of, whose binding was released before its watch said so, binds its key anew and is passed there, its caller never told the pod was not reached", async () => {
+  const of = await pool();
+  const gone = await podAt("127.0.0.2");
+  const next = await podAt("127.0.0.1", gone.port);
+  await freePods(of, 1, 0, "127.0.0.2");
+  const served = await front(of, gone.port);
+  try {
+    const key = "sessionfs:released";
+    const asked = (body: string) => fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body });
+    assert.equal((await asked("first")).status, 200);
+    assert.deepEqual(gone.bodies, ["first"]);
+    // Released by another, its pod gone with it; another pod free to bind it in.
+    await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (binder) => binder.release(of, key)), Layer.provideMerge(Binder.layer({ waitMs: 5_000 }), Layer.fresh(KubeClient.layer))));
+    await gone.close();
+    await freePods(of, 1, 1, "127.0.0.1");
+    const second = await asked("second");
+    assert.equal(second.status, 200, await second.text());
+    assert.deepEqual(next.bodies, ["second"]);
+    const lease = await run(readLease(of, key));
+    assert.equal(lease?.spec?.holderIdentity, "free-1");
+  } finally {
+    await served.close();
+    await next.close();
+  }
+});
+
+test("a request on a route of a binding gone that reached its pod before its connection was lost is not passed again, as its pod may have run it: its caller is told the pod was not reached", async () => {
+  const of = await pool();
+  // Its pod takes the request, then drops its connection unanswered, as one ending under it would.
+  let dropping = false;
+  const taken: string[] = [];
+  const old = createServer((incoming, outgoing) => {
+    let body = "";
+    incoming.on("data", (chunk: Buffer) => (body += chunk.toString()));
+    incoming.on("end", () => {
+      taken.push(body);
+      if (dropping) incoming.socket.destroy();
+      else outgoing.writeHead(200, { "content-type": "application/json" }).end("{}");
+    });
+  });
+  old.listen(0, "127.0.0.2");
+  await once(old, "listening");
+  const port = (old.address() as AddressInfo).port;
+  const next = await podAt("127.0.0.1", port);
+  await freePods(of, 1, 0, "127.0.0.2");
+  const served = await front(of, port);
+  try {
+    const key = "sessionfs:dropped";
+    const asked = (body: string) => fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body });
+    assert.equal((await asked("first")).status, 200);
+    await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (binder) => binder.release(of, key)), Layer.provideMerge(Binder.layer({ waitMs: 5_000 }), Layer.fresh(KubeClient.layer))));
+    await freePods(of, 1, 1, "127.0.0.1");
+    dropping = true;
+    const second = await asked("second");
+    assert.equal(second.status, 503);
+    assert.deepEqual(await second.json(), { error: `the pod of ${key} was not reached` });
+    assert.deepEqual(taken, ["first", "second"]);
+    assert.deepEqual(next.bodies, [], "passed again");
+  } finally {
+    await served.close();
+    await next.close();
+    old.close();
   }
 });

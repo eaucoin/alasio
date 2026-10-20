@@ -22,10 +22,14 @@
  *   it is not (./proxy.ts), but for a request that says it must bind nothing (NO_BIND_HEADER
  *   `never`), as one that reads what a binding has, answered 409 `{ "bound": false }` where the
  *   key has no binding serving, its Lease untaken and no pod claimed; with the binding's token for the caller's, the key's Lease
- *   stamped active now and then, as what releases it reads; 503 with a Retry-After
- *   where it could not be bound now (its pool had no pod for it in time, its pod could not
- *   be readied), or its pod was not reached, its route then forgotten, so the next request
- *   binds the key anew, the 503 saying why (`reason`); 403 where the gateway binds it nowhere, as
+ *   stamped active as each bind of it is through and as its requests come, now and then, as
+ *   what releases it reads; passed again, where a route the front knew of was of a binding
+ *   gone, released by another replica or its sweep before its watch said so, to the key
+ *   bound anew, within its bind's own wait, where the request's body was one the front could
+ *   read whole first and its connection to the gone pod was never made (NEVER_CONNECTED), so
+ *   that pod had nothing of it; 503 with a Retry-After where it could not be bound now (its pool had no
+ *   pod for it in time, its pod could not be readied), or its pod was not reached, its route
+ *   then forgotten, so the next request binds the key anew, the 503 saying why (`reason`); 403 where the gateway binds it nowhere, as
  *   its token says it is bound; and 503 `{ "held": true }`, with no Retry-After, where its binds
  *   failed one after another, so it is bound again only as its caller asks.
  *
@@ -85,8 +89,21 @@ export const MAX_CALLER_TOKEN_MS = 6 * 60 * 60_000 + 5 * 60_000;
 
 /** What a Retry-After asks a caller to wait, in seconds, before it asks again. */
 const RETRY_AFTER_S = 1;
-/** How often a key's Lease is stamped with its requests, at most, by one replica: well within any wait to release it. */
+/** How often a binding's Lease is stamped with its requests, at most, by one replica: well within any wait to release it. */
 const ACTIVE_STAMP_MS = 30_000;
+/**
+ * The largest body of a request the front reads whole before it passes it on a route it knew
+ * of, so it may pass it again where that route was of a binding gone: an MCP call's, with room.
+ * One larger, or of no stated length, is streamed as it comes, and passed once.
+ */
+const REPLAYED_BYTES = 1024 ** 2;
+/**
+ * The errors of a connection to a pod that was never made, of which the pod had nothing: refused,
+ * no route to it, or reset before it was made. A request so failed may be passed again; one
+ * that timed out, or failed once its connection was made, may have reached the pod, as an MCP
+ * call that runs an exec, and is not.
+ */
+const NEVER_CONNECTED: ReadonlySet<string> = new Set(["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ECONNRESET"]);
 
 /** A key bound nowhere, as its caller's token says it is bound: why, answered 403. */
 export class PlacementRefused extends Schema.TaggedError<PlacementRefused>()("PlacementRefused", { reason: Schema.String }) {
@@ -168,6 +185,16 @@ async function bodyOf(incoming: IncomingMessage, limit: number): Promise<Uint8Ar
   return Buffer.concat(chunks);
 }
 
+/** A route the front keeps of a binding: its pod's, and the binding's pool and Lease's uid. */
+type Routed = Route & { readonly pool: Pool; readonly binding: string };
+
+/** Whether `incoming` has no body, or one of a stated length within `limit`: one the front may read whole, to pass again. */
+const replayable = (incoming: IncomingMessage, limit: number): boolean => {
+  const length = incoming.headers["content-length"];
+  if (length === undefined) return incoming.headers["transfer-encoding"] === undefined;
+  return Number(length) <= limit;
+};
+
 const Waiting = Schema.Struct({ waiting: Schema.Number });
 const decodeWaiting = Schema.decodeUnknownOption(Waiting);
 
@@ -179,18 +206,26 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
   // What the front knows of each binding, by its pool's namespace and its key, never the key
   // alone: environments share keys (a branch's sessions are forks of main's, under their ids),
   // and each binds its own, which a caller of one never reaches by another's.
-  const routes = new Map<string, Route & { readonly pool: Pool; readonly binding: string }>();
+  const routes = new Map<string, Routed>();
   const flights = new Map<string, number>();
-  const stamped = new Map<string, number>();
+  // When this replica last stamped each key's binding active, by the binding: a new binding's first request is stamped whatever its key's last was.
+  const stamped = new Map<string, { readonly binding: string; readonly at: number }>();
   /** The key of `key`, as `pool` binds it, in what the front keeps: a namespace has no slash. */
   const slot = (pool: Pool, key: string): string => `${pool.namespace}/${key}`;
 
-  /** Stamps `key`'s Lease in `pool` with a request now, at most every ACTIVE_STAMP_MS from this replica, so whatever releases it sees it active. */
-  const active = (key: string, pool: Pool): Effect.Effect<void> =>
+  /**
+   * Stamps the binding `binding` of `key`'s Lease in `pool` active now, so whatever releases it
+   * sees it so: as a request comes, at most every ACTIVE_STAMP_MS a binding from this replica;
+   * or, `bound`, as a bind of it is through, whatever was stamped before, so a binding is idle
+   * from when it was bound at the earliest, not from when its pod was made, which a restore
+   * makes some while before.
+   */
+  const active = (key: string, pool: Pool, binding: string, { bound = false }: { readonly bound?: boolean } = {}): Effect.Effect<void> =>
     Effect.gen(function*() {
       const now = yield* Clock.currentTimeMillis;
-      if (now - (stamped.get(slot(pool, key)) ?? 0) < ACTIVE_STAMP_MS) return;
-      stamped.set(slot(pool, key), now);
+      const last = stamped.get(slot(pool, key));
+      if (!bound && last?.binding === binding && now - last.at < ACTIVE_STAMP_MS) return;
+      stamped.set(slot(pool, key), { binding, at: now });
       yield* Effect.provideService(touchLease(pool, key, now), KubeClient, kube).pipe(Effect.catch((error) => Effect.logDebug(`stamping ${key}'s binding active failed: ${error.message}`)));
     });
 
@@ -200,12 +235,12 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
    * where it is to be asked `anew`, or its pod bound now; or, where it is to bind nothing
    * (`unbound`), its pod as its binding is now, null where none serves.
    */
-  const routeOf = (key: string, options: Readonly<Record<string, string>>, { unbound, anew }: { readonly unbound: boolean; readonly anew: boolean }): Effect.Effect<(Route & { readonly pool: Pool }) | null, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused | PlacementHeld> =>
+  const routeOf = (key: string, options: Readonly<Record<string, string>>, { unbound, anew }: { readonly unbound: boolean; readonly anew: boolean }): Effect.Effect<{ readonly route: Routed; readonly known: boolean } | null, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused | PlacementHeld> =>
     Effect.gen(function*() {
       const { pool, held, settled, ...placed } = yield* poolOf(key, options);
       const known = anew ? undefined : routes.get(slot(pool, key));
       // One whose binding is gone, as its watch says, is bound anew; one not yet known of is used as it is.
-      if (known && (!routeHeld || (yield* routeHeld(key, known.binding, known.pool.namespace)) !== "gone")) return known;
+      if (known && (!routeHeld || (yield* routeHeld(key, known.binding, known.pool.namespace)) !== "gone")) return { route: known, known: true };
       routes.delete(slot(pool, key));
       if (!unbound && held) {
         const reason = yield* held;
@@ -219,7 +254,9 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       if (!bound) return null;
       const route = { address: bound.address, port: podPort, token: bindingToken(bindingKey, { key, binding: bound.binding, namespace: pool.namespace }), pool, binding: bound.binding };
       routes.set(slot(pool, key), route);
-      return route;
+      // Bound now, as a bind of it is through: idle from now at the earliest.
+      if (!unbound) yield* active(key, pool, bound.binding, { bound: true });
+      return { route, known: false };
     });
 
   /** The pool's counts, its waiting summed over every replica's. */
@@ -279,16 +316,19 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       // A bind asked ahead, and a request that binds nothing, asks how the key is bound now, not
       // the route this front last knew, which a release by another, as an idle or broken binding's,
       // leaves behind.
-      const routed = yield* routeOf(key, claims.options ?? {}, { unbound, anew: unbound || (incoming.method === "POST" && url === "/bind") }).pipe(Effect.result);
-      if (routed._tag === "Failure") {
-        if (routed.failure._tag === "PlacementRefused") return answer(outgoing, 403, { error: routed.failure.message });
-        // Held, it is bound again only as its caller asks: no Retry-After.
-        if (routed.failure._tag === "PlacementHeld") return answer(outgoing, 503, { error: `${key} is bound again only as its caller asks`, reason: routed.failure.message, held: true });
-        yield* Effect.logWarning(`binding ${key} failed: ${routed.failure.message}`);
-        return answer(outgoing, 503, { error: `${key} could not be bound now`, reason: routed.failure.message }, { "retry-after": String(RETRY_AFTER_S) });
-      }
-      const route = routed.success;
-      if (!route) {
+      const options = claims.options ?? {};
+      /** Why `key` could not be routed, answered. */
+      const refused = (failure: KubeApiError | BindTimeout | BindStepFailed | PlacementRefused | PlacementHeld) =>
+        Effect.gen(function*() {
+          if (failure._tag === "PlacementRefused") return answer(outgoing, 403, { error: failure.message });
+          // Held, it is bound again only as its caller asks: no Retry-After.
+          if (failure._tag === "PlacementHeld") return answer(outgoing, 503, { error: `${key} is bound again only as its caller asks`, reason: failure.message, held: true });
+          yield* Effect.logWarning(`binding ${key} failed: ${failure.message}`);
+          return answer(outgoing, 503, { error: `${key} could not be bound now`, reason: failure.message }, { "retry-after": String(RETRY_AFTER_S) });
+        });
+      const routed = yield* routeOf(key, options, { unbound, anew: unbound || (incoming.method === "POST" && url === "/bind") }).pipe(Effect.result);
+      if (routed._tag === "Failure") return yield* refused(routed.failure);
+      if (!routed.success) {
         incoming.resume();
         return answer(outgoing, 409, { bound: false });
       }
@@ -296,14 +336,39 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         incoming.resume();
         return answer(outgoing, 204);
       }
-      yield* active(key, route.pool);
-      const flight = slot(route.pool, key);
-      flights.set(flight, (flights.get(flight) ?? 0) + 1);
-      const proxied = yield* Effect.promise(() => proxy(incoming, outgoing, route)).pipe(
-        Effect.ensuring(Effect.sync(() => void flights.set(flight, (flights.get(flight) ?? 1) - 1))),
-      );
+      const { known } = routed.success;
+      let { route } = routed.success;
+      // On a route it knew of, which may be of a binding released since, as its watch has yet to
+      // say, a request whose body it may read whole is read first, to pass it again.
+      const body = known && replayable(incoming, REPLAYED_BYTES) ? (yield* Effect.promise(() => bodyOf(incoming, REPLAYED_BYTES))) ?? undefined : undefined;
+      const passed = (to: Routed) =>
+        Effect.gen(function*() {
+          yield* active(key, to.pool, to.binding);
+          const flight = slot(to.pool, key);
+          flights.set(flight, (flights.get(flight) ?? 0) + 1);
+          return yield* Effect.promise(() => proxy(incoming, outgoing, to, body)).pipe(
+            Effect.ensuring(Effect.sync(() => void flights.set(flight, (flights.get(flight) ?? 1) - 1))),
+          );
+        });
+      let proxied = yield* passed(route);
+      if (!proxied.reached && known && body !== undefined && !proxied.connected && NEVER_CONNECTED.has(proxied.code ?? "")) {
+        // The pod not reached by a route it knew of, nothing of the request sent it: where its
+        // binding is gone, released by another replica or by this one's sweep, the key is
+        // routed anew, bound as a request binds it, within its bind's own wait, and the request
+        // passed again.
+        routes.delete(slot(route.pool, key));
+        const now = yield* binder.bound(route.pool, key).pipe(Effect.orElseSucceed(() => undefined));
+        if (now !== undefined && now?.binding !== route.binding) {
+          yield* Effect.logInfo(`the route of ${key} was of its binding ${route.binding}, gone: routed anew`);
+          const again = yield* routeOf(key, options, { unbound, anew: true }).pipe(Effect.result);
+          if (again._tag === "Failure") return yield* refused(again.failure);
+          if (!again.success) return answer(outgoing, 409, { bound: false });
+          route = again.success.route;
+          proxied = yield* passed(route);
+        }
+      }
       if (proxied.reached) return;
-      routes.delete(flight);
+      routes.delete(slot(route.pool, key));
       yield* Effect.logWarning(`the pod of ${key} was not reached: ${proxied.error}`);
       answer(outgoing, 503, { error: `the pod of ${key} was not reached` }, { "retry-after": String(RETRY_AFTER_S) });
     }).pipe(

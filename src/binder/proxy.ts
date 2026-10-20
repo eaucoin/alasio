@@ -15,8 +15,14 @@ export interface Route {
   readonly token: string;
 }
 
-/** What a proxied request came to: answered by the pod (its status), or not reached (why). */
-export type Proxied = { readonly reached: true; readonly status: number } | { readonly reached: false; readonly error: string };
+/**
+ * What a proxied request came to: answered by the pod (its status), or not reached (why), and
+ * whether its connection to the pod was made first (`connected`), as one reused is, so the pod
+ * may have had some of it, or none, so it had nothing of it; and the error's code.
+ */
+export type Proxied =
+  | { readonly reached: true; readonly status: number }
+  | { readonly reached: false; readonly error: string; readonly connected: boolean; readonly code: string | undefined };
 
 // Hop-by-hop headers (RFC 9110 7.6.1), each connection's own, and the caller's credentials.
 const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "authorization"]);
@@ -28,11 +34,12 @@ function endToEnd(headers: IncomingHttpHeaders): OutgoingHttpHeaders {
 }
 
 /**
- * Passes `incoming` to `route` and its answer to `outgoing`, as the module says. Where the
+ * Passes `incoming` to `route` and its answer to `outgoing`, as the module says: its body as
+ * it comes, or `body`, where the caller read it first, so it may be passed again. Where the
  * pod is not reached, nothing is answered: the caller decides what to answer (as binding the
  * key anew), from what it came to.
  */
-export function proxy(incoming: IncomingMessage, outgoing: ServerResponse, route: Route): Promise<Proxied> {
+export function proxy(incoming: IncomingMessage, outgoing: ServerResponse, route: Route, body?: Uint8Array): Promise<Proxied> {
   return new Promise((resolve) => {
     const upstream = request({
       host: route.address,
@@ -42,6 +49,12 @@ export function proxy(incoming: IncomingMessage, outgoing: ServerResponse, route
       headers: { ...endToEnd(incoming.headers), authorization: `Bearer ${route.token}`, "x-forwarded-for": incoming.socket.remoteAddress ?? "" },
     });
     let answered = false;
+    // Whether its connection was made: at once, where it reuses one, as Node's agent keeps them.
+    let connected = false;
+    upstream.on("socket", (socket) => {
+      if (!socket.connecting) connected = true;
+      else socket.once("connect", () => void (connected = true));
+    });
     upstream.on("response", (response) => {
       answered = true;
       outgoing.writeHead(response.statusCode ?? 502, endToEnd(response.headers));
@@ -57,12 +70,13 @@ export function proxy(incoming: IncomingMessage, outgoing: ServerResponse, route
     });
     upstream.on("error", (error) => {
       if (answered) outgoing.destroy();
-      else resolve({ reached: false, error: error.message });
+      else resolve({ reached: false, error: error.message, connected, code: (error as NodeJS.ErrnoException).code });
     });
     // The caller gone: so is its request to the pod.
     outgoing.on("close", () => {
       if (!outgoing.writableFinished) upstream.destroy();
     });
-    incoming.pipe(upstream);
+    if (body === undefined) incoming.pipe(upstream);
+    else upstream.end(body);
   });
 }
