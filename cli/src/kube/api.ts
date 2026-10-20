@@ -63,7 +63,6 @@ const KINDS = {
   DaemonSet: { apiVersion: "apps/v1", plural: "daemonsets", namespaced: true },
   Job: { apiVersion: "batch/v1", plural: "jobs", namespaced: true },
   CronJob: { apiVersion: "batch/v1", plural: "cronjobs", namespaced: true },
-  Sandbox: { apiVersion: "agents.x-k8s.io/v1beta1", plural: "sandboxes", namespaced: true },
   ScaledObject: { apiVersion: "keda.sh/v1alpha1", plural: "scaledobjects", namespaced: true },
   TriggerAuthentication: { apiVersion: "keda.sh/v1alpha1", plural: "triggerauthentications", namespaced: true },
   VerticalPodAutoscaler: { apiVersion: "autoscaling.k8s.io/v1", plural: "verticalpodautoscalers", namespaced: true },

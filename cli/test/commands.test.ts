@@ -1941,26 +1941,6 @@ test("up applies nothing where an object the cluster has cannot take this releas
   assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
 });
 
-test("up and upgrade apply nothing while the sessions' namespace holds the release before's session workspaces, naming each and how to delete it", async (t) => {
-  const { alasio, kube } = await installed(t);
-  kube.put("sandboxes", { apiVersion: "agents.x-k8s.io/v1beta1", kind: "Sandbox", metadata: { name: "fs-abc123", namespace: "alasio-sessions" }, spec: {} });
-  kube.put("persistentvolumeclaims", { apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: { name: "workspace-fs-abc123", namespace: "alasio-sessions" }, spec: {}, status: { phase: "Bound" } });
-  kube.changes.length = 0;
-  for (const command of [["up"], ["upgrade", "--check"]]) {
-    assert.equal(
-      failure(await alasio(command)),
-      "alasio-sessions holds session workspaces of the release before (Sandbox fs-abc123, claim workspace-fs-abc123), which this release runs no session on and moves nothing of, " +
-        "so alasio applies nothing: delete each first, its files with it " +
-        "(kubectl -n alasio-sessions delete sandboxes.agents.x-k8s.io fs-abc123; kubectl -n alasio-sessions delete pvc workspace-fs-abc123)",
-    );
-  }
-  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
-  // Once they are deleted, it applies.
-  kube.objects.delete("/apis/agents.x-k8s.io/v1beta1/namespaces/alasio-sessions/sandboxes/fs-abc123");
-  kube.objects.delete("/api/v1/namespaces/alasio-sessions/persistentvolumeclaims/workspace-fs-abc123");
-  succeeded(await alasio(["up"]));
-});
-
 test("up applies nothing where objects the cluster has cannot take this release's of them, telling every one refused at once, as a dry run of each says", async (t) => {
   const { alasio, kube } = await branchable(t);
   // Two of them, the log's and the pageservers' StatefulSets, each with its pods started in order, which no StatefulSet changes.
