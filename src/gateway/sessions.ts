@@ -318,9 +318,10 @@ export const makeSessions = Effect.fnUntraced(function*(
         if (pod.metadata?.deletionTimestamp === undefined || !workspace || draining.has(uid)) continue;
         draining.add(uid);
         started.push(key);
-        // Released as the binder releases one, its Lease marked releasing first: a release of the gateway's own under way is one of none.
+        // Released as the binder releases one, its Lease marked releasing first: a release of the gateway's own under way is one of none,
+        // and one of the key bound anew since, to another pod, is none of this pod's.
         let binding = "";
-        yield* Effect.forkDetach(binder.release(pool, key, (bound) => (bound.pod === pod.metadata?.name ? ((binding = bound.binding), drained(pool, workspace, pod)) : Effect.void)).pipe(
+        yield* Effect.forkDetach(binder.release(pool, key, (bound) => ((binding = bound.binding), drained(pool, workspace, pod)), pod.metadata?.name ?? "").pipe(
           Effect.tap((done) =>
             done === "released"
               ? Effect.andThen(released(pool, "deleted"), tell(pool, (environment) => ({ kind: "workspace.released", environment, source: "sandbox-gateway", subject: subject(key), binding, reason: "deleted" })))
@@ -351,7 +352,7 @@ export const makeSessions = Effect.fnUntraced(function*(
   /** Releases the binding of `key` of `pool`, its pod `pod`, as `before` says, telling of it, as released for `reason`. */
   const releaseFor = (pool: Pool, key: string, pod: V1Pod, reason: "broken", before: (name: string) => Effect.Effect<void, KubeApiError | NodeAgentError | BindStepFailed>) => {
     let binding = "";
-    return binder.release(pool, key, (bound) => (bound.pod === pod.metadata?.name ? ((binding = bound.binding), before(bound.pod)) : Effect.void)).pipe(
+    return binder.release(pool, key, (bound) => ((binding = bound.binding), before(bound.pod)), pod.metadata?.name ?? "").pipe(
       Effect.tap((done) =>
         done === "released" ? Effect.andThen(released(pool, reason), tell(pool, (environment) => ({ kind: "workspace.released", environment, source: "sandbox-gateway", subject: subject(key), binding, reason }))) : Effect.void
       ),

@@ -13,7 +13,7 @@ import { TestClock } from "effect/testing";
 import { added } from "./support/metrics.ts";
 import { Binder } from "../src/binder/binder.ts";
 import { markReleasing, readLease, releaseLease, takeLease, touchLease } from "../src/binder/bindings.ts";
-import { freeLabels, type Pool } from "../src/binder/names.ts";
+import { freeLabels, leaseName, type Pool } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
 import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
 import type { EventInput } from "../src/events/events.ts";
@@ -901,6 +901,25 @@ test("a bound pod ending whose binding another releases, as a broken one's is, i
   // Its release one of none, as another's runs.
   await new Promise((resolve) => setTimeout(resolve, 1_000));
   assert.deepEqual(await drain(), []);
+  assert.deepEqual(recorded.asked, []);
+});
+
+test("a bound pod ending whose key was bound anew to another pod before its release came leaves that pod and its binding whole", async () => {
+  const env = await environment(2, { gvisor: true, holdsStop: true });
+  const recorded = agents();
+  const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+  const key = sessionKey("fs-rebound");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  await run(withKube((kube) => kube.remove("v1", "Pod", env.namespace, bound.pod)));
+  // Bound anew, to the pool's other pod, before the drain looks at the first.
+  const other = bound.pod === "none-0" ? "none-1" : "none-0";
+  await run(withKube((kube) => kube.patch("coordination.k8s.io/v1", "Lease", env.namespace, leaseName(key), { spec: { holderIdentity: other } })));
+  assert.deepEqual(await Effect.runPromise(Effect.provide(sessions.drain, Layer.fresh(KubeClient.layer))), [key]);
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  assert.equal((await run(readLease(env.none, key)))?.spec?.holderIdentity, other);
+  const pod = await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, other))) as V1Pod | null;
+  assert.equal(pod?.metadata?.deletionTimestamp, undefined, `${other}, bound anew, was deleted`);
   assert.deepEqual(recorded.asked, []);
 });
 

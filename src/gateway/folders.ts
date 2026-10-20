@@ -330,7 +330,7 @@ export const makeFolders = Effect.fnUntraced(function*(
       const bayma = pod.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER);
       if (bayma?.state?.terminated === undefined && pod.status?.phase !== "Failed" && pod.status?.phase !== "Succeeded") continue;
       yield* Effect.logWarning(`${key}'s bayma ended in its folder instance ${pod.metadata?.name}, which serves its binding no more: it is released, the next bind making another`);
-      yield* Effect.forkDetach(binder.release(pool, key, ({ pod: name }) => removed(name)).pipe(
+      yield* Effect.forkDetach(binder.release(pool, key, ({ pod: name }) => removed(name), pod.metadata?.name ?? "").pipe(
         Effect.tap((done) => (done === "released" ? released(pool, "broken") : Effect.void)),
         Effect.catch((error) => Effect.logWarning(`releasing ${key}, whose bayma ended, failed: ${error.message}`)),
       ));
