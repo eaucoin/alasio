@@ -38,7 +38,7 @@ function rig(t: TestContext) {
   return { directory, machine, perform };
 }
 
-test("a server's files: k3s's config, without traefik, its volumes where the config says, kubelet's thresholds, no snapshotter of its own; registries only when given; each gVisor release a runtime, where systemd runs the machine; stargz-snapshotter's daemon's", () => {
+test("a server's files: k3s's config, without traefik, its volumes where the config says, kubelet's thresholds, no snapshotter of its own, its sandbox image pinned; registries only when given; each gVisor release a runtime, where systemd runs the machine; stargz-snapshotter's daemon's", () => {
   const files = nodeFiles({ role: "server", storagePath: STORAGE, gvisor: ["20990101.0"] });
   assert.deepEqual([...files.keys()], [
     "/etc/rancher/k3s/config.yaml",
@@ -64,6 +64,8 @@ test("a server's files: k3s's config, without traefik, its volumes where the con
       "image-gc-low-threshold=95",
     ],
     "snapshotter": "",
+    // Its sandbox image by the name the CRI pins it by.
+    "pause-image": "docker.io/rancher/mirrored-pause:3.10.2",
   });
   const runtimes = containerdFiles(["20990101.0"], { systemd: true });
   for (const [path, content] of runtimes) assert.equal(files.get(path), content);

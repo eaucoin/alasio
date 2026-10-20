@@ -45,6 +45,7 @@ import {
   readySince,
   type Registries,
   registriesYaml,
+  SANDBOX_IMAGE,
   staleRuntimeClasses,
   WAITS,
   writeKubeconfig,
@@ -246,10 +247,11 @@ const ABORT_FUSE = [
 ].join("\n");
 
 /**
- * What every node's k3s is given: kubelet's settings, and no snapshotter, as containerd's
- * files in its container say stargz-snapshotter's daemon's (./stargz.ts).
+ * What every node's k3s is given: kubelet's settings, no snapshotter, as containerd's
+ * files in its container say stargz-snapshotter's daemon's (./stargz.ts), and its sandbox
+ * image pinned (./k3s.ts).
  */
-const nodeArgs = [...KUBELET_ARGS.map((arg) => `--kubelet-arg=${arg}`), "--snapshotter="];
+const nodeArgs = [...KUBELET_ARGS.map((arg) => `--kubelet-arg=${arg}`), "--snapshotter=", `--pause-image=${SANDBOX_IMAGE}`];
 
 /** A digest of `spec` and the `files` put into its container that two share only when they are the same. */
 const specHash = (spec: ContainerCreate, files: ReadonlyMap<string, string>): string => createHash("sha256").update(JSON.stringify([spec, [...files]])).digest("hex");

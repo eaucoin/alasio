@@ -38,6 +38,7 @@ import { neonStack } from "../../neon/test/stack.ts";
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
+import { SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
 import { NODE_PINS } from "../../cli/src/cluster/node.ts";
 import { goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
@@ -889,6 +890,16 @@ if (inShard("sessions")) {
       // alasio comes up, beside every other image of alasio's, which some pulls wait behind.
       const fastest = Math.min(...pulls.map(goSeconds));
       assert.ok(fastest < 30, `the agent's image took ${pulls.join(", ")} to pull`);
+    });
+
+    test("pins the pods' sandbox image, k3s's own, by the name containerd's CRI pulls it by, so neither a prune of the node's images nor kubelet's collection deletes it", async () => {
+      const server = `${CLUSTER}-server-0`;
+      const fallback = /--pause-image value[^\n]*\(default: "([^"]+)"\)/u.exec(await onNode(server, "k3s agent --help"))?.[1];
+      assert.equal(fallback, NODE_PINS.k3s.pauseImage, "cluster/node/pins.json's pauseImage is not k3s's own");
+      const { status } = JSON.parse(await onNode(server, `crictl inspecti -o json '${SANDBOX_IMAGE}'`)) as { status: { pinned?: boolean } };
+      assert.equal(status.pinned, true, `the CRI holds ${SANDBOX_IMAGE} unpinned`);
+      // What containerd holds of each image's content: none of the layers stargz-snapshotter's daemon reads lazily.
+      console.error(`# the node's images, as containerd checks their content:\n${(await onNode(server, "ctr -n k8s.io images check")).trimEnd()}`);
     });
 
     test("a new workspace with internet reaches the internet and nothing private", async () => {

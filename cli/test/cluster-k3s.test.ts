@@ -10,8 +10,9 @@ import { test } from "node:test";
 
 import { KubeConfig } from "@kubernetes/client-node";
 
+import pins from "../../cluster/node/pins.json" with { type: "json" };
 import { runscFlags } from "../../src/node-agent/runsc.ts";
-import { clusterKubeconfig, containerdFiles, gvisorRuntimeClasses, nodeHostsWith, readySince, registriesYaml, staleRuntimeClasses, unservedPods } from "../src/cluster/k3s.ts";
+import { clusterKubeconfig, containerdFiles, gvisorRuntimeClasses, nodeHostsWith, normalizedReference, readySince, registriesYaml, SANDBOX_IMAGE, staleRuntimeClasses, unservedPods } from "../src/cluster/k3s.ts";
 import { SNAPSHOTTER, STARGZ_ROOT, STARGZ_SOCKET } from "../src/cluster/stargz.ts";
 
 /** The kubeconfig k3s writes. */
@@ -34,6 +35,19 @@ users:
     client-certificate-data: Q0VSVA==
     client-key-data: S0VZ
 `;
+
+test("an image's name is normalized as the CRI names it, so k3s's sandbox image is pinned by the name it is pulled by", () => {
+  assert.deepEqual(["rancher/mirrored-pause:3.10.2", "busybox:1.37", "docker.io/library/busybox:1.37", "ghcr.io/eaucoin/alasio:9.0.0", "localhost:5000/alasio", "localhost/alasio", "registry:5000/a/b"].map(normalizedReference), [
+    "docker.io/rancher/mirrored-pause:3.10.2",
+    "docker.io/library/busybox:1.37",
+    "docker.io/library/busybox:1.37",
+    "ghcr.io/eaucoin/alasio:9.0.0",
+    "localhost:5000/alasio",
+    "localhost/alasio",
+    "registry:5000/a/b",
+  ]);
+  assert.equal(SANDBOX_IMAGE, `docker.io/${pins.k3s.pauseImage}`);
+});
 
 test("registriesYaml says the registries in k3s's keys, leaving out what is not given", () => {
   assert.deepEqual(JSON.parse(registriesYaml({})), { mirrors: {}, configs: {} });

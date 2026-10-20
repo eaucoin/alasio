@@ -134,6 +134,8 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
       "--kubelet-arg=image-gc-low-threshold=95",
       // No snapshotter of k3s's: the node image's template says stargz-snapshotter's daemon's.
       "--snapshotter=",
+      // Its sandbox image by the name the CRI pins it by.
+      "--pause-image=docker.io/rancher/mirrored-pause:3.10.2",
     ],
     Env: [`ALASIO_STARGZ_CONFIG=${stargzConfig()}`, "ALASIO_STARGZ_MEMORY_LIMIT=128MiB"],
     ExposedPorts: { "6443/tcp": {} },

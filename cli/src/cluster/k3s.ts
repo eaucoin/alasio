@@ -12,6 +12,7 @@ import { dirname } from "node:path";
 import { type Cluster, KubeConfig, type User, type V1Node, type V1Pod, type V1RuntimeClass } from "@kubernetes/client-node";
 import { Duration, Effect, FileSystem, type PlatformError, Schedule, Schema } from "effect";
 
+import pins from "../../../cluster/node/pins.json" with { type: "json" };
 import { CONTAINERD, gvisorDirectory, gvisorHandler, gvisorRuntimeClass } from "../../../src/node-agent/names.ts";
 import { SNAPSHOTTER, STARGZ_ROOT, STARGZ_SOCKET } from "./stargz.ts";
 
@@ -58,6 +59,32 @@ export const KUBELET_ARGS: readonly string[] = [
   "image-gc-high-threshold=98",
   "image-gc-low-threshold=95",
 ];
+
+/**
+ * `reference` as Docker's references normalize it, as containerd's CRI names the image it
+ * pulls: with its registry, docker.io where it names none, and library/ for one of
+ * docker.io's own.
+ */
+export function normalizedReference(reference: string): string {
+  const [first = "", ...rest] = reference.split("/");
+  if (rest.length > 0 && (first.includes(".") || first.includes(":") || first === "localhost")) return reference;
+  return `docker.io/${rest.length > 0 ? reference : `library/${reference}`}`;
+}
+
+/**
+ * The pods' sandbox image, k3s's own (its --pause-image's default, cluster/node/pins.json's
+ * k3s.pauseImage), by the name containerd's CRI pins it by, so that neither kubelet's
+ * collection of unused images nor a prune of the node's images deletes it. k3s writes the
+ * name it is given as containerd's pinned sandbox image, and the CRI pins an image only where
+ * that is the name it pulls by, normalized: k3s's default, "rancher/mirrored-pause:...", pins
+ * nothing. Unpinned, it is deleted while pods run on its snapshot, as no container is of it,
+ * and pulled again by the next pod onto that snapshot, which containerd fetches no layer of:
+ * recorded without its layer's content, which a node whose snapshotter changes cannot make a
+ * pod without (upgrades/from-8.0.0.sh, lazy pulling). So it is no check of an image's content
+ * that keeps a node sound: an image stargz-snapshotter's daemon pulls lazily is recorded
+ * without its layers' content by design.
+ */
+export const SANDBOX_IMAGE = normalizedReference(pins.k3s.pauseImage);
 
 /**
  * The pod annotations containerd passes on to gVisor's runtimes, and drops otherwise:
