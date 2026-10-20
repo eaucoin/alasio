@@ -72,6 +72,7 @@ import { pipeline } from "node:stream/promises";
 import type { BatchObservableResult } from "@opentelemetry/api";
 import { Clock, type Duration, Effect, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 
+import { quantityOf } from "../kube/quantity.ts";
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
 import { withLogScope } from "../shared/log.ts";
@@ -646,9 +647,6 @@ async function imageFiles(directory: string): Promise<ImageFile[]> {
 const sameFiles = (found: readonly ImageFile[], layer: Layer): boolean =>
   JSON.stringify(found) === JSON.stringify(layer.files.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })));
 
-/** What each suffix of a Kubernetes quantity multiplies it by. */
-const QUANTITY_UNITS: Readonly<Record<string, number>> = { Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40, Pi: 2 ** 50, Ei: 2 ** 60, k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18 };
-
 /**
  * The most memory the pod of `podTemplate` may hold, as its containers' limits say, which
  * bounds its sandbox's image: what a checkpoint makes room for in the cache. A container of
@@ -657,9 +655,7 @@ const QUANTITY_UNITS: Readonly<Record<string, number>> = { Ki: 2 ** 10, Mi: 2 **
 export function memoryLimitOf(podTemplate: Readonly<Record<string, unknown>>): number {
   const spec = podTemplate["spec"] as { readonly containers?: readonly { readonly resources?: { readonly limits?: Readonly<Record<string, unknown>> } }[] } | undefined;
   return (spec?.containers ?? []).reduce((sum, { resources }) => {
-    const limit = resources?.limits?.["memory"];
-    const [, amount = "", unit = ""] = /^([0-9]+(?:\.[0-9]+)?)([A-Za-z]*)$/u.exec(typeof limit === "string" ? limit : String(limit ?? "")) ?? [];
-    const bytes = Number(amount) * (unit === "" ? 1 : QUANTITY_UNITS[unit] ?? Number.NaN);
+    const bytes = quantityOf(resources?.limits?.["memory"]);
     return sum + (Number.isFinite(bytes) ? Math.ceil(bytes) : 0);
   }, 0);
 }
