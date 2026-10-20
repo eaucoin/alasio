@@ -25,8 +25,11 @@ export const BRANCH_FORK_PORT = 4319;
 /** The namespace of the branch environment `branch`: its alasio, its compute and its lake, and their Secrets. */
 export const branchNamespace = (branch: string): string => `alasio-branch-${branch}`;
 
+/** What ends the name of a branch environment's sessions' namespace, after its own's. */
+export const SESSIONS_SUFFIX = "-sessions";
+
 /** The namespace of the branch environment `branch`'s sessions. */
-export const branchSessionsNamespace = (branch: string): string => `${branchNamespace(branch)}-sessions`;
+export const branchSessionsNamespace = (branch: string): string => `${branchNamespace(branch)}${SESSIONS_SUFFIX}`;
 
 /** The token the branch `branch` forks its parent's sessions with: `key`'s HMAC of its name. */
 export function forkToken(key: string, branch: string): string {

@@ -327,6 +327,11 @@ describe("a compute named", () => {
     assert.match(nameProblem("try-ro") ?? "", /does not end in -ro/u);
     assert.equal(nameProblem("try-row"), null);
   });
+
+  test("leaves no branch a name whose namespace another branch's sessions' would be", () => {
+    assert.match(nameProblem("try-sessions") ?? "", /does not end in -sessions/u);
+    assert.equal(nameProblem("try-sessionsx"), null);
+  });
 });
 
 describe("the shards", () => {

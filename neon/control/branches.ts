@@ -21,6 +21,7 @@
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 
+import { SESSIONS_SUFFIX } from "../../src/branch/names.ts";
 import type { JsonWebKeySet } from "./jwt.ts";
 import { DATABASE, HARNESS_ROLE, LAKE_ROLE, ROLE } from "./secrets.ts";
 
@@ -129,6 +130,8 @@ export function nameProblem(name: string): string | null {
   // A DNS-1123 label, as the names of the objects named after it must be.
   if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/u.test(name)) return "a branch's name is lowercase letters, digits and inner hyphens";
   if (name.endsWith(REPLICA_SUFFIX)) return `a branch's name does not end in ${REPLICA_SUFFIX}, which names a read replica's compute`;
+  // Its namespace would be another branch's sessions', whose pods run untrusted code.
+  if (name.endsWith(SESSIONS_SUFFIX)) return `a branch's name does not end in ${SESSIONS_SUFFIX}, which names a branch's sessions' namespace`;
   return null;
 }
 
