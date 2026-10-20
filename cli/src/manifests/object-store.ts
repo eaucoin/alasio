@@ -403,6 +403,20 @@ function filerStoreObjects(config: InstallConfig): KubernetesObject[] {
 }
 
 /**
+ * How many GETs its limiter lets be under way at a gateway at once (src/object-store/
+ * get-limiter.ts): SeaweedFS 4.48 reads the chunks its GETs read into 256 slots shared by
+ * them all, each GET holding the one it reads and four ahead, and past what they hold, a GET
+ * takes another's slot, even one it reads, which that GET reads again and may lose again.
+ * Under the box's load in CI (test/gateway-memory.test.ts), 68 GETs at once, one took 392 s;
+ * with 40 let through, 200 slots at most, a GET still trickled at 0.1 to 0.2 MiB/s in two
+ * runs of four; with 16, 80 at most, none came slower than an eighteenth of the median GET's
+ * rate once begun, under 124 at once too, the others waiting their turn up to 12 s.
+ */
+export const GATEWAY_GET_STREAMS = 16;
+/** The port `weed s3` serves on in its pod, behind its GET limiter, which serves the S3 port. */
+const GATEWAY_BEHIND_LIMITER_PORT = 8334;
+
+/**
  * How many MiB an S3 gateway of `resources` holds at most of the uploads under way: a request
  * past it waits for room, its part held whole as it is read. An eighth of its memory limit,
  * 256 MiB of 2 GiB; 256 where it has no limit.
@@ -495,6 +509,9 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
                 "s3",
                 `-filer=${podAddresses(FILER, FILER_PEERS, bundled.filers.scaling.min, 8888)}`,
                 "-ip.bind=0.0.0.0",
+                // Behind its GET limiter, which serves the S3 port; its gRPC port as it was.
+                `-port=${GATEWAY_BEHIND_LIMITER_PORT}`,
+                "-port.grpc=18333",
                 "-config=/etc/seaweedfs/s3.json",
                 "-allowDeleteBucketNotEmpty=false",
                 "-autoCreateBucket=false",
@@ -505,12 +522,32 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
                 `-concurrentUploadLimitMB=${gatewayUploadBufferMiB(bundled.gateways.resources)}`,
               ],
               ...goMemoryLimit(bundled.gateways.resources),
-              ports: [...PORTS.gateway.map(({ name, port }) => ({ name, containerPort: port })), { name: "metrics", containerPort: METRICS_PORT }],
-              readinessProbe: { httpGet: { path: "/healthz", port: "s3" }, periodSeconds: 5 },
-              livenessProbe: { httpGet: { path: "/healthz", port: "s3" }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 6 },
+              ports: [{ name: "s3-behind", containerPort: GATEWAY_BEHIND_LIMITER_PORT }, { name: "s3-grpc", containerPort: 18333 }, { name: "metrics", containerPort: METRICS_PORT }],
+              readinessProbe: { httpGet: { path: "/healthz", port: "s3-behind" }, periodSeconds: 5 },
+              livenessProbe: { httpGet: { path: "/healthz", port: "s3-behind" }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 6 },
               securityContext: restrictedContainer(),
               resources: bundled.gateways.resources,
               volumeMounts: [{ name: "identities", mountPath: "/etc/seaweedfs", readOnly: true }],
+            },
+            // In front of it on the S3 port, every client's way in: at most GATEWAY_GET_STREAMS
+            // GETs under way at once, the rest waiting their turn (src/object-store/get-limiter.ts).
+            {
+              name: "get-limiter",
+              image: imageReference(config.images.alasio),
+              imagePullPolicy: config.images.pullPolicy,
+              command: ["node", "/opt/alasio/src/object-store/get-limiter-main.ts"],
+              env: [
+                { name: "GET_LIMITER_PORT", value: "8333" },
+                { name: "GET_LIMITER_UPSTREAM", value: `127.0.0.1:${GATEWAY_BEHIND_LIMITER_PORT}` },
+                { name: "GET_LIMITER_STREAMS", value: String(GATEWAY_GET_STREAMS) },
+              ],
+              ports: [{ name: "s3", containerPort: 8333 }],
+              readinessProbe: { tcpSocket: { port: "s3" }, periodSeconds: 5 },
+              securityContext: restrictedContainer(),
+              // At most 201 MiB under 124 GETs at once (test/gateway-memory.test.ts): node's own
+              // 60, its connections' buffers as far as 60, and the pieces passed on that its
+              // collector has yet to free, up to 110. Half again on that, for more clients.
+              resources: { requests: { cpu: "10m", memory: "48Mi" }, limits: { memory: "320Mi" } },
             },
             // Makes the buckets, idempotently, as the gateway starts: Neon's versioned (its
             // time-travel recovery needs that), writes fsynced. One a gateway beside it has

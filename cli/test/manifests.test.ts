@@ -971,7 +971,7 @@ describe("object store", () => {
     assert.deepEqual(modes, { "alasio-seaweedfs-master": "Off", "alasio-seaweedfs-volume": "Off", "alasio-seaweedfs-filer-store": "Off", "alasio-seaweedfs-filer": "InPlace", "alasio-seaweedfs": "InPlace" });
   });
 
-  test("bounds what an S3 gateway holds of uploads under way, not of GETs, holds its connections' buffers small, and has Go collect before its memory limit", () => {
+  test("puts an S3 gateway behind a GET limiter, bounds what it holds of uploads under way, holds its connections' buffers small, and has Go collect before its memory limit", () => {
     const gateway = (objects: readonly KubernetesObject[]) => container(one<V1Deployment>(objects, "Deployment", "alasio-seaweedfs"));
     const s3 = gateway(install());
     // Its limit 2Gi by default, an eighth of it for uploads; no budget of its GETs, which livelocks one (./object-store.ts).
@@ -984,6 +984,20 @@ describe("object store", () => {
       { name: "net.ipv4.tcp_rmem", value: "4096 131072 1048576" },
       { name: "net.ipv4.tcp_wmem", value: "4096 16384 1048576" },
     ]);
+    // Behind its GET limiter, which serves the S3 port and lets 16 GETs be under way at once.
+    const pod = one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs").spec?.template.spec;
+    assert.deepEqual(s3.args?.filter((arg) => /^-port(\.grpc)?=/u.test(arg)), ["-port=8334", "-port.grpc=18333"]);
+    assert.deepEqual(s3.ports?.map(({ name, containerPort }) => [name, containerPort]), [["s3-behind", 8334], ["s3-grpc", 18333], ["metrics", 9327]]);
+    const limiter = pod?.containers.find(({ name }) => name === "get-limiter");
+    assert.deepEqual(limiter?.command, ["node", "/opt/alasio/src/object-store/get-limiter-main.ts"]);
+    assert.deepEqual(limiter?.env, [
+      { name: "GET_LIMITER_PORT", value: "8333" },
+      { name: "GET_LIMITER_UPSTREAM", value: "127.0.0.1:8334" },
+      { name: "GET_LIMITER_STREAMS", value: "16" },
+    ]);
+    assert.deepEqual(limiter?.ports, [{ name: "s3", containerPort: 8333 }]);
+    assert.equal(limiter?.resources?.limits?.["memory"], "320Mi");
+    assert.deepEqual(one<V1Service>(install(), "Service", "alasio-seaweedfs").spec?.ports?.map(({ port }) => port), [8333, 18333, 9327]);
     const smaller = gateway(install({ objectStore: { bundled: { gateways: { resources: { limits: { memory: "1Gi" } } } } } }));
     assert.deepEqual(smaller.args?.filter((arg) => /^-concurrentUploadLimitMB=/u.test(arg)), ["-concurrentUploadLimitMB=128"]);
     assert.deepEqual(smaller.env, [{ name: "GOMEMLIMIT", value: "614MiB" }]);
@@ -1075,8 +1089,8 @@ describe("object store", () => {
 
   test("makes the buckets and their lifecycle rules in each gateway as it starts, ready only once they are", () => {
     const gateway = one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs");
-    assert.deepEqual(gateway.spec?.template.spec?.containers.map(({ name }) => name), ["s3", "buckets", "lifecycle"]);
-    const buckets = gateway.spec?.template.spec?.containers[1]?.command?.[2] ?? "";
+    assert.deepEqual(gateway.spec?.template.spec?.containers.map(({ name }) => name), ["s3", "get-limiter", "buckets", "lifecycle"]);
+    const buckets = gateway.spec?.template.spec?.containers.find(({ name }) => name === "buckets")?.command?.[2] ?? "";
     assert.match(buckets, /weed shell -master=alasio-seaweedfs-master-0\.alasio-seaweedfs-master\.alasio\.svc\.cluster\.local:9333 -filer=alasio-seaweedfs-filer:8888/u);
     assert.match(buckets, /for bucket in neon lake backups workspaces snapshots; do/u);
   });
