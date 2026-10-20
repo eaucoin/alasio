@@ -30,7 +30,7 @@ import { CONTAINERD, GVISOR_RELEASES, gvisorDirectory, gvisorHandler } from "../
 import { Registries } from "../config.ts";
 import { clusterKubeconfig, containerdFiles, KUBELET_ARGS, NotYet, registriesYaml, SANDBOX_IMAGE } from "./k3s.ts";
 import { Machine, type RootCommandFailed, RootSystem, under } from "./machine.ts";
-import { STARGZ_CONFIG, STARGZ_EXECUTABLES, STARGZ_MEMORY_LIMIT, STARGZ_ROOT, STARGZ_SOCKET, stargzConfig } from "./stargz.ts";
+import { FUSE_MANAGER_SOCKET, FUSE_MANAGER_STORE, STARGZ_CONFIG, STARGZ_EXECUTABLES, STARGZ_MEMORY_LIMIT, STARGZ_ROOT, STARGZ_SOCKET, stargzConfig } from "./stargz.ts";
 import { tarEntries } from "./tar.ts";
 
 /**
@@ -130,6 +130,10 @@ export const STARGZ_SERVICE = "stargz-snapshotter";
 const STARGZ_UNIT = `/etc/systemd/system/${STARGZ_SERVICE}.service`;
 /** What k3s's service is given beside its install script's: the daemon, started before it. */
 const K3S_DROP_IN = `/etc/systemd/system/${SERVICE}.service.d/alasio-stargz.conf`;
+/** The containers that ran on a FUSE manager gone, which the daemon's service lists as it starts and stops once the daemon serves, one id a line. */
+const ON_GONE_MANAGER = `${dirname(STARGZ_SOCKET)}/on-gone-manager`;
+/** The mounts of a FUSE manager gone, as the daemon's service finds them before it unmounts them. */
+const SERVED = `${ON_GONE_MANAGER}.mounts`;
 
 /**
  * How a node is made: a server, its volumes in `storagePath`, pulling through
@@ -177,7 +181,40 @@ export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
       "[Service]",
       "# Go's soft limit on its heap and its FUSE manager's (./stargz.ts's STARGZ_MEMORY_LIMIT).",
       `Environment=GOMEMLIMIT=${STARGZ_MEMORY_LIMIT}`,
+      "# Its FUSE manager gone, as one killed is or a machine's crash ends, its socket held by no process, as the",
+      "# kernel's table of sockets says: its socket removed, so the daemon starts a manager anew rather than none for the",
+      "# socket; its record of what it mounted removed, so the new manager mounts nothing the daemon then finds mounted",
+      "# and skips (./stargz.ts's FUSE_MANAGER_SOCKET and FUSE_MANAGER_STORE); and the mounts it served unmounted",
+      "# lazily, deepest first, as the daemon unmounts each before it mounts it again, and cannot where the pods'",
+      "# containers that ran on it hold it. And those containers, each on an overlay of a layer it served, whose reads",
+      "# fail now and whose probes may not say so, listed, the id of each the directory of its root's mount, to be",
+      "# stopped once the daemon serves. Only then: a manager there serves its mounts on, and is left be with them and",
+      "# its pods, so what is unmounted serves nothing already.",
+      `ExecStartPre=/bin/sh -c '${[
+        // systemd's $$ a $, the end of the line the socket is on.
+        `grep -q " ${FUSE_MANAGER_SOCKET}$$" /proc/net/unix && exit 0`,
+        `mkdir -p ${dirname(STARGZ_SOCKET)}`,
+        // Its mounts, the layers it served; the overlays on any of them, the containers that ran on it.
+        `grep " - fuse" /proc/self/mountinfo | cut -d " " -f 5 | grep "^${STARGZ_ROOT}/snapshotter/snapshots/" > ${SERVED}`,
+        `grep " - overlay " /proc/self/mountinfo | grep -F -f ${SERVED} | cut -d " " -f 5 | sed -n "s|/rootfs$$||p" | xargs -r -n 1 basename > ${ON_GONE_MANAGER}`,
+        // The daemon's socket too, which it makes once it has mounted its snapshots' layers again, and the step after waits for.
+        `rm -f ${FUSE_MANAGER_SOCKET} ${FUSE_MANAGER_STORE} ${STARGZ_SOCKET}`,
+        `sort -r ${SERVED} | xargs -r -n 1 umount -l`,
+        `rm -f ${SERVED}`,
+      ].join("; ")}'`,
       `ExecStart=${BIN}/containerd-stargz-grpc --address=${STARGZ_SOCKET} --config=${STARGZ_CONFIG} --root=${STARGZ_ROOT}`,
+      "# The containers listed before it started stopped at once, once it serves, as no hook of theirs can run on what",
+      "# serves nothing, so kubelet starts each again on the layers it mounted anew; what it costs, the containers on",
+      "# those mounts started again, they could read nothing anyway. Each step bounded, and the unit started however",
+      "# they end, a stop that fails said in its journal. Where the manager went as k3s restarts, k3s's start waits for",
+      "# this one's (After=), about 65 s at most, and crictl reaches no containerd: the stop fails so, and those",
+      "# containers run on, their reads failing, until each ends or is ended by hand.",
+      `ExecStartPost=-/bin/sh -c '${[
+        `[ -s ${ON_GONE_MANAGER} ] || { rm -f ${ON_GONE_MANAGER}; exit 0; }`,
+        `waited=0; until [ -S ${STARGZ_SOCKET} ] || [ "$$waited" -ge 450 ]; do sleep 0.1; waited=$$((waited + 1)); done`,
+        `timeout 20 xargs -n 1 ${BIN}/k3s crictl stop --timeout 0 < ${ON_GONE_MANAGER} || echo "stopping the containers on the FUSE manager gone failed: $$(xargs < ${ON_GONE_MANAGER})" >&2`,
+        `rm -f ${ON_GONE_MANAGER}`,
+      ].join("; ")}'`,
       "Restart=always",
       "# Its FUSE manager keeps the mounts of the images running pods read, through the daemon's restarts.",
       "KillMode=process",

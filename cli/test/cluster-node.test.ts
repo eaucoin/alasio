@@ -4,9 +4,11 @@
  * k3s's own scripts do, and what is downloaded checked against its pin again as root.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 
 import { NodeServices } from "@effect/platform-node";
@@ -15,7 +17,7 @@ import { Effect, Layer, Logger } from "effect";
 import { containerdFiles } from "../src/cluster/k3s.ts";
 import { Machine } from "../src/cluster/machine.ts";
 import { type Artifact, ConfigureNode, downloads, InstallGvisor, InstallStargz, nodeFiles, type NodeStep, performNodeStep, RemoveGvisor } from "../src/cluster/node.ts";
-import { STARGZ_ROOT, STARGZ_SOCKET, stargzConfig } from "../src/cluster/stargz.ts";
+import { FUSE_MANAGER_SOCKET, FUSE_MANAGER_STORE, STARGZ_ROOT, STARGZ_SOCKET, stargzConfig } from "../src/cluster/stargz.ts";
 import { FakeMachine } from "./support/fake-machine.ts";
 import { type FakeReleases, fakeReleases } from "./support/fake-releases.ts";
 
@@ -38,7 +40,7 @@ function rig(t: TestContext) {
   return { directory, machine, perform };
 }
 
-test("a server's files: k3s's config, without traefik, its volumes where the config says, kubelet's thresholds, no snapshotter of its own, its sandbox image pinned; registries only when given; each gVisor release a runtime, where systemd runs the machine; stargz-snapshotter's daemon's", () => {
+test("a server's files: k3s's config, without traefik, its volumes where the config says, kubelet's thresholds, no snapshotter of its own, its sandbox image pinned; registries only when given; each gVisor release a runtime, where systemd runs the machine; stargz-snapshotter's daemon's", async () => {
   const files = nodeFiles({ role: "server", storagePath: STORAGE, gvisor: ["20990101.0"] });
   assert.deepEqual([...files.keys()], [
     "/etc/rancher/k3s/config.yaml",
@@ -74,6 +76,66 @@ test("a server's files: k3s's config, without traefik, its volumes where the con
   const unit = files.get("/etc/systemd/system/stargz-snapshotter.service") ?? "";
   assert.match(unit, /^PartOf=k3s\.service$/mu);
   assert.match(unit, /^KillMode=process$/mu);
+  // Before it starts, its FUSE manager gone: its socket no process holds and its record of its mounts removed, the
+  // containers on an overlay of a layer it served listed, and its mounts unmounted lazily, deepest first; once the daemon
+  // serves, those containers stopped. A manager there, its socket held, left be with its record, its mounts and its pods,
+  // as the kernel's tables say.
+  const script = (step: string) => new RegExp(`^${step}=-?/bin/sh -c '(.*)'$`, "mu").exec(unit)?.[1] ?? "";
+  const directory = mkdtempSync(join(tmpdir(), "alasio-fuse-manager-"));
+  const listening = createServer();
+  try {
+    const run = join(directory, "run");
+    const store = join(directory, "fusestore.db");
+    const sockets = join(directory, "unix");
+    const mounts = join(directory, "mountinfo");
+    const unmounted = join(directory, "unmounted");
+    const stopped = join(directory, "stopped");
+    mkdirSync(join(directory, "bin"));
+    writeFileSync(join(directory, "bin", "umount"), `#!/bin/sh\necho "$*" >> ${unmounted}\n`, { mode: 0o755 });
+    writeFileSync(join(directory, "bin", "k3s"), `#!/bin/sh\necho "$*" >> ${stopped}\n`, { mode: 0o755 });
+    const snapshots = `${STARGZ_ROOT}/snapshotter/snapshots`;
+    const task = "/run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io";
+    writeFileSync(mounts, [
+      `36 1 0:50 / ${snapshots}/1/fs rw - fuse.rawBridge stargz rw`,
+      `37 36 0:51 / ${snapshots}/1/fs/inner rw - fuse.rawBridge stargz rw`,
+      "38 1 0:52 / /var/lib/kubelet rw - ext4 /dev/sda1 rw",
+      // A container on a layer the manager served, and one on a layer pulled whole.
+      `39 1 0:53 / ${task}/c0ffee/rootfs rw - overlay overlay rw,lowerdir=${snapshots}/2/fs:${snapshots}/1/fs,upperdir=${snapshots}/3/fs`,
+      `40 1 0:54 / ${task}/beef/rootfs rw - overlay overlay rw,lowerdir=${snapshots}/4/fs,upperdir=${snapshots}/5/fs`,
+      // A layer pulled whole, no mount of the manager's though under the daemon's snapshots.
+      `41 1 8:1 /var/lib/whole ${snapshots}/4/fs rw - ext4 /dev/sda1 rw`,
+      "",
+    ].join("\n"));
+    // As systemd runs each, its $$ a $, on tables and paths of the test's.
+    const unitScript = (step: string) =>
+      script(step).replaceAll("$$", "$").replaceAll("/proc/net/unix", sockets).replaceAll("/proc/self/mountinfo", mounts).replaceAll(dirname(FUSE_MANAGER_SOCKET), run).replaceAll(FUSE_MANAGER_STORE, store).replaceAll("/usr/local/bin/k3s", join(directory, "bin", "k3s"));
+    const ran = (step: string) => spawnSync("sh", ["-c", unitScript(step)], { env: { PATH: `${join(directory, "bin")}:/usr/bin:/bin` } });
+    const socket = FUSE_MANAGER_SOCKET.replace(dirname(FUSE_MANAGER_SOCKET), run);
+    mkdirSync(run);
+    writeFileSync(socket, "");
+    writeFileSync(store, "");
+    writeFileSync(sockets, `Num       RefCount Protocol Flags    Type St Inode Path\n0000000000000000: 00000002 00000000 00010000 0001 01 23456 ${socket}\n`);
+    assert.equal(ran("ExecStartPre").status, 0);
+    assert.equal(ran("ExecStartPost").status, 0);
+    assert.ok(existsSync(socket) && existsSync(store) && !existsSync(unmounted) && !existsSync(stopped), "a manager there is left be, with its record, its mounts and its pods");
+    writeFileSync(sockets, `Num       RefCount Protocol Flags    Type St Inode Path\n0000000000000000: 00000002 00000000 00010000 0001 01 23457 ${socket}.other\n`);
+    assert.equal(ran("ExecStartPre").status, 0);
+    assert.ok(!existsSync(socket), "a socket no process holds is removed");
+    assert.ok(!existsSync(store), "the record of the manager gone is removed");
+    assert.equal(readFileSync(unmounted, "utf8"), `-l ${snapshots}/1/fs/inner\n-l ${snapshots}/1/fs\n`);
+    // Stopped once the daemon serves, as its socket says, and not before.
+    const after = spawn("sh", ["-c", unitScript("ExecStartPost")], { env: { PATH: `${join(directory, "bin")}:/usr/bin:/bin` } });
+    const ended = new Promise<number | null>((resolve) => after.on("exit", resolve));
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.ok(!existsSync(stopped), "nothing is stopped before the daemon serves");
+    await new Promise<void>((resolve) => listening.listen(STARGZ_SOCKET.replace(dirname(FUSE_MANAGER_SOCKET), run), resolve));
+    assert.equal(await ended, 0);
+    assert.equal(readFileSync(stopped, "utf8"), "crictl stop --timeout 0 c0ffee\n");
+    assert.deepEqual(readdirSync(run), [basename(STARGZ_SOCKET)]);
+  } finally {
+    listening.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
   assert.match(unit, /^Environment=GOMEMLIMIT=128MiB$/mu, "Go's soft limit on the daemon's heap and its FUSE manager's");
   assert.match(unit, new RegExp(`^ExecStart=/usr/local/bin/containerd-stargz-grpc --address=${STARGZ_SOCKET} --config=/etc/containerd-stargz-grpc/config\\.toml --root=${STARGZ_ROOT}$`, "mu"));
   assert.match(files.get("/etc/systemd/system/k3s.service.d/alasio-stargz.conf") ?? "", /^\[Unit\]\nWants=stargz-snapshotter\.service\nAfter=stargz-snapshotter\.service\n$/mu);

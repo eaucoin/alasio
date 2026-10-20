@@ -996,7 +996,7 @@ if (inShard("sessions")) {
       await untilInLake("Claude Code's answer in its transcript", "select count(*) as n from claude.entries where type = 'assistant'");
     });
 
-    // Last, as a restart of k3s ends the port forwards the tests before it reach the stand-ins through.
+    // After the tests that reach the stand-ins through port forwards, as a restart of k3s ends them; the webhook's tests forward anew.
     test("keeps pods pulled lazily running through a restart of k3s, and of stargz-snapshotter's daemon with it, the node's workspace mount ready again", { skip: (TARGET !== "host" || !ESTARGZ) && "k3s is restarted on its own where it is a service of the machine's, and its pods pulled lazily" }, async () => {
       const session = await newSession("none");
       const sessionName = (await sessionPod(session)).metadata?.name ?? "";
@@ -1014,7 +1014,50 @@ if (inShard("sessions")) {
       await kube.awaitReady([ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE)], "5 minutes");
     });
 
-    // Last, as a restart of a node's container ends the port forwards the tests before it reach the stand-ins through.
+    // After the tests that reach the stand-ins through port forwards, as the pods it ends take them; the webhook's tests forward anew.
+    test("mounts the layers of pods pulled lazily again once stargz-snapshotter's FUSE manager is killed and its daemon restarts, a manager started anew", { skip: (TARGET !== "host" || !ESTARGZ) && "the daemon is a service of the machine's where k3s is, its pods pulled lazily" }, async () => {
+      const managers = async () =>
+        (await onNode("", 'for exe in /proc/[0-9]*/exe; do [ "$(readlink "$exe")" = /usr/local/bin/stargz-fuse-manager ] && { pid=${exe%/exe}; echo "${pid#/proc/}"; }; done; true')).trim();
+      // Running through the kill, on layers it served: a session's bayma, under gVisor, and the node's workspace mount.
+      const session = await newSession("none");
+      const sessionName = (await sessionPod(session)).metadata?.name ?? "";
+      const [mount] = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("workspace-mount")) });
+      const ranThrough: [string, string][] = [[SESSIONS, sessionName], [NAMESPACE, mount?.metadata?.name ?? ""]];
+      // A pod gone counts as started again: a session's, its bayma ended, is released as broken and bound anew.
+      const restarts = () =>
+        Promise.all(ranThrough.map(async ([namespace, name]) => {
+          const pod = await kube.get<V1Pod>(ref("Pod", name, namespace));
+          return pod ? pod.status?.containerStatuses?.[0]?.restartCount ?? 0 : Number.POSITIVE_INFINITY;
+        }));
+      const restartsBefore = await restarts();
+      assert.deepEqual(await Promise.all(ranThrough.map(([namespace, name]) => onRemoteSnapshot(namespace, name))), [true, true]);
+      const killed = await managers();
+      assert.match(killed, /^\d+$/u, "one FUSE manager runs");
+      await onNode("", `kill -KILL ${killed} && systemctl restart stargz-snapshotter`);
+      await until("a FUSE manager started anew", async () => {
+        const now = await managers();
+        return now !== "" && now !== killed ? true : undefined;
+      }, 120_000);
+      // Each container that ran on its layers stopped, and started again on the layers mounted anew.
+      await until("the containers on the manager killed started again", async () => {
+        const now = await restarts();
+        return now.every((count, at) => count > (restartsBefore[at] ?? 0)) ? true : undefined;
+      }, 300_000);
+      const read = () => inSession(session, 'console.log(require("node:fs").readdirSync("/usr/lib").length > 0)').then((said) => said.trim(), () => undefined);
+      assert.equal(await until("the session's bayma reached again", async () => await read(), 300_000), "true");
+      await kube.awaitReady([ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE)], "5 minutes");
+      // Pods started now run on the layers the daemon mounted again; those that ran on the manager killed are started again.
+      const before = await kube.runningPod(NAMESPACE, RELEASE);
+      await kube.remove(ref("Pod", before, NAMESPACE));
+      const after = await until("alasio running anew", async () => {
+        const now = await kube.runningPod(NAMESPACE, RELEASE).catch(() => undefined);
+        return now !== undefined && now !== before ? now : undefined;
+      }, 600_000);
+      assert.equal(await inAlasioContainer(["node", "-e", "process.stdout.write('ran')"]), "ran");
+      assert.ok(await onRemoteSnapshot(NAMESPACE, after), `${after} runs on no remote snapshot`);
+    });
+
+    // After the tests that reach the stand-ins through port forwards, as a restart of a node's container ends them; the webhook's tests forward anew.
     test("runs pods pulled lazily again after their node's container restarts, as a machine does, stargz-snapshotter's daemon mounting their layers again", { skip: (TARGET !== "docker" || !ESTARGZ) && "a node restarts so where it is a container, its pods pulled lazily" }, async () => {
       const name = await kube.runningPod(NAMESPACE, RELEASE);
       const restarts = async () => (await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))?.status?.containerStatuses?.find((status) => status.name === "alasio")?.restartCount ?? 0;

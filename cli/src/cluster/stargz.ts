@@ -34,6 +34,20 @@ export const STARGZ_CONFIG = "/etc/containerd-stargz-grpc/config.toml";
  * the limit does not bound: past it, Go collects more often.
  */
 export const STARGZ_MEMORY_LIMIT = "128MiB";
+/**
+ * The socket of the daemon's FUSE manager, which serves the layers it mounts. The daemon
+ * starts a manager only where no socket is there, and mounts its snapshots' layers again
+ * only through one it started; one kept is taken to keep its mounts.
+ */
+export const FUSE_MANAGER_SOCKET = "/run/containerd-stargz-grpc/fuse-manager.sock";
+/**
+ * The FUSE manager's record of the layers it mounted, which a manager stopped removes, and
+ * one killed leaves. A manager started anew mounts what it records again as the daemon
+ * starts it; the daemon then unmounts each of its snapshots' layers and mounts it again
+ * through the manager, which skips each it mounted itself, so each is left with nothing
+ * mounted (stargz-snapshotter's restoreFuseInfo and restoreRemoteSnapshot).
+ */
+export const FUSE_MANAGER_STORE = `${STARGZ_ROOT}/fusestore.db`;
 /** The daemon's executables, as its release has them: the daemon and its FUSE manager. */
 export const STARGZ_EXECUTABLES = ["containerd-stargz-grpc", "stargz-fuse-manager"] as const;
 
@@ -62,7 +76,7 @@ export function stargzConfig(registries?: Registries): string {
     "",
     "[fuse_manager]",
     "enable = true",
-    `address = ${tomlString("/run/containerd-stargz-grpc/fuse-manager.sock")}`,
+    `address = ${tomlString(FUSE_MANAGER_SOCKET)}`,
     `path = ${tomlString("/usr/local/bin/stargz-fuse-manager")}`,
     ...mirrors.flatMap(([host, reached]) =>
       reached.flatMap((url) => [
