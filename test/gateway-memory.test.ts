@@ -123,7 +123,10 @@ async function withStore<A>(gateway: Gateway, use: (endpoint: string, s3: string
         "-v", `${join(ROOT, "src")}:/opt/alasio/src:ro`, "-v", `${join(ROOT, "package.json")}:/opt/alasio/package.json:ro`, limiter.image, ...limiter.args);
     }
     const port = limiter ? docker("port", name("limiter"), valueOf(limiter.env, "GET_LIMITER_PORT")).split(":").at(-1) : docker("port", name("s3"), s3Port(args)).split(":").at(-1);
-    const endpoint = `http://127.0.0.1:${port}`;
+    // Diagnostics: straight to the container's address on its network, past Docker's userland proxy.
+    const front = limiter ? name("limiter") : name("s3");
+    const endpoint = !process.env["ALASIO_GATEWAY_DIRECT"] ? `http://127.0.0.1:${port}` : `http://${docker("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", front)}:${limiter ? valueOf(limiter.env, "GET_LIMITER_PORT") : s3Port(args)}`;
+    console.log(`# the load's endpoint: ${endpoint}`);
     for (let tries = 0; ; tries += 1) {
       const answered = await ask(`${endpoint}/load`, { method: "PUT" }).then(({ status }) => status, () => 0);
       if (answered === 200) break;
@@ -399,14 +402,16 @@ async function load(restores: number, endpoint: string, gateway: string, limiter
     execFileSync("mkdir", ["-p", at]);
     writeFileSync(join(at, "under-way.txt"), [...underWay].map((each) => `${now - each.started} ms ${each.named}`).toSorted().join("\n"));
     const network = gateway.slice(0, -"-s3".length);
-    for (const [part, host] of [["s3", "127.0.0.1"], ["volume", "volume"], ["filer", "filer"]] as const) {
+    for (const part of ["s3", "volume", "filer"]) {
       for (const [file, path] of [["goroutines-2.txt", "goroutine?debug=2"], ["goroutines-1.txt", "goroutine?debug=1"]] as const) {
-        void dockerAsync("exec", gateway, "wget", "-q", "-O", "-", `http://${host}:6060/debug/pprof/${path}`).then((dump) => writeFileSync(join(at, `${part}-${file}`), dump), (error: unknown) => writeFileSync(join(at, `${part}-${file}`), String(error)));
+        void dockerAsync("exec", `${network}-${part}`, "wget", "-q", "-O", "-", `http://127.0.0.1:6060/debug/pprof/${path}`).then((dump) => writeFileSync(join(at, `${part}-${file}`), dump), (error: unknown) => writeFileSync(join(at, `${part}-${file}`), String(error)));
       }
     }
     for (const part of ["s3", "limiter", "volume"]) {
       void promisify(execFile)("bash", ["-c", `pid=$(docker inspect -f '{{.State.Pid}}' ${network}-${part}) && sudo nsenter -t "$pid" -n ss -tinmoe`], { maxBuffer: 64 * MiB }).then(({ stdout }) => writeFileSync(join(at, `${part}-ss.txt`), stdout), (error: unknown) => writeFileSync(join(at, `${part}-ss.txt`), String(error)));
     }
+    // The host's side: Docker's proxy's and the client's sockets, and TCP's memory and counters.
+    void promisify(execFile)("bash", ["-c", "sudo ss -tinmoe; echo; cat /proc/net/sockstat; sysctl net.ipv4.tcp_mem net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.core.rmem_max; echo; nstat -az; echo; ps -eo pid,rss,args | grep -E 'docker-proxy|node' | grep -v grep"], { maxBuffer: 64 * MiB }).then(({ stdout }) => writeFileSync(join(at, "host.txt"), stdout), (error: unknown) => writeFileSync(join(at, "host.txt"), String(error)));
   }, 5000);
   void loading.finally(() => clearInterval(watching));
   // What its memory goes to, at most: its Go heap and stacks (anon), the page cache (file),
