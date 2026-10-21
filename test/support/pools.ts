@@ -166,6 +166,8 @@ export class Pools extends Context.Service<Pools, {
   readonly binding: () => ReadonlySet<string>;
   /** The port each conversation's pod serves on, or is to. */
   readonly ports: () => ReadonlyMap<string, number>;
+  /** Tells of what the conversation's harness did on its own, as its pod tells the front and the gateway relays it, once each time. */
+  readonly tell: (kind: "harness.idle" | "harness.background-response", conversationId: string) => Effect.Effect<void>;
 }>()("alasio/test/Pools") {}
 
 /**
@@ -288,6 +290,8 @@ export const pooledHost = ({ standIns = {}, branch, host = (made) => made }: Poo
       bound: () => new Map([...pods].flatMap(([key, pod]) => (pod.bound ? [[conversationOfHarnessKey(key) ?? key, pod.bound.binding] as const] : []))),
       binding: () => new Set([...pods].flatMap(([key, pod]) => (pod.binding && !pod.bound ? [conversationOfHarnessKey(key) ?? key] : []))),
       ports: () => new Map([...pods].map(([key, pod]) => [conversationOfHarnessKey(key) ?? key, pod.port] as const)),
+      tell: (kind, conversationId) =>
+        Effect.map(Clock.currentTimeMillis, (at) => void events.write(eventRecord({ kind, environment: ENVIRONMENT, source: "harness", subject: { kind: "conversation", key: conversationId } }, at).value)),
     });
     const home = process.env["CODEX_HOME"] ?? "";
     const pooled = pooledHarnessHost({ url: front.url, environment: ENVIRONMENT, callerKey, codexLogin: { url: "http://127.0.0.1:9/v1", home } });

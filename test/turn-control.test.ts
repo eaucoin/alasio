@@ -6,6 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import { Deferred, Effect, Exit, Fiber, Layer, Option, Scope } from "effect";
 import { TestClock } from "effect/testing";
@@ -22,7 +23,7 @@ import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { StoreError } from "../src/persistence/sql.ts";
 import { Store, TurnFenced } from "../src/persistence/store.ts";
 import { forgetfulPersistence } from "./support/persistence.ts";
-import { bindHarness, holdsOf, POOLED_SCHEMA, pooledStore, poolOf } from "./support/pools.ts";
+import { bindHarness, holdsOf, POOLED_SCHEMA, Pools, pooledStore, poolOf } from "./support/pools.ts";
 import { run } from "./support/store.ts";
 import { type QueuedToOutbox, recordingOutbox, type TestAlasio, withServices } from "./support/turns.ts";
 
@@ -554,4 +555,28 @@ test("a notice whose reply could not be queued is not recorded as told, the two 
   assert.equal(await run(store.enqueueOutboxNotice(conversationId, { chatId: CONVERSATION_CHAT, text: "told" })), true);
   assert.equal(await run(store.enqueueOutboxNotice(conversationId, { chatId: CONVERSATION_CHAT, text: "told" })), false);
   assert.equal((await pool.query(`select 1 from ${schema}.telegram_outbox where text = 'told'`)).rows.length, 1);
+});
+
+test("replies a pod tells of, however often, are delivered once at a time, and once more where told of meanwhile, so no pod drives alasio's delivery", async () => {
+  const { store, conversationId } = await conversation();
+  // Each delivery's read of the replies due takes a while, counted.
+  let reads = 0;
+  let reading = 0;
+  let most = 0;
+  const counted: Store["Service"] = {
+    ...store,
+    getCompletedResponsesPendingDelivery: Effect.acquireUseRelease(
+      Effect.sync(() => void ((reads += 1), (most = Math.max(most, ++reading)))),
+      () => Effect.andThen(Effect.sleep("100 millis"), store.getCompletedResponsesPendingDelivery),
+      () => Effect.sync(() => void (reading -= 1)),
+    ),
+  };
+  await withTurns(counted, scriptedHarness((params) => answered(params, "Done.")), async (alasio) => {
+    const before = reads;
+    await alasio.runPromise(Effect.flatMap(Pools, (pools) => Effect.forEach(Array.from({ length: 30 }), () => pools.tell("harness.background-response", conversationId), { discard: true })));
+    await until("the replies told of to be delivered", () => reads > before);
+    await sleep(1_000);
+    assert.equal(most, 1, "two deliveries at once");
+    assert.ok(reads - before <= 3, `${reads - before} deliveries of 30 tellings`);
+  });
 });

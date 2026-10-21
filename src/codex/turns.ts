@@ -577,16 +577,29 @@ const makeTurns = Effect.fnUntraced(function*() {
   // What a harness running on between prompts does on its own, as its host tells it: a
   // reply of its own, delivered; its letting go of the conversation, which may run what
   // waits on it.
+  //
+  // However often a pod tells of either, what it leads to runs once at a time, and once more
+  // where it is told of meanwhile: a conversation's worker, as schedule runs it; and the replies'
+  // delivery, as deliverBackground runs it; so no pod, telling of its conversation as often as it
+  // likes, makes alasio do more than that.
+  const backgroundDelivery = yield* Ref.make<"idle" | "delivering" | "again">("idle");
+  const deliverOnce = flushCompletedResponses.pipe(
+    Effect.catch((error) => Effect.logWarning(`Background response delivery deferred: ${error.message}`)),
+    Effect.catchDefect((defect) => Effect.logWarning(`Background response delivery deferred: ${errorText(defect)}`)),
+  );
+  const deliverBackground: Effect.Effect<void> = Ref.modify(backgroundDelivery, (state) => (state === "idle" ? [true, "delivering"] as const : [false, "again"] as const)).pipe(
+    Effect.flatMap((start) =>
+      start
+        ? Effect.asVoid(FiberSet.run(workers, Effect.gen(function*() {
+          do yield* deliverOnce;
+          while (yield* Ref.modify(backgroundDelivery, (state) => (state === "again" ? [true, "delivering"] as const : [false, "idle"] as const)));
+        }).pipe(Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : Ref.set(backgroundDelivery, "idle"))))))
+        : Effect.void
+    ),
+  );
   const hostEvents = yield* (yield* HarnessEvents).subscribe;
   yield* PubSub.take(hostEvents).pipe(
-    Effect.flatMap((event) =>
-      event.kind === "idle"
-        ? schedule(event.conversationId)
-        : flushCompletedResponses.pipe(
-          Effect.catch((error) => Effect.logWarning(`Background response delivery deferred for ${event.conversationId}: ${error.message}`)),
-          Effect.catchDefect((defect) => Effect.logWarning(`Background response delivery deferred for ${event.conversationId}: ${errorText(defect)}`)),
-        )
-    ),
+    Effect.flatMap((event) => (event.kind === "idle" ? schedule(event.conversationId) : deliverBackground)),
     Effect.forever,
     withLogScope(LOG_SCOPE),
     Effect.forkScoped,
