@@ -3,7 +3,7 @@
  * file system, made through the sandbox gateway by a node agent with its quota, on the
  * nodes' mount of it (cli/src/manifests/sandbox-gateway.ts workspaceMount), doing in gVisor
  * what tools ask of a file system within its quota; its files kept through the session
- * released and bound again, and Valkey and the object store killed mid-write; a session forked, its fork a clone of its files
+ * released and bound again, and Valkey and the object store killed mid-write; a file's fsync or close failing while Valkey is away; a session forked, its fork a clone of its files
  * with their owners, its own quota, and neither touched by what is done in the other or by
  * its deletion; neither Valkey nor the object store, nor their credentials, within a
  * session's reach (its moving to another node is the snapshots shard's); a workspace deleted, its directory with it; the file system checked and
@@ -137,6 +137,32 @@ for (let i = 0; Date.now() < end; i++) {
   } catch (error) {
     console.error(String(error));
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+  }
+}`;
+
+/**
+ * Node, in a session: opens argv[3] files in the directory argv[1], then, once the file
+ * argv[2] is there, writes each as WRITER does, fsyncs it and closes it, printing of each, as a
+ * line of JSON, its name and, should it have failed, the step that did and its error's code.
+ */
+const AWAY_WRITER = `const fs = require("node:fs");
+const [dir, go, count] = process.argv.slice(1);
+fs.mkdirSync(dir, { recursive: true });
+const fds = Array.from({ length: Number(count) }, (_, i) => fs.openSync(dir + "/" + i, "w"));
+while (!fs.existsSync(go)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+for (const [i, fd] of fds.entries()) {
+  let step = "write";
+  try {
+    fs.writeSync(fd, (i + "\\n").repeat(4096));
+    step = "fsync";
+    fs.fsyncSync(fd);
+    step = "close";
+    fs.closeSync(fd);
+    console.log(JSON.stringify({ file: String(i) }));
+  } catch (error) {
+    console.log(JSON.stringify({ file: String(i), failed: step, code: error.code }));
+    // Closed all the same, what it says already said by the step that failed.
+    if (step !== "close") try { fs.closeSync(fd); } catch {}
   }
 }`;
 
@@ -461,6 +487,30 @@ export function workspaceStorage(): void {
         assert.equal(await fixtureDigest(none), fixture);
       });
     }
+
+    test("a file written while Valkey is away fails its fsync or its close, as JuiceFS fails to commit it", async () => {
+      const dir = `${WORKDIR}/while-valkey-away`;
+      const go = "/tmp/valkey-away";
+      const files = 2;
+      const pod = (await bringUp(none)).name;
+      const inPod = (command: readonly string[]) => kube.execOk(SESSIONS, pod, [...command], { container: "bayma" });
+      const writing = inPod(["node", "-e", AWAY_WRITER, dir, go, String(files)]);
+      await until(`${files} files open in ${dir}`, async () => ((await inPod(["sh", "-c", `ls ${dir} 2>/dev/null | wc -l`])).trim() === String(files) ? true : undefined));
+      const valkey = ref("StatefulSet", VALKEY, NAMESPACE);
+      const name = `${VALKEY}-0`;
+      await kube.patch(valkey, { spec: { replicas: 0 } });
+      try {
+        await until(`${name} gone`, async () => ((await kube.get<V1Pod>(ref("Pod", name, NAMESPACE))) === null ? true : undefined));
+        await inPod(["touch", go]);
+        // Each fsync waits out JuiceFS's retries of Valkey.
+        const told = (await writing).trim().split("\n").map((line) => JSON.parse(line) as { readonly file: string; readonly failed?: string; readonly code?: string });
+        assert.deepEqual(told.filter(({ failed }) => failed !== "fsync" && failed !== "close"), [], "a file was told written, or failed but not by its fsync or close");
+      } finally {
+        await kube.patch(valkey, { spec: { replicas: 1 } });
+        await kube.awaitReady([valkey], "10 minutes");
+      }
+      assert.equal(await fixtureDigest(none), fixture);
+    });
 
     test("a second Valkey started on alasio-valkey's volume, as a pod deleted outright is made anew while its server runs, serves nothing until the first has ended", async () => {
       const template = (await kube.get<V1StatefulSet>(ref("StatefulSet", VALKEY, NAMESPACE)))?.spec?.template.spec;
