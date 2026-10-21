@@ -18,12 +18,15 @@ const SCRIPT = fileURLToPath(new URL("../upgrades/from-9.0.0.sh", import.meta.ur
 const PAUSE = `sha256:${"a".repeat(64)}`;
 
 /**
- * A machine for the cut-over: a kubectl that reaches its cluster and lists the namespaces
- * `namespaces` names, `<name>\t<branch label>` each; an UPGRADE and an UPGRADE_CHECK, each
- * saying it ran, UPGRADE failing while `upgradeFails` is there; and a node, in `node`, whose
- * containerd pins the sandbox image k3s gives it, and records the images `images` lists, and
- * whose k3s's ctr says what it was asked to fetch, fetching what no registry answers for
- * failing, and what `unfetched` names fetched to no end.
+ * A machine for the cut-over: a kubectl that reaches its cluster, lists the namespaces
+ * `namespaces` names, `<name>\t<branch label>` each, and alasio's pod, busy with a turn for
+ * as many looks as `busy` says, there until it scales alasio to none and for as many looks
+ * after as `lingers` says, every look and the scale said in order in `looked`, and fails to
+ * list any while `unlisted` is there; an UPGRADE and an UPGRADE_CHECK, each saying it ran,
+ * UPGRADE failing while `upgradeFails` is there; and a node, in `node`, whose containerd
+ * pins the sandbox image k3s gives it, and records the images `images` lists, and whose
+ * k3s's ctr says what it was asked to fetch, fetching what no registry answers for failing,
+ * and what `unfetched` names fetched to no end.
  */
 function machine() {
   const root = mkdtempSync(join(tmpdir(), "alasio-cut-over-"));
@@ -31,6 +34,11 @@ function machine() {
   const ran = join(root, "ran");
   const namespaces = join(root, "namespaces");
   const upgradeFails = join(root, "upgrade-fails");
+  const busy = join(root, "busy");
+  const lingers = join(root, "lingers");
+  const stopped = join(root, "stopped");
+  const looked = join(root, "looked");
+  const unlisted = join(root, "unlisted");
   const config = join(root, "config.json");
   const node = join(root, "node");
   const fetched = join(root, "fetched");
@@ -42,6 +50,8 @@ function machine() {
   const containerd = join(node, "var/lib/rancher/k3s/agent/etc/containerd");
   for (const made of [bin, containerd, join(node, "usr/local/bin")]) mkdirSync(made, { recursive: true });
   writeFileSync(namespaces, "");
+  writeFileSync(busy, "0");
+  writeFileSync(lingers, "0");
   writeFileSync(config, JSON.stringify({ target: { host: {} }, install: { host: { enabled: true } } }), { mode: 0o600 });
   writeFileSync(images, `docker.io/rancher/mirrored-pause:3.10.2 ${PAUSE} complete\n`);
   writeFileSync(unreachable, "");
@@ -53,6 +63,18 @@ function machine() {
 case "$*" in
   "get --raw=/readyz") exit 0 ;;
   "get namespace -l alasio.dev/branch -o jsonpath="*) cat '${namespaces}' ;;
+  "-n alasio get pod -l app.kubernetes.io/component=alasio,alasio.dev/busy=true -o name")
+    [ ! -e '${unlisted}' ] || exit 1
+    left=$(cat '${busy}')
+    if [ "$left" -gt 0 ]; then echo $((left - 1)) >'${busy}'; echo "busy: running" >>'${looked}'; echo pod/alasio-0; else echo "busy: none" >>'${looked}'; fi ;;
+  "-n alasio scale deployment alasio --replicas=0") echo "stop alasio" >>'${ran}'; echo stop >>'${looked}'; touch '${stopped}' ;;
+  "-n alasio get pod -l app.kubernetes.io/component=alasio -o name")
+    [ ! -e '${unlisted}' ] || exit 1
+    left=$(cat '${lingers}')
+    if [ ! -e '${stopped}' ] || [ "$left" -gt 0 ]; then
+      [ ! -e '${stopped}' ] || echo $((left - 1)) >'${lingers}'
+      echo "alasio: running" >>'${looked}'; echo pod/alasio-0
+    else echo "alasio: none" >>'${looked}'; fi ;;
   *) echo "kubectl $* is not the cut-over's" >&2; exit 2 ;;
 esac
 `, { mode: 0o755 });
@@ -74,8 +96,8 @@ case "$1 $2" in
 esac
 `, { mode: 0o755 });
   const out = join(root, "out");
-  /** The cut-over, failing at `failAt` if given: what it came to. */
-  const cutOver = (failAt?: string) => {
+  /** The cut-over, failing at `failAt` if given, its waits bounded by `bounds`: what it came to. */
+  const cutOver = (failAt?: string, bounds: Readonly<Record<string, string>> = {}) => {
     const run = spawnSync("bash", [SCRIPT], {
       encoding: "utf8",
       env: {
@@ -85,6 +107,8 @@ esac
         NODE_ROOT: node,
         UPGRADE: `echo upgrade >>'${ran}' && [ ! -e '${upgradeFails}' ]`,
         UPGRADE_CHECK: `echo check >>'${ran}'`,
+        POLL_SECONDS: "0",
+        ...bounds,
         ...(failAt === undefined ? {} : { FAIL_AT: failAt }),
       },
     });
@@ -97,12 +121,24 @@ esac
   };
   return {
     cutOver,
-    /** What UPGRADE and UPGRADE_CHECK ran, in order, since the last time it was asked. */
+    /** What UPGRADE and UPGRADE_CHECK ran, and alasio stopped, in order, since the last time it was asked. */
     ran: () => lines(ran),
     /** The cut-over's markers, of what it recorded. */
     marks: () => (existsSync(out) ? readdirSync(out).filter((name) => ["point-of-no-return", "upgraded"].includes(name)).sort() : []),
     namespaces: (listed: string) => writeFileSync(namespaces, listed),
     upgradeFails: (fails: boolean) => (fails ? writeFileSync(upgradeFails, "") : rmSync(upgradeFails, { force: true })),
+    /** Has alasio busy with a turn for the next `looks` looks at it. */
+    busy: (looks: number) => writeFileSync(busy, String(looks)),
+    /** Has alasio's pod there for `looks` looks once alasio is scaled to none. */
+    lingers: (looks: number) => writeFileSync(lingers, String(looks)),
+    /** Has kubectl fail to list alasio's pods, or list them again. */
+    unlisted: (fails: boolean) => (fails ? writeFileSync(unlisted, "") : rmSync(unlisted, { force: true })),
+    /** Each look at alasio's pods, and the scale, in order, since the last time it was asked. */
+    looked: () => lines(looked),
+    /** Whether the cut-over recorded alasio stopped. */
+    alasioStopped: () => existsSync(join(out, "alasio-stopped")),
+    /** Has alasio running again, as the upgrade starts it. */
+    started: () => rmSync(stopped, { force: true }),
     /** Has containerd pin `sandbox` as the sandbox image, as k3s writes it. */
     pins,
     /** Has containerd record the images `recorded`, `[name, digest, whether it holds all their content]` each. */
@@ -129,9 +165,58 @@ test("the cut-over checks, upgrades past its point of no return, and says it is 
   try {
     const run = at.cutOver();
     assert.equal(run.code, 0, run.said);
-    assert.deepEqual(at.ran(), ["check", "upgrade"]);
+    assert.deepEqual(at.ran(), ["check", "stop alasio", "upgrade"]);
     assert.deepEqual(at.marks(), ["point-of-no-return", "upgraded"]);
-    assert.match(run.said, /cutting over from 9\.0\.0[^]*checking that no branch environment exists[^]*checking that the upgrade can run[^]*past the point of no return[^]*upgrading, from the cut-over begun at [^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+    assert.match(run.said, /cutting over from 9\.0\.0[^]*checking that no branch environment exists[^]*checking that the upgrade can run[^]*past the point of no return[^]*waiting for alasio to run no turn[^]*alasio stopped, to be started again by the upgrade\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+  } finally {
+    at.remove();
+  }
+});
+
+test("past its point of no return, the cut-over waits for alasio to run no turn, stops it, and records it stopped once its pod is gone, before it upgrades", () => {
+  const at = machine();
+  try {
+    at.busy(2);
+    at.lingers(2);
+    const run = at.cutOver();
+    assert.equal(run.code, 0, run.said);
+    assert.deepEqual(at.ran(), ["check", "stop alasio", "upgrade"]);
+    // Stopped after the look that found no turn, and recorded stopped after the look that found no pod.
+    assert.deepEqual(at.looked(), ["busy: running", "busy: running", "busy: none", "stop", "alasio: running", "alasio: running", "alasio: none"]);
+    assert.ok(at.alasioStopped());
+    assert.match(run.said, /past the point of no return[^\n]*\n[^\n]* waiting for alasio to run no turn, then stopping it[^\n]*\n[^\n]* alasio stopped, to be started again by the upgrade\n[^\n]* upgrading/u);
+  } finally {
+    at.remove();
+  }
+});
+
+test("the cut-over fails, stopping nothing, where alasio runs a turn on past its bound, and, alasio stopped, recording nothing where its pod outlives its bound", () => {
+  const at = machine();
+  try {
+    at.busy(1_000);
+    const busy = at.cutOver(undefined, { TURN_WAIT_SECONDS: "0" });
+    assert.notEqual(busy.code, 0);
+    assert.match(busy.said, /FAILED: alasio ran a turn on for 0 s: let it end, and run the cut-over again\n$/u);
+    assert.deepEqual([at.ran(), at.looked(), at.alasioStopped()], [["check"], ["busy: running"], false]);
+    at.busy(0);
+    at.lingers(1_000);
+    const lingering = at.cutOver(undefined, { STOP_WAIT_SECONDS: "0" });
+    assert.notEqual(lingering.code, 0);
+    assert.match(lingering.said, /FAILED: alasio did not stop within 0 s\n$/u);
+    assert.deepEqual([at.ran(), at.looked(), at.alasioStopped()], [["stop alasio"], ["busy: none", "stop", "alasio: running"], false]);
+  } finally {
+    at.remove();
+  }
+});
+
+test("the cut-over fails, stopping nothing, where alasio's pods cannot be listed, rather than take none for none", () => {
+  const at = machine();
+  try {
+    at.unlisted(true);
+    const run = at.cutOver();
+    assert.notEqual(run.code, 0);
+    assert.match(run.said, /FAILED: the pods of app\.kubernetes\.io\/component=alasio,alasio\.dev\/busy=true in alasio could not be listed\n$/u);
+    assert.deepEqual([at.ran(), at.alasioStopped()], [["check"], false]);
   } finally {
     at.remove();
   }
@@ -163,7 +248,7 @@ test("the cut-over failing before its point of no return leaves none, and a run 
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
     assert.match(again.said, /checking that no branch environment exists/u);
-    assert.deepEqual([at.ran(), at.marks()], [["check", "upgrade"], ["point-of-no-return", "upgraded"]]);
+    assert.deepEqual([at.ran(), at.marks()], [["check", "stop alasio", "upgrade"], ["point-of-no-return", "upgraded"]]);
   } finally {
     at.remove();
   }
@@ -179,8 +264,10 @@ test("the cut-over failing past its point of no return, or in its upgrade, goes 
     at.upgradeFails(true);
     const broken = at.cutOver();
     assert.notEqual(broken.code, 0);
-    assert.match(broken.said, /FAILED: the upgrade failed \(upgrade\.log\): the cut-over run again goes on with it\n$/u);
-    assert.deepEqual([at.ran(), at.marks()], [["upgrade"], ["point-of-no-return"]]);
+    assert.match(broken.said, /FAILED: the upgrade failed \(upgrade\.log\): alasio stays stopped until an upgrade gets as far as starting it; the cut-over run again goes on with it\n$/u);
+    assert.deepEqual([at.ran(), at.marks()], [["stop alasio", "upgrade"], ["point-of-no-return"]]);
+    // Run again, alasio the release's as the upgrade that failed left it, it is stopped no more.
+    at.started();
     at.upgradeFails(false);
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
@@ -197,7 +284,7 @@ test("the cut-over failing once its upgrade is through goes on with what follows
     const failed = at.cutOver("after-the-upgrade");
     assert.notEqual(failed.code, 0);
     assert.match(failed.said, /FAILED: a failure injected once the upgrade was through\n$/u);
-    assert.deepEqual([at.ran(), at.marks()], [["check", "upgrade"], ["point-of-no-return", "upgraded"]]);
+    assert.deepEqual([at.ran(), at.marks()], [["check", "stop alasio", "upgrade"], ["point-of-no-return", "upgraded"]]);
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
     assert.doesNotMatch(again.said, /checking that|upgrading, from the cut-over/u);
@@ -297,7 +384,7 @@ test("the cut-over fails before its point of no return where what containerd lac
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
     assert.deepEqual(at.images(), [["docker.io/rancher/mirrored-pause:3.10.2", PAUSE, true]]);
-    assert.deepEqual([at.ran(), at.marks()], [["check", "upgrade"], ["point-of-no-return", "upgraded"]]);
+    assert.deepEqual([at.ran(), at.marks()], [["check", "stop alasio", "upgrade"], ["point-of-no-return", "upgraded"]]);
   } finally {
     at.remove();
   }

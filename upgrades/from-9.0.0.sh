@@ -99,6 +99,48 @@ sandbox_image_before() {
 }
 # END the sandbox image.
 
+# BEGIN alasio stopped.
+#
+# This release's sandbox gateway refuses the caller tokens 9.0.0's alasio mints, good for six
+# hours, and answers a bind with 200 and the binding, where 9.0.0's alasio takes 204 alone;
+# and the upgrade rolls the two apart: a turn 9.0.0's alasio ran as the gateway rolled would
+# lose its workspace's bayma for as long as that alasio ran on. So, past the point of no
+# return, before the upgrade, alasio is waited for until it runs no turn, as its busy label
+# says, then stopped, so none starts until the upgrade starts this release's. A turn that
+# starts between the last look and the stop ends with alasio, as any restart of alasio ends
+# one. Once, as OUT/alasio-stopped says it was, the pod gone: a run again after the upgrade
+# failed finds alasio the release's, or stopped still. Each wait is bounded, by
+# TURN_WAIT_SECONDS (30 min) and STOP_WAIT_SECONDS (10 min), looking every POLL_SECONDS (5).
+
+NS=alasio
+TURN_WAIT_SECONDS=${TURN_WAIT_SECONDS:-1800}
+STOP_WAIT_SECONDS=${STOP_WAIT_SECONDS:-600}
+POLL_SECONDS=${POLL_SECONDS:-5}
+k() { kubectl -n "$NS" "$@"; }
+# Whether alasio's namespace has no pod of the selector `$1` within `$2` seconds, looking every
+# POLL_SECONDS; the run failing where its pods cannot be listed, as nothing can be told then.
+gone() {
+  local waited=0 listed
+  while :; do
+    listed=$(k get pod -l "$1" -o name) || fail "the pods of $1 in $NS could not be listed"
+    [ -n "$listed" ] || return 0
+    [ "$waited" -lt "$2" ] || return 1
+    sleep "$POLL_SECONDS"
+    waited=$((waited + POLL_SECONDS))
+  done
+}
+alasio_stopped_past() {
+  [ ! -e "$OUT/alasio-stopped" ] || return 0
+  log "waiting for alasio to run no turn, then stopping it, so none runs on as the sandbox gateway rolls"
+  gone app.kubernetes.io/component=alasio,alasio.dev/busy=true "$TURN_WAIT_SECONDS" ||
+    fail "alasio ran a turn on for ${TURN_WAIT_SECONDS} s: let it end, and run the cut-over again"
+  k scale deployment alasio --replicas=0 >/dev/null || fail "alasio could not be stopped"
+  gone app.kubernetes.io/component=alasio "$STOP_WAIT_SECONDS" || fail "alasio did not stop within ${STOP_WAIT_SECONDS} s"
+  date -u +%FT%TZ >"$OUT/alasio-stopped"
+  log "alasio stopped, to be started again by the upgrade"
+}
+# END alasio stopped.
+
 command -v kubectl >/dev/null || fail "kubectl is not on root's PATH"
 [ -r "$CONFIG" ] || fail "CONFIG $CONFIG cannot be read"
 kubectl get --raw=/readyz >/dev/null 2>&1 || fail "kubectl does not reach the cluster: give it k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
@@ -123,9 +165,11 @@ fi
 
 if [ ! -e "$OUT/upgraded" ]; then
   [ "${FAIL_AT:-}" != past-the-point-of-no-return ] || fail "a failure injected past the point of no return, before the upgrade"
+  alasio_stopped_past
   log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
   printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
-  bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" || fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it"
+  bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" ||
+    fail "the upgrade failed (upgrade.log): alasio stays stopped until an upgrade gets as far as starting it; the cut-over run again goes on with it"
   date -u +%FT%TZ >"$OUT/upgraded"
 fi
 [ "${FAIL_AT:-}" != after-the-upgrade ] || fail "a failure injected once the upgrade was through"
