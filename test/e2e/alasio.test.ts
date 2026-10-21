@@ -3510,12 +3510,19 @@ if (inShard("agents")) {
       try {
         for (const deadline = Date.now() + 180_000; await kube.runningPod(NAMESPACE, RELEASE).then(() => true, () => false); await sleep(2_000)) assert.ok(Date.now() < deadline, "alasio did not stop");
         // Its command running on in the background keeps the pod bound, past the time of every token alasio gave it, as the gateway's watch of the bindings is cut and resumed.
-        const logged = () => kube.logs(NAMESPACE, bound.metadata?.name ?? "", "harness").catch(String);
-        for (const deadline = Date.now() + (later + 180) * 1000; !/bayma later: \d+/u.test(await logged()); await sleep(5_000)) assert.ok(Date.now() < deadline, "the harness's command in the background never asked its bayma");
+        const name = bound.metadata?.name ?? "";
+        // Its logs, read while it is there; it gone, the loop fails at once, naming it, rather than waiting out its deadline.
+        const logged = async () => {
+          const read = await kube.logs(NAMESPACE, name, "harness").then((logs) => ({ logs }), (error: unknown) => ({ error }));
+          if ("logs" in read) return read.logs;
+          if (!(await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))) assert.fail(`the bound pod ${name} is gone, before its command in the background was seen to ask its bayma`);
+          throw read.error;
+        };
+        for (const deadline = Date.now() + (later + 180) * 1000; !/bayma later: \d+/u.test(await logged()); await sleep(5_000)) assert.ok(Date.now() < deadline, `the harness's command in the background never asked its bayma in ${name}`);
         // Its bayma answered it, in the pod bound before alasio stopped, whose logs these are: that pod's
-        // binding held all along. Its work done, the pod is idle, and the gateway may release it at its
-        // next sweep, so whether it is bound still is not asked.
+        // binding held all along. Its work just done, it is kept its whole wait from then, as after a turn.
         assert.match(await logged(), /bayma later: 200/u);
+        assert.equal((await harnessPod()).metadata?.uid, bound.metadata?.uid, `${name} was let go of as its work in the background ended`);
       } finally {
         await kube.patch(alasio, { spec: { replicas: 1 } });
         for (const deadline = Date.now() + 300_000; !(await kube.runningPod(NAMESPACE, RELEASE).then(() => true, () => false)); await sleep(2_000)) assert.ok(Date.now() < deadline, "alasio did not start again");

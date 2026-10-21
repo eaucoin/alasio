@@ -157,17 +157,20 @@ const harnessesOf = (env: SessionsEnvironment & { home: string }, config: Harnes
 
 const sweep = (harnesses: { readonly sweep: Effect.Effect<readonly string[], unknown, never> }) => Effect.runPromise(harnesses.sweep);
 
-test("a harness is idle once nothing goes on in it and nothing has for its wait, as its last turn, the last call of it and its binding say; asked again no sooner than it could be", () => {
+test("a harness is idle once nothing goes on in it and nothing has for its wait, as its last turn, its last work seen in the background, the last call of it and its binding say; asked again no sooner than it could be", () => {
   const lease: BindingLease = { metadata: { annotations: { [ACTIVE_ANNOTATION]: "5000" } } };
   const pod = { metadata: { creationTimestamp: new Date(1_000) } } as V1Pod;
   const timing = { releaseAfterMs: 10_000, idlePollMs: 1_000 };
-  const idle = (status: Partial<HarnessStatus>, backgroundWork = false, now = 100_000) => harnessIdleness({ status: { ...IDLE, ...status }, backgroundWork }, lease, pod, now, timing);
+  const idle = (status: Partial<HarnessStatus>, backgroundWork = false, now = 100_000, workSeenAt?: number) => harnessIdleness({ status: { ...IDLE, ...status }, backgroundWork }, lease, pod, now, timing, workSeenAt);
   for (const busy of [{ busy: true }, { running: true }, { cliInitiated: true }, { held: true }, { idleSince: null }]) assert.deepEqual(idle(busy), { idle: false, askAt: 101_000 }, JSON.stringify(busy));
   assert.deepEqual(idle({}, true), { idle: false, askAt: 101_000 });
   assert.deepEqual(idle({ idleSince: 2_000 }), { idle: true });
   // Its last call, the Lease's stamp, later than its last turn: kept until its wait from it.
   assert.deepEqual(idle({ idleSince: 2_000 }, false, 8_000), { idle: false, askAt: 15_000 });
   assert.deepEqual(idle({ idleSince: 2_000 }, false, 14_500), { idle: false, askAt: 15_500 });
+  // Its work in the background last seen later than all of those: kept until its wait from it.
+  assert.deepEqual(idle({ idleSince: 2_000 }, false, 95_000, 90_000), { idle: false, askAt: 100_000 });
+  assert.deepEqual(idle({ idleSince: 2_000 }, false, 100_000, 90_000), { idle: true });
 });
 
 test("a conversation's harness is placed in its environment's own namespace's pool of its harness, a folder's in main's, main's alone, and nothing else is", async () => {
@@ -266,6 +269,41 @@ test("a bound harness is kept while anything goes on in it, its host asked with 
     assert.deepEqual(told.filter((event) => event.subject.key === "telegram:41" && event.kind === "harness.released" && event.binding === bound.binding), [
       { kind: "harness.released", environment: "main", source: "sandbox-gateway", subject: { kind: "conversation", key: "telegram:41" }, binding: bound.binding, reason: "idle" },
     ]);
+  } finally {
+    stand.close();
+  }
+});
+
+test("a bound harness whose work in the background ends is kept its whole wait from the last sweep that found it working, however long ago its last turn ended", async () => {
+  const env = await environment(1);
+  const stand = await host();
+  try {
+    const { binder, harnesses } = await harnessesOf(env, configOf(env.home, stand.port, { releaseAfterSeconds: 2 }), agents().agents, 100);
+    const key = harnessKey("telegram:46");
+    const placement = await Effect.runPromise(harnesses.place(key, { environment: "main", harness: "codex", workspace: "session" }));
+    const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+    const ending = endsOnceDeleted(env.home, bound.pod);
+    /** Kept by a sweep now: none released, its pod not ended. */
+    const kept = async (why: string) => {
+      assert.deepEqual(await sweep(harnesses), [], why);
+      assert.equal(((await run(withKube((kube) => kube.read("v1", "Pod", env.home, bound.pod)))) as V1Pod | null)?.metadata?.deletionTimestamp, undefined, why);
+    };
+    // Its last turn long over, past its binding's making and its last call, its command in the background runs on: kept.
+    await new Promise((resolve) => setTimeout(resolve, 2_100));
+    stand.status = { ...IDLE, idleSince: Date.now() - 600_000 };
+    stand.working = true;
+    await kept("its command runs in the background");
+    const seen = Date.now();
+    // Its command done: kept, as idle since then, not since its last turn.
+    stand.working = false;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await kept("its command has just ended");
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await kept("its command ended within its wait");
+    // Its wait from then passed: released.
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, seen + 2_100 - Date.now())));
+    assert.deepEqual(await sweep(harnesses), [key]);
+    await ending;
   } finally {
     stand.close();
   }

@@ -151,13 +151,15 @@ export interface HostIdleFacts {
  * runs or is about to, one its harness started on its own runs, a hold keeps it, or its
  * harness works on its own between turns (Claude Code's background tasks, Codex's background
  * terminals); and otherwise once nothing has gone on in it for `releaseAfterMs`, as its last
- * turn, the last call of the control plane's that may bind it (its Lease's active stamp, which
- * a call that only reads what it has does not stamp), and its binding say (../binder/sweep.ts
- * lingered).
+ * turn, the last sweep that found its harness working on its own (`workSeenAt`), the last call
+ * of the control plane's that may bind it (its Lease's active stamp, which a call that only
+ * reads what it has does not stamp), and its binding say (../binder/sweep.ts lingered). Work in
+ * the background ending is something going on, as a turn ending is: its operator often comes
+ * back to what it did, so its pod is kept its whole wait from then, not let go of at once.
  */
-export function harnessIdleness({ status, backgroundWork }: HostIdleFacts, lease: BindingLease, pod: V1Pod | null, now: number, timing: { readonly releaseAfterMs: number; readonly idlePollMs: number }): Idleness {
+export function harnessIdleness({ status, backgroundWork }: HostIdleFacts, lease: BindingLease, pod: V1Pod | null, now: number, timing: { readonly releaseAfterMs: number; readonly idlePollMs: number }, workSeenAt = 0): Idleness {
   if (status.busy || status.running || status.cliInitiated || status.held || backgroundWork || status.idleSince === null) return notIdle(now, timing.idlePollMs);
-  return lingered(status.idleSince, lease, pod, now, timing);
+  return lingered(Math.max(status.idleSince, workSeenAt), lease, pod, now, timing);
 }
 
 /** How `pod`'s host's container last ended, as kubelet says it: its exit code, its reason and its message, where it says them. */
@@ -242,15 +244,23 @@ export const makeHarnesses = Effect.fnUntraced(function*(
   const subject = (key: string) => ({ kind: "conversation", key: conversationOfHarnessKey(key) ?? key }) as const;
   /** The bound hosts the sweep could not ask, by their binding: since when, and why, as last said. */
   const unreached = new Map<string, { readonly since: number; readonly reason: string }>();
+  /** When the sweep last found each bound host's harness working on its own, by its binding (harnessIdleness). */
+  const workSeen = new Map<string, number>();
+  /** What the sweep keeps of the binding `binding`, let go of with it. */
+  const forget = (binding: string) =>
+    Effect.sync(() => {
+      unreached.delete(binding);
+      workSeen.delete(binding);
+    });
   /** Counts and tells of `key`'s binding `binding` of `pool`, released for `reason`. */
   const releasedFor = (pool: Pool, key: string, binding: string, reason: ReleaseReason) =>
-    Effect.sync(() => void unreached.delete(binding)).pipe(
+    forget(binding).pipe(
       Effect.andThen(released(pool, reason)),
       Effect.andThen(tell(pool, (environment) => ({ kind: "harness.released", environment, source: "sandbox-gateway", subject: subject(key), binding, reason }))),
     );
   /** Counts and tells of `key`'s binding `binding` of `pool`, its pod `pod`, let go of as lost, for `reason`. */
   const lostFor = (pool: Pool, key: string, binding: string, pod: string, reason: string) =>
-    Effect.sync(() => void unreached.delete(binding)).pipe(
+    forget(binding).pipe(
       Effect.andThen(released(pool, "lost")),
       Effect.andThen(tell(pool, (environment) => ({ kind: "harness.lost", environment, source: "sandbox-gateway", subject: subject(key), binding, pod, reason }))),
     );
@@ -379,7 +389,8 @@ export const makeHarnesses = Effect.fnUntraced(function*(
         const name = pod.metadata?.name ?? "";
         if (facts._tag === "Success") {
           if (unreached.delete(binding)) yield* Effect.logInfo(`${key}'s host in ${name} answers again`);
-          return harnessIdleness(facts.success, lease, pod, now, { releaseAfterMs, idlePollMs });
+          if (facts.success.backgroundWork) workSeen.set(binding, now);
+          return harnessIdleness(facts.success, lease, pod, now, { releaseAfterMs, idlePollMs }, workSeen.get(binding));
         }
         // Not reached, it is not idle, as it may be working, until it has answered no sweep for unreachedMs.
         const reason = facts.failure.message;
