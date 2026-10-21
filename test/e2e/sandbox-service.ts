@@ -306,6 +306,25 @@ export function sandboxService(): void {
       assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
     });
 
+    test("a node's agent started as the node's mount of workspace storage serves sees the mount made anew once that one's juicefs is gone: a workspace is made after it", async () => {
+      const of = (component: string) => async () => await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels(component)) });
+      const [mount] = await of("workspace-mount")();
+      const node = mount?.spec?.nodeName ?? "";
+      const [agent] = (await of("node-agent")()).filter(({ spec }) => spec?.nodeName === node);
+      assert.ok(mount?.metadata?.name && agent?.metadata?.name, "the node runs a mount's pod and an agent");
+      const readyAnew = (pods: readonly V1Pod[], before: V1Pod) =>
+        pods.some(({ metadata, spec, status }) => spec?.nodeName === node && metadata?.uid !== before.metadata?.uid && status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True"));
+      const made = (workspace: string) => async () => ((await gatewayCall(await mainToken(workspace), "POST", "/workspace")).status === 204 ? true : undefined);
+      // The agent started again while the node's mount serves, as a rollout of it starts one.
+      await kube.kill(NAMESPACE, agent.metadata.name);
+      await until("the node's agent started again", async () => (readyAnew(await of("node-agent")(), agent) ? true : undefined), 300_000);
+      await until("the gateway making a workspace through it", made("fs-e2ebefore"), 120_000);
+      // Then the mount's juicefs killed with no successor: the DaemonSet's next pod mounts anew, the agent running on.
+      await kube.kill(NAMESPACE, mount.metadata.name);
+      await until("the node's mount made anew", async () => (readyAnew(await of("workspace-mount")(), mount) ? true : undefined), 300_000);
+      await until("the gateway making a workspace after it", made("fs-e2eanew"), 120_000);
+    });
+
     test("a workspace released with a session holding its files open, a writer mid-write, an SQLite transaction under way and a git index.lock among them, is restored whole from its snapshot as it is next bound, the session running on, its files held", async (t) => {
       const workspace = "fs-e2eheld";
       const token = await mainToken(workspace);

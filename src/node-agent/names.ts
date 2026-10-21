@@ -129,13 +129,20 @@ export const gvisorRuntimeClass = (release: string): string => `gvisor-${gvisorL
 export const runscVersion = (release: string): string => `release-${release}`;
 
 /**
+ * The directory alasio's pods keep on a node, which nothing of k3s's removes: the workspaces'
+ * JuiceFS mount and its state and cache, its juicefs, and the pool pods' directories, which
+ * workspaces are attached into, mounts all (cli/src/manifests/sandbox-gateway.ts).
+ */
+export const NODE_DIRECTORY = "/var/lib/alasio";
+
+/**
  * Where a node has workspace storage mounted, held by a pod of its own, each workspace's
  * files at `<environment>/<workspace>/files`.
  */
-export const WORKSPACES_ROOT = "/var/lib/alasio/workspaces";
+export const WORKSPACES_ROOT = `${NODE_DIRECTORY}/workspaces`;
 
 /** Where a node keeps the directory of each pod of a sandbox pool, or of a harness pool, `<namespace>/<pod>`, which the pod mounts by `subPathExpr` of its namespace and its name. */
-export const ATTACH_ROOT = "/var/lib/alasio/attach";
+export const ATTACH_ROOT = `${NODE_DIRECTORY}/attach`;
 
 /** The file of a harness pool's pod's binding in its directory, which its node's agent writes as the gateway binds it, and the pod serves once it is there (src/harness/program.ts). */
 export const BINDING_FILE = "binding.json";

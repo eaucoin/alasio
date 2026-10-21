@@ -25,7 +25,6 @@
 import type { KubernetesObject, V1DaemonSet, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
 
 import {
-  ATTACH_ROOT,
   BACKGROUND_READ_SECONDS_VARIABLE,
   backgroundReadSeconds,
   CONTAINERD,
@@ -34,12 +33,11 @@ import {
   META_URL_VARIABLE,
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
+  NODE_DIRECTORY,
   nodeAgentStopSeconds,
   POD_IP_VARIABLE,
   RESTORES_FROM_BUCKET_SINCE_VARIABLE,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
-  SNAPSHOT_CACHE_DIR,
-  WORKSPACES_ROOT,
 } from "../../../src/node-agent/names.ts";
 import { memoryBytes } from "../capacity.ts";
 import { currentGvisorRelease, NODE_PINS } from "../cluster/node.ts";
@@ -61,11 +59,12 @@ const HOST_PATHS: readonly { readonly name: string; readonly path: string; reado
   { name: "run", path: "/run", type: "Directory" },
   { name: "gvisor", path: GVISOR_RELEASES, type: "DirectoryOrCreate", readOnly: true },
   { name: "containerd", path: CONTAINERD, type: "DirectoryOrCreate", readOnly: true },
-  { name: "snapshots", path: SNAPSHOT_CACHE_DIR, type: "DirectoryOrCreate" },
-  // Workspace storage, as the node's mount of it holds it, and the pool pods' directories,
-  // which it attaches workspaces into and writes their tokens beside.
-  { name: "workspaces", path: WORKSPACES_ROOT, type: "DirectoryOrCreate" },
-  { name: "attach", path: ATTACH_ROOT, type: "DirectoryOrCreate" },
+  // alasio's directory of the node's: workspace storage, as the node's mount of it holds it,
+  // the pool pods' directories, which it attaches workspaces into and writes their tokens
+  // beside, and the snapshots' cache. The directory, not the mount point: a bind of the mount
+  // point is of the mount it finds there, and the node's mount made there anew, as it is once
+  // its juicefs is gone, would never be the agent's.
+  { name: "alasio", path: NODE_DIRECTORY, type: "DirectoryOrCreate" },
 ];
 
 /** What each suffix of a size multiplies it by, as Kubernetes counts a quantity. */
@@ -88,8 +87,8 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
     name,
     mountPath: path,
     ...(readOnly ? { readOnly } : {}),
-    // What is mounted under the node's /run, and its mount of workspace storage, after the agent starts are the agent's too.
-    ...(name === "run" || name === "workspaces" ? { mountPropagation: "HostToContainer" } : {}),
+    // What is mounted under the node's /run, and in alasio's directory, its mount of workspace storage among it, after the agent starts are the agent's too.
+    ...(name === "run" || name === "alasio" ? { mountPropagation: "HostToContainer" } : {}),
   }));
   return {
     apiVersion: "apps/v1",
@@ -126,7 +125,7 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
             command: ["node", "/opt/alasio/src/node-agent/cpu-features.ts", currentGvisorRelease()],
             securityContext: { privileged: true, runAsUser: 0 },
             resources: sessions.snapshots.nodeAgent.resources,
-            volumeMounts: volumeMounts.filter(({ name }) => name !== "snapshots"),
+            volumeMounts,
           }],
           containers: [{
             name: "node-agent",

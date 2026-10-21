@@ -2398,9 +2398,7 @@ describe("node agents", () => {
       { name: "run", hostPath: { path: "/run", type: "Directory" } },
       { name: "gvisor", hostPath: { path: "/usr/local/lib/alasio/gvisor", type: "DirectoryOrCreate" } },
       { name: "containerd", hostPath: { path: "/var/lib/rancher/k3s/agent/etc/containerd", type: "DirectoryOrCreate" } },
-      { name: "snapshots", hostPath: { path: "/var/lib/alasio/snapshots", type: "DirectoryOrCreate" } },
-      { name: "workspaces", hostPath: { path: "/var/lib/alasio/workspaces", type: "DirectoryOrCreate" } },
-      { name: "attach", hostPath: { path: "/var/lib/alasio/attach", type: "DirectoryOrCreate" } },
+      { name: "alasio", hostPath: { path: "/var/lib/alasio", type: "DirectoryOrCreate" } },
     ]);
     const [container] = pod?.containers ?? [];
     assert.equal(container?.image, one<V1Deployment>(objects, "Deployment", "alasio").spec?.template.spec?.containers[0]?.image);
@@ -2410,10 +2408,8 @@ describe("node agents", () => {
       { name: "run", mountPath: "/run", mountPropagation: "HostToContainer" },
       { name: "gvisor", mountPath: "/usr/local/lib/alasio/gvisor", readOnly: true },
       { name: "containerd", mountPath: "/var/lib/rancher/k3s/agent/etc/containerd", readOnly: true },
-      { name: "snapshots", mountPath: "/var/lib/alasio/snapshots" },
-      // The node's mount of workspace storage, made after the agent starts, is the agent's too.
-      { name: "workspaces", mountPath: "/var/lib/alasio/workspaces", mountPropagation: "HostToContainer" },
-      { name: "attach", mountPath: "/var/lib/alasio/attach" },
+      // alasio's directory, not its mount point: the node's mount of workspace storage, made there anew after the agent starts, is the agent's too.
+      { name: "alasio", mountPath: "/var/lib/alasio", mountPropagation: "HostToContainer" },
     ]);
     assert.deepEqual(container?.ports, [{ name: "api", containerPort: 8484 }]);
     assert.deepEqual(container?.readinessProbe, { httpGet: { path: "/healthz", port: "api" }, periodSeconds: 10 });

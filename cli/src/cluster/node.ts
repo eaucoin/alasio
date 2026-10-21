@@ -26,7 +26,7 @@ import { gunzipSync, zstdDecompressSync } from "node:zlib";
 import { Duration, Effect, FileSystem, Option, type PlatformError, Schedule, Schema } from "effect";
 
 import pins from "../../../cluster/node/pins.json" with { type: "json" };
-import { CONTAINERD, GVISOR_RELEASES, gvisorDirectory, gvisorHandler } from "../../../src/node-agent/names.ts";
+import { CONTAINERD, GVISOR_RELEASES, gvisorDirectory, gvisorHandler, NODE_DIRECTORY } from "../../../src/node-agent/names.ts";
 import { Registries } from "../config.ts";
 import { clusterKubeconfig, containerdFiles, KUBELET_ARGS, NotYet, registriesYaml, SANDBOX_IMAGE } from "./k3s.ts";
 import { Machine, type RootCommandFailed, RootSystem, under } from "./machine.ts";
@@ -117,12 +117,6 @@ const SERVICE_CIDR = "10.43.0.0/16";
  * (cli/src/manifests/network-policies.ts).
  */
 export const CLUSTER_NETWORKS: readonly string[] = [CLUSTER_CIDR, SERVICE_CIDR];
-/**
- * The directory alasio's pods keep on the node, which nothing of k3s's removes: the workspaces'
- * JuiceFS mount and its state and cache, its juicefs, and the attachments bound into sessions'
- * pods, mounts all (cli/src/manifests/sandbox-gateway.ts, src/node-agent/names.ts).
- */
-const NODE_DIRECTORY = "/var/lib/alasio";
 /** What alasio installs of a gVisor release, in the release's directory: runsc and its shim, and the binaries runsc runs beside it. */
 const GVISOR = ["runsc", "containerd-shim-runsc-v1", "gvisor-bin"] as const;
 /** stargz-snapshotter's daemon's systemd service, which k3s's wants, and with which it stops and restarts. */
