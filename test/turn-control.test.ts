@@ -22,7 +22,8 @@ import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { StoreError } from "../src/persistence/sql.ts";
 import { Store, TurnFenced } from "../src/persistence/store.ts";
 import { forgetfulPersistence } from "./support/persistence.ts";
-import { holdsIn, newSchema, run, testPool, testStore } from "./support/store.ts";
+import { bindHarness, holdsOf, POOLED_SCHEMA, pooledStore, poolOf } from "./support/pools.ts";
+import { run } from "./support/store.ts";
 import { type QueuedToOutbox, recordingOutbox, type TestAlasio, withServices } from "./support/turns.ts";
 
 /** A Codex harness whose turns run as `turn` says, given what alasio gives each. */
@@ -64,8 +65,8 @@ const CONVERSATION_CHAT = 41;
 
 /** A Codex conversation on a folder, in a new store. */
 async function conversation(): Promise<{ readonly store: Store["Service"]; readonly schema: string; readonly conversationId: string }> {
-  const schema = newSchema();
-  const store = await testStore({ schema });
+  const schema = POOLED_SCHEMA;
+  const store = await pooledStore();
   const conversationId = await run(store.upsertConversation({ chatId: String(CONVERSATION_CHAT), user: { id: CONVERSATION_CHAT } }));
   await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
   await run(store.setWorkingDirectory(conversationId, "/work"));
@@ -248,7 +249,7 @@ test("a prompt the last alasio was handing to a turn to steer as it stopped is a
 });
 
 test("alasio starting lets go of the holds the last one left, and ends each turn it left running, its status message saying how", async () => {
-  const { store, schema, conversationId } = await conversation();
+  const { store, conversationId } = await conversation();
   const harness = scriptedHarness((params) => answered(params, "unused"));
   // Left by an alasio killed mid-turn: its hold, and its turn, working, with its status message.
   await run(store.holdConversations([conversationId], "forking", 60_000));
@@ -259,7 +260,7 @@ test("alasio starting lets go of the holds the last one left, and ends each turn
   await run(killed.updateActiveTurnPendingResponseId(partial));
   await withTurns(store, harness, async (alasio, queued) => {
     await alasio.runPromise(Effect.flatMap(Turns, (turns) => Effect.andThen(turns.reconcilePersistentState, turns.recoverInterruptedTurns)));
-    assert.deepEqual(await holdsIn(schema), []);
+    assert.deepEqual(await holdsOf(store), []);
     const ended = await run(store.getTurn(conversationId));
     assert.deepEqual([ended?.state, ended?.status, ended?.outcome], ["completed", "ended", "stopped"]);
     assert.deepEqual(queued.edits.map(({ edits, text }) => [edits, text]), [[
@@ -376,6 +377,7 @@ test("a held prompt sent to steer is done only once the turn took it, and queued
     let answer = Effect.runSync(Deferred.make<boolean>());
     const scope = await alasio.runPromise(Scope.make());
     // A turn runs, which answers each steer as the test says.
+    await alasio.runPromise(bindHarness(conversationId));
     await alasio.runPromise(Effect.flatMap(ActiveTurns, (turns) =>
       turns.register(conversationId, { stop: () => Effect.void, steer: () => Deferred.await(answer), cliInitiated: false })
     ).pipe(Scope.provide(scope)));
@@ -468,6 +470,7 @@ test("a prompt queued again while a turn runs, as its update is handled again af
   await withTurns(store, scriptedHarness(() => Effect.never), async (alasio, queued) => {
     await alasio.runPromise(Effect.scoped(Effect.gen(function*() {
       // A turn runs in the conversation.
+      yield* bindHarness(conversationId);
       assert.ok(yield* (yield* ActiveTurns).reserve(conversationId));
       const turns = yield* Turns;
       const prompt = { conversationId, chatId: CONVERSATION_CHAT, messageId: 77, prompt: "Is it done?", fileIds: [], visibleText: "Is it done?" };
@@ -481,7 +484,7 @@ test("a prompt queued again while a turn runs, as its update is handled again af
 
 test("a question's buttons are kept with its reply or not at all: a reply the store refuses keeps none of its buttons' actions", async () => {
   const { store, schema, conversationId } = await conversation();
-  await (await testPool()).query(`
+  await poolOf(store).query(`
     create sequence ${schema}.replies_queued;
     create function ${schema}.refuse_first_reply() returns trigger language plpgsql as $$
       begin
@@ -503,6 +506,7 @@ test("a prompt held while a turn runs whose question could not be asked, the sto
   const { store, conversationId } = await conversation();
   await withTurns(store, scriptedHarness(() => Effect.never), async (alasio, queued) => {
     await alasio.runPromise(Effect.scoped(Effect.gen(function*() {
+      yield* bindHarness(conversationId);
       assert.ok(yield* (yield* ActiveTurns).reserve(conversationId));
       const turns = yield* Turns;
       const prompt = { conversationId, chatId: CONVERSATION_CHAT, messageId: 78, prompt: "And the docs?", fileIds: [], visibleText: "And the docs?" };
@@ -541,7 +545,7 @@ test("a notice one alasio told a conversation is told by no other on its store, 
 
 test("a notice whose reply could not be queued is not recorded as told, the two being one transaction", async () => {
   const { store, schema, conversationId } = await conversation();
-  const pool = await testPool();
+  const pool = poolOf(store);
   // A reply the store cannot queue, as its outbox refuses it.
   await pool.query(`alter table ${schema}.telegram_outbox add constraint refused check (text <> 'refused') not valid`);
   const refused = await Effect.runPromise(Effect.flip(store.enqueueOutboxNotice(conversationId, { chatId: CONVERSATION_CHAT, text: "refused" })));

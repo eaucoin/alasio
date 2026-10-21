@@ -41,7 +41,8 @@ import { takeCallbackQuery } from "../src/telegram/callback-handler.ts";
 import type { TextMessageOptions } from "../src/telegram/client.ts";
 import { handleMessage } from "../src/telegram/message-handler.ts";
 import { listWorkspaceCandidates } from "../src/workspace/policy.ts";
-import { run, testStore, writerOf } from "./support/store.ts";
+import { bindHarness, pooledStore } from "./support/pools.ts";
+import { run, writerOf } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { type TestAlasio, type TestServicesOptions, withServices } from "./support/turns.ts";
 
@@ -75,7 +76,7 @@ async function withStore<T>(use: (store: Store["Service"], paths: WorkspacePaths
   writeFileSync(join(workspaceRoot, "notes.txt"), "not a folder");
   symlinkSync(root, join(workspaceRoot, "escape"));
   try {
-    return await use(await testStore(), { root, workspaceRoot, repo: join(workspaceRoot, "repo"), plain: join(workspaceRoot, "plain") });
+    return await use(await pooledStore(), { root, workspaceRoot, repo: join(workspaceRoot, "repo"), plain: join(workspaceRoot, "plain") });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -135,6 +136,7 @@ function withAlasio<T>(
 /** Holds the conversation busy, as a running turn does, with `turn`'s stop and steer, until the returned release. */
 async function occupy(alasio: TestAlasio, conversationId: string, turn: Partial<RunningTurn> = {}): Promise<() => Promise<void>> {
   const scope = await alasio.runPromise(Scope.make());
+  await alasio.runPromise(bindHarness(conversationId));
   await alasio.runPromise(Effect.flatMap(ActiveTurns, (activeTurns) =>
     activeTurns.register(conversationId, { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false, ...turn })).pipe(Scope.provide(scope)));
   return () => alasio.runPromise(Scope.close(scope, Exit.void));
@@ -478,9 +480,11 @@ test("/service text command switches and reports the outcome", async () => {
 });
 
 test("service callbacks switch harness and surface refusals in the panel", async () => {
-  await withStore(async (store) => {
+  await withStore(async (store, paths) => {
     const conversationId = await run(store.upsertConversation({ chatId: "8", user: { id: 8 } }));
     await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+    // In a folder, where its pod runs the turn that works.
+    await run(store.setWorkingDirectory(conversationId, paths.repo));
     const telegram = recordingTelegram();
     await withAlasio(store, async (alasio) => {
       await occupy(alasio, conversationId);

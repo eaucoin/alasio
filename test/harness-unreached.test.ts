@@ -16,7 +16,8 @@ import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { handleGoalTextCommand } from "../src/operator/goal-control.ts";
 import { Mounts } from "../src/operator/mounts.ts";
 import { takeCallbackQuery } from "../src/telegram/callback-handler.ts";
-import { run, testStore } from "./support/store.ts";
+import { pooledStore } from "./support/pools.ts";
+import { run } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 import { turnsStub, withServices } from "./support/turns.ts";
 
@@ -76,8 +77,8 @@ const logging = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<readonl
   });
 
 /** A conversation on Codex in a folder, with a session, and alasio's services over it, its host not reached, its turns' scheduling recorded in `scheduled`. */
-async function unreachedConversation<T>(use: (services: { readonly alasio: Parameters<Parameters<typeof withServices>[1]>[0]; readonly conversationId: string; readonly store: Awaited<ReturnType<typeof testStore>>; readonly telegram: ReturnType<typeof recordingTelegram>; readonly scheduled: string[] }) => Promise<T>, { goals }: { readonly goals?: HarnessGoals } = {}): Promise<T> {
-  const store = await testStore();
+async function unreachedConversation<T>(use: (services: { readonly alasio: Parameters<Parameters<typeof withServices>[1]>[0]; readonly conversationId: string; readonly store: Awaited<ReturnType<typeof pooledStore>>; readonly telegram: ReturnType<typeof recordingTelegram>; readonly scheduled: string[] }) => Promise<T>, { goals }: { readonly goals?: HarnessGoals } = {}): Promise<T> {
+  const store = await pooledStore();
   const conversationId = await run(store.upsertConversation({ chatId: String(CHAT), user: { id: CHAT } }));
   await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
   await run(store.setWorkingDirectory(conversationId, "/work"));

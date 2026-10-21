@@ -6,7 +6,8 @@ import { Effect } from "effect";
 
 import { Authorizer } from "../src/telegram/authorizer.ts";
 import { takeCallbackQuery } from "../src/telegram/callback-handler.ts";
-import { run, testStore } from "./support/store.ts";
+import { pooledStore } from "./support/pools.ts";
+import { run } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 import { withServices } from "./support/turns.ts";
 
@@ -67,7 +68,7 @@ test("with no user allowed, no one is", async () => {
 });
 
 test("unauthorized callback is rejected before consuming its action", async () => {
-  const store = await testStore();
+  const store = await pooledStore();
   const conversationId = await run(store.upsertConversation({ chatId: "456", user: { id: 456 } }));
   const [actionId = ""] = await run(store.createCallbackActions(conversationId, [{ kind: "queue", payload: { prompt: "later" } }]));
   const telegram = recordingTelegram();

@@ -18,7 +18,8 @@ import {
   handleGoalTextCommand,
 } from "../src/operator/goal-control.ts";
 import type { Store } from "../src/persistence/store.ts";
-import { run, testStore } from "./support/store.ts";
+import { bindHarness, pooledStore } from "./support/pools.ts";
+import { run } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { recordingOutbox, type TestAlasio, turnsStub, withServices } from "./support/turns.ts";
 
@@ -105,8 +106,11 @@ async function withGoalControls<T>(
 
 /** A store holding the conversation of chat 123, on Codex. */
 async function codexConversation(): Promise<Store["Service"]> {
-  const store = await testStore();
-  await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "123", user: { id: 123 } })), "codex"));
+  const store = await pooledStore();
+  const conversationId = await run(store.upsertConversation({ chatId: "123", user: { id: 123 } }));
+  await run(store.setActiveHarness(conversationId, "codex"));
+  // In a folder, where a pool's pod runs its turns.
+  await run(store.setWorkingDirectory(conversationId, "/work"));
   return store;
 }
 
@@ -358,6 +362,7 @@ test("goal turns use normal concurrent-message decision panel when Codex is alre
   const handled = await withServices({ store, outbox: outbox.layer }, (alasio) =>
     // Codex is working: a turn of the conversation is running.
     alasio.runPromise(Effect.scoped(Effect.gen(function*() {
+      yield* bindHarness(CONVERSATION);
       const activeTurns = yield* ActiveTurns;
       yield* activeTurns.register(CONVERSATION, { stop: () => Effect.void, steer: () => Effect.succeed(true), cliInitiated: false });
       const turns = yield* Turns;

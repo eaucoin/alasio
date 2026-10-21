@@ -57,6 +57,7 @@ const { processPrompt } = await import("../src/operator/prompts.ts");
 const { eventually } = await import("./support/wait.ts");
 const { CLAUDE_HARNESS, CODEX_HARNESS } = await import("../src/harness/names.ts");
 const { run: stored, testStore } = await import("./support/store.ts");
+const { pooledStore } = await import("./support/pools.ts");
 const { sessionFsWorkspace } = await import("../src/workspace/kind.ts");
 const { AlasioLoggerLayer, withLogScope } = await import("../src/shared/log.ts");
 const { outsideTraces, resolveTelemetry, sharedResourceAttributes, TracingLayer, withoutTelemetry, withAlasioSpan, withRpcCall } = await import("../src/telemetry/index.ts");
@@ -320,7 +321,7 @@ test("a call of a harness host elsewhere carries its span's trace context, and t
 
 test("a prompt's update, turn, and reply delivery are one trace, however long the prompt waits, the turn naming its session and workspace", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-telemetry-"));
-  const store = await testStore();
+  const store = await pooledStore();
   try {
     const conversationId = await stored(store.upsertConversation({ chatId: "42", user: { id: 42 } }));
     await stored(store.setActiveHarness(conversationId, CODEX_HARNESS));

@@ -16,7 +16,8 @@ import { FOLDER_RETRY, HostBayma } from "../src/mcp/bayma.ts";
 import { takeCallbackQuery } from "../src/telegram/callback-handler.ts";
 import { buildWorkspacePanel, handleWorkspaceControlCallback, handleWorkspaceTextCommand } from "../src/operator/workspace-control.ts";
 import type { FolderScope } from "../src/sandbox/gateway-client.ts";
-import { run, testStore } from "./support/store.ts";
+import { pooledStore } from "./support/pools.ts";
+import { run } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 import { withServices } from "./support/turns.ts";
 
@@ -43,7 +44,7 @@ test("the workspace panel offers to restart a mounted folder's instance where fo
 
 test("a notice's Retry now and Restart folder instance act on its harness's instance, the panel's on each harness's, and are answered as they did", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-folder-controls-"));
-  const store = await testStore();
+  const store = await pooledStore();
   try {
     mkdirSync(join(root, "repo"));
     await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "1", user: { id: 1 } })), "claude"));
@@ -75,7 +76,7 @@ test("a notice's Retry now and Restart folder instance act on its harness's inst
 });
 
 test("a notice's button acts though the conversation's session and service changed since it was sent, as a panel's does not", async () => {
-  const store = await testStore();
+  const store = await pooledStore();
   await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "1", user: { id: 1 } })), "claude"));
   await run(store.setSessionId(CONVERSATION, "session-before"));
   const [retry = "", refresh = ""] = await run(store.createCallbackActions(CONVERSATION, [{ kind: FOLDER_RETRY, payload: { harness: "claude" } }, { kind: "workspace:refresh" }]));

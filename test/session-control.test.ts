@@ -9,7 +9,8 @@ import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { parseCommand } from "../src/operator/command-parser.ts";
 import { type SessionControlHarness, handleSessionControlCallback } from "../src/operator/session-control.ts";
 import type { Store } from "../src/persistence/store.ts";
-import { run, testStore } from "./support/store.ts";
+import { pooledStore } from "./support/pools.ts";
+import { run } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { type TestAlasio, turnsStub, withServices } from "./support/turns.ts";
 
@@ -42,7 +43,7 @@ async function withSessionControls<T>(
   turns: (store: Store["Service"]) => Partial<Turns["Service"]>,
   use: (alasio: TestAlasio, telegram: RecordingTelegram, store: Store["Service"]) => Promise<T>,
 ): Promise<T> {
-  const store = await testStore();
+  const store = await pooledStore();
   await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "123", user: { id: 123 } })), "codex"));
   const telegram = recordingTelegram();
   return await withServices({ store, telegram: telegram.layer, turns: turnsStub(turns(store)) }, (alasio) => use(alasio, telegram, store));

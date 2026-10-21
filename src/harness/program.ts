@@ -173,15 +173,17 @@ export function loadHarnessConfig(env: NodeJS.ProcessEnv = process.env): Harness
   };
 }
 
-/** What a test gives the harnesses the host makes, in place of the deployment's. */
-export type HarnessStandIns = Pick<HarnessesOptions, "overrides" | "claudeQueryFactory" | "folderBayma">;
+/** What a test gives the host in place of the deployment's: the harnesses it makes, and the running turns it keeps, where the test keeps them itself. */
+export interface HarnessStandIns extends Pick<HarnessesOptions, "overrides" | "claudeQueryFactory" | "folderBayma"> {
+  readonly activeTurns?: ActiveTurns["Service"] | undefined;
+}
 
 /**
  * Waits for its binding, then binds the conversation it names, as the module says, and
  * serves its harness host until the scope closes, telling its events as the module says: the
  * port it serves on.
  */
-export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, standIns: HarnessStandIns = {}): Effect.fn.Return<{ readonly port: number }, unknown, Scope.Scope> {
+export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, { activeTurns, ...standIns }: HarnessStandIns = {}): Effect.fn.Return<{ readonly port: number }, unknown, Scope.Scope> {
   yield* Effect.logInfo(`free: serving once bound, as ${config.bindingFile} says`);
   const { conversationId, token } = yield* awaitBinding(config.bindingFile);
   yield* markServed(config.stateDir);
@@ -222,7 +224,7 @@ export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, s
     : CodexAppServer.layer;
   const built = yield* Layer.build(HarnessHost.layer.pipe(
     Layer.provideMerge(Harnesses.layer({ ...standIns, ...(given ? { folderBayma: given.folderBayma } : {}), branch: config.branch, sessionStore: neon.sessionStore, codexRollouts, sessionFsCodexRollouts })),
-    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, appServer, ReceivedFiles.layer({ stateDir: config.stateDir }), told)),
+    Layer.provideMerge(Layer.mergeAll(activeTurns ? Layer.succeed(ActiveTurns, activeTurns) : ActiveTurns.layer, appServer, ReceivedFiles.layer({ stateDir: config.stateDir }), told)),
     Layer.provideMerge(sessions),
     Layer.provideMerge(Layer.succeedContext(stores)),
   ));

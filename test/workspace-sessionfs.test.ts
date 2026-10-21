@@ -9,13 +9,15 @@ import { Effect, Logger } from "effect";
 
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { HarnessHost } from "../src/harness/host.ts";
+import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { Mounts } from "../src/operator/mounts.ts";
 import { buildWorkspacePanel, handleWorkspaceControlCallback, handleWorkspaceTextCommand } from "../src/operator/workspace-control.ts";
 import type { Store } from "../src/persistence/store.ts";
 import { GatewayError } from "../src/sandbox/gateway-client.ts";
 import type { NetMode, SessionSandboxes } from "../src/sandbox/index.ts";
 import { parseWorkspace } from "../src/workspace/kind.ts";
-import { run, testStore } from "./support/store.ts";
+import { bindHarness, pooledStore } from "./support/pools.ts";
+import { run } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { type TestAlasio, withServices } from "./support/turns.ts";
 import { eventually } from "./support/wait.ts";
@@ -65,7 +67,7 @@ async function withWorkspaceControls(
   use: (alasio: TestAlasio, telegram: RecordingTelegram, store: Store["Service"], root: string) => Promise<void>,
 ): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "alasio-workspace-sessionfs-"));
-  const store = await testStore();
+  const store = await pooledStore();
   try {
     await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "1", user: { id: 1 } })), "codex"));
     const telegram = recordingTelegram();
@@ -280,10 +282,12 @@ test("Fork holds every conversation on the workspace busy while it clones, and i
     const source = await mountedVolume(store);
     const other = await run(store.upsertConversation({ chatId: "2", user: { id: 2 } }));
     await run(store.setWorkingDirectory(other, `sessionfs:${source}`));
+    await run(store.setActiveHarness(other, CODEX_HARNESS));
     const busy = (conversationId: string) => alasio.runPromise(Effect.flatMap(HarnessHost, (host) => Effect.map(host.status(conversationId), (status) => status.busy)));
 
     // A turn in another conversation on the workspace, which the fork would suspend.
     const turnEnds = Promise.withResolvers<void>();
+    await alasio.runPromise(bindHarness(other));
     const turn = alasio.runPromise(Effect.scoped(Effect.gen(function*() {
       yield* (yield* ActiveTurns).register(other, { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false });
       yield* Effect.promise(() => turnEnds.promise);

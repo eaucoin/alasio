@@ -29,7 +29,6 @@ import { noFolderBayma } from "../src/mcp/bayma.ts";
 import { Store, TurnFenced } from "../src/persistence/store.ts";
 import { ReceivedFiles } from "../src/telegram/files.ts";
 import { holdsIn, newSchema, run, testStore } from "./support/store.ts";
-import { turnsStub, withServices } from "./support/turns.ts";
 
 /** What the recording harness tells of each turn besides its reply. */
 const NOTICE = "This Codex login doesn't offer gpt-5.6-sol, so Codex used gpt-5.6-terra, the login's default (at high effort). Use /model to choose another.";
@@ -75,6 +74,22 @@ function recordingHarness(seen: TurnParams[], onRun: () => void = () => {}): Har
   };
 }
 
+/**
+ * Runs `effect` on the host a harness pool's pod serves (HarnessHost.layer, src/harness/program.ts),
+ * its Codex `harness`, on `store`, the files a prompt names written under `stateDir`, what it
+ * tells heard in the test's process (HostEvents.inProcess).
+ */
+const onPodHost = <A, E>(
+  { store, harness, stateDir = "/nonexistent-state-dir" }: { readonly store: Store["Service"]; readonly harness: Harness; readonly stateDir?: string },
+  effect: Effect.Effect<A, E, HarnessHost | HarnessEvents | Scope.Scope>,
+): Promise<A> =>
+  Effect.runPromise(Effect.scoped(effect).pipe(Effect.provide(HarnessHost.layer.pipe(
+    Layer.provideMerge(Harnesses.layer({ overrides: { [CODEX_HARNESS]: harness } })),
+    Layer.provideMerge(HostEvents.inProcess),
+    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir }))),
+    Layer.provideMerge(Layer.succeed(Store, store)),
+  ))));
+
 /** The host as the control plane reaches it: in its process, or elsewhere, over HTTP (src/harness/serve.ts, src/harness/remote-host.ts), serving `conversationId`. */
 const REACHES: Readonly<Record<string, (host: HarnessHost["Service"], conversationId: string) => Effect.Effect<HarnessHost["Service"], unknown, Scope.Scope>>> = {
   "in alasio's process": (host) => Effect.succeed(host),
@@ -114,54 +129,52 @@ for (const [reach, reached] of Object.entries(REACHES)) {
       bayma: null,
       codex: null,
     });
-    await withServices({ store, harnesses: { [CODEX_HARNESS]: recordingHarness(seen) }, turns: turnsStub({}) }, (alasio) =>
-      alasio.runPromise(Effect.scoped(Effect.gen(function*() {
-        const host = yield* reached(yield* HarnessHost, conversationId);
-        const events = yield* (yield* HarnessEvents).subscribe;
-        // Held for one turn at a time, until the scope it is held in closes.
-        yield* Effect.scoped(Effect.gen(function*() {
-          assert.equal(yield* host.reserve(conversationId), true);
-          assert.deepEqual(yield* host.status(conversationId), { busy: true, running: true, cliInitiated: false, held: false, idleSince: null });
-          assert.equal(yield* Effect.scoped(host.reserve(conversationId)), false);
-        }));
-        const { idleSince, ...idle } = yield* host.status(conversationId);
-        assert.deepEqual(idle, { busy: false, running: false, cliInitiated: false, held: false });
-        assert.ok(idleSince !== null && idleSince <= Date.now());
-        // A fork's hold, a row of the store, keeps it busy as no turn, which no turn starts under.
-        assert.ok(Option.isSome(yield* whileHeld(host, store, [conversationId], "forking session fs-a into fs-b", () => Effect.gen(function*() {
-          assert.deepEqual([(yield* host.status(conversationId)).busy, (yield* host.status(conversationId)).held, (yield* host.status(conversationId)).running], [true, true, false]);
-          assert.equal(yield* Effect.scoped(host.reserve(conversationId)), false);
-        }))));
-        // And none is held where a turn runs.
-        yield* Effect.scoped(Effect.gen(function*() {
-          assert.equal(yield* host.reserve(conversationId), true);
-          assert.deepEqual(yield* whileHeld(host, store, [conversationId], "forking", () => Effect.void), Option.none());
-        }));
-        assert.deepEqual(yield* Effect.promise(() => holdsIn(schema)), []);
+    await onPodHost({ store, harness: recordingHarness(seen) }, Effect.gen(function*() {
+      const host = yield* reached(yield* HarnessHost, conversationId);
+      const events = yield* (yield* HarnessEvents).subscribe;
+      // Held for one turn at a time, until the scope it is held in closes.
+      yield* Effect.scoped(Effect.gen(function*() {
+        assert.equal(yield* host.reserve(conversationId), true);
+        assert.deepEqual(yield* host.status(conversationId), { busy: true, running: true, cliInitiated: false, held: false, idleSince: null });
+        assert.equal(yield* Effect.scoped(host.reserve(conversationId)), false);
+      }));
+      const { idleSince, ...idle } = yield* host.status(conversationId);
+      assert.deepEqual(idle, { busy: false, running: false, cliInitiated: false, held: false });
+      assert.ok(idleSince !== null && idleSince <= Date.now());
+      // A fork's hold, a row of the store, keeps it busy as no turn, which no turn starts under.
+      assert.ok(Option.isSome(yield* whileHeld(host, store, [conversationId], "forking session fs-a into fs-b", () => Effect.gen(function*() {
+        assert.deepEqual([(yield* host.status(conversationId)).busy, (yield* host.status(conversationId)).held, (yield* host.status(conversationId)).running], [true, true, false]);
+        assert.equal(yield* Effect.scoped(host.reserve(conversationId)), false);
+      }))));
+      // And none is held where a turn runs.
+      yield* Effect.scoped(Effect.gen(function*() {
+        assert.equal(yield* host.reserve(conversationId), true);
+        assert.deepEqual(yield* whileHeld(host, store, [conversationId], "forking", () => Effect.void), Option.none());
+      }));
+      assert.deepEqual(yield* Effect.promise(() => holdsIn(schema)), []);
 
-        const result = yield* host.startTurn(start("10", epoch, job.id));
-        assert.deepEqual([result.blockSequence, result.sessionId, result.interrupted, result.responseCompleted, result.notice], [[{ type: "text", content: "Done." }], "session-1", false, true, NOTICE]);
-        assert.ok((yield* store.getCompletedResponsesPendingDelivery).some(({ id }) => id === result.pendingResponseId));
-        assert.deepEqual([yield* PubSub.take(events), yield* PubSub.take(events)], [
-          { kind: "background-response", conversationId },
-          { kind: "idle", conversationId },
-        ]);
-        // A turn of a claim another has overtaken since fails as its write does.
-        yield* Effect.promise(() => claim("11"));
-        assert.deepEqual(yield* Effect.flip(host.startTurn(start("12", epoch, null))), new TurnFenced({ threadKey: conversationId, epoch }));
-        // A fresh session of the harness, through the host; none where no folder is mounted.
-        assert.equal(yield* host.startFreshSession({ conversationId, harness: CODEX_HARNESS, workingDirectory: "/work" }), `fresh-of-${conversationId}`);
-        assert.deepEqual(yield* Effect.flip(host.startFreshSession({ conversationId, harness: CODEX_HARNESS, workingDirectory: "" })), new NoWorkspaceMounted());
-        // No turn of it runs once it has ended, to steer or stop.
-        assert.equal((yield* host.status(conversationId)).busy, false);
-        assert.deepEqual(yield* host.steer(conversationId, "also", []), Option.none());
-        assert.equal(yield* host.interrupt(conversationId, "interrupt"), false);
-        // A rewind's fork, and a thread's goals, of the conversation's harness, through the host: of a harness with no goals, none.
-        const of = { conversationId, harness: CODEX_HARNESS, workingDirectory: "/work" } as const;
-        assert.equal(yield* host.forkSession({ ...of, sessionId: "session-1", beforeUuid: "turn-1" }), `fork of session-1 before turn-1 for ${conversationId}`);
-        assert.match((yield* Effect.flip(host.goals(of).read({ threadId: "session-1" }))).message, /has no goals/u);
-      })))
-    );
+      const result = yield* host.startTurn(start("10", epoch, job.id));
+      assert.deepEqual([result.blockSequence, result.sessionId, result.interrupted, result.responseCompleted, result.notice], [[{ type: "text", content: "Done." }], "session-1", false, true, NOTICE]);
+      assert.ok((yield* store.getCompletedResponsesPendingDelivery).some(({ id }) => id === result.pendingResponseId));
+      assert.deepEqual([yield* PubSub.take(events), yield* PubSub.take(events)], [
+        { kind: "background-response", conversationId },
+        { kind: "idle", conversationId },
+      ]);
+      // A turn of a claim another has overtaken since fails as its write does.
+      yield* Effect.promise(() => claim("11"));
+      assert.deepEqual(yield* Effect.flip(host.startTurn(start("12", epoch, null))), new TurnFenced({ threadKey: conversationId, epoch }));
+      // A fresh session of the harness, through the host; none where no folder is mounted.
+      assert.equal(yield* host.startFreshSession({ conversationId, harness: CODEX_HARNESS, workingDirectory: "/work" }), `fresh-of-${conversationId}`);
+      assert.deepEqual(yield* Effect.flip(host.startFreshSession({ conversationId, harness: CODEX_HARNESS, workingDirectory: "" })), new NoWorkspaceMounted());
+      // No turn of it runs once it has ended, to steer or stop.
+      assert.equal((yield* host.status(conversationId)).busy, false);
+      assert.deepEqual(yield* host.steer(conversationId, "also", []), Option.none());
+      assert.equal(yield* host.interrupt(conversationId, "interrupt"), false);
+      // A rewind's fork, and a thread's goals, of the conversation's harness, through the host: of a harness with no goals, none.
+      const of = { conversationId, harness: CODEX_HARNESS, workingDirectory: "/work" } as const;
+      assert.equal(yield* host.forkSession({ ...of, sessionId: "session-1", beforeUuid: "turn-1" }), `fork of session-1 before turn-1 for ${conversationId}`);
+      assert.match((yield* Effect.flip(host.goals(of).read({ threadId: "session-1" }))).message, /has no goals/u);
+    }));
     const [params] = seen;
     assert.ok(params);
     assert.deepEqual(
@@ -185,16 +198,14 @@ for (const [reach, reached] of Object.entries(REACHES)) {
       ...recordingHarness([]),
       backgroundWork: (threadKey) => Effect.sync(() => (asked.push(threadKey), working)),
     };
-    await withServices({ store, harnesses: { [CODEX_HARNESS]: harness }, turns: turnsStub({}) }, (alasio) =>
-      alasio.runPromise(Effect.scoped(Effect.gen(function*() {
-        const host = yield* reached(yield* HarnessHost, conversationId);
-        const status = yield* host.status(conversationId);
-        assert.deepEqual([status.busy, status.running, asked], [false, false, []]);
-        assert.equal(yield* host.backgroundWork(conversationId), true);
-        working = false;
-        assert.equal(yield* host.backgroundWork(conversationId), false);
-      })))
-    );
+    await onPodHost({ store, harness }, Effect.gen(function*() {
+      const host = yield* reached(yield* HarnessHost, conversationId);
+      const status = yield* host.status(conversationId);
+      assert.deepEqual([status.busy, status.running, asked], [false, false, []]);
+      assert.equal(yield* host.backgroundWork(conversationId), true);
+      working = false;
+      assert.equal(yield* host.backgroundWork(conversationId), false);
+    }));
     assert.deepEqual(asked, [conversationId, conversationId]);
   });
 }
@@ -231,29 +242,27 @@ for (const [reach, reached] of Object.entries(REACHES)) {
     const mirrored: string[] = [];
     let working = false;
     const harness: Harness = { ...recordingHarness([]), mirror: (sessionId) => Effect.sync(() => void mirrored.push(sessionId)), backgroundWork: () => Effect.sync(() => working) };
-    await withServices({ store, harnesses: { [CODEX_HARNESS]: harness }, turns: turnsStub({}) }, (alasio) =>
-      alasio.runPromise(Effect.scoped(Effect.gen(function*() {
-        const host = yield* reached(yield* HarnessHost, conversationId);
-        // A turn about to run, its reservation held until it is let go: not drained, and not waited for, so neither waits on the other.
-        const letGo = yield* Deferred.make<void>();
-        const turn = yield* Effect.forkChild(Effect.scoped(Effect.andThen(host.reserve(conversationId), Deferred.await(letGo))));
-        while (!(yield* host.status(conversationId)).running) yield* Effect.sleep("10 millis");
-        assert.deepEqual([yield* host.drain(conversationId), mirrored], [false, []]);
-        yield* Deferred.succeed(letGo, undefined);
-        yield* Fiber.join(turn);
-        // Kept as it was: a turn reserves it again, then lets it go.
-        assert.equal(yield* Effect.scoped(host.reserve(conversationId)), true);
-        // Its harness working on its own: not drained.
-        working = true;
-        assert.deepEqual([yield* host.drain(conversationId), mirrored], [false, []]);
-        working = false;
-        // Nothing going on: drained, mirrored, and no turn is started in it again.
-        assert.equal(yield* host.drain(conversationId), true);
-        assert.deepEqual(mirrored, ["session-1"]);
-        assert.equal((yield* host.status(conversationId)).busy, true);
-        assert.equal(yield* Effect.scoped(host.reserve(conversationId)), false);
-      })))
-    );
+    await onPodHost({ store, harness }, Effect.gen(function*() {
+      const host = yield* reached(yield* HarnessHost, conversationId);
+      // A turn about to run, its reservation held until it is let go: not drained, and not waited for, so neither waits on the other.
+      const letGo = yield* Deferred.make<void>();
+      const turn = yield* Effect.forkChild(Effect.scoped(Effect.andThen(host.reserve(conversationId), Deferred.await(letGo))));
+      while (!(yield* host.status(conversationId)).running) yield* Effect.sleep("10 millis");
+      assert.deepEqual([yield* host.drain(conversationId), mirrored], [false, []]);
+      yield* Deferred.succeed(letGo, undefined);
+      yield* Fiber.join(turn);
+      // Kept as it was: a turn reserves it again, then lets it go.
+      assert.equal(yield* Effect.scoped(host.reserve(conversationId)), true);
+      // Its harness working on its own: not drained.
+      working = true;
+      assert.deepEqual([yield* host.drain(conversationId), mirrored], [false, []]);
+      working = false;
+      // Nothing going on: drained, mirrored, and no turn is started in it again.
+      assert.equal(yield* host.drain(conversationId), true);
+      assert.deepEqual(mirrored, ["session-1"]);
+      assert.equal((yield* host.status(conversationId)).busy, true);
+      assert.equal(yield* Effect.scoped(host.reserve(conversationId)), false);
+    }));
   });
 }
 
@@ -317,31 +326,29 @@ test("the files a turn's prompt names, and a steer's, are written where the harn
     const epoch = await run(store.claimTurn({ conversationId, chatId: "41", messageId: "10", sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));
     let found: string | null = null;
     const harness = recordingHarness([], () => (found = existsSync(written(report, "report.txt")) ? readFileSync(written(report, "report.txt"), "utf8") : null));
-    await withServices({ store, stateDir, harnesses: { [CODEX_HARNESS]: harness }, turns: turnsStub({}) }, (alasio) =>
-      alasio.runPromise(Effect.gen(function*() {
-        const host = yield* HarnessHost;
-        yield* host.startTurn({
-          conversationId,
-          chatId: "41",
-          messageId: "10",
-          harness: CODEX_HARNESS,
-          workingDirectory: "/work",
-          prompt: "go",
-          fileIds: [report],
-          resumeSession: null,
-          modelChoice: null,
-          epoch,
-          jobId: null,
-          attachedTurn: null,
-          bayma: null,
-          codex: null,
-        });
-        assert.equal(found, "a report", "the harness found the file as it ran");
-        // No turn runs to take the steer, but its file is written all the same, for the turn it is queued for.
-        assert.deepEqual(yield* host.steer(conversationId, "and these", [notes]), Option.none());
-        assert.equal(readFileSync(written(notes, "notes.txt"), "utf8"), "some notes");
-      }))
-    );
+    await onPodHost({ store, stateDir, harness }, Effect.gen(function*() {
+      const host = yield* HarnessHost;
+      yield* host.startTurn({
+        conversationId,
+        chatId: "41",
+        messageId: "10",
+        harness: CODEX_HARNESS,
+        workingDirectory: "/work",
+        prompt: "go",
+        fileIds: [report],
+        resumeSession: null,
+        modelChoice: null,
+        epoch,
+        jobId: null,
+        attachedTurn: null,
+        bayma: null,
+        codex: null,
+      });
+      assert.equal(found, "a report", "the harness found the file as it ran");
+      // No turn runs to take the steer, but its file is written all the same, for the turn it is queued for.
+      assert.deepEqual(yield* host.steer(conversationId, "and these", [notes]), Option.none());
+      assert.equal(readFileSync(written(notes, "notes.txt"), "utf8"), "some notes");
+    }));
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

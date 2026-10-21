@@ -7,10 +7,10 @@
 import { Effect, Layer, ManagedRuntime } from "effect";
 
 import { CodexAppServer } from "../../src/codex/app-server/client.ts";
+import { EventsConsumer } from "../../src/events/consume.ts";
 import { Turns } from "../../src/codex/turns.ts";
 import { ActiveTurns } from "../../src/harness/active-turns.ts";
-import { HarnessHost } from "../../src/harness/host.ts";
-import { HostEvents } from "../../src/harness/host-events.ts";
+import type { HarnessHost } from "../../src/harness/host.ts";
 import { type Harness, Harnesses } from "../../src/harness/index.ts";
 import type { HarnessName } from "../../src/harness/names.ts";
 import { Panels } from "../../src/harness/panels.ts";
@@ -27,6 +27,7 @@ import type { TelegramClient } from "../../src/telegram/client.ts";
 import { MediaGroups } from "../../src/telegram/media-group-buffer.ts";
 import { Outbox, type OutboxStatus, type OutboxText } from "../../src/telegram/outbox.ts";
 import { TracingLayer } from "../../src/telemetry/index.ts";
+import { pooledHost, type Pools } from "./pools.ts";
 import { recordingTelegram } from "./telegram-calls.ts";
 
 /** An outbox that queues nothing, for turns whose replies a test does not follow. */
@@ -141,16 +142,16 @@ function testServices({
   hostBayma,
   branch,
   host,
-}: TestServicesOptions): Layer.Layer<AlasioServices> {
-  return MediaGroups.layer().pipe(
+}: TestServicesOptions): Layer.Layer<AlasioServices | Pools> {
+  return Layer.effectDiscard(Effect.flatMap(EventsConsumer, (consumer) => consumer.start)).pipe(Layer.provideMerge(MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot, branch }), Authorizer.layer(allowedUserIds))),
     Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer()),
     Layer.provideMerge(Panels.ofHarnesses),
-    Layer.provideMerge(host ? Layer.effect(HarnessHost, Effect.map(HarnessHost, host)).pipe(Layer.provide(HarnessHost.layer)) : HarnessHost.layer),
+    // Its harnesses run where a pool's do: in a pod's host, bound for the conversation, reached through the sandbox gateway's front.
+    Layer.provideMerge(pooledHost({ standIns: { overrides: harnesses }, branch, host })),
     Layer.provideMerge(Harnesses.layer({ overrides: harnesses, branch })),
     // Received files are written nowhere a test does not say; into a session through the test's session filesystems.
     Layer.provideMerge(ReceivedFiles.layer({ stateDir: stateDir ?? "/nonexistent-state-dir" })),
-    Layer.provideMerge(HostEvents.inProcess),
     Layer.provideMerge(Layer.mergeAll(
       ActiveTurns.layer,
       outbox,
@@ -160,11 +161,11 @@ function testServices({
       hostBayma ? Layer.succeed(HostBayma, hostBayma) : Layer.empty,
     )),
     Layer.provideMerge(Layer.mergeAll(Layer.succeed(Store, store), telegram)),
-  );
+  )));
 }
 
 /** alasio's services for one test, which runs its effects in them. */
-export type TestAlasio = ManagedRuntime.ManagedRuntime<AlasioServices | Layer.Success<typeof TracingLayer>, never>;
+export type TestAlasio = ManagedRuntime.ManagedRuntime<AlasioServices | Pools | Layer.Success<typeof TracingLayer>, never>;
 
 /**
  * Runs `use` on alasio's services over `options`, and takes them down after, however it
