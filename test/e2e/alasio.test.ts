@@ -551,6 +551,16 @@ if (inShard("upgrade")) {
           assert.match(await inCutOverRecord("cat events.log"), new RegExp(`fetching what containerd lacks of the sandbox image ${sandboxImage.replaceAll(".", "\\.")}, `, "u"));
         },
       },
+      {
+        seeds: "the tally 9.0.0 keeps of albums whose files it failed to write",
+        seed: async () => {
+          assert.equal(await onDatabase(NAMESPACE, "select to_regclass('state.media_group_failures') is not null"), "t", `${PREVIOUS} keeps no tally of albums`);
+        },
+        keeps: "no tally of albums, as a turn's host writes a prompt's files",
+        check: async () => {
+          assert.equal(await onDatabase(NAMESPACE, "select to_regclass('state.media_group_failures') is null"), "t", "the tally of albums is kept still");
+        },
+      },
     ];
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);

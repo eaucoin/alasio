@@ -4,7 +4,8 @@
  * release's state, made as alasio makes it, its rows written, and what was recorded of them as
  * they were let go of, as 9.0.0's was never recorded, it gives each conversation the sessions
  * its rows name, as this release records them as they are written, and the Codex threads their
- * histories start in, as the rollouts say; run again, nothing more.
+ * histories start in, as the rollouts say; 9.0.0's tally of albums whose files failed gone, as
+ * this release keeps none; run again, nothing more.
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -22,7 +23,7 @@ import { startPostgres } from "./support/postgres.ts";
 /** The cut-over's SQL, as bash reads the script's definition of it. */
 const SESSIONS_CLAIMED = spawnSync("bash", ["-c", 'eval "$(sed -n \'/^SESSIONS_CLAIMED="/,/^select count[^"]*"$/p\' "$0")"; printf %s "$SESSIONS_CLAIMED"', fileURLToPath(new URL("../upgrades/from-9.0.0.sh", import.meta.url))], { encoding: "utf8" }).stdout;
 
-test("the cut-over gives each conversation the sessions its rows name, as this release records them as they are written, and the threads their histories start in, and nothing more run again", async () => {
+test("the cut-over gives each conversation the sessions its rows name, as this release records them as they are written, and the threads their histories start in, drops 9.0.0's tally of albums, and nothing more run again", async () => {
   assert.match(SESSIONS_CLAIMED, /insert into state\.conversation_sessions/u);
   const database = await startPostgres();
   const pool = new pg.Pool({ connectionString: database.url, max: 2 });
@@ -53,14 +54,16 @@ test("the cut-over gives each conversation the sessions its rows name, as this r
     // As this release records them, the mounted thread's lineage with it.
     assert.deepEqual(named.map(({ session_id }) => session_id), ["a-before", "a-mounted", "a-parent", "a-root", "a-turn", "b-before", "b-mounted", "b-turn"]);
     assert.deepEqual(new Set(named.map(({ conversation_id }) => conversation_id)), new Set([first, second]));
-    // As 9.0.0's rows were: none of it recorded.
+    // As 9.0.0's rows were: none of it recorded; and its tally of albums whose files failed, which this release keeps none of.
     await pool.query("delete from state.conversation_sessions");
+    await pool.query("create table state.media_group_failures (media_group_id text primary key, failures integer not null default 1)");
     /** How many sessions the conversations have, as the cut-over's SQL says last. */
     const claimed = async () => {
       const results = (await pool.query(SESSIONS_CLAIMED)) as unknown as { rows: { count: string }[] }[];
       return results.at(-1)?.rows[0]?.count;
     };
     assert.equal(await claimed(), "8");
+    assert.equal((await pool.query("select to_regclass('state.media_group_failures') as kept")).rows[0]?.kept, null, "9.0.0's tally of albums is kept");
     // The rows' sessions, and the first's mounted thread's lineage, its: as this release records them.
     assert.deepEqual(await recorded(), named);
     assert.equal(await claimed(), "8");

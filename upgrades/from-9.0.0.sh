@@ -164,7 +164,9 @@ SETUP_POD_NAME=alasio-setup
 # records them from as they are written (src/persistence/schema.ts SESSION_ROWS); and of each, the
 # Codex threads its history starts in, transitively, as its rollouts kept in Neon say them, which
 # 9.0.0's alasio wrote, so a thread resumed has its lineage, as this release gives it them as a row
-# names a thread (state.claim_lineage). How many sessions the conversations have then.
+# names a thread (state.claim_lineage). How many sessions the conversations have then. And
+# 9.0.0's tally of the albums whose files it failed to write, which this release keeps none of,
+# as a turn's host writes a prompt's files: its table dropped.
 SESSIONS_CLAIMED="
 insert into state.conversation_sessions (session_id, conversation_id)
 select named.session_id, named.conversation_id from (
@@ -181,6 +183,7 @@ select named.session_id, named.conversation_id from (
 where named.session_id is not null
 on conflict do nothing;
 select count(state.claim_lineage(session_id, conversation_id)) from (select session_id, conversation_id from state.conversation_sessions) claimed;
+drop table if exists state.media_group_failures;
 select count(*) from state.conversation_sessions"
 # The release's setup pod, as SETUP_POD printed it, before the point of no return: it changes nothing.
 sessions_claimed_before() {
