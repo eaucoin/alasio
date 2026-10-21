@@ -160,6 +160,14 @@ export function harnessIdleness({ status, backgroundWork }: HostIdleFacts, lease
   return lingered(status.idleSince, lease, pod, now, timing);
 }
 
+/** How `pod`'s host's container last ended, as kubelet says it: its exit code, its reason and its message, where it says them. */
+const endedHow = (pod: V1Pod): string => {
+  const host = pod.status?.containerStatuses?.find(({ name }) => name === HARNESS_CONTAINER);
+  const ended = host?.state?.terminated ?? host?.lastState?.terminated;
+  if (!ended) return `its pod's phase is ${pod.status?.phase ?? "unknown"}`;
+  return [`exit code ${ended.exitCode}`, ended.reason, ended.message?.trim()].filter(Boolean).join(", ");
+};
+
 /** Whether `pod`'s host ended, or was started again in it, which serves its binding no more. */
 const hostEnded = (pod: V1Pod): boolean => {
   const host = pod.status?.containerStatuses?.find(({ name }) => name === HARNESS_CONTAINER);
@@ -409,7 +417,7 @@ export const makeHarnesses = Effect.fnUntraced(function*(
         const deleted = pod.metadata?.deletionTimestamp !== undefined;
         if (!held.has(name) || releasing.has(uid) || !(deleted || hostEnded(pod))) continue;
         releasing.add(uid);
-        yield* Effect.logWarning(deleted ? `${key}'s pod ${name} ends, though the gateway did not end it: it is released` : `${key}'s host ended in ${name}, which serves its binding no more: it is released, the next bind making another`);
+        yield* Effect.logWarning(deleted ? `${key}'s pod ${name} ends, though the gateway did not end it: it is released` : `${key}'s host ended in ${name} (${endedHow(pod)}), which serves its binding no more: it is released, the next bind making another`);
         // Its host drained where it may yet answer; one ending, or ended, is not.
         yield* Effect.forkDetach(releaseAs(pool, key, deleted ? "deleted" : "broken", false, name).pipe(
           Effect.catch((error) => Effect.andThen(Effect.sync(() => void releasing.delete(uid)), Effect.logWarning(`releasing ${key} failed: ${error.message}`))),
