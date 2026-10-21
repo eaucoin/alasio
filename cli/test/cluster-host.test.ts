@@ -80,6 +80,25 @@ test("planNode installs a newly pinned gVisor release beside the one before it, 
   assert.deepEqual(plan(["21010101.0"], ["20990101.0", "21000101.0"], null).gvisor, { install: ["21010101.0"], remove: [] });
 });
 
+test("planNode, upgraded once where what the snapshots name is not known, keeps every release installed; upgraded again where it is known, removes the unnamed ones, restarting k3s once; and then plans nothing", () => {
+  const pinned = ["21010101.0"];
+  // As the node is once the first upgrade is through: the pinned release installed beside the ones before it.
+  const installed = ["21010101.0", "20990101.0", "21000101.0"];
+  const pins = fakeReleases({ gvisor: pinned }).pins;
+  /** The plan against `gvisor` installed, its configuration that of the releases kept then, as up writes it, given what the snapshots name. */
+  const plan = (gvisor: readonly string[], configured: readonly string[], named: SnapshotReleases | null) => {
+    const kept = keptReleases(pinned, gvisor, named);
+    return planNode(pins, { stamp: { k3s: pins.k3s.version, stargz: pins.stargz.version, gvisor: [...gvisor], config: configured.join(",") }, config: kept.join(","), unit: RUNNING, kubeconfig: "current", firewall: null, kept });
+  };
+  const none = { firewall: null, configure: false, gvisor: { install: [], remove: [] }, stargz: false, k3s: null, kubeconfig: false, renew: false };
+  // The gateway could not say, as one of a release before GET /snapshots/releases cannot: every release kept, nothing more to do.
+  assert.deepEqual(plan(installed, installed, null), none);
+  // It says now, naming none of the releases before: those removed, the configuration with them, k3s restarted once.
+  assert.deepEqual(plan(installed, installed, new Map()), { ...none, configure: true, gvisor: { install: [], remove: ["20990101.0", "21000101.0"] }, k3s: "restart", kubeconfig: true });
+  // Once that is through, nothing.
+  assert.deepEqual(plan(pinned, pinned, new Map()), none);
+});
+
 test("the releases kept are the pinned ones first, then those installed that a snapshot names, as the sandbox gateway says, and every one installed where it cannot be read", async () => {
   const read = (asked: Effect.Effect<unknown, { readonly message: string }>) => Effect.runPromise(snapshotReleasesFrom(asked).pipe(Effect.provide(Logger.layer([]))));
   const named = await read(Effect.succeed({ releases: { "20990101.0": ["alasio-sessions/fs-a/s-1", "alasio-sessions/fs-c/s-2"], "21000101.0": ["alasio-branch-one-sessions/fs-d/s-3"] } }));
