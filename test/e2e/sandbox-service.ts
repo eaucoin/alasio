@@ -115,7 +115,7 @@ async function branchToken(branch: string, workspace: string): Promise<string> {
   const master = Buffer.from(await kube.secret(NAMESPACE, GATEWAY, "caller-key"));
   const written = await kube.secret(`alasio-branch-${branch}`, componentName("sessions-caller"), "caller-key").catch(() => null);
   if (written !== null) assert.deepEqual(Buffer.from(written), environmentKey(master, branch));
-  return mintToken(environmentKey(master, branch), { key: sessionKey(workspace), expires: Date.now() + 600_000, options: { environment: branch, mode: "none" } });
+  return mintToken(environmentKey(master, branch), { key: sessionKey(workspace), expires: Date.now() + 9 * 60_000, options: { environment: branch, mode: "none" } });
 }
 
 /** Whether main's gateway serves the branch environment `branch`: its answer to a request that binds nothing, 409 where it does, 403 where it does not. */

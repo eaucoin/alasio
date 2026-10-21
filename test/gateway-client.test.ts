@@ -48,7 +48,7 @@ async function gateway(t: TestContext, answer: (asked: Asked) => { status: numbe
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
 const refused = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(Effect.flip(effect));
 
-test("bayma's endpoint is the gateway's /mcp, with a caller's token of the workspace's key, its environment and internet, good for hours, by its environment's own key", async (t) => {
+test("bayma's endpoint is the gateway's /mcp, with a caller's token of the workspace's key, its environment and internet, good for minutes, by its environment's own key", async (t) => {
   const { workspaces } = await gateway(t, () => ({ status: 200 }));
   const endpoint = await run(workspaces.endpoint("fs-abc123", "full"));
   assert.match(endpoint.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp$/u);

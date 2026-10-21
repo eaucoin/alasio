@@ -112,10 +112,10 @@ export interface Answer {
 
 /**
  * The longest a caller's token may stay good for, from now: alasio's (src/sandbox/gateway-client.ts
- * TOKEN_TTL_MS, six hours), with room for clocks apart (CLOCKS_APART_MS). One good for
+ * TOKEN_TTL_MS, five minutes), with room for clocks apart (CLOCKS_APART_MS). One good for
  * longer, as a key leaked would mint, is answered 401.
  */
-export const MAX_CALLER_TOKEN_MS = 6 * 60 * 60_000 + CLOCKS_APART_MS;
+export const MAX_CALLER_TOKEN_MS = 5 * 60_000 + CLOCKS_APART_MS;
 
 /** What a Retry-After asks a caller to wait, in seconds, before it asks again. */
 const RETRY_AFTER_S = 1;

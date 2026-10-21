@@ -170,7 +170,7 @@ test("alasio reaches each conversation's pooled host through the front, a token 
       assert.deepEqual(stand.asked[0]?.claims?.key, `harness:${conversationId}`);
       assert.deepEqual(stand.asked[0]?.claims?.options, { environment: "main", harness: "codex", workspace: "folder" });
       const lifetime = (stand.asked[0]?.claims?.expires ?? 0) - Date.now();
-      assert.ok(lifetime > 5 * 60 * 60_000 && lifetime <= 6 * 60 * 60_000, String(lifetime));
+      assert.ok(lifetime > 4 * 60_000 && lifetime <= 5 * 60_000, String(lifetime));
 
       // A turn binds it, given its folder's bayma as alasio brought it up, what its bind waited on said in its status meanwhile.
       const epoch = await run(store.claimTurn({ conversationId, chatId: "41", messageId: "10", sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));

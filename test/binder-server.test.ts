@@ -260,7 +260,7 @@ test("a caller's token good for longer than alasio's, as a key leaked would mint
     assert.equal((await ask(Date.now() + MAX_CALLER_TOKEN_MS + 60_000)).status, 401);
     assert.equal((await ask(Date.now() + 365 * 24 * 60 * 60_000)).status, 401);
     assert.equal(stand.sent.length, 0);
-    assert.equal((await ask(Date.now() + 6 * 60 * 60_000)).status, 200);
+    assert.equal((await ask(Date.now() + 5 * 60_000)).status, 200);
   } finally {
     await served.close();
     stand.close();

@@ -512,13 +512,13 @@ export const recordSession = (volumeId: string, mode: SessionMode): void => void
 /** A caller's token of the workspace `workspace` of main's sessions, signed by main's own key, as main's alasio signs one, of its internet. */
 export async function mainToken(workspace: string, mode: SessionMode = sessionModes.get(workspace) ?? "none"): Promise<string> {
   const callerKey = await kube.secret(NAMESPACE, GATEWAY, "caller-key");
-  return mintToken(environmentKey(Buffer.from(callerKey), "main"), { key: sessionKey(workspace), expires: Date.now() + 600_000, options: { environment: "main", mode } });
+  return mintToken(environmentKey(Buffer.from(callerKey), "main"), { key: sessionKey(workspace), expires: Date.now() + 9 * 60_000, options: { environment: "main", mode } });
 }
 
-/** A caller's token of main's environment for `key`, good for ten minutes, as main's alasio signs one: of a folder conversation's instance, say. */
+/** A caller's token of main's environment for `key`, good for nine minutes, within the longest the gateway takes, as main's alasio signs one: of a folder conversation's instance, say. */
 export async function mainKeyToken(key: string): Promise<string> {
   const callerKey = await kube.secret(NAMESPACE, GATEWAY, "caller-key");
-  return mintToken(environmentKey(Buffer.from(callerKey), "main"), { key, expires: Date.now() + 600_000, options: { environment: "main" } });
+  return mintToken(environmentKey(Buffer.from(callerKey), "main"), { key, expires: Date.now() + 9 * 60_000, options: { environment: "main" } });
 }
 
 /** What the gateway answers `method path` with, asked as alasio asks it, from its pod, with `token`, `body` sent as it is: its status, what it said, and when it asked to be asked again (its Retry-After), if it did. */
