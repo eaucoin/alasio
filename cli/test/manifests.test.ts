@@ -3800,6 +3800,19 @@ describe("conversations' harnesses' pools", () => {
     assert.deepEqual(all<V1Deployment>(branch, "Deployment").filter(({ metadata }) => metadata?.name?.startsWith("harness-")).map(({ metadata }) => `${metadata?.namespace}/${metadata?.name}`), ["alasio-branch-try/harness-codex", "alasio-branch-try/harness-claude"]);
   });
 
+  test("Claude Code's login, where the installation gives one, in each pool's pods as in alasio's own, the operator's Claude home with it in a folder conversation's; none where it gives none", () => {
+    const host = { enabled: true, uid: 1001, gid: 1002, home: "/home/op", mounts: [{ name: "home", hostPath: "/home/op", mountPath: "/home/op" }] };
+    const tokenOf = (pool: V1Deployment) => container(pool).env?.find(({ name }) => name === "CLAUDE_CODE_OAUTH_TOKEN")?.valueFrom?.secretKeyRef;
+    const given = install({ ...pooling, host, alasio: { claude: { existingSecret: "claude" } } });
+    for (const name of ["harness-claude", "harness-codex", "harness-folder-claude", "harness-folder-codex", "alasio"]) {
+      assert.deepEqual(tokenOf(one<V1Deployment>(given, "Deployment", name)), { name: "claude", key: "token" }, name);
+    }
+    // A folder conversation's, with the operator's home, their ~/.claude among it, as alasio's pod is under the host profile.
+    assert.ok(container(one<V1Deployment>(given, "Deployment", "harness-folder-claude")).volumeMounts?.some(({ mountPath }) => mountPath === "/home/op"));
+    const none = install({ ...pooling, host });
+    for (const name of ["harness-claude", "harness-folder-claude"]) assert.equal(tokenOf(one<V1Deployment>(none, "Deployment", name)), undefined, name);
+  });
+
   test("a branch environment's in its own namespace, and the gateway may claim, read and delete their pods alone, and make none", () => {
     const branch = branchObjects(configOf(pooling), "try", BASELINE);
     const pool = one<V1Deployment>(branch, "Deployment", "harness-codex");
