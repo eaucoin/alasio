@@ -18,8 +18,8 @@
  *   as the gateway answers them, through its node agents (POST and DELETE /workspace,
  *   GET /workspace/quota, GET /workspace/all, GET and PUT /workspace/files, POST /workspace/forks);
  *   a file's write asked again every few seconds while the gateway answers it 503, as a node's
- *   mount of workspace storage does not hold its workspace's quota yet, or is handed over,
- *   until FILE_WRITE_WAIT_MS.
+ *   mount of workspace storage does not hold its workspace's quota yet, or is handed over, or
+ *   is not reached, as while the gateway rolls, until FILE_WRITE_WAIT_MS.
  *
  * What the gateway refuses is a GatewayError with its status and what it said.
  *
@@ -52,10 +52,10 @@ export const TOKEN_TTL_MS = 5 * 60_000;
 /** How long a bind asked ahead is asked again for, while the gateway's pool has no pod for it. */
 export const BIND_WAIT_MS = 5 * 60_000;
 /**
- * How long a file's write is asked again for, while the gateway answers it 503: past a node's
- * mount of workspace storage's handover to its successor, and two of JuiceFS's heartbeats
- * (12 s), at which the mount loads a workspace's new quota (../node-agent/workspaces.ts), with
- * room.
+ * How long a file's write is asked again for, while the gateway answers it 503, or is not
+ * reached: past a gateway's rollout, a node's mount of workspace storage's handover to its
+ * successor, and two of JuiceFS's heartbeats (12 s), at which the mount loads a workspace's new
+ * quota (../node-agent/workspaces.ts), with room.
  */
 const FILE_WRITE_WAIT_MS = 60_000;
 /** How long a call of the gateway's may take, in ms, but a bind's and a release's, which wait for a pod and a save. */
@@ -95,6 +95,9 @@ const StartingAnswer = Schema.Struct({ starting: Schema.NullOr(Schema.String) })
 
 /** A bind refused as its pool had no pod for it in time, or a write as its workspace's mount was not ready for it, to be asked again after what it said. */
 class NotYet extends Schema.TaggedError<NotYet>()("NotYet", { reason: Schema.String }) {}
+
+/** A write the gateway was not reached for, its request failing or not answered in time, to be asked again. */
+class Unreached extends Schema.TaggedError<Unreached>()("Unreached", { reason: Schema.String }) {}
 
 /** A workspace's quota, as the gateway reads it back. */
 export interface Quota {
@@ -295,19 +298,25 @@ export function makeGatewayWorkspaces(options: GatewayWorkspacesOptions | GivenT
     },
     writeFile: (volumeId, path, bytes) => {
       const what = `write ${path} of ${volumeId}`;
-      return ask(what, volumeId, "none", "PUT", `/workspace/files?${new URLSearchParams({ path })}`, { body: bytes }).pipe(
-        Effect.flatMap((answer): Effect.Effect<void, GatewayError | NotYet> => {
-          if (answer.status === 204) return Effect.void;
-          if (answer.status === 503) return Effect.fail(new NotYet({ reason: said(answer.bytes) }));
-          return Effect.fail(new GatewayError({ call: what, status: answer.status, reason: said(answer.bytes) }));
-        }),
-        Effect.retry({
-          while: (error) => error._tag === "NotYet",
-          schedule: Schedule.max([Schedule.spaced("2 seconds"), Schedule.during(FILE_WRITE_WAIT_MS)]),
-        }),
-        Effect.catchTag("NotYet", (error) => Effect.fail(new GatewayError({ call: what, status: 503, reason: error.reason }))),
-      );
+      // Its token had first, as one there is none of is no matter of asking again.
+      return Effect.flatMap(tokenOf(volumeId, "none"), (token) =>
+        askAs(what, Effect.succeed(token), "PUT", `/workspace/files?${new URLSearchParams({ path })}`, { body: bytes }).pipe(
+          // Not reached, as while the gateway rolls or its node starts again: asked again too, as the write is of the file whole, so one that went through and is asked again writes the same.
+          Effect.mapError((error) => new Unreached({ reason: error.reason })),
+          Effect.flatMap((answer): Effect.Effect<void, GatewayError | NotYet> => {
+            if (answer.status === 204) return Effect.void;
+            if (answer.status === 503) return Effect.fail(new NotYet({ reason: said(answer.bytes) }));
+            return Effect.fail(new GatewayError({ call: what, status: answer.status, reason: said(answer.bytes) }));
+          }),
+          Effect.retry({
+            while: (error) => error._tag === "NotYet" || error._tag === "Unreached",
+            schedule: Schedule.max([Schedule.spaced("2 seconds"), Schedule.during(FILE_WRITE_WAIT_MS)]),
+          }),
+          Effect.catchTag("NotYet", (error) => Effect.fail(new GatewayError({ call: what, status: 503, reason: error.reason }))),
+          Effect.catchTag("Unreached", (error) => Effect.fail(new GatewayError({ call: what, reason: error.reason }))),
+        ));
     },
+
     fork: (volumeId, into) => {
       const what = `fork ${volumeId} into ${into.environment}'s ${into.workspace}`;
       return ask(what, volumeId, "none", "POST", "/workspace/forks", { body: JSON.stringify(into) }).pipe(Effect.flatMap(expect(what, [204])), Effect.asVoid);

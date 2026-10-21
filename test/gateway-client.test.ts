@@ -134,6 +134,25 @@ test("a file's write is asked again while the gateway answers it 503, as a node'
   assert.deepEqual([failed.status, failed.reason, failing.asked.length], [502, "the node agent of node-a could not write it", 1]);
 });
 
+test("a file's write is asked again where the gateway was not reached, as while it rolls, then written", async (t) => {
+  // Its connection cut before it answers, as of a gateway's pod stopping, its first two writes.
+  let cuts = 2;
+  const written: string[] = [];
+  const server = createServer(async (incoming, outgoing) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of incoming) chunks.push(chunk as Buffer);
+    if (incoming.method === "PUT" && cuts > 0) return void ((cuts -= 1), outgoing.socket?.destroy());
+    written.push(Buffer.concat(chunks).toString("utf8"));
+    outgoing.writeHead(204).end();
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => server.close());
+  const workspaces = makeGatewayWorkspaces({ url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/`, environment: "try", callerKey: environmentKey(master, "try") });
+  await run(workspaces.writeFile("fs-abc123", "home/.alasio/received/1/note.txt", Buffer.from("hello")));
+  assert.deepEqual([cuts, written], [0, ["hello"]]);
+});
+
 test("a folder conversation's instance is reached, bound and released through the gateway by a caller's token of its folder key, of its environment alone; a bind that failed is not asked again, saying why, and whether it is held", async (t) => {
   let binds = 0;
   const { asked, workspaces } = await gateway(t, ({ url }) => {
