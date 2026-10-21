@@ -52,7 +52,7 @@ function recordingHarness(seen: TurnParams[], onRun: () => void = () => {}): Har
       getSessionLastMessage: unused("getSessionLastMessage"),
       listSessionMessages: unused("listSessionMessages"),
       getTotalRewindPages: unused("getTotalRewindPages"),
-      createForkedSession: unused("createForkedSession"),
+      createForkedSession: (sessionId, beforeUuid, { threadKey }) => Effect.succeed(`fork of ${sessionId} before ${beforeUuid} for ${threadKey}`),
     },
     startFreshSession: ({ threadKey }) => Effect.succeed(`fresh-of-${threadKey}`),
     warmSession: () => Effect.succeed(false),
@@ -81,7 +81,7 @@ const REACHES: Readonly<Record<string, (host: HarnessHost["Service"], conversati
   "elsewhere, over HTTP": (host, conversationId) =>
     Effect.gen(function*() {
       const { port } = yield* Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token" }), HarnessHost, host);
-      const remote = yield* Layer.build(remoteHarnessHost({ url: `http://127.0.0.1:${port}`, token: Effect.succeed("host-token"), panels: host.panels }));
+      const remote = yield* Layer.build(remoteHarnessHost({ url: `http://127.0.0.1:${port}`, token: Effect.succeed("host-token") }));
       return Context.get(remote, HarnessHost);
     }),
 };
@@ -156,10 +156,10 @@ for (const [reach, reached] of Object.entries(REACHES)) {
         assert.equal((yield* host.status(conversationId)).busy, false);
         assert.deepEqual(yield* host.steer(conversationId, "also", []), Option.none());
         assert.equal(yield* host.interrupt(conversationId, "interrupt"), false);
-        // The panels reach the mount's harness through the host.
-        const panels = Option.getOrNull(yield* host.panels(yield* store.getMount(conversationId)));
-        assert.equal(panels?.displayName, harnessDisplayName(CODEX_HARNESS));
-        assert.throws(() => panels?.listModels(), /the recording harness has no listModels/u);
+        // A rewind's fork, and a thread's goals, of the conversation's harness, through the host: of a harness with no goals, none.
+        const of = { conversationId, harness: CODEX_HARNESS, workingDirectory: "/work" } as const;
+        assert.equal(yield* host.forkSession({ ...of, sessionId: "session-1", beforeUuid: "turn-1" }), `fork of session-1 before turn-1 for ${conversationId}`);
+        assert.match((yield* Effect.flip(host.goals(of).read({ threadId: "session-1" }))).message, /has no goals/u);
       })))
     );
     const [params] = seen;
@@ -282,7 +282,7 @@ test("a host elsewhere not reached says nothing of its conversation and stops no
   const conversationId = await run(store.upsertConversation({ chatId: "41", user: { id: 41 } }));
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     // A port no host listens on: a partition, as the control plane sees one.
-    const host = Context.get(yield* Layer.build(remoteHarnessHost({ url: "http://127.0.0.1:1", token: Effect.succeed("host-token"), panels: () => Effect.succeedNone })), HarnessHost);
+    const host = Context.get(yield* Layer.build(remoteHarnessHost({ url: "http://127.0.0.1:1", token: Effect.succeed("host-token") })), HarnessHost);
     assert.equal((yield* Effect.flip(host.status(conversationId)))._tag, "HarnessHostError");
     assert.equal((yield* Effect.flip(host.interrupt(conversationId, "interrupt")))._tag, "HarnessHostError");
     assert.equal((yield* Effect.flip(Effect.scoped(host.reserve(conversationId))))._tag, "HarnessHostError");

@@ -17,14 +17,14 @@
  */
 import { Context, Effect, Layer, Option, type Scope } from "effect";
 
-import type { ModelChoice, Mount } from "../persistence/conversation-repository.ts";
+import type { ModelChoice } from "../persistence/conversation-repository.ts";
 import type { BaymaEndpoint } from "../sandbox/gateway-client.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { type ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
 import { Store, type TurnFenced } from "../persistence/store.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { ActiveTurns, type StopReason } from "./active-turns.ts";
-import { type AttachedTurn, type Harness, type HarnessError, Harnesses, type HarnessHostError, type HarnessUnavailable, type OwnTurn, type OwnTurns, type TurnResult } from "./index.ts";
+import { type AttachedTurn, type Harness, type HarnessError, type HarnessGoals, Harnesses, HarnessHostError, type HarnessUnavailable, type OwnTurn, type OwnTurns, type TurnResult } from "./index.ts";
 import { HostEvents } from "./host-events.ts";
 import type { HarnessName } from "./names.ts";
 
@@ -80,10 +80,17 @@ export interface TurnCodex {
 export type TurnBayma = { readonly endpoint: BaymaEndpoint; readonly notice: null } | { readonly endpoint: null; readonly notice: string };
 
 /**
- * What the operator's panels reach of a mount's harness, through its host: what it is,
- * its sessions, its goals where it has them, and its models.
+ * What the operator's panels reach of a mount's harness (./panels.ts): what it is, its
+ * sessions, its goals where it has them, and its models.
  */
 export type HarnessPanels = Pick<Harness, "name" | "displayName" | "supportsGoals" | "sessions" | "goals" | "listModels" | "defaultModelChoice">;
+
+/** A conversation, and the harness and workspace it mounts, which a call of the host's is of. */
+export interface ConversationHarness {
+  readonly conversationId: string;
+  readonly harness: HarnessName;
+  readonly workingDirectory: string;
+}
 
 /** What the host says of a conversation. */
 export interface HarnessStatus {
@@ -152,8 +159,14 @@ export class HarnessHost extends Context.Service<HarnessHost, {
   readonly renewCodexLogin: (conversationId: string, login: TurnCodex["login"]) => Effect.Effect<void, HarnessHostError>;
   /** A new, empty session of `harness` in `workingDirectory` for the conversation: its id. */
   readonly startFreshSession: (params: { readonly conversationId: string; readonly harness: HarnessName; readonly workingDirectory: string }) => Effect.Effect<string, HarnessError | HarnessUnavailable>;
-  /** What the panels reach of the mount's harness in its folder; none until both are mounted. */
-  readonly panels: (mount: Mount) => Effect.Effect<Option.Option<HarnessPanels>, HarnessUnavailable>;
+  /**
+   * A new session of `harness` in `workingDirectory` for the conversation, holding `sessionId`'s
+   * history before its message `beforeUuid`, as a rewind makes one: its id, or none where it
+   * could not be made (Harness.sessions.createForkedSession).
+   */
+  readonly forkSession: (params: ConversationHarness & { readonly sessionId: string; readonly beforeUuid: string }) => Effect.Effect<string | null, HarnessError | HarnessUnavailable>;
+  /** The goals of `harness`'s threads in `workingDirectory`, for the conversation, where its harness has goals (Harness.goals). */
+  readonly goals: (params: ConversationHarness) => HarnessGoals;
 }>()("alasio/harness/HarnessHost") {
   /** A host over its harnesses, its running turns, and the files received, telling its events as HostEvents does. */
   static readonly layer: Layer.Layer<HarnessHost, never, Harnesses | ActiveTurns | Store | ReceivedFiles | HostEvents> = Layer.effect(HarnessHost, Effect.gen(function*() {
@@ -262,7 +275,21 @@ export class HarnessHost extends Context.Service<HarnessHost, {
       renewCodexLogin: () => Effect.void,
       startFreshSession: ({ conversationId, harness, workingDirectory }) =>
         Effect.flatMap(harnesses.getFor(harness, workingDirectory), (found) => found.startFreshSession({ threadKey: conversationId, workingDirectory })),
-      panels: (mount) => harnesses.forMount(mount),
+      forkSession: ({ conversationId, harness, workingDirectory, sessionId, beforeUuid }) =>
+        Effect.flatMap(harnesses.getFor(harness, workingDirectory), (found) => found.sessions.createForkedSession(sessionId, beforeUuid, { threadKey: conversationId })),
+      goals: ({ harness, workingDirectory }) => {
+        /** The harness's goals, failing as not reached where it has none, or none serves the workspace. */
+        const goals = harnesses.getFor(harness, workingDirectory).pipe(
+          Effect.mapError((error) => new HarnessHostError({ reason: error.message })),
+          Effect.flatMap((found) => (found.goals ? Effect.succeed(found.goals) : Effect.fail(new HarnessHostError({ reason: `${found.displayName} has no goals` })))),
+        );
+        return {
+          read: (params) => Effect.flatMap(goals, (each) => each.read(params)),
+          set: (params) => Effect.flatMap(goals, (each) => each.set(params)),
+          clear: (params) => Effect.flatMap(goals, (each) => each.clear(params)),
+          waitForTurnId: (threadId, timeoutMs) => Effect.flatMap(goals, (each) => each.waitForTurnId(threadId, timeoutMs)),
+        };
+      },
     });
   }));
 }

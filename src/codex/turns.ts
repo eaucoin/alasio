@@ -2,9 +2,7 @@ import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, FiberSet, HashMap
 
 import {
   type AttachedTurn,
-  type Harness,
   type HarnessError,
-  Harnesses,
   type HarnessUnavailable,
   type NoServiceMounted,
   NoWorkspaceMounted,
@@ -25,6 +23,8 @@ import { SessionSandboxes } from "../sandbox/index.ts";
 import type { ChatId } from "../telegram/client.ts";
 import type { ReceivedFileError } from "../telegram/files.ts";
 import { Outbox } from "../telegram/outbox.ts";
+import type { HarnessPanels } from "../harness/host.ts";
+import { Panels } from "../harness/panels.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { truncateText } from "../operator/text.ts";
 import { makeReplyMedia } from "./reply-media.ts";
@@ -161,14 +161,14 @@ export class Turns extends Context.Service<Turns, {
   static readonly layer = (): Layer.Layer<
     Turns,
     never,
-    Store | Outbox | Harnesses | HarnessHost | HarnessEvents
+    Store | Outbox | Panels | HarnessHost | HarnessEvents
   > => Layer.effect(Turns, makeTurns());
 }
 
 const makeTurns = Effect.fnUntraced(function*() {
   const store = yield* Store;
   const outbox = yield* Outbox;
-  const harnesses = yield* Harnesses;
+  const panels = yield* Panels;
   const host = yield* HarnessHost;
   /**
    * Whether no turn may start in the conversation, as its host says; where it cannot say,
@@ -209,7 +209,7 @@ const makeTurns = Effect.fnUntraced(function*() {
    * delivery, and its status message saying so.
    */
   const runTurn = Effect.fnUntraced(function*(
-    harness: Harness,
+    harness: HarnessPanels,
     mount: Mount,
     { conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null, fileIds = [] }: Omit<SessionTurn, "traceparent">,
     ahead: StatusAhead,
@@ -348,7 +348,7 @@ const makeTurns = Effect.fnUntraced(function*() {
    * its outcome labels it and its duration.
    */
   const runSessionTurn = Effect.fnUntraced(function*(mount: Mount, turn: SessionTurn): Effect.fn.Return<boolean, TurnError> {
-    const harness = yield* harnesses.requireForMount(mount);
+    const harness = yield* panels.requireForMount(turn.conversationId, mount);
     const labels = { "alasio.harness": harness.name };
     // Held busy before it claims the conversation, as one decision, and until it has let go
     // of it; refused where another turn holds it, before it is a turn at all. What it waits on
@@ -374,7 +374,7 @@ const makeTurns = Effect.fnUntraced(function*() {
   }, withLogScope(LOG_SCOPE));
 
   /** A turn of `harness`'s, as the span `alasio.turn`, and counted and timed by its outcome. */
-  const measuredTurn = Effect.fnUntraced(function*(harness: Harness, mount: Mount, turn: SessionTurn, labels: { readonly "alasio.harness": string }, ahead: StatusAhead): Effect.fn.Return<boolean, TurnError> {
+  const measuredTurn = Effect.fnUntraced(function*(harness: HarnessPanels, mount: Mount, turn: SessionTurn, labels: { readonly "alasio.harness": string }, ahead: StatusAhead): Effect.fn.Return<boolean, TurnError> {
     const startedAt = yield* Clock.currentTimeMillis;
     let outcome: TurnOutcome = "failed";
     runningTurns.add(1, labels);
@@ -434,7 +434,7 @@ const makeTurns = Effect.fnUntraced(function*() {
       }
       // A mount no harness serves (none, or one the deployment cannot serve) fails the job, saying why.
       yield* store.getMount(conversationId).pipe(
-        Effect.flatMap(harnesses.requireForMount),
+        Effect.flatMap((mount) => panels.requireForMount(conversationId, mount)),
         Effect.tap(({ name: activeHarness }) =>
           Effect.gen(function*() {
             if (job.harness !== activeHarness) {
@@ -646,7 +646,7 @@ const makeTurns = Effect.fnUntraced(function*() {
     }),
     startNewSession: Effect.fnUntraced(function*(conversationId) {
       const mount = yield* store.getMount(conversationId);
-      const harness = yield* harnesses.requireForMount(mount);
+      const harness = yield* panels.requireForMount(conversationId, mount);
       if (yield* isBusy(conversationId)) {
         return yield* new ConversationBusy({ message: `${harness.displayName} is currently working. Stop the active turn before starting a new session.` });
       }

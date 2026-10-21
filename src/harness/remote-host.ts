@@ -21,9 +21,9 @@
  * (GRANT_HEADER, ./grant.ts), which a pool's pod reaches its conversation's rows by from then on:
  * one the front finds bound to another fails saying which (HarnessHostError.moved).
  *
- * Its events are not heard here: it tells them as its HostEvents says (./host-events.ts), on
- * the log, where the control plane hears them. The operator's panels are reached where the
- * control plane says, as the host elsewhere does not serve them yet.
+ * Its events are not heard here: it tells them as its HostEvents says (./host-events.ts), and
+ * the control plane hears them on its environment's events topic. The operator's panels are
+ * the control plane's (./panels.ts), which reach a host for a fork or a thread's goals alone.
  */
 import { Effect, Layer, Option, Schema } from "effect";
 
@@ -42,7 +42,11 @@ import {
   crossingErrorOf,
   decodeTurnAnswer,
   Failure,
+  ForkSessionAnswer,
   FreshSessionAnswer,
+  GoalAnswer,
+  GoalClearAnswer,
+  GoalTurnAnswer,
   HOST_PATHS,
   InterruptAnswer,
   ReleaseAnswer,
@@ -52,13 +56,12 @@ import {
   TurnAnswered,
 } from "./wire.ts";
 
-/** Where the host elsewhere is, the token it takes, and what the panels reach instead. */
+/** Where the host elsewhere is, and the token it takes. */
 export interface RemoteHostOptions {
   /** The host's address, `http://<host>:<port>`, or the front's it is reached through. */
   readonly url: string;
   /** The token each call bears, made as the call is. */
   readonly token: Effect.Effect<string, HarnessHostError>;
-  readonly panels: HarnessHost["Service"]["panels"];
   /** Where it is reached through the sandbox gateway's front: the status of a conversation bound nowhere, as the module says; none where the host is reached itself. */
   readonly unbound?: ((conversationId: string) => Effect.Effect<HarnessStatus, StoreError | HarnessHostError>) | undefined;
   /**
@@ -109,7 +112,7 @@ function linesOf(body: ReadableStream<Uint8Array>, what: string): { readonly nex
 }
 
 /** The harness host at `url`, as the module says. */
-export function remoteHost({ url, token, panels, unbound, bound }: RemoteHostOptions): HarnessHost["Service"] {
+export function remoteHost({ url, token, unbound, bound }: RemoteHostOptions): HarnessHost["Service"] {
   /** The host's answer to `path` with `body`, binding nothing where `bindsNothing`: its status and what it said, or a HarnessHostError where it was not reached. */
   const post = (path: string, body: object, { signal, bindsNothing = false }: { readonly signal?: AbortSignal; readonly bindsNothing?: boolean } = {}) =>
     Effect.flatMap(Effect.all([token, Effect.sync(traceCarrier)]), ([bearer, trace]) =>
@@ -164,6 +167,9 @@ export function remoteHost({ url, token, panels, unbound, bound }: RemoteHostOpt
   /** `error`, if the host's status may fail with it, as its reservation may: the store's, or else as the host's not reaching it. */
   const asStatusError = (error: CrossingError | HarnessHostError) => (error._tag === "StoreError" || error._tag === "HarnessHostError" ? error : new HarnessHostError({ reason: error.message }));
 
+  /** `error`, if it is the host's not being reached, or else as that, saying what it was. */
+  const asHostError = (error: CrossingError | HarnessHostError): HarnessHostError => (error._tag === "HarnessHostError" ? error : new HarnessHostError({ reason: error.message }));
+
   /** `error`, if a steer may fail with it, or else as the host's not reaching it. */
   const asSteerError = (error: CrossingError | HarnessHostError) =>
     error._tag === "StoreError" || error._tag === "ReceivedFileError" || error._tag === "HarnessHostError" ? error : new HarnessHostError({ reason: error.message });
@@ -217,7 +223,22 @@ export function remoteHost({ url, token, panels, unbound, bound }: RemoteHostOpt
         Effect.map(({ sessionId }) => sessionId),
         Effect.mapError((error) => (error._tag === "HarnessHostError" || error._tag === "UnknownHarness" || error._tag === "NoWorkspaceMounted" || error._tag === "SessionFilesystemsDisabled" || error._tag === "FolderOnBranch" ? error : new HarnessHostError({ reason: error.message }))),
       ),
-    panels,
+    forkSession: ({ conversationId, harness, workingDirectory, sessionId, beforeUuid }) =>
+      call(HOST_PATHS.forkSession, { conversationId, harness, workingDirectory, sessionId, beforeUuid }, ForkSessionAnswer).pipe(
+        Effect.map((answer) => answer.sessionId),
+        Effect.mapError(asHostError),
+      ),
+    goals: (of) => ({
+      read: ({ threadId }) => call(HOST_PATHS.goalRead, { ...of, threadId }, GoalAnswer).pipe(Effect.map(({ goal }) => goal), Effect.mapError(asHostError)),
+      set: ({ threadId, objective, status }) =>
+        call(HOST_PATHS.goalSet, { ...of, threadId, ...(objective === undefined ? {} : { objective }), ...(status === undefined ? {} : { status }) }, GoalAnswer).pipe(
+          Effect.map(({ goal }) => goal),
+          Effect.mapError(asHostError),
+        ),
+      clear: ({ threadId }) => call(HOST_PATHS.goalClear, { ...of, threadId }, GoalClearAnswer).pipe(Effect.mapError(asHostError)),
+      waitForTurnId: (threadId, timeoutMs) =>
+        call(HOST_PATHS.goalTurn, { ...of, threadId, timeoutMs: timeoutMs ?? null }, GoalTurnAnswer).pipe(Effect.map(({ turnId }) => turnId), Effect.mapError(asHostError)),
+    }),
   });
 }
 

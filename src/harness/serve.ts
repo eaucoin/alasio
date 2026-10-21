@@ -41,8 +41,17 @@ import {
   DrainRequest,
   encodeTurnAnswer,
   failureOf,
+  ForkSessionAnswer,
+  ForkSessionRequest,
   FreshSessionAnswer,
   FreshSessionRequest,
+  GoalAnswer,
+  GoalClearAnswer,
+  GoalClearRequest,
+  GoalReadRequest,
+  GoalSetRequest,
+  GoalTurnAnswer,
+  GoalTurnRequest,
   HOST_PATHS,
   InterruptAnswer,
   InterruptRequest,
@@ -214,6 +223,36 @@ export const serveHost = Effect.fnUntraced(function*(
         return Effect.flatMap(body(FreshSessionRequest), ({ harness, workingDirectory }) =>
           host.startFreshSession({ conversationId, harness, workingDirectory }).pipe(
             Effect.map((sessionId) => answer(200, Schema.encodeSync(FreshSessionAnswer)({ sessionId }))),
+            Effect.mapError((error) => failed(422, error)),
+          ));
+      case HOST_PATHS.forkSession:
+        return Effect.flatMap(body(ForkSessionRequest), ({ harness, workingDirectory, sessionId, beforeUuid }) =>
+          host.forkSession({ conversationId, harness, workingDirectory, sessionId, beforeUuid }).pipe(
+            Effect.map((forked) => answer(200, Schema.encodeSync(ForkSessionAnswer)({ sessionId: forked }))),
+            Effect.mapError((error) => failed(422, error)),
+          ));
+      case HOST_PATHS.goalRead:
+        return Effect.flatMap(body(GoalReadRequest), ({ harness, workingDirectory, threadId }) =>
+          host.goals({ conversationId, harness, workingDirectory }).read({ threadId }).pipe(
+            Effect.map((goal) => answer(200, Schema.encodeSync(GoalAnswer)({ goal }))),
+            Effect.mapError((error) => failed(422, error)),
+          ));
+      case HOST_PATHS.goalSet:
+        return Effect.flatMap(body(GoalSetRequest), ({ harness, workingDirectory, threadId, objective, status }) =>
+          host.goals({ conversationId, harness, workingDirectory }).set({ threadId, objective, status }).pipe(
+            Effect.map((goal) => answer(200, Schema.encodeSync(GoalAnswer)({ goal }))),
+            Effect.mapError((error) => failed(422, error)),
+          ));
+      case HOST_PATHS.goalClear:
+        return Effect.flatMap(body(GoalClearRequest), ({ harness, workingDirectory, threadId }) =>
+          host.goals({ conversationId, harness, workingDirectory }).clear({ threadId }).pipe(
+            Effect.map((cleared) => answer(200, Schema.encodeSync(GoalClearAnswer)(cleared))),
+            Effect.mapError((error) => failed(422, error)),
+          ));
+      case HOST_PATHS.goalTurn:
+        return Effect.flatMap(body(GoalTurnRequest), ({ harness, workingDirectory, threadId, timeoutMs }) =>
+          host.goals({ conversationId, harness, workingDirectory }).waitForTurnId(threadId, timeoutMs ?? undefined).pipe(
+            Effect.map((turnId) => answer(200, Schema.encodeSync(GoalTurnAnswer)({ turnId }))),
             Effect.mapError((error) => failed(422, error)),
           ));
       default:

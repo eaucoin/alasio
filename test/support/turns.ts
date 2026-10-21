@@ -13,6 +13,7 @@ import { HarnessHost } from "../../src/harness/host.ts";
 import { HostEvents } from "../../src/harness/host-events.ts";
 import { type Harness, Harnesses } from "../../src/harness/index.ts";
 import type { HarnessName } from "../../src/harness/names.ts";
+import { Panels } from "../../src/harness/panels.ts";
 import { HostBayma } from "../../src/mcp/bayma.ts";
 import { Mounts } from "../../src/operator/mounts.ts";
 import { inlineKeyboard } from "../../src/operator/panel.ts";
@@ -144,6 +145,7 @@ function testServices({
   return MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot, branch }), Authorizer.layer(allowedUserIds))),
     Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer()),
+    Layer.provideMerge(Panels.ofHarnesses),
     Layer.provideMerge(host ? Layer.effect(HarnessHost, Effect.map(HarnessHost, host)).pipe(Layer.provide(HarnessHost.layer)) : HarnessHost.layer),
     Layer.provideMerge(Harnesses.layer({ overrides: harnesses, branch })),
     // Received files are written nowhere a test does not say; into a session through the test's session filesystems.

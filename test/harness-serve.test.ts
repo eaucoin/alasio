@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { request } from "node:http";
 import { test } from "node:test";
 
-import { Effect, Exit, Option, Scope } from "effect";
+import { Effect, Exit, Scope } from "effect";
 
 import { HarnessHost } from "../src/harness/host.ts";
 import type { TurnResult } from "../src/harness/index.ts";
@@ -30,7 +30,8 @@ function slowHost(turnMs: number, started: { count: number }): HarnessHost["Serv
     drain: () => Effect.succeed(true),
     renewCodexLogin: () => Effect.void,
     startFreshSession: () => Effect.succeed("thread-2"),
-    panels: () => Effect.succeed(Option.none()),
+    forkSession: () => Effect.succeed(null),
+    goals: () => ({ read: () => Effect.succeed(null), set: () => Effect.succeed(null), clear: () => Effect.succeed({ cleared: false }), waitForTurnId: () => Effect.succeed(null) }),
   });
 }
 

@@ -290,12 +290,13 @@ test("a call of a harness host elsewhere carries its span's trace context, and t
     drain: () => Effect.succeed(true),
     renewCodexLogin: () => Effect.void,
     startFreshSession: () => Effect.succeed("thread-2"),
-    panels: () => Effect.succeedNone,
+    forkSession: () => Effect.succeed(null),
+    goals: () => ({ read: () => Effect.succeed(null), set: () => Effect.succeed(null), clear: () => Effect.succeed({ cleared: false }), waitForTurnId: () => Effect.succeed(null) }),
   });
   const scope = Effect.runSync(Scope.make());
   try {
     const { port } = await Effect.runPromise(serveHost({ port: 0, host: "127.0.0.1", conversationId: "telegram:7", token: "host-token" }).pipe(Effect.provideService(HarnessHost, host), Scope.provide(scope), Effect.provide(TracingLayer)));
-    const reached = remoteHost({ url: `http://127.0.0.1:${port}`, token: Effect.succeed("host-token"), panels: () => Effect.succeedNone });
+    const reached = remoteHost({ url: `http://127.0.0.1:${port}`, token: Effect.succeed("host-token") });
     const start = { conversationId: "telegram:7", chatId: "7", messageId: "1", harness: CODEX_HARNESS as typeof CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch: 1, jobId: null, attachedTurn: null, bayma: null, codex: null };
     await Effect.runPromise(reached.startTurn(start).pipe(withAlasioSpan("test.pooled-turn"), Effect.provide(TracingLayer)));
     const turn = finishedSpan("test.pooled-turn");

@@ -65,7 +65,8 @@ function podHost(started: TurnStart[], { renewed = [], turnMs = 0 }: { readonly 
     drain: () => Effect.succeed(true),
     renewCodexLogin: (_conversationId, login) => Effect.sync(() => void renewed.push(login)),
     startFreshSession: () => Effect.succeed("thread-2"),
-    panels: () => Effect.succeedNone,
+    forkSession: () => Effect.succeed(null),
+    goals: () => ({ read: () => Effect.succeed(null), set: () => Effect.succeed(null), clear: () => Effect.succeed({ cleared: false }), waitForTurnId: () => Effect.succeed(null) }),
   });
 }
 

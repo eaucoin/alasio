@@ -1,8 +1,7 @@
-import type { v2 } from "../../.types/codex/index.js";
 import { Effect } from "effect";
 
 import { CodexAppServer } from "../codex/app-server/client.ts";
-import { resolveCodexModelChoice } from "../codex/model.ts";
+import { resolveCodexModelChoice, toModelOption } from "../codex/model.ts";
 import {
   type CodexScopeProvider,
   CodexScopeError,
@@ -17,24 +16,8 @@ import { SessionFilesystemsDisabled, type SessionSandboxes } from "../sandbox/in
 import { parseWorkspace } from "../workspace/kind.ts";
 import { withLogScope } from "../shared/log.ts";
 import { ActiveTurns } from "./active-turns.ts";
-import type { Harness, HarnessOptions, ModelOption } from "./index.ts";
+import type { Harness, HarnessOptions } from "./index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "./names.ts";
-
-/** The app-server's model entry, in the shape /model shows for either harness. */
-function toModelOption(model: v2.Model): ModelOption {
-  const efforts = (model.supportedReasoningEfforts ?? [])
-    .map((entry) => (typeof entry === "string" ? entry : entry?.reasoningEffort))
-    .filter(Boolean);
-  return {
-    id: model.id ?? model.model,
-    label: model.displayName ?? model.id ?? model.model,
-    description: model.description ?? "",
-    resolvedModel: model.model ?? model.id,
-    efforts,
-    defaultEffort: model.defaultReasoningEffort ?? null,
-    isDefault: Boolean(model.isDefault),
-  };
-}
 
 /** A session-filesystem workspace's volume, with the session sandboxes and the app-server that serve it. */
 interface ServedSessionFs {

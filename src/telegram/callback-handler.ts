@@ -3,8 +3,8 @@ import { Effect, Option } from "effect";
 
 import type { ConcurrentPromptPayload } from "../codex/turns.ts";
 import { discardHeld, queueHeld, shownBusy, steerWithHeld, swerveTo } from "../harness/commands.ts";
-import { HarnessHost } from "../harness/host.ts";
 import { harnessLabelOf, NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, isHarnessName } from "../harness/index.ts";
+import { Panels } from "../harness/panels.ts";
 import { FOLDER_RESTART, FOLDER_RETRY } from "../mcp/bayma.ts";
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
 import { handleGoalControlCallback, isGoalControlAction } from "../operator/goal-control.ts";
@@ -177,7 +177,7 @@ const handlePress = Effect.fnUntraced(function*(callbackQuery: CallbackQuery, ac
     return;
   }
   // Every remaining action is the mounted harness's, which the mount may have none of.
-  const harness = Option.getOrNull(yield* Effect.flatMap(HarnessHost, (host) => host.panels(mount)));
+  const harness = Option.getOrNull(yield* Effect.flatMap(Panels, (panels) => panels.forMount(conversationId, mount)));
   if (!harness) {
     const reason = mount.harness ? NO_WORKSPACE_MOUNTED : NO_SERVICE_MOUNTED;
     yield* client.answerCallbackQuery(callbackQuery.id, reason);

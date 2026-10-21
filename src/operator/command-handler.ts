@@ -7,7 +7,8 @@ import { Effect, Option } from "effect";
 import { type TurnError, Turns } from "../codex/turns.ts";
 import { HarnessHost } from "../harness/host.ts";
 import { shownBusy, stopTurnSaying } from "../harness/commands.ts";
-import { type HarnessError, harnessLabelOf, Harnesses, type HarnessUnavailable } from "../harness/index.ts";
+import { type HarnessError, harnessLabelOf, type HarnessUnavailable } from "../harness/index.ts";
+import { Panels } from "../harness/panels.ts";
 import { Store } from "../persistence/store.ts";
 import type { ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
 import { type ChatId, TelegramClient, type TelegramError } from "../telegram/client.ts";
@@ -22,7 +23,7 @@ import { truncateText } from "./text.ts";
 import { handleWorkspaceTextCommand, sendChooseWorkspacePanel } from "./workspace-control.ts";
 
 /** What the operator's commands and controls run on. */
-export type OperatorServices = Store | TelegramClient | HarnessHost | Harnesses | Turns | Mounts | ReceivedFiles;
+export type OperatorServices = Store | TelegramClient | HarnessHost | Panels | Turns | Mounts | ReceivedFiles;
 
 /** How a command fails: the operator is told why. Turns' errors include alasio's store's. */
 export type CommandError = TelegramError | HarnessError | HarnessUnavailable | NewSessionError | TurnError | ReceivedFileError;
@@ -84,7 +85,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     yield* handleWorkspaceTextCommand({ ...conversation, args: cmd.args });
     return true;
   }
-  const harness = Option.getOrNull(yield* Effect.flatMap(HarnessHost, (host) => host.panels(mount)));
+  const harness = Option.getOrNull(yield* Effect.flatMap(Panels, (panels) => panels.forMount(conversationId, mount)));
   if (cmd.type === "model") {
     yield* sendModelPanel({ harness, ...conversation });
     return true;

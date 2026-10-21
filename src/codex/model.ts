@@ -1,4 +1,5 @@
 import type { v2 } from "../../.types/codex/index.js";
+import type { ModelOption } from "../harness/index.ts";
 import type { ModelChoice } from "../persistence/conversation-repository.ts";
 
 export const ALASIO_CODEX_MODEL = "gpt-5.6-sol";
@@ -54,5 +55,21 @@ export function choiceForLogin(wanted: ModelChoice, offered: readonly v2.Model[]
   return {
     choice: { model: fallback.model, effort },
     notice: `This Codex login doesn't offer ${wanted.model}, so Codex used ${fallback.model}, the login's default (at ${effort} effort). Use /model to choose another.`,
+  };
+}
+
+/** The app-server's model entry, in the shape /model shows for either harness. */
+export function toModelOption(model: v2.Model): ModelOption {
+  const efforts = (model.supportedReasoningEfforts ?? [])
+    .map((entry) => (typeof entry === "string" ? entry : entry?.reasoningEffort))
+    .filter(Boolean);
+  return {
+    id: model.id ?? model.model,
+    label: model.displayName ?? model.id ?? model.model,
+    description: model.description ?? "",
+    resolvedModel: model.model ?? model.id,
+    efforts,
+    defaultEffort: model.defaultReasoningEffort ?? null,
+    isDefault: Boolean(model.isDefault),
   };
 }

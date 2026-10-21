@@ -31,7 +31,8 @@
  * keeps it fresh before the turn and as it renews its token (../codex/login-refresh.ts), by its
  * own app-server. alasio's own pod is held busy for as long as it drives a turn (../kube/busy.ts),
  * as where the turn runs in its process, since it is alasio that takes the turn's answer to its
- * chat. The operator's panels are alasio's own harnesses', as the hosts do not serve them yet.
+ * chat. The operator's panels are alasio's (./panels.ts): a fork of a session, and a thread's
+ * goals, of the conversation's pod, bound ahead for them (forkSession, goals).
  */
 import { join } from "node:path";
 
@@ -50,8 +51,8 @@ import { Store } from "../persistence/store.ts";
 import { BIND_WAIT_MS, TOKEN_TTL_MS } from "../sandbox/gateway-client.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
-import { HarnessHost, type TurnBayma, type TurnCodex, type TurnStart } from "./host.ts";
-import { Harnesses, HarnessHostError } from "./index.ts";
+import { type ConversationHarness, HarnessHost, type TurnBayma, type TurnCodex, type TurnStart } from "./host.ts";
+import { HarnessHostError } from "./index.ts";
 import { grantDigest, grantKey, harnessGrant } from "./grant.ts";
 import { CODEX_HARNESS, type HarnessName } from "./names.ts";
 import { remoteHost } from "./remote-host.ts";
@@ -93,12 +94,11 @@ export interface PooledHostOptions {
 }
 
 /** The host of each conversation, bound in its harness's pool, as the module says. */
-export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, written = () => {} }: PooledHostOptions): Layer.Layer<HarnessHost, never, Store | Harnesses | CodexAppServer> =>
+export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, written = () => {} }: PooledHostOptions): Layer.Layer<HarnessHost, never, Store | CodexAppServer> =>
   Layer.effect(
     HarnessHost,
     Effect.gen(function*() {
       const store = yield* Store;
-      const harnesses = yield* Harnesses;
       const appServer = yield* CodexAppServer;
       const sandboxes = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
       const hostBayma = Option.getOrNull(yield* Effect.serviceOption(HostBayma));
@@ -118,7 +118,7 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
       const unbound = (conversationId: string) =>
         Effect.map(store.isConversationHeld(conversationId), (held) => ({ busy: held, running: false, cliInitiated: false, held, idleSince: 0 }));
       /** The conversation's host, its calls bearing `token`, and, where the caller bound one, for that binding alone, giving its grant. */
-      const hostBy = (token: Effect.Effect<string, HarnessHostError>, bound?: { readonly binding: string; readonly grant: string }) => remoteHost({ url, token, panels: harnesses.forMount, unbound, bound });
+      const hostBy = (token: Effect.Effect<string, HarnessHostError>, bound?: { readonly binding: string; readonly grant: string }) => remoteHost({ url, token, unbound, bound });
       const grantsKey = grantKey(callerKey);
       /** The grant of the binding `held` of the conversation's harness, kept as the conversation's, as the module says. */
       const grantOf = (conversationId: string, held: HeldTo): string => harnessGrant(grantsKey, conversationId, held.binding);
@@ -210,6 +210,18 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
         );
       };
 
+      /**
+       * `call` of the conversation's host as `of` places it, its harness bound ahead first and the
+       * call for that binding alone, giving its grant (onBinding): what it answered.
+       */
+      const onBound = <A, E>(of: ConversationHarness, call: (host: HarnessHost["Service"]) => Effect.Effect<A, E | HarnessHostError>): Effect.Effect<A, E | HarnessHostError> =>
+        Effect.gen(function*() {
+          const token = tokenOf(of.conversationId, of.harness, of.workingDirectory);
+          const held = yield* boundAhead(of.conversationId, token, () => Effect.void);
+          const [answered] = yield* onBinding(of.conversationId, held, (_held, bound) => call(hostBy(token, bound)));
+          return answered;
+        });
+
       /** The bayma of the turn `start`'s workspace, brought up for it, its bearer held to the binding `held` of the conversation's harness, as the module says. */
       const baymaOf = (start: TurnStart, held: HeldTo): Effect.Effect<TurnBayma> =>
         Effect.gen(function*() {
@@ -299,14 +311,15 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
             Effect.catchTag("StoreError", (error) => Effect.fail(new HarnessHostError({ reason: error.message }))),
           ),
         // Bound ahead first, as a reservation is, so the pod is given its grant, as what its harness makes of a fresh session it may keep at once.
-        startFreshSession: (params) =>
-          Effect.gen(function*() {
-            const token = tokenOf(params.conversationId, params.harness, params.workingDirectory);
-            const held = yield* boundAhead(params.conversationId, token, () => Effect.void);
-            const [sessionId] = yield* onBinding(params.conversationId, held, (_held, bound) => hostBy(token, bound).startFreshSession(params));
-            return sessionId;
-          }),
-        panels: harnesses.forMount,
+        startFreshSession: (params) => onBound(params, (host) => host.startFreshSession(params)),
+        // Of the conversation's pod, bound for it, as only its harness holds its sessions' app-server state.
+        forkSession: (params) => onBound(params, (host) => host.forkSession(params)),
+        goals: (of) => ({
+          read: (params) => onBound(of, (host) => host.goals(of).read(params)),
+          set: (params) => onBound(of, (host) => host.goals(of).set(params)),
+          clear: (params) => onBound(of, (host) => host.goals(of).clear(params)),
+          waitForTurnId: (threadId, timeoutMs) => onBound(of, (host) => host.goals(of).waitForTurnId(threadId, timeoutMs)),
+        }),
       });
     }),
   );

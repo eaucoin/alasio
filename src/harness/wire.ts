@@ -32,6 +32,11 @@ export const HOST_PATHS = {
   drain: "/drain",
   freshSession: "/fresh-session",
   codexLogin: "/codex-login",
+  forkSession: "/fork-session",
+  goalRead: "/goal/read",
+  goalSet: "/goal/set",
+  goalClear: "/goal/clear",
+  goalTurn: "/goal/turn",
 } as const;
 
 /** What names the conversation a call is about, which a host serving another refuses. */
@@ -129,6 +134,31 @@ export const BackgroundWorkAnswer = Schema.Struct({ working: Schema.Boolean });
 
 export const FreshSessionRequest = Schema.Struct({ conversationId: Schema.String, harness: Harness, workingDirectory: Schema.String });
 export const FreshSessionAnswer = Schema.Struct({ sessionId: Schema.String });
+
+/** A session of the conversation's harness forked before one of its messages (HarnessHost.forkSession): the new session's id, or none where it could not be. */
+export const ForkSessionRequest = Schema.Struct({ conversationId: Schema.String, harness: Harness, workingDirectory: Schema.String, sessionId: Schema.String, beforeUuid: Schema.String });
+export const ForkSessionAnswer = Schema.Struct({ sessionId: Schema.NullOr(Schema.String) });
+
+/** Of the conversation's harness's goals (HarnessHost.goals): which thread's, of the harness in the workspace the conversation mounts. */
+const GoalOf = { conversationId: Schema.String, harness: Harness, workingDirectory: Schema.String, threadId: Schema.String };
+/** A thread's goal, as Codex says it. */
+const Goal = Schema.Struct({
+  threadId: Schema.String,
+  objective: Schema.String,
+  status: Schema.Literals(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]),
+  tokenBudget: Schema.NullOr(Schema.Number),
+  tokensUsed: Schema.Number,
+  timeUsedSeconds: Schema.Number,
+  createdAt: Schema.Number,
+  updatedAt: Schema.Number,
+});
+export const GoalReadRequest = Schema.Struct(GoalOf);
+export const GoalSetRequest = Schema.Struct({ ...GoalOf, objective: Schema.optionalKey(Schema.NullOr(Schema.String)), status: Schema.optionalKey(Schema.NullOr(Goal.fields.status)) });
+export const GoalClearRequest = Schema.Struct(GoalOf);
+export const GoalTurnRequest = Schema.Struct({ ...GoalOf, timeoutMs: Schema.NullOr(Schema.Number) });
+export const GoalAnswer = Schema.Struct({ goal: Schema.NullOr(Goal) });
+export const GoalClearAnswer = Schema.Struct({ cleared: Schema.Boolean });
+export const GoalTurnAnswer = Schema.Struct({ turnId: Schema.NullOr(Schema.String) });
 
 /** A fresh token of alasio's relay of its Codex login, as a turn alasio drives runs (HarnessHost.renewCodexLogin). */
 export const CodexLoginRequest = Schema.Struct({ conversationId: Schema.String, login: Schema.Struct({ url: Schema.String, token: Schema.String }) });

@@ -33,9 +33,8 @@ const alasio = Effect.gen(function*() {
   // Session filesystems (an empty, isolated workspace per session) are on when the
   // deployment gives alasio a sandbox gateway. Their Codex runs from a home of its own,
   // mirrored the same way into a schema of its own.
-  const sessionFsCodexRollouts = config.sessionsGateway
-    ? yield* SessionFsCodexRollouts.make({ store: yield* neon.sessionFsRollouts, home: sessionFsCodexHome(config.stateDir) })
-    : null;
+  const sessionFsRollouts = config.sessionsGateway ? yield* neon.sessionFsRollouts : null;
+  const sessionFsCodexRollouts = sessionFsRollouts ? yield* SessionFsCodexRollouts.make({ store: sessionFsRollouts, home: sessionFsCodexHome(config.stateDir) }) : null;
   // A branch asks main to fork the sessions it inherited, on main's forks topic, and hears
   // its answers among its own events; main reads its forks topic and answers on theirs.
   yield* serveAlasio({
@@ -52,6 +51,7 @@ const alasio = Effect.gen(function*() {
     pool: neon.pool,
     harnessRole: HARNESS_ROLE,
     lakeWritten: neon.written,
+    rolloutStores: { codex: neon.rollouts, sessionFs: sessionFsRollouts },
     sessionStore: neon.sessionStore,
     codexRollouts,
     sessionFsCodexRollouts,

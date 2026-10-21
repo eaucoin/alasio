@@ -70,7 +70,7 @@ export interface TelegramAppConfig
 }
 
 /** What the app runs on. */
-export type TelegramAppServices = Authorizer | MediaGroups | Outbox | TelegramUpdates | OperatorServices;
+export type TelegramAppServices = Authorizer | MediaGroups | Outbox | TelegramUpdates | OperatorServices | Harnesses;
 
 /** How the app fails to start. */
 export type TelegramAppError = TelegramError | CommandError | TranscriptAdoptionError | RolloutRestoreError | StoreError;

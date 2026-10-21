@@ -233,7 +233,7 @@ export const makeHarnesses = Effect.fnUntraced(function*(
     if (!address) return null;
     const token = bindingToken(bindingKey, { key: lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "", binding: lease.metadata?.uid ?? "", namespace: lease.metadata?.namespace ?? "" });
     // The operator's panels are alasio's to reach, never the gateway's.
-    return remoteHost({ url: `http://${address}:${config.podPort}`, token: Effect.succeed(token), panels: () => Effect.succeedNone });
+    return remoteHost({ url: `http://${address}:${config.podPort}`, token: Effect.succeed(token) });
   };
 
   /** Tells `pool`'s environment's alasio of what `of` says; where its environment is gone, no one. */

@@ -12,6 +12,7 @@ import { ForkAsks, forkAnswered, ForkRequests, parentForks, serveBranchForks } f
 import { CodexAppServer } from "./codex/app-server/client.ts";
 import { codexHome } from "./codex/env.ts";
 import { type CodexLoginError, keepCodexLogin } from "./codex/login.ts";
+import type { NeonRolloutStore } from "./codex/rollouts/store.ts";
 import { SessionFsCodex, sessionFsCodexHome } from "./codex/sessionfs.ts";
 import { Turns } from "./codex/turns.ts";
 import type { AlasioConfig, BranchEnvironment } from "./config.ts";
@@ -21,6 +22,7 @@ import { ActiveTurns } from "./harness/active-turns.ts";
 import type { ClaudeQueryFactory } from "./harness/claude/runtime.ts";
 import { HarnessHost } from "./harness/host.ts";
 import { HarnessEvents, HostEvents } from "./harness/host-events.ts";
+import { Panels } from "./harness/panels.ts";
 import { pooledHarnessHost } from "./harness/pooled-host.ts";
 import { CODEX_LOGIN_PORT, poolLoginKey, poolLoginRefusal, startLoginRelay } from "./codex/login-relay.ts";
 import { Harnesses } from "./harness/index.ts";
@@ -62,6 +64,8 @@ export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog" | "log" 
   readonly pool: Pool;
   /** The schema alasio's state is kept in: `state`, unless a test gives one of its own. */
   readonly stateSchema?: string | undefined;
+  /** The stores of Codex's rollouts, the operator's home's and the session filesystems', which the panels read; none in a test without Neon. */
+  readonly rolloutStores?: { readonly codex: NeonRolloutStore; readonly sessionFs: NeonRolloutStore | null } | undefined;
   /** Tells the lake's loader of what a harness pool's pod committed, which tells it nothing itself (../neon/connect.ts ConnectedNeon.written); none where nothing loads it. */
   readonly lakeWritten?: (() => void) | undefined;
   /** The harness host's role, which Neon has (../neon/harness.ts), granted its part of the state; none in a test without one. */
@@ -82,6 +86,7 @@ export type AlasioServices =
   | HarnessHost
   | HarnessEvents
   | Harnesses
+  | Panels
   | Turns
   | Mounts
   | Authorizer
@@ -103,6 +108,7 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       branchEvents(options),
     )),
     Layer.provideMerge(Turns.layer()),
+    Layer.provideMerge(panels(options)),
     Layer.provideMerge(harnessHost(options)),
     Layer.provideMerge(Harnesses.layer({
       branch: options.branch?.name,
@@ -172,6 +178,18 @@ function harnessHost({ harnessPools, sessionsGateway, lakeWritten }: AlasioOptio
     );
   }
   return HarnessHost.layer.pipe(Layer.provideMerge(HostEvents.inProcess));
+}
+
+/**
+ * What the operator's panels reach of each conversation's harness: where its harnesses run in
+ * pools, what Neon keeps of their sessions, and of their goals and forks what the conversation's
+ * pod does; otherwise the harnesses in alasio's process.
+ */
+function panels({ harnessPools, sessionsGateway, rolloutStores, sessionStore, stateDir, branch }: AlasioOptions): Layer.Layer<Panels, never, Harnesses | HarnessHost | CodexAppServer> {
+  if (harnessPools && sessionsGateway && rolloutStores && sessionStore) {
+    return Panels.layer({ sessionStore, codexRollouts: rolloutStores.codex, sessionFsCodexRollouts: rolloutStores.sessionFs, stateDir, branch: branch?.name });
+  }
+  return Panels.ofHarnesses;
 }
 
 /**
