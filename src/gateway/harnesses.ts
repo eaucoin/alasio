@@ -36,14 +36,14 @@
  * namespace, and is passed over, said so, until it is made again.
  */
 import type { V1Pod } from "@kubernetes/client-node";
-import { Clock, Effect, Option, Schema } from "effect";
+import { Cause, Clock, Effect, Exit, Option, Schema } from "effect";
 
 import { type Binder, BindStepFailed } from "../binder/binder.ts";
 import { type BindingLease, heldLeases } from "../binder/bindings.ts";
 import { BINDING_LABEL, KEY_ANNOTATION, type Pool, POOL_LABEL } from "../binder/names.ts";
-import { type Placement, PlacementRefused } from "../binder/server.ts";
+import { type Answer, type Placement, PlacementRefused } from "../binder/server.ts";
 import { IDLE_POLL_MS, type Idleness, lingered, makeSweep, notIdle } from "../binder/sweep.ts";
-import { bindingToken } from "../binder/tokens.ts";
+import { bindingToken, type HeldTo } from "../binder/tokens.ts";
 import { branchNamespace } from "../branch/names.ts";
 import type { EventInput, Events } from "../events/events.ts";
 import type { HarnessHost, HarnessStatus } from "../harness/host.ts";
@@ -106,7 +106,39 @@ export interface Harnesses {
   readonly live: Effect.Effect<void, KubeApiError>;
   /** Tells of the binding `lease` of `pool`, let go as its pod went while it was bound, as lost. */
   readonly lost: (pool: Pool, lease: BindingLease) => Effect.Effect<void>;
+  /** What the bound host of the binding `bound` tells, `body`, told its environment's alasio, as relayed says: how it is answered. */
+  readonly relay: (bound: HeldTo, body: Uint8Array) => Effect.Effect<Answer>;
 }
+
+/** The kinds of event a bound host tells of its harness (../harness/host-events.ts). */
+const HOST_KINDS = ["harness.idle", "harness.background-response"] as const;
+
+/** What a bound host tells: an event's kind and its conversation, and nothing else, which the gateway makes the rest of. */
+const Told = Schema.Struct({ kind: Schema.Literals(HOST_KINDS), subject: Schema.Struct({ kind: Schema.Literal("conversation"), key: Schema.String }) });
+const decodeTold = Schema.decodeUnknownExit(Schema.fromJsonString(Told), { onExcessProperty: "error" });
+
+/**
+ * How what the bound host of `conversation`'s harness tells, `body`, is answered: refused (400)
+ * where it is no telling, or says more than an event's kind and its conversation, and (403) of a
+ * kind no host tells, or of another conversation than its own; told otherwise, by `tell`, as of
+ * the host (source "harness"), with its record's id and time the gateway's (202).
+ */
+export const relayed = (conversation: string, body: Uint8Array, tell: (event: (typeof Told)["Type"]) => Effect.Effect<void>): Effect.Effect<Answer> =>
+  Effect.gen(function*() {
+    const text = Buffer.from(body).toString("utf8");
+    let kind: unknown;
+    try {
+      kind = (JSON.parse(text) as { readonly kind?: unknown } | null)?.kind;
+    } catch {
+      return { status: 400, json: { error: "a telling is an event's JSON" } };
+    }
+    if (typeof kind !== "string" || !(HOST_KINDS as readonly string[]).includes(kind)) return { status: 403, json: { error: `a harness host tells of ${HOST_KINDS.join(" and ")} alone, not ${String(kind)}` } };
+    const told = decodeTold(text);
+    if (Exit.isFailure(told)) return { status: 400, json: { error: `a telling is an event's kind and its conversation alone: ${Cause.pretty(told.cause)}` } };
+    if (told.value.subject.key !== conversation) return { status: 403, json: { error: `the host of ${conversation} tells of its own conversation alone, not ${told.value.subject.key}` } };
+    yield* tell(told.value);
+    return { status: 202 };
+  });
 
 /** What a host's harness has going on, as the sweep asks it: its status, and whether it works on its own between turns. */
 export interface HostIdleFacts {
@@ -390,5 +422,14 @@ export const makeHarnesses = Effect.fnUntraced(function*(
   const lost = (pool: Pool, lease: BindingLease): Effect.Effect<void> =>
     lostFor(pool, lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "", lease.metadata?.uid ?? "", lease.spec?.holderIdentity ?? "", "its pod went while it was bound");
 
-  return { place, pools, namespaces, ownsNamespace, sweep, live, lost };
+  // Of the binding's own conversation, told its environment's alasio; a binding of a namespace no environment's harnesses are in tells no one.
+  const relay = (bound: HeldTo, body: Uint8Array): Effect.Effect<Answer> =>
+    Effect.gen(function*() {
+      const conversation = conversationOfHarnessKey(bound.key);
+      const environment = yield* environmentOf(bound.namespace);
+      if (!conversation || environment === null) return { status: 403, json: { error: `${bound.key} is no harness's of an environment here` } };
+      return yield* relayed(conversation, body, ({ kind, subject }) => events.tell({ kind, environment, source: "harness", subject }));
+    });
+
+  return { place, pools, namespaces, ownsNamespace, sweep, live, lost, relay };
 });

@@ -71,8 +71,6 @@ export const telegramTopic = (name: string): string => `telegram.${name}`;
 export const alasioPrincipal = (name: string): string => `alasio-${name}`;
 /** The consumer group the environment `name`'s alasio reads its Telegram topic in. */
 export const alasioGroup = (name: string): string => `alasio.${name}`;
-/** The principal the environment `name`'s harness pools' hosts tell its events, and wake its lake loader, as (./harness-pools.ts). */
-export const harnessPrincipal = (name: string): string => `harness-${name}`;
 
 /** How long an environment's wake records are kept: a day, long past its lake loader's waking at the first. */
 export const WAKE_RETENTION_MS = 86_400_000;
@@ -92,17 +90,17 @@ export const loaderGroup = (name: string): string => `lake-loader.${name}`;
  * forgotten with the environment. Its alasio's, `alasio-<name>`, reading its Telegram
  * topic in its group, `alasio.<name>`, and writing its wake topic, `lake.<name>`, as it
  * commits transcripts; its lake loader's, `loader-<name>`, reading the wake topic in its
- * group, `lake-loader.<name>`; its harness pools' hosts', `harness-<name>`, writing its events
- * topic, `events.<name>` (src/events/), and its wake topic, as they commit transcripts and
- * rollouts, as alasio does, and nothing else; the events topic, which the sandbox gateway writes too
- * and its alasio reads in its group, `alasio-events.<name>`. Branches ask main to fork the
- * sessions they inherited on main's forks topic, `forks.main` (src/branch/fork.ts), which a
- * branch's alasio writes and main's reads in its group, `alasio-forks.main`, answering on the
- * branches' events topics, which it may write. Those topics are of one partition each, as one
- * alasio and one loader read them, a chat's updates in order, each keeping a segment beside the
- * one it writes at most: a week of a bot's updates, or of events, and a day of wakes or of
- * requests, is kilobytes. Each update, event and request is flushed to the volume as it is
- * written, as what told of it does not tell again; a wake, lost, costs nothing.
+ * group, `lake-loader.<name>`; the events topic, `events.<name>` (src/events/), which the sandbox
+ * gateway writes, of what it binds and of what its harness pools' hosts tell it, which hold no
+ * principal of their own, and its alasio reads in its group, `alasio-events.<name>`. Branches ask
+ * main to fork the sessions they inherited on main's forks topic, `forks.main`
+ * (src/branch/fork.ts), which a branch's alasio writes and main's reads in its group,
+ * `alasio-forks.main`, answering on the branches' events topics, which it may write. Those topics
+ * are of one partition each, as one alasio and one loader read them, a chat's updates in order,
+ * each keeping a segment beside the one it writes at most: a week of a bot's updates, or of
+ * events, and a day of wakes or of requests, is kilobytes. Each update, event and request is
+ * flushed to the volume as it is written, as what told of it does not tell again; a wake, lost,
+ * costs nothing.
  */
 export function environmentAccess(name: string): EnvironmentLogAccess {
   const topic = telegramTopic(name);
@@ -134,10 +132,6 @@ export function environmentAccess(name: string): EnvironmentLogAccess {
         name: loaderPrincipal(name),
         acls: [{ resource: "topic", name: wake, pattern: "literal", operations: ["read", "describe"] }, { resource: "group", name: loaderGroup(name), pattern: "literal", operations: ["read"] }],
       },
-      {
-        name: harnessPrincipal(name),
-        acls: [{ resource: "topic", name: events, pattern: "literal", operations: ["write", "describe"] }, { resource: "topic", name: wake, pattern: "literal", operations: ["write", "describe"] }],
-      },
     ],
     topics: [
       // Each update flushed to the volume as it is written: Telegram, answered once the log has it, sends it no more.
@@ -165,8 +159,6 @@ export const environmentLogSecret = ({ branch }: Environment): string => (branch
 /** The Secret of the principal the lake loader of `environment` reads its wake topic as, in its namespace: main's, which the stack's setup writes; a branch environment's, which alasio's command line writes. */
 export const loaderLogSecret = ({ branch }: Environment): string => (branch === null ? logPrincipalSecret("loader-main") : componentName("log-loader"));
 
-/** The Secret of the principal the harness pools' hosts of `environment` tell its events as, in its namespace: main's, which the stack's setup writes; a branch environment's, which alasio's command line writes. */
-export const harnessLogSecret = ({ branch }: Environment): string => (branch === null ? logPrincipalSecret("harness-main") : componentName("log-harness"));
 
 /** A node's address, by its ordinal: its pod's name in the log's headless Service. */
 const nodeAddress = (ordinal: number | string): string => `${LOG}-${ordinal}.${LOG}.${NAMESPACE}.svc`;

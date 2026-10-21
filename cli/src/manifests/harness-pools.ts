@@ -10,10 +10,10 @@
  *   (src/node-agent/names.ts ATTACH_ROOT, by `subPathExpr` of its namespace and its name) at
  *   /attach, where its node's agent writes its binding once the gateway binds it; it serves
  *   once it is there, and is ready only then. Its database is its environment's Neon, as the
- *   harness host's role, which may write a turn's part of the state alone; what its harness
- *   does on its own it tells on its environment's events topic, and each transcript and rollout
- *   it commits it tells its lake's loader of on its wake topic, as alasio does, as its
- *   environment's harness principal, which may write those two alone (./log.ts environmentAccess).
+ *   harness host's role, its rows its conversation's alone, as its grant says
+ *   (src/harness/grant.ts); what its harness does on its own it tells the sandbox gateway, with
+ *   its binding's token, which tells it on its environment's events topic, as the pod reaches
+ *   no log; and alasio tells its lake's loader of what it commits.
  * - A pool of each harness of main's folder conversations, where the host profile is on,
  *   beside main's alasio: the same, run as the operator, in their home, with the machine's
  *   mounts, as alasio's own pod is under the host profile; not in the folder namespace, whose
@@ -44,7 +44,6 @@ import { posix } from "node:path";
 import type { KubernetesObject, V1Deployment, V1EnvVar, V1PodTemplateSpec, V1Role, V1RoleBinding, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
 
 import { freeLabels, type Pool } from "../../../src/binder/names.ts";
-import { EVENTS_BROKERS_VARIABLE, EVENTS_PASSWORD_FILE_VARIABLE, EVENTS_USERNAME_VARIABLE } from "../../../src/events/names.ts";
 import { ALASIO_GATEWAY_URL_VARIABLE, type GatewayConfig, HARNESS_CONTAINER } from "../../../src/gateway/names.ts";
 import { HARNESS_NAMES, type HarnessName } from "../../../src/harness/names.ts";
 import { ATTACH_ROOT, BINDING_FILE } from "../../../src/node-agent/names.ts";
@@ -59,7 +58,6 @@ import {
   hostVolumes,
   imagePullSecrets,
   labels,
-  lakeRuns,
   NAMESPACE,
   otelEnv,
   restrictedContainer,
@@ -68,7 +66,6 @@ import {
 import { durationSeconds, type InstallConfig } from "./config.ts";
 import { boundBudget } from "./disruption.ts";
 import { foldersRun } from "./folders.ts";
-import { environmentName, harnessLogSecret, lakeWakeTopic, LOG_BROKERS } from "./log.ts";
 import { priority } from "./priorities.ts";
 import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT, GATEWAY_USER, sandboxServiceRuns } from "./sandbox-gateway.ts";
 import { harnessPodPolicy, harnessPoolPodPolicy } from "./admission.ts";
@@ -125,19 +122,6 @@ function harnessTemplate(config: InstallConfig, environment: Environment, pool: 
     ...(environment.branch ? [{ name: "ALASIO_BRANCH", value: environment.branch }] : []),
     // Its turns' workspaces' bayma, and its session's files, through the gateway, by what each turn gives.
     { name: ALASIO_GATEWAY_URL_VARIABLE, value: `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}` },
-    // Its environment's events topic, which it writes as its environment's harness principal.
-    { name: EVENTS_BROKERS_VARIABLE, value: LOG_BROKERS },
-    { name: EVENTS_USERNAME_VARIABLE, valueFrom: { secretKeyRef: { name: harnessLogSecret(environment), key: "username" } } },
-    { name: EVENTS_PASSWORD_FILE_VARIABLE, value: "/run/alasio/log/password" },
-    // Its environment's wake topic, which it tells the lake's loader of each transcript and rollout it commits on, as alasio does, as the same principal.
-    ...(lakeRuns(config)
-      ? [
-        { name: "ALASIO_LOG_BROKERS", value: LOG_BROKERS },
-        { name: "ALASIO_LOG_USERNAME", valueFrom: { secretKeyRef: { name: harnessLogSecret(environment), key: "username" } } },
-        { name: "ALASIO_LOG_PASSWORD_FILE", value: "/run/alasio/log/password" },
-        { name: "ALASIO_LAKE_WAKE_TOPIC", value: lakeWakeTopic(environmentName(environment)) },
-      ]
-      : []),
     ...(alasio.claude.existingSecret ? [{ name: "CLAUDE_CODE_OAUTH_TOKEN", valueFrom: { secretKeyRef: { name: alasio.claude.existingSecret, key: alasio.claude.key } } }] : []),
     ...otelEnv(config, environment),
   ];
@@ -149,7 +133,6 @@ function harnessTemplate(config: InstallConfig, environment: Environment, pool: 
     // The operator's own Codex home, their login in it, hidden where the machine's mounts would show it.
     ...(folder ? [...hostVolumeMounts(config), { name: "codex-hidden", mountPath: posix.join(home, ".codex"), readOnly: true }] : [{ name: "home", mountPath: home }]),
     { name: "database", mountPath: "/run/alasio/database", readOnly: true },
-    { name: "log", mountPath: "/run/alasio/log", readOnly: true },
   ];
   const volumes: V1Volume[] = [
     { name: "attach", hostPath: { path: ATTACH_ROOT, type: "DirectoryOrCreate" } },
@@ -157,7 +140,6 @@ function harnessTemplate(config: InstallConfig, environment: Environment, pool: 
     { name: "codex", emptyDir: {} },
     ...(folder ? [...hostVolumes(config), { name: "codex-hidden", emptyDir: {} }] : [{ name: "home", emptyDir: {} }]),
     { name: "database", secret: { secretName: componentName("harness-database"), items: [{ key: "url", path: "url" }] } },
-    { name: "log", secret: { secretName: harnessLogSecret(environment), items: [{ key: "password", path: "password" }] } },
   ];
   return {
     metadata: { labels: { ...labels(HARNESS_COMPONENT), ...freeLabels(pool) } },

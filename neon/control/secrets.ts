@@ -43,7 +43,7 @@ export type S3Identity = "neon" | "admin" | "backups" | "lake" | "lakeReader" | 
  * writes its wake topic, and its lake loader's, which reads that. A branch environment's
  * are its own, which alasio's command line makes with it.
  */
-export const MAIN_ENVIRONMENT_PRINCIPALS = ["alasio-main", "loader-main", "harness-main"] as const;
+export const MAIN_ENVIRONMENT_PRINCIPALS = ["alasio-main", "loader-main"] as const;
 export type MainEnvironmentPrincipal = (typeof MAIN_ENVIRONMENT_PRINCIPALS)[number];
 
 /**

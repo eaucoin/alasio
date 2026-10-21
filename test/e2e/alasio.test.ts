@@ -443,8 +443,8 @@ if (inShard("upgrade")) {
           const after = await stackSecrets();
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
-          // And what this release adds to the stack's: main's harness pools' principal on the log.
-          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), ["log.harness-main"]);
+          // And this release adds nothing to the stack's.
+          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), []);
         },
       },
       {

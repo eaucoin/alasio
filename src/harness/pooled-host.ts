@@ -87,10 +87,12 @@ export interface PooledHostOptions {
   readonly environment: string;
   readonly callerKey: Buffer;
   readonly codexLogin: { readonly url: string; readonly home: string; readonly renewMs?: number };
+  /** Tells the lake's loader of what a pod committed, as each turn of its ends, the pod telling it nothing itself; nothing where none is given. */
+  readonly written?: (() => void) | undefined;
 }
 
 /** The host of each conversation, bound in its harness's pool, as the module says. */
-export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin }: PooledHostOptions): Layer.Layer<HarnessHost, never, Store | Harnesses | CodexAppServer> =>
+export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, written = () => {} }: PooledHostOptions): Layer.Layer<HarnessHost, never, Store | Harnesses | CodexAppServer> =>
   Layer.effect(
     HarnessHost,
     Effect.gen(function*() {
@@ -247,7 +249,8 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin }: P
             const codex = yield* codexOf(start);
             const host = hostBy(tokenOf(start.conversationId, start.harness, start.workingDirectory), grantOf(start.conversationId, held));
             if (codex) yield* Effect.forkScoped(renewing(host, start));
-            return yield* host.startTurn({ ...start, bayma, codex });
+            // What the turn committed, the lake's to load once it ends, however it ends.
+            return yield* host.startTurn({ ...start, bayma, codex }).pipe(Effect.ensuring(Effect.sync(written)));
           }).pipe(Effect.scoped),
         steer: (conversationId, prompt, fileIds) => onHost(conversationId, (host) => host.steer(conversationId, prompt, fileIds), Effect.succeedNone),
         interrupt: (conversationId, reason) =>

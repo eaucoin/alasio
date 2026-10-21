@@ -51,6 +51,7 @@ const alasio = Effect.gen(function*() {
       : undefined,
     pool: neon.pool,
     harnessRole: HARNESS_ROLE,
+    lakeWritten: neon.written,
     sessionStore: neon.sessionStore,
     codexRollouts,
     sessionFsCodexRollouts,

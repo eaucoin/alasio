@@ -67,6 +67,35 @@ test("a binding is confirmed while its Lease names its pod, under its own key al
   }
 });
 
+test("a binding not seen is not known while the watch has heard nothing since the time asked of, and gone once it has, on a real API server", async () => {
+  const of: Pool = { name: "sandboxes", namespace: "live-since" };
+  await run(Effect.flatMap(KubeClient, (kube) => kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: of.namespace } })));
+  await run(Effect.flatMap(KubeClient, (kube) =>
+    Effect.gen(function*() {
+      yield* kube.create({ apiVersion: "v1", kind: "Pod", metadata: { name: "free-0", namespace: of.namespace, labels: { ...freeLabels(of) } }, spec: { containers: [{ name: "bayma", image: "agent" }] } });
+      yield* kube.patchPodStatus(of.namespace, "free-0", { status: { phase: "Running", podIP: "10.42.0.9", conditions: [{ type: "Ready", status: "True" }] } });
+    })
+  ));
+  const scope = await Effect.runPromise(Scope.make());
+  const live = Context.get(await Effect.runPromise(Layer.buildWithScope(Layer.provide(LiveBindings.layer({ namespaces: only([of.namespace]) }), Layer.fresh(KubeClient.layer)), scope)), LiveBindings);
+  try {
+    const holds = (binding: string, since?: number) => Effect.runPromise(live.holds("sessionfs:never", binding, of.namespace, since));
+    // Its first list heard, with no binding of it.
+    await until(async () => (await holds("never-made")) === "gone", true, "the watch never heard its namespace");
+    // Asked of as of now, after the watch last heard anything: not known, however often asked, until it hears again.
+    const since = Date.now() + 1;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(await holds("never-made", since), "unknown");
+    assert.equal(await holds("never-made", since), "unknown");
+    // The watch hears a change of the namespace's since: gone.
+    const binder = Layer.provideMerge(Binder.layer({ waitMs: 5_000 }), Layer.fresh(KubeClient.layer));
+    await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (each) => each.bind(of, "sessionfs:other")), binder));
+    await until(async () => (await holds("never-made", since)) === "gone", true, "a binding never made was still not known once the watch heard since");
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+});
+
 test("a watch cut, on a real API server, is watched again from the last version it saw, and hears what changed while it was cut", async () => {
   const of: Pool = { name: "sandboxes", namespace: "live-cut" };
   await run(Effect.flatMap(KubeClient, (kube) => kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: of.namespace } })));

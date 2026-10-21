@@ -55,3 +55,6 @@ export const boundAnnotations = (key: string): Readonly<Record<string, string>> 
  * MCP call's among them, which a pod given it may have run.
  */
 export const NOT_PASSED_HEADER = "x-alasio-not-passed";
+
+/** Where a bound pod tells the front of what its harness did on its own, for its caller's control plane, with its binding's token (./server.ts relay). */
+export const EVENTS_PATH = "/events";

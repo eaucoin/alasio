@@ -33,8 +33,10 @@
  * transcript, the store given it mirroring alone (its own load would serve too).
  * The Codex login is not kept here: alasio alone keeps it, and relays it, as two refreshing
  * it would end it. The files a prompt names are written as each turn starts (./host.ts). What
- * its harness does on its own between prompts it tells on its environment's events topic
- * (./host-events.ts HostEvents.onLog), as Events tells them, which alasio reads.
+ * its harness does on its own between prompts it tells the sandbox gateway's front, with its
+ * binding's token (./host-events.ts HostEvents.throughFront), which tells it on its environment's
+ * events topic, which alasio reads: it holds no principal of the log, and, where it has no
+ * gateway, tells it no one. What it commits to the stores alasio tells the lake's loader of.
  *
  * Its turns' workspaces' bayma is the control plane's to bring up, as it mints the tokens:
  * each turn gives the host its endpoint through the sandbox gateway, ALASIO_GATEWAY_URL, which
@@ -53,9 +55,7 @@ import { spawnAppServer } from "../codex/app-server/process.ts";
 import { codexHome } from "../codex/env.ts";
 import { CodexRollouts, SessionFsCodexRollouts } from "../codex/rollouts/index.ts";
 import { LOGIN_BEARER_ENV, loginRelayOverrides, SessionFsCodex, sessionFsCodexHome } from "../codex/sessionfs.ts";
-import { Events } from "../events/events.ts";
 import { HarnessNeon } from "../neon/connect.ts";
-import { LakeWake, type WakeLog, wakeLogOf } from "../neon/lake-wake.ts";
 import { ALASIO_GATEWAY_URL_VARIABLE } from "../gateway/names.ts";
 import { Store } from "../persistence/store.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
@@ -149,8 +149,6 @@ export interface HarnessConfig {
   readonly stateDir: string;
   /** The branch environment it is of, which gives no harness in a folder; null for main. */
   readonly branch: string | null;
-  /** Where it tells the lake's loader it wrote transcripts and rollouts; null where the lake does not run. */
-  readonly lakeWake: WakeLog | null;
   /** The sandbox gateway's address, its turns' workspaces' bayma reached through: `ALASIO_GATEWAY_URL`; null where it has none. */
   readonly gatewayUrl: string | null;
 }
@@ -171,7 +169,6 @@ export function loadHarnessConfig(env: NodeJS.ProcessEnv = process.env): Harness
     port,
     stateDir: required(env, "ALASIO_STATE_DIR"),
     branch: env["ALASIO_BRANCH"]?.trim() || null,
-    lakeWake: wakeLogOf(env),
     gatewayUrl: env[ALASIO_GATEWAY_URL_VARIABLE]?.trim() || null,
   };
 }
@@ -181,15 +178,14 @@ export type HarnessStandIns = Pick<HarnessesOptions, "overrides" | "claudeQueryF
 
 /**
  * Waits for its binding, then binds the conversation it names, as the module says, and
- * serves its harness host until the scope closes, telling its events as Events does: the
+ * serves its harness host until the scope closes, telling its events as the module says: the
  * port it serves on.
  */
-export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, standIns: HarnessStandIns = {}): Effect.fn.Return<{ readonly port: number }, unknown, Scope.Scope | Events> {
+export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, standIns: HarnessStandIns = {}): Effect.fn.Return<{ readonly port: number }, unknown, Scope.Scope> {
   yield* Effect.logInfo(`free: serving once bound, as ${config.bindingFile} says`);
   const { conversationId, token } = yield* awaitBinding(config.bindingFile);
   yield* markServed(config.stateDir);
-  const wake = config.lakeWake ? yield* LakeWake.make(config.lakeWake) : LakeWake.none;
-  const neon = yield* Effect.provideService(HarnessNeon.make, LakeWake, wake);
+  const neon = yield* HarnessNeon.make;
   const stores = yield* Layer.build(Store.layer({ pool: neon.pool, makesSchema: false }));
   const store = Context.get(stores, Store);
   const codexRollouts = yield* CodexRollouts.make({ store: neon.rollouts, home: codexHome() });
@@ -211,6 +207,8 @@ export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, s
     }).pipe(Semaphore.withPermit(taking));
 
   const environment = config.branch ?? MAIN_ENVIRONMENT_NAME;
+  // What its harness does on its own, told the gateway's front with its binding's token; no one, where it has no gateway.
+  const told = config.gatewayUrl ? HostEvents.throughFront({ url: config.gatewayUrl, token }) : Layer.succeed(HostEvents, HostEvents.of({ tell: (event) => Effect.logWarning(`no sandbox gateway to tell of ${event.kind} of ${event.conversationId}: told no one`) }));
   // Its turns' workspaces' bayma, as they give it, through the gateway, where it has one.
   const given = config.gatewayUrl ? yield* makeGivenBayma({ gatewayUrl: config.gatewayUrl, environment, stateDir: config.stateDir }) : null;
   // Its Codex's login, alasio's, relayed to it, where it is of a pool: none on its disk.
@@ -224,7 +222,7 @@ export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, s
     : CodexAppServer.layer;
   const built = yield* Layer.build(HarnessHost.layer.pipe(
     Layer.provideMerge(Harnesses.layer({ ...standIns, ...(given ? { folderBayma: given.folderBayma } : {}), branch: config.branch, sessionStore: neon.sessionStore, codexRollouts, sessionFsCodexRollouts })),
-    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, appServer, ReceivedFiles.layer({ stateDir: config.stateDir }), HostEvents.onLog(environment))),
+    Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, appServer, ReceivedFiles.layer({ stateDir: config.stateDir }), told)),
     Layer.provideMerge(sessions),
     Layer.provideMerge(Layer.succeedContext(stores)),
   ));
@@ -246,7 +244,4 @@ export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, s
 });
 
 /** `alasio harness`, as ./main.ts runs it: the host, from its environment, until it is stopped. */
-export const harness: Effect.Effect<never, unknown, Scope.Scope> = Effect.suspend(() => startHarness(loadHarnessConfig())).pipe(
-  Effect.provideServiceEffect(Events, Events.fromEnvironment),
-  Effect.andThen(Effect.never),
-);
+export const harness: Effect.Effect<never, unknown, Scope.Scope> = Effect.suspend(() => startHarness(loadHarnessConfig())).pipe(Effect.andThen(Effect.never));

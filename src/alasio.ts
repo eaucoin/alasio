@@ -62,6 +62,8 @@ export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog" | "log" 
   readonly pool: Pool;
   /** The schema alasio's state is kept in: `state`, unless a test gives one of its own. */
   readonly stateSchema?: string | undefined;
+  /** Tells the lake's loader of what a harness pool's pod committed, which tells it nothing itself (../neon/connect.ts ConnectedNeon.written); none where nothing loads it. */
+  readonly lakeWritten?: (() => void) | undefined;
   /** The harness host's role, which Neon has (../neon/harness.ts), granted its part of the state; none in a test without one. */
   readonly harnessRole?: string | undefined;
   /** Stand-ins for a folder workspace's bayma and for Claude Code, in the harnesses alasio makes. */
@@ -154,7 +156,7 @@ function eventsConsumer({ events }: AlasioOptions): Layer.Layer<EventsConsumer, 
  * harness's pool through the sandbox gateway, heard on its environment's events topic; and
  * otherwise its own, in its process, told and heard there.
  */
-function harnessHost({ harnessPools, sessionsGateway }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | Harnesses | ActiveTurns | ReceivedFiles | EventsConsumer | CodexAppServer> {
+function harnessHost({ harnessPools, sessionsGateway, lakeWritten }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | Harnesses | ActiveTurns | ReceivedFiles | EventsConsumer | CodexAppServer> {
   if (harnessPools && sessionsGateway) {
     const home = codexHome();
     // Its Codex login relayed to its pools' pods, on its pod's port, to each Codex turn's token alone; held by none of them.
@@ -164,8 +166,8 @@ function harnessHost({ harnessPools, sessionsGateway }: AlasioOptions): Layer.La
       authorize: poolLoginRefusal(poolLoginKey(sessionsGateway.callerKey), Date.now),
     }).pipe(Effect.tapError((error) => Effect.logError(`the Codex login could not be relayed to the harness pools: ${error.message}`)))));
     return Layer.mergeAll(
-      pooledHarnessHost({ ...sessionsGateway, codexLogin: { url: harnessPools.codexLoginUrl, home } }),
-      HarnessEvents.fromLog,
+      pooledHarnessHost({ ...sessionsGateway, codexLogin: { url: harnessPools.codexLoginUrl, home }, written: lakeWritten }),
+      HarnessEvents.fromLog({ written: lakeWritten }),
       relay,
     );
   }

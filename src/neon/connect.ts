@@ -72,6 +72,11 @@ export interface ConnectedNeon extends OpenNeon {
   readonly lake: boolean;
   /** The session-filesystem Codex home's rollout store, made in Neon (and for the lake to read) when asked for. */
   readonly sessionFsRollouts: Effect.Effect<NeonRolloutStore, NeonUnavailable>;
+  /**
+   * Tells the lake's loader of what others committed to the stores, as alasio's own stores tell
+   * it of theirs: a harness pool's pod, which reaches no log, and so tells it nothing itself.
+   */
+  readonly written: () => void;
 }
 
 /** What connecting to Neon fails with: a setting missing, or Neon not answering in time. */
@@ -227,6 +232,7 @@ const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope | LakeWak
     sessionStore,
     rollouts,
     lake,
+    written: writtenOn(pool, wake),
     sessionFsRollouts: onNeon(async () => {
       const store = new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA, written: writtenOn(pool, wake) });
       await store.ensureSchema();
@@ -258,11 +264,12 @@ export interface HarnessNeonStores extends OpenNeon {
  * Connects to the Neon the deployment provides as the harness host's role
  * (`ALASIO_DATABASE_URL`, or its `_FILE` form), until the scope closes, waiting for it as
  * alasio does; it makes nothing there, which alasio has made, and may not. Until its pool is
- * given a grant, it reaches nothing there but the server.
+ * given a grant, it reaches nothing there but the server. What it commits it tells the lake's
+ * loader of through no log of its own: alasio tells it, as the pod's turns end and as alasio
+ * hears what the pod did on its own (ConnectedNeon.written).
  */
-const connectHarnessNeon: Effect.Effect<HarnessNeonStores, NeonError, Scope.Scope | LakeWake> = Effect.gen(function*() {
+const connectHarnessNeon: Effect.Effect<HarnessNeonStores, NeonError, Scope.Scope> = Effect.gen(function*() {
   const databaseUrl = yield* deploymentSecret("ALASIO_DATABASE_URL");
-  const wake = yield* LakeWake;
   const runFork = yield* FiberSet.makeRuntime();
   const pool = yield* Effect.acquireRelease(
     Effect.sync(() => poolOf(databaseUrl, (error) => void runFork(Effect.logWarning(`idle database connection lost: ${error.message}`)), (config) => new GrantedPool(config))),
@@ -274,12 +281,11 @@ const connectHarnessNeon: Effect.Effect<HarnessNeonStores, NeonError, Scope.Scop
     Effect.interruptible,
   );
   yield* Effect.logInfo("connected to Neon");
-  const written = writtenOn(pool, wake);
   return {
     pool,
-    sessionStore: new NeonSessionStore(pool, { written }),
-    rollouts: new NeonRolloutStore(pool, { written }),
-    sessionFsRollouts: new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA, written }),
+    sessionStore: new NeonSessionStore(pool),
+    rollouts: new NeonRolloutStore(pool),
+    sessionFsRollouts: new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA }),
   };
 }).pipe(withLogScope("neon"));
 

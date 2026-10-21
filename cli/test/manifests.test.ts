@@ -1928,10 +1928,6 @@ describe("the log", () => {
         name: "loader-main",
         acls: [{ resource: "topic", name: "lake.main", pattern: "literal", operations: ["read", "describe"] }, { resource: "group", name: "lake-loader.main", pattern: "literal", operations: ["read"] }],
       },
-      {
-        name: "harness-main",
-        acls: [{ resource: "topic", name: "events.main", pattern: "literal", operations: ["write", "describe"] }, { resource: "topic", name: "lake.main", pattern: "literal", operations: ["write", "describe"] }],
-      },
     ]);
     // Each one the stack's setup makes a password for, main's environment's among them.
     assert.deepEqual(access.principals.map(({ name }: { name: string }) => name), [...LOG_PRINCIPALS]);
@@ -3747,7 +3743,7 @@ describe("conversations' harnesses' pools", () => {
     assert.ok(policy("alasio-harness-pool-pods") < policy("alasio-sandbox-pods"), `${policy("alasio-harness-pool-pods")} of ${policy("alasio-sandbox-pods")}`);
   });
 
-  test("of each harness in each environment's own namespace, alasio's image free until bound, its binding written beside it, its database the harness role's and its events its environment's harness principal's, scaled on the binds that wait", () => {
+  test("of each harness in each environment's own namespace, alasio's image free until bound, its binding written beside it, its database the harness role's, no principal of the log its own, scaled on the binds that wait", () => {
     const objects = install(pooling);
     for (const harness of ["codex", "claude"]) {
       const pool = one<V1Deployment>(objects, "Deployment", `harness-${harness}`);
@@ -3761,11 +3757,12 @@ describe("conversations' harnesses' pools", () => {
       assert.deepEqual(host.command, ["node", "/opt/alasio/src/harness/main.ts"]);
       const env = Object.fromEntries((host.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom?.secretKeyRef ?? valueFrom?.fieldRef?.fieldPath]));
       assert.deepEqual(
-        [env["ALASIO_HARNESS_BINDING_FILE"], env["ALASIO_HARNESS_PORT"], env["ALASIO_STATE_DIR"], env["ALASIO_DATABASE_URL_FILE"], env["ALASIO_GATEWAY_URL"], env["EVENTS_USERNAME"], env["EVENTS_PASSWORD_FILE"], env["ALASIO_BRANCH"]],
-        ["/attach/binding.json", "8080", "/var/lib/alasio/state", "/run/alasio/database/url", "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080", { name: "alasio-log-harness-main", key: "username" }, "/run/alasio/log/password", undefined],
+        [env["ALASIO_HARNESS_BINDING_FILE"], env["ALASIO_HARNESS_PORT"], env["ALASIO_STATE_DIR"], env["ALASIO_DATABASE_URL_FILE"], env["ALASIO_GATEWAY_URL"], env["ALASIO_BRANCH"]],
+        ["/attach/binding.json", "8080", "/var/lib/alasio/state", "/run/alasio/database/url", "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080", undefined],
       );
-      // Its lake's loader woken as it commits transcripts and rollouts, as alasio wakes it, as the same principal.
-      assert.deepEqual([env["ALASIO_LAKE_WAKE_TOPIC"], env["ALASIO_LOG_USERNAME"], env["ALASIO_LOG_PASSWORD_FILE"], env["ALASIO_LOG_BROKERS"]], ["lake.main", { name: "alasio-log-harness-main", key: "username" }, "/run/alasio/log/password", "alasio-log.alasio.svc:9092"]);
+      // Nothing of the log: what it tells goes through the gateway, and alasio wakes its lake's loader for it.
+      assert.deepEqual(Object.keys(env).filter((name) => /^(EVENTS_|ALASIO_LOG_|ALASIO_LAKE_WAKE)/u.test(name)), []);
+      assert.equal(spec?.volumes?.some(({ name }) => name === "log"), false);
       assert.deepEqual(host.readinessProbe?.httpGet, { path: "/healthz", port: "host" });
       assert.deepEqual(host.volumeMounts?.find(({ name }) => name === "attach"), { name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAMESPACE)/$(POD_NAME)", readOnly: true });
       assert.deepEqual(spec?.volumes?.find(({ name }) => name === "database")?.secret, { secretName: "alasio-harness-database", items: [{ key: "url", path: "url" }] });
@@ -3803,11 +3800,11 @@ describe("conversations' harnesses' pools", () => {
     assert.deepEqual(all<V1Deployment>(branch, "Deployment").filter(({ metadata }) => metadata?.name?.startsWith("harness-")).map(({ metadata }) => `${metadata?.namespace}/${metadata?.name}`), ["alasio-branch-try/harness-codex", "alasio-branch-try/harness-claude"]);
   });
 
-  test("a branch environment's in its own namespace, its events its own principal's, and the gateway may claim, read and delete their pods alone, and make none", () => {
+  test("a branch environment's in its own namespace, and the gateway may claim, read and delete their pods alone, and make none", () => {
     const branch = branchObjects(configOf(pooling), "try", BASELINE);
     const pool = one<V1Deployment>(branch, "Deployment", "harness-codex");
     const env = Object.fromEntries((container(pool).env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom?.secretKeyRef]));
-    assert.deepEqual([env["ALASIO_BRANCH"], env["EVENTS_USERNAME"]], ["try", { name: "alasio-log-harness", key: "username" }]);
+    assert.equal(env["ALASIO_BRANCH"], "try");
     for (const objects of [install(pooling), branch]) {
       const role = all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio-sandbox-gateway-harnesses");
       assert.deepEqual(role?.rules?.find(({ resources }) => resources?.includes("pods"))?.verbs, ["get", "list", "watch", "update", "delete"]);

@@ -17,6 +17,7 @@ import type { EventInput } from "../src/events/events.ts";
 import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
 import { harnessIdleness, type HarnessesConfig, makeHarnesses } from "../src/gateway/harnesses.ts";
 import { harnessKey } from "../src/gateway/names.ts";
+import { branchNamespace } from "../src/branch/names.ts";
 import { RELEASES } from "../src/gateway/releases.ts";
 import type { HarnessStatus } from "../src/harness/host.ts";
 import { HOST_PATHS } from "../src/harness/wire.ts";
@@ -421,4 +422,34 @@ test("a bound pod whose host ended, or was started again in it, is released as b
   } finally {
     stand.close();
   }
+});
+
+test("what a bound host tells is told its environment's alasio as the host's, of its own conversation and an event's kind alone, the record the gateway's; anything else is refused", async () => {
+  const env = await environment(0);
+  const { harnesses } = await harnessesOf(env, configOf(env.home, 8080), agents().agents);
+  const key = harnessKey("telegram:41");
+  const relay = (namespace: string, said: unknown, raw?: string) =>
+    Effect.runPromise(harnesses.relay({ key, binding: "binding-1", namespace }, Buffer.from(raw ?? JSON.stringify(said))));
+  const subject = { kind: "conversation", key: "telegram:41" } as const;
+  const before = told.length;
+  // main's and the branch's, each its own environment's.
+  assert.deepEqual(await relay(env.home, { kind: "harness.idle", subject }), { status: 202 });
+  assert.deepEqual(await relay(branchNamespace("try"), { kind: "harness.background-response", subject }), { status: 202 });
+  assert.deepEqual(told.slice(before), [
+    { kind: "harness.idle", environment: "main", source: "harness", subject },
+    { kind: "harness.background-response", environment: "try", source: "harness", subject },
+  ]);
+  // Of a kind no host tells, another conversation, more than an event's kind and its conversation (its id or source among it), no JSON, or of a namespace no environment's harnesses are in: refused, told no one.
+  const refused = [
+    [env.home, { kind: "harness.released", subject, binding: "binding-1", reason: "idle" }, 403],
+    [env.home, { kind: "workspace.lost", subject }, 403],
+    [env.home, { kind: "harness.idle", subject: { kind: "conversation", key: "telegram:42" } }, 403],
+    [env.home, { kind: "harness.idle", subject, id: "00000000-0000-4000-8000-000000000001" }, 400],
+    [env.home, { kind: "harness.idle", subject, source: "sandbox-gateway" }, 400],
+    [env.home, { kind: "harness.idle", subject: { ...subject, kind: "workspace" } }, 400],
+    ["elsewhere", { kind: "harness.idle", subject }, 403],
+  ] as const;
+  for (const [namespace, said, status] of refused) assert.equal((await relay(namespace, said)).status, status, JSON.stringify(said));
+  assert.equal((await relay(env.home, null, "not json")).status, 400);
+  assert.equal(told.length, before + 2);
 });

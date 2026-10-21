@@ -9,7 +9,9 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { after, test } from "node:test";
 
 import { ConfigProvider, Context, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect";
 import pg from "pg";
@@ -17,7 +19,6 @@ import pg from "pg";
 import { HARNESS_ROLE } from "../neon/control/secrets.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
 import { makeCodexRollouts } from "../src/codex/rollouts/index.ts";
-import { Events, type EventInput } from "../src/events/events.ts";
 import { GRANT_HEADER, grantDigest, grantKey, harnessGrant } from "../src/harness/grant.ts";
 import { type Harness, type TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
@@ -150,18 +151,27 @@ test("alasio harness binds its conversation and serves its host to the bearer of
     }).pipe(Effect.provideService(LakeWake, LakeWake.none)));
 
     let held: Held | null = null;
-    // What it tells, as the log would be told it.
-    const told: EventInput[] = [];
-    const tell = (event: EventInput) => Effect.sync(() => void told.push(event));
-    const telling = Events.of({ tell, send: tell });
+    // What it tells the gateway's front, as the front would be told it: with what it bears.
+    const told: { readonly authorization: string | undefined; readonly said: unknown }[] = [];
+    const front = createServer((incoming, outgoing) => {
+      const chunks: Buffer[] = [];
+      incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+      incoming.on("end", () => {
+        if (incoming.method === "POST" && incoming.url === "/events") told.push({ authorization: incoming.headers.authorization, said: JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown });
+        outgoing.writeHead(incoming.url === "/events" ? 202 : 404).end();
+      });
+    });
+    await new Promise<void>((resolve) => front.listen(0, "127.0.0.1", resolve));
+    const gatewayUrl = `http://127.0.0.1:${(front.address() as AddressInfo).port}`;
+    after(() => void front.close());
     // Free, of no conversation, until its binding is beside it.
     const attach = join(dir, "attach");
     mkdirSync(attach);
     const bindingFile = join(attach, "binding.json");
     const starting = await inScope(startHarness(
-      { bindingFile, port: 0, stateDir: stateDir!, branch: null, lakeWake: null, gatewayUrl: null },
+      { bindingFile, port: 0, stateDir: stateDir!, branch: null, gatewayUrl },
       { overrides: { [CODEX_HARNESS]: answeringHarness(() => held) } },
-    ).pipe(Effect.provide(neonEnv(as(HARNESS_ROLE, "harness-password"))), Effect.provideService(Events, telling), Effect.forkScoped));
+    ).pipe(Effect.provide(neonEnv(as(HARNESS_ROLE, "harness-password"))), Effect.forkScoped));
     await new Promise((resolve) => setTimeout(resolve, 600));
     assert.equal(starting.pollUnsafe(), undefined, "a free host serves nothing");
     assert.equal(existsSync(join(home!, ROLLOUT)), false, "a free host writes back nothing");
@@ -170,7 +180,7 @@ test("alasio harness binds its conversation and serves its host to the bearer of
     // Its binding's directory read alone, its node's agent's to write: served, as it marks it, in a directory of its own.
     assert.deepEqual(readdirSync(attach), ["binding.json"]);
     // Its pod's binding served once: a host started again in it, as its container restarted, binds it no more.
-    const again = await Effect.runPromise(Effect.flip(Effect.scoped(startHarness({ bindingFile, port: 0, stateDir: stateDir!, branch: null, lakeWake: null, gatewayUrl: null }))).pipe(Effect.provideService(Events, telling)));
+    const again = await Effect.runPromise(Effect.flip(Effect.scoped(startHarness({ bindingFile, port: 0, stateDir: stateDir!, branch: null, gatewayUrl }))));
     assert.equal((again as { readonly _tag?: string })._tag, "BindingServed");
 
     const call = (path: string, body: object | null, { token = "harness-token", signal, granting }: { readonly token?: string; readonly signal?: AbortSignal; readonly granting?: string } = {}) =>
@@ -218,7 +228,7 @@ test("alasio harness binds its conversation and serves its host to the bearer of
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
 
-    // A turn, claimed by alasio, run to its end; what its harness does on its own after it told on main's events topic.
+    // A turn, claimed by alasio, run to its end; what its harness does on its own after it told the gateway's front, bearing its binding's token, of its conversation alone.
     const start = (prompt: string, epoch: number) => ({
       conversationId,
       chatId: "41",
@@ -241,8 +251,8 @@ test("alasio harness binds its conversation and serves its host to the bearer of
     assert.deepEqual([turn.answer["blockSequence"], turn.answer["sessionId"], turn.answer["responseCompleted"]], [[{ type: "text", content: "Answered first." }], THREAD, true]);
     const subject = { kind: "conversation", key: conversationId } as const;
     assert.deepEqual(told, [
-      { kind: "harness.background-response", environment: "main", source: "harness", subject },
-      { kind: "harness.idle", environment: "main", source: "harness", subject },
+      { authorization: "Bearer harness-token", said: { kind: "harness.background-response", subject } },
+      { authorization: "Bearer harness-token", said: { kind: "harness.idle", subject } },
     ]);
     // One of a claim since overtaken fails as the store says, whole.
     const second = await claim("second");
@@ -278,23 +288,11 @@ test("alasio harness binds its conversation and serves its host to the bearer of
   }
 });
 
-test("a pool's host is configured from its environment: its binding's file, its state, the gateway, and the wake topic it tells its lake's loader of each write on, as alasio does", () => {
+test("a pool's host is configured from its environment: its binding's file, its state, and the gateway", () => {
   const base = { ALASIO_HARNESS_BINDING_FILE: "/attach/binding.json", ALASIO_STATE_DIR: "/var/lib/alasio/state" };
-  assert.deepEqual(loadHarnessConfig(base), { bindingFile: "/attach/binding.json", port: 8080, stateDir: "/var/lib/alasio/state", branch: null, lakeWake: null, gatewayUrl: null });
-  const pooled = loadHarnessConfig({
-    ...base,
-    ALASIO_BRANCH: "try",
-    ALASIO_GATEWAY_URL: "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080",
-    ALASIO_LAKE_WAKE_TOPIC: "lake.try",
-    ALASIO_LOG_BROKERS: "alasio-log.alasio.svc:9092",
-    ALASIO_LOG_USERNAME: "harness-try",
-    ALASIO_LOG_PASSWORD_FILE: "/run/alasio/log/password",
-  });
-  assert.deepEqual([pooled.branch, pooled.gatewayUrl, pooled.lakeWake], [
-    "try",
-    "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080",
-    { brokers: ["alasio-log.alasio.svc:9092"], username: "harness-try", passwordFile: "/run/alasio/log/password", topic: "lake.try" },
-  ]);
+  assert.deepEqual(loadHarnessConfig(base), { bindingFile: "/attach/binding.json", port: 8080, stateDir: "/var/lib/alasio/state", branch: null, gatewayUrl: null });
+  const pooled = loadHarnessConfig({ ...base, ALASIO_BRANCH: "try", ALASIO_GATEWAY_URL: "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080" });
+  assert.deepEqual([pooled.branch, pooled.gatewayUrl], ["try", "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080"]);
   assert.throws(() => loadHarnessConfig({ ALASIO_STATE_DIR: "/state" }), /ALASIO_HARNESS_BINDING_FILE/u);
 });
 

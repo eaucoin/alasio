@@ -16,6 +16,11 @@
  *   its bindings, and the binds waiting for a free pod in every replica of the binder, as
  *   `peers` names them; asked without a token, as KEDA's metrics-api trigger asks.
  * - `GET /waiting/<namespace>/<pool>`: `{ waiting }`, this replica's alone, as its peers ask.
+ * - `POST /events`: what a bound pod tells of what its harness did on its own, for its caller's
+ *   control plane, as `relay` says it, of TOLD_BYTES at most (413 past it), asked with the
+ *   binding's token alone, never a caller's (401 for any other): while its binding is held, as
+ *   the bindings' Leases are watched; 503 with a Retry-After while whether it is held is not
+ *   known yet, and 401 once it is gone.
  * - `GET /healthz`: 200 once it serves, asked without a token.
  * - `/workspace`, `/snapshots` and `/folders`, and what is under them: what the front answers itself of
  *   the token's key, beyond binding it, or of its caller, as `operate` says, such as the files
@@ -58,7 +63,7 @@ import { withLogScope } from "../shared/log.ts";
 import { BearerToken } from "../shared/tokens.ts";
 import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
 import { counts, touchLease } from "./bindings.ts";
-import { NO_BIND_HEADER, NOT_PASSED_HEADER, type Pool } from "./names.ts";
+import { EVENTS_PATH, NO_BIND_HEADER, NOT_PASSED_HEADER, type Pool } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
 import type { Held } from "./live.ts";
 import { bindingToken, type HeldTo, type TokenClaims, verifyToken } from "./tokens.ts";
@@ -79,9 +84,16 @@ const OPERATED = /^\/(workspace|snapshots|folders)(\/|$)/u;
 const BIND_PATH = "/bind";
 /** Where a caller asks the front to release its token's key's binding. */
 const RELEASE_PATH = "/release";
+/** The most a pod's telling may carry: an event's few fields, with room. */
+export const TOLD_BYTES = 4 * 1024;
 
 /** Whether the front answers a request to `path` itself, passing none to a pod: what a bound pod serves is at none of them. */
-export const answeredByFront = (path: string): boolean => path === BIND_PATH || path === RELEASE_PATH || OPERATED.test(path);
+/** How many bindings not known yet the front remembers when each was first told of, at most (/events). */
+export const FIRST_TOLD_KEPT = 1024;
+/** How long it remembers when one was first told of: past any watch's catching up, after which it is asked of anew. */
+const FIRST_TOLD_FOR_MS = 10 * 60_000;
+
+export const answeredByFront = (path: string): boolean => path === BIND_PATH || path === RELEASE_PATH || path === EVENTS_PATH || OPERATED.test(path);
 
 /** Where a workspace's files are read and written, as the front answers them (`operate`). */
 const FILES_PATH = "/workspace/files";
@@ -196,6 +208,12 @@ export interface BinderServerOptions {
    * where none is given, nor where the bindings are not watched (`routeHeld`).
    */
   readonly grants?: (key: string, held: HeldTo) => boolean;
+  /**
+   * What a bound pod tells, asked with its binding's token (`POST /events`): the binding, its
+   * body, and how it is answered; none where no pod tells anything, which is answered 404, nor
+   * where the bindings are not watched (`routeHeld`).
+   */
+  readonly relay?: (bound: HeldTo, body: Uint8Array) => Effect.Effect<Answer>;
 }
 
 /** A listening front: its port, and how many requests of each key of each pool it is passing on now. */
@@ -238,7 +256,7 @@ const Waiting = Schema.Struct({ waiting: Schema.Number });
 const decodeWaiting = Schema.decodeUnknownOption(Waiting);
 
 /** Serves the front on `port` until the scope closes, as the module says. */
-export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]), operate, routeHeld, grants }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
+export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]), operate, routeHeld, grants, relay }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
   const binder = yield* Binder;
   const kube = yield* KubeClient;
   const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
@@ -247,6 +265,9 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
   // and each binds its own, which a caller of one never reaches by another's.
   const routes = new Map<string, Routed>();
   const flights = new Map<string, number>();
+  // When each binding the watch did not know yet was first told of by its pod (/events), by its namespace and uid, until it is
+  // known held or gone; FIRST_TOLD_KEPT at most, the oldest let go of first, and none for longer than FIRST_TOLD_FOR_MS.
+  const firstTold = new Map<string, number>();
   // When this replica last stamped each key's binding active, by the binding: a new binding's first request is stamped whatever its key's last was.
   const stamped = new Map<string, { readonly binding: string; readonly at: number }>();
   /** The key of `key`, as `pool` binds it, in what the front keeps: a namespace has no slash. */
@@ -323,6 +344,35 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       }
       const bearer = Schema.decodeUnknownOption(BearerToken)(incoming.headers.authorization);
       const now = yield* Clock.currentTimeMillis;
+      if (url.split("?", 1)[0] === EVENTS_PATH) {
+        if (!relay || !routeHeld) return answer(outgoing, 404, { error: "no pod tells anything here" });
+        if (incoming.method !== "POST") return answer(outgoing, 405, { error: `${incoming.method} ${EVENTS_PATH} is no telling` });
+        // A binding's token alone, as its pod is given it: a caller's is signed by no binding key, and no binding's names no binding.
+        const bound = Option.isSome(bearer) ? verifyToken(bindingKey, bearer.value[1], now) : null;
+        if (!bound || bound.binding === undefined || bound.namespace === undefined || bound.expires !== undefined || bound.held !== undefined) return answer(outgoing, 401, { error: "no binding's token" });
+        const binding = { key: bound.key, binding: bound.binding, namespace: bound.namespace };
+        // One not seen yet is not known until the watch has heard of its namespace since it was first told of, as a binding just
+        // made may not be heard of yet; from then on, gone, as one let go of is, however often its pod tells again.
+        const told = `${binding.namespace}/${binding.binding}`;
+        const first = firstTold.get(told);
+        const since = first !== undefined && now - first < FIRST_TOLD_FOR_MS ? first : now;
+        const holding = yield* routeHeld(binding.key, binding.binding, binding.namespace, since);
+        if (holding === "unknown") {
+          firstTold.delete(told);
+          firstTold.set(told, since);
+          for (const [oldest] of firstTold) {
+            if (firstTold.size <= FIRST_TOLD_KEPT) break;
+            firstTold.delete(oldest);
+          }
+          return answer(outgoing, 503, { error: `whether ${binding.key}'s binding is held is not known yet` }, { "retry-after": String(RETRY_AFTER_S) });
+        }
+        firstTold.delete(told);
+        if (holding === "gone") return answer(outgoing, 401, { error: `the binding of ${binding.key} is gone` });
+        const body = yield* Effect.promise(() => bodyOf(incoming, TOLD_BYTES));
+        if (body === null) return answer(outgoing, 413, { error: `a telling is ${TOLD_BYTES} bytes at most` });
+        const answered = yield* relay(binding, body);
+        return answer(outgoing, answered.status, answered.json, answered.headers);
+      }
       const claims = Option.isSome(bearer) ? verifyToken(callerKey, bearer.value[1], now) : null;
       // A caller's token, which stops within MAX_CALLER_TOKEN_MS, or is held to a binding; a binding's, which a bound pod takes requests with, is none.
       if (!claims || claims.binding !== undefined || (claims.expires !== undefined && claims.expires > now + MAX_CALLER_TOKEN_MS)) return answer(outgoing, 401, { error: "no caller's token" });

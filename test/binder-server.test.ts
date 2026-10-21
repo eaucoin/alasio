@@ -13,7 +13,7 @@ import { ACTIVE_ANNOTATION, activeAt, readLease, takeLease, touchLease } from ".
 import { baymaIdleness } from "../src/binder/sweep.ts";
 import { LiveBindings } from "../src/binder/live.ts";
 import { environmentKey, freeLabels, NO_BIND_HEADER, NOT_PASSED_HEADER, type Pool } from "../src/binder/names.ts";
-import { type BinderServer, type BinderServerOptions, MAX_CALLER_TOKEN_MS, MAX_OPERATION_BYTES, type Operation, type Placement, PlacementRefused, serveBinder } from "../src/binder/server.ts";
+import { type BinderServer, type BinderServerOptions, FIRST_TOLD_KEPT, MAX_CALLER_TOKEN_MS, MAX_OPERATION_BYTES, type Operation, type Placement, PlacementRefused, serveBinder, TOLD_BYTES } from "../src/binder/server.ts";
 import { bindingToken, mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 import { heldToHarness } from "../src/gateway/names.ts";
 import { KubeClient } from "../src/kube/client.ts";
@@ -76,6 +76,7 @@ async function front(
     watched = false,
     holds = undefined as BinderServerOptions["routeHeld"],
     grants = undefined as BinderServerOptions["grants"],
+    relay = undefined as BinderServerOptions["relay"],
     elsewhere = {} as Readonly<Record<string, Pool>>,
   } = {},
 ): Promise<BinderServer & { close: () => Promise<void> }> {
@@ -90,7 +91,7 @@ async function front(
     : null;
   const routeHeld = holds ?? live?.holds;
   const served = await Effect.runPromise(
-    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), ...(routeHeld ? { routeHeld } : {}), ...(grants ? { grants } : {}), poolOf: (_key, options) =>
+    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), ...(routeHeld ? { routeHeld } : {}), ...(grants ? { grants } : {}), ...(relay ? { relay } : {}), poolOf: (_key, options) =>
       options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: elsewhere[options["environment"] ?? ""] ?? of, release, ...told })), peers: () => Effect.succeed(peers) }).pipe(
       Effect.provide(layer),
       Scope.provide(scope),
@@ -901,5 +902,98 @@ test("a pod's answer that says the front passed its request to no pod is passed 
   } finally {
     await served.close();
     pretending.close();
+  }
+});
+
+test("a pod tells the front with its binding's token alone, while its binding is held: a caller's token, a binding gone, and a telling past its bound are refused, and one whose binding is not known yet is told again", async () => {
+  const of = await pool();
+  const stand = await pods();
+  const key = "harness:telegram:41";
+  /** What each binding's watch says, by its Lease's uid: gone where it says nothing. */
+  const held = new Map<string, "held" | "unknown">([["binding-1", "held"], ["binding-2", "unknown"]]);
+  const asked: { readonly binding: string; readonly since: number | undefined }[] = [];
+  const told: { readonly bound: unknown; readonly said: string }[] = [];
+  const served = await front(of, stand.port, {
+    holds: (_key, binding, _namespace, since) => Effect.sync(() => (asked.push({ binding, since }), held.get(binding) ?? "gone")),
+    relay: (bound, body) => Effect.sync(() => (told.push({ bound, said: Buffer.from(body).toString("utf8") }), { status: 202 })),
+  });
+  try {
+    const tell = (authorization: string, body = '{"kind":"harness.idle"}', method = "POST") =>
+      fetch(`http://127.0.0.1:${served.port}/events`, { method, headers: { authorization }, ...(method === "POST" ? { body } : {}) });
+    const of1 = (binding: string) => `Bearer ${bindingToken(bindingKey, { key, binding, namespace: of.namespace })}`;
+    // Its binding held: told on, as the pod's binding, whole.
+    const before = Date.now();
+    assert.equal((await tell(of1("binding-1"))).status, 202);
+    assert.deepEqual(told, [{ bound: { key, binding: "binding-1", namespace: of.namespace }, said: '{"kind":"harness.idle"}' }]);
+    // Of a binding not seen, not known until the watch has heard of its namespace since the telling.
+    assert.ok((asked[0]?.since ?? 0) >= before);
+    // Not known yet: told again after a while, known since it was first told of, not since each telling, so one gone is found gone; gone: refused.
+    const unknown = await tell(of1("binding-2"));
+    assert.deepEqual([unknown.status, unknown.headers.get("retry-after")], [503, "1"]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal((await tell(of1("binding-2"))).status, 503);
+    const sinces = asked.filter(({ binding }) => binding === "binding-2").map(({ since }) => since);
+    assert.deepEqual([sinces.length, sinces[1]], [2, sinces[0]]);
+    assert.equal((await tell(of1("binding-3"))).status, 401);
+    // A caller's token, the key's own, or one held to the binding, is no binding's; nor is none.
+    assert.equal((await tell(caller(key))).status, 401);
+    assert.equal((await tell(`Bearer ${mintToken(callerKey, { key: "session:fs-a", held: { key, binding: "binding-1", namespace: of.namespace }, issued: Date.now() })}`)).status, 401);
+    assert.equal((await tell("Bearer forged")).status, 401);
+    // A telling past its bound, and one that is no POST.
+    assert.equal((await tell(of1("binding-1"), "x".repeat(TOLD_BYTES + 1))).status, 413);
+    assert.equal((await tell(of1("binding-1"), "", "GET")).status, 405);
+    assert.equal(told.length, 1);
+    // None of it reached a pod, nor bound one.
+    assert.deepEqual(stand.sent, []);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("the front remembers when bindings not known yet were first told of, of so many at most, the oldest let go of first, so no pod's tellings grow it", { timeout: 60_000 }, async () => {
+  const of = await pool();
+  const stand = await pods();
+  const key = "harness:telegram:41";
+  const asked = new Map<string, number[]>();
+  const served = await front(of, stand.port, {
+    holds: (_key, binding, _namespace, since) => Effect.sync(() => (asked.set(binding, [...(asked.get(binding) ?? []), since ?? 0]), "unknown" as const)),
+    relay: () => Effect.succeed({ status: 202 }),
+  });
+  try {
+    const tell = (binding: string) =>
+      fetch(`http://127.0.0.1:${served.port}/events`, { method: "POST", headers: { authorization: `Bearer ${bindingToken(bindingKey, { key, binding, namespace: of.namespace })}` }, body: '{"kind":"harness.idle"}' });
+    assert.equal((await tell("binding-0")).status, 503);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal((await tell("binding-0")).status, 503);
+    // Remembered while it is among the latest.
+    assert.equal(asked.get("binding-0")?.[1], asked.get("binding-0")?.[0]);
+    for (let n = 1; n <= FIRST_TOLD_KEPT; n += 1) assert.equal((await tell(`binding-${n}`)).status, 503);
+    // Let go of, as so many were told of since: asked of anew.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal((await tell("binding-0")).status, 503);
+    const sinces = asked.get("binding-0") ?? [];
+    assert.ok((sinces[2] ?? 0) > (sinces[0] ?? 0), "the oldest was not let go of");
+    // The latest remembered still.
+    assert.equal((await tell(`binding-${FIRST_TOLD_KEPT}`)).status, 503);
+    const latest = asked.get(`binding-${FIRST_TOLD_KEPT}`) ?? [];
+    assert.equal(latest[1], latest[0]);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a front no pod tells anything answers a telling 404", async () => {
+  const of = await pool();
+  const stand = await pods();
+  const served = await front(of, stand.port);
+  try {
+    const answered = await fetch(`http://127.0.0.1:${served.port}/events`, { method: "POST", headers: { authorization: `Bearer ${bindingToken(bindingKey, { key: "harness:telegram:41", binding: "binding-1", namespace: of.namespace })}` }, body: "{}" });
+    assert.equal(answered.status, 404);
+    assert.deepEqual(stand.sent, []);
+  } finally {
+    await served.close();
+    stand.close();
   }
 });

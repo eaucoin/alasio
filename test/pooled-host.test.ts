@@ -154,7 +154,9 @@ test("alasio reaches each conversation's pooled host through the front, a token 
             return { server: { type: "http", url: "http://gateway/mcp", headers: { Authorization: "Bearer folder" } }, notice: null } as const;
           }),
       } as unknown as HostBayma["Service"];
-      const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: "http://alasio-codex-login.alasio.svc.cluster.local:4320/v1", home: CODEX_HOME } }).pipe(
+      // What a pod commits told the lake's loader, as each turn of its ends.
+      let wakes = 0;
+      const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: "http://alasio-codex-login.alasio.svc.cluster.local:4320/v1", home: CODEX_HOME }, written: () => void (wakes += 1) }).pipe(
         Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), codexAppServer, Layer.succeed(SessionSandboxes, sessions), Layer.succeed(HostBayma, folders), Layer.succeed(BusyPods, busyPods))),
       )).pipe(Scope.provide(scope))), HarnessHost);
 
@@ -181,6 +183,7 @@ test("alasio reaches each conversation's pooled host through the front, a token 
       assert.equal((await Effect.runPromise(reservedTurn(host, turn))).pendingResponseId, "pending-1");
       assert.deepEqual(started.at(-1)?.bayma, { endpoint: { url: "http://gateway/mcp", headers: { Authorization: "Bearer folder" } }, notice: null });
       assert.deepEqual(waitedOn, ["whose image is being pulled", null]);
+      assert.equal(wakes, 1);
       const held = { key: `harness:${conversationId}`, binding: "binding-1", namespace: "alasio" };
       assert.deepEqual(heldTo, [held]);
       // alasio's own pod held busy while it drove the turn, and let go of once it ended.

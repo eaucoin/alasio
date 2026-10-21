@@ -208,6 +208,8 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       routeHeld: live.holds,
       // Where harnesses are bound in pools: a workspace's token held to its conversation's harness's binding, as alasio gives one.
       ...(harnesses ? { grants: (key: string, held: HeldTo) => heldToHarness(key, held.key) } : {}),
+      // What a harness's bound host tells, told its environment's alasio as the gateway's, the host holding no principal of the log.
+      ...(harnesses ? { relay: harnesses.relay } : {}),
       // Every replica's address but its own, which answers its own waiting.
       peers: () =>
         Effect.tryPromise(() => lookup(config.peers, { all: true })).pipe(

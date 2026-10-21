@@ -1,8 +1,9 @@
 /**
  * An environment's events: what the sandbox gateway tells its alasio of what happens to what
- * it binds for it, and what the harness hosts of its harness pools tell of what their
- * harnesses do on their own, on its events topic in the log, `events.<environment>`
- * (eventsTopic), which its alasio reads in its group (cli/src/manifests/log.ts).
+ * it binds for it, and of what the harness hosts of its harness pools tell it their harnesses do
+ * on their own, which hold no principal of the log (../gateway/harnesses.ts relayed), on its
+ * events topic in the log, `events.<environment>` (eventsTopic), which its alasio reads in its
+ * group (cli/src/manifests/log.ts).
  *
  * A record's key is its subject's key, the workspace's or the conversation's, so one
  * subject's events keep their order on a partition. Its value is JSON, an envelope of
@@ -40,7 +41,7 @@ export const EVENTS_VERSION = 1;
 /** What an event is about: a session's workspace, by its key, or a conversation, by its. */
 const Subject = Schema.Struct({ kind: Schema.Literals(["workspace", "conversation"]), key: Schema.String });
 
-/** What tells of events: the sandbox gateway, of what it binds; a harness pool's host, of what its harness does on its own; a parent's alasio, of its branches' forks it answered. */
+/** What tells of events: the sandbox gateway, of what it binds; a harness pool's host, of what its harness does on its own, through the gateway, which writes it so; a parent's alasio, of its branches' forks it answered. */
 export const EVENT_SOURCES = ["sandbox-gateway", "harness", "alasio"] as const;
 
 const envelope = {
