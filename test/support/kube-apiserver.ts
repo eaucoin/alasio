@@ -2,7 +2,10 @@
  * A throwaway Kubernetes API server for tests, as controller-runtime's envtest runs one: the
  * kube-apiserver and etcd of an envtest release, pinned by digest, downloaded once into the
  * user's cache and started as children of the test process on free ports of the loopback,
- * with no controller, scheduler or kubelet beside them. What a test makes is stored and
+ * with no controller, scheduler or kubelet beside them. A port is found free by probing it,
+ * and is bound by its server only once that starts: another process may take it in between, as
+ * the test files' processes run beside each other, so a start whose server found its port
+ * taken is made again on ports found free anew (STARTS). What a test makes is stored and
  * served, with the API's own conflicts, conditioned updates and watches, and nothing acts
  * on it. A pod is made without a ServiceAccount, as nothing makes the default one. One
  * server per test process, started by the first startKubeApiServer and stopped as the test
@@ -38,6 +41,12 @@ after(async () => {
   started = undefined;
   await running?.stop();
 });
+
+/** How many times the servers are started, each time on ports found free anew, where one found its port taken as it started. */
+const STARTS = 5;
+
+/** What a server that found its port taken as it started says, as etcd's and kube-apiserver's listeners do. */
+const PORT_TAKEN = /address already in use/u;
 
 /** A port of the loopback no one listens on now. */
 async function freePort(): Promise<number> {
@@ -88,10 +97,27 @@ const ready = (port: number, ca: Buffer, token: string): Promise<boolean> =>
     asked.end();
   });
 
-async function start(): Promise<{ readonly api: TestKubeApiServer; readonly stop: () => Promise<void> }> {
+/** A server that ended as it started, as it found its port taken: started again on another. */
+class PortTaken extends Error {}
+
+/**
+ * An API server on ports `ports` finds free, started again on others where one of its servers
+ * found its port taken as it started, STARTS times at most.
+ */
+export async function startApiServer(ports: () => Promise<number> = freePort): Promise<{ readonly api: TestKubeApiServer; readonly stop: () => Promise<void> }> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await startOnce(ports);
+    } catch (error) {
+      if (!(error instanceof PortTaken) || attempt === STARTS) throw error;
+    }
+  }
+}
+
+async function startOnce(ports: () => Promise<number>): Promise<{ readonly api: TestKubeApiServer; readonly stop: () => Promise<void> }> {
   const bin = await binaries();
   const directory = mkdtempSync(join(tmpdir(), "alasio-kube-apiserver-"));
-  const [etcdPort, peerPort, apiPort] = [await freePort(), await freePort(), await freePort()];
+  const [etcdPort, peerPort, apiPort] = [await ports(), await ports(), await ports()];
   const etcd = run(join(bin, "etcd"), [
     `--data-dir=${join(directory, "etcd")}`,
     `--listen-client-urls=http://127.0.0.1:${etcdPort}`,
@@ -138,7 +164,7 @@ async function start(): Promise<{ readonly api: TestKubeApiServer; readonly stop
     const certificate = join(certs, "apiserver.crt");
     for (const deadline = Date.now() + 60_000; ; await new Promise((resolve) => setTimeout(resolve, 250))) {
       for (const [name, { child, output }] of [["etcd", etcd], ["kube-apiserver", apiServer]] as const) {
-        if (child.exitCode !== null) throw new Error(`${name} ended (${child.exitCode}): ${output()}`);
+        if (child.exitCode !== null) throw new (PORT_TAKEN.test(output()) ? PortTaken : Error)(`${name} ended (${child.exitCode}): ${output()}`);
       }
       if (existsSync(certificate) && (await ready(apiPort, readFileSync(certificate), token))) break;
       if (Date.now() > deadline) throw new Error(`kube-apiserver was not ready within a minute: ${apiServer.output()}`);
@@ -162,6 +188,6 @@ async function start(): Promise<{ readonly api: TestKubeApiServer; readonly stop
 
 /** The test process's API server, started at the first call. */
 export function startKubeApiServer(): Promise<TestKubeApiServer> {
-  started ??= start();
+  started ??= startApiServer();
   return started.then(({ api }) => api);
 }
