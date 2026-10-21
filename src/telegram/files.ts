@@ -1,13 +1,14 @@
 /**
- * The files the operator sends alasio: kept whole in alasio's store, and written for the
- * agent to read where its workspace is, each at a path of its own (its id, then its name),
- * which the prompt it came with names. A folder workspace's agent reads them under alasio's
- * state directory; a session filesystem's, in its session, under its home (RECEIVED_IN_SESSION),
- * written through the sandbox gateway, confined to the session's files, as the harness that runs
- * in alasio reaches none of alasio's own. Neither outlasts what holds it for long (alasio's pod,
- * a session's deletion), so before a prompt runs, its files are written again where they may be
- * missing, from the store: under the state directory where they are not there, into a session
- * each time, as alasio cannot see what a session holds but by reading it whole.
+ * The files the operator sends alasio: kept whole in alasio's store as they come, and written
+ * for the agent to read where its workspace is, each at a path of its own (its id, then its
+ * name), which the prompt it came with names, by the host of the turn the prompt runs in, as
+ * the turn starts (materialize, ../harness/host.ts), and as a steer naming them reaches it: a
+ * folder workspace's agent reads them under the state directory, a session filesystem's in its
+ * session, under its home (RECEIVED_IN_SESSION), written through the sandbox gateway, confined
+ * to the session's files. Neither outlasts what holds it for long (a pod, a session's deletion),
+ * so each turn writes its prompt's files again where they may be missing, from the store: under
+ * the state directory where they are not there, into a session each time, as its host cannot see
+ * what a session holds but by reading it whole.
  */
 import { existsSync } from "node:fs";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
@@ -41,8 +42,8 @@ export interface ReceivedFile {
 }
 
 export class ReceivedFiles extends Context.Service<ReceivedFiles, {
-  /** Keeps a file a message carried, and writes it where the agent of `workspace`, the conversation's, reads it. */
-  readonly keep: (file: NewFile, workspace: Workspace | null) => Effect.Effect<ReceivedFile, StoreError | ReceivedFileError>;
+  /** Keeps a file a message carried: it, and where the agent of `workspace`, the conversation's, reads it once its turn's host has written it there (materialize). */
+  readonly keep: (file: NewFile, workspace: Workspace | null) => Effect.Effect<ReceivedFile, StoreError>;
   /** Where the agent of `workspace` reads a kept file. */
   readonly pathOf: (file: Pick<StoredFile, "id" | "name">, workspace: Workspace | null) => string;
   /** Writes the files `ids` name where the agent of `workspace` reads them, where they may be missing. */
@@ -77,13 +78,7 @@ export class ReceivedFiles extends Context.Service<ReceivedFiles, {
       };
 
       return ReceivedFiles.of({
-        keep: Effect.fnUntraced(function*(file, workspace) {
-          const id = yield* store.insertFile(file);
-          // Written once: a file kept already, as for a message handled again, is there; one into a session is written
-          // again, the same.
-          if (workspace?.kind === "sessionfs" || !existsSync(join(root, id))) yield* write({ id, name: file.name, content: file.content }, workspace);
-          return { id, path: pathOf({ id, name: file.name }, workspace) };
-        }),
+        keep: (file, workspace) => Effect.map(store.insertFile(file), (id) => ({ id, path: pathOf({ id, name: file.name }, workspace) })),
         pathOf,
         materialize: (ids, workspace) =>
           Effect.suspend(() => {

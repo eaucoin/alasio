@@ -329,8 +329,6 @@ export class Store extends Context.Service<Store, {
   readonly getFileContents: (ids: readonly string[]) => Stored<FileContent[]>;
   /** Keeps the album a message arrived in, unless it is kept already: whether it still waits, or was handled before the message came. */
   readonly upsertMediaGroup: (arrival: MediaGroupArrival) => Stored<boolean>;
-  /** Records that handling the album failed once more: how many times it has. */
-  readonly recordMediaGroupFailure: (mediaGroupId: string) => Stored<number>;
   readonly getMediaGroupMessages: (mediaGroupId: string) => Stored<StoredMessage[]>;
   readonly getFilesForMessages: (messageIds: readonly string[]) => Stored<StoredFile[]>;
   /** The albums still waiting none of whose messages was kept within `quietMs`, oldest first. */
@@ -603,7 +601,6 @@ const makeStore = Effect.fnUntraced(function*({
     insertFile: (file) => telegramContent.insertFile(file),
     getFileContents: (ids) => telegramContent.getFileContents(ids),
     upsertMediaGroup: (arrival) => telegramContent.upsertMediaGroup(arrival),
-    recordMediaGroupFailure: (mediaGroupId) => telegramContent.recordMediaGroupFailure(mediaGroupId),
     getMediaGroupMessages: (mediaGroupId) => telegramContent.getMediaGroupMessages(mediaGroupId),
     getFilesForMessages: (messageIds) => telegramContent.getFilesForMessages(messageIds),
     getPendingMediaGroupsDue: (quietMs) => telegramContent.getPendingMediaGroupsDue(quietMs),

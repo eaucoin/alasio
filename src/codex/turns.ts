@@ -21,7 +21,7 @@ import type { Turn, TurnOutcome } from "../persistence/turn-repository.ts";
 import { Store, type TurnFenced } from "../persistence/store.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import type { ChatId } from "../telegram/client.ts";
-import type { ReceivedFileError } from "../telegram/files.ts";
+import { ReceivedFileError } from "../telegram/files.ts";
 import { Outbox } from "../telegram/outbox.ts";
 import type { HarnessPanels } from "../harness/host.ts";
 import { Panels } from "../harness/panels.ts";
@@ -423,8 +423,12 @@ const makeTurns = Effect.fnUntraced(function*() {
     /** Whatever a job's turn failed with, the job fails with it and the operator is told why. */
     const failJob = Effect.fnUntraced(function*(job: PromptJob, error: unknown) {
       yield* store.failPromptJob(job.id, error);
-      const mount = yield* store.getMount(conversationId);
-      yield* outbox.enqueueText({ chatId: job.chat_id, text: `${harnessLabelOf(mount)} hit an error: ${errorText(error)}` }).pipe(Effect.ignore);
+      const label = harnessLabelOf(yield* store.getMount(conversationId));
+      // Its files not written where its harness reads them, as its turn's host started it: said so, as no error of the harness's.
+      const text = error instanceof ReceivedFileError
+        ? `The files this prompt carried could not be written where ${label} reads them, so its prompt was not run: ${errorText(error)}. Send it again.`
+        : `${label} hit an error: ${errorText(error)}`;
+      yield* outbox.enqueueText({ chatId: job.chat_id, text }).pipe(Effect.ignore);
     });
     while (!(yield* isBusy(conversationId))) {
       const job = yield* store.claimNextPromptJob(conversationId);

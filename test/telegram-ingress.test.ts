@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -15,7 +15,6 @@ import type { SessionSandboxes } from "../src/sandbox/index.ts";
 import { Store } from "../src/persistence/store.ts";
 import { NeonTelegramContentRepository } from "../src/persistence/telegram-content-repository.ts";
 import { TelegramTransportError } from "../src/telegram/client.ts";
-import { ReceivedFiles } from "../src/telegram/files.ts";
 import { handleMessage, TELEGRAM_BOT_FILE_LIMIT_BYTES } from "../src/telegram/message-handler.ts";
 import { consumeUpdates, TelegramUpdates, type UpdateFeed } from "../src/telegram/update-consumer.ts";
 import { newSchema, run, testPool, testStore } from "./support/store.ts";
@@ -70,7 +69,7 @@ test("Bot API download refusals are reported and a file-only message ends there"
   assert.equal(prompt, null);
 });
 
-test("a file a message carries is kept in the store, and written where its prompt names it, again once it is gone", async () => {
+test("a file a message carries is kept in the store, its prompt naming where its turn's host writes it, under the state directory, where alasio writes nothing", async () => {
   const store = await testStore();
   const stateDir = mkdtempSync(join(tmpdir(), "alasio-ingress-"));
   const content = Buffer.from("a photo");
@@ -89,18 +88,16 @@ test("a file a message carries is kept in the store, and written where its promp
       }, 3));
       const [file] = prompt?.files ?? [];
       assert.ok(file);
-      assert.deepEqual(readFileSync(file.path), content);
-      // alasio's state directory does not outlast its pod.
-      rmSync(join(stateDir, "telegram-files"), { recursive: true });
-      await alasio.runPromise(Effect.flatMap(ReceivedFiles, (files) => files.materialize([file.id], null)));
-      assert.deepEqual(readFileSync(file.path), content);
+      assert.equal(file.path, join(stateDir, "telegram-files", file.id, "photo.jpg"));
+      assert.deepEqual((await run(store.getFileContents([file.id]))).map(({ content: kept }) => Buffer.from(kept)), [content]);
+      assert.equal(existsSync(join(stateDir, "telegram-files")), false);
     });
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
 
-test("a file sent to a conversation on a session workspace is written into its session, under its home, through the session filesystems, and again before its prompt runs; none under alasio's state directory", async () => {
+test("a file sent to a conversation on a session workspace is kept, its prompt naming where its turn's host writes it, in its session, under its home; alasio writes it neither there nor under its state directory", async () => {
   const store = await testStore();
   const stateDir = mkdtempSync(join(tmpdir(), "alasio-ingress-"));
   const content = Buffer.from("a photo");
@@ -126,11 +123,8 @@ test("a file sent to a conversation on a session workspace is written into its s
       assert.ok(file);
       // Where the session's agent reads it, which its prompt names.
       assert.equal(file.path, `/home/agent/.alasio/received/${file.id}/photo.jpg`);
-      assert.deepEqual(written, [`fs-abc123 ${file.path} a photo`]);
+      assert.deepEqual(written, []);
       assert.equal(existsSync(join(stateDir, "telegram-files")), false);
-      // Written again as its prompt runs, as alasio cannot see what the session holds.
-      await alasio.runPromise(Effect.flatMap(ReceivedFiles, (files) => files.materialize([file.id], { kind: "sessionfs", volumeId: "fs-abc123" })));
-      assert.equal(written.length, 2);
     });
   } finally {
     rmSync(stateDir, { recursive: true, force: true });

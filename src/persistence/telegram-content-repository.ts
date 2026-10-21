@@ -191,16 +191,6 @@ export class NeonTelegramContentRepository {
     ).pipe(Effect.map(([row]) => row?.status === "pending"));
   }
 
-  /** Records that handling the album failed once more: how many times it has. */
-  recordMediaGroupFailure(mediaGroupId: string): Effect.Effect<number, StoreError> {
-    return this.#sql.query<{ failures: number }>(
-      `insert into ${this.#schema}.media_group_failures (media_group_id) values ($1)
-       on conflict (media_group_id) do update set failures = media_group_failures.failures + 1, failed_at = now()
-       returning failures`,
-      [mediaGroupId],
-    ).pipe(Effect.map(([row]) => row?.failures ?? 1));
-  }
-
   /**
    * Claims the album to be handled, marking it handled, where it is still waiting and none
    * of its messages was kept within `quietMs`: whether it did. Run in its chat's handling
