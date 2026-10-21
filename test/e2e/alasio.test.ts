@@ -3306,6 +3306,10 @@ async function seedLineage(): Promise<{ readonly store: string; readonly thread:
       }
       throw new Error(`no store keeps the rollout of ${thread}`);
     });
+  // Its turn's last line kept, as Codex writes none after it until the next turn: so 9.0.0's mirror saves the rollout no more, which would
+  // set its history_base again as its file says it, none.
+  await until(`${thread}'s turn complete in ${store}`, async () =>
+    (await onDatabase(NAMESPACE, `select count(*) from ${store}.rollout_chunks c join ${store}.rollouts r using (name) where r.thread_id = '${thread}' and position('"task_complete"' in convert_from(c.bytes, 'UTF8')) > 0`)) === "0" ? undefined : true, 120_000);
   const parent = randomUUID();
   const parentFile = `rollout-2026-01-01T00-00-00-${parent}.jsonl`;
   const meta = `${JSON.stringify({ timestamp: "2026-01-01T00:00:00.000Z", type: "session_meta", payload: { id: parent, timestamp: "2026-01-01T00:00:00.000Z", cwd: "/", source: "vscode" } })}\n`;
