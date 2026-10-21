@@ -173,7 +173,8 @@ for (const [reach, reached] of Object.entries(REACHES)) {
       // A rewind's fork, and a thread's goals, of the conversation's harness, through the host: of a harness with no goals, none.
       const of = { conversationId, harness: CODEX_HARNESS, workingDirectory: "/work" } as const;
       assert.equal(yield* host.forkSession({ ...of, sessionId: "session-1", beforeUuid: "turn-1" }), `fork of session-1 before turn-1 for ${conversationId}`);
-      assert.match((yield* Effect.flip(host.goals(of).read({ threadId: "session-1" }))).message, /has no goals/u);
+      // Said as the host says it, wherever it is: not as of the host's being reached again.
+      assert.equal((yield* Effect.flip(host.goals(of).read({ threadId: "session-1" }))).message, "The conversation's harness could not be reached: Codex has no goals");
     }));
     const [params] = seen;
     assert.ok(params);

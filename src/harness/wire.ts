@@ -17,7 +17,7 @@ import { TurnFenced } from "../persistence/store.ts";
 import { SessionFilesystemsDisabled } from "../sandbox/index.ts";
 import { ReceivedFileError } from "../telegram/files.ts";
 import type { TurnStart } from "./host.ts";
-import { FolderOnBranch, type HarnessUnavailable, NoWorkspaceMounted, type TurnResult, UnknownHarness } from "./index.ts";
+import { FolderOnBranch, HarnessHostError, type HarnessUnavailable, NoWorkspaceMounted, type TurnResult, UnknownHarness } from "./index.ts";
 import { HARNESS_NAMES } from "./names.ts";
 
 /** Where each of the host's calls is served, all of them POSTs, none where the sandbox gateway's front answers itself (../binder/server.ts answeredByFront). */
@@ -186,6 +186,7 @@ export const Failure = Schema.Struct({
     epoch: Schema.optionalKey(Schema.Number),
     name: Schema.optionalKey(Schema.String),
     branch: Schema.optionalKey(Schema.String),
+    reason: Schema.optionalKey(Schema.String),
   }),
 });
 
@@ -201,11 +202,12 @@ export function failureOf(error: { readonly _tag: string; readonly message: stri
   if (error instanceof TurnFenced) return { error: { ...said, threadKey: error.threadKey, epoch: error.epoch } };
   if (error instanceof UnknownHarness) return { error: { ...said, name: error.name } };
   if (error instanceof FolderOnBranch) return { error: { ...said, branch: error.branch } };
+  if (error instanceof HarnessHostError) return { error: { ...said, reason: error.reason } };
   return { error: said };
 }
 
 /** The error of the host's an answer names, as the host failed with it; null for one that crosses only as its message. */
-export function crossingErrorOf({ error }: typeof Failure.Type): CrossingError | null {
+export function crossingErrorOf({ error }: typeof Failure.Type): CrossingError | HarnessHostError | null {
   switch (error._tag) {
     case "StoreError":
       return new StoreError({ cause: new Error(error.message) });
@@ -221,6 +223,9 @@ export function crossingErrorOf({ error }: typeof Failure.Type): CrossingError |
       return new NoWorkspaceMounted();
     case "SessionFilesystemsDisabled":
       return new SessionFilesystemsDisabled();
+    // Its harness not reached in the host, as of a harness elsewhere, or with no goals: said as the host said it, not as of the host's being reached.
+    case "HarnessHostError":
+      return error.reason !== undefined ? new HarnessHostError({ reason: error.reason }) : null;
     default:
       return null;
   }
