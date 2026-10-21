@@ -51,6 +51,19 @@ export interface BranchEnvironment {
 /** How alasio talks to Codex: through `codex exec` or a Codex app-server. */
 export type CodexTransportMode = "exec" | "app-server";
 
+/**
+ * alasio's own variables: its configuration and its secrets, as its deployment gives them
+ * (cli/src/manifests/alasio.ts alasioEnv), the bot's token and the sandbox gateway's caller key
+ * among them, which would let whatever a harness runs speak as alasio or mint a caller's token
+ * of any key of its environment. None is a harness's to have (withoutAlasio).
+ */
+const ALASIO_VARIABLE = /^(?:ALASIO_|TELEGRAM_)|^WORKING_DIRECTORY$/u;
+
+/** An environment without alasio's own variables (ALASIO_VARIABLE): what a harness's process, and all it runs, is given of alasio's. */
+export function withoutAlasio(env: Readonly<NodeJS.ProcessEnv>): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([name]) => !ALASIO_VARIABLE.test(name)));
+}
+
 function requireEnv(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key];
   if (!value) {
