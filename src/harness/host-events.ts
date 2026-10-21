@@ -69,12 +69,18 @@ export class HarnessEvents extends Context.Service<HarnessEvents, {
       yield* (yield* EventsConsumer).handle({
         "harness.background-response": (event) => told({ kind: "background-response", conversationId: event.subject.key }),
         "harness.idle": (event) => told({ kind: "idle", conversationId: event.subject.key }),
-        // A binding let go of, released or lost, lets go of its conversation too: what waited on it, as its host was drained, runs, bound anew.
-        "harness.lost": (event) =>
+        // A binding let go of, released or lost, lets go of its conversation too: what waited on it,
+        // as its host was drained, runs, bound anew; and its grant reaches nothing from then on.
+        "harness.lost": (event, writes) =>
           Effect.logWarning(`${event.subject.key}'s harness's binding was lost, its pod ${event.pod} gone while it was bound (${event.reason}): its next turn binds it anew`).pipe(
+            Effect.andThen(writes.revokeHarnessGrant(event.subject.key, event.binding)),
             Effect.andThen(told({ kind: "idle", conversationId: event.subject.key })),
           ),
-        "harness.released": (event) => Effect.andThen(Effect.logInfo(`${event.subject.key}'s harness was released (${event.reason})`), told({ kind: "idle", conversationId: event.subject.key })),
+        "harness.released": (event, writes) =>
+          Effect.logInfo(`${event.subject.key}'s harness was released (${event.reason})`).pipe(
+            Effect.andThen(writes.revokeHarnessGrant(event.subject.key, event.binding)),
+            Effect.andThen(told({ kind: "idle", conversationId: event.subject.key })),
+          ),
       }, Deferred.await(listened));
       return HarnessEvents.of({ subscribe: PubSub.subscribe(heard).pipe(Effect.tap(() => Deferred.succeed(listened, undefined))) });
     }),

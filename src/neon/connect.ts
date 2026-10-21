@@ -4,9 +4,8 @@
  *
  * It makes the analytics lake's role and catalog database either way (./lake.ts), and
  * with the lake on (ALASIO_LAKE_ENABLED) grants the lake its reads; with it off, it
- * revokes them. It makes the harness host's role (./harness.ts) either way, granted the
- * transcripts' and rollouts' stores (alasio's state grants it its part as the store opens,
- * ../persistence/harness-grants.ts). It makes the lake reader's role (./lake.ts) and Grafana's role and
+ * revokes them. It makes the harness host's role (./harness.ts) either way, which alasio's
+ * state grants its part as the store opens (../persistence/harness-grants.ts). It makes the lake reader's role (./lake.ts) and Grafana's role and
  * database (./grafana.ts) when the deployment gives their verifiers, as it does while
  * they run. It sets each role's password to the SCRAM verifier the deployment gives, the
  * one neon-control answers Neon's proxy with, and never sees a password.
@@ -23,7 +22,8 @@ import { hearingConnections } from "../persistence/sql.ts";
 import { withLogScope } from "../shared/log.ts";
 import { withAlasioSpan } from "../telemetry/index.ts";
 import { ensureGrafanaRole } from "./grafana.ts";
-import { ensureHarnessRole, syncHarnessStores } from "./harness.ts";
+import { GrantedPool } from "./granted-pool.ts";
+import { ensureHarnessRole } from "./harness.ts";
 import { ensureLakeReaderRole, ensureLakeRole, lakeEnabled, syncLakeReads } from "./lake.ts";
 import { LakeWake } from "./lake-wake.ts";
 
@@ -138,9 +138,9 @@ const writtenOn = (pool: Pool, wake: LakeWake["Service"]): (() => void) => () =>
     return row.lsn;
   });
 
-/** A pool of connections to `databaseUrl`, whose idle connections lost are said with `onIdleError`. */
-function poolOf(databaseUrl: Redacted.Redacted, onIdleError: (error: Error) => void): Pool {
-  const pool = new pg.Pool({
+/** A pool of connections to `databaseUrl`, as `make` makes one, whose idle connections lost are said with `onIdleError`. */
+function poolOf<P extends Pool>(databaseUrl: Redacted.Redacted, onIdleError: (error: Error) => void, make: (config: pg.PoolConfig) => P): P {
+  const pool = make({
     connectionString: Redacted.value(databaseUrl),
     max: 8,
     idleTimeoutMillis: 30_000,
@@ -164,7 +164,7 @@ const openNeon = Effect.fnUntraced(function*(
   onIdleError: (error: Error) => void,
   wake: LakeWake["Service"],
 ): Effect.fn.Return<OpenNeon, NeonUnavailable> {
-  const pool = poolOf(databaseUrl, onIdleError);
+  const pool = poolOf(databaseUrl, onIdleError, (config) => new pg.Pool(config));
   const written = writtenOn(pool, wake);
   const sessionStore = new NeonSessionStore(pool, { written });
   const rollouts = new NeonRolloutStore(pool, { written });
@@ -174,7 +174,6 @@ const openNeon = Effect.fnUntraced(function*(
     await ensureLakeRole(pool, Redacted.value(lakeVerifier));
     await syncLakeReads(pool, lake);
     await ensureHarnessRole(pool, Redacted.value(harnessVerifier));
-    await syncHarnessStores(pool);
     if (Option.isSome(lakeReaderVerifier)) await ensureLakeReaderRole(pool, Redacted.value(lakeReaderVerifier.value));
     if (Option.isSome(grafanaVerifier)) await ensureGrafanaRole(pool, Redacted.value(databaseUrl), Redacted.value(grafanaVerifier.value));
   }).pipe(
@@ -231,9 +230,8 @@ const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope | LakeWak
     sessionFsRollouts: onNeon(async () => {
       const store = new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA, written: writtenOn(pool, wake) });
       await store.ensureSchema();
-      // The analytics lake loads this home too, once it may read it, and the harness host writes it.
+      // The analytics lake loads this home too, once it may read it.
       await syncLakeReads(pool, lake);
-      await syncHarnessStores(pool);
       return store;
     }),
   };
@@ -245,8 +243,13 @@ const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope | LakeWak
  * files, and `lake` says whether the analytics lake runs.
  */
 export class Neon extends Context.Service<Neon, ConnectedNeon>()("alasio/neon/Neon", { make: connectNeon }) {}
-/** The harness host's connection to alasio's Neon: its pool, and the stores of Claude Code's transcripts and Codex's rollouts, which alasio made. */
+/**
+ * The harness host's connection to alasio's Neon: its pool, its connections carrying the
+ * grant last given it (./granted-pool.ts), and the stores of Claude Code's transcripts and
+ * Codex's rollouts, which alasio made.
+ */
 export interface HarnessNeonStores extends OpenNeon {
+  readonly pool: GrantedPool;
   /** The session-filesystem Codex home's rollout store. */
   readonly sessionFsRollouts: NeonRolloutStore;
 }
@@ -254,14 +257,15 @@ export interface HarnessNeonStores extends OpenNeon {
 /**
  * Connects to the Neon the deployment provides as the harness host's role
  * (`ALASIO_DATABASE_URL`, or its `_FILE` form), until the scope closes, waiting for it as
- * alasio does; it makes nothing there, which alasio has made, and may not.
+ * alasio does; it makes nothing there, which alasio has made, and may not. Until its pool is
+ * given a grant, it reaches nothing there but the server.
  */
 const connectHarnessNeon: Effect.Effect<HarnessNeonStores, NeonError, Scope.Scope | LakeWake> = Effect.gen(function*() {
   const databaseUrl = yield* deploymentSecret("ALASIO_DATABASE_URL");
   const wake = yield* LakeWake;
   const runFork = yield* FiberSet.makeRuntime();
   const pool = yield* Effect.acquireRelease(
-    Effect.sync(() => poolOf(databaseUrl, (error) => void runFork(Effect.logWarning(`idle database connection lost: ${error.message}`)))),
+    Effect.sync(() => poolOf(databaseUrl, (error) => void runFork(Effect.logWarning(`idle database connection lost: ${error.message}`)), (config) => new GrantedPool(config))),
     (made) => Effect.promise(() => made.end()),
   );
   yield* onNeon(() => pool.query("select 1")).pipe(

@@ -19,6 +19,7 @@ import { CodexAppServer } from "../src/codex/app-server/client.ts";
 import { answeredByFront } from "../src/binder/server.ts";
 import { type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 import { poolLoginKey } from "../src/codex/login-relay.ts";
+import { GRANT_HEADER, grantDigest, grantKey, harnessGrant } from "../src/harness/grant.ts";
 import { HarnessHost, type TurnCodex, type TurnStart } from "../src/harness/host.ts";
 import { BusyPods } from "../src/kube/busy.ts";
 import { Harnesses } from "../src/harness/index.ts";
@@ -30,7 +31,7 @@ import { type FolderBaymaScope, HostBayma } from "../src/mcp/bayma.ts";
 import { Store } from "../src/persistence/store.ts";
 import { SessionSandboxes } from "../src/sandbox/index.ts";
 import { sessionFsWorkspace } from "../src/workspace/kind.ts";
-import { run, testStore } from "./support/store.ts";
+import { newSchema, run, testPool, testStore } from "./support/store.ts";
 
 const CALLER_KEY = Buffer.from("the environment's key");
 
@@ -69,20 +70,21 @@ function podHost(started: TurnStart[], { renewed = [], turnMs = 0 }: { readonly 
 }
 
 /**
- * A stand-in for the front: the claims of each call's token, and whether it bound nothing, as
- * it was asked; a bind asked ahead (POST /bind) answered each of `refusals` in turn, as one
+ * A stand-in for the front: the claims of each call's token, whether it bound nothing, and the
+ * grant it gave the pod, as it was asked; a bind asked ahead (POST /bind) answered each of `refusals` in turn, as one
  * the front cannot make yet or holds is, then its binding, binding the conversation; a call that binds
  * nothing answered 409 `{ bound: false }` until the conversation is bound, as a call that binds
  * does; the rest passed on to the host at `podPort`; `onBind` run as each bind is asked.
  */
-async function front(podPort: number, { refusals = [], onBind = () => {} }: { readonly refusals?: readonly object[]; readonly onBind?: () => void } = {}): Promise<{ url: string; asked: { claims: TokenClaims | null; bindsNothing: boolean; path: string }[]; close: () => void }> {
-  const asked: { claims: TokenClaims | null; bindsNothing: boolean; path: string }[] = [];
+async function front(podPort: number, { refusals = [], onBind = () => {} }: { readonly refusals?: readonly object[]; readonly onBind?: () => void } = {}): Promise<{ url: string; asked: { claims: TokenClaims | null; bindsNothing: boolean; path: string; grant: string | undefined }[]; close: () => void }> {
+  const asked: { claims: TokenClaims | null; bindsNothing: boolean; path: string; grant: string | undefined }[] = [];
   const refusing = [...refusals];
   let bound = false;
   const server = createServer((incoming, outgoing) => {
     const claims = verifyToken(CALLER_KEY, String(incoming.headers.authorization).slice("Bearer ".length), Date.now());
     const bindsNothing = incoming.headers[NO_BIND_HEADER] === "never";
-    asked.push({ claims, bindsNothing, path: incoming.url ?? "" });
+    const grant = incoming.headers[GRANT_HEADER];
+    asked.push({ claims, bindsNothing, path: incoming.url ?? "", grant: typeof grant === "string" ? grant : undefined });
     if (!claims) return void outgoing.writeHead(401, { "content-type": "application/json" }).end(JSON.stringify({ error: "no caller's token" }));
     if (incoming.method === "POST" && incoming.url === "/bind") {
       incoming.resume();
@@ -127,7 +129,8 @@ const codexAppServer = Layer.succeed(CodexAppServer, {
 const harnesses = Harnesses.of({ names: HARNESS_NAMES, getFor: () => Effect.die("no harness of alasio's runs a turn"), forMount: () => Effect.succeedNone, requireForMount: () => Effect.die("no harness of alasio's runs a turn") });
 
 test("alasio reaches each conversation's pooled host through the front, a token minted per call as its mount places it now, binding nothing of what only reads a binding, and gives each turn its workspace's bayma", async () => {
-  const store = await testStore();
+  const schema = newSchema();
+  const store = await testStore({ schema });
   const conversationId = await run(store.upsertConversation({ chatId: "41", user: { id: 41 } }));
   const started: TurnStart[] = [];
   const scope = Effect.runSync(Scope.make());
@@ -193,6 +196,19 @@ test("alasio reaches each conversation's pooled host through the front, a token 
       assert.equal(verifyToken(CALLER_KEY, codex?.login.token ?? "", Date.now()), null, "a relay token is no caller's");
       assert.deepEqual(codex?.home, { "config.toml": 'model = "gpt-5"\n', "AGENTS.md": "Be brief.\n", "skills/review/SKILL.md": "Review it.\n" });
       assert.equal(stand.asked.findLast(({ path }) => path === HOST_PATHS.turns)?.bindsNothing, false);
+      // The pod given the grant of the binding its bind answered with, by its reservation and its turn, and by no call that binds nothing; alasio keeping its digest as the conversation's.
+      const grant = harnessGrant(grantKey(CALLER_KEY), conversationId, "binding-1");
+      assert.deepEqual(stand.asked.map(({ path, grant }) => [path, grant]), [
+        ...[HOST_PATHS.status, HOST_PATHS.backgroundWork, HOST_PATHS.steer, HOST_PATHS.interrupt].map((path) => [path, undefined]),
+        ["/bind", undefined],
+        [HOST_PATHS.reserve, grant],
+        [HOST_PATHS.turns, grant],
+        [HOST_PATHS.release, grant],
+      ]);
+      assert.deepEqual((await (await testPool()).query(`select binding, secret_sha256 as digest from ${schema}.harness_grants where conversation_id = $1`, [conversationId])).rows, [{ binding: "binding-1", digest: grantDigest(grant) }]);
+      // A fresh session is bound ahead too, so its pod has the grant as its harness makes it.
+      assert.equal(await Effect.runPromise(host.startFreshSession({ conversationId, harness: CODEX_HARNESS, workingDirectory: "/work" })), "thread-2");
+      assert.deepEqual(stand.asked.slice(-2).map(({ path, grant }) => [path, grant]), [["/bind", undefined], [HOST_PATHS.freshSession, grant]]);
       // Bound, what reads it is passed on to its host.
       assert.deepEqual(await Effect.runPromise(host.status(conversationId)), { busy: true, running: true, cliInitiated: false, held: false, idleSince: null });
       assert.equal(await Effect.runPromise(host.backgroundWork(conversationId)), true);

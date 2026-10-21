@@ -4,7 +4,7 @@
  * group (EventsConsumer): each heard once, however often it is delivered, its reply to deliver
  * and its letting go of the conversation passed on to the turns, none read before they listen;
  * what the sandbox gateway tells of its bindings let go of, released or lost, said in alasio's
- * log and passed on to the turns as their conversations' letting go.
+ * log, the binding's grant deleted, and passed on to the turns as their conversations' letting go.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -14,15 +14,24 @@ import { Context, Effect, Exit, Layer, Option, PubSub, Scope } from "effect";
 
 import { EnvironmentEvents, EventsConsumer } from "../src/events/consume.ts";
 import { eventRecord, type EventInput } from "../src/events/events.ts";
+import { grantDigest } from "../src/harness/grant.ts";
 import { HarnessEvents, type HostEvent } from "../src/harness/host-events.ts";
 import { Store } from "../src/persistence/store.ts";
-import { testStore } from "./support/store.ts";
+import { newSchema, testPool, testStore } from "./support/store.ts";
 import { memoryTopic } from "./support/topics.ts";
 
 const ofConversation = (kind: "harness.background-response" | "harness.idle"): EventInput => ({ kind, environment: "main", source: "harness", subject: { kind: "conversation", key: "telegram:7" } });
 
-test("a pool's pod's events are heard once each, however often delivered, and passed on to the turns; the gateway's, of bindings released or lost, free their conversations", async () => {
-  const store = await testStore();
+test("a pool's pod's events are heard once each, however often delivered, and passed on to the turns; the gateway's, of bindings released or lost, free their conversations and end their grants", async () => {
+  const schema = newSchema();
+  const store = await testStore({ schema });
+  // The grants of the bindings let go of, as alasio kept them as it bound them.
+  for (const [chatId, binding] of [["7", "binding-1"], ["8", "binding-2"]] as const) {
+    const conversationId = await Effect.runPromise(store.upsertConversation({ chatId, user: { id: Number(chatId) } }));
+    await Effect.runPromise(store.issueHarnessGrant(conversationId, binding, grantDigest(`grant-${binding}`)));
+  }
+  const grants = async () => (await (await testPool()).query(`select conversation_id, binding from ${schema}.harness_grants order by 1`)).rows;
+  assert.deepEqual(await grants(), [{ conversation_id: "telegram:7", binding: "binding-1" }, { conversation_id: "telegram:8", binding: "binding-2" }]);
   const reply = eventRecord(ofConversation("harness.background-response"), 1, "00000000-0000-4000-8000-000000000001").value;
   const idle = eventRecord(ofConversation("harness.idle"), 2, "00000000-0000-4000-8000-000000000002").value;
   const released = eventRecord(
@@ -58,6 +67,7 @@ test("a pool's pod's events are heard once each, however often delivered, and pa
       null,
     ]);
     for (const deadline = Date.now() + 15_000; topic.committed() < 6; await sleep(20)) assert.ok(Date.now() < deadline, `${topic.committed()} of 6 told`);
+    assert.deepEqual(await grants(), []);
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
   }

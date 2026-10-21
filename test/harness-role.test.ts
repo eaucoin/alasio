@@ -22,8 +22,10 @@ import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { HarnessHost } from "../src/harness/host.ts";
 import { HostEvents } from "../src/harness/host-events.ts";
 import { type Harness, Harnesses, type OwnTurns, type TurnResult } from "../src/harness/index.ts";
+import { grantDigest, grantKey, harnessGrant } from "../src/harness/grant.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { Neon } from "../src/neon/connect.ts";
+import { GrantedPool } from "../src/neon/granted-pool.ts";
 import { LakeWake } from "../src/neon/lake-wake.ts";
 import { Store } from "../src/persistence/store.ts";
 import { ReceivedFiles } from "../src/telegram/files.ts";
@@ -92,7 +94,8 @@ test("a turn run through the harness host as its own role writes all a turn writ
     Object.assign(url, { username: user, password, pathname: "/alasio" });
     return url.toString();
   };
-  const harnessPool = new pg.Pool({ connectionString: as(HARNESS_ROLE, "harness-password") });
+  // As a pool's pod reaches it: by the grant of its conversation's binding, which alasio keeps.
+  const harnessPool = new GrantedPool({ connectionString: as(HARNESS_ROLE, "harness-password") });
   // Where the host writes the files a prompt names, as its harness reads them.
   const stateDir = mkdtempSync(join(tmpdir(), "alasio-harness-role-"));
   try {
@@ -104,6 +107,9 @@ test("a turn run through the harness host as its own role writes all a turn writ
       // alasio's store, which makes the state and grants the role its part.
       const alasio = Context.get(yield* Layer.build(Store.layer({ pool: neon.pool, harnessRole: HARNESS_ROLE })), Store);
       const conversationId = yield* alasio.upsertConversation({ chatId: "41", user: { id: 41 } });
+      const grant = harnessGrant(grantKey(Buffer.from("the environment's key")), conversationId, "binding-1");
+      yield* alasio.issueHarnessGrant(conversationId, "binding-1", grantDigest(grant));
+      harnessPool.grant(grant);
       yield* alasio.setActiveHarness(conversationId, CODEX_HARNESS);
       yield* alasio.setWorkingDirectory(conversationId, "/work");
       const messageId = yield* alasio.insertMessage({ conversationId, direction: "in", kind: "file", transportMessageId: 10, text: "go" });

@@ -5,6 +5,7 @@ import type { ListedSession } from "../harness/claude/sessions.ts";
 import { HarnessHost } from "../harness/host.ts";
 import { shownBusy, stopTurnSaying } from "../harness/commands.ts";
 import type { Harness, HarnessError, HarnessUnavailable, NoServiceMounted } from "../harness/index.ts";
+import { CLAUDE_HARNESS } from "../harness/names.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
@@ -14,7 +15,16 @@ import { type ButtonDraft, type ControlCallback, type ControlPanel, closePanel, 
 import { truncateText } from "./text.ts";
 
 /** The mounted harness, as the session panels list, rewind, and resume its sessions. */
-export type SessionControlHarness = Pick<Harness, "displayName" | "sessions">;
+export type SessionControlHarness = Pick<Harness, "name" | "displayName" | "sessions">;
+
+/**
+ * Mounts `forkedId`, a rewind's fork of a session of the conversation's: Claude Code's, which
+ * alasio made of its session store (../harness/claude/sessions.ts), given the conversation as its
+ * operator's; Codex's, which the conversation's pod made (HarnessHost.forkSession), whose id is the
+ * pod's word, set as any session a pod names is (Store.setSessionId).
+ */
+export const mountFork = (harness: Pick<Harness, "name">, conversationId: string, forkedId: string): Effect.Effect<void, StoreError, Store> =>
+  Effect.flatMap(Store, (store) => (harness.name === CLAUDE_HARNESS ? store.mountGivenSession(conversationId, forkedId) : store.setSessionId(conversationId, forkedId)));
 
 /** How starting a new session from a panel fails. */
 export type NewSessionError = NoServiceMounted | HarnessUnavailable | ConversationBusy | HarnessError | StoreError;
@@ -364,7 +374,8 @@ export const handleSessionControlCallback = Effect.fnUntraced(function*({
   } else if (kind === "preview" && payloadSessionId !== undefined) {
     panel = yield* buildSessionPreviewPanel({ harness, conversationId, sessionId: payloadSessionId, page: payload["page"] });
   } else if (kind === "mount" && payloadSessionId !== undefined) {
-    yield* store.setSessionId(conversationId, payloadSessionId);
+    // The operator's choice of a session of the panel's, another conversation's among them: given the conversation.
+    yield* store.mountGivenSession(conversationId, payloadSessionId);
     notice = "Mounted.";
     panel = yield* current;
   } else if (kind === "rewind") {
@@ -381,9 +392,11 @@ export const handleSessionControlCallback = Effect.fnUntraced(function*({
     const index = numberField(payload, "index");
     const messages = yield* harness.sessions.listSessionMessages(payloadSessionId);
     const target = messages.find((message) => message.index === index);
+    // The session forked, the operator's choice of the panel's, given the conversation first, so its pod reaches it to fork it.
+    if (target) yield* store.giveSession(conversationId, payloadSessionId);
     const forkedId = target ? yield* harness.sessions.createForkedSession(payloadSessionId, target.uuid, { threadKey: conversationId }) : null;
     if (forkedId) {
-      yield* store.setSessionId(conversationId, forkedId);
+      yield* mountFork(harness, conversationId, forkedId);
       notice = "Fork mounted.";
       panel = yield* current;
     } else {

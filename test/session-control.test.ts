@@ -5,6 +5,7 @@ import { Effect } from "effect";
 
 import type { Turns } from "../src/codex/turns.ts";
 import type { HarnessSessions } from "../src/harness/index.ts";
+import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { parseCommand } from "../src/operator/command-parser.ts";
 import { type SessionControlHarness, handleSessionControlCallback } from "../src/operator/session-control.ts";
 import type { Store } from "../src/persistence/store.ts";
@@ -49,6 +50,7 @@ async function withSessionControls<T>(
 
 function createHarness(sessions: Partial<HarnessSessions> = {}): SessionControlHarness {
   return {
+    name: CODEX_HARNESS,
     displayName: "Codex",
     sessions: {
       listSessions: () => assert.fail("listSessions"),

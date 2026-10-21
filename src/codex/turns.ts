@@ -630,7 +630,8 @@ const makeTurns = Effect.fnUntraced(function*() {
       if (held) {
         return true;
       }
-      yield* store.setSessionId(conversationId, sessionId);
+      // The thread of the operator's choice, of its goals' panel: given the conversation.
+      yield* store.mountGivenSession(conversationId, sessionId);
       const mount = yield* store.getMount(conversationId);
       yield* runDirect(runSessionTurn(mount, {
         conversationId,

@@ -16,7 +16,9 @@
  * nothing runs in, its status as `unbound` says. What the front refuses itself, a token or a
  * bind, fails as the host's not being reached, saying what it said. Each call carries the trace
  * context of the span it is made in (traceCarrier), so what the host does for it, its turn and
- * its harness's calls among it, joins the caller's trace.
+ * its harness's calls among it, joins the caller's trace; and, where its options give one, the
+ * grant of the binding its caller bound (GRANT_HEADER, ./grant.ts), which a pool's pod reaches
+ * its conversation's rows by from then on.
  *
  * Its events are not heard here: it tells them as its HostEvents says (./host-events.ts), on
  * the log, where the control plane hears them. The operator's panels are reached where the
@@ -27,6 +29,7 @@ import { Effect, Layer, Option, Schema } from "effect";
 import { NO_BIND_HEADER } from "../binder/names.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { traceCarrier } from "../telemetry/index.ts";
+import { GRANT_HEADER } from "./grant.ts";
 import { HarnessHost, type HarnessStatus } from "./host.ts";
 import { HarnessHostError } from "./index.ts";
 import {
@@ -57,6 +60,8 @@ export interface RemoteHostOptions {
   readonly panels: HarnessHost["Service"]["panels"];
   /** Where it is reached through the sandbox gateway's front: the status of a conversation bound nowhere, as the module says; none where the host is reached itself. */
   readonly unbound?: ((conversationId: string) => Effect.Effect<HarnessStatus, StoreError | HarnessHostError>) | undefined;
+  /** The grant of the binding the caller bound the host's conversation's harness to, which each call gives the host; none where the caller bound none. */
+  readonly grant?: string | undefined;
 }
 
 /** What the front answers of a call that binds nothing, of a key bound nowhere. */
@@ -99,7 +104,7 @@ function linesOf(body: ReadableStream<Uint8Array>, what: string): { readonly nex
 }
 
 /** The harness host at `url`, as the module says. */
-export function remoteHost({ url, token, panels, unbound }: RemoteHostOptions): HarnessHost["Service"] {
+export function remoteHost({ url, token, panels, unbound, grant }: RemoteHostOptions): HarnessHost["Service"] {
   /** The host's answer to `path` with `body`, binding nothing where `bindsNothing`: its status and what it said, or a HarnessHostError where it was not reached. */
   const post = (path: string, body: object, { signal, bindsNothing = false }: { readonly signal?: AbortSignal; readonly bindsNothing?: boolean } = {}) =>
     Effect.flatMap(Effect.all([token, Effect.sync(traceCarrier)]), ([bearer, trace]) =>
@@ -107,7 +112,13 @@ export function remoteHost({ url, token, panels, unbound }: RemoteHostOptions): 
         try: (interrupted) =>
           fetch(`${url}${path}`, {
             method: "POST",
-            headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json", ...trace, ...(bindsNothing && unbound ? { [NO_BIND_HEADER]: "never" } : {}) },
+            headers: {
+              authorization: `Bearer ${bearer}`,
+              "content-type": "application/json",
+              ...trace,
+              ...(bindsNothing && unbound ? { [NO_BIND_HEADER]: "never" } : {}),
+              ...(grant === undefined ? {} : { [GRANT_HEADER]: grant }),
+            },
             body: JSON.stringify(body),
             signal: signal ?? interrupted,
           }),

@@ -35,6 +35,7 @@ import { type KeptPress, NeonPressRepository, type NewKeptPress } from "./press-
 import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState } from "./prompt-job-repository.ts";
 import { type CompletedResponse, NeonResponseRepository, type ResponseBlock } from "./response-repository.ts";
 import { NeonRestartRepository, type NewRestartEvent, type RestartEvent } from "./restart-repository.ts";
+import { NeonHarnessGrantRepository } from "./harness-grant-repository.ts";
 import { grantHarness } from "./harness-grants.ts";
 import { ensureSchema } from "./schema.ts";
 import { type NewSessionWorkspace, NeonSessionWorkspaceRepository, type SessionWorkspace, type SessionWorkspaceNetMode } from "./session-workspace-repository.ts";
@@ -139,6 +140,7 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
   presses: new NeonPressRepository(sql, schema),
   events: new NeonEventRepository(sql, schema),
   forks: new NeonForkRepository(sql, schema),
+  harnessGrants: new NeonHarnessGrantRepository(sql, schema),
 });
 
 /** The record of bot_state that says when the store was last pruned (Store pruneTransientIfDue). */
@@ -187,6 +189,8 @@ export interface EventWrites {
   readonly enqueuePromptJob: (job: NewPromptJob) => Stored<PromptJob>;
   /** Records the answer this alasio's parent gave its request `request` to fork `volumeId` for it (src/branch/fork.ts), unless it was already. */
   readonly recordForkAnswer: (request: string, volumeId: string, answer: ForkAnswer) => Stored<void>;
+  /** Deletes the grant of the conversation's harness pool pod where it is of `binding`, let go of (Store.issueHarnessGrant). */
+  readonly revokeHarnessGrant: (conversationId: string, binding: string) => Stored<void>;
 }
 
 /**
@@ -264,8 +268,20 @@ export class Store extends Context.Service<Store, {
   readonly getModelChoice: (conversationId: string, harness: HarnessName) => Stored<ModelChoice | null>;
   readonly setModelChoice: (conversationId: string, harness: HarnessName, choice: NewModelChoice) => Stored<void>;
   readonly clearModelChoice: (conversationId: string, harness: HarnessName) => Stored<void>;
-  /** Sets the session of the conversation's mounted harness. */
+  /**
+   * Sets the session of the conversation's mounted harness: one it has, or one no conversation
+   * has, which it has from then on, as of a session a pod made for it; another conversation's,
+   * or one the stores kept before any row named it, refused, as a pod may say any session's id.
+   */
   readonly setSessionId: (conversationId: string, sessionId: string | null) => Stored<void>;
+  /**
+   * Gives the conversation `sessionId`, whoever has it, with the Codex threads its history starts
+   * in, as its operator chose it: a session of a folder's panel resumed, or a fork alasio made of
+   * its own (setSessionId refuses what this alone gives).
+   */
+  readonly giveSession: (conversationId: string, sessionId: string) => Stored<void>;
+  /** Gives the conversation `sessionId` (giveSession) and sets it as its mounted harness's session, at once. */
+  readonly mountGivenSession: (conversationId: string, sessionId: string) => Stored<void>;
 
   /** Records a session filesystem before it is made, not yet made. */
   readonly recordSessionWorkspace: (workspace: NewSessionWorkspace) => Stored<void>;
@@ -349,6 +365,13 @@ export class Store extends Context.Service<Store, {
   readonly isConversationHeld: (conversationId: string) => Stored<boolean>;
   /** Lets go of the holds of `holder`; of every hold, for null. */
   readonly releaseHolds: (holder: string | null) => Stored<void>;
+  /**
+   * Keeps `digest` as the grant of the conversation's harness pool pod (../harness/grant.ts),
+   * of its binding `binding`, which the harness host's role reaches the conversation's rows by
+   * from then on, until the binding is let go of (revokeHarnessGrant), whatever other binding of
+   * the conversation's harness is made meanwhile.
+   */
+  readonly issueHarnessGrant: (conversationId: string, binding: string, digest: Buffer) => Stored<void>;
 
   /** Lets go of a response, as delivered or never to be. */
   readonly markPendingAsPosted: (pendingResponseId: string) => Stored<void>;
@@ -509,7 +532,7 @@ const makeStore = Effect.fnUntraced(function*({
   /** `notice` queued to the conversation, recorded as told, on the transaction's repositories `on`, unless it was told already: whether it was queued now. */
   const noticeOn = (on: ReturnType<typeof repositoriesOn>, conversationId: string, notice: NewOutboxText): Stored<boolean> =>
     Effect.flatMap(on.outbox.recordNotice(conversationId, notice.text), (fresh) => (fresh ? Effect.as(on.outbox.enqueueText(notice), true) : Effect.succeed(false)));
-  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin, sessionWorkspaces, presses, events, forks } = repositoriesOn(database);
+  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin, sessionWorkspaces, presses, events, forks, harnessGrants } = repositoriesOn(database);
 
   const pruneTransient = (age: Duration.Input): Stored<void> => {
     const ageMs = Duration.toMillis(age);
@@ -532,6 +555,12 @@ const makeStore = Effect.fnUntraced(function*({
     setModelChoice: (conversationId, harness, choice) => conversations.setModelChoice(conversationId, harness, choice),
     clearModelChoice: (conversationId, harness) => conversations.clearModelChoice(conversationId, harness),
     setSessionId: (conversationId, sessionId) => conversations.setSessionId(conversationId, sessionId),
+    giveSession: (conversationId, sessionId) => conversations.giveSession(conversationId, sessionId),
+    mountGivenSession: (conversationId, sessionId) =>
+      database.transaction((sql) => {
+        const on = repositoriesOn(sql);
+        return Effect.andThen(on.conversations.giveSession(conversationId, sessionId), on.conversations.setSessionId(conversationId, sessionId));
+      }),
 
     recordSessionWorkspace: (workspace) => sessionWorkspaces.record(workspace),
     markSessionWorkspaceMade: (volumeId, netMode) => sessionWorkspaces.markMade(volumeId, netMode),
@@ -628,6 +657,7 @@ const makeStore = Effect.fnUntraced(function*({
     },
     renewHolds: (holder, ttlMs) => turns.renew(holder, ttlMs),
     releaseHolds: (holder) => turns.release(holder),
+    issueHarnessGrant: (conversationId, binding, digest) => harnessGrants.issue(conversationId, binding, digest),
     isConversationHeld: (conversationId) => turns.isHeld(conversationId),
 
     markPendingAsPosted: (pendingResponseId) => Effect.asVoid(responses.markPendingAsPosted(pendingResponseId)),
@@ -723,6 +753,7 @@ const makeStore = Effect.fnUntraced(function*({
                 enqueueOutboxNotice: (conversationId, notice) => noticeOn(on, conversationId, notice),
                 enqueuePromptJob: (job) => on.promptJobs.enqueue(job),
                 recordForkAnswer: (request, volumeId, answer) => on.forks.recordAnswer(request, volumeId, answer),
+                revokeHarnessGrant: (conversationId, binding) => on.harnessGrants.revoke(conversationId, binding),
               }),
               Option.some,
             )

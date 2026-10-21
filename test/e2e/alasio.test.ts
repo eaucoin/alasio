@@ -3358,8 +3358,8 @@ if (inShard("agents")) {
       const bound = await harnessPod();
       assert.equal(bound.metadata?.labels?.["alasio.dev/pool"], "harness-codex");
       assert.match(bound.metadata?.annotations?.["alasio.dev/binding-key"] ?? "", /^harness:telegram:/u);
-      // Its host started free, and bound the conversation once its binding was beside it.
-      assert.match(await kube.logs(NAMESPACE, bound.metadata?.name ?? "", "harness"), /bound telegram:\S+: wrote back \d+ Codex rollout file\(s\)/u);
+      // Its host started free, bound the conversation once its binding was beside it, and reached its rows once the turn's first call gave it their grant.
+      assert.match(await kube.logs(NAMESPACE, bound.metadata?.name ?? "", "harness"), /granted telegram:\S+'s rows: wrote back \d+ Codex rollout file\(s\)/u);
       await tg.say("again");
       await tg.waitFor((call) => answered(call));
       assert.equal((await harnessPod()).metadata?.uid, bound.metadata?.uid);

@@ -16,7 +16,7 @@ import { handleGoalTextCommand } from "./goal-control.ts";
 import { sendModelPanel } from "./model-control.ts";
 import type { Mounts } from "./mounts.ts";
 import { handleServiceTextCommand, sendChooseServicePanel } from "./service-control.ts";
-import { type NewSessionError, sendCurrentSessionPanel, sendSessionsPanel } from "./session-control.ts";
+import { mountFork, type NewSessionError, sendCurrentSessionPanel, sendSessionsPanel } from "./session-control.ts";
 import { formatRewindForTelegram, formatSessionsForTelegram } from "./session-replies.ts";
 import { truncateText } from "./text.ts";
 import { handleWorkspaceTextCommand, sendChooseWorkspacePanel } from "./workspace-control.ts";
@@ -159,7 +159,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
       yield* client.sendMessage(chatId, "Failed to create forked session.");
       return true;
     }
-    yield* store.setSessionId(conversationId, forkedId);
+    yield* mountFork(harness, conversationId, forkedId);
     yield* client.sendMessage(chatId, `Rewound to before message ${cmd.index}:\n\n${truncateText(target.text, 700)}\n\nReady to continue from earlier state.`);
     return true;
   }
@@ -175,7 +175,8 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     } else {
       resolvedSessionId = cmd.ref;
     }
-    yield* store.setSessionId(conversationId, resolvedSessionId);
+    // The operator's choice, another conversation's session of the folder's among them: given the conversation.
+    yield* store.mountGivenSession(conversationId, resolvedSessionId);
     if (cmd.followUp) {
       yield* turns.run({ conversationId, chatId, messageId, prompt: cmd.followUp });
       return true;

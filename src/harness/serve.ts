@@ -12,13 +12,16 @@
  * caller that is gone does. `GET /healthz` answers 200 to anyone once it serves, as a harness
  * pool's pod is ready only once bound. A call that carries a trace context is served in a span
  * of it, its turn and its harness's calls within it, so they join its caller's trace; one that
- * carries none, as the sandbox gateway's asking whether the host is idle, is in no trace.
+ * carries none, as the sandbox gateway's asking whether the host is idle, is in no trace. A call
+ * that gives a grant (GRANT_HEADER, ./grant.ts), as alasio's of a binding it bound do, has it
+ * taken first (`granted`), and is answered once it is: a pool's pod's host reaches its
+ * conversation's rows by it from then on.
  */
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 
 import { NodeHttpServer } from "@effect/platform-node";
-import { Deferred, Effect, Fiber, Option, Schema, type Scope, Stream } from "effect";
+import { Deferred, Effect, Fiber, Option, Result, Schema, type Scope, Stream } from "effect";
 import { HttpMiddleware, type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import type { StoreError } from "../persistence/sql.ts";
@@ -26,6 +29,7 @@ import type { TurnFenced } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken, sameToken } from "../shared/tokens.ts";
 import type { ReceivedFileError } from "../telegram/files.ts";
+import { GRANT_HEADER, isGrant } from "./grant.ts";
 import { HarnessHost, type TurnStart } from "./host.ts";
 import type { HarnessUnavailable, TurnResult } from "./index.ts";
 import {
@@ -54,12 +58,18 @@ import {
   TurnStartRequest,
 } from "./wire.ts";
 
-/** What serveHost is given: where it listens, the conversation it serves, the token its caller bears, and how often a call that lasts says so (KEEP_ALIVE_MS unless a test says). */
+/**
+ * What serveHost is given: where it listens, the conversation it serves, the token its caller
+ * bears, what takes the grant a call gives (none where nothing does, as a host that reaches its
+ * state as no pool's pod), and how often a call that lasts says so (KEEP_ALIVE_MS unless a test
+ * says).
+ */
 export interface HostServerOptions {
   readonly port: number;
   readonly host?: string | undefined;
   readonly conversationId: string;
   readonly token: string;
+  readonly granted?: ((grant: string) => Effect.Effect<void, { readonly message: string }>) | undefined;
   readonly keepAliveMs?: number | undefined;
 }
 
@@ -87,7 +97,7 @@ const lines = <A, E>(values: Stream.Stream<A, E>, keepAliveMs: number): HttpServ
  * port it listens on, once it does.
  */
 export const serveHost = Effect.fnUntraced(function*(
-  { port, host: hostname = "0.0.0.0", conversationId, token, keepAliveMs = KEEP_ALIVE_MS }: HostServerOptions,
+  { port, host: hostname = "0.0.0.0", conversationId, token, granted, keepAliveMs = KEEP_ALIVE_MS }: HostServerOptions,
 ): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope | HarnessHost> {
   const host = yield* HarnessHost;
   const scope = yield* Effect.scope;
@@ -216,6 +226,14 @@ export const serveHost = Effect.fnUntraced(function*(
     if (request.method === "GET" && request.url === "/healthz") return answer(200, { ok: true });
     const bearer = Schema.decodeUnknownOption(BearerToken)(request.headers["authorization"]);
     if (Option.isNone(bearer) || !sameToken(bearer.value[1], token)) return failed(401, { _tag: "Unauthorized", message: "the request bears no token of this host's" });
+    const grant = request.headers[GRANT_HEADER];
+    if (grant !== undefined) {
+      if (!isGrant(grant)) return failed(400, { _tag: "BadRequest", message: "its grant is none alasio makes" });
+      if (granted) {
+        const taken = yield* Effect.result(granted(grant));
+        if (Result.isFailure(taken)) return failed(503, { _tag: "GrantNotTaken", message: `its grant could not be taken: ${taken.failure.message}` });
+      }
+    }
     return yield* route(request.method, new URL(request.url, "http://host").pathname).pipe(Effect.catch(Effect.succeed));
   }).pipe(withLogScope("harness-host"));
 

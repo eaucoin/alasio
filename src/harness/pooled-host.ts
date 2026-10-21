@@ -13,7 +13,9 @@
  * a turn is about to start, asked again while the front cannot bind it yet, as a pod slow to
  * serve after its node started again is, what it waits on told the reservation's caller, who
  * says it in the turn's status message; then holds it at its host. A turn and a fresh session
- * reach the pod bound then. Each turn is given its workspace's bayma as alasio brings it up, as
+ * reach the pod bound then, given the binding's grant (./grant.ts), kept as the conversation's
+ * as it is bound, which the pod reaches the conversation's rows by and no other's. Each turn
+ * is given its workspace's bayma as alasio brings it up, as
  * the host there has no key to (TurnStart.bayma): a session's, brought up as it is in alasio's
  * process, a branch's inherited session forked first; a folder instance's, bound, what a long
  * bind of it waits on said in the turn's status, its chat told of a bind that failed. Its
@@ -44,12 +46,14 @@ import { poolLoginKey } from "../codex/login-relay.ts";
 import { harnessKey } from "../gateway/names.ts";
 import { BusyPods } from "../kube/busy.ts";
 import { HostBayma } from "../mcp/bayma.ts";
+import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { BIND_WAIT_MS, TOKEN_TTL_MS } from "../sandbox/gateway-client.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { HarnessHost, type TurnBayma, type TurnCodex, type TurnStart } from "./host.ts";
 import { Harnesses, HarnessHostError } from "./index.ts";
+import { grantDigest, grantKey, harnessGrant } from "./grant.ts";
 import { CODEX_HARNESS, type HarnessName } from "./names.ts";
 import { remoteHost } from "./remote-host.ts";
 
@@ -110,8 +114,15 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin }: P
       /** A conversation bound nowhere: nothing runs in it, since ever, and a hold of the store's keeps it as it would anywhere. */
       const unbound = (conversationId: string) =>
         Effect.map(store.isConversationHeld(conversationId), (held) => ({ busy: held, running: false, cliInitiated: false, held, idleSince: 0 }));
-      /** The conversation's host, its calls bearing `token`. */
-      const hostBy = (token: Effect.Effect<string, HarnessHostError>) => remoteHost({ url, token, panels: harnesses.forMount, unbound });
+      /** The conversation's host, its calls bearing `token`, and giving `grant`, the binding's the caller bound, where it bound one. */
+      const hostBy = (token: Effect.Effect<string, HarnessHostError>, grant?: string) => remoteHost({ url, token, panels: harnesses.forMount, unbound, grant });
+      const grantsKey = grantKey(callerKey);
+      /** The grant of the binding `held` of the conversation's harness, kept as the conversation's, as the module says. */
+      const grantOf = (conversationId: string, held: HeldTo): string => harnessGrant(grantsKey, conversationId, held.binding);
+      const granted = (conversationId: string, held: HeldTo): Effect.Effect<string, StoreError> => {
+        const grant = grantOf(conversationId, held);
+        return Effect.as(store.issueHarnessGrant(conversationId, held.binding, grantDigest(grant)), grant);
+      };
       /**
        * `call` of the conversation's host, as its mount places it now, given its token's making;
        * or, where it has no harness in a workspace, so that nothing is bound for it, what `none`
@@ -215,10 +226,10 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin }: P
         // held to: by a reservation the host made alone, and let go of by that one alone, so a
         // reservation refused, as another holds the conversation, leaves the other's as it is.
         reserve: (conversationId, waiting = () => Effect.void) =>
-          onHost(conversationId, (host, token) =>
+          onHost(conversationId, (_host, token) =>
             Effect.gen(function*() {
               const held = yield* boundAhead(conversationId, token, waiting);
-              const made = yield* host.reserve(conversationId);
+              const made = yield* hostBy(token, yield* granted(conversationId, held)).reserve(conversationId);
               if (made) {
                 yield* Effect.acquireRelease(Effect.sync(() => void reserved.set(conversationId, held)), () =>
                   Effect.sync(() => {
@@ -234,7 +245,7 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin }: P
             if (!held) return yield* new HarnessHostError({ reason: `a turn of ${start.conversationId} was started with its harness reserved for none` });
             const bayma = yield* baymaOf(start, held);
             const codex = yield* codexOf(start);
-            const host = hostBy(tokenOf(start.conversationId, start.harness, start.workingDirectory));
+            const host = hostBy(tokenOf(start.conversationId, start.harness, start.workingDirectory), grantOf(start.conversationId, held));
             if (codex) yield* Effect.forkScoped(renewing(host, start));
             return yield* host.startTurn({ ...start, bayma, codex });
           }).pipe(Effect.scoped),
@@ -250,7 +261,14 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin }: P
           onHost(conversationId, (host) => host.renewCodexLogin(conversationId, login), Effect.void).pipe(
             Effect.catchTag("StoreError", (error) => Effect.fail(new HarnessHostError({ reason: error.message }))),
           ),
-        startFreshSession: (params) => hostBy(tokenOf(params.conversationId, params.harness, params.workingDirectory)).startFreshSession(params),
+        // Bound ahead first, as a reservation is, so the pod is given its grant, as what its harness makes of a fresh session it may keep at once.
+        startFreshSession: (params) =>
+          Effect.gen(function*() {
+            const token = tokenOf(params.conversationId, params.harness, params.workingDirectory);
+            const held = yield* boundAhead(params.conversationId, token, () => Effect.void);
+            const grant = yield* granted(params.conversationId, held).pipe(Effect.mapError((error) => new HarnessHostError({ reason: `its grant could not be kept: ${error.message}` })));
+            return yield* hostBy(token, grant).startFreshSession(params);
+          }),
         panels: harnesses.forMount,
       });
     }),

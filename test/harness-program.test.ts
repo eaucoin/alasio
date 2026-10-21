@@ -1,9 +1,9 @@
 /**
  * `alasio harness` (src/harness/program.ts, src/harness/serve.ts): one conversation's
- * harness host, run apart from alasio as the harness host's role. As it binds, it writes
- * back the Codex rollouts the conversation's session needs from Neon; then it serves the
- * host over HTTP, as src/harness/wire.ts says, to the bearer of its token alone. A test
- * file of its own, as the role is the server's.
+ * harness host, run apart from alasio as the harness host's role. Bound, it serves the host
+ * over HTTP, as src/harness/wire.ts says, to the bearer of its token alone; given its grant,
+ * it writes back the Codex rollouts the conversation's session needs from Neon, and reaches
+ * the conversation's rows by it. A test file of its own, as the role is the server's.
  */
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -18,6 +18,7 @@ import { HARNESS_ROLE } from "../neon/control/secrets.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
 import { makeCodexRollouts } from "../src/codex/rollouts/index.ts";
 import { Events, type EventInput } from "../src/events/events.ts";
+import { GRANT_HEADER, grantDigest, grantKey, harnessGrant } from "../src/harness/grant.ts";
 import { type Harness, type TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { awaitBinding, loadHarnessConfig, startHarness } from "../src/harness/program.ts";
@@ -113,7 +114,7 @@ function linesOf(response: Response): { readonly next: () => Promise<unknown> } 
   };
 }
 
-test("alasio harness binds its conversation, writing back the rollouts its Codex session needs, and serves its host to the bearer of its token", { timeout: 120_000 }, async () => {
+test("alasio harness binds its conversation and serves its host to the bearer of its token; given its grant, it writes back the rollouts its Codex session needs and reaches the conversation's rows", { timeout: 120_000 }, async () => {
   const database = await startPostgres();
   /** `database`'s server, as `user`, in alasio's database. */
   const as = (user: string, password: string) => {
@@ -132,7 +133,7 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
   try {
     await run(database.url, "create role alasio login password 'alasio-password' createrole createdb", "create database alasio owner alasio");
     // alasio: its state made, the conversation mounted on a folder with Codex, its session one an earlier instance's home kept the rollout of.
-    const { alasio, conversationId } = await inScope(Effect.gen(function*() {
+    const { alasio, conversationId, grant } = await inScope(Effect.gen(function*() {
       const neon = yield* Effect.provide(Neon.make, neonEnv(as("alasio", "alasio-password")));
       const alasio = Context.get(yield* Layer.build(Store.layer({ pool: neon.pool, harnessRole: HARNESS_ROLE })), Store);
       const conversationId = yield* alasio.upsertConversation({ chatId: "41", user: { id: 41 } });
@@ -142,7 +143,10 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
       mkdirSync(join(earlier!, "sessions/2026/09/28"), { recursive: true });
       writeFileSync(join(earlier!, ROLLOUT), ROLLOUT_TEXT);
       yield* Effect.scoped(Effect.flatMap(makeCodexRollouts({ store: neon.rollouts, home: earlier! }), (kept) => kept.flush(THREAD)));
-      return { alasio, conversationId };
+      // The grant of the binding its pod is bound by, as alasio keeps it as it binds it ahead.
+      const grant = harnessGrant(grantKey(Buffer.from("the environment's key")), conversationId, "binding-1");
+      yield* alasio.issueHarnessGrant(conversationId, "binding-1", grantDigest(grant));
+      return { alasio, conversationId, grant };
     }).pipe(Effect.provideService(LakeWake, LakeWake.none)));
 
     let held: Held | null = null;
@@ -168,11 +172,14 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
     // Its pod's binding served once: a host started again in it, as its container restarted, binds it no more.
     const again = await Effect.runPromise(Effect.flip(Effect.scoped(startHarness({ bindingFile, port: 0, stateDir: stateDir!, branch: null, lakeWake: null, gatewayUrl: null }))).pipe(Effect.provideService(Events, telling)));
     assert.equal((again as { readonly _tag?: string })._tag, "BindingServed");
-    // Bound: the conversation's session's rollout written back, whole, where Codex reads it.
-    assert.equal(readFileSync(join(home!, ROLLOUT), "utf8"), ROLLOUT_TEXT);
 
-    const call = (path: string, body: object | null, { token = "harness-token", signal }: { readonly token?: string; readonly signal?: AbortSignal } = {}) =>
-      fetch(`http://127.0.0.1:${port}${path}`, { method: body === null ? "GET" : "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, ...(body === null ? {} : { body: JSON.stringify(body) }), ...(signal ? { signal } : {}) });
+    const call = (path: string, body: object | null, { token = "harness-token", signal, granting }: { readonly token?: string; readonly signal?: AbortSignal; readonly granting?: string } = {}) =>
+      fetch(`http://127.0.0.1:${port}${path}`, {
+        method: body === null ? "GET" : "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...(granting === undefined ? {} : { [GRANT_HEADER]: granting }) },
+        ...(body === null ? {} : { body: JSON.stringify(body) }),
+        ...(signal ? { signal } : {}),
+      });
     const answered = async (path: string, body: object, options?: Parameters<typeof call>[2]) => {
       const response = await call(path, body, options);
       return { status: response.status, body: await response.json() as Readonly<Record<string, unknown>> };
@@ -181,10 +188,20 @@ test("alasio harness binds its conversation, writing back the rollouts its Codex
     // Its token's bearer alone, of its conversation alone.
     assert.equal((await answered(HOST_PATHS.status, { conversationId }, { token: "forged" })).status, 401);
     assert.deepEqual(await answered(HOST_PATHS.status, { conversationId: "telegram:42" }), { status: 404, body: { error: { _tag: "OtherConversation", message: `this host serves ${conversationId}, not telegram:42` } } });
+    // Bound, but given no grant yet: it reaches none of the conversation's rows, and writes back nothing, a hold of the conversation's unseen.
+    const holder = await Effect.runPromise(alasio.holdConversations([conversationId], "forking session fs-a into fs-b", 60_000));
+    assert.ok(holder);
+    assert.deepEqual([(await answered(HOST_PATHS.status, { conversationId })).body["busy"], (await answered(HOST_PATHS.status, { conversationId })).body["held"]], [false, false]);
+    assert.equal(existsSync(join(home!, ROLLOUT)), false, "a host given no grant writes back nothing");
+    // A grant none of alasio's makes is refused; the binding's, the first call that gives it is answered once it is taken, the conversation's session's rollout written back, whole, where Codex reads it.
+    assert.equal((await answered(HOST_PATHS.status, { conversationId }, { granting: "forged" })).status, 400);
+    assert.deepEqual([(await answered(HOST_PATHS.status, { conversationId }, { granting: grant })).body["held"]], [true]);
+    assert.equal(readFileSync(join(home!, ROLLOUT), "utf8"), ROLLOUT_TEXT);
+    await Effect.runPromise(alasio.releaseHolds(holder));
     assert.deepEqual([(await answered(HOST_PATHS.status, { conversationId })).body["busy"], (await answered(HOST_PATHS.status, { conversationId })).body["held"]], [false, false]);
 
     // Held by one holder at a time, until it releases the hold: let go of by the time it is answered.
-    const reservation = linesOf(await call(HOST_PATHS.reserve, { conversationId }));
+    const reservation = linesOf(await call(HOST_PATHS.reserve, { conversationId }, { granting: grant }));
     const hold = await reservation.next() as { readonly held: boolean; readonly id: string };
     assert.equal(hold.held, true);
     assert.equal((await answered(HOST_PATHS.status, { conversationId })).body["busy"], true);

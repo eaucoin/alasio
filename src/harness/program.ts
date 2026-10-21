@@ -22,7 +22,10 @@
  * state its last start lost. The gateway, finding the pod gone or broken, binds the
  * conversation anew in another.
  *
- * As it binds the conversation, before it serves: its Codex home's rollouts are kept in
+ * It reaches alasio's Neon as its role, but sees nothing of it until alasio's first call of the
+ * binding gives it its grant (../harness/grant.ts), which every connection of its pool carries
+ * from then on (../neon/granted-pool.ts), reaching the conversation's rows alone. As it takes
+ * the first, before it answers the call: its Codex home's rollouts are kept in
  * Neon (../codex/rollouts/index.ts), and those the conversation's Codex session needs
  * written back from there, so the session resumes where its last instance left it. Claude
  * Code's transcript is written back as its session is resumed, as alasio's harness writes
@@ -42,7 +45,7 @@
 import { access, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { Clock, Context, Duration, Effect, Layer, Result, Schema, type Scope } from "effect";
+import { Clock, Context, Duration, Effect, Layer, Result, Schema, type Scope, Semaphore } from "effect";
 
 import { MAIN_ENVIRONMENT_NAME } from "../branch/names.ts";
 import { CodexAppServer, makeAppServer } from "../codex/app-server/client.ts";
@@ -192,10 +195,20 @@ export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, s
   const codexRollouts = yield* CodexRollouts.make({ store: neon.rollouts, home: codexHome() });
   // Its session workspaces' Codex's, from a home of their own, where it serves them, as alasio's are.
   const sessionFsCodexRollouts = config.gatewayUrl ? yield* SessionFsCodexRollouts.make({ store: neon.sessionFsRollouts, home: sessionFsCodexHome(config.stateDir) }) : null;
-  const conversation = yield* store.getConversation(conversationId);
-  const rollouts = isSessionFs(conversation?.working_directory) ? sessionFsCodexRollouts : codexRollouts;
-  const written = rollouts ? yield* rollouts.restore(conversation?.codex_session_id ? [conversation.codex_session_id] : []) : [];
-  yield* Effect.logInfo(`bound ${conversationId}: wrote back ${written.length} Codex rollout file(s)`);
+  /** Whether the conversation's Codex session's rollouts were written back, as the first grant was taken. */
+  let restored = false;
+  const taking = yield* Semaphore.make(1);
+  /** `grant` taken, as the module says: every connection's from now on, and, the first, the rollouts written back. */
+  const granted = (grant: string) =>
+    Effect.gen(function*() {
+      neon.pool.grant(grant);
+      if (restored) return;
+      const conversation = yield* store.getConversation(conversationId);
+      const rollouts = isSessionFs(conversation?.working_directory) ? sessionFsCodexRollouts : codexRollouts;
+      const written = rollouts ? yield* rollouts.restore(conversation?.codex_session_id ? [conversation.codex_session_id] : []) : [];
+      restored = true;
+      yield* Effect.logInfo(`granted ${conversationId}'s rows: wrote back ${written.length} Codex rollout file(s)`);
+    }).pipe(Semaphore.withPermit(taking));
 
   const environment = config.branch ?? MAIN_ENVIRONMENT_NAME;
   // Its turns' workspaces' bayma, as they give it, through the gateway, where it has one.
@@ -227,7 +240,7 @@ export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, s
       renewCodexLogin: (_conversationId, renewed) => login.renew(renewed),
     })
     : host;
-  const served = yield* Effect.provideService(serveHost({ port: config.port, conversationId, token }), HarnessHost, giving);
+  const served = yield* Effect.provideService(serveHost({ port: config.port, conversationId, token, granted }), HarnessHost, giving);
   yield* Effect.logInfo(`serving the harness host of ${conversationId} on port ${served.port}`);
   return served;
 });

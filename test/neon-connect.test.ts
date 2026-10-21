@@ -107,7 +107,7 @@ describe("Neon, answering", () => {
   const harnessWrites = async (table: string) =>
     (await admin.query<{ writes: boolean }>("select has_table_privilege('harness', $1, 'select, insert, update, delete') as writes", [table])).rows[0]?.writes;
 
-  test("connects from the deployment's files, makes what alasio keeps, the harness host's role granted its stores, and ends its pool as its scope closes", async () => {
+  test("connects from the deployment's files, makes what alasio keeps, the harness host's role granted nothing of its stores until alasio's state grants it its part, and ends its pool as its scope closes", async () => {
     assert.ok(database && secrets, "set up before the tests");
     const urlFile = join(secrets, "database-url");
     writeFileSync(urlFile, `${database.url}\n`);
@@ -123,13 +123,13 @@ describe("Neon, answering", () => {
           "codex_sessions.rollouts",
         ]);
         assert.equal(yield* Effect.promise(() => lakeReads("codex_sessions.rollouts")), true);
-        // The harness host reads and writes every table of the transcripts' and rollouts' stores.
-        for (const table of yield* Effect.promise(tables)) assert.equal(yield* Effect.promise(() => harnessWrites(table)), true, table);
-        // The session-filesystem home's store, made when asked for, readable by the lake and the harness host's.
+        // The harness host's role reaches none of the transcripts' and rollouts' stores: what it may, of its own conversation's sessions, alasio's state grants it (test/harness-isolation.test.ts).
+        for (const table of yield* Effect.promise(tables)) assert.equal(yield* Effect.promise(() => harnessWrites(table)), false, table);
+        // The session-filesystem home's store, made when asked for, readable by the lake.
         const sessionFs = yield* neon.sessionFsRollouts;
         assert.deepEqual(yield* Effect.promise(() => sessionFs.list()), []);
         assert.equal(yield* Effect.promise(() => lakeReads("codex_sessionfs_sessions.rollouts")), true);
-        assert.equal(yield* Effect.promise(() => harnessWrites("codex_sessionfs_sessions.rollouts")), true);
+        assert.equal(yield* Effect.promise(() => harnessWrites("codex_sessionfs_sessions.rollouts")), false);
         assert.equal(neon.pool.ended, false);
         return neon.pool;
       })

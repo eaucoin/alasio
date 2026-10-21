@@ -299,11 +299,21 @@ export class NeonConversationRepository {
     ));
   }
 
-  /** Sets the session of the conversation's mounted harness; with none mounted, nothing changes. */
+  /**
+   * Sets the session of the conversation's mounted harness; with none mounted, nothing changes.
+   * Refused, failing, where it is a session the conversation may not name (./schema.ts
+   * session_claimed): another conversation's, or one the stores kept before any row named it,
+   * which only giveSession gives it.
+   */
   setSessionId(conversationId: string, sessionId: string | null): Effect.Effect<void, StoreError> {
     return Effect.asVoid(this.#sql.query(
       `update ${this.#schema}.conversations set ${assignSession("active_harness", "$2")}, updated_at = now() where id = $1`,
       [conversationId, sessionId],
     ));
+  }
+
+  /** Gives the conversation `sessionId`, whoever has it, with the Codex threads its history starts in, as its operator chose it (./schema.ts give_session). */
+  giveSession(conversationId: string, sessionId: string): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(`select ${this.#schema}.give_session($2, $1)`, [conversationId, sessionId]));
   }
 }
