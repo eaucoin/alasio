@@ -122,11 +122,18 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
     )),
     Layer.provideMerge(eventsConsumer(options)),
     Layer.provideMerge(Layer.mergeAll(
-      Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory, branch: options.branch?.name, harnessRole: options.harnessRole }),
+      stateStore(options),
       TelegramClient.layer(options.telegramBotToken),
     )),
   )));
 }
+
+/**
+ * alasio's store, its state made as it opens: its tables, a branch's state its own, and the
+ * harness host's grants; as alasio starts, and as `alasio setup` makes it before (./setup/program.ts).
+ */
+export const stateStore = (options: Pick<AlasioOptions, "pool" | "stateSchema" | "workingDirectory" | "branch" | "harnessRole">): Layer.Layer<Store, StoreError> =>
+  Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory, branch: options.branch?.name, harnessRole: options.harnessRole });
 
 /**
  * The one member of the environment's events' group every part of alasio adds its handling

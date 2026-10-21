@@ -27,3 +27,11 @@ export function runAlasio<E>(program: Effect.Effect<void, E, Scope.Scope>): void
     NodeRuntime.runMain({ disableErrorReporting: true, teardown }),
   );
 }
+
+/** Runs `program` as alasio's process, as runAlasio does, but to its end: its process exits once it has, what it acquired released, 0 where it succeeded. */
+export function runAlasioOnce<E>(program: Effect.Effect<void, E, Scope.Scope>): void {
+  Effect.scoped(program).pipe(
+    Effect.provide([AlasioLoggerLayer, TracingLayer]),
+    NodeRuntime.runMain({ disableErrorReporting: true, teardown }),
+  );
+}
