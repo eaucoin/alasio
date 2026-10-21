@@ -35,18 +35,19 @@ import type { Made } from "./session-volumes.ts";
  * Deployment's; and the port each takes them on.
  */
 const STORES: readonly Store[] = [
-  { name: VALKEY, kind: "StatefulSet", port: 6379 },
+  { name: VALKEY, kind: "StatefulSet", port: 6379, server: "valkey" },
   { name: GATEWAY, kind: "Deployment", port: 8333 },
   { name: FILER, kind: "StatefulSet", port: 8888 },
   { name: VOLUME_SERVER, kind: "StatefulSet", port: 8080 },
-  { name: FILER_STORE, kind: "StatefulSet", port: 6379 },
+  { name: FILER_STORE, kind: "StatefulSet", port: 6379, server: "valkey" },
 ];
 
-/** A workload of the stack's a workspace's data goes through, or might: its name, its kind, and a port it takes connections on. */
+/** A workload of the stack's a workspace's data goes through, or might: its name, its kind, a port it takes connections on, and the container whose log says how it started again, where one does. */
 interface Store {
   readonly name: string;
   readonly kind: "StatefulSet" | "Deployment";
   readonly port: number;
+  readonly server?: string;
 }
 
 /** What a session must not reach: every store, and the object store's masters, which its writes go through to none of. */
@@ -138,6 +139,18 @@ for (let i = 0; Date.now() < end; i++) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
   }
 }`;
+
+/** Node, in a session: of each file argv[2...] of the directory argv[1], whether it is there, its size and its first bytes, as JSON. */
+const SEEN = `const fs = require("node:fs");
+const [dir, ...names] = process.argv.slice(1);
+console.log(JSON.stringify(names.map((name) => {
+  try {
+    const held = fs.readFileSync(dir + "/" + name);
+    return { name, size: held.length, starts: held.subarray(0, 16).toString("latin1") };
+  } catch (error) {
+    return { name, error: String(error) };
+  }
+})));`;
 
 /** Node, in a session: the names of the files in the directory argv[1] that hold what WRITER wrote, as JSON. */
 const WRITTEN = `const fs = require("node:fs");
@@ -439,7 +452,12 @@ export function workspaceStorage(): void {
         const written = (await writing).trim().split("\n").filter(Boolean);
         assert.ok(written.length > 0, "nothing was written");
         const kept = new Set<string>(JSON.parse(await kube.execOk(SESSIONS, pod, ["node", "-e", WRITTEN, dir], { container: "bayma" })));
-        assert.deepEqual(written.filter((file) => !kept.has(file)), []);
+        const lost = written.filter((file) => !kept.has(file));
+        if (lost.length > 0) {
+          const seen = await kube.execOk(SESSIONS, pod, ["node", "-e", SEEN, dir, ...lost], { container: "bayma" });
+          const started = store.server ? await kube.logs(NAMESPACE, await podOfStore(store), store.server) : "";
+          assert.fail(`the files ${lost.join(", ")}, written, were lost: ${seen}\n${store.name} as it started again:\n${started}`);
+        }
         assert.equal(await fixtureDigest(none), fixture);
       });
     }
