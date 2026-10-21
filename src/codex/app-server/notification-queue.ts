@@ -1,4 +1,4 @@
-import { Clock, type Duration, Effect, PubSub, Queue, type Scope, Semaphore } from "effect";
+import { type Duration, Effect, PubSub, Queue, type Scope, Semaphore } from "effect";
 
 import { type AppServerNotification, getNotificationTurnId, itemIds, type NotificationIds } from "./protocol.ts";
 
@@ -9,15 +9,6 @@ interface ThreadTurn {
   preferredId: string | null;
   readonly ids: Set<string>;
   completed: boolean;
-}
-
-/**
- * A thread loaded in the app-server: the conversations it is loaded for, by their thread
- * keys, and when it was loaded with the config it has, or, one found loaded, first found so.
- */
-interface LoadedThread {
-  readonly keys: Set<string>;
-  loadedAt: number;
 }
 
 /** A thread's turn, now known by `turnId`, which a wait for the thread's turn id is told of. */
@@ -66,21 +57,16 @@ export interface AppServerNotifications {
   readonly forgetTurn: (threadId: string) => Effect.Effect<void>;
   /** Drops the thread's queued notifications of turns other than `turnId`'s; how many it dropped. */
   readonly discardStaleForTurn: (threadId: string, turnId: string | null | undefined) => Effect.Effect<number>;
-  /** Records that `threadId` was loaded now for the conversation `threadKey`, with the config given now (started, resumed or forked). */
-  readonly recordLoad: (threadKey: string, threadId: string) => Effect.Effect<void>;
   /**
-   * Records that `threadId`, found loaded, is loaded for the conversation `threadKey` too: one
-   * of the threads its background work is asked of; its config's time counted from now where
-   * the app-server loaded it unasked.
+   * Records that `threadId`, started, resumed or forked, or found loaded, is loaded for the
+   * conversation `threadKey`: one of the threads its background work is asked of.
    */
   readonly recordThread: (threadKey: string, threadId: string) => Effect.Effect<void>;
-  /** When `threadId` was loaded with the config it has (recordLoad), or first found loaded (recordThread); null where it is not recorded. */
-  readonly loadedAt: (threadId: string) => Effect.Effect<number | null>;
-  /** The threads loaded for the conversation `threadKey` (recordLoad, recordThread). */
+  /** The threads loaded for the conversation `threadKey` (recordThread). */
   readonly threadsOf: (threadKey: string) => Effect.Effect<ReadonlyArray<string>>;
-  /** Forgets `threadId`, loaded for the conversation `threadKey`, as the app-server has it no more: for every conversation, with when it was loaded. */
+  /** Forgets `threadId`, loaded for the conversation `threadKey`, as the app-server has it no more: for every conversation. */
   readonly forgetThread: (threadKey: string, threadId: string) => Effect.Effect<void>;
-  /** Forgets every thread's turn and queued notifications, and the threads loaded, with when, as the app-server they were of is gone. */
+  /** Forgets every thread's turn and queued notifications, and the threads loaded, as the app-server they were of is gone. */
   readonly clear: Effect.Effect<void>;
   /** The threads with a turn running, each with the turn's id: what stopping the app-server ends. */
   readonly runningTurns: Effect.Effect<ReadonlyArray<{ readonly threadId: string; readonly turnId: string }>>;
@@ -94,13 +80,8 @@ export interface AppServerNotifications {
  */
 export const makeAppServerNotifications: Effect.Effect<AppServerNotifications, never, Scope.Scope> = Effect.gen(function*() {
   const turnByThread = new Map<string, ThreadTurn>();
-  // The threads loaded, by their ids: one record of each, its conversations and its load.
-  const loadedThreads = new Map<string, LoadedThread>();
-  const recordOf = (threadId: string, now: number): LoadedThread => {
-    const record = loadedThreads.get(threadId) ?? { keys: new Set<string>(), loadedAt: now };
-    loadedThreads.set(threadId, record);
-    return record;
-  };
+  // The threads loaded, by their ids, each with the conversations it is loaded for, by their thread keys.
+  const loadedThreads = new Map<string, Set<string>>();
   let queues = new Map<string, Queue.Queue<AppServerNotification>>();
   const remembered = yield* Effect.acquireRelease(PubSub.unbounded<RememberedTurn>(), PubSub.shutdown);
   // A queue is added to, or sorted through, by one fiber at a time, so its order holds.
@@ -228,16 +209,12 @@ export const makeAppServerNotifications: Effect.Effect<AppServerNotifications, n
       return discarded;
     }),
 
-    recordLoad: (threadKey, threadId) =>
-      Effect.flatMap(Clock.currentTimeMillis, (now) =>
-        Effect.sync(() => {
-          const record = recordOf(threadId, now);
-          record.keys.add(threadKey);
-          record.loadedAt = now;
-        })),
-    recordThread: (threadKey, threadId) => Effect.flatMap(Clock.currentTimeMillis, (now) => Effect.sync(() => void recordOf(threadId, now).keys.add(threadKey))),
-    loadedAt: (threadId) => Effect.sync(() => loadedThreads.get(threadId)?.loadedAt ?? null),
-    threadsOf: (threadKey) => Effect.sync(() => [...loadedThreads].flatMap(([threadId, { keys }]) => (keys.has(threadKey) ? [threadId] : []))),
+    recordThread: (threadKey, threadId) =>
+      Effect.sync(() => {
+        const keys = loadedThreads.get(threadId) ?? new Set<string>();
+        loadedThreads.set(threadId, keys.add(threadKey));
+      }),
+    threadsOf: (threadKey) => Effect.sync(() => [...loadedThreads].flatMap(([threadId, keys]) => (keys.has(threadKey) ? [threadId] : []))),
     forgetThread: (_threadKey, threadId) => Effect.sync(() => void loadedThreads.delete(threadId)),
 
     clear: Effect.sync(() => {

@@ -9,7 +9,7 @@
 import { type Server, type Socket, connect, createServer } from "node:net";
 import { createInterface } from "node:readline";
 
-import type { McpServerConfig, McpSetServersResult, Options, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Options, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import type { ClaudeQueryFactory } from "../../src/harness/claude/runtime.ts";
 import { type StampedPrompt, stamped } from "./claude-sdk.ts";
@@ -88,8 +88,6 @@ export function bridgedQueryFactory(socketPath: string): ClaudeQueryFactory {
       close: (): void => {
         socket.end();
       },
-      // Each server given anew taken, as Claude Code takes them.
-      setMcpServers: async (servers: Record<string, McpServerConfig>): Promise<McpSetServersResult> => ({ added: Object.keys(servers), removed: [], errors: {} }),
     });
   };
 }

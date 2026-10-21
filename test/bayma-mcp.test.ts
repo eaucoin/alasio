@@ -7,12 +7,21 @@ import { Effect, Layer } from "effect";
 import { buildCodexThreadConfig, codexMcpServer } from "../src/codex/thread-config.ts";
 import { claudeMcpServers } from "../src/harness/claude/mcp.ts";
 import { type BaymaMcpServer, folderBayma, HostBayma, noFolderBayma } from "../src/mcp/bayma.ts";
+import { BaymaProxy } from "../src/mcp/bayma-proxy.ts";
 import { Store } from "../src/persistence/store.ts";
-import { FolderBindFailed, type FolderScope, GatewayError, type GatewayWorkspaces } from "../src/sandbox/gateway-client.ts";
+import { type BaymaEndpoint, FolderBindFailed, type FolderScope, GatewayError, type GatewayWorkspaces } from "../src/sandbox/gateway-client.ts";
 import { run, testStore } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 
 const BAYMA: BaymaMcpServer = { type: "http", url: "http://alasio-sandbox-gateway.alasio.svc:8080/mcp", headers: { Authorization: "Bearer folder.t" } };
+/** A folder instance's bayma as a harness is given it, at alasio's loopback. */
+const LOOPBACK: BaymaMcpServer = { type: "http", url: "http://127.0.0.1:1/mcp/folder:claude:telegram:42", headers: { Authorization: "Bearer loopback" } };
+
+/** alasio's loopback, as a stand-in: each workspace's endpoint at its key, its upstream kept. */
+const upstreams = new Map<string, Effect.Effect<BaymaEndpoint>>();
+const loopback = Layer.succeed(BaymaProxy, BaymaProxy.of({
+  reach: (key, upstream) => Effect.sync(() => (upstreams.set(key, upstream), { url: `http://127.0.0.1:1/mcp/${key}`, headers: { Authorization: "Bearer loopback" } })),
+}));
 
 test("a deployment whose gateway serves no folder instances offers no folder bayma", async () => {
   const none = Effect.runSync(folderBayma);
@@ -37,16 +46,19 @@ function fakeFolders(binds: () => Effect.Effect<void, FolderBindFailed | Gateway
 async function withHostBayma<A>(folders: GatewayWorkspaces["folders"], telegram: RecordingTelegram, use: (host: HostBayma["Service"]) => Effect.Effect<A>, timing: Parameters<typeof HostBayma.layer>[1] = {}): Promise<A> {
   const store = await testStore();
   await run(store.upsertConversation({ chatId: 42, user: { id: 1 } }));
-  return Effect.runPromise(Effect.flatMap(HostBayma, use).pipe(Effect.provide(HostBayma.layer(folders, timing).pipe(Layer.provide(Layer.merge(Layer.succeed(Store, store), telegram.layer))))));
+  return Effect.runPromise(Effect.flatMap(HostBayma, use).pipe(Effect.provide(HostBayma.layer(folders, timing).pipe(Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), telegram.layer, loopback))))));
 }
 
 const SCOPE = { harness: "claude", threadKey: "telegram:42", workingDirectory: "/home/op/repo" } as const;
 
-test("a folder conversation's bayma is its folder instance, bound through the gateway before its endpoint is given, in Claude Code's shape", async () => {
+test("a folder conversation's bayma is its folder instance, bound through the gateway before its endpoint at alasio's loopback is given, in Claude Code's shape, the loopback passing it on with the gateway's endpoint as each request goes", async () => {
   const { calls, folders } = fakeFolders(() => Effect.void);
   const telegram = recordingTelegram();
   const outcome = await withHostBayma(folders, telegram, (host) => host.ensure({ ...SCOPE, chatId: "42" }));
-  assert.deepEqual(outcome, { server: BAYMA, notice: null });
+  assert.deepEqual(outcome, { server: LOOPBACK, notice: null });
+  assert.deepEqual(calls, ["bind claude telegram:42"]);
+  const { type: _, ...endpoint } = BAYMA;
+  assert.deepEqual(await Effect.runPromise(upstreams.get("folder:claude:telegram:42") ?? Effect.die("not reached")), endpoint);
   assert.deepEqual(calls, ["bind claude telegram:42", "endpoint claude telegram:42"]);
   assert.deepEqual(telegram.calls.sendMessage, []);
 });
@@ -110,7 +122,7 @@ test("a bind that waits long says in its turn's status what it waits on, as the 
       const quick = yield* host.ensure({ ...SCOPE, chatId: "42", waiting });
       return [slow, quick];
     }), { toldAfterMs: 100, askedEveryMs: 50 });
-  assert.deepEqual([slow?.server, quick?.server], [BAYMA, BAYMA]);
+  assert.deepEqual([slow?.server, quick?.server], [LOOPBACK, LOOPBACK]);
   // Each change said once, then that it waits no more.
   assert.deepEqual(said.slice(0, 2), ["its folder's bayma, whose instance before is saving its REPL sessions", "its folder's bayma, whose image is being pulled"]);
   assert.equal(said.at(-1), null);

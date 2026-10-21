@@ -20,6 +20,7 @@ import { Harnesses } from "./harness/index.ts";
 import { BusyPods } from "./kube/busy.ts";
 import { KubeClient } from "./kube/client.ts";
 import { type FolderBayma, HostBayma } from "./mcp/bayma.ts";
+import { BaymaProxy } from "./mcp/bayma-proxy.ts";
 import { Mounts } from "./operator/mounts.ts";
 import type { StoreError } from "./persistence/sql.ts";
 import { Store } from "./persistence/store.ts";
@@ -105,20 +106,20 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
 /**
  * The services of the workspaces the deployment offers, each made only where it offers them:
  * session filesystems (SessionSandboxes), through the sandbox gateway it gives alasio, and
- * folder workspaces' bayma (HostBayma), the gateway's folder instances, where it serves them.
- * They are not among AlasioServices, which are always there; what uses them asks whether they are.
+ * folder workspaces' bayma (HostBayma), the gateway's folder instances, where it serves them;
+ * both reached by the harnesses at one loopback of alasio's (BaymaProxy). They are not among
+ * AlasioServices, which are always there; what uses them asks whether they are.
  */
 function workspaceServices({ folders, sessionsGateway, stateDir, branch }: AlasioOptions): Layer.Layer<never, never, Store | TelegramClient> {
+  if (!sessionsGateway) return Layer.empty;
   return Layer.mergeAll(
-    sessionsGateway
-      ? Layer.unwrap(Effect.gen(function*() {
-        const store = yield* Store;
-        const inherit = branch ? inheritance(branch, store) : undefined;
-        return SessionSandboxes.layer({ gateway: sessionsGateway, stateDir, netModeOf: netModeIn(store), inherit });
-      }))
-      : Layer.empty,
-    sessionsGateway && folders ? HostBayma.layer(makeGatewayWorkspaces(sessionsGateway).folders) : Layer.empty,
-  );
+    Layer.unwrap(Effect.gen(function*() {
+      const store = yield* Store;
+      const inherit = branch ? inheritance(branch, store) : undefined;
+      return SessionSandboxes.layer({ gateway: sessionsGateway, stateDir, netModeOf: netModeIn(store), inherit });
+    })),
+    folders ? HostBayma.layer(makeGatewayWorkspaces(sessionsGateway).folders) : Layer.empty,
+  ).pipe(Layer.provide(BaymaProxy.layer));
 }
 
 /** The internet each session filesystem was made with, as `store` records it; null for one it records not, or cannot read. */

@@ -18,6 +18,7 @@ import { Effect } from "effect";
 
 import { loadAlasioConfig } from "../../src/config.ts";
 import { type BaymaEndpoint, makeGatewayWorkspaces } from "../../src/sandbox/gateway-client.ts";
+import { makeBaymaProxy } from "../../src/mcp/bayma-proxy.ts";
 import { makeSessionSandboxes } from "../../src/sandbox/index.ts";
 
 /** What bayma's session.create answers, as far as the end-to-end scripts read it. */
@@ -72,9 +73,10 @@ const { sessionsGateway: gateway } = loadAlasioConfig();
 if (!gateway) throw new Error("the installation gives alasio no sandbox gateway");
 const workspaces = makeGatewayWorkspaces(gateway);
 // As alasio records it: a session made with no internet.
-const sessions = makeSessionSandboxes({ gateway, stateDir: "/tmp/roundtrip", netModeOf: () => Effect.succeed("none"), workspaces });
 
-const seen = await Effect.runPromise(Effect.gen(function*() {
+const seen = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+  // Its bayma reached as a harness's is, at a loopback of this process's.
+  const sessions = makeSessionSandboxes({ gateway, stateDir: "/tmp/roundtrip", netModeOf: () => Effect.succeed("none"), proxy: yield* makeBaymaProxy, workspaces });
   const seen: Partial<RoundtripSeen> = {};
   const read = (path: string, maxBytes: number) => sessions.readFile(volumeId, path, maxBytes);
   const { bayma } = yield* sessions.ensureSession(volumeId);
@@ -91,5 +93,5 @@ const seen = await Effect.runPromise(Effect.gen(function*() {
   const after = yield* Effect.promise(() => exec(again.bayma, 'require("fs").readFileSync("/workspace/out/hello.txt", "utf8")'));
   seen.execAfterBind = after.result_text;
   return seen;
-}));
+})));
 console.log(JSON.stringify(seen));

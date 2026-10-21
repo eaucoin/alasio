@@ -10,8 +10,8 @@
  *   machine, which would reach its loopback.
  * - `settingSources: []` and `strictMcpConfig` keep the operator's settings, hooks,
  *   skills, plugins, and MCP servers out.
- * - bayma, reached through the sandbox gateway with its token (sandbox/index.ts), is the one
- *   MCP server, and so the agent's only way into the workspace.
+ * - bayma, reached through the sandbox gateway at alasio's loopback (sandbox/index.ts), is the
+ *   one MCP server, and so the agent's only way into the workspace.
  */
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 

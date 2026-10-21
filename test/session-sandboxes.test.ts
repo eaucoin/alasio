@@ -12,7 +12,8 @@ import { test } from "node:test";
 
 import { Effect } from "effect";
 
-import { GatewayError, type GatewayWorkspaces } from "../src/sandbox/gateway-client.ts";
+import type { BaymaProxy } from "../src/mcp/bayma-proxy.ts";
+import { type BaymaEndpoint, GatewayError, type GatewayWorkspaces } from "../src/sandbox/gateway-client.ts";
 import { filesPath, type Inheritance, makeSessionSandboxes, type NetMode, SessionInheritError } from "../src/sandbox/index.ts";
 
 const GATEWAY = { url: "http://gateway:8080", environment: "main", callerKey: Buffer.from("key") };
@@ -43,6 +44,12 @@ function gateway({ files = new Map<string, Uint8Array>(), there = new Set<string
   };
 }
 
+/** alasio's loopback, as a stand-in: each workspace's endpoint at its key, its upstream kept. */
+const upstreams = new Map<string, Effect.Effect<BaymaEndpoint>>();
+const loopback: BaymaProxy["Service"] = {
+  reach: (key, upstream) => Effect.sync(() => (upstreams.set(key, upstream), { url: `http://127.0.0.1:1/mcp/${key}`, headers: { Authorization: "Bearer loopback" } })),
+};
+
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
 
 test("a path a session sees is named in its files under its workspace, as one relative to it is, or its home, and none outside both", () => {
@@ -53,15 +60,16 @@ test("a path a session sees is named in its files under its workspace, as one re
   for (const outside of ["/etc/passwd", "/workspace", "/workspace/../etc/passwd", "../etc/passwd", "/home/agentx/a", "out//a"]) assert.equal(filesPath(outside), null, outside);
 });
 
-test("a session is brought up bound to a pod of the internet alasio records, none where it records none, its bayma reached through the gateway", async () => {
+test("a session is brought up bound to a pod of the internet alasio records, none where it records none, its bayma reached at alasio's loopback, which passes it on through the gateway", async () => {
   const stand = gateway();
   const modes = new Map<string, NetMode>([["fs-full01", "full"]]);
-  const sessions = makeSessionSandboxes({ gateway: GATEWAY, stateDir: "/state", netModeOf: (volumeId) => Effect.succeed(modes.get(volumeId) ?? null), workspaces: stand });
-  assert.deepEqual(await run(sessions.ensureSession("fs-full01")), { bayma: { url: "http://gateway:8080/mcp", headers: { Authorization: "Bearer fs-full01/full" } } });
+  const sessions = makeSessionSandboxes({ gateway: GATEWAY, proxy: loopback, stateDir: "/state", netModeOf: (volumeId) => Effect.succeed(modes.get(volumeId) ?? null), workspaces: stand });
+  assert.deepEqual(await run(sessions.ensureSession("fs-full01")), { bayma: { url: "http://127.0.0.1:1/mcp/sessionfs:fs-full01", headers: { Authorization: "Bearer loopback" } } });
+  assert.deepEqual(await run(upstreams.get("sessionfs:fs-full01") ?? Effect.die("not reached")), { url: "http://gateway:8080/mcp", headers: { Authorization: "Bearer fs-full01/full" } });
   await run(sessions.ensureSession("fs-plain1"));
   assert.deepEqual(stand.asked, ["bind fs-full01 full", "bind fs-plain1 none"]);
   // One whose bind the gateway refuses: its refusal.
-  const refusing = makeSessionSandboxes({ gateway: GATEWAY, stateDir: "/state", netModeOf: () => Effect.succeed(null), workspaces: gateway({ refuse: new Map([["bind", 503]]) }) });
+  const refusing = makeSessionSandboxes({ gateway: GATEWAY, proxy: loopback, stateDir: "/state", netModeOf: () => Effect.succeed(null), workspaces: gateway({ refuse: new Map([["bind", 503]]) }) });
   const failed = await run(Effect.flip(refusing.ensureSession("fs-plain1")));
   assert.equal(failed._tag === "GatewayError" && failed.status, 503);
 });
@@ -74,7 +82,7 @@ test("a branch's session it inherited, not here yet, is forked from its parent's
     record: (volumeId, netMode) => Effect.sync(() => void recorded.push(`record ${volumeId} ${netMode}`)),
   };
   const modes = new Map<string, NetMode>();
-  const sessions = makeSessionSandboxes({ gateway: GATEWAY, stateDir: "/state", netModeOf: (volumeId) => Effect.succeed(modes.get(volumeId) ?? null), inherit: { ...inherit, record: (volumeId, netMode) => Effect.andThen(inherit.record(volumeId, netMode), Effect.sync(() => void modes.set(volumeId, netMode))) }, workspaces: stand });
+  const sessions = makeSessionSandboxes({ gateway: GATEWAY, proxy: loopback, stateDir: "/state", netModeOf: (volumeId) => Effect.succeed(modes.get(volumeId) ?? null), inherit: { ...inherit, record: (volumeId, netMode) => Effect.andThen(inherit.record(volumeId, netMode), Effect.sync(() => void modes.set(volumeId, netMode))) }, workspaces: stand });
   await run(sessions.ensureSession("fs-parent1"));
   await run(sessions.ensureSession("fs-here01"));
   await run(sessions.ensureSession("fs-nobody1"));
@@ -83,6 +91,7 @@ test("a branch's session it inherited, not here yet, is forked from its parent's
   // A fork the parent could not make: its refusal, the session not brought up.
   const failing = makeSessionSandboxes({
     gateway: GATEWAY,
+    proxy: loopback,
     stateDir: "/state",
     netModeOf: () => Effect.succeed(null),
     inherit: { ...inherit, fork: () => Effect.fail(new SessionInheritError({ message: "the parent did not answer" })) },
@@ -93,7 +102,7 @@ test("a branch's session it inherited, not here yet, is forked from its parent's
 
 test("a workspace is made, forked with its source's internet into alasio's environment or another, deleted once its binding is let go, and listed, through the gateway", async () => {
   const stand = gateway();
-  const sessions = makeSessionSandboxes({ gateway: GATEWAY, stateDir: "/state", netModeOf: (volumeId) => Effect.succeed(volumeId === "fs-source1" ? "full" : null), workspaces: stand });
+  const sessions = makeSessionSandboxes({ gateway: GATEWAY, proxy: loopback, stateDir: "/state", netModeOf: (volumeId) => Effect.succeed(volumeId === "fs-source1" ? "full" : null), workspaces: stand });
   assert.deepEqual(await run(sessions.volumes.create("fs-source1", "full")), { volumeId: "fs-source1", netMode: "full" });
   assert.deepEqual(await run(sessions.volumes.fork("fs-source1", "fs-fork001")), { volumeId: "fs-fork001", netMode: "full" });
   assert.deepEqual(await run(sessions.volumes.fork("fs-source1", "fs-source1", "try")), { volumeId: "fs-source1", netMode: "full" });
@@ -101,14 +110,14 @@ test("a workspace is made, forked with its source's internet into alasio's envir
   await run(sessions.volumes.destroy("fs-source1"));
   assert.deepEqual(stand.asked, ["create fs-source1", "fork fs-source1 main/fs-fork001", "fork fs-source1 try/fs-source1", "release fs-source1 full", "remove fs-source1"]);
   // One the gateway would not delete: its refusal, which keeps alasio's record.
-  const refusing = makeSessionSandboxes({ gateway: GATEWAY, stateDir: "/state", netModeOf: () => Effect.succeed(null), workspaces: gateway({ refuse: new Map([["remove", 409]]) }) });
+  const refusing = makeSessionSandboxes({ gateway: GATEWAY, proxy: loopback, stateDir: "/state", netModeOf: () => Effect.succeed(null), workspaces: gateway({ refuse: new Map([["remove", 409]]) }) });
   const failed = await run(Effect.flip(refusing.volumes.destroy("fs-source1")));
   assert.equal(failed._tag === "GatewayError" && failed.status, 409);
 });
 
 test("a session's file is read and written through the gateway by the path it sees it at, one not there, refused, or outside its files a note, one too large said so", async () => {
   const stand = gateway({ files: new Map([["workspace/out/chart.png", Uint8Array.from([1, 2, 3])], ["workspace/big", new Uint8Array(10)]]), refuse: new Map([["workspace/link", 403]]) });
-  const sessions = makeSessionSandboxes({ gateway: GATEWAY, stateDir: "/state", netModeOf: () => Effect.succeed(null), workspaces: stand });
+  const sessions = makeSessionSandboxes({ gateway: GATEWAY, proxy: loopback, stateDir: "/state", netModeOf: () => Effect.succeed(null), workspaces: stand });
   assert.deepEqual(await run(sessions.readFile("fs-abc123", "/workspace/out/chart.png", 5)), { bytes: Buffer.from([1, 2, 3]) });
   assert.deepEqual(await run(sessions.readFile("fs-abc123", "out/none.png", 5)), { note: "file not found" });
   assert.deepEqual(await run(sessions.readFile("fs-abc123", "link", 5)), { note: "file not found" });
@@ -124,7 +133,7 @@ test("a session's harness directory is its own, under the state directory, outsi
   const stateDir = mkdtempSync(join(tmpdir(), "alasio-session-sandboxes-"));
   try {
     const stand = gateway();
-    const sessions = makeSessionSandboxes({ gateway: GATEWAY, stateDir, netModeOf: () => Effect.die("no internet is read"), workspaces: stand });
+    const sessions = makeSessionSandboxes({ gateway: GATEWAY, proxy: loopback, stateDir, netModeOf: () => Effect.die("no internet is read"), workspaces: stand });
     const directory = sessions.harnessDirectory("fs-abc123");
     assert.equal(directory, join(stateDir, "sessionfs", "workspaces", "fs-abc123"));
     assert.ok(existsSync(directory));

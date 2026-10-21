@@ -79,8 +79,6 @@ export interface AppServer extends Omit<AppServerThreads, "startTurn"> {
 export interface AppServerOptions {
   /** How the app-server process is started; the local codex binary's when absent. */
   readonly spawn?: SpawnAppServer | undefined;
-  /** How long a thread keeps the config it was loaded with (./thread-client.ts THREAD_CONFIG_LIFE_MS unless said). */
-  readonly threadConfigLifeMs?: number | undefined;
 }
 
 /** Puts every effect of `appServer` in the app-server's log scope; its streams' effects are put there as they are made. */
@@ -109,7 +107,7 @@ function inLogScope(appServer: AppServer): AppServer {
 }
 
 /** A Codex app-server, run as asked until the scope closes. */
-export const makeAppServer = Effect.fnUntraced(function*({ spawn = spawnAppServer, threadConfigLifeMs }: AppServerOptions = {}): Effect.fn.Return<AppServer, never, Scope.Scope> {
+export const makeAppServer = Effect.fnUntraced(function*({ spawn = spawnAppServer }: AppServerOptions = {}): Effect.fn.Return<AppServer, never, Scope.Scope> {
   const notifications = yield* makeAppServerNotifications;
   // What an app-server that ended on its own had running is gone with it: its turns, and the threads it loaded.
   const rpc = yield* makeAppServerRpc({ spawn, onNotification: notifications.observe, onEnded: notifications.clear });
@@ -117,7 +115,7 @@ export const makeAppServer = Effect.fnUntraced(function*({ spawn = spawnAppServe
   // app-server waits for it before it stops, each bounded as it runs.
   const apart = yield* FiberSet.make<void>();
   yield* Effect.addFinalizer(() => FiberSet.awaitEmpty(apart));
-  const threads = makeAppServerThreads(rpc, notifications, (work) => FiberSet.run(apart, work), threadConfigLifeMs);
+  const threads = makeAppServerThreads(rpc, notifications, (work) => FiberSet.run(apart, work));
   const stop = rpc.stop.pipe(Effect.andThen(notifications.clear));
 
   /** The turn's notifications, as the events they map to, until the turn's end. */

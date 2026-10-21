@@ -5,12 +5,13 @@
  * it does not know. Claude Code and Codex, each run here as alasio runs it, with alasio's
  * options and bayma's server as alasio gives it, keep their process across such a release
  * and reach the new bayma's tools on the next turn, their MCP client initializing a session
- * anew, with the endpoint's bearer still.
+ * anew.
  *
- * A process outlives its bearer too, a caller's token good for TOKEN_TTL_MS: given bayma's
- * server anew, its bearer fresh, as alasio gives it once the bearer is about to lapse (Claude
- * Code's by the Agent SDK's setMcpServers, Codex's thread loaded anew with the config its turn
- * gives), it reaches bayma's tools with the new bearer, the old one refused.
+ * A process outlives the gateway's caller tokens too, each good for TOKEN_TTL_MS: given its
+ * bayma once, as it starts, at alasio's loopback (src/mcp/bayma-proxy.ts), which mints the
+ * bearer of each request as it goes, it reaches bayma's tools past the first bearer's life,
+ * with no turn of alasio's to give it anything anew: Claude Code's turns of its own, and a
+ * Codex thread whose commands run on in the background, loaded still.
  *
  * Each is run against a model API of this test's own, which calls bayma's tool on a prompt
  * that asks for it, and answers with what it returned.
@@ -31,15 +32,21 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { Effect, Exit, Scope, Stream } from "effect";
+import { Effect, Exit, Layer, Scope, Stream } from "effect";
+import { TestClock } from "effect/testing";
 
+import { environmentKey } from "../src/binder/names.ts";
+import { verifyToken } from "../src/binder/tokens.ts";
 import { makeAppServer } from "../src/codex/app-server/client.ts";
 import type { AppServerEvent } from "../src/codex/app-server/protocol.ts";
 import { buildCodexThreadConfig } from "../src/codex/thread-config.ts";
 import { claudeMcpServers } from "../src/harness/claude/mcp.ts";
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.ts";
+import { makeBaymaProxy } from "../src/mcp/bayma-proxy.ts";
+import { type BaymaEndpoint, makeGatewayWorkspaces, TOKEN_TTL_MS } from "../src/sandbox/gateway-client.ts";
 
-const BEARER = "Bearer the-binding's";
+const MASTER = Buffer.from("the gateway's caller key");
+const FOLDER = { harness: "claude", threadKey: "telegram:1" };
 
 async function bodyOf(incoming: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -55,18 +62,22 @@ async function listening(server: Server): Promise<string> {
 }
 
 /**
- * A stand-in for a binding's bayma, through the gateway: its tool `ping` says which pod
+ * A stand-in for a folder instance's bayma, through the gateway, which takes a caller's token
+ * of its key as the gateway checks one, by its own clock: its tool `ping` says which pod
  * answers, and `rebind` puts another pod in its place, which knows none of the sessions of
- * the one before. What it was asked, in order.
+ * the one before. What it was asked, in order; `later` moves its clock on, and alasio's
+ * (`clock`, which the loopback mints by), past the life of any bearer minted before.
  */
 async function bayma() {
   let pod = 1;
-  let bearer = BEARER;
+  let now = 0;
+  const clock = await Effect.runPromise(Layer.build(TestClock.layer()).pipe(Scope.provide(Effect.runSync(Scope.make()))));
   const sessions = new Map<string, StreamableHTTPServerTransport>();
   const asked: string[] = [];
   const server = createServer(async (incoming, outgoing) => {
-    if (incoming.headers.authorization !== bearer) {
-      asked.push(`refused ${incoming.headers.authorization}`);
+    const bearer = String(incoming.headers.authorization ?? "").replace(/^Bearer /u, "");
+    if (verifyToken(environmentKey(MASTER, "try"), bearer, now)?.key !== "folder:claude:telegram:1") {
+      asked.push("refused");
       return void outgoing.writeHead(401).end();
     }
     const id = incoming.headers["mcp-session-id"];
@@ -78,7 +89,7 @@ async function bayma() {
       return void outgoing.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32004, message: "unknown MCP session" }, id: null }));
     }
     if (incoming.method !== "POST" || !isInitializeRequest(body)) return void outgoing.writeHead(400).end();
-    asked.push(`initialize of pod ${pod} with ${bearer}`);
+    asked.push(`initialize of pod ${pod}`);
     const mcp = new McpServer({ name: "bayma", version: "1.0.0" });
     const answering = pod;
     mcp.tool("ping", "Says which pod answers", async () => ({ content: [{ type: "text", text: `pong from pod ${answering}` }] }));
@@ -87,20 +98,32 @@ async function bayma() {
     await mcp.connect(transport as Transport);
     await transport.handleRequest(incoming, outgoing, body);
   });
-  const url = `${await listening(server)}/mcp`;
+  const { folders } = makeGatewayWorkspaces({ url: await listening(server), environment: "try", callerKey: environmentKey(MASTER, "try") });
+  const served = Effect.runSync(Scope.make());
+  const run = <A>(effect: Effect.Effect<A, never, Scope.Scope>) => Effect.runPromise(Scope.provide(effect, served).pipe(Effect.provideContext(clock)));
+  const proxy = await run(makeBaymaProxy);
   return {
-    url,
+    /** Its endpoint as a process is given it: alasio's loopback, which mints each request's bearer by alasio's clock. */
+    endpoint: await run(proxy.reach("folder:claude:telegram:1", folders.endpoint(FOLDER))),
+    /** A bearer minted now, as the first request's is. */
+    first: await run(folders.endpoint(FOLDER)),
     asked,
     rebind: async () => {
       for (const session of sessions.values()) await session.close();
       sessions.clear();
       pod += 1;
     },
-    /** The bearer it takes from now on, the one before lapsed. */
-    take: (fresh: string) => {
-      bearer = fresh;
+    /** Moves its clock, and alasio's, on past TOKEN_TTL_MS. */
+    later: () => {
+      now += TOKEN_TTL_MS + 60_000;
+      return run(TestClock.adjust(TOKEN_TTL_MS + 60_000));
     },
-    close: () => server.close(),
+    /** Whether it takes the bearer of `endpoint` now. */
+    takes: (endpoint: BaymaEndpoint) => verifyToken(environmentKey(MASTER, "try"), String(endpoint.headers["Authorization"]).replace(/^Bearer /u, ""), now) !== null,
+    close: async () => {
+      await Effect.runPromise(Scope.close(served, Exit.void));
+      server.close();
+    },
   };
 }
 
@@ -166,10 +189,11 @@ function responsesApi(): Server {
 
 /**
  * A long-lived Claude Code process, as alasio starts one for a folder, of alasio's options,
- * its bayma given with `bearer`, against the Messages API's stand-in: its turns, each
- * answered with what bayma's tool returned, and its query, as alasio holds it.
+ * its bayma given at `bayma`, against the Messages API's stand-in: its turns, each answered
+ * with what bayma's tool returned, pushed to it as a turn of alasio's pushes it, or as one it
+ * starts on its own would be, with nothing given it anew.
  */
-async function claudeProcess(url: string, bearer: string) {
+async function claudeProcess(bayma: BaymaEndpoint) {
   const api = messagesApi();
   const home = mkdtempSync(join(tmpdir(), "alasio-reconnect-claude-"));
   const prompts: SDKUserMessage[] = [];
@@ -179,7 +203,7 @@ async function claudeProcess(url: string, bearer: string) {
   }
   const controller = new AbortController();
   const claudeEnv = { PATH: process.env["PATH"] ?? "", HOME: home, CLAUDE_CONFIG_DIR: join(home, ".claude"), ANTHROPIC_BASE_URL: await listening(api), ANTHROPIC_API_KEY: "sk-test", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
-  const options = buildClaudeQueryOptions({ workingDirectory: home, claudeEnv, mcpServers: claudeMcpServers({ type: "http", url, headers: { Authorization: bearer } }), controller, hooks: {}, env: {} });
+  const options = buildClaudeQueryOptions({ workingDirectory: home, claudeEnv, mcpServers: claudeMcpServers({ type: "http", ...bayma }), controller, hooks: {}, env: {} });
   const running = query({ prompt: channel(), options: { ...options, model: "claude-sonnet-4-5" } });
   const results: string[] = [];
   const reading = (async () => {
@@ -188,7 +212,6 @@ async function claudeProcess(url: string, bearer: string) {
     }
   })();
   return {
-    running,
     /** A turn of `prompt`: what it answered. */
     turn: async (prompt: string) => {
       const count = results.length + 1;
@@ -210,11 +233,10 @@ async function claudeProcess(url: string, bearer: string) {
 
 /**
  * Codex's app-server, as alasio runs it, against the Responses API's stand-in, a thread of it
- * started with bayma's server given with `bearer`, keeping its config `configLifeMs`: its
- * turns, each giving the thread bayma's server with the bearer it is given, as alasio's turns
- * give it, and what bayma's tool call of it came to.
+ * started with bayma's server given at `bayma`: its turns, each ensuring the thread as alasio's
+ * turns ensure it, with the same config, and what bayma's tool call of it came to.
  */
-async function codexThread(url: string, bearer: string, configLifeMs?: number) {
+async function codexThread(bayma: BaymaEndpoint) {
   const api = responsesApi();
   const home = mkdtempSync(join(tmpdir(), "alasio-reconnect-codex-"));
   const codexHome = join(home, ".codex");
@@ -230,17 +252,17 @@ async function codexThread(url: string, bearer: string, configLifeMs?: number) {
   ].join("\n"));
   const codexEnv = { PATH: process.env["PATH"] ?? "", HOME: home, CODEX_HOME: codexHome };
   const scope = Effect.runSync(Scope.make());
-  const options = (given: string) => ({ threadKey: "telegram:1", cwd: home, env: codexEnv, config: buildCodexThreadConfig({ codexEnv, bayma: { url, headers: { Authorization: given } } }) });
-  const appServer = await Effect.runPromise(makeAppServer({ threadConfigLifeMs: configLifeMs }).pipe(Scope.provide(scope)));
-  const threadId = await Effect.runPromise(appServer.startThread(options(bearer)));
+  const options = { threadKey: "telegram:1", cwd: home, env: codexEnv, config: buildCodexThreadConfig({ codexEnv, bayma }) };
+  const appServer = await Effect.runPromise(makeAppServer().pipe(Scope.provide(scope)));
+  const threadId = await Effect.runPromise(appServer.startThread(options));
   return {
-    /** A turn of `prompt`, its thread ensured as alasio's turn ensures it, with `given`: bayma's tool call of it. */
-    turn: (prompt: string, given = bearer) =>
+    /** A turn of `prompt`, its thread ensured as alasio's turn ensures it: bayma's tool call of it. */
+    turn: (prompt: string) =>
       Effect.runPromise(Effect.gen(function*() {
-        yield* appServer.ensureThread({ ...options(given), threadId });
+        yield* appServer.ensureThread({ ...options, threadId });
         // On a model Codex offers MCP tools to as functions, which this test's API calls; the
         // MCP client that reaches bayma is the same whichever model asks it.
-        const turnId = yield* appServer.startTurn({ ...options(given), threadId, prompt, model: "gpt-5" });
+        const turnId = yield* appServer.startTurn({ ...options, threadId, prompt, model: "gpt-5" });
         const events = yield* Stream.runCollect(appServer.eventsForTurn(threadId, turnId));
         return [...events].flatMap((event: AppServerEvent) => (event.type === "item.completed" && event.item.type === "mcp_tool_call" ? [JSON.stringify(event.item)] : [])).join("\n");
       })),
@@ -256,62 +278,46 @@ async function codexThread(url: string, bearer: string, configLifeMs?: number) {
 
 test("Claude Code's process reaches its bayma's tools on the turn after its binding was released and bound anew, its MCP client initializing anew", { timeout: 120_000 }, async () => {
   const stand = await bayma();
-  const claude = await claudeProcess(stand.url, BEARER);
+  const claude = await claudeProcess(stand.endpoint);
   try {
     assert.match(await claude.turn("PING"), /pong from pod 1/u);
     await stand.rebind();
     assert.match(await claude.turn("PING"), /pong from pod 2/u);
-    assert.deepEqual(stand.asked.slice(0, 3), [`initialize of pod 1 with ${BEARER}`, "POST of a session pod 2 does not know", `initialize of pod 2 with ${BEARER}`]);
+    assert.deepEqual(stand.asked.slice(0, 3), ["initialize of pod 1", "POST of a session pod 2 does not know", "initialize of pod 2"]);
   } finally {
     await claude.close();
-    stand.close();
+    await stand.close();
   }
 });
 
-test("Claude Code's process given its bayma anew, its bearer fresh, reaches its tools with it, the bearer before refused", { timeout: 120_000 }, async () => {
+test("Claude Code's process reaches its bayma's tools past the life of the first bearer it reached them with, its MCP servers as it started with them, nothing given it anew", { timeout: 120_000 }, async () => {
   const stand = await bayma();
-  const claude = await claudeProcess(stand.url, BEARER);
+  const claude = await claudeProcess(stand.endpoint);
   try {
     assert.match(await claude.turn("PING"), /pong from pod 1/u);
-    // Its bearer lapsed: bayma takes a fresh one alone, which alasio gives the process as it would.
-    stand.take("Bearer fresh");
-    const given = await claude.running.setMcpServers(claudeMcpServers({ type: "http", url: stand.url, headers: { Authorization: "Bearer fresh" } }));
-    assert.deepEqual(given.errors, {});
+    await stand.later();
+    assert.equal(stand.takes(stand.first), false, "the first bearer has lapsed");
+    // A turn of the process's, as one it starts on its own to report a background task is.
     assert.match(await claude.turn("PING"), /pong from pod 1/u);
-    assert.ok(stand.asked.includes("initialize of pod 1 with Bearer fresh"), JSON.stringify(stand.asked));
+    assert.deepEqual(stand.asked.filter((asked) => asked === "refused"), []);
   } finally {
     await claude.close();
-    stand.close();
+    await stand.close();
   }
 });
 
 test("Codex's app-server reaches its bayma's tools on the turn after its binding was released and bound anew, its thread loaded still, its MCP client initializing anew", { timeout: 120_000 }, async () => {
   const stand = await bayma();
-  const codex = await codexThread(stand.url, BEARER);
+  const codex = await codexThread(stand.endpoint);
   try {
     assert.match(await codex.turn("PING"), /pong from pod 1/u);
     await stand.rebind();
     // Its thread loaded still, as alasio's next turn of it finds it.
     assert.match(await codex.turn("PING"), /pong from pod 2/u);
-    assert.deepEqual(stand.asked.slice(0, 3), [`initialize of pod 1 with ${BEARER}`, "POST of a session pod 2 does not know", `initialize of pod 2 with ${BEARER}`]);
+    assert.deepEqual(stand.asked.slice(0, 3), ["initialize of pod 1", "POST of a session pod 2 does not know", "initialize of pod 2"]);
   } finally {
     await codex.close();
-    stand.close();
-  }
-});
-
-test("Codex's thread past its config's time is loaded anew by its next turn, with the bearer that turn gives, which reaches bayma's tools, the bearer before refused", { timeout: 120_000 }, async () => {
-  const stand = await bayma();
-  const codex = await codexThread(stand.url, BEARER, 1_000);
-  try {
-    assert.match(await codex.turn("PING"), /pong from pod 1/u);
-    stand.take("Bearer fresh");
-    await new Promise((resolve) => setTimeout(resolve, 1_200));
-    assert.match(await codex.turn("PING", "Bearer fresh"), /pong from pod 1/u);
-    assert.ok(stand.asked.includes("initialize of pod 1 with Bearer fresh"), JSON.stringify(stand.asked));
-  } finally {
-    await codex.close();
-    stand.close();
+    await stand.close();
   }
 });
 
@@ -322,29 +328,22 @@ const marked = (mark: string): number[] =>
     return args.join(" ").includes(mark) && !args.join(" ").startsWith("ps ") ? [Number(pid)] : [];
   });
 
-test("Codex's thread past its config's time that left commands running in the background is kept as it is, as letting it go ends them, and loaded anew with the bearer its turn gives once they end", { timeout: 120_000 }, async () => {
+test("Codex's thread whose commands run on in the background reaches its bayma's tools past the life of the first bearer it reached them with, loaded still, its commands running on", { timeout: 120_000 }, async () => {
   const stand = await bayma();
-  const codex = await codexThread(stand.url, BEARER, 1_000);
+  const codex = await codexThread(stand.endpoint);
   const mark = `alasio-background-${randomUUID().slice(0, 8)}`;
   try {
+    assert.match(await codex.turn("PING"), /pong from pod 1/u);
     await codex.turn(`BG ${mark}`);
     assert.equal(await codex.backgroundWork(), true, "its terminal left running");
-    stand.take("Bearer fresh");
-    await new Promise((resolve) => setTimeout(resolve, 1_200));
-    // Its config past its time, but its command running: kept, its bearer before kept with it.
-    // Its tool call answered, failed, as bayma refused the bearer that lapsed: no wait without end.
-    const refused = await codex.turn("PING", "Bearer fresh");
-    assert.doesNotMatch(refused, /pong/u);
-    assert.match(refused, /"status":"failed".*HTTP 401/u);
-    assert.ok(stand.asked.includes(`refused ${BEARER}`), JSON.stringify(stand.asked));
+    await stand.later();
+    assert.equal(stand.takes(stand.first), false, "the first bearer has lapsed");
+    assert.match(await codex.turn("PING"), /pong from pod 1/u);
     assert.deepEqual([await codex.backgroundWork(), marked(mark).length], [true, 1], "its command running on");
-    // Its command ended: its next turn loads it anew, with the bearer that turn gives.
-    for (const pid of marked(mark)) process.kill(pid, "SIGKILL");
-    for (const deadline = Date.now() + 30_000; await codex.backgroundWork(); await new Promise((resolve) => setTimeout(resolve, 200))) assert.ok(Date.now() < deadline, "its terminal still listed");
-    assert.match(await codex.turn("PING", "Bearer fresh"), /pong from pod 1/u);
+    assert.deepEqual(stand.asked.filter((asked) => asked === "refused"), []);
   } finally {
     for (const pid of marked(mark)) process.kill(pid, "SIGKILL");
     await codex.close();
-    stand.close();
+    await stand.close();
   }
 });

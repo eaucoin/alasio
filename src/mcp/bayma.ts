@@ -7,8 +7,9 @@
  * operator's opt-in to agents that work on a machine's own files, which the gateway makes as
  * the instance is bound, on the conversation's state directory, and lets go once it is idle,
  * its REPL sessions saved whole as it stops. alasio binds it ahead of the harness, and the
- * harness reaches it through the gateway, over MCP HTTP, with a caller's token of its key;
- * each adapter turns the server into its own config shape.
+ * harness reaches it through the gateway, over MCP HTTP, with a caller's token of its key
+ * minted as each of its requests goes, at the loopback (./bayma-proxy.ts); each adapter turns
+ * the server into its own config shape.
  *
  * A bind that fails leaves the turn to run without bayma's tools: the harness is told why, to
  * put before the turn's prompt, and, for a turn, the operator is told in the chat first, with
@@ -28,6 +29,7 @@ import { Store } from "../persistence/store.ts";
 import type { BaymaEndpoint, FolderBindFailed, FolderScope, GatewayError, GatewayWorkspaces } from "../sandbox/gateway-client.ts";
 import { folderKey } from "../gateway/names.ts";
 import { TelegramClient } from "../telegram/client.ts";
+import { BaymaProxy } from "./bayma-proxy.ts";
 
 export const BAYMA_SERVER_NAME = "bayma";
 
@@ -94,12 +96,13 @@ export class HostBayma extends Context.Service<HostBayma, {
   static readonly layer = (
     folders: GatewayWorkspaces["folders"],
     { toldAfterMs = BIND_TOLD_AFTER_MS, askedEveryMs = BIND_ASKED_EVERY_MS }: { readonly toldAfterMs?: number; readonly askedEveryMs?: number } = {},
-  ): Layer.Layer<HostBayma, never, Store | TelegramClient> =>
+  ): Layer.Layer<HostBayma, never, Store | TelegramClient | BaymaProxy> =>
     Layer.effect(
       HostBayma,
       Effect.gen(function*() {
         const store = yield* Store;
         const telegram = yield* TelegramClient;
+        const proxy = yield* BaymaProxy;
 
         /**
          * `binding`, the bind of `scope`'s folder instance, said in its turn's status, once it has
@@ -125,7 +128,8 @@ export class HostBayma extends Context.Service<HostBayma, {
         };
         /** The folder instances whose chat was told they are held, until a bind of one goes through. */
         const toldHeld = new Set<string>();
-        const server = (scope: HostBaymaScope) => Effect.map(folders.endpoint(scope), (endpoint): BaymaMcpServer => ({ type: "http", ...endpoint }));
+        const server = (scope: HostBaymaScope) =>
+          Effect.map(proxy.reach(folderKey(scope.harness, scope.threadKey), folders.endpoint(scope)), (endpoint): BaymaMcpServer => ({ type: "http", ...endpoint }));
 
         /** Tells the chat `chatId` of the conversation of `scope` the notice, with its buttons. */
         const tell = (scope: FolderBaymaScope, chatId: string, notice: string): Effect.Effect<void> => {

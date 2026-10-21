@@ -36,7 +36,7 @@ export interface BaymaEndpoint {
 /** A session's internet, as its pool is chosen by it. */
 export type NetMode = "none" | "full";
 
-/** How long a caller's token alasio mints is good for: past any turn, as a turn's bayma is reached by one minted as it starts. */
+/** How long a caller's token alasio mints is good for: past any one call of the gateway's, as each call, and each request a harness makes of its bayma (../mcp/bayma-proxy.ts), mints its own. */
 export const TOKEN_TTL_MS = 6 * 60 * 60_000;
 /** How long a bind asked ahead is asked again for, while the gateway's pool has no pod for it. */
 const BIND_WAIT_MS = 5 * 60_000;

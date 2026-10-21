@@ -62,7 +62,7 @@ import {
   storeBlocks,
 } from "../../codex/event-projection.ts";
 import { createTurnTimer, type TurnTimer } from "../../codex/turn-timing.ts";
-import { type BaymaEndpoint, TOKEN_TTL_MS } from "../../sandbox/gateway-client.ts";
+import type { BaymaEndpoint } from "../../sandbox/gateway-client.ts";
 import type { ModelChoice } from "../../persistence/conversation-repository.ts";
 import type { StoreError } from "../../persistence/sql.ts";
 import type { TurnFenced } from "../../persistence/store.ts";
@@ -173,8 +173,6 @@ export interface ClaudeHost {
   readonly baymaUrl: string | null;
   /** Why it runs without its folder's bayma, which its turns' prompts are told, as its last bind said: none where it has it, or runs in a session filesystem. */
   baymaNotice: string | null;
-  /** When its bayma's server was given it, with its bearer, which is good for TOKEN_TTL_MS from then. */
-  baymaGivenAt: number;
   /** Whether it was started with its folder's bayma among its MCP servers. */
   readonly withFolderBayma: boolean;
   sessionId: string | null;
@@ -213,15 +211,7 @@ export interface ClaudeLiveSessionsOptions {
   readonly sessionFsBayma?: Effect.Effect<BaymaEndpoint, SessionError> | null;
   readonly folderBayma?: (scope: Omit<FolderBaymaScope, "harness">) => Effect.Effect<FolderBaymaOutcome, NoFolderWorkspaces>;
   readonly queryFactory?: ClaudeQueryFactory | undefined;
-  /** How long a process keeps its bayma's server as it was given it before a turn gives it the server anew, its bearer fresh: BAYMA_BEARER_LIFE_MS unless said. */
-  readonly baymaBearerLifeMs?: number | undefined;
 }
-
-/**
- * How long a process keeps its bayma's server as it was given it: an hour less than the
- * bearer in it is good for, so a turn of it never reaches bayma with a bearer that lapsed.
- */
-export const BAYMA_BEARER_LIFE_MS = TOKEN_TTL_MS - 60 * 60_000;
 
 /** The live Claude Code processes of one working directory, one per conversation, for as long as their scope is open. */
 export interface ClaudeLiveSessions {
@@ -259,10 +249,6 @@ const needed = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, ClaudeCodeE
 /** What says, in the status of the turn of `params`, what its folder's bayma's bind waits on, as a long one does, and that it waits no more (null). */
 const waitingOf = (params: TurnParams) => (what: string | null): Effect.Effect<void> =>
   params.persistence.setWaiting(what).pipe(Effect.catch((error) => Effect.logWarning(`could not say thread=${params.threadKey} waits on ${what ?? "nothing"}: ${error.message}`)));
-
-/** What a turn is told before its prompt where its process could not be given its bayma anew, its bearer lapsing. */
-const renewalNotice = (workspace: string, reason: string): string =>
-  `Workspace ${workspace}: its bayma could not be given its credentials anew (${reason}). This turn may run without bayma's REPL tools; your REPL sessions are kept and come back on a later turn.`;
 
 /** Now, as a log line gives it. */
 const now = Effect.map(Clock.currentTimeMillis, (millis) => new Date(millis).toISOString());
@@ -316,7 +302,6 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   sessionFsBayma = null,
   folderBayma = defaultFolderBayma,
   queryFactory = query,
-  baymaBearerLifeMs = BAYMA_BEARER_LIFE_MS,
 }: ClaudeLiveSessionsOptions): Effect.fn.Return<ClaudeLiveSessions, never, Scope.Scope | ActiveTurns> {
   const scope = yield* Effect.scope;
   const activeTurns = yield* ActiveTurns;
@@ -866,7 +851,6 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       key,
       baymaUrl: bayma?.url ?? null,
       baymaNotice: folder?.notice ?? null,
-      baymaGivenAt: yield* Clock.currentTimeMillis,
       withFolderBayma: folder?.server != null,
       sessionId: resumeSession ?? null,
       channel,
@@ -913,9 +897,6 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     const bayma = sessionFsBayma ? yield* needed(sessionFsBayma) : null;
     const existing = hosts.get(params.threadKey);
     const reusable = existing && !existing.closed && params.resumeSession && existing.sessionId === params.resumeSession && existing.key === key && existing.baymaUrl === (bayma?.url ?? null);
-    const now = yield* Clock.currentTimeMillis;
-    // Its bayma's bearer, as the process was given it, about to lapse: given it anew below.
-    const lapsing = reusable && now - existing.baymaGivenAt >= baymaBearerLifeMs;
     // A folder's bayma bound before every turn, a process's first and those of a process
     // reused alike, as one released since is bound anew before the turn rather than by its
     // first tool call: one that does not start leaves the turn without it, told so before its
@@ -930,22 +911,6 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     }
     if (reusable && (folder === null || existing.withFolderBayma)) {
       existing.baymaNotice = null;
-      // Its bearer about to lapse: given its server anew, the bearer fresh, the process kept,
-      // its MCP client connecting to it afresh, as the Agent SDK replaces a server it is given.
-      const renewed = !lapsing ? null : bayma ? { bayma: { type: "http" as const, url: bayma.url, headers: bayma.headers } } : folder?.server ? claudeMcpServers(folder.server) : null;
-      // Given anew only where it took it: one that did not, or whose update failed, is given it
-      // again the next turn, and one whose update failed runs this turn told so, without it.
-      if (renewed) {
-        const set = yield* Effect.result(attempt(() => existing.sdkQuery.setMcpServers(renewed)));
-        if (set._tag === "Failure") {
-          yield* Effect.logWarning(`giving thread=${params.threadKey} its bayma anew failed: ${set.failure.message}`);
-          existing.baymaNotice = renewalNotice(workingDirectory, set.failure.message);
-        } else if (Object.keys(set.success.errors).length > 0) {
-          yield* Effect.logWarning(`giving thread=${params.threadKey} its bayma anew failed: ${JSON.stringify(set.success.errors)}`);
-        } else {
-          existing.baymaGivenAt = now;
-        }
-      }
       return existing;
     }
     if (existing && !existing.closed) {
