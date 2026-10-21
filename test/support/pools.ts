@@ -27,7 +27,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after } from "node:test";
 
-import { Clock, ConfigProvider, Context, type Duration, Effect, Exit, Layer, Scope } from "effect";
+import { Clock, ConfigProvider, Context, type Duration, Effect, Exit, Fiber, FiberSet, Layer, Scope } from "effect";
 import pg from "pg";
 
 import { HARNESS_ROLE } from "../../neon/control/secrets.ts";
@@ -136,10 +136,11 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-/** A pod of a key's: the port it serves on, and, once bound, its binding, and the scope its host runs in. */
+/** A pod of a key's: the port it serves on; its bind, while one is under way; and, once bound, its binding, and the scope its host runs in. */
 interface Pod {
   readonly name: string;
   readonly port: number;
+  binding: Fiber.Fiber<Bound> | null;
   bound: { readonly binding: string; readonly scope: Scope.Closeable } | null;
 }
 
@@ -154,9 +155,12 @@ export interface PoolsOptions {
   readonly host?: ((host: HarnessHost["Service"]) => HarnessHost["Service"]) | undefined;
 }
 
-/** What the stand-in says of its pods, for a test to look at: the conversations whose harness is bound now, each to its binding. */
+/** What the stand-in says of its pods, for a test to look at: the conversations whose harness is bound now, each to its binding, those whose harness is being bound, and where their pods serve. */
 export class Pools extends Context.Service<Pools, {
   readonly bound: () => ReadonlyMap<string, string>;
+  readonly binding: () => ReadonlySet<string>;
+  /** The port each conversation's pod serves on, or is to. */
+  readonly ports: () => ReadonlyMap<string, number>;
 }>()("alasio/test/Pools") {}
 
 /**
@@ -184,7 +188,7 @@ export const pooledHost = ({ standIns = {}, branch, host = (made) => made }: Poo
         const known = pods.get(key);
         if (known) return known;
         made += 1;
-        const pod: Pod = { name: `harness-${made}`, port: yield* Effect.promise(freePort), bound: null };
+        const pod: Pod = { name: `harness-${made}`, port: yield* Effect.promise(freePort), binding: null, bound: null };
         pods.set(key, pod);
         return pod;
       });
@@ -204,17 +208,28 @@ export const pooledHost = ({ standIns = {}, branch, host = (made) => made }: Poo
         writeFileSync(bindingFile, JSON.stringify({ conversationId, token: bindingToken(bindingKey, { key, binding, namespace: pool.namespace }) }));
         const scope = yield* Scope.make();
         const env = ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ALASIO_DATABASE_URL: database.harnessUrl } }));
+        // Its host's scope closed where it does not start, as one ended as it starts.
         yield* startHarness({ bindingFile, port: pod.port, stateDir, branch: branch ?? null, gatewayUrl: front.url }, { ...standIns, activeTurns }).pipe(
           Effect.provide(env),
           Scope.provide(scope),
+          Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : Scope.close(scope, exit))),
           Effect.orDie,
         );
         pod.bound = { binding, scope };
         return { binding, pod: pod.name, address: "127.0.0.1" };
       });
 
+    // Each bind, the front's request's own no more, in the stand-in's scope, so it ends as the services do, its host with it.
+    const binds = yield* FiberSet.make<Bound>();
     const binder = Binder.of({
-      bind: (pool, key) => Effect.flatMap(podOf(key), (pod) => bindPod(pool, key, pod)),
+      // One bind of a key at a time, as a binder holds its Lease: one under way is waited for.
+      bind: (pool, key) =>
+        Effect.flatMap(podOf(key), (pod) =>
+          Effect.gen(function*() {
+            if (pod.bound) return { binding: pod.bound.binding, pod: pod.name, address: "127.0.0.1" };
+            pod.binding ??= yield* FiberSet.run(binds, bindPod(pool, key, pod).pipe(Effect.ensuring(Effect.sync(() => void (pod.binding = null)))));
+            return yield* Fiber.join(pod.binding);
+          })),
       bound: (_pool, key) => Effect.sync(() => {
         const pod = pods.get(key);
         return pod?.bound ? { binding: pod.bound.binding, pod: pod.name, address: "127.0.0.1" } : null;
@@ -264,7 +279,11 @@ export const pooledHost = ({ standIns = {}, branch, host = (made) => made }: Poo
       Effect.map((served) => ({ ...served, url: `http://127.0.0.1:${served.port}` })),
     );
 
-    const pools = Pools.of({ bound: () => new Map([...pods].flatMap(([key, pod]) => (pod.bound ? [[conversationOfHarnessKey(key) ?? key, pod.bound.binding] as const] : []))) });
+    const pools = Pools.of({
+      bound: () => new Map([...pods].flatMap(([key, pod]) => (pod.bound ? [[conversationOfHarnessKey(key) ?? key, pod.bound.binding] as const] : []))),
+      binding: () => new Set([...pods].flatMap(([key, pod]) => (pod.binding && !pod.bound ? [conversationOfHarnessKey(key) ?? key] : []))),
+      ports: () => new Map([...pods].map(([key, pod]) => [conversationOfHarnessKey(key) ?? key, pod.port] as const)),
+    });
     const home = process.env["CODEX_HOME"] ?? "";
     const pooled = pooledHarnessHost({ url: front.url, environment: ENVIRONMENT, callerKey, codexLogin: { url: "http://127.0.0.1:9/v1", home } });
     return Layer.mergeAll(
