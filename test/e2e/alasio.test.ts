@@ -360,7 +360,6 @@ if (inShard("upgrade")) {
         seeds: "main at work in a session workspace, a file written in it and a turn on Codex there, and the folder chat at work in a folder of its own, a file in it",
         seed: async () => {
           volumeId = await workInMain();
-          lineage = await seedLineage();
           await tg.say("hello", FOLDER_CHAT);
           await tg.waitFor((call) => answered(call, FOLDER_CHAT));
           folder = await onDatabase(NAMESPACE, `select working_directory from state.conversations where id = 'telegram:${FOLDER_CHAT}'`);
@@ -585,6 +584,11 @@ if (inShard("upgrade")) {
       assert.ok(await runs(RELEASE), "alasio runs as it did");
       await tg.say("between the cut-overs");
       await tg.waitFor((call) => answered(call));
+    });
+
+    // Last of what 9.0.0 does before the cut-over, as a turn of main's after it would save its rollout again, its history_base as its file says it, none.
+    test(`on ${PREVIOUS}: main's Codex thread given a history starting in a thread no row names, as a fork's does`, { timeout: 10 * 60_000 }, async () => {
+      lineage = await seedLineage();
     });
 
     test(`the cut-over from ${PREVIOUS}, failing past its point of no return, before the upgrade, goes on with it when run again, its checks not run again`, { timeout: 60 * 60_000 }, async () => {
