@@ -6,11 +6,13 @@
  * In a pod it authenticates as the pod's ServiceAccount; elsewhere (tests, a developer's
  * machine) as the current context of `KUBECONFIG` or ~/.kube/config.
  */
+import { request, type RequestOptions } from "node:http";
+import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { finished } from "node:stream/promises";
 import { isDeepStrictEqual } from "node:util";
 
-import { CoreV1Api, Exec, KubeConfig, type KubernetesObject, KubernetesObjectApi, PatchStrategy, setHeaderOptions, type V1Status, Watch } from "@kubernetes/client-node";
+import { CoreV1Api, Exec, KubeConfig, type KubernetesObject, KubernetesObjectApi, PatchStrategy, setHeaderOptions, type V1Status } from "@kubernetes/client-node";
 import { Cause, Context, Effect, Layer, Predicate, Queue, Result, Schema, Stream } from "effect";
 
 /** What `exec` is given beyond the command. */
@@ -90,6 +92,13 @@ type ExecSocket = Awaited<ReturnType<Exec["exec"]>>;
 
 const DEFAULT_EXEC_MAX_BYTES = 16 * 1024 * 1024;
 
+/**
+ * How long a watch hears nothing before its connection is taken for lost and the watch
+ * fails: two and a half times the minute between the bookmarks the API server sends a watch
+ * that asks for them, however quiet what it watches.
+ */
+const WATCH_SILENCE_MS = 150_000;
+
 /** The kubeconfig alasio runs with: its ServiceAccount in a pod, the default elsewhere. */
 function loadKubeConfig(): KubeConfig {
   const kubeConfig = new KubeConfig();
@@ -137,7 +146,8 @@ export class KubeClient extends Context.Service<KubeClient, {
    * The objects `plural` of `apiVersion` in the namespace that `labelSelector` selects, as
    * they change: first every one there is, as ADDED, then a bookmark annotated
    * INITIAL_EVENTS_END, then each change, until the API ends the watch, as it does now and
-   * then, when the stream ends; a watch that fails fails it.
+   * then, when the stream ends; a watch that fails, or hears nothing for WATCH_SILENCE_MS,
+   * not even a bookmark, fails it.
    */
   readonly watch: (apiVersion: string, plural: string, namespace: string, labelSelector: string) => Stream.Stream<WatchEvent, KubeApiError>;
   /**
@@ -161,8 +171,8 @@ export class KubeClient extends Context.Service<KubeClient, {
   static readonly layer: Layer.Layer<KubeClient> = Layer.sync(KubeClient, () => makeKubeClient(loadKubeConfig()));
 }
 
-/** The client over `kubeConfig`. */
-function makeKubeClient(kubeConfig: KubeConfig): KubeClient["Service"] {
+/** The client over `kubeConfig`, its watches failing after `watchSilenceMs` of silence. */
+export function makeKubeClient(kubeConfig: KubeConfig, { watchSilenceMs = WATCH_SILENCE_MS }: { readonly watchSilenceMs?: number } = {}): KubeClient["Service"] {
   const objects = KubernetesObjectApi.makeApiClient(kubeConfig);
   const core = kubeConfig.makeApiClient(CoreV1Api);
   const executor = new Exec(kubeConfig);
@@ -221,21 +231,49 @@ function makeKubeClient(kubeConfig: KubeConfig): KubeClient["Service"] {
     };
   });
 
-  const watcher = new Watch(kubeConfig);
+  // Asked over node:http, as client-node's ProtoClient asks, not through its Watch: its request timeout, 30 s and not to be
+  // set, ends every watch of something quiet between two of the API server's bookmarks, so each would be listed anew twice a minute.
   const watch = (apiVersion: string, plural: string, namespace: string, labelSelector: string): Stream.Stream<WatchEvent, KubeApiError> =>
     Stream.callback<WatchEvent, KubeApiError>((queue) =>
       Effect.acquireRelease(
         Effect.tryPromise({
-          try: () =>
-            watcher.watch(
-              `/${apiVersion.includes("/") ? "apis" : "api"}/${apiVersion}/namespaces/${namespace}/${plural}`,
-              { labelSelector, sendInitialEvents: true, resourceVersionMatch: "NotOlderThan", allowWatchBookmarks: true },
-              (type, object: KubernetesObject) => void Queue.offerUnsafe(queue, { type: type as WatchEvent["type"], object }),
-              (error: unknown) => void (error ? Queue.failCauseUnsafe(queue, Cause.fail(KubeApiError.of(error))) : Queue.endUnsafe(queue)),
-            ),
+          try: async () => {
+            const url = new URL(`${kubeConfig.getCurrentCluster()?.server ?? ""}/${apiVersion.includes("/") ? "apis" : "api"}/${apiVersion}/namespaces/${namespace}/${plural}`);
+            for (const [name, value] of Object.entries({ watch: "true", labelSelector, sendInitialEvents: "true", resourceVersionMatch: "NotOlderThan", allowWatchBookmarks: "true" })) {
+              url.searchParams.set(name, value);
+            }
+            const options: RequestOptions = {};
+            await kubeConfig.applyToHTTPSOptions(options);
+            const fail = (error: unknown) => void Queue.failCauseUnsafe(queue, Cause.fail(KubeApiError.of(error)));
+            const asked = request(url, options, (response) => {
+              response.on("error", fail);
+              if (response.statusCode !== 200) {
+                response.resume();
+                return fail(Object.assign(new Error(`watching ${url.pathname} was answered ${response.statusCode} ${response.statusMessage}`), { code: response.statusCode }));
+              }
+              const lines = createInterface({ input: response, crlfDelay: Infinity });
+              // What ends the response, the watch ended or its connection lost, ends the lines, which say so as their own error.
+              lines.on("error", fail);
+              lines.on("line", (line) => {
+                try {
+                  const { type, object } = JSON.parse(line) as { readonly type: WatchEvent["type"] | "ERROR"; readonly object: KubernetesObject & V1Status };
+                  // The API server's own end of a watch it cannot go on with, as a Status: 410 where what it watched from is too old.
+                  if (type === "ERROR") fail(Object.assign(new Error(object.message ?? `watching ${url.pathname} failed`), { code: object.code }));
+                  else Queue.offerUnsafe(queue, { type, object });
+                } catch (error) {
+                  fail(error);
+                }
+              });
+              response.on("end", () => void Queue.endUnsafe(queue));
+            });
+            asked.setTimeout(watchSilenceMs, () => asked.destroy(new Error(`the watch of ${url.pathname} heard nothing for ${watchSilenceMs} ms`)));
+            asked.on("error", fail);
+            asked.end();
+            return asked;
+          },
           catch: KubeApiError.of,
         }),
-        (aborting) => Effect.sync(() => aborting.abort()),
+        (asked) => Effect.sync(() => asked.destroy()),
       )
     );
 
