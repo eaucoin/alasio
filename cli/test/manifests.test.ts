@@ -1196,7 +1196,9 @@ describe("object store", () => {
   test("logs in to the filer store as users of its own, each with its own Secret, its default user off: the filers to their keys alone, the collector to INFO, the backups to a snapshot", () => {
     const objects = install();
     const store = container(one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs-filer-store"));
-    assert.deepEqual(store.command, [
+    // Started by the script that waits for any server before it on its volume to end.
+    assert.deepEqual(store.command?.slice(0, 2), ["/bin/sh", "-c"]);
+    assert.deepEqual(store.command?.slice(3), [
       "valkey-server",
       "/etc/valkey/valkey.conf",
       "--user",
@@ -1234,8 +1236,14 @@ describe("object store", () => {
     // Its readiness probe logs in as the collector; workspace storage's Valkey, whose clients log in as its default user, the node agents' beside it, as its default user.
     assert.match(store.readinessProbe?.exec?.command?.[2] ?? "", /^persistence=\$\(valkey-cli --user collector info persistence\)/u);
     const valkey = container(one<V1StatefulSet>(objects, "StatefulSet", "alasio-valkey"));
-    assert.deepEqual(valkey.command?.slice(0, 4), ["valkey-server", "/etc/valkey/valkey.conf", "--requirepass", "$(VALKEY_PASSWORD)"]);
+    assert.deepEqual(valkey.command?.slice(2, 7), [store.command?.[2], "valkey-server", "/etc/valkey/valkey.conf", "--requirepass", "$(VALKEY_PASSWORD)"]);
     assert.match(valkey.readinessProbe?.exec?.command?.[2] ?? "", /^persistence=\$\(valkey-cli info persistence\)/u);
+    // A server waiting for the one before it on its volume, which ends within its pod's grace, is not ended by its liveness probe as it waits.
+    for (const server of [store, valkey]) {
+      const grace = one<V1StatefulSet>(objects, "StatefulSet", server === store ? "alasio-seaweedfs-filer-store" : "alasio-valkey").spec?.template.spec?.terminationGracePeriodSeconds ?? 30;
+      const { periodSeconds = 10, failureThreshold = 3 } = server.startupProbe ?? {};
+      assert.ok(server.startupProbe?.tcpSocket && periodSeconds * failureThreshold >= 2 * grace, `${server.name}'s start-up allows ${periodSeconds * failureThreshold} s`);
+    }
   });
 
   test("backs the filer store up hourly, a snapshot of it as a replica takes one, onto a volume of its own on another node where one takes it, renamed once whole", () => {

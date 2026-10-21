@@ -18,7 +18,7 @@
 import assert from "node:assert/strict";
 import { before, describe, test } from "node:test";
 
-import type { V1CronJob, V1Deployment, V1Pod, V1Service } from "@kubernetes/client-node";
+import type { V1CronJob, V1Deployment, V1Pod, V1Service, V1StatefulSet } from "@kubernetes/client-node";
 
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, selectorLabels } from "../../cli/src/manifests/common.ts";
@@ -443,6 +443,41 @@ export function workspaceStorage(): void {
         assert.equal(await fixtureDigest(none), fixture);
       });
     }
+
+    test("a second Valkey started on alasio-valkey's volume, as a pod deleted outright is made anew while its server runs, serves nothing until the first has ended", async () => {
+      const template = (await kube.get<V1StatefulSet>(ref("StatefulSet", VALKEY, NAMESPACE)))?.spec?.template.spec;
+      const server = template?.containers.find(({ name }) => name === "valkey");
+      assert.ok(template && server, "alasio-valkey has no server");
+      const second = `${VALKEY}-second`;
+      // Its server alone, unprobed, as nothing waits for it to be ready.
+      const { readinessProbe: _readiness, livenessProbe: _liveness, startupProbe: _startup, ...unprobed } = server;
+      const pod: V1Pod = {
+        apiVersion: "v1",
+        kind: "Pod",
+        metadata: { name: second, namespace: NAMESPACE },
+        spec: {
+          ...template,
+          containers: [unprobed],
+          volumes: [...(template.volumes ?? []), { name: "data", persistentVolumeClaim: { claimName: `data-${VALKEY}-0` } }],
+        },
+      };
+      await kube.apply(pod);
+      try {
+        await until(`${second} running`, async () => ((await kube.get<V1Pod>(ref("Pod", second, NAMESPACE)))?.status?.containerStatuses?.[0]?.state?.running ? true : undefined));
+        // Long past what a server that started anyway, loading the append-only file, would take to listen.
+        await sleep(30_000);
+        // No server runs in it, and none takes connections: one loading the file would answer LOADING.
+        const servers = await kube.execOk(NAMESPACE, second, ["sh", "-c", "cat /proc/[0-9]*/comm"]);
+        assert.doesNotMatch(servers, /valkey-server/u);
+        const answered = await kube.execOk(NAMESPACE, second, ["sh", "-c", "valkey-cli ping 2>&1 || true"]);
+        assert.match(answered, /Could not connect|Connection refused/u);
+        assert.match(await kube.logs(NAMESPACE, second, "valkey"), /waiting for the Valkey that holds \/data\/valkey\.lock to end/u);
+        // The first serves on, whole.
+        assert.equal(await fixtureDigest(none), fixture);
+      } finally {
+        await kube.remove(ref("Pod", second, NAMESPACE));
+      }
+    });
 
     test("the daily quota check checks each workspace's quota, which is consistent after it", async () => {
       await runCronJob(componentName("juicefs-quota-check"));

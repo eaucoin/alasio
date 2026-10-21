@@ -11,6 +11,10 @@
  *   loses none of it, where once a second loses what it answered in the second before; and
  *   written with a snapshot as its preamble, so a rewrite is a snapshot; at a start the file
  *   is loaded, as the more complete, and the server is ready only once it has been;
+ * - one server on its volume at a time (oneAtATime): a pod deleted outright, as
+ *   `kubectl delete --force` deletes one, is made anew by its StatefulSet at once while its
+ *   server still runs, answering the clients it holds connections from, and one that loaded
+ *   the files then would lose what the other wrote after;
  * - memory: a `maxmemory` under the container's limit, leaving room for the fork that
  *   writes snapshots and for deletions once it is reached, and the policy `noeviction`, as
  *   an evicted key is lost metadata.
@@ -34,6 +38,29 @@ export const VALKEY_PORT = 6379;
 
 /** The uid and gid of the image's `valkey` user. */
 const VALKEY_UID = 999;
+
+/** The lock of a Valkey's volume, which its server holds as long as it runs. */
+const VALKEY_LOCK = "/data/valkey.lock";
+
+/**
+ * The script a Valkey's server is started by, the server's command its arguments: once no
+ * other server holds `lock`, the lock of its volume, which it then holds as long as it runs,
+ * on a descriptor it keeps across its exec, so the kernel lets it go as it ends however it
+ * ends. Where the lock cannot be opened or taken (flock failing, or killed as it waits), the
+ * script ends, and with it the container, starting no server. The lock is on the volume
+ * itself, which one node alone mounts: that holds of local-path and of ReadWriteOnce block
+ * storage, not of a shared file system such as NFS, which two nodes may mount at once. A
+ * server waiting on it listens on nothing, so its pod is not ready and its Service routes
+ * nothing to it.
+ */
+export const oneAtATime = (lock: string): string => [
+  `exec 9>>${lock} || exit 1`,
+  "if ! flock -n 9; then",
+  `  echo "waiting for the Valkey that holds ${lock} to end" >&2`,
+  `  flock 9 || { echo "could not take ${lock}" >&2; exit 1; }`,
+  "fi",
+  'exec "$0" "$@"',
+].join("\n");
 
 /**
  * A user of a Valkey's own: its name, the Secret its password is in (as `password`), what
@@ -163,7 +190,7 @@ export function valkeyObjects(config: InstallConfig, instance: ValkeyInstance, s
             name: "valkey",
             image: imageReference(instance.image),
             imagePullPolicy: "IfNotPresent",
-            command: ["valkey-server", "/etc/valkey/valkey.conf", ...login.args],
+            command: ["/bin/sh", "-c", oneAtATime(VALKEY_LOCK), "valkey-server", "/etc/valkey/valkey.conf", ...login.args],
             // VALKEYCLI_AUTH is valkey-cli's password, for the readiness probe.
             env: login.env,
             ports: [{ name: "valkey", containerPort: VALKEY_PORT }],
@@ -179,7 +206,11 @@ export function valkeyObjects(config: InstallConfig, instance: ValkeyInstance, s
               periodSeconds: 5,
               timeoutSeconds: 3,
             },
-            livenessProbe: { tcpSocket: { port: "valkey" }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 6 },
+            // Started once it listens, which it does only once the server before it on its volume
+            // has ended (within that pod's grace) and its append-only file is loaded: five minutes
+            // for both, so the wait is not ended by the liveness probe and put back by a crash loop.
+            startupProbe: { tcpSocket: { port: "valkey" }, periodSeconds: 5, failureThreshold: 60 },
+            livenessProbe: { tcpSocket: { port: "valkey" }, periodSeconds: 10, failureThreshold: 6 },
             securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
             resources: instance.resources,
             volumeMounts: [{ name: "data", mountPath: "/data" }, { name: "config", mountPath: "/etc/valkey", readOnly: true }],
