@@ -279,6 +279,8 @@ if (inShard("upgrade")) {
     /** The folder mounted in the other chat, which holds a file. */
     let folder: string;
     let messages: number;
+    /** Main's conversation's Codex thread, and the thread its history starts in, which 9.0.0 kept the rollouts of and no row names. */
+    let lineage: { readonly store: string; readonly thread: string; readonly parent: string; readonly parentFile: string };
     /** Runs `sql` on the storage controller's database, neon-control's record among it: what psql printed. */
     const onRecord = async (sql: string) =>
       (await kube.execOk(NAMESPACE, `${neonName("controller-db")}-0`, ["psql", "-U", "storage_controller", "-d", "storage_controller", "-Atc", sql], { container: "postgres" })).trim();
@@ -358,6 +360,7 @@ if (inShard("upgrade")) {
         seeds: "main at work in a session workspace, a file written in it and a turn on Codex there, and the folder chat at work in a folder of its own, a file in it",
         seed: async () => {
           volumeId = await workInMain();
+          lineage = await seedLineage();
           await tg.say("hello", FOLDER_CHAT);
           await tg.waitFor((call) => answered(call, FOLDER_CHAT));
           folder = await onDatabase(NAMESPACE, `select working_directory from state.conversations where id = 'telegram:${FOLDER_CHAT}'`);
@@ -374,6 +377,7 @@ if (inShard("upgrade")) {
           await tg.say("again");
           await tg.waitFor((call) => answered(call));
           assert.equal(await inSession(volumeId, 'process.stdout.write(require("fs").readFileSync("/workspace/proof", "utf8"))'), "written by main");
+          await lineageResumed(lineage);
           await tg.say("again", FOLDER_CHAT);
           await tg.waitFor((call) => answered(call, FOLDER_CHAT));
           assert.equal(readFileSync(`${folder}/proof`, "utf8"), "written by the folder chat");
@@ -3285,6 +3289,57 @@ async function workInMain(): Promise<string> {
     await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /^Active: Codex$/mu.test(call.payload.text ?? ""));
   }
   return volumeId;
+}
+
+/**
+ * Main's conversation's Codex thread given a history starting in another thread, as a fork's
+ * does, which 9.0.0 kept the rollout of in Neon and no row of main's names: its rollout's
+ * history_base that one's, of the store its rollout is kept in.
+ */
+async function seedLineage(): Promise<{ readonly store: string; readonly thread: string; readonly parent: string; readonly parentFile: string }> {
+  const thread = await onDatabase(NAMESPACE, "select codex_session_id from state.conversations where id = 'telegram:1001'");
+  assert.match(thread, /^[0-9a-f-]{36}$/u, "main's conversation has a Codex thread");
+  const store = await onDatabase(NAMESPACE, `select s from (values ('codex_sessions'), ('codex_sessionfs_sessions')) as v(s) where to_regclass(s || '.rollouts') is not null and exists (select from pg_tables where schemaname = s) order by s desc`)
+    .then(async (stores) => {
+      for (const candidate of stores.split("\n").filter(Boolean)) {
+        if (await onDatabase(NAMESPACE, `select count(*) from ${candidate}.rollouts where thread_id = '${thread}'`) !== "0") return candidate;
+      }
+      throw new Error(`no store keeps the rollout of ${thread}`);
+    });
+  const parent = randomUUID();
+  const parentFile = `rollout-2026-01-01T00-00-00-${parent}.jsonl`;
+  const meta = `${JSON.stringify({ timestamp: "2026-01-01T00:00:00.000Z", type: "session_meta", payload: { id: parent, timestamp: "2026-01-01T00:00:00.000Z", cwd: "/", source: "vscode" } })}\n`;
+  await onDatabase(NAMESPACE, [
+    `insert into ${store}.rollouts (name, path, thread_id, rollout_id, history_base, size, head_digest, modified_ms) values ('${parentFile}', 'sessions/2026/01/01/${parentFile}', '${parent}', '${parent}', null, ${Buffer.byteLength(meta)}, 'seeded', 1767225600000)`,
+    `insert into ${store}.rollout_chunks (name, start, bytes) values ('${parentFile}', 0, convert_to('${meta.replaceAll("'", "''")}', 'UTF8'))`,
+    `update ${store}.rollouts set history_base = '${parent}' where thread_id = '${thread}'`,
+  ].join("; "));
+  return { store, thread, parent, parentFile };
+}
+
+/**
+ * Main's conversation's thread resumed by its pod after the upgrade, its lineage with it: the
+ * thread and the one its history starts in its conversation's alone, the pod having written the
+ * other back where its Codex reads it; and no pod of another conversation can claim either.
+ */
+async function lineageResumed({ store, thread, parent, parentFile }: { readonly store: string; readonly thread: string; readonly parent: string; readonly parentFile: string }): Promise<void> {
+  assert.equal(await onDatabase(NAMESPACE, `select string_agg(session_id || ' ' || conversation_id, ',' order by session_id) from state.conversation_sessions where session_id in ('${thread}', '${parent}')`),
+    [`${thread} telegram:1001`, `${parent} telegram:1001`].sort().join(","));
+  const [pod] = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "alasio.dev/binding" }))
+    .filter(({ metadata }) => metadata?.annotations?.["alasio.dev/binding-key"] === "harness:telegram:1001" && metadata.deletionTimestamp === undefined);
+  assert.ok(pod?.metadata?.name, "no pod is bound to main's conversation's harness");
+  const home = store === "codex_sessionfs_sessions" ? "/var/lib/alasio/state/sessionfs/codex" : "/var/lib/alasio/codex";
+  assert.match(await kube.execOk(NAMESPACE, pod.metadata.name, ["sh", "-c", `find ${home} -name '${parentFile}'`], { container: "harness" }), new RegExp(parentFile.replaceAll(".", "\\."), "u"));
+  // A pod of another conversation, by a grant of its own, claims neither: in one transaction, never committed, the select its last statement, which psql prints.
+  const claimed = await onDatabase(NAMESPACE, [
+    "begin",
+    "insert into state.conversations (id, transport, chat_id) values ('e2e:other', 'e2e', 'other')",
+    "insert into state.harness_grants (conversation_id, binding, secret_sha256) values ('e2e:other', 'e2e', sha256(convert_to('e2e-grant', 'UTF8')))",
+    "set local role harness",
+    "select set_config('alasio.harness_grant', 'e2e-grant', true)",
+    `select state.harness_claim('${thread}')::text || ' ' || state.harness_claim('${parent}')::text || ' ' || (select count(*) from ${store}.rollouts where thread_id in ('${thread}', '${parent}'))`,
+  ].join("; "));
+  assert.equal(claimed.split("\n").filter(Boolean).at(-1), "false false 0");
 }
 
 /**

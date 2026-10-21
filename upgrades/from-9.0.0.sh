@@ -6,7 +6,7 @@
 # for k3s on this machine). Everything is recorded in OUT, which is to be on a disk that
 # outlives a restart of the machine, as /tmp may not.
 #
-#   UPGRADE=<command> UPGRADE_CHECK=<command> CONFIG=<file> OUT=<dir> [FAIL_AT=<point>] upgrades/from-9.0.0.sh
+#   UPGRADE=<command> UPGRADE_CHECK=<command> SETUP_POD=<command> CONFIG=<file> OUT=<dir> [FAIL_AT=<point>] upgrades/from-9.0.0.sh
 #
 # CONFIG is the configuration's file, the owner's alasio/config.json, which UPGRADE upgrades
 # by and the steps below read, and change where they say.
@@ -19,8 +19,11 @@
 #   as='sudo -u <owner> env HOME=/home/<owner> PATH=<node bin>:/usr/local/bin:/usr/bin:/bin'
 #   UPGRADE="$as npx --yes alasio@<v> upgrade --timeout 30m"
 #   UPGRADE_CHECK="$as npx --yes alasio@<v> upgrade --check && sudo -u <owner> sudo -n true"
+#   SETUP_POD="$as npx --yes alasio@<v> upgrade --setup-pod"
 #
-# the last proving that the owner's sudo asks for no password, which the upgrade does what it
+# SETUP_POD prints, changing nothing, the release's pod that makes alasio's state alone (its
+# `alasio setup`), which the cut-over runs before the upgrade, as its sessions' conversations
+# say. The last of UPGRADE_CHECK proving that the owner's sudo asks for no password, which the upgrade does what it
 # does as root through. FAIL_AT=before-the-point-of-no-return fails the run there, once every
 # step before the upgrade has run; FAIL_AT=past-the-point-of-no-return past it, before the
 # upgrade; and FAIL_AT=after-the-upgrade once the upgrade is through, before what follows it:
@@ -42,7 +45,7 @@
 # and once the upgrade went through (OUT/upgraded), with what follows it alone.
 set -euo pipefail
 umask 077
-: "${UPGRADE:?the upgrade of the release, run as the owner of the configuration}" "${UPGRADE_CHECK:?a command proving UPGRADE can run}" "${CONFIG:?the file of the configuration}" "${OUT:?where to record}"
+: "${UPGRADE:?the upgrade of the release, run as the owner of the configuration}" "${UPGRADE_CHECK:?a command proving UPGRADE can run}" "${SETUP_POD:?a command printing the release's pod that makes alasio's state}" "${CONFIG:?the file of the configuration}" "${OUT:?where to record}"
 mkdir -p "$OUT"
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$OUT/events.log" >&2; }
 fail() {
@@ -141,7 +144,105 @@ alasio_stopped_past() {
 }
 # END alasio stopped.
 
-command -v kubectl >/dev/null || fail "kubectl is not on root's PATH"
+# BEGIN the sessions' conversations.
+#
+# This release holds each harness pool's pod to its own conversation's rows, a transcript's or a
+# rollout's among them by the sessions its conversation has (state.conversation_sessions), which
+# its schema makes, and fills as rows naming sessions are written from then on. 9.0.0's rows name
+# sessions it never recorded so, and a pod resuming one of them would find nothing of it, a Codex
+# thread's lineage among it, as the prompts queued through the upgrade run the moment the
+# release's alasio serves. So, past the point of no return, once alasio is stopped, before the
+# upgrade, the release's own setup (`alasio setup`, the pod SETUP_POD prints, which checked before
+# the point of no return that it could) makes the release's state as its alasio would as it
+# starts, which that alasio then finds made; and a pod of the same spec gives each conversation
+# the sessions its rows name. Once, as OUT/sessions-claimed says it was; each pod's last lines
+# kept in OUT, waited for SETUP_WAIT_SECONDS (10 min) at most, and deleted after.
+
+SETUP_WAIT_SECONDS=${SETUP_WAIT_SECONDS:-600}
+SETUP_POD_NAME=alasio-setup
+# Every session a conversation's row names, the conversation's: the rows this release's schema
+# records them from as they are written (src/persistence/schema.ts SESSION_ROWS); and of each, the
+# Codex threads its history starts in, transitively, as its rollouts kept in Neon say them, which
+# 9.0.0's alasio wrote, so a thread resumed has its lineage, as this release gives it them as a row
+# names a thread (state.claim_lineage). How many sessions the conversations have then.
+SESSIONS_CLAIMED="
+insert into state.conversation_sessions (session_id, conversation_id)
+select named.session_id, named.conversation_id from (
+  select codex_session_id as session_id, id as conversation_id from state.conversations
+  union select claude_session_id, id from state.conversations
+  union select session_id, conversation_id from state.workspace_sessions
+  union select session_id, conversation_id from state.messages
+  union select session_id, conversation_id from state.turns
+  union select session_id, thread_key from state.responses
+  union select session_id, thread_key from state.restart_events
+  union select upstream_session_id, conversation_id from state.prompt_jobs
+  union select expected_session_id, conversation_id from state.callback_actions
+) named join state.conversations c on c.id = named.conversation_id
+where named.session_id is not null
+on conflict do nothing;
+select count(state.claim_lineage(session_id, conversation_id)) from (select session_id, conversation_id from state.conversation_sessions) claimed;
+select count(*) from state.conversation_sessions"
+# The release's setup pod, as SETUP_POD printed it, before the point of no return: it changes nothing.
+sessions_claimed_before() {
+  bash -c "$SETUP_POD" >"$OUT/setup-pod.json" 2>"$OUT/setup-pod.log" || fail "SETUP_POD failed, so the release's setup could not run (setup-pod.log): $(tail -n 3 "$OUT/setup-pod.log")"
+  jq -e '.kind == "Pod" and (.spec.containers | length) == 1' "$OUT/setup-pod.json" >/dev/null || fail "SETUP_POD printed no pod of one container (setup-pod.json)"
+}
+# Runs the setup pod, as named `$1`, with its container's command `$2` (a JSON array) and, where
+# given, its SQL `$3`, to its end: its last lines in OUT/<name>.log; failing where it did not succeed.
+one_off() {
+  local name=$1 phase waited=0
+  jq --arg name "$name" --argjson command "$2" --arg sql "${3:-}" '
+    .metadata.name = $name
+    | .spec.containers[0].command = $command
+    | if $sql == "" then . else .spec.containers[0].env += [{ name: "ALASIO_CUTOVER_SQL", value: $sql }] end
+  ' "$OUT/setup-pod.json" >"$OUT/$name.json" || fail "the pod $name could not be made of setup-pod.json"
+  k delete pod "$name" --ignore-not-found --wait >/dev/null || fail "a pod $name left before could not be deleted"
+  k apply -f "$OUT/$name.json" >/dev/null || fail "the pod $name could not be made"
+  while :; do
+    phase=$(k get pod "$name" -o jsonpath='{.status.phase}') || fail "the pod $name could not be read"
+    [ "$phase" != Succeeded ] && [ "$phase" != Failed ] || break
+    [ "$waited" -lt "$SETUP_WAIT_SECONDS" ] || fail "the pod $name had not ended within ${SETUP_WAIT_SECONDS} s"
+    sleep "$POLL_SECONDS"
+    waited=$((waited + POLL_SECONDS))
+  done
+  k logs "$name" >"$OUT/$name.log" 2>&1 || true
+  k delete pod "$name" --wait >/dev/null || fail "the pod $name could not be deleted"
+  [ "$phase" = Succeeded ] || fail "the pod $name failed ($name.log): $(tail -n 3 "$OUT/$name.log")"
+}
+# What runs SQL on alasio's database, as alasio reaches it, from its pod: ALASIO_CUTOVER_SQL's
+# statements, the rows of the last printed a line each, tab-separated.
+ON_DATABASE='import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+const pg = createRequire("/opt/alasio/package.json")("pg");
+try {
+  const url = process.env.ALASIO_DATABASE_URL ?? readFileSync(process.env.ALASIO_DATABASE_URL_FILE, "utf8");
+  const client = new pg.Client({ connectionString: url.trim(), connectionTimeoutMillis: 120000 });
+  await client.connect();
+  try {
+    for (const { rows } of [await client.query({ text: process.env.ALASIO_CUTOVER_SQL, rowMode: "array" })].flat()) {
+      for (const row of rows ?? []) console.log(row.map((value) => String(value ?? "")).join("\t"));
+    }
+  } finally {
+    await client.end();
+  }
+} catch (error) {
+  // Said on one line, the last of its log the cut-over says: what failed, reaching the database or running the SQL, with its code.
+  console.error(`it failed: ${error.code ?? "no code"}: ${error.message}${error.where ? ` (${error.where})` : ""}`);
+  process.exitCode = 1;
+}'
+# Past the point of no return, alasio stopped, before the upgrade: the release's state made, and the sessions given, once.
+sessions_claimed_past() {
+  [ ! -e "$OUT/sessions-claimed" ] || return 0
+  log "making this release's state with its own setup, as its alasio would as it starts (alasio-setup.log)"
+  one_off "$SETUP_POD_NAME" '["node", "/opt/alasio/src/setup/main.ts"]'
+  log "giving each conversation the sessions its rows name (alasio-sessions-claimed.log)"
+  one_off alasio-sessions-claimed "$(jq -cn --arg script "$ON_DATABASE" '["node", "--input-type=module", "-e", $script]')" "$SESSIONS_CLAIMED"
+  tail -n 1 "$OUT/alasio-sessions-claimed.log" >"$OUT/sessions-claimed"
+  log "the conversations have $(cat "$OUT/sessions-claimed") sessions, of their rows and the threads their histories start in"
+}
+# END the sessions' conversations.
+
+for tool in jq kubectl; do command -v "$tool" >/dev/null || fail "$tool is not on root's PATH"; done
 [ -r "$CONFIG" ] || fail "CONFIG $CONFIG cannot be read"
 kubectl get --raw=/readyz >/dev/null 2>&1 || fail "kubectl does not reach the cluster: give it k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
 
@@ -156,6 +257,7 @@ if [ ! -e "$OUT/point-of-no-return" ]; then
   [ -z "$branches" ] ||
     fail "alasio upgrades main alone, and the branch environments 9.0.0 made would not run on what upgrading changes: delete each first ($(printf '%s\n' "$branches" | awk 'NR > 1 { printf ", " } { printf "alasio branch delete %s", $0 }')), and make them again once alasio is upgraded"
   sandbox_image_before
+  sessions_claimed_before
   log "checking that the upgrade can run (upgrade-check.log)"
   accepted || fail "UPGRADE_CHECK failed, so UPGRADE could not run (upgrade-check.log): $(tail -n 3 "$OUT/upgrade-check.log")"
   [ "${FAIL_AT:-}" != before-the-point-of-no-return ] || fail "a failure injected before the point of no return"
@@ -166,6 +268,7 @@ fi
 if [ ! -e "$OUT/upgraded" ]; then
   [ "${FAIL_AT:-}" != past-the-point-of-no-return ] || fail "a failure injected past the point of no return, before the upgrade"
   alasio_stopped_past
+  sessions_claimed_past
   log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
   printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
   bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" ||

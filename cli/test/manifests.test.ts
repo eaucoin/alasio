@@ -55,6 +55,7 @@ import { carriedPools, workspaceMountReady, workspaceMountScript } from "../src/
 import { folderStateDir, templateHash } from "../../src/gateway/names.ts";
 import { hookOf } from "../../src/gateway/snapshots.ts";
 import { VERSION } from "../src/release.ts";
+import { SETUP_LABEL, setupPod } from "../src/setup-pod.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
 /** A NetworkPolicy as rendered, its ingress rules' peers under `from`. */
@@ -3860,4 +3861,22 @@ describe("conversations' harnesses' pools", () => {
     assert.equal(connects(both, gateway, branchPod, 8080), true);
     assert.equal(connects(both, branchPod, proxy, 5432), true);
   });
+});
+
+test("the release's setup pod is alasio's own container, its image, environment and Secrets, run once to its end, serving nothing and mounting none of the machine's folders, labelled as alasio's pods but by no ReplicaSet", () => {
+  const objects = install({ host: { enabled: true, uid: 1001, gid: 1002, home: "/home/op", mounts: [{ name: "home", hostPath: "/home/op", mountPath: "/home/op" }] } });
+  const deployment = one<V1Deployment>(objects, "Deployment", "alasio");
+  const alasio = container(deployment);
+  const pod = setupPod(objects);
+  assert.deepEqual([pod.kind, pod.metadata?.name, pod.metadata?.namespace, pod.spec?.restartPolicy], ["Pod", "alasio-setup", "alasio", "Never"]);
+  assert.deepEqual(pod.metadata?.labels, { ...deployment.spec?.template.metadata?.labels, [SETUP_LABEL]: "true" });
+  const [setup, ...others] = pod.spec?.containers ?? [];
+  assert.deepEqual(others, []);
+  assert.deepEqual([setup?.image, setup?.env, setup?.command], [alasio.image, alasio.env, ["node", "/opt/alasio/src/setup/main.ts"]]);
+  assert.deepEqual([setup?.ports, setup?.readinessProbe, setup?.livenessProbe], [undefined, undefined, undefined]);
+  // The machine's folders, which the host profile mounts into alasio, none of its.
+  assert.ok(deployment.spec?.template.spec?.volumes?.some(({ hostPath }) => hostPath !== undefined));
+  assert.equal(pod.spec?.volumes?.some(({ hostPath }) => hostPath !== undefined), false);
+  assert.ok(setup?.volumeMounts?.every(({ name }) => pod.spec?.volumes?.some((volume) => volume.name === name)));
+  assert.equal(pod.spec?.serviceAccountName, "alasio");
 });

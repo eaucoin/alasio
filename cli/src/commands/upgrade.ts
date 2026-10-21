@@ -10,6 +10,7 @@ import { kind, KubeApi } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR } from "../kube/apply.ts";
 import { RELEASE } from "../manifests/common.ts";
 import { VERSION } from "../release.ts";
+import { setupPod } from "../setup-pod.ts";
 import { describeTarget, kubeApi, resolveTarget } from "../target.ts";
 import { timeoutFlag, waitOptions } from "./common.ts";
 import { announce, ensureCluster, refuseFirst } from "./up.ts";
@@ -53,10 +54,18 @@ export const upgrade = Command.make("upgrade", {
     Flag.withDefault(false),
     Flag.withDescription("Check only, changing nothing, that alasio would upgrade: fail with what it would refuse, if anything"),
   ),
-}, ({ timeout, check }) =>
+  setupPod: Flag.Boolean("setup-pod").pipe(
+    Flag.withDefault(false),
+    Flag.withDescription("Print, as JSON, changing nothing, the pod of this version's alasio that makes its state alone, for a cut-over to run before the upgrade"),
+  ),
+}, ({ timeout, check, setupPod: printSetupPod }) =>
   Effect.gen(function*() {
     const config = yield* loadConfig;
     const target = yield* resolveTarget(config);
+    if (printSetupPod) {
+      const objects = yield* Effect.provide(Effect.map(installConfig(config), (made) => installationObjects(made)), kubeApi(target));
+      return yield* Console.log(JSON.stringify(setupPod(objects), null, 2));
+    }
     if (check) {
       yield* Effect.provide(refusals(config), kubeApi(target));
       return yield* Console.log(`alasio would upgrade ${describeTarget(target)} to ${VERSION}: it refuses nothing there now; nothing was changed.`);

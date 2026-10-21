@@ -903,7 +903,8 @@ const shellWord = (word: string): string => `'${word.replaceAll("'", `'\\''`)}'`
  * the configuration first (./release-config.ts), as this checkout's command line, of no
  * release, pins no images of its own, and its UPGRADE_CHECK this checkout's
  * `alasio upgrade --check` as this user, on a copy of the configuration laid over so, as the
- * configuration itself is laid over only as UPGRADE runs, and sudo asking this user for no
+ * configuration itself is laid over only as UPGRADE runs, its SETUP_POD this checkout's
+ * `alasio upgrade --setup-pod`, on another such copy, and sudo asking this user for no
  * password; failing at `failAt`, a point the script names, when given. What it came to; from
  * its success on, the run runs this checkout's `alasio`.
  */
@@ -930,9 +931,17 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
     command(...owner(copy), release, "upgrade", "--check"),
     command("sudo", "-u", user, "sudo", "-n", "true"),
   ].join(" && ");
+  // The release's setup pod, printed of a copy of the configuration laid over so too, as it is printed before anything changes.
+  const setupCopy = join(work, "setup-config");
+  const setupPod = [
+    command(...owner(configHome), "rm", "-rf", setupCopy),
+    command(...owner(configHome), "cp", "-a", configHome, setupCopy),
+    configured(setupCopy),
+    command(...owner(setupCopy), release, "upgrade", "--setup-pod"),
+  ].join(" && ");
   const out = cutOverRecord();
   console.error(`# the cut-over from ${PREVIOUS}: upgrades/from-${PREVIOUS}.sh, recording in ${out}`);
-  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `OUT=${out}`, `CONFIG=${join(configHome, "alasio", "config.json")}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
+  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `OUT=${out}`, `CONFIG=${join(configHome, "alasio", "config.json")}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, `SETUP_POD=${setupPod}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
     stdio: ["ignore", "pipe", "pipe"],
   }));
   if (ran.code === 0) current().bin = release;
