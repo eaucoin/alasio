@@ -943,6 +943,8 @@ test("a pod tells the front with its binding's token alone, while its binding is
     assert.equal((await tell(of1("binding-1"), "x".repeat(TOLD_BYTES + 1))).status, 413);
     assert.equal((await tell(of1("binding-1"), "", "GET")).status, 405);
     assert.equal(told.length, 1);
+    // Nor does a pod reach anything else of the front's, a wake of the lake's loader among it: no path but /events takes a binding's token.
+    for (const path of ["/wake", "/lake", "/bind"]) assert.equal((await fetch(`http://127.0.0.1:${served.port}${path}`, { method: "POST", headers: { authorization: of1("binding-1") }, body: '{"lsn":"FFFFFFFF/FFFFFFFF"}' })).status, 401, path);
     // None of it reached a pod, nor bound one.
     assert.deepEqual(stand.sent, []);
   } finally {

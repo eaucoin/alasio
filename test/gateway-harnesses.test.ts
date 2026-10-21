@@ -446,6 +446,8 @@ test("what a bound host tells is told its environment's alasio as the host's, of
     [env.home, { kind: "harness.idle", subject: { kind: "conversation", key: "telegram:42" } }, 403],
     [env.home, { kind: "harness.idle", subject, id: "00000000-0000-4000-8000-000000000001" }, 400],
     [env.home, { kind: "harness.idle", subject, source: "sandbox-gateway" }, 400],
+    // Nor any WAL position, which the lake's loader would wait for: alasio alone names one, of its own read.
+    [env.home, { kind: "harness.idle", subject, lsn: "FFFFFFFF/FFFFFFFF" }, 400],
     [env.home, { kind: "harness.idle", subject: { ...subject, kind: "workspace" } }, 400],
     ["elsewhere", { kind: "harness.idle", subject }, 403],
   ] as const;
