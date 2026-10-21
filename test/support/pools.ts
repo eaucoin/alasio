@@ -113,6 +113,11 @@ export async function pooledStore({ workingDirectory = null, branch = null, hand
   return Object.assign(store, { [DATABASE]: { url: database.url, pool, harnessUrl: harnessUrl.toString() } satisfies PooledDatabase });
 }
 
+/** The pool, as alasio, of the database of `store`, where it is one of pooledStore's (or a store a test made of one), and null otherwise. */
+export function pooledPoolOf(store: Store["Service"]): pg.Pool | null {
+  return databaseOf(store)?.pool ?? null;
+}
+
 /** The pool, as alasio, of the database of `store`, one of pooledStore's, for a test to read or change it as no store does. */
 export function poolOf(store: Store["Service"]): pg.Pool {
   const database = databaseOf(store);

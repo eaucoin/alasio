@@ -5,14 +5,17 @@
  * it.
  */
 import { Effect, Layer, ManagedRuntime } from "effect";
+import type pg from "pg";
 
 import { CodexAppServer } from "../../src/codex/app-server/client.ts";
+import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../../src/codex/rollouts/store.ts";
 import { EventsConsumer } from "../../src/events/consume.ts";
 import { Turns } from "../../src/codex/turns.ts";
 import { ActiveTurns } from "../../src/harness/active-turns.ts";
-import type { HarnessHost } from "../../src/harness/host.ts";
-import { type Harness, Harnesses } from "../../src/harness/index.ts";
-import type { HarnessName } from "../../src/harness/names.ts";
+import { HarnessHost } from "../../src/harness/host.ts";
+import { type Harness, Harnesses, type ModelOption } from "../../src/harness/index.ts";
+import { CLAUDE_HARNESS, CODEX_HARNESS, type HarnessName } from "../../src/harness/names.ts";
+import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { Panels } from "../../src/harness/panels.ts";
 import { HostBayma } from "../../src/mcp/bayma.ts";
 import { Mounts } from "../../src/operator/mounts.ts";
@@ -27,7 +30,8 @@ import type { TelegramClient } from "../../src/telegram/client.ts";
 import { MediaGroups } from "../../src/telegram/media-group-buffer.ts";
 import { Outbox, type OutboxStatus, type OutboxText } from "../../src/telegram/outbox.ts";
 import { TracingLayer } from "../../src/telemetry/index.ts";
-import { pooledHost, type Pools } from "./pools.ts";
+import { pooledHost, pooledPoolOf, type Pools } from "./pools.ts";
+import { testPool } from "./store.ts";
 import { recordingTelegram } from "./telegram-calls.ts";
 
 /** An outbox that queues nothing, for turns whose replies a test does not follow. */
@@ -124,6 +128,8 @@ export interface TestServicesOptions {
   readonly hostBayma?: HostBayma["Service"] | undefined;
   /** The branch environment alasio is, if it is one. */
   readonly branch?: string | undefined;
+  /** The models each harness offers, as the panels list them; a listing a test gives none of fails. */
+  readonly models?: Partial<Record<HarnessName, readonly ModelOption[]>> | undefined;
   /** What the harness host is made into, for a test that stands in for part of it: as made unless given. */
   readonly host?: ((host: HarnessHost["Service"]) => HarnessHost["Service"]) | undefined;
 }
@@ -142,11 +148,12 @@ function testServices({
   hostBayma,
   branch,
   host,
+  models = {},
 }: TestServicesOptions): Layer.Layer<AlasioServices | Pools> {
   return Layer.effectDiscard(Effect.flatMap(EventsConsumer, (consumer) => consumer.start)).pipe(Layer.provideMerge(MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot, branch }), Authorizer.layer(allowedUserIds))),
     Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer()),
-    Layer.provideMerge(Panels.ofHarnesses),
+    Layer.provideMerge(testPanels({ stateDir, branch, models })),
     // Its harnesses run where a pool's do: in a pod's host, bound for the conversation, reached through the sandbox gateway's front.
     Layer.provideMerge(pooledHost({ standIns: { overrides: harnesses }, branch, host })),
     Layer.provideMerge(Harnesses.layer({ overrides: harnesses, branch })),
@@ -162,6 +169,37 @@ function testServices({
     )),
     Layer.provideMerge(Layer.mergeAll(Layer.succeed(Store, store), telegram)),
   )));
+}
+
+/** The stores' schemas made, once of each database, as services made at once would make them each at once. */
+const made = new WeakMap<pg.Pool, Promise<void>>();
+const storesMade = (pool: pg.Pool, stores: Readonly<Record<string, { readonly ensureSchema: () => Promise<void> }>>): Promise<void> => {
+  let making = made.get(pool);
+  if (!making) {
+    making = (async () => {
+      for (const store of Object.values(stores)) await store.ensureSchema();
+    })();
+    made.set(pool, making);
+  }
+  return making;
+};
+
+/**
+ * The operator's panels, as alasio's are (src/harness/panels.ts): the sessions as Neon keeps
+ * them, in the store's database where it is one of pooledStore's, the test file's otherwise; a
+ * fork, and a thread's goals, of the conversation's pod; and the models `models` says.
+ */
+function testPanels({ stateDir = "/nonexistent-state-dir", branch, models }: { readonly stateDir?: string | undefined; readonly branch?: string | undefined; readonly models: Partial<Record<HarnessName, readonly ModelOption[]>> }): Layer.Layer<Panels, never, Store | HarnessHost | CodexAppServer> {
+  const listed = (harness: HarnessName) => (): Effect.Effect<ModelOption[]> => {
+    const offered = models[harness];
+    return offered ? Effect.succeed([...offered]) : Effect.die(new Error(`the test offers no ${harness} models`));
+  };
+  return Layer.unwrap(Effect.gen(function*() {
+    const pool = pooledPoolOf(yield* Store) ?? (yield* Effect.promise(testPool));
+    const stores = { sessionStore: new NeonSessionStore(pool), codexRollouts: new NeonRolloutStore(pool), sessionFsCodexRollouts: new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA }) };
+    yield* Effect.promise(() => storesMade(pool, stores));
+    return Panels.layer({ ...stores, stateDir, branch, claudeModels: listed(CLAUDE_HARNESS), codexModels: listed(CODEX_HARNESS) });
+  }));
 }
 
 /** alasio's services for one test, which runs its effects in them. */

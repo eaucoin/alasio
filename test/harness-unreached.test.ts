@@ -11,8 +11,8 @@ import { Array as Arr, Effect, Logger } from "effect";
 
 import { shownBusy, stopTurnSaying, swerveTo } from "../src/harness/commands.ts";
 import type { HarnessHost } from "../src/harness/host.ts";
-import { type Harness, type HarnessGoals, HarnessHostError } from "../src/harness/index.ts";
-import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
+import { type HarnessGoals, HarnessHostError } from "../src/harness/index.ts";
+import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { handleGoalTextCommand } from "../src/operator/goal-control.ts";
 import { Mounts } from "../src/operator/mounts.ts";
 import { takeCallbackQuery } from "../src/telegram/callback-handler.ts";
@@ -24,15 +24,7 @@ import { turnsStub, withServices } from "./support/turns.ts";
 const CHAT = 41;
 const unreached = new HarnessHostError({ reason: "connect ECONNREFUSED 10.43.0.9:8080" });
 
-/** The host elsewhere, not reached: what it would say of its conversation, and stop, fails as not reached. */
-const notReached = (host: HarnessHost["Service"]): HarnessHost["Service"] => ({
-  ...host,
-  reserve: () => Effect.fail(unreached),
-  status: () => Effect.fail(unreached),
-  interrupt: () => Effect.fail(unreached),
-});
-
-/** The goals of a thread on the host not reached, as Codex keeps them there: each read or change fails as not reached. */
+/** The goals of a thread on the host not reached: each read or change fails as not reached. */
 const unreachedGoals: HarnessGoals = {
   read: () => Effect.fail(unreached),
   set: () => Effect.fail(unreached),
@@ -40,31 +32,14 @@ const unreachedGoals: HarnessGoals = {
   waitForTurnId: () => Effect.fail(unreached),
 };
 
-/** Codex in the conversation's folder, its goals `goals`, and nothing else of it used. */
-function codexWithGoals(goals: HarnessGoals): Harness {
-  const unused = (name: string) => () => assert.fail(`Codex here has no ${name}`);
-  return {
-    name: CODEX_HARNESS,
-    displayName: harnessDisplayName(CODEX_HARNESS),
-    supportsGoals: true,
-    supportsWarmup: false,
-    sessions: {
-      listSessions: unused("listSessions"),
-      getTotalSessionPages: unused("getTotalSessionPages"),
-      getSessionByNumber: unused("getSessionByNumber"),
-      getSessionLastMessage: unused("getSessionLastMessage"),
-      listSessionMessages: unused("listSessionMessages"),
-      getTotalRewindPages: unused("getTotalRewindPages"),
-      createForkedSession: unused("createForkedSession"),
-    },
-    goals,
-    startFreshSession: unused("startFreshSession"),
-    warmSession: () => Effect.succeed(false),
-    runTurn: unused("runTurn"),
-    listModels: unused("listModels"),
-    defaultModelChoice: unused("defaultModelChoice"),
-  };
-}
+/** The host elsewhere, not reached: what it would say of its conversation, its goals among it, and stop, fails as not reached. */
+const notReached = (host: HarnessHost["Service"]): HarnessHost["Service"] => ({
+  ...host,
+  reserve: () => Effect.fail(unreached),
+  status: () => Effect.fail(unreached),
+  interrupt: () => Effect.fail(unreached),
+  goals: () => unreachedGoals,
+});
 
 /** `effect`, with what it logs, as written: what it came to, and each line. */
 const logging = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<readonly [A, readonly string[]], E, R> =>
@@ -77,7 +52,7 @@ const logging = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<readonl
   });
 
 /** A conversation on Codex in a folder, with a session, and alasio's services over it, its host not reached, its turns' scheduling recorded in `scheduled`. */
-async function unreachedConversation<T>(use: (services: { readonly alasio: Parameters<Parameters<typeof withServices>[1]>[0]; readonly conversationId: string; readonly store: Awaited<ReturnType<typeof pooledStore>>; readonly telegram: ReturnType<typeof recordingTelegram>; readonly scheduled: string[] }) => Promise<T>, { goals }: { readonly goals?: HarnessGoals } = {}): Promise<T> {
+async function unreachedConversation<T>(use: (services: { readonly alasio: Parameters<Parameters<typeof withServices>[1]>[0]; readonly conversationId: string; readonly store: Awaited<ReturnType<typeof pooledStore>>; readonly telegram: ReturnType<typeof recordingTelegram>; readonly scheduled: string[] }) => Promise<T>): Promise<T> {
   const store = await pooledStore();
   const conversationId = await run(store.upsertConversation({ chatId: String(CHAT), user: { id: CHAT } }));
   await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
@@ -86,7 +61,7 @@ async function unreachedConversation<T>(use: (services: { readonly alasio: Param
   const telegram = recordingTelegram();
   const scheduled: string[] = [];
   return await withServices(
-    { store, telegram: telegram.layer, allowedUserIds: String(CHAT), host: notReached, harnesses: goals ? { [CODEX_HARNESS]: codexWithGoals(goals) } : {}, turns: turnsStub({ schedule: (id) => Effect.sync(() => void scheduled.push(id)) }) },
+    { store, telegram: telegram.layer, allowedUserIds: String(CHAT), host: notReached, turns: turnsStub({ schedule: (id) => Effect.sync(() => void scheduled.push(id)) }) },
     (alasio) => use({ alasio, conversationId, store, telegram, scheduled }),
   );
 }
@@ -120,7 +95,7 @@ test("a press of a goal panel, of a conversation whose host is not reached, is a
     await alasio.runPromise(press);
     assert.deepEqual(telegram.calls.answerCallbackQuery.map(([id, text]) => [id, text]), [["press-1", "Working..."]]);
     assert.deepEqual(telegram.calls.editMessageText.map(([, , text]) => text), [`Goal\n\nFailed to update goal: ${unreached.message}`]);
-  }, { goals: unreachedGoals });
+  });
 });
 
 test("a swerve to a held prompt, of a conversation whose host is not reached, queues the prompt first in line, the turn not stopped, as alasio's log says", async () => {

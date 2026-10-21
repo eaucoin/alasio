@@ -55,6 +55,8 @@ export interface PanelsOptions {
   readonly branch?: string | null | undefined;
   /** Claude Code's models, as its CLI lists them: listClaudeModels, unless a test gives its own. */
   readonly claudeModels?: ((workingDirectory: string) => Effect.Effect<ModelOption[], HarnessError>) | undefined;
+  /** Codex's models, as alasio's own app-server lists them, unless a test gives its own. */
+  readonly codexModels?: ((workingDirectory: string) => Effect.Effect<ModelOption[], HarnessError>) | undefined;
 }
 
 /** The panels of each conversation's mounted harness, as the module says. */
@@ -81,9 +83,15 @@ export class Panels extends Context.Service<Panels, {
 /** The directory a session filesystem's harness runs in, under `stateDir`, as a pool's pod has it. */
 export const sessionFsDirectory = (stateDir: string, volumeId: string): string => join(stateDir, "sessionfs", "workspaces", volumeId);
 
-const makePanels = Effect.fnUntraced(function*({ sessionStore, codexRollouts, sessionFsCodexRollouts, stateDir, branch = null, claudeModels = (workingDirectory) => listClaudeModels({ workingDirectory }) }: PanelsOptions) {
+const makePanels = Effect.fnUntraced(function*({ sessionStore, codexRollouts, sessionFsCodexRollouts, stateDir, branch = null, claudeModels = (workingDirectory) => listClaudeModels({ workingDirectory }), codexModels }: PanelsOptions) {
   const host = yield* HarnessHost;
   const appServer = yield* CodexAppServer;
+  // Of alasio's own app-server, run in a directory of the workspace's, as the models are the login's, whatever the workspace.
+  const listCodexModels = codexModels ?? ((directory: string) =>
+    Effect.sync(() => mkdirSync(directory, { recursive: true })).pipe(
+      Effect.andThen(appServer.listModels({ env: buildCodexEnv(), cwd: directory })),
+      Effect.map((models) => models.filter((model) => !model.hidden).map(toModelOption)),
+    ));
   /** Claude Code's models, listed once a process's life, as its CLI is pinned with the release; a listing that failed is tried again as next asked. */
   let claudeListed: ModelOption[] | null = null;
   const claudeModelsOnce = (workingDirectory: string) =>
@@ -123,12 +131,7 @@ const makePanels = Effect.fnUntraced(function*({ sessionStore, codexRollouts, se
             ),
         }),
         goals: host.goals(of),
-        // Of alasio's own app-server, run in a directory of the workspace's, as the models are the login's, whatever the workspace.
-        listModels: () =>
-          Effect.sync(() => mkdirSync(directory, { recursive: true })).pipe(
-            Effect.andThen(appServer.listModels({ env: codexEnv, cwd: directory })),
-            Effect.map((models) => models.filter((model) => !model.hidden).map(toModelOption)),
-          ),
+        listModels: () => listCodexModels(directory),
         defaultModelChoice: () => resolveCodexModelChoice(null),
       });
     });
