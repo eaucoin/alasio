@@ -10,7 +10,7 @@
  * Roles are the server's, and so shared by the databases of one test process.
  */
 import { randomBytes } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,11 +55,25 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-async function startServer(): Promise<Server> {
+/** How many times a server is started on a port another took between freePort and its start, before that is given up on. */
+const PORT_TRIES = 5;
+
+/** What Postgres says where its port was taken before it bound it. */
+const PORT_TAKEN = /could not bind IPv4 address .*: Address already in use/u;
+
+/**
+ * A server, started on a free port of the loopback; on another where one is taken between
+ * freePort and its start, as a test process starting a server of its own may take it.
+ * embedded-postgres rejects a start whose server ended with no reason, so what the server
+ * said is kept to say why.
+ */
+async function startServer(ports: () => Promise<number>, tries = PORT_TRIES): Promise<Server> {
   const password = randomBytes(12).toString("hex");
-  const port = await freePort();
+  const port = await ports();
+  const databaseDir = mkdtempSync(join(tmpdir(), "alasio-postgres-"));
+  let said = "";
   const postgres = new EmbeddedPostgres({
-    databaseDir: mkdtempSync(join(tmpdir(), "alasio-postgres-")),
+    databaseDir,
     port,
     user: "postgres",
     password,
@@ -67,10 +81,18 @@ async function startServer(): Promise<Server> {
     persistent: false,
     // On the loopback alone, with no socket file; and nothing a test needs kept through a crash.
     postgresFlags: ["-c", "listen_addresses=127.0.0.1", "-c", "unix_socket_directories=", "-c", "fsync=off", "-c", "full_page_writes=off"],
-    onLog: () => {},
+    onLog: (message) => void (said += message),
   });
   await postgres.initialise();
-  await postgres.start();
+  try {
+    await postgres.start();
+  } catch (error) {
+    // Its directory, which a server that ended leaves, removed as a stop removes it; its stop
+    // itself waits on an exit that has come already.
+    rmSync(databaseDir, { recursive: true, force: true });
+    if (PORT_TAKEN.test(said) && tries > 1) return startServer(ports, tries - 1);
+    throw new Error(`Postgres ended as it started on port ${port}: ${said.trim().split("\n").slice(-5).join(" | ") || "saying nothing"}`, { cause: error });
+  }
   return { postgres, url: new URL(`postgresql://postgres:${password}@127.0.0.1:${port}/postgres`), databases: 0, ended: false };
 }
 
@@ -85,8 +107,17 @@ async function onServer({ url }: Server, sql: string): Promise<void> {
   }
 }
 
-export async function startPostgres(): Promise<TestPostgres> {
-  server ??= startServer();
+/** Where the process's server is started, where it is not running yet: free ports of the loopback, unless a test of the start itself gives others. */
+export interface StartPostgresOptions {
+  readonly ports?: (() => Promise<number>) | undefined;
+}
+
+export async function startPostgres({ ports = freePort }: StartPostgresOptions = {}): Promise<TestPostgres> {
+  // A start that failed is not kept, so the next is tried anew.
+  server ??= startServer(ports).catch((error: unknown) => {
+    server = undefined;
+    throw error;
+  });
   const running = await server;
   running.databases++;
   const name = `test_${++databases}`;
