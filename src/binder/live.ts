@@ -7,16 +7,19 @@
  * The Leases of bindings of each namespace there may be bindings in are watched, from every
  * one there is to each change: those the namespaces say now, looked at anew every
  * `refreshMs`, a watch started for each one new and ended for each gone, and one a token
- * names, as soon as it is asked of, where the namespaces know it. A namespace whose watch has
- * not yet sent every Lease there was as it began, as at the start or once the API server has
- * ended it and it is watched anew, can say of no binding that it is gone: what takes the
- * token refuses it meanwhile, to be asked again. One the namespaces do not know has no
- * binding. A binding under way, its pod not yet named, is no binding a token is minted for,
- * and is not held.
+ * names, as soon as it is asked of, where the namespaces know it. A watch that ends, as the
+ * API server ends one now and then or its connection is lost, is watched again from the last
+ * version it saw, so it misses no change between, and listed anew only where the API server
+ * keeps no change from that far back (410); the bindings it knew are what it says meanwhile,
+ * and those of the new list once it has them all. A namespace can say of no binding that it
+ * is gone before its first list has sent every Lease there was, or once nothing of it has been
+ * heard for `knownForMs`, the API server unreachable: what takes the token refuses it
+ * meanwhile, to be asked again. One the namespaces do not know has no binding. A binding
+ * under way, its pod not yet named, is no binding a token is minted for, and is not held.
  */
-import { Context, Effect, FiberMap, Layer, Schedule, Stream } from "effect";
+import { Clock, Context, Effect, FiberMap, Layer, Schedule, Stream } from "effect";
 
-import { INITIAL_EVENTS_END, KubeClient } from "../kube/client.ts";
+import { hasStatus, INITIAL_EVENTS_END, KubeClient, WATCH_SILENCE_MS } from "../kube/client.ts";
 import { type BindingLease } from "./bindings.ts";
 import { BINDING_LABEL, KEY_ANNOTATION } from "./names.ts";
 
@@ -24,6 +27,19 @@ import { BINDING_LABEL, KEY_ANNOTATION } from "./names.ts";
 const RETRY_MS = 1_000;
 /** How often the namespaces are looked at anew, by default. */
 const REFRESH_MS = 30_000;
+/**
+ * How long a namespace's bindings are what it says since its watch last heard of them, by
+ * default: as long as a watch hears nothing, not even a bookmark, before its connection is
+ * taken for lost, so a watch watched again in time keeps them, and a gateway cut off from
+ * the API server keeps no binding another released for longer.
+ */
+const KNOWN_FOR_MS = WATCH_SILENCE_MS;
+
+/** A namespace's bindings, by their Leases' uids, as of when its watch last heard of them. */
+interface Known {
+  readonly bindings: Map<string, string>;
+  heard: number;
+}
 
 /** Whether a binding is held now: held; gone, as its namespace's watch says; or not known, its watch not caught up. */
 export type Held = "held" | "gone" | "unknown";
@@ -39,37 +55,55 @@ export class LiveBindings extends Context.Service<LiveBindings, {
   readonly holds: (key: string, binding: string, namespace: string) => Effect.Effect<Held>;
 }>()("alasio/binder/LiveBindings") {
   /** On the KubeClient, the bindings of `namespaces`, each watched as the module says, for as long as the layer lives. */
-  static readonly layer = ({ namespaces, refreshMs = REFRESH_MS }: { readonly namespaces: BindingNamespaces; readonly refreshMs?: number }): Layer.Layer<LiveBindings, never, KubeClient> =>
+  static readonly layer = (
+    { namespaces, refreshMs = REFRESH_MS, knownForMs = KNOWN_FOR_MS }: { readonly namespaces: BindingNamespaces; readonly refreshMs?: number; readonly knownForMs?: number },
+  ): Layer.Layer<LiveBindings, never, KubeClient> =>
     Layer.effect(
       LiveBindings,
       Effect.gen(function*() {
         const kube = yield* KubeClient;
-        // Each namespace's bindings by their Leases' uids, while its watch is caught up.
-        const live = new Map<string, Map<string, string>>();
+        // Each namespace's bindings, once its first list has sent them all.
+        const live = new Map<string, Known>();
         const watches = yield* FiberMap.make<string>();
         const watched = new Set<string>();
 
-        /** Watches `namespace` once, from every Lease there is, until the watch ends. */
-        const watchOnce = (namespace: string): Effect.Effect<void> => {
-          const seen = new Map<string, string>();
-          return kube.watch("coordination.k8s.io/v1", "leases", namespace, BINDING_LABEL).pipe(
-            Stream.runForEach(({ type, object }) =>
-              Effect.sync(() => {
-                const { metadata, spec } = object as BindingLease;
-                if (type === "BOOKMARK") {
-                  if (metadata?.annotations?.[INITIAL_EVENTS_END] === "true") live.set(namespace, seen);
-                  return;
-                }
-                const uid = metadata?.uid ?? "";
-                const key = metadata?.annotations?.[KEY_ANNOTATION];
-                if (type === "DELETED" || !key || !spec?.holderIdentity) seen.delete(uid);
-                else seen.set(uid, key);
-              })
-            ),
-            Effect.catch((error) => Effect.logWarning(`watching the bindings of ${namespace} failed: ${error.message}`).pipe(Effect.andThen(Effect.sleep(RETRY_MS)))),
-            // Ended, by the API server, a failure or its namespace gone: nothing of it confirmed until it is watched anew.
-            Effect.ensuring(Effect.sync(() => void live.delete(namespace))),
-          );
+        /** Watches `namespace`, as the module says, until its fiber is ended. */
+        const watchAlways = (namespace: string): Effect.Effect<void> => {
+          // The last version the watch saw of what it knows, to be watched again from; none until a list has sent every Lease there was.
+          let from: string | undefined;
+          const once = Effect.suspend(() => {
+            const listing = from === undefined;
+            // Where a list is under way, the bindings it sends, said once it has sent them all; the bindings known, where it is watched again from `from`.
+            const bindings = listing ? new Map<string, string>() : live.get(namespace)?.bindings ?? new Map<string, string>();
+            let caughtUp = !listing;
+            return kube.watch("coordination.k8s.io/v1", "leases", namespace, BINDING_LABEL, from).pipe(
+              Stream.runForEach(({ type, object }) =>
+                Effect.gen(function*() {
+                  const { metadata, spec } = object as BindingLease;
+                  const now = yield* Clock.currentTimeMillis;
+                  if (type === "BOOKMARK") {
+                    if (listing && metadata?.annotations?.[INITIAL_EVENTS_END] === "true") {
+                      caughtUp = true;
+                      live.set(namespace, { bindings, heard: now });
+                    }
+                  } else {
+                    const uid = metadata?.uid ?? "";
+                    const key = metadata?.annotations?.[KEY_ANNOTATION];
+                    if (type === "DELETED" || !key || !spec?.holderIdentity) bindings.delete(uid);
+                    else bindings.set(uid, key);
+                  }
+                  if (!caughtUp) return;
+                  from = metadata?.resourceVersion ?? from;
+                  const known = live.get(namespace);
+                  if (known) known.heard = now;
+                })
+              ),
+              Effect.catchIf(hasStatus(410), () => Effect.sync(() => void (from = undefined))),
+              Effect.catch((error) => Effect.logWarning(`watching the bindings of ${namespace} failed: ${error.message}`).pipe(Effect.andThen(Effect.sleep(RETRY_MS)))),
+            );
+          });
+          // Its namespace gone: nothing of it known.
+          return Effect.forever(once).pipe(Effect.ensuring(Effect.sync(() => void live.delete(namespace))));
         };
 
         /** Watches `namespace`, unless it is watched. */
@@ -77,7 +111,7 @@ export class LiveBindings extends Context.Service<LiveBindings, {
           Effect.suspend(() => {
             if (watched.has(namespace)) return Effect.void;
             watched.add(namespace);
-            return Effect.asVoid(FiberMap.run(watches, namespace, Effect.forever(watchOnce(namespace)), { onlyIfMissing: true }));
+            return Effect.asVoid(FiberMap.run(watches, namespace, watchAlways(namespace), { onlyIfMissing: true }));
           });
 
         /** Watches each namespace there is now, and ends the watch of each gone. */
@@ -100,9 +134,9 @@ export class LiveBindings extends Context.Service<LiveBindings, {
                 if (!(yield* namespaces.known(namespace))) return "gone";
                 yield* watch(namespace);
               }
-              const bindings = live.get(namespace);
-              if (!bindings) return "unknown";
-              return bindings.get(binding) === key ? "held" : "gone";
+              const known = live.get(namespace);
+              if (!known || (yield* Clock.currentTimeMillis) - known.heard >= knownForMs) return "unknown";
+              return known.bindings.get(binding) === key ? "held" : "gone";
             }),
         });
       }),

@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { before, test } from "node:test";
 
-import { type Cause, Context, Effect, Exit, Layer, Queue, Scope, Stream } from "effect";
+import { Cause, Context, Effect, Exit, Layer, Queue, Scope, Stream } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
 import { readLease } from "../src/binder/bindings.ts";
 import { freeLabels, KEY_ANNOTATION, type Pool } from "../src/binder/names.ts";
 import { type BindingNamespaces, LiveBindings } from "../src/binder/live.ts";
-import { INITIAL_EVENTS_END, KubeClient, type WatchEvent } from "../src/kube/client.ts";
+import { INITIAL_EVENTS_END, KubeApiError, KubeClient, type WatchEvent } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
 
 // The bindings there are, as their Leases are watched on a real API server.
@@ -67,33 +67,181 @@ test("a binding is confirmed while its Lease names its pod, under its own key al
   }
 });
 
-test("a namespace whose watch has not sent every Lease there was, or has ended, can say of no binding that it is gone until it is watched anew", async () => {
-  const watches: Queue.Queue<WatchEvent, Cause.Done>[] = [];
+test("a watch cut, on a real API server, is watched again from the last version it saw, and hears what changed while it was cut", async () => {
+  const of: Pool = { name: "sandboxes", namespace: "live-cut" };
+  await run(Effect.flatMap(KubeClient, (kube) => kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: of.namespace } })));
+  await run(Effect.flatMap(KubeClient, (kube) =>
+    Effect.gen(function*() {
+      for (const name of ["free-0", "free-1"]) {
+        yield* kube.create({ apiVersion: "v1", kind: "Pod", metadata: { name, namespace: of.namespace, labels: { ...freeLabels(of) } }, spec: { containers: [{ name: "bayma", image: "agent" }] } });
+        yield* kube.patchPodStatus(of.namespace, name, { status: { phase: "Running", podIP: "10.42.0.9", conditions: [{ type: "Ready", status: "True" }] } });
+      }
+    })
+  ));
+  const binder = Layer.provideMerge(Binder.layer({ waitMs: 5_000 }), Layer.fresh(KubeClient.layer));
+  const bind = (key: string) => Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (each) => each.bind(of, key)), binder));
+  const before = await bind("sessionfs:before");
+  // The real client's watches, the first cut once its list is through, the next held until the test lets it go on.
+  const real = await run(KubeClient);
+  const asked: (string | undefined)[] = [];
+  let goOn!: () => void;
+  const gone = new Promise<void>((resolve) => { goOn = resolve; });
+  const kube = KubeClient.of({
+    ...real,
+    watch: (apiVersion, plural, namespace, labelSelector, from) => {
+      asked.push(from);
+      const watched = real.watch(apiVersion, plural, namespace, labelSelector, from);
+      return asked.length === 1
+        ? Stream.takeUntil(watched, ({ object }) => object.metadata?.annotations?.[INITIAL_EVENTS_END] === "true")
+        : Stream.unwrap(Effect.as(Effect.promise(() => gone), watched));
+    },
+  });
+  const scope = await Effect.runPromise(Scope.make());
+  const live = Context.get(await Effect.runPromise(Layer.buildWithScope(Layer.provide(LiveBindings.layer({ namespaces: only([of.namespace]) }), Layer.succeed(KubeClient, kube)), scope)), LiveBindings);
+  try {
+    const holds = (key: string, binding: string) => Effect.runPromise(live.holds(key, binding, of.namespace));
+    await until(async () => asked.length === 2, true, "the cut watch was not watched again");
+    assert.equal(asked[0], undefined);
+    assert.ok(asked[1], "the cut watch was listed anew, not watched again from a version");
+    assert.equal(await holds("sessionfs:before", before.binding), "held");
+    // While it is cut: one released, one bound.
+    await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (each) => each.release(of, "sessionfs:before")), binder));
+    const after = await bind("sessionfs:after");
+    goOn();
+    await until(async () => (await holds("sessionfs:after", after.binding)) === "held", true, "the binding made while the watch was cut was never confirmed");
+    assert.equal(await holds("sessionfs:before", before.binding), "gone");
+    assert.equal(asked.length, 2);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+});
+
+/** A watch the fake KubeClient below was asked for: the version it was asked to watch from, if any, and what it sends. */
+interface FakeWatch {
+  readonly from: string | undefined;
+  readonly queue: Queue.Queue<WatchEvent, KubeApiError | Cause.Done>;
+}
+
+/** A KubeClient that only watches, each watch asked for kept, by its namespace, for the test to send it what it will. */
+function watchingOnly(): { readonly kube: KubeClient["Service"]; readonly watches: (namespace: string) => readonly FakeWatch[] } {
+  const watches = new Map<string, FakeWatch[]>();
   const unreachable = () => Effect.die("not called");
   const kube = KubeClient.of({
     read: unreachable, list: unreachable, create: unreachable, replace: unreachable, patch: unreachable, patchPodStatus: unreachable, remove: unreachable, exec: unreachable,
-    watch: () => Stream.callback<WatchEvent>((queue) => Effect.sync(() => void watches.push(queue))),
+    watch: (_apiVersion, _plural, namespace, _labelSelector, from) =>
+      Stream.callback<WatchEvent, KubeApiError>((queue) => Effect.sync(() => void watches.set(namespace, [...(watches.get(namespace) ?? []), { from, queue }]))),
   });
-  const lease = (uid: string) => ({ apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid, annotations: { [KEY_ANNOTATION]: "sessionfs:workspace" } }, spec: { holderIdentity: "pod" } });
-  const caughtUp = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { annotations: { [INITIAL_EVENTS_END]: "true" } } };
+  return { kube, watches: (namespace) => watches.get(namespace) ?? [] };
+}
+
+/** A binding's Lease of `key`, its uid `uid`, at `version`. */
+const bindingLease = (uid: string, version: string, key = "sessionfs:workspace") =>
+  ({ apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid, resourceVersion: version, annotations: { [KEY_ANNOTATION]: key } }, spec: { holderIdentity: "pod" } });
+
+/** A bookmark at `version`; the one that ends a list's Leases, where `ending`. */
+const bookmark = (version: string, ending = false) =>
+  ({ apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { resourceVersion: version, ...(ending ? { annotations: { [INITIAL_EVENTS_END]: "true" } } : {}) } });
+
+test("a namespace whose first list has not sent every Lease there was can say of no binding that it is gone", async () => {
+  const { kube, watches } = watchingOnly();
   const scope = await Effect.runPromise(Scope.make());
   const live = Context.get(await Effect.runPromise(Layer.buildWithScope(Layer.provide(LiveBindings.layer({ namespaces: only(["sessions"]) }), Layer.succeed(KubeClient, kube)), scope)), LiveBindings);
+  const holds = (binding: string) => Effect.runPromise(live.holds("sessionfs:workspace", binding, "sessions"));
+  try {
+    await until(async () => watches("sessions").length === 1, true, "nothing was watched");
+    assert.equal(watches("sessions")[0]!.from, undefined);
+    Queue.offerUnsafe(watches("sessions")[0]!.queue, { type: "ADDED", object: bindingLease("uid-1", "5") });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(await holds("uid-1"), "unknown");
+    Queue.offerUnsafe(watches("sessions")[0]!.queue, { type: "BOOKMARK", object: bookmark("6", true) });
+    await until(async () => (await holds("uid-1")) === "held", true, "the binding was never confirmed once caught up");
+    assert.equal(await holds("uid-2"), "gone");
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+});
+
+test("a watch that ends, or fails, is watched again from the last version it saw, its bindings known meanwhile", async () => {
+  const { kube, watches } = watchingOnly();
+  const scope = await Effect.runPromise(Scope.make());
+  const live = Context.get(await Effect.runPromise(Layer.buildWithScope(Layer.provide(LiveBindings.layer({ namespaces: only(["sessions"]) }), Layer.succeed(KubeClient, kube)), scope)), LiveBindings);
+  const holds = (binding: string) => Effect.runPromise(live.holds("sessionfs:workspace", binding, "sessions"));
+  try {
+    await until(async () => watches("sessions").length === 1, true, "nothing was watched");
+    Queue.offerUnsafe(watches("sessions")[0]!.queue, { type: "ADDED", object: bindingLease("uid-1", "5") });
+    Queue.offerUnsafe(watches("sessions")[0]!.queue, { type: "BOOKMARK", object: bookmark("6", true) });
+    Queue.offerUnsafe(watches("sessions")[0]!.queue, { type: "ADDED", object: bindingLease("uid-2", "7") });
+    Queue.offerUnsafe(watches("sessions")[0]!.queue, { type: "BOOKMARK", object: bookmark("9") });
+    await until(async () => (await holds("uid-2")) === "held", true, "the binding made once caught up was never confirmed");
+    // Ended by the API server: watched again from the bookmark, every binding known all along.
+    Queue.endUnsafe(watches("sessions")[0]!.queue);
+    assert.equal(await holds("uid-1"), "held");
+    await until(async () => watches("sessions").length === 2, true, "it was not watched again");
+    assert.equal(watches("sessions")[1]!.from, "9");
+    assert.equal(await holds("uid-1"), "held");
+    // What changed while it was not watched, sent by the API server from that version on.
+    Queue.offerUnsafe(watches("sessions")[1]!.queue, { type: "DELETED", object: bindingLease("uid-1", "10") });
+    Queue.offerUnsafe(watches("sessions")[1]!.queue, { type: "ADDED", object: bindingLease("uid-3", "11") });
+    await until(async () => (await holds("uid-1")) === "gone", true, "the binding released while it was not watched was still confirmed");
+    assert.equal(await holds("uid-3"), "held");
+    assert.equal(await holds("uid-2"), "held");
+    // Failed: watched again, a second on, from the last change it saw.
+    Queue.failCauseUnsafe(watches("sessions")[1]!.queue, Cause.fail(new KubeApiError({ cause: new Error("connection reset") })));
+    assert.equal(await holds("uid-3"), "held");
+    await until(async () => watches("sessions").length === 3, true, "it was not watched again once it failed");
+    assert.equal(watches("sessions")[2]!.from, "11");
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+});
+
+test("a watch from a version the API server keeps no change from is listed anew, its bindings known until the new list has sent them all", async () => {
+  const { kube, watches } = watchingOnly();
+  const scope = await Effect.runPromise(Scope.make());
+  const live = Context.get(await Effect.runPromise(Layer.buildWithScope(Layer.provide(LiveBindings.layer({ namespaces: only(["sessions"]) }), Layer.succeed(KubeClient, kube)), scope)), LiveBindings);
+  const holds = (binding: string) => Effect.runPromise(live.holds("sessionfs:workspace", binding, "sessions"));
+  try {
+    await until(async () => watches("sessions").length === 1, true, "nothing was watched");
+    Queue.offerUnsafe(watches("sessions")[0]!.queue, { type: "ADDED", object: bindingLease("uid-1", "5") });
+    Queue.offerUnsafe(watches("sessions")[0]!.queue, { type: "BOOKMARK", object: bookmark("6", true) });
+    await until(async () => (await holds("uid-1")) === "held", true, "the binding was never confirmed");
+    Queue.endUnsafe(watches("sessions")[0]!.queue);
+    await until(async () => watches("sessions").length === 2, true, "it was not watched again");
+    Queue.failCauseUnsafe(watches("sessions")[1]!.queue, Cause.fail(new KubeApiError({ status: 410, cause: new Error("too old resource version: 6") })));
+    await until(async () => watches("sessions").length === 3, true, "it was not listed anew");
+    assert.equal(watches("sessions")[2]!.from, undefined);
+    // The new list under way: the bindings known before it, none of its own yet.
+    Queue.offerUnsafe(watches("sessions")[2]!.queue, { type: "ADDED", object: bindingLease("uid-2", "40") });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(await holds("uid-1"), "held");
+    assert.equal(await holds("uid-2"), "gone");
+    // Every Lease sent: the list's alone.
+    Queue.offerUnsafe(watches("sessions")[2]!.queue, { type: "BOOKMARK", object: bookmark("41", true) });
+    await until(async () => (await holds("uid-2")) === "held", true, "the new list's binding was never confirmed");
+    assert.equal(await holds("uid-1"), "gone");
+    Queue.endUnsafe(watches("sessions")[2]!.queue);
+    await until(async () => watches("sessions").length === 4, true, "it was not watched again");
+    assert.equal(watches("sessions")[3]!.from, "41");
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+});
+
+test("a namespace nothing has been heard of for its bindings' time can say of no binding that it is gone, until it is heard of again", async () => {
+  const { kube, watches } = watchingOnly();
+  const scope = await Effect.runPromise(Scope.make());
+  const live = Context.get(await Effect.runPromise(Layer.buildWithScope(Layer.provide(LiveBindings.layer({ namespaces: only(["sessions"]), knownForMs: 300 }), Layer.succeed(KubeClient, kube)), scope)), LiveBindings);
   const holds = () => Effect.runPromise(live.holds("sessionfs:workspace", "uid-1", "sessions"));
   try {
-    await until(async () => watches.length === 1, true, "nothing was watched");
-    Queue.offerUnsafe(watches[0]!, { type: "ADDED", object: lease("uid-1") });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(await holds(), "unknown");
-    Queue.offerUnsafe(watches[0]!, { type: "BOOKMARK", object: caughtUp });
-    await until(async () => (await holds()) === "held", true, "the binding was never confirmed once caught up");
-    assert.equal(await Effect.runPromise(live.holds("sessionfs:workspace", "uid-2", "sessions")), "gone");
-    // Ended by the API server: watched anew, and nothing confirmed until it has caught up again.
-    Queue.endUnsafe(watches[0]!);
-    await until(async () => watches.length === 2, true, "it was not watched anew");
-    assert.equal(await holds(), "unknown");
-    Queue.offerUnsafe(watches[1]!, { type: "ADDED", object: lease("uid-1") });
-    Queue.offerUnsafe(watches[1]!, { type: "BOOKMARK", object: caughtUp });
-    await until(async () => (await holds()) === "held", true, "the binding was never confirmed once caught up again");
+    await until(async () => watches("sessions").length === 1, true, "nothing was watched");
+    Queue.offerUnsafe(watches("sessions")[0]!.queue, { type: "ADDED", object: bindingLease("uid-1", "5") });
+    Queue.offerUnsafe(watches("sessions")[0]!.queue, { type: "BOOKMARK", object: bookmark("6", true) });
+    await until(async () => (await holds()) === "held", true, "the binding was never confirmed");
+    // The API server unreachable: watched again, and again, and nothing heard.
+    Queue.endUnsafe(watches("sessions")[0]!.queue);
+    await until(async () => (await holds()) === "unknown", true, "the binding was confirmed though nothing had been heard of it");
+    Queue.offerUnsafe(watches("sessions").at(-1)!.queue, { type: "BOOKMARK", object: bookmark("7") });
+    await until(async () => (await holds()) === "held", true, "the binding was not confirmed once heard of again");
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
   }

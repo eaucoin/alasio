@@ -94,10 +94,10 @@ const DEFAULT_EXEC_MAX_BYTES = 16 * 1024 * 1024;
 
 /**
  * How long a watch hears nothing before its connection is taken for lost and the watch
- * fails: two and a half times the minute between the bookmarks the API server sends a watch
+ * fails: one and a half times the minute between the bookmarks the API server sends a watch
  * that asks for them, however quiet what it watches.
  */
-const WATCH_SILENCE_MS = 150_000;
+export const WATCH_SILENCE_MS = 90_000;
 
 /** The kubeconfig alasio runs with: its ServiceAccount in a pod, the default elsewhere. */
 function loadKubeConfig(): KubeConfig {
@@ -147,9 +147,10 @@ export class KubeClient extends Context.Service<KubeClient, {
    * they change: first every one there is, as ADDED, then a bookmark annotated
    * INITIAL_EVENTS_END, then each change, until the API ends the watch, as it does now and
    * then, when the stream ends; a watch that fails, or hears nothing for WATCH_SILENCE_MS,
-   * not even a bookmark, fails it.
+   * not even a bookmark, fails it. Given `from`, a resourceVersion it saw, each change since
+   * then alone, and bookmarks: 410 where the API server keeps no change from that far back.
    */
-  readonly watch: (apiVersion: string, plural: string, namespace: string, labelSelector: string) => Stream.Stream<WatchEvent, KubeApiError>;
+  readonly watch: (apiVersion: string, plural: string, namespace: string, labelSelector: string, from?: string) => Stream.Stream<WatchEvent, KubeApiError>;
   /**
    * Deletes it, with its dependents in the background; one already gone is not an error.
    * Given `resourceVersion`, only as it is at that version: 409 when it has changed since.
@@ -233,13 +234,14 @@ export function makeKubeClient(kubeConfig: KubeConfig, { watchSilenceMs = WATCH_
 
   // Asked over node:http, as client-node's ProtoClient asks, not through its Watch: its request timeout, 30 s and not to be
   // set, ends every watch of something quiet between two of the API server's bookmarks, so each would be listed anew twice a minute.
-  const watch = (apiVersion: string, plural: string, namespace: string, labelSelector: string): Stream.Stream<WatchEvent, KubeApiError> =>
+  const watch = (apiVersion: string, plural: string, namespace: string, labelSelector: string, from?: string): Stream.Stream<WatchEvent, KubeApiError> =>
     Stream.callback<WatchEvent, KubeApiError>((queue) =>
       Effect.acquireRelease(
         Effect.tryPromise({
           try: async () => {
             const url = new URL(`${kubeConfig.getCurrentCluster()?.server ?? ""}/${apiVersion.includes("/") ? "apis" : "api"}/${apiVersion}/namespaces/${namespace}/${plural}`);
-            for (const [name, value] of Object.entries({ watch: "true", labelSelector, sendInitialEvents: "true", resourceVersionMatch: "NotOlderThan", allowWatchBookmarks: "true" })) {
+            const since = from === undefined ? { sendInitialEvents: "true", resourceVersionMatch: "NotOlderThan" } : { resourceVersion: from };
+            for (const [name, value] of Object.entries({ watch: "true", labelSelector, allowWatchBookmarks: "true", ...since })) {
               url.searchParams.set(name, value);
             }
             const options: RequestOptions = {};
