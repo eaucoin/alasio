@@ -330,7 +330,7 @@ test("a session's telemetry the collector does not take, down longer than the fo
   const forwarder = createOtlpForwarder({ OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}` });
   try {
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const { url } = yield* receiving(forwarder);
+      const { url, receiver } = yield* receiving(forwarder);
       // As bayma exports, with its exporter's own retries and timeout.
       const exporter = new OTLPTraceExporter({ url, headers: { authorization: "Bearer fs-abc123.good" } });
       const exported = (name: string) => new Promise<ExportResult>((resolve) => exporter.export(spansNamed(name), resolve));
@@ -338,6 +338,12 @@ test("a session's telemetry the collector does not take, down longer than the fo
         const down = await exported("while-down");
         assert.equal(down.code, ExportResultCode.FAILED);
         assert.equal(taken.length, 0);
+        // The forward of the exporter's last attempt ended too, as its going away ends it, before the
+        // collector comes up: a retry of it in flight as the exporter gave up would reach a collector
+        // listening at once, which would take a request its sender was answered as not taken.
+        for (const deadline = Date.now() + 5_000; receiver.held().bytes > 0; await new Promise((resolve) => setTimeout(resolve, 10))) {
+          assert.ok(Date.now() < deadline, "the forward of the exporter's last attempt outlived the exporter");
+        }
         await new Promise<void>((resolve) => collector.listen(port, "127.0.0.1", resolve));
         const up = await exported("once-up");
         assert.equal(up.code, ExportResultCode.SUCCESS);
