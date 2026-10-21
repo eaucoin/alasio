@@ -53,6 +53,16 @@ export interface KeptRollout {
   readonly headDigest: string;
 }
 
+/** A rollout file kept, as `files()` gives it: its name, where it is, its thread and its own id, when it last changed, and whether it is archived. */
+export interface KeptRolloutFile {
+  readonly name: string;
+  readonly path: string;
+  readonly threadId: string;
+  readonly rolloutId: string;
+  readonly modifiedMs: number;
+  readonly archived: boolean;
+}
+
 /** A rollout file to keep, as `save()` takes it. */
 export interface Rollout {
   readonly name: string;
@@ -168,6 +178,28 @@ export class NeonRolloutStore {
       [threadIds],
     );
     return rows.map((row) => ({ name: row.name, path: row.path, size: Number(row.size), modifiedMs: Number(row.modified_ms) }));
+  }
+
+  /** The rollout files kept, of the threads `threadIds` where given, every one's otherwise. */
+  async files({ threadIds }: { readonly threadIds?: readonly string[] }): Promise<KeptRolloutFile[]> {
+    const { rows } = await this.#pool.query<{ name: string; path: string; thread_id: string; rollout_id: string; modified_ms: string }>(
+      `select name, path, thread_id, rollout_id, modified_ms from ${this.#schema}.rollouts${threadIds ? " where thread_id = any($1)" : ""}`,
+      threadIds ? [threadIds] : [],
+    );
+    return rows.map((row) => ({
+      name: row.name,
+      path: row.path,
+      threadId: row.thread_id,
+      rolloutId: row.rollout_id,
+      modifiedMs: Number(row.modified_ms),
+      archived: row.path.startsWith("archived_sessions/"),
+    }));
+  }
+
+  /** The first bytes of a rollout, its first chunk's, up to CHUNK_BYTES: what of a file its first lines are in. */
+  async head(name: string): Promise<Buffer> {
+    const { rows } = await this.#pool.query<{ bytes: Buffer }>(`select bytes from ${this.#schema}.rollout_chunks where name = $1 and start = 0`, [name]);
+    return rows[0]?.bytes ?? Buffer.alloc(0);
   }
 
   /** A rollout's bytes, whole. */

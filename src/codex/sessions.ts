@@ -13,13 +13,14 @@ import { SESSIONS_PER_PAGE } from "../shared/runtime-constants.ts";
 import { dateLabel, sessionLabel } from "../shared/session-labels.ts";
 import type { AppServer } from "./app-server/client.ts";
 import { type CodexEnv, buildCodexEnv } from "./env.ts";
+import type { ListedThread, ListedTurn } from "./rollouts/listing.ts";
 import type { CodexScopeError, CodexSessionError } from "./runtime.ts";
 
 type AgentMessage = Extract<v2.ThreadItem, { type: "agentMessage" }>;
 type TextInput = Extract<v2.UserInput, { type: "text" }>;
 
 /** What the operator wrote to start a turn. */
-function promptOf(turn: v2.Turn): string {
+function promptOf(turn: ListedTurn): string {
   return (turn.items ?? [])
     .filter((item) => item.type === "userMessage")
     .flatMap((item) => item.content ?? [])
@@ -30,7 +31,7 @@ function promptOf(turn: v2.Turn): string {
 }
 
 /** What Codex last said in a turn, or "" if it said nothing. */
-function answerOf(turn: v2.Turn): string {
+function answerOf(turn: ListedTurn): string {
   const messages = (turn.items ?? []).filter((item): item is AgentMessage => item.type === "agentMessage" && Boolean(item.text?.trim()));
   return messages.at(-1)?.text.trim() ?? "";
 }
@@ -42,9 +43,15 @@ export interface CodexListingScope {
   readonly appServer: AppServer;
 }
 
-/** What the session panels read of a listing scope: its directory and env, and its app-server's thread and turn lists. */
+/**
+ * What the session panels read of a listing scope: its directory and env, and its thread and
+ * turn lists, an app-server's (Codex's own), or the rollouts' kept in Neon (./rollouts/listing.ts).
+ */
 export interface SessionListingScope extends Omit<CodexListingScope, "appServer"> {
-  readonly appServer: Pick<AppServer, "listThreads" | "listTurns">;
+  readonly appServer: {
+    readonly listThreads: (scope: { readonly cwd: string; readonly env: CodexEnv }) => Effect.Effect<readonly ListedThread[], CodexSessionError>;
+    readonly listTurns: (scope: { readonly threadId: string; readonly cwd: string; readonly env: CodexEnv }) => Effect.Effect<readonly ListedTurn[], CodexSessionError>;
+  };
 }
 
 /** A thread forked before one of its turns, for the conversation `threadKey`: the new thread's id. */
@@ -75,7 +82,7 @@ export function createCodexSessionApi({ listingScope, fork, beforeFork }: CodexS
   const listAll = Effect.flatMap(listingScope, ({ cwd, codexEnv, appServer }) => appServer.listThreads({ env: codexEnv, cwd }));
 
   /** A thread's turns, newest first; none for a thread Codex cannot read. */
-  const turnsOf = (sessionId: string): Effect.Effect<v2.Turn[]> =>
+  const turnsOf = (sessionId: string): Effect.Effect<readonly ListedTurn[]> =>
     Effect.flatMap(listingScope, ({ cwd, codexEnv, appServer }) => appServer.listTurns({ threadId: sessionId, env: codexEnv, cwd })).pipe(
       Effect.catch((error) => Effect.logWarning(`could not list the turns of ${sessionId}: ${error.message}`).pipe(Effect.as([]))),
     );

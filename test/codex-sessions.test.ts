@@ -6,12 +6,10 @@
  * whose history starts in another's.
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createServer } from "node:http";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
-import { zstdDecompressSync } from "node:zlib";
 
 import { Effect, Exit, Logger, Scope, Stream } from "effect";
 import pg from "pg";
@@ -26,86 +24,17 @@ import { NeonRolloutStore } from "../src/codex/rollouts/store.ts";
 import { type SessionListingScope, createCodexSessionApi } from "../src/codex/sessions.ts";
 import type { CodexThreadConfig } from "../src/codex/thread-config.ts";
 import { agentMessage, codexThread, codexTurn, userMessage } from "./support/codex-protocol.ts";
+import { makeCodexHome, type ResponsesStandIn, startResponses } from "./support/codex-responses.ts";
 import { type TestPostgres, startPostgres } from "./support/postgres.ts";
 
 const CODEX_BIN = new URL("../node_modules/.bin/codex", import.meta.url).pathname;
 const skip = !existsSync(CODEX_BIN) && "needs the Codex binary alasio installs";
-
-/** An event the Responses API streams: its type, and what it carries. */
-interface ResponsesEvent {
-  readonly type: string;
-  readonly [field: string]: unknown;
-}
-
-/** The stand-in for the Responses API: its URL, the request bodies it was sent, and how to stop it. */
-interface ResponsesStandIn {
-  readonly url: string;
-  readonly requests: readonly string[];
-  close(): Promise<void>;
-}
 
 /** Runs the session panels' effects, their log lines dropped. */
 const run = <A, E>(effect: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(effect.pipe(Effect.provideService(Logger.CurrentLoggers, new Set())));
 
 /** No config beyond what alasio itself sets on a thread. */
 const NO_CONFIG: CodexThreadConfig = { developer_instructions: "", mcp_servers: {} };
-
-/** Server-sent events as the Responses API streams them. */
-function sse(events: readonly ResponsesEvent[]): string {
-  return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
-}
-
-/** A stand-in for the Responses API that answers the nth request "answer n", and keeps what each asked. */
-async function startResponses(): Promise<ResponsesStandIn> {
-  const requests: string[] = [];
-  const server = createServer((request, response) => {
-    const body: Buffer[] = [];
-    request.on("data", (chunk: Buffer) => body.push(chunk));
-    request.on("end", () => {
-      if (request.method !== "POST" || !request.url?.endsWith("/responses")) {
-        response.writeHead(404).end();
-        return;
-      }
-      const raw = Buffer.concat(body);
-      const text = request.headers["content-encoding"] === "zstd" ? zstdDecompressSync(raw).toString() : raw.toString();
-      requests.push(text);
-      const id = `resp_${requests.length}`;
-      response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end(sse([
-        { type: "response.created", response: { id } },
-        {
-          type: "response.output_item.done",
-          item: { type: "message", role: "assistant", id: `msg_${requests.length}`, content: [{ type: "output_text", text: `answer ${requests.length}` }] },
-        },
-        {
-          type: "response.completed",
-          response: { id, usage: { input_tokens: 0, input_tokens_details: null, output_tokens: 0, output_tokens_details: null, total_tokens: 0 } },
-        },
-      ]));
-    });
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  assert.ok(address !== null && typeof address === "object", "a TCP server's address");
-  return { url: `http://127.0.0.1:${address.port}/v1`, requests, close: () => new Promise((resolve) => server.close(() => resolve())) };
-}
-
-/** A Codex home of its own, whose only provider is the stand-in. */
-function makeCodexHome(root: string, name: string, providerUrl: string): string {
-  const home = join(root, name);
-  mkdirSync(home, { recursive: true });
-  writeFileSync(join(home, "config.toml"), `
-model_provider = "stand_in"
-
-[model_providers.stand_in]
-name = "stand-in"
-base_url = "${providerUrl}"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-`);
-  return home;
-}
 
 test("sessions are labelled by name, else first prompt; turns without a prompt are no rewind point; an unreadable thread has none", async () => {
   const turn = (id: string, prompt: string | null, answer: string | null) => codexTurn(id, {

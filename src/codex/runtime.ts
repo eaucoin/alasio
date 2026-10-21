@@ -4,6 +4,7 @@
  * filesystem's), a new, forked or warmed session, and a turn from its pending response
  * to its result, with the DB guardrail and restart provenance applied to its commands.
  */
+import type { RolloutListingError } from "./rollouts/listing.ts";
 import { Cause, Deferred, Effect, Exit, Fiber, Schema, Stream } from "effect";
 
 import { buildCodexEnv } from "./env.ts";
@@ -144,7 +145,7 @@ function codexScope({ scope, ...params }: CodexScopeParams): Effect.Effect<Codex
 }
 
 /** How a call on a session fails: what it runs against did not come up, or its app-server failed it. */
-export type CodexSessionError = CodexScopeError | CodexTransportRefused | AppServerStartError | ThreadIdMissing;
+export type CodexSessionError = CodexScopeError | CodexTransportRefused | AppServerStartError | ThreadIdMissing | RolloutListingError;
 
 export const startFreshCodexSession = Effect.fnUntraced(function*(params: CodexScopeParams): Effect.fn.Return<string, CodexSessionError> {
   const startedAt = process.hrtime.bigint();
