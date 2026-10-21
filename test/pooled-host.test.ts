@@ -14,7 +14,7 @@ import { test } from "node:test";
 
 import { Context, Effect, Layer, Option, Scope, Exit } from "effect";
 
-import { NO_BIND_HEADER } from "../src/binder/names.ts";
+import { NO_BIND_HEADER, PINNED_HEADER } from "../src/binder/names.ts";
 import { CodexAppServer } from "../src/codex/app-server/client.ts";
 import { answeredByFront } from "../src/binder/server.ts";
 import { type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
@@ -76,15 +76,18 @@ function podHost(started: TurnStart[], { renewed = [], turnMs = 0 }: { readonly 
  * nothing answered 409 `{ bound: false }` until the conversation is bound, as a call that binds
  * does; the rest passed on to the host at `podPort`; `onBind` run as each bind is asked.
  */
-async function front(podPort: number, { refusals = [], onBind = () => {} }: { readonly refusals?: readonly object[]; readonly onBind?: () => void } = {}): Promise<{ url: string; asked: { claims: TokenClaims | null; bindsNothing: boolean; path: string; grant: string | undefined }[]; close: () => void }> {
-  const asked: { claims: TokenClaims | null; bindsNothing: boolean; path: string; grant: string | undefined }[] = [];
+async function front(podPort: number, { refusals = [], onBind = () => {}, movesOn }: { readonly refusals?: readonly object[]; readonly onBind?: () => void; readonly movesOn?: string } = {}): Promise<{ url: string; asked: { claims: TokenClaims | null; bindsNothing: boolean; path: string; grant: string | undefined; pinned: string | undefined }[]; close: () => void }> {
+  const asked: { claims: TokenClaims | null; bindsNothing: boolean; path: string; grant: string | undefined; pinned: string | undefined }[] = [];
   const refusing = [...refusals];
   let bound = false;
+  /** The binding the key is bound to, a new one once the pod is gone (movesOn). */
+  let binding = "binding-1";
   const server = createServer((incoming, outgoing) => {
     const claims = verifyToken(CALLER_KEY, String(incoming.headers.authorization).slice("Bearer ".length), Date.now());
     const bindsNothing = incoming.headers[NO_BIND_HEADER] === "never";
     const grant = incoming.headers[GRANT_HEADER];
-    asked.push({ claims, bindsNothing, path: incoming.url ?? "", grant: typeof grant === "string" ? grant : undefined });
+    const pinned = incoming.headers[PINNED_HEADER];
+    asked.push({ claims, bindsNothing, path: incoming.url ?? "", grant: typeof grant === "string" ? grant : undefined, pinned: typeof pinned === "string" ? pinned : undefined });
     if (!claims) return void outgoing.writeHead(401, { "content-type": "application/json" }).end(JSON.stringify({ error: "no caller's token" }));
     if (incoming.method === "POST" && incoming.url === "/bind") {
       incoming.resume();
@@ -92,14 +95,20 @@ async function front(podPort: number, { refusals = [], onBind = () => {} }: { re
       const refusal = refusing.shift();
       if (refusal) return void outgoing.writeHead(503, { "content-type": "application/json" }).end(JSON.stringify(refusal));
       bound = true;
-      return void outgoing.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ binding: "binding-1", namespace: "alasio" }));
+      return void outgoing.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ binding, namespace: "alasio" }));
     }
     if (bindsNothing && !bound) {
       incoming.resume();
       return void outgoing.writeHead(409, { "content-type": "application/json" }).end(JSON.stringify({ bound: false }));
     }
     bound = true;
-    const { [NO_BIND_HEADER]: _bindsNothing, ...headers } = { ...incoming.headers, authorization: "Bearer host-token" } as Record<string, string | string[] | undefined>;
+    // Its pod gone as the first call of `movesOn` comes, the key bound anew: the call, for the binding before, refused, saying the one now.
+    if (movesOn !== undefined && incoming.url === movesOn && binding === "binding-1") {
+      binding = "binding-2";
+      incoming.resume();
+      return void outgoing.writeHead(409, { "content-type": "application/json" }).end(JSON.stringify({ error: "bound to another binding now", moved: { binding, namespace: "alasio" } }));
+    }
+    const { [NO_BIND_HEADER]: _bindsNothing, [PINNED_HEADER]: _pinned, ...headers } = { ...incoming.headers, authorization: "Bearer host-token" } as Record<string, string | string[] | undefined>;
     const upstream = request({ host: "127.0.0.1", port: podPort, path: incoming.url, method: incoming.method, headers }, (answered) => {
       outgoing.writeHead(answered.statusCode ?? 502, answered.headers);
       answered.pipe(outgoing);
@@ -201,12 +210,12 @@ test("alasio reaches each conversation's pooled host through the front, a token 
       assert.equal(stand.asked.findLast(({ path }) => path === HOST_PATHS.turns)?.bindsNothing, false);
       // The pod given the grant of the binding its bind answered with, by its reservation and its turn, and by no call that binds nothing; alasio keeping its digest as the conversation's.
       const grant = harnessGrant(grantKey(CALLER_KEY), conversationId, "binding-1");
-      assert.deepEqual(stand.asked.map(({ path, grant }) => [path, grant]), [
-        ...[HOST_PATHS.status, HOST_PATHS.backgroundWork, HOST_PATHS.steer, HOST_PATHS.interrupt].map((path) => [path, undefined]),
-        ["/bind", undefined],
-        [HOST_PATHS.reserve, grant],
-        [HOST_PATHS.turns, grant],
-        [HOST_PATHS.release, grant],
+      assert.deepEqual(stand.asked.map(({ path, grant, pinned }) => [path, grant, pinned]), [
+        ...[HOST_PATHS.status, HOST_PATHS.backgroundWork, HOST_PATHS.steer, HOST_PATHS.interrupt].map((path) => [path, undefined, undefined]),
+        ["/bind", undefined, undefined],
+        [HOST_PATHS.reserve, grant, "binding-1"],
+        [HOST_PATHS.turns, grant, "binding-1"],
+        [HOST_PATHS.release, grant, "binding-1"],
       ]);
       assert.deepEqual((await (await testPool()).query(`select binding, secret_sha256 as digest from ${schema}.harness_grants where conversation_id = $1`, [conversationId])).rows, [{ binding: "binding-1", digest: grantDigest(grant) }]);
       // A fresh session is bound ahead too, so its pod has the grant as its harness makes it.
@@ -279,6 +288,50 @@ test("a turn's reservation binds its conversation's harness ahead, asked again w
       assert.deepEqual(holding.asked.map(({ path }) => path), ["/bind"]);
     } finally {
       holding.close();
+    }
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+});
+
+test("a turn whose harness is bound anew after its reservation, its pod gone, runs on the new binding's pod with that binding's grant and bayma, never the old one's", async () => {
+  const schema = newSchema();
+  const store = await testStore({ schema });
+  const conversationId = await run(store.upsertConversation({ chatId: "47", user: { id: 47 } }));
+  await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+  await run(store.setWorkingDirectory(conversationId, sessionFsWorkspace("fs-abc123")));
+  const started: TurnStart[] = [];
+  const scope = Effect.runSync(Scope.make());
+  try {
+    const { port } = await Effect.runPromise(Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token" }), HarnessHost, podHost(started)).pipe(Scope.provide(scope)));
+    // Its pod gone as its turn is started: the front binds it anew, and refuses the turn, for the binding before.
+    const stand = await front(port, { movesOn: HOST_PATHS.turns });
+    try {
+      const heldTo: unknown[] = [];
+      const sessions = { ensureSession: (_volumeId: string, held: unknown) => Effect.sync(() => (heldTo.push(held), { bayma: { url: "http://gateway/mcp", headers: {} } })) } as unknown as SessionSandboxes["Service"];
+      const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: "http://alasio-codex-login:4320/v1", home: CODEX_HOME } }).pipe(
+        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), codexAppServer, Layer.succeed(SessionSandboxes, sessions))),
+      )).pipe(Scope.provide(scope))), HarnessHost);
+      const epoch = await run(store.claimTurn({ conversationId, chatId: "47", messageId: "1", sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));
+      const answer = await Effect.runPromise(Effect.scoped(Effect.andThen(host.reserve(conversationId), host.startTurn({ conversationId, chatId: "47", messageId: "1", harness: CODEX_HARNESS, workingDirectory: sessionFsWorkspace("fs-abc123"), prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null, bayma: null, codex: null }))));
+      assert.equal(answer.pendingResponseId, "pending-1");
+      const grantOf = (binding: string) => harnessGrant(grantKey(CALLER_KEY), conversationId, binding);
+      // Each call for one binding alone, the turn made again of the new one with its own grant.
+      assert.deepEqual(stand.asked.filter(({ path }) => path !== "/bind").map(({ path, grant, pinned }) => [path, grant, pinned]), [
+        [HOST_PATHS.reserve, grantOf("binding-1"), "binding-1"],
+        [HOST_PATHS.turns, grantOf("binding-1"), "binding-1"],
+        [HOST_PATHS.turns, grantOf("binding-2"), "binding-2"],
+        [HOST_PATHS.release, grantOf("binding-1"), "binding-1"],
+      ]);
+      assert.equal(started.length, 1);
+      // Its bayma held to the binding its turn ran on; and each binding's grant kept, until its own binding is let go of, as the gateway tells.
+      assert.deepEqual(heldTo.map((held) => (held as { readonly binding: string }).binding), ["binding-1", "binding-2"]);
+      assert.deepEqual((await (await testPool()).query(`select binding, secret_sha256 as digest from ${schema}.harness_grants where conversation_id = $1 order by binding`, [conversationId])).rows, [
+        { binding: "binding-1", digest: grantDigest(grantOf("binding-1")) },
+        { binding: "binding-2", digest: grantDigest(grantOf("binding-2")) },
+      ]);
+    } finally {
+      stand.close();
     }
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));

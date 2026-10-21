@@ -38,7 +38,9 @@
  *   pod for it in time, its pod could not be readied), or its pod was not reached, its route
  *   then forgotten, so the next request binds the key anew, the 503 saying why (`reason`); 403 where the gateway binds it nowhere, as
  *   its token says it is bound; and 503 `{ "held": true }`, with no Retry-After, where its binds
- *   failed one after another, so it is bound again only as its caller asks.
+ *   failed one after another, so it is bound again only as its caller asks. A request for one
+ *   binding alone (PINNED_HEADER), whose key is bound to another by the time it would be passed,
+ *   is passed to no pod and answered 409 `{ moved: { binding, namespace } }`, the binding now.
  *
  * A token that is no caller's, has stopped, or is good for longer than MAX_CALLER_TOKEN_MS, is
  * answered 401; so is one that stops at no time, but where it is held to a binding of another
@@ -63,7 +65,7 @@ import { withLogScope } from "../shared/log.ts";
 import { BearerToken } from "../shared/tokens.ts";
 import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
 import { counts, touchLease } from "./bindings.ts";
-import { EVENTS_PATH, NO_BIND_HEADER, NOT_PASSED_HEADER, type Pool } from "./names.ts";
+import { EVENTS_PATH, NO_BIND_HEADER, NOT_PASSED_HEADER, PINNED_HEADER, type Pool } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
 import type { Held } from "./live.ts";
 import { bindingToken, type HeldTo, type TokenClaims, verifyToken } from "./tokens.ts";
@@ -419,6 +421,15 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       }
       const unbound = incoming.headers[NO_BIND_HEADER] === "never";
       delete incoming.headers[NO_BIND_HEADER];
+      const pinned = incoming.headers[PINNED_HEADER];
+      delete incoming.headers[PINNED_HEADER];
+      /** Whether `to` is of another binding than the request is for alone, as answered then: the binding the key is bound to now told, nothing passed. */
+      const movedFrom = (to: Routed): boolean => {
+        if (pinned === undefined || pinned === to.binding) return false;
+        incoming.resume();
+        answer(outgoing, 409, { error: `${key} is bound to another binding than ${String(pinned)} now`, moved: { binding: to.binding, namespace: to.pool.namespace } }, { [NOT_PASSED_HEADER]: "true" });
+        return true;
+      };
       // A bind asked ahead, and a request that binds nothing, asks how the key is bound now, not
       // the route this front last knew, which a release by another, as an idle or broken binding's,
       // leaves behind.
@@ -445,6 +456,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       }
       const { known } = routed.success;
       let { route } = routed.success;
+      if (movedFrom(route)) return;
       // On a route it knew of, which may be of a binding released since, as its watch has yet to
       // say, a request whose body it may read whole is read first, to pass it again.
       const body = known && replayable(incoming, REPLAYED_BYTES) ? (yield* Effect.promise(() => bodyOf(incoming, REPLAYED_BYTES))) ?? undefined : undefined;
@@ -472,6 +484,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
           if (again._tag === "Failure") return yield* refused(again.failure);
           if (!again.success) return answer(outgoing, 409, { bound: false });
           route = again.success.route;
+          if (movedFrom(route)) return;
           proxied = yield* passed(route);
         }
       }

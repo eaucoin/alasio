@@ -58,3 +58,12 @@ export const NOT_PASSED_HEADER = "x-alasio-not-passed";
 
 /** Where a bound pod tells the front of what its harness did on its own, for its caller's control plane, with its binding's token (./server.ts relay). */
 export const EVENTS_PATH = "/events";
+
+/**
+ * The header of a request for the binding it names alone, by its Lease's uid, as one that gives
+ * that binding's pod its grant is (src/harness/grant.ts): where its key is bound to another now,
+ * bound anew as the request came or before, it is passed to no pod, and answered 409 `{ moved:
+ * { binding, namespace } }`, the binding it is bound to now, for its caller to ask again of that
+ * one (./server.ts).
+ */
+export const PINNED_HEADER = "x-alasio-binding";

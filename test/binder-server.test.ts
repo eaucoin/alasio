@@ -12,7 +12,7 @@ import { Binder } from "../src/binder/binder.ts";
 import { ACTIVE_ANNOTATION, activeAt, readLease, takeLease, touchLease } from "../src/binder/bindings.ts";
 import { baymaIdleness } from "../src/binder/sweep.ts";
 import { LiveBindings } from "../src/binder/live.ts";
-import { environmentKey, freeLabels, NO_BIND_HEADER, NOT_PASSED_HEADER, type Pool } from "../src/binder/names.ts";
+import { environmentKey, freeLabels, NO_BIND_HEADER, NOT_PASSED_HEADER, PINNED_HEADER, type Pool } from "../src/binder/names.ts";
 import { type BinderServer, type BinderServerOptions, FIRST_TOLD_KEPT, MAX_CALLER_TOKEN_MS, MAX_OPERATION_BYTES, type Operation, type Placement, PlacementRefused, serveBinder, TOLD_BYTES } from "../src/binder/server.ts";
 import { bindingToken, mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 import { heldToHarness } from "../src/gateway/names.ts";
@@ -994,6 +994,34 @@ test("a front no pod tells anything answers a telling 404", async () => {
     const answered = await fetch(`http://127.0.0.1:${served.port}/events`, { method: "POST", headers: { authorization: `Bearer ${bindingToken(bindingKey, { key: "harness:telegram:41", binding: "binding-1", namespace: of.namespace })}` }, body: "{}" });
     assert.equal(answered.status, 404);
     assert.deepEqual(stand.sent, []);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a request for one binding alone is passed to its pod while its key is bound to it, and refused, passed to none, saying the binding now, once the key is bound anew", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  const stand = await pods();
+  const served = await front(of, stand.port, { watched: true });
+  try {
+    const key = "session:fs-pin";
+    const bind = async () => (await (await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).json()) as { readonly binding: string; readonly namespace: string };
+    const ask = (pinned: string) => fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key), [PINNED_HEADER]: pinned }, body: "{}" });
+    const first = await bind();
+    assert.equal((await ask(first.binding)).status, 200);
+    // The pod is sent no word of the binding asked for.
+    assert.equal(stand.sent.at(-1)?.[PINNED_HEADER], undefined);
+    const sent = stand.sent.length;
+    // Let go of, and bound anew to another pod.
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/release`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
+    const second = await bind();
+    assert.notEqual(second.binding, first.binding);
+    const refused = await ask(first.binding);
+    assert.deepEqual([refused.status, refused.headers.get(NOT_PASSED_HEADER), ((await refused.json()) as { readonly moved?: unknown }).moved], [409, "true", { binding: second.binding, namespace: of.namespace }]);
+    assert.equal(stand.sent.length, sent);
+    assert.equal((await ask(second.binding)).status, 200);
   } finally {
     await served.close();
     stand.close();

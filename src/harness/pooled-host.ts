@@ -35,7 +35,7 @@
  */
 import { join } from "node:path";
 
-import { Clock, Effect, Layer, Option, Schedule, Schema } from "effect";
+import { Clock, Effect, Layer, Option, Result, Schedule, Schema } from "effect";
 
 import { type HeldTo, mintToken } from "../binder/tokens.ts";
 import { CodexAppServer } from "../codex/app-server/client.ts";
@@ -46,7 +46,6 @@ import { poolLoginKey } from "../codex/login-relay.ts";
 import { harnessKey } from "../gateway/names.ts";
 import { BusyPods } from "../kube/busy.ts";
 import { HostBayma } from "../mcp/bayma.ts";
-import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { BIND_WAIT_MS, TOKEN_TTL_MS } from "../sandbox/gateway-client.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
@@ -65,6 +64,8 @@ export const HARNESS_BINDING = "its harness, whose pod is being readied";
 const CODEX_LOGIN_TTL_MS = 10 * 60_000;
 /** How often a running Codex turn's token is renewed, by default: well within its time. */
 const CODEX_LOGIN_RENEW_MS = 3 * 60_000;
+/** How often a call of one binding is made again of the binding the conversation's harness was bound to anew instead, at most: its pod gone once, and once more as it was. */
+const MOVED_RETRIES = 2;
 
 /** What the front says as it refuses a bind: why, and whether it holds the key, bound again only as its caller asks. */
 const BindRefusal = Schema.Struct({ error: Schema.String, reason: Schema.optional(Schema.String), held: Schema.optional(Schema.Boolean) });
@@ -116,15 +117,41 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
       /** A conversation bound nowhere: nothing runs in it, since ever, and a hold of the store's keeps it as it would anywhere. */
       const unbound = (conversationId: string) =>
         Effect.map(store.isConversationHeld(conversationId), (held) => ({ busy: held, running: false, cliInitiated: false, held, idleSince: 0 }));
-      /** The conversation's host, its calls bearing `token`, and giving `grant`, the binding's the caller bound, where it bound one. */
-      const hostBy = (token: Effect.Effect<string, HarnessHostError>, grant?: string) => remoteHost({ url, token, panels: harnesses.forMount, unbound, grant });
+      /** The conversation's host, its calls bearing `token`, and, where the caller bound one, for that binding alone, giving its grant. */
+      const hostBy = (token: Effect.Effect<string, HarnessHostError>, bound?: { readonly binding: string; readonly grant: string }) => remoteHost({ url, token, panels: harnesses.forMount, unbound, bound });
       const grantsKey = grantKey(callerKey);
       /** The grant of the binding `held` of the conversation's harness, kept as the conversation's, as the module says. */
       const grantOf = (conversationId: string, held: HeldTo): string => harnessGrant(grantsKey, conversationId, held.binding);
-      const granted = (conversationId: string, held: HeldTo): Effect.Effect<string, StoreError> => {
+      const granted = (conversationId: string, held: HeldTo): Effect.Effect<string, HarnessHostError> => {
         const grant = grantOf(conversationId, held);
-        return Effect.as(store.issueHarnessGrant(conversationId, held.binding, grantDigest(grant)), grant);
+        return Effect.as(store.issueHarnessGrant(conversationId, held.binding, grantDigest(grant)), grant).pipe(
+          Effect.mapError((error) => new HarnessHostError({ reason: `its harness's grant could not be kept: ${error.message}` })),
+        );
       };
+      /**
+       * `call`, of the binding `first` of the conversation's harness alone, its grant kept as the
+       * conversation's first; made again of the binding the front says it is bound to instead,
+       * where it was bound anew meanwhile, as a pod gone is, that one's grant kept and given in
+       * its place, MOVED_RETRIES times at most, so no pod is ever given another binding's grant:
+       * what it answered, and the binding it answered of.
+       */
+      const onBinding = <A, E, R>(
+        conversationId: string,
+        first: HeldTo,
+        call: (held: HeldTo, bound: { readonly binding: string; readonly grant: string }) => Effect.Effect<A, E | HarnessHostError, R>,
+      ): Effect.Effect<readonly [A, HeldTo], E | HarnessHostError, R> =>
+        Effect.gen(function*() {
+          let held = first;
+          for (let moves = 0; ; moves += 1) {
+            const grant = yield* granted(conversationId, held);
+            const answered = yield* Effect.result(call(held, { binding: held.binding, grant }));
+            if (Result.isSuccess(answered)) return [answered.success, held] as const;
+            const moved = answered.failure instanceof HarnessHostError ? answered.failure.moved : undefined;
+            if (!moved || moves >= MOVED_RETRIES) return yield* Effect.fail(answered.failure);
+            yield* Effect.logInfo(`${conversationId}'s harness was bound anew, from ${held.binding} to ${moved.binding}: its call is made again of that one`);
+            held = { ...held, ...moved };
+          }
+        });
       /**
        * `call` of the conversation's host, as its mount places it now, given its token's making;
        * or, where it has no harness in a workspace, so that nothing is bound for it, what `none`
@@ -230,8 +257,7 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
         reserve: (conversationId, waiting = () => Effect.void) =>
           onHost(conversationId, (_host, token) =>
             Effect.gen(function*() {
-              const held = yield* boundAhead(conversationId, token, waiting);
-              const made = yield* hostBy(token, yield* granted(conversationId, held)).reserve(conversationId);
+              const [made, held] = yield* onBinding(conversationId, yield* boundAhead(conversationId, token, waiting), (_held, bound) => hostBy(token, bound).reserve(conversationId));
               if (made) {
                 yield* Effect.acquireRelease(Effect.sync(() => void reserved.set(conversationId, held)), () =>
                   Effect.sync(() => {
@@ -243,14 +269,22 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
         startTurn: (start) =>
           Effect.gen(function*() {
             if (busyPods) yield* busyPods.hold;
-            const held = reserved.get(start.conversationId);
-            if (!held) return yield* new HarnessHostError({ reason: `a turn of ${start.conversationId} was started with its harness reserved for none` });
-            const bayma = yield* baymaOf(start, held);
+            const reservedTo = reserved.get(start.conversationId);
+            if (!reservedTo) return yield* new HarnessHostError({ reason: `a turn of ${start.conversationId} was started with its harness reserved for none` });
             const codex = yield* codexOf(start);
-            const host = hostBy(tokenOf(start.conversationId, start.harness, start.workingDirectory), grantOf(start.conversationId, held));
-            if (codex) yield* Effect.forkScoped(renewing(host, start));
-            // What the turn committed, the lake's to load once it ends, however it ends.
-            return yield* host.startTurn({ ...start, bayma, codex }).pipe(Effect.ensuring(Effect.sync(written)));
+            const token = tokenOf(start.conversationId, start.harness, start.workingDirectory);
+            // Of the binding reserved, or the one its harness is bound to anew, its pod gone: its bayma held to that one, and its grant given.
+            const [result] = yield* onBinding(start.conversationId, reservedTo, (held, bound) =>
+              Effect.gen(function*() {
+                const bayma = yield* baymaOf(start, held);
+                const host = hostBy(token, bound);
+                if (codex) yield* Effect.forkScoped(renewing(host, start));
+                return yield* host.startTurn({ ...start, bayma, codex });
+              }).pipe(Effect.scoped)).pipe(
+                // What the turn committed, the lake's to load once it ends, however it ends.
+                Effect.ensuring(Effect.sync(written)),
+              );
+            return result;
           }).pipe(Effect.scoped),
         steer: (conversationId, prompt, fileIds) => onHost(conversationId, (host) => host.steer(conversationId, prompt, fileIds), Effect.succeedNone),
         interrupt: (conversationId, reason) =>
@@ -269,8 +303,8 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
           Effect.gen(function*() {
             const token = tokenOf(params.conversationId, params.harness, params.workingDirectory);
             const held = yield* boundAhead(params.conversationId, token, () => Effect.void);
-            const grant = yield* granted(params.conversationId, held).pipe(Effect.mapError((error) => new HarnessHostError({ reason: `its grant could not be kept: ${error.message}` })));
-            return yield* hostBy(token, grant).startFreshSession(params);
+            const [sessionId] = yield* onBinding(params.conversationId, held, (_held, bound) => hostBy(token, bound).startFreshSession(params));
+            return sessionId;
           }),
         panels: harnesses.forMount,
       });

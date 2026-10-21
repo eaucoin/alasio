@@ -276,6 +276,8 @@ export const folderRefusedOnBranch = (branch: string): string =>
  */
 export class HarnessHostError extends Schema.TaggedError<HarnessHostError>()("HarnessHostError", {
   reason: Schema.String,
+  /** Where a call for one binding alone was refused, its conversation's harness bound to another since: that one, its Lease's uid and namespace. */
+  moved: Schema.optional(Schema.Struct({ binding: Schema.String, namespace: Schema.String })),
 }) {
   override get message(): string {
     return `The conversation's harness could not be reached: ${this.reason}`;
