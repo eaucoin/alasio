@@ -15,7 +15,7 @@
  * pod does; ./remote-host.ts is one elsewhere, an `alasio harness` (./program.ts) the control plane
  * reaches over HTTP (./serve.ts) as it does this one.
  */
-import { Context, Effect, Layer, Option, type Scope } from "effect";
+import { Context, Effect, Fiber, Layer, Option, type Scope } from "effect";
 
 import type { ModelChoice } from "../persistence/conversation-repository.ts";
 import type { BaymaEndpoint } from "../sandbox/gateway-client.ts";
@@ -85,6 +85,13 @@ export type TurnBayma = { readonly endpoint: BaymaEndpoint; readonly notice: nul
  */
 export type HarnessPanels = Pick<Harness, "name" | "displayName" | "supportsGoals" | "sessions" | "goals" | "listModels" | "defaultModelChoice">;
 
+/** A turn a caller attaches to (HarnessHost.attach): its conversation, the epoch it was claimed under, and the message it answers. */
+export interface AttachedTo {
+  readonly conversationId: string;
+  readonly epoch: number;
+  readonly messageId: string;
+}
+
 /** A conversation, and the harness and workspace it mounts, which a call of the host's is of. */
 export interface ConversationHarness {
   readonly conversationId: string;
@@ -123,6 +130,16 @@ export class HarnessHost extends Context.Service<HarnessHost, {
    * written: what else goes wrong ends up in its response.
    */
   readonly startTurn: (start: TurnStart) => Effect.Effect<TurnResult, StoreError | TurnFenced | HarnessUnavailable | ReceivedFileError>;
+  /**
+   * The conversation's turn claimed under `epoch` for the message `messageId`, as its host
+   * started it: what it came to, once it ends, as startTurn would have answered it; none where
+   * the host knows no such turn, as one that never ran there, or whose result it let go of. It
+   * starts no turn, and binds nothing (../harness/pooled-host.ts): a caller that lost a turn's
+   * answer, as alasio stopped while it ran, takes it so. A host keeps a turn's result until the
+   * next turn of its conversation starts, or the host stops, however often it is taken, so an
+   * attach whose answer was lost on its way, its connection broken, is asked again.
+   */
+  readonly attach: (turn: AttachedTo) => Effect.Effect<Option.Option<TurnResult>, StoreError | TurnFenced | HarnessUnavailable | ReceivedFileError | HarnessHostError>;
   /**
    * Sends the conversation's running turn more guidance, the files it names written first
    * where its harness reads them: whether it took it, or none when no turn runs.
@@ -175,6 +192,16 @@ export class HarnessHost extends Context.Service<HarnessHost, {
     const store = yield* Store;
     const receivedFiles = yield* ReceivedFiles;
     const { tell } = yield* HostEvents;
+    const scope = yield* Effect.scope;
+    /**
+     * Each conversation's latest turn, by the epoch it was claimed under and the message it
+     * answers: running in the host's scope, not its caller's, so a caller that lets go of it, as
+     * alasio does as it stops, leaves it running; asked for again so, it is the one started then
+     * that answers; and its result kept until the conversation's next turn starts, however often
+     * one attaches to it.
+     */
+    const turns = new Map<string, { readonly key: string; readonly fiber: Fiber.Fiber<TurnResult, StoreError | TurnFenced | HarnessUnavailable | ReceivedFileError> }>();
+    const keyOf = ({ epoch, messageId }: { readonly epoch: number; readonly messageId: string }): string => `${epoch}:${messageId}`;
     /** The conversations let go of (drain), which no turn starts in again. */
     const draining = new Set<string>();
     /** A turn of none, which holds a conversation as it is drained, while its harness is mirrored. */
@@ -197,6 +224,40 @@ export class HarnessHost extends Context.Service<HarnessHost, {
       held: store.isConversationHeld(conversationId),
     });
 
+    /** The turn `start` run on its harness, under its claim, its job's progress recorded. */
+    const run = (start: TurnStart) =>
+      Effect.gen(function*() {
+        const harness = yield* harnesses.getFor(start.harness, start.workingDirectory);
+        yield* receivedFiles.materialize(start.fileIds, parseWorkspace(start.workingDirectory));
+        /**
+         * What the job's turn records of its progress, for a restart to know what became of
+         * its prompt. The turn dies on a record it cannot make: so a prompt whose dispatch is
+         * not recorded is never sent, and a restart never misjudges the prompt of a turn
+         * that ran.
+         */
+        const recordJob = (record: (jobId: string) => Effect.Effect<void, StoreError>): Effect.Effect<void> =>
+          start.jobId ? Effect.orDie(record(start.jobId)) : Effect.void;
+        return yield* harness.runTurn({
+          prompt: start.prompt,
+          resumeSession: start.resumeSession,
+          threadKey: start.conversationId,
+          chatId: start.chatId,
+          messageId: start.messageId,
+          workingDirectory: start.workingDirectory,
+          modelChoice: start.modelChoice,
+          persistence: store.turnPersistence(start.conversationId, start.epoch),
+          ownTurns: ownTurnsOf(start.conversationId, start.chatId, harness.name),
+          attachedTurn: start.attachedTurn,
+          onPromptDispatched: recordJob(store.markPromptJobDispatched),
+          onTransportStarted: ({ sessionId, turnId }) => recordJob((id) => store.markPromptJobUpstreamStarted(id, sessionId, turnId)),
+          onTransportCompleted: ({ sessionId, turnId }) => recordJob((id) => store.markPromptJobUpstreamCompleted(id, sessionId, turnId)),
+          // A harness that keeps running between prompts (Claude Code's background work)
+          // produces replies of its own and frees the conversation when they finish.
+          onBackgroundResponse: tell({ kind: "background-response", conversationId: start.conversationId }),
+          onIdle: tell({ kind: "idle", conversationId: start.conversationId }),
+        });
+      });
+
     return HarnessHost.of({
       reserve: (conversationId) =>
         Effect.gen(function*() {
@@ -204,36 +265,20 @@ export class HarnessHost extends Context.Service<HarnessHost, {
           return !(yield* store.isConversationHeld(conversationId));
         }),
       startTurn: (start) =>
-        Effect.gen(function*() {
-          const harness = yield* harnesses.getFor(start.harness, start.workingDirectory);
-          yield* receivedFiles.materialize(start.fileIds, parseWorkspace(start.workingDirectory));
-          /**
-           * What the job's turn records of its progress, for a restart to know what became of
-           * its prompt. The turn dies on a record it cannot make: so a prompt whose dispatch is
-           * not recorded is never sent, and a restart never misjudges the prompt of a turn
-           * that ran.
-           */
-          const recordJob = (record: (jobId: string) => Effect.Effect<void, StoreError>): Effect.Effect<void> =>
-            start.jobId ? Effect.orDie(record(start.jobId)) : Effect.void;
-          return yield* harness.runTurn({
-            prompt: start.prompt,
-            resumeSession: start.resumeSession,
-            threadKey: start.conversationId,
-            chatId: start.chatId,
-            messageId: start.messageId,
-            workingDirectory: start.workingDirectory,
-            modelChoice: start.modelChoice,
-            persistence: store.turnPersistence(start.conversationId, start.epoch),
-            ownTurns: ownTurnsOf(start.conversationId, start.chatId, harness.name),
-            attachedTurn: start.attachedTurn,
-            onPromptDispatched: recordJob(store.markPromptJobDispatched),
-            onTransportStarted: ({ sessionId, turnId }) => recordJob((id) => store.markPromptJobUpstreamStarted(id, sessionId, turnId)),
-            onTransportCompleted: ({ sessionId, turnId }) => recordJob((id) => store.markPromptJobUpstreamCompleted(id, sessionId, turnId)),
-            // A harness that keeps running between prompts (Claude Code's background work)
-            // produces replies of its own and frees the conversation when they finish.
-            onBackgroundResponse: tell({ kind: "background-response", conversationId: start.conversationId }),
-            onIdle: tell({ kind: "idle", conversationId: start.conversationId }),
-          });
+        Effect.suspend(() => {
+          const key = keyOf(start);
+          const latest = turns.get(start.conversationId);
+          if (latest?.key === key) return Fiber.join(latest.fiber);
+          return Effect.forkIn(run(start), scope).pipe(
+            Effect.tap((fiber) => Effect.sync(() => void turns.set(start.conversationId, { key, fiber }))),
+            Effect.flatMap(Fiber.join),
+          );
+        }),
+      attach: (turn) =>
+        Effect.suspend(() => {
+          const kept = turns.get(turn.conversationId);
+          if (kept?.key !== keyOf(turn)) return Effect.succeedNone;
+          return Effect.asSome(Fiber.join(kept.fiber));
         }),
       steer: (conversationId, prompt, fileIds) =>
         store.getMount(conversationId).pipe(

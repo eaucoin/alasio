@@ -35,6 +35,7 @@ import { HarnessHost, type HarnessStatus } from "./host.ts";
 import { HarnessHostError } from "./index.ts";
 import {
   Alive,
+  AttachUnknown,
   BackgroundWorkAnswer,
   CodexLoginAnswer,
   DrainAnswer,
@@ -154,14 +155,27 @@ export function remoteHost({ url, token, unbound, bound }: RemoteHostOptions): H
       return yield* failed(response.status, said);
     });
 
-  /** An answer that lasts: its lines, where the host answered with them; what it failed with otherwise, as the host failed with it. */
-  const lasting = (path: string, body: object, what: string, signal?: AbortSignal) =>
+  /**
+   * An answer that lasts: its lines, where the host answered with them; what it failed with
+   * otherwise, as the host failed with it; and, of one that binds nothing (`bindsNothing`), null
+   * of a conversation the front binds nowhere.
+   */
+  const lasting = (path: string, body: object, what: string, { signal, bindsNothing = false }: { readonly signal?: AbortSignal; readonly bindsNothing?: boolean } = {}) =>
     Effect.gen(function*() {
-      const response = yield* post(path, body, signal ? { signal } : {});
+      const response = yield* post(path, body, { ...(signal ? { signal } : {}), bindsNothing });
       const answer = response.body;
       if (response.status === 200 && answer !== null) return linesOf(answer, what);
       const said = yield* Effect.tryPromise({ try: () => response.json() as Promise<unknown>, catch: (cause) => new HarnessHostError({ reason: errorText(cause) }) });
+      if (bindsNothing && response.status === 409 && Schema.is(Unbound)(said)) return null;
       return yield* failed(response.status, said);
+    });
+
+  /** A turn's answer, its last line `said`: its result, or what it failed with, as the host failed with it. */
+  const turnAnswered = (said: unknown) =>
+    Effect.gen(function*() {
+      if (Schema.is(Failure)(said)) return yield* Effect.fail(crossingErrorOf(said) ?? new HarnessHostError({ reason: said.error.message }));
+      const { answer } = yield* read(TurnAnswered, said);
+      return yield* Effect.mapError(decodeTurnAnswer(answer), (error) => new HarnessHostError({ reason: `it answered as no harness host does: ${error.message}` }));
     });
 
   /** `error`, if the host's status may fail with it, as its reservation may: the store's, or else as the host's not reaching it. */
@@ -180,7 +194,9 @@ export function remoteHost({ url, token, unbound, bound }: RemoteHostOptions): H
         // The connection the conversation is held on, until the scope closes.
         const holding = new AbortController();
         yield* Effect.addFinalizer(() => Effect.sync(() => holding.abort()));
-        const answer = yield* lasting(HOST_PATHS.reserve, { conversationId }, "a reservation", holding.signal).pipe(Effect.mapError(asStatusError));
+        const answer = yield* lasting(HOST_PATHS.reserve, { conversationId }, "a reservation", { signal: holding.signal }).pipe(Effect.mapError(asStatusError));
+        // A reservation binds; it is never of a conversation bound nowhere.
+        if (answer === null) return yield* new HarnessHostError({ reason: `the sandbox gateway bound nothing for ${conversationId}'s reservation` });
         const { held, id } = yield* read(Reserved, yield* answer.next);
         // Let go of as the scope closes, and so let go of by then, as the host in alasio's process lets go.
         if (id !== null) {
@@ -194,10 +210,18 @@ export function remoteHost({ url, token, unbound, bound }: RemoteHostOptions): H
       }),
     startTurn: (start) =>
       Effect.gen(function*() {
-        const said = yield* (yield* lasting(HOST_PATHS.turns, start, "a turn")).next;
-        if (Schema.is(Failure)(said)) return yield* Effect.fail(crossingErrorOf(said) ?? new HarnessHostError({ reason: said.error.message }));
-        const { answer } = yield* read(TurnAnswered, said);
-        return yield* Effect.mapError(decodeTurnAnswer(answer), (error) => new HarnessHostError({ reason: `it answered as no harness host does: ${error.message}` }));
+        const answer = yield* lasting(HOST_PATHS.turns, start, "a turn");
+        if (answer === null) return yield* new HarnessHostError({ reason: `the sandbox gateway bound nothing for ${start.conversationId}'s turn` });
+        return yield* turnAnswered(yield* answer.next);
+      }),
+    // Of the conversation's harness bound now alone: of one bound nowhere, no turn is known.
+    attach: (turn) =>
+      Effect.gen(function*() {
+        const answer = yield* lasting(HOST_PATHS.attach, turn, "an attach to a turn", { bindsNothing: true });
+        if (answer === null) return Option.none();
+        const said = yield* answer.next;
+        if (Schema.is(AttachUnknown)(said)) return Option.none();
+        return Option.some(yield* turnAnswered(said));
       }),
     steer: (conversationId, prompt, fileIds) =>
       call(HOST_PATHS.steer, { conversationId, prompt, fileIds }, SteerAnswer, { none: Effect.succeed({ taken: null }) }).pipe(

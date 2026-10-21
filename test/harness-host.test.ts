@@ -211,6 +211,72 @@ for (const [reach, reached] of Object.entries(REACHES)) {
   });
 }
 
+for (const [reach, reached] of Object.entries(REACHES)) {
+  test(`a turn's caller that lets go of it, as alasio does as it stops, attaches to it again through the host ${reach}, the turn asked for again the one started then: its result once it ends, kept however often taken, an attach broken on its way among them, until the next turn starts, and none of a turn it knows not`, async () => {
+    const store = await testStore();
+    const conversationId = await run(store.upsertConversation({ chatId: "41", user: { id: 41 } }));
+    await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+    await run(store.setWorkingDirectory(conversationId, "/work"));
+    const claim = (messageId: string) => run(store.claimTurn({ conversationId, chatId: "41", messageId, sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));
+    const start = (messageId: string, epoch: number): TurnStart => ({ conversationId, chatId: "41", messageId, harness: CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null, bayma: null, codex: null });
+    // Each turn ends as the test lets it, once it is running.
+    const seen: TurnParams[] = [];
+    const gates: Deferred.Deferred<void>[] = [];
+    const recorded = recordingHarness(seen);
+    const harness: Harness = {
+      ...recorded,
+      runTurn: (params) => Effect.gen(function*() {
+        const gate = yield* Deferred.make<void>();
+        gates.push(gate);
+        yield* Deferred.await(gate);
+        return yield* recorded.runTurn(params);
+      }),
+    };
+    const first = await claim("10");
+    await onPodHost({ store, harness }, Effect.gen(function*() {
+      const host = yield* reached(yield* HarnessHost, conversationId);
+      // None of a turn it never ran.
+      assert.deepEqual(yield* host.attach({ conversationId, epoch: first, messageId: "10" }), Option.none());
+      // Its caller lets go of it as it runs: it runs on.
+      const caller = yield* Effect.forkChild(host.startTurn(start("10", first)));
+      while (gates.length === 0) yield* Effect.sleep("10 millis");
+      yield* Fiber.interrupt(caller);
+      const attached = yield* Effect.forkChild(host.attach({ conversationId, epoch: first, messageId: "10" }));
+      // An attach that lets go as it waits, as one whose connection broke does, takes nothing away.
+      const broken = yield* Effect.forkChild(host.attach({ conversationId, epoch: first, messageId: "10" }));
+      yield* Effect.sleep("20 millis");
+      yield* Fiber.interrupt(broken);
+      // Asked for again under its epoch, as a caller that lost its answer may, it is the one started then.
+      const again = yield* Effect.forkChild(host.startTurn(start("10", first)));
+      yield* Effect.sleep("50 millis");
+      assert.equal(attached.pollUnsafe(), undefined, "an attach answered before its turn ended");
+      yield* Deferred.succeed(gates[0]!, undefined);
+      const result = Option.getOrThrow(yield* Fiber.join(attached));
+      assert.deepEqual([result.blockSequence, result.sessionId], [[{ type: "text", content: "Done." }], "session-1"]);
+      assert.equal((yield* Fiber.join(again)).pendingResponseId, result.pendingResponseId);
+      // Taken so, it is kept still, for an attach whose answer was lost on its way to ask again; and only the one turn ran.
+      assert.equal(Option.getOrThrow(yield* host.attach({ conversationId, epoch: first, messageId: "10" })).pendingResponseId, result.pendingResponseId);
+      assert.equal(seen.length, 1);
+      // A turn whose caller took its answer is kept until the next starts: attached to after it ended, then of no more once another has started.
+      const second = yield* Effect.promise(() => claim("11"));
+      const ending = yield* Effect.forkChild(host.startTurn(start("11", second)));
+      while (gates.length < 2) yield* Effect.sleep("10 millis");
+      yield* Deferred.succeed(gates[1]!, undefined);
+      yield* Fiber.join(ending);
+      const third = yield* Effect.promise(() => claim("12"));
+      const next = yield* Effect.forkChild(host.startTurn(start("12", third)));
+      while (gates.length < 3) yield* Effect.sleep("10 millis");
+      assert.deepEqual(yield* host.attach({ conversationId, epoch: second, messageId: "11" }), Option.none());
+      // And of another message, or another epoch, of the turn running: none either.
+      assert.deepEqual(yield* host.attach({ conversationId, epoch: third, messageId: "11" }), Option.none());
+      assert.deepEqual(yield* host.attach({ conversationId, epoch: second, messageId: "12" }), Option.none());
+      yield* Deferred.succeed(gates[2]!, undefined);
+      yield* Fiber.join(next);
+      assert.ok(Option.isSome(yield* host.attach({ conversationId, epoch: third, messageId: "12" })));
+    }));
+  });
+}
+
 test("Codex has work of its own in a conversation as its app-server says, none where it runs none, and where that cannot be told, in time or at all, has, as alasio's log says", async () => {
   const logged: string[] = [];
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {

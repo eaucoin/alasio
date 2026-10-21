@@ -58,6 +58,10 @@ function podHost(started: TurnStart[], { renewed = [], turnMs = 0 }: { readonly 
         Effect.andThen(Effect.sleep(turnMs)),
         Effect.as({ blockSequence: [], sessionId: "thread-1", pendingResponseId: "pending-1", interrupted: false, responseCompleted: true }),
       ),
+    attach: ({ epoch, messageId }) =>
+      Effect.succeed(started.some((start) => start.epoch === epoch && start.messageId === messageId)
+        ? Option.some({ blockSequence: [], sessionId: "thread-1", pendingResponseId: "pending-1", interrupted: false, responseCompleted: true })
+        : Option.none()),
     steer: () => Effect.succeed(Option.some(true)),
     interrupt: () => Effect.succeed(true),
     status: () => Effect.succeed({ busy: true, running: true, cliInitiated: false, held: false, idleSince: null }),
@@ -181,7 +185,9 @@ test("alasio reaches each conversation's pooled host through the front, a token 
       assert.deepEqual(await Effect.runPromise(host.backgroundWork(conversationId)), false);
       assert.deepEqual(await Effect.runPromise(host.steer(conversationId, "more", [])), Option.none());
       assert.equal(await Effect.runPromise(host.interrupt(conversationId, "interrupt")), false);
-      assert.deepEqual(stand.asked.map(({ bindsNothing }) => bindsNothing), [true, true, true, true]);
+      // Nor does an attach to a turn of it, of which none is known.
+      assert.deepEqual(await Effect.runPromise(host.attach({ conversationId, epoch: 1, messageId: "10" })), Option.none());
+      assert.deepEqual(stand.asked.map(({ bindsNothing }) => bindsNothing), [true, true, true, true, true]);
       assert.deepEqual(stand.asked[0]?.claims?.key, `harness:${conversationId}`);
       assert.deepEqual(stand.asked[0]?.claims?.options, { environment: "main", harness: "codex", workspace: "folder" });
       const lifetime = (stand.asked[0]?.claims?.expires ?? 0) - Date.now();
@@ -212,7 +218,7 @@ test("alasio reaches each conversation's pooled host through the front, a token 
       // The pod given the grant of the binding its bind answered with, by its reservation and its turn, and by no call that binds nothing; alasio keeping its digest as the conversation's.
       const grant = harnessGrant(grantKey(CALLER_KEY), conversationId, "binding-1");
       assert.deepEqual(stand.asked.map(({ path, grant, pinned }) => [path, grant, pinned]), [
-        ...[HOST_PATHS.status, HOST_PATHS.backgroundWork, HOST_PATHS.steer, HOST_PATHS.interrupt].map((path) => [path, undefined, undefined]),
+        ...[HOST_PATHS.status, HOST_PATHS.backgroundWork, HOST_PATHS.steer, HOST_PATHS.interrupt, HOST_PATHS.attach].map((path) => [path, undefined, undefined]),
         ["/bind", undefined, undefined],
         [HOST_PATHS.reserve, grant, "binding-1"],
         [HOST_PATHS.turns, grant, "binding-1"],
@@ -222,9 +228,11 @@ test("alasio reaches each conversation's pooled host through the front, a token 
       // A fresh session is bound ahead too, so its pod has the grant as its harness makes it.
       assert.equal(await Effect.runPromise(host.startFreshSession({ conversationId, harness: CODEX_HARNESS, workingDirectory: "/work" })), "thread-2");
       assert.deepEqual(stand.asked.slice(-2).map(({ path, grant }) => [path, grant]), [["/bind", undefined], [HOST_PATHS.freshSession, grant]]);
-      // Bound, what reads it is passed on to its host.
+      // Bound, what reads it is passed on to its host, an attach to its turn among it, binding nothing still, nor giving its grant.
       assert.deepEqual(await Effect.runPromise(host.status(conversationId)), { busy: true, running: true, cliInitiated: false, held: false, idleSince: null });
       assert.equal(await Effect.runPromise(host.backgroundWork(conversationId)), true);
+      assert.equal(Option.getOrThrow(await Effect.runPromise(host.attach({ conversationId, epoch, messageId: "10" }))).pendingResponseId, "pending-1");
+      assert.deepEqual([stand.asked.at(-1)?.path, stand.asked.at(-1)?.bindsNothing, stand.asked.at(-1)?.grant], [HOST_PATHS.attach, true, undefined]);
 
       // Its workspace switched to a session: the next call's token places it so, and its turn is given the session's bayma.
       await run(store.setWorkingDirectory(conversationId, sessionFsWorkspace("fs-abc123")));

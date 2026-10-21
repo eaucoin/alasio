@@ -3,11 +3,12 @@
  * that bears its token: `alasio harness`'s interface (./main.ts), which the control plane
  * reaches through the sandbox gateway's front where its harnesses run in pools.
  *
- * A turn the host starts runs in the server's scope, not the request's: its caller may let
- * go of the call, as alasio does when it stops, and the turn goes on, its writes in the
- * store, under the epoch it was claimed under, as they are wherever it runs; it ends as
- * the turn does, or as the host stops; asked for again under its epoch, as a caller that
- * lost its answer asks again, it is the turn running that answers, not another. A
+ * A turn the host starts runs in the host's scope, not the request's (HarnessHost.startTurn):
+ * its caller may let go of the call, as alasio does when it stops, and the turn goes on, its
+ * writes in the store, under the epoch it was claimed under, as they are wherever it runs;
+ * asked for again under its epoch, it is the turn running that answers, not another; and a
+ * caller that lost its answer attaches to it (HarnessHost.attach), its answer the turn's as it
+ * comes to it, or what the host kept of it. A
  * reservation lasts until its caller releases it, or lets go of the connection, as a
  * caller that is gone does. `GET /healthz` answers 200 to anyone once it serves, as a harness
  * pool's pod is ready only once bound. A call that carries a trace context is served in a span
@@ -21,18 +22,16 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 
 import { NodeHttpServer } from "@effect/platform-node";
-import { Deferred, Effect, Fiber, Option, Result, Schema, type Scope, Stream } from "effect";
+import { Deferred, Effect, Option, Result, Schema, type Scope, Stream } from "effect";
 import { HttpMiddleware, type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 
-import type { StoreError } from "../persistence/sql.ts";
-import type { TurnFenced } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken, sameToken } from "../shared/tokens.ts";
-import type { ReceivedFileError } from "../telegram/files.ts";
 import { GRANT_HEADER, isGrant } from "./grant.ts";
-import { HarnessHost, type TurnStart } from "./host.ts";
-import type { HarnessUnavailable, TurnResult } from "./index.ts";
+import { HarnessHost } from "./host.ts";
 import {
+  AttachRequest,
+  AttachUnknown,
   BackgroundWorkAnswer,
   BackgroundWorkRequest,
   CodexLoginAnswer,
@@ -82,9 +81,6 @@ export interface HostServerOptions {
   readonly keepAliveMs?: number | undefined;
 }
 
-/** How many of the latest turns' answers are kept, for a caller that asks again (serveHost). */
-const TURNS_KEPT = 8;
-
 /** `body`, as JSON, with `status`. */
 const answer = (status: number, body: object): HttpServerResponse.HttpServerResponse => HttpServerResponse.jsonUnsafe(body, { status });
 
@@ -109,30 +105,6 @@ export const serveHost = Effect.fnUntraced(function*(
   { port, host: hostname = "0.0.0.0", conversationId, token, granted, keepAliveMs = KEEP_ALIVE_MS }: HostServerOptions,
 ): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope | HarnessHost> {
   const host = yield* HarnessHost;
-  const scope = yield* Effect.scope;
-
-  /**
-   * The latest turns, by the epoch each was claimed under and the message it answers,
-   * running or ended: a turn asked for again so, as a caller that lost its answer asks
-   * again, is the one started then, answered as it is, not another. The latest TURNS_KEPT
-   * alone are kept, as a conversation's epochs only grow and an answer is asked for again
-   * soon or never.
-   */
-  const turns = new Map<string, { readonly epoch: number; readonly fiber: Fiber.Fiber<TurnResult, StoreError | TurnFenced | HarnessUnavailable | ReceivedFileError> }>();
-  const turnOf = (start: TurnStart) =>
-    Effect.suspend(() => {
-      const key = `${start.epoch}:${start.messageId}`;
-      const started = turns.get(key);
-      if (started) return Effect.succeed(started.fiber);
-      return Effect.forkIn(host.startTurn(start), scope).pipe(
-        Effect.tap((fiber) =>
-          Effect.sync(() => {
-            turns.set(key, { epoch: start.epoch, fiber });
-            for (const [kept] of [...turns].sort(([, a], [, b]) => b.epoch - a.epoch).slice(TURNS_KEPT)) turns.delete(kept);
-          })
-        ),
-      );
-    });
 
   /** The conversation's holds, by id: each let go of once it is released, and closed once the host has let go. */
   const holds = new Map<string, { readonly release: Deferred.Deferred<void>; readonly closed: Deferred.Deferred<void> }>();
@@ -176,9 +148,20 @@ export const serveHost = Effect.fnUntraced(function*(
       case HOST_PATHS.turns:
         return Effect.map(body(TurnStartRequest), (start) =>
           lines(
-            Stream.fromEffect(turnOf(turnStartOf(start)).pipe(
-              Effect.flatMap(Fiber.join),
+            Stream.fromEffect(host.startTurn(turnStartOf(start)).pipe(
               Effect.map((result): object => ({ answer: encodeTurnAnswer(result) })),
+              Effect.catch((error) => Effect.succeed(failureOf(error))),
+            )),
+            keepAliveMs,
+          ));
+      case HOST_PATHS.attach:
+        return Effect.map(body(AttachRequest), (turn) =>
+          lines(
+            Stream.fromEffect(host.attach(turn).pipe(
+              Effect.map(Option.match({
+                onNone: (): object => Schema.encodeSync(AttachUnknown)({ known: false }),
+                onSome: (result): object => ({ answer: encodeTurnAnswer(result) }),
+              })),
               Effect.catch((error) => Effect.succeed(failureOf(error))),
             )),
             keepAliveMs,

@@ -1,7 +1,7 @@
 /**
  * The harness host's interface as alasio harness serves it (src/harness/serve.ts): what
  * lasts says so often enough for a client, or a proxy between, that gives up on a quiet
- * connection, and a turn asked for again under its epoch is the one running.
+ * connection; a turn asked for again is its host's to answer (test/harness-host.test.ts).
  */
 import assert from "node:assert/strict";
 import { request } from "node:http";
@@ -23,6 +23,7 @@ function slowHost(turnMs: number, started: { count: number }): HarnessHost["Serv
   return HarnessHost.of({
     reserve: () => Effect.succeed(true),
     startTurn: () => Effect.sync(() => void (started.count += 1)).pipe(Effect.andThen(Effect.sleep(turnMs)), Effect.as(result)),
+    attach: () => Effect.succeedNone,
     steer: () => Effect.succeedNone,
     interrupt: () => Effect.succeed(false),
     status: () => Effect.succeed({ busy: false, running: false, cliInitiated: false, held: false, idleSince: 0 }),
@@ -127,21 +128,5 @@ test("a reservation, quiet for longer than a client waits, is kept alive", { tim
     assert.equal(held.gaveUp, false);
     assert.ok(held.lines.some((line) => (line as { readonly held?: boolean }).held === true));
     assert.ok(held.lines.filter((line) => (line as { readonly alive?: boolean }).alive === true).length >= 5);
-  });
-});
-
-test("a turn asked for again under its epoch, as a caller that lost its answer asks again, is the one started then, answered as it is", { timeout: 30_000 }, async () => {
-  const started = { count: 0 };
-  await serving(slowHost(500, started), 100, async (port) => {
-    const [first, again] = await Promise.all([called(port, HOST_PATHS.turns, START, 5_000, 5_000), called(port, HOST_PATHS.turns, START, 5_000, 5_000)]);
-    assert.equal(started.count, 1);
-    for (const { lines } of [first, again]) assert.equal(answerOf(lines), "pending-1");
-    // Asked for again once it has ended, it is answered as it ended, run no more.
-    const late = await called(port, HOST_PATHS.turns, START, 5_000, 5_000);
-    assert.equal(answerOf(late.lines), "pending-1");
-    assert.equal(started.count, 1);
-    // A turn of another epoch is another turn.
-    await called(port, HOST_PATHS.turns, { ...START, epoch: 4 }, 5_000, 5_000);
-    assert.equal(started.count, 2);
   });
 });

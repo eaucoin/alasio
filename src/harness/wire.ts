@@ -25,6 +25,7 @@ export const HOST_PATHS = {
   reserve: "/reserve",
   release: "/release-hold",
   turns: "/turns",
+  attach: "/turns/attach",
   steer: "/steer",
   interrupt: "/interrupt",
   status: "/status",
@@ -189,6 +190,11 @@ export const Failure = Schema.Struct({
     reason: Schema.optionalKey(Schema.String),
   }),
 });
+
+/** A turn to attach to (HarnessHost.attach): of the conversation, claimed under `epoch`, answering `messageId`. */
+export const AttachRequest = Schema.Struct({ conversationId: Schema.String, epoch: Schema.Number, messageId: Schema.String });
+/** The last line of an attach's answer where the host knows no such turn, as one that never ran there, or whose result it let go of. */
+export const AttachUnknown = Schema.Struct({ known: Schema.Literal(false) });
 
 /** The last line of a turn's answer but where it failed (Failure): its result, as TurnAnswer encodes it. */
 export const TurnAnswered = Schema.Struct({ answer: Schema.Unknown });
