@@ -6,11 +6,12 @@
  * reads it: its image's files, linked to the cache's, and in its `layers/<digest>/` each
  * image it holds pages of besides its own, its layers, linked to the cache's too, as runsc
  * finds an image's layers; or, for one read from the bucket, the checkpoint gofer's options
- * file alone, until its restore has read it, and which runsc describes it from a copy of
- * (remoteCopy). An image is written in a directory of its own beside the layers,
- * whose name begins with ".", and moved among them once it is whole and its digest known, so
- * what the cache holds is always whole; what a stopped agent left half written is removed as
- * the next one starts.
+ * file alone, until its restore has read it, and which runsc describes it from a copy of, in
+ * `<root>/.inspect/`, apart from every workspace, so that no clear or eviction of the
+ * workspace removes it while runsc reads it (remoteCopy). An image is written in a directory
+ * of its own beside the layers, whose name begins with ".", and moved among them once it is
+ * whole and its digest known, so what the cache holds is always whole; what a stopped agent
+ * left half written is removed as the next one starts.
  *
  * Beside the images, in `<root>/<environment>/<workspace>/stamps/<digest>.json`, each
  * image's stamp: its files as they were checked as they were written, each by its SHA-256,
@@ -50,6 +51,9 @@ export const RESERVE_BYTES = 2 * 1024 ** 3;
 
 /** The directory of a workspace's images, each in one named by its digest; and of a snapshot's, its layers. */
 export const LAYERS_DIR = "layers";
+
+/** The directory, under the cache's root and of no workspace, of the copies of options runsc inspects a snapshot in the bucket by (remoteCopy): its name begins with ".", as no workspace's environment does. */
+const INSPECT_DIR = ".inspect";
 
 /** The directory of a workspace's images' stamps, each named by its image's digest. */
 export const STAMPS_DIR = "stamps";
@@ -146,9 +150,9 @@ export interface SnapshotCache {
    * A directory of its own holding the checkpoint gofer's options file `name`, holding
    * `options`, as prepareRemote writes it, from which runsc reads the snapshot from the bucket
    * as its restore does, whatever becomes of the restore's directory meanwhile: its options
-   * removed once its restore has read them, or the directory made anew for the next restore.
-   * Written beside the images being written, so that one a stopped agent left is removed as
-   * the next starts; removed as the scope ends.
+   * removed once its restore has read them, or the directory made anew for the next restore,
+   * or the workspace cleared or evicted whole. Apart from every workspace (INSPECT_DIR); one a
+   * stopped agent left is removed as the next starts; removed as the scope ends.
    */
   readonly remoteCopy: (environment: string, workspace: string, snapshot: string, name: string, options: string) => Effect.Effect<string, CacheError, Scope.Scope>;
   /** Removes everything of the workspace. */
@@ -167,7 +171,7 @@ export interface SnapshotCache {
    * workspaces as `evict` does: those evicted. Fails, saying so, where it cannot.
    */
   readonly room: (bytes: number, spared: Spared) => Effect.Effect<readonly CachedWorkspace[], CacheError>;
-  /** Removes what was left half written. */
+  /** Removes what was left half written, and the copies of options left (remoteCopy). */
   readonly clean: Effect.Effect<void, CacheError>;
 }
 
@@ -377,12 +381,12 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
     remoteCopy: (environment, workspace, snapshot, name, options) => {
       checked(environment, workspace, snapshot);
       if (!/^[a-z0-9_]+\.json$/u.test(name)) throw new Error(`the snapshot cache writes no options file ${JSON.stringify(name)}`);
-      const layers = join(workspaceDir(environment, workspace), LAYERS_DIR);
+      const copies = join(root, INSPECT_DIR);
       return Effect.acquireRelease(
         attempt(async () => {
-          await mkdir(layers, { recursive: true });
+          await mkdir(copies, { recursive: true, mode: 0o700 });
           // One of its own however many are made of the snapshot at once, owner-only from its making.
-          const directory = await mkdtemp(join(layers, staged(`${snapshot}.remote-`)));
+          const directory = await mkdtemp(join(copies, `${environment}.${workspace}.${snapshot}-`));
           await writeFile(join(directory, name), options, { mode: 0o600, flag: "wx" });
           return directory;
         }),
@@ -460,6 +464,7 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
       }),
 
     clean: attempt(async () => {
+      await rm(join(root, INSPECT_DIR), { recursive: true, force: true });
       for (const environment of (await directories(root)).filter((name) => NAME.test(name))) {
         for (const workspace of (await directories(join(root, environment))).filter((name) => NAME.test(name))) {
           for (const under of [LAYERS_DIR, STAMPS_DIR]) {

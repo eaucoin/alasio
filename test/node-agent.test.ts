@@ -14,7 +14,7 @@ import { request as httpRequest } from "node:http";
 import { closeSync, constants, type PathLike, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
@@ -1865,6 +1865,30 @@ test("the node's cache lists what it holds as the agent moves and removes it mea
     // At rest, each image written again, it holds each, and its bytes.
     for (let index = 0; index < 64; index += 1) write(index);
     assert.deepEqual((await Effect.runPromise(cache.list)).map(({ images, bytes }) => [images.length, bytes]), [[64, 64 * 5]]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the copy of a restore's options runsc inspects the snapshot by outlives its workspace's clear and eviction while runsc reads it, removed once it has, and by the next agent where one was left", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-cache-inspect-"));
+  try {
+    const cache = makeSnapshotCache({ root, budget: 0, graceMs: 0 });
+    const scope = Effect.runSync(Scope.make());
+    const copy = await Effect.runPromise(cache.remoteCopy("main", "fs-abc", "20261021T000000000Z-0123abcd", "s3_opts.json", "{}").pipe(Scope.provide(scope)));
+    // As a restore abandoned, or another prepare's, clears the workspace, and a budget spent evicts it.
+    await Effect.runPromise(cache.prepareRemote("main", "fs-abc", "20261021T000000000Z-0123abcd", "s3_opts.json", "{}"));
+    await Effect.runPromise(cache.clear("main", "fs-abc"));
+    await Effect.runPromise(cache.room(0, () => false));
+    assert.equal(readFileSync(join(copy, "s3_opts.json"), "utf8"), "{}");
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    assert.ok(!existsSync(copy));
+    // One a stopped agent left: removed as the next starts.
+    const left = join(dirname(copy), "main.fs-abc.left");
+    mkdirSync(left);
+    writeFileSync(join(left, "s3_opts.json"), "{}");
+    await Effect.runPromise(cache.clean);
+    assert.ok(!existsSync(left));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
