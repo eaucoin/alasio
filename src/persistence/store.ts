@@ -16,7 +16,8 @@ import type { HarnessName } from "../harness/names.ts";
 import type { MediaAttachment } from "../telegram/client.ts";
 import { startBranch } from "./branch-start.ts";
 import { type CallbackAction, NeonCallbackRepository, type NewCallbackAction } from "./callback-repository.ts";
-import { NeonCodexLoginRepository } from "./codex-login-repository.ts";
+import { type CodexLoginRecord, NeonCodexLoginRepository } from "./codex-login-repository.ts";
+export type { CodexLoginRecord } from "./codex-login-repository.ts";
 import {
   type Conversation,
   type ModelChoice,
@@ -242,6 +243,19 @@ export interface EventWrites {
  * of the store's schema and the chat, which Postgres hashes to one (hashtextextended).
  */
 export const handlingLockName = (schema: string, chatId: string | number): string => `${schema}:handling:${chatId}`;
+
+/** What names the store's Codex login lock to Postgres, as handlingLockName names a chat's. */
+export const codexLoginLockName = (schema: string): string => `${schema}:codex-login`;
+
+/** Codex's login as the holder of the store's Codex login lock reads and writes it (Store.withCodexLoginLock). */
+export interface CodexLoginWrites {
+  /** Codex's login as last kept, with when it was kept and when its refresh was refused, or null when none is. */
+  readonly get: Stored<CodexLoginRecord | null>;
+  /** Keeps `auth` as Codex's login: when it was kept. */
+  readonly save: (auth: string) => Stored<number>;
+  /** Records the login kept at `savedAt` as refused as it was refreshed, its refresh token spent or revoked: none, where another was kept since. */
+  readonly refuse: (savedAt: number) => Stored<void>;
+}
 
 /**
  * A turn's write refused, as another turn has claimed its conversation since
@@ -500,6 +514,15 @@ export class Store extends Context.Service<Store, {
   readonly getCodexLogin: Stored<string | null>;
   /** Keeps `auth` as Codex's login; null, Codex logged out, keeps none. */
   readonly setCodexLogin: (auth: string | null) => Stored<void>;
+  /** Codex's login as last kept, with when it was kept and when its refresh was refused, by the store's own clock, or null when none is. */
+  readonly getCodexLoginRecord: Stored<CodexLoginRecord | null>;
+  /**
+   * Runs `work` holding the store's Codex login lock, given the login as kept and its writes,
+   * in one transaction: of the alasios on the store, one at a time, each waiting for the one
+   * before, so a login whose refresh token works once is refreshed by one alone, and the next
+   * reads what it kept (../codex/login-refresh.ts).
+   */
+  readonly withCodexLoginLock: <A, E, R>(work: (login: CodexLoginWrites) => Effect.Effect<A, E, R>) => Effect.Effect<A, E | StoreError, R>;
 
   /**
    * Runs `work` as the handling of the environment's event `id`, of `kind`, given what it
@@ -742,6 +765,14 @@ const makeStore = Effect.fnUntraced(function*({
 
     getCodexLogin: codexLogin.getCodexLogin(),
     setCodexLogin: (auth) => codexLogin.setCodexLogin(auth),
+    getCodexLoginRecord: codexLogin.getCodexLoginRecord(),
+    withCodexLoginLock: (work) =>
+      database.transaction((sql) => {
+        const login = repositoriesOn(sql).codexLogin;
+        return sql.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [codexLoginLockName(schema)]).pipe(
+          Effect.andThen(work({ get: login.getCodexLoginRecord(), save: (auth) => login.saveCodexLogin(auth), refuse: (savedAt) => login.refuseCodexLogin(savedAt) })),
+        );
+      }),
 
     withEventHandled: (id, kind, work) =>
       database.transaction((sql) => {

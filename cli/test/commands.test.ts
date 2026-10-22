@@ -123,8 +123,10 @@ async function rig(t: TestContext): Promise<Rig> {
   // The storage controller, once installed, says what Neon's storage holds, which alasio up
   // checks the configuration against: one pageserver, before the tenant is made.
   const storage: FakeStorage = { pageservers: 1, shards: null, answering: true, databaseAnswering: true };
+  // alasio's pod, asked of its Codex login, as its store keeps one (src/codex/login-state.ts).
+  const codexLogin = (command: readonly string[]) => (command.at(-1) === "/opt/alasio/src/codex/login-state.ts" ? { exitCode: 0, stdout: '{"kept":true,"refusedAt":null}\n' } : { exitCode: 0 });
   kube.onExec = ({ container, command }) =>
-    container === "storage-controller" ? storageControllerAnswer(storage, command) : container === "postgres" ? controllerDatabaseAnswer(storage, command) : { exitCode: 0 };
+    container === "storage-controller" ? storageControllerAnswer(storage, command) : container === "postgres" ? controllerDatabaseAnswer(storage, command) : codexLogin(command);
   const home = mkdtempSync(join(tmpdir(), "alasio-commands-"));
   t.after(async () => {
     await Promise.all([kube.close(), telegram.close(), docker.close()]);
@@ -792,13 +794,14 @@ test("status with rights in alasio's namespace alone says what it sees there, an
   succeeded(run);
   assert.ok(run.printed.includes("  Deployment alasio/alasio: ready"));
   assert.ok(!run.printed.some((line) => line.includes("kube-system")), "nothing of kube-system's is listed");
-  // The object store's, in alasio's namespace, it sees; its volume server's metrics, here, say nothing; Telegram it asks.
-  assert.deepEqual(run.printed.slice(-7), [
+  // The object store's, in alasio's namespace, it sees; its volume server's metrics, here, say nothing; Telegram it asks, and alasio's pod.
+  assert.deepEqual(run.printed.slice(-8), [
     "  alasio's workloads outside its namespace, alasio: not seen, as this kubeconfig may list them there alone",
     "the object store: each object kept once (replication 000)",
     "  alasio-seaweedfs-volume-0: not measured, as its metrics do not say its disk",
     "Telegram's deliveries:",
     `  main's bot @${BOT}: delivered, 0 updates waiting`,
+    "Codex's login: kept",
     "memory: not seen, as this kubeconfig may not list the cluster's nodes and pods",
     "whether the cluster has a metrics server: not seen, as this kubeconfig may not read its APIServices",
   ]);

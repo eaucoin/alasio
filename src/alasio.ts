@@ -10,6 +10,7 @@ import type { Pool } from "pg";
 
 import { FORK_EVENT_KINDS, ForkAsks, forkAnswered, ForkRequests, parentForks, serveBranchForks } from "./branch/fork.ts";
 import { CodexAppServer } from "./codex/app-server/client.ts";
+import { CodexLoginFreshness } from "./codex/login-refresh.ts";
 import { codexHome } from "./codex/env.ts";
 import { type CodexLoginError, keepCodexLogin } from "./codex/login.ts";
 import type { NeonRolloutStore } from "./codex/rollouts/store.ts";
@@ -112,9 +113,11 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       // Before Codex is first started, which is not before a turn needs it.
       options.keepCodexLogin ? Layer.effectDiscard(keepCodexLogin(codexHome())) : Layer.empty,
       workspaceServices(options),
-      CodexAppServer.layer,
       busyPods(options),
     )),
+    // Of alasio's own app-server, which refreshes it, and its store, which the alasios on it share it by.
+    Layer.provideMerge(CodexLoginFreshness.layer(codexHome())),
+    Layer.provideMerge(CodexAppServer.layer),
     Layer.provideMerge(EventsConsumer.layer.pipe(Layer.provide(options.events))),
     Layer.provideMerge(Layer.mergeAll(
       stateStore(options),
@@ -136,13 +139,15 @@ export const stateStore = (options: Pick<AlasioOptions, "pool" | "stateSchema" |
  * events topic; its Codex login relayed to the pools' pods, on its pod's port, to each Codex
  * turn's token alone, held by none of them.
  */
-function harnessHost({ codexLoginUrl, codexLoginPort = CODEX_LOGIN_PORT, sessionsGateway, lakeWritten }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | EventsConsumer | CodexAppServer> {
+function harnessHost({ codexLoginUrl, codexLoginPort = CODEX_LOGIN_PORT, sessionsGateway, lakeWritten }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | EventsConsumer | CodexLoginFreshness> {
   const home = codexHome();
-  const relay = Layer.effectDiscard(Effect.ignore(startLoginRelay({
+  const relay = Layer.effectDiscard(Effect.flatMap(CodexLoginFreshness, ({ fresh }) => Effect.ignore(startLoginRelay({
     authFile: join(home, "auth.json"),
+    // A login refused passes on as it is, its access token good until it stops: a Codex turn refused it says why.
+    fresh: Effect.catchTag(fresh, "CodexLoginRefused", () => Effect.void),
     listen: { host: "0.0.0.0", port: codexLoginPort },
     authorize: poolLoginRefusal(poolLoginKey(sessionsGateway.callerKey), Date.now),
-  }).pipe(Effect.tapError((error) => Effect.logError(`the Codex login could not be relayed to the harness pools: ${error.message}`)))));
+  }).pipe(Effect.tapError((error) => Effect.logError(`the Codex login could not be relayed to the harness pools: ${error.message}`))))));
   return Layer.mergeAll(
     pooledHarnessHost({ ...sessionsGateway, codexLogin: { url: codexLoginUrl, home }, written: lakeWritten }),
     HarnessEvents.fromLog({ written: lakeWritten }),

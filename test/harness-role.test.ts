@@ -181,6 +181,7 @@ test("a turn run through the harness host as its own role writes all a turn writ
         "delete from state.turns",
         "select * from state.session_workspaces",
         "select * from state.codex_login",
+        "select * from state.codex_login_refusal",
         "insert into state.conversation_holds (conversation_id, reason) values ('telegram:41', 'held')",
         "create table state.forged (id int)",
       ]

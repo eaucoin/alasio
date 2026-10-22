@@ -8,6 +8,7 @@ import { Effect, Layer, ManagedRuntime } from "effect";
 import type pg from "pg";
 
 import { CodexAppServer } from "../../src/codex/app-server/client.ts";
+import { CodexLoginFreshness } from "../../src/codex/login-refresh.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../../src/codex/rollouts/store.ts";
 import { EventsConsumer } from "../../src/events/consume.ts";
 import { Turns } from "../../src/codex/turns.ts";
@@ -198,7 +199,8 @@ function testPanels({ stateDir = "/nonexistent-state-dir", branch, models }: { r
     const pool = pooledPoolOf(yield* Store) ?? (yield* Effect.promise(testPool));
     const stores = { sessionStore: new NeonSessionStore(pool), codexRollouts: new NeonRolloutStore(pool), sessionFsCodexRollouts: new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA }) };
     yield* Effect.promise(() => storesMade(pool, stores));
-    return Panels.layer({ ...stores, stateDir, branch, claudeModels: listed(CLAUDE_HARNESS), codexModels: listed(CODEX_HARNESS) });
+    // Its models the test's, which no login of alasio's lists, so none is kept fresh for them.
+    return Panels.layer({ ...stores, stateDir, branch, claudeModels: listed(CLAUDE_HARNESS), codexModels: listed(CODEX_HARNESS) }).pipe(Layer.provide(Layer.succeed(CodexLoginFreshness, CodexLoginFreshness.of({ fresh: Effect.void }))));
   }));
 }
 

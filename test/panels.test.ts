@@ -13,6 +13,7 @@ import { Effect, Layer, Logger, ManagedRuntime, Option } from "effect";
 import pg from "pg";
 
 import { CodexAppServer } from "../src/codex/app-server/client.ts";
+import { CodexLoginFreshness } from "../src/codex/login-refresh.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import { type ConversationHarness, HarnessHost, type HarnessPanels } from "../src/harness/host.ts";
@@ -112,7 +113,7 @@ async function seededPanels(schema: string) {
   const asked: Asked = { forks: [], goals: [] };
   const panels = ManagedRuntime.make(
     Panels.layer({ sessionStore, codexRollouts, sessionFsCodexRollouts, stateDir: STATE_DIR }).pipe(
-      Layer.provide(Layer.mergeAll(Layer.succeed(HarnessHost, recordingHost(asked)), CodexAppServer.layer)),
+      Layer.provide(Layer.mergeAll(Layer.succeed(HarnessHost, recordingHost(asked)), CodexAppServer.layer, Layer.succeed(CodexLoginFreshness, CodexLoginFreshness.of({ fresh: Effect.void })))),
       Layer.provideMerge(Logger.layer([])),
     ),
   );
@@ -149,6 +150,34 @@ test("a rewind's fork of a Codex thread, and the thread's goals, are asked of th
       forks: [{ ...conversation, sessionId: "11111111-0000-4000-8000-000000000001", beforeUuid: "11111111-0000-4000-8000-000000000001-turn" }],
       goals: [{ ...conversation, threadId: "11111111-0000-4000-8000-000000000001" }],
     });
+  } finally {
+    await panels.dispose();
+  }
+});
+
+test("Codex's models are listed by alasio's own app-server only once the login is kept fresh, so it never finds the login due and refreshes it on its own", async () => {
+  const order: string[] = [];
+  const appServer = { listModels: () => Effect.sync(() => (order.push("listed"), [])) } as unknown as CodexAppServer["Service"];
+  const codexRollouts = new NeonRolloutStore(pool, { schema: "models_codex" });
+  const sessionFsCodexRollouts = new NeonRolloutStore(pool, { schema: `models_${SESSION_FS_SCHEMA}` });
+  const sessionStore = new NeonSessionStore(pool, { schema: "models_claude" });
+  const panels = ManagedRuntime.make(
+    Panels.layer({ sessionStore, codexRollouts, sessionFsCodexRollouts, stateDir: STATE_DIR }).pipe(
+      Layer.provide(Layer.mergeAll(
+        Layer.succeed(HarnessHost, recordingHost({ forks: [], goals: [] })),
+        Layer.succeed(CodexAppServer, appServer),
+        Layer.succeed(CodexLoginFreshness, CodexLoginFreshness.of({ fresh: Effect.sync(() => void order.push("kept fresh")) })),
+      )),
+      Layer.provideMerge(Logger.layer([])),
+    ),
+  );
+  try {
+    // A folder of its own, which the listing runs in.
+    const folder = mkdtempSync(join(tmpdir(), "alasio-panels-models-"));
+    const codex = await panels.runPromise(Effect.flatMap(Panels, (each) => each.forMount("conversation-1", { harness: CODEX_HARNESS, workingDirectory: folder, sessionId: null })).pipe(Effect.map(Option.getOrThrow)));
+    await Effect.runPromise(codex.listModels());
+    assert.deepEqual(order, ["kept fresh", "listed"]);
+    rmSync(folder, { recursive: true, force: true });
   } finally {
     await panels.dispose();
   }

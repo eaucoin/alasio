@@ -22,11 +22,12 @@
  * checked in constant time, its refusal said why in alasio's log alone; and a pod relays on
  * its own loopback to it, with the latest token given (../harness/given-codex-login.ts), so
  * only alasio ever holds or refreshes the login (./login-refresh.ts), as a ChatGPT refresh
- * token is single-use.
+ * token is single-use; alasio's relay keeps the login fresh before each request it passes on
+ * (`fresh`).
  */
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
-import httpClient, { createServer, type IncomingMessage, type OutgoingHttpHeaders, type RequestOptions } from "node:http";
+import httpClient, { createServer, type IncomingMessage, type OutgoingHttpHeaders, type RequestOptions, type ServerResponse } from "node:http";
 import httpsClient from "node:https";
 import type { AddressInfo } from "node:net";
 
@@ -52,6 +53,8 @@ export interface LoginUpstream {
 
 export interface LoginRelayOptions {
   readonly authFile: string;
+  /** Run before each request is passed on, as it keeps the login fresh (./login-refresh.ts); none where the relay passes another's on. */
+  readonly fresh?: Effect.Effect<void> | undefined;
   readonly bearer?: string;
   /** What a request's Authorization must be: why it is refused, or null where it may go on; the bearer's alone unless given. */
   readonly authorize?: ((authorization: string | undefined) => string | null) | undefined;
@@ -157,6 +160,7 @@ export const startLoginRelay: StartLoginRelay = Effect.fnUntraced(function*({
   authorize,
   listen = { host: "127.0.0.1", port: 0 },
   upstreamFor = loginUpstream,
+  fresh = Effect.void,
 }: LoginRelayOptions) {
   const request = (options: RequestOptions, onResponse: (response: IncomingMessage) => void) => (options.protocol === "http:" ? httpClient : httpsClient).request(options, onResponse);
   const expected = `Bearer ${bearer}`;
@@ -173,6 +177,17 @@ export const startLoginRelay: StartLoginRelay = Effect.fnUntraced(function*({
     // A request an http.Server receives always has a url.
     const url = req.url!;
     if (!allowedPath(url)) { res.writeHead(403).end("path not allowed"); return; }
+    // The login read once it is fresh, the request held meanwhile; answered 502 where keeping it fresh died, not left waiting.
+    req.pause();
+    void Effect.runPromiseWith(context)(fresh).then(() => passOn(req, res, url), (defect: unknown) => {
+      runFork(Effect.logError(`could not keep the Codex login fresh for a request of ${url}: ${defect instanceof Error ? defect.message : String(defect)}`).pipe(withLogScope("codex-login-relay")));
+      req.resume();
+      res.writeHead(502).end("the Codex login could not be kept fresh");
+    });
+  });
+  const context = yield* Effect.context<never>();
+  /** Passes `req`, of `url`, on with the login in `authFile`, its answer to `res`. */
+  const passOn = (req: IncomingMessage, res: ServerResponse, url: string) => {
     const upstream = upstreamFor(authFile, url);
     if (!upstream) { res.writeHead(503).end(`no Codex login in ${authFile}`); return; }
     const origin = new URL(upstream.origin);
@@ -189,7 +204,8 @@ export const startLoginRelay: StartLoginRelay = Effect.fnUntraced(function*({
       res.end(String(error.message));
     });
     req.pipe(upstreamReq);
-  });
+    req.resume();
+  };
   yield* Effect.acquireRelease(
     Effect.callback<void, LoginRelayError>((resume) => {
       server.once("error", (cause) => resume(Effect.fail(new LoginRelayError({ cause }))));

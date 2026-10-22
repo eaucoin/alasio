@@ -41,6 +41,7 @@ export const startBranch = (database: Database, schema: string, branch: string):
         delete from ${schema}.callback_actions;
         delete from ${schema}.press_jobs;
         delete from ${schema}.codex_login;
+        delete from ${schema}.codex_login_refusal;
         delete from ${schema}.events_handled;
         delete from ${schema}.fork_requests;
         delete from ${schema}.fork_answers;

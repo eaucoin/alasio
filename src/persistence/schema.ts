@@ -226,6 +226,14 @@ create table if not exists ${SCHEMA}.codex_login (
   updated_at timestamptz not null default now()
 );
 
+-- The refusal of the login kept at saved_at (codex_login's updated_at) as it was refreshed, its
+-- refresh token refused for good, so no alasio refreshes it again (../codex/login-refresh.ts);
+-- one of a login kept since says nothing of it.
+create table if not exists ${SCHEMA}.codex_login_refusal (
+  saved_at timestamptz primary key,
+  refused_at timestamptz not null default now()
+);
+
 create table if not exists ${SCHEMA}.session_usage (
   session_id text primary key,
   cache_read_input_tokens integer not null,

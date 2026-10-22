@@ -16,6 +16,7 @@ import { Context, Effect, Layer, Option, Scope, Exit } from "effect";
 
 import { NO_BIND_HEADER, PINNED_HEADER } from "../src/binder/names.ts";
 import { CodexAppServer } from "../src/codex/app-server/client.ts";
+import { CodexLoginFreshness, CodexLoginRefused } from "../src/codex/login-refresh.ts";
 import { answeredByFront } from "../src/binder/server.ts";
 import { type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 import { poolLoginKey } from "../src/codex/login-relay.ts";
@@ -134,14 +135,22 @@ async function front(podPort: number, { refusals = [], onBind = () => {}, movesO
 /** A turn of `start`'s on `host`, its conversation reserved first, as Turns runs one. */
 const reservedTurn = (host: HarnessHost["Service"], start: TurnRequest) => Effect.scoped(Effect.andThen(host.reserve(start.conversationId), host.startTurn(start)));
 
-/** alasio's own app-server, as it refreshes its Codex login: how often it was asked to, each refresh writing `refreshed`'s login, where given, as Codex writes it. */
-const appServer = { refreshes: 0, refreshed: null as string | null };
+/**
+ * alasio's own app-server, as it refreshes its Codex login: how often it was asked to, each
+ * refresh writing the login `refreshed` gives of its count, where given, as Codex writes one anew.
+ */
+const appServer = { refreshes: 0, refreshed: null as ((count: number) => string) | null };
 const codexAppServer = Layer.succeed(CodexAppServer, {
   refreshLogin: () => Effect.sync(() => {
     appServer.refreshes += 1;
-    if (appServer.refreshed !== null) writeFileSync(join(CODEX_HOME, "auth.json"), appServer.refreshed);
+    if (appServer.refreshed !== null) writeFileSync(join(CODEX_HOME, "auth.json"), appServer.refreshed(appServer.refreshes));
+    return "asked" as const;
   }),
+  // Its login, the home's own, loaded anew as it next refreshes.
+  stop: Effect.void,
 } as unknown as CodexAppServer["Service"]);
+/** alasio's Codex login kept fresh by `codexAppServer`, as its store keeps it. */
+const loginFreshness = (store: Store["Service"]) => CodexLoginFreshness.layer(CODEX_HOME).pipe(Layer.provide(Layer.mergeAll(codexAppServer, Layer.succeed(Store, store))));
 
 /** alasio's harnesses, as the panels reach them: none of a test's. */
 const harnesses = Harnesses.of({ names: HARNESS_NAMES, getFor: () => Effect.die("no harness of alasio's runs a turn"), forMount: () => Effect.succeedNone, requireForMount: () => Effect.die("no harness of alasio's runs a turn") });
@@ -175,7 +184,7 @@ test("alasio reaches each conversation's pooled host through the front, a token 
       // What a pod commits told the lake's loader, as each turn of its ends.
       let wakes = 0;
       const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: "http://alasio-codex-login.alasio.svc.cluster.local:4320/v1", home: CODEX_HOME }, written: () => void (wakes += 1) }).pipe(
-        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), codexAppServer, Layer.succeed(SessionSandboxes, sessions), Layer.succeed(HostBayma, folders), Layer.succeed(BusyPods, busyPods))),
+        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions), Layer.succeed(HostBayma, folders), Layer.succeed(BusyPods, busyPods))),
       )).pipe(Scope.provide(scope))), HarnessHost);
 
       // No harness in a workspace: nothing bound, nothing asked of the front.
@@ -268,7 +277,7 @@ test("a turn's reservation binds its conversation's harness ahead, asked again w
     const sessions = { ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
     const hostOn = async (url: string) =>
       Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: "http://alasio-codex-login:4320/v1", home: CODEX_HOME } }).pipe(
-        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), codexAppServer, Layer.succeed(SessionSandboxes, sessions))),
+        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions))),
       )).pipe(Scope.provide(scope))), HarnessHost);
     const notYet = { error: `harness:${conversationId} could not be bound now`, reason: "it waited for its pod to serve" };
     // What the reservation's caller was told it waits on, as each bind was asked, and in all.
@@ -323,7 +332,7 @@ test("a turn whose harness is bound anew after its reservation, its pod gone, ru
       const heldTo: unknown[] = [];
       const sessions = { ensureSession: (_volumeId: string, held: unknown) => Effect.sync(() => (heldTo.push(held), { bayma: { url: "http://gateway/mcp", headers: {} } })) } as unknown as SessionSandboxes["Service"];
       const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: "http://alasio-codex-login:4320/v1", home: CODEX_HOME } }).pipe(
-        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), codexAppServer, Layer.succeed(SessionSandboxes, sessions))),
+        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions))),
       )).pipe(Scope.provide(scope))), HarnessHost);
       const epoch = await run(store.claimTurn({ conversationId, chatId: "47", messageId: "1", sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));
       const answer = await Effect.runPromise(Effect.scoped(Effect.andThen(host.reserve(conversationId), host.startTurn({ conversationId, chatId: "47", messageId: "1", harness: CODEX_HARNESS, workingDirectory: sessionFsWorkspace("fs-abc123"), prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null }))));
@@ -367,7 +376,7 @@ test("a reservation the host refuses, as another holds its conversation, leaves 
       const heldTo: unknown[] = [];
       const sessions = { ensureSession: (_volumeId: string, held: unknown) => Effect.sync(() => (heldTo.push(held), { bayma: { url: "http://gateway/mcp", headers: {} } })) } as unknown as SessionSandboxes["Service"];
       const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: "http://alasio-codex-login:4320/v1", home: CODEX_HOME } }).pipe(
-        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), codexAppServer, Layer.succeed(SessionSandboxes, sessions))),
+        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions))),
       )).pipe(Scope.provide(scope))), HarnessHost);
       const epoch = await run(store.claimTurn({ conversationId, chatId: "46", messageId: "1", sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));
       const answer = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
@@ -397,7 +406,7 @@ test("a hold let go of binds nothing: its pod gone meanwhile, as one released or
     const stand = await front(port);
     try {
       const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: "http://alasio-codex-login:4320/v1", home: CODEX_HOME } }).pipe(
-        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), codexAppServer)),
+        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store))),
       )).pipe(Scope.provide(scope))), HarnessHost);
       await Effect.runPromise(Effect.scoped(host.reserve(conversationId)));
       const released = stand.asked.find(({ path }) => path === HOST_PATHS.release);
@@ -416,12 +425,12 @@ test("a Codex turn's token for alasio's relay is renewed as it runs; alasio, the
   await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
   await run(store.setWorkingDirectory(conversationId, sessionFsWorkspace("fs-abc123")));
   const jwt = (exp: number) => `h.${Buffer.from(JSON.stringify({ exp: Math.floor(exp / 1000) })).toString("base64url")}.s`;
-  const login = (exp: number) => JSON.stringify({ tokens: { access_token: jwt(exp), refresh_token: "once" } });
+  const login = (exp: number, refresh = "rt-0") => JSON.stringify({ tokens: { access_token: jwt(exp), refresh_token: refresh } });
   // About to stop: refreshed before the turn, each refresh again about to stop, as only a test's would be.
   const kept = readFileSync(join(CODEX_HOME, "auth.json"), "utf8");
   writeFileSync(join(CODEX_HOME, "auth.json"), login(Date.now() + 60_000));
   appServer.refreshes = 0;
-  appServer.refreshed = login(Date.now() + 120_000);
+  appServer.refreshed = (count) => login(Date.now() + 120_000, `rt-${count}`);
   const started: TurnStart[] = [];
   const renewed: TurnCodex["login"][] = [];
   const scope = Effect.runSync(Scope.make());
@@ -431,7 +440,7 @@ test("a Codex turn's token for alasio's relay is renewed as it runs; alasio, the
     try {
       const sessions = { ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
       const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: "http://alasio-codex-login:4320/v1", home: CODEX_HOME, renewMs: 300 } }).pipe(
-        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), codexAppServer, Layer.succeed(SessionSandboxes, sessions))),
+        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions))),
       )).pipe(Scope.provide(scope))), HarnessHost);
       const epoch = await run(store.claimTurn({ conversationId, chatId: "45", messageId: "1", sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));
       await Effect.runPromise(reservedTurn(host, { conversationId, chatId: "45", messageId: "1", harness: CODEX_HARNESS, workingDirectory: sessionFsWorkspace("fs-abc123"), prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null }));
@@ -461,6 +470,35 @@ test("a Codex turn's token for alasio's relay is renewed as it runs; alasio, the
   }
 });
 
+test("a Codex turn whose login is refused fails saying to log in again, started on no pod", async () => {
+  const store = await testStore();
+  const conversationId = await run(store.upsertConversation({ chatId: "46", user: { id: 46 } }));
+  await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+  await run(store.setWorkingDirectory(conversationId, sessionFsWorkspace("fs-abc123")));
+  const started: TurnStart[] = [];
+  const scope = Effect.runSync(Scope.make());
+  try {
+    const { port } = await Effect.runPromise(Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token", given: givenTo(started) }), HarnessHost, podHost(started)).pipe(Scope.provide(scope)));
+    const stand = await front(port);
+    try {
+      const sessions = { ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
+      const refused = Layer.succeed(CodexLoginFreshness, CodexLoginFreshness.of({ fresh: Effect.fail(new CodexLoginRefused()) }));
+      const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: "http://alasio-codex-login:4320/v1", home: CODEX_HOME } }).pipe(
+        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), refused, Layer.succeed(SessionSandboxes, sessions))),
+      )).pipe(Scope.provide(scope))), HarnessHost);
+      const epoch = await run(store.claimTurn({ conversationId, chatId: "46", messageId: "1", sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));
+      const failed = await Effect.runPromise(Effect.flip(reservedTurn(host, { conversationId, chatId: "46", messageId: "1", harness: CODEX_HARNESS, workingDirectory: sessionFsWorkspace("fs-abc123"), prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null })));
+      assert.equal(failed._tag, "CodexLoginRefused");
+      assert.match(failed.message, /run `alasio login codex`/u);
+      assert.deepEqual(started, []);
+    } finally {
+      stand.close();
+    }
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+});
+
 test("no call of a pooled host's is one the front answers itself, so each reaches the host: a hold let go of releases no binding", () => {
   for (const [call, path] of Object.entries(HOST_PATHS)) assert.equal(answeredByFront(path), false, `${call} at ${path}`);
 });
@@ -477,7 +515,7 @@ test("a pooled host the front refuses fails as not reached, saying what the fron
   await new Promise<void>((resolve) => refusing.listen(0, "127.0.0.1", resolve));
   try {
     const host = Context.get(await Effect.runPromise(Effect.scoped(Layer.build(pooledHarnessHost({ url: `http://127.0.0.1:${(refusing.address() as AddressInfo).port}`, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: "http://alasio-codex-login.alasio.svc.cluster.local:4320/v1", home: CODEX_HOME } }).pipe(
-      Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), codexAppServer)),
+      Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store))),
     )))), HarnessHost);
     const failed = await Effect.runPromise(Effect.flip(host.status(conversationId)));
     assert.equal(failed.message, `The conversation's harness could not be reached: the sandbox gateway answered 503: harness:${conversationId} could not be bound now (no free pod)`);
