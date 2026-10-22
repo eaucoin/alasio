@@ -376,15 +376,13 @@ describe("alasio", () => {
     const lag = (trigger: ScaledObject["spec"]["triggers"][number]) => [trigger.metadata["consumerGroup"], trigger.metadata["topic"], trigger.metadata["lagThreshold"], trigger.metadata["offsetResetPolicy"]];
     const lags = scaled.spec.triggers.filter(({ type }) => type === "kafka");
     assert.deepEqual(lags.map(lag), [["alasio.main", "telegram.main", "20", "earliest"], ["alasio-events.main", "events.main", "1", "latest"], ["alasio-forks.main", "forks.main", "1", "earliest"]]);
-    // Any number bound asks for one alasio, from none.
-    const bound = scaled.spec.triggers.filter(({ type }) => type === "metrics-api");
-    assert.deepEqual(bound.map(({ metadata }) => [metadata["url"], metadata["valueLocation"], metadata["targetValue"], metadata["activationTargetValue"]]), [
-      ["http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio/harness-codex", "bound", "1000000", "0"],
-      ["http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio/harness-claude", "bound", "1000000", "0"],
-    ]);
+    // Any number bound, of every pool in its namespace, asks for one alasio, from none.
+    const bound = (object: ScaledObject) => object.spec.triggers.filter(({ type }) => type === "metrics-api").map(({ metadata }) => [metadata["url"], metadata["valueLocation"], metadata["targetValue"], metadata["activationTargetValue"]]);
+    assert.deepEqual(bound(scaled), [["http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio", "bound", "1000000", "0"]]);
     // A branch's reads its events from its first, and asks no forks of its own.
     const branch = alasioScaling(scaledOf(configOf()), branchEnvironment("try"), deployment).find((object): object is ScaledObject => object.kind === "ScaledObject")!;
     assert.deepEqual(branch.spec.triggers.filter(({ type }) => type === "kafka").map(lag), [["alasio.try", "telegram.try", "20", "earliest"], ["alasio-events.try", "events.try", "1", "earliest"]]);
+    assert.deepEqual(bound(branch), [[`http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/${branchEnvironment("try").namespace}`, "bound", "1000000", "0"]]);
   });
 
   test("keeps no volume: its state is in Neon, its home and what it writes on emptyDirs", () => {

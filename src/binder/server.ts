@@ -15,6 +15,8 @@
  * - `GET /counts/<namespace>/<pool>`: `{ free, bound, waiting }`, the pool's free pods running,
  *   its bindings, and the binds waiting for a free pod in every replica of the binder, as
  *   `peers` names them; asked without a token, as KEDA's metrics-api trigger asks.
+ * - `GET /counts/<namespace>`: `{ bound }`, the bindings of every pool in the namespace, as an
+ *   environment's alasio is scaled on its harnesses bound, whichever pool's; asked so too.
  * - `GET /waiting/<namespace>/<pool>`: `{ waiting }`, this replica's alone, as its peers ask.
  * - `POST /events`: what a bound pod tells of what its harness did on its own, for its caller's
  *   control plane, as `relay` says it, of TOLD_BYTES at most (413 past it), asked with the
@@ -64,7 +66,7 @@ import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken } from "../shared/tokens.ts";
 import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
-import { counts, touchLease } from "./bindings.ts";
+import { boundIn, counts, touchLease } from "./bindings.ts";
 import { EVENTS_PATH, NO_BIND_HEADER, NOT_PASSED_HEADER, PINNED_HEADER, type Pool } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
 import type { Held } from "./live.ts";
@@ -338,6 +340,8 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
     Effect.gen(function*() {
       const url = incoming.url ?? "/";
       if (incoming.method === "GET" && url === "/healthz") return answer(outgoing, 200, { ok: true });
+      const ofNamespace = /^\/counts\/([a-z0-9-]+)$/u.exec(url);
+      if (incoming.method === "GET" && ofNamespace) return answer(outgoing, 200, { bound: yield* Effect.provideService(boundIn(ofNamespace[1]!), KubeClient, kube) });
       const asked = /^\/(counts|waiting)\/([a-z0-9-]+)\/([a-z0-9-]+)$/u.exec(url);
       if (incoming.method === "GET" && asked) {
         const pool = { namespace: asked[2]!, name: asked[3]! };
