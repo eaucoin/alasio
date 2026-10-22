@@ -1,7 +1,7 @@
 /**
- * An environment's events: what the sandbox gateway tells its alasio of what happens to what
- * it binds for it, and of what the harness hosts of its harness pools tell it their harnesses do
- * on their own, which hold no principal of the log (../gateway/harnesses.ts relayed), on its
+ * An environment's events: what the sandbox gateway tells its alasio of what becomes of its
+ * conversations' harnesses' bindings, and of what the harness hosts of its harness pools tell it
+ * their harnesses do on their own, which hold no principal of the log (../gateway/harnesses.ts relayed), on its
  * events topic in the log, `events.<environment>` (eventsTopic), which its alasio reads in its
  * group (cli/src/manifests/log.ts).
  *
@@ -14,12 +14,10 @@
  * (decodeEvent): a writer can add kinds, or move to a new version, before every reader can
  * read them.
  *
- * Kinds:
- * - `workspace.exec-ended`: a background exec of a bound session's bayma ended;
- * - `workspace.lost`: a session's binding whose pod, or the mount it served from, went while
- *   it was bound;
- * - `workspace.released`: a session's binding let go: idle, its pod deleted, or broken;
- * - `harness.lost`, `harness.released`: likewise of a conversation's harness's binding;
+ * Kinds, each one alasio acts on, as nothing else reads the topic (alasio's handlers of them,
+ * HOST_EVENT_KINDS and FORK_EVENT_KINDS, are all of them):
+ * - `harness.lost`: a conversation's harness's binding whose pod went while it was bound;
+ * - `harness.released`: a conversation's harness's binding let go;
  * - `harness.background-response`: a conversation's harness, running on between prompts, has
  *   a reply of its own completed in the store, to deliver;
  * - `harness.idle`: it let go of the conversation, which may run what waits on it;
@@ -53,14 +51,6 @@ const envelope = {
   subject: Subject,
 };
 
-const WorkspaceExecEnded = Schema.Struct({
-  ...envelope,
-  kind: Schema.Literal("workspace.exec-ended"),
-  binding: Schema.String,
-  exec: Schema.Struct({ id: Schema.String, exitCode: Schema.NullOr(Schema.Number), endedAt: Schema.Number }),
-});
-const WorkspaceLost = Schema.Struct({ ...envelope, kind: Schema.Literal("workspace.lost"), binding: Schema.String, pod: Schema.String, reason: Schema.String });
-const WorkspaceReleased = Schema.Struct({ ...envelope, kind: Schema.Literal("workspace.released"), binding: Schema.String, reason: Schema.Literals(["idle", "deleted", "broken"]) });
 const HarnessLost = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.lost"), binding: Schema.String, pod: Schema.String, reason: Schema.String });
 const HarnessReleased = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.released"), binding: Schema.String, reason: Schema.String });
 const HarnessBackgroundResponse = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.background-response") });
@@ -84,7 +74,7 @@ const WorkspaceForkAnswered = Schema.Struct({
 });
 
 /** An event, of any kind this release knows. */
-export const Event = Schema.Union([WorkspaceExecEnded, WorkspaceLost, WorkspaceReleased, HarnessLost, HarnessReleased, HarnessBackgroundResponse, HarnessIdle, WorkspaceForkAnswered]);
+export const Event = Schema.Union([HarnessLost, HarnessReleased, HarnessBackgroundResponse, HarnessIdle, WorkspaceForkAnswered]);
 export type Event = typeof Event.Type;
 
 /** The kinds this release knows. */

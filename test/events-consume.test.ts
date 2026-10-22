@@ -22,13 +22,15 @@ import { memoryTopic } from "./support/topics.ts";
 const idOf = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}` as const;
 
 const RELEASED: EventInput = {
-  kind: "workspace.released",
+  kind: "harness.released",
   environment: "main",
   source: "sandbox-gateway",
-  subject: { kind: "workspace", key: "sessionfs:fs-1" },
+  subject: { kind: "conversation", key: "telegram:41" },
   binding: "binding-1",
   reason: "idle",
 };
+
+const LOST: EventInput = { kind: "harness.lost", environment: "main", source: "sandbox-gateway", subject: { kind: "conversation", key: "telegram:41" }, binding: "binding-1", pod: "pod-1", reason: "gone" };
 
 /** Runs `handlers` on `values` with the store in `schema` until every record is told, then stops. */
 async function consume(schema: string, values: readonly string[], handlers: EventHandlers): Promise<void> {
@@ -46,10 +48,10 @@ async function queued(schema: string): Promise<string[]> {
   return (await (await testPool()).query<{ text: string }>(`select text from ${schema}.telegram_outbox order by seq`)).rows.map(({ text }) => text);
 }
 
-/** Handlers that queue a reply for each workspace released, counting each handling. */
+/** Handlers that queue a reply for each harness released, counting each handling. */
 function replying(handled: string[]): EventHandlers {
   return {
-    "workspace.released": (event, writes) => Effect.sync(() => void handled.push(event.id)).pipe(Effect.andThen(writes.enqueueOutboxText({ chatId: 42, text: `released ${event.binding}` }))),
+    "harness.released": (event, writes) => Effect.sync(() => void handled.push(event.id)).pipe(Effect.andThen(writes.enqueueOutboxText({ chatId: 42, text: `released ${event.binding}` }))),
   };
 }
 
@@ -69,7 +71,7 @@ test("an event whose handling fails is handled again as it is delivered again, n
   const handled: string[] = [];
   let failures = 1;
   const handlers: EventHandlers = {
-    "workspace.released": (event, writes) =>
+    "harness.released": (event, writes) =>
       writes.enqueueOutboxText({ chatId: 42, text: `released ${event.binding}` }).pipe(
         Effect.andThen(Effect.suspend(() => (failures-- > 0 ? Effect.fail(new StoreError({ cause: new Error("Neon is away") })) : Effect.sync(() => void handled.push(event.id))))),
       ),
@@ -84,7 +86,7 @@ test("a record alasio cannot read, of a later version, of a kind it does not kno
   const handled: string[] = [];
   const later = JSON.stringify({ ...JSON.parse(eventRecord(RELEASED, 1, idOf(90)).value), v: 99 });
   const unknown = JSON.stringify({ ...JSON.parse(eventRecord(RELEASED, 1, idOf(91)).value), kind: "workspace.renamed" });
-  const unhandled = eventRecord({ kind: "workspace.lost", environment: "main", source: "sandbox-gateway", subject: { kind: "workspace", key: "sessionfs:fs-1" }, binding: "binding-1", pod: "pod-1", reason: "gone" }, 1, idOf(92)).value;
+  const unhandled = eventRecord(LOST, 1, idOf(92)).value;
   await consume(schema, ["not json", later, unknown, unhandled, eventRecord(RELEASED, 1, idOf(3)).value], replying(handled));
   assert.deepEqual(handled, [idOf(3)]);
   assert.deepEqual((await (await testPool()).query<{ id: string }>(`select id from ${schema}.events_handled order by id`)).rows.map(({ id }) => id), [idOf(3)]);
@@ -106,7 +108,6 @@ test("the events handled are forgotten with what else is kept only in flight onc
 test("the environment's one member hands each event to the part of alasio that added its kind's handling, once every part's handling is ready, and refuses a kind added twice or a handling added once it reads", async () => {
   const schema = newSchema();
   const store = await testStore({ schema });
-  const LOST: EventInput = { kind: "workspace.lost", environment: "main", source: "sandbox-gateway", subject: { kind: "workspace", key: "sessionfs:fs-1" }, binding: "binding-1", pod: "pod-1", reason: "gone" };
   const topic = memoryTopic("events.main", [eventRecord(RELEASED, 1, idOf(5)).value, eventRecord(LOST, 1, idOf(6)).value]);
   const scope = Effect.runSync(Scope.make());
   try {
@@ -116,9 +117,9 @@ test("the environment's one member hands each event to the part of alasio that a
     ));
     const heard: string[] = [];
     const listening = Effect.runSync(Deferred.make<void>());
-    await Effect.runPromise(consumer.handle({ "workspace.released": (event) => Effect.sync(() => void heard.push(`released ${event.id}`)) }));
-    await Effect.runPromise(consumer.handle({ "workspace.lost": (event) => Effect.sync(() => void heard.push(`lost ${event.id}`)) }, Deferred.await(listening)));
-    const twice = await Effect.runPromiseExit(consumer.handle({ "workspace.released": () => Effect.void }));
+    await Effect.runPromise(consumer.handle({ "harness.released": (event) => Effect.sync(() => void heard.push(`released ${event.id}`)) }));
+    await Effect.runPromise(consumer.handle({ "harness.lost": (event) => Effect.sync(() => void heard.push(`lost ${event.id}`)) }, Deferred.await(listening)));
+    const twice = await Effect.runPromiseExit(consumer.handle({ "harness.released": () => Effect.void }));
     assert.ok(Exit.isFailure(twice), "a kind handled twice");
     await Effect.runPromise(consumer.start.pipe(Scope.provide(scope)));
     // Nothing read before every part listens.
@@ -127,7 +128,7 @@ test("the environment's one member hands each event to the part of alasio that a
     await Effect.runPromise(Deferred.succeed(listening, undefined));
     for (const deadline = Date.now() + 15_000; topic.committed() < 2; await sleep(20)) assert.ok(Date.now() < deadline, `${topic.committed()} of 2 told`);
     assert.deepEqual(heard, [`released ${idOf(5)}`, `lost ${idOf(6)}`]);
-    const late = await Effect.runPromiseExit(consumer.handle({ "workspace.exec-ended": () => Effect.void }));
+    const late = await Effect.runPromiseExit(consumer.handle({ "harness.idle": () => Effect.void }));
     assert.ok(Exit.isFailure(late), "a handling added once it reads");
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));

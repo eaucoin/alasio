@@ -260,6 +260,9 @@ export const serveBranchForks = ({ keyFile }: { readonly keyFile: string }): Eff
     return yield* consumeGroup({ name: "the branches' requests to fork sessions", join, handle });
   }).pipe(withLogScope("branch-forks"));
 
+/** The kinds of the environment's events a branch's handling of its parent's answers acts on (forkAnswered). */
+export const FORK_EVENT_KINDS = ["workspace.fork-answered"] as const;
+
 /**
  * The branch `branch`'s events' handling of its parent's answers: each signed with its token,
  * read from `tokenFile`, recorded in its store, with the event's record as handled, for the

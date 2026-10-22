@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { Effect, Layer, Option, type Scope } from "effect";
 import type { Pool } from "pg";
 
-import { ForkAsks, forkAnswered, ForkRequests, parentForks, serveBranchForks } from "./branch/fork.ts";
+import { FORK_EVENT_KINDS, ForkAsks, forkAnswered, ForkRequests, parentForks, serveBranchForks } from "./branch/fork.ts";
 import { CodexAppServer } from "./codex/app-server/client.ts";
 import { codexHome } from "./codex/env.ts";
 import { type CodexLoginError, keepCodexLogin } from "./codex/login.ts";
@@ -225,7 +225,7 @@ function branchForks({ branchForkKeyFile, branchesLog }: AlasioOptions): Layer.L
  */
 function branchEvents({ branch, parentLog }: AlasioOptions): Layer.Layer<never, never, EventsConsumer | Store> {
   if (!branch || !parentLog) return Layer.empty;
-  return Layer.effectDiscard(Effect.flatMap(EventsConsumer, (consumer) => consumer.handle({ "workspace.fork-answered": forkAnswered({ branch: branch.name, tokenFile: branch.tokenFile }) })));
+  return Layer.effectDiscard(Effect.flatMap(EventsConsumer, (consumer) => consumer.handle({ "workspace.fork-answered": forkAnswered({ branch: branch.name, tokenFile: branch.tokenFile }) } satisfies { readonly [K in (typeof FORK_EVENT_KINDS)[number]]: unknown })));
 }
 
 /**

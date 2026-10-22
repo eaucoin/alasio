@@ -103,7 +103,6 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
         releaseAfterMs: config.releaseAfterSeconds * 1000,
         podPort: config.podPort,
         bindingKey,
-        events,
         quotaBytes: config.quotaBytes,
         snapshots: config.snapshots,
         mainNamespace: config.environment.namespace,
