@@ -206,6 +206,13 @@ export const releaseLease = Effect.fnUntraced(function*(lease: BindingLease): Ef
   yield* kube.remove("coordination.k8s.io/v1", "Lease", lease.metadata?.namespace ?? "", lease.metadata?.name ?? "", lease.metadata?.resourceVersion);
 });
 
+/** How many keys are bound in `namespace`, of every pool there. */
+export const boundIn = Effect.fnUntraced(function*(namespace: string): Effect.fn.Return<number, KubeApiError, KubeClient> {
+  const kube = yield* KubeClient;
+  const leases = (yield* kube.list("coordination.k8s.io/v1", "Lease", namespace, POOL_LABEL)) as BindingLease[];
+  return leases.filter(({ spec }) => spec?.holderIdentity).length;
+});
+
 /** How many of `pool`'s pods are free and running, and how many of its keys are bound. */
 export const counts = Effect.fnUntraced(function*(pool: Pool): Effect.fn.Return<{ readonly free: number; readonly bound: number }, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;

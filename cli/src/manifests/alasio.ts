@@ -27,7 +27,6 @@ import { busyLabelPolicy } from "./admission.ts";
 import { foldersRun } from "./folders.ts";
 import { carriedPools, GATEWAY, GATEWAY_PORT } from "./sandbox-gateway.ts";
 import { alasioGroup, environmentLogSecret, environmentName, lagTrigger, lakeWakeTopic, LOG_BROKERS, logAuthentication, telegramTopic } from "./log.ts";
-import { environmentPools } from "./harness-pools.ts";
 import { scaledObject, type Trigger } from "./scalers.ts";
 import { CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
 import { STOP_GRACE_SECONDS } from "../../../src/telegram/stop.ts";
@@ -419,10 +418,11 @@ export function alasioScaling(config: InstallConfig, environment: Environment, a
     lagTrigger(alasioGroup(name), telegramTopic(name), UPDATES_PER_ALASIO, authentication),
     lagTrigger(eventsGroup(name), eventsTopic(name), 1, authentication, environment.branch === null ? "latest" : "earliest"),
     ...(environment.branch === null ? [lagTrigger(forksGroup(MAIN_ENVIRONMENT_NAME), forksTopic(MAIN_ENVIRONMENT_NAME), 1, authentication)] : []),
-    ...environmentPools(config, environment).map((pool): Trigger => ({
+    // Its harnesses bound, of every pool in its namespace, as the gateway counts them.
+    {
       type: "metrics-api",
-      metadata: { url: `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/counts/${pool.namespace}/${pool.name}`, valueLocation: "bound", targetValue: String(BOUND_TARGET), activationTargetValue: "0" },
-    })),
+      metadata: { url: `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/counts/${environment.namespace}`, valueLocation: "bound", targetValue: String(BOUND_TARGET), activationTargetValue: "0" },
+    },
   ];
   const scaledObjects = scaledObject(alasio, config.alasio.scaling, triggers, { pollingSeconds: config.alasio.pollingSeconds, cooldownSeconds: config.alasio.cooldownSeconds });
   return scaledObjects.length > 0 ? [logAuthentication(authentication, environment.namespace, "alasio"), ...scaledObjects] : [];
