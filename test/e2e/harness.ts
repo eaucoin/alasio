@@ -68,6 +68,7 @@ import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.
 import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { COMPONENTS as OBJECT_STORE_COMPONENTS } from "../../cli/src/manifests/object-store.ts";
 import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
+import { WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import { BINDING_LABEL, environmentKey, keyHash } from "../../src/binder/names.ts";
 import { NO_BIND_HEADER } from "../../src/binder/names.ts";
 import { mintToken } from "../../src/binder/tokens.ts";
@@ -957,6 +958,24 @@ export async function inCutOverRecord(script: string): Promise<string> {
 export const LOGGED_ERROR = /level=(?:error|fatal)|"level":"(?:error|fatal)"|[EF]\d{4} \d{2}:/u;
 
 /**
+ * How long the dump waits for any one thing it reads before it says it is still being read and
+ * goes on: a read can hang, as a stat of a mount whose FUSE session no process serves does, and a
+ * dump that hangs on one says nothing of the rest, the hang itself among it.
+ */
+const DUMP_READ_MS = 30_000;
+
+/** What `reading` comes to, or what it was where it fails, or, past DUMP_READ_MS, that it was still being read. */
+function bounded(reading: Promise<string>): Promise<string> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<string>((resolve) => (timer = setTimeout(() => resolve(`still being read after ${DUMP_READ_MS / 1000} s`), DUMP_READ_MS)));
+  return Promise.race([reading.catch((error: unknown) => `could not be read: ${error instanceof Error ? error.message : String(error)}`), late]).finally(() => clearTimeout(timer));
+}
+
+/** What the container `container` of `namespace`/`pod` logged, before it restarted where `previous`, as bounded reads it. */
+const logsOf = (namespace: string, pod: string, container: string, options: { readonly previous?: boolean } = {}): Promise<string> =>
+  bounded(kube.logs(namespace, pod, container, options));
+
+/**
  * What each of the cluster's nodes that `which` names, or each when it names none, says of
  * itself, which the API cannot say of a node that never joined: its container's state, in
  * Docker, the errors k3s logged (its agent's kubelet's among them) and its last lines, and
@@ -972,35 +991,34 @@ async function dumpNodes(which: ((node: string) => boolean) | undefined): Promis
     say(`${heading}${lines.length === 0 ? ": none" : ":"}`);
     for (const line of lines) say(`  ${line}`);
   };
-  const failure = (error: unknown) => `could not be read: ${error instanceof Error ? error.message : String(error)}`;
   const containerdLog = "tail -n 30 /var/lib/rancher/k3s/agent/containerd/containerd.log";
   try {
     if (TARGET === "host") {
       if (which && !which(hostname())) return said;
-      const logged = await sudo("journalctl", "--unit=k3s", "--no-pager", "--lines=2000").then(({ stdout }) => stdout, failure);
+      const logged = await bounded(sudo("journalctl", "--unit=k3s", "--no-pager", "--lines=2000").then(({ stdout }) => stdout));
       say(`--- this machine, the node ${hostname()}`);
       lastOf("k3s's errors", logged, true);
       lastOf("k3s's last lines", logged);
-      lastOf("containerd's last lines", await sudo("sh", "-c", containerdLog).then(({ stdout }) => stdout, failure));
-      const daemon = await sudo("journalctl", "--unit=stargz-snapshotter", "--no-pager", "--lines=2000").then(({ stdout }) => stdout, failure);
+      lastOf("containerd's last lines", await bounded(sudo("sh", "-c", containerdLog).then(({ stdout }) => stdout)));
+      const daemon = await bounded(sudo("journalctl", "--unit=stargz-snapshotter", "--no-pager", "--lines=2000").then(({ stdout }) => stdout));
       lastOf("stargz-snapshotter's errors", daemon, true);
       lastOf("stargz-snapshotter's last lines", daemon);
-      lastOf("its FUSE manager's last lines", await sudo("tail", "-n", "30", "/var/lib/containerd-stargz-grpc/stargz-fuse-manager.log").then(({ stdout }) => stdout, failure));
+      lastOf("its FUSE manager's last lines", await bounded(sudo("tail", "-n", "30", "/var/lib/containerd-stargz-grpc/stargz-fuse-manager.log").then(({ stdout }) => stdout)));
       return said;
     }
     // What the machine's kernel killed for its memory, as a node's container may be.
-    lastOf("the kernel's kills for memory", await sudo("dmesg", "--ctime").then(({ stdout: out }) => out.split("\n").filter((line) => /out of memory|oom-kill|killed process/iu.test(line)).join("\n"), failure));
-    const { stdout } = await docker("ps", "--all", "--filter", `label=alasio.cluster=${CLUSTER}`, "--format", "{{.Names}}");
+    lastOf("the kernel's kills for memory", await bounded(sudo("dmesg", "--ctime").then(({ stdout: out }) => out.split("\n").filter((line) => /out of memory|oom-kill|killed process/iu.test(line)).join("\n"))));
+    const stdout = await bounded(docker("ps", "--all", "--filter", `label=alasio.cluster=${CLUSTER}`, "--format", "{{.Names}}").then(({ stdout: listed }) => listed));
     for (const node of stdout.split("\n").filter(Boolean).sort()) {
       if (which && !which(node)) continue;
-      const state = await docker("inspect", "--format", "{{.State.Status}}, started {{.State.StartedAt}}, exit code {{.State.ExitCode}}{{if .State.OOMKilled}}, killed for its memory{{end}}{{if .State.Error}}, {{.State.Error}}{{end}}, restarted {{.RestartCount}} times", node)
-        .then(({ stdout: inspected }) => inspected.trim(), failure);
+      const state = await bounded(docker("inspect", "--format", "{{.State.Status}}, started {{.State.StartedAt}}, exit code {{.State.ExitCode}}{{if .State.OOMKilled}}, killed for its memory{{end}}{{if .State.Error}}, {{.State.Error}}{{end}}, restarted {{.RestartCount}} times", node)
+        .then(({ stdout: inspected }) => inspected.trim()));
       say(`--- node ${node}: its container ${state}`);
       // k3s logs on stderr, which docker logs says as such.
-      const logged = await docker("logs", "--tail", "2000", node).then(({ stdout: out, stderr }) => `${out}${stderr}`, failure);
+      const logged = await bounded(docker("logs", "--tail", "2000", node).then(({ stdout: out, stderr }) => `${out}${stderr}`));
       lastOf("k3s's errors", logged, true);
       lastOf("k3s's last lines", logged);
-      lastOf("containerd's last lines", await docker("exec", node, "sh", "-c", containerdLog).then(({ stdout: out }) => out, failure));
+      lastOf("containerd's last lines", await bounded(docker("exec", node, "sh", "-c", containerdLog).then(({ stdout: out }) => out)));
     }
   } catch (error) {
     say(`the cluster's nodes could not be listed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1027,8 +1045,9 @@ export async function dumpClusterState(): Promise<void> {
     process.stderr.write(`${["::group::cluster state", ...await dumpNodes(undefined), "::endgroup::"].join("\n")}\n`);
     return;
   }
-  const said: string[] = ["::group::cluster state"];
-  const say = (line: string) => said.push(line);
+  // Said as it is read, so a dump cut short, as a hook that outlasts its timeout is, still says what it read.
+  const say = (line: string) => void process.stderr.write(`${line}\n`);
+  say("::group::cluster state");
   const ready = (conditions: readonly { readonly type: string; readonly status: string }[] | undefined) =>
     conditions?.find(({ type }) => type === "Ready")?.status === "True";
   try {
@@ -1069,37 +1088,66 @@ export async function dumpClusterState(): Promise<void> {
       for (const problem of podProblems(pod)) say(problem);
       for (const event of events.filter(({ involvedObject }) => involvedObject.name === name).slice(-10)) say(`${event.type} ${event.reason}: ${event.message?.trim()}`);
       for (const container of [...(pod.spec?.initContainers ?? []), ...(pod.spec?.containers ?? [])]) {
-        const logged = await kube.logs(namespace, name, container.name).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        const logged = await logsOf(namespace, name, container.name);
         say(`logs of ${container.name}:`);
         for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
         // A readiness command run again, each step it takes said, and how long it took, as kubelet's says only that it failed.
         const [shell, flag, script] = container.readinessProbe?.exec?.command ?? [];
         if (shell === "sh" && flag === "-c" && script !== undefined) {
           const started = Date.now();
-          const ran = await Promise.race([
-            kube.exec(namespace, name, ["sh", "-xc", script], { container: container.name }).then(({ code, stdout, stderr }) => `exited with ${code}\n${stderr}${stdout}`, (error: unknown) => String(error)),
-            new Promise<string>((resolve) => setTimeout(() => resolve("still running after 30 s"), 30_000)),
-          ]);
+          const ran = await bounded(kube.exec(namespace, name, ["sh", "-xc", script], { container: container.name }).then(({ code, stdout, stderr }) => `exited with ${code}\n${stderr}${stdout}`));
           say(`its readiness command, run again, in ${Date.now() - started} ms: ${ran.trimEnd()}`);
         }
       }
     }
     // Ready or not, each node's mount of workspace storage and its agent: what the mount's juicefs said, its container
     // before it restarted too, and what each, the agent among them, which every bind reaches the mount through, sees
-    // of alasio's directory of the node's: the workspaces' root's file system, and every mount under it, with its
-    // propagation.
-    const view = 'stat -f -c "%T" /var/lib/alasio/workspaces 2>&1; grep " /var/lib/alasio" /proc/self/mountinfo || echo "no mount there"';
+    // of alasio's directory of the node's: the workspaces' root's file system, asked of for 5 s at most, as a stat of a
+    // FUSE session no process serves never answers, and every mount under it, with its propagation.
+    const view = [
+      `timeout -s KILL 5 stat -f -c "%T" ${WORKSPACES_ROOT} 2>&1 || echo "stat -f of ${WORKSPACES_ROOT} did not answer in 5 s"`,
+      `grep " /var/lib/alasio" /proc/self/mountinfo || echo "no mount there"`,
+    ].join("; ");
+    // And, of a mount's pod, which shares the node's PIDs: the juicefs log it keeps, then each of the node's juicefs
+    // processes and each process waiting uninterruptibly, as one whose request a FUSE session leaves unanswered does:
+    // its state, what it waits in, its parent, and its kernel stack.
+    const processes = [
+      "tail -n 80 /run/alasio/juicefs.log 2>&1",
+      "for proc in /proc/[0-9]*; do",
+      `  fields=$(sed 's/.*) //' "$proc/stat" 2>/dev/null) || continue`,
+      `  state=$(echo "$fields" | cut -d ' ' -f 1)`,
+      `  command=$(tr '\\0' ' ' < "$proc/cmdline" 2>/dev/null)`,
+      `  case "$state:$command" in D:*|*juicefs*) ;; *) continue ;; esac`,
+      `  echo "pid \${proc#/proc/} $state, waiting in $(cat "$proc/wchan" 2>/dev/null), its parent $(echo "$fields" | cut -d ' ' -f 2): $command"`,
+      `  sed 's/^/    /' "$proc/stack" 2>/dev/null`,
+      "done",
+    ].join("\n");
     for (const pod of pods.filter((each) => each.status?.phase === "Running" && ["workspace-mount", "node-agent"].includes(each.metadata?.labels?.["app.kubernetes.io/component"] ?? ""))) {
       const { namespace = "", name = "" } = pod.metadata ?? {};
       const container = pod.spec?.containers[0]?.name ?? "";
       const restarted = (pod.status?.containerStatuses?.[0]?.restartCount ?? 0) > 0;
       for (const previous of restarted ? [true, false] : [false]) {
-        const logged = await kube.logs(namespace, name, container, { previous }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        const logged = await logsOf(namespace, name, container, { previous });
         say(`--- logs of ${container} of ${namespace}/${name}${previous ? ", before it restarted" : ""}:`);
         for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
       }
-      const seen = await kube.exec(namespace, name, ["sh", "-c", view], { container }).then(({ stdout, stderr }) => `${stdout}${stderr}`, (error: unknown) => String(error));
+      const seen = await bounded(kube.exec(namespace, name, ["sh", "-c", view], { container }).then(({ stdout, stderr }) => `${stdout}${stderr}`));
       say(`--- alasio's directory of the node's as ${namespace}/${name} sees it:\n${seen.trimEnd()}`);
+      if (pod.metadata?.labels?.["app.kubernetes.io/component"] === "workspace-mount") {
+        const running = await bounded(kube.exec(namespace, name, ["sh", "-c", processes], { container }).then(({ stdout, stderr }) => `${stdout}${stderr}`));
+        say(`--- the juicefs log of ${namespace}/${name}, then the node's juicefs processes and those waiting uninterruptibly:\n${running.trimEnd()}`);
+      }
+    }
+    // Each Valkey's last lines, ready or not, and before it restarted: whether it waits for the lock of its volume,
+    // has loaded its file, or serves, which workspace storage's mount waits on as it starts.
+    for (const pod of pods.filter((each) => each.status?.phase === "Running" && (each.spec?.containers ?? []).some(({ name: container }) => container === "valkey"))) {
+      const { namespace = "", name = "" } = pod.metadata ?? {};
+      const restarted = (pod.status?.containerStatuses ?? []).some(({ name: container, restartCount }) => container === "valkey" && restartCount > 0);
+      for (const previous of restarted ? [true, false] : [false]) {
+        const logged = await logsOf(namespace, name, "valkey", { previous });
+        say(`--- logs of valkey of ${namespace}/${name}${previous ? ", before it restarted" : ""}:`);
+        for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
+      }
     }
     const waking = new Set(["neon-proxy", "neon-control", "neon-compute", "lake-loader", "lake-query", "lake-intake"]);
     const restarts = (pod: V1Pod) => (pod.status?.containerStatuses ?? []).some(({ restartCount }) => restartCount > 0);
@@ -1110,7 +1158,7 @@ export async function dumpClusterState(): Promise<void> {
         // A container restarted, what it logged as it ended too, which is why.
         const restarted = (pod.status?.containerStatuses ?? []).some(({ name: each, restartCount }) => each === container.name && restartCount > 0);
         for (const previous of restarted ? [true, false] : [false]) {
-          const logged = await kube.logs(namespace, name, container.name, { previous }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+          const logged = await logsOf(namespace, name, container.name, { previous });
           say(`--- logs of ${container.name} of ${namespace}/${name}${previous ? ", before it restarted" : ""}:`);
           for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
         }
@@ -1123,7 +1171,7 @@ export async function dumpClusterState(): Promise<void> {
     for (const pod of pods.filter((each) => each.status?.phase === "Running" && objectStore.has(each.metadata?.labels?.["app.kubernetes.io/component"] ?? ""))) {
       const { namespace = "", name = "" } = pod.metadata ?? {};
       for (const container of pod.spec?.containers ?? []) {
-        const logged = await kube.logs(namespace, name, container.name).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        const logged = await logsOf(namespace, name, container.name);
         say(`--- ${namespace}/${name}: the warnings and errors of ${container.name}`);
         for (const line of logged.trimEnd().split("\n").filter((each) => /^[EW]\d{4} /u.test(each)).slice(-40)) say(`  ${line}`);
       }
@@ -1134,7 +1182,7 @@ export async function dumpClusterState(): Promise<void> {
     for (const [component, scopes] of [[GATEWAY_COMPONENT, ["[snapshots]", "[binder]"]], ["node-agent", ["[node-agent]"]]] as const) {
       for (const pod of await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels(component)) })) {
         const name = pod.metadata?.name ?? "";
-        const logged = await kube.logs(NAMESPACE, name, component).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        const logged = await logsOf(NAMESPACE, name, component);
         say(`--- ${NAMESPACE}/${name}: its last lines of ${scopes.join(" and ")}`);
         for (const line of logged.trimEnd().split("\n").filter((each) => scopes.some((scope) => each.startsWith(scope))).slice(-80)) say(`  ${line}`);
       }
@@ -1144,7 +1192,7 @@ export async function dumpClusterState(): Promise<void> {
     for (const component of [GATEWAY_COMPONENT, "alasio"] as const) {
       for (const pod of await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels(component)) })) {
         const name = pod.metadata?.name ?? "";
-        const logged = await kube.logs(NAMESPACE, name, component).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        const logged = await logsOf(NAMESPACE, name, component);
         say(`--- ${NAMESPACE}/${name}: its last lines of harnesses`);
         const told = (each: string) => each.includes("harness:") || each.includes("harness's") || each.startsWith("[sandbox-gateway]");
         for (const line of logged.trimEnd().split("\n").filter(told).slice(-60)) say(`  ${line}`);
@@ -1153,7 +1201,7 @@ export async function dumpClusterState(): Promise<void> {
     // And each bound harness pod's own last lines, which a pod ready as it serves shows nowhere else.
     for (const pod of pods.filter((each) => each.metadata?.annotations?.["alasio.dev/binding-key"]?.startsWith("harness:") && podProblems(each).length === 0)) {
       const { namespace = "", name = "" } = pod.metadata ?? {};
-      const logged = await kube.logs(namespace, name, "harness").catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+      const logged = await logsOf(namespace, name, "harness");
       say(`--- ${namespace}/${name}: the last lines of its harness host`);
       for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
     }
@@ -1163,7 +1211,6 @@ export async function dumpClusterState(): Promise<void> {
     for (const line of await dumpNodes(undefined)) say(line);
   }
   say("::endgroup::");
-  process.stderr.write(`${said.join("\n")}\n`);
 }
 
 /** Removes what the run made, unless it is kept: the registry, the cluster, with all it holds, the node image, and the run's directory. */
