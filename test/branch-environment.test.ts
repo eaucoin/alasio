@@ -56,6 +56,7 @@ test("a branch's state, as it first starts, keeps its conversations and loses wh
   await run(main.enqueueOutboxText({ chatId: 1001, text: "on its way" }));
   const [button] = await run(main.createCallbackActions(conversationId, [{ kind: "refresh" }]));
   await run(main.setCodexLogin('{"tokens":{"refresh_token":"once"}}'));
+  await run(main.withCodexLoginLock((login) => Effect.flatMap(login.get, (kept) => (kept ? login.refuse(kept.savedAt) : Effect.void))));
   // As a parent, a request of its branch's it answered; as a branch, an answer its own parent gave it.
   const answer: ForkAnswer = { outcome: "forked", netMode: "none", reason: null };
   await run(main.recordForkRequest("other", "request-answered", "fs-0123456789abcdef", answer));
@@ -69,6 +70,7 @@ test("a branch's state, as it first starts, keeps its conversations and loses wh
   assert.deepEqual(await run(branch.getCompletedResponsesPendingDelivery), []);
   assert.equal(await run(branch.getPendingOutboxCount), 0);
   assert.equal(await run(branch.getCodexLogin), null);
+  assert.deepEqual((await (await testPool()).query(`select saved_at from ${schema}.codex_login_refusal`)).rows, []);
   assert.equal(await run(branch.consumeCallbackAction(button ?? "")), null);
   assert.equal(await run(branch.getState("branch")), "try-codex");
   assert.equal(await run(branch.forkRequestAnswered("other", "request-answered")), null);

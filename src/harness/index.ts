@@ -2,6 +2,7 @@ import type { v2 } from "../../.types/codex/index.js";
 import { Context, Effect, Layer, Option, Schema, type Scope } from "effect";
 
 import type { CodexAppServer } from "../codex/app-server/client.ts";
+import type { CodexLoginRefused } from "../codex/login-refresh.ts";
 import type { NoActiveTurn } from "../codex/app-server/thread-client.ts";
 import type { ResponseBlock } from "../codex/event-projection.ts";
 import type { KeptCodexRollouts } from "../codex/rollouts/index.ts";
@@ -132,7 +133,7 @@ export interface ModelOption {
 }
 
 /** What a harness's call failed with, its message the one the operator is shown. */
-export type HarnessError = CodexSessionError | NoActiveTurn | ClaudeCodeError | HarnessHostError;
+export type HarnessError = CodexSessionError | NoActiveTurn | ClaudeCodeError | HarnessHostError | CodexLoginRefused;
 
 /** A harness's sessions of one working directory, as the operator's panels list, rewind, and resume them. */
 export interface HarnessSessions {
@@ -277,9 +278,10 @@ export class HarnessHostError extends Schema.TaggedError<HarnessHostError>()("Ha
 
 /**
  * Why there is no harness to give: none of that name, no folder, a workspace the
- * deployment cannot serve or a branch must not, or a host elsewhere not reached.
+ * deployment cannot serve or a branch must not, a host elsewhere not reached, or Codex's
+ * login refused.
  */
-export type HarnessUnavailable = UnknownHarness | NoWorkspaceMounted | SessionFilesystemsDisabled | FolderOnBranch | HarnessHostError;
+export type HarnessUnavailable = UnknownHarness | NoWorkspaceMounted | SessionFilesystemsDisabled | FolderOnBranch | HarnessHostError | CodexLoginRefused;
 
 /** What Harnesses.layer is given: what harnesses are made with, and test doubles. */
 export interface HarnessesOptions extends Partial<Pick<HarnessOptions, "sessionStore" | "codexRollouts" | "sessionFsCodexRollouts" | "claudeQueryFactory">> {

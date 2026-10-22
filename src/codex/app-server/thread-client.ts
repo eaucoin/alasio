@@ -107,6 +107,18 @@ export class StaleTurnCleanupError extends Schema.TaggedError<StaleTurnCleanupEr
   }
 }
 
+/**
+ * What a refresh of the Codex login came to, as the app-server says it. The pinned Codex answers
+ * a refresh that failed with no error, whyever it failed (codex-rs app-server,
+ * account_processor.rs refresh_token_if_requested). But a refusal for good, as Codex judges one
+ * (login/src/auth/manager.rs: a 401, an `invalid_grant`, or the issuer's
+ * `refresh_token_expired`, `refresh_token_reused` or `refresh_token_invalidated`), it records
+ * against the login, and getAuthStatus, asked for the login's token, then names the login's
+ * method and gives no token. "refused" is that; "asked" any other answer: refreshed, or not, as
+ * the issuer was not reached or failed otherwise, which the home's auth.json, unchanged, says.
+ */
+export type LoginRefresh = "asked" | "refused";
+
 /** A thread's work in the app-server: its threads, turns, goals, and the models it offers. */
 export interface AppServerThreads {
   /** Loads the thread, unless the app-server has it loaded; the id of the thread loaded. */
@@ -132,11 +144,11 @@ export interface AppServerThreads {
    */
   readonly loginModels: (scope: AppServerScope) => Effect.Effect<readonly v2.Model[], AppServerStartError>;
   /**
-   * Refreshes this machine's Codex login now, as Codex refreshes it (account/read, its refresh
+   * Refreshes this machine's Codex login now, as Codex refreshes it (getAuthStatus, its refresh
    * token asked for): its access token, and its refresh token, which works once, rotated in its
-   * home's auth.json.
+   * home's auth.json. What came of it, as LoginRefresh says.
    */
-  readonly refreshLogin: (scope: AppServerScope) => Effect.Effect<void, AppServerStartError>;
+  readonly refreshLogin: (scope: AppServerScope) => Effect.Effect<LoginRefresh, AppServerStartError>;
   /**
    * Whether the conversation `threadKey` has Codex working in it on its own: a turn of one
    * of its threads running in the app-server, whoever started it (a goal's, as its
@@ -327,7 +339,11 @@ export function makeAppServerThreads(
 
     listModels: ({ env, cwd }) => rpc.start({ env, cwd }).pipe(Effect.andThen(listAll("model/list", { includeHidden: false }))),
 
-    refreshLogin: ({ env, cwd }) => rpc.start({ env, cwd }).pipe(Effect.andThen(rpc.request("account/read", { refreshToken: true })), Effect.asVoid),
+    refreshLogin: ({ env, cwd }) =>
+      rpc.start({ env, cwd }).pipe(
+        Effect.andThen(rpc.request("getAuthStatus", { includeToken: true, refreshToken: true })),
+        Effect.map(({ authMethod, authToken }): LoginRefresh => (authMethod !== null && authToken === null ? "refused" : "asked")),
+      ),
 
     loginModels: ({ env, cwd }) =>
       Effect.gen(function*() {

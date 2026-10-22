@@ -321,6 +321,32 @@ const deliveries = (config: Parameters<typeof installConfig>[0]) =>
     return yield* describeBots(yield* installConfig(config), [...(main ? [{ environment: "main", bot: main }] : []), ...branchBots.flat()]);
   });
 
+/** What alasio's store keeps of its Codex login, as alasio's pod reads it (src/codex/login-state.ts). */
+const CodexLoginState = Schema.fromJsonString(Schema.Struct({ kept: Schema.Boolean, refusedAt: Schema.NullOr(Schema.String) }));
+
+/**
+ * What alasio says of its Codex login, asked in its pod: kept, none kept, or refused as alasio
+ * refreshed it, so Codex runs no turn until the operator logs in again; or why it is not seen.
+ */
+export const describeCodexLogin = (said: typeof CodexLoginState.Type): string =>
+  said.refusedAt !== null
+    ? `Codex's login: refused as alasio refreshed it, at ${said.refusedAt}, so Codex runs no turn until it is logged in again: run \`alasio login codex\``
+    : said.kept
+    ? "Codex's login: kept"
+    : "Codex's login: none kept, so Codex runs no turn until it is logged in: run `alasio login codex`";
+
+const codexLogin: Effect.Effect<string, never, KubeApi> = runningPodIn(NAMESPACE, RELEASE).pipe(
+  Effect.flatMap((pod) => runIn({ namespace: NAMESPACE, pod, container: RELEASE }, ["node", "/opt/alasio/src/codex/login-state.ts"])),
+  Effect.map(({ exitCode, stdout, stderr }) =>
+    Option.match(exitCode === 0 ? Schema.decodeUnknownOption(CodexLoginState)(stdout.trim()) : Option.none(), {
+      onNone: () => `Codex's login: not seen: ${(stderr || stdout).trim() || `exit ${exitCode}`}`,
+      onSome: describeCodexLogin,
+    })
+  ),
+  Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(403)(error), () => Effect.succeed("Codex's login: not seen, as this kubeconfig may not run commands in alasio's pod")),
+  Effect.catch((error) => Effect.succeed(`Codex's login: not seen: ${error.message}`)),
+);
+
 /** Whether `scaledObject` scales on what the metrics server measures: its pods' CPU. */
 const onResources = (scaledObject: ScaledObject): boolean => scaledObject.spec.triggers.some(({ type }) => type === "cpu");
 
@@ -424,6 +450,7 @@ export const status = Command.make("status", {}, () =>
         for (const line of yield* objectStore(workloads)) yield* Console.log(line);
         const telegram = workloads.length > 0 ? yield* deliveries(config) : { lines: [], fixes: [] };
         for (const line of telegram.lines) yield* Console.log(line);
+        if (alasio) yield* Console.log(yield* codexLogin);
         const cluster = yield* memory;
         yield* Console.log(cluster.memory ? describeMemory(cluster.memory) : "memory: not seen, as this kubeconfig may not list the cluster's nodes and pods");
         if (cluster.measures === null) yield* Console.log("whether the cluster has a metrics server: not seen, as this kubeconfig may not read its APIServices");

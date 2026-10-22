@@ -712,6 +712,8 @@ describe("alasio's command line, on the alasio it installed", () => {
     }
     assert.ok(said.includes(`  Deployment ${NAMESPACE}/${RELEASE}: ready\n`), said);
     assert.ok(said.includes(`  StatefulSet ${NAMESPACE}/${RELEASE}-neon-pageserver: ready\n`), said);
+    // As alasio's pod reads its store, refused by none.
+    assert.match(said, /^Codex's login: (kept|none kept, so Codex runs no turn until it is logged in: run `alasio login codex`)$/mu);
     // The object store's copies, as the run gives them, and each volume server's disk, as its metrics say.
     assert.ok(said.includes(AGENTS >= 2 ? "\nthe object store: each object kept twice (replication 001)\n" : "\nthe object store: each object kept once (replication 000)\n"), said);
     const servers = AGENTS >= 2 ? 3 : 1;

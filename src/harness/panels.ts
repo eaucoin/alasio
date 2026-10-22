@@ -12,8 +12,8 @@
  *   (HarnessHost.forkSession, HarnessHost.goals), as Codex keeps a thread's goal and makes a fork
  *   in the app-server that runs it.
  * - Models: Codex's of alasio's own app-server, which runs anyway as the one refresher of the
- *   Codex login (../codex/login-refresh.ts); Claude Code's as its CLI lists them, once for the
- *   process's life, as the CLI is pinned with the release.
+ *   Codex login (../codex/login-refresh.ts), the login kept fresh first; Claude Code's as its
+ *   CLI lists them, once for the process's life, as the CLI is pinned with the release.
  *
  * What each panel shows of a workspace is the sessions of its folder's project, or of its session
  * filesystem's directory, and no conversation's beyond them.
@@ -24,6 +24,7 @@ import { join } from "node:path";
 import { Context, Effect, Layer, Option } from "effect";
 
 import { CodexAppServer } from "../codex/app-server/client.ts";
+import { CodexLoginFreshness } from "../codex/login-refresh.ts";
 import { buildCodexEnv } from "../codex/env.ts";
 import { resolveCodexModelChoice, toModelOption } from "../codex/model.ts";
 import { rolloutListing } from "../codex/rollouts/listing.ts";
@@ -64,7 +65,7 @@ export class Panels extends Context.Service<Panels, {
   readonly forMount: (conversationId: string, mount: Mount) => Effect.Effect<Option.Option<HarnessPanels>, HarnessUnavailable>;
   readonly requireForMount: (conversationId: string, mount: Mount) => Effect.Effect<HarnessPanels, NoServiceMounted | HarnessUnavailable>;
 }>()("alasio/harness/Panels") {
-  static readonly layer = (options: PanelsOptions): Layer.Layer<Panels, never, HarnessHost | CodexAppServer> => Layer.effect(Panels, makePanels(options));
+  static readonly layer = (options: PanelsOptions): Layer.Layer<Panels, never, HarnessHost | CodexAppServer | CodexLoginFreshness> => Layer.effect(Panels, makePanels(options));
 }
 
 /** The directory a session filesystem's harness runs in, under `stateDir`, as a pool's pod has it. */
@@ -73,9 +74,12 @@ export const sessionFsDirectory = (stateDir: string, volumeId: string): string =
 const makePanels = Effect.fnUntraced(function*({ sessionStore, codexRollouts, sessionFsCodexRollouts, stateDir, branch = null, claudeModels = (workingDirectory) => listClaudeModels({ workingDirectory }), codexModels }: PanelsOptions) {
   const host = yield* HarnessHost;
   const appServer = yield* CodexAppServer;
-  // Of alasio's own app-server, run in a directory of the workspace's, as the models are the login's, whatever the workspace.
+  const { fresh } = yield* CodexLoginFreshness;
+  // Of alasio's own app-server, run in a directory of the workspace's, as the models are the login's, whatever the workspace;
+  // the login kept fresh first, so the app-server, as it calls with it, never finds it due and refreshes it on its own.
   const listCodexModels = codexModels ?? ((directory: string) =>
     Effect.sync(() => mkdirSync(directory, { recursive: true })).pipe(
+      Effect.andThen(fresh),
       Effect.andThen(appServer.listModels({ env: buildCodexEnv(), cwd: directory })),
       Effect.map((models) => models.filter((model) => !model.hidden).map(toModelOption)),
     ));
