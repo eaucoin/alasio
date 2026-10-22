@@ -21,7 +21,7 @@
  * which every state of one database would share, are held to one state's grants alone.
  */
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -68,8 +68,13 @@ export const CODEX_LOGIN_URL = "http://127.0.0.1:9/v1";
 /** The namespace its pools are in, as main's are. */
 const NAMESPACE = "alasio";
 
-// The test process's own Codex home, its pods' and alasio's, so that no test writes the operator's.
-process.env["CODEX_HOME"] ??= mkdtempSync(join(tmpdir(), "alasio-pools-codex-"));
+// The test process's own Codex home, its pods' and alasio's, so that no test writes the operator's:
+// removed as the test file's tests end, where it is made here.
+if (process.env["CODEX_HOME"] === undefined) {
+  const home = mkdtempSync(join(tmpdir(), "alasio-pools-codex-"));
+  process.env["CODEX_HOME"] = home;
+  after(() => rmSync(home, { recursive: true, force: true }));
+}
 
 /** Where a pooled store is: its database, as alasio owns it, a pool of its, and as the harness host's role reaches it. */
 export interface PooledDatabase {
@@ -239,7 +244,9 @@ export const standInPools = ({ database, standIns = {}, branch }: StandInPoolsOp
     const bindingKey = randomBytes(32);
     const events = memoryTopic(eventsTopic(ENVIRONMENT));
     const pods = new Map<string, Pod>();
+    // The pods' directories, removed once their hosts have ended, as the scope closes.
     const root = mkdtempSync(join(tmpdir(), "alasio-pools-"));
+    yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(root, { recursive: true, force: true })));
     let made = 0;
     const folderBayma = yield* folderBaymaStandIn;
     // The pods' hosts, ended as the scope is.

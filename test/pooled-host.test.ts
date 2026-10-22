@@ -5,12 +5,12 @@
  * front does, and passes the rest on to a host served as alasio harness serves it.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, request } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 
 import { Context, Effect, Layer, Option, Scope, Exit } from "effect";
 
@@ -35,8 +35,9 @@ import { newSchema, run, testPool, testStore } from "./support/store.ts";
 
 const CALLER_KEY = Buffer.from("the environment's key");
 
-/** The operator's Codex home, as alasio has it: its configuration, and its login, which no pod is given. */
+/** The operator's Codex home, as alasio has it: its configuration, and its login, which no pod is given; removed as the file's tests end. */
 const CODEX_HOME = mkdtempSync(join(tmpdir(), "alasio-pooled-codex-"));
+after(() => rmSync(CODEX_HOME, { recursive: true, force: true }));
 mkdirSync(join(CODEX_HOME, "skills", "review"), { recursive: true });
 writeFileSync(join(CODEX_HOME, "config.toml"), 'model = "gpt-5"\n');
 writeFileSync(join(CODEX_HOME, "AGENTS.md"), "Be brief.\n");
