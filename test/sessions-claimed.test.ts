@@ -8,7 +8,12 @@
  * this release keeps none; run again, nothing more.
  */
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { connect, createServer, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -27,6 +32,135 @@ import { startPostgres } from "./support/postgres.ts";
  */
 const SESSIONS_CLAIMED = spawnSync("bash", ["-c", 'eval "$(sed -n \'/^SESSIONS_CLAIMED="/,/^select count[^"]*"$/p\' "$0")"; printf %s "$SESSIONS_CLAIMED"', fileURLToPath(new URL("../upgrades/from-9.0.0.sh", import.meta.url))], { encoding: "utf8" }).stdout
   .split("$$").join("$");
+
+/**
+ * What the cut-over's pod runs its SQL with (the script's ON_DATABASE), as bash reads it, its
+ * dependencies this checkout's, where the release's image keeps them at /opt/alasio.
+ */
+const ON_DATABASE_SCRIPT = spawnSync("bash", ["-c", 'eval "$(sed -n \'/^ON_DATABASE=\x27/,/^}\x27$/p\' "$0")"; printf %s "$ON_DATABASE"', fileURLToPath(new URL("../upgrades/from-9.0.0.sh", import.meta.url))], { encoding: "utf8" }).stdout;
+const ON_DATABASE = ON_DATABASE_SCRIPT.split("/opt/alasio/package.json").join(fileURLToPath(new URL("../package.json", import.meta.url)));
+
+/**
+ * A package whose pg is this checkout's, but for the first connections, which fail as `fails`
+ * says, in turn, each before any connection is made: a Node error of a connection's, by its code
+ * (EPIPE), or the database's, by its SQLSTATE (57P03); for ON_DATABASE to be run on.
+ */
+function failingPg(fails: readonly string[]): { readonly packageJson: string; readonly remove: () => void } {
+  const root = mkdtempSync(join(tmpdir(), "alasio-failing-pg-"));
+  mkdirSync(join(root, "node_modules", "pg"), { recursive: true });
+  writeFileSync(join(root, "package.json"), JSON.stringify({ name: "failing-pg" }));
+  writeFileSync(join(root, "node_modules", "pg", "package.json"), JSON.stringify({ name: "pg", main: "index.js" }));
+  writeFileSync(join(root, "node_modules", "pg", "index.js"), `const real = require(${JSON.stringify(createRequire(import.meta.url).resolve("pg"))});
+const fails = ${JSON.stringify(fails)};
+class Client extends real.Client {
+  async connect() {
+    const next = fails.shift();
+    if (next === undefined) return super.connect();
+    if (/^E[A-Z]+$/.test(next)) throw Object.assign(new Error("write " + next), { code: next, syscall: "write" });
+    const refused = new real.DatabaseError("the database system is starting up", 0, "error");
+    refused.code = next;
+    throw refused;
+  }
+}
+module.exports = { ...real, Client };
+`);
+  return { packageJson: join(root, "package.json"), remove: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+/** What the cut-over's pod's script (ON_DATABASE) came to, run on `url`'s database with `sql`: its exit code, and what it printed. */
+async function onDatabase(url: string, sql: string, script = ON_DATABASE): Promise<{ readonly code: number | null; readonly stdout: string; readonly stderr: string }> {
+  const ran = spawn(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, ALASIO_DATABASE_URL: url, ALASIO_CUTOVER_SQL: sql },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  ran.stdout.on("data", (chunk: Buffer) => (stdout += chunk));
+  ran.stderr.on("data", (chunk: Buffer) => (stderr += chunk));
+  const code = await new Promise<number | null>((resolve) => ran.on("exit", resolve));
+  return { code, stdout, stderr };
+}
+
+test("the cut-over's pod, its first connections refused as a new pod's are until the network policies let its address in, connects as they do and runs its SQL once", async () => {
+  assert.match(ON_DATABASE, /ALASIO_CUTOVER_SQL/u);
+  const database = await startPostgres();
+  // The database's address, refusing until it is let through, then reaching the database.
+  const free = createServer();
+  await new Promise<void>((resolve) => free.listen(0, "127.0.0.1", resolve));
+  const port = (free.address() as { port: number }).port;
+  await new Promise((resolve) => free.close(resolve));
+  const { hostname, port: databasePort } = new URL(database.url);
+  const open = new Set<Socket>();
+  const through = createServer((socket) => {
+    const upstream = connect(Number(databasePort), hostname);
+    socket.pipe(upstream).pipe(socket);
+    for (const end of [socket, upstream]) {
+      open.add(end);
+      end.on("close", () => open.delete(end));
+      end.on("error", () => (socket.destroy(), upstream.destroy()));
+    }
+  });
+  const letThrough = setTimeout(() => through.listen(port, "127.0.0.1"), 1_000);
+  try {
+    const url = new URL(database.url);
+    url.port = String(port);
+    const { code, stdout, stderr } = await onDatabase(url.toString(), "select 41 + 1; select 'once'");
+    assert.equal(code, 0, stderr);
+    assert.match(stderr, /^waiting for the database: ECONNREFUSED: /u);
+    assert.equal(stdout, "42\nonce\n");
+  } finally {
+    clearTimeout(letThrough);
+    for (const socket of open) socket.destroy();
+    if (through.listening) await new Promise((resolve) => through.close(resolve));
+    await database.stop();
+  }
+});
+
+test("the cut-over's pod waits out a connection Node says failed, as of EPIPE, and a database taking none yet, as of 57P03, a compute starting; any other answer of the database's fails at once", async () => {
+  const database = await startPostgres();
+  try {
+    for (const [fails, waited] of [[["EPIPE", "57P03"], 2], [["08006"], 1]] as const) {
+      const stub = failingPg(fails);
+      try {
+        const { code, stdout, stderr } = await onDatabase(database.url, "select 1", ON_DATABASE_SCRIPT.split("/opt/alasio/package.json").join(stub.packageJson));
+        assert.equal(code, 0, stderr);
+        assert.equal(stdout, "1\n");
+        assert.equal(stderr.split("\n").filter((line) => line.startsWith("waiting for the database: ")).length, waited, stderr);
+        for (const fail of fails) assert.ok(stderr.includes(`waiting for the database: ${fail}: `), stderr);
+      } finally {
+        stub.remove();
+      }
+    }
+    const stub = failingPg(["53300"]);
+    try {
+      const asked = Date.now();
+      const { code, stderr } = await onDatabase(database.url, "select 1", ON_DATABASE_SCRIPT.split("/opt/alasio/package.json").join(stub.packageJson));
+      assert.equal(code, 1);
+      assert.match(stderr, /^it failed: 53300: /u);
+      assert.ok(Date.now() - asked < 5_000, "it waited before it failed");
+    } finally {
+      stub.remove();
+    }
+  } finally {
+    await database.stop();
+  }
+});
+
+test("the cut-over's pod, refused by the database itself, as of a password it does not take, fails at once, waiting on nothing no wait mends", async () => {
+  const database = await startPostgres();
+  try {
+    const url = new URL(database.url);
+    url.password = "not-the-password";
+    const asked = Date.now();
+    const { code, stdout, stderr } = await onDatabase(url.toString(), "select 1");
+    assert.equal(code, 1);
+    assert.equal(stdout, "");
+    assert.match(stderr, /^it failed: 28P01: /u);
+    assert.ok(Date.now() - asked < 5_000, "it waited before it failed");
+  } finally {
+    await database.stop();
+  }
+});
 
 test("the cut-over gives each conversation the sessions its rows name, as this release records them as they are written, and the threads their histories start in, drops 9.0.0's tally of albums and its restart events, and nothing more run again", async () => {
   assert.match(SESSIONS_CLAIMED, /insert into state\.conversation_sessions/u);

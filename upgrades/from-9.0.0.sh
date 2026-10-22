@@ -219,14 +219,39 @@ one_off() {
   [ "$phase" = Succeeded ] || fail "the pod $name failed ($name.log): $(tail -n 3 "$OUT/$name.log")"
 }
 # What runs SQL on alasio's database, as alasio reaches it, from its pod: ALASIO_CUTOVER_SQL's
-# statements, the rows of the last printed a line each, tab-separated.
+# statements, the rows of the last printed a line each, tab-separated. Its pod's address is let
+# in by the network policies of what it reaches only as they next sync, just after it starts, so
+# its first connections may be refused: it connects as alasio's setup does (src/neon/connect.ts),
+# trying again every 5 s, for 5 minutes, saying why, where its connection failed (one of Node's
+# errors of a connection, as ECONNREFUSED, ECONNRESET or EPIPE, or pg's of one ended) or the
+# database said it takes none yet (SQLSTATE classes 08, a connection's, and 57P, as 57P03 of a
+# compute starting); any other the database answered, as of a password it does not take, fails
+# at once, as no wait mends it. The SQL runs once, connected.
 ON_DATABASE='import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 const pg = createRequire("/opt/alasio/package.json")("pg");
+const CONNECTION_ERRORS = new Set(["ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT", "ECONNABORTED", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN"]);
+const waitedOut = (error) =>
+  error instanceof pg.DatabaseError
+    ? /^(08|57P)/.test(error.code ?? "")
+    : CONNECTION_ERRORS.has(error.code) || (error.code === undefined && /^Connection terminated/.test(error.message));
+const connected = async (url) => {
+  for (const until = Date.now() + 300000; ;) {
+    const client = new pg.Client({ connectionString: url, connectionTimeoutMillis: 120000 });
+    try {
+      await client.connect();
+      return client;
+    } catch (error) {
+      await client.end().catch(() => {});
+      if (!waitedOut(error) || Date.now() >= until) throw error;
+      console.error(`waiting for the database: ${error.code ?? "no code"}: ${error.message}`);
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+  }
+};
 try {
   const url = process.env.ALASIO_DATABASE_URL ?? readFileSync(process.env.ALASIO_DATABASE_URL_FILE, "utf8");
-  const client = new pg.Client({ connectionString: url.trim(), connectionTimeoutMillis: 120000 });
-  await client.connect();
+  const client = await connected(url.trim());
   try {
     for (const { rows } of [await client.query({ text: process.env.ALASIO_CUTOVER_SQL, rowMode: "array" })].flat()) {
       for (const row of rows ?? []) console.log(row.map((value) => String(value ?? "")).join("\t"));
