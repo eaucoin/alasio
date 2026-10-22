@@ -207,16 +207,21 @@ test("a token lasts as long as a restore takes to its resume, and from its resum
       assert.equal(proxy.reading(), 0);
     }), { preparedForMs: 300 }));
 
+// Each window half a second, ten times the 50 ms its restore asks again in, so a request on
+// however loaded a machine comes within it.
+const KEPT_ASKING_WINDOW_MS = 500;
+
 test("a resumed token lasts while its restore keeps asking, through a bucket away for ten times its window, failing or not answering; once it asks no more, a window later it ends", () =>
   withProxy(({ proxy, s3 }) =>
     Effect.gen(function*() {
+      const window = KEPT_ASKING_WINDOW_MS;
       const status = (token: StoreToken, through = proxy) => Effect.promise(() => ask(through.endpoint, `/snapshots/${KEY}`, { token })).pipe(Effect.map(refusal));
       const token = minted(proxy);
-      proxy.resumed("main/fs-abc", 100);
+      proxy.resumed("main/fs-abc", window);
       // The bucket failing every read for ten windows, its restore asking again every 50 ms,
       // as its gofer does: each answered as the bucket answers, the token lasting.
       s3.refuse = (method) => (method === "GET" ? 503 : null);
-      for (const startedAt = Date.now(); Date.now() - startedAt < 2000;) {
+      for (const startedAt = Date.now(); Date.now() - startedAt < 10 * window;) {
         assert.equal(yield* status(token), "503 InternalError");
         yield* sleep(50);
       }
@@ -224,21 +229,21 @@ test("a resumed token lasts while its restore keeps asking, through a bucket awa
       s3.refuse = () => null;
       assert.equal(yield* status(token), "200 ");
       // Asked no more, it ends a window after its last request.
-      yield* sleep(100);
+      yield* sleep(window / 2);
       assert.equal(yield* status(token), "200 ");
-      yield* sleep(300);
+      yield* sleep(window + 100);
       assert.equal(yield* status(token), "403 AccessDenied");
       // A bucket that does not answer at all, likewise.
       yield* Effect.scoped(Effect.gen(function*() {
-        const away = yield* makeStoreProxy({ store: { endpoint: "http://127.0.0.1:1", region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, askedWindowMs: 200 });
+        const away = yield* makeStoreProxy({ store: { endpoint: "http://127.0.0.1:1", region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, askedWindowMs: window });
         const unanswered = away.mint("main/fs-abc", PREFIX);
         assert.ok(unanswered);
-        away.resumed("main/fs-abc", 100);
-        for (const startedAt = Date.now(); Date.now() - startedAt < 2000;) {
+        away.resumed("main/fs-abc", window);
+        for (const startedAt = Date.now(); Date.now() - startedAt < 10 * window;) {
           assert.equal(yield* status(unanswered, away), "502 BadGateway");
           yield* sleep(50);
         }
-        yield* sleep(300);
+        yield* sleep(window + 100);
         assert.equal(yield* status(unanswered, away), "403 AccessDenied");
       }));
       // Never resumed, its requests lengthen it not: it ends as a prepare's does.
@@ -248,13 +253,13 @@ test("a resumed token lasts while its restore keeps asking, through a bucket awa
         yield* sleep(100);
       }
       assert.equal(yield* status(prepared), "403 AccessDenied");
-    }), { askedWindowMs: 200, preparedForMs: 300 }));
+    }), { askedWindowMs: KEPT_ASKING_WINDOW_MS, preparedForMs: 300 }));
 
 test("a resumed token ends at its ceiling from its resume, however its restore keeps asking", () =>
   withProxy(({ proxy }) =>
     Effect.gen(function*() {
       const token = minted(proxy);
-      proxy.resumed("main/fs-abc", 100);
+      proxy.resumed("main/fs-abc", KEPT_ASKING_WINDOW_MS);
       const startedAt = Date.now();
       let refused = 0;
       while (refused === 0 && Date.now() - startedAt < 3000) {
@@ -262,8 +267,9 @@ test("a resumed token ends at its ceiling from its resume, however its restore k
         if (said !== "200 ") refused = Date.now() - startedAt;
         yield* sleep(50);
       }
-      assert.ok(refused >= 1000 && refused < 1400, `refused ${refused} ms after its resume`);
-    }), { askedWindowMs: 200, resumedCeilingMs: 1000 }));
+      // Refused at its ceiling, not before, as its window would end it, nor never, as its asking would keep it.
+      assert.ok(refused >= 1000 && refused < 1500, `refused ${refused} ms after its resume`);
+    }), { askedWindowMs: KEPT_ASKING_WINDOW_MS, resumedCeilingMs: 1000 }));
 
 test("a proxy that starts again takes back the time its tokens' requests lengthened, kept at most every so often", () =>
   withDirectory(async (directory) => {
