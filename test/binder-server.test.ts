@@ -626,7 +626,7 @@ test("a key whose pod is not reached is answered 503, and its next request binds
   }
 });
 
-test("a pool's counts are its free pods, its bindings, and the binds waiting in every replica", async () => {
+test("a pool's counts are its free pods, its bindings, and the binds waiting in every replica; a namespace's, the bindings of its pools", async () => {
   const of = await pool();
   const stand = await pods();
   const [one, two] = [await front(of, stand.port, { waitMs: 3_000 }), await front(of, stand.port, { waitMs: 3_000 })];
@@ -636,9 +636,13 @@ test("a pool's counts are its free pods, its bindings, and the binds waiting in 
     await new Promise((resolve) => setTimeout(resolve, 1_000));
     const counts = await (await fetch(`http://127.0.0.1:${counting.port}/counts/${of.namespace}/${of.name}`)).json();
     assert.deepEqual(counts, { free: 0, bound: 0, waiting: 2 });
+    assert.deepEqual(await (await fetch(`http://127.0.0.1:${counting.port}/counts/${of.namespace}`)).json(), { bound: 0 });
     await freePods(of, 3);
     assert.deepEqual((await Promise.all(waiting)).map(({ status }) => status), [200, 200]);
     assert.deepEqual(await (await fetch(`http://127.0.0.1:${counting.port}/counts/${of.namespace}/${of.name}`)).json(), { free: 1, bound: 2, waiting: 0 });
+    // The namespace's, of every pool there: this one's alone, and none of another namespace's.
+    assert.deepEqual(await (await fetch(`http://127.0.0.1:${counting.port}/counts/${of.namespace}`)).json(), { bound: 2 });
+    assert.deepEqual(await (await fetch(`http://127.0.0.1:${counting.port}/counts/${(await pool()).namespace}`)).json(), { bound: 0 });
   } finally {
     await Promise.all([one.close(), two.close(), counting.close()]);
     stand.close();

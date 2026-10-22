@@ -227,21 +227,11 @@ function harnessTemplates(config: InstallConfig, environment: Environment): V1Po
 const harnessPoolsOf = (environment: Environment): Record<HarnessName, Pool> =>
   Object.fromEntries(HARNESS_NAMES.map((harness) => [harness, { name: HARNESS_POOLS[harness], namespace: environment.namespace }])) as Record<HarnessName, Pool>;
 
-/** The folder conversations' harness pools of `environment`: main's, where folders run; none of a branch environment's. */
-function folderPoolsOf(config: InstallConfig, environment: Environment): Pool[] {
-  return environment.branch === null && foldersRun(config) ? HARNESS_NAMES.map((harness) => ({ name: FOLDER_HARNESS_POOLS[harness], namespace: environment.namespace })) : [];
-}
-
-/** Every harness pool of `environment`, its session conversations' and its folder conversations', where they run. */
-export function environmentPools(config: InstallConfig, environment: Environment): Pool[] {
-  const pools = harnessPoolsOf(environment);
-  return [...HARNESS_NAMES.map((harness) => pools[harness]), ...folderPoolsOf(config, environment)];
-}
-
 /** The harness pools of `environment`, main's or a branch environment's, in its own namespace, as the module says; and, main's, its folder conversations'. */
 export function harnessPoolObjects(config: InstallConfig, environment: Environment): KubernetesObject[] {
   const pools = harnessPoolsOf(environment);
-  const folderPools = folderPoolsOf(config, environment);
+  const folder = environment.branch === null && foldersRun(config);
+  const folderPools = folder ? HARNESS_NAMES.map((harness) => ({ name: FOLDER_HARNESS_POOLS[harness], namespace: environment.namespace })) : [];
   return [
     ...gatewayRole(environment.namespace, [...Object.values(HARNESS_POOLS), ...folderPools.map(({ name }) => name)]),
     ...HARNESS_NAMES.flatMap((harness) => poolObjects(config, environment, pools[harness], false)),
