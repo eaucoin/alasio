@@ -1044,7 +1044,9 @@ async function dumpNodes(which: ((node: string) => boolean) | undefined): Promis
  * not, with its logs, and the latest logs of the pods a compute's wake goes through, its
  * proxy's, neon-control's and each compute's, ready or not: a compute's Postgres restarting
  * within its container leaves its pod ready, and says why in its log alone; the lake's and
- * its intake's, whose queries and writes wait on the catalog there unseen; and of any
+ * its intake's, whose queries and writes wait on the catalog there unseen; alasio's, which a
+ * reply that never comes says nothing of anywhere else, and the log's, whose access applier
+ * says what it made of the topics; and of any
  * other ready pod a container of which restarted, as one killed for its memory is ready
  * again by the time this is said; the log's nodes', their access appliers' among them, and
  * the collector's gateway's, which telemetry and Telegram's updates go through; and the
@@ -1162,7 +1164,7 @@ export async function dumpClusterState(): Promise<void> {
         for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
       }
     }
-    const waking = new Set(["neon-proxy", "neon-control", "neon-compute", "lake-loader", "lake-query", "lake-intake"]);
+    const waking = new Set(["neon-proxy", "neon-control", "neon-compute", "lake-loader", "lake-query", "lake-intake", "alasio", "log"]);
     const restarts = (pod: V1Pod) => (pod.status?.containerStatuses ?? []).some(({ restartCount }) => restartCount > 0);
     const told = (pod: V1Pod) => waking.has(pod.metadata?.labels?.["app.kubernetes.io/component"] ?? "") || restarts(pod);
     for (const pod of pods.filter((each) => each.status?.phase === "Running" && told(each) && podProblems(each).length === 0)) {
