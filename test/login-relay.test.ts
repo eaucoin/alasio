@@ -133,6 +133,34 @@ test("the relay takes only its own bearer and the model API's paths, and reads t
   await assert.rejects(fetch(relay.url));
 });
 
+test("the relay keeps the login fresh before it passes each request on, with the login as that left it, its body whole", async () => {
+  const upstreamFor = (file: string, path: string): LoginUpstream | null => {
+    const real = loginUpstream(file, path);
+    return real && { ...real, origin: upstreamOrigin };
+  };
+  writeAuth({ tokens: { access_token: "stale", account_id: "acct-1" } });
+  let kept = 0;
+  // Refreshed as it is kept fresh, after a while, as a refresh takes.
+  const fresh = Effect.sleep("50 millis").pipe(Effect.andThen(Effect.sync(() => {
+    kept += 1;
+    writeAuth({ tokens: { access_token: `fresh-${kept}`, account_id: "acct-1" } });
+  })));
+  const listening = Effect.runSync(Scope.make());
+  const relay = await Effect.runPromise(startLoginRelay({ authFile, bearer: "relay-bearer", upstreamFor, fresh }).pipe(Scope.provide(listening), Effect.provide(Logger.layer([]))));
+  try {
+    seen.length = 0;
+    const call = () => fetch(`${relay.url}/responses`, { method: "POST", headers: { authorization: "Bearer relay-bearer" }, body: '{"input":"hi"}' });
+    assert.equal((await call()).status, 200);
+    assert.equal((await call()).status, 200);
+    assert.deepEqual(seen.map(({ auth, body }) => [auth, body]), [["Bearer fresh-1", '{"input":"hi"}'], ["Bearer fresh-2", '{"input":"hi"}']]);
+    // A request refused is passed on to none, and keeps nothing fresh.
+    assert.equal((await fetch(`${relay.url}/responses`, { method: "POST", body: "{}" })).status, 401);
+    assert.equal(kept, 2);
+  } finally {
+    await Effect.runPromise(Scope.close(listening, Exit.void));
+  }
+});
+
 test("alasio's relay to its harness pools takes a token of a conversation's turn's alone, saying why it refuses in its log alone; a pod relays to it on its loopback with the latest token its turns gave, its Codex home given the operator's configuration and never their login", async () => {
   const key = poolLoginKey(Buffer.from("main's key"));
   const token = (claims: { readonly key: string; readonly expires?: number }, signedBy = key) => mintToken(signedBy, claims);

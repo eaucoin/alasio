@@ -39,6 +39,7 @@ import { PlacementRefused, serveBinder } from "../../src/binder/server.ts";
 import type { Pool as BoundPool } from "../../src/binder/names.ts";
 import type { Held } from "../../src/binder/live.ts";
 import { CodexAppServer } from "../../src/codex/app-server/client.ts";
+import { CodexLoginFreshness } from "../../src/codex/login-refresh.ts";
 import { ActiveTurns } from "../../src/harness/active-turns.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../../src/codex/rollouts/store.ts";
 import { EnvironmentEvents, EventsConsumer } from "../../src/events/consume.ts";
@@ -420,7 +421,7 @@ export const pooledHost = ({ standIns = {}, branch, host = (made) => made }: Poo
     const activeTurns = yield* ActiveTurns;
     const { url, callerKey, events, pools } = yield* standInPools({ database: databaseOf(yield* Store), standIns: { ...standIns, activeTurns }, branch });
     const home = process.env["CODEX_HOME"] ?? "";
-    const pooled = pooledHarnessHost({ url, environment: ENVIRONMENT, callerKey, codexLogin: { url: CODEX_LOGIN_URL, home } });
+    const pooled = pooledHarnessHost({ url, environment: ENVIRONMENT, callerKey, codexLogin: { url: CODEX_LOGIN_URL, home } }).pipe(Layer.provide(CodexLoginFreshness.layer(home)));
     return Layer.mergeAll(
       Layer.effect(HarnessHost, Effect.map(HarnessHost, host)).pipe(Layer.provide(pooled)),
       HarnessEvents.fromLog().pipe(Layer.provideMerge(EventsConsumer.layer.pipe(Layer.provide(Layer.succeed(EnvironmentEvents, EnvironmentEvents.of({ join: events.join })))))),

@@ -29,19 +29,15 @@
  * (HarnessHost.renewCodexLogin), and, a folder conversation's, the operator's Codex
  * configuration, as only alasio holds the login; and alasio, the one refresher of the login,
  * keeps it fresh before the turn and as it renews its token (../codex/login-refresh.ts), by its
- * own app-server. alasio's own pod is held busy for as long as it drives a turn (../kube/busy.ts),
+ * own app-server, one of the alasios on its store at a time. alasio's own pod is held busy for as long as it drives a turn (../kube/busy.ts),
  * since it is alasio that takes the turn's answer to its chat. The operator's panels are alasio's (./panels.ts): a fork of a session, and a thread's
  * goals, of the conversation's pod, bound ahead for them (forkSession, goals).
  */
-import { join } from "node:path";
-
 import { Clock, Effect, Layer, Option, Result, Schedule, Schema } from "effect";
 
 import { type HeldTo, mintToken } from "../binder/tokens.ts";
-import { CodexAppServer } from "../codex/app-server/client.ts";
 import { codexConfiguration } from "../codex/configuration.ts";
-import { buildCodexEnv } from "../codex/env.ts";
-import { makeLoginFreshness } from "../codex/login-refresh.ts";
+import { CodexLoginFreshness } from "../codex/login-refresh.ts";
 import { poolLoginKey } from "../codex/login-relay.ts";
 import { harnessKey } from "../gateway/names.ts";
 import { BusyPods } from "../kube/busy.ts";
@@ -93,12 +89,12 @@ export interface PooledHostOptions {
 }
 
 /** The host of each conversation, bound in its harness's pool, as the module says. */
-export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, written = () => {} }: PooledHostOptions): Layer.Layer<HarnessHost, never, Store | CodexAppServer> =>
+export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, written = () => {} }: PooledHostOptions): Layer.Layer<HarnessHost, never, Store | CodexLoginFreshness> =>
   Layer.effect(
     HarnessHost,
     Effect.gen(function*() {
       const store = yield* Store;
-      const appServer = yield* CodexAppServer;
+      const { fresh: loginFresh } = yield* CodexLoginFreshness;
       const sandboxes = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
       const hostBayma = Option.getOrNull(yield* Effect.serviceOption(HostBayma));
       const busyPods = Option.getOrNull(yield* Effect.serviceOption(BusyPods));
@@ -238,10 +234,6 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
         });
 
       const loginKey = poolLoginKey(callerKey);
-      // Refreshed by alasio's own app-server, as Codex refreshes it, where its access token is about to stop; said, and the turn run on what there is, where it cannot be.
-      const loginFresh = (yield* makeLoginFreshness(join(codexLogin.home, "auth.json"), appServer.refreshLogin({ env: buildCodexEnv(), cwd: codexLogin.home }))).pipe(
-        Effect.catch((error) => Effect.logWarning(`the Codex login could not be refreshed: ${error.message}`)),
-      );
       /** A token of the conversation's Codex turn for alasio's relay of its login, good for CODEX_LOGIN_TTL_MS, the login kept fresh first. */
       const loginOf = (conversationId: string): Effect.Effect<TurnCodex["login"]> =>
         Effect.andThen(loginFresh, Effect.map(Clock.currentTimeMillis, (now) => ({ url: codexLogin.url, token: mintToken(loginKey, { key: harnessKey(conversationId), expires: now + CODEX_LOGIN_TTL_MS }) })));
