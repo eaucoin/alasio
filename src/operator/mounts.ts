@@ -12,7 +12,7 @@
  * session filesystems: those it inherited are forked from its parent's as it first uses
  * them (src/branch/fork.ts), and the parent's clones are the parent's to make.
  */
-import { Context, Effect, Layer, Option, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 
 import type { AlasioConfig } from "../config.ts";
 import { Turns } from "../codex/turns.ts";
@@ -22,6 +22,7 @@ import { folderRefusedOnBranch, harnessLabelOf, isHarnessName } from "../harness
 import type { HarnessName } from "../harness/names.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
+import { LONG_CALL_TIMEOUT_MS } from "../sandbox/gateway-client.ts";
 import { type NetMode, type SessionError, SessionSandboxes } from "../sandbox/index.ts";
 import { isValidVolumeId, newVolumeId } from "../sandbox/names.ts";
 import { withLogScope } from "../shared/log.ts";
@@ -104,9 +105,10 @@ export class Mounts extends Context.Service<Mounts, {
   readonly forkSessionWorkspace: (conversationId: string) => Effect.Effect<WorkspaceChange, MountRefused | SessionError | StoreError>;
   /**
    * Sets the session workspaces the gateway holds against those alasio's store records, and
-   * says each where they differ: one whose making never ended, one recorded as made the
-   * gateway holds none of, and one the gateway holds no record names; nothing is deleted.
-   * As alasio starts, before any is made.
+   * says each where they differ: one whose making never ended, begun longer ago than
+   * UNMADE_AFTER_MS, as one younger may be under way in another alasio on the store; one
+   * recorded as made the gateway holds none of; and one the gateway holds no record names;
+   * nothing is deleted. As alasio starts.
    */
   readonly reconcileSessionWorkspaces: Effect.Effect<void, StoreError>;
 }>()("alasio/operator/Mounts") {
@@ -114,6 +116,9 @@ export class Mounts extends Context.Service<Mounts, {
   static readonly layer = ({ workspaceRoot, branch = null }: Pick<AlasioConfig, "workspaceRoot"> & { readonly branch?: string | null | undefined }): Layer.Layer<Mounts, never, Store | HarnessHost | Turns> =>
     Layer.effect(Mounts, makeMounts(workspaceRoot, branch));
 }
+
+/** How long ago a session workspace whose making has not ended began, past which no alasio is still making it: twice the longest call of the gateway's. */
+const UNMADE_AFTER_MS = 2 * LONG_CALL_TIMEOUT_MS;
 
 const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: string | null): Effect.fn.Return<Mounts["Service"], never, Store | HarnessHost | Turns> {
   const store = yield* Store;
@@ -256,13 +261,16 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
     // What the gateway holds and alasio's store records, set against each other and said where they differ: nothing is deleted.
     reconcileSessionWorkspaces: Effect.gen(function*() {
       if (!sandbox) return;
+      const now = yield* Clock.currentTimeMillis;
       const workspaces = yield* store.listSessionWorkspaces;
       const listed = yield* sandbox.volumes.list.pipe(Effect.option);
       if (Option.isNone(listed)) return yield* Effect.logWarning("could not list the gateway's session workspaces, to set them against alasio's records");
       const there = new Set(listed.value);
       const recorded = new Set(workspaces.map(({ volumeId }) => volumeId));
-      for (const { volumeId, madeAt } of workspaces) {
-        if (madeAt === null) yield* Effect.logWarning(`workspace.unmade.sessionfs volume=${volumeId}: its making never ended; it is left as it is`);
+      for (const { volumeId, madeAt, createdAt } of workspaces) {
+        if (madeAt === null) {
+          if (now - createdAt.getTime() > UNMADE_AFTER_MS) yield* Effect.logWarning(`workspace.unmade.sessionfs volume=${volumeId}: its making never ended; it is left as it is`);
+        }
         else if (!there.has(volumeId)) yield* Effect.logWarning(`workspace.missing.sessionfs volume=${volumeId}: recorded as made, and the gateway holds none of it`);
       }
       for (const volumeId of there) {

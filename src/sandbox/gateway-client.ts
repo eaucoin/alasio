@@ -60,8 +60,8 @@ export const BIND_WAIT_MS = 5 * 60_000;
 const FILE_WRITE_WAIT_MS = 60_000;
 /** How long a call of the gateway's may take, in ms, but a bind's and a release's, which wait for a pod and a save. */
 const CALL_TIMEOUT_MS = 60_000;
-/** How long a bind or a release may take, in ms: a restore's, or a save's, with room. */
-const LONG_CALL_TIMEOUT_MS = 10 * 60_000;
+/** How long a bind or a release may take, in ms: a restore's, or a save's, with room; the longest any call of the gateway's takes. */
+export const LONG_CALL_TIMEOUT_MS = 10 * 60_000;
 /** How long a folder instance's bind or release may take, in ms: as long as the gateway gives a bind of it, with room. */
 const FOLDER_CALL_TIMEOUT_MS = folderBindMs() + 60_000;
 

@@ -10,6 +10,8 @@ export type SessionWorkspace = {
   readonly volumeId: string;
   /** The session filesystem it is a fork of; null for one made empty. */
   readonly forkedFrom: string | null;
+  /** When its making began. */
+  readonly createdAt: Date;
 } & ({ readonly netMode: SessionWorkspaceNetMode; readonly madeAt: Date } | { readonly netMode: null; readonly madeAt: null });
 
 /** A session filesystem about to be made. */
@@ -23,10 +25,11 @@ interface SessionWorkspaceRow {
   readonly forked_from: string | null;
   readonly net_mode: SessionWorkspaceNetMode | null;
   readonly made_at: Date | null;
+  readonly created_at: Date;
 }
 
-function sessionWorkspaceOf({ volume_id: volumeId, forked_from: forkedFrom, net_mode: netMode, made_at: madeAt }: SessionWorkspaceRow): SessionWorkspace {
-  return netMode !== null && madeAt !== null ? { volumeId, forkedFrom, netMode, madeAt } : { volumeId, forkedFrom, netMode: null, madeAt: null };
+function sessionWorkspaceOf({ volume_id: volumeId, forked_from: forkedFrom, net_mode: netMode, made_at: madeAt, created_at: createdAt }: SessionWorkspaceRow): SessionWorkspace {
+  return netMode !== null && madeAt !== null ? { volumeId, forkedFrom, createdAt, netMode, madeAt } : { volumeId, forkedFrom, createdAt, netMode: null, madeAt: null };
 }
 
 export class NeonSessionWorkspaceRepository {
@@ -64,7 +67,7 @@ export class NeonSessionWorkspaceRepository {
 
   list(): Effect.Effect<SessionWorkspace[], StoreError> {
     return this.#sql.query<SessionWorkspaceRow>(
-      `select volume_id, net_mode, forked_from, made_at from ${this.#schema}.session_workspaces order by created_at desc, volume_id`,
+      `select volume_id, net_mode, forked_from, made_at, created_at from ${this.#schema}.session_workspaces order by created_at desc, volume_id`,
     ).pipe(Effect.map((rows) => rows.map(sessionWorkspaceOf)));
   }
 }

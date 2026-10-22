@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import type { InlineKeyboardMarkup } from "@grammyjs/types";
 import { Effect, Logger } from "effect";
+import { TestClock } from "effect/testing";
 
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { HarnessHost } from "../src/harness/host.ts";
@@ -13,7 +14,7 @@ import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { Mounts } from "../src/operator/mounts.ts";
 import { buildWorkspacePanel, handleWorkspaceControlCallback, handleWorkspaceTextCommand } from "../src/operator/workspace-control.ts";
 import type { Store } from "../src/persistence/store.ts";
-import { GatewayError } from "../src/sandbox/gateway-client.ts";
+import { GatewayError, LONG_CALL_TIMEOUT_MS } from "../src/sandbox/gateway-client.ts";
 import type { NetMode, SessionSandboxes } from "../src/sandbox/index.ts";
 import { parseWorkspace } from "../src/workspace/kind.ts";
 import { bindHarness, pooledStore } from "./support/pools.ts";
@@ -34,8 +35,8 @@ test("the workspace panel offers New empty workspace only when session filesyste
 
 test("the workspace panel lists the session workspaces made by what they are, and offers to fork the one mounted, saying what a fork is", () => {
   const sessionWorkspaces = [
-    { volumeId: "fs-def456", netMode: "none", forkedFrom: "fs-abc123", madeAt: new Date(2) },
-    { volumeId: "fs-abc123", netMode: "full", forkedFrom: null, madeAt: new Date(1) },
+    { volumeId: "fs-def456", netMode: "none", forkedFrom: "fs-abc123", madeAt: new Date(2), createdAt: new Date(2) },
+    { volumeId: "fs-abc123", netMode: "full", forkedFrom: null, madeAt: new Date(1), createdAt: new Date(1) },
   ] as const;
   const panel = (current: string | null) =>
     buildWorkspacePanel({ current, workspaceRoot: "/root", listing: { candidates: [{ name: "repo", path: "/root/repo", git: true }] }, working: false, sandboxEnabled: true, sessionWorkspaces });
@@ -238,7 +239,7 @@ test("only a session workspace alasio made is switched to", async () => {
   });
 });
 
-test("as alasio starts, what the gateway holds and alasio records are set against each other, each that differs said, and nothing deleted", async () => {
+test("as alasio starts, what the gateway holds and alasio records are set against each other, each that differs said, one being made said only once no alasio can be making it, and nothing deleted", async () => {
   const sandbox = fakeVolumes({ listed: ["fs-made", "fs-unmade", "fs-orphan"] });
   await withWorkspaceControls(sandbox, async (alasio, _telegram, store) => {
     await run(store.recordSessionWorkspace({ volumeId: "fs-made", forkedFrom: "fs-source" }));
@@ -246,15 +247,25 @@ test("as alasio starts, what the gateway holds and alasio records are set agains
     await run(store.recordSessionWorkspace({ volumeId: "fs-unmade", forkedFrom: "fs-source" }));
     await run(store.recordSessionWorkspace({ volumeId: "fs-missing", forkedFrom: null }));
     await run(store.markSessionWorkspaceMade("fs-missing", "full"));
-    const logged: string[] = [];
-    await alasio.runPromise(Effect.flatMap(Mounts, (mounts) => mounts.reconcileSessionWorkspaces).pipe(Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push(String(message)))]))));
-    assert.deepEqual(sandbox.destroyed, []);
-    assert.deepEqual((await run(store.listSessionWorkspaces)).map(({ volumeId }) => volumeId).sort(), ["fs-made", "fs-missing", "fs-unmade"]);
-    assert.deepEqual(logged.map((line) => line.split(":")[0]).sort(), [
+    // Set against each other as long after fs-unmade's making began as `after` says.
+    const reconciled = async (after: number) => {
+      const logged: string[] = [];
+      await alasio.runPromise(Effect.gen(function*() {
+        yield* TestClock.setTime(Date.now() + after);
+        yield* Effect.flatMap(Mounts, (mounts) => mounts.reconcileSessionWorkspaces);
+      }).pipe(Effect.provide(TestClock.layer()), Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push(String(message)))]))));
+      return logged.map((line) => line.split(":")[0]).sort();
+    };
+    // Just begun, as another alasio on the store may be making it now: not said.
+    assert.deepEqual(await reconciled(0), ["workspace.missing.sessionfs volume=fs-missing", "workspace.orphan.sessionfs volume=fs-orphan"]);
+    // Begun past twice the longest call of the gateway's: no alasio is making it.
+    assert.deepEqual(await reconciled(2 * LONG_CALL_TIMEOUT_MS + 60_000), [
       "workspace.missing.sessionfs volume=fs-missing",
       "workspace.orphan.sessionfs volume=fs-orphan",
       "workspace.unmade.sessionfs volume=fs-unmade",
     ]);
+    assert.deepEqual(sandbox.destroyed, []);
+    assert.deepEqual((await run(store.listSessionWorkspaces)).map(({ volumeId }) => volumeId).sort(), ["fs-made", "fs-missing", "fs-unmade"]);
   });
 });
 

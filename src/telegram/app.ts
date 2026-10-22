@@ -167,7 +167,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   yield* Effect.logInfo(`  Default service: ${config.defaultHarness ?? "none (operator chooses with /service)"}`);
   yield* Effect.logInfo(`  Session filesystems: ${sandbox ? "enabled" : "off (the deployment renders no sessions template)"}`);
   yield* turns.reconcilePersistentState;
-  // Before anything can make another, the session filesystems a crash left unmade go.
+  // The session filesystems the gateway holds set against those the store records, and where they differ said.
   yield* Effect.flatMap(Mounts, (mounts) => mounts.reconcileSessionWorkspaces);
   yield* turns.flushCompletedResponses;
   yield* mediaGroups.flushDue;

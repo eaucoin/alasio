@@ -422,7 +422,7 @@ test("a branch environment mounts and makes no folder, forks no workspace itself
     listing: { candidates: [{ name: "repo", path: "/root/repo", git: true }] },
     working: false,
     sandboxEnabled: true,
-    sessionWorkspaces: [{ volumeId: "fs-abc123", forkedFrom: null, netMode: "none", madeAt: new Date() }],
+    sessionWorkspaces: [{ volumeId: "fs-abc123", forkedFrom: null, netMode: "none", madeAt: new Date(), createdAt: new Date() }],
     branch: "try",
   });
   assert.deepEqual(panel.keyboard.flat().map(({ text }) => text), ["* fs-abc123", "New empty workspace…", "Refresh", "Close"]);
