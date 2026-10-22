@@ -1352,17 +1352,22 @@ test("a sandbox restored from the bucket, checkpointed as its pod stops while it
       const [image] = base.layers;
       assert.ok(image);
       const there = yield* node("node-2");
-      // Each get of the bucket slow, as one of a large image is.
-      s3.getDelayMs = 1500;
+      // Each get of its image's files held until the checkpoint is through, as one of a large image takes its time.
+      let gotten = () => {};
+      const held = new Promise<void>((resolve) => (gotten = resolve));
+      let holding = 0;
+      s3.holdGet = (key) => (key.includes(image.digest) ? ((holding += 1), held) : null);
       const { manifest } = yield* there.agent.prepare(workspace);
       yield* there.agent.resume(resumeRequest(manifest.snapshot));
-      // Its image is fetched still, a get of each of its files taking 1.5 s.
+      // Its image is being fetched, its gets held.
+      for (const deadline = Date.now() + 10_000; holding === 0; yield* Effect.sleep("20 millis")) assert.ok(Date.now() < deadline, "its image was not fetched");
       assert.ok(!existsSync(join(there.cacheDir, "main", "fs-abc", "layers", image.digest)));
-      const startedAt = Date.now();
-      const released = yield* there.agent.checkpoint(request("fs-abc"));
-      const took = Date.now() - startedAt;
-      assert.ok(took < 1000, `the checkpoint waited ${took} ms`);
+      // Through while they are held: it waits on none of them, and a checkpoint that did would wait on them for good.
+      const released = yield* there.agent.checkpoint(request("fs-abc")).pipe(
+        Effect.timeoutOrElse({ duration: "30 seconds", orElse: () => Effect.die(new Error("the checkpoint waited on the image's download")) }),
+      );
       assert.ok(!existsSync(join(there.cacheDir, "main", "fs-abc", "layers", image.digest)), "the image was fetched before the checkpoint ended");
+      gotten();
       // Whole, as the cache held no base for it; and the image fetched after all.
       assert.equal(released.layers.length, 1);
       yield* fetched(there, base);

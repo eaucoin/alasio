@@ -36,6 +36,8 @@ export interface FakeS3 {
   refuse: (method: string, key: string, asked: string) => number | null;
   /** How long it waits before it answers a get of an object, so gets overlap as they would on a network. */
   getDelayMs: number;
+  /** What a get of the object `key` waits on before it is answered, where it gives one, as one of a large image waits on the network: a test's to settle. */
+  holdGet: (key: string) => Promise<void> | null;
   /** The most gets of objects it has answered at once. */
   readonly mostGetting: () => number;
   readonly close: () => Promise<void>;
@@ -125,6 +127,7 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
       mostGetting = Math.max(mostGetting, getting);
       response.on("close", () => void (getting -= 1));
       if (fake.getDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, fake.getDelayMs));
+      await fake.holdGet(key);
     }
     if (key && url.searchParams.has("uploads") && method === "POST") {
       const id = `upload-${uploads.size + requests.length}`;
@@ -242,6 +245,7 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     uploads,
     refuse: () => null,
     getDelayMs: 0,
+    holdGet: () => null,
     mostGetting: () => mostGetting,
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
