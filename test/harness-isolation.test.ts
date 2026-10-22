@@ -10,6 +10,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import { ConfigProvider, Context, Effect, Exit, Layer, Scope } from "effect";
 import pg from "pg";
@@ -276,6 +277,50 @@ test("a pool pod's grant holds the harness role to its own conversation's rows: 
     // Its grant issued again, as alasio binds the conversation anew, it reaches its rows again.
     await Effect.runPromise(alasio.issueHarnessGrant(a.id, "binding-a", grantDigest(grantA)));
     assert.notDeepEqual(await seen(harness.a), none);
+  });
+});
+
+test("a pod's writes of its turn and of its response at once, each naming its conversation's session, never wait on each other's lock of it", { timeout: 60_000 }, async () => {
+  await withGrantedPods(async ({ harness, a }) => {
+    // A write of its response, fenced on its turn's row, as its host's are (src/persistence/response-repository.ts): the row held for share.
+    const responding = await harness.a.connect();
+    const turning = await harness.a.connect();
+    try {
+      await responding.query("begin");
+      await responding.query("select 1 from state.turns where conversation_id = $1 for share", [a.id]);
+      // Its turn's row written meanwhile, which waits for the fence to let go.
+      const turned = turning.query("update state.turns set status = 'working' where conversation_id = $1", [a.id]);
+      await sleep(300);
+      // The response written, as its session is its conversation's already: no wait on the turn's writer, and so no deadlock.
+      assert.equal((await responding.query("update state.responses set completed = completed where thread_key = $1", [a.id])).rowCount, 1);
+      await responding.query("commit");
+      assert.equal((await turned).rowCount, 1);
+    } finally {
+      responding.release();
+      turning.release();
+    }
+  });
+});
+
+test("a pod's turn given a session no conversation has yet, as its response is given it at once, takes its turn's row before the session's lock, as the response's write does, so neither waits on the other", { timeout: 60_000 }, async () => {
+  await withGrantedPods(async ({ harness, a }) => {
+    const store = await Effect.runPromise(Effect.provide(Store, Store.layer({ pool: harness.a, makesSchema: false })));
+    const { epoch } = (await harness.a.query<{ epoch: string }>("select epoch from state.turns where id = $1", [a.id])).rows[0]!;
+    const responding = await harness.a.connect();
+    try {
+      // The response given the session, fenced on its turn's row (src/persistence/response-repository.ts updatePendingSessionId), its transaction not yet through.
+      await responding.query("begin");
+      await responding.query("select 1 from state.turns where id = $1 for share", [a.id]);
+      // The turn given it meanwhile, as its host records the session its harness started (src/persistence/turn-repository.ts updateSessionIdAt).
+      const turned = Effect.runPromise(store.turnPersistence(a.id, Number(epoch)).updateActiveTurnSessionId("new-session"));
+      await sleep(300);
+      assert.equal((await responding.query("update state.responses set session_id = 'new-session' where id = $1", [a.response])).rowCount, 1);
+      await responding.query("commit");
+      await turned;
+    } finally {
+      responding.release();
+    }
+    assert.deepEqual((await harness.a.query("select session_id from state.turns where id = $1", [a.id])).rows, [{ session_id: "new-session" }]);
   });
 });
 

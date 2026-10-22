@@ -114,12 +114,18 @@ export class NeonTurnRepository {
   /**
    * Records the session the conversation's turn of `epoch` runs in, on the turn and as its
    * harness's session in the conversation: whether no turn has claimed it since (a turn
-   * that ended records under its epoch until the next claim).
+   * that ended records under its epoch until the next claim). The turn's row is taken
+   * before the session's lock, which the harness host's role's check of the row takes as it
+   * claims a session (./harness-grants.ts, ./schema.ts harness_claim), as a write fenced on
+   * the turn holds the row before it does: so two writes giving the turn and its response a
+   * new session at once wait in one order, and never on each other.
    */
   updateSessionIdAt(threadKey: string, epoch: number, sessionId: string | null): Effect.Effect<boolean, StoreError> {
     return this.#sql.query(
       `with turn as (
-         update ${this.#schema}.turns set session_id = $3 where id = $1 and epoch = $2 returning harness
+         update ${this.#schema}.turns set session_id = $3
+         where id = $1 and epoch = $2 and exists (select 1 from ${this.#schema}.turns taken where taken.id = $1 and taken.epoch = $2 for no key update)
+         returning harness
        )
        update ${this.#schema}.conversations set ${assignSession("(select harness from turn)", "$3")}, updated_at = now()
        where id = $1 and exists (select 1 from turn)

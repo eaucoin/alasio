@@ -502,6 +502,12 @@ $$;
 create or replace function ${SCHEMA}.session_claimed(session text, conversation text) returns boolean
 language plpgsql volatile security definer set search_path = pg_catalog, pg_temp as $$
 begin
+  -- One the conversation has stays its, so it is its without waiting on any claim of it: a write
+  -- that waits for the lock as it holds its turn's row (a response's, fenced on it) would wait on
+  -- one of the turn's row itself, whose check holds the lock as it waits for that row.
+  if exists (select from ${SCHEMA}.conversation_sessions where session_id = session and conversation_id = conversation) then
+    return true;
+  end if;
   perform ${SCHEMA}.session_lock(session);
   if exists (select from ${SCHEMA}.conversation_sessions where session_id = session and conversation_id = conversation) then
     return true;
