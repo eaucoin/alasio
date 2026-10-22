@@ -68,6 +68,8 @@ import { folderTemplate, foldersRun } from "./folders.ts";
 import { harnessesConfig } from "./harness-pools.ts";
 import {
   accountRole,
+  APPLIED_AFTER_ANNOTATION,
+  appliedAfter,
   componentName,
   type Environment,
   given,
@@ -87,6 +89,7 @@ import { resumedConditionPolicy, sandboxPodPolicy } from "./admission.ts";
 import { durationSeconds, type InstallConfig } from "./config.ts";
 import { LOG_BROKERS, logPrincipalSecret } from "./log.ts";
 import { boundBudget } from "./disruption.ts";
+import { FILER_STORE } from "./object-store.ts";
 import { priority } from "./priorities.ts";
 import { scaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
@@ -641,7 +644,15 @@ function workspaceMount(config: InstallConfig, mountServices: Kept["mountService
   return {
     apiVersion: "apps/v1",
     kind: "DaemonSet",
-    metadata: { name: WORKSPACE_MOUNT, namespace: NAMESPACE, labels: labels(WORKSPACE_MOUNT_COMPONENT) },
+    metadata: {
+      name: WORKSPACE_MOUNT,
+      namespace: NAMESPACE,
+      labels: labels(WORKSPACE_MOUNT_COMPONENT),
+      // Rolled only once the Valkeys it reaches are ready, its metadata engine's and the
+      // bucket's filer store's: a pod that takes its predecessor's FUSE session over while its
+      // metadata engine restarts may never serve it.
+      annotations: { [APPLIED_AFTER_ANNOTATION]: appliedAfter([{ kind: "StatefulSet", namespace: NAMESPACE, name: VALKEY }, { kind: "StatefulSet", namespace: NAMESPACE, name: FILER_STORE }]) },
+    },
     spec: {
       selector: { matchLabels: selectorLabels(WORKSPACE_MOUNT_COMPONENT) },
       updateStrategy: { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } },

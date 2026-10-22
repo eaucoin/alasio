@@ -3424,6 +3424,13 @@ describe("the sandbox service", () => {
     assert.notEqual(reaching({ "alasio-valkey": "uid-1", "alasio-seaweedfs": "uid-2" }, { objectStore: { buckets: { workspaces: "elsewhere" } } }), before);
   });
 
+  test("rolls the nodes' mount only once the Valkeys it reaches are ready, its metadata engine's and the bucket's filer store's, as its annotation says, which rolls none of its pods", () => {
+    const mount = one<V1DaemonSet>(install(), "DaemonSet", "alasio-workspace-mount");
+    assert.equal(mount.metadata?.annotations?.["alasio.dev/applied-after"], "StatefulSet/alasio/alasio-valkey,StatefulSet/alasio/alasio-seaweedfs-filer-store");
+    assert.equal(mount.spec?.template.metadata?.annotations?.["alasio.dev/applied-after"], undefined);
+    for (const name of ["alasio-valkey", "alasio-seaweedfs-filer-store"]) assert.ok(one(install(), "StatefulSet", name));
+  });
+
   test("confines a pool's pods to the gateway in and the receiver out, with internet to the public internet beside, and admits every environment's alasio, its replicas and KEDA to the gateway, and the gateway to the node agents", () => {
     const policies = all<NetworkPolicyObject>(install(), "NetworkPolicy");
     const podOf = (component: string, namespace = "alasio", labels: Record<string, string> = {}): Pod => ({

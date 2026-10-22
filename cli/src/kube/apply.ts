@@ -4,7 +4,9 @@
  * waited for until established; namespaces, and the cluster's classes of pods; what pods
  * run as and with, and where the API server
  * reaches its extensions (APIServices, webhooks); Jobs, each run to completion afresh
- * (the Neon setup, which makes the Secrets the stack mounts); the workloads; then what
+ * (the Neon setup, which makes the Secrets the stack mounts); the workloads, each that names
+ * others of them it waits for (APPLIED_AFTER_ANNOTATION) applied only once those are ready;
+ * then what
  * scales and sizes them, for KEDA and VPA, whose CRDs are established by then, with what
  * KEDA's scalers authenticate as. What the
  * installation had and no longer has is deleted, but for what holds data, and its
@@ -17,11 +19,11 @@
  * here where it has not within a minute, as it does not run.
  */
 import type { KubernetesObject, V1Deployment } from "@kubernetes/client-node";
-import { Duration, Effect, Schedule, Schema } from "effect";
+import { Clock, Duration, Effect, Schedule, Schema } from "effect";
 
 import { POOL_LABEL } from "../../../src/binder/names.ts";
 import { harnessPoolPodPolicyName } from "../manifests/admission.ts";
-import { RELEASE } from "../manifests/common.ts";
+import { APPLIED_AFTER_ANNOTATION, RELEASE } from "../manifests/common.ts";
 import { FOLDER_HARNESS_POOLS, HARNESS_POOLS } from "../manifests/harness-pools.ts";
 import { describeRef, FIELD_MANAGER, hasStatus, type Kind, kind, type KindName, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./api.ts";
 import { awaitGone, awaitReady, type NotReadyInTime, type RolloutFailed, selectorOf, type WaitOptions } from "./rollout.ts";
@@ -57,6 +59,9 @@ const PHASES: readonly (readonly KindName[])[] = [
   ["Deployment", "StatefulSet", "DaemonSet", "CronJob"],
   ["TriggerAuthentication", "ScaledObject", "VerticalPodAutoscaler"],
 ];
+
+/** The phase of PHASES `object` is applied in, by its index; -1 where none applies it. */
+const phaseOf = (object: KubernetesObject): number => PHASES.findIndex((phase) => phase.some((name) => name === object.kind));
 
 /** The kinds alasio makes, in the order it applies them. */
 const MADE_KINDS: readonly Kind[] = PHASES.flat().map(kind);
@@ -270,16 +275,61 @@ const replaceChangedClasses = Effect.fnUntraced(function*(objects: readonly Kube
   yield* awaitGone(changed.map(refOf), options);
 });
 
+/** The workloads of `objects` that `object` is applied only once they are ready, as its APPLIED_AFTER_ANNOTATION names them, in its order. */
+const appliedOnceReady = (object: KubernetesObject, objects: readonly KubernetesObject[]): ObjectRef[] => {
+  const refs = new Map(objects.map(refOf).map((ref) => [nameOf(ref), ref]));
+  // In the order the annotation names them.
+  return namedBy(object).flatMap((named) => refs.get(named) ?? []);
+};
+
+/** How APPLIED_AFTER_ANNOTATION names `ref`. */
+const nameOf = (ref: ObjectRef): string => `${ref.kind}/${ref.namespace ?? ""}/${ref.name}`;
+
+/** What `object`'s APPLIED_AFTER_ANNOTATION names. */
+const namedBy = (object: KubernetesObject): string[] => (object.metadata?.annotations?.[APPLIED_AFTER_ANNOTATION] ?? "").split(",").filter(Boolean);
+
+/**
+ * What `object` of `batch`, one phase's of `objects`, names in its APPLIED_AFTER_ANNOTATION that
+ * `objects` has in another phase: a manifest's mistake, as a wait is among its own phase's alone.
+ * What `objects` has not, as a filer store where another object store serves the bucket, is no
+ * mistake, and waited for by none.
+ */
+const namedElsewhere = (object: KubernetesObject, batch: readonly KubernetesObject[], objects: readonly KubernetesObject[]): string[] => {
+  const inPhase = new Set(batch.map(refOf).map(nameOf));
+  const installed = new Set(objects.map(refOf).map(nameOf));
+  return namedBy(object).filter((named) => installed.has(named) && !inPhase.has(named));
+};
+
+/**
+ * `options` for a wait of those that share one timeout, the waits for what runs: those for the
+ * workloads others wait for (APPLIED_AFTER_ANNOTATION) and the one for every workload after
+ * them. Counted as though the wait began `spent` milliseconds before now, what those before it
+ * waited, so the timeout bounds their waiting together, and nothing else an apply does between
+ * them, its Jobs or its prune.
+ */
+const sharedAfter = (options: WaitOptions, spent: number): Effect.Effect<WaitOptions> =>
+  Effect.map(Clock.currentTimeMillis, (now) => ({ ...options, since: now - spent }));
+
 /** The workloads of `objects`. */
 const workloadsOf = (objects: readonly KubernetesObject[]): ObjectRef[] =>
   objects.filter((object) => WORKLOADS.some((name) => name === object.kind)).map(refOf);
 
-/** Applies `objects` in the order of PHASES, as the module says, without waiting for their workloads. */
-const applyPhases = Effect.fnUntraced(function*(objects: readonly KubernetesObject[], options: WaitOptions): Effect.fn.Return<void, ApplyError, KubeApi> {
+/**
+ * Applies `objects` in the order of PHASES, as the module says, without waiting for their
+ * workloads but those others wait for, within the timeout those waits share (sharedAfter): how
+ * many milliseconds they waited.
+ */
+const applyPhases = Effect.fnUntraced(function*(objects: readonly KubernetesObject[], options: WaitOptions): Effect.fn.Return<number, ApplyError, KubeApi> {
   const kube = yield* KubeApi;
   const unplaced = objects.filter((object) => !MADE_KINDS.some((each) => each.kind === object.kind && each.apiVersion === object.apiVersion));
   if (unplaced.length > 0) return yield* Effect.die(new Error(`alasio does not apply ${unplaced.map((object) => describeRef(refOf(object))).join(", ")}`));
+  // A wait named across phases refused before anything is applied, as one of its own phase's alone is waited for.
+  for (const object of objects) {
+    const elsewhere = namedElsewhere(object, objects.filter((each) => phaseOf(each) === phaseOf(object)), objects);
+    if (elsewhere.length > 0) return yield* Effect.die(new Error(`${describeRef(refOf(object))} waits for ${elsewhere.join(", ")}, which ${elsewhere.length === 1 ? "is" : "are"} applied in another phase than its own, where it waits for none`));
+  }
   yield* Effect.logInfo(`applying ${objects.length} objects to ${kube.server}`);
+  let spent = 0;
   for (const phase of PHASES) {
     const batch = objects.filter((object) => phase.some((name) => name === object.kind));
     if (phase.includes("Job")) {
@@ -292,9 +342,20 @@ const applyPhases = Effect.fnUntraced(function*(objects: readonly KubernetesObje
       yield* harnessPoolPolicyInForce(objects);
       yield* handOverReplicas(batch);
     }
-    yield* Effect.forEach(batch, (object) => kube.apply(object), { concurrency: 8, discard: true });
+    // Those that wait for others of theirs (APPLIED_AFTER_ANNOTATION) once the rest are applied, each once those are ready.
+    const later = batch.filter((object) => appliedOnceReady(object, batch).length > 0);
+    yield* Effect.forEach(batch.filter((object) => !later.includes(object)), (object) => kube.apply(object), { concurrency: 8, discard: true });
+    for (const object of later) {
+      const before = appliedOnceReady(object, batch);
+      yield* Effect.logInfo(`applying ${describeRef(refOf(object))} once ${before.map(describeRef).join(", ")} ${before.length === 1 ? "is" : "are"} ready`);
+      const began = yield* Clock.currentTimeMillis;
+      yield* awaitReady(before, yield* sharedAfter(options, spent));
+      spent += (yield* Clock.currentTimeMillis) - began;
+      yield* kube.apply(object);
+    }
     if (phase.includes("CustomResourceDefinition")) yield* awaitReady(batch.map(refOf), options);
   }
+  return spent;
 });
 
 /** Applies the installation `objects` are, deletes what it no longer has, and waits until its workloads run. */
@@ -306,9 +367,9 @@ export const applyInstallation = Effect.fnUntraced(function*(
   // A scaler no longer wanted goes before the workloads are applied, as it would set the
   // replicas they are given back to its own.
   yield* removeFinalized(yield* staleOf(desired, FINALIZED_KINDS), options);
-  yield* applyPhases(desired, options);
+  const spent = yield* applyPhases(desired, options);
   yield* prune(desired, options);
-  yield* awaitReady(workloadsOf(desired), options);
+  yield* awaitReady(workloadsOf(desired), yield* sharedAfter(options, spent));
 });
 
 /**
@@ -316,8 +377,8 @@ export const applyInstallation = Effect.fnUntraced(function*(
  * installation leaves be), and waits until their workloads run.
  */
 export const applyObjects = Effect.fnUntraced(function*(objects: readonly KubernetesObject[], options: WaitOptions): Effect.fn.Return<void, ApplyError, KubeApi> {
-  yield* applyPhases(objects, options);
-  yield* awaitReady(workloadsOf(objects), options);
+  const spent = yield* applyPhases(objects, options);
+  yield* awaitReady(workloadsOf(objects), yield* sharedAfter(options, spent));
 });
 
 /**

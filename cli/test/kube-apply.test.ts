@@ -414,6 +414,118 @@ test("PriorityClasses are applied with the namespaces, before what uses them; Da
   assert.match(error.message, /^not ready within 0\.3s, still waiting for:\n {2}DaemonSet kube-system\/node-service: 0 of 1 nodes ready\n {4}container service of pod node-service-0 is waiting: ImagePullBackOff/u);
 });
 
+test("the nodes' mount of workspace storage is applied only once the Valkeys it reaches are ready, so its pods never take a FUSE session over as its metadata engine restarts", async (t) => {
+  const { kube, run, progress } = await rig(t);
+  const objects = objectsOf();
+  const changed = (from = 0) => kube.changes.slice(from).filter(({ method }) => method === "PATCH").map(({ path }) => `${pluralOf(path)}/${path.split("/").at(-1)}`);
+  // Its metadata engine never ready: the mount is not applied at all.
+  kube.stuck.add("alasio-valkey");
+  const error = await run(Effect.flip(applyInstallation(objects, { timeout: "300 millis", poll: "10 millis" })));
+  assert.equal(error._tag, "NotReadyInTime");
+  assert.match(error.message, /StatefulSet alasio\/alasio-valkey: /u);
+  assert.ok(changed().includes("statefulsets/alasio-valkey"));
+  assert.ok(!changed().includes("daemonsets/alasio-workspace-mount"), "the mount was applied as its metadata engine was not ready");
+  // Ready, the mount is applied after both Valkeys, said.
+  kube.stuck.delete("alasio-valkey");
+  const since = kube.changes.length;
+  await run(applyInstallation(objects, WAIT));
+  const order = changed(since);
+  const mount = order.indexOf("daemonsets/alasio-workspace-mount");
+  assert.ok(mount > order.indexOf("statefulsets/alasio-valkey") && mount > order.indexOf("statefulsets/alasio-seaweedfs-filer-store"), order.join(", "));
+  assert.ok(progress.includes("applying DaemonSet alasio/alasio-workspace-mount once StatefulSet alasio/alasio-valkey, StatefulSet alasio/alasio-seaweedfs-filer-store are ready"), progress.join("\n"));
+});
+
+test("the wait for the Valkeys the mount waits on and the wait for every workload share one timeout: a Valkey ready only late leaves the rest what is left of it", async (t) => {
+  const { kube, run, progress } = await rig(t);
+  kube.stuck.add("alasio-valkey");
+  kube.stuck.add("alasio");
+  /** When the mount began to wait for the Valkeys, as it says. */
+  let waited: number | undefined;
+  // Ready two thirds of the way through the timeout from that, as one slow to load its file is.
+  const late = setInterval(() => {
+    if (waited === undefined && progress.some((line) => line.startsWith("applying DaemonSet alasio/alasio-workspace-mount once"))) waited = Date.now();
+    if (waited === undefined || Date.now() - waited < 2_700) return;
+    clearInterval(late);
+    const valkey = kube.get("/apis/apps/v1/namespaces/alasio/statefulsets/alasio-valkey");
+    assert.ok(valkey);
+    valkey.status = { ...valkey.status, readyReplicas: 1, availableReplicas: 1 };
+  }, 10);
+  t.after(() => clearInterval(late));
+  const error = await run(Effect.flip(applyInstallation(objectsOf(), { timeout: "4 seconds", poll: "10 millis" })));
+  assert.ok(waited !== undefined, "the mount waited for no Valkey");
+  const took = Date.now() - waited;
+  assert.equal(error._tag, "NotReadyInTime");
+  assert.match(error.message, /Deployment alasio\/alasio: /u);
+  assert.doesNotMatch(error.message, /alasio-valkey/u);
+  // Said of the one timeout it was given.
+  assert.match(error.message, /^not ready within 4s, /u);
+  // Within its one timeout of the Valkey's wait, and what applying and saying why take: not a
+  // second timeout after it, which would end it 6.7 s on at the soonest.
+  assert.ok(took < 5_200, `failed ${took} ms after the Valkeys' wait began, given 4000 ms`);
+});
+
+/** The path of the Job `name` in alasio's namespace, as the fake keeps it. */
+const jobPath = (name: string) => `/apis/batch/v1/namespaces/alasio/jobs/${name}`;
+
+/** Has the Job `name`, stuck running, complete after `ms`, as one that takes its time does. */
+function completesAfter(t: TestContext, kube: FakeKube, name: string, ms: number): void {
+  kube.stuck.add(name);
+  const done = setTimeout(() => {
+    kube.stuck.delete(name);
+    const job = kube.get(jobPath(name));
+    assert.ok(job, `no Job ${name}`);
+    job.status = { conditions: [{ type: "Complete", status: "True", reason: "Complete", message: "" }] };
+  }, ms);
+  t.after(() => clearTimeout(done));
+}
+
+test("what an apply does before its workloads' waits, a slow Job among it, takes nothing of the timeout those waits share", async (t) => {
+  const { kube, run } = await rig(t);
+  const started = Date.now();
+  // A setup taking three quarters of the timeout, and alasio ready only a while after it: past the timeout from the start, within it from the waits.
+  completesAfter(t, kube, "alasio-neon-setup", 1_500);
+  kube.stuck.add("alasio");
+  const ready = setInterval(() => {
+    if (Date.now() - started < 3_000) return;
+    clearInterval(ready);
+    const alasio = kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio");
+    assert.ok(alasio);
+    alasio.status = { ...alasio.status, readyReplicas: 1, availableReplicas: 1 };
+  }, 10);
+  t.after(() => clearInterval(ready));
+  await run(applyInstallation(objectsOf(), { timeout: "2 seconds", poll: "10 millis" }));
+  assert.ok(Date.now() - started >= 3_000);
+});
+
+test("a Valkey the mount waits for that is never ready, its wait begun well into the apply, fails it one timeout after that wait began, naming it", async (t) => {
+  const { kube, run } = await rig(t);
+  completesAfter(t, kube, "alasio-neon-setup", 1_500);
+  kube.stuck.add("alasio-valkey");
+  const started = Date.now();
+  const error = await run(Effect.flip(applyInstallation(objectsOf(), { timeout: "2 seconds", poll: "10 millis" })));
+  const took = Date.now() - started;
+  assert.equal(error._tag, "NotReadyInTime");
+  assert.match(error.message, /^not ready within 2s, still waiting for:\n {2}StatefulSet alasio\/alasio-valkey: /u);
+  // The Job's 1.5 s, then the Valkey's whole 2 s.
+  assert.ok(took >= 3_400 && took < 5_000, `failed ${took} ms after it began`);
+});
+
+test("a workload's applied-after naming what the installation applies in another phase fails the apply, naming it; one naming what it has not waits for the rest alone", async (t) => {
+  const { kube, run, progress } = await rig(t);
+  const naming = (extra: string) => objectsOf().map((object) =>
+    object.kind === "DaemonSet" && object.metadata?.name === "alasio-workspace-mount"
+      ? { ...object, metadata: { ...object.metadata, annotations: { ...object.metadata.annotations, "alasio.dev/applied-after": `${object.metadata.annotations?.["alasio.dev/applied-after"]},${extra}` } } }
+      : object
+  );
+  const configMap = objectsOf().find((object) => object.kind === "ConfigMap" && object.metadata?.namespace === "alasio");
+  assert.ok(configMap?.metadata?.name);
+  await assert.rejects(run(applyInstallation(naming(`ConfigMap/alasio/${configMap.metadata.name}`), WAIT)), new RegExp(`DaemonSet alasio/alasio-workspace-mount waits for ConfigMap/alasio/${configMap.metadata.name}, which is applied in another phase than its own`, "u"));
+  // Refused before anything is applied.
+  assert.deepEqual(kube.changes.filter(({ method }) => method === "PATCH"), []);
+  await run(applyInstallation(naming("StatefulSet/alasio/alasio-nothing"), WAIT));
+  assert.ok(progress.includes("applying DaemonSet alasio/alasio-workspace-mount once StatefulSet alasio/alasio-valkey, StatefulSet alasio/alasio-seaweedfs-filer-store are ready"), progress.join("\n"));
+});
+
 test("a DaemonSet is ready once every node it schedules to runs its current pod, ready", () => {
   const daemonSet = (status: Record<string, number>) => ({ apiVersion: "apps/v1", kind: "DaemonSet", metadata: { name: "csi-node", generation: 2 }, status });
   assert.deepEqual(readiness(daemonSet({ observedGeneration: 1, desiredNumberScheduled: 3, updatedNumberScheduled: 3, numberReady: 3 })), { _tag: "Waiting", status: "not yet rolled out" });

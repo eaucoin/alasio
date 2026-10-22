@@ -60,6 +60,18 @@ export function componentName(component: string): string {
   return `${RELEASE}-${component}`;
 }
 
+/**
+ * The annotation of a workload applied only once the workloads it names are ready, each
+ * `<Kind>/<namespace>/<name>`, comma-separated, of those the installation has
+ * (../kube/apply.ts): for a workload whose pods take their predecessors' sessions over as they
+ * roll, which should not roll while what serves those sessions rolls too.
+ */
+export const APPLIED_AFTER_ANNOTATION = "alasio.dev/applied-after";
+
+/** The value of APPLIED_AFTER_ANNOTATION that names `workloads`. */
+export const appliedAfter = (workloads: readonly { readonly kind: string; readonly namespace: string; readonly name: string }[]): string =>
+  workloads.map(({ kind, namespace, name }) => `${kind}/${namespace}/${name}`).join(",");
+
 /** The Secret of a branch environment's token, which its parent forks the sessions it inherited for (src/branch/fork.ts). */
 export const BRANCH_FORK_SECRET = componentName("branch-fork");
 

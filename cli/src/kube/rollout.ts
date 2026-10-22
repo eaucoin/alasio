@@ -152,6 +152,12 @@ class TimedOut extends Schema.TaggedError<TimedOut>()("TimedOut", {}) {}
 export interface WaitOptions {
   readonly timeout: Duration.Input;
   readonly poll: Duration.Input;
+  /**
+   * When the timeout counts from, in milliseconds since the epoch: the wait's start, unless it
+   * shares one with waits before it, counted as though it began what they spent before now. A
+   * wait past it says the timeout it was given, the budget, not how long it took on the clock.
+   */
+  readonly since?: number;
 }
 
 const POD = kind("Pod");
@@ -241,13 +247,13 @@ const awaitAll = Effect.fnUntraced(function*(
   refs: readonly ObjectRef[],
   look: (ref: ObjectRef) => Effect.Effect<Readiness, KubeApiError, KubeApi>,
   why: (ref: ObjectRef) => Effect.Effect<string[], KubeApiError, KubeApi>,
-  { timeout, poll }: WaitOptions,
+  { timeout, poll, since }: WaitOptions,
 ): Effect.fn.Return<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> {
   // What the last look found still waiting, and what was last said of it.
   let pending: ReadonlyArray<readonly [ObjectRef, string]> = [];
   let said = "";
   const timeoutMs = Duration.toMillis(Duration.fromInputUnsafe(timeout));
-  const startedAt = yield* Clock.currentTimeMillis;
+  const startedAt = since ?? (yield* Clock.currentTimeMillis);
   let deadline = startedAt + timeoutMs;
   const once = Effect.gen(function*() {
     const states = yield* Effect.forEach(refs, (ref) => Effect.map(look(ref), (state) => [ref, state] as const), { concurrency: 8 });

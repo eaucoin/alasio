@@ -11,8 +11,8 @@
  * Its controllers are make-believe: what is applied is at once as the cluster would make
  * it once it runs (a CRD established, a Job complete, a workload rolled out with a ready
  * pod, or none once scaled to none, a deleted claim's volume reclaimed), unless the test says an object is stuck (its
- * pods wait on an image pull the cluster warns about, or its data is never deleted) or,
- * for a Job, fails.
+ * pods wait on an image pull the cluster warns about, its data is never deleted, or, a
+ * Job's, it runs on) or, for a Job, fails.
  */
 import { createHash } from "node:crypto";
 import { once } from "node:events";
@@ -108,7 +108,7 @@ export interface FakeKube {
   /** Its objects, by path. */
   readonly objects: Map<string, KubeObject>;
   readonly changes: KubeChange[];
-  /** Names of workloads whose pods never run, and of volumes whose data cannot be deleted; and of Jobs that fail. */
+  /** Names of workloads whose pods never run, of volumes whose data cannot be deleted, and of Jobs that run on until the test says they completed. */
   readonly stuck: Set<string>;
   /** What a workload's pod's init container says as it ends, its termination message, by `<workload>/<container>`; one it says nothing of has not ended. */
   readonly said: Map<string, string>;
@@ -274,6 +274,11 @@ export async function serveFakeKube(): Promise<FakeKube> {
     const { name, namespace, generation = 1 } = object.metadata;
     const condition = (type: string, reason = type) => ({ type, status: "True", reason, message: "" });
     if (object.kind === "CustomResourceDefinition") object.status = { conditions: [condition("Established")] };
+    // A Job stuck runs on, its pod not yet ended, until the test says it completed.
+    if (object.kind === "Job" && stuck.has(name)) {
+      object.status = { active: 1 };
+      return;
+    }
     if (object.kind === "Job") {
       const failed = failing.has(name);
       object.status = { conditions: [failed ? { ...condition("Failed", "BackoffLimitExceeded"), message: "Job has reached the specified backoff limit" } : condition("Complete")] };
