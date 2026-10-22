@@ -194,8 +194,6 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
   };
   const commandPolicy = createCommandEventPolicy({
     persistence,
-    chatId,
-    messageId,
     onBlocked: (reason) => Effect.asVoid(Deferred.fail(stopped, new GuardrailStopped({ reason }))),
   });
 
@@ -222,7 +220,7 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
         }
         if (event.item.type === "command_execution") {
           const command = event.item.command ?? "";
-          const policyResult = yield* commandPolicy.inspectCommand({ command, sessionId });
+          const policyResult = yield* commandPolicy.inspectCommand(command);
           if (policyResult.blocked) {
             break;
           }

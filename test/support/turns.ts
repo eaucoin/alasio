@@ -101,7 +101,7 @@ export function turnsStub(turns: Partial<Turns["Service"]>): Turns["Service"] {
     startNewSession: () => unused("startNewSession"),
     reconcilePersistentState: unused("reconcilePersistentState"),
     flushCompletedResponses: unused("flushCompletedResponses"),
-    recoverInterruptedTurns: unused("recoverInterruptedTurns"),
+    reattachLeftTurns: unused("reattachLeftTurns"),
     resumePendingPrompts: unused("resumePendingPrompts"),
     ...turns,
   });

@@ -3,9 +3,9 @@ import { test } from "node:test";
 
 import { isBlockedDbCommand } from "../src/policy/db-guardrail.ts";
 import { extractShellCommands } from "../src/policy/embedded-shell.ts";
-import { looksLikeSelfRestartCommand } from "../src/policy/restart-command.ts";
 
-const restarts = (code: string) => extractShellCommands(code).some((command) => looksLikeSelfRestartCommand(command, { env: {} }));
+/** Whether `code` runs a rollout restart of alasio's Deployment, as a command it recovers. */
+const restarts = (code: string) => extractShellCommands(code).some((command) => /^kubectl (?:-n alasio )?rollout restart (?:deployment|deploy)\/alasio$/u.test(command.trim()));
 const blocked = (code: string) =>extractShellCommands(code).some(isBlockedDbCommand);
 
 test("shell commands are recovered from Bun shell, spawn and exec calls and bare command lines", () => {

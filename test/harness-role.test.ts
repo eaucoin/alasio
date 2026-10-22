@@ -73,7 +73,6 @@ function writingHarness(own: OwnTurns[]): Harness {
         yield* turn.updateSessionUsage("thread-1", { cacheReadInputTokens: 12 });
         yield* turn.setWaiting("workflow 7");
         yield* turn.setWaiting(null);
-        yield* turn.recordRestartEvent({ cause: "self_induced", channel: params.chatId, thread_ts: params.messageId, session_id: "thread-1", command: "kubectl rollout restart deployment/alasio" });
         yield* turn.markPendingResponseComplete(pendingResponseId);
         yield* params.onTransportCompleted?.({ sessionId: "thread-1", turnId: "turn-1" }) ?? Effect.void;
         const result: TurnResult = { blockSequence: [], sessionId: "thread-1", pendingResponseId, interrupted: false, responseCompleted: true };
@@ -149,7 +148,6 @@ test("a turn run through the harness host as its own role writes all a turn writ
       assert.equal((yield* alasio.getConversation(conversationId))?.codex_session_id, "thread-1");
       const progress = yield* alasio.getPromptJob(job.id);
       assert.ok(progress?.upstream_dispatched_at && progress.upstream_started_at && progress.upstream_completed_at);
-      assert.equal((yield* alasio.getRestartEvent(conversationId))?.cause, "self_induced");
       // A turn of its harness's own after it, claimed and ended by the host.
       yield* alasio.endTurn(conversationId, epoch, "completed");
       const [ownTurns] = own;

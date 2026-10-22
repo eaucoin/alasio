@@ -19,7 +19,6 @@ export const forgetfulPersistence: TurnPersistence = {
   markPendingAsPosted: () => Effect.void,
   updateSessionUsage: () => Effect.void,
   setWaiting: () => Effect.void,
-  recordRestartEvent: () => Effect.void,
 };
 
 /** The turns a harness starts on its own, each claimed onto `persistence`, its end recorded in `ended` where given, under no hold of a fork's unless `held` says. */

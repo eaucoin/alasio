@@ -1,4 +1,4 @@
-import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, FiberSet, HashMap, Layer, Option, PubSub, Ref, Schema, Semaphore } from "effect";
+import { Cause, Clock, Context, Deferred, Duration, Effect, Exit, Fiber, FiberSet, HashMap, Layer, Option, PubSub, Ref, Schedule, Schema, Semaphore } from "effect";
 
 import {
   type AttachedTurn,
@@ -8,6 +8,7 @@ import {
   NoWorkspaceMounted,
   harnessDisplayName,
   harnessLabelOf,
+  type TurnResult,
 } from "../harness/index.ts";
 import { HarnessHost } from "../harness/host.ts";
 import { HarnessEvents } from "../harness/host-events.ts";
@@ -18,7 +19,7 @@ import { type Mount, mountOf } from "../persistence/conversation-repository.ts";
 import type { PromptJob, PromptJobState } from "../persistence/prompt-job-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import type { Turn, TurnOutcome } from "../persistence/turn-repository.ts";
-import { Store, type TurnFenced } from "../persistence/store.ts";
+import { LOST_PREFIX, Store, type TurnFenced } from "../persistence/store.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import type { ChatId } from "../telegram/client.ts";
 import { ReceivedFileError } from "../telegram/files.ts";
@@ -26,15 +27,24 @@ import { Outbox } from "../telegram/outbox.ts";
 import type { HarnessPanels } from "../harness/host.ts";
 import { Panels } from "../harness/panels.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
+import { buildLostHarnessText, lostStatusText } from "../operator/lost-prompt.ts";
 import { truncateText } from "../operator/text.ts";
 import { makeReplyMedia } from "./reply-media.ts";
-import { recoverInterruptedTurns } from "./restart-recovery.ts";
 import { makeStatusReporter, type StatusAhead } from "./status-reporter.ts";
 import { withLogScope } from "../shared/log.ts";
 import { currentTraceparent, meter, withAlasioSpan } from "../telemetry/index.ts";
 
 /** The scope these lines have always been logged in, kept for whatever reads alasio's logs. */
 const LOG_SCOPE = "codex-turn-controller";
+
+/**
+ * How long a turn's pod is asked for it again (reattach), each try REATTACH_EVERY after the
+ * last, before the turn is taken as lost with its harness instance: longer than the sandbox
+ * gateway takes to let go of a pod it reaches no more, so a pod that answers again in that
+ * time is attached to, and one that does not is let go of, its loss told of, by then.
+ */
+const REATTACH_WITHIN = Duration.minutes(12);
+const REATTACH_EVERY = Duration.seconds(5);
 
 const turnDuration = meter.createHistogram("alasio.turn.duration", {
   description: "Time from a turn starting to its reply being queued for delivery, by harness and outcome",
@@ -150,8 +160,12 @@ export class Turns extends Context.Service<Turns, {
   readonly reconcilePersistentState: Effect.Effect<void, StoreError>;
   /** Queues every completed response that was never delivered. */
   readonly flushCompletedResponses: Effect.Effect<void, StoreError>;
-  /** Continues, or lets go of, the turns the last alasio was running when it stopped. */
-  readonly recoverInterruptedTurns: Effect.Effect<void, StoreError>;
+  /**
+   * Attaches again to the turns the last alasio left running on their conversations' pods as
+   * it stopped, each in the background, to take its result as the turn would have
+   * (reattach), or, its pod lost meanwhile, to run it again.
+   */
+  readonly reattachLeftTurns: Effect.Effect<void, StoreError>;
   /**
    * Schedules every conversation with prompt jobs waiting: to run, or, held for the
    * operator's choice, to be asked about again.
@@ -204,9 +218,9 @@ const makeTurns = Effect.fnUntraced(function*() {
    * One turn through `harness` in the mount's folder, from its status message to its
    * reply: its outcome, and whether its response completed, run while its conversation is
    * held busy for it (runSessionTurn). Every write of the turn's, and its end, holds only
-   * under the epoch it claimed. Interrupted, as alasio stops, the turn is left for after the
-   * restart: the restart recorded for it to continue then, or its completed response for
-   * delivery, and its status message saying so.
+   * under the epoch it claimed. Interrupted, as alasio stops, the turn is left running on its
+   * pod, for the next alasio to attach to (reattach), or its completed response for delivery,
+   * and its status message saying so; its pod not reached, it is attached to again.
    */
   const runTurn = Effect.fnUntraced(function*(
     harness: HarnessPanels,
@@ -240,7 +254,11 @@ const makeTurns = Effect.fnUntraced(function*() {
       let responseCompleted: boolean | null = null;
       const posted = yield* status.statusUpdates({ chatId, conversationId, epoch, harnessName: harness.displayName, ahead });
 
-      /** Leaves the turn, as alasio stops, for after the restart. */
+      /**
+       * Leaves the turn, as alasio stops, running on its conversation's pod, for alasio to
+       * attach to once it starts again (reattach); its response, where it was complete, for
+       * delivery then.
+       */
       const leaveForRestart = Effect.gen(function*() {
         const turn = yield* store.getActiveTurn(conversationId);
         if (!turn || Number(turn.epoch) !== epoch) {
@@ -254,9 +272,8 @@ const makeTurns = Effect.fnUntraced(function*() {
           yield* store.endTurn(conversationId, epoch, "completed");
           yield* Effect.logInfo(`Leaving completed response ${pendingResponseId} for post-restart delivery`);
         } else {
-          yield* store.recordExternalRestartEvent(conversationId, epoch);
           yield* store.setTurnStatus(conversationId, epoch, "interrupted");
-          yield* Effect.logInfo(`Leaving active turn ${conversationId} for post-restart recovery because the service is stopping`);
+          yield* Effect.logInfo(`Leaving turn ${conversationId} running on its harness's pod, for the next alasio to attach to`);
         }
         yield* status.restarting(chatId, yield* Deferred.await(posted), harness.displayName);
       }).pipe(
@@ -296,13 +313,14 @@ const makeTurns = Effect.fnUntraced(function*() {
           yield* Effect.annotateCurrentSpan("alasio.session.id", newSessionId);
         }
         if (interrupted) {
-          yield* status.finishWithoutResponse({ chatId, pendingResponseId, status: shown, harnessName: harness.displayName });
+          yield* status.finishWithoutResponse({ conversationId, chatId, pendingResponseId, status: shown, harnessName: harness.displayName });
           yield* tellNotice;
           yield* letGo("interrupted");
           return { outcome: "interrupted", completed: false } as const;
         }
         if (!responseCompleted) {
           yield* status.finishWithoutResponse({
+            conversationId,
             chatId,
             pendingResponseId,
             status: shown,
@@ -314,7 +332,7 @@ const makeTurns = Effect.fnUntraced(function*() {
         }
         // The response is complete in the store, and delivered from there if its handoff fails.
         yield* Effect.suspend(() =>
-          status.postResponse({ chatId, response: finalResponseToMarkdown(blockSequence), pendingResponseId, status: shown, harnessName: harness.displayName })
+          status.postResponse({ conversationId, chatId, response: finalResponseToMarkdown(blockSequence), pendingResponseId, status: shown, harnessName: harness.displayName })
         ).pipe(
           Effect.catch((error) => Effect.logError(`Final response handoff deferred for ${conversationId}: ${error.message}`)),
           Effect.catchDefect((defect) => Effect.logError(`Final response handoff deferred for ${conversationId}: ${errorText(defect)}`)),
@@ -325,12 +343,20 @@ const makeTurns = Effect.fnUntraced(function*() {
       }).pipe(
         Effect.onInterrupt(() => leaveForRestart),
         // A turn that failed lets go of its conversation, its status message saying so; one
-        // interrupted is left for the restart.
+        // interrupted is left for the restart; one whose pod was not reached is left to
+        // attach to again (reattach), as its pod may run it on, or have been lost under it.
         Effect.onError((cause) =>
           Cause.hasInterruptsOnly(cause)
             ? Effect.void
+            : Option.exists(Cause.findErrorOption(cause), (error) => error._tag === "HarnessHostError")
+            ? store.setTurnStatus(conversationId, epoch, "interrupted").pipe(
+              Effect.andThen(Effect.logWarning(`${conversationId}'s turn lost its harness's pod (${Option.match(Cause.findErrorOption(cause), { onNone: () => "", onSome: (error) => error.message })}): attaching to it again`)),
+              Effect.andThen(Effect.flatMap(Deferred.await(posted), (shown) => status.unreached(chatId, shown, harness.displayName))),
+              Effect.andThen(Effect.flatMap(store.getActiveTurn(conversationId), (turn) => (turn && Number(turn.epoch) === epoch ? Effect.asVoid(FiberSet.run(workers, reattach(turn))) : Effect.void))),
+              Effect.catch((error) => Effect.logError(`Could not leave turn ${conversationId} to attach to again: ${error.message}`)),
+            )
             : Deferred.await(posted).pipe(
-              Effect.flatMap((shown) => status.finishWithoutResponse({ chatId, pendingResponseId: null, status: shown, statusText: `${harness.displayName} hit an error.` })),
+              Effect.flatMap((shown) => status.finishWithoutResponse({ conversationId, chatId, pendingResponseId: null, status: shown, statusText: `${harness.displayName} hit an error.` })),
               Effect.andThen(letGo("failed")),
               Effect.catch((error) => Effect.logError(`Could not end failed turn ${conversationId}: ${error.message}`)),
             )
@@ -571,6 +597,85 @@ const makeTurns = Effect.fnUntraced(function*() {
       )
       : Effect.void;
 
+  /**
+   * The turn `turn` attached to again on its conversation's pod, as an alasio that stopped
+   * left it, or one whose pod its drive did not reach: its result taken as the turn would
+   * have taken it (settleAttached); or, its pod knowing nothing of it, or not reached for
+   * REATTACH_WITHIN, taken as lost with its harness instance, and run again (recoverLost).
+   * Of that and a recovery staged by the binding's loss, told of on the events topic, the
+   * first to end the turn alone acts, as each ends it under its epoch first. One that fails
+   * otherwise, as its turn failed on its host, or its answer is refused (as of a session another
+   * conversation has), ends failed, its status message saying so, rather than stay holding its
+   * conversation. Its conversation's prompts then run.
+   */
+  const reattach = (turn: Turn): Effect.Effect<void> => {
+    const conversationId = turn.thread_key;
+    const epoch = Number(turn.epoch);
+    return host.attach({ conversationId, epoch, messageId: turn.thread_ts }).pipe(
+      Effect.retry({ while: (error) => error._tag === "HarnessHostError", schedule: Schedule.max([Schedule.spaced(REATTACH_EVERY), Schedule.during(REATTACH_WITHIN)]) }),
+      Effect.flatMap(Option.match({
+        onNone: () => recoverLost(turn, `${LOST_PREFIX}${epoch}`, "its harness instance knew nothing of it"),
+        onSome: (result) => settleAttached(turn, result),
+      })),
+      Effect.catchTag("HarnessHostError", (error) => recoverLost(turn, `${LOST_PREFIX}${epoch}`, `its harness was not reached within ${Duration.format(REATTACH_WITHIN)}: ${error.message}`)),
+      Effect.catch((error) => failAttached(turn, error.message)),
+      Effect.ensuring(schedule(conversationId)),
+      withLogScope(LOG_SCOPE),
+    );
+  };
+
+  /** The result `result` of the turn `turn`, taken as its alasio would have, once the turn is ended under its epoch: nothing, where something else let go of it first. */
+  const settleAttached = Effect.fnUntraced(function*(turn: Turn, result: TurnResult) {
+    const conversationId = turn.thread_key;
+    const epoch = Number(turn.epoch);
+    const harnessName = harnessDisplayName(turn.harness);
+    if (result.sessionId && !turn.session_id) {
+      yield* store.turnPersistence(conversationId, epoch).updateActiveTurnSessionId(result.sessionId).pipe(Effect.catchTag("TurnFenced", () => Effect.void));
+    }
+    const outcome: TurnOutcome = result.interrupted ? "interrupted" : result.responseCompleted ? "completed" : "incomplete";
+    if (!(yield* store.endTurn(conversationId, epoch, outcome))) {
+      return yield* Effect.logInfo(`${conversationId}'s turn attached to again had been let go of already`);
+    }
+    yield* Effect.logInfo(`${conversationId}'s turn attached to again ended ${outcome}`);
+    if (outcome === "completed") {
+      yield* editLeftStatus(turn, `${harnessName} finished this turn as alasio restarted.`);
+      // Its response, which its pod completed, delivered as every completed one is.
+      yield* flushCompletedResponses;
+    } else {
+      yield* store.markAnswerPosted(conversationId, result.pendingResponseId);
+      yield* editLeftStatus(turn, outcome === "interrupted" ? `${harnessName} stopped.` : notCompleted(harnessName, result.blockSequence));
+    }
+    if (result.notice) {
+      yield* outbox.enqueueNotice({ conversationId, chatId: turn.channel, text: result.notice }).pipe(
+        Effect.asVoid,
+        Effect.catch((error) => Effect.logWarning(`Could not tell ${conversationId} of its turn: ${error.message}`)),
+      );
+    }
+  });
+
+  /** The turn `turn`, attached to again, ended failed for `why` under its epoch, its status message saying so: nothing, where something else let go of it first. */
+  const failAttached = (turn: Turn, why: string): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      yield* Effect.logError(`${turn.thread_key}'s turn attached to again failed: ${why}`);
+      if (yield* store.endTurn(turn.thread_key, Number(turn.epoch), "failed")) yield* editLeftStatus(turn, `${harnessDisplayName(turn.harness)} hit an error.`);
+    }).pipe(Effect.catch((error) => Effect.logError(`Could not end ${turn.thread_key}'s turn attached to again: ${error.message}`)));
+
+  /** The turn `turn` taken as lost with its harness instance, for `why`: run again, as `messageId`, once (Store.stageLostRecovery), its status message saying so; its reply delivered, where it was complete. */
+  const recoverLost = (turn: Turn, messageId: string, why: string): Effect.Effect<void, StoreError> =>
+    store.stageLostRecovery({
+      conversationId: turn.thread_key,
+      epoch: Number(turn.epoch),
+      binding: null,
+      messageId,
+      prompt: (lost) => buildLostHarnessText(lost.harness),
+      said: (outcome, lost) => lostStatusText(outcome, lost.harness),
+    }).pipe(
+      Effect.flatMap((recovery) => (recovery.outcome === "none" ? Effect.void : Effect.andThen(
+        Effect.logWarning(`${turn.thread_key}'s turn was lost with its harness instance (${why}): ${recovery.outcome}`),
+        recovery.outcome === "completed" ? flushCompletedResponses : Effect.void,
+      ))),
+    );
+
   // What a harness running on between prompts does on its own, as its host tells it: a
   // reply of its own, delivered; its letting go of the conversation, which may run what
   // waits on it.
@@ -686,7 +791,7 @@ const makeTurns = Effect.fnUntraced(function*() {
       yield* Effect.forEach(yield* store.holdUnsteeredPromptJobsAfterRestart, askAboutUnsteered, { discard: true });
     }),
     flushCompletedResponses,
-    recoverInterruptedTurns: recoverInterruptedTurns(store, editLeftStatus),
+    reattachLeftTurns: Effect.flatMap(store.getActiveTurns, (turns) => Effect.forEach(turns, (turn) => FiberSet.run(workers, reattach(turn)), { discard: true })),
     resumePendingPrompts: Effect.flatMap(store.listWaitingPromptConversations, (conversationIds) => Effect.forEach(conversationIds, schedule, { discard: true })),
   });
 }, withLogScope(LOG_SCOPE));

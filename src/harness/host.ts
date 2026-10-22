@@ -116,6 +116,13 @@ export interface HarnessStatus {
   readonly idleSince: number | null;
 }
 
+/**
+ * The binding of the conversation's harness a host serves, as a pool's pod knows it from its
+ * binding's token (./program.ts): the binding a turn its harness starts on its own runs on, which
+ * a loss of another, as of a pod before it that lingers, never ends.
+ */
+export class HostBinding extends Context.Service<HostBinding, { readonly binding: string }>()("alasio/harness/HostBinding") {}
+
 export class HarnessHost extends Context.Service<HarnessHost, {
   /**
    * Holds the conversation for a turn the control plane is about to start, until the scope
@@ -195,6 +202,7 @@ export class HarnessHost extends Context.Service<HarnessHost, {
     const store = yield* Store;
     const receivedFiles = yield* ReceivedFiles;
     const { tell } = yield* HostEvents;
+    const hostBinding = Option.getOrNull(yield* Effect.serviceOption(HostBinding));
     const scope = yield* Effect.scope;
     /**
      * Each conversation's latest turn, by the epoch it was claimed under and the message it
@@ -218,7 +226,8 @@ export class HarnessHost extends Context.Service<HarnessHost, {
     const ownTurnsOf = (conversationId: string, chatId: string, harness: HarnessName): OwnTurns => ({
       claim: (messageId, sessionId) =>
         Effect.map(
-          store.claimTurn({ conversationId, chatId, messageId, sessionId, harness, prompt: null }),
+          // On the host's own binding, as a pool's pod knows it, the one whose loss takes the turn with it.
+          store.claimTurn({ conversationId, chatId, messageId, sessionId, harness, prompt: null, binding: hostBinding?.binding ?? null }),
           (epoch): OwnTurn => ({
             persistence: store.turnPersistence(conversationId, epoch),
             end: (outcome) => Effect.asVoid(store.endTurn(conversationId, epoch, outcome)),

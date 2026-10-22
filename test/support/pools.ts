@@ -203,6 +203,14 @@ export class Pools extends Context.Service<Pools, {
   readonly stateDir: (conversationId: string) => string | undefined;
   /** Tells of what the conversation's harness did on its own, as its pod tells the front and the gateway relays it, once each time. */
   readonly tell: (kind: "harness.idle" | "harness.background-response", conversationId: string) => Effect.Effect<void>;
+  /**
+   * Ends the conversation's pod bound now, as a node lost with it, or its pod deleted, ends one,
+   * what it runs with it, and tells of its binding let go of so, as the gateway does
+   * (harness.released, of `reason`, deleted or broken; or harness.lost): its binding's.
+   */
+  readonly lose: (conversationId: string, reason: "deleted" | "broken" | "lost") => Effect.Effect<string>;
+  /** Ends the conversation's pod bound now as lose does, telling of it only as `tell` runs, as an event heard late is: its binding, and the telling. */
+  readonly loseUntold: (conversationId: string, reason: "deleted" | "broken" | "lost") => Effect.Effect<{ readonly binding: string; readonly tell: Effect.Effect<void> }>;
 }>()("alasio/test/Pools") {}
 
 /** The stand-in's pools: the front's address and the key alasio's calls to it are made with, the environment's events topic its pods' events are relayed onto, and what it says of its pods. */
@@ -342,6 +350,26 @@ export const standInPools = ({ database, standIns = {}, branch }: StandInPoolsOp
       Effect.map((served) => ({ ...served, url: `http://127.0.0.1:${served.port}` })),
     );
 
+    /** The conversation's pod bound now ended, and the telling of its binding let go of so, as Pools.loseUntold says. */
+    const loseUntold = (conversationId: string, reason: "deleted" | "broken" | "lost") =>
+      Effect.gen(function*() {
+        const key = [...pods.keys()].find((each) => conversationOfHarnessKey(each) === conversationId);
+        const pod = key === undefined ? undefined : pods.get(key);
+        if (key === undefined || !pod?.bound) return yield* Effect.die(new Error(`${conversationId} has no pod bound`));
+        const { binding, scope } = pod.bound;
+        yield* Scope.close(scope, Exit.void);
+        pods.delete(key);
+        const subject = { kind: "conversation", key: conversationId } as const;
+        const tell = Effect.map(Clock.currentTimeMillis, (at) =>
+          void events.write(eventRecord(
+            reason === "lost"
+              ? { kind: "harness.lost", environment: ENVIRONMENT, source: "sandbox-gateway", subject, binding, pod: pod.name, reason: "its pod went while it was bound" }
+              : { kind: "harness.released", environment: ENVIRONMENT, source: "sandbox-gateway", subject, binding, reason },
+            at,
+          ).value));
+        return { binding, tell };
+      });
+
     /** The conversations' harnesses' pods, by their conversations, of all the stand-in binds. */
     const harnessPods = () =>
       [...pods].flatMap(([key, pod]) => {
@@ -355,6 +383,8 @@ export const standInPools = ({ database, standIns = {}, branch }: StandInPoolsOp
       stateDir: (conversationId) => harnessPods().find(([conversation]) => conversation === conversationId)?.[1].bound?.stateDir,
       tell: (kind, conversationId) =>
         Effect.map(Clock.currentTimeMillis, (at) => void events.write(eventRecord({ kind, environment: ENVIRONMENT, source: "harness", subject: { kind: "conversation", key: conversationId } }, at).value)),
+      lose: (conversationId, reason) => Effect.flatMap(loseUntold(conversationId, reason), ({ binding, tell }) => Effect.as(tell, binding)),
+      loseUntold: (conversationId, reason) => loseUntold(conversationId, reason),
     });
     return { url: front.url, callerKey, events, pools };
   });

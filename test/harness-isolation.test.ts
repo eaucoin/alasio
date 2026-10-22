@@ -55,7 +55,6 @@ const KEYS: ReadonlyArray<readonly [table: string, column: string, of: (kept: Ke
   ["state.responses", "thread_key", (kept) => kept.id],
   ["state.response_blocks", "response_id", (kept) => kept.response],
   ["state.session_usage", "session_id", (kept) => kept.codex],
-  ["state.restart_events", "thread_key", (kept) => kept.id],
   ["state.files", "conversation_id", (kept) => kept.id],
   ["state.conversation_holds", "conversation_id", (kept) => kept.id],
   ["state.prompt_jobs", "conversation_id", (kept) => kept.id],
@@ -78,7 +77,6 @@ const inserts = (kept: Kept, suffix: string): ReadonlyArray<readonly [statement:
   ["insert into state.responses (id, chat_id, message_id, thread_key) values ($1, '1', '1', $2)", [`response-${suffix}`, kept.id]],
   ["insert into state.response_blocks (response_id, block) values ($1, '{}')", [kept.response]],
   ["insert into state.session_usage (session_id, cache_read_input_tokens) values ($1, 1) on conflict (session_id) do update set cache_read_input_tokens = 2", [kept.codex]],
-  ["insert into state.restart_events (thread_key, cause, channel, thread_ts) values ($1, 'harness', '1', '1') on conflict (thread_key) do update set cause = 'again'", [kept.id]],
   ["insert into claude_sessions.entries (project_key, session_id, entry, mtime) values ('p', $1, '{}', 1)", [kept.claude]],
   ["insert into claude_sessions.summaries (project_key, session_id, mtime, data) values ($2, $1, 1, '{}')", [kept.claude, `p-${suffix}`]],
   ["insert into codex_sessions.rollouts (name, path, thread_id, rollout_id, size, head_digest, modified_ms) values ($1, 'r', $2, $2, 0, 'd', 1)", [`rollout-${suffix}`, kept.codex]],
@@ -100,7 +98,6 @@ const changes = (kept: Kept): ReadonlyArray<readonly [statement: string, values:
   ["delete from codex_sessions.rollouts where thread_id = $1", [kept.codex]],
   ["delete from claude_sessions.entries where session_id = $1", [kept.claude]],
   ["delete from claude_sessions.summaries where session_id = $1", [kept.claude]],
-  ["delete from state.restart_events where thread_key = $1", [kept.id]],
 ];
 
 /** A conversation with a row of each kind the role reaches, as alasio writes them, its sessions named `name`. */
@@ -127,7 +124,6 @@ const keep = (alasio: StoreService["Service"], owner: pg.Pool, sessions: NeonSes
     const response = yield* turn.createPendingResponse(chatId, "10", kept.codex);
     yield* turn.appendBlocksToPending(response, [{ type: "text", content: "Fixed." }]);
     yield* turn.updateSessionUsage(kept.codex, { cacheReadInputTokens: 12 });
-    yield* turn.recordRestartEvent({ cause: "self_induced", channel: chatId, thread_ts: "10", session_id: kept.codex });
     assert.ok(yield* alasio.holdConversations([id], "forking", 60_000));
     yield* Effect.promise(async () => {
       await owner.query("update state.conversations set claude_session_id = $2 where id = $1", [id, kept.claude]);

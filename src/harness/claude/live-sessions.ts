@@ -70,7 +70,6 @@ import type { TurnOutcome } from "../../persistence/turn-repository.ts";
 import { type FolderBaymaOutcome, type FolderBaymaScope, type NoFolderWorkspaces, noFolderBayma } from "../../mcp/bayma.ts";
 import { isBlockedDbCommand } from "../../policy/db-guardrail.ts";
 import { extractShellCommands } from "../../policy/embedded-shell.ts";
-import { looksLikeSelfRestartCommand } from "../../policy/restart-command.ts";
 import { detectWorkflowWait } from "../../policy/workflow-wait.ts";
 import { withLogScope } from "../../shared/log.ts";
 import type { SessionError } from "../../sandbox/index.ts";
@@ -441,7 +440,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         const pendingResponseId = yield* own.persistence.createPendingResponse(host.chatId, messageId, host.sessionId);
         cliTurn.projection = { ...cliTurn.projection, pendingResponseId };
         yield* storeBlocks(cliTurn.projection, own.persistence);
-        cliTurn.claim = { own, commandPolicy: createCommandEventPolicy({ persistence: own.persistence, chatId: host.chatId, messageId }) };
+        cliTurn.claim = { own, commandPolicy: createCommandEventPolicy({ persistence: own.persistence }) };
       }).pipe(
         Effect.tapError(() =>
           own.end("failed").pipe(Effect.catch((error) => Effect.logWarning(`could not end a CLI turn's claim thread=${host.threadKey}: ${error.message}`)))
@@ -767,8 +766,8 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   });
 
   /**
-   * Bash is disabled, so shell work arrives as code sent to bayma exec; restart
-   * provenance and the database guardrail inspect the commands embedded in it.
+   * Bash is disabled, so shell work arrives as code sent to bayma exec; workflow waits
+   * and the database guardrail inspect the commands embedded in it.
    */
   const execHook = Effect.fnUntraced(function*(host: ClaudeHost, input: HookInput): Effect.fn.Return<HookJSONOutput> {
     if (input?.hook_event_name !== "PreToolUse") {
@@ -798,17 +797,11 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         },
       };
     }
-    const policy = host.current?.commandPolicy ?? host.cliTurn?.claim?.commandPolicy ?? createCommandEventPolicy({
-      persistence: host.persistence,
-      chatId: host.chatId,
-      messageId: host.messageId,
-    });
-    // One call records at most one restart event, so inspect the most telling command.
-    const primary = commands.find((candidate) => looksLikeSelfRestartCommand(candidate))
-      ?? commands.find((candidate) => detectWorkflowWait(candidate))
-      ?? firstCommand;
+    const policy = host.current?.commandPolicy ?? host.cliTurn?.claim?.commandPolicy ?? createCommandEventPolicy({ persistence: host.persistence });
+    // One call records at most one wait, so inspect the most telling command.
+    const primary = commands.find((candidate) => detectWorkflowWait(candidate)) ?? firstCommand;
     // The command runs whether or not what it sets off could be recorded.
-    yield* policy.inspectCommand({ command: primary, sessionId: host.sessionId }).pipe(
+    yield* policy.inspectCommand(primary).pipe(
       Effect.catch((error) => Effect.logWarning(`could not record what a command sets off thread=${host.threadKey}: ${error.message}`)),
     );
     return {};
@@ -992,11 +985,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       blockedGuardrailCommand: null,
       unansweredGrace: undefined,
       earlySteers: [],
-      commandPolicy: createCommandEventPolicy({
-        persistence,
-        chatId,
-        messageId,
-      }),
+      commandPolicy: createCommandEventPolicy({ persistence }),
       done,
       registration: yield* Scope.make(),
     };

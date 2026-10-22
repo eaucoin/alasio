@@ -35,7 +35,6 @@ import { type BaymaMcpServer, type FolderBaymaOutcome, type FolderBaymaScope, ty
 import type { ModelChoice } from "../src/persistence/conversation-repository.ts";
 import type { ResponseBlock as StoredBlock } from "../src/persistence/response-repository.ts";
 import { StoreError } from "../src/persistence/sql.ts";
-import type { NewRestartEvent } from "../src/persistence/restart-repository.ts";
 import type { SessionUsage } from "../src/persistence/usage-repository.ts";
 import {
   assistantMessage,
@@ -66,7 +65,6 @@ interface RecordingPersistence extends TurnPersistence {
     readonly posted: string[];
     readonly pending: string[];
     readonly usage: [string | null | undefined, SessionUsage | null | undefined][];
-    readonly restarts: Omit<NewRestartEvent, "thread_key">[];
     readonly waits: (string | null)[];
   };
 }
@@ -80,7 +78,6 @@ function createPersistence(): RecordingPersistence {
     posted: [],
     pending: [],
     usage: [],
-    restarts: [],
     waits: [],
   };
   const record = (write: () => void) => Effect.sync(write);
@@ -100,7 +97,6 @@ function createPersistence(): RecordingPersistence {
     markPendingResponseComplete: (id) => record(() => state.completed.push(id)),
     updateSessionUsage: (sessionId, turnUsage) => record(() => state.usage.push([sessionId, turnUsage])),
     setWaiting: (waitingOn) => record(() => state.waits.push(waitingOn)),
-    recordRestartEvent: (event) => record(() => state.restarts.push(event)),
   };
 }
 
@@ -593,31 +589,6 @@ test("Bash, Monitor, Grep and Glob are removed and bayma exec code passes the da
   assert.deepEqual(allowed, {});
   assert.equal(result.responseCompleted, true);
   assert.equal(finalResponseToMarkdown(result.blockSequence), "Skipped the drop.");
-});
-
-test("a restart through a Bun shell in bayma exec records self-induced provenance once", async () => {
-  const persistence = createPersistence();
-  const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => fakeQuery((async function* run(): AsyncGenerator<SDKMessage, void> {
-    const first = await readPrompt(prompt[Symbol.asyncIterator]());
-    yield initMessage("s-5");
-    const hook = options.hooks?.PreToolUse?.[0]?.hooks[0];
-    assert.ok(hook, "the bayma exec hook");
-    await hook(execHookInput("await $`kubectl rollout restart deployment/alasio`", "t1"), "t1", { signal: new AbortController().signal });
-    yield successResult({ result: "Restarting.", session_id: "s-5", user_message_uuids: [first.uuid] });
-  })());
-  await runClaudeTurn({
-    prompt: "restart yourself",
-    resumeSession: null,
-    threadKey: "telegram:5",
-    chatId: "5",
-    messageId: "5",
-    workingDirectory: "/work",
-    persistence,
-    sessions: quietSessions,
-    queryFactory,
-  });
-  assert.equal(persistence.state.restarts.length, 1);
-  assert.equal(persistence.state.restarts[0]?.cause, "self_induced");
 });
 
 test("Claude session api maps SDK transcripts to alasio session and rewind shapes", async () => {

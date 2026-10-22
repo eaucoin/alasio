@@ -12,7 +12,6 @@ import { AppServerRequestTimeout } from "../src/codex/app-server/rpc-client.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { makeAppServerThreads } from "../src/codex/app-server/thread-client.ts";
 import { finalResponseToMarkdown } from "../src/codex/response-markdown.ts";
-import { recoverInterruptedTurns } from "../src/codex/restart-recovery.ts";
 import { makeStatusReporter, type StatusReporter } from "../src/codex/status-reporter.ts";
 import { Turns } from "../src/codex/turns.ts";
 import { HARNESS_ROLE } from "../neon/control/secrets.ts";
@@ -140,7 +139,7 @@ test("missing phased final answer does not enqueue fabricated completion text", 
     return "outbox-1";
   }));
 
-  await run(reporter.postResponse({ chatId: "123", response: "", pendingResponseId, status: null }));
+  await run(reporter.postResponse({ conversationId: CONVERSATION, chatId: "123", response: "", pendingResponseId, status: null }));
 
   assert.deepEqual(enqueued, []);
   // Posted as it is, with nothing to deliver.
@@ -360,57 +359,83 @@ test("restart reconciliation runs again only the prompts never sent to the agent
   assert.equal((await run(store.getPromptJob(jobs.get("2") ?? "")))?.state, "interrupted");
 });
 
-test("self-restart recovery stages a distinct durable continuation", async () => {
+test("a turn whose harness instance was lost is run again once, as a prompt of its own; one whose response was complete is delivered instead; a recovery lost again is let go of", async () => {
   const store = await codexConversation();
-  const original = await run(store.enqueuePromptJob({
-    conversationId: CONVERSATION,
-    chatId: "123",
-    messageId: "3334",
-    prompt: "Apply the change and restart.",
-  }));
+  const original = await run(store.enqueuePromptJob({ conversationId: CONVERSATION, chatId: "123", messageId: "3334", prompt: "Apply the change." }));
   await run(store.claimNextPromptJob(CONVERSATION));
   await run(store.markPromptJobUpstreamStarted(original.id, "session-1", "turn-1"));
-  const epoch = await run(store.claimTurn({
-    conversationId: CONVERSATION,
-    chatId: "123",
-    messageId: "3334",
-    sessionId: "session-1",
-    harness: CODEX_HARNESS,
-    prompt: original.prompt,
-  }));
+  const claim = (messageId: string) => run(store.claimTurn({ conversationId: CONVERSATION, chatId: "123", messageId, sessionId: "session-1", harness: CODEX_HARNESS, prompt: "go" }));
+  const epoch = await claim("3334");
   const writer = store.turnPersistence(CONVERSATION, epoch);
-  const partialResponseId = await run(writer.createPendingResponse("123", "3334", "session-1"));
-  await run(writer.updateActiveTurnPendingResponseId(partialResponseId));
-  await run(writer.appendBlocksToPending(partialResponseId, [{ type: "text", content: "Restarting now.", phase: "commentary" }]));
-  await run(writer.recordRestartEvent({ cause: "self_induced", channel: "123", thread_ts: "3334", session_id: "session-1" }));
+  const partial = await run(writer.createPendingResponse("123", "3334", "session-1"));
+  await run(writer.updateActiveTurnPendingResponseId(partial));
+  await run(writer.appendBlocksToPending(partial, [{ type: "text", content: "Applying.", phase: "commentary" }]));
+  await run(store.setTurnStatusMessage(CONVERSATION, epoch, await run(store.enqueueOutboxText({ chatId: "123", text: "Codex is working" }))));
+  // Its status message delivered, so an edit of it is the chat's next due.
+  const shown = await run(store.claimOutboxOf("123", "delivering", "1 minute"));
+  assert.ok(shown);
+  await run(store.markOutboxSent(shown));
+  const said: string[] = [];
+  const lost = (messageId: string, of: number | null = epoch, binding: string | null = null) =>
+    run(store.stageLostRecovery({ conversationId: CONVERSATION, epoch: of, binding, messageId, prompt: (turn) => `run ${turn.thread_ts} again`, said: (outcome) => (said.push(outcome), `said ${outcome}`) }));
 
-  await run(store.recoverPromptJobsAfterRestart);
-  await run(recoverInterruptedTurns(store, () => Effect.void));
-  await run(recoverInterruptedTurns(store, () => Effect.void));
-
-  assert.equal((await run(store.getPromptJob(original.id)))?.state, "interrupted");
+  // Of another epoch, none, nor of a binding it does not run on, as a loss heard after the conversation was bound anew is;
+  // of its own, once, however often it is staged, as by its binding's loss and its reattach both.
+  assert.deepEqual(await lost("lost:binding", epoch + 1), { outcome: "none" });
+  assert.equal(await run(store.setTurnBinding(CONVERSATION, epoch, "binding-now")), true);
+  assert.deepEqual(await lost("lost:binding", null, "binding-before"), { outcome: "none" });
+  assert.equal((await lost("lost:binding")).outcome, "staged");
+  assert.deepEqual(await lost(`lost:${epoch}`), { outcome: "none" });
+  assert.deepEqual(await lost("lost:binding", null), { outcome: "none" });
   assert.deepEqual(await run(store.getActiveTurns), []);
-  assert.equal(await run(store.getRestartEvent(CONVERSATION)), null);
-  // The partial response was let go of: completed, it is still never delivered.
-  await run(writer.markPendingResponseComplete(partialResponseId));
+  assert.equal((await run(store.getTurn(CONVERSATION)))?.outcome, "stopped");
+  // Its partial response let go of: completed by its pod after, it is still never delivered.
+  await run(writer.markPendingResponseComplete(partial));
   assert.deepEqual(await run(store.getCompletedResponsesPendingDelivery), []);
-  const continuation = await run(store.claimNextPromptJob(CONVERSATION));
-  assert.ok(continuation);
-  assert.notEqual(continuation.message_id, "3334");
-  assert.match(continuation.message_id, /^restart:3334:/);
-  assert.match(continuation.prompt, /SYSTEM RESTART EVENT/);
-  assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null, "staged twice, the continuation is queued once");
-  assert.equal((await run(store.getMount(CONVERSATION))).sessionId, "session-1");
+  const recovery = await run(store.claimNextPromptJob(CONVERSATION));
+  assert.deepEqual([recovery?.message_id, recovery?.prompt, recovery?.harness], ["lost:binding", "run 3334 again", CODEX_HARNESS]);
+  assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null, "staged twice, the recovery is queued once");
+  // Its status message says so.
+  assert.deepEqual(said, ["staged"]);
+  assert.ok((await run(store.getDueOutbox(10))).some((item) => item.text === "said staged"));
 
-  const completedResponseId = await run((await writerOf(store, CONVERSATION)).createPendingResponse("123", continuation.message_id, "session-1"));
-  await run((await writerOf(store, CONVERSATION)).appendBlocksToPending(completedResponseId, [
-    { type: "text", content: "Recovered commentary.", phase: "commentary" },
-    { type: "text", content: "Recovered final answer.", phase: "final_answer" },
-  ]));
-  await run((await writerOf(store, CONVERSATION)).markPendingResponseComplete(completedResponseId));
-  const reporter = reporterFor(store, (args) => store.enqueueOutboxText(args));
-  await run(reporter.flushCompletedResponses);
-  assert.deepEqual((await run(store.getDueOutbox(10))).map((item) => item.text), ["Recovered final answer."]);
+  // The recovery's own turn lost too: let go of, not run again; it has no status message, so the chat is told by one of its own.
+  await claim("lost:binding");
+  const pending = await run(store.getPendingOutboxCount);
+  assert.equal((await lost("lost:again", null)).outcome, "given-up");
+  assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null);
+  assert.deepEqual(said, ["staged", "given-up"]);
+  assert.equal(await run(store.getPendingOutboxCount), pending + 1);
+
+  // A turn whose pod completed its response before it went: delivered, not run again.
+  const finished = await claim("3335");
+  const done = store.turnPersistence(CONVERSATION, finished);
+  const response = await run(done.createPendingResponse("123", "3335", "session-1"));
+  await run(done.updateActiveTurnPendingResponseId(response));
+  await run(done.appendBlocksToPending(response, [{ type: "text", content: "Applied.", phase: "final_answer" }]));
+  await run(done.markPendingResponseComplete(response));
+  const told = await run(store.getPendingOutboxCount);
+  assert.equal((await lost("lost:other", null)).outcome, "completed");
+  // Its reply tells of it: nothing more is said.
+  assert.equal(await run(store.getPendingOutboxCount), told);
+  assert.equal((await run(store.getTurn(CONVERSATION)))?.outcome, "completed");
+  assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null);
+  assert.deepEqual((await run(store.getCompletedResponsesPendingDelivery)).map(({ id }) => id), [response]);
+});
+
+test("a turn its harness starts on its own runs on the binding its pod's host says is its own, and one alasio claims on none until alasio drives it on one", async () => {
+  const store = await codexConversation();
+  const claim = (messageId: string, binding?: string) => run(store.claimTurn({ conversationId: CONVERSATION, chatId: "123", messageId, harness: CODEX_HARNESS, binding }));
+  const binding = async () => (await run(store.getTurn(CONVERSATION)))?.binding;
+  const driven = await claim("1");
+  assert.equal(await binding(), null);
+  assert.equal(await run(store.setTurnBinding(CONVERSATION, driven, "binding-a")), true);
+  assert.equal(await binding(), "binding-a");
+  await run(store.endTurn(CONVERSATION, driven, "completed"));
+  await claim("own", "binding-before");
+  assert.equal(await binding(), "binding-before");
+  await claim("2");
+  assert.equal(await binding(), null);
 });
 
 test("stale turn completion cannot clear a replacement turn", async () => {

@@ -39,6 +39,16 @@ const decodeClaims = Schema.decodeUnknownOption(Schema.fromJsonString(TokenClaim
 
 const signatureOf = (secret: Buffer, claims: string): Buffer => createHmac("sha256", secret).update(claims).digest();
 
+/**
+ * What `token` says, its signature unchecked: of a token its holder was given where it trusts
+ * it to come from, as a pod reads its own binding's token from beside it (../harness/program.ts);
+ * null where it says nothing a token does. Never of a token a caller presents (verifyToken).
+ */
+export function claimsOf(token: string): TokenClaims | null {
+  const dot = token.indexOf(".");
+  return dot < 0 ? null : Option.getOrNull(decodeClaims(Buffer.from(token.slice(0, dot), "base64url").toString("utf8")));
+}
+
 /** A token of `claims`, signed with `secret`. */
 export function mintToken(secret: Buffer, claims: TokenClaims): string {
   const encoded = Buffer.from(JSON.stringify(claims)).toString("base64url");

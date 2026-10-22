@@ -55,7 +55,6 @@ test("a branch's state, as it first starts, keeps its conversations and loses wh
   await run(writer.markPendingResponseComplete(pending));
   await run(main.enqueueOutboxText({ chatId: 1001, text: "on its way" }));
   const [button] = await run(main.createCallbackActions(conversationId, [{ kind: "refresh" }]));
-  await run(writer.recordRestartEvent({ cause: "operator_induced", channel: "1001", thread_ts: "8", session_id: null }));
   await run(main.setCodexLogin('{"tokens":{"refresh_token":"once"}}'));
   // As a parent, a request of its branch's it answered; as a branch, an answer its own parent gave it.
   const answer: ForkAnswer = { outcome: "forked", netMode: "none", reason: null };
@@ -69,7 +68,6 @@ test("a branch's state, as it first starts, keeps its conversations and loses wh
   assert.deepEqual(await run(branch.getActiveTurns), []);
   assert.deepEqual(await run(branch.getCompletedResponsesPendingDelivery), []);
   assert.equal(await run(branch.getPendingOutboxCount), 0);
-  assert.equal(await run(branch.getRestartEvent(conversationId)), null);
   assert.equal(await run(branch.getCodexLogin), null);
   assert.equal(await run(branch.consumeCallbackAction(button ?? "")), null);
   assert.equal(await run(branch.getState("branch")), "try-codex");

@@ -8,10 +8,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { Deferred, Effect, Exit, Fiber, Layer, Option, Scope } from "effect";
+import { Context, Deferred, Effect, Exit, Fiber, Layer, Option, Scope } from "effect";
 import { TestClock } from "effect/testing";
 
 import { createCommandEventPolicy } from "../src/codex/command-event-policy.ts";
+import { buildLostHarnessText } from "../src/operator/lost-prompt.ts";
 import { makeStatusReporter } from "../src/codex/status-reporter.ts";
 import { Turns } from "../src/codex/turns.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
@@ -247,9 +248,10 @@ test("a prompt the last alasio was handing to a turn to steer as it stopped is a
   });
 });
 
-test("alasio starting lets go of the holds the last one left, and ends each turn it left running, its status message saying how", async () => {
+test("alasio starting lets go of the holds the last one left, and attaches again to each turn it left running: one its pod knows nothing of runs again, once, its status message saying so", async () => {
   const { store, conversationId } = await conversation();
-  const harness = scriptedHarness((params) => answered(params, "unused"));
+  const ran: string[] = [];
+  const harness = scriptedHarness((params) => (ran.push(params.prompt), answered(params, "Checked.")));
   // Left by an alasio killed mid-turn: its hold, and its turn, working, with its status message.
   await run(store.holdConversations([conversationId], "forking", 60_000));
   const epoch = await run(store.claimTurn({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "9", harness: CODEX_HARNESS }));
@@ -257,18 +259,16 @@ test("alasio starting lets go of the holds the last one left, and ends each turn
   const killed = store.turnPersistence(conversationId, epoch);
   const partial = await run(killed.createPendingResponse(String(CONVERSATION_CHAT), "9", null));
   await run(killed.updateActiveTurnPendingResponseId(partial));
-  await withTurns(store, harness, async (alasio, queued) => {
-    await alasio.runPromise(Effect.flatMap(Turns, (turns) => Effect.andThen(turns.reconcilePersistentState, turns.recoverInterruptedTurns)));
+  await withTurns(store, harness, async (alasio) => {
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => Effect.andThen(turns.reconcilePersistentState, turns.reattachLeftTurns)));
     assert.deepEqual(await holdsOf(store), []);
-    const ended = await run(store.getTurn(conversationId));
-    assert.deepEqual([ended?.state, ended?.status, ended?.outcome], ["completed", "ended", "stopped"]);
-    assert.deepEqual(queued.edits.map(({ edits, text }) => [edits, text]), [[
-      "status-of-the-killed",
-      "alasio stopped during this turn, and Codex did not finish it. Send the message again to run it.",
-    ]]);
-    // Its partial response is never delivered.
-    await run(killed.markPendingResponseComplete(partial));
-    assert.deepEqual(await run(store.getCompletedResponsesPendingDelivery), []);
+    // Its conversation's pod knows nothing of it, as one bound anew after its own was lost would not.
+    await until("the lost turn to run again", () => ran.length === 1);
+    assert.deepEqual(ran, [buildLostHarnessText(CODEX_HARNESS)]);
+    // Said as the recovery is staged, in its transaction.
+    assert.ok((await run(store.getDueOutbox(50))).some(({ text }) => text === "Codex's harness was lost during this turn; it runs again on another."));
+    // Its partial response let go of, never to be delivered; the recovery's own answer is.
+    assert.deepEqual((await run(store.getCompletedResponsesPendingDelivery)).map(({ id }) => id).filter((id) => id === partial), []);
   });
 });
 
@@ -432,16 +432,16 @@ test("a turn waiting to hold its conversation does so once the turn holding it l
 test("a turn's command that waits on a workflow run is recorded as its wait, the store failing to record it failing no turn, a turn superseded told so", async () => {
   const waits: (string | null)[] = [];
   const policyOn = (setWaiting: (waitingOn: string | null) => Effect.Effect<void, StoreError | TurnFenced>) =>
-    createCommandEventPolicy({ persistence: { ...forgetfulPersistence, setWaiting }, chatId: "41", messageId: "1" });
+    createCommandEventPolicy({ persistence: { ...forgetfulPersistence, setWaiting } });
   const recorded = policyOn((waitingOn) => Effect.sync(() => void waits.push(waitingOn)));
-  await Effect.runPromise(recorded.inspectCommand({ command: "gh run watch 12345678", sessionId: "s-1" }));
-  await Effect.runPromise(recorded.inspectCommand({ command: "gh run watch 12345678", sessionId: "s-1" }));
-  await Effect.runPromise(recorded.inspectCommand({ command: "ls", sessionId: "s-1" }));
+  await Effect.runPromise(recorded.inspectCommand("gh run watch 12345678"));
+  await Effect.runPromise(recorded.inspectCommand("gh run watch 12345678"));
+  await Effect.runPromise(recorded.inspectCommand("ls"));
   assert.deepEqual(waits, ["workflow run 12345678 (watch)", null]);
   const failing = policyOn(() => Effect.fail(new StoreError({ cause: new Error("the store is down") })));
-  assert.deepEqual(await Effect.runPromise(failing.inspectCommand({ command: "gh run watch 12345678", sessionId: "s-1" })), { blocked: false });
+  assert.deepEqual(await Effect.runPromise(failing.inspectCommand("gh run watch 12345678")), { blocked: false });
   const fenced = policyOn(() => Effect.fail(new TurnFenced({ threadKey: "telegram:41", epoch: 1 })));
-  const exit = await Effect.runPromiseExit(fenced.inspectCommand({ command: "gh run watch 12345678", sessionId: "s-1" }));
+  const exit = await Effect.runPromiseExit(fenced.inspectCommand("gh run watch 12345678"));
   assert.ok(Exit.isFailure(exit) && String(exit.cause).includes("TurnFenced"));
 });
 
@@ -576,5 +576,177 @@ test("replies a pod tells of, however often, are delivered once at a time, and o
     await sleep(1_000);
     assert.equal(most, 1, "two deliveries at once");
     assert.ok(reads - before <= 3, `${reads - before} deliveries of 30 tellings`);
+  });
+});
+
+/** A Codex harness whose turns each wait for `release`, then answer `text`, its prompts kept in `ran`. */
+const waitingHarness = (release: Deferred.Deferred<void>, ran: string[], text = "Done.") =>
+  scriptedHarness((params) => Effect.andThen(Effect.sync(() => void ran.push(params.prompt)), Effect.andThen(Deferred.await(release), answered(params, text))));
+
+/**
+ * Starts a turn of `prompt` in the conversation through turns of an alasio of their own, over
+ * the same store and pods, and once its pod runs it, stops that alasio: the turn left on its
+ * pod, for the test's alasio to attach to as the next one would.
+ */
+async function leftOnItsPod(alasio: TestAlasio, store: Store["Service"], conversationId: string, ran: string[], prompt = "go"): Promise<void> {
+  const scope = await alasio.runPromise(Scope.make());
+  const stopping = Context.get(await alasio.runPromise(Layer.buildWithScope(Turns.layer(), scope)), Turns);
+  alasio.runFork(stopping.run({ conversationId, chatId: CONVERSATION_CHAT, messageId: prompt, prompt, traceparent: null }));
+  await until("the turn to run on its pod", () => ran.includes(prompt));
+  await alasio.runPromise(Scope.close(scope, Exit.void));
+  assert.equal((await run(store.getActiveTurn(conversationId)))?.status, "interrupted");
+}
+
+/** Attaches again to the turns left, as alasio starting does. */
+const reattached = (alasio: TestAlasio) => alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.reattachLeftTurns));
+
+test("a turn alasio stops driving runs on on its pod, and the next start attaches to it: its reply delivered once, as its pod ends it, and its binding lost after runs nothing again", async () => {
+  const { store, conversationId } = await conversation();
+  const release = Effect.runSync(Deferred.make<void>());
+  const ran: string[] = [];
+  const outbox = recordingOutbox();
+  await withServices({ store, harnesses: { [CODEX_HARNESS]: waitingHarness(release, ran) }, outbox: outbox.layer }, async (alasio) => {
+    await leftOnItsPod(alasio, store, conversationId, ran);
+    await reattached(alasio);
+    // The pod ends the turn after the start, which waits for it.
+    await alasio.runPromise(Deferred.succeed(release, undefined));
+    await until("its reply", () => outbox.queued.texts.some(({ text }) => text === "Done."));
+    await until("its turn to end", async () => (await run(store.getActiveTurn(conversationId))) === null);
+    assert.equal((await run(store.getTurn(conversationId)))?.outcome, "completed");
+    // Its binding lost after: nothing of it is run again.
+    await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, "lost")));
+    await sleep(500);
+    assert.deepEqual(ran, ["go"]);
+    assert.equal(await run(store.hasOpenPromptJobs(conversationId)), false);
+    assert.equal(outbox.queued.texts.filter(({ text }) => text === "Done.").length, 1);
+  });
+});
+
+test("a turn's pod lost as alasio attaches to it again runs the turn again, once, whichever lets go of it first, and delivers nothing of the lost one", async () => {
+  for (const reason of ["deleted", "lost"] as const) {
+    const { store, conversationId } = await conversation();
+    const release = Effect.runSync(Deferred.make<void>());
+    const ran: string[] = [];
+    const outbox = recordingOutbox();
+    await withServices({ store, harnesses: { [CODEX_HARNESS]: waitingHarness(release, ran, "Recovered.") }, outbox: outbox.layer }, async (alasio) => {
+      await leftOnItsPod(alasio, store, conversationId, ran);
+      // Attaching, which waits on the pod; the pod lost meanwhile, told of as the gateway tells it.
+      await reattached(alasio);
+      await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, reason)));
+      await until("the turn to run again", () => ran.length === 2);
+      assert.deepEqual(ran, ["go", buildLostHarnessText(CODEX_HARNESS)], reason);
+      await alasio.runPromise(Deferred.succeed(release, undefined));
+      await until("the recovery's reply", () => outbox.queued.texts.some(({ text }) => text === "Recovered."));
+      await sleep(500);
+      assert.equal(ran.length, 2, `${reason}: run again more than once`);
+      assert.equal(outbox.queued.texts.filter(({ text }) => text === "Recovered.").length, 1, reason);
+    });
+  }
+});
+
+test("a turn whose pod is lost as alasio drives it is run again, once, as the drive and the binding's loss both take it as lost", async () => {
+  const { store, conversationId } = await conversation();
+  const release = Effect.runSync(Deferred.make<void>());
+  const ran: string[] = [];
+  const outbox = recordingOutbox();
+  await withServices({ store, harnesses: { [CODEX_HARNESS]: waitingHarness(release, ran, "Recovered.") }, outbox: outbox.layer }, async (alasio) => {
+    const driving = alasio.runFork(turnOf(conversationId, "go"));
+    await until("the turn to run on its pod", () => ran.length > 0);
+    await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, "broken")));
+    await alasio.runPromise(Fiber.await(driving));
+    await until("the turn to run again", () => ran.length === 2);
+    assert.deepEqual(ran, ["go", buildLostHarnessText(CODEX_HARNESS)]);
+    await alasio.runPromise(Deferred.succeed(release, undefined));
+    await until("the recovery's reply", () => outbox.queued.texts.some(({ text }) => text === "Recovered."));
+    await sleep(500);
+    assert.equal(ran.length, 2, "run again more than once");
+  });
+});
+
+test("a recovery whose pod is lost too is given up, not run again, and the chat is told once to send the message again", async () => {
+  const { store, schema, conversationId } = await conversation();
+  const release = Effect.runSync(Deferred.make<void>());
+  const ran: string[] = [];
+  const outbox = recordingOutbox();
+  const GIVEN_UP = "Codex's harness was lost during this turn, which was itself run again as one was lost before. Send the message again to run it.";
+  /** How often the chat was told the turn was given up, on its status message or by a message of its own. */
+  const toldGivenUp = async () => Number((await poolOf(store).query(`select count(*) from ${schema}.telegram_outbox where text = $1`, [GIVEN_UP])).rows[0]?.count);
+  await withServices({ store, harnesses: { [CODEX_HARNESS]: waitingHarness(release, ran, "Recovered.") }, outbox: outbox.layer }, async (alasio) => {
+    const driving = alasio.runFork(turnOf(conversationId, "go"));
+    await until("the turn to run on its pod", () => ran.length === 1);
+    await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, "broken")));
+    await alasio.runPromise(Fiber.await(driving));
+    await until("the turn to run again", () => ran.length === 2);
+    // The recovery's pod lost as well, as the gateway tells it, however often.
+    await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, "broken")));
+    await until("the chat to be told", async () => (await toldGivenUp()) > 0);
+    await until("the recovery to end", async () => (await run(store.getActiveTurn(conversationId))) === null);
+    await alasio.runPromise(Deferred.succeed(release, undefined));
+    await sleep(500);
+    assert.equal(ran.length, 2, "run again more than once");
+    assert.equal(await toldGivenUp(), 1);
+    assert.equal(await run(store.hasOpenPromptJobs(conversationId)), false);
+    assert.equal(outbox.queued.texts.filter(({ text }) => text === "Recovered.").length, 0, "the given-up recovery's reply delivered");
+  });
+});
+
+test("a binding's loss heard late, once the conversation was bound anew and a turn begun on its new pod, ends nothing of that turn", async () => {
+  for (const reason of ["broken", "lost"] as const) {
+    const { store, conversationId } = await conversation();
+    const ran: string[] = [];
+    const release = Effect.runSync(Deferred.make<void>());
+    // The first turn answers at once; the next waits for the test.
+    const harness = scriptedHarness((params) =>
+      Effect.andThen(Effect.sync(() => void ran.push(params.prompt)), Effect.andThen(params.prompt === "next" ? Deferred.await(release) : Effect.void, answered(params, `Done ${params.prompt}.`)))
+    );
+    const outbox = recordingOutbox();
+    await withServices({ store, harnesses: { [CODEX_HARNESS]: harness }, outbox: outbox.layer }, async (alasio) => {
+      assert.equal(await alasio.runPromise(turnOf(conversationId, "first")), true);
+      // Its pod lost after, as an upgrade --now restarting the cluster loses it; told of only once the next turn runs on another.
+      const { tell } = await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.loseUntold(conversationId, reason)));
+      const next = alasio.runFork(turnOf(conversationId, "next"));
+      await until("the next turn to run on its pod", () => ran.length === 2);
+      await alasio.runPromise(tell);
+      await sleep(500);
+      assert.equal((await run(store.getActiveTurn(conversationId)))?.thread_ts, "next", reason);
+      await alasio.runPromise(Deferred.succeed(release, undefined));
+      assert.equal(await alasio.runPromise(Fiber.join(next)), true);
+      assert.deepEqual(ran, ["first", "next"], reason);
+      assert.equal(await run(store.hasOpenPromptJobs(conversationId)), false);
+      assert.equal(outbox.queued.texts.filter(({ text }) => text === "Done next.").length, 1, reason);
+    });
+  }
+});
+
+test("a pod answering with a session another conversation has, of a turn, a fresh session or a turn attached to again, gets it for its conversation in none, each refused", async () => {
+  const { store, conversationId } = await conversation();
+  // Another conversation's session, as its own turns named it.
+  const other = await run(store.upsertConversation({ chatId: "42", user: { id: 42 } }));
+  await run(store.setActiveHarness(other, CODEX_HARNESS));
+  await run(store.setSessionId(other, "theirs"));
+  const ofIts = async () => (await run(store.getMount(conversationId))).sessionId;
+  const release = Effect.runSync(Deferred.make<void>());
+  const ran: string[] = [];
+  const answeringTheirs = (params: TurnParams) => Effect.map(answered(params, "Done."), (result) => ({ ...result, sessionId: "theirs" }));
+  const harness: Harness = {
+    ...scriptedHarness((params) => Effect.andThen(Effect.sync(() => void ran.push(params.prompt)), params.prompt === "left" ? Effect.andThen(Deferred.await(release), answeringTheirs(params)) : answeringTheirs(params))),
+    startFreshSession: () => Effect.succeed("theirs"),
+  };
+  const outbox = recordingOutbox();
+  await withServices({ store, harnesses: { [CODEX_HARNESS]: harness }, outbox: outbox.layer }, async (alasio) => {
+    // A turn: it fails, its reply never delivered.
+    assert.equal((await alasio.runPromise(Effect.flip(turnOf(conversationId, "go"))))._tag, "StoreError");
+    assert.equal((await run(store.getTurn(conversationId)))?.outcome, "failed");
+    assert.deepEqual(outbox.queued.texts.filter(({ text }) => text === "Done."), []);
+    // A fresh session.
+    assert.equal((await alasio.runPromise(Effect.flip(Effect.flatMap(Turns, (turns) => turns.startNewSession(conversationId)))))._tag, "StoreError");
+    // A turn attached to again: ended failed, its status message saying so.
+    await leftOnItsPod(alasio, store, conversationId, ran, "left");
+    await reattached(alasio);
+    await alasio.runPromise(Deferred.succeed(release, undefined));
+    await until("the turn attached to again to end", async () => (await run(store.getActiveTurn(conversationId))) === null);
+    assert.equal((await run(store.getTurn(conversationId)))?.outcome, "failed");
+    assert.ok(outbox.queued.edits.some(({ text }) => text === "Codex hit an error."));
+    assert.equal(await ofIts(), null);
   });
 });

@@ -27,7 +27,6 @@ import { parseCommand } from "../src/operator/command-parser.ts";
 import { Turns } from "../src/codex/turns.ts";
 import { Mounts } from "../src/operator/mounts.ts";
 import { processPrompt } from "../src/operator/prompts.ts";
-import { buildRestartSyntheticText } from "../src/operator/restart-prompts.ts";
 import {
   CHOOSE_SERVICE_NOTICE,
   buildServicePanel,
@@ -361,32 +360,6 @@ test("new sessions and active turns are recorded under the active harness", asyn
       assert.equal(harnessSessionOf(await run(store.getConversation(conversationId)), CLAUDE_HARNESS), "claude-live");
       assert.equal(harnessSessionOf(await run(store.getConversation(conversationId)), CODEX_HARNESS), null);
     });
-  });
-});
-
-test("restart recovery restores the interrupted turn's own harness session", async () => {
-  await withStore(async (store) => {
-    const conversationId = await run(store.upsertConversation({ chatId: "5", user: { id: 5 } }));
-    await run(store.setActiveHarness(conversationId, CLAUDE_HARNESS));
-    await run(store.claimTurn({ conversationId, chatId: "5", messageId: "8", sessionId: "claude-1", harness: CLAUDE_HARNESS, prompt: "restart please" }));
-    await run((await writerOf(store, conversationId, "5")).recordRestartEvent({ cause: "self_induced", channel: "5", thread_ts: "8", session_id: "claude-1" }));
-    const [turn] = await run(store.getActiveTurns);
-    assert.ok(turn);
-    // An empty environment gives the defaults even when the tests themselves run in a
-    // release whose names differ.
-    const job = await run(store.stageRestartRecovery({ turn, prompt: buildRestartSyntheticText("self_induced", turn.harness, {}) }));
-    assert.ok(job);
-    assert.equal(job.harness, CLAUDE_HARNESS);
-    assert.match(job.prompt, /You are Claude, connected through the Kubernetes Deployment alasio in namespace alasio/);
-    assert.match(job.prompt, /restart is `kubectl -n alasio rollout restart deployment\/alasio`/);
-    assert.match(job.prompt, /not deleting alasio's pod/);
-    assert.equal(harnessSessionOf(await run(store.getConversation(conversationId)), CLAUDE_HARNESS), "claude-1");
-    assert.equal(harnessSessionOf(await run(store.getConversation(conversationId)), CODEX_HARNESS), null);
-    const operator = buildRestartSyntheticText("operator_induced", undefined, {});
-    assert.match(operator, /You are Codex/);
-    const named = buildRestartSyntheticText("self_induced", CLAUDE_HARNESS, { ALASIO_DEPLOYMENT: "bot-alasio", ALASIO_NAMESPACE: "bots" });
-    assert.match(named, /connected through the Kubernetes Deployment bot-alasio in namespace bots/);
-    assert.match(named, /`kubectl -n bots rollout restart deployment\/bot-alasio`/);
   });
 });
 

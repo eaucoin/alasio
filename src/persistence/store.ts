@@ -1,7 +1,7 @@
 /**
  * alasio's state, in its Neon: the conversations and what they have mounted, the prompts
  * queued and the turns running, the responses and replies on their way to Telegram,
- * what came from Telegram, and the restarts that cut turns short. The repositories keep
+ * and what came from Telegram. The repositories keep
  * a table or a few each; the store is what alasio uses of them, and the few changes that
  * span them, each in one transaction.
  */
@@ -32,7 +32,6 @@ import { type DueOutboxEntry, NeonOutboxRepository, type NewOutboxStatus, type N
 import { type KeptPress, NeonPressRepository, type NewKeptPress } from "./press-repository.ts";
 import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState } from "./prompt-job-repository.ts";
 import { type CompletedResponse, NeonResponseRepository, type ResponseBlock } from "./response-repository.ts";
-import { NeonRestartRepository, type NewRestartEvent, type RestartEvent } from "./restart-repository.ts";
 import { NeonHarnessGrantRepository } from "./harness-grant-repository.ts";
 import { grantHarness } from "./harness-grants.ts";
 import { ensureSchema } from "./schema.ts";
@@ -59,11 +58,35 @@ import { NeonUsageRepository, type SessionUsage } from "./usage-repository.ts";
  */
 export const DEFAULT_SCHEMA = "state";
 
-/** A turn a restart cut short, and the prompt that resumes it. */
-export interface RestartRecovery {
-  readonly turn: Turn;
-  readonly prompt: string;
+/** What a recovery prompt's message id begins with: a turn whose harness instance was lost, run again (Store.stageLostRecovery). */
+export const LOST_PREFIX = "lost:";
+
+/**
+ * The conversation's active turn whose harness instance was lost under it, of `epoch` where
+ * given, as a turn alasio attached to again knew it, or running on `binding` where given, as a
+ * binding's loss told of it, which a turn begun since on another binding is not; and how it is
+ * run again: as a prompt of `messageId`, which a lost turn's message id begins with (LOST_PREFIX),
+ * and the text `prompt` gives it; and what its status message says.
+ */
+export interface LostRecovery {
+  readonly conversationId: string;
+  readonly epoch: number | null;
+  readonly binding: string | null;
+  readonly messageId: string;
+  readonly prompt: (turn: Turn) => string;
+  /** What the chat is told of what became of the turn: on its status message, or, where it has none, as a message of its own, but of a reply complete, which tells it. */
+  readonly said: (outcome: "staged" | "completed" | "given-up", turn: Turn) => string;
 }
+
+/**
+ * What staging a lost turn's recovery came to, of its turn: `staged`, run again as a prompt
+ * of its own; `completed`, its response complete already, which is delivered, so it is not
+ * run again; `given-up`, a recovery itself lost, let go of rather than run again; or `none`,
+ * no such turn active, as one ended, or recovered, already.
+ */
+export type LostRecoveryOutcome =
+  | { readonly outcome: "staged" | "completed" | "given-up"; readonly turn: Turn }
+  | { readonly outcome: "none" };
 
 /** What the store is made on: the pool it shares, and where in it the state is. */
 export interface StoreOptions {
@@ -131,7 +154,6 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
   responses: new NeonResponseRepository(sql, schema),
   outbox: new NeonOutboxRepository(sql, schema),
   promptJobs: new NeonPromptJobRepository(sql, schema),
-  restarts: new NeonRestartRepository(sql, schema),
   usage: new NeonUsageRepository(sql, schema),
   codexLogin: new NeonCodexLoginRepository(sql, schema),
   sessionWorkspaces: new NeonSessionWorkspaceRepository(sql, schema),
@@ -140,6 +162,28 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
   forks: new NeonForkRepository(sql, schema),
   harnessGrants: new NeonHarnessGrantRepository(sql, schema),
 });
+
+/**
+ * The lost turn's recovery, on the transaction's repositories `on`, as Store.stageLostRecovery
+ * says: the turn ended first, so of what let go of it the first alone acts, and its response's
+ * row locked, so no write of its pod's completes it meanwhile; a response complete already
+ * delivered rather than run again; and a recovery itself lost let go of; the chat told of
+ * each but a reply delivered, in the same transaction, so once.
+ */
+const stageLostOn = (on: ReturnType<typeof repositories>, { conversationId, epoch, binding, messageId, prompt, said }: LostRecovery): Effect.Effect<LostRecoveryOutcome, StoreError> =>
+  Effect.gen(function*() {
+    const turn = yield* on.turns.getActiveTurn(conversationId);
+    if (!turn || (epoch !== null && Number(turn.epoch) !== epoch) || (binding !== null && turn.binding !== binding)) return { outcome: "none" } as const;
+    const completed = turn.pending_response_id === null ? false : yield* on.responses.lockCompleted(turn.pending_response_id);
+    if (!(yield* on.turns.end(conversationId, Number(turn.epoch), completed ? "completed" : "stopped"))) return { outcome: "none" } as const;
+    const outcome = completed ? "completed" : turn.thread_ts.startsWith(LOST_PREFIX) ? "given-up" : "staged";
+    if (!completed && turn.pending_response_id !== null) yield* on.responses.markPendingAsPosted(turn.pending_response_id);
+    if (outcome === "staged") yield* on.promptJobs.enqueue({ conversationId, chatId: turn.channel, messageId, prompt: prompt(turn), priority: 1, harness: turn.harness });
+    // Said on its status message; where it has none, as a message of its own, but of a reply it completed, which says it.
+    if (turn.status_outbox_id !== null) yield* on.outbox.enqueueEdit(turn.status_outbox_id, { chatId: turn.channel, text: said(outcome, turn) });
+    else if (outcome !== "completed") yield* on.outbox.enqueueText({ chatId: turn.channel, text: said(outcome, turn) });
+    return { outcome, turn } as const;
+  });
 
 /** The record of bot_state that says when the store was last pruned (Store pruneTransientIfDue). */
 const PRUNED_KEY = "pruned";
@@ -189,6 +233,8 @@ export interface EventWrites {
   readonly recordForkAnswer: (request: string, volumeId: string, answer: ForkAnswer) => Stored<void>;
   /** Deletes the grant of the conversation's harness pool pod where it is of `binding`, let go of (Store.issueHarnessGrant). */
   readonly revokeHarnessGrant: (conversationId: string, binding: string) => Stored<void>;
+  /** Runs again the conversation's active turn whose harness instance was lost under it, once (Store.stageLostRecovery). */
+  readonly stageLostRecovery: (recovery: LostRecovery) => Stored<LostRecoveryOutcome>;
 }
 
 /**
@@ -219,7 +265,7 @@ export type TurnWrite<A> = Effect.Effect<A, StoreError | TurnFenced>;
 /**
  * What a turn, and its harness, write in alasio's store as it runs, all of the
  * conversation's turn it was made for: its response, its session and usage, what it
- * waits on, and any restart it causes. Each write holds only while no turn has claimed
+ * waits on. Each write holds only while no turn has claimed
  * the conversation since the turn did (Store.turnPersistence), and fails otherwise, with
  * TurnFenced; the turn's epoch is checked in the statement, or the transaction, that
  * writes.
@@ -241,8 +287,6 @@ export interface TurnPersistence {
   readonly updateSessionUsage: (sessionId: string | null | undefined, usage: SessionUsage | null | undefined) => TurnWrite<void>;
   /** Says the turn waits on `waitingOn` (a workflow run), or works again, for null, while it works. */
   readonly setWaiting: (waitingOn: string | null) => TurnWrite<void>;
-  /** Records a restart the turn causes, of its conversation. */
-  readonly recordRestartEvent: (event: Omit<NewRestartEvent, "thread_key">) => TurnWrite<void>;
 }
 
 export class Store extends Context.Service<Store, {
@@ -334,12 +378,11 @@ export class Store extends Context.Service<Store, {
   readonly turnPersistence: (conversationId: string, epoch: number) => TurnPersistence;
   /** Says what the conversation's active turn of `epoch` is doing: whether it still holds the conversation. */
   readonly setTurnStatus: (conversationId: string, epoch: number, status: TurnStatus) => Stored<boolean>;
+  /** Records the binding of the conversation's harness its turn of `epoch` runs on, as alasio drives it there: whether it still holds the conversation. */
+  readonly setTurnBinding: (conversationId: string, epoch: number, binding: string) => Stored<boolean>;
   /** Records the status message the conversation's turn of `epoch` queued: whether it still holds the conversation. */
   readonly setTurnStatusMessage: (conversationId: string, epoch: number, outboxId: string) => Stored<boolean>;
-  /**
-   * Ends the conversation's active turn of `epoch`, as `outcome` says it ended, and lets go
-   * of any restart recorded under it: whether it was that turn, and active.
-   */
+  /** Ends the conversation's active turn of `epoch`, as `outcome` says it ended: whether it was that turn, and active. */
   readonly endTurn: (conversationId: string, epoch: number, outcome: TurnOutcome) => Stored<boolean>;
   readonly getActiveTurns: Stored<Turn[]>;
   readonly getActiveTurn: (conversationId: string) => Stored<Turn | null>;
@@ -367,6 +410,8 @@ export class Store extends Context.Service<Store, {
 
   /** Lets go of a response, as delivered or never to be. */
   readonly markPendingAsPosted: (pendingResponseId: string) => Stored<void>;
+  /** Lets go of a response a turn's host answered with, of the conversation's alone, as a pod may answer with any response's id. */
+  readonly markAnswerPosted: (conversationId: string, pendingResponseId: string) => Stored<void>;
   readonly getCompletedResponsesPendingDelivery: Stored<CompletedResponse[]>;
 
   /** Queues a reply: its id, or that of the one already queued for its pending response. */
@@ -443,14 +488,11 @@ export class Store extends Context.Service<Store, {
   readonly holdUnsteeredPromptJobsAfterRestart: Stored<PromptJob[]>;
 
   /**
-   * Continues a turn a restart cut short, if its restart was recorded: its session
-   * mounted again, its prompt queued first, and the turn and the restart let go of. The
-   * job queued, or null when no restart was recorded.
+   * Runs again the conversation's active turn whose harness instance was lost under it, as
+   * `recovery` says, once, in one transaction: the turn its row's state guards, ended, as
+   * whatever else let go of it first, its reply delivered or its recovery staged, ended it.
    */
-  readonly stageRestartRecovery: (recovery: RestartRecovery) => Stored<PromptJob | null>;
-  /** Records a restart alasio cannot attribute under the conversation's active turn of `epoch`, unless one is recorded. */
-  readonly recordExternalRestartEvent: (conversationId: string, epoch: number) => Stored<void>;
-  readonly getRestartEvent: (conversationId: string) => Stored<RestartEvent | null>;
+  readonly stageLostRecovery: (recovery: LostRecovery) => Stored<LostRecoveryOutcome>;
 
   readonly getSessionTokens: (sessionId: string) => Stored<number>;
 
@@ -524,7 +566,7 @@ const makeStore = Effect.fnUntraced(function*({
   /** `notice` queued to the conversation, recorded as told, on the transaction's repositories `on`, unless it was told already: whether it was queued now. */
   const noticeOn = (on: ReturnType<typeof repositoriesOn>, conversationId: string, notice: NewOutboxText): Stored<boolean> =>
     Effect.flatMap(on.outbox.recordNotice(conversationId, notice.text), (fresh) => (fresh ? Effect.as(on.outbox.enqueueText(notice), true) : Effect.succeed(false)));
-  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin, sessionWorkspaces, presses, events, forks, harnessGrants } = repositoriesOn(database);
+  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, usage, codexLogin, sessionWorkspaces, presses, events, forks, harnessGrants } = repositoriesOn(database);
 
   const pruneTransient = (age: Duration.Input): Stored<void> => {
     const ageMs = Duration.toMillis(age);
@@ -623,16 +665,12 @@ const makeStore = Effect.fnUntraced(function*({
         markPendingAsPosted: (pendingResponseId) => held(responses.markPendingAsPosted(pendingResponseId, true)),
         updateSessionUsage: (sessionId, sessionUsage) => holding((on) => on.usage.updateSessionUsage(sessionId, sessionUsage)),
         setWaiting: (waitingOn) => held(turns.setWaitingAt(conversationId, epoch, waitingOn)),
-        recordRestartEvent: (event) => holding((on) => on.restarts.recordRestartEvent({ ...event, thread_key: conversationId })),
       };
     },
     setTurnStatus: (conversationId, epoch, status) => turns.setStatus(conversationId, epoch, status),
+    setTurnBinding: (conversationId, epoch, binding) => turns.setBindingAt(conversationId, epoch, binding),
     setTurnStatusMessage: (conversationId, epoch, outboxId) => turns.setStatusMessageAt(conversationId, epoch, outboxId),
-    endTurn: (conversationId, epoch, outcome) =>
-      database.transaction((sql) => {
-        const on = repositoriesOn(sql);
-        return Effect.tap(on.turns.end(conversationId, epoch, outcome), (ended) => (ended ? on.restarts.clearRestartEvent(conversationId) : Effect.void));
-      }),
+    endTurn: (conversationId, epoch, outcome) => turns.end(conversationId, epoch, outcome),
     getActiveTurns: turns.getActiveTurns(),
     getActiveTurn: (conversationId) => turns.getActiveTurn(conversationId),
     getTurn: (conversationId) => turns.getTurn(conversationId),
@@ -650,6 +688,7 @@ const makeStore = Effect.fnUntraced(function*({
     isConversationHeld: (conversationId) => turns.isHeld(conversationId),
 
     markPendingAsPosted: (pendingResponseId) => Effect.asVoid(responses.markPendingAsPosted(pendingResponseId)),
+    markAnswerPosted: (conversationId, pendingResponseId) => Effect.asVoid(responses.markPendingAsPosted(pendingResponseId, false, conversationId)),
     getCompletedResponsesPendingDelivery: responses.getCompletedResponsesPendingDelivery(),
 
     enqueueOutboxText: (text) => outbox.enqueueText(text),
@@ -697,34 +736,7 @@ const makeStore = Effect.fnUntraced(function*({
     recoverPromptJobsAfterRestart: promptJobs.recoverAfterRestart(),
     holdUnsteeredPromptJobsAfterRestart: promptJobs.holdUnsteeredAfterRestart(),
 
-    stageRestartRecovery: ({ turn, prompt }) =>
-      database.transaction(Effect.fnUntraced(function*(sql) {
-        const { conversations, promptJobs, responses, turns, restarts } = repositoriesOn(sql);
-        const restartEvent = yield* restarts.getRestartEvent(turn.thread_key);
-        if (!restartEvent) {
-          return null;
-        }
-        if (restartEvent.session_id) {
-          yield* conversations.setHarnessSessionId(turn.thread_key, turn.harness, restartEvent.session_id);
-        }
-        const job = yield* promptJobs.enqueue({
-          conversationId: turn.thread_key,
-          chatId: turn.channel,
-          // One recovery per restart, however often it is staged.
-          messageId: ["restart", turn.thread_ts, restartEvent.recorded_at.getTime() / 1000].join(":"),
-          prompt,
-          priority: 1,
-          harness: turn.harness,
-        });
-        if (turn.pending_response_id) {
-          yield* responses.markPendingAsPosted(turn.pending_response_id);
-        }
-        yield* turns.end(turn.thread_key, Number(turn.epoch), "stopped");
-        yield* restarts.clearRestartEvent(turn.thread_key);
-        return job;
-      })),
-    recordExternalRestartEvent: (conversationId, epoch) => restarts.recordExternalRestartEvent(conversationId, epoch),
-    getRestartEvent: (conversationId) => restarts.getRestartEvent(conversationId),
+    stageLostRecovery: (recovery) => database.transaction((sql) => stageLostOn(repositoriesOn(sql), recovery)),
 
     getSessionTokens: (sessionId) => usage.getSessionTokens(sessionId),
 
@@ -743,6 +755,7 @@ const makeStore = Effect.fnUntraced(function*({
                 enqueuePromptJob: (job) => on.promptJobs.enqueue(job),
                 recordForkAnswer: (request, volumeId, answer) => on.forks.recordAnswer(request, volumeId, answer),
                 revokeHarnessGrant: (conversationId, binding) => on.harnessGrants.revoke(conversationId, binding),
+                stageLostRecovery: (recovery) => stageLostOn(on, recovery),
               }),
               Option.some,
             )

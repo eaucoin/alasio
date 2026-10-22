@@ -72,9 +72,7 @@ test("a turn's writes, and its harness's, hold until another turn claims the con
   await refused(first.markPendingAsPosted(response), 1);
   await refused(first.updateSessionUsage("session-1", { cacheReadInputTokens: 10 }), 1);
   await refused(first.setWaiting("workflow run 1 (watch)"), 1);
-  await refused(first.recordRestartEvent({ cause: "self_induced", channel: "7", thread_ts: "1", session_id: null }), 1);
   assert.equal((await run(store.getMount(conversationId))).sessionId, "session-1");
-  assert.equal(await run(store.getRestartEvent(conversationId)), null);
   assert.equal(await run(store.getSessionTokens("session-1")), 0);
   assert.deepEqual(await run(store.getCompletedResponsesPendingDelivery), []);
   assert.equal((await run(store.getActiveTurn(conversationId)))?.status, "working");
@@ -91,24 +89,22 @@ test("a turn's writes, and its harness's, hold until another turn claims the con
   await run(second.markPendingAsPosted(own));
 });
 
-test("what alasio does with a turn holds only under the turn's epoch: a turn superseded ends, interrupts, records and names nothing of the one after it", async () => {
+test("what alasio does with a turn holds only under the turn's epoch: a turn superseded ends, interrupts and names nothing of the one after it, nor is run again as lost", async () => {
   const { store, conversationId, claim } = await conversation();
   const first = await claim("1");
   const second = await claim("2");
   assert.equal(await run(store.endTurn(conversationId, first, "failed")), false);
   assert.equal(await run(store.setTurnStatus(conversationId, first, "interrupted")), false);
   assert.equal(await run(store.setTurnStatusMessage(conversationId, first, "status-of-the-first")), false);
-  await run(store.recordExternalRestartEvent(conversationId, first));
+  assert.equal(await run(store.setTurnBinding(conversationId, first, "binding-of-the-first")), false);
+  const lost = { conversationId, epoch: first, binding: null, messageId: "lost:1", prompt: () => "again", said: () => "lost" };
+  assert.deepEqual(await run(store.stageLostRecovery(lost)), { outcome: "none" });
   const turn = await run(store.getActiveTurn(conversationId));
   assert.deepEqual([turn?.epoch, turn?.state, turn?.status, turn?.status_outbox_id], [String(second), "active", "working", null]);
-  assert.equal(await run(store.getRestartEvent(conversationId)), null);
 
-  // The second's own: a restart recorded under it is let go of as it ends.
+  // The second's own.
   assert.equal(await run(store.setTurnStatusMessage(conversationId, second, "status-of-the-second")), true);
-  await run(store.recordExternalRestartEvent(conversationId, second));
-  assert.equal((await run(store.getRestartEvent(conversationId)))?.cause, "external_or_unknown");
   assert.equal(await run(store.endTurn(conversationId, second, "stopped")), true);
-  assert.equal(await run(store.getRestartEvent(conversationId)), null);
   const ended = await run(store.getTurn(conversationId));
   assert.deepEqual([ended?.outcome, ended?.status_outbox_id], ["stopped", "status-of-the-second"]);
 });
@@ -126,7 +122,6 @@ test("a write racing a claim waits for it, and is refused once it commits", asyn
     const writes = [
       first.appendBlocksToPending(response, [{ type: "text", content: "Late.", phase: "final_answer" }]),
       first.updateSessionUsage("session-1", { cacheReadInputTokens: 5 }),
-      first.recordRestartEvent({ cause: "self_induced", channel: "7", thread_ts: "1", session_id: null }),
     ].map((write) => Effect.runPromiseExit(write).finally(() => void (settled += 1)));
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.equal(settled, 0, "a write did not wait for the claim");
@@ -140,7 +135,6 @@ test("a write racing a claim waits for it, and is refused once it commits", asyn
     client.release();
   }
   assert.equal(await run(store.getSessionTokens("session-1")), 0);
-  assert.equal(await run(store.getRestartEvent(conversationId)), null);
 });
 
 test("a turn says what it waits on while it works, and works again once it is past it; one left for a restart, or ended, says what it said", async () => {

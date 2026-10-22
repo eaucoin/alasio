@@ -16,7 +16,6 @@ const SESSION_ROWS: ReadonlyArray<readonly [table: string, conversation: string,
   ["messages", "conversation_id", ["session_id"]],
   ["turns", "conversation_id", ["session_id"]],
   ["responses", "thread_key", ["session_id"]],
-  ["restart_events", "thread_key", ["session_id"]],
   ["prompt_jobs", "conversation_id", ["upstream_session_id"]],
   ["callback_actions", "conversation_id", ["expected_session_id"]],
 ];
@@ -175,6 +174,10 @@ create table if not exists ${SCHEMA}.turns (
   outcome text,
   -- its status message's outbox entry, which edits name, so a start after a crash can say how it ended
   status_outbox_id text,
+  -- the binding of the conversation's harness it runs on, as alasio drove it there, or as the turn
+  -- before ran on, of one its harness started on its own: the one turn the binding's loss takes
+  -- with it (Store.stageLostRecovery)
+  binding text,
   started_at timestamptz not null,
   completed_at timestamptz
 );
@@ -215,17 +218,6 @@ create table if not exists ${SCHEMA}.response_blocks (
 );
 
 create index if not exists response_blocks_response on ${SCHEMA}.response_blocks (response_id, seq);
-
-create table if not exists ${SCHEMA}.restart_events (
-  thread_key text primary key,
-  cause text not null,
-  channel text not null,
-  thread_ts text not null,
-  session_id text,
-  -- the command that restarted alasio, for a restart the agent caused
-  command text,
-  recorded_at timestamptz not null default now()
-);
 
 -- Codex's login (its auth.json), where its home does not outlast alasio's pod; one row.
 create table if not exists ${SCHEMA}.codex_login (

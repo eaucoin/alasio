@@ -2,8 +2,7 @@
  * What the harness host's role (src/neon/harness.ts) may do in alasio's state: the turn's
  * part of it and nothing more. It writes the turn it runs, and the turns its harness
  * starts on its own (claiming, ending, and what each writes as it runs: its response, its
- * session, its usage, what it waits on, a restart it causes, and its end, which lets go
- * of a restart recorded for it), and its job's progress; it reads the files a prompt
+ * session, its usage, what it waits on, and its end), and its job's progress; it reads the files a prompt
  * names, and the holds that keep a conversation busy as no turn; and it reads and writes the
  * transcripts and rollouts of its sessions, in the stores of Claude Code's and Codex's.
  * Telegram's updates, the buttons, the outbox, making holds, the workspaces, the Codex login,
@@ -63,8 +62,6 @@ const stateReach = (schema: string): Readonly<Record<string, Reach>> => {
       check: `response_id in (select id from ${schema}.responses where thread_key = ${conversation})`,
     },
     session_usage: { privileges: "select, insert, update", using: `session_id = any (${sessions})`, check: claim("session_id") },
-    // Deleted as a turn of its own ends (../persistence/store.ts endTurn).
-    restart_events: of("select, insert, update, delete", "thread_key", "session_id"),
     files: of("select", "conversation_id"),
     conversation_holds: of("select", "conversation_id"),
     // A turn's session is the conversation's, as its row says (./turn-repository.ts updateSessionIdAt).

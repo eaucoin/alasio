@@ -1,6 +1,7 @@
 /**
  * alasio stopped and started again on the same state, as a rollout restart does, from the
- * outside: what becomes of a reply it had not delivered.
+ * outside, its conversations' pods running on: what becomes of a reply it had not delivered,
+ * and of a turn it left running.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -59,6 +60,28 @@ test("a reply completed but not delivered when alasio stops is delivered after t
 
   assert.deepEqual(telegram.callsTo("sendRichMessage").map((call) => [call.params.rich_message.markdown, call.status]), [
     ["Change applied.", 429],
+    ["Change applied.", 200],
+    ["You're welcome.", 200],
+  ]);
+});
+
+test("a turn running as alasio restarts runs on on its pod, and its reply, which the pod finishes after the restart, is posted once", async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex } = alasio;
+  await runningTurn(alasio);
+  assert.deepEqual(await alasio.stop(), { code: 0, signal: null });
+  await alasio.start();
+  answerTurn(codex, "thread-1", "turn-1", "Change applied.");
+  await telegram.waitFor("sendRichMessage", (call) => call.params.rich_message.markdown === "Change applied.");
+  // Ask something of the restarted alasio, so that a second delivery, or the turn run again, would have come by its reply.
+  telegram.say("Thanks");
+  // On the pod that ran the turn, its thread still loaded.
+  await answerLoadedThreads(codex, ["thread-1"]);
+  await answerTurnStart(codex, "thread-1", "turn-2");
+  answerTurn(codex, "thread-1", "turn-2", "You're welcome.");
+  await telegram.waitFor("sendRichMessage", (call) => call.params.rich_message.markdown === "You're welcome.");
+
+  assert.deepEqual(telegram.callsTo("sendRichMessage").map((call) => [call.params.rich_message.markdown, call.status]), [
     ["Change applied.", 200],
     ["You're welcome.", 200],
   ]);

@@ -39,9 +39,14 @@ export function workingStatusHtml({ harnessName, startedAtMs, waitingOn = null }
   return `${doing} · ${since}`;
 }
 
-/** What a turn's status message says when alasio stops during the turn, which it continues after the restart. */
+/** What a turn's status message says when alasio stops during the turn, which its pod runs on, its reply following the restart. */
 function restartingStatusText(harnessName: string): string {
-  return `alasio is restarting; ${harnessName} continues this turn after the restart.`;
+  return `alasio is restarting; ${harnessName} goes on with this turn, and its reply follows the restart.`;
+}
+
+/** What a turn's status message says when alasio does not reach its pod, which it asks again. */
+function unreachedStatusText(harnessName: string): string {
+  return `${harnessName}'s harness could not be reached; alasio asks it again for this turn.`;
 }
 
 /** A final response to queue for delivery, as the pending response it delivers. */
@@ -79,7 +84,9 @@ export interface StatusAhead {
   readonly end: (text: string) => Effect.Effect<void>;
 }
 
+/** A turn's reply to queue: of the conversation `conversationId`, whose host answered with `pendingResponseId`. */
 export interface PostedResponse {
+  readonly conversationId: string;
   readonly chatId: ChatId;
   readonly response: string;
   readonly pendingResponseId: string | null | undefined;
@@ -87,7 +94,9 @@ export interface PostedResponse {
   readonly harnessName?: string;
 }
 
+/** A turn that ended without its reply: of the conversation `conversationId`, whose host answered with `pendingResponseId`. */
 export interface UnansweredTurn {
+  readonly conversationId: string;
   readonly chatId: ChatId;
   readonly pendingResponseId: string | null | undefined;
   readonly status: PostedStatus | null;
@@ -117,8 +126,10 @@ export interface StatusReporter {
   readonly ahead: (chatId: ChatId, harnessName: string) => Effect.Effect<StatusAhead>;
   readonly postResponse: (response: PostedResponse) => Effect.Effect<void, StoreError>;
   readonly finishWithoutResponse: (turn: UnansweredTurn) => Effect.Effect<void, StoreError>;
-  /** Says on the status message that alasio is restarting and the turn continues after it. */
+  /** Says on the status message that alasio is restarting and the turn goes on, its reply following the restart. */
   readonly restarting: (chatId: ChatId, status: PostedStatus | null, harnessName: string) => Effect.Effect<void>;
+  /** Says on the status message that alasio did not reach the turn's pod, which it asks again. */
+  readonly unreached: (chatId: ChatId, status: PostedStatus | null, harnessName: string) => Effect.Effect<void>;
   /** Queues every completed response that has not been delivered. */
   readonly flushCompletedResponses: Effect.Effect<void, StoreError>;
 }
@@ -234,7 +245,7 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
       };
     });
 
-  const postResponse = Effect.fnUntraced(function*({ chatId, response, pendingResponseId, status, harnessName = "Codex" }: PostedResponse) {
+  const postResponse = Effect.fnUntraced(function*({ conversationId, chatId, response, pendingResponseId, status, harnessName = "Codex" }: PostedResponse) {
     const trimmedResponse = response.trim();
     if (status) {
       const elapsedSeconds = ((yield* Clock.currentTimeMillis) - status.startTime) / 1000;
@@ -242,19 +253,19 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
     }
     if (!trimmedResponse) {
       if (pendingResponseId) {
-        yield* store.markPendingAsPosted(pendingResponseId);
+        yield* store.markAnswerPosted(conversationId, pendingResponseId);
       }
       return;
     }
     yield* enqueueFinalResponse({ chatId, text: trimmedResponse, pendingResponseId });
   });
 
-  const finishWithoutResponse = Effect.fnUntraced(function*({ chatId, pendingResponseId, status, statusText = null, harnessName = "Codex" }: UnansweredTurn) {
+  const finishWithoutResponse = Effect.fnUntraced(function*({ conversationId, chatId, pendingResponseId, status, statusText = null, harnessName = "Codex" }: UnansweredTurn) {
     if (status) {
       yield* edit(chatId, status, statusText ?? `${harnessName} interrupted.`);
     }
     if (pendingResponseId) {
-      yield* store.markPendingAsPosted(pendingResponseId);
+      yield* store.markAnswerPosted(conversationId, pendingResponseId);
     }
   });
 
@@ -276,6 +287,7 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
           Effect.asVoid,
         )
         : Effect.void,
+    unreached: (chatId, status, harnessName) => (status ? edit(chatId, status, unreachedStatusText(harnessName)) : Effect.void),
     flushCompletedResponses: Effect.gen(function*() {
       for (const completed of yield* store.getCompletedResponsesPendingDelivery) {
         const response = finalResponseToMarkdown(completed.blocks);

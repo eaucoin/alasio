@@ -19,7 +19,7 @@ import type { ResponseBlock } from "../src/codex/event-projection.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { makeCodexHarness } from "../src/harness/codex.ts";
 import { whileHeld } from "../src/harness/holds.ts";
-import { HarnessHost, type TurnBayma, type TurnStart } from "../src/harness/host.ts";
+import { HarnessHost, HostBinding, type TurnBayma, type TurnStart } from "../src/harness/host.ts";
 import { HarnessEvents, type HostEvent, HostEvents } from "../src/harness/host-events.ts";
 import { type Harness, Harnesses, NoWorkspaceMounted, type TurnParams, type TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
@@ -79,10 +79,11 @@ function recordingHarness(seen: TurnParams[], onRun: () => void = () => {}): Har
  * tells heard in the test's process (inProcessEvents).
  */
 const onPodHost = <A, E>(
-  { store, harness, stateDir = "/nonexistent-state-dir" }: { readonly store: Store["Service"]; readonly harness: Harness; readonly stateDir?: string },
+  { store, harness, stateDir = "/nonexistent-state-dir", binding }: { readonly store: Store["Service"]; readonly harness: Harness; readonly stateDir?: string; readonly binding?: string },
   effect: Effect.Effect<A, E, HarnessHost | HarnessEvents | Scope.Scope>,
 ): Promise<A> =>
   Effect.runPromise(Effect.scoped(effect).pipe(Effect.provide(HarnessHost.layer.pipe(
+    Layer.provideMerge(binding === undefined ? Layer.empty : Layer.succeed(HostBinding, HostBinding.of({ binding }))),
     Layer.provideMerge(Harnesses.layer({ overrides: { [CODEX_HARNESS]: harness } })),
     Layer.provideMerge(inProcessEvents),
     Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir }))),
@@ -416,4 +417,30 @@ test("the files a turn's prompt names, and a steer's, are written where the harn
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
+});
+
+test("a turn a lingering pod's harness starts on its own runs on that pod's binding, not the one alasio drove the conversation's last turn on, so only that binding's loss ends it", async () => {
+  const store = await testStore();
+  const conversationId = await run(store.upsertConversation({ chatId: "41", user: { id: 41 } }));
+  await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+  await run(store.setWorkingDirectory(conversationId, "/work"));
+  // The conversation's last turn, as alasio drove it on the pod bound to it now.
+  const driven = await run(store.claimTurn({ conversationId, chatId: "41", messageId: "10", harness: CODEX_HARNESS, prompt: "go" }));
+  assert.equal(await run(store.setTurnBinding(conversationId, driven, "binding-now")), true);
+  await run(store.endTurn(conversationId, driven, "completed"));
+  // The pod bound before it, whose harness's work in the background goes on, and starts a turn of its own.
+  const lingering: Harness = {
+    ...recordingHarness([]),
+    runTurn: (params) => Effect.as(params.ownTurns.claim("own-1", "session-1"), { blockSequence: [], sessionId: "session-1", pendingResponseId: "none", interrupted: false, responseCompleted: false }),
+  };
+  const claimed = await run(store.claimTurn({ conversationId, chatId: "41", messageId: "11", harness: CODEX_HARNESS, prompt: "go" }));
+  await onPodHost({ store, harness: lingering, binding: "binding-before" }, Effect.gen(function*() {
+    const host = yield* HarnessHost;
+    yield* host.startTurn({ conversationId, chatId: "41", messageId: "11", harness: CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch: claimed, jobId: null, attachedTurn: null });
+  }));
+  const own = await run(store.getActiveTurn(conversationId));
+  assert.deepEqual([own?.thread_ts, own?.binding], ["own-1", "binding-before"]);
+  const lost = (binding: string) => run(store.stageLostRecovery({ conversationId, epoch: null, binding, messageId: `lost:${binding}`, prompt: () => "again", said: () => "lost" }));
+  assert.deepEqual(await lost("binding-now"), { outcome: "none" });
+  assert.equal((await lost("binding-before")).outcome, "staged");
 });

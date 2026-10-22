@@ -38,6 +38,8 @@ export interface Turn {
   readonly outcome: TurnOutcome | null;
   /** Its status message's outbox entry, once queued. */
   readonly status_outbox_id: string | null;
+  /** The binding of the conversation's harness it runs on (setBindingAt), or none yet. */
+  readonly binding: string | null;
   readonly started_at: Date;
   readonly completed_at: Date | null;
 }
@@ -52,6 +54,11 @@ export interface ActiveTurn {
   readonly harness: HarnessName;
   readonly pendingResponseId?: string | null | undefined;
   readonly prompt?: string | null | undefined;
+  /**
+   * The binding of the conversation's harness it runs on, as a pod's host knows its own, of a turn
+   * its harness starts on its own; none, of one alasio claims, until alasio drives it on one (setBindingAt).
+   */
+  readonly binding?: string | null | undefined;
 }
 
 /**
@@ -73,8 +80,8 @@ export class NeonTurnRepository {
   claim(turn: ActiveTurn): Effect.Effect<number, StoreError> {
     return this.#sql.query<{ readonly epoch: string }>(
       `insert into ${this.#schema}.turns
-         (id, conversation_id, thread_key, channel, thread_ts, session_id, harness, pending_response_id, prompt, state, epoch, status, started_at)
-       values ($1, $1, $1, $2, $3, $4, $5, $6, $7, 'active', 1, 'working', now())
+         (id, conversation_id, thread_key, channel, thread_ts, session_id, harness, pending_response_id, prompt, binding, state, epoch, status, started_at)
+       values ($1, $1, $1, $2, $3, $4, $5, $6, $7, $8, 'active', 1, 'working', now())
        on conflict (id) do update set
          channel = excluded.channel,
          thread_ts = excluded.thread_ts,
@@ -88,11 +95,20 @@ export class NeonTurnRepository {
          waiting_on = null,
          outcome = null,
          status_outbox_id = null,
+         binding = excluded.binding,
          started_at = excluded.started_at,
          completed_at = null
        returning epoch`,
-      [turn.conversationId, turn.chatId, turn.messageId, turn.sessionId ?? null, turn.harness, turn.pendingResponseId ?? null, turn.prompt ?? null],
+      [turn.conversationId, turn.chatId, turn.messageId, turn.sessionId ?? null, turn.harness, turn.pendingResponseId ?? null, turn.prompt ?? null, turn.binding ?? null],
     ).pipe(Effect.map(([row]) => Number(row?.epoch)));
+  }
+
+  /** Records the binding of the conversation's harness its turn of `epoch` runs on, while it runs: whether no turn has claimed it since. */
+  setBindingAt(threadKey: string, epoch: number, binding: string): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `update ${this.#schema}.turns set binding = $3 where id = $1 and epoch = $2 and state = 'active' returning id`,
+      [threadKey, epoch, binding],
+    ).pipe(Effect.map((rows) => rows.length > 0));
   }
 
   /**

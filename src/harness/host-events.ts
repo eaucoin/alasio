@@ -21,6 +21,11 @@ import { Context, Deferred, Duration, Effect, Layer, PubSub, Schedule, Schema, t
 import { EVENTS_PATH } from "../binder/names.ts";
 import { EventsConsumer } from "../events/consume.ts";
 import type { Event } from "../events/events.ts";
+import { buildLostHarnessText, lostStatusText } from "../operator/lost-prompt.ts";
+import { type EventWrites, LOST_PREFIX } from "../persistence/store.ts";
+
+/** How a binding is let go of with its pod, which takes the turn it ran with it: deleted, its host ended, or lost (../gateway/releases.ts). */
+const LOST_WITH_POD: ReadonlySet<string> = new Set(["deleted", "broken", "lost"]);
 
 /** What a harness running on between prompts did on its own, for the control plane to act on. */
 export type HostEvent =
@@ -99,6 +104,26 @@ export class HarnessEvents extends Context.Service<HarnessEvents, {
         event.source === toldBy(event.kind)
           ? handling(event)
           : Effect.logWarning(`passing over ${event.kind} ${event.id} of ${event.subject.key}, as ${event.source} tells of no ${event.kind}`);
+      /**
+       * The conversation's turn running on its binding `binding` as that was let go of with its
+       * pod, run again, once, in the event's transaction: none begun since on another, as one is
+       * where the event is heard late, the conversation bound anew meanwhile.
+       */
+      const recoverOf = (conversationId: string, binding: string, writes: EventWrites) =>
+        writes.stageLostRecovery({
+          conversationId,
+          epoch: null,
+          binding,
+          messageId: `${LOST_PREFIX}${binding}`,
+          prompt: (turn) => buildLostHarnessText(turn.harness),
+          said: (outcome, turn) => lostStatusText(outcome, turn.harness),
+        }).pipe(
+          Effect.flatMap((recovery) => (recovery.outcome === "none" ? Effect.void : Effect.andThen(
+            Effect.logWarning(`${conversationId}'s turn ran as its pod went: ${recovery.outcome}`),
+            // Its response, which its pod completed before it went, delivered as a background reply is.
+            recovery.outcome === "completed" ? told({ kind: "background-response", conversationId }) : Effect.void,
+          ))),
+        );
       // Read once the turns listen, as an event handled is not handled again: none heard before
       // they subscribe, and so lost.
       const listened = yield* Deferred.make<void>();
@@ -107,10 +132,13 @@ export class HarnessEvents extends Context.Service<HarnessEvents, {
         "harness.idle": fromItsTeller((event) => told({ kind: "idle", conversationId: event.subject.key })),
         // A binding let go of, released or lost, lets go of its conversation too: what waited on it,
         // as its host was drained, runs, bound anew; and its grant reaches nothing from then on.
+        // A pod gone under its binding, lost, deleted or its host ended, takes what it ran with it: the
+        // conversation's turn running then is run again, once (Store.stageLostRecovery).
         "harness.lost": (event, writes) =>
           fromItsTeller((lost: typeof event) =>
             Effect.logWarning(`${lost.subject.key}'s harness's binding was lost, its pod ${lost.pod} gone while it was bound (${lost.reason}): its next turn binds it anew`).pipe(
               Effect.andThen(writes.revokeHarnessGrant(lost.subject.key, lost.binding)),
+              Effect.andThen(recoverOf(lost.subject.key, lost.binding, writes)),
               Effect.andThen(told({ kind: "idle", conversationId: lost.subject.key })),
             )
           )(event),
@@ -118,6 +146,7 @@ export class HarnessEvents extends Context.Service<HarnessEvents, {
           fromItsTeller((released: typeof event) =>
             Effect.logInfo(`${released.subject.key}'s harness was released (${released.reason})`).pipe(
               Effect.andThen(writes.revokeHarnessGrant(released.subject.key, released.binding)),
+              Effect.andThen(LOST_WITH_POD.has(released.reason) ? recoverOf(released.subject.key, released.binding, writes) : Effect.void),
               Effect.andThen(told({ kind: "idle", conversationId: released.subject.key })),
             )
           )(event),

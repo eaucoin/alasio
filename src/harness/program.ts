@@ -49,6 +49,7 @@ import { join } from "node:path";
 
 import { Clock, Context, Duration, Effect, Layer, Result, Schema, type Scope, Semaphore } from "effect";
 
+import { claimsOf } from "../binder/tokens.ts";
 import { MAIN_ENVIRONMENT_NAME } from "../branch/names.ts";
 import { CodexAppServer, makeAppServer } from "../codex/app-server/client.ts";
 import { spawnAppServer } from "../codex/app-server/process.ts";
@@ -64,7 +65,7 @@ import { ReceivedFiles } from "../telegram/files.ts";
 import { ActiveTurns } from "./active-turns.ts";
 import { makeGivenBayma } from "./given-bayma.ts";
 import { makeGivenCodexLogin } from "./given-codex-login.ts";
-import { HarnessHost, type TurnStart } from "./host.ts";
+import { HarnessHost, HostBinding, type TurnStart } from "./host.ts";
 import { HostEvents } from "./host-events.ts";
 import { Harnesses, type HarnessesOptions } from "./index.ts";
 import { serveHost } from "./serve.ts";
@@ -186,6 +187,7 @@ export interface HarnessStandIns extends Pick<HarnessesOptions, "overrides" | "c
 export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, { activeTurns, ...standIns }: HarnessStandIns = {}): Effect.fn.Return<{ readonly port: number }, unknown, Scope.Scope> {
   yield* Effect.logInfo(`free: serving once bound, as ${config.bindingFile} says`);
   const { conversationId, token } = yield* awaitBinding(config.bindingFile);
+  const binding = claimsOf(token)?.binding;
   yield* markServed(config.stateDir);
   const neon = yield* HarnessNeon.make;
   const stores = yield* Layer.build(Store.layer({ pool: neon.pool, makesSchema: false }));
@@ -227,6 +229,8 @@ export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, {
     Layer.provideMerge(Layer.mergeAll(activeTurns ? Layer.succeed(ActiveTurns, activeTurns) : ActiveTurns.layer, appServer, ReceivedFiles.layer({ stateDir: config.stateDir }), told)),
     Layer.provideMerge(sessions),
     Layer.provideMerge(Layer.succeedContext(stores)),
+    // Its own binding, as its binding's token, which its node's agent wrote beside it, says.
+    Layer.provideMerge(binding === undefined ? Layer.empty : Layer.succeed(HostBinding, HostBinding.of({ binding }))),
   ));
   const host = Context.get(built, HarnessHost);
   // Its Codex's login renewed as alasio gives it anew.

@@ -171,7 +171,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   yield* Effect.flatMap(Mounts, (mounts) => mounts.reconcileSessionWorkspaces);
   yield* turns.flushCompletedResponses;
   yield* mediaGroups.flushDue;
-  yield* turns.recoverInterruptedTurns;
+  // The turns the last alasio left running on their conversations' pods, attached to again in the background.
+  yield* turns.reattachLeftTurns;
   yield* turns.resumePendingPrompts;
   // Presses kept as an alasio before stopped, run again before updates come.
   yield* recoverPresses(handling).pipe(Effect.provideContext(services));

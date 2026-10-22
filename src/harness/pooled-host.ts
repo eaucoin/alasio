@@ -284,9 +284,11 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
             if (!reservedTo) return yield* new HarnessHostError({ reason: `a turn of ${start.conversationId} was started with its harness reserved for none` });
             const codex = yield* codexOf(start);
             const token = tokenOf(start.conversationId, start.harness, start.workingDirectory);
-            // Of the binding reserved, or the one its harness is bound to anew, its pod gone: its bayma held to that one, and its grant given.
+            // Of the binding reserved, or the one its harness is bound to anew, its pod gone: the turn's row saying it runs on that one, which
+            // a loss of another binding, heard late, leaves be (Store.stageLostRecovery), its bayma held to it, and its grant given.
             const [result] = yield* onBinding(start.conversationId, reservedTo, (held, bound) =>
               Effect.gen(function*() {
+                yield* store.setTurnBinding(start.conversationId, start.epoch, held.binding);
                 const bayma = yield* baymaOf(start, held);
                 const host = hostBy(token, bound);
                 if (codex) yield* Effect.forkScoped(renewing(host, start));

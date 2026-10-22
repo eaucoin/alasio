@@ -87,12 +87,23 @@ export class NeonResponseRepository {
     ).pipe(Effect.map((rows) => rows.length > 0));
   }
 
-  /** Lets go of a response, as delivered or never to be: whether its writer still holds its conversation, where `fenced`. */
-  markPendingAsPosted(pendingResponseId: string, fenced = false): Effect.Effect<boolean, StoreError> {
+  /**
+   * Lets go of a response, as delivered or never to be: whether its writer still holds its
+   * conversation, where `fenced`; of the conversation `of` alone, where given, as of an id a pod
+   * answered with, which may name any response.
+   */
+  markPendingAsPosted(pendingResponseId: string, fenced = false, of: string | null = null): Effect.Effect<boolean, StoreError> {
     return this.#sql.query(
-      `update ${this.#schema}.responses set posted = true where id = $1${fenced ? ` and ${this.#held("responses")}` : ""} returning id`,
-      [pendingResponseId],
+      `update ${this.#schema}.responses set posted = true where id = $1${fenced ? ` and ${this.#held("responses")}` : ""}${of === null ? "" : " and thread_key = $2"} returning id`,
+      of === null ? [pendingResponseId] : [pendingResponseId, of],
     ).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
+  /** Whether a response is complete, its row locked until the transaction asking ends, so no write completes it meanwhile. */
+  lockCompleted(pendingResponseId: string): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query<{ completed: boolean }>(`select completed from ${this.#schema}.responses where id = $1 for update`, [pendingResponseId]).pipe(
+      Effect.map(([row]) => row?.completed ?? false),
+    );
   }
 
   getCompletedResponsesPendingDelivery(): Effect.Effect<CompletedResponse[], StoreError> {
