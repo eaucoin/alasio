@@ -20,7 +20,6 @@ import { scramVerifier } from "../neon/control/scram.ts";
 import { CodexAppServer } from "../src/codex/app-server/client.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { HarnessHost } from "../src/harness/host.ts";
-import { HostEvents } from "../src/harness/host-events.ts";
 import { type Harness, Harnesses, type OwnTurns, type TurnResult } from "../src/harness/index.ts";
 import { grantDigest, grantKey, harnessGrant } from "../src/harness/grant.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
@@ -30,6 +29,7 @@ import { LakeWake } from "../src/neon/lake-wake.ts";
 import { Store } from "../src/persistence/store.ts";
 import { ReceivedFiles } from "../src/telegram/files.ts";
 import { startPostgres } from "./support/postgres.ts";
+import { inProcessEvents } from "./support/host-events.ts";
 
 /** Runs `statements` on a connection to `url`. */
 async function run(url: string, ...statements: string[]): Promise<void> {
@@ -49,7 +49,6 @@ function writingHarness(own: OwnTurns[]): Harness {
     name: CODEX_HARNESS,
     displayName: harnessDisplayName(CODEX_HARNESS),
     supportsGoals: false,
-    supportsWarmup: false,
     sessions: {
       listSessions: unused("listSessions"),
       getTotalSessionPages: unused("getTotalSessionPages"),
@@ -60,7 +59,6 @@ function writingHarness(own: OwnTurns[]): Harness {
       createForkedSession: unused("createForkedSession"),
     },
     startFreshSession: unused("startFreshSession"),
-    warmSession: () => Effect.succeed(false),
     runTurn: (params) =>
       Effect.gen(function*() {
         const turn = params.persistence;
@@ -129,7 +127,7 @@ test("a turn run through the harness host as its own role writes all a turn writ
       // The host, on a store of the harness's role, of the state alasio made: it makes none of it.
       const services = yield* Layer.build(HarnessHost.layer.pipe(
         Layer.provideMerge(Harnesses.layer({ overrides: { [CODEX_HARNESS]: writingHarness(own) } })),
-        Layer.provideMerge(Layer.mergeAll(HostEvents.inProcess, ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir }))),
+        Layer.provideMerge(Layer.mergeAll(inProcessEvents, ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir }))),
         Layer.provideMerge(Store.layer({ pool: harnessPool, makesSchema: false })),
       ));
       const harness = { host: Context.get(services, HarnessHost), store: Context.get(services, Store) };
@@ -146,8 +144,6 @@ test("a turn run through the harness host as its own role writes all a turn writ
         epoch,
         jobId: job.id,
         attachedTurn: null,
-        bayma: null,
-        codex: null,
       });
       assert.deepEqual((yield* alasio.getCompletedResponsesPendingDelivery).map(({ id, blocks }) => ({ id, blocks })), [{ id: result.pendingResponseId, blocks: [{ type: "text", content: "Fixed." }] }]);
       assert.equal((yield* alasio.getConversation(conversationId))?.codex_session_id, "thread-1");

@@ -86,7 +86,7 @@ const START = {
   epoch: 3,
   jobId: null,
   attachedTurn: null,
-  bayma: null,
+  bayma: { endpoint: null, notice: "this test brings up no bayma" },
   codex: null,
 };
 

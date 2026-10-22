@@ -61,7 +61,6 @@ function answeringHarness(holding: () => Held | null): Harness {
     name: CODEX_HARNESS,
     displayName: harnessDisplayName(CODEX_HARNESS),
     supportsGoals: false,
-    supportsWarmup: false,
     sessions: {
       listSessions: unused("listSessions"),
       getTotalSessionPages: unused("getTotalSessionPages"),
@@ -72,7 +71,6 @@ function answeringHarness(holding: () => Held | null): Harness {
       createForkedSession: unused("createForkedSession"),
     },
     startFreshSession: () => Effect.succeed("thread-fresh"),
-    warmSession: () => Effect.succeed(false),
     runTurn: (params) =>
       Effect.gen(function*() {
         const pendingResponseId = yield* params.persistence.createPendingResponse(params.chatId, params.messageId, THREAD);
@@ -242,7 +240,7 @@ test("alasio harness binds its conversation and serves its host to the bearer of
       epoch,
       jobId: null,
       attachedTurn: null,
-      bayma: null,
+      bayma: { endpoint: null, notice: "this test brings up no bayma" },
       codex: null,
     });
     const claim = (messageId: string) => Effect.runPromise(alasio.claimTurn({ conversationId, chatId: "41", messageId, sessionId: THREAD, harness: CODEX_HARNESS, prompt: messageId }));

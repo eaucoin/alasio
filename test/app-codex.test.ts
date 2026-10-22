@@ -21,21 +21,30 @@ import {
   alasioFor,
   timeless,
 } from "./support/scenarios.ts";
-import { testPool } from "./support/store.ts";
 import { OPERATOR_ID } from "./support/telegram.ts";
 
 /** What alasio adds to every Codex thread's developer instructions. */
 const REPLY_INSTRUCTIONS = "Your replies reach the operator in Telegram through alasio. To show the operator an image or video file, embed it on a line of its own with Markdown image syntax and a local path, `![short caption](path)`, absolute or relative to the working directory: alasio sends the file itself in its place, several embeds in one paragraph as a collage. Naming a path any other way, such as in backticks, only refers to the file. Photos up to 10 MB and videos up to 50 MB, at most 10 per reply.";
 
 /** Once a statement of the conversation store's `schema` sleeps, as a test's trigger has it, waiting for it. */
-async function sleepingIn(schema: string): Promise<void> {
-  const pool = await testPool();
+async function sleepingIn({ stateSchema: schema, pool }: RunningAlasio): Promise<void> {
   for (let waited = 0; ; waited += 50) {
     const { rows } = await pool.query<{ n: string }>("select count(*) as n from pg_stat_activity where wait_event = 'PgSleep' and query ilike $1", [`%${schema}.prompt_jobs%`]);
     if (Number(rows[0]?.n) > 0) return;
     assert.ok(waited < 10_000, "the store never slept on the turn's start");
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+}
+
+/**
+ * The bayma a Codex thread's configuration names, its folder's: at its pod's loopback, which
+ * passes its requests on through the gateway to its folder instance, with a bearer of its own.
+ */
+function podBayma(params: { readonly config?: unknown }): { readonly url: string; readonly http_headers: { readonly Authorization: string } } {
+  const bayma = (params.config as { readonly mcp_servers?: { readonly bayma?: { readonly url: string; readonly http_headers: { readonly Authorization: string } } } } | undefined)?.mcp_servers?.bayma;
+  assert.match(bayma?.url ?? "", /^http:\/\/127\.0\.0\.1:\d+\/mcp\/[0-9a-f-]+$/u);
+  assert.match(bayma?.http_headers.Authorization ?? "", /^Bearer \S+$/u);
+  return { url: bayma?.url ?? "", http_headers: { Authorization: bayma?.http_headers.Authorization ?? "" } };
 }
 
 /** The concurrency panel's buttons. */
@@ -124,7 +133,7 @@ test("a message before any service is mounted gets the service picker and is not
         "",
         "No folder is mounted. Choose a folder to work in, or create one; your message was not queued.",
       ].join("\n"),
-      buttons: [["· alpha"], ["New folder…", "Refresh", "Close"]],
+      buttons: [["· alpha"], ["New empty workspace…"], ["New folder…", "Refresh", "Close"]],
     },
   ]);
 
@@ -147,7 +156,7 @@ test("a message before any service is mounted gets the service picker and is not
         "",
         `Mounted alpha (${alpha}). Send a message to start.`,
       ].join("\n"),
-      buttons: [["* · alpha"], ["New folder…", "Refresh", "Close"]],
+      buttons: [["* · alpha"], ["Restart folder instance"], ["New empty workspace…"], ["New folder…", "Refresh", "Close"]],
     },
   ]);
   // The first message was not queued: mounting ran nothing, and the next prompt is the first turn.
@@ -179,7 +188,7 @@ test("a Codex turn: a status message, sent then edited, and the final answer alo
     config: {
       project_doc_max_bytes: 32768,
       developer_instructions: REPLY_INSTRUCTIONS,
-      mcp_servers: { bayma: { url: "http://bayma.test:7290/mcp", http_headers: { Authorization: "Bearer folder-bayma" }, startup_timeout_sec: 60 } },
+      mcp_servers: { bayma: { ...podBayma(threadStart.params), startup_timeout_sec: 60 } },
       model_reasoning_effort: "high",
     },
   });
@@ -211,8 +220,15 @@ test("a Codex turn: a status message, sent then edited, and the final answer alo
   ]);
   const [edit] = telegram.callsTo("editMessageText", mark);
   assert.equal(edit?.params.message_id, status.messageId);
-  // One app-server, started in the folder, as Codex's app-server over stdio.
-  assert.deepEqual(codex.processes.map(({ argv, cwd }) => ({ argv, cwd })), [{ argv: ["app-server", "--disable", "plugins", "--disable", "apps", "--listen", "stdio://"], cwd: alpha }]);
+  // One app-server, started in the folder by the conversation's pod, as Codex's app-server over stdio, calling the model through the pod's relay of alasio's login.
+  const [started, ...others] = codex.processes;
+  assert.deepEqual(others, []);
+  const relay = /^model_providers\.alasio_login_relay=\{ name = "the operator's Codex login, through alasio", base_url = "http:\/\/127\.0\.0\.1:\d+\/v1", env_key = "ALASIO_CODEX_LOGIN", wire_api = "responses" \}$/u;
+  assert.match(started?.argv[8] ?? "", relay);
+  assert.deepEqual({ argv: started?.argv.toSpliced(8, 1), cwd: started?.cwd }, {
+    argv: ["app-server", "--disable", "plugins", "--disable", "apps", "-c", 'model_provider="alasio_login_relay"', "-c", "--listen", "stdio://"],
+    cwd: alpha,
+  });
   assert.deepEqual(codex.notifications, [{ method: "initialized", params: null }]);
   assert.deepEqual(codex.unanswered(), []);
 });
@@ -406,7 +422,7 @@ test("/stop as the turn's start is recorded, before its events are read, interru
   const alasio = await alasioFor(t, { folders: ["alpha"] });
   const { telegram, codex, stateSchema } = alasio;
   // The store takes its while to record that the turn started upstream.
-  await (await testPool()).query(`
+  await alasio.pool.query(`
     create function ${stateSchema}.slow_upstream_start() returns trigger language plpgsql as $$
       begin
         if new.upstream_started_at is not null and old.upstream_started_at is null then perform pg_sleep(3); end if;
@@ -420,7 +436,7 @@ test("/stop as the turn's start is recorded, before its events are read, interru
   await answerThreadStart(codex, "thread-1", alasio.folder("alpha"));
   await answerTurnStart(codex, "thread-1", "turn-1");
   // Stopped once the store is recording the turn's start, the app-server having answered it.
-  await sleepingIn(stateSchema);
+  await sleepingIn(alasio);
   const mark = telegram.mark();
   telegram.say("/stop");
   const interrupt = await codex.next("turn/interrupt");
@@ -564,7 +580,7 @@ test("the app-server exiting mid-turn fails the turn visibly, and the next promp
     config: {
       project_doc_max_bytes: 32768,
       developer_instructions: REPLY_INSTRUCTIONS,
-      mcp_servers: { bayma: { url: "http://bayma.test:7290/mcp", http_headers: { Authorization: "Bearer folder-bayma" }, startup_timeout_sec: 60 } },
+      mcp_servers: { bayma: { ...podBayma(resume.params), startup_timeout_sec: 60 } },
       model_reasoning_effort: "high",
     },
   });

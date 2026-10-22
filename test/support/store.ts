@@ -85,11 +85,11 @@ export async function handlingLockHolder(schema: string, chatId: string | number
 }
 
 /**
- * Holds the chat's handling lock of the store in `schema` as another alasio does, until
- * what it gives is called, which lets go of it, the first time.
+ * Holds the chat's handling lock of the store in `schema`, of the test's database or `pool`'s,
+ * as another alasio does, until what it gives is called, which lets go of it, the first time.
  */
-export async function holdHandlingLock(schema: string, chatId: string | number): Promise<() => Promise<void>> {
-  const other = await (await database()).pool.connect();
+export async function holdHandlingLock(schema: string, chatId: string | number, pool?: pg.Pool): Promise<() => Promise<void>> {
+  const other = await (pool ?? (await database()).pool).connect();
   await other.query("begin");
   await other.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [handlingLockName(schema, chatId)]);
   let held = true;

@@ -6,9 +6,9 @@
  * bound (TurnStart.bayma): what the harness leaves going on reaches it with no turn after.
  *
  * Its harness's process is told its bayma once, as it starts: it reaches it at the pod's
- * loopback (../mcp/bayma-proxy.ts), as a harness in alasio's process does, which passes each
- * request on with the bearer the latest turn gave its workspace, its configuration never
- * changing as its conversation's turns switch workspaces.
+ * loopback (../mcp/bayma-proxy.ts), which passes each request on with the bearer the latest
+ * turn gave its workspace, its configuration never changing as its conversation's turns switch
+ * workspaces.
  *
  * The session filesystems are the gateway's, as alasio's are (../sandbox/index.ts), each
  * workspace reached by the token its latest turn gave (../sandbox/gateway-client.ts
@@ -71,7 +71,6 @@ export const makeGivenBayma = Effect.fnUntraced(function*({ gatewayUrl, environm
   return {
     give: (start) =>
       Effect.sync(() => {
-        if (start.bayma === null) return;
         if (start.bayma.endpoint === null) {
           notice = start.bayma.notice;
           return;

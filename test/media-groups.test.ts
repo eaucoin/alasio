@@ -118,7 +118,6 @@ function refusingHarness(ran: string[]): Harness {
     name: CODEX_HARNESS,
     displayName: harnessDisplayName(CODEX_HARNESS),
     supportsGoals: false,
-    supportsWarmup: false,
     sessions: {
       listSessions: unused("listSessions"),
       getTotalSessionPages: unused("getTotalSessionPages"),
@@ -129,7 +128,6 @@ function refusingHarness(ran: string[]): Harness {
       createForkedSession: unused("createForkedSession"),
     },
     startFreshSession: unused("startFreshSession"),
-    warmSession: () => Effect.succeed(false),
     runTurn: (params) => Effect.andThen(Effect.sync(() => void ran.push(params.prompt)), Effect.die(new Error("its turn ran"))),
     listModels: unused("listModels"),
     defaultModelChoice: unused("defaultModelChoice"),

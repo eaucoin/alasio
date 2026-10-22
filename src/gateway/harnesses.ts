@@ -46,10 +46,10 @@ import { IDLE_POLL_MS, type Idleness, lingered, makeSweep, notIdle } from "../bi
 import { bindingToken, type HeldTo } from "../binder/tokens.ts";
 import { branchNamespace } from "../branch/names.ts";
 import type { EventInput, Events } from "../events/events.ts";
-import type { HarnessHost, HarnessStatus } from "../harness/host.ts";
+import type { HarnessStatus } from "../harness/host.ts";
 import { HarnessHostError } from "../harness/index.ts";
 import { isHarnessName } from "../harness/names.ts";
-import { remoteHost } from "../harness/remote-host.ts";
+import { type RemoteHost, remoteHost } from "../harness/remote-host.ts";
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { PodOwner } from "../node-agent/workspaces.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
@@ -230,7 +230,7 @@ export const makeHarnesses = Effect.fnUntraced(function*(
   const ownsNamespace = (namespace: string) => Effect.map(environmentOf(namespace), (environment) => environment !== null);
 
   /** The host of the binding `lease`'s pod `pod`, reached at its address with its binding's token; null where it has none. */
-  const hostOf = (lease: BindingLease, pod: V1Pod): HarnessHost["Service"] | null => {
+  const hostOf = (lease: BindingLease, pod: V1Pod): RemoteHost | null => {
     const address = pod.status?.podIP;
     if (!address) return null;
     const token = bindingToken(bindingKey, { key: lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "", binding: lease.metadata?.uid ?? "", namespace: lease.metadata?.namespace ?? "" });

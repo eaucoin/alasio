@@ -25,7 +25,6 @@ function endlessHarness(started: string[]): Harness {
     name: CODEX_HARNESS,
     displayName: harnessDisplayName(CODEX_HARNESS),
     supportsGoals: false,
-    supportsWarmup: false,
     sessions: {
       listSessions: unused("listSessions"),
       getTotalSessionPages: unused("getTotalSessionPages"),
@@ -36,7 +35,6 @@ function endlessHarness(started: string[]): Harness {
       createForkedSession: unused("createForkedSession"),
     },
     startFreshSession: unused("startFreshSession"),
-    warmSession: () => Effect.succeed(false),
     runTurn: (params) => Effect.andThen(Effect.sync(() => void started.push(params.prompt)), Effect.never),
     listModels: unused("listModels"),
     defaultModelChoice: unused("defaultModelChoice"),

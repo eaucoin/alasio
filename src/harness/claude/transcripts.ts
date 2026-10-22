@@ -8,8 +8,9 @@
  *
  * - `ensureLocalTranscript` writes a transcript back from the store before a
  *   resume, if the local file is gone.
- * - `adoptTranscripts` runs at startup: a session the store has never seen is
- *   imported whole; one it has is reconciled, adding any entry the
+ * - `adoptTranscripts` runs as a harness pool's pod's host is let go of, its
+ *   transcripts going with its pod (Harness.mirror): a session the store has
+ *   never seen is imported whole; one it has is reconciled, adding any entry the
  *   best-effort mirror dropped or never saw, matched so nothing is duplicated.
  */
 import { importSessionToStore, type SessionKey, type SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
@@ -201,8 +202,8 @@ const adopting = <A>(work: () => Promise<A>): Effect.Effect<A, TranscriptAdoptio
   Effect.tryPromise({ try: work, catch: (cause) => new TranscriptAdoptionError({ cause }) });
 
 /**
- * Brings every session alasio points at into the store: `sessions` is
- * `[{ sessionId, workingDirectory }]`. Idempotent; run before serving. A session
+ * Brings the sessions `sessions` into the store: `[{ sessionId, workingDirectory }]`.
+ * Idempotent. A session
  * that cannot be adopted is logged and left; failing to look for sessions here fails.
  */
 export const adoptTranscripts = Effect.fnUntraced(function*({ store, sessions }: AdoptTranscriptsOptions): Effect.fn.Return<void, TranscriptAdoptionError> {

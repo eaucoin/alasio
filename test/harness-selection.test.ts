@@ -93,7 +93,6 @@ function createFakeHarness(name: HarnessName, { sessionId = `${name}-fresh` } = 
     name,
     displayName: harnessDisplayName(name),
     supportsGoals: name === CODEX_HARNESS,
-    supportsWarmup: false,
     sessions: {
       listSessions: () => assert.fail("listSessions"),
       getTotalSessionPages: () => assert.fail("getTotalSessionPages"),
@@ -109,7 +108,6 @@ function createFakeHarness(name: HarnessName, { sessionId = `${name}-fresh` } = 
         calls.push(["startFreshSession", args]);
         return sessionId;
       }),
-    warmSession: () => Effect.succeed(false),
     runTurn: () => Effect.die(new Error("not exercised")),
     listModels: () => assert.fail("listModels"),
     defaultModelChoice: () => assert.fail("defaultModelChoice"),
@@ -218,7 +216,6 @@ test("conversations keep one parked session pointer per harness", async () => {
 
     await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
     assert.equal((await run(store.getMount(conversationId))).harness, CODEX_HARNESS);
-    assert.deepEqual(await run(store.listConversationsWithSessions(CODEX_HARNESS)), []);
     await run(store.setWorkingDirectory(conversationId, "/work/a"));
     await run(store.setSessionId(conversationId, "codex-session"));
     assert.equal((await run(store.getMount(conversationId))).sessionId, "codex-session");
@@ -233,12 +230,6 @@ test("conversations keep one parked session pointer per harness", async () => {
     await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
     assert.equal((await run(store.getMount(conversationId))).sessionId, "codex-session");
     assert.equal(harnessSessionOf(await run(store.getConversation(conversationId)), CLAUDE_HARNESS), "claude-session");
-
-    assert.deepEqual(
-      (await run(store.listConversationsWithSessions(CODEX_HARNESS))).map((row) => [row.session_id, row.working_directory]),
-      [["codex-session", "/work/a"]],
-    );
-    assert.deepEqual(await run(store.listConversationsWithSessions(CLAUDE_HARNESS)), []);
   });
 });
 
@@ -265,38 +256,6 @@ test("switching folders parks both harness session pointers per folder", async (
     await run(store.setWorkingDirectory(conversationId, "/work/b"));
     assert.equal((await run(store.getMount(conversationId))).sessionId, "codex-b");
     assert.equal(harnessSessionOf(await run(store.getConversation(conversationId)), CLAUDE_HARNESS), null);
-  });
-});
-
-test("every session a harness is pointed at is listed with its folder, once", async () => {
-  await withStore(async (store) => {
-    const parked = await run(store.upsertConversation({ chatId: "16", user: { id: 16 } }));
-    await run(store.setActiveHarness(parked, CLAUDE_HARNESS));
-    await run(store.setWorkingDirectory(parked, "/work/a"));
-    await run(store.setSessionId(parked, "claude-a"));
-    await run(store.setWorkingDirectory(parked, "/work/b"));
-    await run(store.setSessionId(parked, "claude-b"));
-
-    const live = await run(store.upsertConversation({ chatId: "17", user: { id: 17 } }));
-    await run(store.setActiveHarness(live, CLAUDE_HARNESS));
-    await run(store.setWorkingDirectory(live, "/work/c"));
-    await run(store.claimTurn({ conversationId: live, chatId: "17", messageId: "1", sessionId: null, harness: CLAUDE_HARNESS, prompt: "hi" }));
-    await run((await writerOf(store, live, "17")).updateActiveTurnSessionId("claude-live"));
-
-    const codex = await run(store.upsertConversation({ chatId: "18", user: { id: 18 } }));
-    await run(store.setActiveHarness(codex, CODEX_HARNESS));
-    await run(store.setWorkingDirectory(codex, "/work/d"));
-    await run(store.setSessionId(codex, "codex-d"));
-
-    assert.deepEqual(
-      (await run(store.listHarnessSessionReferences(CLAUDE_HARNESS))).sort((x, y) => x.sessionId.localeCompare(y.sessionId)),
-      [
-        { sessionId: "claude-a", workingDirectory: "/work/a" },
-        { sessionId: "claude-b", workingDirectory: "/work/b" },
-        { sessionId: "claude-live", workingDirectory: "/work/c" },
-      ],
-    );
-    assert.deepEqual(await run(store.listHarnessSessionReferences(CODEX_HARNESS)), [{ sessionId: "codex-d", workingDirectory: "/work/d" }]);
   });
 });
 

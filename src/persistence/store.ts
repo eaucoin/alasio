@@ -19,8 +19,6 @@ import { type CallbackAction, NeonCallbackRepository, type NewCallbackAction } f
 import { NeonCodexLoginRepository } from "./codex-login-repository.ts";
 import {
   type Conversation,
-  type HarnessSessionReference,
-  type LinkedConversation,
   type ModelChoice,
   type Mount,
   NeonConversationRepository,
@@ -256,10 +254,6 @@ export class Store extends Context.Service<Store, {
   readonly getConversationByChatId: (chatId: number | string) => Stored<Conversation | null>;
   /** What the conversation has mounted; nothing, for one not yet made. */
   readonly getMount: (conversationId: string) => Stored<Mount>;
-  /** The conversations whose mounted harness, `harness`, has a session, most recently changed first. */
-  readonly listConversationsWithSessions: (harness: HarnessName) => Stored<LinkedConversation[]>;
-  /** Every session of a harness alasio points at, with the folder it runs in. */
-  readonly listHarnessSessionReferences: (harness: HarnessName) => Stored<HarnessSessionReference[]>;
   /** The conversations that know the workspace: mounting it, or keeping a session of it parked; none for one alasio never made. */
   readonly listWorkspaceConversations: (workingDirectory: string) => Stored<WorkspaceConversation[]>;
   readonly setActiveHarness: (conversationId: string, harness: HarnessName) => Stored<void>;
@@ -544,8 +538,6 @@ const makeStore = Effect.fnUntraced(function*({
     getConversation: (conversationId) => conversations.getConversation(conversationId),
     getConversationByChatId: (chatId) => conversations.getConversationByChatId(chatId),
     getMount: (conversationId) => conversations.getMount(conversationId),
-    listConversationsWithSessions: (harness) => conversations.listConversationsWithSessions(harness),
-    listHarnessSessionReferences: (harness) => conversations.listHarnessSessionReferences(harness),
     listWorkspaceConversations: (workingDirectory) => conversations.listWorkspaceConversations(workingDirectory),
     setActiveHarness: (conversationId, harness) => conversations.setActiveHarness(conversationId, harness),
     setWorkingDirectory: (conversationId, workingDirectory) => conversations.setWorkingDirectory(conversationId, workingDirectory),

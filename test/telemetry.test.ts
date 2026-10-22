@@ -299,7 +299,7 @@ test("a call of a harness host elsewhere carries its span's trace context, and t
   try {
     const { port } = await Effect.runPromise(serveHost({ port: 0, host: "127.0.0.1", conversationId: "telegram:7", token: "host-token" }).pipe(Effect.provideService(HarnessHost, host), Scope.provide(scope), Effect.provide(TracingLayer)));
     const reached = remoteHost({ url: `http://127.0.0.1:${port}`, token: Effect.succeed("host-token") });
-    const start = { conversationId: "telegram:7", chatId: "7", messageId: "1", harness: CODEX_HARNESS as typeof CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch: 1, jobId: null, attachedTurn: null, bayma: null, codex: null };
+    const start = { conversationId: "telegram:7", chatId: "7", messageId: "1", harness: CODEX_HARNESS as typeof CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch: 1, jobId: null, attachedTurn: null, bayma: { endpoint: null, notice: "this test brings up no bayma" } as const, codex: null };
     await Effect.runPromise(reached.startTurn(start).pipe(withAlasioSpan("test.pooled-turn"), Effect.provide(TracingLayer)));
     const turn = finishedSpan("test.pooled-turn");
     // The server's span ends once its answer is sent whole, a moment after its caller read it.
@@ -339,7 +339,6 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
         name,
         displayName: name,
         supportsGoals: false,
-        supportsWarmup: false,
         sessions: {
           listSessions: unused,
           getTotalSessionPages: unused,
@@ -350,7 +349,6 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
           createForkedSession: unused,
         },
         startFreshSession: unused,
-        warmSession: unused,
         listModels: unused,
         defaultModelChoice: unused,
         runTurn: () =>

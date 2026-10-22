@@ -9,15 +9,15 @@
  *
  * What only reads what a binding has (its status, its background work, its turn steered or
  * stopped) binds nothing: of a conversation bound nowhere, nothing runs, and a hold of the
- * store's keeps it as alasio's process would say. A reservation binds it ahead (POST /bind), as
+ * store's keeps it busy, as a bound pod's host would say (HarnessHost.status). A reservation binds it ahead (POST /bind), as
  * a turn is about to start, asked again while the front cannot bind it yet, as a pod slow to
  * serve after its node started again is, what it waits on told the reservation's caller, who
  * says it in the turn's status message; then holds it at its host. A turn and a fresh session
  * reach the pod bound then, given the binding's grant (./grant.ts), kept as the conversation's
  * as it is bound, which the pod reaches the conversation's rows by and no other's. Each turn
- * is given its workspace's bayma as alasio brings it up, as
- * the host there has no key to (TurnStart.bayma): a session's, brought up as it is in alasio's
- * process, a branch's inherited session forked first; a folder instance's, bound, what a long
+ * is given its workspace's bayma as alasio brings it up, as the host there has no key to
+ * (TurnStart.bayma): a session's, a branch's inherited session forked first; a folder
+ * instance's, bound, what a long
  * bind of it waits on said in the turn's status, its chat told of a bind that failed. Its
  * bearer stops at no time, but is held to the binding of the conversation's harness the bind
  * ahead answers with, good for as long as that is held (../binder/server.ts): the pod's
@@ -30,8 +30,7 @@
  * configuration, as only alasio holds the login; and alasio, the one refresher of the login,
  * keeps it fresh before the turn and as it renews its token (../codex/login-refresh.ts), by its
  * own app-server. alasio's own pod is held busy for as long as it drives a turn (../kube/busy.ts),
- * as where the turn runs in its process, since it is alasio that takes the turn's answer to its
- * chat. The operator's panels are alasio's (./panels.ts): a fork of a session, and a thread's
+ * since it is alasio that takes the turn's answer to its chat. The operator's panels are alasio's (./panels.ts): a fork of a session, and a thread's
  * goals, of the conversation's pod, bound ahead for them (forkSession, goals).
  */
 import { join } from "node:path";
@@ -51,11 +50,11 @@ import { Store } from "../persistence/store.ts";
 import { BIND_WAIT_MS, TOKEN_TTL_MS } from "../sandbox/gateway-client.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
-import { type ConversationHarness, HarnessHost, type TurnBayma, type TurnCodex, type TurnStart } from "./host.ts";
+import { type ConversationHarness, HarnessHost, type TurnBayma, type TurnCodex, type TurnRequest } from "./host.ts";
 import { HarnessHostError } from "./index.ts";
 import { grantDigest, grantKey, harnessGrant } from "./grant.ts";
 import { CODEX_HARNESS, type HarnessName } from "./names.ts";
-import { remoteHost } from "./remote-host.ts";
+import { type RemoteHost, remoteHost } from "./remote-host.ts";
 
 /** How often a harness the front cannot bind yet is asked to be bound again. */
 const BIND_RETRY = "2 seconds";
@@ -157,15 +156,15 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
        * or, where it has no harness in a workspace, so that nothing is bound for it, what `none`
        * says.
        */
-      const onHost = <A, E, R>(conversationId: string, call: (host: HarnessHost["Service"], token: Effect.Effect<string>) => Effect.Effect<A, E, R>, none: Effect.Effect<A, E, R>) =>
+      const onHost = <A, E, R>(conversationId: string, call: (host: RemoteHost, token: Effect.Effect<string>) => Effect.Effect<A, E, R>, none: Effect.Effect<A, E, R>) =>
         Effect.flatMap(store.getMount(conversationId), ({ harness, workingDirectory }) => {
           if (!harness || !workingDirectory) return none;
           const token = tokenOf(conversationId, harness, workingDirectory);
           return call(hostBy(token), token);
         });
 
-      /** What a long bind of the turn `start`'s waits on, said in its status, as the harness in alasio's process says it. */
-      const waitingOf = (start: TurnStart) => (what: string | null) =>
+      /** What a long bind of the turn `start`'s waits on, said in its status message, as a harness says what its turn waits on (TurnPersistence.setWaiting). */
+      const waitingOf = (start: TurnRequest) => (what: string | null) =>
         store.turnPersistence(start.conversationId, start.epoch).setWaiting(what).pipe(
           Effect.catch((error) => Effect.logWarning(`could not say thread=${start.conversationId} waits on ${what ?? "nothing"}: ${error.message}`)),
         );
@@ -214,7 +213,7 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
        * `call` of the conversation's host as `of` places it, its harness bound ahead first and the
        * call for that binding alone, giving its grant (onBinding): what it answered.
        */
-      const onBound = <A, E>(of: ConversationHarness, call: (host: HarnessHost["Service"]) => Effect.Effect<A, E | HarnessHostError>): Effect.Effect<A, E | HarnessHostError> =>
+      const onBound = <A, E>(of: ConversationHarness, call: (host: RemoteHost) => Effect.Effect<A, E | HarnessHostError>): Effect.Effect<A, E | HarnessHostError> =>
         Effect.gen(function*() {
           const token = tokenOf(of.conversationId, of.harness, of.workingDirectory);
           const held = yield* boundAhead(of.conversationId, token, () => Effect.void);
@@ -223,7 +222,7 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
         });
 
       /** The bayma of the turn `start`'s workspace, brought up for it, its bearer held to the binding `held` of the conversation's harness, as the module says. */
-      const baymaOf = (start: TurnStart, held: HeldTo): Effect.Effect<TurnBayma> =>
+      const baymaOf = (start: TurnRequest, held: HeldTo): Effect.Effect<TurnBayma> =>
         Effect.gen(function*() {
           const workspace = parseWorkspace(start.workingDirectory);
           if (workspace?.kind === "sessionfs") {
@@ -247,7 +246,7 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
       const loginOf = (conversationId: string): Effect.Effect<TurnCodex["login"]> =>
         Effect.andThen(loginFresh, Effect.map(Clock.currentTimeMillis, (now) => ({ url: codexLogin.url, token: mintToken(loginKey, { key: harnessKey(conversationId), expires: now + CODEX_LOGIN_TTL_MS }) })));
       /** What a Codex turn of `start`'s is given of its login, a token of the turn's for alasio's relay, and, a folder conversation's, the operator's Codex configuration; none for another harness's. */
-      const codexOf = (start: TurnStart): Effect.Effect<TurnCodex | null> =>
+      const codexOf = (start: TurnRequest): Effect.Effect<TurnCodex | null> =>
         Effect.gen(function*() {
           if (start.harness !== CODEX_HARNESS) return null;
           const login = yield* loginOf(start.conversationId);
@@ -255,7 +254,7 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
           return { login, home };
         });
       /** The token of the Codex turn `start`'s renewed on `host` every renewMs, for as long as it runs, as the module says. */
-      const renewing = (host: HarnessHost["Service"], start: TurnStart): Effect.Effect<void> =>
+      const renewing = (host: RemoteHost, start: TurnRequest): Effect.Effect<void> =>
         Effect.flatMap(loginOf(start.conversationId), (login) => host.renewCodexLogin(start.conversationId, login)).pipe(
           Effect.catch((error) => Effect.logWarning(`thread=${start.conversationId}'s Codex login could not be renewed: ${error.message}`)),
           Effect.delay(codexLogin.renewMs ?? CODEX_LOGIN_RENEW_MS),

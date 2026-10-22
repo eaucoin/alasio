@@ -64,7 +64,7 @@ import { ReceivedFiles } from "../telegram/files.ts";
 import { ActiveTurns } from "./active-turns.ts";
 import { makeGivenBayma } from "./given-bayma.ts";
 import { makeGivenCodexLogin } from "./given-codex-login.ts";
-import { HarnessHost } from "./host.ts";
+import { HarnessHost, type TurnStart } from "./host.ts";
 import { HostEvents } from "./host-events.ts";
 import { Harnesses, type HarnessesOptions } from "./index.ts";
 import { serveHost } from "./serve.ts";
@@ -228,19 +228,17 @@ export const startHarness = Effect.fnUntraced(function*(config: HarnessConfig, {
     Layer.provideMerge(sessions),
     Layer.provideMerge(Layer.succeedContext(stores)),
   ));
-  // Each turn's workspace's bayma taken as it starts, before it runs.
   const host = Context.get(built, HarnessHost);
-  const giving = given && login
-    ? HarnessHost.of({
-      ...host,
-      startTurn: (start) => given.give(start).pipe(
+  // Its Codex's login renewed as alasio gives it anew.
+  const renewing = login ? HarnessHost.of({ ...host, renewCodexLogin: (_conversationId, renewed) => login.renew(renewed) }) : host;
+  // Each turn's workspace's bayma, and its Codex's login, taken as it starts, before it runs.
+  const takes = given && login
+    ? (start: TurnStart) =>
+      given.give(start).pipe(
         Effect.andThen(login.give(start).pipe(Effect.catch((error) => Effect.logWarning(`the operator's Codex configuration could not be written for its turn, which runs on what it had: ${error.message}`)))),
-        Effect.andThen(host.startTurn(start)),
-      ),
-      renewCodexLogin: (_conversationId, renewed) => login.renew(renewed),
-    })
-    : host;
-  const served = yield* Effect.provideService(serveHost({ port: config.port, conversationId, token, granted }), HarnessHost, giving);
+      )
+    : undefined;
+  const served = yield* Effect.provideService(serveHost({ port: config.port, conversationId, token, granted, given: takes }), HarnessHost, renewing);
   yield* Effect.logInfo(`serving the harness host of ${conversationId} on port ${served.port}`);
   return served;
 });

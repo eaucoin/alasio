@@ -28,7 +28,7 @@ import { HttpMiddleware, type HttpServerError, HttpServerRequest, HttpServerResp
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken, sameToken } from "../shared/tokens.ts";
 import { GRANT_HEADER, isGrant } from "./grant.ts";
-import { HarnessHost } from "./host.ts";
+import { HarnessHost, type TurnStart } from "./host.ts";
 import {
   AttachRequest,
   AttachUnknown,
@@ -78,6 +78,8 @@ export interface HostServerOptions {
   readonly conversationId: string;
   readonly token: string;
   readonly granted?: ((grant: string) => Effect.Effect<void, { readonly message: string }>) | undefined;
+  /** What the host is given of each turn before it runs it: what alasio brought up for it, its workspace's bayma and its Codex login (./program.ts); nothing where none is given. */
+  readonly given?: ((start: TurnStart) => Effect.Effect<void>) | undefined;
   readonly keepAliveMs?: number | undefined;
 }
 
@@ -102,7 +104,7 @@ const lines = <A, E>(values: Stream.Stream<A, E>, keepAliveMs: number): HttpServ
  * port it listens on, once it does.
  */
 export const serveHost = Effect.fnUntraced(function*(
-  { port, host: hostname = "0.0.0.0", conversationId, token, granted, keepAliveMs = KEEP_ALIVE_MS }: HostServerOptions,
+  { port, host: hostname = "0.0.0.0", conversationId, token, granted, given = () => Effect.void, keepAliveMs = KEEP_ALIVE_MS }: HostServerOptions,
 ): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope | HarnessHost> {
   const host = yield* HarnessHost;
 
@@ -148,7 +150,10 @@ export const serveHost = Effect.fnUntraced(function*(
       case HOST_PATHS.turns:
         return Effect.map(body(TurnStartRequest), (start) =>
           lines(
-            Stream.fromEffect(host.startTurn(turnStartOf(start)).pipe(
+            Stream.fromEffect(Effect.suspend(() => {
+              const turn = turnStartOf(start);
+              return Effect.andThen(given(turn), host.startTurn(turn));
+            }).pipe(
               Effect.map((result): object => ({ answer: encodeTurnAnswer(result) })),
               Effect.catch((error) => Effect.succeed(failureOf(error))),
             )),

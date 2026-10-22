@@ -13,7 +13,7 @@ import { EventsConsumer } from "../../src/events/consume.ts";
 import { Turns } from "../../src/codex/turns.ts";
 import { ActiveTurns } from "../../src/harness/active-turns.ts";
 import { HarnessHost } from "../../src/harness/host.ts";
-import { type Harness, Harnesses, type ModelOption } from "../../src/harness/index.ts";
+import type { Harness, ModelOption } from "../../src/harness/index.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS, type HarnessName } from "../../src/harness/names.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { Panels } from "../../src/harness/panels.ts";
@@ -149,17 +149,17 @@ function testServices({
   branch,
   host,
   models = {},
-}: TestServicesOptions): Layer.Layer<AlasioServices | Pools> {
+}: TestServicesOptions): Layer.Layer<AlasioServices | Pools | ActiveTurns> {
   return Layer.effectDiscard(Effect.flatMap(EventsConsumer, (consumer) => consumer.start)).pipe(Layer.provideMerge(MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot, branch }), Authorizer.layer(allowedUserIds))),
     Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer()),
     Layer.provideMerge(testPanels({ stateDir, branch, models })),
     // Its harnesses run where a pool's do: in a pod's host, bound for the conversation, reached through the sandbox gateway's front.
     Layer.provideMerge(pooledHost({ standIns: { overrides: harnesses }, branch, host })),
-    Layer.provideMerge(Harnesses.layer({ overrides: harnesses, branch })),
     // Received files are written nowhere a test does not say; into a session through the test's session filesystems.
     Layer.provideMerge(ReceivedFiles.layer({ stateDir: stateDir ?? "/nonexistent-state-dir" })),
     Layer.provideMerge(Layer.mergeAll(
+      // The running turns the stand-in's pods keep, for a test to say a turn runs in a conversation as a pod's harness would.
       ActiveTurns.layer,
       outbox,
       // Started only by a turn on alasio's own Codex harness, which a test stands in for.
@@ -203,7 +203,7 @@ function testPanels({ stateDir = "/nonexistent-state-dir", branch, models }: { r
 }
 
 /** alasio's services for one test, which runs its effects in them. */
-export type TestAlasio = ManagedRuntime.ManagedRuntime<AlasioServices | Pools | Layer.Success<typeof TracingLayer>, never>;
+export type TestAlasio = ManagedRuntime.ManagedRuntime<AlasioServices | Pools | ActiveTurns | Layer.Success<typeof TracingLayer>, never>;
 
 /**
  * Runs `use` on alasio's services over `options`, and takes them down after, however it

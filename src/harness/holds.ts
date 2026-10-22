@@ -80,7 +80,7 @@ export interface HoldTiming {
  * begins, which starts its deadline (HOLD_DEADLINE): a fork runs it as it asks the gateway.
  */
 export const whileHeld = <A, E, R>(
-  host: HarnessHost["Service"],
+  host: Pick<HarnessHost["Service"], "status">,
   store: Store["Service"],
   conversationIds: readonly string[],
   reason: string,

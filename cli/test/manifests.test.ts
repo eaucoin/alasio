@@ -3696,7 +3696,6 @@ describe("conversations' harnesses' pools", () => {
     const config = JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}");
     assert.deepEqual(config.harnesses, { namespace: "alasio", pools: { codex: "harness-codex", claude: "harness-claude" }, podPort: 8080, owner: { uid: 1000, gid: 1000 }, releaseAfterSeconds: 300, drainSeconds: 120, folders: null });
     const alasio = Object.fromEntries((container(one<V1Deployment>(objects, "Deployment", "alasio")).env ?? []).map(({ name, value }) => [name, value]));
-    assert.equal(alasio["ALASIO_HARNESS_POOLS"], "1");
     // Its Codex login relayed to its pools' pods, on its pod's port, through a Service of its own.
     assert.equal(alasio["ALASIO_CODEX_LOGIN_URL"], "http://alasio-codex-login.alasio.svc.cluster.local:4320/v1");
     assert.deepEqual(container(one<V1Deployment>(objects, "Deployment", "alasio")).ports?.find(({ name }) => name === "codex-login")?.containerPort, 4320);

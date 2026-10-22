@@ -120,12 +120,6 @@ export interface FreshSessionParams {
   readonly workingDirectory?: string | undefined;
 }
 
-export interface WarmSessionParams {
-  readonly sessionId: string | null;
-  readonly threadKey: string;
-  readonly workingDirectory?: string | null | undefined;
-}
-
 /** A model as /model offers it, from either harness's catalogue. */
 export interface ModelOption {
   readonly id: string;
@@ -172,14 +166,11 @@ export interface Harness {
   readonly name: HarnessName;
   readonly displayName: string;
   readonly supportsGoals: boolean;
-  readonly supportsWarmup: boolean;
   readonly sessions: HarnessSessions;
   /** Present when the harness supports goals. */
   readonly goals?: HarnessGoals;
   /** A new, empty session for the conversation: its id. */
   readonly startFreshSession: (params: FreshSessionParams) => Effect.Effect<string, HarnessError>;
-  /** Loads a session ahead of its next turn: whether it did. */
-  readonly warmSession: (params: WarmSessionParams) => Effect.Effect<boolean, HarnessError>;
   /**
    * Runs a turn to its end. It fails only as alasio's store does, or with TurnFenced where
    * another turn has claimed the conversation since: what else goes wrong ends up in its
@@ -196,8 +187,8 @@ export interface Harness {
   readonly backgroundWork?: ((threadKey: string) => Effect.Effect<boolean>) | undefined;
   /**
    * Mirrors what the harness keeps of the session `sessionId` where it is kept beside it, so
-   * a host let go of leaves none of it behind: Codex's rollouts, to Neon. None where its
-   * mirror keeps up as it writes (Claude Code's transcripts, through its session store).
+   * a host let go of leaves none of it behind: Codex's rollouts, to Neon; Claude Code's
+   * transcripts, which its session store mirrors as it writes, whatever that mirror dropped.
    */
   readonly mirror?: ((sessionId: string) => Effect.Effect<void>) | undefined;
   readonly listModels: () => Effect.Effect<ModelOption[], HarnessError>;

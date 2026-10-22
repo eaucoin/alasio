@@ -10,6 +10,7 @@ import { getClaudeEffort, getClaudeModel } from "./model.ts";
 import { listClaudeModels } from "./models.ts";
 import { startFreshClaudeSession } from "./runtime.ts";
 import { createClaudeSessionApi, type ClaudeSessionApi } from "./sessions.ts";
+import { adoptTranscripts } from "./transcripts.ts";
 
 /** What makeClaudeHarness is given: a harness's options, and a stand-in session api for tests. */
 export interface ClaudeHarnessOptions extends HarnessOptions {
@@ -55,10 +56,8 @@ export const makeClaudeHarness = Effect.fnUntraced(function*({
     name: CLAUDE_HARNESS,
     displayName: harnessDisplayName(CLAUDE_HARNESS),
     supportsGoals: false,
-    supportsWarmup: false,
     sessions,
     startFreshSession: ({ threadKey }) => startFreshClaudeSession({ threadKey }),
-    warmSession: () => Effect.succeed(false),
     /**
      * One operator prompt on the conversation's live Claude Code process, starting or
      * replacing that process when the mounted session, folder or model differs from
@@ -66,6 +65,15 @@ export const makeClaudeHarness = Effect.fnUntraced(function*({
      */
     runTurn: (params) => liveSessions.runTurn({ ...params, workingDirectory: directory }),
     backgroundWork: (threadKey) => Effect.sync(() => liveSessions.backgroundWork(threadKey)),
+    // What the store's mirror dropped of the session, added as its host is let go of, its transcripts going with its pod.
+    ...(sessionStore
+      ? {
+        mirror: (sessionId: string) =>
+          adoptTranscripts({ store: sessionStore, sessions: [{ sessionId, workingDirectory: directory }] }).pipe(
+            Effect.catch((error) => Effect.logWarning(`the transcripts of ${sessionId} could not be set against the store's: ${error.message}`)),
+          ),
+      }
+      : {}),
     listModels: () => listClaudeModels({ workingDirectory: directory }),
     /** What a turn runs on when no /model choice is stored. */
     defaultModelChoice: () => ({ model: getClaudeModel(), effort: getClaudeEffort() }),

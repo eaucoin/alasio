@@ -4,6 +4,7 @@
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { join, relative } from "node:path";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -18,7 +19,7 @@ import {
   mount,
   alasioFor,
 } from "./support/scenarios.ts";
-import { holdHandlingLock, testPool } from "./support/store.ts";
+import { holdHandlingLock } from "./support/store.ts";
 import { LATE_ALBUM_PART } from "../src/telegram/media-group-buffer.ts";
 import { OPERATOR_ID } from "./support/telegram.ts";
 import { eventually } from "./support/wait.ts";
@@ -59,7 +60,10 @@ test("two photos of one album are one turn, whose prompt is the caption and both
   const [, firstPath = "", secondPath = ""] = prompt;
   assert.ok(firstPath.endsWith(`/photo-${first.message_id}.jpg`), firstPath);
   assert.ok(secondPath.endsWith(`/photo-${second.message_id}.jpg`), secondPath);
-  assert.deepEqual([readFileSync(firstPath), readFileSync(secondPath)], [firstPhoto, secondPhoto]);
+  // Written where the prompt names them, of the conversation's pod's own filesystem, alasio's path there.
+  const podStateDir = alasio.pools.stateDir(`telegram:${OPERATOR_ID}`) ?? assert.fail("the conversation has no pod bound");
+  const onPod = (path: string) => join(podStateDir, relative(alasio.stateDir, path));
+  assert.deepEqual([readFileSync(onPod(firstPath)), readFileSync(onPod(secondPath))], [firstPhoto, secondPhoto]);
   assert.deepEqual(telegram.callsTo("getFile", mark).map((call) => call.params.file_id), ["photo-a", "photo-b"]);
 
   answerTurn(codex, "thread-1", "turn-1", "Two photos.");
@@ -76,7 +80,7 @@ test("a photo of an album that comes once the album was handled is told of in it
   await answerThreadStart(codex, "thread-1", alasio.folder("alpha"));
   await answerTurnStart(codex, "thread-1", "turn-1");
   // The store refuses the first update it marks processed from now: the late photo's, which is handled again.
-  await (await testPool()).query(`
+  await alasio.pool.query(`
     create sequence ${stateSchema}.updates_marked;
     create function ${stateSchema}.refuse_first_mark() returns trigger language plpgsql as $$
       begin
@@ -89,9 +93,9 @@ test("a photo of an album that comes once the album was handled is told of in it
   const mark = telegram.mark();
   telegram.sendPhoto("photo-c", Buffer.from("late photo"), { mediaGroupId: "album-1" });
   await telegram.waitFor("sendMessage", (call) => call.params.text === LATE_ALBUM_PART, { mark });
-  await eventually("the late photo's update handled again", async () => (Number((await (await testPool()).query<{ n: string }>(`select last_value as n from ${stateSchema}.updates_marked`)).rows[0]?.n) >= 2 ? true : undefined));
+  await eventually("the late photo's update handled again", async () => (Number((await alasio.pool.query<{ n: string }>(`select last_value as n from ${stateSchema}.updates_marked`)).rows[0]?.n) >= 2 ? true : undefined));
   await sleep(1000);
-  const told = (await (await testPool()).query<{ text: string }>(`select text from ${stateSchema}.telegram_outbox where text = $1`, [LATE_ALBUM_PART])).rows;
+  const told = (await alasio.pool.query<{ text: string }>(`select text from ${stateSchema}.telegram_outbox where text = $1`, [LATE_ALBUM_PART])).rows;
   assert.equal(told.length, 1);
 });
 
@@ -100,7 +104,7 @@ test("an album whose prompt fails is said to have failed in its chat, as a singl
   const { telegram, stateSchema } = alasio;
   await mount(alasio, "codex", "alpha");
   // The store refuses the album's prompt as its job is queued.
-  await (await testPool()).query(`
+  await alasio.pool.query(`
     create function ${stateSchema}.refuse_prompts() returns trigger language plpgsql as $$
       begin raise exception 'the store is down'; end
     $$;
@@ -118,7 +122,7 @@ test("an album another alasio kept, and left waiting as it stopped, is handled b
   const { codex, stateSchema } = alasio;
   await mount(alasio, "codex", "alpha");
   // Kept by the other a moment ago, its wait gone with it.
-  await (await testPool()).query(
+  await alasio.pool.query(
     `with album as (
        insert into ${stateSchema}.media_groups (id, conversation_id, first_update_id, created_at) values ('left', $1, 9001, now() - interval '5 seconds')
      )
@@ -154,7 +158,7 @@ test("a chat's update waits for its handling lock, which another alasio on the s
   const alasio = await alasioFor(t);
   const { telegram, stateSchema } = alasio;
   // Another alasio, handling the operator's chat.
-  const letGo = await holdHandlingLock(stateSchema, OPERATOR_ID);
+  const letGo = await holdHandlingLock(stateSchema, OPERATOR_ID, alasio.pool);
   try {
     telegram.say("/stop");
     await sleep(1500);
@@ -170,7 +174,7 @@ test("an update whose handling the store fails is handled once the store answers
   const { telegram, stateSchema } = alasio;
   // The store refuses the first message alasio keeps: a sequence's count outlasts the
   // transaction the refusal rolls back.
-  await (await testPool()).query(`
+  await alasio.pool.query(`
     create sequence ${stateSchema}.messages_kept;
     create function ${stateSchema}.refuse_first_message() returns trigger language plpgsql as $$
       begin
@@ -192,7 +196,7 @@ test("a button press whose handling the store fails is handled once the store an
   const alasio = await alasioFor(t, { folders: ["alpha"] });
   const { stateSchema } = alasio;
   // The store refuses the first press it takes, as it consumes the press's action.
-  await (await testPool()).query(`
+  await alasio.pool.query(`
     create sequence ${stateSchema}.presses_taken;
     create function ${stateSchema}.refuse_first_press() returns trigger language plpgsql as $$
       begin
@@ -248,7 +252,7 @@ async function steerUnanswered(alasio: RunningAlasio) {
 
 /** The presses kept in alasio's store, each with whether its hold is past. */
 async function keptPresses(alasio: RunningAlasio): Promise<{ id: string; lapsed: boolean }[]> {
-  return (await (await testPool()).query<{ id: string; lapsed: boolean }>(`select id, held_until <= now() as lapsed from ${alasio.stateSchema}.press_jobs`)).rows;
+  return (await alasio.pool.query<{ id: string; lapsed: boolean }>(`select id, held_until <= now() as lapsed from ${alasio.stateSchema}.press_jobs`)).rows;
 }
 
 /** Once alasio has shown the operator `text` after `mark`. */
@@ -333,7 +337,7 @@ test("a press kept by an alasio that crashed, its hold lapsed, is run again by t
     message: { message_id: 1, date: 0, chat: { id: OPERATOR_ID, type: "private", first_name: "Operator" } },
   };
   const action = { id: "gone", conversationId: `telegram:${OPERATOR_ID}`, kind: "workspace:refresh", payload: { expectedSessionId: null, expectedHarness: "codex" } };
-  await (await testPool()).query(
+  await alasio.pool.query(
     `insert into ${stateSchema}.press_jobs (id, conversation_id, callback_query, action, holder, held_until) values ($1, $2, $3, $4, 'crashed', now() - interval '1 second')`,
     [callbackQuery.id, action.conversationId, JSON.stringify(callbackQuery), JSON.stringify(action)],
   );

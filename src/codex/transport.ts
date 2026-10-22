@@ -106,15 +106,6 @@ export interface ForkCodexSessionOptions extends CodexSessionOptions {
   readonly beforeTurnId: string;
 }
 
-/** A session to load in the app-server before its next turn. */
-export interface WarmCodexSessionOptions extends CodexSessionOptions {
-  readonly sessionId: string;
-}
-
-export function canWarmCodexSession(): boolean {
-  return CODEX_TRANSPORT !== "exec";
-}
-
 const createAppServerStream = Effect.fnUntraced(function*({ resumeSession, threadKey, workingDirectory, codexEnv, codexConfig, prompt, modelChoice, persistence, pendingResponseId, turnTimer, appServer, onPromptDispatched }: CodexStreamParams) {
   const scope = { threadKey, cwd: workingDirectory, env: codexEnv, config: codexConfig };
   const sessionId = resumeSession
@@ -229,8 +220,4 @@ export function startCodexTransportThread({ threadKey, workingDirectory, codexEn
 /** Forks through the app-server under either transport: the fork is a rollout like any other, which exec resumes too. */
 export function forkCodexTransportThread({ sessionId, beforeTurnId, threadKey, workingDirectory, codexEnv, codexConfig, appServer }: ForkCodexSessionOptions): Effect.Effect<string, AppServerStartError | ThreadIdMissing> {
   return appServer.forkThread({ threadId: sessionId, beforeTurnId, threadKey, cwd: workingDirectory, env: codexEnv, config: codexConfig });
-}
-
-export function warmCodexTransportThread({ sessionId, threadKey, workingDirectory, codexEnv, codexConfig, appServer }: WarmCodexSessionOptions): Effect.Effect<string, AppServerStartError | ThreadIdMissing> {
-  return appServer.ensureThread({ threadId: sessionId, threadKey, cwd: workingDirectory, env: codexEnv, config: codexConfig });
 }

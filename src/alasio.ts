@@ -13,22 +13,19 @@ import { CodexAppServer } from "./codex/app-server/client.ts";
 import { codexHome } from "./codex/env.ts";
 import { type CodexLoginError, keepCodexLogin } from "./codex/login.ts";
 import type { NeonRolloutStore } from "./codex/rollouts/store.ts";
-import { SessionFsCodex, sessionFsCodexHome } from "./codex/sessionfs.ts";
 import { Turns } from "./codex/turns.ts";
 import type { AlasioConfig, BranchEnvironment } from "./config.ts";
 import { type EnvironmentEvents, EventsConsumer } from "./events/consume.ts";
 import type { Events } from "./events/events.ts";
-import { ActiveTurns } from "./harness/active-turns.ts";
-import type { ClaudeQueryFactory } from "./harness/claude/runtime.ts";
-import { HarnessHost } from "./harness/host.ts";
-import { HarnessEvents, HostEvents } from "./harness/host-events.ts";
+import type { NeonSessionStore } from "./harness/claude/session-store.ts";
+import type { HarnessHost } from "./harness/host.ts";
+import { HarnessEvents } from "./harness/host-events.ts";
 import { Panels } from "./harness/panels.ts";
 import { pooledHarnessHost } from "./harness/pooled-host.ts";
 import { CODEX_LOGIN_PORT, poolLoginKey, poolLoginRefusal, startLoginRelay } from "./codex/login-relay.ts";
-import { Harnesses } from "./harness/index.ts";
 import { BusyPods } from "./kube/busy.ts";
 import { KubeClient } from "./kube/client.ts";
-import { type FolderBayma, HostBayma } from "./mcp/bayma.ts";
+import { HostBayma } from "./mcp/bayma.ts";
 import { BaymaProxy } from "./mcp/bayma-proxy.ts";
 import { Mounts } from "./operator/mounts.ts";
 import type { StoreError } from "./persistence/sql.ts";
@@ -43,7 +40,7 @@ import { MediaGroups } from "./telegram/media-group-buffer.ts";
 import { Outbox } from "./telegram/outbox.ts";
 import type { TelegramUpdates } from "./telegram/update-consumer.ts";
 
-/** What alasio is made with: its configuration, its Neon and what main keeps there, what the deployment's templates offer, and where its updates come from. */
+/** What alasio is made with: its configuration, its Neon and what main keeps there, and where its updates come from. */
 export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog" | "log" | "events" | "lakeWake">, TelegramAppConfig {
   /** Telegram's updates: its environment's topic in the log (TelegramUpdates.layer), or a stand-in's in alasio's tests. */
   readonly updates: Layer.Layer<TelegramUpdates>;
@@ -53,26 +50,26 @@ export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog" | "log" 
    */
   readonly parentLog?: Layer.Layer<ForkAsks> | undefined;
   /**
-   * The environment's events, read in its group (EnvironmentEvents), where alasio reads them:
-   * where its harnesses run in pools, and in a branch, whose parent answers its forks there; on
-   * the log, or a stand-in in tests.
+   * The environment's events, read in its group (EnvironmentEvents): what its harness pools'
+   * hosts and the sandbox gateway tell of them, and, in a branch, its parent's answers to its
+   * forks; on the log, or a stand-in in tests.
    */
-  readonly events?: Layer.Layer<EnvironmentEvents> | undefined;
+  readonly events: Layer.Layer<EnvironmentEvents>;
   /** Where alasio forks its sessions for branches, the requests they make (ForkRequests) and what it answers on (Events), on the log, or stand-ins in tests. */
   readonly branchesLog?: Layer.Layer<ForkRequests | Events> | undefined;
   /** The pool of alasio's Neon database, which its state is kept in. */
   readonly pool: Pool;
   /** The schema alasio's state is kept in: `state`, unless a test gives one of its own. */
   readonly stateSchema?: string | undefined;
-  /** The stores of Codex's rollouts, the operator's home's and the session filesystems', which the panels read; none in a test without Neon. */
-  readonly rolloutStores?: { readonly codex: NeonRolloutStore; readonly sessionFs: NeonRolloutStore | null } | undefined;
+  /** What Neon keeps of the harnesses' sessions, which the operator's panels read: Claude Code's transcripts, and Codex's rollouts, the operator's home's and the session filesystems'. */
+  readonly sessionStore: NeonSessionStore;
+  readonly rolloutStores: { readonly codex: NeonRolloutStore; readonly sessionFs: NeonRolloutStore };
   /** Tells the lake's loader of what a harness pool's pod committed, which tells it nothing itself (../neon/connect.ts ConnectedNeon.written); none where nothing loads it. */
   readonly lakeWritten?: (() => void) | undefined;
-  /** The harness host's role, which Neon has (../neon/harness.ts), granted its part of the state; none in a test without one. */
-  readonly harnessRole?: string | undefined;
-  /** Stand-ins for a folder workspace's bayma and for Claude Code, in the harnesses alasio makes. */
-  readonly folderBayma?: FolderBayma | undefined;
-  readonly claudeQueryFactory?: ClaudeQueryFactory | undefined;
+  /** The harness host's role, which Neon has (../neon/harness.ts), granted its part of the state. */
+  readonly harnessRole: string;
+  /** The port its relay of its Codex login listens on: CODEX_LOGIN_PORT, as its pod's Service reaches it, unless a test gives another (0, a free one). */
+  readonly codexLoginPort?: number | undefined;
 }
 
 /** The services alasio's app runs on, which are always there. */
@@ -82,10 +79,8 @@ export type AlasioServices =
   | TelegramClient
   | Outbox
   | CodexAppServer
-  | ActiveTurns
   | HarnessHost
   | HarnessEvents
-  | Harnesses
   | Panels
   | Turns
   | Mounts
@@ -94,8 +89,8 @@ export type AlasioServices =
 
 /**
  * alasio's services, made for `options`: each made after what it runs on, and stopped
- * before it. The turns are made after the harnesses, Telegram and the store they report
- * to, so that stopping alasio interrupts the turns running while those are still there. The
+ * before it. The turns are made after the harnesses' host, Telegram and the store they report
+ * to, so that stopping alasio interrupts the turns it drives while those are still there. The
  * environment's events are read last, by one member of their group, once every part has added
  * its handling of them (EventsConsumer).
  */
@@ -108,27 +103,19 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       branchEvents(options),
     )),
     Layer.provideMerge(Turns.layer()),
-    Layer.provideMerge(panels(options)),
+    Layer.provideMerge(Panels.layer({ sessionStore: options.sessionStore, codexRollouts: options.rolloutStores.codex, sessionFsCodexRollouts: options.rolloutStores.sessionFs, stateDir: options.stateDir, branch: options.branch?.name })),
     Layer.provideMerge(harnessHost(options)),
-    Layer.provideMerge(Harnesses.layer({
-      branch: options.branch?.name,
-      sessionStore: options.sessionStore,
-      codexRollouts: options.codexRollouts,
-      sessionFsCodexRollouts: options.sessionFsCodexRollouts,
-      folderBayma: options.folderBayma,
-      claudeQueryFactory: options.claudeQueryFactory,
-    })),
-    // After the session filesystems, which it writes a session's files into.
+    // After the session filesystems, whose sessions' files it names.
     Layer.provideMerge(ReceivedFiles.layer(options)),
     Layer.provideMerge(Layer.mergeAll(
       Outbox.layer,
       // Before Codex is first started, which is not before a turn needs it.
       options.keepCodexLogin ? Layer.effectDiscard(keepCodexLogin(codexHome())) : Layer.empty,
       workspaceServices(options),
-      codexServices(options),
-      activeTurns(options),
+      CodexAppServer.layer,
+      busyPods(options),
     )),
-    Layer.provideMerge(eventsConsumer(options)),
+    Layer.provideMerge(EventsConsumer.layer.pipe(Layer.provide(options.events))),
     Layer.provideMerge(Layer.mergeAll(
       stateStore(options),
       TelegramClient.layer(options.telegramBotToken),
@@ -144,63 +131,32 @@ export const stateStore = (options: Pick<AlasioOptions, "pool" | "stateSchema" |
   Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory, branch: options.branch?.name, harnessRole: options.harnessRole });
 
 /**
- * The one member of the environment's events' group every part of alasio adds its handling
- * to: on its events topic where alasio reads it (AlasioOptions.events); elsewhere none, which
- * reads nothing, and to which a part adding a handling is a defect.
+ * The host alasio's turns run on, each conversation's, bound in its harness's pool through the
+ * sandbox gateway, and where it hears what their harnesses do on their own, on its environment's
+ * events topic; its Codex login relayed to the pools' pods, on its pod's port, to each Codex
+ * turn's token alone, held by none of them.
  */
-function eventsConsumer({ events }: AlasioOptions): Layer.Layer<EventsConsumer, never, Store> {
-  if (events) return EventsConsumer.layer.pipe(Layer.provide(events));
-  return Layer.succeed(EventsConsumer, EventsConsumer.of({
-    handle: (handlers) => Effect.die(new Error(`alasio reads no events topic here, so it handles no event of ${Object.keys(handlers).join(", ")}`)),
-    start: Effect.void,
-  }));
+function harnessHost({ codexLoginUrl, codexLoginPort = CODEX_LOGIN_PORT, sessionsGateway, lakeWritten }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | EventsConsumer | CodexAppServer> {
+  const home = codexHome();
+  const relay = Layer.effectDiscard(Effect.ignore(startLoginRelay({
+    authFile: join(home, "auth.json"),
+    listen: { host: "0.0.0.0", port: codexLoginPort },
+    authorize: poolLoginRefusal(poolLoginKey(sessionsGateway.callerKey), Date.now),
+  }).pipe(Effect.tapError((error) => Effect.logError(`the Codex login could not be relayed to the harness pools: ${error.message}`)))));
+  return Layer.mergeAll(
+    pooledHarnessHost({ ...sessionsGateway, codexLogin: { url: codexLoginUrl, home }, written: lakeWritten }),
+    HarnessEvents.fromLog({ written: lakeWritten }),
+    relay,
+  );
 }
 
 /**
- * The harness host alasio's turns run on, and where it hears what their harnesses do on their
- * own: where its harnesses run in pools of their own, each conversation's, bound in its
- * harness's pool through the sandbox gateway, heard on its environment's events topic; and
- * otherwise its own, in its process, told and heard there.
- */
-function harnessHost({ harnessPools, sessionsGateway, lakeWritten }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | Harnesses | ActiveTurns | ReceivedFiles | EventsConsumer | CodexAppServer> {
-  if (harnessPools && sessionsGateway) {
-    const home = codexHome();
-    // Its Codex login relayed to its pools' pods, on its pod's port, to each Codex turn's token alone; held by none of them.
-    const relay = Layer.effectDiscard(Effect.ignore(startLoginRelay({
-      authFile: join(home, "auth.json"),
-      listen: { host: "0.0.0.0", port: CODEX_LOGIN_PORT },
-      authorize: poolLoginRefusal(poolLoginKey(sessionsGateway.callerKey), Date.now),
-    }).pipe(Effect.tapError((error) => Effect.logError(`the Codex login could not be relayed to the harness pools: ${error.message}`)))));
-    return Layer.mergeAll(
-      pooledHarnessHost({ ...sessionsGateway, codexLogin: { url: harnessPools.codexLoginUrl, home }, written: lakeWritten }),
-      HarnessEvents.fromLog({ written: lakeWritten }),
-      relay,
-    );
-  }
-  return HarnessHost.layer.pipe(Layer.provideMerge(HostEvents.inProcess));
-}
-
-/**
- * What the operator's panels reach of each conversation's harness: where its harnesses run in
- * pools, what Neon keeps of their sessions, and of their goals and forks what the conversation's
- * pod does; otherwise the harnesses in alasio's process.
- */
-function panels({ harnessPools, sessionsGateway, rolloutStores, sessionStore, stateDir, branch }: AlasioOptions): Layer.Layer<Panels, never, Harnesses | HarnessHost | CodexAppServer> {
-  if (harnessPools && sessionsGateway && rolloutStores && sessionStore) {
-    return Panels.layer({ sessionStore, codexRollouts: rolloutStores.codex, sessionFsCodexRollouts: rolloutStores.sessionFs, stateDir, branch: branch?.name });
-  }
-  return Panels.ofHarnesses;
-}
-
-/**
- * The services of the workspaces the deployment offers, each made only where it offers them:
- * session filesystems (SessionSandboxes), through the sandbox gateway it gives alasio, and
- * folder workspaces' bayma (HostBayma), the gateway's folder instances, where it serves them;
- * both reached by the harnesses at one loopback of alasio's (BaymaProxy). They are not among
- * AlasioServices, which are always there; what uses them asks whether they are.
+ * The services of the workspaces the deployment offers: session filesystems (SessionSandboxes),
+ * through the sandbox gateway, and folder workspaces' bayma (HostBayma), the gateway's folder
+ * instances, where it serves them; both reached at one loopback of alasio's (BaymaProxy). They
+ * are not among AlasioServices, which are always there; what uses them asks whether they are.
  */
 function workspaceServices({ folders, sessionsGateway, stateDir, branch, parentLog }: AlasioOptions): Layer.Layer<never, never, Store | TelegramClient> {
-  if (!sessionsGateway) return Layer.empty;
   return Layer.mergeAll(
     Layer.unwrap(Effect.gen(function*() {
       const store = yield* Store;
@@ -220,14 +176,14 @@ const netModeIn = (store: Store["Service"]) => (volumeId: string): Effect.Effect
   );
 
 /**
- * The turns running, which hold alasio's own pod busy (./kube/busy.ts) where alasio runs in
- * Kubernetes, on a KubeClient of their own, as the turns it drives in its harness pools do
- * (./harness/pooled-host.ts); elsewhere they hold none. The pods its workspaces run in are the
- * gateway's, which holds each busy as it is bound.
+ * What holds alasio's own pod busy (./kube/busy.ts) where alasio runs in Kubernetes, on a
+ * KubeClient of its own: the turns it drives in its harness pools (./harness/pooled-host.ts);
+ * elsewhere nothing. The pods its harnesses and workspaces run in are the gateway's, which
+ * holds each busy as it is bound.
  */
-function activeTurns({ inKubernetes }: AlasioOptions): Layer.Layer<ActiveTurns> | Layer.Layer<ActiveTurns | BusyPods> {
-  if (!inKubernetes) return ActiveTurns.layer;
-  return ActiveTurns.layer.pipe(Layer.provideMerge(Layer.orDie(BusyPods.layer({})).pipe(Layer.provide(KubeClient.layer))));
+function busyPods({ inKubernetes }: AlasioOptions): Layer.Layer<never> | Layer.Layer<BusyPods> {
+  if (!inKubernetes) return Layer.empty;
+  return Layer.orDie(BusyPods.layer({})).pipe(Layer.provide(KubeClient.layer));
 }
 
 /**
@@ -270,18 +226,6 @@ function branchForks({ branchForkKeyFile, branchesLog }: AlasioOptions): Layer.L
 function branchEvents({ branch, parentLog }: AlasioOptions): Layer.Layer<never, never, EventsConsumer | Store> {
   if (!branch || !parentLog) return Layer.empty;
   return Layer.effectDiscard(Effect.flatMap(EventsConsumer, (consumer) => consumer.handle({ "workspace.fork-answered": forkAnswered({ branch: branch.name, tokenFile: branch.tokenFile }) })));
-}
-
-/**
- * Codex's app-servers: the operator's (CodexAppServer), which folder workspaces' turns
- * run on, and where the deployment offers session filesystems, theirs (SessionFsCodex),
- * from a Codex home of alasio's own; that one is not among AlasioServices, and what uses
- * it asks whether it is.
- */
-function codexServices({ sessionsGateway, stateDir }: AlasioOptions): Layer.Layer<CodexAppServer> {
-  return sessionsGateway
-    ? Layer.merge(CodexAppServer.layer, SessionFsCodex.layer({ home: sessionFsCodexHome(stateDir) }))
-    : CodexAppServer.layer;
 }
 
 /**

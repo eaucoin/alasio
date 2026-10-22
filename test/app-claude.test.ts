@@ -8,7 +8,7 @@ import { test } from "node:test";
 
 import { assistantMessage, backgroundTasksChanged, errorResult, initMessage, successResult, text } from "./support/claude-sdk.ts";
 import type { FakeClaudeQuery } from "./support/claude.ts";
-import { FOLDER_BAYMA, type RunningAlasio } from "./support/alasio.ts";
+import type { RunningAlasio } from "./support/alasio.ts";
 import { WORKING, inAnyOrder, mount, alasioFor, timeless } from "./support/scenarios.ts";
 
 /** Mounts Claude on alpha and starts a turn of `prompt`: the Claude Code process serving it, and the prompt's uuid. */
@@ -35,11 +35,16 @@ test("a Claude turn: the prompt goes into the conversation's Claude Code process
 
   telegram.say("Fix the build");
   const query = await claude.query(0);
-  assert.deepEqual(query.options, {
+  // Its folder's bayma at its pod's loopback, which passes its requests on through the gateway to its folder instance.
+  const { mcpServers, ...options } = query.options as typeof query.options & { readonly mcpServers?: { readonly bayma?: { readonly type: string; readonly url: string; readonly headers: Record<string, string> } } };
+  const bayma = mcpServers?.bayma;
+  assert.equal(bayma?.type, "http");
+  assert.match(bayma.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp\//u);
+  assert.equal((await fetch(bayma.url, { method: "POST", headers: bayma.headers, body: "{}" })).status, 200);
+  assert.deepEqual(options, {
     cwd: alasio.folder("alpha"),
     model: "claude-opus-5-5[1m]",
     effort: "high",
-    mcpServers: { bayma: FOLDER_BAYMA },
     disallowedTools: ["Bash", "Monitor", "Grep", "Glob"],
     permissionMode: "bypassPermissions",
     persistSession: true,

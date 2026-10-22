@@ -19,7 +19,7 @@ export interface AlasioConfig {
   readonly telegramLog: TelegramLog;
   /** The log alasio's environment's events and its branches' forks are on: its brokers, and alasio's principal on them. */
   readonly log: EventsLog;
-  /** Its environment's events topic on the log, and the group it reads it in (src/events/consume.ts), where it reads it. */
+  /** Its environment's events topic on the log, and the group it reads it in (src/events/consume.ts). */
   readonly events: TopicLog;
   /** Where alasio tells the lake's loader it wrote transcripts: its environment's wake topic in the log; null where the lake does not run. */
   readonly lakeWake: WakeLog | null;
@@ -28,7 +28,6 @@ export interface AlasioConfig {
   readonly stateDir: string;
   /** Whether Codex's login is kept in alasio's store, as its Codex home does not outlast its pod. */
   readonly keepCodexLogin: boolean;
-  readonly warmLinkedSessions: boolean;
   readonly defaultHarness: HarnessName | null;
   /**
    * The branch environment this alasio is (`alasio branch create`), on a copy of another
@@ -38,21 +37,15 @@ export interface AlasioConfig {
   /** The key branch environments' tokens are signed with, where alasio forks its sessions for them (src/branch/fork.ts); null for none. */
   readonly branchForkKeyFile: string | null;
   /**
-   * The sandbox gateway alasio's session filesystems are reached through (src/sandbox/index.ts):
-   * its address, alasio's environment's name and its own key to it; null where the deployment
-   * gives none, and offers no session filesystems.
+   * The sandbox gateway alasio's conversations' harnesses are bound through, each in a pod of
+   * its harness's pool (src/harness/pooled-host.ts), as are its session filesystems
+   * (src/sandbox/index.ts): its address, alasio's environment's name and its own key to it.
    */
-  readonly sessionsGateway: GatewayWorkspacesOptions | null;
+  readonly sessionsGateway: GatewayWorkspacesOptions;
   /** Whether the sandbox gateway serves folder workspaces' instances (src/gateway/folders.ts), as the deployment renders the host profile. */
   readonly folders: boolean;
-  /**
-   * Where alasio's conversations' harnesses run in pools of their own, through the sandbox
-   * gateway (src/harness/pooled-host.ts), as the deployment says (`ALASIO_HARNESS_POOLS`), their
-   * hosts heard on its environment's events (`events`): where its pools' pods reach the relay of
-   * its Codex login it serves them (src/codex/login-relay.ts); null where they run in alasio's
-   * process.
-   */
-  readonly harnessPools: { readonly codexLoginUrl: string } | null;
+  /** Where alasio's harness pools' pods reach the relay of its Codex login it serves them (src/codex/login-relay.ts). */
+  readonly codexLoginUrl: string;
   /** Whether alasio runs in a pod of Kubernetes, which it holds busy while a turn runs (src/kube/busy.ts). */
   readonly inKubernetes: boolean;
 }
@@ -106,22 +99,16 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
     // Codex home), none of which outlasts it: its state is in Neon.
     stateDir: env["ALASIO_STATE_DIR"]?.trim() || join(homedir(), ".alasio"),
     keepCodexLogin: env["ALASIO_KEEP_CODEX_LOGIN"] === "1",
-    warmLinkedSessions: env["ALASIO_WARM_LINKED_SESSIONS"] === "1",
     defaultHarness: getDefaultHarness(env),
     branch: branch ? { name: branch, tokenFile: requireEnv(env, "ALASIO_BRANCH_FORK_TOKEN_FILE") } : null,
     branchForkKeyFile: env["ALASIO_BRANCH_FORK_KEY_FILE"]?.trim() || null,
-    sessionsGateway: env[ALASIO_GATEWAY_URL_VARIABLE]?.trim()
-      ? {
-        url: env[ALASIO_GATEWAY_URL_VARIABLE].trim(),
-        environment: requireEnv(env, ALASIO_GATEWAY_ENVIRONMENT_VARIABLE),
-        callerKey: Buffer.from(requireEnv(env, ALASIO_GATEWAY_CALLER_KEY_VARIABLE).trim()),
-      }
-      : null,
+    sessionsGateway: {
+      url: requireEnv(env, ALASIO_GATEWAY_URL_VARIABLE).trim(),
+      environment: requireEnv(env, ALASIO_GATEWAY_ENVIRONMENT_VARIABLE),
+      callerKey: Buffer.from(requireEnv(env, ALASIO_GATEWAY_CALLER_KEY_VARIABLE).trim()),
+    },
     folders: env[ALASIO_GATEWAY_FOLDERS_VARIABLE] === "1",
-    harnessPools: env["ALASIO_HARNESS_POOLS"] === "1"
-      // Where its pools' pods reach its relay of its Codex login.
-      ? { codexLoginUrl: requireEnv(env, "ALASIO_CODEX_LOGIN_URL") }
-      : null,
+    codexLoginUrl: requireEnv(env, "ALASIO_CODEX_LOGIN_URL"),
     inKubernetes: Boolean(env["ALASIO_POD"]?.trim()),
   };
 }

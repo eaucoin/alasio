@@ -195,8 +195,6 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     { name: ALASIO_GATEWAY_CALLER_KEY_VARIABLE, valueFrom: { secretKeyRef: { name: SESSIONS_CALLER_SECRET, key: "caller-key" } } },
     // Main's folder workspaces, the gateway's folder instances, where the host profile renders them.
     ...(environment.branch === null && foldersRun(config) ? [{ name: ALASIO_GATEWAY_FOLDERS_VARIABLE, value: "1" }] : []),
-    // Its conversations' harnesses, in pools of their own, heard on its events topic in its group.
-    { name: "ALASIO_HARNESS_POOLS", value: "1" },
     // Where its conversations' harnesses' pools' pods reach its relay of its Codex login, which only it holds.
     { name: "ALASIO_CODEX_LOGIN_URL", value: `http://${CODEX_LOGIN}.${environment.namespace}.svc.cluster.local:${CODEX_LOGIN_PORT}/v1` },
     ...branchEnv(environment),

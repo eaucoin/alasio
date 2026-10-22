@@ -19,16 +19,17 @@ import type { ResponseBlock } from "../src/codex/event-projection.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { makeCodexHarness } from "../src/harness/codex.ts";
 import { whileHeld } from "../src/harness/holds.ts";
-import { HarnessHost, type TurnStart } from "../src/harness/host.ts";
+import { HarnessHost, type TurnBayma, type TurnStart } from "../src/harness/host.ts";
 import { HarnessEvents, type HostEvent, HostEvents } from "../src/harness/host-events.ts";
 import { type Harness, Harnesses, NoWorkspaceMounted, type TurnParams, type TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
-import { remoteHarnessHost } from "../src/harness/remote-host.ts";
+import { type RemoteHost, remoteHost } from "../src/harness/remote-host.ts";
 import { serveHost } from "../src/harness/serve.ts";
 import { noFolderBayma } from "../src/mcp/bayma.ts";
 import { Store, TurnFenced } from "../src/persistence/store.ts";
 import { ReceivedFiles } from "../src/telegram/files.ts";
 import { holdsIn, newSchema, run, testStore } from "./support/store.ts";
+import { inProcessEvents } from "./support/host-events.ts";
 
 /** What the recording harness tells of each turn besides its reply. */
 const NOTICE = "This Codex login doesn't offer gpt-5.6-sol, so Codex used gpt-5.6-terra, the login's default (at high effort). Use /model to choose another.";
@@ -43,7 +44,6 @@ function recordingHarness(seen: TurnParams[], onRun: () => void = () => {}): Har
     name: CODEX_HARNESS,
     displayName: harnessDisplayName(CODEX_HARNESS),
     supportsGoals: false,
-    supportsWarmup: false,
     sessions: {
       listSessions: unused("listSessions"),
       getTotalSessionPages: unused("getTotalSessionPages"),
@@ -54,7 +54,6 @@ function recordingHarness(seen: TurnParams[], onRun: () => void = () => {}): Har
       createForkedSession: (sessionId, beforeUuid, { threadKey }) => Effect.succeed(`fork of ${sessionId} before ${beforeUuid} for ${threadKey}`),
     },
     startFreshSession: ({ threadKey }) => Effect.succeed(`fresh-of-${threadKey}`),
-    warmSession: () => Effect.succeed(false),
     runTurn: (params) =>
       Effect.gen(function*() {
         seen.push(params);
@@ -77,7 +76,7 @@ function recordingHarness(seen: TurnParams[], onRun: () => void = () => {}): Har
 /**
  * Runs `effect` on the host a harness pool's pod serves (HarnessHost.layer, src/harness/program.ts),
  * its Codex `harness`, on `store`, the files a prompt names written under `stateDir`, what it
- * tells heard in the test's process (HostEvents.inProcess).
+ * tells heard in the test's process (inProcessEvents).
  */
 const onPodHost = <A, E>(
   { store, harness, stateDir = "/nonexistent-state-dir" }: { readonly store: Store["Service"]; readonly harness: Harness; readonly stateDir?: string },
@@ -85,20 +84,20 @@ const onPodHost = <A, E>(
 ): Promise<A> =>
   Effect.runPromise(Effect.scoped(effect).pipe(Effect.provide(HarnessHost.layer.pipe(
     Layer.provideMerge(Harnesses.layer({ overrides: { [CODEX_HARNESS]: harness } })),
-    Layer.provideMerge(HostEvents.inProcess),
+    Layer.provideMerge(inProcessEvents),
     Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir }))),
     Layer.provideMerge(Layer.succeed(Store, store)),
   ))));
 
+/** What a turn started on a pod's host is given of its workspace's bayma, of a test that brings none up. */
+const NO_BAYMA: TurnBayma = { endpoint: null, notice: "this test brings up no bayma" };
+
 /** The host as the control plane reaches it: in its process, or elsewhere, over HTTP (src/harness/serve.ts, src/harness/remote-host.ts), serving `conversationId`. */
-const REACHES: Readonly<Record<string, (host: HarnessHost["Service"], conversationId: string) => Effect.Effect<HarnessHost["Service"], unknown, Scope.Scope>>> = {
-  "in alasio's process": (host) => Effect.succeed(host),
+const REACHES: Readonly<Record<string, (host: HarnessHost["Service"], conversationId: string) => Effect.Effect<RemoteHost, unknown, Scope.Scope>>> = {
+  "in its process": (host) => Effect.succeed(host),
   "elsewhere, over HTTP": (host, conversationId) =>
-    Effect.gen(function*() {
-      const { port } = yield* Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token" }), HarnessHost, host);
-      const remote = yield* Layer.build(remoteHarnessHost({ url: `http://127.0.0.1:${port}`, token: Effect.succeed("host-token") }));
-      return Context.get(remote, HarnessHost);
-    }),
+    Effect.map(Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token" }), HarnessHost, host), ({ port }) =>
+      remoteHost({ url: `http://127.0.0.1:${port}`, token: Effect.succeed("host-token") })),
 };
 
 for (const [reach, reached] of Object.entries(REACHES)) {
@@ -126,7 +125,7 @@ for (const [reach, reached] of Object.entries(REACHES)) {
       epoch: claimed,
       jobId,
       attachedTurn: null,
-      bayma: null,
+      bayma: NO_BAYMA,
       codex: null,
     });
     await onPodHost({ store, harness: recordingHarness(seen) }, Effect.gen(function*() {
@@ -218,7 +217,7 @@ for (const [reach, reached] of Object.entries(REACHES)) {
     await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
     await run(store.setWorkingDirectory(conversationId, "/work"));
     const claim = (messageId: string) => run(store.claimTurn({ conversationId, chatId: "41", messageId, sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));
-    const start = (messageId: string, epoch: number): TurnStart => ({ conversationId, chatId: "41", messageId, harness: CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null, bayma: null, codex: null });
+    const start = (messageId: string, epoch: number): TurnStart => ({ conversationId, chatId: "41", messageId, harness: CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null, bayma: NO_BAYMA, codex: null });
     // Each turn ends as the test lets it, once it is running.
     const seen: TurnParams[] = [];
     const gates: Deferred.Deferred<void>[] = [];
@@ -347,7 +346,7 @@ test("a host tells what its harness does on its own as the HostEvents it is give
       Layer.provideMerge(Layer.mergeAll(ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: "/nonexistent-state-dir" }))),
       Layer.provideMerge(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(HostEvents, telling))),
     )), HarnessHost);
-    yield* host.startTurn({ conversationId, chatId: "41", messageId: "10", harness: CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null, bayma: null, codex: null });
+    yield* host.startTurn({ conversationId, chatId: "41", messageId: "10", harness: CODEX_HARNESS, workingDirectory: "/work", prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null });
   })));
   assert.deepEqual(told, [{ kind: "background-response", conversationId }, { kind: "idle", conversationId }]);
 });
@@ -358,7 +357,7 @@ test("a host elsewhere not reached says nothing of its conversation and stops no
   const conversationId = await run(store.upsertConversation({ chatId: "41", user: { id: 41 } }));
   await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     // A port no host listens on: a partition, as the control plane sees one.
-    const host = Context.get(yield* Layer.build(remoteHarnessHost({ url: "http://127.0.0.1:1", token: Effect.succeed("host-token") })), HarnessHost);
+    const host = remoteHost({ url: "http://127.0.0.1:1", token: Effect.succeed("host-token") });
     assert.equal((yield* Effect.flip(host.status(conversationId)))._tag, "HarnessHostError");
     assert.equal((yield* Effect.flip(host.interrupt(conversationId, "interrupt")))._tag, "HarnessHostError");
     assert.equal((yield* Effect.flip(Effect.scoped(host.reserve(conversationId))))._tag, "HarnessHostError");
@@ -408,8 +407,6 @@ test("the files a turn's prompt names, and a steer's, are written where the harn
         epoch,
         jobId: null,
         attachedTurn: null,
-        bayma: null,
-        codex: null,
       });
       assert.equal(found, "a report", "the harness found the file as it ran");
       // No turn runs to take the steer, but its file is written all the same, for the turn it is queued for.

@@ -25,7 +25,6 @@ import { Mounts } from "../src/operator/mounts.ts";
 import { buildWorkspacePanel } from "../src/operator/workspace-control.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { HarnessHost } from "../src/harness/host.ts";
-import { HostEvents } from "../src/harness/host-events.ts";
 import { Harnesses } from "../src/harness/index.ts";
 import type { ForkAnswer } from "../src/persistence/fork-repository.ts";
 import { Store } from "../src/persistence/store.ts";
@@ -37,6 +36,7 @@ import { newSchema, run, testPool, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 import { type MemoryTopic, memoryTopic } from "./support/topics.ts";
 import { recordingOutbox, turnsStub, withServices } from "./support/turns.ts";
+import { inProcessEvents } from "./support/host-events.ts";
 
 /** A press taken from the store, then handled, as alasio handles one, its handling run in turn. */
 const handleCallbackQuery = (query: Parameters<typeof takeCallbackQuery>[0]) => Effect.flatten(takeCallbackQuery(query));
@@ -223,7 +223,7 @@ test("an alasio forks a session one of its conversations knows for the branch wh
       Layer.buildWithScope(Layer.mergeAll(Layer.succeed(SessionSandboxes, sandboxes), Layer.succeed(Turns, turns)).pipe(
         Layer.provideMerge(HarnessHost.layer),
         Layer.provideMerge(Harnesses.layer({})),
-        Layer.provideMerge(Layer.mergeAll(HostEvents.inProcess, ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: "/nonexistent-state-dir" }).pipe(Layer.provideMerge(Layer.succeed(Store, store))))),
+        Layer.provideMerge(Layer.mergeAll(inProcessEvents, ActiveTurns.layer, CodexAppServer.layer, ReceivedFiles.layer({ stateDir: "/nonexistent-state-dir" }).pipe(Layer.provideMerge(Layer.succeed(Store, store))))),
         Layer.provideMerge(Layer.mergeAll(ForkRequests.layer(logOf("forks.main", "alasio-forks.main"), forks.joinTopic), Layer.succeed(Events, events))),
       ), scope),
     );
@@ -394,9 +394,6 @@ test("a branch environment runs no turn in a folder, which it cannot copy, and s
     assert.equal(String(chatId), "1001");
     assert.match(String(text), /^Codex hit an error: This is the branch environment try, .* A folder is this machine's own files, which cannot be copied on write, so a branch never works in one: use \/workspace for a session workspace\.$/u);
     assert.equal(await run(store.hasOpenPromptJobs(conversationId)), false);
-    // A session workspace is the branch's to work in, where its deployment has them.
-    const refusal = await alasio.runPromise(Effect.flip(Effect.flatMap(Harnesses, (harnesses) => harnesses.getFor("codex", "sessionfs:fs-abc123"))));
-    assert.equal(refusal._tag, "SessionFilesystemsDisabled");
   });
 });
 

@@ -2,10 +2,11 @@
  * alasio, running for a test. alasio runs as a process of its own (./alasio-main.ts, the
  * one place that knows how alasio is assembled), so stopping and restarting it are what
  * they are in production, and it talks to stand-ins at its boundaries: Telegram
- * (./telegram.ts), the Codex app-server it spawns (./codex.ts), Claude Code's queries
- * (./claude.ts), and a folder workspace's bayma. Tests talk to those stand-ins, and to
- * alasio's state through its store, on the test's Postgres, where a scenario is about
- * durability; to nothing inside alasio.
+ * (./telegram.ts), and its conversations' harness pools (./pools.ts standInPools), run in the
+ * test's process, which outlast alasio as a deployment's do, their pods' hosts spawning the
+ * Codex app-server (./codex.ts) and asking Claude Code's queries (./claude.ts) the test stands
+ * in. Tests talk to those stand-ins, and to alasio's state through its store, in a database of
+ * the test's, where a scenario is about durability; to nothing inside alasio.
  *
  * ALASIO_TEST_LOG=1 shows alasio's own log as it runs.
  */
@@ -15,21 +16,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { Effect } from "effect";
+import { Effect, Exit, Scope } from "effect";
+import type pg from "pg";
 
-import type { BaymaMcpServer } from "../../src/mcp/bayma.ts";
+import { HARNESS_ROLE } from "../../neon/control/secrets.ts";
 import type { StoreError } from "../../src/persistence/sql.ts";
-import type { Store } from "../../src/persistence/store.ts";
-import { FakeClaude } from "./claude.ts";
+import { Store } from "../../src/persistence/store.ts";
+import { bridgedQueryFactory, FakeClaude } from "./claude.ts";
 import { FakeCodexAppServer } from "./codex.ts";
 import { type AlasioProcessConfig, READY } from "./alasio-main.ts";
-import { newSchema, run, testDatabaseUrl, testStore } from "./store.ts";
+import { CODEX_LOGIN_URL, ENVIRONMENT, POOLED_SCHEMA, pooledDatabase, type StandInPools, standInPools } from "./pools.ts";
+import { run } from "./store.ts";
 import { OPERATOR_ID, TelegramStandIn } from "./telegram.ts";
+import { serveTopic } from "./topics.ts";
 
 const ALASIO_MAIN = fileURLToPath(new URL("./alasio-main.ts", import.meta.url));
-
-/** The bayma a folder workspace's agent is given. */
-export const FOLDER_BAYMA: BaymaMcpServer = { type: "http", url: "http://bayma.test:7290/mcp", headers: { Authorization: "Bearer folder-bayma" } };
 
 /** The environment of the test's own that alasio would read, and so does not inherit. */
 const WITHHELD_ENV = [
@@ -43,7 +44,6 @@ const WITHHELD_ENV = [
   "ALASIO_CLAUDE_EFFORT",
   "ALASIO_CLAUDE_BIN",
   "ALASIO_KUBE_TEMPLATES",
-  "ALASIO_WARM_LINKED_SESSIONS",
 ];
 
 export interface AlasioOptions {
@@ -61,18 +61,22 @@ export interface RunningAlasio {
   readonly telegram: TelegramStandIn;
   readonly codex: FakeCodexAppServer;
   readonly claude: FakeClaude;
-  /** The directory every folder workspace is under. */
+  /** The harness pools alasio's conversations' harnesses run in, which outlast it. */
+  readonly pools: StandInPools["pools"];
+  /** The directory every folder workspace is under, and alasio's state directory. */
   readonly workspaceRoot: string;
+  readonly stateDir: string;
   /** The path of the folder `name` under the workspace root, as alasio names it. */
   folder(name: string): string;
-  /** Stops alasio as SIGTERM does in production; the stand-ins stay up. How its process ended. */
+  /** Stops alasio as SIGTERM does in production; the stand-ins, and the pools' pods, stay up. How its process ended. */
   stop(): Promise<AlasioExit>;
   /** Starts alasio again, on the same state. */
   start(): Promise<void>;
   /** Reads alasio's state through its store, for scenarios about durability. */
   readStore<T>(read: (store: Store["Service"]) => Effect.Effect<T, StoreError>): Promise<T>;
-  /** The schema of the test's Postgres alasio keeps its state in, for what the store has no reader of. */
+  /** The schema of the test's database alasio keeps its state in, and a pool of the database as alasio owns it, for what the store has no reader of. */
   readonly stateSchema: string;
+  readonly pool: pg.Pool;
   /** Stops alasio if it runs, and takes everything down. */
   close(): Promise<void>;
 }
@@ -89,6 +93,12 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
   const telegram = await TelegramStandIn.start();
   const codex = await FakeCodexAppServer.start(root);
   const claude = await FakeClaude.start(join(root, "claude.sock"));
+  // The pools' pods' hosts, in the test's process, spawn the stand-in as Codex, as alasio does as it lists Codex's models.
+  process.env["ALASIO_CODEX_BIN"] = codex.bin;
+  const database = await pooledDatabase();
+  const poolsScope = await Effect.runPromise(Scope.make());
+  const standIn = await Effect.runPromise(Scope.provide(standInPools({ database, standIns: { claudeQueryFactory: bridgedQueryFactory(claude.socketPath) } }), poolsScope));
+  const events = await serveTopic(standIn.events);
 
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of WITHHELD_ENV) delete env[key];
@@ -98,16 +108,21 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
     CODEX_HOME: join(root, "codex-home"),
     CLAUDE_CONFIG_DIR: join(root, "claude-config"),
   });
-  const stateSchema = newSchema();
+  const stateSchema = POOLED_SCHEMA;
   const config: AlasioProcessConfig = {
-    databaseUrl: await testDatabaseUrl(),
+    databaseUrl: database.url,
     stateSchema,
     stateDir,
     workspaceRoot,
     allowedUserIds: String(OPERATOR_ID),
-    claudeSocket: claude.socketPath,
-    folderBayma: FOLDER_BAYMA,
+    gatewayUrl: standIn.url,
+    callerKey: standIn.callerKey.toString("base64"),
+    environment: ENVIRONMENT,
+    codexLoginUrl: CODEX_LOGIN_URL,
+    eventsUrl: events.url,
   };
+  /** alasio's store, as a test reads alasio's state through it. */
+  const store = await Effect.runPromise(Effect.provide(Store, Store.layer({ pool: database.pool, harnessRole: HARNESS_ROLE })));
   const verbose = process.env["ALASIO_TEST_LOG"] === "1";
   let output = "";
   let child: ChildProcess | null = null;
@@ -142,9 +157,7 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
     if (!running) throw new Error("alasio is not running");
     child = null;
     running.kill("SIGTERM");
-    const exit = await exited;
-    await codex.allExited();
-    return exit;
+    return await exited;
   }
 
   await start();
@@ -152,12 +165,15 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
     telegram,
     codex,
     claude,
+    pools: standIn.pools,
     workspaceRoot,
+    stateDir,
     folder: (name) => join(workspaceRoot, name),
     stop,
     start,
-    readStore: async (read) => run(read(await testStore({ schema: stateSchema }))),
+    readStore: (read) => run(read(store)),
     stateSchema,
+    pool: database.pool,
     async close() {
       try {
         if (crashed) throw new Error(`alasio exited on its own (code ${crashed.code}, signal ${crashed.signal}):\n${output.slice(-4000)}`);
@@ -166,9 +182,12 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
           if (exit.code !== 0) throw new Error(`alasio exited with code ${exit.code} as it stopped:\n${output.slice(-4000)}`);
         }
       } finally {
-        await telegram.close();
+        // Codex's stand-in first, so a turn still running in a pod, as its pod ends, finds its app-server gone, and waits on no answer it will not get.
         await codex.close();
         await claude.close();
+        await Effect.runPromise(Scope.close(poolsScope, Exit.void));
+        await events.close();
+        await telegram.close();
         rmSync(root, { recursive: true, force: true });
       }
     },

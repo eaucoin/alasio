@@ -1,7 +1,7 @@
 /**
- * The harness host elsewhere: an `alasio harness` (./program.ts), reached over HTTP as
- * ./wire.ts says, which the control plane reaches as HarnessHost, as it reaches the host in
- * its process (./host.ts). What fails there fails here as the same error; a host not
+ * A harness pool's pod's host: an `alasio harness` (./program.ts), reached over HTTP as
+ * ./wire.ts says, as HarnessHost (./host.ts), each turn given what alasio brought up for it
+ * (TurnStart). What fails there fails here as the same error; a host not
  * reached, or answering as none of alasio's does, fails a call with HarnessHostError,
  * what it says of its conversation and its stopping a turn among them, so that what
  * decides by them refuses, saying why. A call that lasts (./wire.ts) skips what says only
@@ -25,13 +25,13 @@
  * the control plane hears them on its environment's events topic. The operator's panels are
  * the control plane's (./panels.ts), which reach a host for a fork or a thread's goals alone.
  */
-import { Effect, Layer, Option, Schema } from "effect";
+import { Effect, Option, Schema } from "effect";
 
 import { NO_BIND_HEADER, PINNED_HEADER } from "../binder/names.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { traceCarrier } from "../telemetry/index.ts";
 import { GRANT_HEADER } from "./grant.ts";
-import { HarnessHost, type HarnessStatus } from "./host.ts";
+import type { HarnessHost, HarnessStatus, TurnStart } from "./host.ts";
 import { HarnessHostError } from "./index.ts";
 import {
   Alive,
@@ -73,6 +73,11 @@ export interface RemoteHostOptions {
   readonly bound?: { readonly binding: string; readonly grant: string } | undefined;
 }
 
+/** A pod's host, as HarnessHost, each turn started with what alasio brought up for it (TurnStart). */
+export type RemoteHost = Omit<HarnessHost["Service"], "startTurn"> & {
+  readonly startTurn: (start: TurnStart) => ReturnType<HarnessHost["Service"]["startTurn"]>;
+};
+
 /** What the front answers of a call that binds nothing, of a key bound nowhere. */
 const Unbound = Schema.Struct({ bound: Schema.Literal(false) });
 /** What the front answers where it refuses a call itself: why, and, of a bind, what failed; of a call for one binding alone, the binding its key is bound to now. */
@@ -113,7 +118,7 @@ function linesOf(body: ReadableStream<Uint8Array>, what: string): { readonly nex
 }
 
 /** The harness host at `url`, as the module says. */
-export function remoteHost({ url, token, unbound, bound }: RemoteHostOptions): HarnessHost["Service"] {
+export function remoteHost({ url, token, unbound, bound }: RemoteHostOptions): RemoteHost {
   /** The host's answer to `path` with `body`, binding nothing where `bindsNothing`: its status and what it said, or a HarnessHostError where it was not reached. */
   const post = (path: string, body: object, { signal, bindsNothing = false }: { readonly signal?: AbortSignal; readonly bindsNothing?: boolean } = {}) =>
     Effect.flatMap(Effect.all([token, Effect.sync(traceCarrier)]), ([bearer, trace]) =>
@@ -188,7 +193,7 @@ export function remoteHost({ url, token, unbound, bound }: RemoteHostOptions): H
   const asSteerError = (error: CrossingError | HarnessHostError) =>
     error._tag === "StoreError" || error._tag === "ReceivedFileError" || error._tag === "HarnessHostError" ? error : new HarnessHostError({ reason: error.message });
 
-  return HarnessHost.of({
+  return {
     reserve: (conversationId) =>
       Effect.gen(function*() {
         // The connection the conversation is held on, until the scope closes.
@@ -198,7 +203,7 @@ export function remoteHost({ url, token, unbound, bound }: RemoteHostOptions): H
         // A reservation binds; it is never of a conversation bound nowhere.
         if (answer === null) return yield* new HarnessHostError({ reason: `the sandbox gateway bound nothing for ${conversationId}'s reservation` });
         const { held, id } = yield* read(Reserved, yield* answer.next);
-        // Let go of as the scope closes, and so let go of by then, as the host in alasio's process lets go.
+        // Let go of as the scope closes, and so let go of by then, as HarnessHost's reservation is.
         if (id !== null) {
           yield* Effect.addFinalizer(() =>
             call(HOST_PATHS.release, { conversationId, id }, ReleaseAnswer, { none: Effect.succeed({ released: false }) }).pipe(
@@ -263,8 +268,5 @@ export function remoteHost({ url, token, unbound, bound }: RemoteHostOptions): H
       waitForTurnId: (threadId, timeoutMs) =>
         call(HOST_PATHS.goalTurn, { ...of, threadId, timeoutMs: timeoutMs ?? null }, GoalTurnAnswer).pipe(Effect.map(({ turnId }) => turnId), Effect.mapError(asHostError)),
     }),
-  });
+  };
 }
-
-/** The harness host at `url`, as remoteHost is, as HarnessHost. */
-export const remoteHarnessHost = (options: RemoteHostOptions): Layer.Layer<HarnessHost> => Layer.succeed(HarnessHost, remoteHost(options));

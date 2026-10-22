@@ -69,10 +69,10 @@ export const TurnStartRequest = Schema.Struct({
   epoch: Schema.Number,
   jobId: Schema.NullOr(Schema.String),
   attachedTurn: Schema.NullOr(Schema.Struct({ sessionId: Schema.String, turnId: Schema.String })),
-  bayma: Schema.NullOr(Schema.Union([
+  bayma: Schema.Union([
     Schema.Struct({ endpoint: Schema.Struct({ url: Schema.String, headers: Schema.Record(Schema.String, Schema.String) }), notice: Schema.Null }),
     Schema.Struct({ endpoint: Schema.Null, notice: Schema.String }),
-  ])),
+  ]),
   codex: Schema.NullOr(Schema.Struct({
     login: Schema.Struct({ url: Schema.String, token: Schema.String }),
     home: Schema.NullOr(Schema.Record(Schema.String, Schema.String)),

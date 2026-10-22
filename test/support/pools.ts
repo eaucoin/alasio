@@ -22,6 +22,7 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -44,7 +45,7 @@ import { EnvironmentEvents, EventsConsumer } from "../../src/events/consume.ts";
 import { eventRecord } from "../../src/events/events.ts";
 import { eventsTopic } from "../../src/events/names.ts";
 import { relayed } from "../../src/gateway/harnesses.ts";
-import { conversationOfHarnessKey, heldToHarness } from "../../src/gateway/names.ts";
+import { conversationOfHarnessKey, folderOfKey, heldToHarness } from "../../src/gateway/names.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { HarnessHost } from "../../src/harness/host.ts";
 import type { HarnessHostError } from "../../src/harness/index.ts";
@@ -56,12 +57,14 @@ import { KubeApiError, KubeClient } from "../../src/kube/client.ts";
 import { ensureHarnessRole } from "../../src/neon/harness.ts";
 import { Store } from "../../src/persistence/store.ts";
 import { startPostgres } from "./postgres.ts";
-import { memoryTopic } from "./topics.ts";
+import { type MemoryTopic, memoryTopic } from "./topics.ts";
 
 /** The harness host's role's password, as the stand-in's databases keep its verifier. */
 const HARNESS_PASSWORD = "harness-password";
 /** The environment the stand-in's alasio is, main. */
-const ENVIRONMENT = "main";
+export const ENVIRONMENT = "main";
+/** Where the stand-in's alasio tells its pods its Codex login is relayed: nowhere, as the harnesses its pods' hosts make call no model. */
+export const CODEX_LOGIN_URL = "http://127.0.0.1:9/v1";
 /** The namespace its pools are in, as main's are. */
 const NAMESPACE = "alasio";
 
@@ -69,7 +72,7 @@ const NAMESPACE = "alasio";
 process.env["CODEX_HOME"] ??= mkdtempSync(join(tmpdir(), "alasio-pools-codex-"));
 
 /** Where a pooled store is: its database, as alasio owns it, a pool of its, and as the harness host's role reaches it. */
-interface PooledDatabase {
+export interface PooledDatabase {
   readonly url: string;
   readonly pool: pg.Pool;
   readonly harnessUrl: string;
@@ -97,20 +100,26 @@ export interface PooledStoreOptions {
 }
 
 /**
- * A store of a database of its own, as the module says: alasio's state, made as alasio makes
- * it, the harness host's role granted its part, and the stores of the transcripts and rollouts
- * made before it, as alasio makes them, for the role to be granted theirs.
+ * A database of its own, as alasio's Neon is made for it: the harness host's role, and the
+ * stores of the transcripts and rollouts, made before alasio's state, as alasio makes them, for
+ * the role to be granted theirs; its pool ended as the test file's tests end.
  */
-export async function pooledStore({ workingDirectory = null, branch = null, handlingLockTimeout, chatStatementTimeout }: PooledStoreOptions = {}): Promise<Store["Service"]> {
+export async function pooledDatabase(): Promise<PooledDatabase> {
   const database = await startPostgres();
   const pool = new pg.Pool({ connectionString: database.url, max: 4 });
   opened.push(pool);
   await ensureHarnessRole(pool, scramVerifier(HARNESS_PASSWORD));
   for (const store of [new NeonSessionStore(pool), new NeonRolloutStore(pool), new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA })]) await store.ensureSchema();
-  const store = await Effect.runPromise(Effect.provide(Store, Store.layer({ pool, workingDirectory, branch, handlingLockTimeout, chatStatementTimeout, harnessRole: HARNESS_ROLE })));
   const harnessUrl = new URL(database.url);
   Object.assign(harnessUrl, { username: HARNESS_ROLE, password: HARNESS_PASSWORD });
-  return Object.assign(store, { [DATABASE]: { url: database.url, pool, harnessUrl: harnessUrl.toString() } satisfies PooledDatabase });
+  return { url: database.url, pool, harnessUrl: harnessUrl.toString() };
+}
+
+/** A store of a database of its own (pooledDatabase), as the module says: alasio's state, made as alasio makes it, the harness host's role granted its part. */
+export async function pooledStore({ workingDirectory = null, branch = null, handlingLockTimeout, chatStatementTimeout }: PooledStoreOptions = {}): Promise<Store["Service"]> {
+  const database = await pooledDatabase();
+  const store = await Effect.runPromise(Effect.provide(Store, Store.layer({ pool: database.pool, workingDirectory, branch, handlingLockTimeout, chatStatementTimeout, harnessRole: HARNESS_ROLE })));
+  return Object.assign(store, { [DATABASE]: database });
 }
 
 /** The pool, as alasio, of the database of `store`, where it is one of pooledStore's (or a store a test made of one), and null otherwise. */
@@ -141,12 +150,32 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+/**
+ * Every folder instance's bayma, as the front passes a folder workspace's harness's requests on
+ * to it: what each asked, its path and its bearer, answered as a bayma that has nothing to say
+ * would answer; closed as the scope is.
+ */
+const folderBaymaStandIn: Effect.Effect<{ readonly port: number; readonly asked: readonly { readonly path: string; readonly authorization: string | undefined }[] }, never, Scope.Scope> =
+  Effect.acquireRelease(
+    Effect.promise(async () => {
+      const asked: { path: string; authorization: string | undefined }[] = [];
+      const server = createHttpServer((incoming, outgoing) => {
+        asked.push({ path: incoming.url ?? "", authorization: incoming.headers.authorization });
+        incoming.resume();
+        outgoing.writeHead(200, { "content-type": "application/json" }).end("{}");
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      return { server, port: (server.address() as AddressInfo).port, asked };
+    }),
+    ({ server }) => Effect.promise(() => new Promise((resolve) => server.close(resolve))),
+  );
+
 /** A pod of a key's: the port it serves on; its bind, while one is under way; and, once bound, its binding, and the scope its host runs in. */
 interface Pod {
   readonly name: string;
   readonly port: number;
   binding: Fiber.Fiber<Bound> | null;
-  bound: { readonly binding: string; readonly scope: Scope.Closeable } | null;
+  bound: { readonly binding: string; readonly scope: Scope.Closeable; readonly stateDir?: string } | null;
 }
 
 /**
@@ -166,36 +195,56 @@ export class Pools extends Context.Service<Pools, {
   readonly binding: () => ReadonlySet<string>;
   /** The port each conversation's pod serves on, or is to. */
   readonly ports: () => ReadonlyMap<string, number>;
+  /**
+   * The state directory of the conversation's pod bound now, where it writes the files a prompt
+   * names: a pool's pod's is alasio's own path, where the prompt names them, on a filesystem of its
+   * own, which the stand-in's pods, on the test's one, each have a directory of their own for.
+   */
+  readonly stateDir: (conversationId: string) => string | undefined;
   /** Tells of what the conversation's harness did on its own, as its pod tells the front and the gateway relays it, once each time. */
   readonly tell: (kind: "harness.idle" | "harness.background-response", conversationId: string) => Effect.Effect<void>;
 }>()("alasio/test/Pools") {}
 
+/** The stand-in's pools: the front's address and the key alasio's calls to it are made with, the environment's events topic its pods' events are relayed onto, and what it says of its pods. */
+export interface StandInPools {
+  readonly url: string;
+  readonly callerKey: Buffer;
+  readonly events: MemoryTopic;
+  readonly pools: Pools["Service"];
+}
+
+/** What the stand-in's pools are made with: the database their pods reach as the harness host's role, where they bind any, and what their hosts are made with. */
+export interface StandInPoolsOptions {
+  readonly database?: PooledDatabase | undefined;
+  readonly standIns?: HarnessStandIns | undefined;
+  readonly branch?: string | undefined;
+}
+
 /**
- * alasio's host where its harnesses run in pools, on the stand-in, as the module says, and where
- * it hears what they do on their own; and the stand-in, for a test to look at.
+ * The stand-in's pools, as the module says, for as long as the scope is open, their pods' hosts
+ * ended as it closes: for alasio's services in the test's process (pooledHost), or for an alasio
+ * of its own process (./alasio.ts), which they outlast.
  */
-export const pooledHost = ({ standIns = {}, branch, host = (made) => made }: PoolsOptions = {}): Layer.Layer<HarnessHost | HarnessEvents | EventsConsumer | Pools, never, Store | CodexAppServer | ActiveTurns> =>
-  Layer.unwrap(Effect.gen(function*() {
-    const store = yield* Store;
-    // The running turns its pods keep, the test's, for a test to say a turn runs in a conversation as a pod's harness would.
-    const activeTurns = yield* ActiveTurns;
-    const database = databaseOf(store);
+export const standInPools = ({ database, standIns = {}, branch }: StandInPoolsOptions): Effect.Effect<StandInPools, never, Scope.Scope> =>
+  Effect.gen(function*() {
     const callerKey = randomBytes(32);
     const bindingKey = randomBytes(32);
     const events = memoryTopic(eventsTopic(ENVIRONMENT));
     const pods = new Map<string, Pod>();
     const root = mkdtempSync(join(tmpdir(), "alasio-pools-"));
     let made = 0;
-    // The pods' hosts, ended as the services are.
+    const folderBayma = yield* folderBaymaStandIn;
+    // The pods' hosts, ended as the scope is.
     yield* Effect.addFinalizer(() => Effect.forEach([...pods.values()], (pod) => (pod.bound ? Scope.close(pod.bound.scope, Exit.void) : Effect.void), { discard: true }));
-
     /** The pod of `key`, made where it has none: of the conversation alone, on a port of its own. */
     const podOf = (key: string): Effect.Effect<Pod> =>
       Effect.gen(function*() {
         const known = pods.get(key);
         if (known) return known;
         made += 1;
-        const pod: Pod = { name: `harness-${made}`, port: yield* Effect.promise(freePort), binding: null, bound: null };
+        // A folder instance's serves on the stand-in's folder bayma's port.
+        const port = folderOfKey(key) ? folderBayma.port : yield* Effect.promise(freePort);
+        const pod: Pod = { name: folderOfKey(key) ? `host-${made}` : `harness-${made}`, port, binding: null, bound: null };
         pods.set(key, pod);
         return pod;
       });
@@ -204,6 +253,11 @@ export const pooledHost = ({ standIns = {}, branch, host = (made) => made }: Poo
     const bindPod = (pool: BoundPool, key: string, pod: Pod): Effect.Effect<Bound> =>
       Effect.gen(function*() {
         if (pod.bound) return { binding: pod.bound.binding, pod: pod.name, address: "127.0.0.1" };
+        // A folder instance's: bound as its bayma is there, which the front passes its requests on to.
+        if (folderOfKey(key)) {
+          pod.bound = { binding: randomUUID(), scope: yield* Scope.make() };
+          return { binding: pod.bound.binding, pod: pod.name, address: "127.0.0.1" };
+        }
         // Its pod reaches the store's database as the harness host's role: of a store of pooledStore's alone, which a test that binds none needs not make.
         if (!database) return yield* Effect.die(new Error("the stand-in of the harness pools binds a pod only on a store of pooledStore's, as the pod reaches its database as the harness host's role"));
         const conversationId = conversationOfHarnessKey(key) ?? "";
@@ -216,13 +270,13 @@ export const pooledHost = ({ standIns = {}, branch, host = (made) => made }: Poo
         const scope = yield* Scope.make();
         const env = ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ALASIO_DATABASE_URL: database.harnessUrl } }));
         // Its host's scope closed where it does not start, as one ended as it starts.
-        yield* startHarness({ bindingFile, port: pod.port, stateDir, branch: branch ?? null, gatewayUrl: front.url }, { ...standIns, activeTurns }).pipe(
+        yield* startHarness({ bindingFile, port: pod.port, stateDir, branch: branch ?? null, gatewayUrl: front.url }, standIns).pipe(
           Effect.provide(env),
           Scope.provide(scope),
           Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : Scope.close(scope, exit))),
           Effect.orDie,
         );
-        pod.bound = { binding, scope };
+        pod.bound = { binding, scope, stateDir };
         return { binding, pod: pod.name, address: "127.0.0.1" };
       });
 
@@ -266,10 +320,12 @@ export const pooledHost = ({ standIns = {}, branch, host = (made) => made }: Poo
       podPort: 0,
       poolOf: (key, options) =>
         Effect.gen(function*() {
-          if (conversationOfHarnessKey(key) === null) return yield* new PlacementRefused({ reason: `${key} is no conversation's harness` });
+          const folder = folderOfKey(key);
+          if (folder) return { pool: { name: `host-${folder.harness}`, namespace: NAMESPACE }, port: (yield* podOf(key)).port };
+          if (conversationOfHarnessKey(key) === null) return yield* new PlacementRefused({ reason: `${key} is no conversation's harness nor folder instance` });
           const pod = yield* podOf(key);
-          const folder = options["workspace"] === "folder" ? "folder-" : "";
-          return { pool: { name: `harness-${folder}${options["harness"] ?? ""}`, namespace: NAMESPACE }, port: pod.port };
+          const ofFolder = options["workspace"] === "folder" ? "folder-" : "";
+          return { pool: { name: `harness-${ofFolder}${options["harness"] ?? ""}`, namespace: NAMESPACE }, port: pod.port };
         }),
       routeHeld,
       grants: (key: string, held: HeldTo) => heldToHarness(key, held.key),
@@ -286,15 +342,34 @@ export const pooledHost = ({ standIns = {}, branch, host = (made) => made }: Poo
       Effect.map((served) => ({ ...served, url: `http://127.0.0.1:${served.port}` })),
     );
 
+    /** The conversations' harnesses' pods, by their conversations, of all the stand-in binds. */
+    const harnessPods = () =>
+      [...pods].flatMap(([key, pod]) => {
+        const conversation = conversationOfHarnessKey(key);
+        return conversation ? [[conversation, pod] as const] : [];
+      });
     const pools = Pools.of({
-      bound: () => new Map([...pods].flatMap(([key, pod]) => (pod.bound ? [[conversationOfHarnessKey(key) ?? key, pod.bound.binding] as const] : []))),
-      binding: () => new Set([...pods].flatMap(([key, pod]) => (pod.binding && !pod.bound ? [conversationOfHarnessKey(key) ?? key] : []))),
-      ports: () => new Map([...pods].map(([key, pod]) => [conversationOfHarnessKey(key) ?? key, pod.port] as const)),
+      bound: () => new Map(harnessPods().flatMap(([conversation, pod]) => (pod.bound ? [[conversation, pod.bound.binding] as const] : []))),
+      binding: () => new Set(harnessPods().flatMap(([conversation, pod]) => (pod.binding && !pod.bound ? [conversation] : []))),
+      ports: () => new Map(harnessPods().map(([conversation, pod]) => [conversation, pod.port] as const)),
+      stateDir: (conversationId) => harnessPods().find(([conversation]) => conversation === conversationId)?.[1].bound?.stateDir,
       tell: (kind, conversationId) =>
         Effect.map(Clock.currentTimeMillis, (at) => void events.write(eventRecord({ kind, environment: ENVIRONMENT, source: "harness", subject: { kind: "conversation", key: conversationId } }, at).value)),
     });
+    return { url: front.url, callerKey, events, pools };
+  });
+
+/**
+ * alasio's host where its harnesses run in pools, on the stand-in, as the module says, and where
+ * it hears what they do on their own; and the stand-in, for a test to look at.
+ */
+export const pooledHost = ({ standIns = {}, branch, host = (made) => made }: PoolsOptions = {}): Layer.Layer<HarnessHost | HarnessEvents | EventsConsumer | Pools, never, Store | CodexAppServer | ActiveTurns> =>
+  Layer.unwrap(Effect.gen(function*() {
+    // The running turns its pods keep, the test's, for a test to say a turn runs in a conversation as a pod's harness would.
+    const activeTurns = yield* ActiveTurns;
+    const { url, callerKey, events, pools } = yield* standInPools({ database: databaseOf(yield* Store), standIns: { ...standIns, activeTurns }, branch });
     const home = process.env["CODEX_HOME"] ?? "";
-    const pooled = pooledHarnessHost({ url: front.url, environment: ENVIRONMENT, callerKey, codexLogin: { url: "http://127.0.0.1:9/v1", home } });
+    const pooled = pooledHarnessHost({ url, environment: ENVIRONMENT, callerKey, codexLogin: { url: CODEX_LOGIN_URL, home } });
     return Layer.mergeAll(
       Layer.effect(HarnessHost, Effect.map(HarnessHost, host)).pipe(Layer.provide(pooled)),
       HarnessEvents.fromLog().pipe(Layer.provideMerge(EventsConsumer.layer.pipe(Layer.provide(Layer.succeed(EnvironmentEvents, EnvironmentEvents.of({ join: events.join })))))),

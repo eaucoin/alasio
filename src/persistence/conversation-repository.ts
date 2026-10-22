@@ -68,20 +68,6 @@ export interface Mount {
   readonly sessionId: string | null;
 }
 
-/** A conversation whose mounted harness has a session, in the folder it runs in. */
-export interface LinkedConversation {
-  readonly id: string;
-  readonly session_id: string;
-  readonly active_harness: HarnessName;
-  readonly working_directory: string;
-}
-
-/** A harness session alasio points at, and the folder it runs in. */
-export interface HarnessSessionReference {
-  readonly sessionId: string;
-  readonly workingDirectory: string;
-}
-
 /** A conversation that knows a workspace: mounting it now, or keeping a session of it parked. */
 export interface WorkspaceConversation {
   readonly conversationId: string;
@@ -178,22 +164,6 @@ export class NeonConversationRepository {
     return Effect.map(this.getConversation(conversationId), mountOf);
   }
 
-  listConversationsWithSessions(harness: HarnessName): Effect.Effect<LinkedConversation[], StoreError> {
-    const column = SESSION_COLUMNS[harness];
-    return this.#sql.query<LinkedConversation>(
-      `select id, ${column} as session_id, active_harness, working_directory
-       from ${this.#schema}.conversations
-       where ${column} <> '' and active_harness = $1 and working_directory is not null
-       order by updated_at desc`,
-      [harness],
-    );
-  }
-
-  /**
-   * Every session of a harness alasio points at, with the folder it runs in:
-   * each conversation's mounted one, the ones parked per folder, and those of
-   * active turns. Distinct by session.
-   */
   /** The conversations that know the workspace `workingDirectory`, each once. */
   listWorkspaceConversations(workingDirectory: string): Effect.Effect<WorkspaceConversation[], StoreError> {
     return this.#sql.query<WorkspaceConversation>(
@@ -203,24 +173,6 @@ export class NeonConversationRepository {
          select conversation_id, false from ${this.#schema}.workspace_sessions where working_directory = $1
        ) as knowing group by id`,
       [workingDirectory],
-    );
-  }
-
-  listHarnessSessionReferences(harness: HarnessName): Effect.Effect<HarnessSessionReference[], StoreError> {
-    const column = SESSION_COLUMNS[harness];
-    return this.#sql.query<HarnessSessionReference>(
-      `select session_id as "sessionId", min(working_directory) as "workingDirectory" from (
-         select ${column} as session_id, working_directory from ${this.#schema}.conversations
-         where ${column} <> '' and working_directory is not null
-         union
-         select session_id, working_directory from ${this.#schema}.workspace_sessions
-         where harness = $1 and session_id <> ''
-         union
-         select turns.session_id, conversations.working_directory from ${this.#schema}.turns
-         join ${this.#schema}.conversations on conversations.id = turns.conversation_id
-         where turns.harness = $1 and turns.session_id <> '' and conversations.working_directory is not null
-       ) as referenced group by session_id`,
-      [harness],
     );
   }
 

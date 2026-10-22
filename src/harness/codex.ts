@@ -8,7 +8,6 @@ import {
   executeCodexTurn,
   forkCodexSession,
   startFreshCodexSession,
-  warmCodexSession,
 } from "../codex/runtime.ts";
 import { type CodexListingScope, createCodexSessionApi, folderListingScope } from "../codex/sessions.ts";
 import type { SessionFsCodex } from "../codex/sessionfs.ts";
@@ -103,7 +102,6 @@ export const makeCodexHarness = Effect.fnUntraced(function*({
     name: CODEX_HARNESS,
     displayName: harnessDisplayName(CODEX_HARNESS),
     supportsGoals: true,
-    supportsWarmup: true,
     sessions: createCodexSessionApi({
       listingScope,
       fork: ({ sessionId, beforeTurnId, threadKey }) => forkCodexSession({ sessionId, beforeTurnId, threadKey, ...scopeParams }),
@@ -119,8 +117,6 @@ export const makeCodexHarness = Effect.fnUntraced(function*({
       waitForTurnId: (threadId, timeoutMs) => Effect.flatMap(listingScope, ({ appServer }) => appServer.waitForTurnId(threadId, timeoutMs)).pipe(scoped),
     },
     startFreshSession: ({ threadKey }) => startFreshCodexSession({ threadKey, ...scopeParams }).pipe(scoped),
-    warmSession: ({ sessionId, threadKey }) =>
-      ensureRollouts(sessionId).pipe(Effect.andThen(warmCodexSession({ sessionId, threadKey, ...scopeParams })), scoped),
     mirror: flushRollouts,
     runTurn: (params) =>
       ensureRollouts(params.resumeSession).pipe(

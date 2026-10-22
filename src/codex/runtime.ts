@@ -12,13 +12,11 @@ import { appendBlock, completeResponse, errorBlock, isVisibleCodexItem, mapItemT
 import {
   type CodexEvent,
   type CodexTransportRefused,
-  canWarmCodexSession,
   forkCodexTransportThread,
   openAttachedCodexEventStream,
   openCodexEventStream,
   startCodexTransportThread,
   steerCodexTransportTurn,
-  warmCodexTransportThread,
 } from "./transport.ts";
 import { createTurnTimer, elapsedMs } from "./turn-timing.ts";
 import {
@@ -83,10 +81,6 @@ export interface CodexScopeParams {
 export interface ForkCodexSessionParams extends CodexScopeParams {
   readonly sessionId: string;
   readonly beforeTurnId: string;
-}
-
-export interface WarmCodexSessionParams extends CodexScopeParams {
-  readonly sessionId: string | null;
 }
 
 /** A Codex turn: a harness's turn, with what the Codex harness runs it against and around. */
@@ -162,17 +156,6 @@ export const forkCodexSession = Effect.fnUntraced(function*({ sessionId, beforeT
   const { cwd, codexEnv, codexConfig, appServer } = yield* codexScope(params);
   return yield* forkCodexTransportThread({ sessionId, beforeTurnId, threadKey: params.threadKey, workingDirectory: cwd, codexEnv, codexConfig, appServer });
 });
-
-export const warmCodexSession = Effect.fnUntraced(function*({ sessionId, ...params }: WarmCodexSessionParams): Effect.fn.Return<boolean, CodexSessionError> {
-  if (!sessionId || !canWarmCodexSession()) {
-    return false;
-  }
-  const startedAt = process.hrtime.bigint();
-  const { cwd, codexEnv, codexConfig, appServer } = yield* codexScope(params);
-  yield* warmCodexTransportThread({ sessionId, threadKey: params.threadKey, workingDirectory: cwd, codexEnv, codexConfig, appServer });
-  yield* Effect.logInfo(`warm_session.done total_ms=${elapsedMs(startedAt).toFixed(1)} thread_key=${JSON.stringify(params.threadKey)} session=${JSON.stringify(sessionId.slice(0, 8))}`);
-  return true;
-}, withLogScope("codex-runtime"));
 
 /**
  * A Codex turn, from its pending response to its result. It fails only as alasio's store

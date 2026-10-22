@@ -44,7 +44,7 @@ const start = (workingDirectory: string, bayma: TurnStart["bayma"]): TurnStart =
 });
 
 test("a turn's start carries its workspace's bayma, or why it has none, across to a host elsewhere, as it was", () => {
-  for (const bayma of [{ endpoint: { url: "http://gateway/mcp", headers: { Authorization: "Bearer t" } }, notice: null }, { endpoint: null, notice: "its bayma did not start" }, null] as const) {
+  for (const bayma of [{ endpoint: { url: "http://gateway/mcp", headers: { Authorization: "Bearer t" } }, notice: null }, { endpoint: null, notice: "its bayma did not start" }] as const) {
     const encoded = JSON.parse(JSON.stringify(start("/work", bayma))) as unknown;
     assert.deepEqual(Schema.decodeUnknownSync(TurnStartRequest)(encoded), start("/work", bayma));
   }

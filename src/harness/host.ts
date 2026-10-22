@@ -10,10 +10,10 @@
  * control plane claimed the turn under, as are the claims of the turns its harness starts
  * on its own, and the progress of the prompt job it runs.
  *
- * HarnessHost.layer is the host over Harnesses and ActiveTurns, telling its events as
- * HostEvents does (./host-events.ts): in alasio's process, or on the log, as a harness pool's
- * pod does; ./remote-host.ts is one elsewhere, an `alasio harness` (./program.ts) the control plane
- * reaches over HTTP (./serve.ts) as it does this one.
+ * HarnessHost.layer is the host over Harnesses and ActiveTurns, a harness pool's pod's, an
+ * `alasio harness` (./program.ts), telling its events as HostEvents does (./host-events.ts); the
+ * control plane reaches it over HTTP (./serve.ts, ./remote-host.ts), through the sandbox gateway's
+ * front (./pooled-host.ts).
  */
 import { Context, Effect, Fiber, Layer, Option, type Scope } from "effect";
 
@@ -28,8 +28,8 @@ import { type AttachedTurn, type Harness, type HarnessError, type HarnessGoals, 
 import { HostEvents } from "./host-events.ts";
 import type { HarnessName } from "./names.ts";
 
-/** A turn for the host to run: where, on what, and as which claim of the conversation. */
-export interface TurnStart {
+/** A turn alasio asks a host to run: where, on what, and as which claim of the conversation. */
+export interface TurnRequest {
   readonly conversationId: string;
   readonly chatId: string;
   readonly messageId: string;
@@ -48,18 +48,21 @@ export interface TurnStart {
   readonly jobId: string | null;
   /** A turn already running upstream (a Codex goal's) that it attaches to instead of starting one. */
   readonly attachedTurn: AttachedTurn | null;
-  /**
-   * The bayma of the turn's workspace, as the control plane brought it up for a host
-   * elsewhere, which has no key to reach it by of its own; null for the host in alasio's
-   * process, whose harnesses bring it up themselves.
-   */
-  readonly bayma: TurnBayma | null;
-  /** A Codex turn's login and configuration, as the control plane gives a host elsewhere (TurnCodex); null for the host in alasio's process, or a turn of no Codex. */
+}
+
+/**
+ * A turn as a harness pool's pod's host is given it (./program.ts): alasio's request, with what
+ * alasio brought up for it, which the pod has no key to reach of its own.
+ */
+export interface TurnStart extends TurnRequest {
+  /** The bayma of the turn's workspace, or why it has none. */
+  readonly bayma: TurnBayma;
+  /** A Codex turn's login and configuration (TurnCodex); null for a turn of another harness. */
   readonly codex: TurnCodex | null;
 }
 
 /**
- * A Codex turn's login and configuration, as the control plane gives a host elsewhere, which
+ * A Codex turn's login and configuration, as the control plane gives a pool's pod's host, which
  * holds no login: the relay of alasio's login it calls the model through, and a token of the
  * turn's for it, good for minutes, which alasio renews as the turn runs (renewCodexLogin);
  * and, of a folder conversation's, the operator's Codex
@@ -72,7 +75,7 @@ export interface TurnCodex {
 }
 
 /**
- * A turn's workspace's bayma, as the control plane gives it a host elsewhere: its endpoint,
+ * A turn's workspace's bayma, as the control plane gives it a pool's pod's host: its endpoint,
  * through the sandbox gateway, a caller's token of the workspace's key (a session's, or a
  * folder instance's) its bearer, held to the host's binding (../binder/tokens.ts HeldTo); or
  * none, its bind having failed, and why, which the harness puts before the turn's prompt.
@@ -129,7 +132,7 @@ export class HarnessHost extends Context.Service<HarnessHost, {
    * where no harness serves it there, or where the files its prompt names cannot be
    * written: what else goes wrong ends up in its response.
    */
-  readonly startTurn: (start: TurnStart) => Effect.Effect<TurnResult, StoreError | TurnFenced | HarnessUnavailable | ReceivedFileError>;
+  readonly startTurn: (request: TurnRequest) => Effect.Effect<TurnResult, StoreError | TurnFenced | HarnessUnavailable | ReceivedFileError>;
   /**
    * The conversation's turn claimed under `epoch` for the message `messageId`, as its host
    * started it: what it came to, once it ends, as startTurn would have answered it; none where
@@ -169,9 +172,9 @@ export class HarnessHost extends Context.Service<HarnessHost, {
   readonly drain: (conversationId: string) => Effect.Effect<boolean, StoreError | HarnessHostError>;
   /**
    * Gives the conversation's Codex `login`, a fresh token for alasio's relay of its login, as
-   * a turn alasio drives runs on past the last token's time, which is minutes (TurnCodex): a
-   * host elsewhere relays with it from then on; the host in alasio's process, whose Codex reads
-   * alasio's login itself, takes none.
+   * a turn alasio drives runs on past the last token's time, which is minutes (TurnCodex): the
+   * pod's host relays with it from then on (./program.ts); HarnessHost.layer itself, which holds no
+   * login, takes none.
    */
   readonly renewCodexLogin: (conversationId: string, login: TurnCodex["login"]) => Effect.Effect<void, HarnessHostError>;
   /** A new, empty session of `harness` in `workingDirectory` for the conversation: its id. */
@@ -225,7 +228,7 @@ export class HarnessHost extends Context.Service<HarnessHost, {
     });
 
     /** The turn `start` run on its harness, under its claim, its job's progress recorded. */
-    const run = (start: TurnStart) =>
+    const run = (start: TurnRequest) =>
       Effect.gen(function*() {
         const harness = yield* harnesses.getFor(start.harness, start.workingDirectory);
         yield* receivedFiles.materialize(start.fileIds, parseWorkspace(start.workingDirectory));

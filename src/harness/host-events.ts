@@ -3,9 +3,8 @@
  * to deliver, and its letting go of the conversation, which its host tells (HostEvents) and
  * the control plane hears (HarnessEvents), to act on.
  *
- * In alasio's process, both are one PubSub of its own (HostEvents.inProcess). A harness pool's
- * pod has no control plane beside it, nor any principal of the log: its host tells them to the
- * sandbox gateway's front (HostEvents.throughFront), with its binding's token, and the gateway
+ * A harness pool's pod has no control plane beside it, nor any principal of the log: its host
+ * tells them to the sandbox gateway's front (HostEvents.throughFront), with its binding's token, and the gateway
  * tells them on its environment's events topic as its own, of the pod's own conversation alone
  * (../gateway/harnesses.ts relayed); alasio hears them as it reads the topic in its group
  * (HarnessEvents.fromLog, ../events/consume.ts), a host's kinds as told of a host (source
@@ -45,14 +44,6 @@ export class HostEvents extends Context.Service<HostEvents, {
   /** Tells of `event`; never fails, one not told being logged where it is told elsewhere. */
   readonly tell: (event: HostEvent) => Effect.Effect<void>;
 }>()("alasio/harness/HostEvents") {
-  /** Told, and heard, in alasio's process. */
-  static readonly inProcess: Layer.Layer<HostEvents | HarnessEvents> = Layer.effectContext(
-    Effect.map(PubSub.unbounded<HostEvent>(), (events) =>
-      Context.make(HostEvents, HostEvents.of({ tell: (event) => Effect.asVoid(PubSub.publish(events, event)) })).pipe(
-        Context.add(HarnessEvents, HarnessEvents.of({ subscribe: PubSub.subscribe(events) })),
-      )),
-  );
-
   /**
    * Told to the sandbox gateway's front at `url` (EVENTS_PATH), bearing the pod's binding's
    * `token`, as the module says: `harness.<kind>`, of the conversation, by its key; told again

@@ -7,8 +7,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { v2 } from "../.types/codex/index.js";
+import { NeonRolloutStore } from "../src/codex/rollouts/store.ts";
 import {
-  agentMessage,
   codexModel,
   codexThread,
   codexTurn,
@@ -16,7 +16,6 @@ import {
   threadResumeResponse,
   threadStartResponse,
   turnStarted,
-  userMessage,
 } from "./support/codex-protocol.ts";
 import {
   WORKING,
@@ -190,7 +189,7 @@ test("/service and /workspace are refused while a turn runs", async (t) => {
       "",
       blocker,
     ].join("\n"),
-    buttons: [["* · alpha", "· beta"], ["New folder…", "Refresh", "Close"]],
+    buttons: [["* · alpha", "· beta"], ["Restart folder instance"], ["New empty workspace…"], ["New folder…", "Refresh", "Close"]],
   }]);
 
   // Still Codex in alpha: the turn finishes there, and so does the next.
@@ -264,26 +263,15 @@ test("switching folders parks the session under the folder it leaves and restore
   assert.deepEqual(codex.requests("thread/start").map(({ params }) => params.cwd), [alpha, beta]);
 });
 
-test("/sessions lists the folder's threads from thread/list; a listed session is previewed and mounted, and the next prompt resumes it; New Session starts one", async (t) => {
+test("/sessions lists the folder's threads from their rollouts in Neon; a listed session is previewed and mounted, and the next prompt resumes it; New Session starts one", async (t) => {
   const alasio = await alasioFor(t, { folders: ["alpha"] });
   const { telegram, codex } = alasio;
   const alpha = alasio.folder("alpha");
   await mount(alasio, "codex", "alpha");
-  codex.answerEvery("thread/list", () => ({
-    data: [
-      codexThread("thread-x", { name: "Refactor parser", updatedAt: 1_790_769_600, cwd: alpha }),
-      codexThread("thread-y", { preview: "Add tests for the lexer", updatedAt: 1_790_683_200, cwd: alpha }),
-    ],
-    nextCursor: null,
-    backwardsCursor: null,
-  }));
-  codex.answerEvery("thread/turns/list", ({ params }) => ({
-    data: params.threadId === "thread-x"
-      ? [codexTurn("turn-x1", { items: [userMessage("u1", [{ type: "text", text: "Refactor it", text_elements: [] }]), agentMessage("a1", "Parser refactored.", "final_answer")] })]
-      : [],
-    nextCursor: null,
-    backwardsCursor: null,
-  }));
+  // As the folder's pods' Codex kept them, its rollouts mirrored to Neon.
+  const rollouts = new NeonRolloutStore(alasio.pool);
+  await keepThread(rollouts, { id: "thread-x", cwd: alpha, prompt: "Refactor parser", answer: "Parser refactored.", at: "2026-09-30T12:00:00.000Z" });
+  await keepThread(rollouts, { id: "thread-y", cwd: alpha, prompt: "Add tests for the lexer", at: "2026-09-29T12:00:00.000Z" });
 
   let mark = telegram.mark();
   telegram.say("/sessions");
@@ -301,10 +289,8 @@ test("/sessions lists the folder's threads from thread/list; a listed session is
     ].join("\n"),
     buttons: [["Current Session", "New Session"], ["1. 2026-09-30 - Refactor parser"], ["2. 2026-09-29 - Add tests for the lexer"], ["Close"]],
   }]);
-  assert.deepEqual(codex.requests("thread/list").map(({ params }) => params), [
-    { cwd: alpha, sortKey: "updated_at", sourceKinds: ["cli", "vscode", "exec"], limit: 100 },
-    { cwd: alpha, sortKey: "updated_at", sourceKinds: ["cli", "vscode", "exec"], limit: 100 },
-  ]);
+  // No Codex is asked: alasio runs none of the conversation's.
+  assert.deepEqual(codex.requests("thread/list"), []);
 
   mark = telegram.mark();
   telegram.press("1. 2026-09-30 - Refactor parser");
@@ -353,3 +339,17 @@ test("/sessions lists the folder's threads from thread/list; a listed session is
   await answerLoadedThreads(codex, ["thread-x", "thread-new"]);
   assert.equal((await answerTurnStart(codex, "thread-new", "turn-n1")).params.threadId, "thread-new");
 });
+
+/** A Codex thread's rollout as Codex writes one, kept in `store`: begun in `cwd` at `at`, its one turn the prompt `prompt`, answered `answer` where given. */
+async function keepThread(store: NeonRolloutStore, { id, cwd, prompt, answer, at }: { readonly id: string; readonly cwd: string; readonly prompt: string; readonly answer?: string; readonly at: string }): Promise<void> {
+  const turn = `${id}-turn`;
+  const lines = [
+    { timestamp: at, ordinal: 0, type: "session_meta", payload: { id, cwd, source: "cli" } },
+    { timestamp: at, ordinal: 1, type: "event_msg", payload: { type: "task_started", turn_id: turn, started_at: 1 } },
+    { timestamp: at, ordinal: 2, type: "event_msg", payload: { type: "item_completed", turn_id: turn, item: { type: "UserMessage", id: `${id}-prompt`, content: [{ type: "text", text: prompt }] } } },
+    ...(answer === undefined ? [] : [{ timestamp: at, ordinal: 3, type: "event_msg", payload: { type: "item_completed", turn_id: turn, item: { type: "AgentMessage", id: `${id}-answer`, content: [{ type: "Text", text: answer }] } } }]),
+  ];
+  const bytes = Buffer.from(lines.map((line) => JSON.stringify(line)).join("\n") + "\n");
+  const name = `rollout-${at.slice(0, 19).replaceAll(":", "-")}-${id}.jsonl`;
+  await store.save({ name, path: `sessions/${at.slice(0, 10).replaceAll("-", "/")}/${name}`, threadId: id, rolloutId: id, historyBase: null, size: bytes.length, headDigest: id, modifiedMs: Date.parse(at) }, { start: 0, bytes });
+}

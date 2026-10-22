@@ -32,23 +32,22 @@ import type { NeonRolloutStore } from "../codex/rollouts/store.ts";
 import { CodexScopeError } from "../codex/runtime.ts";
 import { createCodexSessionApi } from "../codex/sessions.ts";
 import type { Mount } from "../persistence/conversation-repository.ts";
-import { SessionFilesystemsDisabled } from "../sandbox/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import type { NeonSessionStore } from "./claude/session-store.ts";
 import { createClaudeSessionApi } from "./claude/sessions.ts";
 import { getClaudeEffort, getClaudeModel } from "./claude/model.ts";
 import { listClaudeModels } from "./claude/models.ts";
 import { HarnessHost, type HarnessPanels } from "./host.ts";
-import { FolderOnBranch, type HarnessError, Harnesses, type HarnessUnavailable, type ModelOption, NoServiceMounted, NoWorkspaceMounted, UnknownHarness } from "./index.ts";
+import { FolderOnBranch, type HarnessError, type HarnessUnavailable, type ModelOption, NoServiceMounted, NoWorkspaceMounted, UnknownHarness } from "./index.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS, HARNESS_NAMES, harnessDisplayName, isHarnessName } from "./names.ts";
 
 /** What the panels are made with: the stores, where the session filesystems' directories are, and the branch environment alasio is. */
 export interface PanelsOptions {
   /** Claude Code's transcripts. */
   readonly sessionStore: NeonSessionStore;
-  /** The operator's Codex home's rollouts, and the session filesystems' Codex's, where the deployment has session filesystems. */
+  /** The operator's Codex home's rollouts, and the session filesystems' Codex's. */
   readonly codexRollouts: NeonRolloutStore;
-  readonly sessionFsCodexRollouts: NeonRolloutStore | null;
+  readonly sessionFsCodexRollouts: NeonRolloutStore;
   /** alasio's state directory, which a session filesystem's harness directory is under, as a pool's pod's is (../sandbox/index.ts harnessDirectory). */
   readonly stateDir: string;
   /** The branch environment alasio is, which gives no harness in a folder; none for main. */
@@ -67,17 +66,6 @@ export class Panels extends Context.Service<Panels, {
   readonly requireForMount: (conversationId: string, mount: Mount) => Effect.Effect<HarnessPanels, NoServiceMounted | HarnessUnavailable>;
 }>()("alasio/harness/Panels") {
   static readonly layer = (options: PanelsOptions): Layer.Layer<Panels, never, HarnessHost | CodexAppServer> => Layer.effect(Panels, makePanels(options));
-
-  /** Of the harnesses in alasio's process, where they run there: what each harness itself reaches. */
-  static readonly ofHarnesses: Layer.Layer<Panels, never, Harnesses> = Layer.effect(
-    Panels,
-    Effect.map(Harnesses, (harnesses) =>
-      Panels.of({
-        names: harnesses.names,
-        forMount: (_conversationId, mount) => harnesses.forMount(mount),
-        requireForMount: (_conversationId, mount) => harnesses.requireForMount(mount),
-      })),
-  );
 }
 
 /** The directory a session filesystem's harness runs in, under `stateDir`, as a pool's pod has it. */
@@ -103,7 +91,6 @@ const makePanels = Effect.fnUntraced(function*({ sessionStore, codexRollouts, se
       const workspace = parseWorkspace(workingDirectory);
       if (branch && workspace?.kind === "folder") return Effect.fail(new FolderOnBranch({ branch }));
       const sessionFs = workspace?.kind === "sessionfs" ? workspace : null;
-      if (sessionFs && !sessionFsCodexRollouts) return Effect.fail(new SessionFilesystemsDisabled());
       const directory = sessionFs ? sessionFsDirectory(stateDir, sessionFs.volumeId) : workingDirectory;
       const of = { conversationId, harness: name, workingDirectory };
       if (name === CLAUDE_HARNESS) {

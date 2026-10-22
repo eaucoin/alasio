@@ -15,7 +15,11 @@ import { finalResponseToMarkdown } from "../src/codex/response-markdown.ts";
 import { recoverInterruptedTurns } from "../src/codex/restart-recovery.ts";
 import { makeStatusReporter, type StatusReporter } from "../src/codex/status-reporter.ts";
 import { Turns } from "../src/codex/turns.ts";
+import { HARNESS_ROLE } from "../neon/control/secrets.ts";
+import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../src/codex/rollouts/store.ts";
+import { EnvironmentEvents } from "../src/events/consume.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
+import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import type { StoreError } from "../src/persistence/sql.ts";
 import { Store } from "../src/persistence/store.ts";
 import { type AlasioOptions, alasioServices } from "../src/alasio.ts";
@@ -25,6 +29,8 @@ import { botApiClient, paramsOf } from "./support/bot-api.ts";
 import { newSchema, run, testDatabaseUrl, testPool, testStore, writerOf } from "./support/store.ts";
 import { stubUpdates } from "./support/stub-updates.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
+import { CODEX_LOGIN_URL, pooledDatabase } from "./support/pools.ts";
+import { memoryTopic } from "./support/topics.ts";
 import { withServices } from "./support/turns.ts";
 import { eventually } from "./support/wait.ts";
 
@@ -284,23 +290,29 @@ test("alasio's services wire the durable outbox into final response delivery", a
   const apiRoot = process.env["TELEGRAM_API_ROOT"];
   process.env["TELEGRAM_API_ROOT"] = "http://127.0.0.1:9";
   try {
+    const database = await pooledDatabase();
     const options: AlasioOptions = {
       telegramBotToken: "test-token",
       allowedUserIds: "",
       workingDirectory: root,
       workspaceRoot: root,
       stateDir: join(root, ".alasio"),
-      pool: await testPool(),
+      pool: database.pool,
       stateSchema: newSchema(),
       keepCodexLogin: false,
-      warmLinkedSessions: false,
       defaultHarness: null,
       branch: null,
       branchForkKeyFile: null,
-      sessionsGateway: null,
+      // A gateway that refuses every connection: nothing here binds a harness.
+      sessionsGateway: { url: "http://127.0.0.1:9", environment: "main", callerKey: Buffer.from("caller-key") },
       folders: false,
-      harnessPools: null,
+      codexLoginUrl: CODEX_LOGIN_URL,
+      codexLoginPort: 0,
       inKubernetes: false,
+      harnessRole: HARNESS_ROLE,
+      sessionStore: new NeonSessionStore(database.pool),
+      rolloutStores: { codex: new NeonRolloutStore(database.pool), sessionFs: new NeonRolloutStore(database.pool, { schema: SESSION_FS_SCHEMA }) },
+      events: Layer.succeed(EnvironmentEvents, EnvironmentEvents.of({ join: memoryTopic("events.main").join })),
       // No update comes: the stand-in is refused as Telegram is.
       updates: stubUpdates("http://127.0.0.1:9"),
     };
