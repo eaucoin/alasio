@@ -35,7 +35,7 @@ import type { KubernetesObject, V1CronJob, V1Deployment, V1EnvVar, V1Job, V1JobS
 import { computeId, MAIN, replicaId } from "../../../neon/control/branches.ts";
 import { memoryBytes } from "../capacity.ts";
 import { imageReference } from "../images.ts";
-import { environmentName, INTAKE_GROUP, lakeWakeTopic, LOG_BROKERS, loaderGroup, loaderLogSecret, logPrincipalSecret, retentionMs, TELEMETRY_TOPICS } from "./log.ts";
+import { environmentName, INTAKE_GROUP, lagTrigger, lakeWakeTopic, LOG_BROKERS, loaderGroup, loaderLogSecret, logAuthentication, logPrincipalSecret, retentionMs, TELEMETRY_TOPICS } from "./log.ts";
 import {
   componentName,
   type Environment,
@@ -57,7 +57,7 @@ import type { InstallConfig } from "./config.ts";
 import { PROXY_HOST, PROXY_PORT } from "./neon.ts";
 import { FILER, MASTER } from "./object-store.ts";
 import { priority } from "./priorities.ts";
-import { scaledObject, type Trigger, type TriggerAuthentication } from "./scalers.ts";
+import { scaledObject, type Trigger } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 
 /** The port its readers take queries on. */
@@ -115,24 +115,6 @@ const writerSecrets = (): V1EnvVar[] => ["LAKE_DATABASE_PASSWORD", "LAKE_S3_KEY"
 
 /** A probe of `path` on the metrics port. */
 const probe = (path: string) => ({ httpGet: { path, port: "metrics" } });
-
-/** KEDA's reading of the log as the `scaler` principal, which may describe the groups and topics it scales on and read none, in `namespace`, the Secret's copy there. */
-function logAuthentication(name: string, namespace: string, component: string): TriggerAuthentication {
-  const scaler = logPrincipalSecret("scaler");
-  return {
-    apiVersion: "keda.sh/v1alpha1",
-    kind: "TriggerAuthentication",
-    metadata: { name, namespace, labels: stackLabels(component) },
-    spec: { secretTargetRef: ["sasl", "username", "password"].map((parameter) => ({ parameter, name: scaler, key: parameter })) },
-  };
-}
-
-/** A trigger of how far `group` is behind on `topic`, past `threshold` records a partition, authenticated as `authentication` says. */
-const lagTrigger = (group: string, topic: string, threshold: number, authentication: string): Trigger => ({
-  type: "kafka",
-  metadata: { bootstrapServers: LOG_BROKERS, consumerGroup: group, topic, lagThreshold: String(threshold), activationLagThreshold: "0", offsetResetPolicy: "earliest" },
-  authenticationRef: { name: authentication },
-});
 
 /**
  * The loader of `environment`: woken by KEDA once its group is behind on the environment's

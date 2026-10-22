@@ -24,8 +24,11 @@ const ACCESS: LogAccess = {
 /** A topic's configurations as the log is asked them. */
 const said = (configs: readonly TopicConfig[]) => configs.map(({ name, value }) => `${name}=${value}`).join(" ");
 
-/** A log that has `topics` (by their partitions), recording what it is asked. */
-function fakeLog(topics: Record<string, number> = {}): LogAdmin & { readonly asked: string[]; readonly acls: Acl[] } {
+/**
+ * A log that has `topics` (by their partitions), its groups with `unread` records left of each
+ * topic and `members` (none of either, unless it says), recording what it is asked.
+ */
+function fakeLog(topics: Record<string, number> = {}, unread: Record<string, number> = {}, members: Record<string, number> = {}): LogAdmin & { readonly asked: string[]; readonly acls: Acl[] } {
   const asked: string[] = [];
   const acls: Acl[] = [];
   return {
@@ -36,6 +39,14 @@ function fakeLog(topics: Record<string, number> = {}): LogAdmin & { readonly ask
     },
     async topics() {
       return new Map(Object.entries(topics));
+    },
+    async unread(topic, partitions, group) {
+      asked.push(`unread ${topic} ${partitions} ${group}`);
+      return unread[`${group} ${topic}`] ?? 0;
+    },
+    async members(group) {
+      asked.push(`members ${group}`);
+      return members[group] ?? 0;
     },
     async createTopic(name, partitions, configs) {
       asked.push(`create ${name} ${partitions} ${said(configs)}`);
@@ -93,6 +104,27 @@ test("gives a topic it has more partitions where it has fewer, never fewer, and 
     "configs otel.spans retention.ms=86400000 retention.bytes=268435456 flush.ms=1000",
     "configs otel.logs retention.ms=86400000 retention.bytes=268435456",
   ]);
+});
+
+test("gives a topic read in order more partitions only while its group has no member and has read all of it, and says which it left until then", async () => {
+  const ordered: LogAccess = { topics: [{ name: "telegram.main", partitions: 6, readInOrderBy: "alasio.main", retentionMs: 604_800_000, retentionBytes: 2 ** 26, configs: {} }], principals: [] };
+  const configs = "configs telegram.main retention.ms=604800000 retention.bytes=67108864";
+  // Read by a member, though it has read all: a producer's metadata, a moment behind, would put a chat's records on two partitions it reads at once.
+  const read = fakeLog({ "telegram.main": 1 }, {}, { "alasio.main": 1 });
+  assert.deepEqual(await applyAccess(read, ordered, {}), ["telegram.main"]);
+  assert.deepEqual(read.asked, ["members alasio.main", configs]);
+  // No member, but records left to read.
+  const behind = fakeLog({ "telegram.main": 1 }, { "alasio.main telegram.main": 3 });
+  assert.deepEqual(await applyAccess(behind, ordered, {}), ["telegram.main"]);
+  assert.deepEqual(behind.asked, ["members alasio.main", "unread telegram.main 1 alasio.main", configs]);
+  // Its alasio stopped, with none left.
+  const stopped = fakeLog({ "telegram.main": 1 });
+  assert.deepEqual(await applyAccess(stopped, ordered, {}), []);
+  assert.deepEqual(stopped.asked, ["members alasio.main", "unread telegram.main 1 alasio.main", "partitions telegram.main 6", configs]);
+  // One it has the partitions of is not asked about.
+  const grown = fakeLog({ "telegram.main": 6 }, { "alasio.main telegram.main": 3 }, { "alasio.main": 1 });
+  assert.deepEqual(await applyAccess(grown, ordered, {}), []);
+  assert.ok(!grown.asked.some((asked) => asked.startsWith("members") || asked.startsWith("unread") || asked.startsWith("partitions")));
 });
 
 test("stops where a principal has no password, before any ACL, credential or topic", async () => {

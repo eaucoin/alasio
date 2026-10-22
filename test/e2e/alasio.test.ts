@@ -29,10 +29,11 @@ import pg from "pg";
 import { memoryBytes } from "../../cli/src/capacity.ts";
 import type { KindName } from "../../cli/src/kube/api.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
-import { componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
+import { componentName, MAIN_ENVIRONMENT, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT, WORKSPACE_MOUNT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { pageserverName } from "../../cli/src/manifests/neon.ts";
-import { environmentAccess } from "../../cli/src/manifests/log.ts";
+import { TELEGRAM_PARTITIONS } from "../../cli/src/manifests/config.ts";
+import { environmentAccess, environmentName, telegramTopic } from "../../cli/src/manifests/log.ts";
 import { WEBHOOK, WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
@@ -635,6 +636,11 @@ if (inShard("upgrade")) {
       assert.ok(policy, "alasio's NetworkPolicy is gone");
       // What it admits, if anything, is of its own namespace's: no branch environment's.
       assert.deepEqual((policy.spec?.ingress ?? []).filter(({ from }) => from?.some(({ namespaceSelector }) => namespaceSelector !== undefined)), []);
+    });
+
+    test(`upgraded: alasio's Telegram topic, of one partition on ${PREVIOUS}, has its ${TELEGRAM_PARTITIONS}, given while the cut-over had alasio stopped`, async () => {
+      const partitions = await kube.execOk(NAMESPACE, `${componentName("log")}-0`, ["node", "/opt/alasio/src/log/access.ts", "partitions", telegramTopic(environmentName(MAIN_ENVIRONMENT))], { container: "access" });
+      assert.equal(Number(partitions.trim()), TELEGRAM_PARTITIONS);
     });
 
     for (const { keeps, check } of scenarios) test(`upgraded: ${keeps}`, check);

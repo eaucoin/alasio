@@ -277,6 +277,51 @@ sessions_claimed_past() {
 }
 # END the sessions' conversations.
 
+
+# BEGIN telegram partitions.
+#
+# This release reads an environment's Telegram topic in a partition for each alasio it may run
+# (TELEGRAM_PARTITIONS, 6), where 9.0.0's has one. The log's access applier gives a topic read
+# in order more only while its group has no member and none of it left to read
+# (src/log/access.ts), and the upgrade starts this release's alasio as it rolls the log, so the
+# applier finds alasio reading it. So, once the upgrade is through, alasio is stopped again,
+# once it runs no turn, as above, the applier, which looks again every few seconds, given
+# PARTITIONS_WAIT_SECONDS (2 min) to grow the topic, and alasio started again. Where an update
+# came while alasio was stopped, and so is unread, the topic is left as it is, said: a topic of
+# one serves the one alasio this release runs, and the next stop of alasio with nothing unread
+# grows it.
+
+TELEGRAM_TOPIC=telegram.main
+TELEGRAM_PARTITIONS=6
+PARTITIONS_WAIT_SECONDS=${PARTITIONS_WAIT_SECONDS:-120}
+# How many partitions the topic `$1` has, as the log's access applier reads them.
+partitions() {
+  k exec alasio-log-0 -c access -- node /opt/alasio/src/log/access.ts partitions "$1"
+}
+telegram_partitions_after() {
+  local has waited=0
+  has=$(partitions "$TELEGRAM_TOPIC") || fail "the partitions of $TELEGRAM_TOPIC could not be read"
+  [ "$has" -lt "$TELEGRAM_PARTITIONS" ] || return 0
+  log "waiting for alasio to run no turn, then stopping it again, for the log to give $TELEGRAM_TOPIC its $TELEGRAM_PARTITIONS partitions"
+  gone app.kubernetes.io/component=alasio,alasio.dev/busy=true "$TURN_WAIT_SECONDS" ||
+    fail "alasio ran a turn on for ${TURN_WAIT_SECONDS} s: let it end, and run the cut-over again"
+  k scale deployment alasio --replicas=0 >/dev/null || fail "alasio could not be stopped"
+  gone app.kubernetes.io/component=alasio "$STOP_WAIT_SECONDS" || fail "alasio did not stop within ${STOP_WAIT_SECONDS} s"
+  while has=$(partitions "$TELEGRAM_TOPIC") && [ "$has" -lt "$TELEGRAM_PARTITIONS" ] && [ "$waited" -lt "$PARTITIONS_WAIT_SECONDS" ]; do
+    sleep "$POLL_SECONDS"
+    waited=$((waited + POLL_SECONDS))
+  done
+  [ -n "$has" ] || fail "the partitions of $TELEGRAM_TOPIC could not be read"
+  if [ "$has" -lt "$TELEGRAM_PARTITIONS" ]; then
+    log "$TELEGRAM_TOPIC is left as it is, of $has of its $TELEGRAM_PARTITIONS partitions, as an update came for it while alasio was stopped: the next stop of alasio with nothing unread grows it"
+  else
+    log "$TELEGRAM_TOPIC has its $has partitions"
+  fi
+  k scale deployment alasio --replicas=1 >/dev/null || fail "alasio could not be started again"
+  k rollout status deployment/alasio --timeout="${STOP_WAIT_SECONDS}s" >/dev/null || fail "alasio did not start again within ${STOP_WAIT_SECONDS} s"
+}
+# END telegram partitions.
+
 for tool in jq kubectl; do command -v "$tool" >/dev/null || fail "$tool is not on root's PATH"; done
 [ -r "$CONFIG" ] || fail "CONFIG $CONFIG cannot be read"
 kubectl get --raw=/readyz >/dev/null 2>&1 || fail "kubectl does not reach the cluster: give it k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
@@ -308,6 +353,7 @@ if [ ! -e "$OUT/upgraded" ]; then
   printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
   bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" ||
     fail "the upgrade failed (upgrade.log): alasio stays stopped until an upgrade gets as far as starting it; the cut-over run again goes on with it"
+  telegram_partitions_after
   date -u +%FT%TZ >"$OUT/upgraded"
 fi
 [ "${FAIL_AT:-}" != after-the-upgrade ] || fail "a failure injected once the upgrade was through"

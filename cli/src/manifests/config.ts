@@ -87,6 +87,15 @@ export interface Scale {
 
 const Count = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0, { message: "must be a number of replicas, 0 or more" }));
 
+/**
+ * How many partitions each environment's Telegram topic has: as many as its alasios may be at
+ * most, each reading some, a chat's updates all in one, by its key. Fixed, as one added moves a
+ * chat's later updates to another partition, ahead of its earlier ones where those are still to
+ * be read: a topic is given more only while its alasio is stopped, as a cut-over stops it, with
+ * nothing left to read (src/log/access.ts).
+ */
+export const TELEGRAM_PARTITIONS = 6;
+
 /** What a component's scale may be beyond `min <= max`, as its component allows. */
 interface ScaleLimits {
   /** Whether it is of the floor, what never sleeps, so its `min` is at least 1. */
@@ -95,14 +104,18 @@ interface ScaleLimits {
   readonly scaled: boolean;
   /** The most replicas it runs, if any. */
   readonly most?: number;
+  /** The scale it keeps to for now, `min` at least and `max` at most that, and until what. */
+  readonly held?: { readonly min: number; readonly max: number; readonly until: string };
 }
 
 /** What is wrong with `scale`, given `limits`: the key, and why; none when nothing is. */
-function scaleProblem({ min, max }: Scale, { floor, scaled, most }: ScaleLimits): { readonly path: ReadonlyArray<string>; readonly issue: string } | undefined {
+function scaleProblem({ min, max }: Scale, { floor, scaled, most, held }: ScaleLimits): { readonly path: ReadonlyArray<string>; readonly issue: string } | undefined {
   if (min > max) return { path: ["max"], issue: "must be at least min" };
   if (floor && min === 0) return { path: ["min"], issue: "must be at least 1: it never sleeps" };
   if (!scaled && min !== max) return { path: ["max"], issue: "must equal min: nothing scales it between them" };
   if (most !== undefined && max > most) return { path: ["max"], issue: `must be at most ${most}` };
+  if (held && min < held.min) return { path: ["min"], issue: `must be at least ${held.min} until ${held.until}` };
+  if (held && max > held.max) return { path: ["max"], issue: `must be at most ${held.max} until ${held.until}` };
   return undefined;
 }
 
@@ -163,6 +176,17 @@ const Alasio = Schema.Struct({
   nodeSelector: NodeSelector,
   tolerations: Tolerations,
   affinity: Affinity,
+  /**
+   * How many alasios each environment runs: between `min` and `max`, as KEDA scales them on
+   * what waits on their environment's topics and on its bound harnesses
+   * (cli/src/manifests/alasio.ts); at most as many as its Telegram topic has partitions. One
+   * alone for now, as its turns still run in its process.
+   */
+  scaling: Scaling({ min: 1, max: 1 }, { floor: false, scaled: true, most: TELEGRAM_PARTITIONS, held: { min: 1, max: 1, until: "its conversations' turns run in harness pools alone" } }),
+  /** How often KEDA looks at what alasio scales on, in seconds. */
+  pollingSeconds: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be at least 1" })), 5),
+  /** How long none of what alasio scales on must have been seen before KEDA scales it back to `min`, in seconds. */
+  cooldownSeconds: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0, { message: "must be 0 or more" })), 300),
 });
 
 /**

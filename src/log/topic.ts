@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 
 import { Consumer, MessagesStreamFallbackModes, MessagesStreamModes } from "@platformatic/kafka";
 
-import type { Feed, Received } from "./consume.ts";
+import { type Feed, JoinAgain, type Received } from "./consume.ts";
 
 /** Where a topic is read: the log's brokers, the principal read as, the file of its password, the topic, and the group read in. */
 export interface TopicLog {
@@ -58,11 +58,56 @@ export const memberOptions = (log: TopicLog) => ({
   rebalanceTimeout: REBALANCE_TIMEOUT_MS,
 });
 
-/** Joins `log`'s group on its topic, reading on from where the group was last told, or, of a group told of none, from the topic's first record still kept (`earliest`) or the next written (`latest`). */
+/** How often a member looks at how many partitions its topic has, to join its group again where it has more than it joined with. */
+export const PARTITIONS_LOOK_EVERY_MS = 30_000;
+
+/** How a member looks at its topic's partitions (rejoinOnGrowth): the topic, how many it had as the member joined, and how many it has now. */
+export interface PartitionsLook {
+  readonly topic: string;
+  readonly joinedWith: number;
+  readonly partitions: () => Promise<number>;
+  /** How often it looks: PARTITIONS_LOOK_EVERY_MS, unless a test says. */
+  readonly everyMs?: number;
+}
+
+/**
+ * `feed`, a member that joined its group as its topic had `joinedWith` partitions: ended, as it
+ * looks every `everyMs` and finds its topic of more, with JoinAgain, for its group to be joined
+ * again (../log/consume.ts) with them. A group is assigned the partitions its topic has as its
+ * members join, and none added after until it rebalances.
+ */
+export function rejoinOnGrowth<R extends Received>(feed: Feed<R>, { topic, joinedWith, partitions, everyMs = PARTITIONS_LOOK_EVERY_MS }: PartitionsLook): Feed<R> {
+  let grown: (error: JoinAgain) => void = () => {};
+  const grew = new Promise<never>((_, reject) => (grown = reject));
+  // Settled only by the look below, and raced by every read: never left unhandled.
+  grew.catch(() => {});
+  const looking = setInterval(() => {
+    partitions().then((has) => {
+      if (has > joinedWith) grown(new JoinAgain(`${topic} has ${has} partitions, more than the ${joinedWith} its member joined with`));
+    }, () => {});
+  }, everyMs);
+  return {
+    next: () => Promise.race([feed.next(), grew]),
+    async close() {
+      clearInterval(looking);
+      await feed.close();
+    },
+  };
+}
+
+/**
+ * Joins `log`'s group on its topic, reading on from where the group was last told, or, of a
+ * group told of none, from the topic's first record still kept (`earliest`) or the next written
+ * (`latest`); joined again where its topic grows (rejoinOnGrowth).
+ */
 export async function joinTopic(log: TopicLog, untold: "earliest" | "latest"): Promise<TopicFeed> {
   const consumer = new Consumer(memberOptions(log));
+  const partitions = async (): Promise<number> => (await consumer.metadata({ topics: [log.topic], forceUpdate: true })).topics.get(log.topic)?.partitionsCount ?? 0;
   let stream;
+  let joinedWith;
   try {
+    // Before it joins: a partition added as it joins is one it may not be assigned, which it then finds more than this.
+    joinedWith = await partitions();
     stream = await consumer.consume({
       topics: [log.topic],
       mode: MessagesStreamModes.COMMITTED,
@@ -74,7 +119,7 @@ export async function joinTopic(log: TopicLog, untold: "earliest" | "latest"): P
     throw error;
   }
   const records = stream[Symbol.asyncIterator]();
-  return {
+  return rejoinOnGrowth({
     async next() {
       const read = await records.next();
       if (read.done) throw new Error("the topic's stream of records ended");
@@ -85,5 +130,5 @@ export async function joinTopic(log: TopicLog, untold: "earliest" | "latest"): P
       await stream.close().catch(() => {});
       await consumer.close(true);
     },
-  };
+  }, { topic: log.topic, joinedWith, partitions });
 }

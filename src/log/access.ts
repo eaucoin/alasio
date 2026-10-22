@@ -10,8 +10,17 @@
  *   library's Admin does not wrap, on a connection of its own;
  * - each topic: made where it is not, of its partitions, its retention, by time and by
  *   size, and its other configurations; given more partitions where it has fewer, as the
- *   intake's replicas may be raised; its retention and its other configurations set where
- *   it is.
+ *   intake's replicas may be raised, but one read in its records' order by key (an
+ *   environment's Telegram updates, each chat's in order) only while the group that reads it
+ *   has no member and none left to read: while its alasio is stopped, as an upgrade's
+ *   cut-over stops it (upgrades/from-9.0.0.sh). A partition added before its group has read
+ *   all moves a key's later records ahead of its earlier ones; one added while a member
+ *   reads does too, as a producer writes by the partitions it last knew until its metadata
+ *   catches up, putting a key's records on two partitions that member reads at once. Until
+ *   then it is left as it is, said, and looked at again; its retention and its other
+ *   configurations set where it is. What the gate leaves open: an update the webhook writes
+ *   between the look and the partitions' addition, a window of milliseconds, once an
+ *   installation's topic grows.
  *
  * The ACLs come first, so that no principal signs in before its ACLs are there: a client
  * that does is refused what it asks as unauthorized, and the collector's Kafka client
@@ -51,6 +60,11 @@
  *   node access.ts environment    makes the environment's principals, their ACLs and its topics
  *   node access.ts forget         deletes the ACLs and the topics, and replaces each
  *                                 principal's credential with one of a random secret
+ *
+ * and a cut-over runs it there to ask how many partitions a topic has, as it waits for its
+ * Telegram topic to be given more (upgrades/from-9.0.0.sh):
+ *
+ *   node access.ts partitions <topic>   prints the topic's partitions, 0 where there is none
  */
 import { pbkdf2Sync, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -109,6 +123,10 @@ export interface LogAdmin extends CredentialWriter {
   disallow(acls: readonly Acl[]): Promise<void>;
   /** The topics there are, and how many partitions each has. */
   topics(): Promise<ReadonlyMap<string, number>>;
+  /** How many of `topic`'s records, of its `partitions`, the group `group` has yet to read: all of them, of a group that has read none. */
+  unread(topic: string, partitions: number, group: string): Promise<number>;
+  /** How many members the group `group` has: none of one no consumer is in. */
+  members(group: string): Promise<number>;
   createTopic(name: string, partitions: number, configs: readonly TopicConfig[]): Promise<void>;
   addPartitions(name: string, partitions: number): Promise<void>;
   setConfigs(name: string, configs: readonly TopicConfig[]): Promise<void>;
@@ -131,8 +149,19 @@ export function bindings(principal: string, { resource, name, pattern, operation
   }));
 }
 
-/** Applies `access` on the log through `admin`, each principal's password of `passwords`. */
-export async function applyAccess(admin: LogAdmin, access: LogAccess, passwords: Readonly<Record<string, string>>): Promise<void> {
+/**
+ * Whether `group` neither reads `topic` of its `partitions` now nor has any of its records
+ * left to read: the moment, as the module says, a topic read in order is given more.
+ */
+const stoppedAndRead = async (admin: LogAdmin, topic: string, partitions: number, group: string): Promise<boolean> =>
+  (await admin.members(group)) === 0 && (await admin.unread(topic, partitions, group)) === 0;
+
+/**
+ * Applies `access` on the log through `admin`, each principal's password of `passwords`: the
+ * topics read in order whose partitions it left for now, as their groups have a member or
+ * records left to read (the module says why), to be applied again.
+ */
+export async function applyAccess(admin: LogAdmin, access: LogAccess, passwords: Readonly<Record<string, string>>): Promise<readonly string[]> {
   const credentials = access.principals.map(({ name }) => {
     const password = passwords[name];
     if (!password) throw new Error(`the principal ${name} has no password`);
@@ -142,15 +171,20 @@ export async function applyAccess(admin: LogAdmin, access: LogAccess, passwords:
   await admin.allow(access.principals.flatMap(({ name, acls }) => acls.flatMap((acl) => bindings(name, acl))));
   for (const { name, password } of credentials) await admin.credential(name, password);
   const topics = await admin.topics();
+  const left: string[] = [];
   for (const topic of access.topics) {
     const has = topics.get(topic.name);
     if (has === undefined) {
       await admin.createTopic(topic.name, topic.partitions, topicConfigs(topic));
       continue;
     }
-    if (has < topic.partitions) await admin.addPartitions(topic.name, topic.partitions);
+    if (has < topic.partitions) {
+      if (topic.readInOrderBy !== undefined && !(await stoppedAndRead(admin, topic.name, has, topic.readInOrderBy))) left.push(topic.name);
+      else await admin.addPartitions(topic.name, topic.partitions);
+    }
     await admin.setConfigs(topic.name, topicConfigs(topic));
   }
+  return left;
 }
 
 /** A topic's retention and its other configurations, as those of its own it is made or altered with. */
@@ -163,6 +197,7 @@ const topicConfigs = ({ retentionMs, retentionBytes, configs }: LogTopic): Topic
 /** Makes the branch environment's `access` on the log: its topics, and each principal's credential and ACLs. */
 export async function applyEnvironment(admin: LogAdmin, { principals, topics }: EnvironmentLogAccess): Promise<void> {
   const passwords = Object.fromEntries(principals.flatMap(({ name, password }) => (password ? [[name, password]] : [])));
+  // A branch's topics are made with it, so none has more partitions to be given.
   await applyAccess(admin, { topics, principals }, passwords);
 }
 
@@ -255,6 +290,24 @@ export function logAdmin(brokers: readonly string[], password: string): LogAdmin
       const { topics } = await admin.metadata({ topics: names, forceUpdate: true });
       return new Map([...topics].map(([name, { partitionsCount }]) => [name, partitionsCount]));
     },
+    async unread(topic, partitions, group) {
+      const indexes = Array.from({ length: partitions }, (_, partitionIndex) => partitionIndex);
+      // Each partition's first offset kept (-2) and next to be written (-1).
+      const offsets = async (timestamp: bigint) =>
+        new Map(((await admin.listOffsets({ topics: [{ name: topic, partitions: indexes.map((partitionIndex) => ({ partitionIndex, timestamp })) }] }))[0]?.partitions ?? []).map(({ partitionIndex, offset }) => [partitionIndex, offset]));
+      const [first, next] = [await offsets(-2n), await offsets(-1n)];
+      const [read] = await admin.listConsumerGroupOffsets({ groups: [{ groupId: group, topics: [{ name: topic, partitionIndexes: indexes }] }] });
+      const committed = new Map((read?.topics.find(({ name }) => name === topic)?.partitions ?? []).map(({ partitionIndex, committedOffset }) => [partitionIndex, committedOffset]));
+      let unread = 0n;
+      for (const partition of indexes) {
+        const from = committed.get(partition) ?? -1n;
+        unread += (next.get(partition) ?? 0n) - (from < 0n ? (first.get(partition) ?? 0n) : from);
+      }
+      return Number(unread);
+    },
+    async members(group) {
+      return (await admin.describeGroups({ groups: [group] })).get(group)?.members.size ?? 0;
+    },
     async createTopic(name, partitions, configs) {
       await admin.createTopics({ topics: [name], partitions, configs: [...configs] });
     },
@@ -291,6 +344,19 @@ const required = (key: string) => {
   return value;
 };
 
+/** Prints how many partitions `topic` has, 0 where there is none, then exits: 0 once said, 1 saying why where it could not be. */
+async function printPartitions(topic: string): Promise<void> {
+  const admin = logAdmin(required("LOG_BROKERS").split(","), required("LOG_ADMIN_PASSWORD"));
+  try {
+    console.log((await admin.topics()).get(topic) ?? 0);
+  } catch (error) {
+    console.error(errorText(error));
+    process.exitCode = 1;
+  } finally {
+    await admin.close().catch(() => {});
+  }
+}
+
 /** Makes, or forgets, the environment its input says, then exits: 0 once done, 1 saying why where it failed. */
 async function changeEnvironment(change: "environment" | "forget"): Promise<void> {
   const access: EnvironmentLogAccess = JSON.parse(readFileSync(0, "utf8"));
@@ -309,9 +375,11 @@ async function changeEnvironment(change: "environment" | "forget"): Promise<void
   }
 }
 
-const [mode] = process.argv.slice(2);
+const [mode, topic] = process.argv.slice(2);
 if (import.meta.url === `file://${process.argv[1]}` && (mode === "environment" || mode === "forget")) {
   await changeEnvironment(mode);
+} else if (import.meta.url === `file://${process.argv[1]}` && mode === "partitions" && topic) {
+  await printPartitions(topic);
 } else if (import.meta.url === `file://${process.argv[1]}`) {
   const brokers = required("LOG_BROKERS").split(",");
   const controllers = controllersWriter(required("LOG_CONTROLLERS").split(","));
@@ -326,6 +394,8 @@ if (import.meta.url === `file://${process.argv[1]}` && (mode === "environment" |
   server.listen(Number(required("LOG_ACCESS_PORT")), "0.0.0.0");
   let timer: NodeJS.Timeout | undefined;
   let restored = false;
+  /** The topics read in order last said to be left, joined. */
+  let leftSaid = "";
   const apply = async (): Promise<void> => {
     const admin = logAdmin(brokers, password);
     try {
@@ -336,9 +406,13 @@ if (import.meta.url === `file://${process.argv[1]}` && (mode === "environment" |
         restored = true;
         log("the log's admin's credential written again through its controllers");
       }
-      await applyAccess(admin, access, passwords);
-      log("the log's access applied", { principals: access.principals.map(({ name }) => name), topics: access.topics.map(({ name }) => name) });
+      const left = await applyAccess(admin, access, passwords);
+      if (!applied) log("the log's access applied", { principals: access.principals.map(({ name }) => name), topics: access.topics.map(({ name }) => name) });
       applied = true;
+      // Said once for as long as the same are left, as they are while their alasio runs.
+      if (left.join() !== leftSaid && left.length > 0) log("topics read in order left at their partitions until their groups have no member and have read them all", { topics: left });
+      leftSaid = left.join();
+      if (left.length > 0) timer = setTimeout(apply, RETRY_MS);
     } catch (error) {
       log("the log's access could not be applied yet", { error: errorText(error) });
       timer = setTimeout(apply, RETRY_MS);

@@ -33,7 +33,9 @@ const PAUSE = `sha256:${"a".repeat(64)}`;
  * as many looks as `busy` says, there until it scales alasio to none and for as many looks
  * after as `lingers` says, every look and the scale said in order in `looked`, and fails to
  * list any while `unlisted` is there; an UPGRADE and an UPGRADE_CHECK, each saying it ran,
- * UPGRADE failing while `upgradeFails` is there; and a node, in `node`, whose containerd
+ * UPGRADE failing while `upgradeFails` is there, and otherwise starting alasio again; a log whose Telegram topic has the partitions
+ * `partitions` says, 6 unless given, which its applier grows to 6 while alasio is stopped where
+ * `grows` is there, alasio started again said in `ran`; and a node, in `node`, whose containerd
  * pins the sandbox image k3s gives it, and records the images `images` lists, and whose
  * k3s's ctr says what it was asked to fetch, fetching what no registry answers for failing,
  * and what `unfetched` names fetched to no end.
@@ -49,6 +51,8 @@ function machine() {
   const stopped = join(root, "stopped");
   const looked = join(root, "looked");
   const unlisted = join(root, "unlisted");
+  const partitions = join(root, "partitions");
+  const grows = join(root, "grows");
   const config = join(root, "config.json");
   const node = join(root, "node");
   const fetched = join(root, "fetched");
@@ -64,6 +68,7 @@ function machine() {
   writeFileSync(namespaces, "");
   writeFileSync(busy, "0");
   writeFileSync(lingers, "0");
+  writeFileSync(partitions, "6");
   writeFileSync(config, JSON.stringify({ target: { host: {} }, install: { host: { enabled: true } } }), { mode: 0o600 });
   writeFileSync(images, `docker.io/rancher/mirrored-pause:3.10.2 ${PAUSE} complete\n`);
   writeFileSync(unreachable, "");
@@ -93,6 +98,11 @@ case "$*" in
   "-n alasio get pod "*" -o jsonpath={.status.phase}") if grep -qx "$5" '${podFails}' 2>/dev/null; then echo Failed; else echo Succeeded; fi ;;
   "-n alasio logs "*) if [ "$4" = alasio-sessions-claimed ]; then echo 3; else echo "made alasio's state"; fi ;;
   "-n alasio delete pod "*" --wait") exit 0 ;;
+  "-n alasio exec alasio-log-0 -c access -- node /opt/alasio/src/log/access.ts partitions telegram.main")
+    if [ -e '${grows}' ] && [ -e '${stopped}' ]; then echo 6 >'${partitions}'; fi
+    cat '${partitions}' ;;
+  "-n alasio scale deployment alasio --replicas=1") echo "start alasio" >>'${ran}'; rm -f '${stopped}' ;;
+  "-n alasio rollout status deployment/alasio --timeout=600s") exit 0 ;;
   *) echo "kubectl $* is not the cut-over's" >&2; exit 2 ;;
 esac
 `, { mode: 0o755 });
@@ -123,7 +133,8 @@ esac
         OUT: out,
         CONFIG: config,
         NODE_ROOT: node,
-        UPGRADE: `echo upgrade >>'${ran}' && [ ! -e '${upgradeFails}' ]`,
+        // Starting alasio again, as the upgrade does once it gets as far as it.
+        UPGRADE: `echo upgrade >>'${ran}' && [ ! -e '${upgradeFails}' ] && rm -f '${stopped}'`,
         UPGRADE_CHECK: `echo check >>'${ran}'`,
         SETUP_POD: `printf '%s' '${JSON.stringify(SETUP_POD)}'`,
         POLL_SECONDS: "0",
@@ -156,6 +167,12 @@ esac
     looked: () => lines(looked),
     /** Whether the cut-over recorded alasio stopped. */
     alasioStopped: () => existsSync(join(out, "alasio-stopped")),
+    /** Has the log's Telegram topic of `count` partitions, grown to 6 while alasio is stopped where `grown`. */
+    partitions: (count: number, grown: boolean) => {
+      writeFileSync(partitions, String(count));
+      if (grown) writeFileSync(grows, "");
+      else rmSync(grows, { force: true });
+    },
     /** Has alasio running again, as the upgrade starts it. */
     started: () => rmSync(stopped, { force: true }),
     /** Has containerd pin `sandbox` as the sandbox image, as k3s writes it. */
@@ -191,6 +208,33 @@ test("the cut-over checks, upgrades past its point of no return, and says it is 
     assert.deepEqual(at.ran(), ["check", "stop alasio", ...SETUP, "upgrade"]);
     assert.deepEqual(at.marks(), ["point-of-no-return", "upgraded"]);
     assert.match(run.said, /cutting over from 9\.0\.0[^]*checking that no branch environment exists[^]*checking that the upgrade can run[^]*past the point of no return[^]*waiting for alasio to run no turn[^]*alasio stopped, to be started again by the upgrade\n[^\n]* making this release's state with its own setup[^\n]*\n[^\n]* giving each conversation the sessions its rows name[^\n]*\n[^\n]* the conversations have 3 sessions, of their rows and the threads their histories start in\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+  } finally {
+    at.remove();
+  }
+});
+
+test("once the upgrade is through, the cut-over stops alasio again, once it runs no turn, for the log to give its Telegram topic 9.0.0's one partition's five more, then starts it again, before it records the upgrade", () => {
+  const at = machine();
+  try {
+    at.partitions(1, true);
+    const run = at.cutOver();
+    assert.equal(run.code, 0, run.said);
+    assert.deepEqual(at.ran(), ["check", "stop alasio", ...SETUP, "upgrade", "stop alasio", "start alasio"]);
+    assert.deepEqual(at.marks(), ["point-of-no-return", "upgraded"]);
+    assert.match(run.said, /upgrading, from the cut-over begun at [^\n]*\n[^\n]* waiting for alasio to run no turn, then stopping it again, for the log to give telegram\.main its 6 partitions\n[^\n]* telegram\.main has its 6 partitions\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+  } finally {
+    at.remove();
+  }
+});
+
+test("a Telegram topic the log does not grow within its bound, as an update came while alasio was stopped, is left as it is, said, and alasio started again", () => {
+  const at = machine();
+  try {
+    at.partitions(1, false);
+    const run = at.cutOver(undefined, { PARTITIONS_WAIT_SECONDS: "0" });
+    assert.equal(run.code, 0, run.said);
+    assert.deepEqual(at.ran(), ["check", "stop alasio", ...SETUP, "upgrade", "stop alasio", "start alasio"]);
+    assert.match(run.said, /telegram\.main is left as it is, of 1 of its 6 partitions, as an update came for it while alasio was stopped: the next stop of alasio with nothing unread grows it\n[^\n]* upgraded at /u);
   } finally {
     at.remove();
   }

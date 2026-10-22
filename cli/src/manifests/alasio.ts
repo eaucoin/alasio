@@ -17,7 +17,8 @@ import type {
   V1Volume,
 } from "@kubernetes/client-node";
 
-import { BRANCH_PARENT_LABEL, branchSessionsNamespace, MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
+import { BRANCH_PARENT_LABEL, branchSessionsNamespace, forksGroup, forksTopic, MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
+import { eventsGroup, eventsTopic } from "../../../src/events/names.ts";
 import { ALASIO_GATEWAY_CALLER_KEY_VARIABLE, ALASIO_GATEWAY_ENVIRONMENT_VARIABLE, ALASIO_GATEWAY_FOLDERS_VARIABLE, ALASIO_GATEWAY_URL_VARIABLE } from "../../../src/gateway/names.ts";
 import type { ApiServer } from "../api-server.ts";
 import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
@@ -25,8 +26,11 @@ import { imageReference } from "../images.ts";
 import { busyLabelPolicy } from "./admission.ts";
 import { foldersRun } from "./folders.ts";
 import { carriedPools, GATEWAY, GATEWAY_PORT } from "./sandbox-gateway.ts";
-import { alasioGroup, environmentLogSecret, environmentName, lakeWakeTopic, LOG_BROKERS, telegramTopic } from "./log.ts";
+import { alasioGroup, environmentLogSecret, environmentName, lagTrigger, lakeWakeTopic, LOG_BROKERS, logAuthentication, telegramTopic } from "./log.ts";
+import { environmentPools } from "./harness-pools.ts";
+import { scaledObject, type Trigger } from "./scalers.ts";
 import { CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
+import { STOP_GRACE_SECONDS } from "../../../src/telegram/stop.ts";
 import {
   BRANCH_FORK_SECRET,
   BRANCH_LABEL,
@@ -42,7 +46,6 @@ import {
   lakeRuns,
   MAIN_ENVIRONMENT,
   NAMESPACE,
-  ONE,
   otelEnv,
   RELEASE,
   replicasOf,
@@ -203,9 +206,10 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
 }
 
 /**
- * alasio's Deployment: one replica, the one member of its group on its topic's one
- * partition, which its turns run in, so an update stops the old pod before the new one
- * starts. It keeps no volume: its state is in Neon,
+ * alasio's Deployment: of alasio.scaling's replicas, which KEDA moves between its min and max
+ * where they are apart (alasioScaling). At one at most, an update stops the old pod before the
+ * new one starts; beyond, the new one starts beside the old, which drains as it stops, within
+ * STOP_GRACE_SECONDS (src/telegram/stop.ts, src/telegram/drain.ts). It keeps no volume: its state is in Neon,
  * and what it writes to disk (received files written for the agent, its home unless it
  * is the operator's) is written again as needed, on emptyDirs. Under the
  * host profile it runs as the operator, in their home, with the machine's mounts. A
@@ -229,8 +233,8 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
     kind: "Deployment",
     metadata: { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") },
     spec: {
-      ...replicasOf(ONE),
-      strategy: { type: "Recreate" },
+      ...replicasOf(alasio.scaling),
+      strategy: alasio.scaling.max > 1 ? { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } } : { type: "Recreate" },
       selector: { matchLabels: selectorLabels("alasio") },
       template: {
         metadata: {
@@ -240,8 +244,8 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
         spec: {
           serviceAccountName: RELEASE,
           ...priority("turn"),
-          // alasio finishes its turns' bookkeeping and records what it interrupts as it stops.
-          terminationGracePeriodSeconds: 60,
+          // alasio finishes its turns' bookkeeping and records what it interrupts as it stops, and delivers what it owes.
+          terminationGracePeriodSeconds: STOP_GRACE_SECONDS,
           securityContext: { ...restrictedPod(uid, gid), ...given("supplementalGroups", groups) },
           ...imagePullSecrets(config),
           containers: [{
@@ -395,6 +399,35 @@ function codexLoginService(environment: Environment): V1Service {
   };
 }
 
+/** How many updates waiting on its environment's Telegram topic ask for one more alasio: a few chats' bursts. */
+const UPDATES_PER_ALASIO = 20;
+/** What a bound harness asks of alasio's scale: so much that any number of them ask for one alasio, to hear and deliver what they do, and no more. */
+const BOUND_TARGET = 1_000_000;
+
+/**
+ * KEDA's scaling of the environment's alasio (deployment), where its scale's min and max are
+ * apart: up from none at the first update, event or fork request waiting on its topics, or
+ * harness bound to one of its conversations, and up by one for each UPDATES_PER_ALASIO updates
+ * waiting; back to its min once none of that has been seen for its cooldown. Its groups' lags
+ * read as the log's scaler principal; a group that has read none of a topic counts its records
+ * as it reads them, from its first or from the next written (src/events/consume.ts).
+ */
+export function alasioScaling(config: InstallConfig, environment: Environment, alasio: V1Deployment): KubernetesObject[] {
+  const name = environmentName(environment);
+  const authentication = RELEASE;
+  const triggers: Trigger[] = [
+    lagTrigger(alasioGroup(name), telegramTopic(name), UPDATES_PER_ALASIO, authentication),
+    lagTrigger(eventsGroup(name), eventsTopic(name), 1, authentication, environment.branch === null ? "latest" : "earliest"),
+    ...(environment.branch === null ? [lagTrigger(forksGroup(MAIN_ENVIRONMENT_NAME), forksTopic(MAIN_ENVIRONMENT_NAME), 1, authentication)] : []),
+    ...environmentPools(config, environment).map((pool): Trigger => ({
+      type: "metrics-api",
+      metadata: { url: `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/counts/${pool.namespace}/${pool.name}`, valueLocation: "bound", targetValue: String(BOUND_TARGET), activationTargetValue: "0" },
+    })),
+  ];
+  const scaledObjects = scaledObject(alasio, config.alasio.scaling, triggers, { pollingSeconds: config.alasio.pollingSeconds, cooldownSeconds: config.alasio.cooldownSeconds });
+  return scaledObjects.length > 0 ? [logAuthentication(authentication, environment.namespace, "alasio"), ...scaledObjects] : [];
+}
+
 /** The objects of the alasio of `environment`, main's unless a branch environment's, with what main's carries forward. */
 export function alasioObjects(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT, carried: Carried = NOTHING_CARRIED): KubernetesObject[] {
   const alasio = deployment(config, carried.botChecksum, environment);
@@ -402,6 +435,7 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
     ...namespaces(config, environment),
     ...identity(config, environment),
     alasio,
+    ...alasioScaling(config, environment, alasio),
     // It runs turns, in its harnesses, which a recreation would end.
     verticalPodAutoscaler(alasio, "AtStart"),
     // A drain waits for the turns running in its pod to end.

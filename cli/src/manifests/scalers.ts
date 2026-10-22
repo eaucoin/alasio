@@ -29,6 +29,10 @@ export interface ScaledObject extends KubernetesObject {
     readonly scaleTargetRef: { readonly apiVersion?: string | undefined; readonly kind?: string | undefined; readonly name: string };
     readonly minReplicaCount: number;
     readonly maxReplicaCount: number;
+    /** How often KEDA looks at its triggers, in seconds; its default, 30, where none is said. */
+    readonly pollingInterval?: number;
+    /** How long its triggers must have asked for none before it scales the workload to its minimum, in seconds; KEDA's default, 300, where none is said. */
+    readonly cooldownPeriod?: number;
     readonly triggers: readonly Trigger[];
     /** How the HorizontalPodAutoscaler KEDA makes of it scales: here, how long it holds off scaling up. */
     readonly advanced?: { readonly horizontalPodAutoscalerConfig: { readonly behavior: { readonly scaleUp: { readonly stabilizationWindowSeconds: number } } } };
@@ -40,9 +44,15 @@ export interface ScaledObject extends KubernetesObject {
   };
 }
 
-/** The ScaledObject of `workload`, of `scale`, on `triggers`: none where the scale is a fixed count. */
-export function scaledObject(workload: V1Deployment | V1StatefulSet, scale: Scale, triggers: readonly Trigger[]): ScaledObject[] {
-  return scaledOn(workload, scale, triggers, undefined);
+/** How often a ScaledObject looks at its triggers, and how long they must ask for none before it scales its workload to its minimum, in seconds. */
+export interface ScalingTiming {
+  readonly pollingSeconds: number;
+  readonly cooldownSeconds: number;
+}
+
+/** The ScaledObject of `workload`, of `scale`, on `triggers`, as often and as long as `timing` says, KEDA's defaults where none: none where the scale is a fixed count. */
+export function scaledObject(workload: V1Deployment | V1StatefulSet, scale: Scale, triggers: readonly Trigger[], timing?: ScalingTiming): ScaledObject[] {
+  return scaledOn(workload, scale, triggers, undefined, timing);
 }
 
 /**
@@ -58,7 +68,7 @@ export function cpuScaledObject(workload: V1Deployment | V1StatefulSet, scale: S
   return scaledOn(workload, scale, [cpu], { horizontalPodAutoscalerConfig: { behavior: { scaleUp: { stabilizationWindowSeconds: startUpSeconds } } } });
 }
 
-function scaledOn(workload: V1Deployment | V1StatefulSet, scale: Scale, triggers: readonly Trigger[], advanced: ScaledObject["spec"]["advanced"]): ScaledObject[] {
+function scaledOn(workload: V1Deployment | V1StatefulSet, scale: Scale, triggers: readonly Trigger[], advanced: ScaledObject["spec"]["advanced"], timing?: ScalingTiming): ScaledObject[] {
   if (!scaled(scale)) return [];
   const { name = "", namespace = "", labels = {} } = workload.metadata ?? {};
   return [{
@@ -69,6 +79,7 @@ function scaledOn(workload: V1Deployment | V1StatefulSet, scale: Scale, triggers
       scaleTargetRef: { apiVersion: workload.apiVersion, kind: workload.kind, name },
       minReplicaCount: scale.min,
       maxReplicaCount: scale.max,
+      ...(timing ? { pollingInterval: timing.pollingSeconds, cooldownPeriod: timing.cooldownSeconds } : {}),
       triggers,
       ...(advanced ? { advanced } : {}),
     },

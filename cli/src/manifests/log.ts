@@ -28,9 +28,10 @@ import { forksGroup, forksTopic, MAIN_ENVIRONMENT_NAME } from "../../../src/bran
 import { EVENTS_RETENTION_MS, EVENTS_TOPIC_PREFIX, eventsGroup, eventsTopic } from "../../../src/events/names.ts";
 import { imageReference } from "../images.ts";
 import { claimLabels, claimSpec, componentName, type Environment, NAMESPACE, replicasOf, restrictedContainer, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
-import { type InstallConfig, LOG_SEGMENT_BYTES, telemetryRetentionBytes } from "./config.ts";
+import { type InstallConfig, LOG_SEGMENT_BYTES, TELEGRAM_PARTITIONS, telemetryRetentionBytes } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
+import type { Trigger, TriggerAuthentication } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 
 /** The log's name: its StatefulSet's, its Service's, its ConfigMap's and its Secret's. */
@@ -95,9 +96,10 @@ export const loaderGroup = (name: string): string => `lake-loader.${name}`;
  * principal of their own, and its alasio reads in its group, `alasio-events.<name>`. Branches ask
  * main to fork the sessions they inherited on main's forks topic, `forks.main`
  * (src/branch/fork.ts), which a branch's alasio writes and main's reads in its group,
- * `alasio-forks.main`, answering on the branches' events topics, which it may write. Those topics
- * are of one partition each, as one alasio and one loader read them, a chat's updates in order,
- * each keeping a segment beside the one it writes at most: a week of a bot's updates, or of
+ * `alasio-forks.main`, answering on the branches' events topics, which it may write. The Telegram
+ * topic is of TELEGRAM_PARTITIONS partitions, as many as the environment's alasios may be, each
+ * chat's updates in one, by its key, so in order; the others of one each, as one alasio and one
+ * loader read them. Each keeps a segment beside the one it writes at most: a week of a bot's updates, or of
  * events, and a day of wakes or of requests, is kilobytes. Each update, event and request is
  * flushed to the volume as it is written, as what told of it does not tell again; a wake, lost,
  * costs nothing.
@@ -135,7 +137,7 @@ export function environmentAccess(name: string): EnvironmentLogAccess {
     ],
     topics: [
       // Each update flushed to the volume as it is written: Telegram, answered once the log has it, sends it no more.
-      { name: topic, partitions: 1, retentionMs: TELEGRAM_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: { "flush.messages": "1" } },
+      { name: topic, partitions: TELEGRAM_PARTITIONS, readInOrderBy: alasioGroup(name), retentionMs: TELEGRAM_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: { "flush.messages": "1" } },
       { name: wake, partitions: 1, retentionMs: WAKE_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: {} },
       { name: events, partitions: 1, retentionMs: EVENTS_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: { "flush.messages": "1" } },
       ...(main ? [{ name: forks, partitions: 1, retentionMs: FORKS_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: { "flush.messages": "1" } }] : []),
@@ -171,10 +173,16 @@ export interface LogAcl {
   readonly operations: readonly ("read" | "write" | "describe")[];
 }
 
-/** A topic: its partitions, how long and how much of each it keeps, and its other configurations of its own, by Kafka's names. */
+/**
+ * A topic: its partitions, how long and how much of each it keeps, and its other
+ * configurations of its own, by Kafka's names; and, of one read in its records' order by key,
+ * the group that reads it, no partition added while it has a member or records to read
+ * (src/log/access.ts).
+ */
 export interface LogTopic {
   readonly name: string;
   readonly partitions: number;
+  readonly readInOrderBy?: string;
   readonly retentionMs: number;
   readonly retentionBytes: number;
   readonly configs: Readonly<Record<string, string>>;
@@ -203,6 +211,28 @@ export interface LogAccess {
   readonly topics: readonly LogTopic[];
   readonly principals: readonly LogPrincipalAccess[];
 }
+
+/** KEDA's reading of the log as the `scaler` principal, which may describe the groups and topics it scales on and read none, in `namespace`, the Secret's copy there. */
+export function logAuthentication(name: string, namespace: string, component: string): TriggerAuthentication {
+  const scaler = logPrincipalSecret("scaler");
+  return {
+    apiVersion: "keda.sh/v1alpha1",
+    kind: "TriggerAuthentication",
+    metadata: { name, namespace, labels: stackLabels(component) },
+    spec: { secretTargetRef: ["sasl", "username", "password"].map((parameter) => ({ parameter, name: scaler, key: parameter })) },
+  };
+}
+
+/**
+ * A trigger of how far `group` is behind on `topic`, past `threshold` records a partition,
+ * authenticated as `authentication` says; of a group that has read none, as far as the topic
+ * is long (`earliest`, the default) or not at all (`latest`), as the group reads it.
+ */
+export const lagTrigger = (group: string, topic: string, threshold: number, authentication: string, untold: "earliest" | "latest" = "earliest"): Trigger => ({
+  type: "kafka",
+  metadata: { bootstrapServers: LOG_BROKERS, consumerGroup: group, topic, lagThreshold: String(threshold), activationLagThreshold: "0", offsetResetPolicy: untold },
+  authenticationRef: { name: authentication },
+});
 
 /** The hours of a retention as log.retention says it. */
 export const retentionMs = (retention: string): number => Number(retention.slice(0, -1)) * 3_600_000;
@@ -239,12 +269,16 @@ export function logAccess(config: InstallConfig): LogAccess {
   const services: Record<Exclude<LogPrincipal, MainEnvironmentPrincipal>, readonly LogAcl[]> = {
     gateway: [{ ...telemetry, operations: ["write", "describe"] }],
     intake: [{ ...telemetry, operations: ["read", "describe"] }, { ...group, operations: ["read"] }],
-    // And every environment's wake topic and its loader's group, which it reads how far behind on too.
+    // And every environment's wake topic and its loader's group, and the topics its alasio
+    // scales on, its Telegram updates', its events' and main's forks', and its groups on them,
+    // which it reads how far behind on too: each name's prefix, as its name of none.
     scaler: [
       { ...telemetry, operations: ["describe"] },
       { ...group, operations: ["describe"] },
       { resource: "topic", name: "lake.", pattern: "prefixed", operations: ["describe"] },
       { resource: "group", name: "lake-loader.", pattern: "prefixed", operations: ["describe"] },
+      ...[telegramTopic(""), eventsTopic(""), forksTopic("")].map((name): LogAcl => ({ resource: "topic", name, pattern: "prefixed", operations: ["describe"] })),
+      ...[alasioGroup(""), eventsGroup(""), forksGroup("")].map((name): LogAcl => ({ resource: "group", name, pattern: "prefixed", operations: ["describe"] })),
     ],
     webhook: [{ resource: "topic", name: "telegram.", pattern: "prefixed", operations: ["write", "describe"] }],
     // Every environment's events, a branch's among them, and nothing else.

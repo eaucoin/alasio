@@ -26,14 +26,21 @@ export interface Feed<R extends Received> {
   readonly close: () => Promise<void>;
 }
 
+/**
+ * What a member ends with that is no failure: it ends for its group to be joined again, at
+ * once, as its topic grew (./topic.ts), saying why.
+ */
+export class JoinAgain extends Error {}
+
 /** What `error` says. */
 export const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /**
  * Keeps a member of the group `join` joins, handing each record to `handle` in turn and
  * telling the group of it once handled, until it is interrupted; `name` says what it reads,
- * in what it logs. A failure of joining, reading, handling or telling is logged, and the
- * group joined again after REJOIN_BACKOFF.
+ * in what it logs. A failure of joining, reading, handling or telling is logged as one, and the
+ * group joined again after REJOIN_BACKOFF; a member's JoinAgain is said as what it is, and the
+ * group joined again at once.
  */
 export const consumeGroup = <R extends Received, E1, E2, Q1, Q2>({ name, join, handle }: {
   readonly name: string;
@@ -52,13 +59,16 @@ export const consumeGroup = <R extends Received, E1, E2, Q1, Q2>({ name, join, h
     Effect.mapError(join, errorText),
     (feed) => Effect.promise(() => feed.close().catch(() => {})),
   ).pipe(
-    Effect.flatMap((feed) => Effect.forever(Effect.tryPromise({ try: () => feed.next(), catch: errorText }).pipe(Effect.flatMap(handled)))),
+    Effect.flatMap((feed) => Effect.forever(Effect.tryPromise({ try: () => feed.next(), catch: (error) => (error instanceof JoinAgain ? error : errorText(error)) }).pipe(Effect.flatMap(handled)))),
     Effect.scoped,
   );
 
   return member.pipe(
-    Effect.catch((error) => Effect.logError(`Consuming ${name} failed: ${error}`)),
-    Effect.andThen(Effect.sleep(REJOIN_BACKOFF)),
+    Effect.catch((error) =>
+      error instanceof JoinAgain
+        ? Effect.logInfo(`${name}: ${error.message}, so its group is joined again`)
+        : Effect.logError(`Consuming ${name} failed: ${error}`).pipe(Effect.andThen(Effect.sleep(REJOIN_BACKOFF)))
+    ),
     Effect.forever,
   );
 };

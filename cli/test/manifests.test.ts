@@ -40,6 +40,7 @@ import { DRAIN_WITHIN_MS } from "../../neon/lake/src/drain.ts";
 import { memoryBytes } from "../src/capacity.ts";
 import { NODE_PINS } from "../src/cluster/node.ts";
 import { installConfigOf } from "../src/config.ts";
+import { alasioObjects, alasioScaling } from "../src/manifests/alasio.ts";
 import { branchEnvironment, branchObjects } from "../src/manifests/branch.ts";
 import { MAIN_ENVIRONMENT } from "../src/manifests/common.ts";
 import { lakeReconcile } from "../src/manifests/lake.ts";
@@ -346,6 +347,44 @@ describe("alasio", () => {
       assert.equal(deployment.spec?.replicas, 1);
       assert.equal(deployment.spec?.strategy?.type, "Recreate");
     }
+  });
+
+  test("refuses a scale of alasio's but one until its turns run in harness pools alone, and more than its Telegram topic's partitions; gives it its grace to deliver what it owes as it stops", () => {
+    const refusal = (scaling: unknown) => {
+      const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" }, scaling } });
+      assert.ok(Result.isFailure(decoded));
+      return decoded.failure.message;
+    };
+    assert.equal(refusal({ min: 0 }), "alasio.scaling.min must be at least 1 until its conversations' turns run in harness pools alone");
+    assert.equal(refusal({ max: 2 }), "alasio.scaling.max must be at most 1 until its conversations' turns run in harness pools alone");
+    assert.equal(refusal({ max: 7 }), "alasio.scaling.max must be at most 6");
+    const deployment = one<V1Deployment>(install(), "Deployment", "alasio");
+    assert.equal(deployment.spec?.template.spec?.terminationGracePeriodSeconds, 360);
+    // Of a fixed count, nothing scales it.
+    assert.deepEqual(all(install(), "ScaledObject").filter(({ metadata }) => metadata?.name === "alasio"), []);
+  });
+
+  // The scaling it is held from until then, as it is rendered for a scale apart.
+  test("scales alasio from none on what waits on its environment's topics and on its bound harnesses, back once none has been seen for its cooldown, a rollout's new one beside the old", () => {
+    const scaledOf = (config: InstallConfig) => ({ ...config, alasio: { ...config.alasio, scaling: { min: 0, max: 3 } } });
+    const main = scaledOf(configOf());
+    const deployment = alasioObjects(main).find((object): object is V1Deployment => object.kind === "Deployment")!;
+    assert.deepEqual([deployment.spec?.replicas, deployment.spec?.strategy], [undefined, { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }]);
+    const [authentication, scaled] = alasioScaling(main, MAIN_ENVIRONMENT, deployment) as [KubernetesObject, ScaledObject];
+    assert.deepEqual([authentication.kind, authentication.metadata?.name, authentication.metadata?.namespace], ["TriggerAuthentication", "alasio", "alasio"]);
+    assert.deepEqual([scaled.spec.minReplicaCount, scaled.spec.maxReplicaCount, scaled.spec.pollingInterval, scaled.spec.cooldownPeriod], [0, 3, 5, 300]);
+    const lag = (trigger: ScaledObject["spec"]["triggers"][number]) => [trigger.metadata["consumerGroup"], trigger.metadata["topic"], trigger.metadata["lagThreshold"], trigger.metadata["offsetResetPolicy"]];
+    const lags = scaled.spec.triggers.filter(({ type }) => type === "kafka");
+    assert.deepEqual(lags.map(lag), [["alasio.main", "telegram.main", "20", "earliest"], ["alasio-events.main", "events.main", "1", "latest"], ["alasio-forks.main", "forks.main", "1", "earliest"]]);
+    // Any number bound asks for one alasio, from none.
+    const bound = scaled.spec.triggers.filter(({ type }) => type === "metrics-api");
+    assert.deepEqual(bound.map(({ metadata }) => [metadata["url"], metadata["valueLocation"], metadata["targetValue"], metadata["activationTargetValue"]]), [
+      ["http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio/harness-codex", "bound", "1000000", "0"],
+      ["http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio/harness-claude", "bound", "1000000", "0"],
+    ]);
+    // A branch's reads its events from its first, and asks no forks of its own.
+    const branch = alasioScaling(scaledOf(configOf()), branchEnvironment("try"), deployment).find((object): object is ScaledObject => object.kind === "ScaledObject")!;
+    assert.deepEqual(branch.spec.triggers.filter(({ type }) => type === "kafka").map(lag), [["alasio.try", "telegram.try", "20", "earliest"], ["alasio-events.try", "events.try", "1", "earliest"]]);
   });
 
   test("keeps no volume: its state is in Neon, its home and what it writes on emptyDirs", () => {
@@ -1853,8 +1892,8 @@ describe("the log", () => {
     // Each telemetry topic flushed to the volume within a second, so a host's crash loses a second of what it acknowledged at most, and kept compressed.
     assert.deepEqual(access.topics, [
       ...["otel.spans", "otel.logs", "otel.metrics"].map((name) => ({ name, partitions: 2, retentionMs: 259_200_000, retentionBytes: 448 * 1024 * 1024, configs: { "flush.ms": "1000", "compression.type": "zstd" } })),
-      // A week of main's Telegram updates, on one partition, as its one alasio reads them, within a segment beside the one it writes, each flushed as it is written.
-      { name: "telegram.main", partitions: 1, retentionMs: 604_800_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
+      // A week of main's Telegram updates, on a partition for each alasio it may run, given more only once its group has read them all, within a segment beside the one it writes, each flushed as it is written.
+      { name: "telegram.main", partitions: 6, readInOrderBy: "alasio.main", retentionMs: 604_800_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
       // A day of main's wake records, on one partition, as its one loader reads them, within a segment beside the one it writes.
       { name: "lake.main", partitions: 1, retentionMs: 86_400_000, retentionBytes: 64 * 1024 * 1024, configs: {} },
       // A week of main's events, on one partition, as its one alasio reads them, each flushed as it is written, as what told of it tells no more.
@@ -1874,6 +1913,9 @@ describe("the log", () => {
           { ...group, operations: ["describe"] },
           { resource: "topic", name: "lake.", pattern: "prefixed", operations: ["describe"] },
           { resource: "group", name: "lake-loader.", pattern: "prefixed", operations: ["describe"] },
+          // What every environment's alasio is scaled on.
+          ...["telegram.", "events.", "forks."].map((name) => ({ resource: "topic", name, pattern: "prefixed", operations: ["describe"] })),
+          ...["alasio.", "alasio-events.", "alasio-forks."].map((name) => ({ resource: "group", name, pattern: "prefixed", operations: ["describe"] })),
         ],
       },
       { name: "webhook", acls: [{ resource: "topic", name: "telegram.", pattern: "prefixed", operations: ["write", "describe"] }] },
