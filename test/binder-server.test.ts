@@ -724,6 +724,35 @@ test("a request on a route the front knew of, whose binding was released before 
   }
 });
 
+test("a request of no stated length on a route of a binding gone is streamed to its pod once, never read whole to pass again: its caller is told it was passed to no pod, to send it again itself", async () => {
+  const of = await pool();
+  const gone = await podAt("127.0.0.2");
+  const next = await podAt("127.0.0.1", gone.port);
+  await freePods(of, 1, 0, "127.0.0.2");
+  const served = await front(of, gone.port);
+  try {
+    const key = "sessionfs:streamed";
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "first" })).status, 200);
+    await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (binder) => binder.release(of, key)), Layer.provideMerge(Binder.layer({ waitMs: 5_000 }), Layer.fresh(KubeClient.layer))));
+    await gone.close();
+    await freePods(of, 1, 1, "127.0.0.1");
+    // Its body as it comes, chunked, as a stream's is.
+    const chunked = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("sec"));
+        controller.enqueue(new TextEncoder().encode("ond"));
+        controller.close();
+      },
+    });
+    const second = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: chunked, duplex: "half" } as RequestInit);
+    assert.deepEqual([second.status, second.headers.get("retry-after"), second.headers.get(NOT_PASSED_HEADER)], [503, "1", "true"]);
+    assert.deepEqual(next.bodies, [], "read whole and passed again");
+  } finally {
+    await served.close();
+    await next.close();
+  }
+});
+
 test("a request on a route of a binding gone that reached its pod before its connection was lost is not passed again, as its pod may have run it: its caller is told the pod was not reached", async () => {
   const of = await pool();
   // Its pod takes the request, then drops its connection unanswered, as one ending under it would.
