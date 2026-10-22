@@ -31,17 +31,36 @@ export type TopicFeed = Feed<TopicRecord>;
 /** What joins a group on its topic: the log's (joinTopic), or a stand-in's in tests. */
 export type JoinTopic = (log: TopicLog, untold: "earliest" | "latest") => Promise<TopicFeed>;
 
+/**
+ * How a member keeps its place in its group: the broker ends the membership of one it has not
+ * heard from in SESSION_TIMEOUT_MS, and the member's heartbeats, on a timer of their own however
+ * long a record's handling takes, come every HEARTBEAT_INTERVAL_MS. So the records of a member
+ * killed, or lost with its node, go to another within seconds, where the client's default would
+ * leave them a minute and more; a rebalance waits REBALANCE_TIMEOUT_MS at most for the members to
+ * join it. The broker takes no session shorter than its group.min.session.timeout.ms, six seconds
+ * by default.
+ */
+export const SESSION_TIMEOUT_MS = 10_000;
+export const HEARTBEAT_INTERVAL_MS = 3_000;
+export const REBALANCE_TIMEOUT_MS = 10_000;
+
+/** The options of a member of `log`'s group, as joinTopic makes it. */
+export const memberOptions = (log: TopicLog) => ({
+  clientId: log.username,
+  groupId: log.group,
+  bootstrapBrokers: [...log.brokers],
+  // Read at each join, as the kubelet keeps the Secret's file.
+  sasl: { mechanism: "SCRAM-SHA-512" as const, username: log.username, password: readFileSync(log.passwordFile, "utf8").trim() },
+  autocommit: false,
+  maxWaitTime: 1_000,
+  sessionTimeout: SESSION_TIMEOUT_MS,
+  heartbeatInterval: HEARTBEAT_INTERVAL_MS,
+  rebalanceTimeout: REBALANCE_TIMEOUT_MS,
+});
+
 /** Joins `log`'s group on its topic, reading on from where the group was last told, or, of a group told of none, from the topic's first record still kept (`earliest`) or the next written (`latest`). */
 export async function joinTopic(log: TopicLog, untold: "earliest" | "latest"): Promise<TopicFeed> {
-  const consumer = new Consumer({
-    clientId: log.username,
-    groupId: log.group,
-    bootstrapBrokers: [...log.brokers],
-    // Read at each join, as the kubelet keeps the Secret's file.
-    sasl: { mechanism: "SCRAM-SHA-512", username: log.username, password: readFileSync(log.passwordFile, "utf8").trim() },
-    autocommit: false,
-    maxWaitTime: 1_000,
-  });
+  const consumer = new Consumer(memberOptions(log));
   let stream;
   try {
     stream = await consumer.consume({
