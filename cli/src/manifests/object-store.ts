@@ -44,7 +44,7 @@ import type {
 import { HISTORY_DAYS } from "../../../neon/control/branches.ts";
 import { memoryBytes } from "../capacity.ts";
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, labels, NAMESPACE, neonName, replicasOf, restrictedContainer, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
+import { claimSpec, componentName, labels, NAMESPACE, neonName, oncePolicyApplies, replicasOf, restrictedContainer, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import { filerStoreMaxmemoryBytes, type InstallConfig, type Scale } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -669,8 +669,7 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
                 command: [
                   "/bin/sh",
                   "-c",
-                  // Waits out the moment before its NetworkPolicy applies, as a new pod.
-                  `until wget -q -O /dev/null http://${MASTER}:9333/cluster/status; do sleep 2; done && ` +
+                  `${oncePolicyApplies(`wget -q -O /dev/null http://${MASTER}:9333/cluster/status`)} && ` +
                   `printf '${commands.map((command) => `${command}\\n`).join("")}' | weed shell -master=${masters(config)} -filer=${FILER}:8888`,
                 ],
                 securityContext: restrictedContainer(),
@@ -718,8 +717,7 @@ function filerStoreBackup(config: InstallConfig): KubernetesObject[] {
         "stamp=$(date -u +%Y%m%dT%H%M%SZ)",
         // What a backup that failed left behind, which no other is writing: they run one at a time.
         "rm -f /backups/.filer-store-*.rdb",
-        // Waits out the moment before its NetworkPolicy applies, as a new pod.
-        `until valkey-cli -h ${FILER_STORE} --user ${FILER_STORE_USERS.backup.name} ping 2>/dev/null | grep -q PONG; do sleep 2; done`,
+        oncePolicyApplies(`valkey-cli -h ${FILER_STORE} --user ${FILER_STORE_USERS.backup.name} ping 2>/dev/null | grep -q PONG`),
         `valkey-cli -h ${FILER_STORE} --user ${FILER_STORE_USERS.backup.name} --rdb "/backups/.filer-store-$stamp.rdb"`,
         'test -s "/backups/.filer-store-$stamp.rdb"',
         'mv "/backups/.filer-store-$stamp.rdb" "/backups/filer-store-$stamp.rdb"',

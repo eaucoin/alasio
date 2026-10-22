@@ -241,6 +241,14 @@ export function stackPodSpec(config: InstallConfig): Pick<V1PodSpec, "imagePullS
   };
 }
 
+/**
+ * A pod's shell command that runs `probe` every 2 s until it succeeds, before what follows it:
+ * a new pod's NetworkPolicy applies a moment after it starts, as kube-router lets its address in
+ * only as it next syncs, and what the pod reaches refuses it until then, so one that reaches
+ * something first thing waits that out rather than fail at the first refusal.
+ */
+export const oncePolicyApplies = (probe: string): string => `until ${probe}; do sleep 2; done`;
+
 /** An init container that waits until `url` answers 2xx, with Neon's image's curl. */
 export function waitFor(config: InstallConfig, name: string, url: string): V1Container {
   return {

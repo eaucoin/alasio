@@ -221,12 +221,13 @@ one_off() {
 # What runs SQL on alasio's database, as alasio reaches it, from its pod: ALASIO_CUTOVER_SQL's
 # statements, the rows of the last printed a line each, tab-separated. Its pod's address is let
 # in by the network policies of what it reaches only as they next sync, just after it starts, so
-# its first connections may be refused: it connects as alasio's setup does (src/neon/connect.ts),
-# trying again every 5 s, for 5 minutes, saying why, where its connection failed (one of Node's
-# errors of a connection, as ECONNREFUSED, ECONNRESET or EPIPE, or pg's of one ended) or the
-# database said it takes none yet (SQLSTATE classes 08, a connection's, and 57P, as 57P03 of a
-# compute starting); any other the database answered, as of a password it does not take, fails
-# at once, as no wait mends it. The SQL runs once, connected.
+# its first connections may be refused, as the stack's pods' are (cli/src/manifests/common.ts
+# oncePolicyApplies): it connects as alasio's setup does (src/neon/connect.ts), trying again
+# every 5 s, for 5 minutes, saying why, where its connection failed (one of Node's errors of a
+# connection, as ECONNREFUSED, ECONNRESET or EPIPE, or pg's of one ended) or the database said it
+# takes none yet (SQLSTATE classes 08, a connection's, and 57P, as 57P03 of a compute starting);
+# any other the database answered, as of a password it does not take, fails at once, as no wait
+# mends it. The SQL runs once, connected.
 ON_DATABASE='import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 const pg = createRequire("/opt/alasio/package.json")("pg");

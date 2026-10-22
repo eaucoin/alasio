@@ -37,6 +37,7 @@ import {
   MAIN_ENVIRONMENT,
   NAMESPACE,
   neonName,
+  oncePolicyApplies,
   ONE,
   otelEnv,
   RELEASE,
@@ -786,9 +787,7 @@ function backup(config: InstallConfig): V1CronJob {
     command: [
       "/bin/sh",
       "-c",
-      // A new pod's NetworkPolicy may apply a moment after it starts, so the proxy is
-      // waited for rather than given up on at the first refusal.
-      `until pg_isready --quiet; do sleep 2; done && pg_dump --username=${ROLE} --dbname=${DATABASE} --format=custom --file=/backup/alasio.dump`,
+      `${oncePolicyApplies("pg_isready --quiet")} && pg_dump --username=${ROLE} --dbname=${DATABASE} --format=custom --file=/backup/alasio.dump`,
     ],
     env: [
       { name: "PGHOST", value: PROXY_HOST },
