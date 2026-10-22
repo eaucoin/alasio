@@ -4,20 +4,29 @@
  * idempotently, once a start of the node (what it applies changes with the installation,
  * which restarts the node, and the passwords never change):
  *
+ * - each principal's ACLs, which the log keeps once of each;
  * - each principal's SCRAM-SHA-512 credential, from its password, as the stack's setup
  *   made it (neon/control/kube-setup.ts), by AlterUserScramCredentials, which the client
  *   library's Admin does not wrap, on a connection of its own;
  * - each topic: made where it is not, of its partitions, its retention, by time and by
  *   size, and its other configurations; given more partitions where it has fewer, as the
  *   intake's replicas may be raised; its retention and its other configurations set where
- *   it is;
- * - each principal's ACLs, which the log keeps once of each.
+ *   it is.
  *
- * Before it logs in as the admin, it writes every credential it holds again, the admin's
- * among them, through the controllers' listener, which admits what reaches it from the
- * log's own pods unauthenticated (restoreCredentials): of each voter in turn, as KRaft's
- * active controller alone writes one, the others answering NOT_CONTROLLER without
- * forwarding it (controllersWriter). A broker whose start replayed a
+ * The ACLs come first, so that no principal signs in before its ACLs are there: a client
+ * that does is refused what it asks as unauthorized, and the collector's Kafka client
+ * (franz-go) keeps InitProducerId's CLUSTER_AUTHORIZATION_FAILED, as it does any error it
+ * cannot retry, for as long as it runs, every record of its signal refused with it. The
+ * log's metadata holds a credential only after the ACLs, so each broker that signs a
+ * principal in has them. Where they came last, a first start of three nodes left every
+ * principal signed in without them until every node ran, as the log makes a topic only
+ * once each of the nodes it is replicated to does.
+ *
+ * Before it logs in as the admin, it writes the admin's credential again through the
+ * controllers' listener, which admits what reaches it from the log's own pods
+ * unauthenticated: of each voter in turn, as KRaft's active controller alone writes one, the
+ * others answering NOT_CONTROLLER without forwarding it (controllersWriter); every other
+ * credential it then writes again as its admin. A broker whose start replayed a
  * credential's removal may hold no credential of its mechanism until then: as it starts,
  * Kafka 4.2's metadata loader applies every record since the last snapshot as one delta,
  * and ScramDelta.apply drops a mechanism whole where a removal, in the order of its map of
@@ -124,11 +133,14 @@ export function bindings(principal: string, { resource, name, pattern, operation
 
 /** Applies `access` on the log through `admin`, each principal's password of `passwords`. */
 export async function applyAccess(admin: LogAdmin, access: LogAccess, passwords: Readonly<Record<string, string>>): Promise<void> {
-  for (const { name } of access.principals) {
+  const credentials = access.principals.map(({ name }) => {
     const password = passwords[name];
     if (!password) throw new Error(`the principal ${name} has no password`);
-    await admin.credential(name, password);
-  }
+    return { name, password };
+  });
+  // Every ACL before any credential, so that no principal signs in without its ACLs (the module says why).
+  await admin.allow(access.principals.flatMap(({ name, acls }) => acls.flatMap((acl) => bindings(name, acl))));
+  for (const { name, password } of credentials) await admin.credential(name, password);
   const topics = await admin.topics();
   for (const topic of access.topics) {
     const has = topics.get(topic.name);
@@ -139,7 +151,6 @@ export async function applyAccess(admin: LogAdmin, access: LogAccess, passwords:
     if (has < topic.partitions) await admin.addPartitions(topic.name, topic.partitions);
     await admin.setConfigs(topic.name, topicConfigs(topic));
   }
-  await admin.allow(access.principals.flatMap(({ name, acls }) => acls.flatMap((acl) => bindings(name, acl))));
 }
 
 /** A topic's retention and its other configurations, as those of its own it is made or altered with. */
@@ -165,11 +176,6 @@ export async function forgetEnvironment(admin: LogAdmin, { principals, topics }:
   const there = await admin.topics();
   for (const { name } of topics) if (there.has(name)) await admin.deleteTopic(name);
   for (const { name } of principals) await admin.credential(name, randomBytes(32).toString("base64url"));
-}
-
-/** Writes each credential of `passwords`, by its principal's name, through `writer`. */
-export async function restoreCredentials(writer: CredentialWriter, passwords: Readonly<Record<string, string>>): Promise<void> {
-  for (const [name, password] of Object.entries(passwords)) await writer.credential(name, password);
 }
 
 /** The credential writer on a connection of its own to `address` (host:port), signed in as `sasl` says, or not at all. */
@@ -324,11 +330,11 @@ if (import.meta.url === `file://${process.argv[1]}` && (mode === "environment" |
     const admin = logAdmin(brokers, password);
     try {
       const passwords = Object.fromEntries(access.principals.map(({ name }) => [name, readFileSync(join(directory, name), "utf8")]));
-      // Every credential it holds written again as it starts, before it logs in as the admin (the module says why).
+      // The admin's credential written again as it starts, before it logs in as the admin (the module says why).
       if (!restored) {
-        await restoreCredentials(controllers, { admin: password, ...passwords });
+        await controllers.credential("admin", password);
         restored = true;
-        log("the log's credentials written again through its controllers", { principals: ["admin", ...access.principals.map(({ name }) => name)] });
+        log("the log's admin's credential written again through its controllers");
       }
       await applyAccess(admin, access, passwords);
       log("the log's access applied", { principals: access.principals.map(({ name }) => name), topics: access.topics.map(({ name }) => name) });

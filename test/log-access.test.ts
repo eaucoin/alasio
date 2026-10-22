@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { type Acl, AclOperations, AclPermissionTypes, ResourcePatternTypes, ResourceTypes } from "@platformatic/kafka";
 
 import type { EnvironmentLogAccess, LogAccess } from "../cli/src/manifests/log.ts";
-import { applyAccess, applyEnvironment, bindings, controllersWriter, CredentialRefused, type CredentialWriter, forgetEnvironment, type LogAdmin, NOT_CONTROLLER, restoreCredentials, type TopicConfig } from "../src/log/access.ts";
+import { applyAccess, applyEnvironment, bindings, controllersWriter, CredentialRefused, type CredentialWriter, forgetEnvironment, type LogAdmin, NOT_CONTROLLER, type TopicConfig } from "../src/log/access.ts";
 
 const ACCESS: LogAccess = {
   topics: [
@@ -48,6 +48,7 @@ function fakeLog(topics: Record<string, number> = {}): LogAdmin & { readonly ask
     },
     async allow(given) {
       acls.push(...given);
+      asked.push(...given.map(({ principal, resourceName, operation }) => `allow ${principal} ${resourceName} ${operation}`));
     },
     async deleteTopic(name) {
       asked.push(`delete ${name}`);
@@ -59,10 +60,18 @@ function fakeLog(topics: Record<string, number> = {}): LogAdmin & { readonly ask
   };
 }
 
-test("makes each principal's credential, each topic of its retention and its other configurations, and every ACL, on a log that has none", async () => {
+test("makes every ACL, then each principal's credential, so that none signs in without its ACLs, then each topic of its retention and its other configurations, on a log that has none", async () => {
   const log = fakeLog();
   await applyAccess(log, ACCESS, { gateway: "g", intake: "i" });
-  assert.deepEqual(log.asked, ["credential gateway g", "credential intake i", "create otel.spans 2 retention.ms=86400000 retention.bytes=268435456 flush.ms=1000", "create otel.logs 2 retention.ms=86400000 retention.bytes=268435456"]);
+  assert.deepEqual(log.asked, [
+    `allow User:gateway otel. ${AclOperations.WRITE}`,
+    `allow User:gateway otel. ${AclOperations.DESCRIBE}`,
+    `allow User:intake lake-intake ${AclOperations.READ}`,
+    "credential gateway g",
+    "credential intake i",
+    "create otel.spans 2 retention.ms=86400000 retention.bytes=268435456 flush.ms=1000",
+    "create otel.logs 2 retention.ms=86400000 retention.bytes=268435456",
+  ]);
   assert.deepEqual(log.acls, [...bindings("gateway", { resource: "topic", name: "otel.", pattern: "prefixed", operations: ["write", "describe"] }), ...bindings("intake", { resource: "group", name: "lake-intake", pattern: "literal", operations: ["read"] })]);
   assert.deepEqual(log.acls[0], {
     resourceType: ResourceTypes.TOPIC,
@@ -79,18 +88,17 @@ test("makes each principal's credential, each topic of its retention and its oth
 test("gives a topic it has more partitions where it has fewer, never fewer, and sets its retention and its other configurations", async () => {
   const log = fakeLog({ "otel.spans": 1, "otel.logs": 4 });
   await applyAccess(log, ACCESS, { gateway: "g", intake: "i" });
-  assert.deepEqual(log.asked.slice(2), [
+  assert.deepEqual(log.asked.slice(5), [
     "partitions otel.spans 2",
     "configs otel.spans retention.ms=86400000 retention.bytes=268435456 flush.ms=1000",
     "configs otel.logs retention.ms=86400000 retention.bytes=268435456",
   ]);
 });
 
-test("stops where a principal has no password, before any topic or ACL", async () => {
+test("stops where a principal has no password, before any ACL, credential or topic", async () => {
   const log = fakeLog();
   await assert.rejects(applyAccess(log, ACCESS, { gateway: "g" }), /the principal intake has no password/u);
-  assert.deepEqual(log.acls, []);
-  assert.ok(!log.asked.some((asked) => asked.startsWith("create")));
+  assert.deepEqual(log.asked, []);
 });
 
 /** A branch environment of two principals and two topics, as one may be given. */
@@ -105,10 +113,17 @@ const BRANCH: EnvironmentLogAccess = {
   ],
 };
 
-test("a branch environment's access is made: each principal's credential, its topics, every principal's ACLs; and forgotten whole, but its credentials, each replaced by one of a random secret", async () => {
+test("a branch environment's access is made: every principal's ACLs, each principal's credential, its topics; and forgotten whole, but its credentials, each replaced by one of a random secret", async () => {
   const log = fakeLog();
   await applyEnvironment(log, BRANCH);
-  assert.deepEqual(log.asked, ["credential alasio-try p", "credential loader-try q", "create telegram.try 1 retention.ms=604800000 retention.bytes=67108864 flush.messages=1", "create lake.try 1 retention.ms=86400000 retention.bytes=268435456"]);
+  assert.deepEqual(log.asked, [
+    `allow User:alasio-try telegram.try ${AclOperations.READ}`,
+    `allow User:loader-try lake.try ${AclOperations.READ}`,
+    "credential alasio-try p",
+    "credential loader-try q",
+    "create telegram.try 1 retention.ms=604800000 retention.bytes=67108864 flush.messages=1",
+    "create lake.try 1 retention.ms=86400000 retention.bytes=268435456",
+  ]);
   assert.deepEqual(log.acls, BRANCH.principals.flatMap(({ name, acls }) => acls.flatMap((acl) => bindings(name, acl))));
   const passwordless = { ...BRANCH, principals: BRANCH.principals.map((principal, index) => (index === 1 ? { ...principal, password: "" } : principal)) };
   const refused = fakeLog();
@@ -135,12 +150,6 @@ test("a branch environment's access is made: each principal's credential, its to
   const gone = fakeLog({ "telegram.try": 1 });
   await forgetEnvironment(gone, BRANCH);
   assert.ok(gone.asked.includes("delete telegram.try") && !gone.asked.includes("delete lake.try"));
-});
-
-test("every credential held is written again, the admin's among them, each of its password", async () => {
-  const log = fakeLog();
-  await restoreCredentials(log, { admin: "a", gateway: "g", intake: "i" });
-  assert.deepEqual(log.asked, ["credential admin a", "credential gateway g", "credential intake i"]);
 });
 
 /** Controllers at each address, of which `active` alone writes: what each was asked, and what it wrote. */
