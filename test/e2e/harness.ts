@@ -65,7 +65,9 @@ import { cpuMillis, cpuText } from "../../cli/src/capacity.ts";
 import { subnetAddress } from "../../cli/src/cluster/docker.ts";
 import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "../../cli/src/kube/api.ts";
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
+import { GATEWAY_COMPONENT as COLLECTOR_COMPONENT } from "../../cli/src/manifests/collector.ts";
 import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
+import { LOG_COMPONENT } from "../../cli/src/manifests/log.ts";
 import { COMPONENTS as OBJECT_STORE_COMPONENTS } from "../../cli/src/manifests/object-store.ts";
 import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
@@ -1044,7 +1046,9 @@ async function dumpNodes(which: ((node: string) => boolean) | undefined): Promis
  * within its container leaves its pod ready, and says why in its log alone; the lake's and
  * its intake's, whose queries and writes wait on the catalog there unseen; and of any
  * other ready pod a container of which restarted, as one killed for its memory is ready
- * again by the time this is said; and the warnings and errors of the object store's parts.
+ * again by the time this is said; the log's nodes', their access appliers' among them, and
+ * the collector's gateway's, which telemetry and Telegram's updates go through; and the
+ * warnings and errors of the object store's parts.
  * Before the API answers, or for a node not ready, what the node itself logs, as dumpNodes
  * says.
  */
@@ -1170,6 +1174,26 @@ export async function dumpClusterState(): Promise<void> {
           const logged = await logsOf(namespace, name, container.name, { previous });
           say(`--- logs of ${container.name} of ${namespace}/${name}${previous ? ", before it restarted" : ""}:`);
           for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
+        }
+      }
+    }
+    // Ready as they stay, the log's nodes and the collector's gateway say why telemetry or
+    // Telegram's updates did not go through them in their logs alone: each node's access
+    // applier, whether and when it applied every principal's ACLs, credential and topics, or
+    // why not yet; Kafka's warnings and errors, its authorizer's denials and the sign-ins it
+    // refused; and the gateway's last lines, which say why an export failed. Each container
+    // restarted, what it logged before it did too.
+    const carrying = new Set([LOG_COMPONENT, COLLECTOR_COMPONENT]);
+    const refused = (line: string) => / (WARN|ERROR) |is Denied|Failed authentication/u.test(line);
+    for (const pod of pods.filter((each) => each.status?.phase === "Running" && carrying.has(each.metadata?.labels?.["app.kubernetes.io/component"] ?? ""))) {
+      const { namespace = "", name = "" } = pod.metadata ?? {};
+      for (const container of pod.spec?.containers ?? []) {
+        const kafka = container.name === LOG_COMPONENT;
+        const restarted = (pod.status?.containerStatuses ?? []).some(({ name: each, restartCount }) => each === container.name && restartCount > 0);
+        for (const previous of restarted ? [true, false] : [false]) {
+          const logged = await logsOf(namespace, name, container.name, { previous });
+          say(`--- ${kafka ? "the warnings, errors and refusals" : "logs"} of ${container.name} of ${namespace}/${name}${previous ? ", before it restarted" : ""}:`);
+          for (const line of logged.trimEnd().split("\n").filter((each) => !kafka || refused(each)).slice(-60)) say(`  ${line}`);
         }
       }
     }
