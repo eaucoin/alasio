@@ -268,12 +268,15 @@ test("a resumed token ends at its ceiling from its resume, however its restore k
 test("a proxy that starts again takes back the time its tokens' requests lengthened, kept at most every so often", () =>
   withDirectory(async (directory) => {
     const tokensFile = join(directory, "node-agent", "tokens.json");
+    // Each resume a second, so a request asked at once, on however loaded a machine, comes
+    // within it; each wait past it, so that what serves after is the requests' lengthening.
+    const resumedForMs = 1000;
     const status = (proxy: StoreProxy, token: StoreToken) => Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token })).pipe(Effect.map(refusal));
     const until = () => (JSON.parse(readFileSync(tokensFile, "utf8")) as { tokens: { until: number }[] }).tokens[0]?.until ?? 0;
     const token = await withProxy(({ proxy }) =>
       Effect.gen(function*() {
         const token = minted(proxy, "main/fs-a", "socket");
-        proxy.resumed("main/fs-a", 100);
+        proxy.resumed("main/fs-a", resumedForMs);
         const resumedUntil = until();
         // Asked of, its lengthened time kept.
         assert.equal(yield* status(proxy, token), "200 ");
@@ -282,7 +285,7 @@ test("a proxy that starts again takes back the time its tokens' requests lengthe
         return token;
       }), { tokensFile, askedWindowMs: 60_000, keptEveryMs: 0 });
     // Past its resume's time, taken back, it reads, as its requests lengthened it.
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await new Promise((resolve) => setTimeout(resolve, resumedForMs + 300));
     await withProxy(({ proxy }) => Effect.gen(function*() {
       assert.equal(yield* status(proxy, token), "200 ");
     }), { tokensFile });
@@ -290,11 +293,11 @@ test("a proxy that starts again takes back the time its tokens' requests lengthe
     await withProxy(({ proxy }) =>
       Effect.gen(function*() {
         const again = minted(proxy, "main/fs-b", "socket");
-        proxy.resumed("main/fs-b", 100);
+        proxy.resumed("main/fs-b", resumedForMs);
         const written = readFileSync(tokensFile, "utf8");
         assert.equal(yield* status(proxy, again), "200 ");
         assert.equal(readFileSync(tokensFile, "utf8"), written);
-        yield* sleep(300);
+        yield* sleep(resumedForMs + 300);
         assert.equal(yield* status(proxy, again), "200 ");
       }), { tokensFile, askedWindowMs: 60_000, keptEveryMs: 60_000 });
   }));
