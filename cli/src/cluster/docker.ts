@@ -30,6 +30,7 @@ import { Context, type Duration, Effect, FileSystem, Layer, type PlatformError, 
 
 import { SNAPSHOT_CACHE_DIR } from "../../../src/node-agent/names.ts";
 import { imageReference } from "../images.ts";
+import { KubeApi, type KubeconfigUnusable } from "../kube/api.ts";
 import { NODE_IMAGE } from "../release.ts";
 import { type ContainerCreate, DockerEngine, type DockerError, type ExecOptions, type Mount, type NetworkInspect } from "./docker-engine.ts";
 import {
@@ -47,6 +48,7 @@ import {
   registriesYaml,
   SANDBOX_IMAGE,
   staleRuntimeClasses,
+  type UpOptions,
   WAITS,
   writeKubeconfig,
 } from "./k3s.ts";
@@ -134,7 +136,7 @@ export interface RemoveOptions {
 }
 
 /** How bringing the cluster up fails. */
-export type DockerClusterError = DockerError | ClusterUnusable | ClusterNotReady | PlatformError.PlatformError;
+export type DockerClusterError = DockerError | ClusterUnusable | ClusterNotReady | KubeconfigUnusable | PlatformError.PlatformError;
 
 /** The cluster in Docker of the options its layer was given. */
 export class DockerCluster extends Context.Service<DockerCluster, {
@@ -142,9 +144,11 @@ export class DockerCluster extends Context.Service<DockerCluster, {
    * Makes the cluster, or what of it is missing, starts what is stopped, makes nodes
    * whose image or settings changed anew, and waits until its nodes are ready; then gives
    * CoreDNS the host aliases, applies gVisor's RuntimeClasses, deleting those of releases
-   * no longer kept, and writes a kubeconfig that reaches it to `kubeconfig` (0600).
+   * no longer kept, and writes a kubeconfig that reaches it to `kubeconfig` (0600). Before it
+   * makes a node that runs anew, stopping its pods, it runs `beforeRestart`, once, on the
+   * cluster's API, as an upgrade waits on it for what those pods hold.
    */
-  readonly up: (kubeconfig: string) => Effect.Effect<void, DockerClusterError>;
+  readonly up: <E = never>(kubeconfig: string, options?: UpOptions<E>) => Effect.Effect<void, DockerClusterError | E>;
   /** Stops its nodes, keeping everything. */
   readonly down: Effect.Effect<void, DockerError>;
   /**
@@ -353,14 +357,16 @@ const makeDockerCluster = Effect.fnUntraced(function*({
   /**
    * `node`'s container made as `spec` says, with the files put into it before it first
    * starts, anew when it was made otherwise, and running. The files are in its k3s volume,
-   * which keeps them, and those of a node made anew replace them.
+   * which keeps them, and those of a node made anew replace them. A node that runs is made
+   * anew once `restarting` is through.
    */
-  const ensureNode = Effect.fnUntraced(function*(node: string, spec: ContainerCreate): Effect.fn.Return<void, DockerError | ClusterUnusable> {
+  const ensureNode = Effect.fnUntraced(function*<E>(node: string, spec: ContainerCreate, restarting: Effect.Effect<void, E>): Effect.fn.Return<void, DockerError | ClusterUnusable | E> {
     const hash = specHash(spec, files);
     const existing = yield* docker.inspectContainer(node);
     if (existing && existing.Config.Labels?.[CLUSTER_LABEL] !== cluster) return yield* unusable(`a container named ${node} is not one of its nodes`);
     const current = existing !== null && existing.Config.Labels?.[SPEC_LABEL] === hash;
     if (existing && !current) {
+      if (existing.State.Running) yield* restarting;
       yield* Effect.logInfo(`making node ${node} anew, from its current image and settings`);
       yield* docker.stopContainer(node);
       yield* docker.removeContainer(node);
@@ -443,7 +449,9 @@ const makeDockerCluster = Effect.fnUntraced(function*({
     yield* Effect.logInfo(`wrote the kubeconfig of cluster ${cluster} to ${path}`);
   });
 
-  const up = Effect.fnUntraced(function*(kubeconfig: string): Effect.fn.Return<void, DockerClusterError> {
+  const up = Effect.fnUntraced(function*<E = never>(kubeconfig: string, { beforeRestart }: UpOptions<E> = {}): Effect.fn.Return<void, DockerClusterError | E> {
+    // Run once, before the first node that runs is made anew, on the API its kubeconfig, from the up that made it, reaches.
+    const restarting = beforeRestart && (yield* fs.exists(kubeconfig)) ? yield* Effect.cached(Effect.provide(beforeRestart, KubeApi.layer({ path: kubeconfig }))) : Effect.void;
     if (!(yield* docker.inspectImage(image))) {
       yield* Effect.logInfo(`pulling ${image}`);
       yield* docker.pullImage(image);
@@ -460,6 +468,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
         `--default-local-storage-path=${storagePath}`,
         ...nodeArgs,
       ], []),
+      restarting,
     );
     yield* awaitReady("its API server", kubectl(["get", "--raw=/readyz"]));
     if (agents > 0) {
@@ -471,6 +480,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
             `K3S_URL=https://${server}:${K3S_PORT}`,
             `K3S_TOKEN=${token}`,
           ]),
+          restarting,
         );
       }
     }

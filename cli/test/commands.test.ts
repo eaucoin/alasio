@@ -17,7 +17,7 @@ import { Cause, Exit } from "effect";
 
 import { tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
-import { environmentKey } from "../../src/binder/names.ts";
+import { BINDING_LABEL, environmentKey, KEY_ANNOTATION, POOL_LABEL } from "../../src/binder/names.ts";
 import { verifyToken } from "../../src/binder/tokens.ts";
 import { forkToken } from "../../src/branch/names.ts";
 import { BOT_COMMANDS } from "../../src/telegram/bot-commands.ts";
@@ -1424,6 +1424,27 @@ test("upgrade installs this version's k3s, its gVisor release beside the one bef
   assert.equal(machine.has("/usr/local/lib/alasio/gvisor/20990101.0"), false);
   assert.deepEqual(handlers(), ["gvisor runsc-21000101-0", "gvisor-21000101-0 runsc-21000101-0"]);
   assert.deepEqual(rootSteps(await runAlasio(["up"], { env, machine, releases: latest })), []);
+});
+
+test("an upgrade that restarts k3s refuses while a conversation's harness stays bound on it for its timeout, changing nothing of the machine, and goes on at once with --now", async (t) => {
+  const setup = await onHost(t);
+  const { env, kube, machine } = setup;
+  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0", "20990101.0"] });
+  kube.put("leases", {
+    apiVersion: "coordination.k8s.io/v1",
+    kind: "Lease",
+    metadata: { name: "binding-a1", namespace: "alasio", labels: { [POOL_LABEL]: "harness-codex", [BINDING_LABEL]: "a1" }, annotations: { [KEY_ANNOTATION]: "telegram:7" } },
+    spec: { holderIdentity: "alasio-harness-codex-a1" },
+  });
+  const ran = machine.ran.length;
+  const refused = await runAlasio(["upgrade", "--timeout", "1s"], { env, machine, releases: newer });
+  assert.match(failure(refused), /^1 conversation harness stayed bound for 1s, which restarting the cluster would stop, ending the turn in each: alasio\/alasio-harness-codex-a1 \(telegram:7\)\. /u);
+  assert.deepEqual(rootSteps(refused), []);
+  assert.equal(machine.ran.length, ran);
+  assert.equal(machine.read("/usr/local/bin/k3s"), "k3s v1.99.0+k3s1\n");
+  const now = await runAlasio(["upgrade", "--now"], { env, machine, releases: newer });
+  succeeded(now);
+  assert.equal(machine.read("/usr/local/bin/k3s"), "k3s v1.100.0+k3s1\n");
 });
 
 test("an up or upgrade alasio refuses changes nothing of the machine first: no k3s or gVisor installed anew, nothing run as root", async (t) => {

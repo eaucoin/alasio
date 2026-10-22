@@ -14,7 +14,14 @@ import { Duration, Effect, FileSystem, type PlatformError, Schedule, Schema } fr
 
 import pins from "../../../cluster/node/pins.json" with { type: "json" };
 import { CONTAINERD, gvisorDirectory, gvisorHandler, gvisorRuntimeClass } from "../../../src/node-agent/names.ts";
+import type { KubeApi } from "../kube/api.ts";
 import { SNAPSHOTTER, STARGZ_ROOT, STARGZ_SOCKET } from "./stargz.ts";
+
+/** What a cluster's up is given beyond the kubeconfig it writes. */
+export interface UpOptions<E> {
+  /** Run on the cluster's API before up stops the pods that run on it, as restarting k3s or making a node anew does: nothing unless given. */
+  readonly beforeRestart?: Effect.Effect<void, E, KubeApi> | undefined;
+}
 
 /** A name the cluster's DNS resolves to an address, as an /etc/hosts line says. */
 export interface HostAlias {

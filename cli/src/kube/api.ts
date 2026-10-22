@@ -56,6 +56,7 @@ const KINDS = {
   EndpointSlice: { apiVersion: "discovery.k8s.io/v1", plural: "endpointslices", namespaced: true },
   Pod: { apiVersion: "v1", plural: "pods", namespaced: true },
   Event: { apiVersion: "v1", plural: "events", namespaced: true },
+  Lease: { apiVersion: "coordination.k8s.io/v1", plural: "leases", namespaced: true },
   NetworkPolicy: { apiVersion: "networking.k8s.io/v1", plural: "networkpolicies", namespaced: true },
   PodDisruptionBudget: { apiVersion: "policy/v1", plural: "poddisruptionbudgets", namespaced: true },
   Deployment: { apiVersion: "apps/v1", plural: "deployments", namespaced: true },

@@ -13,11 +13,15 @@ import { test, type TestContext } from "node:test";
 import { NodeServices } from "@effect/platform-node";
 import { Effect, Layer, Logger } from "effect";
 
+import { BINDING_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../src/binder/names.ts";
+import { untilHarnessesReleased } from "../src/bound-harnesses.ts";
 import { HostCluster, kubeconfigState, planNode } from "../src/cluster/host.ts";
+import type { KubeApi } from "../src/kube/api.ts";
 import { describeKept, keptReleases, type SnapshotReleases, snapshotReleasesFrom } from "../src/kept-releases.ts";
 import { Machine } from "../src/cluster/machine.ts";
 import { gvisorReleases, NODE_PINS } from "../src/cluster/node.ts";
 import { Root } from "../src/cluster/root.ts";
+import type { Registries } from "../src/config.ts";
 import { CERTIFICATE, serveFakeKube } from "./support/fake-kube.ts";
 import { FakeMachine } from "./support/fake-machine.ts";
 import { fakeReleases } from "./support/fake-releases.ts";
@@ -175,12 +179,13 @@ async function rig(t: TestContext, ready: { since: boolean }, releases = fakeRel
   node("2026-01-01T00:00:00Z");
   machine.onStart = () => ready.since && node(new Date().toISOString());
   kube.put("configmaps", { apiVersion: "v1", kind: "ConfigMap", metadata: { name: "coredns", namespace: "kube-system" }, data: { NodeHosts: "" } });
-  const up = () =>
+  /** Brings it up, with `registries` and before a restart `beforeRestart`, where given: what it failed with, or null. */
+  const up = ({ registries, beforeRestart }: { readonly registries?: typeof Registries.Type; readonly beforeRestart?: Effect.Effect<void, { readonly message: string }, KubeApi> } = {}) =>
     Effect.runPromise(
-      Effect.flatMap(HostCluster, (cluster) => cluster.up(join(directory, "kubeconfig"))).pipe(
+      Effect.flatMap(HostCluster, (cluster) => cluster.up(join(directory, "kubeconfig"), { beforeRestart })).pipe(
         Effect.match({ onFailure: (error) => error.message, onSuccess: () => null }),
         Effect.provide(
-          HostCluster.layer({ storagePath: join(directory, "storage"), readyTimeout: "300 millis", poll: "5 millis" }).pipe(
+          HostCluster.layer({ storagePath: join(directory, "storage"), readyTimeout: "300 millis", poll: "5 millis", ...(registries ? { registries } : {}) }).pipe(
             Layer.provide(Root.inProcess),
             Layer.provideMerge(Layer.mergeAll(Layer.succeed(Machine, { platform: "linux", arch: "x64", root: machine.root }), machine.layer, machine.systemd, releases.layer)),
             Layer.provideMerge(NodeServices.layer),
@@ -243,4 +248,56 @@ test("what root's work did not do as it failed is done the next time, as alasio 
   machine.onRun = (ran) => machine.act(ran);
   assert.equal(await up(), null);
   assert.deepEqual(machine.commands().map((command) => command.replace(/\/\S+\/install\.sh/u, "install.sh")), ["systemctl daemon-reload", "sh install.sh", "sh install.sh"]);
+});
+
+/** A registry k3s pulls through, so a config that names it changes k3s's files, and restarts it. */
+const MIRRORED: typeof Registries.Type = { mirrors: { "docker.io": { endpoint: ["https://registry.internal"] } }, configs: {} };
+
+test("up runs what it is given before it restarts a k3s that runs, which stops its pods, and nothing as it installs one or changes nothing", async (t) => {
+  const { machine, up } = await rig(t, { since: true });
+  /** The commands root had run as each run of it began. */
+  const ranBefore: string[][] = [];
+  const beforeRestart = Effect.sync(() => void ranBefore.push(machine.commands()));
+  assert.equal(await up({ beforeRestart }), null);
+  assert.equal(await up({ beforeRestart }), null);
+  assert.equal(ranBefore.length, 0);
+  assert.equal(await up({ registries: MIRRORED, beforeRestart }), null);
+  assert.equal(ranBefore.length, 1);
+  assert.ok(!ranBefore[0]!.includes("systemctl restart k3s"), "k3s restarted before it ran");
+  assert.ok(machine.commands().includes("systemctl restart k3s"));
+  // Failing, it stops the restart.
+  const restarts = () => machine.commands().filter((command) => command === "systemctl restart k3s").length;
+  const before = restarts();
+  assert.equal(await up({ beforeRestart: Effect.fail({ message: "still bound" }) }), "still bound");
+  assert.equal(restarts(), before);
+});
+
+test("an upgrade restarting k3s waits for each conversation's harness bound on it to be released, every environment's, and refuses past its timeout, restarting nothing", async (t) => {
+  const { kube, machine, up } = await rig(t, { since: true });
+  assert.equal(await up(), null);
+  const lease = (namespace: string, name: string, pool: string, holder: string | null) =>
+    kube.put("leases", {
+      apiVersion: "coordination.k8s.io/v1",
+      kind: "Lease",
+      metadata: { name, namespace, labels: { [POOL_LABEL]: pool, [BINDING_LABEL]: name }, annotations: { [KEY_ANNOTATION]: `telegram:${name}` } },
+      spec: holder ? { holderIdentity: holder } : {},
+    });
+  lease("alasio", "a1", "harness-codex", "harness-codex-pod-1");
+  lease("alasio-branch-one", "b1", "harness-claude", "harness-claude-pod-2");
+  // Neither a sandbox's binding nor one under way, its pod not yet named, holds a harness.
+  lease("alasio-sessions", "s1", "sessions", "sessions-pod-3");
+  lease("alasio", "u1", "harness-codex", null);
+  const restarts = () => machine.commands().filter((command) => command === "systemctl restart k3s").length;
+  assert.match(
+    await up({ registries: MIRRORED, beforeRestart: untilHarnessesReleased({ timeout: "200 millis", poll: "10 millis" }) }) ?? "",
+    /^2 conversation harnesses stayed bound for 200ms, which restarting the cluster would stop, ending the turn in each: alasio-branch-one\/harness-claude-pod-2 \(telegram:b1\), alasio\/harness-codex-pod-1 \(telegram:a1\)\. .* or with --now to go on at once/u,
+  );
+  assert.equal(restarts(), 0);
+  // Released as it waits, each in its turn.
+  setTimeout(() => kube.objects.delete("/apis/coordination.k8s.io/v1/namespaces/alasio/leases/a1"), 50);
+  setTimeout(() => kube.objects.delete("/apis/coordination.k8s.io/v1/namespaces/alasio-branch-one/leases/b1"), 150);
+  const asked = Date.now();
+  assert.equal(await up({ registries: MIRRORED, beforeRestart: untilHarnessesReleased({ timeout: "5 seconds", poll: "10 millis" }) }), null);
+  assert.ok(Date.now() - asked >= 150, "k3s restarted before its harnesses were released");
+  assert.equal(restarts(), 1);
 });

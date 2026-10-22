@@ -4,6 +4,7 @@ import { Console, Effect } from "effect";
 import { Command, Flag } from "effect/cli";
 
 import { refuseBranchesOfOtherReleases } from "../branches.ts";
+import { untilHarnessesReleased } from "../bound-harnesses.ts";
 import { loadConfig, type OperatorConfig } from "../config.ts";
 import { checkInstallation, install, installationObjects, installConfig } from "../install.ts";
 import { kind, KubeApi } from "../kube/api.ts";
@@ -54,11 +55,17 @@ export const upgrade = Command.make("upgrade", {
     Flag.withDefault(false),
     Flag.withDescription("Check only, changing nothing, that alasio would upgrade: fail with what it would refuse, if anything"),
   ),
+  now: Flag.Boolean("now").pipe(
+    Flag.withDefault(false),
+    Flag.withDescription(
+      "Restart the cluster, where the upgrade does, without waiting for the conversations' harnesses to be released: each turn running is ended, and run again on a harness of its own",
+    ),
+  ),
   setupPod: Flag.Boolean("setup-pod").pipe(
     Flag.withDefault(false),
     Flag.withDescription("Print, as JSON, changing nothing, the pod of this version's alasio that makes its state alone, for a cut-over to run before the upgrade"),
   ),
-}, ({ timeout, check, setupPod: printSetupPod }) =>
+}, ({ timeout, check, now, setupPod: printSetupPod }) =>
   Effect.gen(function*() {
     const config = yield* loadConfig;
     const target = yield* resolveTarget(config);
@@ -71,7 +78,8 @@ export const upgrade = Command.make("upgrade", {
       return yield* Console.log(`alasio would upgrade ${describeTarget(target)} to ${VERSION}: it refuses nothing there now; nothing was changed.`);
     }
     yield* refuseFirst(target, refusals(config), "refuse");
-    yield* ensureCluster(target);
+    // A harness bound on the cluster is released before its pod stops with the cluster, unless told not to wait.
+    yield* ensureCluster(target, now ? {} : { beforeRestart: untilHarnessesReleased(waitOptions(timeout)) });
     yield* Effect.provide(
       Effect.gen(function*() {
         const kube = yield* KubeApi;
@@ -89,7 +97,11 @@ export const upgrade = Command.make("upgrade", {
     Command.withDescription(
       "Does what alasio up does, with the images this version of alasio's package pins, after saying which images change " +
         "and from which version of alasio, and, for k3s on this machine, with the k3s, gVisor and stargz-snapshotter it pins, saying which it " +
-        "installs in place of which. It upgrades main alone, and refuses while a branch environment another release of alasio " +
+        "installs in place of which; where that restarts the cluster, which stops its pods, it waits first for each conversation's harness " +
+        "bound on it to be released, as it is once its conversation has been quiet for harness.pools.releaseAfter, for --timeout at most, " +
+        "unless given --now, which ends the turns they run, each run again on a harness of its own. A conversation may bind a harness " +
+        "while it waits, as its operator's message comes, so a busy machine may not come to have none bound in time: run it when the " +
+        "conversations are quiet, or with --now. It upgrades main alone, and refuses while a branch environment another release of alasio " +
         "made exists, which would not run on what it changes: delete each first, and make it again once upgraded. What it refuses " +
         "it refuses before it changes anything, and with --check it checks for that alone, changing nothing; on this machine, of " +
         "a cluster it made that does not answer, it can check nothing, so refuses. Run as npx alasio@latest upgrade to upgrade " +

@@ -37,6 +37,7 @@ import {
   readySince,
   unservedPods,
   staleRuntimeClasses,
+  type UpOptions,
   WAITS,
   writeKubeconfig,
 } from "./k3s.ts";
@@ -277,9 +278,11 @@ export class HostCluster extends Context.Service<HostCluster, {
    * Makes this machine a node, or what of it is not as it should be, as root, and starts
    * it; writes a kubeconfig that reaches it to `kubeconfig` (0600) when there is a new one
    * to; waits until the node is ready; then gives CoreDNS the host aliases and applies
-   * gVisor's RuntimeClasses, deleting those of releases no longer kept.
+   * gVisor's RuntimeClasses, deleting those of releases no longer kept. Of a k3s that runs,
+   * which it would install anew or restart, stopping the cluster's pods, it runs `beforeRestart`
+   * first, on the cluster's API, as an upgrade waits on it for what those pods hold.
    */
-  readonly up: (kubeconfig: string) => Effect.Effect<void, HostClusterError>;
+  readonly up: <E = never>(kubeconfig: string, options?: UpOptions<E>) => Effect.Effect<void, HostClusterError | E>;
   /** Stops k3s, as root, keeping everything; nothing when it is not installed. */
   readonly down: Effect.Effect<void, SystemdUnavailable | ForeignK3s | RootError | PlatformError.PlatformError>;
   /**
@@ -386,7 +389,7 @@ const makeHostCluster = Effect.fnUntraced(function*({
     yield* Effect.forEach(desired, (runtimeClass) => kube.apply(runtimeClass), { discard: true });
   });
 
-  const up = Effect.fnUntraced(function*(kubeconfig: string): Effect.fn.Return<void, HostClusterError> {
+  const up = Effect.fnUntraced(function*<E = never>(kubeconfig: string, { beforeRestart }: UpOptions<E> = {}): Effect.fn.Return<void, HostClusterError | E> {
     const { unit, stamp } = yield* installed;
     // Made by the operator, whose it stays, though k3s makes the volumes in it as root.
     yield* fs.makeDirectory(storagePath, { recursive: true });
@@ -426,6 +429,10 @@ const makeHostCluster = Effect.fnUntraced(function*({
         ...(plan.k3s === "restart" || plan.k3s === "start" ? [StartK3s.make({ restart: plan.k3s === "restart" })] : []),
         ...(plan.kubeconfig ? [ReadKubeconfig.make({ renew: plan.renew })] : []),
       ];
+      // Its pods stopped with k3s, once all it needs is downloaded, so as little as can be starts on them meanwhile.
+      if (beforeRestart && unit.active === "active" && copy !== null && (plan.k3s === "install" || plan.k3s === "restart")) {
+        yield* Effect.provide(beforeRestart, KubeApi.layer({ path: kubeconfig }));
+      }
       return yield* root.run(steps);
     }));
     if (outcome.kubeconfig) {

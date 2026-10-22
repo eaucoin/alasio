@@ -250,6 +250,25 @@ test("up makes the nodes anew when the gVisor releases change, with their files 
   assert.deepEqual(runtimeClasses(), ["gvisor runsc-21000101-0", "gvisor-21000101-0 runsc-21000101-0"]);
 });
 
+test("up runs what it is given once before it makes the first node that runs anew, as that stops its pods, and not as it makes the cluster or starts it; failing, it makes none anew", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  /** The changes the fake had been asked for as each run of it began. */
+  const ranAfter: number[] = [];
+  const beforeRestart = Effect.sync(() => void ranAfter.push(fake.changes().length));
+  const nodes = { agents: 1, gvisor: ["20990101.0"] };
+  await run((cluster) => cluster.up(kubeconfig, { beforeRestart }), nodes);
+  await run((cluster) => cluster.down);
+  await run((cluster) => cluster.up(kubeconfig, { beforeRestart }), nodes);
+  assert.equal(ranAfter.length, 0);
+  const changes = fake.changes().length;
+  await run((cluster) => cluster.up(kubeconfig, { beforeRestart }), { agents: 1, gvisor: ["21000101.0", "20990101.0"] });
+  assert.deepEqual(ranAfter, [changes]);
+  assert.ok(fake.changes().slice(changes).includes("POST /containers/dev-agent-0/stop"));
+  const before = fake.changes().length;
+  assert.equal(await run((cluster) => Effect.flip(cluster.up(kubeconfig, { beforeRestart: Effect.fail("still bound") })), { agents: 1, gvisor: ["21010101.0"] }), "still bound");
+  assert.deepEqual(fake.changes().slice(before), []);
+});
+
 test("agents join the server with the token it made, at the addresses after it, and stop before it", async (t) => {
   const { fake, kubeconfig, run } = await rig(t);
   await run((cluster) => cluster.up(kubeconfig), { agents: 2 });

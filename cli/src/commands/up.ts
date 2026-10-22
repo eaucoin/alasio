@@ -4,6 +4,7 @@ import { Command } from "effect/cli";
 
 import { DockerCluster } from "../cluster/docker.ts";
 import { HostCluster } from "../cluster/host.ts";
+import type { UpOptions } from "../cluster/k3s.ts";
 import { inotifyStep, requireLocalMachine } from "../cluster/machine.ts";
 import { Root } from "../cluster/root.ts";
 import { loadConfig, type OperatorConfig } from "../config.ts";
@@ -19,18 +20,19 @@ import { timeoutFlag, waitOptions } from "./common.ts";
  * Makes or starts the cluster on this machine when it is the target, once this machine is
  * one it runs on, its inotify limits raised, as root, where they are too low, writing its
  * kubeconfig: k3s on the machine itself, with what it changes as root at once, or in
- * Docker; nothing for another.
+ * Docker; nothing for another. What `options` say is run before the pods of a cluster that
+ * runs are stopped, as up restarts it.
  */
-export const ensureCluster = (target: ResolvedTarget) =>
+export const ensureCluster = <E = never>(target: ResolvedTarget, options: UpOptions<E> = {}) =>
   Effect.gen(function*() {
     if (target._tag === "Kubeconfig") return;
     yield* requireLocalMachine;
     if (target._tag === "Host") {
-      return yield* Effect.provide(Effect.flatMap(HostCluster, (cluster) => cluster.up(target.kubeconfig.path)), HostCluster.layer(target.cluster));
+      return yield* Effect.provide(Effect.flatMap(HostCluster, (cluster) => cluster.up(target.kubeconfig.path, options)), HostCluster.layer(target.cluster));
     }
     const raise = yield* inotifyStep;
     yield* Effect.flatMap(Root, (root) => root.run(raise ? [raise] : []));
-    yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.up(target.kubeconfig.path)), dockerCluster(target.cluster));
+    yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.up(target.kubeconfig.path, options)), dockerCluster(target.cluster));
   });
 
 /** The cluster on this machine alasio made is stopped, so what an upgrade would refuse cannot be checked before it changes the machine. */
