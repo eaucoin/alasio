@@ -7,7 +7,7 @@ import pg, { type QueryResultRow } from "pg";
 
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import { indexTranscripts } from "../src/harness/claude/search/index.ts";
-import { SETTLE_MS, collectOrphans, indexBatch, settle } from "../src/harness/claude/search/indexer.ts";
+import { SETTLE_MS, collectOrphans, indexBatch, indexingLockName, settle } from "../src/harness/claude/search/indexer.ts";
 import { ensureSearchSchema } from "../src/harness/claude/search/schema.ts";
 import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 
@@ -36,7 +36,7 @@ async function makeSearch() {
     (await pool.query<Row>(text.replaceAll("S.", `${schema}.`), values)).rows;
   const indexAll = async () => {
     let total = 0;
-    for (let read; (read = await indexBatch(pool, schema)) > 0; ) total += read;
+    for (let read; (read = (await indexBatch(pool, schema)) ?? 0) > 0; ) total += read;
     return total;
   };
   return { schema, store, q, indexAll };
@@ -74,6 +74,22 @@ describe("indexing the store's entries", () => {
     assert.equal(await indexBatch(pool, schema, { limit: 2 }), 1);
     assert.equal(await indexBatch(pool, schema, { limit: 2 }), 0);
     assert.deepEqual((await q<{ text: string }>("select text from S.passages order by id")).map((row) => row.text), ["one", "two", "three"]);
+  });
+
+  test("of the indexers on a store, one indexes at a time: another reads none while one holds its lock", async () => {
+    const { schema, store, q } = await makeSearch();
+    await store.append(key("a"), [prompt("u1", "one")]);
+    const other = await pool.connect();
+    try {
+      await other.query("begin");
+      await other.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [indexingLockName(schema)]);
+      assert.equal(await indexBatch(pool, schema), null);
+      assert.deepEqual(await q("select count(*)::int as n from S.indexed"), [{ n: 0 }]);
+      await other.query("commit");
+    } finally {
+      other.release();
+    }
+    assert.equal(await indexBatch(pool, schema), 1);
   });
 
   test("an entry holding a NUL is indexed with U+FFFD in its place", async () => {

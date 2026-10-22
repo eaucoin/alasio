@@ -43,11 +43,23 @@ function timeOf(entry: SessionStoreEntry): string | null {
   return typeof entry.timestamp === "string" && !Number.isNaN(Date.parse(entry.timestamp)) ? entry.timestamp : null;
 }
 
-/** Indexes the next entries not yet indexed. Returns how many it read. */
-export async function indexBatch(pool: Pool, schema: string, { limit = ENTRIES_PER_BATCH }: { readonly limit?: number } = {}): Promise<number> {
+/** The name of the lock an indexer holds while it indexes a batch of the store in `schema`, so of the alasios on it one indexes at a time. */
+export const indexingLockName = (schema: string): string => `${schema}:indexing`;
+
+/**
+ * Indexes the next entries not yet indexed. Returns how many it read; null where another
+ * indexer, of another alasio on the store, is indexing a batch: what it reads is what this
+ * would, so this reads none.
+ */
+export async function indexBatch(pool: Pool, schema: string, { limit = ENTRIES_PER_BATCH }: { readonly limit?: number } = {}): Promise<number | null> {
   const client = await pool.connect();
   try {
     await client.query("begin");
+    const { rows: [lock] } = await client.query<{ held: boolean }>("select pg_try_advisory_xact_lock(hashtextextended($1, 0)) as held", [indexingLockName(schema)]);
+    if (!lock?.held) {
+      await client.query("commit");
+      return null;
+    }
     // Shared locks keep the SDK from deleting these entries until they are indexed.
     const { rows } = await client.query<{ seq: string; session_id: string; subpath: string; entry: SessionStoreEntry }>(
       `select e.seq, e.session_id, e.subpath, e.entry from ${schema}.entries e

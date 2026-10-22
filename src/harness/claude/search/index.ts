@@ -61,7 +61,10 @@ export const indexTranscripts = Effect.fnUntraced(
         yield* indexing(() => ensureSearchSchema(pool, schema));
         ready = true;
       }
-      if ((yield* indexing(() => indexBatch(pool, schema))) > 0) return "read";
+      const read = yield* indexing(() => indexBatch(pool, schema));
+      // Another alasio's indexer is at it: this one looks again in a while.
+      if (read === null) return "idle";
+      if (read > 0) return "read";
       if (!caughtUp) yield* Effect.logInfo("every stored entry is indexed");
       caughtUp = true;
       const now = yield* Clock.currentTimeMillis;
