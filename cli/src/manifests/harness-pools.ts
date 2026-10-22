@@ -1,8 +1,7 @@
 /**
- * Conversations' harnesses' pools (src/gateway/harnesses.ts, src/harness/program.ts), where
- * the configuration turns them on (harness.pools.enabled): each conversation's harness host,
- * `alasio harness`, runs in a pod of its harness's pool, which the sandbox gateway binds to the
- * conversation while it has work, rather than in alasio's process.
+ * Conversations' harnesses' pools (src/gateway/harnesses.ts, src/harness/program.ts): each
+ * conversation's harness host, `alasio harness`, runs in a pod of its harness's pool, which the
+ * sandbox gateway binds to the conversation while it has work.
  *
  * - A pool of each harness in each environment's own namespace, beside its alasio (main's, or
  *   a branch's, ./branch.ts), for its session conversations: alasio's image, restricted, as
@@ -67,7 +66,7 @@ import { durationSeconds, type InstallConfig } from "./config.ts";
 import { boundBudget } from "./disruption.ts";
 import { foldersRun } from "./folders.ts";
 import { priority } from "./priorities.ts";
-import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT, GATEWAY_USER, sandboxServiceRuns } from "./sandbox-gateway.ts";
+import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT, GATEWAY_USER } from "./sandbox-gateway.ts";
 import { harnessPodPolicy, harnessPoolPodPolicy } from "./admission.ts";
 import { scaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
@@ -90,13 +89,6 @@ const CODEX_HOME = "/var/lib/alasio/codex";
 /** Where a session pool's pod's harnesses have their home, of their own. */
 const SESSION_HOME = "/var/lib/alasio/home";
 
-/** Whether conversations' harnesses run in pools: where the configuration says, and the sandbox service runs, which binds them. */
-export function harnessPoolsRun(config: InstallConfig): boolean {
-  return config.harness.pools.enabled && sandboxServiceRuns(config);
-}
-
-/** Whether main's folder conversations' harnesses run in pools too: where the host profile renders folder workspaces. */
-const folderHarnessPoolsRun = (config: InstallConfig): boolean => harnessPoolsRun(config) && foldersRun(config);
 
 /**
  * The template of the pool `pool`'s pods, of `environment`, as the module says: of its session
@@ -237,7 +229,6 @@ const harnessPoolsOf = (environment: Environment): Record<HarnessName, Pool> =>
 
 /** The harness pools of `environment`, main's or a branch environment's, in its own namespace, as the module says; and, main's, its folder conversations'. */
 export function harnessPoolObjects(config: InstallConfig, environment: Environment): KubernetesObject[] {
-  if (!harnessPoolsRun(config)) return [];
   const pools = harnessPoolsOf(environment);
   const folder = environment.branch === null && foldersRun(config);
   const folderPools = folder ? HARNESS_NAMES.map((harness) => ({ name: FOLDER_HARNESS_POOLS[harness], namespace: environment.namespace })) : [];
@@ -256,9 +247,8 @@ export function harnessPoolObjects(config: InstallConfig, environment: Environme
   ];
 }
 
-/** What the gateway's configuration says of the harnesses' pools (src/gateway/names.ts GatewayConfig): none where they do not run. */
+/** What the gateway's configuration says of the harnesses' pools (src/gateway/names.ts GatewayConfig). */
 export function harnessesConfig(config: InstallConfig): GatewayConfig["harnesses"] {
-  if (!harnessPoolsRun(config)) return null;
   const { alasio, host } = config;
   return {
     namespace: NAMESPACE,
@@ -268,6 +258,6 @@ export function harnessesConfig(config: InstallConfig): GatewayConfig["harnesses
     // A duration, as the configuration checks it.
     releaseAfterSeconds: durationSeconds(config.harness.pools.releaseAfter) ?? 0,
     drainSeconds: DRAIN_SECONDS,
-    folders: folderHarnessPoolsRun(config) ? { pools: { ...FOLDER_HARNESS_POOLS }, owner: { uid: host.uid, gid: host.gid } } : null,
+    folders: foldersRun(config) ? { pools: { ...FOLDER_HARNESS_POOLS }, owner: { uid: host.uid, gid: host.gid } } : null,
   };
 }

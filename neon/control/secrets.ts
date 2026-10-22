@@ -137,8 +137,8 @@ export interface Buckets {
   neon: string;
   lake: string;
   backups: string;
-  workspaces: string | null;
-  snapshots: string | null;
+  workspaces: string;
+  snapshots: string;
 }
 
 /** SeaweedFS's S3 configuration (its s3.json). */
@@ -270,8 +270,8 @@ export function remoteStorage(prefix: string, { endpoint, bucket, region = "us-e
 }
 
 /**
- * SeaweedFS's S3 identities: Neon, the lake, workspace storage when it is on and the
- * snapshots' when sandboxes are snapshotted, each on their own bucket of `buckets`; the
+ * SeaweedFS's S3 identities: Neon, the lake, workspace storage and the snapshots', each
+ * on their own bucket of `buckets`; the
  * lake's reader, which may only read the lake's; the backups', which writes the backups'
  * bucket and reads the workspaces' metadata it backs up; and an admin of Neon's bucket
  * alone, which gives it its lifecycle rules. The snapshots' identity is its bucket's admin,
@@ -287,15 +287,15 @@ export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3
       {
         name: "backups",
         credentials: [secrets.s3.backups],
-        actions: [...on(buckets.backups), ...(buckets.workspaces === null ? [] : [`Read:${buckets.workspaces}`, `List:${buckets.workspaces}`])],
+        actions: [...on(buckets.backups), `Read:${buckets.workspaces}`, `List:${buckets.workspaces}`],
       },
       // Branch environments' lakes are given it too: a branch's lake reads main's files where they are (DuckLake keeps
       // every file's path relative to one data path) and writes beside them, and SeaweedFS's Write, which writing
       // needs, deletes as well, so it cannot be narrowed to a branch's own files (cli/src/branches.ts).
       { name: "lake", credentials: [secrets.s3.lake], actions: on(buckets.lake) },
       { name: "lakeReader", credentials: [secrets.s3.lakeReader], actions: [`Read:${buckets.lake}`, `List:${buckets.lake}`] },
-      ...(buckets.workspaces === null ? [] : [{ name: "workspaces" as const, credentials: [secrets.s3.workspaces], actions: on(buckets.workspaces) }]),
-      ...(buckets.snapshots === null ? [] : [{ name: "snapshots" as const, credentials: [secrets.s3.snapshots], actions: [...on(buckets.snapshots), `Admin:${buckets.snapshots}`] }]),
+      { name: "workspaces", credentials: [secrets.s3.workspaces], actions: on(buckets.workspaces) },
+      { name: "snapshots", credentials: [secrets.s3.snapshots], actions: [...on(buckets.snapshots), `Admin:${buckets.snapshots}`] },
     ],
   };
 }

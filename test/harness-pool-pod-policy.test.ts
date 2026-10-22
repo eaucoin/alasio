@@ -32,7 +32,6 @@ const withKube = <A, E>(use: (kube: KubeClient["Service"]) => Effect.Effect<A, E
 const decoded = decodeInstallConfig({
   alasio: { telegram: { existingSecret: "telegram" } },
   host: { enabled: true, uid: 1001, gid: 1002, home: "/home/operator", mounts: [{ name: "home", hostPath: "/home/operator", mountPath: "/home/operator" }] },
-  harness: { pools: { enabled: true } },
 });
 if (Result.isFailure(decoded)) throw new Error("the configuration does not decode");
 const config: InstallConfig = decoded.success;

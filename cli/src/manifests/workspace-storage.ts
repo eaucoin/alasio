@@ -27,7 +27,7 @@ import type { KubernetesObject, V1Container, V1CronJob } from "@kubernetes/clien
 
 import { WORKSPACE_QUOTAS_USER } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
-import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, nodeAgentRuns, restrictedContainer, restrictedPod, s3Endpoint, script } from "./common.ts";
+import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, restrictedContainer, restrictedPod, s3Endpoint, script } from "./common.ts";
 import { everyIntervalCron, type InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { VALKEY_PORT, valkeyObjects, valkeyPassword } from "./valkey.ts";
@@ -360,9 +360,8 @@ function formatter(config: InstallConfig): V1Container {
   };
 }
 
-/** Workspace storage's objects, when it is on: Valkey, and the jobs that do what a mount's background jobs would. */
+/** Workspace storage's objects: Valkey, and the jobs that do what a mount's background jobs would. */
 export function workspaceStorageObjects(config: InstallConfig): KubernetesObject[] {
-  if (!config.workspaceStorage.enabled) return [];
   const { valkey } = config.workspaceStorage;
   const instance = {
     name: VALKEY,
@@ -371,7 +370,7 @@ export function workspaceStorageObjects(config: InstallConfig): KubernetesObject
     // The node agents', which set workspaces' quotas: every key, but no command Valkey calls
     // dangerous, those that read or change its server whole, but INFO, which JuiceFS reads its
     // settings in.
-    ...(nodeAgentRuns(config) ? { besideDefault: [{ name: WORKSPACE_QUOTAS_USER, secret: WORKSPACE_QUOTAS, rules: QUOTAS_RULES }] } : {}),
+    besideDefault: [{ name: WORKSPACE_QUOTAS_USER, secret: WORKSPACE_QUOTAS, rules: QUOTAS_RULES }],
   };
   return [...valkeyObjects(config, instance, [formatter(config)]), quotaCheck(config), collection(config), metadataDump(config), staleSessions(config)];
 }

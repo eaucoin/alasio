@@ -190,7 +190,6 @@ const running = (wait: WaitOptions): Effect.Effect<void, KubeApiError | NotReady
  * `wait`, where it is given, as alasio is applied.
  */
 export const checkNeonStorage = Effect.fnUntraced(function*(settings: InstallConfig, wait?: WaitOptions): Effect.fn.Return<void, KubeApiError | NotReadyInTime | RolloutFailed | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified, KubeApi> {
-  if (!settings.neon.enabled) return;
   if (wait) yield* running(wait);
   const held = yield* storageHeld(wait);
   if (!held) return;

@@ -28,7 +28,7 @@ import { computeRestartPolicy, computeServingPolicy } from "./admission.ts";
 import {
   claimSpec,
   collectorRuns,
-  databaseSecret,
+  DATABASE_SECRET,
   type Environment,
   given,
   helperResources,
@@ -43,7 +43,6 @@ import {
   replicasOf,
   restrictedContainer,
   s3Endpoint,
-  sandboxSnapshots,
   script,
   selectorLabels,
   stackLabels,
@@ -74,11 +73,10 @@ function secretVariable(secret: string, key: string): V1EnvVar {
 
 /**
  * The stack's secrets, made once and kept, and each service's rendered from them, by
- * neon/control/kube-setup.ts: the log's and the webhook intake's; and where Neon runs,
- * Neon's, the object store's, workspace storage's when it is on, and the snapshots
- * bucket's and the node agents' when sandboxes are snapshotted: a Job, which applying
- * alasio runs to completion before anything else of alasio starts (../kube/apply.ts), with
- * Neon or without it.
+ * neon/control/kube-setup.ts: the log's and the webhook intake's, Neon's, the object
+ * store's, workspace storage's, and the snapshots bucket's and the node agents': a Job,
+ * which applying alasio runs to completion before anything else of alasio starts
+ * (../kube/apply.ts).
  */
 function setup(config: InstallConfig): KubernetesObject[] {
   const name = neonName("setup");
@@ -122,40 +120,28 @@ function setup(config: InstallConfig): KubernetesObject[] {
             env: [
               { name: "NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
               { name: "SECRET_PREFIX", value: RELEASE },
-              ...(config.neon.enabled
-                ? [
-                  { name: "NEON_BROKER_URL", value: `http://${neonName("storage-broker")}:50051` },
-                  { name: "NEON_CONTROLLER_URL", value: `http://${neonName("storage-controller")}:1234` },
-                  { name: "NEON_PROXY_HOST", value: PROXY_HOST },
-                  { name: "NEON_CONTROLLER_DB_HOST", value: neonName("controller-db") },
-                ]
-                : []),
+              { name: "NEON_BROKER_URL", value: `http://${neonName("storage-broker")}:50051` },
+              { name: "NEON_CONTROLLER_URL", value: `http://${neonName("storage-controller")}:1234` },
+              { name: "NEON_PROXY_HOST", value: PROXY_HOST },
+              { name: "NEON_CONTROLLER_DB_HOST", value: neonName("controller-db") },
               { name: "S3_ENDPOINT", value: s3Endpoint(config) },
               { name: "S3_REGION", value: objectStore.external.region },
               { name: "S3_BUCKET_NEON", value: objectStore.buckets.neon },
               { name: "S3_BUCKET_LAKE", value: objectStore.buckets.lake },
               { name: "S3_BUCKET_BACKUPS", value: objectStore.buckets.backups },
               { name: "WEBHOOK_ADDRESS", value: config.webhook.publicAddress },
-              ...(workspaceStorage.enabled
-                ? [
-                  { name: "WORKSPACES_NAME", value: workspaceStorage.name },
-                  { name: "WORKSPACES_BUCKET", value: objectStore.buckets.workspaces },
-                  { name: "WORKSPACES_BUCKET_URL", value: workspacesBucketUrl(config) },
-                  { name: "WORKSPACES_TRASH_DAYS", value: String(workspaceStorage.trashDays) },
-                  { name: "VALKEY_ADDRESS", value: VALKEY_ADDRESS },
-                ]
-                : []),
-              ...(sandboxSnapshots(config) ? [{ name: "SNAPSHOTS_BUCKET", value: objectStore.buckets.snapshots }] : []),
+              { name: "WORKSPACES_NAME", value: workspaceStorage.name },
+              { name: "WORKSPACES_BUCKET", value: objectStore.buckets.workspaces },
+              { name: "WORKSPACES_BUCKET_URL", value: workspacesBucketUrl(config) },
+              { name: "WORKSPACES_TRASH_DAYS", value: String(workspaceStorage.trashDays) },
+              { name: "VALKEY_ADDRESS", value: VALKEY_ADDRESS },
+              { name: "SNAPSHOTS_BUCKET", value: objectStore.buckets.snapshots },
               ...(objectStore.bundled.enabled ? [] : [
                 { name: "S3_EXTERNAL", value: "1" },
                 { name: "S3_ACCESS_KEY", valueFrom: { secretKeyRef: { name: objectStore.external.existingSecret, key: "accessKey" } } },
                 { name: "S3_SECRET_KEY", valueFrom: { secretKeyRef: { name: objectStore.external.existingSecret, key: "secretKey" } } },
-                ...(sandboxSnapshots(config)
-                  ? [
-                    { name: "S3_SNAPSHOTS_ACCESS_KEY", valueFrom: { secretKeyRef: { name: objectStore.external.snapshotsSecret, key: "accessKey" } } },
-                    { name: "S3_SNAPSHOTS_SECRET_KEY", valueFrom: { secretKeyRef: { name: objectStore.external.snapshotsSecret, key: "secretKey" } } },
-                  ]
-                  : []),
+                { name: "S3_SNAPSHOTS_ACCESS_KEY", valueFrom: { secretKeyRef: { name: objectStore.external.snapshotsSecret, key: "accessKey" } } },
+                { name: "S3_SNAPSHOTS_SECRET_KEY", valueFrom: { secretKeyRef: { name: objectStore.external.snapshotsSecret, key: "secretKey" } } },
               ]),
             ],
             securityContext: restrictedContainer(),
@@ -810,7 +796,7 @@ function backup(config: InstallConfig): V1CronJob {
       // Main's compute, through the proxy, which wakes it if it sleeps.
       { name: "PGOPTIONS", value: `endpoint=${computeId(MAIN)}` },
       { name: "PGCONNECT_TIMEOUT", value: "60" },
-      { name: "PGPASSWORD", valueFrom: { secretKeyRef: { name: databaseSecret(config), key: "password" } } },
+      { name: "PGPASSWORD", valueFrom: { secretKeyRef: { name: DATABASE_SECRET, key: "password" } } },
     ],
     securityContext: restrictedContainer(),
     resources: { requests: { cpu: "100m", memory: "128Mi" }, limits: { memory: "1Gi" } },
@@ -832,25 +818,21 @@ function backup(config: InstallConfig): V1CronJob {
         "stamp=$(date -u +%Y%m%dT%H%M%SZ)",
         's3 cp "$BACKUP_DIR/alasio.dump" "s3://$BUCKET/alasio-$stamp.dump"',
         "prune '^alasio-.*\\.dump$'",
-        ...(workspaceStorage.enabled
-          ? [
-            'meta="s3://$WORKSPACES_BUCKET/$WORKSPACES_NAME/meta/"',
-            "dump=$(s3 ls \"$meta\" | awk '{print $4}' | grep '^dump-.*\\.json\\.gz$' | sort -r | head -n 1)",
-            // Copied by its bytes, read and written as every object is, not by the object store's
-            // own copy (CopyObject), which SeaweedFS failed for a dump, all of the job's tries;
-            // checked as the gzip it is, and read back the same once written. None until a
-            // workspace's volume has been mounted for a while.
-            'copied="s3://$BUCKET/$WORKSPACES_NAME-$dump"',
-            'if [ -n "$dump" ]; then',
-            '  s3 cp "$meta$dump" "$BACKUP_DIR/workspaces.json.gz"',
-            '  gzip -t "$BACKUP_DIR/workspaces.json.gz" 2>/dev/null || { echo "$dump is no whole gzip" >&2; exit 1; }',
-            '  s3 cp "$BACKUP_DIR/workspaces.json.gz" "$copied"',
-            '  s3 cp "$copied" "$BACKUP_DIR/workspaces.copied"',
-            '  cmp -s "$BACKUP_DIR/workspaces.json.gz" "$BACKUP_DIR/workspaces.copied" || { echo "the copy of $dump in $BUCKET is not the dump read" >&2; exit 1; }',
-            'else echo "JuiceFS has dumped no metadata of $WORKSPACES_NAME yet"; fi',
-            'prune "^$WORKSPACES_NAME-dump-.*\\.json\\.gz$"',
-          ]
-          : []),
+        'meta="s3://$WORKSPACES_BUCKET/$WORKSPACES_NAME/meta/"',
+        "dump=$(s3 ls \"$meta\" | awk '{print $4}' | grep '^dump-.*\\.json\\.gz$' | sort -r | head -n 1)",
+        // Copied by its bytes, read and written as every object is, not by the object store's
+        // own copy (CopyObject), which SeaweedFS failed for a dump, all of the job's tries;
+        // checked as the gzip it is, and read back the same once written. None until a
+        // workspace's volume has been mounted for a while.
+        'copied="s3://$BUCKET/$WORKSPACES_NAME-$dump"',
+        'if [ -n "$dump" ]; then',
+        '  s3 cp "$meta$dump" "$BACKUP_DIR/workspaces.json.gz"',
+        '  gzip -t "$BACKUP_DIR/workspaces.json.gz" 2>/dev/null || { echo "$dump is no whole gzip" >&2; exit 1; }',
+        '  s3 cp "$BACKUP_DIR/workspaces.json.gz" "$copied"',
+        '  s3 cp "$copied" "$BACKUP_DIR/workspaces.copied"',
+        '  cmp -s "$BACKUP_DIR/workspaces.json.gz" "$BACKUP_DIR/workspaces.copied" || { echo "the copy of $dump in $BUCKET is not the dump read" >&2; exit 1; }',
+        'else echo "JuiceFS has dumped no metadata of $WORKSPACES_NAME yet"; fi',
+        'prune "^$WORKSPACES_NAME-dump-.*\\.json\\.gz$"',
       ),
     ],
     env: [
@@ -859,9 +841,8 @@ function backup(config: InstallConfig): V1CronJob {
       { name: "KEEP", value: String(config.neon.backup.keep) },
       // Where the database's dump is, which the backup's own reads of JuiceFS's are put beside.
       { name: "BACKUP_DIR", value: "/backup" },
-      ...(workspaceStorage.enabled
-        ? [{ name: "WORKSPACES_BUCKET", value: objectStore.buckets.workspaces }, { name: "WORKSPACES_NAME", value: workspaceStorage.name }]
-        : []),
+      { name: "WORKSPACES_BUCKET", value: objectStore.buckets.workspaces },
+      { name: "WORKSPACES_NAME", value: workspaceStorage.name },
       { name: "AWS_DEFAULT_REGION", value: objectStore.external.region },
       { name: "HOME", value: "/tmp" },
     ],
@@ -901,10 +882,8 @@ function backup(config: InstallConfig): V1CronJob {
   };
 }
 
-/** The stack's setup, which runs with Neon or without it, and Neon's objects, when it runs. */
+/** The stack's setup, and Neon's objects. */
 export function neonObjects(config: InstallConfig): KubernetesObject[] {
-  const { neon } = config;
-  if (!neon.enabled) return setup(config);
   return [
     ...setup(config),
     ...controllerDb(config),
@@ -915,6 +894,6 @@ export function neonObjects(config: InstallConfig): KubernetesObject[] {
     ...control(config),
     ...proxy(config),
     ...compute(config),
-    ...(neon.backup.enabled ? [backup(config)] : []),
+    ...(config.neon.backup.enabled ? [backup(config)] : []),
   ];
 }

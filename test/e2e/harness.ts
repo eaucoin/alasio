@@ -667,12 +667,12 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
     },
     // The release before's folder instances let go after four hours idle, as the box's configuration says.
     host: { resources: { requests: { cpu: "20m", memory: "128Mi" } }, ...(of === "previous" ? { releaseAfter: "4h" } : {}) },
-    // Conversations' harnesses in pools of their own, as 10.0.0's are, of this checkout's alone, as the release before has none:
+    // Conversations' harnesses' pools, of this checkout's configuration alone, as the release before has none:
     // released within the run in the agents shard alone, as the other suites' turns are not written to wait on a pool's pod.
     ...(of === "release"
       ? {
         harness: {
-          pools: { enabled: true, scaling: { min: 1, max: 2 }, releaseAfter: SHARD === "agents" ? `${HARNESS_RELEASE_AFTER_SECONDS}s` : "24h" },
+          pools: { scaling: { min: 1, max: 2 }, releaseAfter: SHARD === "agents" ? `${HARNESS_RELEASE_AFTER_SECONDS}s` : "24h" },
           resources: { requests: { cpu: "20m", memory: "128Mi" } },
         },
       }

@@ -347,11 +347,10 @@ const Log = Schema.Struct({
 });
 
 const Sessions = Schema.Struct({
-  enabled: defaulted(Schema.Boolean, true),
   namespace: defaulted(Namespace, "alasio-sessions"),
   createNamespace: defaulted(Schema.Boolean, true),
-  /** The RuntimeClass sessions run under; empty runs them under the cluster's default runtime. */
-  runtimeClassName: defaulted(Schema.String, "gvisor"),
+  /** The RuntimeClass sessions run under, gVisor's, whose checkpoints their snapshots are. */
+  runtimeClassName: defaulted(matching(/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/u, "must name a RuntimeClass, gVisor's"), "gvisor"),
   /** A new session's workspace: its quota, of workspace storage. */
   storage: defaulted(Schema.Struct({ size: defaulted(Size, "10Gi") }), {}),
   resources: Resources({ requests: { cpu: "250m", memory: "512Mi" }, limits: { cpu: "2", memory: "2Gi" } }),
@@ -384,16 +383,14 @@ const Sessions = Schema.Struct({
 });
 
 /**
- * Conversations' harnesses (cli/src/manifests/harness-pools.ts): where `pools.enabled`, each
- * conversation's harness host runs in a pod of its harness's pool, bound to it by the sandbox
- * gateway while it has work and let go of once it has had none for `pools.releaseAfter`,
- * rather than in alasio's process; each pool keeps `pools.scaling.min` free, and makes more,
- * to its max, for the binds that wait for one.
+ * Conversations' harnesses (cli/src/manifests/harness-pools.ts): each conversation's harness
+ * host runs in a pod of its harness's pool, bound to it by the sandbox gateway while it has work
+ * and let go of once it has had none for `pools.releaseAfter`; each pool keeps
+ * `pools.scaling.min` free, and makes more, to its max, for the binds that wait for one.
  */
 const Harness = Schema.Struct({
   pools: defaulted(
     Schema.Struct({
-      enabled: defaulted(Schema.Boolean, false),
       scaling: Scaling({ min: 1, max: 5 }, { floor: false, scaled: true }),
       releaseAfter: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 5m")), "5m"),
     }),
@@ -441,12 +438,6 @@ const NeonStored = (size: string, resources: Parameters<typeof Resources>[0]) =>
 const NeonService = (resources: Parameters<typeof Resources>[0]) => defaulted(Schema.Struct({ resources: Resources(resources) }), {});
 
 const Neon = Schema.Struct({
-  enabled: defaulted(Schema.Boolean, true),
-  /**
-   * Without Neon, alasio's database: a Secret with `url`, `lake-verifier` and `harness-verifier`, the SCRAM verifiers
-   * of the lake role's password and the harness host's.
-   */
-  external: defaulted(Schema.Struct({ existingSecret: defaulted(OptionalSecretName, "") }), {}),
   image: Image({
     repository: "neondatabase/neon",
     tag: "release-9129",
@@ -675,7 +666,7 @@ const ObjectStore = Schema.Struct({
   ),
   /**
    * Or an S3-compatible store of the operator's: its endpoint, region, and a Secret with
-   * `accessKey` and `secretKey`; and, where sessions are snapshotted, a Secret of the same
+   * `accessKey` and `secretKey`; and a Secret of the same
    * keys for a key of the store's that reaches the snapshots bucket alone, which only the
    * node agents hold, as what writes that bucket writes what they restore as root: the
    * first key may not write it, and Neon's setup, which tries, refuses one that can.
@@ -742,7 +733,6 @@ const Valkey = Schema.Struct({
  * service runs on it alone.
  */
 const WorkspaceStorage = Schema.Struct({
-  enabled: defaulted(Schema.Boolean, true),
   /** The file system's name, which its data is kept under in the bucket. */
   name: defaulted(matching(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/u, "must be a JuiceFS file system name"), "workspaces"),
   /** How many days a deleted file is kept in the file system's trash, 0 for none; set as the file system is first made. */
@@ -854,9 +844,6 @@ const HARNESS_POD_HOMES =["HOME", "CODEX_HOME"] as const;
 
 /** What a configuration must also hold, given what it turns off: the issue of the first it lacks. */
 function completeness(config: typeof InstallStruct.Type): { readonly path: ReadonlyArray<string>; readonly issue: string } | undefined {
-  if (!config.neon.enabled && !config.neon.external.existingSecret) {
-    return { path: ["neon", "external", "existingSecret"], issue: "is required when neon.enabled is false" };
-  }
   const { webhook } = config;
   if (webhook.exposure === "hostAddress" && webhook.publicAddress && !/^(\d{1,3}\.){3}\d{1,3}$/u.test(webhook.publicAddress)) {
     return { path: ["webhook", "publicAddress"], issue: "must be this machine's public IPv4 address, which Telegram delivers to and the webhook intake binds alone: alasio init finds it" };
@@ -864,25 +851,16 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
   if (webhook.exposure !== "loadBalancer" && webhook.scaling.min > 1) {
     return { path: ["webhook", "scaling"], issue: "must be 1 where the webhook intake binds its node's port, which one pod holds" };
   }
-  if (config.neon.enabled && !config.objectStore.bundled.enabled) {
+  if (!config.objectStore.bundled.enabled) {
     if (!config.objectStore.external.endpoint) return { path: ["objectStore", "external", "endpoint"], issue: "is required when objectStore.bundled.enabled is false" };
     if (!config.objectStore.external.existingSecret) return { path: ["objectStore", "external", "existingSecret"], issue: "is required with an external object store" };
-    if (config.sessions.enabled && config.sessions.runtimeClassName !== "" && !config.objectStore.external.snapshotsSecret) {
-      return { path: ["objectStore", "external", "snapshotsSecret"], issue: "is required with an external object store where sessions are snapshotted: a key that reaches the snapshots bucket alone" };
+    if (!config.objectStore.external.snapshotsSecret) {
+      return { path: ["objectStore", "external", "snapshotsSecret"], issue: "is required with an external object store: a key that reaches the snapshots bucket alone" };
     }
   }
-  if (config.workspaceStorage.enabled && !config.sessions.enabled) {
-    return { path: ["workspaceStorage", "enabled"], issue: "must be false when sessions.enabled is false, as its volumes are sessions' workspaces" };
-  }
-  if (config.harness.pools.enabled && !(config.workspaceStorage.enabled && config.sessions.enabled && config.sessions.runtimeClassName !== "" && config.neon.enabled)) {
-    return { path: ["harness", "pools", "enabled"], issue: "must be false unless the sandbox service runs, on workspace storage and Neon, which binds the pools' pods" };
-  }
-  const homes = config.harness.pools.enabled ? HARNESS_POD_HOMES.find((name) => name in config.alasio.env) : undefined;
+  const homes = HARNESS_POD_HOMES.find((name) => name in config.alasio.env);
   if (homes !== undefined) {
-    return { path: ["alasio", "env", homes], issue: "must not be set while harness.pools.enabled: a harness pool's pod has a home and a Codex home of its own, which it sets itself" };
-  }
-  if (config.workspaceStorage.enabled && !config.neon.enabled) {
-    return { path: ["workspaceStorage", "enabled"], issue: "must be false when neon.enabled is false, as its data is in the object store that runs with Neon" };
+    return { path: ["alasio", "env", homes], issue: "must not be set: a harness pool's pod has a home and a Codex home of its own, which it sets itself" };
   }
   const { bundled } = config.objectStore;
   if (bundled.masters.scaling.min === 2) return { path: ["objectStore", "bundled", "masters", "scaling"], issue: "must be 1 or 3: two masters elect no leader once one is gone" };
@@ -897,7 +875,7 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
     };
   }
   const { nodeAgent } = config.sessions.snapshots;
-  if (config.sessions.enabled && config.sessions.runtimeClassName !== "" && memoryBytes(nodeAgent.resources.limits["memory"] ?? "0") < NODE_AGENT_MEMORY_FLOOR) {
+  if (memoryBytes(nodeAgent.resources.limits["memory"] ?? "0") < NODE_AGENT_MEMORY_FLOOR) {
     return {
       path: ["sessions", "snapshots", "nodeAgent", "resources", "limits", "memory"],
       issue: `must be at least ${memoryText(NODE_AGENT_MEMORY_FLOOR)}: the node agent's own memory, and what a restore holds written and not yet on the disk`,

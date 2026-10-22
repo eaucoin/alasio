@@ -259,10 +259,9 @@ export const GatewayConfig = Schema.Struct({
    * environment's own namespace, main's `namespace`, a branch's its own; the port and user
    * their pods' hosts run on; how long an idle one is kept, and how long its host is given to
    * drain as it is let go of; and, main's alone, each harness's pool of folder conversations,
-   * in main's namespace too, and their pods' user, the host profile's. None where the
-   * installation's harnesses run in alasio's process.
+   * in main's namespace too, and their pods' user, the host profile's.
    */
-  harnesses: Schema.NullOr(Schema.Struct({
+  harnesses: Schema.Struct({
     namespace: Schema.String,
     pools: Schema.Record(Schema.Literals(HARNESS_NAMES), Schema.String),
     podPort: Schema.Number,
@@ -270,6 +269,6 @@ export const GatewayConfig = Schema.Struct({
     releaseAfterSeconds: Schema.Number,
     drainSeconds: Schema.Number,
     folders: Schema.NullOr(Schema.Struct({ pools: Schema.Record(Schema.Literals(HARNESS_NAMES), Schema.String), owner: PodOwner })),
-  })),
+  }),
 });
 export type GatewayConfig = typeof GatewayConfig.Type;

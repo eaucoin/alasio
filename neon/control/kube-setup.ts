@@ -1,23 +1,22 @@
 /**
  * Prepares alasio's stack on Kubernetes, as a Job that runs before it starts: the secrets
  * it runs on, made once and kept in one Secret, and what each service is given from them,
- * as a Secret of its own, rendered from them on every install and upgrade: the log's and
- * the webhook intake's; and, where Neon runs, Neon's, the object store's beside it,
- * workspace storage's and the node agents'. Idempotent, and never rotating.
+ * as a Secret of its own, rendered from them on every install and upgrade: the log's, the
+ * webhook intake's, Neon's, the object store's beside it, workspace storage's and the node
+ * agents'. Idempotent, and never rotating.
  *
  * Environment: NAMESPACE, SECRET_PREFIX (the installation's name, which every Secret's
- * name begins with); where Neon runs, NEON_BROKER_URL, NEON_CONTROLLER_URL, NEON_PROXY_HOST
- * and NEON_CONTROLLER_DB_HOST, without which Neon's Secrets are not made; S3_ENDPOINT and
- * S3_REGION, and
+ * name begins with); NEON_BROKER_URL, NEON_CONTROLLER_URL, NEON_PROXY_HOST and
+ * NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
  * S3_BUCKET_NEON, S3_BUCKET_LAKE and S3_BUCKET_BACKUPS (neon, lake and backups unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
  * when the object store is the operator's own rather than the bundled SeaweedFS, whose
- * identities, and its filers' store's users' passwords, are made here otherwise, and with
- * sessions snapshotted, S3_SNAPSHOTS_ACCESS_KEY and S3_SNAPSHOTS_SECRET_KEY, the store's key
+ * identities, and its filers' store's users' passwords, are made here otherwise, and
+ * S3_SNAPSHOTS_ACCESS_KEY and S3_SNAPSHOTS_SECRET_KEY, the store's key
  * for the snapshots bucket alone, which nothing but it may write: the setup refuses a main
- * key that can (refuseMainKeyOnSnapshots). With workspace storage on, WORKSPACES_NAME (its JuiceFS
+ * key that can (refuseMainKeyOnSnapshots). WORKSPACES_NAME (workspace storage's JuiceFS
  * file system's), WORKSPACES_BUCKET and WORKSPACES_BUCKET_URL (its bucket's name
- * and URL), WORKSPACES_TRASH_DAYS, and VALKEY_ADDRESS (its metadata engine's host:port). With session sandboxes snapshotted,
- * SNAPSHOTS_BUCKET (the bucket their snapshots are kept in). WEBHOOK_ADDRESS, the address
+ * and URL), WORKSPACES_TRASH_DAYS, and VALKEY_ADDRESS (its metadata engine's host:port).
+ * SNAPSHOTS_BUCKET (the bucket session sandboxes' snapshots are kept in). WEBHOOK_ADDRESS, the address
  * Telegram delivers to, which the webhook intake's certificate is made for
  * (./certificate.ts).
  */
@@ -101,7 +100,7 @@ export interface WorkspacesConfig {
 /** The deployment's configuration, from the environment the module comment lists. */
 export type SetupConfig = SetupConfigBase & (
   | { external: false }
-  | { external: true; accessKey: string; secretKey: string; snapshots: S3Credentials | null }
+  | { external: true; accessKey: string; secretKey: string; snapshots: S3Credentials }
 );
 
 /** Where Neon's services are, as its Secrets are made for. */
@@ -116,17 +115,14 @@ export interface NeonHosts {
 interface SetupConfigBase {
   namespace: string;
   prefix: string;
-  /** Null when Neon does not run, alasio's database being the operator's. */
-  neon: NeonHosts | null;
+  neon: NeonHosts;
   s3Endpoint: string;
   s3Region: string;
   neonBucket: string;
   lakeBucket: string;
   backupsBucket: string;
-  /** Null when workspace storage is off. */
-  workspaces: WorkspacesConfig | null;
-  /** Null when session sandboxes are not snapshotted. */
-  snapshotsBucket: string | null;
+  workspaces: WorkspacesConfig;
+  snapshotsBucket: string;
   /** The address Telegram delivers to, which the webhook intake's certificate is made for. */
   webhookAddress: string;
 }
@@ -217,15 +213,12 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
   // what writes it writes what the node agents restore as root.
   const s3 = (identity: S3Identity): S3Credentials => {
     if (!config.external) return secrets.s3[identity];
-    if (identity === "snapshots") {
-      if (!config.snapshots) throw new Error("S3_SNAPSHOTS_ACCESS_KEY and S3_SNAPSHOTS_SECRET_KEY must be set where sessions are snapshotted on an external store");
-      return config.snapshots;
-    }
+    if (identity === "snapshots") return config.snapshots;
     return { accessKey: config.accessKey, secretKey: config.secretKey };
   };
   const aws = (identity: S3Identity) => ({ AWS_ACCESS_KEY_ID: s3(identity).accessKey, AWS_SECRET_ACCESS_KEY: s3(identity).secretKey });
   const storage = (prefix: string) => remoteStorage(prefix, { endpoint: config.s3Endpoint, bucket: config.neonBucket, region: config.s3Region });
-  /** Neon's services', the lake's, Grafana's, branch environments' and the object store's admin's, where Neon runs. */
+  /** Neon's services', the lake's, Grafana's, branch environments' and the object store's admin's. */
   const neonSecrets = (neon: NeonHosts): RenderedSecrets => ({
     [names.s3Admin]: aws("admin"),
     [names.safekeeper]: {
@@ -321,49 +314,43 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
     [names.webhookTls]: { "tls.crt": webhookTls.cert, "tls.key": webhookTls.key },
   };
   const { neon, workspaces } = config;
-  // The object store runs beside Neon alone, and with it workspace storage and the snapshots bucket.
-  if (!neon) return rendered;
   Object.assign(rendered, neonSecrets(neon));
-  if (workspaces) {
-    rendered[names.valkey] = { password: secrets.valkeyPassword };
-    // The file system's credentials, as alasio's JuiceFS clients read them (the nodes'
-    // mount and the admin jobs); the format options are applied as it is first made.
-    rendered[names.workspaces] = {
-      name: workspaces.name,
-      // Its database 1, leaving the others free for a restore to be loaded into.
-      metaurl: `redis://:${encodeURIComponent(secrets.valkeyPassword)}@${workspaces.valkeyAddress}/1`,
-      storage: "s3",
-      bucket: workspaces.bucketUrl,
-      "access-key": s3("workspaces").accessKey,
-      "secret-key": s3("workspaces").secretKey,
-      "format-options": `trash-days=${workspaces.trashDays}`,
-    };
-    // The node agents', which set workspaces' quotas on its metadata as a Valkey user of their
-    // own, of no command Valkey calls dangerous but what JuiceFS asks, and no key of the object store.
-    rendered[names.workspaceQuotas] = {
-      password: secrets.valkeyQuotasPassword,
-      metaurl: `redis://${WORKSPACE_QUOTAS_USER}:${encodeURIComponent(secrets.valkeyQuotasPassword)}@${workspaces.valkeyAddress}/1`,
-    };
-  }
+  rendered[names.valkey] = { password: secrets.valkeyPassword };
+  // The file system's credentials, as alasio's JuiceFS clients read them (the nodes'
+  // mount and the admin jobs); the format options are applied as it is first made.
+  rendered[names.workspaces] = {
+    name: workspaces.name,
+    // Its database 1, leaving the others free for a restore to be loaded into.
+    metaurl: `redis://:${encodeURIComponent(secrets.valkeyPassword)}@${workspaces.valkeyAddress}/1`,
+    storage: "s3",
+    bucket: workspaces.bucketUrl,
+    "access-key": s3("workspaces").accessKey,
+    "secret-key": s3("workspaces").secretKey,
+    "format-options": `trash-days=${workspaces.trashDays}`,
+  };
+  // The node agents', which set workspaces' quotas on its metadata as a Valkey user of their
+  // own, of no command Valkey calls dangerous but what JuiceFS asks, and no key of the object store.
+  rendered[names.workspaceQuotas] = {
+    password: secrets.valkeyQuotasPassword,
+    metaurl: `redis://${WORKSPACE_QUOTAS_USER}:${encodeURIComponent(secrets.valkeyQuotasPassword)}@${workspaces.valkeyAddress}/1`,
+  };
   const { snapshotsBucket } = config;
-  if (snapshotsBucket) {
-    // The node agents': where they keep session sandboxes' snapshots, and as whom, which
-    // they take whole as their environment.
-    rendered[names.snapshots] = {
-      S3_ENDPOINT: config.s3Endpoint,
-      S3_REGION: config.s3Region,
-      S3_BUCKET: snapshotsBucket,
-      ...aws("snapshots"),
-    };
-    // The token alasio presents to the node agents, which they check: both read it here.
-    rendered[names.nodeAgent] = { token: secrets.nodeAgentToken };
-    // The sandbox gateway's keys, beside the node agents it attaches workspaces through.
-    rendered[names.sandboxGateway] = { "caller-key": secrets.gatewayCallerKey, "binding-key": secrets.gatewayBindingKey };
-    // main's alasio's key to it, its own of the gateway's caller key, which signs main's sessions' tokens alone; a branch's is `alasio branch create`'s to write.
-    rendered[names.sessionsCaller] = { "caller-key": environmentKey(Buffer.from(secrets.gatewayCallerKey), MAIN_ENVIRONMENT_NAME).toString() };
-  }
+  // The node agents': where they keep session sandboxes' snapshots, and as whom, which
+  // they take whole as their environment.
+  rendered[names.snapshots] = {
+    S3_ENDPOINT: config.s3Endpoint,
+    S3_REGION: config.s3Region,
+    S3_BUCKET: snapshotsBucket,
+    ...aws("snapshots"),
+  };
+  // The token alasio presents to the node agents, which they check: both read it here.
+  rendered[names.nodeAgent] = { token: secrets.nodeAgentToken };
+  // The sandbox gateway's keys, beside the node agents it attaches workspaces through.
+  rendered[names.sandboxGateway] = { "caller-key": secrets.gatewayCallerKey, "binding-key": secrets.gatewayBindingKey };
+  // main's alasio's key to it, its own of the gateway's caller key, which signs main's sessions' tokens alone; a branch's is `alasio branch create`'s to write.
+  rendered[names.sessionsCaller] = { "caller-key": environmentKey(Buffer.from(secrets.gatewayCallerKey), MAIN_ENVIRONMENT_NAME).toString() };
   if (!config.external) {
-    const buckets = { neon: config.neonBucket, lake: config.lakeBucket, backups: config.backupsBucket, workspaces: workspaces?.bucket ?? null, snapshots: snapshotsBucket };
+    const buckets = { neon: config.neonBucket, lake: config.lakeBucket, backups: config.backupsBucket, workspaces: workspaces.bucket, snapshots: snapshotsBucket };
     rendered[names.seaweedfs] = { "s3.json": JSON.stringify(s3Identities(secrets, buckets), null, 2) + "\n" };
     // The filers' store's users', which its Valkey requires: the filers', each filer is
     // given, the collector's, which reads its metrics, and the backups'.
@@ -385,30 +372,26 @@ export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
   const base: SetupConfigBase = {
     namespace: required("NAMESPACE"),
     prefix: required("SECRET_PREFIX"),
-    neon: env["NEON_PROXY_HOST"]?.trim()
-      ? {
-        brokerUrl: required("NEON_BROKER_URL"),
-        controllerUrl: required("NEON_CONTROLLER_URL"),
-        proxyHost: required("NEON_PROXY_HOST"),
-        controllerDbHost: required("NEON_CONTROLLER_DB_HOST"),
-      }
-      : null,
+    neon: {
+      brokerUrl: required("NEON_BROKER_URL"),
+      controllerUrl: required("NEON_CONTROLLER_URL"),
+      proxyHost: required("NEON_PROXY_HOST"),
+      controllerDbHost: required("NEON_CONTROLLER_DB_HOST"),
+    },
     s3Endpoint: required("S3_ENDPOINT"),
     s3Region: env["S3_REGION"]?.trim() || "us-east-1",
     neonBucket: env["S3_BUCKET_NEON"]?.trim() || "neon",
     lakeBucket: env["S3_BUCKET_LAKE"]?.trim() || "lake",
     backupsBucket: env["S3_BUCKET_BACKUPS"]?.trim() || "backups",
     webhookAddress: required("WEBHOOK_ADDRESS"),
-    workspaces: env["WORKSPACES_NAME"]?.trim()
-      ? {
-        name: required("WORKSPACES_NAME"),
-        bucket: required("WORKSPACES_BUCKET"),
-        bucketUrl: required("WORKSPACES_BUCKET_URL"),
-        trashDays: required("WORKSPACES_TRASH_DAYS"),
-        valkeyAddress: required("VALKEY_ADDRESS"),
-      }
-      : null,
-    snapshotsBucket: env["SNAPSHOTS_BUCKET"]?.trim() || null,
+    workspaces: {
+      name: required("WORKSPACES_NAME"),
+      bucket: required("WORKSPACES_BUCKET"),
+      bucketUrl: required("WORKSPACES_BUCKET_URL"),
+      trashDays: required("WORKSPACES_TRASH_DAYS"),
+      valkeyAddress: required("VALKEY_ADDRESS"),
+    },
+    snapshotsBucket: required("SNAPSHOTS_BUCKET"),
   };
   return external
     ? {
@@ -416,7 +399,7 @@ export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
       external,
       accessKey: required("S3_ACCESS_KEY"),
       secretKey: required("S3_SECRET_KEY"),
-      snapshots: base.snapshotsBucket ? { accessKey: required("S3_SNAPSHOTS_ACCESS_KEY"), secretKey: required("S3_SNAPSHOTS_SECRET_KEY") } : null,
+      snapshots: { accessKey: required("S3_SNAPSHOTS_ACCESS_KEY"), secretKey: required("S3_SNAPSHOTS_SECRET_KEY") },
     }
     : { ...base, external };
 }
@@ -503,7 +486,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     replace: (object) => Effect.runPromise(kube.replace(object)),
   };
   const config = setupConfig();
-  const refused = config.external && config.snapshotsBucket
+  const refused = config.external
     ? refuseMainKeyOnSnapshots(makeS3Bucket({ endpoint: config.s3Endpoint, region: config.s3Region, bucket: config.snapshotsBucket, accessKeyId: config.accessKey, secretAccessKey: config.secretKey }))
     : Promise.resolve();
   refused.then(() => setupKube({ kube: client, config })).catch((error: unknown) => {

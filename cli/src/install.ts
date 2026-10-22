@@ -21,8 +21,8 @@ import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts
 import { checkObjectStoreLayout, checkObjectStoreScale, type ObjectStoreScaleRefused } from "./kube/object-store-scale.ts";
 import type { NotReadyInTime, RolloutFailed, WaitOptions } from "./kube/rollout.ts";
 import type { CpuBaseline, Kept } from "./manifests/alasio.ts";
-import { labels, NAMESPACE, nodeAgentRuns } from "./manifests/common.ts";
-import { mountServices as mountServicesOf, sandboxServiceRuns } from "./manifests/sandbox-gateway.ts";
+import { labels, NAMESPACE } from "./manifests/common.ts";
+import { mountServices as mountServicesOf } from "./manifests/sandbox-gateway.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { type Carried, carriedFrom, manifests, NOTHING_CARRIED } from "./manifests/index.ts";
 import { checkNeonStorage, type PageserversLowered, type ShardsLowered, type StorageDatabaseUnread, type StorageUnverified } from "./neon-storage.ts";
@@ -94,7 +94,7 @@ export interface Installed {
 
 /** Whether the installation `settings` confines what reaches its API server to it, by NetworkPolicies, but could not, as `apiServer` was not read. */
 export const apiServerUnconfined = (settings: InstallConfig, apiServer: ApiServer | null): boolean =>
-  apiServer === null && settings.networkPolicies.enabled && sandboxServiceRuns(settings);
+  apiServer === null && settings.networkPolicies.enabled;
 
 /** An object the cluster has that cannot take this release's of it, and why, as a dry run of its apply said. */
 const Refusal = Schema.Struct({ object: Schema.String, reason: Schema.String });
@@ -193,8 +193,8 @@ export const checkInstallation = Effect.fnUntraced(function*(
 
 /**
  * Applies the installation `config` describes, once its bot is set, waits until it runs,
- * and has Telegram deliver main's bot's updates to it. Where sessions are snapshotted, it
- * holds them to the CPU baseline it recorded before, then to the one the node agents' pods
+ * and has Telegram deliver main's bot's updates to it. It holds sessions, which are
+ * snapshotted, to the CPU baseline it recorded before, then to the one the node agents' pods
  * then say (./cpu-baseline.ts), applied again where that differs.
  */
 export const install = Effect.fnUntraced(function*(
@@ -211,7 +211,6 @@ export const install = Effect.fnUntraced(function*(
   yield* applyInstallation(objects, options);
   yield* registerBot(settings, "main", bot, route, options);
   const installed = { bot, claude: settings.alasio.claude.existingSecret !== "", apiServerUnconfined: apiServerUnconfined(settings, apiServer) };
-  if (!nodeAgentRuns(settings)) return { ...installed, cpuBaseline: null };
   const decision = decideCpuBaseline(yield* surveyCpu, recorded);
   // Carried from the installation before this one, as the first apply carried it.
   if (!sameBaseline(decision.baseline, recorded)) {

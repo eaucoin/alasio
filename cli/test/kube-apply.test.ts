@@ -131,19 +131,16 @@ test("applying again deletes what the installation no longer has, but for what h
 
   await run(applyInstallation(
     objectsOf({
-      sessions: { enabled: false },
-      neon: { enabled: false, external: { existingSecret: "database" } },
+      sessions: { createNamespace: false },
+      lake: { enabled: false },
       objectStore: { bundled: { filerStore: { backups: { enabled: false } } } },
-      workspaceStorage: { enabled: false },
     }),
     WAIT,
   ));
 
   const deleted = kube.changes.slice(before).filter(({ method }) => method === "DELETE").map(({ path }) => path);
-  assert.ok(deleted.includes("/apis/apps/v1/namespaces/alasio/deployments/alasio-neon-compute"));
-  assert.ok(deleted.includes("/apis/apps/v1/namespaces/alasio/statefulsets/alasio-neon-safekeeper"));
-  assert.ok(deleted.includes("/apis/networking.k8s.io/v1/namespaces/alasio-sessions/networkpolicies/default-deny"));
-  assert.ok(deleted.includes("/apis/rbac.authorization.k8s.io/v1/namespaces/alasio-sessions/roles/alasio-sandbox-gateway"));
+  assert.ok(deleted.includes("/apis/apps/v1/namespaces/alasio/deployments/alasio-lake-query"));
+  assert.ok(deleted.includes("/apis/apps/v1/namespaces/alasio/deployments/alasio-neon-compute-ro"));
   assert.ok(!deleted.includes("/api/v1/namespaces/alasio-sessions"));
   assert.ok(!deleted.includes("/api/v1/namespaces/alasio/persistentvolumeclaims/alasio-seaweedfs-filer-store-backups"));
   assert.ok(kube.get("/api/v1/namespaces/alasio-sessions"));
@@ -151,7 +148,7 @@ test("applying again deletes what the installation no longer has, but for what h
   assert.ok(kube.get("/apis/apps/v1/namespaces/alasio/deployments/mine"));
   assert.ok(progress.includes("kept Namespace alasio-sessions, no longer part of alasio, as it holds data; alasio uninstall --purge deletes it"));
   assert.ok(progress.includes("kept PersistentVolumeClaim alasio/alasio-seaweedfs-filer-store-backups, no longer part of alasio, as it holds data; alasio uninstall --purge deletes it"), progress.join("\n"));
-  assert.ok(progress.includes("deleted Deployment alasio/alasio-neon-compute, no longer part of alasio"));
+  assert.ok(progress.includes("deleted Deployment alasio/alasio-neon-compute-ro, no longer part of alasio"));
 });
 
 test("a Job of the installation's left from before, as by an apply interrupted, is deleted and run afresh, its pod template changed", async (t) => {
@@ -480,11 +477,11 @@ test("KEDA and VPA are installed where the cluster has none, refused where it ha
   const verticalPodAutoscaler = { apiVersion: "autoscaling.k8s.io/v1", kind: "VerticalPodAutoscaler", metadata: { name: "alasio-lake", namespace: "alasio" } };
   const crd = (name: string) => kube.put("customresourcedefinitions", { apiVersion: "apiextensions.k8s.io/v1", kind: "CustomResourceDefinition", metadata: { name } });
   assert.equal(await check({}), "fits");
-  assert.equal(await check(without("keda"), [scaledObject]), "this cluster has no KEDA, which scales alasio-lake-loader, alasio-lake-intake, sandboxes-none, sandboxes-full, alasio-grafana: install.autoscaling.keda.enabled true installs alasio's");
+  assert.equal(await check(without("keda"), [scaledObject]), "this cluster has no KEDA, which scales alasio-lake-loader, alasio-lake-intake, sandboxes-none, sandboxes-full, harness-codex, harness-claude, alasio-grafana: install.autoscaling.keda.enabled true installs alasio's");
   assert.match(await check(without("vpa")), /^this cluster has no VPA, which sizes alasio-keda-operator, .*alasio-lake.*: install\.autoscaling\.vpa\.enabled true installs alasio's$/u);
-  // The lake's intake and loader, which KEDA wakes, and the sandbox service's pools, each at a count of its own: nothing scaled.
+  // The lake's intake and loader, which KEDA wakes, the sandbox service's pools and the harness pools, each at a count of its own: nothing scaled.
   const fixed = { min: 1, max: 1 };
-  assert.equal(await check({ ...without("keda"), lake: { intake: { scaling: fixed }, loader: { scaling: fixed } }, sessions: { pools: fixed } }), "fits");
+  assert.equal(await check({ ...without("keda"), lake: { intake: { scaling: fixed }, loader: { scaling: fixed } }, sessions: { pools: fixed }, harness: { pools: { scaling: fixed } } }), "fits");
 
   // alasio's own, installed, are no other's, and not the cluster's once alasio is told to use the cluster's.
   await run(applyInstallation(objectsOf(), WAIT));

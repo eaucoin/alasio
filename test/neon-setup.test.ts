@@ -87,23 +87,19 @@ test("the setup's configuration comes from the environment, checked", () => {
   assert.equal(config.s3Region, "us-east-1");
   assert.equal(config.neonBucket, "neon");
   assert.equal(config.external, false);
-  // Without Neon, none of its hosts; with it, every one.
-  assert.equal(setupConfig({ ...ENV, NEON_PROXY_HOST: "" }).neon, null);
-  assert.throws(() => setupConfig({ ...ENV, NEON_BROKER_URL: "" }), /NEON_BROKER_URL must be set/);
+  // Each of Neon's hosts, workspace storage's and the snapshots bucket required.
+  for (const name of ["NEON_PROXY_HOST", "NEON_BROKER_URL", "WORKSPACES_NAME", "WORKSPACES_BUCKET_URL", "SNAPSHOTS_BUCKET"]) {
+    assert.throws(() => setupConfig({ ...ENV, [name]: "" }), new RegExp(`${name} must be set`, "u"), name);
+  }
   assert.throws(() => setupConfig({ ...ENV, S3_EXTERNAL: "1" }), /S3_ACCESS_KEY must be set/);
-  // Where sessions are snapshotted, the external store's key for the snapshots bucket alone is required.
+  // The external store's key for the snapshots bucket alone is required.
   assert.throws(() => setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b" }), /S3_SNAPSHOTS_ACCESS_KEY must be set/);
   const external = setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b", S3_SNAPSHOTS_ACCESS_KEY: "c", S3_SNAPSHOTS_SECRET_KEY: "d" });
   assert.ok(external.external);
   assert.equal(external.accessKey, "a");
   assert.deepEqual(external.snapshots, { accessKey: "c", secretKey: "d" });
-  const unsnapshotted = setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b", SNAPSHOTS_BUCKET: "" });
-  assert.ok(unsnapshotted.external && unsnapshotted.snapshots === null);
-  assert.equal(config.workspaces?.valkeyAddress, "q-valkey.alasio.svc.cluster.local:6379");
-  assert.equal(setupConfig({ ...ENV, WORKSPACES_NAME: "" }).workspaces, null);
-  assert.throws(() => setupConfig({ ...ENV, WORKSPACES_BUCKET_URL: "" }), /WORKSPACES_BUCKET_URL must be set/);
+  assert.equal(config.workspaces.valkeyAddress, "q-valkey.alasio.svc.cluster.local:6379");
   assert.equal(config.snapshotsBucket, "snapshots");
-  assert.equal(setupConfig({ ...ENV, SNAPSHOTS_BUCKET: "" }).snapshotsBucket, null);
 });
 
 test("the stack's secrets are made once, and every service's rendered from them on each run", async () => {
@@ -412,48 +408,6 @@ test("with an external object store, every service uses its credentials, but the
   for (const [name, data] of Object.entries(rendered)) {
     if (name !== names.snapshots) assert.ok(!JSON.stringify(data).includes("SNAP-"), name);
   }
-});
-
-test("without Neon, the log's and the webhook intake's Secrets are made, and none of Neon's, the object store's or workspace storage's", () => {
-  const rendered = renderSecrets({
-    secrets: stackSecrets({ accessKey: "key", secretKey: "secret" }),
-    privateKeyPem: generateKeyPair().privateKeyPem,
-    publicKeyPem: "pk",
-    webhookTls: { cert: "c", key: "k" },
-    config: setupConfig({ ...ENV, NEON_BROKER_URL: "", NEON_CONTROLLER_URL: "", NEON_PAGESERVER_HOST: "", NEON_PROXY_HOST: "", NEON_CONTROLLER_DB_HOST: "" }),
-  });
-  const names = secretNames("q");
-  assert.deepEqual(Object.keys(rendered).sort(), [names.root, names.log, names.logAccess, ...Object.values(names.logPrincipals), names.webhookTls].sort());
-});
-
-test("without workspace storage, neither its Secrets nor its identity are made", () => {
-  const rendered = renderSecrets({
-    secrets: stackSecrets({ accessKey: "key", secretKey: "secret" }),
-    privateKeyPem: generateKeyPair().privateKeyPem,
-    publicKeyPem: "pk",
-    webhookTls: { cert: "c", key: "k" },
-    config: setupConfig({ ...ENV, WORKSPACES_NAME: "" }),
-  });
-  const names = secretNames("q");
-  assert.equal(rendered[names.valkey], undefined);
-  assert.equal(rendered[names.workspaces], undefined);
-  const seaweed: SeaweedS3Config = JSON.parse(rendered[names.seaweedfs]?.["s3.json"] ?? "");
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "backups", "lake", "lakeReader", "snapshots"]);
-});
-
-test("without session sandboxes snapshotted, neither the snapshots' Secret, their identity nor the node agents' token's Secret are made", () => {
-  const rendered = renderSecrets({
-    secrets: stackSecrets({ accessKey: "key", secretKey: "secret" }),
-    privateKeyPem: generateKeyPair().privateKeyPem,
-    publicKeyPem: "pk",
-    webhookTls: { cert: "c", key: "k" },
-    config: setupConfig({ ...ENV, SNAPSHOTS_BUCKET: "" }),
-  });
-  const names = secretNames("q");
-  assert.equal(rendered[names.snapshots], undefined);
-  assert.equal(rendered[names.nodeAgent], undefined);
-  const seaweed: SeaweedS3Config = JSON.parse(rendered[names.seaweedfs]?.["s3.json"] ?? "");
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "backups", "lake", "lakeReader", "workspaces"]);
 });
 
 test("on an external store, the setup refuses a main key that can write the snapshots bucket, and leaves nothing there it wrote", async () => {

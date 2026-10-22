@@ -6,7 +6,6 @@
  * pools' pods on its node, from its node's mount of workspace storage (./sandbox-gateway.ts),
  * makes their directories there, and sets their quotas on workspace storage's metadata
  * engine, with JuiceFS's own command, of its image.
- * It runs where sandboxes are snapshotted (common.ts nodeAgentRuns).
  *
  * It is the one component that runs runsc on a node, beside containerd's shims, as they
  * run it, so it runs as the node does: privileged, as root, in the node's PID namespace
@@ -42,7 +41,7 @@ import {
 import { memoryBytes } from "../capacity.ts";
 import { currentGvisorRelease, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
-import { componentName, given, imagePullSecrets, labels, NAMESPACE, nodeAgentRuns, otelEnv, selectorLabels } from "./common.ts";
+import { componentName, given, imagePullSecrets, labels, NAMESPACE, otelEnv, selectorLabels } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
@@ -141,7 +140,7 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
               { name: RESTORES_FROM_BUCKET_SINCE_VARIABLE, value: NODE_PINS.gvisor.restoresFromBucketSince },
               { name: BACKGROUND_READ_SECONDS_VARIABLE, value: String(backgroundReadSeconds(sandboxBytes)) },
               // Workspace storage's metadata engine, which it sets workspaces' quotas on alone, as a user of its own there: no key of its object store.
-              ...(config.workspaceStorage.enabled ? [{ name: META_URL_VARIABLE, valueFrom: { secretKeyRef: { name: WORKSPACE_QUOTAS, key: "metaurl" } } }] : []),
+              { name: META_URL_VARIABLE, valueFrom: { secretKeyRef: { name: WORKSPACE_QUOTAS, key: "metaurl" } } },
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: "alasio-node-agent" }, ...otelEnv(config)] : []),
             ],
             envFrom: [{ secretRef: { name: SNAPSHOTS_SECRET } }],
@@ -159,11 +158,10 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
 }
 
 /**
- * The node agents, where they run, and their sizing: recommended, not applied in place, as
+ * The node agents, and their sizing: recommended, not applied in place, as
  * a resize would restart an agent in the middle of a snapshot's upload.
  */
 export function nodeAgentObjects(config: InstallConfig): KubernetesObject[] {
-  if (!nodeAgentRuns(config)) return [];
   const agents = daemonSet(config);
   return [agents, verticalPodAutoscaler(agents, "Recommended")];
 }

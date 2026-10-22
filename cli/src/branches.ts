@@ -52,7 +52,7 @@ import { harnessPoolPodPolicyName } from "./manifests/admission.ts";
 import { branchObjects } from "./manifests/branch.ts";
 import { REPLICA_NAME } from "./manifests/neon.ts";
 import { BRANCH_FORK_SECRET, BRANCH_LABEL, componentName, NAMESPACE, neonName, RELEASE, selectorLabels, SESSIONS_CALLER_SECRET } from "./manifests/common.ts";
-import { GATEWAY, sandboxServiceRuns } from "./manifests/sandbox-gateway.ts";
+import { GATEWAY } from "./manifests/sandbox-gateway.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { LOADER_COMPONENT } from "./manifests/lake.ts";
 import { CLAUDE_SECRET, readClaudeToken, readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "./secrets.ts";
@@ -280,7 +280,6 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   const problem = nameProblem(name);
   if (problem) return yield* new BranchRefused({ message: `${name} is no branch's name: ${problem}` });
   const settings = yield* branchConfig(config, overrides);
-  if (!settings.neon.enabled) return yield* new BranchRefused({ message: "a branch environment is a branch of alasio's Neon, which this installation does not run" });
   if (!(yield* kube.get({ ...DEPLOYMENT, namespace: NAMESPACE, name: RELEASE }))) {
     return yield* new BranchRefused({ message: "alasio is not installed in this cluster: alasio up installs it" });
   }
@@ -325,9 +324,7 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
     branchSecret(name, TELEGRAM_SECRET, { token: Redacted.value(bot.token), allowedUserIds: bot.allowedUserIds.join(",") }),
     branchSecret(name, BRANCH_FORK_SECRET, { token: forkToken(yield* requiredSecret(componentName("branches"), "fork-key"), name) }),
     // Its callers' key to the sandbox gateway, its own of the gateway's, which signs its own sessions' tokens alone.
-    ...(sandboxServiceRuns(settings)
-      ? [branchSecret(name, SESSIONS_CALLER_SECRET, { "caller-key": environmentKey(Buffer.from(yield* requiredSecret(GATEWAY, "caller-key")), name).toString() })]
-      : []),
+    branchSecret(name, SESSIONS_CALLER_SECRET, { "caller-key": environmentKey(Buffer.from(yield* requiredSecret(GATEWAY, "caller-key")), name).toString() }),
     branchSecret(name, environmentLogSecret({ namespace: branchNamespace(name), branch: name }), { username: alasioPrincipal(name), password: credentials.log }),
     // Its lake loader's, which reads its wake topic alone; and KEDA's, which may describe
     // how far behind that is and read nothing, which its loader's scaler reads as.

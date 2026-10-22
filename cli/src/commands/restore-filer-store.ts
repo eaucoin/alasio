@@ -312,7 +312,7 @@ export const restoreFilerStore = Command.make(
       Effect.gen(function*() {
         const settings = yield* installConfig(yield* loadConfig);
         const { bundled } = settings.objectStore;
-        if (!settings.neon.enabled || !bundled.enabled) return yield* new RestoreRefused({ message: "alasio runs no bundled object store, whose filer store this restores" });
+        if (!bundled.enabled) return yield* new RestoreRefused({ message: "alasio runs no bundled object store, whose filer store this restores" });
         if (!bundled.filerStore.backups.enabled) return yield* new RestoreRefused({ message: "the filer store's backups are off (objectStore.bundled.filerStore.backups.enabled), so there is none to restore" });
         const options = waitOptions(timeout);
         const stamps = yield* backups(settings, options);

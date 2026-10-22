@@ -75,7 +75,6 @@ import {
   labels,
   MAIN_ENVIRONMENT,
   NAMESPACE,
-  nodeAgentRuns,
   otelEnv,
   RELEASE,
   replicasOf,
@@ -112,11 +111,6 @@ export const POOLS = { none: "sandboxes-none", full: "sandboxes-full" } as const
 /** The component of a pool's pods: a session's. */
 export const POOL_COMPONENT = "session";
 
-/** Whether the sandbox service runs: for session workspaces on workspace storage, where the node agents run, which attach them, and Neon's setup makes its keys. */
-export function sandboxServiceRuns(config: InstallConfig): boolean {
-  return config.workspaceStorage.enabled && nodeAgentRuns(config);
-}
-
 /** The pools of `environment`, by its sessions' internet. */
 export const poolsOf = (config: InstallConfig, environment: Environment): Record<keyof typeof POOLS, Pool> => {
   const namespace = sessionsNamespace(config, environment);
@@ -134,7 +128,7 @@ export const poolsOf = (config: InstallConfig, environment: Environment): Record
  */
 export function carriedPools(config: InstallConfig, liveGateway: string | undefined, kept: Kept): PreviousPools {
   const none: PreviousPools = { none: null, full: null };
-  if (!sandboxServiceRuns(config) || !poolsSnapshotted(config, kept.cpuBaseline) || liveGateway === undefined) return none;
+  if (!poolsSnapshotted(kept.cpuBaseline) || liveGateway === undefined) return none;
   const held = Schema.decodeUnknownOption(Schema.fromJsonString(GatewayConfigSchema))(liveGateway);
   if (held._tag === "None" || held.value.snapshots === null) return none;
   const pools = poolsOf(config, MAIN_ENVIRONMENT);
@@ -159,8 +153,8 @@ export function recordedCpuBaseline(liveGateway: string | undefined): CpuBaselin
   return recorded ? recorded.split(",") : null;
 }
 
-/** Whether the sandbox pools' sessions are snapshotted: where the node agents run, which save them, and the nodes' CPU baseline is recorded, which they are held to. */
-export const poolsSnapshotted = (config: InstallConfig, cpuBaseline: CpuBaseline): cpuBaseline is readonly string[] => nodeAgentRuns(config) && cpuBaseline !== null;
+/** Whether the sandbox pools' sessions are snapshotted: where the nodes' CPU baseline is recorded, which they are held to. */
+export const poolsSnapshotted = (cpuBaseline: CpuBaseline): cpuBaseline is readonly string[] => cpuBaseline !== null;
 
 /**
  * The template of a pool's pods, as the module says: a session's, under its internet `mode`.
@@ -172,7 +166,7 @@ export const poolsSnapshotted = (config: InstallConfig, cpuBaseline: CpuBaseline
  */
 export function poolTemplate(config: InstallConfig, pool: Pool, mode: keyof typeof POOLS, cpuBaseline: CpuBaseline): V1PodTemplateSpec {
   const template = unhashedPoolTemplate(config, pool, mode, cpuBaseline);
-  if (!poolsSnapshotted(config, cpuBaseline)) return template;
+  if (!poolsSnapshotted(cpuBaseline)) return template;
   return { ...template, metadata: { ...template.metadata, annotations: { ...template.metadata?.annotations, [SESSION_TEMPLATE_ANNOTATION]: templateHash(template) } } };
 }
 
@@ -180,7 +174,7 @@ export function poolTemplate(config: InstallConfig, pool: Pool, mode: keyof type
 function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typeof POOLS, cpuBaseline: CpuBaseline): V1PodTemplateSpec {
   const { sessions } = config;
   const agent = imageReference(config.images.agent);
-  const snapshotted = poolsSnapshotted(config, cpuBaseline);
+  const snapshotted = poolsSnapshotted(cpuBaseline);
   return {
     metadata: {
       labels: { "app.kubernetes.io/part-of": "alasio", "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": POOL_COMPONENT, [NET_MODE_LABEL]: mode, ...freeLabels(pool) },
@@ -291,7 +285,7 @@ function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
     // A new session's volume's size, as the configuration checks it.
     quotaBytes: memoryBytes(config.sessions.storage.size),
     // Under the releases the cluster keeps, each restored with a RuntimeClass of its own.
-    snapshots: poolsSnapshotted(config, carried.cpuBaseline)
+    snapshots: poolsSnapshotted(carried.cpuBaseline)
       ? {
         liveEverySeconds: durationSeconds(config.sessions.snapshots.liveEvery) ?? 0,
         releases: carried.gvisorReleases.map((release) => ({ release, runtimeClassName: gvisorRuntimeClass(release), gofer: goferOf(release, NODE_PINS.gvisor.restoresThroughSocketSince) })),
@@ -690,7 +684,6 @@ function workspaceMount(config: InstallConfig, mountServices: Kept["mountService
  * may do there, binding in its pools, and the receiver, watching their Leases.
  */
 export function sandboxPoolObjects(config: InstallConfig, environment: Environment, cpuBaseline: CpuBaseline): KubernetesObject[] {
-  if (!sandboxServiceRuns(config)) return [];
   const pools = poolsOf(config, environment);
   const namespace = pools.none.namespace;
   return [
@@ -716,7 +709,6 @@ export function sandboxPoolObjects(config: InstallConfig, environment: Environme
 
 /** The sandbox service's objects: its gateway, its receiver, and the nodes' mount, main's alone, which serve every environment, and main's pools. */
 export function sandboxServiceObjects(config: InstallConfig, carried: Carried): KubernetesObject[] {
-  if (!sandboxServiceRuns(config)) return [];
   const mount = workspaceMount(config, carried.mountServices);
   const pools = poolsOf(config, MAIN_ENVIRONMENT);
   return [
@@ -726,7 +718,7 @@ export function sandboxServiceObjects(config: InstallConfig, carried: Carried): 
     ...sandboxPodPolicy([poolTemplate(config, pools.none, "none", carried.cpuBaseline), poolTemplate(config, pools.full, "full", carried.cpuBaseline)], {
       sessionsNamespace: sessionsNamespace(config, MAIN_ENVIRONMENT),
       // Main's restores, by the gateway alone, onto each pool's template and the one before it, under the releases kept.
-      restores: poolsSnapshotted(config, carried.cpuBaseline)
+      restores: poolsSnapshotted(carried.cpuBaseline)
         ? {
           restorer: GATEWAY_USER,
           templates: (["none", "full"] as const).flatMap((mode) => [poolTemplate(config, pools[mode], mode, carried.cpuBaseline), ...(carried.previousPools[mode] ? [carried.previousPools[mode]] : [])]),
@@ -735,7 +727,7 @@ export function sandboxServiceObjects(config: InstallConfig, carried: Carried): 
         : null,
     }),
     // Where main's sessions are snapshotted, what the gateway may set of a restore's pod's status.
-    ...(poolsSnapshotted(config, carried.cpuBaseline) ? resumedConditionPolicy(componentName("resumed-condition"), GATEWAY_USER, pools.none.namespace) : []),
+    ...(poolsSnapshotted(carried.cpuBaseline) ? resumedConditionPolicy(componentName("resumed-condition"), GATEWAY_USER, pools.none.namespace) : []),
     ...receiverObjects(config),
     ...sandboxPoolObjects(config, MAIN_ENVIRONMENT, carried.cpuBaseline),
     mount,

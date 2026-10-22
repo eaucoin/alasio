@@ -24,15 +24,14 @@ import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { busyLabelPolicy } from "./admission.ts";
 import { foldersRun } from "./folders.ts";
-import { carriedPools, GATEWAY, GATEWAY_PORT, sandboxServiceRuns } from "./sandbox-gateway.ts";
+import { carriedPools, GATEWAY, GATEWAY_PORT } from "./sandbox-gateway.ts";
 import { alasioGroup, environmentLogSecret, environmentName, lakeWakeTopic, LOG_BROKERS, telegramTopic } from "./log.ts";
-import { harnessPoolsRun } from "./harness-pools.ts";
 import { CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
 import {
   BRANCH_FORK_SECRET,
   BRANCH_LABEL,
   componentName,
-  databaseSecret,
+  DATABASE_SECRET,
   type Environment,
   envOf,
   given,
@@ -134,25 +133,20 @@ const BRANCH_SECRETS = "/run/alasio/branch";
  * it starts; a branch, which it is, and its token to ask its parent to fork the sessions it
  * inherited with, on the log (src/branch/fork.ts).
  */
-function branchEnv(config: InstallConfig, { branch }: Environment): V1EnvVar[] {
+function branchEnv({ branch }: Environment): V1EnvVar[] {
   if (branch) {
     return [
       { name: "ALASIO_BRANCH", value: branch },
       { name: "ALASIO_BRANCH_FORK_TOKEN_FILE", value: `${BRANCH_SECRETS}/token` },
     ];
   }
-  return forksForBranches(config) ? [{ name: "ALASIO_BRANCH_FORK_KEY_FILE", value: `${BRANCH_SECRETS}/fork-key` }] : [];
+  return [{ name: "ALASIO_BRANCH_FORK_KEY_FILE", value: `${BRANCH_SECRETS}/fork-key` }];
 }
 
 /** The volume of branch environments' Secret: main's key, kept optional, or a branch's token. */
-function branchSecretVolume(config: InstallConfig, { branch }: Environment): V1Volume[] {
+function branchSecretVolume({ branch }: Environment): V1Volume[] {
   if (branch) return [{ name: "branch", secret: { secretName: BRANCH_FORK_SECRET, items: [{ key: "token", path: "token" }] } }];
-  return forksForBranches(config) ? [{ name: "branch", secret: { secretName: componentName("branches"), items: [{ key: "fork-key", path: "fork-key" }], optional: true } }] : [];
-}
-
-/** Whether main forks its sessions for branch environments: where it has Neon to branch, and the sandbox service, whose node agents clone them. */
-export function forksForBranches(config: InstallConfig): boolean {
-  return config.neon.enabled && sandboxServiceRuns(config);
+  return [{ name: "branch", secret: { secretName: componentName("branches"), items: [{ key: "fork-key", path: "fork-key" }], optional: true } }];
 }
 
 /**
@@ -181,7 +175,7 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     { name: "ALASIO_LAKE_VERIFIER_FILE", value: "/run/alasio/database/lake-verifier" },
     { name: "ALASIO_HARNESS_VERIFIER_FILE", value: "/run/alasio/database/harness-verifier" },
     ...readerRoles(config, environment).map(({ key, variable }) => ({ name: variable, value: `/run/alasio/database/${key}` })),
-    { name: "ALASIO_LAKE_ENABLED", value: config.lake.enabled && config.neon.enabled ? "1" : "0" },
+    { name: "ALASIO_LAKE_ENABLED", value: config.lake.enabled ? "1" : "0" },
     // Its Telegram updates: its environment's topic, read in its group as its principal.
     { name: "ALASIO_LOG_BROKERS", value: LOG_BROKERS },
     { name: "ALASIO_LOG_USERNAME", valueFrom: { secretKeyRef: { name: environmentLogSecret(environment), key: "username" } } },
@@ -196,24 +190,16 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
       ? [{ name: "CLAUDE_CODE_OAUTH_TOKEN", valueFrom: { secretKeyRef: { name: alasio.claude.existingSecret, key: alasio.claude.key } } }]
       : []),
     // Its environment's sessions, through the sandbox gateway, by its environment's own key of the gateway's.
-    ...(sandboxServiceRuns(config)
-      ? [
-        { name: ALASIO_GATEWAY_URL_VARIABLE, value: `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}` },
-        { name: ALASIO_GATEWAY_ENVIRONMENT_VARIABLE, value: environmentName(environment) },
-        { name: ALASIO_GATEWAY_CALLER_KEY_VARIABLE, valueFrom: { secretKeyRef: { name: SESSIONS_CALLER_SECRET, key: "caller-key" } } },
-      ]
-      : []),
+    { name: ALASIO_GATEWAY_URL_VARIABLE, value: `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}` },
+    { name: ALASIO_GATEWAY_ENVIRONMENT_VARIABLE, value: environmentName(environment) },
+    { name: ALASIO_GATEWAY_CALLER_KEY_VARIABLE, valueFrom: { secretKeyRef: { name: SESSIONS_CALLER_SECRET, key: "caller-key" } } },
     // Main's folder workspaces, the gateway's folder instances, where the host profile renders them.
     ...(environment.branch === null && foldersRun(config) ? [{ name: ALASIO_GATEWAY_FOLDERS_VARIABLE, value: "1" }] : []),
-    // Its conversations' harnesses, in pools of their own, where they run so, heard on its events topic in its group.
-    ...(harnessPoolsRun(config)
-      ? [
-        { name: "ALASIO_HARNESS_POOLS", value: "1" },
-        // Where its pools' pods reach its relay of its Codex login, which only it holds.
-        { name: "ALASIO_CODEX_LOGIN_URL", value: `http://${CODEX_LOGIN}.${environment.namespace}.svc.cluster.local:${CODEX_LOGIN_PORT}/v1` },
-      ]
-      : []),
-    ...branchEnv(config, environment),
+    // Its conversations' harnesses, in pools of their own, heard on its events topic in its group.
+    { name: "ALASIO_HARNESS_POOLS", value: "1" },
+    // Where its conversations' harnesses' pools' pods reach its relay of its Codex login, which only it holds.
+    { name: "ALASIO_CODEX_LOGIN_URL", value: `http://${CODEX_LOGIN}.${environment.namespace}.svc.cluster.local:${CODEX_LOGIN_PORT}/v1` },
+    ...branchEnv(environment),
     ...otelEnv(config, environment),
     ...envOf(alasio.env),
   ];
@@ -240,7 +226,7 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
   const gid = host.enabled ? host.gid : alasio.runAsGroup;
   const groups = [...new Set([...alasio.supplementalGroups, ...(host.enabled ? host.supplementalGroups : [])])];
   const image = imageReference(config.images.alasio);
-  const branchSecret = branchSecretVolume(config, environment);
+  const branchSecret = branchSecretVolume(environment);
   return {
     apiVersion: "apps/v1",
     kind: "Deployment",
@@ -268,7 +254,7 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
             workingDir: home,
             env: alasioEnv(config, home, operatorHome, environment),
             ...given("envFrom", [...alasio.envFrom]),
-            ...given("ports", [...(harnessPoolsRun(config) ? [{ name: "codex-login", containerPort: CODEX_LOGIN_PORT }] : [])]),
+            ports: [{ name: "codex-login", containerPort: CODEX_LOGIN_PORT }],
             securityContext: restrictedContainer(),
             resources: alasio.resources,
             volumeMounts: [
@@ -286,7 +272,7 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
             {
               name: "database",
               secret: {
-                secretName: databaseSecret(config),
+                secretName: DATABASE_SECRET,
                 items: ["url", "lake-verifier", "harness-verifier", ...readerRoles(config, environment).map(({ key }) => key)].map((key) => ({ key, path: key })),
               },
             },
@@ -320,7 +306,7 @@ function namespaces(config: InstallConfig, environment: Environment): V1Namespac
   const branched = branch ? { [BRANCH_LABEL]: branch } : {};
   return [
     ...(branch ? [{ apiVersion: "v1", kind: "Namespace", metadata: { name: environment.namespace, labels: { ...labels("alasio"), ...branched } } }] : []),
-    ...(sessions.enabled && (sessions.createNamespace || branch)
+    ...(sessions.createNamespace || branch
       ? [{
         apiVersion: "v1",
         kind: "Namespace",
@@ -330,9 +316,9 @@ function namespaces(config: InstallConfig, environment: Environment): V1Namespac
             ...labels("session"),
             ...branched,
             ...(branch ? { [BRANCH_PARENT_LABEL]: MAIN_ENVIRONMENT_NAME } : {}),
-            ...(sandboxServiceRuns(config)
-              ? { "pod-security.kubernetes.io/enforce": "privileged", "pod-security.kubernetes.io/audit": "restricted", "pod-security.kubernetes.io/audit-version": "latest" }
-              : { "pod-security.kubernetes.io/enforce": "restricted", "pod-security.kubernetes.io/enforce-version": "latest" }),
+            "pod-security.kubernetes.io/enforce": "privileged",
+            "pod-security.kubernetes.io/audit": "restricted",
+            "pod-security.kubernetes.io/audit-version": "latest",
             "pod-security.kubernetes.io/warn": "restricted",
             "pod-security.kubernetes.io/warn-version": "latest",
           },
@@ -423,7 +409,7 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
     verticalPodAutoscaler(alasio, "AtStart"),
     // A drain waits for the turns running in its pod to end.
     busyBudget(environment.namespace),
-    ...(harnessPoolsRun(config) ? [codexLoginService(environment)] : []),
+    codexLoginService(environment),
     // What alasio may do beyond what RBAC can say: the cluster's, made with main's.
     ...(environment.branch === null ? busyLabelPolicy() : []),
   ];

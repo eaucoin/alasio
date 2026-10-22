@@ -48,7 +48,7 @@ import { COLLECTOR_PORT, collectorRuns, componentName, given, goJson, lakeRuns, 
 import type { InstallConfig } from "./config.ts";
 import { LOG_BROKERS, LOG_METRICS_PORT, LOG_RECORD_BYTES, logPrincipalSecret, TELEMETRY_TOPICS } from "./log.ts";
 import { replicaBudget, spread } from "./disruption.ts";
-import { JUICEFS_METRICS_PORT, sandboxServiceRuns, WORKSPACE_MOUNT_COMPONENT } from "./sandbox-gateway.ts";
+import { JUICEFS_METRICS_PORT, WORKSPACE_MOUNT_COMPONENT } from "./sandbox-gateway.ts";
 import { INTAKE_COMPONENT, LAKE_METRICS_PORT, LAKE_QUERY_PORT, LOADER_COMPONENT, QUERY_COMPONENT } from "./lake.ts";
 import { COMPONENTS, FILER_STORE, FILER_STORE_USERS, METRICS_PORT as SEAWEEDFS_METRICS_PORT } from "./object-store.ts";
 import { priority } from "./priorities.ts";
@@ -100,7 +100,7 @@ const NODE_STATS = {
 };
 
 /** Whether the bundled object store runs, whose parts it scrapes and whose filer store it reads. */
-const seaweedfsRuns = ({ neon, objectStore }: InstallConfig): boolean => neon.enabled && objectStore.bundled.enabled;
+const seaweedfsRuns = ({ objectStore }: InstallConfig): boolean => objectStore.bundled.enabled;
 
 /** The object store's parts it scrapes, by their pods' component: all but the filer store, which it reads as a Valkey. */
 const SEAWEEDFS_SCRAPED = [COMPONENTS.gateway, COMPONENTS.master, COMPONENTS.volumeServer, COMPONENTS.filer];
@@ -118,7 +118,7 @@ interface ReadValkey {
 function valkeys(config: InstallConfig): ReadValkey[] {
   const { collector } = FILER_STORE_USERS;
   return [
-    ...(config.workspaceStorage.enabled ? [{ receiver: "redis", name: VALKEY, secret: VALKEY, variable: "VALKEY_PASSWORD" }] : []),
+    { receiver: "redis", name: VALKEY, secret: VALKEY, variable: "VALKEY_PASSWORD" },
     ...(seaweedfsRuns(config)
       ? [{ receiver: "redis/filer-store", name: FILER_STORE, username: collector.name, secret: collector.secret, variable: "FILER_STORE_PASSWORD" }]
       : []),
@@ -148,21 +148,16 @@ function podJob(job: string, namespace: string, components: readonly string[], p
 
 /** What it scrapes, a job of each component's pods, by the job's name, which its metrics' service is named. */
 function scrapes(config: InstallConfig): object[] {
-  const { neon } = config;
   const stack: Record<string, readonly [components: readonly string[], port: number]> = {
-    ...(neon.enabled
-      ? {
-        pageserver: [["neon-pageserver"], 9898],
-        "storage-controller": [["neon-storage-controller"], 1234],
-        "storage-broker": [["neon-storage-broker"], 50051],
-        // The primary and, where the lake runs, its read replica.
-        compute: [["neon-compute", "neon-compute-ro"], COMPUTE_CTL_PORT],
-        // Each replica's own wakes and sleeps, as any of them wakes a compute.
-        "neon-control": [["neon-control"], 8080],
-        proxy: [["neon-proxy"], 7001],
-        safekeeper: [["neon-safekeeper"], 7676],
-      } as const
-      : {}),
+    pageserver: [["neon-pageserver"], 9898],
+    "storage-controller": [["neon-storage-controller"], 1234],
+    "storage-broker": [["neon-storage-broker"], 50051],
+    // The primary and, where the lake runs, its read replica.
+    compute: [["neon-compute", "neon-compute-ro"], COMPUTE_CTL_PORT],
+    // Each replica's own wakes and sleeps, as any of them wakes a compute.
+    "neon-control": [["neon-control"], 8080],
+    proxy: [["neon-proxy"], 7001],
+    safekeeper: [["neon-safekeeper"], 7676],
     ...(lakeRuns(config)
       ? { "lake-loader": [[LOADER_COMPONENT], LAKE_METRICS_PORT], "lake-query": [[QUERY_COMPONENT], LAKE_QUERY_PORT], "lake-intake": [[INTAKE_COMPONENT], LAKE_METRICS_PORT] } as const
       : {}),
@@ -177,7 +172,7 @@ function scrapes(config: InstallConfig): object[] {
     // The object store's parts, each labelled with its part.
     ...(seaweedfsRuns(config) ? [podJob("seaweedfs", NAMESPACE, SEAWEEDFS_SCRAPED, SEAWEEDFS_METRICS_PORT, true)] : []),
     // Each node's mount of workspace storage, JuiceFS's client.
-    ...(sandboxServiceRuns(config) ? [podJob("juicefs", NAMESPACE, [WORKSPACE_MOUNT_COMPONENT], JUICEFS_METRICS_PORT)] : []),
+    podJob("juicefs", NAMESPACE, [WORKSPACE_MOUNT_COMPONENT], JUICEFS_METRICS_PORT),
   ];
 }
 

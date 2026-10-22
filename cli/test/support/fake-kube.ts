@@ -24,6 +24,8 @@ import { buffer } from "node:stream/consumers";
 
 import { KubeConfig } from "@kubernetes/client-node";
 
+import { harnessPoolPodPolicyName } from "../../src/manifests/admission.ts";
+
 /** The fake's certificate, for 127.0.0.1, and its key: made once for these tests, valid for a century. */
 export const CERTIFICATE = `-----BEGIN CERTIFICATE-----
 MIIBkDCCATagAwIBAgIUXXWRzs0lXBHSGKq+4GuCxbqU8HowCgYIKoZIzj0EAwIw
@@ -472,6 +474,15 @@ export async function serveFakeKube(): Promise<FakeKube> {
       const policy = (object: KubeObject) => (object.spec?.["podManagementPolicy"] as string | undefined) ?? "OrderedReady";
       if (existing?.kind === "StatefulSet" && patch.spec?.["podManagementPolicy"] !== undefined && policy(patch) !== policy(existing)) {
         return refuse(response, 422, `StatefulSet.apps "${target.name}" is invalid: spec: Forbidden: updates to statefulset spec for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy', 'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden`);
+      }
+      // A harness pool's pod held to its templates by its environment's policy of them, once that is held: the fake makes no pod of a pool's itself, so one it is asked to make is none of them.
+      // Each environment's policy holds its own namespace's pods alone, main's or a branch's.
+      const branch = target.namespace?.startsWith("alasio-branch-") ? target.namespace.slice("alasio-branch-".length) : null;
+      const poolPolicy = patch.kind === "Pod" && (patch.metadata.labels?.["alasio.dev/pool"] ?? "").startsWith("harness-")
+        ? [...objects.values()].find((object) => object.kind === "ValidatingAdmissionPolicy" && object.metadata.name === harnessPoolPodPolicyName(branch))
+        : undefined;
+      if (poolPolicy) {
+        return refuse(response, 422, `pods "${target.name}" is forbidden: ValidatingAdmissionPolicy '${poolPolicy.metadata.name}' with binding '${poolPolicy.metadata.name}' denied request: a harness pool's pod is of one of its templates`);
       }
       version += 1;
       const base: KubeObject = existing ?? { ...patch, metadata: { ...patch.metadata, uid: `uid-${version}`, generation: 0, creationTimestamp: new Date().toISOString() } };

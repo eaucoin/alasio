@@ -151,9 +151,9 @@ export function envOf(variables: Readonly<Record<string, string>>): V1EnvVar[] {
   return Object.keys(variables).sort().map((name) => ({ name, value: variables[name] ?? "" }));
 }
 
-/** Whether the lake runs: when it is on, beside Neon. */
+/** Whether the lake runs: when it is on. */
 export function lakeRuns(config: InstallConfig): boolean {
-  return config.lake.enabled && config.neon.enabled;
+  return config.lake.enabled;
 }
 
 /** Whether Grafana runs (./grafana.ts): when it is on, beside the lake, which it reads. */
@@ -164,23 +164,6 @@ export function grafanaRuns(config: InstallConfig): boolean {
 /** Whether the stack's telemetry collector runs (./collector.ts): with the lake, or an endpoint to send to. */
 export function collectorRuns(config: InstallConfig): boolean {
   return lakeRuns(config) || Boolean(config.telemetry.otlpEndpoint);
-}
-
-/**
- * Whether session sandboxes are snapshotted whole, into the object store's snapshots
- * bucket: when sessions run under a RuntimeClass, gVisor's, whose checkpoints the
- * snapshots are, and not under the cluster's default runtime.
- */
-export function sandboxSnapshots(config: InstallConfig): boolean {
-  return config.sessions.enabled && config.sessions.runtimeClassName !== "";
-}
-
-/**
- * Whether the node agents run (./node-agent.ts): where sandboxes are snapshotted, and
- * Neon's setup makes the Secrets they run with, their bucket's and their token.
- */
-export function nodeAgentRuns(config: InstallConfig): boolean {
-  return sandboxSnapshots(config) && config.neon.enabled;
 }
 
 /** The port the collector takes OTLP over HTTP on. */
@@ -227,10 +210,8 @@ export function claimSpec(storage: InstallConfig["neon"]["pageserver"]["storage"
   };
 }
 
-/** The Secret alasio reads its database URL and the lake role's verifier from. */
-export function databaseSecret(config: InstallConfig): string {
-  return config.neon.enabled ? `${RELEASE}-database` : config.neon.external.existingSecret;
-}
+/** The Secret alasio reads its database URL and the lake role's verifier from, which Neon's setup makes. */
+export const DATABASE_SECRET = `${RELEASE}-database`;
 
 /**
  * The verifiers of the passwords of the roles alasio makes in its Neon for what reads it

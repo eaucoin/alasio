@@ -80,19 +80,17 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
     const environments = yield* makeEnvironments({ main: config.environment });
     const foldersNamespace = config.folders?.namespace ?? null;
     const events = yield* Events.fromEnvironment;
-    // Conversations' harnesses, where the installation runs them in pools of their own (./harnesses.ts).
-    const harnesses = config.harnesses
-      ? yield* makeHarnesses({ config: config.harnesses, environments, main: config.environment.name, bindingKey, events }, agents, binder)
-      : null;
+    // Conversations' harnesses, in pools of their own (./harnesses.ts).
+    const harnesses = yield* makeHarnesses({ config: config.harnesses, environments, main: config.environment.name, bindingKey, events }, agents, binder);
     // The bindings' Leases watched, every environment's, the folder instances' and the harnesses', so a route this replica knew of a binding another released is let go.
     const namespaces: BindingNamespaces = {
       current: Effect.gen(function*() {
         const sessions = (yield* environments.current).map(({ namespace }) => namespace);
-        return [...new Set([...sessions, ...(foldersNamespace ? [foldersNamespace] : []), ...(harnesses ? yield* harnesses.namespaces : [])])];
+        return [...new Set([...sessions, ...(foldersNamespace ? [foldersNamespace] : []), ...(yield* harnesses.namespaces)])];
       }),
       known: (namespace) =>
         Effect.gen(function*() {
-          if (namespace === foldersNamespace || (harnesses && (yield* harnesses.ownsNamespace(namespace)))) return true;
+          if (namespace === foldersNamespace || (yield* harnesses.ownsNamespace(namespace))) return true;
           return (yield* environments.ofNamespace(namespace)) !== null;
         }),
     };
@@ -130,7 +128,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
     // Of the pools there are as each round begins, the folder instances' and the harnesses' among them, each binding lost told of as its kind's.
     const setRight = Effect.gen(function*() {
       const workspaces = [...(yield* sessions.pools), ...(folders ? [folders.pool] : [])].map((pool) => ({ pool, lost: sessions.lost, recordLost: sessions.recordLost }));
-      const harnessed = harnesses ? (yield* harnesses.pools).map((pool) => ({ pool, lost: harnesses.lost, recordLost: () => Effect.void })) : [];
+      const harnessed = (yield* harnesses.pools).map((pool) => ({ pool, lost: harnesses.lost, recordLost: () => Effect.void }));
       return [...workspaces, ...harnessed];
     }).pipe(Effect.flatMap((pools) =>
       Effect.forEach(pools, ({ pool, lost, recordLost }) =>
@@ -175,19 +173,17 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       yield* Effect.forkScoped(Effect.repeat(folders.measure, Schedule.spaced(SWEEP_MS)));
     }
     // The harnesses', as often: each idle one released, drained first, and each whose host ended, or whose pod ends.
-    if (harnesses) {
-      yield* Effect.forkScoped(Effect.repeat(
-        harnesses.sweep.pipe(
-          Effect.tap((released) => (released.length > 0 ? Effect.logInfo(`released ${released.join(", ")}`) : Effect.void)),
-          Effect.catch((error) => Effect.logWarning(`looking at bound harnesses failed: ${error.message}`)),
-        ),
-        Schedule.spaced(SWEEP_MS),
-      ));
-      yield* Effect.forkScoped(Effect.repeat(
-        harnesses.live.pipe(Effect.catch((error) => Effect.logWarning(`looking at bound harnesses' pods failed: ${error.message}`))),
-        Schedule.spaced(SWEEP_MS),
-      ));
-    }
+    yield* Effect.forkScoped(Effect.repeat(
+      harnesses.sweep.pipe(
+        Effect.tap((released) => (released.length > 0 ? Effect.logInfo(`released ${released.join(", ")}`) : Effect.void)),
+        Effect.catch((error) => Effect.logWarning(`looking at bound harnesses failed: ${error.message}`)),
+      ),
+      Schedule.spaced(SWEEP_MS),
+    ));
+    yield* Effect.forkScoped(Effect.repeat(
+      harnesses.live.pipe(Effect.catch((error) => Effect.logWarning(`looking at bound harnesses' pods failed: ${error.message}`))),
+      Schedule.spaced(SWEEP_MS),
+    ));
     // As often, the bound pods ending though the gateway did not end them, each released in the background as its bayma holds its stop.
     yield* Effect.forkScoped(Effect.repeat(
       sessions.drain.pipe(
@@ -202,14 +198,14 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       bindingKey,
       podPort: config.podPort,
       poolOf: (key, options) =>
-        folders && folderOfKey(key) ? folders.place(key, options) : harnesses && conversationOfHarnessKey(key) ? harnesses.place(key, options) : sessions.place(key, options),
+        folders && folderOfKey(key) ? folders.place(key, options) : conversationOfHarnessKey(key) ? harnesses.place(key, options) : sessions.place(key, options),
       // The folder instances' listing, where there are folder instances; the rest, the sessions'.
       operate: (claims, operation) => (folders && /^\/folders(\/|$)/u.test(operation.path) ? folders.operate(claims, operation) : sessions.operate(claims, operation)),
       routeHeld: live.holds,
-      // Where harnesses are bound in pools: a workspace's token held to its conversation's harness's binding, as alasio gives one.
-      ...(harnesses ? { grants: (key: string, held: HeldTo) => heldToHarness(key, held.key) } : {}),
+      // A workspace's token held to its conversation's harness's binding, as alasio gives one.
+      grants: (key: string, held: HeldTo) => heldToHarness(key, held.key),
       // What a harness's bound host tells, told its environment's alasio as the gateway's, the host holding no principal of the log.
-      ...(harnesses ? { relay: harnesses.relay } : {}),
+      relay: harnesses.relay,
       // Every replica's address but its own, which answers its own waiting.
       peers: () =>
         Effect.tryPromise(() => lookup(config.peers, { all: true })).pipe(

@@ -10,7 +10,7 @@ import type { KubernetesObject, V1PodTemplateSpec, V1Volume } from "@kubernetes/
 import { FOLDER_TOKEN_FILE } from "../../../src/gateway/names.ts";
 import { sandboxBaymaTelemetryEnv } from "../../../src/sandbox/telemetry.ts";
 import { imageReference } from "../images.ts";
-import { accountRole, componentName, envOf, given, hostVolumeMounts, hostVolumes, imagePullSecrets, NAMESPACE, nodeAgentRuns, otelEnv, RELEASE } from "./common.ts";
+import { accountRole, componentName, envOf, given, hostVolumeMounts, hostVolumes, imagePullSecrets, NAMESPACE, otelEnv, RELEASE } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { folderDeletionPolicy, folderPodPolicy, folderSecretPolicy } from "./admission.ts";
 import { boundBudget } from "./disruption.ts";
@@ -24,9 +24,9 @@ const GATEWAY = componentName("sandbox-gateway");
 const GATEWAY_USER = `system:serviceaccount:${NAMESPACE}:${GATEWAY}`;
 const RECEIVER = componentName("receiver");
 
-/** Whether the installation has folder workspaces, whose instances the sandbox gateway makes: the host profile, where the sandbox service runs (./sandbox-gateway.ts sandboxServiceRuns). */
+/** Whether the installation has folder workspaces, whose instances the sandbox gateway makes: the host profile. */
 export function foldersRun(config: InstallConfig): boolean {
-  return config.host.enabled && config.workspaceStorage.enabled && nodeAgentRuns(config);
+  return config.host.enabled;
 }
 
 /** The template of a folder instance's pod, as the operator runs bayma on their own machine: bayma itself, as them, with the machine's mounts, under the cluster's own runtime, which its process snapshots need. */

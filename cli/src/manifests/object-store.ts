@@ -16,7 +16,7 @@
  * - S3 gateways, on the filers, the store's endpoint, under the name the stack reaches it
  *   by (alasio-seaweedfs:8333), scaled on their CPU where their scale is a range. Each makes
  *   the buckets, idempotently, as it starts: Neon's, the lake's, backups', workspace
- *   storage's when it is on, and session sandboxes' snapshots' when they are taken; and
+ *   storage's, and session sandboxes' snapshots'; and
  *   gives each bucket with lifecycle rules its rules (Neon's, and the snapshots'). It is
  *   ready, and the stack's writers start, only once they are.
  *
@@ -44,7 +44,7 @@ import type {
 import { HISTORY_DAYS } from "../../../neon/control/branches.ts";
 import { memoryBytes } from "../capacity.ts";
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, labels, NAMESPACE, neonName, replicasOf, restrictedContainer, sandboxSnapshots, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
+import { claimSpec, componentName, labels, NAMESPACE, neonName, replicasOf, restrictedContainer, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import { filerStoreMaxmemoryBytes, type InstallConfig, type Scale } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -453,13 +453,12 @@ export function goMemoryLimit(resources: { readonly limits?: { readonly memory?:
 function gatewayObjects(config: InstallConfig): KubernetesObject[] {
   const { bundled, buckets } = config.objectStore;
   const { scaling } = bundled.gateways;
-  const snapshots = sandboxSnapshots(config);
-  const made = [buckets.neon, buckets.lake, buckets.backups, ...(config.workspaceStorage.enabled ? [buckets.workspaces] : []), ...(snapshots ? [buckets.snapshots] : [])];
+  const made = [buckets.neon, buckets.lake, buckets.backups, buckets.workspaces, buckets.snapshots];
   // Each bucket's rules given as its admin: Neon's as the admin's, the snapshots' as their own
   // identity's, as nothing else may write that bucket (neon/control/secrets.ts s3Identities).
   const lifecycles = [
     { bucket: buckets.neon, rules: NEON_LIFECYCLE, as: "ADMIN" },
-    ...(snapshots ? [{ bucket: buckets.snapshots, rules: SNAPSHOTS_LIFECYCLE, as: "SNAPSHOTS" }] : []),
+    { bucket: buckets.snapshots, rules: SNAPSHOTS_LIFECYCLE, as: "SNAPSHOTS" },
   ];
   const image = imageReference(bundled.image);
   const ready = { exec: { command: ["test", "-f", "/tmp/ready"] }, periodSeconds: 5 };
@@ -907,9 +906,9 @@ export function filerStoreRestore(config: InstallConfig, file: string): Kubernet
   return [service, source, restore];
 }
 
-/** The bundled object store's objects, when it runs, which is beside Neon. */
+/** The bundled object store's objects, when it runs. */
 export function objectStoreObjects(config: InstallConfig): KubernetesObject[] {
-  if (!config.neon.enabled || !config.objectStore.bundled.enabled) return [];
+  if (!config.objectStore.bundled.enabled) return [];
   return [
     ...masterObjects(config),
     ...volumeServerObjects(config),
