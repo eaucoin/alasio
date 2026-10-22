@@ -27,6 +27,7 @@ import { Authorizer } from "./authorizer.ts";
 import { takePress } from "./callback-handler.ts";
 import { TelegramClient, type TelegramError } from "./client.ts";
 import { watchDeliveries } from "./delivery-watch.ts";
+import { drain, stopToldAt } from "./drain.ts";
 import { MediaGroups } from "./media-group-buffer.ts";
 import { handleMessage, processIncomingPrompt } from "./message-handler.ts";
 import type { Outbox } from "./outbox.ts";
@@ -176,6 +177,10 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   yield* turns.resumePendingPrompts;
   // Presses kept as an alasio before stopped, run again before updates come.
   yield* recoverPresses(handling).pipe(Effect.provideContext(services));
+  // As alasio stops: its member of the Telegram group, forked after, gone first, then what it
+  // owes delivered (./drain.ts), within the grace counted from when it was told to stop.
+  const toldAt = yield* stopToldAt;
+  yield* Effect.addFinalizer(() => drain({ toldAt }).pipe(Effect.provideContext(services)));
   yield* consumeUpdates(processUpdate).pipe(Effect.forkScoped);
   // Responses completed but never delivered (their delivery failed, or alasio stopped first) go out.
   yield* turns.flushCompletedResponses.pipe(

@@ -29,6 +29,7 @@ import { CODEX_LOGIN_URL, ENVIRONMENT, POOLED_SCHEMA, pooledDatabase, type Stand
 import { run } from "./store.ts";
 import { OPERATOR_ID, TelegramStandIn } from "./telegram.ts";
 import { serveTopic } from "./topics.ts";
+import { eventually } from "./wait.ts";
 
 const ALASIO_MAIN = fileURLToPath(new URL("./alasio-main.ts", import.meta.url));
 
@@ -69,6 +70,8 @@ export interface RunningAlasio {
   stop(): Promise<AlasioExit>;
   /** Starts alasio again, on the same state. */
   start(): Promise<void>;
+  /** Resolves once alasio has logged `text` since it last started. */
+  logged(text: string): Promise<void>;
   /** Reads alasio's state through its store, for scenarios about durability. */
   readStore<T>(read: (store: Store["Service"]) => Effect.Effect<T, StoreError>): Promise<T>;
   /** The schema of the test's database alasio keeps its state in, and a pool of the database as alasio owns it, for what the store has no reader of. */
@@ -122,6 +125,8 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
   const store = await Effect.runPromise(Effect.provide(Store, Store.layer({ pool: database.pool, harnessRole: HARNESS_ROLE })));
   const verbose = process.env["ALASIO_TEST_LOG"] === "1";
   let output = "";
+  /** Where in its output alasio last started. */
+  let startedAt = 0;
   let child: ChildProcess | null = null;
   let exited: Promise<AlasioExit> = Promise.resolve({ code: 0, signal: null });
   /** How alasio ended when it ended without being stopped. */
@@ -129,6 +134,7 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
 
   async function start(): Promise<void> {
     if (child) throw new Error("alasio is already running");
+    startedAt = output.length;
     const started = fork(ALASIO_MAIN, [JSON.stringify(config)], { env, execArgv: [], stdio: ["ignore", "pipe", "pipe", "ipc"] });
     child = started;
     for (const stream of [started.stdout, started.stderr]) {
@@ -168,6 +174,7 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
     folder: (name) => join(workspaceRoot, name),
     stop,
     start,
+    logged: async (text) => void await eventually(`alasio to log "${text}"`, () => (output.includes(text, startedAt) || undefined), { timeoutMs: 30_000 }),
     readStore: (read) => run(read(store)),
     stateSchema,
     pool: database.pool,

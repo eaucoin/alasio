@@ -5,7 +5,7 @@
  * API call alasio made, typed as the Bot API types it.
  */
 import type { AddressInfo } from "node:net";
-import type { ApiMethods, InlineKeyboardButton, InlineKeyboardMarkup, Opts } from "@grammyjs/types";
+import type { ApiMethods, InlineKeyboardButton, InlineKeyboardMarkup, Opts, Update } from "@grammyjs/types";
 
 import { type OperatorMessage, type Press, type RecordedCall, type StubFailure, createTelegramStub } from "../e2e/telegram-stub.ts";
 import { eventually, WAIT_MS } from "./wait.ts";
@@ -119,6 +119,14 @@ export class TelegramStandIn {
   /** The update alasio's group was told of last, as it is told once each is handled. */
   async committed(): Promise<number> {
     return ((await (await fetch(`${this.apiRoot}/control/committed`)).json()) as { updateId: number }).updateId;
+  }
+
+  /** The first update after `updateId`, as a member of alasio's group takes it, another alasio's among them: once one comes. */
+  async updateAfter(updateId: number): Promise<Update> {
+    for (;;) {
+      const [update] = (await (await fetch(`${this.apiRoot}/control/updates?after=${updateId}`)).json()) as Update[];
+      if (update) return update;
+    }
   }
 
   /** Has the next call to `method` fail as `failure` says. */
