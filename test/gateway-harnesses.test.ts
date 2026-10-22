@@ -487,7 +487,7 @@ test("what a bound host tells is told its environment's alasio as the host's, of
   // Of a kind no host tells, another conversation, more than an event's kind and its conversation (its id or source among it), no JSON, or of a namespace no environment's harnesses are in: refused, told no one.
   const refused = [
     [env.home, { kind: "harness.released", subject, binding: "binding-1", reason: "idle" }, 403],
-    [env.home, { kind: "workspace.lost", subject }, 403],
+    [env.home, { kind: "workspace.fork-answered", subject }, 403],
     [env.home, { kind: "harness.idle", subject: { kind: "conversation", key: "telegram:42" } }, 403],
     [env.home, { kind: "harness.idle", subject, id: "00000000-0000-4000-8000-000000000001" }, 400],
     [env.home, { kind: "harness.idle", subject, source: "sandbox-gateway" }, 400],

@@ -10,13 +10,12 @@ import type { V1Deployment, V1Pod, V1PodSpec, V1PodTemplateSpec } from "@kuberne
 import { Effect, Layer } from "effect";
 import { TestClock } from "effect/testing";
 
-import { added } from "./support/metrics.ts";
+import { added, collected } from "./support/metrics.ts";
 import { Binder } from "../src/binder/binder.ts";
 import { markReleasing, readLease, releaseLease, takeLease, touchLease } from "../src/binder/bindings.ts";
 import { freeLabels, leaseName, type Pool } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
 import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
-import type { EventInput } from "../src/events/events.ts";
 import { RELEASES } from "../src/gateway/releases.ts";
 import { ATTACH_DURATION, DETACH_DURATION, makeSessions, type SessionsOptions } from "../src/gateway/sessions.ts";
 import { KubeClient } from "../src/kube/client.ts";
@@ -157,8 +156,9 @@ const found = (list: readonly SessionsEnvironment[]): Environments => ({
   ofNamespace: (namespace) => Effect.succeed(list.find((each) => each.namespace === namespace) ?? null),
 });
 
-/** What the sessions told of, as each environment's alasio reads it. */
-const told: EventInput[] = [];
+/** How many of `namespace`'s bindings the gateway has counted released for `reason`, since the test process started. */
+const releasedFor = async (namespace: string, reason: string): Promise<number> =>
+  (await collected(RELEASES)).find(({ attributes }) => attributes === `k8s.namespace.name=${namespace},alasio.gateway.release.reason=${reason}`)?.value ?? 0;
 
 /** The gateway's sessions' options, of the environment `env`, main, whose sessions are snapshotted under the release `r1`, onto its pool's template. */
 const options = (env: SessionsEnvironment & { template?: V1PodTemplateSpec }, podPort: number): SessionsOptions => ({
@@ -174,7 +174,6 @@ const options = (env: SessionsEnvironment & { template?: V1PodTemplateSpec }, po
   podPort,
   quotaBytes: 2 * 1024 ** 3,
   bindingKey,
-  events: { tell: (event) => Effect.sync(() => void told.push(event)), send: (event) => Effect.sync(() => void told.push(event)) },
 });
 
 /** The gateway's sessions and its Binder, on clients of their own. */
@@ -281,10 +280,6 @@ test("a bound pod whose bayma is idle is kept while a request of it came within 
     assert.deepEqual(counted, { [`k8s.namespace.name=${env.namespace},alasio.gateway.release.reason=idle`]: 1 });
     assert.deepEqual(recorded.detached, [`node-a ${bound.pod} c-0`]);
     assert.equal(await run(readLease(env.none, key)), null);
-    // Told of, to its environment's alasio.
-    assert.deepEqual(told.filter((event) => event.subject.key === key && event.environment === env.name), [
-      { kind: "workspace.released", environment: env.name, source: "sandbox-gateway", subject: { kind: "workspace", key }, binding: bound.binding, reason: "idle" },
-    ]);
   } finally {
     stand.close();
   }
@@ -337,17 +332,6 @@ test("a release whose save fails leaving the sandbox running keeps the binding, 
       stand.close();
     }
   }
-});
-
-test("a binding let go as its pod went while it was bound is told of, to its environment's alasio, as lost", async () => {
-  const env = { name: "try", namespace: "alasio-branch-try-sessions", parent: "main" };
-  const { sessions } = await sessionsOf(options(env, 7290), agents().agents);
-  const key = sessionKey("fs-lost");
-  const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-lost", namespace: env.namespace, annotations: { "alasio.dev/binding-key": key } }, spec: { holderIdentity: "sandboxes-none-0" } };
-  await Effect.runPromise(sessions.lost({ name: "sandboxes-none", namespace: env.namespace }, lease));
-  assert.deepEqual(told.filter((event) => event.subject.key === key), [
-    { kind: "workspace.lost", environment: "try", source: "sandbox-gateway", subject: { kind: "workspace", key }, binding: "uid-lost", pod: "sandboxes-none-0", reason: "its pod went while it was bound" },
-  ]);
 });
 
 /** Makes the namespace `name`, as a branch's sessions' is made, where it is not there. */
@@ -877,6 +861,7 @@ test("a bound pod ended by other than the gateway, as a drain ends one, is saved
   const key = sessionKey("fs-drained");
   const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
   const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  const deletedBefore = await releasedFor(env.namespace, "deleted");
   // Deleted as a drain deletes it: with its grace, kubelet to end it.
   await run(withKube((kube) => kube.remove("v1", "Pod", env.namespace, bound.pod)));
   const counted = await added("alasio.sandbox.stop_releases", async () => {
@@ -889,10 +874,9 @@ test("a bound pod ended by other than the gateway, as a drain ends one, is saved
   });
   assert.deepEqual(counted, { "alasio.sandbox.stop_release.outcome=snapshotted": 1 });
   assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-drained released into s-1`, `detach node-a ${env.namespace}/${bound.pod}`]);
-  // Told once its release is through, which lets its binding go first.
-  const toldReleased = () => told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "deleted" && event.binding === bound.binding);
-  for (const deadline = Date.now() + 10_000; !toldReleased(); await new Promise((resolve) => setTimeout(resolve, 50))) {
-    assert.ok(Date.now() < deadline, "its release was not told");
+  // Counted, once its release is through, which lets its binding go first.
+  for (const deadline = Date.now() + 10_000; (await releasedFor(env.namespace, "deleted")) === deletedBefore; await new Promise((resolve) => setTimeout(resolve, 50))) {
+    assert.ok(Date.now() < deadline, "its release was not counted");
   }
 });
 
@@ -983,6 +967,7 @@ test("a bound pod whose bayma ended in it, or was started again, is released as 
   const live = { ...recorded.agents, current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/home/agent/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null) };
   const { binder, sessions } = await sessionsOf(options(env, 7290), live);
   const key = sessionKey("fs-broken");
+  const brokenBefore = await releasedFor(env.namespace, "broken");
   const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
   const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
   saved = true;
@@ -1003,7 +988,7 @@ test("a bound pod whose bayma ended in it, or was started again, is released as 
   await ending;
   for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its binding was not let go");
   assert.deepEqual(recorded.asked, [`record ${env.namespace}/fs-broken released into s-live`, `detach node-a ${env.namespace}/${bound.pod}`]);
-  assert.ok(told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "broken"));
+  assert.equal(await releasedFor(env.namespace, "broken"), brokenBefore + 1);
   // One whose pod went: released into it as its Lease is let go.
   const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-gone", namespace: env.namespace, annotations: { "alasio.dev/binding-key": sessionKey("fs-gone") } }, spec: { holderIdentity: "none-9" } };
   await Effect.runPromise(sessions.recordLost(env.none, lease));
@@ -1023,6 +1008,7 @@ test("a bound pod whose workspace its node can reach no more, as its node's moun
   const { binder, sessions } = await sessionsOf(options(env, 7291), live);
   const key = sessionKey("fs-unreachable");
   const kept = sessionKey("fs-reachable");
+  const brokenBefore = await releasedFor(env.namespace, "broken");
   const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
   const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
   const other = await Effect.runPromise(binder.bind(placement.pool, kept, await Effect.runPromise(sessions.place(kept, { environment: env.name, mode: "none" }))));
@@ -1041,14 +1027,14 @@ test("a bound pod whose workspace its node can reach no more, as its node's moun
   })();
   await Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
   await ending;
-  // Its binding let go, then its release told, once its Lease is gone.
-  const toldBroken = () => told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "broken");
-  for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null || !toldBroken(); await new Promise((resolve) => setTimeout(resolve, 100))) {
+  // Its binding let go, then its release counted, once its Lease is gone.
+  for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null || (await releasedFor(env.namespace, "broken")) === brokenBefore; await new Promise((resolve) => setTimeout(resolve, 100))) {
     assert.ok(Date.now() < deadline, "its binding was not let go as broken");
   }
   // Its node was asked once, for both.
   assert.deepEqual(recorded.asked, ["attachments node-a", `record ${env.namespace}/fs-unreachable released into s-live`, `detach node-a ${env.namespace}/${bound.pod}`]);
   assert.notEqual(await run(readLease(env.none, kept)), null);
-  assert.ok(!told.some((event) => event.kind === "workspace.released" && event.subject.key === kept));
+  // That one alone.
+  assert.equal(await releasedFor(env.namespace, "broken"), brokenBefore + 1);
   assert.notEqual(other.pod, bound.pod);
 });

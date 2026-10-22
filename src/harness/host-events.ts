@@ -19,7 +19,7 @@
 import { Context, Deferred, Duration, Effect, Layer, PubSub, Schedule, Schema, type Scope } from "effect";
 
 import { EVENTS_PATH } from "../binder/names.ts";
-import { EventsConsumer } from "../events/consume.ts";
+import { type EventHandling, EventsConsumer } from "../events/consume.ts";
 import type { Event } from "../events/events.ts";
 import { buildLostHarnessText, lostStatusText } from "../operator/lost-prompt.ts";
 import { type EventWrites, LOST_PREFIX } from "../persistence/store.ts";
@@ -84,6 +84,9 @@ export class HostEvents extends Context.Service<HostEvents, {
 /** What tells of events of `kind`: a host's kinds the gateway as of the host, the bindings' the gateway as its own. */
 const toldBy = (kind: Event["kind"]): Event["source"] => (kind === "harness.idle" || kind === "harness.background-response" ? "harness" : "sandbox-gateway");
 
+/** The kinds of the environment's events its harnesses' handling acts on (HarnessEvents.fromLog). */
+export const HOST_EVENT_KINDS = ["harness.background-response", "harness.idle", "harness.lost", "harness.released"] as const;
+
 /** Where the control plane hears its hosts' events. */
 export class HarnessEvents extends Context.Service<HarnessEvents, {
   /** Subscribes to the hosts' events, as they are heard from now on, for as long as the scope lasts. */
@@ -127,7 +130,7 @@ export class HarnessEvents extends Context.Service<HarnessEvents, {
       // Read once the turns listen, as an event handled is not handled again: none heard before
       // they subscribe, and so lost.
       const listened = yield* Deferred.make<void>();
-      yield* (yield* EventsConsumer).handle({
+      const handlers: { readonly [K in (typeof HOST_EVENT_KINDS)[number]]: EventHandling<K> } = {
         "harness.background-response": fromItsTeller((event) => told({ kind: "background-response", conversationId: event.subject.key })),
         "harness.idle": fromItsTeller((event) => told({ kind: "idle", conversationId: event.subject.key })),
         // A binding let go of, released or lost, lets go of its conversation too: what waited on it,
@@ -150,7 +153,8 @@ export class HarnessEvents extends Context.Service<HarnessEvents, {
               Effect.andThen(told({ kind: "idle", conversationId: released.subject.key })),
             )
           )(event),
-      }, Deferred.await(listened));
+      };
+      yield* (yield* EventsConsumer).handle(handlers, Deferred.await(listened));
       return HarnessEvents.of({ subscribe: PubSub.subscribe(heard).pipe(Effect.tap(() => Deferred.succeed(listened, undefined))) });
     }),
   );
