@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -113,6 +113,27 @@ test("the session panels say of Codex's threads, read from the rollouts kept in 
     const thread = (cwd: string) => run(client.startThread({ threadKey: "c1", cwd, env: buildCodexEnv(), config: NO_CONFIG }));
     /** A second between threads' last changes, so their order is the same whoever sorts them. */
     const apart = () => new Promise((resolve) => setTimeout(resolve, 1_100));
+    /**
+     * Gives the threads `[made first, made after]` files that last changed within one second, the
+     * one made first 400 ms after the other, in the second its last turn ended: on the home, which
+     * Codex lists by, and as Neon keeps them, as the mirror keeps a file's time only as its bytes
+     * change. Set, not waited for: two turns one after the other end within a second only on a
+     * machine not loaded. Each a second or more from the threads before and after, as `apart` is.
+     */
+    const tie = async ([before, after]: readonly string[]) => {
+      const fileOf = (threadId: string) => {
+        const [file] = listRolloutFiles(home).filter(({ name }) => name.includes(threadId));
+        assert.ok(file, `no rollout of ${threadId}`);
+        return file;
+      };
+      const second = Math.floor(fileOf(before!).modifiedMs / 1_000) * 1_000;
+      for (const [threadId, ms] of [[after!, second + 100], [before!, second + 500]] as const) {
+        const file = fileOf(threadId);
+        utimesSync(join(home, file.path), new Date(ms), new Date(ms));
+        const { rowCount } = await pool.query("update codex_listing.rollouts set modified_ms = $2 where name = $1", [file.name, ms]);
+        assert.equal(rowCount, 1, `Neon keeps no rollout ${file.name}`);
+      }
+    };
 
     const first = await thread(here!);
     await turn(first, "remember the heron", here!);
@@ -136,11 +157,11 @@ test("the session panels say of Codex's threads, read from the rollouts kept in 
     await apart();
     // Two whose files last changed within one second, the one made first changed last, as two turns ending at once leave them.
     const tied = [await thread(here!), await thread(here!)];
-    await new Promise((resolve) => setTimeout(resolve, 1_000 - (Date.now() % 1_000) + 10));
-    const second = Math.floor(Date.now() / 1_000);
     await turn(tied[1]!, "a tie, made after", here!);
     await turn(tied[0]!, "a tie, made before", here!);
-    assert.equal(Math.floor(Date.now() / 1_000), second, "the tied threads' turns took longer than a second");
+    await Effect.runPromise(rollouts.flush(tied[1]!));
+    await Effect.runPromise(rollouts.flush(tied[0]!));
+    await tie(tied);
     await apart();
     // One archived, as the operator archives a thread, which Codex lists no more.
     const archived = await thread(here!);
