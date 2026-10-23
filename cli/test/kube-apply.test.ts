@@ -467,26 +467,35 @@ test("the wait for the Valkeys the mount waits on and the wait for every workloa
 /** The path of the Job `name` in alasio's namespace, as the fake keeps it. */
 const jobPath = (name: string) => `/apis/batch/v1/namespaces/alasio/jobs/${name}`;
 
-/** Has the Job `name`, stuck running, complete after `ms`, as one that takes its time does. */
-function completesAfter(t: TestContext, kube: FakeKube, name: string, ms: number): void {
+/**
+ * Has the Job `name`, stuck running, complete `ms` after it is applied, as one that takes its
+ * time does: when it completed, once it has, as the apply's pace under load is the runner's.
+ */
+function completesAfter(t: TestContext, kube: FakeKube, name: string, ms: number): { completedAt: number | null } {
   kube.stuck.add(name);
-  const done = setTimeout(() => {
-    kube.stuck.delete(name);
+  const completion: { completedAt: number | null } = { completedAt: null };
+  let appliedAt: number | null = null;
+  const watching = setInterval(() => {
     const job = kube.get(jobPath(name));
-    assert.ok(job, `no Job ${name}`);
+    if (!job) return;
+    appliedAt ??= Date.now();
+    if (Date.now() - appliedAt < ms) return;
+    clearInterval(watching);
+    kube.stuck.delete(name);
     job.status = { conditions: [{ type: "Complete", status: "True", reason: "Complete", message: "" }] };
-  }, ms);
-  t.after(() => clearTimeout(done));
+    completion.completedAt = Date.now();
+  }, 10);
+  t.after(() => clearInterval(watching));
+  return completion;
 }
 
 test("what an apply does before its workloads' waits, a slow Job among it, takes nothing of the timeout those waits share", async (t) => {
   const { kube, run } = await rig(t);
-  const started = Date.now();
   // A setup taking three quarters of the timeout, and alasio ready only a while after it: past the timeout from the start, within it from the waits.
-  completesAfter(t, kube, "alasio-neon-setup", 1_500);
+  const setup = completesAfter(t, kube, "alasio-neon-setup", 1_500);
   kube.stuck.add("alasio");
   const ready = setInterval(() => {
-    if (Date.now() - started < 3_000) return;
+    if (setup.completedAt === null || Date.now() - setup.completedAt < 1_500) return;
     clearInterval(ready);
     const alasio = kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio");
     assert.ok(alasio);
@@ -494,20 +503,20 @@ test("what an apply does before its workloads' waits, a slow Job among it, takes
   }, 10);
   t.after(() => clearInterval(ready));
   await run(applyInstallation(objectsOf(), { timeout: "2 seconds", poll: "10 millis" }));
-  assert.ok(Date.now() - started >= 3_000);
+  assert.ok(setup.completedAt !== null && Date.now() - setup.completedAt >= 1_500, "alasio was ready before the test made it so");
 });
 
 test("a Valkey the mount waits for that is never ready, its wait begun well into the apply, fails it one timeout after that wait began, naming it", async (t) => {
   const { kube, run } = await rig(t);
-  completesAfter(t, kube, "alasio-neon-setup", 1_500);
+  const setup = completesAfter(t, kube, "alasio-neon-setup", 1_500);
   kube.stuck.add("alasio-valkey");
-  const started = Date.now();
   const error = await run(Effect.flip(applyInstallation(objectsOf(), { timeout: "2 seconds", poll: "10 millis" })));
-  const took = Date.now() - started;
   assert.equal(error._tag, "NotReadyInTime");
   assert.match(error.message, /^not ready within 2s, still waiting for:\n {2}StatefulSet alasio\/alasio-valkey: /u);
-  // The Job's 1.5 s, then the Valkey's whole 2 s.
-  assert.ok(took >= 3_400 && took < 5_000, `failed ${took} ms after it began`);
+  // The Valkey's whole 2 s, from the wait that began as the Job completed, and what saying why takes.
+  assert.ok(setup.completedAt !== null);
+  const waited = Date.now() - setup.completedAt;
+  assert.ok(waited >= 1_900 && waited < 3_500, `failed ${waited} ms after the Job completed`);
 });
 
 test("a workload's applied-after naming what the installation applies in another phase fails the apply, naming it; one naming what it has not waits for the rest alone", async (t) => {
