@@ -42,7 +42,6 @@ import { resourceFromAttributes } from "@opentelemetry/resources";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 
 import type { ClientRequest, RequestId, ServerNotification, v2 } from "../../.types/codex/index.js";
-import { NO_BIND_HEADER } from "../../src/binder/names.ts";
 import { ALASIO_CODEX_MODEL } from "../../src/codex/model.ts";
 import {
   agentMessage,
@@ -57,6 +56,13 @@ import {
   turnStarted,
   userMessage,
 } from "../support/codex-protocol.ts";
+
+/**
+ * The header of a request that binds nothing (src/binder/names.ts NO_BIND_HEADER), held here by
+ * its name rather than imported: the upgrade's run starts this stand-in on the source of the
+ * release before, which may have no such export.
+ */
+const NO_BIND_HEADER = "x-alasio-bind";
 
 /** What every turn answers. */
 export const ANSWER = "Answered by the end-to-end run's stand-in for Codex.";
