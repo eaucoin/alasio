@@ -49,6 +49,7 @@ import type { NetMode } from "../../src/sandbox/index.ts";
 import { BACKGROUND_REPORT, ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
 import { ANSWER } from "./codex-stand-in.ts";
 import { bindBranchSession, bindInBranch, mainSandboxService, sandboxService, serviceLogs, servesBranch } from "./sandbox-service.ts";
+import type { ReleaseSeen } from "./claude-mcp-release.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
 import type { FolderReplsRead, FolderReplsSet } from "./folder-repl.ts";
 import {
@@ -3466,6 +3467,42 @@ if (inShard("agents")) {
       // Its turns' spans, from the pod's Codex, in the lake; and its turns, from the rollouts the pod mirrored, loaded as it woke the lake's loader, as alasio, which writes none of them, does not.
       await untilInLake("span of a pooled Codex's app-server", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'turn/start'");
       await untilInLake("a pooled Codex's turn, loaded as its pod woke the loader", "select count(*) as n from codex.turns", 600_000);
+    });
+
+    test("Claude Code's MCP client, given a session's bayma once through the gateway, reaches it across the session's releases and its pod's loss in the same process; a release asked during a call waits for the call to end", { timeout: 20 * 60_000 }, async (t) => {
+      const bound = await bindSession(session);
+      // Where the pools run gVisor, a release snapshots the session, its REPL with it; elsewhere its files alone outlive it.
+      const snapshotted = (await kube.get<V1Pod>(ref("Pod", bound.name, SESSIONS)))?.spec?.runtimeClassName !== undefined;
+      const url = `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`;
+      const mark = "mcp-release-cut";
+      const running = inAlasio<ReleaseSeen>("./claude-mcp-release.ts", url, await mainToken(session), mark);
+      // The pod deleted as the cut call starts, as its mark says, a real loss mid-call.
+      const lost = (async () => {
+        await until("the call to cut to start", async () => ((await gatewayCall(await mainToken(session), "GET", `/workspace/files?path=workspace%2F${mark}`)).status === 200 ? true : undefined), 15 * 60_000);
+        const cutting = await boundPodOf(session);
+        assert.ok(cutting, "no pod was bound as the call to cut started");
+        await kube.kill(SESSIONS, cutting.name);
+      })();
+      const seen = await running;
+      await lost;
+      t.diagnostic(`Claude Code across its session's releases and loss (${snapshotted ? "snapshotted" : "no snapshot"}): ${JSON.stringify(seen)}`);
+      assert.equal(seen.pinned, true, "the SDK's own CLI, as alasio pins it");
+      assert.ok(seen.wrote.ok, seen.wrote.text);
+      assert.equal(seen.released.status, 204);
+      // The process's MCP client reaches the session bound anew, its server configured once: its file there, and, snapshotted, its REPL's value in the session it ran in.
+      assert.ok(seen.read.ok, seen.read.text);
+      assert.match(seen.read.text, /kept through the release/u);
+      if (snapshotted) {
+        assert.equal(seen.sessionAnew, false, seen.read.text);
+        assert.match(seen.read.text, /kept through the release 42/u);
+      }
+      // A release asked during a call let it end first: answered, then released.
+      assert.deepEqual([seen.inFlight.ok, seen.inFlight.releaseStatus, seen.inFlight.releasedAfter], [true, 204, true], JSON.stringify(seen.inFlight));
+      assert.match(seen.inFlight.text, /slept/u);
+      // After the pod's loss mid-call, the next call reaches the session again, its control taken
+      // over first where bayma says a call's connection, snapshotted open, holds it.
+      assert.ok(seen.after.ok, `${JSON.stringify(seen.cut)}\n${seen.after.text}`);
+      assert.match(seen.after.text, /kept through the release/u);
     });
 
     test("a pooled Codex turn calls the model through alasio's relay of its login, its token taken there, its pod's own Codex home holding no login", async () => {
