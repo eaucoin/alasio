@@ -3442,6 +3442,10 @@ if (inShard("agents")) {
       await tg.say("again");
       await tg.waitFor((call) => answered(call));
       assert.equal((await harnessPod()).metadata?.uid, bound.metadata?.uid);
+      // alasio status says it bound, idle once its turn ended, as the gateway asked its host.
+      const status = (await alasio("status")).stdout;
+      assert.match(status, /^ {2}main's bound harnesses:$/mu, status);
+      assert.match(status, new RegExp(`^ {4}telegram:\\S+ under Codex: bound to ${bound.metadata?.name ?? ""} of harness-codex for \\S+, idle( for \\S+)?$`, "mu"), status);
       // Its turns' spans, from the pod's Codex, in the lake; and its turns, from the rollouts the pod mirrored, loaded as it woke the lake's loader, as alasio, which writes none of them, does not.
       await untilInLake("span of a pooled Codex's app-server", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'turn/start'");
       await untilInLake("a pooled Codex's turn, loaded as its pod woke the loader", "select count(*) as n from codex.turns", 600_000);

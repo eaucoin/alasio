@@ -200,7 +200,12 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       poolOf: (key, options) =>
         folders && folderOfKey(key) ? folders.place(key, options) : conversationOfHarnessKey(key) ? harnesses.place(key, options) : sessions.place(key, options),
       // The folder instances' listing, where there are folder instances; the rest, the sessions'.
-      operate: (claims, operation) => (folders && /^\/folders(\/|$)/u.test(operation.path) ? folders.operate(claims, operation) : sessions.operate(claims, operation)),
+      operate: (claims, operation) =>
+        folders && /^\/folders(\/|$)/u.test(operation.path)
+          ? folders.operate(claims, operation)
+          : /^\/harnesses(\/|$)/u.test(operation.path)
+          ? harnesses.operate(claims, operation)
+          : sessions.operate(claims, operation),
       routeHeld: live.holds,
       // A workspace's token held to its conversation's harness's binding, as alasio gives one.
       grants: (key: string, held: HeldTo) => heldToHarness(key, held.key),

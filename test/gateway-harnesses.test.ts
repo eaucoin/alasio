@@ -500,3 +500,37 @@ test("what a bound host tells is told its environment's alasio as the host's, of
   assert.equal((await relay(env.home, null, "not json")).status, 400);
   assert.equal(told.length, before + 2);
 });
+
+test("the front lists an environment's bound harnesses to that environment's caller, each host asked now: its conversation, harness, pool, pod and binding's time, and a turn running, work in the background and since when idle, or why its host was not reached", async () => {
+  const env = await environment(1);
+  const stand = await host();
+  try {
+    const { binder, harnesses } = await harnessesOf(env, configOf(env.home, stand.port), agents().agents);
+    const key = harnessKey("telegram:43");
+    const placement = await Effect.runPromise(harnesses.place(key, { environment: "main", harness: "codex", workspace: "session" }));
+    const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+    const listed = async (environment = "main", path = "/harnesses") =>
+      Effect.runPromise(harnesses.operate({ key: "harnesses", options: { environment } }, { method: "GET", path, query: new URLSearchParams(), body: new Uint8Array() }));
+    stand.status = { ...IDLE, busy: true, running: true, idleSince: null };
+    stand.working = true;
+    const answered = await listed();
+    assert.equal(answered.status, 200);
+    const [harness, ...others] = (answered.json as { harnesses: { boundAt: string | null }[] }).harnesses;
+    assert.deepEqual(others, []);
+    assert.ok(harness?.boundAt && Date.now() - Date.parse(harness.boundAt) < 60_000, JSON.stringify(harness));
+    assert.deepEqual({ ...harness, boundAt: undefined }, { conversation: "telegram:43", harness: "codex", pool: "harness-codex", pod: bound.pod, boundAt: undefined, host: { running: true, background: true, idleSince: null } });
+    stand.status = { ...IDLE, idleSince: Date.parse("2026-10-23T00:00:00.000Z") };
+    stand.working = false;
+    assert.deepEqual(((await listed()).json as { harnesses: { host: object }[] }).harnesses.map(({ host: asked }) => asked), [{ running: false, background: false, idleSince: "2026-10-23T00:00:00.000Z" }]);
+    // Its host gone quiet: said so, why with it.
+    stand.close();
+    const unreached = ((await listed()).json as { harnesses: { host: { unreached?: string } }[] }).harnesses[0]?.host;
+    assert.ok(unreached?.unreached, JSON.stringify(unreached));
+    // A branch's caller is listed its own environment's, none of main's; one of no environment, nothing; and nothing else is answered here.
+    assert.deepEqual(((await listed("try")).json as { harnesses: object[] }).harnesses, []);
+    assert.equal((await listed("elsewhere")).status, 403);
+    assert.equal((await listed("main", "/harnesses/telegram:43")).status, 404);
+  } finally {
+    stand.close();
+  }
+});

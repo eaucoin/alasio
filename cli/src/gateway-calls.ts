@@ -1,18 +1,20 @@
 /**
- * The command line's calls of the sandbox gateway's front (src/gateway/sessions.ts operate),
+ * The command line's calls of the sandbox gateway's front (operate, src/binder/server.ts),
  * through a port-forward to a gateway pod of its own: each call on a connection of its own,
  * closed once answered, so its forward ends with it, with a token of the environment it is
  * of, signed by that environment's key, which stops a minute after it is made.
  */
+import type { V1Secret } from "@kubernetes/client-node";
 import { request } from "node:http";
 import { type AddressInfo, createServer, type Server, type Socket } from "node:net";
 
 import { Clock, Effect, FiberSet, Schema, type Scope } from "effect";
 
 import { mintToken } from "../../src/binder/tokens.ts";
+import { branchNamespace, MAIN_ENVIRONMENT_NAME } from "../../src/branch/names.ts";
 import { runningPodIn } from "./commands/common.ts";
-import { KubeApi } from "./kube/api.ts";
-import { NAMESPACE } from "./manifests/common.ts";
+import { kind, KubeApi, type KubeApiError } from "./kube/api.ts";
+import { NAMESPACE, SESSIONS_CALLER_SECRET } from "./manifests/common.ts";
 import { GATEWAY_COMPONENT, GATEWAY_PORT } from "./manifests/sandbox-gateway.ts";
 
 /** The gateway could not be reached, or a call of it not made; the reason says why. */
@@ -85,3 +87,15 @@ export const gatewayCalls: Effect.Effect<
       });
     });
 });
+
+/** Calls the gateway as the environment `environment`, main or a branch, for `key`, with the caller key its namespace keeps: what it answered. */
+export const callAs = (environment: string, key: string, method: GatewayCall["method"], path: string): Effect.Effect<GatewayAnswer, GatewayUnreached | KubeApiError, KubeApi> =>
+  Effect.gen(function*() {
+    const kube = yield* KubeApi;
+    const namespace = environment === MAIN_ENVIRONMENT_NAME ? NAMESPACE : branchNamespace(environment);
+    const secret = yield* kube.get<V1Secret>({ ...kind("Secret"), namespace, name: SESSIONS_CALLER_SECRET });
+    const callerKey = secret?.data?.["caller-key"];
+    if (!callerKey) return yield* new GatewayUnreached({ reason: `${SESSIONS_CALLER_SECRET} holds no caller key of ${environment}'s` });
+    const call = yield* gatewayCalls;
+    return yield* call({ callerKey: Buffer.from(callerKey, "base64"), environment, key, method, path });
+  }).pipe(Effect.scoped);

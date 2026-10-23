@@ -4,15 +4,13 @@
  * `alasio folder restart`, which lets a conversation's instances go, saved whole, so its next
  * message makes them anew. Each asked by main's token, signed by main's own key.
  */
-import type { V1Secret } from "@kubernetes/client-node";
 import { Effect, Schema } from "effect";
 
 import { CLAUDE_HARNESS, CODEX_HARNESS, harnessDisplayName } from "../../src/harness/names.ts";
 import { folderKey } from "../../src/gateway/names.ts";
 import { MAIN_ENVIRONMENT_NAME } from "../../src/branch/names.ts";
-import { gatewayCalls, type GatewayCall, GatewayUnreached } from "./gateway-calls.ts";
-import { kind, KubeApi, type KubeApiError } from "./kube/api.ts";
-import { NAMESPACE, SESSIONS_CALLER_SECRET } from "./manifests/common.ts";
+import { callAs, type GatewayCall, GatewayUnreached } from "./gateway-calls.ts";
+import type { KubeApi, KubeApiError } from "./kube/api.ts";
 
 /** A folder instance, as the gateway lists it. */
 const FolderInstance = Schema.Struct({
@@ -28,15 +26,7 @@ export type FolderInstance = typeof FolderInstance.Type;
 const Listed = Schema.Struct({ folders: Schema.Array(FolderInstance) });
 
 /** Calls the gateway as main, for `key`: what it answered. */
-const asMain = (key: string, method: GatewayCall["method"], path: string) =>
-  Effect.gen(function*() {
-    const kube = yield* KubeApi;
-    const secret = yield* kube.get<V1Secret>({ ...kind("Secret"), namespace: NAMESPACE, name: SESSIONS_CALLER_SECRET });
-    const callerKey = secret?.data?.["caller-key"];
-    if (!callerKey) return yield* new GatewayUnreached({ reason: `${SESSIONS_CALLER_SECRET} holds no caller key of main's` });
-    const call = yield* gatewayCalls;
-    return yield* call({ callerKey: Buffer.from(callerKey, "base64"), environment: MAIN_ENVIRONMENT_NAME, key, method, path });
-  }).pipe(Effect.scoped);
+const asMain = (key: string, method: GatewayCall["method"], path: string) => callAs(MAIN_ENVIRONMENT_NAME, key, method, path);
 
 /** The folder instances, bound or whose last bind failed, as the gateway lists them; or why they could not be read. */
 export type FolderListing = { readonly listed: readonly FolderInstance[] } | { readonly unread: string };
@@ -48,7 +38,7 @@ export const folderInstances: Effect.Effect<FolderListing, never, KubeApi> = asM
 );
 
 /** How long ago `at` was, of `now`, as people say it: in seconds, minutes, hours, or days. */
-function ago(at: string, now: number): string {
+export function ago(at: string, now: number): string {
   const seconds = Math.max(0, Math.round((now - Date.parse(at)) / 1000));
   if (seconds < 120) return `${seconds}s`;
   const minutes = Math.round(seconds / 60);

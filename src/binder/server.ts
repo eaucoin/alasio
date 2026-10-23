@@ -22,9 +22,10 @@
  *   the bindings' Leases are watched; 503 with a Retry-After while whether it is held is not
  *   known yet, and 401 once it is gone.
  * - `GET /healthz`: 200 once it serves, asked without a token.
- * - `/workspace`, `/snapshots` and `/folders`, and what is under them: what the front answers itself of
- *   the token's key, beyond binding it, or of its caller, as `operate` says, such as the files
- *   of what the key binds; its body of MAX_OPERATION_BYTES at most (413 past it).
+ * - `/workspace`, `/snapshots`, `/folders` and `/harnesses`, and what is under them: what the
+ *   front answers itself of the token's key, beyond binding it, or of its caller, as `operate`
+ *   says, such as the files of what the key binds; its body of MAX_OPERATION_BYTES at most
+ *   (413 past it).
  * - anything else: passed to the pod the token's key is bound to, the key bound first where
  *   it is not (./proxy.ts), but for a request that says it must bind nothing (NO_BIND_HEADER
  *   `never`), as one that reads what a binding has, answered 409 `{ "bound": false }` where the
@@ -80,8 +81,8 @@ const CLOCKS_APART_MS = 5 * 60_000;
 /** The most a request the front answers itself may carry: a file of a workspace's, as its node agent writes one, with room. */
 export const MAX_OPERATION_BYTES = 64 * 1024 ** 2;
 
-/** The paths of the requests the front answers itself (`operate`): /workspace, /snapshots and /folders, and what is under them. */
-const OPERATED = /^\/(workspace|snapshots|folders)(\/|$)/u;
+/** The paths of the requests the front answers itself (`operate`): /workspace, /snapshots, /folders and /harnesses, and what is under them. */
+const OPERATED = /^\/(workspace|snapshots|folders|harnesses)(\/|$)/u;
 /** Where a caller asks the front to bind its token's key ahead of any request. */
 const BIND_PATH = "/bind";
 /** Where a caller asks the front to release its token's key's binding. */
@@ -108,7 +109,7 @@ const FILES_PATH = "/workspace/files";
  */
 const heldMayAsk = (method: string, path: string): boolean => !answeredByFront(path) || (path === FILES_PATH && (method === "GET" || method === "PUT"));
 
-/** A caller's request the front answers itself (`operate`): its method, its path, under /workspace, /snapshots or /folders, its query, and its body. */
+/** A caller's request the front answers itself (`operate`): its method, its path, under /workspace, /snapshots, /folders or /harnesses, its query, and its body. */
 export interface Operation {
   readonly method: string;
   readonly path: string;
@@ -194,7 +195,7 @@ export interface BinderServerOptions {
   readonly poolOf: (key: string, options: Readonly<Record<string, string>>) => Effect.Effect<Placement, PlacementRefused>;
   /** The addresses (`host:port`) of the binder's other replicas. */
   readonly peers?: () => Effect.Effect<readonly string[]>;
-  /** What the front answers itself of a caller's key, or its caller, as its token says them, under /workspace, /snapshots and /folders; none where it answers nothing. */
+  /** What the front answers itself of a caller's key, or its caller, as its token says them, under /workspace, /snapshots, /folders and /harnesses; none where it answers nothing. */
   readonly operate?: (claims: TokenClaims, operation: Operation) => Effect.Effect<Answer>;
   /**
    * Whether the binding `binding` of `key`, its Lease's uid in `namespace`, is held now, as the

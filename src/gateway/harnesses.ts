@@ -34,6 +34,11 @@
  * The pools are those of main's environment and of each branch environment that has them: one
  * made before the installation turned harness pools on has none, nor the gateway's Role in its
  * namespace, and is passed over, said so, until it is made again.
+ *
+ * Its front lists an environment's bound harnesses to that environment's caller (`GET
+ * /harnesses`, operate), as `alasio status` says them: each one's conversation, harness, pool and
+ * pod, since when it is bound, and what its host says now of a turn running, of work in the
+ * background, and since when nothing has gone on in it, or why its host could not be asked.
  */
 import type { V1Pod } from "@kubernetes/client-node";
 import { Cause, Clock, Effect, Exit, Option, Schema } from "effect";
@@ -41,9 +46,9 @@ import { Cause, Clock, Effect, Exit, Option, Schema } from "effect";
 import { type Binder, BindStepFailed } from "../binder/binder.ts";
 import { type BindingLease, heldLeases } from "../binder/bindings.ts";
 import { BINDING_LABEL, KEY_ANNOTATION, type Pool, POOL_LABEL } from "../binder/names.ts";
-import { type Answer, type Placement, PlacementRefused } from "../binder/server.ts";
+import { type Answer, type Operation, type Placement, PlacementRefused } from "../binder/server.ts";
 import { IDLE_POLL_MS, type Idleness, lingered, makeSweep, notIdle } from "../binder/sweep.ts";
-import { bindingToken, type HeldTo } from "../binder/tokens.ts";
+import { bindingToken, type HeldTo, type TokenClaims } from "../binder/tokens.ts";
 import { branchNamespace } from "../branch/names.ts";
 import type { EventInput, Events } from "../events/events.ts";
 import type { HarnessStatus } from "../harness/host.ts";
@@ -108,6 +113,23 @@ export interface Harnesses {
   readonly lost: (pool: Pool, lease: BindingLease) => Effect.Effect<void>;
   /** What the bound host of the binding `bound` tells, `body`, told its environment's alasio, as relayed says: how it is answered. */
   readonly relay: (bound: HeldTo, body: Uint8Array) => Effect.Effect<Answer>;
+  /** What the front answers a caller of an environment itself, under /harnesses: its bound harnesses (`GET /harnesses`), as the module says. */
+  readonly operate: (claims: TokenClaims, operation: Operation) => Effect.Effect<Answer>;
+}
+
+/**
+ * A bound harness, as the front lists it: its conversation and harness, the pool and pod it is
+ * bound in, since when, and, as its host says now, whether a turn runs in it, whether its
+ * harness works in the background, and since when nothing has gone on in it; or why its host
+ * could not be asked.
+ */
+export interface ListedHarness {
+  readonly conversation: string;
+  readonly harness: string;
+  readonly pool: string;
+  readonly pod: string;
+  readonly boundAt: string | null;
+  readonly host: { readonly running: boolean; readonly background: boolean; readonly idleSince: string | null } | { readonly unreached: string };
 }
 
 /** The kinds of event a bound host tells of its harness (../harness/host-events.ts). */
@@ -450,5 +472,45 @@ export const makeHarnesses = Effect.fnUntraced(function*(
       return yield* relayed(conversation, body, ({ kind, subject }) => events.tell({ kind, environment, source: "harness", subject }));
     });
 
-  return { place, pools, namespaces, ownsNamespace, sweep, live, lost, relay };
+  /** Each pool's harness, by the pool's name, as the configuration names them. */
+  const harnessOfPool = new Map<string, string>([...Object.entries(config.pools), ...Object.entries(config.folders?.pools ?? {})].map(([harness, pool]) => [pool, harness]));
+  /** The bound harnesses of `environment`'s pools, each host asked now, at once, as the module says. */
+  const listOf = (environment: string): Effect.Effect<readonly ListedHarness[], KubeApiError> =>
+    Effect.gen(function*() {
+      const of = [...sessionPools(environment), ...(environment === main ? folderPools : [])];
+      const listed = yield* Effect.forEach(of, (pool) =>
+        Effect.flatMap(Effect.provideService(heldLeases(pool), KubeClient, kube), (leases) =>
+          Effect.forEach(leases, (lease) =>
+            Effect.gen(function*() {
+              const key = lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
+              const conversation = conversationOfHarnessKey(key) ?? key;
+              const name = lease.spec?.holderIdentity ?? "";
+              const pod = (yield* kube.read("v1", "Pod", pool.namespace, name)) as V1Pod | null;
+              const host = pod ? hostOf(lease, pod) : null;
+              const asked = host
+                ? yield* Effect.all([host.status(conversation), host.backgroundWork(conversation)]).pipe(
+                  Effect.timeoutOrElse({ duration: ASK_TIMEOUT_MS, orElse: () => Effect.fail(new HarnessHostError({ reason: `it did not answer within ${ASK_TIMEOUT_MS / 1000} s` })) }),
+                  Effect.map(([status, background]): ListedHarness["host"] => ({ running: status.running, background, idleSince: status.idleSince === null ? null : new Date(status.idleSince).toISOString() })),
+                  Effect.catch((error) => Effect.succeed<ListedHarness["host"]>({ unreached: error.message })),
+                )
+                : { unreached: pod ? "its pod has no address" : "its pod is gone" };
+              const created = lease.metadata?.creationTimestamp;
+              return { conversation, harness: harnessOfPool.get(pool.name) ?? "", pool: pool.name, pod: name, boundAt: created ? new Date(created).toISOString() : null, host: asked } satisfies ListedHarness;
+            }), { concurrency: "unbounded" })), { concurrency: "unbounded" });
+      return listed.flat();
+    });
+
+  /** `GET /harnesses` of the caller's environment, as the module says; 403 to one of no environment there is, and 404 to anything else under /harnesses. */
+  const operate = (claims: TokenClaims, { method, path }: Operation): Effect.Effect<Answer> =>
+    Effect.gen(function*() {
+      const named = claims.options?.["environment"];
+      const environment = named === undefined ? null : yield* environments.named(named);
+      if (!environment) return { status: 403, json: { error: `there is no environment ${named ?? "named"}` } };
+      if (method !== "GET" || path !== "/harnesses") return { status: 404, json: { error: `no ${method} ${path}` } };
+      // A branch made before the harness pools were turned on has none, nor the gateway's Role there.
+      const pooled = environment.name === main || (yield* hasPools(environment.name));
+      return { status: 200, json: { harnesses: pooled ? yield* listOf(environment.name) : [] } };
+    }).pipe(Effect.catch((error) => Effect.succeed({ status: 503, json: { error: `the bound harnesses could not be read: ${error.message}` } })));
+
+  return { place, pools, namespaces, ownsNamespace, sweep, live, lost, relay, operate };
 });

@@ -16,6 +16,7 @@ import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, re
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
 import { diagnose, READY_ONCE_BOUND_ANNOTATION, readinessOf, selectorOf, starting } from "../kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE } from "../manifests/common.ts";
+import { HARNESS_POOLS } from "../manifests/harness-pools.ts";
 import { LOADER_COMPONENT } from "../manifests/lake.ts";
 import { REPLICA_NAME } from "../manifests/neon.ts";
 import { MASTER, METRICS_PORT, VOLUME_SERVER } from "../manifests/object-store.ts";
@@ -26,11 +27,12 @@ import { describeReplication, describeVolumeServer, volumeServerDisk } from "../
 import { type ComputeTimes, computeTimes, type TenantView, tenantView } from "../branches.ts";
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
 import { branchNamespaces } from "../branches.ts";
+import { describeHarnesses, harnessesOf } from "../bound-harnesses.ts";
 import { describeFolders, folderInstances } from "../folders.ts";
 import { installConfig } from "../install.ts";
 import { readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "../secrets.ts";
 import { describeBots, type EnvironmentBot } from "../webhook.ts";
-import { branchNamespace } from "../../../src/branch/names.ts";
+import { branchNamespace, MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
 import { ALASIO_GATEWAY_FOLDERS_VARIABLE } from "../../../src/gateway/names.ts";
 import { notRunning, runIn, runningPodIn } from "./common.ts";
 
@@ -54,6 +56,9 @@ export class DeliveriesFailing extends Schema.TaggedError<DeliveriesFailing>()("
     return `Telegram does not deliver to the webhook intake as it should: ${this.fixes.join("; ")}`;
   }
 }
+
+/** The harness pools of session conversations, which every environment with harness pools has. */
+const SESSION_HARNESS_POOLS: ReadonlySet<string> = new Set(Object.values(HARNESS_POOLS));
 
 /** What `look` finds, or none where this kubeconfig's rights do not reach it. */
 const seen = <A>(look: Effect.Effect<A, KubeApiError, KubeApi>): Effect.Effect<Option.Option<A>, KubeApiError, KubeApi> =>
@@ -403,6 +408,14 @@ export const status = Command.make("status", {}, () =>
         if (alasio?.spec?.template.spec?.containers.some(({ env }) => env?.some(({ name, value }) => name === ALASIO_GATEWAY_FOLDERS_VARIABLE && value === "1"))) {
           for (const line of describeFolders(yield* folderInstances, Date.now())) yield* Console.log(`  ${line}`);
         }
+        // Each environment's bound harnesses, of those whose namespace has harness pools: main's, and each branch's made since they were turned on.
+        const pooled = new Set(workloads.filter((object) => object.kind === "Deployment" && SESSION_HARNESS_POOLS.has(object.metadata?.name ?? "")).map(({ metadata }) => metadata?.namespace));
+        const branches = pooled.size === 0 ? [] : yield* branchNamespaces.pipe(Effect.catchIf(hasStatus(403), () => Effect.succeed([])));
+        const harnessed = [...(pooled.has(NAMESPACE) ? [MAIN_ENVIRONMENT_NAME] : []), ...branches.filter((name) => pooled.has(branchNamespace(name))).sort()];
+        const listings = yield* Effect.forEach(harnessed, harnessesOf, { concurrency: "unbounded" });
+        for (const [index, environment] of harnessed.entries()) {
+          for (const line of describeHarnesses(environment, listings[index] ?? { unread: "not asked" }, Date.now())) yield* Console.log(`  ${line}`);
+        }
         const tenant = yield* tenantView;
         if (tenant) for (const line of describeTenant(tenant)) yield* Console.log(line);
         if (listed.some(({ whole }) => !whole)) {
@@ -443,7 +456,9 @@ export const status = Command.make("status", {}, () =>
         "its Deployment's progress deadline), or what it is at and " +
         "why; its replicas, and its scale where KEDA moves it; and its pods' requests, beside " +
         "what VPA recommends once it has measured them; the CPU baseline sessions are held to, and the nodes that lack it, and the gVisor releases kept, with the snapshots naming each; where the sandbox gateway serves folder conversations' instances, each, " +
-        "bound or released, its pod, how long it has been bound, its bayma's last exec, and its binds' last failure, and whether three in a row hold it until asked. Of the bundled object store, the copies it keeps of each object, and of each " +
+        "bound or released, its pod, how long it has been bound, its bayma's last exec, and its binds' last failure, and whether three in a row hold it until asked; each environment's bound conversation harnesses, " +
+        "the pod and pool each is bound in, for how long, and whether its host says a turn runs in it, its harness works in the background, " +
+        "or since when it has been idle, or why its host was not reached. Of the bundled object store, the copies it keeps of each object, and of each " +
         "volume server, as its metrics say: what it may still fill of its disk before it takes no more writes, what it keeps " +
         "free (minFreeSpace), its volumes, and what they take, deleted and not yet compacted away. Then the memory the cluster's pods request and use, of what its nodes have " +
         "for pods, and whether a metrics server measures them, which VPA and what scales on CPU need; of these, what the kubeconfig's " +
