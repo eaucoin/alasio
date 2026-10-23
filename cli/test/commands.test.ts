@@ -211,10 +211,12 @@ async function initialize({ alasio, home, kubeconfig }: Rig): Promise<void> {
   succeeded(await alasio(["init", "--non-interactive", "--kubeconfig", kubeconfig, "--bot-token-file", tokenFile, "--claude-token-file", claudeFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--no-up"]));
 }
 
-/** alasio initialized and up, in the cluster the kubeconfig reaches. */
+/** alasio initialized and up, in the cluster the kubeconfig reaches, of one alasio, as a box holds it, which no KEDA of the rig's scales. */
 async function installed(t: TestContext): Promise<Rig> {
   const setup = await rig(t);
   await initialize(setup);
+  const initialized = setup.config() as { readonly install: { readonly alasio: object } };
+  setup.configure({ ...initialized, install: { ...initialized.install, alasio: { ...initialized.install.alasio, scaling: { min: 1, max: 1 } } } });
   succeeded(await setup.alasio(["up"]));
   return setup;
 }

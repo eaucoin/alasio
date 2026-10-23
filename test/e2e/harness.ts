@@ -665,6 +665,8 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       },
       // The release before's as much as the box's asks for.
       resources: { requests: { cpu: "50m", memory: of === "previous" ? "2560Mi" : "256Mi" } },
+      // One, as the suites reach its pod as one, but where the agents shard makes its scale a range and fixes it again.
+      ...(of === "release" ? { scaling: { min: 1, max: 1 } } : {}),
       ...on("agent-1"),
     },
     // The release before's folder instances let go after four hours idle, as the box's configuration says.

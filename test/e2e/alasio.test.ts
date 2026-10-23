@@ -3769,6 +3769,78 @@ if (inShard("agents")) {
       assert.equal((await folderChatPod()).metadata?.labels?.["alasio.dev/pool"], "harness-claude");
     });
   });
+
+  // Here, where the run's conversations' harnesses are let go of once idle, so nothing keeps alasio awake but what waits.
+  describe("alasio, its scale made a range from none and fixed again", () => {
+    before(async () => {
+      telegram = await forward(TELEGRAM);
+      tg = operator(telegram.base);
+    });
+
+    after(() => {
+      telegram?.close();
+    });
+
+    const alasioDeployment = () => kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE));
+    /** Brings alasio up with its scale `scaling`, KEDA letting it sleep `cooldownSeconds` after nothing waited. */
+    const upScaled = async (scaling: { min: number; max: number }, cooldownSeconds = 300) => {
+      const { configFile } = paths();
+      const config = JSON.parse(readFileSync(configFile, "utf8"));
+      config.install.alasio.scaling = scaling;
+      config.install.alasio.cooldownSeconds = cooldownSeconds;
+      writeFileSync(configFile, JSON.stringify(config));
+      await alasioOk("up", "--timeout", "20m");
+    };
+    /** How many calls the stand-in has recorded: the mark of what is sent after. */
+    const callsMark = async () => ((await (await fetch(`${telegram?.base}/control/calls`)).json()) as CallsListing).total;
+    /** How many of the operator's prompts were answered since `mark`. */
+    const answeredSince = async (mark: number) =>
+      ((await (await fetch(`${telegram?.base}/control/calls?since=${mark}`)).json()) as CallsListing).calls.filter((call) => answered(call)).length;
+    /** Says a prompt as the operator and waits until it is answered, the `count`th answer since `mark`. */
+    const askAnswered = async (mark: number, count: number, timeoutMs = 300_000) => {
+      await tg.say("hello");
+      await until(`answer ${count}`, async () => ((await answeredSince(mark)) >= count ? true : undefined), timeoutMs);
+    };
+
+    test("two alasios answer each of a chat's prompts once, as an update rolls a new one out beside each old", { timeout: 40 * 60_000 }, async () => {
+      await upScaled({ min: 2, max: 2 });
+      await until("two alasios ready", async () => (((await alasioDeployment())?.status?.readyReplicas ?? 0) === 2 ? true : undefined), 600_000);
+      assert.deepEqual((await alasioDeployment())?.spec?.strategy, { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } });
+      await tg.say("/service codex");
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      const mark = await callsMark();
+      for (let count = 1; count <= 3; count += 1) await askAnswered(mark, count);
+      // Rolled out as the prompts go on, each conversation then driven by the alasio that takes its claim.
+      const rolling = alasioOk("restart");
+      for (let count = 4; count <= 6; count += 1) await askAnswered(mark, count, 600_000);
+      await rolling;
+      // Each once: none run again by the other, or by the new.
+      await sleep(30_000);
+      assert.equal(await answeredSince(mark), 6);
+    });
+
+    test("KEDA lets alasio sleep once nothing waited for its cooldown, and wakes it on an update, which it answers once", { timeout: 40 * 60_000 }, async () => {
+      await upScaled({ min: 0, max: 2 }, 30);
+      // Once its conversations' harnesses are let go of, idle, and nothing else waits on it.
+      await until("alasio asleep", async () => ((await alasioDeployment())?.spec?.replicas === 0 ? true : undefined), 20 * 60_000);
+      const mark = await callsMark();
+      await askAnswered(mark, 1, 10 * 60_000);
+      assert.ok(((await alasioDeployment())?.spec?.replicas ?? 0) >= 1);
+      await sleep(30_000);
+      assert.equal(await answeredSince(mark), 1);
+    });
+
+    test("ends at one, of a fixed count again, which KEDA no longer scales, an update stopping the old before the new", { timeout: 30 * 60_000 }, async () => {
+      await upScaled({ min: 1, max: 1 });
+      assert.equal(await kube.get(ref("ScaledObject", RELEASE, NAMESPACE)), null);
+      await until("one alasio ready", async () => {
+        const deployment = await alasioDeployment();
+        return deployment?.spec?.replicas === 1 && deployment.status?.readyReplicas === 1 ? true : undefined;
+      }, 600_000);
+      assert.deepEqual((await alasioDeployment())?.spec?.strategy, { type: "Recreate" });
+      await askAnswered(await callsMark(), 1);
+    });
+  });
 }
 
 if (inShard("branches")) {
