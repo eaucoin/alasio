@@ -1,8 +1,7 @@
 /**
  * What the operator's panels reach of a conversation's harness, alasio running none
  * (src/harness/panels.ts): the sessions of the conversation's workspace alone, read from where
- * Neon keeps them, as the panels showed them when harnesses ran in alasio's process; and a
- * rewind's fork, and a thread's goals, of the conversation's own pod.
+ * Neon keeps them; and a rewind's fork, and a thread's goals, of the conversation's own pod.
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";

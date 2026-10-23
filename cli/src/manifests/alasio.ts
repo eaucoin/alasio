@@ -166,7 +166,6 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     { name: "HOME", value: home },
     // A home of alasio's own does not outlast its pod; the operator's keeps their login.
     ...(operatorHome ? [] : [{ name: "ALASIO_KEEP_CODEX_LOGIN", value: "1" }]),
-    { name: "ALASIO_DEPLOYMENT", value: RELEASE },
     { name: "ALASIO_NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
     { name: "ALASIO_POD", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
     { name: "TELEGRAM_BOT_TOKEN", valueFrom: { secretKeyRef: { name: alasio.telegram.existingSecret, key: "token" } } },

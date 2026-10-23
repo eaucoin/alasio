@@ -1,10 +1,10 @@
 /**
  * Claude Code as alasio's tests see it. Faking the CLI process is not worth it, so the
  * stand-in is at the narrowest seam alasio has, the query it starts through the Agent SDK
- * (ClaudeQueryFactory): in alasio's process, `bridgedQueryFactory` starts each query as a
- * connection to the test's socket, relaying the prompts alasio pushes and the interrupts it
- * makes; in the test, FakeClaude hands each query to the test, which emits what Claude
- * Code would.
+ * (ClaudeQueryFactory): in the harness host of the stand-in pools, `bridgedQueryFactory`
+ * starts each query as a connection to the test's socket, relaying the prompts alasio pushes and
+ * the interrupts it makes; in the test, FakeClaude hands each query to the test, which emits what
+ * Claude Code would.
  */
 import { type Server, type Socket, connect, createServer } from "node:net";
 import { createInterface } from "node:readline";

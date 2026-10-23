@@ -13,13 +13,6 @@ export function unwrapShellCommand(command: string): string {
   return innerCommand?.trim() || trimmed;
 }
 
-export function unwrapShellCommandOnce(command: string): string | null {
-  const trimmed = command.trim();
-  const match = SHELL_WRAPPER_PATTERN.exec(trimmed);
-  const innerCommand = match?.[2] ?? match?.[3];
-  return innerCommand?.trim() ?? null;
-}
-
 export function tokenizeShellCommand(command: string): string[] {
   const tokens: string[] = [];
   let current = "";

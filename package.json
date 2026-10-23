@@ -11,7 +11,6 @@
   "main": "src/index.ts",
   "scripts": {
     "start": "node ./src/index.ts",
-    "doctor:telegram": "node ./src/telegram/doctor.ts",
     "typecheck": "node tooling/codex-protocol-types.ts && tsc -p .",
     "test": "node --test test/*.test.ts cli/test/*.test.ts",
     "test:e2e": "node --test --test-timeout=1800000 test/e2e/alasio.test.ts"
@@ -34,7 +33,6 @@
     "@platformatic/kafka": "2.14.0",
     "@smithy/hash-node": "4.5.2",
     "@smithy/signature-v4": "5.7.4",
-    "dotenv": "^16.4.0",
     "effect": "4.0.0",
     "import-in-the-middle": "^3.5.2",
     "pg": "^8.23.0"

@@ -118,9 +118,6 @@ function pinnedMap(expression: string, expected: PinnedMap, defaults: Readonly<R
   ].join(" && ");
 }
 
-/** The name the ServiceAccount of the alasio of the namespace `namespace` asks as. */
-export const alasioAccount = (namespace: string) => `system:serviceaccount:${namespace}:${RELEASE}`;
-
 /** Whether the request is by main's alasio or a branch environment's, as CEL. */
 const BY_ANY_ALASIO = `request.userInfo.username.matches('^system:serviceaccount:(${NAMESPACE}|${branchNamespace("")}[a-z0-9-]+):${RELEASE}$')`;
 

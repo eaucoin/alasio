@@ -15,9 +15,8 @@
  *   Codex login (../codex/login-refresh.ts); Claude Code's as its CLI lists them, once for the
  *   process's life, as the CLI is pinned with the release.
  *
- * What each panel shows of a workspace is what it showed when harnesses ran in alasio's process:
- * the sessions of its folder's project, or of its session filesystem's directory, and no
- * conversation's beyond them.
+ * What each panel shows of a workspace is the sessions of its folder's project, or of its session
+ * filesystem's directory, and no conversation's beyond them.
  */
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
