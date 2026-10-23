@@ -2404,7 +2404,7 @@ if (inShard("telemetry")) {
         assert.equal((await api("/api/health")).status, 200);
         assert.deepEqual((await api("/api/datasources/uid/lake/health")).body, { message: "Health check successful", status: "OK" });
         const dashboards = (await api("/api/search?type=dash-db")).body as { title: string; folderTitle: string }[];
-        assert.deepEqual(dashboards.map(({ folderTitle, title }) => `${folderTitle}/${title}`).sort(), ["alasio/Agents", "alasio/Conversations", "alasio/Stack health"]);
+        assert.deepEqual(dashboards.map(({ folderTitle, title }) => `${folderTitle}/${title}`).sort(), ["alasio/Agents", "alasio/Conversations", "alasio/Harnesses", "alasio/Stack health"]);
         // The Stack health dashboard's tables of services and of the object store's volume servers, as their panels query them.
         const stack: { panels: { title: string; targets?: object[] }[] } = JSON.parse(readFileSync(new URL("../../neon/grafana/dashboards/stack-health.json", import.meta.url), "utf8"));
         // Each as Grafana's browser sends it: it fills in ${__interval_ms} (a minute here, the scrape's), which /api/ds/query

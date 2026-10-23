@@ -1,0 +1,889 @@
+{
+  "uid": "alasio-harnesses",
+  "title": "Harnesses",
+  "description": "The conversations' harnesses as the sandbox gateway binds and releases them in their pools, from its metrics; and the turns alasio ran again as their harness instance was lost under them, and how long a turn took to its harness's first output, from alasio's. Main's, or a branch environment's, as Branch chooses.",
+  "tags": [
+    "alasio"
+  ],
+  "editable": false,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "timezone": "",
+  "schemaVersion": 41,
+  "templating": {
+    "list": [
+      {
+        "name": "branch",
+        "label": "Branch",
+        "type": "query",
+        "datasource": {
+          "type": "yesoreyeram-infinity-datasource",
+          "uid": "lake"
+        },
+        "query": {
+          "queryType": "infinity",
+          "refId": "variable",
+          "infinityQuery": {
+            "refId": "A",
+            "datasource": {
+              "type": "yesoreyeram-infinity-datasource",
+              "uid": "lake"
+            },
+            "type": "json",
+            "source": "url",
+            "parser": "backend",
+            "format": "table",
+            "url": "/query",
+            "url_options": {
+              "method": "POST",
+              "body_type": "raw",
+              "body_content_type": "text/plain",
+              "data": "select * from (\nselect 'main' as __text, 'main' as __value\nunion\nselect distinct ResourceAttributes['alasio.branch'], ResourceAttributes['alasio.branch']\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] is not null and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})\n) order by __value <> 'main', __value"
+            },
+            "root_selector": "",
+            "columns": [
+              {
+                "selector": "__text",
+                "text": "__text",
+                "type": "string"
+              },
+              {
+                "selector": "__value",
+                "text": "__value",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "refresh": 2,
+        "description": "main, or a branch environment (alasio branch): its harness pools, in its own namespace, and its alasio's turns, whose telemetry is tagged alasio.branch.",
+        "current": {
+          "text": "main",
+          "value": "main"
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Binds",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Binds",
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "description": "Conversations' harnesses bound in the time range, of every harness pool of the environment's.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select coalesce(sum(added_count), 0) as binds\nfrom (\nselect TimeUnix, Attributes, Sum - coalesce(lag(Sum) over series, 0) as added_sum, Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count\nfrom otel.metrics_histogram where MetricName = 'alasio.binder.bind.duration' and ServiceName = 'alasio-sandbox-gateway' and Attributes['alasio.binder.pool'] like 'harness-%' and Attributes['k8s.namespace.name'] = if(${branch:sqlstring} = 'main', 'alasio', 'alasio-branch-' || ${branch:sqlstring}) and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added_count > 0"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "binds",
+              "text": "binds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Mean bind time",
+      "gridPos": {
+        "x": 6,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "description": "How long a harness's bind took on average in the time range, from its bind asked to its host serving.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select sum(added_sum) / sum(added_count) as seconds\nfrom (\nselect TimeUnix, Attributes, Sum - coalesce(lag(Sum) over series, 0) as added_sum, Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count\nfrom otel.metrics_histogram where MetricName = 'alasio.binder.bind.duration' and ServiceName = 'alasio-sandbox-gateway' and Attributes['alasio.binder.pool'] like 'harness-%' and Attributes['k8s.namespace.name'] = if(${branch:sqlstring} = 'main', 'alasio', 'alasio-branch-' || ${branch:sqlstring}) and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added_count > 0"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "seconds",
+              "text": "seconds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Bindings lost",
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "description": "Bindings let go of as their pod went while they were bound: lost, deleted by other than the sandbox gateway, or its host ended.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select coalesce(sum(added), 0) as lost\nfrom (\nselect TimeUnix, Attributes, Value - coalesce(lag(Value) over series, 0) as added\nfrom otel.metrics_sum where MetricName = 'alasio.gateway.releases' and ServiceName = 'alasio-sandbox-gateway' and Attributes['alasio.binder.pool'] like 'harness-%' and Attributes['k8s.namespace.name'] = if(${branch:sqlstring} = 'main', 'alasio', 'alasio-branch-' || ${branch:sqlstring}) and Attributes['alasio.gateway.release.reason'] in ('lost', 'deleted', 'broken') and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added > 0"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "lost",
+              "text": "lost",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Turns run again",
+      "gridPos": {
+        "x": 18,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "description": "Turns alasio ran again, once, as their harness instance was lost under them.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select coalesce(sum(added), 0) as turns\nfrom (\nselect TimeUnix, Attributes, Value - coalesce(lag(Value) over series, 0) as added\nfrom otel.metrics_sum where MetricName = 'alasio.harness.recoveries' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and Attributes['alasio.harness.recovery.outcome'] = 'staged' and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added > 0"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "turns",
+              "text": "turns",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Bind time",
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "description": "How long the sandbox gateway took to bind a conversation's harness, by its pool and how its pod came: warm, a free pod claimed at once; cold, waited for as its pool was scaled.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['alasio.binder.pool'] || ', ' || Attributes['alasio.binder.start'] as bind, sum(added_sum) / sum(added_count) as seconds\nfrom (\nselect TimeUnix, Attributes, Sum - coalesce(lag(Sum) over series, 0) as added_sum, Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count\nfrom otel.metrics_histogram where MetricName = 'alasio.binder.bind.duration' and ServiceName = 'alasio-sandbox-gateway' and Attributes['alasio.binder.pool'] like 'harness-%' and Attributes['k8s.namespace.name'] = if(${branch:sqlstring} = 'main', 'alasio', 'alasio-branch-' || ${branch:sqlstring}) and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added_count > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "bind",
+              "text": "bind",
+              "type": "string"
+            },
+            {
+              "selector": "seconds",
+              "text": "seconds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "displayName": "${__field.labels.bind}",
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "showPoints": "always",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Binds by pool",
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Conversations' harnesses bound, by pool: a session conversation's harness, or a folder conversation's on the machine.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['alasio.binder.pool'] as pool, sum(added_count) as binds\nfrom (\nselect TimeUnix, Attributes, Sum - coalesce(lag(Sum) over series, 0) as added_sum, Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count\nfrom otel.metrics_histogram where MetricName = 'alasio.binder.bind.duration' and ServiceName = 'alasio-sandbox-gateway' and Attributes['alasio.binder.pool'] like 'harness-%' and Attributes['k8s.namespace.name'] = if(${branch:sqlstring} = 'main', 'alasio', 'alasio-branch-' || ${branch:sqlstring}) and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added_count > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "pool",
+              "text": "pool",
+              "type": "string"
+            },
+            {
+              "selector": "binds",
+              "text": "binds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.pool}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "Releases",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Bindings released",
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Harnesses' bindings the sandbox gateway let go of, by why: idle, by its sweep once the conversation was quiet for its time; asked, by alasio; lost, deleted or broken, as their pod went while they were bound.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['alasio.gateway.release.reason'] as reason, sum(added) as releases\nfrom (\nselect TimeUnix, Attributes, Value - coalesce(lag(Value) over series, 0) as added\nfrom otel.metrics_sum where MetricName = 'alasio.gateway.releases' and ServiceName = 'alasio-sandbox-gateway' and Attributes['alasio.binder.pool'] like 'harness-%' and Attributes['k8s.namespace.name'] = if(${branch:sqlstring} = 'main', 'alasio', 'alasio-branch-' || ${branch:sqlstring}) and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "reason",
+              "text": "reason",
+              "type": "string"
+            },
+            {
+              "selector": "releases",
+              "text": "releases",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.reason}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Bindings lost by pool",
+      "gridPos": {
+        "x": 12,
+        "y": 14,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Bindings let go of as their pod went while they were bound, by pool: each takes the turn it ran with it, which alasio runs again.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['alasio.binder.pool'] as pool, sum(added) as lost\nfrom (\nselect TimeUnix, Attributes, Value - coalesce(lag(Value) over series, 0) as added\nfrom otel.metrics_sum where MetricName = 'alasio.gateway.releases' and ServiceName = 'alasio-sandbox-gateway' and Attributes['alasio.binder.pool'] like 'harness-%' and Attributes['k8s.namespace.name'] = if(${branch:sqlstring} = 'main', 'alasio', 'alasio-branch-' || ${branch:sqlstring}) and Attributes['alasio.gateway.release.reason'] in ('lost', 'deleted', 'broken') and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "pool",
+              "text": "pool",
+              "type": "string"
+            },
+            {
+              "selector": "lost",
+              "text": "lost",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.pool}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "Turns",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Lost turns",
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Turns whose harness instance was lost under them, by how each came out: staged, run again; completed, its reply delivered as its pod finished it first; given-up, as one run again already was; and by what found it lost: its binding's loss, or alasio attaching to it again.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['alasio.harness.recovery.outcome'] || ', ' || Attributes['alasio.harness.recovery.by'] as recovery, sum(added) as turns\nfrom (\nselect TimeUnix, Attributes, Value - coalesce(lag(Value) over series, 0) as added\nfrom otel.metrics_sum where MetricName = 'alasio.harness.recoveries' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "recovery",
+              "text": "recovery",
+              "type": "string"
+            },
+            {
+              "selector": "turns",
+              "text": "turns",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.recovery}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "First output",
+      "gridPos": {
+        "x": 12,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "description": "How long a turn took to its harness's first output, by harness: its bind, its host's start and its harness's own included.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['alasio.harness'] as harness, sum(added_sum) / sum(added_count) as seconds\nfrom (\nselect TimeUnix, Attributes, Sum - coalesce(lag(Sum) over series, 0) as added_sum, Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count\nfrom otel.metrics_histogram where MetricName = 'alasio.turn.first_output' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added_count > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "harness",
+              "text": "harness",
+              "type": "string"
+            },
+            {
+              "selector": "seconds",
+              "text": "seconds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "displayName": "${__field.labels.harness}",
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "showPoints": "always",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    }
+  ]
+}

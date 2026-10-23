@@ -2952,7 +2952,7 @@ describe("the lake's reader", () => {
     }
   });
 
-  test("the Sandbox gateway row times its binds by how their pod came and its attaches and detaches, counts its releases by why and the pods the policy refused, and the alerts page on refusals and slow warm binds", async () => {
+  test("the Sandbox gateway row times its binds by how their pod came and its attaches and detaches, counts its releases by why and the pods the policy refused, and the alerts page on refusals and slow warm binds, none of the conversations' harnesses'", async () => {
     const minute = 60_000;
     const now = Math.floor(Date.now() / minute) * minute;
     const keyValues = (attributes: Readonly<Record<string, string>>) => Object.entries(attributes).map(([key, value]) => ({ key, value: { stringValue: value } }));
@@ -2978,6 +2978,8 @@ describe("the lake's reader", () => {
     const main = { "k8s.namespace.name": "alasio-sessions" };
     const bind = (start: string) => ({ ...main, "alasio.binder.pool": "sandboxes-none", "alasio.binder.start": start });
     const reason = (why: string) => ({ ...main, "alasio.gateway.release.reason": why });
+    // A conversation's harness, the Harnesses dashboard's, of a branch no other test writes for.
+    const harness = { "k8s.namespace.name": "alasio-branch-elsewhere", "alasio.binder.pool": "harness-codex" };
     // The gateway up for three hours, which timed and counted before the last hour too.
     await withLake(async (db) => {
       await ensureOtel(db);
@@ -2994,6 +2996,8 @@ describe("the lake's reader", () => {
               counter("alasio.gateway.releases", reason("idle"), [150, 40, 30]),
               counter("alasio.gateway.releases", reason("asked"), [20]),
               counter("alasio.gateway.releases", reason("lost"), [10]),
+              histogram("alasio.binder.bind.duration", { ...harness, "alasio.binder.start": "warm" }, [[20, 30]]),
+              counter("alasio.gateway.releases", { ...harness, "alasio.gateway.release.reason": "idle" }, [15]),
               counter("alasio.gateway.pod_policy.refusals", { "k8s.namespace.name": "alasio-branch-try-sessions" }, [100, 5, 4]),
             ],
           }],
@@ -3025,6 +3029,95 @@ describe("the lake's reader", () => {
       // Two refused in the last fifteen minutes; the warm binds of the last half hour, 13 s on average.
       assert.deepEqual(await answer(reader.db, alertQuery("The sandbox pods' policy refuses pods")), [{ refused: 2 }]);
       assert.deepEqual(await answer(reader.db, alertQuery("Binds are slow")), [{ seconds: 13 }]);
+    } finally {
+      reader.close();
+    }
+  });
+
+  test("the Harnesses dashboard times and counts the binds of main's harness pools or a branch environment's, as its Branch chooses, counts their releases by why and their losses by pool, and the turns run again as their harness was lost, by how each came out, none of the folder instances'", async () => {
+    const minute = 60_000;
+    const now = Math.floor(Date.now() / minute) * minute;
+    const keyValues = (attributes: Readonly<Record<string, string>>) => Object.entries(attributes).map(([key, value]) => ({ key, value: { stringValue: value } }));
+    const nanos = (ms: number) => String(BigInt(ms) * 1_000_000n);
+    /** A point a minute of a series begun three hours ago, of the values `at` (minutes before now) by each. */
+    const points = <Point extends object>(at: readonly (readonly [number, number])[], point: (seen: readonly number[]) => Point) =>
+      Array.from({ length: Math.max(...at.map(([ago]) => ago)) + 1 }, (_, index) => Math.max(...at.map(([ago]) => ago)) - index).map((ago) => ({
+        startTimeUnixNano: nanos(now - 180 * minute),
+        timeUnixNano: nanos(now - ago * minute),
+        ...point(at.filter(([happened]) => happened >= ago).map(([, value]) => value)),
+      }));
+    const counter = (name: string, attributes: Readonly<Record<string, string>>, at: readonly number[]) => ({
+      name,
+      sum: { aggregationTemporality: 2, isMonotonic: true, dataPoints: points(at.map((ago) => [ago, 1]), (seen) => ({ asDouble: seen.length, attributes: keyValues(attributes) })) },
+    });
+    const histogram = (name: string, attributes: Readonly<Record<string, string>>, at: readonly (readonly [number, number])[]) => ({
+      name,
+      histogram: {
+        aggregationTemporality: 2,
+        dataPoints: points(at, (seen) => ({ count: String(seen.length), sum: seen.reduce((total, value) => total + value, 0), bucketCounts: [String(seen.length)], explicitBounds: [], attributes: keyValues(attributes) })),
+      },
+    });
+    const bind = (namespace: string, pool: string, start: string) => ({ "alasio.binder.pool": pool, "k8s.namespace.name": namespace, "alasio.binder.start": start });
+    const released = (namespace: string, pool: string, why: string) => ({ "alasio.binder.pool": pool, "k8s.namespace.name": namespace, "alasio.gateway.release.reason": why });
+    const recovered = (by: string, outcome: string) => ({ "alasio.harness": "codex", "alasio.harness.recovery.by": by, "alasio.harness.recovery.outcome": outcome });
+    const BIND = "alasio.binder.bind.duration";
+    const RELEASES = "alasio.gateway.releases";
+    const RECOVERIES = "alasio.harness.recoveries";
+    // The gateway's, of main's harness pools, its folder instances' pool, in the same namespace, and a branch's harness pool; and main's alasio and the branch's.
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      await writeTelemetry(db, telemetryRows("metrics", {
+        resourceMetrics: [
+          {
+            resource: { attributes: keyValues({ "service.name": "alasio-sandbox-gateway", "service.instance.id": "gateway-0" }) },
+            scopeMetrics: [{
+              metrics: [
+                histogram(BIND, bind("alasio", "harness-codex", "warm"), [[150, 99], [20, 4], [10, 6]]),
+                histogram(BIND, bind("alasio", "harness-folder-claude", "cold"), [[5, 30]]),
+                histogram(BIND, bind("alasio", "folder", "warm"), [[15, 2]]),
+                histogram(BIND, bind("alasio-branch-try", "harness-codex", "warm"), [[12, 8]]),
+                counter(RELEASES, released("alasio", "harness-codex", "idle"), [150, 30, 20]),
+                counter(RELEASES, released("alasio", "harness-codex", "lost"), [10]),
+                counter(RELEASES, released("alasio", "harness-folder-claude", "broken"), [5]),
+                counter(RELEASES, released("alasio", "folder", "lost"), [15]),
+                counter(RELEASES, released("alasio-branch-try", "harness-codex", "deleted"), [8]),
+              ],
+            }],
+          },
+          {
+            resource: { attributes: keyValues({ "service.name": "alasio" }) },
+            scopeMetrics: [{ metrics: [counter(RECOVERIES, recovered("lost", "staged"), [10]), counter(RECOVERIES, recovered("reattach", "given-up"), [4]), histogram("alasio.turn.first_output", { "alasio.harness": "codex" }, [[20, 7]])] }],
+          },
+          { resource: { attributes: keyValues({ "service.name": "alasio", "alasio.branch": "try" }) }, scopeMetrics: [{ metrics: [counter(RECOVERIES, recovered("lost", "staged"), [8])] }] },
+        ],
+      }));
+    });
+    const dashboard: { panels: { title: string; type: string; targets?: { url_options: { data: string } }[] }[] } =
+      JSON.parse(readFileSync(new URL("../neon/grafana/dashboards/harnesses.json", import.meta.url), "utf8"));
+    /** A panel's query over the last hour, by the minute, on `branch`. */
+    const panel = (title: string, branch: string) => {
+      const sql = dashboard.panels.find((found) => found.title === title && found.type !== "row")?.targets?.[0]?.url_options.data;
+      assert.ok(sql, title);
+      return [["${__from}", String(now - 60 * minute)], ["${__to}", String(now + minute)], ["${__interval_ms}", String(minute)], ["${branch:sqlstring}", `'${branch}'`]]
+        .reduce((text, [variable = "", value = ""]) => text.replaceAll(variable, value), sql);
+    };
+    const reader = await openReader(readerConfig);
+    try {
+      const rows = async (title: string, label: string, value: string, branch = "main") =>
+        (await answer(reader.db, panel(title, branch))).map((row) => `${String(row[label])} ${Number(row[value])}`).sort();
+      const stat = async (title: string, value: string, branch = "main") => Number((await answer(reader.db, panel(title, branch)))[0]?.[value]);
+      // Main's: its harness pools' binds and releases of the last hour, its folder instances' not.
+      assert.deepEqual([await stat("Binds", "binds"), await stat("Mean bind time", "seconds"), await stat("Bindings lost", "lost"), await stat("Turns run again", "turns")], [3, 40 / 3, 2, 1]);
+      assert.deepEqual(await rows("Bind time", "bind", "seconds"), ["harness-codex, warm 4", "harness-codex, warm 6", "harness-folder-claude, cold 30"]);
+      assert.deepEqual(await rows("Binds by pool", "pool", "binds"), ["harness-codex 1", "harness-codex 1", "harness-folder-claude 1"]);
+      assert.deepEqual(await rows("Bindings released", "reason", "releases"), ["broken 1", "idle 1", "idle 1", "lost 1"]);
+      assert.deepEqual(await rows("Bindings lost by pool", "pool", "lost"), ["harness-codex 1", "harness-folder-claude 1"]);
+      assert.deepEqual(await rows("Lost turns", "recovery", "turns"), ["given-up, reattach 1", "staged, lost 1"]);
+      assert.deepEqual(await rows("First output", "harness", "seconds"), ["codex 7"]);
+      // The branch's, its own.
+      assert.deepEqual([await stat("Binds", "binds", "try"), await stat("Bindings lost", "lost", "try"), await stat("Turns run again", "turns", "try")], [1, 1, 1]);
+      assert.deepEqual(await rows("Bindings released", "reason", "releases", "try"), ["deleted 1"]);
+      assert.deepEqual(await rows("First output", "harness", "seconds", "try"), []);
     } finally {
       reader.close();
     }

@@ -2180,7 +2180,7 @@
         "w": 6,
         "h": 8
       },
-      "description": "How long the sandbox gateway took to bind a session's workspace, from its bind asked to its pod serving, every environment's, by how its pod came: warm, a free pod claimed at once; cold, waited for as its pool was scaled; made, its own, as a restore makes one.",
+      "description": "How long the sandbox gateway took to bind a session's workspace, from its bind asked to its pod serving, every environment's (the conversations' harnesses' are the Harnesses dashboard's), by how its pod came: warm, a free pod claimed at once; cold, waited for as its pool was scaled; made, its own, as a restore makes one.",
       "datasource": {
         "type": "yesoreyeram-infinity-datasource",
         "uid": "lake"
@@ -2202,7 +2202,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['alasio.binder.start'] as start, sum(added_sum) / sum(added_count) as seconds\nfrom (\nselect TimeUnix, MetricName, Attributes, Sum - coalesce(lag(Sum) over series, 0) as added_sum, Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count\nfrom otel.metrics_histogram where MetricName in ('alasio.binder.bind.duration') and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by MetricName, ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added_count > 0\ngroup by all order by 1"
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['alasio.binder.start'] as start, sum(added_sum) / sum(added_count) as seconds\nfrom (\nselect TimeUnix, MetricName, Attributes, Sum - coalesce(lag(Sum) over series, 0) as added_sum, Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count\nfrom otel.metrics_histogram where MetricName in ('alasio.binder.bind.duration') and coalesce(Attributes['alasio.binder.pool'], '') not like 'harness-%' and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by MetricName, ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added_count > 0\ngroup by all order by 1"
           },
           "root_selector": "",
           "columns": [
@@ -2338,7 +2338,7 @@
         "w": 6,
         "h": 8
       },
-      "description": "Bindings the sandbox gateway released, every environment's, by why: idle, by its sweep; asked, by its caller; lost, its pod gone while it was bound.",
+      "description": "Sessions' and folder instances' bindings the sandbox gateway released, every environment's (the conversations' harnesses' are the Harnesses dashboard's), by why: idle, by its sweep; asked, by its caller; lost, its pod gone while it was bound.",
       "datasource": {
         "type": "yesoreyeram-infinity-datasource",
         "uid": "lake"
@@ -2360,7 +2360,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['alasio.gateway.release.reason'] as reason, sum(added) as releases\nfrom (\nselect TimeUnix, Attributes, Value - coalesce(lag(Value) over series, 0) as added\nfrom otel.metrics_sum where MetricName = 'alasio.gateway.releases' and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added > 0\ngroup by all order by 1"
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['alasio.gateway.release.reason'] as reason, sum(added) as releases\nfrom (\nselect TimeUnix, Attributes, Value - coalesce(lag(Value) over series, 0) as added\nfrom otel.metrics_sum where MetricName = 'alasio.gateway.releases' and coalesce(Attributes['alasio.binder.pool'], '') not like 'harness-%' and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added > 0\ngroup by all order by 1"
           },
           "root_selector": "",
           "columns": [

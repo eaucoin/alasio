@@ -820,7 +820,7 @@ groups:
       # free pod claimed at once, its workspace attached, and its bayma serving. Slow, the node
       # agents' attaches or bayma's start keep every session's first request waiting. Cold
       # binds, which wait for their pool to scale, and those whose pod is made, as a restore,
-      # count neither way.
+      # count neither way, nor the conversations' harnesses', whose host starts as they bind.
       - uid: alasio-binds-slow
         title: Binds are slow
         condition: slow
@@ -853,6 +853,7 @@ groups:
                       Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count
                     from otel.metrics_histogram
                     where MetricName = 'alasio.binder.bind.duration' and ServiceName = 'alasio-sandbox-gateway'
+                      and coalesce(Attributes['alasio.binder.pool'], '') not like 'harness-%'
                       and TimeUnix > now()::timestamp - interval 2 hour
                     window series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)
                   )
