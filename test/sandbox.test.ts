@@ -80,6 +80,8 @@ test("a session filesystem's Claude Code keeps only tools that stay off this mac
   const { systemPrompt } = opts;
   assert.ok(typeof systemPrompt === "object" && !Array.isArray(systemPrompt) && systemPrompt.type === "preset", "Claude Code's own prompt, appended to");
   assert.match(systemPrompt.append ?? "", new RegExp(SESSION_FS_INSTRUCTIONS.slice(0, 40)));
+  // Told to take its session's control over where bayma refuses a call for it, as after its machine was lost mid-call.
+  assert.match(systemPrompt.append ?? "", /"write action requires controller lease"[^.]*session\.acquire_controller/u);
   assert.equal(opts.spawnClaudeCodeProcess, undefined); // the CLI runs here, not in the sandbox
 
   // A folder workspace is as before: its own folder, the operator's settings, the usual tools.
@@ -102,6 +104,7 @@ test("the session-filesystem Codex home has no environment and the login relay a
   const config = sessionFsThreadConfig(BAYMA);
   assert.deepEqual(config.mcp_servers, { bayma: { url: BAYMA.url, http_headers: BAYMA.headers, startup_timeout_sec: 60 } });
   assert.match(config.developer_instructions, new RegExp(SESSION_FS_INSTRUCTIONS.slice(0, 40)));
+  assert.match(config.developer_instructions, /"write action requires controller lease"[^.]*session\.acquire_controller/u);
 });
 
 test("the session-filesystem Codex writes its own home, carries none of the operator's env, and stops cleanly", async () => {
