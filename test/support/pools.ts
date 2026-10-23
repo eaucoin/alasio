@@ -20,8 +20,8 @@
  * it, as alasio makes them, the harness host's role granted its part of them: the stores' tables,
  * which every state of one database would share, are held to one state's grants alone.
  */
-import { randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes, randomInt, randomUUID } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -145,14 +145,28 @@ export async function holdsOf(store: Store["Service"]): Promise<(readonly [strin
   return rows.map(({ conversation_id, reason }) => [conversation_id, reason] as const);
 }
 
-/** A port of the loopback no one listens on now, which a pod is to serve on. */
+/**
+ * The lowest port the kernel gives a socket of its own choosing, as a server listening on port
+ * 0 (ip_local_port_range): a pod's port is chosen below it, as it is chosen when the pod is
+ * made and served on only once it is bound, and any server listening on port 0 meanwhile, as
+ * a bound harness's relay of its Codex login does, could otherwise take it.
+ */
+const KERNEL_CHOSEN_FROM = Number(readFileSync("/proc/sys/net/ipv4/ip_local_port_range", "utf8").trim().split(/\s+/u)[0]);
+
+/** A port no one listens on now, below the kernel's own (KERNEL_CHOSEN_FROM), which a pod is to serve on. */
 async function freePort(): Promise<number> {
-  const probe = createServer();
-  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-  // A server listening on a TCP port has an address of its own.
-  const { port } = probe.address() as AddressInfo;
-  await new Promise((resolve) => probe.close(resolve));
-  return port;
+  for (;;) {
+    const port = KERNEL_CHOSEN_FROM - 1 - randomInt(10_000);
+    const probe = createServer();
+    const free = await new Promise<boolean>((resolve) => {
+      probe.once("error", () => resolve(false));
+      probe.listen(port, "0.0.0.0", () => resolve(true));
+    });
+    if (free) {
+      await new Promise((resolve) => probe.close(resolve));
+      return port;
+    }
+  }
 }
 
 /**
