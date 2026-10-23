@@ -887,7 +887,7 @@ test("a caller's token held to a binding whether held is not known yet is answer
   }
 });
 
-test("a caller's token held to a binding asks its key's pod and its workspace's files alone, nothing else the front answers itself", async () => {
+test("a caller's token held to a binding asks its key's pod and its workspace's files alone, nothing else the front answers itself, its environment's harnesses among it", async () => {
   const of = await pool();
   await freePods(of, 1);
   const stand = await pods();
@@ -900,7 +900,7 @@ test("a caller's token held to a binding asks its key's pod and its workspace's 
   try {
     const held = `Bearer ${mintToken(callerKey, { key: "sessionfs:workspace", held: { key: "harness:telegram:1", binding: "binding-1", namespace: of.namespace }, options: { environment: "main", mode: "none" } })}`;
     const at = (method: string, path: string) => fetch(`http://127.0.0.1:${served.port}${path}`, { method, headers: { authorization: held }, ...(method === "GET" || method === "DELETE" ? {} : { body: "{}" }) });
-    for (const [method, path] of [["DELETE", "/workspace"], ["POST", "/workspace"], ["POST", "/workspace/forks"], ["GET", "/workspace/all"], ["GET", "/workspace/quota"], ["POST", "/bind"], ["POST", "/release"], ["GET", "/snapshots"], ["GET", "/folders/starting"], ["DELETE", "/workspace/files?path=workspace%2Fa"]] as const) {
+    for (const [method, path] of [["DELETE", "/workspace"], ["POST", "/workspace"], ["POST", "/workspace/forks"], ["GET", "/workspace/all"], ["GET", "/workspace/quota"], ["POST", "/bind"], ["POST", "/release"], ["GET", "/snapshots"], ["GET", "/folders/starting"], ["GET", "/harnesses"], ["DELETE", "/workspace/files?path=workspace%2Fa"]] as const) {
       assert.equal((await at(method, path)).status, 403, `${method} ${path}`);
     }
     assert.deepEqual([operated, stand.sent.length], [[], 0], "none answered, none passed on");
