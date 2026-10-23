@@ -1,15 +1,11 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { test } from "node:test";
 
-import { Codex, type Thread, type ThreadEvent } from "@openai/codex-sdk";
-import { Effect, Layer, Logger } from "effect";
+import { Effect, Layer, Logger, Stream } from "effect";
 
-import { makeAppServer } from "../src/codex/app-server/client.ts";
+import type { AppServer } from "../src/codex/app-server/client.ts";
+import type { AppServerEvent } from "../src/codex/app-server/protocol.ts";
 import { executeCodexTurn } from "../src/codex/runtime.ts";
-import { type CodexExecClient, execCodexOptions } from "../src/codex/transport.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { TurnPersistence } from "../src/harness/index.ts";
 import type { FolderBayma, FolderBaymaScope } from "../src/mcp/bayma.ts";
@@ -19,31 +15,25 @@ import { ownTurnsOn } from "./support/persistence.ts";
 /** The prompts the test's Codex was given, in order. */
 const prompted: string[] = [];
 
-/** A Codex whose every thread runs one turn that edits three files, answers, and completes. */
-function codexFactory(): CodexExecClient {
-  const thread = {
-    async runStreamed(prompt: Parameters<Pick<Thread, "runStreamed">["runStreamed"]>[0]) {
-      prompted.push(String(prompt));
-      return {
-        events: (async function* (): AsyncGenerator<ThreadEvent> {
-          yield { type: "thread.started", thread_id: "thread-1" };
-          yield {
-            type: "item.completed",
-            item: { id: "item-1", type: "file_change", status: "completed", changes: ["a", "b", "c"].map((path) => ({ path, kind: "update" as const })) },
-          };
-          yield { type: "item.completed", item: { id: "item-2", type: "agent_message", text: "done" } };
-          yield { type: "turn.completed", usage: {
-            input_tokens: 1,
-            cached_input_tokens: 0,
-            cache_write_input_tokens: 0,
-            output_tokens: 1,
-            reasoning_output_tokens: 0,
-          } };
-        })(),
-      };
-    },
+/** The events of the test's Codex's every turn: it edits three files, answers, and completes. */
+const TURN: readonly AppServerEvent[] = [
+  { type: "item.completed", item: { id: "item-1", type: "file_change", status: "completed", changes: ["a", "b", "c"].map((path) => ({ path, kind: { type: "update", move_path: null }, diff: "" })) } },
+  { type: "item.completed", item: { id: "item-2", type: "agent_message", text: "done", phase: null, memoryCitation: null, delivery: null, questions: null } },
+  { type: "turn.completed", usage: null },
+];
+
+/** An app-server whose every thread runs TURN, and which dies of anything else a turn would ask of it. */
+function codexAppServer(): AppServer {
+  const answers: Partial<AppServer> = {
+    startThread: () => Effect.succeed("thread-1"),
+    loginModels: () => Effect.succeed([]),
+    startTurn: ({ prompt }) => Effect.sync(() => (prompted.push(prompt), "turn-1")),
+    eventsForTurn: () => Stream.fromIterable(TURN),
+    interrupt: () => Effect.succeed(false),
   };
-  return { startThread: () => thread, resumeThread: () => thread };
+  return new Proxy(answers as AppServer, {
+    get: (target, name) => target[name as keyof AppServer] ?? (() => Effect.die(new Error(`the test's app-server was asked ${String(name)}`))),
+  });
 }
 
 /** alasio's persistence, recording which of its methods are called, in order, and the blocks each store of them is given. */
@@ -62,7 +52,7 @@ function recordingPersistence(calls: string[], stored: unknown[][] = []): TurnPe
 }
 
 /**
- * Runs a turn of `codexFactory`'s Codex on `persistence`, its response made complete once
+ * Runs a turn of the test's Codex (codexAppServer) on `persistence`, its response made complete once
  * `beforeResponseComplete` is done, holding alasio's pod busy in `holds`.
  */
 const runTurn = (
@@ -71,8 +61,6 @@ const runTurn = (
   { holds = [], folderBayma = () => Effect.succeed({ server: { type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }, notice: null }) }: { readonly holds?: Hold[]; readonly folderBayma?: FolderBayma } = {},
 ) =>
   Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-    // The exec transport's turn, which no app-server serves.
-    const appServer = yield* makeAppServer({ spawn: () => Effect.sync(() => assert.fail("no app-server runs in this test")) });
     return yield* executeCodexTurn({
       prompt: "hello",
       resumeSession: null,
@@ -83,8 +71,7 @@ const runTurn = (
       modelChoice: null,
       ownTurns: ownTurnsOn(persistence),
       persistence,
-      appServer,
-      codexFactory,
+      appServer: codexAppServer(),
       folderBayma,
       beforeResponseComplete,
     });
@@ -127,22 +114,4 @@ test("a turn whose folder's bayma did not start runs without it, its prompt told
   await runTurn(recordingPersistence([]), () => Effect.void, { folderBayma: (scope) => Effect.sync(() => (asked.push(scope), { server: null, notice })) });
   assert.deepEqual(prompted, [`${notice}\n\nhello`]);
   assert.deepEqual(asked.map(({ harness, threadKey, chatId }) => ({ harness, threadKey, chatId })), [{ harness: "codex", threadKey: "conversation-1", chatId: "1" }]);
-});
-
-test("codex exec, which the exec transport runs, is run without the login's apps nor plugins", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "alasio-codex-exec-"));
-  try {
-    // A codex that records how it was run, reads its prompt, and runs nothing.
-    const codex = join(directory, "codex");
-    writeFileSync(codex, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(directory, "argv"))}\ncat > /dev/null\nexit 1\n`);
-    chmodSync(codex, 0o755);
-    const client = new Codex({ ...execCodexOptions({ PATH: process.env["PATH"] ?? "" }, { developer_instructions: "", mcp_servers: {} }), codexPathOverride: codex });
-    await client.startThread({ skipGitRepoCheck: true }).run("hello").then(() => assert.fail("the recording codex runs nothing"), () => undefined);
-    const argv = readFileSync(join(directory, "argv"), "utf8").split("\n");
-    const configs = argv.flatMap((arg, index) => (arg === "--config" ? [argv[index + 1]] : []));
-    assert.equal(argv[0], "exec");
-    for (const feature of ["features.apps=false", "features.plugins=false"]) assert.ok(configs.includes(feature), `${feature} in ${JSON.stringify(configs)}`);
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
 });

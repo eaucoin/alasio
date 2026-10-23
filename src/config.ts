@@ -56,9 +56,6 @@ export interface BranchEnvironment {
   readonly tokenFile: string;
 }
 
-/** How alasio talks to Codex: through `codex exec` or a Codex app-server. */
-export type CodexTransportMode = "exec" | "app-server";
-
 /**
  * alasio's own variables: its configuration and its secrets, as its deployment gives them
  * (cli/src/manifests/alasio.ts alasioEnv), the bot's token and the sandbox gateway's caller key
@@ -111,10 +108,6 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
     codexLoginUrl: requireEnv(env, "ALASIO_CODEX_LOGIN_URL"),
     inKubernetes: Boolean(env["ALASIO_POD"]?.trim()),
   };
-}
-
-export function getCodexTransportMode(): CodexTransportMode {
-  return process.env["ALASIO_CODEX_TRANSPORT"] === "exec" ? "exec" : "app-server";
 }
 
 export function getCodexBinaryOverride(): string | null {

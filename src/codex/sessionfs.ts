@@ -23,7 +23,6 @@ import { join } from "node:path";
 
 import { Context, Effect, Layer, RcRef, type Scope } from "effect";
 
-import { getCodexTransportMode } from "../config.ts";
 import { SESSION_FS_AGENT_INSTRUCTIONS } from "../harness/workspace-instructions.ts";
 import type { BaymaEndpoint } from "../sandbox/gateway-client.ts";
 import { type AppServer, makeAppServer } from "./app-server/client.ts";
@@ -33,7 +32,6 @@ import { type StartLoginRelay, startLoginRelay } from "./login-relay.ts";
 import { type CodexScope, CodexScopeError } from "./runtime.ts";
 import type { CodexListingScope } from "./sessions.ts";
 import type { CodexThreadConfig } from "./thread-config.ts";
-import { CodexTransportRefused } from "./transport.ts";
 
 /** The env var the relay's bearer is in, the model provider's `env_key`. */
 export const LOGIN_BEARER_ENV = "ALASIO_CODEX_LOGIN";
@@ -111,7 +109,7 @@ export class SessionFsCodex extends Context.Service<SessionFsCodex, {
   /** Its app-server, as the scopes give it, for what asks of one only where it runs (backgroundWork). */
   readonly appServer: AppServer;
   /** The scope a call in the workspace reached through `bayma` runs against, in `directory`. */
-  readonly scope: (params: SessionFsScopeParams) => Effect.Effect<CodexScope, CodexScopeError | CodexTransportRefused>;
+  readonly scope: (params: SessionFsScopeParams) => Effect.Effect<CodexScope, CodexScopeError>;
   /** The scope a thread list, a model list, or a goal read runs against: no workspace needed. */
   readonly listingScope: (params: { readonly directory: string }) => Effect.Effect<CodexListingScope, CodexScopeError>;
   /** Stops its app-server, if one runs; the next call starts another. */
@@ -159,10 +157,7 @@ export const makeSessionFsCodex = Effect.fnUntraced(function*({
   return SessionFsCodex.of({
     home,
     appServer,
-    scope: ({ directory, bayma }) =>
-      getCodexTransportMode() === "exec"
-        ? Effect.fail(new CodexTransportRefused({ message: "session-filesystem workspaces run Codex through its app-server; unset ALASIO_CODEX_TRANSPORT=exec" }))
-        : Effect.map(start, (codexEnv) => ({ cwd: directory, codexEnv, codexConfig: sessionFsThreadConfig(bayma), appServer })),
+    scope: ({ directory, bayma }) => Effect.map(start, (codexEnv) => ({ cwd: directory, codexEnv, codexConfig: sessionFsThreadConfig(bayma), appServer })),
     listingScope: ({ directory }) => Effect.map(start, (codexEnv) => ({ cwd: directory, codexEnv, appServer })),
     stop: appServer.stop,
   });

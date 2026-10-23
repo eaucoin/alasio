@@ -21,7 +21,7 @@
     "@effect/platform-node": "4.0.0",
     "@kubernetes/client-node": "2.0.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
-    "@openai/codex-sdk": "0.153.3",
+    "@openai/codex": "0.153.3",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/api-logs": "^0.222.0",
     "@opentelemetry/core": "^2.11.0",

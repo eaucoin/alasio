@@ -12,7 +12,7 @@ import { operatorDeveloperInstructions } from "./config-toml.ts";
 import { type CodexEnv, codexHome } from "./env.ts";
 
 // These two are types rather than interfaces so they are JSON objects to TypeScript, as
-// the app-server's and the Codex SDK's config types take them.
+// the app-server's config types take them.
 
 /** An MCP server in Codex's config shape. */
 export type CodexMcpServer = {

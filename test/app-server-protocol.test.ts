@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { FileChangeItem as SdkFileChangeItem } from "@openai/codex-sdk";
 import { Array as Arr, Deferred, Effect, Exit, Fiber, Logger, Option, Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 
@@ -20,7 +19,7 @@ import {
 } from "../src/codex/app-server/protocol.ts";
 import { AppServerNotRunning, AppServerRequestFailed, type AppServerRequestError, AppServerRequestTimeout, type AppServerRpc } from "../src/codex/app-server/rpc-client.ts";
 import { type AppServerApart, makeAppServerThreads } from "../src/codex/app-server/thread-client.ts";
-import { mapItemToBlocks, responseProjection } from "../src/codex/event-projection.ts";
+import { type FileChange, mapItemToBlocks, responseProjection } from "../src/codex/event-projection.ts";
 import type { CodexThreadConfig } from "../src/codex/thread-config.ts";
 import { appServerProcess } from "./support/app-server-process.ts";
 import { agentMessage, codexModel, codexThread, codexTurn, turnCompleted } from "./support/codex-protocol.ts";
@@ -464,8 +463,8 @@ test("an error notification reports Codex's own message, unless Codex is retryin
   assert.equal(error(true), null);
 });
 
-test("a file change shows a deletion as one, from the app-server and from exec", () => {
-  const names = (changes: readonly v2.FileUpdateChange[] | SdkFileChangeItem["changes"]) => {
+test("a file change shows a deletion as one, from the app-server and as a Claude Code edit's projection names its kind", () => {
+  const names = (changes: readonly v2.FileUpdateChange[] | readonly FileChange[]) => {
     const projection = responseProjection("pending-1");
     mapItemToBlocks({ type: "file_change", id: "item-1", changes }, projection);
     return projection.blockSequence.map((block) => ("name" in block ? block.name : undefined));

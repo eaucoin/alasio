@@ -128,10 +128,10 @@ const IGNORABLE_NOTIFICATION_METHODS: ReadonlySet<AppServerNotification["method"
 /** The app-server item of type `T`. */
 type ItemOf<T extends v2.ThreadItem["type"]> = Extract<v2.ThreadItem, { type: T }>;
 
-/** An app-server item under the type the Codex SDK gives the same item. */
+/** An app-server item under the type `codex exec --json` gives the same item. */
 type Renamed<Item extends v2.ThreadItem, Type extends string> = Omit<Item, "type"> & { readonly type: Type };
 
-/** The app-server's item types that are renamed into the Codex SDK's (normalizeAppServerItem). */
+/** The app-server's item types that are renamed into `codex exec --json`'s (normalizeAppServerItem). */
 type RenamedItemType =
   | "agentMessage"
   | "commandExecution"
@@ -141,11 +141,11 @@ type RenamedItemType =
   | "webSearch"
   | "contextCompaction";
 
-/** The app-server's items with no Codex SDK counterpart, reported as the app-server sends them. */
+/** The app-server's items with no `codex exec --json` counterpart, reported as the app-server sends them. */
 export type PassedThroughItem = Exclude<v2.ThreadItem, { type: RenamedItemType }>;
 
 /**
- * An app-server item as alasio reports it: under the Codex SDK's type where the SDK has
+ * An app-server item as alasio reports it: under `codex exec --json`'s type where exec has
  * the item, a dynamic tool call as an MCP tool call, and any other as it came.
  */
 export type AppServerItem =
@@ -163,8 +163,8 @@ export type AppServerItem =
   | PassedThroughItem;
 
 /**
- * An app-server notification as alasio reports it, in the shape of the Codex SDK's
- * thread events, which the exec transport reports.
+ * An app-server notification as alasio reports it: an event of the turn, in the shape
+ * `codex exec --json` reports its own (thread.started, item.completed, turn.completed).
  */
 export type AppServerEvent =
   | { readonly type: "thread.started"; readonly thread_id: string }

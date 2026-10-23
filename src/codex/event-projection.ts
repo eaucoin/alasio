@@ -1,4 +1,3 @@
-import type { FileChangeItem as SdkFileChangeItem } from "@openai/codex-sdk";
 import { Effect } from "effect";
 
 import type { MessagePhase, v2 } from "../../.types/codex/index.js";
@@ -6,9 +5,9 @@ import type { TurnPersistence, TurnWrite } from "../persistence/store.ts";
 import type { PassedThroughItem } from "./app-server/protocol.ts";
 
 /*
- * Codex-shaped items: what a harness reports an agent did, in the shape of the Codex SDK's
- * thread items. Codex exec reports them so; Codex app-server items and Claude Agent SDK
- * messages are projected into them. Each carries what this module reads.
+ * Codex-shaped items: what a harness reports an agent did, in the shape `codex exec --json`
+ * reports its items; Codex app-server items and Claude Agent SDK messages are projected into
+ * them. Each carries what this module reads.
  */
 
 /** Text from the agent: commentary while it works, or its final answer. */
@@ -26,15 +25,15 @@ export interface CommandExecutionItem {
   readonly command: string;
 }
 
-/** One file a file change touched; the kind is a string from Codex exec and an object from app-server. */
+/** One file a file change touched; the kind is a string as Claude Code's edits are projected, and an object from the app-server. */
 export interface FileChange {
   readonly path: string;
-  readonly kind: SdkFileChangeItem["changes"][number]["kind"] | v2.PatchChangeKind;
+  readonly kind: "add" | "delete" | "update" | v2.PatchChangeKind;
 }
 
 /**
- * Whether a change deletes its file: Codex exec names the kind, the app-server's
- * protocol describes it as an object.
+ * Whether a change deletes its file: a Claude Code edit's projection names the kind, the
+ * app-server's protocol describes it as an object.
  */
 function isDeletion(kind: FileChange["kind"]): boolean {
   return typeof kind === "string" ? kind === "delete" : kind.type === "delete";
@@ -69,7 +68,7 @@ export interface ErrorItem {
   readonly message: string;
 }
 
-/** Items no response block shows, the app-server's with no Codex SDK counterpart among them. */
+/** Items no response block shows, the app-server's with no `codex exec --json` counterpart among them. */
 export interface UnshownItem {
   readonly type: "reasoning" | "todo_list" | "context_compaction" | PassedThroughItem["type"];
 }

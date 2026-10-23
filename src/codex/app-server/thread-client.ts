@@ -30,7 +30,8 @@ const BACKGROUND_WORK_TIMEOUT = "5 seconds";
 const LOGIN_MODELS_TIMEOUT = "10 seconds";
 /**
  * The thread sources the session panels list: the Codex CLI's and editors',
- * which include alasio's app-server threads, and alasio's exec transport's.
+ * which include alasio's app-server threads, and `codex exec`'s, as the operator
+ * runs it in a folder.
  * Sub-agent threads are left out.
  */
 const LISTED_SOURCE_KINDS: v2.ThreadSourceKind[] = ["cli", "vscode", "exec"];

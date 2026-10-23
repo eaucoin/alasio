@@ -11,7 +11,6 @@ import { buildCodexEnv } from "./env.ts";
 import { appendBlock, completeResponse, errorBlock, isVisibleCodexItem, mapItemToBlocks, responseProjection, storeBlocks } from "./event-projection.ts";
 import {
   type CodexEvent,
-  type CodexTransportRefused,
   forkCodexTransportThread,
   openAttachedCodexEventStream,
   openCodexEventStream,
@@ -60,7 +59,7 @@ export class CodexScopeError extends Schema.TaggedError<CodexScopeError>()("Code
 }
 
 /** The scope a harness's calls run against, in place of the folder workspace's. */
-export type CodexScopeProvider = Effect.Effect<CodexScope, CodexScopeError | CodexTransportRefused>;
+export type CodexScopeProvider = Effect.Effect<CodexScope, CodexScopeError>;
 
 /** The conversation and folder a call is for, and what it runs against. */
 export interface CodexScopeParams {
@@ -87,7 +86,6 @@ export interface ForkCodexSessionParams extends CodexScopeParams {
 export interface CodexTurnParams extends TurnParams, CodexScopeParams {
   /** Runs once the turn has completed, before its response is marked complete. */
   readonly beforeResponseComplete?: ((sessionId: string | null | undefined) => Effect.Effect<void>) | undefined;
-  readonly codexFactory?: CodexStreamParams["codexFactory"];
   /** How many times the DB guardrail has already sent the turn back to Codex. */
   readonly guardrailRecoveryDepth?: number | undefined;
 }
@@ -134,12 +132,12 @@ const folderCodexScope = ({
  * The scope a call runs against: `scope`, when the harness gives one (a session
  * filesystem's, from ./sessionfs.ts), else the folder workspace's.
  */
-function codexScope({ scope, ...params }: CodexScopeParams): Effect.Effect<CodexScope, CodexScopeError | CodexTransportRefused> {
+function codexScope({ scope, ...params }: CodexScopeParams): Effect.Effect<CodexScope, CodexScopeError> {
   return scope ?? folderCodexScope(params);
 }
 
 /** How a call on a session fails: what it runs against did not come up, or its app-server failed it. */
-export type CodexSessionError = CodexScopeError | CodexTransportRefused | AppServerStartError | ThreadIdMissing | RolloutListingError;
+export type CodexSessionError = CodexScopeError | AppServerStartError | ThreadIdMissing | RolloutListingError;
 
 export const startFreshCodexSession = Effect.fnUntraced(function*(params: CodexScopeParams): Effect.fn.Return<string, CodexSessionError> {
   const startedAt = process.hrtime.bigint();
@@ -239,11 +237,6 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
         if (params.onTransportCompleted) {
           yield* params.onTransportCompleted({ sessionId, turnId });
         }
-        if (sessionId && event.usage) {
-          yield* persistence.updateSessionUsage(sessionId, {
-            cacheReadInputTokens: event.usage.cached_input_tokens,
-          });
-        }
         break;
       case "usage.updated":
         if (sessionId && event.usage?.last) {
@@ -284,7 +277,6 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
       modelChoice: params.modelChoice,
       persistence,
       pendingResponseId,
-      codexFactory: params.codexFactory,
       turnTimer,
       appServer,
       onPromptDispatched: params.onPromptDispatched,

@@ -36,7 +36,6 @@ const ALASIO_MAIN = fileURLToPath(new URL("./alasio-main.ts", import.meta.url));
 const WITHHELD_ENV = [
   "NODE_TEST_CONTEXT",
   "WORKING_DIRECTORY",
-  "ALASIO_CODEX_TRANSPORT",
   "ALASIO_DEFAULT_HARNESS",
   "ALASIO_NAMESPACE",
   "ALASIO_CLAUDE_MODEL",
