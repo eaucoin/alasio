@@ -59,8 +59,17 @@ const tomlString = (value: string): string => JSON.stringify(value);
  * which fetches every layer whole so a pod reads nothing from the registry once it is done,
  * one layer at a time, so it takes less of the network a pod's start reads its layers
  * over (in CI, a 2.1 GB image started in 0.7–1.3 s so, and 1.0–3.2 s with the
- * default two); its FUSE manager on, which keeps its mounts; and each mirror it can reach
- * as it is, ahead of the registry itself, which it reads last. Pure, for tests.
+ * default two); one range at a time in each request it makes of a registry; its FUSE manager
+ * on, which keeps its mounts; and each mirror it can reach as it is, ahead of the registry
+ * itself, which it reads last. Pure, for tests.
+ *
+ * One range at a time, as ghcr.io's blobs answer a request of more than one range with 501
+ * Not Implemented (pkg-containers.githubusercontent.com, which its blobs redirect to), which
+ * the daemon neither retries nor falls back from (it falls back on 400 alone, as gcr.io
+ * answers). A file read as its layer is fetched in the background, some of its chunks fetched
+ * already and others not, asks for those others at once, in ranges apart: refused so, the read
+ * failed with EIO in the pod, as a 9.0.0 workspace-mount's of its juicefs did in CI. Asked for
+ * as one range covering them, it reads again what was fetched between them, no more.
  */
 export function stargzConfig(registries?: Registries): string {
   const mirrors = Object.entries(registries?.mirrors ?? {})
@@ -73,6 +82,9 @@ export function stargzConfig(registries?: Registries): string {
   return [
     "# stargz-snapshotter's daemon on a node alasio makes: alasio writes this file.",
     "max_concurrency = 1",
+    "",
+    "[blob]",
+    "force_single_range_mode = true",
     "",
     "[fuse_manager]",
     "enable = true",
