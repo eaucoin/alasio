@@ -575,12 +575,19 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     `meta=$(resolved "$(node -e 'const url = new URL(process.env.META_URL); url.password = ""; process.stdout.write(url.href)')") || exit 1`,
     'bucket=$(resolved "$BUCKET") || exit 1',
     `run=${run}`,
-    `mkdir -p "$run" ${bin} ${state} ${cache}`,
+    `mkdir -p "$run" ${bin} ${state} ${cache} || exit 1`,
     `rm -f "$run/handed-over"`,
     // Made, empty, before the mount starts or the log is followed, which would not find it yet.
     `: > "$run/juicefs.log"`,
-    `node_juicefs="${bin}/juicefs-$(sha256sum ${juicefs} | cut -c1-16)"`,
-    `if [ ! -x "$node_juicefs" ]; then cp ${juicefs} "$node_juicefs.$$" && chmod 755 "$node_juicefs.$$" && mv "$node_juicefs.$$" "$node_juicefs"; fi`,
+    // Named by its digest, read whole: a read that fails, as one of a layer lazily pulled may, stops
+    // the mount, which kubelet starts again, rather than run a juicefs of no digest, which is none.
+    `digest=$(sha256sum ${juicefs}) || { echo "could not read ${juicefs}, so the mount is not started" >&2; exit 1; }`,
+    `node_juicefs="${bin}/juicefs-$(printf '%.16s' "$digest")"`,
+    // Copied beside it under a name of its own, made by mktemp, and moved into place, so no
+    // pod's half-written copy is run: no $$, which Kubernetes makes $ in a container's command.
+    `if [ ! -x "$node_juicefs" ]; then`,
+    `  copying=$(mktemp "${bin}/.juicefs.XXXXXX") && { cp ${juicefs} "$copying" && chmod 755 "$copying" && mv "$copying" "$node_juicefs"; } || { rm -f "$copying"; echo "could not copy ${juicefs} to the node, so the mount is not started" >&2; exit 1; }`,
+    "fi",
     // A mount of a juicefs gone, which its kernel answers as no longer connected: unmounted, so this
     // one mounts afresh. Not one that fails otherwise, as a juicefs that serves does while its
     // metadata engine is unreachable, which this one takes over.

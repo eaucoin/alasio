@@ -40,9 +40,10 @@ interface Mount {
  * The mount's script, its juicefs doing as `juicefs` says, its mount the node's mount table's
  * line while it serves; where `left`, the table holds a mount of a juicefs gone at the root
  * already, which the kernel answers as not connected until it is unmounted; where
- * `unreachable`, the mount it takes over fails its reads, as one whose metadata engine is down.
+ * `unreachable`, the mount it takes over fails its reads, as one whose metadata engine is down;
+ * where `unreadable`, its image's juicefs cannot be read, as one of a layer whose read failed.
  */
-function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = false, env: given = {} as Record<string, string> } = {}): Mount & { readonly takeOver: () => void } {
+function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = false, unreadable = false, env: given = {} as Record<string, string> } = {}): Mount & { readonly takeOver: () => void } {
   const directory = mkdtempSync(join(tmpdir(), "alasio-workspace-mount-"));
   const root = join(directory, "workspaces");
   const mountinfo = join(directory, "mountinfo");
@@ -88,7 +89,7 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = f
     "esac",
   ].join("\n"));
   for (const file of [image, inNode, resolve]) chmodSync(file, 0o755);
-  const paths: MountPaths = { run: join(directory, "run"), bin: join(directory, "bin"), state: join(directory, "state"), cache: join(directory, "cache"), juicefs: image, mountinfo, inNode, resolve: `${resolve} hosts` };
+  const paths: MountPaths = { run: join(directory, "run"), bin: join(directory, "bin"), state: join(directory, "state"), cache: join(directory, "cache"), juicefs: unreadable ? join(directory, "unread-juicefs") : image, mountinfo, inNode, resolve: `${resolve} hosts` };
   mkdirSync(paths.run);
   const env = { ...process.env, META_URL: "redis://:a%40secret@alasio-valkey.alasio.svc.cluster.local:6379/1", BUCKET: "http://alasio-seaweedfs.alasio.svc.cluster.local:8333/workspaces", ...given };
   // A group of its own, so whatever it started is ended with it.
@@ -169,6 +170,14 @@ test("a mount that ends without handing its session over fails, so kubelet start
   assert.equal(existsSync(join(failed.paths.run, "handed-over")), false);
   assert.match(failed.out(), /the metadata engine refused us/u);
   assert.match(failed.out(), /juicefs mount ended \(3\) without handing its mount over/u);
+});
+
+test("a mount whose image's juicefs cannot be read, as one of a layer whose read failed, fails before it runs any juicefs, saying so", async (t) => {
+  const unread = mount(t, "serves", { unreadable: true });
+  assert.equal(await unread.ended, 1);
+  assert.match(unread.out(), /could not read .*unread-juicefs, so the mount is not started/u);
+  assert.deepEqual(unread.inNode(), []);
+  assert.deepEqual(readdirSync(unread.paths.bin), []);
 });
 
 test("a mount left at the root by a juicefs gone, as a pod killed with no successor leaves one, is unmounted before the node is mounted afresh", async (t) => {

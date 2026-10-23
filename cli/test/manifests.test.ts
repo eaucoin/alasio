@@ -2333,6 +2333,16 @@ describe("workspace storage", () => {
     }
   });
 
+  // Kubernetes makes $$ of a container's command $, and $(NAME) of a variable the container has its value: the script as sh runs it.
+  test("runs the nodes' mount by a script Kubernetes leaves as written, its copy of juicefs made under a name mktemp gives it", () => {
+    const command = one<V1DaemonSet>(install(), "DaemonSet", "alasio-workspace-mount").spec?.template.spec?.containers.find(({ name }) => name === "workspace-mount")?.command ?? [];
+    assert.deepEqual(command.slice(0, 2), ["sh", "-c"]);
+    const script = command[2] ?? "";
+    assert.equal(script.includes("$$"), false);
+    assert.deepEqual(script.match(/\$\([A-Za-z_][A-Za-z0-9_]*\)/gu), null);
+    assert.ok(script.includes('copying=$(mktemp "/var/lib/alasio/bin/.juicefs.XXXXXX") && { cp /usr/local/bin/juicefs "$copying" && chmod 755 "$copying" && mv "$copying" "$node_juicefs"; }'), script);
+  });
+
   test("admits JuiceFS's clients alone, alasio's JuiceFS admins and the nodes' mount, to Valkey, but for the node agents setting quotas and the collector's scraper reading its metrics, and to the object store's S3 port, with Valkey's, which formats the file system", () => {
     const objects = install();
     const policy = (name: string) =>
