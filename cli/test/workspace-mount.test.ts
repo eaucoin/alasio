@@ -23,7 +23,7 @@ import { HANDED_OVER, type MountPaths, SERVING, workspaceMountReady, workspaceMo
 import { serveFakeKube } from "./support/fake-kube.ts";
 
 /** What juicefs's stand-in does: serve until it is ended, take a mount over once told to and serve it, hand its mount over, or fail. */
-type Juicefs = "serves" | "takes over" | "hands over" | "fails";
+type Juicefs = "serves" | "takes over" | "hands over" | "fails" | "never serves";
 
 interface Mount {
   readonly paths: MountPaths;
@@ -41,20 +41,29 @@ interface Mount {
  * line while it serves; where `left`, the table holds a mount of a juicefs gone at the root
  * already, which the kernel answers as not connected until it is unmounted; where
  * `unreachable`, the mount it takes over fails its reads, as one whose metadata engine is down;
- * where `unreadable`, its image's juicefs cannot be read, as one of a layer whose read failed.
+ * where `unreadable`, its image's juicefs cannot be read, as one of a layer whose read failed;
+ * where `hung`, the table holds a mount at the root already that answers nothing, as one whose
+ * juicefs is stopped or hangs does, until it is unmounted; where `slow`, the mount it takes over
+ * answers what needs its metadata engine, a listing, in no less than a minute, as one whose
+ * metadata engine is slow does, and what it holds in memory, its .config, at once.
+ * `serveWaitSeconds` is how long its juicefs has to serve.
  */
-function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = false, unreadable = false, env: given = {} as Record<string, string> } = {}): Mount & { readonly takeOver: () => void } {
+function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = false, unreadable = false, hung = false, slow = false, serveWaitSeconds = 180, env: given = {} as Record<string, string> } = {}): Mount & { readonly takeOver: () => void } {
   const directory = mkdtempSync(join(tmpdir(), "alasio-workspace-mount-"));
   const root = join(directory, "workspaces");
   const mountinfo = join(directory, "mountinfo");
   const ran = join(directory, "in-node");
   const dead = join(directory, "dead");
   const failing = join(directory, "failing");
+  const hanging = join(directory, "hanging");
+  const slowed = join(directory, "slow");
   const line = `36 1 0:50 / ${root} rw,relatime shared:9 - fuse.juicefs JuiceFS:workspaces rw`;
   // The mount of the pod a mount that takes over replaces, served still.
-  writeFileSync(mountinfo, left || juicefs === "takes over" ? `${line}\n` : "");
+  writeFileSync(mountinfo, left || hung || juicefs === "takes over" ? `${line}\n` : "");
+  if (hung) writeFileSync(hanging, "");
   if (left) writeFileSync(dead, "");
   if (unreachable) writeFileSync(failing, "");
+  if (slow) writeFileSync(slowed, "");
   // Served, it reads as a directory.
   if (juicefs === "takes over") mkdirSync(root);
   const told = join(directory, "take-over");
@@ -64,18 +73,27 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = f
     "takes over": `trap 'exit 0' TERM; while [ ! -e ${told} ]; do sleep 0.05; done; ${serving}; while :; do sleep 0.1; done`,
     "hands over": `echo 'juicefs[7] <INFO>: ${HANDED_OVER} [launchMount@mount_unix.go:1057]'; exit 1`,
     fails: "echo 'juicefs[7] <FATAL>: the metadata engine refused us'; exit 3",
+    // As one held up on a read of a mount that answers nothing: it says nothing more, and ends on KILL alone.
+    "never serves": "echo 'juicefs[7] <INFO>: Data use s3://bucket/workspaces/'; trap '' TERM; while :; do sleep 0.1; done",
   };
   const image = join(directory, "image-juicefs");
   writeFileSync(image, `#!/bin/sh\n${what[juicefs]}\n`);
-  // The node's namespace, the test's own: each command logged, a dead mount's ls not connected and a failing one's ls an I/O error, as
-  // the kernel and juicefs answer, its umount taking it out of the table.
+  // The node's namespace, the test's own: each command logged, as the kernel and juicefs answer:
+  // a dead mount not connected, a hung one nothing; one whose metadata engine is down failing
+  // its listing, one whose metadata engine is slow listing in a minute; and, of each that
+  // serves, its .config read at once; its umount taking it out of the table.
   const inNode = join(directory, "nsenter");
   writeFileSync(inNode, [
     "#!/bin/sh",
     `echo "$*" >> ${ran}`,
-    `if [ "$1" = ls ] && [ -e ${dead} ]; then echo "ls: cannot access '$2': Transport endpoint is not connected" >&2; exit 2; fi`,
+    `if [ "$1" = ls ] || [ "$1" = cat ]; then`,
+    `  if [ -e ${dead} ]; then echo "$1: '$2': Transport endpoint is not connected" >&2; exit 2; fi`,
+    `  if [ -e ${hanging} ]; then sleep 60; fi`,
+    "fi",
+    `if [ "$1" = cat ] && [ "$2" = ${root}/.config ]; then echo '{"Meta": {}}'; exit 0; fi`,
     `if [ "$1" = ls ] && [ -e ${failing} ]; then echo "ls: reading directory '$2': Input/output error" >&2; exit 2; fi`,
-    `if [ "$1" = umount ]; then rm -f ${dead}; : > ${mountinfo}; exit 0; fi`,
+    `if [ "$1" = ls ] && [ -e ${slowed} ]; then sleep 60; fi`,
+    `if [ "$1" = umount ]; then rm -f ${dead} ${hanging}; : > ${mountinfo}; exit 0; fi`,
     'exec "$@"',
   ].join("\n"));
   // The pod's DNS: the cluster's two Services, and nothing else.
@@ -93,7 +111,7 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = f
   mkdirSync(paths.run);
   const env = { ...process.env, META_URL: "redis://:a%40secret@alasio-valkey.alasio.svc.cluster.local:6379/1", BUCKET: "http://alasio-seaweedfs.alasio.svc.cluster.local:8333/workspaces", ...given };
   // A group of its own, so whatever it started is ended with it.
-  const child = spawn("sh", ["-c", workspaceMountScript(root, 1024, paths)], { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+  const child = spawn("sh", ["-c", workspaceMountScript(root, 1024, paths, serveWaitSeconds)], { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
   let out = "";
   child.stdout?.on("data", (chunk: Buffer) => (out += chunk.toString()));
   child.stderr?.on("data", (chunk: Buffer) => (out += chunk.toString()));
@@ -118,9 +136,9 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = f
   };
 }
 
-/** Waits until `condition` holds, for a few seconds at most. */
-async function until(condition: () => boolean): Promise<void> {
-  for (let n = 0; n < 100 && !condition(); n += 1) await sleep(50);
+/** Waits until `condition` holds, for `tries` looks 50 ms apart, a few seconds unless given. */
+async function until(condition: () => boolean, tries = 100): Promise<void> {
+  for (let n = 0; n < tries && !condition(); n += 1) await sleep(50);
   assert.ok(condition());
 }
 
@@ -153,10 +171,10 @@ test("a mount whose juicefs runs is not ready while the node's table holds the m
   await until(() => taking.ready());
 });
 
-test("a mount that hands its session over idles, not ready, until its pod is deleted", async (t) => {
+test("a mount that hands its session over idles, ready, until its pod is deleted, as Kubernetes deletes it at once otherwise, its successor not ready yet", async (t) => {
   const handed = mount(t, "hands over");
   await until(() => existsSync(join(handed.paths.run, "handed-over")));
-  assert.equal(handed.ready(), false);
+  assert.equal(handed.ready(), true);
   await sleep(500);
   assert.equal(handed.child.exitCode, null);
   assert.match(handed.out(), /handed over to the pod that replaces this one/u);
@@ -178,6 +196,33 @@ test("a mount whose image's juicefs cannot be read, as one of a layer whose read
   assert.match(unread.out(), /could not read .*unread-juicefs, so the mount is not started/u);
   assert.deepEqual(unread.inNode(), []);
   assert.deepEqual(readdirSync(unread.paths.bin), []);
+});
+
+test("a mount whose juicefs serves nothing within its wait, as one held up taking over a mount that answers nothing, has it ended, KILLed where TERM does not end it, and fails, so kubelet starts it again", { timeout: 30_000 }, async (t) => {
+  const stuck = mount(t, "never serves", { serveWaitSeconds: 2 });
+  const started = Date.now();
+  assert.equal(await stuck.ended, 137);
+  assert.ok(Date.now() - started < 15_000, `ended ${Date.now() - started} ms on`);
+  assert.match(stuck.out(), /juicefs served nothing within 2 s of starting, so it is ended, and the mount started again to mount afresh/u);
+  assert.match(stuck.out(), /juicefs mount ended \(137\) without handing its mount over/u);
+  assert.equal(stuck.ready(), false);
+});
+
+test("a mount at the root that answers nothing, as one whose juicefs is stopped or hangs, not even its .config, is unmounted within 5 s before the node is mounted afresh", async (t) => {
+  const serving = mount(t, "serves", { hung: true });
+  await until(() => serving.ready(), 200);
+  const ran = serving.inNode();
+  assert.ok(ran.indexOf(`umount -l ${serving.root}`) >= 0 && ran.indexOf(`umount -l ${serving.root}`) < ran.findIndex((command) => command.includes(" mount ")), ran.join("\n"));
+  await until(() => serving.out().includes("unmounted the node's mount, whose juicefs answered nothing in 5 s, not even its .config"));
+});
+
+test("a mount whose metadata engine is slow, as it is where `up` rolls the mount, its listing taking a minute, but which answers its .config, is taken over, not unmounted", async (t) => {
+  const taking = mount(t, "takes over", { slow: true });
+  await until(() => existsSync(join(taking.paths.run, "juicefs.pid")), 200);
+  taking.takeOver();
+  await until(() => taking.ready());
+  assert.ok(!taking.inNode().some((command) => command.startsWith("umount")), taking.inNode().join("\n"));
+  assert.doesNotMatch(taking.out(), /unmounted the node's mount/u);
 });
 
 test("a mount left at the root by a juicefs gone, as a pod killed with no successor leaves one, is unmounted before the node is mounted afresh", async (t) => {

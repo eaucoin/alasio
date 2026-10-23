@@ -518,6 +518,13 @@ export interface MountPaths {
   readonly resolve: string;
 }
 
+/**
+ * How long a mount's juicefs has to serve the node's mount once it starts: past what a takeover
+ * takes, juicefs's own waits in it bounded at some 70 s (the FUSE session's fd, then the old
+ * mount's end), and a fresh mount, a matter of seconds.
+ */
+export const MOUNT_SERVE_WAIT_SECONDS = 180;
+
 export const MOUNT_PATHS: MountPaths = {
   run: MOUNT_RUN,
   bin: JUICEFS_BIN,
@@ -540,7 +547,14 @@ export const MOUNT_PATHS: MountPaths = {
  * Its juicefs is JuiceFS's static release, of alasio's image, which runs as it is in the node's
  * namespace: copied to the node, under its digest, never over the one a mount runs. A mount left
  * at `root` whose juicefs is gone, as a pod killed with no successor leaves one, which the kernel
- * answers as not connected, is unmounted first, lazily, so the next mounts afresh.
+ * answers as not connected, or whose juicefs answers nothing within 5 s, as one stopped or hung
+ * does, not even of what it holds in memory, is unmounted first, lazily, so the next mounts
+ * afresh.
+ *
+ * Its juicefs, taking a mount over or mounting afresh, serves within MOUNT_SERVE_WAIT_SECONDS
+ * (`serveWaitSeconds`), or is ended, and the mount fails, so kubelet starts it again, to mount
+ * afresh: a takeover whose old mount stopped answering waits, in juicefs's own reads of it, for
+ * as long as it does, and no juicefs serves the node's mount meanwhile.
  *
  * In the node's mount namespace its juicefs reads the node's resolv.conf, which resolves none of
  * the cluster's names, its network the pod's still: so the metadata engine's and the bucket's,
@@ -552,9 +566,10 @@ export const MOUNT_PATHS: MountPaths = {
  * Its juicefs, run in the node's mount namespace, is still this pod's process, of its cgroup: the
  * pod's teardown kills it. So a pod hands its mount over before it is torn down, never after: the
  * pod that replaces it starts beside it (maxSurge), takes its FUSE session over, and only then is
- * it deleted, idle, its juicefs ended already. `paths` are MOUNT_PATHS but for tests.
+ * it deleted, idle, its juicefs ended already, which its readiness keeps it from until then
+ * (workspaceMountReady). `paths` are MOUNT_PATHS but for tests.
  */
-export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: MountPaths = MOUNT_PATHS): string {
+export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: MountPaths = MOUNT_PATHS, serveWaitSeconds = MOUNT_SERVE_WAIT_SECONDS): string {
   const { run, bin, state, cache, juicefs, mountinfo, inNode, resolve } = paths;
   return [
     // `url`, its host a Service's name given as its address, by the pod's DNS.
@@ -588,11 +603,19 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     `if [ ! -x "$node_juicefs" ]; then`,
     `  copying=$(mktemp "${bin}/.juicefs.XXXXXX") && { cp ${juicefs} "$copying" && chmod 755 "$copying" && mv "$copying" "$node_juicefs"; } || { rm -f "$copying"; echo "could not copy ${juicefs} to the node, so the mount is not started" >&2; exit 1; }`,
     "fi",
-    // A mount of a juicefs gone, which its kernel answers as no longer connected: unmounted, so this
-    // one mounts afresh. Not one that fails otherwise, as a juicefs that serves does while its
-    // metadata engine is unreachable, which this one takes over.
-    `if awk -v root=${root} '$5 == root { found = 1 } END { exit !found }' ${mountinfo} && ${inNode} ls ${root} 2>&1 >/dev/null | grep -qi 'not connected'; then`,
-    `  ${inNode} umount -l ${root} && echo "unmounted the node's mount its juicefs left, which served nothing"`,
+    // A mount of a juicefs gone, which its kernel answers as no longer connected, or of one that
+    // answers nothing within 5 s: unmounted, so this one mounts afresh. Asked of its .config,
+    // which juicefs answers of its own memory, never its metadata engine's (JuiceFS's
+    // pkg/vfs/internal.go), so a juicefs that serves still, however slow its metadata engine
+    // is, or unreachable, as it is where `up` rolls the mount, is answered and taken over, its
+    // workspaces kept. Its takeover reads the same file (cmd/mount.go).
+    `if awk -v root=${root} '$5 == root { found = 1 } END { exit !found }' ${mountinfo}; then`,
+    `  probed=$(timeout -s KILL 5 ${inNode} cat ${root}/.config 2>&1 >/dev/null); probing=$?`,
+    `  if [ "$probing" -eq 137 ] || [ "$probing" -eq 124 ]; then`,
+    `    ${inNode} umount -l ${root} && echo "unmounted the node's mount, whose juicefs answered nothing in 5 s, not even its .config"`,
+    `  elif printf '%s' "$probed" | grep -qi 'not connected'; then`,
+    `    ${inNode} umount -l ${root} && echo "unmounted the node's mount its juicefs left, which served nothing"`,
+    "  fi",
     "fi",
     `${inNode} mkdir -p ${root}`,
     `TMPDIR=${state} ${inNode} "$node_juicefs" mount --no-bgjob --metrics 0.0.0.0:${JUICEFS_METRICS_PORT} --bucket "$bucket" --cache-dir ${cache} --cache-size ${cacheSizeMiB} "$meta" ${root} >> "$run/juicefs.log" 2>&1 &`,
@@ -600,12 +623,20 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     `echo "$pid" > "$run/juicefs.pid"`,
     `tail -n +1 -f "$run/juicefs.log" &`,
     "tailer=$!",
+    // Ended where it serves nothing within its wait: TERM, and KILL 5 s on, as one held up on a
+    // read of a mount that answers nothing may not end on TERM.
+    "(",
+    `  for second in $(seq ${serveWaitSeconds}); do grep -qF '${SERVING}' "$run/juicefs.log" && exit 0; kill -0 "$pid" 2>/dev/null || exit 0; sleep 1; done`,
+    `  echo "juicefs served nothing within ${serveWaitSeconds} s of starting, so it is ended, and the mount started again to mount afresh" >&2`,
+    `  kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null`,
+    ") &",
+    "watcher=$!",
     `trap 'kill -TERM "$pid"' TERM INT`,
     `wait "$pid"; code=$?`,
     // A TERM's wait ends as the trap runs; the mount's own end is waited for.
     `while kill -0 "$pid" 2>/dev/null; do wait "$pid"; code=$?; done`,
     "sleep 1",
-    `kill "$tailer" 2>/dev/null`,
+    `kill "$tailer" "$watcher" 2>/dev/null`,
     `if grep -qF '${HANDED_OVER}' "$run/juicefs.log"; then`,
     `  touch "$run/handed-over"`,
     "  echo 'the mount is handed over to the pod that replaces this one, which is idle until it is deleted'",
@@ -620,19 +651,26 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
 
 /**
  * The readiness of a workspace mount's pod: its own juicefs runs, has said it serves the mount
- * point (SERVING), and has not handed its mount over, and the node's mount table holds JuiceFS's
- * mount at `root`: this pod's juicefs serves the node's mount point. The table alone holds the
- * mount of the pod it replaces as its juicefs starts, before it takes that mount over, which the
- * pod it replaces would be deleted for, its mount with it.
+ * point (SERVING), and the node's mount table holds JuiceFS's mount at `root`: this pod's juicefs
+ * serves the node's mount point. The table alone holds the mount of the pod it replaces as its
+ * juicefs starts, before it takes that mount over, which the pod it replaces would be deleted
+ * for, its mount with it.
+ *
+ * Or it has handed its mount over, its part done: ready still, until its DaemonSet's update
+ * deletes it, once the pod that took its mount over is ready. Kubernetes keeps two of a
+ * DaemonSet's pods on a node, a surge's, only while the new is not ready and the old is; were
+ * neither ready, it deletes the old at once (the DaemonSet controller's podsShouldBeOnNode),
+ * whatever the update's maxUnavailable, and the node has no ready pod of its mount while the
+ * takeover runs on.
  */
 export function workspaceMountReady(root: string, paths: Pick<MountPaths, "run" | "mountinfo"> = MOUNT_PATHS): string {
   const { run, mountinfo } = paths;
-  return [
-    `[ ! -e ${run}/handed-over ]`,
+  const serving = [
     `kill -0 "$(cat ${run}/juicefs.pid)" 2>/dev/null`,
     `grep -qF '${SERVING}' ${run}/juicefs.log`,
     `awk -v root=${root} '$5 == root { for (i = 6; i < NF; i += 1) if ($i == "-") { if ($(i + 1) == "fuse.juicefs") found = 1; break } } END { exit !found }' ${mountinfo}`,
   ].join(" && ");
+  return `[ -e ${run}/handed-over ] || { ${serving}; }`;
 }
 
 /**

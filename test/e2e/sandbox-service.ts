@@ -292,6 +292,41 @@ export function sandboxService(): void {
       assert.equal(after.status, 204, `${after.said}; ${await seen()}`);
     });
 
+    test("a handover whose old mount answers nothing, its juicefs held up, leaves the node's mount served by a new pod within its juicefs's wait and its restart, the old mount unmounted", { timeout: 20 * 60_000 }, async () => {
+      const mountPods = async () => kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("workspace-mount")) });
+      const [before] = await mountPods();
+      assert.ok(before?.spec?.nodeName && before.metadata?.name);
+      const node = before.spec.nodeName;
+      // Its juicefs held up, as one that answers nothing is: its supervisor and the mount process it runs stopped, the
+      // FUSE session theirs still, so the node's mount answers no request, as in CI run 39965151183.
+      const stop = [
+        "supervisor=$(cat /run/alasio/juicefs.pid)",
+        'for proc in /proc/[0-9]*; do [ "$(sed "s/.*) //" "$proc/stat" 2>/dev/null | cut -d " " -f 2)" = "$supervisor" ] && kill -STOP "${proc#/proc/}"; done',
+        'kill -STOP "$supervisor"',
+      ].join("\n");
+      await kube.execOk(NAMESPACE, before.metadata.name, ["sh", "-c", stop], { container: "workspace-mount" });
+      await kube.patch(ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE), { spec: { template: { metadata: { annotations: { "alasio.dev/e2e-restartedAt": new Date().toISOString() } } } } });
+      // Served again by a pod of the new template alone: the old deleted once the new is ready.
+      await until("the node's mount served by a new pod alone", async () => {
+        const pods = (await mountPods()).filter(({ spec }) => spec?.nodeName === node);
+        const ready = pods.filter(({ status }) => status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True"));
+        return ready.length === 1 && pods.every(({ metadata }) => metadata?.uid !== before.metadata?.uid) ? true : undefined;
+      }, 12 * 60_000).catch(async (error: unknown) => {
+        for (const pod of (await mountPods()).filter(({ spec }) => spec?.nodeName === node)) {
+          const logged = await kube.logs(NAMESPACE, pod.metadata?.name ?? "", "workspace-mount").catch(String);
+          console.error(`# the mount's pod ${pod.metadata?.name} logged:\n${logged.split("\n").slice(-60).join("\n")}`);
+        }
+        throw error;
+      });
+      // And a workspace is made through it, as the node agent sees the node's mount.
+      let made = { status: 0, said: "" };
+      for (const deadline = Date.now() + 60_000; Date.now() < deadline; await new Promise((resolve) => setTimeout(resolve, 2_000))) {
+        made = await gatewayCall(await mainToken("fs-e2eanswersnothing"), "POST", "/workspace");
+        if (made.status === 204) break;
+      }
+      assert.equal(made.status, 204, made.said);
+    });
+
     test("a node's mount of workspace storage killed with no successor, as a node's reboot ends it, is mounted again by the DaemonSet's restart: a workspace is made after it, and one bound through it is released as broken, then bound again with what it held", async () => {
       const workspace = "fs-e2ereboot";
       const token = await mainToken(workspace);
