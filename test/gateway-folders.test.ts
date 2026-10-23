@@ -228,7 +228,7 @@ test("a folder instance idle for its time is released, its pod gone before its L
       assert.equal(await run(withKube((kube) => kube.read("v1", "Pod", of.namespace, asked.metadata?.name ?? ""))), null);
     });
     // Each counted, by why, as a session workspace's release is.
-    const reason = (why: string) => `k8s.namespace.name=${of.namespace},alasio.gateway.release.reason=${why}`;
+    const reason = (why: string) => `alasio.binder.pool=${FOLDER_POOL},k8s.namespace.name=${of.namespace},alasio.gateway.release.reason=${why}`;
     assert.deepEqual(counted, { [reason("idle")]: 1, [reason("broken")]: 1, [reason("asked")]: 1 });
   } finally {
     stand.close();

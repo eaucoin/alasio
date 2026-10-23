@@ -264,7 +264,7 @@ test("a bound harness is kept while anything goes on in it, its host asked with 
     await ending;
     assert.deepEqual(released, [key]);
     assert.ok(stand.asked.some((path: string) => path === HOST_PATHS.drain));
-    assert.deepEqual(counted, { [`k8s.namespace.name=${env.home},alasio.gateway.release.reason=idle`]: 1 });
+    assert.deepEqual(counted, { [`alasio.binder.pool=${env.codex.name},k8s.namespace.name=${env.home},alasio.gateway.release.reason=idle`]: 1 });
     assert.deepEqual(recorded.detached, [`node-a ${env.home}/${bound.pod}`]);
     assert.equal(await run(readLease(env.codex, key)), null);
     assert.deepEqual(told.filter((event) => event.subject.key === "telegram:41" && event.kind === "harness.released" && event.binding === bound.binding), [

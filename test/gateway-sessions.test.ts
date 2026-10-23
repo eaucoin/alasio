@@ -278,7 +278,7 @@ test("a bound pod whose bayma is idle is kept while a request of it came within 
     const counted = await added(RELEASES, async () => (released = await Effect.runPromise(Effect.provide(sessions.sweep, Layer.fresh(KubeClient.layer)))));
     await stopping;
     assert.deepEqual(released, [key]);
-    assert.deepEqual(counted, { [`k8s.namespace.name=${env.namespace},alasio.gateway.release.reason=idle`]: 1 });
+    assert.deepEqual(counted, { [`alasio.binder.pool=${placement.pool.name},k8s.namespace.name=${env.namespace},alasio.gateway.release.reason=idle`]: 1 });
     assert.deepEqual(recorded.detached, [`node-a ${bound.pod} c-0`]);
     assert.equal(await run(readLease(env.none, key)), null);
     // Told of, to its environment's alasio.
@@ -641,12 +641,12 @@ test("each attach and detach is timed, and each binding released counted by why:
     const asked = await added(RELEASES, async () => {
       assert.equal(await Effect.runPromise(binder.release(placement.pool, key, placement.release)), "released");
     });
-    assert.deepEqual(asked, { [`${of},alasio.gateway.release.reason=asked`]: 1 });
+    assert.deepEqual(asked, { [`alasio.binder.pool=${placement.pool.name},${of},alasio.gateway.release.reason=asked`]: 1 });
   });
   await stopping;
   assert.deepEqual(detached, { [of]: 1 });
   const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-gone", namespace: env.namespace, annotations: { "alasio.dev/binding-key": key } }, spec: { holderIdentity: "none-0" } };
-  assert.deepEqual(await added(RELEASES, () => Effect.runPromise(sessions.lost(env.none, lease))), { [`${of},alasio.gateway.release.reason=lost`]: 1 });
+  assert.deepEqual(await added(RELEASES, () => Effect.runPromise(sessions.lost(env.none, lease))), { [`alasio.binder.pool=${env.none.name},${of},alasio.gateway.release.reason=lost`]: 1 });
 });
 
 test("a release whose sandbox can be saved no more has its bayma go on with the stop it holds, its node's agent running its hook, and is released into no snapshot", async () => {
