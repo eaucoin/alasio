@@ -39,7 +39,11 @@ const PAUSE = `sha256:${"a".repeat(64)}`;
  * list any while `unlisted` is there; an UPGRADE and an UPGRADE_CHECK, each saying it ran,
  * UPGRADE failing while `upgradeFails` is there, and otherwise starting alasio again; a log whose Telegram topic has the partitions
  * `partitions` says, 6 unless given, which its applier grows to 6 while alasio is stopped where
- * `grows` is there, alasio started again said in `ran`; and a node, in `node`, whose containerd
+ * `grows` is there, alasio started again said in `ran`; this release's alasio of the count
+ * `replicas` says, 1 unless given, or, where `keda` is there, scaled by KEDA once the upgrade
+ * is through, which starts it again on a scale of its Deployment's to none, and holds it at
+ * none while its ScaledObject is paused, the pause failing to be lifted while `liftFails` is
+ * there; and a node, in `node`, whose containerd
  * pins the sandbox image k3s gives it, and records the images `images` lists, and whose
  * k3s's ctr says what it was asked to fetch, fetching what no registry answers for failing,
  * and what `unfetched` names fetched to no end.
@@ -57,6 +61,10 @@ function machine() {
   const unlisted = join(root, "unlisted");
   const partitions = join(root, "partitions");
   const grows = join(root, "grows");
+  const replicas = join(root, "replicas");
+  const keda = join(root, "keda");
+  const scaled = join(root, "scaled");
+  const liftFails = join(root, "lift-fails");
   const config = join(root, "config.json");
   const node = join(root, "node");
   const fetched = join(root, "fetched");
@@ -74,6 +82,7 @@ function machine() {
   writeFileSync(busy, "0");
   writeFileSync(lingers, "0");
   writeFileSync(partitions, "6");
+  writeFileSync(replicas, "1");
   writeFileSync(config, JSON.stringify({ target: { host: {} }, install: { host: { enabled: true } } }), { mode: 0o600 });
   writeFileSync(images, `docker.io/rancher/mirrored-pause:3.10.2 ${PAUSE} complete\n`);
   writeFileSync(unreachable, "");
@@ -89,7 +98,8 @@ case "$*" in
     [ ! -e '${unlisted}' ] || exit 1
     left=$(cat '${busy}')
     if [ "$left" -gt 0 ]; then echo $((left - 1)) >'${busy}'; echo "busy: running" >>'${looked}'; echo pod/alasio-0; else echo "busy: none" >>'${looked}'; fi ;;
-  "-n alasio scale deployment alasio --replicas=0") echo "stop alasio" >>'${ran}'; echo stop >>'${looked}'; touch '${stopped}' ;;
+  "-n alasio scale deployment alasio --replicas=0")
+    if [ -e '${scaled}' ]; then echo "stop alasio, which KEDA starts again" >>'${ran}'; else echo "stop alasio" >>'${ran}'; echo stop >>'${looked}'; touch '${stopped}'; fi ;;
   "-n alasio get pod -l app.kubernetes.io/component=alasio -o name")
     [ ! -e '${unlisted}' ] || exit 1
     left=$(cat '${lingers}')
@@ -107,7 +117,13 @@ case "$*" in
   "-n alasio exec alasio-log-0 -c access -- node /opt/alasio/src/log/access.ts partitions telegram.main")
     if [ -e '${grows}' ] && [ -e '${stopped}' ]; then echo 6 >'${partitions}'; fi
     cat '${partitions}' ;;
-  "-n alasio scale deployment alasio --replicas=1") echo "start alasio" >>'${ran}'; rm -f '${stopped}' ;;
+  "-n alasio scale deployment alasio --replicas="*) echo "start alasio at \${6#--replicas=}" >>'${ran}'; rm -f '${stopped}' ;;
+  "-n alasio get scaledobject alasio --ignore-not-found -o name") [ ! -e '${scaled}' ] || echo scaledobject.keda.sh/alasio ;;
+  "-n alasio get deployment alasio -o jsonpath={.spec.replicas}") cat '${replicas}' ;;
+  "-n alasio annotate --overwrite scaledobject alasio autoscaling.keda.sh/paused-replicas=0") echo "pause alasio's ScaledObject" >>'${ran}'; touch '${stopped}' ;;
+  "-n alasio annotate scaledobject alasio autoscaling.keda.sh/paused-replicas-")
+    [ ! -e '${liftFails}' ] || exit 1
+    echo "lift its pause" >>'${ran}'; rm -f '${stopped}' ;;
   "-n alasio rollout status deployment/alasio --timeout=600s") exit 0 ;;
   *) echo "kubectl $* is not the cut-over's" >&2; exit 2 ;;
 esac
@@ -140,7 +156,7 @@ esac
         CONFIG: config,
         NODE_ROOT: node,
         // Starting alasio again, as the upgrade does once it gets as far as it.
-        UPGRADE: `echo upgrade >>'${ran}' && [ ! -e '${upgradeFails}' ] && rm -f '${stopped}'`,
+        UPGRADE: `echo upgrade >>'${ran}' && [ ! -e '${upgradeFails}' ] && rm -f '${stopped}' && { [ ! -e '${keda}' ] || touch '${scaled}'; }`,
         UPGRADE_CHECK: `echo check >>'${ran}'`,
         SETUP_POD: `printf '%s' '${JSON.stringify(SETUP_POD)}'`,
         SETUP_JOB: `printf '%s' '${JSON.stringify(SETUP_JOB)}'`,
@@ -180,6 +196,12 @@ esac
       if (grown) writeFileSync(grows, "");
       else rmSync(grows, { force: true });
     },
+    /** Has this release's alasio of the count `count`. */
+    replicas: (count: number) => writeFileSync(replicas, String(count)),
+    /** Has this release's alasio scaled by KEDA, as a range is. */
+    kedaScales: () => writeFileSync(keda, ""),
+    /** Has the lift of alasio's ScaledObject's pause fail, or succeed again. */
+    liftFails: (fails: boolean) => (fails ? writeFileSync(liftFails, "") : rmSync(liftFails, { force: true })),
     /** Has alasio running again, as the upgrade starts it. */
     started: () => rmSync(stopped, { force: true }),
     /** Has containerd pin `sandbox` as the sandbox image, as k3s writes it. */
@@ -228,9 +250,59 @@ test("once the upgrade is through, the cut-over stops alasio again, once it runs
     at.partitions(1, true);
     const run = at.cutOver();
     assert.equal(run.code, 0, run.said);
-    assert.deepEqual(at.ran(), ["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade", "stop alasio", "start alasio"]);
+    assert.deepEqual(at.ran(), ["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade", "stop alasio", "start alasio at 1"]);
     assert.deepEqual(at.marks(), ["point-of-no-return", "upgraded"]);
     assert.match(run.said, /upgrading, from the cut-over begun at [^\n]*\n[^\n]* waiting for alasio to run no turn, then stopping it again, for the log to give telegram\.main its 6 partitions\n[^\n]* telegram\.main has its 6 partitions\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+  } finally {
+    at.remove();
+  }
+});
+
+test("where KEDA scales this release's alasio, the cut-over pauses its ScaledObject at none for the log to grow the topic, rather than scale alasio, which KEDA would start again, and lifts the pause after", () => {
+  const at = machine();
+  try {
+    at.kedaScales();
+    at.partitions(1, true);
+    const run = at.cutOver(undefined, { STOP_WAIT_SECONDS: "0" });
+    assert.equal(run.code, 0, run.said);
+    assert.deepEqual(at.ran(), ["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade", "pause alasio's ScaledObject", "lift its pause"]);
+    assert.match(run.said, /telegram\.main has its 6 partitions\n[^\n]* alasio's ScaledObject is paused no more: KEDA starts alasio as its updates, events and bound harnesses ask\n[^\n]* upgraded at /u);
+  } finally {
+    at.remove();
+  }
+});
+
+test("a fixed count of this release's alasio is scaled back to that count once the log has grown the topic", () => {
+  const at = machine();
+  try {
+    at.replicas(2);
+    at.partitions(1, true);
+    const run = at.cutOver();
+    assert.equal(run.code, 0, run.said);
+    assert.deepEqual(at.ran(), ["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade", "stop alasio", "start alasio at 2"]);
+  } finally {
+    at.remove();
+  }
+});
+
+test("a run again of a cut-over that stopped alasio for the topic and failed before it started it again starts it, the topic grown", () => {
+  const at = machine();
+  try {
+    at.kedaScales();
+    at.partitions(1, true);
+    at.liftFails(true);
+    const failed = at.cutOver(undefined, { STOP_WAIT_SECONDS: "0" });
+    assert.notEqual(failed.code, 0);
+    assert.match(failed.said, /FAILED: the pause of alasio's ScaledObject could not be lifted: remove its annotation autoscaling\.keda\.sh\/paused-replicas\n$/u);
+    assert.deepEqual([at.ran(), at.marks()], [["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade", "pause alasio's ScaledObject"], ["point-of-no-return"]]);
+    at.liftFails(false);
+    const again = at.cutOver(undefined, { STOP_WAIT_SECONDS: "0" });
+    assert.equal(again.code, 0, again.said);
+    // The upgrade, recorded once what follows it is through, run again, and then the pause lifted.
+    assert.deepEqual([at.ran(), at.marks()], [["upgrade", "lift its pause"], ["point-of-no-return", "upgraded"]]);
+    // Started again once: a run after finds nothing to start.
+    assert.equal(at.cutOver(undefined, { STOP_WAIT_SECONDS: "0" }).code, 0);
+    assert.deepEqual(at.ran(), []);
   } finally {
     at.remove();
   }
@@ -242,7 +314,7 @@ test("a Telegram topic the log does not grow within its bound, as an update came
     at.partitions(1, false);
     const run = at.cutOver(undefined, { PARTITIONS_WAIT_SECONDS: "0" });
     assert.equal(run.code, 0, run.said);
-    assert.deepEqual(at.ran(), ["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade", "stop alasio", "start alasio"]);
+    assert.deepEqual(at.ran(), ["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade", "stop alasio", "start alasio at 1"]);
     assert.match(run.said, /telegram\.main is left as it is, of 1 of its 6 partitions, as an update came for it while alasio was stopped: the next stop of alasio with nothing unread grows it\n[^\n]* upgraded at /u);
   } finally {
     at.remove();

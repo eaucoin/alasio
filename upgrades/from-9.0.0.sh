@@ -11,10 +11,11 @@
 # CONFIG is the configuration's file, the owner's alasio/config.json, which UPGRADE upgrades
 # by and the steps below read, and change where they say.
 #
-# UPGRADE runs the release's upgrade as the configuration's owner, which restarts alasio,
-# ending the turn it runs; UPGRADE_CHECK proves, before the upgrade, that it can, and that the
-# release accepts the installation as it is. On a machine whose node is on the owner's PATH
-# alone, as sudo's secure_path drops it:
+# UPGRADE runs the release's upgrade as the configuration's owner, which replaces alasio,
+# ending the turn it runs, with this release's: started at its count where that is fixed, or,
+# where KEDA scales it, once an update, event or bound harness wakes it. UPGRADE_CHECK proves,
+# before the upgrade, that it can, and that the release accepts the installation as it is. On
+# a machine whose node is on the owner's PATH alone, as sudo's secure_path drops it:
 #
 #   as='sudo -u <owner> env HOME=/home/<owner> PATH=<node bin>:/usr/local/bin:/usr/bin:/bin'
 #   UPGRADE="$as npx --yes alasio@<v> upgrade --timeout 30m"
@@ -320,26 +321,64 @@ stack_setup_before() {
 # (src/log/access.ts), and the upgrade starts this release's alasio as it rolls the log, so the
 # applier finds alasio reading it. So, once the upgrade is through, alasio is stopped again,
 # once it runs no turn, as above, the applier, which looks again every few seconds, given
-# PARTITIONS_WAIT_SECONDS (2 min) to grow the topic, and alasio started again. Where an update
-# came while alasio was stopped, and so is unread, the topic is left as it is, said: a topic of
-# one serves the one alasio this release runs, and the next stop of alasio with nothing unread
-# grows it.
+# PARTITIONS_WAIT_SECONDS (2 min) to grow the topic, and alasio started again. Where KEDA
+# scales alasio, as it does a range (install.alasio.scaling, from none to three by default),
+# a scale of alasio's Deployment would be undone at KEDA's next look, as any update, event or
+# bound harness wakes it: so its ScaledObject is paused at none instead, and the pause lifted
+# after, KEDA starting alasio again as those say. A fixed count is scaled to none, and back to
+# that count after. What was stopped is recorded in OUT/partitions-stopped until alasio is
+# started again, so a run again after a failure in between starts it. Where an update came
+# while alasio was stopped, and so is unread, the topic is left as it is, said: each alasio
+# reads what partitions it is given, the one there is serving all, and the next stop of alasio
+# with nothing unread grows it.
 
 TELEGRAM_TOPIC=telegram.main
 TELEGRAM_PARTITIONS=6
 PARTITIONS_WAIT_SECONDS=${PARTITIONS_WAIT_SECONDS:-120}
+PAUSED=autoscaling.keda.sh/paused-replicas
 # How many partitions the topic `$1` has, as the log's access applier reads them.
 partitions() {
   k exec alasio-log-0 -c access -- node /opt/alasio/src/log/access.ts partitions "$1"
 }
+# alasio started again, as OUT/partitions-stopped says it was stopped: its ScaledObject's
+# pause lifted, or its Deployment scaled back to its count.
+alasio_started_again() {
+  local stopped
+  stopped=$(cat "$OUT/partitions-stopped")
+  if [ "$stopped" = keda ]; then
+    k annotate scaledobject alasio "$PAUSED-" >/dev/null || fail "the pause of alasio's ScaledObject could not be lifted: remove its annotation $PAUSED"
+    log "alasio's ScaledObject is paused no more: KEDA starts alasio as its updates, events and bound harnesses ask"
+  else
+    k scale deployment alasio --replicas="$stopped" >/dev/null || fail "alasio could not be started again"
+    k rollout status deployment/alasio --timeout="${STOP_WAIT_SECONDS}s" >/dev/null || fail "alasio did not start again within ${STOP_WAIT_SECONDS} s"
+  fi
+  rm -f "$OUT/partitions-stopped"
+}
 telegram_partitions_after() {
-  local has waited=0
+  local has waited=0 scaler replicas
   has=$(partitions "$TELEGRAM_TOPIC") || fail "the partitions of $TELEGRAM_TOPIC could not be read"
-  [ "$has" -lt "$TELEGRAM_PARTITIONS" ] || return 0
+  if [ "$has" -ge "$TELEGRAM_PARTITIONS" ]; then
+    # A run before stopped alasio, and failed before it started it again.
+    [ ! -e "$OUT/partitions-stopped" ] || alasio_started_again
+    return 0
+  fi
   log "waiting for alasio to run no turn, then stopping it again, for the log to give $TELEGRAM_TOPIC its $TELEGRAM_PARTITIONS partitions"
   gone app.kubernetes.io/component=alasio,alasio.dev/busy=true "$TURN_WAIT_SECONDS" ||
     fail "alasio ran a turn on for ${TURN_WAIT_SECONDS} s: let it end, and run the cut-over again"
-  k scale deployment alasio --replicas=0 >/dev/null || fail "alasio could not be stopped"
+  if [ ! -e "$OUT/partitions-stopped" ]; then
+    scaler=$(k get scaledobject alasio --ignore-not-found -o name) || fail "whether KEDA scales alasio could not be read"
+    if [ -n "$scaler" ]; then
+      echo keda >"$OUT/partitions-stopped"
+    else
+      replicas=$(k get deployment alasio -o jsonpath='{.spec.replicas}') || fail "alasio's count could not be read"
+      echo "$replicas" >"$OUT/partitions-stopped"
+    fi
+  fi
+  if [ "$(cat "$OUT/partitions-stopped")" = keda ]; then
+    k annotate --overwrite scaledobject alasio "$PAUSED=0" >/dev/null || fail "alasio's ScaledObject could not be paused"
+  else
+    k scale deployment alasio --replicas=0 >/dev/null || fail "alasio could not be stopped"
+  fi
   gone app.kubernetes.io/component=alasio "$STOP_WAIT_SECONDS" || fail "alasio did not stop within ${STOP_WAIT_SECONDS} s"
   while has=$(partitions "$TELEGRAM_TOPIC") && [ "$has" -lt "$TELEGRAM_PARTITIONS" ] && [ "$waited" -lt "$PARTITIONS_WAIT_SECONDS" ]; do
     sleep "$POLL_SECONDS"
@@ -351,8 +390,7 @@ telegram_partitions_after() {
   else
     log "$TELEGRAM_TOPIC has its $has partitions"
   fi
-  k scale deployment alasio --replicas=1 >/dev/null || fail "alasio could not be started again"
-  k rollout status deployment/alasio --timeout="${STOP_WAIT_SECONDS}s" >/dev/null || fail "alasio did not start again within ${STOP_WAIT_SECONDS} s"
+  alasio_started_again
 }
 # END telegram partitions.
 

@@ -340,39 +340,57 @@ describe("alasio", () => {
     assert.match(decoded.failure.message, /telegram\.existingSecret/u);
   });
 
-  // One alasio at a time, never two, on main and on a branch, a rollout's new one starting
-  // only once the old is gone: alasio still runs its turns in its own process, and its start
-  // settles what the last left (it lets go of every hold and ends every active turn), so a
-  // second, or a rollout's surge, would end the turns the first runs. Until conversations'
-  // workers are claimed from the store and recovery comes from the harnesses' lost bindings
-  // alone, nothing may run two.
-  test("runs one alasio at a time, never two, on main and on a branch", () => {
-    for (const objects of [install(), branchObjects(configOf(), "try", BASELINE)]) {
+  // Of a fixed count of one, as a configuration may hold it, an update stops the old before the new starts.
+  test("runs one alasio of a fixed count of one, on main and on a branch, a rollout's new one starting once the old is gone, which nothing scales, nor spreads, nor budgets but while busy", () => {
+    const fixed = (config: InstallConfig) => ({ ...config, alasio: { ...config.alasio, scaling: { min: 1, max: 1 } } });
+    for (const objects of [alasioObjects(fixed(configOf())), branchObjects(fixed(configOf()), "try", BASELINE)]) {
       const deployment = one<V1Deployment>(objects, "Deployment", "alasio");
       assert.equal(deployment.spec?.replicas, 1);
       assert.equal(deployment.spec?.strategy?.type, "Recreate");
+      assert.deepEqual(all(objects, "ScaledObject").filter(({ metadata }) => metadata?.name === "alasio"), []);
+      assert.equal(deployment.spec?.template.spec?.topologySpreadConstraints, undefined);
+      const budgets = all(objects, "PodDisruptionBudget").map(({ metadata }) => metadata?.name);
+      assert.ok(budgets.includes("alasio-busy") && !budgets.includes("alasio-alasio"), budgets.join());
     }
   });
 
-  test("refuses a scale of alasio's but one until its turns run in harness pools alone, and more than its Telegram topic's partitions; gives it its grace to deliver what it owes as it stops", () => {
-    const refusal = (scaling: unknown) => {
-      const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" }, scaling } });
-      assert.ok(Result.isFailure(decoded));
-      return decoded.failure.message;
-    };
-    assert.equal(refusal({ min: 0 }), "alasio.scaling.min must be at least 1 until its conversations' turns run in harness pools alone");
-    assert.equal(refusal({ max: 2 }), "alasio.scaling.max must be at most 1 until its conversations' turns run in harness pools alone");
-    assert.equal(refusal({ max: 7 }), "alasio.scaling.max must be at most 6");
-    const deployment = one<V1Deployment>(install(), "Deployment", "alasio");
-    assert.equal(deployment.spec?.template.spec?.terminationGracePeriodSeconds, 360);
-    // Of a fixed count, nothing scales it.
-    assert.deepEqual(all(install(), "ScaledObject").filter(({ metadata }) => metadata?.name === "alasio"), []);
+  // A fixed count of more than one, as a configuration may hold it: each update rolls a new one out beside each old, which nothing scales.
+  test("runs a fixed count of two alasios as decoded, a rollout's new one beside each old, which nothing scales", () => {
+    const objects = install({ alasio: { scaling: { min: 2, max: 2 } } });
+    const deployment = one<V1Deployment>(objects, "Deployment", "alasio");
+    assert.deepEqual([deployment.spec?.replicas, deployment.spec?.strategy], [2, { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }]);
+    assert.deepEqual(all(objects, "ScaledObject").filter(({ metadata }) => metadata?.name === "alasio"), []);
   });
 
-  // The scaling it is held from until then, as it is rendered for a scale apart.
+  // As every component that may run more than one replica (../src/manifests/disruption.ts), a busy one held by the busy budget alone.
+  test("spreads alasio's replicas across nodes where it may run more than one, on main and on a branch, a drain evicting one of those not busy at a time, and a busy one never but unready", () => {
+    for (const [objects, namespace] of [[alasioObjects(configOf()), "alasio"], [branchObjects(configOf(), "try", BASELINE), branchEnvironment("try").namespace]] as const) {
+      const deployment = one<V1Deployment>(objects, "Deployment", "alasio");
+      const selector = { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "alasio" };
+      assert.deepEqual(deployment.spec?.template.spec?.topologySpreadConstraints, [
+        { maxSkew: 1, topologyKey: "kubernetes.io/hostname", whenUnsatisfiable: "ScheduleAnyway", labelSelector: { matchLabels: selector } },
+        { maxSkew: 1, topologyKey: "topology.kubernetes.io/zone", whenUnsatisfiable: "ScheduleAnyway", labelSelector: { matchLabels: selector } },
+      ]);
+      // alasio's own, of the others there (the bound pods').
+      const budgets = all<V1PodDisruptionBudget>(objects, "PodDisruptionBudget").filter(({ metadata }) => metadata?.namespace === namespace && ["alasio-busy", "alasio-alasio"].includes(metadata.name ?? ""));
+      assert.deepEqual(budgets.map(({ metadata, spec }) => [metadata?.name, spec]), [
+        ["alasio-busy", { maxUnavailable: 0, selector: { matchLabels: { "alasio.dev/busy": "true" } }, unhealthyPodEvictionPolicy: "AlwaysAllow" }],
+        ["alasio-alasio", { maxUnavailable: 1, selector: { matchLabels: selector, matchExpressions: [{ key: "alasio.dev/busy", operator: "NotIn", values: ["true"] }] } }],
+      ]);
+    }
+  });
+
+  test("refuses a scale of alasio's of more than its Telegram topic's partitions; gives it its grace to deliver what it owes as it stops", () => {
+    const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" }, scaling: { max: 7 } } });
+    assert.ok(Result.isFailure(decoded));
+    assert.equal(decoded.failure.message, "alasio.scaling.max must be at most 6");
+    const deployment = one<V1Deployment>(install(), "Deployment", "alasio");
+    assert.equal(deployment.spec?.template.spec?.terminationGracePeriodSeconds, 360);
+  });
+
+  // As it is rendered by default: none to three, each conversation driven by the one holding its worker's claim.
   test("scales alasio from none on what waits on its environment's topics and on its bound harnesses, back once none has been seen for its cooldown, a rollout's new one beside the old", () => {
-    const scaledOf = (config: InstallConfig) => ({ ...config, alasio: { ...config.alasio, scaling: { min: 0, max: 3 } } });
-    const main = scaledOf(configOf());
+    const main = configOf();
     const deployment = alasioObjects(main).find((object): object is V1Deployment => object.kind === "Deployment")!;
     assert.deepEqual([deployment.spec?.replicas, deployment.spec?.strategy], [undefined, { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }]);
     const [authentication, scaled] = alasioScaling(main, MAIN_ENVIRONMENT, deployment) as [KubernetesObject, ScaledObject];
@@ -385,7 +403,7 @@ describe("alasio", () => {
     const bound = (object: ScaledObject) => object.spec.triggers.filter(({ type }) => type === "metrics-api").map(({ metadata }) => [metadata["url"], metadata["valueLocation"], metadata["targetValue"], metadata["activationTargetValue"]]);
     assert.deepEqual(bound(scaled), [["http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio", "bound", "1000000", "0"]]);
     // A branch's reads its events from its first, and asks no forks of its own.
-    const branch = alasioScaling(scaledOf(configOf()), branchEnvironment("try"), deployment).find((object): object is ScaledObject => object.kind === "ScaledObject")!;
+    const branch = alasioScaling(configOf(), branchEnvironment("try"), deployment).find((object): object is ScaledObject => object.kind === "ScaledObject")!;
     assert.deepEqual(branch.spec.triggers.filter(({ type }) => type === "kafka").map(lag), [["alasio.try", "telegram.try", "20", "earliest"], ["alasio-events.try", "events.try", "1", "earliest"]]);
     assert.deepEqual(bound(branch), [[`http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/${branchEnvironment("try").namespace}`, "bound", "1000000", "0"]]);
   });
@@ -499,11 +517,11 @@ describe("neon", () => {
     assert.equal(setup?.env?.find(({ name }) => name === "S3_EXTERNAL"), undefined);
   });
 
-  test("runs each workload at the count its scale fixes: one, but for the safekeepers, the compute, whose count neon-control owns, and the lake's intake and loader, the sandbox pools, the harness pools and the relay of the Codex login, which KEDA scales", () => {
+  test("runs each workload at the count its scale fixes: one, but for the safekeepers, the compute, whose count neon-control owns, and alasio, the lake's intake and loader, the sandbox pools, the harness pools and the relay of the Codex login, which KEDA scales", () => {
     const objects = install({ host: { enabled: true } });
     const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet")];
     assert.ok(workloads.length > 10);
-    const counts: Record<string, number | undefined> = { "alasio-neon-safekeeper": 3, "alasio-neon-compute": undefined, "alasio-neon-compute-ro": undefined, "alasio-lake-intake": undefined, "alasio-lake-loader": undefined, "sandboxes-none": undefined, "sandboxes-full": undefined, "harness-codex": undefined, "harness-claude": undefined, "harness-folder-codex": undefined, "harness-folder-claude": undefined, "alasio-codex-login": undefined };
+    const counts: Record<string, number | undefined> = { alasio: undefined, "alasio-neon-safekeeper": 3, "alasio-neon-compute": undefined, "alasio-neon-compute-ro": undefined, "alasio-lake-intake": undefined, "alasio-lake-loader": undefined, "sandboxes-none": undefined, "sandboxes-full": undefined, "harness-codex": undefined, "harness-claude": undefined, "harness-folder-codex": undefined, "harness-folder-claude": undefined, "alasio-codex-login": undefined };
     for (const { metadata, spec } of workloads) assert.equal(spec?.replicas, Object.hasOwn(counts, metadata?.name ?? "") ? counts[metadata?.name ?? ""] : 1, metadata?.name);
   });
 
@@ -1475,7 +1493,7 @@ describe("Grafana", () => {
     assert.deepEqual([admits(policies, pod, pod, 9094), admits(policies, alasio, pod, 9094), admits(policies, pod, pod, 3000)], [true, false, false]);
     // Of one replica, none of that.
     const single = install();
-    assert.deepEqual(all(single, "PodDisruptionBudget").filter(({ metadata }) => metadata?.namespace === "alasio" && metadata.name !== "alasio-busy").map(({ metadata }) => metadata?.name), ["alasio-neon-safekeeper", "alasio-lake-intake", "alasio-bound"]);
+    assert.deepEqual(all(single, "PodDisruptionBudget").filter(({ metadata }) => metadata?.namespace === "alasio" && metadata.name !== "alasio-busy").map(({ metadata }) => metadata?.name), ["alasio-alasio", "alasio-neon-safekeeper", "alasio-lake-intake", "alasio-bound"]);
     assert.equal(all(single, "Service").find(({ metadata }) => metadata?.name === "alasio-grafana-peers"), undefined);
     assert.equal(container(one<V1Deployment>(single, "Deployment", "alasio-grafana")).env?.find(({ name }) => name.startsWith("GF_UNIFIED_ALERTING_HA")), undefined);
   });
@@ -1977,7 +1995,7 @@ describe("the log", () => {
       { name: "telegram.main", partitions: 6, readInOrderBy: "alasio.main", retentionMs: 604_800_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
       // A day of main's wake records, on one partition, as its one loader reads them, within a segment beside the one it writes.
       { name: "lake.main", partitions: 1, retentionMs: 86_400_000, retentionBytes: 64 * 1024 * 1024, configs: {} },
-      // A week of main's events, on one partition, as its one alasio reads them, each flushed as it is written, as what told of it tells no more.
+      // A week of main's events, on one partition, read by whichever of its alasios holds it, each flushed as it is written, as what told of it tells no more.
       { name: "events.main", partitions: 1, retentionMs: 604_800_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
       // A day of the branches' requests to fork main's sessions, past the wait for an answer, each flushed as it is written, as a branch waits for its answer.
       { name: "forks.main", partitions: 1, retentionMs: 86_400_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },

@@ -213,10 +213,12 @@ async function initialize({ alasio, home, kubeconfig }: Rig): Promise<void> {
   succeeded(await alasio(["init", "--non-interactive", "--kubeconfig", kubeconfig, "--bot-token-file", tokenFile, "--claude-token-file", claudeFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--no-up"]));
 }
 
-/** alasio initialized and up, in the cluster the kubeconfig reaches. */
+/** alasio initialized and up, in the cluster the kubeconfig reaches, of one alasio, as a box holds it, which no KEDA of the rig's scales. */
 async function installed(t: TestContext): Promise<Rig> {
   const setup = await rig(t);
   await initialize(setup);
+  const initialized = setup.config() as { readonly install: { readonly alasio: object } };
+  setup.configure({ ...initialized, install: { ...initialized.install, alasio: { ...initialized.install.alasio, scaling: { min: 1, max: 1 } } } });
   succeeded(await setup.alasio(["up"]));
   return setup;
 }
@@ -1174,7 +1176,7 @@ test("logs prints a component's log, each line with its pod's name when it has s
   assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has alasio, codex-login, collector, collector-scraper, grafana, harness-claude, harness-codex, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake-intake, lake-loader, lake-query, log, /u);
 });
 
-test("restart rolls alasio's pod out again as a manager of its own, and waits until it runs", async (t) => {
+test("restart rolls alasio's pods out again as a manager of its own, waits until they run, and says what it restarted", async (t) => {
   const { alasio, kube } = await installed(t);
   const run = await alasio(["restart"]);
   succeeded(run);
@@ -1184,6 +1186,12 @@ test("restart rolls alasio's pod out again as a manager of its own, and waits un
   const template = (kube.get(DEPLOYMENT)?.spec as { template: { metadata: { annotations: Record<string, string> } } }).template;
   assert.match(template.metadata.annotations["kubectl.kubernetes.io/restartedAt"] ?? "", /^\d{4}-\d\d-\d\dT/u);
   assert.deepEqual(run.printed, ["alasio restarted; a turn it was running continues."]);
+  // Of several, each replaced; of none, asleep, none to restart.
+  const scaled = (replicas: number) => void ((kube.get(DEPLOYMENT)?.spec as { replicas?: number }).replicas = replicas);
+  scaled(3);
+  assert.deepEqual((await alasio(["restart"])).printed, ["alasio's 3 pods restarted, each beside the one replacing it; a turn one was running continues."]);
+  scaled(0);
+  assert.deepEqual((await alasio(["restart"])).printed, ["alasio runs no pod, asleep as KEDA lets it while nothing waits for it: the one it starts next runs anew."]);
 });
 
 test("upgrade says what it installs, and which images change", async (t) => {

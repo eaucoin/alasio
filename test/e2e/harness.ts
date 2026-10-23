@@ -669,6 +669,9 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       resources: { requests: { cpu: "50m", memory: of === "previous" ? "2560Mi" : "256Mi" } },
       // What KEDA scales of an environment's, its relay of its Codex login among it, back to none within the agents shard's run.
       ...(of === "release" && SHARD === "agents" ? { cooldownSeconds: 30 } : {}),
+      // One, as the suites reach its pod as one, but where the agents shard makes its scale a range and fixes it again, and in
+      // the upgrade shard, whose cut-over upgrades to the default scale, KEDA's, as an installation of the release before's does.
+      ...(of === "release" && SHARD !== "upgrade" ? { scaling: { min: 1, max: 1 } } : {}),
       ...on("agent-1"),
     },
     // The release before's folder instances let go after four hours idle, as the box's configuration says. This checkout's limited

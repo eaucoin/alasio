@@ -10,7 +10,9 @@
  *   not;
  * - alasio's pod, while its harnesses run a turn, is labelled busy by alasio for as long as
  *   they do (src/kube/busy.ts), and its namespace's budget of busy pods lets none of them
- *   be evicted: a drain waits until the turn is done;
+ *   be evicted: a drain waits until the turn is done. Its budget of one pod at a time, where
+ *   it may run more than one, counts those not busy alone, as the eviction API refuses a pod
+ *   two budgets select;
  * - a pod the sandbox service has bound, a pool's to a workspace or a folder conversation's
  *   instance, holds what lives only in it until its release, its REPLs' state: its
  *   namespace's budget of bound pods lets none of them be evicted, so a drain waits until
@@ -29,14 +31,19 @@ import type { Scale } from "./config.ts";
 /** Whether a component of `scale` may run more than one replica. */
 export const replicated = ({ max }: Scale): boolean => max > 1;
 
-/** The budget of `component`'s pods in `namespace`, of `scale`: one of them evicted at a time; none for a component of one replica. */
-export function replicaBudget(component: string, namespace: string, scale: Scale): V1PodDisruptionBudget[] {
+/**
+ * The budget of `component`'s pods in `namespace`, of `scale`: one of them evicted at a time;
+ * none for a component of one replica. `unlessBusy`, of its pods not labelled busy alone,
+ * which the budget of busy pods holds (busyBudget).
+ */
+export function replicaBudget(component: string, namespace: string, scale: Scale, { unlessBusy = false }: { readonly unlessBusy?: boolean } = {}): V1PodDisruptionBudget[] {
   if (!replicated(scale)) return [];
+  const notBusy = unlessBusy ? { matchExpressions: [{ key: BUSY_LABEL, operator: "NotIn", values: ["true"] }] } : {};
   return [{
     apiVersion: "policy/v1",
     kind: "PodDisruptionBudget",
     metadata: { name: componentName(component), namespace, labels: labels(component) },
-    spec: { maxUnavailable: 1, selector: { matchLabels: selectorLabels(component) } },
+    spec: { maxUnavailable: 1, selector: { matchLabels: selectorLabels(component), ...notBusy } },
   }];
 }
 

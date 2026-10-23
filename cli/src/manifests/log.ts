@@ -98,9 +98,10 @@ export const loaderGroup = (name: string): string => `lake-loader.${name}`;
  * (src/branch/fork.ts), which a branch's alasio writes and main's reads in its group,
  * `alasio-forks.main`, answering on the branches' events topics, which it may write. The Telegram
  * topic is of TELEGRAM_PARTITIONS partitions, as many as the environment's alasios may be, each
- * chat's updates in one, by its key, so in order; the others of one each, as one alasio and one
- * loader read them. Each keeps a segment beside the one it writes at most: a week of a bot's updates, or of
- * events, and a day of wakes or of requests, is kilobytes. Each update, event and request is
+ * chat's updates in one, by its key, so in order, each partition read by the one alasio of the
+ * group it is given to; the others of one each, read by whichever alasio of its group, or the
+ * loader, holds it. Each keeps a segment beside the one it writes at most: a week of a bot's
+ * updates, or of events, and a day of wakes or of requests, is kilobytes. Each update, event and request is
  * flushed to the volume as it is written, as what told of it does not tell again; a wake, lost,
  * costs nothing.
  */

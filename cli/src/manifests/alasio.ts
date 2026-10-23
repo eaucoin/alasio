@@ -57,7 +57,7 @@ import {
   SESSIONS_CALLER_SECRET,
 } from "./common.ts";
 import { durationSeconds, type InstallConfig } from "./config.ts";
-import { busyBudget } from "./disruption.ts";
+import { busyBudget, replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 
@@ -332,6 +332,8 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
           ...given("nodeSelector", { ...alasio.nodeSelector }),
           ...given("tolerations", [...alasio.tolerations]),
           ...given("affinity", alasio.affinity),
+          // Its replicas, where it may run more than one, on as many nodes as there are.
+          ...spread("alasio", alasio.scaling),
         },
       },
     },
@@ -486,8 +488,9 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
     ...alasioScaling(config, environment, alasio),
     // It runs turns, in its harnesses, which a recreation would end.
     verticalPodAutoscaler(alasio, "AtStart"),
-    // A drain waits for the turns running in its pod to end.
+    // A drain waits for the turns running in its pod to end, and evicts one of its pods not busy at a time.
     busyBudget(environment.namespace),
+    ...replicaBudget("alasio", environment.namespace, config.alasio.scaling, { unlessBusy: true }),
     ...codexLoginObjects(config, environment),
     // What alasio may do beyond what RBAC can say: the cluster's, made with main's.
     ...(environment.branch === null ? busyLabelPolicy() : []),
