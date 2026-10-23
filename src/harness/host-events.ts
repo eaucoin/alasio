@@ -23,6 +23,7 @@ import { EventsConsumer } from "../events/consume.ts";
 import type { Event } from "../events/events.ts";
 import { buildLostHarnessText, lostStatusText } from "../operator/lost-prompt.ts";
 import { type EventWrites, LOST_PREFIX } from "../persistence/store.ts";
+import { countRecovery } from "./recoveries.ts";
 
 /** How a binding is let go of with its pod, which takes the turn it ran with it: deleted, its host ended, or lost (../gateway/releases.ts). */
 const LOST_WITH_POD: ReadonlySet<string> = new Set(["deleted", "broken", "lost"]);
@@ -118,6 +119,7 @@ export class HarnessEvents extends Context.Service<HarnessEvents, {
           prompt: (turn) => buildLostHarnessText(turn.harness),
           said: (outcome, turn) => lostStatusText(outcome, turn.harness),
         }).pipe(
+          Effect.tap((recovery) => countRecovery(recovery, "lost")),
           Effect.flatMap((recovery) => (recovery.outcome === "none" ? Effect.void : Effect.andThen(
             Effect.logWarning(`${conversationId}'s turn ran as its pod went: ${recovery.outcome}`),
             // Its response, which its pod completed before it went, delivered as a background reply is.

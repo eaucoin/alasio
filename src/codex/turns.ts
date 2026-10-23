@@ -12,6 +12,7 @@ import {
 } from "../harness/index.ts";
 import { HarnessHost } from "../harness/host.ts";
 import { HarnessEvents } from "../harness/host-events.ts";
+import { countRecovery } from "../harness/recoveries.ts";
 import { errorsIn, type ResponseBlock } from "./event-projection.ts";
 import { finalResponseToMarkdown } from "./response-markdown.ts";
 import type { GoalTurnRequest } from "../operator/goal-control.ts";
@@ -670,6 +671,7 @@ const makeTurns = Effect.fnUntraced(function*() {
       prompt: (lost) => buildLostHarnessText(lost.harness),
       said: (outcome, lost) => lostStatusText(outcome, lost.harness),
     }).pipe(
+      Effect.tap((recovery) => countRecovery(recovery, "reattach")),
       Effect.flatMap((recovery) => (recovery.outcome === "none" ? Effect.void : Effect.andThen(
         Effect.logWarning(`${turn.thread_key}'s turn was lost with its harness instance (${why}): ${recovery.outcome}`),
         recovery.outcome === "completed" ? flushCompletedResponses : Effect.void,

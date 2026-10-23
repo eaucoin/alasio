@@ -11,6 +11,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Option, Scope } from "effect";
 import { TestClock } from "effect/testing";
 
+// Before alasio's modules, which make their instruments as they load.
+import { added } from "./support/metrics.ts";
 import { createCommandEventPolicy } from "../src/codex/command-event-policy.ts";
 import { buildLostHarnessText } from "../src/operator/lost-prompt.ts";
 import { makeStatusReporter } from "../src/codex/status-reporter.ts";
@@ -18,6 +20,7 @@ import { Turns } from "../src/codex/turns.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { discardHeld, queueHeld, steerWithHeld, swerveTo } from "../src/harness/commands.ts";
 import { HarnessHost } from "../src/harness/host.ts";
+import { RECOVERIES } from "../src/harness/recoveries.ts";
 import { HARNESS_BINDING } from "../src/harness/pooled-host.ts";
 import type { Harness, OwnTurns, TurnParams, TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
@@ -627,10 +630,14 @@ test("a turn's pod lost as alasio attaches to it again runs the turn again, once
     const outbox = recordingOutbox();
     await withServices({ store, harnesses: { [CODEX_HARNESS]: waitingHarness(release, ran, "Recovered.") }, outbox: outbox.layer }, async (alasio) => {
       await leftOnItsPod(alasio, store, conversationId, ran);
-      // Attaching, which waits on the pod; the pod lost meanwhile, told of as the gateway tells it.
-      await reattached(alasio);
-      await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, reason)));
-      await until("the turn to run again", () => ran.length === 2);
+      const counted = await added(RECOVERIES, async () => {
+        // Attaching, which waits on the pod; the pod lost meanwhile, told of as the gateway tells it.
+        await reattached(alasio);
+        await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, reason)));
+        await until("the turn to run again", () => ran.length === 2);
+      });
+      // Counted once, as run again, by whichever found it lost first.
+      assert.deepEqual(Object.entries(counted).map(([attributes, count]) => `${attributes.replace(/alasio\.harness\.recovery\.by=(lost|reattach),/u, "")} ${count}`), [`alasio.harness=${CODEX_HARNESS},alasio.harness.recovery.outcome=staged 1`], reason);
       assert.deepEqual(ran, ["go", buildLostHarnessText(CODEX_HARNESS)], reason);
       await alasio.runPromise(Deferred.succeed(release, undefined));
       await until("the recovery's reply", () => outbox.queued.texts.some(({ text }) => text === "Recovered."));
@@ -669,15 +676,22 @@ test("a recovery whose pod is lost too is given up, not run again, and the chat 
   /** How often the chat was told the turn was given up, on its status message or by a message of its own. */
   const toldGivenUp = async () => Number((await poolOf(store).query(`select count(*) from ${schema}.telegram_outbox where text = $1`, [GIVEN_UP])).rows[0]?.count);
   await withServices({ store, harnesses: { [CODEX_HARNESS]: waitingHarness(release, ran, "Recovered.") }, outbox: outbox.layer }, async (alasio) => {
-    const driving = alasio.runFork(turnOf(conversationId, "go"));
-    await until("the turn to run on its pod", () => ran.length === 1);
-    await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, "broken")));
-    await alasio.runPromise(Fiber.await(driving));
-    await until("the turn to run again", () => ran.length === 2);
-    // The recovery's pod lost as well, as the gateway tells it, however often.
-    await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, "broken")));
-    await until("the chat to be told", async () => (await toldGivenUp()) > 0);
-    await until("the recovery to end", async () => (await run(store.getActiveTurn(conversationId))) === null);
+    const counted = await added(RECOVERIES, async () => {
+      const driving = alasio.runFork(turnOf(conversationId, "go"));
+      await until("the turn to run on its pod", () => ran.length === 1);
+      await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, "broken")));
+      await alasio.runPromise(Fiber.await(driving));
+      await until("the turn to run again", () => ran.length === 2);
+      // The recovery's pod lost as well, as the gateway tells it, however often.
+      await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, "broken")));
+      await until("the chat to be told", async () => (await toldGivenUp()) > 0);
+      await until("the recovery to end", async () => (await run(store.getActiveTurn(conversationId))) === null);
+    });
+    // Each loss counted once, by whichever found it lost first: the turn run again, then its recovery given up.
+    assert.deepEqual(
+      Object.entries(counted).map(([attributes, count]) => `${attributes.replace(/alasio\.harness\.recovery\.by=(lost|reattach),/u, "")} ${count}`).sort(),
+      [`alasio.harness=${CODEX_HARNESS},alasio.harness.recovery.outcome=given-up 1`, `alasio.harness=${CODEX_HARNESS},alasio.harness.recovery.outcome=staged 1`],
+    );
     await alasio.runPromise(Deferred.succeed(release, undefined));
     await sleep(500);
     assert.equal(ran.length, 2, "run again more than once");
