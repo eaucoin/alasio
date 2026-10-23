@@ -3757,7 +3757,7 @@ describe("conversations' harnesses' pools", () => {
     assert.deepEqual(all(branch, "ValidatingAdmissionPolicyBinding").map(({ metadata }) => metadata?.name), ["alasio-harness-pool-pods-try"]);
   });
 
-  test("confines a session conversation's pool's pods to the gateway in, and the gateway, Neon's proxy, the log, and the internet's HTTPS out, none of the cluster's private addresses", () => {
+  test("confines a session conversation's pool's pods to the gateway in, and the gateway, Neon's proxy and the internet's HTTPS out, none of the cluster's private addresses; the log takes no pool's pod, as the gateway writes their events", () => {
     const policies = all<NetworkPolicyObject>(install(), "NetworkPolicy");
     const harness = (pool: string) => podOf("harness", "alasio", { "alasio.dev/pool": pool, "alasio.dev/binding": "0".repeat(40) });
     const [gateway, alasio, proxy, log, agent] = ["sandbox-gateway", "alasio", "neon-proxy", "log", "node-agent"].map((component) => podOf(component));
@@ -3770,13 +3770,16 @@ describe("conversations' harnesses' pools", () => {
       assert.equal(connects(policies, alasio, pod, 8080), false);
       assert.equal(connects(policies, pod, gateway, 8080), true);
       assert.equal(connects(policies, pod, proxy, 5432), true);
-      assert.equal(connects(policies, pod, log, 9092), true);
+      assert.equal(connects(policies, pod, log, 9092), false);
       assert.equal(connects(policies, pod, internet, 443), true);
       assert.equal(connects(policies, pod, privateAddress, 443), false);
       assert.equal(connects(policies, pod, agent, 8484), false);
       // Its alasio's relay of its Codex login.
       assert.equal(connects(policies, pod, alasio, 4320), true);
     }
+    // A folder conversation's, which reaches what alasio's pod does, is not taken by the log either.
+    assert.equal(connects(policies, harness("harness-folder-codex"), log, 9092), false);
+    assert.equal(connects(policies, alasio, log, 9092), true);
     // None of another environment's.
     const elsewhere = podOf("harness", "alasio-branch-try", { "alasio.dev/pool": "harness-codex" }, { "alasio.dev/branch": "try" });
     assert.equal(connects(policies, elsewhere, alasio, 4320), false);

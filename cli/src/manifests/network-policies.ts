@@ -333,8 +333,6 @@ function logPolicy(config: InstallConfig): NetworkPolicy {
           of(LOADER_COMPONENT),
           { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } },
           { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels(LOADER_COMPONENT) } },
-          // Harness pools' hosts, which write their environment's events.
-          ...HARNESS_PEERS,
         ],
         ports: [{ protocol: "TCP", port: LOG_PORT }],
       },
@@ -489,10 +487,11 @@ const HARNESS_PEERS: V1NetworkPolicyPeer[] = [
 /**
  * The harness pools' pods of `environment` (./harness-pools.ts), free or bound: they take main's
  * sandbox gateway alone, on their host's port, which it reaches them through. A session
- * conversation's reaches the cluster's DNS, the gateway (its bayma and its files through it),
- * Neon's proxy (its database, as the harness host's role), the log's brokers (its events), its
- * alasio's relay of its Codex login, the collector where it runs, and the internet's HTTPS port, its harness's model's API, none of
- * the cluster's or its network's private addresses, as a session with internet; nothing else.
+ * conversation's reaches the cluster's DNS, the gateway (its bayma and its files through it, and
+ * its events, which the gateway writes), Neon's proxy (its database, as the harness host's role),
+ * its alasio's relay of its Codex login, the collector where it runs, and the internet's HTTPS
+ * port, its harness's model's API, none of the cluster's or its network's private addresses, as a
+ * session with internet; nothing else, the log not among it.
  * A folder conversation's, main's, reaches what alasio's own pod reaches, as the operator's agents do.
  */
 function harnessPolicies(config: InstallConfig, environment: Environment): NetworkPolicy[] {
@@ -512,7 +511,6 @@ function harnessPolicies(config: InstallConfig, environment: Environment): Netwo
         CLUSTER_DNS,
         { to: [{ namespaceSelector: namespaceNamed(NAMESPACE), ...SANDBOX_GATEWAY }], ports: [{ protocol: "TCP", port: SANDBOX_GATEWAY_PORT }] },
         { to: [ofMainNamespace("neon-proxy")], ports: [{ protocol: "TCP", port: PROXY_PORT }] },
-        { to: [ofMainNamespace(LOG_COMPONENT)], ports: [{ protocol: "TCP", port: LOG_PORT }] },
         // Its environment's alasio, its relay of its Codex login.
         { to: [{ podSelector: { matchLabels: selectorLabels("alasio") } }], ports: [{ protocol: "TCP", port: CODEX_LOGIN_PORT }] },
         ...(collectorRuns(config) ? [{ to: [ofMainNamespace(GATEWAY_COMPONENT)], ports: [{ protocol: "TCP", port: COLLECTOR_PORT }] }] : []),
