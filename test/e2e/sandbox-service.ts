@@ -239,12 +239,25 @@ export function sandboxService(): void {
         (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("workspace-mount")) })).filter(({ spec }) => spec?.nodeName === node);
       const [before] = await mountPods();
       await kube.patch(ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE), { spec: { template: { metadata: { annotations: { "alasio.dev/e2e-restartedAt": new Date().toISOString() } } } } });
+      // What the old pod logged, and when it turned unready, kept as it goes, as its pod, once deleted, keeps neither.
+      let oldLogged = "";
+      const oldReadiness: string[] = [];
       await until("the node's mount handed over to a new pod, and the old pod gone", async () => {
         const pods = await mountPods();
+        const old = pods.find(({ metadata }) => metadata?.uid === before?.metadata?.uid);
+        if (old) {
+          oldLogged = await kube.logs(NAMESPACE, old.metadata?.name ?? "", "workspace-mount").catch(() => oldLogged);
+          const ready = old.status?.conditions?.find(({ type }) => type === "Ready");
+          const said = `${ready?.status} since ${ready?.lastTransitionTime}`;
+          if (oldReadiness.at(-1) !== said) oldReadiness.push(said);
+        }
         const set = await kube.get<V1DaemonSet>(ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE));
         const ready = pods.filter(({ metadata, status }) => metadata?.uid !== before?.metadata?.uid && status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True"));
-        return ready.length === 1 && !pods.some(({ metadata }) => metadata?.uid === before?.metadata?.uid) && (set?.status?.updatedNumberScheduled ?? 0) >= 1 ? true : undefined;
-      }, 240_000);
+        return ready.length === 1 && !old && (set?.status?.updatedNumberScheduled ?? 0) >= 1 ? true : undefined;
+      }, 240_000).catch((error: unknown) => {
+        console.error(`# the old mount's pod ${before?.metadata?.name}, ready ${oldReadiness.join(", then ")}, logged:\n${oldLogged.split("\n").slice(-80).join("\n")}`);
+        throw error;
+      });
       const written = await writing;
       const outcomes = written.stdout.trim().split("\n");
       const failed = outcomes.filter((line) => line.startsWith("fail"));

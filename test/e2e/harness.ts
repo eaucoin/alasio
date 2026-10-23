@@ -1125,7 +1125,9 @@ export async function dumpClusterState(): Promise<void> {
     ].join("; ");
     // And, of a mount's pod, which shares the node's PIDs: the juicefs log it keeps, then each of the node's juicefs
     // processes and each process waiting uninterruptibly, as one whose request a FUSE session leaves unanswered does:
-    // its state, what it waits in, its parent, and its kernel stack.
+    // its state, what it waits in, its parent, and its kernel stack, each of its threads' too, as a Go process's main
+    // thread idles while another waits on what holds it up, and what it holds open of FUSE and of sockets; and the
+    // node's FUSE connections, with the requests each leaves unanswered.
     const processes = [
       "tail -n 80 /run/alasio/juicefs.log 2>&1",
       "for proc in /proc/[0-9]*; do",
@@ -1135,7 +1137,29 @@ export async function dumpClusterState(): Promise<void> {
       `  case "$state:$command" in D:*|*juicefs*) ;; *) continue ;; esac`,
       `  echo "pid \${proc#/proc/} $state, waiting in $(cat "$proc/wchan" 2>/dev/null), its parent $(echo "$fields" | cut -d ' ' -f 2): $command"`,
       `  sed 's/^/    /' "$proc/stack" 2>/dev/null`,
+      `  for task in "$proc"/task/*; do`,
+      `    [ "\${task##*/}" = "\${proc#/proc/}" ] && continue`,
+      `    echo "    thread \${task##*/} $(sed 's/.*) //' "$task/stat" 2>/dev/null | cut -d ' ' -f 1), waiting in $(cat "$task/wchan" 2>/dev/null)"`,
+      `    sed 's/^/        /' "$task/stack" 2>/dev/null`,
+      "  done",
+      `  for fd in "$proc"/fd/*; do target=$(readlink "$fd" 2>/dev/null) || continue; case "$target" in *fuse*|socket:*) echo "    fd \${fd##*/} $target";; esac; done`,
       "done",
+      `nsenter -t 1 -m -- sh -c 'for connection in /sys/fs/fuse/connections/*; do [ -e "$connection/waiting" ] && echo "FUSE connection \${connection##*/}: $(cat "$connection/waiting") waiting"; done' 2>&1`,
+    ].join("\n");
+    // Of a mount's juicefs that has not said it serves two minutes after it started, as one held up taking a mount
+    // over does: what each of its goroutines waits on, as Go says it on SIGQUIT, which ends it, for kubelet to start
+    // its mount again; said once its log has it.
+    const goroutines = [
+      `pid=$(cat /run/alasio/juicefs.pid 2>/dev/null) || exit 0`,
+      `grep -qF 'is ready at' /run/alasio/juicefs.log && exit 0`,
+      // Its age: the system's uptime less when it started, in clock ticks since boot, a hundred a second.
+      `started=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d ' ' -f 20) || exit 0`,
+      `age=$(( $(cut -d . -f 1 /proc/uptime) - started / 100 ))`,
+      `[ "$age" -ge 120 ] || exit 0`,
+      `lines=$(wc -l < /run/alasio/juicefs.log)`,
+      `kill -QUIT "$pid" && sleep 3`,
+      `echo "juicefs $pid, mounting for $age s without serving, its goroutines as SIGQUIT ended it:"`,
+      `tail -n +"$(( lines + 1 ))" /run/alasio/juicefs.log | head -n 400`,
     ].join("\n");
     for (const pod of pods.filter((each) => each.status?.phase === "Running" && ["workspace-mount", "node-agent"].includes(each.metadata?.labels?.["app.kubernetes.io/component"] ?? ""))) {
       const { namespace = "", name = "" } = pod.metadata ?? {};
@@ -1151,6 +1175,8 @@ export async function dumpClusterState(): Promise<void> {
       if (pod.metadata?.labels?.["app.kubernetes.io/component"] === "workspace-mount") {
         const running = await bounded(kube.exec(namespace, name, ["sh", "-c", processes], { container }).then(({ stdout, stderr }) => `${stdout}${stderr}`));
         say(`--- the juicefs log of ${namespace}/${name}, then the node's juicefs processes and those waiting uninterruptibly:\n${running.trimEnd()}`);
+        const stuck = await bounded(kube.exec(namespace, name, ["sh", "-c", goroutines], { container }).then(({ stdout, stderr }) => `${stdout}${stderr}`));
+        if (stuck.trim() !== "") say(`--- ${namespace}/${name}'s ${stuck.trimEnd()}`);
       }
     }
     // Each Valkey's last lines, ready or not, and before it restarted: whether it waits for the lock of its volume,
