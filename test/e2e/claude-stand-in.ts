@@ -7,8 +7,16 @@
  * SDK's control requests are answered, `initialize` with what the CLI says of itself and
  * the rest with nothing; and each prompt is answered with ANSWER, after the session's
  * init: at once, or, for a prompt `wait N`, N seconds after it comes, as a turn whose
- * tools run that long, unless it is interrupted first. Each answer's result names the
- * prompt it answers, as the CLI's does. The session's transcript is written as the CLI
+ * tools run that long, unless it is interrupted first; for a prompt `background N`, at once,
+ * a background task of its own told live (background_tasks_changed), which N seconds on reports
+ * BACKGROUND_REPORT as a turn of its own, as the CLI's background agent's does, its prompt none,
+ * and is told ended; for a prompt `options`, beside how it was started (`options: <JSON>`), its
+ * tools, allowed and disallowed, its setting sources and its MCP servers; for a prompt
+ * `memory`, beside the operator's memory and skills, as its user settings source reads them from
+ * its config directory (`memory: <CLAUDE.md's first line>; skills: <names>`); for a prompt
+ * `edit <name> <text>`, once it wrote `text` to the file `name` of its working directory, as its
+ * Write tool would (`edited <name>`); and for a prompt `read <name>`, beside that file's text
+ * (`read <name>: <text>`). Each answer's result names the prompt it answers, as the CLI's does. The session's transcript is written as the CLI
  * writes it, under `$CLAUDE_CONFIG_DIR/projects/<the working directory's key>/`, and
  * mirrored to the SDK as the CLI mirrors it (transcript_mirror), so alasio's session store,
  * and the lake, have it. A session it is given (`--session-id`) or resumes (`--resume`)
@@ -17,13 +25,16 @@
  *   claude-stand-in.ts [the CLI's flags]...
  */
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 /** What every turn answers. */
 export const ANSWER = "Answered by the end-to-end run's stand-in for Claude Code.";
+
+/** What a background task reports as a turn of its own, once its time is over. */
+export const BACKGROUND_REPORT = "Reported by a background task of the end-to-end run's stand-in for Claude Code.";
 
 /** The model it says it is, unless the CLI is given one. */
 const MODEL = "claude-stand-in";
@@ -56,12 +67,56 @@ interface ControlRequest {
 const textOf = ({ message: { content } }: Prompt): string =>
   typeof content === "string" ? content : content.flatMap(({ type, text }) => (type === "text" && text ? [text] : [])).join("\n");
 
+/** What its config directory is, as the CLI resolves it: CLAUDE_CONFIG_DIR, else ~/.claude. */
+const configDir = (): string => process.env["CLAUDE_CONFIG_DIR"] ?? join(homedir(), ".claude");
+
+/** What answering `text` finds besides its answer, in the working directory `cwd`, the CLI started with `args`, as the module says; null for a prompt that finds nothing. */
+function found(text: string, cwd: string, args: readonly string[]): string | null {
+  if (text === "options") {
+    const listed = (flag: string) => flagOf(args, flag)?.split(",").filter(Boolean) ?? null;
+    const mcp = flagOf(args, "--mcp-config");
+    return `options: ${JSON.stringify({
+      tools: listed("--tools"),
+      allowedTools: listed("--allowedTools"),
+      disallowedTools: listed("--disallowedTools"),
+      settingSources: listed("--setting-sources"),
+      strictMcpConfig: args.includes("--strict-mcp-config"),
+      mcpServers: mcp ? Object.keys((JSON.parse(mcp) as { readonly mcpServers?: object }).mcpServers ?? {}) : [],
+    })}`;
+  }
+  if (text === "memory") {
+    const read = (path: string) => {
+      try {
+        return readFileSync(path, "utf8");
+      } catch {
+        return null;
+      }
+    };
+    const listed = (path: string) => {
+      try {
+        return readdirSync(path).sort();
+      } catch {
+        return [];
+      }
+    };
+    return `memory: ${read(join(configDir(), "CLAUDE.md"))?.split("\n")[0] ?? "none"}; skills: ${listed(join(configDir(), "skills")).join(",") || "none"}`;
+  }
+  const edit = /^edit (\S+) (.+)$/su.exec(text);
+  if (edit?.[1] && edit[2] !== undefined) {
+    writeFileSync(join(cwd, edit[1]), edit[2]);
+    return `edited ${edit[1]}`;
+  }
+  const read = /^read (\S+)$/u.exec(text)?.[1];
+  if (read) return `read ${read}: ${readFileSync(join(cwd, read), "utf8")}`;
+  return null;
+}
+
 /** Runs the CLI stand-in, given the CLI's arguments, until the SDK closes its input or stops it. */
 function serve(args: readonly string[]): void {
   const sessionId = flagOf(args, "--resume") ?? flagOf(args, "--session-id") ?? randomUUID();
   const model = flagOf(args, "--model") ?? MODEL;
   const cwd = process.cwd();
-  const transcript = join(process.env["CLAUDE_CONFIG_DIR"] ?? join(homedir(), ".claude"), "projects", projectKey(cwd), `${sessionId}.jsonl`);
+  const transcript = join(configDir(), "projects", projectKey(cwd), `${sessionId}.jsonl`);
   const write = (message: object) => process.stdout.write(`${JSON.stringify(message)}\n`);
   /** The last entry of the transcript, which the next names as its parent. */
   let parent: string | null = null;
@@ -76,7 +131,15 @@ function serve(args: readonly string[]): void {
   let initialized = false;
   /** The prompt being answered, and what answers it once its wait is over. */
   let running: { readonly uuid: string; readonly timer: NodeJS.Timeout } | null = null;
-  const result = (uuid: string, answer: string | null, started: number) =>
+  /** The assistant's message saying `text`, written to the transcript and to the SDK. */
+  const say = (text: string) => {
+    const message = { id: `msg_${randomUUID()}`, type: "message", role: "assistant", model, content: [{ type: "text", text }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } };
+    record("assistant", message);
+    write({ type: "assistant", message, parent_tool_use_id: null, session_id: sessionId, uuid: randomUUID() });
+  };
+  const result = (uuid: string, answer: string | null, started: number) => writeResult([uuid], answer, started);
+  /** A turn's result, of the prompts `uuids` it answers, none for a turn of its own. */
+  const writeResult = (uuids: readonly string[], answer: string | null, started: number) =>
     write({
       type: "result",
       subtype: answer === null ? "error_during_execution" : "success",
@@ -90,7 +153,7 @@ function serve(args: readonly string[]): void {
       usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
       modelUsage: {},
       permission_denials: [],
-      user_message_uuids: [uuid],
+      user_message_uuids: uuids,
       uuid: randomUUID(),
     });
 
@@ -104,13 +167,23 @@ function serve(args: readonly string[]): void {
     const text = textOf(prompt);
     record("user", { role: "user", content: text }, uuid);
     const seconds = Number(/^wait (\d+)$/u.exec(text.trim())?.[1] ?? 0);
+    const said = [ANSWER, ...[found(text.trim(), cwd, args)].filter((extra) => extra !== null)].join("\n\n");
     const answer = () => {
       running = null;
-      const message = { id: `msg_${randomUUID()}`, type: "message", role: "assistant", model, content: [{ type: "text", text: ANSWER }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } };
-      record("assistant", message);
-      write({ type: "assistant", message, parent_tool_use_id: null, session_id: sessionId, uuid: randomUUID() });
-      result(uuid, ANSWER, started);
+      say(said);
+      result(uuid, said, started);
     };
+    const background = Number(/^background (\d+)$/u.exec(text.trim())?.[1] ?? Number.NaN);
+    if (!Number.isNaN(background)) {
+      const task = { task_id: randomUUID(), task_type: "local_agent", description: "the end-to-end run's background task" };
+      write({ type: "system", subtype: "background_tasks_changed", tasks: [task], uuid: randomUUID(), session_id: sessionId });
+      setTimeout(() => {
+        // A turn of its own, as the CLI reports a background agent's: no prompt of the SDK's answered.
+        say(BACKGROUND_REPORT);
+        write({ type: "system", subtype: "background_tasks_changed", tasks: [], uuid: randomUUID(), session_id: sessionId });
+        writeResult([], BACKGROUND_REPORT, Date.now());
+      }, background * 1000);
+    }
     if (seconds === 0) answer();
     else running = { uuid, timer: setTimeout(answer, seconds * 1000) };
   };

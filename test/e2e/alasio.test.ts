@@ -14,7 +14,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { connect } from "node:net";
@@ -37,6 +37,8 @@ import { environmentAccess, environmentName, telegramTopic } from "../../cli/src
 import { WEBHOOK, WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
+import { SESSION_FS_ENVIRONMENTS_TOML } from "../../src/codex/sessionfs.ts";
+import { SESSION_FS_CLAUDE_TOOLS } from "../../src/harness/claude/sessionfs.ts";
 import { TOKEN_TTL_MS } from "../../src/sandbox/gateway-client.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
@@ -44,7 +46,7 @@ import { SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
 import { NODE_PINS } from "../../cli/src/cluster/node.ts";
 import { goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
-import { ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
+import { BACKGROUND_REPORT, ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
 import { ANSWER } from "./codex-stand-in.ts";
 import { bindBranchSession, bindInBranch, mainSandboxService, sandboxService, serviceLogs, servesBranch } from "./sandbox-service.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
@@ -208,6 +210,21 @@ function operator(base: string) {
         await sleep(500);
       }
       throw new Error(`alasio sent nothing that matched; it sent ${JSON.stringify(got.map((call) => [call.method, call.payload.text?.slice(0, 120)]))}`);
+    },
+    /**
+     * What alasio sends until each of `predicates` holds for one of it, which may come together,
+     * as two replies sent at once do: the first each holds for, in their order.
+     */
+    async waitForEach(predicates: readonly ((call: RecordedCall) => boolean)[], timeoutMs = 300_000): Promise<RecordedCall[]> {
+      const deadline = Date.now() + timeoutMs;
+      const got: RecordedCall[] = [];
+      while (Date.now() < deadline) {
+        got.push(...(await calls()));
+        const hits = predicates.map((predicate) => got.find(predicate));
+        if (hits.every((hit) => hit !== undefined)) return hits as RecordedCall[];
+        await sleep(500);
+      }
+      throw new Error(`alasio sent nothing that matched each; it sent ${JSON.stringify(got.map((call) => [call.method, call.payload.text?.slice(0, 120)]))}`);
     },
     /** Presses the button labelled like `label` in what alasio sends next. */
     async choose(label: RegExp) {
@@ -3537,6 +3554,174 @@ if (inShard("agents")) {
         await kube.patch(alasio, { spec: { replicas: 1 } });
         for (const deadline = Date.now() + 300_000; !(await kube.runningPod(NAMESPACE, RELEASE).then(() => true, () => false)); await sleep(2_000)) assert.ok(Date.now() < deadline, "alasio did not start again");
       }
+    });
+
+    /** The status message of a turn on `harness` as it runs, sent to `chat`, the operator's unless given. */
+    const working = (harness: string, chat?: number) =>
+      tg.waitFor((call) => call.method === "sendMessage" && new RegExp(`^${harness} is working`, "u").test(call.payload.text ?? "") && (chat === undefined || Number(call.payload.chat_id) === chat));
+    /** Whether `call` is a reply of `markdown`, in the chat `chat`, the operator's unless given. */
+    const replied = (call: RecordedCall, markdown: string, chat?: number) =>
+      call.method === "sendRichMessage" && call.payload.rich_message?.markdown === markdown && (chat === undefined || Number(call.payload.chat_id) === chat);
+    /** Says `prompt` to a turn running, and steers it into the turn, as the operator chooses Steer for it. */
+    const steer = async (prompt: string) => {
+      await tg.say(prompt);
+      await tg.choose(/^Steer$/u);
+    };
+
+    test("a message to a running turn is steered into it, and one queued runs as a turn of its own once it ended, both on the conversation's pod", { timeout: 15 * 60_000 }, async () => {
+      const bound = await boundNow();
+      await tg.calls();
+      await tg.say("wait 600");
+      await working("Codex");
+      await steer("also the docs");
+      await tg.waitFor((call) => call.method === "editMessageText" && call.payload.text === "Sent as guidance to the active Codex turn.");
+      await steer("finish now");
+      await tg.waitFor((call) => replied(call, `${ANSWER}\n\nsteered: also the docs\n\nsteered: finish now`));
+      // Queued as it runs: answered as a turn of its own after it, as it was said.
+      await tg.calls();
+      await tg.say("wait 600");
+      await working("Codex");
+      await tg.say("queued after");
+      await tg.choose(/^Queue$/u);
+      await steer("finish now");
+      // Each reply, which may come together, the queued one's after the steered turn's.
+      const [steered, queued] = await tg.waitForEach([(call) => replied(call, `${ANSWER}\n\nsteered: finish now`), (call) => answered(call)]);
+      assert.ok(steered && queued && steered.at <= queued.at, "the queued message was answered before the turn it was queued behind");
+      assert.equal((await harnessPod()).metadata?.uid, bound.metadata?.uid);
+    });
+
+    test("a session pool's Codex runs with no environment of its own, so no shell, apply_patch or view_image, and its pod reaches neither Telegram nor a session's pod but through the gateway", async () => {
+      const bound = await boundNow();
+      await tg.calls();
+      await tg.say("tools");
+      await tg.waitFor((call) => replied(call, `${ANSWER}\n\ntools: ${SESSION_FS_ENVIRONMENTS_TOML.trim()}`));
+      const reaches = (host: string, port: number) => kube.execOk(NAMESPACE, bound.metadata?.name ?? "", ["node", "-e", tcp(JSON.stringify(host), port)], { container: "harness" }).then((said) => said.trim());
+      const telegramAt = new URL(urlOf(TELEGRAM));
+      assert.equal(await reaches(telegramAt.hostname, Number(telegramAt.port || 443)), "blocked");
+      const sessionPodIp = (await sessionPod(session)).status?.podIP ?? "";
+      assert.ok(sessionPodIp, "the session's pod has no address");
+      assert.equal(await reaches(sessionPodIp, 7290), "blocked");
+    });
+
+    test("an instance killed mid-turn has its turn run again once, on another, the chat told so", { timeout: 15 * 60_000 }, async () => {
+      const bound = await boundNow();
+      await tg.calls();
+      await tg.say("wait 600");
+      await working("Codex");
+      await kube.kill(NAMESPACE, bound.metadata?.name ?? "");
+      // Told so, and its recovery prompt answered on a pod of its own, once, which may come together.
+      const [, recovered] = await tg.waitForEach([
+        (call) => call.method === "editMessageText" && call.payload.text === "Codex's harness was lost during this turn; it runs again on another.",
+        (call) => answered(call),
+      ]);
+      assert.notEqual((await harnessPod()).metadata?.uid, bound.metadata?.uid);
+      await sleep(60_000);
+      const after = (await tg.calls()).filter((call) => call.method === "sendRichMessage");
+      assert.deepEqual(after, [], `alasio replied again after ${JSON.stringify(recovered?.payload.rich_message?.markdown)}`);
+    });
+
+    test("an upgrade of alasio and of its harness pools' template, run during a turn, leaves the bound pod running it to its end; the next binding is of the new template", { timeout: 40 * 60_000 }, async () => {
+      const bound = await boundNow();
+      await tg.calls();
+      await tg.say("wait 1800");
+      await working("Codex");
+      const { configFile } = paths();
+      const config = JSON.parse(readFileSync(configFile, "utf8"));
+      config.install.alasio.env = { ...config.install.alasio.env, ALASIO_E2E_TEMPLATE: "upgraded" };
+      writeFileSync(configFile, JSON.stringify(config));
+      await alasioOk("up", "--timeout", "20m");
+      const pool = await kube.get<V1Deployment>(ref("Deployment", "harness-codex", NAMESPACE));
+      assert.ok(pool?.spec?.template.spec?.containers[0]?.env?.some(({ name, value }) => name === "ALASIO_E2E_TEMPLATE" && value === "upgraded"), "the pool's template is not the new one");
+      // The turn's pod as it was, of the template before, bound throughout.
+      const during = await harnessPod();
+      assert.equal(during.metadata?.uid, bound.metadata?.uid);
+      assert.equal(during.spec?.containers[0]?.env?.some(({ name }) => name === "ALASIO_E2E_TEMPLATE"), false);
+      await steer("finish now");
+      await tg.waitFor((call) => replied(call, `${ANSWER}\n\nsteered: finish now`), 600_000);
+      // Released once idle, the next prompt binds a pod of the new template.
+      for (const deadline = Date.now() + 10 * 60_000; (await harnessPods()).length > 0; await sleep(5_000)) assert.ok(Date.now() < deadline, "the idle harness was not released");
+      const next = await boundNow();
+      assert.ok(next.spec?.containers[0]?.env?.some(({ name, value }) => name === "ALASIO_E2E_TEMPLATE" && value === "upgraded"), "the next binding is not of the new template");
+    });
+
+    test("a prompt's session workspace, released, is bound again before its turn's first tool call", { timeout: 15 * 60_000 }, async () => {
+      const released = await gatewayCall(await mainToken(session), "POST", "/release");
+      assert.equal(released.status, 204, released.said);
+      await until("the session released", async () => ((await boundPodOf(session)) === null ? true : undefined), 300_000);
+      await tg.calls();
+      await tg.say("bayma bound");
+      // Bound as the turn started, before its first tool call, which binds nothing itself: the gateway would answer 409 of one bound to no pod.
+      await tg.waitFor((call) => replied(call, `${ANSWER}\n\nbayma bound: 200`));
+    });
+
+    test("a background task of a session conversation's Claude reports as a turn of its own once its turn ended, and Claude runs confined to bayma there", { timeout: 15 * 60_000 }, async () => {
+      await tg.calls();
+      await tg.say("/service claude");
+      await tg.waitFor((call) => /^Active: Claude$/mu.test(call.payload.text ?? ""));
+      await tg.say("background 30");
+      await tg.waitFor((call) => replied(call, CLAUDE_ANSWER));
+      // Bound in Claude's pool, as the Codex pod it leaves is let go of.
+      const inClaudes = () => until("a pod of Claude's pool bound to the conversation", async () => (await harnessPods()).find(({ metadata }) => metadata?.labels?.["alasio.dev/pool"] === "harness-claude"), 120_000);
+      const bound = await inClaudes();
+      await tg.waitFor((call) => replied(call, BACKGROUND_REPORT), 300_000);
+      // Its pod held through its work in the background.
+      assert.equal((await inClaudes()).metadata?.uid, bound.metadata?.uid);
+      await tg.say("options");
+      const options = await tg.waitFor((call) => call.method === "sendRichMessage" && (call.payload.rich_message?.markdown ?? "").startsWith(`${CLAUDE_ANSWER}\n\noptions: `));
+      const started = JSON.parse((options.payload.rich_message?.markdown ?? "").slice(`${CLAUDE_ANSWER}\n\noptions: `.length)) as { tools: string[] | null; settingSources: string[] | null; strictMcpConfig: boolean; mcpServers: string[] };
+      assert.deepEqual([started.tools, started.settingSources, started.strictMcpConfig, started.mcpServers], [[...SESSION_FS_CLAUDE_TOOLS], [], true, ["bayma"]]);
+      await tg.say("/service codex");
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+    });
+
+    test("a folder conversation's harness runs in a host pool, as the operator, its first tool call finding its folder's bayma bound, its Claude with the operator's memory and skills and its own file tools in the folder; switched to a session workspace, it is bound in a session pool", { skip: !HOST_PROFILE && "folder workspaces are for a single node", timeout: 20 * 60_000 }, async () => {
+      const { home } = paths();
+      const folder = "e2e-harness-folder";
+      /** The pod bound to the folder chat's conversation's harness, once there is one. */
+      const folderChatPod = () =>
+        until("a pod bound to the folder chat's harness", async () =>
+          (await harnessPods()).find(({ metadata }) => metadata?.annotations?.["alasio.dev/binding-key"]?.endsWith(`:${FOLDER_CHAT}`)), 120_000);
+      await tg.calls();
+      await tg.say(`/workspace new ${folder}`, FOLDER_CHAT);
+      await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && new RegExp(folder, "u").test(call.payload.text ?? ""));
+      await tg.say("/service codex", FOLDER_CHAT);
+      await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      await tg.say("bayma bound", FOLDER_CHAT);
+      await tg.waitFor((call) => replied(call, `${ANSWER}\n\nbayma bound: 200`, FOLDER_CHAT));
+      const codex = await folderChatPod();
+      assert.equal(codex.metadata?.labels?.["alasio.dev/pool"], "harness-folder-codex");
+      assert.equal(codex.spec?.securityContext?.runAsUser, HOST_USER);
+      // The operator's memory and a skill of theirs, in their Claude config, written as them, through their home the pod has.
+      const config = join(home, ".claude");
+      await kube.execOk(NAMESPACE, codex.metadata?.name ?? "", ["sh", "-c", `mkdir -p '${config}/skills/e2e-skill' && printf '%s\\n' 'Remembered by the e2e operator.' >'${config}/CLAUDE.md'`], { container: "harness" });
+      await tg.say("tools", FOLDER_CHAT);
+      await tg.waitFor((call) => replied(call, `${ANSWER}\n\ntools: local`, FOLDER_CHAT));
+      await tg.say("/service claude", FOLDER_CHAT);
+      await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /^Active: Claude$/mu.test(call.payload.text ?? ""));
+      await tg.say("options", FOLDER_CHAT);
+      const options = await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && (call.payload.rich_message?.markdown ?? "").startsWith(`${CLAUDE_ANSWER}\n\noptions: `));
+      const started = JSON.parse((options.payload.rich_message?.markdown ?? "").slice(`${CLAUDE_ANSWER}\n\noptions: `.length)) as { tools: string[] | null; disallowedTools: string[] | null; settingSources: string[] | null };
+      assert.equal(started.tools, null);
+      assert.deepEqual([...(started.disallowedTools ?? [])].sort(), ["Bash", "Glob", "Grep", "Monitor"]);
+      // No setting sources named, so the CLI reads each of its own, the operator's user settings among them.
+      assert.equal(started.settingSources, null, JSON.stringify(started));
+      const claude = await folderChatPod();
+      assert.equal(claude.metadata?.labels?.["alasio.dev/pool"], "harness-folder-claude");
+      await tg.say("memory", FOLDER_CHAT);
+      await tg.waitFor((call) => replied(call, `${CLAUDE_ANSWER}\n\nmemory: Remembered by the e2e operator.; skills: e2e-skill`, FOLDER_CHAT));
+      await tg.say("edit e2e-note written in the folder", FOLDER_CHAT);
+      await tg.waitFor((call) => replied(call, `${CLAUDE_ANSWER}\n\nedited e2e-note`, FOLDER_CHAT));
+      assert.equal(readFileSync(join(home, folder, "e2e-note"), "utf8"), "written in the folder");
+      assert.equal(statSync(join(home, folder, "e2e-note")).uid, HOST_USER);
+      // Switched to a session workspace: bound in a session pool.
+      await tg.say("/workspace", FOLDER_CHAT);
+      await tg.choose(/New empty workspace/u);
+      await tg.choose(/No internet/u);
+      // Said in the answer to the press, which names no chat, as a new session's is (newSession).
+      await tg.waitFor((call) => /Created and mounted session workspace/u.test(call.payload.text ?? ""));
+      await tg.say("hello", FOLDER_CHAT);
+      await tg.waitFor((call) => replied(call, CLAUDE_ANSWER, FOLDER_CHAT));
+      assert.equal((await folderChatPod()).metadata?.labels?.["alasio.dev/pool"], "harness-claude");
     });
   });
 }

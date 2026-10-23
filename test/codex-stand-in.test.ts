@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +20,7 @@ import { makeAppServer } from "../src/codex/app-server/client.ts";
 import type { AppServerEvent } from "../src/codex/app-server/protocol.ts";
 import { codexTelemetryArgs } from "../src/codex/app-server/telemetry.ts";
 import { buildCodexEnv } from "../src/codex/env.ts";
+import { SESSION_FS_ENVIRONMENTS_TOML } from "../src/codex/sessionfs.ts";
 import { listRolloutFiles, parseRolloutName } from "../src/codex/rollouts/files.ts";
 import { ANSWER } from "./e2e/codex-stand-in.ts";
 import { eventually } from "./support/wait.ts";
@@ -129,6 +130,36 @@ test("the stand-in shows the file a prompt `show <path>` names beside its answer
     return seen.flatMap((event: AppServerEvent) => (event.type === "item.completed" && event.item.type === "agent_message" ? [event.item.text] : []));
   })).pipe(Effect.provideService(Logger.CurrentLoggers, new Set())));
   assert.deepEqual(answered, [`${ANSWER}\n\n![shown](/workspace/shown.png)`]);
+});
+
+test("a turn the stand-in runs answers beside each prompt it is steered with as it runs, ends at once steered to finish now, and `tools` answers beside its home's environments, or its local one where it names none", async () => {
+  const answered = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const client = yield* makeAppServer();
+    const thread = { cwd: home, env: buildCodexEnv(), threadKey: "conversation-3", config: { developer_instructions: "", mcp_servers: {} } };
+    const answersOf = (threadId: string, turnId: string) =>
+      Stream.runCollect(client.eventsForTurn(threadId, turnId).pipe(Stream.takeUntil((event) => event.type === "turn.completed"))).pipe(
+        Effect.map((seen) => seen.flatMap((event: AppServerEvent) => (event.type === "item.completed" && event.item.type === "agent_message" ? [event.item.text] : []))),
+      );
+    const threadId = yield* client.startThread(thread);
+    const running = yield* client.startTurn({ ...thread, threadId, prompt: "wait 1" });
+    yield* client.steerTurn({ threadId, turnId: running, prompt: "also the docs" });
+    const steered = yield* answersOf(threadId, running);
+    // A turn of a long wait ends as it is steered to finish now.
+    const long = yield* client.startTurn({ ...thread, threadId, prompt: "wait 600" });
+    yield* client.steerTurn({ threadId, turnId: long, prompt: "finish now" });
+    const finished = yield* answersOf(threadId, long).pipe(Effect.timeout("10 seconds"));
+    const local = yield* answersOf(threadId, yield* client.startTurn({ ...thread, threadId, prompt: "tools" }));
+    // As a session filesystem's Codex home has it.
+    writeFileSync(join(home, "environments.toml"), SESSION_FS_ENVIRONMENTS_TOML);
+    const none = yield* answersOf(threadId, yield* client.startTurn({ ...thread, threadId, prompt: "tools" })).pipe(Effect.ensuring(Effect.sync(() => rmSync(join(home, "environments.toml")))));
+    return { steered, finished, local, none };
+  })).pipe(Effect.provideService(Logger.CurrentLoggers, new Set())));
+  assert.deepEqual(answered, {
+    steered: [`${ANSWER}\n\nsteered: also the docs`],
+    finished: [`${ANSWER}\n\nsteered: finish now`],
+    local: [`${ANSWER}\n\ntools: local`],
+    none: [`${ANSWER}\n\ntools: include_local = false`],
+  });
 });
 
 test("each request is a server span of the trace it is sent in, exported as alasio tells Codex to, from codex-app-server", async () => {

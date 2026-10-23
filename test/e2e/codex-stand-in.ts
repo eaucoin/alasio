@@ -12,7 +12,15 @@
  * `bayma later N`, at once, a command left running in the background, its terminal listed,
  * which N seconds on asks the thread's bayma, as its config names it, to initialize, as Codex's
  * MCP client does, and says what bayma answered on its standard error (`bayma later: <status>`),
- * then ends. Every request is a server
+ * then ends; for a prompt `bayma bound`, after asking the thread's bayma to initialize at once, as a
+ * turn's first tool call would, binding nothing (x-alasio-bind: never), so the sandbox gateway
+ * answers 409 where the workspace is bound to no pod yet, beside what it answered
+ * (`bayma bound: <status>`); for a prompt
+ * `tools`, beside its home's environments.toml (`tools: <its environments>`), whose local
+ * environment is the one its shell, apply_patch and view_image run in, or `tools: local` where it
+ * has none, its local environment on. A turn steered (turn/steer) answers beside each prompt it was
+ * steered with (`steered: <prompt>`), and, steered with `finish now`, ends at once, its wait cut
+ * short. Every request is a server
  * span named by its method, of the trace alasio sends it in when it does, with the name
  * the client initialized with, exported where alasio's `-c otel.trace_exporter=` says,
  * from the service codex-app-server, as Codex's own are. Each thread's rollout is written
@@ -34,6 +42,7 @@ import { resourceFromAttributes } from "@opentelemetry/resources";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 
 import type { ClientRequest, RequestId, ServerNotification, v2 } from "../../.types/codex/index.js";
+import { NO_BIND_HEADER } from "../../src/binder/names.ts";
 import { ALASIO_CODEX_MODEL } from "../../src/codex/model.ts";
 import {
   agentMessage,
@@ -138,6 +147,16 @@ async function providerStatus(settings: ReadonlyMap<string, string>): Promise<st
   }
 }
 
+/** The environments its home's environments.toml names, its lines but comments and blanks, joined; `local` where it has none, its local environment on. */
+function environments(): string {
+  try {
+    const toml = readFileSync(join(process.env["CODEX_HOME"] ?? "", "environments.toml"), "utf8");
+    return toml.split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("#")).join("; ");
+  } catch {
+    return "local";
+  }
+}
+
 /** Runs the app-server stand-in, given Codex's arguments after `app-server`, until alasio closes its input or stops it. */
 async function serve(args: readonly string[]): Promise<void> {
   const settings = new Map(args.flatMap((arg, index) => {
@@ -156,19 +175,23 @@ async function serve(args: readonly string[]): Promise<void> {
   const baymaOf = new Map<string, { readonly url: string; readonly http_headers?: Record<string, string> }>();
   /** Each thread's commands left running in the background, by their item's id. */
   const background = new Map<string, Set<string>>();
+  /** What each running turn was steered with, by its id. */
+  const steered = new Map<string, string[]>();
+  /** What ends each running turn at once, its wait cut short, by its id. */
+  const finishers = new Map<string, () => void>();
   /** Remembers the bayma `params`' config names for the thread `threadId`, where it names one. */
   const keepBayma = (threadId: string, params: { readonly config?: { readonly [key: string]: unknown } | null }) => {
     const bayma = (params.config?.["mcp_servers"] as { readonly bayma?: { readonly url: string; readonly http_headers?: Record<string, string> } } | undefined)?.bayma;
     if (bayma) baymaOf.set(threadId, bayma);
   };
-  /** What the thread's bayma answers an initialize, as Codex's MCP client sends it: its status, or why none. */
-  const initializeBayma = async (threadId: string): Promise<string> => {
+  /** What the thread's bayma answers an initialize, as Codex's MCP client sends it, binding nothing where `bindsNothing`: its status, or why none. */
+  const initializeBayma = async (threadId: string, { bindsNothing = false } = {}): Promise<string> => {
     const bayma = baymaOf.get(threadId);
     if (!bayma) return "no bayma";
     try {
       const response = await fetch(bayma.url, {
         method: "POST",
-        headers: { ...bayma.http_headers, "content-type": "application/json", accept: "application/json, text/event-stream" },
+        headers: { ...bayma.http_headers, "content-type": "application/json", accept: "application/json, text/event-stream", ...(bindsNothing ? { [NO_BIND_HEADER]: "never" } : {}) },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "codex-stand-in", version: "1.0.0" } } }),
       });
       await response.body?.cancel();
@@ -230,6 +253,15 @@ async function serve(args: readonly string[]): Promise<void> {
       nextCursor: null,
     }),
     "turn/interrupt": () => ({}),
+    // Taken into the turn still running, answered beside its answer as it ends.
+    "turn/steer": ({ expectedTurnId, input }) => {
+      const prompts = steered.get(expectedTurnId);
+      if (!prompts) throw new Error(`no turn ${expectedTurnId} is running`);
+      const text = input.map((item) => (item.type === "text" ? item.text : "")).join("");
+      prompts.push(text);
+      if (text === "finish now") setImmediate(() => finishers.get(expectedTurnId)?.());
+      return { turnId: expectedTurnId };
+    },
     "turn/start": ({ threadId, input }, span) => {
       const thread = threads.get(threadId);
       if (!thread) throw new Error(`thread not found: ${threadId}`);
@@ -240,8 +272,23 @@ async function serve(args: readonly string[]): Promise<void> {
       const shown = /^show (\S+)$/u.exec(text)?.[1];
       const said = shown ? `${ANSWER}\n\n![shown](${shown})` : ANSWER;
       const answer = agentMessage(randomUUID(), said, "final_answer");
-      // Its model provider asked, as Codex asks it, and what it answered said after the answer.
-      const asked = text === "login" ? providerStatus(settings).then((status) => agentMessage(randomUUID(), `${ANSWER}\n\nlogin ${status}`, "final_answer")) : Promise.resolve(answer);
+      // What the turn finds out besides its answer, said after it: its model provider asked, as Codex asks it; its bayma asked at once, as its
+      // first tool call would; or its environments, as its home names them.
+      const found: Promise<string | null> = text === "login"
+        ? providerStatus(settings).then((status) => `login ${status}`)
+        : text === "bayma bound"
+        ? initializeBayma(threadId, { bindsNothing: true }).then((status) => `bayma bound: ${status}`)
+        : text === "tools"
+        ? Promise.resolve(`tools: ${environments()}`)
+        : Promise.resolve(null);
+      steered.set(turn.id, []);
+      /** The turn's answer as it ends: what it found, and each prompt it was steered with, after its answer. */
+      const final = () =>
+        found.then((extra) => {
+          const after = [...(extra === null ? [] : [extra]), ...(steered.get(turn.id) ?? []).map((prompt) => `steered: ${prompt}`)];
+          steered.delete(turn.id);
+          return after.length === 0 ? answer : agentMessage(randomUUID(), [said, ...after].join("\n\n"), "final_answer");
+        });
       const done = codexTurn(turn.id, { items: [userMessage(randomUUID(), input), answer], itemsView: "full", status: "completed", startedAt, completedAt: now(), durationMs: 0 });
       record(threadId, "turn_context", { turn_id: turn.id, cwd: thread.cwd, model: ALASIO_CODEX_MODEL });
       record(threadId, "event_msg", { type: "task_started", turn_id: turn.id });
@@ -265,12 +312,16 @@ async function serve(args: readonly string[]): Promise<void> {
       const seconds = Number(/^wait (\d+)$/u.exec(text)?.[1] ?? 0);
       setImmediate(() => {
         notify(turnStarted(threadId, turn));
-        setTimeout(() => {
-          void asked.then((final) => {
-            notify(itemCompleted(threadId, turn.id, final));
-            notify(turnCompleted(threadId, { ...done, items: [final], itemsView: "summary" }));
+        const finish = () => {
+          clearTimeout(waiting);
+          finishers.delete(turn.id);
+          void final().then((ended) => {
+            notify(itemCompleted(threadId, turn.id, ended));
+            notify(turnCompleted(threadId, { ...done, items: [ended], itemsView: "summary" }));
           });
-        }, seconds * 1000);
+        };
+        const waiting = setTimeout(finish, seconds * 1000);
+        finishers.set(turn.id, finish);
       });
       return { turn };
     },

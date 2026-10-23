@@ -1229,8 +1229,11 @@ export async function dumpClusterState(): Promise<void> {
         const name = pod.metadata?.name ?? "";
         const logged = await logsOf(NAMESPACE, name, component);
         say(`--- ${NAMESPACE}/${name}: its last lines of harnesses`);
-        const told = (each: string) => each.includes("harness:") || each.includes("harness's") || each.startsWith("[sandbox-gateway]");
-        for (const line of logged.trimEnd().split("\n").filter(told).slice(-60)) say(`  ${line}`);
+        // alasio's of its turns' drives, reattaches and recoveries too, which name the conversation, not its harness's key.
+        const told = (each: string) =>
+          each.includes("harness:") || each.includes("harness's") || each.startsWith("[sandbox-gateway]") ||
+          (component === "alasio" && /harness|turn-controller|was lost|attach/iu.test(each));
+        for (const line of logged.trimEnd().split("\n").filter(told).slice(-120)) say(`  ${line}`);
       }
     }
     // And each bound harness pod's own last lines, which a pod ready as it serves shows nowhere else.
