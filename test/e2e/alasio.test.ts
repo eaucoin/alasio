@@ -1109,8 +1109,14 @@ if (inShard("sessions")) {
 
   describe("Telegram's deliveries, through the webhook intake", () => {
     before(async () => {
-      // The tests before end and start the node's containers again: the intake, the log it writes to and alasio ready first.
-      await kube.awaitReady([ref("Deployment", WEBHOOK, NAMESPACE), ref("StatefulSet", componentName("log"), NAMESPACE), ref("Deployment", RELEASE, NAMESPACE)], "10 minutes");
+      // The tests before end and start the node's containers again: the intake, the log it writes to, alasio, and the sandbox
+      // gateway it asks whether a conversation works through, which a command's panel says, ready first.
+      await kube.awaitReady([
+        ref("Deployment", WEBHOOK, NAMESPACE),
+        ref("StatefulSet", componentName("log"), NAMESPACE),
+        ref("Deployment", RELEASE, NAMESPACE),
+        ref("Deployment", GATEWAY, NAMESPACE),
+      ], "10 minutes");
       telegram = await forward(TELEGRAM);
       tg = operator(telegram.base);
     });
