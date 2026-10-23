@@ -8,6 +8,11 @@
  * failed before it stopped its database leaves no server keeping the process alive; each
  * startPostgres gets a database of its own.
  * Roles are the server's, and so shared by the databases of one test process.
+ *
+ * What holds connections to it is closed before it stops (closedBeforeStop): a test file's
+ * hooks run in the order they were made, and this module's is made first, as each module that
+ * pools connections imports it, so a pool's own hook would end it only after the server had
+ * terminated its idle connections, which the pool then fails of with none to hear it.
  */
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -36,8 +41,16 @@ interface Server {
 
 let server: Promise<Server> | undefined;
 let databases = 0;
+/** What holds connections to the server, closed before it stops as the test file's tests end, in turn. */
+const closers: (() => Promise<unknown>)[] = [];
+
+/** Has `close` run as the test file's tests end, before the server stops: a pool's end, say. */
+export function closedBeforeStop(close: () => Promise<unknown>): void {
+  closers.push(close);
+}
 
 after(async () => {
+  for (const close of closers.splice(0)) await close();
   const left = await server?.catch(() => null);
   server = undefined;
   if (!left) return;

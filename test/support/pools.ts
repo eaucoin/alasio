@@ -49,14 +49,14 @@ import { conversationOfHarnessKey, folderOfKey, heldToHarness } from "../../src/
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { HarnessHost } from "../../src/harness/host.ts";
 import type { HarnessHostError } from "../../src/harness/index.ts";
-import type { StoreError } from "../../src/persistence/sql.ts";
+import { hearingConnections, type StoreError } from "../../src/persistence/sql.ts";
 import { HarnessEvents } from "../../src/harness/host-events.ts";
 import { type HarnessStandIns, startHarness } from "../../src/harness/program.ts";
 import { pooledHarnessHost } from "../../src/harness/pooled-host.ts";
 import { KubeApiError, KubeClient } from "../../src/kube/client.ts";
 import { ensureHarnessRole } from "../../src/neon/harness.ts";
 import { Store } from "../../src/persistence/store.ts";
-import { startPostgres } from "./postgres.ts";
+import { closedBeforeStop, startPostgres } from "./postgres.ts";
 import { type MemoryTopic, memoryTopic } from "./topics.ts";
 
 /** The harness host's role's password, as the stand-in's databases keep its verifier. */
@@ -90,11 +90,9 @@ export const POOLED_SCHEMA = "state";
 const DATABASE = Symbol("alasio/test/pooled-database");
 /** The database of `store`, where it is one of pooledStore's, or one a test made of one. */
 const databaseOf = (store: Store["Service"]): PooledDatabase | undefined => (store as Store["Service"] & { readonly [DATABASE]?: PooledDatabase })[DATABASE];
-/** The pools pooledStore opened, ended as the test file's tests end. */
+/** The pools pooledStore opened, ended as the test file's tests end, before their server stops. */
 const opened: pg.Pool[] = [];
-after(async () => {
-  await Promise.all(opened.splice(0).map((pool) => pool.end()));
-});
+closedBeforeStop(() => Promise.all(opened.splice(0).map((pool) => pool.end())));
 
 /** What a pooled store is made with, as testStore's are (./store.ts). */
 export interface PooledStoreOptions {
@@ -111,7 +109,11 @@ export interface PooledStoreOptions {
  */
 export async function pooledDatabase(): Promise<PooledDatabase> {
   const database = await startPostgres();
-  const pool = new pg.Pool({ connectionString: database.url, max: 4 });
+  // Its connections heard as alasio's are (../../src/neon/connect.ts): one held, by its
+  // handling lock say, by hearingConnections; one idle, by the pool's own listener, as the
+  // server ends them as the test file's tests end. A statement of one that dies fails still.
+  const pool = hearingConnections(new pg.Pool({ connectionString: database.url, max: 4 }));
+  pool.on("error", () => {});
   opened.push(pool);
   await ensureHarnessRole(pool, scramVerifier(HARNESS_PASSWORD));
   for (const store of [new NeonSessionStore(pool), new NeonRolloutStore(pool), new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA })]) await store.ensureSchema();

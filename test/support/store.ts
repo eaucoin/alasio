@@ -3,15 +3,13 @@
  * started as its first test needs it and stopped after its last, each store in a
  * schema of its own, its pool's connections heard as alasio's are.
  */
-import { after } from "node:test";
-
 import { type Duration, Effect } from "effect";
 import pg from "pg";
 
 import { hearingConnections, type StoreError } from "../../src/persistence/sql.ts";
 import { handlingLockName, Store, type TurnFenced, type TurnPersistence } from "../../src/persistence/store.ts";
 import { CODEX_HARNESS } from "../../src/harness/names.ts";
-import { startPostgres, type TestPostgres } from "./postgres.ts";
+import { closedBeforeStop, startPostgres, type TestPostgres } from "./postgres.ts";
 
 /** The test file's Postgres, and the pool its stores share. */
 interface TestDatabase {
@@ -25,7 +23,7 @@ let schemas = 0;
 const database = (): Promise<TestDatabase> =>
   started ??= startPostgres().then((postgres) => ({ postgres, pool: hearingConnections(new pg.Pool({ connectionString: postgres.url, max: 4 })) }));
 
-after(async () => {
+closedBeforeStop(async () => {
   if (!started) return;
   const { postgres, pool } = await started;
   await pool.end();
