@@ -27,6 +27,7 @@ import { forgetfulPersistence } from "./support/persistence.ts";
 import { bindHarness, holdsOf, POOLED_SCHEMA, Pools, pooledStore, poolOf } from "./support/pools.ts";
 import { run } from "./support/store.ts";
 import { type QueuedToOutbox, recordingOutbox, type TestAlasio, withServices } from "./support/turns.ts";
+import { eventually } from "./support/wait.ts";
 
 /** A Codex harness whose turns run as `turn` says, given what alasio gives each. */
 function scriptedHarness(turn: (params: TurnParams) => Effect.Effect<TurnResult, StoreError | TurnFenced>): Harness {
@@ -88,13 +89,9 @@ async function withTurns<T>(
 const turnOf = (conversationId: string, prompt: string) =>
   Effect.flatMap(Turns, (turns) => turns.run({ conversationId, chatId: CONVERSATION_CHAT, messageId: prompt, prompt, traceparent: null }));
 
-/** Waits for `check` to hold, a little at a time. */
+/** Waits for `check` to hold, as eventually does, for its outer bound at most, the failure naming `what`. */
 async function until(what: string, check: () => Promise<boolean> | boolean): Promise<void> {
-  for (let waited = 0; waited < 5000; waited += 20) {
-    if (await check()) return;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.fail(`timed out waiting for ${what}`);
+  await eventually(what, async () => ((await check()) ? true : undefined));
 }
 
 test("a turn holds its conversation from before its claim until it lets go: one decided meanwhile is refused, and claims nothing", async () => {

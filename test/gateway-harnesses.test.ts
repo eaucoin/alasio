@@ -24,6 +24,7 @@ import { HOST_PATHS } from "../src/harness/wire.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { type BindingRequest, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
+import { eventually } from "./support/wait.ts";
 
 // The gateway's conversations' harnesses on a real API server, each pool's pods at the
 // loopback's address, where a stand-in for a harness host answers as the test says, and the
@@ -415,7 +416,11 @@ test("a bound harness whose host cannot be asked is kept, said so as it first fa
     for (const deadline = Date.now() + 10_000; await run(readLease(env.codex, key)); await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, `${key} was not released`);
     assert.equal(stand.asked.includes(HOST_PATHS.drain), false);
     for (const deadline = Date.now() + 10_000; !recorded.detached.includes(`node-a ${env.home}/${bound.pod}`); await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, recorded.detached.join("\n"));
-    const lost = told.filter((event) => event.kind === "harness.lost" && event.subject.key === "telegram:43");
+    // Told once its release is done, which its detach is a step of.
+    const lost = await eventually("the binding told of as lost", () => {
+      const found = told.filter((event) => event.kind === "harness.lost" && event.subject.key === "telegram:43");
+      return found.length > 0 ? found : undefined;
+    });
     assert.equal(lost.length, 1);
     assert.deepEqual({ ...lost[0], reason: undefined }, { kind: "harness.lost", environment: "main", source: "sandbox-gateway", subject: { kind: "conversation", key: "telegram:43" }, binding: bound.binding, pod: bound.pod, reason: undefined });
     assert.match(lost[0]?.kind === "harness.lost" ? lost[0].reason : "", /^its host answered no sweep for 1\.5 s: /u);
@@ -449,6 +454,8 @@ test("a bound pod whose host ended, or was started again in it, is released as b
     }
     assert.equal(stand.asked.includes(HOST_PATHS.drain), false);
     const reasons = (conversation: string) => told.filter((event) => event.subject.key === conversation && event.kind === "harness.released").map((event) => (event.kind === "harness.released" ? event.reason : ""));
+    // Each told once its release in the background is done, which its Lease's deletion is a step of.
+    await eventually("each release told of", () => ([reasons("telegram:51"), reasons("telegram:52"), reasons("telegram:53")].every((told) => told.length > 0) ? true : undefined));
     assert.deepEqual([reasons("telegram:51"), reasons("telegram:52"), reasons("telegram:53")], [["broken"], ["broken"], ["deleted"]]);
     // A binding whose pod went while it was bound, told of as lost.
     const lease = await run(readLease(env.codex, ended.key));
