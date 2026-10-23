@@ -75,7 +75,6 @@ if (import.meta.main) {
       sessionsGateway: { url: config.gatewayUrl, environment: config.environment, callerKey: Buffer.from(config.callerKey, "base64") },
       folders: true,
       codexLoginUrl: config.codexLoginUrl,
-      codexLoginPort: 0,
       pod: config.pod,
       inKubernetes: false,
       harnessRole: HARNESS_ROLE,

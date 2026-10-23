@@ -306,7 +306,6 @@ test("alasio's services wire the durable outbox into final response delivery", a
       sessionsGateway: { url: "http://127.0.0.1:9", environment: "main", callerKey: Buffer.from("caller-key") },
       folders: false,
       codexLoginUrl: CODEX_LOGIN_URL,
-      codexLoginPort: 0,
       pod: "alasio-composition",
       inKubernetes: false,
       harnessRole: HARNESS_ROLE,

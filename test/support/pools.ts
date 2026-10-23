@@ -64,8 +64,15 @@ import { type MemoryTopic, memoryTopic } from "./topics.ts";
 const HARNESS_PASSWORD = "harness-password";
 /** The environment the stand-in's alasio is, main. */
 export const ENVIRONMENT = "main";
-/** Where the stand-in's alasio tells its pods its Codex login is relayed: nowhere, as the harnesses its pods' hosts make call no model. */
-export const CODEX_LOGIN_URL = "http://127.0.0.1:9/v1";
+/**
+ * Where the stand-in's alasio tells its pods its Codex login is relayed: a relay that refuses
+ * every request, as the harnesses its pods' hosts make call no model, and that answers, as
+ * alasio waits for the relay to before it starts a Codex turn. It keeps no test process up.
+ */
+const relayStandIn = createHttpServer((_request, response) => void response.writeHead(401).end("refused"));
+await new Promise<void>((listening) => relayStandIn.listen(0, "127.0.0.1", listening));
+relayStandIn.unref();
+export const CODEX_LOGIN_URL = `http://127.0.0.1:${(relayStandIn.address() as AddressInfo).port}/v1`;
 /** The namespace its pools are in, as main's are. */
 const NAMESPACE = "alasio";
 

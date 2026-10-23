@@ -44,7 +44,7 @@ export interface AlasioConfig {
   readonly sessionsGateway: GatewayWorkspacesOptions;
   /** Whether the sandbox gateway serves folder workspaces' instances (src/gateway/folders.ts), as the deployment renders the host profile. */
   readonly folders: boolean;
-  /** Where alasio's harness pools' pods reach the relay of its Codex login it serves them (src/codex/login-relay.ts). */
+  /** Where alasio's harness pools' pods reach its environment's relay of its Codex login (src/codex/relay.ts). */
   readonly codexLoginUrl: string;
   /**
    * alasio's own pod's name, as its Deployment gives it (ALASIO_POD), which it holds its

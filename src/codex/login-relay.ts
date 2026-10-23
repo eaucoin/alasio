@@ -15,15 +15,15 @@
  * under /backend-api/codex, with the login's account id; an API-key login is sent to the
  * OpenAI API as it is.
  *
- * Where alasio's harnesses run in pools of their own, alasio serves the same relay to its
- * environment's harness pools' pods, on a port of its pod's (CODEX_LOGIN_PORT), each request
+ * Where alasio's harnesses run in pools of their own, the same relay serves its environment's
+ * harness pools' pods as a component of its own (./relay.ts), on CODEX_LOGIN_PORT, each request
  * bearing a token alasio gives each Codex turn it starts there, signed by its pools' key
  * (poolLoginKey), good for minutes and renewed as the turn runs (../harness/pooled-host.ts),
- * checked in constant time, its refusal said why in alasio's log alone; and a pod relays on
+ * checked in constant time, its refusal said why in the relay's log alone; and a pod relays on
  * its own loopback to it, with the latest token given (../harness/given-codex-login.ts), so
- * only alasio ever holds or refreshes the login (./login-refresh.ts), as a ChatGPT refresh
- * token is single-use; alasio's relay keeps the login fresh before each request it passes on
- * (`fresh`).
+ * no pod ever holds or refreshes the login, which alasio and the relay refresh one at a time
+ * under the store's lock (./login-refresh.ts), as a ChatGPT refresh token is single-use; the
+ * relay keeps the login fresh before each request it passes on (`fresh`).
  */
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";

@@ -3572,10 +3572,13 @@ if (inShard("agents")) {
       assert.match(seen.after.text, /kept through the release/u);
     });
 
-    test("a pooled Codex turn calls the model through alasio's relay of its login, its token taken there, its pod's own Codex home holding no login", async () => {
+    test("a pooled Codex turn calls the model through its environment's relay of its login, a component of its own, up as a Codex harness is bound, its token taken there, its pod's own Codex home holding no login", async () => {
       await tg.say("login");
-      // Refused nowhere on its way, it finds no login in the run's alasio, which has none: 503, not 401.
+      // Refused nowhere on its way, it finds no login in the run's store, which keeps none: 503, not 401.
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === `${ANSWER}\n\nlogin 503`);
+      // By the relay's pod, which KEDA started as the conversation's Codex harness was bound: alasio's has no port for it.
+      const relay = await kube.get<V1Deployment>(ref("Deployment", componentName("codex-login"), NAMESPACE));
+      assert.ok((relay?.status?.readyReplicas ?? 0) >= 1, `the relay of the Codex login is at ${relay?.status?.readyReplicas ?? 0} ready replicas`);
       const pod = await harnessPod();
       const home = await kube.execOk(NAMESPACE, pod.metadata?.name ?? "", ["sh", "-c", 'test -e "$CODEX_HOME/auth.json" && echo login || echo none'], { container: "harness" });
       assert.equal(home.trim(), "none");
@@ -3597,6 +3600,11 @@ if (inShard("agents")) {
       for (const deadline = Date.now() + 10 * 60_000; (await harnessPods()).length > 0; await sleep(5_000)) assert.ok(Date.now() < deadline, "the idle harness was not released");
       for (const deadline = Date.now() + 120_000; !/telegram:\S+'s harness was released \(idle\)/u.test(await alasioLogged()); await sleep(2_000)) {
         assert.ok(Date.now() < deadline, "alasio was not told its harness was released");
+      }
+      // No Codex harness bound, the relay of the Codex login back at none, as KEDA scales it past its cooldown.
+      const relay = ref("Deployment", componentName("codex-login"), NAMESPACE);
+      for (const deadline = Date.now() + 5 * 60_000; ((await kube.get<V1Deployment>(relay))?.spec?.replicas ?? 0) > 0; await sleep(5_000)) {
+        assert.ok(Date.now() < deadline, "the relay of the Codex login was not scaled to none once no Codex harness was bound");
       }
       await tg.say("back");
       await tg.waitFor((call) => answered(call));

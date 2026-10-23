@@ -3,8 +3,6 @@
  * src/main.ts runs it in production, as ./shared/run.ts runs a process,
  * test/support/alasio-main.ts against the tests' stand-ins.
  */
-import { join } from "node:path";
-
 import { Effect, Layer, Option, type Scope } from "effect";
 import type { Pool } from "pg";
 
@@ -23,7 +21,6 @@ import type { HarnessHost } from "./harness/host.ts";
 import { HarnessEvents } from "./harness/host-events.ts";
 import { Panels } from "./harness/panels.ts";
 import { pooledHarnessHost } from "./harness/pooled-host.ts";
-import { CODEX_LOGIN_PORT, poolLoginKey, poolLoginRefusal, startLoginRelay } from "./codex/login-relay.ts";
 import { BusyPods } from "./kube/busy.ts";
 import { KubeClient } from "./kube/client.ts";
 import { recordStart } from "./kube/started.ts";
@@ -71,8 +68,6 @@ export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog" | "log" 
   readonly lakeWritten?: (() => void) | undefined;
   /** The harness host's role, which Neon has (../neon/harness.ts), granted its part of the state. */
   readonly harnessRole: string;
-  /** The port its relay of its Codex login listens on: CODEX_LOGIN_PORT, as its pod's Service reaches it, unless a test gives another (0, a free one). */
-  readonly codexLoginPort?: number | undefined;
 }
 
 /** The services alasio's app runs on, which are always there. */
@@ -142,22 +137,13 @@ export const stateStore = (options: Pick<AlasioOptions, "pool" | "stateSchema" |
 /**
  * The host alasio's turns run on, each conversation's, bound in its harness's pool through the
  * sandbox gateway, and where it hears what their harnesses do on their own, on its environment's
- * events topic; its Codex login relayed to the pools' pods, on its pod's port, to each Codex
- * turn's token alone, held by none of them.
+ * events topic; its Codex turns given tokens for its environment's relay of its Codex login
+ * (./codex/relay.ts), a component of its own, which no pod holds the login past.
  */
-function harnessHost({ codexLoginUrl, codexLoginPort = CODEX_LOGIN_PORT, sessionsGateway, lakeWritten }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | EventsConsumer | CodexLoginFreshness> {
-  const home = codexHome();
-  const relay = Layer.effectDiscard(Effect.flatMap(CodexLoginFreshness, ({ fresh }) => Effect.ignore(startLoginRelay({
-    authFile: join(home, "auth.json"),
-    // A login refused passes on as it is, its access token good until it stops: a Codex turn refused it says why.
-    fresh: Effect.catchTag(fresh, "CodexLoginRefused", () => Effect.void),
-    listen: { host: "0.0.0.0", port: codexLoginPort },
-    authorize: poolLoginRefusal(poolLoginKey(sessionsGateway.callerKey), Date.now),
-  }).pipe(Effect.tapError((error) => Effect.logError(`the Codex login could not be relayed to the harness pools: ${error.message}`))))));
+function harnessHost({ codexLoginUrl, sessionsGateway, lakeWritten }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | EventsConsumer | CodexLoginFreshness> {
   return Layer.mergeAll(
-    pooledHarnessHost({ ...sessionsGateway, codexLogin: { url: codexLoginUrl, home }, written: lakeWritten }),
+    pooledHarnessHost({ ...sessionsGateway, codexLogin: { url: codexLoginUrl, home: codexHome() }, written: lakeWritten }),
     HarnessEvents.fromLog({ written: lakeWritten }),
-    relay,
   );
 }
 

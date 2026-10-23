@@ -24,12 +24,13 @@
  * harness, and the work it leaves going on, reach bayma for as long as the pod is bound, with no
  * turn of alasio's to renew it, and alasio asleep.
  *
- * Each Codex turn is given a token for alasio's relay of its Codex login (../codex/login-relay.ts),
- * good for CODEX_LOGIN_TTL_MS, renewed every `renewMs` for as long as the turn runs
- * (HarnessHost.renewCodexLogin), and, a folder conversation's, the operator's Codex
- * configuration, as only alasio holds the login; and alasio, the one refresher of the login,
- * keeps it fresh before the turn and as it renews its token (../codex/login-refresh.ts), by its
- * own app-server, one of the alasios on its store at a time. alasio's own pod is held busy for as long as it drives a turn (../kube/busy.ts),
+ * Each Codex turn is given a token for its environment's relay of its Codex login
+ * (../codex/relay.ts), good for CODEX_LOGIN_TTL_MS, renewed every `renewMs` for as long as the
+ * turn runs (HarnessHost.renewCodexLogin), and, a folder conversation's, the operator's Codex
+ * configuration, as no pod holds the login; the turn starts once the relay answers, which KEDA
+ * keeps up while a Codex harness is bound, at none otherwise, its status saying so meanwhile.
+ * alasio keeps the login fresh before the turn and as it renews its token
+ * (../codex/login-refresh.ts), by its own app-server, under the store's lock, as the relay does. alasio's own pod is held busy for as long as it drives a turn (../kube/busy.ts),
  * since it is alasio that takes the turn's answer to its chat. The operator's panels are alasio's (./panels.ts): a fork of a session, and a thread's
  * goals, of the conversation's pod, bound ahead for them (forkSession, goals).
  */
@@ -60,6 +61,15 @@ export const HARNESS_BINDING = "its harness, whose pod is being readied";
 const CODEX_LOGIN_TTL_MS = 10 * 60_000;
 /** How often a running Codex turn's token is renewed, by default: well within its time. */
 const CODEX_LOGIN_RENEW_MS = 3 * 60_000;
+/** What a Codex turn says it waits on while its environment's relay of its Codex login starts, as one at none does once a Codex harness is bound. */
+export const CODEX_LOGIN_RELAY = "the relay of its Codex login, which is starting";
+/** How long a Codex turn waits for the relay of its Codex login to answer before it starts anyway: past a pod's start, as KEDA scales the relay up once a Codex harness is bound. */
+const CODEX_RELAY_WAIT_MS = 3 * 60_000;
+/** How long one ask of the relay waits for its answer. */
+const CODEX_RELAY_ASK_MS = 2_000;
+/** How often the relay is asked again while it does not answer. */
+const CODEX_RELAY_RETRY = "1 second";
+
 /** How often a call of one binding is made again of the binding the conversation's harness was bound to anew instead, at most: its pod gone once, and once more as it was. */
 const MOVED_RETRIES = 2;
 
@@ -234,6 +244,20 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
         });
 
       const loginKey = poolLoginKey(callerKey);
+      /**
+       * Waits until the relay of the Codex login answers, as any answer says it serves, refused as
+       * an ask bearing no token is, for CODEX_RELAY_WAIT_MS at most, the turn's status saying what
+       * it waits on meanwhile; past that, the turn starts anyway, and its Codex says what it found.
+       */
+      const relayAnswers = (waiting: (what: string | null) => Effect.Effect<void>): Effect.Effect<void> => {
+        const ask = Effect.tryPromise(() => fetch(`${codexLogin.url}/models`, { signal: AbortSignal.timeout(CODEX_RELAY_ASK_MS) })).pipe(Effect.flatMap((answer) => Effect.promise(() => answer.body?.cancel() ?? Promise.resolve())));
+        return Effect.gen(function*() {
+          if (Result.isSuccess(yield* Effect.result(ask))) return;
+          yield* waiting(CODEX_LOGIN_RELAY);
+          const answered = yield* ask.pipe(Effect.retry(Schedule.spaced(CODEX_RELAY_RETRY)), Effect.timeoutOption(CODEX_RELAY_WAIT_MS), Effect.orElseSucceed(() => Option.none()), Effect.ensuring(waiting(null)));
+          if (Option.isNone(answered)) yield* Effect.logWarning(`the relay of the Codex login at ${codexLogin.url} did not answer in ${CODEX_RELAY_WAIT_MS / 1000} s: the turn starts anyway`);
+        });
+      };
       /** A token of the conversation's Codex turn for alasio's relay of its login, good for CODEX_LOGIN_TTL_MS, the login kept fresh first; none where it is refused. */
       const loginOf = (conversationId: string): Effect.Effect<TurnCodex["login"], CodexLoginRefused> =>
         Effect.andThen(loginFresh, Effect.map(Clock.currentTimeMillis, (now) => ({ url: codexLogin.url, token: mintToken(loginKey, { key: harnessKey(conversationId), expires: now + CODEX_LOGIN_TTL_MS }) })));
@@ -241,7 +265,9 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
       const codexOf = (start: TurnRequest): Effect.Effect<TurnCodex | null, CodexLoginRefused> =>
         Effect.gen(function*() {
           if (start.harness !== CODEX_HARNESS) return null;
+          // Its login first, as one refused fails the turn at once, whether the relay answers or not.
           const login = yield* loginOf(start.conversationId);
+          yield* relayAnswers(waitingOf(start));
           const home = parseWorkspace(start.workingDirectory)?.kind === "sessionfs" ? null : yield* codexConfiguration(codexLogin.home);
           return { login, home };
         });

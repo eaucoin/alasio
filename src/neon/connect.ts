@@ -269,18 +269,7 @@ export interface HarnessNeonStores extends OpenNeon {
  * hears what the pod did on its own (ConnectedNeon.written).
  */
 const connectHarnessNeon: Effect.Effect<HarnessNeonStores, NeonError, Scope.Scope> = Effect.gen(function*() {
-  const databaseUrl = yield* deploymentSecret("ALASIO_DATABASE_URL");
-  const runFork = yield* FiberSet.makeRuntime();
-  const pool = yield* Effect.acquireRelease(
-    Effect.sync(() => poolOf(databaseUrl, (error) => void runFork(Effect.logWarning(`idle database connection lost: ${error.message}`)), (config) => new GrantedPool(config))),
-    (made) => Effect.promise(() => made.end()),
-  );
-  yield* onNeon(() => pool.query("select 1")).pipe(
-    Effect.retry(whileNeonStarts),
-    withAlasioSpan("alasio.neon.connect"),
-    Effect.interruptible,
-  );
-  yield* Effect.logInfo("connected to Neon");
+  const pool = yield* deploymentPool((config) => new GrantedPool(config));
   return {
     pool,
     sessionStore: new NeonSessionStore(pool),
@@ -288,6 +277,35 @@ const connectHarnessNeon: Effect.Effect<HarnessNeonStores, NeonError, Scope.Scop
     sessionFsRollouts: new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA }),
   };
 }).pipe(withLogScope("neon"));
+
+/**
+ * A pool of `make`'s on the Neon the deployment provides (`ALASIO_DATABASE_URL`, or its `_FILE`
+ * form), as the role it names, until the scope closes, waiting for it as alasio does; it makes
+ * nothing there.
+ */
+const deploymentPool = <P extends Pool>(make: (config: pg.PoolConfig) => P): Effect.Effect<P, NeonError, Scope.Scope> =>
+  Effect.gen(function*() {
+    const databaseUrl = yield* deploymentSecret("ALASIO_DATABASE_URL");
+    const runFork = yield* FiberSet.makeRuntime();
+    const pool = yield* Effect.acquireRelease(
+      Effect.sync(() => poolOf(databaseUrl, (error) => void runFork(Effect.logWarning(`idle database connection lost: ${error.message}`)), make)),
+      (made) => Effect.promise(() => made.end()),
+    );
+    yield* onNeon(() => pool.query("select 1")).pipe(
+      Effect.retry(whileNeonStarts),
+      withAlasioSpan("alasio.neon.connect"),
+      Effect.interruptible,
+    );
+    yield* Effect.logInfo("connected to Neon");
+    return pool;
+  }).pipe(withLogScope("neon"));
+
+/**
+ * The relay of alasio's Codex login's connection to alasio's Neon (../codex/relay.ts), as
+ * alasio's own role, whose state keeps the login: its pool, open while the scope is, which makes
+ * nothing there, as alasio has made it.
+ */
+export const connectRelayNeon: Effect.Effect<Pool, NeonError, Scope.Scope> = deploymentPool((config) => new pg.Pool(config));
 
 /** The harness host's connection to alasio's Neon, open while the scope `HarnessNeon.make` is run in lasts. */
 export class HarnessNeon extends Context.Service<HarnessNeon, HarnessNeonStores>()("alasio/neon/HarnessNeon", { make: connectHarnessNeon }) {}
