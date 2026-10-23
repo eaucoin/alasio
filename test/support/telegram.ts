@@ -8,7 +8,7 @@ import type { AddressInfo } from "node:net";
 import type { ApiMethods, InlineKeyboardButton, InlineKeyboardMarkup, Opts } from "@grammyjs/types";
 
 import { type OperatorMessage, type Press, type RecordedCall, type StubFailure, createTelegramStub } from "../e2e/telegram-stub.ts";
-import { eventually } from "./wait.ts";
+import { eventually, WAIT_MS } from "./wait.ts";
 
 export type { OperatorMessage, Press, StubFailure };
 
@@ -152,12 +152,12 @@ export class TelegramStandIn {
   }
 
   /** The first call to `method` after `mark` that `matches`, once alasio has made it. */
-  async waitFor<M extends BotMethod>(method: M, matches: (call: CallTo<M>) => boolean = () => true, { mark = 0, timeoutMs = 5_000 }: { readonly mark?: number; readonly timeoutMs?: number } = {}): Promise<CallTo<M>> {
+  async waitFor<M extends BotMethod>(method: M, matches: (call: CallTo<M>) => boolean = () => true, { mark = 0, timeoutMs = WAIT_MS }: { readonly mark?: number; readonly timeoutMs?: number } = {}): Promise<CallTo<M>> {
     return await eventually(`alasio to call ${method}`, () => this.callsTo(method, mark).find(matches), { timeoutMs, seen: () => this.shown(mark) });
   }
 
   /** What alasio has shown the operator after `mark`, once it has shown `count` things. */
-  async waitForShown(count: number, { mark = 0, timeoutMs = 5_000 }: { readonly mark?: number; readonly timeoutMs?: number } = {}): Promise<Shown[]> {
+  async waitForShown(count: number, { mark = 0, timeoutMs = WAIT_MS }: { readonly mark?: number; readonly timeoutMs?: number } = {}): Promise<Shown[]> {
     return await eventually(`alasio to show ${count} things`, () => {
       const entries = this.shown(mark);
       return entries.length >= count ? entries : undefined;

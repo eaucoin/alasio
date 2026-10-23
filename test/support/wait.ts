@@ -4,6 +4,15 @@
  */
 import { setTimeout as delay } from "node:timers/promises";
 
+/**
+ * How long a test waits on what it observes by default: an outer bound for what never comes,
+ * which its failure names, not a threshold. What a machine under the full suite's load does
+ * may take many times what it takes alone, as a child alasio's first request of a pod's
+ * app-server does; a wait ends as soon as what it waits on is there, so a long bound costs
+ * nothing but the failure's own time.
+ */
+export const WAIT_MS = 30_000;
+
 export interface EventuallyOptions {
   readonly timeoutMs?: number;
   /** What the failure says was seen instead. */
@@ -14,7 +23,7 @@ export interface EventuallyOptions {
 export async function eventually<T>(
   what: string,
   probe: () => T | undefined | Promise<T | undefined>,
-  { timeoutMs = 5_000, seen }: EventuallyOptions = {},
+  { timeoutMs = WAIT_MS, seen }: EventuallyOptions = {},
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {

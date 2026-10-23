@@ -14,7 +14,7 @@ import type { ClientNotification, ClientRequest, InitializeResponse, RequestId, 
 import { ALASIO_CODEX_MODEL } from "../../src/codex/model.ts";
 import { codexModel, initializeResponse } from "./codex-protocol.ts";
 import type { FakeCodexCommand, FakeCodexReport } from "./fake-codex-app-server.ts";
-import { eventually } from "./wait.ts";
+import { eventually, WAIT_MS } from "./wait.ts";
 
 /** What the app-server answers each request alasio makes of it with. */
 export interface CodexResults {
@@ -178,7 +178,7 @@ export class FakeCodexAppServer {
   }
 
   /** The first request of `method` not yet taken, once alasio has made it; the test answers it. */
-  async next<M extends CodexMethod>(method: M, { timeoutMs = 5_000 }: { readonly timeoutMs?: number } = {}): Promise<CodexRequest<M>> {
+  async next<M extends CodexMethod>(method: M, { timeoutMs = WAIT_MS }: { readonly timeoutMs?: number } = {}): Promise<CodexRequest<M>> {
     const received = await eventually(`alasio to request ${method} of the app-server`, () => this.received.find((candidate) => !candidate.taken && candidate.request.method === method), {
       timeoutMs,
       seen: () => this.received.map(({ request, taken }) => `${request.method}${taken ? "" : " (unanswered)"}`),
@@ -205,7 +205,7 @@ export class FakeCodexAppServer {
   }
 
   /** Resolves once every app-server process alasio started has exited. */
-  async allExited({ timeoutMs = 5_000 }: { readonly timeoutMs?: number } = {}): Promise<void> {
+  async allExited({ timeoutMs = WAIT_MS }: { readonly timeoutMs?: number } = {}): Promise<void> {
     await eventually("every app-server process to exit", () => (this.processes.every(({ exited }) => exited) ? true : undefined), { timeoutMs });
   }
 
