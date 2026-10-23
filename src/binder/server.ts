@@ -12,10 +12,20 @@
  *   before, and resets what its placement keeps of its binds (204), as it does where it has
  *   none; 409 `{ "busy": true }` with a Retry-After where another bind or release of it is
  *   under way, so none was released; 503 where it could not be released now, its binding kept.
+ *   It waits first for the binding's calls under way (its requests but GETs, as an MCP client's
+ *   stream it listens on is) through any replica of the front to end, for RELEASE_HOLD_MS at most, so no call to its pod is cut short by its caller's release,
+ *   as an exec's would be, its pod's state saved with the call open: only a real loss, its pod
+ *   gone, ends one.
  * - `GET /counts/<namespace>/<pool>`: `{ free, bound, waiting }`, the pool's free pods running,
  *   its bindings, and the binds waiting for a free pod in every replica of the binder, as
  *   `peers` names them; asked without a token, as KEDA's metrics-api trigger asks.
  * - `GET /waiting/<namespace>/<pool>`: `{ waiting }`, this replica's alone, as its peers ask.
+ * - `GET /flights/<namespace>/<key>`: `{ flights }`, the calls of the key's binding in the
+ *   namespace this replica is passing on now, its requests but GETs, as its peers ask before a
+ *   release, each with a token of its own replicas' (peerToken), which no pod can make, so a pod
+ *   learns nothing of another binding's calls: 401 to any other, 400 for a key that is none. A
+ *   peer that does not answer is taken as passing on none, as one that cannot be reached is
+ *   passing no call on either.
  * - `POST /events`: what a bound pod tells of what its harness did on its own, for its caller's
  *   control plane, as `relay` says it, of TOLD_BYTES at most (413 past it), asked with the
  *   binding's token alone, never a caller's (401 for any other): while its binding is held, as
@@ -56,6 +66,7 @@
  * as environments share keys (a branch's forks of main's sessions keep their ids), each
  * binding its own.
  */
+import { createHmac } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -69,7 +80,7 @@ import { counts, touchLease } from "./bindings.ts";
 import { EVENTS_PATH, NO_BIND_HEADER, NOT_PASSED_HEADER, PINNED_HEADER, type Pool } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
 import type { Held } from "./live.ts";
-import { bindingToken, type HeldTo, type TokenClaims, verifyToken } from "./tokens.ts";
+import { bindingToken, type HeldTo, mintToken, type TokenClaims, verifyToken } from "./tokens.ts";
 
 /**
  * How far apart the clocks of the front and of what mints its callers' tokens may be: room in
@@ -134,6 +145,25 @@ export const MAX_CALLER_TOKEN_MS = 5 * 60_000 + CLOCKS_APART_MS;
 
 /** What a Retry-After asks a caller to wait, in seconds, before it asks again. */
 const RETRY_AFTER_S = 1;
+/**
+ * How long a release its caller asks waits at most for its binding's requests under way to end:
+ * well within the caller's own wait for it (../sandbox/gateway-client.ts LONG_CALL_TIMEOUT_MS),
+ * and past any one call of an exec's, which bayma yields from within minutes. One open longer is
+ * taken as stuck, and the release goes on, saying so.
+ */
+export const RELEASE_HOLD_MS = 5 * 60_000;
+/** How often a release waiting on its binding's requests under way asks whether they have ended. */
+const FLIGHTS_POLL_MS = 250;
+/** How long a token a replica asks a peer of a binding's calls with is good for. */
+const PEER_TOKEN_MS = 60_000;
+
+/**
+ * The key the front's replicas sign the tokens they ask one another with, of the key a binding's
+ * tokens are signed with, which every replica has and no pod does: a pod holds tokens signed
+ * with that one, never it, and so can make none of these.
+ */
+export const peerKeyOf = (bindingKey: Buffer): Buffer => createHmac("sha256", bindingKey).update("alasio binder peers").digest();
+
 /** How often a binding's Lease is stamped with its requests, at most, by one replica: well within any wait to release it. */
 const ACTIVE_STAMP_MS = 30_000;
 /**
@@ -219,7 +249,7 @@ export interface BinderServerOptions {
   readonly relay?: (bound: HeldTo, body: Uint8Array) => Effect.Effect<Answer>;
 }
 
-/** A listening front: its port, and how many requests of each key of each pool it is passing on now. */
+/** A listening front: its port, and how many calls (requests but GETs) of each key of each pool it is passing on now. */
 export interface BinderServer {
   readonly port: number;
   readonly inFlight: (pool: Pool, key: string) => number;
@@ -257,6 +287,8 @@ const replayable = (incoming: IncomingMessage, limit: number): boolean => {
 
 const Waiting = Schema.Struct({ waiting: Schema.Number });
 const decodeWaiting = Schema.decodeUnknownOption(Waiting);
+const Flights = Schema.Struct({ flights: Schema.Number });
+const decodeFlights = Schema.decodeUnknownOption(Flights);
 
 /** Serves the front on `port` until the scope closes, as the module says. */
 export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]), operate, routeHeld, grants, relay }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
@@ -335,6 +367,36 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       return { free, bound, waiting: (yield* binder.waiting(pool)) + theirs.reduce((sum, each) => sum + each, 0) };
     });
 
+  const peerKey = peerKeyOf(bindingKey);
+  /** The calls of `key`'s binding in `pool`'s namespace under way through every replica of the front, a peer that does not answer taken as passing none on. */
+  const flightsOf = (pool: Pool, key: string) =>
+    Effect.gen(function*() {
+      const token = mintToken(peerKey, { key: slot(pool, key), expires: (yield* Clock.currentTimeMillis) + PEER_TOKEN_MS });
+      const theirs = yield* Effect.forEach(yield* peers(), (peer) =>
+        Effect.tryPromise(() =>
+          fetch(`http://${peer}/flights/${pool.namespace}/${encodeURIComponent(key)}`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(2_000) }).then((response) => response.json())
+        ).pipe(
+          Effect.map((body) => Option.match(decodeFlights(body), { onNone: () => 0, onSome: ({ flights: under }) => under })),
+          // A peer that does not answer passes on none it can say.
+          Effect.orElseSucceed(() => 0),
+        ), { concurrency: "unbounded" });
+      return (flights.get(slot(pool, key)) ?? 0) + theirs.reduce((sum, each) => sum + each, 0);
+    });
+
+  /** Waits for `key`'s binding in `pool` to have no request under way through any replica, as the module says, for RELEASE_HOLD_MS at most. */
+  const quiet = (pool: Pool, key: string): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      const deadline = (yield* Clock.currentTimeMillis) + RELEASE_HOLD_MS;
+      for (;;) {
+        const under = yield* flightsOf(pool, key);
+        if (under === 0) return;
+        if ((yield* Clock.currentTimeMillis) >= deadline) {
+          return yield* Effect.logWarning(`releasing ${key} with ${under} request(s) to its pod under way still after ${RELEASE_HOLD_MS / 1000} s, as they are taken as stuck`);
+        }
+        yield* Effect.sleep(FLIGHTS_POLL_MS);
+      }
+    });
+
   const handle = (incoming: IncomingMessage, outgoing: ServerResponse): Effect.Effect<void> =>
     Effect.gen(function*() {
       const url = incoming.url ?? "/";
@@ -344,6 +406,19 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         const pool = { namespace: asked[2]!, name: asked[3]! };
         if (asked[1] === "waiting") return answer(outgoing, 200, { waiting: yield* binder.waiting(pool) });
         return answer(outgoing, 200, yield* countsOf(pool));
+      }
+      const flying = /^\/flights\/([a-z0-9-]+)\/([^/]+)$/u.exec(url);
+      if (incoming.method === "GET" && flying) {
+        const asked = Option.getOrUndefined(Schema.decodeUnknownOption(BearerToken)(incoming.headers.authorization));
+        let flight: string;
+        try {
+          flight = `${flying[1]}/${decodeURIComponent(flying[2] ?? "")}`;
+        } catch {
+          return answer(outgoing, 400, { error: "no key of a binding" });
+        }
+        // A peer's alone, of this binding: no pod, nor a caller, learns of its calls.
+        if (!asked || verifyToken(peerKey, asked[1], yield* Clock.currentTimeMillis)?.key !== flight) return answer(outgoing, 401, { error: "no peer's token of this binding" });
+        return answer(outgoing, 200, { flights: flights.get(flight) ?? 0 });
       }
       const bearer = Schema.decodeUnknownOption(BearerToken)(incoming.headers.authorization);
       const now = yield* Clock.currentTimeMillis;
@@ -408,7 +483,8 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       if (incoming.method === "POST" && url === RELEASE_PATH) {
         incoming.resume();
         const released = yield* poolOf(key, claims.options ?? {}).pipe(
-          Effect.tap(({ pool }) => Effect.sync(() => routes.delete(slot(pool, key)))),
+          // Its requests under way through any replica let end first; then its route forgotten, as its binding is released.
+          Effect.tap(({ pool }) => Effect.andThen(quiet(pool, key), Effect.sync(() => routes.delete(slot(pool, key))))),
           Effect.flatMap(({ pool, release, reset }) => Effect.andThen(reset ?? Effect.void, binder.release(pool, key, release))),
           Effect.result,
         );
@@ -465,6 +541,10 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         Effect.gen(function*() {
           // One that binds nothing only reads what the binding has, as whether it is idle, and so keeps it no longer.
           if (!unbound) yield* active(key, to.pool, to.binding);
+          // A call holds its binding against its caller's release while it is under way; a GET does not, as the
+          // stream an MCP client listens on for what its server sends of its own, open for as long as the client is,
+          // waits on nothing it asked.
+          if (incoming.method === "GET") return yield* Effect.promise(() => proxy(incoming, outgoing, to, body));
           const flight = slot(to.pool, key);
           flights.set(flight, (flights.get(flight) ?? 0) + 1);
           return yield* Effect.promise(() => proxy(incoming, outgoing, to, body)).pipe(

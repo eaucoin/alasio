@@ -13,7 +13,7 @@ import { ACTIVE_ANNOTATION, activeAt, readLease, takeLease, touchLease } from ".
 import { baymaIdleness } from "../src/binder/sweep.ts";
 import { LiveBindings } from "../src/binder/live.ts";
 import { environmentKey, freeLabels, NO_BIND_HEADER, NOT_PASSED_HEADER, PINNED_HEADER, type Pool } from "../src/binder/names.ts";
-import { type BinderServer, type BinderServerOptions, FIRST_TOLD_KEPT, MAX_CALLER_TOKEN_MS, MAX_OPERATION_BYTES, type Operation, type Placement, PlacementRefused, serveBinder, TOLD_BYTES } from "../src/binder/server.ts";
+import { type BinderServer, type BinderServerOptions, FIRST_TOLD_KEPT, MAX_CALLER_TOKEN_MS, MAX_OPERATION_BYTES, type Operation, peerKeyOf, type Placement, PlacementRefused, serveBinder, TOLD_BYTES } from "../src/binder/server.ts";
 import { bindingToken, mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 import { heldToHarness } from "../src/gateway/names.ts";
 import { KubeClient } from "../src/kube/client.ts";
@@ -339,6 +339,82 @@ test("a caller's release runs what its placement says comes before, then lets it
     assert.equal((await call("/release")).status, 204);
     assert.deepEqual(before, [bound?.spec?.holderIdentity, bound?.spec?.holderIdentity]);
     assert.equal(await run(readLease(of, key)), null);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a caller's release waits for its binding's calls under way, through this replica of the front or another, to end, then lets it go: none is cut short; a GET open, as an MCP client's stream, holds nothing", async () => {
+  const of = await pool();
+  await freePods(of, 3);
+  const happened: string[] = [];
+  // A pod that answers /slow a second and a half after it is asked, as an exec's call is answered once it ends, and /stream never, as an MCP server its client's stream.
+  const slowPod = createServer((incoming, outgoing) => {
+    if (incoming.url === "/stream") return void (happened.push("streaming"), outgoing.writeHead(200, { "content-type": "text/event-stream" }).flushHeaders());
+    incoming.resume();
+    incoming.on("end", () => setTimeout(() => (happened.push(`answered ${incoming.url}`), outgoing.writeHead(200, { "content-type": "application/json" }).end("{}")), incoming.url === "/slow" ? 1_500 : 0));
+  });
+  slowPod.listen(0, "127.0.0.1");
+  await once(slowPod, "listening");
+  const podPort = (slowPod.address() as AddressInfo).port;
+  const other = await front(of, podPort);
+  const served = await front(of, podPort, { peers: [`127.0.0.1:${other.port}`], release: () => Effect.sync(() => void happened.push("released")) });
+  try {
+    const key = "sessionfs:held-by-its-calls";
+    const call = (through: { port: number }, path: string) => fetch(`http://127.0.0.1:${through.port}${path}`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" });
+    for (const through of [served, other]) {
+      happened.length = 0;
+      assert.equal((await call(served, "/bind")).status, 200);
+      const slow = call(through, "/slow").then((response) => response.status);
+      for (const deadline = Date.now() + 5_000; through.inFlight(of, key) === 0; await new Promise((resolve) => setTimeout(resolve, 20))) assert.ok(Date.now() < deadline, "the slow call never went through");
+      // Asked of this replica as the call is under way through it, or through another.
+      const released = call(served, "/release").then((response) => response.status);
+      assert.deepEqual([await slow, await released], [200, 204]);
+      assert.deepEqual(happened, ["answered /slow", "released"], through === served ? "this replica" : "another replica");
+      assert.equal(await run(readLease(of, key)), null);
+    }
+    // A GET open as the release is asked, as the stream an MCP client listens on: released at once.
+    happened.length = 0;
+    assert.equal((await call(served, "/bind")).status, 200);
+    const listening = new AbortController();
+    const stream = fetch(`http://127.0.0.1:${other.port}/stream`, { headers: { authorization: caller(key) }, signal: listening.signal }).catch(() => null);
+    for (const deadline = Date.now() + 5_000; !happened.includes("streaming"); await new Promise((resolve) => setTimeout(resolve, 20))) assert.ok(Date.now() < deadline, "the stream never went through");
+    const asked = Date.now();
+    assert.equal((await call(served, "/release")).status, 204);
+    assert.ok(Date.now() - asked < 1_000, `the release waited ${Date.now() - asked} ms on an open GET`);
+    listening.abort();
+    await stream;
+  } finally {
+    await served.close();
+    await other.close();
+    slowPod.closeAllConnections();
+    slowPod.close();
+  }
+});
+
+test("a binding's calls under way are told only to the front's own peers, by their token of that binding: a pod's token, a caller's, or a peer's of another binding is refused; a key that is none answered 400", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  const served = await front(of, stand.port);
+  try {
+    const key = "sessionfs:asked-of";
+    const bound = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller(key) } });
+    const { binding } = (await bound.json()) as { binding: string };
+    const peerOf = (asked: string) => `Bearer ${mintToken(peerKeyOf(bindingKey), { key: asked, expires: Date.now() + 60_000 })}`;
+    const ask = (path: string, authorization?: string) => fetch(`http://127.0.0.1:${served.port}${path}`, { headers: authorization ? { authorization } : {} });
+    const flights = `/flights/${of.namespace}/${encodeURIComponent(key)}`;
+    assert.deepEqual(await (await ask(flights, peerOf(`${of.namespace}/${key}`))).json(), { flights: 0 });
+    for (const [who, authorization] of [
+      ["no one", undefined],
+      ["its pod, by its binding's token", `Bearer ${bindingToken(bindingKey, { key, binding, namespace: of.namespace })}`],
+      ["its caller", caller(key)],
+      ["a peer, of another binding", peerOf(`${of.namespace}/sessionfs:another`)],
+    ] as const) {
+      assert.equal((await ask(flights, authorization)).status, 401, who);
+    }
+    assert.equal((await ask(`/flights/${of.namespace}/%E0%A4%A`, peerOf(`${of.namespace}/x`))).status, 400);
   } finally {
     await served.close();
     stand.close();
