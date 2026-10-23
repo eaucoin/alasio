@@ -11,7 +11,6 @@ import type {
   V1Namespace,
   V1Role,
   V1RoleBinding,
-  V1Service,
   V1ServiceAccount,
   V1PodTemplateSpec,
   V1Volume,
@@ -24,11 +23,11 @@ import type { ApiServer } from "../api-server.ts";
 import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { busyLabelPolicy } from "./admission.ts";
+import { codexLoginObjects, codexLoginUrl } from "./codex-login.ts";
 import { foldersRun } from "./folders.ts";
 import { carriedPools, GATEWAY, GATEWAY_PORT } from "./sandbox-gateway.ts";
 import { alasioGroup, environmentLogSecret, environmentName, lagTrigger, lakeWakeTopic, LOG_BROKERS, logAuthentication, telegramTopic } from "./log.ts";
 import { scaledObject, type Trigger } from "./scalers.ts";
-import { CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
 import { STOP_GRACE_SECONDS } from "../../../src/telegram/stop.ts";
 import {
   BRANCH_FORK_SECRET,
@@ -196,8 +195,8 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     { name: ALASIO_GATEWAY_CALLER_KEY_VARIABLE, valueFrom: { secretKeyRef: { name: SESSIONS_CALLER_SECRET, key: "caller-key" } } },
     // Main's folder workspaces, the gateway's folder instances, where the host profile renders them.
     ...(environment.branch === null && foldersRun(config) ? [{ name: ALASIO_GATEWAY_FOLDERS_VARIABLE, value: "1" }] : []),
-    // Where its conversations' harnesses' pools' pods reach its relay of its Codex login, which only it holds.
-    { name: "ALASIO_CODEX_LOGIN_URL", value: `http://${CODEX_LOGIN}.${environment.namespace}.svc.cluster.local:${CODEX_LOGIN_PORT}/v1` },
+    // Where its conversations' harnesses' pools' pods reach its environment's relay of its Codex login (./codex-login.ts).
+    { name: "ALASIO_CODEX_LOGIN_URL", value: codexLoginUrl(environment) },
     ...branchEnv(environment),
     ...otelEnv(config, environment),
     ...envOf(alasio.env),
@@ -254,7 +253,6 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
             workingDir: home,
             env: alasioEnv(config, home, operatorHome, environment),
             ...given("envFrom", [...alasio.envFrom]),
-            ports: [{ name: "codex-login", containerPort: CODEX_LOGIN_PORT }],
             securityContext: restrictedContainer(),
             resources: alasio.resources,
             volumeMounts: [
@@ -386,18 +384,6 @@ function hostAgentIdentity(config: InstallConfig): KubernetesObject[] {
   return [serviceAccount, role, binding];
 }
 
-/** The Service of its relay of its Codex login, which its harness pools' pods reach it by (src/codex/login-relay.ts). */
-export const CODEX_LOGIN = componentName("codex-login");
-
-function codexLoginService(environment: Environment): V1Service {
-  return {
-    apiVersion: "v1",
-    kind: "Service",
-    metadata: { name: CODEX_LOGIN, namespace: environment.namespace, labels: labels("alasio") },
-    spec: { selector: selectorLabels("alasio"), ports: [{ name: "codex-login", port: CODEX_LOGIN_PORT, targetPort: "codex-login" }] },
-  };
-}
-
 /** How many updates waiting on its environment's Telegram topic ask for one more alasio: a few chats' bursts. */
 const UPDATES_PER_ALASIO = 20;
 /** What a bound harness asks of alasio's scale: so much that any number of them ask for one alasio, to hear and deliver what they do, and no more. */
@@ -440,7 +426,7 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
     verticalPodAutoscaler(alasio, "AtStart"),
     // A drain waits for the turns running in its pod to end.
     busyBudget(environment.namespace),
-    codexLoginService(environment),
+    ...codexLoginObjects(config, environment),
     // What alasio may do beyond what RBAC can say: the cluster's, made with main's.
     ...(environment.branch === null ? busyLabelPolicy() : []),
   ];

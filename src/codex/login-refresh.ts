@@ -1,12 +1,12 @@
 /**
- * alasio's Codex login, kept fresh by alasio alone where its harnesses run in pools of their
- * own (../harness/pooled-host.ts), whichever of the alasios on one store does. No Codex of
- * alasio's process calls the model for a turn there, and the pods' Codex calls it through
- * alasio's relay (./login-relay.ts), holding no login to refresh. So before each Codex turn alasio
- * drives in a pod, and while it runs, before each request the relay passes on, and before
- * alasio's own app-server lists the login's models, a ChatGPT login that is due is refreshed
- * through Codex's own refresh, by alasio's app-server (account/read, its refresh token asked
- * for).
+ * alasio's Codex login, kept fresh by alasio and by its environment's relay of it (./relay.ts)
+ * where its harnesses run in pools of their own (../harness/pooled-host.ts), whichever of them
+ * on one store does. No Codex of alasio's process calls the model for a turn there, and the pods'
+ * Codex calls it through the relay (./login-relay.ts), holding no login to refresh. So before
+ * each Codex turn alasio drives in a pod, and while it runs, and before alasio's own app-server
+ * lists the login's models, by alasio's app-server, and before each request the relay passes
+ * on, by the relay's, a ChatGPT login that is due is refreshed through Codex's own refresh
+ * (account/read, its refresh token asked for).
  *
  * A login is due where its access token stops within FRESH_FOR_MS, or it was last refreshed
  * REFRESHED_WITHIN_MS ago: before Codex would refresh it on its own as it calls (codex-rs

@@ -1084,7 +1084,7 @@ test("logs prints a component's log, each line with its pod's name when it has s
   const log = await alasio(["logs", "log"]);
   succeeded(log);
   assert.deepEqual(log.stdout.split("\n").filter(Boolean).sort(), ["[access] applied", "[log] serving"]);
-  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has alasio, collector, collector-scraper, grafana, harness-claude, harness-codex, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake-intake, lake-loader, lake-query, log, /u);
+  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has alasio, codex-login, collector, collector-scraper, grafana, harness-claude, harness-codex, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake-intake, lake-loader, lake-query, log, /u);
 });
 
 test("restart rolls alasio's pod out again as a manager of its own, and waits until it runs", async (t) => {
@@ -2261,7 +2261,7 @@ test("branch list says each branch, what it is a branch of, its age, the release
   succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
   const listed = await alasio(["branch", "list"]);
   succeeded(listed);
-  assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, made by alasio 0.0.0-development, its alasio ready, 2.8 GiB requested, 0 MiB used"]);
+  assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, made by alasio 0.0.0-development, its alasio ready, 2.9 GiB requested, 0 MiB used"]);
 });
 
 test("branch delete refuses while the branch's alasio has a turn running, or a workspace of its sessions is bound, unless --force, and deletes it whole: its alasio and lake, its sessions' workspaces, its compute, its branch of Neon, its namespaces", async (t) => {

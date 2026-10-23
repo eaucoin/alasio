@@ -598,11 +598,11 @@ test("KEDA and VPA are installed where the cluster has none, refused where it ha
   const verticalPodAutoscaler = { apiVersion: "autoscaling.k8s.io/v1", kind: "VerticalPodAutoscaler", metadata: { name: "alasio-lake", namespace: "alasio" } };
   const crd = (name: string) => kube.put("customresourcedefinitions", { apiVersion: "apiextensions.k8s.io/v1", kind: "CustomResourceDefinition", metadata: { name } });
   assert.equal(await check({}), "fits");
-  assert.equal(await check(without("keda"), [scaledObject]), "this cluster has no KEDA, which scales alasio-lake-loader, alasio-lake-intake, sandboxes-none, sandboxes-full, harness-codex, harness-claude, alasio-grafana: install.autoscaling.keda.enabled true installs alasio's");
+  assert.equal(await check(without("keda"), [scaledObject]), "this cluster has no KEDA, which scales alasio-codex-login, alasio-lake-loader, alasio-lake-intake, sandboxes-none, sandboxes-full, harness-codex, harness-claude, alasio-grafana: install.autoscaling.keda.enabled true installs alasio's");
   assert.match(await check(without("vpa")), /^this cluster has no VPA, which sizes alasio-keda-operator, .*alasio-lake.*: install\.autoscaling\.vpa\.enabled true installs alasio's$/u);
-  // The lake's intake and loader, which KEDA wakes, the sandbox service's pools and the harness pools, each at a count of its own: nothing scaled.
+  // The relay of Codex's login, the lake's intake and loader, which KEDA wakes, the sandbox service's pools and the harness pools, each at a count of its own: nothing scaled.
   const fixed = { min: 1, max: 1 };
-  assert.equal(await check({ ...without("keda"), lake: { intake: { scaling: fixed }, loader: { scaling: fixed } }, sessions: { pools: fixed }, harness: { pools: { scaling: fixed } } }), "fits");
+  assert.equal(await check({ ...without("keda"), alasio: { codexLogin: { scaling: fixed } }, lake: { intake: { scaling: fixed }, loader: { scaling: fixed } }, sessions: { pools: fixed }, harness: { pools: { scaling: fixed } } }), "fits");
 
   // alasio's own, installed, are no other's, and not the cluster's once alasio is told to use the cluster's.
   await run(applyInstallation(objectsOf(), WAIT));

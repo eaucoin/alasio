@@ -187,6 +187,15 @@ const Alasio = Schema.Struct({
   pollingSeconds: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be at least 1" })), 5),
   /** How long none of what alasio scales on must have been seen before KEDA scales it back to `min`, in seconds. */
   cooldownSeconds: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0, { message: "must be 0 or more" })), 300),
+  /**
+   * The relay of each environment's Codex login to its harness pools' pods (src/codex/relay.ts,
+   * cli/src/manifests/codex-login.ts): between `min` and `max`, as KEDA keeps it up while any of
+   * the environment's Codex harnesses is bound, at none otherwise unless `min` says.
+   */
+  codexLogin: defaulted(Schema.Struct({
+    scaling: Scaling({ min: 0, max: 1 }, { floor: false, scaled: true }),
+    resources: Resources({ requests: { cpu: "10m", memory: "128Mi" }, limits: { memory: "512Mi" } }),
+  }), {}),
 });
 
 /**
