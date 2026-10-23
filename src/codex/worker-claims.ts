@@ -1,0 +1,214 @@
+/**
+ * Which of the alasios on one store drives each conversation: the one holding its worker's
+ * claim (Store.claimWorker), a row of the store's taken where none holds it or its holder's has
+ * lapsed, each taking one generation past the last. Its prompt jobs, its turns and what is left
+ * of them are run by that alasio alone, under the claim (CurrentWorkerFence): each write of
+ * theirs holds only while the claim is still the conversation's, so an alasio stalled past its
+ * claim's life, which another took over meanwhile, writes nothing once it resumes.
+ *
+ * Within an alasio, the claim is shared by whatever drives the conversation at once (its
+ * worker, a turn run outside it, a turn attached to again): taken by the first, renewed every
+ * WORKER_CLAIM_RENEWAL while any holds it, and let go of once the last ends, for another alasio
+ * to take at once. One that stops lets go of every claim it holds. One that stops renewing, as
+ * it crashed or stalled, has its claims lapse WORKER_CLAIM_LIFE after its last renewal; an
+ * alasio's sweep of the conversations with work left that none holds (Turns.takeUnheld), every
+ * WORKER_SWEEP_EVERY, takes them up, so a conversation is driven again within
+ * WORKER_CLAIM_LIFE + WORKER_SWEEP_EVERY of its alasio's crash at the most.
+ *
+ * A claim found taken over as it is renewed is let go of: what holds it is interrupted, and
+ * none of its writes lands meanwhile, being fenced. So does one whose renewals all failed, as
+ * of a store that answered nothing for more than WORKER_CLAIM_LIFE - WORKER_CLAIM_RENEWAL
+ * (45 s): another alasio may take the claim then, and what this one drove is interrupted once
+ * a renewal finds that, its writes in between refused. Safe, disruptive to the turn it drove,
+ * and unlikely, as the store answering nothing for that long stops every alasio on it alike.
+ *
+ * A claim's holder is the alasio's pod's name, as its Deployment gives it (ALASIO_POD), and a
+ * uuid of its process's. An alasio starting lets go of the claims of its pod's processes before
+ * it (lapseOwn), as a container restarted in its pod leaves them, its process gone: so its
+ * conversations are taken up at once, not WORKER_CLAIM_LIFE after the crash. The pod's name, not
+ * its hostname, which two alasios share under hostNetwork, so none lets go of another's claims.
+ */
+import { randomUUID } from "node:crypto";
+
+import { Deferred, Duration, Effect, Fiber, FiberSet, Option, Schema, Semaphore } from "effect";
+
+import type { StoreError } from "../persistence/sql.ts";
+import { CurrentWorkerFence, Store, type WorkerFence } from "../persistence/store.ts";
+
+/** How long a worker's claim lasts unless renewed. */
+export const WORKER_CLAIM_LIFE = Duration.seconds(60);
+/** How often an alasio renews the claims it holds, well within WORKER_CLAIM_LIFE. */
+export const WORKER_CLAIM_RENEWAL = Duration.seconds(15);
+/** How often an alasio takes up the conversations with work left whose claims lapsed (Turns.takeUnheld). */
+export const WORKER_SWEEP_EVERY = Duration.seconds(30);
+
+/** What drove a conversation under its claim, interrupted as another alasio took it over. */
+export class WorkerClaimLost extends Schema.TaggedError<WorkerClaimLost>()("WorkerClaimLost", {
+  conversationId: Schema.String,
+}) {
+  override get message(): string {
+    return `another alasio took ${this.conversationId} over, so this one drives it no more`;
+  }
+}
+
+/** How long a claim lasts unless renewed, and how often it is renewed: WORKER_CLAIM_LIFE and WORKER_CLAIM_RENEWAL but for tests. */
+export interface WorkerClaimTimings {
+  readonly life: Duration.Input;
+  readonly renewal: Duration.Input;
+}
+
+/** What WorkerClaims is made with: the name of the pod it is of, as the module says, and its timings. */
+export interface WorkerClaimsOptions {
+  readonly pod: string;
+  readonly timings?: WorkerClaimTimings | undefined;
+}
+
+/** A conversation's claim as this alasio holds it: by how many at once, and whether it was found taken over. */
+interface Held {
+  readonly fence: WorkerFence;
+  users: number;
+  readonly lost: Deferred.Deferred<void>;
+  readonly renewal: Fiber.Fiber<void>;
+}
+
+/** What drives a conversation, under its claim, as the module says. */
+export interface WorkerClaims {
+  /**
+   * `work` under the conversation's claim: joining this alasio's where it holds it, taking it
+   * where none does, `recover` run first under a claim taken so, for what the last holder left.
+   * Its result; none, without running it, where another alasio holds the claim.
+   */
+  readonly holding: <A, E, R>(conversationId: string, work: Effect.Effect<A, E, R>, recover: Effect.Effect<void, StoreError, R>) => Effect.Effect<Option.Option<A>, E | StoreError | WorkerClaimLost, R>;
+  /**
+   * `work` forked into `fibers` under the conversation's claim, which what runs now holds:
+   * joined before it is forked, so it holds the claim on past it. Nothing, said so, where this
+   * alasio holds no claim of the conversation's.
+   */
+  readonly forkHolding: <E>(conversationId: string, work: Effect.Effect<void, E>, fibers: FiberSet.FiberSet<void>) => Effect.Effect<void>;
+  /** Lets go of the claims this alasio's pod's processes before it held, as the module says: how many. */
+  readonly lapseOwn: Effect.Effect<number, StoreError>;
+}
+
+export const makeWorkerClaims = Effect.fnUntraced(function*({ pod, timings = { life: WORKER_CLAIM_LIFE, renewal: WORKER_CLAIM_RENEWAL } }: WorkerClaimsOptions) {
+  const store = yield* Store;
+  const holder = `${pod}/${randomUUID()}`;
+  const lifeMs = Duration.toMillis(timings.life);
+  const held = new Map<string, Held>();
+  /**
+   * Each conversation's own lock of its claim's joins and leaves, taken and let go of one at a
+   * time, which wait on the store's answers: so one conversation's slow statement holds up its
+   * own, no other's. One a conversation, kept while the alasio runs.
+   */
+  const locks = new Map<string, Semaphore.Semaphore>();
+  const lockOf = (conversationId: string): Semaphore.Semaphore => {
+    const made = locks.get(conversationId) ?? Semaphore.makeUnsafe(1);
+    locks.set(conversationId, made);
+    return made;
+  };
+  const renewals = yield* FiberSet.make<void>();
+
+  /** Forgets the claim `fence` where it is still the one held of its conversation. */
+  const forget = (fence: WorkerFence) => {
+    if (held.get(fence.conversationId)?.fence === fence) held.delete(fence.conversationId);
+  };
+
+  /**
+   * Renews the claim every WORKER_CLAIM_RENEWAL; found taken over, it is forgotten and `lost`
+   * told. A renewal that fails is tried again at the next: the claim holds while no other alasio
+   * has taken it, lapsed or not.
+   */
+  const renewing = (fence: WorkerFence, lost: Deferred.Deferred<void>): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      while (true) {
+        yield* Effect.sleep(timings.renewal);
+        const still = yield* store.renewWorker(fence, lifeMs).pipe(
+          Effect.catch((error) => Effect.as(Effect.logWarning(`could not renew the claim of ${fence.conversationId}'s worker, trying again: ${error.message}`), true)),
+        );
+        if (!still) {
+          yield* Effect.logWarning(new WorkerClaimLost({ conversationId: fence.conversationId }).message);
+          forget(fence);
+          yield* Deferred.succeed(lost, undefined);
+          return;
+        }
+      }
+    });
+
+  /**
+   * This alasio's claim of the conversation joined, or taken where it holds none: whether it was
+   * taken now; none where another alasio holds it. Run where nothing interrupts it but `restore`'s
+   * part, the take's statement, which may wait on the claim's row, locked by a fenced write: an
+   * alasio stopping meanwhile interrupts it, the claim taken, if it was, lapsing unrecorded.
+   */
+  const join = (conversationId: string, restore: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>): Effect.Effect<Option.Option<{ readonly entry: Held; readonly taken: boolean }>, StoreError> =>
+    lockOf(conversationId).withPermit(Effect.gen(function*() {
+      const entry = held.get(conversationId);
+      if (entry) {
+        entry.users += 1;
+        return Option.some({ entry, taken: false });
+      }
+      const fence = yield* restore(store.claimWorker(conversationId, holder, lifeMs));
+      if (!fence) return Option.none();
+      const lost = yield* Deferred.make<void>();
+      const made: Held = { fence, users: 1, lost, renewal: yield* FiberSet.run(renewals, renewing(fence, lost)) };
+      held.set(conversationId, made);
+      return Option.some({ entry: made, taken: true });
+    }));
+
+  /** One fewer holds `entry`: the last let go of the claim, for another alasio to take at once. */
+  const leave = (conversationId: string, entry: Held): Effect.Effect<void> =>
+    lockOf(conversationId).withPermit(Effect.gen(function*() {
+      entry.users -= 1;
+      if (entry.users > 0) return;
+      forget(entry.fence);
+      yield* Fiber.interrupt(entry.renewal);
+      // Not let go of, it lapses within its life.
+      yield* store.releaseWorker(entry.fence).pipe(
+        Effect.catch((error) => Effect.logWarning(`could not let go of the claim of ${conversationId}'s worker, which lapses: ${error.message}`)),
+      );
+    }));
+
+  /** `work` under `entry`'s claim, interrupted where it is found taken over. */
+  const under = <A, E, R>(conversationId: string, entry: Held, work: Effect.Effect<A, E, R>): Effect.Effect<A, E | WorkerClaimLost, R> =>
+    work.pipe(
+      Effect.raceFirst(Effect.andThen(Deferred.await(entry.lost), Effect.fail(new WorkerClaimLost({ conversationId })))),
+      Effect.provideService(CurrentWorkerFence, entry.fence),
+    );
+
+  // Whatever holds a claim as alasio stops is interrupted first; what is left is let go of.
+  yield* Effect.addFinalizer(() =>
+    Effect.forEach([...held.values()], (entry) => store.releaseWorker(entry.fence).pipe(Effect.ignore), { discard: true }).pipe(
+      Effect.andThen(Effect.sync(() => held.clear())),
+    )
+  );
+
+  const claims: WorkerClaims = {
+    holding: (conversationId, work, recover) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.flatMap(join(conversationId, restore), Option.match({
+          onNone: () => Effect.succeedNone,
+          onSome: ({ entry, taken }) =>
+            restore(under(conversationId, entry, taken ? Effect.andThen(recover, work) : work)).pipe(
+              Effect.map(Option.some),
+              Effect.ensuring(leave(conversationId, entry)),
+            ),
+        }))
+      ),
+    forkHolding: (conversationId, work, fibers) =>
+      lockOf(conversationId).withPermit(Effect.sync(() => {
+        const entry = held.get(conversationId);
+        if (entry) entry.users += 1;
+        return entry;
+      })).pipe(
+        Effect.flatMap((entry) =>
+          entry
+            ? Effect.asVoid(FiberSet.run(fibers, under(conversationId, entry, work).pipe(
+              Effect.catch((error) => Effect.logWarning(`what drove ${conversationId} under its worker's claim failed: ${error instanceof Error ? error.message : String(error)}`)),
+              Effect.ensuring(leave(conversationId, entry)),
+            )))
+            : Effect.logWarning(`nothing was forked under ${conversationId}'s worker's claim, as this alasio holds it no longer`)
+        ),
+      ),
+    lapseOwn: Effect.tap(store.lapseWorkersOf(pod), (lapsed) => (lapsed > 0 ? Effect.logInfo(`let go of the claims of ${lapsed} conversation(s) an earlier process of pod ${pod} held`) : Effect.void)),
+  };
+  return claims;
+});

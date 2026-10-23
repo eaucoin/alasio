@@ -43,6 +43,8 @@ export interface AlasioProcessConfig {
   readonly eventsUrl: string;
   /** The branch environment alasio is, if it is one. */
   readonly branch?: BranchEnvironment;
+  /** alasio's pod's name, the same each time it starts, as a container started again in its pod keeps it. */
+  readonly pod: string;
 }
 
 /** What the process tells its parent once alasio has started. */
@@ -74,6 +76,7 @@ if (import.meta.main) {
       folders: true,
       codexLoginUrl: config.codexLoginUrl,
       codexLoginPort: 0,
+      pod: config.pod,
       inKubernetes: false,
       harnessRole: HARNESS_ROLE,
       sessionStore: new NeonSessionStore(pool),

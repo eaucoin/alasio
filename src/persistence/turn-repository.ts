@@ -53,6 +53,10 @@ export interface ActiveTurn {
   /** The harness the turn runs on. */
   readonly harness: HarnessName;
   readonly pendingResponseId?: string | null | undefined;
+  /**
+   * The prompt alasio drives the turn with; none, of a turn its harness started on its own,
+   * which its harness host drives, alasio's worker attaching to none (Store.unheldConversations).
+   */
   readonly prompt?: string | null | undefined;
   /**
    * The binding of the conversation's harness it runs on, as a pod's host knows its own, of a turn
@@ -236,9 +240,9 @@ export class NeonTurnRepository {
     );
   }
 
-  /** Lets go of `holder`'s holds; of every hold, held by any, with `null`, as the alasio that held them is gone. */
-  release(holder: string | null): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(`delete from ${this.#schema}.conversation_holds where $1::text is null or holder = $1`, [holder]));
+  /** Lets go of `holder`'s holds. */
+  release(holder: string): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(`delete from ${this.#schema}.conversation_holds where holder = $1`, [holder]));
   }
 
   /** The conversation's latest turn, active or ended, or null when none has run. */

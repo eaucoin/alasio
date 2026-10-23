@@ -25,7 +25,7 @@ import { HARNESS_BINDING } from "../src/harness/pooled-host.ts";
 import type { Harness, OwnTurns, TurnParams, TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { StoreError } from "../src/persistence/sql.ts";
-import { Store, TurnFenced } from "../src/persistence/store.ts";
+import { CurrentWorkerFence, Store, TurnFenced } from "../src/persistence/store.ts";
 import { forgetfulPersistence } from "./support/persistence.ts";
 import { bindHarness, holdsOf, POOLED_SCHEMA, Pools, pooledStore, poolOf } from "./support/pools.ts";
 import { run } from "./support/store.ts";
@@ -222,7 +222,7 @@ test("the prompts held while a turn ran are asked about again once the conversat
   });
 });
 
-test("a prompt the last alasio was handing to a turn to steer as it stopped is asked about, quoted, once, and run only as the operator says", async () => {
+test("a prompt an alasio was handing to a turn to steer as it stopped is asked about, quoted, once, as its conversation is taken up, and run only as the operator says", async () => {
   const { store, conversationId } = await conversation();
   const ran: string[] = [];
   const harness = scriptedHarness((params) => Effect.sync(() => ran.push(params.prompt)).pipe(Effect.andThen(answered(params, "Done."))));
@@ -230,7 +230,7 @@ test("a prompt the last alasio was handing to a turn to steer as it stopped is a
   const { job } = await heldPrompt(store, conversationId, "steer this");
   assert.equal((await run(store.settleHeldPromptJob(job.id, "steering")))?.state, "steering");
   await withTurns(store, harness, async (alasio, queued) => {
-    await alasio.runPromise(Effect.flatMap(Turns, (turns) => Effect.andThen(turns.reconcilePersistentState, turns.resumePendingPrompts)));
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => Effect.andThen(turns.takeUnheld, turns.resumePendingPrompts)));
     await until("the steer to be asked about", () => queued.texts.length > 0);
     await new Promise((resolve) => setTimeout(resolve, 100));
     // Neither run again nor asked about as an ordinary held prompt.
@@ -248,20 +248,22 @@ test("a prompt the last alasio was handing to a turn to steer as it stopped is a
   });
 });
 
-test("alasio starting lets go of the holds the last one left, and attaches again to each turn it left running: one its pod knows nothing of runs again, once, its status message saying so", async () => {
+test("alasio taking up the conversations no alasio drives attaches again to the turn one left running as it was killed: one its pod knows nothing of runs again, once, its status message saying so; and it leaves the holds of others' forks", async () => {
   const { store, conversationId } = await conversation();
   const ran: string[] = [];
   const harness = scriptedHarness((params) => (ran.push(params.prompt), answered(params, "Checked.")));
-  // Left by an alasio killed mid-turn: its hold, and its turn, working, with its status message.
-  await run(store.holdConversations([conversationId], "forking", 60_000));
-  const epoch = await run(store.claimTurn({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "9", harness: CODEX_HARNESS }));
+  // Another conversation's fork, which another alasio runs.
+  const forked = await run(store.upsertConversation({ chatId: "77", user: { id: 77 } }));
+  await run(store.holdConversations([forked], "forking", 60_000));
+  // Left by an alasio killed mid-turn: its turn, working, with its status message.
+  const epoch = await run(store.claimTurn({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "9", harness: CODEX_HARNESS, prompt: "check" }));
   assert.equal(await run(store.setTurnStatusMessage(conversationId, epoch, "status-of-the-killed")), true);
   const killed = store.turnPersistence(conversationId, epoch);
   const partial = await run(killed.createPendingResponse(String(CONVERSATION_CHAT), "9", null));
   await run(killed.updateActiveTurnPendingResponseId(partial));
   await withTurns(store, harness, async (alasio) => {
-    await alasio.runPromise(Effect.flatMap(Turns, (turns) => Effect.andThen(turns.reconcilePersistentState, turns.reattachLeftTurns)));
-    assert.deepEqual(await holdsOf(store), []);
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.takeUnheld));
+    assert.deepEqual(await holdsOf(store), [[forked, "forking"]]);
     // Its conversation's pod knows nothing of it, as one bound anew after its own was lost would not.
     await until("the lost turn to run again", () => ran.length === 1);
     assert.deepEqual(ran, [buildLostHarnessText(CODEX_HARNESS)]);
@@ -272,7 +274,7 @@ test("alasio starting lets go of the holds the last one left, and attaches again
   });
 });
 
-test("alasio starting ends a turn whose job the agent finished as the last alasio stopped, completed, its status message saying so", async () => {
+test("alasio taking up a conversation ends a turn whose job the agent finished as its alasio stopped, completed, its status message saying so", async () => {
   const { store, conversationId } = await conversation();
   const harness = scriptedHarness((params) => answered(params, "unused"));
   const job = await run(store.enqueuePromptJob({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "5", prompt: "finish" }));
@@ -281,7 +283,8 @@ test("alasio starting ends a turn whose job the agent finished as the last alasi
   const epoch = await run(store.claimTurn({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "5", harness: CODEX_HARNESS }));
   await run(store.setTurnStatusMessage(conversationId, epoch, "status-of-the-finished"));
   await withTurns(store, harness, async (alasio, queued) => {
-    await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.reconcilePersistentState));
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.takeUnheld));
+    await until("the turn to end", async () => (await run(store.getActiveTurn(conversationId))) === null);
     assert.deepEqual([(await run(store.getTurn(conversationId)))?.outcome, (await run(store.getPromptJob(job.id)))?.state], ["completed", "completed"]);
     assert.deepEqual(queued.edits.map(({ edits, text }) => [edits, text]), [["status-of-the-finished", "Codex finished this turn as alasio stopped."]]);
   });
@@ -590,15 +593,15 @@ const waitingHarness = (release: Deferred.Deferred<void>, ran: string[], text = 
  */
 async function leftOnItsPod(alasio: TestAlasio, store: Store["Service"], conversationId: string, ran: string[], prompt = "go"): Promise<void> {
   const scope = await alasio.runPromise(Scope.make());
-  const stopping = Context.get(await alasio.runPromise(Layer.buildWithScope(Turns.layer(), scope)), Turns);
+  const stopping = Context.get(await alasio.runPromise(Layer.buildWithScope(Turns.layer({ pod: "alasio-stopping" }), scope)), Turns);
   alasio.runFork(stopping.run({ conversationId, chatId: CONVERSATION_CHAT, messageId: prompt, prompt, traceparent: null }));
   await until("the turn to run on its pod", () => ran.includes(prompt));
   await alasio.runPromise(Scope.close(scope, Exit.void));
   assert.equal((await run(store.getActiveTurn(conversationId)))?.status, "interrupted");
 }
 
-/** Attaches again to the turns left, as alasio starting does. */
-const reattached = (alasio: TestAlasio) => alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.reattachLeftTurns));
+/** Takes up the conversations no alasio drives, attaching again to the turns left, as alasio starting does. */
+const reattached = (alasio: TestAlasio) => alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.takeUnheld));
 
 test("a turn alasio stops driving runs on on its pod, and the next start attaches to it: its reply delivered once, as its pod ends it, and its binding lost after runs nothing again", async () => {
   const { store, conversationId } = await conversation();
@@ -759,5 +762,115 @@ test("a pod answering with a session another conversation has, of a turn, a fres
     assert.equal((await run(store.getTurn(conversationId)))?.outcome, "failed");
     assert.ok(outbox.queued.edits.some(({ text }) => text === "Codex hit an error."));
     assert.equal(await ofIts(), null);
+  });
+});
+
+/** Turns of another alasio's, over the same store and pods as the test's, let go of as the scope it gives `use` closes. */
+async function withAnotherAlasio<T>(alasio: TestAlasio, use: (another: Turns["Service"]) => Promise<T>): Promise<T> {
+  const scope = await alasio.runPromise(Scope.make());
+  try {
+    return await use(Context.get(await alasio.runPromise(Layer.buildWithScope(Turns.layer({ pod: "alasio-another" }), scope)), Turns));
+  } finally {
+    await alasio.runPromise(Scope.close(scope, Exit.void));
+  }
+}
+
+test("two alasios on one store, each scheduling a conversation's prompts at once, run each once, by the one worker holding the conversation's claim", async () => {
+  const { store, conversationId } = await conversation();
+  const ran: string[] = [];
+  const harness = scriptedHarness((params) => Effect.sync(() => ran.push(params.prompt)).pipe(Effect.andThen(Effect.sleep("50 millis")), Effect.andThen(answered(params, "Done."))));
+  await withTurns(store, harness, (alasio) =>
+    withAnotherAlasio(alasio, async (another) => {
+      const jobs = [];
+      for (const prompt of ["one", "two", "three"]) jobs.push(await run(store.enqueuePromptJob({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: prompt, prompt })));
+      await Promise.all([alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.schedule(conversationId))), alasio.runPromise(another.schedule(conversationId))]);
+      // And again as a prompt runs, as one queued through either would.
+      await until("a prompt to run", () => ran.length > 0);
+      await Promise.all([alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.schedule(conversationId))), alasio.runPromise(another.schedule(conversationId))]);
+      await until("every prompt to run", async () => !(await run(store.hasOpenPromptJobs(conversationId))));
+      assert.deepEqual(ran, ["one", "two", "three"]);
+      // Claimed once each: no worker of the other's took one only to find the conversation busy.
+      for (const job of jobs) assert.deepEqual([(await run(store.getPromptJob(job.id)))?.state, (await run(store.getPromptJob(job.id)))?.attempts], ["completed", 1]);
+    })
+  );
+});
+
+test("a turn whose alasio crashed is attached to again by another taking up the conversations no alasio drives once the crashed one's claim lapsed, not before", async () => {
+  const { store, conversationId } = await conversation();
+  const release = Effect.runSync(Deferred.make<void>());
+  const ran: string[] = [];
+  const outbox = recordingOutbox();
+  await withServices({ store, harnesses: { [CODEX_HARNESS]: waitingHarness(release, ran) }, outbox: outbox.layer }, async (alasio) => {
+    await leftOnItsPod(alasio, store, conversationId, ran);
+    // Its alasio crashed rather than stopped: its claim held until it lapses.
+    assert.ok(await run(store.claimWorker(conversationId, "crashed", 500)));
+    await reattached(alasio);
+    await alasio.runPromise(Deferred.succeed(release, undefined));
+    await sleep(200);
+    assert.equal((await run(store.getActiveTurn(conversationId)))?.status, "interrupted");
+    assert.equal(outbox.queued.texts.some(({ text }) => text === "Done."), false);
+    await sleep(400);
+    await reattached(alasio);
+    await until("its reply", () => outbox.queued.texts.some(({ text }) => text === "Done."));
+    await until("its turn to end", async () => (await run(store.getActiveTurn(conversationId))) === null);
+    assert.equal((await run(store.getTurn(conversationId)))?.outcome, "completed");
+    assert.deepEqual(ran, ["go"]);
+  });
+});
+
+test("a prompt job another alasio runs under its claim is left running by one taking up the conversations no alasio drives, and settled, and run again, once that claim lapsed", async () => {
+  const { store, conversationId } = await conversation();
+  const ran: string[] = [];
+  const harness = scriptedHarness((params) => Effect.sync(() => ran.push(params.prompt)).pipe(Effect.andThen(answered(params, "Done."))));
+  const holder = await run(store.claimWorker(conversationId, "other", 500));
+  assert.ok(holder);
+  const job = await run(store.enqueuePromptJob({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "1", prompt: "never sent" }));
+  // Claimed by the other alasio's worker, which has yet to send it to the agent.
+  await run(store.claimNextPromptJob(conversationId).pipe(Effect.provideService(CurrentWorkerFence, holder)));
+  await withTurns(store, harness, async (alasio) => {
+    const takeUnheld = () => alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.takeUnheld));
+    await takeUnheld();
+    // Nor taken up as a prompt queued through this alasio schedules its worker.
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.schedule(conversationId)));
+    await sleep(200);
+    assert.deepEqual([(await run(store.getPromptJob(job.id)))?.state, ran], ["running", []]);
+    await sleep(400);
+    await takeUnheld();
+    await until("the job to run again", () => ran.length === 1);
+    await until("the job to complete", async () => (await run(store.getPromptJob(job.id)))?.state === "completed");
+    assert.equal((await run(store.getPromptJob(job.id)))?.attempts, 2);
+  });
+});
+
+test("a turn a harness started on its own is its host's: no alasio taking up conversations attaches to it, nor runs it again, even taking its conversation's claim for what else was left", async () => {
+  const { store, conversationId } = await conversation();
+  const ran: string[] = [];
+  const harness = scriptedHarness((params) => Effect.sync(() => ran.push(params.prompt)).pipe(Effect.andThen(answered(params, "Done."))));
+  // Its own turn, as a pod's harness claims one, with no prompt of alasio's.
+  await run(store.claimTurn({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "own", harness: CODEX_HARNESS }));
+  await withTurns(store, harness, async (alasio) => {
+    const takeUnheld = () => alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.takeUnheld));
+    assert.deepEqual(await run(store.unheldConversations), []);
+    await takeUnheld();
+    // And a job an alasio left running as it crashed, which takes the conversation up.
+    const job = await run(store.enqueuePromptJob({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "1", prompt: "left" }));
+    await run(store.claimNextPromptJob(conversationId));
+    await takeUnheld();
+    await until("the job left to run again", async () => (await run(store.getPromptJob(job.id)))?.state === "completed");
+    assert.deepEqual(ran, ["left"]);
+  });
+});
+
+test("a turn run outside a worker, its conversation's claim held by another alasio's worker as it asks, waits for that claim, and runs once it is let go of", async () => {
+  const { store, conversationId } = await conversation();
+  const ran: string[] = [];
+  const harness = scriptedHarness((params) => Effect.sync(() => ran.push(params.prompt)).pipe(Effect.andThen(answered(params, "Done."))));
+  // Another alasio's worker, at a pass that runs nothing, for a second.
+  const other = await run(store.claimWorker(conversationId, "other", 60_000));
+  assert.ok(other);
+  setTimeout(() => void Effect.runPromise(store.releaseWorker(other)), 1_000);
+  await withTurns(store, harness, async (alasio) => {
+    assert.equal(await alasio.runPromise(turnOf(conversationId, "direct")), true);
+    assert.deepEqual(ran, ["direct"]);
   });
 });

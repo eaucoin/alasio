@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 import { Duration, Effect, Fiber, FiberSet, Layer, Option, Schedule, type Scope } from "effect";
 
 import { Turns } from "../codex/turns.ts";
+import { WORKER_SWEEP_EVERY } from "../codex/worker-claims.ts";
 import type { AlasioConfig } from "../config.ts";
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
 import { Mounts } from "../operator/mounts.ts";
@@ -167,13 +168,16 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   yield* Effect.logInfo(`  Default folder: ${config.workingDirectory ?? "none (operator chooses with /workspace)"}`);
   yield* Effect.logInfo(`  Default service: ${config.defaultHarness ?? "none (operator chooses with /service)"}`);
   yield* Effect.logInfo(`  Session filesystems: ${sandbox ? "enabled" : "off (the deployment renders no sessions template)"}`);
-  yield* turns.reconcilePersistentState;
   // The session filesystems the gateway holds set against those the store records, and where they differ said.
   yield* Effect.flatMap(Mounts, (mounts) => mounts.reconcileSessionWorkspaces);
   yield* turns.flushCompletedResponses;
   yield* mediaGroups.flushDue;
-  // The turns the last alasio left running on their conversations' pods, attached to again in the background.
-  yield* turns.reattachLeftTurns;
+  // The claims of the processes of this pod before this one let go of, as a container restarted in it leaves them; then
+  // the conversations with work left that no alasio drives, as theirs stopped or crashed, taken up: what each left
+  // recovered, its turn running on its pod attached to again in the background (Turns.takeUnheld); and then the
+  // prompts waiting, to run or to be asked about again.
+  yield* turns.lapseOwnClaims;
+  yield* turns.takeUnheld;
   yield* turns.resumePendingPrompts;
   // Presses kept as an alasio before stopped, run again before updates come.
   yield* recoverPresses(handling).pipe(Effect.provideContext(services));
@@ -187,6 +191,12 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
     Effect.catch((error) => Effect.logWarning(`Completed response recovery failed: ${error.message}`)),
     Effect.catchDefect((defect) => Effect.logWarning(`Completed response recovery failed: ${defect instanceof Error ? defect.message : String(defect)}`)),
     Effect.schedule(Schedule.spaced(COMPLETED_RESPONSE_RECOVERY)),
+    Effect.forkScoped,
+  );
+  // The conversations whose worker's claims lapsed since, as another alasio crashed, taken up.
+  yield* turns.takeUnheld.pipe(
+    Effect.catch((error) => Effect.logWarning(`Taking up the conversations no alasio drives failed: ${error.message}`)),
+    Effect.schedule(Schedule.spaced(WORKER_SWEEP_EVERY)),
     Effect.forkScoped,
   );
   // Albums due, which no alasio's wait is for (it stopped, or their chat's updates went to another).

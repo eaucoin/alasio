@@ -225,7 +225,7 @@ test("prompt jobs and the outbox outlast the store they were queued through", as
   await run(first.enqueueOutboxText({ chatId: "123", text: "done", pendingResponseId: null }));
 
   const second = await testStore({ schema });
-  await run(second.recoverPromptJobsAfterRestart);
+  assert.equal(await run(second.recoverLeftPromptJobs(conversationId)), false);
   assert.equal((await run(second.claimNextPromptJob(conversationId)))?.prompt, "hello");
   assert.equal((await run(second.getDueOutbox(10)))[0]?.text, "done");
 });
@@ -307,6 +307,7 @@ test("alasio's services wire the durable outbox into final response delivery", a
       folders: false,
       codexLoginUrl: CODEX_LOGIN_URL,
       codexLoginPort: 0,
+      pod: "alasio-composition",
       inKubernetes: false,
       harnessRole: HARNESS_ROLE,
       sessionStore: new NeonSessionStore(database.pool),
@@ -333,19 +334,20 @@ test("alasio's services wire the durable outbox into final response delivery", a
   }
 });
 
-test("restart reconciliation preserves upstream-completed prompt jobs", async () => {
+test("a conversation's recovery of what its last worker left completes a prompt job the agent finished", async () => {
   const store = await codexConversation();
   const job = await run(store.enqueuePromptJob({ conversationId: CONVERSATION, chatId: "123", messageId: "10", prompt: "finish" }));
   await run(store.claimNextPromptJob(CONVERSATION));
   await run(store.markPromptJobUpstreamStarted(job.id, "session", "turn"));
   await run(store.markPromptJobUpstreamCompleted(job.id, "session", "turn"));
-  assert.deepEqual(await run(store.recoverPromptJobsAfterRestart), [CONVERSATION]);
+  assert.equal(await run(store.recoverLeftPromptJobs(CONVERSATION)), true);
   assert.equal((await run(store.getPromptJob(job.id)))?.state, "completed");
 });
 
-test("restart reconciliation runs again only the prompts never sent to the agent", async () => {
+test("a conversation's recovery of what its last worker left runs again only the prompts never sent to the agent, and only the conversation's", async () => {
   const store = await testStore();
   const jobs = new Map<string, string>();
+  const conversations = new Map<string, string>();
   for (const [chatId, dispatched] of [["1", false], ["2", true]] as const) {
     const conversationId = await run(store.upsertConversation({ chatId, user: { id: Number(chatId) } }));
     await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
@@ -353,9 +355,11 @@ test("restart reconciliation runs again only the prompts never sent to the agent
     await run(store.claimNextPromptJob(conversationId));
     if (dispatched) await run(store.markPromptJobDispatched(job.id));
     jobs.set(chatId, job.id);
+    conversations.set(chatId, conversationId);
   }
-  assert.deepEqual(await run(store.recoverPromptJobsAfterRestart), []);
-  assert.equal((await run(store.getPromptJob(jobs.get("1") ?? "")))?.state, "pending");
+  assert.equal(await run(store.recoverLeftPromptJobs(conversations.get("1") ?? "")), false);
+  assert.deepEqual([(await run(store.getPromptJob(jobs.get("1") ?? "")))?.state, (await run(store.getPromptJob(jobs.get("2") ?? "")))?.state], ["pending", "running"]);
+  assert.equal(await run(store.recoverLeftPromptJobs(conversations.get("2") ?? "")), false);
   assert.equal((await run(store.getPromptJob(jobs.get("2") ?? "")))?.state, "interrupted");
 });
 

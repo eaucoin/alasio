@@ -13,15 +13,10 @@
  * HOLD_DEADLINE, from when it begins, past which it is stopped and the hold let go of. A
  * hold found expired, or taken, as it is renewed is the work's no longer: the work is
  * stopped, with HoldLost, before it touches the workspace again. The letting go is tried
- * until it is through, in
- * the background, the hold expiring meanwhile if it never is.
+ * until it is through, in the background, the hold expiring meanwhile if it never is.
  *
- * Clearing every row as alasio starts (Turns.reconcilePersistentState) is safe because
- * one alasio runs on its store at a time: its Deployment has one replica and replaces it
- * by Recreate (cli/src/manifests/alasio.ts), so the alasio starting is the only one, and
- * the one that held the rows has stopped, its forks with it. Two alasios on one store at
- * once (more replicas, or a rolling update) would make it unsafe: the one starting would
- * clear the holds of forks the other still runs.
+ * No alasio clears another's holds as it starts, as others on the store may run their forks
+ * meanwhile: the holds of one that stopped, or crashed, expire within HOLD_TTL.
  */
 import { Deferred, Duration, Effect, Option, Schedule, Schema } from "effect";
 

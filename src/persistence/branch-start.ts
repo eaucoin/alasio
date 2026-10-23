@@ -3,7 +3,8 @@
  * copy-on-write copy of the alasio it was branched from, as that one's was at the branch
  * point, and so holds what was in flight there: Telegram's updates, which are another
  * bot's; prompts queued and turns running, which its start would run, or attach
- * to, again; replies on their way, which would be sent again, by this bot; buttons,
+ * to, again, and the claims of the workers that drove them, and the conversations held for
+ * forks, there; replies on their way, which would be sent again, by this bot; buttons,
  * which this bot never sent, and presses of them under way; Codex's login, whose refresh
  * token works once, so that using it here would log the other out; and the events and
  * forks it handled, another environment's. All of it goes, once, in one transaction; the
@@ -35,6 +36,8 @@ export const startBranch = (database: Database, schema: string, branch: string):
         delete from ${schema}.telegram_updates;
         delete from ${schema}.media_groups;
         delete from ${schema}.prompt_jobs;
+        delete from ${schema}.conversation_workers;
+        delete from ${schema}.conversation_holds;
         update ${schema}.turns set state = 'completed', completed_at = now() where state = 'active';
         update ${schema}.responses set posted = true where not posted;
         delete from ${schema}.telegram_outbox;

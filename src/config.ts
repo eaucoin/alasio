@@ -46,7 +46,12 @@ export interface AlasioConfig {
   readonly folders: boolean;
   /** Where alasio's harness pools' pods reach the relay of its Codex login it serves them (src/codex/login-relay.ts). */
   readonly codexLoginUrl: string;
-  /** Whether alasio runs in a pod of Kubernetes, which it holds busy while a turn runs (src/kube/busy.ts). */
+  /**
+   * alasio's own pod's name, as its Deployment gives it (ALASIO_POD), which it holds its
+   * conversations' claims as (src/codex/worker-claims.ts); without it, alasio does not start.
+   */
+  readonly pod: string;
+  /** Whether alasio runs in a pod of Kubernetes, which it holds busy while a turn runs (src/kube/busy.ts): one loadAlasioConfig reads always does, a test's not. */
   readonly inKubernetes: boolean;
 }
 
@@ -69,9 +74,10 @@ export function withoutAlasio(env: Readonly<NodeJS.ProcessEnv>): NodeJS.ProcessE
   return Object.fromEntries(Object.entries(env).filter(([name]) => !ALASIO_VARIABLE.test(name)));
 }
 
+/** The variable `key` of `env`, failing where it is unset or blank. */
 function requireEnv(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key];
-  if (!value) {
+  if (!value?.trim()) {
     throw new Error(`Missing required environment variable: ${key}`);
   }
   return value;
@@ -106,7 +112,8 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
     },
     folders: env[ALASIO_GATEWAY_FOLDERS_VARIABLE] === "1",
     codexLoginUrl: requireEnv(env, "ALASIO_CODEX_LOGIN_URL"),
-    inKubernetes: Boolean(env["ALASIO_POD"]?.trim()),
+    pod: requireEnv(env, "ALASIO_POD").trim(),
+    inKubernetes: true,
   };
 }
 

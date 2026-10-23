@@ -103,7 +103,7 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       branchForks(options),
       branchEvents(options),
     )),
-    Layer.provideMerge(Turns.layer()),
+    Layer.provideMerge(Turns.layer({ pod: options.pod })),
     Layer.provideMerge(Panels.layer({ sessionStore: options.sessionStore, codexRollouts: options.rolloutStores.codex, sessionFsCodexRollouts: options.rolloutStores.sessionFs, stateDir: options.stateDir, branch: options.branch?.name })),
     Layer.provideMerge(harnessHost(options)),
     // After the session filesystems, whose sessions' files it names.
