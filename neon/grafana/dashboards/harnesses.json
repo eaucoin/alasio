@@ -42,7 +42,7 @@
               "method": "POST",
               "body_type": "raw",
               "body_content_type": "text/plain",
-              "data": "select * from (\nselect 'main' as __text, 'main' as __value\nunion\nselect distinct ResourceAttributes['alasio.branch'], ResourceAttributes['alasio.branch']\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] is not null and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})\n) order by __value <> 'main', __value"
+              "data": "select * from (\nselect 'main' as __text, 'main' as __value\nunion\nselect distinct ResourceAttributes['alasio.branch'], ResourceAttributes['alasio.branch']\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] is not null and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})\nunion\nselect distinct substr(Attributes['k8s.namespace.name'], length('alasio-branch-') + 1), substr(Attributes['k8s.namespace.name'], length('alasio-branch-') + 1)\nfrom otel.metrics_histogram where MetricName = 'alasio.binder.bind.duration' and Attributes['alasio.binder.pool'] like 'harness-%' and Attributes['k8s.namespace.name'] like 'alasio-branch-%' and ServiceName = 'alasio-sandbox-gateway' and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\nunion\nselect distinct substr(Attributes['k8s.namespace.name'], length('alasio-branch-') + 1), substr(Attributes['k8s.namespace.name'], length('alasio-branch-') + 1)\nfrom otel.metrics_sum where MetricName = 'alasio.gateway.releases' and Attributes['alasio.binder.pool'] like 'harness-%' and Attributes['k8s.namespace.name'] like 'alasio-branch-%' and ServiceName = 'alasio-sandbox-gateway' and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\n) order by __value <> 'main', __value"
             },
             "root_selector": "",
             "columns": [
@@ -60,7 +60,7 @@
           }
         },
         "refresh": 2,
-        "description": "main, or a branch environment (alasio branch): its harness pools, in its own namespace, and its alasio's turns, whose telemetry is tagged alasio.branch.",
+        "description": "main, or a branch environment (alasio branch): its harness pools, in its own namespace, and its alasio's turns, whose telemetry is tagged alasio.branch. A branch is offered where its alasio ran a turn, or its harness pools bound or released one, in the time range.",
         "current": {
           "text": "main",
           "value": "main"

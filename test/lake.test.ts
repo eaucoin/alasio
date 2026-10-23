@@ -3075,12 +3075,12 @@ describe("the lake's reader", () => {
                 histogram(BIND, bind("alasio", "harness-codex", "warm"), [[150, 99], [20, 4], [10, 6]]),
                 histogram(BIND, bind("alasio", "harness-folder-claude", "cold"), [[5, 30]]),
                 histogram(BIND, bind("alasio", "folder", "warm"), [[15, 2]]),
-                histogram(BIND, bind("alasio-branch-try", "harness-codex", "warm"), [[12, 8]]),
+                histogram(BIND, bind("alasio-branch-pooled", "harness-codex", "warm"), [[12, 8]]),
                 counter(RELEASES, released("alasio", "harness-codex", "idle"), [150, 30, 20]),
                 counter(RELEASES, released("alasio", "harness-codex", "lost"), [10]),
                 counter(RELEASES, released("alasio", "harness-folder-claude", "broken"), [5]),
                 counter(RELEASES, released("alasio", "folder", "lost"), [15]),
-                counter(RELEASES, released("alasio-branch-try", "harness-codex", "deleted"), [8]),
+                counter(RELEASES, released("alasio-branch-pooled", "harness-codex", "deleted"), [8]),
               ],
             }],
           },
@@ -3088,11 +3088,11 @@ describe("the lake's reader", () => {
             resource: { attributes: keyValues({ "service.name": "alasio" }) },
             scopeMetrics: [{ metrics: [counter(RECOVERIES, recovered("lost", "staged"), [10]), counter(RECOVERIES, recovered("reattach", "given-up"), [4]), histogram("alasio.turn.first_output", { "alasio.harness": "codex" }, [[20, 7]])] }],
           },
-          { resource: { attributes: keyValues({ "service.name": "alasio", "alasio.branch": "try" }) }, scopeMetrics: [{ metrics: [counter(RECOVERIES, recovered("lost", "staged"), [8])] }] },
+          { resource: { attributes: keyValues({ "service.name": "alasio", "alasio.branch": "pooled" }) }, scopeMetrics: [{ metrics: [counter(RECOVERIES, recovered("lost", "staged"), [8])] }] },
         ],
       }));
     });
-    const dashboard: { panels: { title: string; type: string; targets?: { url_options: { data: string } }[] }[] } =
+    const dashboard: { panels: { title: string; type: string; targets?: { url_options: { data: string } }[] }[]; templating: { list: { name: string; query: { infinityQuery: { url_options: { data: string } } } }[] } } =
       JSON.parse(readFileSync(new URL("../neon/grafana/dashboards/harnesses.json", import.meta.url), "utf8"));
     /** A panel's query over the last hour, by the minute, on `branch`. */
     const panel = (title: string, branch: string) => {
@@ -3114,10 +3114,15 @@ describe("the lake's reader", () => {
       assert.deepEqual(await rows("Bindings lost by pool", "pool", "lost"), ["harness-codex 1", "harness-folder-claude 1"]);
       assert.deepEqual(await rows("Lost turns", "recovery", "turns"), ["given-up, reattach 1", "staged, lost 1"]);
       assert.deepEqual(await rows("First output", "harness", "seconds"), ["codex 7"]);
+      // The branch is offered, its harness pools' binds and releases in range, though its alasio ran no turn.
+      const branches = dashboard.templating.list.find(({ name }) => name === "branch")?.query.infinityQuery.url_options.data ?? "";
+      const offered = (await answer(reader.db, [["${__from}", String(now - 60 * minute)], ["${__to}", String(now + minute)]].reduce((text, [variable = "", value = ""]) => text.replaceAll(variable, value), branches))).map((row) => row["__value"]);
+      assert.equal(offered[0], "main");
+      assert.ok(offered.includes("pooled"), JSON.stringify(offered));
       // The branch's, its own.
-      assert.deepEqual([await stat("Binds", "binds", "try"), await stat("Bindings lost", "lost", "try"), await stat("Turns run again", "turns", "try")], [1, 1, 1]);
-      assert.deepEqual(await rows("Bindings released", "reason", "releases", "try"), ["deleted 1"]);
-      assert.deepEqual(await rows("First output", "harness", "seconds", "try"), []);
+      assert.deepEqual([await stat("Binds", "binds", "pooled"), await stat("Bindings lost", "lost", "pooled"), await stat("Turns run again", "turns", "pooled")], [1, 1, 1]);
+      assert.deepEqual(await rows("Bindings released", "reason", "releases", "pooled"), ["deleted 1"]);
+      assert.deepEqual(await rows("First output", "harness", "seconds", "pooled"), []);
     } finally {
       reader.close();
     }
