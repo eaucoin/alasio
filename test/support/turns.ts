@@ -96,13 +96,14 @@ export function turnsStub(turns: Partial<Turns["Service"]>): Turns["Service"] {
   return Turns.of({
     submit: () => unused("submit"),
     schedule: () => unused("schedule"),
+    holding: () => unused("holding"),
     setPromptDisposition: () => unused("setPromptDisposition"),
     run: () => unused("run"),
     runGoalTurn: () => unused("runGoalTurn"),
     startNewSession: () => unused("startNewSession"),
-    reconcilePersistentState: unused("reconcilePersistentState"),
     flushCompletedResponses: unused("flushCompletedResponses"),
-    reattachLeftTurns: unused("reattachLeftTurns"),
+    takeUnheld: unused("takeUnheld"),
+    lapseOwnClaims: unused("lapseOwnClaims"),
     resumePendingPrompts: unused("resumePendingPrompts"),
     ...turns,
   });
@@ -153,7 +154,7 @@ function testServices({
 }: TestServicesOptions): Layer.Layer<AlasioServices | Pools | ActiveTurns> {
   return Layer.effectDiscard(Effect.flatMap(EventsConsumer, (consumer) => consumer.start)).pipe(Layer.provideMerge(MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot, branch }), Authorizer.layer(allowedUserIds))),
-    Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer()),
+    Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer({ pod: "alasio-test" })),
     Layer.provideMerge(testPanels({ stateDir, branch, models })),
     // Its harnesses run where a pool's do: in a pod's host, bound for the conversation, reached through the sandbox gateway's front.
     Layer.provideMerge(pooledHost({ standIns: { overrides: harnesses }, branch, host })),

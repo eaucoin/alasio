@@ -12,6 +12,7 @@
 import { Effect, Option, Result } from "effect";
 
 import { Turns } from "../codex/turns.ts";
+import type { WorkerClaimLost } from "../codex/worker-claims.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import type { StopReason } from "./active-turns.ts";
@@ -56,11 +57,24 @@ export const stopTurnSaying = (conversationId: string, reason: StopReason): Effe
  * Steers the conversation's running turn with the prompt held as the job `jobId`, or
  * queues it, as Steered says. The job is taken from being held first, as steering, so no
  * other press of its buttons acts on it and no worker runs it; it is done once the turn
- * took it, and pending again otherwise, or where its files could not be written. One a
- * restart finds steering, the turn may or may not have taken: the operator is asked what
- * to do with it (Turns.reconcilePersistentState), rather than it run again or lost unsaid.
+ * took it, and pending again otherwise, or where its files could not be written. Steered
+ * under the conversation's worker's claim, so no alasio takes the conversation up meanwhile;
+ * queued, for the alasio that drives it, where another does. One whose alasio stopped or
+ * crashed as it steered, the turn may or may not have taken: the operator is asked what to do
+ * with it as the conversation is taken up again (Turns recoverLeft), rather than it run again
+ * or lost unsaid.
  */
-export const steerWithHeld = (conversationId: string, jobId: string): Effect.Effect<Steered, StoreError, HarnessHost | Turns | Store> =>
+export const steerWithHeld = (conversationId: string, jobId: string): Effect.Effect<Steered, StoreError | WorkerClaimLost, HarnessHost | Turns | Store> =>
+  Effect.flatMap(Turns, (turns) => turns.holding(conversationId, steerHeld(conversationId, jobId))).pipe(
+    Effect.flatMap(Option.match({
+      onSome: Effect.succeed,
+      onNone: () =>
+        Effect.map(queueHeld(jobId), (held): Steered => (held ? { outcome: "queued", reason: "failed", failure: "Another alasio drives this conversation." } : { outcome: "gone" })),
+    })),
+  );
+
+/** The steer of steerWithHeld, under the conversation's worker's claim. */
+const steerHeld = (conversationId: string, jobId: string): Effect.Effect<Steered, StoreError, HarnessHost | Turns | Store> =>
   Effect.gen(function*() {
     const store = yield* Store;
     const turns = yield* Turns;

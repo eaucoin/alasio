@@ -17,6 +17,8 @@ import type { MediaAttachment } from "../telegram/client.ts";
 import { startBranch } from "./branch-start.ts";
 import { type CallbackAction, NeonCallbackRepository, type NewCallbackAction } from "./callback-repository.ts";
 import { type CodexLoginRecord, NeonCodexLoginRepository } from "./codex-login-repository.ts";
+import { CurrentWorkerFence, NeonWorkerRepository, takenOver, type WorkerFence } from "./worker-repository.ts";
+export { CurrentWorkerFence, WorkerTakenOver, type WorkerFence } from "./worker-repository.ts";
 export type { CodexLoginRecord } from "./codex-login-repository.ts";
 import {
   type Conversation,
@@ -162,6 +164,7 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
   events: new NeonEventRepository(sql, schema),
   forks: new NeonForkRepository(sql, schema),
   harnessGrants: new NeonHarnessGrantRepository(sql, schema),
+  workers: new NeonWorkerRepository(sql, schema),
 });
 
 /**
@@ -403,6 +406,23 @@ export class Store extends Context.Service<Store, {
   /** The conversation's latest turn, active or ended: what its harness said it did, and how it ended. */
   readonly getTurn: (conversationId: string) => Stored<Turn | null>;
   /**
+   * Takes the conversation's worker's claim for `holder`, for `lifeMs` unless renewed, where no
+   * other alasio's holds it or its holder's lapsed: the claim taken, which the writes of the work
+   * run under it hold under (CurrentWorkerFence), or null where another's holds it.
+   */
+  readonly claimWorker: (conversationId: string, holder: string, lifeMs: number) => Stored<WorkerFence | null>;
+  /** Keeps the claim for `lifeMs` more: whether it is still the conversation's, no other alasio having taken it since. */
+  readonly renewWorker: (fence: WorkerFence, lifeMs: number) => Stored<boolean>;
+  /** Lets go of the claim, for another alasio to take at once; none where another took it since. */
+  readonly releaseWorker: (fence: WorkerFence) => Stored<void>;
+  /** Lets go of the claims held by the processes of the pod `pod` (holders `pod/uuid`), gone as one starts in it: how many. */
+  readonly lapseWorkersOf: (pod: string) => Stored<number>;
+  /**
+   * The conversations with work left that no worker's claim holds: an active turn alasio drives
+   * (none its harness started on its own), or a prompt job to run or running.
+   */
+  readonly unheldConversations: Stored<string[]>;
+  /**
    * Holds the conversations busy for `reason`, as no turn does (a fork), for `ttlMs` unless
    * renewed, all at once where none is held already, or none at all: the holder they are
    * held as, or null where it held none.
@@ -412,8 +432,8 @@ export class Store extends Context.Service<Store, {
   readonly renewHolds: (holder: string, ttlMs: number) => Stored<number>;
   /** Whether the conversation is held busy, as no turn, by a hold not expired (holdConversations). */
   readonly isConversationHeld: (conversationId: string) => Stored<boolean>;
-  /** Lets go of the holds of `holder`; of every hold, for null. */
-  readonly releaseHolds: (holder: string | null) => Stored<void>;
+  /** Lets go of the holds of `holder`. */
+  readonly releaseHolds: (holder: string) => Stored<void>;
   /**
    * Keeps `digest` as the grant of the conversation's harness pool pod (../harness/grant.ts),
    * of its binding `binding`, which the harness host's role reaches the conversation's rows by
@@ -478,6 +498,8 @@ export class Store extends Context.Service<Store, {
   /** Queues a prompt: the job queued, or the one already queued for its message. */
   readonly enqueuePromptJob: (job: NewPromptJob) => Stored<PromptJob>;
   readonly hasOpenPromptJobs: (conversationId: string) => Stored<boolean>;
+  /** Whether the conversation has prompt jobs to run. */
+  readonly hasPendingPromptJobs: (conversationId: string) => Stored<boolean>;
   readonly getPromptJob: (id: string) => Stored<PromptJob | null>;
   /** Starts the conversation's next pending job: the job, or null when none waits. */
   readonly claimNextPromptJob: (conversationId: string) => Stored<PromptJob | null>;
@@ -496,10 +518,10 @@ export class Store extends Context.Service<Store, {
   readonly failPromptJob: (id: string, error: unknown) => Stored<void>;
   /** The conversations with prompt jobs waiting: to run, or for the operator's choice. */
   readonly listWaitingPromptConversations: Stored<string[]>;
-  /** Settles the jobs a restart found running: the conversations whose turn the agent finished. */
-  readonly recoverPromptJobsAfterRestart: Stored<string[]>;
-  /** Holds again the jobs a restart found handed to a turn to steer it (prompt-job-repository.ts holdUnsteeredAfterRestart). */
-  readonly holdUnsteeredPromptJobsAfterRestart: Stored<PromptJob[]>;
+  /** Settles the conversation's jobs its last worker left running (prompt-job-repository.ts recoverLeft): whether the agent finished one's turn. */
+  readonly recoverLeftPromptJobs: (conversationId: string) => Stored<boolean>;
+  /** Holds again the conversation's jobs its last worker left handed to a turn to steer it (prompt-job-repository.ts holdUnsteeredLeft). */
+  readonly holdUnsteeredLeftPromptJobs: (conversationId: string) => Stored<PromptJob[]>;
 
   /**
    * Runs again the conversation's active turn whose harness instance was lost under it, as
@@ -589,7 +611,29 @@ const makeStore = Effect.fnUntraced(function*({
   /** `notice` queued to the conversation, recorded as told, on the transaction's repositories `on`, unless it was told already: whether it was queued now. */
   const noticeOn = (on: ReturnType<typeof repositoriesOn>, conversationId: string, notice: NewOutboxText): Stored<boolean> =>
     Effect.flatMap(on.outbox.recordNotice(conversationId, notice.text), (fresh) => (fresh ? Effect.as(on.outbox.enqueueText(notice), true) : Effect.succeed(false)));
-  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, usage, codexLogin, sessionWorkspaces, presses, events, forks, harnessGrants } = repositoriesOn(database);
+  /**
+   * `work`, on the transaction's repositories `on`, where the current worker's claim
+   * (CurrentWorkerFence) still holds its conversation, its row locked for share so a takeover waits
+   * for the transaction to end: failing with WorkerTakenOver where it does not. As it is, where no
+   * worker's work runs.
+   */
+  const fencedOn = <A, E>(on: ReturnType<typeof repositoriesOn>, work: Effect.Effect<A, E>): Effect.Effect<A, E | StoreError> =>
+    CurrentWorkerFence.use((fence): Effect.Effect<A, E | StoreError> =>
+      fence === null ? work : Effect.flatMap(on.workers.holds(fence), (holds): Effect.Effect<A, E | StoreError> => (holds ? work : Effect.fail(takenOver(fence)))));
+  /** `write`'s statements, on the repositories of a transaction of their own, under the current worker's claim (fencedOn). */
+  const transacting = <A, E>(write: (on: ReturnType<typeof repositoriesOn>) => Effect.Effect<A, E>): Effect.Effect<A, E | StoreError> =>
+    database.transaction((sql) => {
+      const on = repositoriesOn(sql);
+      return fencedOn(on, write(on));
+    });
+  /**
+   * A write of what a worker drives, `write` on the repositories: in a transaction of its own
+   * under the current worker's claim where one runs (transacting); as it is, on any connection,
+   * where none does.
+   */
+  const fenced = <A, E>(write: (on: ReturnType<typeof repositoriesOn>) => Effect.Effect<A, E>): Effect.Effect<A, E | StoreError> =>
+    CurrentWorkerFence.use((fence): Effect.Effect<A, E | StoreError> => (fence === null ? write(repositoriesOn(database)) : transacting(write)));
+  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, usage, codexLogin, sessionWorkspaces, presses, events, forks, workers } = repositoriesOn(database);
 
   const pruneTransient = (age: Duration.Input): Stored<void> => {
     const ageMs = Duration.toMillis(age);
@@ -609,13 +653,10 @@ const makeStore = Effect.fnUntraced(function*({
     getModelChoice: (conversationId, harness) => conversations.getModelChoice(conversationId, harness),
     setModelChoice: (conversationId, harness, choice) => conversations.setModelChoice(conversationId, harness, choice),
     clearModelChoice: (conversationId, harness) => conversations.clearModelChoice(conversationId, harness),
-    setSessionId: (conversationId, sessionId) => conversations.setSessionId(conversationId, sessionId),
-    giveSession: (conversationId, sessionId) => conversations.giveSession(conversationId, sessionId),
+    setSessionId: (conversationId, sessionId) => fenced((on) => on.conversations.setSessionId(conversationId, sessionId)),
+    giveSession: (conversationId, sessionId) => fenced((on) => on.conversations.giveSession(conversationId, sessionId)),
     mountGivenSession: (conversationId, sessionId) =>
-      database.transaction((sql) => {
-        const on = repositoriesOn(sql);
-        return Effect.andThen(on.conversations.giveSession(conversationId, sessionId), on.conversations.setSessionId(conversationId, sessionId));
-      }),
+      transacting((on) => Effect.andThen(on.conversations.giveSession(conversationId, sessionId), on.conversations.setSessionId(conversationId, sessionId))),
 
     recordSessionWorkspace: (workspace) => sessionWorkspaces.record(workspace),
     markSessionWorkspaceMade: (volumeId, netMode) => sessionWorkspaces.markMade(volumeId, netMode),
@@ -623,7 +664,7 @@ const makeStore = Effect.fnUntraced(function*({
     forgetSessionWorkspace: (volumeId) => sessionWorkspaces.forget(volumeId),
     listSessionWorkspaces: sessionWorkspaces.list(),
 
-    createCallbackActions: (conversationId, actions) => callbacks.createCallbackActions(conversationId, actions),
+    createCallbackActions: (conversationId, actions) => fenced((on) => on.callbacks.createCallbackActions(conversationId, actions)),
     consumeCallbackAction: (id) => callbacks.consumeCallbackAction(id),
     hasCallbackActionsOfJob: (jobId) => callbacks.hasActionsOfJob(jobId),
 
@@ -662,41 +703,45 @@ const makeStore = Effect.fnUntraced(function*({
     getFilesForMessages: (messageIds) => telegramContent.getFilesForMessages(messageIds),
     getPendingMediaGroupsDue: (quietMs) => telegramContent.getPendingMediaGroupsDue(quietMs),
 
-    claimTurn: (turn) => turns.claim(turn),
+    claimTurn: (turn) => fenced((on) => on.turns.claim(turn)),
     turnPersistence: (conversationId, epoch) => {
-      const fenced = () => new TurnFenced({ threadKey: conversationId, epoch });
+      const superseded = () => new TurnFenced({ threadKey: conversationId, epoch });
       /** `write`, failing with TurnFenced where it did not hold. */
-      const held = (write: Stored<boolean>): TurnWrite<void> => Effect.flatMap(write, (holds) => (holds ? Effect.void : Effect.fail(fenced())));
+      const held = (write: (on: ReturnType<typeof repositoriesOn>) => Stored<boolean>): TurnWrite<void> =>
+        Effect.flatMap(fenced(write), (holds) => (holds ? Effect.void : Effect.fail(superseded())));
       /**
        * `write`, of a table that names no turn, in one transaction with the turn's row
        * locked for share once it is seen to hold the conversation.
        */
       const holding = (write: (repositories: ReturnType<typeof repositoriesOn>) => Stored<void>): TurnWrite<void> =>
-        database.transaction((sql) => {
-          const on = repositoriesOn(sql);
-          return Effect.flatMap(on.turns.lockAt(conversationId, epoch), (holds): TurnWrite<void> => (holds ? write(on) : Effect.fail(fenced())));
-        });
+        transacting((on) => Effect.flatMap(on.turns.lockAt(conversationId, epoch), (holds): TurnWrite<void> => (holds ? write(on) : Effect.fail(superseded()))));
       return {
         epoch,
         createPendingResponse: (chatId, messageId, sessionId) =>
-          Effect.flatMap(responses.createPendingResponse(conversationId, epoch, chatId, messageId, sessionId), (id) => (id === null ? Effect.fail(fenced()) : Effect.succeed(id))),
-        updateActiveTurnPendingResponseId: (pendingResponseId) => held(turns.updatePendingResponseIdAt(conversationId, epoch, pendingResponseId)),
-        updatePendingSessionId: (pendingResponseId, sessionId) => held(responses.updatePendingSessionId(pendingResponseId, sessionId)),
-        updateActiveTurnSessionId: (sessionId) => held(turns.updateSessionIdAt(conversationId, epoch, sessionId)),
-        appendBlocksToPending: (pendingResponseId, blocks) => held(responses.appendBlocks(pendingResponseId, blocks)),
-        markPendingResponseComplete: (pendingResponseId) => held(responses.markPendingComplete(pendingResponseId)),
-        markPendingAsPosted: (pendingResponseId) => held(responses.markPendingAsPosted(pendingResponseId, true)),
+          Effect.flatMap(fenced((on) => on.responses.createPendingResponse(conversationId, epoch, chatId, messageId, sessionId)), (id) => (id === null ? Effect.fail(superseded()) : Effect.succeed(id))),
+        updateActiveTurnPendingResponseId: (pendingResponseId) => held((on) => on.turns.updatePendingResponseIdAt(conversationId, epoch, pendingResponseId)),
+        updatePendingSessionId: (pendingResponseId, sessionId) => held((on) => on.responses.updatePendingSessionId(pendingResponseId, sessionId)),
+        updateActiveTurnSessionId: (sessionId) => held((on) => on.turns.updateSessionIdAt(conversationId, epoch, sessionId)),
+        appendBlocksToPending: (pendingResponseId, blocks) => held((on) => on.responses.appendBlocks(pendingResponseId, blocks)),
+        markPendingResponseComplete: (pendingResponseId) => held((on) => on.responses.markPendingComplete(pendingResponseId)),
+        markPendingAsPosted: (pendingResponseId) => held((on) => on.responses.markPendingAsPosted(pendingResponseId, true)),
         updateSessionUsage: (sessionId, sessionUsage) => holding((on) => on.usage.updateSessionUsage(sessionId, sessionUsage)),
-        setWaiting: (waitingOn) => held(turns.setWaitingAt(conversationId, epoch, waitingOn)),
+        setWaiting: (waitingOn) => held((on) => on.turns.setWaitingAt(conversationId, epoch, waitingOn)),
       };
     },
-    setTurnStatus: (conversationId, epoch, status) => turns.setStatus(conversationId, epoch, status),
-    setTurnBinding: (conversationId, epoch, binding) => turns.setBindingAt(conversationId, epoch, binding),
-    setTurnStatusMessage: (conversationId, epoch, outboxId) => turns.setStatusMessageAt(conversationId, epoch, outboxId),
-    endTurn: (conversationId, epoch, outcome) => turns.end(conversationId, epoch, outcome),
+    setTurnStatus: (conversationId, epoch, status) => fenced((on) => on.turns.setStatus(conversationId, epoch, status)),
+    setTurnBinding: (conversationId, epoch, binding) => fenced((on) => on.turns.setBindingAt(conversationId, epoch, binding)),
+    setTurnStatusMessage: (conversationId, epoch, outboxId) => fenced((on) => on.turns.setStatusMessageAt(conversationId, epoch, outboxId)),
+    endTurn: (conversationId, epoch, outcome) => fenced((on) => on.turns.end(conversationId, epoch, outcome)),
     getActiveTurns: turns.getActiveTurns(),
     getActiveTurn: (conversationId) => turns.getActiveTurn(conversationId),
     getTurn: (conversationId) => turns.getTurn(conversationId),
+    claimWorker: (conversationId, holder, lifeMs) =>
+      Effect.map(workers.take(conversationId, holder, lifeMs), (generation) => (generation === null ? null : { conversationId, generation })),
+    renewWorker: (fence, lifeMs) => workers.renew(fence, lifeMs),
+    releaseWorker: (fence) => workers.release(fence),
+    lapseWorkersOf: (pod) => workers.lapseOf(pod),
+    unheldConversations: workers.unheld(),
     holdConversations: (conversationIds, reason, ttlMs) => {
       const holder = randomUUID();
       // One that made fewer than all, as another held one of them, or held it as this ran, keeps none.
@@ -707,22 +752,19 @@ const makeStore = Effect.fnUntraced(function*({
     },
     renewHolds: (holder, ttlMs) => turns.renew(holder, ttlMs),
     releaseHolds: (holder) => turns.release(holder),
-    issueHarnessGrant: (conversationId, binding, digest) => harnessGrants.issue(conversationId, binding, digest),
+    issueHarnessGrant: (conversationId, binding, digest) => fenced((on) => on.harnessGrants.issue(conversationId, binding, digest)),
     isConversationHeld: (conversationId) => turns.isHeld(conversationId),
 
-    markPendingAsPosted: (pendingResponseId) => Effect.asVoid(responses.markPendingAsPosted(pendingResponseId)),
-    markAnswerPosted: (conversationId, pendingResponseId) => Effect.asVoid(responses.markPendingAsPosted(pendingResponseId, false, conversationId)),
+    markPendingAsPosted: (pendingResponseId) => Effect.asVoid(fenced((on) => on.responses.markPendingAsPosted(pendingResponseId))),
+    markAnswerPosted: (conversationId, pendingResponseId) => Effect.asVoid(fenced((on) => on.responses.markPendingAsPosted(pendingResponseId, false, conversationId))),
     getCompletedResponsesPendingDelivery: responses.getCompletedResponsesPendingDelivery(),
 
-    enqueueOutboxText: (text) => outbox.enqueueText(text),
+    enqueueOutboxText: (text) => fenced((on) => on.outbox.enqueueText(text)),
     enqueueOutboxPanel: (conversationId, actions, compose) =>
-      database.transaction((sql) => {
-        const on = repositoriesOn(sql);
-        return Effect.flatMap(on.callbacks.createCallbackActions(conversationId, actions), (ids) => on.outbox.enqueueText(compose(ids)));
-      }),
-    enqueueOutboxNotice: (conversationId, notice) => database.transaction((sql) => noticeOn(repositoriesOn(sql), conversationId, notice)),
-    enqueueOutboxStatus: (status) => outbox.enqueueStatus(status),
-    enqueueOutboxEdit: (edits, edit) => outbox.enqueueEdit(edits, edit),
+      transacting((on) => Effect.flatMap(on.callbacks.createCallbackActions(conversationId, actions), (ids) => on.outbox.enqueueText(compose(ids)))),
+    enqueueOutboxNotice: (conversationId, notice) => transacting((on) => noticeOn(on, conversationId, notice)),
+    enqueueOutboxStatus: (status) => fenced((on) => on.outbox.enqueueStatus(status)),
+    enqueueOutboxEdit: (edits, edit) => fenced((on) => on.outbox.enqueueEdit(edits, edit)),
     getDueOutbox: (limit) => outbox.getDue(limit),
     getDueOutboxOf: (chatId) => outbox.getDueOf(chatId),
     claimOutboxOf: (chatId, token, life) =>
@@ -740,26 +782,24 @@ const makeStore = Effect.fnUntraced(function*({
     rescheduleOutbox: ({ entry, token }, error, delayMs) => delivering((on) => Effect.andThen(on.lock(entry.id), on.reschedule(entry.id, token, error, delayMs))),
     getPendingOutboxCount: outbox.getPendingCount(),
 
-    enqueuePromptJob: (job) => promptJobs.enqueue(job),
+    enqueuePromptJob: (job) => fenced((on) => on.promptJobs.enqueue(job)),
     hasOpenPromptJobs: (conversationId) => promptJobs.hasOpenJobs(conversationId),
+    hasPendingPromptJobs: (conversationId) => promptJobs.hasPendingJobs(conversationId),
     getPromptJob: (id) => promptJobs.get(id),
-    claimNextPromptJob: (conversationId) => promptJobs.claimNext(conversationId),
-    setPromptJobDisposition: (id, state, priority) => promptJobs.setDisposition(id, state, priority),
+    claimNextPromptJob: (conversationId) => fenced((on) => on.promptJobs.claimNext(conversationId)),
+    setPromptJobDisposition: (id, state, priority) => fenced((on) => on.promptJobs.setDisposition(id, state, priority)),
     listHeldPromptJobs: (conversationId) => promptJobs.listHeld(conversationId),
     settleHeldPromptJob: (id, state, priority) =>
-      database.transaction((sql) => {
-        const { promptJobs, callbacks } = repositoriesOn(sql);
-        return Effect.tap(promptJobs.settleHeld(id, state, priority), (job) => (job ? callbacks.forgetActionsOfJob(id) : Effect.void));
-      }),
-    markPromptJobDispatched: (id) => promptJobs.markDispatched(id),
-    markPromptJobUpstreamStarted: (id, sessionId, turnId) => promptJobs.markUpstreamStarted(id, sessionId, turnId),
-    markPromptJobUpstreamCompleted: (id, sessionId, turnId) => promptJobs.markUpstreamCompleted(id, sessionId, turnId),
-    failPromptJob: (id, error) => promptJobs.fail(id, error),
+      transacting((on) => Effect.tap(on.promptJobs.settleHeld(id, state, priority), (job) => (job ? on.callbacks.forgetActionsOfJob(id) : Effect.void))),
+    markPromptJobDispatched: (id) => fenced((on) => on.promptJobs.markDispatched(id)),
+    markPromptJobUpstreamStarted: (id, sessionId, turnId) => fenced((on) => on.promptJobs.markUpstreamStarted(id, sessionId, turnId)),
+    markPromptJobUpstreamCompleted: (id, sessionId, turnId) => fenced((on) => on.promptJobs.markUpstreamCompleted(id, sessionId, turnId)),
+    failPromptJob: (id, error) => fenced((on) => on.promptJobs.fail(id, error)),
     listWaitingPromptConversations: promptJobs.listWaitingConversations(),
-    recoverPromptJobsAfterRestart: promptJobs.recoverAfterRestart(),
-    holdUnsteeredPromptJobsAfterRestart: promptJobs.holdUnsteeredAfterRestart(),
+    recoverLeftPromptJobs: (conversationId) => fenced((on) => on.promptJobs.recoverLeft(conversationId)),
+    holdUnsteeredLeftPromptJobs: (conversationId) => fenced((on) => on.promptJobs.holdUnsteeredLeft(conversationId)),
 
-    stageLostRecovery: (recovery) => database.transaction((sql) => stageLostOn(repositoriesOn(sql), recovery)),
+    stageLostRecovery: (recovery) => transacting((on) => stageLostOn(on, recovery)),
 
     getSessionTokens: (sessionId) => usage.getSessionTokens(sessionId),
 

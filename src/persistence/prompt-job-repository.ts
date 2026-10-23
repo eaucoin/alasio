@@ -163,6 +163,14 @@ export class NeonPromptJobRepository {
     ).pipe(Effect.map(([row]) => row!.open));
   }
 
+  /** Whether the conversation has jobs to run. */
+  hasPendingJobs(conversationId: string): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query<{ pending: boolean }>(
+      `select exists (select 1 from ${this.#schema}.prompt_jobs where conversation_id = $1 and state = 'pending') as pending`,
+      [conversationId],
+    ).pipe(Effect.map(([row]) => row!.pending));
+  }
+
   /** The conversation's jobs held for the operator's choice, in the order queued. */
   listHeld(conversationId: string): Effect.Effect<PromptJob[], StoreError> {
     return this.#sql.query<PromptJob>(
@@ -179,23 +187,25 @@ export class NeonPromptJobRepository {
   }
 
   /**
-   * Holds again for the operator's choice the jobs a restart found being handed to a turn
-   * to steer it, which it may or may not have taken: the jobs, to be asked about.
+   * Holds again for the operator's choice the conversation's jobs its last worker left being
+   * handed to a turn to steer it, which it may or may not have taken: the jobs, to be asked
+   * about.
    */
-  holdUnsteeredAfterRestart(): Effect.Effect<PromptJob[], StoreError> {
+  holdUnsteeredLeft(conversationId: string): Effect.Effect<PromptJob[], StoreError> {
     return this.#sql.query<PromptJob>(
-      `update ${this.#schema}.prompt_jobs set state = 'awaiting_choice', completed_at = null where state = 'steering' returning *`,
+      `update ${this.#schema}.prompt_jobs set state = 'awaiting_choice', completed_at = null where conversation_id = $1 and state = 'steering' returning *`,
+      [conversationId],
     );
   }
 
   /**
-   * Settles the jobs a restart found running: one whose turn the agent finished is
-   * completed; one never sent to the agent runs again; one sent to it is interrupted,
-   * never sent twice, since the agent may have acted on it (the turn's restart recovery
-   * continues it). Returns the conversations whose turn the agent finished.
+   * Settles the conversation's jobs its last worker left running: one whose turn the agent
+   * finished is completed; one never sent to the agent runs again; one sent to it is
+   * interrupted, never sent twice, since the agent may have acted on it (the turn's recovery
+   * continues it). Whether the agent finished one's turn.
    */
-  recoverAfterRestart(): Effect.Effect<string[], StoreError> {
-    return this.#sql.query<{ conversation_id: string }>(
+  recoverLeft(conversationId: string): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query<{ finished: boolean }>(
       `with settled as (
          update ${this.#schema}.prompt_jobs set
            state = case
@@ -208,10 +218,11 @@ export class NeonPromptJobRepository {
              when upstream_dispatched_at is null and upstream_started_at is null and upstream_completed_at is null then completed_at
              else coalesce(completed_at, now())
            end
-         where state = 'running'
-         returning conversation_id, state
+         where conversation_id = $1 and state = 'running'
+         returning state
        )
-       select distinct conversation_id from settled where state = 'completed'`,
-    ).pipe(Effect.map((rows) => rows.map((row) => row.conversation_id)));
+       select exists (select 1 from settled where state = 'completed') as finished`,
+      [conversationId],
+    ).pipe(Effect.map(([row]) => row!.finished));
   }
 }

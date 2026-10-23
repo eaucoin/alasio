@@ -13,7 +13,7 @@
 import { type ChildProcess, fork } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Effect, Exit, Scope } from "effect";
@@ -120,6 +120,7 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
     environment: ENVIRONMENT,
     codexLoginUrl: CODEX_LOGIN_URL,
     eventsUrl: events.url,
+    pod: `alasio-${basename(root)}`,
   };
   /** alasio's store, as a test reads alasio's state through it. */
   const store = await Effect.runPromise(Effect.provide(Store, Store.layer({ pool: database.pool, harnessRole: HARNESS_ROLE })));

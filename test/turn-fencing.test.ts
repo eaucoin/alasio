@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 
-import { Effect, Exit, Layer, Option, Schedule } from "effect";
+import { Deferred, Effect, Exit, Fiber, Layer, Option, Schedule } from "effect";
 
 import { CodexAppServer } from "../src/codex/app-server/client.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
@@ -9,8 +10,10 @@ import { whileHeld } from "../src/harness/holds.ts";
 import { HarnessHost } from "../src/harness/host.ts";
 import { Harnesses } from "../src/harness/index.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
-import { StoreError } from "../src/persistence/sql.ts";
-import { Store, TurnFenced } from "../src/persistence/store.ts";
+import { poolDatabase, StoreError } from "../src/persistence/sql.ts";
+import { NeonPromptJobRepository } from "../src/persistence/prompt-job-repository.ts";
+import { NeonWorkerRepository } from "../src/persistence/worker-repository.ts";
+import { CurrentWorkerFence, Store, TurnFenced, type WorkerFence, WorkerTakenOver } from "../src/persistence/store.ts";
 import { ReceivedFiles } from "../src/telegram/files.ts";
 import { holdsIn, newSchema, run, testPool, testStore } from "./support/store.ts";
 import { inProcessEvents } from "./support/host-events.ts";
@@ -240,7 +243,7 @@ test("a fork's hold that expired is renewed no more, and its fork, which no long
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(await run(store.renewHolds(holder, 60_000)), 0);
   assert.equal(await run(store.isConversationHeld(conversationId)), false);
-  await run(store.releaseHolds(null));
+  await run(store.releaseHolds(holder));
   // A fork whose renewals come only after its hold expired.
   let touched = false;
   const stopped = await withHost(store, (host) =>
@@ -282,6 +285,124 @@ test("holds of conversations some of which are the same, made at once, are each 
     // b is one's or the other's: the one that has it holds all of its, and the other none.
     assert.ok((first === null) !== (second === null), `attempt ${attempt}: ${first} and ${second}`);
     assert.deepEqual(rows, (first !== null ? [a, b] : [b, c]).sort(), `attempt ${attempt}`);
-    await run(store.releaseHolds(null));
+    for (const holder of held) if (holder !== null) await run(store.releaseHolds(holder));
   }
+});
+
+/** `effect` as the worker holding `fence` makes it. */
+const under = <A, E>(fence: WorkerFence, effect: Effect.Effect<A, E>): Effect.Effect<A, E> => effect.pipe(Effect.provideService(CurrentWorkerFence, fence));
+
+/** That `effect` failed as a worker's write refused, its conversation taken over by another alasio since its claim was taken. */
+async function takenOver(effect: Effect.Effect<unknown, unknown>): Promise<void> {
+  const exit = await Effect.runPromiseExit(effect);
+  assert.ok(Exit.isFailure(exit), "the write was made");
+  const failure = exit.cause.reasons.find((reason) => reason._tag === "Fail");
+  assert.ok(failure && failure._tag === "Fail" && failure.error instanceof StoreError, String(failure));
+  assert.ok(failure.error.cause instanceof WorkerTakenOver, String(failure.error.cause));
+}
+
+test("a worker's writes hold while its claim is the conversation's, lapsed or not, and none lands once another alasio took it over, as one stalled past its claim resumes", async () => {
+  const { store, conversationId } = await conversation();
+  const stalled = await run(store.claimWorker(conversationId, "stalled", 50));
+  assert.ok(stalled);
+  // Another alasio's claim refused while it holds.
+  assert.equal(await run(store.claimWorker(conversationId, "other", 60_000)), null);
+  const job = await run(under(stalled, store.enqueuePromptJob({ conversationId, chatId: "7", messageId: "1", prompt: "one" })));
+  // Lapsed, as its alasio stalled, and taken by none yet: its writes still land.
+  await sleep(100);
+  assert.equal((await run(under(stalled, store.claimNextPromptJob(conversationId))))?.id, job.id);
+  assert.deepEqual(await run(store.unheldConversations), [conversationId]);
+  const other = await run(store.claimWorker(conversationId, "other", 60_000));
+  assert.ok(other);
+  assert.equal(other.generation, stalled.generation + 1);
+  assert.deepEqual(await run(store.unheldConversations), []);
+  // Resumed, it writes nothing more: neither its job's end, nor a reply, nor a turn, nor a job.
+  await takenOver(under(stalled, store.setPromptJobDisposition(job.id, "completed")));
+  await takenOver(under(stalled, store.enqueueOutboxText({ chatId: "7", text: "late", pendingResponseId: null })));
+  await takenOver(under(stalled, store.claimTurn({ conversationId, chatId: "7", messageId: "2", harness: CODEX_HARNESS })));
+  await takenOver(under(stalled, store.enqueuePromptJob({ conversationId, chatId: "7", messageId: "3", prompt: "three" })));
+  await takenOver(under(stalled, store.recoverLeftPromptJobs(conversationId)));
+  assert.equal((await run(store.getPromptJob(job.id)))?.state, "running");
+  assert.equal(await run(store.getPendingOutboxCount), 0);
+  assert.equal(await run(store.getActiveTurn(conversationId)), null);
+  // Nor is its claim its own to renew or let go of.
+  assert.equal(await run(store.renewWorker(stalled, 60_000)), false);
+  await run(store.releaseWorker(stalled));
+  assert.equal(await run(store.claimWorker(conversationId, "third", 60_000)), null);
+  // The new holder's land, and recover what the stalled one left.
+  assert.equal(await run(under(other, store.recoverLeftPromptJobs(conversationId))), false);
+  assert.equal((await run(store.getPromptJob(job.id)))?.state, "pending");
+  // Let go of, it is taken at once.
+  await run(store.releaseWorker(other));
+  assert.equal((await run(store.claimWorker(conversationId, "third", 60_000)))?.generation, stalled.generation + 2);
+});
+
+test("a takeover waits for a worker's write under way, its claim's row read for share, so the write lands before the claim is another's, never after", async () => {
+  const { store, schema, conversationId } = await conversation();
+  const stalled = await run(store.claimWorker(conversationId, "stalled", 50));
+  assert.ok(stalled);
+  await sleep(100);
+  // A worker's fenced write, its claim lapsed but taken by none, held open as one under way is.
+  const open = Effect.runSync(Deferred.make<void>());
+  const checked = Effect.runSync(Deferred.make<void>());
+  const writing = Effect.runFork(poolDatabase(await testPool()).transaction((sql) =>
+    Effect.gen(function*() {
+      assert.equal(yield* new NeonWorkerRepository(sql, schema).holds(stalled), true);
+      yield* new NeonPromptJobRepository(sql, schema).enqueue({ conversationId, chatId: "7", messageId: "under-way", prompt: "under way" });
+      yield* Deferred.succeed(checked, undefined);
+      yield* Deferred.await(open);
+    })
+  ));
+  await Effect.runPromise(Deferred.await(checked));
+  let taken: number | null = null;
+  const takeover = Effect.runPromise(store.claimWorker(conversationId, "other", 60_000)).then((fence) => (taken = fence?.generation ?? null));
+  await sleep(500);
+  assert.equal(taken, null, "the takeover went past the write under way");
+  await Effect.runPromise(Deferred.succeed(open, undefined));
+  await Effect.runPromise(Fiber.join(writing));
+  await takeover;
+  assert.equal(taken, stalled.generation + 1);
+  assert.ok((await run(store.listWaitingPromptConversations)).includes(conversationId));
+  // Taken over, the stalled one's next write is refused.
+  await takenOver(under(stalled, store.enqueuePromptJob({ conversationId, chatId: "7", messageId: "after", prompt: "after" })));
+});
+
+test("each write of a turn's and of what drives it, made under a claim taken over since, is refused and changes nothing", async () => {
+  const { store, conversationId } = await conversation();
+  // A turn under way, as the stalled worker started it before its claim lapsed.
+  const epoch = await run(store.claimTurn({ conversationId, chatId: "7", messageId: "1", harness: CODEX_HARNESS, prompt: "go" }));
+  const persistence = store.turnPersistence(conversationId, epoch);
+  const response = await run(persistence.createPendingResponse("7", "1", null));
+  const status = await run(store.enqueueOutboxStatus({ chatId: "7", text: "Working." }));
+  const stalled = await run(store.claimWorker(conversationId, "stalled", 50));
+  assert.ok(stalled);
+  await sleep(100);
+  assert.ok(await run(store.claimWorker(conversationId, "other", 60_000)));
+  const outbox = await run(store.getPendingOutboxCount);
+  const writes: Record<string, Effect.Effect<unknown, unknown>> = {
+    endTurn: store.endTurn(conversationId, epoch, "completed"),
+    setTurnStatus: store.setTurnStatus(conversationId, epoch, "interrupted"),
+    setTurnBinding: store.setTurnBinding(conversationId, epoch, "binding-1"),
+    setTurnStatusMessage: store.setTurnStatusMessage(conversationId, epoch, status),
+    enqueueOutboxStatus: store.enqueueOutboxStatus({ chatId: "7", text: "Working still." }),
+    enqueueOutboxEdit: store.enqueueOutboxEdit(status, { chatId: "7", text: "Done." }),
+    markPendingAsPosted: store.markPendingAsPosted(response),
+    markAnswerPosted: store.markAnswerPosted(conversationId, response),
+    issueHarnessGrant: store.issueHarnessGrant(conversationId, "binding-1", Buffer.from("digest")),
+    stageLostRecovery: store.stageLostRecovery({ conversationId, epoch, binding: null, messageId: "lost:1", prompt: () => "again", said: () => "lost" }),
+    "turnPersistence.createPendingResponse": persistence.createPendingResponse("7", "1", null),
+    "turnPersistence.appendBlocksToPending": persistence.appendBlocksToPending(response, [{ type: "text", content: "late", phase: "final_answer" }]),
+    "turnPersistence.markPendingResponseComplete": persistence.markPendingResponseComplete(response),
+    "turnPersistence.updateActiveTurnSessionId": persistence.updateActiveTurnSessionId("session-late"),
+    "turnPersistence.updateSessionUsage": persistence.updateSessionUsage("session-late", { cacheReadInputTokens: 7 }),
+    "turnPersistence.setWaiting": persistence.setWaiting("a run"),
+  };
+  for (const [name, write] of Object.entries(writes)) {
+    await takenOver(under(stalled, write)).catch((error: unknown) => assert.fail(`${name}: ${error instanceof Error ? error.message : String(error)}`));
+  }
+  const turn = await run(store.getActiveTurn(conversationId));
+  assert.deepEqual([turn?.epoch, turn?.status, turn?.binding, turn?.status_outbox_id, turn?.waiting_on, turn?.session_id], [String(epoch), "working", null, null, null, null]);
+  assert.equal(await run(store.getPendingOutboxCount), outbox);
+  assert.deepEqual(await run(store.getCompletedResponsesPendingDelivery), []);
+  assert.equal(await run(store.hasOpenPromptJobs(conversationId)), false);
 });
