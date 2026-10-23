@@ -304,6 +304,7 @@ test("a kept press's query is answered Working... once its update is told handle
   await shownText(alasio, "Steered.", mark);
 });
 
+// Bounded by two starts of alasio's, the test's first (some 10 s) and its restart (some 6 s), and the press's handling between.
 test("a press kept as alasio stops is let go of, and run again from its action once alasio starts, its answer through the outbox", { timeout: 60_000 }, async (t) => {
   const alasio = await alasioFor(t, { folders: ["alpha"] });
   const { telegram, codex } = alasio;
@@ -314,11 +315,11 @@ test("a press kept as alasio stops is let go of, and run again from its action o
   // Let go of as alasio stopped, for the next to run at once.
   assert.deepEqual((await keptPresses(alasio)).map(({ lapsed }) => lapsed), [true]);
   const mark = telegram.mark();
+  // Run again as alasio starts: steering the turn recovered from the restart, or queued where none runs to take it, whose
+  // turn then asks Codex the threads it has loaded. Answered whichever comes, as neither is waited for where it never does.
+  codex.answerEvery("turn/steer", () => ({ turnId: "turn-2" }));
+  codex.answerEvery("thread/loaded/list", () => ({ data: [], nextCursor: null }));
   await alasio.start();
-  // Run again as alasio starts: steering the turn recovered from the restart, or queued where none runs to take it.
-  const steered = codex.next("turn/steer").then((steer) => codex.answer(steer, { turnId: "turn-2" }));
-  void steered.catch(() => {});
-  await answerLoadedThreads(codex, []).catch(() => {});
   await shownText(alasio, /^(Steered|Queued)\.$/u, mark);
   await eventually("the press forgotten once run again", async () => ((await keptPresses(alasio)).length === 0 ? true : undefined));
 });
