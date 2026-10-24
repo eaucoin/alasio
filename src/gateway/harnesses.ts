@@ -60,7 +60,7 @@ import type { PodOwner } from "../node-agent/workspaces.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import type { Environments } from "./environments.ts";
 import { conversationOfHarnessKey, HARNESS_CONTAINER, type GatewayConfig } from "./names.ts";
-import { released, type ReleaseReason } from "./releases.ts";
+import { killedForMemory, memoryLimitOf, released, type ReleaseReason } from "./releases.ts";
 
 /** How long an ask of a harness host's may take, but its drain's. */
 const ASK_TIMEOUT_MS = 5_000;
@@ -190,13 +190,6 @@ const endedHow = (pod: V1Pod): string => {
   const ended = host?.state?.terminated ?? host?.lastState?.terminated;
   if (!ended) return `its pod's phase is ${pod.status?.phase ?? "unknown"}`;
   return [`exit code ${ended.exitCode}`, ended.reason, ended.message?.trim()].filter(Boolean).join(", ");
-};
-
-/** The memory limit of `pod`'s host where the kernel killed it for its memory, as kubelet says its container ended: null where it ended otherwise, or did not. */
-const killedForMemory = (pod: V1Pod): string | null => {
-  const host = pod.status?.containerStatuses?.find(({ name }) => name === HARNESS_CONTAINER);
-  if ((host?.state?.terminated ?? host?.lastState?.terminated)?.reason !== "OOMKilled") return null;
-  return pod.spec?.containers.find(({ name }) => name === HARNESS_CONTAINER)?.resources?.limits?.["memory"] ?? "its limit";
 };
 
 /** Whether `pod`'s host ended, or was started again in it, which serves its binding no more. */
@@ -461,9 +454,9 @@ export const makeHarnesses = Effect.fnUntraced(function*(
         // Its host drained where it may yet answer; one ending, or ended, is not. One the kernel
         // killed for its memory is told so, with the limit it ran out of, as what it ran would run
         // out of it again.
-        const memoryLimit = deleted ? null : killedForMemory(pod);
-        const reason = deleted ? "deleted" : memoryLimit === null ? "broken" : "oom";
-        yield* Effect.forkDetach(releaseAs(pool, key, reason, false, name, (binding) => releasedFor(pool, key, binding, reason, memoryLimit ?? undefined)).pipe(
+        const reason = deleted ? "deleted" : killedForMemory(pod, HARNESS_CONTAINER) ? "oom" : "broken";
+        const memoryLimit = reason === "oom" ? memoryLimitOf(pod, HARNESS_CONTAINER) ?? undefined : undefined;
+        yield* Effect.forkDetach(releaseAs(pool, key, reason, false, name, (binding) => releasedFor(pool, key, binding, reason, memoryLimit)).pipe(
           Effect.catch((error) => Effect.andThen(Effect.sync(() => void releasing.delete(uid)), Effect.logWarning(`releasing ${key} failed: ${error.message}`))),
         ));
       }

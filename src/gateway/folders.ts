@@ -14,7 +14,8 @@
  * `releaseAfterMs`: its pod deleted, and waited for until it is gone, as its bayma dumps each
  * idle REPL session as it stops (./names.ts FOLDER_STOP_SECONDS), so the next bind's pod, on
  * the same state directory, restores them; nothing of the node agents', nor of the bucket's. A
- * pod whose bayma ended is released as broken, the next bind making another.
+ * pod whose bayma ended is released as broken, or as oom where the kernel killed it for its
+ * memory, its log saying the limit, the next bind making another.
  *
  * A bind makes its pod once no pod of the key before it is left, as one being deleted still
  * dumps its REPL sessions. It gives its pod FOLDER_START_MS to run (FOLDER_PULL_MS while its
@@ -55,7 +56,7 @@ import { quantityOf } from "../kube/quantity.ts";
 import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import { meter } from "../telemetry/index.ts";
 import { FOLDER_GONE_MS, FOLDER_POOL, FOLDER_PULL_MS, FOLDER_START_MS, folderBindMs, folderOfKey, folderPodName, folderPodSpec, folderStateDir, folderTokenSecret } from "./names.ts";
-import { released } from "./releases.ts";
+import { killedForMemory, memoryLimitOf, released } from "./releases.ts";
 
 /** How many binds of a key failing one after another, within FOLDER_FAILING_MS, hold it. */
 export const FOLDER_FAILURES = 3;
@@ -168,7 +169,7 @@ export interface Folders {
   readonly place: (key: string, options: Readonly<Record<string, string>>) => Effect.Effect<Placement, PlacementRefused>;
   /** Releases each folder instance idle for its time, as the module says: which keys. */
   readonly sweep: Effect.Effect<readonly string[], KubeApiError>;
-  /** Releases, as broken, each folder instance whose bayma ended, as the module says; and counts the keys held. */
+  /** Releases, as broken or oom, each folder instance whose bayma ended, as the module says; and counts the keys held. */
   readonly live: Effect.Effect<void, KubeApiError>;
   /** Keeps the memory peak of each folder instance bound, as the metrics server measures it, and forgets each folder's peaks once all are past SIZING's days. */
   readonly measure: Effect.Effect<void>;
@@ -373,9 +374,10 @@ export const makeFolders = Effect.fnUntraced(function*(
       catch: (error) => ({ message: error instanceof Error ? error.message : String(error) }),
     });
 
-  /** Why the pod `pod`, as it is now, is not serving yet: pending, its image unpulled, its bayma ended, or not yet running. */
+  /** Why the pod `pod`, as it is now, is not serving yet: pending, its image unpulled, its bayma ended, or killed for its memory, or not yet running. */
   const notServing = (pod: V1Pod): string => {
     const bayma = pod.status?.containerStatuses?.find(({ name }) => name === BAYMA_CONTAINER);
+    if (bayma?.state?.terminated && killedForMemory(pod, BAYMA_CONTAINER)) return `its bayma ran out of its memory (${memoryLimitOf(pod, BAYMA_CONTAINER) ?? "its limit"})`;
     if (bayma?.state?.terminated) return `its bayma ended (${bayma.state.terminated.reason ?? `exit code ${bayma.state.terminated.exitCode}`})`;
     const waiting = bayma?.state?.waiting;
     if (waiting?.reason && waiting.reason !== "ContainerCreating") return `its bayma did not start: ${waiting.reason}${waiting.message ? ` (${waiting.message})` : ""}`;
@@ -406,7 +408,7 @@ export const makeFolders = Effect.fnUntraced(function*(
           if (now >= runningSince + startMs) return yield* new BindStepFailed({ reason: `its bayma did not answer within ${startMs / 1000} s of its start: ${answered.failure.message}` });
         } else {
           const why = notServing(pod);
-          if (why.startsWith("its bayma ended")) return yield* new BindStepFailed({ reason: why });
+          if (bayma?.state?.terminated) return yield* new BindStepFailed({ reason: why });
           // Scheduled, its image being pulled, as a node that has never run it pulls it first.
           const pulling = bayma?.state?.waiting?.reason === "ContainerCreating" || (bayma === undefined && pod.status?.conditions?.some(({ type, status }) => type === "PodScheduled" && status === "True") === true);
           const waited = pulling ? pullMs : startMs;
@@ -493,9 +495,11 @@ export const makeFolders = Effect.fnUntraced(function*(
       if (!pod || pod.metadata?.deletionTimestamp !== undefined) continue;
       const bayma = pod.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER);
       if (bayma?.state?.terminated === undefined && pod.status?.phase !== "Failed" && pod.status?.phase !== "Succeeded") continue;
-      yield* Effect.logWarning(`${key}'s bayma ended in its folder instance ${pod.metadata?.name}, which serves its binding no more: it is released, the next bind making another`);
+      const killed = killedForMemory(pod, BAYMA_CONTAINER);
+      const ended = killed ? `ran out of its memory (${memoryLimitOf(pod, BAYMA_CONTAINER) ?? "its limit"})` : "ended";
+      yield* Effect.logWarning(`${key}'s bayma ${ended} in its folder instance ${pod.metadata?.name}, which serves its binding no more: it is released, the next bind making another`);
       yield* Effect.forkDetach(binder.release(pool, key, ({ pod: name }) => releasedPod(key, name), pod.metadata?.name ?? "").pipe(
-        Effect.tap((done) => (done === "released" ? released(pool, "broken") : Effect.void)),
+        Effect.tap((done) => (done === "released" ? released(pool, killed ? "oom" : "broken") : Effect.void)),
         Effect.catch((error) => Effect.logWarning(`releasing ${key}, whose bayma ended, failed: ${error.message}`)),
       ));
     }

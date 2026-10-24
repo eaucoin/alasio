@@ -40,6 +40,9 @@ const TEMPLATE = {
   },
 };
 
+/** The folder template with a memory limit, as alasio up renders one. */
+const LIMITED = { ...TEMPLATE, spec: { ...TEMPLATE.spec, containers: TEMPLATE.spec.containers.map((container) => ({ ...container, resources: { limits: { memory: "4Gi" } } })) } };
+
 /** A stand-in for bayma's /status, answering as the test says. */
 async function bayma(): Promise<{ port: number; status: { execsRunning: number; execsQueued: number; idleSinceMs: number | null }; close: () => void }> {
   const stand = { status: { execsRunning: 1, execsQueued: 0, idleSinceMs: null as number | null } };
@@ -190,10 +193,10 @@ test("a folder instance's pod whose token's Secret it cannot own is deleted with
   }
 });
 
-test("a folder instance idle for its time is released, its pod gone before its Lease, one whose bayma ended released as broken, and one its caller lets go, each release counted", async () => {
+test("a folder instance idle for its time is released, its pod gone before its Lease, one whose bayma ended released as broken, or as oom where it was killed for its memory, and one its caller lets go, each release counted", async () => {
   const stand = await bayma();
   try {
-    const of = await foldersOf(stand.port, 200);
+    const of = await foldersOf(stand.port, 200, 10_000, 3_000, { template: LIMITED });
     const pool = { name: FOLDER_POOL, namespace: of.namespace };
     const key = folderKey("claude", "telegram:idle");
     const pod = await bound(of, key);
@@ -212,15 +215,20 @@ test("a folder instance idle for its time is released, its pod gone before its L
       // One whose bayma ended: released, the next bind making another.
       stand.status = { execsRunning: 1, execsQueued: 0, idleSinceMs: null };
       const broken = await bound(of, folderKey("claude", "telegram:broken"));
-      await run(withKube((kube) => kube.patchPodStatus(of.namespace, broken.metadata?.name ?? "", {
-        status: { containerStatuses: [{ name: "bayma", image: "bayma", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated: { exitCode: 1 } } }] },
-      })));
-      await Effect.runPromise(Effect.provide(of.folders.live, Layer.fresh(KubeClient.layer)));
-      for (const deadline = Date.now() + 10_000; ; await new Promise((resolve) => setTimeout(resolve, 100))) {
-        if ((await run(readLease(pool, folderKey("claude", "telegram:broken")))) === null) break;
-        assert.ok(Date.now() < deadline, "the broken folder instance was not released");
+      const killed = await bound(of, folderKey("claude", "telegram:killed"));
+      for (const [pod, terminated] of [[broken, { exitCode: 1 }], [killed, { exitCode: 137, reason: "OOMKilled" }]] as const) {
+        await run(withKube((kube) => kube.patchPodStatus(of.namespace, pod.metadata?.name ?? "", {
+          status: { containerStatuses: [{ name: "bayma", image: "bayma", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated } }] },
+        })));
       }
-      assert.equal(await run(withKube((kube) => kube.read("v1", "Pod", of.namespace, broken.metadata?.name ?? ""))), null);
+      await Effect.runPromise(Effect.provide(of.folders.live, Layer.fresh(KubeClient.layer)));
+      for (const conversation of ["telegram:broken", "telegram:killed"]) {
+        for (const deadline = Date.now() + 10_000; ; await new Promise((resolve) => setTimeout(resolve, 100))) {
+          if ((await run(readLease(pool, folderKey("claude", conversation)))) === null) break;
+          assert.ok(Date.now() < deadline, `the folder instance of ${conversation} was not released`);
+        }
+      }
+      for (const pod of [broken, killed]) assert.equal(await run(withKube((kube) => kube.read("v1", "Pod", of.namespace, pod.metadata?.name ?? ""))), null);
       // One its caller lets go, as a restart does.
       const asked = await bound(of, folderKey("claude", "telegram:asked"));
       const placement = await Effect.runPromise(of.folders.place(folderKey("claude", "telegram:asked"), { environment: "main" }));
@@ -229,7 +237,7 @@ test("a folder instance idle for its time is released, its pod gone before its L
     });
     // Each counted, by why, as a session workspace's release is.
     const reason = (why: string) => `alasio.binder.pool=${FOLDER_POOL},k8s.namespace.name=${of.namespace},alasio.gateway.release.reason=${why}`;
-    assert.deepEqual(counted, { [reason("idle")]: 1, [reason("broken")]: 1, [reason("asked")]: 1 });
+    assert.deepEqual(counted, { [reason("idle")]: 1, [reason("broken")]: 1, [reason("oom")]: 1, [reason("asked")]: 1 });
   } finally {
     stand.close();
   }
@@ -320,13 +328,14 @@ test("a held folder instance's restart, its caller's release, forgets its binds'
 test("a folder instance's bind gives its pod its time to run and its bayma to answer, or deletes the pod and its Lease, saying why", async () => {
   const stand = await bayma();
   try {
-    const of = await foldersOf(stand.port, 60_000, 1_500);
+    const of = await foldersOf(stand.port, 60_000, 1_500, 3_000, { template: LIMITED });
     const pool = { name: FOLDER_POOL, namespace: of.namespace };
     const container = (state: object) => ({ name: "bayma", image: "bayma", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state });
     const failures: [string, object | null, RegExp][] = [
       ["unscheduled", { phase: "Pending", conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: "0/1 nodes are available: 1 Insufficient memory." }] }, /did not serve within 1\.5 s: its pod is pending: 0\/1 nodes are available: 1 Insufficient memory\.$/u],
       ["unpulled", { phase: "Pending", containerStatuses: [container({ waiting: { reason: "ImagePullBackOff", message: "Back-off pulling image \"bayma\"" } })] }, /did not serve within 1\.5 s: its bayma did not start: ImagePullBackOff \(Back-off pulling image "bayma"\)$/u],
       ["ended", { phase: "Running", podIP: "127.0.0.1", containerStatuses: [container({ terminated: { exitCode: 2, reason: "Error" } })] }, /^its bayma ended \(Error\)$/u],
+      ["killed", { phase: "Running", podIP: "127.0.0.1", containerStatuses: [container({ terminated: { exitCode: 137, reason: "OOMKilled" } })] }, /^its bayma ran out of its memory \(4Gi\)$/u],
       ["unanswered", { phase: "Running", podIP: "127.0.0.2", podIPs: [{ ip: "127.0.0.2" }], containerStatuses: [container({ running: {} })] }, /^its bayma did not answer within 1\.5 s of its start: /u],
       // Scheduled, its image pulled the longer while, then given up on.
       ["pulling", { phase: "Pending", conditions: [{ type: "PodScheduled", status: "True" }], containerStatuses: [container({ waiting: { reason: "ContainerCreating" } })] }, /did not serve within 3 s: its image is still being pulled$/u],
