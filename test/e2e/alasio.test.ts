@@ -51,7 +51,7 @@ import { ANSWER } from "./codex-stand-in.ts";
 import { bindBranchSession, bindInBranch, mainSandboxService, sandboxService, serviceLogs, servesBranch } from "./sandbox-service.ts";
 import type { ReleaseSeen } from "./claude-mcp-release.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
-import type { FolderReplsRead, FolderReplsSet } from "./folder-repl.ts";
+import type { FolderReplsRead, FolderReplsSet, FolderRunaway } from "./folder-repl.ts";
 import {
   AGENTS,
   alasio,
@@ -948,6 +948,19 @@ if (inShard("sessions")) {
       const after = await instance();
       assert.notEqual(after?.metadata?.uid, before?.metadata?.uid);
       assert.ok(requested(after) > 800 * 2 ** 20 && requested(after) > asked, `requests ${requested(after)} bytes, its instance before ${asked}`);
+    });
+
+    test("a folder conversation's exec whose process runs past its instance's memory has that process alone killed: its REPL session, its bayma and its pod live on", { skip: !HOST_PROFILE && "folder workspaces are for a single node", timeout: 20 * 60_000 }, async () => {
+      const key = "folder:claude:e2e:folder";
+      const instance = async () => (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" })).find(({ metadata }) => metadata?.deletionTimestamp === undefined);
+      // Past the run's 1536Mi (test/e2e/harness.ts).
+      const before = await instance();
+      const seen = await inAlasio<FolderRunaway>("./folder-repl.ts", "runaway", GATEWAY_MCP, await mainKeyToken(key), "2048");
+      // Killed by the kernel (SIGKILL), its session holding what it held, told of no return, as it never left.
+      assert.deepEqual(seen, { returncode: -9, kept: "kept through a runaway", notice: null }, JSON.stringify(seen));
+      const after = await instance();
+      assert.equal(after?.metadata?.uid, before?.metadata?.uid);
+      assert.deepEqual(after?.status?.containerStatuses?.map(({ name, restartCount, state }) => [name, restartCount, state?.running !== undefined]), [["bayma", 0, true]]);
     });
 
     test("no one makes a pod in the folders' namespace but the gateway, which makes none but of the folder template, nor a Secret there but an instance's token", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
@@ -3475,6 +3488,19 @@ if (inShard("agents")) {
       // Its turns' spans, from the pod's Codex, in the lake; and its turns, from the rollouts the pod mirrored, loaded as it woke the lake's loader, as alasio, which writes none of them, does not.
       await untilInLake("span of a pooled Codex's app-server", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'turn/start'");
       await untilInLake("a pooled Codex's turn, loaded as its pod woke the loader", "select count(*) as n from codex.turns", 600_000);
+    });
+
+    test("a Codex turn whose app-server runs its pod out of its memory has the app-server alone killed: the turn ends saying so, with the pod's limit, never run again, and its pod serves the next", { timeout: 10 * 60_000 }, async () => {
+      // Past the session harness pods' 1536Mi, their default: the turn binds the conversation's pod, as its idle one was let go of since.
+      await tg.say("hog 2048");
+      const bound = await harnessPod();
+      await tg.waitFor((call) => /^Codex did not complete: Codex app-server ran out of its memory \(1536Mi\) and was killed by the kernel$/mu.test(call.payload.text ?? ""), 300_000);
+      const after = await harnessPod();
+      assert.equal(after.metadata?.uid, bound.metadata?.uid);
+      assert.equal(after.status?.containerStatuses?.find(({ name }) => name === "harness")?.restartCount, 0);
+      await tg.say("again");
+      await tg.waitFor((call) => answered(call));
+      assert.equal((await harnessPod()).metadata?.uid, bound.metadata?.uid);
     });
 
     test("Claude Code's MCP client, given a session's bayma once through the gateway, reaches it across the session's releases and its pod's loss in the same process; a release asked during a call waits for the call to end", { timeout: 20 * 60_000 }, async (t) => {

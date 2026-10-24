@@ -667,8 +667,13 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       resources: { requests: { cpu: "50m", memory: of === "previous" ? "2560Mi" : "256Mi" } },
       ...on("agent-1"),
     },
-    // The release before's folder instances let go after four hours idle, as the box's configuration says.
-    host: { resources: { requests: { cpu: "20m", memory: "128Mi" } }, ...(of === "previous" ? { releaseAfter: "4h" } : {}) },
+    // The release before's folder instances let go after four hours idle, as the box's configuration says. This checkout's limited
+    // to 1536Mi, for this run alone, so that a runaway exec's process runs past it without filling the runner, and the 800 MiB its
+    // sizing holds still fits.
+    host: {
+      resources: { requests: { cpu: "20m", memory: "128Mi" }, ...(of === "previous" ? {} : { limits: { memory: "1536Mi" } }) },
+      ...(of === "previous" ? { releaseAfter: "4h" } : {}),
+    },
     // Conversations' harnesses' pools, of this checkout's configuration alone, as the release before has none:
     // released within the run in the agents shard alone, as the other suites' turns are not written to wait on a pool's pod.
     ...(of === "release"

@@ -5,7 +5,9 @@
  * ./codex-stand-in.Dockerfile builds. It speaks the app-server's JSON-RPC over stdio as
  * Codex does, as far as alasio's turns go: threads start, resume and are listed, and each
  * turn is answered with ANSWER as its final answer: at once, or, for a prompt `wait N`, N
- * seconds after it starts, as a turn whose tools run that long; for a prompt `show <path>`,
+ * seconds after it starts, as a turn whose tools run that long; for a prompt `hog N`, never,
+ * N MiB held once it starts, each page written, as a runaway turn holds them, the process
+ * killed by the kernel past its pod's limit; for a prompt `show <path>`,
  * beside the file at `path` of its workspace, shown as an image is; for a prompt `login`, after a
  * request of its model provider's Responses API, as Codex calls it, with the bearer its
  * provider's env_key names, beside what the provider answered (`login <status>`); for a prompt
@@ -316,8 +318,12 @@ async function serve(args: readonly string[]): Promise<void> {
       }
       // After the answer to turn/start, as Codex reports a turn once it has accepted it.
       const seconds = Number(/^wait (\d+)$/u.exec(text)?.[1] ?? 0);
+      const hog = Number(/^hog (\d+)$/u.exec(text)?.[1] ?? 0);
       setImmediate(() => {
         notify(turnStarted(threadId, turn));
+        // What a runaway turn holds, written as it is taken, never let go of.
+        const held: Buffer[] = [];
+        for (let mib = 0; mib < hog; mib += 64) held.push(Buffer.alloc(64 * 2 ** 20, 1));
         const finish = () => {
           clearTimeout(waiting);
           finishers.delete(turn.id);

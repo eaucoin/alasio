@@ -12,6 +12,10 @@
  *   each exec of how its session came back.
  * - `hold <url> <token> <mib>`: a Python session holding `mib` MiB, each page of it written;
  *   lets go of its control, and prints its id.
+ * - `runaway <url> <token> <mib>`: a Python session holding a value live, whose exec runs a
+ *   process of its own that takes `mib` MiB, each page written, as a runaway command does;
+ *   then, in the same session, reads the value again; prints how that process ended, what
+ *   the session held after, and what bayma told that exec of how its session came back.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -27,6 +31,13 @@ export interface FolderReplsSet {
   readonly count: number;
 }
 
+/** What `runaway` saw: how its process ended (its return code), what its session held after, and bayma's notice to the exec after, if any. */
+export interface FolderRunaway {
+  readonly returncode: number;
+  readonly kept: string | null;
+  readonly notice: string | null;
+}
+
 /** What `read` saw of each session, and bayma's notice to each exec, if any. */
 export interface FolderReplsRead {
   readonly python: { readonly live: string | null; readonly checkpointed: string | null; readonly count: number | null; readonly counting: boolean; readonly notice: string | null };
@@ -34,8 +45,8 @@ export interface FolderReplsRead {
 }
 
 const [verb, url, token, ...rest] = process.argv.slice(2);
-if (!url || !token || !(((verb === "set" || verb === "hold") && rest.length === 1) || (verb === "read" && rest.length === 2))) {
-  throw new Error("usage: folder-repl.ts set <url> <token> <value> | read <url> <token> <python> <bun> | hold <url> <token> <mib>");
+if (!url || !token || !(((verb === "set" || verb === "hold" || verb === "runaway") && rest.length === 1) || (verb === "read" && rest.length === 2))) {
+  throw new Error("usage: folder-repl.ts set <url> <token> <value> | read <url> <token> <python> <bun> | hold <url> <token> <mib> | runaway <url> <token> <mib>");
 }
 
 /** The text of a part of a tool's answer, where bayma gives its JSON. */
@@ -95,6 +106,18 @@ try {
     for (const session of [python, bun]) await call(client, "session.release_controller", { session_id: session.session_id });
     const set: FolderReplsSet = { python: python.session_id, bun: bun.session_id, count: Number(counted.stdout.trim()) };
     console.log(JSON.stringify(set));
+  } else if (verb === "runaway") {
+    const { session } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "python", title: "e2e", cwd: "/tmp" });
+    const ran = await exec(client, session.session_id, [
+      "import subprocess, sys",
+      'kept = "kept through a runaway"',
+      `hog = "held = bytearray(${Number(rest[0])} << 20)\\nfor at in range(0, len(held), 4096): held[at] = 1"`,
+      "print(subprocess.run([sys.executable, \"-c\", hog]).returncode)",
+    ].join("\n"));
+    const after = await exec(client, session.session_id, 'print(globals().get("kept"))');
+    await call(client, "session.close", { session_id: session.session_id });
+    const seen: FolderRunaway = { returncode: Number(ran.stdout.trim()), kept: after.stdout.trim() || null, notice: after.notice };
+    console.log(JSON.stringify(seen));
   } else if (verb === "hold") {
     const { session } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "python", title: "e2e", cwd: "/tmp" });
     await exec(client, session.session_id, `held = bytearray(${Number(rest[0])} << 20)\nfor at in range(0, len(held), 4096): held[at] = 1\nprint("held")`);
