@@ -73,7 +73,7 @@ import { isValidVolumeId, sessionKey, volumeIdOfKey } from "../sandbox/names.ts"
 import { meter } from "../telemetry/index.ts";
 import type { Environments } from "./environments.ts";
 import type { GatewaySnapshots as GatewaySnapshotsConfig } from "./names.ts";
-import { released } from "./releases.ts";
+import { killedForMemory, memoryLimitOf, released } from "./releases.ts";
 import { BaymaStatus, makeGatewaySnapshots } from "./snapshots.ts";
 
 /** The metrics of the gateway's sessions, as the module says. */
@@ -342,7 +342,7 @@ export const makeSessions = Effect.fnUntraced(function*(
   };
 
   /** Releases the binding of `key` of `pool`, its pod `pod`, as `before` says, counting it released for `reason`. */
-  const releaseFor = (pool: Pool, key: string, pod: V1Pod, reason: "broken", before: (name: string) => Effect.Effect<void, KubeApiError | NodeAgentError | BindStepFailed>) => {
+  const releaseFor = (pool: Pool, key: string, pod: V1Pod, reason: "broken" | "oom", before: (name: string) => Effect.Effect<void, KubeApiError | NodeAgentError | BindStepFailed>) => {
     return binder.release(pool, key, (bound) => before(bound.pod), pod.metadata?.name ?? "").pipe(
       Effect.tap((done) =>
         done === "released" ? released(pool, reason) : Effect.void
@@ -364,7 +364,8 @@ export const makeSessions = Effect.fnUntraced(function*(
    * Looks at each bound pod of the gateway's pools: one whose bayma ended, or was started again
    * in it, or whose workspace its node can reach no more (the node's mount of workspace storage
    * ended under it, as its mount's pod killed with no successor leaves it), which serves no more,
-   * is released into the snapshot taken of it live, if any, as broken; and of each that runs, the snapshot taken of it live is kept true to it
+   * is released into the snapshot taken of it live, if any, as broken, or as oom where its
+   * sandbox was killed for its memory; and of each that runs, the snapshot taken of it live is kept true to it
    * (./snapshots.ts keepLive), one that can be saved no more released now.
    */
   const live: Effect.Effect<void, KubeApiError> = Effect.gen(function*() {
@@ -395,9 +396,11 @@ export const makeSessions = Effect.fnUntraced(function*(
         const bayma = pod.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER);
         const ended = bayma !== undefined && (bayma.restartCount > 0 || bayma.state?.terminated !== undefined);
         if (ended || (yield* unreachable(pod.spec?.nodeName ?? "")).has(`${pool.namespace}/${pod.metadata?.name ?? ""}`)) {
-          const why = ended ? "bayma ended in its pod" : "workspace is unreachable in its pod";
+          // Killed for its memory, the whole sandbox, as gVisor runs it as one process on the node.
+          const killed = ended && killedForMemory(pod, BAYMA_CONTAINER);
+          const why = killed ? `sandbox ran out of its memory (${memoryLimitOf(pod, BAYMA_CONTAINER) ?? "its limit"}) in its pod` : ended ? "bayma ended in its pod" : "workspace is unreachable in its pod";
           yield* Effect.logWarning(`${key}'s ${why} ${pod.metadata?.name}, which serves its binding no more: it is released into the snapshot taken of it live, if any`);
-          yield* Effect.forkDetach(releaseFor(pool, key, pod, "broken", () =>
+          yield* Effect.forkDetach(releaseFor(pool, key, pod, killed ? "oom" : "broken", () =>
             Effect.andThen(
               Effect.flatMap(snapshots.liveSnapshotOf(pool, workspace), (into) => agents.setReleased({ environment: pool.namespace, workspace }, into)),
               endAndDetachUnsaved(pool, pod),

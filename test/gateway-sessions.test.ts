@@ -1000,6 +1000,25 @@ test("a bound pod whose bayma ended in it, or was started again, is released as 
   assert.equal(recorded.asked.at(-1), `record ${env.namespace}/fs-gone released into s-live`);
 });
 
+test("a bound pod whose sandbox was killed for its memory is released as oom, into the snapshot taken of it live", async () => {
+  const env = await environment(1, { gvisor: true });
+  const recorded = agents();
+  let saved = false;
+  const live = { ...recorded.agents, current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/home/agent/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null) };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), live);
+  const key = sessionKey("fs-killed");
+  const [oomBefore, brokenBefore] = [await releasedFor(env.namespace, "oom"), await releasedFor(env.namespace, "broken")];
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  saved = true;
+  // Ended as kubelet says one the kernel killed for its memory ended.
+  await run(withKube((kube) => kube.patchPodStatus(env.namespace, bound.pod, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated: { exitCode: 137, reason: "OOMKilled" } } }] } })));
+  await Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
+  for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its binding was not let go");
+  assert.deepEqual(recorded.asked, [`record ${env.namespace}/fs-killed released into s-live`, `detach node-a ${env.namespace}/${bound.pod}`]);
+  assert.deepEqual([await releasedFor(env.namespace, "oom"), await releasedFor(env.namespace, "broken")], [oomBefore + 1, brokenBefore]);
+});
+
 test("a bound pod whose workspace its node can reach no more, as its node's mount of workspace storage ended under it, is released as broken, into the snapshot taken of it live; one whose workspace is reachable is kept", async () => {
   const env = await environment(2, { gvisor: true });
   const recorded = agents();
