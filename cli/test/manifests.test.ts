@@ -430,19 +430,48 @@ describe("alasio", () => {
     });
   });
 
-  test("runs as the operator, in their home, with their mounts, under the host profile", () => {
-    const objects = install({
-      host: { enabled: true, uid: 1234, gid: 1235, supplementalGroups: [999], home: "/home/op", mounts: [{ name: "home", hostPath: "/home", mountPath: "/home" }] },
-    });
+  test("runs as the operator, in their home, under the host profile, with what of the machine it reads itself: the workspace root, their home in it, and none of the rest of the mounts", () => {
+    // A profile as a machine's operator writes one: their home, as the workspace root, among the machine's other paths and its Docker.
+    const mounts = [
+      { name: "home", hostPath: "/home", mountPath: "/home" },
+      { name: "tmp", hostPath: "/tmp", mountPath: "/tmp" },
+      { name: "docker-socket", hostPath: "/var/run/docker.sock", mountPath: "/var/run/docker.sock", type: "Socket" },
+      { name: "docker", hostPath: "/usr/bin/docker", mountPath: "/usr/bin/docker", readOnly: true, type: "File" },
+    ];
+    const objects = install({ host: { enabled: true, uid: 1234, gid: 1235, supplementalGroups: [999], home: "/home/op", workspaceRoot: "/home/op", mounts } });
     const spec = one<V1Deployment>(objects, "Deployment", "alasio").spec?.template.spec;
     assert.equal(spec?.securityContext?.runAsUser, 1234);
     assert.deepEqual(spec?.securityContext?.supplementalGroups, [999]);
     assert.deepEqual(spec?.containers[0]?.env?.find(({ name }) => name === "HOME"), { name: "HOME", value: "/home/op" });
-    assert.deepEqual(spec?.containers[0]?.volumeMounts?.find(({ name }) => name === "home"), { name: "home", mountPath: "/home" });
-    assert.deepEqual(spec?.volumes?.find(({ name }) => name === "home"), { name: "home", hostPath: { path: "/home" } });
-    // Their home keeps their own Codex login.
+    const machine = (of: V1PodSpec | undefined) => ({
+      mounts: of?.containers[0]?.volumeMounts?.filter(({ name }) => of.volumes?.some((volume) => volume.name === name && volume.hostPath)),
+      volumes: of?.volumes?.filter(({ hostPath }) => hostPath),
+    });
+    assert.deepEqual(machine(spec), {
+      mounts: [{ name: "workspace-root", mountPath: "/home/op" }],
+      volumes: [{ name: "workspace-root", hostPath: { path: "/home/op", type: "Directory" } }],
+    });
+    // Their home, given with the root, keeps their own Codex login.
     assert.equal(spec?.containers[0]?.env?.find(({ name }) => name === "ALASIO_KEEP_CODEX_LOGIN"), undefined);
     assert.equal(spec?.volumes?.find(({ name }) => name === "alasio-home"), undefined);
+    // A folder conversation's pool keeps every mount, as its harness runs there.
+    const folder = one<V1Deployment>(objects, "Deployment", "harness-folder-claude").spec?.template.spec;
+    for (const { mountPath } of mounts) assert.ok(folder?.containers[0]?.volumeMounts?.some((mount) => mount.mountPath === mountPath), mountPath);
+
+    // A root outside their home: it, and of their home their Claude and Codex homes alone, the rest its own.
+    const apart = one<V1Deployment>(install({ host: { enabled: true, home: "/home/op", workspaceRoot: "/srv/work", mounts: [...mounts, { name: "srv", hostPath: "/data/srv", mountPath: "/srv", readOnly: true }] } }), "Deployment", "alasio").spec?.template.spec;
+    assert.deepEqual(machine(apart), {
+      mounts: [{ name: "workspace-root", mountPath: "/srv/work", readOnly: true }, { name: "claude-home", mountPath: "/home/op/.claude" }, { name: "codex-home", mountPath: "/home/op/.codex" }],
+      volumes: [
+        { name: "workspace-root", hostPath: { path: "/data/srv/work", type: "Directory" } },
+        { name: "claude-home", hostPath: { path: "/home/op/.claude", type: "DirectoryOrCreate" } },
+        { name: "codex-home", hostPath: { path: "/home/op/.codex", type: "DirectoryOrCreate" } },
+      ],
+    });
+    assert.deepEqual(apart?.volumes?.find(({ name }) => name === "alasio-home"), { name: "alasio-home", emptyDir: {} });
+    // A home of alasio's own, the root under it no mount gives: none of the machine.
+    const own = one<V1Deployment>(install({ host: { enabled: true, alasioHome: false, mounts } }), "Deployment", "alasio").spec?.template.spec;
+    assert.deepEqual(machine(own), { mounts: [], volumes: [] });
   });
 
   test("gives alasio no template of workspaces, whose pods are the sandbox gateway's, and tells main's alone that the gateway serves folder instances, where it does", () => {

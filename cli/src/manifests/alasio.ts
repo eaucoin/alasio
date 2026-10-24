@@ -4,6 +4,8 @@
  * config.ts); main's, or a branch environment's in its own namespaces (./branch.ts), and
  * main's Service of the forks it asks the sandbox gateway for them.
  */
+import { posix } from "node:path";
+
 import type {
   KubernetesObject,
   V1Deployment,
@@ -15,6 +17,7 @@ import type {
   V1ServiceAccount,
   V1PodTemplateSpec,
   V1Volume,
+  V1VolumeMount,
 } from "@kubernetes/client-node";
 
 import { BRANCH_PARENT_LABEL, branchSessionsNamespace, forksGroup, forksTopic, MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
@@ -39,8 +42,6 @@ import {
   type Environment,
   envOf,
   given,
-  hostVolumeMounts,
-  hostVolumes,
   imagePullSecrets,
   labels,
   lakeRuns,
@@ -206,13 +207,57 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
 }
 
 /**
+ * What of the machine alasio's pod mounts under the host profile: what alasio itself reads and
+ * writes there, now that no harness runs in its pod, each where the host profile's mounts put it
+ * (its folder conversations' harnesses run in pools of their own, with every mount):
+ * - the root its folder workspaces are under (ALASIO_WORKSPACE_ROOT, else its home), which it
+ *   lists and makes folders in, reads a reply's media from, and starts Claude Code in to list
+ *   the models its login can use (../../../src/harness/claude/models.ts);
+ * - where its home is the operator's and outside that root, the operator's Claude and Codex
+ *   homes in it, `~/.claude` and `~/.codex`: Claude Code's login and settings it lists models
+ *   with, and the Codex login its app-server keeps fresh and lists models with, and the
+ *   configuration it gives folder conversations' Codex (../../../src/codex/configuration.ts);
+ *   the rest of that home its own, an emptyDir.
+ * Nothing else: no socket, binary, or other path of the machine any mount gives. A path no mount
+ * gives is mounted from nowhere, as it was not given the machine's.
+ */
+export function hostPaths(config: InstallConfig, home: string): { readonly mounts: V1VolumeMount[]; readonly volumes: V1Volume[]; readonly homeIsGiven: boolean } {
+  const { host } = config;
+  if (!host.enabled) return { mounts: [], volumes: [], homeIsGiven: false };
+  const under = (path: string, of: string) => path === of || path.startsWith(`${of.replace(/\/$/u, "")}/`);
+  /** Where on the machine the mount that gives `path` has it, and whether it gives it read-only; null where none does. */
+  const given = (path: string) => {
+    const [mount] = host.mounts.filter(({ mountPath }) => under(path, mountPath)).sort((a, b) => b.mountPath.length - a.mountPath.length);
+    return mount ? { hostPath: posix.join(mount.hostPath, posix.relative(mount.mountPath, path)), readOnly: mount.readOnly } : null;
+  };
+  const root = host.workspaceRoot || home;
+  const operatorHome = host.alasioHome;
+  const paths: { readonly name: string; readonly path: string; readonly type: string }[] = [
+    { name: "workspace-root", path: root, type: "Directory" },
+    ...(operatorHome && !under(home, root)
+      ? [{ name: "claude-home", path: posix.join(home, ".claude"), type: "DirectoryOrCreate" }, { name: "codex-home", path: posix.join(home, ".codex"), type: "DirectoryOrCreate" }]
+      : []),
+  ];
+  const mounts: V1VolumeMount[] = [];
+  const volumes: V1Volume[] = [];
+  for (const { name, path, type } of paths) {
+    const at = given(path);
+    if (!at) continue;
+    mounts.push({ name, mountPath: path, ...(at.readOnly ? { readOnly: true } : {}) });
+    volumes.push({ name, hostPath: { path: at.hostPath, type } });
+  }
+  return { mounts, volumes, homeIsGiven: operatorHome && under(home, root) && given(root) !== null };
+}
+
+/**
  * alasio's Deployment: of alasio.scaling's replicas, which KEDA moves between its min and max
  * where they are apart (alasioScaling). At one at most, an update stops the old pod before the
  * new one starts; beyond, the new one starts beside the old, which drains as it stops, within
  * STOP_GRACE_SECONDS (src/telegram/stop.ts, src/telegram/drain.ts). It keeps no volume: its state is in Neon,
  * and what it writes to disk (received files written for the agent, its home unless it
  * is the operator's) is written again as needed, on emptyDirs. Under the
- * host profile it runs as the operator, in their home, with the machine's mounts. A
+ * host profile it runs as the operator, in their home, with what of the machine it reads
+ * itself (hostPaths), no more of the machine's mounts. A
  * branch environment's runs in its namespace on the branch's database, told it is the
  * branch, with its token to ask main to fork the sessions it inherited; main's is given
  * the key branch environments' tokens are signed with, where it forks sessions. Its pod
@@ -228,6 +273,9 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
   const groups = [...new Set([...alasio.supplementalGroups, ...(host.enabled ? host.supplementalGroups : [])])];
   const image = imageReference(config.images.alasio);
   const branchSecret = branchSecretVolume(environment);
+  const machine = hostPaths(config, home);
+  // Its home its own, an emptyDir, but where the machine's root it is given holds it.
+  const ownHome = !machine.homeIsGiven;
   return {
     apiVersion: "apps/v1",
     kind: "Deployment",
@@ -260,16 +308,16 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
             resources: alasio.resources,
             volumeMounts: [
               { name: "state", mountPath: "/var/lib/alasio/state" },
-              ...(operatorHome ? [] : [{ name: "alasio-home", mountPath: home }]),
+              ...(ownHome ? [{ name: "alasio-home", mountPath: home }] : []),
               { name: "database", mountPath: "/run/alasio/database", readOnly: true },
               { name: "log", mountPath: "/run/alasio/log", readOnly: true },
               ...branchSecret.map(({ name }) => ({ name, mountPath: BRANCH_SECRETS, readOnly: true })),
-              ...(host.enabled ? hostVolumeMounts(config) : []),
+              ...machine.mounts,
             ],
           }],
           volumes: [
             { name: "state", emptyDir: {} },
-            ...(operatorHome ? [] : [{ name: "alasio-home", emptyDir: {} }]),
+            ...(ownHome ? [{ name: "alasio-home", emptyDir: {} }] : []),
             {
               name: "database",
               secret: {
@@ -279,7 +327,7 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
             },
             { name: "log", secret: { secretName: environmentLogSecret(environment), items: [{ key: "password", path: "password" }] } },
             ...branchSecret,
-            ...(host.enabled ? hostVolumes(config) : []),
+            ...machine.volumes,
           ],
           ...given("nodeSelector", { ...alasio.nodeSelector }),
           ...given("tolerations", [...alasio.tolerations]),
