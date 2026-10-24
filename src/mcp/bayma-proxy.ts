@@ -22,6 +22,12 @@
  * could be read whole first; any other is answered as the gateway answered it, as an MCP call
  * a pod was given may have run. A caller that goes stops its request on, and a
  * bayma that goes mid-answer ends the caller's, as the binder's proxy does (../binder/proxy.ts).
+ *
+ * The gateway not reached at all, its connection never made, as while it starts again, a
+ * request is passed again every UNREACHED_EVERY_MS, for `unreachedForMs`
+ * (GATEWAY_RESTART_MS) from when it came, where its body could be read whole first: no pod was
+ * given it. So a call a harness makes while the gateway starts again is answered once it is,
+ * as is the GET its MCP client makes to reopen its stream, rather than each answered 502.
  */
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { type ClientRequest, createServer, type IncomingHttpHeaders, type IncomingMessage, request as httpRequest, type ServerResponse } from "node:http";
@@ -45,6 +51,18 @@ const REPLAYED_BYTES = 1024 ** 2;
 
 /** How long a request answered 503 with a Retry-After is passed again for, from when it came. */
 const RETRY_WITHIN_MS = 30_000;
+
+/**
+ * How long a request whose connection to the gateway was never made is passed again for, from
+ * when it came: past a restart of the gateway's, which the end-to-end test measures (the gateway
+ * reached by none of its pods 12 to 25 s, on k3s in Docker and on a host alike), with room; and
+ * within a harness's own wait for a call (Claude Code's 60 s), so that one given up is answered
+ * the loopback's 502, its call never passed on, before its harness times it out unsure.
+ */
+export const GATEWAY_RESTART_MS = 45_000;
+
+/** How often a request is passed again while its connection to the gateway is never made. */
+const UNREACHED_EVERY_MS = 1_000;
 
 /** The headers of one hop, which go no further than it (RFC 9110 7.6.1), and the Authorization the loopback is reached with. */
 const HOP_HEADERS = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade", "host", "authorization"]);
@@ -72,8 +90,13 @@ function authorized(route: Route, given: string | undefined): boolean {
   return bytes.length === route.authorization.length && timingSafeEqual(bytes, route.authorization);
 }
 
+/** What the loopback is made with: how long a request whose connection to the gateway is never made is passed again for, GATEWAY_RESTART_MS but for tests. */
+export interface BaymaProxyOptions {
+  readonly unreachedForMs?: number | undefined;
+}
+
 /** The loopback's endpoints, as the module says, served until the scope closes. */
-export const makeBaymaProxy: Effect.Effect<BaymaProxy["Service"], never, Scope.Scope> = Effect.gen(function*() {
+export const makeBaymaProxy = ({ unreachedForMs = GATEWAY_RESTART_MS }: BaymaProxyOptions = {}): Effect.Effect<BaymaProxy["Service"], never, Scope.Scope> => Effect.gen(function*() {
   /** Each workspace's endpoint, by its key, and by its path. */
   const routes = new Map<string, Route>();
   const paths = new Map<string, Route>();
@@ -93,6 +116,7 @@ export const makeBaymaProxy: Effect.Effect<BaymaProxy["Service"], never, Scope.S
     // it, never as if it were answered whole.
     const failed = (error: Error) => (outgoing.headersSent ? outgoing.destroy(error) : answer(502, `bayma was not reached: ${error.message}`));
     const until = Date.now() + RETRY_WITHIN_MS;
+    const unreachedUntil = Date.now() + unreachedForMs;
     let current: ClientRequest | null = null;
     // A caller that goes stops its request on, as a stream it no longer reads.
     outgoing.on("close", () => {
@@ -102,7 +126,9 @@ export const makeBaymaProxy: Effect.Effect<BaymaProxy["Service"], never, Scope.S
      * Passes the request on, its body `body` where it was read whole first: then, answered 503
      * by a gateway that says it passed it to no pod (NOT_PASSED_HEADER), as it answers a bearer
      * held to a binding it does not know of yet, passed again after its Retry-After, until
-     * RETRY_WITHIN_MS; otherwise as answered, as a pod given it may have run it.
+     * RETRY_WITHIN_MS; its connection to the gateway never made, passed again every
+     * UNREACHED_EVERY_MS until `unreachedForMs`; otherwise as answered, as a pod given it may
+     * have run it.
      */
     const pass = (body: Buffer | null): void =>
       // Got as the request goes, so its bearer is fresh however long its process has lived.
@@ -123,7 +149,16 @@ export const makeBaymaProxy: Effect.Effect<BaymaProxy["Service"], never, Scope.S
           answered.on("error", failed);
           answered.pipe(outgoing);
         });
-        current.on("error", failed);
+        /** Whether its connection to the gateway was made: one that was may have passed it on. */
+        let connected = false;
+        current.on("socket", (socket) => {
+          if (socket.connecting) socket.once("connect", () => void (connected = true));
+          else connected = true;
+        });
+        current.on("error", (error) => {
+          if (connected || body === null || Date.now() + UNREACHED_EVERY_MS >= unreachedUntil || outgoing.destroyed) return failed(error);
+          setTimeout(() => pass(body), UNREACHED_EVERY_MS);
+        });
         if (body === null) incoming.pipe(current);
         else current.end(body);
       }, (error: { readonly message: string }) => answer(502, `bayma was not reached: ${error.message}`));
@@ -172,5 +207,5 @@ export class BaymaProxy extends Context.Service<BaymaProxy, {
    */
   readonly reach: (key: string, upstream: Effect.Effect<BaymaEndpoint, { readonly message: string }>) => Effect.Effect<BaymaEndpoint>;
 }>()("alasio/mcp/BaymaProxy") {
-  static readonly layer: Layer.Layer<BaymaProxy> = Layer.effect(BaymaProxy, makeBaymaProxy);
+  static readonly layer: Layer.Layer<BaymaProxy> = Layer.effect(BaymaProxy, makeBaymaProxy());
 }

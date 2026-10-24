@@ -51,7 +51,7 @@ const NOT_GIVEN = "No turn has said where this conversation's bayma is yet, so t
 
 /** A pod's bayma, as the module says, until the scope closes. */
 export const makeGivenBayma = Effect.fnUntraced(function*({ gatewayUrl, environment, stateDir }: GivenBaymaOptions): Effect.fn.Return<GivenBayma, never, Scope.Scope> {
-  const proxy = yield* makeBaymaProxy;
+  const proxy = yield* makeBaymaProxy();
   /** The latest endpoint a turn gave, by its workspace's key. */
   const given = new Map<string, BaymaEndpoint>();
   /** Why the latest turn of a folder workspace runs without its bayma; null where it has it. */

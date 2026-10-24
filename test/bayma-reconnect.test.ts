@@ -101,7 +101,7 @@ async function bayma() {
   const { folders } = makeGatewayWorkspaces({ url: await listening(server), environment: "try", callerKey: environmentKey(MASTER, "try") });
   const served = Effect.runSync(Scope.make());
   const run = <A>(effect: Effect.Effect<A, never, Scope.Scope>) => Effect.runPromise(Scope.provide(effect, served).pipe(Effect.provideContext(clock)));
-  const proxy = await run(makeBaymaProxy);
+  const proxy = await run(makeBaymaProxy());
   return {
     /** Its endpoint as a process is given it: alasio's loopback, which mints each request's bearer by alasio's clock. */
     endpoint: await run(proxy.reach("folder:claude:telegram:1", folders.endpoint(FOLDER))),
