@@ -40,10 +40,11 @@ function rig(t: TestContext) {
   return { directory, machine, perform };
 }
 
-test("a server's files: k3s's config, without traefik, its volumes where the config says, kubelet's thresholds, no snapshotter of its own, its sandbox image pinned; registries only when given; each gVisor release a runtime, where systemd runs the machine; stargz-snapshotter's daemon's", async () => {
+test("a server's files: k3s's config, without traefik, its volumes where the config says, kubelet's thresholds and its config file, a runaway process killed alone, no snapshotter of its own, its sandbox image pinned; registries only when given; each gVisor release a runtime, where systemd runs the machine; stargz-snapshotter's daemon's", async () => {
   const files = nodeFiles({ role: "server", storagePath: STORAGE, gvisor: ["20990101.0"] });
   assert.deepEqual([...files.keys()], [
     "/etc/rancher/k3s/config.yaml",
+    "/etc/rancher/k3s/kubelet.yaml",
     `${CONTAINERD}/config-v3.toml.tmpl`,
     `${CONTAINERD}/runsc-20990101-0.toml`,
     "/etc/containerd-stargz-grpc/config.toml",
@@ -60,15 +61,27 @@ test("a server's files: k3s's config, without traefik, its volumes where the con
     "kubelet-arg": [
       "kube-reserved=cpu=250m,memory=1Gi",
       "system-reserved=cpu=250m,memory=512Mi",
-      "eviction-hard=imagefs.available<5%,nodefs.available<5%,memory.available<500Mi",
+      "eviction-hard=imagefs.available<5%,nodefs.available<5%,memory.available<1Gi",
+      "eviction-soft=memory.available<1536Mi",
+      "eviction-soft-grace-period=memory.available=30s",
+      "eviction-max-pod-grace-period=120",
       "eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%",
       "image-gc-high-threshold=98",
       "image-gc-low-threshold=95",
+      // Its config file, which k3s copies among its kubelet's own.
+      "config=/etc/rancher/k3s/kubelet.yaml",
     ],
     "snapshotter": "",
     // Its sandbox image by the name the CRI pins it by.
     "pause-image": "docker.io/rancher/mirrored-pause:3.10.2",
   });
+  // A container over its memory's limit loses its largest process alone, not every process in it.
+  assert.deepEqual(files.get("/etc/rancher/k3s/kubelet.yaml")?.split("\n").filter((line) => !line.startsWith("#")), [
+    "apiVersion: kubelet.config.k8s.io/v1beta1",
+    "kind: KubeletConfiguration",
+    "singleProcessOOMKill: true",
+    "",
+  ]);
   const runtimes = containerdFiles(["20990101.0"], { systemd: true });
   for (const [path, content] of runtimes) assert.equal(files.get(path), content);
   assert.equal(files.get("/etc/containerd-stargz-grpc/config.toml"), stargzConfig());

@@ -10,7 +10,7 @@ import { Effect, Layer, Logger } from "effect";
 
 import { DockerEngine } from "../src/cluster/docker-engine.ts";
 import { DockerCluster, type DockerClusterOptions, freeSubnet, subnetAddress } from "../src/cluster/docker.ts";
-import { containerdFiles, gvisorRuntimeClasses } from "../src/cluster/k3s.ts";
+import { containerdFiles, gvisorRuntimeClasses, KUBELET_CONFIG, KUBELET_CONFIG_PATH } from "../src/cluster/k3s.ts";
 import { gvisorReleases, NODE_PINS } from "../src/cluster/node.ts";
 import { stargzConfig } from "../src/cluster/stargz.ts";
 import type { FakeDocker } from "./support/fake-docker.ts";
@@ -128,10 +128,15 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
       `--default-local-storage-path=${options.storagePath}`,
       "--kubelet-arg=kube-reserved=cpu=250m,memory=1Gi",
       "--kubelet-arg=system-reserved=cpu=250m,memory=512Mi",
-      "--kubelet-arg=eviction-hard=imagefs.available<5%,nodefs.available<5%,memory.available<500Mi",
+      "--kubelet-arg=eviction-hard=imagefs.available<5%,nodefs.available<5%,memory.available<1Gi",
+      "--kubelet-arg=eviction-soft=memory.available<1536Mi",
+      "--kubelet-arg=eviction-soft-grace-period=memory.available=30s",
+      "--kubelet-arg=eviction-max-pod-grace-period=120",
       "--kubelet-arg=eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%",
       "--kubelet-arg=image-gc-high-threshold=98",
       "--kubelet-arg=image-gc-low-threshold=95",
+      // Its config file, put in with containerd's before it starts.
+      "--kubelet-arg=config=/etc/rancher/k3s/kubelet.yaml",
       // No snapshotter of k3s's: the node image's template says stargz-snapshotter's daemon's.
       "--snapshotter=",
       // Its sandbox image by the name the CRI pins it by.
@@ -164,7 +169,7 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
 
   assert.equal(k3s.nodeHosts, "172.30.9.2 dev-server-0\n172.30.9.250 otelcol.observability");
   assert.deepEqual(k3s.patches, [{ metadata: { resourceVersion: "1" }, data: { NodeHosts: k3s.nodeHosts } }]);
-  assert.deepEqual(fake.containers.get("dev-server-0")?.files, new Map([...containerdFiles(gvisorReleases(NODE_PINS), { systemd: false })].map(([path, content]) => [path, Buffer.from(content)])));
+  assert.deepEqual(fake.containers.get("dev-server-0")?.files, new Map([...containerdFiles(gvisorReleases(NODE_PINS), { systemd: false }), [KUBELET_CONFIG_PATH, KUBELET_CONFIG] as const].map(([path, content]) => [path, Buffer.from(content)])));
   assert.deepEqual(k3s.applied, [{ apiVersion: "v1", kind: "List", items: gvisorRuntimeClasses(gvisorReleases(NODE_PINS)) }]);
 
   assert.equal(statSync(kubeconfig).mode & 0o777, 0o600);
@@ -242,7 +247,7 @@ test("up makes the nodes anew when the gVisor releases change, with their files 
     "POST /containers/dev-agent-0/start",
   ]);
   for (const node of ["dev-server-0", "dev-agent-0"]) {
-    assert.deepEqual(fake.containers.get(node)?.files, new Map([...containerdFiles(releases, { systemd: false })].map(([path, content]) => [path, Buffer.from(content)])));
+    assert.deepEqual(fake.containers.get(node)?.files, new Map([...containerdFiles(releases, { systemd: false }), [KUBELET_CONFIG_PATH, KUBELET_CONFIG] as const].map(([path, content]) => [path, Buffer.from(content)])));
   }
   assert.deepEqual(runtimeClasses(), ["gvisor runsc-21000101-0", "gvisor-20990101-0 runsc-20990101-0", "gvisor-21000101-0 runsc-21000101-0"]);
 

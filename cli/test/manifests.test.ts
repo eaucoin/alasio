@@ -38,6 +38,7 @@ import { Result } from "effect";
 import { LOG_PRINCIPALS } from "../../neon/control/secrets.ts";
 import { DRAIN_WITHIN_MS } from "../../neon/lake/src/drain.ts";
 import { memoryBytes } from "../src/capacity.ts";
+import { EVICTION_MAX_POD_GRACE_SECONDS } from "../src/cluster/k3s.ts";
 import { NODE_PINS } from "../src/cluster/node.ts";
 import { installConfigOf } from "../src/config.ts";
 import { alasioObjects, alasioScaling } from "../src/manifests/alasio.ts";
@@ -255,11 +256,11 @@ describe("configuration", () => {
     assert.match(refused({ sessions: { snapshots: { releaseAfter: "five minutes" } } }), /^sessions\.snapshots\.releaseAfter must be a duration such as 5m$/u);
     assert.match(refused({ sessions: { snapshots: { releaseAfter: "0s" } } }), /^sessions\.snapshots\.releaseAfter must be a duration such as 5m$/u);
     assert.match(refused({ sessions: { snapshots: { liveEvery: "never" } } }), /^sessions\.snapshots\.liveEvery must be a duration such as 10m$/u);
-    for (const stopWait of ["never", "15s", "601s"]) {
-      assert.match(refused({ sessions: { snapshots: { stopWait } } }), /^sessions\.snapshots\.stopWait must be a duration of more than 15s and at most 10m, such as 60s$/u);
+    for (const stopWait of ["never", "15s", "91s"]) {
+      assert.match(refused({ sessions: { snapshots: { stopWait } } }), /^sessions\.snapshots\.stopWait must be a duration of more than 15s and at most 90s, as its pod stops within what kubelet gives one it evicts, such as 60s$/u);
     }
-    // Past one look for ending pods, and as long as a drain sanely waits on one.
-    for (const stopWait of ["16s", "10m"]) assert.equal(configOf({ sessions: { snapshots: { stopWait } } }).sessions.snapshots.stopWait, stopWait);
+    // Past one look for ending pods, and, with bayma's own stop, within what kubelet gives a pod it evicts.
+    for (const stopWait of ["16s", "90s"]) assert.equal(configOf({ sessions: { snapshots: { stopWait } } }).sessions.snapshots.stopWait, stopWait);
     assert.match(refused({ sessions: { snapshots: { nodeCache: "lots" } } }), /^sessions\.snapshots\.nodeCache must be a storage size, such as 20Gi$/u);
   });
 
@@ -3329,6 +3330,8 @@ describe("the sandbox service", () => {
       // not given for the gateway's save, and its template named by its own hash, which a snapshot taken on it records.
       assert.deepEqual(bayma?.args?.slice(-2), ["--stop-wait-ms", "60000"]);
       assert.equal(spec?.terminationGracePeriodSeconds, 60 + 30);
+      // Within what kubelet gives a pod it evicts as memory has been short a while, so its save is whole.
+      assert.ok((spec?.terminationGracePeriodSeconds ?? 0) <= EVICTION_MAX_POD_GRACE_SECONDS);
       const { ["alasio.dev/session-template"]: hash, ...annotations } = template?.metadata?.annotations ?? {};
       assert.equal(annotations["dev.gvisor.internal.cpufeatures"], BASELINE.join(","));
       assert.equal(hash, templateHash({ ...template, metadata: { ...template?.metadata, annotations } }));

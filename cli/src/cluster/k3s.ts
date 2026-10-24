@@ -47,6 +47,24 @@ export interface Registries {
   readonly configs?: Readonly<Record<string, { readonly tls: RegistryTls }>>;
 }
 
+/** Where a node's kubelet config file is, which k3s copies among its own kubelet's (KUBELET_ARGS). */
+export const KUBELET_CONFIG_PATH = "/etc/rancher/k3s/kubelet.yaml";
+
+/**
+ * What kubelet takes from its config file alone: a container over its memory's limit has the
+ * kernel kill its largest process alone (singleProcessOOMKill), as a build or a dev server an
+ * agent runs in a folder instance or a harness's pod is, rather than every process in it, as
+ * kubelet has the kernel do on cgroup v2 otherwise: the container, its bayma or harness and
+ * their REPL sessions, lives on, and the exec that ran it says it was killed.
+ */
+export const KUBELET_CONFIG = [
+  "# kubelet as alasio's cluster runs it, beside what k3s gives it: alasio up writes this file.",
+  "apiVersion: kubelet.config.k8s.io/v1beta1",
+  "kind: KubeletConfiguration",
+  "singleProcessOOMKill: true",
+  "",
+].join("\n");
+
 /**
  * kubelet's settings, as its arguments say them, for a machine the cluster shares with
  * everything else on it:
@@ -55,16 +73,34 @@ export interface Registries {
  *   only then, so images in use are not evicted;
  * - its memory: what k3s itself takes (its server, containerd and the containers' shims,
  *   about 1.3 GB) and the system beside it are reserved, so pods are scheduled against
- *   what is left rather than the whole machine; and kubelet evicts pods, lowest priority
- *   first, while 500 MiB is still free, before the kernel kills a process of its choosing.
+ *   what is left rather than the whole machine; and kubelet evicts pods, those furthest
+ *   over their requests first, as agents' small requests put theirs, while 1.5 GiB has
+ *   been short for 30 s, each given EVICTION_MAX_POD_GRACE_SECONDS at most to stop in, and
+ *   at once while 1 GiB is: before the kernel kills a process of its choosing, as it does
+ *   once the machine has none left, whatever else on it, outside the cluster, holds memory
+ *   kubelet does not count;
+ * - and its config file (KUBELET_CONFIG): what kubelet takes there alone.
  */
+/**
+ * The longest a pod kubelet evicts while memory has been short for a while (eviction-soft)
+ * is given to stop in, of its own grace, which kubelet otherwise cuts to none: a session's
+ * sandbox's, its bayma holding its stop for its snapshot as long as its snapshot stop wait
+ * says (sessions.snapshots.stopWait, 60 s by default) and then stopping (30 s), among them,
+ * so its save is whole.
+ */
+export const EVICTION_MAX_POD_GRACE_SECONDS = 120;
+
 export const KUBELET_ARGS: readonly string[] = [
   "kube-reserved=cpu=250m,memory=1Gi",
   "system-reserved=cpu=250m,memory=512Mi",
-  "eviction-hard=imagefs.available<5%,nodefs.available<5%,memory.available<500Mi",
+  "eviction-hard=imagefs.available<5%,nodefs.available<5%,memory.available<1Gi",
+  "eviction-soft=memory.available<1536Mi",
+  "eviction-soft-grace-period=memory.available=30s",
+  `eviction-max-pod-grace-period=${EVICTION_MAX_POD_GRACE_SECONDS}`,
   "eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%",
   "image-gc-high-threshold=98",
   "image-gc-low-threshold=95",
+  `config=${KUBELET_CONFIG_PATH}`,
 ];
 
 /**

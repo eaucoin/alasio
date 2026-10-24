@@ -13,6 +13,8 @@ import type { V1Affinity, V1EnvFromSource, V1Toleration } from "@kubernetes/clie
 import { Effect, Predicate, Result, Schema, SchemaGetter, SchemaIssue } from "effect";
 
 import { memoryBytes, memoryText } from "../capacity.ts";
+import { EVICTION_MAX_POD_GRACE_SECONDS } from "../cluster/k3s.ts";
+import { BAYMA_STOP_SECONDS } from "../../../src/kube/sandbox-shape.ts";
 import { NODE_AGENT_MEMORY_FLOOR } from "../../../src/node-agent/names.ts";
 import { IMAGES } from "../release.ts";
 
@@ -250,8 +252,9 @@ const Snapshots = Schema.Struct({
    * as a drain, another eviction through the API server (a preemption's, a NoExecute
    * taint's) or a deletion ends it, for alasio to snapshot it first as it releases a session
    * (bayma's --stop-wait-ms): its pod's grace period is this and 30 s more for bayma's own
-   * stop. More than 15 s, as alasio looks for ending pods every 15 s, and at most 10m, as a
-   * drain waits on each pod. The node agents run as a DaemonSet, which a drain leaves in
+   * stop. More than 15 s, as alasio looks for ending pods every 15 s, and at most as long as,
+   * with bayma's 30 s, kubelet gives a pod it evicts as memory has been short a while
+   * (EVICTION_MAX_POD_GRACE_SECONDS, of cli/src/cluster/k3s.ts), so its save is whole then too. The node agents run as a DaemonSet, which a drain leaves in
    * place. Each node snapshots two such sessions at a time, the others waiting their turn; one
    * whose snapshot fails, or whose turn comes once its bayma holds its stop no more, comes
    * back from bayma's checkpoints. A pod that ends where it is, with no grace or the kubelet's
@@ -269,7 +272,8 @@ const Snapshots = Schema.Struct({
   stopWait: defaulted(
     Schema.String.check(Schema.makeFilter((duration) => {
       const seconds = durationSeconds(duration) ?? 0;
-      return (seconds > 15 && seconds <= 600) || "must be a duration of more than 15s and at most 10m, such as 60s";
+      const most = EVICTION_MAX_POD_GRACE_SECONDS - BAYMA_STOP_SECONDS;
+      return (seconds > 15 && seconds <= most) || `must be a duration of more than 15s and at most ${most}s, as its pod stops within what kubelet gives one it evicts, such as 60s`;
     })),
     "60s",
   ),

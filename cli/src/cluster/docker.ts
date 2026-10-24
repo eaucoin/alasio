@@ -41,6 +41,8 @@ import {
   gvisorRuntimeClasses,
   type HostAlias,
   KUBELET_ARGS,
+  KUBELET_CONFIG,
+  KUBELET_CONFIG_PATH,
   nodeHostsWith,
   NotYet,
   readySince,
@@ -297,8 +299,11 @@ const makeDockerCluster = Effect.fnUntraced(function*({
 
   const unusable = (reason: string) => new ClusterUnusable({ cluster, reason });
 
-  /** containerd's files, which pull through stargz-snapshotter's daemon and make each gVisor release the node image holds a runtime, in every node. */
-  const files = containerdFiles(gvisor, { systemd: false });
+  /**
+   * containerd's files, which pull through stargz-snapshotter's daemon and make each gVisor
+   * release the node image holds a runtime, and kubelet's config file, in every node.
+   */
+  const files = new Map([...containerdFiles(gvisor, { systemd: false }), [KUBELET_CONFIG_PATH, KUBELET_CONFIG]]);
 
   /**
    * The container of `node`, with what every node has: privileged, as k3s in Docker needs,

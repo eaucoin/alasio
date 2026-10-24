@@ -28,7 +28,7 @@ import { Duration, Effect, FileSystem, Option, type PlatformError, Schedule, Sch
 import pins from "../../../cluster/node/pins.json" with { type: "json" };
 import { CONTAINERD, GVISOR_RELEASES, gvisorDirectory, gvisorHandler, NODE_DIRECTORY } from "../../../src/node-agent/names.ts";
 import { Registries } from "../config.ts";
-import { clusterKubeconfig, containerdFiles, KUBELET_ARGS, NotYet, registriesYaml, SANDBOX_IMAGE } from "./k3s.ts";
+import { clusterKubeconfig, containerdFiles, KUBELET_ARGS, KUBELET_CONFIG, KUBELET_CONFIG_PATH, NotYet, registriesYaml, SANDBOX_IMAGE } from "./k3s.ts";
 import { Machine, type RootCommandFailed, RootSystem, under } from "./machine.ts";
 import { FUSE_MANAGER_SOCKET, FUSE_MANAGER_STORE, STARGZ_CONFIG, STARGZ_EXECUTABLES, STARGZ_MEMORY_LIMIT, STARGZ_ROOT, STARGZ_SOCKET, stargzConfig } from "./stargz.ts";
 import { tarEntries } from "./tar.ts";
@@ -145,8 +145,8 @@ export type NodeConfig = typeof NodeConfig.Type;
 /**
  * The files that make k3s and its containerd a node of `config`, by their paths: k3s's
  * config.yaml, written as JSON, which YAML reads as it is, its snapshotter none, as
- * containerd's files say the daemon's, and its sandbox image pinned (./k3s.ts); the
- * registries; the files that make containerd pull through stargz-snapshotter's daemon and
+ * containerd's files say the daemon's, and its sandbox image pinned (./k3s.ts); its kubelet's
+ * config file; the registries; the files that make containerd pull through stargz-snapshotter's daemon and
  * run each gVisor release, where systemd runs the machine; and the daemon's configuration
  * and service, which k3s's service wants, and with which it stops and restarts. Pure, for
  * tests.
@@ -163,6 +163,7 @@ export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
   };
   return new Map([
     [CONFIG_YAML, `# k3s as alasio's cluster runs it: alasio up writes this file.\n${JSON.stringify(k3s)}\n`],
+    [KUBELET_CONFIG_PATH, KUBELET_CONFIG],
     ...(config.registries ? [[REGISTRIES_YAML, `${registriesYaml(config.registries)}\n`] as const] : []),
     ...containerdFiles(config.gvisor, { systemd: true }),
     [STARGZ_CONFIG, stargzConfig(config.registries)],
