@@ -8,6 +8,7 @@ import { Deferred, Effect, Exit, Schema, type Scope, Stream } from "effect";
 
 import { getCodexBinaryOverride } from "../../config.ts";
 import { withLogScope } from "../../shared/log.ts";
+import { CGROUP_DIR, type MemoryKill, ranOutOf, watchMemoryKills } from "../../shared/memory-kills.ts";
 import type { CodexEnv } from "../env.ts";
 import { CODEX_DISABLED_FEATURES } from "../features.ts";
 import { codexTelemetryArgs, codexTelemetryEnv } from "./telemetry.ts";
@@ -37,12 +38,14 @@ export class AppServerSpawnFailed extends Schema.TaggedError<AppServerSpawnFaile
   }
 }
 
-/** The app-server process exited: its exit code, or the signal that ended it. */
+/** The app-server process exited: its exit code, or the signal that ended it, and, where the kernel killed it for its memory, the limit it ran out of. */
 export class AppServerExited extends Schema.TaggedError<AppServerExited>()("AppServerExited", {
   code: Schema.NullOr(Schema.Number),
   signal: Schema.NullOr(Schema.String),
+  outOfMemory: Schema.optional(Schema.Struct({ limit: Schema.NullOr(Schema.String) })),
 }) {
   override get message(): string {
+    if (this.outOfMemory) return `Codex app-server ${ranOutOf(this.outOfMemory)} and was killed by the kernel`;
     return `Codex app-server exited code=${this.code} signal=${this.signal}`;
   }
 }
@@ -71,14 +74,16 @@ function codexBinPath() {
 /**
  * The local codex binary's app-server, over stdio, without CODEX_DISABLED_FEATURES
  * (../features.ts): its error output is logged as it comes, and it is sent SIGTERM when its
- * scope closes.
+ * scope closes. One killed (SIGKILL) as the cgroup at `cgroup` counts a kill for memory since it
+ * started ends saying so (../../shared/memory-kills.ts).
  */
-export const spawnAppServer: SpawnAppServer = Effect.fnUntraced(function*({ cwd, env, config = [] }: AppServerProcessOptions) {
+export const makeSpawnAppServer = (cgroup: string = CGROUP_DIR): SpawnAppServer => Effect.fnUntraced(function*({ cwd, env, config = [] }: AppServerProcessOptions) {
   const binPath = codexBinPath();
   if (!existsSync(binPath)) {
     return yield* new CodexBinaryMissing({ path: binPath });
   }
   const ended = yield* Deferred.make<never, AppServerEnded>();
+  const killedForMemory = watchMemoryKills(cgroup);
   const child = yield* Effect.acquireRelease(
     Effect.try({
       try: () => spawn(binPath, ["app-server", ...CODEX_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]), ...codexTelemetryArgs(), ...config.flatMap((each) => ["-c", each]), "--listen", "stdio://"], {
@@ -90,7 +95,10 @@ export const spawnAppServer: SpawnAppServer = Effect.fnUntraced(function*({ cwd,
     }),
     (child) => Effect.sync(() => child.kill("SIGTERM")),
   );
-  child.on("exit", (code, signal) => Deferred.doneUnsafe(ended, Exit.fail(new AppServerExited({ code, signal }))));
+  child.on("exit", (code, signal) => {
+    const outOfMemory: MemoryKill | null = signal === "SIGKILL" ? killedForMemory() : null;
+    Deferred.doneUnsafe(ended, Exit.fail(new AppServerExited({ code, signal, ...(outOfMemory ? { outOfMemory } : {}) })));
+  });
   child.on("error", (cause) => Deferred.doneUnsafe(ended, Exit.fail(new AppServerSpawnFailed({ cause }))));
   // Its output streams end with it; reading them is no reason to fail.
   const output = (evaluate: () => NodeJS.ReadableStream) => NodeStream.fromReadable({ evaluate, onError: () => undefined }).pipe(Stream.ignore);
@@ -111,3 +119,6 @@ export const spawnAppServer: SpawnAppServer = Effect.fnUntraced(function*({ cwd,
     ended: Deferred.await(ended),
   };
 });
+
+/** The local codex binary's app-server, as makeSpawnAppServer starts it, of the container's own cgroup. */
+export const spawnAppServer: SpawnAppServer = makeSpawnAppServer();

@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import type {
@@ -708,8 +711,14 @@ function createFakeCli() {
   const prompts: SDKUserMessage[] = [];
   const promptWaiters: ((message: SDKUserMessage) => void)[] = [];
   const state: FakeCliState = { created: 0, closed: 0, interrupts: 0, consumed: 0, options: [] };
+  // What the process fails with, as the Agent SDK fails a query whose process ended so.
+  let crashed: Error | null = null;
   function emit(message: SDKMessage): void {
     outbox.push(message);
+    wake?.();
+  }
+  function crash(error: Error): void {
+    crashed = error;
     wake?.();
   }
   function nextPrompt(): Promise<StampedPrompt> {
@@ -746,6 +755,9 @@ function createFakeCli() {
             yield message;
           }
         }
+        if (crashed) {
+          throw crashed;
+        }
         if (closed) {
           return;
         }
@@ -766,7 +778,7 @@ function createFakeCli() {
       },
     });
   };
-  return { queryFactory, emit, nextPrompt, prompts, state };
+  return { queryFactory, emit, crash, nextPrompt, prompts, state };
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
@@ -1321,6 +1333,34 @@ test("/stop interrupts the turn without killing the process, and the interrupted
   await settle();
   assert.deepEqual(persistence.state.pending, ["1"], "no reply was created for the tail");
   await closeAll();
+});
+
+test("a Claude Code process the kernel kills for its memory mid-turn fails that turn saying so, the limit it ran out of with it; one killed otherwise, as it was", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "alasio-cgroup-"));
+  const kills = (count: number) => writeFileSync(join(dir, "memory.events"), `oom 1\noom_kill ${count}\n`);
+  try {
+    kills(2);
+    writeFileSync(join(dir, "memory.max"), `${1536 * 2 ** 20}\n`);
+    for (const [killed, said] of [[3, /^Error: Claude Code ran out of its memory \(1536Mi\) and was killed by the kernel$/u], [3, /^Error: Claude Code process terminated by signal SIGKILL$/u]] as const) {
+      const persistence = createPersistence();
+      const activeTurns = makeActiveTurns();
+      const cli = createFakeCli();
+      const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma, cgroup: dir }, activeTurns);
+      const turn = runTurn(liveSessions, turnParams(persistence));
+      await cli.nextPrompt();
+      // Killed as its cgroup counts the kill: the first a kill since it started, the second none.
+      kills(killed);
+      cli.crash(new Error("Claude Code process terminated by signal SIGKILL"));
+      const result = await turn;
+      assert.equal(result.responseCompleted, false);
+      const last = result.blockSequence.at(-1);
+      assert.ok(last?.type === "text");
+      assert.match(last.content, said);
+      await closeAll();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("a Claude Code process that exits mid-turn fails that turn and the next prompt starts a fresh one", async () => {

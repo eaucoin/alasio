@@ -72,6 +72,7 @@ import { isBlockedDbCommand } from "../../policy/db-guardrail.ts";
 import { extractShellCommands } from "../../policy/embedded-shell.ts";
 import { detectWorkflowWait } from "../../policy/workflow-wait.ts";
 import { withLogScope } from "../../shared/log.ts";
+import { CGROUP_DIR, type MemoryKills, ranOutOf, watchMemoryKills } from "../../shared/memory-kills.ts";
 import type { SessionError } from "../../sandbox/index.ts";
 import { outsideTraces } from "../../telemetry/index.ts";
 import { ActiveTurns, type RunningTurn, type StopReason, stopReasonText } from "../active-turns.ts";
@@ -179,6 +180,8 @@ export interface ClaudeHost {
   /** Aborts the process; the Agent SDK is given it to stop the process with. */
   readonly controller: AbortController;
   readonly sdkQuery: ClaudeQuery;
+  /** Whether the kernel killed the process for its memory, as its container's cgroup counted the kills from its start. */
+  readonly killedForMemory: MemoryKills;
   /** What the process lives in: closing it closes the process. */
   readonly scope: Scope.Closeable;
   readonly mode: ClaudeHostMode;
@@ -210,6 +213,8 @@ export interface ClaudeLiveSessionsOptions {
   readonly sessionFsBayma?: Effect.Effect<BaymaEndpoint, SessionError> | null;
   readonly folderBayma?: (scope: Omit<FolderBaymaScope, "harness">) => Effect.Effect<FolderBaymaOutcome, NoFolderWorkspaces>;
   readonly queryFactory?: ClaudeQueryFactory | undefined;
+  /** Where the container's cgroup is, which tells a process the kernel killed for its memory (../../shared/memory-kills.ts): its own, unless given. */
+  readonly cgroup?: string | undefined;
 }
 
 /** The live Claude Code processes of one working directory, one per conversation, for as long as their scope is open. */
@@ -301,6 +306,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   sessionFsBayma = null,
   folderBayma = defaultFolderBayma,
   queryFactory = query,
+  cgroup = CGROUP_DIR,
 }: ClaudeLiveSessionsOptions): Effect.fn.Return<ClaudeLiveSessions, never, Scope.Scope | ActiveTurns> {
   const scope = yield* Effect.scope;
   const activeTurns = yield* ActiveTurns;
@@ -762,8 +768,19 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     if (!host.closed) {
       yield* closeHost(host, "process exited");
     }
-    yield* settleOnExit(host, exitError);
+    yield* settleOnExit(host, endedWith(host, exitError));
   });
+
+  /**
+   * What the process ended with, `error`: said as its running out of its memory where the
+   * kernel killed it (SIGKILL, as the Agent SDK says it) as its cgroup counted a kill since it
+   * started, the container living on.
+   */
+  const endedWith = (host: ClaudeHost, error: unknown): unknown => {
+    if (error === null || !/\bSIGKILL\b/u.test(getErrorMessage(error))) return error;
+    const kill = host.killedForMemory();
+    return kill === null ? error : new Error(`Claude Code ${ranOutOf(kill)} and was killed by the kernel`);
+  };
 
   /**
    * Bash is disabled, so shell work arrives as code sent to bayma exec; workflow waits
@@ -833,6 +850,8 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         PreToolUse: [{ matcher: BAYMA_EXEC_TOOL, hooks: [hook] }],
       },
     });
+    // Its container's kills for memory counted as it starts, so one before is not taken for its own.
+    const killedForMemory = watchMemoryKills(cgroup);
     // The process outlives the turn that starts it, so it starts outside that turn's
     // trace: Claude Code's traces are its own, found from a turn by its session id.
     const sdkQuery = yield* Effect.try({
@@ -849,6 +868,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       channel,
       controller,
       sdkQuery,
+      killedForMemory,
       scope: yield* Scope.fork(scope),
       mode: resumeSession ? (resumeExists ? "resume" : "reserved") : "start",
       closed: false,
