@@ -63,10 +63,15 @@ export interface WorkerClaimsOptions {
   readonly timings?: WorkerClaimTimings | undefined;
 }
 
-/** A conversation's claim as this alasio holds it: by how many at once, and whether it was found taken over. */
+/**
+ * A conversation's claim as this alasio holds it: by how many at once, whether what the last
+ * holder left is recovered yet, and whether it was found taken over.
+ */
 interface Held {
   readonly fence: WorkerFence;
   users: number;
+  /** Done once the claim's recovery of what the last holder left is through, as it ended: whatever holds the claim waits for it before its work. */
+  readonly recovered: Deferred.Deferred<void, StoreError | WorkerClaimLost>;
   readonly lost: Deferred.Deferred<void>;
   readonly renewal: Fiber.Fiber<void>;
 }
@@ -75,7 +80,8 @@ interface Held {
 export interface WorkerClaims {
   /**
    * `work` under the conversation's claim: joining this alasio's where it holds it, taking it
-   * where none does, `recover` run first under a claim taken so, for what the last holder left.
+   * where none does, `recover` run under a claim taken so, for what the last holder left, as a
+   * fiber of the claim's own, whose end `work`, as whatever holds the claim, waits for.
    * Its result; none, without running it, where another alasio holds the claim.
    */
   readonly holding: <A, E, R>(conversationId: string, work: Effect.Effect<A, E, R>, recover: Effect.Effect<void, StoreError, R>) => Effect.Effect<Option.Option<A>, E | StoreError | WorkerClaimLost, R>;
@@ -134,24 +140,28 @@ export const makeWorkerClaims = Effect.fnUntraced(function*({ pod, timings = { l
     });
 
   /**
-   * This alasio's claim of the conversation joined, or taken where it holds none: whether it was
-   * taken now; none where another alasio holds it. Run where nothing interrupts it but `restore`'s
-   * part, the take's statement, which may wait on the claim's row, locked by a fenced write: an
-   * alasio stopping meanwhile interrupts it, the claim taken, if it was, lapsing unrecorded.
+   * This alasio's claim of the conversation joined, or taken where it holds none, its recovery
+   * of what the last holder left, `recover`, then started as a fiber of the claim's own
+   * (recovering); none where another alasio holds it. Run where nothing interrupts it but
+   * `restore`'s part, the take's statement, which may wait on the claim's row, locked by a
+   * fenced write: an alasio stopping meanwhile interrupts it, the claim taken, if it was, lapsing
+   * unrecorded.
    */
-  const join = (conversationId: string, restore: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>): Effect.Effect<Option.Option<{ readonly entry: Held; readonly taken: boolean }>, StoreError> =>
+  const join = <R>(conversationId: string, restore: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>, recover: Effect.Effect<void, StoreError, R>): Effect.Effect<Option.Option<Held>, StoreError, R> =>
     lockOf(conversationId).withPermit(Effect.gen(function*() {
       const entry = held.get(conversationId);
       if (entry) {
         entry.users += 1;
-        return Option.some({ entry, taken: false });
+        return Option.some(entry);
       }
       const fence = yield* restore(store.claimWorker(conversationId, holder, lifeMs));
       if (!fence) return Option.none();
       const lost = yield* Deferred.make<void>();
-      const made: Held = { fence, users: 1, lost, renewal: yield* FiberSet.run(renewals, renewing(fence, lost)) };
+      // Held by what took it, and by its recovery.
+      const made: Held = { fence, users: 2, recovered: yield* Deferred.make<void, StoreError | WorkerClaimLost>(), lost, renewal: yield* FiberSet.run(renewals, renewing(fence, lost)) };
       held.set(conversationId, made);
-      return Option.some({ entry: made, taken: true });
+      yield* recovering(conversationId, made, recover);
+      return Option.some(made);
     }));
 
   /** One fewer holds `entry`: the last let go of the claim, for another alasio to take at once. */
@@ -174,20 +184,41 @@ export const makeWorkerClaims = Effect.fnUntraced(function*({ pod, timings = { l
       Effect.provideService(CurrentWorkerFence, entry.fence),
     );
 
+  /**
+   * `recover` run under `entry`'s claim, just taken, as a fiber of the claim's own: whatever holds
+   * the claim, what took it among them, waits for its end (Held.recovered) before its work, so
+   * nothing acts on what the last holder left before it is recovered, as a press's steer joining
+   * the claim the conversation's worker took would; and what took it, interrupted, stops no
+   * recovery under way. It holds the claim as it runs, let go of once it ends; it ends as alasio
+   * stops (recoveries), or the claim is found taken over (under).
+   */
+  const recovering = <R>(conversationId: string, entry: Held, recover: Effect.Effect<void, StoreError, R>): Effect.Effect<void, never, R> =>
+    Effect.asVoid(FiberSet.run(recoveries, under(conversationId, entry, recover).pipe(
+      Effect.exit,
+      Effect.flatMap((exit) => Deferred.done(entry.recovered, exit)),
+      Effect.ensuring(leave(conversationId, entry)),
+    )));
+
   // Whatever holds a claim as alasio stops is interrupted first; what is left is let go of.
   yield* Effect.addFinalizer(() =>
     Effect.forEach([...held.values()], (entry) => store.releaseWorker(entry.fence).pipe(Effect.ignore), { discard: true }).pipe(
       Effect.andThen(Effect.sync(() => held.clear())),
     )
   );
+  /**
+   * The claims' recoveries, each a fiber of the claim's own (recovering), ended as alasio stops:
+   * made after the claims' letting go above, so they end before it, as a scope's finalizers run
+   * last first, and no recovery runs on past its claim's release, beside another alasio's.
+   */
+  const recoveries = yield* FiberSet.make<void>();
 
   const claims: WorkerClaims = {
     holding: (conversationId, work, recover) =>
       Effect.uninterruptibleMask((restore) =>
-        Effect.flatMap(join(conversationId, restore), Option.match({
+        Effect.flatMap(join(conversationId, restore, recover), Option.match({
           onNone: () => Effect.succeedNone,
-          onSome: ({ entry, taken }) =>
-            restore(under(conversationId, entry, taken ? Effect.andThen(recover, work) : work)).pipe(
+          onSome: (entry) =>
+            restore(under(conversationId, entry, Effect.andThen(Deferred.await(entry.recovered), work))).pipe(
               Effect.map(Option.some),
               Effect.ensuring(leave(conversationId, entry)),
             ),
@@ -201,7 +232,7 @@ export const makeWorkerClaims = Effect.fnUntraced(function*({ pod, timings = { l
       })).pipe(
         Effect.flatMap((entry) =>
           entry
-            ? Effect.asVoid(FiberSet.run(fibers, under(conversationId, entry, work).pipe(
+            ? Effect.asVoid(FiberSet.run(fibers, under(conversationId, entry, Effect.andThen(Deferred.await(entry.recovered), work)).pipe(
               Effect.catch((error) => Effect.logWarning(`what drove ${conversationId} under its worker's claim failed: ${error instanceof Error ? error.message : String(error)}`)),
               Effect.ensuring(leave(conversationId, entry)),
             )))

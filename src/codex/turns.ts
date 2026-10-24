@@ -769,7 +769,9 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
    * stopped or crashed: a turn whose job the agent finished ended so, its status message saying
    * so; a steer it was handing over asked about, not run again; the jobs it ran settled; and the
    * turn it left running on its pod attached to again in the background (reattach), under the
-   * claim.
+   * claim. Run as what took the claim recovers, before anything that joins the claim may act: so it
+   * never asks for its own conversation's claim (holding), which would wait on itself; what it
+   * starts under the claim it forks (forkHolding), to run once it is through.
    */
   const recoverLeft = (conversationId: string): Effect.Effect<void, StoreError> =>
     Effect.gen(function*() {
