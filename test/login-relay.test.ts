@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, request, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { type AddressInfo, connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -132,6 +132,88 @@ test("the relay takes only its own bearer and the model API's paths, and reads t
   }
   // Closed with its scope.
   await assert.rejects(fetch(relay.url));
+});
+
+test("the relay stopped takes no more requests and lets an answer streaming through it end, for its drain at most, then cuts it", async () => {
+  // An upstream streaming its answer: its first part at once, the rest once the test says.
+  let finish = () => {};
+  const streaming = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("first\n");
+    finish = () => res.end("last\n");
+  });
+  await new Promise<void>((resolve) => streaming.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${(streaming.address() as AddressInfo).port}`;
+  writeAuth({ tokens: { access_token: "token-1", account_id: "acct-1" } });
+  /** A relay to the streaming upstream, its drain `drainMs`: its URL's origin, and what stops it, as its pod's stop does. */
+  const relayOf = async (drainMs: number) => {
+    const scope = Effect.runSync(Scope.make());
+    const relay = await Effect.runPromise(startLoginRelay({ authFile, bearer: "relay-bearer", upstreamFor: (file, path) => {
+      const real = loginUpstream(file, path);
+      return real && { ...real, origin };
+    }, drainMs }).pipe(Scope.provide(scope), Effect.provide(Logger.layer([]))));
+    return { origin: relay.url.replace(/\/v1$/, ""), stop: () => Effect.runPromise(Scope.close(scope, Exit.void)) };
+  };
+  /** A request of the model's answer through `relayOrigin`: its body as it streams, and how it ended. */
+  const answer = async (relayOrigin: string) => {
+    const response = await fetch(`${relayOrigin}/v1/responses`, { method: "POST", headers: { authorization: "Bearer relay-bearer" }, body: "{}" });
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let body = decoder.decode((await reader.read()).value, { stream: true });
+    const ended = (async () => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return body;
+        body += decoder.decode(value, { stream: true });
+      }
+    })();
+    return { first: body, ended };
+  };
+  try {
+    // Stopped mid-answer: it takes no more, and the answer ends whole once its upstream ends it.
+    const draining = await relayOf(60_000);
+    const streamed = await answer(draining.origin);
+    assert.equal(streamed.first, "first\n");
+    let stopped = false;
+    const stopping = draining.stop().then(() => void (stopped = true));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await assert.rejects(fetch(`${draining.origin}/v1/responses`, { method: "POST", headers: { authorization: "Bearer relay-bearer" }, body: "{}" }));
+    assert.equal(stopped, false, "it stopped with an answer streaming");
+    finish();
+    assert.equal(await streamed.ended, "first\nlast\n");
+    await stopping;
+    // An answer that streams on past its drain: cut, and the relay stopped.
+    const cutting = await relayOf(200);
+    const cut = await answer(cutting.origin);
+    const startedAt = Date.now();
+    await cutting.stop();
+    assert.ok(Date.now() - startedAt < 5_000);
+    await assert.rejects(cut.ended);
+    // A connection kept open from before it stopped: its answer ends whole, the request sent on it meanwhile is answered 503, and it closes.
+    const kept = await relayOf(60_000);
+    const socket = connect(Number(new URL(kept.origin).port), "127.0.0.1");
+    let said = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk: string) => void (said += chunk));
+    const closed = new Promise<void>((resolve) => socket.on("close", () => resolve()));
+    const asked = "POST /v1/responses HTTP/1.1\r\nhost: relay\r\nauthorization: Bearer relay-bearer\r\ncontent-length: 2\r\n\r\n{}";
+    socket.write(asked);
+    for (const deadline = Date.now() + 5_000; !said.includes("first"); await new Promise((resolve) => setTimeout(resolve, 10))) assert.ok(Date.now() < deadline, said);
+    const keptStopping = kept.stop();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    socket.write(asked);
+    finish();
+    await closed;
+    await keptStopping;
+    const [first, second, ...more] = said.split(/(?=HTTP\/1\.1 )/u);
+    assert.deepEqual(more, [], said);
+    assert.match(first ?? "", /^HTTP\/1\.1 200 [\s\S]*first\n[\s\S]*last\n/u);
+    assert.match(second ?? "", /^HTTP\/1\.1 503 [^\r]*\r\nconnection: close\r\n[\s\S]*the relay is stopping/u);
+  } finally {
+    finish();
+    streaming.closeAllConnections();
+    await new Promise((resolve) => streaming.close(resolve));
+  }
 });
 
 test("the relay keeps the login fresh before it passes each request on, with the login as that left it, its body whole", async () => {

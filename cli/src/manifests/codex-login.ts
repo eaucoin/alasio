@@ -17,7 +17,7 @@
 import type { KubernetesObject, V1Deployment, V1Service, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
 import { posix } from "node:path";
 
-import { CODEX_LOGIN_KEY_VARIABLE, CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
+import { CODEX_LOGIN_DRAIN_SECONDS, CODEX_LOGIN_KEY_VARIABLE, CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
 import { imageReference } from "../images.ts";
 import {
   CODEX_LOGIN_DATABASE_SECRET,
@@ -83,6 +83,8 @@ function deployment(config: InstallConfig, environment: Environment): V1Deployme
         metadata: { labels: labels(CODEX_LOGIN_COMPONENT) },
         spec: {
           automountServiceAccountToken: false,
+          // Long enough for the answers streaming through it as it stops to end (CODEX_LOGIN_DRAIN_SECONDS), and its telemetry to be sent.
+          terminationGracePeriodSeconds: CODEX_LOGIN_DRAIN_SECONDS + 10,
           // As a running turn's Codex calls the model through it.
           ...priority("turn"),
           securityContext: restrictedPod(uid, gid),

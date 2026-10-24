@@ -3915,6 +3915,8 @@ describe("the relay of an environment's Codex login", () => {
     assert.deepEqual(container(relay).command, ["node", "/opt/alasio/src/codex/relay-main.ts"]);
     assert.equal(container(relay).image, container(one<V1Deployment>(objects, "Deployment", "alasio")).image);
     assert.equal(spec?.automountServiceAccountToken, false);
+    // Given its drain, and a little more, to stop in.
+    assert.equal(spec?.terminationGracePeriodSeconds, 130);
     const env = Object.fromEntries((container(relay).env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
     assert.deepEqual([env["HOME"], env["CODEX_HOME"], env["ALASIO_KEEP_CODEX_LOGIN"], env["ALASIO_DATABASE_URL_FILE"]], ["/var/lib/alasio/home", "/var/lib/alasio/home/.codex", "1", "/run/alasio/database/url"]);
     assert.deepEqual(env["ALASIO_CODEX_LOGIN_KEY"], { secretKeyRef: { name: "alasio-codex-login-key", key: "key" } });

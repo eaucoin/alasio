@@ -24,6 +24,11 @@
  * no pod ever holds or refreshes the login, which alasio and the relay refresh one at a time
  * under the store's lock (./login-refresh.ts), as a ChatGPT refresh token is single-use; the
  * relay keeps the login fresh before each request it passes on (`fresh`).
+ *
+ * Stopped, it takes no more requests, answering one that comes on a connection kept open 503,
+ * that connection closed, and lets those it passes on run to their end, as a model's answer
+ * streams for minutes, for CODEX_LOGIN_DRAIN_SECONDS at most, each connection closed as its
+ * answer ends, then cuts those left, so a rollout of its pod cuts no turn's answer short.
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -35,6 +40,7 @@ import { Effect, Schema, type Scope } from "effect";
 
 import { verifyToken } from "../binder/tokens.ts";
 import { conversationOfHarnessKey } from "../gateway/names.ts";
+import { CODEX_LOGIN_DRAIN_SECONDS } from "../harness/names.ts";
 export { CODEX_LOGIN_PORT } from "../harness/names.ts";
 import { withLogScope } from "../shared/log.ts";
 
@@ -61,6 +67,8 @@ export interface LoginRelayOptions {
   /** Where it listens: alasio's loopback, on a port of its own, unless given. */
   readonly listen?: { readonly host: string; readonly port: number } | undefined;
   readonly upstreamFor?: (authFile: string, path: string) => LoginUpstream | null;
+  /** How long its requests passed on run on once it is stopped, before those left are cut: CODEX_LOGIN_DRAIN_SECONDS unless a test says. */
+  readonly drainMs?: number | undefined;
 }
 
 
@@ -159,12 +167,22 @@ export const startLoginRelay: StartLoginRelay = Effect.fnUntraced(function*({
   listen = { host: "127.0.0.1", port: 0 },
   upstreamFor = loginUpstream,
   fresh = Effect.void,
+  drainMs = CODEX_LOGIN_DRAIN_SECONDS * 1000,
 }: LoginRelayOptions) {
   const request = (options: RequestOptions, onResponse: (response: IncomingMessage) => void) => (options.protocol === "http:" ? httpClient : httpsClient).request(options, onResponse);
   const expected = `Bearer ${bearer}`;
   const refusalOf = authorize ?? ((authorization: string | undefined) => (sameSecret(authorization, expected) ? null : "unknown bearer"));
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
+  // Whether it is stopping: no request is taken on a connection kept open from before, and each closes as its answer ends.
+  let stopping = false;
   const server = createServer((req, res) => {
+    if (stopping) {
+      res.writeHead(503, { connection: "close" }).end("the relay is stopping");
+      return;
+    }
+    res.on("finish", () => {
+      if (stopping) req.socket.end();
+    });
     const refusal = refusalOf(req.headers.authorization);
     if (refusal !== null) {
       // Why, to alasio's log alone: the caller is told it is refused, and nothing of why.
@@ -209,8 +227,14 @@ export const startLoginRelay: StartLoginRelay = Effect.fnUntraced(function*({
       server.once("error", (cause) => resume(Effect.fail(new LoginRelayError({ cause }))));
       server.listen(listen.port, listen.host, () => resume(Effect.void));
     }),
+    // Taking no more, its idle connections closed; those passing a request on cut once they have had drainMs.
     () => Effect.callback<void>((resume) => {
-      server.close(() => resume(Effect.void));
+      stopping = true;
+      const cut = setTimeout(() => server.closeAllConnections(), drainMs);
+      server.close(() => {
+        clearTimeout(cut);
+        resume(Effect.void);
+      });
     }),
   );
   // A server listening on a TCP port has an AddressInfo address.

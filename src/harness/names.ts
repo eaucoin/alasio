@@ -19,6 +19,13 @@ export const HARNESS_NAMES = Object.freeze([CODEX_HARNESS, CLAUDE_HARNESS] as co
 /** The port alasio relays its Codex login to its harness pools' pods on (../codex/login-relay.ts). */
 export const CODEX_LOGIN_PORT = 4320;
 
+/**
+ * How long the relay of the Codex login, told to stop, lets the requests it passes on run to
+ * their end, a model's answer streaming as long as it does, before it cuts those left
+ * (../codex/login-relay.ts): its pod is given this and a little more to stop in.
+ */
+export const CODEX_LOGIN_DRAIN_SECONDS = 120;
+
 /** The variable the relay of the Codex login is given the key it checks the turns' tokens by in, in hexadecimal (poolLoginKey). */
 export const CODEX_LOGIN_KEY_VARIABLE = "ALASIO_CODEX_LOGIN_KEY";
 
