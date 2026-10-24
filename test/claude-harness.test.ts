@@ -1249,6 +1249,33 @@ test("a reused process's folder bayma is bound before each of its turns, and a t
   await closeAll();
 });
 
+test("a session filesystem's process is reused across turns whose bayma bearer is minted anew, its MCP servers as it started with them: nothing of its live MCP session is changed as a turn starts", async () => {
+  const persistence = createPersistence();
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  let minted = 0;
+  const { liveSessions, closeAll } = openLiveSessions({
+    workingDirectory: "/work",
+    sessions: { sessionExists: () => Effect.succeed(true) },
+    queryFactory: cli.queryFactory,
+    folderBayma,
+    // Bound before each turn, its endpoint's bearer minted anew each time, as a caller's token is.
+    sessionFsBayma: Effect.sync(() => ({ url: "http://gateway.test/mcp", headers: { Authorization: `Bearer token-${(minted += 1)}` } })),
+  }, activeTurns);
+  const run = async (prompt: string) => {
+    const turn = runTurn(liveSessions, turnParams(persistence, { prompt }));
+    const received = await cli.nextPrompt();
+    cli.emit(successResult({ result: "done", session_id: "s-1", user_message_uuids: [received.uuid] }));
+    await turn;
+  };
+  cli.emit(initMessage("s-1"));
+  for (const prompt of ["one", "two", "three"]) await run(prompt);
+  assert.deepEqual([minted, cli.state.created, cli.state.closed], [3, 1, 0], "bound before each turn, the one process kept");
+  // Its MCP server as the process started with it, the first bearer's: none given it anew.
+  assert.deepEqual(cli.state.options[0]?.mcpServers, { bayma: { type: "http", url: "http://gateway.test/mcp", headers: { Authorization: "Bearer token-1" } } });
+  await closeAll();
+});
+
 test("steering a Claude-started turn is answered in that turn's own reply", async () => {
   const persistence = createPersistence();
   const activeTurns = makeActiveTurns();

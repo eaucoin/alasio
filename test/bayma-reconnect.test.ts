@@ -290,16 +290,20 @@ test("Claude Code's process reaches its bayma's tools on the turn after its bind
   }
 });
 
-test("Claude Code's process reaches its bayma's tools past the life of the first bearer it reached them with, its MCP servers as it started with them, nothing given it anew", { timeout: 120_000 }, async () => {
+test("Claude Code's process reaches its bayma's tools past the life of the first bearer it reached them with, its MCP servers as it started with them, nothing given it anew, its live MCP session never made anew", { timeout: 120_000 }, async () => {
   const stand = await bayma();
   const claude = await claudeProcess(stand.endpoint);
   try {
     assert.match(await claude.turn("PING"), /pong from pod 1/u);
-    await stand.later();
-    assert.equal(stand.takes(stand.first), false, "the first bearer has lapsed");
-    // A turn of the process's, as one it starts on its own to report a background task is.
-    assert.match(await claude.turn("PING"), /pong from pod 1/u);
+    // Turns over two of a bearer's lives, as alasio's or the process's own.
+    for (const _ of [1, 2]) {
+      await stand.later();
+      assert.equal(stand.takes(stand.first), false, "the first bearer has lapsed");
+      assert.match(await claude.turn("PING"), /pong from pod 1/u);
+    }
     assert.deepEqual(stand.asked.filter((asked) => asked === "refused"), []);
+    // The one MCP session it initialized, used throughout: no call refused, none made anew.
+    assert.deepEqual(stand.asked.filter((asked) => asked.startsWith("initialize") || asked.includes("does not know")), ["initialize of pod 1"]);
   } finally {
     await claude.close();
     await stand.close();
