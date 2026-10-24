@@ -1,7 +1,7 @@
 {
   "uid": "alasio-harnesses",
   "title": "Harnesses",
-  "description": "The conversations' harnesses as the sandbox gateway binds and releases them in their pools, from its metrics; the turns alasio ran again as their harness instance was lost under them, and how long a turn took to its harness's first output, from alasio's; and what scales alasio, what waits on its topics and its harnesses bound, as KEDA measures them, beside its starts. Main's, or a branch environment's, as Branch chooses.",
+  "description": "The conversations' harnesses as the sandbox gateway binds and releases them in their pools, from its metrics; the turns alasio ran again as their harness instance was lost under them, and how long a turn took to its harness's first output, from alasio's; and what scales alasio, what waits on its topics and its harnesses bound, as KEDA measures them, beside its starts; and how its replicas share the work: the rebalances of their groups on the log, how long they waited for conversations' claims, and the claims they lost. Main's, or a branch environment's, as Branch chooses.",
   "tags": [
     "alasio"
   ],
@@ -1108,6 +1108,258 @@
         "defaults": {
           "unit": "short",
           "displayName": "${__field.labels.started}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "alasio's replicas",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Rebalances",
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 8,
+        "h": 8
+      },
+      "description": "The rebalances of alasio's groups on the log its replicas took part in, Telegram's updates' among them, each generation of a group a replica joined: as it started, and as replicas came and went or a topic grew.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['messaging.consumer.group.name'] as consumer_group, sum(added) as rebalances\nfrom (\nselect TimeUnix, MetricName, Attributes, Value - coalesce(lag(Value) over series, 0) as added\nfrom otel.metrics_sum where MetricName = 'alasio.log.rebalances' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, MetricName, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "consumer_group",
+              "text": "consumer_group",
+              "type": "string"
+            },
+            {
+              "selector": "rebalances",
+              "text": "rebalances",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.consumer_group}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Claim waits",
+      "gridPos": {
+        "x": 8,
+        "y": 41,
+        "w": 8,
+        "h": 8
+      },
+      "description": "How long, on average, alasio's replicas waited for a conversation's claim, by how it was answered: taken where none held it, joined where the replica held it, held where another does; and how long a turn run outside a worker, a command's or a goal's, waited for it, asking again while another replica's worker held it, until it ran or was refused.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, case MetricName when 'alasio.turn.claim_wait' then 'turn ' || Attributes['alasio.turn.claim_wait.outcome'] else Attributes['alasio.worker_claim.outcome'] end as claim, sum(added_sum) / sum(added_count) as seconds\nfrom (\nselect TimeUnix, MetricName, Attributes, Sum - coalesce(lag(Sum) over series, 0) as added_sum, Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count\nfrom otel.metrics_histogram where MetricName in ('alasio.worker_claim.wait', 'alasio.turn.claim_wait') and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, MetricName, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added_count > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "claim",
+              "text": "claim",
+              "type": "string"
+            },
+            {
+              "selector": "seconds",
+              "text": "seconds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "displayName": "${__field.labels.claim}",
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "showPoints": "always",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Claims lost",
+      "gridPos": {
+        "x": 16,
+        "y": 41,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Conversations' claims alasio's replicas lost: found taken over by another replica as they were renewed (lost), or let go of as a replica's pod started its alasio again (lapsed); and the conversations whose claim no replica held, as theirs stopped or crashed, taken up by a replica's sweep (taken up).",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, case MetricName when 'alasio.worker_claim.unheld' then 'taken up' else Attributes['alasio.worker_claim.outcome'] end as claim, sum(added) as claims\nfrom (\nselect TimeUnix, MetricName, Attributes, Value - coalesce(lag(Value) over series, 0) as added\nfrom otel.metrics_sum where MetricName in ('alasio.worker_claim.losses', 'alasio.worker_claim.unheld') and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, MetricName, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "claim",
+              "text": "claim",
+              "type": "string"
+            },
+            {
+              "selector": "claims",
+              "text": "claims",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.claim}",
           "custom": {
             "drawStyle": "bars",
             "fillOpacity": 80,
