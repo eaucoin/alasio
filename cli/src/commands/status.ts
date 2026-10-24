@@ -28,6 +28,7 @@ import { type ComputeTimes, computeTimes, type TenantView, tenantView } from "..
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
 import { branchNamespaces } from "../branches.ts";
 import { describeHarnesses, harnessesOf } from "../bound-harnesses.ts";
+import { describeWakes, wakesOf } from "../wakes.ts";
 import { describeFolders, folderInstances } from "../folders.ts";
 import { installConfig } from "../install.ts";
 import { readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "../secrets.ts";
@@ -399,22 +400,24 @@ export const status = Command.make("status", {}, () =>
           // A DaemonSet runs a pod on every node it schedules to, of no scale of its own.
           const scaler = of(scaledObjects, workload, ({ spec }) => spec.scaleTargetRef.name);
           const scale = workload.kind === "DaemonSet" ? "" : `${describeScale(workload, scaler)}; `;
-          const sizing = `    ${scale}${describeSizing(workload, of(sizings, workload, ({ spec }) => spec.targetRef.name))}`;
+          // Of an environment's alasio KEDA scales, what scales it: its triggers now, and when it was last woken.
+          const wakes = workload.kind === "Deployment" && workload.metadata?.name === RELEASE && scaler ? describeWakes(yield* wakesOf(scaler)) : [];
+          const sizing = [`    ${scale}${describeSizing(workload, of(sizings, workload, ({ spec }) => spec.targetRef.name))}`, ...wakes.map((line) => `    ${line}`)];
           if (state._tag === "Ready") {
             const { said, ready } = describeReady(workload, computes, scaler, pools);
             if (!ready) notReady += 1;
             yield* Console.log(`  ${describeRef(refOf(workload))}: ${said}`);
-            yield* Console.log(sizing);
+            for (const line of sizing) yield* Console.log(line);
             continue;
           }
           if (state._tag === "Waiting" && (yield* waking(workload, scaler))) {
             yield* Console.log(`  ${describeRef(refOf(workload))}: waking, ${state.status}`);
-            yield* Console.log(sizing);
+            for (const line of sizing) yield* Console.log(line);
             continue;
           }
           notReady += 1;
           yield* Console.log(`  ${describeRef(refOf(workload))}: ${state._tag === "Waiting" ? state.status : state.reason}`);
-          yield* Console.log(sizing);
+          for (const line of sizing) yield* Console.log(line);
           for (const line of yield* diagnose(refOf(workload))) yield* Console.log(`    ${line}`);
         }
         // Where the node agents run, the CPU baseline sessions are held to, and the nodes that fall short of it.
@@ -481,7 +484,8 @@ export const status = Command.make("status", {}, () =>
         "another node; a lock a workspace's file held on a node that died, through that node's mount, holds for up to about seven minutes, " +
         "until workspace storage cleans the sessions of its clients that died), waking (a compute or the loader whose pod starts, within " +
         "its Deployment's progress deadline), or what it is at and " +
-        "why; its replicas, and its scale where KEDA moves it; and its pods' requests, beside " +
+        "why; its replicas, and its scale where KEDA moves it, and, of an environment's alasio, each of its triggers' value now, as KEDA's " +
+        "metrics say it, and when it was last woken, and by which, while KEDA's record of it lasts, or else when it last started; and its pods' requests, beside " +
         "what VPA recommends once it has measured them; the CPU baseline sessions are held to, and the nodes that lack it, and the gVisor releases kept, with the snapshots naming each; where the sandbox gateway serves folder conversations' instances, each, " +
         "bound or released, its pod, how long it has been bound, its bayma's last exec, and its binds' last failure, and whether three in a row hold it until asked; each environment's bound conversation harnesses, " +
         "the pod and pool each is bound in, for how long, and whether its host says a turn runs in it, its harness works in the background, " +

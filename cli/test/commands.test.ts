@@ -699,6 +699,56 @@ test("status says how Telegram delivers each bot's updates, and fails when it do
   assert.equal(line(undelivered), `  main's bot @${BOT}: not delivered: alasio up registers it`);
 });
 
+test("status says, of an alasio KEDA scales, each of its triggers' value now, as KEDA's metrics say it, and when it was last woken: by KEDA's event while it lasts, else at its last start, its cause not kept", async (t) => {
+  const { alasio, kube } = await installed(t);
+  const lines = async () => {
+    const run = await alasio(["status"]);
+    succeeded(run);
+    const at = run.printed.indexOf("  Deployment alasio/alasio: ready");
+    return run.printed.slice(at + 1, at + 4);
+  };
+  // Scaled by KEDA on its Telegram topic's lag and its harnesses bound, as its ScaledObject says.
+  const triggers = [
+    { type: "kafka", metadata: { topic: "alasio.main.telegram", consumerGroup: "alasio-main", lagThreshold: "20" } },
+    { type: "metrics-api", metadata: { url: "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio", valueLocation: "bound", targetValue: "1000000" } },
+  ];
+  kube.put("scaledobjects", {
+    apiVersion: "keda.sh/v1alpha1",
+    kind: "ScaledObject",
+    metadata: { name: "alasio", namespace: "alasio", labels: { "alasio.dev/installation": "alasio" } },
+    spec: { scaleTargetRef: { name: "alasio" }, minReplicaCount: 0, maxReplicaCount: 2, triggers },
+  });
+  // Before KEDA has made its HPA, and before alasio has kept a start.
+  assert.deepEqual(await lines(), ["    1 replica of 0 to 2, scaled by KEDA; requests 250m CPU and 768 MiB", "    its triggers: not seen, as KEDA scales it on no metrics yet", "    its last start: not kept"]);
+  // KEDA's HPA, a metric of each trigger, in their order, and their values now; and the start alasio kept.
+  kube.put("horizontalpodautoscalers", {
+    apiVersion: "autoscaling/v2",
+    kind: "HorizontalPodAutoscaler",
+    metadata: { name: "keda-hpa-alasio", namespace: "alasio" },
+    spec: { metrics: [{ type: "External", external: { metric: { name: "s0-kafka-alasio-main-telegram" } } }, { type: "External", external: { metric: { name: "s1-metric-api-bound" } } }] },
+  });
+  for (const [metric, value] of [["s0-kafka-alasio-main-telegram", "3"], ["s1-metric-api-bound", "1"]] as const) {
+    kube.put(metric, { apiVersion: "external.metrics.k8s.io/v1beta1", kind: "ExternalMetricValue", metadata: { name: "value", namespace: "alasio", labels: { "scaledobject.keda.sh/name": "alasio" } }, metricName: metric, value });
+  }
+  const started = kube.get("/api/v1/namespaces/alasio/configmaps/alasio-started");
+  assert.ok(started);
+  started["data"] = { startedAt: "2026-10-24T10:00:00.000Z" };
+  assert.deepEqual((await lines()).slice(1), ["    its triggers: 3 waiting on alasio.main.telegram, 1 of its harnesses bound", "    last started at 2026-10-24T10:00:00.000Z, its cause not kept"]);
+  // KEDA's event of waking it, while it lasts: the last of them, with what it says woke it.
+  for (const [name, at] of [["alasio.1", "2026-10-24T09:00:00Z"], ["alasio.2", "2026-10-24T11:00:00Z"]] as const) {
+    kube.put("events", {
+      apiVersion: "v1",
+      kind: "Event",
+      metadata: { name, namespace: "alasio" },
+      involvedObject: { kind: "ScaledObject", name: "alasio", namespace: "alasio" },
+      reason: "KEDAScaleTargetActivated",
+      message: `Scaled apps/v1.Deployment alasio/alasio from 0 to 1, triggered by ${name === "alasio.2" ? "kafkaScaler" : "metricsAPIScaler"}`,
+      lastTimestamp: at,
+    });
+  }
+  assert.deepEqual((await lines()).slice(2), ["    last woken at 2026-10-24T11:00:00.000Z, by kafkaScaler"]);
+});
+
 test("status says each workload's replicas and scale, its requests beside VPA's recommendation, and the cluster's memory, and where no metrics server measures them", async (t) => {
   const { alasio, kube } = await installed(t);
   const lines = async () => {

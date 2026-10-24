@@ -65,6 +65,8 @@ const KINDS = {
   Job: { apiVersion: "batch/v1", plural: "jobs", namespaced: true },
   CronJob: { apiVersion: "batch/v1", plural: "cronjobs", namespaced: true },
   ScaledObject: { apiVersion: "keda.sh/v1alpha1", plural: "scaledobjects", namespaced: true },
+  // What KEDA makes of a ScaledObject, whose metrics name its triggers', in their order.
+  HorizontalPodAutoscaler: { apiVersion: "autoscaling/v2", plural: "horizontalpodautoscalers", namespaced: true },
   TriggerAuthentication: { apiVersion: "keda.sh/v1alpha1", plural: "triggerauthentications", namespaced: true },
   VerticalPodAutoscaler: { apiVersion: "autoscaling.k8s.io/v1", plural: "verticalpodautoscalers", namespaced: true },
   // What the cluster's metrics server measures its pods and nodes using now.
@@ -212,6 +214,8 @@ export class KubeApi extends Context.Service<KubeApi, {
   readonly portForward: (target: PodRef, port: number, connection: Duplex) => Effect.Effect<void, KubeApiError>;
   /** The pods the kubelet of `node` lists as its own, as the API server's proxy of it answers. */
   readonly nodePods: (node: string) => Effect.Effect<readonly V1Pod[], KubeApiError>;
+  /** The values now of the external metric `name` in `namespace`, of what `labelSelector` selects, as the API's external metrics answer them (KEDA's). */
+  readonly externalMetric: (namespace: string, name: string, labelSelector: string) => Effect.Effect<readonly string[], KubeApiError>;
 }>()("alasio/kube/KubeApi") {
   /** The API `kubeconfig` reaches. */
   static readonly layer = (kubeconfig: KubeconfigRef): Layer.Layer<KubeApi, KubeconfigUnusable> =>
@@ -397,6 +401,12 @@ function makeKubeApi(kubeConfig: KubeConfig): KubeApi["Service"] {
       }),
     get: <T extends KubernetesObject>(ref: ObjectRef) =>
       json<T>({ method: "GET", path: objectPath(ref) }).pipe(Effect.catchIf(hasStatus(404), () => Effect.succeed(null))),
+    externalMetric: (namespace, name, labelSelector) =>
+      json<{ readonly items?: readonly { readonly value: string }[] | null }>({
+        method: "GET",
+        path: `/apis/external.metrics.k8s.io/v1beta1/namespaces/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+        query: { labelSelector },
+      }).pipe(Effect.map(({ items }) => (items ?? []).map(({ value }) => value))),
     nodePods: (node) =>
       json<{ readonly items?: readonly V1Pod[] | null }>({ method: "GET", path: `/api/v1/nodes/${encodeURIComponent(node)}/proxy/pods` }).pipe(Effect.map(({ items }) => items ?? [])),
     list: <T extends KubernetesObject>(kind: Kind, { namespace, labelSelector, fieldSelector }: ListOptions = {}) =>
