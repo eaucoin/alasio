@@ -32,7 +32,7 @@ import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, MAIN_ENVIRONMENT, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT, WORKSPACE_MOUNT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { pageserverName } from "../../cli/src/manifests/neon.ts";
-import { TELEGRAM_PARTITIONS } from "../../cli/src/manifests/config.ts";
+import { HOST_BAYMA_IMAGE, TELEGRAM_PARTITIONS } from "../../cli/src/manifests/config.ts";
 import { environmentAccess, environmentName, telegramTopic } from "../../cli/src/manifests/log.ts";
 import { WEBHOOK, WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { neonStack } from "../../neon/test/stack.ts";
@@ -665,13 +665,34 @@ if (inShard("upgrade")) {
 
     // On this release's bayma, the folder conversation's REPL sessions, its instance let go, as
     // an idle one is, come back whole: the box's path once its folders run what this release pins.
-    test("upgraded, on this release's bayma: the folder conversation's REPL sessions, its instance let go, come back whole, its thread counting on", { timeout: 30 * 60_000 }, async () => {
+    // Its instance made on the release before keeps its pod, and that pod's bayma, across the
+    // upgrade until it is let go, and a bayma refuses another's snapshot of its processes: so it is
+    // let go first, and the sessions set in the instance made anew, on this release's bayma.
+    test("upgraded, on this release's bayma: the folder conversation's REPL sessions, its instance let go, come back whole, its thread counting on", { timeout: 30 * 60_000 }, async (t) => {
+      /** Each of the folder chat's instances still running, and the bayma image it runs, as kubelet says it. */
+      const folderImages = async () =>
+        (await folderInstances()).filter((pod) => !pod.metadata?.deletionTimestamp)
+          .map((pod) => `${pod.metadata?.name} runs ${pod.status?.containerStatuses?.find(({ name }) => name === "bayma")?.imageID ?? "no bayma yet"}`).join("; ");
+      const conversation = folderInstance.key.slice(folderInstance.key.indexOf(":", "folder:".length) + 1);
+      const restarted = /its folder instance of [^\n]+ is let go, its REPL sessions saved, its failed binds forgotten; the next message makes it anew/u;
+      assert.match(await alasioOk("folder", "restart", conversation), restarted);
       const value = `kept on this release by ${folderInstance.name}`;
       const set = await inAlasio<FolderReplsSet>("./folder-repl.ts", "set", GATEWAY_MCP, await mainKeyToken(folderInstance.key), value);
-      const conversation = folderInstance.key.slice(folderInstance.key.indexOf(":", "folder:".length) + 1);
-      assert.match(await alasioOk("folder", "restart", conversation), /its folder instance of [^\n]+ is let go, its REPL sessions saved, its failed binds forgotten; the next message makes it anew/u);
+      const setOn = await folderImages();
+      t.diagnostic(`the sessions set as ${setOn}`);
+      // The one instance the sessions are set in, made anew, runs the bayma this release pins.
+      const running = (await folderInstances()).filter((pod) => !pod.metadata?.deletionTimestamp);
+      assert.equal(running.length, 1, setOn);
+      assert.match(running[0]?.spec?.containers.find(({ name }) => name === "bayma")?.image ?? "", new RegExp(`@${HOST_BAYMA_IMAGE.digest}$`, "u"), setOn);
+      assert.match(await alasioOk("folder", "restart", conversation), restarted);
       const seen = await inAlasio<FolderReplsRead>("./folder-repl.ts", "read", GATEWAY_MCP, await mainKeyToken(folderInstance.key), set.python, set.bun);
-      assert.deepEqual([seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed], [value, value, true, value, value], JSON.stringify(seen));
+      const readOn = await folderImages();
+      t.diagnostic(`the sessions read as ${readOn}`);
+      assert.deepEqual(
+        [seen.python.live, seen.python.checkpointed, seen.python.counting, seen.bun.live, seen.bun.checkpointed],
+        [value, value, true, value, value],
+        `${JSON.stringify(seen)}; set as ${setOn}; read as ${readOn}`,
+      );
       assert.ok((seen.python.count ?? 0) > set.count, `the count went on from ${set.count}: ${JSON.stringify(seen)}`);
       for (const notice of [seen.python.notice, seen.bun.notice]) assert.match(notice ?? "", FOLDER_CAME_BACK_WHOLE);
     });
