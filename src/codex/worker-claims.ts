@@ -27,13 +27,31 @@
  * it (lapseOwn), as a container restarted in its pod leaves them, its process gone: so its
  * conversations are taken up at once, not WORKER_CLAIM_LIFE after the crash. The pod's name, not
  * its hostname, which two alasios share under hostNetwork, so none lets go of another's claims.
+ *
+ * Each ask for a claim is timed (CLAIM_WAITS), from the ask to its answer, the conversation's
+ * lock in the alasio and its claim's row in the store waited on, by how it was answered; and each
+ * claim lost is counted (CLAIM_LOSSES): taken over, or let go of as the pod's next process starts.
+ * By the pod alone, not the conversation, which would make a series of each; the ask's span
+ * (alasio.worker_claim.join) and the log line of a claim taken over say which conversation.
  */
 import { randomUUID } from "node:crypto";
 
-import { Deferred, Duration, Effect, Fiber, FiberSet, Option, Schema, Semaphore } from "effect";
+import { Clock, Deferred, Duration, Effect, Fiber, FiberSet, Option, Schema, Semaphore } from "effect";
 
 import type { StoreError } from "../persistence/sql.ts";
 import { CurrentWorkerFence, Store, type WorkerFence } from "../persistence/store.ts";
+import { meter, withAlasioSpan } from "../telemetry/index.ts";
+
+export const CLAIM_WAITS = "alasio.worker_claim.wait";
+const claimWaits = meter.createHistogram(CLAIM_WAITS, {
+  description: "How long an ask for a conversation's worker's claim took to be answered, on the conversation's lock in alasio and its claim's row in the store, by the pod asking and outcome (taken: none held it; joined: this alasio held it; held: another alasio does)",
+  unit: "s",
+});
+export const CLAIM_LOSSES = "alasio.worker_claim.losses";
+const claimLosses = meter.createCounter(CLAIM_LOSSES, {
+  description: "Claims of conversations' workers a pod's alasio lost, by the pod and outcome (lost: found taken over by another alasio as it was renewed; lapsed: let go of as the pod's next process started)",
+  unit: "{claim}",
+});
 
 /** How long a worker's claim lasts unless renewed. */
 export const WORKER_CLAIM_LIFE = Duration.seconds(60);
@@ -131,6 +149,7 @@ export const makeWorkerClaims = Effect.fnUntraced(function*({ pod, timings = { l
           Effect.catch((error) => Effect.as(Effect.logWarning(`could not renew the claim of ${fence.conversationId}'s worker, trying again: ${error.message}`), true)),
         );
         if (!still) {
+          claimLosses.add(1, { "k8s.pod.name": pod, "alasio.worker_claim.outcome": "lost" });
           yield* Effect.logWarning(new WorkerClaimLost({ conversationId: fence.conversationId }).message);
           forget(fence);
           yield* Deferred.succeed(lost, undefined);
@@ -145,14 +164,23 @@ export const makeWorkerClaims = Effect.fnUntraced(function*({ pod, timings = { l
    * (recovering); none where another alasio holds it. Run where nothing interrupts it but
    * `restore`'s part, the take's statement, which may wait on the claim's row, locked by a
    * fenced write: an alasio stopping meanwhile interrupts it, the claim taken, if it was, lapsing
-   * unrecorded.
+   * unrecorded. Timed (CLAIM_WAITS), from the ask to its answer.
    */
   const join = <R>(conversationId: string, restore: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>, recover: Effect.Effect<void, StoreError, R>): Effect.Effect<Option.Option<Held>, StoreError, R> =>
+    Effect.flatMap(Clock.currentTimeMillis, (asked) =>
+      Effect.flatMap(joining(conversationId, restore, recover), (joined) =>
+        Effect.flatMap(Clock.currentTimeMillis, (answered) => {
+          const outcome = Option.match(joined, { onNone: () => "held", onSome: ({ taken }) => (taken ? "taken" : "joined") });
+          claimWaits.record((answered - asked) / 1_000, { "k8s.pod.name": pod, "alasio.worker_claim.outcome": outcome });
+          return Effect.as(Effect.annotateCurrentSpan({ "alasio.worker_claim.outcome": outcome }), Option.map(joined, ({ entry }) => entry));
+        }))).pipe(withAlasioSpan("alasio.worker_claim.join", { attributes: { "alasio.conversation.id": conversationId, "k8s.pod.name": pod } }));
+  /** join's ask, untimed: the claim, and whether it was taken now. */
+  const joining = <R>(conversationId: string, restore: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>, recover: Effect.Effect<void, StoreError, R>): Effect.Effect<Option.Option<{ readonly entry: Held; readonly taken: boolean }>, StoreError, R> =>
     lockOf(conversationId).withPermit(Effect.gen(function*() {
       const entry = held.get(conversationId);
       if (entry) {
         entry.users += 1;
-        return Option.some(entry);
+        return Option.some({ entry, taken: false });
       }
       const fence = yield* restore(store.claimWorker(conversationId, holder, lifeMs));
       if (!fence) return Option.none();
@@ -161,7 +189,7 @@ export const makeWorkerClaims = Effect.fnUntraced(function*({ pod, timings = { l
       const made: Held = { fence, users: 2, recovered: yield* Deferred.make<void, StoreError | WorkerClaimLost>(), lost, renewal: yield* FiberSet.run(renewals, renewing(fence, lost)) };
       held.set(conversationId, made);
       yield* recovering(conversationId, made, recover);
-      return Option.some(made);
+      return Option.some({ entry: made, taken: true });
     }));
 
   /** One fewer holds `entry`: the last let go of the claim, for another alasio to take at once. */
@@ -239,7 +267,13 @@ export const makeWorkerClaims = Effect.fnUntraced(function*({ pod, timings = { l
             : Effect.logWarning(`nothing was forked under ${conversationId}'s worker's claim, as this alasio holds it no longer`)
         ),
       ),
-    lapseOwn: Effect.tap(store.lapseWorkersOf(pod), (lapsed) => (lapsed > 0 ? Effect.logInfo(`let go of the claims of ${lapsed} conversation(s) an earlier process of pod ${pod} held`) : Effect.void)),
+    lapseOwn: Effect.tap(store.lapseWorkersOf(pod), (lapsed) =>
+      lapsed > 0
+        ? Effect.andThen(
+          Effect.sync(() => claimLosses.add(lapsed, { "k8s.pod.name": pod, "alasio.worker_claim.outcome": "lapsed" })),
+          Effect.logInfo(`let go of the claims of ${lapsed} conversation(s) an earlier process of pod ${pod} held`),
+        )
+        : Effect.void),
   };
   return claims;
 });

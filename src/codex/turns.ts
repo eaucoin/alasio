@@ -72,6 +72,17 @@ export interface TurnsOptions {
 const DIRECT_CLAIM_WAIT = Duration.seconds(10);
 const DIRECT_CLAIM_EVERY = Duration.millis(250);
 
+export const DIRECT_CLAIM_WAITS = "alasio.turn.claim_wait";
+const directClaimWaits = meter.createHistogram(DIRECT_CLAIM_WAITS, {
+  description: "How long a turn run outside a worker, a command's or a goal's, waited for its conversation's worker's claim, asked again while another alasio's worker held it, by the pod asking and outcome (ran; refused: still held past the wait)",
+  unit: "s",
+});
+export const UNHELD_TAKEN = "alasio.worker_claim.unheld";
+const unheldTaken = meter.createCounter(UNHELD_TAKEN, {
+  description: "Conversations with work left whose worker's claim no alasio held, as their alasio stopped or crashed, taken up by a pod's sweep, by the pod",
+  unit: "{conversation}",
+});
+
 /** A turn's claim of its conversation, held by another alasio's worker, as it asked. */
 class ClaimHeld extends Schema.TaggedError<ClaimHeld>()("ClaimHeld", {}) {}
 
@@ -480,20 +491,33 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
   /**
    * A turn of the conversation's run outside a worker, as a fiber of the service's, for alasio's
    * stopping to reach, under the conversation's claim: asked for again while another alasio's
-   * worker holds it, for DIRECT_CLAIM_WAIT, and refused past it.
+   * worker holds it, for DIRECT_CLAIM_WAIT, and refused past it. Its wait timed
+   * (DIRECT_CLAIM_WAITS): to what it first runs under the claim, what the last holder left or
+   * the turn, or to its refusal.
    */
   const runDirect = (conversationId: string, turn: Effect.Effect<boolean, TurnError>): Effect.Effect<boolean, TurnError> =>
-    Effect.flatMap(
-      FiberSet.run(
-        directTurns,
-        claims.holding(conversationId, turn, recoverLeft(conversationId)).pipe(
-          Effect.flatMap(Option.match({ onNone: () => Effect.fail(new ClaimHeld()), onSome: Effect.succeed })),
-          Effect.retry({ while: (error) => error._tag === "ClaimHeld", schedule: Schedule.max([Schedule.spaced(DIRECT_CLAIM_EVERY), Schedule.during(DIRECT_CLAIM_WAIT)]) }),
-          Effect.catchTag("ClaimHeld", () => Effect.fail(new ConversationBusy({ message: "Another alasio is working in this conversation; send this again once it is through." }))),
+    Effect.flatMap(Clock.currentTimeMillis, (asked) => {
+      let timed = false;
+      const waited = (outcome: "ran" | "refused") =>
+        Effect.suspend(() => {
+          if (timed) return Effect.void;
+          timed = true;
+          return Effect.map(Clock.currentTimeMillis, (now) =>
+            directClaimWaits.record((now - asked) / 1_000, { "k8s.pod.name": claimsOptions.pod, "alasio.turn.claim_wait.outcome": outcome }));
+        });
+      return Effect.flatMap(
+        FiberSet.run(
+          directTurns,
+          claims.holding(conversationId, Effect.andThen(waited("ran"), turn), Effect.andThen(waited("ran"), recoverLeft(conversationId))).pipe(
+            Effect.flatMap(Option.match({ onNone: () => Effect.fail(new ClaimHeld()), onSome: Effect.succeed })),
+            Effect.retry({ while: (error) => error._tag === "ClaimHeld", schedule: Schedule.max([Schedule.spaced(DIRECT_CLAIM_EVERY), Schedule.during(DIRECT_CLAIM_WAIT)]) }),
+            Effect.catchTag("ClaimHeld", () =>
+              Effect.andThen(waited("refused"), Effect.fail(new ConversationBusy({ message: "Another alasio is working in this conversation; send this again once it is through." })))),
+          ),
         ),
-      ),
-      Fiber.join,
-    );
+        Fiber.join,
+      );
+    });
 
   /**
    * The conversation's prompt jobs, one at a time, for as long as it is free and has any;
@@ -887,7 +911,13 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
       return sessionId;
     }),
     flushCompletedResponses,
-    takeUnheld: Effect.flatMap(store.unheldConversations, (conversationIds) => Effect.forEach(conversationIds, schedule, { discard: true })),
+    takeUnheld: Effect.flatMap(store.unheldConversations, (conversationIds) =>
+      conversationIds.length === 0 ? Effect.void : Effect.andThen(
+        Effect.sync(() => unheldTaken.add(conversationIds.length, { "k8s.pod.name": claimsOptions.pod })).pipe(
+          Effect.andThen(Effect.logInfo(`taking up ${conversationIds.length} conversation(s) no alasio drives: ${conversationIds.join(", ")}`)),
+        ),
+        Effect.forEach(conversationIds, schedule, { discard: true }),
+      )),
     lapseOwnClaims: Effect.asVoid(claims.lapseOwn),
     resumePendingPrompts: Effect.flatMap(store.listWaitingPromptConversations, (conversationIds) => Effect.forEach(conversationIds, schedule, { discard: true })),
   });

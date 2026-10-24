@@ -16,7 +16,7 @@ import { added } from "./support/metrics.ts";
 import { createCommandEventPolicy } from "../src/codex/command-event-policy.ts";
 import { buildLostHarnessText } from "../src/operator/lost-prompt.ts";
 import { makeStatusReporter } from "../src/codex/status-reporter.ts";
-import { Turns } from "../src/codex/turns.ts";
+import { DIRECT_CLAIM_WAITS, Turns, UNHELD_TAKEN } from "../src/codex/turns.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { discardHeld, queueHeld, steerWithHeld, swerveTo } from "../src/harness/commands.ts";
 import { HarnessHost } from "../src/harness/host.ts";
@@ -893,13 +893,13 @@ test("a prompt job another alasio runs under its claim is left running by one ta
   await run(store.claimNextPromptJob(conversationId).pipe(Effect.provideService(CurrentWorkerFence, holder)));
   await withTurns(store, harness, async (alasio) => {
     const takeUnheld = () => alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.takeUnheld));
-    await takeUnheld();
+    assert.deepEqual(await added(UNHELD_TAKEN, takeUnheld), {});
     // Nor taken up as a prompt queued through this alasio schedules its worker.
     await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.schedule(conversationId)));
     await sleep(200);
     assert.deepEqual([(await run(store.getPromptJob(job.id)))?.state, ran], ["running", []]);
     await sleep(400);
-    await takeUnheld();
+    assert.deepEqual(await added(UNHELD_TAKEN, takeUnheld), { "k8s.pod.name=alasio-test": 1 });
     await until("the job to run again", () => ran.length === 1);
     await until("the job to complete", async () => (await run(store.getPromptJob(job.id)))?.state === "completed");
     assert.equal((await run(store.getPromptJob(job.id)))?.attempts, 2);
@@ -925,7 +925,7 @@ test("a turn a harness started on its own is its host's: no alasio taking up con
   });
 });
 
-test("a turn run outside a worker, its conversation's claim held by another alasio's worker as it asks, waits for that claim, and runs once it is let go of", async () => {
+test("a turn run outside a worker, its conversation's claim held by another alasio's worker as it asks, waits for that claim, and runs once it is let go of, its wait timed once", async () => {
   const { store, conversationId } = await conversation();
   const ran: string[] = [];
   const harness = scriptedHarness((params) => Effect.sync(() => ran.push(params.prompt)).pipe(Effect.andThen(answered(params, "Done."))));
@@ -934,7 +934,29 @@ test("a turn run outside a worker, its conversation's claim held by another alas
   assert.ok(other);
   setTimeout(() => void Effect.runPromise(store.releaseWorker(other)), 1_000);
   await withTurns(store, harness, async (alasio) => {
-    assert.equal(await alasio.runPromise(turnOf(conversationId, "direct")), true);
+    const timed = await added(DIRECT_CLAIM_WAITS, async () => assert.equal(await alasio.runPromise(turnOf(conversationId, "direct")), true));
     assert.deepEqual(ran, ["direct"]);
+    // Once, as what the last holder left is recovered, not again as the turn runs.
+    assert.deepEqual(timed, { "k8s.pod.name=alasio-test,alasio.turn.claim_wait.outcome=ran": 1 });
   });
+});
+
+test("a turn run outside a worker, its conversation's claim held by another alasio's worker past the wait, is refused, its wait timed as refused, and runs nothing", { timeout: 30_000 }, async () => {
+  const { store, conversationId } = await conversation();
+  const ran: string[] = [];
+  const harness = scriptedHarness((params) => Effect.sync(() => ran.push(params.prompt)).pipe(Effect.andThen(answered(params, "Done."))));
+  const other = await run(store.claimWorker(conversationId, "other", 60_000));
+  assert.ok(other);
+  try {
+    await withTurns(store, harness, async (alasio) => {
+      const timed = await added(DIRECT_CLAIM_WAITS, async () => {
+        const refused = await alasio.runPromise(Effect.flip(turnOf(conversationId, "direct")));
+        assert.equal(refused._tag, "ConversationBusy");
+      });
+      assert.deepEqual(ran, []);
+      assert.deepEqual(timed, { "k8s.pod.name=alasio-test,alasio.turn.claim_wait.outcome=refused": 1 });
+    });
+  } finally {
+    await run(store.releaseWorker(other));
+  }
 });

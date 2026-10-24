@@ -1,7 +1,7 @@
 /**
  * The claims of conversations' workers as an alasio holds them (src/codex/worker-claims.ts): what
  * runs under one found taken over as it is renewed interrupted, and the claims of a pod's
- * processes before it let go of as one starts in it.
+ * processes before it let go of as one starts in it; each ask timed, and each claim lost counted.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -9,7 +9,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 import { Cause, Deferred, Effect, Exit, Fiber, FiberSet, Option, Scope } from "effect";
 
-import { makeWorkerClaims, WorkerClaimLost, type WorkerClaimsOptions } from "../src/codex/worker-claims.ts";
+import { added } from "./support/metrics.ts";
+import { CLAIM_LOSSES, CLAIM_WAITS, makeWorkerClaims, WorkerClaimLost, type WorkerClaimsOptions } from "../src/codex/worker-claims.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { poolDatabase, StoreError } from "../src/persistence/sql.ts";
 import { Store } from "../src/persistence/store.ts";
@@ -33,7 +34,7 @@ async function conversations(count: number) {
 const claimsOf = (store: Store["Service"], scope: Scope.Closeable, options: WorkerClaimsOptions) =>
   Effect.runPromise(makeWorkerClaims(options).pipe(Effect.provideService(Store, store), Scope.provide(scope)));
 
-test("what runs under a claim another alasio took over is interrupted as a renewal finds it, failing with WorkerClaimLost", async () => {
+test("what runs under a claim another alasio took over is interrupted as a renewal finds it, failing with WorkerClaimLost, the claim counted lost", async () => {
   const { store, schema, ids: [conversationId = ""] } = await conversations(1);
   const scope = Effect.runSync(Scope.make());
   try {
@@ -42,8 +43,13 @@ test("what runs under a claim another alasio took over is interrupted as a renew
     await sleep(250);
     assert.equal(holding.pollUnsafe(), undefined);
     // Taken over, as another alasio takes a claim that lapsed: one generation past this one's.
-    await (await testPool()).query(`update ${schema}.conversation_workers set holder = 'pod-b/x', generation = generation + 1, held_until = now() + interval '1 minute'`);
-    const ended = await Effect.runPromise(Fiber.await(holding).pipe(Effect.timeout("2 seconds")));
+    let ended: Exit.Exit<unknown, unknown> | undefined;
+    const lost = await added(CLAIM_LOSSES, async () => {
+      await (await testPool()).query(`update ${schema}.conversation_workers set holder = 'pod-b/x', generation = generation + 1, held_until = now() + interval '1 minute'`);
+      ended = await Effect.runPromise(Fiber.await(holding).pipe(Effect.timeout("2 seconds")));
+    });
+    assert.deepEqual(lost, { "k8s.pod.name=pod-a,alasio.worker_claim.outcome=lost": 1 });
+    assert.ok(ended);
     assert.ok(Exit.isFailure(ended));
     assert.ok(Cause.squash(ended.cause) instanceof WorkerClaimLost, String(Cause.squash(ended.cause)));
     // The other's claim is left as it is.
@@ -167,7 +173,7 @@ test("a claim's recovery never outlives alasio's stop, ending before its claim i
   assert.deepEqual(stopped.slice(0, 2), ["recovery ended", "claim let go of"]);
 });
 
-test("an alasio starting in a pod lets go of the claims its pod's processes before it held, which it then takes at once, and of no other pod's", async () => {
+test("an alasio starting in a pod lets go of the claims its pod's processes before it held, counted lapsed, which it then takes at once, and of no other pod's", async () => {
   const { store, ids: [own = "", others = ""] } = await conversations(2);
   // As a container that crashed in its pod left its claims, held as an alasio holds them, and another pod holds its own.
   const [before, scope] = [Effect.runSync(Scope.make()), Effect.runSync(Scope.make())];
@@ -179,7 +185,8 @@ test("an alasio starting in a pod lets go of the claims its pod's processes befo
       await Effect.runPromise(Deferred.await(held));
     }
     const claims = await claimsOf(store, scope, { pod: "pod-a" });
-    assert.equal(await Effect.runPromise(claims.lapseOwn), 1);
+    const lapsed = await added(CLAIM_LOSSES, async () => assert.equal(await Effect.runPromise(claims.lapseOwn), 1));
+    assert.deepEqual(lapsed, { "k8s.pod.name=pod-a,alasio.worker_claim.outcome=lapsed": 1 });
     assert.equal(Option.getOrNull(await Effect.runPromise(claims.holding(own, Effect.succeed("driven"), Effect.void))), "driven");
     assert.ok(Option.isNone(await Effect.runPromise(claims.holding(others, Effect.succeed("driven"), Effect.void))));
   } finally {
@@ -220,6 +227,27 @@ test("a take of one conversation's claim that waits on its row, locked by a writ
   } finally {
     await Effect.runPromise(Deferred.succeed(open, undefined));
     await Effect.runPromise(Fiber.join(writing));
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+});
+
+test("each ask for a conversation's claim is timed by how it was answered: taken where none held it, joined where this alasio did, held where another does", async () => {
+  const { store, ids: [own = ""] } = await conversations(1);
+  const scope = Effect.runSync(Scope.make());
+  const holders: Fiber.Fiber<unknown, unknown>[] = [];
+  try {
+    const [claims, another] = [await claimsOf(store, scope, { pod: "pod-a" }), await claimsOf(store, scope, { pod: "pod-b" })];
+    const asked = (pod: string, outcome: string) => `k8s.pod.name=${pod},alasio.worker_claim.outcome=${outcome}`;
+    const timed = await added(CLAIM_WAITS, async () => {
+      const held = Effect.runSync(Deferred.make<void>());
+      holders.push(Effect.runFork(claims.holding(own, Effect.andThen(Deferred.succeed(held, undefined), Effect.never), Effect.void)));
+      await Effect.runPromise(Deferred.await(held));
+      assert.equal(Option.getOrNull(await Effect.runPromise(claims.holding(own, Effect.succeed("joined"), Effect.void))), "joined");
+      assert.ok(Option.isNone(await Effect.runPromise(another.holding(own, Effect.succeed("held"), Effect.void))));
+    });
+    assert.deepEqual(timed, { [asked("pod-a", "taken")]: 1, [asked("pod-a", "joined")]: 1, [asked("pod-b", "held")]: 1 });
+  } finally {
+    await Effect.runPromise(Fiber.interruptAll(holders));
     await Effect.runPromise(Scope.close(scope, Exit.void));
   }
 });
