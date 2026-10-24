@@ -414,7 +414,10 @@ const Sessions = Schema.Struct({
  * Conversations' harnesses (cli/src/manifests/harness-pools.ts): each conversation's harness
  * host runs in a pod of its harness's pool, bound to it by the sandbox gateway while it has work
  * and let go of once it has had none for `pools.releaseAfter`; each pool keeps
- * `pools.scaling.min` free, and makes more, to its max, for the binds that wait for one.
+ * `pools.scaling.min` free, and makes more, to its max, for the binds that wait for one. A
+ * session conversation's pod holds its harness alone, its commands run in its session's
+ * sandbox; a folder conversation's holds what its harness runs there too, as Codex's shell
+ * runs its commands in the folder, builds and dev servers among them.
  */
 const Harness = Schema.Struct({
   pools: defaulted(
@@ -424,7 +427,8 @@ const Harness = Schema.Struct({
     }),
     {},
   ),
-  resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "4Gi" } }),
+  session: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "100m", memory: "384Mi" }, limits: { memory: "1536Mi" } }) }), {}),
+  folder: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "3Gi" } }) }), {}),
 });
 
 /** The bayma the host profile's folder instances run, as this release pins it. */
@@ -455,7 +459,8 @@ const Host = Schema.Struct({
   /** Whether alasio's home is the operator's rather than its volume. */
   alasioHome: defaulted(Schema.Boolean, true),
   env: Env,
-  resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "8Gi" } }),
+  /** A folder instance's, the operator's workbench in its folder: room for a typecheck and two test processes beside its REPLs. */
+  resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "4Gi" } }),
 });
 
 /** A service of Neon's with a volume. */

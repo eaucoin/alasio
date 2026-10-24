@@ -2296,7 +2296,7 @@ test("branch list says each branch, what it is a branch of, its age, the release
   succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
   const listed = await alasio(["branch", "list"]);
   succeeded(listed);
-  assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, made by alasio 0.0.0-development, its alasio ready, 2.8 GiB requested, 0 MiB used"]);
+  assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, made by alasio 0.0.0-development, its alasio ready, 2.6 GiB requested, 0 MiB used"]);
 });
 
 test("branch delete refuses while the branch's alasio has a turn running, or a workspace of its sessions is bound, unless --force, and deletes it whole: its alasio and lake, its sessions' workspaces, its compute, its branch of Neon, its namespaces", async (t) => {

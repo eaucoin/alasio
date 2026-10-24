@@ -159,7 +159,7 @@ function harnessTemplate(config: InstallConfig, environment: Environment, pool: 
         // Ready once it serves, which it does once bound.
         readinessProbe: { httpGet: { path: "/healthz", port: "host" }, periodSeconds: 2 },
         securityContext: restrictedContainer(),
-        resources: config.harness.resources,
+        resources: folder ? config.harness.folder.resources : config.harness.session.resources,
         volumeMounts,
       }],
       volumes,

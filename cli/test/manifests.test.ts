@@ -48,6 +48,7 @@ import { lakeReconcile } from "../src/manifests/lake.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
 import { everyIntervalCron, filerStoreBackupHours } from "../src/manifests/config.ts";
+import { folderTemplate } from "../src/manifests/folders.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { goferOf, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
@@ -3807,6 +3808,20 @@ describe("conversations' harnesses' pools", () => {
     // None of a branch's, as a branch has no folder.
     const branch = branchObjects(configOf({ host: { enabled: true } }), "try", BASELINE);
     assert.deepEqual(all<V1Deployment>(branch, "Deployment").filter(({ metadata }) => metadata?.name?.startsWith("harness-")).map(({ metadata }) => `${metadata?.namespace}/${metadata?.name}`), ["alasio-branch-try/harness-codex", "alasio-branch-try/harness-claude"]);
+  });
+
+  test("holds a session conversation's harness pod to its harness, and a folder conversation's, with what its harness runs, and its folder instance, the operator's workbench, to more, each as the installation says", () => {
+    const host = { enabled: true, uid: 1001, gid: 1002, home: "/home/op", mounts: [{ name: "home", hostPath: "/home/op", mountPath: "/home/op" }] };
+    const resourcesOf = (objects: readonly KubernetesObject[], name: string) => container(one<V1Deployment>(objects, "Deployment", name)).resources;
+    const objects = install({ host });
+    for (const name of ["harness-codex", "harness-claude"]) assert.deepEqual(resourcesOf(objects, name), { requests: { cpu: "100m", memory: "384Mi" }, limits: { memory: "1536Mi" } }, name);
+    for (const name of ["harness-folder-codex", "harness-folder-claude"]) assert.deepEqual(resourcesOf(objects, name), { requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "3Gi" } }, name);
+    assert.deepEqual(folderTemplate(configOf({ host })).spec?.containers[0]?.resources, { requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "4Gi" } });
+    // Each its own setting.
+    const given = { requests: { cpu: "50m", memory: "256Mi" }, limits: { memory: "2Gi" } };
+    const set = install({ host: { ...host, resources: given }, harness: { session: { resources: given }, folder: { resources: given } } });
+    for (const name of ["harness-codex", "harness-folder-claude"]) assert.deepEqual(resourcesOf(set, name), given, name);
+    assert.deepEqual(folderTemplate(configOf({ host: { ...host, resources: given } })).spec?.containers[0]?.resources, given);
   });
 
   test("Claude Code's login, where the installation gives one, in each pool's pods as in alasio's own, the operator's Claude home with it in a folder conversation's; none where it gives none", () => {

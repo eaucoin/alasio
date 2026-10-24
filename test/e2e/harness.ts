@@ -675,7 +675,8 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       ? {
         harness: {
           pools: { scaling: { min: 1, max: 2 }, releaseAfter: SHARD === "agents" ? `${HARNESS_RELEASE_AFTER_SECONDS}s` : "24h" },
-          resources: { requests: { cpu: "20m", memory: "128Mi" } },
+          session: { resources: { requests: { cpu: "20m", memory: "128Mi" } } },
+          folder: { resources: { requests: { cpu: "20m", memory: "128Mi" } } },
         },
       }
       : {}),

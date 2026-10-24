@@ -117,7 +117,9 @@ test("a folder instance's pod, as the gateway makes it of the folder template, i
   const pod = await madeAs(GATEWAY_USER, folderPod());
   assert.ok("name" in pod, JSON.stringify(pod));
   // Its bayma's memory request the gateway's, as its folder's instances came to use, as many bytes as it says, up to its limit.
-  for (const memory of ["1853882368", "8Gi"]) {
+  const limit = folderPod().spec?.containers[0]?.resources?.limits?.["memory"];
+  assert.ok(limit, "the folder template limits its bayma's memory");
+  for (const memory of ["1853882368", limit]) {
     const sized = await madeAs(GATEWAY_USER, folderPod("telegram:sized", (made) => void (made.spec.containers[0]!.resources!.requests!["memory"] = memory)));
     assert.ok("name" in sized, `${memory}: ${JSON.stringify(sized)}`);
   }
