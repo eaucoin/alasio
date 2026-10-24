@@ -2,7 +2,7 @@
  * A member of a group on the log (src/log/topic.ts), as alasio's three groups join theirs: its
  * place kept by heartbeats often enough that the broker ends it within seconds of its last, and
  * its group joined again where its topic grows, as one is assigned no partition added after it
- * joined.
+ * joined; and each generation of its group it joins counted, a rebalance.
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -11,10 +11,12 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import { Consumer } from "@platformatic/kafka";
 import { Duration, Effect, Fiber, Logger } from "effect";
 
+import { added } from "./support/metrics.ts";
 import { consumeGroup, REJOIN_BACKOFF } from "../src/log/consume.ts";
-import { memberOptions, rejoinOnGrowth } from "../src/log/topic.ts";
+import { countRebalances, memberOptions, REBALANCES, rejoinOnGrowth } from "../src/log/topic.ts";
 import { memoryTopic } from "./support/topics.ts";
 
 test("a member's session ends ten seconds after its last heartbeat, which come every three, and a rebalance waits ten seconds at most", () => {
@@ -31,6 +33,26 @@ test("a member's session ends ten seconds after its last heartbeat, which come e
     assert.deepEqual([options.groupId, options.sasl.password], ["alasio.main", "secret"]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("each generation of its group a member joins is counted a rebalance, by group, topic, and the topic's partitions it was assigned", async () => {
+  const log = { brokers: ["log:9092"], username: "alasio-main", passwordFile: "/dev/null", topic: "telegram.main", group: "alasio.main" };
+  // The client's member, never connected: what it says as it joins, as the client says it.
+  const member = new Consumer({ clientId: log.username, groupId: log.group, bootstrapBrokers: log.brokers });
+  try {
+    countRebalances(member, log);
+    const counted = await added(REBALANCES, async () => {
+      member.emit("consumer:group:join", { groupId: log.group, memberId: "m-1", generationId: 1, assignments: [{ topic: log.topic, partitions: [0, 1, 2] }] });
+      member.emit("consumer:group:join", { groupId: log.group, memberId: "m-1", generationId: 2, assignments: [{ topic: log.topic, partitions: [1] }, { topic: "another", partitions: [0] }] });
+      member.emit("consumer:group:join", { groupId: log.group, memberId: "m-1", generationId: 3, assignments: [] });
+      // As the consumer protocol's member joins: no assignment said.
+      member.emit("consumer:group:join", { groupId: log.group, memberId: "m-1" });
+    });
+    const of = (partitions?: number) => `messaging.consumer.group.name=alasio.main,messaging.destination.name=telegram.main${partitions === undefined ? "" : `,alasio.log.partitions=${partitions}`}`;
+    assert.deepEqual(counted, { [of(3)]: 1, [of(1)]: 1, [of(0)]: 1, [of()]: 1 });
+  } finally {
+    await member.close(true);
   }
 });
 

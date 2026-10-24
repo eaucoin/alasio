@@ -3,12 +3,14 @@
  * alasio's one Kafka client: its records in turn, each told to the group only once whoever
  * reads it says so (commit), so a member started again reads on from the last record told,
  * neither losing one nor skipping one. A group that has been told of none begins at the
- * topic's first record still kept, or at the next written, as its reader asks.
+ * topic's first record still kept, or at the next written, as its reader asks. Each generation
+ * of the group a member joins, a rebalance, is counted (REBALANCES).
  */
 import { readFileSync } from "node:fs";
 
-import { Consumer, MessagesStreamFallbackModes, MessagesStreamModes } from "@platformatic/kafka";
+import { Consumer, type ConsumerGroupJoinPayload, MessagesStreamFallbackModes, MessagesStreamModes } from "@platformatic/kafka";
 
+import { meter } from "../telemetry/index.ts";
 import { type Feed, JoinAgain, type Received } from "./consume.ts";
 
 /** Where a topic is read: the log's brokers, the principal read as, the file of its password, the topic, and the group read in. */
@@ -43,6 +45,25 @@ export type JoinTopic = (log: TopicLog, untold: "earliest" | "latest") => Promis
 export const SESSION_TIMEOUT_MS = 10_000;
 export const HEARTBEAT_INTERVAL_MS = 3_000;
 export const REBALANCE_TIMEOUT_MS = 10_000;
+
+export const REBALANCES = "alasio.log.rebalances";
+const rebalances = meter.createCounter(REBALANCES, {
+  description: "Rebalances of a group on the log alasio's member took part in, each generation of the group it joined: as it joined, and as members came and went or the topic grew; by group, topic, and how many of the topic's partitions the member was assigned",
+  unit: "{rebalance}",
+});
+
+/** What a member says as it joins a generation of its group: its assignment, where the group's protocol gives one. */
+export interface JoinsOf {
+  readonly on: (event: "consumer:group:join", listener: (payload: Pick<ConsumerGroupJoinPayload, "assignments">) => void) => unknown;
+}
+
+/** Counts each generation of `log`'s group `member` joins (REBALANCES). */
+export function countRebalances(member: JoinsOf, log: TopicLog): void {
+  member.on("consumer:group:join", ({ assignments }) => {
+    const partitions = assignments?.filter(({ topic }) => topic === log.topic).reduce((sum, { partitions }) => sum + partitions.length, 0);
+    rebalances.add(1, { "messaging.consumer.group.name": log.group, "messaging.destination.name": log.topic, ...(partitions === undefined ? {} : { "alasio.log.partitions": partitions }) });
+  });
+}
 
 /** The options of a member of `log`'s group, as joinTopic makes it. */
 export const memberOptions = (log: TopicLog) => ({
@@ -102,6 +123,7 @@ export function rejoinOnGrowth<R extends Received>(feed: Feed<R>, { topic, joine
  */
 export async function joinTopic(log: TopicLog, untold: "earliest" | "latest"): Promise<TopicFeed> {
   const consumer = new Consumer(memberOptions(log));
+  countRebalances(consumer, log);
   const partitions = async (): Promise<number> => (await consumer.metadata({ topics: [log.topic], forceUpdate: true })).topics.get(log.topic)?.partitionsCount ?? 0;
   let stream;
   let joinedWith;

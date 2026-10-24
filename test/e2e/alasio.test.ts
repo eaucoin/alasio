@@ -2451,6 +2451,8 @@ if (inShard("telemetry")) {
           metricRows(`ServiceName = 'keda' and MetricName = 'keda_scaler_metrics_value' and Attributes['scaler'] = '${scaler}' and Attributes['scaledObject'] <> '' and Attributes['namespace'] <> '' and Attributes['metric'] <> ''`),
         );
       }
+      // alasio's, its members' joins of its groups on the log counted as their rebalances, Telegram's among them.
+      await untilInLake("rebalance of alasio's group of Telegram's updates", metricRows("ServiceName = 'alasio' and MetricName = 'alasio.log.rebalances' and Attributes['messaging.destination.name'] like 'telegram%'"));
     });
 
     describe("Grafana", () => {
