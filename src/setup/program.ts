@@ -10,7 +10,7 @@
  */
 import { Effect, Layer, type Scope } from "effect";
 
-import { HARNESS_ROLE } from "../../neon/control/secrets.ts";
+import { CODEX_LOGIN_ROLE, HARNESS_ROLE } from "../../neon/control/secrets.ts";
 import { stateStore } from "../alasio.ts";
 import type { AlasioConfig } from "../config.ts";
 import { Neon } from "../neon/connect.ts";
@@ -22,6 +22,6 @@ export const setUpState = (config: Pick<AlasioConfig, "workingDirectory" | "bran
     const neon = yield* Neon.make.pipe(Effect.provideService(LakeWake, LakeWake.none));
     // The session filesystems' Codex's store, as alasio makes it before its state.
     yield* neon.sessionFsRollouts;
-    yield* Layer.build(stateStore({ pool: neon.pool, workingDirectory: config.workingDirectory, branch: config.branch, harnessRole: HARNESS_ROLE }));
+    yield* Layer.build(stateStore({ pool: neon.pool, workingDirectory: config.workingDirectory, branch: config.branch, harnessRole: HARNESS_ROLE, codexLoginRole: CODEX_LOGIN_ROLE }));
     yield* Effect.logInfo("alasio's state is made");
   });

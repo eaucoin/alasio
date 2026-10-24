@@ -10,6 +10,7 @@ import { refuseMainKeyOnSnapshots, renderSecrets, secretNames, setupConfig, setu
 import { scramVerifier } from "../neon/control/scram.ts";
 import { clusterId, type SeaweedS3Config, type StackSecrets, type StoredSecrets } from "../neon/control/secrets.ts";
 import { environmentKey } from "../src/binder/names.ts";
+import { poolLoginKey } from "../src/harness/names.ts";
 import { makeS3Bucket } from "../src/node-agent/s3.ts";
 import { startFakeS3 } from "./support/fake-s3.ts";
 
@@ -177,6 +178,7 @@ test("the stack's secrets are made once, and every service's rendered from them 
       ["lake-reader-verifier", "lake_reader", root.lakeReaderPassword],
       ["grafana-verifier", "grafana", root.grafanaPassword],
       ["harness-verifier", "harness", root.harnessPassword],
+      ["codex-login-verifier", "codex_login", root.codexLoginPassword],
     ] as const
   ) {
     const verifier = value(kube, names.database, key);
@@ -185,9 +187,10 @@ test("the stack's secrets are made once, and every service's rendered from them 
   }
   assert.ok(verifies(root.verifiers?.alasio, root.alasioPassword));
   // Each salted at random.
-  assert.equal(new Set(Object.values(root.verifiers ?? {}).map((verifier) => verifier.split("$")[1])).size, 5);
-  // The harness host's pools reach main's compute as its own role.
+  assert.equal(new Set(Object.values(root.verifiers ?? {}).map((verifier) => verifier.split("$")[1])).size, 6);
+  // The harness host's pools, and the Codex login relay, reach main's compute each as its own role.
   assert.equal(value(kube, names.harnessDatabase, "url"), `postgresql://harness:${encodeURIComponent(root.harnessPassword)}@q-neon-proxy.alasio.svc:5432/alasio?options=endpoint%3Dalasio`);
+  assert.equal(value(kube, names.codexLoginDatabase, "url"), `postgresql://codex_login:${encodeURIComponent(root.codexLoginPassword)}@q-neon-proxy.alasio.svc:5432/alasio?options=endpoint%3Dalasio`);
   assert.equal(value(kube, names.grafana, "LAKE_QUERY_TOKEN"), value(kube, names.lake, "LAKE_QUERY_TOKEN"));
   // Grafana's password, which its database's URL takes as it is.
   assert.equal(value(kube, names.grafana, "GF_DATABASE_PASSWORD"), root.grafanaPassword);
@@ -255,6 +258,8 @@ test("the stack's secrets are made once, and every service's rendered from them 
   // main's alasio's key to it, of the caller key, not the caller key itself.
   assert.equal(value(kube, names.sessionsCaller, "caller-key"), environmentKey(Buffer.from(root.gatewayCallerKey), "main").toString());
   assert.notEqual(value(kube, names.sessionsCaller, "caller-key"), root.gatewayCallerKey);
+  // main's relay of its Codex login's: the key of its turns' tokens, made of main's callers' key, which it is not.
+  assert.equal(value(kube, names.codexLoginKey, "key"), poolLoginKey(Buffer.from(value(kube, names.sessionsCaller, "caller-key"))).toString("hex"));
 
   // A second run keeps every secret and the key, and rewrites what derives from them.
   await setupKube({ kube, config, log: () => {} });
@@ -352,12 +357,13 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     grafanaAdminPassword: "a",
     grafanaSecretKey: "s",
     harnessPassword: "h",
+    codexLoginPassword: "x",
     branchForkKey: "f",
     filerStoreFilerPassword: "p",
     filerStoreCollectorPassword: "c",
     filerStoreBackupPassword: "b",
     monitorKey: "m",
-    verifiers: { alasio: "SCRAM-SHA-256$q", lake: "SCRAM-SHA-256$l", lake_reader: "SCRAM-SHA-256$r", grafana: "SCRAM-SHA-256$g", harness: "SCRAM-SHA-256$h" },
+    verifiers: { alasio: "SCRAM-SHA-256$q", lake: "SCRAM-SHA-256$l", lake_reader: "SCRAM-SHA-256$r", grafana: "SCRAM-SHA-256$g", harness: "SCRAM-SHA-256$h", codex_login: "SCRAM-SHA-256$x" },
     nodeAgentToken: "n",
     gatewayCallerKey: "gc",
     gatewayBindingKey: "gb",

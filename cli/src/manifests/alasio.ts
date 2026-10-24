@@ -177,6 +177,7 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     { name: "ALASIO_DATABASE_URL_FILE", value: "/run/alasio/database/url" },
     { name: "ALASIO_LAKE_VERIFIER_FILE", value: "/run/alasio/database/lake-verifier" },
     { name: "ALASIO_HARNESS_VERIFIER_FILE", value: "/run/alasio/database/harness-verifier" },
+    { name: "ALASIO_CODEX_LOGIN_VERIFIER_FILE", value: "/run/alasio/database/codex-login-verifier" },
     ...readerRoles(config, environment).map(({ key, variable }) => ({ name: variable, value: `/run/alasio/database/${key}` })),
     { name: "ALASIO_LAKE_ENABLED", value: config.lake.enabled ? "1" : "0" },
     // Its Telegram updates: its environment's topic, read in its group as its principal.
@@ -321,7 +322,7 @@ function deployment(config: InstallConfig, botChecksum: string | null, environme
               name: "database",
               secret: {
                 secretName: DATABASE_SECRET,
-                items: ["url", "lake-verifier", "harness-verifier", ...readerRoles(config, environment).map(({ key }) => key)].map((key) => ({ key, path: key })),
+                items: ["url", "lake-verifier", "harness-verifier", "codex-login-verifier", ...readerRoles(config, environment).map(({ key }) => key)].map((key) => ({ key, path: key })),
               },
             },
             { name: "log", secret: { secretName: environmentLogSecret(environment), items: [{ key: "password", path: "password" }] } },

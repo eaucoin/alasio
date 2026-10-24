@@ -19,7 +19,7 @@ import { CodexAppServer } from "../src/codex/app-server/client.ts";
 import { CodexLoginFreshness, CodexLoginRefused } from "../src/codex/login-refresh.ts";
 import { answeredByFront } from "../src/binder/server.ts";
 import { type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
-import { poolLoginKey } from "../src/codex/login-relay.ts";
+import { poolLoginKey } from "../src/harness/names.ts";
 import { GRANT_HEADER, grantDigest, grantKey, harnessGrant } from "../src/harness/grant.ts";
 import { type Attached, HarnessHost, type TurnCodex, type TurnRequest, type TurnStart } from "../src/harness/host.ts";
 import { BusyPods } from "../src/kube/busy.ts";

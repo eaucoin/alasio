@@ -16,7 +16,7 @@
 import { Effect, Layer } from "effect";
 import pg from "pg";
 
-import { HARNESS_ROLE } from "../../neon/control/secrets.ts";
+import { CODEX_LOGIN_ROLE, HARNESS_ROLE } from "../../neon/control/secrets.ts";
 import { serveAlasio } from "../../src/alasio.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../../src/codex/rollouts/store.ts";
 import type { BranchEnvironment } from "../../src/config.ts";
@@ -78,6 +78,7 @@ if (import.meta.main) {
       pod: config.pod,
       inKubernetes: false,
       harnessRole: HARNESS_ROLE,
+      codexLoginRole: CODEX_LOGIN_ROLE,
       sessionStore: new NeonSessionStore(pool),
       rolloutStores: { codex: new NeonRolloutStore(pool), sessionFs: new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA }) },
       events: Layer.succeed(EnvironmentEvents, EnvironmentEvents.of({

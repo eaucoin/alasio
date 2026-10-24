@@ -9,7 +9,8 @@ import { after, before, test } from "node:test";
 import { Array as Arr, Effect, Exit, Logger, Scope } from "effect";
 
 import { mintToken } from "../src/binder/tokens.ts";
-import { loginUpstream, poolLoginKey, poolLoginRefusal, startLoginRelay, type LoginUpstream } from "../src/codex/login-relay.ts";
+import { loginUpstream, poolLoginRefusal, startLoginRelay, type LoginUpstream } from "../src/codex/login-relay.ts";
+import { poolLoginKey } from "../src/harness/names.ts";
 import { makeGivenCodexLogin } from "../src/harness/given-codex-login.ts";
 import type { TurnStart } from "../src/harness/host.ts";
 

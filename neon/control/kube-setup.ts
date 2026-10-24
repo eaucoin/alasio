@@ -25,12 +25,14 @@ import { Cause, Effect, Exit } from "effect";
 
 import { environmentKey } from "../../src/binder/names.ts";
 import { MAIN_ENVIRONMENT_NAME } from "../../src/branch/names.ts";
+import { poolLoginKey } from "../../src/harness/names.ts";
 import { makeS3Bucket, type S3Bucket, S3Error } from "../../src/node-agent/s3.ts";
 
 import { BRANCHES_SCOPE, computeId, MAIN, PROXY_SCOPE } from "./branches.ts";
 import { type Certificate, webhookCertificate } from "./certificate.ts";
 import { generateKeyPair, type KeyPair, signToken } from "./jwt.ts";
 import {
+  CODEX_LOGIN_ROLE,
   completeSecrets,
   DATABASE,
   GRAFANA_ROLE,
@@ -70,6 +72,8 @@ export interface SecretNames {
   database: string;
   /** The harness host's database URL, as its own role (HARNESS_ROLE), for the harness pools to mount. */
   harnessDatabase: string;
+  /** The Codex login relay's database URL, as its own role (CODEX_LOGIN_ROLE), for the relay to mount. */
+  codexLoginDatabase: string;
   lake: string;
   grafana: string;
   branches: string;
@@ -80,6 +84,8 @@ export interface SecretNames {
   nodeAgent: string;
   sandboxGateway: string;
   sessionsCaller: string;
+  /** What main's relay of its Codex login checks the turns' tokens by: the key alasio signs them with (poolLoginKey), not the caller key it is made of. */
+  codexLoginKey: string;
   /** The log's own (its cluster's id and its admin's password), its access applier's (every principal's password), and each principal's. */
   log: string;
   logAccess: string;
@@ -185,6 +191,7 @@ export function secretNames(prefix: string): SecretNames {
     proxy: `${prefix}-neon-proxy`,
     database: `${prefix}-database`,
     harnessDatabase: `${prefix}-harness-database`,
+    codexLoginDatabase: `${prefix}-codex-login-database`,
     lake: `${prefix}-lake`,
     grafana: `${prefix}-grafana`,
     branches: `${prefix}-branches`,
@@ -195,6 +202,7 @@ export function secretNames(prefix: string): SecretNames {
     nodeAgent: `${prefix}-node-agent`,
     sandboxGateway: `${prefix}-sandbox-gateway`,
     sessionsCaller: `${prefix}-sessions-caller`,
+    codexLoginKey: `${prefix}-codex-login-key`,
     log: `${prefix}-log`,
     logAccess: `${prefix}-log-access`,
     logPrincipals: Object.fromEntries(LOG_PRINCIPALS.map((principal) => [principal, `${prefix}-log-${principal}`])) as Record<LogPrincipal, string>,
@@ -262,9 +270,12 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
       "lake-reader-verifier": secrets.verifiers[LAKE_READER_ROLE],
       "grafana-verifier": secrets.verifiers[GRAFANA_ROLE],
       "harness-verifier": secrets.verifiers[HARNESS_ROLE],
+      "codex-login-verifier": secrets.verifiers[CODEX_LOGIN_ROLE],
     },
     // The harness host's, which reaches main's compute as its own role, and no further than that role may.
     [names.harnessDatabase]: { url: databaseUrl(neon.proxyHost, secrets.harnessPassword, computeId(MAIN), HARNESS_ROLE) },
+    // The Codex login relay's, which reaches main's compute as its own role, the login's alone.
+    [names.codexLoginDatabase]: { url: databaseUrl(neon.proxyHost, secrets.codexLoginPassword, computeId(MAIN), CODEX_LOGIN_ROLE) },
     // The lake service's, and its query endpoint's, which each read their own.
     [names.lake]: {
       LAKE_DATABASE_PASSWORD: secrets.lakePassword,
@@ -348,7 +359,10 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
   // The sandbox gateway's keys, beside the node agents it attaches workspaces through.
   rendered[names.sandboxGateway] = { "caller-key": secrets.gatewayCallerKey, "binding-key": secrets.gatewayBindingKey };
   // main's alasio's key to it, its own of the gateway's caller key, which signs main's sessions' tokens alone; a branch's is `alasio branch create`'s to write.
-  rendered[names.sessionsCaller] = { "caller-key": environmentKey(Buffer.from(secrets.gatewayCallerKey), MAIN_ENVIRONMENT_NAME).toString() };
+  const mainCallerKey = environmentKey(Buffer.from(secrets.gatewayCallerKey), MAIN_ENVIRONMENT_NAME).toString();
+  rendered[names.sessionsCaller] = { "caller-key": mainCallerKey };
+  // main's relay of its Codex login's: the key of its turns' tokens alone, which signs none of its sessions'.
+  rendered[names.codexLoginKey] = { key: poolLoginKey(Buffer.from(mainCallerKey)).toString("hex") };
   if (!config.external) {
     const buckets = { neon: config.neonBucket, lake: config.lakeBucket, backups: config.backupsBucket, workspaces: workspaces.bucket, snapshots: snapshotsBucket };
     rendered[names.seaweedfs] = { "s3.json": JSON.stringify(s3Identities(secrets, buckets), null, 2) + "\n" };

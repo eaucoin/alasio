@@ -23,6 +23,7 @@ import { withLogScope } from "../shared/log.ts";
 import { withAlasioSpan } from "../telemetry/index.ts";
 import { ensureGrafanaRole } from "./grafana.ts";
 import { GrantedPool } from "./granted-pool.ts";
+import { ensureCodexLoginRole } from "./codex-login.ts";
 import { ensureHarnessRole } from "./harness.ts";
 import { ensureLakeReaderRole, ensureLakeRole, lakeEnabled, syncLakeReads } from "./lake.ts";
 import { LakeWake } from "./lake-wake.ts";
@@ -52,6 +53,7 @@ interface NeonAccess {
   readonly databaseUrl: Redacted.Redacted;
   readonly lakeVerifier: Redacted.Redacted;
   readonly harnessVerifier: Redacted.Redacted;
+  readonly codexLoginVerifier: Redacted.Redacted;
   readonly lake: boolean;
   /** The lake's reader's, given while the lake runs. */
   readonly lakeReaderVerifier: Option.Option<Redacted.Redacted>;
@@ -159,13 +161,14 @@ function poolOf<P extends Pool>(databaseUrl: Redacted.Redacted, onIdleError: (er
 
 /**
  * Connects to a Neon that is already up and makes what alasio keeps in it: the session
- * and rollout stores' schemas, the lake's role and reads, and the lake reader's and
- * Grafana's roles when their verifiers are given. A pool that cannot is ended: before
+ * and rollout stores' schemas, the lake's role and reads, the harness host's and the Codex
+ * login relay's roles, and the lake reader's and Grafana's roles when their verifiers are
+ * given. A pool that cannot is ended: before
  * the next attempt when this one fails, and in the background when a stop ends the
  * wait, which does not wait for it.
  */
 const openNeon = Effect.fnUntraced(function*(
-  { databaseUrl, lakeVerifier, harnessVerifier, lake, lakeReaderVerifier, grafanaVerifier }: NeonAccess,
+  { databaseUrl, lakeVerifier, harnessVerifier, codexLoginVerifier, lake, lakeReaderVerifier, grafanaVerifier }: NeonAccess,
   onIdleError: (error: Error) => void,
   wake: LakeWake["Service"],
 ): Effect.fn.Return<OpenNeon, NeonUnavailable> {
@@ -179,6 +182,7 @@ const openNeon = Effect.fnUntraced(function*(
     await ensureLakeRole(pool, Redacted.value(lakeVerifier));
     await syncLakeReads(pool, lake);
     await ensureHarnessRole(pool, Redacted.value(harnessVerifier));
+    await ensureCodexLoginRole(pool, Redacted.value(codexLoginVerifier));
     if (Option.isSome(lakeReaderVerifier)) await ensureLakeReaderRole(pool, Redacted.value(lakeReaderVerifier.value));
     if (Option.isSome(grafanaVerifier)) await ensureGrafanaRole(pool, Redacted.value(databaseUrl), Redacted.value(grafanaVerifier.value));
   }).pipe(
@@ -201,7 +205,7 @@ const whileNeonStarts = Schedule.max([Schedule.spaced(CONNECT_RETRY), Schedule.d
 
 /**
  * Connects to the Neon the deployment provides, from `ALASIO_DATABASE_URL`,
- * `ALASIO_LAKE_VERIFIER` and `ALASIO_HARNESS_VERIFIER`, and `ALASIO_LAKE_READER_VERIFIER` and `ALASIO_GRAFANA_VERIFIER`
+ * `ALASIO_LAKE_VERIFIER`, `ALASIO_HARNESS_VERIFIER` and `ALASIO_CODEX_LOGIN_VERIFIER`, and `ALASIO_LAKE_READER_VERIFIER` and `ALASIO_GRAFANA_VERIFIER`
  * if given, or their `_FILE` forms, until the scope closes. The stack starts
  * beside alasio, so it is waited for, up to ten minutes, retrying while it does not
  * answer; a stop meanwhile stops the wait.
@@ -210,6 +214,7 @@ const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope | LakeWak
   const databaseUrl = yield* deploymentSecret("ALASIO_DATABASE_URL");
   const lakeVerifier = yield* Effect.flatMap(deploymentSecret("ALASIO_LAKE_VERIFIER"), verifier("ALASIO_LAKE_VERIFIER"));
   const harnessVerifier = yield* Effect.flatMap(deploymentSecret("ALASIO_HARNESS_VERIFIER"), verifier("ALASIO_HARNESS_VERIFIER"));
+  const codexLoginVerifier = yield* Effect.flatMap(deploymentSecret("ALASIO_CODEX_LOGIN_VERIFIER"), verifier("ALASIO_CODEX_LOGIN_VERIFIER"));
   const lake = yield* lakeEnabled;
   const lakeReaderVerifier = yield* givenVerifier("ALASIO_LAKE_READER_VERIFIER");
   const grafanaVerifier = yield* givenVerifier("ALASIO_GRAFANA_VERIFIER");
@@ -219,7 +224,7 @@ const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope | LakeWak
     runFork(Effect.logWarning(`idle database connection lost: ${error.message}`));
   };
   const { pool, sessionStore, rollouts } = yield* Effect.acquireRelease(
-    openNeon({ databaseUrl, lakeVerifier, harnessVerifier, lake, lakeReaderVerifier, grafanaVerifier }, onIdleError, wake).pipe(
+    openNeon({ databaseUrl, lakeVerifier, harnessVerifier, codexLoginVerifier, lake, lakeReaderVerifier, grafanaVerifier }, onIdleError, wake).pipe(
       Effect.retry(whileNeonStarts),
       withAlasioSpan("alasio.neon.connect", { attributes: { "alasio.neon.lake": lake } }),
       Effect.interruptible,
@@ -301,9 +306,9 @@ const deploymentPool = <P extends Pool>(make: (config: pg.PoolConfig) => P): Eff
   }).pipe(withLogScope("neon"));
 
 /**
- * The relay of alasio's Codex login's connection to alasio's Neon (../codex/relay.ts), as
- * alasio's own role, whose state keeps the login: its pool, open while the scope is, which makes
- * nothing there, as alasio has made it.
+ * The relay of alasio's Codex login's connection to alasio's Neon (../codex/relay.ts), as its
+ * own role (./codex-login.ts), which reaches the login of alasio's state alone: its pool, open
+ * while the scope is, which makes nothing there, as alasio has made it.
  */
 export const connectRelayNeon: Effect.Effect<Pool, NeonError, Scope.Scope> = deploymentPool((config) => new pg.Pool(config));
 

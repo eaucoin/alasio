@@ -3,9 +3,10 @@
  * component of its own, from alasio's image, so a bound Codex harness goes on calling the model
  * while its environment's alasio sleeps:
  *
- * - its Deployment, of alasio.codexLogin.scaling's replicas, as alasio's role on the
- *   environment's database, whose state keeps the login, with the sandbox gateway's caller key,
- *   which alasio signs its Codex turns' tokens for the relay by. Its Codex home is its own,
+ * - its Deployment, of alasio.codexLogin.scaling's replicas, as a role of its own on the
+ *   environment's database, which reaches the login there alone, with the key alasio signs its
+ *   Codex turns' tokens for the relay by, and none of the caller key it is made of, which
+ *   signs the environment's sessions' tokens. Its Codex home is its own,
  *   written from the store and kept there, unless the host profile gives alasio the operator's
  *   home, whose `~/.codex` is then the relay's too, as the operator;
  * - KEDA's scaling of it on the gateway's count of the environment's Codex harnesses bound, of
@@ -16,12 +17,12 @@
 import type { KubernetesObject, V1Deployment, V1Service, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
 import { posix } from "node:path";
 
-import { ALASIO_GATEWAY_CALLER_KEY_VARIABLE } from "../../../src/gateway/names.ts";
-import { CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
+import { CODEX_LOGIN_KEY_VARIABLE, CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
 import { imageReference } from "../images.ts";
 import {
+  CODEX_LOGIN_DATABASE_SECRET,
+  CODEX_LOGIN_KEY_SECRET,
   componentName,
-  DATABASE_SECRET,
   type Environment,
   envOf,
   given,
@@ -33,7 +34,6 @@ import {
   restrictedContainer,
   restrictedPod,
   selectorLabels,
-  SESSIONS_CALLER_SECRET,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { foldersRun } from "./folders.ts";
@@ -101,7 +101,7 @@ function deployment(config: InstallConfig, environment: Environment): V1Deployme
               // A home of its own does not outlast its pod: the store keeps its login.
               ...(operatorHome ? [] : [{ name: "ALASIO_KEEP_CODEX_LOGIN", value: "1" }]),
               { name: "ALASIO_DATABASE_URL_FILE", value: "/run/alasio/database/url" },
-              { name: ALASIO_GATEWAY_CALLER_KEY_VARIABLE, valueFrom: { secretKeyRef: { name: SESSIONS_CALLER_SECRET, key: "caller-key" } } },
+              { name: CODEX_LOGIN_KEY_VARIABLE, valueFrom: { secretKeyRef: { name: CODEX_LOGIN_KEY_SECRET, key: "key" } } },
               ...otelEnv(config, environment),
             ],
             ports: [{ name: "codex-login", containerPort: CODEX_LOGIN_PORT }],
@@ -110,7 +110,7 @@ function deployment(config: InstallConfig, environment: Environment): V1Deployme
             resources: alasio.codexLogin.resources,
             volumeMounts: mounts,
           }],
-          volumes: [homeVolume, { name: "database", secret: { secretName: DATABASE_SECRET, items: [{ key: "url", path: "url" }] } }],
+          volumes: [homeVolume, { name: "database", secret: { secretName: CODEX_LOGIN_DATABASE_SECRET, items: [{ key: "url", path: "url" }] } }],
           ...given("nodeSelector", { ...alasio.nodeSelector }),
           ...given("tolerations", [...alasio.tolerations]),
           ...given("affinity", alasio.affinity),

@@ -16,18 +16,20 @@
  * alasio does with a home of its own; the operator's home, where the host profile gives alasio
  * theirs, is the relay's too.
  *
- * A request bears a token alasio gave the turn of a conversation's harness (poolLoginKey); any
- * other is refused. It reaches alasio's Neon as alasio's role, whose state keeps the login, and
- * makes nothing there.
+ * A request bears a token alasio gave the turn of a conversation's harness, checked by the key
+ * alasio signs them with (poolLoginKey), the relay's alone of the environment's keys: it holds
+ * none of the caller key that key is made of, which signs the environment's sessions' tokens. Any
+ * other is refused. It reaches alasio's Neon as a role of its own, which reaches the login of the
+ * state alone (../neon/codex-login.ts), and makes nothing there.
  *
- * Environment: ALASIO_DATABASE_URL (or its _FILE form), the sandbox gateway's caller key
- * (ALASIO_GATEWAY_CALLER_KEY), ALASIO_KEEP_CODEX_LOGIN, and CODEX_HOME or HOME.
+ * Environment: ALASIO_DATABASE_URL (or its _FILE form), the key of the turns' tokens
+ * (CODEX_LOGIN_KEY_VARIABLE, in hexadecimal), ALASIO_KEEP_CODEX_LOGIN, and CODEX_HOME or HOME.
  */
 import { join } from "node:path";
 
 import { Effect, Layer, type Scope } from "effect";
 
-import { ALASIO_GATEWAY_CALLER_KEY_VARIABLE } from "../gateway/names.ts";
+import { CODEX_LOGIN_KEY_VARIABLE } from "../harness/names.ts";
 import { connectRelayNeon } from "../neon/connect.ts";
 import { Store } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
@@ -35,12 +37,12 @@ import { CodexAppServer } from "./app-server/client.ts";
 import { codexHome } from "./env.ts";
 import { keepCodexLogin } from "./login.ts";
 import { CodexLoginFreshness } from "./login-refresh.ts";
-import { CODEX_LOGIN_PORT, type LoginRelayOptions, poolLoginKey, poolLoginRefusal, startLoginRelay } from "./login-relay.ts";
+import { CODEX_LOGIN_PORT, type LoginRelayOptions, poolLoginRefusal, startLoginRelay } from "./login-relay.ts";
 
 /** What the relay is run with, as its environment says. */
 export interface RelayConfig {
-  /** The sandbox gateway's caller key of the environment, which alasio signs its turns' tokens for the relay by (poolLoginKey). */
-  readonly callerKey: Buffer;
+  /** The key alasio signs its turns' tokens for the relay with (poolLoginKey). */
+  readonly loginKey: Buffer;
   /** Whether its Codex home is its own, written from the store and kept there, rather than the operator's. */
   readonly keepCodexLogin: boolean;
   /** Its Codex home. */
@@ -51,13 +53,13 @@ export interface RelayConfig {
 
 /** The relay's configuration from `env`, its process's. */
 export function loadRelayConfig(env: NodeJS.ProcessEnv = process.env): RelayConfig {
-  const callerKey = env[ALASIO_GATEWAY_CALLER_KEY_VARIABLE]?.trim();
-  if (!callerKey) throw new Error(`${ALASIO_GATEWAY_CALLER_KEY_VARIABLE} must be set`);
-  return { callerKey: Buffer.from(callerKey), keepCodexLogin: env["ALASIO_KEEP_CODEX_LOGIN"] === "1", home: codexHome(env), port: CODEX_LOGIN_PORT };
+  const loginKey = env[CODEX_LOGIN_KEY_VARIABLE]?.trim() ?? "";
+  if (!/^(?:[0-9a-f]{2})+$/u.test(loginKey)) throw new Error(`${CODEX_LOGIN_KEY_VARIABLE} must be set, in hexadecimal`);
+  return { loginKey: Buffer.from(loginKey, "hex"), keepCodexLogin: env["ALASIO_KEEP_CODEX_LOGIN"] === "1", home: codexHome(env), port: CODEX_LOGIN_PORT };
 }
 
 /** The relay of `config`, on the store, until the scope closes, as the module says, sending each request on as `upstreamFor` says, a test's: the port it listens on. */
-export const startRelay = Effect.fnUntraced(function*({ callerKey, keepCodexLogin: keeps, home, port }: RelayConfig, { upstreamFor }: Pick<LoginRelayOptions, "upstreamFor"> = {}): Effect.fn.Return<number, unknown, Store | CodexLoginFreshness | Scope.Scope> {
+export const startRelay = Effect.fnUntraced(function*({ loginKey, keepCodexLogin: keeps, home, port }: RelayConfig, { upstreamFor }: Pick<LoginRelayOptions, "upstreamFor"> = {}): Effect.fn.Return<number, unknown, Store | CodexLoginFreshness | Scope.Scope> {
   if (keeps) yield* keepCodexLogin(home);
   const { fresh } = yield* CodexLoginFreshness;
   const authFile = join(home, "auth.json");
@@ -66,7 +68,7 @@ export const startRelay = Effect.fnUntraced(function*({ callerKey, keepCodexLogi
     // A login refused passes on as it is, its access token good until it stops: a Codex turn refused it says why.
     fresh: Effect.catchTag(fresh, "CodexLoginRefused", () => Effect.void),
     listen: { host: "0.0.0.0", port },
-    authorize: poolLoginRefusal(poolLoginKey(callerKey), Date.now),
+    authorize: poolLoginRefusal(loginKey, Date.now),
     ...(upstreamFor ? { upstreamFor } : {}),
   });
   return Number(new URL(relay.url).port);

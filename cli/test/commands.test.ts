@@ -20,6 +20,7 @@ import { scramVerifier } from "../../neon/control/scram.ts";
 import { BINDING_LABEL, environmentKey, KEY_ANNOTATION, POOL_LABEL } from "../../src/binder/names.ts";
 import { verifyToken } from "../../src/binder/tokens.ts";
 import { forkToken } from "../../src/branch/names.ts";
+import { poolLoginKey } from "../../src/harness/names.ts";
 import { BOT_COMMANDS } from "../../src/telegram/bot-commands.ts";
 import type { TenantView } from "../src/branches.ts";
 import { CODEX_LOGIN } from "../src/commands/login.ts";
@@ -1821,6 +1822,7 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
     "lake-reader-verifier": "SCRAM-SHA-256$r",
     "grafana-verifier": "SCRAM-SHA-256$g",
     "harness-verifier": "SCRAM-SHA-256$h",
+    "codex-login-verifier": "SCRAM-SHA-256$x",
   });
   stackSecret(setup.kube, "alasio-lake", {
     LAKE_DATABASE_PASSWORD: "l",
@@ -2266,12 +2268,21 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   assert.notEqual(harnessUrl.password, url.password);
   assert.ok(verifies(compute?.verifiers["harness"], decodeURIComponent(harnessUrl.password)));
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-database", "harness-verifier"), compute?.verifiers["harness"]);
-  assert.deepEqual(Object.keys(compute?.verifiers ?? {}), ["alasio", "lake", "harness"]);
+  // Its Codex login relay's role's own password likewise, and the key of its turns' tokens alone, made of its callers' key.
+  const codexLoginUrl = new URL(secretIn(kube, "alasio-branch-try", "alasio-codex-login-database", "url") ?? "");
+  assert.deepEqual([codexLoginUrl.username, codexLoginUrl.host, codexLoginUrl.searchParams.get("options")], ["codex_login", "alasio-neon-proxy.alasio.svc:5432", "endpoint=branch-try"]);
+  assert.ok(verifies(compute?.verifiers["codex_login"], decodeURIComponent(codexLoginUrl.password)));
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-database", "codex-login-verifier"), compute?.verifiers["codex_login"]);
+  const callerKey = secretIn(kube, "alasio-branch-try", "alasio-sessions-caller", "caller-key") ?? "";
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-codex-login-key", "key"), poolLoginKey(Buffer.from(callerKey)).toString("hex"));
+  assert.deepEqual(Object.keys(compute?.verifiers ?? {}), ["alasio", "lake", "harness", "codex_login"]);
   // Of main's, only the lake's object store identity, which reads main's files where they are.
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-lake", "LAKE_S3_KEY"), "k");
   const keys = (name: string) => Object.keys((kube.get(`/api/v1/namespaces/alasio-branch-try/secrets/${name}`)?.["data"] ?? {}) as object).sort();
-  assert.deepEqual(keys("alasio-database"), ["harness-verifier", "lake-verifier", "url"]);
+  assert.deepEqual(keys("alasio-database"), ["codex-login-verifier", "harness-verifier", "lake-verifier", "url"]);
   assert.deepEqual(keys("alasio-harness-database"), ["url"]);
+  assert.deepEqual(keys("alasio-codex-login-database"), ["url"]);
+  assert.deepEqual(keys("alasio-codex-login-key"), ["key"]);
   assert.deepEqual(keys("alasio-lake"), ["LAKE_DATABASE_PASSWORD", "LAKE_S3_KEY", "LAKE_S3_SECRET"]);
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-claude", "token"), "sk-ant-oat01-claude");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branch-fork", "token"), forkToken("key", "try"));

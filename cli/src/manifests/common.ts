@@ -82,6 +82,16 @@ export const BRANCH_FORK_SECRET = componentName("branch-fork");
  */
 export const SESSIONS_CALLER_SECRET = componentName("sessions-caller");
 
+/**
+ * The Secrets of an environment's relay of its Codex login (src/codex/relay.ts): its database
+ * URL, as the relay's own role (neon/control/secrets.ts CODEX_LOGIN_ROLE); and the key it checks
+ * the tokens of its harness pools' Codex turns by (src/codex/login-relay.ts poolLoginKey), made of
+ * the environment's callers' key, which the relay holds none of. main's as Neon's setup renders
+ * them, a branch environment's as `alasio branch create` writes them.
+ */
+export const CODEX_LOGIN_DATABASE_SECRET = componentName("codex-login-database");
+export const CODEX_LOGIN_KEY_SECRET = componentName("codex-login-key");
+
 /** A Neon service's name: `alasio-neon-<component>`. */
 export function neonName(component: string): string {
   return componentName(`neon-${component}`);

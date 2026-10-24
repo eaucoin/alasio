@@ -23,7 +23,7 @@ test("alasio setup makes alasio's state, the harness host's grants and policies 
   try {
     await admin.query("create role alasio login password 'alasio-password' createrole createdb");
     await admin.query("create database alasio owner alasio");
-    const env = { ALASIO_DATABASE_URL: url.toString(), ALASIO_LAKE_VERIFIER: scramVerifier("lake-password"), ALASIO_HARNESS_VERIFIER: scramVerifier("harness-password") };
+    const env = { ALASIO_DATABASE_URL: url.toString(), ALASIO_LAKE_VERIFIER: scramVerifier("lake-password"), ALASIO_HARNESS_VERIFIER: scramVerifier("harness-password"), ALASIO_CODEX_LOGIN_VERIFIER: scramVerifier("codex-login-password") };
     const setUp = Effect.scoped(setUpState({ workingDirectory: null, branch: null })).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))));
     await Effect.runPromise(setUp);
     const owner = new pg.Client({ connectionString: url.toString() });

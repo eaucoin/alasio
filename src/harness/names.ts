@@ -10,12 +10,25 @@
  * `null` harness is therefore a real state, not a fallback, and callers must
  * not coerce it to a default.
  */
+import { createHmac } from "node:crypto";
+
 export const CODEX_HARNESS = "codex";
 export const CLAUDE_HARNESS = "claude";
 export const HARNESS_NAMES = Object.freeze([CODEX_HARNESS, CLAUDE_HARNESS] as const);
 
 /** The port alasio relays its Codex login to its harness pools' pods on (../codex/login-relay.ts). */
 export const CODEX_LOGIN_PORT = 4320;
+
+/** The variable the relay of the Codex login is given the key it checks the turns' tokens by in, in hexadecimal (poolLoginKey). */
+export const CODEX_LOGIN_KEY_VARIABLE = "ALASIO_CODEX_LOGIN_KEY";
+
+/**
+ * The key alasio's pool login tokens, which the relay of the Codex login checks
+ * (../codex/login-relay.ts), are signed with: its environment's own key of the gateway's caller
+ * key's, made apart, so a token of one is never the other, and the relay, holding it alone, signs
+ * none of the environment's sessions' tokens.
+ */
+export const poolLoginKey = (environmentKey: Buffer): Buffer => createHmac("sha256", environmentKey).update("codex-login").digest();
 
 /** The name of a harness alasio can drive. */
 export type HarnessName = (typeof HARNESS_NAMES)[number];

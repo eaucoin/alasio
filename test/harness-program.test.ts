@@ -125,7 +125,7 @@ test("alasio harness binds its conversation and serves its host to the bearer of
   const [earlier, home, stateDir, folder] = ["earlier", "home", "state", "folder"].map((name) => join(dir, name));
   for (const made of [earlier, home, stateDir, folder]) mkdirSync(made!, { recursive: true });
   process.env["CODEX_HOME"] = home;
-  const neonEnv = (url: string) => ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ALASIO_DATABASE_URL: url, ALASIO_LAKE_VERIFIER: scramVerifier("lake-password"), ALASIO_HARNESS_VERIFIER: scramVerifier("harness-password") } }));
+  const neonEnv = (url: string) => ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ALASIO_DATABASE_URL: url, ALASIO_LAKE_VERIFIER: scramVerifier("lake-password"), ALASIO_HARNESS_VERIFIER: scramVerifier("harness-password"), ALASIO_CODEX_LOGIN_VERIFIER: scramVerifier("codex-login-password") } }));
   const scope = Effect.runSync(Scope.make());
   /** `effect`, in the test's scope, which closes as the test ends. */
   const inScope = <A, E>(effect: Effect.Effect<A, E, Scope.Scope>) => Effect.runPromise(Scope.provide(effect, scope));

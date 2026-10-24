@@ -97,7 +97,7 @@ test("a turn run through the harness host as its own role writes all a turn writ
   const stateDir = mkdtempSync(join(tmpdir(), "alasio-harness-role-"));
   try {
     await run(database.url, "create role alasio login password 'alasio-password' createrole createdb", "create database alasio owner alasio");
-    const env = { ALASIO_DATABASE_URL: as("alasio", "alasio-password"), ALASIO_LAKE_VERIFIER: scramVerifier("lake-password"), ALASIO_HARNESS_VERIFIER: scramVerifier("harness-password") };
+    const env = { ALASIO_DATABASE_URL: as("alasio", "alasio-password"), ALASIO_LAKE_VERIFIER: scramVerifier("lake-password"), ALASIO_HARNESS_VERIFIER: scramVerifier("harness-password"), ALASIO_CODEX_LOGIN_VERIFIER: scramVerifier("codex-login-password") };
     const own: OwnTurns[] = [];
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const neon = yield* Neon.make;

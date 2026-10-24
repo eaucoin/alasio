@@ -46,7 +46,12 @@ const DEV_TIMELINE = "22222222222222222222222222222222";
 
 /** dev's compute's own credentials: its roles' passwords' verifiers, and its token's hash. */
 const DEV_COMPUTE = {
-  verifiers: { alasio: scramVerifier("dev-password"), lake: scramVerifier("dev-lake-password"), harness: scramVerifier("dev-harness-password") },
+  verifiers: {
+    alasio: scramVerifier("dev-password"),
+    lake: scramVerifier("dev-lake-password"),
+    harness: scramVerifier("dev-harness-password"),
+    codex_login: scramVerifier("dev-codex-login-password"),
+  },
   tokenSha256: tokenSha256("dev-token"),
 };
 

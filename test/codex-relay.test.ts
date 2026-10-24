@@ -15,7 +15,8 @@ import { Effect, Exit, Layer, Logger, Scope } from "effect";
 
 import { mintToken } from "../src/binder/tokens.ts";
 import { CodexLoginFreshness, makeCodexLoginFreshness } from "../src/codex/login-refresh.ts";
-import { loginUpstream, poolLoginKey } from "../src/codex/login-relay.ts";
+import { loginUpstream } from "../src/codex/login-relay.ts";
+import { poolLoginKey } from "../src/harness/names.ts";
 import { startRelay } from "../src/codex/relay.ts";
 import { harnessKey } from "../src/gateway/names.ts";
 import { Store } from "../src/persistence/store.ts";
@@ -59,7 +60,7 @@ test("a relay of its own home takes the store's login as it starts, and the one 
     // Its freshness as the relay's own, over the store; no login here is due, so none is refreshed.
     const freshness = Layer.effect(CodexLoginFreshness, makeCodexLoginFreshness({ home, refresh: Effect.fail({ message: "no refresh is due" }), reload: Effect.void }));
     const services = Layer.provideMerge(freshness, Layer.succeed(Store, store));
-    const port = await Effect.runPromise(startRelay({ callerKey: CALLER_KEY, keepCodexLogin: true, home, port: 0 }, {
+    const port = await Effect.runPromise(startRelay({ loginKey: poolLoginKey(CALLER_KEY), keepCodexLogin: true, home, port: 0 }, {
       upstreamFor: (file, path) => {
         const upstreamOf = loginUpstream(file, path);
         return upstreamOf && { ...upstreamOf, origin };

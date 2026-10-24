@@ -23,7 +23,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 
 import { SESSIONS_SUFFIX } from "../../src/branch/names.ts";
 import type { JsonWebKeySet } from "./jwt.ts";
-import { DATABASE, HARNESS_ROLE, LAKE_ROLE, ROLE } from "./secrets.ts";
+import { CODEX_LOGIN_ROLE, DATABASE, HARNESS_ROLE, LAKE_ROLE, ROLE } from "./secrets.ts";
 
 /** alasio's own branch: its first timeline, bootstrapped, never deleted. */
 export const MAIN = "main";
@@ -51,8 +51,8 @@ export interface Placement {
   ids: number[];
 }
 
-/** The roles a branch's clients connect as: alasio's, its lake's, and its harness host's. */
-export const BRANCH_ROLES = [ROLE, LAKE_ROLE, HARNESS_ROLE] as const;
+/** The roles a branch's clients connect as: alasio's, its lake's, its harness host's, and its Codex login relay's. */
+export const BRANCH_ROLES = [ROLE, LAKE_ROLE, HARNESS_ROLE, CODEX_LOGIN_ROLE] as const;
 
 /** A branch's compute's own credentials, as neon-control keeps them: hashes alone. */
 export interface ComputeCredentials {
@@ -164,7 +164,10 @@ function computeCredentials(value: unknown): ComputeCredentials {
     throw new BranchError(400, `a branch's compute is given as { verifiers, tokenSha256 }: a SCRAM-SHA-256 verifier of each of ${BRANCH_ROLES.join(", ")}, and a SHA-256 in hexadecimal`);
   }
   // Each checked above to be a verifier.
-  return { verifiers: { [ROLE]: given[ROLE] as string, [LAKE_ROLE]: given[LAKE_ROLE] as string, [HARNESS_ROLE]: given[HARNESS_ROLE] as string }, tokenSha256: sha };
+  return {
+    verifiers: { [ROLE]: given[ROLE] as string, [LAKE_ROLE]: given[LAKE_ROLE] as string, [HARNESS_ROLE]: given[HARNESS_ROLE] as string, [CODEX_LOGIN_ROLE]: given[CODEX_LOGIN_ROLE] as string },
+    tokenSha256: sha,
+  };
 }
 
 /** The branch `body` asks for: `{ name, parent?, lsn?, compute }`, its parent main if not given. */

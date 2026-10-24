@@ -58,7 +58,7 @@ import { carriedPools, workspaceMountReady, workspaceMountScript } from "../src/
 import { folderStateDir, templateHash } from "../../src/gateway/names.ts";
 import { hookOf } from "../../src/gateway/snapshots.ts";
 import { VERSION } from "../src/release.ts";
-import { SETUP_LABEL, setupPod } from "../src/setup-pod.ts";
+import { SETUP_LABEL, setupPod, stackSetupPod } from "../src/setup-pod.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
 /** A NetworkPolicy as rendered, its ingress rules' peers under `from`. */
@@ -864,15 +864,16 @@ describe("the lake's readers", () => {
 
   test("has alasio make the lake reader's role while the lake runs", () => {
     const alasio = (file: Record<string, unknown>) => one<V1Deployment>(install(file), "Deployment", "alasio");
-    assert.deepEqual(verifierFiles(alasio({}))?.slice(0, 3), [
+    assert.deepEqual(verifierFiles(alasio({}))?.slice(0, 4), [
       ["ALASIO_LAKE_VERIFIER_FILE", "/run/alasio/database/lake-verifier"],
       ["ALASIO_HARNESS_VERIFIER_FILE", "/run/alasio/database/harness-verifier"],
+      ["ALASIO_CODEX_LOGIN_VERIFIER_FILE", "/run/alasio/database/codex-login-verifier"],
       ["ALASIO_LAKE_READER_VERIFIER_FILE", "/run/alasio/database/lake-reader-verifier"],
     ]);
     const database = alasio({}).spec?.template.spec?.volumes?.find(({ name }) => name === "database");
-    assert.deepEqual(database?.secret?.items?.map(({ key }) => key).slice(0, 4), ["url", "lake-verifier", "harness-verifier", "lake-reader-verifier"]);
-    // The lake's role and the harness host's alasio makes whatever runs.
-    assert.deepEqual(verifierFiles(alasio({ lake: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_VERIFIER_FILE", "ALASIO_HARNESS_VERIFIER_FILE"]);
+    assert.deepEqual(database?.secret?.items?.map(({ key }) => key).slice(0, 5), ["url", "lake-verifier", "harness-verifier", "codex-login-verifier", "lake-reader-verifier"]);
+    // The lake's role, the harness host's and the Codex login relay's alasio makes whatever runs.
+    assert.deepEqual(verifierFiles(alasio({ lake: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_VERIFIER_FILE", "ALASIO_HARNESS_VERIFIER_FILE", "ALASIO_CODEX_LOGIN_VERIFIER_FILE"]);
     // The log's password beside them, as alasio reaches its Telegram topic.
     assert.equal(container(alasio({})).env?.find(({ name }) => name === "ALASIO_LOG_PASSWORD_FILE")?.value, "/run/alasio/log/password");
   });
@@ -1490,8 +1491,8 @@ describe("Grafana", () => {
     const alasio = (file: Record<string, unknown>) => one<V1Deployment>(install(file), "Deployment", "alasio");
     assert.deepEqual(verifierFiles(alasio({}))?.at(-1), ["ALASIO_GRAFANA_VERIFIER_FILE", "/run/alasio/database/grafana-verifier"]);
     const database = alasio({}).spec?.template.spec?.volumes?.find(({ name }) => name === "database");
-    assert.deepEqual(database?.secret?.items?.map(({ key }) => key), ["url", "lake-verifier", "harness-verifier", "lake-reader-verifier", "grafana-verifier"]);
-    assert.deepEqual(verifierFiles(alasio({ grafana: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_VERIFIER_FILE", "ALASIO_HARNESS_VERIFIER_FILE", "ALASIO_LAKE_READER_VERIFIER_FILE"]);
+    assert.deepEqual(database?.secret?.items?.map(({ key }) => key), ["url", "lake-verifier", "harness-verifier", "codex-login-verifier", "lake-reader-verifier", "grafana-verifier"]);
+    assert.deepEqual(verifierFiles(alasio({ grafana: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_VERIFIER_FILE", "ALASIO_HARNESS_VERIFIER_FILE", "ALASIO_CODEX_LOGIN_VERIFIER_FILE", "ALASIO_LAKE_READER_VERIFIER_FILE"]);
   });
 });
 
@@ -2712,7 +2713,7 @@ describe("branch environments", () => {
     // It makes no role for what reads main's Neon beside it, which a branch has none of.
     assert.equal(variable(alasio, "ALASIO_LAKE_READER_VERIFIER_FILE"), undefined);
     assert.equal(variable(alasio, "ALASIO_GRAFANA_VERIFIER_FILE"), undefined);
-    assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "database")?.secret?.items?.map(({ key }) => key), ["url", "lake-verifier", "harness-verifier"]);
+    assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "database")?.secret?.items?.map(({ key }) => key), ["url", "lake-verifier", "harness-verifier", "codex-login-verifier"]);
     // Its sandboxes' telemetry is tagged by main's receiver, as each binding's token names its namespace.
     for (const workload of all<V1Deployment>(branch, "Deployment").filter(({ metadata }) => !metadata?.name?.startsWith("sandboxes-"))) {
       assert.equal(variable(workload, "OTEL_RESOURCE_ATTRIBUTES"), "alasio.branch=try", workload.metadata?.name);
@@ -3907,7 +3908,7 @@ describe("conversations' harnesses' pools", () => {
 
 
 describe("the relay of an environment's Codex login", () => {
-  test("is a component of its own, from alasio's image, as alasio's role with the gateway's caller key, its own Codex home kept in the store, holding no Kubernetes token", () => {
+  test("is a component of its own, from alasio's image, as a role of its own with the key of its turns' tokens alone, none of the callers' key it is made of, its own Codex home kept in the store, holding no Kubernetes token", () => {
     const objects = install();
     const relay = one<V1Deployment>(objects, "Deployment", "alasio-codex-login");
     const spec = relay.spec?.template.spec;
@@ -3916,9 +3917,13 @@ describe("the relay of an environment's Codex login", () => {
     assert.equal(spec?.automountServiceAccountToken, false);
     const env = Object.fromEntries((container(relay).env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
     assert.deepEqual([env["HOME"], env["CODEX_HOME"], env["ALASIO_KEEP_CODEX_LOGIN"], env["ALASIO_DATABASE_URL_FILE"]], ["/var/lib/alasio/home", "/var/lib/alasio/home/.codex", "1", "/run/alasio/database/url"]);
-    assert.deepEqual(env["ALASIO_GATEWAY_CALLER_KEY"], { secretKeyRef: { name: "alasio-sessions-caller", key: "caller-key" } });
-    // alasio's role's URL alone of the database's Secret: no verifier, as it makes no role.
-    assert.deepEqual(spec?.volumes?.find(({ name }) => name === "database"), { name: "database", secret: { secretName: "alasio-database", items: [{ key: "url", path: "url" }] } });
+    assert.deepEqual(env["ALASIO_CODEX_LOGIN_KEY"], { secretKeyRef: { name: "alasio-codex-login-key", key: "key" } });
+    // Nothing of the callers' key, nor of the gateway's keys, which sign the environment's sessions' tokens.
+    const secretsOf = JSON.stringify([container(relay).env, spec?.volumes]);
+    for (const secret of ["alasio-sessions-caller", "alasio-sandbox-gateway", "alasio-database"]) assert.ok(!secretsOf.includes(`"${secret}"`), secret);
+    assert.equal(env["ALASIO_GATEWAY_CALLER_KEY"], undefined);
+    // Its own role's URL: no verifier, as it makes no role.
+    assert.deepEqual(spec?.volumes?.find(({ name }) => name === "database"), { name: "database", secret: { secretName: "alasio-codex-login-database", items: [{ key: "url", path: "url" }] } });
     assert.deepEqual(spec?.volumes?.find(({ name }) => name === "codex-home"), { name: "codex-home", emptyDir: {} });
     // Its Service, which the pools' pods' Codex reaches, selects it, not alasio.
     assert.deepEqual(one<V1Service>(objects, "Service", "alasio-codex-login").spec?.selector, relay.spec?.selector.matchLabels);
@@ -3972,4 +3977,16 @@ test("the release's setup pod is alasio's own container, its image, environment 
   assert.equal(pod.spec?.volumes?.some(({ hostPath }) => hostPath !== undefined), false);
   assert.ok(setup?.volumeMounts?.every(({ name }) => pod.spec?.volumes?.some((volume) => volume.name === name)));
   assert.equal(pod.spec?.serviceAccountName, "alasio");
+});
+
+test("the release's stack setup's pod is its neon-setup Job's, its image, command, environment and service account, run once to its end, labelled as the Job's pods", () => {
+  const objects = install();
+  const job = one<V1Job>(objects, "Job", "alasio-neon-setup");
+  const pod = stackSetupPod(objects);
+  assert.deepEqual([pod.kind, pod.metadata?.name, pod.metadata?.namespace, pod.spec?.restartPolicy], ["Pod", "alasio-stack-setup", "alasio", "Never"]);
+  assert.deepEqual(pod.metadata?.labels, { ...job.spec?.template.metadata?.labels, [SETUP_LABEL]: "true" });
+  assert.deepEqual(pod.spec?.containers, job.spec?.template.spec?.containers);
+  assert.deepEqual(pod.spec?.containers[0]?.command, ["node", "/opt/alasio/neon/control/kube-setup.ts"]);
+  assert.equal(pod.spec?.serviceAccountName, "alasio-neon-setup");
+  assert.throws(() => stackSetupPod(objects.filter(({ kind }) => kind !== "Job")), /has no alasio\/alasio-neon-setup Job/u);
 });

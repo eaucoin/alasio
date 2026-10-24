@@ -29,7 +29,7 @@ import pg from "pg";
 import { memoryBytes } from "../../cli/src/capacity.ts";
 import type { KindName } from "../../cli/src/kube/api.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
-import { componentName, MAIN_ENVIRONMENT, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
+import { componentName, DATABASE_SECRET, MAIN_ENVIRONMENT, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT, WORKSPACE_MOUNT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { pageserverName } from "../../cli/src/manifests/neon.ts";
 import { HOST_BAYMA_IMAGE, TELEGRAM_PARTITIONS } from "../../cli/src/manifests/config.ts";
@@ -340,6 +340,18 @@ if (inShard("upgrade")) {
       };
     };
     let secretsBefore: Awaited<ReturnType<typeof stackSecrets>>;
+    /** The key the stack's secrets are kept whole under, in its root Secret, which stackSecrets reads field by field. */
+    const ROOT_SECRETS = `${neonName("root")}/secrets.json`;
+    /**
+     * Every key of every Secret of alasio's namespace, `<Secret>/<key>`, and its value's hash: the
+     * services' Secrets the stack setup renders among them, so a setup run again shows what it
+     * changed of those, and what it added. All but the stack's secrets kept whole, one value that
+     * a release's secrets are added to, which stackSecrets reads field by field.
+     */
+    const namespaceSecrets = async (): Promise<Readonly<Record<string, string>>> =>
+      Object.fromEntries((await kube.list<V1Secret>("Secret", { namespace: NAMESPACE })).flatMap(({ metadata, data }) =>
+        Object.entries(data ?? {}).map(([key, value]) => [`${metadata?.name}/${key}`, createHash("sha256").update(value).digest("hex").slice(0, 12)])
+      ).filter(([key]) => key !== ROOT_SECRETS));
     /** When the telemetry the lake held was counted, and how many of alasio's spans it held then; and when the cut-over was through. */
     let counted: number;
     let spans: number;
@@ -465,8 +477,8 @@ if (inShard("upgrade")) {
           const after = await stackSecrets();
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
-          // And this release adds nothing to the stack's.
-          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), []);
+          // And this release adds to the stack's the Codex login relay's role's password and verifier alone.
+          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), ["codexLoginPassword", "verifiers.codex_login"]);
         },
       },
       {
@@ -603,11 +615,20 @@ if (inShard("upgrade")) {
       await tg.waitFor((call) => answered(call));
     });
 
-    test(`the cut-over from ${PREVIOUS}, failing before its point of no return, once every step before it has run, changes nothing, and a run again starts over`, { timeout: 60 * 60_000 }, async () => {
+    test(`the cut-over from ${PREVIOUS}, failing before its point of no return, once every step before it has run, changes nothing but adding this release's secrets, and a run again starts over`, { timeout: 60 * 60_000 }, async () => {
       const generation = await alasioGeneration();
+      const [secrets, stack] = [await namespaceSecrets(), await stackSecrets()];
       const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
       assert.notEqual(failed.code, 0, failed.stdout);
-      assert.match(failed.stderr, /checking that the upgrade can run [^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
+      assert.match(failed.stderr, /checking that the upgrade can run [^\n]*\n[^\n]* making what the stack's secrets lack with this release's stack setup[^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
+      // The release's stack setup kept every key of every Secret 9.0.0's made, its value too, and added the Codex login relay's role's
+      // verifier; and of the stack's secrets, kept whole as one value, it kept every field, adding the role's password and verifier alone.
+      const after = await namespaceSecrets();
+      assert.deepEqual(Object.keys(secrets).filter((key) => after[key] !== secrets[key]), []);
+      assert.ok(Object.keys(after).includes(`${DATABASE_SECRET}/codex-login-verifier`), Object.keys(after).filter((key) => !(key in secrets)).join(", "));
+      const stackAfter = await stackSecrets();
+      assert.deepEqual(Object.keys(stack.root).filter((key) => stackAfter.root[key] !== stack.root[key]), []);
+      assert.deepEqual(Object.keys(stackAfter.root).filter((key) => !(key in stack.root)).sort(), ["codexLoginPassword", "verifiers.codex_login"]);
       assert.ok(!(await recorded()).includes("point-of-no-return"));
       assert.equal(await alasioGeneration(), generation);
       assert.ok(await runs(RELEASE), "alasio runs as it did");

@@ -6,7 +6,7 @@
 # for k3s on this machine). Everything is recorded in OUT, which is to be on a disk that
 # outlives a restart of the machine, as /tmp may not.
 #
-#   UPGRADE=<command> UPGRADE_CHECK=<command> SETUP_POD=<command> CONFIG=<file> OUT=<dir> [FAIL_AT=<point>] upgrades/from-9.0.0.sh
+#   UPGRADE=<command> UPGRADE_CHECK=<command> SETUP_POD=<command> SETUP_JOB=<command> CONFIG=<file> OUT=<dir> [FAIL_AT=<point>] upgrades/from-9.0.0.sh
 #
 # CONFIG is the configuration's file, the owner's alasio/config.json, which UPGRADE upgrades
 # by and the steps below read, and change where they say.
@@ -20,10 +20,13 @@
 #   UPGRADE="$as npx --yes alasio@<v> upgrade --timeout 30m"
 #   UPGRADE_CHECK="$as npx --yes alasio@<v> upgrade --check && sudo -u <owner> sudo -n true"
 #   SETUP_POD="$as npx --yes alasio@<v> upgrade --setup-pod"
+#   SETUP_JOB="$as npx --yes alasio@<v> upgrade --setup-job"
 #
 # SETUP_POD prints, changing nothing, the release's pod that makes alasio's state alone (its
 # `alasio setup`), which the cut-over runs before the upgrade, as its sessions' conversations
-# say. The last of UPGRADE_CHECK proving that the owner's sudo asks for no password, which the upgrade does what it
+# say. SETUP_JOB prints, changing nothing, the pod of the release's stack setup, which makes what
+# the stack's secrets lack, which the cut-over runs before the point of no return, as the
+# release's setup pod reads a secret 9.0.0's never made. The last of UPGRADE_CHECK proving that the owner's sudo asks for no password, which the upgrade does what it
 # does as root through. FAIL_AT=before-the-point-of-no-return fails the run there, once every
 # step before the upgrade has run; FAIL_AT=past-the-point-of-no-return past it, before the
 # upgrade; and FAIL_AT=after-the-upgrade once the upgrade is through, before what follows it:
@@ -45,7 +48,7 @@
 # and once the upgrade went through (OUT/upgraded), with what follows it alone.
 set -euo pipefail
 umask 077
-: "${UPGRADE:?the upgrade of the release, run as the owner of the configuration}" "${UPGRADE_CHECK:?a command proving UPGRADE can run}" "${SETUP_POD:?a command printing the release's pod that makes alasio's state}" "${CONFIG:?the file of the configuration}" "${OUT:?where to record}"
+: "${UPGRADE:?the upgrade of the release, run as the owner of the configuration}" "${UPGRADE_CHECK:?a command proving UPGRADE can run}" "${SETUP_POD:?a command printing the release's pod that makes alasio's state}" "${SETUP_JOB:?a command printing the pod of the release that makes the secrets of the stack}" "${CONFIG:?the file of the configuration}" "${OUT:?where to record}"
 mkdir -p "$OUT"
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$OUT/events.log" >&2; }
 fail() {
@@ -197,14 +200,20 @@ sessions_claimed_before() {
   jq -e '.kind == "Pod" and (.spec.containers | length) == 1' "$OUT/setup-pod.json" >/dev/null || fail "SETUP_POD printed no pod of one container (setup-pod.json)"
 }
 # Runs the setup pod, as named `$1`, with its container's command `$2` (a JSON array) and, where
-# given, its SQL `$3`, to its end: its last lines in OUT/<name>.log; failing where it did not succeed.
+# given, its SQL `$3`, to its end (run_pod).
 one_off() {
-  local name=$1 phase waited=0
+  local name=$1
   jq --arg name "$name" --argjson command "$2" --arg sql "${3:-}" '
     .metadata.name = $name
     | .spec.containers[0].command = $command
     | if $sql == "" then . else .spec.containers[0].env += [{ name: "ALASIO_CUTOVER_SQL", value: $sql }] end
   ' "$OUT/setup-pod.json" >"$OUT/$name.json" || fail "the pod $name could not be made of setup-pod.json"
+  run_pod "$name"
+}
+# Runs the pod OUT/`$1`.json names `$1` to its end, waited for SETUP_WAIT_SECONDS at most: its
+# last lines in OUT/<name>.log, the pod deleted after; failing where it did not succeed.
+run_pod() {
+  local name=$1 phase waited=0
   k delete pod "$name" --ignore-not-found --wait >/dev/null || fail "a pod $name left before could not be deleted"
   k apply -f "$OUT/$name.json" >/dev/null || fail "the pod $name could not be made"
   while :; do
@@ -277,6 +286,31 @@ sessions_claimed_past() {
 }
 # END the sessions' conversations.
 
+# BEGIN the stack's secrets.
+#
+# This release's alasio reads a secret of the stack's that 9.0.0's setup never made, the Codex
+# login relay's role's verifier, in the database Secret alasio mounts, beside the relay's own
+# Secrets: the release's stack setup (neon/control/kube-setup.ts) makes them, which the upgrade
+# runs as applying alasio does, before anything of the release starts. But the release's setup
+# pod, which mounts that Secret, runs before the upgrade, and would wait for the key to its
+# bound. So, before the point of no return, once the upgrade is checked, the release's stack
+# setup, the pod SETUP_JOB prints (its neon-setup Job's), runs once to its end, as the upgrade
+# runs it again after: it makes what the stack's secrets lack, and renders each service's from
+# them again, changing none of 9.0.0's, as it keeps every secret made and rotates none. A run
+# that fails before the point of no return leaves nothing to make again, and runs it again. Its
+# last lines in OUT/alasio-stack-setup.log, waited for SETUP_WAIT_SECONDS at most.
+
+STACK_SETUP_POD_NAME=alasio-stack-setup
+# Before the point of no return: the release's stack setup run, the secrets it lacks made.
+stack_setup_before() {
+  bash -c "$SETUP_JOB" >"$OUT/setup-job.json" 2>"$OUT/setup-job.log" || fail "SETUP_JOB failed, so the release's stack setup could not run (setup-job.log): $(tail -n 3 "$OUT/setup-job.log")"
+  jq -e '.kind == "Pod" and (.spec.containers | length) == 1' "$OUT/setup-job.json" >/dev/null || fail "SETUP_JOB printed no pod of one container (setup-job.json)"
+  jq --arg name "$STACK_SETUP_POD_NAME" '.metadata.name = $name' "$OUT/setup-job.json" >"$OUT/$STACK_SETUP_POD_NAME.json" || fail "the pod $STACK_SETUP_POD_NAME could not be made of setup-job.json"
+  log "making what the stack's secrets lack with this release's stack setup, changing none of those there ($STACK_SETUP_POD_NAME.log)"
+  run_pod "$STACK_SETUP_POD_NAME"
+}
+# END the stack's secrets.
+
 
 # BEGIN telegram partitions.
 #
@@ -340,6 +374,7 @@ if [ ! -e "$OUT/point-of-no-return" ]; then
   sessions_claimed_before
   log "checking that the upgrade can run (upgrade-check.log)"
   accepted || fail "UPGRADE_CHECK failed, so UPGRADE could not run (upgrade-check.log): $(tail -n 3 "$OUT/upgrade-check.log")"
+  stack_setup_before
   [ "${FAIL_AT:-}" != before-the-point-of-no-return ] || fail "a failure injected before the point of no return"
   date -u +%FT%TZ >"$OUT/point-of-no-return"
   log "past the point of no return: a run again goes on from here"

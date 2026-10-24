@@ -18,7 +18,10 @@ import { scramVerifier } from "../neon/control/scram.ts";
 import { startPostgres } from "./support/postgres.ts";
 
 /** dev's compute's own credentials, as its request gave them. */
-const dev: ComputeCredentials = { verifiers: { alasio: scramVerifier("dev-password"), lake: scramVerifier("dev-lake"), harness: scramVerifier("dev-harness") }, tokenSha256: "0".repeat(64) };
+const dev: ComputeCredentials = {
+  verifiers: { alasio: scramVerifier("dev-password"), lake: scramVerifier("dev-lake"), harness: scramVerifier("dev-harness"), codex_login: scramVerifier("dev-codex-login") },
+  tokenSha256: "0".repeat(64),
+};
 const mainVerifiers = {
   alasio: scramVerifier("main-password"),
   lake: scramVerifier("main-lake"),

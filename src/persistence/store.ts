@@ -36,6 +36,7 @@ import { type KeptPress, NeonPressRepository, type NewKeptPress } from "./press-
 import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState } from "./prompt-job-repository.ts";
 import { type CompletedResponse, NeonResponseRepository, type ResponseBlock } from "./response-repository.ts";
 import { NeonHarnessGrantRepository } from "./harness-grant-repository.ts";
+import { grantCodexLogin } from "./codex-login-grants.ts";
 import { grantHarness } from "./harness-grants.ts";
 import { ensureSchema } from "./schema.ts";
 import { type NewSessionWorkspace, NeonSessionWorkspaceRepository, type SessionWorkspace, type SessionWorkspaceNetMode } from "./session-workspace-repository.ts";
@@ -110,12 +111,14 @@ export interface StoreOptions {
   readonly chatStatementTimeout?: Duration.Input | undefined;
   /**
    * Whether it makes the schema: its tables where missing, a branch's state its own, and the
-   * harness host's grants. alasio's store does; the harness host's, of the schema alasio made,
-   * as a role that may make nothing, does none of it.
+   * harness host's and the Codex login relay's grants. alasio's store does; the harness host's
+   * and the relay's, of the schema alasio made, as roles that may make nothing, do none of it.
    */
   readonly makesSchema?: boolean | undefined;
   /** The harness host's role, granted what it writes once the tables are made (./harness-grants.ts); none where no harness host writes. */
   readonly harnessRole?: string | null | undefined;
+  /** The Codex login relay's role, granted the login once the tables are made (./codex-login-grants.ts); none where no relay keeps it. */
+  readonly codexLoginRole?: string | null | undefined;
 }
 
 /**
@@ -595,6 +598,7 @@ const makeStore = Effect.fnUntraced(function*({
   chatStatementTimeout = CHAT_STATEMENT_TIMEOUT,
   makesSchema = true,
   harnessRole = null,
+  codexLoginRole = null,
 }: StoreOptions) {
   const database = poolDatabase(pool);
   /** Bounds the statements of a chat's handling or delivery transaction `sql` (CHAT_STATEMENT_TIMEOUT), for that transaction alone. */
@@ -606,6 +610,7 @@ const makeStore = Effect.fnUntraced(function*({
   if (makesSchema) {
     yield* ensureSchema(database, schema);
     if (harnessRole) yield* grantHarness(database, schema, harnessRole);
+    if (codexLoginRole) yield* grantCodexLogin(database, schema, codexLoginRole);
     if (branch && (yield* startBranch(database, schema, branch))) {
       yield* Effect.logInfo(`made the state the branch ${branch}'s: what was in flight where it was branched from is gone`);
     }

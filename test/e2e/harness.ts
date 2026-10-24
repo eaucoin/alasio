@@ -916,7 +916,8 @@ const shellWord = (word: string): string => `'${word.replaceAll("'", `'\\''`)}'`
  * release, pins no images of its own, and its UPGRADE_CHECK this checkout's
  * `alasio upgrade --check` as this user, on a copy of the configuration laid over so, as the
  * configuration itself is laid over only as UPGRADE runs, its SETUP_POD this checkout's
- * `alasio upgrade --setup-pod`, on another such copy, and sudo asking this user for no
+ * `alasio upgrade --setup-pod`, on another such copy, its SETUP_JOB this checkout's
+ * `alasio upgrade --setup-job`, on that copy too, and sudo asking this user for no
  * password; failing at `failAt`, a point the script names, when given. What it came to; from
  * its success on, the run runs this checkout's `alasio`.
  */
@@ -951,14 +952,16 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
     configured(setupCopy),
     command(...owner(setupCopy), release, "upgrade", "--setup-pod"),
   ].join(" && ");
+  // And its stack setup's pod, printed of that copy, as SETUP_POD's has laid it over.
+  const setupJob = command(...owner(setupCopy), release, "upgrade", "--setup-job");
   const out = cutOverRecord();
   console.error(`# the cut-over from ${PREVIOUS}: upgrades/from-${PREVIOUS}.sh, recording in ${out}`);
-  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `OUT=${out}`, `CONFIG=${join(configHome, "alasio", "config.json")}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, `SETUP_POD=${setupPod}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
+  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `OUT=${out}`, `CONFIG=${join(configHome, "alasio", "config.json")}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, `SETUP_POD=${setupPod}`, `SETUP_JOB=${setupJob}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
     stdio: ["ignore", "pipe", "pipe"],
   }));
   if (ran.code === 0) current().bin = release;
-  // What the upgrade and its check said, which the cut-over keeps in its record alone: a failure of theirs says only where to look.
-  for (const name of ["upgrade-check.log", "upgrade.log"]) {
+  // What the upgrade, its check and the release's stack setup said, which the cut-over keeps in its record alone: a failure of theirs says only where to look.
+  for (const name of ["upgrade-check.log", "alasio-stack-setup.log", "upgrade.log"]) {
     const kept = await inCutOverRecord(`if [ -f ${name} ]; then tail -n 80 ${name}; else echo "(none)"; fi`).catch((error: unknown) => `could not be read: ${String(error)}`);
     console.error(`# the cut-over's ${name}, its last lines:\n${kept.trimEnd()}`);
   }

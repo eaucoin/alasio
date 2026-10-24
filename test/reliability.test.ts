@@ -14,7 +14,7 @@ import { makeAppServerThreads } from "../src/codex/app-server/thread-client.ts";
 import { finalResponseToMarkdown } from "../src/codex/response-markdown.ts";
 import { makeStatusReporter, type StatusReporter } from "../src/codex/status-reporter.ts";
 import { Turns } from "../src/codex/turns.ts";
-import { HARNESS_ROLE } from "../neon/control/secrets.ts";
+import { CODEX_LOGIN_ROLE, HARNESS_ROLE } from "../neon/control/secrets.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../src/codex/rollouts/store.ts";
 import { EnvironmentEvents } from "../src/events/consume.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
@@ -309,6 +309,7 @@ test("alasio's services wire the durable outbox into final response delivery", a
       pod: "alasio-composition",
       inKubernetes: false,
       harnessRole: HARNESS_ROLE,
+      codexLoginRole: CODEX_LOGIN_ROLE,
       sessionStore: new NeonSessionStore(database.pool),
       rolloutStores: { codex: new NeonRolloutStore(database.pool), sessionFs: new NeonRolloutStore(database.pool, { schema: SESSION_FS_SCHEMA }) },
       events: Layer.succeed(EnvironmentEvents, EnvironmentEvents.of({ join: memoryTopic("events.main").join })),

@@ -169,7 +169,7 @@ async function withGrantedPods(use: (pods: GrantedPods) => Promise<void>): Promi
   const scope = Effect.runSync(Scope.make());
   try {
     await run(database.url, "create role alasio login password 'alasio-password' createrole createdb", "create database alasio owner alasio");
-    const env = { ALASIO_DATABASE_URL: as("alasio", "alasio-password"), ALASIO_LAKE_VERIFIER: scramVerifier("lake-password"), ALASIO_HARNESS_VERIFIER: scramVerifier("harness-password"), ALASIO_LAKE_ENABLED: "1" };
+    const env = { ALASIO_DATABASE_URL: as("alasio", "alasio-password"), ALASIO_LAKE_VERIFIER: scramVerifier("lake-password"), ALASIO_HARNESS_VERIFIER: scramVerifier("harness-password"), ALASIO_CODEX_LOGIN_VERIFIER: scramVerifier("codex-login-password"), ALASIO_LAKE_ENABLED: "1" };
     const key = grantKey(Buffer.from("the environment's key"));
     const { alasio, a, b, grantA } = await Effect.runPromise(Scope.provide(Effect.gen(function*() {
       const neon = yield* Neon.make;

@@ -21,6 +21,10 @@ const pathOf = (bin: string) => [bin, JQ_DIR, "/usr/bin", "/bin"].join(delimiter
 
 /** The release's setup pod, as `alasio upgrade --setup-pod` prints it, of the fields the cut-over reads and changes. */
 const SETUP_POD = { apiVersion: "v1", kind: "Pod", metadata: { name: "alasio-setup", namespace: "alasio" }, spec: { restartPolicy: "Never", containers: [{ name: "alasio", image: "alasio:release", command: ["node", "/opt/alasio/src/setup/main.ts"], env: [] }] } };
+/** The release's stack setup's pod, as `alasio upgrade --setup-job` prints it, of the fields the cut-over reads and changes. */
+const SETUP_JOB = { apiVersion: "v1", kind: "Pod", metadata: { name: "alasio-stack-setup", namespace: "alasio" }, spec: { restartPolicy: "Never", containers: [{ name: "setup", image: "alasio:release", command: ["node", "/opt/alasio/neon/control/kube-setup.ts"], env: [] }] } };
+/** The pod the cut-over runs before its point of no return, once the upgrade is checked, as its record of it says: the stack's secrets made. */
+const STACK_SETUP_RAN = "pod alasio-stack-setup: node /opt/alasio/neon/control/kube-setup.ts";
 /** The pods the cut-over runs past its point of no return, once alasio is stopped, as its record of each says: its setup, and the sessions given their conversations. */
 const SETUP = ["pod alasio-setup: node /opt/alasio/src/setup/main.ts", "pod alasio-sessions-claimed: node --input-type=module -e, with its SQL"];
 
@@ -61,8 +65,9 @@ function machine() {
   const images = join(root, "images");
   const unreachable = join(root, "unreachable");
   const unfetched = join(root, "unfetched");
-  // The pods the cut-over runs that fail, by name, a line each.
+  // The pods the cut-over runs that fail, by name, a line each, and those that run on, never ending.
   const podFails = join(root, "pod-fails");
+  const podRuns = join(root, "pod-runs");
   const containerd = join(node, "var/lib/rancher/k3s/agent/etc/containerd");
   for (const made of [bin, containerd, join(node, "usr/local/bin")]) mkdirSync(made, { recursive: true });
   writeFileSync(namespaces, "");
@@ -95,7 +100,8 @@ case "$*" in
   "-n alasio delete pod "*" --ignore-not-found --wait") exit 0 ;;
   "-n alasio apply -f "*)
     echo "pod $(jq -r '.metadata.name + ": " + (.spec.containers[0].command[:3] | join(" ")) + (if any(.spec.containers[0].env[]?; .name == "ALASIO_CUTOVER_SQL") then ", with its SQL" else "" end)' "$5")" >>'${ran}' ;;
-  "-n alasio get pod "*" -o jsonpath={.status.phase}") if grep -qx "$5" '${podFails}' 2>/dev/null; then echo Failed; else echo Succeeded; fi ;;
+  "-n alasio get pod "*" -o jsonpath={.status.phase}")
+    if grep -qx "$5" '${podRuns}' 2>/dev/null; then echo Running; elif grep -qx "$5" '${podFails}' 2>/dev/null; then echo Failed; else echo Succeeded; fi ;;
   "-n alasio logs "*) if [ "$4" = alasio-sessions-claimed ]; then echo 3; else echo "made alasio's state"; fi ;;
   "-n alasio delete pod "*" --wait") exit 0 ;;
   "-n alasio exec alasio-log-0 -c access -- node /opt/alasio/src/log/access.ts partitions telegram.main")
@@ -137,6 +143,7 @@ esac
         UPGRADE: `echo upgrade >>'${ran}' && [ ! -e '${upgradeFails}' ] && rm -f '${stopped}'`,
         UPGRADE_CHECK: `echo check >>'${ran}'`,
         SETUP_POD: `printf '%s' '${JSON.stringify(SETUP_POD)}'`,
+        SETUP_JOB: `printf '%s' '${JSON.stringify(SETUP_JOB)}'`,
         POLL_SECONDS: "0",
         ...bounds,
         ...(failAt === undefined ? {} : { FAIL_AT: failAt }),
@@ -193,6 +200,8 @@ esac
     unfetched: (digests: readonly string[]) => writeFileSync(unfetched, digests.map((digest) => `${digest}\n`).join("")),
     /** Has the pods `names` the cut-over runs fail. */
     podFails: (names: readonly string[]) => writeFileSync(podFails, names.map((name) => `${name}\n`).join("")),
+    /** Has the pods `names` the cut-over runs run on, never ending. */
+    podRuns: (names: readonly string[]) => writeFileSync(podRuns, names.map((name) => `${name}\n`).join("")),
     /** What the cut-over's record of a pod's run says. */
     recorded: (name: string) => readFileSync(join(out, name), "utf8"),
     containerd,
@@ -205,7 +214,7 @@ test("the cut-over checks, upgrades past its point of no return, and says it is 
   try {
     const run = at.cutOver();
     assert.equal(run.code, 0, run.said);
-    assert.deepEqual(at.ran(), ["check", "stop alasio", ...SETUP, "upgrade"]);
+    assert.deepEqual(at.ran(), ["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade"]);
     assert.deepEqual(at.marks(), ["point-of-no-return", "upgraded"]);
     assert.match(run.said, /cutting over from 9\.0\.0[^]*checking that no branch environment exists[^]*checking that the upgrade can run[^]*past the point of no return[^]*waiting for alasio to run no turn[^]*alasio stopped, to be started again by the upgrade\n[^\n]* making this release's state with its own setup[^\n]*\n[^\n]* giving each conversation the sessions its rows name[^\n]*\n[^\n]* the conversations have 3 sessions, of their rows and the threads their histories start in\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
   } finally {
@@ -219,7 +228,7 @@ test("once the upgrade is through, the cut-over stops alasio again, once it runs
     at.partitions(1, true);
     const run = at.cutOver();
     assert.equal(run.code, 0, run.said);
-    assert.deepEqual(at.ran(), ["check", "stop alasio", ...SETUP, "upgrade", "stop alasio", "start alasio"]);
+    assert.deepEqual(at.ran(), ["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade", "stop alasio", "start alasio"]);
     assert.deepEqual(at.marks(), ["point-of-no-return", "upgraded"]);
     assert.match(run.said, /upgrading, from the cut-over begun at [^\n]*\n[^\n]* waiting for alasio to run no turn, then stopping it again, for the log to give telegram\.main its 6 partitions\n[^\n]* telegram\.main has its 6 partitions\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
   } finally {
@@ -233,7 +242,7 @@ test("a Telegram topic the log does not grow within its bound, as an update came
     at.partitions(1, false);
     const run = at.cutOver(undefined, { PARTITIONS_WAIT_SECONDS: "0" });
     assert.equal(run.code, 0, run.said);
-    assert.deepEqual(at.ran(), ["check", "stop alasio", ...SETUP, "upgrade", "stop alasio", "start alasio"]);
+    assert.deepEqual(at.ran(), ["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade", "stop alasio", "start alasio"]);
     assert.match(run.said, /telegram\.main is left as it is, of 1 of its 6 partitions, as an update came for it while alasio was stopped: the next stop of alasio with nothing unread grows it\n[^\n]* upgraded at /u);
   } finally {
     at.remove();
@@ -247,7 +256,7 @@ test("past its point of no return, the cut-over waits for alasio to run no turn,
     at.lingers(2);
     const run = at.cutOver();
     assert.equal(run.code, 0, run.said);
-    assert.deepEqual(at.ran(), ["check", "stop alasio", ...SETUP, "upgrade"]);
+    assert.deepEqual(at.ran(), ["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade"]);
     // Stopped after the look that found no turn, and recorded stopped after the look that found no pod.
     assert.deepEqual(at.looked(), ["busy: running", "busy: running", "busy: none", "stop", "alasio: running", "alasio: running", "alasio: none"]);
     assert.ok(at.alasioStopped());
@@ -264,7 +273,7 @@ test("the cut-over fails, stopping nothing, where alasio runs a turn on past its
     const busy = at.cutOver(undefined, { TURN_WAIT_SECONDS: "0" });
     assert.notEqual(busy.code, 0);
     assert.match(busy.said, /FAILED: alasio ran a turn on for 0 s: let it end, and run the cut-over again\n$/u);
-    assert.deepEqual([at.ran(), at.looked(), at.alasioStopped()], [["check"], ["busy: running"], false]);
+    assert.deepEqual([at.ran(), at.looked(), at.alasioStopped()], [["check", STACK_SETUP_RAN], ["busy: running"], false]);
     at.busy(0);
     at.lingers(1_000);
     const lingering = at.cutOver(undefined, { STOP_WAIT_SECONDS: "0" });
@@ -283,7 +292,7 @@ test("the cut-over fails, stopping nothing, where alasio's pods cannot be listed
     const run = at.cutOver();
     assert.notEqual(run.code, 0);
     assert.match(run.said, /FAILED: the pods of app\.kubernetes\.io\/component=alasio,alasio\.dev\/busy=true in alasio could not be listed\n$/u);
-    assert.deepEqual([at.ran(), at.alasioStopped()], [["check"], false]);
+    assert.deepEqual([at.ran(), at.alasioStopped()], [["check", STACK_SETUP_RAN], false]);
   } finally {
     at.remove();
   }
@@ -310,12 +319,12 @@ test("the cut-over failing before its point of no return leaves none, and a run 
   try {
     const failed = at.cutOver("before-the-point-of-no-return");
     assert.notEqual(failed.code, 0);
-    assert.match(failed.said, /checking that the upgrade can run[^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
-    assert.deepEqual([at.ran(), at.marks()], [["check"], []]);
+    assert.match(failed.said, /checking that the upgrade can run[^\n]*\n[^\n]* making what the stack's secrets lack with this release's stack setup[^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
+    assert.deepEqual([at.ran(), at.marks()], [["check", STACK_SETUP_RAN], []]);
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
     assert.match(again.said, /checking that no branch environment exists/u);
-    assert.deepEqual([at.ran(), at.marks()], [["check", "stop alasio", ...SETUP, "upgrade"], ["point-of-no-return", "upgraded"]]);
+    assert.deepEqual([at.ran(), at.marks()], [["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade"], ["point-of-no-return", "upgraded"]]);
   } finally {
     at.remove();
   }
@@ -327,7 +336,7 @@ test("the cut-over failing past its point of no return, or in its upgrade, goes 
     const failed = at.cutOver("past-the-point-of-no-return");
     assert.notEqual(failed.code, 0);
     assert.match(failed.said, /FAILED: a failure injected past the point of no return, before the upgrade\n$/u);
-    assert.deepEqual([at.ran(), at.marks()], [["check"], ["point-of-no-return"]]);
+    assert.deepEqual([at.ran(), at.marks()], [["check", STACK_SETUP_RAN], ["point-of-no-return"]]);
     at.upgradeFails(true);
     const broken = at.cutOver();
     assert.notEqual(broken.code, 0);
@@ -351,7 +360,7 @@ test("the cut-over failing once its upgrade is through goes on with what follows
     const failed = at.cutOver("after-the-upgrade");
     assert.notEqual(failed.code, 0);
     assert.match(failed.said, /FAILED: a failure injected once the upgrade was through\n$/u);
-    assert.deepEqual([at.ran(), at.marks()], [["check", "stop alasio", ...SETUP, "upgrade"], ["point-of-no-return", "upgraded"]]);
+    assert.deepEqual([at.ran(), at.marks()], [["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade"], ["point-of-no-return", "upgraded"]]);
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
     assert.doesNotMatch(again.said, /checking that|upgrading, from the cut-over/u);
@@ -368,7 +377,10 @@ test("the cut-over refuses to run without what it needs, or a cluster to reach, 
     const run = spawnSync("bash", [SCRIPT], { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } });
     assert.notEqual(run.status, 0);
     assert.match(run.stderr, /UPGRADE: the upgrade of the release/u);
-    const needs = { PATH: pathOf(join(root, "bin")), OUT: join(root, "out"), UPGRADE: "true", UPGRADE_CHECK: "true", SETUP_POD: "true" };
+    const unjobbed = spawnSync("bash", [SCRIPT], { encoding: "utf8", env: { PATH: "/usr/bin:/bin", UPGRADE: "true", UPGRADE_CHECK: "true", SETUP_POD: "true" } });
+    assert.notEqual(unjobbed.status, 0);
+    assert.match(unjobbed.stderr, /SETUP_JOB: a command printing the pod of the release that makes the secrets of the stack/u);
+    const needs = { PATH: pathOf(join(root, "bin")), OUT: join(root, "out"), UPGRADE: "true", UPGRADE_CHECK: "true", SETUP_POD: "true", SETUP_JOB: "true" };
     const unconfigured = spawnSync("bash", [SCRIPT], { encoding: "utf8", env: needs });
     assert.notEqual(unconfigured.status, 0);
     assert.match(unconfigured.stderr, /CONFIG: the file of the configuration/u);
@@ -451,7 +463,7 @@ test("the cut-over fails before its point of no return where what containerd lac
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
     assert.deepEqual(at.images(), [["docker.io/rancher/mirrored-pause:3.10.2", PAUSE, true]]);
-    assert.deepEqual([at.ran(), at.marks()], [["check", "stop alasio", ...SETUP, "upgrade"], ["point-of-no-return", "upgraded"]]);
+    assert.deepEqual([at.ran(), at.marks()], [["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade"], ["point-of-no-return", "upgraded"]]);
   } finally {
     at.remove();
   }
@@ -495,7 +507,7 @@ test("past its point of no return, alasio stopped, the cut-over makes the releas
     const failing = at.cutOver();
     assert.notEqual(failing.code, 0);
     assert.match(failing.said, /FAILED: the pod alasio-setup failed \(alasio-setup\.log\): made alasio's state\n$/u);
-    assert.deepEqual([at.ran(), at.marks()], [["check", "stop alasio", SETUP[0]], ["point-of-no-return"]]);
+    assert.deepEqual([at.ran(), at.marks()], [["check", STACK_SETUP_RAN, "stop alasio", SETUP[0]], ["point-of-no-return"]]);
     at.podFails([]);
     at.upgradeFails(true);
     const upgradeFailing = at.cutOver();
@@ -511,6 +523,48 @@ test("past its point of no return, alasio stopped, the cut-over makes the releas
     const claimed = JSON.parse(at.recorded("alasio-sessions-claimed.json")) as { metadata: { name: string }; spec: { restartPolicy: string; containers: { image: string; env: { name: string; value: string }[] }[] } };
     assert.deepEqual([claimed.metadata.name, claimed.spec.containers[0]?.image, claimed.spec.restartPolicy], ["alasio-sessions-claimed", "alasio:release", "Never"]);
     assert.match(claimed.spec.containers[0]?.env.find(({ name }) => name === "ALASIO_CUTOVER_SQL")?.value ?? "", /insert into state\.conversation_sessions/u);
+  } finally {
+    at.remove();
+  }
+});
+
+test("before its point of no return, once the upgrade is checked, the cut-over makes what the stack's secrets lack with the release's stack setup, failing cleanly, changing nothing past it, where that cannot run or fails, and a run again runs it again", () => {
+  const at = machine();
+  try {
+    const unprinted = at.cutOver(undefined, { SETUP_JOB: "echo no such release >&2; exit 1" });
+    assert.notEqual(unprinted.code, 0);
+    assert.match(unprinted.said, /FAILED: SETUP_JOB failed, so the release's stack setup could not run \(setup-job\.log\): no such release\n$/u);
+    const unpodded = at.cutOver(undefined, { SETUP_JOB: "echo '{\"kind\":\"Job\"}'" });
+    assert.notEqual(unpodded.code, 0);
+    assert.match(unpodded.said, /FAILED: SETUP_JOB printed no pod of one container \(setup-job\.json\)\n$/u);
+    assert.deepEqual([at.ran(), at.marks()], [["check", "check"], []]);
+    // The stack setup failing: nothing past the point of no return.
+    at.podFails(["alasio-stack-setup"]);
+    const failing = at.cutOver();
+    assert.notEqual(failing.code, 0);
+    assert.match(failing.said, /FAILED: the pod alasio-stack-setup failed \(alasio-stack-setup\.log\): made alasio's state\n$/u);
+    assert.deepEqual([at.ran(), at.marks(), at.alasioStopped()], [["check", STACK_SETUP_RAN], [], false]);
+    // Run again, it runs it again, then goes on.
+    at.podFails([]);
+    const run = at.cutOver();
+    assert.equal(run.code, 0, run.said);
+    assert.deepEqual(at.ran(), ["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade"]);
+    // Of the pod SETUP_JOB printed, run to its end, as named.
+    const ran = JSON.parse(at.recorded("alasio-stack-setup.json")) as { metadata: { name: string }; spec: { restartPolicy: string; containers: { image: string; command: string[] }[] } };
+    assert.deepEqual([ran.metadata.name, ran.spec.containers[0]?.image, ran.spec.containers[0]?.command, ran.spec.restartPolicy], ["alasio-stack-setup", "alasio:release", ["node", "/opt/alasio/neon/control/kube-setup.ts"], "Never"]);
+  } finally {
+    at.remove();
+  }
+});
+
+test("the release's stack setup that does not end within its bound fails the cut-over before its point of no return", () => {
+  const at = machine();
+  try {
+    at.podRuns(["alasio-stack-setup"]);
+    const failed = at.cutOver(undefined, { SETUP_WAIT_SECONDS: "0" });
+    assert.notEqual(failed.code, 0);
+    assert.match(failed.said, /FAILED: the pod alasio-stack-setup had not ended within 0 s\n$/u);
+    assert.deepEqual(at.marks(), []);
   } finally {
     at.remove();
   }

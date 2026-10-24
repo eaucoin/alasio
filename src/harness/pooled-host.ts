@@ -39,7 +39,6 @@ import { Clock, Effect, Layer, Option, Result, Schedule, Schema } from "effect";
 import { type HeldTo, mintToken } from "../binder/tokens.ts";
 import { codexConfiguration } from "../codex/configuration.ts";
 import { type CodexLoginRefused, CodexLoginFreshness } from "../codex/login-refresh.ts";
-import { poolLoginKey } from "../codex/login-relay.ts";
 import { harnessKey } from "../gateway/names.ts";
 import { BusyPods } from "../kube/busy.ts";
 import { HostBayma } from "../mcp/bayma.ts";
@@ -50,7 +49,7 @@ import { parseWorkspace } from "../workspace/kind.ts";
 import { type ConversationHarness, HarnessHost, type TurnBayma, type TurnCodex, type TurnRequest } from "./host.ts";
 import { HarnessHostError } from "./index.ts";
 import { grantDigest, grantKey, harnessGrant } from "./grant.ts";
-import { CODEX_HARNESS, type HarnessName } from "./names.ts";
+import { CODEX_HARNESS, type HarnessName, poolLoginKey } from "./names.ts";
 import { type RemoteHost, remoteHost } from "./remote-host.ts";
 
 /** How often a harness the front cannot bind yet is asked to be bound again. */

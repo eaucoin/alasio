@@ -11,7 +11,7 @@ import { kind, KubeApi } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR } from "../kube/apply.ts";
 import { RELEASE } from "../manifests/common.ts";
 import { VERSION } from "../release.ts";
-import { setupPod } from "../setup-pod.ts";
+import { setupPod, stackSetupPod } from "../setup-pod.ts";
 import { describeTarget, kubeApi, resolveTarget } from "../target.ts";
 import { timeoutFlag, waitOptions } from "./common.ts";
 import { announce, ensureCluster, refuseFirst } from "./up.ts";
@@ -65,13 +65,19 @@ export const upgrade = Command.make("upgrade", {
     Flag.withDefault(false),
     Flag.withDescription("Print, as JSON, changing nothing, the pod of this version's alasio that makes its state alone, for a cut-over to run before the upgrade"),
   ),
-}, ({ timeout, check, now, setupPod: printSetupPod }) =>
+  setupJob: Flag.Boolean("setup-job").pipe(
+    Flag.withDefault(false),
+    Flag.withDescription(
+      "Print, as JSON, changing nothing, the pod of this version's stack setup, which makes what the stack's secrets lack and renders each service's from them, for a cut-over to run before the setup pod",
+    ),
+  ),
+}, ({ timeout, check, now, setupPod: printSetupPod, setupJob: printSetupJob }) =>
   Effect.gen(function*() {
     const config = yield* loadConfig;
     const target = yield* resolveTarget(config);
-    if (printSetupPod) {
+    if (printSetupPod || printSetupJob) {
       const objects = yield* Effect.provide(Effect.map(installConfig(config), (made) => installationObjects(made)), kubeApi(target));
-      return yield* Console.log(JSON.stringify(setupPod(objects), null, 2));
+      return yield* Console.log(JSON.stringify(printSetupJob ? stackSetupPod(objects) : setupPod(objects), null, 2));
     }
     if (check) {
       yield* Effect.provide(refusals(config), kubeApi(target));

@@ -18,14 +18,14 @@
  * Where alasio's harnesses run in pools of their own, the same relay serves its environment's
  * harness pools' pods as a component of its own (./relay.ts), on CODEX_LOGIN_PORT, each request
  * bearing a token alasio gives each Codex turn it starts there, signed by its pools' key
- * (poolLoginKey), good for minutes and renewed as the turn runs (../harness/pooled-host.ts),
+ * (../harness/names.ts poolLoginKey), good for minutes and renewed as the turn runs (../harness/pooled-host.ts),
  * checked in constant time, its refusal said why in the relay's log alone; and a pod relays on
  * its own loopback to it, with the latest token given (../harness/given-codex-login.ts), so
  * no pod ever holds or refreshes the login, which alasio and the relay refresh one at a time
  * under the store's lock (./login-refresh.ts), as a ChatGPT refresh token is single-use; the
  * relay keeps the login fresh before each request it passes on (`fresh`).
  */
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import httpClient, { createServer, type IncomingMessage, type OutgoingHttpHeaders, type RequestOptions, type ServerResponse } from "node:http";
 import httpsClient from "node:https";
@@ -63,12 +63,10 @@ export interface LoginRelayOptions {
   readonly upstreamFor?: (authFile: string, path: string) => LoginUpstream | null;
 }
 
-/** The key alasio's pool login tokens are signed with: its environment's own key of the gateway's caller key's, made apart, so a token of one is never the other. */
-export const poolLoginKey = (environmentKey: Buffer): Buffer => createHmac("sha256", environmentKey).update("codex-login").digest();
 
 /**
  * Why a request of a harness pool's pod bearing `authorization` is refused, or null where it
- * may go on: its bearer a token signed by `key` (poolLoginKey), compared in constant time, of a
+ * may go on: its bearer a token signed by `key` (../harness/names.ts poolLoginKey), compared in constant time, of a
  * conversation's harness's turn, not stopped by `now`.
  */
 export const poolLoginRefusal = (key: Buffer, now: () => number) => (authorization: string | undefined): string | null => {

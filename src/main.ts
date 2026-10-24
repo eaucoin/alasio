@@ -5,7 +5,7 @@
  */
 import { Cause, Effect, Layer } from "effect";
 
-import { HARNESS_ROLE } from "../neon/control/secrets.ts";
+import { CODEX_LOGIN_ROLE, HARNESS_ROLE } from "../neon/control/secrets.ts";
 import { ForkAsks, ForkRequests } from "./branch/fork.ts";
 import { forksGroup, forksTopic, MAIN_ENVIRONMENT_NAME } from "./branch/names.ts";
 import { loadAlasioConfig } from "./config.ts";
@@ -42,6 +42,7 @@ const alasio = Effect.gen(function*() {
       : undefined,
     pool: neon.pool,
     harnessRole: HARNESS_ROLE,
+    codexLoginRole: CODEX_LOGIN_ROLE,
     lakeWritten: neon.written,
     rolloutStores: { codex: neon.rollouts, sessionFs: sessionFsRollouts },
     sessionStore: neon.sessionStore,

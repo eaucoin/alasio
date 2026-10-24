@@ -55,6 +55,7 @@ import { HarnessEvents } from "../../src/harness/host-events.ts";
 import { type HarnessStandIns, startHarness } from "../../src/harness/program.ts";
 import { pooledHarnessHost } from "../../src/harness/pooled-host.ts";
 import { KubeApiError, KubeClient } from "../../src/kube/client.ts";
+import { ensureCodexLoginRole } from "../../src/neon/codex-login.ts";
 import { ensureHarnessRole } from "../../src/neon/harness.ts";
 import { Store } from "../../src/persistence/store.ts";
 import { closedBeforeStop, startPostgres } from "./postgres.ts";
@@ -62,6 +63,7 @@ import { type MemoryTopic, memoryTopic } from "./topics.ts";
 
 /** The harness host's role's password, as the stand-in's databases keep its verifier. */
 const HARNESS_PASSWORD = "harness-password";
+const CODEX_LOGIN_PASSWORD = "codex-login-password";
 /** The environment the stand-in's alasio is, main. */
 export const ENVIRONMENT = "main";
 /**
@@ -111,9 +113,10 @@ export interface PooledStoreOptions {
 }
 
 /**
- * A database of its own, as alasio's Neon is made for it: the harness host's role, and the
- * stores of the transcripts and rollouts, made before alasio's state, as alasio makes them, for
- * the role to be granted theirs; its pool ended as the test file's tests end.
+ * A database of its own, as alasio's Neon is made for it: the harness host's role and the Codex
+ * login relay's, and the stores of the transcripts and rollouts, made before alasio's state, as
+ * alasio makes them, for the roles to be granted theirs; its pool ended as the test file's tests
+ * end.
  */
 export async function pooledDatabase(): Promise<PooledDatabase> {
   const database = await startPostgres();
@@ -124,6 +127,7 @@ export async function pooledDatabase(): Promise<PooledDatabase> {
   pool.on("error", () => {});
   opened.push(pool);
   await ensureHarnessRole(pool, scramVerifier(HARNESS_PASSWORD));
+  await ensureCodexLoginRole(pool, scramVerifier(CODEX_LOGIN_PASSWORD));
   for (const store of [new NeonSessionStore(pool), new NeonRolloutStore(pool), new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA })]) await store.ensureSchema();
   const harnessUrl = new URL(database.url);
   Object.assign(harnessUrl, { username: HARNESS_ROLE, password: HARNESS_PASSWORD });

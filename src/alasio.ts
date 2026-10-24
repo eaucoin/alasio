@@ -68,6 +68,8 @@ export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog" | "log" 
   readonly lakeWritten?: (() => void) | undefined;
   /** The harness host's role, which Neon has (../neon/harness.ts), granted its part of the state. */
   readonly harnessRole: string;
+  /** The Codex login relay's role, which Neon has (../neon/codex-login.ts), granted the login. */
+  readonly codexLoginRole: string;
 }
 
 /** The services alasio's app runs on, which are always there. */
@@ -129,10 +131,18 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
 
 /**
  * alasio's store, its state made as it opens: its tables, a branch's state its own, and the
- * harness host's grants; as alasio starts, and as `alasio setup` makes it before (./setup/program.ts).
+ * harness host's and the Codex login relay's grants; as alasio starts, and as `alasio setup`
+ * makes it before (./setup/program.ts).
  */
-export const stateStore = (options: Pick<AlasioOptions, "pool" | "stateSchema" | "workingDirectory" | "branch" | "harnessRole">): Layer.Layer<Store, StoreError> =>
-  Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory, branch: options.branch?.name, harnessRole: options.harnessRole });
+export const stateStore = (options: Pick<AlasioOptions, "pool" | "stateSchema" | "workingDirectory" | "branch" | "harnessRole" | "codexLoginRole">): Layer.Layer<Store, StoreError> =>
+  Store.layer({
+    pool: options.pool,
+    schema: options.stateSchema,
+    workingDirectory: options.workingDirectory,
+    branch: options.branch?.name,
+    harnessRole: options.harnessRole,
+    codexLoginRole: options.codexLoginRole,
+  });
 
 /**
  * The host alasio's turns run on, each conversation's, bound in its harness's pool through the

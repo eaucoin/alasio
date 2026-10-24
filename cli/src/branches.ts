@@ -35,10 +35,11 @@ import { Console, Effect, Predicate, Redacted, Result, Schedule, Schema } from "
 
 import { type BranchView, COMPUTE_PORT, computeId, MAIN, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
-import { HARNESS_ROLE, LAKE_ROLE, ROLE } from "../../neon/control/secrets.ts";
+import { CODEX_LOGIN_ROLE, HARNESS_ROLE, LAKE_ROLE, ROLE } from "../../neon/control/secrets.ts";
 import { BINDING_LABEL, environmentKey, KEY_ANNOTATION } from "../../src/binder/names.ts";
 import { sessionKey, volumeIdOfKey } from "../../src/sandbox/names.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
+import { poolLoginKey } from "../../src/harness/names.ts";
 import { memoryBytes, memoryText } from "./capacity.ts";
 import { installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
 import { recordedBaseline } from "./cpu-baseline.ts";
@@ -51,7 +52,18 @@ import { alasioPrincipal, environmentAccess, type EnvironmentLogAccess, environm
 import { harnessPoolPodPolicyName } from "./manifests/admission.ts";
 import { branchObjects } from "./manifests/branch.ts";
 import { REPLICA_NAME } from "./manifests/neon.ts";
-import { BRANCH_FORK_SECRET, BRANCH_LABEL, componentName, NAMESPACE, neonName, RELEASE, selectorLabels, SESSIONS_CALLER_SECRET } from "./manifests/common.ts";
+import {
+  BRANCH_FORK_SECRET,
+  BRANCH_LABEL,
+  CODEX_LOGIN_DATABASE_SECRET,
+  CODEX_LOGIN_KEY_SECRET,
+  componentName,
+  NAMESPACE,
+  neonName,
+  RELEASE,
+  selectorLabels,
+  SESSIONS_CALLER_SECRET,
+} from "./manifests/common.ts";
 import { GATEWAY } from "./manifests/sandbox-gateway.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { LOADER_COMPONENT } from "./manifests/lake.ts";
@@ -297,9 +309,14 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
 
   // The branch's own, as the module says: none of main's passwords or tokens of its Neon.
   const own = () => randomBytes(24).toString("base64url");
-  const credentials = { alasio: own(), lake: own(), harness: own(), compute: own(), log: own(), loader: own() };
+  const credentials = { alasio: own(), lake: own(), harness: own(), codexLogin: own(), compute: own(), log: own(), loader: own() };
   // Their verifiers, each made once and given to whatever sets the role or answers for it.
-  const verifiers = { [ROLE]: scramVerifier(credentials.alasio), [LAKE_ROLE]: scramVerifier(credentials.lake), [HARNESS_ROLE]: scramVerifier(credentials.harness) };
+  const verifiers = {
+    [ROLE]: scramVerifier(credentials.alasio),
+    [LAKE_ROLE]: scramVerifier(credentials.lake),
+    [HARNESS_ROLE]: scramVerifier(credentials.harness),
+    [CODEX_LOGIN_ROLE]: scramVerifier(credentials.codexLogin),
+  };
   // Each of its principals on the log a password of its own, its alasio's the one in its Secret.
   const access = environmentAccess(name);
   const passwords: Readonly<Record<string, string>> = { [alasioPrincipal(name)]: credentials.log, [loaderPrincipal(name)]: credentials.loader };
@@ -308,14 +325,25 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   const url = new URL(yield* requiredSecret(componentName("database"), "url"));
   url.password = credentials.alasio;
   url.searchParams.set("options", `endpoint=${computeId(name)}`);
-  // The harness host's, the same as its own role.
+  // The harness host's, and its Codex login relay's, the same as their own roles.
   const harnessUrl = new URL(url);
   harnessUrl.username = HARNESS_ROLE;
   harnessUrl.password = credentials.harness;
+  const codexLoginUrl = new URL(url);
+  codexLoginUrl.username = CODEX_LOGIN_ROLE;
+  codexLoginUrl.password = credentials.codexLogin;
+  // Its callers' key to the sandbox gateway, its own of the gateway's, which signs its own sessions' tokens alone.
+  const callerKey = environmentKey(Buffer.from(yield* requiredSecret(GATEWAY, "caller-key")), name).toString();
   const lake = settings.lake.enabled ? yield* copiedSecret(name, componentName("lake"), ["LAKE_S3_KEY", "LAKE_S3_SECRET"]) : null;
   const secrets = [
-    branchSecret(name, componentName("database"), { url: url.toString(), "lake-verifier": verifiers[LAKE_ROLE], "harness-verifier": verifiers[HARNESS_ROLE] }),
+    branchSecret(name, componentName("database"), {
+      url: url.toString(),
+      "lake-verifier": verifiers[LAKE_ROLE],
+      "harness-verifier": verifiers[HARNESS_ROLE],
+      "codex-login-verifier": verifiers[CODEX_LOGIN_ROLE],
+    }),
     branchSecret(name, componentName("harness-database"), { url: harnessUrl.toString() }),
+    branchSecret(name, CODEX_LOGIN_DATABASE_SECRET, { url: codexLoginUrl.toString() }),
     branchSecret(name, neonName("compute"), { NEON_CONTROL_PLANE_TOKEN: credentials.compute }),
     // The lake service's: main's object store identity, the one thing of main's a branch is given (see the module), and its role's password.
     ...(lake ? [{ ...lake, data: { ...lake.data, LAKE_DATABASE_PASSWORD: Buffer.from(credentials.lake, "utf8").toString("base64") } }] : []),
@@ -323,8 +351,9 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
     ...(yield* Effect.forEach(settings.imagePullSecrets, (secret) => copiedSecret(name, secret))),
     branchSecret(name, TELEGRAM_SECRET, { token: Redacted.value(bot.token), allowedUserIds: bot.allowedUserIds.join(",") }),
     branchSecret(name, BRANCH_FORK_SECRET, { token: forkToken(yield* requiredSecret(componentName("branches"), "fork-key"), name) }),
-    // Its callers' key to the sandbox gateway, its own of the gateway's, which signs its own sessions' tokens alone.
-    branchSecret(name, SESSIONS_CALLER_SECRET, { "caller-key": environmentKey(Buffer.from(yield* requiredSecret(GATEWAY, "caller-key")), name).toString() }),
+    branchSecret(name, SESSIONS_CALLER_SECRET, { "caller-key": callerKey }),
+    // Its Codex login relay's: the key of its turns' tokens alone, which signs none of its sessions'.
+    branchSecret(name, CODEX_LOGIN_KEY_SECRET, { key: poolLoginKey(Buffer.from(callerKey)).toString("hex") }),
     branchSecret(name, environmentLogSecret({ namespace: branchNamespace(name), branch: name }), { username: alasioPrincipal(name), password: credentials.log }),
     // Its lake loader's, which reads its wake topic alone; and KEDA's, which may describe
     // how far behind that is and read nothing, which its loader's scaler reads as.
