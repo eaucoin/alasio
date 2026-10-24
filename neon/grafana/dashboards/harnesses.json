@@ -1,7 +1,7 @@
 {
   "uid": "alasio-harnesses",
   "title": "Harnesses",
-  "description": "The conversations' harnesses as the sandbox gateway binds and releases them in their pools, from its metrics; the turns alasio ran again as their harness instance was lost under them, and how long a turn took to its harness's first output, from alasio's; and what scales alasio, what waits on its topics and its harnesses bound, as KEDA measures them, beside its starts; and how its replicas share the work: the rebalances of their groups on the log, how long they waited for conversations' claims, and the claims they lost. Main's, or a branch environment's, as Branch chooses.",
+  "description": "The conversations' harnesses as the sandbox gateway binds and releases them in their pools, from its metrics; the turns alasio ran again as their harness instance was lost under them, and how long a turn took to its harness's first output, from alasio's; and what scales alasio, what waits on its topics and its harnesses bound, as KEDA measures them, beside its starts and how long each took to answer what woke it; and how its replicas share the work: the rebalances of their groups on the log, how long they waited for conversations' claims, and the claims they lost. Main's, or a branch environment's, as Branch chooses.",
   "tags": [
     "alasio"
   ],
@@ -905,7 +905,7 @@
       "gridPos": {
         "x": 0,
         "y": 32,
-        "w": 8,
+        "w": 6,
         "h": 8
       },
       "description": "What waits on each of the environment's topics alasio reads, Telegram's updates, its events and, main's, its forks, as KEDA, which wakes alasio at the first and adds a replica for each 20 updates, measured it.",
@@ -979,9 +979,9 @@
       "type": "timeseries",
       "title": "Harnesses bound",
       "gridPos": {
-        "x": 8,
+        "x": 6,
         "y": 32,
-        "w": 8,
+        "w": 6,
         "h": 8
       },
       "description": "The environment's conversations' harnesses bound, as KEDA, which keeps alasio up while any is, measured it of the sandbox gateway's count.",
@@ -1055,9 +1055,9 @@
       "type": "timeseries",
       "title": "Starts",
       "gridPos": {
-        "x": 16,
+        "x": 12,
         "y": 32,
-        "w": 8,
+        "w": 6,
         "h": 8
       },
       "description": "alasio's starts, each as it came up: woken from none by what waited, or started again.",
@@ -1115,6 +1115,85 @@
             "showPoints": "never",
             "stacking": {
               "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Wake latency",
+      "gridPos": {
+        "x": 18,
+        "y": 32,
+        "w": 6,
+        "h": 8
+      },
+      "description": "How long alasio took, started, to answer the first update it handled: from its message's date, as Telegram gives it, to the first reply queued, or sent at once, to its chat in the update's own trace, so, woken from none by it, the wait its sender saw, not a reply of a turn that ran on meanwhile. Once a start; none where the first was a press, or its answer took more than five minutes. Telegram dates a message to the second, so a latency reads up to a second more than it took.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, 'alasio' as woken, sum(added_sum) / sum(added_count) as seconds\nfrom (\nselect TimeUnix, Attributes, Sum - coalesce(lag(Sum) over series, 0) as added_sum, Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count\nfrom otel.metrics_histogram where MetricName = 'alasio.wake.latency' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added_count > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "woken",
+              "text": "woken",
+              "type": "string"
+            },
+            {
+              "selector": "seconds",
+              "text": "seconds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "displayName": "${__field.labels.woken}",
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "showPoints": "always",
+            "stacking": {
+              "mode": "none"
             }
           }
         },

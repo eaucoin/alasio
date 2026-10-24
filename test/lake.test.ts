@@ -3034,7 +3034,7 @@ describe("the lake's reader", () => {
     }
   });
 
-  test("the Harnesses dashboard times and counts the binds of main's harness pools or a branch environment's, as its Branch chooses, counts their releases by why and their losses by pool, and the turns run again as their harness was lost, by how each came out, none of the folder instances'; says what scales its alasio, as KEDA measures it, beside its starts; and how its replicas share the work: their rebalances, claim waits and claims lost", async () => {
+  test("the Harnesses dashboard times and counts the binds of main's harness pools or a branch environment's, as its Branch chooses, counts their releases by why and their losses by pool, and the turns run again as their harness was lost, by how each came out, none of the folder instances'; says what scales its alasio, as KEDA measures it, beside its starts and how long each took to answer what woke it; and how its replicas share the work: their rebalances, claim waits and claims lost", async () => {
     const minute = 60_000;
     const now = Math.floor(Date.now() / minute) * minute;
     const keyValues = (attributes: Readonly<Record<string, string>>) => Object.entries(attributes).map(([key, value]) => ({ key, value: { stringValue: value } }));
@@ -3092,6 +3092,7 @@ describe("the lake's reader", () => {
           {
             resource: { attributes: keyValues({ "service.name": "alasio" }) },
             scopeMetrics: [{ metrics: [counter(RECOVERIES, recovered("lost", "staged"), [10]), counter(RECOVERIES, recovered("reattach", "given-up"), [4]), histogram("alasio.turn.first_output", { "alasio.harness": "codex" }, [[20, 7]]), counter("alasio.starts", {}, [90, 30, 10]),
+              histogram("alasio.wake.latency", {}, [[30, 12], [10, 4]]),
               // Its replicas': two joins of Telegram's group, one of its events'; asks for claims and turns' waits for them; claims lost and taken up.
               counter("alasio.log.rebalances", { "messaging.consumer.group.name": "alasio.main", "messaging.destination.name": "telegram.main" }, [20, 10]),
               counter("alasio.log.rebalances", { "messaging.consumer.group.name": "alasio-events.main", "messaging.destination.name": "alasio-events.main" }, [20]),
@@ -3145,6 +3146,7 @@ describe("the lake's reader", () => {
       assert.deepEqual(await rows("Waiting on its topics", "topic", "value"), ["s0-kafka-alasio-main-telegram 3"]);
       assert.deepEqual(await rows("Harnesses bound", "harnesses", "value"), ["bound 1"]);
       assert.deepEqual(await rows("Starts", "started", "starts"), ["alasio 1", "alasio 1"]);
+      assert.deepEqual(await rows("Wake latency", "woken", "seconds"), ["alasio 12", "alasio 4"]);
       // How its replicas share the work: by the minute, a claim's waits averaged across its replicas.
       assert.deepEqual(await rows("Rebalances", "consumer_group", "rebalances"), ["alasio-events.main 1", "alasio.main 1", "alasio.main 1"]);
       assert.deepEqual(await rows("Claim waits", "claim", "seconds"), ["held 0.125", "taken 0.25", "taken 0.5", "turn refused 10"]);
@@ -3160,6 +3162,7 @@ describe("the lake's reader", () => {
       assert.deepEqual(await rows("First output", "harness", "seconds", "pooled"), []);
       assert.deepEqual(await rows("Waiting on its topics", "topic", "value", "pooled"), ["s0-kafka-alasio-pooled-telegram 7"]);
       assert.deepEqual(await rows("Starts", "started", "starts", "pooled"), ["alasio 1"]);
+      assert.deepEqual(await rows("Wake latency", "woken", "seconds", "pooled"), []);
       assert.deepEqual(await rows("Rebalances", "consumer_group", "rebalances", "pooled"), ["alasio.pooled 1"]);
       assert.deepEqual(await rows("Claims lost", "claim", "claims", "pooled"), []);
     } finally {

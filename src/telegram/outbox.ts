@@ -10,6 +10,7 @@ import { inlineKeyboard, type PanelDraft } from "../operator/panel.ts";
 import { withLogScope } from "../shared/log.ts";
 import { currentTraceparent, meter, withAlasioSpan } from "../telemetry/index.ts";
 import { type TelegramError, TelegramClient } from "./client.ts";
+import { WakeLatency } from "./wake-latency.ts";
 
 const DEFAULT_RETRY_MS = 10_000;
 const MAX_RETRY_MS = 5 * 60_000;
@@ -112,6 +113,8 @@ export class Outbox extends Context.Service<Outbox, {
     const store = yield* Store;
     const client = yield* TelegramClient;
     const wakeup = yield* Latch.make();
+    // What times the start's first answer, where alasio's is given (./wake-latency.ts).
+    const wake = Option.getOrNull(yield* Effect.serviceOption(WakeLatency));
 
     // The gauge is read as metrics are exported, outside every fiber of alasio's.
     const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
@@ -270,18 +273,25 @@ export class Outbox extends Context.Service<Outbox, {
       Effect.forkScoped,
     );
 
-    /** Queues with the trace it is queued in, and wakes delivery. */
-    const queued = <A>(enqueue: (traceparent: string | null) => Effect.Effect<A, StoreError>) =>
-      Effect.suspend(() => enqueue(currentTraceparent())).pipe(Effect.tap(() => Effect.sync(() => wakeup.openUnsafe())));
+    /** Queues with the trace it is queued in, and wakes delivery; what `answers`, where it says it queued it, told to `wake`, with its trace. */
+    const queued = <A>(enqueue: (traceparent: string | null) => Effect.Effect<A, StoreError>, answers?: { readonly chatId: string | number; readonly queued?: (queued: A) => boolean }) =>
+      Effect.suspend(() => {
+        const traceparent = currentTraceparent();
+        return enqueue(traceparent).pipe(Effect.tap((result) =>
+          Effect.andThen(
+            Effect.sync(() => wakeup.openUnsafe()),
+            wake && answers && (answers.queued?.(result) ?? true) ? wake.queued(answers.chatId, traceparent) : Effect.void,
+          )
+        ));
+      });
 
     return Outbox.of({
-      enqueueText: (text) => queued((traceparent) => store.enqueueOutboxText({ ...text, traceparent })),
+      enqueueText: (text) => queued((traceparent) => store.enqueueOutboxText({ ...text, traceparent }), { chatId: text.chatId }),
       enqueuePanel: ({ conversationId, chatId, text, keyboard }) =>
         queued((traceparent) =>
-          store.enqueueOutboxPanel(conversationId, keyboard.flat(), (ids) => ({ chatId, text, options: { reply_markup: inlineKeyboard(keyboard, ids) }, traceparent }))
-        ),
-      enqueueNotice: ({ conversationId, chatId, text }) => queued((traceparent) => store.enqueueOutboxNotice(conversationId, { chatId, text, traceparent })),
-      enqueueStatus: (status) => queued((traceparent) => store.enqueueOutboxStatus({ ...status, traceparent })),
+          store.enqueueOutboxPanel(conversationId, keyboard.flat(), (ids) => ({ chatId, text, options: { reply_markup: inlineKeyboard(keyboard, ids) }, traceparent })), { chatId }),
+      enqueueNotice: ({ conversationId, chatId, text }) => queued((traceparent) => store.enqueueOutboxNotice(conversationId, { chatId, text, traceparent }), { chatId, queued: (told) => told }),
+      enqueueStatus: (status) => queued((traceparent) => store.enqueueOutboxStatus({ ...status, traceparent }), { chatId: status.chatId }),
       enqueueEdit: (edits, edit) => queued((traceparent) => store.enqueueOutboxEdit(edits, { ...edit, traceparent })),
       deliverDue,
       deliverChat: (chatId) =>

@@ -2240,6 +2240,8 @@ if (inShard("telemetry")) {
       await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
       await tg.say("hello");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      // Its first update since it started timed to its first answer, once.
+      await untilInLake("alasio's wake latency", "select count(*) as n from otel.metrics_histogram where ServiceName = 'alasio' and MetricName = 'alasio.wake.latency'");
       // alasio's turn names Codex's thread, Codex's span in its trace names Codex's turn, and
       // the thread's rollout, mirrored to Neon and loaded, has that turn, completed.
       await untilInLake(

@@ -40,6 +40,7 @@ import { TelegramClient } from "./telegram/client.ts";
 import { ReceivedFiles } from "./telegram/files.ts";
 import { MediaGroups } from "./telegram/media-group-buffer.ts";
 import { Outbox } from "./telegram/outbox.ts";
+import { answeringClient, WakeLatency } from "./telegram/wake-latency.ts";
 import type { TelegramUpdates } from "./telegram/update-consumer.ts";
 
 /** What alasio is made with: its configuration, its Neon and what main keeps there, and where its updates come from. */
@@ -123,8 +124,11 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
     Layer.provideMerge(EventsConsumer.layer.pipe(Layer.provide(options.events))),
     Layer.provideMerge(Layer.mergeAll(
       stateStore(options),
-      TelegramClient.layer(options.telegramBotToken),
+      // What it sends at once told the start's timing, as an answer is, beside what the outbox queues.
+      answeringClient.pipe(Layer.provide(TelegramClient.layer(options.telegramBotToken))),
     )),
+    // Below all: the outbox tells it what it queues, the Telegram client what it sends at once, and the app the updates it handles.
+    Layer.provideMerge(WakeLatency.layer),
   )));
 }
 

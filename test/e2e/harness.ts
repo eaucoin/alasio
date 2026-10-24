@@ -1263,10 +1263,11 @@ export async function dumpClusterState(): Promise<void> {
         const name = pod.metadata?.name ?? "";
         const logged = await logsOf(NAMESPACE, name, component);
         say(`--- ${NAMESPACE}/${name}: its last lines of harnesses`);
-        // alasio's of its turns' drives, reattaches and recoveries too, which name the conversation, not its harness's key.
+        // alasio's of its turns' drives, reattaches and recoveries too, which name the conversation, not its harness's key, and
+        // of its timing of its start's first answer (src/telegram/wake-latency.ts).
         const told = (each: string) =>
           each.includes("harness:") || each.includes("harness's") || each.startsWith("[sandbox-gateway]") ||
-          (component === "alasio" && /harness|turn-controller|was lost|attach/iu.test(each));
+          (component === "alasio" && /harness|turn-controller|was lost|attach|the start's first update/iu.test(each));
         for (const line of logged.trimEnd().split("\n").filter(told).slice(-120)) say(`  ${line}`);
       }
     }

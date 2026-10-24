@@ -23,7 +23,7 @@ import type { StoreError } from "../persistence/sql.ts";
 import { Store, type UpdateMarks } from "../persistence/store.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import { withLogScope } from "../shared/log.ts";
-import { SpanKind, withAlasioSpan } from "../telemetry/index.ts";
+import { currentTraceparent, SpanKind, withAlasioSpan } from "../telemetry/index.ts";
 import { Authorizer } from "./authorizer.ts";
 import { takePress } from "./callback-handler.ts";
 import { TelegramClient, type TelegramError } from "./client.ts";
@@ -34,6 +34,7 @@ import { handleMessage, processIncomingPrompt } from "./message-handler.ts";
 import type { Outbox } from "./outbox.ts";
 import { chatOfPress, holdWhileRunning, PRESS_AWAITED, PRESS_HOLD, type PressAnswers, PRESSES_DUE_EVERY, pressAnswers, recoverPresses } from "./presses.ts";
 import { consumeUpdates, type TelegramUpdates } from "./update-consumer.ts";
+import { WakeLatency } from "./wake-latency.ts";
 
 /** How often completed responses that were never delivered are looked for. */
 const COMPLETED_RESPONSE_RECOVERY = "30 seconds";
@@ -78,6 +79,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   const turns = yield* Turns;
   const mediaGroups = yield* MediaGroups;
   const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
+  // What times the start's first answer, where alasio's is given (./wake-latency.ts).
+  const wake = Option.getOrNull(yield* Effect.serviceOption(WakeLatency));
   // What an update is processed with, given to it as the poller hands it over.
   const services = yield* Effect.context<TelegramAppServices>();
   // What an update leads to that outlasts it (a prompt, a button's control), stopped as the app stops.
@@ -107,6 +110,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
         if (!(yield* marks.recordTelegramUpdate(update))) {
           return yield* Effect.logInfo(`Skipping update ${update.update_id}, processed already`);
         }
+        if (wake) yield* wake.handling(update, currentTraceparent());
         const callbackQuery = update.callback_query;
         if (callbackQuery) {
           // Taken from the store before the update is marked processed, as a message is: the
