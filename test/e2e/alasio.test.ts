@@ -39,6 +39,7 @@ import { neonStack } from "../../neon/test/stack.ts";
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
 import { SESSION_FS_ENVIRONMENTS_TOML } from "../../src/codex/sessionfs.ts";
 import { SESSION_FS_CLAUDE_TOOLS } from "../../src/harness/claude/sessionfs.ts";
+import { GATEWAY_RESTART_MS } from "../../src/mcp/bayma-proxy.ts";
 import { TOKEN_TTL_MS } from "../../src/sandbox/gateway-client.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
@@ -51,6 +52,7 @@ import { ANSWER } from "./codex-stand-in.ts";
 import { bindBranchSession, bindInBranch, mainSandboxService, sandboxService, serviceLogs, servesBranch } from "./sandbox-service.ts";
 import type { ReleaseSeen } from "./claude-mcp-release.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
+import type { FolderRestartSeen } from "./folder-gateway-restart.ts";
 import type { FolderReplsRead, FolderReplsSet, FolderRunaway } from "./folder-repl.ts";
 import {
   AGENTS,
@@ -969,6 +971,109 @@ if (inShard("sessions")) {
       // A pod of its own, made anew.
       const [after] = await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
       assert.notEqual(after?.metadata?.uid, before?.metadata?.uid);
+    });
+
+    test("a folder conversation's Claude Code, and its Codex, reach their bayma again through the loopback alone, at the same address, as the sandbox gateway starts again between their calls and mid-call, and once it was away past the loopback's bound, its REPL session kept", { skip: !HOST_PROFILE && "folder workspaces are for a single node", timeout: 30 * 60_000 }, async () => {
+      const gateways = () => kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("sandbox-gateway")) });
+      const instances = () => kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" });
+      const GATEWAY_DEPLOYMENT = ref("Deployment", GATEWAY, NAMESPACE);
+      for (const harness of ["claude", "codex"] as const) {
+        const key = `folder:${harness}:e2e:restart`;
+        const mark = `e2e-restart-${harness}-${Date.now()}`;
+        try {
+          const running = inAlasio<FolderRestartSeen>("./folder-gateway-restart.ts", harness, mark);
+          /** The gateway started again as the script asks for `step`: how long from its pods' deletion until one of its own is ready again. */
+          const restarted = async (step: string) => {
+            await until(`the script to ask for ${step}`, async () => ((await inAlasioContainer(["sh", "-c", `test -e /tmp/${mark}-${step} && echo asked || true`])).trim() === "asked" ? true : undefined), 600_000);
+            const before = new Set((await gateways()).map(({ metadata }) => metadata?.uid));
+            const deleted = Date.now();
+            for (const { metadata } of await gateways()) await kube.remove(ref("Pod", metadata?.name ?? "", NAMESPACE));
+            await until("a gateway of its own ready again", async () =>
+              (await gateways()).some(({ metadata, status }) => !before.has(metadata?.uid) && status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True")) ? true : undefined, 300_000);
+            const unreachedMs = Date.now() - deleted;
+            await inAlasioContainer(["touch", `/tmp/${mark}-${step}-done`]);
+            return unreachedMs;
+          };
+          /**
+           * The gateway away as the script asks for `step`, for less than GATEWAY_RESTART_MS: scaled to
+           * none, the script told once none of its pods is left (`-deleted`), so that no connection to
+           * it is made then, and started again 5 s on, until one is ready: how long it was away. A pod
+           * deleted is no such case: a call made as it stops may reach it, and is passed on no more.
+           */
+          const bounced = async (step: string) => {
+            await until(`the script to ask for ${step}`, async () => ((await inAlasioContainer(["sh", "-c", `test -e /tmp/${mark}-${step} && echo asked || true`])).trim() === "asked" ? true : undefined), 600_000);
+            const away = Date.now();
+            await kube.patch(GATEWAY_DEPLOYMENT, { spec: { replicas: 0 } });
+            await until("no gateway left", async () => ((await gateways()).length === 0 ? true : undefined), 300_000);
+            await inAlasioContainer(["touch", `/tmp/${mark}-${step}-deleted`]);
+            await sleep(5_000);
+            await kube.patch(GATEWAY_DEPLOYMENT, { spec: { replicas: 1 } });
+            await until("a gateway ready again", async () =>
+              (await gateways()).some(({ metadata, status }) => !metadata?.deletionTimestamp && status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True")) ? true : undefined, 300_000);
+            await inAlasioContainer(["touch", `/tmp/${mark}-${step}-done`]);
+            return Date.now() - away;
+          };
+          /** The gateway stopped as the script asks for `step`, its Deployment scaled to none, once none of its pods is left. */
+          const stopped = async (step: string) => {
+            await until(`the script to ask for ${step}`, async () => ((await inAlasioContainer(["sh", "-c", `test -e /tmp/${mark}-${step} && echo asked || true`])).trim() === "asked" ? true : undefined), 600_000);
+            await kube.patch(GATEWAY_DEPLOYMENT, { spec: { replicas: 0 } });
+            await until("no gateway left", async () => ((await gateways()).length === 0 ? true : undefined), 300_000);
+            await inAlasioContainer(["touch", `/tmp/${mark}-${step}-done`]);
+            return Date.now();
+          };
+          /**
+           * The gateway started again as the script asks for `step`, of its one replica, once it is
+           * ready: no sooner than past GATEWAY_RESTART_MS, with room, from `downAt`, when it was
+           * stopped, so the loopback gives up the call made meanwhile.
+           */
+          const startedAgain = async (step: string, downAt: number) => {
+            await until(`the script to ask for ${step}`, async () => ((await inAlasioContainer(["sh", "-c", `test -e /tmp/${mark}-${step} && echo asked || true`])).trim() === "asked" ? true : undefined), 600_000);
+            await sleep(Math.max(0, downAt + GATEWAY_RESTART_MS + 15_000 - Date.now()));
+            await kube.patch(GATEWAY_DEPLOYMENT, { spec: { replicas: 1 } });
+            await until("a gateway ready again", async () =>
+              (await gateways()).some(({ metadata, status }) => !metadata?.deletionTimestamp && status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True")) ? true : undefined, 300_000);
+            await inAlasioContainer(["touch", `/tmp/${mark}-${step}-done`]);
+          };
+          /** `step` done as the script asks, or the script's failure where it fails first. */
+          const failedFirst = running.then(() => new Promise<never>(() => {}));
+          const asked = (step: string) => Promise.race([restarted(step), failedFirst]);
+          const idle = await asked("idle");
+          const restarting = await Promise.race([bounced("restarting"), failedFirst]);
+          const [instance] = (await instances()).filter(({ metadata }) => metadata?.annotations?.["alasio.dev/binding-key"] === key);
+          const calling = await asked("calling");
+          // Away for longer than the loopback passes a request on again for.
+          const downAt = await Promise.race([stopped("down"), failedFirst]);
+          await Promise.race([startedAgain("up", downAt), failedFirst]);
+          const seen = await running;
+          // The measure of GATEWAY_RESTART_MS: how long the loopback finds no gateway as it starts again.
+          console.log(`# ${harness}: the gateway was ready again ${idle} ms after its pods were deleted, ${restarting} ms after it was stopped for 5 s, then ${calling} ms after its pods were deleted under a call; ${JSON.stringify(seen)}`);
+          assert.ok(Math.max(idle, restarting, calling) < GATEWAY_RESTART_MS, `the gateway was ready again ${idle} ms, ${restarting} ms, then ${calling} ms after it went, past GATEWAY_RESTART_MS`);
+          assert.ok(seen.kept.ok, JSON.stringify(seen.kept));
+          // Cut, the call under way as the gateway stopped is lost, never answered as if it ran; and
+          // one made while the gateway was away past GATEWAY_RESTART_MS fails, the loopback having
+          // given it up.
+          assert.ok(!seen.cut.ok, JSON.stringify(seen.cut));
+          assert.ok(!seen.during.ok && !seen.during.text.includes("kept through the restart"), JSON.stringify(seen.during));
+          // Each read after, by the MCP client as the gateway left it, never told to reconnect, its
+          // session's control its own still: the loopback carries it across them all.
+          // The one made as the gateway started again passed on once it was ready, as the loopback passes a
+          // request whose connection was refused again, and answered.
+          for (const after of [seen.afterIdle, seen.restarting, seen.afterCut, seen.afterOutage]) {
+            assert.ok(after.ok && after.text.includes("kept through the restart"), JSON.stringify(seen));
+          }
+          // Its instance as it was, never released by the gateway's restarts.
+          const [now] = (await instances()).filter(({ metadata }) => metadata?.annotations?.["alasio.dev/binding-key"] === key);
+          assert.equal(now?.metadata?.uid, instance?.metadata?.uid);
+        } finally {
+          // The gateway of its one replica again, where the test failed while it was stopped.
+          await kube.patch(GATEWAY_DEPLOYMENT, { spec: { replicas: 1 } });
+          await until("a gateway ready", async () =>
+            (await gateways()).some(({ metadata, status }) => !metadata?.deletionTimestamp && status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True")) ? true : undefined, 300_000);
+          // Let go of, so the folder tests after find the folder conversation's instance alone.
+          assert.equal((await gatewayCall(await mainKeyToken(key), "POST", "/release")).status, 204);
+          await until(`${key}'s instance gone`, async () => ((await instances()).some(({ metadata }) => metadata?.annotations?.["alasio.dev/binding-key"] === key) ? undefined : true), 300_000);
+        }
+      }
     });
 
     test("a folder conversation's next instance requests the memory its instances came to use, as the gateway kept it of the folder's own", { skip: !HOST_PROFILE && "folder workspaces are for a single node", timeout: 20 * 60_000 }, async () => {
