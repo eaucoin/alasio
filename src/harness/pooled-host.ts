@@ -292,7 +292,7 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
             return result;
           }).pipe(Effect.scoped),
         // Of the binding the conversation's harness has now, binding none: a turn of one let go of, its pod gone, is known nowhere.
-        attach: (turn) => onHost(turn.conversationId, (host) => host.attach(turn), Effect.succeedNone),
+        attach: (turn) => onHost(turn.conversationId, (host) => host.attach(turn), Effect.succeed({ _tag: "Unknown" } as const)),
         steer: (conversationId, prompt, fileIds) => onHost(conversationId, (host) => host.steer(conversationId, prompt, fileIds), Effect.succeedNone),
         interrupt: (conversationId, reason) =>
           onHost(conversationId, (host) => host.interrupt(conversationId, reason), Effect.succeed(false)).pipe(

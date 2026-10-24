@@ -163,10 +163,7 @@ export const serveHost = Effect.fnUntraced(function*(
         return Effect.map(body(AttachRequest), (turn) =>
           lines(
             Stream.fromEffect(host.attach(turn).pipe(
-              Effect.map(Option.match({
-                onNone: (): object => Schema.encodeSync(AttachUnknown)({ known: false }),
-                onSome: (result): object => ({ answer: encodeTurnAnswer(result) }),
-              })),
+              Effect.map((attached): object => (attached._tag === "Answered" ? { answer: encodeTurnAnswer(attached.result) } : Schema.encodeSync(AttachUnknown)({ known: false }))),
               Effect.catch((error) => Effect.succeed(failureOf(error))),
             )),
             keepAliveMs,

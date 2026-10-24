@@ -17,7 +17,8 @@
  * Kinds, each one alasio acts on, as nothing else reads the topic (alasio's handlers of them,
  * HOST_EVENT_KINDS and FORK_EVENT_KINDS, are all of them):
  * - `harness.lost`: a conversation's harness's binding whose pod went while it was bound;
- * - `harness.released`: a conversation's harness's binding let go;
+ * - `harness.released`: a conversation's harness's binding let go; one released as its host
+ *   was killed for its memory (`oom`) saying the limit it ran out of;
  * - `harness.background-response`: a conversation's harness, running on between prompts, has
  *   a reply of its own completed in the store, to deliver;
  * - `harness.idle`: it let go of the conversation, which may run what waits on it;
@@ -52,7 +53,7 @@ const envelope = {
 };
 
 const HarnessLost = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.lost"), binding: Schema.String, pod: Schema.String, reason: Schema.String });
-const HarnessReleased = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.released"), binding: Schema.String, reason: Schema.String });
+const HarnessReleased = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.released"), binding: Schema.String, reason: Schema.String, memoryLimit: Schema.optional(Schema.String) });
 const HarnessBackgroundResponse = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.background-response") });
 const HarnessIdle = Schema.Struct({ ...envelope, kind: Schema.Literal("harness.idle") });
 

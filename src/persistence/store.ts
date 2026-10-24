@@ -69,7 +69,8 @@ export const LOST_PREFIX = "lost:";
  * given, as a turn alasio attached to again knew it, or running on `binding` where given, as a
  * binding's loss told of it, which a turn begun since on another binding is not; and how it is
  * run again: as a prompt of `messageId`, which a lost turn's message id begins with (LOST_PREFIX),
- * and the text `prompt` gives it; and what its status message says.
+ * and the text `prompt` gives it, unless `rerun` is false, as of a pod its own work ran out of
+ * memory, which would again; and what its status message says.
  */
 export interface LostRecovery {
   readonly conversationId: string;
@@ -77,18 +78,21 @@ export interface LostRecovery {
   readonly binding: string | null;
   readonly messageId: string;
   readonly prompt: (turn: Turn) => string;
+  /** Whether the turn is run again; true unless given. */
+  readonly rerun?: boolean;
   /** What the chat is told of what became of the turn: on its status message, or, where it has none, as a message of its own, but of a reply complete, which tells it. */
-  readonly said: (outcome: "staged" | "completed" | "given-up", turn: Turn) => string;
+  readonly said: (outcome: "staged" | "completed" | "given-up" | "ended", turn: Turn) => string;
 }
 
 /**
  * What staging a lost turn's recovery came to, of its turn: `staged`, run again as a prompt
  * of its own; `completed`, its response complete already, which is delivered, so it is not
- * run again; `given-up`, a recovery itself lost, let go of rather than run again; or `none`,
- * no such turn active, as one ended, or recovered, already.
+ * run again; `given-up`, a recovery itself lost, let go of rather than run again; `ended`, one
+ * not to be run again (`rerun` false), ended; or `none`, no such turn active, as one ended, or
+ * recovered, already.
  */
 export type LostRecoveryOutcome =
-  | { readonly outcome: "staged" | "completed" | "given-up"; readonly turn: Turn }
+  | { readonly outcome: "staged" | "completed" | "given-up" | "ended"; readonly turn: Turn }
   | { readonly outcome: "none" };
 
 /** What the store is made on: the pool it shares, and where in it the state is. */
@@ -174,13 +178,13 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
  * delivered rather than run again; and a recovery itself lost let go of; the chat told of
  * each but a reply delivered, in the same transaction, so once.
  */
-const stageLostOn = (on: ReturnType<typeof repositories>, { conversationId, epoch, binding, messageId, prompt, said }: LostRecovery): Effect.Effect<LostRecoveryOutcome, StoreError> =>
+const stageLostOn = (on: ReturnType<typeof repositories>, { conversationId, epoch, binding, messageId, prompt, rerun = true, said }: LostRecovery): Effect.Effect<LostRecoveryOutcome, StoreError> =>
   Effect.gen(function*() {
     const turn = yield* on.turns.getActiveTurn(conversationId);
     if (!turn || (epoch !== null && Number(turn.epoch) !== epoch) || (binding !== null && turn.binding !== binding)) return { outcome: "none" } as const;
     const completed = turn.pending_response_id === null ? false : yield* on.responses.lockCompleted(turn.pending_response_id);
     if (!(yield* on.turns.end(conversationId, Number(turn.epoch), completed ? "completed" : "stopped"))) return { outcome: "none" } as const;
-    const outcome = completed ? "completed" : turn.thread_ts.startsWith(LOST_PREFIX) ? "given-up" : "staged";
+    const outcome = completed ? "completed" : !rerun ? "ended" : turn.thread_ts.startsWith(LOST_PREFIX) ? "given-up" : "staged";
     if (!completed && turn.pending_response_id !== null) yield* on.responses.markPendingAsPosted(turn.pending_response_id);
     if (outcome === "staged") yield* on.promptJobs.enqueue({ conversationId, chatId: turn.channel, messageId, prompt: prompt(turn), priority: 1, harness: turn.harness });
     // Said on its status message; where it has none, as a message of its own, but of a reply it completed, which says it.

@@ -25,7 +25,7 @@ import { buildLostHarnessText, lostStatusText } from "../operator/lost-prompt.ts
 import { type EventWrites, LOST_PREFIX } from "../persistence/store.ts";
 import { countRecovery } from "./recoveries.ts";
 
-/** How a binding is let go of with its pod, which takes the turn it ran with it: deleted, its host ended, or lost (../gateway/releases.ts). */
+/** How a binding is let go of with its pod, which takes the turn it ran with it: deleted, its host ended, or lost (../gateway/releases.ts); and `oom`, its host killed for its memory, which ends the turn rather than running it again. */
 const LOST_WITH_POD: ReadonlySet<string> = new Set(["deleted", "broken", "lost"]);
 
 /** What a harness running on between prompts did on its own, for the control plane to act on. */
@@ -111,16 +111,18 @@ export class HarnessEvents extends Context.Service<HarnessEvents, {
       /**
        * The conversation's turn running on its binding `binding` as that was let go of with its
        * pod, run again, once, in the event's transaction: none begun since on another, as one is
-       * where the event is heard late, the conversation bound anew meanwhile.
+       * where the event is heard late, the conversation bound anew meanwhile. One whose pod ran out
+       * of `memoryLimit` is ended instead, told so, as what it ran would run out of it again.
        */
-      const recoverOf = (conversationId: string, binding: string, writes: EventWrites) =>
+      const recoverOf = (conversationId: string, binding: string, writes: EventWrites, memoryLimit?: string) =>
         writes.stageLostRecovery({
           conversationId,
           epoch: null,
           binding,
           messageId: `${LOST_PREFIX}${binding}`,
           prompt: (turn) => buildLostHarnessText(turn.harness),
-          said: (outcome, turn) => lostStatusText(outcome, turn.harness),
+          rerun: memoryLimit === undefined,
+          said: (outcome, turn) => lostStatusText(outcome, turn.harness, memoryLimit),
         }).pipe(
           Effect.tap((recovery) => countRecovery(recovery, "lost")),
           Effect.flatMap((recovery) => (recovery.outcome === "none" ? Effect.void : Effect.andThen(
@@ -138,7 +140,8 @@ export class HarnessEvents extends Context.Service<HarnessEvents, {
         // A binding let go of, released or lost, lets go of its conversation too: what waited on it,
         // as its host was drained, runs, bound anew; and its grant reaches nothing from then on.
         // A pod gone under its binding, lost, deleted or its host ended, takes what it ran with it: the
-        // conversation's turn running then is run again, once (Store.stageLostRecovery).
+        // conversation's turn running then is run again, once (Store.stageLostRecovery); but where its
+        // host was killed for its memory, ended, told the limit it ran out of, as it would again.
         "harness.lost": (event, writes) =>
           fromItsTeller((lost: typeof event) =>
             Effect.logWarning(`${lost.subject.key}'s harness's binding was lost, its pod ${lost.pod} gone while it was bound (${lost.reason}): its next turn binds it anew`).pipe(
@@ -151,7 +154,13 @@ export class HarnessEvents extends Context.Service<HarnessEvents, {
           fromItsTeller((released: typeof event) =>
             Effect.logInfo(`${released.subject.key}'s harness was released (${released.reason})`).pipe(
               Effect.andThen(writes.revokeHarnessGrant(released.subject.key, released.binding)),
-              Effect.andThen(LOST_WITH_POD.has(released.reason) ? recoverOf(released.subject.key, released.binding, writes) : Effect.void),
+              Effect.andThen(
+                released.reason === "oom"
+                  ? recoverOf(released.subject.key, released.binding, writes, released.memoryLimit ?? "its limit")
+                  : LOST_WITH_POD.has(released.reason)
+                  ? recoverOf(released.subject.key, released.binding, writes)
+                  : Effect.void,
+              ),
               Effect.andThen(told({ kind: "idle", conversationId: released.subject.key })),
             )
           )(event),

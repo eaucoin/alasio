@@ -429,8 +429,8 @@ test("a bound harness whose host cannot be asked is kept, said so as it first fa
   }
 });
 
-test("a bound pod whose host ended, or was started again in it, is released as broken, undrained; one ended by other than the gateway, as deleted; and a binding lost, told of", async () => {
-  const env = await environment(3);
+test("a bound pod whose host ended, or was started again in it, is released as broken, undrained; one killed for its memory, as oom, told the limit it ran out of; one ended by other than the gateway, as deleted; and a binding lost, told of", async () => {
+  const env = await environment(4);
   const recorded = agents();
   const stand = await host();
   try {
@@ -443,20 +443,29 @@ test("a bound pod whose host ended, or was started again in it, is released as b
     const ended = await placed("telegram:51");
     const restarted = await placed("telegram:52");
     const deleted = await placed("telegram:53");
+    const killed = await placed("telegram:55");
     await stopped(env.home, ended.bound.pod);
+    // Started again as the kernel killed its host for its memory, as kubelet records it.
+    const limit = ((await run(withKube((kube) => kube.read("v1", "Pod", env.home, killed.bound.pod)))) as V1Pod | null)?.spec?.containers[0]?.resources?.limits?.["memory"] ?? "its limit";
+    await run(withKube((kube) => kube.patchPodStatus(env.home, killed.bound.pod, {
+      status: { containerStatuses: [{ name: "harness", image: "alasio", imageID: "", ready: true, restartCount: 1, state: { running: {} }, lastState: { terminated: { exitCode: 137, reason: "OOMKilled" } } }] },
+    })));
     await run(withKube((kube) => kube.patchPodStatus(env.home, restarted.bound.pod, { status: { containerStatuses: [{ name: "harness", image: "alasio", imageID: "", ready: true, restartCount: 1, state: { running: {} } }] } })));
-    const ending = [endsOnceDeleted(env.home, restarted.bound.pod), endsOnceDeleted(env.home, deleted.bound.pod)];
+    const ending = [endsOnceDeleted(env.home, restarted.bound.pod), endsOnceDeleted(env.home, deleted.bound.pod), endsOnceDeleted(env.home, killed.bound.pod)];
     await run(withKube((kube) => kube.remove("v1", "Pod", env.home, deleted.bound.pod)));
     await Effect.runPromise(harnesses.live);
     await Promise.all(ending);
-    for (const { key } of [ended, restarted, deleted]) {
+    for (const { key } of [ended, restarted, deleted, killed]) {
       for (const deadline = Date.now() + 10_000; await run(readLease(env.codex, key)); await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, `${key} was not released`);
     }
     assert.equal(stand.asked.includes(HOST_PATHS.drain), false);
     const reasons = (conversation: string) => told.filter((event) => event.subject.key === conversation && event.kind === "harness.released").map((event) => (event.kind === "harness.released" ? event.reason : ""));
     // Each told once its release in the background is done, which its Lease's deletion is a step of.
-    await eventually("each release told of", () => ([reasons("telegram:51"), reasons("telegram:52"), reasons("telegram:53")].every((told) => told.length > 0) ? true : undefined));
-    assert.deepEqual([reasons("telegram:51"), reasons("telegram:52"), reasons("telegram:53")], [["broken"], ["broken"], ["deleted"]]);
+    const conversations = ["telegram:51", "telegram:52", "telegram:53", "telegram:55"];
+    await eventually("each release told of", () => (conversations.map(reasons).every((told) => told.length > 0) ? true : undefined));
+    assert.deepEqual(conversations.map(reasons), [["broken"], ["broken"], ["deleted"], ["oom"]]);
+    const limits = told.flatMap((event) => (event.kind === "harness.released" ? [[event.subject.key, event.memoryLimit]] : []));
+    assert.deepEqual(limits.filter(([, given]) => given !== undefined), [["telegram:55", limit]]);
     // A binding whose pod went while it was bound, told of as lost.
     const lease = await run(readLease(env.codex, ended.key));
     assert.equal(lease, null);

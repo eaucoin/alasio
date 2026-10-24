@@ -284,7 +284,7 @@ test("a call of a harness host elsewhere carries its span's trace context, and t
   const host = HarnessHost.of({
     reserve: () => Effect.succeed(true),
     startTurn: () => Effect.sync(() => void (handedOn = traceparentHere())).pipe(Effect.as({ blockSequence: [], sessionId: "thread-1", pendingResponseId: "pending-1", interrupted: false, responseCompleted: true })),
-    attach: () => Effect.succeedNone,
+    attach: () => Effect.succeed({ _tag: "Unknown" } as const),
     steer: () => Effect.succeed(Option.none()),
     interrupt: () => Effect.succeed(false),
     status: () => Effect.succeed({ busy: false, running: false, cliInitiated: false, held: false, idleSince: 0 }),

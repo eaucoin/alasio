@@ -21,9 +21,9 @@ import { answeredByFront } from "../src/binder/server.ts";
 import { type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 import { poolLoginKey } from "../src/codex/login-relay.ts";
 import { GRANT_HEADER, grantDigest, grantKey, harnessGrant } from "../src/harness/grant.ts";
-import { HarnessHost, type TurnCodex, type TurnRequest, type TurnStart } from "../src/harness/host.ts";
+import { type Attached, HarnessHost, type TurnCodex, type TurnRequest, type TurnStart } from "../src/harness/host.ts";
 import { BusyPods } from "../src/kube/busy.ts";
-import { Harnesses } from "../src/harness/index.ts";
+import { Harnesses, type TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, HARNESS_NAMES } from "../src/harness/names.ts";
 import { HARNESS_BINDING, pooledHarnessHost } from "../src/harness/pooled-host.ts";
 import { serveHost } from "../src/harness/serve.ts";
@@ -33,6 +33,12 @@ import { Store } from "../src/persistence/store.ts";
 import { SessionSandboxes } from "../src/sandbox/index.ts";
 import { sessionFsWorkspace } from "../src/workspace/kind.ts";
 import { newSchema, run, testPool, testStore } from "./support/store.ts";
+
+/** The result an attach answered, which it must have. */
+function answered(attached: Attached): TurnResult {
+  assert.ok(attached._tag === "Answered", JSON.stringify(attached));
+  return attached.result;
+}
 
 const CALLER_KEY = Buffer.from("the environment's key");
 
@@ -64,9 +70,9 @@ function podHost(started: TurnStart[], { renewed = [], turnMs = 0 }: { readonly 
         Effect.as({ blockSequence: [], sessionId: "thread-1", pendingResponseId: "pending-1", interrupted: false, responseCompleted: true }),
       ),
     attach: ({ epoch, messageId }) =>
-      Effect.succeed(started.some((start) => start.epoch === epoch && start.messageId === messageId)
-        ? Option.some({ blockSequence: [], sessionId: "thread-1", pendingResponseId: "pending-1", interrupted: false, responseCompleted: true })
-        : Option.none()),
+      Effect.succeed<Attached>(started.some((start) => start.epoch === epoch && start.messageId === messageId)
+        ? { _tag: "Answered", result: { blockSequence: [], sessionId: "thread-1", pendingResponseId: "pending-1", interrupted: false, responseCompleted: true } }
+        : { _tag: "Unknown" }),
     steer: () => Effect.succeed(Option.some(true)),
     interrupt: () => Effect.succeed(true),
     status: () => Effect.succeed({ busy: true, running: true, cliInitiated: false, held: false, idleSince: null }),
@@ -198,8 +204,8 @@ test("alasio reaches each conversation's pooled host through the front, a token 
       assert.deepEqual(await Effect.runPromise(host.backgroundWork(conversationId)), false);
       assert.deepEqual(await Effect.runPromise(host.steer(conversationId, "more", [])), Option.none());
       assert.equal(await Effect.runPromise(host.interrupt(conversationId, "interrupt")), false);
-      // Nor does an attach to a turn of it, of which none is known.
-      assert.deepEqual(await Effect.runPromise(host.attach({ conversationId, epoch: 1, messageId: "10" })), Option.none());
+      // Nor does an attach to a turn of it, its conversation bound to no pod.
+      assert.deepEqual(await Effect.runPromise(host.attach({ conversationId, epoch: 1, messageId: "10" })), { _tag: "Unbound" });
       assert.deepEqual(stand.asked.map(({ bindsNothing }) => bindsNothing), [true, true, true, true, true]);
       assert.deepEqual(stand.asked[0]?.claims?.key, `harness:${conversationId}`);
       assert.deepEqual(stand.asked[0]?.claims?.options, { environment: "main", harness: "codex", workspace: "folder" });
@@ -244,7 +250,7 @@ test("alasio reaches each conversation's pooled host through the front, a token 
       // Bound, what reads it is passed on to its host, an attach to its turn among it, binding nothing still, nor giving its grant.
       assert.deepEqual(await Effect.runPromise(host.status(conversationId)), { busy: true, running: true, cliInitiated: false, held: false, idleSince: null });
       assert.equal(await Effect.runPromise(host.backgroundWork(conversationId)), true);
-      assert.equal(Option.getOrThrow(await Effect.runPromise(host.attach({ conversationId, epoch, messageId: "10" }))).pendingResponseId, "pending-1");
+      assert.equal(answered(await Effect.runPromise(host.attach({ conversationId, epoch, messageId: "10" }))).pendingResponseId, "pending-1");
       assert.deepEqual([stand.asked.at(-1)?.path, stand.asked.at(-1)?.bindsNothing, stand.asked.at(-1)?.grant], [HOST_PATHS.attach, true, undefined]);
 
       // Its workspace switched to a session: the next call's token places it so, and its turn is given the session's bayma.

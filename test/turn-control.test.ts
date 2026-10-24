@@ -27,7 +27,7 @@ import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { StoreError } from "../src/persistence/sql.ts";
 import { CurrentWorkerFence, Store, TurnFenced } from "../src/persistence/store.ts";
 import { forgetfulPersistence } from "./support/persistence.ts";
-import { bindHarness, holdsOf, POOLED_SCHEMA, Pools, pooledStore, poolOf } from "./support/pools.ts";
+import { bindHarness, holdsOf, OOM_LIMIT, POOLED_SCHEMA, Pools, pooledStore, poolOf } from "./support/pools.ts";
 import { run } from "./support/store.ts";
 import { type QueuedToOutbox, recordingOutbox, type TestAlasio, withServices } from "./support/turns.ts";
 import { eventually } from "./support/wait.ts";
@@ -701,6 +701,70 @@ test("a recovery whose pod is lost too is given up, not run again, and the chat 
     assert.equal(await toldGivenUp(), 1);
     assert.equal(await run(store.hasOpenPromptJobs(conversationId)), false);
     assert.equal(outbox.queued.texts.filter(({ text }) => text === "Recovered.").length, 0, "the given-up recovery's reply delivered");
+  });
+});
+
+test("a turn whose pod's host is killed for its memory is ended, not run again, and the chat is told once of the limit it ran out of", async () => {
+  const { store, schema, conversationId } = await conversation();
+  const release = Effect.runSync(Deferred.make<void>());
+  const ran: string[] = [];
+  const outbox = recordingOutbox();
+  const ENDED = `Codex's harness ran out of its memory (${OOM_LIMIT}) during this turn and was stopped. The turn is not run again, as it would run out again; send a message to go on, asking for less at once.`;
+  const toldEnded = async () => Number((await poolOf(store).query(`select count(*) from ${schema}.telegram_outbox where text = $1`, [ENDED])).rows[0]?.count);
+  await withServices({ store, harnesses: { [CODEX_HARNESS]: waitingHarness(release, ran, "Recovered.") }, outbox: outbox.layer }, async (alasio) => {
+    const counted = await added(RECOVERIES, async () => {
+      const driving = alasio.runFork(turnOf(conversationId, "go"));
+      await until("the turn to run on its pod", () => ran.length === 1);
+      // Its host killed for its memory, as the gateway tells it.
+      await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, "oom")));
+      await alasio.runPromise(Fiber.await(driving));
+      await until("the chat to be told", async () => (await toldEnded()) > 0);
+      await until("the turn to end", async () => (await run(store.getActiveTurn(conversationId))) === null);
+    });
+    assert.deepEqual(
+      Object.entries(counted).map(([attributes, count]) => `${attributes.replace(/alasio\.harness\.recovery\.by=(lost|reattach),/u, "")} ${count}`),
+      [`alasio.harness=${CODEX_HARNESS},alasio.harness.recovery.outcome=ended 1`],
+    );
+    await alasio.runPromise(Deferred.succeed(release, undefined));
+    await sleep(500);
+    assert.deepEqual(ran, ["go"], "run again");
+    assert.equal(await toldEnded(), 1);
+    assert.equal((await run(store.getTurn(conversationId)))?.outcome, "stopped");
+    assert.equal(await run(store.hasOpenPromptJobs(conversationId)), false);
+  });
+});
+
+test("a turn alasio attaches to again, its pod gone as its host ran out of its memory, waits for the release to be heard, which ends it, never run again", { timeout: 60_000 }, async () => {
+  const { store, schema, conversationId } = await conversation();
+  const release = Effect.runSync(Deferred.make<void>());
+  const ran: string[] = [];
+  const outbox = recordingOutbox();
+  const ENDED = `Codex's harness ran out of its memory (${OOM_LIMIT}) during this turn and was stopped. The turn is not run again, as it would run out again; send a message to go on, asking for less at once.`;
+  const toldEnded = async () => Number((await poolOf(store).query(`select count(*) from ${schema}.telegram_outbox where text = $1`, [ENDED])).rows[0]?.count);
+  await withServices({ store, harnesses: { [CODEX_HARNESS]: waitingHarness(release, ran, "Recovered.") }, outbox: outbox.layer, lossHeardWithin: "20 seconds" }, async (alasio) => {
+    await leftOnItsPod(alasio, store, conversationId, ran);
+    const counted = await added(RECOVERIES, async () => {
+      // Its pod gone, its release told of only once alasio, attaching, finds its next pod knows nothing of it.
+      const { tell } = await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.loseUntold(conversationId, "oom")));
+      const attaching = reattached(alasio);
+      await sleep(2_000);
+      assert.equal(ran.length, 1, "run again before its release was heard");
+      await alasio.runPromise(tell);
+      await attaching;
+      await until("the chat to be told", async () => (await toldEnded()) > 0);
+      await until("the turn to end", async () => (await run(store.getActiveTurn(conversationId))) === null);
+      await sleep(500);
+    });
+    // Ended by its release, which knew why; nothing found it lost as it was attached to.
+    assert.deepEqual(
+      Object.entries(counted).map(([attributes, count]) => `${attributes} ${count}`),
+      [`alasio.harness=${CODEX_HARNESS},alasio.harness.recovery.by=lost,alasio.harness.recovery.outcome=ended 1`],
+    );
+    await alasio.runPromise(Deferred.succeed(release, undefined));
+    await sleep(500);
+    assert.deepEqual(ran, ["go"], "run again");
+    assert.equal(await toldEnded(), 1);
+    assert.equal(await run(store.hasOpenPromptJobs(conversationId)), false);
   });
 });
 

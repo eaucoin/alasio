@@ -23,7 +23,7 @@ function slowHost(turnMs: number, started: { count: number }): HarnessHost["Serv
   return HarnessHost.of({
     reserve: () => Effect.succeed(true),
     startTurn: () => Effect.sync(() => void (started.count += 1)).pipe(Effect.andThen(Effect.sleep(turnMs)), Effect.as(result)),
-    attach: () => Effect.succeedNone,
+    attach: () => Effect.succeed({ _tag: "Unknown" } as const),
     steer: () => Effect.succeedNone,
     interrupt: () => Effect.succeed(false),
     status: () => Effect.succeed({ busy: false, running: false, cliInitiated: false, held: false, idleSince: 0 }),

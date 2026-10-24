@@ -211,6 +211,12 @@ export interface PoolsOptions {
   readonly host?: ((host: HarnessHost["Service"]) => HarnessHost["Service"]) | undefined;
 }
 
+/** How a conversation's pod is lost (Pools.lose). */
+export type LostReason = "deleted" | "broken" | "lost" | "oom";
+
+/** The memory limit a pod lost as `oom` ran out of, as the gateway tells it: the session pods' own. */
+export const OOM_LIMIT = "1536Mi";
+
 /** What the stand-in says of its pods, for a test to look at: the conversations whose harness is bound now, each to its binding, those whose harness is being bound, and where their pods serve. */
 export class Pools extends Context.Service<Pools, {
   readonly bound: () => ReadonlyMap<string, string>;
@@ -228,11 +234,12 @@ export class Pools extends Context.Service<Pools, {
   /**
    * Ends the conversation's pod bound now, as a node lost with it, or its pod deleted, ends one,
    * what it runs with it, and tells of its binding let go of so, as the gateway does
-   * (harness.released, of `reason`, deleted or broken; or harness.lost): its binding's.
+   * (harness.released, of `reason`, deleted or broken, or oom, its host killed for its memory,
+   * OOM_LIMIT; or harness.lost): its binding's.
    */
-  readonly lose: (conversationId: string, reason: "deleted" | "broken" | "lost") => Effect.Effect<string>;
+  readonly lose: (conversationId: string, reason: LostReason) => Effect.Effect<string>;
   /** Ends the conversation's pod bound now as lose does, telling of it only as `tell` runs, as an event heard late is: its binding, and the telling. */
-  readonly loseUntold: (conversationId: string, reason: "deleted" | "broken" | "lost") => Effect.Effect<{ readonly binding: string; readonly tell: Effect.Effect<void> }>;
+  readonly loseUntold: (conversationId: string, reason: LostReason) => Effect.Effect<{ readonly binding: string; readonly tell: Effect.Effect<void> }>;
 }>()("alasio/test/Pools") {}
 
 /** The stand-in's pools: the front's address and the key alasio's calls to it are made with, the environment's events topic its pods' events are relayed onto, and what it says of its pods. */
@@ -375,7 +382,7 @@ export const standInPools = ({ database, standIns = {}, branch }: StandInPoolsOp
     );
 
     /** The conversation's pod bound now ended, and the telling of its binding let go of so, as Pools.loseUntold says. */
-    const loseUntold = (conversationId: string, reason: "deleted" | "broken" | "lost") =>
+    const loseUntold = (conversationId: string, reason: LostReason) =>
       Effect.gen(function*() {
         const key = [...pods.keys()].find((each) => conversationOfHarnessKey(each) === conversationId);
         const pod = key === undefined ? undefined : pods.get(key);
@@ -388,6 +395,8 @@ export const standInPools = ({ database, standIns = {}, branch }: StandInPoolsOp
           void events.write(eventRecord(
             reason === "lost"
               ? { kind: "harness.lost", environment: ENVIRONMENT, source: "sandbox-gateway", subject, binding, pod: pod.name, reason: "its pod went while it was bound" }
+              : reason === "oom"
+              ? { kind: "harness.released", environment: ENVIRONMENT, source: "sandbox-gateway", subject, binding, reason, memoryLimit: OOM_LIMIT }
               : { kind: "harness.released", environment: ENVIRONMENT, source: "sandbox-gateway", subject, binding, reason },
             at,
           ).value));

@@ -223,10 +223,10 @@ export function remoteHost({ url, token, unbound, bound }: RemoteHostOptions): R
     attach: (turn) =>
       Effect.gen(function*() {
         const answer = yield* lasting(HOST_PATHS.attach, turn, "an attach to a turn", { bindsNothing: true });
-        if (answer === null) return Option.none();
+        if (answer === null) return { _tag: "Unbound" } as const;
         const said = yield* answer.next;
-        if (Schema.is(AttachUnknown)(said)) return Option.none();
-        return Option.some(yield* turnAnswered(said));
+        if (Schema.is(AttachUnknown)(said)) return { _tag: "Unknown" } as const;
+        return { _tag: "Answered", result: yield* turnAnswered(said) } as const;
       }),
     steer: (conversationId, prompt, fileIds) =>
       call(HOST_PATHS.steer, { conversationId, prompt, fileIds }, SteerAnswer, { none: Effect.succeed({ taken: null }) }).pipe(

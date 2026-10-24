@@ -19,7 +19,7 @@ import type { ResponseBlock } from "../src/codex/event-projection.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { makeCodexHarness } from "../src/harness/codex.ts";
 import { whileHeld } from "../src/harness/holds.ts";
-import { HarnessHost, HostBinding, type TurnBayma, type TurnStart } from "../src/harness/host.ts";
+import { type Attached, HarnessHost, HostBinding, type TurnBayma, type TurnStart } from "../src/harness/host.ts";
 import { HarnessEvents, type HostEvent, HostEvents } from "../src/harness/host-events.ts";
 import { type Harness, Harnesses, NoWorkspaceMounted, type TurnParams, type TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
@@ -30,6 +30,12 @@ import { Store, TurnFenced } from "../src/persistence/store.ts";
 import { ReceivedFiles } from "../src/telegram/files.ts";
 import { holdsIn, newSchema, run, testStore } from "./support/store.ts";
 import { inProcessEvents } from "./support/host-events.ts";
+
+/** The result an attach answered, which it must have. */
+function answered(attached: Attached): TurnResult {
+  assert.ok(attached._tag === "Answered", JSON.stringify(attached));
+  return attached.result;
+}
 
 /** What the recording harness tells of each turn besides its reply. */
 const NOTICE = "This Codex login doesn't offer gpt-5.6-sol, so Codex used gpt-5.6-terra, the login's default (at high effort). Use /model to choose another.";
@@ -236,7 +242,7 @@ for (const [reach, reached] of Object.entries(REACHES)) {
     await onPodHost({ store, harness }, Effect.gen(function*() {
       const host = yield* reached(yield* HarnessHost, conversationId);
       // None of a turn it never ran.
-      assert.deepEqual(yield* host.attach({ conversationId, epoch: first, messageId: "10" }), Option.none());
+      assert.deepEqual(yield* host.attach({ conversationId, epoch: first, messageId: "10" }), { _tag: "Unknown" });
       // Its caller lets go of it as it runs: it runs on.
       const caller = yield* Effect.forkChild(host.startTurn(start("10", first)));
       while (gates.length === 0) yield* Effect.sleep("10 millis");
@@ -251,11 +257,11 @@ for (const [reach, reached] of Object.entries(REACHES)) {
       yield* Effect.sleep("50 millis");
       assert.equal(attached.pollUnsafe(), undefined, "an attach answered before its turn ended");
       yield* Deferred.succeed(gates[0]!, undefined);
-      const result = Option.getOrThrow(yield* Fiber.join(attached));
+      const result = answered(yield* Fiber.join(attached));
       assert.deepEqual([result.blockSequence, result.sessionId], [[{ type: "text", content: "Done." }], "session-1"]);
       assert.equal((yield* Fiber.join(again)).pendingResponseId, result.pendingResponseId);
       // Taken so, it is kept still, for an attach whose answer was lost on its way to ask again; and only the one turn ran.
-      assert.equal(Option.getOrThrow(yield* host.attach({ conversationId, epoch: first, messageId: "10" })).pendingResponseId, result.pendingResponseId);
+      assert.equal(answered(yield* host.attach({ conversationId, epoch: first, messageId: "10" })).pendingResponseId, result.pendingResponseId);
       assert.equal(seen.length, 1);
       // A turn whose caller took its answer is kept until the next starts: attached to after it ended, then of no more once another has started.
       const second = yield* Effect.promise(() => claim("11"));
@@ -266,13 +272,13 @@ for (const [reach, reached] of Object.entries(REACHES)) {
       const third = yield* Effect.promise(() => claim("12"));
       const next = yield* Effect.forkChild(host.startTurn(start("12", third)));
       while (gates.length < 3) yield* Effect.sleep("10 millis");
-      assert.deepEqual(yield* host.attach({ conversationId, epoch: second, messageId: "11" }), Option.none());
+      assert.deepEqual(yield* host.attach({ conversationId, epoch: second, messageId: "11" }), { _tag: "Unknown" });
       // And of another message, or another epoch, of the turn running: none either.
-      assert.deepEqual(yield* host.attach({ conversationId, epoch: third, messageId: "11" }), Option.none());
-      assert.deepEqual(yield* host.attach({ conversationId, epoch: second, messageId: "12" }), Option.none());
+      assert.deepEqual(yield* host.attach({ conversationId, epoch: third, messageId: "11" }), { _tag: "Unknown" });
+      assert.deepEqual(yield* host.attach({ conversationId, epoch: second, messageId: "12" }), { _tag: "Unknown" });
       yield* Deferred.succeed(gates[2]!, undefined);
       yield* Fiber.join(next);
-      assert.ok(Option.isSome(yield* host.attach({ conversationId, epoch: third, messageId: "12" })));
+      assert.equal((yield* host.attach({ conversationId, epoch: third, messageId: "12" }))._tag, "Answered");
     }));
   });
 }

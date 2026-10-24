@@ -4,7 +4,8 @@
  * sandbox gateway told it (./host-events.ts), or alasio finding its pod knew nothing of it, or
  * could not be reached, as it attached to it again (../codex/turns.ts); and by how it came
  * out: run again (`staged`), its reply delivered, as its pod completed it first
- * (`completed`), or given up, as a turn that was itself run again is (`given-up`).
+ * (`completed`), given up, as a turn that was itself run again is (`given-up`), or ended, as
+ * one whose pod's host was killed for its memory is, which would run out again (`ended`).
  */
 import { Effect } from "effect";
 
@@ -13,7 +14,7 @@ import { meter } from "../telemetry/index.ts";
 
 export const RECOVERIES = "alasio.harness.recoveries";
 const recoveries = meter.createCounter(RECOVERIES, {
-  description: "Turns whose harness instance was lost under them, by harness, what found them lost (lost: their binding's loss; reattach: alasio attaching again), and outcome (staged: run again; completed: their reply delivered; given-up)",
+  description: "Turns whose harness instance was lost under them, by harness, what found them lost (lost: their binding's loss; reattach: alasio attaching again), and outcome (staged: run again; completed: their reply delivered; given-up; ended: their host killed for its memory)",
   unit: "{turn}",
 });
 

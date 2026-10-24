@@ -4,7 +4,7 @@
  * harnesses it stands in, with alasio's tracing; built for one test and taken down after
  * it.
  */
-import { Effect, Layer, ManagedRuntime } from "effect";
+import { type Duration, Effect, Layer, ManagedRuntime } from "effect";
 import type pg from "pg";
 
 import { CodexAppServer } from "../../src/codex/app-server/client.ts";
@@ -134,6 +134,8 @@ export interface TestServicesOptions {
   readonly models?: Partial<Record<HarnessName, readonly ModelOption[]>> | undefined;
   /** What the harness host is made into, for a test that stands in for part of it: as made unless given. */
   readonly host?: ((host: HarnessHost["Service"]) => HarnessHost["Service"]) | undefined;
+  /** How long a turn found lost as it is attached to again waits for its loss to be heard: a moment, unless a test says, which no test's stand-in tells of otherwise. */
+  readonly lossHeardWithin?: Duration.Input | undefined;
 }
 
 /** alasio's services over `options`, as src/alasio.ts makes them but for what the test stands in. */
@@ -151,10 +153,11 @@ function testServices({
   branch,
   host,
   models = {},
+  lossHeardWithin = "200 millis",
 }: TestServicesOptions): Layer.Layer<AlasioServices | Pools | ActiveTurns> {
   return Layer.effectDiscard(Effect.flatMap(EventsConsumer, (consumer) => consumer.start)).pipe(Layer.provideMerge(MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot, branch }), Authorizer.layer(allowedUserIds))),
-    Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer({ pod: "alasio-test" })),
+    Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer({ pod: "alasio-test" }, { lossHeardWithin })),
     Layer.provideMerge(testPanels({ stateDir, branch, models })),
     // Its harnesses run where a pool's do: in a pod's host, bound for the conversation, reached through the sandbox gateway's front.
     Layer.provideMerge(pooledHost({ standIns: { overrides: harnesses }, branch, host })),

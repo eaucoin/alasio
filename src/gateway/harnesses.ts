@@ -192,6 +192,13 @@ const endedHow = (pod: V1Pod): string => {
   return [`exit code ${ended.exitCode}`, ended.reason, ended.message?.trim()].filter(Boolean).join(", ");
 };
 
+/** The memory limit of `pod`'s host where the kernel killed it for its memory, as kubelet says its container ended: null where it ended otherwise, or did not. */
+const killedForMemory = (pod: V1Pod): string | null => {
+  const host = pod.status?.containerStatuses?.find(({ name }) => name === HARNESS_CONTAINER);
+  if ((host?.state?.terminated ?? host?.lastState?.terminated)?.reason !== "OOMKilled") return null;
+  return pod.spec?.containers.find(({ name }) => name === HARNESS_CONTAINER)?.resources?.limits?.["memory"] ?? "its limit";
+};
+
 /** Whether `pod`'s host ended, or was started again in it, which serves its binding no more. */
 const hostEnded = (pod: V1Pod): boolean => {
   const host = pod.status?.containerStatuses?.find(({ name }) => name === HARNESS_CONTAINER);
@@ -275,10 +282,10 @@ export const makeHarnesses = Effect.fnUntraced(function*(
       workSeen.delete(binding);
     });
   /** Counts and tells of `key`'s binding `binding` of `pool`, released for `reason`. */
-  const releasedFor = (pool: Pool, key: string, binding: string, reason: ReleaseReason) =>
+  const releasedFor = (pool: Pool, key: string, binding: string, reason: ReleaseReason, memoryLimit?: string) =>
     forget(binding).pipe(
       Effect.andThen(released(pool, reason)),
-      Effect.andThen(tell(pool, (environment) => ({ kind: "harness.released", environment, source: "sandbox-gateway", subject: subject(key), binding, reason }))),
+      Effect.andThen(tell(pool, (environment) => ({ kind: "harness.released", environment, source: "sandbox-gateway", subject: subject(key), binding, reason, ...(memoryLimit === undefined ? {} : { memoryLimit }) }))),
     );
   /** Counts and tells of `key`'s binding `binding` of `pool`, its pod `pod`, let go of as lost, for `reason`. */
   const lostFor = (pool: Pool, key: string, binding: string, pod: string, reason: string) =>
@@ -451,8 +458,12 @@ export const makeHarnesses = Effect.fnUntraced(function*(
         if (!held.has(name) || releasing.has(uid) || !(deleted || hostEnded(pod))) continue;
         releasing.add(uid);
         yield* Effect.logWarning(deleted ? `${key}'s pod ${name} ends, though the gateway did not end it: it is released` : `${key}'s host ended in ${name} (${endedHow(pod)}), which serves its binding no more: it is released, the next bind making another`);
-        // Its host drained where it may yet answer; one ending, or ended, is not.
-        yield* Effect.forkDetach(releaseAs(pool, key, deleted ? "deleted" : "broken", false, name).pipe(
+        // Its host drained where it may yet answer; one ending, or ended, is not. One the kernel
+        // killed for its memory is told so, with the limit it ran out of, as what it ran would run
+        // out of it again.
+        const memoryLimit = deleted ? null : killedForMemory(pod);
+        const reason = deleted ? "deleted" : memoryLimit === null ? "broken" : "oom";
+        yield* Effect.forkDetach(releaseAs(pool, key, reason, false, name, (binding) => releasedFor(pool, key, binding, reason, memoryLimit ?? undefined)).pipe(
           Effect.catch((error) => Effect.andThen(Effect.sync(() => void releasing.delete(uid)), Effect.logWarning(`releasing ${key} failed: ${error.message}`))),
         ));
       }

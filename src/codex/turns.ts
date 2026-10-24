@@ -49,6 +49,22 @@ const REATTACH_WITHIN = Duration.minutes(12);
 const REATTACH_EVERY = Duration.seconds(5);
 
 /**
+ * How long a turn attached to again, its conversation bound to no pod, its binding gone, waits
+ * for its binding's release or loss to be heard first (../harness/host-events.ts), which knows
+ * why its pod went and lets go of the turn itself, ending it where its host ran out of its
+ * memory, so as not to run it again, before it is taken as lost and run again (recoverLost):
+ * longer than the sandbox gateway takes to tell of a release it made, its Lease gone; and how
+ * often, meanwhile, the turn is looked at.
+ */
+const LOSS_HEARD_WITHIN = Duration.seconds(30);
+const LOSS_LOOK_EVERY = Duration.seconds(1);
+
+/** What alasio's turns are made with besides their claims: how long a turn found lost waits for its loss to be heard (LOSS_HEARD_WITHIN), unless a test says. */
+export interface TurnsOptions {
+  readonly lossHeardWithin?: Duration.Input | undefined;
+}
+
+/**
  * How long a turn run outside a worker waits for its conversation's claim, as another alasio's
  * worker holds it, before it is refused: past the pass of a worker that has nothing to run, so
  * one finding its conversation's prompts drained waits for that pass alone.
@@ -197,14 +213,14 @@ export class Turns extends Context.Service<Turns, {
   readonly resumePendingPrompts: Effect.Effect<void, StoreError>;
 }>()("alasio/codex/Turns") {
   /** alasio's turns, its conversations' claims made as `claims` says: of alasio's pod, with their own timings unless a test says. */
-  static readonly layer = (claims: WorkerClaimsOptions): Layer.Layer<
+  static readonly layer = (claims: WorkerClaimsOptions, options: TurnsOptions = {}): Layer.Layer<
     Turns,
     never,
     Store | Outbox | Panels | HarnessHost | HarnessEvents
-  > => Layer.effect(Turns, makeTurns(claims));
+  > => Layer.effect(Turns, makeTurns(claims, options));
 }
 
-const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions) {
+const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions, { lossHeardWithin = LOSS_HEARD_WITHIN }: TurnsOptions) {
   const store = yield* Store;
   const outbox = yield* Outbox;
   const panels = yield* Panels;
@@ -667,10 +683,14 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
     const epoch = Number(turn.epoch);
     return host.attach({ conversationId, epoch, messageId: turn.thread_ts }).pipe(
       Effect.retry({ while: (error) => error._tag === "HarnessHostError", schedule: Schedule.max([Schedule.spaced(REATTACH_EVERY), Schedule.during(REATTACH_WITHIN)]) }),
-      Effect.flatMap(Option.match({
-        onNone: () => recoverLost(turn, `${LOST_PREFIX}${epoch}`, "its harness instance knew nothing of it"),
-        onSome: (result) => settleAttached(turn, result),
-      })),
+      Effect.flatMap((attached) =>
+        attached._tag === "Answered"
+          ? settleAttached(turn, attached.result)
+          : attached._tag === "Unknown"
+          ? recoverLost(turn, `${LOST_PREFIX}${epoch}`, "its harness instance knew nothing of it")
+          // Its binding gone, as its pod's: its release, or its loss, which knows why, heard first.
+          : Effect.andThen(lossHeard(turn), recoverLost(turn, `${LOST_PREFIX}${epoch}`, "its conversation is bound to no harness instance"))
+      ),
       Effect.catchTag("HarnessHostError", (error) => recoverLost(turn, `${LOST_PREFIX}${epoch}`, `its harness was not reached within ${Duration.format(REATTACH_WITHIN)}: ${error.message}`)),
       Effect.catch((error) => failAttached(turn, error.message)),
       Effect.ensuring(schedule(conversationId)),
@@ -714,7 +734,20 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
       if (yield* store.endTurn(turn.thread_key, Number(turn.epoch), "failed")) yield* editLeftStatus(turn, `${harnessDisplayName(turn.harness)} hit an error.`);
     }).pipe(Effect.catch((error) => Effect.logError(`Could not end ${turn.thread_key}'s turn attached to again: ${error.message}`)));
 
-  /** The turn `turn` taken as lost with its harness instance, for `why`: run again, as `messageId`, once (Store.stageLostRecovery), its status message saying so; its reply delivered, where it was complete. */
+  /** Waits, for lossHeardWithin at most, for the turn `turn` to be let go of as its binding's release or loss is heard. */
+  const lossHeard = (turn: Turn): Effect.Effect<void, StoreError> =>
+    store.getActiveTurn(turn.thread_key).pipe(
+      Effect.repeat({ until: (active) => active === null || active.epoch !== turn.epoch, schedule: Schedule.spaced(LOSS_LOOK_EVERY) }),
+      Effect.timeoutOption(lossHeardWithin),
+      Effect.asVoid,
+    );
+
+  /**
+   * The turn `turn` taken as lost with its harness instance, for `why`: run again, as
+   * `messageId`, once (Store.stageLostRecovery), its status message saying so; its reply
+   * delivered, where it was complete; nothing, where something else, its binding's release or
+   * loss among them, let go of it first.
+   */
   const recoverLost = (turn: Turn, messageId: string, why: string): Effect.Effect<void, StoreError> =>
     store.stageLostRecovery({
       conversationId: turn.thread_key,

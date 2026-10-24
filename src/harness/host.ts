@@ -116,6 +116,12 @@ export interface HarnessStatus {
   readonly idleSince: number | null;
 }
 
+/** What a turn attached to again came to (HarnessHost.attach): its result; unknown to its conversation's host; or its conversation bound to no pod. */
+export type Attached =
+  | { readonly _tag: "Answered"; readonly result: TurnResult }
+  | { readonly _tag: "Unknown" }
+  | { readonly _tag: "Unbound" };
+
 /**
  * The binding of the conversation's harness a host serves, as a pool's pod knows it from its
  * binding's token (./program.ts): the binding a turn its harness starts on its own runs on, which
@@ -142,14 +148,15 @@ export class HarnessHost extends Context.Service<HarnessHost, {
   readonly startTurn: (request: TurnRequest) => Effect.Effect<TurnResult, StoreError | TurnFenced | HarnessUnavailable | ReceivedFileError>;
   /**
    * The conversation's turn claimed under `epoch` for the message `messageId`, as its host
-   * started it: what it came to, once it ends, as startTurn would have answered it; none where
-   * the host knows no such turn, as one that never ran there, or whose result it let go of. It
-   * starts no turn, and binds nothing (../harness/pooled-host.ts): a caller that lost a turn's
-   * answer, as alasio stopped while it ran, takes it so. A host keeps a turn's result until the
-   * next turn of its conversation starts, or the host stops, however often it is taken, so an
-   * attach whose answer was lost on its way, its connection broken, is asked again.
+   * started it: what it came to, once it ends, as startTurn would have answered it (Attached);
+   * unknown where the host knows no such turn, as one that never ran there, or whose result it
+   * let go of; or, of a host in a pool's pod, unbound where the conversation is bound to no pod,
+   * its binding gone. It starts no turn, and binds nothing (../harness/pooled-host.ts): a caller
+   * that lost a turn's answer, as alasio stopped while it ran, takes it so. A host keeps a turn's
+   * result until the next turn of its conversation starts, or the host stops, however often it
+   * is taken, so an attach whose answer was lost on its way, its connection broken, is asked again.
    */
-  readonly attach: (turn: AttachedTo) => Effect.Effect<Option.Option<TurnResult>, StoreError | TurnFenced | HarnessUnavailable | ReceivedFileError | HarnessHostError>;
+  readonly attach: (turn: AttachedTo) => Effect.Effect<Attached, StoreError | TurnFenced | HarnessUnavailable | ReceivedFileError | HarnessHostError>;
   /**
    * Sends the conversation's running turn more guidance, the files it names written first
    * where its harness reads them: whether it took it, or none when no turn runs.
@@ -287,10 +294,10 @@ export class HarnessHost extends Context.Service<HarnessHost, {
           );
         }),
       attach: (turn) =>
-        Effect.suspend(() => {
+        Effect.suspend((): Effect.Effect<Attached, StoreError | TurnFenced | HarnessUnavailable | ReceivedFileError> => {
           const kept = turns.get(turn.conversationId);
-          if (kept?.key !== keyOf(turn)) return Effect.succeedNone;
-          return Effect.asSome(Fiber.join(kept.fiber));
+          if (kept?.key !== keyOf(turn)) return Effect.succeed({ _tag: "Unknown" });
+          return Effect.map(Fiber.join(kept.fiber), (result) => ({ _tag: "Answered", result }));
         }),
       steer: (conversationId, prompt, fileIds) =>
         store.getMount(conversationId).pipe(

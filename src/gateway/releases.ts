@@ -10,10 +10,10 @@ import type { Pool } from "../binder/names.ts";
 import { meter } from "../telemetry/index.ts";
 
 export const RELEASES = "alasio.gateway.releases";
-const releases = meter.createCounter(RELEASES, { description: "Bindings released, by pool and why: idle, asked by their caller, lost as their pod went, deleted as their pod was ended by other than the gateway, or broken" });
+const releases = meter.createCounter(RELEASES, { description: "Bindings released, by pool and why: idle, asked by their caller, lost as their pod went, deleted as their pod was ended by other than the gateway, broken, or oom, as its main process was killed for its memory" });
 
 /** Why a binding was released. */
-export type ReleaseReason = "idle" | "asked" | "lost" | "deleted" | "broken";
+export type ReleaseReason = "idle" | "asked" | "lost" | "deleted" | "broken" | "oom";
 
 /** Counts a binding of `pool` released, for `reason`. */
 export const released = (pool: Pool, reason: ReleaseReason): Effect.Effect<void> =>

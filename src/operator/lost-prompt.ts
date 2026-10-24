@@ -2,7 +2,8 @@
  * The prompt a conversation's turn is run again with once the harness instance it ran in,
  * its pool's pod, was lost before the turn ended (Store.stageLostRecovery): what it ran
  * stopped with the pod, and its session resumes on another, its workspace as it was left;
- * and what the turn's status message says of what became of it.
+ * and what the turn's status message says of what became of it: one whose pod ran out of its
+ * memory is not run again, and is told the limit it ran out of.
  */
 import { harnessDisplayName, type HarnessName } from "../harness/names.ts";
 import type { LostRecoveryOutcome } from "../persistence/store.ts";
@@ -17,9 +18,12 @@ export function buildLostHarnessText(harness: HarnessName): string {
     "Instruction: check what of the interrupted task was done, briefly say so, and ask how the user wants to proceed.";
 }
 
-/** What the status message of a lost turn of `harness` says, its recovery come to `outcome`. */
-export function lostStatusText(outcome: Exclude<LostRecoveryOutcome["outcome"], "none">, harness: HarnessName): string {
+/** What the status message of a lost turn of `harness` says, its recovery come to `outcome`; of one ended as its pod ran out of `memoryLimit`, that. */
+export function lostStatusText(outcome: Exclude<LostRecoveryOutcome["outcome"], "none">, harness: HarnessName, memoryLimit?: string): string {
   const harnessName = harnessDisplayName(harness);
+  if (outcome === "ended") {
+    return `${harnessName}'s harness ran out of its memory (${memoryLimit ?? "its limit"}) during this turn and was stopped. The turn is not run again, as it would run out again; send a message to go on, asking for less at once.`;
+  }
   if (outcome === "completed") return `${harnessName} finished this turn as its harness was let go of.`;
   if (outcome === "staged") return `${harnessName}'s harness was lost during this turn; it runs again on another.`;
   return `${harnessName}'s harness was lost during this turn, which was itself run again as one was lost before. Send the message again to run it.`;
