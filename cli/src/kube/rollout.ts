@@ -109,7 +109,7 @@ export const readinessOf = Effect.fnUntraced(function*(object: KubernetesObject)
   if (updated < replicas) return waiting(`${updated} of ${replicas} updated`);
   if ((status?.replicas ?? 0) > updated) return waiting(`${(status?.replicas ?? 0) - updated} old pods stopping`);
   const kube = yield* KubeApi;
-  const pods = yield* kube.list<V1Pod>(POD, { namespace: metadata?.namespace, labelSelector: selectorOf(spec?.selector?.matchLabels ?? {}) });
+  const pods = yield* kube.list<V1Pod>(POD, { namespace: metadata?.namespace, labelSelector: podSelectorOf(spec?.selector?.matchLabels ?? {}) });
   const runs = pods.filter((pod) => !pod.metadata?.deletionTimestamp && pod.status?.phase === "Running" && (pod.status.containerStatuses ?? []).every(({ state }) => state?.running)).length;
   return runs < replicas ? waiting(`${runs} of ${replicas} running`) : READY;
 });
@@ -168,6 +168,18 @@ export function selectorOf(labels: Readonly<Record<string, string>>): string {
   return Object.entries(labels).map(([key, value]) => `${key}=${value}`).join(",");
 }
 
+/**
+ * The label of a pod the command line holds of a workload's spec for a command of its own
+ * (../commands/login-relay.ts): its workload's labels, so its NetworkPolicy lets it reach what
+ * the workload does, but none of its workload's pods, which a workload's pods are listed without.
+ */
+export const HELD_LABEL = "alasio.dev/held";
+
+/** The pods of a workload `matchLabels` selects, as a label selector: none of those held (HELD_LABEL). */
+export function podSelectorOf(matchLabels: Readonly<Record<string, string>>): string {
+  return `${selectorOf(matchLabels)},!${HELD_LABEL}`;
+}
+
 /** What is wrong with `container`, unless nothing is. */
 function containerProblem(pod: string, container: V1ContainerStatus): string | null {
   const { state, lastState, restartCount } = container;
@@ -223,7 +235,7 @@ export const diagnose = Effect.fnUntraced(function*(ref: ObjectRef): Effect.fn.R
   const kube = yield* KubeApi;
   const object = yield* kube.get<KubernetesObject & { spec?: { selector?: { matchLabels?: Record<string, string> } } }>(ref);
   const matchLabels = object?.spec?.selector?.matchLabels;
-  const pods = matchLabels ? yield* kube.list<V1Pod>(POD, { namespace: ref.namespace, labelSelector: selectorOf(matchLabels) }) : [];
+  const pods = matchLabels ? yield* kube.list<V1Pod>(POD, { namespace: ref.namespace, labelSelector: podSelectorOf(matchLabels) }) : [];
   const warnings = yield* kube.list<CoreV1Event>(EVENT, { namespace: ref.namespace ?? "default", fieldSelector: "type=Warning" });
   const about = (names: readonly string[]) =>
     warnings
@@ -312,7 +324,7 @@ const workloadReadiness = (object: KubernetesObject & { spec?: { selector?: { ma
     const matchLabels = object.spec?.selector?.matchLabels;
     if (state._tag !== "Waiting" || !matchLabels) return state;
     const kube = yield* KubeApi;
-    const pods = yield* kube.list<V1Pod>(POD, { namespace: object.metadata?.namespace, labelSelector: selectorOf(matchLabels) });
+    const pods = yield* kube.list<V1Pod>(POD, { namespace: object.metadata?.namespace, labelSelector: podSelectorOf(matchLabels) });
     const stopping = pods.filter(({ metadata }) => metadata?.deletionTimestamp !== undefined);
     if (stopping.length === 0) return state;
     const said = yield* Effect.forEach(stopping, (pod) =>
@@ -345,7 +357,7 @@ export const awaitScheduled = (refs: readonly ObjectRef[], options: WaitOptions)
         const made = set.status?.replicas ?? 0;
         if ((set.status?.observedGeneration ?? 0) < (set.metadata?.generation ?? 0)) return waiting("not yet rolled out");
         if (made < replicas) return waiting(`${made} of ${replicas} pods made`);
-        const pods = yield* kube.list<V1Pod>(POD, { namespace: ref.namespace, labelSelector: selectorOf(set.spec?.selector?.matchLabels ?? {}) });
+        const pods = yield* kube.list<V1Pod>(POD, { namespace: ref.namespace, labelSelector: podSelectorOf(set.spec?.selector?.matchLabels ?? {}) });
         // Every replica's pod made, the pods listed are all of them.
         const unscheduled = pods.filter((pod) => !pod.spec?.nodeName).length;
         return unscheduled > 0 ? waiting(`${unscheduled} of ${pods.length} pods not yet scheduled`) : READY;

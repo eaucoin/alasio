@@ -142,6 +142,8 @@ export interface FakeKube {
   readonly get: (path: string) => KubeObject | undefined;
   /** Puts `object` at the path its kind (`plural`) and names make. */
   readonly put: (plural: string, object: KubeObject) => void;
+  /** Takes the object at `path` away, as one gone without a request of the test's, a pod a scale-in ended say. */
+  readonly drop: (path: string) => void;
   readonly close: () => Promise<void>;
 }
 
@@ -163,10 +165,11 @@ function parse(path: string): { api: string; plural: string; namespace?: string;
   return { api, plural: rest[0] ?? "", ...(rest[1] ? { name: rest[1] } : {}) };
 }
 
-/** Whether `labels` carry every `key=value` of `selector`, and every bare `key` of it, of any value. */
+/** Whether `labels` carry every `key=value` of `selector`, and every bare `key` of it, of any value, and none of its `!key`. */
 function selects(selector: string | null, labels: Readonly<Record<string, string>> | undefined): boolean {
   if (!selector) return true;
   return selector.split(",").every((pair) => {
+    if (pair.startsWith("!")) return labels?.[pair.slice(1)] === undefined;
     if (!pair.includes("=")) return labels?.[pair] !== undefined;
     const [key = "", value = ""] = pair.split("=");
     return labels?.[key] === value;
@@ -274,6 +277,16 @@ export async function serveFakeKube(): Promise<FakeKube> {
     const { name, namespace, generation = 1 } = object.metadata;
     const condition = (type: string, reason = type) => ({ type, status: "True", reason, message: "" });
     if (object.kind === "CustomResourceDefinition") object.status = { conditions: [condition("Established")] };
+    // A pod made of the command line's own runs, on the cluster's one node, its readiness as the pod says.
+    if (object.kind === "Pod" && object.status === undefined) {
+      const containers = (object.spec?.["containers"] as { name: string; image: string; readinessProbe?: unknown }[] | undefined) ?? [];
+      object.spec = { ...object.spec, nodeName: "machine" };
+      object.status = {
+        phase: "Running",
+        conditions: [{ type: "Ready", status: containers.some(({ readinessProbe }) => readinessProbe !== undefined) ? "False" : "True" }],
+        containerStatuses: containers.map(({ name: container, image }) => ({ name: container, ready: false, restartCount: 0, image, imageID: "", state: { running: {} } })),
+      };
+    }
     // A Job stuck runs on, its pod not yet ended, until the test says it completed.
     if (object.kind === "Job" && stuck.has(name)) {
       object.status = { active: 1 };
@@ -606,6 +619,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
     finalizers,
     forbidden,
     unserved,
+    drop: (path) => void objects.delete(path),
     execs,
     onExec: () => ({ exitCode: 0 }),
     forwards,

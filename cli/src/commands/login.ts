@@ -1,4 +1,4 @@
-/** `alasio login codex`: Codex's device login, run in alasio's pod, at this terminal. */
+/** `alasio login codex`: Codex's device login, run in a pod of the Codex login relay's, at this terminal, whether or not alasio runs. */
 import { PassThrough, type Readable } from "node:stream";
 
 import { Effect, Option } from "effect";
@@ -7,11 +7,12 @@ import { Command, Flag } from "effect/cli";
 import { branchNamespace } from "../../../src/branch/names.ts";
 
 import { KubeApi } from "../kube/api.ts";
-import { NAMESPACE, RELEASE } from "../manifests/common.ts";
-import { CommandFailed, onCluster, runningPod, runningPodIn } from "./common.ts";
+import { NAMESPACE } from "../manifests/common.ts";
+import { CommandFailed, onCluster } from "./common.ts";
+import { inLoginRelay } from "./login-relay.ts";
 
-/** Codex's login by a code entered on another device, as alasio's image installs Codex (Dockerfile). */
-export const CODEX_LOGIN = ["/opt/alasio/node_modules/.bin/codex", "login", "--device-auth"] as const;
+/** Codex's login by a code entered on another device, kept in the store where the relay's home is its own (src/codex/login-device.ts). */
+export const DEVICE_LOGIN = ["node", "/opt/alasio/src/codex/login-device.ts"] as const;
 
 /**
  * What is typed at this process's terminal, while `use` runs with it: raw, so it reaches
@@ -43,18 +44,17 @@ const codex = Command.make("codex", {
     Effect.gen(function*() {
       const kube = yield* KubeApi;
       const namespace = Option.match(branch, { onNone: () => NAMESPACE, onSome: branchNamespace });
-      const pod = Option.isSome(branch) ? yield* runningPodIn(namespace, RELEASE) : yield* runningPod(RELEASE);
       // The terminal itself, not alasio's output: what Codex asks and is answered is the operator's.
-      const exitCode = yield* terminalInput((stdin) =>
-        kube.exec({ namespace, pod, container: RELEASE }, CODEX_LOGIN, { stdin, stdout: process.stdout, stderr: process.stderr, tty: process.stdout.isTTY })
-      );
+      const exitCode = yield* inLoginRelay(namespace, (target) =>
+        terminalInput((stdin) => kube.exec(target, DEVICE_LOGIN, { stdin, stdout: process.stdout, stderr: process.stderr, tty: process.stdout.isTTY })), { held: "always" });
       if (exitCode !== 0) return yield* new CommandFailed({ command: "codex login", exitCode });
     })
   )).pipe(
     Command.withShortDescription("Log Codex in"),
     Command.withDescription(
-      "Runs Codex's device login in alasio's pod, at this terminal: Codex shows a code to enter on a page it names, " +
-        "and alasio keeps the login in its Neon (under the host profile, in the operator's own Codex home), so it is done once. " +
+      "Runs Codex's device login at this terminal, in a short-lived pod of the environment's Codex login relay's, whether or not alasio or the relay runs: " +
+        "Codex shows a code to enter on a page it names, and the login is kept in alasio's Neon (under the host profile, in the " +
+        "operator's own Codex home), so it is done once. " +
         "A branch environment has a login of its own, which --branch logs in.",
     ),
   );
@@ -62,5 +62,5 @@ const codex = Command.make("codex", {
 export const login = Command.make("login").pipe(
   Command.withSubcommands([codex]),
   Command.withShortDescription("Log a harness in"),
-  Command.withDescription("Logs a harness in, in alasio's pod. Claude Code needs none: alasio init gives it a token."),
+  Command.withDescription("Logs a harness in, in alasio's cluster. Claude Code needs none: alasio init gives it a token."),
 );

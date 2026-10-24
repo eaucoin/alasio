@@ -11,7 +11,7 @@
  * alasio's own app-server does for the panels: whichever finds the login due first refreshes it,
  * and the other takes it from the store. The store is the login's record: before each request,
  * the relay's home takes the login the store kept since it last took one, as one `alasio login
- * codex` made in alasio's pod is. A home of the relay's own (ALASIO_KEEP_CODEX_LOGIN) is written from the
+ * codex` made in a pod of the relay's is (./login-device.ts). A home of the relay's own (ALASIO_KEEP_CODEX_LOGIN) is written from the
  * store as it starts, and what Codex itself writes there kept again in the store (./login.ts), as
  * alasio does with a home of its own; the operator's home, where the host profile gives alasio
  * theirs, is the relay's too.

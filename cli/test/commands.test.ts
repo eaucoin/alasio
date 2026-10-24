@@ -4,6 +4,7 @@
  * Kubernetes API, and a fake Telegram, on a machine of the test's, whose inotify limits the cluster
  * here needs unless a test gives others.
  */
+import type { V1Deployment, V1Pod } from "@kubernetes/client-node";
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -23,7 +24,7 @@ import { forkToken } from "../../src/branch/names.ts";
 import { poolLoginKey } from "../../src/harness/names.ts";
 import { BOT_COMMANDS } from "../../src/telegram/bot-commands.ts";
 import type { TenantView } from "../src/branches.ts";
-import { CODEX_LOGIN } from "../src/commands/login.ts";
+import { DEVICE_LOGIN } from "../src/commands/login.ts";
 import { API_SERVER_UNCONFINED } from "../src/commands/up.ts";
 import { SYSCTL_FILE } from "../src/cluster/machine.ts";
 import { currentGvisorRelease, downloads } from "../src/cluster/node.ts";
@@ -1202,12 +1203,82 @@ test("upgrade says what it installs, and which images change", async (t) => {
   ].join("\n"));
 });
 
-test("login codex runs Codex's device login in alasio's pod, and fails as it does", async (t) => {
+test("login codex runs Codex's device login in a pod held of the Codex login relay's spec, even where the relay runs, so its scale-in cuts no login, and fails as it does", async (t) => {
   const { alasio, kube } = await installed(t);
   succeeded(await alasio(["login", "codex"]));
-  assert.deepEqual(kube.execs.at(-1), { namespace: "alasio", pod: "alasio-0", container: "alasio", command: CODEX_LOGIN, tty: false });
+  const login = kube.execs.at(-1);
+  assert.deepEqual([login?.namespace, login?.container, login?.command, login?.tty], ["alasio", "codex-login", DEVICE_LOGIN, false]);
+  assert.match(login?.pod ?? "", /^alasio-codex-login-held-[0-9a-f]{8}$/u);
   kube.onExec = () => ({ exitCode: 1 });
   assert.equal(failure(await alasio(["login", "codex"])), "codex login exited with 1");
+});
+
+test("status reads the Codex login in the Codex login relay's pod where one runs, and takes none of the pods held of its spec for the relay's", async (t) => {
+  const { alasio, kube } = await installed(t);
+  const run = await alasio(["status"]);
+  succeeded(run);
+  assert.ok(run.printed.includes("Codex's login: kept"), run.printed.join("\n"));
+  const read = () => kube.execs.findLast(({ command }) => command.at(-1) === "/opt/alasio/src/codex/login-state.ts");
+  assert.equal(read()?.pod, "alasio-codex-login-0");
+  // The relay at none, and one held before running on, ready as it would be had it no probe: no pod of the relay's, so one is held anew.
+  kube.drop("/api/v1/namespaces/alasio/pods/alasio-codex-login-0");
+  const relay = kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio-codex-login") as unknown as V1Deployment;
+  kube.put("pods", {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: "alasio-codex-login-held-0", namespace: "alasio", labels: { ...relay.spec?.template.metadata?.labels, "alasio.dev/held": "true" } },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }], containerStatuses: [{ name: "codex-login", ready: true, restartCount: 0, image: "", imageID: "", state: { running: {} } }] },
+  });
+  succeeded(await alasio(["status"]));
+  assert.match(read()?.pod ?? "", /^alasio-codex-login-held-[0-9a-f]{8}$/u);
+});
+
+test("with neither alasio nor its Codex login relay running, login codex and status reach the login in a pod of the relay's spec held for it, never ready, below the turns' priority, of none of the key of its turns' tokens, and deleted after, as are those held before that ended", async (t) => {
+  const { alasio, kube } = await installed(t);
+  // Both at none, as KEDA keeps them while nothing waits and no Codex harness is bound.
+  for (const pod of ["alasio-0", "alasio-codex-login-0"]) kube.drop(`/api/v1/namespaces/alasio/pods/${pod}`);
+  const relay = kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio-codex-login") as unknown as V1Deployment;
+  // Held before by command lines that went: one ended by its deadline, deleted; one held for another command at once, left to it.
+  for (const [name, phase] of [["alasio-codex-login-held-ended", "Failed"], ["alasio-codex-login-held-other", "Running"]] as const) {
+    kube.put("pods", { apiVersion: "v1", kind: "Pod", metadata: { name, namespace: "alasio", labels: { ...relay.spec?.template.metadata?.labels, "alasio.dev/held": "true" } }, status: { phase } });
+  }
+  /** The pods the relay's command line held, as the API had them when a command ran in one. */
+  const held: Record<string, unknown>[] = [];
+  const others = kube.onExec;
+  kube.onExec = (exec) => {
+    const pod = kube.get(`/api/v1/namespaces/alasio/pods/${exec.pod}`);
+    if (pod && exec.pod.startsWith("alasio-codex-login-held-")) held.push(pod as unknown as Record<string, unknown>);
+    return others(exec);
+  };
+  succeeded(await alasio(["login", "codex"]));
+  const login = kube.execs.at(-1);
+  assert.deepEqual([login?.namespace, login?.container, login?.command], ["alasio", "codex-login", DEVICE_LOGIN]);
+  assert.match(login?.pod ?? "", /^alasio-codex-login-held-[0-9a-f]{8}$/u);
+  assert.equal(kube.get("/api/v1/namespaces/alasio/pods/alasio-codex-login-held-ended"), undefined);
+  assert.ok(kube.get("/api/v1/namespaces/alasio/pods/alasio-codex-login-held-other"));
+  const run = await alasio(["status"]);
+  succeeded(run);
+  assert.ok(run.printed.includes("Codex's login: kept"), run.printed.join("\n"));
+  const read = kube.execs.at(-1);
+  assert.deepEqual([read?.container, read?.command], ["codex-login", ["node", "/opt/alasio/src/codex/login-state.ts"]]);
+  assert.match(read?.pod ?? "", /^alasio-codex-login-held-[0-9a-f]{8}$/u);
+  // Each the relay's spec, its role's database and its home, labelled as the relay's and held, serving nothing, never ready, of
+  // alasio's components' priority, with none of the key of the turns' tokens, and ended within its bound.
+  for (const pod of held as unknown as V1Pod[]) {
+    const container = pod.spec?.containers?.[0];
+    const relayContainer = relay.spec?.template.spec?.containers?.[0];
+    assert.deepEqual([container?.image, container?.volumeMounts], [relayContainer?.image, relayContainer?.volumeMounts]);
+    assert.deepEqual(container?.env, relayContainer?.env?.filter(({ name }) => name !== "ALASIO_CODEX_LOGIN_KEY"));
+    assert.ok(relayContainer?.env?.some(({ name }) => name === "ALASIO_CODEX_LOGIN_KEY"));
+    assert.deepEqual(pod.spec?.volumes, relay.spec?.template.spec?.volumes);
+    assert.deepEqual(pod.metadata?.labels, { ...relay.spec?.template.metadata?.labels, "alasio.dev/held": "true" });
+    assert.deepEqual(container?.command, ["node", "-e", "setTimeout(() => {}, 1800000)"]);
+    assert.deepEqual([container?.ports, container?.readinessProbe?.exec?.command, pod.spec?.restartPolicy, pod.spec?.activeDeadlineSeconds], [undefined, ["node", "-e", "process.exit(1)"], "Never", 1800]);
+    assert.equal(pod.spec?.priorityClassName, "alasio-component");
+  }
+  assert.equal(held.length, 2);
+  // Deleted after, each.
+  for (const pod of [login?.pod, read?.pod]) assert.equal(kube.get(`/api/v1/namespaces/alasio/pods/${pod}`), undefined);
 });
 
 test("lake runs the query in the lake's query container and prints its answer, in the format asked for", async (t) => {
@@ -2419,13 +2490,15 @@ test("branch delete refuses while the branch's alasio has a turn running, or a w
   assert.equal(failure(await alasio(["branch", "delete", "try"])), "there is no branch try");
 });
 
-test("login codex --branch logs the branch's own Codex in, in the branch's alasio's pod", async (t) => {
+test("login codex --branch logs the branch's own Codex in, in a pod held of the branch's Codex login relay's spec", async (t) => {
   const { alasio, home, kube, telegram } = await branchable(t);
   telegram.bots.set("456:branch", "branch_bot");
   writeFileSync(join(home, "branch"), "456:branch");
   succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
   succeeded(await alasio(["login", "codex", "--branch", "try"]));
-  assert.deepEqual(kube.execs.at(-1), { namespace: "alasio-branch-try", pod: "alasio-0", container: "alasio", command: CODEX_LOGIN, tty: false });
+  const login = kube.execs.at(-1);
+  assert.deepEqual([login?.namespace, login?.container, login?.command], ["alasio-branch-try", "codex-login", DEVICE_LOGIN]);
+  assert.match(login?.pod ?? "", /^alasio-codex-login-held-/u);
 });
 
 test("uninstall refuses while alasio has branch environments, which run on what it removes", async (t) => {

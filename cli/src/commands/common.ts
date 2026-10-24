@@ -13,7 +13,7 @@ import { HostCluster } from "../cluster/host.ts";
 import { loadConfig } from "../config.ts";
 import { type ContainerRef, kind, KubeApi, type KubeApiError, type KubeExecError } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR } from "../kube/apply.ts";
-import { podProblems, selectorOf, type WaitOptions } from "../kube/rollout.ts";
+import { podProblems, podSelectorOf, type WaitOptions } from "../kube/rollout.ts";
 import { NAMESPACE, RELEASE, selectorLabels } from "../manifests/common.ts";
 import { dockerCluster, kubeApi, type ResolvedTarget, resolveTarget } from "../target.ts";
 
@@ -132,7 +132,7 @@ export const component = Effect.fnUntraced(function*(name: string): Effect.fn.Re
 
 /** The pods of `namespace` that `labels` select, the newest first. */
 const podsSelected = (namespace: string, labels: Readonly<Record<string, string>>): Effect.Effect<readonly V1Pod[], KubeApiError, KubeApi> =>
-  Effect.flatMap(KubeApi, (kube) => kube.list<V1Pod>(kind("Pod"), { namespace, labelSelector: selectorOf(labels) })).pipe(
+  Effect.flatMap(KubeApi, (kube) => kube.list<V1Pod>(kind("Pod"), { namespace, labelSelector: podSelectorOf(labels) })).pipe(
     Effect.map((pods) => pods.toSorted((a, b) => new Date(b.metadata?.creationTimestamp ?? 0).getTime() - new Date(a.metadata?.creationTimestamp ?? 0).getTime())),
   );
 

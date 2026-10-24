@@ -1,7 +1,8 @@
 /**
- * What alasio's store keeps of its Codex login, for `alasio status`, run in alasio's container
- * (cli/src/commands/status.ts), which reaches the store as alasio does: one line of JSON, whether
- * a login is kept, and when its refresh was refused, if it was (./login-refresh.ts).
+ * What alasio's store keeps of its Codex login, for `alasio status`, run in a pod of the Codex
+ * login relay's (cli/src/commands/status.ts, cli/src/commands/login-relay.ts), which reaches the
+ * store as the relay's role does, the login's tables alone: one line of JSON, whether a login is
+ * kept, and when its refresh was refused, if it was (./login-refresh.ts).
  */
 import { readFileSync } from "node:fs";
 

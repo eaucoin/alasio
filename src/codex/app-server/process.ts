@@ -66,7 +66,8 @@ export interface AppServerProcess {
 /** Starts an app-server process, stopped when the scope it is started in closes. */
 export type SpawnAppServer = (options: AppServerProcessOptions) => Effect.Effect<AppServerProcess, CodexBinaryMissing | AppServerSpawnFailed, Scope.Scope>;
 
-function codexBinPath() {
+/** The codex binary alasio runs: ALASIO_CODEX_BIN where it is set, else the one its image installs. */
+export function codexBinPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
   return getCodexBinaryOverride() || join(here, "..", "..", "..", "node_modules", ".bin", "codex");
 }

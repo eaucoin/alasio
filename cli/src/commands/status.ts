@@ -14,7 +14,7 @@ import { clusterReleases, describeKept, snapshotReleases } from "../kept-release
 import { describeMemory, describeScale, describeSizing, memoryBytes, memoryText, type ScaledWorkload } from "../capacity.ts";
 import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
-import { diagnose, READY_ONCE_BOUND_ANNOTATION, readinessOf, selectorOf, starting } from "../kube/rollout.ts";
+import { diagnose, podSelectorOf, READY_ONCE_BOUND_ANNOTATION, readinessOf, selectorOf, starting } from "../kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE } from "../manifests/common.ts";
 import { HARNESS_POOLS } from "../manifests/harness-pools.ts";
 import { LOADER_COMPONENT } from "../manifests/lake.ts";
@@ -36,6 +36,7 @@ import { describeBots, type EnvironmentBot } from "../webhook.ts";
 import { branchNamespace, MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
 import { ALASIO_GATEWAY_FOLDERS_VARIABLE } from "../../../src/gateway/names.ts";
 import { notRunning, runIn, runningPodIn } from "./common.ts";
+import { inLoginRelay } from "./login-relay.ts";
 
 /** Some of alasio's workloads do not run as they should. */
 export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", {
@@ -284,7 +285,7 @@ const waking = Effect.fnUntraced(function*(workload: ScaledWorkload, scaler: Sca
   // waking.
   const said = (type: string, is: string) => status?.conditions?.some((condition) => condition.type === type && condition.status === is) ?? false;
   if (said("Progressing", "False") || said("ReplicaFailure", "True")) return false;
-  const pods = yield* (yield* KubeApi).list<V1Pod>(kind("Pod"), { namespace: metadata?.namespace, labelSelector: selectorOf(spec?.selector.matchLabels ?? {}) });
+  const pods = yield* (yield* KubeApi).list<V1Pod>(kind("Pod"), { namespace: metadata?.namespace, labelSelector: podSelectorOf(spec?.selector.matchLabels ?? {}) });
   const readyAt = (pod: V1Pod) => pod.status?.conditions?.find(({ type, status: ready }) => type === "Ready" && ready === "True")?.lastTransitionTime;
   const unready = pods.filter((pod) => readyAt(pod) === undefined);
   const now = Date.now();
@@ -322,11 +323,11 @@ const deliveries = (config: Parameters<typeof installConfig>[0]) =>
     return yield* describeBots(yield* installConfig(config), [...(main ? [{ environment: "main", bot: main }] : []), ...branchBots.flat()]);
   });
 
-/** What alasio's store keeps of its Codex login, as alasio's pod reads it (src/codex/login-state.ts). */
+/** What alasio's store keeps of its Codex login, as a pod of the Codex login relay's reads it (src/codex/login-state.ts, ./login-relay.ts). */
 const CodexLoginState = Schema.fromJsonString(Schema.Struct({ kept: Schema.Boolean, refusedAt: Schema.NullOr(Schema.String) }));
 
 /**
- * What alasio says of its Codex login, asked in its pod: kept, none kept, or refused as alasio
+ * What alasio says of its Codex login, asked in a pod of the Codex login relay's, whether or not alasio runs: kept, none kept, or refused as alasio
  * refreshed it, so Codex runs no turn until the operator logs in again; or why it is not seen.
  */
 export const describeCodexLogin = (said: typeof CodexLoginState.Type): string =>
@@ -336,15 +337,14 @@ export const describeCodexLogin = (said: typeof CodexLoginState.Type): string =>
     ? "Codex's login: kept"
     : "Codex's login: none kept, so Codex runs no turn until it is logged in: run `alasio login codex`";
 
-const codexLogin: Effect.Effect<string, never, KubeApi> = runningPodIn(NAMESPACE, RELEASE).pipe(
-  Effect.flatMap((pod) => runIn({ namespace: NAMESPACE, pod, container: RELEASE }, ["node", "/opt/alasio/src/codex/login-state.ts"])),
+const codexLogin: Effect.Effect<string, never, KubeApi> = inLoginRelay(NAMESPACE, (target) => runIn(target, ["node", "/opt/alasio/src/codex/login-state.ts"])).pipe(
   Effect.map(({ exitCode, stdout, stderr }) =>
     Option.match(exitCode === 0 ? Schema.decodeUnknownOption(CodexLoginState)(stdout.trim()) : Option.none(), {
       onNone: () => `Codex's login: not seen: ${(stderr || stdout).trim() || `exit ${exitCode}`}`,
       onSome: describeCodexLogin,
     })
   ),
-  Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(403)(error), () => Effect.succeed("Codex's login: not seen, as this kubeconfig may not run commands in alasio's pod")),
+  Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(403)(error), () => Effect.succeed("Codex's login: not seen, as this kubeconfig may not run commands in, or make, a pod of the Codex login relay's")),
   Effect.catch((error) => Effect.succeed(`Codex's login: not seen: ${error.message}`)),
 );
 
@@ -491,7 +491,9 @@ export const status = Command.make("status", {}, () =>
         "the pod and pool each is bound in, for how long, and whether its host says a turn runs in it, its harness works in the background, " +
         "or since when it has been idle, or why its host was not reached. Of the bundled object store, the copies it keeps of each object, and of each " +
         "volume server, as its metrics say: what it may still fill of its disk before it takes no more writes, what it keeps " +
-        "free (minFreeSpace), its volumes, and what they take, deleted and not yet compacted away. Then the memory the cluster's pods request and use, of what its nodes have " +
+        "free (minFreeSpace), its volumes, and what they take, deleted and not yet compacted away. Whether Codex's login is kept, as " +
+        "the Codex login relay reads it from alasio's Neon: while the relay runs no pod, in a short-lived pod of its own, below the " +
+        "turns' priority so it takes no running pod's place, deleted once read. Then the memory the cluster's pods request and use, of what its nodes have " +
         "for pods, and whether a metrics server measures them, which VPA and what scales on CPU need; of these, what the kubeconfig's " +
         "rights do not reach, it says is not seen. Exits with 1 when something " +
         "is not ready, or the limits are too low, or this machine is not Linux on x86-64, which the cluster here needs.",
