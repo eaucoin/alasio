@@ -66,7 +66,7 @@ import { Clock, Effect, Schedule, Schema, Semaphore } from "effect";
 import { BindStepFailed, type MakePod } from "../binder/binder.ts";
 import { FREE_LABEL, type Pool } from "../binder/names.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
-import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION, STOP_WAIT_ARG } from "../kube/sandbox-shape.ts";
+import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SANDBOX_STOP_REASON_VARIABLE, SESSION_TEMPLATE_ANNOTATION, STOP_WAIT_ARG } from "../kube/sandbox-shape.ts";
 import type { Manifest } from "../node-agent/agent.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { withLogScope } from "../shared/log.ts";
@@ -242,11 +242,12 @@ export interface Restoring {
 
 /**
  * How a restore's workspace is attached into the directory of its pod, `pod`, on `node`, made for
- * it, before the pod is (`attach`, of the binding `binding`); and how what was attached is
- * detached, once the pod has gone, as its restore did not come back (`detach`).
+ * it, before the pod is (`attach`, of the binding `binding`), its bayma's hook given the variables
+ * `env` beside its own; and how what was attached is detached, once the pod has gone, as its
+ * restore did not come back (`detach`).
  */
 export interface Attaching {
-  readonly attach: (node: string, pod: string, binding: string) => Effect.Effect<void, BindStepFailed>;
+  readonly attach: (node: string, pod: string, binding: string, env: Readonly<Record<string, string>>) => Effect.Effect<void, BindStepFailed>;
   readonly detach: (node: string, pod: string) => Effect.Effect<void>;
 }
 
@@ -630,9 +631,10 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           yield* Effect.logInfo(`restoring ${named(pool, workspace)} on ${node} from its snapshot ${from.snapshot}, taken at ${from.takenAt} under gVisor ${from.release}`);
           const { [FREE_LABEL]: _free, ...own } = base.metadata?.labels ?? {};
           // Named before it is made, as its own directory is by its name (ownDirectory); its workspace
-          // attached there first, so its sandbox, restored as its bayma starts, finds every file it held open.
+          // attached there first, so its sandbox, restored as its bayma starts, finds every file it held open;
+          // and, of one stopped as it ran out of its memory, its bayma's hook told so, for its sessions' next execs.
           const name = restorePodName(pool.name, randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7));
-          yield* attaching.attach(node, name, binding);
+          yield* attaching.attach(node, name, binding, into?.memoryLimit === undefined ? {} : { [SANDBOX_STOP_REASON_VARIABLE]: `it ran out of its memory (${into.memoryLimit})` });
           const spec = ownDirectory({ containers: [], ...base.spec }, pool.namespace, name);
           const pod = yield* kube.create<V1Pod>({
             apiVersion: "v1",

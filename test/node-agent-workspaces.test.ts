@@ -451,7 +451,7 @@ test("a FIFO in a workspace is neither read nor written, nor waited on", async (
   }
 });
 
-test("a workspace records the snapshot it was released into beside its files, out of its sandbox's reach, replaced whole, and none once cleared", async () => {
+test("a workspace records the snapshot it was released into beside its files, out of its sandbox's reach, replaced whole, with the memory limit its sandbox ran out of where it did, and none once cleared", async () => {
   const at = workspacesNode();
   try {
     const ref = { environment: "main", workspace: "fs-released" };
@@ -459,8 +459,8 @@ test("a workspace records the snapshot it was released into beside its files, ou
     assert.equal(await Effect.runPromise(at.workspaces.released(ref)), null);
     await Effect.runPromise(at.workspaces.setReleased(ref, { snapshot: "20261017T120000000Z-0000000a", release: "20260921.0-eaucoin.8" }));
     assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), { snapshot: "20261017T120000000Z-0000000a", release: "20260921.0-eaucoin.8" });
-    await Effect.runPromise(at.workspaces.setReleased(ref, { snapshot: "20261017T130000000Z-0000000b", release: "20260921.0-eaucoin.8" }));
-    assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), { snapshot: "20261017T130000000Z-0000000b", release: "20260921.0-eaucoin.8" });
+    await Effect.runPromise(at.workspaces.setReleased(ref, { snapshot: "20261017T130000000Z-0000000b", release: "20260921.0-eaucoin.8", memoryLimit: "4Gi" }));
+    assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), { snapshot: "20261017T130000000Z-0000000b", release: "20260921.0-eaucoin.8", memoryLimit: "4Gi" });
     // Beside its files, which its sandbox sees, not among them; nothing staged left beside it.
     assert.deepEqual(readdirSync(join(files, "..")).sort(), ["files", "released.json"]);
     assert.deepEqual(readdirSync(files).sort(), ["home", "workspace"]);

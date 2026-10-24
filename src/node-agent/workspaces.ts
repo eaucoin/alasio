@@ -128,8 +128,16 @@ export function mountPoints(mountinfo: string): string[] {
   });
 }
 
-/** The snapshot a workspace was last released into: its id, and the gVisor release that took it. */
-export const Released = Schema.Struct({ snapshot: Schema.String.check(Schema.isPattern(new RegExp(`^${SNAPSHOT_ID}$`, "u"))), release: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._-]*$/u)) });
+/**
+ * The snapshot a workspace was last released into: its id, and the gVisor release that took
+ * it; and, where its sandbox was stopped as it ran out of its memory, the limit it ran out of,
+ * a Kubernetes quantity, which its restore tells its bayma (../gateway/snapshots.ts).
+ */
+export const Released = Schema.Struct({
+  snapshot: Schema.String.check(Schema.isPattern(new RegExp(`^${SNAPSHOT_ID}$`, "u"))),
+  release: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._-]*$/u)),
+  memoryLimit: Schema.optional(Schema.String.check(Schema.isPattern(/^[0-9]+(\.[0-9]+)?[A-Za-z]{0,2}$/u))),
+});
 export type Released = typeof Released.Type;
 
 /** The name of a workspace's record of the snapshot it was released into, beside its files. */

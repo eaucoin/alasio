@@ -20,6 +20,7 @@ import { RELEASES } from "../src/gateway/releases.ts";
 import { ATTACH_DURATION, DETACH_DURATION, makeSessions, type SessionsOptions } from "../src/gateway/sessions.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
+import type { Released } from "../src/node-agent/workspaces.ts";
 import { DEFER_FOR_MS } from "../src/gateway/snapshots.ts";
 import { type AttachRequest, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
 import { sessionKey } from "../src/sandbox/names.ts";
@@ -107,7 +108,7 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
           return { snapshot: "s-1" } as unknown as Manifest;
         }),
       attach: (node, request) => Effect.sync(() => void attached.push({ node, ...request })),
-      setReleased: (ref, into) => Effect.sync(() => void asked.push(`record ${ref.environment}/${ref.workspace} released into ${into?.snapshot ?? "none"}`)),
+      setReleased: (ref, into) => Effect.sync(() => void asked.push(`record ${ref.environment}/${ref.workspace} released into ${into?.snapshot ?? "none"}${into?.memoryLimit === undefined ? "" : `, out of ${into.memoryLimit}`}`)),
       // Its bayma, told to go on with its stop, ends.
       stop: (node, request) =>
         Effect.sync(() => void asked.push(`stop ${node} ${request.pod} ${request.hook.join(" ")}`)).pipe(
@@ -122,8 +123,8 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
   };
 }
 
-/** An environment of the test's own, its pools' namespace, with `count` free pods of the `none` pool on node-a, serving at the loopback. */
-async function environment(count: number, { gvisor = false, holdsStop = false } = {}): Promise<SessionsEnvironment & { none: Pool; template: V1PodTemplateSpec }> {
+/** An environment of the test's own, its pools' namespace, with `count` free pods of the `none` pool on node-a, serving at the loopback, their bayma limited to `memoryLimit` where given. */
+async function environment(count: number, { gvisor = false, holdsStop = false, memoryLimit = undefined as string | undefined } = {}): Promise<SessionsEnvironment & { none: Pool; template: V1PodTemplateSpec }> {
   const namespace = `sessions-${(namespaces += 1)}`;
   const none: Pool = { name: "sandboxes-none", namespace };
   let template: V1PodTemplateSpec = {};
@@ -132,9 +133,10 @@ async function environment(count: number, { gvisor = false, holdsStop = false } 
       yield* kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: namespace } });
       // The pool's template, as its snapshots record it.
       // Its bayma holding its stop for a save, where it is told to, as a pool's of snapshotted sessions does.
-      const spec = holdsStop
+      const held = holdsStop
         ? { terminationGracePeriodSeconds: 90, volumes: BAYMA_SPEC.volumes, containers: BAYMA_SPEC.containers.map((container) => ({ ...container, args: [...container.args, "--stop-wait-ms", "60000"] })) }
         : BAYMA_SPEC;
+      const spec = memoryLimit === undefined ? held : { ...held, containers: held.containers.map((container) => ({ ...container, resources: { limits: { memory: memoryLimit } } })) };
       template = { metadata: { labels: { ...freeLabels(none) }, annotations: { "alasio.dev/session-template": "t-current" } }, spec: { ...spec, ...(gvisor ? { runtimeClassName: "gvisor" } : {}) } };
       yield* kube.create<V1Deployment>({ apiVersion: "apps/v1", kind: "Deployment", metadata: { name: none.name, namespace }, spec: { replicas: 0, selector: { matchLabels: { ...freeLabels(none) } }, template } });
       for (let n = 0; n < count; n += 1) {
@@ -678,7 +680,7 @@ const manifestOf = (env: SessionsEnvironment & { template: V1PodTemplateSpec }, 
 });
 
 /** Node agents as `agents` makes them, which hold `current` of the workspace, and its record of `released`; their prepare does as `prepare` says. */
-function restoringAgents(current: Manifest | null, released: { snapshot: string; release: string } | null, { prepare = "prepares" as "prepares" | "fails" } = {}) {
+function restoringAgents(current: Manifest | null, released: Released | null, { prepare = "prepares" as "prepares" | "fails" } = {}) {
   const base = agents();
   const state = { current, released };
   const restoring: NodeAgents = {
@@ -698,11 +700,12 @@ function restoringAgents(current: Manifest | null, released: { snapshot: string;
   return { ...base, state, agents: restoring };
 }
 
-test("a workspace released into its snapshot is restored from it as it is next bound, by a pod of its own of the pool's template, its workspace attached into its directory, made for it, before the pod is made, paused until its node's agent resumes it, then spent", async () => {
+test("a workspace released into its snapshot is restored from it as it is next bound, by a pod of its own of the pool's template, its workspace attached into its directory, made for it, before the pod is made, its bayma's hook told why it stopped, paused until its node's agent resumes it, then spent", async () => {
   const env = await environment(1, { gvisor: true });
   await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
   const snapshot = "20261017T120000000Z-0000000a";
-  const recorded = restoringAgents(manifestOf(env, "fs-restored", snapshot), { snapshot, release: "r1" });
+  // Released as its sandbox ran out of its memory.
+  const recorded = restoringAgents(manifestOf(env, "fs-restored", snapshot), { snapshot, release: "r1", memoryLimit: "4Gi" });
   const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
   const key = sessionKey("fs-restored");
   const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
@@ -721,6 +724,7 @@ test("a workspace released into its snapshot is restored from it as it is next b
     assert.equal(restored.spec?.restartPolicy, "Never");
     // Its workspace attached into its directory on the node it is restored on, made for it, before the pod was made.
     assert.deepEqual(recorded.attached.map(({ node, pod, made }) => ({ node, pod, made })), [{ node: "node-a", pod: name, made: true }]);
+    assert.equal(recorded.attached[0]?.env["BAYMA_SANDBOX_STOP_REASON"], "it ran out of its memory (4Gi)");
     assert.deepEqual(recorded.asked, [`prepare node-a socket retrying pages`]);
     await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-restored", state: { running: {} } }] } })));
     for (;;) {
@@ -779,6 +783,8 @@ async function failedRestore(workspace: string, status: Record<string, unknown>)
     })();
     name = restored.metadata?.name ?? "";
     assert.deepEqual(recorded.attached.map(({ pod, made }) => ({ pod, made })), [{ pod: name, made: true }]);
+    // Released as other than its memory running out, its hook told no reason.
+    assert.equal(recorded.attached[0]?.env["BAYMA_SANDBOX_STOP_REASON"], undefined);
     await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, ...status }] } })));
     return binding;
   });
@@ -1000,8 +1006,8 @@ test("a bound pod whose bayma ended in it, or was started again, is released as 
   assert.equal(recorded.asked.at(-1), `record ${env.namespace}/fs-gone released into s-live`);
 });
 
-test("a bound pod whose sandbox was killed for its memory is released as oom, into the snapshot taken of it live", async () => {
-  const env = await environment(1, { gvisor: true });
+test("a bound pod whose sandbox was killed for its memory is released as oom, into the snapshot taken of it live, the limit it ran out of recorded with it", async () => {
+  const env = await environment(1, { gvisor: true, memoryLimit: "1Gi" });
   const recorded = agents();
   let saved = false;
   const live = { ...recorded.agents, current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/home/agent/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null) };
@@ -1015,7 +1021,7 @@ test("a bound pod whose sandbox was killed for its memory is released as oom, in
   await run(withKube((kube) => kube.patchPodStatus(env.namespace, bound.pod, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated: { exitCode: 137, reason: "OOMKilled" } } }] } })));
   await Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
   for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its binding was not let go");
-  assert.deepEqual(recorded.asked, [`record ${env.namespace}/fs-killed released into s-live`, `detach node-a ${env.namespace}/${bound.pod}`]);
+  assert.deepEqual(recorded.asked, [`record ${env.namespace}/fs-killed released into s-live, out of 1Gi`, `detach node-a ${env.namespace}/${bound.pod}`]);
   assert.deepEqual([await releasedFor(env.namespace, "oom"), await releasedFor(env.namespace, "broken")], [oomBefore + 1, brokenBefore]);
 });
 

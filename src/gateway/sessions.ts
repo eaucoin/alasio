@@ -188,10 +188,11 @@ export const makeSessions = Effect.fnUntraced(function*(
       if (mode !== "none" && mode !== "full") return yield* new PlacementRefused({ reason: `a session's internet is none or full, not ${mode ?? "unsaid"}` });
       const pool = { name: poolNames[mode], namespace: environment.namespace };
       // Its workspace attached into `pod`'s directory on `node`, its binding's token beside it, on
-      // which its bayma starts; the directory made now where `made`, for a restore's pod made after.
-      const attachInto = (node: string, pod: string, binding: string, made: boolean) =>
+      // which its bayma starts, with the variables `given` beside its telemetry's; the directory made
+      // now where `made`, for a restore's pod made after.
+      const attachInto = (node: string, pod: string, binding: string, made: boolean, given: Readonly<Record<string, string>> = {}) =>
         Effect.gen(function*() {
-          const env = telemetry ? { ...telemetry.env, OTEL_EXPORTER_OTLP_ENDPOINT: `http://${yield* addressOf(telemetry.host)}:${telemetry.port}` } : {};
+          const env = { ...(telemetry ? { ...telemetry.env, OTEL_EXPORTER_OTLP_ENDPOINT: `http://${yield* addressOf(telemetry.host)}:${telemetry.port}` } : {}), ...given };
           yield* timed(attachDuration, pool, agents.attach(node, {
             environment: environment.namespace,
             workspace: volumeId,
@@ -203,7 +204,7 @@ export const makeSessions = Effect.fnUntraced(function*(
         });
       // Restored from the snapshot it was released into, where it was, by a pod of its own, its workspace attached first (./snapshots.ts).
       const restoring = snapshots.restoring(pool, volumeId, mode, {
-        attach: (node, pod, binding) => attachInto(node, pod, binding, true),
+        attach: (node, pod, binding, env) => attachInto(node, pod, binding, true, env),
         detach: (node, pod) => detachOnceGone(pool, node, pod),
       });
       return {
@@ -398,11 +399,14 @@ export const makeSessions = Effect.fnUntraced(function*(
         if (ended || (yield* unreachable(pod.spec?.nodeName ?? "")).has(`${pool.namespace}/${pod.metadata?.name ?? ""}`)) {
           // Killed for its memory, the whole sandbox, as gVisor runs it as one process on the node.
           const killed = ended && killedForMemory(pod, BAYMA_CONTAINER);
-          const why = killed ? `sandbox ran out of its memory (${memoryLimitOf(pod, BAYMA_CONTAINER) ?? "its limit"}) in its pod` : ended ? "bayma ended in its pod" : "workspace is unreachable in its pod";
+          const memoryLimit = killed ? memoryLimitOf(pod, BAYMA_CONTAINER) : null;
+          const why = killed ? `sandbox ran out of its memory (${memoryLimit ?? "its limit"}) in its pod` : ended ? "bayma ended in its pod" : "workspace is unreachable in its pod";
           yield* Effect.logWarning(`${key}'s ${why} ${pod.metadata?.name}, which serves its binding no more: it is released into the snapshot taken of it live, if any`);
           yield* Effect.forkDetach(releaseFor(pool, key, pod, killed ? "oom" : "broken", () =>
             Effect.andThen(
-              Effect.flatMap(snapshots.liveSnapshotOf(pool, workspace), (into) => agents.setReleased({ environment: pool.namespace, workspace }, into)),
+              // Of one killed for its memory, the limit kept with it, for its restore to tell its bayma.
+              Effect.flatMap(snapshots.liveSnapshotOf(pool, workspace), (into) =>
+                agents.setReleased({ environment: pool.namespace, workspace }, into === null || memoryLimit === null ? into : { ...into, memoryLimit })),
               endAndDetachUnsaved(pool, pod),
             )));
           continue;

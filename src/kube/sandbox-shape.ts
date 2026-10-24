@@ -21,6 +21,13 @@ export const STOP_WAIT_ARG = "--stop-wait-ms";
 /** How long a session's bayma takes to stop once it holds its stop no more: it persists its sessions. */
 export const BAYMA_STOP_SECONDS = 30;
 
+/**
+ * The variable bayma's hook, run as its sandbox is restored, takes why its host stopped the
+ * sandbox from, as the end of a sentence, to tell each live session's next exec (bayma's
+ * sandbox-hook help).
+ */
+export const SANDBOX_STOP_REASON_VARIABLE = "BAYMA_SANDBOX_STOP_REASON";
+
 /** A path segment from `value`: never empty, nor starting with a dot. */
 export function sanitizePathToken(value: string): string {
   return String(value).replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[-.]+|-+$/g, "") || "default";
