@@ -28,7 +28,9 @@ test("an API server whose port another process takes between its probe and its b
     const { api, stop } = await startApiServer(ports);
     try {
       assert.notEqual(new URL(api.server).port, String(takenPort));
-      assert.equal(asked, 6, "started again, on three ports found free anew");
+      // Started again at least once, each time on three ports found free anew: more than once
+      // where a port found free was taken again, as the test files' processes beside it may.
+      assert.ok(asked >= 6 && asked % 3 === 0, `asked for ${asked} ports`);
     } finally {
       await stop();
     }
