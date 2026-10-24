@@ -2565,7 +2565,7 @@ describe("node agents", () => {
 
   test("are reached by the sandbox gateway, not alasio, which watches no pod", () => {
     const own = all<V1Role>(install(), "Role").find(({ metadata }) => metadata?.name === "alasio" && metadata.namespace === "alasio")?.rules;
-    assert.deepEqual(own, [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }]);
+    assert.deepEqual(own, [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }, { apiGroups: [""], resources: ["configmaps"], resourceNames: ["alasio-started"], verbs: ["get", "patch"] }]);
     const branchRules = all<V1Role>(branchObjects(configOf(), "try", BASELINE), "Role").filter(({ metadata }) => metadata?.name === "alasio").flatMap(({ rules }) => rules ?? []);
     assert.ok(!branchRules.some(({ resources, verbs }) => resources?.includes("pods") && verbs.includes("watch")));
   });
@@ -2621,12 +2621,14 @@ describe("security", () => {
     assert.deepEqual(all(install({ networkPolicies: { enabled: false } }), "NetworkPolicy"), []);
   });
 
-  test("lets alasio label its own pod busy in its own namespace and nothing else, nothing of its sessions or folder instances, which are the sandbox gateway's", () => {
+  test("lets alasio label its own pod busy in its own namespace, and keep its last start in its ConfigMap of that, and nothing else, nothing of its sessions or folder instances, which are the sandbox gateway's", () => {
     const rolesOf = (objects: readonly KubernetesObject[]) =>
       Object.fromEntries(all<V1Role>(objects, "Role").filter((role) => role.metadata?.name === "alasio").map(({ metadata, rules }) => [metadata?.namespace, rules]));
-    const own = [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }];
+    const own = [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }, { apiGroups: [""], resources: ["configmaps"], resourceNames: ["alasio-started"], verbs: ["get", "patch"] }];
     const objects = install({ host: { enabled: true } });
     assert.deepEqual(rolesOf(objects), { alasio: own });
+    // Made empty, its start's to write, `alasio up`'s apply owning none of it.
+    assert.deepEqual(one<V1ConfigMap>(objects, "ConfigMap", "alasio-started").data, undefined);
     const binding = one<V1RoleBinding>(objects.filter(({ metadata }) => metadata?.namespace === "alasio"), "RoleBinding", "alasio");
     assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
     assert.deepEqual(binding.roleRef, { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: "alasio" });
@@ -2640,11 +2642,13 @@ describe("security", () => {
     // No node agent's token, nor JuiceFS's mount pods, which are the gateway's and the nodes' mount's.
     assert.equal(container(one<V1Deployment>(main, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_NODE_AGENT_TOKEN"), undefined);
     assert.deepEqual(all<V1RoleBinding>(main, "RoleBinding").filter((each) => ofAlasio(each) && each.metadata?.namespace !== "alasio").map(({ metadata }) => metadata?.namespace), []);
-    // Its templates are alasio up's to render, not alasio's to write: no role of its own lets it write a ConfigMap.
+    // Its templates are alasio up's to render, not alasio's to write: no role of its own lets it write a ConfigMap but the one of its last start.
     const bound = all<V1RoleBinding>(objects, "RoleBinding").filter(ofAlasio).map(({ metadata, roleRef }) => `${metadata?.namespace}/${roleRef.name}`);
     const alasioRoles = all<V1Role>(objects, "Role").filter(({ metadata }) => bound.includes(`${metadata?.namespace}/${metadata?.name}`));
     assert.ok(alasioRoles.length > 0);
-    assert.ok(!alasioRoles.some(({ rules }) => rules?.some(({ resources, verbs }) => resources?.includes("configmaps") && verbs.some((verb) => verb !== "get" && verb !== "list" && verb !== "watch"))));
+    assert.ok(!alasioRoles.some(({ rules }) => rules?.some(({ resources, resourceNames, verbs }) =>
+      resources?.includes("configmaps") && verbs.some((verb) => verb !== "get" && verb !== "list" && verb !== "watch") && JSON.stringify(resourceNames) !== JSON.stringify(["alasio-started"])
+    )));
   });
 
   test("lets the host profile's agents restart alasio's own Deployment and nothing else", () => {
@@ -2736,7 +2740,7 @@ describe("branch environments", () => {
       // main's sandbox gateway, which binds in its harness pools.
       ["alasio-branch-try", "alasio-sandbox-gateway-harnesses"],
     ]);
-    assert.deepEqual(of<V1Role>("Role", "alasio", "alasio-branch-try").rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }]);
+    assert.deepEqual(of<V1Role>("Role", "alasio", "alasio-branch-try").rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }, { apiGroups: [""], resources: ["configmaps"], resourceNames: ["alasio-started"], verbs: ["get", "patch"] }]);
   });
 
   test("run a compute on the branch's timeline, from main's neon-control, which alone scales it, and a lake's loader woken on the branch's wake topic, and never maintained", () => {

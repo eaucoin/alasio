@@ -8,6 +8,7 @@ import { posix } from "node:path";
 
 import type {
   KubernetesObject,
+  V1ConfigMap,
   V1Deployment,
   V1EnvVar,
   V1Namespace,
@@ -23,6 +24,7 @@ import type {
 import { BRANCH_PARENT_LABEL, branchSessionsNamespace, forksGroup, forksTopic, MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
 import { eventsGroup, eventsTopic } from "../../../src/events/names.ts";
 import { ALASIO_GATEWAY_CALLER_KEY_VARIABLE, ALASIO_GATEWAY_ENVIRONMENT_VARIABLE, ALASIO_GATEWAY_FOLDERS_VARIABLE, ALASIO_GATEWAY_URL_VARIABLE } from "../../../src/gateway/names.ts";
+import { STARTED_CONFIG_MAP } from "../../../src/kube/started-map.ts";
 import type { ApiServer } from "../api-server.ts";
 import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
@@ -385,12 +387,23 @@ function namespaces(config: InstallConfig, environment: Environment): V1Namespac
 
 /**
  * alasio's identity: it labels its own pod busy while turns run in it (src/kube/busy.ts), and
- * nothing else. Its sessions and its folder workspaces are the sandbox gateway's, which it
- * reaches by its key alone.
+ * keeps the time of its last start in a ConfigMap of its own, made here empty, which it may
+ * read and patch alone (src/kube/started.ts); nothing else. Its sessions and its folder
+ * workspaces are the sandbox gateway's, which it reaches by its key alone.
  */
 function identity(config: InstallConfig, environment: Environment): KubernetesObject[] {
   const inOwnNamespace = { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") };
-  const own: V1Role = { apiVersion: "rbac.authorization.k8s.io/v1", kind: "Role", metadata: inOwnNamespace, rules: [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }] };
+  const own: V1Role = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "Role",
+    metadata: inOwnNamespace,
+    rules: [
+      { apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] },
+      { apiGroups: [""], resources: ["configmaps"], resourceNames: [STARTED_CONFIG_MAP], verbs: ["get", "patch"] },
+    ],
+  };
+  // Of no data, which alasio's starts write and `alasio up` leaves to them.
+  const started: V1ConfigMap = { apiVersion: "v1", kind: "ConfigMap", metadata: { name: STARTED_CONFIG_MAP, namespace: environment.namespace, labels: labels("alasio") } };
   const binding: V1RoleBinding = {
     apiVersion: "rbac.authorization.k8s.io/v1",
     kind: "RoleBinding",
@@ -399,7 +412,7 @@ function identity(config: InstallConfig, environment: Environment): KubernetesOb
     roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: RELEASE },
   };
   const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") } };
-  return [serviceAccount, own, binding, ...(environment.branch === null && foldersRun(config) ? hostAgentIdentity(config) : [])];
+  return [serviceAccount, own, binding, started, ...(environment.branch === null && foldersRun(config) ? hostAgentIdentity(config) : [])];
 }
 
 /**

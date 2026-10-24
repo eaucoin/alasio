@@ -26,6 +26,7 @@ import { pooledHarnessHost } from "./harness/pooled-host.ts";
 import { CODEX_LOGIN_PORT, poolLoginKey, poolLoginRefusal, startLoginRelay } from "./codex/login-relay.ts";
 import { BusyPods } from "./kube/busy.ts";
 import { KubeClient } from "./kube/client.ts";
+import { recordStart } from "./kube/started.ts";
 import { HostBayma } from "./mcp/bayma.ts";
 import { BaymaProxy } from "./mcp/bayma-proxy.ts";
 import { Mounts } from "./operator/mounts.ts";
@@ -114,6 +115,7 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       options.keepCodexLogin ? Layer.effectDiscard(keepCodexLogin(codexHome())) : Layer.empty,
       workspaceServices(options),
       busyPods(options),
+      recordStart(options.inKubernetes),
     )),
     // Of alasio's own app-server, which refreshes it, and its store, which the alasios on it share it by.
     Layer.provideMerge(CodexLoginFreshness.layer(codexHome())),
