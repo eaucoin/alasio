@@ -1331,6 +1331,11 @@ export function neonStack(): void {
           await new NeonSessionStore(pool).append({ projectKey: "-kube-stack-restore", sessionId: "44444444-4444-4444-8444-444444444444" }, entries);
           await wakeLake();
           await untilLoaded(transcriptsWhole, "loaded the entries written since the backup");
+          // The lake's daily pass since, as one ran in a restore's window once: what its writers
+          // kept inlined in its catalog flushed to files the restore loses, the intake's offsets of
+          // the log and the loader's model version among them, which each reads as it starts. Its
+          // own are ready again only once its catalog is set right.
+          assert.match(await runCronJob(componentName("lake-maintenance")), /"message":"maintained"/u);
 
           // The log's nodes, by their pods' ids, which run on throughout the restore.
           const logNodes = async () =>

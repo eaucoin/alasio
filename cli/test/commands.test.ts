@@ -995,6 +995,38 @@ test("restore-filer-store lists the filer store's backups, and puts one back wit
   assert.deepEqual(annotations("alasio-lake-loader"), { "autoscaling.keda.sh/paused-replicas": "1" });
 });
 
+test("restore-filer-store sets the lake's catalog right before it waits for the lake, whose loader is not ready, as it reads a file the store lost, until it is", async (t) => {
+  const { alasio, kube } = await installed(t);
+  kube.logs.set("alasio-seaweedfs-filer-store-backups-listing-0/list", "filer-store-20261013T092300Z.rdb\n");
+  kube.logs.set("alasio-seaweedfs-filer-store-restore-0/restore", "restored 1234 keys\n");
+  kube.logs.set("alasio-lake-reconcile-0/maintenance", '{"message":"reconciled","lost":1}\n');
+  kube.onExec = ({ pod, container }) =>
+    pod === "alasio-seaweedfs-filer-store-0" && container === "valkey"
+      ? { exitCode: 0, stdout: "# Keyspace\ndb0:keys=1234,expires=0,avg_ttl=0\n# Persistence\nloading:0\naof_enabled:1\naof_last_bgrewrite_status:ok\n" }
+      : { exitCode: 0 };
+  // The loader wrote a file after the backup was taken: started on the store put back, it fails its reads of it, and is not ready.
+  kube.stuck.add("alasio-lake-loader");
+  const loader = "/apis/apps/v1/namespaces/alasio/deployments/alasio-lake-loader";
+  // Ready once the reconciliation has dropped the file from its catalog.
+  const reconciled = setInterval(() => {
+    if (!kube.changes.some(({ path }) => path.endsWith("/namespaces/alasio/jobs/alasio-lake-reconcile"))) return;
+    clearInterval(reconciled);
+    kube.stuck.delete("alasio-lake-loader");
+    const deployment = kube.objects.get(loader);
+    const pod = kube.objects.get("/api/v1/namespaces/alasio/pods/alasio-lake-loader-0");
+    if (deployment) deployment.status = { ...deployment.status, availableReplicas: 1, readyReplicas: 1 };
+    if (pod) pod.status = { phase: "Running", conditions: [{ type: "Ready", status: "True" }], containerStatuses: [{ name: "loader", ready: true, restartCount: 0, image: "", imageID: "", state: { running: {} } }] };
+  }, 20);
+  t.after(() => clearInterval(reconciled));
+  const restored = await alasio(["restore-filer-store", "20261013T092300Z", "--yes", "--timeout", "10s"]);
+  succeeded(restored);
+  assert.match(restored.printed.join("\n"), /alasio runs on it again/u);
+  // One the reconciliation leaves unready is waited for all the same, and the restore fails saying so.
+  kube.logs.set("alasio-seaweedfs-filer-store-backups-listing-0/list", "filer-store-20261013T092300Z.rdb\n");
+  kube.stuck.add("alasio-lake-loader");
+  assert.match(failure(await alasio(["restore-filer-store", "20261013T092300Z", "--yes", "--timeout", "5s"])), /alasio-lake-loader/u);
+});
+
 test("init and up raise inotify limits too low for the cluster here as root, now and for every boot, and status says them too low", async (t) => {
   const { alasio, configure, home, kube, machine } = await rig(t);
   configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });

@@ -22,6 +22,7 @@ import { reconcileLake } from "../lake.ts";
 import { branchEnvironment } from "../manifests/branch.ts";
 import { lakeRuns, MAIN_ENVIRONMENT, NAMESPACE, RELEASE } from "../manifests/common.ts";
 import type { InstallConfig } from "../manifests/config.ts";
+import { INTAKE_COMPONENT, LOADER_COMPONENT, QUERY_COMPONENT } from "../manifests/lake.ts";
 import { LOG_COMPONENT } from "../manifests/log.ts";
 import {
   BACKUPS_LISTING,
@@ -113,6 +114,17 @@ const backups = Effect.fnUntraced(function*(config: InstallConfig, options: Wait
   return files.flatMap((file) => BACKUP_FILE.exec(file)?.slice(1, 2) ?? []).toSorted().toReversed();
 });
 
+/** `workload`'s component, as its label names it. */
+const component = (workload: Workload): string => workload.metadata?.labels?.["app.kubernetes.io/component"] ?? "";
+
+/**
+ * The lake's workloads, every environment's: each reads the lake's files, so one of a catalog
+ * that names files the store lost fails its reads, and is not ready, until its catalog is set
+ * right (reconciledLakes).
+ */
+const LAKE_COMPONENTS = new Set([LOADER_COMPONENT, QUERY_COMPONENT, INTAKE_COMPONENT]);
+const ofLake = (workload: Workload): boolean => LAKE_COMPONENTS.has(component(workload));
+
 /**
  * The workloads that write to the store, through it: alasio and the data stack, main's and
  * each branch environment's, but the log, whose segments are on its own volumes, so it
@@ -121,7 +133,6 @@ const backups = Effect.fnUntraced(function*(config: InstallConfig, options: Wait
  * filers and gateways, which write to the filer store.
  */
 const writers = Effect.map(listed<Workload>(WORKLOADS), (workloads) => {
-  const component = (workload: Workload) => workload.metadata?.labels?.["app.kubernetes.io/component"] ?? "";
   const store = new Set([...Object.values(COMPONENTS), LOG_COMPONENT]);
   const front = new Set([COMPONENTS.gateway, COMPONENTS.filer]);
   return {
@@ -167,12 +178,12 @@ const stop = Effect.fnUntraced(function*(workloads: readonly Workload[], options
 const held = (workload: Workload): boolean => workload.kind === "StatefulSet" && (workload.spec?.volumeClaimTemplates?.length ?? 0) > 0;
 
 /**
- * Starts again what of `workloads` was stopped, as its mark says, and their ScaledObjects,
- * and waits until they run. Those whose volumes hold them to a node start first, and are
- * scheduled before the rest start: the rest, which run on any node, would otherwise take
- * the room on theirs, where nothing else would do.
+ * Starts again what of `workloads` was stopped, as its mark says, and their ScaledObjects:
+ * what was, for the caller to wait for. Those whose volumes hold them to a node start first,
+ * and are scheduled before the rest start: the rest, which run on any node, would otherwise
+ * take the room on theirs, where nothing else would do.
  */
-const start = Effect.fnUntraced(function*(workloads: readonly Workload[], options: WaitOptions) {
+const started = Effect.fnUntraced(function*(workloads: readonly Workload[], options: WaitOptions) {
   const kube = yield* KubeApi;
   const stopped = workloads.filter((workload) => markOf(workload) !== null);
   const scaled = (each: readonly Workload[]) =>
@@ -187,7 +198,12 @@ const start = Effect.fnUntraced(function*(workloads: readonly Workload[], option
   for (const scaler of (yield* scalersOf(stopped)).filter((each) => markOf(each) !== null)) {
     yield* kube.patch(refOf(scaler), { metadata: { annotations: { ...markOf<Record<string, string | null>>(scaler), [MARK]: null } } }, MANAGER);
   }
-  yield* awaitReady(stopped.map(refOf), options);
+  return stopped;
+});
+
+/** Starts again what of `workloads` was stopped (started), and waits until it runs. */
+const start = Effect.fnUntraced(function*(workloads: readonly Workload[], options: WaitOptions) {
+  yield* awaitReady((yield* started(workloads, options)).map(refOf), options);
 });
 
 /** Suspends the installation's CronJobs, each marked with whether it was before, and waits until the Jobs of any running end. */
@@ -247,7 +263,7 @@ const filerStoreState = Effect.gen(function*() {
  * Puts the backup `stamp` back: stops what writes to the store, alasio and Neon first,
  * while the store takes what they write as they stop, then its filers, and the filer
  * store; loads the backup onto its volume; starts the filer store and checks it; and
- * starts the rest again.
+ * starts the rest again, waiting for the lake's own once its catalog is set right.
  */
 const restore = Effect.fnUntraced(function*(settings: InstallConfig, stamp: string, options: WaitOptions) {
   const kube = yield* KubeApi;
@@ -282,9 +298,13 @@ const restore = Effect.fnUntraced(function*(settings: InstallConfig, stamp: stri
   yield* Effect.logInfo("starting the object store's filers and gateways, then alasio, Neon and the lake, and the CronJobs");
   const again = yield* writers;
   yield* start(again.front, options);
-  yield* start(again.clients, options);
+  // The lake's own started with the rest, its intake to read again what its telemetry lost as
+  // the reconciliation asks it, but waited for once its catalog is set right, which they wait on.
+  const running = yield* started(again.clients, options);
+  yield* awaitReady(running.filter((workload) => !ofLake(workload)).map(refOf), options);
   yield* Effect.logInfo("setting each lake's catalog right with the store, and loading again what its transcripts lost");
   const lost = yield* reconciledLakes(settings, options);
+  yield* awaitReady(running.filter(ofLake).map(refOf), options);
   yield* resumeCronJobs;
   yield* Console.log([`The filer store is as it was at ${when(stamp)}, with its ${restored} keys, and alasio runs on it again.`, ...lost.map((line) => `  ${line}`)].join("\n"));
 });
