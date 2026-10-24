@@ -71,9 +71,11 @@ import { LOG_COMPONENT } from "../../cli/src/manifests/log.ts";
 import { COMPONENTS as OBJECT_STORE_COMPONENTS } from "../../cli/src/manifests/object-store.ts";
 import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
-import { BINDING_LABEL, environmentKey, keyHash } from "../../src/binder/names.ts";
+import { BINDING_LABEL, environmentKey, keyHash, POOL_LABEL } from "../../src/binder/names.ts";
 import { NO_BIND_HEADER } from "../../src/binder/names.ts";
 import { mintToken } from "../../src/binder/tokens.ts";
+import { FOLDER_POOL } from "../../src/gateway/names.ts";
+import { BAYMA_CONTAINER } from "../../src/kube/sandbox-shape.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { installCli, packCli } from "../../tooling/cli-package.ts";
 import { NODE_BUILD_ARGS } from "../../tooling/node-image.ts";
@@ -1274,6 +1276,19 @@ export async function dumpClusterState(): Promise<void> {
       const logged = await logsOf(namespace, name, "harness");
       say(`--- ${namespace}/${name}: the last lines of its harness host`);
       for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
+    }
+    // And each folder instance's bayma, whole, ready as it serves, and before it restarted where it did: its own account
+    // of the REPL sessions it saved as its instance was let go and restored as one was made anew, which nothing else
+    // says, a snapshot it does not restore said why on its stderr, and the image it runs.
+    for (const pod of pods.filter((each) => each.metadata?.labels?.[POOL_LABEL] === FOLDER_POOL)) {
+      const { namespace = "", name = "" } = pod.metadata ?? {};
+      const restarted = (pod.status?.containerStatuses ?? []).some(({ name: container, restartCount }) => container === BAYMA_CONTAINER && restartCount > 0);
+      for (const previous of restarted ? [true, false] : [false]) {
+        const logged = await logsOf(namespace, name, BAYMA_CONTAINER, { previous });
+        const image = pod.status?.containerStatuses?.find(({ name: container }) => container === BAYMA_CONTAINER)?.imageID ?? "an image not yet said";
+        say(`--- logs of ${BAYMA_CONTAINER} of the folder instance ${namespace}/${name}, running ${image}${previous ? ", before it restarted" : ""}:`);
+        for (const line of logged.trimEnd().split("\n")) say(`  ${line}`);
+      }
     }
   } catch (error) {
     say(`the cluster's state could not be read: ${error instanceof Error ? error.message : String(error)}`);
