@@ -6,6 +6,7 @@
  * alongside them.
  */
 import { withReplyInstructions } from "../harness/reply-instructions.ts";
+import { BAYMA_CONTROL_INSTRUCTIONS } from "../harness/workspace-instructions.ts";
 import type { BaymaEndpoint } from "../sandbox/gateway-client.ts";
 import { BAYMA_SERVER_NAME, BAYMA_STARTUP_TIMEOUT_MS } from "../mcp/bayma.ts";
 import { operatorDeveloperInstructions } from "./config-toml.ts";
@@ -37,8 +38,9 @@ export function codexMcpServer(server: BaymaEndpoint): CodexMcpServer {
 export function buildCodexThreadConfig({ codexEnv, bayma }: { readonly codexEnv: CodexEnv; readonly bayma: BaymaEndpoint | null }): CodexThreadConfig {
   return {
     project_doc_max_bytes: 32768,
-    // An override replaces the config's own, so the operator's are kept, then alasio's.
-    developer_instructions: withReplyInstructions(operatorDeveloperInstructions(codexHome(codexEnv))),
+    // An override replaces the config's own, so the operator's are kept, then alasio's, and,
+    // with its bayma, what to do where bayma refuses a call as its session's control is another's.
+    developer_instructions: [withReplyInstructions(operatorDeveloperInstructions(codexHome(codexEnv))), ...(bayma ? [BAYMA_CONTROL_INSTRUCTIONS] : [])].join("\n\n"),
     mcp_servers: bayma ? { [BAYMA_SERVER_NAME]: codexMcpServer(bayma) } : {},
   };
 }

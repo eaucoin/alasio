@@ -22,11 +22,13 @@ import type {
   SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
 import { Effect, Schema } from "effect";
+import { BAYMA_SERVER_NAME } from "../../mcp/bayma.ts";
 import type { BaymaEndpoint } from "../../sandbox/gateway-client.ts";
 import type { ModelChoice } from "../../persistence/conversation-repository.ts";
 import { withLogScope } from "../../shared/log.ts";
 import { sessionFsQueryOptions } from "./sessionfs.ts";
 import { REPLY_INSTRUCTIONS } from "../reply-instructions.ts";
+import { FOLDER_BAYMA_AGENT_INSTRUCTIONS } from "../workspace-instructions.ts";
 import { getClaudeBinaryOverride, getClaudeEffort, getClaudeModel } from "./model.ts";
 import { mirrorOnly } from "./session-store.ts";
 
@@ -107,7 +109,8 @@ export function buildClaudeQueryOptions({
     abortController: controller,
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
-    systemPrompt: { type: "preset", preset: "claude_code", append: REPLY_INSTRUCTIONS },
+    // With its folder's bayma, what to do where bayma refuses a call as its session's control is another's too.
+    systemPrompt: { type: "preset", preset: "claude_code", append: mcpServers?.[BAYMA_SERVER_NAME] ? FOLDER_BAYMA_AGENT_INSTRUCTIONS : REPLY_INSTRUCTIONS },
     includePartialMessages: false,
     persistSession: true,
     disallowedTools: [...CLAUDE_DISALLOWED_TOOLS],

@@ -33,6 +33,8 @@ import { buildClaudeQueryOptions, type ClaudeQueryFactory } from "../src/harness
 import { ALASIO_CLAUDE_EFFORT, ALASIO_CLAUDE_MODEL } from "../src/harness/claude/model.ts";
 import { type ClaudeSessionApi, type ClaudeTranscriptStore, createClaudeSessionApi } from "../src/harness/claude/sessions.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
+import { REPLY_INSTRUCTIONS } from "../src/harness/reply-instructions.ts";
+import { BAYMA_CONTROL_INSTRUCTIONS } from "../src/harness/workspace-instructions.ts";
 import type { TurnParams, TurnPersistence, TurnResult } from "../src/harness/index.ts";
 import { type BaymaMcpServer, type FolderBaymaOutcome, type FolderBaymaScope, type HostBaymaScope, NoFolderWorkspaces } from "../src/mcp/bayma.ts";
 import type { ModelChoice } from "../src/persistence/conversation-repository.ts";
@@ -265,6 +267,13 @@ test("result projection separates final answers from failures", () => {
   const apiFailure = projectResultMessage(successResult({ result: "rate limited", is_error: true, session_id: "s-1" }));
   assert.ok(apiFailure?.ok === false);
   assert.equal(apiFailure.error, "rate limited");
+});
+
+test("a folder's Claude Code with its bayma is told to take its session's control where bayma refuses a call as another's; one without is told its replies' instructions alone", () => {
+  const options = (mcpServers: Record<string, { readonly type: "http"; readonly url: string }>) =>
+    buildClaudeQueryOptions({ workingDirectory: "/w", claudeEnv: {}, mcpServers, controller: new AbortController(), hooks: {}, env: {} }).systemPrompt;
+  assert.deepEqual(options({ bayma: { type: "http", url: "http://127.0.0.1:1/mcp/a" } }), { type: "preset", preset: "claude_code", append: `${REPLY_INSTRUCTIONS}\n\n${BAYMA_CONTROL_INSTRUCTIONS}` });
+  assert.deepEqual(options({}), { type: "preset", preset: "claude_code", append: REPLY_INSTRUCTIONS });
 });
 
 test("query options resume existing sessions and reserve fresh ids", () => {

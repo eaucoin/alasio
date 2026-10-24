@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { ALASIO_CODEX_MODEL } from "../src/codex/model.ts";
+import { BAYMA_CONTROL_INSTRUCTIONS } from "../src/harness/workspace-instructions.ts";
 import { agentMessage, codexModel, codexThread, codexTurn, commandExecution, threadResumeResponse, turnCompleted, turnError, turnStarted } from "./support/codex-protocol.ts";
 import type { RunningAlasio } from "./support/alasio.ts";
 import {
@@ -187,7 +188,7 @@ test("a Codex turn: a status message, sent then edited, and the final answer alo
     sandbox: "danger-full-access",
     config: {
       project_doc_max_bytes: 32768,
-      developer_instructions: REPLY_INSTRUCTIONS,
+      developer_instructions: `${REPLY_INSTRUCTIONS}\n\n${BAYMA_CONTROL_INSTRUCTIONS}`,
       mcp_servers: { bayma: { ...podBayma(threadStart.params), startup_timeout_sec: 60 } },
       model_reasoning_effort: "high",
     },
@@ -579,7 +580,7 @@ test("the app-server exiting mid-turn fails the turn visibly, and the next promp
     sandbox: "danger-full-access",
     config: {
       project_doc_max_bytes: 32768,
-      developer_instructions: REPLY_INSTRUCTIONS,
+      developer_instructions: `${REPLY_INSTRUCTIONS}\n\n${BAYMA_CONTROL_INSTRUCTIONS}`,
       mcp_servers: { bayma: { ...podBayma(resume.params), startup_timeout_sec: 60 } },
       model_reasoning_effort: "high",
     },

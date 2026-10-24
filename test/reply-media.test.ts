@@ -11,6 +11,7 @@ import { makeReplyMedia } from "../src/codex/reply-media.ts";
 import { buildCodexThreadConfig } from "../src/codex/thread-config.ts";
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.ts";
 import { REPLY_INSTRUCTIONS, withReplyInstructions } from "../src/harness/reply-instructions.ts";
+import { BAYMA_CONTROL_INSTRUCTIONS } from "../src/harness/workspace-instructions.ts";
 import { Store } from "../src/persistence/store.ts";
 import type { SessionSandboxes } from "../src/sandbox/index.ts";
 import type { MediaAttachment } from "../src/telegram/client.ts";
@@ -239,14 +240,15 @@ test("the operator's own Codex developer instructions are read in every TOML str
   });
 });
 
-test("both harnesses are told how to show media, Codex after the operator's own instructions", () => withDir((dir) => {
+test("both harnesses are told how to show media, Codex after the operator's own instructions, and with a folder's bayma what to do where it refuses a call as its session's control is another's", () => withDir((dir) => {
   assert.equal(withReplyInstructions(null), REPLY_INSTRUCTIONS);
   assert.equal(withReplyInstructions("Mine."), `Mine.\n\n${REPLY_INSTRUCTIONS}`);
   assert.match(REPLY_INSTRUCTIONS, /!\[short caption\]\(path\)/);
 
   writeFileSync(join(dir, "config.toml"), 'developer_instructions = "Operator rule."\n');
   const config = buildCodexThreadConfig({ codexEnv: { CODEX_HOME: dir, HOME: dir }, bayma: { url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} } });
-  assert.equal(config.developer_instructions, `Operator rule.\n\n${REPLY_INSTRUCTIONS}`);
+  assert.equal(config.developer_instructions, `Operator rule.\n\n${REPLY_INSTRUCTIONS}\n\n${BAYMA_CONTROL_INSTRUCTIONS}`);
+  assert.equal(buildCodexThreadConfig({ codexEnv: { CODEX_HOME: dir, HOME: dir }, bayma: null }).developer_instructions, `Operator rule.\n\n${REPLY_INSTRUCTIONS}`);
 
   const claude = buildClaudeQueryOptions({ workingDirectory: dir, claudeEnv: {}, mcpServers: {}, controller: new AbortController(), hooks: {} });
   assert.deepEqual(claude.systemPrompt, { type: "preset", preset: "claude_code", append: REPLY_INSTRUCTIONS });
