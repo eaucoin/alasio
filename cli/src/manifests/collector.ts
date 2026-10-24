@@ -49,6 +49,7 @@ import type { InstallConfig } from "./config.ts";
 import { LOG_BROKERS, LOG_METRICS_PORT, LOG_RECORD_BYTES, logPrincipalSecret, TELEMETRY_TOPICS } from "./log.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { JUICEFS_METRICS_PORT, WORKSPACE_MOUNT_COMPONENT } from "./sandbox-gateway.ts";
+import { KEDA_OPERATOR_METRICS_PORT } from "./keda.ts";
 import { INTAKE_COMPONENT, LAKE_METRICS_PORT, LAKE_QUERY_PORT, LOADER_COMPONENT, QUERY_COMPONENT } from "./lake.ts";
 import { COMPONENTS, FILER_STORE, FILER_STORE_USERS, METRICS_PORT as SEAWEEDFS_METRICS_PORT } from "./object-store.ts";
 import { priority } from "./priorities.ts";
@@ -146,9 +147,16 @@ function podJob(job: string, namespace: string, components: readonly string[], p
   };
 }
 
-/** What it scrapes, a job of each component's pods, by the job's name, which its metrics' service is named. */
+/**
+ * Of KEDA's operator's metrics, those kept: what each ScaledObject's triggers measured, which the
+ * Harnesses dashboard says of alasio's scale. Its others (its reconciles, its Go runtime's) are
+ * dropped as they are scraped; every other job keeps all it scrapes.
+ */
+export const KEDA_SCRAPED_METRICS = ["keda_scaler_metrics_value"] as const;
+
+/** What it scrapes, a job of each component's pods, by the job's name, which its metrics' service is named, and, where it keeps only some, the metrics it keeps. */
 function scrapes(config: InstallConfig): object[] {
-  const stack: Record<string, readonly [components: readonly string[], port: number]> = {
+  const stack: Record<string, readonly [components: readonly string[], port: number, kept?: readonly string[]]> = {
     pageserver: [["neon-pageserver"], 9898],
     "storage-controller": [["neon-storage-controller"], 1234],
     "storage-broker": [["neon-storage-broker"], 50051],
@@ -163,11 +171,14 @@ function scrapes(config: InstallConfig): object[] {
       : {}),
     log: [["log"], LOG_METRICS_PORT],
     webhook: [["webhook"], WEBHOOK_HEALTH_PORT],
+    // What each ScaledObject's triggers measure, as KEDA's operator polls them: alasio's scale's among them, where the KEDA is alasio's own.
+    ...(config.autoscaling.keda.enabled ? { keda: [["keda-operator"], KEDA_OPERATOR_METRICS_PORT, KEDA_SCRAPED_METRICS] } as const : {}),
   };
   return [
     ...Object.keys(stack).sort().map((job) => {
-      const [components, port] = stack[job] ?? [[], 0];
-      return podJob(job, NAMESPACE, components, port);
+      const [components, port, kept] = stack[job] ?? [[], 0];
+      const scraped = podJob(job, NAMESPACE, components, port);
+      return kept ? { ...scraped, metric_relabel_configs: [{ source_labels: ["__name__"], regex: kept.join("|"), action: "keep" }] } : scraped;
     }),
     // The object store's parts, each labelled with its part.
     ...(seaweedfsRuns(config) ? [podJob("seaweedfs", NAMESPACE, SEAWEEDFS_SCRAPED, SEAWEEDFS_METRICS_PORT, true)] : []),

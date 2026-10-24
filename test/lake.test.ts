@@ -3034,7 +3034,7 @@ describe("the lake's reader", () => {
     }
   });
 
-  test("the Harnesses dashboard times and counts the binds of main's harness pools or a branch environment's, as its Branch chooses, counts their releases by why and their losses by pool, and the turns run again as their harness was lost, by how each came out, none of the folder instances'", async () => {
+  test("the Harnesses dashboard times and counts the binds of main's harness pools or a branch environment's, as its Branch chooses, counts their releases by why and their losses by pool, and the turns run again as their harness was lost, by how each came out, none of the folder instances'; and says what scales its alasio, as KEDA measures it, beside its starts", async () => {
     const minute = 60_000;
     const now = Math.floor(Date.now() / minute) * minute;
     const keyValues = (attributes: Readonly<Record<string, string>>) => Object.entries(attributes).map(([key, value]) => ({ key, value: { stringValue: value } }));
@@ -3060,6 +3060,11 @@ describe("the lake's reader", () => {
     const bind = (namespace: string, pool: string, start: string) => ({ "alasio.binder.pool": pool, "k8s.namespace.name": namespace, "alasio.binder.start": start });
     const released = (namespace: string, pool: string, why: string) => ({ "alasio.binder.pool": pool, "k8s.namespace.name": namespace, "alasio.gateway.release.reason": why });
     const recovered = (by: string, outcome: string) => ({ "alasio.harness": "codex", "alasio.harness.recovery.by": by, "alasio.harness.recovery.outcome": outcome });
+    /** What KEDA measured of a trigger of the ScaledObject `scaledObject` of `namespace`, five minutes ago, as its operator says it. */
+    const scaledOn = (namespace: string, scaledObject: string, scaler: string, metric: string, value: number) => ({
+      name: "keda_scaler_metrics_value",
+      gauge: { dataPoints: [{ timeUnixNano: nanos(now - 5 * minute), asDouble: value, attributes: keyValues({ namespace, scaledObject, scaler, metric, triggerIndex: "0", type: "ScaledObject" }) }] },
+    });
     const BIND = "alasio.binder.bind.duration";
     const RELEASES = "alasio.gateway.releases";
     const RECOVERIES = "alasio.harness.recoveries";
@@ -3086,9 +3091,21 @@ describe("the lake's reader", () => {
           },
           {
             resource: { attributes: keyValues({ "service.name": "alasio" }) },
-            scopeMetrics: [{ metrics: [counter(RECOVERIES, recovered("lost", "staged"), [10]), counter(RECOVERIES, recovered("reattach", "given-up"), [4]), histogram("alasio.turn.first_output", { "alasio.harness": "codex" }, [[20, 7]])] }],
+            scopeMetrics: [{ metrics: [counter(RECOVERIES, recovered("lost", "staged"), [10]), counter(RECOVERIES, recovered("reattach", "given-up"), [4]), histogram("alasio.turn.first_output", { "alasio.harness": "codex" }, [[20, 7]]), counter("alasio.starts", {}, [90, 30, 10])] }],
           },
-          { resource: { attributes: keyValues({ "service.name": "alasio", "alasio.branch": "pooled" }) }, scopeMetrics: [{ metrics: [counter(RECOVERIES, recovered("lost", "staged"), [8])] }] },
+          { resource: { attributes: keyValues({ "service.name": "alasio", "alasio.branch": "pooled" }) }, scopeMetrics: [{ metrics: [counter(RECOVERIES, recovered("lost", "staged"), [8]), counter("alasio.starts", {}, [9])] }] },
+          // KEDA's operator, as the scraper names its job: what alasio's triggers measured, main's and the branch's, and another ScaledObject's.
+          {
+            resource: { attributes: keyValues({ "service.name": "keda" }) },
+            scopeMetrics: [{
+              metrics: [
+                scaledOn("alasio", "alasio", "kafkaScaler", "s0-kafka-alasio-main-telegram", 3),
+                scaledOn("alasio", "alasio", "metricsAPIScaler", "s1-metric-api-bound", 1),
+                scaledOn("alasio-branch-pooled", "alasio", "kafkaScaler", "s0-kafka-alasio-pooled-telegram", 7),
+                scaledOn("alasio", "alasio-lake-loader", "kafkaScaler", "s0-kafka-lake-main", 40),
+              ],
+            }],
+          },
         ],
       }));
     });
@@ -3114,6 +3131,10 @@ describe("the lake's reader", () => {
       assert.deepEqual(await rows("Bindings lost by pool", "pool", "lost"), ["harness-codex 1", "harness-folder-claude 1"]);
       assert.deepEqual(await rows("Lost turns", "recovery", "turns"), ["given-up, reattach 1", "staged, lost 1"]);
       assert.deepEqual(await rows("First output", "harness", "seconds"), ["codex 7"]);
+      // What scales main's alasio, of its own ScaledObject alone, and its starts of the last hour.
+      assert.deepEqual(await rows("Waiting on its topics", "topic", "value"), ["s0-kafka-alasio-main-telegram 3"]);
+      assert.deepEqual(await rows("Harnesses bound", "harnesses", "value"), ["bound 1"]);
+      assert.deepEqual(await rows("Starts", "started", "starts"), ["alasio 1", "alasio 1"]);
       // The branch is offered, its harness pools' binds and releases in range, though its alasio ran no turn.
       const branches = dashboard.templating.list.find(({ name }) => name === "branch")?.query.infinityQuery.url_options.data ?? "";
       const offered = (await answer(reader.db, [["${__from}", String(now - 60 * minute)], ["${__to}", String(now + minute)]].reduce((text, [variable = "", value = ""]) => text.replaceAll(variable, value), branches))).map((row) => row["__value"]);
@@ -3123,6 +3144,8 @@ describe("the lake's reader", () => {
       assert.deepEqual([await stat("Binds", "binds", "pooled"), await stat("Bindings lost", "lost", "pooled"), await stat("Turns run again", "turns", "pooled")], [1, 1, 1]);
       assert.deepEqual(await rows("Bindings released", "reason", "releases", "pooled"), ["deleted 1"]);
       assert.deepEqual(await rows("First output", "harness", "seconds", "pooled"), []);
+      assert.deepEqual(await rows("Waiting on its topics", "topic", "value", "pooled"), ["s0-kafka-alasio-pooled-telegram 7"]);
+      assert.deepEqual(await rows("Starts", "started", "starts", "pooled"), ["alasio 1"]);
     } finally {
       reader.close();
     }

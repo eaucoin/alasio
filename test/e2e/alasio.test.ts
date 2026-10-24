@@ -2443,6 +2443,14 @@ if (inShard("telemetry")) {
       await untilInLake("metric of the lake's intake's", metricRows("ServiceName = 'lake-intake' and MetricName = 'lake_telemetry_lag_records'"));
       // Each node's filesystem, as its kubelet says it, which the disk alert reads.
       await untilInLake("filesystem of a node's", metricRows("MetricName = 'k8s.node.filesystem.available'"));
+      // KEDA's operator's, what it measured of a ScaledObject's trigger of each kind alasio's scale has, by what the
+      // Harnesses dashboard's panels of it query: the ScaledObject, its namespace, its scaler, and the metric.
+      for (const scaler of ["kafkaScaler", "metricsAPIScaler"]) {
+        await untilInLake(
+          `KEDA's measure of a trigger of its ${scaler}`,
+          metricRows(`ServiceName = 'keda' and MetricName = 'keda_scaler_metrics_value' and Attributes['scaler'] = '${scaler}' and Attributes['scaledObject'] <> '' and Attributes['namespace'] <> '' and Attributes['metric'] <> ''`),
+        );
+      }
     });
 
     describe("Grafana", () => {

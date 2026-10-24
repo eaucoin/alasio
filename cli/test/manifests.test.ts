@@ -1684,7 +1684,7 @@ describe("telemetry", () => {
   test("scrapes each pod of every service of the stack, every minute, found in its namespace, so one that sleeps is not scraped", () => {
     const config = scraperConfig(install());
     const jobs: { job_name: string; scrape_interval: string }[] = config.receivers.prometheus.config.scrape_configs;
-    assert.deepEqual(jobs.map(({ job_name }) => job_name), ["compute", "lake-intake", "lake-loader", "lake-query", "log", "neon-control", "pageserver", "proxy", "safekeeper", "storage-broker", "storage-controller", "webhook", "seaweedfs", "juicefs"]);
+    assert.deepEqual(jobs.map(({ job_name }) => job_name), ["compute", "keda", "lake-intake", "lake-loader", "lake-query", "log", "neon-control", "pageserver", "proxy", "safekeeper", "storage-broker", "storage-controller", "webhook", "seaweedfs", "juicefs"]);
     assert.deepEqual(jobs.find(({ job_name }) => job_name === "safekeeper"), {
       job_name: "safekeeper",
       scrape_interval: "60s",
@@ -1707,6 +1707,14 @@ describe("telemetry", () => {
     // Without the lake, none of its parts; the log, which carries Telegram's updates too, still.
     const without: { job_name: string }[] = scraperConfig(install({ lake: { enabled: false }, telemetry: { otlpEndpoint: "https://otlp.example.com" } })).receivers.prometheus.config.scrape_configs;
     assert.deepEqual(without.filter(({ job_name }) => job_name.startsWith("lake") || job_name === "log").map(({ job_name }) => job_name), ["log"]);
+    // KEDA's operator, what each ScaledObject's triggers measure, at its metrics' port, and of its metrics that alone;
+    // every other job keeps all it scrapes. None where the KEDA is another's.
+    assert.equal(port("keda"), "$$1:8080");
+    const kept = (job: string) => (jobs.find(({ job_name }) => job_name === job) as { metric_relabel_configs?: unknown } | undefined)?.metric_relabel_configs;
+    assert.deepEqual(kept("keda"), [{ source_labels: ["__name__"], regex: "keda_scaler_metrics_value", action: "keep" }]);
+    assert.deepEqual(jobs.filter(({ job_name }) => job_name !== "keda" && kept(job_name) !== undefined).map(({ job_name }) => job_name), []);
+    const elsewhere: { job_name: string }[] = scraperConfig(install({ autoscaling: { keda: { enabled: false } } })).receivers.prometheus.config.scrape_configs;
+    assert.ok(!elsewhere.some(({ job_name }) => job_name === "keda"));
   });
 
   test("scrapes each node's mount of workspace storage, JuiceFS's client, on the port it serves its metrics on, and Valkey, with its password, when workspace storage is on", () => {

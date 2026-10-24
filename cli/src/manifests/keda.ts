@@ -83,6 +83,9 @@ const HEALTH_PROBES = {
   readinessProbe: { httpGet: { path: "/readyz", port: 8081 }, initialDelaySeconds: 20 },
 };
 
+/** Where the operator serves its metrics, what each ScaledObject's triggers measured among them (keda_scaler_metrics_value), as KEDA's default has it. */
+export const KEDA_OPERATOR_METRICS_PORT = 8080;
+
 /** The operator, which scales what ScaledObjects name, and makes the three's certificate. */
 function operator(config: InstallConfig): KubernetesObject[] {
   const { operator } = config.autoscaling.keda;
@@ -113,7 +116,7 @@ function operator(config: InstallConfig): KubernetesObject[] {
       // through a ClusterTriggerAuthentication.
       { name: "KEDA_RESTRICT_SECRET_ACCESS", value: "true" },
     ],
-    ports: [{ name: "http", containerPort: 8080 }, { name: "metricsservice", containerPort: 9666 }],
+    ports: [{ name: "http", containerPort: KEDA_OPERATOR_METRICS_PORT }, { name: "metricsservice", containerPort: 9666 }],
     ...HEALTH_PROBES,
     resources: operator.resources,
     volumeMounts: [certs.mount],
@@ -316,7 +319,7 @@ export function kedaObjects(config: InstallConfig): KubernetesObject[] {
   return [
     ...KEDA_CRDS,
     ...identity(),
-    service(OPERATOR, "keda-operator", [{ name: "metricsservice", port: 9666, targetPort: 9666 }, { name: "metrics", port: 8080, targetPort: 8080 }]),
+    service(OPERATOR, "keda-operator", [{ name: "metricsservice", port: 9666, targetPort: 9666 }, { name: "metrics", port: KEDA_OPERATOR_METRICS_PORT, targetPort: KEDA_OPERATOR_METRICS_PORT }]),
     service(METRICS_API_SERVER, "keda-metrics-apiserver", [{ name: "https", port: 443, targetPort: 6443 }, { name: "metrics", port: 8080, targetPort: 8080 }]),
     service(WEBHOOKS, "keda-admission-webhooks", [{ name: "https", port: 443, targetPort: 9443 }, { name: "metrics", port: 8080, targetPort: 8080 }]),
     ...registrations(),

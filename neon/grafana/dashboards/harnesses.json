@@ -1,7 +1,7 @@
 {
   "uid": "alasio-harnesses",
   "title": "Harnesses",
-  "description": "The conversations' harnesses as the sandbox gateway binds and releases them in their pools, from its metrics; and the turns alasio ran again as their harness instance was lost under them, and how long a turn took to its harness's first output, from alasio's. Main's, or a branch environment's, as Branch chooses.",
+  "description": "The conversations' harnesses as the sandbox gateway binds and releases them in their pools, from its metrics; the turns alasio ran again as their harness instance was lost under them, and how long a turn took to its harness's first output, from alasio's; and what scales alasio, what waits on its topics and its harnesses bound, as KEDA measures them, beside its starts. Main's, or a branch environment's, as Branch chooses.",
   "tags": [
     "alasio"
   ],
@@ -870,6 +870,251 @@
             "showPoints": "always",
             "stacking": {
               "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "alasio's scale",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Waiting on its topics",
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 8,
+        "h": 8
+      },
+      "description": "What waits on each of the environment's topics alasio reads, Telegram's updates, its events and, main's, its forks, as KEDA, which wakes alasio at the first and adds a replica for each 20 updates, measured it.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "1m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['metric'] as topic, max(Value) as value\nfrom otel.metrics_gauge where ServiceName = 'keda' and MetricName = 'keda_scaler_metrics_value' and Attributes['scaledObject'] = 'alasio' and Attributes['scaler'] = 'kafkaScaler' and Attributes['namespace'] = case when ${branch:sqlstring} = 'main' then 'alasio' else 'alasio-branch-' || ${branch:sqlstring} end and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "topic",
+              "text": "topic",
+              "type": "string"
+            },
+            {
+              "selector": "value",
+              "text": "value",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.topic}",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Harnesses bound",
+      "gridPos": {
+        "x": 8,
+        "y": 32,
+        "w": 8,
+        "h": 8
+      },
+      "description": "The environment's conversations' harnesses bound, as KEDA, which keeps alasio up while any is, measured it of the sandbox gateway's count.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "1m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, 'bound' as harnesses, max(Value) as value\nfrom otel.metrics_gauge where ServiceName = 'keda' and MetricName = 'keda_scaler_metrics_value' and Attributes['scaledObject'] = 'alasio' and Attributes['scaler'] = 'metricsAPIScaler' and Attributes['namespace'] = case when ${branch:sqlstring} = 'main' then 'alasio' else 'alasio-branch-' || ${branch:sqlstring} end and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "harnesses",
+              "text": "harnesses",
+              "type": "string"
+            },
+            {
+              "selector": "value",
+              "text": "value",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.harnesses}",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Starts",
+      "gridPos": {
+        "x": 16,
+        "y": 32,
+        "w": 8,
+        "h": 8
+      },
+      "description": "alasio's starts, each as it came up: woken from none by what waited, or started again.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, 'alasio' as started, sum(added) as starts\nfrom (\nselect TimeUnix, Attributes, Value - coalesce(lag(Value) over series, 0) as added\nfrom otel.metrics_sum where MetricName = 'alasio.starts' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "started",
+              "text": "started",
+              "type": "string"
+            },
+            {
+              "selector": "starts",
+              "text": "starts",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.started}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
             }
           }
         },
