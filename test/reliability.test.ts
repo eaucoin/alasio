@@ -468,6 +468,18 @@ test("a turn attached to again settles, as it ends, the job left of it, claimed 
   assert.equal((await run(store.getPromptJob(job.id)))?.state, "interrupted");
 });
 
+test("a turn ended as one not to be run again, as its pod ran out of its memory, has its job, never sent, ended with it, not run again as what its worker left is settled", async () => {
+  const store = await codexConversation();
+  const job = await run(store.enqueuePromptJob({ conversationId: CONVERSATION, chatId: "123", messageId: "4441", prompt: "Hold it all." }));
+  assert.equal((await run(store.claimNextPromptJob(CONVERSATION)))?.id, job.id);
+  await run(store.claimTurn({ conversationId: CONVERSATION, chatId: "123", messageId: "4441", sessionId: "session-1", harness: CODEX_HARNESS, prompt: "Hold it all." }));
+  const ended = await run(store.stageLostRecovery({ conversationId: CONVERSATION, epoch: null, binding: null, messageId: "lost:oom", prompt: () => "again", rerun: false, said: (outcome) => `said ${outcome}` }));
+  assert.equal(ended.outcome, "ended");
+  await run(store.recoverLeftPromptJobs(CONVERSATION));
+  assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null, "the ended turn's job was run again");
+  assert.equal((await run(store.getPromptJob(job.id)))?.state, "interrupted");
+});
+
 test("a turn whose harness instance was lost is run again once, as a prompt of its own; one whose response was complete is delivered instead; a recovery lost again is let go of", async () => {
   const store = await codexConversation();
   const original = await run(store.enqueuePromptJob({ conversationId: CONVERSATION, chatId: "123", messageId: "3334", prompt: "Apply the change." }));
@@ -513,6 +525,11 @@ test("a turn whose harness instance was lost is run again once, as a prompt of i
   const pending = await run(store.getPendingOutboxCount);
   assert.equal((await lost("lost:again", null)).outcome, "given-up");
   assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null);
+  // Its job, which its worker ran and its pod never sent, not put back to run either as what its worker left is settled,
+  // as attaching to its turn again settles it.
+  await run(store.recoverLeftPromptJobs(CONVERSATION));
+  assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null, "the given-up recovery's job was run again");
+  assert.equal((await run(store.getPromptJob(recovery?.id ?? "")))?.state, "interrupted");
   assert.deepEqual(said, ["staged", "given-up"]);
   assert.equal(await run(store.getPendingOutboxCount), pending + 1);
 

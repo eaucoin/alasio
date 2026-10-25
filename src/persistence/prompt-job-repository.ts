@@ -174,6 +174,20 @@ export class NeonPromptJobRepository {
     ).pipe(Effect.map((rows) => rows.length > 0));
   }
 
+  /**
+   * Settles as interrupted the conversation's job of `messageId` where it runs still, as of a turn
+   * not to be run again (a recovery itself lost, given up; one ended, as its pod ran out of its
+   * memory), in the transaction that ends that turn: so no settling of what its worker left
+   * (recoverLeft, recoverLeftOf) puts it back to run as one whose prompt was never sent.
+   */
+  endRunning(conversationId: string, messageId: string): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `update ${this.#schema}.prompt_jobs set state = 'interrupted', completed_at = coalesce(completed_at, now())
+       where conversation_id = $1 and message_id = $2 and state = 'running'`,
+      [conversationId, messageId],
+    ));
+  }
+
   markUpstreamStarted(id: string, sessionId: string | null | undefined, turnId: string | null | undefined): Effect.Effect<void, StoreError> {
     return Effect.asVoid(this.#sql.query(
       `update ${this.#schema}.prompt_jobs set upstream_session_id = $2, upstream_turn_id = $3, upstream_started_at = now()

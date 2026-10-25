@@ -181,7 +181,8 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
  * says: the turn ended first, so of what let go of it the first alone acts, and its response's
  * row locked, so no write of its pod's completes it meanwhile; a response complete already
  * delivered rather than run again; a job whose prompt was never sent run again as itself; and a
- * recovery itself lost let go of; the chat told of each but a reply delivered, in the same
+ * recovery itself lost let go of, and a turn not to be run again ended, the job of either
+ * ended, so nothing runs it again; the chat told of each but a reply delivered, in the same
  * transaction, so once.
  */
 const stageLostOn = (on: ReturnType<typeof repositories>, { conversationId, epoch, binding, messageId, prompt, rerun = true, said }: LostRecovery): Effect.Effect<LostRecoveryOutcome, StoreError> =>
@@ -194,6 +195,8 @@ const stageLostOn = (on: ReturnType<typeof repositories>, { conversationId, epoc
     const requeued = !completed && rerun && !turn.thread_ts.startsWith(LOST_PREFIX) && (yield* on.promptJobs.requeueUnsent(conversationId, turn.thread_ts));
     const outcome = completed ? "completed" : !rerun ? "ended" : requeued ? "requeued" : turn.thread_ts.startsWith(LOST_PREFIX) ? "given-up" : "staged";
     if (!completed && turn.pending_response_id !== null) yield* on.responses.markPendingAsPosted(turn.pending_response_id);
+    // Not run again, its job is not either, as one whose prompt was never sent would be once its worker's are settled.
+    if (outcome === "given-up" || outcome === "ended") yield* on.promptJobs.endRunning(conversationId, turn.thread_ts);
     if (outcome === "staged") yield* on.promptJobs.enqueue({ conversationId, chatId: turn.channel, messageId, prompt: prompt(turn), priority: 1, harness: turn.harness });
     // Said on its status message; where it has none, as a message of its own, but of a reply it completed, which says it.
     if (turn.status_outbox_id !== null) yield* on.outbox.enqueueEdit(turn.status_outbox_id, { chatId: turn.channel, text: said(outcome, turn) });
