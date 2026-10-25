@@ -404,9 +404,9 @@ export const makeSessions = Effect.fnUntraced(function*(
           yield* Effect.logWarning(`${key}'s ${why} ${pod.metadata?.name}, which serves its binding no more: it is released into the snapshot taken of it live, if any`);
           yield* Effect.forkDetach(releaseFor(pool, key, pod, killed ? "oom" : "broken", () =>
             Effect.andThen(
-              // Of one killed for its memory, the limit kept with it, for its restore to tell its bayma.
-              Effect.flatMap(snapshots.liveSnapshotOf(pool, workspace), (into) =>
-                agents.setReleased({ environment: pool.namespace, workspace }, into === null || memoryLimit === null ? into : { ...into, memoryLimit })),
+              // Of one killed for its memory, the limit kept with it, for its restore to tell its bayma; of one saved by a release
+              // whose pod's end failed after, that snapshot kept.
+              snapshots.releasedUnsaved(pool, workspace, pod.metadata?.name ?? "", memoryLimit),
               endAndDetachUnsaved(pool, pod),
             )));
           continue;
@@ -420,11 +420,15 @@ export const makeSessions = Effect.fnUntraced(function*(
     for (const [namespace, bound] of boundIn) yield* snapshots.forgetLive(namespace, bound);
   });
 
-  /** Records what the binding `lease` of `pool`, whose pod went while it was bound, is released into: the snapshot taken of it live, if any. Run while its Lease holds still. */
+  /**
+   * Records what the binding `lease` of `pool`, whose pod went while it was bound, is released into: the snapshot a release's
+   * save took of its pod, where one did before the pod went, else the snapshot taken of it live, if any. Run while its Lease
+   * holds still.
+   */
   const recordLost = (pool: Pool, lease: BindingLease): Effect.Effect<void> => {
     const workspace = volumeIdOfKey(lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "");
     if (!workspace) return Effect.void;
-    return Effect.flatMap(snapshots.liveSnapshotOf(pool, workspace), (into) => agents.setReleased({ environment: pool.namespace, workspace }, into)).pipe(
+    return snapshots.releasedUnsaved(pool, workspace, lease.spec?.holderIdentity ?? "").pipe(
       Effect.catch((error) => Effect.logWarning(`could not record what ${pool.namespace}/${workspace}, whose pod went, is released into: ${error.message}`)),
     );
   };

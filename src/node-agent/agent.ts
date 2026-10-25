@@ -1018,21 +1018,28 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     const moved = "as the workspace has moved on since it was taken";
     const taken = take(request).pipe(Effect.tapError((error) => Effect.sync(() => checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": error._tag }))));
     const committed = request.live === undefined
-      ? taken.pipe(
-        Effect.catch((error) =>
-          forgetNow(request).pipe(
-            Effect.matchEffect({
-              onSuccess: () => Effect.fail(failed(error, `${error.message}; its snapshot is forgotten, ${moved}`)),
-              onFailure: (forgetting) => Effect.fail(failed(error, `${error.message}; forgetting its snapshot, ${moved}, failed too: ${forgetting.message}`)),
-            }),
-          )
-        ),
-        Effect.onInterrupt(() => forgetNow(request).pipe(Effect.ignore)),
-        // The sandbox it saved ended, and its restore's reads of the bucket with it.
-        Effect.ensuring(Effect.sync(() => {
-          bases.delete(request.containerId);
-          storeProxy.revoke(prefixOf(request));
-        })),
+      // Of a container not there, or another pod's, nothing is saved, nor ended, by this checkpoint, so what was saved of
+      // the workspace before is kept: as a release asked again once its sandbox has ended, its last checkpoint the one that
+      // ended it, finds.
+      ? ofPod(request.containerId, request.namespace, request.pod).pipe(
+        Effect.tapError((error) => Effect.sync(() => checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": error._tag }))),
+        Effect.mapError((error) => failed(error, `${error.message}; its snapshot is kept, as no sandbox of the container was reached`)),
+        Effect.andThen(taken.pipe(
+          Effect.catch((error) =>
+            forgetNow(request).pipe(
+              Effect.matchEffect({
+                onSuccess: () => Effect.fail(failed(error, `${error.message}; its snapshot is forgotten, ${moved}`)),
+                onFailure: (forgetting) => Effect.fail(failed(error, `${error.message}; forgetting its snapshot, ${moved}, failed too: ${forgetting.message}`)),
+              }),
+            )
+          ),
+          Effect.onInterrupt(() => forgetNow(request).pipe(Effect.ignore)),
+          // The sandbox it saved ended, and its restore's reads of the bucket with it.
+          Effect.ensuring(Effect.sync(() => {
+            bases.delete(request.containerId);
+            storeProxy.revoke(prefixOf(request));
+          })),
+        )),
       )
       : taken.pipe(
         // The sandbox runs on from the image it was saved to, which its next checkpoint saves what

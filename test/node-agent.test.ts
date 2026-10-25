@@ -811,6 +811,24 @@ test("a snapshot is committed only once each image it refers to is in the bucket
     })
   ));
 
+test("a checkpoint of a container no sandbox runs, as one whose release is asked again once the checkpoint before it ended its sandbox, keeps the workspace's snapshot, restorable, and says so", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const taken = yield* here.agent.checkpoint(request("fs-abc"));
+      const kept = keysOf(s3, "main/fs-abc/");
+      // Its container gone with its sandbox, which runsc finds no state of.
+      const gone = "d".repeat(64);
+      assert.match(
+        failure(yield* Effect.exit(here.agent.checkpoint(request("fs-abc", gone)))),
+        /^checkpointing main\/fs-abc failed: .*container does not exist.*; its snapshot is kept, as no sandbox of the container was reached$/u,
+      );
+      assert.deepEqual(keysOf(s3, "main/fs-abc/"), kept);
+      assert.deepEqual(yield* here.agent.current({ environment: "main", workspace: "fs-abc" }), taken);
+      assert.equal(cachesAny(here, "fs-abc"), true);
+    })
+  ));
+
 test("a checkpoint that fails forgets the workspace's snapshot, which the workspace has moved on from, and says so", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {

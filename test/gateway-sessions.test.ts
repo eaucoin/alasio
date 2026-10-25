@@ -6,13 +6,13 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { before, test } from "node:test";
 
-import type { V1Deployment, V1Pod, V1PodSpec, V1PodTemplateSpec } from "@kubernetes/client-node";
+import { CoreV1Api, KubeConfig, type V1Deployment, type V1Pod, type V1PodSpec, type V1PodTemplateSpec } from "@kubernetes/client-node";
 import { Effect, Layer } from "effect";
 import { TestClock } from "effect/testing";
 
 import { added, collected } from "./support/metrics.ts";
 import { Binder } from "../src/binder/binder.ts";
-import { markReleasing, readLease, releaseLease, takeLease, touchLease } from "../src/binder/bindings.ts";
+import { markReleasing, readLease, reconcile, releaseLease, takeLease, touchLease } from "../src/binder/bindings.ts";
 import { freeLabels, leaseName, type Pool } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
 import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
@@ -33,6 +33,13 @@ import { startKubeApiServer } from "./support/kube-apiserver.ts";
 const bindingKey = randomBytes(32);
 
 const withKube = <A, E>(use: (kube: KubeClient["Service"]) => Effect.Effect<A, E>): Effect.Effect<A, E, KubeClient> => Effect.flatMap(KubeClient, use);
+/** The core API of the test's API server, as its kubeconfig reaches it, for what KubeClient does not ask: a pod deleted with no grace. */
+const core = () => {
+  const config = new KubeConfig();
+  config.loadFromDefault();
+  return config.makeApiClient(CoreV1Api);
+};
+
 const run = <A, E>(effect: Effect.Effect<A, E, KubeClient>): Promise<A> => Effect.runPromise(Effect.provide(effect, Layer.fresh(KubeClient.layer)));
 
 before(async () => {
@@ -313,6 +320,148 @@ test("a bound gVisor pod idle for its wait is saved whole by its node's agent fi
   } finally {
     stand.close();
   }
+});
+
+test("a release asked again after its save took its snapshot, as one whose detach failed is, is released into that snapshot, never saved anew: the snapshot kept, and recorded, for its next bind to restore", async () => {
+  const env = await environment(1, { gvisor: true });
+  const stand = await bayma();
+  const recorded = agents();
+  // The record its node's agents keep, as they keep it; a save of a sandbox ended finds none to save, as runsc finds no
+  // container; and a detach refused once, as one is while its sandbox is seen running still.
+  const records = new Map<string, Released | null>();
+  let detaches = 0;
+  const once: NodeAgents = {
+    ...recording(recorded, records),
+    checkpoint: (node, request) =>
+      recorded.saved.length === 0
+        ? recorded.agents.checkpoint(node, request)
+        : Effect.andThen(Effect.sync(() => void recorded.asked.push(`checkpoint ${node} ${request.pod}`)), Effect.fail(new NodeAgentError({ node, call: "snapshot", status: 500, reason: "runsc state failed: loading container: file does not exist" }))),
+    detach: (node, namespace, pod, containerIds) =>
+      (detaches += 1) === 1
+        ? Effect.fail(new NodeAgentError({ node, call: "detach", status: 409, reason: `${pod}'s sandbox still runs` }))
+        : recorded.agents.detach(node, namespace, pod, containerIds),
+  };
+  try {
+    const { binder, sessions } = await sessionsOf({ ...options(env, stand.port), releaseAfterMs: 0 }, once);
+    const key = sessionKey("fs-again");
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+    stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 600_000 };
+    // Its first release saved, its bayma ended with the save, then failed at its detach, its binding kept.
+    assert.deepEqual(await Effect.runPromise(sessions.sweep), []);
+    assert.notEqual(await run(readLease(env.none, key)), null);
+    const ended = (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, bound.pod)))) as V1Pod | null;
+    assert.ok(ended?.status?.containerStatuses?.find(({ name }) => name === "bayma")?.state?.terminated, "its bayma did not end with its save");
+    // Asked again, as its pod ends: released into the snapshot its first took, not saved again.
+    for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) {
+      assert.ok(Date.now() < deadline, `its binding was not let go: ${recorded.asked.join(", ")}`);
+      await Effect.runPromise(Effect.provide(Effect.all([sessions.sweep, sessions.drain]), Layer.fresh(KubeClient.layer)));
+    }
+    assert.deepEqual(recorded.asked.filter((asked) => asked.startsWith("checkpoint")), [`checkpoint node-a ${bound.pod}`]);
+    assert.deepEqual(records.get(`${env.namespace}/fs-again`), { snapshot: "s-1", release: undefined, pod: bound.pod });
+  } finally {
+    stand.close();
+  }
+});
+
+/** The agents of `recorded`, keeping the record of each workspace's release as node agents keep it, in `records`, by `<namespace>/<workspace>`. */
+const recording = (recorded: ReturnType<typeof agents>, records: Map<string, Released | null>): NodeAgents => ({
+  ...recorded.agents,
+  released: (ref) => Effect.sync(() => records.get(`${ref.environment}/${ref.workspace}`) ?? null),
+  setReleased: (ref, into) => Effect.andThen(recorded.agents.setReleased(ref, into), Effect.sync(() => void records.set(`${ref.environment}/${ref.workspace}`, into))),
+});
+
+test("a binding whose pod a release saved went before the release was through, as one whose detach failed and whose pod then went is, is let go as lost released into that snapshot, not the one taken live, nor none", async () => {
+  const env = await environment(1, { gvisor: true });
+  const stand = await bayma();
+  const recorded = agents();
+  const records = new Map<string, Released | null>();
+  // Its detach refused, as one is while its sandbox is seen running still.
+  const refusing: NodeAgents = { ...recording(recorded, records), detach: (node, _namespace, pod) => Effect.fail(new NodeAgentError({ node, call: "detach", status: 409, reason: `${pod}'s sandbox still runs` })) };
+  try {
+    const { binder, sessions } = await sessionsOf({ ...options(env, stand.port), releaseAfterMs: 0 }, refusing);
+    const key = sessionKey("fs-gone-saved");
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+    stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 600_000 };
+    assert.deepEqual(await Effect.runPromise(sessions.sweep), []);
+    assert.deepEqual(records.get(`${env.namespace}/fs-gone-saved`), { snapshot: "s-1", release: undefined, pod: bound.pod });
+    // Its pod gone for good, as kubelet ends it, before the release was asked again: its binding let go as lost.
+    await core().deleteNamespacedPod({ name: bound.pod, namespace: env.namespace, gracePeriodSeconds: 0 });
+    const set = await run(reconcile(env.none, (lease) => sessions.lost(env.none, lease), (lease) => sessions.recordLost(env.none, lease)));
+    assert.equal(set.leases.length, 1);
+    assert.deepEqual(records.get(`${env.namespace}/fs-gone-saved`), { snapshot: "s-1", release: undefined, pod: bound.pod });
+  } finally {
+    stand.close();
+  }
+});
+
+test("a bound pod a release saved, whose bayma ended with the save, its pod's end failing after, is released as broken into that snapshot, not the one taken live, nor none", async () => {
+  const env = await environment(1, { gvisor: true });
+  const recorded = agents();
+  const records = new Map<string, Released | null>();
+  // A snapshot taken live once it is bound, which a pod gone unsaved is released into.
+  let saved = false;
+  const live: NodeAgents = { ...recording(recorded, records), current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/home/agent/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null) };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), live);
+  const key = sessionKey("fs-saved-broken");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  saved = true;
+  // Saved by a release, its bayma ended with the save, its pod running on as its deletion failed.
+  records.set(`${env.namespace}/fs-saved-broken`, { snapshot: "s-1", release: "r1", pod: bound.pod });
+  await run(withKube((kube) => kube.patchPodStatus(env.namespace, bound.pod, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated: { exitCode: 0 } } }] } })));
+  await Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
+  for (const deadline = Date.now() + 10_000; !recorded.asked.some((asked) => asked.startsWith("detach")); await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, recorded.asked.join(", "));
+  assert.deepEqual(records.get(`${env.namespace}/fs-saved-broken`), { snapshot: "s-1", release: "r1", pod: bound.pod });
+  assert.ok(!recorded.asked.some((asked) => asked.startsWith("record")), recorded.asked.join(", "));
+});
+
+test("a record of a workspace's release that cannot be read is written over by a save alone: its pod's end recorded where it saved, not where it saved nothing, and its binding let go as lost, or its pod released as broken, leaving it as it is", async () => {
+  // Unreadable once each workspace is bound, as a bind reads it first.
+  const unread = { now: false };
+  const unreadable = (agentsOf: NodeAgents): NodeAgents => ({
+    ...agentsOf,
+    released: (ref) =>
+      unread.now ? Effect.fail(new NodeAgentError({ node: "node-a", call: "read the release", status: 503, reason: "workspace storage is not mounted on this node now" })) : agentsOf.released(ref),
+  });
+  // Its pod's end, deleted as a drain deletes it: recorded where its save took a snapshot, and not where it took none.
+  for (const [checkpoint, asked] of [["saves", "record"], ["fails, ending it", null]] as const) {
+    const env = await environment(1, { gvisor: true, holdsStop: true });
+    const recorded = agents(checkpoint);
+    const { binder, sessions } = await sessionsOf(options(env, 7290), unreadable(recorded.agents));
+    const key = sessionKey("fs-unread");
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    unread.now = false;
+    const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+    unread.now = true;
+    await run(withKube((kube) => kube.remove("v1", "Pod", env.namespace, bound.pod)));
+    assert.deepEqual(await Effect.runPromise(Effect.provide(sessions.drain, Layer.fresh(KubeClient.layer))), [key]);
+    for (const deadline = Date.now() + 15_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) {
+      assert.ok(Date.now() < deadline, `its binding was not let go: ${recorded.asked.join(", ")}`);
+    }
+    assert.deepEqual(
+      recorded.asked.filter((each) => each.startsWith("record")),
+      asked === null ? [] : [`record ${env.namespace}/fs-unread released into s-1`],
+      checkpoint,
+    );
+  }
+  // Its binding let go as lost, its pod gone; and its pod released as broken, its bayma ended: neither writes it.
+  const env = await environment(1, { gvisor: true });
+  const recorded = agents();
+  const { binder, sessions } = await sessionsOf(options(env, 7290), unreadable(recorded.agents));
+  const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-gone", namespace: env.namespace, annotations: { "alasio.dev/binding-key": sessionKey("fs-unread-lost") } }, spec: { holderIdentity: "none-9" } };
+  unread.now = true;
+  await Effect.runPromise(sessions.recordLost(env.none, lease));
+  const key = sessionKey("fs-unread-broken");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  unread.now = false;
+  const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  unread.now = true;
+  await run(withKube((kube) => kube.patchPodStatus(env.namespace, bound.pod, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated: { exitCode: 0 } } }] } })));
+  await Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
+  for (const deadline = Date.now() + 15_000; !recorded.asked.some((each) => each.startsWith("detach")); await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, recorded.asked.join(", "));
+  assert.deepEqual(recorded.asked.filter((each) => each.startsWith("record")), []);
 });
 
 test("a release whose save fails leaving the sandbox running keeps the binding, and one whose save fails ending it goes on, as bayma's checkpoints keep what ran", async () => {
