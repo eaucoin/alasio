@@ -4777,6 +4777,25 @@ if (inShard("wake")) {
       t.diagnostic(`# answered in ${sorted.map((ms) => (ms / 1000).toFixed(1)).join(", ")} s; p50 ${((sorted[Math.floor(sorted.length / 2)] ?? 0) / 1000).toFixed(1)} s, p100 ${((sorted.at(-1) ?? 0) / 1000).toFixed(1)} s`);
       assert.ok(sorted.every((ms) => ms < ANSWER_WITHIN_MS), `answered in ${sorted.map((ms) => (ms / 1000).toFixed(1)).join(", ")} s, past ${ANSWER_WITHIN_MS / 1000} s`);
     });
+
+    test("logs and status say alasio is asleep while it is, since when and what wakes it, and logs prints what the lake keeps of its last run", { timeout: 20 * 60_000 }, async () => {
+      const asleep = /^alasio runs no pod: asleep at no replica( since \S+)?, as KEDA lets it while nothing waits for it, woken by what waits on telegram\.main, /mu;
+      // Its last run's, which it logged to the lake as it ran: the gate's last press, answered. Asked again until the lake has
+      // loaded them, which it does a while after they are sent, and of alasio asleep again where something woke it meanwhile.
+      const lastRun = /^Its logs of its last run, since it started at \S+, as the lake keeps them:$/mu;
+      const statusAsleep = /^ {2}Deployment alasio\/alasio: asleep at no replica/mu;
+      // Its pods all gone, those stopping among them, whose logs `logs` prints while they are there.
+      const podsLeft = async () => (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("alasio")) })).length;
+      let [logged, status] = ["", ""];
+      await until("alasio asleep, and its last run's logs in the lake", async () => {
+        if ((await alasioDeployment())?.spec?.replicas !== 0 || (await podsLeft()) > 0) return undefined;
+        [logged, status] = [await alasioOk("logs"), await alasioOk("status")];
+        return asleep.test(logged) && lastRun.test(logged) && statusAsleep.test(status) ? true : undefined;
+      }, 15 * 60_000).catch((error: unknown) => assert.fail(`${error instanceof Error ? error.message : String(error)}, logs last saying:\n${logged}\nand status:\n${status}`));
+      assert.match(logged, asleep);
+      assert.match(logged, lastRun);
+      assert.match(status, statusAsleep);
+    });
   });
 }
 

@@ -1176,6 +1176,81 @@ test("logs prints a component's log, each line with its pod's name when it has s
   assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has alasio, codex-login, collector, collector-scraper, grafana, harness-claude, harness-codex, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake-intake, lake-loader, lake-query, log, /u);
 });
 
+/** alasio as KEDA lets it sleep: its Deployment at no replica, its pod gone, scaled by its ScaledObject, which KEDA last scaled to none at `slept`. */
+function asleep(kube: Rig["kube"], slept?: string): void {
+  const deployment = kube.get(DEPLOYMENT);
+  assert.ok(deployment);
+  deployment["spec"] = { ...(deployment["spec"] as object), replicas: 0 };
+  kube.drop("/api/v1/namespaces/alasio/pods/alasio-0");
+  kube.put("scaledobjects", {
+    apiVersion: "keda.sh/v1alpha1",
+    kind: "ScaledObject",
+    metadata: { name: "alasio", namespace: "alasio", labels: { "alasio.dev/installation": "alasio" } },
+    spec: {
+      scaleTargetRef: { name: "alasio" },
+      minReplicaCount: 0,
+      maxReplicaCount: 3,
+      triggers: [
+        { type: "kafka", metadata: { topic: "telegram.main", consumerGroup: "alasio.main", lagThreshold: "20" } },
+        { type: "kafka", metadata: { topic: "events.main", consumerGroup: "alasio-events.main", lagThreshold: "1" } },
+        { type: "metrics-api", metadata: { url: "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio", valueLocation: "bound", targetValue: "1000000" } },
+      ],
+    },
+    status: { conditions: [{ type: "Ready", status: "True" }] },
+  });
+  if (slept) {
+    kube.put("events", {
+      apiVersion: "v1",
+      kind: "Event",
+      metadata: { name: "alasio.slept", namespace: "alasio" },
+      involvedObject: { kind: "ScaledObject", name: "alasio", namespace: "alasio" },
+      reason: "KEDAScaleTargetDeactivated",
+      message: "Deactivated apps/v1.Deployment alasio/alasio from 1 to 0",
+      lastTimestamp: slept,
+    });
+  }
+}
+
+test("logs of alasio asleep says so, since when and what wakes it, and prints what the lake keeps of its last run's logs, since it last started; or that it keeps none, or why it was not read", async (t) => {
+  const { alasio, kube } = await installed(t);
+  asleep(kube, "2026-10-25T10:05:00Z");
+  const started = kube.get("/api/v1/namespaces/alasio/configmaps/alasio-started");
+  assert.ok(started);
+  started["data"] = { startedAt: "2026-10-25T10:00:00.000Z" };
+  // The lake's query answers its newest first, as asked.
+  kube.onExec = () => ({ exitCode: 0, stdout: `${JSON.stringify({ Timestamp: "2026-10-25 10:01:00", Body: "handled" })}\n${JSON.stringify({ Timestamp: "2026-10-25 10:00:01", Body: "started" })}\n` });
+  const run = await alasio(["logs"]);
+  succeeded(run);
+  assert.deepEqual(run.printed, [
+    "alasio runs no pod: asleep at no replica since 2026-10-25T10:05:00.000Z, as KEDA lets it while nothing waits for it, woken by what waits on telegram.main, what waits on events.main or a harness bound.",
+    "Its logs of its last run, since it started at 2026-10-25T10:00:00.000Z, as the lake keeps them:",
+    "2026-10-25 10:00:01 started",
+    "2026-10-25 10:01:00 handled",
+  ]);
+  const [, , , , sql = ""] = kube.execs.at(-1)?.command ?? [];
+  assert.equal(kube.execs.at(-1)?.container, "query");
+  assert.match(sql, /^SELECT Timestamp, Body FROM otel\.logs WHERE ServiceName = 'alasio' AND coalesce\(ResourceAttributes\['alasio\.branch'\], ''\) = '' AND Timestamp >= TIMESTAMP '2026-10-25 10:00:00\.000' ORDER BY Timestamp DESC LIMIT 1000$/u);
+  // None kept.
+  kube.onExec = () => ({ exitCode: 0, stdout: "" });
+  assert.equal((await alasio(["logs"])).printed.at(-1), "The lake keeps none of its logs of its last run, since it started at 2026-10-25T10:00:00.000Z.");
+  // Not read.
+  kube.onExec = () => ({ exitCode: 1, stderr: "the lake is not reached\n" });
+  assert.equal((await alasio(["logs"])).printed.at(-1), "Its last run's logs, which the lake keeps, were not read: the lake's query failed: the lake is not reached.");
+});
+
+test("status says of alasio asleep since when, and what wakes it, ready while KEDA would wake it, and not where its ScaledObject is paused", async (t) => {
+  const { alasio, kube } = await installed(t);
+  asleep(kube, "2026-10-25T10:05:00Z");
+  const run = await alasio(["status"]);
+  succeeded(run);
+  assert.ok(run.printed.includes("  Deployment alasio/alasio: asleep at no replica since 2026-10-25T10:05:00.000Z, as KEDA lets it while nothing waits for it, woken by what waits on telegram.main, what waits on events.main or a harness bound"), run.printed.join("\n"));
+  const scaler = kube.get("/apis/keda.sh/v1alpha1/namespaces/alasio/scaledobjects/alasio");
+  assert.ok(scaler);
+  scaler.metadata = { ...scaler.metadata, annotations: { "autoscaling.keda.sh/paused": "true" } };
+  const paused = await alasio(["status"]);
+  assert.ok(paused.printed.includes("  Deployment alasio/alasio: at no replica, its ScaledObject paused, which wakes it no more"), paused.printed.join("\n"));
+});
+
 test("restart rolls alasio's pods out again as a manager of its own, waits until they run, and says what it restarted", async (t) => {
   const { alasio, kube } = await installed(t);
   const run = await alasio(["restart"]);

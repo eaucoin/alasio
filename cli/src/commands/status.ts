@@ -28,7 +28,7 @@ import { type ComputeTimes, computeTimes, type TenantView, tenantView } from "..
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
 import { branchNamespaces } from "../branches.ts";
 import { describeHarnesses, harnessesOf } from "../bound-harnesses.ts";
-import { describeWakes, wakesOf } from "../wakes.ts";
+import { describeAsleep, describeWakes, wakesOf } from "../wakes.ts";
 import { describeFolders, folderInstances } from "../folders.ts";
 import { installConfig } from "../install.ts";
 import { readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "../secrets.ts";
@@ -401,10 +401,15 @@ export const status = Command.make("status", {}, () =>
           const scaler = of(scaledObjects, workload, ({ spec }) => spec.scaleTargetRef.name);
           const scale = workload.kind === "DaemonSet" ? "" : `${describeScale(workload, scaler)}; `;
           // Of an environment's alasio KEDA scales, what scales it: its triggers now, and when it was last woken.
-          const wakes = workload.kind === "Deployment" && workload.metadata?.name === RELEASE && scaler ? describeWakes(yield* wakesOf(scaler)) : [];
+          const alasioWakes = workload.kind === "Deployment" && workload.metadata?.name === RELEASE && scaler ? yield* wakesOf(scaler) : null;
+          const wakes = alasioWakes ? describeWakes(alasioWakes) : [];
           const sizing = [`    ${scale}${describeSizing(workload, of(sizings, workload, ({ spec }) => spec.targetRef.name))}`, ...wakes.map((line) => `    ${line}`)];
           if (state._tag === "Ready") {
-            const { said, ready } = describeReady(workload, computes, scaler, pools);
+            // An environment's alasio KEDA lets sleep: since when, and what wakes it, where KEDA would; not ready where it would not.
+            const asleep = alasioWakes && scaler && workload.spec?.replicas === 0
+              ? unwakeable(scaler) === null ? { said: describeAsleep(scaler, alasioWakes), ready: true } : { said: `at no replica, ${unwakeable(scaler)}`, ready: false }
+              : null;
+            const { said, ready } = asleep ?? describeReady(workload, computes, scaler, pools);
             if (!ready) notReady += 1;
             yield* Console.log(`  ${describeRef(refOf(workload))}: ${said}`);
             for (const line of sizing) yield* Console.log(line);
