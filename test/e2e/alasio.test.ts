@@ -36,7 +36,7 @@ import { HOST_BAYMA_IMAGE, TELEGRAM_PARTITIONS } from "../../cli/src/manifests/c
 import { environmentAccess, environmentName, telegramTopic } from "../../cli/src/manifests/log.ts";
 import { WEBHOOK, WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { neonStack } from "../../neon/test/stack.ts";
-import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
+import { BINDING_LABEL, FREE_LABEL, keyHash, POOL_LABEL } from "../../src/binder/names.ts";
 import { SESSION_FS_ENVIRONMENTS_TOML } from "../../src/codex/sessionfs.ts";
 import { SESSION_FS_CLAUDE_TOOLS } from "../../src/harness/claude/sessionfs.ts";
 import { GATEWAY_RESTART_MS } from "../../src/sandbox/gateway-passing.ts";
@@ -1315,15 +1315,19 @@ if (inShard("sessions")) {
     });
 
     // After the tests that reach the stand-ins through port forwards, as the pods it ends take them; the webhook's tests forward anew.
-    test("mounts the layers of pods pulled lazily again once stargz-snapshotter's FUSE manager is killed and its daemon restarts, a manager started anew", { skip: (TARGET !== "host" || !ESTARGZ) && "the daemon is a service of the machine's where k3s is, its pods pulled lazily" }, async () => {
+    test("starts again each container that ran on the layers of stargz-snapshotter's FUSE manager once it is killed and its daemon restarts a manager anew, none left on them: a session's bayma, and a free pod of its pool, replaced, so the next bind to the pool is served first time", { skip: (TARGET !== "host" || !ESTARGZ) && "the daemon is a service of the machine's where k3s is, its pods pulled lazily" }, async () => {
       const managers = async () =>
         (await onNode("", 'for exe in /proc/[0-9]*/exe; do [ "$(readlink "$exe")" = /usr/local/bin/stargz-fuse-manager ] && { pid=${exe%/exe}; echo "${pid#/proc/}"; }; done; true')).trim();
-      // Running through the kill, on layers it served: a session's bayma, under gVisor, and the node's workspace mount.
+      // Running through the kill, on layers it served: a session's bayma, under gVisor, and a free pod of its pool, which nothing reads.
       const session = await newSession("none");
       const sessionName = (await sessionPod(session)).metadata?.name ?? "";
-      const [mount] = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("workspace-mount")) });
-      const ranThrough: [string, string][] = [[SESSIONS, sessionName], [NAMESPACE, mount?.metadata?.name ?? ""]];
-      // A pod gone counts as started again: a session's, its bayma ended, is released as broken and bound anew.
+      const pool = (await sessionPod(session)).metadata?.labels?.[POOL_LABEL] ?? "";
+      const freeOfPool = async () =>
+        (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${FREE_LABEL}=true,${POOL_LABEL}=${pool}` })).filter(({ metadata, status }) => status?.phase === "Running" && metadata?.deletionTimestamp === undefined);
+      const free = (await freeOfPool())[0];
+      assert.ok(free?.metadata?.name, `the session's pool ${pool} has no free pod running`);
+      const ranThrough: [string, string][] = [[SESSIONS, sessionName], [SESSIONS, free.metadata.name]];
+      // A pod gone counts as started again: a session's, its bayma ended, is released as broken and bound anew; a free one is replaced.
       const restarts = () =>
         Promise.all(ranThrough.map(async ([namespace, name]) => {
           const pod = await kube.get<V1Pod>(ref("Pod", name, namespace));
@@ -1331,6 +1335,7 @@ if (inShard("sessions")) {
         }));
       const restartsBefore = await restarts();
       assert.deepEqual(await Promise.all(ranThrough.map(([namespace, name]) => onRemoteSnapshot(namespace, name))), [true, true]);
+      assert.deepEqual(await staleOnNode(""), [], "a container ran on dead layers before the kill");
       const killed = await managers();
       assert.match(killed, /^\d+$/u, "one FUSE manager runs");
       await onNode("", `kill -KILL ${killed} && systemctl restart stargz-snapshotter`);
@@ -1343,6 +1348,20 @@ if (inShard("sessions")) {
         const now = await restarts();
         return now.every((count, at) => count > (restartsBefore[at] ?? 0)) ? true : undefined;
       }, 300_000);
+      // None left on the layers of the manager killed, idle or not.
+      await until("no container left on the layers of the manager killed", async () => ((await staleOnNode("")).length === 0 ? true : undefined), 120_000);
+      // Each free pod of the pool started again in place, which no bind can be served by, replaced, as its gateway sets its pool right.
+      await until("every free pod of the pool never started again", async () => {
+        const now = await freeOfPool();
+        return now.length > 0 && now.every(({ status }) => !status?.containerStatuses?.some(({ restartCount, state }) => restartCount > 0 || state?.terminated)) ? true : undefined;
+      }, 300_000);
+      // The next bind to the pool is served first time: by a pod that never started again, which it stays bound to, its session reached.
+      const next = await newSession("none");
+      const bound = await sessionPod(next);
+      assert.deepEqual(bound.status?.containerStatuses?.filter(({ restartCount }) => restartCount > 0).map(({ name }) => name), [], `${bound.metadata?.name} was started again before it was bound`);
+      const ranNext = () => inSession(next, 'console.log(require("node:fs").readdirSync("/usr/lib").length > 0)').then((said) => said.trim(), () => undefined);
+      assert.equal(await until("the next session's bayma reached", async () => await ranNext(), 300_000), "true");
+      assert.equal((await sessionPod(next)).metadata?.uid, bound.metadata?.uid, "the next session was bound anew");
       const read = () => inSession(session, 'console.log(require("node:fs").readdirSync("/usr/lib").length > 0)').then((said) => said.trim(), () => undefined);
       assert.equal(await until("the session's bayma reached again", async () => await read(), 300_000), "true");
       await kube.awaitReady([ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE)], "5 minutes");
@@ -3146,6 +3165,26 @@ async function asAccountIn(run: (command: readonly string[], stdin?: string) => 
     contentType,
   ], JSON.stringify(body));
   return Number(said);
+}
+
+/**
+ * The containers of the node `node` whose rootfs lies on layers no FUSE manager serves: of each
+ * overlay that is a container's rootfs over stargz-snapshotter's snapshots, a name never asked of
+ * before looked up in it, which its overlay answers its connection is gone of.
+ */
+async function staleOnNode(node: string): Promise<string[]> {
+  const found = (await onNode(node, "cat /proc/self/mountinfo")).split("\n").flatMap((line) => {
+    const [before = "", after = ""] = line.split(" - ");
+    const [type = "", , options = ""] = after.split(" ");
+    const at = before.split(" ")[4] ?? "";
+    const container = /\/k8s\.io\/([0-9a-f]{64})\/rootfs$/u.exec(at)?.[1];
+    const lower = (/(?:^|,)lowerdir=([^,]+)/u.exec(options)?.[1] ?? "").split(":");
+    return type === "overlay" && container && lower.some((directory) => directory.startsWith("/var/lib/containerd-stargz-grpc/snapshotter/snapshots/")) ? [{ container, at }] : [];
+  });
+  if (found.length === 0) return [];
+  const name = `.alasio-e2e-probe-${randomUUID()}`;
+  const said = await onNode(node, `for rootfs in ${found.map(({ at }) => `'${at}'`).join(" ")}; do timeout -s KILL 5 stat -c %n -- "$rootfs/${name}" 2>&1 | tr '\\n' ' '; printf '\\000'; done; true`);
+  return found.filter((_, n) => /Transport endpoint is not connected|Software caused connection abort/u.test(said.split("\u0000")[n] ?? "")).map(({ container }) => container);
 }
 
 /**

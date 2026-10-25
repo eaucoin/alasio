@@ -132,7 +132,11 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
     }).pipe(Effect.flatMap((pools) =>
       Effect.forEach(pools, ({ pool, lost, recordLost }) =>
         reconcile(pool, (lease) => lost(pool, lease), (lease) => recordLost(pool, lease)).pipe(
-          Effect.tap(({ pods, leases }) => (pods.length + leases.length > 0 ? Effect.logInfo(`set ${pool.namespace}/${pool.name} right: deleted ${pods.join(", ") || "no pod"}, let go ${leases.join(", ") || "no Lease"}`) : Effect.void)),
+          Effect.tap(({ pods, leases, broken }) =>
+            pods.length + leases.length + broken.length > 0
+              ? Effect.logInfo(`set ${pool.namespace}/${pool.name} right: deleted ${pods.join(", ") || "no pod"}, let go ${leases.join(", ") || "no Lease"}, deleted ${broken.join(", ") || "no free pod"} a container of which ended or started again`)
+              : Effect.void
+          ),
           Effect.catch((error) => Effect.logWarning(`setting ${pool.namespace}/${pool.name} right failed: ${error.message}`)),
         ), { discard: true })));
     yield* setRight;

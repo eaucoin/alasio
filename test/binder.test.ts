@@ -279,7 +279,7 @@ test("reconciling a pool deletes a bound pod no Lease names and lets go a Lease 
     (lease) => Effect.sync(() => void told.push(`${lease.metadata?.annotations?.[KEY_ANNOTATION]} ${lease.metadata?.uid === gone.binding} ${lease.spec?.holderIdentity === gone.pod}`)),
     (lease) => Effect.map(readLease(of, lease.metadata?.annotations?.[KEY_ANNOTATION] ?? ""), (still) => void held.push(still !== null)).pipe(Effect.provide(binder()), Effect.orDie),
   ));
-  assert.deepEqual(set, { pods: [orphan?.metadata?.name], leases: [leaseName("sessionfs:gone")] });
+  assert.deepEqual(set, { pods: [orphan?.metadata?.name], leases: [leaseName("sessionfs:gone")], broken: [] });
   // The binding whose pod went, as what binds may say lost: its key, binding and pod; what comes before run while its Lease held.
   assert.deepEqual(told, ["sessionfs:gone true true"]);
   assert.deepEqual(held, [true]);
@@ -288,6 +288,22 @@ test("reconciling a pool deletes a bound pod no Lease names and lets go a Lease 
   assert.ok(await run(binder(), readLease(of, "sessionfs:under-way")));
   assert.equal((await run(binder(), readLease(of, "sessionfs:whole")))?.spec?.holderIdentity, whole.pod);
   assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [whole.pod]);
+});
+
+test("a free pod a container of which started again, or ended, is never claimed, and reconciling its pool deletes it, for its Deployment to make another", async () => {
+  const of = await pool();
+  const [again, ended] = await freePods(of, 3);
+  const status = (name: string, state: object, restartCount: number) =>
+    run(binder(), withKube((client) => client.patchPodStatus(of.namespace, name, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount, ...state }] } })));
+  // Started again in place, as a container whose rootfs failed under it is; and one ended, not yet started again.
+  await status(again!, { state: { running: { startedAt: new Date().toISOString() } }, lastState: { terminated: { exitCode: 135, reason: "Error" } } }, 1);
+  await status(ended!, { state: { terminated: { exitCode: 135, reason: "Error" } } }, 0);
+  const first = await run(binder(), claim(of, "sessionfs:first"));
+  assert.equal(first?.metadata?.name, "free-2");
+  assert.equal(await run(binder(), claim(of, "sessionfs:second")), null);
+  const set = await run(binder(), reconcile(of));
+  assert.deepEqual(set.broken.sort(), [again, ended].sort());
+  for (const name of [again!, ended!]) assert.equal(await run(binder(), withKube((client) => client.read("v1", "Pod", of.namespace, name))), null);
 });
 
 test("a release of a key's binding of one pod releases none the key was bound to anew since, of another pod", async () => {

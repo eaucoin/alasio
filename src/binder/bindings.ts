@@ -51,6 +51,15 @@ const selector = (labels: Readonly<Record<string, string>>): string => Object.en
 /** Whether `pod` runs, its containers started, and is not being deleted: free to be claimed, as it waits for what it is to serve. */
 export const running = (pod: V1Pod): boolean => !pod.metadata?.deletionTimestamp && pod.status?.phase === "Running";
 
+/**
+ * Whether a container of `pod` ended, or was started again in it, as one whose rootfs failed
+ * under it does: a free pod so serves no binding, as what binds takes a bound pod whose container
+ * ended or started again for broken (src/gateway/sessions.ts, src/gateway/harnesses.ts hostEnded),
+ * and is never claimed, but deleted, for its Deployment to make another (reconcile).
+ */
+export const restarted = (pod: V1Pod): boolean =>
+  (pod.status?.containerStatuses ?? []).some(({ restartCount, state, lastState }) => restartCount > 0 || state?.terminated !== undefined || lastState?.terminated !== undefined);
+
 /** Whether `pod` runs ready, and is not being deleted: serving its binding. */
 export const serving = (pod: V1Pod): boolean => running(pod) && (pod.status?.conditions ?? []).some(({ type, status }) => type === "Ready" && status === "True");
 
@@ -166,15 +175,15 @@ export const renewLease = Effect.fnUntraced(function*(lease: BindingLease): Effe
  * Claims a free pod of `pool` that runs for `key`, ready or not, as one is ready only once
  * what it serves is readied for it (BindOptions' prepare): each tried in turn, from a random
  * one on, so binders claiming at once mostly try apart, relabelled by an update conditioned
- * on the version read; one another claimed first is passed over. The pod claimed, or null
- * where none was free.
+ * on the version read; one another claimed first is passed over, and so is one a container of
+ * which ended or started again (restarted). The pod claimed, or null where none was free.
  */
 export const claim = Effect.fnUntraced(function*(pool: Pool, key: string): Effect.fn.Return<V1Pod | null, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;
   // A pod that was ever bound is never claimed, whatever its labels came to say since: it
   // serves one binding in its life, as a sandbox released can still reach what it was given.
   const free = ((yield* kube.list("v1", "Pod", pool.namespace, selector(freeLabels(pool)))) as V1Pod[]).filter((pod) =>
-    running(pod) && pod.metadata?.labels?.[BINDING_LABEL] === undefined && pod.metadata?.annotations?.[KEY_ANNOTATION] === undefined
+    running(pod) && !restarted(pod) && pod.metadata?.labels?.[BINDING_LABEL] === undefined && pod.metadata?.annotations?.[KEY_ANNOTATION] === undefined
   );
   const from = Math.floor(Math.random() * free.length);
   for (let n = 0; n < free.length; n += 1) {
@@ -213,10 +222,10 @@ export const boundIn = Effect.fnUntraced(function*(namespace: string): Effect.fn
   return leases.filter(({ spec }) => spec?.holderIdentity).length;
 });
 
-/** How many of `pool`'s pods are free and running, and how many of its keys are bound. */
+/** How many of `pool`'s pods are free and running, none of whose containers ended or started again, and how many of its keys are bound. */
 export const counts = Effect.fnUntraced(function*(pool: Pool): Effect.fn.Return<{ readonly free: number; readonly bound: number }, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;
-  const free = ((yield* kube.list("v1", "Pod", pool.namespace, selector(freeLabels(pool)))) as V1Pod[]).filter(running).length;
+  const free = ((yield* kube.list("v1", "Pod", pool.namespace, selector(freeLabels(pool)))) as V1Pod[]).filter((pod) => running(pod) && !restarted(pod)).length;
   const leases = (yield* kube.list("coordination.k8s.io/v1", "Lease", pool.namespace, `${POOL_LABEL}=${pool.name}`)) as BindingLease[];
   return { free, bound: leases.filter(({ spec }) => spec?.holderIdentity).length };
 });
@@ -230,13 +239,15 @@ export const counts = Effect.fnUntraced(function*(pool: Pool): Effect.fn.Return<
  * be saving it as it ends. A binding under way, its pod not yet named, is left to its binder,
  * or to the next to take it over; and so is one being released, whose releaser deletes its pod
  * before its Lease, and tells of its release itself, unless it has stopped renewing it, so a
- * binding released is never told of as lost too. What was set right, as names.
+ * binding released is never told of as lost too. And a free pod a container of which ended or
+ * started again (restarted), which no bind claims, is deleted as it was read, for its Deployment
+ * to make another; one claimed since is left to its binder. What was set right, as names.
  */
 export const reconcile = Effect.fnUntraced(function*(
   pool: Pool,
   letGo: (lease: BindingLease) => Effect.Effect<void> = () => Effect.void,
   before: (lease: BindingLease) => Effect.Effect<void> = () => Effect.void,
-): Effect.fn.Return<{ readonly pods: string[]; readonly leases: string[] }, KubeApiError, KubeClient> {
+): Effect.fn.Return<{ readonly pods: string[]; readonly leases: string[]; readonly broken: string[] }, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;
   const leases = (yield* kube.list("coordination.k8s.io/v1", "Lease", pool.namespace, `${POOL_LABEL}=${pool.name},${BINDING_LABEL}`)) as BindingLease[];
   const there = (yield* kube.list("v1", "Pod", pool.namespace, `${POOL_LABEL}=${pool.name},${BINDING_LABEL}`)) as V1Pod[];
@@ -254,5 +265,13 @@ export const reconcile = Effect.fnUntraced(function*(
   // One changed since it was read, as by its binder, is no more this one's to let go, nor to tell of.
   const letGone = yield* Effect.forEach(gone, (lease) => before(lease).pipe(Effect.andThen(releaseLease(lease)), Effect.as(true), Effect.catchIf(hasStatus(409), () => Effect.succeed(false))));
   yield* Effect.forEach(gone.filter((_, n) => letGone[n]), letGo, { discard: true });
-  return { pods: orphans.map(({ metadata }) => metadata?.name ?? ""), leases: gone.filter((_, n) => letGone[n]).map(({ metadata }) => metadata?.name ?? "") };
+  const free = (yield* kube.list("v1", "Pod", pool.namespace, selector(freeLabels(pool)))) as V1Pod[];
+  const broken = free.filter((pod) => !pod.metadata?.deletionTimestamp && restarted(pod) && pod.metadata?.labels?.[BINDING_LABEL] === undefined && pod.metadata?.annotations?.[KEY_ANNOTATION] === undefined);
+  const deleted = yield* Effect.forEach(broken, ({ metadata }) =>
+    kube.remove("v1", "Pod", pool.namespace, metadata?.name ?? "", metadata?.resourceVersion).pipe(Effect.as(true), Effect.catchIf(hasStatus(409), () => Effect.succeed(false))));
+  return {
+    pods: orphans.map(({ metadata }) => metadata?.name ?? ""),
+    leases: gone.filter((_, n) => letGone[n]).map(({ metadata }) => metadata?.name ?? ""),
+    broken: broken.filter((_, n) => deleted[n]).map(({ metadata }) => metadata?.name ?? ""),
+  };
 });
