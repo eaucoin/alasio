@@ -33,7 +33,7 @@ import { drain, stopToldAt } from "./drain.ts";
 import { MediaGroups } from "./media-group-buffer.ts";
 import { handleMessage } from "./message-handler.ts";
 import type { Outbox } from "./outbox.ts";
-import { type Awaited, awaitOrKeep, chatOfPress, CONTROL_AWAITED, CONTROLS_DUE_EVERY, holdWhileRunning, type KeptRunning, pressAnswers, recoverControls, rolledBack } from "./controls.ts";
+import { awaitOrKeep, chatOfPress, CONTROL_AWAITED, CONTROLS_DUE_EVERY, holdWhileRunning, type KeptRunning, pressAnswers, recoverControls, rolledBack, type Rollbacks } from "./controls.ts";
 import { consumeUpdates, type TelegramUpdates } from "./update-consumer.ts";
 import { WakeLatency } from "./wake-latency.ts";
 
@@ -112,8 +112,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
       // What it leads to once its transaction is through: a control kept, held while it runs, a
       // kept press's query answered, a prompt's job carried on.
       let after: Effect.Effect<void> = Effect.void;
-      // Its command's work, cut short where its transaction fails after all, keeping nothing of it (rolledBack).
-      const awaited: Awaited[] = [];
+      // What becomes of its controls where its transaction fails after all, keeping nothing of them (rolledBack).
+      const rollbacks: Rollbacks = [];
       const holding = (kept: KeptRunning, unsent?: () => readonly string[]) =>
         FiberSet.run(handling, holdWhileRunning(kept.id, kept.holder, kept.running, unsent).pipe(Effect.provideService(Store, store)));
       return underLock((marks) => Effect.gen(function*() {
@@ -140,9 +140,9 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
             const running = yield* FiberSet.run(handling, Effect.interruptible(work));
             yield* Fiber.await(running).pipe(Effect.timeoutOption(CONTROL_AWAITED));
           } else {
-            // Not among the awaited the transaction's failing cuts short, as a command is: its action consumed already (rolledBack).
-            const { kept } = yield* awaitOrKeep(handling, { kind: "press", callbackQuery, action }, work, marks, answers.keep);
-            if (Option.isSome(kept)) after = Effect.asVoid(Effect.all([holding(kept.value, answers.unsent), FiberSet.run(handling, answers.acknowledge.pipe(Effect.provideContext(services)))]));
+            const acknowledge = answers.acknowledge.pipe(Effect.provideContext(services));
+            const kept = yield* awaitOrKeep(handling, { kind: "press", callbackQuery, action }, work, marks, rollbacks, { kept: answers.keep, pressKept: { keep: answers.keep, unsent: answers.unsent, acknowledge } });
+            if (Option.isSome(kept)) after = Effect.asVoid(Effect.all([holding(kept.value, answers.unsent), FiberSet.run(handling, acknowledge)]));
           }
         } else if (update.message) {
           const prompt = yield* handleMessage(update.message, update.update_id, marks).pipe(
@@ -154,7 +154,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
             Effect.catchTag(["TelegramApiError", "TelegramTransportError"], Effect.die),
           );
           if (admitted?._tag === "Command") {
-            const { kept } = awaited[awaited.push(yield* awaitOrKeep(handling, admitted.command, runCommand(admitted.command).pipe(Effect.provideContext(services)), marks)) - 1]!;
+            const kept = yield* awaitOrKeep(handling, admitted.command, runCommand(admitted.command).pipe(Effect.provideContext(services)), marks, rollbacks);
             if (Option.isSome(kept)) after = Effect.asVoid(holding(kept.value));
           } else if (admitted?._tag === "Queued") {
             const { job } = admitted;
@@ -165,7 +165,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
         }
         yield* marks.markTelegramUpdateProcessed(update.update_id);
       })).pipe(
-        Effect.onError(() => rolledBack(awaited)),
+        Effect.onError(() => rolledBack(rollbacks).pipe(Effect.provideService(Store, store))),
         Effect.andThen(Effect.suspend(() => after)),
         Effect.tapError((error) => Effect.logError(`Failed to keep update ${update.update_id}: ${error}`)),
         withAlasioSpan("alasio.update", {

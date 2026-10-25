@@ -14,7 +14,7 @@ import type { Control, NewKeptControl } from "../src/persistence/control-reposit
 import { StoreError } from "../src/persistence/sql.ts";
 import { Store } from "../src/persistence/store.ts";
 import { TelegramClient } from "../src/telegram/client.ts";
-import { type Awaited, awaitOrKeep, CONTROL_HOLD, holdWhileRunning, pressAnswers, recoverControls, rolledBack } from "../src/telegram/controls.ts";
+import { awaitOrKeep, CONTROL_HOLD, holdWhileRunning, pressAnswers, type PressKept, recoverControls, rolledBack, type Rollbacks } from "../src/telegram/controls.ts";
 import { newSchema, run, testPool, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 import { recordingOutbox, withServices } from "./support/turns.ts";
@@ -99,53 +99,73 @@ test("a kept command its holder let go of, as its alasio stopped, is run again f
 test("a command cut short as its update awaits it, as a stop interrupts it, is kept to run again, not taken as done", async () => {
   const keptControls: NewKeptControl[] = [];
   const marks = { keepControl: (kept: NewKeptControl) => Effect.sync(() => void keptControls.push(kept)) };
-  const awaited = await Effect.runPromise(Effect.scoped(Effect.flatMap(FiberSet.make(), (handling) => awaitOrKeep(handling, command("telegram:1", 9, "/sessions new"), Effect.interrupt, marks))));
-  assert.ok(Option.isSome(awaited.kept));
+  const kept = await Effect.runPromise(Effect.scoped(Effect.flatMap(FiberSet.make(), (handling) => awaitOrKeep(handling, command("telegram:1", 9, "/sessions new"), Effect.interrupt, marks, []))));
+  assert.ok(Option.isSome(kept));
   assert.deepEqual(keptControls.map(({ control }) => control), [command("telegram:1", 9, "/sessions new")]);
 });
 
-test("a command whose keeping fails, its update's transaction with it, is cut short, so it never runs beside the update handled again", async () => {
-  const refusing = { keepControl: () => Effect.fail(new StoreError({ cause: new Error("the store is down") })) };
-  let cut = false;
-  const work = Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => void (cut = true))));
-  // Whether it was cut short as it failed, its handling, which a stop would cut it short with, still open.
-  const cutAsItFailed = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+/** A control's work that runs until cut short, and whether it was. */
+function cuttable() {
+  const state = { cut: false };
+  return { state, work: Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => void (state.cut = true)))) };
+}
+
+/**
+ * As an update's handling does: `control` awaited, its keeping as `keepControl` says, and its
+ * update's mark then failing, what becomes of the control rolled back; `seen` read once it
+ * is, its handling, which a stop would end it with, still open.
+ */
+async function handledThenFailed<A>(store: Store["Service"], control: Control, keepControl: (kept: NewKeptControl) => Effect.Effect<void, StoreError>, work: Effect.Effect<void>, seen: () => A | Promise<A>, pressKept?: PressKept): Promise<A> {
+  return await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const handling = yield* FiberSet.make();
-    const exit = yield* Effect.exit(awaitOrKeep(handling, command("telegram:1", 9, "/sessions new"), work, refusing));
+    const rollbacks: Rollbacks = [];
+    const exit = yield* Effect.exit(Effect.gen(function*() {
+      yield* awaitOrKeep(handling, control, work, { keepControl }, rollbacks, { pressKept });
+      return yield* Effect.fail(new StoreError({ cause: new Error("the store is down") }));
+    }).pipe(Effect.onError(() => rolledBack(rollbacks))));
     assert.ok(Exit.isFailure(exit));
-    return cut;
-  })));
-  assert.equal(cutAsItFailed, true);
+    return yield* Effect.promise(async () => await seen());
+  })).pipe(Effect.provideService(Store, store)));
+}
+
+const refusing = () => Effect.fail(new StoreError({ cause: new Error("the store is down") }));
+
+test("a command whose keeping fails, its update's transaction with it, is cut short, so it never runs beside the update handled again", async () => {
+  const { state, work } = cuttable();
+  assert.equal(await handledThenFailed(await testStore({ schema: newSchema() }), command("telegram:1", 9, "/sessions new"), refusing, work, () => state.cut), true);
 });
 
 test("a command kept as its update's transaction fails after all, keeping nothing of it, is cut short as the transaction rolls back", async () => {
-  const marks = { keepControl: () => Effect.void };
-  let cut = false;
-  const work = Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => void (cut = true))));
-  const awaited: Awaited[] = [];
-  const cutAsItFailed = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-    const handling = yield* FiberSet.make();
-    // As an update's transaction does: the command kept, then its update's mark failing.
-    const exit = yield* Effect.exit(Effect.gen(function*() {
-      awaited.push(yield* awaitOrKeep(handling, command("telegram:1", 9, "/sessions new"), work, marks));
-      return yield* Effect.fail(new StoreError({ cause: new Error("the store is down") }));
-    }).pipe(Effect.onError(() => rolledBack(awaited))));
-    assert.ok(Exit.isFailure(exit));
-    return cut;
-  })));
-  assert.deepEqual([awaited.length, cutAsItFailed], [1, true]);
+  const { state, work } = cuttable();
+  assert.equal(await handledThenFailed(await testStore({ schema: newSchema() }), command("telegram:1", 9, "/sessions new"), () => Effect.void, work, () => state.cut), true);
 });
 
-test("a press whose keeping fails, its update's transaction with it, runs on, as its action is consumed already and the update handled again does nothing of it", async () => {
-  const refusing = { keepControl: () => Effect.fail(new StoreError({ cause: new Error("the store is down") })) };
-  let cut = false;
-  const work = Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => void (cut = true))));
-  const action = { id: "action-1", conversationId: "telegram:1", kind: "workspace:refresh", payload: {} };
-  const cutAsItFailed = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-    const handling = yield* FiberSet.make();
-    const exit = yield* Effect.exit(awaitOrKeep(handling, { kind: "press", callbackQuery: query, action }, work, refusing));
-    assert.ok(Exit.isFailure(exit));
-    return cut;
-  })));
-  assert.equal(cutAsItFailed, false);
+test("a press whose update's transaction fails after it was awaited, its keeping or its mark, runs on, kept anew on the store's own, so a stop then loses nothing of it", async () => {
+  for (const keepControl of [refusing, () => Effect.void]) {
+    const schema = newSchema();
+    const store = await testStore({ schema });
+    const conversationId = await run(store.upsertConversation({ chatId: CHAT, user: { id: CHAT } }));
+    const { state, work } = cuttable();
+    // Its answers through the outbox from then on, its query answered as kept.
+    const told: string[] = [];
+    const pressKept = { keep: Effect.sync(() => void told.push("keep")), unsent: () => [], acknowledge: Effect.sync(() => void told.push("acknowledge")) };
+    const seen = await handledThenFailed(store, { kind: "press", callbackQuery: query, action: { id: "action-1", conversationId, kind: "workspace:refresh", payload: {} } }, keepControl, work, async () => [state.cut, await kept(schema), [...told]] as const, pressKept);
+    // Running on, kept anew, held by this alasio, its answers through the outbox.
+    assert.deepEqual(seen, [false, [{ id: query.id, lapsed: false }], ["keep", "acknowledge"]]);
+    // Let go of as its handling ended, as a stop ends it, for the next look to run it again.
+    assert.deepEqual(await kept(schema), [{ id: query.id, lapsed: true }]);
+  }
+});
+
+test("a press whose update's transaction fails as a stop closes its handling, its work cut short with it, is kept anew and let go of at once, for the next look to run it again", async () => {
+  const schema = newSchema();
+  const store = await testStore({ schema });
+  const conversationId = await run(store.upsertConversation({ chatId: CHAT, user: { id: CHAT } }));
+  const rollbacks: Rollbacks = [];
+  const { work } = cuttable();
+  // Its handling closed first, as a stop closes it, the press's work cut short with it; its transaction rolled back after.
+  await Effect.runPromise(Effect.scoped(Effect.flatMap(FiberSet.make(), (handling) =>
+    awaitOrKeep(handling, { kind: "press", callbackQuery: query, action: { id: "action-1", conversationId, kind: "workspace:refresh", payload: {} } }, work, { keepControl: () => Effect.void }, rollbacks))));
+  await Effect.runPromise(rolledBack(rollbacks).pipe(Effect.provideService(Store, store)));
+  assert.deepEqual(await kept(schema), [{ id: query.id, lapsed: true }]);
 });

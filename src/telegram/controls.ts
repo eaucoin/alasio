@@ -117,10 +117,17 @@ export interface KeptRunning {
   readonly running: Fiber.Fiber<void>;
 }
 
-/** A control awaited as its update was handled (awaitOrKeep): its work, running or done, and whether it was kept. */
-export interface Awaited {
-  readonly running: Fiber.Fiber<void>;
-  readonly kept: Option.Option<KeptRunning>;
+/**
+ * What becomes of the controls an update's handling awaited where its transaction fails after
+ * all, keeping nothing of them (awaitOrKeep): run as the transaction rolls back (rolledBack).
+ */
+export type Rollbacks = Effect.Effect<void, never, Store>[];
+
+/** What a kept press does besides, as it is kept: its answers made to go through the outbox, those not sent, and its query answered as kept (pressAnswers). */
+export interface PressKept {
+  readonly keep: Effect.Effect<void>;
+  readonly unsent: () => readonly string[];
+  readonly acknowledge: Effect.Effect<void>;
 }
 
 /**
@@ -129,30 +136,60 @@ export interface Awaited {
  * nothing more; still running, or cut short, as a stop interrupts it, kept with `marks`,
  * held by a token of its own, and `kept` run, as a press's answers are made to go through
  * the outbox, for the kept control to be held while it runs, or let go of to run again, once
- * the transaction is through (holdWhileRunning). Its work, so that where the transaction
- * fails after all, which keeps nothing of it, its caller cuts a command's short
- * (rolledBack), the update to be handled again, so it never runs twice at once.
+ * the transaction is through (holdWhileRunning). Where the transaction fails after all, which
+ * keeps nothing of it, what is in `rollbacks` for it, which its caller runs as the
+ * transaction rolls back (rolledBack): a command cut short, to run again with the update
+ * handled again, never beside itself; a press, whose action it consumed by itself as it was
+ * taken, so the update handled again does nothing of it, kept anew on the store's own
+ * marks, held while it runs, as `pressKept` says its answers go, so a stop then loses
+ * nothing of it either.
  */
-export const awaitOrKeep = <R>(handling: FiberSet.FiberSet, control: Control, work: Effect.Effect<void, never, R>, marks: Pick<UpdateMarks, "keepControl">, kept: Effect.Effect<void> = Effect.void): Effect.Effect<Awaited, StoreError, R> =>
+export const awaitOrKeep = <R>(
+  handling: FiberSet.FiberSet,
+  control: Control,
+  work: Effect.Effect<void, never, R>,
+  marks: Pick<UpdateMarks, "keepControl">,
+  rollbacks: Rollbacks,
+  { kept = Effect.void, pressKept }: { readonly kept?: Effect.Effect<void> | undefined; readonly pressKept?: PressKept | undefined } = {},
+): Effect.Effect<Option.Option<KeptRunning>, StoreError, R> =>
   Effect.gen(function*() {
     const running = yield* FiberSet.run(handling, Effect.interruptible(work));
     const done = yield* Fiber.await(running).pipe(Effect.timeoutOption(CONTROL_AWAITED));
-    if (Option.isSome(done) && !Exit.hasInterrupts(done.value)) return { running, kept: Option.none() };
+    if (Option.isSome(done) && !Exit.hasInterrupts(done.value)) return Option.none();
     const holder = randomUUID();
-    // Not kept, the transaction failing with it: a command's cut short here, as the caller has
-    // none of it; a press's not (rolledBack).
-    yield* marks.keepControl({ control, holder, holdMs: Duration.toMillis(CONTROL_HOLD) }).pipe(Effect.onError(() => (control.kind === "command" ? Fiber.interrupt(running) : Effect.void)));
+    const id = controlId(control);
+    // Before it is kept, so whatever fails the transaction after finds it.
+    rollbacks.push(control.kind === "command" ? Fiber.interrupt(running) : keptAnew(handling, control, running, holder, pressKept));
+    yield* marks.keepControl({ control, holder, holdMs: Duration.toMillis(CONTROL_HOLD) });
     yield* kept;
-    return { running, kept: Option.some({ id: controlId(control), holder, running }) };
+    return Option.some({ id, holder, running });
   });
 
 /**
- * Cuts short the work of each command `awaited` as its update's transaction failed, as
- * awaitOrKeep says, waiting for it to end. A press's runs on: its action consumed by itself
- * as it was taken, the update handled again finds it consumed, and does nothing of it again,
- * where a press cut short would be done by neither.
+ * The press `control`, running still as its update's transaction rolled back, or cut short as
+ * a stop cuts it, kept anew on the store's own marks and held while it runs, as awaitOrKeep
+ * says; let go of at once where it was cut short, or its handling is closed, for the next look
+ * to run it again; nothing where it was done meanwhile.
  */
-export const rolledBack = (awaited: readonly Awaited[]): Effect.Effect<void> => Effect.forEach(awaited, ({ running }) => Fiber.interrupt(running), { discard: true });
+const keptAnew = (handling: FiberSet.FiberSet, control: Control, running: Fiber.Fiber<void>, holder: string, pressKept: PressKept | undefined): Effect.Effect<void, never, Store> =>
+  Effect.gen(function*() {
+    // Done meanwhile, nothing to keep; cut short, as a stop cuts it, kept to run again.
+    const ended = running.pollUnsafe();
+    if (ended !== undefined && !Exit.hasInterrupts(ended)) return;
+    const store = yield* Store;
+    const id = controlId(control);
+    yield* store.keepControl({ control, holder, holdMs: Duration.toMillis(CONTROL_HOLD) });
+    if (pressKept) yield* pressKept.keep;
+    const holding = yield* FiberSet.run(handling, holdWhileRunning(id, holder, running, pressKept?.unsent).pipe(Effect.provideService(Store, store)));
+    // Its handling closed, as a stop closes it, the hold never starts, and has ended already:
+    // let go of at once, for the next look. A hold started has not, as it waits on the store
+    // first, as it renews, or as it settles the press.
+    if (holding.pollUnsafe() !== undefined) return yield* store.releaseControl(id, holder);
+    if (pressKept) yield* FiberSet.run(handling, pressKept.acknowledge);
+  }).pipe(Effect.catch((error) => Effect.logWarning(`Could not keep anew, or let go of, press ${controlId(control)}, whose update's transaction failed: ${error.message}`)));
+
+/** Runs what `rollbacks` holds of an update's controls, as its transaction rolled back (awaitOrKeep). */
+export const rolledBack = (rollbacks: Rollbacks): Effect.Effect<void, never, Store> => Effect.all(rollbacks, { discard: true });
 
 /**
  * Holds the kept control `id` for `holder` while `running` runs, renewing its hold; then

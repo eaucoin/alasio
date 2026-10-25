@@ -16,7 +16,7 @@ import { Store, type UpdateMarks } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { ReceivedFiles } from "./files.ts";
-import { type Awaited, awaitOrKeep, holdWhileRunning, rolledBack } from "./controls.ts";
+import { awaitOrKeep, holdWhileRunning, rolledBack, type Rollbacks } from "./controls.ts";
 
 /** How long a media group waits for more of its messages before it is handled. */
 const DEFAULT_FLUSH_AFTER: Duration.Input = "1500 millis";
@@ -80,8 +80,8 @@ const makeMediaGroups = Effect.fnUntraced(function*(flushAfter: Duration.Input) 
    * runs on (../telegram/controls.ts); nothing where it was not claimed.
    */
   const claimed = (mediaGroupId: string, conversationId: string, chatId: number | string): Effect.Effect<Effect.Effect<void>, StoreError> => {
-    // Its command's work, cut short where the transaction fails after all, keeping nothing of it (rolledBack).
-    const awaited: Awaited[] = [];
+    // What becomes of its command where the transaction fails after all, keeping nothing of it (rolledBack).
+    const rollbacks: Rollbacks = [];
     return holders.withPermit(store.withHandlingLock(chatId, (marks) =>
       Effect.gen(function*() {
         if (!(yield* marks.claimMediaGroup(mediaGroupId, flushMs))) return Effect.void;
@@ -98,7 +98,7 @@ const makeMediaGroups = Effect.fnUntraced(function*(flushAfter: Duration.Input) 
             Effect.as(Effect.logError(`Could not send the setup step media group ${mediaGroupId} lacks: ${error.message}`), { _tag: "Done" } as const)),
         );
         if (admitted._tag === "Command") {
-          const { kept } = awaited[awaited.push(yield* awaitOrKeep(prompts, admitted.command, runCommand(admitted.command).pipe(Effect.provideContext(services)), marks)) - 1]!;
+          const kept = yield* awaitOrKeep(prompts, admitted.command, runCommand(admitted.command).pipe(Effect.provideContext(services)), marks, rollbacks);
           return Option.match(kept, {
             onNone: () => Effect.void,
             onSome: ({ id, holder, running }) => Effect.asVoid(FiberSet.run(prompts, holdWhileRunning(id, holder, running).pipe(Effect.provideService(Store, store)))),
@@ -111,7 +111,7 @@ const makeMediaGroups = Effect.fnUntraced(function*(flushAfter: Duration.Input) 
           Effect.provideContext(services),
         )));
       })
-    )).pipe(Effect.onError(() => rolledBack(awaited)));
+    )).pipe(Effect.onError(() => rolledBack(rollbacks).pipe(Effect.provideService(Store, store))));
   };
 
   /**
