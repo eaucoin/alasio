@@ -1211,7 +1211,7 @@ function asleep(kube: Rig["kube"], slept?: string): void {
   }
 }
 
-test("logs of alasio asleep says so, since when and what wakes it, and prints what the lake keeps of its last run's logs, since it last started; or that it keeps none, or why it was not read", async (t) => {
+test("logs of alasio asleep says so, since when and what wakes it, and prints what the lake keeps of its last run's logs, since it last started; or that it keeps none, that they may still be loading where its last run just ended, or why they were not read", async (t) => {
   const { alasio, kube } = await installed(t);
   asleep(kube, "2026-10-25T10:05:00Z");
   const started = kube.get("/api/v1/namespaces/alasio/configmaps/alasio-started");
@@ -1233,6 +1233,14 @@ test("logs of alasio asleep says so, since when and what wakes it, and prints wh
   // None kept.
   kube.onExec = () => ({ exitCode: 0, stdout: "" });
   assert.equal((await alasio(["logs"])).printed.at(-1), "The lake keeps none of its logs of its last run, since it started at 2026-10-25T10:00:00.000Z.");
+  // None kept yet, its last run ended so lately that the lake may not have loaded them.
+  const ended = new Date(Date.now() - 20_000).toISOString();
+  asleep(kube, ended);
+  assert.equal(
+    (await alasio(["logs"])).printed.at(-1),
+    `The lake keeps none yet of its logs of its last run, since it started at 2026-10-25T10:00:00.000Z; they may still be loading, as its last run ended at ${ended}, within the 2 minutes the lake may take to load what is logged.`,
+  );
+  asleep(kube, "2026-10-25T10:05:00Z");
   // Not read.
   kube.onExec = () => ({ exitCode: 1, stderr: "the lake is not reached\n" });
   assert.equal((await alasio(["logs"])).printed.at(-1), "Its last run's logs, which the lake keeps, were not read: the lake's query failed: the lake is not reached.");

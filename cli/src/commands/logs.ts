@@ -20,6 +20,13 @@ const QUERY = ["node", "/opt/lake/src/query.ts"] as const;
 /** The most of a component's last run's lines the lake is asked for: its newest. */
 const LAKE_LINES = 1000;
 
+/**
+ * How long after alasio's last run ended the lake may not have loaded its logs yet: its intake
+ * writes a minute's at a time (neon/lake/src/intake.ts BATCH), and as long again goes to the
+ * collector's sending them on and the intake's waking for them.
+ */
+export const LAKE_CATCH_UP = Duration.minutes(2);
+
 /** How far back a component's logs are asked of the lake where neither its last start nor --since says. */
 const LAKE_BACK = Duration.hours(1);
 
@@ -79,7 +86,16 @@ const noPod = (found: Component, since: Option.Option<Duration.Duration>): Effec
     const kept = yield* lakeLines(service, from);
     if ("unread" in kept) return yield* Console.log(`Its last run's logs, which the lake keeps, were not read: ${kept.unread}.`);
     const of = started && Option.isNone(since) ? `of its last run, since it started at ${started.toISOString()}` : `since ${from.toISOString()}`;
-    if (kept.lines.length === 0) return yield* Console.log(`The lake keeps none of its logs ${of}.`);
+    if (kept.lines.length === 0) {
+      // Its last run ended so lately that the lake may not have them yet.
+      const ended = wakes?.slept ?? null;
+      const loading = ended !== null && Date.now() - Date.parse(ended) < Duration.toMillis(LAKE_CATCH_UP);
+      return yield* Console.log(
+        loading
+          ? `The lake keeps none yet of its logs ${of}; they may still be loading, as its last run ended at ${ended}, within the ${Duration.toMinutes(LAKE_CATCH_UP)} minutes the lake may take to load what is logged.`
+          : `The lake keeps none of its logs ${of}.`,
+      );
+    }
     yield* Console.log(`Its logs ${of}, as the lake keeps them${kept.lines.length === LAKE_LINES ? `, the newest ${LAKE_LINES}` : ""}:`);
     for (const line of kept.lines) yield* Console.log(line);
   });
