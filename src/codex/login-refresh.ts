@@ -21,8 +21,9 @@
  * one `alasio login codex` made, of an API key or of ChatGPT, in place of the other. And a due
  * login is refreshed holding the store's Codex login lock (Store.withCodexLoginLock): the home
  * made the store's first, as above, and refreshed only where it is due still, the store kept of
- * what the refresh wrote, in the same transaction. One that is not due is left as it is,
- * without the lock.
+ * what the refresh wrote, in the same transaction, which nothing interrupts once the lock is
+ * asked for, so a refresh made is kept whatever stops what asked for it. One that is not due is
+ * left as it is, without the lock.
  *
  * A refresh refused for good, as Codex's app-server says one is (LoginRefresh), its refresh token
  * spent, expired or revoked, reads the store again, and takes the login another alasio kept
@@ -200,8 +201,15 @@ export const makeCodexLoginFreshness = <E extends { readonly message: string }>(
       if (refusedNow(kept, home)) return yield* new CodexLoginRefused();
       const now = yield* Clock.currentTimeMillis;
       if (!due(home, now) || now < retryAt) return;
-      /** What the lock's holder came to, and the stamp the home took the store's login as of, adopted once its transaction commits. */
-      const { outcome, stamp } = yield* store.withCodexLoginLock((login) =>
+      /**
+       * What the lock's holder came to, and the stamp the home took the store's login as of, adopted once its transaction
+       * commits. Whole once the lock is asked for, whoever interrupts it, as an operator's stop of a turn as it starts does:
+       * Codex's refresh spends the refresh token as it rewrites the home's auth.json, and a transaction cut short past it
+       * would roll back the store's save of what it wrote, the store left keeping the spent one, which another alasio takes.
+       * A stop waits for the lock so, as long as another alasio's refresh holds it, as it would interruptible: a statement
+       * of the transaction's runs on to its end, its connection's rollback queued behind it (../persistence/sql.ts).
+       */
+      const { outcome, stamp } = yield* Effect.uninterruptible(store.withCodexLoginLock((login) =>
         Effect.gen(function*() {
           const locked = yield* login.get;
           let stamp = yield* take(locked);
@@ -236,7 +244,7 @@ export const makeCodexLoginFreshness = <E extends { readonly message: string }>(
           yield* Effect.logInfo(`refreshed the Codex login${stopped ? `, whose access token stopped at ${new Date(stopped).toISOString()}` : ""}`);
           return { outcome: "refreshed", stamp } as const;
         })
-      );
+      ));
       if (stamp !== null) tookSavedAt = stamp;
       if (outcome === "refused") return yield* new CodexLoginRefused();
     }).pipe(

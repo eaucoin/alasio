@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
-import { Context, Effect, Layer, Option, Scope, Exit } from "effect";
+import { Context, Deferred, Effect, Exit, Fiber, Layer, Option, Scope } from "effect";
 
 import { NO_BIND_HEADER, PINNED_HEADER } from "../src/binder/names.ts";
 import { CodexAppServer } from "../src/codex/app-server/client.ts";
@@ -154,15 +154,15 @@ const reservedTurn = (host: HarnessHost["Service"], start: TurnRequest) => Effec
 
 /**
  * alasio's own app-server, as it refreshes its Codex login: how often it was asked to, each
- * refresh writing the login `refreshed` gives of its count, where given, as Codex writes one anew.
+ * refresh writing the login `refreshed` gives of its count, where given, as Codex writes one anew,
+ * and answering once `answered` has, as Codex answers once it wrote it.
  */
-const appServer = { refreshes: 0, refreshed: null as ((count: number) => string) | null };
+const appServer = { refreshes: 0, refreshed: null as ((count: number) => string) | null, answered: Effect.void as Effect.Effect<void> };
 const codexAppServer = Layer.succeed(CodexAppServer, {
   refreshLogin: () => Effect.sync(() => {
     appServer.refreshes += 1;
     if (appServer.refreshed !== null) writeFileSync(join(CODEX_HOME, "auth.json"), appServer.refreshed(appServer.refreshes));
-    return "asked" as const;
-  }),
+  }).pipe(Effect.andThen(Effect.suspend(() => appServer.answered)), Effect.as("asked" as const)),
   // Its login, the home's own, loaded anew as it next refreshes.
   stop: Effect.void,
 } as unknown as CodexAppServer["Service"]);
@@ -469,9 +469,11 @@ test("a Codex turn's token for alasio's relay is renewed as it runs; alasio, the
       assert.ok(stand.asked.filter(({ path }) => path === HOST_PATHS.codexLogin).every(({ bindsNothing }) => bindsNothing));
       const after = renewed.length;
       await new Promise((resolve) => setTimeout(resolve, 700));
-      assert.equal(renewed.length, after);
-      // Refreshed before the turn, and as each renewal found it about to stop again.
-      assert.equal(appServer.refreshes, 1 + renewed.length);
+      // Renewed no more, but for the renewal under way as the turn ended, which may reach the pod after.
+      assert.ok(renewed.length - after <= 1, `renewed ${renewed.length - after} more times once the turn ended`);
+      // Refreshed before the turn, and as each renewal found it about to stop again: one more where the turn's end cut a
+      // renewal short between its refresh and its token's reaching the pod, its refresh kept all the same.
+      assert.ok([1, 2].includes(appServer.refreshes - renewed.length), `refreshed ${appServer.refreshes} times, renewed ${renewed.length}`);
       // A login far from stopping is refreshed by none.
       appServer.refreshes = 0;
       writeFileSync(join(CODEX_HOME, "auth.json"), login(Date.now() + 24 * 60 * 60_000));
@@ -482,6 +484,53 @@ test("a Codex turn's token for alasio's relay is renewed as it runs; alasio, the
     }
   } finally {
     appServer.refreshed = null;
+    writeFileSync(join(CODEX_HOME, "auth.json"), kept);
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+});
+
+test("a refresh of the Codex login under way as the turn it is kept fresh for is stopped is kept: the store keeps what Codex wrote", async () => {
+  const store = await testStore();
+  const conversationId = await run(store.upsertConversation({ chatId: "47", user: { id: 47 } }));
+  await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+  await run(store.setWorkingDirectory(conversationId, sessionFsWorkspace("fs-abc123")));
+  const jwt = (exp: number) => `h.${Buffer.from(JSON.stringify({ exp: Math.floor(exp / 1000) })).toString("base64url")}.s`;
+  const login = (exp: number, refresh: string) => JSON.stringify({ tokens: { access_token: jwt(exp), refresh_token: refresh } });
+  // About to stop, so the turn's start refreshes it; Codex writing the refreshed login, its refresh token spent, then answering only once let.
+  const kept = readFileSync(join(CODEX_HOME, "auth.json"), "utf8");
+  writeFileSync(join(CODEX_HOME, "auth.json"), login(Date.now() + 60_000, "rt-spent"));
+  const refreshed = login(Date.now() + 60 * 60_000, "rt-new");
+  const answer = Effect.runSync(Deferred.make<void>());
+  appServer.refreshes = 0;
+  appServer.refreshed = () => refreshed;
+  appServer.answered = Deferred.await(answer);
+  const started: TurnStart[] = [];
+  const scope = Effect.runSync(Scope.make());
+  try {
+    const { port } = await Effect.runPromise(Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token", given: givenTo(started) }), HarnessHost, podHost(started)).pipe(Scope.provide(scope)));
+    const stand = await front(port);
+    try {
+      const sessions = { ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
+      const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: RELAY.url, home: CODEX_HOME } }).pipe(
+        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions))),
+      )).pipe(Scope.provide(scope))), HarnessHost);
+      const epoch = await run(store.claimTurn({ conversationId, chatId: "47", messageId: "1", sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));
+      const turn = Effect.runFork(reservedTurn(host, { conversationId, chatId: "47", messageId: "1", harness: CODEX_HARNESS, workingDirectory: sessionFsWorkspace("fs-abc123"), prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null }));
+      await eventually("Codex asked to refresh the login", () => (appServer.refreshes === 1 ? true : undefined));
+      // The turn stopped as its start keeps the login fresh, Codex having written the refreshed login, and answering after.
+      const stopped = Effect.runPromise(Fiber.interrupt(turn));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      Effect.runSync(Deferred.succeed(answer, undefined));
+      await stopped;
+      assert.equal(started.length, 0);
+      // What Codex wrote kept by the store, as every alasio takes it: not the spent refresh token.
+      assert.equal((await run(store.getCodexLoginRecord))?.auth, refreshed);
+    } finally {
+      stand.close();
+    }
+  } finally {
+    appServer.refreshed = null;
+    appServer.answered = Effect.void;
     writeFileSync(join(CODEX_HOME, "auth.json"), kept);
     await Effect.runPromise(Scope.close(scope, Exit.void));
   }
