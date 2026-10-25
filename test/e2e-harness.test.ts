@@ -29,11 +29,12 @@ test("ALASIO_E2E_SHARD names a shard of the suites, and every suite unset or emp
   assert.equal(shardOf(""), undefined);
 });
 
-test("a run of a shard runs its suites alone, and a run of none every suite but the snapshots, upgrade and agents shards'", () => {
+test("a run of a shard runs its suites alone, and a run of none every suite but the snapshots, upgrade, agents and wake shards'", () => {
   assert.deepEqual(SHARDS.filter((shard) => runsShard("neon", shard)), ["neon"]);
   assert.deepEqual(SHARDS.filter((shard) => runsShard("snapshots", shard)), ["snapshots"]);
   assert.deepEqual(SHARDS.filter((shard) => runsShard("upgrade", shard)), ["upgrade"]);
   assert.deepEqual(SHARDS.filter((shard) => runsShard("agents", shard)), ["agents"]);
+  assert.deepEqual(SHARDS.filter((shard) => runsShard("wake", shard)), ["wake"]);
   assert.deepEqual(SHARDS.filter((shard) => runsShard(undefined, shard)), ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling"]);
 });
 
@@ -58,7 +59,7 @@ test("a node's logs are read for its errors as k3s, containerd, stargz-snapshott
 });
 
 test("a shard there is not is refused, with those there are", () => {
-  assert.throws(() => shardOf("kubernetes"), { message: "ALASIO_E2E_SHARD is kubernetes, not one of sessions, workspaces, neon, telemetry, branches, scaling, snapshots, upgrade, agents" });
+  assert.throws(() => shardOf("kubernetes"), { message: "ALASIO_E2E_SHARD is kubernetes, not one of sessions, workspaces, neon, telemetry, branches, scaling, snapshots, upgrade, agents, wake" });
 });
 
 test("the upgrade shard's install configuration is laid over the one alasio init wrote, keeping what only that has", () => {

@@ -4595,6 +4595,148 @@ const INSTALLED_HERE = [
   "/etc/sysctl.d/60-alasio-inotify.conf",
 ];
 
+if (inShard("wake")) {
+  /**
+   * A press waking alasio from none, as an operator's of a panel's button it sent awake: answered well within Telegram's expiry of
+   * a callback query, undocumented, of about fifteen seconds (ANSWER_WITHIN_MS), every time of SAMPLES, its callback query's answer
+   * the wake's first. Each sample's steps said, timed from the press, by when kubelet took each line: the webhook intake's taking
+   * it, KEDA's scaling alasio up as its operator logs it, alasio's container's start, its first line, its Telegram app's start,
+   * and the answer; and what KEDA's looks at the log's lags cost the log's broker while alasio sleeps, its CPU over a minute of it.
+   */
+  describe("a press waking alasio from none", () => {
+    /** How many presses the gate takes, each from alasio asleep. */
+    const SAMPLES = 12;
+    /** How soon each must be answered: five seconds within Telegram's expiry, which it does not say. */
+    const ANSWER_WITHIN_MS = 10_000;
+    /** How long the broker's CPU is watched with alasio asleep, KEDA alone asking it of its groups. */
+    const ASLEEP_WATCH_MS = 60_000;
+
+    /** alasio upped at `scaling`, or the default scale where none: what it is installed with, and what KEDA scales it to. */
+    const scaledTo = async (scaling?: { readonly min: number; readonly max: number }) => {
+      const { configFile } = paths();
+      const config = JSON.parse(readFileSync(configFile, "utf8"));
+      if (scaling) config.install.alasio.scaling = scaling;
+      else delete config.install.alasio.scaling;
+      writeFileSync(configFile, JSON.stringify(config));
+      await alasioOk("up", "--timeout", "20m");
+    };
+
+    // The gate's alone, the default scale, from none: the suites before read alasio's pod and reach it, as the shard's
+    // installation runs one.
+    before(async () => {
+      await scaledTo();
+      telegram = await forward(TELEGRAM);
+      tg = operator(telegram.base);
+      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+    });
+
+    // Held at one again for the suites after, as the shard's installation runs it.
+    after(async () => {
+      try {
+        await scaledTo({ min: 1, max: 1 });
+        await until("one alasio ready", async () => {
+          const deployment = await alasioDeployment();
+          return deployment?.spec?.replicas === 1 && deployment.status?.readyReplicas === 1 ? true : undefined;
+        }, 600_000);
+      } finally {
+        telegram?.close();
+      }
+    });
+
+    const alasioDeployment = () => kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE));
+    /** alasio's pods, but those being deleted. */
+    const alasioPods = async () => (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("alasio")) })).filter(({ metadata }) => !metadata?.deletionTimestamp);
+    /** What the stand-in recorded since the `since`th call, and how many in all. */
+    const callsOf = async (since = 0) => (await (await fetch(`${telegram?.base}/control/calls?since=${since}`)).json()) as CallsListing;
+    /** Up to which update the webhook intake has taken, answering the stand-in's delivery of it once it is in the log. */
+    const committed = async () => ((await (await fetch(`${telegram?.base}/control/committed`)).json()) as { updateId: number }).updateId;
+    /** The lines of `container` of `pod` from `since`, each with when kubelet took it. */
+    const linesOf = async (pod: string, container: string, since: number) =>
+      (await kube.logs(NAMESPACE, pod, container, { timestamps: true }).catch(() => "")).split("\n").flatMap((line) => {
+        const at = Date.parse(line.slice(0, line.indexOf(" ")));
+        return Number.isFinite(at) && at >= since ? [{ at, text: line.slice(line.indexOf(" ") + 1) }] : [];
+      });
+    /** The CPU the log's broker has used, in seconds, as its pod's cgroup counts it on its node. */
+    const brokerCpuSeconds = async () => {
+      const pod = await kube.get<V1Pod>(ref("Pod", `${componentName("log")}-0`, NAMESPACE));
+      const uid = pod?.metadata?.uid ?? "";
+      const node = TARGET === "host" ? "" : pod?.spec?.nodeName ?? "";
+      // Its pod's cgroup, named after its uid, with its dashes or, by systemd's driver, underscores.
+      const said = await onNode(node, `d=$(find /sys/fs/cgroup -maxdepth 6 -type d \\( -name "*pod${uid}*" -o -name "*pod${uid.replaceAll("-", "_")}*" \\) | head -n 1); sed -n "s/^usage_usec //p" "$d/cpu.stat"`).catch(() => "");
+      // Unmeasured, not failed, where its node keeps it otherwise: the gate is the answer's.
+      return said.trim() === "" ? Number.NaN : Number(said.trim()) / 1e6;
+    };
+
+    test(`a press is answered within ${ANSWER_WITHIN_MS / 1000} s of it, every time of ${SAMPLES}, alasio woken from none by it`, { timeout: 120 * 60_000 }, async (t) => {
+      const samples: number[] = [];
+      for (let sample = 1; sample <= SAMPLES; sample += 1) {
+        // A panel's button, sent awake: /service's Close.
+        await tg.calls();
+        await tg.say("/service");
+        const panel = await tg.waitFor((call) => /^Service$/mu.test(call.payload.text ?? "") && tg.buttons(call).some(({ text }) => text === "Close"));
+        const close = tg.buttons(panel).find(({ text }) => text === "Close");
+        assert.ok(close && "callback_data" in close, JSON.stringify(panel.payload));
+        // Asleep: scaled to none by KEDA once nothing waited for its cooldown, its pod gone.
+        await until("alasio asleep", async () => ((await alasioDeployment())?.spec?.replicas === 0 && (await alasioPods()).length === 0 ? true : undefined), 15 * 60_000).catch(async (error: unknown) => {
+          // What kept it awake: its ScaledObject, as KEDA reads its triggers, the HPA it made, and the harnesses bound.
+          const scaled = await kube.get<KubernetesObject & { spec?: unknown; status?: unknown }>(ref("ScaledObject", RELEASE, NAMESPACE));
+          const hpa = await kube.get<KubernetesObject & { status?: unknown }>(ref("HorizontalPodAutoscaler", `keda-hpa-${RELEASE}`, NAMESPACE)).catch(() => null);
+          const bound = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: BINDING_LABEL })).map(({ metadata }) => metadata?.annotations?.["alasio.dev/binding-key"]);
+          assert.fail(`${error instanceof Error ? error.message : String(error)}: alasio at ${(await alasioDeployment())?.spec?.replicas} replica(s); its ScaledObject ${JSON.stringify({ spec: scaled?.spec, status: scaled?.status })}; its HPA ${JSON.stringify(hpa?.status)}; bound ${JSON.stringify(bound)}`);
+        });
+        if (sample === 1) {
+          // At the polling the installation sets, then at KEDA's five seconds, alasio's ScaledObject patched for a minute: what an
+          // environment's looks at the log's lags cost its broker, each environment's ScaledObject asking it of its own groups.
+          const scaledObject = ref("ScaledObject", RELEASE, NAMESPACE);
+          const brokerAt = async () => {
+            const [from, at] = [await brokerCpuSeconds(), Date.now()];
+            await sleep(ASLEEP_WATCH_MS);
+            return ((await brokerCpuSeconds()) - from) / ((Date.now() - at) / 1000);
+          };
+          const polling = (await kube.get<KubernetesObject & { spec?: { pollingInterval?: number } }>(scaledObject))?.spec?.pollingInterval;
+          const asSet = await brokerAt();
+          await kube.patch(scaledObject, { spec: { pollingInterval: 5 } });
+          const atFive = await brokerAt().finally(() => kube.patch(scaledObject, { spec: { pollingInterval: polling } }));
+          t.diagnostic(`# the log's broker, alasio asleep: ${asSet.toFixed(4)} CPU with KEDA polling alasio's ScaledObject each ${polling} s, ${atFive.toFixed(4)} each 5 s; an environment's polling each ${polling} s costs ${(asSet - atFive).toFixed(4)} CPU more, three ${(3 * (asSet - atFive)).toFixed(4)}`);
+        }
+        const mark = (await callsOf()).total;
+        const taken = await committed();
+        const pressed = Date.now();
+        await tg.press(close.callback_data);
+        const seen: Record<string, number> = {};
+        const at = (step: string, when: number) => void (seen[step] ??= (when - pressed) / 1000);
+        let answered: number | undefined;
+        for (const deadline = pressed + 5 * 60_000; answered === undefined; await sleep(100)) {
+          assert.ok(Date.now() < deadline, `the press of sample ${sample} was never answered`);
+          if ((await committed()) > taken) at("in the log", Date.now());
+          if (((await alasioDeployment())?.spec?.replicas ?? 0) > 0) at("scaled", Date.now());
+          answered = (await callsOf(mark)).calls.find((call) => call.method === "answerCallbackQuery")?.at;
+        }
+        at("answered", answered);
+        // What KEDA's operator logged of scaling alasio up, and alasio of its start.
+        const operator = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE })).find(({ metadata }) => metadata?.name?.startsWith(componentName("keda-operator")));
+        const scaledUp = (await linesOf(operator?.metadata?.name ?? "", "keda-operator", pressed)).find(({ text }) => /ScaleTarget/u.test(text) && /"alasio"/u.test(text));
+        if (scaledUp) at("KEDA scaled it", scaledUp.at);
+        for (const pod of await alasioPods()) {
+          const started = pod.status?.containerStatuses?.find(({ name }) => name === "alasio")?.state?.running?.startedAt;
+          if (started) at("container started", new Date(started).getTime());
+          const lines = await linesOf(pod.metadata?.name ?? "", "alasio", pressed);
+          if (lines[0]) at("first line", lines[0].at);
+          const telegramStarted = lines.find(({ text }) => /Starting Telegram/u.test(text));
+          if (telegramStarted) at("Telegram started", telegramStarted.at);
+        }
+        samples.push(answered - pressed);
+        const said = `# sample ${sample}: ${Object.entries(seen).sort(([, a], [, b]) => a - b).map(([step, seconds]) => `${step} ${seconds.toFixed(1)} s`).join(", ")}`;
+        console.error(said);
+        t.diagnostic(said);
+      }
+      const sorted = [...samples].sort((a, b) => a - b);
+      t.diagnostic(`# answered in ${sorted.map((ms) => (ms / 1000).toFixed(1)).join(", ")} s; p50 ${((sorted[Math.floor(sorted.length / 2)] ?? 0) / 1000).toFixed(1)} s, p100 ${((sorted.at(-1) ?? 0) / 1000).toFixed(1)} s`);
+      assert.ok(sorted.every((ms) => ms < ANSWER_WITHIN_MS), `answered in ${sorted.map((ms) => (ms / 1000).toFixed(1)).join(", ")} s, past ${ANSWER_WITHIN_MS / 1000} s`);
+    });
+  });
+}
+
 describe("alasio uninstall --purge", { skip: KEEP && "the run keeps the cluster" }, () => {
   test("removes alasio and the cluster on this machine, with all they keep, and keeps the config", async () => {
     const { configFile, kubeconfig, storage } = paths();

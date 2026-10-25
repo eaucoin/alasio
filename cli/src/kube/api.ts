@@ -167,6 +167,8 @@ export interface LogOptions {
   readonly previous?: boolean | undefined;
   /** Its last lines alone, this many. */
   readonly tailLines?: number | undefined;
+  /** Each line led by when kubelet took it, RFC 3339. */
+  readonly timestamps?: boolean | undefined;
 }
 
 /** A container a command is run in. */
@@ -465,11 +467,11 @@ function makeKubeApi(kubeConfig: KubeConfig, busyUntil: number | undefined): Kub
         Effect.asVoid,
         Effect.catchIf(hasStatus(404), () => Effect.void),
       ),
-    logs: (namespace, pod, { container, follow = false, sinceSeconds, previous = false, tailLines }) => {
+    logs: (namespace, pod, { container, follow = false, sinceSeconds, previous = false, tailLines, timestamps = false }) => {
       const call: KubeCall = {
         method: "GET",
         path: `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods/${encodeURIComponent(pod)}/log`,
-        query: { container, follow: String(follow), sinceSeconds: sinceSeconds === undefined ? undefined : String(sinceSeconds), previous: previous ? "true" : undefined, tailLines: tailLines === undefined ? undefined : String(tailLines) },
+        query: { container, follow: String(follow), sinceSeconds: sinceSeconds === undefined ? undefined : String(sinceSeconds), previous: previous ? "true" : undefined, tailLines: tailLines === undefined ? undefined : String(tailLines), timestamps: timestamps ? "true" : undefined },
       };
       return Stream.unwrap(
         Effect.map(open(call), (response) => NodeStream.fromReadable({ evaluate: () => response, onError: (cause) => unreachable(call, cause) })),

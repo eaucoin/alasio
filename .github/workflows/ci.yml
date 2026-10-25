@@ -183,7 +183,7 @@ jobs:
               else [.target, (.agents | tostring), .shard] end;
             def named($word): ($word | split("/")) as $parts | name($parts | length) == $parts;
             [({target: "docker", agents: (0, 2)}, {target: "host", agents: 0}) as $cluster
-              | ("sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents") as $shard
+              | ("sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents", "wake") as $shard
               | $cluster + {shard: $shard}
               | select(.shard != "upgrade" or .target == "host")
               | if .target == "host" and .shard == "sessions" then . + {firewall: "ufw"} else . end]

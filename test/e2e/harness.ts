@@ -121,7 +121,7 @@ export function targetOf(value: string | undefined): "host" | "docker" {
 }
 
 /** The shards of the suites, each run on a cluster of its own. */
-export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents"] as const;
+export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents", "wake"] as const;
 export type Shard = (typeof SHARDS)[number];
 
 /** The shard `value` names, or none, when it is unset or empty. */
@@ -140,16 +140,17 @@ export function shardOf(value: string | undefined): Shard | undefined {
  * with Grafana highly available; `agents`, conversations' harnesses in pools of their own,
  * on an installation that releases an idle one within HARNESS_RELEASE_AFTER_SECONDS;
  * `snapshots`, sessions released into whole-sandbox snapshots and restored from them, on an
- * installation that releases them within RELEASE_AFTER_SECONDS; or `upgrade`, what alasio keeps upgraded from the release before;
- * every suite but those three shards' unless set, as each needs an installation of its own.
+ * installation that releases them within RELEASE_AFTER_SECONDS; `upgrade`, what alasio keeps upgraded from the release before;
+ * or `wake`, a press waking alasio from none, its gate's own at the default scale, sleeping within the run; every suite
+ * but those four shards' unless set, as each needs an installation of its own.
  * Each shard runs the command line's suite, and uninstall's, as well.
  */
 export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
 
 /** The shards whose suites need an installation of their own, run only when selected. */
-const OWN_INSTALLATION: readonly Shard[] = ["snapshots", "upgrade", "agents"];
+const OWN_INSTALLATION: readonly Shard[] = ["snapshots", "upgrade", "agents", "wake"];
 
-/** Whether a run of the shard `selected`, or of none, runs the suites of `shard`: the snapshots, upgrade and agents shards' only when selected. */
+/** Whether a run of the shard `selected`, or of none, runs the suites of `shard`: the snapshots, upgrade, agents and wake shards' only when selected. */
 export const runsShard = (selected: Shard | undefined, shard: Shard): boolean => selected === shard || (selected === undefined && !OWN_INSTALLATION.includes(shard));
 
 /** Whether the run runs the suites of `shard`. */
@@ -366,8 +367,8 @@ export const kube = {
     Effect.runPromise(Effect.provideService(awaitReady(refs, { timeout, poll: "2 seconds" }), KubeApi, kubeApi())),
 
   /** What the container has logged, or, `previous`, its instance before this one, which ended. */
-  logs: (namespace: string, pod: string, container: string, { previous = false }: { readonly previous?: boolean } = {}): Promise<string> =>
-    Effect.runPromise(kubeApi().logs(namespace, pod, { container, previous }).pipe(Stream.decodeText(), Stream.mkString)),
+  logs: (namespace: string, pod: string, container: string, { previous = false, timestamps = false }: { readonly previous?: boolean; readonly timestamps?: boolean } = {}): Promise<string> =>
+    Effect.runPromise(kubeApi().logs(namespace, pod, { container, previous, timestamps }).pipe(Stream.decodeText(), Stream.mkString)),
 
   /**
    * All the container logs until it ends, as one that stops logs as it does, whose log goes
@@ -695,10 +696,11 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       },
       // The release before's as much as the box's asks for.
       resources: { requests: { cpu: "50m", memory: of === "previous" ? "2560Mi" : "256Mi" } },
-      // What KEDA scales of an environment's, its relay of its Codex login among it, back to none within the agents shard's run.
-      ...(of === "release" && SHARD === "agents" ? { cooldownSeconds: 30 } : {}),
-      // One, as the suites reach its pod as one, but where the agents shard makes its scale a range and fixes it again, and in
-      // the upgrade shard, whose cut-over upgrades to the default scale, KEDA's, as an installation of the release before's does.
+      // What KEDA scales of an environment's, its relay of its Codex login among it, back to none within the agents and wake shards' runs.
+      ...(of === "release" && (SHARD === "agents" || SHARD === "wake") ? { cooldownSeconds: 30 } : {}),
+      // One, as the suites reach its pod as one, but where the agents shard makes its scale a range and fixes it again, and the
+      // wake shard's gate gives it the default scale, KEDA's, which its press wakes from none; and in the upgrade shard, whose
+      // cut-over upgrades to the default scale, as an installation of the release before's does.
       ...(of === "release" && SHARD !== "upgrade" ? { scaling: { min: 1, max: 1 } } : {}),
       ...on("agent-1"),
     },
@@ -710,11 +712,12 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       ...(of === "previous" ? { releaseAfter: "4h" } : {}),
     },
     // Conversations' harnesses' pools, of this checkout's configuration alone, as the release before has none:
-    // released within the run in the agents shard alone, as the other suites' turns are not written to wait on a pool's pod.
+    // released within the run in the agents and wake shards alone, as the other suites' turns are not written to wait on a pool's
+    // pod: the wake shard's alasio sleeps only once nothing the command line's suite left keeps it awake.
     ...(of === "release"
       ? {
         harness: {
-          pools: { scaling: { min: 1, max: 2 }, releaseAfter: SHARD === "agents" ? `${HARNESS_RELEASE_AFTER_SECONDS}s` : "24h" },
+          pools: { scaling: { min: 1, max: 2 }, releaseAfter: SHARD === "agents" || SHARD === "wake" ? `${HARNESS_RELEASE_AFTER_SECONDS}s` : "24h" },
           session: { resources: { requests: { cpu: "20m", memory: "128Mi" } } },
           folder: { resources: { requests: { cpu: "20m", memory: "128Mi" } } },
         },
@@ -724,10 +727,10 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       storage: { size: "1Gi" },
       // The snapshots shard's sessions hold a REPL of BIG_REPL_MEBIBYTES live, with room for bayma and gVisor.
       resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: { cpu: "1", memory: SHARD === "snapshots" ? "3Gi" : "1Gi" } },
-      // Never released within the run but in the snapshots and upgrade shards: the other suites
+      // Never released within the run but in the snapshots, upgrade and wake shards: the other suites
       // reach sessions by exec in their pods, which is no exec of bayma's, and a release would end
       // their pods under them.
-      snapshots: { releaseAfter: SHARD === "snapshots" || SHARD === "upgrade" ? `${RELEASE_AFTER_SECONDS}s` : "24h" },
+      snapshots: { releaseAfter: SHARD === "snapshots" || SHARD === "upgrade" || SHARD === "wake" ? `${RELEASE_AFTER_SECONDS}s` : "24h" },
       // On one agent, but in the snapshots shard, where a session runs on any node, as it may be restored on another than it was saved on.
       ...(SHARD === "snapshots" ? {} : on("agent-0")),
     },
