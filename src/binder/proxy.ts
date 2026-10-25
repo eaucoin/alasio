@@ -36,13 +36,17 @@ function endToEnd(headers: IncomingHttpHeaders): OutgoingHttpHeaders {
   return Object.fromEntries(Object.entries(headers).filter(([name]) => !HOP_BY_HOP.has(name) && !named.has(name)));
 }
 
+/** Whether `answer` is an event stream (server-sent events), as an MCP server's GET is answered. */
+export const eventStream = (answer: IncomingMessage): boolean => /^text\/event-stream\b/iu.test(answer.headers["content-type"] ?? "");
+
 /**
  * Passes `incoming` to `route` and its answer to `outgoing`, as the module says: its body as
- * it comes, or `body`, where the caller read it first, so it may be passed again. Where the
- * pod is not reached, nothing is answered: the caller decides what to answer (as binding the
- * key anew), from what it came to.
+ * it comes, or `body`, where the caller read it first, so it may be passed again; `headed`
+ * told of the pod's answer once its head is passed on. Where the pod is not reached, nothing
+ * is answered: the caller decides what to answer (as binding the key anew), from what it came
+ * to.
  */
-export function proxy(incoming: IncomingMessage, outgoing: ServerResponse, route: Route, body?: Uint8Array): Promise<Proxied> {
+export function proxy(incoming: IncomingMessage, outgoing: ServerResponse, route: Route, body?: Uint8Array, headed?: (answer: IncomingMessage) => void): Promise<Proxied> {
   return new Promise((resolve) => {
     const upstream = request({
       host: route.address,
@@ -72,6 +76,7 @@ export function proxy(incoming: IncomingMessage, outgoing: ServerResponse, route
         outgoing.destroy();
         resolve({ reached: true, status: response.statusCode ?? 502 });
       });
+      headed?.(response);
     });
     upstream.on("error", (error) => {
       if (answered) outgoing.destroy();

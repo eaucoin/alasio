@@ -73,9 +73,12 @@
  * its endpoints are let go of, is refused at once rather than left to wait on a pod gone; and a
  * request that comes on a connection it kept, as a keep-alive caller's, is answered 503 saying
  * no pod was given it (NOT_PASSED_HEADER), for its caller to ask again, its connection closed.
- * It lets its requests under way end, each told to close its connection as it does, its
- * callers' streams but, for STOP_CALLS_MS at most, and runs on for STOP_LINGER_MS at least, so it is there to
- * refuse while the routes to it are let go of; what is left then, the streams among it, is cut.
+ * Its callers' streams, the GETs it passes on that are answered as event streams, it cuts at
+ * once, and one whose head comes as it stops as that comes, for each to be opened again where
+ * a gateway is. It lets its requests under way end, another GET among them, each told to close
+ * its connection as it does, for STOP_CALLS_MS at most, and runs on for STOP_LINGER_MS at
+ * least, so it is there to refuse while the routes to it are let go of; what is left then is
+ * cut.
  */
 import { createHmac } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -89,7 +92,7 @@ import { BearerToken } from "../shared/tokens.ts";
 import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
 import { boundIn, counts, touchLease } from "./bindings.ts";
 import { EVENTS_PATH, GATEWAY_READINESS, NO_BIND_HEADER, NOT_PASSED_HEADER, PINNED_HEADER, type Pool, STOP_GRACE_SECONDS } from "./names.ts";
-import { proxy, type Route } from "./proxy.ts";
+import { eventStream, proxy, type Route } from "./proxy.ts";
 import type { Held } from "./live.ts";
 import { bindingToken, type HeldTo, mintToken, type TokenClaims, verifyToken } from "./tokens.ts";
 
@@ -572,9 +575,15 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
           // stream an MCP client listens on for what its server sends of its own, open for as long as the client is,
           // waits on nothing it asked.
           if (incoming.method === "GET") {
-            // A stream, which a stop waits on no more than its caller does.
-            streams.add(outgoing);
-            return yield* Effect.promise(() => proxy(incoming, outgoing, to, body));
+            // Answered as an event stream, a stream, which a stop cuts at once, as it does one
+            // whose head comes as it stops; another GET is a request under way, let end.
+            return yield* Effect.promise(() =>
+              proxy(incoming, outgoing, to, body, (answer) => {
+                if (!eventStream(answer)) return;
+                streams.add(outgoing);
+                if (stopping) outgoing.destroy();
+              })
+            );
           }
           const flight = slot(to.pool, key);
           flights.set(flight, (flights.get(flight) ?? 0) + 1);
@@ -614,7 +623,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       withLogScope("binder"),
     );
 
-  /** Whether the front is told to stop, as the module says; what it is answering, and of that the streams it passes on. */
+  /** Whether the front is told to stop, as the module says; what it is answering, and of that the streams it passes on, answered as event streams. */
   let stopping = false;
   const answering = new Set<ServerResponse>();
   const streams = new Set<ServerResponse>();
@@ -643,6 +652,12 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         // An answer under way told to close its connection as it ends, its headers not sent yet,
         // so its caller sends nothing more on it, which the cut as the stop ends would reset.
         for (const outgoing of answering) if (!outgoing.headersSent) outgoing.shouldKeepAlive = false;
+        // Its callers' streams cut at once, not left open past what reaches it: a server's request
+        // sent on one, as bayma's ping of its client, would be answered by a call the front refuses,
+        // and go unanswered for as long as no gateway is reached, its MCP session closed for it;
+        // cut, its caller opens it again where a gateway is (as bayma counts a ping whose stream
+        // ended for nothing).
+        for (const stream of streams) stream.destroy();
         server.close(() => Deferred.doneUnsafe(closed, Exit.void));
         // Those idle now closed, once: a request on one kept after is answered as the module
         // says, never cut, as a connection closed as its caller writes on it would be.

@@ -257,30 +257,105 @@ test("a front told to stop lets a request under way end that it answers itself, 
   }
 });
 
-test("a front told to stop waits on no caller's stream it passes on, cutting it as its linger ends", { timeout: 30_000 }, async () => {
+/**
+ * A pod whose every GET is answered as an event stream that stays open, as an MCP server's, its
+ * head `headMs` after it came: how many it was sent, and when its first stream ended, as an MCP
+ * server is told.
+ */
+async function streamingPods(headMs = 0): Promise<{ port: number; sent: () => number; ended: Promise<number>; close: () => void }> {
+  let sent = 0;
+  let ends: (at: number) => void = () => {};
+  const ended = new Promise<number>((resolve) => (ends = resolve));
+  const server = createServer((incoming, outgoing) => {
+    sent += 1;
+    incoming.resume();
+    outgoing.on("close", () => ends(Date.now()));
+    setTimeout(() => {
+      outgoing.writeHead(200, { "content-type": "text/event-stream" });
+      outgoing.flushHeaders();
+    }, headMs);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  return { port: (server.address() as AddressInfo).port, sent: () => sent, ended, close: () => (server.closeAllConnections(), server.close()) };
+}
+
+/** When `ended` came, ms after `from`, or Infinity where it has not within `withinMs`. */
+async function msUntil(ended: Promise<number>, from: number, withinMs: number): Promise<number> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<number>((resolve) => (timer = setTimeout(resolve, withinMs, Infinity)));
+  try {
+    return await Promise.race([ended.then((at) => at - from), late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test("a front told to stop cuts at once each caller's stream it passes on, for the caller to open it again where a gateway is, and waits on none", { timeout: 30_000 }, async () => {
   const of = await pool();
   await freePods(of, 1);
-  // A pod whose stream, an MCP client's GET, stays open, its head sent.
-  let streams = 0;
-  const stand = createServer((incoming, outgoing) => {
-    streams += 1;
-    incoming.resume();
-    outgoing.writeHead(200, { "content-type": "text/event-stream" });
-    outgoing.flushHeaders();
-  });
-  stand.listen(0, "127.0.0.1");
-  await once(stand, "listening");
-  const served = await front(of, (stand.address() as AddressInfo).port, { stopping: { callsMs: 10_000, lingerMs: 500 } });
+  const stand = await streamingPods();
+  const served = await front(of, stand.port, { stopping: { callsMs: 10_000, lingerMs: 5_000 } });
   try {
     const listening = await fetch(`http://127.0.0.1:${served.port}/mcp`, { headers: { authorization: caller("sessionfs:listening") } });
-    assert.deepEqual([listening.status, streams], [200, 1]);
-    const ended = listening.text().then(() => "ended", () => "cut");
+    assert.deepEqual([listening.status, stand.sent()], [200, 1]);
     const told = Date.now();
-    await served.close();
-    assert.ok(Date.now() - told < 3_000, `stopped in ${Date.now() - told} ms, waiting on a stream`);
-    assert.equal(await ended, "cut");
+    const ended = listening.text().then(() => "ended", () => "cut").then((how) => ({ how, ms: Date.now() - told }));
+    const stopped = served.close();
+    // Cut as the stop begins, long before its linger ends.
+    const cut = await ended;
+    assert.equal(cut.how, "cut");
+    assert.ok(cut.ms < 2_000, `cut ${cut.ms} ms into the stop`);
+    // Ended at the pod too, as bayma, which pings its client on the stream, counts a ping whose stream ended for nothing.
+    const podMs = await msUntil(stand.ended, told, 4_000);
+    assert.ok(podMs < 2_000, `the pod's stream ended ${podMs} ms into the stop`);
+    await stopped;
+    assert.ok(Date.now() - told < 8_000, `stopped in ${Date.now() - told} ms, waiting on a stream`);
   } finally {
-    stand.closeAllConnections();
+    stand.close();
+  }
+});
+
+test("a front told to stop cuts a caller's stream whose head comes as it stops, as it comes", { timeout: 30_000 }, async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await streamingPods(1_000);
+  const served = await front(of, stand.port, { stopping: { callsMs: 10_000, lingerMs: 6_000 } });
+  try {
+    const listening = fetch(`http://127.0.0.1:${served.port}/mcp`, { headers: { authorization: caller("sessionfs:opening") } }).then((answered) => answered.text());
+    for (const deadline = Date.now() + 10_000; stand.sent() === 0; await new Promise((resolve) => setTimeout(resolve, 20))) {
+      assert.ok(Date.now() < deadline, "the stream was never passed on");
+    }
+    const told = Date.now();
+    const ended = listening.then(() => "ended", () => "cut").then((how) => ({ how, ms: Date.now() - told }));
+    const stopped = served.close();
+    // Cut as its head came, a second into the stop, long before its linger ends.
+    const cut = await ended;
+    assert.equal(cut.how, "cut");
+    assert.ok(cut.ms < 3_000, `cut ${cut.ms} ms into the stop`);
+    const podMs = await msUntil(stand.ended, told, 5_000);
+    assert.ok(podMs < 3_000, `the pod's stream ended ${podMs} ms into the stop`);
+    await stopped;
+  } finally {
+    stand.close();
+  }
+});
+
+test("a front told to stop lets a GET under way end that is answered as no event stream", { timeout: 30_000 }, async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await slowPods(1_500);
+  const served = await front(of, stand.port, { stopping: { callsMs: 10_000, lingerMs: 0 } });
+  try {
+    const asking = fetch(`http://127.0.0.1:${served.port}/status`, { headers: { authorization: caller("sessionfs:status") } }).then(async (answered) => [answered.status, await answered.text()]);
+    for (const deadline = Date.now() + 10_000; stand.sent() === 0; await new Promise((resolve) => setTimeout(resolve, 20))) {
+      assert.ok(Date.now() < deadline, "the GET was never passed on");
+    }
+    const told = Date.now();
+    const stopped = served.close().then(() => Date.now() - told);
+    assert.deepEqual(await asking, [200, "{}"]);
+    assert.ok((await stopped) >= 1_000, "the stop did not wait for the GET under way");
+  } finally {
     stand.close();
   }
 });
