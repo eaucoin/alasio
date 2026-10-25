@@ -516,6 +516,8 @@ export interface MountPaths {
   readonly inNode: string;
   /** What resolves a name by the pod's DNS: its address first on the line it prints. */
   readonly resolve: string;
+  /** Where the node's FUSE connections are, as the node's mount namespace has them, fusectl's mount, made where it is not there. */
+  readonly fuseConnections: string;
 }
 
 /**
@@ -534,6 +536,7 @@ export const MOUNT_PATHS: MountPaths = {
   mountinfo: "/proc/1/mountinfo",
   inNode: "nsenter -t 1 -m --",
   resolve: "getent hosts",
+  fuseConnections: "/sys/fs/fuse/connections",
 };
 
 /**
@@ -554,7 +557,10 @@ export const MOUNT_PATHS: MountPaths = {
  * Its juicefs, taking a mount over or mounting afresh, serves within MOUNT_SERVE_WAIT_SECONDS
  * (`serveWaitSeconds`), or is ended, and the mount fails, so kubelet starts it again, to mount
  * afresh: a takeover whose old mount stopped answering waits, in juicefs's own reads of it, for
- * as long as it does, and no juicefs serves the node's mount meanwhile.
+ * as long as it does, and no juicefs serves the node's mount meanwhile. Ended so, or unmounted as
+ * one that answers nothing, the node's mount has its FUSE connection aborted first: a request on
+ * a session no process will answer, as a juicefs makes of the one it takes over and holds, waits
+ * where no signal ends it, KILL among them, until its connection is aborted, which fails it.
  *
  * In the node's mount namespace its juicefs reads the node's resolv.conf, which resolves none of
  * the cluster's names, its network the pod's still: so the metadata engine's and the bucket's,
@@ -570,8 +576,29 @@ export const MOUNT_PATHS: MountPaths = {
  * (workspaceMountReady). `paths` are MOUNT_PATHS but for tests.
  */
 export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: MountPaths = MOUNT_PATHS, serveWaitSeconds = MOUNT_SERVE_WAIT_SECONDS): string {
-  const { run, bin, state, cache, juicefs, mountinfo, inNode, resolve } = paths;
+  const { run, bin, state, cache, juicefs, mountinfo, inNode, resolve, fuseConnections } = paths;
   return [
+    // The FUSE connection of the node's mount at the root aborted, where its mount there, the
+    // topmost, is a FUSE file system's: every request on it fails, those no process will ever
+    // answer among them, as one a juicefs makes of the very session it takes over and holds,
+    // which leaves it waiting where no signal, not even KILL, ends it. Its connection is named by
+    // the minor of the mount's device, under fusectl's mount, made where the node has none.
+    "aborted() {",
+    `  connection=$(awk -v root=${root} '$5 == root { connection = ""; for (i = 6; i < NF; i += 1) if ($i == "-") { if ($(i + 1) ~ /^fuse(\\.|$)/) { split($3, device, ":"); connection = device[2] }; break } } END { print connection }' ${mountinfo})`,
+    '  [ -n "$connection" ] || return 0',
+    `  grep -qF ' ${fuseConnections} ' ${mountinfo} || ${inNode} mount -t fusectl none ${fuseConnections}`,
+    `  ${inNode} sh -c 'echo 1 > "$1"' sh "${fuseConnections}/$connection/abort" && echo "aborted the FUSE connection $connection of the node's mount, so what waits on it fails"`,
+    "}",
+    // Whether the node's mount at the root answers its .config within 5 s, which juicefs answers
+    // of its own memory, what the read said kept in $run/probed: where not, no process serves it,
+    // or one stopped or hung does. Not waited on past that: a read juicefs took but never
+    // answers waits where no signal ends it, until the connection is aborted, which frees it.
+    "answers() {",
+    `  rm -f "$run/answered" "$run/probed"`,
+    `  ( ${inNode} cat ${root}/.config > /dev/null 2> "$run/probed"; : > "$run/answered" ) &`,
+    `  for tick in 1 2 3 4 5; do sleep 1; [ -e "$run/answered" ] && return 0; done`,
+    "  return 1",
+    "}",
     // `url`, its host a Service's name given as its address, by the pod's DNS.
     "resolved() {",
     '  scheme=${1%%://*}; rest=${1#*://}; auth=""',
@@ -591,7 +618,7 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     'bucket=$(resolved "$BUCKET") || exit 1',
     `run=${run}`,
     `mkdir -p "$run" ${bin} ${state} ${cache} || exit 1`,
-    `rm -f "$run/handed-over"`,
+    `rm -f "$run/handed-over" "$run/expired"`,
     // Made, empty, before the mount starts or the log is followed, which would not find it yet.
     `: > "$run/juicefs.log"`,
     // Named by its digest, read whole: a read that fails, as one of a layer lazily pulled may, stops
@@ -610,10 +637,10 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     // is, or unreachable, as it is where `up` rolls the mount, is answered and taken over, its
     // workspaces kept. Its takeover reads the same file (cmd/mount.go).
     `if awk -v root=${root} '$5 == root { found = 1 } END { exit !found }' ${mountinfo}; then`,
-    `  probed=$(timeout -s KILL 5 ${inNode} cat ${root}/.config 2>&1 >/dev/null); probing=$?`,
-    `  if [ "$probing" -eq 137 ] || [ "$probing" -eq 124 ]; then`,
+    "  if ! answers; then",
+    "    aborted",
     `    ${inNode} umount -l ${root} && echo "unmounted the node's mount, whose juicefs answered nothing in 5 s, not even its .config"`,
-    `  elif printf '%s' "$probed" | grep -qi 'not connected'; then`,
+    `  elif grep -qi 'not connected' "$run/probed"; then`,
     `    ${inNode} umount -l ${root} && echo "unmounted the node's mount its juicefs left, which served nothing"`,
     "  fi",
     "fi",
@@ -623,12 +650,24 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     `echo "$pid" > "$run/juicefs.pid"`,
     `tail -n +1 -f "$run/juicefs.log" &`,
     "tailer=$!",
-    // Ended where it serves nothing within its wait: TERM, and KILL 5 s on, as one held up on a
-    // read of a mount that answers nothing may not end on TERM.
+    // Ended where it serves nothing within its wait, its watcher's end awaited then (expired):
+    // what each of its goroutines waits on said, into its log, as Go says it on QUIT, of it and
+    // of each process it runs, while their main threads run still, as a KILLed process one of
+    // whose threads waits on yet says nothing. Then, where the node's mount answers nothing, as
+    // where it holds the session no process serves, its FUSE connection aborted, as what holds
+    // it up may be a request on it that nothing answers, which no signal ends; TERM, and KILL 5 s
+    // on; and the mount, dead, unmounted, so the next mounts afresh. Where it answers, it is the
+    // mount of the pod this replaces, served still, which the next takes over again.
     "(",
     `  for second in $(seq ${serveWaitSeconds}); do grep -qF '${SERVING}' "$run/juicefs.log" && exit 0; kill -0 "$pid" 2>/dev/null || exit 0; sleep 1; done`,
+    `  : > "$run/expired"`,
     `  echo "juicefs served nothing within ${serveWaitSeconds} s of starting, so it is ended, and the mount started again to mount afresh" >&2`,
+    `  for proc in /proc/[0-9]*; do [ "$(sed 's/.*) //' "$proc/stat" 2>/dev/null | cut -d ' ' -f 2)" = "$pid" ] && kill -QUIT "\${proc#/proc/}" 2>/dev/null; done`,
+    `  kill -QUIT "$pid" 2>/dev/null; sleep 2`,
+    "  dead=",
+    "  if ! answers; then aborted; dead=1; fi",
     `  kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null`,
+    `  if [ -n "$dead" ]; then ${inNode} umount -l ${root} && echo "unmounted the node's mount, which no juicefs served"; fi`,
     ") &",
     "watcher=$!",
     `trap 'kill -TERM "$pid"' TERM INT`,
@@ -636,6 +675,7 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     // A TERM's wait ends as the trap runs; the mount's own end is waited for.
     `while kill -0 "$pid" 2>/dev/null; do wait "$pid"; code=$?; done`,
     "sleep 1",
+    `if [ -e "$run/expired" ]; then wait "$watcher"; fi`,
     `kill "$tailer" "$watcher" 2>/dev/null`,
     `if grep -qF '${HANDED_OVER}' "$run/juicefs.log"; then`,
     `  touch "$run/handed-over"`,

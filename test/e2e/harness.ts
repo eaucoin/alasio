@@ -1147,8 +1147,12 @@ export async function dumpClusterState(): Promise<void> {
       `  fields=$(sed 's/.*) //' "$proc/stat" 2>/dev/null) || continue`,
       `  state=$(echo "$fields" | cut -d ' ' -f 1)`,
       `  command=$(tr '\\0' ' ' < "$proc/cmdline" 2>/dev/null)`,
-      `  case "$state:$command" in D:*|*juicefs*) ;; *) continue ;; esac`,
-      `  echo "pid \${proc#/proc/} $state, waiting in $(cat "$proc/wchan" 2>/dev/null), its parent $(echo "$fields" | cut -d ' ' -f 2): $command"`,
+      // By its name too, and any of its threads' waiting uninterruptibly: a juicefs whose main
+      // thread has ended, a zombie, has no command line, as one of its threads waits on yet.
+      `  name=$(awk '/^Name:/ { print $2; exit }' "$proc/status" 2>/dev/null)`,
+      `  waiting=$(cat "$proc"/task/*/stat 2>/dev/null | sed 's/.*) //' | cut -d ' ' -f 1 | grep -c '^D')`,
+      `  case "$state:$name:$command" in D:*|*:juicefs*:*|*juicefs*) ;; *) [ "$waiting" -gt 0 ] || continue ;; esac`,
+      `  echo "pid \${proc#/proc/} $state, named $name, $waiting of its threads waiting uninterruptibly, waiting in $(cat "$proc/wchan" 2>/dev/null), its parent $(echo "$fields" | cut -d ' ' -f 2): $command"`,
       `  sed 's/^/    /' "$proc/stack" 2>/dev/null`,
       `  for task in "$proc"/task/*; do`,
       `    [ "\${task##*/}" = "\${proc#/proc/}" ] && continue`,
@@ -1157,7 +1161,10 @@ export async function dumpClusterState(): Promise<void> {
       "  done",
       `  for fd in "$proc"/fd/*; do target=$(readlink "$fd" 2>/dev/null) || continue; case "$target" in *fuse*|socket:*) echo "    fd \${fd##*/} $target";; esac; done`,
       "done",
-      `nsenter -t 1 -m -- sh -c 'for connection in /sys/fs/fuse/connections/*; do [ -e "$connection/waiting" ] && echo "FUSE connection \${connection##*/}: $(cat "$connection/waiting") waiting"; done' 2>&1`,
+      // fusectl's mount made where the node has none, its connections otherwise unseen.
+      `nsenter -t 1 -m -- sh -c 'grep -qF " /sys/fs/fuse/connections " /proc/self/mountinfo || mount -t fusectl none /sys/fs/fuse/connections; for connection in /sys/fs/fuse/connections/*; do [ -e "$connection/waiting" ] && echo "FUSE connection \${connection##*/}: $(cat "$connection/waiting") waiting"; done' 2>&1`,
+      // And which mount each is, by its device's minor.
+      `nsenter -t 1 -m -- awk '{ for (i = 6; i < NF; i += 1) if ($i == "-") { if ($(i + 1) ~ /^fuse(\\.|$)/) { split($3, device, ":"); print "FUSE connection " device[2] " is the mount at " $5 }; break } }' /proc/self/mountinfo 2>&1`,
     ].join("\n");
     // Of a mount's juicefs that has not said it serves two minutes after it started, as one held up taking a mount
     // over does: what each of its goroutines waits on, as Go says it on SIGQUIT, which ends it, for kubelet to start

@@ -292,11 +292,18 @@ export function sandboxService(): void {
       assert.equal(after.status, 204, `${after.said}; ${await seen()}`);
     });
 
-    test("a handover whose old mount answers nothing, its juicefs held up, leaves the node's mount served by a new pod within its juicefs's wait and its restart, the old mount unmounted", { timeout: 20 * 60_000 }, async () => {
+    test("a handover whose old mount answers nothing, its juicefs held up, leaves the node's mount served by a new pod within its juicefs's wait and its restart, the old mount's FUSE connection aborted, so a process waiting on it where no signal ends it ends, and the mount unmounted", { timeout: 20 * 60_000 }, async () => {
       const mountPods = async () => kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("workspace-mount")) });
       const [before] = await mountPods();
       assert.ok(before?.spec?.nodeName && before.metadata?.name);
       const node = before.spec.nodeName;
+      // A process of the node's holding a file of the mount open, as a session's does: once the mount answers nothing,
+      // KILLed, its exit's flush of that file waits on a request no process will answer, where no signal ends it, as
+      // a takeover's juicefs's did in CI run 40158785689. Started on its own, so it outlives the exec that starts it.
+      const holder = (await kube.execOk(NAMESPACE, before.metadata.name, ["sh", "-c", `setsid nsenter -t 1 -m -- sh -c 'exec 3< ${WORKSPACES_ROOT}/.config; exec sleep 3600' > /dev/null 2>&1 < /dev/null & echo $!`], { container: "workspace-mount" })).trim();
+      assert.match(holder, /^\d+$/u);
+      /** Whether the holder's process is there still, and how its threads are: none, where it is gone. */
+      const holding = (pod: string) => kube.execOk(NAMESPACE, pod, ["sh", "-c", `cat /proc/${holder}/task/*/stat 2>/dev/null | sed 's/.*) //' | cut -d ' ' -f 1 | tr '\\n' ' '`], { container: "workspace-mount" }).then((states) => states.trim());
       // Its juicefs held up, as one that answers nothing is: its supervisor and the mount process it runs stopped, the
       // FUSE session theirs still, so the node's mount answers no request, as in CI run 39965151183.
       const stop = [
@@ -305,6 +312,11 @@ export function sandboxService(): void {
         'kill -STOP "$supervisor"',
       ].join("\n");
       await kube.execOk(NAMESPACE, before.metadata.name, ["sh", "-c", stop], { container: "workspace-mount" });
+      // KILLed, the holder stays, waiting uninterruptibly on its flush.
+      await kube.execOk(NAMESPACE, before.metadata.name, ["kill", "-KILL", holder], { container: "workspace-mount" });
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      const held = await holding(before.metadata.name);
+      assert.match(held, /D/u, `the holder, KILLed, is not waiting uninterruptibly: ${held || "gone"}`);
       await kube.patch(ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE), { spec: { template: { metadata: { annotations: { "alasio.dev/e2e-restartedAt": new Date().toISOString() } } } } });
       // Served again by a pod of the new template alone: the old deleted once the new is ready.
       await until("the node's mount served by a new pod alone", async () => {
@@ -325,6 +337,9 @@ export function sandboxService(): void {
         if (made.status === 204) break;
       }
       assert.equal(made.status, 204, made.said);
+      // The holder ended, its flush failed as the old mount's FUSE connection was aborted before it was unmounted.
+      const [now] = (await mountPods()).filter(({ spec, metadata }) => spec?.nodeName === node && !metadata?.deletionTimestamp);
+      assert.equal(await holding(now?.metadata?.name ?? ""), "", "the holder, its flush unanswered, is there still");
     });
 
     test("a node's mount of workspace storage killed with no successor, as a node's reboot ends it, is mounted again by the DaemonSet's restart: a workspace is made after it, and one bound through it is released as broken, then bound again with what it held", async () => {

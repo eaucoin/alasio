@@ -23,7 +23,7 @@ import { HANDED_OVER, type MountPaths, SERVING, workspaceMountReady, workspaceMo
 import { serveFakeKube } from "./support/fake-kube.ts";
 
 /** What juicefs's stand-in does: serve until it is ended, take a mount over once told to and serve it, hand its mount over, or fail. */
-type Juicefs = "serves" | "takes over" | "hands over" | "fails" | "never serves";
+type Juicefs = "serves" | "takes over" | "hands over" | "fails" | "never serves" | "dies on quit";
 
 interface Mount {
   readonly paths: MountPaths;
@@ -45,10 +45,14 @@ interface Mount {
  * where `hung`, the table holds a mount at the root already that answers nothing, as one whose
  * juicefs is stopped or hangs does, until it is unmounted; where `slow`, the mount it takes over
  * answers what needs its metadata engine, a listing, in no less than a minute, as one whose
- * metadata engine is slow does, and what it holds in memory, its .config, at once.
- * `serveWaitSeconds` is how long its juicefs has to serve.
+ * metadata engine is slow does, and what it holds in memory, its .config, at once; where `held`,
+ * the table holds the mount of the pod it replaces, which answers its .config, as one its
+ * juicefs takes over does; where `foreign`, it holds, on top of any other at the root, a mount of
+ * the same minor that is no FUSE connection's: a block device's FUSE file system; where `takes`, its juicefs, as it starts, takes the node's mount's
+ * session, which no process serves then, so the mount answers nothing; where `fusectl`, the
+ * node has fusectl's mount. `serveWaitSeconds` is how long its juicefs has to serve.
  */
-function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = false, unreadable = false, hung = false, slow = false, serveWaitSeconds = 180, env: given = {} as Record<string, string> } = {}): Mount & { readonly takeOver: () => void } {
+function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = false, unreadable = false, hung = false, slow = false, held = false, foreign = false, takes = false, fusectl = false, serveWaitSeconds = 180, env: given = {} as Record<string, string> } = {}): Mount & { readonly takeOver: () => void; readonly aborted: () => string } {
   const directory = mkdtempSync(join(tmpdir(), "alasio-workspace-mount-"));
   const root = join(directory, "workspaces");
   const mountinfo = join(directory, "mountinfo");
@@ -59,7 +63,13 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = f
   const slowed = join(directory, "slow");
   const line = `36 1 0:50 / ${root} rw,relatime shared:9 - fuse.juicefs JuiceFS:workspaces rw`;
   // The mount of the pod a mount that takes over replaces, served still.
-  writeFileSync(mountinfo, left || hung || juicefs === "takes over" ? `${line}\n` : "");
+  writeFileSync(mountinfo, `${left || hung || held || juicefs === "takes over" ? `${line}\n` : ""}${foreign ? `37 1 0:50 / ${root} rw - fuseblk /dev/sdb1 rw\n` : ""}`);
+  // The node's FUSE connections, fusectl's: the mount's, of its device's minor, aborted as 1 is written to its abort.
+  const fuse = join(directory, "fuse-connections");
+  mkdirSync(join(fuse, "50"), { recursive: true });
+  writeFileSync(join(fuse, "50", "abort"), "");
+  if (fusectl) writeFileSync(mountinfo, `${readFileSync(mountinfo, "utf8")}24 22 0:21 / ${fuse} rw - fusectl fusectl rw\n`);
+  const taking = takes ? `require("node:fs").writeFileSync(${JSON.stringify(hanging)}, ""); ` : "";
   if (hung) writeFileSync(hanging, "");
   if (left) writeFileSync(dead, "");
   if (unreachable) writeFileSync(failing, "");
@@ -74,7 +84,11 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = f
     "hands over": `echo 'juicefs[7] <INFO>: ${HANDED_OVER} [launchMount@mount_unix.go:1057]'; exit 1`,
     fails: "echo 'juicefs[7] <FATAL>: the metadata engine refused us'; exit 3",
     // As one held up on a read of a mount that answers nothing: it says nothing more, and ends on KILL alone.
-    "never serves": "echo 'juicefs[7] <INFO>: Data use s3://bucket/workspaces/'; trap '' TERM; while :; do sleep 0.1; done",
+    // Node, not sh, which an asynchronous list's QUIT is ignored in, past any trap. As one held up where no signal but
+    // KILL ends it, it says its goroutines on QUIT, as Go's runtime does, and so does the mount process it runs, and
+    // goes on; or, as Go's runtime, says them and ends.
+    "never serves": `exec node -e '${taking}console.log("juicefs[7] <INFO>: Data use s3://bucket/workspaces/"); require("node:child_process").spawn(process.execPath, ["-e", "process.on(\\"SIGQUIT\\", () => console.log(\\"goroutine 9 [mount process]:\\")); setInterval(() => {}, 100)"], { stdio: "inherit" }); process.on("SIGTERM", () => console.log("TERM heard")); process.on("SIGQUIT", () => console.log("goroutine 1 [chan receive]:")); setInterval(() => {}, 100)'`,
+    "dies on quit": `exec node -e '${taking}console.log("juicefs[7] <INFO>: Data use s3://bucket/workspaces/"); process.on("SIGTERM", () => {}); process.on("SIGQUIT", () => { console.log("goroutine 1 [chan receive]:"); process.exit(2); }); setInterval(() => {}, 100)'`,
   };
   const image = join(directory, "image-juicefs");
   writeFileSync(image, `#!/bin/sh\n${what[juicefs]}\n`);
@@ -88,12 +102,15 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = f
     `echo "$*" >> ${ran}`,
     `if [ "$1" = ls ] || [ "$1" = cat ]; then`,
     `  if [ -e ${dead} ]; then echo "$1: '$2': Transport endpoint is not connected" >&2; exit 2; fi`,
-    `  if [ -e ${hanging} ]; then sleep 60; fi`,
+    // Hung, as a read a juicefs took but never answers is, which no wait outlasts: KILLed, it leaves behind what holds
+    // its output open, out of its group's reach, as the read itself stays where no signal ends it.
+    `  if [ -e ${hanging} ]; then setsid sleep 60 & wait; fi`,
     "fi",
     `if [ "$1" = cat ] && [ "$2" = ${root}/.config ]; then echo '{"Meta": {}}'; exit 0; fi`,
     `if [ "$1" = ls ] && [ -e ${failing} ]; then echo "ls: reading directory '$2': Input/output error" >&2; exit 2; fi`,
     `if [ "$1" = ls ] && [ -e ${slowed} ]; then sleep 60; fi`,
     `if [ "$1" = umount ]; then rm -f ${dead} ${hanging}; : > ${mountinfo}; exit 0; fi`,
+    `if [ "$1" = mount ]; then exit 0; fi`,
     'exec "$@"',
   ].join("\n"));
   // The pod's DNS: the cluster's two Services, and nothing else.
@@ -107,7 +124,7 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = f
     "esac",
   ].join("\n"));
   for (const file of [image, inNode, resolve]) chmodSync(file, 0o755);
-  const paths: MountPaths = { run: join(directory, "run"), bin: join(directory, "bin"), state: join(directory, "state"), cache: join(directory, "cache"), juicefs: unreadable ? join(directory, "unread-juicefs") : image, mountinfo, inNode, resolve: `${resolve} hosts` };
+  const paths: MountPaths = { run: join(directory, "run"), bin: join(directory, "bin"), state: join(directory, "state"), cache: join(directory, "cache"), juicefs: unreadable ? join(directory, "unread-juicefs") : image, mountinfo, inNode, resolve: `${resolve} hosts`, fuseConnections: fuse };
   mkdirSync(paths.run);
   const env = { ...process.env, META_URL: "redis://:a%40secret@alasio-valkey.alasio.svc.cluster.local:6379/1", BUCKET: "http://alasio-seaweedfs.alasio.svc.cluster.local:8333/workspaces", ...given };
   // A group of its own, so whatever it started is ended with it.
@@ -131,6 +148,7 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = f
     out: () => out,
     ended,
     takeOver: () => writeFileSync(told, ""),
+    aborted: () => readFileSync(join(fuse, "50", "abort"), "utf8"),
     ready: () => spawnSync("sh", ["-c", workspaceMountReady(root, paths)], { env }).status === 0,
     inNode: () => (existsSync(ran) ? readFileSync(ran, "utf8").trim().split("\n") : []),
   };
@@ -208,12 +226,49 @@ test("a mount whose juicefs serves nothing within its wait, as one held up takin
   assert.equal(stuck.ready(), false);
 });
 
+test("a mount whose juicefs serves nothing within its wait, holding the node's mount's session, which no process serves, says its goroutines' waits and those of the process it runs, has the mount's FUSE connection aborted before it is ended, as what holds it up may be a request on that session, which no signal ends, and the dead mount unmounted", { timeout: 60_000 }, async (t) => {
+  const stuck = mount(t, "never serves", { held: true, takes: true, serveWaitSeconds: 2 });
+  assert.equal(await stuck.ended, 137);
+  assert.equal(stuck.aborted(), "1\n");
+  assert.match(stuck.out(), /goroutine 9 \[mount process\]:/u);
+  assert.match(stuck.out(), /goroutine 1 \[chan receive\]:[^]*aborted the FUSE connection 50 of the node's mount, so what waits on it fails[^]*TERM heard[^]*unmounted the node's mount, which no juicefs served/u);
+  assert.equal(readFileSync(stuck.paths.mountinfo, "utf8"), "");
+  // fusectl's mount made, the node having none.
+  assert.ok(stuck.inNode().includes(`mount -t fusectl none ${stuck.paths.fuseConnections}`), stuck.inNode().join("\n"));
+  // A juicefs that ends on QUIT, as Go's runtime does, has its mount aborted and unmounted all the same; and a node with fusectl's mount has none made.
+  const ending = mount(t, "dies on quit", { held: true, takes: true, fusectl: true, serveWaitSeconds: 2 });
+  assert.equal(await ending.ended, 2);
+  assert.equal(ending.aborted(), "1\n");
+  assert.match(ending.out(), /unmounted the node's mount, which no juicefs served/u);
+  assert.ok(!ending.inNode().some((command) => command.startsWith("mount -t fusectl")), ending.inNode().join("\n"));
+});
+
+test("a mount whose juicefs serves nothing within its wait, the node's mount it would take over served still, as before it asks for the session, is ended alone, that mount neither aborted nor unmounted, for the next to take over", { timeout: 30_000 }, async (t) => {
+  const stuck = mount(t, "never serves", { held: true, serveWaitSeconds: 2 });
+  assert.equal(await stuck.ended, 137);
+  assert.equal(stuck.aborted(), "");
+  assert.ok(!stuck.inNode().some((command) => command.startsWith("umount")), stuck.inNode().join("\n"));
+  assert.notEqual(readFileSync(stuck.paths.mountinfo, "utf8"), "");
+});
+
+test("a mount whose juicefs serves nothing within its wait aborts no connection where the root holds no mount, or, topmost, one of no FUSE connection's", { timeout: 30_000 }, async (t) => {
+  for (const none of [mount(t, "never serves", { takes: true, serveWaitSeconds: 2 }), mount(t, "never serves", { foreign: true, takes: true, serveWaitSeconds: 2 }), mount(t, "never serves", { held: true, foreign: true, takes: true, serveWaitSeconds: 2 })]) {
+    assert.equal(await none.ended, 137);
+    assert.equal(none.aborted(), "");
+    assert.doesNotMatch(none.out(), /aborted the FUSE connection/u);
+  }
+});
+
 test("a mount at the root that answers nothing, as one whose juicefs is stopped or hangs, not even its .config, is unmounted within 5 s before the node is mounted afresh", async (t) => {
   const serving = mount(t, "serves", { hung: true });
   await until(() => serving.ready(), 200);
   const ran = serving.inNode();
-  assert.ok(ran.indexOf(`umount -l ${serving.root}`) >= 0 && ran.indexOf(`umount -l ${serving.root}`) < ran.findIndex((command) => command.includes(" mount ")), ran.join("\n"));
+  assert.ok(ran.indexOf(`umount -l ${serving.root}`) >= 0 && ran.indexOf(`umount -l ${serving.root}`) < ran.findIndex((command) => command.includes(" mount --no-bgjob ")), ran.join("\n"));
   await until(() => serving.out().includes("unmounted the node's mount, whose juicefs answered nothing in 5 s, not even its .config"));
+  // Its FUSE connection aborted first, so what waits on it, unanswerable, fails rather than stays.
+  assert.equal(serving.aborted(), "1\n");
+  const aborting = ran.findIndex((command) => command.startsWith("sh -c") && command.includes("abort"));
+  assert.ok(aborting >= 0 && aborting < ran.indexOf(`umount -l ${serving.root}`), ran.join("\n"));
 });
 
 test("a mount whose metadata engine is slow, as it is where `up` rolls the mount, its listing taking a minute, but which answers its .config, is taken over, not unmounted", async (t) => {
@@ -229,7 +284,7 @@ test("a mount left at the root by a juicefs gone, as a pod killed with no succes
   const serving = mount(t, "serves", { left: true });
   await until(() => serving.ready());
   const ran = serving.inNode();
-  assert.ok(ran.indexOf(`umount -l ${serving.root}`) >= 0 && ran.indexOf(`umount -l ${serving.root}`) < ran.findIndex((command) => command.includes(" mount ")), ran.join("\n"));
+  assert.ok(ran.indexOf(`umount -l ${serving.root}`) >= 0 && ran.indexOf(`umount -l ${serving.root}`) < ran.findIndex((command) => command.includes(" mount --no-bgjob ")), ran.join("\n"));
   // As its output comes, which may be after its mount is ready.
   await until(() => serving.out().includes("unmounted the node's mount its juicefs left"));
   // One that serves is left be.
