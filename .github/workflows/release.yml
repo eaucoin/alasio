@@ -78,7 +78,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       # alasio's own images pushed as eStargz (tooling/push-estargz.sh), which the clusters
-      # alasio makes pull lazily.
+      # alasio makes pull lazily, but alasio's, whole (tooling/push-whole.sh), its start read
+      # from its nodes' disks.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # All eight at once, each line said with its image's name, the node image with its pins
       # (tooling/node-image.ts), whole, as Docker runs it; then each one's digest, as buildx
@@ -102,7 +103,9 @@ jobs:
                 # alasio's own, with the commit it is built from, which its telemetry says.
                 revision=()
                 if [ "$name" = alasio ]; then revision=(--build-arg "REVISION=$GITHUB_SHA"); fi
-                METADATA="$RUNNER_TEMP/$name.json" tooling/push-estargz.sh "$REGISTRY/$name:$VERSION" "${image#*:}" "${revision[@]}" "${labels[@]}"
+                push=tooling/push-estargz.sh
+                if [ "$name" = alasio ]; then push=tooling/push-whole.sh; fi
+                METADATA="$RUNNER_TEMP/$name.json" "$push" "$REGISTRY/$name:$VERSION" "${image#*:}" "${revision[@]}" "${labels[@]}"
               fi
             } 2>&1 | sed -u "s/^/$name: /" &
             pids[$name]=$!

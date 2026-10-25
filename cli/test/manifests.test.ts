@@ -3067,9 +3067,26 @@ describe("scaling", () => {
     assert.ok(Result.isFailure(refused) && refused.failure.message === "autoscaling.headroom.scaling must be 0 when autoscaling.preemption is false, as no pod takes a placeholder's place then");
   });
 
+  test("holds alasio's image on each of alasio's nodes, as its pods may be scheduled there, doing nothing, every node's pulled at once as it is upgraded", () => {
+    const config = { alasio: { nodeSelector: { "alasio.dev/role": "alasio" }, tolerations: [{ key: "dedicated", operator: "Equal", value: "alasio", effect: "NoSchedule" }], affinity: { nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchExpressions: [{ key: "zone", operator: "In", values: ["a"] }] }] } }, podAntiAffinity: { preferredDuringSchedulingIgnoredDuringExecution: [] } } } };
+    const objects = install(config);
+    const holder = one<V1DaemonSet>(objects, "DaemonSet", "alasio-image");
+    const alasio = one<V1Deployment>(objects, "Deployment", "alasio");
+    const spec = holder.spec?.template.spec;
+    // Of alasio's image, on alasio's nodes alone, its affinity to pods none of a DaemonSet's.
+    assert.equal(spec?.containers[0]?.image, alasio.spec?.template.spec?.containers.find(({ name }) => name === "alasio")?.image);
+    assert.deepEqual([spec?.nodeSelector, spec?.tolerations, spec?.affinity], [alasio.spec?.template.spec?.nodeSelector, alasio.spec?.template.spec?.tolerations, { nodeAffinity: config.alasio.affinity.nodeAffinity }]);
+    // Under the image's tini, as its arguments, so its pod's SIGTERM ends it.
+    assert.deepEqual([spec?.containers[0]?.command, spec?.containers[0]?.args], [undefined, ["sleep", "infinity"]]);
+    assert.deepEqual(holder.spec?.updateStrategy, { type: "RollingUpdate", rollingUpdate: { maxUnavailable: "100%", maxSurge: 0 } });
+    assert.equal(spec?.automountServiceAccountToken, false);
+  });
+
   test("sizes every workload by a VerticalPodAutoscaler beside it: in place what keeps no state and runs no turn, as it is made alasio's pod and the log, the rest recommended alone, from a small floor to half a core and its memory limit", () => {
     const objects = [...install({ host: { enabled: true } }), ...branchObjects(configOf(), "try", BASELINE)];
-    const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet"), ...all<V1DaemonSet>(objects, "DaemonSet")];
+    // But what holds alasio's image on its nodes, which runs nothing to size.
+    const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet"), ...all<V1DaemonSet>(objects, "DaemonSet")]
+      .filter(({ metadata }) => metadata?.name !== "alasio-image");
     const sized = all<VerticalPodAutoscaler>(objects, "VerticalPodAutoscaler");
     const key = ({ metadata }: KubernetesObject) => `${metadata?.namespace}/${metadata?.name}`;
     assert.deepEqual(sized.map(key).sort(), workloads.map(key).sort());

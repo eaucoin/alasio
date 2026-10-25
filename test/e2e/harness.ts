@@ -183,7 +183,8 @@ const PUSHED = process.env["ALASIO_E2E_REGISTRY"] || undefined;
 
 /**
  * Whether alasio's own images are eStargz, which the nodes pull lazily: as CI pushes them
- * (tooling/push-estargz.sh), not as the run builds them itself, whole.
+ * (tooling/push-estargz.sh), not as the run builds them itself, whole; alasio's own but, which
+ * CI pushes whole (tooling/push-whole.sh), as the release does.
  */
 export const ESTARGZ = PUSHED !== undefined;
 
@@ -702,7 +703,8 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       // wake shard's gate gives it the default scale, KEDA's, which its press wakes from none; and in the upgrade shard, whose
       // cut-over upgrades to the default scale, as an installation of the release before's does.
       ...(of === "release" && SHARD !== "upgrade" ? { scaling: { min: 1, max: 1 } } : {}),
-      ...on("agent-1"),
+      // On one node but in the wake shard, whose gate wakes it onto one it never ran on.
+      ...(SHARD === "wake" ? {} : on("agent-1")),
     },
     // The release before's folder instances let go after four hours idle, as the box's configuration says. This checkout's limited
     // to 1536Mi, for this run alone, so that a runaway exec's process runs past it without filling the runner, and the 800 MiB its

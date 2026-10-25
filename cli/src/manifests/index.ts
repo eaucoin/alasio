@@ -13,6 +13,7 @@ import { folderObjects } from "./folders.ts";
 import { grafanaObjects } from "./grafana.ts";
 import { harnessPoolObjects } from "./harness-pools.ts";
 import { headroomObjects } from "./headroom.ts";
+import { imageHolderObjects } from "./image-holder.ts";
 import { kedaObjects } from "./keda.ts";
 import { lakeObjects } from "./lake.ts";
 import { logObjects } from "./log.ts";
@@ -32,7 +33,7 @@ export { NAMESPACE } from "./common.ts";
 
 /**
  * The objects of the installation `config` describes: the PriorityClasses its pods run
- * under, KEDA's, VPA's, alasio's, Neon's, the object store's, the log's, the webhook
+ * under, KEDA's, VPA's, alasio's, what holds alasio's image on its nodes, Neon's, the object store's, the log's, the webhook
  * intake's, the lake's, Grafana's, the telemetry collector's, workspace storage's, the node
  * agents', the sandbox service's, its folder instances', its harness pools', the NetworkPolicies, and the
  * headroom's; with what alasio
@@ -44,6 +45,7 @@ export function manifests(config: InstallConfig, carried: Carried = NOTHING_CARR
     ...kedaObjects(config),
     ...vpaObjects(config),
     ...alasioObjects(config, MAIN_ENVIRONMENT, carried),
+    ...imageHolderObjects(config),
     ...neonObjects(config),
     ...objectStoreObjects(config),
     ...logObjects(config),

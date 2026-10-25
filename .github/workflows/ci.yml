@@ -109,7 +109,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       # Pushes alasio's own images as eStargz (tooling/push-estargz.sh), which the clusters
-      # the end-to-end runs make pull lazily.
+      # the end-to-end runs make pull lazily, but alasio's, and the stand-ins on it, whole
+      # (tooling/push-whole.sh), as the release pushes alasio's.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # All seven at once, each line said with its image's name, the node image with its pins
       # (tooling/node-image.ts), whole, as Docker runs it, and on alasio's,
@@ -140,9 +141,12 @@ jobs:
                 # alasio's own, with the commit it is built from, which its telemetry says.
                 revision=()
                 if [ "$name" = alasio ]; then revision=(--build-arg "REVISION=$GITHUB_SHA"); fi
-                tooling/push-estargz.sh "$PUSH_TO/$name:e2e" "${image#*:}" "${revision[@]}" --label "org.opencontainers.image.source=$SOURCE" &&
+                # alasio's own, and the stand-ins on it, which the runs install as alasio's, whole, as the release pushes it.
+                push=tooling/push-estargz.sh
+                if [ "$name" = alasio ]; then push=tooling/push-whole.sh; fi
+                "$push" "$PUSH_TO/$name:e2e" "${image#*:}" "${revision[@]}" --label "org.opencontainers.image.source=$SOURCE" &&
                   if [ "$name" = alasio ]; then
-                    tooling/push-estargz.sh "$PUSH_TO/alasio-harness-stand-ins:e2e" test --file test/e2e/harness-stand-ins.Dockerfile \
+                    tooling/push-whole.sh "$PUSH_TO/alasio-harness-stand-ins:e2e" test --file test/e2e/harness-stand-ins.Dockerfile \
                       --build-arg "ALASIO=$PUSH_TO/alasio:e2e" --label "org.opencontainers.image.source=$SOURCE"
                   fi
               fi

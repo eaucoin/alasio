@@ -922,16 +922,18 @@ if (inShard("sessions")) {
       assert.match(await inSession(none, 'console.log(require("fs").existsSync("/var/run/secrets/kubernetes.io/serviceaccount"))'), /false/u);
     });
 
-    test("runs each of alasio's images on remote snapshots, the first session's pulled lazily in seconds", { skip: !ESTARGZ && "the run's own images are built whole" }, async () => {
+    test("runs alasio on its image pulled whole, and each of alasio's other images on remote snapshots, the first session's pulled lazily in seconds", { skip: !ESTARGZ && "the run's own images are built whole" }, async () => {
       const session = await sessionPod(none);
       const sessionName = session.metadata?.name ?? "";
       const pods: [string, string][] = [
-        [NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)],
         [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("lake-query"))],
         [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("grafana"))],
         [SESSIONS, sessionName],
       ];
       for (const [namespace, name] of pods) assert.ok(await onRemoteSnapshot(namespace, name), `${namespace}/${name} runs on no remote snapshot`);
+      // Its start read from its node's disk, none of it through stargz-snapshotter's FUSE (tooling/push-whole.sh).
+      const alasio = await kube.runningPod(NAMESPACE, RELEASE);
+      assert.equal(await onRemoteSnapshot(NAMESPACE, alasio), false, `${alasio} runs on a remote snapshot`);
       // Its FUSE manager under Go's soft memory limit, inherited from the daemon.
       const node = session.spec?.nodeName ?? "";
       const limits = await onNode(node, `for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = stargz-fuse-man ] && tr '\\0' '\\n' <"$p/environ" | grep '^GOMEMLIMIT='; done; true`);
@@ -1303,7 +1305,8 @@ if (inShard("sessions")) {
     test("keeps pods pulled lazily running through a restart of k3s, and of stargz-snapshotter's daemon with it, the node's workspace mount ready again", { skip: (TARGET !== "host" || !ESTARGZ) && "k3s is restarted on its own where it is a service of the machine's, and its pods pulled lazily" }, async () => {
       const session = await newSession("none");
       const sessionName = (await sessionPod(session)).metadata?.name ?? "";
-      const watched: [string, string][] = [[NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)], [SESSIONS, sessionName]];
+      // Of alasio-agent's image, which the nodes pull lazily, as alasio's they do not: a session's pool's free pod, and a session's.
+      const watched: [string, string][] = [[SESSIONS, await freePoolPod()], [SESSIONS, sessionName]];
       const restarts = () => Promise.all(watched.map(async ([namespace, name]) => (await kube.get<V1Pod>(ref("Pod", name, namespace)))?.status?.containerStatuses?.map(({ restartCount }) => restartCount)));
       const before = await restarts();
       // The daemon's service is part of k3s's, so it restarts with it; its FUSE manager keeps the mounts.
@@ -1313,7 +1316,7 @@ if (inShard("sessions")) {
       assert.equal(await until("the session's bayma reached again", async () => await ran(), 300_000), "true");
       assert.deepEqual(await restarts(), before);
       assert.ok(await onRemoteSnapshot(SESSIONS, sessionName));
-      // The node's workspace mount, run from its image lazily too, ready again on the mount it kept.
+      // The node's workspace mount, of alasio's image pulled whole, ready again on the mount it kept.
       await kube.awaitReady([ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE)], "5 minutes");
     });
 
@@ -1321,7 +1324,8 @@ if (inShard("sessions")) {
     test("starts again each container that ran on the layers of stargz-snapshotter's FUSE manager once it is killed and its daemon restarts a manager anew, none left on them: a session's bayma, and a free pod of its pool, replaced, so the next bind to the pool is served first time", { skip: (TARGET !== "host" || !ESTARGZ) && "the daemon is a service of the machine's where k3s is, its pods pulled lazily" }, async () => {
       const managers = async () =>
         (await onNode("", 'for exe in /proc/[0-9]*/exe; do [ "$(readlink "$exe")" = /usr/local/bin/stargz-fuse-manager ] && { pid=${exe%/exe}; echo "${pid#/proc/}"; }; done; true')).trim();
-      // Running through the kill, on layers it served: a session's bayma, under gVisor, and a free pod of its pool, which nothing reads.
+      // Running through the kill, on layers it served: a session's bayma, under gVisor, and a free pod of its pool, which nothing reads,
+      // of alasio-agent's image, which the nodes pull lazily, as alasio's they do not.
       const session = await newSession("none");
       const sessionName = (await sessionPod(session)).metadata?.name ?? "";
       const pool = (await sessionPod(session)).metadata?.labels?.[POOL_LABEL] ?? "";
@@ -1368,29 +1372,32 @@ if (inShard("sessions")) {
       const read = () => inSession(session, 'console.log(require("node:fs").readdirSync("/usr/lib").length > 0)').then((said) => said.trim(), () => undefined);
       assert.equal(await until("the session's bayma reached again", async () => await read(), 300_000), "true");
       await kube.awaitReady([ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE)], "5 minutes");
-      // Pods started now run on the layers the daemon mounted again; those that ran on the manager killed are started again.
-      const before = await kube.runningPod(NAMESPACE, RELEASE);
-      await kube.remove(ref("Pod", before, NAMESPACE));
-      const after = await until("alasio running anew", async () => {
-        const now = await kube.runningPod(NAMESPACE, RELEASE).catch(() => undefined);
-        return now !== undefined && now !== before ? now : undefined;
-      }, 600_000);
-      assert.equal(await inAlasioContainer(["node", "-e", "process.stdout.write('ran')"]), "ran");
-      assert.ok(await onRemoteSnapshot(NAMESPACE, after), `${after} runs on no remote snapshot`);
+      // Pods started since run on the layers the daemon mounted again, remote snapshots: the pool's free pods, each made since the
+      // kill, and the next session's.
+      for (const name of [...(await freeOfPool()).map(({ metadata }) => metadata?.name ?? ""), bound.metadata?.name ?? ""]) {
+        assert.ok(await onRemoteSnapshot(SESSIONS, name), `${name} runs on no remote snapshot`);
+      }
     });
 
     // After the tests that reach the stand-ins through port forwards, as a restart of a node's container ends them; the webhook's tests forward anew.
     test("runs pods pulled lazily again after their node's container restarts, as a machine does, stargz-snapshotter's daemon mounting their layers again", { skip: (TARGET !== "docker" || !ESTARGZ) && "a node restarts so where it is a container, its pods pulled lazily" }, async () => {
-      const name = await kube.runningPod(NAMESPACE, RELEASE);
-      const restarts = async () => (await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))?.status?.containerStatuses?.find((status) => status.name === "alasio")?.restartCount ?? 0;
+      // A free pod of a session's pool, of alasio-agent's image, which the nodes pull lazily, as alasio's they do not.
+      const name = await freePoolPod();
+      // Gone counts as started again: a free pod started again is deleted, for its pool to make another (src/binder/bindings.ts).
+      const restarts = async () => {
+        const pod = await kube.get<V1Pod>(ref("Pod", name, SESSIONS));
+        return pod ? pod.status?.containerStatuses?.[0]?.restartCount ?? 0 : Number.POSITIVE_INFINITY;
+      };
       const before = await restarts();
-      await restartNodeContainer((await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))?.spec?.nodeName ?? "");
+      await restartNodeContainer((await kube.get<V1Pod>(ref("Pod", name, SESSIONS)))?.spec?.nodeName ?? "");
       // Every container of the node ended with it; kubelet starts each again, on the layers the daemon mounts again.
       // Its API server, where it is the node's, answers nothing until the node is back.
-      await until("alasio started again on its node", async () => ((await restarts().catch(() => before)) > before ? true : undefined), 600_000);
+      await until("the pool's free pod started again on its node", async () => ((await restarts().catch(() => before)) > before ? true : undefined), 600_000);
       await kube.awaitReady([ref("Deployment", RELEASE, NAMESPACE), ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE)], "10 minutes");
       assert.equal(await inAlasioContainer(["node", "-e", "process.stdout.write('ran')"]), "ran");
-      assert.ok(await onRemoteSnapshot(NAMESPACE, name), `${name} runs on no remote snapshot`);
+      // The pool's free pod running again, or the one made in its place, on layers the daemon mounted again.
+      const running = await freePoolPod();
+      assert.ok(await onRemoteSnapshot(SESSIONS, running), `${running} runs on no remote snapshot`);
     });
   });
 
@@ -3206,6 +3213,14 @@ async function staleOnNode(node: string): Promise<string[]> {
  * directory of its rootfs's overlay, on its node, is one of stargz-snapshotter's FUSE
  * mounts, which reads its layer from the registry as it is read.
  */
+/** A free pod of the sessions' pool `pool`, of alasio-agent's image, which the nodes pull lazily, its container running: not ready, as its bayma serves once bound. */
+async function freePoolPod(pool = "sandboxes-none"): Promise<string> {
+  return until(`a free pod of ${pool} running`, async () => {
+    const pods = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${FREE_LABEL}=true,${POOL_LABEL}=${pool}` });
+    return pods.find(({ metadata, status }) => !metadata?.deletionTimestamp && status?.containerStatuses?.[0]?.state?.running)?.metadata?.name;
+  }, 300_000);
+}
+
 async function onRemoteSnapshot(namespace: string, name: string): Promise<boolean> {
   const pod = await kube.get<V1Pod>(ref("Pod", name, namespace));
   const id = pod?.status?.containerStatuses?.[0]?.containerID?.replace(/^containerd:\/\//u, "");
@@ -4680,6 +4695,9 @@ if (inShard("wake")) {
 
     test(`a press is answered within ${ANSWER_WITHIN_MS / 1000} s of it, every time of ${SAMPLES}, alasio woken from none by it`, { timeout: 120 * 60_000 }, async (t) => {
       const samples: number[] = [];
+      /** The nodes alasio ran on so far, each sample's. */
+      const ranOn = new Set<string>();
+      const nodes = (await kube.list<V1Node>("Node")).map(({ metadata }) => metadata?.name ?? "");
       for (let sample = 1; sample <= SAMPLES; sample += 1) {
         // A panel's button, sent awake: /service's Close.
         await tg.calls();
@@ -4710,6 +4728,10 @@ if (inShard("wake")) {
           const atFive = await brokerAt().finally(() => kube.patch(scaledObject, { spec: { pollingInterval: polling } }));
           t.diagnostic(`# the log's broker, alasio asleep: ${asSet.toFixed(4)} CPU with KEDA polling alasio's ScaledObject each ${polling} s, ${atFive.toFixed(4)} each 5 s; an environment's polling each ${polling} s costs ${(asSet - atFive).toFixed(4)} CPU more, three ${(3 * (asSet - atFive)).toFixed(4)}`);
         }
+        // The last woken onto a node it never ran on, the others cordoned, where the cluster has one: its image there already, held
+        // there as on each of alasio's nodes (cli/src/manifests/image-holder.ts), not pulled for the wake.
+        const elsewhere = sample === SAMPLES && nodes.some((node) => !ranOn.has(node)) ? [...ranOn] : [];
+        for (const node of elsewhere) await kube.patch(ref("Node", node), { spec: { unschedulable: true } });
         const mark = (await callsOf()).total;
         const taken = await committed();
         const pressed = Date.now();
@@ -4736,6 +4758,16 @@ if (inShard("wake")) {
           const telegramStarted = lines.find(({ text }) => /Starting Telegram/u.test(text));
           if (telegramStarted) at("Telegram started", telegramStarted.at);
         }
+        for (const node of elsewhere) await kube.patch(ref("Node", node), { spec: { unschedulable: null } });
+        const woken = (await alasioPods())[0];
+        const wokenOn = woken?.spec?.nodeName ?? "";
+        if (elsewhere.length > 0) {
+          assert.ok(!ranOn.has(wokenOn), `woken onto ${wokenOn}, which it ran on before`);
+          const pulled = (await kube.list<CoreV1Event>("Event", { namespace: NAMESPACE })).filter(({ involvedObject, reason }) => involvedObject.name === woken?.metadata?.name && reason === "Pulled").map(({ message }) => message ?? "");
+          t.diagnostic(`# sample ${sample} woken onto ${wokenOn}, which never ran alasio: ${pulled.join("; ") || "no pull said"}`);
+          assert.ok(pulled.every((message) => /already present on machine/u.test(message)), `its image pulled for the wake: ${pulled.join("; ")}`);
+        }
+        ranOn.add(wokenOn);
         samples.push(answered - pressed);
         const said = `# sample ${sample}: ${Object.entries(seen).sort(([, a], [, b]) => a - b).map(([step, seconds]) => `${step} ${seconds.toFixed(1)} s`).join(", ")}`;
         console.error(said);
