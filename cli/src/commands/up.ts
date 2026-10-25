@@ -1,5 +1,5 @@
 /** `alasio up`: makes or starts the cluster on this machine, applies alasio, and waits until it runs. */
-import { Console, Effect, Schema } from "effect";
+import { Clock, Console, Duration, Effect, Schema } from "effect";
 import { Command } from "effect/cli";
 
 import { DockerCluster } from "../cluster/docker.ts";
@@ -95,7 +95,9 @@ export const bringUp = Effect.fnUntraced(function*(config: OperatorConfig, timeo
   const target = yield* resolveTarget(config);
   yield* refuseFirst(target, Effect.asVoid(checkInstallation(config)), "go on");
   yield* ensureCluster(target);
-  const installed = yield* Effect.provide(install(config, waitOptions(timeout)), kubeApi(target));
+  // The install's deadline, from when its waits start: what the API server is too busy for asked again until then at most.
+  const busyUntil = (yield* Clock.currentTimeMillis) + Duration.toMillis(timeout);
+  const installed = yield* Effect.provide(install(config, waitOptions(timeout)), kubeApi(target, { busyUntil }));
   yield* announce(target, installed);
 });
 

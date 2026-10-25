@@ -17,7 +17,7 @@ import { Effect, Logger, Result } from "effect";
 
 import { installConfigOf } from "../src/config.ts";
 import { installationObjects } from "../src/install.ts";
-import { KubeApi } from "../src/kube/api.ts";
+import { kind, KubeApi } from "../src/kube/api.ts";
 import { applyInstallation, removeInstallation } from "../src/kube/apply.ts";
 import { checkAutoscalers } from "../src/kube/autoscalers.ts";
 import { READY_ONCE_BOUND_ANNOTATION, readiness, readinessOf } from "../src/kube/rollout.ts";
@@ -39,7 +39,7 @@ interface Rig {
   readonly run: <A, E>(effect: Effect.Effect<A, E, KubeApi>) => Promise<A>;
 }
 
-async function rig(t: TestContext): Promise<Rig> {
+async function rig(t: TestContext, { busyFor }: { readonly busyFor?: number } = {}): Promise<Rig> {
   const kube = await serveFakeKube();
   const directory = mkdtempSync(join(tmpdir(), "alasio-apply-"));
   t.after(async () => {
@@ -56,7 +56,8 @@ async function rig(t: TestContext): Promise<Rig> {
     run: (effect) =>
       Effect.runPromise(
         effect.pipe(
-          Effect.provide(KubeApi.layer({ path: kubeconfig })),
+          // The deadline taken anew as each run starts, as a command takes its own as its install starts.
+          Effect.provide(KubeApi.layer({ path: kubeconfig }, busyFor === undefined ? {} : { busyUntil: Date.now() + busyFor })),
           Effect.provide(Logger.layer([Logger.make(({ message }) => void progress.push(String(message)))])),
         ),
       ),
@@ -111,6 +112,48 @@ test("an installation is applied as alasio, in the order what runs needs it, eve
   // All but the Jobs, deleted once run.
   assert.equal(stored.length, objectsOf().filter(({ kind }) => kind !== "Job").length);
   for (const object of stored) assert.equal(object.metadata.labels?.["alasio.dev/installation"], "alasio", `${object.kind} ${object.metadata.name}`);
+});
+
+test("a call the API server is too busy for, answered 504, 503 or 429, is asked again, after the Retry-After it says, within its bound; one failed otherwise, or past the bound, fails as answered", async (t) => {
+  const { kube, run } = await rig(t, { busyFor: 5_000 });
+  const policy = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/alasio-harness-pool-pods";
+  // Timed out twice as it applies the installation, as an API server under load does, then served.
+  kube.busy.set(`PATCH ${policy}`, [{ status: 504 }, { status: 503 }]);
+  await run(applyInstallation(objectsOf(), WAIT));
+  assert.ok(kube.get(policy), "the policy was not applied");
+  assert.deepEqual(kube.busy.get(`PATCH ${policy}`), []);
+  // Asked to wait 2 s, past its own first wait of 1 s: asked again no sooner.
+  const pool = "/api/v1/namespaces/alasio";
+  kube.busy.set(`GET ${pool}`, [{ status: 429, retryAfter: 2 }]);
+  const asked = Date.now();
+  assert.ok(await run(Effect.flatMap(KubeApi, (api) => api.get({ ...kind("Namespace"), name: "alasio" }))));
+  assert.ok(Date.now() - asked >= 2_000, `asked again ${Date.now() - asked} ms on`);
+  // A 500 is the call's own failure: not asked again.
+  kube.busy.set(`GET ${pool}`, [{ status: 500 }]);
+  const failed = await run(Effect.flip(Effect.flatMap(KubeApi, (api) => api.get({ ...kind("Namespace"), name: "alasio" }))));
+  assert.equal(failed.status, 500);
+  // Done behind the timeout, then answered 504: an apply asked again sets what it set; a delete asked again finds it gone, and is done.
+  kube.busy.set(`PATCH ${policy}`, [{ status: 504, committed: true }]);
+  const applied = kube.changes.length;
+  const before = structuredClone(kube.get(policy));
+  await run(Effect.flatMap(KubeApi, (api) => api.apply(kube.get(policy) as KubernetesObject)));
+  assert.deepEqual(kube.changes.slice(applied).map(({ method }) => method), ["PATCH", "PATCH"]);
+  assert.deepEqual(kube.get(policy)?.spec, before?.spec);
+  kube.busy.set(`DELETE ${policy}`, [{ status: 504, committed: true }]);
+  await run(Effect.flatMap(KubeApi, (api) => api.remove({ ...kind("ValidatingAdmissionPolicy"), name: "alasio-harness-pool-pods" })));
+  assert.equal(kube.get(policy), undefined);
+  // Asked to wait past the command's deadline: failing at once, as answered.
+  kube.busy.set(`GET ${pool}`, [{ status: 503, retryAfter: 60 }]);
+  const told = Date.now();
+  assert.equal((await run(Effect.flip(Effect.flatMap(KubeApi, (api) => api.get({ ...kind("Namespace"), name: "alasio" }))))).status, 503);
+  assert.ok(Date.now() - told < 1_000, `gave up ${Date.now() - told} ms on`);
+  // Too busy past the command's deadline: failing as last answered, at it, not past it; its own
+  // waits of 1 s and 2 s, the third, of 4 s, past the deadline 5 s on.
+  kube.busy.set(`GET ${pool}`, Array.from({ length: 100 }, () => ({ status: 503 })));
+  const since = Date.now();
+  const gaveUp = await run(Effect.flip(Effect.flatMap(KubeApi, (api) => api.get({ ...kind("Namespace"), name: "alasio" }))));
+  assert.equal(gaveUp.status, 503);
+  assert.ok(Date.now() - since >= 2_500 && Date.now() - since <= 5_500, `gave up ${Date.now() - since} ms on`);
 });
 
 test("objects reach the API server as the manifests have them, keys client-node's model lacks included", async (t) => {

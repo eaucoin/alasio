@@ -18,7 +18,7 @@ import { inspect } from "node:util";
 
 import { NodeStream } from "@effect/platform-node";
 import { Exec, KubeConfig, type KubernetesObject, PortForward, type V1Pod, type V1Status } from "@kubernetes/client-node";
-import { Context, Effect, Layer, Predicate, Schema, type Scope, Stream } from "effect";
+import { Clock, Context, Duration, Effect, Layer, Predicate, Schema, type Scope, Stream } from "effect";
 
 /** A kind of object: its API version and kind, as an object of it says them. */
 export interface Kind {
@@ -116,6 +116,8 @@ export class KubeApiError extends Schema.TaggedError<KubeApiError>()("KubeApiErr
   call: Schema.String,
   /** The API's HTTP status (404 for absent, 409 for a conflict), when it answered. */
   status: Schema.optional(Schema.Number),
+  /** How long the API said to wait before asking again, in seconds (its Retry-After), when it said. */
+  retryAfterSeconds: Schema.optional(Schema.Number),
   /** What the API answered, or why it could not be reached. */
   reason: Schema.String,
 }) {
@@ -217,9 +219,13 @@ export class KubeApi extends Context.Service<KubeApi, {
   /** The values now of the external metric `name` in `namespace`, of what `labelSelector` selects, as the API's external metrics answer them (KEDA's). */
   readonly externalMetric: (namespace: string, name: string, labelSelector: string) => Effect.Effect<readonly string[], KubeApiError>;
 }>()("alasio/kube/KubeApi") {
-  /** The API `kubeconfig` reaches. */
-  static readonly layer = (kubeconfig: KubeconfigRef): Layer.Layer<KubeApi, KubeconfigUnusable> =>
-    Layer.effect(KubeApi, Effect.map(loadKubeConfig(kubeconfig), makeKubeApi));
+  /**
+   * The API `kubeconfig` reaches, a call it is too busy for asked again for BUSY_WITHIN at most,
+   * and never past `busyUntil`, in milliseconds since the epoch, where given: the deadline of the
+   * command it serves.
+   */
+  static readonly layer = (kubeconfig: KubeconfigRef, { busyUntil }: { readonly busyUntil?: number } = {}): Layer.Layer<KubeApi, KubeconfigUnusable> =>
+    Layer.effect(KubeApi, Effect.map(loadKubeConfig(kubeconfig), (kubeConfig) => makeKubeApi(kubeConfig, busyUntil)));
 }
 
 /** The kubeconfig `ref` names, at its context. */
@@ -261,8 +267,20 @@ function exitCodeOf(status: V1Status): number | null {
   return cause ? Number(cause.message) : null;
 }
 
-/** The API `kubeConfig` reaches, at its current context. */
-function makeKubeApi(kubeConfig: KubeConfig): KubeApi["Service"] {
+/**
+ * The statuses an API server answers a call with as it is too busy to serve it, or timed it out,
+ * which it may serve asked again: 429 Too Many Requests, 503 Service Unavailable, 504 Gateway
+ * Timeout (its own request timeout, "context deadline exceeded"). No other: a 500 says the call
+ * itself failed, which asking again need not change.
+ */
+const BUSY_STATUSES: ReadonlySet<number> = new Set([429, 503, 504]);
+/** The longest wait between asks of a call the API was too busy for, where it said none. */
+const BUSY_WAIT_AT_MOST = Duration.seconds(10);
+/** How long a call the API is too busy for is asked again for, at most, from its first ask. */
+export const BUSY_WITHIN = Duration.minutes(1);
+
+/** The API `kubeConfig` reaches, at its current context, a call it is too busy for asked again as `busy` says, never past `busyUntil` where given. */
+function makeKubeApi(kubeConfig: KubeConfig, busyUntil: number | undefined): KubeApi["Service"] {
   const server = new URL(kubeConfig.getCurrentCluster()?.server ?? "");
   const request = server.protocol === "http:" ? httpRequest : httpsRequest;
   const executor = new Exec(kubeConfig);
@@ -295,6 +313,8 @@ function makeKubeApi(kubeConfig: KubeConfig): KubeApi["Service"] {
     readAll(call, response).pipe(
       Effect.flatMap((content) => {
         const status = response.statusCode ?? 0;
+        const said = response.headers["retry-after"]?.trim();
+        const retryAfter = said ? Number(said) : Number.NaN;
         const text = content.toString("utf8").trim();
         let reason = text || STATUS_CODES[status] || "no message";
         try {
@@ -303,7 +323,7 @@ function makeKubeApi(kubeConfig: KubeConfig): KubeApi["Service"] {
         } catch {
           // Not JSON: the text is the message.
         }
-        return Effect.fail(new KubeApiError({ call: describeCall(call), status, reason }));
+        return Effect.fail(new KubeApiError({ call: describeCall(call), status, reason, ...(Number.isFinite(retryAfter) && retryAfter >= 0 ? { retryAfterSeconds: retryAfter } : {}) }));
       }),
     );
 
@@ -319,11 +339,36 @@ function makeKubeApi(kubeConfig: KubeConfig): KubeApi["Service"] {
       (response) => Effect.sync(() => response.destroy()),
     ).pipe(Effect.tap((response) => ((response.statusCode ?? 0) >= 400 ? refusal(call, response) : Effect.void)));
 
-  /** The JSON the API answers `call` with. */
+  /** The JSON the API answers `call` with, asked again while the API is too busy to answer it (busy). */
   const json = <A>(call: KubeCall): Effect.Effect<A, KubeApiError> =>
-    Effect.scoped(Effect.flatMap(open(call), (response) => readAll(call, response))).pipe(
+    busy(Effect.scoped(Effect.flatMap(open(call), (response) => readAll(call, response))).pipe(
       Effect.map((content) => JSON.parse(content.toString("utf8")) as A),
-    );
+    ));
+
+  /**
+   * `asked`, asked again while the API answers it as too busy to (BUSY_STATUSES), after the wait
+   * it says (its Retry-After), or one of its own doubling from a second to BUSY_WAIT_AT_MOST:
+   * for BUSY_WITHIN from the first ask at most, and never past `busyUntil`, where given, the
+   * deadline of what makes the call (`up`'s, as its --timeout ends); then failing as it was last
+   * answered. The bound says when the next ask may start: an ask under way, as one the server
+   * itself times out after its own request timeout, ends as it ends. A 503 or 504 may come of a
+   * call the API server did, behind its own timeout: so every call of these is one a second ask
+   * does no more than the first did, and alasio makes no other (KubeCall): a read; a server-side
+   * apply or merge patch, which sets what it sets again, or, made over the version it read, is
+   * refused 409, for its caller to read again; or a delete, which a second ask finds done, 404,
+   * which remove takes as done.
+   */
+  const busy = <A>(asked: Effect.Effect<A, KubeApiError>): Effect.Effect<A, KubeApiError> =>
+    Effect.flatMap(Clock.currentTimeMillis, (began) => {
+      const until = Math.min(began + Duration.toMillis(BUSY_WITHIN), busyUntil ?? Number.POSITIVE_INFINITY);
+      const attempt = (own: number): Effect.Effect<A, KubeApiError> =>
+        Effect.catchIf(asked, (error) => error.status !== undefined && BUSY_STATUSES.has(error.status), (error) =>
+          Effect.flatMap(Clock.currentTimeMillis, (now) => {
+            const wait = error.retryAfterSeconds ?? own / 1000;
+            return now + wait * 1000 > until ? Effect.fail(error) : Effect.andThen(Effect.sleep(Duration.seconds(wait)), attempt(Math.min(own * 2, Duration.toMillis(BUSY_WAIT_AT_MOST))));
+          }));
+      return attempt(1000);
+    });
 
   const exec = Effect.fnUntraced(function*(
     { namespace, pod, container }: ContainerRef,

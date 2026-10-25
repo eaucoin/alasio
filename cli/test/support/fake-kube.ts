@@ -16,7 +16,7 @@
  */
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { type IncomingMessage, ServerResponse } from "node:http";
 import { createServer } from "node:https";
 import { type AddressInfo, connect } from "node:net";
 import type { Duplex } from "node:stream";
@@ -76,6 +76,14 @@ export interface KubeChange {
   readonly query: URLSearchParams;
 }
 
+/** What the fake answers a request with as one too busy to serve it: its status, and the Retry-After it says, in seconds, where it says one. */
+export interface KubeBusy {
+  readonly status: number;
+  readonly retryAfter?: number;
+  /** Whether it did what was asked first, as an API server that committed a change behind its own timeout does, answering the status after. */
+  readonly committed?: boolean;
+}
+
 /** A command run in a container, as it was asked for. */
 export interface KubeExec {
   readonly namespace: string;
@@ -126,6 +134,12 @@ export interface FakeKube {
   readonly finalizers: Map<string, string>;
   /** The paths it refuses to read, as a kubeconfig's rights may not reach them: 403. */
   readonly forbidden: Set<string>;
+  /**
+   * What it answers the next requests of `<METHOD> <path>` with before it serves them, as an API
+   * server too busy to, or timed out, answers: a status each, with a Retry-After where given, the
+   * first first, each once.
+   */
+  readonly busy: Map<string, KubeBusy[]>;
   /**
    * The pods, by `<namespace>/<name>`, their node's kubelet does not serve yet, as one started
    * anew has not taken them back: it lists every other pod bound to it, and answers an exec of
@@ -261,6 +275,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
   const logReads: URLSearchParams[] = [];
   const finalizers = new Map<string, string>();
   const forbidden = new Set<string>();
+  const busy = new Map<string, KubeBusy[]>();
   const unserved = new Set<string>();
   const execs: KubeExec[] = [];
   const forwards: KubeForward[] = [];
@@ -436,6 +451,13 @@ export async function serveFakeKube(): Promise<FakeKube> {
     const target = parse(url.pathname);
     if (!target) return refuse(response, 404, `the server could not find the requested resource (${url.pathname})`);
     const path = url.pathname;
+    const answered = busy.get(`${method} ${path}`)?.shift();
+    // Done first, its own answer to no one, where it was committed behind the timeout.
+    if (answered?.committed) handle(request, body, new ServerResponse(request));
+    if (answered) {
+      if (answered.retryAfter !== undefined) response.setHeader("Retry-After", String(answered.retryAfter));
+      return refuse(response, answered.status, "Timeout: request did not complete within requested timeout - context deadline exceeded");
+    }
     if (method === "GET" && forbidden.has(path)) return refuse(response, 403, `${target.plural} is forbidden`);
     // A node's kubelet's own pods, through the API server's proxy of it.
     const kubelet = /^\/api\/v1\/nodes\/([^/]+)\/proxy\/pods$/u.exec(path);
@@ -618,6 +640,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
     logReads,
     finalizers,
     forbidden,
+    busy,
     unserved,
     drop: (path) => void objects.delete(path),
     execs,

@@ -70,8 +70,8 @@ const dockerEngine: Layer.Layer<DockerEngine, DockerHostUnsupported | Config.Con
 export const dockerCluster = (options: DockerClusterOptions): Layer.Layer<DockerCluster, DockerHostUnsupported | Config.ConfigError, FileSystem.FileSystem> =>
   DockerCluster.layer(options).pipe(Layer.provide(dockerEngine));
 
-/** The API of the cluster `target` is. */
-export const kubeApi = (target: ResolvedTarget): Layer.Layer<KubeApi, KubeconfigUnusable> => KubeApi.layer(target.kubeconfig);
+/** The API of the cluster `target` is, a call it is too busy for asked again never past `busyUntil`, where given (KubeApi.layer). */
+export const kubeApi = (target: ResolvedTarget, options: { readonly busyUntil?: number } = {}): Layer.Layer<KubeApi, KubeconfigUnusable> => KubeApi.layer(target.kubeconfig, options);
 
 /** Where the cluster `target` is, as people read it. */
 export function describeTarget(target: ResolvedTarget): string {

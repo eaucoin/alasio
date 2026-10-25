@@ -1,6 +1,6 @@
 /** `alasio upgrade`: `up` with this version of the package's images, saying what changes; refused while a branch environment another release made exists. */
 import type { KubernetesObject, V1PodSpec } from "@kubernetes/client-node";
-import { Console, Effect } from "effect";
+import { Clock, Console, Duration, Effect } from "effect";
 import { Command, Flag } from "effect/cli";
 
 import { refuseBranchesOfOtherReleases } from "../branches.ts";
@@ -86,6 +86,8 @@ export const upgrade = Command.make("upgrade", {
     yield* refuseFirst(target, refusals(config), "refuse");
     // A harness bound on the cluster is released before its pod stops with the cluster, unless told not to wait.
     yield* ensureCluster(target, now ? {} : { beforeRestart: untilHarnessesReleased(waitOptions(timeout)) });
+    // The install's deadline, from when its waits start: what the API server is too busy for asked again until then at most.
+    const busyUntil = (yield* Clock.currentTimeMillis) + Duration.toMillis(timeout);
     yield* Effect.provide(
       Effect.gen(function*() {
         const kube = yield* KubeApi;
@@ -96,7 +98,7 @@ export const upgrade = Command.make("upgrade", {
         yield* refuseBranchesOfOtherReleases(VERSION);
         yield* announce(target, yield* install(config, waitOptions(timeout)));
       }),
-      kubeApi(target),
+      kubeApi(target, { busyUntil }),
     );
   })).pipe(
     Command.withShortDescription("Upgrade alasio to this version"),
