@@ -930,18 +930,30 @@ if (inShard("sessions")) {
       assert.match(await inSession(none, 'console.log(require("fs").existsSync("/var/run/secrets/kubernetes.io/serviceaccount"))'), /false/u);
     });
 
-    test("runs alasio on its image pulled whole, and each of alasio's other images on remote snapshots, the first session's pulled lazily in seconds", { skip: !ESTARGZ && "the run's own images are built whole" }, async () => {
+    test("runs each of alasio's images pulled whole, the lake's held on its nodes, but the sessions' agent image, on remote snapshots, the first session's pulled lazily in seconds", { skip: !ESTARGZ && "the run's own images are built whole" }, async () => {
       const session = await sessionPod(none);
       const sessionName = session.metadata?.name ?? "";
-      const pods: [string, string][] = [
+      assert.ok(await onRemoteSnapshot(SESSIONS, sessionName), `${SESSIONS}/${sessionName} runs on no remote snapshot`);
+      // Each read from its node's disk, none of it through stargz-snapshotter's FUSE (tooling/push-whole.sh).
+      const whole: [string, string][] = [
+        [NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)],
         [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("lake-query"))],
         [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("grafana"))],
-        [SESSIONS, sessionName],
+        [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("collector"))],
+        [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("webhook"))],
+        [NAMESPACE, `${componentName("log")}-0`],
       ];
-      for (const [namespace, name] of pods) assert.ok(await onRemoteSnapshot(namespace, name), `${namespace}/${name} runs on no remote snapshot`);
-      // Its start read from its node's disk, none of it through stargz-snapshotter's FUSE (tooling/push-whole.sh).
-      const alasio = await kube.runningPod(NAMESPACE, RELEASE);
-      assert.equal(await onRemoteSnapshot(NAMESPACE, alasio), false, `${alasio} runs on a remote snapshot`);
+      for (const [namespace, name] of whole) assert.equal(await onRemoteSnapshot(namespace, name), false, `${namespace}/${name} runs on a remote snapshot`);
+      // The lake's image held on each of its nodes, as its loader and intake wake from none there.
+      const lakeHolder = ref("DaemonSet", componentName("lake-image"), NAMESPACE);
+      await kube.awaitReady([lakeHolder], "5 minutes");
+      // Its holder, PID 1 of its own, no tini, ends on the SIGTERM a stop sends it, by itself, 0, not left to its grace's kill.
+      const [holderPod] = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("lake-image")) });
+      const holderName = holderPod?.metadata?.name ?? assert.fail("the lake's image held by no pod");
+      await kube.execOk(NAMESPACE, holderName, ["sh", "-c", "kill -TERM 1"], { container: "image" }).catch(() => "");
+      const ended = await until("the lake's holder to end on its SIGTERM", async () =>
+        (await kube.get<V1Pod>(ref("Pod", holderName, NAMESPACE)))?.status?.containerStatuses?.[0]?.lastState?.terminated, 60_000);
+      assert.deepEqual([ended.exitCode, ended.signal ?? null], [0, null]);
       // Its FUSE manager under Go's soft memory limit, inherited from the daemon.
       const node = session.spec?.nodeName ?? "";
       const limits = await onNode(node, `for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = stargz-fuse-man ] && tr '\\0' '\\n' <"$p/environ" | grep '^GOMEMLIMIT='; done; true`);

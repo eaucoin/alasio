@@ -4,7 +4,7 @@
  * configuration is checked and defaulted.
  */
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,6 +49,7 @@ import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
 import { everyIntervalCron, filerStoreBackupHours } from "../src/manifests/config.ts";
 import { folderTemplate } from "../src/manifests/folders.ts";
+import { UNTIL_TERM } from "../src/manifests/image-holder.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { oneAtATime } from "../src/manifests/volume-lock.ts";
@@ -3083,11 +3084,35 @@ describe("scaling", () => {
     assert.equal(spec?.automountServiceAccountToken, false);
   });
 
+  test("holds the lake's image on the stack's nodes, as its loader and intake, which wake from none, may be scheduled there, where the lake runs", () => {
+    const config = { neon: { nodeSelector: { "alasio.dev/role": "stack" }, tolerations: [{ key: "dedicated", operator: "Equal", value: "stack", effect: "NoSchedule" }] } };
+    const objects = install(config);
+    const holder = one<V1DaemonSet>(objects, "DaemonSet", "alasio-lake-image");
+    const spec = holder.spec?.template.spec;
+    for (const woken of ["alasio-lake-loader", "alasio-lake-intake"]) {
+      const workload = one<V1Deployment>(objects, "Deployment", woken).spec?.template.spec;
+      assert.deepEqual([spec?.containers[0]?.image, spec?.nodeSelector, spec?.tolerations], [workload?.containers[0]?.image, workload?.nodeSelector, workload?.tolerations], woken);
+    }
+    // Under node's image's entrypoint, no tini: a program that ends on the SIGTERM its pod is stopped with, as PID 1.
+    assert.deepEqual([spec?.containers[0]?.command, spec?.containers[0]?.args], [undefined, [...UNTIL_TERM]]);
+    assert.equal(all<V1DaemonSet>(install({ ...config, lake: { enabled: false } }), "DaemonSet").some(({ metadata }) => metadata?.name === "alasio-lake-image"), false);
+  });
+
+  test("a holder of an image with no tini waits on nothing but a SIGTERM, which it ends on itself, never left to its grace's kill", async () => {
+    const [shell = "", ...script] = UNTIL_TERM;
+    const held = spawn(shell, script, { stdio: "ignore" });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const ended = new Promise<[number | null, NodeJS.Signals | null]>((resolve) => held.on("exit", (code, signal) => resolve([code, signal])));
+    held.kill("SIGTERM");
+    // Exited by its trap, 0, not ended by the signal, as a shell with no handler would be where it is no PID 1, and not at all where it is.
+    assert.deepEqual(await ended, [0, null]);
+  });
+
   test("sizes every workload by a VerticalPodAutoscaler beside it: in place what keeps no state and runs no turn, as it is made alasio's pod and the log, the rest recommended alone, from a small floor to half a core and its memory limit", () => {
     const objects = [...install({ host: { enabled: true } }), ...branchObjects(configOf(), "try", BASELINE)];
-    // But what holds alasio's image on its nodes, which runs nothing to size.
+    // But what holds alasio's images on their nodes, which runs nothing to size.
     const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet"), ...all<V1DaemonSet>(objects, "DaemonSet")]
-      .filter(({ metadata }) => metadata?.name !== "alasio-image");
+      .filter(({ metadata }) => metadata?.name !== "alasio-image" && metadata?.name !== "alasio-lake-image");
     const sized = all<VerticalPodAutoscaler>(objects, "VerticalPodAutoscaler");
     const key = ({ metadata }: KubernetesObject) => `${metadata?.namespace}/${metadata?.name}`;
     assert.deepEqual(sized.map(key).sort(), workloads.map(key).sort());
