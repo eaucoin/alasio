@@ -3192,6 +3192,35 @@ if (inShard("scaling")) {
       telegram?.close();
     });
 
+    // First of the shard's, as a fresh installation's: no event yet written to its events' partitions, whose group was never told of them.
+    test("alasio, of a scale from none, sleeps with nothing waiting on a fresh installation, its events' group told where it reads each partition from though none was written to", { timeout: 30 * 60_000 }, async () => {
+      const alasio = ref("Deployment", RELEASE, NAMESPACE);
+      const scaledUp = async (scaling: { min: number; max: number }, cooldownSeconds?: number) => {
+        const { configFile } = paths();
+        const config = JSON.parse(readFileSync(configFile, "utf8"));
+        config.install.alasio.scaling = scaling;
+        if (cooldownSeconds === undefined) delete config.install.alasio.cooldownSeconds;
+        else config.install.alasio.cooldownSeconds = cooldownSeconds;
+        writeFileSync(configFile, JSON.stringify(config));
+        await alasioOk("up", "--timeout", "20m");
+      };
+      await scaledUp({ min: 0, max: 3 }, 30);
+      try {
+        await until("alasio asleep", async () => ((await kube.get<V1Deployment>(alasio))?.spec?.replicas === 0 ? true : undefined), 10 * 60_000).catch(async (error: unknown) => {
+          // Which of its triggers kept it up, as KEDA read them.
+          const scaled = await kube.get<KubernetesObject & { status?: { triggersActivity?: unknown } }>(ref("ScaledObject", RELEASE, NAMESPACE));
+          assert.fail(`${error instanceof Error ? error.message : String(error)}: its triggers ${JSON.stringify(scaled?.status?.triggersActivity)}`);
+        });
+      } finally {
+        // One again, as the shard's suites after reach its pod as one.
+        await scaledUp({ min: 1, max: 1 });
+        await until("one alasio ready", async () => {
+          const deployment = await kube.get<V1Deployment>(alasio);
+          return deployment?.spec?.replicas === 1 && deployment.status?.readyReplicas === 1 ? true : undefined;
+        }, 600_000);
+      }
+    });
+
     test("KEDA and VPA run restricted, on pinned images, the external metrics served, within the floor's budget for them", async (t) => {
       const controllers = ["keda-operator", "keda-metrics-apiserver", "keda-admission-webhooks", "vpa-recommender", "vpa-updater", "vpa-admission-controller"];
       for (const controller of controllers) {

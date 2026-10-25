@@ -5,6 +5,7 @@
  * joined; and each generation of its group it joins counted, a rebalance.
  */
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +17,7 @@ import { Duration, Effect, Fiber, Logger } from "effect";
 
 import { added } from "./support/metrics.ts";
 import { consumeGroup, REJOIN_BACKOFF } from "../src/log/consume.ts";
-import { countRebalances, memberOptions, REBALANCES, rejoinOnGrowth } from "../src/log/topic.ts";
+import { countRebalances, memberOptions, REBALANCES, rejoinOnGrowth, tellStarts } from "../src/log/topic.ts";
 import { memoryTopic } from "./support/topics.ts";
 
 test("a member's session ends ten seconds after its last heartbeat, which come every three, and a rebalance waits ten seconds at most", () => {
@@ -97,4 +98,99 @@ test("a member whose topic grows under it ends, its group joined again at once, 
   } finally {
     await Effect.runPromise(Fiber.interrupt(member));
   }
+});
+
+/**
+ * A member's consumer and stream as tellStarts reads them (StartsTold): its group's offsets kept
+ * by partition, each told as the commits it is asked come, the generation `rejoin` moves on, and
+ * each commit asked kept, as what `refuse` first refuses is asked again in the next generation,
+ * as the client asks one again once it rejoined.
+ */
+function member(topic: string, partitions: readonly number[], { committed = new Map<number, bigint>(), refuse = 0 }: { readonly committed?: Map<number, bigint>; readonly refuse?: number } = {}) {
+  const stream = Object.assign(new EventEmitter(), { offsetsToFetch: new Map<string, bigint>() });
+  const asked: { readonly generation: number; readonly offsets: readonly { readonly partition: number; readonly offset: bigint }[] }[] = [];
+  let refusals = refuse;
+  const consumer = {
+    assignments: [{ topic, partitions }],
+    generationId: 1,
+    listCommittedOffsets: async ({ topics }: { topics: { topic: string; partitions: number[] }[] }) =>
+      new Map(topics.map(({ topic: name, partitions: indexes }) => {
+        const offsets: bigint[] = [];
+        for (const index of indexes) offsets[index] = committed.get(index) ?? -1n;
+        return [name, offsets] as const;
+      })),
+    commit: async ({ offsets }: { offsets: { topic: string; partition: number; offset: bigint; leaderEpoch: number }[] }) => {
+      // Refused as the group rebalances: the client rejoins, in the next generation, and asks it again.
+      while (refusals > 0) {
+        refusals -= 1;
+        consumer.generationId += 1;
+      }
+      asked.push({ generation: consumer.generationId, offsets: offsets.map(({ partition, offset }) => ({ partition, offset })) });
+      for (const { partition, offset } of offsets) committed.set(partition, offset);
+    },
+  };
+  /** The stream's offsets resolved, `starts` by partition, as it says it has them. */
+  const resolved = (starts: Readonly<Record<number, bigint>>) => {
+    for (const [partition, offset] of Object.entries(starts)) stream.offsetsToFetch.set(`${topic}:${partition}`, offset);
+    stream.emit("offsets");
+  };
+  return { stream, consumer, committed, asked, resolved };
+}
+
+test("a member reading from the next written tells its group of where it reads each partition it was assigned and told of none from, so every one has an offset, no record written", async () => {
+  // Partition 1 told of before; 0 and 2 never, no record of theirs ever written.
+  const of = member("events.main", [0, 1, 2], { committed: new Map([[1, 7n]]) });
+  const told = tellStarts(of, "events.main");
+  of.resolved({ 0: 0n, 1: 7n, 2: 0n });
+  await told();
+  assert.deepEqual(of.asked, [{ generation: 1, offsets: [{ partition: 0, offset: 0n }, { partition: 2, offset: 0n }] }]);
+  assert.deepEqual([...of.committed].sort(([a], [b]) => a - b), [[0, 0n], [1, 7n], [2, 0n]]);
+  // Assigned them again, each told of: nothing more asked.
+  of.resolved({ 0: 0n, 1: 7n, 2: 0n });
+  await told();
+  assert.equal(of.asked.length, 1);
+});
+
+test("a member's starts are told of in the generation it was assigned them in, and not where it joined another before it could tell them", async () => {
+  const of = member("events.main", [0]);
+  const told = tellStarts(of, "events.main");
+  of.resolved({ 0: 3n });
+  // Rejoined before the telling is asked: that generation's own resolution tells its starts.
+  of.consumer.generationId = 2;
+  await told();
+  assert.deepEqual(of.asked, []);
+  of.resolved({ 0: 3n });
+  await told();
+  assert.deepEqual(of.asked, [{ generation: 2, offsets: [{ partition: 0, offset: 3n }] }]);
+});
+
+test("a start's telling refused as the group rebalances, asked again in the next generation, never tells the group past a record not handled", async () => {
+  const of = member("events.main", [0], { refuse: 1 });
+  const told = tellStarts(of, "events.main");
+  // Records 5 and on written after the member resolved its start, 5, none of them handled.
+  of.resolved({ 0: 5n });
+  await told();
+  assert.deepEqual(of.asked, [{ generation: 2, offsets: [{ partition: 0, offset: 5n }] }]);
+  // At the first record not handled, never past it: one asked again can only have records delivered again.
+  assert.ok((of.committed.get(0) ?? -1n) <= 5n);
+});
+
+test("a member hands a record on only once its starts' telling is through, so the record's own telling, past it, comes after", async () => {
+  const of = member("events.main", [0]);
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const commit = of.consumer.commit;
+  of.consumer.commit = async (options) => {
+    await held;
+    await commit(options);
+  };
+  const told = tellStarts(of, "events.main");
+  of.resolved({ 0: 0n });
+  let through = false;
+  const reading = told().then(() => void (through = true));
+  await sleep(20);
+  assert.equal(through, false, "a record was handed on before its member's starts were told");
+  release();
+  await reading;
+  assert.deepEqual(of.committed.get(0), 0n);
 });

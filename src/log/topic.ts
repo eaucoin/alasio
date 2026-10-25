@@ -3,7 +3,8 @@
  * alasio's one Kafka client: its records in turn, each told to the group only once whoever
  * reads it says so (commit), so a member started again reads on from the last record told,
  * neither losing one nor skipping one. A group that has been told of none begins at the
- * topic's first record still kept, or at the next written, as its reader asks. Each generation
+ * topic's first record still kept, or at the next written, as its reader asks; one beginning
+ * at the next written is told so as it is assigned each partition (tellStarts). Each generation
  * of the group a member joins, a rebalance, is counted (REBALANCES).
  */
 import { readFileSync } from "node:fs";
@@ -116,6 +117,58 @@ export function rejoinOnGrowth<R extends Received>(feed: Feed<R>, { topic, joine
   };
 }
 
+/** What tellStarts reads and asks of a member, as @platformatic/kafka's consumer and its stream of records have it: fakes stand in in tests. */
+export interface StartsTold {
+  readonly stream: {
+    readonly on: (event: "offsets", listener: () => void) => unknown;
+    /** Where the stream reads each partition from, by `topic:partition`, as it has resolved it. */
+    readonly offsetsToFetch: ReadonlyMap<string, bigint>;
+  };
+  readonly consumer: {
+    readonly assignments: readonly { readonly topic: string; readonly partitions: readonly number[] }[] | null;
+    readonly generationId: number;
+    /** Where the group was last told of each partition, by its index: below 0 where it was told of none. */
+    readonly listCommittedOffsets: (options: { topics: { topic: string; partitions: number[] }[] }) => Promise<ReadonlyMap<string, readonly bigint[]>>;
+    readonly commit: (options: { offsets: { topic: string; partition: number; offset: bigint; leaderEpoch: number }[] }) => Promise<void>;
+  };
+}
+
+/**
+ * Tells the group of `topic`, as a member reading from the next written (`latest`) is assigned
+ * its partitions, where it reads each from that it was told of none: the position the member's
+ * stream resolved for it, as it says it has (its `offsets`), which the member reads on from, as
+ * the group would be told once a record there was handled. A group told of none on a partition
+ * is one KEDA's lag counts one of there (its scaleToZeroOnInvalidOffset false): an environment
+ * none of whose events was ever written, its events' group never told, would never sleep.
+ *
+ * Asked of the generation the partitions were assigned in, and not where the member has joined
+ * another since; a commit the broker refuses as the group rebalances is asked again by the client
+ * in the generation it rejoins, which may have another member read the partition: as what it
+ * tells is a start, never past a record no member handled, that can only have records delivered
+ * again, which each of alasio's groups' handling passes over. What a read awaits before it hands
+ * a record on, so that a record's own telling, past it, is never told before it.
+ */
+export function tellStarts({ stream, consumer }: StartsTold, topic: string): () => Promise<void> {
+  let telling: Promise<void> = Promise.resolve();
+  stream.on("offsets", () => {
+    // Read as the stream says them, before it reads on past them.
+    const partitions = consumer.assignments?.find((assignment) => assignment.topic === topic)?.partitions ?? [];
+    const starts = partitions.flatMap((partition) => {
+      const offset = stream.offsetsToFetch.get(`${topic}:${partition}`);
+      return offset === undefined ? [] : [{ partition, offset }];
+    });
+    const generation = consumer.generationId;
+    telling = telling.then(async () => {
+      if (starts.length === 0) return;
+      const committed = (await consumer.listCommittedOffsets({ topics: [{ topic, partitions: starts.map(({ partition }) => partition) }] })).get(topic) ?? [];
+      const untold = starts.filter(({ partition }) => (committed[partition] ?? -1n) < 0n);
+      if (untold.length === 0 || consumer.generationId !== generation) return;
+      await consumer.commit({ offsets: untold.map(({ partition, offset }) => ({ topic, partition, offset, leaderEpoch: -1 })) });
+    });
+  });
+  return () => telling;
+}
+
 /**
  * Joins `log`'s group on its topic, reading on from where the group was last told, or, of a
  * group told of none, from the topic's first record still kept (`earliest`) or the next written
@@ -140,10 +193,13 @@ export async function joinTopic(log: TopicLog, untold: "earliest" | "latest"): P
     await consumer.close(true).catch(() => {});
     throw error;
   }
+  // A member reading from the next written tells the group of where it reads each partition it was told of none from.
+  const told = untold === "latest" ? tellStarts({ stream, consumer }, log.topic) : () => Promise.resolve();
   const records = stream[Symbol.asyncIterator]();
   return rejoinOnGrowth({
     async next() {
       const read = await records.next();
+      await told();
       if (read.done) throw new Error("the topic's stream of records ended");
       const record = read.value;
       return { value: record.value, position: `${record.topic}/${record.partition}/${record.offset}`, commit: () => record.commit() as Promise<void> };
