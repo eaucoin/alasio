@@ -298,8 +298,15 @@ if (inShard("upgrade")) {
       const deployment = await kube.get<V1Deployment>(ref("Deployment", name, NAMESPACE));
       return (deployment?.spec?.replicas ?? 0) > 0 && deployment?.status?.readyReplicas === deployment?.spec?.replicas;
     };
-    /** alasio's Deployment's generation, which an upgrade moves on. */
-    const alasioGeneration = async () => (await kube.get(ref("Deployment", RELEASE, NAMESPACE)))?.metadata?.generation;
+    /**
+     * What of alasio's Deployment an apply of it sets, which an upgrade changes: its spec but its
+     * replicas, which KEDA sets as it scales alasio, in a range, from none, as it is woken, and so its
+     * generation with them.
+     */
+    const alasioApplied = async () => {
+      const { replicas: _scaled, ...applied } = (await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE)))?.spec ?? {};
+      return applied;
+    };
     /** The files of the cut-over's record, which its markers are among. */
     const recorded = async () => (await inCutOverRecord("ls -1")).split("\n").filter(Boolean);
 
@@ -643,13 +650,13 @@ if (inShard("upgrade")) {
     // so the cut-over refuses while one exists, as its first checks find it.
     test(`on ${PREVIOUS}: a branch environment, which the cut-over refuses to go past, before it changes anything, until it is deleted`, { timeout: 60 * 60_000 }, async () => {
       await createBranch(branchTelegram?.base, {});
-      const generation = await alasioGeneration();
+      const applied = await alasioApplied();
       const refused = await cutOver();
       assert.notEqual(refused.code, 0, refused.stdout);
       assert.match(refused.stderr, new RegExp(`FAILED: alasio upgrades main alone[^\\n]*\\(alasio branch delete ${BRANCH}\\)`, "u"));
       assert.doesNotMatch(refused.stderr, /checking that the upgrade can run|upgrading, from the cut-over/u);
       assert.ok(!(await recorded()).includes("point-of-no-return"));
-      assert.equal(await alasioGeneration(), generation);
+      assert.deepEqual(await alasioApplied(), applied);
       assert.ok(await runs(RELEASE), "alasio runs as it did");
       // By the branch's Telegram, whose bot's webhook it deletes, as main's is another bot's.
       await alasioOkWith({ TELEGRAM_API_ROOT: branchTelegram?.base }, "branch", "delete", BRANCH);
@@ -659,7 +666,7 @@ if (inShard("upgrade")) {
     });
 
     test(`the cut-over from ${PREVIOUS}, failing before its point of no return, once every step before it has run, changes nothing but adding this release's secrets, and a run again starts over`, { timeout: 60 * 60_000 }, async () => {
-      const generation = await alasioGeneration();
+      const applied = await alasioApplied();
       const [secrets, stack] = [await namespaceSecrets(), await stackSecrets()];
       const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
       assert.notEqual(failed.code, 0, failed.stdout);
@@ -673,7 +680,7 @@ if (inShard("upgrade")) {
       assert.deepEqual(Object.keys(stack.root).filter((key) => stackAfter.root[key] !== stack.root[key]), []);
       assert.deepEqual(Object.keys(stackAfter.root).filter((key) => !(key in stack.root)).sort(), ["codexLoginPassword", "verifiers.codex_login"]);
       assert.ok(!(await recorded()).includes("point-of-no-return"));
-      assert.equal(await alasioGeneration(), generation);
+      assert.deepEqual(await alasioApplied(), applied);
       assert.ok(await runs(RELEASE), "alasio runs as it did");
       await tg.say("between the cut-overs");
       await tg.waitFor((call) => answered(call));
@@ -711,12 +718,12 @@ if (inShard("upgrade")) {
     });
 
     test(`the cut-over from ${PREVIOUS}, upgrades/from-${PREVIOUS}.sh, as the box runs it, run again once it has upgraded, goes on with what follows the upgrade alone`, { timeout: 60 * 60_000 }, async () => {
-      const generation = await alasioGeneration();
+      const applied = await alasioApplied();
       const again = await cutOver();
       assert.equal(again.code, 0, `${again.stdout}${again.stderr}`);
       assert.doesNotMatch(again.stderr, /checking that|upgrading, from the cut-over begun at /u);
       assert.match(again.stderr, /^[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
-      assert.equal(await alasioGeneration(), generation);
+      assert.deepEqual(await alasioApplied(), applied);
       upgraded = Date.now();
     });
 
