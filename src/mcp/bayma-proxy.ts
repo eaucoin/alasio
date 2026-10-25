@@ -23,8 +23,9 @@
  * a pod was given may have run. A caller that goes stops its request on, and a
  * bayma that goes mid-answer ends the caller's, as the binder's proxy does (../binder/proxy.ts).
  *
- * The gateway not reached at all, its connection never made, as while it starts again, a
- * request is passed again every UNREACHED_EVERY_MS, for `unreachedForMs`
+ * The gateway not reached at all, its connection never made, as while it starts again, or not
+ * made within CONNECT_WITHIN_MS, as one whose SYN nothing answers, a request is passed again
+ * every UNREACHED_EVERY_MS, for `unreachedForMs`
  * (GATEWAY_RESTART_MS) from when it came, where its body could be read whole first: no pod was
  * given it. So a call a harness makes while the gateway starts again is answered once it is,
  * as is the GET its MCP client makes to reopen its stream, rather than each answered 502.
@@ -64,6 +65,14 @@ export const GATEWAY_RESTART_MS = 45_000;
 /** How often a request is passed again while its connection to the gateway is never made. */
 const UNREACHED_EVERY_MS = 1_000;
 
+/**
+ * How long a connection to the gateway is waited for, at most, before it is taken as never made:
+ * one whose SYN nothing answers, as one routed to a pod going away may be, would otherwise wait
+ * out the kernel's own retries, minutes, past GATEWAY_RESTART_MS and the harness's wait both. A
+ * connection to a gateway that runs is made within milliseconds.
+ */
+export const CONNECT_WITHIN_MS = 5_000;
+
 /** The headers of one hop, which go no further than it (RFC 9110 7.6.1), and the Authorization the loopback is reached with. */
 const HOP_HEADERS = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade", "host", "authorization"]);
 
@@ -90,13 +99,18 @@ function authorized(route: Route, given: string | undefined): boolean {
   return bytes.length === route.authorization.length && timingSafeEqual(bytes, route.authorization);
 }
 
-/** What the loopback is made with: how long a request whose connection to the gateway is never made is passed again for, GATEWAY_RESTART_MS but for tests. */
+/**
+ * What the loopback is made with: how long a request whose connection to the gateway is never
+ * made is passed again for, and how long each connection is waited for: GATEWAY_RESTART_MS and
+ * CONNECT_WITHIN_MS but for tests.
+ */
 export interface BaymaProxyOptions {
   readonly unreachedForMs?: number | undefined;
+  readonly connectWithinMs?: number | undefined;
 }
 
 /** The loopback's endpoints, as the module says, served until the scope closes. */
-export const makeBaymaProxy = ({ unreachedForMs = GATEWAY_RESTART_MS }: BaymaProxyOptions = {}): Effect.Effect<BaymaProxy["Service"], never, Scope.Scope> => Effect.gen(function*() {
+export const makeBaymaProxy = ({ unreachedForMs = GATEWAY_RESTART_MS, connectWithinMs = CONNECT_WITHIN_MS }: BaymaProxyOptions = {}): Effect.Effect<BaymaProxy["Service"], never, Scope.Scope> => Effect.gen(function*() {
   /** Each workspace's endpoint, by its key, and by its path. */
   const routes = new Map<string, Route>();
   const paths = new Map<string, Route>();
@@ -126,9 +140,10 @@ export const makeBaymaProxy = ({ unreachedForMs = GATEWAY_RESTART_MS }: BaymaPro
      * Passes the request on, its body `body` where it was read whole first: then, answered 503
      * by a gateway that says it passed it to no pod (NOT_PASSED_HEADER), as it answers a bearer
      * held to a binding it does not know of yet, passed again after its Retry-After, until
-     * RETRY_WITHIN_MS; its connection to the gateway never made, passed again every
-     * UNREACHED_EVERY_MS until `unreachedForMs`; otherwise as answered, as a pod given it may
-     * have run it.
+     * RETRY_WITHIN_MS; its connection to the gateway never made, or not made within
+     * `connectWithinMs`, nor past `unreachedForMs`, so never waited on past it, passed again
+     * every UNREACHED_EVERY_MS until `unreachedForMs`; otherwise as answered, as a pod given it
+     * may have run it.
      */
     const pass = (body: Buffer | null): void =>
       // Got as the request goes, so its bearer is fresh however long its process has lived.
@@ -138,7 +153,7 @@ export const makeBaymaProxy = ({ unreachedForMs = GATEWAY_RESTART_MS }: BaymaPro
         target.pathname = [target.pathname.replace(/\/$/u, ""), ...below].join("/");
         target.search = asked.search;
         const send = target.protocol === "https:" ? httpsRequest : httpRequest;
-        current = send(target, { method: incoming.method ?? "GET", headers: passedOn(incoming.headers, endpoint.headers) }, (answered) => {
+        const sent = send(target, { method: incoming.method ?? "GET", headers: passedOn(incoming.headers, endpoint.headers) }, (answered) => {
           const after = Number(answered.headers["retry-after"] ?? 1);
           if (answered.statusCode === 503 && answered.headers[NOT_PASSED_HEADER] !== undefined && body !== null && Number.isFinite(after) && Date.now() + after * 1000 < until) {
             answered.resume();
@@ -149,18 +164,25 @@ export const makeBaymaProxy = ({ unreachedForMs = GATEWAY_RESTART_MS }: BaymaPro
           answered.on("error", failed);
           answered.pipe(outgoing);
         });
+        current = sent;
         /** Whether its connection to the gateway was made: one that was may have passed it on. */
         let connected = false;
-        current.on("socket", (socket) => {
-          if (socket.connecting) socket.once("connect", () => void (connected = true));
-          else connected = true;
+        sent.on("socket", (socket) => {
+          if (!socket.connecting) return void (connected = true);
+          const waited = Math.max(0, Math.min(connectWithinMs, unreachedUntil - Date.now()));
+          const unmade = setTimeout(() => sent.destroy(new Error(`its connection to the gateway was not made within ${waited} ms`)), waited);
+          socket.once("connect", () => {
+            clearTimeout(unmade);
+            connected = true;
+          });
+          socket.once("close", () => clearTimeout(unmade));
         });
-        current.on("error", (error) => {
+        sent.on("error", (error) => {
           if (connected || body === null || Date.now() + UNREACHED_EVERY_MS >= unreachedUntil || outgoing.destroyed) return failed(error);
           setTimeout(() => pass(body), UNREACHED_EVERY_MS);
         });
-        if (body === null) incoming.pipe(current);
-        else current.end(body);
+        if (body === null) incoming.pipe(sent);
+        else sent.end(body);
       }, (error: { readonly message: string }) => answer(502, `bayma was not reached: ${error.message}`));
     // One whose body may be read whole first, as an MCP call's, may be passed again; another is passed once, as it comes.
     if (incoming.headers["transfer-encoding"] !== undefined || Number(incoming.headers["content-length"] ?? 0) > REPLAYED_BYTES) return pass(null);

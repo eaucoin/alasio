@@ -1,7 +1,9 @@
 /** The workspaces' bayma at alasio's loopback (src/mcp/bayma-proxy.ts): each key's requests passed on with a bearer got as each goes. */
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { createServer, type IncomingMessage, request } from "node:http";
-import type { AddressInfo } from "node:net";
+import { type AddressInfo, connect } from "node:net";
 import { test } from "node:test";
 
 import { Context, Effect, Exit, Layer, Scope } from "effect";
@@ -143,6 +145,47 @@ test("a request to a gateway not reached, as while it starts again, is passed ag
     assert.ok(Date.now() - started >= 1_000, `answered in ${Date.now() - started} ms`);
   } finally {
     await bounded.close();
+  }
+});
+
+/**
+ * A port on the loopback whose connections are never made, as one whose SYN nothing answers:
+ * listened on with no room for a connection not yet taken, and that room filled, so the kernel
+ * drops each SYN after. Its listener a Python's, which, unlike Node's, takes none of them.
+ */
+async function unanswering(): Promise<{ readonly port: number; readonly close: () => void }> {
+  const listener = spawn("python3", ["-c", "import socket, sys, time\ns = socket.socket()\ns.bind(('127.0.0.1', 0))\ns.listen(0)\nprint(s.getsockname()[1], flush=True)\nsys.stdin.read()"], { stdio: ["pipe", "pipe", "inherit"] });
+  const port = Number((await once(listener.stdout, "data"))[0].toString().trim());
+  const filling = [1, 2, 3].map(() => connect(port, "127.0.0.1").on("error", () => {}));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  return { port, close: () => (filling.forEach((socket) => socket.destroy()), listener.kill()) };
+}
+
+test("a request to a gateway whose connection is never made, its SYN unanswered, as one routed to a pod going away, is answered 502 within the bound, never waited on past it", { timeout: 30_000 }, async () => {
+  const gone = await unanswering();
+  const { proxy, close } = await loopback(Context.empty(), { unreachedForMs: 3_000, connectWithinMs: 1_000 });
+  try {
+    const endpoint = await Effect.runPromise(proxy.reach("folder:claude:telegram:1", Effect.succeed({ url: `http://127.0.0.1:${gone.port}/mcp`, headers: {} })));
+    const started = Date.now();
+    const answered = await ask(endpoint);
+    const took = Date.now() - started;
+    assert.equal(answered.status, 502);
+    assert.match(((await answered.json()) as { readonly error: string }).error, /not made within/u);
+    // Asked again within the bound, each connection given up on, then answered at the bound.
+    assert.ok(took >= 2_000 && took < 4_500, `answered in ${took} ms`);
+  } finally {
+    await close();
+  }
+  // A connection waited for no longer than the bound has left, however long a connection may take.
+  const bounded = await loopback(Context.empty(), { unreachedForMs: 2_000, connectWithinMs: 20_000 });
+  try {
+    const endpoint = await Effect.runPromise(bounded.proxy.reach("folder:claude:telegram:1", Effect.succeed({ url: `http://127.0.0.1:${gone.port}/mcp`, headers: {} })));
+    const started = Date.now();
+    assert.equal((await ask(endpoint)).status, 502);
+    assert.ok(Date.now() - started < 3_500, `answered in ${Date.now() - started} ms`);
+  } finally {
+    await bounded.close();
+    gone.close();
   }
 });
 
