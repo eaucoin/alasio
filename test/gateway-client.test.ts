@@ -11,7 +11,7 @@ import { test, type TestContext } from "node:test";
 
 import { Effect } from "effect";
 
-import { environmentKey } from "../src/binder/names.ts";
+import { environmentKey, NOT_PASSED_HEADER } from "../src/binder/names.ts";
 import { type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 import { makeGatewayWorkspaces, TOKEN_TTL_MS } from "../src/sandbox/gateway-client.ts";
 
@@ -151,6 +151,59 @@ test("a file's write is asked again where the gateway was not reached, as while 
   const workspaces = makeGatewayWorkspaces({ url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/`, environment: "try", callerKey: environmentKey(master, "try") });
   await run(workspaces.writeFile("fs-abc123", "home/.alasio/received/1/note.txt", Buffer.from("hello")));
   assert.deepEqual([cuts, written], [0, ["hello"]]);
+});
+
+test("each call of the gateway's, a bind's, a release's and a workspace's alike, is passed again while the gateway is not reached, as while it starts again, and answered once it is; one past the bound fails", { timeout: 30_000 }, async (t) => {
+  // A port no one listens on yet, as the gateway's Service's while no pod of it is ready.
+  const free = createServer();
+  free.listen(0, "127.0.0.1");
+  await once(free, "listening");
+  const port = (free.address() as AddressInfo).port;
+  await new Promise<void>((resolve) => free.close(() => resolve()));
+  const options = { url: `http://127.0.0.1:${port}/`, environment: "try", callerKey: environmentKey(master, "try") };
+  const workspaces = makeGatewayWorkspaces(options, { unreachedForMs: 10_000 });
+  const calls = Promise.all([
+    run(workspaces.bind("fs-abc123", "none")),
+    run(workspaces.release("fs-abc123", "none")),
+    run(workspaces.folders.release({ harness: "claude", threadKey: "telegram:42" })),
+    run(workspaces.create("fs-abc123")),
+  ]);
+  // Started again 2 s on, at the same address.
+  await new Promise((resolve) => setTimeout(resolve, 2_000));
+  const asked: string[] = [];
+  const server = createServer((incoming, outgoing) => {
+    asked.push(`${incoming.method} ${incoming.url}`);
+    incoming.resume();
+    incoming.on("end", () => (incoming.url === "/bind" ? outgoing.writeHead(200).end(JSON.stringify({ binding: "binding-1" })) : outgoing.writeHead(204).end()));
+  });
+  server.listen(port, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => server.close());
+  await calls;
+  assert.deepEqual(asked.sort(), ["POST /bind", "POST /release", "POST /release", "POST /workspace"]);
+  // Not reached within its bound: failing, saying so.
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  const bounded = makeGatewayWorkspaces(options, { unreachedForMs: 1_500 });
+  const started = Date.now();
+  const failed = await refused(bounded.release("fs-abc123", "none"));
+  assert.equal(failed.status, undefined);
+  assert.match(failed.reason, /ECONNREFUSED/u);
+  assert.ok(Date.now() - started >= 1_000, `failed in ${Date.now() - started} ms`);
+});
+
+test("a call the gateway answers 503 saying it passed it to no pod, as it does stopping, is passed again after its Retry-After; any other 503 is the call's", async (t) => {
+  let stopping = 1;
+  const { asked, workspaces } = await gateway(t, ({ url }) => {
+    if (url === "/release" && stopping > 0) return ((stopping -= 1), { status: 503, body: JSON.stringify({ error: "the gateway is stopping" }), headers: { "retry-after": "1", [NOT_PASSED_HEADER]: "true" } });
+    if (url === "/workspace") return { status: 503, body: JSON.stringify({ error: "the node agent of node-a is not reached" }) };
+    return { status: 204 };
+  });
+  const releasing = Date.now();
+  await run(workspaces.release("fs-abc123", "none"));
+  assert.ok(Date.now() - releasing >= 1_000, `asked again ${Date.now() - releasing} ms on, before its Retry-After`);
+  const failed = await refused(workspaces.create("fs-abc123"));
+  assert.deepEqual([failed.status, failed.reason], [503, "the node agent of node-a is not reached"]);
+  assert.deepEqual(asked.map(({ method, url }) => `${method} ${url}`), ["POST /release", "POST /release", "POST /workspace"]);
 });
 
 test("a folder conversation's instance is reached, bound and released through the gateway by a caller's token of its folder key, of its environment alone; a bind that failed is not asked again, saying why, and whether it is held", async (t) => {

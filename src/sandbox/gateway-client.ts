@@ -19,9 +19,15 @@
  *   GET /workspace/quota, GET /workspace/all, GET and PUT /workspace/files, POST /workspace/forks);
  *   a file's write asked again every few seconds while the gateway answers it 503, as a node's
  *   mount of workspace storage does not hold its workspace's quota yet, or is handed over, or
- *   is not reached, as while the gateway rolls, until FILE_WRITE_WAIT_MS.
+ *   where its answer did not come once its connection was made, as of a gateway's pod
+ *   stopping under it, until FILE_WRITE_WAIT_MS: a write of the file whole, which written twice
+ *   writes the same.
  *
- * What the gateway refuses is a GatewayError with its status and what it said.
+ * Each call is passed to the gateway as ./gateway-passing.ts says, as alasio's loopback passes a
+ * harness's (../mcp/bayma-proxy.ts): asked again while the gateway is not reached, as while it
+ * starts again, for GATEWAY_RESTART_MS, and after its Retry-After where it says it passed it to
+ * no pod, as it does stopping. What the gateway refuses is a GatewayError with its status and
+ * what it said.
  *
  * A harness pool's pod has no key to mint tokens by: it reaches its conversation's
  * workspace by the tokens its turns give it (GivenTokens), the latest of each key's, and none
@@ -31,6 +37,7 @@ import { Clock, Duration, Effect, Schedule, Schema } from "effect";
 
 import { type HeldTo, mintToken } from "../binder/tokens.ts";
 import { folderBindMs, folderKey } from "../gateway/names.ts";
+import { type GatewayPassing, passToGateway } from "./gateway-passing.ts";
 import { sessionKey } from "./names.ts";
 
 /** Where an instance's bayma serves MCP, through the gateway, and the bearer to reach it with. */
@@ -158,8 +165,8 @@ export interface GivenTokens {
 const QuotaAnswer = Schema.Struct({ capacityBytes: Schema.Number, usedBytes: Schema.Number });
 const AllAnswer = Schema.Struct({ workspaces: Schema.Array(Schema.String) });
 
-/** The gateway's session workspaces, as the module says, by alasio's environment's key, or by the tokens given. */
-export function makeGatewayWorkspaces(options: GatewayWorkspacesOptions | GivenTokens): GatewayWorkspaces {
+/** The gateway's session workspaces, as the module says, by alasio's environment's key, or by the tokens given; asked as `passing` says but for tests (./gateway-passing.ts). */
+export function makeGatewayWorkspaces(options: GatewayWorkspacesOptions | GivenTokens, passing: GatewayPassing = {}): GatewayWorkspaces {
   const base = options.url.replace(/\/+$/u, "");
   /**
    * A caller's token of the key `key`: minted, of alasio's environment and what `said` says
@@ -178,22 +185,33 @@ export function makeGatewayWorkspaces(options: GatewayWorkspacesOptions | GivenT
   const ask = (what: string, volumeId: string, mode: NetMode, method: string, path: string, options: { readonly body?: Uint8Array | string; readonly timeoutMs?: number } = {}) =>
     askAs(what, tokenOf(volumeId, mode), method, path, options);
 
-  /** Asks the gateway `method path` by the token `tokenOf` makes, with `body`: its status and its body. */
+  /**
+   * Asks the gateway `method path` by the token `tokenOf` makes, with `body`: its status and its
+   * body. Passed again while the gateway is not reached, as while it starts again, or says it
+   * passed it to no pod, as it does stopping, as ./gateway-passing.ts says: nothing of it reached
+   * the gateway, so asking again does nothing twice, a bind's, a release's and a write's alike.
+   */
   const askAs = (what: string, tokenOf: Effect.Effect<string, GatewayError>, method: string, path: string, { body, timeoutMs = CALL_TIMEOUT_MS }: { readonly body?: Uint8Array | string; readonly timeoutMs?: number } = {}) =>
     Effect.gen(function*() {
       const token = yield* tokenOf;
-      return yield* Effect.tryPromise({
-        try: async (signal) => {
-          const response = await fetch(`${base}${path}`, {
-            method,
-            headers: { authorization: `Bearer ${token}`, ...(typeof body === "string" ? { "content-type": "application/json" } : {}) },
-            ...(body === undefined ? {} : { body: typeof body === "string" ? body : Buffer.from(body) }),
-            signal,
-          });
-          const bytes = new Uint8Array(await response.arrayBuffer());
-          return { status: response.status, bytes };
-        },
-        catch: (error) => new GatewayError({ call: what, reason: error instanceof Error ? error.message : String(error) }),
+      const sent = body === undefined ? Buffer.alloc(0) : Buffer.from(body);
+      const headers = { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { "content-length": String(sent.length) }), ...(typeof body === "string" ? { "content-type": "application/json" } : {}) };
+      return yield* Effect.callback<{ readonly status: number; readonly bytes: Uint8Array }, GatewayError>((resume) => {
+        const failed = (error: Error) => resume(Effect.fail(new GatewayError({ call: what, reason: error.message })));
+        const stop = passToGateway({
+          ...passing,
+          method,
+          body: sent,
+          target: () => Promise.resolve({ url: new URL(`${base}${path}`), headers }),
+          answered: (answer) => {
+            const chunks: Buffer[] = [];
+            answer.on("data", (chunk: Buffer) => chunks.push(chunk));
+            answer.on("end", () => resume(Effect.succeed({ status: answer.statusCode ?? 0, bytes: new Uint8Array(Buffer.concat(chunks)) })));
+            answer.on("error", failed);
+          },
+          failed,
+        });
+        return Effect.sync(stop);
       }).pipe(Effect.timeoutOrElse({ duration: Duration.millis(timeoutMs), orElse: () => Effect.fail(new GatewayError({ call: what, reason: `it did not answer within ${timeoutMs / 1000} s` })) }));
     });
 
@@ -301,7 +319,7 @@ export function makeGatewayWorkspaces(options: GatewayWorkspacesOptions | GivenT
       // Its token had first, as one there is none of is no matter of asking again.
       return Effect.flatMap(tokenOf(volumeId, "none"), (token) =>
         askAs(what, Effect.succeed(token), "PUT", `/workspace/files?${new URLSearchParams({ path })}`, { body: bytes }).pipe(
-          // Not reached, as while the gateway rolls or its node starts again: asked again too, as the write is of the file whole, so one that went through and is asked again writes the same.
+          // Its answer not come once its connection was made, as of a gateway's pod stopping under it, or not within its time: asked again too, as the write is of the file whole, so one that went through and is asked again writes the same. (One whose connection was never made is passed again as every call is, ./gateway-passing.ts.)
           Effect.mapError((error) => new Unreached({ reason: error.reason })),
           Effect.flatMap((answer): Effect.Effect<void, GatewayError | NotYet> => {
             if (answer.status === 204) return Effect.void;

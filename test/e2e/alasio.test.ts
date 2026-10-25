@@ -39,7 +39,7 @@ import { neonStack } from "../../neon/test/stack.ts";
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
 import { SESSION_FS_ENVIRONMENTS_TOML } from "../../src/codex/sessionfs.ts";
 import { SESSION_FS_CLAUDE_TOOLS } from "../../src/harness/claude/sessionfs.ts";
-import { GATEWAY_RESTART_MS } from "../../src/mcp/bayma-proxy.ts";
+import { GATEWAY_RESTART_MS } from "../../src/sandbox/gateway-passing.ts";
 import { TOKEN_TTL_MS } from "../../src/sandbox/gateway-client.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
