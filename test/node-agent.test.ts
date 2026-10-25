@@ -2113,6 +2113,8 @@ const unusedWorkspaces: Workspaces = {
   attach: () => Effect.die("no workspace is attached"),
   bindFree: () => Effect.die("no free pod is bound"),
   detach: () => Effect.die("no workspace is detached"),
+  sweep: () => Effect.die("no pod's directory is swept"),
+  attachedNamespaces: Effect.die("no namespace's directories are listed"),
   read: () => Effect.die("no workspace's file is read"),
   write: () => Effect.die("no workspace's file is written"),
   stop: () => Effect.die("no bayma is told to stop"),

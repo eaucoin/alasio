@@ -19,9 +19,13 @@
  *
  * Its bucket and the identity it is reached as are the Secret Neon's setup makes for it
  * (neon/control/kube-setup.ts), taken whole as its environment, and the token the sandbox
- * gateway presents, the Secret both are given.
+ * gateway presents, the Secret both are given. Of the cluster's API it reads the pods alone, as
+ * its ServiceAccount, of the namespaces it attaches into: main's, its sessions' and, made with
+ * each branch environment (./branch.ts), each branch's (nodeAgentPodReaders), as it watches them
+ * to keep what is attached on its node to the pods there are (src/node-agent/attachments.ts):
+ * no other right, and nothing of any other namespace.
  */
-import type { KubernetesObject, V1DaemonSet, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
+import type { KubernetesObject, V1DaemonSet, V1Role, V1RoleBinding, V1ServiceAccount, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
 
 import {
   BACKGROUND_READ_SECONDS_VARIABLE,
@@ -41,7 +45,8 @@ import {
 import { memoryBytes } from "../capacity.ts";
 import { currentGvisorRelease, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
-import { componentName, given, imagePullSecrets, labels, NAMESPACE, otelEnv, selectorLabels } from "./common.ts";
+import { sessionsNamespace } from "./alasio.ts";
+import { componentName, given, imagePullSecrets, labels, MAIN_ENVIRONMENT, NAMESPACE, otelEnv, selectorLabels } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
@@ -51,6 +56,8 @@ import { WORKSPACE_QUOTAS } from "./workspace-storage.ts";
 const SNAPSHOTS_SECRET = componentName("snapshots");
 /** The Secret of the token the sandbox gateway presents to the node agents, under `token`. */
 const NODE_AGENT_SECRET = componentName("node-agent");
+/** The node agents' ServiceAccount, and the Role of each namespace it reads the pods of, and its binding. */
+const NODE_AGENT_ACCOUNT = componentName("node-agent");
 
 /** The node's paths the agent has at the same paths: each one's volume, what must be there, and whether the agent only reads it. */
 const HOST_PATHS: readonly { readonly name: string; readonly path: string; readonly type: string; readonly readOnly?: true }[] = [
@@ -109,8 +116,9 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
           // unsaved, or leave its cache half written (src/node-agent/operations.ts).
           terminationGracePeriodSeconds: nodeAgentStopSeconds(sandboxBytes),
           hostPID: true,
-          // It speaks to nothing of the cluster's but alasio, which calls it.
-          automountServiceAccountToken: false,
+          // Of the cluster's API, it reads the pods alone (nodeAgentObjects).
+          serviceAccountName: NODE_AGENT_ACCOUNT,
+          automountServiceAccountToken: true,
           enableServiceLinks: false,
           ...imagePullSecrets(config),
           ...given("nodeSelector", { ...sessions.nodeSelector }),
@@ -163,5 +171,21 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
  */
 export function nodeAgentObjects(config: InstallConfig): KubernetesObject[] {
   const agents = daemonSet(config);
-  return [agents, verticalPodAutoscaler(agents, "Recommended")];
+  // Who the agents are, and that they may read the pods of main's namespaces they attach into.
+  const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name: NODE_AGENT_ACCOUNT, namespace: NAMESPACE, labels: labels("node-agent") } };
+  return [serviceAccount, ...[NAMESPACE, sessionsNamespace(config, MAIN_ENVIRONMENT)].flatMap(nodeAgentPodReaders), agents, verticalPodAutoscaler(agents, "Recommended")];
+}
+
+/** That the node agents may read the pods of `namespace`, as they watch those of a namespace they attach into: its Role, and its binding. */
+export function nodeAgentPodReaders(namespace: string): KubernetesObject[] {
+  const metadata = { name: NODE_AGENT_ACCOUNT, namespace, labels: labels("node-agent") };
+  const role: V1Role = { apiVersion: "rbac.authorization.k8s.io/v1", kind: "Role", metadata, rules: [{ apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"] }] };
+  const binding: V1RoleBinding = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "RoleBinding",
+    metadata,
+    subjects: [{ kind: "ServiceAccount", name: NODE_AGENT_ACCOUNT, namespace: NAMESPACE }],
+    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: NODE_AGENT_ACCOUNT },
+  };
+  return [role, binding];
 }

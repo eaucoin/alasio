@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, type StatsFs, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, type StatsFs, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -549,6 +549,80 @@ test("the sandbox of a bound pod's bayma of a pool on this node is told to write
     // One that fails, its failure said.
     at.hooks.fail = true;
     assert.equal(await refusal(sync("c-bayma")), 502);
+  } finally {
+    at.done();
+  }
+});
+
+test("a sweep detaches the directory of each pod the cluster no longer has on the node, a session's workspace mounted into it or a harness's binding written for it alike, once it has not changed for its grace and no process of runsc's runs for its pod's containers; one whose pod is there, one changed lately, and one whose sandbox runs still are kept, the last detached once it has ended", async () => {
+  const at = workspacesNode({ orphanGraceMs: 60_000 });
+  try {
+    const owner = { uid: process.getuid?.() ?? 1000, gid: process.getgid?.() ?? 1000 };
+    at.files("fs-abc123");
+    for (const pod of ["gone-0", "kept-0", "young-0", "running-0", "odd-0"]) {
+      at.pod(pod);
+      await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, pod, "t", {}));
+    }
+    at.pod("harness-codex-0", "alasio");
+    await Effect.runPromise(at.workspaces.bindFree("alasio", "harness-codex-0", owner, "{}"));
+    // What no attach wrote, in one of them.
+    writeFileSync(join(at.attachRoot, "main", "odd-0", "other"), "");
+    // Each but the young one last changed past its grace.
+    const past = new Date(Date.now() - 120_000);
+    for (const [namespace, pod] of [["main", "gone-0"], ["main", "kept-0"], ["main", "running-0"], ["main", "odd-0"], ["alasio", "harness-codex-0"]] as const) {
+      const directory = join(at.attachRoot, namespace, pod);
+      for (const name of readdirSync(directory)) if (name !== "ws") utimesSync(join(directory, name), past, past);
+      utimesSync(directory, past, past);
+    }
+    // Its sandbox ending still, as kubelet ends a pod deleted with no grace after it has gone from the cluster: its pause
+    // running on after its bayma ended; and another pod's, of the same name elsewhere, running on, which is no matter.
+    const of = (pod: string, namespace = "main", type = "container") => ({ "io.kubernetes.cri.container-type": type, "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": pod });
+    at.annotations.set("container-0", of("running-0"));
+    at.annotations.set("pause-0", of("running-0", "main", "sandbox"));
+    at.annotations.set("other-0", of("gone-0", "other"));
+    at.running.add("pause-0");
+    at.running.add("other-0");
+    // What the cluster has, of the namespaces whose pods were listed: none of another's, which is not swept.
+    const present = new Map([["main", new Set(["kept-0"])], ["alasio", new Set<string>()]]);
+    at.pod("unlisted-0", "other");
+    utimesSync(join(at.attachRoot, "other", "unlisted-0"), past, past);
+    const swept = await Effect.runPromise(at.workspaces.sweep(present));
+    assert.deepEqual([[...swept.detached].sort(), swept.waiting], [["alasio/harness-codex-0", "main/gone-0", "main/odd-0"], ["main/running-0"]]);
+    const there = (namespace: string, pod: string) => existsSync(join(at.attachRoot, namespace, pod));
+    assert.deepEqual([there("main", "gone-0"), there("alasio", "harness-codex-0"), there("main", "kept-0"), there("main", "young-0"), there("main", "running-0")], [false, false, true, true, true]);
+    // The odd one unmounted, its own file left, and left alone after.
+    assert.deepEqual(readdirSync(join(at.attachRoot, "main", "odd-0")), ["other"]);
+    assert.deepEqual(at.mounts.map((point) => point.split("/").at(-2)).sort(), ["kept-0", "running-0", "young-0"]);
+    at.running.delete("pause-0");
+    assert.deepEqual(await Effect.runPromise(at.workspaces.sweep(present)), { detached: ["main/running-0"], waiting: [] });
+    assert.deepEqual(at.mounts.map((point) => point.split("/").at(-2)).sort(), ["kept-0", "young-0"]);
+    // Nothing more, as long as the young one is young and the kept one's pod is there; nor ever of a namespace not listed.
+    assert.deepEqual(await Effect.runPromise(at.workspaces.sweep(present)), { detached: [], waiting: [] });
+    assert.equal(existsSync(join(at.attachRoot, "other", "unlisted-0")), true);
+    assert.deepEqual([...await Effect.runPromise(at.workspaces.attachedNamespaces)].sort(), ["alasio", "main", "other"]);
+  } finally {
+    at.done();
+  }
+});
+
+test("a sweep that cannot tell from runsc whether a pod gone runs still takes it to run, and detaches nothing of it until it can", async () => {
+  const at = workspacesNode();
+  try {
+    at.files("fs-abc123");
+    at.pod("gone-0");
+    await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "gone-0", "t", {}));
+    // Last changed past its grace, none as the node's clock may run behind its file system's.
+    const directory = join(at.attachRoot, "main", "gone-0");
+    const past = new Date(Date.now() - 120_000);
+    for (const name of readdirSync(directory)) if (name !== "ws") utimesSync(join(directory, name), past, past);
+    utimesSync(directory, past, past);
+    at.runscFails.list = true;
+    const present = new Map([["main", new Set<string>()]]);
+    assert.deepEqual(await Effect.runPromise(at.workspaces.sweep(present)), { detached: [], waiting: ["main/gone-0"] });
+    assert.equal(at.mounts.length, 1);
+    at.runscFails.list = false;
+    assert.deepEqual(await Effect.runPromise(at.workspaces.sweep(present)), { detached: ["main/gone-0"], waiting: [] });
+    assert.deepEqual(at.mounts, []);
   } finally {
     at.done();
   }

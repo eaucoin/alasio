@@ -2502,7 +2502,14 @@ describe("node agents", () => {
     assert.deepEqual(agent.spec?.selector.matchLabels, { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "node-agent" });
     const pod = agent.spec?.template.spec;
     assert.equal(pod?.hostPID, true);
-    assert.equal(pod?.automountServiceAccountToken, false);
+    // Its token, of its ServiceAccount's, which reads the pods alone, of main's namespaces it attaches into, and of no other, the cluster's whole least.
+    assert.deepEqual([pod?.serviceAccountName, pod?.automountServiceAccountToken], ["alasio-node-agent", true]);
+    assert.equal(one<V1ServiceAccount>(objects, "ServiceAccount", "alasio-node-agent").metadata?.namespace, "alasio");
+    const readers = all<V1Role>(objects, "Role").filter(({ metadata }) => metadata?.name === "alasio-node-agent");
+    assert.deepEqual(readers.map(({ metadata, rules }) => [metadata?.namespace, rules]), ["alasio", "alasio-sessions"].map((namespace) => [namespace, [{ apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"] }]]));
+    const reading = all<V1RoleBinding>(objects, "RoleBinding").filter(({ metadata }) => metadata?.name === "alasio-node-agent");
+    assert.deepEqual(reading.map(({ subjects, roleRef }) => [subjects, roleRef]), readers.map(() => [[{ kind: "ServiceAccount", name: "alasio-node-agent", namespace: "alasio" }], { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: "alasio-node-agent" }]));
+    assert.deepEqual([...all<V1ClusterRole>(objects, "ClusterRole"), ...all<V1ClusterRoleBinding>(objects, "ClusterRoleBinding")].filter(({ metadata }) => metadata?.name === "alasio-node-agent"), []);
     // Stopped, or replaced one node at a time, it lets what it runs end first: the restores that
     // read the bucket through it, the last prepared just before taking as long as one takes to
     // its resume (5 minutes), then to read a session's 2 GiB at 4 MiB/s (512 s); then its
@@ -2620,6 +2627,7 @@ describe("node agents", () => {
     const selected = (component: string) => ({ podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component } } });
     assert.deepEqual(egress({}).policyTypes, ["Ingress", "Egress"]);
     const metadata = { to: [selected("valkey")], ports: [{ protocol: "TCP", port: 6379 }] };
+    // Not the API server, where up could not read where it is, as here (the gateway's test, below, reads it): never anywhere, from a privileged pod.
     assert.deepEqual(egress({}).egress, [
       dns,
       { to: [selected("seaweedfs")], ports: [{ protocol: "TCP", port: 8333 }] },
@@ -2816,7 +2824,14 @@ describe("branch environments", () => {
       ["alasio-branch-try-sessions", "alasio-receiver"],
       // main's sandbox gateway, which binds in its harness pools.
       ["alasio-branch-try", "alasio-sandbox-gateway-harnesses"],
+      // main's node agents, which watch the pods of the namespaces they attach into, its harness pools' and its sessions'.
+      ["alasio-branch-try", "alasio-node-agent"],
+      ["alasio-branch-try-sessions", "alasio-node-agent"],
     ]);
+    for (const namespace of ["alasio-branch-try", "alasio-branch-try-sessions"]) {
+      assert.deepEqual(of<V1Role>("Role", "alasio-node-agent", namespace).rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"] }]);
+      assert.deepEqual(of<V1RoleBinding>("RoleBinding", "alasio-node-agent", namespace).subjects, [{ kind: "ServiceAccount", name: "alasio-node-agent", namespace: "alasio" }]);
+    }
     assert.deepEqual(of<V1Role>("Role", "alasio", "alasio-branch-try").rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }, { apiGroups: [""], resources: ["configmaps"], resourceNames: ["alasio-started"], verbs: ["get", "patch"] }]);
   });
 
@@ -3649,7 +3664,7 @@ describe("the sandbox service", () => {
     }]);
   });
 
-  test("lets the gateway and the receiver reach the cluster's DNS, what each talks to, and the API server alone, where up finds it, and anywhere where it cannot, which up warns of", () => {
+  test("lets the gateway, the receiver and the node agents reach the cluster's DNS, what each talks to, and the API server alone, where up finds it, and anywhere where it cannot, which up warns of", () => {
     const apiServer = { addresses: ["172.18.0.2", "172.18.0.3"], ports: [6443] };
     const policies = all<NetworkPolicyObject>(manifests(configOf({}), { ...NOTHING_CARRIED, cpuBaseline: BASELINE, apiServer }), "NetworkPolicy");
     const podOf = (component: string, namespace = "alasio", labels: Record<string, string> = {}): Pod => ({
@@ -3675,6 +3690,8 @@ describe("the sandbox service", () => {
         .map(([to, port]) => `${to.labels["app.kubernetes.io/component"] ?? to.labels["k8s-app"] ?? to.address}:${port}`);
     assert.deepEqual(reached(receiver), ["kube-dns:53", "172.18.0.2:6443", "172.18.0.3:6443", "collector:4318"]);
     assert.deepEqual(reached(gateway), ["kube-dns:53", "172.18.0.2:6443", "172.18.0.3:6443", "collector:4318", "session:7290", "session:7290", "node-agent:8484", "sandbox-gateway:8080"]);
+    // The node agents, which watch their nodes' pods.
+    assert.deepEqual(reached(agent), ["kube-dns:53", "172.18.0.2:6443", "172.18.0.3:6443", "collector:4318"]);
     // A branch environment's pool pods reach the receiver as main's do; a pod of a namespace of no environment's, none.
     assert.equal(connects(policies, branchPooled, receiver, 4318), true);
     assert.equal(admits(policies, { ...pooled, namespace: "elsewhere", namespaceLabels: { "kubernetes.io/metadata.name": "elsewhere" } }, receiver, 4318), false);

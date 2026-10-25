@@ -449,10 +449,11 @@ function lakeQueryPolicy(config: InstallConfig): NetworkPolicy {
  * and saves and restores sandboxes through them, on their API's port, and nothing else, the
  * gateway alone holding the token they take (./node-agent.ts); they reach the cluster's
  * DNS, the object store's S3 port, the bundled one's or the operator's at any address,
- * workspace storage's metadata engine, which they set workspaces' quotas on, and the collector
- * where it runs, and nothing else. The bundled object store, and the metadata engine, admit them.
+ * workspace storage's metadata engine, which they set workspaces' quotas on, the API server,
+ * which they watch the pods they attach into on, where `apiServer` says, and nowhere where up
+ * could not read it, as they run privileged, and the collector where it runs, and nothing else. The bundled object store, and the metadata engine, admit them.
  */
-function nodeAgentPolicies(config: InstallConfig): NetworkPolicy[] {
+function nodeAgentPolicies(config: InstallConfig, apiServer: ApiServer | null): NetworkPolicy[] {
   const { bundled, external } = config.objectStore;
   const seaweedfs = { podSelector: { matchLabels: selectorLabels("seaweedfs") } };
   const endpoint = bundled.enabled ? null : new URL(external.endpoint);
@@ -468,6 +469,8 @@ function nodeAgentPolicies(config: InstallConfig): NetworkPolicy[] {
         CLUSTER_DNS,
         objectStore,
         { to: [{ podSelector: { matchLabels: selectorLabels("valkey") } }], ports: [{ protocol: "TCP", port: VALKEY_PORT }] },
+        // Where up read it alone: a privileged pod is never let reach anywhere for it, its sweep not run instead.
+        ...(apiServer ? [apiServerRule(apiServer)] : []),
         ...(collectorRuns(config) ? [{ to: [{ podSelector: { matchLabels: selectorLabels("collector") } }], ports: [{ protocol: "TCP", port: COLLECTOR_PORT }] }] : []),
       ],
     }),
@@ -693,7 +696,7 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
     ...(grafanaRuns(config) ? grafanaPolicies(config) : []),
     ...(lakeRuns(config) ? [lakeQueryPolicy(config)] : []),
     ...workspaceStoragePolicies(config),
-    ...nodeAgentPolicies(config),
+    ...nodeAgentPolicies(config, apiServer),
     ...poolPolicies(config, environment),
     ...sandboxServicePolicies(config, apiServer),
   ];

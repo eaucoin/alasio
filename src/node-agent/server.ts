@@ -134,6 +134,7 @@ import { NodeHttpServer } from "@effect/platform-node";
 import { Cause, Config, Effect, Option, Redacted, Schema, type Scope } from "effect";
 import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 
+import { KubeClient } from "../kube/client.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken, sameToken } from "../shared/tokens.ts";
 import {
@@ -151,6 +152,7 @@ import {
   type SandboxUnsaveable,
   WorkspaceRef,
 } from "./agent.ts";
+import { convergeAttachments } from "./attachments.ts";
 import { type CacheError, DIGEST, makeSnapshotCache } from "./cache.ts";
 import { makeHostCommands } from "./host.ts";
 import { makeJuicefs } from "./juicefs.ts";
@@ -469,7 +471,9 @@ const EVICTION_GRACE_MS = 10 * 60_000;
  * as on its socket on the node, beside its restores' tokens (NODE_AGENT_RUN_DIR, unless
  * NODE_AGENT_RUN_DIR_VARIABLE says), and how long a resumed restore may read it there
  * (BACKGROUND_READ_SECONDS_VARIABLE). What a
- * stopped agent left half written in the cache is removed first. What stops it is logged,
+ * stopped agent left half written in the cache is removed first; what is attached on the node
+ * is kept to the pods the cluster has on it (./attachments.ts), which it reads as its
+ * ServiceAccount, of no other right. What stops it is logged,
  * and its stop waits on its restores' reads, as the module says.
  */
 export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError.ServeError | CacheError | StoreProxyError, Scope.Scope> = Effect.gen(function*() {
@@ -505,7 +509,10 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const juicefs = Option.match(metaUrl, { onNone: () => null, onSome: (url) => makeJuicefs({ metaUrl: Redacted.value(url) }) });
   // What workspace storage holds, as the node's mount counts it, where the agent works with it.
   if (juicefs) yield* observeStorageUsage(WORKSPACES_ROOT);
-  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces: makeWorkspaces({ host, runsc, juicefs }) });
+  const workspaces = makeWorkspaces({ host, runsc, juicefs });
+  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces });
+  // What is attached on the node, kept to the pods the cluster has on it.
+  yield* convergeAttachments({ node, workspaces }).pipe(Effect.provide(KubeClient.layer));
   // As it stops, before its API does: its restores' reads of the bucket done first.
   yield* Effect.addFinalizer(() =>
     Effect.gen(function*() {

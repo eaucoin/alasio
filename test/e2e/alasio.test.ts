@@ -45,7 +45,7 @@ import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
 import { SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
 import { NODE_PINS } from "../../cli/src/cluster/node.ts";
-import { goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
+import { ATTACH_ROOT, goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { BACKGROUND_REPORT, ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
 import { ANSWER } from "./codex-stand-in.ts";
@@ -3062,6 +3062,17 @@ const deploymentOf = (name: string, replicas: number, pod: ReturnType<typeof pau
   spec: { replicas, selector: { matchLabels: { app: name } }, template: { ...pod, metadata: { labels: { ...pod.metadata.labels, app: name } } } },
 });
 
+/**
+ * Waits until nothing of the pod `pod` of `namespace` is left in its directory on `node`, nor
+ * mounted there, as a pod's node's agent detaches it once the pod is gone (src/node-agent/attachments.ts):
+ * within its grace for a directory changed lately, and its sweep's period.
+ */
+async function untilDetachedOn(node: string, namespace: string, pod: string): Promise<void> {
+  const directory = `${ATTACH_ROOT}/${namespace}/${pod}`;
+  const look = `if grep -q ' ${directory}/' /proc/self/mountinfo || [ -e '${directory}' ]; then echo held; else echo gone; fi`;
+  await until(`what was attached into ${namespace}/${pod} detached on ${node}`, async () => ((await onNode(node, look)).trim() === "gone" ? true : undefined), 5 * 60_000);
+}
+
 /** Waits until `check` gives something, every two seconds for `timeoutMs`: what it gave. */
 async function until<A>(what: string, check: () => Promise<A | undefined>, timeoutMs: number): Promise<A> {
   for (const deadline = Date.now() + timeoutMs; Date.now() < deadline; await sleep(2000)) {
@@ -3799,9 +3810,12 @@ if (inShard("agents")) {
         const cutting = await boundPodOf(session);
         assert.ok(cutting, "no pod was bound as the call to cut started");
         await kube.kill(SESSIONS, cutting.name);
+        return cutting;
       })();
       const seen = await running;
-      await lost;
+      const cut = await lost;
+      // What was attached into the pod lost detached on its node by the node's agent, as no deletion of the pod's was seen.
+      await untilDetachedOn(cut.node, SESSIONS, cut.name);
       t.diagnostic(`Claude Code across its session's releases and loss (${snapshotted ? "snapshotted" : "no snapshot"}): ${JSON.stringify(seen)}`);
       assert.equal(seen.pinned, true, "the SDK's own CLI, as alasio pins it");
       assert.ok(seen.wrote.ok, seen.wrote.text);
@@ -4001,6 +4015,8 @@ if (inShard("agents")) {
       await sleep(60_000);
       const after = (await tg.calls()).filter((call) => call.method === "sendRichMessage");
       assert.deepEqual(after, [], `alasio replied again after ${JSON.stringify(recovered?.payload.rich_message?.markdown)}`);
+      // What was written for the pod killed, its binding, removed from its node by the node's agent, as no deletion of the pod's was seen.
+      await untilDetachedOn(bound.spec?.nodeName ?? "", NAMESPACE, name);
     });
 
     test("an upgrade of alasio and of its harness pools' template, run during a turn, leaves the bound pod running it to its end; the next binding is of the new template", { timeout: 40 * 60_000 }, async () => {

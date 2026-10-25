@@ -22,7 +22,7 @@
  */
 import type { KubernetesObject } from "@kubernetes/client-node";
 
-import { branchNamespace } from "../../../src/branch/names.ts";
+import { branchNamespace, branchSessionsNamespace } from "../../../src/branch/names.ts";
 import { alasioObjects, type CpuBaseline } from "./alasio.ts";
 import { BRANCH_LABEL, type Environment } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
@@ -30,6 +30,7 @@ import { lakeObjects } from "./lake.ts";
 import { harnessPoolObjects } from "./harness-pools.ts";
 import { compute, computeScaling } from "./neon.ts";
 import { networkPolicyObjects } from "./network-policies.ts";
+import { nodeAgentPodReaders } from "./node-agent.ts";
 import { sandboxPoolObjects } from "./sandbox-gateway.ts";
 
 /** The environment of the branch `name`. */
@@ -55,5 +56,7 @@ export function branchObjects(config: InstallConfig, name: string, cpuBaseline: 
     ...networkPolicyObjects(config, environment),
     ...sandboxPoolObjects(config, environment, cpuBaseline),
     ...harnessPoolObjects(config, environment),
+    // That the node agents may read the pods of the branch's namespaces they attach into, its harness pools' and its sessions'.
+    ...[environment.namespace, branchSessionsNamespace(name)].flatMap(nodeAgentPodReaders),
   ].map((object) => branchLabelled(object, name));
 }

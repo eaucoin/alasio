@@ -2,7 +2,8 @@
  * A node agent's workspaces on directories of a test's own, the node's mount table a
  * stand-in's: what its commands mount and unmount, in order; which of its sandboxes'
  * containers run; its pods' directories, as kubelet makes them; and the workspaces whose quota
- * the node's mount does not hold yet, for as long as `quotaHeldWithinMs` is waited for one.
+ * the node's mount does not hold yet, for as long as `quotaHeldWithinMs` is waited for one; and a
+ * sweep's grace for a directory whose pod is gone, `orphanGraceMs`, none unless given.
  */
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,7 +16,7 @@ import { makeJuicefs } from "../../src/node-agent/juicefs.ts";
 import { RunscError } from "../../src/node-agent/runsc.ts";
 import { makeWorkspaces } from "../../src/node-agent/workspaces.ts";
 
-export function workspacesNode({ quotaHeldWithinMs = 1_000 }: { readonly quotaHeldWithinMs?: number } = {}) {
+export function workspacesNode({ quotaHeldWithinMs = 1_000, orphanGraceMs = 0 }: { readonly quotaHeldWithinMs?: number; readonly orphanGraceMs?: number } = {}) {
   const root = mkdtempSync(join(tmpdir(), "alasio-workspaces-"));
   const workspacesRoot = join(root, "workspaces");
   const attachRoot = join(root, "attach");
@@ -32,6 +33,8 @@ export function workspacesNode({ quotaHeldWithinMs = 1_000 }: { readonly quotaHe
   const annotations = new Map<string, Readonly<Record<string, string>>>();
   const execs: string[] = [];
   const hooks = { fail: false };
+  // Whether runsc's list of its containers fails, as a test says.
+  const runscFails = { list: false };
   const host: HostCommands = {
     run: (command) =>
       Effect.sync(() => {
@@ -83,10 +86,17 @@ export function workspacesNode({ quotaHeldWithinMs = 1_000 }: { readonly quotaHe
       return Promise.resolve(!unheld.has(basename(directory)));
     },
     quotaHeldWithinMs,
+    orphanGraceMs,
     juicefs: makeJuicefs({ metaUrl: "redis://:the%20password@valkey.alasio.svc:6379/1", juicefs }),
     runsc: {
       container: (id) =>
         running.has(id) ? Effect.succeed({ release: "r", annotations: { ...annotations.get(id) }, tracksWrites: false, bundle: "" }) : Effect.fail(new RunscError({ release: "", command: "state", reason: "not found" })),
+      // Each that has annotations, whether it runs or not, as runsc lists what it keeps.
+      containers: Effect.suspend(() =>
+        runscFails.list ? Effect.fail(new RunscError({ release: "the node's", command: "list", reason: "runsc could not list its containers" })) : Effect.succeed([...annotations].map(([id, of]) => ({ id, bundle: "", annotations: { ...of } })))
+      ),
+      // A process of each that runs, as runsc runs one for a container's sandbox.
+      processes: (containers) => Effect.sync(() => containers.filter(({ id }) => running.has(id)).map(({ id }, n) => ({ containerId: id, pid: 1000 + n, startTime: "1" }))),
       exec: (release, id, argv) =>
         Effect.suspend(() => {
           execs.push(`${release} ${id} ${argv.join(" ")}`);
@@ -114,6 +124,6 @@ export function workspacesNode({ quotaHeldWithinMs = 1_000 }: { readonly quotaHe
   const pod = (name: string, namespace = "main") => mkdirSync(join(attachRoot, namespace, name), { recursive: true });
   /** What JuiceFS's command was run with, a call a line. */
   const juicefsCalls = () => (existsSync(join(root, "juicefs.log")) ? readFileSync(join(root, "juicefs.log"), "utf8").trim().split("\n") : []);
-  return { root, workspacesRoot, attachRoot, mounts, stuck, ran, tokenAtMount, running, annotations, execs, hooks, storage, unreachable, unheld, looks, workspaces, files, pod, juicefsCalls, inconsistentChecks, ownMounts, done: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, workspacesRoot, attachRoot, mounts, stuck, ran, tokenAtMount, running, annotations, execs, hooks, runscFails, storage, unreachable, unheld, looks, workspaces, files, pod, juicefsCalls, inconsistentChecks, ownMounts, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 
