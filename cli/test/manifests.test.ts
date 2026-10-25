@@ -395,7 +395,7 @@ describe("alasio", () => {
     assert.deepEqual([deployment.spec?.replicas, deployment.spec?.strategy], [undefined, { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }]);
     const [authentication, scaled] = alasioScaling(main, MAIN_ENVIRONMENT, deployment) as [KubernetesObject, ScaledObject];
     assert.deepEqual([authentication.kind, authentication.metadata?.name, authentication.metadata?.namespace], ["TriggerAuthentication", "alasio", "alasio"]);
-    assert.deepEqual([scaled.spec.minReplicaCount, scaled.spec.maxReplicaCount, scaled.spec.pollingInterval, scaled.spec.cooldownPeriod], [0, 3, 5, 300]);
+    assert.deepEqual([scaled.spec.minReplicaCount, scaled.spec.maxReplicaCount, scaled.spec.pollingInterval, scaled.spec.cooldownPeriod], [0, 3, 1, 300]);
     const lag = (trigger: ScaledObject["spec"]["triggers"][number]) => [trigger.metadata["consumerGroup"], trigger.metadata["topic"], trigger.metadata["lagThreshold"], trigger.metadata["offsetResetPolicy"]];
     const lags = scaled.spec.triggers.filter(({ type }) => type === "kafka");
     assert.deepEqual(lags.map(lag), [["alasio.main", "telegram.main", "20", "earliest"], ["alasio-events.main", "events.main", "1", "latest"], ["alasio-forks.main", "forks.main", "1", "earliest"]]);
@@ -4024,7 +4024,7 @@ describe("the relay of an environment's Codex login", () => {
     const relay = one<V1Deployment>(objects, "Deployment", "alasio-codex-login");
     assert.equal(relay.spec?.replicas, undefined);
     const scaler = one<ScaledObject>(objects, "ScaledObject", "alasio-codex-login");
-    assert.deepEqual([scaler.spec.minReplicaCount, scaler.spec.maxReplicaCount, scaler.spec.pollingInterval], [0, 1, 5]);
+    assert.deepEqual([scaler.spec.minReplicaCount, scaler.spec.maxReplicaCount, scaler.spec.pollingInterval], [0, 1, 1]);
     assert.deepEqual(scaler.spec.triggers.map(({ type, metadata }) => [type, metadata["url"], metadata["valueLocation"], metadata["activationTargetValue"]]), [
       ["metrics-api", "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio/harness-codex", "bound", "0"],
       ["metrics-api", "http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio/harness-folder-codex", "bound", "0"],

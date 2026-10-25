@@ -183,8 +183,13 @@ const Alasio = Schema.Struct({
    * (src/codex/worker-claims.ts).
    */
   scaling: Scaling({ min: 0, max: 3 }, { floor: false, scaled: true, most: TELEGRAM_PARTITIONS }),
-  /** How often KEDA looks at what alasio scales on, in seconds. */
-  pollingSeconds: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be at least 1" })), 5),
+  /**
+   * How often KEDA looks at what alasio scales on, and its relay of the Codex login, in seconds:
+   * each second, as alasio asleep wakes only once KEDA has looked and seen what waits, a press
+   * waiting on its answer within Telegram's 15 s above all. Each look asks the log for its
+   * groups' lags, a few requests of each environment's.
+   */
+  pollingSeconds: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be at least 1" })), 1),
   /** How long none of what alasio scales on must have been seen before KEDA scales it back to `min`, in seconds. */
   cooldownSeconds: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0, { message: "must be 0 or more" })), 300),
   /**
