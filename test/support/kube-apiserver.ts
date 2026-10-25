@@ -13,6 +13,7 @@
  */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
+import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:https";
 import { type AddressInfo, createServer } from "node:net";
@@ -86,10 +87,36 @@ function run(binary: string, args: readonly string[]): { readonly child: ChildPr
   return { child, output: () => output };
 }
 
-/** Whether the API server at `port`, whose certificate is `ca`, answers `/readyz` with 200 to `token`. */
-const ready = (port: number, ca: Buffer, token: string): Promise<boolean> =>
+/** How long a probe of the API server's readiness waits for its answer. */
+const READY_TIMEOUT_MS = 2_000;
+
+/** How long a server stopped is given to end on SIGTERM, before SIGKILL ends it. */
+const STOP_TIMEOUT_MS = 10_000;
+
+/** Whether `child` has ended: with a code, or by a signal, which leaves its code null. */
+const ended = (child: ChildProcess): boolean => child.exitCode !== null || child.signalCode !== null;
+
+/** Ends `child`, by SIGTERM, then SIGKILL where it has not ended within STOP_TIMEOUT_MS; at once where it has ended already. */
+export async function end(child: ChildProcess): Promise<void> {
+  if (ended(child)) return;
+  const exited = once(child, "exit");
+  child.kill("SIGTERM");
+  const killing = setTimeout(() => child.kill("SIGKILL"), STOP_TIMEOUT_MS);
+  try {
+    await exited;
+  } finally {
+    clearTimeout(killing);
+  }
+}
+
+/**
+ * Whether the API server at `port`, whose certificate is `ca`, answers `/readyz` with 200 to
+ * `token` within READY_TIMEOUT_MS. Bounded, as what holds the port may be no API server: one
+ * that took it before kube-apiserver could bind it may take the connection and say nothing.
+ */
+export const ready = (port: number, ca: Buffer, token: string): Promise<boolean> =>
   new Promise((resolve) => {
-    const asked = request({ host: "127.0.0.1", port, path: "/readyz", ca, headers: { authorization: `Bearer ${token}` } }, (response) => {
+    const asked = request({ host: "127.0.0.1", port, path: "/readyz", ca, headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(READY_TIMEOUT_MS) }, (response) => {
       response.resume();
       resolve(response.statusCode === 200);
     });
@@ -152,19 +179,14 @@ async function startOnce(ports: () => Promise<number>): Promise<{ readonly api: 
     "--allow-privileged=true",
   ]);
   const stop = async () => {
-    for (const { child } of [apiServer, etcd]) {
-      if (child.exitCode !== null) continue;
-      const exited = new Promise((resolve) => child.once("exit", resolve));
-      child.kill("SIGTERM");
-      await exited;
-    }
+    for (const { child } of [apiServer, etcd]) await end(child);
     rmSync(directory, { recursive: true, force: true });
   };
   try {
     const certificate = join(certs, "apiserver.crt");
     for (const deadline = Date.now() + 60_000; ; await new Promise((resolve) => setTimeout(resolve, 250))) {
       for (const [name, { child, output }] of [["etcd", etcd], ["kube-apiserver", apiServer]] as const) {
-        if (child.exitCode !== null) throw new (PORT_TAKEN.test(output()) ? PortTaken : Error)(`${name} ended (${child.exitCode}): ${output()}`);
+        if (ended(child)) throw new (PORT_TAKEN.test(output()) ? PortTaken : Error)(`${name} ended (${child.exitCode ?? child.signalCode}): ${output()}`);
       }
       if (existsSync(certificate) && (await ready(apiPort, readFileSync(certificate), token))) break;
       if (Date.now() > deadline) throw new Error(`kube-apiserver was not ready within a minute: ${apiServer.output()}`);
