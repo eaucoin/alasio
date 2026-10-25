@@ -26,7 +26,7 @@ import { FILER, FILER_STORE, FILER_STORE_USERS, GATEWAY, MASTER, VOLUME_SERVER }
 import { JUICEFS_ADMIN, VALKEY, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/workspace-storage.ts";
 import { WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
-import { bindSession, boundPodOf, gatewayCall, inAlasio, inSession, kube, mainToken, nodeAgents, recordSession, ref, runCronJob, SESSIONS, tcp } from "./harness.ts";
+import { bindSession, boundPodOf, gatewayCall, inAlasio, inSession, kube, mainToken, nodeAgents, reachability, recordSession, ref, runCronJob, SESSIONS } from "./harness.ts";
 import type { Made } from "./session-volumes.ts";
 
 /**
@@ -377,7 +377,7 @@ export function workspaceStorage(): void {
       for (const netMode of ["none", "full"] as const) {
         const session = sessions[netMode];
         for (const [address, port] of addresses) {
-          assert.equal((await inSession(session, tcp(JSON.stringify(address), port))).trim(), "blocked", `${netMode}: ${address}:${port}`);
+          assert.equal(await reachability((code) => inSession(session, code), JSON.stringify(address), port), "blocked", `${netMode}: ${address}:${port}`);
         }
         // Its environment, every process's, and its mounts.
         const seen = await inWorkspaceOk(session, "env; for f in /proc/[0-9]*/environ; do tr '\\0' '\\n' < \"$f\"; done 2>/dev/null; cat /proc/mounts /proc/self/mountinfo");

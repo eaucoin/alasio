@@ -555,9 +555,37 @@ export async function bindSession(volumeId: string, timeoutMs = 300_000): Promis
 export const inSession = async (volumeId: string, code: string): Promise<string> =>
   kube.execOk(SESSIONS, (await bindSession(volumeId)).name, ["node", "-e", code], { container: "bayma" });
 
-/** Node code that prints whether a TCP connection to `host` (an expression) on `port` opens. */
-export const tcp = (host: string, port: number): string =>
+/**
+ * Node code that prints whether a TCP connection to `host` (an expression) on `port` opens:
+ * "open", or "blocked" where it times out or a socket error ends it, as a network policy's
+ * REJECT or DROP does; and nothing else.
+ */
+const tcp = (host: string, port: number): string =>
   `const s=require("net").connect({host:${host},port:${port},timeout:3000});s.on("connect",()=>{console.log("open");process.exit()});s.on("timeout",()=>{console.log("blocked");process.exit()});s.on("error",()=>{console.log("blocked");process.exit()})`;
+
+/** How many times reachability asks before it gives up on a probe that answers neither "open" nor "blocked". */
+const PROBE_TRIES = 3;
+
+/**
+ * Whether a TCP connection to `host` (an expression) on `port` opens where `run` runs Node code
+ * (tcp), as it answers: exactly "open" or "blocked". An exec that fails, or prints anything else,
+ * as nothing, tells nothing, so it is never taken for either: it is asked again, 2 s apart,
+ * PROBE_TRIES times at most, and then fails, saying each raw answer.
+ */
+export async function reachability(run: (code: string) => Promise<string>, host: string, port: number): Promise<"open" | "blocked"> {
+  const answers: string[] = [];
+  for (let tries = 0; tries < PROBE_TRIES; tries += 1) {
+    if (tries > 0) await new Promise((resolve) => setTimeout(resolve, 2_000));
+    const answer = await run(tcp(host, port)).then((said) => said.trim(), (error: unknown) => `the probe's exec failed: ${error instanceof Error ? error.message : String(error)}`);
+    if (answer === "open" || answer === "blocked") return answer;
+    answers.push(JSON.stringify(answer));
+  }
+  throw new Error(`the probe of ${host}:${port} answered neither "open" nor "blocked", ${PROBE_TRIES} times: ${answers.join(", ")}`);
+}
+
+/** Runs Node code in the container `container` of the pod `pod` of `namespace`, as reachability runs it. */
+export const inContainer = (namespace: string, pod: string, container: string) => (code: string): Promise<string> =>
+  kube.execOk(namespace, pod, ["node", "-e", code], { container });
 
 /** Runs `command` in alasio's container, in the pod it runs in now, which must succeed: what it printed. */
 export const inAlasioContainer = async (command: readonly string[], stdin?: string): Promise<string> =>

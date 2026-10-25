@@ -27,7 +27,7 @@ import { componentName, NAMESPACE, neonName, RELEASE } from "../../cli/src/manif
 import { pageserverName, REPLICA_NAME } from "../../cli/src/manifests/neon.ts";
 import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
-import { AGENTS, alasioOk, type Forward, kube, lakeQuery, paths, ref, runCronJob, tcp } from "../../test/e2e/harness.ts";
+import { AGENTS, alasioOk, type Forward, inContainer, kube, lakeQuery, paths, reachability, ref, runCronJob } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
 import { type Branch, type BranchView, COMPUTE_PORT, computeId, MAIN, type ReadyBranch, replicaId, tokenSha256 } from "../control/branches.ts";
 import { SERVING_LABEL, SUSPEND_AFTER } from "../control/endpoints.ts";
@@ -1180,7 +1180,7 @@ export function neonStack(): void {
       test("the object store's parts refuse the stack's other pods: the lake reaches a gateway's S3 port, and neither its gRPC and metrics ports, nor any master, volume server or filer", async () => {
         const lake = await kube.runningPod(NAMESPACE, componentName("lake-query"));
         const addressOf = async (pod: string) => (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.status?.podIP ?? assert.fail(`${pod} has no address`);
-        const reached = async (pod: string, port: number) => (await kube.execOk(NAMESPACE, lake, ["node", "-e", tcp(JSON.stringify(await addressOf(pod)), port)], { container: "query" })).trim();
+        const reached = async (pod: string, port: number) => reachability(inContainer(NAMESPACE, lake, "query"), JSON.stringify(await addressOf(pod)), port);
         const gateway = await kube.runningPod(NAMESPACE, componentName("seaweedfs"));
         assert.equal(await reached(gateway, 8333), "open");
         for (const port of [18333, 9327]) assert.equal(await reached(gateway, port), "blocked", `seaweedfs:${port}`);

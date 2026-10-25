@@ -30,7 +30,7 @@ import { NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Controlled } from "./gateway-control.ts";
 import type { ReplAsked, ReplChecked, ReplHeld, ReplWaited } from "./gateway-repl.ts";
-import { boundPodOf, gatewayCall, inAlasio, kube, mainToken, nodeAgents, onNode, ref, SESSIONS, tcp } from "./harness.ts";
+import { boundPodOf, gatewayCall, inAlasio, inContainer, kube, mainToken, nodeAgents, onNode, reachability, ref, SESSIONS } from "./harness.ts";
 import { until } from "./workspace-storage.ts";
 
 /** What a node agent answers `method path` with, `body` as JSON: its status, and what it said. */
@@ -203,7 +203,7 @@ export function sandboxService(): void {
 
     test("the receiver reaches nothing but the cluster's DNS, the collector and the API server", async () => {
       const receiver = await kube.runningPod(NAMESPACE, RECEIVER);
-      const reach = async (host: string, port: number) => (await kube.execOk(NAMESPACE, receiver, ["node", "-e", tcp(JSON.stringify(host), port)], { container: "receiver" })).trim();
+      const reach = (host: string, port: number) => reachability(inContainer(NAMESPACE, receiver, "receiver"), JSON.stringify(host), port);
       assert.equal(await reach(`${componentName("collector")}.${NAMESPACE}.svc`, 4318), "open");
       assert.equal(await reach("kubernetes.default.svc", 443), "open");
       for (const [host, port] of [[`${VALKEY}.${NAMESPACE}.svc`, 6379], [`${GATEWAY}.${NAMESPACE}.svc`, GATEWAY_PORT], [`${componentName("neon-proxy")}.${NAMESPACE}.svc`, PROXY_PORT], ["1.1.1.1", 443]] as const) {
@@ -217,8 +217,7 @@ export function sandboxService(): void {
       assert.ok(agents.length > 0, "no node agent runs");
       for (const { metadata, status } of agents) {
         assert.ok(status?.podIP, `${metadata?.name} has no address`);
-        const from = async (pod: string, container: string) =>
-          (await kube.execOk(NAMESPACE, pod, ["node", "-e", tcp(JSON.stringify(status.podIP), NODE_AGENT_PORT)], { container })).trim();
+        const from = (pod: string, container: string) => reachability(inContainer(NAMESPACE, pod, container), JSON.stringify(status.podIP), NODE_AGENT_PORT);
         assert.equal(await from(gateway, "sandbox-gateway"), "open", `the gateway does not reach ${metadata?.name}`);
         assert.equal(await from(alasio, "alasio"), "blocked", `alasio reaches ${metadata?.name}`);
       }

@@ -94,7 +94,8 @@ import {
   runCronJob,
   SESSIONS,
   setUp,
-  tcp,
+  inContainer,
+  reachability,
   TARGET,
   tearDown,
 } from "./harness.ts";
@@ -107,6 +108,8 @@ import type { CallsListing, ControlCallback, ControlMessage, RecordedCall } from
 import { workspaceStorage } from "./workspace-storage.ts";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+/** Runs Node code in alasio's container, as reachability runs it. */
+const inAlasioNode = (code: string) => inAlasioContainer(["node", "-e", code]);
 
 /** A bayma for folders other than this release's, as a later release may pin, whose instance refuses a snapshot this release's took. */
 const OTHER_BAYMA = { repository: "ghcr.io/eaucoin/bayma", tag: "0.14.2", digest: "sha256:5a9a731371d083cae815c6f27c5eb0147e1e77fac400544285f8416047ba4109" } as const;
@@ -889,7 +892,7 @@ const probe = (target: string) => `fetch(${JSON.stringify(target)},{signal:Abort
 /** That the session, which has no internet, reaches neither the internet, nor the cluster's API server, nor a resolver. */
 async function assertNoInternet(volumeId: string): Promise<void> {
   assert.equal((await inSession(volumeId, probe("http://1.1.1.1"))).trim(), "blocked");
-  assert.equal((await inSession(volumeId, tcp("process.env.KUBERNETES_SERVICE_HOST", 443))).trim(), "blocked");
+  assert.equal(await reachability((code) => inSession(volumeId, code), "process.env.KUBERNETES_SERVICE_HOST", 443), "blocked");
   assert.match(await inSession(volumeId, 'require("dns").promises.lookup("example.com").then(()=>console.log("resolved"),()=>console.log("no dns"))'), /no dns/u);
 }
 
@@ -980,7 +983,7 @@ if (inShard("sessions")) {
       full = await newSession("full");
       assert.equal((await sessionPod(full)).metadata?.labels?.["alasio.dev/pool"], "sandboxes-full");
       assert.equal((await inSession(full, probe("https://example.com"))).trim(), "open");
-      assert.equal((await inSession(full, tcp("process.env.KUBERNETES_SERVICE_HOST", 443))).trim(), "blocked");
+      assert.equal(await reachability((code) => inSession(full, code), "process.env.KUBERNETES_SERVICE_HOST", 443), "blocked");
       const other = (await sessionPod(none)).status?.podIP;
       assert.ok(other, `the session ${none} has no address`);
       assert.equal((await inSession(full, probe(`http://${other}:7290/mcp`))).trim(), "blocked");
@@ -997,7 +1000,7 @@ if (inShard("sessions")) {
       // Not alasio, which reaches the gateway alone, nor anything else.
       const address = (await sessionPod(none)).status?.podIP;
       assert.ok(address, `the session ${none} has no address`);
-      assert.equal((await inAlasioContainer(["node", "-e", tcp(JSON.stringify(address), 7290)])).trim(), "blocked");
+      assert.equal(await reachability(inAlasioNode, JSON.stringify(address), 7290), "blocked");
       const stub = await kube.runningPod(STAND_INS, TELEGRAM.name);
       for (const url of [gateway, `http://${address}:7290/mcp`]) assert.equal((await kube.execOk(STAND_INS, stub, ["node", "-e", probe(url)], { container: TELEGRAM.container })).trim(), "blocked", url);
     });
@@ -2262,12 +2265,12 @@ if (inShard("workspaces")) {
         }
         // The gateway's pod, which reaches the agent's own API: not its proxy; and alasio's, neither.
         const fromGateway = async (port: number) =>
-          (await kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, componentName("sandbox-gateway")), ["node", "-e", tcp(JSON.stringify(address), port)], { container: "sandbox-gateway" })).trim();
+          reachability(inContainer(NAMESPACE, await kube.runningPod(NAMESPACE, componentName("sandbox-gateway")), "sandbox-gateway"), JSON.stringify(address), port);
         assert.equal(await fromGateway(STORE_PROXY_PORT), "blocked", `the gateway's pod reached ${node}'s agent's proxy`);
         assert.equal(await fromGateway(NODE_AGENT_PORT), "open", `the gateway's pod did not reach ${node}'s agent`);
-        assert.equal((await inAlasioContainer(["node", "-e", tcp(JSON.stringify(address), STORE_PROXY_PORT)])).trim(), "blocked", `alasio's pod reached ${node}'s agent's proxy`);
+        assert.equal(await reachability(inAlasioNode, JSON.stringify(address), STORE_PROXY_PORT), "blocked", `alasio's pod reached ${node}'s agent's proxy`);
         // Nor a session's, which a restore from the bucket runs in.
-        assert.equal((await inSession(session, tcp(JSON.stringify(address), STORE_PROXY_PORT))).trim(), "blocked", `the session ${session} reached ${node}'s agent's proxy`);
+        assert.equal(await reachability((code) => inSession(session, code), JSON.stringify(address), STORE_PROXY_PORT), "blocked", `the session ${session} reached ${node}'s agent's proxy`);
       }
     });
   });
@@ -3965,10 +3968,10 @@ if (inShard("agents")) {
     test("a pool's free pod has no binding and serves nothing; no one but the gateway reaches a bound one", async () => {
       const free = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "alasio.dev/free=true,alasio.dev/pool=harness-codex" }))[0];
       assert.ok(free?.status?.podIP, "the pool has no free pod");
-      assert.match(await inAlasioContainer(["node", "-e", tcp(JSON.stringify(free.status.podIP), 8080)]), /blocked/u);
+      assert.equal(await reachability(inAlasioNode, JSON.stringify(free.status.podIP), 8080), "blocked");
       const bound = await boundNow();
       assert.ok(bound.status?.podIP);
-      assert.match(await inAlasioContainer(["node", "-e", tcp(JSON.stringify(bound.status.podIP), 8080)]), /blocked/u);
+      assert.equal(await reachability(inAlasioNode, JSON.stringify(bound.status.podIP), 8080), "blocked");
     });
 
     test("what a pooled harness leaves going on reaches its bayma past any caller's token's time, with alasio stopped, its bearer held to its pod's binding", { timeout: 20 * 60_000 }, async () => {
@@ -4040,7 +4043,8 @@ if (inShard("agents")) {
       await tg.say("tools");
       await tg.waitFor((call) => replied(call, `${ANSWER}\n\ntools: ${SESSION_FS_ENVIRONMENTS_TOML.trim()}`));
       const name = bound.metadata?.name ?? "";
-      const reaches = (host: string, port: number) => kube.execOk(NAMESPACE, name, ["node", "-e", tcp(JSON.stringify(host), port)], { container: "harness" }).then((said) => said.trim());
+      // Each probe answers exactly "open" or "blocked", an exec that fails or says nothing asked again, never taken for either.
+      const reaches = (host: string, port: number) => reachability(inContainer(NAMESPACE, name, "harness"), JSON.stringify(host), port);
       const telegramAt = new URL(urlOf(TELEGRAM));
       const target = await sessionPod(session);
       const sessionPodIp = target.status?.podIP ?? "";
@@ -4059,7 +4063,7 @@ if (inShard("agents")) {
           `ipset list 2>&1 | grep -nE 'Name:|^${harnessIp}( |$)|^${sessionPodIp}( |$)' | head -200`,
         ].join("; echo ----; ")).catch(String);
         const answered = await kube.execOk(NAMESPACE, name, ["node", "-e", `fetch("http://${sessionPodIp}:7290/status",{signal:AbortSignal.timeout(3000)}).then(r=>console.log(r.status),e=>console.log(String(e)))`], { container: "harness" }).catch(String);
-        assert.fail(`${name} reached ${toTelegram === "blocked" ? "" : "Telegram, "}${toSession === "blocked" ? "" : `the session's pod's port 7290, whose bayma answered its /status ${answered.trim()}, `}which its network policies refuse it:\n${said(now)}\n${said(pod)}\nthe rules of ${node}:\n${rules}`);
+        assert.fail(`${name} reached ${toTelegram === "blocked" ? "" : `Telegram (its probe answered "${toTelegram}"), `}${toSession === "blocked" ? "" : `the session's pod's port 7290 (its probe answered "${toSession}"), whose bayma answered its /status ${answered.trim()}, `}which its network policies refuse it:\n${said(now)}\n${said(pod)}\nthe rules of ${node}:\n${rules}`);
       }
     });
 
