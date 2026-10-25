@@ -1356,7 +1356,10 @@ if (inShard("sessions")) {
         return now.every((count, at) => count > (restartsBefore[at] ?? 0)) ? true : undefined;
       }, 300_000);
       // None left on the layers of the manager killed, idle or not.
-      await until("no container left on the layers of the manager killed", async () => ((await staleOnNode("")).length === 0 ? true : undefined), 120_000);
+      // Those left said by their pods, as the check fails.
+      let left: string[] = [];
+      await until("no container left on the layers of the manager killed", async () => ((left = await staleOnNode("")).length === 0 ? true : undefined), 120_000)
+        .catch((error: unknown) => assert.fail(`${error instanceof Error ? error.message : String(error)}: ${left.join(", ")}`));
       // Each free pod of the pool started again in place, which no bind can be served by, replaced, as its gateway sets its pool right.
       await until("every free pod of the pool never started again", async () => {
         const now = await freeOfPool();
@@ -3191,9 +3194,28 @@ async function asAccountIn(run: (command: readonly string[], stdin?: string) => 
 /**
  * The containers of the node `node` whose rootfs lies on layers no FUSE manager serves: of each
  * overlay that is a container's rootfs over stargz-snapshotter's snapshots, a name never asked of
- * before looked up in it, which its overlay answers its connection is gone of.
+ * before looked up in it, which its overlay answers its connection is gone of. Each by its pod and
+ * container, as CRI's labels of it say (namespace/pod/container, or namespace/pod/sandbox of a
+ * pod's sandbox), or by its id where CRI says nothing of it.
  */
 async function staleOnNode(node: string): Promise<string[]> {
+  const stale = await staleContainersOnNode(node);
+  return Promise.all(stale.map(async (id) => {
+    const said = await onNode(node, `k3s crictl inspect -o json ${id} 2>/dev/null || k3s crictl inspectp -o json ${id} 2>/dev/null || true`).catch(() => "");
+    const labels = (() => {
+      try {
+        return (JSON.parse(said) as { status?: { labels?: Record<string, string> } }).status?.labels ?? {};
+      } catch {
+        return {};
+      }
+    })();
+    const pod = labels["io.kubernetes.pod.name"];
+    return pod ? `${labels["io.kubernetes.pod.namespace"] ?? ""}/${pod}/${labels["io.kubernetes.container.name"] ?? "sandbox"}` : id;
+  }));
+}
+
+/** The ids of the containers of the node `node` whose rootfs lies on layers no FUSE manager serves (staleOnNode). */
+async function staleContainersOnNode(node: string): Promise<string[]> {
   const found = (await onNode(node, "cat /proc/self/mountinfo")).split("\n").flatMap((line) => {
     const [before = "", after = ""] = line.split(" - ");
     const [type = "", , options = ""] = after.split(" ");
