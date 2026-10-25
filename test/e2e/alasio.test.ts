@@ -387,7 +387,36 @@ if (inShard("upgrade")) {
     };
     /** The pods' sandbox image, by the name containerd records it by. */
     let sandboxImage: string;
+    /** A session of main's released into its snapshot on the release before, its record of it that release's, and its REPL there. */
+    const RELEASED_SESSION = "fs-e2eupgradereleased";
+    let releasedRepl: string;
     const scenarios: readonly Scenario[] = [
+      {
+        seeds: "a session released into its snapshot, its REPL holding a value, its record of its release written as the release before writes one",
+        seed: async () => {
+          const token = await mainToken(RELEASED_SESSION);
+          await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
+          await bindSession(RELEASED_SESSION);
+          releasedRepl = (await repl.set(RELEASED_SESSION, `held on ${PREVIOUS}`)).sessionId;
+          await untilReleased(RELEASED_SESSION, Date.now());
+          assert.ok(await snapshotOf(RELEASED_SESSION), `${RELEASED_SESSION} was released into no snapshot on ${PREVIOUS}`);
+        },
+        keeps: "the session released before, its record read as this release reads one as it is bound, back from bayma's checkpoints, as its snapshot was taken on a pools' template the upgrade changed",
+        check: async () => {
+          const bound = await bindSession(RELEASED_SESSION);
+          const said = (await gatewayLogs()).filter((line) => line.includes(`${SESSIONS}/${RELEASED_SESSION}`));
+          // Its record read, never refused as one it cannot read; its snapshot one it names, taken on the template before,
+          // which an upgrade changes, its image's tag at least: had its record not been read, the snapshot would have been
+          // one it was not released into instead.
+          assert.ok(!said.some((line) => /could not read/u.test(line)), said.join("\n"));
+          assert.ok(said.some((line) => line.includes("is bound from bayma's checkpoints, not from its snapshot: the pool's template it was taken on is no longer kept")), said.join("\n"));
+          assert.doesNotMatch(bound.name, /-restore-/u);
+          // What bayma checkpointed of its REPL, whole; what the REPL held live alone, gone with its sandbox.
+          const seen = await repl.read(RELEASED_SESSION, releasedRepl);
+          assert.deepEqual([seen.live, seen.checkpointed], [null, `held on ${PREVIOUS}`]);
+          assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+        },
+      },
       {
         seeds: "main's bot allowing the users its owner gave it",
         seed: async () => {
