@@ -15,6 +15,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { Deferred, Duration, Effect, Exit, Fiber } from "effect";
 import pg from "pg";
 
+import type { PromptJob } from "../src/persistence/prompt-job-repository.ts";
 import { StoreError } from "../src/persistence/sql.ts";
 import type { Harness } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
@@ -87,15 +88,20 @@ test("an album whose handling stops before it is through is left waiting, its cl
   assert.equal(await run(claim(store)), true);
 });
 
-/** The prompts alasio's turns were given, as a stand-in for them records each, holding each until `release` resolves, where it is given. */
+/**
+ * The prompts alasio's turns were given, as a stand-in for them records each as it is queued,
+ * its job then carried on once `release` resolves, where it is given, as a turn that takes a
+ * while runs.
+ */
 function promptsTaken(release?: Promise<void>) {
   const prompts: string[] = [];
   const turns = turnsStub({
-    submit: ({ prompt }) => Effect.promise(async () => {
-      prompts.push(prompt);
-      await release;
-      return { kind: "queued" as const, jobId: `job-${prompts.length}` } as never;
-    }),
+    admit: ({ conversationId, prompt }) =>
+      Effect.sync(() => {
+        prompts.push(prompt);
+        return { id: `job-${prompts.length}`, conversation_id: conversationId, state: "pending" } as PromptJob;
+      }),
+    admitted: () => Effect.promise(async () => void await release),
   });
   return { prompts, turns };
 }

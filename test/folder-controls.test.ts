@@ -57,7 +57,7 @@ test("a notice's Retry now and Restart folder instance act on its harness's inst
       await alasio.runPromise(press("folder_restart", { harness: "codex" }));
       assert.equal(telegram.calls.sendMessage.at(-1)?.[1], "restart of codex");
       // The panel's, of a folder mounted: each harness's instance.
-      await alasio.runPromise(handleWorkspaceTextCommand({ conversationId: CONVERSATION, chatId: 1, args: "repo" }));
+      await alasio.runPromise(handleWorkspaceTextCommand({ conversationId: CONVERSATION, chatId: 1, messageId: 1, args: "repo" }));
       const panel = telegram.calls.sendMessage.at(-1)?.[2] as { reply_markup: { inline_keyboard: { text: string }[][] } } | undefined;
       assert.ok(panel?.reply_markup.inline_keyboard.flat().some(({ text }) => text === "Restart folder instance"));
       await alasio.runPromise(press("folder_restart"));

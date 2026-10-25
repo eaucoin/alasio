@@ -11,14 +11,14 @@
  * the bot is.
  */
 import type { Update } from "@grammyjs/types";
-import { randomUUID } from "node:crypto";
 
-import { Duration, Effect, Fiber, FiberSet, Layer, Option, Schedule, type Scope } from "effect";
+import { Effect, Fiber, FiberSet, Layer, Option, Schedule, type Scope } from "effect";
 
 import { Turns } from "../codex/turns.ts";
 import { WORKER_SWEEP_EVERY } from "../codex/worker-claims.ts";
 import type { AlasioConfig } from "../config.ts";
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
+import { admitPrompt, runCommand } from "../operator/prompts.ts";
 import { Mounts } from "../operator/mounts.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store, type UpdateMarks } from "../persistence/store.ts";
@@ -31,9 +31,9 @@ import { TelegramClient, type TelegramError } from "./client.ts";
 import { watchDeliveries } from "./delivery-watch.ts";
 import { drain, stopToldAt } from "./drain.ts";
 import { MediaGroups } from "./media-group-buffer.ts";
-import { handleMessage, processIncomingPrompt } from "./message-handler.ts";
+import { handleMessage } from "./message-handler.ts";
 import type { Outbox } from "./outbox.ts";
-import { chatOfPress, holdWhileRunning, PRESS_AWAITED, PRESS_HOLD, type PressAnswers, PRESSES_DUE_EVERY, pressAnswers, recoverPresses } from "./presses.ts";
+import { type Awaited, awaitOrKeep, chatOfPress, CONTROL_AWAITED, CONTROLS_DUE_EVERY, holdWhileRunning, type KeptRunning, pressAnswers, recoverControls, rolledBack } from "./controls.ts";
 import { consumeUpdates, type TelegramUpdates } from "./update-consumer.ts";
 import { WakeLatency } from "./wake-latency.ts";
 
@@ -84,7 +84,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   const wake = Option.getOrNull(yield* Effect.serviceOption(WakeLatency));
   // What an update is processed with, given to it as the poller hands it over.
   const services = yield* Effect.context<TelegramAppServices>();
-  // What an update leads to that outlasts it (a prompt, a button's control), stopped as the app stops.
+  // What an update leads to that outlasts it (a prompt's job carried on, a control), stopped as the app stops.
   const handling = yield* FiberSet.make();
 
   /**
@@ -93,20 +93,29 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
    * one that waits for it too long fails as the store does, and is taken again.
    * Each update starts a trace of its own, which everything it leads to joins: the
    * turn its prompt queues, however much later it runs, and the reply's delivery.
-   * What it leads to runs on after it, so that consuming goes on meanwhile: a prompt's
-   * turn, and what a press does past PRESS_AWAITED. One the store
-   * has as processed already, handed over again after a restart, is skipped; one kept but
-   * not processed is handled again. It fails where the store failed, keeping it, handling
-   * it or marking it processed, so that it is taken again; Telegram failing its handling
-   * is a defect, and the update is skipped (./update-consumer.ts).
+   * It is told handled, its marks committed with the lock's transaction, only once what it
+   * asks for is kept with them: its prompt's job queued, the setup step it lacks sent, or
+   * its control, a press or a command, done or kept to run on (./controls.ts). What it
+   * leads to runs on after it, so that consuming goes on meanwhile: a prompt's turn, and
+   * what a control does past CONTROL_AWAITED; so a stop that cuts it short loses nothing of
+   * it, which is either taken again or kept. One the store has as processed already, handed
+   * over again after a restart, is skipped; one kept but not processed is handled again. It
+   * fails where the store failed, keeping it, handling it or marking it processed, so that
+   * it is taken again; Telegram failing its handling is a defect, and the update is skipped
+   * (./update-consumer.ts).
    */
   const processUpdate = (update: Update): Effect.Effect<void, StoreError> =>
     Effect.suspend(() => {
       const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
       // Its marks made in the lock's transaction, where it has a chat's: a lock lost rolls them back.
       const underLock = <A, E, R>(handle: (marks: UpdateMarks) => Effect.Effect<A, E, R>) => chatId === undefined ? handle(store) : store.withHandlingLock(chatId, handle);
-      // A press kept as its update is marked processed, held, once that is committed, while it runs on.
-      let kept: { readonly id: string; readonly holder: string; readonly pressing: Fiber.Fiber<void>; readonly answers: PressAnswers } | null = null;
+      // What it leads to once its transaction is through: a control kept, held while it runs, a
+      // kept press's query answered, a prompt's job carried on.
+      let after: Effect.Effect<void> = Effect.void;
+      // Its command's work, cut short where its transaction fails after all, keeping nothing of it (rolledBack).
+      const awaited: Awaited[] = [];
+      const holding = (kept: KeptRunning, unsent?: () => readonly string[]) =>
+        FiberSet.run(handling, holdWhileRunning(kept.id, kept.holder, kept.running, unsent).pipe(Effect.provideService(Store, store)));
       return underLock((marks) => Effect.gen(function*() {
         if (!(yield* marks.recordTelegramUpdate(update))) {
           return yield* Effect.logInfo(`Skipping update ${update.update_id}, processed already`);
@@ -116,44 +125,48 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
         if (callbackQuery) {
           // Taken from the store before the update is marked processed, as a message is: the
           // store failing that fails the update, taken again. What the press then does is
-          // awaited for PRESS_AWAITED, so a control that is quick, as most are, is done before
+          // awaited for CONTROL_AWAITED, so a control that is quick, as most are, is done before
           // its update is told handled; one that takes longer, a steer or a workspace's, is
-          // kept, as the update is marked processed, and runs on after it (./presses.ts), as a
+          // kept, as the update is marked processed, and runs on after it (./controls.ts), as a
           // prompt's turn does, so it holds back no later update for longer; its failing is said.
           const { handling: press, action } = yield* takePress(callbackQuery).pipe(Effect.provideContext(services));
           const answers = pressAnswers(callbackQuery);
-          const pressing = yield* FiberSet.run(handling, answers.through(press).pipe(
+          const work = answers.through(press).pipe(
             Effect.catch((error) => Effect.logError(`Failed to process callback ${callbackQuery.id}: ${error.message}`)),
             Effect.provideContext(services),
-            Effect.interruptible,
-          ));
-          const done = yield* Fiber.await(pressing).pipe(Effect.timeoutOption(PRESS_AWAITED));
-          if (Option.isNone(done) && action !== null && chatOfPress(callbackQuery) !== undefined) {
-            const holder = randomUUID();
-            yield* marks.keepPress({ callbackQuery, action, holder, holdMs: Duration.toMillis(PRESS_HOLD) });
-            yield* answers.keep;
-            kept = { id: callbackQuery.id, holder, pressing, answers };
+          );
+          if (action === null || chatOfPress(callbackQuery) === undefined) {
+            // Nothing to run again from, or no chat to answer in: awaited as long, kept never.
+            const running = yield* FiberSet.run(handling, Effect.interruptible(work));
+            yield* Fiber.await(running).pipe(Effect.timeoutOption(CONTROL_AWAITED));
+          } else {
+            // Not among the awaited the transaction's failing cuts short, as a command is: its action consumed already (rolledBack).
+            const { kept } = yield* awaitOrKeep(handling, { kind: "press", callbackQuery, action }, work, marks, answers.keep);
+            if (Option.isSome(kept)) after = Effect.asVoid(Effect.all([holding(kept.value, answers.unsent), FiberSet.run(handling, answers.acknowledge.pipe(Effect.provideContext(services)))]));
           }
         } else if (update.message) {
           const prompt = yield* handleMessage(update.message, update.update_id, marks).pipe(
             Effect.provideContext(services),
             Effect.catchTag(["TelegramApiError", "TelegramTransportError"], Effect.die),
           );
-          if (prompt) {
-            yield* FiberSet.run(handling, processIncomingPrompt(prompt).pipe(Effect.provideContext(services), Effect.interruptible));
+          const admitted = prompt === null ? null : yield* admitPrompt(prompt, marks).pipe(
+            Effect.provideContext(services),
+            Effect.catchTag(["TelegramApiError", "TelegramTransportError"], Effect.die),
+          );
+          if (admitted?._tag === "Command") {
+            const { kept } = awaited[awaited.push(yield* awaitOrKeep(handling, admitted.command, runCommand(admitted.command).pipe(Effect.provideContext(services)), marks)) - 1]!;
+            if (Option.isSome(kept)) after = Effect.asVoid(holding(kept.value));
+          } else if (admitted?._tag === "Queued") {
+            const { job } = admitted;
+            after = Effect.asVoid(FiberSet.run(handling, turns.admitted(job).pipe(
+              Effect.catch((error) => Effect.logError(`Could not carry on ${job.conversation_id}'s prompt ${job.id}, which waits for what takes up waiting prompts: ${error.message}`)),
+            )));
           }
         }
         yield* marks.markTelegramUpdateProcessed(update.update_id);
       })).pipe(
-        // Once the update is through: the press held while it runs, and its query answered.
-        Effect.andThen(Effect.suspend(() => {
-          if (kept === null) return Effect.void;
-          const { id, holder, pressing, answers } = kept;
-          return Effect.asVoid(Effect.all([
-            FiberSet.run(handling, holdWhileRunning(id, holder, pressing, answers.unsent).pipe(Effect.provideService(Store, store))),
-            FiberSet.run(handling, answers.acknowledge.pipe(Effect.provideContext(services))),
-          ]));
-        })),
+        Effect.onError(() => rolledBack(awaited)),
+        Effect.andThen(Effect.suspend(() => after)),
         Effect.tapError((error) => Effect.logError(`Failed to keep update ${update.update_id}: ${error}`)),
         withAlasioSpan("alasio.update", {
           kind: SpanKind.CONSUMER,
@@ -177,12 +190,12 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   // as soon as it can, a press's query before Telegram gives up on it:
   // - the claims of the processes of this pod before this one let go of, as a container restarted in it leaves them, so
   //   a conversation of theirs is taken at once;
-  // - the presses kept as an alasio before stopped run again, forked, as before: a head start on their chats' later
+  // - the controls kept as an alasio before stopped run again, forked, as before: a head start on their chats' later
   //   updates, not a guarantee they end first;
   // - responses completed but never delivered, and albums due, queued, so each goes out before the reply to an update of
   //   its chat taken after: one statement each, which finds none as a rule.
   yield* turns.lapseOwnClaims;
-  yield* recoverPresses(handling).pipe(Effect.provideContext(services));
+  yield* recoverControls(handling).pipe(Effect.provideContext(services));
   yield* turns.flushCompletedResponses;
   yield* mediaGroups.flushDue;
   // As alasio stops: its member of the Telegram group, forked after, gone first, then what it
@@ -217,8 +230,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   );
   // Albums due, which no alasio's wait is for (it stopped, or their chat's updates went to another).
   yield* mediaGroups.flushDue.pipe(Effect.schedule(Schedule.spaced(MEDIA_GROUPS_DUE_EVERY)), Effect.forkScoped);
-  // Presses kept whose alasio let go of them, or crashed, run again.
-  yield* recoverPresses(handling).pipe(Effect.provideContext(services), Effect.schedule(Schedule.spaced(PRESSES_DUE_EVERY)), Effect.forkScoped);
+  // Controls kept whose alasio let go of them, or crashed, run again.
+  yield* recoverControls(handling).pipe(Effect.provideContext(services), Effect.schedule(Schedule.spaced(CONTROLS_DUE_EVERY)), Effect.forkScoped);
   // Pruned once a day, by whichever alasio looks when it is due: as one starts, and every hour one runs.
   yield* store.pruneTransientIfDue(TRANSIENT_RETENTION, PRUNE_EVERY).pipe(
     Effect.catch((error) => Effect.logWarning(`Pruning the store failed: ${error.message}`).pipe(Effect.as(false))),

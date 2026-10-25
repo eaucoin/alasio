@@ -32,7 +32,7 @@ import {
 import { NeonEventRepository } from "./event-repository.ts";
 import { type ForkAnswer, type ForkRequestAnswered, NeonForkRepository } from "./fork-repository.ts";
 import { type DueOutboxEntry, NeonOutboxRepository, type NewOutboxStatus, type NewOutboxText } from "./outbox-repository.ts";
-import { type KeptPress, NeonPressRepository, type NewKeptPress } from "./press-repository.ts";
+import { type KeptControl, NeonControlRepository, type NewKeptControl } from "./control-repository.ts";
 import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState } from "./prompt-job-repository.ts";
 import { type CompletedResponse, NeonResponseRepository, type ResponseBlock } from "./response-repository.ts";
 import { NeonHarnessGrantRepository } from "./harness-grant-repository.ts";
@@ -169,7 +169,7 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
   usage: new NeonUsageRepository(sql, schema),
   codexLogin: new NeonCodexLoginRepository(sql, schema),
   sessionWorkspaces: new NeonSessionWorkspaceRepository(sql, schema),
-  presses: new NeonPressRepository(sql, schema),
+  controls: new NeonControlRepository(sql, schema),
   events: new NeonEventRepository(sql, schema),
   forks: new NeonForkRepository(sql, schema),
   harnessGrants: new NeonHarnessGrantRepository(sql, schema),
@@ -222,8 +222,14 @@ export interface UpdateMarks {
   readonly markTelegramUpdateProcessed: (updateId: number) => Stored<void>;
   /** Queues a reply to the chat, committed with what else the update marks, so an update handled again tells the chat once. */
   readonly enqueueOutboxText: (text: NewOutboxText) => Stored<string>;
-  /** Keeps a press whose control runs on past its update, held as it says, unless it is kept already (src/telegram/presses.ts). */
-  readonly keepPress: (press: NewKeptPress) => Stored<void>;
+  /** Keeps a control whose work runs on past its update, held as it says, unless it is kept already (src/telegram/controls.ts). */
+  readonly keepControl: (control: NewKeptControl) => Stored<void>;
+  /**
+   * Queues a prompt the update brings, committed with what else the update marks, so the
+   * update is told handled only once its prompt is kept: the job queued, or the one already
+   * queued for its message.
+   */
+  readonly enqueuePromptJob: (job: NewPromptJob) => Stored<PromptJob>;
 }
 
 /** What a chat's handling lock's holder marks, in the lock's transaction: an update's handling, and an album's. */
@@ -370,18 +376,22 @@ export class Store extends Context.Service<Store, {
   /** Whether buttons that settle the held prompt job `jobId` are kept, as asking about it keeps them until it is settled. */
   readonly hasCallbackActionsOfJob: (jobId: string) => Stored<boolean>;
 
-  /** Keeps a press whose control runs on past its update, held as it says, unless it is kept already (src/telegram/presses.ts). */
-  readonly keepPress: (press: NewKeptPress) => Stored<void>;
-  /** Holds the kept press `id` for `holdMs` more, where `holder` holds it still: whether it does. */
-  readonly renewPress: (id: string, holder: string, holdMs: number) => Stored<boolean>;
-  /** Lets go of the kept press `id`, where `holder` holds it, for another to run again at once. */
-  readonly releasePress: (id: string, holder: string) => Stored<void>;
-  /** Keeps `answer` with the kept press `id`, its control done, where `holder` holds it, and lets go of it, for the next look to queue its answer alone. */
-  readonly pendPressAnswer: (id: string, holder: string, answer: string) => Stored<void>;
-  /** Forgets the kept press `id`, its control done, where `holder` holds it. */
-  readonly forgetPress: (id: string, holder: string) => Stored<void>;
-  /** Takes the kept presses whose holds lapsed, or were let go of, held by `holder` for `holdMs`; none another takes at once. */
-  readonly takeLapsedPresses: (holder: string, holdMs: number) => Stored<KeptPress[]>;
+  /** Keeps a control whose work runs on past its update, held as it says, unless it is kept already (src/telegram/controls.ts). */
+  readonly keepControl: (control: NewKeptControl) => Stored<void>;
+  /** Holds the kept control `id` for `holdMs` more, where `holder` holds it still: whether it does. */
+  readonly renewControl: (id: string, holder: string, holdMs: number) => Stored<boolean>;
+  /** Lets go of the kept control `id`, where `holder` holds it, for another to run again at once. */
+  readonly releaseControl: (id: string, holder: string) => Stored<void>;
+  /** Keeps `answer` with the kept control `id`, done, where `holder` holds it, and lets go of it, for the next look to queue its answer alone. */
+  readonly pendControlAnswer: (id: string, holder: string, answer: string) => Stored<void>;
+  /** Forgets the kept control `id`, done, where `holder` holds it. */
+  readonly forgetControl: (id: string, holder: string) => Stored<void>;
+  /** Takes the kept controls whose holds lapsed, or were let go of, held by `holder` for `holdMs`; none another takes at once. */
+  readonly takeLapsedControls: (holder: string, holdMs: number) => Stored<KeptControl[]>;
+  /** What a control made, kept under `key` (keepControlResult): null where nothing is. */
+  readonly controlResult: (key: string) => Stored<unknown>;
+  /** Keeps what a control made, `result`, under `key`, unless a result is kept there already: the one kept there now. */
+  readonly keepControlResult: (key: string, result: unknown) => Stored<unknown>;
 
   /** Keeps an update, unless it is kept already: whether it is yet to be processed. */
   readonly recordTelegramUpdate: (update: Update) => Stored<boolean>;
@@ -656,11 +666,11 @@ const makeStore = Effect.fnUntraced(function*({
    */
   const fenced = <A, E>(write: (on: ReturnType<typeof repositoriesOn>) => Effect.Effect<A, E>): Effect.Effect<A, E | StoreError> =>
     CurrentWorkerFence.use((fence): Effect.Effect<A, E | StoreError> => (fence === null ? write(repositoriesOn(database)) : transacting(write)));
-  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, usage, codexLogin, sessionWorkspaces, presses, events, forks, workers } = repositoriesOn(database);
+  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, usage, codexLogin, sessionWorkspaces, controls, events, forks, workers } = repositoriesOn(database);
 
   const pruneTransient = (age: Duration.Input): Stored<void> => {
     const ageMs = Duration.toMillis(age);
-    return Effect.all([telegramContent.pruneHandled(ageMs), outbox.pruneSent(ageMs), events.pruneHandled(EVENTS_HANDLED_KEPT_MS), forks.prune(ageMs)], { discard: true });
+    return Effect.all([telegramContent.pruneHandled(ageMs), outbox.pruneSent(ageMs), events.pruneHandled(EVENTS_HANDLED_KEPT_MS), forks.prune(ageMs), controls.pruneResults(ageMs)], { discard: true });
   };
 
   return Store.of({
@@ -691,12 +701,14 @@ const makeStore = Effect.fnUntraced(function*({
     consumeCallbackAction: (id) => callbacks.consumeCallbackAction(id),
     hasCallbackActionsOfJob: (jobId) => callbacks.hasActionsOfJob(jobId),
 
-    keepPress: (press) => presses.keep(press),
-    renewPress: (id, holder, holdMs) => presses.renew(id, holder, holdMs),
-    releasePress: (id, holder) => presses.release(id, holder),
-    pendPressAnswer: (id, holder, answer) => presses.pendAnswer(id, holder, answer),
-    forgetPress: (id, holder) => presses.forget(id, holder),
-    takeLapsedPresses: (holder, holdMs) => presses.takeLapsed(holder, holdMs),
+    keepControl: (control) => controls.keep(control),
+    renewControl: (id, holder, holdMs) => controls.renew(id, holder, holdMs),
+    releaseControl: (id, holder) => controls.release(id, holder),
+    pendControlAnswer: (id, holder, answer) => controls.pendAnswer(id, holder, answer),
+    forgetControl: (id, holder) => controls.forget(id, holder),
+    takeLapsedControls: (holder, holdMs) => controls.takeLapsed(holder, holdMs),
+    controlResult: (key) => controls.resultOf(key),
+    keepControlResult: (key, result) => controls.keepResult(key, result),
 
     recordTelegramUpdate: (update) => telegramContent.recordTelegramUpdate(update),
     withHandlingLock: (chatId, work) =>
@@ -706,11 +718,12 @@ const makeStore = Effect.fnUntraced(function*({
           Effect.andThen(sql.query("select set_config('lock_timeout', $1, true)", [`${Duration.toMillis(handlingLockTimeout)}ms`])),
           Effect.andThen(sql.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [handlingLockName(schema, chatId)])),
           Effect.andThen(Effect.suspend(() => {
-            const { telegramContent: locked, outbox: lockedOutbox, presses: lockedPresses } = repositoriesOn(sql);
+            const { telegramContent: locked, outbox: lockedOutbox, controls: lockedControls, promptJobs: lockedPromptJobs } = repositoriesOn(sql);
             return work({
               recordTelegramUpdate: (update) => locked.recordTelegramUpdate(update),
               markTelegramUpdateProcessed: (updateId) => locked.markTelegramUpdateProcessed(updateId),
-              keepPress: (press) => lockedPresses.keep(press),
+              keepControl: (control) => lockedControls.keep(control),
+              enqueuePromptJob: (job) => lockedPromptJobs.enqueue(job),
               claimMediaGroup: (mediaGroupId, quietMs) => locked.claimMediaGroup(mediaGroupId, quietMs),
               enqueueOutboxText: (text) => lockedOutbox.enqueueText(text),
             });

@@ -17,6 +17,7 @@ import {
   listWorkspaceCandidates,
   workspaceLabel,
 } from "../workspace/policy.ts";
+import { madeOnce } from "./made-once.ts";
 import { Mounts, type WorkspaceChange, type WorkspaceChangeError } from "./mounts.ts";
 import { type ButtonDraft, type ControlCallback, type ControlPanel, closePanel, editPanel, keepPanel, type PanelDraft, sendPanel } from "./panel.ts";
 import { truncateText } from "./text.ts";
@@ -224,11 +225,13 @@ function parseWorkspaceArgs(args: string | null | undefined): WorkspaceArgs {
 }
 
 export interface WorkspaceTextCommand extends ConversationChat {
+  /** The message the command came in, which names the folder it makes, made once (./made-once.ts). */
+  readonly messageId: number;
   /** What followed /workspace. */
   readonly args: string;
 }
 
-export const handleWorkspaceTextCommand = Effect.fnUntraced(function*({ conversationId, chatId, args }: WorkspaceTextCommand): Effect.fn.Return<
+export const handleWorkspaceTextCommand = Effect.fnUntraced(function*({ conversationId, chatId, messageId, args }: WorkspaceTextCommand): Effect.fn.Return<
   void,
   TelegramError | StoreError,
   WorkspaceControlServices
@@ -239,7 +242,7 @@ export const handleWorkspaceTextCommand = Effect.fnUntraced(function*({ conversa
   if (parsed.action === "use") {
     notice = yield* applyWorkspaceChange(mounts.switchWorkspace(conversationId, parsed.target));
   } else if (parsed.action === "create") {
-    notice = yield* applyWorkspaceChange(mounts.createWorkspace(conversationId, parsed.name));
+    notice = yield* applyWorkspaceChange(madeOnce({ conversationId, messageId }, "folder", mounts.createWorkspace(conversationId, parsed.name)));
   }
   yield* sendPanel(chatId, yield* workspacePanel(conversationId, notice));
 });

@@ -1,9 +1,8 @@
 import type { Message } from "@grammyjs/types";
 import { Effect } from "effect";
 
-import { harnessLabelOf } from "../harness/index.ts";
 import type { OperatorServices } from "../operator/command-handler.ts";
-import { type IncomingPrompt, processPrompt, sendNextSetupStep } from "../operator/prompts.ts";
+import { type IncomingPrompt, sendNextSetupStep } from "../operator/prompts.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store, type UpdateMarks } from "../persistence/store.ts";
 import { Authorizer } from "./authorizer.ts";
@@ -30,7 +29,7 @@ function describeDownloadFailure(file: IncomingFile, message: string): string {
 
 /**
  * Records a message from Telegram and keeps its files: the prompt it carries, for
- * processIncomingPrompt, or null when it carries none to process now (it was not the
+ * admitPrompt (../operator/prompts.ts), or null when it carries none to process now (it was not the
  * operator's, it was /start, it carried nothing, or it is part of an album, which is
  * handled as one prompt once all of it has arrived). What it tells the chat of an album is
  * queued with `marks`, the update's, so it is told once however often the update is handled.
@@ -115,16 +114,3 @@ export const handleMessage = Effect.fnUntraced(function*(message: Message, updat
 
   return { conversationId, chatId: message.chat.id, messageId: message.message_id, text, files: received };
 });
-
-/** Processes a message's prompt, telling the operator when that fails. */
-export const processIncomingPrompt = (prompt: IncomingPrompt): Effect.Effect<void, never, OperatorServices> => {
-  const failed = Effect.fnUntraced(function*(error: unknown) {
-    yield* Effect.logError(`Failed to process prompt for ${prompt.conversationId}: ${error}`);
-    yield* Effect.gen(function*() {
-      const agentName = harnessLabelOf(yield* Effect.flatMap(Store, (store) => store.getMount(prompt.conversationId)));
-      const client = yield* TelegramClient;
-      yield* client.sendMessage(prompt.chatId, `${agentName} hit an error: ${error instanceof Error ? error.message : String(error)}`);
-    }).pipe(Effect.ignore);
-  });
-  return processPrompt(prompt).pipe(Effect.catch(failed), Effect.catchDefect(failed));
-};

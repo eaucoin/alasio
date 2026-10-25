@@ -6,9 +6,10 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import type { CallbackQuery, InlineKeyboardButton, Message } from "@grammyjs/types";
-import { Effect, Exit, Scope } from "effect";
+import { Effect, Exit, Option, Scope } from "effect";
 
 import { ActiveTurns, type RunningTurn } from "../src/harness/active-turns.ts";
+import { Panels } from "../src/harness/panels.ts";
 import {
   type FreshSessionParams,
   type Harness,
@@ -26,7 +27,6 @@ import {
 import { parseCommand } from "../src/operator/command-parser.ts";
 import { Turns } from "../src/codex/turns.ts";
 import { Mounts } from "../src/operator/mounts.ts";
-import { processPrompt } from "../src/operator/prompts.ts";
 import {
   CHOOSE_SERVICE_NOTICE,
   buildServicePanel,
@@ -43,7 +43,7 @@ import { listWorkspaceCandidates } from "../src/workspace/policy.ts";
 import { bindHarness, pooledStore } from "./support/pools.ts";
 import { run, writerOf } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
-import { type TestAlasio, type TestServicesOptions, withServices } from "./support/turns.ts";
+import { prompted, type TestAlasio, type TestServicesOptions, withServices } from "./support/turns.ts";
 
 /** A message handled as an update's handling handles it, its marks the store's own. */
 const handled = (message: Message, updateId: number) => Effect.flatMap(Store, (store) => handleMessage(message, updateId, store));
@@ -469,7 +469,7 @@ test("prompts sent before a service and folder are chosen only get the pickers a
     const telegram = recordingTelegram();
     const sent = telegram.calls.sendMessage;
     await withAlasio(store, async (alasio, { codex, claude }) => {
-      const prompt = (messageId: number, text: string) => alasio.runPromise(processPrompt({ conversationId, chatId: "12", messageId, text, files: [] }));
+      const prompt = (messageId: number, text: string) => alasio.runPromise(prompted({ conversationId, chatId: "12", messageId, text, files: [] }));
       await prompt(1, "hello there");
       assert.equal(sent.length, 1);
       assert.match(sent[0]?.[1] ?? "", /Active: none/);
@@ -526,6 +526,68 @@ test("prompts sent before a service and folder are chosen only get the pickers a
       assert.equal((await run(store.getMount(conversationId))).sessionId, null);
       await prompt(11, "/workspace repo");
       assert.equal((await run(store.getMount(conversationId))).sessionId, "claude-fresh");
+    }, { telegram, workspaceRoot: paths.workspaceRoot });
+  });
+});
+
+test("a command run again for the message it came in, as a kept one is after its alasio stopped, makes nothing again: it finds the session, the folder and the fork its run before made", async () => {
+  await withStore(async (store, paths) => {
+    const conversationId = await run(store.upsertConversation({ chatId: "12", user: { id: 12 } }));
+    await run(store.setActiveHarness(conversationId, CLAUDE_HARNESS));
+    await run(store.setWorkingDirectory(conversationId, paths.repo));
+    const telegram = recordingTelegram();
+    const sent = telegram.calls.sendMessage;
+    // Claude's panels, whose session's one message a rewind forks before, each fork made recorded.
+    const forks: string[] = [];
+    const rewinding = (made: Panels["Service"]): Panels["Service"] =>
+      Panels.of({
+        ...made,
+        forMount: (id, mount) =>
+          Effect.map(made.forMount(id, mount), Option.map((panels) => ({
+            ...panels,
+            sessions: {
+              ...panels.sessions,
+              listSessionMessages: () => Effect.succeed([{ index: -1, timestamp: "2026-10-25T00:00:00Z", uuid: "message-1", text: "Earlier" }]),
+              createForkedSession: (sessionId: string) => Effect.sync(() => (forks.push(sessionId), `claude-fork-${forks.length}`)),
+            },
+          }))),
+      });
+    await withAlasio(store, async (alasio, { claude }) => {
+      /** What the command `text` of the message `messageId` said, run, and run again. */
+      const twice = async (messageId: number, text: string) => {
+        for (let run = 0; run < 2; run += 1) await alasio.runPromise(prompted({ conversationId, chatId: "12", messageId, text, files: [] }));
+        return sent.slice(-2).map(([, said]) => said);
+      };
+      assert.deepEqual(await twice(1, "/sessions new"), Array(2).fill("New Claude session mounted: claude-f. Send your next message to start a turn."));
+      assert.equal(claude.calls.length, 1);
+      // Forked once, of the session mounted as the command came, though the run again finds the fork mounted.
+      assert.deepEqual(await twice(2, "!rewind -1"), Array(2).fill("Rewound to before message -1:\n\nEarlier\n\nReady to continue from earlier state."));
+      assert.deepEqual(forks, ["claude-fresh"]);
+      assert.equal((await run(store.getMount(conversationId))).sessionId, "claude-fork-1");
+      // The folder its run before made, found kept, not made again nor found made already.
+      const made = await twice(3, "/workspace new made-once");
+      assert.ok(made.every((said) => /Created and mounted made-once/u.test(said ?? "")), made.join("\n---\n"));
+    }, { telegram, workspaceRoot: paths.workspaceRoot, panels: rewinding });
+  });
+});
+
+test("!resume's follow-up is queued as a prompt of the command's message, held while a turn runs as any prompt is, once however often the command runs", async () => {
+  await withStore(async (store, paths) => {
+    const conversationId = await run(store.upsertConversation({ chatId: "12", user: { id: 12 } }));
+    await run(store.setActiveHarness(conversationId, CLAUDE_HARNESS));
+    await run(store.setWorkingDirectory(conversationId, paths.repo));
+    const telegram = recordingTelegram();
+    await withAlasio(store, async (alasio, { claude }) => {
+      const release = await occupy(alasio, conversationId);
+      try {
+        const sessionId = "0f6b7c1e-8d2a-4c3b-9e5f-1a2b3c4d5e6f";
+        for (let ran = 0; ran < 2; ran += 1) await alasio.runPromise(prompted({ conversationId, chatId: "12", messageId: 30, text: `!resume ${sessionId} Carry on`, files: [] }));
+        assert.equal((await run(store.getMount(conversationId))).sessionId, sessionId);
+        assert.deepEqual((await run(store.listHeldPromptJobs(conversationId))).map(({ message_id: messageId, prompt }) => [messageId, prompt]), [["30", "Carry on"]]);
+        assert.equal(claude.calls.length, 0);
+      } finally {
+        await release();
+      }
     }, { telegram, workspaceRoot: paths.workspaceRoot });
   });
 });

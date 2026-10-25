@@ -174,7 +174,9 @@ SETUP_POD_NAME=alasio-setup
 # reads, as it attaches again to a turn 9.0.0's stop left, by its turn's row, which names its
 # session: their tables dropped. And first, the column of the binding a turn runs on, which a
 # binding's loss ends that turn alone by (src/persistence/schema.ts turns.binding), which 9.0.0's
-# turns have not.
+# turns have not. And 9.0.0's presses kept as their controls ran on past their updates, which
+# this release keeps with its commands as controls (state.control_jobs): moved there, as presses,
+# their table dropped, so one 9.0.0's stop let go of runs again.
 
 SESSIONS_CLAIMED="
 alter table state.turns add column if not exists binding text;
@@ -194,6 +196,14 @@ on conflict do nothing;
 select count(state.claim_lineage(session_id, conversation_id)) from (select session_id, conversation_id from state.conversation_sessions) claimed;
 drop table if exists state.media_group_failures;
 drop table if exists state.restart_events;
+do \$\$\$\$ begin
+  if to_regclass('state.press_jobs') is not null then
+    insert into state.control_jobs (id, conversation_id, control, holder, held_until, answer, created_at)
+    select id, conversation_id, jsonb_build_object('kind', 'press', 'callbackQuery', callback_query, 'action', action), holder, held_until, answer, created_at
+    from state.press_jobs on conflict do nothing;
+    drop table state.press_jobs;
+  end if;
+end \$\$\$\$;
 select count(*) from state.conversation_sessions"
 # The release's setup pod, as SETUP_POD printed it, before the point of no return: it changes nothing.
 sessions_claimed_before() {

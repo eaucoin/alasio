@@ -235,6 +235,9 @@ function branchEvents({ branch, parentLog }: AlasioOptions): Layer.Layer<never, 
   return Layer.effectDiscard(Effect.flatMap(EventsConsumer, (consumer) => consumer.handle({ "workspace.fork-answered": forkAnswered({ branch: branch.name, tokenFile: branch.tokenFile }) } satisfies { readonly [K in (typeof FORK_EVENT_KINDS)[number]]: unknown })));
 }
 
+/** What alasio says as it is told to stop, before anything of it stops. */
+export const SHUTTING_DOWN = "Shutting down...";
+
 /**
  * alasio serving Telegram, in the scope it is run in: its services made, then its app
  * started on them; when the scope closes, the app stops first, then each service in the
@@ -243,5 +246,5 @@ function branchEvents({ branch, parentLog }: AlasioOptions): Layer.Layer<never, 
 export const serveAlasio = Effect.fnUntraced(function*(options: AlasioOptions): Effect.fn.Return<void, TelegramAppError | CodexLoginError, Scope.Scope> {
   yield* Layer.build(serveTelegram(options).pipe(Layer.provide(Layer.merge(alasioServices(options), options.updates))));
   // Added last, so the first thing a stop does.
-  yield* Effect.addFinalizer(() => Effect.logInfo("Shutting down..."));
+  yield* Effect.addFinalizer(() => Effect.logInfo(SHUTTING_DOWN));
 });

@@ -1,7 +1,7 @@
 /**
  * alasio stopped and started again on the same state, as a rollout restart does, from the
  * outside, its conversations' pods running on: what becomes of a reply it had not delivered,
- * and of a turn it left running.
+ * of a turn it left running, and of a prompt whose update it was handling as it stopped.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -16,6 +16,7 @@ import {
   mount,
   alasioFor,
 } from "./support/scenarios.ts";
+import { SHUTTING_DOWN } from "../src/alasio.ts";
 import { DRAINING } from "../src/telegram/drain.ts";
 import { eventually } from "./support/wait.ts";
 
@@ -109,4 +110,38 @@ test("an update that comes as a stopping alasio delivers what it owes is another
   // The stopping alasio handled none of it, and delivered what it owed.
   assert.equal(await telegram.committed(), told);
   assert.deepEqual(telegram.callsTo("sendRichMessage").map((call) => call.status), [429, 200]);
+});
+
+test("a prompt whose update alasio was handling as it stopped, its job not yet queued, is not lost: the alasio after it takes the update again and answers it once", async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex, pool, stateSchema } = alasio;
+  await mount(alasio, "codex", "alpha");
+  // Every statement of prompt_jobs held, by a lock of the table the test holds, as the prompt's job is to be queued.
+  const holder = await pool.connect();
+  try {
+    await holder.query("begin");
+    await holder.query(`lock table ${stateSchema}.prompt_jobs in access exclusive mode`);
+    telegram.say("Apply the change");
+    const queuing = await eventually("alasio to queue the prompt's job", async () =>
+      (await pool.query<{ pid: number }>(
+        `select locks.pid from pg_locks locks join pg_stat_activity activity using (pid)
+         where locks.relation = '${stateSchema}.prompt_jobs'::regclass and not locks.granted and activity.query like 'insert into ${stateSchema}.prompt_jobs%'`,
+      )).rows[0]?.pid);
+    const stopped = alasio.stop();
+    await alasio.logged(SHUTTING_DOWN);
+    // Cut short as alasio stops: its statement cancelled, as an interruption before it was sent would leave it.
+    await pool.query("select pg_cancel_backend($1)", [queuing]);
+    await holder.query("rollback");
+    assert.deepEqual(await stopped, { code: 0, signal: null });
+  } finally {
+    holder.release();
+  }
+  await alasio.start();
+  await answerThreadStart(codex, "thread-1", alasio.folder("alpha"));
+  await answerTurnStart(codex, "thread-1", "turn-1");
+  answerTurn(codex, "thread-1", "turn-1", "Change applied.");
+  await telegram.waitFor("sendRichMessage", (call) => call.params.rich_message.markdown === "Change applied.");
+  // Once: one job, one turn, one reply.
+  const jobs = await pool.query(`select 1 from ${stateSchema}.prompt_jobs`);
+  assert.deepEqual([jobs.rows.length, codex.requests("turn/start").length, telegram.callsTo("sendRichMessage").length], [1, 1, 1]);
 });

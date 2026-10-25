@@ -19,6 +19,7 @@ import type { Mounts } from "./mounts.ts";
 import { handleServiceTextCommand, sendChooseServicePanel } from "./service-control.ts";
 import { mountFork, type NewSessionError, sendCurrentSessionPanel, sendSessionsPanel } from "./session-control.ts";
 import { formatRewindForTelegram, formatSessionsForTelegram } from "./session-replies.ts";
+import { madeOnce } from "./made-once.ts";
 import { truncateText } from "./text.ts";
 import { handleWorkspaceTextCommand, sendChooseWorkspacePanel } from "./workspace-control.ts";
 
@@ -82,7 +83,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     return true;
   }
   if (cmd.type === "workspace") {
-    yield* handleWorkspaceTextCommand({ ...conversation, args: cmd.args });
+    yield* handleWorkspaceTextCommand({ ...conversation, messageId, args: cmd.args });
     return true;
   }
   const harness = Option.getOrNull(yield* Effect.flatMap(Panels, (panels) => panels.forMount(conversationId, mount)));
@@ -128,7 +129,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
       yield* client.sendMessage(chatId, `${harness.displayName} is currently working. Use /stop first, then /sessions new.`);
       return true;
     }
-    const sessionId = yield* turns.startNewSession(conversationId);
+    const sessionId = yield* madeOnce({ conversationId, messageId }, "session", turns.startNewSession(conversationId));
     yield* client.sendMessage(chatId, `New ${harness.displayName} session mounted: ${shortSessionId(sessionId)}. Send your next message to start a turn.`);
     return true;
   }
@@ -149,19 +150,24 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
       yield* client.sendMessage(chatId, "No session linked. Use !resume <#> first.");
       return true;
     }
-    const messages = yield* sessions.listSessionMessages(sessionId);
-    const target = messages.find((message) => message.index === cmd.index);
-    if (!target) {
+    // Forked once, of the session mounted as the command came: a run again, the fork mounted
+    // since, finds the fork its run before made, not the fork's history to rewind.
+    const rewound = yield* madeOnce({ conversationId, messageId }, "rewind", Effect.gen(function*() {
+      const messages = yield* sessions.listSessionMessages(sessionId);
+      const target = messages.find((message) => message.index === cmd.index);
+      if (!target) return { found: false } as const;
+      return { found: true, text: target.text, forkedId: yield* sessions.createForkedSession(sessionId, target.uuid, { threadKey: conversationId }) } as const;
+    }));
+    if (!rewound.found) {
       yield* client.sendMessage(chatId, `Message ${cmd.index} not found. Use !rewind to see available points.`);
       return true;
     }
-    const forkedId = yield* sessions.createForkedSession(sessionId, target.uuid, { threadKey: conversationId });
-    if (!forkedId) {
+    if (!rewound.forkedId) {
       yield* client.sendMessage(chatId, "Failed to create forked session.");
       return true;
     }
-    yield* mountFork(harness, conversationId, forkedId);
-    yield* client.sendMessage(chatId, `Rewound to before message ${cmd.index}:\n\n${truncateText(target.text, 700)}\n\nReady to continue from earlier state.`);
+    yield* mountFork(harness, conversationId, rewound.forkedId);
+    yield* client.sendMessage(chatId, `Rewound to before message ${cmd.index}:\n\n${truncateText(rewound.text, 700)}\n\nReady to continue from earlier state.`);
     return true;
   }
   if (cmd.type === "resume") {
@@ -179,7 +185,9 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     // The operator's choice, another conversation's session of the folder's among them: given the conversation.
     yield* store.mountGivenSession(conversationId, resolvedSessionId);
     if (cmd.followUp) {
-      yield* turns.run({ conversationId, chatId, messageId, prompt: cmd.followUp });
+      // Queued as a prompt of the command's message, once however often the command runs, its turn run as the conversation is free.
+      const followUp = { conversationId, chatId, messageId, prompt: cmd.followUp, fileIds: [], visibleText: cmd.followUp };
+      yield* turns.admitted(yield* turns.admit(followUp, store));
       return true;
     }
     const lastMessage = yield* sessions.getSessionLastMessage(resolvedSessionId);

@@ -5,10 +5,11 @@
  * bot's; prompts queued and turns running, which its start would run, or attach
  * to, again, and the claims of the workers that drove them, and the conversations held for
  * forks, there; replies on their way, which would be sent again, by this bot; buttons,
- * which this bot never sent, and presses of them under way; Codex's login, whose refresh
- * token works once, so that using it here would log the other out; and the events and
- * forks it handled, another environment's. All of it goes, once, in one transaction; the
- * conversations, what they mount, and their history stay.
+ * which this bot never sent, and the controls under way, presses of them and commands;
+ * Codex's login, whose refresh token works once, so that using it here would log the other
+ * out; what controls made, which this bot's would find; and the events and forks it handled,
+ * another environment's. All of it goes, once, in one transaction; the conversations, what
+ * they mount, and their history stay.
  */
 import { Effect } from "effect";
 
@@ -42,7 +43,8 @@ export const startBranch = (database: Database, schema: string, branch: string):
         update ${schema}.responses set posted = true where not posted;
         delete from ${schema}.telegram_outbox;
         delete from ${schema}.callback_actions;
-        delete from ${schema}.press_jobs;
+        delete from ${schema}.control_jobs;
+        delete from ${schema}.control_results;
         delete from ${schema}.codex_login;
         delete from ${schema}.codex_login_refusal;
         delete from ${schema}.events_handled;

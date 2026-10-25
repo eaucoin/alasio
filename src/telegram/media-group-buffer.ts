@@ -6,16 +6,17 @@
  * next (flushDue). A message of an album that comes once the album has been handled is
  * not in its prompt, and its chat is told so.
  */
-import { Clock, Context, Duration, Effect, FiberMap, FiberSet, Layer, Semaphore } from "effect";
+import { Clock, Context, Duration, Effect, FiberMap, FiberSet, Layer, Option, Semaphore } from "effect";
 
+import { Turns } from "../codex/turns.ts";
 import type { OperatorServices } from "../operator/command-handler.ts";
-import type { IncomingPrompt } from "../operator/prompts.ts";
+import { admitPrompt, runCommand } from "../operator/prompts.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store, type UpdateMarks } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { ReceivedFiles } from "./files.ts";
-import { processIncomingPrompt } from "./message-handler.ts";
+import { type Awaited, awaitOrKeep, holdWhileRunning, rolledBack } from "./controls.ts";
 
 /** How long a media group waits for more of its messages before it is handled. */
 const DEFAULT_FLUSH_AFTER: Duration.Input = "1500 millis";
@@ -58,47 +59,69 @@ const makeMediaGroups = Effect.fnUntraced(function*(flushAfter: Duration.Input) 
   const services = yield* Effect.context<OperatorServices>();
   const flushMs = Duration.toMillis(flushAfter);
   // Each group's wait, which a later message of the group starts again; the groups being
-  // handled, which a later message no longer reaches; and their prompts, which run on after.
+  // handled, which a later message no longer reaches; and what their prompts lead to, which runs on after:
+  // made first, so stopped last, once no group is being handled, as a command one awaits stopped under it
+  // is kept to run again, not taken as done.
+  const prompts = yield* FiberSet.make();
   const waits = yield* FiberMap.make<string>();
   const flushing = yield* FiberSet.make();
-  const prompts = yield* FiberSet.make();
   const holders = yield* Semaphore.make(LOCK_HOLDERS);
 
   /**
    * The group's messages and files made one prompt, under its chat's handling lock, which its
    * messages are kept under too, so none of it comes meanwhile: claimed in the lock's
    * transaction, where it still waits and its last message has been quiet for its moment,
-   * so of all the alasios on the store one handles it, once. Its files are named where the
-   * agent of the conversation's workspace reads them, which its turn's host writes them to as
-   * the turn starts (../harness/host.ts). Null where it was not claimed.
+   * so of all the alasios on the store one handles it, once; and what the prompt comes to
+   * kept in the same transaction (admitPrompt), its job queued, so an album claimed is never
+   * one whose prompt is lost, as its alasio stops. Its files are named where the agent of the
+   * conversation's workspace reads them, which its turn's host writes them to as the turn
+   * starts (../harness/host.ts). What it leads to once the transaction is through: its job
+   * carried on, or its command, one of an album that kept none of its files, held while it
+   * runs on (../telegram/controls.ts); nothing where it was not claimed.
    */
-  const claimed = (mediaGroupId: string, conversationId: string, chatId: number | string): Effect.Effect<IncomingPrompt | null, StoreError> =>
-    holders.withPermit(store.withHandlingLock(chatId, (marks) =>
+  const claimed = (mediaGroupId: string, conversationId: string, chatId: number | string): Effect.Effect<Effect.Effect<void>, StoreError> => {
+    // Its command's work, cut short where the transaction fails after all, keeping nothing of it (rolledBack).
+    const awaited: Awaited[] = [];
+    return holders.withPermit(store.withHandlingLock(chatId, (marks) =>
       Effect.gen(function*() {
-        if (!(yield* marks.claimMediaGroup(mediaGroupId, flushMs))) return null;
+        if (!(yield* marks.claimMediaGroup(mediaGroupId, flushMs))) return Effect.void;
         const messages = yield* store.getMediaGroupMessages(mediaGroupId);
         const files = yield* store.getFilesForMessages(messages.map((message) => message.id));
         const text = messages.map((message) => String(message.text ?? "").trim()).find(Boolean) ?? "";
         const messageId = Number(messages[0]?.transport_message_id ?? 0) || (yield* Clock.currentTimeMillis);
         const workspace = parseWorkspace((yield* store.getMount(conversationId)).workingDirectory);
         const received = files.map((file) => ({ id: file.id, path: receivedFiles.pathOf(file, workspace) }));
-        return { conversationId, chatId, messageId, text, files: received };
+        const admitted = yield* admitPrompt({ conversationId, chatId, messageId, text, files: received }, marks).pipe(
+          Effect.provideContext(services),
+          // Telegram not taking the picker of the setup step it lacks: said, and the album handled, as an update would be skipped.
+          Effect.catchTag(["TelegramApiError", "TelegramTransportError"], (error) =>
+            Effect.as(Effect.logError(`Could not send the setup step media group ${mediaGroupId} lacks: ${error.message}`), { _tag: "Done" } as const)),
+        );
+        if (admitted._tag === "Command") {
+          const { kept } = awaited[awaited.push(yield* awaitOrKeep(prompts, admitted.command, runCommand(admitted.command).pipe(Effect.provideContext(services)), marks)) - 1]!;
+          return Option.match(kept, {
+            onNone: () => Effect.void,
+            onSome: ({ id, holder, running }) => Effect.asVoid(FiberSet.run(prompts, holdWhileRunning(id, holder, running).pipe(Effect.provideService(Store, store)))),
+          });
+        }
+        if (admitted._tag === "Done") return Effect.void;
+        const { job } = admitted;
+        return Effect.asVoid(FiberSet.run(prompts, Effect.flatMap(Turns, (turns) => turns.admitted(job)).pipe(
+          Effect.catch((error) => Effect.logError(`Could not carry on media group ${mediaGroupId}'s prompt ${job.id}, which waits for what takes up waiting prompts: ${error.message}`)),
+          Effect.provideContext(services),
+        )));
       })
-    ));
+    )).pipe(Effect.onError(() => rolledBack(awaited)));
+  };
 
   /**
-   * The group handled, as `claimed` says, its prompt then run on after its chat's handling
-   * lock is let go of, as a single message's prompt is (./app.ts), so that a prompt that
-   * takes a while holds back none of its chat's updates; one that fails is said in the
-   * chat, and the group is handled. As a single message's, an album whose claim is committed
-   * and whose prompt is not yet queued as alasio stops is lost: its prompt, forked once the
-   * lock's transaction commits, queues its job within moments of it.
+   * The group handled, as `claimed` says, what it leads to run on after its chat's handling
+   * lock is let go of, as a single message's is (./app.ts), so that a prompt that takes a
+   * while holds back none of its chat's updates.
    */
   const flush = (mediaGroupId: string, conversationId: string, chatId: number | string): Effect.Effect<void> =>
     claimed(mediaGroupId, conversationId, chatId).pipe(
-      Effect.flatMap((prompt) =>
-        prompt === null ? Effect.void : Effect.asVoid(FiberSet.run(prompts, processIncomingPrompt(prompt).pipe(Effect.provideContext(services), Effect.interruptible)))
-      ),
+      Effect.flatten,
       // The store not answering, or its lock not had in time: nothing of the album's own, which waits for the next look.
       Effect.catch((error) => Effect.logWarning(`Could not flush media group ${mediaGroupId} now, which waits for the next look: ${error.message}`)),
       Effect.catchDefect((defect) => Effect.logError(`Failed to flush media group ${mediaGroupId}: ${defect}`)),

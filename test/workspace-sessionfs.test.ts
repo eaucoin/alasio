@@ -198,7 +198,7 @@ test("Fork clones the session workspace mounted and switches the conversation to
 test("a folder is not forked, nor a workspace while prompts wait in its conversation", async () => {
   const sandbox = fakeVolumes();
   await withWorkspaceControls(sandbox, async (alasio, { calls }, store, root) => {
-    await alasio.runPromise(handleWorkspaceTextCommand({ conversationId: CONVERSATION, chatId: 1, args: "new repo" }));
+    await alasio.runPromise(handleWorkspaceTextCommand({ conversationId: CONVERSATION, chatId: 1, messageId: 1, args: "new repo" }));
     await alasio.runPromise(press("fork"));
     assert.equal(calls.sendMessage.at(-1)?.[1], "Only a session workspace can be forked: a folder's files are the host's, which are not copied on write.");
     assert.equal((await run(store.getMount(CONVERSATION))).workingDirectory, join(root, "repo"));
@@ -233,7 +233,7 @@ test("a fork that fails is not recorded, leaves its source mounted, and says why
 
 test("only a session workspace alasio made is switched to", async () => {
   await withWorkspaceControls(fakeVolumes(), async (alasio, { calls }, store) => {
-    await alasio.runPromise(handleWorkspaceTextCommand({ conversationId: CONVERSATION, chatId: 1, args: "sessionfs:fs-unknown" }));
+    await alasio.runPromise(handleWorkspaceTextCommand({ conversationId: CONVERSATION, chatId: 1, messageId: 2, args: "sessionfs:fs-unknown" }));
     assert.match(calls.sendMessage.at(-1)?.[1] ?? "", /^There is no session workspace fs-unknown\.$/mu);
     assert.equal((await run(store.getMount(CONVERSATION))).workingDirectory, null);
   });

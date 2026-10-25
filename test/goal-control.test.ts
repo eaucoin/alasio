@@ -269,6 +269,37 @@ test("goal text command bootstraps a fresh session when none is mounted", async 
   });
 });
 
+test("goal text command run again for the message it came in, as a kept one is after its alasio stopped, sets its goal once, on the session its run before started, asking nothing of the goal it set, and asks for its turn once", async () => {
+  // Goals as Codex keeps them: the one set read back.
+  const goal = createGoals({ waitTurnId: null });
+  let kept: v2.ThreadGoal | null = null;
+  const goals: HarnessGoals = {
+    ...goal.goals,
+    read: (args) => Effect.as(goal.goals.read(args), kept),
+    set: (args) => Effect.tap(goal.goals.set(args), (made) => Effect.sync(() => void (kept = made))),
+  };
+  const startCalls: string[] = [];
+  const runCalls: GoalTurnRequest[] = [];
+  await withGoalControls({
+    sessionId: null,
+    turns: (store) => ({
+      ...recordGoalTurns(runCalls),
+      startNewSession: (conversationId) =>
+        Effect.sync(() => startCalls.push(conversationId)).pipe(
+          Effect.andThen(store.setSessionId(conversationId, "fresh-session")),
+          Effect.as("fresh-session"),
+        ),
+    }),
+  }, async (alasio, { calls }) => {
+    for (let ran = 0; ran < 2; ran += 1) await alasio.runPromise(handleGoalTextCommand({ conversationId: CONVERSATION, chatId: 123, messageId: 456, args: "Refactor CI", goals }));
+    assert.deepEqual(startCalls, [CONVERSATION]);
+    assert.equal(goal.calls.set.length, 1);
+    // Its goal's turn asked for once: one its run before left running is attached to again by the next alasio, not asked for anew.
+    assert.equal(runCalls.length, 1);
+    assert.equal(calls.sendMessage.length, 0, "asked before replacing the goal its run before set");
+  });
+});
+
 test("goal text command clears completed goal state before setting a new objective", async () => {
   const goal = createGoals({
     currentGoal: threadGoal({ objective: "Old goal", status: "complete", tokensUsed: 1200 }),
@@ -356,7 +387,7 @@ test("a goal that cannot be changed says why on its panel", async () => {
   });
 });
 
-test("goal turns use normal concurrent-message decision panel when Codex is already working", async () => {
+test("goal turns use normal concurrent-message decision panel when Codex is already working, asked once though the goal's command asks again", async () => {
   const store = await codexConversation();
   const outbox = recordingOutbox();
   const handled = await withServices({ store, outbox: outbox.layer }, (alasio) =>
@@ -366,17 +397,13 @@ test("goal turns use normal concurrent-message decision panel when Codex is alre
       const activeTurns = yield* ActiveTurns;
       yield* activeTurns.register(CONVERSATION, { stop: () => Effect.void, steer: () => Effect.succeed(true), cliInitiated: false });
       const turns = yield* Turns;
-      return yield* turns.runGoalTurn({
-        conversationId: CONVERSATION,
-        chatId: 123,
-        messageId: 456,
-        sessionId: "session-1",
-        turnId: null,
-        prompt: "Continue working toward this Codex goal.\n\nRefactor CI",
-      });
+      const goalTurn = { conversationId: CONVERSATION, chatId: 123, messageId: 456, sessionId: "session-1", turnId: null, prompt: "Continue working toward this Codex goal.\n\nRefactor CI" };
+      // Asked for again, as its command run again after its alasio stopped asks.
+      return [yield* turns.runGoalTurn(goalTurn), yield* turns.runGoalTurn(goalTurn)];
     }))));
 
-  assert.equal(handled, true);
+  assert.deepEqual(handled, [true, true]);
+  assert.equal(outbox.queued.texts.length, 1);
   // The question is queued to the outbox, in the chat's order.
   const [question] = outbox.queued.texts;
   assert.match(question?.text ?? "", /Codex is currently working/);

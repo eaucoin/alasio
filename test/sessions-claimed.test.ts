@@ -162,7 +162,7 @@ test("the cut-over's pod, refused by the database itself, as of a password it do
   }
 });
 
-test("the cut-over gives each conversation the sessions its rows name, as this release records them as they are written, and the threads their histories start in, drops 9.0.0's tally of albums and its restart events, and nothing more run again", async () => {
+test("the cut-over gives each conversation the sessions its rows name, as this release records them as they are written, and the threads their histories start in, drops 9.0.0's tally of albums and its restart events, keeps its kept presses as controls, and nothing more run again", async () => {
   assert.match(SESSIONS_CLAIMED, /insert into state\.conversation_sessions/u);
   const database = await startPostgres();
   const pool = new pg.Pool({ connectionString: database.url, max: 2 });
@@ -201,6 +201,11 @@ test("the cut-over gives each conversation the sessions its rows name, as this r
     await pool.query("create table state.media_group_failures (media_group_id text primary key, failures integer not null default 1)");
     await pool.query("create table state.restart_events (thread_key text primary key, cause text not null, channel text not null, thread_ts text not null, session_id text, command text, recorded_at timestamptz not null default now())");
     await pool.query("insert into state.restart_events (thread_key, cause, channel, thread_ts, session_id) values ($1, 'external', '41', '1', 'a-restarted')", [first]);
+    // And its presses kept as their controls ran on, one its stop let go of.
+    await pool.query("create table state.press_jobs (id text primary key, conversation_id text not null, callback_query jsonb not null, action jsonb not null, holder text not null, held_until timestamptz not null, answer text, created_at timestamptz not null default now())");
+    const callbackQuery = { id: "press-1", data: "action-1" };
+    const action = { id: "action-1", conversationId: first, kind: "workspace:refresh", payload: {} };
+    await pool.query("insert into state.press_jobs (id, conversation_id, callback_query, action, holder, held_until) values ('press-1', $1, $2, $3, 'stopped', now())", [first, JSON.stringify(callbackQuery), JSON.stringify(action)]);
     /** How many sessions the conversations have, as the cut-over's SQL says last. */
     const claimed = async () => {
       const results = (await pool.query(SESSIONS_CLAIMED)) as unknown as { rows: { count: string }[] }[];
@@ -210,6 +215,9 @@ test("the cut-over gives each conversation the sessions its rows name, as this r
     assert.equal((await pool.query("select to_regclass('state.media_group_failures') as kept")).rows[0]?.kept, null, "9.0.0's tally of albums is kept");
     assert.equal((await pool.query("select to_regclass('state.restart_events') as kept")).rows[0]?.kept, null, "9.0.0's restart events are kept");
     assert.equal((await pool.query("select count(*) from information_schema.columns where table_schema = 'state' and table_name = 'turns' and column_name = 'binding'")).rows[0]?.count, "1", "9.0.0's turns have no binding");
+    // Its kept press a control of this release's, to run again; its table gone.
+    assert.deepEqual(await run(store.takeLapsedControls("next", 60_000)), [{ control: { kind: "press", callbackQuery, action }, answer: null }]);
+    assert.equal((await pool.query("select to_regclass('state.press_jobs') as kept")).rows[0]?.kept, null, "9.0.0's kept presses' table is kept");
     // The rows' sessions, and the first's mounted thread's lineage, its: as this release records them; none its restart event alone named.
     assert.deepEqual(await recorded(), named);
     // Run again, as a cut-over run again past it would: the same.

@@ -29,7 +29,7 @@ import { CurrentWorkerFence, Store, TurnFenced } from "../src/persistence/store.
 import { forgetfulPersistence } from "./support/persistence.ts";
 import { bindHarness, holdsOf, OOM_LIMIT, POOLED_SCHEMA, Pools, pooledStore, poolOf } from "./support/pools.ts";
 import { run } from "./support/store.ts";
-import { type QueuedToOutbox, recordingOutbox, type TestAlasio, withServices } from "./support/turns.ts";
+import { type QueuedToOutbox, recordingOutbox, submitted, type TestAlasio, withServices } from "./support/turns.ts";
 import { eventually } from "./support/wait.ts";
 
 /** A Codex harness whose turns run as `turn` says, given what alasio gives each. */
@@ -497,14 +497,42 @@ test("a prompt queued again while a turn runs, as its update is handled again af
       // A turn runs in the conversation.
       yield* bindHarness(conversationId);
       assert.ok(yield* (yield* ActiveTurns).reserve(conversationId));
-      const turns = yield* Turns;
       const prompt = { conversationId, chatId: CONVERSATION_CHAT, messageId: 77, prompt: "Is it done?", fileIds: [], visibleText: "Is it done?" };
-      yield* turns.submit(prompt);
-      yield* turns.submit(prompt);
+      yield* submitted(prompt);
+      yield* submitted(prompt);
     })));
     assert.equal(queued.texts.filter(({ text }) => text.startsWith("Codex is currently working.")).length, 1);
   });
   assert.deepEqual((await run(store.listHeldPromptJobs(conversationId))).map(({ message_id: messageId }) => messageId), ["77"]);
+});
+
+test("a prompt held while a turn ran, the turn ending as its update's transaction went through, is asked about as a turn's end asks, never as one running", async () => {
+  const { store, conversationId } = await conversation();
+  await withTurns(store, scriptedHarness(() => Effect.never), async (alasio, queued) => {
+    await alasio.runPromise(Effect.gen(function*() {
+      yield* bindHarness(conversationId);
+      const turns = yield* Turns;
+      const reservation = yield* Scope.make();
+      assert.ok(yield* Scope.provide((yield* ActiveTurns).reserve(conversationId), reservation));
+      const job = yield* turns.admit({ conversationId, chatId: CONVERSATION_CHAT, messageId: 79, prompt: "And the tests?", fileIds: [], visibleText: "And the tests?" }, yield* Store);
+      assert.equal(job.state, "awaiting_choice");
+      // The turn ends before its update's transaction is through, its end asking about none.
+      yield* Scope.close(reservation, Exit.void);
+      yield* turns.admitted(job);
+    }));
+    assert.deepEqual(queued.texts.map(({ text }) => text.split("\n")[0]), ["The turn has ended. What should I do with this message?"]);
+  });
+});
+
+test("a prompt's update whose conversation's host does not say whether it is busy is not held back past a few seconds: its job queued to run as the conversation is free", { timeout: 30_000 }, async () => {
+  const { store, conversationId } = await conversation();
+  const outbox = recordingOutbox();
+  await withServices({ store, outbox: outbox.layer, host: (host) => ({ ...host, status: () => Effect.never }) }, async (alasio) => {
+    const began = Date.now();
+    const job = await alasio.runPromise(Effect.flatMap(Turns, (turns) => Effect.flatMap(Store, (marks) => turns.admit({ conversationId, chatId: CONVERSATION_CHAT, messageId: 80, prompt: "Hello?", fileIds: [], visibleText: "Hello?" }, marks))));
+    assert.equal(job.state, "pending");
+    assert.ok(Date.now() - began < 10_000, `held back ${Date.now() - began} ms`);
+  });
 });
 
 test("a question's buttons are kept with its reply or not at all: a reply the store refuses keeps none of its buttons' actions", async () => {
@@ -527,17 +555,15 @@ test("a question's buttons are kept with its reply or not at all: a reply the st
   assert.equal(await run(store.hasCallbackActionsOfJob("job-1")), true);
 });
 
-test("a prompt held while a turn runs whose question could not be asked, the store failing it, is asked about as its update is handled again", async () => {
+test("a prompt held while a turn runs whose question the store fails at first is asked about once it takes it, asked again", async () => {
   const { store, conversationId } = await conversation();
   await withTurns(store, scriptedHarness(() => Effect.never), async (alasio, queued) => {
     await alasio.runPromise(Effect.scoped(Effect.gen(function*() {
       yield* bindHarness(conversationId);
       assert.ok(yield* (yield* ActiveTurns).reserve(conversationId));
-      const turns = yield* Turns;
       const prompt = { conversationId, chatId: CONVERSATION_CHAT, messageId: 78, prompt: "And the docs?", fileIds: [], visibleText: "And the docs?" };
-      // The update's handling fails as the question does, and is handled again.
-      assert.equal((yield* Effect.flip(turns.submit(prompt)))._tag, "StoreError");
-      yield* turns.submit(prompt);
+      // Its job kept, the question asked once its update is through, and again as the store failed it.
+      yield* submitted(prompt);
     })));
     assert.equal(queued.texts.filter(({ text }) => text.startsWith("Codex is currently working.")).length, 1);
   }, { failedPanels: 1 });

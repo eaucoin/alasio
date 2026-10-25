@@ -51,9 +51,8 @@ const { buildCodexEnv } = await import("../src/codex/env.ts");
 const { codexTelemetryArgs, codexTelemetryEnv } = await import("../src/codex/app-server/telemetry.ts");
 const { makeAppServerRpc } = await import("../src/codex/app-server/rpc-client.ts");
 const { appServerProcess } = await import("./support/app-server-process.ts");
-const { withServices } = await import("./support/turns.ts");
+const { prompted, withServices } = await import("./support/turns.ts");
 const { recordingTelegram, sentMessage } = await import("./support/telegram-calls.ts");
-const { processPrompt } = await import("../src/operator/prompts.ts");
 const { eventually } = await import("./support/wait.ts");
 const { CLAUDE_HARNESS, CODEX_HARNESS } = await import("../src/harness/names.ts");
 const { run: stored, testStore } = await import("./support/store.ts");
@@ -374,7 +373,7 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
     const harnesses = { [CODEX_HARNESS]: harness(CODEX_HARNESS), [CLAUDE_HARNESS]: harness(CLAUDE_HARNESS) };
     spans.reset();
     await withServices({ store, telegram: telegram.layer, harnesses, workspaceRoot: root, outbox }, async (alasio) => {
-      await alasio.runPromise(processPrompt({ conversationId, chatId: "42", messageId: 9, text: "hello", files: [] }).pipe(
+      await alasio.runPromise(prompted({ conversationId, chatId: "42", messageId: 9, text: "hello", files: [] }).pipe(
         withAlasioSpan("alasio.update", { kind: SpanKind.CONSUMER, parent: null }),
       ));
       // The conversation's prompt worker runs the turn, whose reply the outbox delivers.

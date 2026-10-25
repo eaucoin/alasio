@@ -11,7 +11,7 @@ import { CodexAppServer } from "../../src/codex/app-server/client.ts";
 import { CodexLoginFreshness } from "../../src/codex/login-refresh.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../../src/codex/rollouts/store.ts";
 import { EventsConsumer } from "../../src/events/consume.ts";
-import { Turns } from "../../src/codex/turns.ts";
+import { type QueuedPrompt, Turns } from "../../src/codex/turns.ts";
 import { ActiveTurns } from "../../src/harness/active-turns.ts";
 import { HarnessHost } from "../../src/harness/host.ts";
 import type { Harness, ModelOption } from "../../src/harness/index.ts";
@@ -20,14 +20,16 @@ import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { Panels } from "../../src/harness/panels.ts";
 import { HostBayma } from "../../src/mcp/bayma.ts";
 import { Mounts } from "../../src/operator/mounts.ts";
+import type { OperatorServices } from "../../src/operator/command-handler.ts";
 import { inlineKeyboard } from "../../src/operator/panel.ts";
+import { admitPrompt, type IncomingPrompt, runCommand } from "../../src/operator/prompts.ts";
 import { StoreError } from "../../src/persistence/sql.ts";
 import { Store } from "../../src/persistence/store.ts";
 import type { AlasioServices } from "../../src/alasio.ts";
 import { SessionSandboxes } from "../../src/sandbox/index.ts";
 import { Authorizer } from "../../src/telegram/authorizer.ts";
 import { ReceivedFiles } from "../../src/telegram/files.ts";
-import type { TelegramClient } from "../../src/telegram/client.ts";
+import type { TelegramClient, TelegramError } from "../../src/telegram/client.ts";
 import { MediaGroups } from "../../src/telegram/media-group-buffer.ts";
 import { Outbox, type OutboxStatus, type OutboxText } from "../../src/telegram/outbox.ts";
 import { TracingLayer } from "../../src/telemetry/index.ts";
@@ -94,7 +96,8 @@ export function recordingOutbox({ failedPanels = 0, refusesText = () => false }:
 export function turnsStub(turns: Partial<Turns["Service"]>): Turns["Service"] {
   const unused = (name: string) => Effect.die(new Error(`the test's turns run no ${name}`));
   return Turns.of({
-    submit: () => unused("submit"),
+    admit: () => unused("admit"),
+    admitted: () => unused("admitted"),
     schedule: () => unused("schedule"),
     holding: () => unused("holding"),
     setPromptDisposition: () => unused("setPromptDisposition"),
@@ -134,6 +137,8 @@ export interface TestServicesOptions {
   readonly models?: Partial<Record<HarnessName, readonly ModelOption[]>> | undefined;
   /** What the harness host is made into, for a test that stands in for part of it: as made unless given. */
   readonly host?: ((host: HarnessHost["Service"]) => HarnessHost["Service"]) | undefined;
+  /** What the operator's panels are made into, for a test that stands in for part of them: as made unless given. */
+  readonly panels?: ((panels: Panels["Service"]) => Panels["Service"]) | undefined;
   /** How long a turn found lost as it is attached to again waits for its loss to be heard: a moment, unless a test says, which no test's stand-in tells of otherwise. */
   readonly lossHeardWithin?: Duration.Input | undefined;
 }
@@ -152,13 +157,14 @@ function testServices({
   hostBayma,
   branch,
   host,
+  panels,
   models = {},
   lossHeardWithin = "200 millis",
 }: TestServicesOptions): Layer.Layer<AlasioServices | Pools | ActiveTurns> {
   return Layer.effectDiscard(Effect.flatMap(EventsConsumer, (consumer) => consumer.start)).pipe(Layer.provideMerge(MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot, branch }), Authorizer.layer(allowedUserIds))),
     Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer({ pod: "alasio-test" }, { lossHeardWithin })),
-    Layer.provideMerge(testPanels({ stateDir, branch, models })),
+    Layer.provideMerge(panels ? Layer.effect(Panels, Effect.map(Panels, panels)).pipe(Layer.provide(testPanels({ stateDir, branch, models }))) : testPanels({ stateDir, branch, models })),
     // Its harnesses run where a pool's do: in a pod's host, bound for the conversation, reached through the sandbox gateway's front.
     Layer.provideMerge(pooledHost({ standIns: { overrides: harnesses }, branch, host })),
     // Received files are written nowhere a test does not say; into a session through the test's session filesystems.
@@ -223,3 +229,24 @@ export async function withServices<T>(options: TestServicesOptions, use: (alasio
     await alasio.dispose();
   }
 }
+
+/**
+ * Queues `prompt` as the update that brings it does, but on the store's own marks rather than
+ * an update's transaction's, and carries its job on (Turns.admit, Turns.admitted).
+ */
+export const submitted = (prompt: QueuedPrompt): Effect.Effect<void, StoreError, Turns | Store> =>
+  Effect.gen(function*() {
+    const turns = yield* Turns;
+    yield* turns.admitted(yield* turns.admit(prompt, yield* Store));
+  });
+
+/**
+ * Handles the operator's prompt `prompt` as the update that brings it does, but on the store's
+ * own marks rather than an update's transaction's: its command run, or its job carried on.
+ */
+export const prompted = (prompt: IncomingPrompt): Effect.Effect<void, TelegramError | StoreError, OperatorServices> =>
+  Effect.gen(function*() {
+    const admitted = yield* admitPrompt(prompt, yield* Store);
+    if (admitted._tag === "Command") return yield* runCommand(admitted.command);
+    if (admitted._tag === "Queued") yield* Effect.flatMap(Turns, (turns) => turns.admitted(admitted.job));
+  });

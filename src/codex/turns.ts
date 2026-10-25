@@ -20,7 +20,7 @@ import { type Mount, mountOf } from "../persistence/conversation-repository.ts";
 import type { PromptJob, PromptJobState } from "../persistence/prompt-job-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import type { Turn, TurnOutcome } from "../persistence/turn-repository.ts";
-import { CurrentWorkerFence, LOST_PREFIX, Store, type TurnFenced } from "../persistence/store.ts";
+import { CurrentWorkerFence, LOST_PREFIX, Store, type TurnFenced, type UpdateMarks } from "../persistence/store.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import type { ChatId } from "../telegram/client.ts";
 import { ReceivedFileError } from "../telegram/files.ts";
@@ -82,6 +82,16 @@ const unheldTaken = meter.createCounter(UNHELD_TAKEN, {
   description: "Conversations with work left whose worker's claim no alasio held, as their alasio stopped or crashed, taken up by a pod's sweep, by the pod",
   unit: "{conversation}",
 });
+
+/**
+ * How long a prompt's update, as it is handled under its chat's lock, waits to hear whether
+ * its conversation is busy, its host asked: a few seconds, so a host not answering holds
+ * back no chat's updates for longer.
+ */
+const ADMIT_BUSY_WITHIN = Duration.seconds(5);
+
+/** How a held prompt's question is asked again where the store fails it: a few times, within a few seconds. */
+const ASKED_AGAIN = Schedule.max([Schedule.exponential("200 millis"), Schedule.recurs(4)]);
 
 /** A turn's claim of its conversation, held by another alasio's worker, as it asked. */
 class ClaimHeld extends Schema.TaggedError<ClaimHeld>()("ClaimHeld", {}) {}
@@ -184,10 +194,21 @@ const errorText = (error: unknown): string => (error instanceof Error ? error.me
  */
 export class Turns extends Context.Service<Turns, {
   /**
-   * Queues an operator's prompt as a prompt job: run as soon as the conversation is free,
-   * or, while a turn runs in it, held for the operator to say what to do with it.
+   * Queues an operator's prompt as a prompt job with `marks`, those of the transaction of the
+   * update that brought it, so the job is kept with the update's handling or not at all: to
+   * run as soon as the conversation is free, or, while a turn runs in it, held for the
+   * operator to say what to do with it. The job queued, or the one already queued for its
+   * message, which `admitted` carries on once the transaction is through.
    */
-  readonly submit: (prompt: QueuedPrompt) => Effect.Effect<void, StoreError>;
+  readonly admit: (prompt: QueuedPrompt, marks: Pick<UpdateMarks, "enqueuePromptJob">) => Effect.Effect<PromptJob, StoreError>;
+  /**
+   * Carries on the job `admit` queued, once its update's transaction is through: one held
+   * asked about, unless it was asked about already, as a turn's end asks about one held
+   * again; one pending run by the conversation's worker. A job queued whose update's alasio
+   * stopped first is carried on as well, by what takes up a conversation's waiting prompts
+   * (takeUnheld, resumePendingPrompts) and asks about one held as its turn ends.
+   */
+  readonly admitted: (job: PromptJob) => Effect.Effect<void, StoreError>;
   /** Makes sure the conversation's worker is draining its prompt jobs. */
   readonly schedule: (conversationId: string) => Effect.Effect<void>;
   /**
@@ -244,6 +265,19 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
     host.status(conversationId).pipe(
       Effect.map(({ busy }) => busy),
       Effect.catch((error) => Effect.as(Effect.logWarning(`could not tell whether ${conversationId} is busy: ${error.message}`), false)),
+    );
+  /**
+   * Whether the conversation is busy, as isBusy says, asked as a prompt's update is handled
+   * under its chat's lock, and so within ADMIT_BUSY_WITHIN: past it, taken as not busy, as
+   * where the host cannot say, the prompt's job run as the conversation is free.
+   */
+  const busyWithin = (conversationId: string): Effect.Effect<boolean> =>
+    isBusy(conversationId).pipe(
+      Effect.timeoutOption(ADMIT_BUSY_WITHIN),
+      Effect.flatMap(Option.match({
+        onNone: () => Effect.as(Effect.logWarning(`could not tell within ${Duration.format(ADMIT_BUSY_WITHIN)} whether ${conversationId} is busy`), false),
+        onSome: Effect.succeed,
+      })),
     );
   const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
   const status = yield* makeStatusReporter({
@@ -854,25 +888,31 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
   );
 
   return Turns.of({
-    submit: Effect.fnUntraced(function*({ conversationId, chatId, messageId, prompt, fileIds, visibleText }: QueuedPrompt) {
-      const traceparent = currentTraceparent();
-      const job = yield* asking.withPermit(Effect.gen(function*() {
-        const queued = yield* store.enqueuePromptJob({
-          conversationId,
-          chatId,
-          messageId,
-          prompt,
-          visibleText,
-          fileIds,
-          state: (yield* isBusy(conversationId)) ? "awaiting_choice" : "pending",
-          traceparent,
-        });
-        // Asked about once: a prompt queued already, as its update is handled again, was
-        // asked about then, its buttons kept with the question, unless asking it failed.
-        if (queued.state === "awaiting_choice" && !(yield* store.hasCallbackActionsOfJob(queued.id))) yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job: queued });
-        return queued;
-      }));
-      if (job.state === "pending") yield* schedule(conversationId);
+    admit: ({ conversationId, chatId, messageId, prompt, fileIds, visibleText }, marks) =>
+      Effect.suspend(() => {
+        const traceparent = currentTraceparent();
+        // Held or not as decided one at a time with the questions about held prompts (asking).
+        return asking.withPermit(Effect.gen(function*() {
+          const state = (yield* busyWithin(conversationId)) ? "awaiting_choice" : "pending";
+          return yield* marks.enqueuePromptJob({ conversationId, chatId, messageId, prompt, visibleText, fileIds, state, traceparent });
+        }));
+      }),
+    admitted: Effect.fnUntraced(function*(job) {
+      if (job.state === "pending") return yield* schedule(job.conversation_id);
+      if (job.state !== "awaiting_choice") return;
+      // Asked about once: one asked about already, as its update was handled before, or as its
+      // turn ended since and asked about it again, has its buttons kept with the question,
+      // unless asking it failed; asked again where the store fails it, a few times, and past
+      // them as its turn ends (askAgainOfHeld). Asked as a turn runs where one still does; where
+      // the turn ended as its update's transaction went through, its end's question missing
+      // the job not yet committed, asked as a turn's end asks, so neither comes out of turn.
+      const ended = yield* asking.withPermit(Effect.gen(function*() {
+        if (yield* store.hasCallbackActionsOfJob(job.id)) return false;
+        if (!(yield* isBusy(job.conversation_id))) return true;
+        yield* askHowToHandleConcurrentPrompt({ conversationId: job.conversation_id, chatId: job.chat_id, job });
+        return false;
+      })).pipe(Effect.retry(ASKED_AGAIN));
+      if (ended) yield* askAgainOfHeld(job.conversation_id);
     }),
     schedule,
     holding: (conversationId, work) => claims.holding(conversationId, work, recoverLeft(conversationId)),
@@ -890,7 +930,8 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
       const held = yield* asking.withPermit(Effect.gen(function*() {
         if (!(yield* isBusy(conversationId))) return false;
         const job = yield* store.enqueuePromptJob({ conversationId, chatId, messageId, prompt, state: "awaiting_choice" });
-        yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job });
+        // Asked about once: a goal's command run again finds its job held, and asked about, already.
+        if (!(yield* store.hasCallbackActionsOfJob(job.id))) yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job });
         return true;
       }));
       if (held) {

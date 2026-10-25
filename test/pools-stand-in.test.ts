@@ -10,12 +10,11 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 import { Effect } from "effect";
 
-import { Turns } from "../src/codex/turns.ts";
 import type { Harness } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { Pools, pooledStore } from "./support/pools.ts";
 import { run } from "./support/store.ts";
-import { withServices } from "./support/turns.ts";
+import { submitted, withServices } from "./support/turns.ts";
 import { eventually } from "./support/wait.ts";
 
 /** Codex, whose turns never end, as a harness that runs on does, recording each one started. */
@@ -85,7 +84,7 @@ test("a test's services end as its pod's turn runs on, its harness never ending,
   const { store, conversationId } = await conversation();
   const started: string[] = [];
   const { took, serving } = await endedAfter({ store, harnesses: { [CODEX_HARNESS]: endlessHarness(started) } }, async (alasio) => {
-    alasio.runFork(Effect.flatMap(Turns, (turns) => turns.submit({ conversationId, chatId: 41, messageId: 1, prompt: "go on", fileIds: [], visibleText: "go on" })));
+    alasio.runFork(submitted({ conversationId, chatId: 41, messageId: 1, prompt: "go on", fileIds: [], visibleText: "go on" }));
     await eventually("the turn to run in its pod", async () => (started.length > 0 ? true : undefined));
     assert.equal(await alasio.runPromise(Effect.map(Pools, (pools) => pools.bound().has(conversationId))), true);
   });
@@ -98,7 +97,7 @@ test("a test's services end as a bind of its conversation's harness is under way
   const started: string[] = [];
   const { took, serving } = await endedAfter({ store, harnesses: { [CODEX_HARNESS]: endlessHarness(started) } }, async (alasio) => {
     // Its turn asked for, and the services ended as its pod is still being bound.
-    alasio.runFork(Effect.flatMap(Turns, (turns) => turns.submit({ conversationId, chatId: 41, messageId: 1, prompt: "go on", fileIds: [], visibleText: "go on" })));
+    alasio.runFork(submitted({ conversationId, chatId: 41, messageId: 1, prompt: "go on", fileIds: [], visibleText: "go on" }));
     await eventually("its harness to be being bound", async () => (await alasio.runPromise(Effect.map(Pools, (pools) => pools.binding().has(conversationId))) ? true : undefined));
   });
   assert.ok(took < ENDS_WITHIN_MS, `the services took ${took} ms to end`);

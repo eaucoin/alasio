@@ -35,7 +35,7 @@ import { ReceivedFiles } from "../src/telegram/files.ts";
 import { newSchema, run, testPool, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 import { type MemoryTopic, memoryTopic } from "./support/topics.ts";
-import { recordingOutbox, turnsStub, withServices } from "./support/turns.ts";
+import { recordingOutbox, submitted, turnsStub, withServices } from "./support/turns.ts";
 import { inProcessEvents } from "./support/host-events.ts";
 
 /** A press taken from the store, then handled, as alasio handles one, its handling run in turn. */
@@ -388,7 +388,7 @@ test("a branch environment runs no turn in a folder, which it cannot copy, and s
   await run(store.setWorkingDirectory(conversationId, "/home/operator/project"));
   const outbox = recordingOutbox();
   await withServices({ store, outbox: outbox.layer, branch: "try" }, async (alasio) => {
-    await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.submit({ conversationId, chatId: 1001, messageId: 7, prompt: "hi", fileIds: [], visibleText: "hi" })));
+    await alasio.runPromise(submitted({ conversationId, chatId: 1001, messageId: 7, prompt: "hi", fileIds: [], visibleText: "hi" }));
     for (let waited = 0; outbox.queued.texts.length === 0 && waited < 5000; waited += 20) await new Promise((resolve) => setTimeout(resolve, 20));
     const [{ chatId, text } = { chatId: undefined, text: undefined }] = outbox.queued.texts;
     assert.equal(String(chatId), "1001");

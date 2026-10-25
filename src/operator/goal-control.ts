@@ -9,6 +9,7 @@ import type { CallbackPayload } from "../persistence/callback-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { type ChatId, TelegramClient, type TelegramError } from "../telegram/client.ts";
+import { type CommandMessage, firstTime, madeOnce } from "./made-once.ts";
 import { type ButtonDraft, type ControlCallback, closePanel, editPanel, keepPanel, type PanelDraft, sendPanel } from "./panel.ts";
 import type { NewSessionError } from "./session-control.ts";
 import { truncateText } from "./text.ts";
@@ -256,20 +257,25 @@ function buildGoalTurnPrompt(goal: v2.ThreadGoal): string {
 /**
  * Runs a goal's turn when the goal is active: attached to the turn Codex started for it,
  * if it starts one soon, or started with the goal as its prompt. Whether it took the
- * turn over, so that no idle panel is needed.
+ * turn over, so that no idle panel is needed. Asked for by a command, `once`, its message,
+ * as the command is run again after its alasio stopped (../telegram/controls.ts): asked for
+ * once, the run again taking it as taken over, as a turn its alasio left is attached to
+ * again by the next (../codex/turns.ts takeUnheld), rather than asked for twice.
  */
-const ensureGoalTurn = Effect.fnUntraced(function*({ conversationId, chatId, messageId, sessionId, goal, goals }: {
+const ensureGoalTurn = Effect.fnUntraced(function*({ conversationId, chatId, messageId, sessionId, goal, goals, once }: {
   readonly conversationId: string;
   readonly chatId: ChatId;
   readonly messageId: number;
   readonly sessionId: string;
   readonly goal: v2.ThreadGoal | null;
   readonly goals: HarnessGoals;
-}): Effect.fn.Return<boolean, GoalError, Turns> {
+  readonly once?: CommandMessage | undefined;
+}): Effect.fn.Return<boolean, GoalError, Turns | Store> {
   if (goal?.status !== "active") {
     return false;
   }
   const turnId = yield* goals.waitForTurnId(sessionId, GOAL_TURN_WAIT_MS);
+  if (once && !(yield* firstTime(once, "goal-turn"))) return true;
   return yield* Effect.flatMap(Turns, (turns) => turns.runGoalTurn({
     conversationId,
     chatId,
@@ -409,7 +415,7 @@ export const handleGoalTextCommand = Effect.fnUntraced(function*({ conversationI
         return yield* sendGoalPanel({ conversationId, chatId, isTurnActive, goals });
       }
       const goal = yield* goals.set({ threadId: sessionId, status: "active" });
-      if (yield* ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal, goals })) {
+      if (yield* ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal, goals, once: { conversationId, messageId } })) {
         return;
       }
       return yield* sendKnownGoalPanel(sessionId, goal);
@@ -420,11 +426,17 @@ export const handleGoalTextCommand = Effect.fnUntraced(function*({ conversationI
     }
 
     const currentGoal = yield* goals.read({ threadId: sessionId });
-    if (shouldConfirmBeforeReplacing(currentGoal)) {
-      return yield* send(buildReplaceGoalPanel({ currentGoal, objective: trimmed }));
+    // Set once, or asked before replacing one unfinished: a run again finds the goal its run
+    // before set, not one to ask before replacing.
+    const objective = yield* madeOnce({ conversationId, messageId }, "goal", Effect.gen(function*() {
+      if (shouldConfirmBeforeReplacing(currentGoal)) return { replacing: currentGoal } as const;
+      return { goal: yield* setFreshObjectiveGoal({ sessionId, objective: trimmed, currentGoal, goals }) } as const;
+    }));
+    if ("replacing" in objective) {
+      return yield* send(buildReplaceGoalPanel({ currentGoal: objective.replacing, objective: trimmed }));
     }
-    const goal = yield* setFreshObjectiveGoal({ sessionId, objective: trimmed, currentGoal, goals });
-    if (yield* ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal, goals })) {
+    const { goal } = objective;
+    if (yield* ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal, goals, once: { conversationId, messageId } })) {
       return;
     }
     yield* sendKnownGoalPanel(sessionId, goal);

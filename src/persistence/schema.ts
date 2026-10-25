@@ -261,19 +261,29 @@ create table if not exists ${SCHEMA}.callback_actions (
   created_at timestamptz not null default now()
 );
 
--- Each press whose control runs on past its update (src/telegram/presses.ts), by its query's
--- id, kept as its update is told handled until the control is done: held by the alasio
+-- Each control whose work runs on past its update (src/telegram/controls.ts), a press of
+-- alasio's buttons or a command the operator sent, by its query's id or its message, kept as
+-- its update is told handled until it is done: what it is (control), held by the alasio
 -- running it, by its token, until held_until, which that alasio renews as it runs, so one
--- left by an alasio that stopped is run again by another; and its answer, where its control
--- was done but the answer could not be queued, which the next look queues alone.
-create table if not exists ${SCHEMA}.press_jobs (
+-- left by an alasio that stopped is run again by another; and its answer, where a press was
+-- done but the answer could not be queued, which the next look queues alone.
+create table if not exists ${SCHEMA}.control_jobs (
   id text primary key,
   conversation_id text not null references ${SCHEMA}.conversations (id) on delete cascade,
-  callback_query jsonb not null,
-  action jsonb not null,
+  control jsonb not null,
   holder text not null,
   held_until timestamptz not null,
   answer text,
+  created_at timestamptz not null default now()
+);
+
+-- What a control made, a session, a fork, a folder or a goal, or that it asked for a goal's
+-- turn, by a key its message names
+-- (src/operator/made-once.ts): so a control run again, as a kept one is after its alasio
+-- stopped, finds what its run before made rather than make another.
+create table if not exists ${SCHEMA}.control_results (
+  key text primary key,
+  result jsonb not null,
   created_at timestamptz not null default now()
 );
 

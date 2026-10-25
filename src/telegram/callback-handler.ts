@@ -78,7 +78,7 @@ export const takeCallbackQuery = (callbackQuery: CallbackQuery): Effect.Effect<P
   Effect.map(takePress(callbackQuery), ({ handling }) => handling);
 
 /**
- * A press taken before, and kept as its control ran on past its update (./presses.ts), run
+ * A press taken before, and kept as its control ran on past its update (./controls.ts), run
  * again from its action, as the alasio that ran it stopped first: its user was let press it,
  * and its action consumed, as it was taken; the conversation's mount is read anew.
  */
