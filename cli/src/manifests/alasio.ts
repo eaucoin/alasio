@@ -387,10 +387,11 @@ function namespaces(config: InstallConfig, environment: Environment): V1Namespac
 }
 
 /**
- * alasio's identity: it labels its own pod busy while turns run in it (src/kube/busy.ts), and
- * keeps the time of its last start in a ConfigMap of its own, made here empty, which it may
- * read and patch alone (src/kube/started.ts); nothing else. Its sessions and its folder
- * workspaces are the sandbox gateway's, which it reaches by its key alone.
+ * alasio's identity: it labels its own pod busy while turns run in it (src/kube/busy.ts),
+ * reads it to stop as it is deleted (src/kube/own-pod.ts), and keeps the time of its last
+ * start in a ConfigMap of its own, made here empty, which it may read and patch alone
+ * (src/kube/started.ts); nothing else. Its sessions and its folder workspaces are the sandbox
+ * gateway's, which it reaches by its key alone.
  */
 function identity(config: InstallConfig, environment: Environment): KubernetesObject[] {
   const inOwnNamespace = { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") };
@@ -399,7 +400,7 @@ function identity(config: InstallConfig, environment: Environment): KubernetesOb
     kind: "Role",
     metadata: inOwnNamespace,
     rules: [
-      { apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] },
+      { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "patch"] },
       { apiGroups: [""], resources: ["configmaps"], resourceNames: [STARTED_CONFIG_MAP], verbs: ["get", "patch"] },
     ],
   };

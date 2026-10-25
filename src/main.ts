@@ -12,6 +12,7 @@ import { loadAlasioConfig } from "./config.ts";
 import { EnvironmentEvents } from "./events/consume.ts";
 import { Events } from "./events/events.ts";
 import { indexTranscripts } from "./harness/claude/search/index.ts";
+import { stopsAsItsPodIsDeleted } from "./kube/own-pod.ts";
 import { Neon } from "./neon/connect.ts";
 import { LakeWake } from "./neon/lake-wake.ts";
 import { serveAlasio } from "./alasio.ts";
@@ -20,6 +21,8 @@ import { runAlasio } from "./shared/run.ts";
 import { TelegramUpdates } from "./telegram/update-consumer.ts";
 
 const alasio = Effect.gen(function*() {
+  // Before all else, as a SIGTERM may be lost as alasio starts: its pod's deletion stops it as one would.
+  yield* stopsAsItsPodIsDeleted;
   const config = loadAlasioConfig();
   // alasio's state, Claude Code's transcripts and Codex's rollouts are kept in alasio's
   // Neon, which the deployment runs, and which its harness pools' pods write as their turns

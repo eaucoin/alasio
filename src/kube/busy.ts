@@ -23,6 +23,7 @@ import { Config, Context, Deferred, type Duration, Effect, Layer, Option, Scope 
 
 import { BUSY_ANNOTATIONS, BUSY_LABEL } from "./busy-label.ts";
 import { hasStatus, KubeClient } from "./client.ts";
+import { ownPod } from "./own-pod.ts";
 
 /** A pod, by its namespace and name. */
 export interface PodRef {
@@ -64,8 +65,8 @@ export class BusyPods extends Context.Service<BusyPods, {
   readonly hold: Effect.Effect<void, never, Scope.Scope>;
 }>()("alasio/kube/BusyPods") {
   /**
-   * On the KubeClient, alasio's own pod as its Deployment names it (ALASIO_POD,
-   * ALASIO_NAMESPACE), none outside a pod; sweeping alasio's namespace.
+   * On the KubeClient, alasio's own pod as its Deployment names it (./own-pod.ts ownPod),
+   * none outside a pod; sweeping alasio's namespace.
    */
   static readonly layer = ({ refresh = "10 seconds", sweep = "1 minute" }: BusyPodsOptions): Layer.Layer<BusyPods, Config.ConfigError, KubeClient> =>
     Layer.effect(
@@ -73,9 +74,8 @@ export class BusyPods extends Context.Service<BusyPods, {
       Effect.gen(function*() {
         const kube = yield* KubeClient;
         const scope = yield* Effect.scope;
-        const name = yield* Config.option(Config.String("ALASIO_POD"));
-        const namespace = yield* Config.String("ALASIO_NAMESPACE").pipe(Config.withDefault("alasio"));
-        const own = Option.map(name, (pod): PodRef => ({ namespace, name: pod }));
+        const own = yield* ownPod;
+        const namespace = Option.match(own, { onNone: () => "alasio", onSome: (pod) => pod.namespace });
         const held = new Map<string, Held>();
         const keyOf = (pod: PodRef): string => `${pod.namespace}/${pod.name}`;
 
