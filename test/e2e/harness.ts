@@ -1296,6 +1296,17 @@ export async function dumpClusterState(): Promise<void> {
         for (const line of logged.trimEnd().split("\n")) say(`  ${line}`);
       }
     }
+    // And each session's bayma bound in a sandbox pool's pod, its last lines, and before it restarted where it did: its own
+    // account of the MCP sessions its clients held, which it closes where they answer no ping, and of its sandbox's saves.
+    for (const pod of pods.filter((each) => each.metadata?.labels?.[BINDING_LABEL] !== undefined && each.metadata.labels[POOL_LABEL] !== FOLDER_POOL && (each.spec?.containers ?? []).some(({ name }) => name === BAYMA_CONTAINER))) {
+      const { namespace = "", name = "" } = pod.metadata ?? {};
+      const restarted = (pod.status?.containerStatuses ?? []).some(({ name: container, restartCount }) => container === BAYMA_CONTAINER && restartCount > 0);
+      for (const previous of restarted ? [true, false] : [false]) {
+        const logged = await logsOf(namespace, name, BAYMA_CONTAINER, { previous });
+        say(`--- logs of ${BAYMA_CONTAINER} of the sandbox ${namespace}/${name}${previous ? ", before it restarted" : ""}:`);
+        for (const line of logged.trimEnd().split("\n").slice(-200)) say(`  ${line}`);
+      }
+    }
   } catch (error) {
     say(`the cluster's state could not be read: ${error instanceof Error ? error.message : String(error)}`);
     // Its API gone, what its nodes say of themselves, their containers' state among it.
