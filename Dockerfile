@@ -49,6 +49,10 @@ COPY src src
 COPY neon/control neon/control
 
 ENV NODE_ENV=production
+# The commit the image was built from, which alasio's telemetry says (src/telemetry/start.ts):
+# none where the build is given none.
+ARG REVISION=
+ENV ALASIO_REVISION=${REVISION}
 # tini reaps what the harnesses leave behind and passes SIGTERM on, so alasio shuts
 # down cleanly when its pod stops.
 ENTRYPOINT ["/usr/bin/tini", "--"]

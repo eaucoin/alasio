@@ -3,10 +3,6 @@
  * alasio is loaded (see src/index.ts), and stops it, flushing what it holds, as alasio
  * exits. With no signal to export the SDK is never loaded.
  */
-import { execFileSync } from "node:child_process";
-import { dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-
 import { diag, type DiagLogFunction, type DiagLogger, DiagLogLevel } from "@opentelemetry/api";
 import type { NodeSDK } from "@opentelemetry/sdk-node";
 
@@ -17,17 +13,17 @@ const INSTRUMENTED_MODULES = ["pg", "pg-pool", "http", "https", "node:http", "no
 
 let sdk: NodeSDK | null = null;
 
-/** The commit alasio runs from, or null outside a git checkout. */
-function revision(): string | null {
-  try {
-    return execFileSync("git", ["rev-parse", "HEAD"], {
-      cwd: dirname(fileURLToPath(import.meta.url)),
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-  } catch {
-    return null;
-  }
+/** The variable alasio's image says the commit it was built from in (Dockerfile's REVISION). */
+export const REVISION_VARIABLE = "ALASIO_REVISION";
+
+/**
+ * What alasio's telemetry says of the service it is of: alasio, and the commit its image was
+ * built from, where the image says one (REVISION_VARIABLE); none is asked of git as alasio
+ * starts, which would spawn a process on its way to its first answer. Pure, for tests.
+ */
+export function serviceAttributes(env: Readonly<NodeJS.ProcessEnv>): Record<string, string> {
+  const revision = env[REVISION_VARIABLE]?.trim();
+  return { "service.name": "alasio", ...(revision ? { "vcs.ref.head.revision": revision } : {}) };
 }
 
 /** The SDK's own problems, exporting above all, as alasio logs: on the console only. */
@@ -61,13 +57,9 @@ export async function startTelemetry(env: NodeJS.ProcessEnv = process.env): Prom
     import("@opentelemetry/instrumentation-pg"),
     import("@opentelemetry/instrumentation-runtime-node"),
   ]);
-  const commit = revision();
   sdk = new NodeSDK({
     // OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES, read by the SDK, override these.
-    resource: defaultResource().merge(resourceFromAttributes({
-      "service.name": "alasio",
-      ...(commit ? { "vcs.ref.head.revision": commit } : {}),
-    })),
+    resource: defaultResource().merge(resourceFromAttributes(serviceAttributes(env))),
     instrumentations: [
       new HttpInstrumentation(),
       // Queries outside a trace (the transcript indexer's polling) would each be a

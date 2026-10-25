@@ -137,7 +137,10 @@ jobs:
                 tooling/push-estargz.sh "$PUSH_TO/$name:e2e" test --file test/e2e/harness-stand-ins.Dockerfile \
                   --build-arg "ALASIO=ghcr.io/eaucoin/alasio:$PREVIOUS" --label "org.opencontainers.image.source=$SOURCE"
               else
-                tooling/push-estargz.sh "$PUSH_TO/$name:e2e" "${image#*:}" --label "org.opencontainers.image.source=$SOURCE" &&
+                # alasio's own, with the commit it is built from, which its telemetry says.
+                revision=()
+                if [ "$name" = alasio ]; then revision=(--build-arg "REVISION=$GITHUB_SHA"); fi
+                tooling/push-estargz.sh "$PUSH_TO/$name:e2e" "${image#*:}" "${revision[@]}" --label "org.opencontainers.image.source=$SOURCE" &&
                   if [ "$name" = alasio ]; then
                     tooling/push-estargz.sh "$PUSH_TO/alasio-harness-stand-ins:e2e" test --file test/e2e/harness-stand-ins.Dockerfile \
                       --build-arg "ALASIO=$PUSH_TO/alasio:e2e" --label "org.opencontainers.image.source=$SOURCE"

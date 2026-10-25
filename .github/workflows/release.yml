@@ -99,7 +99,10 @@ jobs:
                 docker build "${args[@]}" --tag "$REGISTRY/$name:$VERSION" "${labels[@]}" "${image#*:}" &&
                   docker push "$REGISTRY/$name:$VERSION"
               else
-                METADATA="$RUNNER_TEMP/$name.json" tooling/push-estargz.sh "$REGISTRY/$name:$VERSION" "${image#*:}" "${labels[@]}"
+                # alasio's own, with the commit it is built from, which its telemetry says.
+                revision=()
+                if [ "$name" = alasio ]; then revision=(--build-arg "REVISION=$GITHUB_SHA"); fi
+                METADATA="$RUNNER_TEMP/$name.json" tooling/push-estargz.sh "$REGISTRY/$name:$VERSION" "${image#*:}" "${revision[@]}" "${labels[@]}"
               fi
             } 2>&1 | sed -u "s/^/$name: /" &
             pids[$name]=$!
