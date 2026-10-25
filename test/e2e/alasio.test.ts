@@ -124,10 +124,22 @@ before(async () => {
   }
 }, { timeout: 120 * 60_000 });
 
-afterEach(async (t) => {
-  // Node says on a test's context whether it passed, once it has run.
-  if ("passed" in t && t.passed === false) await dumpClusterState();
-});
+/** Whether the test of the context `t` failed, as Node says on it once the test has run. */
+const failed = (t: object): boolean => "passed" in t && t.passed === false;
+/** The tests the cluster's state was said for as they failed, by their full names. */
+const stateSaid = new Set<string>();
+/**
+ * What the cluster was doing as the test of the context `t` failed, said once for it: by a
+ * suite's afterEach that changes the cluster after a failure, before it does, as Node runs a
+ * suite's afterEach before those of the suites around it; by this one otherwise.
+ */
+async function sayStateOfFailure(t: { readonly fullName: string }): Promise<void> {
+  if (!failed(t) || stateSaid.has(t.fullName)) return;
+  stateSaid.add(t.fullName);
+  await dumpClusterState();
+}
+
+afterEach(sayStateOfFailure);
 
 after(async () => {
   await tearDown();
@@ -3625,6 +3637,45 @@ if (inShard("agents")) {
     };
     /** What alasio's pod logged. */
     const alasioLogged = async () => kube.logs(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), "alasio").catch(String);
+    /** How many turns the harness of the pod `name` has started, as its Codex runtime logs the first event of each. */
+    const turnsStartedOn = async (name: string): Promise<number> =>
+      ((await kube.logs(NAMESPACE, name, "harness").catch(() => "")).match(/turn_timing label=first_event .*event_type="turn\.started"/gu) ?? []).length;
+
+    /**
+     * The operator's conversation left with no turn running and no prompt held: its turn stopped
+     * (/stop) until alasio says none runs, twice in a row, each prompt it asks about meanwhile
+     * discarded, as a prompt held keeps its service from being switched, and a turn left running
+     * keeps the next prompts from running.
+     */
+    const settle = async (): Promise<void> => {
+      for (let deadline = Date.now() + 5 * 60_000, idle = 0; idle < 2;) {
+        assert.ok(Date.now() < deadline, "the conversation was not settled within 5 minutes");
+        await tg.say("/stop");
+        const got: RecordedCall[] = [];
+        for (const answered = Date.now() + 60_000; !got.some(({ payload }) => payload.text === "No active query to stop." || payload.text?.startsWith("Stopping ")); await sleep(500)) {
+          assert.ok(Date.now() < answered, "alasio did not answer /stop within 60 s");
+          got.push(...(await tg.calls()));
+        }
+        // What it asks of the prompts it held comes once the turn has ended.
+        await sleep(5_000);
+        got.push(...(await tg.calls()));
+        let discarded = 0;
+        for (const button of got.flatMap((call) => tg.buttons(call))) {
+          if (button.text !== "Discard" || !("callback_data" in button)) continue;
+          await tg.press(button.callback_data);
+          discarded += 1;
+        }
+        idle = got.some(({ payload }) => payload.text === "No active query to stop.") && discarded === 0 ? idle + 1 : 0;
+      }
+    };
+    // A test that failed may leave its turn running, or prompts held, to the tests after it, which would then fail for it
+    // alone: the conversation settled after it, the cluster's state said first, as it failed, and what settling fails at
+    // only said, so that the failure stays the test's own.
+    afterEach(async (t) => {
+      if (!failed(t)) return;
+      await sayStateOfFailure(t);
+      await settle().catch((error: unknown) => t.diagnostic(`the conversation was not settled after the failure: ${error instanceof Error ? error.message : String(error)}`));
+    });
 
     test("a session conversation's turn runs on a pod of its harness's pool, bound to it through the gateway, and the next on the same", async () => {
       session = await newSession("none");
@@ -3843,10 +3894,15 @@ if (inShard("agents")) {
 
     test("an instance killed mid-turn has its turn run again once, on another, the chat told so", { timeout: 15 * 60_000 }, async () => {
       const bound = await boundNow();
+      const name = bound.metadata?.name ?? "";
+      const startedBefore = await turnsStartedOn(name);
       await tg.calls();
       await tg.say("wait 600");
       await working("Codex");
-      await kube.kill(NAMESPACE, bound.metadata?.name ?? "");
+      // Killed once its turn runs there: the turn's status says it works before its pod is given it, and a pod killed
+      // before is no loss, the turn started on the pod bound anew instead (../../src/harness/pooled-host.ts).
+      await until("the turn started on its pod", async () => ((await turnsStartedOn(name)) > startedBefore ? true : undefined), 120_000);
+      await kube.kill(NAMESPACE, name);
       // Told so, and its recovery prompt answered on a pod of its own, once, which may come together.
       const [, recovered] = await tg.waitForEach([
         (call) => call.method === "editMessageText" && call.payload.text === "Codex's harness was lost during this turn; it runs again on another.",
