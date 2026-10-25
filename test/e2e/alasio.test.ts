@@ -4088,6 +4088,8 @@ if (inShard("agents")) {
       await until(`answer ${count}`, async () => ((await answeredSince(mark)) >= count ? true : undefined), timeoutMs);
     };
 
+    /** How long a prompt sent as a rollout ends, the old alasios stopping still, may take to be answered: a take over of its conversation, and its turn. */
+    const PROMPT_AS_ROLLED_OUT_MS = 90_000;
     /** The alasios' pods there are, stopping or not. */
     const allAlasioPods = () => kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("alasio")) });
     /** The alasios' pods that run now, none of them stopping. */
@@ -4107,14 +4109,33 @@ if (inShard("agents")) {
       const old = await alasioPods();
       const before = await driving();
       assert.ok(old.length === 2 && old.includes(before), `driven by ${before}, of ${old.join(", ")}`);
+      // How long each old one took to stop, from when it was told to (its deletion) until it was gone.
+      const stops = new Map<string, { told?: number; gone?: number }>(old.map((name) => [name, {}]));
+      let watching = true;
+      const watched = (async () => {
+        while (watching) {
+          const pods = await allAlasioPods();
+          for (const [name, stop] of stops) {
+            const pod = pods.find(({ metadata }) => metadata?.name === name);
+            if (pod?.metadata?.deletionTimestamp && stop.told === undefined) stop.told = Date.now();
+            if (!pod && stop.gone === undefined) stop.gone = Date.now();
+          }
+          await sleep(500);
+        }
+      })();
       // Rolled out as the prompts go on, each conversation then driven by the alasio that takes its claim.
       const rolling = alasioOk("restart");
       for (let count = 4; count <= 6; count += 1) await askAnswered(mark, count, 600_000);
       await rolling;
-      // One more once the old are all gone, as each runs out its grace delivering what it owes,
-      // which one of the new takes the conversation over for.
-      await until("the old alasios gone", async () => ((await allAlasioPods()).some(({ metadata }) => old.includes(metadata?.name ?? "")) ? undefined : true), 600_000);
-      await askAnswered(mark, 7, 600_000);
+      // One more as the rollout ends, the old perhaps stopping still: answered within its bound, as
+      // an alasio told to stop lets go of its claims at once (src/codex/worker-claims.ts).
+      const asked = Date.now();
+      await askAnswered(mark, 7, PROMPT_AS_ROLLED_OUT_MS);
+      const answeredIn = Date.now() - asked;
+      await until("the old alasios gone", async () => ([...stops.values()].every(({ gone }) => gone !== undefined) ? true : undefined), 600_000);
+      watching = false;
+      await watched;
+      console.log(`# the prompt as the rollout ended answered in ${answeredIn} ms; the old alasios stopped in ${[...stops].map(([name, { told = 0, gone = 0 }]) => `${name} ${gone - told} ms`).join(", ")}`);
       const after = await driving();
       const now = await alasioPods();
       assert.ok(!old.includes(after) && now.includes(after), `driven by ${before}, then by ${after}, of ${now.join(", ")}`);

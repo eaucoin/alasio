@@ -9,7 +9,11 @@
  * Within an alasio, the claim is shared by whatever drives the conversation at once (its
  * worker, a turn run outside it, a turn attached to again): taken by the first, renewed every
  * WORKER_CLAIM_RENEWAL while any holds it, and let go of once the last ends, for another alasio
- * to take at once. One that stops lets go of every claim it holds. One that stops renewing, as
+ * to take at once. One told to stop (SIGTERM) takes none from then on, and what holds its claims
+ * is interrupted at once, not once its drain is through (../telegram/drain.ts): a turn so
+ * interrupted is left running on its harness's pod for the next alasio to attach to, and its
+ * claim let go of, so another alasio takes the conversation over at once, as it does every
+ * claim it still holds as it ends. One that stops renewing, as
  * it crashed or stalled, has its claims lapse WORKER_CLAIM_LIFE after its last renewal; an
  * alasio's sweep of the conversations with work left that none holds (Turns.takeUnheld), every
  * WORKER_SWEEP_EVERY, takes them up, so a conversation is driven again within
@@ -75,11 +79,19 @@ export interface WorkerClaimTimings {
   readonly renewal: Duration.Input;
 }
 
-/** What WorkerClaims is made with: the name of the pod it is of, as the module says, and its timings. */
+/** What WorkerClaims is made with: the name of the pod it is of, as the module says, its timings, and what tells it alasio is told to stop, SIGTERM or SIGINT but for tests. */
 export interface WorkerClaimsOptions {
   readonly pod: string;
   readonly timings?: WorkerClaimTimings | undefined;
+  readonly told?: Effect.Effect<void> | undefined;
 }
+
+/** Waits until the process is told to stop: its first SIGTERM or SIGINT. */
+const toldToStop: Effect.Effect<void> = Effect.callback<void>((resume) => {
+  const hear = () => resume(Effect.void);
+  process.once("SIGTERM", hear).once("SIGINT", hear);
+  return Effect.sync(() => void process.off("SIGTERM", hear).off("SIGINT", hear));
+});
 
 /**
  * A conversation's claim as this alasio holds it: by how many at once, whether what the last
@@ -113,8 +125,11 @@ export interface WorkerClaims {
   readonly lapseOwn: Effect.Effect<number, StoreError>;
 }
 
-export const makeWorkerClaims = Effect.fnUntraced(function*({ pod, timings = { life: WORKER_CLAIM_LIFE, renewal: WORKER_CLAIM_RENEWAL } }: WorkerClaimsOptions) {
+export const makeWorkerClaims = Effect.fnUntraced(function*({ pod, timings = { life: WORKER_CLAIM_LIFE, renewal: WORKER_CLAIM_RENEWAL }, told = toldToStop }: WorkerClaimsOptions) {
   const store = yield* Store;
+  /** Done once alasio is told to stop, as the module says. */
+  const stopping = yield* Deferred.make<void>();
+  yield* Effect.forkScoped(Effect.andThen(told, Deferred.succeed(stopping, undefined)));
   const holder = `${pod}/${randomUUID()}`;
   const lifeMs = Duration.toMillis(timings.life);
   const held = new Map<string, Held>();
@@ -177,6 +192,8 @@ export const makeWorkerClaims = Effect.fnUntraced(function*({ pod, timings = { l
   /** join's ask, untimed: the claim, and whether it was taken now. */
   const joining = <R>(conversationId: string, restore: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>, recover: Effect.Effect<void, StoreError, R>): Effect.Effect<Option.Option<{ readonly entry: Held; readonly taken: boolean }>, StoreError, R> =>
     lockOf(conversationId).withPermit(Effect.gen(function*() {
+      // Told to stop, it takes no claim, nor joins one it holds, for another alasio to take.
+      if (yield* Deferred.isDone(stopping)) return Option.none();
       const entry = held.get(conversationId);
       if (entry) {
         entry.users += 1;
@@ -205,10 +222,11 @@ export const makeWorkerClaims = Effect.fnUntraced(function*({ pod, timings = { l
       );
     }));
 
-  /** `work` under `entry`'s claim, interrupted where it is found taken over. */
+  /** `work` under `entry`'s claim, failing where it is found taken over, interrupted as alasio is told to stop. */
   const under = <A, E, R>(conversationId: string, entry: Held, work: Effect.Effect<A, E, R>): Effect.Effect<A, E | WorkerClaimLost, R> =>
     work.pipe(
       Effect.raceFirst(Effect.andThen(Deferred.await(entry.lost), Effect.fail(new WorkerClaimLost({ conversationId })))),
+      Effect.raceFirst(Effect.andThen(Deferred.await(stopping), Effect.interrupt)),
       Effect.provideService(CurrentWorkerFence, entry.fence),
     );
 

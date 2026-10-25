@@ -59,6 +59,33 @@ test("what runs under a claim another alasio took over is interrupted as a renew
   }
 });
 
+test("told to stop, an alasio interrupts what holds its claims and lets them go at once, its scope open still, and takes none from then on", { timeout: 30_000 }, async () => {
+  const { store, ids: [driven = "", later = ""] } = await conversations(2);
+  const scope = Effect.runSync(Scope.make());
+  try {
+    const told = Effect.runSync(Deferred.make<void>());
+    const claims = await claimsOf(store, scope, { pod: "pod-a", told: Deferred.await(told) });
+    const interrupted = { work: false };
+    const holding = Effect.runFork(claims.holding(driven, Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => void (interrupted.work = true)))), Effect.void));
+    await sleep(200);
+    // Held: no other alasio takes it.
+    assert.equal(await run(store.claimWorker(driven, "pod-b/x", 60_000)), null);
+    Effect.runSync(Deferred.succeed(told, undefined));
+    const ended = await Effect.runPromise(Fiber.await(holding).pipe(Effect.timeout("2 seconds")));
+    assert.ok(Exit.isFailure(ended) && Cause.hasInterruptsOnly(ended.cause), String(ended));
+    assert.equal(interrupted.work, true);
+    // Let go of: another alasio takes it at once.
+    assert.notEqual(await run(store.claimWorker(driven, "pod-b/x", 60_000)), null);
+    // And none taken from then on: nothing runs under one.
+    const ran = { work: false };
+    assert.deepEqual(await Effect.runPromise(claims.holding(later, Effect.sync(() => void (ran.work = true)), Effect.void)), Option.none());
+    assert.equal(ran.work, false);
+    assert.notEqual(await run(store.claimWorker(later, "pod-b/x", 60_000)), null);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+});
+
 test("what joins a claim this alasio took, as a press's steer joins the claim the conversation's worker took as alasio started, runs only once what the last holder left is recovered, and fails where its recovery failed", { timeout: 30_000 }, async () => {
   const { store, ids: [recovered = "", failed = ""] } = await conversations(2);
   const scope = Effect.runSync(Scope.make());

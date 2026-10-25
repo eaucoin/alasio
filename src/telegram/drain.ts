@@ -3,11 +3,14 @@
  * (./stop.ts): its member of its environment's Telegram group gone first, so another alasio,
  * or one woken for them, takes the updates that come meanwhile (the group's member finishes
  * the update in hand and leaves the group as it ends, ../log/consume.ts); then the albums due
- * made prompts of, and every reply due delivered, as none is delivered by an alasio that is not
- * running, Telegram's waits among them, which a delivery waits out as it sends (./outbox.ts):
- * until none is due, or the drain's bound, whichever comes first. The bound counts from when
- * alasio was told to stop, as its grace does, so the whole stop, the update in hand among it,
- * fits the grace. A reply put off after it failed otherwise, its next attempt later, is the
+ * made prompts of, and the replies due as the drain begins delivered, Telegram's waits among
+ * them, which a delivery waits out as it sends (./outbox.ts): until none of them is due still,
+ * or the drain's bound, whichever comes first. What comes due after it begins is another
+ * alasio's, as the turns this one drove are left running for the next to attach to as it is
+ * told to stop (../codex/worker-claims.ts): so the drain waits on no other alasio's turns, nor
+ * holds up the conversations of its own, which they take over at once. The bound counts from
+ * when alasio was told to stop, as its grace does, so the whole stop, the update in hand among
+ * it, fits the grace. A reply put off after it failed otherwise, its next attempt later, is the
  * next alasio's, as is what the bound leaves: a chat Telegram keeps refusing does not hold an
  * alasio's stop.
  */
@@ -43,6 +46,9 @@ export const stopToldAt: Effect.Effect<Effect.Effect<number | null>, never, Scop
 /** How long the drain waits before it looks again at what another alasio's pass holds. */
 const DRAIN_LOOKS_EVERY = Duration.millis(200);
 
+/** The most replies due a drain takes as owed as it begins: what is due past them is the next alasio's. */
+const OWED_AT_MOST = 1000;
+
 /** The drain, as the module says, for at most `bound` after `toldAt` says alasio was told to stop, or after it begins where that says none. */
 export const drain = ({ bound = DRAIN_BOUND, toldAt = Effect.succeed(null) }: {
   readonly bound?: Duration.Input;
@@ -55,14 +61,17 @@ export const drain = ({ bound = DRAIN_BOUND, toldAt = Effect.succeed(null) }: {
     yield* Effect.logInfo(DRAINING);
     const until = ((yield* toldAt) ?? (yield* Clock.currentTimeMillis)) + Duration.toMillis(bound);
     yield* mediaGroups.flushDue;
-    // Delivered until none is due: what an album's prompt or a turn queues meanwhile among it.
+    const dueNow = store.getDueOutbox(OWED_AT_MOST).pipe(Effect.catch(() => Effect.succeed([])));
+    const owed = new Set((yield* dueNow).map(({ id }) => id));
+    // Delivered until none of what it owes is due still: the chats it owes a reply in alone, as
+    // another's, held off by Telegram, would hold its stop.
     for (;;) {
       const remaining = until - (yield* Clock.currentTimeMillis);
-      const due = (yield* store.getDueOutbox(1).pipe(Effect.catch(() => Effect.succeed([])))).length;
-      if (due === 0) return;
+      const chats = new Set((yield* dueNow).filter(({ id }) => owed.has(id)).map(({ chat_id: chat }) => chat));
+      if (chats.size === 0) return;
       if (remaining <= 0) return yield* Effect.logWarning("alasio stops with replies still due, which the next alasio delivers");
       // Cut short at the bound only where it waits out Telegram's wait, as a delivery is.
-      yield* outbox.deliverDue.pipe(
+      yield* Effect.forEach(chats, (chat) => outbox.deliverChat(chat), { concurrency: "unbounded", discard: true }).pipe(
         Effect.timeoutOption(Duration.millis(remaining)),
         Effect.catch((error) => Effect.logWarning(`delivering as alasio stops failed: ${error.message}`)),
       );

@@ -18,11 +18,17 @@ import { Outbox } from "../src/telegram/outbox.ts";
 import { botApiError, botApiLayer } from "./support/bot-api.ts";
 import { testStore } from "./support/store.ts";
 
-/** How a drain is run (drained): how long it is bound to, from how long ago alasio was told to stop (from the drain's start, unless given), and whether its replies are queued straight into the store, waking no delivery of the outbox's own, so the drain's delivers them. */
+/**
+ * How a drain is run (drained): how long it is bound to, from how long ago alasio was told to
+ * stop (from the drain's start, unless given), whether its replies are queued straight into the
+ * store, waking no delivery of the outbox's own, so the drain's delivers them, and a reply queued
+ * as one of them is sent, as another alasio's turn queues one, where given.
+ */
 interface Drained {
   readonly bound: Duration.Input;
   readonly toldAgo?: Duration.Input;
   readonly unwoken?: boolean;
+  readonly meanwhile?: { readonly after: string; readonly text: string };
 }
 
 /**
@@ -30,7 +36,7 @@ interface Drained {
  * send as `answer` says (an error's status and how many seconds it asks to be waited for, or
  * null to accept): what was sent, the albums flushed, and how many replies are left.
  */
-async function drained(texts: readonly string[], answer: (text: string, asked: number) => { readonly status: number; readonly retryAfter: number } | null, { bound, toldAgo, unwoken = false }: Drained) {
+async function drained(texts: readonly string[], answer: (text: string, asked: number) => { readonly status: number; readonly retryAfter: number } | null, { bound, toldAgo, unwoken = false, meanwhile }: Drained) {
   const store = await testStore();
   const sent: string[] = [];
   const asked = new Map<string, number>();
@@ -41,6 +47,7 @@ async function drained(texts: readonly string[], answer: (text: string, asked: n
     const refusal = answer(text, asked.get(text) ?? 0);
     if (refusal) throw botApiError("Too Many Requests", refusal.status, refusal.retryAfter);
     sent.push(text);
+    if (text === meanwhile?.after) await Effect.runPromise(store.enqueueOutboxText({ chatId: 43, text: meanwhile.text, options: { format: "plain" }, traceparent: null }));
     return { message_id: sent.length, date: 0, chat: { id: 42, type: "private", first_name: "Operator" } };
   });
   const albums = Layer.succeed(MediaGroups, MediaGroups.of({ buffer: () => Effect.die("no album comes as alasio stops"), flushDue: Effect.sync(() => void flushed++) }));
@@ -64,6 +71,15 @@ test("delivers every reply queued, one Telegram holds off for a while among them
   // The first refused once, Telegram asking to be waited for a second.
   const { sent, flushed, left } = await drained(["first", "second"], (text, asked) => (text === "first" && asked === 1 ? { status: 429, retryAfter: 1 } : null), { bound: "30 seconds" });
   assert.deepEqual([sent, flushed, left], [["first", "second"], 1, 0]);
+});
+
+test("delivers the replies due as it began alone, ending while another alasio's turn queues more, which are that alasio's to deliver", async () => {
+  const started = Date.now();
+  // Another's, queued as the drain's own is sent, Telegram holding it off for a minute; the
+  // drain's queued unwoken, so that it is the drain that owes and sends it.
+  const { sent, left } = await drained(["owed"], (text) => (text === "theirs" ? { status: 429, retryAfter: 60 } : null), { bound: "30 seconds", unwoken: true, meanwhile: { after: "owed", text: "theirs" } });
+  assert.deepEqual([sent, left], [["owed"], 1]);
+  assert.ok(Date.now() - started < 10_000, `the drain waited ${Date.now() - started} ms for another alasio's reply`);
 });
 
 test("leaves a reply put off after it failed otherwise for the next alasio, and ends without waiting for it", async () => {
