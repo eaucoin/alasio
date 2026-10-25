@@ -67,19 +67,28 @@
  * route, its stamps and its requests under way, is by its pool and key, never its key alone,
  * as environments share keys (a branch's forks of main's sessions keep their ids), each
  * binding its own.
+ *
+ * As its scope closes, as its pod is told to stop (STOP_GRACE_SECONDS), it takes no new
+ * connection at once, its listener closed, so that one made meanwhile, routed to it still as
+ * its endpoints are let go of, is refused at once rather than left to wait on a pod gone; and a
+ * request that comes on a connection it kept, as a keep-alive caller's, is answered 503 saying
+ * no pod was given it (NOT_PASSED_HEADER), for its caller to ask again, its connection closed.
+ * It lets its requests under way end, each told to close its connection as it does, its
+ * callers' streams but, for STOP_CALLS_MS at most, and runs on for STOP_LINGER_MS at least, so it is there to
+ * refuse while the routes to it are let go of; what is left then, the streams among it, is cut.
  */
 import { createHmac } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { Clock, Effect, Option, Schema, type Scope } from "effect";
+import { Clock, Deferred, Effect, Exit, Option, Schema, type Scope } from "effect";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken } from "../shared/tokens.ts";
 import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
 import { boundIn, counts, touchLease } from "./bindings.ts";
-import { EVENTS_PATH, NO_BIND_HEADER, NOT_PASSED_HEADER, PINNED_HEADER, type Pool } from "./names.ts";
+import { EVENTS_PATH, GATEWAY_READINESS, NO_BIND_HEADER, NOT_PASSED_HEADER, PINNED_HEADER, type Pool, STOP_GRACE_SECONDS } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
 import type { Held } from "./live.ts";
 import { bindingToken, type HeldTo, mintToken, type TokenClaims, verifyToken } from "./tokens.ts";
@@ -158,6 +167,18 @@ export const RELEASE_HOLD_MS = 5 * 60_000;
 const FLIGHTS_POLL_MS = 250;
 /** How long a token a replica asks a peer of a binding's calls with is good for. */
 const PEER_TOKEN_MS = 60_000;
+
+/** What of its pod's grace stops after the front: the gateway's sweeps, its bindings' watch, and its telemetry flushed. */
+const STOP_AFTER_FRONT_SECONDS = 10;
+/** How long a front told to stop lets its requests under way end, at most, before it cuts them: its pod's grace, but for what stops after it. */
+export const STOP_CALLS_MS = (STOP_GRACE_SECONDS - STOP_AFTER_FRONT_SECONDS) * 1000;
+/** How long past its pod being marked unready, its third probe unanswered, a front told to stop runs on, for the routes to it to be let go of. */
+const STOP_UNREADY_MARGIN_SECONDS = 5;
+/**
+ * How long a front told to stop runs on, at least, refusing what is routed to it still: until its
+ * pod is marked unready, as its probes go unanswered, and the routes to it let go of.
+ */
+export const STOP_LINGER_MS = (GATEWAY_READINESS.periodSeconds * GATEWAY_READINESS.failureThreshold + STOP_UNREADY_MARGIN_SECONDS) * 1000;
 
 /**
  * The key the front's replicas sign the tokens they ask one another with, of the key a binding's
@@ -249,6 +270,8 @@ export interface BinderServerOptions {
    * where the bindings are not watched (`routeHeld`).
    */
   readonly relay?: (bound: HeldTo, body: Uint8Array) => Effect.Effect<Answer>;
+  /** How it stops, as the module says: STOP_CALLS_MS and STOP_LINGER_MS but for tests. */
+  readonly stopping?: { readonly callsMs: number; readonly lingerMs: number };
 }
 
 /** A listening front: its port, and how many calls (requests but GETs) of each key of each pool it is passing on now. */
@@ -293,7 +316,7 @@ const Flights = Schema.Struct({ flights: Schema.Number });
 const decodeFlights = Schema.decodeUnknownOption(Flights);
 
 /** Serves the front on `port` until the scope closes, as the module says. */
-export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]), operate, routeHeld, grants, relay }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
+export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]), operate, routeHeld, grants, relay, stopping: stopTimings = { callsMs: STOP_CALLS_MS, lingerMs: STOP_LINGER_MS } }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
   const binder = yield* Binder;
   const kube = yield* KubeClient;
   const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
@@ -548,7 +571,11 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
           // A call holds its binding against its caller's release while it is under way; a GET does not, as the
           // stream an MCP client listens on for what its server sends of its own, open for as long as the client is,
           // waits on nothing it asked.
-          if (incoming.method === "GET") return yield* Effect.promise(() => proxy(incoming, outgoing, to, body));
+          if (incoming.method === "GET") {
+            // A stream, which a stop waits on no more than its caller does.
+            streams.add(outgoing);
+            return yield* Effect.promise(() => proxy(incoming, outgoing, to, body));
+          }
           const flight = slot(to.pool, key);
           flights.set(flight, (flights.get(flight) ?? 0) + 1);
           return yield* Effect.promise(() => proxy(incoming, outgoing, to, body)).pipe(
@@ -587,15 +614,53 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       withLogScope("binder"),
     );
 
-  const server = createServer((incoming, outgoing) => void runPromise(handle(incoming, outgoing)));
+  /** Whether the front is told to stop, as the module says; what it is answering, and of that the streams it passes on. */
+  let stopping = false;
+  const answering = new Set<ServerResponse>();
+  const streams = new Set<ServerResponse>();
+  const server = createServer((incoming, outgoing) => {
+    // Stopping, it passes on no request, but tells its caller to ask again, as no pod was given
+    // it, its connection closed, as one a keep-alive caller made before the stop brings it.
+    if (stopping) {
+      outgoing.shouldKeepAlive = false;
+      return answer(outgoing, 503, { error: "the gateway is stopping" }, { "retry-after": String(RETRY_AFTER_S), [NOT_PASSED_HEADER]: "true" });
+    }
+    answering.add(outgoing);
+    outgoing.on("close", () => void (answering.delete(outgoing), streams.delete(outgoing)));
+    void runPromise(handle(incoming, outgoing));
+  });
   // A request holds its stream for as long as its call runs: no time limit of the server's own.
   server.requestTimeout = 0;
+  /** The requests under way but the streams passed on, which a stop lets end. */
+  const underWay = () => answering.size - streams.size;
   yield* Effect.acquireRelease(
     Effect.callback<void>((resume) => void server.listen(port, host, () => resume(Effect.void))),
-    () => Effect.callback<void>((resume) => {
-      server.close(() => resume(Effect.void));
-      server.closeAllConnections();
-    }),
+    // Stopped as the module says.
+    () =>
+      Effect.gen(function*() {
+        const closed = yield* Deferred.make<void>();
+        stopping = true;
+        // An answer under way told to close its connection as it ends, its headers not sent yet,
+        // so its caller sends nothing more on it, which the cut as the stop ends would reset.
+        for (const outgoing of answering) if (!outgoing.headersSent) outgoing.shouldKeepAlive = false;
+        server.close(() => Deferred.doneUnsafe(closed, Exit.void));
+        // Those idle now closed, once: a request on one kept after is answered as the module
+        // says, never cut, as a connection closed as its caller writes on it would be.
+        server.closeIdleConnections();
+        const began = yield* Clock.currentTimeMillis;
+        yield* Effect.logInfo(`stopping: no new connection taken, ${underWay()} call(s) under way let end`);
+        for (;;) {
+          const stoppingFor = (yield* Clock.currentTimeMillis) - began;
+          if (underWay() === 0 && stoppingFor >= stopTimings.lingerMs) break;
+          if (stoppingFor >= stopTimings.callsMs) {
+            yield* Effect.logWarning(`stopping: ${underWay()} call(s) under way still after ${stopTimings.callsMs / 1000} s, cut`);
+            break;
+          }
+          yield* Effect.sleep(FLIGHTS_POLL_MS);
+        }
+        server.closeAllConnections();
+        yield* Deferred.await(closed);
+      }).pipe(withLogScope("binder")),
   );
   return {
     // Listening on a TCP port, its address is an internet one.

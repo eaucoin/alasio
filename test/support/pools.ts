@@ -366,6 +366,8 @@ export const standInPools = ({ database, standIns = {}, branch }: StandInPoolsOp
       host: "127.0.0.1",
       callerKey,
       bindingKey,
+      // Stopped at once as its tests end, as nothing is routed to it but by them.
+      stopping: { callsMs: 1_000, lingerMs: 0 },
       // Each pod serves on a port of its own, as its placement says.
       podPort: 0,
       poolOf: (key, options) =>

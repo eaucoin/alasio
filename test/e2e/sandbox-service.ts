@@ -28,7 +28,7 @@ import { BINDING_LABEL, environmentKey, keyHash, POOL_LABEL } from "../../src/bi
 import { mintToken } from "../../src/binder/tokens.ts";
 import { NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
-import type { ReplChecked, ReplHeld, ReplWaited } from "./gateway-repl.ts";
+import type { ReplAsked, ReplChecked, ReplHeld, ReplWaited } from "./gateway-repl.ts";
 import { boundPodOf, gatewayCall, inAlasio, kube, mainToken, nodeAgents, onNode, ref, SESSIONS, tcp } from "./harness.ts";
 import { until } from "./workspace-storage.ts";
 
@@ -447,7 +447,7 @@ export function sandboxService(): void {
       await until("the gateway deleting the workspace", async () => ((await gatewayCall(token, "DELETE", "/workspace")).status === 204 ? true : undefined), 180_000);
     });
 
-    test("a call through the gateway as the gateway is started again fails, not hangs, and its binding survives it, its session running on", async () => {
+    test("a call through the gateway under way as it is started again is let end, one made as its pod is deleted is answered or refused at once, never left to hang, and its binding survives it, its session running on", async () => {
       const workspace = "fs-e2egatewayagain";
       const token = await mainToken(workspace);
       await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
@@ -457,21 +457,37 @@ export function sandboxService(): void {
       const held = await inAlasio<ReplHeld>("./gateway-repl.ts", "hold", url, token);
       const gateways = () => kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("sandbox-gateway")) });
       const before = new Set((await gateways()).map(({ metadata }) => metadata?.uid));
-      // A call of half a minute under way through it, as its pods are deleted.
-      const started = Date.now();
-      const waiting = inAlasio<ReplWaited>("./gateway-repl.ts", "wait", url, token, held.sessionId);
+      // A call of 10 s under way through it as its pods are deleted, which it lets end as it
+      // stops (src/binder/server.ts STOP_CALLS_MS); and one made as they are, which a gateway
+      // stopping, or none, answers or refuses at once, never one gone.
+      const waiting = inAlasio<ReplWaited>("./gateway-repl.ts", "wait", url, token, held.sessionId, "10");
       await new Promise((resolve) => setTimeout(resolve, 5_000));
       for (const { metadata } of await gateways()) await kube.remove(ref("Pod", metadata?.name ?? "", NAMESPACE));
+      const asked = await inAlasio<ReplAsked>("./gateway-repl.ts", "ask", url, token);
       const waited = await waiting;
-      assert.equal(waited.answered, false, "the call came back answered through a gateway deleted under it");
-      assert.ok(Date.now() - started < 90_000, `the call failed only after ${Date.now() - started} ms: ${waited.failure}`);
+      console.log(`# the call made as the gateway's pods were deleted, a call under way: ${JSON.stringify(asked)}`);
+      assert.equal(waited.answered, true, `the call under way was cut, not let end: ${waited.failure}`);
+      assert.ok(asked.ms < 15_000, `the call made as the gateway's pods were deleted came back only after ${asked.ms} ms: ${JSON.stringify(asked)}`);
       await until("a gateway of its own ready again", async () =>
         (await gateways()).some(({ metadata, status }) => !before.has(metadata?.uid) && status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True")) ? true : undefined, 300_000);
       // Its binding as it was, its pod's session running on, reached through the new gateway.
       assert.equal((await boundPod(workspace)).name, first.name, await serviceLogs(workspace));
       const checked = await inAlasio<ReplChecked>("./gateway-repl.ts", "check", url, token, held.sessionId);
       assert.deepEqual({ writing: checked.writing, whole: checked.whole, notice: checked.notice }, { writing: true, whole: true, notice: null }, JSON.stringify(checked));
-      assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
+      // Its pods deleted again, no call under way to hold it, its linger alone there to refuse.
+      const again = new Set((await gateways()).map(({ metadata }) => metadata?.uid));
+      for (const { metadata } of await gateways()) await kube.remove(ref("Pod", metadata?.name ?? "", NAMESPACE));
+      const idleAsked = await inAlasio<ReplAsked>("./gateway-repl.ts", "ask", url, token);
+      console.log(`# the call made as the gateway's pods were deleted, no call under way: ${JSON.stringify(idleAsked)}`);
+      assert.ok(idleAsked.ms < 15_000, `the call made as the gateway's pods were deleted came back only after ${idleAsked.ms} ms: ${JSON.stringify(idleAsked)}`);
+      await until("a gateway of its own ready again", async () =>
+        (await gateways()).some(({ metadata, status }) => !again.has(metadata?.uid) && status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True")) ? true : undefined, 300_000);
+      // Asked again where refused, as its new pod, ready, is not yet where the Service's routes
+      // lead, which change a moment after: as alasio's loopback passes a request refused so on
+      // again (src/mcp/bayma-proxy.ts).
+      const refused = (error: unknown) => /exited with 7: curl: \(7\)/u.test(String(error));
+      await until("the gateway releasing the workspace", async () =>
+        (await gatewayCall(token, "POST", "/release").catch((error: unknown) => (refused(error) ? null : Promise.reject(error))))?.status === 204 ? true : undefined, 60_000);
       await until("the gateway deleting the workspace", async () => ((await gatewayCall(token, "DELETE", "/workspace")).status === 204 ? true : undefined), 180_000);
     });
 

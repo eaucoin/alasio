@@ -43,7 +43,7 @@ import type {
 } from "@kubernetes/client-node";
 import { Schema } from "effect";
 
-import { freeLabels, type Pool } from "../../../src/binder/names.ts";
+import { freeLabels, GATEWAY_READINESS, type Pool, STOP_GRACE_SECONDS } from "../../../src/binder/names.ts";
 import { EVENTS_BROKERS_VARIABLE, EVENTS_PASSWORD_FILE_VARIABLE, EVENTS_USERNAME_VARIABLE } from "../../../src/events/names.ts";
 import { MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
 import {
@@ -379,6 +379,8 @@ function gatewayObjects(config: InstallConfig, carried: Carried): KubernetesObje
         spec: {
           serviceAccountName: GATEWAY,
           ...priority("floor"),
+          // Its front's calls under way let end as it stops (src/binder/server.ts).
+          terminationGracePeriodSeconds: STOP_GRACE_SECONDS,
           securityContext: restrictedPod(1000, 1000),
           ...imagePullSecrets(config),
           containers: [{
@@ -399,7 +401,7 @@ function gatewayObjects(config: InstallConfig, carried: Carried): KubernetesObje
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: GATEWAY }, ...otelEnv(config)] : []),
             ],
             ports: [{ name: "gateway", containerPort: GATEWAY_PORT }],
-            readinessProbe: { httpGet: { path: "/healthz", port: "gateway" }, periodSeconds: 5 },
+            readinessProbe: { httpGet: { path: "/healthz", port: "gateway" }, ...GATEWAY_READINESS },
             securityContext: restrictedContainer(),
             resources: config.sessions.gateway.resources,
             volumeMounts: [{ name: "config", mountPath: "/etc/gateway", readOnly: true }, { name: "log", mountPath: "/run/alasio/log", readOnly: true }],

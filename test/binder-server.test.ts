@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
-import { createServer, type IncomingHttpHeaders } from "node:http";
+import { Agent, createServer, type IncomingHttpHeaders, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { before, test } from "node:test";
 
@@ -78,6 +78,8 @@ async function front(
     grants = undefined as BinderServerOptions["grants"],
     relay = undefined as BinderServerOptions["relay"],
     elsewhere = {} as Readonly<Record<string, Pool>>,
+    // Stopped at once as a test ends, but where a test says how it stops.
+    stopping = { callsMs: 1_000, lingerMs: 0 } as NonNullable<BinderServerOptions["stopping"]>,
   } = {},
 ): Promise<BinderServer & { close: () => Promise<void> }> {
   const scope = await Effect.runPromise(Scope.make());
@@ -91,7 +93,7 @@ async function front(
     : null;
   const routeHeld = holds ?? live?.holds;
   const served = await Effect.runPromise(
-    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), ...(routeHeld ? { routeHeld } : {}), ...(grants ? { grants } : {}), ...(relay ? { relay } : {}), poolOf: (_key, options) =>
+    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), ...(routeHeld ? { routeHeld } : {}), ...(grants ? { grants } : {}), ...(relay ? { relay } : {}), stopping, poolOf: (_key, options) =>
       options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: elsewhere[options["environment"] ?? ""] ?? of, release, ...told })), peers: () => Effect.succeed(peers) }).pipe(
       Effect.provide(layer),
       Scope.provide(scope),
@@ -130,6 +132,166 @@ test("a caller's request binds its key and reaches the key's pod with the bindin
     assert.equal(served.inFlight(of, key), 0);
   } finally {
     await served.close();
+    stand.close();
+  }
+});
+
+/** A stand-in for every bound pod that answers each request `answerMs` after it is through, or never: how many it was sent. */
+async function slowPods(answerMs: number | null): Promise<{ port: number; sent: () => number; close: () => void }> {
+  let sent = 0;
+  const server = createServer((incoming, outgoing) => {
+    sent += 1;
+    incoming.resume();
+    incoming.on("end", () => {
+      if (answerMs !== null) setTimeout(() => outgoing.writeHead(200, { "content-type": "application/json" }).end("{}"), answerMs);
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  return { port: (server.address() as AddressInfo).port, sent: () => sent, close: () => (server.closeAllConnections(), server.close()) };
+}
+
+/** Whether a connection to `port` of the loopback is refused, rather than taken. */
+const refused = (port: number) => fetch(`http://127.0.0.1:${port}/healthz`).then(() => false, (error: unknown) => /ECONNREFUSED/u.test(String((error as { cause?: unknown }).cause ?? error)));
+
+test("a front told to stop takes no new connection at once, lets a call under way end, and runs on at least its linger before it stops", { timeout: 30_000 }, async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await slowPods(1_500);
+  const served = await front(of, stand.port, { stopping: { callsMs: 10_000, lingerMs: 2_500 } });
+  try {
+    const key = "sessionfs:stopping";
+    const calling = fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" });
+    for (const deadline = Date.now() + 10_000; served.inFlight(of, key) === 0; await new Promise((resolve) => setTimeout(resolve, 20))) {
+      assert.ok(Date.now() < deadline, "the call never went through");
+    }
+    const told = Date.now();
+    const stopped = served.close().then(() => Date.now() - told);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(await refused(served.port), true, "a connection made as it stops is taken");
+    const answered = await calling;
+    assert.equal(answered.status, 200);
+    // Told to close its connection, which the stop's end would cut under a request sent on it.
+    assert.equal(answered.headers.get("connection"), "close");
+    const took = await stopped;
+    assert.ok(took >= 2_500 && took < 5_000, `stopped in ${took} ms`);
+  } finally {
+    stand.close();
+  }
+});
+
+test("a front told to stop answers a keep-alive caller's next request on the connection it kept 503, as passed to no pod, for it to ask again, and closes it", { timeout: 30_000 }, async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  // A pod that answers at once, its body after a while: the answer's head sent before the stop, with its connection kept.
+  let sent = 0;
+  const stand = createServer((incoming, outgoing) => {
+    sent += 1;
+    incoming.resume();
+    incoming.on("end", () => {
+      outgoing.writeHead(200, { "content-type": "application/json" });
+      outgoing.flushHeaders();
+      setTimeout(() => outgoing.end("{}"), 1_000);
+    });
+  });
+  stand.listen(0, "127.0.0.1");
+  await once(stand, "listening");
+  const served = await front(of, (stand.address() as AddressInfo).port, { stopping: { callsMs: 10_000, lingerMs: 2_000 } });
+  const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+  try {
+    const key = "sessionfs:kept";
+    /** A POST of `key`'s on the agent's one connection: its status and its not-passed header, once its body is read. */
+    const post = () => new Promise<{ status: number | undefined; notPassed: string | undefined }>((resolve, reject) => {
+      const asking = httpRequest({ host: "127.0.0.1", port: served.port, path: "/mcp", method: "POST", agent, headers: { authorization: caller(key), "content-length": "2" } }, (answered) => {
+        answered.resume();
+        answered.on("end", () => resolve({ status: answered.statusCode, notPassed: answered.headers[NOT_PASSED_HEADER] as string | undefined }));
+      });
+      asking.on("error", reject);
+      asking.end("{}");
+    });
+    const first = post();
+    for (const deadline = Date.now() + 10_000; served.inFlight(of, key) === 0; await new Promise((resolve) => setTimeout(resolve, 20))) {
+      assert.ok(Date.now() < deadline, "the call never went through");
+    }
+    const stopped = served.close();
+    // Queued behind the first on the agent's one connection, sent on it as the first's answer ends.
+    const queued = post();
+    assert.equal((await first).status, 200);
+    const next = await queued;
+    // On the connection kept, as its listener is closed: answered as passed to no pod, the pod not asked.
+    assert.deepEqual([next.status, next.notPassed, sent], [503, "true", 1]);
+    await stopped;
+  } finally {
+    agent.destroy();
+    stand.closeAllConnections();
+    stand.close();
+  }
+});
+
+test("a front told to stop lets a request under way end that it answers itself, passed to no pod, as an operation", { timeout: 30_000 }, async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await slowPods(0);
+  const served = await front(of, stand.port, {
+    stopping: { callsMs: 10_000, lingerMs: 0 },
+    operate: () => Effect.as(Effect.sleep("1500 millis"), { status: 200, json: { operated: true } }),
+  });
+  try {
+    const operating = fetch(`http://127.0.0.1:${served.port}/workspace`, { method: "POST", headers: { authorization: caller("sessionfs:operated") }, body: "{}" });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const told = Date.now();
+    const stopped = served.close().then(() => Date.now() - told);
+    assert.equal((await operating).status, 200);
+    assert.ok((await stopped) >= 1_000, "the stop did not wait for the operation under way");
+  } finally {
+    stand.close();
+  }
+});
+
+test("a front told to stop waits on no caller's stream it passes on, cutting it as its linger ends", { timeout: 30_000 }, async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  // A pod whose stream, an MCP client's GET, stays open, its head sent.
+  let streams = 0;
+  const stand = createServer((incoming, outgoing) => {
+    streams += 1;
+    incoming.resume();
+    outgoing.writeHead(200, { "content-type": "text/event-stream" });
+    outgoing.flushHeaders();
+  });
+  stand.listen(0, "127.0.0.1");
+  await once(stand, "listening");
+  const served = await front(of, (stand.address() as AddressInfo).port, { stopping: { callsMs: 10_000, lingerMs: 500 } });
+  try {
+    const listening = await fetch(`http://127.0.0.1:${served.port}/mcp`, { headers: { authorization: caller("sessionfs:listening") } });
+    assert.deepEqual([listening.status, streams], [200, 1]);
+    const ended = listening.text().then(() => "ended", () => "cut");
+    const told = Date.now();
+    await served.close();
+    assert.ok(Date.now() - told < 3_000, `stopped in ${Date.now() - told} ms, waiting on a stream`);
+    assert.equal(await ended, "cut");
+  } finally {
+    stand.closeAllConnections();
+    stand.close();
+  }
+});
+
+test("a front told to stop cuts a call under way still at its bound, never leaving it waiting on it", { timeout: 30_000 }, async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await slowPods(null);
+  const served = await front(of, stand.port, { stopping: { callsMs: 1_000, lingerMs: 0 } });
+  try {
+    const key = "sessionfs:stuck";
+    const calling = fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" }).then((response) => response.text().then(() => "answered"), () => "cut");
+    for (const deadline = Date.now() + 10_000; served.inFlight(of, key) === 0; await new Promise((resolve) => setTimeout(resolve, 20))) {
+      assert.ok(Date.now() < deadline, "the call never went through");
+    }
+    const told = Date.now();
+    await served.close();
+    assert.equal(await calling, "cut");
+    assert.ok(Date.now() - told < 3_000, `cut after ${Date.now() - told} ms`);
+  } finally {
     stand.close();
   }
 });

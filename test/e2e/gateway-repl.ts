@@ -12,8 +12,11 @@
  *   does, and prints what it holds of them: whether the writer runs on, at what step, whether
  *   every line it wrote is there in turn, whether the transaction under way commits whole,
  *   whether the lock is still held; and what bayma told the exec of how the session came back.
- * - `wait <url> <token> <sessionId>`: takes the session over and runs an exec of half a
- *   minute in it, printing whether its call came back answered, or what failed it.
+ * - `wait <url> <token> <sessionId> [seconds]`: takes the session over and runs an exec of
+ *   `seconds` in it, half a minute unless given, printing whether its call came back answered,
+ *   or what failed it.
+ * - `ask <url> <token>`: connects anew and lists bayma's tools, printing whether it came back
+ *   answered, or what failed it, the connection among it, and in how long.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -34,6 +37,11 @@ export interface ReplWaited {
   readonly failure: string | null;
 }
 
+/** How `ask`'s call came back, and in how long. */
+export interface ReplAsked extends ReplWaited {
+  readonly ms: number;
+}
+
 /** What `check` saw of what the session held, and bayma's notice to the exec, if any. */
 export interface ReplChecked {
   readonly writing: boolean;
@@ -46,9 +54,9 @@ export interface ReplChecked {
   readonly notice: string | null;
 }
 
-const [verb, url, token, argument] = process.argv.slice(2);
-if (!url || !token || (verb !== "hold" && !((verb === "check" || verb === "wait") && argument))) {
-  throw new Error("usage: gateway-repl.ts hold <url> <token> | check <url> <token> <sessionId> | wait <url> <token> <sessionId>");
+const [verb, url, token, argument, seconds = "30"] = process.argv.slice(2);
+if (!url || !token || (verb !== "hold" && verb !== "ask" && !((verb === "check" || verb === "wait") && argument))) {
+  throw new Error("usage: gateway-repl.ts hold <url> <token> | check <url> <token> <sessionId> | wait <url> <token> <sessionId> [seconds] | ask <url> <token>");
 }
 
 const HOLD = [
@@ -112,9 +120,33 @@ async function exec(client: Client, sessionId: string, code: string): Promise<{ 
   return { stdout: done.stdout_text ?? "", notice: done.notice ?? null };
 }
 
-const client = new Client({ name: "alasio-e2e", version: "1.0.0" });
-// The transport is one; the SDK declares its sessionId `string | undefined` where Transport has it optional.
-await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }) as Transport);
+/** A client of bayma at `url`, connected. */
+async function connected(): Promise<Client> {
+  const made = new Client({ name: "alasio-e2e", version: "1.0.0" });
+  // The transport is one; the SDK declares its sessionId `string | undefined` where Transport has it optional.
+  await made.connect(new StreamableHTTPClientTransport(new URL(url ?? ""), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }) as Transport);
+  return made;
+}
+
+if (verb === "ask") {
+  const started = Date.now();
+  const asked = await (async () => {
+    const asking = await connected();
+    try {
+      await asking.listTools();
+    } finally {
+      await asking.close().catch(() => undefined);
+    }
+  })().then(
+    () => ({ answered: true, failure: null }),
+    (error: unknown) => ({ answered: false, failure: error instanceof Error ? error.message : String(error) }),
+  );
+  const seen: ReplAsked = { ...asked, ms: Date.now() - started };
+  console.log(JSON.stringify(seen));
+  process.exit(0);
+}
+
+const client = await connected();
 try {
   if (verb === "hold") {
     const { session } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "python", title: "e2e", cwd: "/workspace" });
@@ -126,7 +158,7 @@ try {
     console.log(JSON.stringify(held));
   } else if (verb === "wait") {
     await call(client, "session.acquire_controller", { session_id: argument });
-    const waited: ReplWaited = await exec(client, argument ?? "", "import time\ntime.sleep(30)").then(
+    const waited: ReplWaited = await exec(client, argument ?? "", `import time\ntime.sleep(${Number(seconds)})`).then(
       () => ({ answered: true, failure: null }),
       (error: unknown) => ({ answered: false, failure: error instanceof Error ? error.message : String(error) }),
     );

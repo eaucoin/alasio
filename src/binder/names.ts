@@ -56,6 +56,20 @@ export const boundAnnotations = (key: string): Readonly<Record<string, string>> 
  */
 export const NOT_PASSED_HEADER = "x-alasio-not-passed";
 
+/**
+ * How long the gateway's pod is given to stop (its terminationGracePeriodSeconds): its front's
+ * calls under way let end within it, past its linger (./server.ts STOP_CALLS_MS, STOP_LINGER_MS),
+ * with room for what stops after the front.
+ */
+export const STOP_GRACE_SECONDS = 35;
+
+/**
+ * How the gateway's pod's readiness is probed: so long as its front, stopping, answers no
+ * probe, a pod deleted as its Deployment's one replica is a target still, until it is marked
+ * unready after these (./server.ts STOP_LINGER_MS).
+ */
+export const GATEWAY_READINESS = { periodSeconds: 5, failureThreshold: 3 } as const;
+
 /** Where a bound pod tells the front of what its harness did on its own, for its caller's control plane, with its binding's token (./server.ts relay). */
 export const EVENTS_PATH = "/events";
 

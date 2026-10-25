@@ -1008,22 +1008,29 @@ if (inShard("sessions")) {
           };
           /**
            * The gateway away as the script asks for `step`, for less than GATEWAY_RESTART_MS: scaled to
-           * none, the script told once none of its pods is left (`-deleted`), so that no connection to
-           * it is made then, and started again 5 s on, until one is ready: how long it was away. A pod
-           * deleted is no such case: a call made as it stops may reach it, and is passed on no more.
+           * none, the script told once each of its pods is stopping (`-deleted`), its Service routing to
+           * none, so that a connection to it is refused then, as each pod lingers refusing too
+           * (src/binder/server.ts STOP_LINGER_MS), and started again 5 s on, until one is ready: how long
+           * it was away.
            */
           const bounced = async (step: string) => {
             await until(`the script to ask for ${step}`, async () => ((await inAlasioContainer(["sh", "-c", `test -e /tmp/${mark}-${step} && echo asked || true`])).trim() === "asked" ? true : undefined), 600_000);
             const away = Date.now();
             await kube.patch(GATEWAY_DEPLOYMENT, { spec: { replicas: 0 } });
-            await until("no gateway left", async () => ((await gateways()).length === 0 ? true : undefined), 300_000);
+            const stoppingNow = await until("every gateway stopping", async () => {
+              const now = await gateways();
+              return now.every(({ metadata }) => metadata?.deletionTimestamp) ? new Set(now.map(({ metadata }) => metadata?.uid)) : undefined;
+            }, 300_000);
             await inAlasioContainer(["touch", `/tmp/${mark}-${step}-deleted`]);
             await sleep(5_000);
             await kube.patch(GATEWAY_DEPLOYMENT, { spec: { replicas: 1 } });
             await until("a gateway ready again", async () =>
               (await gateways()).some(({ metadata, status }) => !metadata?.deletionTimestamp && status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True")) ? true : undefined, 300_000);
+            const awayMs = Date.now() - away;
+            // And those stopped gone, their linger and their grace past: none left lingering on.
+            await until("the stopped gateways gone", async () => ((await gateways()).some(({ metadata }) => stoppingNow.has(metadata?.uid)) ? undefined : true), 120_000);
             await inAlasioContainer(["touch", `/tmp/${mark}-${step}-done`]);
-            return Date.now() - away;
+            return awayMs;
           };
           /** The gateway stopped as the script asks for `step`, its Deployment scaled to none, once none of its pods is left. */
           const stopped = async (step: string) => {
@@ -1061,16 +1068,17 @@ if (inShard("sessions")) {
           console.log(`# ${harness}: the gateway was ready again ${idle} ms after its pods were deleted, ${restarting} ms after it was stopped for 5 s, then ${calling} ms after its pods were deleted under a call; ${JSON.stringify(seen)}`);
           assert.ok(Math.max(idle, restarting, calling) < GATEWAY_RESTART_MS, `the gateway was ready again ${idle} ms, ${restarting} ms, then ${calling} ms after it went, past GATEWAY_RESTART_MS`);
           assert.ok(seen.kept.ok, JSON.stringify(seen.kept));
-          // Cut, the call under way as the gateway stopped is lost, never answered as if it ran; and
-          // one made while the gateway was away past GATEWAY_RESTART_MS fails, the loopback having
+          // The call under way as the gateway's pods were deleted, let end as they stop, is answered
+          // once: neither cut nor passed on again, which would run it twice, for twice as long.
+          assert.ok(seen.underway.ok && seen.underway.text.includes("slept") && seen.underway.ms < 35_000, JSON.stringify(seen.underway));
+          // One made while the gateway was away past GATEWAY_RESTART_MS fails, the loopback having
           // given it up.
-          assert.ok(!seen.cut.ok, JSON.stringify(seen.cut));
           assert.ok(!seen.during.ok && !seen.during.text.includes("kept through the restart"), JSON.stringify(seen.during));
           // Each read after, by the MCP client as the gateway left it, never told to reconnect, its
           // session's control its own still: the loopback carries it across them all.
           // The one made as the gateway started again passed on once it was ready, as the loopback passes a
           // request whose connection was refused again, and answered.
-          for (const after of [seen.afterIdle, seen.restarting, seen.afterCut, seen.afterOutage]) {
+          for (const after of [seen.afterIdle, seen.restarting, seen.afterUnderway, seen.afterOutage]) {
             assert.ok(after.ok && after.text.includes("kept through the restart"), JSON.stringify(seen));
           }
           // Its instance as it was, never released by the gateway's restarts.

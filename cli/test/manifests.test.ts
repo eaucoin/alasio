@@ -56,6 +56,8 @@ import { goferOf, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
 import { apiServerUnconfined } from "../src/install.ts";
 import { environmentAccess } from "../src/manifests/log.ts";
 import { carriedPools, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
+import { STOP_GRACE_SECONDS } from "../../src/binder/names.ts";
+import { STOP_CALLS_MS, STOP_LINGER_MS } from "../../src/binder/server.ts";
 import { folderStateDir, templateHash } from "../../src/gateway/names.ts";
 import { hookOf } from "../../src/gateway/snapshots.ts";
 import { VERSION } from "../src/release.ts";
@@ -2669,6 +2671,13 @@ describe("security", () => {
 
   test("renders no policies when they are turned off", () => {
     assert.deepEqual(all(install({ networkPolicies: { enabled: false } }), "NetworkPolicy"), []);
+  });
+
+  // Its front's calls under way let end as it stops, within the grace, and the rest of its stop after (src/binder/server.ts).
+  test("gives the sandbox gateway's pod the grace its front lets its calls under way end within as it stops", () => {
+    const gateway = one<V1Deployment>(install(), "Deployment", "alasio-sandbox-gateway");
+    assert.equal(gateway.spec?.template.spec?.terminationGracePeriodSeconds, STOP_GRACE_SECONDS);
+    assert.ok(STOP_LINGER_MS < STOP_CALLS_MS && STOP_CALLS_MS < STOP_GRACE_SECONDS * 1000);
   });
 
   test("lets alasio label its own pod busy in its own namespace, and keep its last start in its ConfigMap of that, and nothing else, nothing of its sessions or folder instances, which are the sandbox gateway's", () => {

@@ -15,9 +15,10 @@
  * 1. an exec keeps a value in a REPL session of the folder's instance;
  * 2. `idle`: the gateway is started again between the harness's calls;
  * 3. an exec reads the value, the harness's MCP client as the restart left it;
- * 4. `restarting`: an exec reads it as the gateway starts again, made once it has no pod left
- *    (`/tmp/<mark>-restarting-deleted`), before one is ready again;
- * 5. `calling`: an exec of 20 s is under way as the gateway is started again;
+ * 4. `restarting`: an exec reads it as the gateway starts again, made once each of its pods is
+ *    stopping (`/tmp/<mark>-restarting-deleted`), before one is ready again;
+ * 5. `calling`: an exec of 20 s is under way as the gateway's pods are deleted, which let it
+ *    end as they stop;
  * 6. as 3, after it;
  * 7. `down`: the gateway stopped, an exec made while it is away for longer than the loopback
  *    passes a request on again for (GATEWAY_RESTART_MS), which fails;
@@ -58,9 +59,9 @@ export interface FolderRestartSeen {
   readonly afterIdle: CallSeen;
   /** What an exec made as the gateway started again, before it was ready, came to. */
   readonly restarting: CallSeen;
-  /** What the exec under way as the gateway started again came to. */
-  readonly cut: CallSeen;
-  readonly afterCut: CallSeen;
+  /** What the exec under way as the gateway's pods were deleted came to. */
+  readonly underway: CallSeen;
+  readonly afterUnderway: CallSeen;
   /** What an exec made while the gateway was away past GATEWAY_RESTART_MS came to. */
   readonly during: CallSeen;
   readonly afterOutage: CallSeen;
@@ -338,21 +339,21 @@ try {
     const kept = await exec("kept = 'kept through the restart'\nprint('kept')");
     await asked("idle");
     const afterIdle = await exec(READ);
-    // Made once the gateway's pods are deleted, its connection refused until one is ready again.
+    // Made once the gateway's pods are stopping, its connection refused until one is ready again.
     await asked("restarting", "deleted");
     const restarting = await exec(READ);
     await asked("restarting");
-    // An exec of 20 s under way as the gateway starts again.
-    const cutting = exec("import time\ntime.sleep(20)\nprint('slept')");
+    // An exec of 20 s under way as the gateway's pods are deleted.
+    const sleeping = exec("import time\ntime.sleep(20)\nprint('slept')");
     await sleep(5_000);
     await asked("calling");
-    const cut = await cutting;
-    const afterCut = await exec(READ);
+    const underway = await sleeping;
+    const afterUnderway = await exec(READ);
     await asked("down");
     const during = await exec(READ);
     await asked("up");
     const afterOutage = await exec(READ);
-    const seen: FolderRestartSeen = { harness, kept, afterIdle, restarting, cut, afterCut, during, afterOutage, apiRequests };
+    const seen: FolderRestartSeen = { harness, kept, afterIdle, restarting, underway, afterUnderway, during, afterOutage, apiRequests };
     console.log(JSON.stringify(seen));
   } finally {
     await driven.close();
