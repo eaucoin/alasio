@@ -2902,6 +2902,11 @@ if (inShard("telemetry")) {
         assert.deepEqual([node["log.flush.scheduler.interval.ms"], ...Object.values(topics).map((configs) => configs["flush.ms"])], ["1000", "1000", "1000", "1000"]);
       });
 
+      test("the log has a group's first member join it at once, not after the broker's default wait for others", async () => {
+        const { node } = await logConfigs();
+        assert.equal(node["group.initial.rebalance.delay.ms"], "0");
+      });
+
       test("the log keeps each telemetry topic compressed with zstd, the stack's metrics in a fraction of their bytes, and the intake says how long it is to keep them", async (t) => {
         const { topics } = await logConfigs();
         assert.deepEqual(Object.values(topics).map((configs) => configs["compression.type"]), ["zstd", "zstd", "zstd"]);
@@ -2987,6 +2992,9 @@ if (inShard("telemetry")) {
             if (granted.stdout.trim() === "1") break;
             if (Date.now() > deadline) assert.fail(`the test could not hold the lake's write lock: ${granted.stderr}${granted.stdout}`);
           }
+          // The rebalances of the intake's group the broker settled so far, as its coordinator logs each.
+          const stabilized = async () => (await kube.logs(NAMESPACE, `${componentName("log")}-0`, "log")).split("\n").filter((line) => /Stabilized group lake-intake generation/u.test(line));
+          const before = (await stabilized()).length;
           const run = randomUUID();
           // Some thousands a partition, as after an outage: KEDA gives it a replica a thousand.
           const taken = await exportAll(run, 0, 6000, 16);
@@ -3005,6 +3013,9 @@ if (inShard("telemetry")) {
           await release();
           const written = await untilWritten(run, taken);
           assert.deepEqual([...written.values()].filter((n) => n > 1), [], "no span is written twice");
+          // Each member's join a rebalance of its own, none waited for another's: how many it took, the spans each written once all the same.
+          const rebalances = (await stabilized()).slice(before);
+          t.diagnostic(`the intake's group rebalanced ${rebalances.length} time(s) as it woke and scaled out: ${rebalances.map((line) => line.slice(0, 200)).join(" | ")}`);
         } finally {
           await release();
           await kube.patch(scaledObject, { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": null } } });

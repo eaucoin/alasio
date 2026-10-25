@@ -325,6 +325,9 @@ function serverProperties(config: InstallConfig): string {
     "super.users=User:admin;User:ANONYMOUS",
     "allow.everyone.if.no.acl.found=false",
     "auto.create.topics.enable=false",
+    // A group none is a member of joined at once by its first, not three seconds later, the broker's default wait for
+    // others to join with it: a woken alasio's first update waits on its group's join.
+    "group.initial.rebalance.delay.ms=0",
     `default.replication.factor=${nodes}`,
     `offsets.topic.replication.factor=${nodes}`,
     `transaction.state.log.replication.factor=${nodes}`,

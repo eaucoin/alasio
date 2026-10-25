@@ -1923,6 +1923,8 @@ describe("the log", () => {
       "authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer",
       "allow.everyone.if.no.acl.found=false",
       "auto.create.topics.enable=false",
+      // A group's first member joining at once, where the broker would wait three seconds for others.
+      "group.initial.rebalance.delay.ms=0",
       "default.replication.factor=1",
       "min.insync.replicas=1",
       "log.dirs=/data/log",
