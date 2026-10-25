@@ -21,7 +21,7 @@
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 
-import { NodeHttpServer } from "@effect/platform-node";
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { Deferred, Effect, Option, Result, Schema, type Scope, Stream } from "effect";
 import { HttpMiddleware, type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 

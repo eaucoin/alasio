@@ -16,7 +16,7 @@ import type { Duplex, Readable, Writable } from "node:stream";
 import { buffer } from "node:stream/consumers";
 import { inspect } from "node:util";
 
-import { NodeStream } from "@effect/platform-node";
+import * as NodeStream from "@effect/platform-node/NodeStream";
 import { Exec, KubeConfig, type KubernetesObject, PortForward, type V1Pod, type V1Status } from "@kubernetes/client-node";
 import { Clock, Context, Duration, Effect, Layer, Predicate, Schema, type Scope, Stream } from "effect";
 

@@ -25,7 +25,7 @@ import { createServer } from "node:http";
 import { promisify } from "node:util";
 import { gunzip } from "node:zlib";
 
-import { NodeHttpServer } from "@effect/platform-node";
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import type { Attributes } from "@opentelemetry/api";
 import { Clock, Effect, Option, Ref, Schema, type Scope, Stream } from "effect";
 import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";

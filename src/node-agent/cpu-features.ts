@@ -5,7 +5,7 @@
 // for `alasio status` to say which node lacks them (cli/src/cpu-baseline.ts).
 import { writeFile } from "node:fs/promises";
 
-import { NodeRuntime } from "@effect/platform-node";
+import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import { Effect } from "effect";
 
 import { AlasioLoggerLayer } from "../shared/log.ts";

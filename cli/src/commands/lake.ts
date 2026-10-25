@@ -5,7 +5,7 @@
  */
 import { PassThrough } from "node:stream";
 
-import { NodeStream } from "@effect/platform-node";
+import * as NodeStream from "@effect/platform-node/NodeStream";
 import { Console, Effect, Option, Schema, Stdio, Stream } from "effect";
 import { Argument, Command, Flag } from "effect/cli";
 

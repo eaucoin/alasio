@@ -6,7 +6,8 @@
  * What a command is doing is said on stderr as it goes; what it answers, on stdout. A
  * command that fails says why on stderr and exits with 1, or 130 when interrupted.
  */
-import { NodeRuntime, NodeServices } from "@effect/platform-node";
+import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Cause, Console, Effect, Layer, Logger, Result } from "effect";
 import { CliError, Command } from "effect/cli";
 

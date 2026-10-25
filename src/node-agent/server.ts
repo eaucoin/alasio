@@ -130,7 +130,7 @@
  */
 import { createServer } from "node:http";
 
-import { NodeHttpServer } from "@effect/platform-node";
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { Cause, Config, Effect, Option, Redacted, Schema, type Scope } from "effect";
 import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 

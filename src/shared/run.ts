@@ -2,7 +2,7 @@
  * A program of alasio's image as the process it is, alasio itself (../main.ts) among
  * them: logging and tracing as alasio does, and flushing its telemetry as it exits.
  */
-import { NodeRuntime } from "@effect/platform-node";
+import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import { Cause, Effect, Exit, Layer, type Scope } from "effect";
 
 import { TracingLayer } from "../telemetry/index.ts";
