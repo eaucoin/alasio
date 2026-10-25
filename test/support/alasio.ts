@@ -12,6 +12,8 @@
  */
 import { type ChildProcess, fork } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { createServer, type IncomingMessage, request as forward } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,6 +49,12 @@ const WITHHELD_ENV = [
 export interface AlasioOptions {
   /** Folders made under the workspace root before alasio starts. */
   readonly folders?: readonly string[];
+  /**
+   * Holds the sandbox gateway's answer to alasio listing its environment's workspaces (GET
+   * /workspace/all), as a gateway slow to answer does, until it resolves: alasio reaches the
+   * gateway through a proxy of the test's then.
+   */
+  readonly workspacesListed?: Promise<void> | undefined;
 }
 
 /** How an alasio process ended. */
@@ -82,7 +90,7 @@ export interface RunningAlasio {
 }
 
 /** alasio, started with stand-ins at its boundaries, answering the operator in chat OPERATOR_ID. */
-export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise<RunningAlasio> {
+export async function startAlasio({ folders = [], workspacesListed }: AlasioOptions = {}): Promise<RunningAlasio> {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "alasio-app-")));
   const workspaceRoot = join(root, "workspaces");
   const stateDir = join(root, "state");
@@ -98,6 +106,7 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
   const database = await pooledDatabase();
   const poolsScope = await Effect.runPromise(Scope.make());
   const standIn = await Effect.runPromise(Scope.provide(standInPools({ database, standIns: { claudeQueryFactory: bridgedQueryFactory(claude.socketPath) } }), poolsScope));
+  const gateway = workspacesListed ? await holdingProxy(standIn.url, (request) => (request.method === "GET" && request.url?.startsWith("/workspace/all") ? workspacesListed : null)) : null;
   const events = await serveTopic(standIn.events);
 
   const env: NodeJS.ProcessEnv = { ...process.env };
@@ -115,7 +124,7 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
     stateDir,
     workspaceRoot,
     allowedUserIds: String(OPERATOR_ID),
-    gatewayUrl: standIn.url,
+    gatewayUrl: gateway?.url ?? standIn.url,
     callerKey: standIn.callerKey.toString("base64"),
     environment: ENVIRONMENT,
     codexLoginUrl: CODEX_LOGIN_URL,
@@ -192,9 +201,36 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
         await claude.close();
         await Effect.runPromise(Scope.close(poolsScope, Exit.void));
         await events.close();
+        await gateway?.close();
         await telegram.close();
         rmSync(root, { recursive: true, force: true });
       }
     },
+  };
+}
+
+/**
+ * A proxy of the HTTP server at `target`, at the loopback, passing every request on as it is but
+ * those `held` gives a promise of, which it holds until the promise resolves.
+ */
+async function holdingProxy(target: string, held: (request: IncomingMessage) => Promise<void> | null): Promise<{ readonly url: string; readonly close: () => Promise<void> }> {
+  const to = new URL(target);
+  const server = createServer((request, response) => {
+    void (held(request) ?? Promise.resolve()).then(() => {
+      const passed = forward({ host: to.hostname, port: to.port, path: request.url, method: request.method, headers: request.headers }, (answer) => {
+        response.writeHead(answer.statusCode ?? 502, answer.headers);
+        answer.pipe(response);
+      });
+      passed.on("error", () => response.destroy());
+      request.pipe(passed);
+    });
+  });
+  await new Promise<void>((listening) => server.listen(0, "127.0.0.1", listening));
+  return {
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}${to.pathname === "/" ? "" : to.pathname}`,
+    close: () => new Promise<void>((closed) => {
+      server.closeAllConnections();
+      server.close(() => closed());
+    }),
   };
 }

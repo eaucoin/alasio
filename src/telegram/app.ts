@@ -1,7 +1,8 @@
 /**
- * alasio serving Telegram: as it starts, what the last alasio left is settled (prompt jobs,
- * undelivered responses, albums, interrupted turns); then Telegram's updates are taken from
- * the environment's topic in the log (./update-consumer.ts) and processed, each once,
+ * alasio serving Telegram: as it starts, Telegram's updates are taken from the environment's
+ * topic in the log (./update-consumer.ts) and processed, each once, as soon as what their
+ * handling needs is done, and what the last alasio left is settled as they are (prompt jobs,
+ * undelivered responses, albums, interrupted turns, each conversation's under its claim);
  * undelivered responses are looked for every thirty seconds, what the store keeps only in
  * flight is pruned daily, and Telegram is asked how its deliveries fare every five minutes
  * (./delivery-watch.ts). All of it stops as its scope
@@ -172,24 +173,35 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   yield* Effect.logInfo(`  Default folder: ${config.workingDirectory ?? "none (operator chooses with /workspace)"}`);
   yield* Effect.logInfo(`  Default service: ${config.defaultHarness ?? "none (operator chooses with /service)"}`);
   yield* Effect.logInfo(`  Session filesystems: ${sandbox ? "enabled" : "off (the deployment renders no sessions template)"}`);
-  // The session filesystems the gateway holds set against those the store records, and where they differ said.
-  yield* Effect.flatMap(Mounts, (mounts) => mounts.reconcileSessionWorkspaces);
+  // Updates are taken first of all but what their handling needs done before, as alasio woken by an update answers it
+  // as soon as it can, a press's query before Telegram gives up on it:
+  // - the claims of the processes of this pod before this one let go of, as a container restarted in it leaves them, so
+  //   a conversation of theirs is taken at once;
+  // - the presses kept as an alasio before stopped run again, forked, as before: a head start on their chats' later
+  //   updates, not a guarantee they end first;
+  // - responses completed but never delivered, and albums due, queued, so each goes out before the reply to an update of
+  //   its chat taken after: one statement each, which finds none as a rule.
+  yield* turns.lapseOwnClaims;
+  yield* recoverPresses(handling).pipe(Effect.provideContext(services));
   yield* turns.flushCompletedResponses;
   yield* mediaGroups.flushDue;
-  // The claims of the processes of this pod before this one let go of, as a container restarted in it leaves them; then
-  // the conversations with work left that no alasio drives, as theirs stopped or crashed, taken up: what each left
-  // recovered, its turn running on its pod attached to again in the background (Turns.takeUnheld); and then the
-  // prompts waiting, to run or to be asked about again.
-  yield* turns.lapseOwnClaims;
-  yield* turns.takeUnheld;
-  yield* turns.resumePendingPrompts;
-  // Presses kept as an alasio before stopped, run again before updates come.
-  yield* recoverPresses(handling).pipe(Effect.provideContext(services));
   // As alasio stops: its member of the Telegram group, forked after, gone first, then what it
   // owes delivered (./drain.ts), within the grace counted from when it was told to stop.
   const toldAt = yield* stopToldAt;
   yield* Effect.addFinalizer(() => drain({ toldAt }).pipe(Effect.provideContext(services)));
   yield* consumeUpdates(processUpdate).pipe(Effect.forkScoped);
+  // Then, as updates are taken: the session filesystems the gateway holds set against those the store records, and
+  // where they differ said, which asks the gateway, forked, a failure of it logged and alasio started all the same; the
+  // conversations with work left that no alasio drives, as theirs stopped or crashed, taken up, what each left recovered
+  // under its claim, which an update of its conversation waits for and no other's (../codex/worker-claims.ts), its turn
+  // running on its pod attached to again in the background (Turns.takeUnheld); and the prompts waiting, to run or to be
+  // asked about again.
+  yield* Effect.flatMap(Mounts, (mounts) => mounts.reconcileSessionWorkspaces).pipe(
+    Effect.catch((error) => Effect.logWarning(`Setting the session filesystems the gateway holds against the store's failed: ${error.message}`)),
+    Effect.forkScoped,
+  );
+  yield* turns.takeUnheld;
+  yield* turns.resumePendingPrompts;
   // Responses completed but never delivered (their delivery failed, or alasio stopped first) go out.
   yield* turns.flushCompletedResponses.pipe(
     Effect.catch((error) => Effect.logWarning(`Completed response recovery failed: ${error.message}`)),
