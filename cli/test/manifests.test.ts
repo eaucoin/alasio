@@ -513,7 +513,7 @@ describe("neon", () => {
     const job = one<V1Job>(install(), "Job", "alasio-neon-setup");
     assert.equal(job.spec?.template.spec?.serviceAccountName, "alasio-neon-setup");
     const setup = job.spec?.template.spec?.containers[0];
-    assert.deepEqual(setup?.command, ["node", "/opt/alasio/neon/control/kube-setup.ts"]);
+    assert.deepEqual(setup?.args, ["node", "/opt/alasio/neon/control/kube-setup.ts"]);
     assert.equal(setup?.env?.find(({ name }) => name === "S3_EXTERNAL"), undefined);
   });
 
@@ -1796,7 +1796,7 @@ describe("telemetry", () => {
     // Which the mount serves on every address of its pod, not the loopback alone, by the port it names.
     const mount = one<V1DaemonSet>(objects, "DaemonSet", "alasio-workspace-mount");
     const mountContainer = mount.spec?.template.spec?.containers.find(({ name }) => name === "workspace-mount");
-    assert.match(mountContainer?.command?.join("\n") ?? "", / mount --no-bgjob --metrics 0\.0\.0\.0:9567 /u);
+    assert.match(mountContainer?.args?.join("\n") ?? "", / mount --no-bgjob --metrics 0\.0\.0\.0:9567 /u);
     assert.deepEqual(mountContainer?.ports, [{ name: "metrics", containerPort: 9567 }]);
     assert.deepEqual(config.receivers.redis, {
       endpoint: "alasio-valkey:6379",
@@ -1887,7 +1887,7 @@ describe("the log", () => {
     assert.deepEqual(pod?.securityContext?.runAsNonRoot, true);
     assert.deepEqual(statefulSet.spec?.volumeClaimTemplates?.map(({ metadata, spec }) => [metadata?.name, spec?.resources?.requests?.["storage"]]), [["data", "4Gi"]]);
     // Its access applier, on alasio's image, logs in as its admin beside it, and its node is ready once it has applied what it applies.
-    assert.deepEqual(access?.command, ["node", "/opt/alasio/src/log/access.ts"]);
+    assert.deepEqual(access?.args, ["node", "/opt/alasio/src/log/access.ts"]);
     assert.deepEqual(access?.readinessProbe?.httpGet, { path: "/readyz", port: "access" });
     // It writes every credential again through the controllers' listener first, unauthenticated there, of each voter in turn (src/log/access.ts).
     assert.deepEqual(access?.env?.filter(({ name }) => name.startsWith("LOG_") && name !== "LOG_ADMIN_PASSWORD").map(({ name, value }) => [name, value]), [
@@ -2434,9 +2434,9 @@ describe("workspace storage", () => {
     }
   });
 
-  // Kubernetes makes $$ of a container's command $, and $(NAME) of a variable the container has its value: the script as sh runs it.
+  // Kubernetes makes $$ of a container's command and arguments $, and $(NAME) of a variable the container has its value: the script as sh runs it.
   test("runs the nodes' mount by a script Kubernetes leaves as written, its copy of juicefs made under a name mktemp gives it", () => {
-    const command = one<V1DaemonSet>(install(), "DaemonSet", "alasio-workspace-mount").spec?.template.spec?.containers.find(({ name }) => name === "workspace-mount")?.command ?? [];
+    const command = one<V1DaemonSet>(install(), "DaemonSet", "alasio-workspace-mount").spec?.template.spec?.containers.find(({ name }) => name === "workspace-mount")?.args ?? [];
     assert.deepEqual(command.slice(0, 2), ["sh", "-c"]);
     const script = command[2] ?? "";
     assert.equal(script.includes("$$"), false);
@@ -2529,7 +2529,7 @@ describe("node agents", () => {
     ]);
     const [container] = pod?.containers ?? [];
     assert.equal(container?.image, one<V1Deployment>(objects, "Deployment", "alasio").spec?.template.spec?.containers[0]?.image);
-    assert.deepEqual(container?.command, ["node", "/opt/alasio/src/node-agent/main.ts"]);
+    assert.deepEqual(container?.args, ["node", "/opt/alasio/src/node-agent/main.ts"]);
     assert.deepEqual(container?.securityContext, { privileged: true, runAsUser: 0 });
     assert.deepEqual(container?.volumeMounts, [
       { name: "run", mountPath: "/run", mountPropagation: "HostToContainer" },
@@ -2546,7 +2546,7 @@ describe("node agents", () => {
     assert.deepEqual(others, []);
     assert.equal(features?.name, "cpu-features");
     assert.equal(features?.image, container?.image);
-    assert.deepEqual(features?.command, ["node", "/opt/alasio/src/node-agent/cpu-features.ts", NODE_PINS.gvisor.releases[0]?.release]);
+    assert.deepEqual(features?.args, ["node", "/opt/alasio/src/node-agent/cpu-features.ts", NODE_PINS.gvisor.releases[0]?.release]);
     assert.deepEqual(features?.securityContext, { privileged: true, runAsUser: 0 });
     assert.deepEqual(features?.volumeMounts, container?.volumeMounts?.filter(({ name }) => name !== "snapshots"));
   });
@@ -2556,6 +2556,7 @@ describe("node agents", () => {
     const env = (file: Record<string, unknown> = {}) => Object.fromEntries((container(file)?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
     assert.deepEqual(container()?.envFrom, [{ secretRef: { name: "alasio-snapshots" } }]);
     assert.deepEqual(env(), {
+      TINI_SUBREAPER: "1",
       NODE_NAME: { fieldRef: { fieldPath: "spec.nodeName" } },
       POD_IP: { fieldRef: { fieldPath: "status.podIP" } },
       ALASIO_NODE_AGENT_TOKEN: { secretKeyRef: { name: "alasio-node-agent", key: "token" } },
@@ -3513,7 +3514,7 @@ describe("the sandbox service", () => {
     const objects = install();
     const gateway = one<V1Deployment>(objects, "Deployment", "alasio-sandbox-gateway");
     const [container] = gateway.spec?.template.spec?.containers ?? [];
-    assert.deepEqual(container?.command, ["node", "/opt/alasio/src/gateway/main.ts"]);
+    assert.deepEqual(container?.args, ["node", "/opt/alasio/src/gateway/main.ts"]);
     const env = Object.fromEntries((container?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom?.secretKeyRef ?? valueFrom?.fieldRef]));
     assert.deepEqual([env["CALLER_KEY"], env["BINDING_KEY"], env["ALASIO_NODE_AGENT_TOKEN"]], [
       { name: "alasio-sandbox-gateway", key: "caller-key" },
@@ -3603,11 +3604,11 @@ describe("the sandbox service", () => {
       { name: "run", mountPath: "/run/alasio" },
     ]);
     assert.deepEqual(mount.spec?.template.spec?.volumes?.[1], { name: "state", hostPath: { path: "/var/lib/alasio/juicefs-state", type: "DirectoryOrCreate" } });
-    assert.deepEqual(juicefs?.command, ["sh", "-c", workspaceMountScript("/var/lib/alasio/workspaces", 1024)]);
-    assert.match(juicefs?.command?.[2] ?? "", /nsenter -t 1 -m -- "\$node_juicefs" mount --no-bgjob --metrics 0\.0\.0\.0:9567 --bucket "\$bucket" --cache-dir \/var\/lib\/alasio\/juicefs-cache --cache-size 1024 "\$meta" \/var\/lib\/alasio\/workspaces /u);
+    assert.deepEqual(juicefs?.args, ["sh", "-c", workspaceMountScript("/var/lib/alasio/workspaces", 1024)]);
+    assert.match(juicefs?.args?.[2] ?? "", /nsenter -t 1 -m -- "\$node_juicefs" mount --no-bgjob --metrics 0\.0\.0\.0:9567 --bucket "\$bucket" --cache-dir \/var\/lib\/alasio\/juicefs-cache --cache-size 1024 "\$meta" \/var\/lib\/alasio\/workspaces /u);
     assert.deepEqual(juicefs?.readinessProbe?.exec?.command, ["sh", "-c", workspaceMountReady("/var/lib/alasio/workspaces")]);
     // Given the metadata engine's URL and the bucket's, which it resolves by the pod's DNS, and the bucket's keys.
-    assert.deepEqual(juicefs?.env?.map(({ name, valueFrom }) => `${name}=${valueFrom?.secretKeyRef?.key}`), ["META_URL=metaurl", "BUCKET=bucket", "ACCESS_KEY=access-key", "SECRET_KEY=secret-key"]);
+    assert.deepEqual(juicefs?.env?.map(({ name, value, valueFrom }) => `${name}=${value ?? valueFrom?.secretKeyRef?.key}`), ["TINI_SUBREAPER=1", "META_URL=metaurl", "BUCKET=bucket", "ACCESS_KEY=access-key", "SECRET_KEY=secret-key"]);
     assert.equal(mount.spec?.template.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
   });
 
@@ -3885,7 +3886,7 @@ describe("conversations' harnesses' pools", () => {
       assert.equal(spec?.automountServiceAccountToken, false);
       assert.deepEqual([spec?.securityContext?.runAsUser, spec?.securityContext?.runAsNonRoot], [1000, true]);
       const host = container(pool);
-      assert.deepEqual(host.command, ["node", "/opt/alasio/src/harness/main.ts"]);
+      assert.deepEqual(host.args, ["node", "/opt/alasio/src/harness/main.ts"]);
       const env = Object.fromEntries((host.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom?.secretKeyRef ?? valueFrom?.fieldRef?.fieldPath]));
       assert.deepEqual(
         [env["ALASIO_HARNESS_BINDING_FILE"], env["ALASIO_HARNESS_PORT"], env["ALASIO_STATE_DIR"], env["ALASIO_DATABASE_URL_FILE"], env["ALASIO_GATEWAY_URL"], env["ALASIO_BRANCH"]],
@@ -4016,7 +4017,7 @@ describe("the relay of an environment's Codex login", () => {
     const objects = install();
     const relay = one<V1Deployment>(objects, "Deployment", "alasio-codex-login");
     const spec = relay.spec?.template.spec;
-    assert.deepEqual(container(relay).command, ["node", "/opt/alasio/src/codex/relay-main.ts"]);
+    assert.deepEqual(container(relay).args, ["node", "/opt/alasio/src/codex/relay-main.ts"]);
     assert.equal(container(relay).image, container(one<V1Deployment>(objects, "Deployment", "alasio")).image);
     assert.equal(spec?.automountServiceAccountToken, false);
     // Given its drain, and a little more, to stop in.
@@ -4076,7 +4077,7 @@ test("the release's setup pod is alasio's own container, its image, environment 
   assert.deepEqual(pod.metadata?.labels, { ...deployment.spec?.template.metadata?.labels, [SETUP_LABEL]: "true" });
   const [setup, ...others] = pod.spec?.containers ?? [];
   assert.deepEqual(others, []);
-  assert.deepEqual([setup?.image, setup?.env, setup?.command], [alasio.image, alasio.env, ["node", "/opt/alasio/src/setup/main.ts"]]);
+  assert.deepEqual([setup?.image, setup?.env, setup?.args], [alasio.image, alasio.env, ["node", "/opt/alasio/src/setup/main.ts"]]);
   assert.deepEqual([setup?.ports, setup?.readinessProbe, setup?.livenessProbe], [undefined, undefined, undefined]);
   // The machine's folders, which the host profile mounts into alasio, none of its.
   assert.ok(deployment.spec?.template.spec?.volumes?.some(({ hostPath }) => hostPath !== undefined));
@@ -4085,14 +4086,65 @@ test("the release's setup pod is alasio's own container, its image, environment 
   assert.equal(pod.spec?.serviceAccountName, "alasio");
 });
 
-test("the release's stack setup's pod is its neon-setup Job's, its image, command, environment and service account, run once to its end, labelled as the Job's pods", () => {
+test("the release's stack setup's pod is its neon-setup Job's, its image, arguments, environment and service account, run once to its end, labelled as the Job's pods", () => {
   const objects = install();
   const job = one<V1Job>(objects, "Job", "alasio-neon-setup");
   const pod = stackSetupPod(objects);
   assert.deepEqual([pod.kind, pod.metadata?.name, pod.metadata?.namespace, pod.spec?.restartPolicy], ["Pod", "alasio-stack-setup", "alasio", "Never"]);
   assert.deepEqual(pod.metadata?.labels, { ...job.spec?.template.metadata?.labels, [SETUP_LABEL]: "true" });
   assert.deepEqual(pod.spec?.containers, job.spec?.template.spec?.containers);
-  assert.deepEqual(pod.spec?.containers[0]?.command, ["node", "/opt/alasio/neon/control/kube-setup.ts"]);
+  assert.deepEqual(pod.spec?.containers[0]?.args, ["node", "/opt/alasio/neon/control/kube-setup.ts"]);
   assert.equal(pod.spec?.serviceAccountName, "alasio-neon-setup");
   assert.throws(() => stackSetupPod(objects.filter(({ kind }) => kind !== "Job")), /has no alasio\/alasio-neon-setup Job/u);
+});
+
+test("runs every container of alasio's image under the image's entrypoint, tini, which ends its program on a SIGTERM that comes before the program handles it: each given its arguments, never a command, which would run in tini's place", () => {
+  const objects = install({ host: { enabled: true } });
+  const branch = branchObjects(configOf(), "try", BASELINE);
+  const image = container(one<V1Deployment>(objects, "Deployment", "alasio")).image;
+  // What may set a command of its own, and why: nothing. A program run in tini's place is, in a pod of PIDs of its own, their
+  // first, which the kernel sends no signal it has no handler for: a SIGTERM before node handles it is lost, and the pod runs
+  // on to the end of its grace.
+  const commanded: Readonly<Record<string, string>> = {};
+  const specs: [string, V1PodSpec][] = [
+    ...podSpecs(objects),
+    ...podSpecs(branch).map(([name, spec]): [string, V1PodSpec] => [`try/${name}`, spec]),
+    ["alasio-setup", setupPod(objects).spec ?? { containers: [] }],
+    ["alasio-stack-setup", stackSetupPod(objects).spec ?? { containers: [] }],
+  ];
+  const ofImage = specs.flatMap(([name, spec]) =>
+    [...(spec.initContainers ?? []), ...spec.containers].filter((each) => each.image === image).map((each): [string, V1Container] => [`${name}/${each.name}`, each])
+  );
+  assert.deepEqual(ofImage.filter(([name, { command }]) => command !== undefined && !(name in commanded)).map(([name]) => name), []);
+  // Where the pod shares the node's PIDs, tini is no PID 1, and is told to reap as it would.
+  const ofNodePids = specs.filter(([, spec]) => spec.hostPID).flatMap(([name, spec]) => [...(spec.initContainers ?? []), ...spec.containers].filter((each) => each.image === image).map((each): [string, V1Container] => [`${name}/${each.name}`, each]));
+  assert.deepEqual(ofNodePids.map(([name, { env }]) => [name, env?.some(({ name: variable, value }) => variable === "TINI_SUBREAPER" && value === "1")]), [
+    ["alasio-node-agent/cpu-features", true],
+    ["alasio-node-agent/node-agent", true],
+    ["alasio-workspace-mount/workspace-mount", true],
+  ]);
+  // Every program of the image, so none is left out of what is held to it.
+  assert.deepEqual(ofImage.map(([name]) => name).sort(), [
+    "alasio-codex-login/codex-login",
+    "alasio-image/image",
+    "alasio-log/access",
+    "alasio-neon-control/neon-control",
+    "alasio-neon-setup/setup",
+    "alasio-node-agent/cpu-features",
+    "alasio-node-agent/node-agent",
+    "alasio-receiver/receiver",
+    "alasio-sandbox-gateway/sandbox-gateway",
+    "alasio-setup/alasio",
+    "alasio-stack-setup/setup",
+    "alasio-workspace-mount/workspace-mount",
+    "alasio/alasio",
+    "harness-claude/harness",
+    "harness-codex/harness",
+    "harness-folder-claude/harness",
+    "harness-folder-codex/harness",
+    "try/alasio-codex-login/codex-login",
+    "try/alasio/alasio",
+    "try/harness-claude/harness",
+    "try/harness-codex/harness",
+  ]);
 });

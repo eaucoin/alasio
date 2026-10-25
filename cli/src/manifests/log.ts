@@ -492,7 +492,7 @@ export function logObjects(config: InstallConfig): KubernetesObject[] {
               name: "access",
               image: imageReference(config.images.alasio),
               imagePullPolicy: config.images.pullPolicy,
-              command: ["node", "/opt/alasio/src/log/access.ts"],
+              args: ["node", "/opt/alasio/src/log/access.ts"],
               env: [
                 { name: "LOG_BROKERS", value: `127.0.0.1:${LOG_PORT}` },
                 // Every voter's, as KRaft's active controller alone writes a credential.

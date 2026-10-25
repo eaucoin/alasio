@@ -138,6 +138,7 @@ test("a harness pool's pod with any field its template pins changed is refused: 
     "privilege escalation": (pod) => void (host(pod).securityContext = { ...host(pod).securityContext, allowPrivilegeEscalation: true }),
     "another image": (pod) => void (host(pod).image = "busybox"),
     "another command": (pod) => void (host(pod).command = ["sh", "-c", "sleep 1d"]),
+    "another program": (pod) => void (host(pod).args = ["node", "-e", "setInterval(() => {}, 1000)"]),
     "a variable more": (pod) => void host(pod).env!.push({ name: "NODE_OPTIONS", value: "--inspect" }),
     "the machine's network": (pod) => void (pod.spec.hostNetwork = true),
     "the account's token": (pod) => void (pod.spec.automountServiceAccountToken = true),

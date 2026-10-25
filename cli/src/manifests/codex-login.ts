@@ -93,7 +93,7 @@ function deployment(config: InstallConfig, environment: Environment): V1Deployme
             name: CODEX_LOGIN_COMPONENT,
             image: imageReference(config.images.alasio),
             imagePullPolicy: config.images.pullPolicy,
-            command: ["node", "/opt/alasio/src/codex/relay-main.ts"],
+            args: ["node", "/opt/alasio/src/codex/relay-main.ts"],
             workingDir: home,
             // alasio's variables first, as its Codex's binary among them, then its own, which win.
             env: [

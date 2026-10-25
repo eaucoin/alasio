@@ -981,6 +981,20 @@ if (inShard("sessions")) {
       console.error(`# the node's images, as containerd checks their content:\n${(await onNode(server, "ctr -n k8s.io images check")).trimEnd()}`);
     });
 
+    test("runs each program of alasio's image under tini, the first of its pod's PIDs, so a SIGTERM that comes before the program handles it ends it", async () => {
+      const image = (await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE)))?.spec?.template.spec?.containers[0]?.image;
+      // Of each pod of PIDs of its own, as one of the node's PIDs has the node's first.
+      const pods = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE })).filter(({ metadata, spec, status }) => !metadata?.deletionTimestamp && !spec?.hostPID && status?.phase === "Running");
+      const first = await Promise.all(pods.flatMap(({ metadata, spec, status }) =>
+        (spec?.containers ?? [])
+          .filter(({ name, image: its }) => its === image && status?.containerStatuses?.some((each) => each.name === name && each.state?.running))
+          .map(async ({ name }): Promise<[string, string]> => [`${metadata?.labels?.["app.kubernetes.io/component"] ?? metadata?.name}/${name}`, (await kube.execOk(NAMESPACE, metadata?.name ?? "", ["cat", "/proc/1/cmdline"], { container: name })).split("\0")[0] ?? ""])
+      ));
+      const programs = new Set(first.map(([program]) => program));
+      for (const program of ["alasio/alasio", "sandbox-gateway/sandbox-gateway", "receiver/receiver", "neon-control/neon-control", "image/image"]) assert.ok(programs.has(program), `no ${program} ran: ${[...programs].join(", ")}`);
+      assert.deepEqual(first.filter(([, program]) => program !== "/usr/bin/tini"), []);
+    });
+
     test("a new workspace with internet reaches the internet and nothing private", async () => {
       full = await newSession("full");
       assert.equal((await sessionPod(full)).metadata?.labels?.["alasio.dev/pool"], "sandboxes-full");

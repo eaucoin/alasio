@@ -118,7 +118,7 @@ function setup(config: InstallConfig): KubernetesObject[] {
             name: "setup",
             image: imageReference(config.images.alasio),
             imagePullPolicy: config.images.pullPolicy,
-            command: ["node", "/opt/alasio/neon/control/kube-setup.ts"],
+            args: ["node", "/opt/alasio/neon/control/kube-setup.ts"],
             env: [
               { name: "NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
               { name: "SECRET_PREFIX", value: RELEASE },
@@ -563,7 +563,7 @@ function control(config: InstallConfig): KubernetesObject[] {
             name: "neon-control",
             image: imageReference(config.images.alasio),
             imagePullPolicy: config.images.pullPolicy,
-            command: ["node", "/opt/alasio/neon/control/service.ts"],
+            args: ["node", "/opt/alasio/neon/control/service.ts"],
             env: [
               { name: "CONTROLLER_URL", value: `http://${neonName("storage-controller")}:1234` },
               { name: "NEON_SAFEKEEPER_HOSTS", value: safekeeperHosts.join(",") },

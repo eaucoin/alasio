@@ -20,9 +20,9 @@ const JQ_DIR = (process.env["PATH"] ?? "").split(delimiter).find((directory) => 
 const pathOf = (bin: string) => [bin, JQ_DIR, "/usr/bin", "/bin"].join(delimiter);
 
 /** The release's setup pod, as `alasio upgrade --setup-pod` prints it, of the fields the cut-over reads and changes. */
-const SETUP_POD = { apiVersion: "v1", kind: "Pod", metadata: { name: "alasio-setup", namespace: "alasio" }, spec: { restartPolicy: "Never", containers: [{ name: "alasio", image: "alasio:release", command: ["node", "/opt/alasio/src/setup/main.ts"], env: [] }] } };
+const SETUP_POD = { apiVersion: "v1", kind: "Pod", metadata: { name: "alasio-setup", namespace: "alasio" }, spec: { restartPolicy: "Never", containers: [{ name: "alasio", image: "alasio:release", args: ["node", "/opt/alasio/src/setup/main.ts"], env: [] }] } };
 /** The release's stack setup's pod, as `alasio upgrade --setup-job` prints it, of the fields the cut-over reads and changes. */
-const SETUP_JOB = { apiVersion: "v1", kind: "Pod", metadata: { name: "alasio-stack-setup", namespace: "alasio" }, spec: { restartPolicy: "Never", containers: [{ name: "setup", image: "alasio:release", command: ["node", "/opt/alasio/neon/control/kube-setup.ts"], env: [] }] } };
+const SETUP_JOB = { apiVersion: "v1", kind: "Pod", metadata: { name: "alasio-stack-setup", namespace: "alasio" }, spec: { restartPolicy: "Never", containers: [{ name: "setup", image: "alasio:release", args: ["node", "/opt/alasio/neon/control/kube-setup.ts"], env: [] }] } };
 /** The pod the cut-over runs before its point of no return, once the upgrade is checked, as its record of it says: the stack's secrets made. */
 const STACK_SETUP_RAN = "pod alasio-stack-setup: node /opt/alasio/neon/control/kube-setup.ts";
 /** The pods the cut-over runs past its point of no return, once alasio is stopped, as its record of each says: its setup, and the sessions given their conversations. */
@@ -109,7 +109,7 @@ case "$*" in
     else echo "alasio: none" >>'${looked}'; fi ;;
   "-n alasio delete pod "*" --ignore-not-found --wait") exit 0 ;;
   "-n alasio apply -f "*)
-    echo "pod $(jq -r '.metadata.name + ": " + (.spec.containers[0].command[:3] | join(" ")) + (if any(.spec.containers[0].env[]?; .name == "ALASIO_CUTOVER_SQL") then ", with its SQL" else "" end)' "$5")" >>'${ran}' ;;
+    echo "pod $(jq -r '.metadata.name + ": " + (.spec.containers[0].args[:3] | join(" ")) + (if any(.spec.containers[0].env[]?; .name == "ALASIO_CUTOVER_SQL") then ", with its SQL" else "" end)' "$5")" >>'${ran}' ;;
   "-n alasio get pod "*" -o jsonpath={.status.phase}")
     if grep -qx "$5" '${podRuns}' 2>/dev/null; then echo Running; elif grep -qx "$5" '${podFails}' 2>/dev/null; then echo Failed; else echo Succeeded; fi ;;
   "-n alasio logs "*) if [ "$4" = alasio-sessions-claimed ]; then echo 3; else echo "made alasio's state"; fi ;;
@@ -622,8 +622,8 @@ test("before its point of no return, once the upgrade is checked, the cut-over m
     assert.equal(run.code, 0, run.said);
     assert.deepEqual(at.ran(), ["check", STACK_SETUP_RAN, "stop alasio", ...SETUP, "upgrade"]);
     // Of the pod SETUP_JOB printed, run to its end, as named.
-    const ran = JSON.parse(at.recorded("alasio-stack-setup.json")) as { metadata: { name: string }; spec: { restartPolicy: string; containers: { image: string; command: string[] }[] } };
-    assert.deepEqual([ran.metadata.name, ran.spec.containers[0]?.image, ran.spec.containers[0]?.command, ran.spec.restartPolicy], ["alasio-stack-setup", "alasio:release", ["node", "/opt/alasio/neon/control/kube-setup.ts"], "Never"]);
+    const ran = JSON.parse(at.recorded("alasio-stack-setup.json")) as { metadata: { name: string }; spec: { restartPolicy: string; containers: { image: string; args: string[] }[] } };
+    assert.deepEqual([ran.metadata.name, ran.spec.containers[0]?.image, ran.spec.containers[0]?.args, ran.spec.restartPolicy], ["alasio-stack-setup", "alasio:release", ["node", "/opt/alasio/neon/control/kube-setup.ts"], "Never"]);
   } finally {
     at.remove();
   }

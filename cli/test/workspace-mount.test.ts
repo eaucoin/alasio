@@ -50,9 +50,10 @@ interface Mount {
  * juicefs takes over does; where `foreign`, it holds, on top of any other at the root, a mount of
  * the same minor that is no FUSE connection's: a block device's FUSE file system; where `takes`, its juicefs, as it starts, takes the node's mount's
  * session, which no process serves then, so the mount answers nothing; where `fusectl`, the
- * node has fusectl's mount. `serveWaitSeconds` is how long its juicefs has to serve.
+ * node has fusectl's mount; where `termed`, the script is sent TERM as it makes the node's mount
+ * point, before its juicefs starts. `serveWaitSeconds` is how long its juicefs has to serve.
  */
-function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = false, unreadable = false, hung = false, slow = false, held = false, foreign = false, takes = false, fusectl = false, serveWaitSeconds = 180, env: given = {} as Record<string, string> } = {}): Mount & { readonly takeOver: () => void; readonly aborted: () => string } {
+function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = false, unreadable = false, hung = false, slow = false, held = false, foreign = false, takes = false, fusectl = false, termed = false, serveWaitSeconds = 180, env: given = {} as Record<string, string> } = {}): Mount & { readonly takeOver: () => void; readonly aborted: () => string } {
   const directory = mkdtempSync(join(tmpdir(), "alasio-workspace-mount-"));
   const root = join(directory, "workspaces");
   const mountinfo = join(directory, "mountinfo");
@@ -111,6 +112,8 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false, unreachable = f
     `if [ "$1" = ls ] && [ -e ${slowed} ]; then sleep 60; fi`,
     `if [ "$1" = umount ]; then rm -f ${dead} ${hanging}; : > ${mountinfo}; exit 0; fi`,
     `if [ "$1" = mount ]; then exit 0; fi`,
+    // The script itself, its parent, sent TERM as it makes the node's mount point.
+    ...(termed ? [`if [ "$1" = mkdir ]; then kill -TERM "$PPID"; fi`] : []),
     'exec "$@"',
   ].join("\n"));
   // The pod's DNS: the cluster's two Services, and nothing else.
@@ -206,6 +209,18 @@ test("a mount that ends without handing its session over fails, so kubelet start
   assert.equal(existsSync(join(failed.paths.run, "handed-over")), false);
   assert.match(failed.out(), /the metadata engine refused us/u);
   assert.match(failed.out(), /juicefs mount ended \(3\) without handing its mount over/u);
+});
+
+test("a mount told to stop before its juicefs starts starts none, and ends, as a pod deleted as it starts does; told to stop once it runs, passes it on to its juicefs", async (t) => {
+  const early = mount(t, "serves", { termed: true });
+  assert.equal(await early.ended, 0);
+  assert.match(early.out(), /told to stop before its juicefs started, so it starts none/u);
+  assert.ok(!early.inNode().some((command) => command.includes(" mount --no-bgjob ")), early.inNode().join("\n"));
+  const serving = mount(t, "serves");
+  await until(() => serving.ready());
+  serving.child.kill("SIGTERM");
+  await serving.ended;
+  assert.equal(existsSync(join(serving.paths.run, "juicefs.pid")) && spawnSync("kill", ["-0", readFileSync(join(serving.paths.run, "juicefs.pid"), "utf8").trim()]).status === 0, false);
 });
 
 test("a mount whose image's juicefs cannot be read, as one of a layer whose read failed, fails before it runs any juicefs, saying so", async (t) => {

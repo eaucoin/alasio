@@ -84,6 +84,7 @@ import {
   restrictedPod,
   selectorLabels,
   sha256,
+  TINI_SUBREAPER,
 } from "./common.ts";
 import { resumedConditionPolicy, sandboxPodPolicy } from "./admission.ts";
 import { durationSeconds, type InstallConfig } from "./config.ts";
@@ -387,7 +388,7 @@ function gatewayObjects(config: InstallConfig, carried: Carried): KubernetesObje
             name: GATEWAY_COMPONENT,
             image: imageReference(config.images.alasio),
             imagePullPolicy: config.images.pullPolicy,
-            command: ["node", "/opt/alasio/src/gateway/main.ts"],
+            args: ["node", "/opt/alasio/src/gateway/main.ts"],
             env: [
               { name: GATEWAY_CONFIG_VARIABLE, value: "/etc/gateway/config.json" },
               key(CALLER_KEY_VARIABLE, "caller-key"),
@@ -441,7 +442,7 @@ function receiverObjects(config: InstallConfig): KubernetesObject[] {
             name: RECEIVER_COMPONENT,
             image: imageReference(config.images.alasio),
             imagePullPolicy: config.images.pullPolicy,
-            command: ["node", "/opt/alasio/src/receiver/main.ts"],
+            args: ["node", "/opt/alasio/src/receiver/main.ts"],
             env: [
               { name: RECEIVER_PORT_VARIABLE, value: String(port) },
               { name: BINDING_KEY_VARIABLE, valueFrom: { secretKeyRef: { name: GATEWAY, key: "binding-key" } } },
@@ -612,6 +613,11 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     "  esac",
     `  printf '%s://%s%s%s\n' "$scheme" "$auth" "$address" "$tail"`,
     "}",
+    // Told to stop (TERM, INT) at any time, the script's start among it: noted, and passed on to
+    // its juicefs, as it runs; before it runs, it is not started.
+    "pid=",
+    "termed=",
+    `trap 'termed=1; [ -z "$pid" ] || kill -TERM "$pid"' TERM INT`,
     // The metadata engine's password given in META_PASSWORD, which JuiceFS reads, not in its
     // address on the command line, which every process of the node's PIDs could read.
     `META_PASSWORD=$(node -e 'process.stdout.write(decodeURIComponent(new URL(process.env.META_URL).password))') || exit 1`,
@@ -647,8 +653,11 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     "  fi",
     "fi",
     `${inNode} mkdir -p ${root}`,
+    `if [ -n "$termed" ]; then echo "told to stop before its juicefs started, so it starts none"; exit 0; fi`,
     `TMPDIR=${state} ${inNode} "$node_juicefs" mount --no-bgjob --metrics 0.0.0.0:${JUICEFS_METRICS_PORT} --bucket "$bucket" --cache-dir ${cache} --cache-size ${cacheSizeMiB} "$meta" ${root} >> "$run/juicefs.log" 2>&1 &`,
     "pid=$!",
+    // Told to stop as it started, before its PID was known: passed on now.
+    `[ -z "$termed" ] || kill -TERM "$pid"`,
     `echo "$pid" > "$run/juicefs.pid"`,
     `tail -n +1 -f "$run/juicefs.log" &`,
     "tailer=$!",
@@ -672,7 +681,6 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     `  if [ -n "$dead" ]; then ${inNode} umount -l ${root} && echo "unmounted the node's mount, which no juicefs served"; fi`,
     ") &",
     "watcher=$!",
-    `trap 'kill -TERM "$pid"' TERM INT`,
     `wait "$pid"; code=$?`,
     // A TERM's wait ends as the trap runs; the mount's own end is waited for.
     `while kill -0 "$pid" 2>/dev/null; do wait "$pid"; code=$?; done`,
@@ -760,8 +768,8 @@ function workspaceMount(config: InstallConfig, mountServices: Kept["mountService
             name: WORKSPACE_MOUNT_COMPONENT,
             image: imageReference(config.images.alasio),
             imagePullPolicy: config.images.pullPolicy,
-            command: ["sh", "-c", workspaceMountScript(WORKSPACES_ROOT, config.workspaceStorage.cacheSizeMiB)],
-            env: [credential("META_URL", "metaurl"), credential("BUCKET", "bucket"), credential("ACCESS_KEY", "access-key"), credential("SECRET_KEY", "secret-key")],
+            args: ["sh", "-c", workspaceMountScript(WORKSPACES_ROOT, config.workspaceStorage.cacheSizeMiB)],
+            env: [TINI_SUBREAPER, credential("META_URL", "metaurl"), credential("BUCKET", "bucket"), credential("ACCESS_KEY", "access-key"), credential("SECRET_KEY", "secret-key")],
             ports: [{ name: "metrics", containerPort: JUICEFS_METRICS_PORT }],
             readinessProbe: { exec: { command: ["sh", "-c", workspaceMountReady(WORKSPACES_ROOT)] }, periodSeconds: 2 },
             securityContext: { privileged: true },

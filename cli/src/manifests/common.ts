@@ -158,6 +158,14 @@ export function restrictedContainer(): V1SecurityContext {
   return { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } };
 }
 
+/**
+ * What a container of alasio's image is told where its pod shares the node's PIDs (hostPID):
+ * tini, the image's entrypoint, is no PID 1 there, so it makes itself its program's subreaper,
+ * reaping what the program leaves as it would as PID 1, rather than warn, each start, that it
+ * cannot.
+ */
+export const TINI_SUBREAPER: V1EnvVar = { name: "TINI_SUBREAPER", value: "1" };
+
 /** The resources of a short-lived helper container: an init container's, say. */
 export function helperResources(): Pick<V1Container, "resources"> {
   return { resources: { requests: { cpu: "10m", memory: "16Mi" }, limits: { memory: "64Mi" } } };

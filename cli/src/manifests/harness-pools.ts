@@ -152,7 +152,7 @@ function harnessTemplate(config: InstallConfig, environment: Environment, pool: 
         name: HARNESS_CONTAINER,
         image: imageReference(config.images.alasio),
         imagePullPolicy: config.images.pullPolicy,
-        command: ["node", "/opt/alasio/src/harness/main.ts"],
+        args: ["node", "/opt/alasio/src/harness/main.ts"],
         workingDir: home,
         env,
         ports: [{ name: "host", containerPort: HARNESS_POD_PORT }],

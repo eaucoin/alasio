@@ -46,7 +46,7 @@ import { memoryBytes } from "../capacity.ts";
 import { currentGvisorRelease, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { sessionsNamespace } from "./alasio.ts";
-import { componentName, given, imagePullSecrets, labels, MAIN_ENVIRONMENT, NAMESPACE, otelEnv, selectorLabels } from "./common.ts";
+import { componentName, given, imagePullSecrets, labels, MAIN_ENVIRONMENT, NAMESPACE, otelEnv, selectorLabels, TINI_SUBREAPER } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
@@ -129,7 +129,8 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
             name: CPU_FEATURES_CONTAINER,
             image: imageReference(config.images.alasio),
             imagePullPolicy: config.images.pullPolicy,
-            command: ["node", "/opt/alasio/src/node-agent/cpu-features.ts", currentGvisorRelease()],
+            args: ["node", "/opt/alasio/src/node-agent/cpu-features.ts", currentGvisorRelease()],
+            env: [TINI_SUBREAPER],
             securityContext: { privileged: true, runAsUser: 0 },
             resources: sessions.snapshots.nodeAgent.resources,
             volumeMounts,
@@ -138,8 +139,9 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
             name: "node-agent",
             image: imageReference(config.images.alasio),
             imagePullPolicy: config.images.pullPolicy,
-            command: ["node", "/opt/alasio/src/node-agent/main.ts"],
+            args: ["node", "/opt/alasio/src/node-agent/main.ts"],
             env: [
+              TINI_SUBREAPER,
               { name: "NODE_NAME", valueFrom: { fieldRef: { fieldPath: "spec.nodeName" } } },
               // Its pod's address, which it serves the bucket to its node's restores on (src/node-agent/store-proxy.ts).
               { name: POD_IP_VARIABLE, valueFrom: { fieldRef: { fieldPath: "status.podIP" } } },

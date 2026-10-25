@@ -41,7 +41,7 @@ export function setupPod(objects: readonly KubernetesObject[]): V1Pod {
       ...spec,
       restartPolicy: "Never",
       volumes: volumes.filter(({ name }) => !machine.has(name)),
-      containers: [{ ...served, command: ["node", "/opt/alasio/src/setup/main.ts"], volumeMounts: volumeMounts.filter(({ name }) => !machine.has(name)) }],
+      containers: [{ ...served, args: ["node", "/opt/alasio/src/setup/main.ts"], volumeMounts: volumeMounts.filter(({ name }) => !machine.has(name)) }],
     },
   };
 }

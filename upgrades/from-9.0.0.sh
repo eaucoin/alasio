@@ -213,13 +213,13 @@ sessions_claimed_before() {
   bash -c "$SETUP_POD" >"$OUT/setup-pod.json" 2>"$OUT/setup-pod.log" || fail "SETUP_POD failed, so the release's setup could not run (setup-pod.log): $(tail -n 3 "$OUT/setup-pod.log")"
   jq -e '.kind == "Pod" and (.spec.containers | length) == 1' "$OUT/setup-pod.json" >/dev/null || fail "SETUP_POD printed no pod of one container (setup-pod.json)"
 }
-# Runs the setup pod, as named `$1`, with its container's command `$2` (a JSON array) and, where
-# given, its SQL `$3`, to its end (run_pod).
+# Runs the setup pod, as named `$1`, with its container's arguments `$2` (a JSON array), which the
+# image's entrypoint, tini, runs, and, where given, its SQL `$3`, to its end (run_pod).
 one_off() {
   local name=$1
-  jq --arg name "$name" --argjson command "$2" --arg sql "${3:-}" '
+  jq --arg name "$name" --argjson args "$2" --arg sql "${3:-}" '
     .metadata.name = $name
-    | .spec.containers[0].command = $command
+    | .spec.containers[0].args = $args
     | if $sql == "" then . else .spec.containers[0].env += [{ name: "ALASIO_CUTOVER_SQL", value: $sql }] end
   ' "$OUT/setup-pod.json" >"$OUT/$name.json" || fail "the pod $name could not be made of setup-pod.json"
   run_pod "$name"
