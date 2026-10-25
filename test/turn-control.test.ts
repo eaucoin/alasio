@@ -719,6 +719,43 @@ test("a turn whose pod is lost as alasio drives it is run again, once, as the dr
   });
 });
 
+test("a job's turn whose pod is lost before its prompt was sent, as alasio drives it, runs the job again once, as itself: never failed, nor run again as lost, however late the loss is heard", async () => {
+  for (const told of ["at once", "late"] as const) {
+    const { store, conversationId } = await conversation();
+    const ran: string[] = [];
+    const never = Effect.runSync(Deferred.make<void>());
+    // Its first run waits on its pod, the prompt never sent; the next answers.
+    const harness = scriptedHarness((params) =>
+      Effect.suspend(() => {
+        ran.push(params.prompt);
+        return ran.length === 1 ? Effect.andThen(Deferred.await(never), answered(params, "Lost.")) : answered(params, "Done.");
+      })
+    );
+    const outbox = recordingOutbox();
+    await withServices({ store, harnesses: { [CODEX_HARNESS]: harness }, outbox: outbox.layer }, async (alasio) => {
+      const job = await run(store.enqueuePromptJob({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "6", prompt: "do it" }));
+      await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.schedule(conversationId)));
+      await until("the job to run on its pod", () => ran.length === 1);
+      if (told === "at once") {
+        await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.lose(conversationId, "broken")));
+      } else {
+        // Its drive finds the pod gone first; the loss is heard only after.
+        const { tell } = await alasio.runPromise(Effect.flatMap(Pools, (pools) => pools.loseUntold(conversationId, "broken")));
+        await sleep(2_000);
+        await alasio.runPromise(tell);
+      }
+      await until("the job to run again and end", async () => ran.length === 2 && (await run(store.getPromptJob(job.id)))?.state === "completed");
+      await until("the conversation to be idle", async () => (await run(store.getActiveTurn(conversationId))) === null);
+      await sleep(1_000);
+      assert.deepEqual(ran, ["do it", "do it"], told);
+      const said = [...outbox.queued.texts.map(({ text }) => text), ...outbox.queued.edits.map(({ text }) => text), ...(await run(store.getDueOutbox(50))).map(({ text }) => text)];
+      assert.deepEqual(said.filter((text) => text.includes("hit an error")), [], told);
+      assert.ok(said.includes("Codex never had this turn's message; it runs again."), `${told}: ${JSON.stringify(said)}`);
+      assert.equal(await run(store.hasOpenPromptJobs(conversationId)), false, told);
+    });
+  }
+});
+
 test("a recovery whose pod is lost too is given up, not run again, and the chat is told once to send the message again", async () => {
   const { store, schema, conversationId } = await conversation();
   const release = Effect.runSync(Deferred.make<void>());
@@ -748,6 +785,8 @@ test("a recovery whose pod is lost too is given up, not run again, and the chat 
     await sleep(500);
     assert.equal(ran.length, 2, "run again more than once");
     assert.equal(await toldGivenUp(), 1);
+    // Its job ended with it, never failed as its worker found its harness gone: told of it as given up alone.
+    assert.deepEqual(outbox.queued.texts.filter(({ text }) => text.includes("hit an error")), []);
     assert.equal(await run(store.hasOpenPromptJobs(conversationId)), false);
     assert.equal(outbox.queued.texts.filter(({ text }) => text === "Recovered.").length, 0, "the given-up recovery's reply delivered");
   });

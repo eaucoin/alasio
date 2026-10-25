@@ -561,7 +561,9 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
   const drain = Effect.fnUntraced(function*(conversationId: string): Effect.fn.Return<"empty" | "busy", StoreError> {
     /**
      * Whatever a job's turn failed with, the job fails with it and the operator is told why; but
-     * one run again since, its prompt never sent as its harness was lost, which runs again as itself.
+     * one run again since, its prompt never sent as its harness was lost, which runs again as
+     * itself, and one whose turn is left to its recovery, as its harness was not reached, which
+     * that recovery settles (Store.stageLostRecovery, reattach).
      */
     const failJob = Effect.fnUntraced(function*(job: PromptJob, error: unknown) {
       if (!(yield* store.failPromptJob(job.id, error))) return;

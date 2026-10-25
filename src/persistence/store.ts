@@ -180,10 +180,10 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
  * The lost turn's recovery, on the transaction's repositories `on`, as Store.stageLostRecovery
  * says: the turn ended first, so of what let go of it the first alone acts, and its response's
  * row locked, so no write of its pod's completes it meanwhile; a response complete already
- * delivered rather than run again; a job whose prompt was never sent run again as itself; and a
- * recovery itself lost let go of, and a turn not to be run again ended, the job of either
- * ended, so nothing runs it again; the chat told of each but a reply delivered, in the same
- * transaction, so once.
+ * delivered rather than run again; a job whose prompt was never sent run again as itself, and
+ * one not so ended with its turn, so nothing runs it again, a recovery itself lost let go of
+ * and a turn not to be run again among them; the chat told of each but a reply delivered, in
+ * the same transaction, so once.
  */
 const stageLostOn = (on: ReturnType<typeof repositories>, { conversationId, epoch, binding, messageId, prompt, rerun = true, said }: LostRecovery): Effect.Effect<LostRecoveryOutcome, StoreError> =>
   Effect.gen(function*() {
@@ -194,9 +194,9 @@ const stageLostOn = (on: ReturnType<typeof repositories>, { conversationId, epoc
     // Its job, never sent, run again as itself; a recovery's own, itself lost, given up rather than run again.
     const requeued = !completed && rerun && !turn.thread_ts.startsWith(LOST_PREFIX) && (yield* on.promptJobs.requeueUnsent(conversationId, turn.thread_ts));
     const outcome = completed ? "completed" : !rerun ? "ended" : requeued ? "requeued" : turn.thread_ts.startsWith(LOST_PREFIX) ? "given-up" : "staged";
+    // Its job, where it is not run again as itself, ended with it, never failed as its worker finds its harness gone.
+    if (!requeued) yield* on.promptJobs.endLeftOf(conversationId, turn.thread_ts, turn.started_at, completed);
     if (!completed && turn.pending_response_id !== null) yield* on.responses.markPendingAsPosted(turn.pending_response_id);
-    // Not run again, its job is not either, as one whose prompt was never sent would be once its worker's are settled.
-    if (outcome === "given-up" || outcome === "ended") yield* on.promptJobs.endRunning(conversationId, turn.thread_ts);
     if (outcome === "staged") yield* on.promptJobs.enqueue({ conversationId, chatId: turn.channel, messageId, prompt: prompt(turn), priority: 1, harness: turn.harness });
     // Said on its status message; where it has none, as a message of its own, but of a reply it completed, which says it.
     if (turn.status_outbox_id !== null) yield* on.outbox.enqueueEdit(turn.status_outbox_id, { chatId: turn.channel, text: said(outcome, turn) });

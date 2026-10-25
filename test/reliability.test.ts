@@ -402,13 +402,55 @@ test("a turn lost before its job's prompt was sent runs that job again as itself
   assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null);
 });
 
-test("a turn whose job's prompt its pod sent first is run again as a prompt of its own, its job left to its own recovery", async () => {
+test("a turn whose job's prompt its pod sent first is run again as a prompt of its own, its job ended with it, never failed nor run again: completed where its response was, interrupted otherwise; no other job of the conversation's", async () => {
+  const sent = async (store: Store["Service"]) => {
+    const left = await unsentJob(store, CONVERSATION);
+    assert.equal(await run(store.markPromptJobDispatched(left.job.id, left.epoch)), true);
+    return left;
+  };
+  {
+    const store = await codexConversation();
+    const { job, epoch } = await sent(store);
+    assert.equal((await run(store.stageLostRecovery(lostRecovery(CONVERSATION, epoch)))).outcome, "staged");
+    assert.equal((await run(store.getPromptJob(job.id)))?.state, "interrupted");
+    // Its worker, finding its harness gone, fails it no more.
+    assert.equal(await run(store.failPromptJob(job.id, "lost")), false);
+  }
+  {
+    // Its response complete, delivered rather than run again.
+    const store = await codexConversation();
+    const { job, epoch } = await sent(store);
+    const writer = store.turnPersistence(CONVERSATION, epoch);
+    const response = await run(writer.createPendingResponse("123", "21", null));
+    await run(writer.updateActiveTurnPendingResponseId(response));
+    await run(writer.markPendingResponseComplete(response));
+    assert.equal((await run(store.stageLostRecovery(lostRecovery(CONVERSATION, epoch)))).outcome, "completed");
+    assert.equal((await run(store.getPromptJob(job.id)))?.state, "completed");
+  }
+  {
+    // Another job running: of another message, claimed before the turn; and one of its message claimed after it began, in a millisecond of its own.
+    const schema = newSchema();
+    const store = await testStore({ schema });
+    await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "123", user: { id: 123 } })), CODEX_HARNESS));
+    const other = await run(store.enqueuePromptJob({ conversationId: CONVERSATION, chatId: "123", messageId: "30", prompt: "another" }));
+    await run(store.claimNextPromptJob(CONVERSATION));
+    const epoch = await run(store.claimTurn({ conversationId: CONVERSATION, chatId: "123", messageId: "21", harness: CODEX_HARNESS, prompt: "do it" }));
+    const later = await run(store.enqueuePromptJob({ conversationId: CONVERSATION, chatId: "123", messageId: "21", prompt: "do it" }));
+    assert.equal((await run(store.claimNextPromptJob(CONVERSATION)))?.id, later.id);
+    await (await testPool()).query(`update ${schema}.prompt_jobs j set started_at = date_trunc('milliseconds', t.started_at) + interval '1 millisecond' from ${schema}.turns t where t.id = j.conversation_id and j.id = $1`, [later.id]);
+    await run(store.markPromptJobUpstreamStarted(later.id, "session-1", "turn-1"));
+    assert.equal((await run(store.stageLostRecovery(lostRecovery(CONVERSATION, epoch)))).outcome, "staged");
+    assert.deepEqual([(await run(store.getPromptJob(other.id)))?.state, (await run(store.getPromptJob(later.id)))?.state], ["running", "running"]);
+  }
+});
+
+test("a turn lost as its host ran out of its memory, not run again, ends its job with it, its prompt never sent: interrupted, never failed nor run again", async () => {
   const store = await codexConversation();
   const { job, epoch } = await unsentJob(store, CONVERSATION);
-  assert.equal(await run(store.markPromptJobDispatched(job.id, epoch)), true);
-  const recovered = await run(store.stageLostRecovery(lostRecovery(CONVERSATION, epoch)));
-  assert.equal(recovered.outcome, "staged");
-  assert.equal((await run(store.getPromptJob(job.id)))?.state, "running");
+  assert.equal((await run(store.stageLostRecovery({ ...lostRecovery(CONVERSATION, epoch), rerun: false }))).outcome, "ended");
+  assert.equal((await run(store.getPromptJob(job.id)))?.state, "interrupted");
+  assert.equal(await run(store.failPromptJob(job.id, "out of memory")), false);
+  assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null);
 });
 
 test("a binding's loss heard for a turn whose job's prompt was never sent, as an alasio holding the conversation's claim attaches to it again or drives it, runs the job again once, as itself: what that alasio settles of the job after does nothing", async () => {
@@ -452,20 +494,26 @@ test("a pod's record of its job's prompt sent, waiting on the job's row as the j
   assert.equal((await run(store.getPromptJob(job.id)))?.upstream_dispatched_at, null);
 });
 
-test("a turn attached to again settles, as it ends, the job left of it, claimed in the millisecond it started in", async () => {
-  const schema = newSchema();
-  const store = await testStore({ schema });
-  await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "123", user: { id: 123 } })), CODEX_HARNESS));
-  const { job, epoch } = await unsentJob(store, CONVERSATION);
-  // Its job claimed, then its turn started, in one millisecond, which the turn's start is read to.
-  const pool = await testPool();
-  await pool.query(`update ${schema}.turns set started_at = date_trunc('milliseconds', started_at) + interval '900 microseconds' where id = $1`, [CONVERSATION]);
-  await pool.query(`update ${schema}.prompt_jobs j set started_at = date_trunc('milliseconds', t.started_at) + interval '400 microseconds' from ${schema}.turns t where t.id = j.conversation_id and j.id = $1`, [job.id]);
-  const turn = await run(store.getActiveTurn(CONVERSATION));
-  assert.equal(await run(store.markPromptJobDispatched(job.id, epoch)), true);
-  assert.equal((await run(store.stageLostRecovery(lostRecovery(CONVERSATION, epoch)))).outcome, "staged");
-  await run(store.recoverLeftPromptJobOf(CONVERSATION, turn!.started_at));
-  assert.equal((await run(store.getPromptJob(job.id)))?.state, "interrupted");
+test("a turn attached to again, or lost, settles as it ends the job left of it, claimed in the millisecond it started in", async () => {
+  for (const ended of ["attached to again", "lost"] as const) {
+    const schema = newSchema();
+    const store = await testStore({ schema });
+    await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "123", user: { id: 123 } })), CODEX_HARNESS));
+    const { job, epoch } = await unsentJob(store, CONVERSATION);
+    // Its job claimed, then its turn started, in one millisecond, which the turn's start is read to.
+    const pool = await testPool();
+    await pool.query(`update ${schema}.turns set started_at = date_trunc('milliseconds', started_at) + interval '900 microseconds' where id = $1`, [CONVERSATION]);
+    await pool.query(`update ${schema}.prompt_jobs j set started_at = date_trunc('milliseconds', t.started_at) + interval '400 microseconds' from ${schema}.turns t where t.id = j.conversation_id and j.id = $1`, [job.id]);
+    const turn = await run(store.getActiveTurn(CONVERSATION));
+    assert.equal(await run(store.markPromptJobDispatched(job.id, epoch)), true);
+    if (ended === "lost") {
+      assert.equal((await run(store.stageLostRecovery(lostRecovery(CONVERSATION, epoch)))).outcome, "staged");
+    } else {
+      assert.equal(await run(store.endTurn(CONVERSATION, epoch, "interrupted")), true);
+      await run(store.recoverLeftPromptJobOf(CONVERSATION, turn!.started_at));
+    }
+    assert.equal((await run(store.getPromptJob(job.id)))?.state, "interrupted", ended);
+  }
 });
 
 test("a turn ended as one not to be run again, as its pod ran out of its memory, has its job, never sent, ended with it, not run again as what its worker left is settled", async () => {

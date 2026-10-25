@@ -174,19 +174,6 @@ export class NeonPromptJobRepository {
     ).pipe(Effect.map((rows) => rows.length > 0));
   }
 
-  /**
-   * Settles as interrupted the conversation's job of `messageId` where it runs still, as of a turn
-   * not to be run again (a recovery itself lost, given up; one ended, as its pod ran out of its
-   * memory), in the transaction that ends that turn: so no settling of what its worker left
-   * (recoverLeft, recoverLeftOf) puts it back to run as one whose prompt was never sent.
-   */
-  endRunning(conversationId: string, messageId: string): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(
-      `update ${this.#schema}.prompt_jobs set state = 'interrupted', completed_at = coalesce(completed_at, now())
-       where conversation_id = $1 and message_id = $2 and state = 'running'`,
-      [conversationId, messageId],
-    ));
-  }
 
   markUpstreamStarted(id: string, sessionId: string | null | undefined, turnId: string | null | undefined): Effect.Effect<void, StoreError> {
     return Effect.asVoid(this.#sql.query(
@@ -205,12 +192,39 @@ export class NeonPromptJobRepository {
     ));
   }
 
-  /** Fails the job its worker runs, where it runs still, not run again since (requeueUnsent): whether it did. */
+  /**
+   * Fails the job its worker runs, where it runs still, not run again since (requeueUnsent), and
+   * its turn is not left active: one whose harness was not reached once its turn began, which that
+   * turn's recovery settles (endLeftOf, recoverLeftOf), is not failed, as it may yet run again as
+   * itself, its prompt never sent; nor one whose turn could not be ended as it failed, which the
+   * conversation's next claim settles (recoverLeft), its status message saying it failed. Whether
+   * it did.
+   */
   fail(id: string, error: unknown): Effect.Effect<boolean, StoreError> {
     return this.#sql.query(
-      `update ${this.#schema}.prompt_jobs set state = 'failed', last_error = $2, completed_at = now() where id = $1 and state = 'running' returning 1`,
+      `update ${this.#schema}.prompt_jobs j set state = 'failed', last_error = $2, completed_at = now()
+       where j.id = $1 and j.state = 'running'
+         and not exists (select 1 from ${this.#schema}.turns t where t.id = j.conversation_id and t.state = 'active' and t.thread_ts = j.message_id)
+       returning 1`,
       [id, String(error).slice(0, 2000)],
     ).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
+  /**
+   * Ends the job a worker runs of the conversation's turn of `messageId` that started at
+   * `turnStarted`, as that turn is ended lost and not run again as itself
+   * (Store.stageLostRecovery): completed, where the agent finished it or its turn's response was
+   * complete (`completed`); interrupted otherwise, never run again. That job alone, claimed before
+   * its turn started (as recoverLeftOf reads it), not one claimed anew since, nor another of the
+   * conversation's claimed as a turn not its own ran.
+   */
+  endLeftOf(conversationId: string, messageId: string, turnStarted: Date, completed: boolean): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `update ${this.#schema}.prompt_jobs
+       set state = case when upstream_completed_at is not null or $4 then 'completed' else 'interrupted' end, completed_at = coalesce(completed_at, now())
+       where conversation_id = $1 and message_id = $2 and state = 'running' and date_trunc('milliseconds', started_at) <= $3`,
+      [conversationId, messageId, turnStarted, completed],
+    ));
   }
 
   hasOpenJobs(conversationId: string): Effect.Effect<boolean, StoreError> {
