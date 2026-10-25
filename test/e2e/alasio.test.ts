@@ -3921,12 +3921,28 @@ if (inShard("agents")) {
       await tg.calls();
       await tg.say("tools");
       await tg.waitFor((call) => replied(call, `${ANSWER}\n\ntools: ${SESSION_FS_ENVIRONMENTS_TOML.trim()}`));
-      const reaches = (host: string, port: number) => kube.execOk(NAMESPACE, bound.metadata?.name ?? "", ["node", "-e", tcp(JSON.stringify(host), port)], { container: "harness" }).then((said) => said.trim());
+      const name = bound.metadata?.name ?? "";
+      const reaches = (host: string, port: number) => kube.execOk(NAMESPACE, name, ["node", "-e", tcp(JSON.stringify(host), port)], { container: "harness" }).then((said) => said.trim());
       const telegramAt = new URL(urlOf(TELEGRAM));
-      assert.equal(await reaches(telegramAt.hostname, Number(telegramAt.port || 443)), "blocked");
-      const sessionPodIp = (await sessionPod(session)).status?.podIP ?? "";
+      const target = await sessionPod(session);
+      const sessionPodIp = target.status?.podIP ?? "";
       assert.ok(sessionPodIp, "the session's pod has no address");
-      assert.equal(await reaches(sessionPodIp, 7290), "blocked");
+      const [toTelegram, toSession] = [await reaches(telegramAt.hostname, Number(telegramAt.port || 443)), await reaches(sessionPodIp, 7290)];
+      if (toTelegram !== "blocked" || toSession !== "blocked") {
+        // What let it through, said as it did: the pods, as the API server has them now, and what the node's rules held then;
+        // and what the session's bayma answered it, which takes the gateway's bearer alone.
+        const [now, pod] = [await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)), await kube.get<V1Pod>(ref("Pod", target.metadata?.name ?? "", SESSIONS))];
+        const said = (each: V1Pod | null | undefined) =>
+          `${each?.metadata?.namespace}/${each?.metadata?.name} at ${each?.status?.podIP}, made ${each?.metadata?.creationTimestamp}, ready since ${each?.status?.conditions?.find(({ type }) => type === "Ready")?.lastTransitionTime}, labelled ${JSON.stringify(each?.metadata?.labels)}`;
+        const [harnessIp, node] = [now?.status?.podIP ?? "", now?.spec?.nodeName ?? ""];
+        const rules = await onNode(node, [
+          "sysctl net.bridge.bridge-nf-call-iptables 2>&1",
+          `iptables-save -t filter 2>&1 | grep -nE '${harnessIp}[/ ]|${sessionPodIp}[/ ]|${name}|${target.metadata?.name}|^:KUBE' | head -200`,
+          `ipset list 2>&1 | grep -nE 'Name:|^${harnessIp}( |$)|^${sessionPodIp}( |$)' | head -200`,
+        ].join("; echo ----; ")).catch(String);
+        const answered = await kube.execOk(NAMESPACE, name, ["node", "-e", `fetch("http://${sessionPodIp}:7290/status",{signal:AbortSignal.timeout(3000)}).then(r=>console.log(r.status),e=>console.log(String(e)))`], { container: "harness" }).catch(String);
+        assert.fail(`${name} reached ${toTelegram === "blocked" ? "" : "Telegram, "}${toSession === "blocked" ? "" : `the session's pod's port 7290, whose bayma answered its /status ${answered.trim()}, `}which its network policies refuse it:\n${said(now)}\n${said(pod)}\nthe rules of ${node}:\n${rules}`);
+      }
     });
 
     test("an instance killed mid-turn has its turn run again once, on another, the chat told so", { timeout: 15 * 60_000 }, async () => {
