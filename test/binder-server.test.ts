@@ -200,24 +200,33 @@ test("a front told to stop answers a keep-alive caller's next request on the con
   const agent = new Agent({ keepAlive: true, maxSockets: 1 });
   try {
     const key = "sessionfs:kept";
-    /** A POST of `key`'s on the agent's one connection: its status and its not-passed header, once its body is read. */
-    const post = () => new Promise<{ status: number | undefined; notPassed: string | undefined }>((resolve, reject) => {
-      const asking = httpRequest({ host: "127.0.0.1", port: served.port, path: "/mcp", method: "POST", agent, headers: { authorization: caller(key), "content-length": "2" } }, (answered) => {
-        answered.resume();
-        answered.on("end", () => resolve({ status: answered.statusCode, notPassed: answered.headers[NOT_PASSED_HEADER] as string | undefined }));
+    /**
+     * A POST of `key`'s on the agent's one connection: its status and its not-passed header, once
+     * its body is read; and, once its answer's head has come, whether that keeps the connection.
+     */
+    const post = () => {
+      let headed: (kept: boolean) => void = () => {};
+      const head = new Promise<boolean>((resolve) => (headed = resolve));
+      const ended = new Promise<{ status: number | undefined; notPassed: string | undefined }>((resolve, reject) => {
+        const asking = httpRequest({ host: "127.0.0.1", port: served.port, path: "/mcp", method: "POST", agent, headers: { authorization: caller(key), "content-length": "2" } }, (answered) => {
+          headed(answered.headers.connection !== "close");
+          answered.resume();
+          answered.on("end", () => resolve({ status: answered.statusCode, notPassed: answered.headers[NOT_PASSED_HEADER] as string | undefined }));
+        });
+        asking.on("error", reject);
+        asking.end("{}");
       });
-      asking.on("error", reject);
-      asking.end("{}");
-    });
+      return { head, ended };
+    };
     const first = post();
-    for (const deadline = Date.now() + 10_000; served.inFlight(of, key) === 0; await new Promise((resolve) => setTimeout(resolve, 20))) {
-      assert.ok(Date.now() < deadline, "the call never went through");
-    }
+    // Its answer's head come, keeping its connection, before the stop: an answer whose head the stop
+    // finds unsent is told to close its connection instead, and the next request opens another.
+    assert.equal(await first.head, true);
     const stopped = served.close();
     // Queued behind the first on the agent's one connection, sent on it as the first's answer ends.
     const queued = post();
-    assert.equal((await first).status, 200);
-    const next = await queued;
+    assert.equal((await first.ended).status, 200);
+    const next = await queued.ended;
     // On the connection kept, as its listener is closed: answered as passed to no pod, the pod not asked.
     assert.deepEqual([next.status, next.notPassed, sent], [503, "true", 1]);
     await stopped;
