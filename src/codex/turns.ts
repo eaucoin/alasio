@@ -90,6 +90,13 @@ const unheldTaken = meter.createCounter(UNHELD_TAKEN, {
  */
 const ADMIT_BUSY_WITHIN = Duration.seconds(5);
 
+/**
+ * How long a goal's turn, as it starts, waits for the turn Codex runs on the goal's session to
+ * be heard of, which it attaches to (run): Codex starts one as a goal is set active, in a
+ * moment; one it never starts, or whose goal's set long since, the turn starts itself past it.
+ */
+const GOAL_TURN_LOOKED_FOR_MS = 5_000;
+
 /** How a held prompt's question is asked again where the store fails it: a few times, within a few seconds. */
 const ASKED_AGAIN = Schedule.max([Schedule.exponential("200 millis"), Schedule.recurs(4)]);
 
@@ -220,8 +227,16 @@ export class Turns extends Context.Service<Turns, {
   readonly setPromptDisposition: (jobId: string, state: PromptJobState, priority?: number) => Effect.Effect<PromptJob | null, StoreError>;
   /** Runs a turn on the conversation's mounted session now: whether its response completed. */
   readonly run: (request: TurnRequest) => Effect.Effect<boolean, TurnError>;
-  /** Runs a goal's turn on its session, or asks what to do with it while a turn runs. */
-  readonly runGoalTurn: (request: GoalTurnRequest) => Effect.Effect<boolean, TurnError>;
+  /**
+   * Queues a goal's turn as a prompt job of its request's message (GoalTurnRequest), of its
+   * goal's session, which it runs on as run says, as it starts: as the conversation is free,
+   * or, while a turn runs in it, held for the operator to say what to do with it, as an
+   * operator's prompt is. Queued once for its message, a goal's command run again, as one kept
+   * is after its alasio stopped, finds it queued; and kept as soon as it is asked for, so a
+   * stop before its turn starts loses it no more than a prompt's. Whether it was queued to run,
+   * or held.
+   */
+  readonly runGoalTurn: (request: GoalTurnRequest) => Effect.Effect<"queued" | "held", StoreError>;
   /** A new, empty session of the mounted service, mounted on the conversation: its id. */
   readonly startNewSession: (conversationId: string) => Effect.Effect<string, NoServiceMounted | HarnessUnavailable | ConversationBusy | HarnessError | StoreError>;
   /** Queues every completed response that was never delivered. */
@@ -516,10 +531,27 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
     return completed;
   }, withLogScope(LOG_SCOPE));
 
-  /** A turn on the conversation's mounted session, in the trace `traceparent` names (null: one of its own). */
-  const run = Effect.fnUntraced(function*(request: TurnRequest & { readonly traceparent: string | null }): Effect.fn.Return<boolean, TurnError> {
+  /**
+   * A turn on the conversation's mounted session, in the trace `traceparent` names (null: one
+   * of its own). Of a goal's turn, `goal`, decided as it starts, against the conversation as it
+   * is then, so what the operator mounted since wins: on the goal's session where the
+   * conversation mounts it still, attached to the turn Codex runs on it then where it runs one,
+   * started with the goal as its prompt otherwise; not run, its chat told so, where the
+   * conversation mounts another session now, or a harness without goals.
+   */
+  const run = Effect.fnUntraced(function*(request: TurnRequest & { readonly traceparent: string | null; readonly goalSession?: string | null | undefined }): Effect.fn.Return<boolean, TurnError> {
+    const { goalSession = null, ...turn } = request;
     const mount = yield* store.getMount(request.conversationId);
-    return yield* runSessionTurn(mount, { ...request, existingSession: mount.sessionId, attachedTurn: null });
+    if (goalSession === null) return yield* runSessionTurn(mount, { ...turn, existingSession: mount.sessionId, attachedTurn: null });
+    const harness = yield* panels.requireForMount(request.conversationId, mount);
+    const notRun = (why: string) => Effect.as(outbox.enqueueText({ chatId: request.chatId, text: `The goal's turn was not run, as ${why}.` }), false);
+    if (!harness.supportsGoals) return yield* notRun(`${harness.displayName}, which has no goals, is the service now`);
+    if (mount.sessionId !== goalSession || !mount.workingDirectory) return yield* notRun(`${harness.displayName} has another session mounted now. Send /goal to see the goal of the one mounted`);
+    // The turn Codex runs on the goal's session now, of the goal's own, as Codex starts one.
+    const running = yield* host.goals({ conversationId: request.conversationId, harness: harness.name, workingDirectory: mount.workingDirectory }).waitForTurnId(goalSession, GOAL_TURN_LOOKED_FOR_MS).pipe(
+      Effect.catch((error) => Effect.as(Effect.logWarning(`could not tell whether Codex runs a turn of ${request.conversationId}'s goal: ${error.message}`), null)),
+    );
+    return yield* runSessionTurn(mount, { ...turn, existingSession: goalSession, attachedTurn: running ? { sessionId: goalSession, turnId: running } : null });
   });
 
   /**
@@ -600,6 +632,7 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
           fileIds: job.file_ids,
           jobId: job.id,
           traceparent: job.traceparent,
+          goalSession: job.goal_session_id,
         })),
         // Settled where it runs still, not run again since as its prompt was never sent (Store.stageLostRecovery).
         Effect.flatMap((completed) => store.settleRunningPromptJob(job.id, completed ? "completed" : "cancelled")),
@@ -928,28 +961,18 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
     }),
     // The trace a turn asked for without one is the asker's, read before the turn is forked.
     run: (request) => Effect.suspend(() => runDirect(request.conversationId, run({ ...request, traceparent: request.traceparent === undefined ? currentTraceparent() : request.traceparent }))),
-    runGoalTurn: Effect.fnUntraced(function*({ conversationId, chatId, messageId, sessionId, turnId, prompt }) {
-      const held = yield* asking.withPermit(Effect.gen(function*() {
-        if (!(yield* isBusy(conversationId))) return false;
-        const job = yield* store.enqueuePromptJob({ conversationId, chatId, messageId, prompt, state: "awaiting_choice" });
-        // Asked about once: a goal's command run again finds its job held, and asked about, already.
-        if (!(yield* store.hasCallbackActionsOfJob(job.id))) yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job });
-        return true;
-      }));
-      if (held) {
-        return true;
-      }
+    runGoalTurn: Effect.fnUntraced(function*({ conversationId, chatId, messageId, sessionId, prompt }) {
       const traceparent = currentTraceparent();
-      yield* runDirect(
-        conversationId,
-        Effect.gen(function*() {
-          // The thread of the operator's choice, of its goals' panel: given the conversation.
-          yield* store.mountGivenSession(conversationId, sessionId);
-          const mount = yield* store.getMount(conversationId);
-          return yield* runSessionTurn(mount, { conversationId, chatId, messageId, prompt, existingSession: sessionId, attachedTurn: turnId ? { sessionId, turnId } : null, traceparent });
-        }),
-      );
-      return true;
+      // Held or not as decided one at a time with the questions about held prompts (asking), as an operator's prompt is.
+      const job = yield* asking.withPermit(Effect.gen(function*() {
+        const state = (yield* isBusy(conversationId)) ? "awaiting_choice" : "pending";
+        const queued = yield* store.enqueuePromptJob({ conversationId, chatId, messageId, prompt, state, traceparent, goalSessionId: sessionId });
+        // Asked about once: a goal's command run again finds its job held, and asked about, already.
+        if (queued.state === "awaiting_choice" && !(yield* store.hasCallbackActionsOfJob(queued.id))) yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job: queued });
+        return queued;
+      }));
+      if (job.state === "pending") yield* schedule(conversationId);
+      return job.state === "pending" ? "queued" : "held";
     }),
     startNewSession: Effect.fnUntraced(function*(conversationId) {
       const mount = yield* store.getMount(conversationId);

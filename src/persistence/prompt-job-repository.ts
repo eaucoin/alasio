@@ -33,6 +33,8 @@ export interface PromptJob {
   readonly upstream_completed_at: Date | null;
   readonly last_error: string | null;
   readonly traceparent: string | null;
+  /** Of a goal's turn: the session its goal is of, which it runs on where the conversation mounts it still. */
+  readonly goal_session_id: string | null;
   readonly created_at: Date;
   readonly started_at: Date | null;
   readonly completed_at: Date | null;
@@ -52,6 +54,8 @@ export interface NewPromptJob {
   readonly harness?: HarnessName | undefined;
   /** The W3C traceparent of the trace the prompt was queued in. */
   readonly traceparent?: string | null | undefined;
+  /** Of a goal's turn: the session its goal is of, which it runs on where the conversation mounts it still. */
+  readonly goalSessionId?: string | null | undefined;
 }
 
 export class NeonPromptJobRepository {
@@ -67,14 +71,14 @@ export class NeonPromptJobRepository {
    * Queues a prompt: the job queued, or the one already queued for its message, as an update
    * handled again queues it again.
    */
-  enqueue({ conversationId, chatId, messageId, prompt, visibleText = prompt, fileIds = [], state = "pending", priority = 0, harness, traceparent = null }: NewPromptJob): Effect.Effect<PromptJob, StoreError> {
+  enqueue({ conversationId, chatId, messageId, prompt, visibleText = prompt, fileIds = [], state = "pending", priority = 0, harness, traceparent = null, goalSessionId = null }: NewPromptJob): Effect.Effect<PromptJob, StoreError> {
     // The no-op update makes the job already queued the one returned.
     return this.#sql.query<PromptJob>(
-      `insert into ${this.#schema}.prompt_jobs (id, conversation_id, chat_id, message_id, prompt, visible_text, file_ids, harness, state, priority, traceparent)
-       select $1, id, $3, $4, $5, $11, $6, coalesce($7, active_harness), $8, $9, $10 from ${this.#schema}.conversations where id = $2
+      `insert into ${this.#schema}.prompt_jobs (id, conversation_id, chat_id, message_id, prompt, visible_text, file_ids, harness, state, priority, traceparent, goal_session_id)
+       select $1, id, $3, $4, $5, $11, $6, coalesce($7, active_harness), $8, $9, $10, $12 from ${this.#schema}.conversations where id = $2
        on conflict (conversation_id, message_id) do update set conversation_id = excluded.conversation_id
        returning *`,
-      [newId(), conversationId, String(chatId), String(messageId), prompt, fileIds, harness ?? null, state, priority, traceparent, visibleText],
+      [newId(), conversationId, String(chatId), String(messageId), prompt, fileIds, harness ?? null, state, priority, traceparent, visibleText, goalSessionId],
     ).pipe(Effect.map(([row]) => row!));
   }
 

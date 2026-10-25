@@ -1,7 +1,7 @@
 import type { v2 } from "../../.types/codex/index.js";
 import { Effect } from "effect";
 
-import { type TurnError, Turns } from "../codex/turns.ts";
+import { Turns } from "../codex/turns.ts";
 import { HarnessHost } from "../harness/host.ts";
 import { shownBusy, stopTurn } from "../harness/commands.ts";
 import type { HarnessError, HarnessGoals } from "../harness/index.ts";
@@ -9,23 +9,26 @@ import type { CallbackPayload } from "../persistence/callback-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { type ChatId, TelegramClient, type TelegramError } from "../telegram/client.ts";
-import { type CommandMessage, firstTime, madeOnce } from "./made-once.ts";
+import { madeOnce } from "./made-once.ts";
 import { type ButtonDraft, type ControlCallback, closePanel, editPanel, keepPanel, type PanelDraft, sendPanel } from "./panel.ts";
 import type { NewSessionError } from "./session-control.ts";
 import { truncateText } from "./text.ts";
 
-/** A turn to run toward a goal: attached to the goal's own turn when it has one, else started with `prompt`. */
+/** What a press of a goal's panel asks for its goal's turn as (ensureGoalTurn): its query, the same however often the press is run, another for another press. */
+export const goalPressKey = (callbackQueryId: string): string => `goal:${callbackQueryId}`;
+
+/** A turn to run toward a goal, on its session: attached to the goal's own turn as it starts where Codex runs one, else started with `prompt` (Turns.runGoalTurn). */
 export interface GoalTurnRequest {
   readonly conversationId: string;
   readonly chatId: ChatId;
-  readonly messageId: number;
+  /** What asked for the goal's turn, the message its prompt job is of: a command's, or a press's (ensureGoalTurn). */
+  readonly messageId: number | string;
   readonly sessionId: string;
-  readonly turnId: string | null;
   readonly prompt: string;
 }
 
 /** How changing a goal fails, as its panel says. */
-type GoalError = HarnessError | NewSessionError | TurnError | TelegramError | StoreError;
+type GoalError = HarnessError | NewSessionError | TelegramError | StoreError;
 
 /** What the goal controls run on: the store, Telegram, and the turns, running and to run. */
 export type GoalServices = Store | TelegramClient | HarnessHost | Turns;
@@ -35,7 +38,6 @@ export type GoalTurnState = "working" | "starting" | "queued" | "idle";
 
 const GOAL_KIND_PREFIX = "goal:";
 const UNFINISHED_STATUSES = new Set<v2.ThreadGoalStatus>(["active", "paused", "blocked", "usageLimited", "budgetLimited"]);
-const GOAL_TURN_WAIT_MS = 5 * 1000;
 
 function goalKind(kind: string): string {
   return `${GOAL_KIND_PREFIX}${kind}`;
@@ -255,35 +257,24 @@ function buildGoalTurnPrompt(goal: v2.ThreadGoal): string {
 }
 
 /**
- * Runs a goal's turn when the goal is active: attached to the turn Codex started for it,
- * if it starts one soon, or started with the goal as its prompt. Whether it took the
- * turn over, so that no idle panel is needed. Asked for by a command, `once`, its message,
- * as the command is run again after its alasio stopped (../telegram/controls.ts): asked for
- * once, the run again taking it as taken over, as a turn its alasio left is attached to
- * again by the next (../codex/turns.ts takeUnheld), rather than asked for twice.
+ * Asks for a goal's turn when the goal is active (Turns.runGoalTurn), queued as a prompt job of
+ * `messageId`, which names what asked for it: a command's message, which the command run again
+ * after its alasio stopped (../telegram/controls.ts) asks for again and finds it queued; or a
+ * press of a goal's panel, by its query, as a press run again is the same press, and another
+ * press of the panel another. Whether it was asked for, queued to run or held while a turn
+ * runs; none where the goal is not active, so that its idle panel is shown.
  */
-const ensureGoalTurn = Effect.fnUntraced(function*({ conversationId, chatId, messageId, sessionId, goal, goals, once }: {
+const ensureGoalTurn = Effect.fnUntraced(function*({ conversationId, chatId, messageId, sessionId, goal }: {
   readonly conversationId: string;
   readonly chatId: ChatId;
-  readonly messageId: number;
+  readonly messageId: number | string;
   readonly sessionId: string;
   readonly goal: v2.ThreadGoal | null;
-  readonly goals: HarnessGoals;
-  readonly once?: CommandMessage | undefined;
-}): Effect.fn.Return<boolean, GoalError, Turns | Store> {
+}): Effect.fn.Return<"queued" | "held" | null, GoalError, Turns> {
   if (goal?.status !== "active") {
-    return false;
+    return null;
   }
-  const turnId = yield* goals.waitForTurnId(sessionId, GOAL_TURN_WAIT_MS);
-  if (once && !(yield* firstTime(once, "goal-turn"))) return true;
-  return yield* Effect.flatMap(Turns, (turns) => turns.runGoalTurn({
-    conversationId,
-    chatId,
-    messageId,
-    sessionId,
-    turnId,
-    prompt: buildGoalTurnPrompt(goal),
-  }));
+  return yield* Effect.flatMap(Turns, (turns) => turns.runGoalTurn({ conversationId, chatId, messageId, sessionId, prompt: buildGoalTurnPrompt(goal) }));
 });
 
 const setFreshObjectiveGoal = Effect.fnUntraced(function*({ sessionId, objective, currentGoal, goals }: {
@@ -415,7 +406,7 @@ export const handleGoalTextCommand = Effect.fnUntraced(function*({ conversationI
         return yield* sendGoalPanel({ conversationId, chatId, isTurnActive, goals });
       }
       const goal = yield* goals.set({ threadId: sessionId, status: "active" });
-      if (yield* ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal, goals, once: { conversationId, messageId } })) {
+      if (yield* ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal })) {
         return;
       }
       return yield* sendKnownGoalPanel(sessionId, goal);
@@ -436,7 +427,7 @@ export const handleGoalTextCommand = Effect.fnUntraced(function*({ conversationI
       return yield* send(buildReplaceGoalPanel({ currentGoal: objective.replacing, objective: trimmed }));
     }
     const { goal } = objective;
-    if (yield* ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal, goals, once: { conversationId, messageId } })) {
+    if (yield* ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal })) {
       return;
     }
     yield* sendKnownGoalPanel(sessionId, goal);
@@ -517,8 +508,10 @@ export const handleGoalControlCallback = Effect.fnUntraced(function*({
     }
 
     yield* edit(panel);
-    if (goalToRun && !(yield* ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal: goalToRun, goals }))) {
-      yield* edit(buildPanelForKnownGoal({ sessionId, goal: goalToRun, turnState: "idle" }));
+    if (goalToRun) {
+      // Held while a turn runs, queued; not active, idle.
+      const asked = yield* ensureGoalTurn({ conversationId, chatId, messageId: goalPressKey(callbackQueryId), sessionId, goal: goalToRun });
+      if (asked !== "queued") yield* edit(buildPanelForKnownGoal({ sessionId, goal: goalToRun, turnState: asked === "held" ? "queued" : "idle" }));
     }
   }).pipe(
     Effect.catch((error) =>

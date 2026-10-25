@@ -162,7 +162,7 @@ test("the cut-over's pod, refused by the database itself, as of a password it do
   }
 });
 
-test("the cut-over gives each conversation the sessions its rows name, as this release records them as they are written, and the threads their histories start in, drops 9.0.0's tally of albums and its restart events, keeps its kept presses as controls, and nothing more run again", async () => {
+test("the cut-over gives each conversation the sessions its rows name, as this release records them as they are written, and the threads their histories start in, drops 9.0.0's tally of albums and its restart events, gives its prompt jobs a goal's session, keeps its kept presses as controls, and nothing more run again", async () => {
   assert.match(SESSIONS_CLAIMED, /insert into state\.conversation_sessions/u);
   const database = await startPostgres();
   const pool = new pg.Pool({ connectionString: database.url, max: 2 });
@@ -198,6 +198,7 @@ test("the cut-over gives each conversation the sessions its rows name, as this r
     // both of which this release keeps none of; and its turns, which have no column of the binding each runs on.
     await pool.query("delete from state.conversation_sessions");
     await pool.query("alter table state.turns drop column binding");
+    await pool.query("alter table state.prompt_jobs drop column goal_session_id");
     await pool.query("create table state.media_group_failures (media_group_id text primary key, failures integer not null default 1)");
     await pool.query("create table state.restart_events (thread_key text primary key, cause text not null, channel text not null, thread_ts text not null, session_id text, command text, recorded_at timestamptz not null default now())");
     await pool.query("insert into state.restart_events (thread_key, cause, channel, thread_ts, session_id) values ($1, 'external', '41', '1', 'a-restarted')", [first]);
@@ -215,6 +216,7 @@ test("the cut-over gives each conversation the sessions its rows name, as this r
     assert.equal((await pool.query("select to_regclass('state.media_group_failures') as kept")).rows[0]?.kept, null, "9.0.0's tally of albums is kept");
     assert.equal((await pool.query("select to_regclass('state.restart_events') as kept")).rows[0]?.kept, null, "9.0.0's restart events are kept");
     assert.equal((await pool.query("select count(*) from information_schema.columns where table_schema = 'state' and table_name = 'turns' and column_name = 'binding'")).rows[0]?.count, "1", "9.0.0's turns have no binding");
+    assert.equal((await pool.query("select count(*) from information_schema.columns where table_schema = 'state' and table_name = 'prompt_jobs' and column_name = 'goal_session_id'")).rows[0]?.count, "1", "9.0.0's jobs have no goal's session");
     // Its kept press a control of this release's, to run again; its table gone.
     assert.deepEqual(await run(store.takeLapsedControls("next", 60_000)), [{ control: { kind: "press", callbackQuery, action }, answer: null }]);
     assert.equal((await pool.query("select to_regclass('state.press_jobs') as kept")).rows[0]?.kept, null, "9.0.0's kept presses' table is kept");

@@ -9,6 +9,7 @@ import { Turns } from "../src/codex/turns.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { GoalUpdate, HarnessGoals } from "../src/harness/index.ts";
 import {
+  goalPressKey,
   type GoalTurnRequest,
   buildGoalPanel,
   buildNoActiveGoalPanel,
@@ -114,13 +115,13 @@ async function codexConversation(): Promise<Store["Service"]> {
   return store;
 }
 
-/** A runGoalTurn that records each goal turn asked for, and takes it over. */
-function recordGoalTurns(runCalls: GoalTurnRequest[]): Pick<Turns["Service"], "runGoalTurn"> {
+/** A runGoalTurn that records each goal turn asked for, and queues it, or holds it where `held` says. */
+function recordGoalTurns(runCalls: GoalTurnRequest[], { held = false }: { readonly held?: boolean } = {}): Pick<Turns["Service"], "runGoalTurn"> {
   return {
     runGoalTurn: (args) =>
       Effect.sync(() => {
         runCalls.push(args);
-        return true;
+        return held ? "held" as const : "queued" as const;
       }),
   };
 }
@@ -222,7 +223,7 @@ test("replace panel requires explicit confirmation", () => {
   );
 });
 
-test("goal text command starts a fallback turn when upstream does not create one", async () => {
+test("goal text command asks for its goal's turn, of its prompt, the turn Codex runs looked for as the turn starts", async () => {
   const goal = createGoals({
     updatedGoal: threadGoal({ objective: "Refactor CI", status: "active", tokensUsed: 0 }),
     waitTurnId: null,
@@ -231,9 +232,9 @@ test("goal text command starts a fallback turn when upstream does not create one
   await withGoalControls({ turns: () => recordGoalTurns(runCalls) }, async (alasio, { calls }) => {
     await alasio.runPromise(handleGoalTextCommand({ conversationId: CONVERSATION, chatId: 123, messageId: 456, args: "Refactor CI", goals: goal.goals }));
     assert.equal(goal.calls.set.length, 1);
-    assert.equal(goal.calls.waitForTurnId.length, 1);
+    // Looked for as its turn starts, not as it is asked for (Turns.runGoalTurn).
+    assert.equal(goal.calls.waitForTurnId.length, 0);
     assert.equal(runCalls.length, 1);
-    assert.equal(runCalls[0]?.turnId, null);
     assert.match(runCalls[0]?.prompt ?? "", /Continue working toward this Codex goal\./);
     assert.match(runCalls[0]?.prompt ?? "", /Refactor CI/);
     assert.equal(calls.sendMessage.length, 0);
@@ -269,7 +270,7 @@ test("goal text command bootstraps a fresh session when none is mounted", async 
   });
 });
 
-test("goal text command run again for the message it came in, as a kept one is after its alasio stopped, sets its goal once, on the session its run before started, asking nothing of the goal it set, and asks for its turn once", async () => {
+test("goal text command run again for the message it came in, as a kept one is after its alasio stopped, sets its goal once, on the session its run before started, asking nothing of the goal it set, its turn asked for of its message", async () => {
   // Goals as Codex keeps them: the one set read back.
   const goal = createGoals({ waitTurnId: null });
   let kept: v2.ThreadGoal | null = null;
@@ -294,8 +295,8 @@ test("goal text command run again for the message it came in, as a kept one is a
     for (let ran = 0; ran < 2; ran += 1) await alasio.runPromise(handleGoalTextCommand({ conversationId: CONVERSATION, chatId: 123, messageId: 456, args: "Refactor CI", goals }));
     assert.deepEqual(startCalls, [CONVERSATION]);
     assert.equal(goal.calls.set.length, 1);
-    // Its goal's turn asked for once: one its run before left running is attached to again by the next alasio, not asked for anew.
-    assert.equal(runCalls.length, 1);
+    // Its goal's turn asked for of the command's message each time, which queues it once (Turns.runGoalTurn).
+    assert.deepEqual(runCalls.map(({ messageId }) => messageId), [456, 456]);
     assert.equal(calls.sendMessage.length, 0, "asked before replacing the goal its run before set");
   });
 });
@@ -340,21 +341,7 @@ test("goal replace callback clears stale goal state before setting replacement",
   assert.equal(runCalls.length, 1);
 });
 
-test("goal text command attaches to an upstream-created goal turn when present", async () => {
-  const goal = createGoals({
-    updatedGoal: threadGoal({ objective: "Refactor CI", status: "active", tokensUsed: 0 }),
-    waitTurnId: "goal-turn",
-  });
-  const runCalls: GoalTurnRequest[] = [];
-  await withGoalControls({ turns: () => recordGoalTurns(runCalls) }, async (alasio) => {
-    await alasio.runPromise(handleGoalTextCommand({ conversationId: CONVERSATION, chatId: 123, messageId: 456, args: "Refactor CI", goals: goal.goals }));
-  });
-  assert.equal(runCalls.length, 1);
-  assert.equal(runCalls[0]?.sessionId, "session-1");
-  assert.equal(runCalls[0]?.turnId, "goal-turn");
-});
-
-test("goal resume callback edits to starting before fallback turn execution", async () => {
+test("goal resume callback edits to starting before it asks for the goal's turn, as its press", async () => {
   const goal = createGoals({
     currentGoal: threadGoal({ objective: "Refactor CI", status: "paused", tokensUsed: 0 }),
     updatedGoal: threadGoal({ objective: "Refactor CI", status: "active", tokensUsed: 0 }),
@@ -373,7 +360,26 @@ test("goal resume callback edits to starting before fallback turn execution", as
     assert.match(calls.editMessageText[0]?.[2] ?? "", /Turn: starting/);
   });
   assert.equal(runCalls.length, 1);
-  assert.equal(runCalls[0]?.turnId, null);
+  // Asked for as the press's, by its query: the same press run again asks so again, another press of the panel not.
+  assert.equal(runCalls[0]?.messageId, goalPressKey("callback-1"));
+});
+
+test("goal resume callback whose goal's turn is held while a turn runs shows it queued", async () => {
+  const goal = createGoals({
+    currentGoal: threadGoal({ objective: "Refactor CI", status: "paused", tokensUsed: 0 }),
+    updatedGoal: threadGoal({ objective: "Refactor CI", status: "active", tokensUsed: 0 }),
+  });
+  const runCalls: GoalTurnRequest[] = [];
+  await withGoalControls({ turns: () => recordGoalTurns(runCalls, { held: true }) }, async (alasio, { calls }) => {
+    await alasio.runPromise(handleGoalControlCallback({
+      action: { id: "action-1", kind: "goal:resume", conversationId: CONVERSATION, payload: {} },
+      callbackQueryId: "callback-1",
+      chatId: 123,
+      messageId: 456,
+      goals: goal.goals,
+    }));
+    assert.deepEqual(calls.editMessageText.map(([, , text]) => /Turn: (\w+)/u.exec(text)?.[1]), ["starting", "queued"]);
+  });
 });
 
 test("a goal that cannot be changed says why on its panel", async () => {
@@ -390,7 +396,7 @@ test("a goal that cannot be changed says why on its panel", async () => {
 test("goal turns use normal concurrent-message decision panel when Codex is already working, asked once though the goal's command asks again", async () => {
   const store = await codexConversation();
   const outbox = recordingOutbox();
-  const handled = await withServices({ store, outbox: outbox.layer }, (alasio) =>
+  await withServices({ store, outbox: outbox.layer }, (alasio) =>
     // Codex is working: a turn of the conversation is running.
     alasio.runPromise(Effect.scoped(Effect.gen(function*() {
       yield* bindHarness(CONVERSATION);
@@ -399,10 +405,10 @@ test("goal turns use normal concurrent-message decision panel when Codex is alre
       const turns = yield* Turns;
       const goalTurn = { conversationId: CONVERSATION, chatId: 123, messageId: 456, sessionId: "session-1", turnId: null, prompt: "Continue working toward this Codex goal.\n\nRefactor CI" };
       // Asked for again, as its command run again after its alasio stopped asks.
-      return [yield* turns.runGoalTurn(goalTurn), yield* turns.runGoalTurn(goalTurn)];
+      yield* turns.runGoalTurn(goalTurn);
+      yield* turns.runGoalTurn(goalTurn);
     }))));
 
-  assert.deepEqual(handled, [true, true]);
   assert.equal(outbox.queued.texts.length, 1);
   // The question is queued to the outbox, in the chat's order.
   const [question] = outbox.queued.texts;

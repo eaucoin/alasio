@@ -5,8 +5,6 @@
  * before made, kept in the store under a key its message names, rather than make another.
  * What its run before made but had not kept yet, cut short between the two, is made again.
  */
-import { randomUUID } from "node:crypto";
-
 import { Effect } from "effect";
 
 import type { StoreError } from "../persistence/sql.ts";
@@ -31,16 +29,4 @@ export const madeOnce = <A extends NonNullable<unknown>, E, R>(message: CommandM
     const kept = (yield* store.controlResult(key)) as A | null;
     if (kept !== null) return kept;
     return (yield* store.keepControlResult(key, yield* make)) as A;
-  });
-
-/**
- * Whether this is the first time the command of `message` comes to `what`, as kept in the
- * store as it does: false for a run again of a command whose run before came to it, as one
- * that asks for something no store keeps, a goal's turn, asks for it once.
- */
-export const firstTime = (message: CommandMessage, what: string): Effect.Effect<boolean, StoreError, Store> =>
-  Effect.gen(function*() {
-    const token = randomUUID();
-    const kept = (yield* Effect.flatMap(Store, (store) => store.keepControlResult(`${message.conversationId}:${message.messageId}:${what}`, { token }))) as { readonly token?: string };
-    return kept.token === token;
   });

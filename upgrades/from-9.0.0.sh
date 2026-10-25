@@ -174,12 +174,15 @@ SETUP_POD_NAME=alasio-setup
 # reads, as it attaches again to a turn 9.0.0's stop left, by its turn's row, which names its
 # session: their tables dropped. And first, the column of the binding a turn runs on, which a
 # binding's loss ends that turn alone by (src/persistence/schema.ts turns.binding), which 9.0.0's
-# turns have not. And 9.0.0's presses kept as their controls ran on past their updates, which
-# this release keeps with its commands as controls (state.control_jobs): moved there, as presses,
-# their table dropped, so one 9.0.0's stop let go of runs again.
+# turns have not; and the column of a goal's turn's prompt job, its goal's session
+# (src/persistence/schema.ts prompt_jobs.goal_session_id), which 9.0.0's jobs have not. And
+# 9.0.0's presses kept as their controls ran on past their updates, which this release keeps
+# with its commands as controls (state.control_jobs): moved there, as presses, their table
+# dropped, so one 9.0.0's stop let go of runs again.
 
 SESSIONS_CLAIMED="
 alter table state.turns add column if not exists binding text;
+alter table state.prompt_jobs add column if not exists goal_session_id text;
 insert into state.conversation_sessions (session_id, conversation_id)
 select named.session_id, named.conversation_id from (
   select codex_session_id as session_id, id as conversation_id from state.conversations

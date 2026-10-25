@@ -535,6 +535,89 @@ test("a prompt's update whose conversation's host does not say whether it is bus
   });
 });
 
+/** A goal's turn of the conversation's goal on "goal-session", as a goal's command or press asks for it, of `messageId`. */
+const goalTurnOf = (conversationId: string, messageId: number | string) => ({ conversationId, chatId: CONVERSATION_CHAT, messageId, sessionId: "goal-session", prompt: "Continue working toward this Codex goal." });
+
+/** The conversation's prompt jobs, in the order queued: each's message and state. */
+async function jobsOf(store: Store["Service"], conversationId: string): Promise<{ message_id: string; state: string }[]> {
+  return (await poolOf(store).query<{ message_id: string; state: string }>(`select message_id, state from ${POOLED_SCHEMA}.prompt_jobs where conversation_id = $1 order by seq`, [conversationId])).rows;
+}
+
+/** A harness that has goals, Codex running `running` on a goal's session as a turn looks for one (none for null), recording each turn's request and answering it. */
+function goalHarness(ran: TurnParams[], running: string | null = null): Harness {
+  const unused = () => Effect.die(new Error("the goal harness reads and sets no goal"));
+  return {
+    ...scriptedHarness((params) => Effect.sync(() => void ran.push(params)).pipe(Effect.andThen(answered(params, "Done.")))),
+    supportsGoals: true,
+    goals: { read: unused, set: unused, clear: unused, waitForTurnId: () => Effect.succeed(running) },
+  };
+}
+
+/** The conversation, its goal's session mounted, as a goal's command finds it. */
+async function goalConversation() {
+  const conversation_ = await conversation();
+  await run(conversation_.store.setSessionId(conversation_.conversationId, "goal-session"));
+  return conversation_;
+}
+
+test("a goal's turn is queued as a prompt job of what asked for it, run on its goal's session attached to the turn Codex runs on it as it starts, once however often it is asked for", async () => {
+  const { store, conversationId } = await goalConversation();
+  const ran: TurnParams[] = [];
+  await withTurns(store, goalHarness(ran, "codex-goal-turn"), async (alasio) => {
+    // Asked for again, as its command run again after its alasio stopped asks.
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => Effect.andThen(turns.runGoalTurn(goalTurnOf(conversationId, 456)), turns.runGoalTurn(goalTurnOf(conversationId, 456)))));
+    await until("its job to complete", async () => (await jobsOf(store, conversationId)).every(({ state }) => state === "completed"));
+  });
+  assert.deepEqual(ran.map(({ messageId, resumeSession, attachedTurn }) => [messageId, resumeSession, attachedTurn]), [["456", "goal-session", { sessionId: "goal-session", turnId: "codex-goal-turn" }]]);
+});
+
+test("a goal's turn that finds Codex running no turn on its session as it starts, as one held since the goal was set, starts one with the goal as its prompt", async () => {
+  const { store, conversationId } = await goalConversation();
+  const ran: TurnParams[] = [];
+  await withTurns(store, goalHarness(ran, null), async (alasio) => {
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.runGoalTurn(goalTurnOf(conversationId, 458))));
+    await until("the goal's turn to run", () => ran.length > 0);
+  });
+  assert.deepEqual(ran.map(({ prompt, resumeSession, attachedTurn }) => [prompt, resumeSession, attachedTurn ?? null]), [["Continue working toward this Codex goal.", "goal-session", null]]);
+});
+
+test("a goal's turn whose conversation mounts another session as it starts, as the operator switched since it was asked for, is not run, its chat told so, the operator's session kept", { timeout: 30_000 }, async () => {
+  const { store, conversationId } = await goalConversation();
+  const ran: TurnParams[] = [];
+  // Another alasio's worker drives the conversation as the goal's turn is asked for; the operator then switches sessions.
+  const other = await run(store.claimWorker(conversationId, "other", 60_000));
+  assert.ok(other);
+  await withTurns(store, goalHarness(ran, "codex-goal-turn"), async (alasio, queued) => {
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.runGoalTurn(goalTurnOf(conversationId, 459))));
+    await run(store.setSessionId(conversationId, "operators-session"));
+    await run(store.releaseWorker(other));
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.schedule(conversationId)));
+    await until("the goal's job to be settled", async () => (await jobsOf(store, conversationId)).every(({ state }) => state !== "pending" && state !== "running"));
+    assert.ok(queued.texts.some(({ text }) => text.startsWith("The goal's turn was not run")), JSON.stringify(queued.texts));
+  });
+  assert.equal(ran.length, 0);
+  assert.equal((await run(store.getMount(conversationId))).sessionId, "operators-session");
+});
+
+test("a goal's turn asked for before its turn starts, its alasio stopping then, is kept, and run by the alasio after it as it takes up the prompts waiting", { timeout: 30_000 }, async () => {
+  const { store, conversationId } = await goalConversation();
+  const ran: TurnParams[] = [];
+  // Another alasio's worker drives the conversation as the goal's turn is asked for, so this alasio stops before running it.
+  const other = await run(store.claimWorker(conversationId, "other", 60_000));
+  assert.ok(other);
+  await withTurns(store, goalHarness(ran), async (alasio) => {
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.runGoalTurn(goalTurnOf(conversationId, 457))));
+  });
+  assert.equal(ran.length, 0);
+  assert.deepEqual((await jobsOf(store, conversationId)).map(({ message_id: messageId, state }) => [messageId, state]), [["457", "pending"]]);
+  await run(store.releaseWorker(other));
+  await withTurns(store, goalHarness(ran), async (alasio) => {
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.resumePendingPrompts));
+    await until("the goal's turn to run", () => ran.length > 0);
+  });
+  assert.deepEqual(ran.map(({ messageId }) => messageId), ["457"]);
+});
+
 test("a question's buttons are kept with its reply or not at all: a reply the store refuses keeps none of its buttons' actions", async () => {
   const { store, schema, conversationId } = await conversation();
   await poolOf(store).query(`

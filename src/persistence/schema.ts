@@ -277,8 +277,7 @@ create table if not exists ${SCHEMA}.control_jobs (
   created_at timestamptz not null default now()
 );
 
--- What a control made, a session, a fork, a folder or a goal, or that it asked for a goal's
--- turn, by a key its message names
+-- What a control made, a session, a fork, a folder or a goal, by a key its message names
 -- (src/operator/made-once.ts): so a control run again, as a kept one is after its alasio
 -- stopped, finds what its run before made rather than make another.
 create table if not exists ${SCHEMA}.control_results (
@@ -408,6 +407,9 @@ create table if not exists ${SCHEMA}.prompt_jobs (
   -- the W3C traceparent of the update that queued the prompt, so its turn joins that
   -- trace however long it waits, restarts included
   traceparent text,
+  -- of a goal's turn (src/operator/goal-control.ts): the session its goal is of, which the
+  -- turn runs on only where the conversation mounts it still as it starts; no other prompt's
+  goal_session_id text,
   created_at timestamptz not null default now(),
   started_at timestamptz,
   completed_at timestamptz,
