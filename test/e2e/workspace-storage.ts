@@ -539,7 +539,7 @@ export function workspaceStorage(): void {
         assert.doesNotMatch(servers, /valkey-server/u);
         const answered = await kube.execOk(NAMESPACE, second, ["sh", "-c", "valkey-cli ping 2>&1 || true"]);
         assert.match(answered, /Could not connect|Connection refused/u);
-        assert.match(await kube.logs(NAMESPACE, second, "valkey"), /waiting for the Valkey that holds \/data\/valkey\.lock to end/u);
+        assert.match(await kube.logs(NAMESPACE, second, "valkey"), /waiting for the Valkey or restore that holds \/data\/valkey\.lock to end/u);
         // The first serves on, whole.
         assert.equal(await fixtureDigest(none), fixture);
       } finally {

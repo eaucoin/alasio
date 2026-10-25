@@ -51,6 +51,7 @@ import { everyIntervalCron, filerStoreBackupHours } from "../src/manifests/confi
 import { folderTemplate } from "../src/manifests/folders.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
+import { oneAtATime } from "../src/manifests/volume-lock.ts";
 import { goferOf, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
 import { apiServerUnconfined } from "../src/install.ts";
 import { environmentAccess } from "../src/manifests/log.ts";
@@ -659,6 +660,18 @@ describe("neon", () => {
     ]);
   });
 
+  test("starts the storage controller's Postgres as its image does, once no other holds the lock of its volume, outside its data directory", () => {
+    const database = container(one<V1StatefulSet>(install(), "StatefulSet", "alasio-neon-controller-db"));
+    const lock = "/var/lib/postgresql/data/.alasio-postgres.lock";
+    assert.deepEqual(database.command, ["/bin/sh", "-c", oneAtATime(lock, "Postgres"), "docker-entrypoint.sh", "postgres"]);
+    assert.equal(database.args, undefined);
+    assert.match(database.command?.[2] ?? "", /waiting for the Postgres that holds \/var\/lib\/postgresql\/data\/\.alasio-postgres\.lock to end/u);
+    // On its volume, in its root, beside the data directory and not in it.
+    const data = database.volumeMounts?.find(({ name }) => name === "data")?.mountPath;
+    const pgdata = database.env?.find(({ name }) => name === "PGDATA")?.value ?? "";
+    assert.deepEqual([data, lock.startsWith(`${pgdata}/`)], [lock.slice(0, lock.lastIndexOf("/")), false]);
+  });
+
   test("dumps the database through the proxy, which wakes main's compute", () => {
     const dump = one<V1CronJob>(install(), "CronJob", "alasio-neon-backup").spec?.jobTemplate.spec?.template.spec?.initContainers?.[0];
     const env = Object.fromEntries((dump?.env ?? []).flatMap(({ name, value }) => (value === undefined ? [] : [[name, value]])));
@@ -1052,6 +1065,29 @@ describe("object store", () => {
     assert.equal(volume.spec?.podManagementPolicy, "Parallel");
   });
 
+  test("starts each master and volume server by the image's entrypoint once no other holds the lock of its volume, which it waits for unended by its liveness probe, and the filers, on none, as the image does", () => {
+    const objects = install();
+    for (const [name, lock, server, first] of [
+      ["alasio-seaweedfs-master", "/data/.alasio-master.lock", "master", "master"],
+      ["alasio-seaweedfs-volume", "/data/.alasio-volume.lock", "volume server", "volume"],
+    ] as const) {
+      const workload = one<V1StatefulSet>(objects, "StatefulSet", name);
+      const part = container(workload);
+      assert.deepEqual(part.command, ["/bin/sh", "-c", oneAtATime(lock, server), "/entrypoint.sh"], name);
+      assert.equal(part.args?.[0], first, name);
+      assert.ok(part.command?.[2]?.includes(`waiting for the ${server} that holds ${lock} to end`), name);
+      // The lock on its volume, as its claim's.
+      assert.deepEqual(part.volumeMounts, [{ name: "data", mountPath: "/data" }], name);
+      assert.deepEqual(workload.spec?.volumeClaimTemplates?.map(({ metadata }) => metadata?.name), ["data"], name);
+      // A server waiting for the one before it on its volume, which ends within its pod's grace, is not ended by its liveness probe as it waits.
+      const grace = workload.spec?.template.spec?.terminationGracePeriodSeconds ?? 30;
+      const { periodSeconds = 10, failureThreshold = 3 } = part.startupProbe ?? {};
+      assert.ok(part.startupProbe?.httpGet && periodSeconds * failureThreshold >= 2 * grace, `${name}'s start-up allows ${periodSeconds * failureThreshold} s`);
+    }
+    const filer = one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs-filer");
+    assert.deepEqual([container(filer).command, container(filer).startupProbe, filer.spec?.volumeClaimTemplates], [undefined, undefined, undefined]);
+  });
+
   test("starts the filers one after another, each once its store has loaded and a volume server has registered, on the filer store", () => {
     const objects = install();
     const filer = one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs-filer");
@@ -1358,7 +1394,12 @@ describe("object store", () => {
     assert.deepEqual(loading?.volumes, [{ name: "data", persistentVolumeClaim: { claimName: "data-alasio-seaweedfs-filer-store-0" } }]);
     // As the filer store's Valkey runs, so the files it writes are its own.
     assert.deepEqual(loading?.securityContext, one<V1StatefulSet>(install(), "StatefulSet", "alasio-seaweedfs-filer-store").spec?.template.spec?.securityContext);
-    const script = loading?.containers[0]?.command?.[2] ?? "";
+    // Run once no Valkey runs on the volume, holding its lock as the filer store's does, so none starts there as it writes.
+    const command = loading?.containers[0]?.command ?? [];
+    const store = container(one<V1StatefulSet>(install(), "StatefulSet", "alasio-seaweedfs-filer-store"));
+    assert.deepEqual(command.slice(0, 5), ["/bin/sh", "-c", store.command?.[2], "/bin/sh", "-c"]);
+    assert.match(command[2] ?? "", /waiting for the Valkey or restore that holds \/data\/valkey\.lock to end/u);
+    const script = command[5] ?? "";
     for (
       const step of [
         "backup --rdb /data/restore.rdb",

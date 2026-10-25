@@ -147,6 +147,38 @@ async function awaitPodReady(name: string, timeoutMs = 300_000) {
   }
 }
 
+/**
+ * A second server of the StatefulSet `name`, on its pod 0's volume, as a pod deleted
+ * outright is made anew while its server still runs: a pod of its template, its container
+ * `server` alone and unprobed, as nothing waits for it to be ready, placed by nothing but its
+ * volume, as the spread of the StatefulSet's pods would keep it from the first's node. Its
+ * name, once its container runs.
+ */
+async function secondServer(name: string, server: string): Promise<string> {
+  const template = (await kube.get<V1StatefulSet>(ref("StatefulSet", name, NAMESPACE)))?.spec?.template.spec;
+  const container = template?.containers.find((each) => each.name === server);
+  assert.ok(template && container, `${name} has no ${server}`);
+  const { readinessProbe: _readiness, livenessProbe: _liveness, startupProbe: _startup, ...unprobed } = container;
+  const { affinity: _affinity, topologySpreadConstraints: _spread, ...placed } = template;
+  const second = `${name}-second`;
+  const pod: V1Pod = {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: second, namespace: NAMESPACE },
+    spec: { ...placed, containers: [unprobed], volumes: [...(template.volumes ?? []), { name: "data", persistentVolumeClaim: { claimName: `data-${name}-0` } }] },
+  };
+  await kube.apply(pod);
+  try {
+    for (const deadline = Date.now() + 300_000; !(await kube.get<V1Pod>(ref("Pod", second, NAMESPACE)))?.status?.containerStatuses?.[0]?.state?.running; await sleep(2000)) {
+      assert.ok(Date.now() < deadline, `${second} does not run: ${await eventsOf(second, 5)}`);
+    }
+  } catch (error) {
+    await kube.remove(ref("Pod", second, NAMESPACE)).catch(() => {});
+    throw error;
+  }
+  return second;
+}
+
 let privateKey: string;
 const token = (scope: string) => signToken(privateKey, scope);
 
@@ -860,6 +892,22 @@ export function neonStack(): void {
         });
       }
 
+      test("a second Postgres started on the storage controller's Postgres's volume, as a pod deleted outright is made anew while its server runs, serves nothing until the first has ended", async () => {
+        const second = await secondServer(neonName("controller-db"), "postgres");
+        try {
+          // Long past what a Postgres that started anyway, recovering the data directory, would take to answer.
+          await sleep(30_000);
+          // No postmaster runs in it, and none answers.
+          assert.doesNotMatch(await kube.execOk(NAMESPACE, second, ["sh", "-c", "cat /proc/[0-9]*/comm"]), /postgres/u);
+          assert.doesNotMatch(await kube.execOk(NAMESPACE, second, ["sh", "-c", "pg_isready -h 127.0.0.1 -t 5 2>&1 || true"]), /accepting connections/u);
+          assert.match(await kube.logs(NAMESPACE, second, "postgres"), /waiting for the Postgres that holds \/var\/lib\/postgresql\/data\/\.alasio-postgres\.lock to end/u);
+          // The first serves on: neon-control's record is read in it.
+          assert.equal((await onRecord("select 1")).trim(), "1");
+        } finally {
+          await kube.remove(ref("Pod", second, NAMESPACE));
+        }
+      });
+
       test("a safekeeper that lost its volume is rebuilt from its peers", async () => {
         const name = `${neonName("safekeeper")}-2`;
         const pod = await kube.get<V1Pod>(ref("Pod", name, NAMESPACE));
@@ -1188,6 +1236,65 @@ export function neonStack(): void {
           assert.fail(`the bucket's volumes were not compacted: ${JSON.stringify(last)}`);
         } finally {
           await s3(`s3 rb --force s3://${bucket} >/dev/null`).catch(() => {});
+        }
+      });
+
+      test("a second volume server started on alasio-seaweedfs-volume-0's volume, as a pod deleted outright is made anew while its server runs, serves nothing until the first has ended", async () => {
+        const volumeServer = componentName("seaweedfs-volume");
+        const second = await secondServer(volumeServer, "volume");
+        const gateway = (await gateways())[0] ?? assert.fail("no gateway runs");
+        const bucket = `second-volume-server-${Date.now()}`;
+        try {
+          // Long past what a volume server that started anyway, loading its volumes, would take to answer.
+          await sleep(30_000);
+          // No server runs in it, and none answers.
+          assert.doesNotMatch(await kube.execOk(NAMESPACE, second, ["sh", "-c", "cat /proc/[0-9]*/comm"]), /weed/u);
+          assert.match(await kube.execOk(NAMESPACE, second, ["sh", "-c", "wget -q -T 5 -O /dev/null http://127.0.0.1:8080/status && echo answered || echo unanswered"]), /^unanswered$/mu);
+          assert.match(await kube.logs(NAMESPACE, second, "volume"), /waiting for the volume server that holds \/data\/\.alasio-volume\.lock to end/u);
+          // The first serves on, ready, and the store takes and serves objects.
+          await awaitPodReady(`${volumeServer}-0`, 10_000);
+          const said = await onGateway(gateway, `s3api 127.0.0.1:8333 create-bucket --bucket ${bucket} >/dev/null; head -c 65536 /dev/urandom > /tmp/kept; s3api 127.0.0.1:8333 put-object --bucket ${bucket} --key kept --body /tmp/kept >/dev/null; s3api 127.0.0.1:8333 get-object --bucket ${bucket} --key kept /tmp/back >/dev/null; cmp -s /tmp/kept /tmp/back && echo same`);
+          assert.match(said, /^same$/mu);
+        } finally {
+          await onGateway(gateway, `aws s3 --endpoint-url http://127.0.0.1:8333 rb --force s3://${bucket} >/dev/null`).catch(() => {});
+          await kube.remove(ref("Pod", second, NAMESPACE));
+        }
+      });
+
+      test("the object store keeps every object it acknowledged through its volume server deleted outright mid-write, three times over", { timeout: 1_800_000 }, async () => {
+        const gateway = (await gateways())[0] ?? assert.fail("no gateway runs");
+        for (let round = 1; round <= 3; round++) {
+          const bucket = `deleted-outright-${round}-${Date.now()}`;
+          await onGateway(gateway, `s3api 127.0.0.1:8333 create-bucket --bucket ${bucket} >/dev/null`);
+          try {
+            // Four writers of 40 KB objects, as the lake's files are, for 25 s, each object acknowledged said with its content's hash.
+            const writing = onGateway(gateway, [
+              "for w in 1 2 3 4; do (",
+              "  end=$(($(date +%s) + 25)); n=0",
+              "  while [ \"$(date +%s)\" -lt \"$end\" ]; do",
+              "    n=$((n + 1)); head -c 40000 /dev/urandom > /tmp/written-$w",
+              `    if s3api 127.0.0.1:8333 put-object --bucket ${bucket} --key w$w-$n --body /tmp/written-$w >/dev/null 2>&1; then echo "acknowledged w$w-$n $(sha256sum < /tmp/written-$w | cut -d' ' -f1)"; fi`,
+              "  done) & done",
+              "wait",
+            ].join("\n"));
+            // Mid-write, the volume server's pod deleted outright, which its StatefulSet makes anew at once, a moment later each round.
+            await sleep(2000 + round * 2000);
+            await kube.kill(NAMESPACE, await podOf("seaweedfs-volume"));
+            const written = await writing;
+            await up();
+            const acknowledged = new Map(written.split("\n").flatMap((line) => {
+              const [said, key, hash] = line.split(" ");
+              return said === "acknowledged" && key && hash ? [[key, hash] as const] : [];
+            }));
+            assert.ok(acknowledged.size > 0, `round ${round}: no object was acknowledged`);
+            // Each read back as it was written.
+            const read = await onGateway(gateway, `for key in ${[...acknowledged.keys()].join(" ")}; do echo "$key $(aws s3 --endpoint-url http://127.0.0.1:8333 cp --quiet s3://${bucket}/$key - 2>/dev/null | sha256sum | cut -d' ' -f1)"; done`);
+            const back = new Map(read.split("\n").map((line) => line.split(" ") as [string, string]));
+            const lost = [...acknowledged].filter(([key, hash]) => back.get(key) !== hash).map(([key]) => key);
+            assert.deepEqual(lost, [], `round ${round}: of ${acknowledged.size} objects acknowledged, ${lost.length} lost`);
+          } finally {
+            await onGateway(gateway, `aws s3 --endpoint-url http://127.0.0.1:8333 rb --force s3://${bucket} >/dev/null`).catch(() => {});
+          }
         }
       });
 

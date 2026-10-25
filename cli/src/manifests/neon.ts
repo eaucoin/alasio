@@ -55,6 +55,7 @@ import { durationSeconds, type InstallConfig } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
+import { oneAtATime } from "./volume-lock.ts";
 import { VALKEY_ADDRESS, workspacesBucketUrl } from "./workspace-storage.ts";
 
 /** A Service of the stack's: its name and component, selecting the component's pods, on `ports`, main's unless of `environment`. */
@@ -176,6 +177,10 @@ function controllerDb(config: InstallConfig): KubernetesObject[] {
             name: "postgres",
             image: imageReference(config.neon.controllerDbImage),
             imagePullPolicy: "IfNotPresent",
+            // Started as the image starts it, its entrypoint running postgres, once no other
+            // Postgres holds the lock of its volume (./volume-lock.ts), a file in the volume's
+            // root, outside its data directory.
+            command: ["/bin/sh", "-c", oneAtATime("/var/lib/postgresql/data/.alasio-postgres.lock", "Postgres"), "docker-entrypoint.sh", "postgres"],
             env: [
               { name: "POSTGRES_USER", value: "storage_controller" },
               { name: "POSTGRES_DB", value: "storage_controller" },

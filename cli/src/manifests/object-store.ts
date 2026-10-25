@@ -50,7 +50,8 @@ import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
 import { cpuScaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
-import { VALKEY_PORT, valkeyObjects, valkeyPassword, valkeyPod, type ValkeyUser } from "./valkey.ts";
+import { VALKEY_ONE_AT_A_TIME, VALKEY_PORT, valkeyObjects, valkeyPassword, valkeyPod, type ValkeyUser } from "./valkey.ts";
+import { oneAtATime } from "./volume-lock.ts";
 
 /** The gateways' name, their Service's, by which the stack reaches the store. */
 export const GATEWAY = componentName("seaweedfs");
@@ -238,20 +239,40 @@ function partStatefulSet(
   };
 }
 
-/** The container of a part, `name`, running `weed` with `args`, probed at `path` on its HTTP port. */
-function partContainer(config: InstallConfig, name: string, args: string[], path: string, port: number, resources: V1Container["resources"]): V1Container {
+/**
+ * The container of a part, `name`, running `weed` with `args`, probed at `path` on its HTTP
+ * port; of a part with a volume, the `server` on it at /data.
+ */
+function partContainer(
+  config: InstallConfig,
+  name: string,
+  args: string[],
+  path: string,
+  port: number,
+  resources: V1Container["resources"],
+  server?: string,
+): V1Container {
   const probe = { httpGet: { path, port } };
   return {
     name,
     image: imageReference(config.objectStore.bundled.image),
     imagePullPolicy: "IfNotPresent",
+    // On a volume, started once no other server holds the volume's lock (./volume-lock.ts),
+    // a file of its own beside the part's, by the image's entrypoint, as one without is,
+    // which runs weed with the image's defaults for the part.
+    ...(server ? { command: ["/bin/sh", "-c", oneAtATime(`/data/.alasio-${name}.lock`, server), "/entrypoint.sh"] } : {}),
     args: [...args, `-metricsPort=${METRICS_PORT}`],
     env: POD_ENV,
     ports: [{ name: "http", containerPort: port }, { name: "grpc", containerPort: port + 10_000 }, { name: "metrics", containerPort: METRICS_PORT }],
     readinessProbe: { ...probe, periodSeconds: 5 },
+    // Started once it answers, which one on a volume does only once the server before it
+    // there has ended (within that pod's grace): five minutes for that and its start, so the
+    // wait is not ended by the liveness probe and put back by a crash loop.
+    ...(server ? { startupProbe: { ...probe, periodSeconds: 5, failureThreshold: 60 } } : {}),
     livenessProbe: { ...probe, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 6 },
     securityContext: restrictedContainer(),
     ...(resources ? { resources } : {}),
+    ...(server ? { volumeMounts: [{ name: "data", mountPath: "/data" }] } : {}),
   };
 }
 
@@ -275,7 +296,7 @@ function masterObjects(config: InstallConfig): KubernetesObject[] {
     "-garbageThreshold=0.1",
     "-telemetry=false",
   ];
-  const container = { ...partContainer(config, "master", args, "/cluster/status", 9333, bundled.masters.resources), volumeMounts: [{ name: "data", mountPath: "/data" }] };
+  const container = partContainer(config, "master", args, "/cluster/status", 9333, bundled.masters.resources, "master");
   const statefulSet = partStatefulSet(config, MASTER, COMPONENTS.master, scaling, { containers: [container] }, bundled.masters.storage);
   return [headless(MASTER, COMPONENTS.master, PORTS.master), statefulSet, ...replicaBudget(COMPONENTS.master, NAMESPACE, scaling), verticalPodAutoscaler(statefulSet, "Recommended")];
 }
@@ -300,7 +321,7 @@ function volumeServerObjects(config: InstallConfig): KubernetesObject[] {
     "-dataCenter=dc1",
     "-rack=rack1",
   ];
-  const container = { ...partContainer(config, "volume", args, "/status", 8080, volumeServers.resources), volumeMounts: [{ name: "data", mountPath: "/data" }] };
+  const container = partContainer(config, "volume", args, "/status", 8080, volumeServers.resources, "volume server");
   const statefulSet = partStatefulSet(config, VOLUME_SERVER, COMPONENTS.volumeServer, volumeServers.scaling, { containers: [container] }, volumeServers.storage, {
     strictly: bundled.replication !== "000",
   });
@@ -821,9 +842,10 @@ export function backupsListing(config: InstallConfig): V1Job {
  * with the filer store stopped, as two Jobs, since the backups' volume and the filer
  * store's may be on different nodes: on the backups' node, a Valkey that loads the backup
  * and serves it, behind a Service, to the other alone (./network-policies.ts), with the
- * backup user's password; and on the filer store's, one that takes a snapshot of it, as the
- * backups do, onto the filer store's volume beside what is there, loads it in a Valkey of
- * its own, checks it holds as many keys as the backup, and only then deletes what was
+ * backup user's password; and on the filer store's, holding the lock of its volume as its
+ * Valkey does (./volume-lock.ts), one that takes a snapshot of it, as the backups do, onto
+ * the filer store's volume beside what is there, loads it in a Valkey of its own, checks it
+ * holds as many keys as the backup, and only then deletes what was
  * there and writes the append-only file the filer store loads as it starts, then prints
  * how many keys it restored (RESTORED).
  */
@@ -866,7 +888,12 @@ export function filerStoreRestore(config: InstallConfig, file: string): Kubernet
     containers: [{
       ...container,
       name: "restore",
+      // Once no Valkey runs on the volume, as one whose pod was deleted outright may still,
+      // and holding its lock, so none starts there until the restore has ended.
       command: [
+        "/bin/sh",
+        "-c",
+        VALKEY_ONE_AT_A_TIME,
         "/bin/sh",
         "-c",
         script(
