@@ -26,5 +26,6 @@ export function lostStatusText(outcome: Exclude<LostRecoveryOutcome["outcome"], 
   }
   if (outcome === "completed") return `${harnessName} finished this turn as its harness was let go of.`;
   if (outcome === "staged") return `${harnessName}'s harness was lost during this turn; it runs again on another.`;
+  if (outcome === "requeued") return `${harnessName} never had this turn's message; it runs again.`;
   return `${harnessName}'s harness was lost during this turn, which was itself run again as one was lost before. Send the message again to run it.`;
 }

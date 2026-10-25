@@ -251,8 +251,9 @@ export class HarnessHost extends Context.Service<HarnessHost, {
         /**
          * What the job's turn records of its progress, for a restart to know what became of
          * its prompt. The turn dies on a record it cannot make: so a prompt whose dispatch is
-         * not recorded is never sent, and a restart never misjudges the prompt of a turn
-         * that ran.
+         * not recorded is never sent, as one whose job was run again, or whose turn ended,
+         * as its alasio stopped and another took the conversation over, is not; and a restart
+         * never misjudges the prompt of a turn that ran.
          */
         const recordJob = (record: (jobId: string) => Effect.Effect<void, StoreError>): Effect.Effect<void> =>
           start.jobId ? Effect.orDie(record(start.jobId)) : Effect.void;
@@ -267,7 +268,10 @@ export class HarnessHost extends Context.Service<HarnessHost, {
           persistence: store.turnPersistence(start.conversationId, start.epoch),
           ownTurns: ownTurnsOf(start.conversationId, start.chatId, harness.name),
           attachedTurn: start.attachedTurn,
-          onPromptDispatched: recordJob(store.markPromptJobDispatched),
+          onPromptDispatched: recordJob((id) =>
+            Effect.flatMap(store.markPromptJobDispatched(id, start.epoch), (recorded) =>
+              recorded ? Effect.void : Effect.die(new Error(`the job ${id} of ${start.conversationId} is run again, or its turn ended: its prompt is not sent`)))
+          ),
           onTransportStarted: ({ sessionId, turnId }) => recordJob((id) => store.markPromptJobUpstreamStarted(id, sessionId, turnId)),
           onTransportCompleted: ({ sessionId, turnId }) => recordJob((id) => store.markPromptJobUpstreamCompleted(id, sessionId, turnId)),
           // A harness that keeps running between prompts (Claude Code's background work)

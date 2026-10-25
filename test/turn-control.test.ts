@@ -274,6 +274,29 @@ test("alasio taking up the conversations no alasio drives attaches again to the 
   });
 });
 
+test("alasio taking up a conversation whose turn its alasio left before sending its prompt, its pod knowing nothing of it, runs the prompt again once, as its job, never as lost besides, its status message saying so", async () => {
+  const { store, conversationId } = await conversation();
+  const ran: string[] = [];
+  const harness = scriptedHarness((params) => (ran.push(params.prompt), answered(params, "Done.")));
+  // Left by an alasio told to stop as it began the job's turn: the job running, never sent; the turn claimed, with its status message.
+  const job = await run(store.enqueuePromptJob({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "6", prompt: "do it" }));
+  await run(store.claimNextPromptJob(conversationId));
+  const epoch = await run(store.claimTurn({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "6", harness: CODEX_HARNESS, prompt: "do it" }));
+  await run(store.setTurnStatusMessage(conversationId, epoch, "status-of-the-unsent"));
+  await withTurns(store, harness, async (alasio) => {
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.takeUnheld));
+    await until("the prompt to run again", () => ran.length === 1);
+    await until("its job to end", async () => (await run(store.getPromptJob(job.id)))?.state === "completed");
+    // Once, as itself, and never as a turn lost with its harness: nothing left to run once the conversation is idle.
+    await until("the conversation to be idle", async () =>
+      (await run(store.getActiveTurn(conversationId))) === null && !(await run(store.listWaitingPromptConversations)).includes(conversationId));
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.deepEqual(ran, ["do it"]);
+    // Said on its status message, in the recovery's transaction.
+    assert.ok((await run(store.getDueOutbox(50))).some(({ text }) => text === "Codex never had this turn's message; it runs again."), JSON.stringify(await run(store.getDueOutbox(50))));
+  });
+});
+
 test("alasio taking up a conversation ends a turn whose job the agent finished as its alasio stopped, completed, its status message saying so", async () => {
   const { store, conversationId } = await conversation();
   const harness = scriptedHarness((params) => answered(params, "unused"));

@@ -112,6 +112,20 @@ export class NeonPromptJobRepository {
   }
 
   /**
+   * Settles the job its worker runs as `state` says, where it runs still, not run again since
+   * (requeueUnsent), whose next run settles it: whether it did.
+   */
+  settleRunning(id: string, state: PromptJobState, priority: number | null = null): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `update ${this.#schema}.prompt_jobs
+       set state = $2, priority = coalesce($3::int, priority), completed_at = case when $2 in ('completed', 'cancelled') then now() end
+       where id = $1 and state = 'running'
+       returning 1`,
+      [id, state, priority],
+    ).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
+  /**
    * Settles a job held for the operator's choice as `state` says: the job, or null where it
    * is held no longer (settled already, by another of its buttons), when nothing changes.
    */
@@ -125,9 +139,39 @@ export class NeonPromptJobRepository {
     ).pipe(Effect.map(([row]) => row ?? null));
   }
 
-  /** Records that the job's prompt was sent to the agent, which may act on it from then on. */
-  markDispatched(id: string): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(`update ${this.#schema}.prompt_jobs set upstream_dispatched_at = now() where id = $1`, [id]));
+  /**
+   * Records that the job's prompt is sent to the agent, which may act on it from then on: only
+   * while the job runs still, and its turn of `epoch` that sends it is still its conversation's.
+   * A recovery running the job again (requeueUnsent) changes the job's row in the transaction that
+   * ends the turn; this, waiting on that row, re-checks the job's state once it is through, and
+   * finds it run again: so the two never both land. The turn is read as the statement began, the
+   * job as it is once through, claimed before the turn started: so one claimed anew since, which
+   * started after it, passes for that turn's no more than one run again, its start cleared.
+   * Whether it was recorded: where not, its prompt is not to be sent.
+   */
+  markDispatched(id: string, epoch: number): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `update ${this.#schema}.prompt_jobs j set upstream_dispatched_at = coalesce(upstream_dispatched_at, now())
+       where j.id = $1 and j.state = 'running'
+         and exists (select 1 from ${this.#schema}.turns t where t.id = j.conversation_id and t.epoch = $2 and t.state = 'active' and t.thread_ts = j.message_id
+           and j.started_at <= t.started_at)
+       returning 1`,
+      [id, epoch],
+    ).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
+  /**
+   * Puts the conversation's job of `messageId` back to run again where it runs and its prompt was
+   * never sent to the agent (markDispatched): whether it did.
+   */
+  requeueUnsent(conversationId: string, messageId: string): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `update ${this.#schema}.prompt_jobs set state = 'pending', started_at = null
+       where conversation_id = $1 and message_id = $2 and state = 'running'
+         and upstream_dispatched_at is null and upstream_started_at is null and upstream_completed_at is null
+       returning 1`,
+      [conversationId, messageId],
+    ).pipe(Effect.map((rows) => rows.length > 0));
   }
 
   markUpstreamStarted(id: string, sessionId: string | null | undefined, turnId: string | null | undefined): Effect.Effect<void, StoreError> {
@@ -147,11 +191,12 @@ export class NeonPromptJobRepository {
     ));
   }
 
-  fail(id: string, error: unknown): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(
-      `update ${this.#schema}.prompt_jobs set state = 'failed', last_error = $2, completed_at = now() where id = $1`,
+  /** Fails the job its worker runs, where it runs still, not run again since (requeueUnsent): whether it did. */
+  fail(id: string, error: unknown): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `update ${this.#schema}.prompt_jobs set state = 'failed', last_error = $2, completed_at = now() where id = $1 and state = 'running' returning 1`,
       [id, String(error).slice(0, 2000)],
-    ));
+    ).pipe(Effect.map((rows) => rows.length > 0));
   }
 
   hasOpenJobs(conversationId: string): Effect.Effect<boolean, StoreError> {
@@ -200,11 +245,31 @@ export class NeonPromptJobRepository {
 
   /**
    * Settles the conversation's jobs its last worker left running: one whose turn the agent
-   * finished is completed; one never sent to the agent runs again; one sent to it is
-   * interrupted, never sent twice, since the agent may have acted on it (the turn's recovery
-   * continues it). Whether the agent finished one's turn.
+   * finished is completed; one never sent to the agent runs again, but where its turn is left
+   * active, whose pod may hold it yet, as that turn's recovery settles it (requeueUnsent, as the
+   * turn's pod knows nothing of it); one sent to it is interrupted, never sent twice, since the
+   * agent may have acted on it (the turn's recovery continues it). Whether the agent finished
+   * one's turn. Run as a worker's claim is taken, before anything runs under it: so every job
+   * running is one the last worker left.
    */
   recoverLeft(conversationId: string): Effect.Effect<boolean, StoreError> {
+    return this.#settleLeft(conversationId, "", []);
+  }
+
+  /**
+   * Settles, as recoverLeft does, the job a worker left running of the conversation's turn that
+   * started at `turnStarted`, attached to again under the claim since: the one claimed before
+   * that turn started, its own, alone, as the conversation's worker may meanwhile run another, or
+   * that one claimed anew, run again as its prompt was never sent (requeueUnsent). To the
+   * millisecond, as `turnStarted` is read: one claimed anew is claimed once the turn is ended, as
+   * its harness was reached or found lost, well past the millisecond it started in.
+   */
+  recoverLeftOf(conversationId: string, turnStarted: Date): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#settleLeft(conversationId, "and date_trunc('milliseconds', started_at) <= $2", [turnStarted]));
+  }
+
+  /** recoverLeft's settling of the conversation's jobs running, of those `where` says, its parameters from $2 on `params`. */
+  #settleLeft(conversationId: string, where: string, params: readonly unknown[]): Effect.Effect<boolean, StoreError> {
     return this.#sql.query<{ finished: boolean }>(
       `with settled as (
          update ${this.#schema}.prompt_jobs set
@@ -218,11 +283,13 @@ export class NeonPromptJobRepository {
              when upstream_dispatched_at is null and upstream_started_at is null and upstream_completed_at is null then completed_at
              else coalesce(completed_at, now())
            end
-         where conversation_id = $1 and state = 'running'
+         where conversation_id = $1 and state = 'running' ${where}
+           and not (upstream_dispatched_at is null and upstream_started_at is null and upstream_completed_at is null
+             and exists (select 1 from ${this.#schema}.turns t where t.id = $1 and t.state = 'active' and t.thread_ts = message_id))
          returning state
        )
        select exists (select 1 from settled where state = 'completed') as finished`,
-      [conversationId],
+      [conversationId, ...params],
     ).pipe(Effect.map(([row]) => row!.finished));
   }
 }

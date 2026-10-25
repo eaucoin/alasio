@@ -71,7 +71,9 @@ export const LOST_PREFIX = "lost:";
  * binding's loss told of it, which a turn begun since on another binding is not; and how it is
  * run again: as a prompt of `messageId`, which a lost turn's message id begins with (LOST_PREFIX),
  * and the text `prompt` gives it, unless `rerun` is false, as of a pod its own work ran out of
- * memory, which would again; and what its status message says.
+ * memory, which would again; and what its status message says. Its prompt, where its job's was
+ * never sent to the agent, runs again as that job, not as a prompt of its own: whatever else
+ * would settle the job, its worker or its recovery, settles one running alone.
  */
 export interface LostRecovery {
   readonly conversationId: string;
@@ -82,18 +84,18 @@ export interface LostRecovery {
   /** Whether the turn is run again; true unless given. */
   readonly rerun?: boolean;
   /** What the chat is told of what became of the turn: on its status message, or, where it has none, as a message of its own, but of a reply complete, which tells it. */
-  readonly said: (outcome: "staged" | "completed" | "given-up" | "ended", turn: Turn) => string;
+  readonly said: (outcome: "staged" | "requeued" | "completed" | "given-up" | "ended", turn: Turn) => string;
 }
 
 /**
  * What staging a lost turn's recovery came to, of its turn: `staged`, run again as a prompt
- * of its own; `completed`, its response complete already, which is delivered, so it is not
+ * of its own; `requeued`, its job, whose prompt was never sent, run again as itself; `completed`, its response complete already, which is delivered, so it is not
  * run again; `given-up`, a recovery itself lost, let go of rather than run again; `ended`, one
  * not to be run again (`rerun` false), ended; or `none`, no such turn active, as one ended, or
  * recovered, already.
  */
 export type LostRecoveryOutcome =
-  | { readonly outcome: "staged" | "completed" | "given-up" | "ended"; readonly turn: Turn }
+  | { readonly outcome: "staged" | "requeued" | "completed" | "given-up" | "ended"; readonly turn: Turn }
   | { readonly outcome: "none" };
 
 /** What the store is made on: the pool it shares, and where in it the state is. */
@@ -178,8 +180,9 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
  * The lost turn's recovery, on the transaction's repositories `on`, as Store.stageLostRecovery
  * says: the turn ended first, so of what let go of it the first alone acts, and its response's
  * row locked, so no write of its pod's completes it meanwhile; a response complete already
- * delivered rather than run again; and a recovery itself lost let go of; the chat told of
- * each but a reply delivered, in the same transaction, so once.
+ * delivered rather than run again; a job whose prompt was never sent run again as itself; and a
+ * recovery itself lost let go of; the chat told of each but a reply delivered, in the same
+ * transaction, so once.
  */
 const stageLostOn = (on: ReturnType<typeof repositories>, { conversationId, epoch, binding, messageId, prompt, rerun = true, said }: LostRecovery): Effect.Effect<LostRecoveryOutcome, StoreError> =>
   Effect.gen(function*() {
@@ -187,7 +190,9 @@ const stageLostOn = (on: ReturnType<typeof repositories>, { conversationId, epoc
     if (!turn || (epoch !== null && Number(turn.epoch) !== epoch) || (binding !== null && turn.binding !== binding)) return { outcome: "none" } as const;
     const completed = turn.pending_response_id === null ? false : yield* on.responses.lockCompleted(turn.pending_response_id);
     if (!(yield* on.turns.end(conversationId, Number(turn.epoch), completed ? "completed" : "stopped"))) return { outcome: "none" } as const;
-    const outcome = completed ? "completed" : !rerun ? "ended" : turn.thread_ts.startsWith(LOST_PREFIX) ? "given-up" : "staged";
+    // Its job, never sent, run again as itself; a recovery's own, itself lost, given up rather than run again.
+    const requeued = !completed && rerun && !turn.thread_ts.startsWith(LOST_PREFIX) && (yield* on.promptJobs.requeueUnsent(conversationId, turn.thread_ts));
+    const outcome = completed ? "completed" : !rerun ? "ended" : requeued ? "requeued" : turn.thread_ts.startsWith(LOST_PREFIX) ? "given-up" : "staged";
     if (!completed && turn.pending_response_id !== null) yield* on.responses.markPendingAsPosted(turn.pending_response_id);
     if (outcome === "staged") yield* on.promptJobs.enqueue({ conversationId, chatId: turn.channel, messageId, prompt: prompt(turn), priority: 1, harness: turn.harness });
     // Said on its status message; where it has none, as a message of its own, but of a reply it completed, which says it.
@@ -512,6 +517,8 @@ export class Store extends Context.Service<Store, {
   readonly claimNextPromptJob: (conversationId: string) => Stored<PromptJob | null>;
   /** Settles what becomes of a job, its priority kept unless given. */
   readonly setPromptJobDisposition: (id: string, state: PromptJobState, priority?: number) => Stored<void>;
+  /** Settles the job its worker runs, where it runs still (prompt-job-repository.ts settleRunning): whether it did. */
+  readonly settleRunningPromptJob: (id: string, state: PromptJobState, priority?: number) => Stored<boolean>;
   /**
    * Settles a job held for the operator's choice, the buttons that would settle it
    * forgotten: the job, or null where it is held no longer, when nothing changes.
@@ -519,14 +526,18 @@ export class Store extends Context.Service<Store, {
   readonly settleHeldPromptJob: (id: string, state: PromptJobState, priority?: number) => Stored<PromptJob | null>;
   /** The conversation's jobs held for the operator's choice, in the order queued. */
   readonly listHeldPromptJobs: (conversationId: string) => Stored<PromptJob[]>;
-  readonly markPromptJobDispatched: (id: string) => Stored<void>;
+  /** Records the job's prompt sent, by its turn of `epoch` (prompt-job-repository.ts markDispatched): whether it was, so it may be sent. */
+  readonly markPromptJobDispatched: (id: string, epoch: number) => Stored<boolean>;
   readonly markPromptJobUpstreamStarted: (id: string, sessionId: string | null | undefined, turnId: string | null | undefined) => Stored<void>;
   readonly markPromptJobUpstreamCompleted: (id: string, sessionId: string | null | undefined, turnId: string | null | undefined) => Stored<void>;
-  readonly failPromptJob: (id: string, error: unknown) => Stored<void>;
+  /** Fails the job its worker runs, where it runs still (prompt-job-repository.ts fail): whether it did. */
+  readonly failPromptJob: (id: string, error: unknown) => Stored<boolean>;
   /** The conversations with prompt jobs waiting: to run, or for the operator's choice. */
   readonly listWaitingPromptConversations: Stored<string[]>;
   /** Settles the conversation's jobs its last worker left running (prompt-job-repository.ts recoverLeft): whether the agent finished one's turn. */
   readonly recoverLeftPromptJobs: (conversationId: string) => Stored<boolean>;
+  /** Settles the job its last worker left running of the conversation's turn that started at `turnStarted`, attached to again since (prompt-job-repository.ts recoverLeftOf). */
+  readonly recoverLeftPromptJobOf: (conversationId: string, turnStarted: Date) => Stored<void>;
   /** Holds again the conversation's jobs its last worker left handed to a turn to steer it (prompt-job-repository.ts holdUnsteeredLeft). */
   readonly holdUnsteeredLeftPromptJobs: (conversationId: string) => Stored<PromptJob[]>;
 
@@ -797,15 +808,17 @@ const makeStore = Effect.fnUntraced(function*({
     getPromptJob: (id) => promptJobs.get(id),
     claimNextPromptJob: (conversationId) => fenced((on) => on.promptJobs.claimNext(conversationId)),
     setPromptJobDisposition: (id, state, priority) => fenced((on) => on.promptJobs.setDisposition(id, state, priority)),
+    settleRunningPromptJob: (id, state, priority) => fenced((on) => on.promptJobs.settleRunning(id, state, priority)),
     listHeldPromptJobs: (conversationId) => promptJobs.listHeld(conversationId),
     settleHeldPromptJob: (id, state, priority) =>
       transacting((on) => Effect.tap(on.promptJobs.settleHeld(id, state, priority), (job) => (job ? on.callbacks.forgetActionsOfJob(id) : Effect.void))),
-    markPromptJobDispatched: (id) => fenced((on) => on.promptJobs.markDispatched(id)),
+    markPromptJobDispatched: (id, epoch) => fenced((on) => on.promptJobs.markDispatched(id, epoch)),
     markPromptJobUpstreamStarted: (id, sessionId, turnId) => fenced((on) => on.promptJobs.markUpstreamStarted(id, sessionId, turnId)),
     markPromptJobUpstreamCompleted: (id, sessionId, turnId) => fenced((on) => on.promptJobs.markUpstreamCompleted(id, sessionId, turnId)),
     failPromptJob: (id, error) => fenced((on) => on.promptJobs.fail(id, error)),
     listWaitingPromptConversations: promptJobs.listWaitingConversations(),
     recoverLeftPromptJobs: (conversationId) => fenced((on) => on.promptJobs.recoverLeft(conversationId)),
+    recoverLeftPromptJobOf: (conversationId, turnStarted) => fenced((on) => on.promptJobs.recoverLeftOf(conversationId, turnStarted)),
     holdUnsteeredLeftPromptJobs: (conversationId) => fenced((on) => on.promptJobs.holdUnsteeredLeft(conversationId)),
 
     stageLostRecovery: (recovery) => transacting((on) => stageLostOn(on, recovery)),

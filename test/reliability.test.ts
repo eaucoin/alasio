@@ -20,7 +20,7 @@ import { EnvironmentEvents } from "../src/events/consume.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import type { StoreError } from "../src/persistence/sql.ts";
-import { Store } from "../src/persistence/store.ts";
+import { LOST_PREFIX, type LostRecovery, Store } from "../src/persistence/store.ts";
 import { type AlasioOptions, alasioServices } from "../src/alasio.ts";
 import { TelegramApiError } from "../src/telegram/client.ts";
 import { Outbox, type OutboxText } from "../src/telegram/outbox.ts";
@@ -353,7 +353,11 @@ test("a conversation's recovery of what its last worker left runs again only the
     await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
     const job = await run(store.enqueuePromptJob({ conversationId, chatId, messageId: "10", prompt: "do it" }));
     await run(store.claimNextPromptJob(conversationId));
-    if (dispatched) await run(store.markPromptJobDispatched(job.id));
+    if (dispatched) {
+      // Sent by its turn, as its pod records it.
+      const epoch = await run(store.claimTurn({ conversationId, chatId, messageId: "10", harness: CODEX_HARNESS, prompt: "do it" }));
+      assert.equal(await run(store.markPromptJobDispatched(job.id, epoch)), true);
+    }
     jobs.set(chatId, job.id);
     conversations.set(chatId, conversationId);
   }
@@ -361,6 +365,107 @@ test("a conversation's recovery of what its last worker left runs again only the
   assert.deepEqual([(await run(store.getPromptJob(jobs.get("1") ?? "")))?.state, (await run(store.getPromptJob(jobs.get("2") ?? "")))?.state], ["pending", "running"]);
   assert.equal(await run(store.recoverLeftPromptJobs(conversations.get("2") ?? "")), false);
   assert.equal((await run(store.getPromptJob(jobs.get("2") ?? "")))?.state, "interrupted");
+});
+
+/** A job of the conversation running, by its turn, claimed, its prompt not yet sent: the job, and the turn's epoch. */
+async function unsentJob(store: Store["Service"], conversationId: string) {
+  const job = await run(store.enqueuePromptJob({ conversationId, chatId: "123", messageId: "21", prompt: "do it" }));
+  await run(store.claimNextPromptJob(conversationId));
+  const epoch = await run(store.claimTurn({ conversationId, chatId: "123", messageId: "21", harness: CODEX_HARNESS, prompt: "do it" }));
+  return { job, epoch };
+}
+
+/** The lost turn's recovery of `epoch`, as alasio attaching again, or a binding's loss heard, asks it. */
+const lostRecovery = (conversationId: string, epoch: number): LostRecovery => ({
+  conversationId,
+  epoch,
+  binding: null,
+  messageId: `${LOST_PREFIX}${epoch}`,
+  prompt: () => "lost",
+  said: (outcome) => outcome,
+});
+
+test("a turn lost before its job's prompt was sent runs that job again as itself, never also as a prompt of its own, and its pod can then send the prompt no more", async () => {
+  const store = await codexConversation();
+  const { job, epoch } = await unsentJob(store, CONVERSATION);
+  // Its conversation's alasio, taking it over, settles its jobs: this one, its turn left, its pod perhaps holding it yet, is left be.
+  assert.equal(await run(store.recoverLeftPromptJobs(CONVERSATION)), false);
+  assert.equal((await run(store.getPromptJob(job.id)))?.state, "running");
+  const recovered = await run(store.stageLostRecovery(lostRecovery(CONVERSATION, epoch)));
+  assert.equal(recovered.outcome, "requeued");
+  assert.equal((await run(store.getPromptJob(job.id)))?.state, "pending");
+  // Its pod, late, records the prompt sent no more, and sends nothing.
+  assert.equal(await run(store.markPromptJobDispatched(job.id, epoch)), false);
+  assert.equal((await run(store.getPromptJob(job.id)))?.upstream_dispatched_at, null);
+  // What runs next is the job itself, and nothing after it: no prompt of its own for the turn lost.
+  assert.equal((await run(store.claimNextPromptJob(CONVERSATION)))?.id, job.id);
+  assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null);
+});
+
+test("a turn whose job's prompt its pod sent first is run again as a prompt of its own, its job left to its own recovery", async () => {
+  const store = await codexConversation();
+  const { job, epoch } = await unsentJob(store, CONVERSATION);
+  assert.equal(await run(store.markPromptJobDispatched(job.id, epoch)), true);
+  const recovered = await run(store.stageLostRecovery(lostRecovery(CONVERSATION, epoch)));
+  assert.equal(recovered.outcome, "staged");
+  assert.equal((await run(store.getPromptJob(job.id)))?.state, "running");
+});
+
+test("a binding's loss heard for a turn whose job's prompt was never sent, as an alasio holding the conversation's claim attaches to it again or drives it, runs the job again once, as itself: what that alasio settles of the job after does nothing", async () => {
+  const store = await codexConversation();
+  const { job, epoch } = await unsentJob(store, CONVERSATION);
+  await run(store.claimWorker(CONVERSATION, "pod-a/x", 60_000));
+  const turn = await run(store.getActiveTurn(CONVERSATION));
+  assert.equal((await run(store.stageLostRecovery(lostRecovery(CONVERSATION, epoch)))).outcome, "requeued");
+  // Its attaching again, given up, settles its turn's job left; its driving ends, failed or settled: none touches the job run again.
+  await run(store.recoverLeftPromptJobOf(CONVERSATION, turn!.started_at));
+  assert.equal(await run(store.failPromptJob(job.id, "lost")), false);
+  assert.equal(await run(store.settleRunningPromptJob(job.id, "cancelled")), false);
+  assert.equal((await run(store.getPromptJob(job.id)))?.state, "pending");
+  // Nor, once the conversation's worker claims it anew, does its attaching again, ending late.
+  assert.equal((await run(store.claimNextPromptJob(CONVERSATION)))?.id, job.id);
+  await run(store.recoverLeftPromptJobOf(CONVERSATION, turn!.started_at));
+  assert.equal((await run(store.getPromptJob(job.id)))?.state, "running");
+  assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null);
+});
+
+test("a pod's record of its job's prompt sent, waiting on the job's row as the job is run again and claimed anew, records it for the turn it was taken from no more", async () => {
+  const schema = newSchema();
+  const store = await testStore({ schema });
+  await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "123", user: { id: 123 } })), CODEX_HARNESS));
+  const { job, epoch } = await unsentJob(store, CONVERSATION);
+  const pool = await testPool();
+  const anew = await pool.connect();
+  try {
+    // The job run again and claimed anew, in a transaction the pod's record waits on, its turn read as it was.
+    await anew.query("begin");
+    await anew.query(`update ${schema}.prompt_jobs set started_at = clock_timestamp(), attempts = attempts + 1 where id = $1`, [job.id]);
+    const recorded = run(store.markPromptJobDispatched(job.id, epoch));
+    await eventually("the record to wait on the job's row", async () =>
+      (await pool.query(`select 1 from pg_stat_activity where pid <> pg_backend_pid() and wait_event_type = 'Lock' and query like '%upstream_dispatched_at = coalesce%'`)).rows.length > 0 ? true : undefined);
+    await anew.query("commit");
+    assert.equal(await recorded, false);
+  } finally {
+    // Its transaction, where the test failed within it, ended with the connection, not left to the pool.
+    anew.release(true);
+  }
+  assert.equal((await run(store.getPromptJob(job.id)))?.upstream_dispatched_at, null);
+});
+
+test("a turn attached to again settles, as it ends, the job left of it, claimed in the millisecond it started in", async () => {
+  const schema = newSchema();
+  const store = await testStore({ schema });
+  await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "123", user: { id: 123 } })), CODEX_HARNESS));
+  const { job, epoch } = await unsentJob(store, CONVERSATION);
+  // Its job claimed, then its turn started, in one millisecond, which the turn's start is read to.
+  const pool = await testPool();
+  await pool.query(`update ${schema}.turns set started_at = date_trunc('milliseconds', started_at) + interval '900 microseconds' where id = $1`, [CONVERSATION]);
+  await pool.query(`update ${schema}.prompt_jobs j set started_at = date_trunc('milliseconds', t.started_at) + interval '400 microseconds' from ${schema}.turns t where t.id = j.conversation_id and j.id = $1`, [job.id]);
+  const turn = await run(store.getActiveTurn(CONVERSATION));
+  assert.equal(await run(store.markPromptJobDispatched(job.id, epoch)), true);
+  assert.equal((await run(store.stageLostRecovery(lostRecovery(CONVERSATION, epoch)))).outcome, "staged");
+  await run(store.recoverLeftPromptJobOf(CONVERSATION, turn!.started_at));
+  assert.equal((await run(store.getPromptJob(job.id)))?.state, "interrupted");
 });
 
 test("a turn whose harness instance was lost is run again once, as a prompt of its own; one whose response was complete is delivered instead; a recovery lost again is let go of", async () => {

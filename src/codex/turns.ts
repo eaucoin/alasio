@@ -525,9 +525,12 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
    * about again. Whether it ended as none was left, or as the conversation was busy.
    */
   const drain = Effect.fnUntraced(function*(conversationId: string): Effect.fn.Return<"empty" | "busy", StoreError> {
-    /** Whatever a job's turn failed with, the job fails with it and the operator is told why. */
+    /**
+     * Whatever a job's turn failed with, the job fails with it and the operator is told why; but
+     * one run again since, its prompt never sent as its harness was lost, which runs again as itself.
+     */
     const failJob = Effect.fnUntraced(function*(job: PromptJob, error: unknown) {
-      yield* store.failPromptJob(job.id, error);
+      if (!(yield* store.failPromptJob(job.id, error))) return;
       const label = harnessLabelOf(yield* store.getMount(conversationId));
       // Its files not written where its harness reads them, as its turn's host started it: said so, as no error of the harness's.
       const text = error instanceof ReceivedFileError
@@ -562,9 +565,10 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
           jobId: job.id,
           traceparent: job.traceparent,
         })),
-        Effect.flatMap((completed) => store.setPromptJobDisposition(job.id, completed ? "completed" : "cancelled")),
+        // Settled where it runs still, not run again since as its prompt was never sent (Store.stageLostRecovery).
+        Effect.flatMap((completed) => store.settleRunningPromptJob(job.id, completed ? "completed" : "cancelled")),
         // Another turn took the conversation as this one was to start: the job waits for it to end, first in line as it was.
-        Effect.catchTag("ConversationBusy", () => store.setPromptJobDisposition(job.id, "pending", job.priority)),
+        Effect.catchTag("ConversationBusy", () => store.settleRunningPromptJob(job.id, "pending", job.priority)),
         Effect.catch((error) => failJob(job, error)),
         Effect.catchDefect((defect) => failJob(job, defect)),
       );
@@ -717,7 +721,12 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
       ),
       Effect.catchTag("HarnessHostError", (error) => recoverLost(turn, `${LOST_PREFIX}${epoch}`, `its harness was not reached within ${Duration.format(REATTACH_WITHIN)}: ${error.message}`)),
       Effect.catch((error) => failAttached(turn, error.message)),
-      Effect.ensuring(schedule(conversationId)),
+      // Its job settled once the turn is ended, as its pod left it, that job alone, as the
+      // conversation's worker may run another meanwhile (recoverLeftPromptJobOf); then what waits run.
+      Effect.ensuring(store.recoverLeftPromptJobOf(conversationId, turn.started_at).pipe(
+        Effect.catch((error) => Effect.logWarning(`Could not settle ${conversationId}'s jobs left by its turn attached to again: ${error.message}`)),
+        Effect.andThen(schedule(conversationId)),
+      )),
       withLogScope(LOG_SCOPE),
     );
   };
@@ -791,9 +800,11 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
   /**
    * What the conversation's last worker left, recovered under the claim taken from it, as it
    * stopped or crashed: a turn whose job the agent finished ended so, its status message saying
-   * so; a steer it was handing over asked about, not run again; the jobs it ran settled; and the
-   * turn it left running on its pod attached to again in the background (reattach), under the
-   * claim. Run as what took the claim recovers, before anything that joins the claim may act: so it
+   * so; a steer it was handing over asked about, not run again; the jobs it ran settled, but one
+   * never sent whose turn it left, which its pod may hold yet; and the turn it left running on its
+   * pod attached to again in the background (reattach), under the claim, which settles that job:
+   * run again as itself where its pod knows nothing of the turn and its prompt was never sent,
+   * never also as a turn lost. Run as what took the claim recovers, before anything that joins the claim may act: so it
    * never asks for its own conversation's claim (holding), which would wait on itself; what it
    * starts under the claim it forks (forkHolding), to run once it is through.
    */
