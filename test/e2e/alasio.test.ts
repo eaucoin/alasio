@@ -4194,13 +4194,55 @@ if (inShard("agents")) {
 
   // Here, where the run's conversations' harnesses are let go of once idle, so nothing keeps alasio awake but what waits.
   describe("alasio, its scale made a range from none and fixed again", () => {
+    /**
+     * Each alasio's log as its pod had it last, kept every 2 s while these tests run, as a pod
+     * deleted, as a rollout deletes the old ones, takes its log with it: by the pod's name.
+     */
+    const alasioLogs = new Map<string, string>();
+    let keepingLogs: Promise<void> = Promise.resolve();
+    let keeping = false;
     before(async () => {
       telegram = await forward(TELEGRAM);
       tg = operator(telegram.base);
+      keeping = true;
+      keepingLogs = (async () => {
+        while (keeping) {
+          // Asked as the loop goes, so that a failure to list, however it comes, is one round's alone.
+          const pods = await Promise.resolve().then(() => kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("alasio")) })).catch(() => []);
+          for (const pod of pods) {
+            const name = pod.metadata?.name ?? "";
+            const logged = await Promise.resolve().then(() => kube.logs(NAMESPACE, name, "alasio")).catch(() => "");
+            if (logged.length >= (alasioLogs.get(name)?.length ?? 0)) alasioLogs.set(name, logged);
+          }
+          await sleep(2_000);
+        }
+      })();
     });
 
-    after(() => {
+    after(async () => {
+      keeping = false;
+      await keepingLogs;
       telegram?.close();
+    });
+
+    // A test that failed says, as it failed, what the operator's conversation was then, by its
+    // rows of the store's, and what each alasio logged, of those gone too: what drove it, and how
+    // each of its prompts came to be answered, or not, from the update that brought it on, as
+    // the intake wrote it to the log and an alasio kept it and its message, to its job and turn.
+    afterEach(async (t) => {
+      if (!failed(t)) return;
+      const said = [
+        ["prompt_jobs", "select row_to_json(row) from state.prompt_jobs row where conversation_id = 'telegram:1001' order by seq"],
+        ["turns", "select row_to_json(row) from state.turns row where id = 'telegram:1001'"],
+        ["conversation_workers", "select row_to_json(row) from state.conversation_workers row where conversation_id = 'telegram:1001'"],
+        ["telegram_updates, the last 12", "select json_build_object('update_id', update_id, 'received_at', received_at, 'processed_at', processed_at, 'chat', payload->'message'->'chat'->>'id', 'message_id', payload->'message'->>'message_id', 'text', payload->'message'->>'text') from state.telegram_updates order by update_id desc limit 12"],
+        ["messages in, the last 12", "select json_build_object('transport_message_id', transport_message_id, 'text', text, 'created_at', created_at) from state.messages where conversation_id = 'telegram:1001' and direction = 'in' order by created_at desc limit 12"],
+      ] as const;
+      for (const [what, query] of said) {
+        const rows = await onDatabase(NAMESPACE, query).catch((error: unknown) => `not read: ${String(error)}`);
+        console.error(`# state.${what} of telegram:1001 as the test failed:\n${rows}`);
+      }
+      for (const [name, logged] of alasioLogs) console.error(`# what ${name} logged, its last 200 lines:\n${logged.split("\n").slice(-200).join("\n")}`);
     });
 
     const alasioDeployment = () => kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE));
