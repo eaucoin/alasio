@@ -20,9 +20,9 @@ on:
         type: string
         default: "local s3-standard s3-express"
       variants:
-        description: "alasio's variants, of as-shipped with-fix, a job each"
+        description: "Variants, a job each, of the systems that name them (alasio: as-shipped with-fix; criu: all phaul splice); each system's own default where empty or none of its"
         type: string
-        default: "as-shipped with-fix"
+        default: ""
       cases:
         description: "Fixture cases, as fixture/MiB (all if empty)"
         type: string
@@ -67,14 +67,16 @@ jobs:
           words() { jq --raw-input --compact-output '[splits("[\\s,]+") | select(. != "")]' <<<"$1"; }
           matrix=$(jq --null-input --compact-output \
             --argjson systems "$(words "$SYSTEMS")" --argjson targets "$(words "$TARGETS")" --argjson profiles "$(words "$PROFILES")" --argjson variants "$(words "$VARIANTS")" '
-            ["alasio", "gvisor", "firecracker", "criu"] as $known
+            {alasio: ["as-shipped", "with-fix"], gvisor: ["all"], firecracker: ["all"], criu: ["all", "phaul", "splice"]} as $variantsOf
+            | {alasio: ["as-shipped", "with-fix"], gvisor: ["all"], firecracker: ["all"], criu: ["all"]} as $defaults
+            | ($variantsOf | keys) as $known
             | ["local", "s3-standard", "s3-express"] as $shapes
             | if ($systems - $known) != [] then "::error::no system \($systems - $known | join(", "))\n" | halt_error(1)
               elif ($profiles - $shapes) != [] then "::error::no profile \($profiles - $shapes | join(", "))\n" | halt_error(1)
               else . end
             | {include: [$systems[] as $system | $profiles[] as $profile
                 | (if $system == "alasio" then $targets[] else "host" end) as $target
-                | (if $system == "alasio" then $variants[] else "all" end) as $variant
+                | ([$variantsOf[$system][] | select(. as $each | $variants | index($each))] | if . == [] then $defaults[$system] else . end)[] as $variant
                 | {system: $system, target: $target, profile: $profile, variant: $variant}]}')
           echo "matrix=$matrix" | tee --append "$GITHUB_OUTPUT"
           echo "alasio=$(jq --arg s alasio 'index($s) != null' <<<"$(words "$SYSTEMS")")" | tee --append "$GITHUB_OUTPUT"
@@ -152,7 +154,7 @@ jobs:
       BENCH_SYSTEM: ${{ matrix.system }}
       BENCH_TARGET: ${{ matrix.target }}
       BENCH_PROFILE: ${{ matrix.profile }}
-      # The variant a job runs, of a system that runs one per job (alasio); "all" for the others, which run all theirs.
+      # The variant a job runs: alasio's, one a job; criu's, its default ("all") or a tuning one; "all" for the others, which run all theirs.
       BENCH_VARIANT: ${{ matrix.variant }}
       BENCH_CASES: ${{ inputs.cases }}
       BENCH_RUNS: ${{ inputs.runs }}
