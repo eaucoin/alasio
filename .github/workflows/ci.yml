@@ -146,7 +146,7 @@ jobs:
       - name: Free disk space
         shell: bash
         run: |
-          for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost /usr/share/swift \
+          for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift \
             /usr/local/share/powershell /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az; do
             sudo rm -rf "$dir" &
           done

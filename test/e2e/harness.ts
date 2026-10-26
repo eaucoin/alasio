@@ -121,7 +121,7 @@ export function targetOf(value: string | undefined): "host" | "docker" {
 }
 
 /** The shards of the suites, each run on a cluster of its own. */
-export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents", "wake"] as const;
+export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents", "wake", "bench"] as const;
 export type Shard = (typeof SHARDS)[number];
 
 /** The shard `value` names, or none, when it is unset or empty. */
@@ -141,14 +141,15 @@ export function shardOf(value: string | undefined): Shard | undefined {
  * on an installation that releases an idle one within HARNESS_RELEASE_AFTER_SECONDS;
  * `snapshots`, sessions released into whole-sandbox snapshots and restored from them, on an
  * installation that releases them within RELEASE_AFTER_SECONDS; `upgrade`, what alasio keeps upgraded from the release before;
- * or `wake`, a press waking alasio from none, its gate's own at the default scale, sleeping within the run; every suite
+ * `wake`, a press waking alasio from none, its gate's own at the default scale, sleeping within the run; or `bench`, the
+ * memory-snapshot benchmark's alasio system (./snapshot-bench.test.ts), its sessions as large as its fixtures; every suite
  * but those four shards' unless set, as each needs an installation of its own.
  * Each shard runs the command line's suite, and uninstall's, as well.
  */
 export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
 
 /** The shards whose suites need an installation of their own, run only when selected. */
-const OWN_INSTALLATION: readonly Shard[] = ["snapshots", "upgrade", "agents", "wake"];
+const OWN_INSTALLATION: readonly Shard[] = ["snapshots", "upgrade", "agents", "wake", "bench"];
 
 /** Whether a run of the shard `selected`, or of none, runs the suites of `shard`: the snapshots, upgrade, agents and wake shards' only when selected. */
 export const runsShard = (selected: Shard | undefined, shard: Shard): boolean => selected === shard || (selected === undefined && !OWN_INSTALLATION.includes(shard));
@@ -728,11 +729,15 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
     sessions: {
       storage: { size: "1Gi" },
       // The snapshots shard's sessions hold a REPL of BIG_REPL_MEBIBYTES live, with room for bayma and gVisor.
-      resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: { cpu: "1", memory: SHARD === "snapshots" ? "3Gi" : "1Gi" } },
+      // The benchmark's, as every system's instance is: 2 CPUs and 5 GiB, its largest fixture's 3 GiB with room for bayma and gVisor.
+      resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: SHARD === "bench" ? { cpu: "2", memory: "5Gi" } : { cpu: "1", memory: SHARD === "snapshots" ? "3Gi" : "1Gi" } },
       // Never released within the run but in the snapshots, upgrade and wake shards: the other suites
       // reach sessions by exec in their pods, which is no exec of bayma's, and a release would end
       // their pods under them.
-      snapshots: { releaseAfter: SHARD === "snapshots" || SHARD === "upgrade" || SHARD === "wake" ? `${RELEASE_AFTER_SECONDS}s` : "24h" },
+      // The benchmark's saved and released by its harness alone, and its images kept on the node for its warm restores.
+      snapshots: SHARD === "bench"
+        ? { releaseAfter: "24h", liveEvery: "24h", nodeCache: "16Gi" }
+        : { releaseAfter: SHARD === "snapshots" || SHARD === "upgrade" || SHARD === "wake" ? `${RELEASE_AFTER_SECONDS}s` : "24h" },
       // On one agent, but in the snapshots shard, where a session runs on any node, as it may be restored on another than it was saved on.
       ...(SHARD === "snapshots" ? {} : on("agent-0")),
     },
