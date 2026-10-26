@@ -55,13 +55,24 @@ export const STARGZ_EXECUTABLES = ["containerd-stargz-grpc", "stargz-fuse-manage
 const tomlString = (value: string): string => JSON.stringify(value);
 
 /**
+ * How much of a layer the daemon asks a registry for at once, as it fetches in the background
+ * and as a file is read: 1 MiB. At the daemon's default, 50 kB, the sessions' 2.1 GiB agent
+ * image, pulled lazily, was fetched whole in the background in 17 min on a runner's host,
+ * and had not been in 30 min in Docker, its sessions reading from the registry all that
+ * while, and its files read whole 5 min on took 611 to 1168 s; at 1 MiB, fetched whole in 8
+ * and 5 min, its files read in 186 to 413 s, its pull as quick (2 to 3 s) and a pull beside
+ * it no slower. 4 MiB read slower than 1 MiB.
+ */
+const CHUNK_BYTES = 1024 * 1024;
+
+/**
  * The daemon's configuration on a node pulling through `registries`: its background fetch,
  * which fetches every layer whole so a pod reads nothing from the registry once it is done,
  * one layer at a time, so it takes less of the network a pod's start reads its layers
  * over (in CI, a 2.1 GB image started in 0.7–1.3 s so, and 1.0–3.2 s with the
- * default two); one range at a time in each request it makes of a registry; its FUSE manager
- * on, which keeps its mounts; and each mirror it can reach as it is, ahead of the registry
- * itself, which it reads last. Pure, for tests.
+ * default two), in chunks of CHUNK_BYTES; one range at a time in each request it makes of a
+ * registry; its FUSE manager on, which keeps its mounts; and each mirror it can reach as it
+ * is, ahead of the registry itself, which it reads last. Pure, for tests.
  *
  * One range at a time, as ghcr.io's blobs answer a request of more than one range with 501
  * Not Implemented (pkg-containers.githubusercontent.com, which its blobs redirect to), which
@@ -85,6 +96,7 @@ export function stargzConfig(registries?: Registries): string {
     "",
     "[blob]",
     "force_single_range_mode = true",
+    `chunk_size = ${CHUNK_BYTES}`,
     "",
     "[fuse_manager]",
     "enable = true",

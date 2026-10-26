@@ -759,6 +759,14 @@ if (inShard("upgrade")) {
       assert.deepEqual((policy.spec?.ingress ?? []).filter(({ from }) => from?.some(({ namespaceSelector }) => namespaceSelector !== undefined)), []);
     });
 
+    test("upgraded: the node's stargz-snapshotter daemon runs with this release's configuration, fetching in chunks of 1 MiB, started again since it was written", async () => {
+      const config = await onNode("", "cat /etc/containerd-stargz-grpc/config.toml");
+      assert.match(config, /^chunk_size = 1048576$/mu);
+      // Started since its configuration was written: the daemon reads its file as it starts alone.
+      const [written = "", started = ""] = (await onNode("", "stat -c %Y /etc/containerd-stargz-grpc/config.toml; date -d \"$(systemctl show stargz-snapshotter -p ActiveEnterTimestamp --value)\" +%s")).trim().split("\n");
+      assert.ok(Number(started) >= Number(written), `the daemon started at ${started}, before its configuration was written at ${written}`);
+    });
+
     test(`upgraded: alasio's Telegram topic, of one partition on ${PREVIOUS}, has its ${TELEGRAM_PARTITIONS}, given while the cut-over had alasio stopped`, async () => {
       const partitions = await kube.execOk(NAMESPACE, `${componentName("log")}-0`, ["node", "/opt/alasio/src/log/access.ts", "partitions", telegramTopic(environmentName(MAIN_ENVIRONMENT))], { container: "access" });
       assert.equal(Number(partitions.trim()), TELEGRAM_PARTITIONS);

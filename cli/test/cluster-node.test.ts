@@ -169,9 +169,9 @@ test("configuring the node removes runsc's options for releases it no longer run
   ]);
 });
 
-test("stargz-snapshotter's daemon fetches one layer at a time in the background, asks a registry for one range at a time, keeps its mounts with its FUSE manager, and reads layers through the mirrors it can reach as they are", () => {
+test("stargz-snapshotter's daemon fetches one layer at a time in the background, in chunks of 1 MiB, asks a registry for one range at a time, keeps its mounts with its FUSE manager, and reads layers through the mirrors it can reach as they are", () => {
   const plain = stargzConfig();
-  assert.match(plain, /^max_concurrency = 1\n\n\[blob\]\nforce_single_range_mode = true\n\n\[fuse_manager\]\nenable = true\n/mu);
+  assert.match(plain, /^max_concurrency = 1\n\n\[blob\]\nforce_single_range_mode = true\nchunk_size = 1048576\n\n\[fuse_manager\]\nenable = true\n/mu);
   assert.doesNotMatch(plain, /resolver/u);
   const mirrored = stargzConfig({
     mirrors: {
