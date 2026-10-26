@@ -330,24 +330,30 @@ function bundleOf(attach: string): Instance {
   return { id, bundle, cgroup: `/sys/fs/cgroup/${CGROUP_PARENT}/${id}` };
 }
 
-/** Waits for bayma to answer on its port, as a started instance's does once it listens. */
-async function answering(): Promise<void> {
+/** Waits for bayma to answer its status, as a started instance's does once it listens. */
+async function answering(token: string): Promise<void> {
   const deadline = Date.now() + 120_000;
+  let said = "nothing";
   for (;;) {
     try {
-      if ((await fetch(`http://${ADDRESS}:${PORT}/status`)).ok) return;
-    } catch {
-      // Not listening yet.
+      const answer = await fetch(`http://${ADDRESS}:${PORT}/status`, { headers: { authorization: `Bearer ${token}` } });
+      if (answer.ok) return;
+      said = `HTTP ${answer.status}`;
+    } catch (error) {
+      said = String((error as Error).cause ?? error);
     }
-    if (Date.now() > deadline) throw new Error("bayma did not answer within 120 s of the instance's start");
+    if (Date.now() > deadline) {
+      const printed = readFileSync(join(work, "instances.log"), "utf8").trim().split("\n").slice(-10).join(" | ");
+      throw new Error(`bayma did not answer within 120 s of the instance's start (${said}; it printed: ${printed})`);
+    }
     await sleep(100);
   }
 }
 
-async function start(attach: string): Promise<Instance> {
-  const instance = bundleOf(attach);
+async function start(run: Run): Promise<Instance> {
+  const instance = bundleOf(run.attach);
   runc(["run", "--detach", "--bundle", instance.bundle, "--pid-file", join(instance.bundle, "pid"), instance.id], stdio);
-  await answering();
+  await answering(run.token);
   return instance;
 }
 
@@ -382,6 +388,8 @@ interface Run extends Case {
   readonly stage: string;
   readonly prefix: string;
   readonly endpoint: readonly string[];
+  /** The bearer bayma's clients send, which /attach/token holds. */
+  readonly token: string;
   /** The fixture's bayma session, once setup has made it. */
   session: string;
   /** Whether a phase of it has failed, so its logs are kept. */
@@ -438,7 +446,7 @@ function prepare(c: Case, run: number): Run {
   must("chown", ["-R", "1000:1000", attach]);
   const stage = join(dir, "stage");
   mkdirSync(stage, { recursive: true });
-  return { ...c, run, runId, dir, attach, stage, prefix: `criu/${runId}/`, endpoint: ["--url", `http://${ADDRESS}:${PORT}/mcp`, "--header", `Authorization: Bearer ${token}`], session: "", failed: false };
+  return { ...c, run, runId, dir, attach, stage, prefix: `criu/${runId}/`, endpoint: ["--url", `http://${ADDRESS}:${PORT}/mcp`, "--header", `Authorization: Bearer ${token}`], token, session: "", failed: false };
 }
 
 /** The bytes of the run's objects in the bucket. */
@@ -751,7 +759,7 @@ async function runCase(c: Case, number: number): Promise<void> {
     throw new Error(`${phase} failed`);
   };
   try {
-    instance = await start(run.attach);
+    instance = await start(run);
     const set = await driven("setup", [...run.endpoint, "--fixture", run.fixture, "--size-mib", String(run.sizeMib), "--run-id", run.runId, "--rate-mib-s", String(host.copy_mib_s)]);
     run.session = String(set["session_id"]);
     await driven("mark", [...run.endpoint, "--session", run.session, "--fixture", run.fixture]);
@@ -798,7 +806,7 @@ async function runCase(c: Case, number: number): Promise<void> {
  */
 async function pauseCheck(): Promise<void> {
   const run = prepare({ fixture: "idle", sizeMib: 16 }, 0);
-  const instance = await start(run.attach);
+  const instance = await start(run);
   try {
     const set = await driven("setup", [...run.endpoint, "--fixture", "idle", "--size-mib", "16", "--run-id", run.runId]);
     const session = String(set["session_id"]);
@@ -823,8 +831,11 @@ const cases: Case[] = options.cases
   })
   : (JSON.parse(readFileSync(join(here, "../common/cases.json"), "utf8")) as { fixture: string; size_mib: number }[]).map(({ fixture, size_mib }) => ({ fixture, sizeMib: size_mib }));
 mkdirSync(dirname(out), { recursive: true });
-await pauseCheck();
-for (let number = 1; number <= Number(options.runs); number++) for (const c of cases) await runCase(c, number);
-closeSync(stdio[0]);
-closeSync(stdio[1]);
-for (const name of ["instances.log", "runc.log"]) if (existsSync(join(work, name))) copyFileSync(join(work, name), join(logs, name));
+try {
+  await pauseCheck();
+  for (let number = 1; number <= Number(options.runs); number++) for (const c of cases) await runCase(c, number);
+} finally {
+  closeSync(stdio[0]);
+  closeSync(stdio[1]);
+  for (const name of ["instances.log", "runc.log"]) if (existsSync(join(work, name))) copyFileSync(join(work, name), join(logs, name));
+}
