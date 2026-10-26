@@ -19,6 +19,10 @@ on:
         description: "Store profiles, of local s3-standard s3-express"
         type: string
         default: "local s3-standard s3-express"
+      variants:
+        description: "alasio's variants, of as-shipped with-fix, a job each"
+        type: string
+        default: "as-shipped with-fix"
       cases:
         description: "Fixture cases, as fixture/MiB (all if empty)"
         type: string
@@ -58,10 +62,11 @@ jobs:
           SYSTEMS: ${{ inputs.systems }}
           TARGETS: ${{ inputs.targets }}
           PROFILES: ${{ inputs.profiles }}
+          VARIANTS: ${{ inputs.variants }}
         run: |
           words() { jq --raw-input --compact-output '[splits("[\\s,]+") | select(. != "")]' <<<"$1"; }
           matrix=$(jq --null-input --compact-output \
-            --argjson systems "$(words "$SYSTEMS")" --argjson targets "$(words "$TARGETS")" --argjson profiles "$(words "$PROFILES")" '
+            --argjson systems "$(words "$SYSTEMS")" --argjson targets "$(words "$TARGETS")" --argjson profiles "$(words "$PROFILES")" --argjson variants "$(words "$VARIANTS")" '
             ["alasio", "gvisor", "firecracker", "criu"] as $known
             | ["local", "s3-standard", "s3-express"] as $shapes
             | if ($systems - $known) != [] then "::error::no system \($systems - $known | join(", "))\n" | halt_error(1)
@@ -69,7 +74,8 @@ jobs:
               else . end
             | {include: [$systems[] as $system | $profiles[] as $profile
                 | (if $system == "alasio" then $targets[] else "host" end) as $target
-                | {system: $system, target: $target, profile: $profile}]}')
+                | (if $system == "alasio" then $variants[] else "all" end) as $variant
+                | {system: $system, target: $target, profile: $profile, variant: $variant}]}')
           echo "matrix=$matrix" | tee --append "$GITHUB_OUTPUT"
           echo "alasio=$(jq --arg s alasio 'index($s) != null' <<<"$(words "$SYSTEMS")")" | tee --append "$GITHUB_OUTPUT"
 
@@ -139,13 +145,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
-    name: bench (${{ matrix.system }}, ${{ matrix.target }}, ${{ matrix.profile }})
+    name: bench (${{ matrix.system }}, ${{ matrix.target }}, ${{ matrix.profile }}, ${{ matrix.variant }})
     env:
       # Beside the checkout, on the runner's disk.
       BENCH_DIR: /home/runner/bench-work
       BENCH_SYSTEM: ${{ matrix.system }}
       BENCH_TARGET: ${{ matrix.target }}
       BENCH_PROFILE: ${{ matrix.profile }}
+      # The variant a job runs, of a system that runs one per job (alasio); "all" for the others, which run all theirs.
+      BENCH_VARIANT: ${{ matrix.variant }}
       BENCH_CASES: ${{ inputs.cases }}
       BENCH_RUNS: ${{ inputs.runs }}
     steps:
@@ -200,7 +208,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: results-${{ matrix.system }}-${{ matrix.target }}-${{ matrix.profile }}
+          name: results-${{ matrix.system }}-${{ matrix.target }}-${{ matrix.profile }}-${{ matrix.variant }}
           path: |
             ${{ env.BENCH_DIR }}/results.jsonl
             ${{ env.BENCH_DIR }}/host.json

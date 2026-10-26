@@ -58,6 +58,14 @@ function variable(name: string): string {
 const BENCH_DIR = variable("BENCH_DIR");
 const PROFILE = variable("BENCH_PROFILE");
 const RUNS = Number(process.env["BENCH_RUNS"] || 5);
+/**
+ * The variant: `as-shipped`, alasio 10.0.0 as it runs, whose live checkpoints of a pool's pod
+ * fail (mountedStateDir), so its release is a whole stop-and-copy; or `with-fix`, its live
+ * checkpoint given bayma's state directory by its mounted path, as alasio's fix, not yet
+ * released, gives it, its release then a delta of the live save's image.
+ */
+const VARIANT = variable("BENCH_VARIANT");
+if (VARIANT !== "as-shipped" && VARIANT !== "with-fix") throw new Error(`BENCH_VARIANT is ${VARIANT}, not as-shipped or with-fix`);
 const COMMON = new URL("../../bench/common/", import.meta.url);
 const read = (relative: string): string => readFileSync(new URL(relative, COMMON), "utf8");
 const PROFILES = JSON.parse(read("store/profiles.json")) as Record<string, { readonly emulated: boolean }>;
@@ -90,7 +98,7 @@ function emit(fixture: string, sizeMib: number, run: number, phase: string, outc
   const line = {
     schema: 1,
     system: "alasio",
-    variant: "live",
+    variant: VARIANT,
     target: TARGET,
     fixture,
     size_mib: sizeMib,
@@ -416,29 +424,33 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const stateDir = bayma ? stateDirOf(bayma) : null;
     if (!hook || !stateDir) throw new Error(`the pod ${bound.name} runs no bayma with a state directory`);
     if (!calibrated) await calibrate(workspace, sessionId, fixture, node, containerIdOf(pod));
-    // bayma's state directory by the path of the volume that holds it: the one the pool's pods give bayma, under /home/agent,
-    // which the image links to /attach/ws/home, is held by no volume of the pod's spec, and the agent, which reads it by the
-    // spec's mounts alone (src/node-agent/volume.ts hostPathOf), fails every live checkpoint of a pool's pod so: "no volume of
-    // its pod holds /home/agent/.bayma/last-save.json" (CI run 40396803554). The same directory, by the path that is mounted.
-    const request = { environment: SESSIONS, workspace, namespace: SESSIONS, pod: bound.name, containerId: containerIdOf(pod), hook, podTemplate: await poolTemplate(pod), live: { stateDir: mountedStateDir(stateDir) } };
+    // bayma's state directory as the pool's pods give it, under /home/agent, which the image links to /attach/ws/home: held
+    // by no volume of the pod's spec, so the agent, which reads it by the spec's mounts alone (src/node-agent/volume.ts
+    // hostPathOf), fails every live checkpoint of a pool's pod as shipped: "no volume of its pod holds
+    // /home/agent/.bayma/last-save.json" (CI run 40396803554). With the fix, the same directory by the path that is mounted.
+    const request = { environment: SESSIONS, workspace, namespace: SESSIONS, pod: bound.name, containerId: containerIdOf(pod), hook, podTemplate: await poolTemplate(pod), live: { stateDir: VARIANT === "with-fix" ? mountedStateDir(stateDir) : stateDir } };
     const sandboxId = await sandboxIdOf(node, bound.name);
     const heldBefore = await bucketBytes(node, workspace);
     await driver(workspace, "mark", "--session", sessionId, "--fixture", fixture);
     const agent = (await nodeAgents()).get(node) ?? "";
-    const live = JSON.parse((await kube.execOk(NAMESPACE, agent, ["node", "-e", CHECKPOINT, String(NODE_AGENT_PORT), SESSIONS, workspace], { container: "node-agent", stdin: JSON.stringify(request) })).trim().split("\n").at(-1) ?? "{}") as { readonly ms: number; readonly manifest: Manifest };
+    const checkpointed = await kube.exec(NAMESPACE, agent, ["node", "-e", CHECKPOINT, String(NODE_AGENT_PORT), SESSIONS, workspace], { container: "node-agent", stdin: JSON.stringify(request) });
     const gaps = await driver<{ readonly max_gap_ms: number; readonly slowdown: number | null }>(workspace, "gaps", "--session", sessionId, "--fixture", fixture);
     const heldLive = await bucketBytes(node, workspace);
     const liveLogged = saveLogged(await bootLog(node, sandboxId));
-    emit(fixture, sizeMib, run, "save-live", { ok: true, failure: null }, {
-      save_total_ms: live.ms,
-      unavailable_ms: gaps.max_gap_ms,
-      pause_reported_ms: liveLogged.pauseMs,
-      slowdown: gaps.slowdown,
-      precopy_passes: liveLogged.passes,
-      precopy_bytes: liveLogged.precopyBytes,
-      image_bytes: live.manifest.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null,
-      uploaded_bytes: heldLive - heldBefore,
-    }, NO_CHECKS, { snapshot: live.manifest.snapshot, state_dir: request.live.stateDir, runsc_checkpoint_ms: live.manifest.pauseMs, upload_ms: live.manifest.uploadMs, chain: live.manifest.layers.length, logged: liveLogged.said, gaps });
+    const logged = { state_dir: request.live.stateDir, logged: liveLogged.said, gaps };
+    const measured = { unavailable_ms: gaps.max_gap_ms, pause_reported_ms: liveLogged.pauseMs, slowdown: gaps.slowdown, precopy_passes: liveLogged.passes, precopy_bytes: liveLogged.precopyBytes, uploaded_bytes: heldLive - heldBefore };
+    if (checkpointed.code === 0) {
+      const live = JSON.parse(checkpointed.stdout.trim().split("\n").at(-1) ?? "{}") as { readonly ms: number; readonly manifest: Manifest };
+      emit(fixture, sizeMib, run, "save-live", { ok: true, failure: null }, {
+        ...measured,
+        save_total_ms: live.ms,
+        image_bytes: live.manifest.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null,
+      }, NO_CHECKS, { ...logged, snapshot: live.manifest.snapshot, runsc_checkpoint_ms: live.manifest.pauseMs, upload_ms: live.manifest.uploadMs, chain: live.manifest.layers.length });
+    } else {
+      // As alasio 10.0.0 fails it (mountedStateDir): its sandbox saved and running on, the snapshot never committed.
+      const said = /"error":"([^"]*)"/u.exec(checkpointed.stderr)?.[1] ?? checkpointed.stderr.trim().split("\n").at(-1) ?? "";
+      emit(fixture, sizeMib, run, "save-live", { ok: false, failure: `the node agent's live checkpoint failed: ${said}` }, measured, NO_CHECKS, logged);
+    }
     done.add(phase);
 
     phase = "save-stop";
