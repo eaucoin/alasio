@@ -133,6 +133,8 @@ export async function openLake(config: LakeAccess, { readOnly = false, source, m
     );
     if (!readOnly) {
       const catalog = new pg.Client({ ...config.catalog, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
+      // A connection lost fails the grants, and so the lake's open, not the process.
+      catalog.on("error", () => {});
       await catalog.connect();
       try {
         await grantReads(catalog);

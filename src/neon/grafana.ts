@@ -32,6 +32,8 @@ export async function ensureGrafanaRole(pool: Pool, databaseUrl: string, verifie
   url.pathname = `/${GRAFANA_DATABASE}`;
   // As patient as the pool's own connections.
   const client = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: pool.options.connectionTimeoutMillis });
+  // A connection lost fails the grant, and so the setup, not the process.
+  client.on("error", () => {});
   try {
     await client.connect();
     await client.query(`grant usage, create on schema public to ${GRAFANA_ROLE}`);

@@ -584,6 +584,9 @@ export interface ReconcileOptions {
   branch?: boolean | undefined;
 }
 
+/** The name the reconciliation's connection to the catalog gives itself (application_name). */
+export const RECONCILE_APPLICATION = "alasio-lake-reconcile";
+
 /**
  * Sets the lake's catalog right with its store, as the module says: forgets the files it
  * names that the store does not hold, under the lake's write lock; asks the log again for
@@ -600,7 +603,12 @@ export async function reconcileLake(
   dataPath: string,
   { log, lockRetryMs = LOADER_LOCK_RETRY_MS, rereadWaitMs = REREAD_WAIT_MS, store = null, branch = false }: ReconcileOptions,
 ): Promise<Reconciled> {
-  const client = new pg.Client({ ...catalog, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
+  // Named, as an operator sees its connection; and a connection lost, as its backend
+  // terminated while it waits on the loader's lock, fails its next statement, and so the
+  // reconciliation, not the process, as pg tells its 'error' listeners too, whose absence
+  // Node takes as the process's to die of.
+  const client = new pg.Client({ ...catalog, application_name: RECONCILE_APPLICATION, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
+  client.on("error", () => {});
   await client.connect();
   try {
     const lost = await serially(async (fence) => {

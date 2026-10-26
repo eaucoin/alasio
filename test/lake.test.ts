@@ -34,7 +34,7 @@ import { askReread, ensureOtel, type Held, LakeSetBack, mergeTelemetry, type Pos
 import { encodeRequest, type LogsRequest, type MetricsRequest, PART_ITEMS, REQUEST_ROW_BYTES, requestParts, requestRowBytes } from "../neon/lake/src/otlp.ts";
 import { format } from "../neon/lake/src/query.ts";
 import { answer, openReader } from "../neon/lake/src/reader.ts";
-import { readable, StoreUndecided, stored } from "../neon/lake/src/reconcile.ts";
+import { readable, RECONCILE_APPLICATION, StoreUndecided, stored } from "../neon/lake/src/reconcile.ts";
 import { type LakeSyncOptions, maintainLake, prepareLake, syncLake } from "../neon/lake/src/sync.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
@@ -2028,6 +2028,30 @@ describe("the lake", () => {
       assert.equal(await reconciled, true, logs.join("\n"));
       const { n, uuids } = await one<{ n: bigint; uuids: bigint }>(db, `select count(*) as n, count(distinct uuid) as uuids from ${LAKE}.claude.entries where uuid like 'fenced-%'`);
       assert.deepEqual([n, uuids], [60n, 60n]);
+    });
+  });
+
+  test("a reconciliation whose connection to the catalog is terminated, as by a compute's restart, fails, saying so, and the process lives on", async () => {
+    await withLake(async (db) => {
+      const logs: string[] = [];
+      const log: Log = (message, fields) => void logs.push(`${message} ${JSON.stringify(fields ?? {})}`);
+      // A loader holding its lock, which the reconciliation waits on, its own connection idle the while.
+      const loader = await takeLoaderLock(config.catalog, () => {});
+      let reconciled: Promise<boolean> | undefined;
+      try {
+        reconciled = runPass(db, "reconcile", { ...passing(log), lockRetryMs: 100 });
+        let terminated = 0;
+        for (const deadline = Date.now() + 30_000; terminated === 0; await new Promise((resolve) => setTimeout(resolve, 20))) {
+          assert.ok(Date.now() < deadline, "the reconciliation never connected to the catalog");
+          terminated = (await admin.query("select pg_terminate_backend(pid) from pg_stat_activity where application_name = $1", [RECONCILE_APPLICATION])).rowCount ?? 0;
+        }
+        // What the server sends its client as it terminates it, heard.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      } finally {
+        await loader.release();
+      }
+      assert.equal(await reconciled, false, logs.join("\n"));
+      assert.match(logs.join("\n"), /terminat|not queryable|Connection terminated/u);
     });
   });
 
