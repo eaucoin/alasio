@@ -356,6 +356,37 @@ async function poolTemplate(pod: V1Pod): Promise<Record<string, unknown>> {
 
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
+/** The job's ticker check failed: none of its measures is written. */
+class Uncalibrated extends Error {}
+
+/** Whether the job's ticker check has passed (calibrate). */
+let calibrated = false;
+
+/**
+ * The job's check of the fixtures' ticker (the benchmark's design, section 3): the sandbox of the
+ * pod `name`, its container `containerId`, paused for a second by runsc and resumed, the gap the
+ * ticker saw within what the harness saw of the freeze, 20 ms either side. Written to
+ * logs/calibration.json; the job fails where it is not.
+ */
+async function calibrate(workspace: string, sessionId: string, fixture: string, node: string, containerId: string): Promise<void> {
+  const runsc = `${gvisorDirectory(RELEASE_UNDER_TEST)}/runsc --root=${RUNSC_ROOT}`;
+  await driver(workspace, "mark", "--session", sessionId, "--fixture", fixture);
+  const pauseStart = now();
+  await onNode(node, `${runsc} pause ${containerId}`);
+  const pauseEnd = now();
+  await sleep(1000);
+  const resumeStart = now();
+  await onNode(node, `${runsc} resume ${containerId}`);
+  const resumeEnd = now();
+  const { max_gap_ms: gap } = await driver<{ readonly max_gap_ms: number }>(workspace, "gaps", "--session", sessionId, "--fixture", fixture);
+  const least = msBetween(pauseEnd, resumeStart) - 20;
+  const most = msBetween(pauseStart, resumeEnd) + 20;
+  const seen = { gap_ms: gap, least_ms: least, most_ms: most, ok: gap >= least && gap <= most };
+  appendFileSync(join(BENCH_DIR, "logs", "calibration.json"), `${JSON.stringify(seen)}\n`);
+  if (!seen.ok) throw new Uncalibrated(`the ticker saw a gap of ${gap} ms of a freeze of ${least + 20} to ${most - 20} ms: its measures are not to be trusted`);
+  calibrated = true;
+}
+
 /** One run of a case, every phase of it written, as the module says; what fails is written as failed, and the run goes on to its cleanup. */
 async function runOnce(fixture: string, sizeMib: number, run: number): Promise<void> {
   const workspace = `fs-${randomBytes(6).toString("hex")}`;
@@ -381,6 +412,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const hook = bayma ? hookOf(bayma) : null;
     const stateDir = bayma ? stateDirOf(bayma) : null;
     if (!hook || !stateDir) throw new Error(`the pod ${bound.name} runs no bayma with a state directory`);
+    if (!calibrated) await calibrate(workspace, sessionId, fixture, node, containerIdOf(pod));
     const request = { environment: SESSIONS, workspace, namespace: SESSIONS, pod: bound.name, containerId: containerIdOf(pod), hook, podTemplate: await poolTemplate(pod), live: { stateDir } };
     const sandboxId = await sandboxIdOf(node, bound.name);
     const heldBefore = await bucketBytes(node, workspace);
@@ -441,6 +473,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     done.add(phase);
     await endUnsaved(cold.pod);
   } catch (error) {
+    if (error instanceof Uncalibrated) throw error;
     const why = `${phase}: ${errorText(error)}`;
     console.error(`# ${fixture} ${sizeMib} MiB run ${run} failed at ${why}`);
     for (const each of phases.filter((name) => !done.has(name))) emit(fixture, sizeMib, run, each, { ok: false, failure: each === phase ? why : `not run: ${why}` }, {});
