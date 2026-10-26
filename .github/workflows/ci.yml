@@ -175,9 +175,14 @@ jobs:
         run: |
           mkdir -p "$BENCH_DIR"
           bench/common/host.sh "$BENCH_DIR/staging" | tee "$BENCH_DIR/host.json"
-      - name: The store
+      - name: The store, and how it answers through its profile
         if: matrix.system != 'alasio'
-        run: bench/common/store/up.sh "$BENCH_DIR/store" "$BENCH_PROFILE"
+        run: |
+          bench/common/store/up.sh "$BENCH_DIR/store" "$BENCH_PROFILE"
+          set -a
+          . "$BENCH_DIR/store/store.env"
+          set +a
+          node bench/common/dist/probe.mjs | tee "$BENCH_DIR/store.json"
       - name: Run ${{ matrix.system }}
         run: bench/${{ matrix.system }}/run.sh "$BENCH_TARGET" "$BENCH_PROFILE"
         env:
@@ -190,6 +195,7 @@ jobs:
           path: |
             ${{ env.BENCH_DIR }}/results.jsonl
             ${{ env.BENCH_DIR }}/host.json
+            ${{ env.BENCH_DIR }}/store.json
             ${{ env.BENCH_DIR }}/logs/
           if-no-files-found: warn
 
