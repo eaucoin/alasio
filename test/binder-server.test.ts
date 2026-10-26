@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { Agent, createServer, type IncomingHttpHeaders, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
-import { before, test } from "node:test";
+import { afterEach, before, test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
 import { Context, Effect, Exit, Layer, Scope } from "effect";
@@ -61,6 +61,19 @@ async function pods(): Promise<{ port: number; sent: IncomingHttpHeaders[]; clos
   return { port: (server.address() as AddressInfo).port, sent, close: () => server.close() };
 }
 
+/**
+ * The fronts made and not closed yet: each closed as the test that made it ends, however it ends,
+ * as one a failed assertion left open would hold the file's process open after its tests, its
+ * run hung with no test failing by it.
+ */
+const open = new Set<() => Promise<void>>();
+
+afterEach(async () => {
+  const closing = [...open];
+  open.clear();
+  await Promise.all(closing.map((close) => close()));
+});
+
 /** A front on its own client and Binder, binds waiting up to `waitMs`, every key in `of` but those of an environment `elsewhere` names; and how to stop it. */
 async function front(
   of: Pool,
@@ -99,7 +112,12 @@ async function front(
       Scope.provide(scope),
     ),
   );
-  return { ...served, close: () => Effect.runPromise(Scope.close(scope, Exit.void)) };
+  const close = () => {
+    open.delete(close);
+    return Effect.runPromise(Scope.close(scope, Exit.void));
+  };
+  open.add(close);
+  return { ...served, close };
 }
 
 const caller = (key: string, expires = Date.now() + 60_000, options?: Record<string, string>) => `Bearer ${mintToken(callerKey, { key, expires, ...(options ? { options } : {}) })}`;
@@ -1381,4 +1399,22 @@ test("a request for one binding alone is passed to its pod while its key is boun
     await served.close();
     stand.close();
   }
+});
+
+/** The port of the front the test below leaves open. */
+let leftOpen = 0;
+
+test("a front a test leaves open, as one whose assertion failed before it stopped its front does, is closed as the test ends", async () => {
+  const of = await pool();
+  const stand = await pods();
+  try {
+    leftOpen = (await front(of, stand.port)).port;
+  } finally {
+    stand.close();
+  }
+});
+
+test("the front the test before left open refuses connections, so none holds the file's process open past its tests", async () => {
+  assert.ok(leftOpen > 0, "the test before made no front");
+  assert.equal(await refused(leftOpen), true);
 });
