@@ -365,11 +365,14 @@ async function endUnsaved(name: string): Promise<void> {
   await gone(name);
 }
 
+/** Drops the page cache of `node`, as every restore starts with it dropped, so what ran before leaves it nothing. */
+const dropPageCache = (node: string): Promise<string> => onNode(node, "sync && echo 1 > /proc/sys/vm/drop_caches");
+
 /** Removes every node's cache of the workspace, and the nodes' page cache, so a restore reads it from the bucket. */
 async function coldCaches(workspace: string): Promise<void> {
   for (const [node, pod] of await nodeAgents()) {
     await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}`], { container: "node-agent" });
-    await onNode(node, "sync && echo 1 > /proc/sys/vm/drop_caches");
+    await dropPageCache(node);
   }
 }
 
@@ -509,6 +512,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace }, to: { environment: SESSIONS, workspace: copy }, quotaBytes: quota.capacityBytes });
 
     phase = "restore-warm";
+    await dropPageCache(node);
     const warm = await restore(workspace, sessionId, fixture, runId, manifest);
     emit(fixture, sizeMib, run, "restore-warm", { ok: warm.probed.ok && warm.details.source === "cache", failure: warm.probed.failure ?? (warm.details.source === "cache" ? null : `restored from the ${warm.details.source}, not the node's cache: ${warm.details.prepared}`) }, warm.metrics, warm.probed.correctness, warm.details);
     done.add(phase);
