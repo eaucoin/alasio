@@ -346,6 +346,9 @@ async function coldCaches(workspace: string): Promise<void> {
 /** The bytes the workspace's snapshots hold in the bucket. */
 const bucketBytes = async (node: string, workspace: string): Promise<number> => (await inNodeAgent<Held>(node, "./bench-bucket.ts", "bytes", SESSIONS, workspace)).bytes;
 
+/** bayma's state directory `stateDir`, under /home/agent, by the path of the volume the image's /home/agent links into (sandbox/agent/Dockerfile). */
+const mountedStateDir = (stateDir: string): string => (stateDir.startsWith("/home/agent/") ? `/attach/ws/home/${stateDir.slice("/home/agent/".length)}` : stateDir);
+
 /** The Deployment of the pool the pod is of, whose template the gateway records with a snapshot (src/gateway/snapshots.ts take). */
 async function poolTemplate(pod: V1Pod): Promise<Record<string, unknown>> {
   const pool = pod.metadata?.labels?.[POOL_LABEL] ?? "";
@@ -413,7 +416,11 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const stateDir = bayma ? stateDirOf(bayma) : null;
     if (!hook || !stateDir) throw new Error(`the pod ${bound.name} runs no bayma with a state directory`);
     if (!calibrated) await calibrate(workspace, sessionId, fixture, node, containerIdOf(pod));
-    const request = { environment: SESSIONS, workspace, namespace: SESSIONS, pod: bound.name, containerId: containerIdOf(pod), hook, podTemplate: await poolTemplate(pod), live: { stateDir } };
+    // bayma's state directory by the path of the volume that holds it: the one the pool's pods give bayma, under /home/agent,
+    // which the image links to /attach/ws/home, is held by no volume of the pod's spec, and the agent, which reads it by the
+    // spec's mounts alone (src/node-agent/volume.ts hostPathOf), fails every live checkpoint of a pool's pod so: "no volume of
+    // its pod holds /home/agent/.bayma/last-save.json" (CI run 40396803554). The same directory, by the path that is mounted.
+    const request = { environment: SESSIONS, workspace, namespace: SESSIONS, pod: bound.name, containerId: containerIdOf(pod), hook, podTemplate: await poolTemplate(pod), live: { stateDir: mountedStateDir(stateDir) } };
     const sandboxId = await sandboxIdOf(node, bound.name);
     const heldBefore = await bucketBytes(node, workspace);
     await driver(workspace, "mark", "--session", sessionId, "--fixture", fixture);
@@ -431,7 +438,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
       precopy_bytes: liveLogged.precopyBytes,
       image_bytes: live.manifest.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null,
       uploaded_bytes: heldLive - heldBefore,
-    }, NO_CHECKS, { snapshot: live.manifest.snapshot, runsc_checkpoint_ms: live.manifest.pauseMs, upload_ms: live.manifest.uploadMs, chain: live.manifest.layers.length, logged: liveLogged.said, gaps });
+    }, NO_CHECKS, { snapshot: live.manifest.snapshot, state_dir: request.live.stateDir, runsc_checkpoint_ms: live.manifest.pauseMs, upload_ms: live.manifest.uploadMs, chain: live.manifest.layers.length, logged: liveLogged.said, gaps });
     done.add(phase);
 
     phase = "save-stop";
