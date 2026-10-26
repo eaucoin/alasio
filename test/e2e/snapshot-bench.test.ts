@@ -470,6 +470,35 @@ async function bootLogs(node: string): Promise<void> {
   for (const pod of free) await gone(pod.metadata?.name ?? "");
 }
 
+/** The process of the node agent on `node`, in the node's PID namespace, as its runtime says. */
+async function agentPid(node: string): Promise<string> {
+  const pod = (await nodeAgents()).get(node) ?? "";
+  const agentId = (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.status?.containerStatuses?.find(({ name }) => name === "node-agent")?.containerID?.replace(/^[a-z]+:\/\//u, "") ?? "";
+  return (await onNode(node, `k3s crictl inspect --output go-template --template '{{.info.pid}}' ${agentId}`)).trim();
+}
+
+/** The address of the store's Service, which the node agents reach the bucket at. */
+async function storeAddress(): Promise<string> {
+  const address = (await kube.get<V1Service>(ref("Service", STORE_GATEWAY, NAMESPACE)))?.spec?.clusterIP;
+  if (!address) throw new Error(`the store's Service ${STORE_GATEWAY} has no address`);
+  return address;
+}
+
+/**
+ * How the store answers through the profile, as the node agent on `node` reaches it: the probe
+ * run in the agent's network namespace, as the agent's own client of the bucket, its key and
+ * bucket, from the node, as the agent's pod has no room for its 256 MiB.
+ */
+async function probeStore(node: string): Promise<Record<string, number>> {
+  const pid = await agentPid(node);
+  const environment = (await onNode(node, `tr '\\0' '\\n' < /proc/${pid}/environ`)).split("\n");
+  const of = (name: string) => environment.find((line) => line.startsWith(`${name}=`))?.slice(name.length + 1) ?? "";
+  const given = { S3_ENDPOINT: `http://${await storeAddress()}:8333`, S3_REGION: of("S3_REGION"), S3_BUCKET: of("S3_BUCKET"), AWS_ACCESS_KEY_ID: of("AWS_ACCESS_KEY_ID"), AWS_SECRET_ACCESS_KEY: of("AWS_SECRET_ACCESS_KEY") };
+  const assignments = Object.entries(given).map(([name, value]) => `${name}='${value}'`).join(" ");
+  const printed = await onNode(node, `nsenter --target ${pid} --net env ${assignments} ${process.execPath} ${new URL("dist/probe.mjs", COMMON).pathname} --prefix bench-probe/`);
+  return JSON.parse(printed.trim().split("\n").at(-1) ?? "{}") as Record<string, number>;
+}
+
 /**
  * Puts the profile's toxics between each node agent and the store: toxiproxy in the agent's
  * network namespace, as an unprivileged user, its proxy to the store's Service, and the agent's
@@ -478,19 +507,16 @@ async function bootLogs(node: string): Promise<void> {
 async function shapeAgents(): Promise<void> {
   if (!PROFILES[PROFILE]?.emulated) return;
   if (TARGET !== "host") throw new Error("the emulated profiles shape the node agents' traffic on the host target alone");
-  const service = await kube.get<V1Service>(ref("Service", STORE_GATEWAY, NAMESPACE));
-  const address = service?.spec?.clusterIP;
-  if (!address) throw new Error(`the store's Service ${STORE_GATEWAY} has no address`);
+  const address = await storeAddress();
   const server = join(BENCH_DIR, "toxiproxy-server");
   const shape = new URL("store/shape.ts", COMMON).pathname;
-  for (const [node, pod] of await nodeAgents()) {
+  for (const node of (await nodeAgents()).keys()) {
     await onNode(node, `[ -x ${server} ] || { curl -fsSL -o ${server} https://github.com/Shopify/toxiproxy/releases/download/v${TOXIPROXY}/toxiproxy-server-linux-amd64 && chmod +x ${server}; }`);
-    const agentId = (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.status?.containerStatuses?.find(({ name }) => name === "node-agent")?.containerID?.replace(/^[a-z]+:\/\//u, "") ?? "";
-    const pid = (await onNode(node, `k3s crictl inspect --output go-template --template '{{.info.pid}}' ${agentId}`)).trim();
+    const pid = await agentPid(node);
     const inNetns = `nsenter --target ${pid} --net`;
     await onNode(node, `${inNetns} setpriv --reuid=${PROXY_UID} --regid=${PROXY_UID} --clear-groups ${server} -host 127.0.0.1 -port 8474 >${BENCH_DIR}/logs/toxiproxy-${node}.log 2>&1 &`);
     await onNode(node, `for _ in $(seq 50); do ${inNetns} curl -fsS http://127.0.0.1:8474/version && exit 0; sleep 0.2; done; exit 1`);
-    await onNode(node, `${inNetns} node ${shape} --api http://127.0.0.1:8474 --profile ${PROFILE} --listen 127.0.0.1:28333 --upstream ${address}:8333`);
+    await onNode(node, `${inNetns} ${process.execPath} ${shape} --api http://127.0.0.1:8474 --profile ${PROFILE} --listen 127.0.0.1:28333 --upstream ${address}:8333`);
     await onNode(node, `${inNetns} iptables -t nat -A OUTPUT -p tcp -d ${address} --dport 8333 -m owner ! --uid-owner ${PROXY_UID} -j DNAT --to-destination 127.0.0.1:28333`);
     // Started again in its pod, whose network namespace, the rule and the proxy in it, stays.
     await onNode(node, `kill ${pid}`);
@@ -510,10 +536,9 @@ before(async () => {
     const agents = await nodeAgents();
     for (const node of agents.keys()) await bootLogs(node);
     await shapeAgents();
-    // How the store answers through the profile, from where the saves run: the node agent's pod.
-    const [[, agent] = ["", ""]] = await nodeAgents();
-    await copyIn(agent, "node-agent", "probe.mjs");
-    store = JSON.parse((await kube.execOk(NAMESPACE, agent, ["node", `${IN_POD}/probe.mjs`, "--prefix", "bench-probe/"], { container: "node-agent" })).trim().split("\n").at(-1) ?? "{}") as Record<string, number>;
+    // How the store answers through the profile, from where the saves run: the node agent's network.
+    const [node = ""] = (await nodeAgents()).keys();
+    store = await probeStore(node);
     console.error(`# the store through ${PROFILE}: ${JSON.stringify(store)}`);
   } catch (error) {
     await dumpClusterState();
