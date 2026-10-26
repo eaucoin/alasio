@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -219,63 +223,44 @@ const (
 	uffdAPI        = 0xaa
 	uffdUserOnly   = 1
 	registerMiss   = 1
+	guestBlocks    = 3
+	guestSocket    = "FCMEM_TEST_GUEST_SOCKET"
 )
 
-// registeredMemory maps n blocks of anonymous memory and registers them with a new
-// userfaultfd, as Firecracker does guest memory; skips where the kernel gives none.
-func registeredMemory(t *testing.T, n int) ([]byte, int) {
-	t.Helper()
+// TestGuest is the guest of TestServeInstallsEachFaultingBlock, run as a process of its own, as
+// Firecracker is: a Go program cannot serve its own faults, as a collection stops the world for
+// threads that wait on them. It registers anonymous memory with a userfaultfd, hands both to the
+// handler as Firecracker does, reads every page from two threads, and prints each block's digest.
+func TestGuest(t *testing.T) {
+	socket := os.Getenv(guestSocket)
+	if socket == "" {
+		t.Skip("the guest of TestServeInstallsEachFaultingBlock")
+	}
 	fd, _, errno := unix.Syscall(unix.SYS_USERFAULTFD, unix.O_CLOEXEC|unix.O_NONBLOCK|uffdUserOnly, 0, 0)
 	if errno != 0 {
-		t.Skipf("no userfaultfd here: %v", errno)
+		t.Fatal(errno)
 	}
-	t.Cleanup(func() { unix.Close(int(fd)) })
 	api := [3]uint64{uffdAPI, 0, 0}
 	if err := ioctl(int(fd), uffdioAPI, unsafe.Pointer(&api)); err != nil {
 		t.Fatal(err)
 	}
-	mem, err := unix.Mmap(-1, 0, n*blockSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
+	mem, err := unix.Mmap(-1, 0, guestBlocks*blockSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { unix.Munmap(mem) })
-	reg := [4]uint64{uint64(uintptr(unsafe.Pointer(&mem[0]))), uint64(len(mem)), registerMiss, 0}
+	base := uint64(uintptr(unsafe.Pointer(&mem[0])))
+	reg := [4]uint64{base, uint64(len(mem)), registerMiss, 0}
 	if err := ioctl(int(fd), uffdioRegister, unsafe.Pointer(&reg)); err != nil {
 		t.Fatal(err)
 	}
-	return mem, int(fd)
-}
-
-func TestServeInstallsEachFaultingBlock(t *testing.T) {
-	ctx := context.Background()
-	mem, fd := registeredMemory(t, 3)
-	s := newMemoryStore()
-	data := append(randomBlock(t), randomBlock(t)...)
-	h := &header{
-		MemSize: 3 * blockSize, BlockSize: blockSize, ChunkSize: chunkSize,
-		Objects: []object{{Key: "p/s/memory", Size: int64(len(data))}},
-		Blocks:  []block{{-1, 0}, {0, blockSize}, {0, 0}},
-	}
-	s.put(ctx, h.Objects[0].Key, data)
-	encoded, _ := json.Marshal(h)
-	if _, err := decodeHeader(encoded); err != nil {
+	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	handler := &handler{start: time.Now(), header: h, cache: newCache(t.TempDir(), s), uffd: fd, state: make([]atomic.Uint32, 3)}
-	base := uint64(uintptr(unsafe.Pointer(&mem[0])))
-	if err := handler.mapBlocks([]region{{BaseHostVirtAddr: base, Size: uint64(len(mem)), PageSize: uint64(os.Getpagesize())}}); err != nil {
+	regions, _ := json.Marshal([]region{{BaseHostVirtAddr: base, Size: uint64(len(mem)), PageSize: uint64(os.Getpagesize())}})
+	if _, _, err := conn.WriteMsgUnix(regions, unix.UnixRights(int(fd)), nil); err != nil {
 		t.Fatal(err)
 	}
-	stop := make([]int, 2)
-	if err := unix.Pipe2(stop, unix.O_CLOEXEC); err != nil {
-		t.Fatal(err)
-	}
-	served := make(chan error, 1)
-	go func() { served <- handler.serveLoop(ctx, stop[0]) }()
-
-	// Every page read, from two threads, faults its block in. A thread waiting on a fault holds
-	// its P, so there are Ps enough for the handler beside them.
-	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(8))
 	var wait sync.WaitGroup
 	for range 2 {
 		wait.Go(func() {
@@ -285,14 +270,77 @@ func TestServeInstallsEachFaultingBlock(t *testing.T) {
 		})
 	}
 	wait.Wait()
-	if !isZero(mem[:blockSize]) || !bytes.Equal(mem[blockSize:2*blockSize], data[blockSize:]) || !bytes.Equal(mem[2*blockSize:], data[:blockSize]) {
-		t.Fatal("guest memory is not the header's blocks")
+	for b := range guestBlocks {
+		fmt.Printf("block %x\n", sha256.Sum256(mem[b*blockSize:(b+1)*blockSize]))
 	}
-	unix.Write(stop[1], []byte{0})
-	if err := <-served; err != nil {
+}
+
+func TestServeInstallsEachFaultingBlock(t *testing.T) {
+	ctx := context.Background()
+	if fd, _, errno := unix.Syscall(unix.SYS_USERFAULTFD, unix.O_CLOEXEC|uffdUserOnly, 0, 0); errno != 0 {
+		t.Skipf("no userfaultfd here: %v", errno)
+	} else {
+		unix.Close(int(fd))
+	}
+	s := newMemoryStore()
+	data := append(randomBlock(t), randomBlock(t)...)
+	h := &header{
+		MemSize: guestBlocks * blockSize, BlockSize: blockSize, ChunkSize: chunkSize,
+		Objects: []object{{Key: "p/s/memory", Size: int64(len(data))}},
+		Blocks:  []block{{-1, 0}, {0, blockSize}, {0, 0}},
+	}
+	s.put(ctx, h.Objects[0].Key, data)
+	socket := filepath.Join(t.TempDir(), "uffd.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if handler.installs.Load() != 3 || handler.zeroInstalls.Load() != 1 || s.ranges.Load() != 1 {
+	defer listener.Close()
+
+	guest := exec.Command(os.Args[0], "-test.run=^TestGuest$", "-test.v")
+	guest.Env = append(os.Environ(), guestSocket+"="+socket)
+	var said bytes.Buffer
+	guest.Stdout, guest.Stderr = &said, &said
+	if err := guest.Start(); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := listener.AcceptUnix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &handler{start: time.Now(), header: h, cache: newCache(t.TempDir(), s), state: make([]atomic.Uint32, guestBlocks)}
+	regions, err := handler.handshake(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handler.peer != guest.Process.Pid {
+		t.Fatalf("the peer is %d, the guest %d", handler.peer, guest.Process.Pid)
+	}
+	if err := handler.mapBlocks(regions); err != nil {
+		t.Fatal(err)
+	}
+	pidfd, err := unix.PidfdOpen(handler.peer, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The handler ends with its guest, as it does with Firecracker.
+	if err := handler.serveLoop(ctx, pidfd); err != nil {
+		t.Fatal(err)
+	}
+	if err := guest.Wait(); err != nil {
+		t.Fatalf("the guest: %v\n%s", err, said.String())
+	}
+	zero := make([]byte, blockSize)
+	for b, want := range [][]byte{zero, data[blockSize:], data[:blockSize]} {
+		if line := fmt.Sprintf("block %x\n", sha256.Sum256(want)); !strings.Contains(said.String(), line) {
+			t.Fatalf("the guest's block %d is not the header's:\n%s", b, said.String())
+		}
+	}
+	// An install's counts follow the copy that woke the guest.
+	for deadline := time.Now().Add(5 * time.Second); handler.installs.Load() < guestBlocks && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	if handler.installs.Load() != guestBlocks || handler.zeroInstalls.Load() != 1 || s.ranges.Load() != 1 {
 		t.Fatalf("%d installs, %d of zeros, %d ranged GETs", handler.installs.Load(), handler.zeroInstalls.Load(), s.ranges.Load())
 	}
 }

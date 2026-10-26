@@ -356,16 +356,21 @@ async function runCase(theCase: Case, runIndex: number, setup: Setup, checkPause
     if (checkPause) {
       // The ticker against Firecracker's own pause, once a job (DESIGN.md section 3).
       driver("mark", [...endpoint, ...fixtureArgs]);
-      const paused = now();
+      const pausing = now();
       await fc.api("PATCH", "/vm", { state: "Paused" });
+      const paused = now();
       await sleep(1000);
+      const resuming = now();
       await fc.api("PATCH", "/vm", { state: "Resumed" });
       const resumed = now();
       const gaps = driver("gaps", [...endpoint, ...fixtureArgs]);
       const gap = Number(gaps["max_gap_ms"]);
-      pauseCheck = { paused_ms: ms(paused, resumed), max_gap_ms: gap, ok: Math.abs(gap - 1000) <= 20 };
+      // At least the time between the pause's answer and the resume's ask, at most the time
+      // between the pause's ask and the resume's answer, 20 ms either side.
+      const [least, most] = [ms(paused, resuming) - 20, ms(pausing, resumed) + 20];
+      pauseCheck = { max_gap_ms: gap, least_ms: least, most_ms: most, ok: gap >= least && gap <= most };
       // A job whose ticker does not see the pause reports nothing.
-      if (!pauseCheck["ok"]) throw new PauseCheckFailed(`the ticker saw ${gap} ms of a 1000 ms pause`);
+      if (!pauseCheck["ok"]) throw new PauseCheckFailed(`the ticker saw ${gap} ms of a pause it should see as ${least} to ${most} ms`);
     }
 
     // save-live
