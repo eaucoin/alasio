@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { describe, test } from "node:test";
 import { gunzipSync, gzipSync } from "node:zlib";
 
@@ -54,13 +54,14 @@ import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHIN
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { oneAtATime } from "../src/manifests/volume-lock.ts";
 import { goferOf, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
+import { hostPathOf, readUnder } from "../../src/node-agent/volume.ts";
 import { apiServerUnconfined } from "../src/install.ts";
 import { environmentAccess } from "../src/manifests/log.ts";
 import { carriedPools, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
 import { STOP_GRACE_SECONDS } from "../../src/binder/names.ts";
 import { STOP_CALLS_MS, STOP_LINGER_MS } from "../../src/binder/server.ts";
 import { folderStateDir, templateHash } from "../../src/gateway/names.ts";
-import { hookOf } from "../../src/gateway/snapshots.ts";
+import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { VERSION } from "../src/release.ts";
 import { SETUP_LABEL, setupPod, stackSetupPod } from "../src/setup-pod.ts";
 
@@ -3520,13 +3521,41 @@ describe("the sandbox service", () => {
       assert.equal(annotations["dev.gvisor.internal.cpufeatures"], BASELINE.join(","));
       assert.equal(hash, templateHash({ ...template, metadata: { ...template?.metadata, annotations } }));
       // Its hook, as a release's snapshot runs it, through the same start.
-      assert.deepEqual(hookOf(bayma ?? { name: "" }), ["/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"]);
+      assert.deepEqual(hookOf(bayma ?? { name: "" }), ["/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"]);
       const scaled = one<ScaledObject>(objects, "ScaledObject", `sandboxes-${mode}`);
       assert.deepEqual([scaled.spec.minReplicaCount, scaled.spec.maxReplicaCount], [1, 10]);
       assert.deepEqual(scaled.spec.triggers, [{
         type: "metrics-api",
         metadata: { url: `http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio-sessions/sandboxes-${mode}`, valueLocation: "waiting", targetValue: "1" },
       }]);
+    }
+  });
+
+  test("keeps each pool's pod's bayma's state where its node's agent reads what a live save caught: in the home of the workspace attached into its directory, by a path a mount of its pod holds", async () => {
+    const objects = install();
+    for (const mode of ["none", "full"] as const) {
+      const spec = one<V1Deployment>(objects, "Deployment", `sandboxes-${mode}`).spec?.template.spec;
+      const bayma = spec?.containers.find(({ name }) => name === "bayma");
+      const stateDir = bayma ? stateDirOf(bayma) : null;
+      assert.ok(spec && bayma && stateDir, `the pool sandboxes-${mode}'s bayma names no state directory`);
+      // The node, as its agent sees it: each volume of the pod where the container's spec in its
+      // bundle mounts it from, the pod's directory among them, its workspace's files attached at
+      // ws/ (src/node-agent/workspaces.ts), and in their home, bayma's last-save.json.
+      const node = mkdtempSync(join(tmpdir(), "alasio-pool-node-"));
+      try {
+        const mounts = (bayma.volumeMounts ?? []).map(({ name, mountPath }) => ({ destination: mountPath, source: `/volumes/${name}` }));
+        for (const { source } of mounts) mkdirSync(join(node, source), { recursive: true });
+        mkdirSync(join(node, "/volumes/attach/ws/home/.bayma"), { recursive: true });
+        const caught = JSON.stringify({ schemaVersion: 1, generation: 5, running: [] });
+        writeFileSync(join(node, "/volumes/attach/ws/home/.bayma/last-save.json"), caught);
+        mkdirSync(join(node, "bundle"));
+        writeFileSync(join(node, "bundle", "config.json"), JSON.stringify({ mounts }));
+        const held = await hostPathOf(node, "/bundle", posix.join(stateDir, "last-save.json"));
+        assert.ok(held, `no volume of the pool sandboxes-${mode}'s pod holds ${stateDir}`);
+        assert.equal((await readUnder(held, 1024)).toString("utf8"), caught);
+      } finally {
+        rmSync(node, { recursive: true, force: true });
+      }
     }
   });
 

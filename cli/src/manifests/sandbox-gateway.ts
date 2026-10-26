@@ -217,8 +217,11 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
           "0.0.0.0",
           "--port",
           String(POOL_POD_PORT),
+          // Its home's, named through the pod's own mount, where its node's agent reads what a live
+          // save caught (src/node-agent/volume.ts hostPathOf), and not through the image's link
+          // of /home/agent to it, which no mount of the pod names.
           "--state-dir",
-          "/home/agent/.bayma",
+          "/attach/ws/home/.bayma",
           "--token-file",
           "/attach/token",
           "--telemetry-token-file",

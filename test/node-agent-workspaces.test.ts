@@ -509,7 +509,7 @@ test("bayma of a bound pod of a pool on this node is told to go on with its stop
       at.running.add(id);
       at.annotations.set(id, annotations);
     }
-    const hook = ["node", "/opt/bayma/bayma.js", "sandbox-hook", "stop", "--state-dir", "/home/agent/.bayma"];
+    const hook = ["node", "/opt/bayma/bayma.js", "sandbox-hook", "stop", "--state-dir", "/attach/ws/home/.bayma"];
     const stop = (containerId: string, of = "pool-0", argv: readonly string[] = hook) => at.workspaces.stop({ namespace: "alasio-sessions", pod: of, containerId, hook: argv });
     await Effect.runPromise(stop("c-bayma"));
     assert.deepEqual(at.execs, [`r c-bayma ${hook.join(" ")}`]);
