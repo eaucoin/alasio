@@ -16,6 +16,8 @@ IMAGE=ghcr.io/eaucoin/alasio-agent:10.0.0@sha256:b90f8164f77e9a56bd0da0fc1869bc7
 work=$BENCH_DIR/staging/criu
 logs=$BENCH_DIR/logs/criu
 mkdir -p "$logs"
+# What the harness writes as root goes to the job's user, for the upload, however it ends.
+trap 'sudo chown -R "$(id -u):$(id -g)" "$logs" "$BENCH_DIR/results.jsonl" 2>/dev/null || true' EXIT
 
 "$here/install.sh" 2>&1 | tee "$logs/install.log"
 

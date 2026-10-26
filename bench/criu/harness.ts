@@ -406,7 +406,10 @@ const UNCHECKED: Correctness = { marker: null, memory: null, children: null, fil
 const nulls = (names: readonly string[]): Metrics => Object.fromEntries(names.map((name) => [name, null]));
 
 function emit(run: Run, phase: string, variant: string, ok: boolean, failure: string | null, metrics: Metrics, correctness: Correctness, details: Record<string, unknown>): void {
-  if (!ok) run.failed = true;
+  if (!ok) {
+    run.failed = true;
+    console.error(`${run.runId} ${phase} ${variant}: ${failure}`);
+  }
   const line = {
     schema: 1,
     system: "criu",
@@ -784,7 +787,6 @@ async function runCase(c: Case, number: number): Promise<void> {
     }
   } catch (error) {
     const reason = (error as Error).message;
-    console.error(`${run.runId}: ${reason}`);
     // A phase that failed has emitted its own row; the ones after it did not run.
     if (/^save-(live|stop) failed$/u.test(reason)) phases.shift();
     for (const [phase = "", variant = ""] of phases) emit(run, phase, variant, false, `not run: ${reason}`, nulls(phase.startsWith("save") ? SAVE_METRICS : RESTORE_METRICS), UNCHECKED, {});
