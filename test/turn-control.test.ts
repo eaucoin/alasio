@@ -297,19 +297,27 @@ test("alasio taking up a conversation whose turn its alasio left before sending 
   });
 });
 
-test("alasio taking up a conversation ends a turn whose job the agent finished as its alasio stopped, completed, its status message saying so", async () => {
+test("alasio taking up a conversation ends a turn whose job the agent finished as its alasio stopped, completed, its status message saying so, and its reply delivered then", async () => {
   const { store, conversationId } = await conversation();
   const harness = scriptedHarness((params) => answered(params, "unused"));
   const job = await run(store.enqueuePromptJob({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "5", prompt: "finish" }));
   await run(store.claimNextPromptJob(conversationId));
-  await run(store.markPromptJobUpstreamCompleted(job.id, "session-1", "turn-1"));
   const epoch = await run(store.claimTurn({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "5", harness: CODEX_HARNESS }));
   await run(store.setTurnStatusMessage(conversationId, epoch, "status-of-the-finished"));
+  // Its reply complete, as its pod wrote it before its job's completion.
+  const finished = store.turnPersistence(conversationId, epoch);
+  const reply = await run(finished.createPendingResponse(String(CONVERSATION_CHAT), "5", "session-1"));
+  await run(finished.updateActiveTurnPendingResponseId(reply));
+  await run(finished.appendBlocksToPending(reply, [{ type: "text", content: "Finished.", phase: "final_answer" }]));
+  await run(finished.markPendingResponseComplete(reply));
+  await run(store.markPromptJobUpstreamCompleted(job.id, "session-1", "turn-1"));
   await withTurns(store, harness, async (alasio, queued) => {
     await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.takeUnheld));
     await until("the turn to end", async () => (await run(store.getActiveTurn(conversationId))) === null);
     assert.deepEqual([(await run(store.getTurn(conversationId)))?.outcome, (await run(store.getPromptJob(job.id)))?.state], ["completed", "completed"]);
     assert.deepEqual(queued.edits.map(({ edits, text }) => [edits, text]), [["status-of-the-finished", "Codex finished this turn as alasio stopped."]]);
+    // Its reply queued as the turn is ended, not left for the next look for replies undelivered, half a minute on.
+    await until("its reply to be queued", () => queued.texts.some(({ pendingResponseId }) => pendingResponseId === reply));
   });
 });
 

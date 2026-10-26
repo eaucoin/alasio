@@ -869,7 +869,7 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
   /**
    * What the conversation's last worker left, recovered under the claim taken from it, as it
    * stopped or crashed: a turn whose job the agent finished ended so, its status message saying
-   * so; a steer it was handing over asked about, not run again; the jobs it ran settled, but one
+   * so and its reply delivered; a steer it was handing over asked about, not run again; the jobs it ran settled, but one
    * never sent whose turn it left, which its pod may hold yet; and the turn it left running on its
    * pod attached to again in the background (reattach), under the claim, which settles that job:
    * run again as itself where its pod knows nothing of the turn and its prompt was never sent,
@@ -883,6 +883,9 @@ const makeTurns = Effect.fnUntraced(function*(claimsOptions: WorkerClaimsOptions
         const turn = yield* store.getActiveTurn(conversationId);
         if (turn && (yield* store.endTurn(conversationId, Number(turn.epoch), "completed"))) {
           yield* editLeftStatus(turn, `${harnessDisplayName(turn.harness)} finished this turn as alasio stopped.`);
+          // Its reply, complete before its job was (../codex/runtime.ts), delivered now, as no turn
+          // attached to again delivers it: not left for the next look for replies undelivered.
+          yield* flushCompletedResponses;
         }
       }
       yield* Effect.forEach(yield* store.holdUnsteeredLeftPromptJobs(conversationId), askAboutUnsteered, { discard: true });
