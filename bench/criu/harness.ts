@@ -112,6 +112,8 @@ mkdirSync(work, { recursive: true });
 writeFileSync(criuConfig, [
   // Established TCP connections neither dumped nor locked, and restored closed, as bayma promises.
   "tcp-close",
+  // The file locks the instance holds (bayma's SQLite state), which only it uses.
+  "file-locks",
   // How a pre-dump reads the pages: after the tasks thaw (read), or spliced while they are frozen.
   `pre-dump-mode ${preDumpMode}`,
   "",
