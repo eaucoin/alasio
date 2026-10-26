@@ -5,7 +5,9 @@
 #
 #   bench/criu/run.sh <target> <profile>
 #
-# With BENCH_DIR, BENCH_RUNS, BENCH_CASES and GITHUB_WORKSPACE as the workflow gives them.
+# With BENCH_DIR, BENCH_RUNS, BENCH_CASES, BENCH_VARIANT and GITHUB_WORKSPACE as the workflow
+# gives them. BENCH_VARIANT `all` is the system as README.md configures it; `phaul` and `splice`
+# are the defaults of the two knobs it tunes on the benchmark, measured beside.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 target=$1
@@ -43,6 +45,13 @@ sudo ip -n criu-bench address add 10.89.0.2/30 dev eth0
 sudo ip -n criu-bench link set eth0 up
 sudo ip -n criu-bench link set lo up
 
+case "${BENCH_VARIANT:-all}" in
+all) knobs=() ;;
+phaul) knobs=(--rounds phaul --variant-suffix phaul) ;;
+splice) knobs=(--pre-dump-mode splice --variant-suffix splice) ;;
+*) echo "criu has no variant $BENCH_VARIANT" >&2; exit 1 ;;
+esac
+
 set -a
 . "$BENCH_DIR/store/store.env"
 set +a
@@ -50,5 +59,5 @@ sudo --preserve-env=S3_ENDPOINT,S3_BUCKET,S3_REGION,AWS_ACCESS_KEY_ID,AWS_SECRET
   "$(command -v node)" "$here/harness.ts" \
   --profile "$profile" --target "$target" --work "$work" --logs "$logs" \
   --host "$BENCH_DIR/host.json" --store "$BENCH_DIR/store.json" --dist "$GITHUB_WORKSPACE/bench/common/dist" \
-  --out "$BENCH_DIR/results.jsonl" --runs "${BENCH_RUNS:-5}" --cases "${BENCH_CASES:-}" \
+  --out "$BENCH_DIR/results.jsonl" --runs "${BENCH_RUNS:-5}" --cases "${BENCH_CASES:-}" "${knobs[@]}" \
   2>&1 | tee "$logs/harness.log"

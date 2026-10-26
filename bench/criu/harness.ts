@@ -409,13 +409,14 @@ type Metrics = Record<string, number | string | null>;
 type Correctness = Record<string, boolean | string | null>;
 
 const SAVE_METRICS = ["save_total_ms", "unavailable_ms", "pause_reported_ms", "slowdown", "precopy_passes", "precopy_bytes", "image_bytes", "uploaded_bytes"];
-const RESTORE_METRICS = ["first_exec_ms", "verify_ms", "resident_ms", "resident_how", "memory_peak_bytes", "memory_bytes", "workload_rss_bytes", "overhead_bytes"];
+const RESTORE_METRICS = ["first_exec_ms", "verify_ms", "resident_ms", "resident_how", "memory_peak_bytes", "memory_bytes", "workload_rss_bytes"];
 const UNCHECKED: Correctness = { marker: null, memory: null, children: null, file: null, socket: null, running: null, notice: null };
 
 const nulls = (names: readonly string[]): Metrics => Object.fromEntries(names.map((name) => [name, null]));
 
 function emit(run: Run, phase: string, variant: string, ok: boolean, failure: string | null, metrics: Metrics, correctness: Correctness, details: Record<string, unknown>): void {
-  if (!ok) {
+  if (ok) console.log(`${run.runId} ${phase} ${variant}: ${Object.entries(metrics).filter(([, value]) => value !== null).map(([name, value]) => `${name} ${typeof value === "number" ? Math.round(value) : value}`).join(", ")}`);
+  else {
     run.failed = true;
     console.error(`${run.runId} ${phase} ${variant}: ${failure}`);
   }
@@ -693,7 +694,7 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
     const args = ["restore", "--detach", "--bundle", instance.bundle, "--image-path", images.top, "--work-path", workDir, "--pid-file", join(instance.bundle, "pid")];
     if (variant === "lazy") {
       // The daemon and the restore meet at lazy-pages.socket in the work directory they share.
-      const lazy = helper("lazy-pages", restoreDir, "criu", ["lazy-pages", "--images-dir", images.top, "--work-dir", workDir, "--log-file", "lazy-pages.log", "--status-fd", "3"], ["ignore", "pipe", "pipe", "pipe"]);
+      const lazy = helper("lazy-pages", restoreDir, "criu", ["lazy-pages", "--images-dir", images.top, "--work-dir", workDir, "--log-file", "lazy-pages.log", "-v4", "--status-fd", "3"], ["ignore", "pipe", "pipe", "pipe"]);
       daemon = lazy;
       await within(new Promise<void>((resolve, reject) => {
         lazy.child.stdio[3]?.once("data", () => resolve());
@@ -711,7 +712,8 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
     if (probed.status !== 0) {
       const state = spawnSync("runc", ["--root", RUNC_ROOT, "state", instance.id], { encoding: "utf8" });
       const daemonSaid = daemon ? ` criu lazy-pages: ${daemon.child.exitCode === null ? "running" : `ended ${daemon.child.exitCode}`}.` : "";
-      throw new Error(`the probe failed: ${probed.stderr.trim().slice(-4000)} (the instance: ${(state.stdout || state.stderr).replace(/\s+/gu, " ").trim()}.${daemonSaid})`);
+      const kernel = spawnSync("dmesg", ["--ctime"], { encoding: "utf8" }).stdout.trim().split("\n").slice(-8).join(" | ");
+      throw new Error(`the probe failed: ${probed.stderr.trim().slice(-4000)} (the instance: ${(state.stdout || state.stderr).replace(/\s+/gu, " ").trim()}.${daemonSaid} The kernel: ${kernel})`);
     }
     const said = JSON.parse(probed.stdout.trim().split("\n").at(-1) ?? "") as Probed;
     const helpers = [...(daemon ? [daemon] : []), ...images.helpers];
@@ -735,7 +737,6 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
       memory_peak_bytes: peak === null ? null : peak + Object.values(helperPeaks).reduce<number>((sum, bytes) => sum + (bytes ?? 0), 0),
       memory_bytes: memory,
       workload_rss_bytes: said.workload_rss_bytes,
-      overhead_bytes: memory === null ? null : memory - said.workload_rss_bytes,
     }, said.correctness, { ...images.details, ready_ms: msBetween(t0, ready), runc_restore_ms: msBetween(ready, restored), cgroup_peak_bytes: peak, cgroup_current_bytes: current, helper_peak_bytes: helperPeaks, probe: said });
   } catch (error) {
     probe.child.kill("SIGKILL");
