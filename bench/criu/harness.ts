@@ -114,6 +114,9 @@ writeFileSync(criuConfig, [
   "tcp-close",
   // The file locks the instance holds (bayma's SQLite state), which only it uses.
   "file-locks",
+  // No packets dropped while a save or a restore runs: with tcp-close there is no connection
+  // to keep, and a client's SYN dropped by the lock waits out TCP's 1 s retransmission.
+  "network-lock skip",
   // How a pre-dump reads the pages: after the tasks thaw (read), or spliced while they are frozen.
   `pre-dump-mode ${preDumpMode}`,
   "",
@@ -260,10 +263,10 @@ function dumpStats(workDir: string): DumpStats {
 // ---------------------------------------------------------------------------------------------
 // Files
 
-/** The bytes of the files under `dir`, as they are on disk (their sizes, symlinks not followed). */
-function bytesUnder(dir: string): number {
+/** The bytes of an image directory's files (its `parent` link, to the image before, not followed). */
+function bytesIn(dir: string): number {
   let bytes = 0;
-  for (const entry of readdirSync(dir, { withFileTypes: true, recursive: true })) if (entry.isFile()) bytes += statSync(join(entry.parentPath, entry.name)).size;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) if (entry.isFile()) bytes += statSync(join(dir, entry.name)).size;
   return bytes;
 }
 
@@ -485,7 +488,7 @@ function checkpoint(run: Run, instance: Instance, name: string, parent: string |
   } catch (error) {
     throw new Error(`${(error as Error).message}${criuErrors(join(workDir, "dump.log"))}`);
   }
-  return { name, ms: msBetween(from, now()), bytes: bytesUnder(images), stats: dumpStats(workDir) };
+  return { name, ms: msBetween(from, now()), bytes: bytesIn(images), stats: dumpStats(workDir) };
 }
 
 /** Whether another pre-dump round goes on after `done` (MAX_ROUNDS and the rules beside it). */
@@ -705,7 +708,11 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
     }
     const restored = now();
     const probed = await within(probe.ended, RESIDENT_TIMEOUT_MS, "the probe had not answered");
-    if (probed.status !== 0) throw new Error(`the probe failed: ${probed.stderr.trim().slice(-4000)}`);
+    if (probed.status !== 0) {
+      const state = spawnSync("runc", ["--root", RUNC_ROOT, "state", instance.id], { encoding: "utf8" });
+      const daemonSaid = daemon ? ` criu lazy-pages: ${daemon.child.exitCode === null ? "running" : `ended ${daemon.child.exitCode}`}.` : "";
+      throw new Error(`the probe failed: ${probed.stderr.trim().slice(-4000)} (the instance: ${(state.stdout || state.stderr).replace(/\s+/gu, " ").trim()}.${daemonSaid})`);
+    }
     const said = JSON.parse(probed.stdout.trim().split("\n").at(-1) ?? "") as Probed;
     const helpers = [...(daemon ? [daemon] : []), ...images.helpers];
     const current = cgroupBytes(instance, "memory.current");
