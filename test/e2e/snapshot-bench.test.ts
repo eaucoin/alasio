@@ -450,6 +450,12 @@ async function calibrate(workspace: string, sessionId: string, fixture: string, 
   calibrated = true;
 }
 
+/** What the runner says of its memory, its kernel's last words and k3s's, as a run fails: in logs/failure-<name>.txt. */
+async function sayRunner(name: string): Promise<void> {
+  const said = await onNode("", "free -m; echo; dmesg | tail -n 60; echo; journalctl -u k3s --since '-10 min' --no-pager | tail -n 80").catch((error: unknown) => errorText(error));
+  appendFileSync(join(BENCH_DIR, "logs", `failure-${name}.txt`), said);
+}
+
 /** One run of a case, every phase of it written, as the module says; what fails is written as failed, and the run goes on to its cleanup. */
 async function runOnce(fixture: string, sizeMib: number, run: number): Promise<void> {
   const workspace = `fs-${randomBytes(6).toString("hex")}`;
@@ -548,6 +554,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     if (error instanceof Uncalibrated) throw error;
     const why = `${phase}: ${errorText(error)}`;
     console.error(`# ${fixture} ${sizeMib} MiB run ${run} failed at ${why}`);
+    await sayRunner(`${fixture}-${sizeMib}-${run}`);
     for (const each of phases.filter((name) => !done.has(name))) emit(fixture, sizeMib, run, each, { ok: false, failure: each === phase ? why : `not run: ${why}` }, {});
     const bound = await boundPodOf(workspace).catch(() => null);
     if (bound) await endUnsaved(bound.name).catch(() => {});
