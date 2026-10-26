@@ -359,6 +359,22 @@ async function restore(workspace: string, sessionId: string, fixture: string, ru
   return { probed, metrics, details, pod: name };
 }
 
+/** How long a restore may take to its first exec's answer, and to every page resident, from its t0 (the benchmark's design, section 5). */
+const RESTORE_BOUND_MS = 300_000;
+
+/** Whether a restore passed: its probe's checks, its image read from `source`, within RESTORE_BOUND_MS; or why not. */
+function restoreOutcome(restored: Awaited<ReturnType<typeof restore>>, source: "cache" | "bucket"): { readonly ok: boolean; readonly failure: string | null } {
+  const { probed, details, metrics } = restored;
+  const resident = typeof metrics.resident_ms === "number" ? metrics.resident_ms : null;
+  const failures = [
+    ...(probed.failure === null ? [] : [probed.failure]),
+    ...(details.source === source ? [] : [`restored from the ${details.source}, not the ${source === "cache" ? "node's cache" : "bucket"}: ${details.prepared}`]),
+    ...(probed.first_exec_ms <= RESTORE_BOUND_MS ? [] : [`its first exec answered ${Math.round(probed.first_exec_ms / 1000)} s after its restore was asked, past ${RESTORE_BOUND_MS / 1000} s`]),
+    ...(resident === null ? [`its pages were not told resident: ${details.resident_error ?? "runsc did not say"}`] : resident <= RESTORE_BOUND_MS ? [] : [`its pages were all resident ${Math.round(resident / 1000)} s after its restore was asked, past ${RESTORE_BOUND_MS / 1000} s`]),
+  ];
+  return { ok: probed.ok && failures.length === 0, failure: failures.length === 0 ? null : failures.join("; ") };
+}
+
 /** Ends the restored pod `name` without a save, as a crash ends it, and waits until it is gone. */
 async function endUnsaved(name: string): Promise<void> {
   await kube.kill(SESSIONS, name);
@@ -514,7 +530,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     phase = "restore-warm";
     await dropPageCache(node);
     const warm = await restore(workspace, sessionId, fixture, runId, manifest);
-    emit(fixture, sizeMib, run, "restore-warm", { ok: warm.probed.ok && warm.details.source === "cache", failure: warm.probed.failure ?? (warm.details.source === "cache" ? null : `restored from the ${warm.details.source}, not the node's cache: ${warm.details.prepared}`) }, warm.metrics, warm.probed.correctness, warm.details);
+    emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, warm.details);
     done.add(phase);
     await endUnsaved(warm.pod);
 
@@ -525,7 +541,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     await agentOk(node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: recommitted.snapshot, release: recommitted.release });
     await coldCaches(workspace);
     const cold = await restore(workspace, sessionId, fixture, runId, manifest);
-    emit(fixture, sizeMib, run, "restore-cold", { ok: cold.probed.ok && cold.details.source === "bucket", failure: cold.probed.failure ?? (cold.details.source === "bucket" ? null : `restored from the ${cold.details.source}, not the bucket: ${cold.details.prepared}`) }, cold.metrics, cold.probed.correctness, cold.details);
+    emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, cold.details);
     done.add(phase);
     await endUnsaved(cold.pod);
   } catch (error) {
