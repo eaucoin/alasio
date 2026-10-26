@@ -133,7 +133,8 @@ jobs:
       matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
     name: bench (${{ matrix.system }}, ${{ matrix.target }}, ${{ matrix.profile }})
     env:
-      BENCH_DIR: ${{ github.workspace }}/../bench-work
+      # Beside the checkout, on the runner's disk.
+      BENCH_DIR: /home/runner/bench-work
       BENCH_SYSTEM: ${{ matrix.system }}
       BENCH_TARGET: ${{ matrix.target }}
       BENCH_PROFILE: ${{ matrix.profile }}
