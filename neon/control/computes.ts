@@ -24,8 +24,7 @@ import { readFileSync } from "node:fs";
 import { request } from "node:https";
 import { connect } from "node:net";
 
-import pg from "pg";
-
+import { heardClient } from "../../src/persistence/sql.ts";
 import { COMPUTE_CTL_PORT, type ComputeConfig } from "./branches.ts";
 import { type Activity, SERVING_LABEL, SUSPEND_AFTER } from "./endpoints.ts";
 
@@ -233,8 +232,7 @@ export async function scaleCompute(ref: ComputeRef, replicas: 0 | 1): Promise<vo
  */
 export async function computeActivity(host: string, port: number, role: string, password: string): Promise<Activity> {
   // Read-only, as all it does is count.
-  const client = new pg.Client({ host, port, user: role, password, database: "postgres", connectionTimeoutMillis: 5000, options: "-c default_transaction_read_only=on" });
-  client.on("error", () => {});
+  const client = heardClient({ host, port, user: role, password, database: "postgres", connectionTimeoutMillis: 5000, options: "-c default_transaction_read_only=on" });
   await client.connect();
   try {
     const { rows } = await client.query<Activity>(
@@ -299,8 +297,7 @@ export async function computeCtlStatus(host: string, token: string): Promise<str
  * replayed (`replica`), as neon-control's own role reads it, read-only.
  */
 export async function computeLsn(host: string, port: number, role: string, password: string, replica: boolean): Promise<string> {
-  const client = new pg.Client({ host, port, user: role, password, database: "postgres", connectionTimeoutMillis: 5000, options: "-c default_transaction_read_only=on" });
-  client.on("error", () => {});
+  const client = heardClient({ host, port, user: role, password, database: "postgres", connectionTimeoutMillis: 5000, options: "-c default_transaction_read_only=on" });
   await client.connect();
   try {
     const { rows } = await client.query<{ lsn: string | null }>(`select ${replica ? "pg_last_wal_replay_lsn()" : "pg_current_wal_flush_lsn()"}::text as lsn`);

@@ -27,6 +27,7 @@
  */
 import pg from "pg";
 
+import { heardClient, heardPool } from "../../src/persistence/sql.ts";
 import type { Branch, ShardLayout } from "./branches.ts";
 
 /** The advisory lock key of changes to the branches: `neon_ctl`, its bytes read as a number. */
@@ -95,9 +96,8 @@ export class BranchRecord {
     this.#url = url;
     this.#busy = busy;
     this.#patienceMs = patienceMs;
-    this.#pool = new pg.Pool({ connectionString: url, max: 4, ...CONNECTION });
     // An idle connection lost is replaced on the next checkout.
-    this.#pool.on("error", () => {});
+    this.#pool = heardPool({ connectionString: url, max: 4, ...CONNECTION });
   }
 
   /** Makes the schema and its tables, idempotently, under the lock, so two replicas starting at once do not race. */
@@ -266,10 +266,8 @@ export class BranchRecord {
 
   /** A connection of its own, for a lock. */
   #client(config: pg.ClientConfig = {}): pg.Client {
-    const client = new pg.Client({ connectionString: this.#url, ...CONNECTION, ...config });
     // Its loss fails what it runs; an error between queries has nothing to fail.
-    client.on("error", () => {});
-    return client;
+    return heardClient({ connectionString: this.#url, ...CONNECTION, ...config });
   }
 
   /**

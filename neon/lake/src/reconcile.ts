@@ -35,7 +35,7 @@ import type { DuckDBConnection } from "@duckdb/node-api";
 import pg from "pg";
 
 import type { DatabaseConfig, StoreParts } from "./config.ts";
-import { CONNECT_TIMEOUT_MS, LAKE, literal, LOADER_LOCK_RETRY_MS, rows, serially, takeLoaderLock, transaction } from "./lake.ts";
+import { heardClient, LAKE, literal, LOADER_LOCK_RETRY_MS, rows, serially, takeLoaderLock, transaction } from "./lake.ts";
 import { askReread, type RereadGap, rereadGaps, rereadsAsked, telemetryTime } from "./otel.ts";
 import type { Signal } from "./otlp.ts";
 import { type LakeLoad, prepareLake, syncLake } from "./sync.ts";
@@ -607,8 +607,7 @@ export async function reconcileLake(
   // terminated while it waits on the loader's lock, fails its next statement, and so the
   // reconciliation, not the process, as pg tells its 'error' listeners too, whose absence
   // Node takes as the process's to die of.
-  const client = new pg.Client({ ...catalog, application_name: RECONCILE_APPLICATION, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
-  client.on("error", () => {});
+  const client = heardClient({ ...catalog, application_name: RECONCILE_APPLICATION });
   await client.connect();
   try {
     const lost = await serially(async (fence) => {

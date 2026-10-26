@@ -4,6 +4,7 @@
  * A transaction whose work fails, or is interrupted, is rolled back.
  */
 import { Effect, Exit, Schema } from "effect";
+import pg from "pg";
 import type { Pool, PoolClient } from "pg";
 
 /** What alasio's store failed with, as Postgres or the driver said it. */
@@ -89,6 +90,31 @@ const releasing = (client: PoolClient, exit: Exit.Exit<unknown, unknown>): Effec
 export function hearingConnections<P extends Pool>(pool: P): P {
   pool.on("connect", (client) => void client.on("error", () => {}));
   return pool;
+}
+
+/**
+ * A client of `config`'s, its connection's loss heard, as `onLost` says it, so it fails its
+ * statements, and its holder's work, not the process: pg tells a connection's 'error'
+ * listeners of it as it is lost, its backend terminated as by a compute's restart, a failover
+ * or an operator, whether a statement of it was running or none was, and with none listening
+ * Node takes it as the process's to die of. Every pg client of alasio's is made by it, or by
+ * the lake's own (neon/lake/src/lake.ts heardClient), as test/pg-heard.test.ts holds them to.
+ */
+export function heardClient(config: pg.ClientConfig, onLost: (error: Error) => void = () => {}): pg.Client {
+  const client = new pg.Client(config);
+  client.on("error", onLost);
+  return client;
+}
+
+/**
+ * A pool, as `make` makes one of `config` (pg's own by default), its idle connections' losses
+ * said with `onIdleError`, as the pool replaces one on the next checkout, and its held ones'
+ * heard (hearingConnections): every pg pool of alasio's is made by it, as heardClient says.
+ */
+export function heardPool<P extends Pool = pg.Pool>(config: pg.PoolConfig, { onIdleError = () => {}, make }: { readonly onIdleError?: (error: Error) => void; readonly make?: (config: pg.PoolConfig) => P } = {}): P {
+  const pool = make ? make(config) : (new pg.Pool(config) as P);
+  pool.on("error", onIdleError);
+  return hearingConnections(pool);
 }
 
 /** The database `pool` connects to. */

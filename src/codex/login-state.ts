@@ -7,10 +7,9 @@
 import { readFileSync } from "node:fs";
 
 import { Effect } from "effect";
-import pg from "pg";
 
 import { NeonCodexLoginRepository } from "../persistence/codex-login-repository.ts";
-import { hearingConnections, poolDatabase } from "../persistence/sql.ts";
+import { heardPool, poolDatabase } from "../persistence/sql.ts";
 import { DEFAULT_SCHEMA } from "../persistence/store.ts";
 
 /** What the line says. */
@@ -25,12 +24,11 @@ const CONNECT_TIMEOUT_MS = 60_000;
 
 const urlFile = process.env["ALASIO_DATABASE_URL_FILE"];
 // A connection lost, idle or held, fails the read, and so the line, not the process unheard.
-const pool = hearingConnections(new pg.Pool({
+const pool = heardPool({
   connectionString: urlFile ? readFileSync(urlFile, "utf8").trim() : process.env["ALASIO_DATABASE_URL"],
   max: 1,
   connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
-}));
-pool.on("error", () => {});
+});
 try {
   const record = await Effect.runPromise(new NeonCodexLoginRepository(poolDatabase(pool), DEFAULT_SCHEMA).getCodexLoginRecord());
   const state: CodexLoginState = { kept: record !== null, refusedAt: record && record.refusedAt !== null ? new Date(record.refusedAt).toISOString() : null };

@@ -132,9 +132,8 @@ export async function openLake(config: LakeAccess, { readOnly = false, source, m
       )
     );
     if (!readOnly) {
-      const catalog = new pg.Client({ ...config.catalog, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
       // A connection lost fails the grants, and so the lake's open, not the process.
-      catalog.on("error", () => {});
+      const catalog = heardClient(config.catalog);
       await catalog.connect();
       try {
         await grantReads(catalog);
@@ -202,6 +201,21 @@ let acrossProcesses: <T>(work: Write<T>) => Promise<T> = (work) => work(async ()
 export const CONNECT_TIMEOUT_MS = 60_000;
 
 /**
+ * A client of `config`'s, connecting within CONNECT_TIMEOUT_MS, its connection's loss heard, as
+ * `onLost` says it, so it fails its statements, and its holder's work, not the process: pg tells
+ * a connection's 'error' listeners of it as it is lost, its backend terminated as by a compute's
+ * restart, a failover or an operator, whether a statement of it was running or none was, and
+ * with none listening Node takes it as the process's to die of. Every pg client of the lake's is
+ * made by it, as alasio's are by its own (src/persistence/sql.ts heardClient), which the lake's
+ * package, built apart, does not reach; test/pg-heard.test.ts holds them to it.
+ */
+export function heardClient(config: pg.ClientConfig, onLost: (error: Error) => void = () => {}): pg.Client {
+  const client = new pg.Client({ connectionTimeoutMillis: CONNECT_TIMEOUT_MS, ...config });
+  client.on("error", onLost);
+  return client;
+}
+
+/**
  * Makes every write of this process's (`serially`) hold the lake's write lock, a session
  * advisory lock of `catalog`'s database, on a connection of its own, made anew when lost,
  * waiting `waitMs` for it at most: the loader's and the intake replicas' writes then
@@ -211,8 +225,7 @@ export function writeLock(catalog: DatabaseConfig, waitMs = WRITE_LOCK_WAIT_MS):
   let client: pg.Client | null = null;
   const connected = async (): Promise<pg.Client> => {
     if (client) return client;
-    const fresh = new pg.Client({ ...catalog, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
-    fresh.on("error", () => {
+    const fresh: pg.Client = heardClient(catalog, () => {
       if (client === fresh) client = null;
     });
     fresh.on("end", () => {
@@ -285,9 +298,8 @@ export async function takeLoaderLock(
   log: (message: string, fields?: Record<string, unknown>) => void,
   { signal, retryMs = LOADER_LOCK_RETRY_MS }: { signal?: AbortSignal | undefined; retryMs?: number | undefined } = {},
 ): Promise<LoaderLock> {
-  const client = new pg.Client({ ...catalog, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
   // A connection lost is found by the fence's round trip.
-  client.on("error", () => {});
+  const client = heardClient(catalog);
   try {
     await client.connect();
     for (let attempt = 0; ; attempt += 1) {

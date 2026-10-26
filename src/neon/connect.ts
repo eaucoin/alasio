@@ -18,7 +18,7 @@ import pg, { type Pool } from "pg";
 import { isScramVerifier } from "../../neon/control/scram.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../codex/rollouts/store.ts";
 import { NeonSessionStore } from "../harness/claude/session-store.ts";
-import { hearingConnections } from "../persistence/sql.ts";
+import { heardPool } from "../persistence/sql.ts";
 import { withLogScope } from "../shared/log.ts";
 import { withAlasioSpan } from "../telemetry/index.ts";
 import { ensureGrafanaRole } from "./grafana.ts";
@@ -145,19 +145,24 @@ const writtenOn = (pool: Pool, wake: LakeWake["Service"]): (() => void) => () =>
     return row.lsn;
   });
 
-/** A pool of connections to `databaseUrl`, as `make` makes one, whose idle connections lost are said with `onIdleError`. */
-function poolOf<P extends Pool>(databaseUrl: Redacted.Redacted, onIdleError: (error: Error) => void, make: (config: pg.PoolConfig) => P): P {
-  const pool = make({
-    connectionString: Redacted.value(databaseUrl),
-    max: 8,
-    idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
-  });
-  // An idle connection dies with the compute when it restarts; the pool
-  // replaces it on the next checkout.
-  pool.on("error", onIdleError);
-  return hearingConnections(pool);
-}
+/** The configuration of alasio's pools of connections to `databaseUrl`. */
+const poolConfig = (databaseUrl: Redacted.Redacted): pg.PoolConfig => ({
+  connectionString: Redacted.value(databaseUrl),
+  max: 8,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
+});
+
+/**
+ * A pool of connections to `databaseUrl`, whose idle connections lost, as one dies with the
+ * compute when it restarts, are said with `onIdleError`, and replaced on the next checkout.
+ */
+const poolOf = (databaseUrl: Redacted.Redacted, onIdleError: (error: Error) => void): pg.Pool => heardPool(poolConfig(databaseUrl), { onIdleError });
+
+/** A pool of connections to `databaseUrl` as poolOf's, each carrying its grant (./granted-pool.ts). */
+const grantedPoolOf = (databaseUrl: Redacted.Redacted, onIdleError: (error: Error) => void): GrantedPool =>
+  heardPool(poolConfig(databaseUrl), { onIdleError, make: (config) => new GrantedPool(config) });
+
 
 /**
  * Connects to a Neon that is already up and makes what alasio keeps in it: the session
@@ -172,7 +177,7 @@ const openNeon = Effect.fnUntraced(function*(
   onIdleError: (error: Error) => void,
   wake: LakeWake["Service"],
 ): Effect.fn.Return<OpenNeon, NeonUnavailable> {
-  const pool = poolOf(databaseUrl, onIdleError, (config) => new pg.Pool(config));
+  const pool = poolOf(databaseUrl, onIdleError);
   const written = writtenOn(pool, wake);
   const sessionStore = new NeonSessionStore(pool, { written });
   const rollouts = new NeonRolloutStore(pool, { written });
@@ -274,7 +279,7 @@ export interface HarnessNeonStores extends OpenNeon {
  * hears what the pod did on its own (ConnectedNeon.written).
  */
 const connectHarnessNeon: Effect.Effect<HarnessNeonStores, NeonError, Scope.Scope> = Effect.gen(function*() {
-  const pool = yield* deploymentPool((config) => new GrantedPool(config));
+  const pool = yield* deploymentPool(grantedPoolOf);
   return {
     pool,
     sessionStore: new NeonSessionStore(pool),
@@ -284,16 +289,16 @@ const connectHarnessNeon: Effect.Effect<HarnessNeonStores, NeonError, Scope.Scop
 }).pipe(withLogScope("neon"));
 
 /**
- * A pool of `make`'s on the Neon the deployment provides (`ALASIO_DATABASE_URL`, or its `_FILE`
+ * A pool, as `make` opens one, on the Neon the deployment provides (`ALASIO_DATABASE_URL`, or its `_FILE`
  * form), as the role it names, until the scope closes, waiting for it as alasio does; it makes
  * nothing there.
  */
-const deploymentPool = <P extends Pool>(make: (config: pg.PoolConfig) => P): Effect.Effect<P, NeonError, Scope.Scope> =>
+const deploymentPool = <P extends Pool>(make: (databaseUrl: Redacted.Redacted, onIdleError: (error: Error) => void) => P): Effect.Effect<P, NeonError, Scope.Scope> =>
   Effect.gen(function*() {
     const databaseUrl = yield* deploymentSecret("ALASIO_DATABASE_URL");
     const runFork = yield* FiberSet.makeRuntime();
     const pool = yield* Effect.acquireRelease(
-      Effect.sync(() => poolOf(databaseUrl, (error) => void runFork(Effect.logWarning(`idle database connection lost: ${error.message}`)), make)),
+      Effect.sync(() => make(databaseUrl, (error) => void runFork(Effect.logWarning(`idle database connection lost: ${error.message}`)))),
       (made) => Effect.promise(() => made.end()),
     );
     yield* onNeon(() => pool.query("select 1")).pipe(
@@ -310,7 +315,7 @@ const deploymentPool = <P extends Pool>(make: (config: pg.PoolConfig) => P): Eff
  * own role (./codex-login.ts), which reaches the login of alasio's state alone: its pool, open
  * while the scope is, which makes nothing there, as alasio has made it.
  */
-export const connectRelayNeon: Effect.Effect<Pool, NeonError, Scope.Scope> = deploymentPool((config) => new pg.Pool(config));
+export const connectRelayNeon: Effect.Effect<Pool, NeonError, Scope.Scope> = deploymentPool(poolOf);
 
 /** The harness host's connection to alasio's Neon, open while the scope `HarnessNeon.make` is run in lasts. */
 export class HarnessNeon extends Context.Service<HarnessNeon, HarnessNeonStores>()("alasio/neon/HarnessNeon", { make: connectHarnessNeon }) {}

@@ -24,7 +24,7 @@ import pg from "pg";
 
 import type { LakeConfig } from "./config.ts";
 import type { BatchBounds } from "./intake.ts";
-import { CONNECT_TIMEOUT_MS, type Lake, openLake, takeLoaderLock } from "./lake.ts";
+import { heardClient, type Lake, openLake, takeLoaderLock } from "./lake.ts";
 import type { Metrics } from "./metrics.ts";
 import type { Position } from "./otel.ts";
 import { type LakeLoad, type LakeSyncOptions, prepareLake, syncLake } from "./sync.ts";
@@ -56,9 +56,8 @@ export async function openLoaderLake(config: LakeConfig, log: Log, signal: Abort
     }
   };
   let lake: Lake | undefined;
-  const source = new pg.Client({ ...config.catalog, ...config.source, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
   // A connection lost fails the next ask, and so the load, which opens all anew.
-  source.on("error", () => {});
+  const source = heardClient({ ...config.catalog, ...config.source });
   try {
     const held = await openLake(config, { source: config.source });
     lake = held;

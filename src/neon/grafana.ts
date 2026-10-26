@@ -4,9 +4,10 @@
  * (./lake.ts), rather than in the compute's spec, whose roles Neon makes members of
  * neon_superuser.
  */
-import pg, { escapeLiteral, type Pool } from "pg";
+import { escapeLiteral, type Pool } from "pg";
 
 import { GRAFANA_ROLE } from "../../neon/control/secrets.ts";
+import { heardClient } from "../persistence/sql.ts";
 
 /** Grafana's database. */
 const GRAFANA_DATABASE = "grafana";
@@ -31,9 +32,8 @@ export async function ensureGrafanaRole(pool: Pool, databaseUrl: string, verifie
   const url = new URL(databaseUrl);
   url.pathname = `/${GRAFANA_DATABASE}`;
   // As patient as the pool's own connections.
-  const client = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: pool.options.connectionTimeoutMillis });
   // A connection lost fails the grant, and so the setup, not the process.
-  client.on("error", () => {});
+  const client = heardClient({ connectionString: url.toString(), connectionTimeoutMillis: pool.options.connectionTimeoutMillis });
   try {
     await client.connect();
     await client.query(`grant usage, create on schema public to ${GRAFANA_ROLE}`);
