@@ -13,6 +13,13 @@
  * hooks run in the order they were made, and this module's is made first, as each module that
  * pools connections imports it, so a pool's own hook would end it only after the server had
  * terminated its idle connections, which the pool then fails of with none to hear it.
+ *
+ * And a database is dropped, or the server stopped, only once the connections to it have ended
+ * as the server sees them, for CONNECTIONS_END_MS at most (ended): pg's pool's end resolves once
+ * it has asked each of its idle clients to end, not once they have, so a drop with force, or a
+ * stop, right after it would terminate a connection whose client still listens, which its pool,
+ * ended, then fails of with none to hear it ("terminating connection due to administrator
+ * command"). One still there past that, as a test left open, is terminated with the drop.
  */
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -55,6 +62,7 @@ after(async () => {
   server = undefined;
   if (!left) return;
   left.ended = true;
+  await ended(left, null).catch(() => {});
   await left.postgres.stop();
 });
 
@@ -109,14 +117,29 @@ async function startServer(ports: () => Promise<number>, tries = PORT_TRIES): Pr
   return { postgres, url: new URL(`postgresql://postgres:${password}@127.0.0.1:${port}/postgres`), databases: 0, ended: false };
 }
 
-/** Runs `sql` on the server's own database, as its superuser. */
-async function onServer({ url }: Server, sql: string): Promise<void> {
+/** Runs `sql` on the server's own database, as its superuser: what its last statement returned. */
+async function onServer({ url }: Server, sql: string, values: readonly unknown[] = []): Promise<readonly Record<string, unknown>[]> {
   const client = new pg.Client({ connectionString: url.toString() });
   await client.connect();
   try {
-    await client.query(sql);
+    return (await client.query(sql, [...values])).rows;
   } finally {
     await client.end();
+  }
+}
+
+/** How long a database's drop, or the server's stop, waits for the connections to it to end on their own. */
+const CONNECTIONS_END_MS = 5_000;
+
+/**
+ * Once no connection to the database `name` of `server`, or, null, to any of its databases, is
+ * there as the server sees it, but this one's own: for CONNECTIONS_END_MS at most, as the module
+ * says.
+ */
+async function ended(server: Server, name: string | null): Promise<void> {
+  for (const deadline = Date.now() + CONNECTIONS_END_MS; Date.now() < deadline; await new Promise((resolve) => setTimeout(resolve, 20))) {
+    const [left] = await onServer(server, "select count(*)::int as left from pg_stat_activity where backend_type = 'client backend' and pid <> pg_backend_pid() and ($1::text is null or datname = $1)", [name]);
+    if (left?.["left"] === 0) return;
   }
 }
 
@@ -146,6 +169,7 @@ export async function startPostgres({ ports = freePort }: StartPostgresOptions =
     url: url.toString(),
     stop: async () => {
       if (running.ended) return;
+      await ended(running, name);
       await onServer(running, `drop database ${name} with (force)`);
       if (--running.databases > 0) return;
       server = undefined;
