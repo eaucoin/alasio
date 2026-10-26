@@ -14,7 +14,7 @@
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:https";
 import { type AddressInfo, createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
@@ -59,31 +59,59 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+/** How long the release's archive may take to fetch, as a download that stalls would wait forever. */
+const FETCH_TIMEOUT_MS = 120_000;
+
 /** The directory of the release's binaries, downloaded and unpacked once, its archive checked against its digest. */
 async function binaries(): Promise<string> {
   const cache = join(process.env["XDG_CACHE_HOME"] || join(homedir(), ".cache"), "alasio-envtest", RELEASE);
-  const directory = join(cache, "controller-tools", "envtest");
-  if (existsSync(join(directory, "kube-apiserver"))) return directory;
-  mkdirSync(cache, { recursive: true });
-  const response = await fetch(ARCHIVE);
+  if (existsSync(unpackedIn(cache))) return unpackedIn(cache);
+  const response = await fetch(ARCHIVE, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   if (!response.ok) throw new Error(`downloading ${ARCHIVE} failed: ${response.status}`);
   const archive = Buffer.from(await response.arrayBuffer());
   const digest = createHash("sha256").update(archive).digest("hex");
   if (digest !== ARCHIVE_SHA256) throw new Error(`${ARCHIVE} is not the archive pinned: its sha256 is ${digest}`);
-  const file = join(cache, "envtest.tar.gz");
-  writeFileSync(file, archive);
-  await promisify(execFile)("tar", ["-xzf", file, "-C", cache]);
-  rmSync(file);
-  return directory;
+  return unpack(cache, archive);
 }
 
-/** Starts `binary` with `args`, its output kept to say why it ended, should it end before it is stopped. */
+/** Where `cache` holds the release's binaries, once unpacked there. */
+const unpackedIn = (cache: string): string => join(cache, "controller-tools", "envtest");
+
+/**
+ * The binaries of `archive`, an envtest release's, unpacked into `cache`: in a directory of
+ * this call's own, then moved into place whole, so a test file's process that fetches the
+ * release beside another, as each of a run's does with nothing in its cache, neither runs a
+ * binary the other is still writing, which fails to start (ETXTBSY), nor writes over one the
+ * other runs. Where another moved its own into place first, that one is kept.
+ */
+export async function unpack(cache: string, archive: Buffer): Promise<string> {
+  mkdirSync(join(cache, "controller-tools"), { recursive: true });
+  const unpacking = mkdtempSync(join(cache, ".unpacking-"));
+  try {
+    writeFileSync(join(unpacking, "envtest.tar.gz"), archive);
+    await promisify(execFile)("tar", ["-xzf", join(unpacking, "envtest.tar.gz"), "-C", unpacking]);
+    try {
+      renameSync(unpackedIn(unpacking), unpackedIn(cache));
+    } catch (error) {
+      if (!existsSync(unpackedIn(cache))) throw error;
+    }
+    return unpackedIn(cache);
+  } finally {
+    rmSync(unpacking, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Starts `binary` with `args`, its output kept to say why it ended, should it end before it is
+ * stopped; one that could not be started ended, saying why.
+ */
 function run(binary: string, args: readonly string[]): { readonly child: ChildProcess; readonly output: () => string } {
   const child = spawn(binary, args, { stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   const keep = (chunk: Buffer) => void (output = (output + chunk.toString("utf8")).slice(-8192));
   child.stdout?.on("data", keep);
   child.stderr?.on("data", keep);
+  child.on("error", (error) => keep(Buffer.from(`${error.message}\n`)));
   return { child, output: () => output };
 }
 
@@ -131,58 +159,63 @@ class PortTaken extends Error {}
  * An API server on ports `ports` finds free, started again on others where one of its servers
  * found its port taken as it started, STARTS times at most.
  */
-export async function startApiServer(ports: () => Promise<number> = freePort): Promise<{ readonly api: TestKubeApiServer; readonly stop: () => Promise<void> }> {
+export async function startApiServer(ports: () => Promise<number> = freePort, bin: () => Promise<string> = binaries): Promise<{ readonly api: TestKubeApiServer; readonly stop: () => Promise<void> }> {
   for (let attempt = 1; ; attempt += 1) {
     try {
-      return await startOnce(ports);
+      return await startOnce(ports, bin);
     } catch (error) {
       if (!(error instanceof PortTaken) || attempt === STARTS) throw error;
     }
   }
 }
 
-async function startOnce(ports: () => Promise<number>): Promise<{ readonly api: TestKubeApiServer; readonly stop: () => Promise<void> }> {
-  const bin = await binaries();
+async function startOnce(ports: () => Promise<number>, binariesOf: () => Promise<string>): Promise<{ readonly api: TestKubeApiServer; readonly stop: () => Promise<void> }> {
+  const bin = await binariesOf();
   const directory = mkdtempSync(join(tmpdir(), "alasio-kube-apiserver-"));
   const [etcdPort, peerPort, apiPort] = [await ports(), await ports(), await ports()];
-  const etcd = run(join(bin, "etcd"), [
-    `--data-dir=${join(directory, "etcd")}`,
-    `--listen-client-urls=http://127.0.0.1:${etcdPort}`,
-    `--advertise-client-urls=http://127.0.0.1:${etcdPort}`,
-    `--listen-peer-urls=http://127.0.0.1:${peerPort}`,
-    `--initial-advertise-peer-urls=http://127.0.0.1:${peerPort}`,
-    `--initial-cluster=default=http://127.0.0.1:${peerPort}`,
-    "--unsafe-no-fsync",
-  ]);
-  const token = randomBytes(24).toString("hex");
-  writeFileSync(join(directory, "tokens.csv"), `${token},admin,admin,system:masters\n`);
-  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
-  writeFileSync(join(directory, "sa.key"), privateKey.export({ type: "pkcs8", format: "pem" }));
-  writeFileSync(join(directory, "sa.pub"), publicKey.export({ type: "spki", format: "pem" }));
-  const certs = join(directory, "certs");
-  const apiServer = run(join(bin, "kube-apiserver"), [
-    `--etcd-servers=http://127.0.0.1:${etcdPort}`,
-    "--bind-address=127.0.0.1",
-    "--advertise-address=127.0.0.1",
-    // The loopback, which no Endpoints of the kubernetes Service may name: none is kept.
-    "--endpoint-reconciler-type=none",
-    `--secure-port=${apiPort}`,
-    `--cert-dir=${certs}`,
-    `--token-auth-file=${join(directory, "tokens.csv")}`,
-    "--authorization-mode=RBAC",
-    "--service-cluster-ip-range=10.0.0.0/24",
-    "--service-account-issuer=https://kubernetes.default.svc",
-    `--service-account-key-file=${join(directory, "sa.pub")}`,
-    `--service-account-signing-key-file=${join(directory, "sa.key")}`,
-    // Nothing makes a namespace's default ServiceAccount, which its admission would have each pod name.
-    "--disable-admission-plugins=ServiceAccount",
-    "--allow-privileged=true",
-  ]);
+  // Each server started, ended as the start fails, however it fails: one left running would hold the test file's process open
+  // after its tests, a hang no test of it fails by.
+  const servers: { readonly child: ChildProcess }[] = [];
   const stop = async () => {
-    for (const { child } of [apiServer, etcd]) await end(child);
+    for (const { child } of servers.toReversed()) await end(child);
     rmSync(directory, { recursive: true, force: true });
   };
   try {
+    const etcd = run(join(bin, "etcd"), [
+      `--data-dir=${join(directory, "etcd")}`,
+      `--listen-client-urls=http://127.0.0.1:${etcdPort}`,
+      `--advertise-client-urls=http://127.0.0.1:${etcdPort}`,
+      `--listen-peer-urls=http://127.0.0.1:${peerPort}`,
+      `--initial-advertise-peer-urls=http://127.0.0.1:${peerPort}`,
+      `--initial-cluster=default=http://127.0.0.1:${peerPort}`,
+      "--unsafe-no-fsync",
+    ]);
+    servers.push(etcd);
+    const token = randomBytes(24).toString("hex");
+    writeFileSync(join(directory, "tokens.csv"), `${token},admin,admin,system:masters\n`);
+    const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    writeFileSync(join(directory, "sa.key"), privateKey.export({ type: "pkcs8", format: "pem" }));
+    writeFileSync(join(directory, "sa.pub"), publicKey.export({ type: "spki", format: "pem" }));
+    const certs = join(directory, "certs");
+    const apiServer = run(join(bin, "kube-apiserver"), [
+      `--etcd-servers=http://127.0.0.1:${etcdPort}`,
+      "--bind-address=127.0.0.1",
+      "--advertise-address=127.0.0.1",
+      // The loopback, which no Endpoints of the kubernetes Service may name: none is kept.
+      "--endpoint-reconciler-type=none",
+      `--secure-port=${apiPort}`,
+      `--cert-dir=${certs}`,
+      `--token-auth-file=${join(directory, "tokens.csv")}`,
+      "--authorization-mode=RBAC",
+      "--service-cluster-ip-range=10.0.0.0/24",
+      "--service-account-issuer=https://kubernetes.default.svc",
+      `--service-account-key-file=${join(directory, "sa.pub")}`,
+      `--service-account-signing-key-file=${join(directory, "sa.key")}`,
+      // Nothing makes a namespace's default ServiceAccount, which its admission would have each pod name.
+      "--disable-admission-plugins=ServiceAccount",
+      "--allow-privileged=true",
+    ]);
+    servers.push(apiServer);
     const certificate = join(certs, "apiserver.crt");
     for (const deadline = Date.now() + 60_000; ; await new Promise((resolve) => setTimeout(resolve, 250))) {
       for (const [name, { child, output }] of [["etcd", etcd], ["kube-apiserver", apiServer]] as const) {

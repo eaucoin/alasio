@@ -2,10 +2,13 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type AddressInfo, createServer, type Socket } from "node:net";
 import { test } from "node:test";
 
-import { end, ready, startApiServer } from "./support/kube-apiserver.ts";
+import { end, ready, startApiServer, unpack } from "./support/kube-apiserver.ts";
 
 /** A port of the loopback no one listens on now, as the support probes one. */
 async function probed(): Promise<number> {
@@ -91,5 +94,79 @@ test("an API server whose port another process takes between its probe and its b
     }
   } finally {
     taken.close();
+  }
+});
+
+/** Whether the process `pid` runs. */
+const running = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+test("an API server whose kube-apiserver cannot be started, as one still being written cannot (ETXTBSY), fails to start, its etcd ended, none left to hold the process open", { timeout: 60_000 }, async () => {
+  const bin = mkdtempSync(join(tmpdir(), "alasio-envtest-bin-"));
+  // An etcd that says its PID and serves nothing until it is ended; a kube-apiserver held open for writing, as another process unpacking it holds it.
+  writeFileSync(join(bin, "etcd"), '#!/bin/sh\necho $$ > "$(dirname "$0")/etcd.pid"\nexec sleep 600\n', { mode: 0o755 });
+  const writing = openSync(join(bin, "kube-apiserver"), "w", 0o755);
+  writeSync(writing, "#!/bin/sh\n");
+  let etcd: number | undefined;
+  try {
+    await assert.rejects(startApiServer(probed, async () => bin), /ETXTBSY/u);
+    etcd = existsSync(join(bin, "etcd.pid")) ? Number(readFileSync(join(bin, "etcd.pid"), "utf8")) : undefined;
+    if (etcd !== undefined) {
+      for (const deadline = Date.now() + 15_000; running(etcd); await new Promise((resolve) => setTimeout(resolve, 50))) {
+        assert.ok(Date.now() < deadline, `etcd ${etcd} runs on after the start failed`);
+      }
+    }
+  } finally {
+    closeSync(writing);
+    if (etcd !== undefined && running(etcd)) process.kill(etcd, "SIGKILL");
+    rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+test("the release unpacked by several at once, as each test file's process with nothing in its cache unpacks it, is whole wherever it is found, each finding it", { timeout: 60_000 }, async () => {
+  const work = mkdtempSync(join(tmpdir(), "alasio-envtest-unpack-"));
+  try {
+    // An archive as the release's: its binaries under controller-tools/envtest, large enough to take a while to write.
+    const source = join(work, "source", "controller-tools", "envtest");
+    mkdirSync(source, { recursive: true });
+    const body = Buffer.alloc(32 * 1024 * 1024, 7);
+    for (const name of ["etcd", "kube-apiserver"]) {
+      writeFileSync(join(source, name), body);
+      chmodSync(join(source, name), 0o755);
+    }
+    execFileSync("tar", ["-czf", join(work, "envtest.tar.gz"), "-C", join(work, "source"), "controller-tools"]);
+    const archive = readFileSync(join(work, "envtest.tar.gz"));
+    const cache = join(work, "cache");
+    const unpacked = join(cache, "controller-tools", "envtest");
+    // Looked at meanwhile, as a process that finds it there runs it: never there but whole.
+    let looking = true;
+    const partial: string[] = [];
+    const look = (async () => {
+      while (looking) {
+        if (existsSync(unpacked)) {
+          for (const name of ["etcd", "kube-apiserver"]) {
+            const size = existsSync(join(unpacked, name)) ? readFileSync(join(unpacked, name)).length : -1;
+            if (size !== body.length) partial.push(`${name}: ${size} bytes`);
+          }
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    })();
+    const found = await Promise.all(Array.from({ length: 4 }, () => unpack(cache, archive)));
+    looking = false;
+    await look;
+    assert.deepEqual(found, Array.from({ length: 4 }, () => unpacked));
+    assert.deepEqual(partial, []);
+    assert.deepEqual(readdirSync(unpacked).toSorted(), ["etcd", "kube-apiserver"]);
+    // Nothing left of each unpacking but the one moved into place.
+    assert.deepEqual(readdirSync(cache), ["controller-tools"]);
+  } finally {
+    rmSync(work, { recursive: true, force: true });
   }
 });
