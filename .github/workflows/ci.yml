@@ -1,85 +1,74 @@
 name: ci
 
-# On demand only, as an end-to-end run builds every image and brings clusters up.
+# The memory-snapshot benchmark, on this throwaway branch alone: the branch's
+# own ci.yml, as GitHub dispatches only workflows whose file is on the default branch. One job
+# per system x target x profile, each installing its system and running every fixture, size and
+# run on its runner; then the results aggregated, and alasio's images deleted.
 on:
   workflow_dispatch:
     inputs:
-      # Some of the end-to-end jobs alone, for a change that needs no more proven (the
-      # shards job says which); the unit, package and images jobs run whatever it says.
-      shards:
-        description: "End-to-end jobs to run, each a shard, target/shard or target/agents/shard (all if empty)"
+      systems:
+        description: "Systems, of alasio gvisor firecracker criu"
+        type: string
+        default: "alasio gvisor firecracker criu"
+      targets:
+        description: "alasio's targets, of host docker (the others run on the host alone)"
+        type: string
+        default: "host"
+      profiles:
+        description: "Store profiles, of local s3-standard s3-express"
+        type: string
+        default: "local s3-standard s3-express"
+      cases:
+        description: "Fixture cases, as fixture/MiB (all if empty)"
         type: string
         default: ""
-      # The release the upgrade shard upgrades from, which an installation runs before it
-      # upgrades to this: npm's latest, as the box's is, unless another is named.
-      previous:
-        description: "Release the upgrade shard upgrades from, as 9.0.0 (npm's latest if empty)"
+      runs:
+        description: "Runs of each case"
         type: string
-        default: ""
+        default: "5"
 
 permissions:
   contents: read
 
 env:
-  # Where the images job pushes the images, once, for every end-to-end job to pull: under
-  # run-<id>-<attempt>, packages of the attempt's own, which the last job deletes whole.
-  # A package GitHub's token makes here is linked to this public repository, and public as
-  # it is, so alasio init and the clusters' nodes pull them without a login.
+  # Where the images job pushes alasio's images, as ci.yml on main does.
   REGISTRY: ghcr.io/eaucoin/alasio-ci
 
 jobs:
-  unit:
+  matrix:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      alasio: ${{ steps.matrix.outputs.alasio }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24.14.0
-          cache: npm
-      - run: npm ci
-      # The lake's package installed too, as a checkout that builds its image has it: its
-      # modules then resolve its own copies, which the root's tests must work beside.
-      - run: npm ci --prefix neon/lake
-      - run: npm run typecheck
-      - run: npm test
-
-  # The object store's S3 gateway under the load the box puts it under, in Docker, as
-  # SeaweedFS leaves it and as alasio runs it (test/gateway-memory.test.ts): several GiB,
-  # on a runner of its own.
-  gateway-memory:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      # Some 10 GiB go to the store's volume server, more than a runner has free: what of its
-      # software this job does not use goes first (Go stays, for the gateway's heap profile).
-      - run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup && df -h /
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24.14.0
-          cache: npm
-      - run: npm ci
-      - run: npm run test:gateway-memory
+      - id: matrix
+        name: Say the jobs
+        shell: bash
         env:
-          ALASIO_GATEWAY_LOAD: "1"
+          SYSTEMS: ${{ inputs.systems }}
+          TARGETS: ${{ inputs.targets }}
+          PROFILES: ${{ inputs.profiles }}
+        run: |
+          words() { jq --raw-input --compact-output '[splits("[\\s,]+") | select(. != "")]' <<<"$1"; }
+          matrix=$(jq --null-input --compact-output \
+            --argjson systems "$(words "$SYSTEMS")" --argjson targets "$(words "$TARGETS")" --argjson profiles "$(words "$PROFILES")" '
+            ["alasio", "gvisor", "firecracker", "criu"] as $known
+            | ["local", "s3-standard", "s3-express"] as $shapes
+            | if ($systems - $known) != [] then "::error::no system \($systems - $known | join(", "))\n" | halt_error(1)
+              elif ($profiles - $shapes) != [] then "::error::no profile \($profiles - $shapes | join(", "))\n" | halt_error(1)
+              else . end
+            | {include: [$systems[] as $system | $profiles[] as $profile
+                | (if $system == "alasio" then $targets[] else "host" end) as $target
+                | {system: $system, target: $target, profile: $profile}]}')
+          echo "matrix=$matrix" | tee --append "$GITHUB_OUTPUT"
+          echo "alasio=$(jq --arg s alasio 'index($s) != null' <<<"$(words "$SYSTEMS")")" | tee --append "$GITHUB_OUTPUT"
 
-  package:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24.14.0
-          cache: npm
-      - run: npm ci
-      # Builds the command line and packs its npm package; checks that the package holds
-      # the built command line alone, with the CRD it applies; and runs alasio --version
-      # and --help from an install of it.
-      - run: node tooling/cli-package.ts
-
+  # alasio's images, as ci.yml on main builds and pushes them, for the alasio jobs to install.
   images:
+    needs: matrix
+    if: needs.matrix.outputs.alasio == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -87,62 +76,35 @@ jobs:
       packages: write
     outputs:
       registry: ${{ steps.push.outputs.registry }}
-      previous: ${{ steps.previous.outputs.previous }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # For tooling/node-image.ts, which says the node image's pins, and npm, which says the
-      # release the upgrade shard upgrades from.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.14.0
-      - id: previous
-        name: Say the release the upgrade shard upgrades from
-        env:
-          PREVIOUS: ${{ inputs.previous }}
-        run: |
-          previous=$(npm view "alasio@${PREVIOUS:-latest}" version)
-          [[ $previous =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::npm names no one release of alasio by ${PREVIOUS:-latest}: ${previous:-none}"; exit 1; }
-          echo "previous=$previous" | tee --append "$GITHUB_OUTPUT"
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      # Pushes alasio's own images whole (tooling/push-whole.sh), as the release does, but the
-      # sessions' agent image, as eStargz (tooling/push-estargz.sh), which the clusters the
-      # end-to-end runs make pull lazily.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      # All seven at once, each line said with its image's name, the node image with its pins
-      # (tooling/node-image.ts), whole, as Docker runs it, and on alasio's,
-      # alasio-harness-stand-ins, which the end-to-end runs install
-      # (test/e2e/harness-stand-ins.Dockerfile); and the stand-ins again, as
-      # alasio-harness-stand-ins-previous, on the published alasio image of the release the
-      # upgrade shard upgrades from; the step fails if any did.
       - id: push
         name: Build and push the images
         shell: bash
         env:
           PUSH_TO: ${{ env.REGISTRY }}/run-${{ github.run_id }}-${{ github.run_attempt }}
           SOURCE: https://github.com/${{ github.repository }}
-          PREVIOUS: ${{ steps.previous.outputs.previous }}
         run: |
           declare -A pids
-          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-log:neon/log" "alasio-collector:neon/collector" "alasio-webhook:webhook" "alasio-node:cluster/node" "alasio-harness-stand-ins-previous:test"; do
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-log:neon/log" "alasio-collector:neon/collector" "alasio-webhook:webhook" "alasio-node:cluster/node"; do
             name=${image%%:*}
             {
               if [ "$name" = alasio-node ]; then
                 mapfile -t args < <(node tooling/node-image.ts)
                 docker build "${args[@]}" --tag "$PUSH_TO/$name:e2e" --label "org.opencontainers.image.source=$SOURCE" "${image#*:}" &&
                   docker push "$PUSH_TO/$name:e2e"
-              elif [ "$name" = alasio-harness-stand-ins-previous ]; then
-                tooling/push-estargz.sh "$PUSH_TO/$name:e2e" test --file test/e2e/harness-stand-ins.Dockerfile \
-                  --build-arg "ALASIO=ghcr.io/eaucoin/alasio:$PREVIOUS" --label "org.opencontainers.image.source=$SOURCE"
               else
-                # alasio's own, with the commit it is built from, which its telemetry says.
                 revision=()
                 if [ "$name" = alasio ]; then revision=(--build-arg "REVISION=$GITHUB_SHA"); fi
-                # Whole, as the release pushes them, but the agent's, lazily pulled: the stand-ins on alasio's among them,
-                # which the runs install as alasio's.
                 push=tooling/push-whole.sh
                 if [ "$name" = alasio-agent ]; then push=tooling/push-estargz.sh; fi
                 "$push" "$PUSH_TO/$name:e2e" "${image#*:}" "${revision[@]}" --label "org.opencontainers.image.source=$SOURCE" &&
@@ -161,131 +123,108 @@ jobs:
           echo "registry=$PUSH_TO" >>"$GITHUB_OUTPUT"
           exit "$failed"
 
-  # The end-to-end jobs, each a shard of the suites on a cluster: in Docker on one node,
-  # and on a server with two agents, so the stack and sessions spread; and k3s on the
-  # runner itself, the host target, which the runner's sudo, asking for no password, lets
-  # alasio install, on one: behind ufw for one shard, as a server often is, and without a
-  # firewall for the others. The shards need nothing of each other's: alasio on
-  # Kubernetes, workspaces on JuiceFS, Neon, alasio's telemetry, branch environments, and
-  # how alasio is scaled, sized and drained, sessions' whole-sandbox snapshots, conversations'
-  # harnesses in pools of their own, and, on the
-  # host target alone, as the box's, alasio upgraded from the release before
-  # (test/e2e/harness.ts). All of them, or those the run's shards input names, each word of
-  # it a shard on every cluster, target/shard on its target's, or target/agents/shard on
-  # one; a word that names none fails the run before any starts.
-  shards:
+  bench:
+    needs: [matrix, images]
+    if: ${{ !cancelled() && needs.matrix.result == 'success' && needs.images.result != 'failure' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-    steps:
-      - id: matrix
-        name: Say the end-to-end jobs
-        shell: bash
-        env:
-          SHARDS: ${{ inputs.shards }}
-        run: |
-          matrix=$(jq --null-input --raw-output --arg shards "$SHARDS" '
-            def name($parts):
-              if $parts == 1 then [.shard] elif $parts == 2 then [.target, .shard]
-              else [.target, (.agents | tostring), .shard] end;
-            def named($word): ($word | split("/")) as $parts | name($parts | length) == $parts;
-            [({target: "docker", agents: (0, 2)}, {target: "host", agents: 0}) as $cluster
-              | ("sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents", "wake") as $shard
-              | $cluster + {shard: $shard}
-              | select(.shard != "upgrade" or .target == "host")
-              | if .target == "host" and .shard == "sessions" then . + {firewall: "ufw"} else . end]
-            | . as $jobs
-            | [$shards | splits("[\\s,]+") | select(. != "")] as $words
-            | [$words[] | select(. as $word | $jobs | any(named($word)) | not)] as $unnamed
-            | if $unnamed != [] then
-                "::error::shards names no end-to-end job by \($unnamed | join(", "))\n" | halt_error(1)
-              elif $words == [] then .
-              else map(select(any(named($words[]); .))) end
-            | "matrix=\({include: .} | tojson)"')
-          echo "$matrix" | tee --append "$GITHUB_OUTPUT"
-
-  e2e:
-    needs: [shards, images]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 360
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.shards.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
+    name: bench (${{ matrix.system }}, ${{ matrix.target }}, ${{ matrix.profile }})
+    env:
+      BENCH_DIR: ${{ github.workspace }}/../bench-work
+      BENCH_SYSTEM: ${{ matrix.system }}
+      BENCH_TARGET: ${{ matrix.target }}
+      BENCH_PROFILE: ${{ matrix.profile }}
+      BENCH_CASES: ${{ inputs.cases }}
+      BENCH_RUNS: ${{ inputs.runs }}
     steps:
-      # The cluster holds Neon's images and the agent image, bayma's with every runtime
-      # it serves, unpacked: far more disk than a runner starts with free, so the
-      # software it comes with that this job does not use goes first. Each directory is
-      # moved aside, as setup-node installs Node in a tool cache made anew, then removed,
-      # and Docker's images pruned, all at once, in the background, while the job readies
-      # the run; the step before the run waits for it.
-      - name: Free disk space, in the background
+      # What the runner comes with that no system uses goes, as ci.yml's end-to-end jobs do it:
+      # the images, the caches and k3s's images need the disk.
+      - name: Free disk space
         shell: bash
         run: |
-          dirs=(/usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
-            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
-            /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az)
-          for dir in "${dirs[@]}"; do
-            [ ! -e "$dir" ] || sudo mv "$dir" "$dir.deleted"
+          for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost /usr/share/swift \
+            /usr/local/share/powershell /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az; do
+            sudo rm -rf "$dir" &
           done
-          (
-            pids=()
-            for dir in "${dirs[@]}"; do
-              sudo rm -rf "$dir.deleted" &
-              pids+=($!)
-            done
-            docker system prune --all --force &
-            pids+=($!)
-            status=0
-            for pid in "${pids[@]}"; do wait "$pid" || status=1; done
-            echo "$status" >"$RUNNER_TEMP/disk-freed.part" && mv "$RUNNER_TEMP/disk-freed.part" "$RUNNER_TEMP/disk-freed"
-          ) >"$RUNNER_TEMP/disk-freed.log" 2>&1 &
+          docker system prune --all --force >/dev/null &
+          wait
+          df -h /
+      - name: KVM, for Firecracker
+        if: matrix.system == 'firecracker'
+        run: |
+          test -c /dev/kvm || { echo "::error::this runner has no /dev/kvm"; exit 1; }
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.14.0
-          cache: npm
-      - run: npm ci
-      - name: Wait for the disk space
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: The common pieces
+        working-directory: bench/common
         run: |
-          until [ -f "$RUNNER_TEMP/disk-freed" ]; do sleep 1; done
-          cat "$RUNNER_TEMP/disk-freed.log"
-          df -h /
-          exit "$(cat "$RUNNER_TEMP/disk-freed")"
-      # ufw active, denying all that comes in, as alasio finds it on a server: alasio lets the
-      # cluster's networks in (cli/src/cluster/node.ts), and its rules, said now, are to be
-      # the same once alasio is removed.
-      - name: Enable ufw, denying what comes in
-        if: matrix.firewall == 'ufw'
+          bun install --frozen-lockfile
+          node driver/build.ts
+          node --test --test-concurrency=1 test/*.test.ts
+      - name: The runner
         run: |
-          command -v ufw >/dev/null || sudo apt-get install --yes ufw
-          sudo ufw default deny incoming
-          sudo ufw default allow outgoing
-          sudo ufw --force enable
-          sudo ufw status verbose
-          sudo ufw show added | tee "$RUNNER_TEMP/ufw-rules"
-      # alasio's package installed, alasio init and up on a cluster of this runner from the
-      # images job's images, the shard's end-to-end tests, and alasio uninstall --purge,
-      # which leaves nothing of the cluster on the runner (test/e2e/harness.ts).
-      - run: npm run test:e2e
+          mkdir -p "$BENCH_DIR"
+          bench/common/host.sh "$BENCH_DIR/staging" | tee "$BENCH_DIR/host.json"
+      - name: The store
+        if: matrix.system != 'alasio'
+        run: bench/common/store/up.sh "$BENCH_DIR/store" "$BENCH_PROFILE"
+      - name: Run ${{ matrix.system }}
+        run: bench/${{ matrix.system }}/run.sh "$BENCH_TARGET" "$BENCH_PROFILE"
         env:
-          ALASIO_E2E_TARGET: ${{ matrix.target }}
-          ALASIO_E2E_AGENTS: ${{ matrix.agents }}
-          ALASIO_E2E_SHARD: ${{ matrix.shard }}
           ALASIO_E2E_REGISTRY: ${{ needs.images.outputs.registry }}
-          ALASIO_E2E_PREVIOUS: ${{ needs.images.outputs.previous }}
-      - name: ufw's rules are as they were before alasio
-        if: matrix.firewall == 'ufw'
-        run: |
-          sudo ufw status verbose
-          sudo ufw show added | diff "$RUNNER_TEMP/ufw-rules" -
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-${{ matrix.system }}-${{ matrix.target }}-${{ matrix.profile }}
+          path: |
+            ${{ env.BENCH_DIR }}/results.jsonl
+            ${{ env.BENCH_DIR }}/host.json
+            ${{ env.BENCH_DIR }}/logs/
+          if-no-files-found: warn
 
-  # Whatever came of the rest, the run's images are deleted, those of each of its attempts,
-  # pushed whole or not; so a failed run is re-run whole, its images built anew, as a
-  # re-run of its failed jobs alone would find them gone.
+  aggregate:
+    needs: bench
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.14.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: results-*
+          path: results
+      - name: Aggregate
+        run: |
+          (cd bench/common && bun install --frozen-lockfile)
+          mapfile -t files < <(find results -name results.jsonl -size +0)
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no job wrote results"; exit 1; }
+          node bench/common/aggregate/aggregate.ts --out summary "${files[@]}"
+          cat summary/summary.md >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: summary
+          path: summary/
+
+  # Whatever came of the rest, the run's images are deleted, as ci.yml on main does.
   delete-images:
-    needs: [images, e2e]
-    if: always()
+    needs: [images, bench]
+    if: always() && needs.images.result != 'skipped'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -298,7 +237,7 @@ jobs:
         run: |
           failed=0
           for attempt in $(seq "$GITHUB_RUN_ATTEMPT"); do
-            for name in alasio alasio-agent alasio-lake alasio-grafana alasio-log alasio-collector alasio-webhook alasio-node alasio-harness-stand-ins alasio-harness-stand-ins-previous; do
+            for name in alasio alasio-agent alasio-lake alasio-grafana alasio-log alasio-collector alasio-webhook alasio-node alasio-harness-stand-ins; do
               image="$REGISTRY/run-$GITHUB_RUN_ID-$attempt/$name"
               package="alasio-ci/run-$GITHUB_RUN_ID-$attempt/$name"
               if said=$(gh api --method DELETE "/users/eaucoin/packages/container/${package//\//%2F}" 2>&1); then

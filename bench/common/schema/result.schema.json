@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/eaucoin/alasio/tree/spike/snapshot-bench/bench/common/schema/result.schema.json",
+  "title": "One run's phase of the memory-snapshot benchmark (DESIGN.md section 6)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "system", "variant", "target", "fixture", "size_mib", "profile", "emulated", "run", "phase", "ok", "failure", "metrics", "correctness", "host", "store", "versions", "ci", "at", "details"],
+  "$defs": {
+    "ms": { "type": ["number", "null"], "minimum": 0 },
+    "bytes": { "type": ["integer", "null"], "minimum": 0 },
+    "check": { "type": ["boolean", "null"] }
+  },
+  "properties": {
+    "schema": { "const": 1 },
+    "system": { "enum": ["alasio", "gvisor", "firecracker", "criu"] },
+    "variant": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+    "target": { "enum": ["host", "docker"] },
+    "fixture": { "enum": ["idle", "poller", "fan-out", "saturating"] },
+    "size_mib": { "type": "integer", "minimum": 1 },
+    "profile": { "enum": ["local", "s3-standard", "s3-express"] },
+    "emulated": { "type": "boolean" },
+    "run": { "type": "integer", "minimum": 1 },
+    "phase": { "enum": ["save-live", "save-stop", "restore-warm", "restore-cold"] },
+    "ok": { "type": "boolean" },
+    "failure": { "type": ["string", "null"] },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "save_total_ms": { "$ref": "#/$defs/ms" },
+        "unavailable_ms": { "$ref": "#/$defs/ms" },
+        "pause_reported_ms": { "$ref": "#/$defs/ms" },
+        "slowdown": { "type": ["number", "null"], "minimum": 0 },
+        "precopy_passes": { "type": ["integer", "null"], "minimum": 0 },
+        "precopy_bytes": { "$ref": "#/$defs/bytes" },
+        "image_bytes": { "$ref": "#/$defs/bytes" },
+        "uploaded_bytes": { "$ref": "#/$defs/bytes" },
+        "first_exec_ms": { "$ref": "#/$defs/ms" },
+        "verify_ms": { "$ref": "#/$defs/ms" },
+        "resident_ms": { "$ref": "#/$defs/ms" },
+        "resident_how": { "enum": ["signal", "touched", null] },
+        "memory_peak_bytes": { "$ref": "#/$defs/bytes" },
+        "memory_bytes": { "$ref": "#/$defs/bytes" },
+        "workload_rss_bytes": { "$ref": "#/$defs/bytes" },
+        "overhead_bytes": { "type": ["integer", "null"] }
+      }
+    },
+    "correctness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["marker", "memory", "children", "file", "socket", "running", "notice"],
+      "properties": {
+        "marker": { "$ref": "#/$defs/check" },
+        "memory": { "$ref": "#/$defs/check" },
+        "children": { "$ref": "#/$defs/check" },
+        "file": { "$ref": "#/$defs/check" },
+        "socket": { "enum": ["open", "closed", "hung", null] },
+        "running": { "$ref": "#/$defs/check" },
+        "notice": { "type": ["string", "null"] }
+      }
+    },
+    "host": {
+      "type": "object",
+      "required": ["cpu_model", "kernel", "cores", "memory_bytes", "copy_mib_s", "runner_image"],
+      "properties": {
+        "cpu_model": { "type": "string" },
+        "kernel": { "type": "string" },
+        "cores": { "type": "integer", "minimum": 1 },
+        "memory_bytes": { "type": "integer", "minimum": 1 },
+        "copy_mib_s": { "type": "number", "minimum": 0 },
+        "runner_image": { "type": "string" }
+      }
+    },
+    "store": {
+      "type": "object",
+      "required": ["first_byte_ms", "get_one_mb_s", "put_one_mb_s", "get_eight_mb_s"],
+      "properties": {
+        "first_byte_ms": { "type": "number", "minimum": 0 },
+        "get_one_mb_s": { "type": "number", "minimum": 0 },
+        "put_one_mb_s": { "type": "number", "minimum": 0 },
+        "get_eight_mb_s": { "type": "number", "minimum": 0 }
+      }
+    },
+    "versions": {
+      "type": "object",
+      "required": ["system", "bayma", "seaweedfs", "toxiproxy"],
+      "additionalProperties": { "type": "string" }
+    },
+    "ci": {
+      "type": "object",
+      "required": ["run_id", "job", "sha"],
+      "properties": {
+        "run_id": { "type": "integer" },
+        "job": { "type": "string" },
+        "sha": { "type": "string" }
+      }
+    },
+    "at": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$" },
+    "details": { "type": "object" }
+  }
+}
