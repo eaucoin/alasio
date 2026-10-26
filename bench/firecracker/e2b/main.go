@@ -33,6 +33,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/metric/noop"
+	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block/metrics"
@@ -253,7 +254,12 @@ func serve(args []string) error {
 		}
 	}
 
-	lg := logger.NewNopLogger()
+	// E2B's own logger, at Info, into the run's log.
+	zl, err := zap.NewProduction()
+	if err != nil {
+		return err
+	}
+	lg := logger.NewTracedLogger(zl)
 	backend := uffd.New(device, *socket, lg)
 	if *withPrefetch {
 		// The orchestrator starts its prefetch before Firecracker loads the snapshot.

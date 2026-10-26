@@ -143,12 +143,18 @@ const now = (): bigint => process.hrtime.bigint();
 const ms = (from: bigint, to: bigint): number => Number(to - from) / 1e6;
 const sleep = (wait: number) => new Promise<void>((resolve) => setTimeout(resolve, wait));
 
-/** Runs a program to its end; its stdout. */
-const run = (file: string, args: readonly string[]): string => execFileSync(file, args, { encoding: "utf8", maxBuffer: 64 * 1024 ** 2 });
+/** Runs a program to its end, killed if it runs longer than `timeout` ms; its stdout. */
+const run = (file: string, args: readonly string[], timeout = 0): string => execFileSync(file, args, { encoding: "utf8", maxBuffer: 64 * 1024 ** 2, timeout, killSignal: "SIGKILL" });
+
+/**
+ * How long a driver's command may take: a restore that waits on a fault no handler answers waits
+ * for ever, and is a failure of its own rather than the job's.
+ */
+const DRIVER_TIMEOUT_MS = 600_000;
 
 /** The driver's answer to a command. */
 function driver(command: string, args: readonly string[]): Record<string, unknown> {
-  return JSON.parse(run(process.execPath, [driverPath, command, ...args])) as Record<string, unknown>;
+  return JSON.parse(run(process.execPath, [driverPath, command, ...args], DRIVER_TIMEOUT_MS)) as Record<string, unknown>;
 }
 
 const s3 = (...args: string[]): Record<string, unknown> => JSON.parse(run(process.execPath, [s3Path, ...args])) as Record<string, unknown>;
@@ -271,7 +277,7 @@ function attachDisk(path: string, token: string): void {
 const nullMetrics = {
   save_total_ms: null, unavailable_ms: null, pause_reported_ms: null, slowdown: null, precopy_passes: null, precopy_bytes: null,
   image_bytes: null, uploaded_bytes: null, first_exec_ms: null, verify_ms: null, resident_ms: null, resident_how: null,
-  memory_peak_bytes: null, memory_bytes: null, workload_rss_bytes: null, overhead_bytes: null,
+  memory_peak_bytes: null, memory_bytes: null, workload_rss_bytes: null,
 };
 const nullCorrectness = { marker: null, memory: null, children: null, file: null, socket: null, running: null, notice: null };
 
@@ -547,7 +553,6 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
     await ended(handler);
     const handlerStats = JSON.parse(readFileSync(stats, "utf8")) as Record<string, number>;
     const memoryPeak = fcPeak + hugetlbPeak + Number(handlerStats["max_rss_bytes"]);
-    const workload = Number(probe["workload_rss_bytes"]);
     return {
       ok: probe["ok"] as boolean,
       failure: (probe["failure"] as string | null) ?? null,
@@ -559,8 +564,7 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
         resident_how: "touched",
         memory_peak_bytes: memoryPeak,
         memory_bytes: memoryBytes,
-        workload_rss_bytes: workload,
-        overhead_bytes: memoryBytes - workload,
+        workload_rss_bytes: Number(probe["workload_rss_bytes"]),
       },
       correctness: probe["correctness"] as Record<string, unknown>,
       details: {
@@ -568,6 +572,11 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
         instance_memory_peak_bytes: fcPeak, instance_hugetlb_peak_bytes: hugetlbPeak, probe,
       },
     };
+  } catch (error) {
+    // What the handler was doing when the restore failed, into the run's log: a Go program
+    // prints every goroutine's stack as SIGQUIT ends it.
+    handler.kill("SIGQUIT");
+    throw error;
   } finally {
     clearInterval(sampler);
     if (fc !== null) await fc.kill();
