@@ -38,7 +38,7 @@ import { GATEWAY as STORE_GATEWAY } from "../../cli/src/manifests/object-store.t
 import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { BINDING_LABEL, FREE_LABEL, keyHash, POOL_LABEL } from "../../src/binder/names.ts";
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
-import { BAYMA_CONTAINER } from "../../src/kube/sandbox-shape.ts";
+import { BAYMA_CONTAINER, RESTORE_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
 import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
@@ -297,6 +297,19 @@ async function watchRestore(workspace: string, release: string): Promise<{ reado
   throw new Error(`no restore's pod of ${workspace} had its container within 900 s`);
 }
 
+/**
+ * Where the restore into `pod` read its image, as the directory its pod restored from holds it
+ * (src/node-agent/cache.ts prepare and prepareRemote): the image's files, linked from the node's
+ * cache; or the checkpoint gofer's options alone, the bucket, which the agent removes once the
+ * sandbox resumes, leaving the directory without the image's files.
+ */
+async function sourceOf(node: string, pod: V1Pod): Promise<"cache" | "bucket" | "unknown"> {
+  const directory = pod.metadata?.annotations?.[RESTORE_ANNOTATION] ?? "";
+  if (directory === "") return "unknown";
+  const said = (await onNode(node, `if [ -e '${directory}/pages.img' ]; then echo cache; elif [ -d '${directory}' ]; then echo bucket; else echo unknown; fi`)).trim();
+  return said === "cache" || said === "bucket" ? said : "unknown";
+}
+
 /** What the agent of `node` logged of preparing the snapshot `snapshot`: its last line of it. */
 async function preparedLine(node: string, snapshot: string): Promise<string> {
   const pod = (await nodeAgents()).get(node) ?? "";
@@ -323,6 +336,7 @@ async function restore(workspace: string, sessionId: string, fixture: string, ru
   const memory = await podMemory(node, pod.metadata?.uid ?? "");
   const logged = restoreLogged(await bootLog(node, await sandboxIdOf(node, name)));
   const prepared = await preparedLine(node, manifest.snapshot);
+  const source = await sourceOf(node, pod);
   const resident = residentNs === null ? null : msBetween(BigInt(probed.t0_ns), residentNs);
   const metrics: Metrics = {
     first_exec_ms: probed.first_exec_ms,
@@ -333,7 +347,7 @@ async function restore(workspace: string, sessionId: string, fixture: string, ru
     memory_bytes: memory.current,
     workload_rss_bytes: probed.workload_rss_bytes,
   };
-  const details = { pod: name, node, prepared, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error };
+  const details = { pod: name, node, source, prepared, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error };
   return { probed, metrics, details, pod: name };
 }
 
@@ -488,7 +502,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
 
     phase = "restore-warm";
     const warm = await restore(workspace, sessionId, fixture, runId, manifest);
-    emit(fixture, sizeMib, run, "restore-warm", { ok: warm.probed.ok && warm.details.prepared.includes(" from the cache: "), failure: warm.probed.failure ?? (warm.details.prepared.includes(" from the cache: ") ? null : `not prepared from the node's cache: ${warm.details.prepared}`) }, warm.metrics, warm.probed.correctness, warm.details);
+    emit(fixture, sizeMib, run, "restore-warm", { ok: warm.probed.ok && warm.details.source === "cache", failure: warm.probed.failure ?? (warm.details.source === "cache" ? null : `restored from the ${warm.details.source}, not the node's cache: ${warm.details.prepared}`) }, warm.metrics, warm.probed.correctness, warm.details);
     done.add(phase);
     await endUnsaved(warm.pod);
 
@@ -499,7 +513,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     await agentOk(node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: recommitted.snapshot, release: recommitted.release });
     await coldCaches(workspace);
     const cold = await restore(workspace, sessionId, fixture, runId, manifest);
-    emit(fixture, sizeMib, run, "restore-cold", { ok: cold.probed.ok && cold.details.prepared.includes(" from the bucket: "), failure: cold.probed.failure ?? (cold.details.prepared.includes(" from the bucket: ") ? null : `not prepared from the bucket: ${cold.details.prepared}`) }, cold.metrics, cold.probed.correctness, cold.details);
+    emit(fixture, sizeMib, run, "restore-cold", { ok: cold.probed.ok && cold.details.source === "bucket", failure: cold.probed.failure ?? (cold.details.source === "bucket" ? null : `restored from the ${cold.details.source}, not the bucket: ${cold.details.prepared}`) }, cold.metrics, cold.probed.correctness, cold.details);
     done.add(phase);
     await endUnsaved(cold.pod);
   } catch (error) {
