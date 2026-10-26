@@ -11,7 +11,8 @@
  *
  *   node harness.ts --profile P --work DIR --host host.json --store store.json --dist DIR
  *     --out results.jsonl [--target host] [--runs 5] [--cases 'idle/16 poller/200 ...']
- *     [--rounds converge|phaul] [--pre-dump-mode read|splice] [--variant-suffix S]
+ *     [--rounds converge|phaul] [--pre-dump-mode read|splice] [--stop full|chain]
+ *     [--variants 'lazy eager'] [--variant-suffix S]
  *
  * --dist is common's bundles (driver.mjs, s3.mjs); --cases, `<fixture>/<MiB>` words, all of
  * ../common/cases.json where empty.
@@ -75,6 +76,8 @@ const { values: options } = parseArgs({
     cases: { type: "string", default: "" },
     rounds: { type: "string", default: "converge" },
     "pre-dump-mode": { type: "string", default: "read" },
+    stop: { type: "string", default: "full" },
+    variants: { type: "string", default: "lazy eager" },
     "variant-suffix": { type: "string", default: "" },
   },
 });
@@ -96,6 +99,11 @@ const rounds = required("rounds") as Rounds;
 if (rounds !== "converge" && rounds !== "phaul") throw new Error("--rounds is converge or phaul");
 const preDumpMode = required("pre-dump-mode");
 if (preDumpMode !== "read" && preDumpMode !== "splice") throw new Error("--pre-dump-mode is read or splice");
+/** The stopping save: `full`, a dump whole; `chain`, pre-dump rounds and a dump on the live save's image (README.md). */
+const stopSave = required("stop");
+if (stopSave !== "full" && stopSave !== "chain") throw new Error("--stop is full or chain");
+const variants = required("variants").split(/\s+/u).filter(Boolean) as Variant[];
+if (variants.length === 0 || variants.some((variant) => !VARIANTS.includes(variant))) throw new Error(`--variants are of ${VARIANTS.join(" ")}`);
 const suffix = options["variant-suffix"] ? `-${options["variant-suffix"]}` : "";
 const store = storeFromEnvironment();
 /** kernel.io_uring_disabled, which run.sh sets (README.md). */
@@ -305,7 +313,7 @@ function keepLogs(run: Run, dir: string): void {
   }
 }
 
-/** Evicts every file from the page cache, as a cold restore starts (DESIGN.md section 4). */
+/** Evicts every file from the page cache, as every restore starts (DESIGN.md section 4). */
 function dropCaches(): void {
   must("sync", []);
   writeFileSync("/proc/sys/vm/drop_caches", "1\n");
@@ -459,7 +467,7 @@ function emit(run: Run, phase: string, variant: string, ok: boolean, failure: st
     versions: VERSIONS,
     ci: { run_id: Number(process.env["GITHUB_RUN_ID"] ?? 0), job: `${process.env["GITHUB_JOB"] ?? "local"} criu ${options.target} ${profile}`, sha: process.env["GITHUB_SHA"] ?? "" },
     at: new Date().toISOString(),
-    details: { rounds_policy: rounds, pre_dump_mode: preDumpMode, io_uring_disabled: ioUringDisabled, pause_check: pauseChecked, ...details },
+    details: { rounds_policy: rounds, pre_dump_mode: preDumpMode, stop_save: stopSave, io_uring_disabled: ioUringDisabled, pause_check: pauseChecked, ...details },
   };
   appendFileSync(out, `${JSON.stringify(line)}\n`);
 }
@@ -531,12 +539,13 @@ interface Saved {
 }
 
 /**
- * A save: pre-dump rounds while the instance runs, then the dump, `kind` its name, each
- * uploaded to the bucket as soon as it is written while the next is taken; then the chain's
- * manifest, `chain-<kind>.json`, which the restores read the order of the image's directories
+ * A save: with `base`, pre-dump rounds while the instance runs, on top of it, then the dump;
+ * without, the dump alone, whole. `kind` names the dump. Each directory is uploaded to the
+ * bucket as soon as it is written, while the next is taken; then the chain's manifest,
+ * `manifest-<kind>/chain.json`, which the restores read the order of the image's directories
  * from, last.
  */
-async function save(run: Run, instance: Instance, kind: "live" | "stop", base: readonly string[]): Promise<Saved> {
+async function save(run: Run, instance: Instance, kind: "live" | "stop", base: readonly string[] | null): Promise<Saved> {
   const before = await bucketBytes(run);
   const t0 = now();
   const done: Round[] = [];
@@ -547,20 +556,22 @@ async function save(run: Run, instance: Instance, kind: "live" | "stop", base: r
       failed = error;
     });
   };
-  let parent = base.at(-1) ?? null;
-  do {
-    const round = checkpoint(run, instance, `${kind}-pre${done.length + 1}`, parent, "pre-dump");
-    done.push(round);
-    put(round.name);
-    parent = round.name;
-  } while (goesOn(done));
+  let parent = base?.at(-1) ?? null;
+  if (base) {
+    do {
+      const round = checkpoint(run, instance, `${kind}-pre${done.length + 1}`, parent, "pre-dump");
+      done.push(round);
+      put(round.name);
+      parent = round.name;
+    } while (goesOn(done));
+  }
   const dump = checkpoint(run, instance, kind, parent, kind === "live" ? "leave-running" : "stop");
   put(kind);
-  const chain = [...base, ...done.map(({ name }) => name), kind];
-  const manifest = join(run.stage, `chain-${kind}`);
+  const chain = [...(base ?? []), ...done.map(({ name }) => name), kind];
+  const manifest = join(run.stage, `manifest-${kind}`);
   mkdirSync(manifest, { recursive: true });
-  writeFileSync(join(manifest, `chain-${kind}.json`), JSON.stringify({ chain }));
-  uploads = uploads.then(() => upload(store, manifest, run.prefix)).then(() => undefined, (error: unknown) => {
+  writeFileSync(join(manifest, "chain.json"), JSON.stringify({ chain }));
+  uploads = uploads.then(() => upload(store, manifest, `${run.prefix}manifest-${kind}/`)).then(() => undefined, (error: unknown) => {
     failed = error;
   });
   await uploads;
@@ -623,8 +634,8 @@ function linkParents(root: string, chain: readonly string[]): void {
   });
 }
 
-/** The order of the stopping save's directories, as its manifest in `dir` says. */
-const chainIn = (dir: string): string[] => (JSON.parse(readFileSync(join(dir, "chain-stop.json"), "utf8")) as { chain: string[] }).chain;
+/** The order of the stopping save's directories, as its manifest under `root` says. */
+const chainIn = (root: string): string[] => (JSON.parse(readFileSync(join(root, "manifest-stop", "chain.json"), "utf8")) as { chain: string[] }).chain;
 
 /** Warm: the directories the saves staged, linked to their parents as runc's checkpoints left them. */
 function staged(run: Run, chain: readonly string[]): Images {
@@ -669,15 +680,26 @@ async function mounted(run: Run, restoreDir: string): Promise<Images> {
   return { top: join(links, chain.at(-1) ?? ""), helpers: [served], release, details: { source: "mountpoint-s3", chain } };
 }
 
-/** Cold, eager: every object of the run's prefix downloaded (common's s3.mjs download), then the parents linked. */
+/**
+ * Cold, eager: the stopping save's manifest, then each directory it names, downloaded with
+ * common's s3.mjs (one process a prefix, one after another), then the parents linked.
+ */
 async function downloaded(run: Run, restoreDir: string): Promise<Images> {
   const dir = join(restoreDir, "images");
-  const download = helper("download", restoreDir, process.execPath, [s3, "download", run.prefix, dir]);
-  const { status, stdout, stderr } = await download.ended;
-  if (status !== 0) throw new Error(`the download failed: ${stderr.trim().slice(-2000)}`);
+  const downloads: Helper[] = [];
+  const said: unknown[] = [];
+  const get = async (key: string, into: string) => {
+    const download = helper(`download-${downloads.length}`, restoreDir, process.execPath, [s3, "download", `${run.prefix}${key}`, into]);
+    downloads.push(download);
+    const { status, stdout, stderr } = await download.ended;
+    if (status !== 0) throw new Error(`the download of ${key} failed: ${stderr.trim().slice(-2000)}`);
+    said.push(JSON.parse(stdout.trim()) as unknown);
+  };
+  await get("manifest-stop/", join(dir, "manifest-stop"));
   const chain = chainIn(dir);
+  for (const name of chain) await get(`${name}/`, join(dir, name));
   linkParents(dir, chain);
-  return { top: join(dir, chain.at(-1) ?? ""), helpers: [download], release: async () => {}, details: { source: "download", download: JSON.parse(stdout.trim()) as unknown, chain } };
+  return { top: join(dir, chain.at(-1) ?? ""), helpers: downloads, release: async () => {}, details: { source: "download", downloads: said, chain } };
 }
 
 /** What the probe prints, as far as a restore's row takes it. */
@@ -747,13 +769,17 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
     const peak = cgroupBytes(instance, "memory.peak");
     await images.release();
     const helperPeaks = Object.fromEntries(helpers.map(({ name, peakFile }) => [name, peakOf(peakFile)]));
+    // The downloads run one after another, so theirs is the largest of them; the rest run together.
+    const peaks = Object.entries(helperPeaks);
+    const downloadPeak = Math.max(0, ...peaks.filter(([name]) => name.startsWith("download-")).map(([, bytes]) => bytes ?? 0));
+    const helpersPeak = downloadPeak + peaks.filter(([name]) => !name.startsWith("download-")).reduce((sum, [, bytes]) => sum + (bytes ?? 0), 0);
     emit(run, phase, variant, said.ok, said.failure, {
       ...nulls(RESTORE_METRICS),
       first_exec_ms: said.first_exec_ms,
       verify_ms: said.verify_ms,
       resident_ms: msBetween(t0, resident),
       resident_how: "signal",
-      memory_peak_bytes: peak === null ? null : peak + Object.values(helperPeaks).reduce<number>((sum, bytes) => sum + (bytes ?? 0), 0),
+      memory_peak_bytes: peak === null ? null : peak + helpersPeak,
       memory_bytes: memory,
       workload_rss_bytes: said.workload_rss_bytes,
     }, said.correctness, { ...images.details, ready_ms: msBetween(t0, ready), runc_restore_ms: msBetween(ready, restored), cgroup_peak_bytes: peak, cgroup_current_bytes: current, helper_peak_bytes: helperPeaks, probe: said });
@@ -786,12 +812,13 @@ function putBack(run: Run): void {
  */
 async function runCase(c: Case, number: number): Promise<void> {
   const run = prepare(c, number);
-  const order: Variant[] = number % 2 === 1 ? ["lazy", "eager"] : ["eager", "lazy"];
-  // The saves are the same for both variants and go under the first README.md names.
-  const phases = [["save-live", "lazy"], ["save-stop", "lazy"], ...order.map((variant) => ["restore-warm", variant]), ...order.map((variant) => ["restore-cold", variant])];
+  const order = number % 2 === 1 ? variants : [...variants].reverse();
+  // The saves are the same for every variant and go under the first.
+  const first = variants[0] ?? "lazy";
+  const phases = [["save-live", first], ["save-stop", first], ...order.map((variant) => ["restore-warm", variant]), ...order.map((variant) => ["restore-cold", variant])];
   let instance: Instance | null = null;
   const failSave = (phase: string) => (error: unknown) => {
-    emit(run, phase, "lazy", false, (error as Error).message, nulls(SAVE_METRICS), UNCHECKED, {});
+    emit(run, phase, first, false, (error as Error).message, nulls(SAVE_METRICS), UNCHECKED, {});
     throw new Error(`${phase} failed`);
   };
   try {
@@ -801,10 +828,10 @@ async function runCase(c: Case, number: number): Promise<void> {
     await driven("mark", [...run.endpoint, "--session", run.session, "--fixture", run.fixture]);
     const live = await save(run, instance, "live", []).catch(failSave("save-live"));
     const gaps = await driven("gaps", [...run.endpoint, "--session", run.session, "--fixture", run.fixture]);
-    emit(run, "save-live", "lazy", true, null, { ...live.metrics, unavailable_ms: gaps["max_gap_ms"] as number, slowdown: (gaps["slowdown"] as number | null) ?? null }, UNCHECKED, { ...live.details, gaps, setup: set });
+    emit(run, "save-live", first, true, null, { ...live.metrics, unavailable_ms: gaps["max_gap_ms"] as number, slowdown: (gaps["slowdown"] as number | null) ?? null }, UNCHECKED, { ...live.details, gaps, setup: set });
     phases.shift();
-    const stop = await save(run, instance, "stop", live.chain).catch(failSave("save-stop"));
-    emit(run, "save-stop", "lazy", true, null, stop.metrics, UNCHECKED, stop.details);
+    const stop = await save(run, instance, "stop", stopSave === "chain" ? live.chain : null).catch(failSave("save-stop"));
+    emit(run, "save-stop", first, true, null, stop.metrics, UNCHECKED, stop.details);
     phases.shift();
     end(instance);
     instance = null;
@@ -814,7 +841,7 @@ async function runCase(c: Case, number: number): Promise<void> {
       // Cold: no copy of the image on the runner but the bucket's.
       if (phase === "restore-cold") rmSync(run.stage, { recursive: true, force: true });
       if (restores > 0) putBack(run);
-      if (phase === "restore-cold") dropCaches();
+      dropCaches();
       await restore(run, variant as Variant, phase === "restore-warm" ? "warm" : "cold", stop.chain, ++restores);
       phases.shift();
     }

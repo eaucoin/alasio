@@ -28,18 +28,22 @@ benchmark is DESIGN.md; this is how the `criu` system meets it, which knobs it s
    `runc checkpoint --pre-dump --image-path <stage>/live-preN --parent-path ../live-pre(N-1)`,
    then `runc checkpoint --leave-running --image-path <stage>/live --parent-path ../live-preK`.
    Each directory is uploaded to the bucket as soon as it is written, while the next round
-   runs. A manifest, `chain-live.json`, holds the directories' order and is uploaded last. t1 is
-   when it is in the bucket.
-3. **save-stop.** The same rounds, built on the live save's image, the first round's parent
-   being `../live`. Then `runc checkpoint` without `--leave-running`, which ends the container,
-   and then `chain-stop.json`. This image is what every restore restores. Right after it, untimed,
-   `/attach` is copied (`cp -a --reflink=auto`) and put back before each restore after the first.
-4. **Restores, two variants.** Odd runs restore `lazy` first, even runs `eager` first. Each
-   variant restores warm first, then cold.
+   runs. A manifest, `manifest-live/chain.json`, holds the directories' order and is uploaded
+   last. t1 is when it is in the bucket.
+3. **save-stop.** A plain `runc checkpoint --image-path <stage>/stop`: no pre-dump, no parent.
+   The whole image is written while the instance is frozen, and the dump ends the container.
+   Then `manifest-stop/chain.json`. This is the image every restore restores. It is whole
+   because CRIU restores lazily only the pages the last dump wrote itself (below), so a chain
+   would leave `lazy` nearly eager. alasio's release takes no pre-copy either. Right after it,
+   untimed, `/attach` is copied (`cp -a --reflink=auto`) and put back before each restore after
+   the first.
+4. **Restores, two variants.** Odd runs restore `lazy` first, even runs `eager` first: the warm
+   restores, then the cold ones. Every restore starts with `sync` and `drop_caches` (DESIGN.md
+   section 4). Before the cold ones the staged images are deleted.
    - `lazy`, warm: `criu lazy-pages --images-dir <stage>/stop --work-dir W`, then
      `runc restore --lazy-pages --image-path <stage>/stop --work-path W`. The two meet at
      `W/lazy-pages.socket`.
-   - `lazy`, cold: the staged images deleted, `drop_caches`. Then, from t0: the bucket mounted by
+   - `lazy`, cold: from t0, the bucket mounted by
      `mount-s3 --read-only --prefix <run>/` with Mountpoint's defaults otherwise (no cache), a
      directory of links to the mount's files (Mountpoint has no symlinks, and CRIU follows each
      image's `parent` link), then the daemon and the restore as warm. CRIU reads every image
@@ -47,9 +51,9 @@ benchmark is DESIGN.md; this is how the `criu` system meets it, which knobs it s
      needed.
    - `eager`, warm: `runc restore --image-path <stage>/stop`. CRIU loads every page before the
      tasks run.
-   - `eager`, cold: from t0, every object of the run's prefix downloaded with common's
-     `s3.mjs download` (32 MiB ranged GETs, 4 at once), the `parent` links made from
-     `chain-stop.json`, then the restore as warm.
+   - `eager`, cold: from t0, the manifest, then each directory it names, downloaded with
+     common's `s3.mjs download` (32 MiB ranged GETs, 4 at once), any `parent` links made, then
+     the restore as warm.
 
    The probe starts at t0, beside the restore. `resident_ms`: for `lazy`, when the lazy-pages
    daemon has injected every page and ends (it exits once nothing is left, `criu/uffd.c`
@@ -58,6 +62,15 @@ benchmark is DESIGN.md; this is how the `criu` system meets it, which knobs it s
    daemon and mount-s3 (`lazy`), and the download (`eager` cold).
 5. The saves are the same for both variants, so their rows go under `lazy`, the variant named
    first here. Restore rows go under each variant.
+
+### Variants beside the system (`BENCH_VARIANT`)
+
+- `all`: the system as this file configures it, rows `lazy` and `eager`.
+- `phaul`: P.Haul's rounds without the `converge` rule, rows `lazy-phaul` and `eager-phaul`.
+- `splice`: CRIU's default `pre-dump-mode splice`, rows `lazy-splice` and `eager-splice`.
+- `chain`: the stopping save as pre-dump rounds and a dump on the live save's image, restored
+  lazily, rows `lazy-chain`. This is the evidence that a pre-copied image restores almost
+  eagerly.
 
 ## Lazy restore from an object store
 
@@ -85,12 +98,30 @@ choices were:
 Both are CRIU's restore unchanged. Neither has a hot-page prefetch of the kind the Firecracker
 variant replays: CRIU has none.
 
+What CRIU restores lazily is only what the last dump wrote itself. A dump marks a page lazy
+(`PE_LAZY`) only as it writes it. A page an earlier pre-dump holds becomes a hole pointing at
+the parent (`PP_HOLE_PARENT`, `criu/mem.c` `generate_iovs`), and the restorer loads every such
+page before the tasks run (`restore_priv_vma_content`). This is CRIU's hybrid migration:
+pre-copied pages are already at the destination, and post-copy covers the rest. A restore of a
+pre-copied image is therefore nearly eager. On the first runs, the lazy-pages daemon logged
+"Found 14 pages to be handled by UFFD" for bayma's `node`. That is why the stopping save is
+whole, and why the `chain` variant is measured beside it.
+
+A defect of CRIU 4.3's lazy-pages daemon, unfixed on `criu-dev` on 2026-10-26: when its
+background transfer finds a lazy page already present (`UFFDIO_COPY` returns `EEXIST`),
+`uffd_check_op_error` counts it as recoverable with no pages done. The daemon then asks for the
+same page again, forever, and serves no other fault of that process. On the first runs it hit
+one page of `node`'s `.bss` in about half of the warm lazy restores of `idle` and `fan-out`:
+860,000 attempts in 1.8 s, then the instance died. These runs are reported as failures with that
+reason, and stock CRIU is not patched.
+
 ## Knobs
 
 | knob | value | why | source |
 |---|---|---|---|
 | pre-copy | `runc checkpoint --pre-dump` rounds, then the dump with `--parent-path` | CRIU's iterative migration: "several pre-dump iterations may reduce the amount of data dumped on dump stage and thus lead to shorter freeze time" | https://criu.org/Iterative_migration; `man runc-checkpoint` (`--pre-dump`, `--parent-path`) |
 | dirty tracking | soft-dirty (`--track-mem`), set by runc wherever `--parent-path` is given; CRIU reads it with `PAGEMAP_SCAN` where the kernel has it (6.7+) | the only tracker CRIU has | runc `libcontainer/criu_linux.go`; CRIU `Documentation/under-the-hood/memory-changes-tracking.md` |
+| stopping save | whole: `runc checkpoint`, no pre-dump, no parent | CRIU restores lazily only the pages the last dump wrote itself (above), so a whole image is the one `lazy` can serve on demand. Pre-copy stays in the live save, where unavailability is measured. **Measured the other way too**: variant `lazy-chain` | `criu/mem.c` (`generate_iovs`, `restore_priv_vma_content`) |
 | rounds | at most 8; stop after a round of at most 64 pages, or one more than 10 % larger than the round before (P.Haul's policy); **and** stop after a round less than 10 % smaller than the round before (`converge`) | P.Haul is CRIU's own live-migration driver, and its policy is CRIU's documented one. LXD's is a round cap and a goal: `migration.incremental.memory.iterations` 10, `.goal` 70 % of memory already copied, which a workload dirtying steadily never reaches. P.Haul alone keeps a workload that dirties steadily (`poller`, `saturating`) at 8 rounds of the same pages, which cost disk, bucket and save time without shrinking the final dump. `converge` ends them once they stop shrinking. **Tuned on the benchmark**: the P.Haul-only numbers are reported beside, as variants `lazy-phaul`/`eager-phaul` | https://github.com/checkpoint-restore/p.haul `phaul/iters.py`; https://documentation.ubuntu.com/lxd/en/latest/reference/instance_options/#migration-options |
 | `pre-dump-mode` | `read` (`criu.conf`) | "The 'read' mode incurs reduced frozen time and reduced memory pressure as compared to 'splice' mode": pages are read with `process_vm_readv` after the tasks thaw, instead of being spliced into pipes while frozen. CRIU's default is `splice`, and its newer under-the-hood page says the opposite. **Measured both ways**: the `splice` numbers are reported beside, as variants `lazy-splice`/`eager-splice` | `Documentation/criu.txt` `--pre-dump-mode`; `Documentation/under-the-hood/optimizing-pre-dump-algorithm.md` |
 | live dump | `--leave-running` | the save under load; the dump also resets dirty tracking (`mem.c` `task_reset_dirty_track`), so save-stop's rounds build on it | `man runc-checkpoint` |

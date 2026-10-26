@@ -7,7 +7,8 @@
 #
 # With BENCH_DIR, BENCH_RUNS, BENCH_CASES, BENCH_VARIANT and GITHUB_WORKSPACE as the workflow
 # gives them. BENCH_VARIANT `all` is the system as README.md configures it; `phaul` and `splice`
-# are the defaults of the two knobs it tunes on the benchmark, measured beside.
+# are the defaults of the two knobs it tunes on the benchmark, measured beside; `chain` restores
+# lazily a stopping save of pre-dump rounds on the live save's image, the evidence for its full one.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 target=$1
@@ -49,6 +50,7 @@ case "${BENCH_VARIANT:-all}" in
 all) knobs=() ;;
 phaul) knobs=(--rounds phaul --variant-suffix phaul) ;;
 splice) knobs=(--pre-dump-mode splice --variant-suffix splice) ;;
+chain) knobs=(--stop chain --variants lazy --variant-suffix chain) ;;
 *) echo "criu has no variant $BENCH_VARIANT" >&2; exit 1 ;;
 esac
 
