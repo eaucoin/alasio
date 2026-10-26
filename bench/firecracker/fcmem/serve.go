@@ -120,7 +120,7 @@ func serve(args []string) error {
 	// The hot set's chunks are fetched while the state file is read and Firecracker loads it.
 	if *prefetch {
 		go func() {
-			h.fetchHot(ctx)
+			h.fetchHot()
 			h.prefetchDoneNs.Store(int64(time.Since(h.start)))
 		}()
 	}
@@ -168,7 +168,7 @@ func serve(args []string) error {
 		<-stop
 		unix.Write(stopPipe[1], []byte{0})
 	}()
-	if err := h.serveLoop(ctx, pidfd, stopPipe[0]); err != nil {
+	if err := h.serveLoop(pidfd, stopPipe[0]); err != nil {
 		h.fatal(err)
 	}
 
@@ -276,7 +276,7 @@ func (h *handler) mapBlocks(regions []region) error {
 }
 
 // serveLoop answers the guest's faults until one of ends is readable.
-func (h *handler) serveLoop(ctx context.Context, ends ...int) error {
+func (h *handler) serveLoop(ends ...int) error {
 	index := h.addressIndex()
 	buf := make([]byte, 64*uffdMsgSize)
 	fds := []unix.PollFd{{Fd: int32(h.uffd), Events: unix.POLLIN}}
@@ -318,7 +318,7 @@ func (h *handler) serveLoop(ctx context.Context, ends ...int) error {
 				switch {
 				case h.state[b].CompareAndSwap(blockMissing, blockInstalling):
 					go func() {
-						if err := h.install(ctx, b); err != nil {
+						if err := h.install(b); err != nil {
 							h.fatal(err)
 						}
 					}()
@@ -360,7 +360,7 @@ func (h *handler) addressIndex() func(uint64) int {
 }
 
 // install puts block b into guest memory, once its install is claimed.
-func (h *handler) install(ctx context.Context, b int) error {
+func (h *handler) install(b int) error {
 	dst := h.addrs[b]
 	src := h.header.Blocks[b]
 	var err error
@@ -375,7 +375,7 @@ func (h *handler) install(ctx context.Context, b int) error {
 	} else {
 		var data []byte
 		var release func()
-		if data, release, err = h.cache.block(ctx, h.header.Objects[src.Object], src.Offset, b); err == nil {
+		if data, release, err = h.cache.block(h.header.Objects[src.Object], src.Offset, b); err == nil {
 			err = copyPages(h.uffd, dst, data)
 			release()
 		}
@@ -392,7 +392,7 @@ func (h *handler) install(ctx context.Context, b int) error {
 var zeroBlock = make([]byte, blockSize)
 
 // fetchHot brings the hot set's chunks into the cache, in order.
-func (h *handler) fetchHot(ctx context.Context) {
+func (h *handler) fetchHot() {
 	type job struct {
 		obj   object
 		chunk int64
@@ -414,7 +414,7 @@ func (h *handler) fetchHot(ctx context.Context) {
 	for range prefetchFetchWorkers {
 		workers.Go(func() {
 			for j := range jobs {
-				if err := h.cache.ensure(ctx, j.obj, j.chunk); err != nil {
+				if err := h.cache.ensure(j.obj, j.chunk); err != nil {
 					fmt.Fprintln(os.Stderr, "fcmem: prefetch:", err)
 				}
 			}

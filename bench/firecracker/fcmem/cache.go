@@ -15,14 +15,17 @@ package main
 // long as its orchestrator; a handler started per restore keeps that bitmap in the filesystem.
 //
 // A block is read alone, into a buffer of a pool. A chunk the cache does not hold is fetched
-// whole with one ranged GET; one asked for while it is being fetched waits for that fetch rather
-// than starting another (E2B's fetch sessions, block/streaming_chunk.go), and once fetched is
-// kept in memory until its file is written.
+// whole with one ranged GET, apart from whoever asked for it, and each of its blocks is handed
+// out as soon as its bytes are in, to whoever waits on it, rather than once the chunk is; a chunk
+// asked for while it is being fetched waits on that fetch rather than starting another (E2B's
+// fetch sessions, block/streaming_chunk.go progressiveFetch and block/fetch_session.go). Once
+// fetched, it is kept in memory until its file is written.
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -47,10 +50,34 @@ type cache struct {
 	bytesFetched         atomic.Int64
 }
 
+// fetch is a chunk being fetched: how many of its bytes are in, or why it failed.
 type fetch struct {
-	done chan struct{}
 	data []byte
+
+	mu   sync.Mutex
+	in   *sync.Cond
+	have int64
 	err  error
+}
+
+// wait returns the chunk once its first end bytes are in.
+func (f *fetch) wait(end int64) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for f.have < end && f.err == nil {
+		f.in.Wait()
+	}
+	if f.have >= end {
+		return f.data, nil
+	}
+	return nil, f.err
+}
+
+func (f *fetch) advance(have int64, err error) {
+	f.mu.Lock()
+	f.have, f.err = have, err
+	f.mu.Unlock()
+	f.in.Broadcast()
 }
 
 func newCache(dir string, s objectStore) *cache {
@@ -97,7 +124,7 @@ func (c *cache) object(ctx context.Context, key string) ([]byte, error) {
 
 // block returns guest block b, stored at off in obj, and what to call once its bytes are no
 // longer used.
-func (c *cache) block(ctx context.Context, obj object, off int64, b int) ([]byte, func(), error) {
+func (c *cache) block(obj object, off int64, b int) ([]byte, func(), error) {
 	if buf, err := c.read(c.taken(obj.Key), int64(b)*blockSize); !errors.Is(err, fs.ErrNotExist) {
 		return buf, func() { c.buffers.Put(buf) }, err
 	}
@@ -110,7 +137,7 @@ func (c *cache) block(ctx context.Context, obj object, off int64, b int) ([]byte
 	if buf, err := c.read(name, inner); !errors.Is(err, fs.ErrNotExist) {
 		return buf, func() { c.buffers.Put(buf) }, err
 	}
-	data, err := c.fetch(ctx, obj, index, name)
+	data, err := c.fetch(obj, index, name).wait(inner + blockSize)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -118,7 +145,7 @@ func (c *cache) block(ctx context.Context, obj object, off int64, b int) ([]byte
 }
 
 // ensure has the cache hold chunk index of obj, fetching it if it does not.
-func (c *cache) ensure(ctx context.Context, obj object, index int64) error {
+func (c *cache) ensure(obj object, index int64) error {
 	name := c.path(obj.Key, index)
 	if _, ok := c.held(name); ok {
 		return nil
@@ -128,7 +155,8 @@ func (c *cache) ensure(ctx context.Context, obj object, index int64) error {
 			return nil
 		}
 	}
-	_, err := c.fetch(ctx, obj, index, name)
+	f := c.fetch(obj, index, name)
+	_, err := f.wait(int64(len(f.data)))
 	return err
 }
 
@@ -160,55 +188,67 @@ func (c *cache) held(name string) ([]byte, bool) {
 	return data, ok
 }
 
-func (c *cache) fetch(ctx context.Context, obj object, index int64, name string) ([]byte, error) {
+// fetch returns the fetch of chunk index of obj, started if none is under way: one of its own,
+// which goes on whoever stops waiting on it, as other restores' faults may need it.
+func (c *cache) fetch(obj object, index int64, name string) *fetch {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if f, ok := c.fetching[name]; ok {
-		c.mu.Unlock()
-		<-f.done
-		return f.data, f.err
+		return f
 	}
-	if data, ok := c.writing[name]; ok {
-		c.mu.Unlock()
-		return data, nil
+	off := index * chunkSize
+	f := &fetch{data: c.writing[name]}
+	f.in = sync.NewCond(&f.mu)
+	if f.data != nil {
+		f.have = int64(len(f.data))
+		return f
 	}
-	f := &fetch{done: make(chan struct{})}
+	if off >= obj.Size {
+		f.err = fmt.Errorf("chunk %d past the end of %s, %d bytes", index, obj.Key, obj.Size)
+		return f
+	}
+	f.data = make([]byte, min(chunkSize, obj.Size-off))
 	c.fetching[name] = f
-	c.mu.Unlock()
-
-	f.data, f.err = c.get(ctx, obj, index)
-	c.mu.Lock()
-	delete(c.fetching, name)
-	if f.err == nil {
-		c.writing[name] = f.data
-	}
-	c.mu.Unlock()
-	close(f.done)
-	if f.err == nil {
-		// Off the fault's path: the fault is answered from the fetched bytes as the file is written.
-		go func() {
-			if err := c.put(name, f.data); err != nil {
-				fmt.Fprintln(os.Stderr, "fcmem: cache:", err)
-			}
-			c.mu.Lock()
-			delete(c.writing, name)
-			c.mu.Unlock()
-		}()
-	}
-	return f.data, f.err
+	go func() {
+		err := c.get(obj.Key, off, f)
+		c.mu.Lock()
+		delete(c.fetching, name)
+		if err == nil {
+			c.writing[name] = f.data
+		}
+		c.mu.Unlock()
+		if err != nil {
+			f.advance(f.have, err)
+			return
+		}
+		c.fromStore.Add(1)
+		c.bytesFetched.Add(int64(len(f.data)))
+		if err := c.put(name, f.data); err != nil {
+			fmt.Fprintln(os.Stderr, "fcmem: cache:", err)
+		}
+		c.mu.Lock()
+		delete(c.writing, name)
+		c.mu.Unlock()
+	}()
+	return f
 }
 
-func (c *cache) get(ctx context.Context, obj object, index int64) ([]byte, error) {
-	off := index * chunkSize
-	if off >= obj.Size {
-		return nil, fmt.Errorf("chunk %d past the end of %s, %d bytes", index, obj.Key, obj.Size)
+// get reads a chunk with one ranged GET, a block at a time, each handed out as it is in.
+func (c *cache) get(key string, off int64, f *fetch) error {
+	body, err := c.store.openRange(context.Background(), key, off, int64(len(f.data)))
+	if err != nil {
+		return err
 	}
-	data := make([]byte, min(chunkSize, obj.Size-off))
-	if err := c.store.getRange(ctx, obj.Key, off, data); err != nil {
-		return nil, err
+	defer body.Close()
+	for have := int64(0); have < int64(len(f.data)); {
+		n, err := io.ReadFull(body, f.data[have:min(have+blockSize, int64(len(f.data)))])
+		have += int64(n)
+		if err != nil {
+			return fmt.Errorf("get %s at %d: %w", key, off+have, err)
+		}
+		f.advance(have, nil)
 	}
-	c.fromStore.Add(1)
-	c.bytesFetched.Add(int64(len(data)))
-	return data, nil
+	return nil
 }
 
 // put writes a chunk into the cache.

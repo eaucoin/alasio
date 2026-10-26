@@ -30,7 +30,7 @@ const (
 // objectStore is what fcmem asks of the bucket.
 type objectStore interface {
 	get(ctx context.Context, key string) ([]byte, error)
-	getRange(ctx context.Context, key string, off int64, buf []byte) error
+	openRange(ctx context.Context, key string, off, length int64) (io.ReadCloser, error)
 	put(ctx context.Context, key string, data []byte) error
 	upload(ctx context.Context, key string, body io.Reader) error
 }
@@ -77,18 +77,14 @@ func (s *store) get(ctx context.Context, key string) ([]byte, error) {
 	return io.ReadAll(out.Body)
 }
 
-// getRange reads length bytes of key from off, into buf.
-func (s *store) getRange(ctx context.Context, key string, off int64, buf []byte) error {
-	rng := fmt.Sprintf("bytes=%d-%d", off, off+int64(len(buf))-1)
+// openRange reads length bytes of key from off.
+func (s *store) openRange(ctx context.Context, key string, off, length int64) (io.ReadCloser, error) {
+	rng := fmt.Sprintf("bytes=%d-%d", off, off+length-1)
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &key, Range: &rng})
 	if err != nil {
-		return fmt.Errorf("get %s %s: %w", key, rng, err)
+		return nil, fmt.Errorf("get %s %s: %w", key, rng, err)
 	}
-	defer out.Body.Close()
-	if _, err := io.ReadFull(out.Body, buf); err != nil {
-		return fmt.Errorf("get %s %s: %w", key, rng, err)
-	}
-	return nil
+	return out.Body, nil
 }
 
 func (s *store) put(ctx context.Context, key string, data []byte) error {

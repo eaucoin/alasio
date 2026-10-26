@@ -43,16 +43,15 @@ func (s *memoryStore) get(_ context.Context, key string) ([]byte, error) {
 	return bytes.Clone(data), nil
 }
 
-func (s *memoryStore) getRange(_ context.Context, key string, off int64, buf []byte) error {
+func (s *memoryStore) openRange(_ context.Context, key string, off, length int64) (io.ReadCloser, error) {
 	s.ranges.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	data, ok := s.objects[key]
-	if !ok || off+int64(len(buf)) > int64(len(data)) {
-		return errors.New("no range of " + key)
+	if !ok || off+length > int64(len(data)) {
+		return nil, errors.New("no range of " + key)
 	}
-	copy(buf, data[off:])
-	return nil
+	return io.NopCloser(bytes.NewReader(bytes.Clone(data[off : off+length]))), nil
 }
 
 func (s *memoryStore) put(_ context.Context, key string, data []byte) error {
@@ -160,7 +159,7 @@ func TestSaveStoresChangedBlocksAndNoZeros(t *testing.T) {
 	}
 	// The node keeps both memory files, where the guest's blocks are.
 	cache := newCache(in.cacheDir, s)
-	got, release, err := cache.block(ctx, h.Objects[1], 0, 2)
+	got, release, err := cache.block(h.Objects[1], 0, 2)
 	if err != nil || !bytes.Equal(got, a) {
 		t.Fatalf("block 2 from the node's copy of live: %v", err)
 	}
@@ -183,7 +182,7 @@ func TestCacheFetchesAChunkOnceAndKeepsIt(t *testing.T) {
 	var wait sync.WaitGroup
 	for b := range 2 {
 		wait.Go(func() {
-			got, release, err := c.block(ctx, obj, int64(b)*blockSize, b)
+			got, release, err := c.block(obj, int64(b)*blockSize, b)
 			if err != nil || !bytes.Equal(got, data[b*blockSize:(b+1)*blockSize]) {
 				t.Errorf("block %d: %v", b, err)
 			}
@@ -206,13 +205,41 @@ func TestCacheFetchesAChunkOnceAndKeepsIt(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	later := newCache(dir, s)
-	got, release, err := later.block(ctx, obj, blockSize, 1)
+	got, release, err := later.block(obj, blockSize, 1)
 	if err != nil || !bytes.Equal(got, data[blockSize:]) {
 		t.Fatalf("block 1 from the cache: %v", err)
 	}
 	release()
 	if s.ranges.Load() != 1 {
 		t.Fatalf("%d ranged GETs after the chunk was cached", s.ranges.Load())
+	}
+}
+
+// streamStore is a bucket whose ranged GETs answer what is written to them, as it is.
+type streamStore struct {
+	*memoryStore
+	body *io.PipeReader
+}
+
+func (s *streamStore) openRange(context.Context, string, int64, int64) (io.ReadCloser, error) {
+	return s.body, nil
+}
+
+func TestCacheHandsOutABlockBeforeItsChunkIsIn(t *testing.T) {
+	body, bucket := io.Pipe()
+	s := &streamStore{memoryStore: newMemoryStore(), body: body}
+	c := newCache(t.TempDir(), s)
+	obj := object{Key: "p/s/memory", Size: chunkSize}
+	first, second := randomBlock(t), randomBlock(t)
+	go bucket.Write(first)
+	got, release, err := c.block(obj, 0, 0)
+	if err != nil || !bytes.Equal(got, first) {
+		t.Fatalf("the first block, with the second not yet sent: %v", err)
+	}
+	release()
+	go bucket.Write(second)
+	if got, _, err = c.block(obj, blockSize, 1); err != nil || !bytes.Equal(got, second) {
+		t.Fatalf("the second block: %v", err)
 	}
 }
 
@@ -324,7 +351,7 @@ func TestServeInstallsEachFaultingBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The handler ends with its guest, as it does with Firecracker.
-	if err := handler.serveLoop(ctx, pidfd); err != nil {
+	if err := handler.serveLoop(pidfd); err != nil {
 		t.Fatal(err)
 	}
 	if err := guest.Wait(); err != nil {
