@@ -3,9 +3,8 @@
  * it as it starts (../main.ts), and nothing more. Its roles, the stores of Claude Code's
  * transcripts and Codex's rollouts, its state's tables, a branch's state its own, and the harness
  * host's grants and the policies that hold each pool pod to its own conversation's rows: so a
- * cut-over may have them made before alasio serves, and do what it does between, as
- * upgrades/from-9.0.0.sh fills in what the harness sessions' conversations are before any pod
- * reads by them. All of it is idempotent: alasio's own making of it, as it starts after, finds it
+ * cut-over (upgrades/) may have them made before alasio serves, and do what it does between,
+ * before any pod reads by them. All of it is idempotent: alasio's own making of it, as it starts after, finds it
  * made.
  */
 import { Effect, Layer, type Scope } from "effect";

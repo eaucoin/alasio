@@ -13,7 +13,7 @@ on:
       # The release the upgrade shard upgrades from, which an installation runs before it
       # upgrades to this: npm's latest, as the box's is, unless another is named.
       previous:
-        description: "Release the upgrade shard upgrades from, as 9.0.0 (npm's latest if empty)"
+        description: "Release the upgrade shard upgrades from, as 10.0.0 (npm's latest if empty)"
         type: string
         default: ""
 

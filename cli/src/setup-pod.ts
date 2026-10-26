@@ -1,7 +1,7 @@
 /**
  * The pod of this release's alasio that makes its state alone, `alasio setup`
  * (src/setup/main.ts), as `alasio upgrade --setup-pod` prints it, for a cut-over to run before
- * the upgrade (upgrades/from-9.0.0.sh): alasio's own container of the release's Deployment, its
+ * the upgrade (upgrades/): alasio's own container of the release's Deployment, its
  * image, its environment and its Secrets, so what it makes is what this release's alasio would
  * make as it starts, run once to its end. It is labelled as alasio's pods are, which alone may
  * reach Neon's proxy (./manifests/network-policies.ts), but by no ReplicaSet's hash, so no

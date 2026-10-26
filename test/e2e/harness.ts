@@ -548,8 +548,8 @@ export async function bindSession(volumeId: string, timeoutMs = 300_000): Promis
   let last = { status: 0, said: "" };
   for (const deadline = Date.now() + timeoutMs; ; await new Promise((resolve) => setTimeout(resolve, 2_000))) {
     last = await gatewayCall(token, "POST", "/bind");
-    // 200 and the binding from this release's gateway; 204 from 9.0.0's, which the upgrade shard seeds its sessions through.
-    const bound = last.status === 200 || last.status === 204 ? await boundPodOf(volumeId) : null;
+    // 200 and the binding.
+    const bound = last.status === 200 ? await boundPodOf(volumeId) : null;
     if (bound) return bound;
     if (Date.now() >= deadline) throw new Error(`the gateway did not bind ${volumeId} within ${timeoutMs / 1000}s: it last answered ${last.status} ${last.said}`);
   }
@@ -681,7 +681,7 @@ async function push(pushHost: string, name: keyof typeof IMAGES, args: readonly 
  * previous release, its own images, which its package pins, but for alasio's, the stand-in
  * built on it, and the settings it has, as its alasio init writes them. A setting the
  * previous release does not have is given to this checkout's alone, as that release refuses
- * a configuration with a setting it does not know: 9.0.0 has every setting this checkout
+ * a configuration with a setting it does not know: 10.0.0 has every setting this checkout
  * has, so far.
  */
 function installation(of: "previous" | "release"): Record<string, unknown> {
@@ -957,9 +957,7 @@ const shellWord = (word: string): string => `'${word.replaceAll("'", `'\\''`)}'`
  * the configuration first (./release-config.ts), as this checkout's command line, of no
  * release, pins no images of its own, and its UPGRADE_CHECK this checkout's
  * `alasio upgrade --check` as this user, on a copy of the configuration laid over so, as the
- * configuration itself is laid over only as UPGRADE runs, its SETUP_POD this checkout's
- * `alasio upgrade --setup-pod`, on another such copy, its SETUP_JOB this checkout's
- * `alasio upgrade --setup-job`, on that copy too, and sudo asking this user for no
+ * configuration itself is laid over only as UPGRADE runs, and sudo asking this user for no
  * password; failing at `failAt`, a point the script names, when given. What it came to; from
  * its success on, the run runs this checkout's `alasio`.
  */
@@ -986,24 +984,14 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
     command(...owner(copy), release, "upgrade", "--check"),
     command("sudo", "-u", user, "sudo", "-n", "true"),
   ].join(" && ");
-  // The release's setup pod, printed of a copy of the configuration laid over so too, as it is printed before anything changes.
-  const setupCopy = join(work, "setup-config");
-  const setupPod = [
-    command(...owner(configHome), "rm", "-rf", setupCopy),
-    command(...owner(configHome), "cp", "-a", configHome, setupCopy),
-    configured(setupCopy),
-    command(...owner(setupCopy), release, "upgrade", "--setup-pod"),
-  ].join(" && ");
-  // And its stack setup's pod, printed of that copy, as SETUP_POD's has laid it over.
-  const setupJob = command(...owner(setupCopy), release, "upgrade", "--setup-job");
   const out = cutOverRecord();
   console.error(`# the cut-over from ${PREVIOUS}: upgrades/from-${PREVIOUS}.sh, recording in ${out}`);
-  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `OUT=${out}`, `CONFIG=${join(configHome, "alasio", "config.json")}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, `SETUP_POD=${setupPod}`, `SETUP_JOB=${setupJob}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
+  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `OUT=${out}`, `CONFIG=${join(configHome, "alasio", "config.json")}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
     stdio: ["ignore", "pipe", "pipe"],
   }));
   if (ran.code === 0) current().bin = release;
-  // What the upgrade, its check and the release's stack setup said, which the cut-over keeps in its record alone: a failure of theirs says only where to look.
-  for (const name of ["upgrade-check.log", "alasio-stack-setup.log", "upgrade.log"]) {
+  // What the upgrade and its check said, which the cut-over keeps in its record alone: a failure of theirs says only where to look.
+  for (const name of ["upgrade-check.log", "upgrade.log"]) {
     const kept = await inCutOverRecord(`if [ -f ${name} ]; then tail -n 80 ${name}; else echo "(none)"; fi`).catch((error: unknown) => `could not be read: ${String(error)}`);
     console.error(`# the cut-over's ${name}, its last lines:\n${kept.trimEnd()}`);
   }

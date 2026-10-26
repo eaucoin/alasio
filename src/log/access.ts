@@ -13,7 +13,7 @@
  *   intake's replicas may be raised, but one read in its records' order by key (an
  *   environment's Telegram updates, each chat's in order) only while the group that reads it
  *   has no member and none left to read: while its alasio is stopped, as an upgrade's
- *   cut-over stops it (upgrades/from-9.0.0.sh). A partition added before its group has read
+ *   cut-over stops it (upgrades/). A partition added before its group has read
  *   all moves a key's later records ahead of its earlier ones; one added while a member
  *   reads does too, as a producer writes by the partitions it last knew until its metadata
  *   catches up, putting a key's records on two partitions that member reads at once. Until
@@ -62,7 +62,7 @@
  *                                 principal's credential with one of a random secret
  *
  * and a cut-over runs it there to ask how many partitions a topic has, as it waits for its
- * Telegram topic to be given more (upgrades/from-9.0.0.sh):
+ * Telegram topic to be given more (upgrades/):
  *
  *   node access.ts partitions <topic>   prints the topic's partitions, 0 where there is none
  */
