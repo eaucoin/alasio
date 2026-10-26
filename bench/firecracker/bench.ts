@@ -11,9 +11,9 @@
  * - restore-warm and restore-cold of what save-stop wrote, once with the handler prefetching the
  *   hot set (`prefetch`) and once without (`no-prefetch`): `fcmem serve` takes the guest's
  *   faults, a new Firecracker loads the state file with its memory behind the handler, and the
- *   driver's probe times the first exec and the verify. Warm restores read the node's cache,
- *   which holds the memory files the saves wrote; a cold restore starts with the cache removed
- *   and the page cache dropped.
+ *   driver's probe times the first exec and the verify. Every restore starts with the page
+ *   cache dropped; a warm one reads the node's cache, which holds the memory files the saves
+ *   wrote, a cold one starts with the cache removed.
  *
  * Both variants' restores are of the one save, whose lines the first variant reports. With
  * --small-pages, each case also runs on 4 KiB pages, Firecracker's default, its restores
@@ -25,7 +25,7 @@
  */
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, createWriteStream, mkdirSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { connect } from "node:net";
 import { join, resolve } from "node:path";
@@ -177,13 +177,18 @@ function removeCgroup(path: string): void {
 }
 const counter = (cgroupPath: string, file: string): number => Number(readFileSync(join(cgroupPath, file), "utf8").trim().split(/\s+/u).at(-1));
 
-/** A process started in `cgroupPath`, its output into `log`. */
-function startIn(cgroupPath: string, log: string, file: string, args: readonly string[]): ChildProcess {
-  const child = spawn("sh", ["-c", `echo $$ > ${cgroupPath}/cgroup.procs && exec "$0" "$@"`, file, ...args], { stdio: ["ignore", "pipe", "pipe"] });
-  const out = createWriteStream(log, { flags: "a" });
-  child.stdout?.pipe(out);
-  child.stderr?.pipe(out);
-  return child;
+/**
+ * A process started in `cgroupPath`, its stderr, and its stdout unless `readStdout`, written to
+ * `log` itself: the harness waits on the driver synchronously, so nothing it would read from a
+ * pipe meanwhile is read, and a process whose pipe filled would stop.
+ */
+function startIn(cgroupPath: string, log: string, file: string, args: readonly string[], readStdout = false): ChildProcess {
+  const out = openSync(log, "a");
+  try {
+    return spawn("sh", ["-c", `echo $$ > ${cgroupPath}/cgroup.procs && exec "$0" "$@"`, file, ...args], { stdio: ["ignore", readStdout ? "pipe" : out, out] });
+  } finally {
+    closeSync(out);
+  }
 }
 
 const ended = (child: ChildProcess): Promise<void> =>
@@ -498,9 +503,11 @@ interface RestoreOptions {
 async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase">> {
   copySparse(o.attachSaved, o.attach);
   if (o.cold) rmSync(o.cache, { recursive: true, force: true });
-  // Nothing written before is still being written back as the restore runs.
+  // Every restore starts with nothing being written back and nothing in the page cache, so a
+  // warm one reads the node's copy from its disk, as alasio's reads its node cache with O_DIRECT,
+  // whatever ran before it.
   run("sync", []);
-  if (o.cold) writeFileSync("/proc/sys/vm/drop_caches", "1");
+  writeFileSync("/proc/sys/vm/drop_caches", "1");
   const socket = join(work, "uffd.sock");
   const state = join(work, "restore.state");
   const stats = join(work, "uffd.stats.json");
@@ -509,7 +516,8 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
   const { handler: kind, prefetch } = o.restorer;
   const serve = ["serve", "--socket", socket, "--prefix", o.prefix, "--snapshot", "stop", "--state-out", state, "--stats", stats, ...(prefetch ? ["--prefetch"] : [])];
   const startHandler = (args: readonly string[]): { readonly process: ChildProcess; readonly ready: Promise<void> } => {
-    const child = startIn(handlerGroup, o.log, join(work, kind === "fcmem" ? "fcmem" : "e2b-serve"), args);
+    // Its stdout says only that it is ready; it logs to its stderr.
+    const child = startIn(handlerGroup, o.log, join(work, kind === "fcmem" ? "fcmem" : "e2b-serve"), args, true);
     const ready = new Promise<void>((resolve, reject) => {
       let said = "";
       child.stdout?.on("data", (part: Buffer) => {

@@ -39,9 +39,10 @@ DESIGN.md section 5, on a GitHub-hosted ubuntu-24.04 runner with `/dev/kvm`:
    and each restore gets a fresh copy at the same path.
 4. restore-warm and restore-cold of save-stop's snapshot, once per variant. `fcmem serve` starts
    at t0, reads the header and state file, and listens. A new Firecracker process loads the state
-   file with `mem_backend: Uffd` and `resume_vm: true`. Then the driver's probe runs. Cold: the
-   node's cache removed, `sync`, `echo 1 > /proc/sys/vm/drop_caches`. Warm: the cache as the
-   saves left it.
+   file with `mem_backend: Uffd` and `resume_vm: true`. Then the driver's probe runs. Every
+   restore starts after `sync` and `echo 1 > /proc/sys/vm/drop_caches`, so a warm one reads the
+   node's copy from its disk (as alasio reads its node cache with O_DIRECT), whatever ran
+   before it. Cold: the node's cache is removed first. Warm: the cache as the saves left it.
 
 The variants' restores alternate in order by run. Each restore runs alone on the runner.
 
@@ -107,7 +108,10 @@ the same snapshot through E2B's header (`e2b-serve export` writes it, objects co
 layout) and E2B's S3 chunker. fcmem runs on the same Firecracker beside it. E2B's cache lives as
 long as its process (an orchestrator that keeps the snapshots it took). So for a warm restore
 E2B's handler is started and has read every block before t0; for a cold one it starts at t0, as
-fcmem always does. E2B's prefetch is also fetch-only for this source.
+fcmem always does. Its cache is a memory-mapped file, whose pages the page cache drop before t0
+does not take while they are mapped, so its warm restores read from memory where fcmem's read
+from disk; its RSS (`details.handler.max_rss_bytes`, about 1.6 GB for poller/1024) counts those
+pages. E2B's prefetch is also fetch-only for this source.
 
 ## What is measured, and how
 
