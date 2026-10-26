@@ -28,6 +28,11 @@ container=$(docker create "$IMAGE")
 docker export "$container" | sudo tar --extract --numeric-owner --directory "$work/rootfs"
 docker rm "$container" >/dev/null
 
+# No io_uring on the runner (kernel.io_uring_disabled, Linux 6.6+): CRIU dumps no io_uring
+# instance, and Node's libuv sets one up for every event loop, which it does without where the
+# kernel refuses it, as gVisor's does by default (README.md).
+sudo sysctl --write kernel.io_uring_disabled=2
+
 # The instances' network: a namespace runc is given, which CRIU leaves to it as external, and a
 # veth to the runner, as runc's checkpoint tests and Podman give a container one.
 sudo ip netns add criu-bench

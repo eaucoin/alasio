@@ -103,6 +103,7 @@ variant replays: CRIU has none.
 | `--auto-dedup` | off (default) | it punches superseded pages out of the parent images on the staging disk only: the bucket's objects and the restores' reads stay the same | `Documentation/criu.txt` `--auto-dedup` |
 | log level | runc's: `-v4` for every request runc makes (fixed in `criu_linux.go`) | runc's own setting, which its users get | runc `criu_linux.go` (`LogLevel: 4`) |
 | cgroups | `--manage-cgroups-mode soft` (runc's default) | the restored tasks go into the new container's cgroup | `man runc-checkpoint` |
+| io_uring | off on the runner: `sysctl kernel.io_uring_disabled=2` (`run.sh`) | CRIU 4.3 cannot dump an io_uring instance (`criu/proc_parse.c`: "Unknown shit 600 (anon_inode:[io_uring])", the first run's pre-dump of bayma's `node`). Node's libuv sets one up for every event loop to batch `epoll_ctl`, whatever `UV_USE_IO_URING` says (that variable governs only its SQPOLL ring), and falls back to plain `epoll_ctl` where the kernel refuses. gVisor offers no io_uring by default either (`runsc --iouring`, off), so bayma runs the same way under alasio and gvisor | libuv `src/unix/linux.c` (`uv__use_io_uring`, `uv__platform_loop_init`); Linux `Documentation/admin-guide/sysctl/kernel.rst` `io_uring_disabled` |
 
 Not wired: bayma's save/restore hook. CRIU's documented hooks (`--action-script` `pre-dump`,
 `post-resume`) run on the host, not in the sandbox, and bayma's `sandbox-hook` reads gVisor's
