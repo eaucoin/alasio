@@ -164,6 +164,8 @@ export const HARNESS_RELEASE_AFTER_SECONDS = 45;
 
 /** How long a session of the snapshots and upgrade shards runs no exec, and no turn, before alasio releases it. */
 export const RELEASE_AFTER_SECONDS = 60;
+/** How often a session of the snapshots shard whose execs run is saved live as they run. */
+export const LIVE_EVERY_SECONDS = 30;
 /** How much a REPL of the snapshots shard holds live, whose snapshots it times. */
 export const BIG_REPL_MEBIBYTES = 1024;
 
@@ -732,7 +734,11 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       // Never released within the run but in the snapshots, upgrade and wake shards: the other suites
       // reach sessions by exec in their pods, which is no exec of bayma's, and a release would end
       // their pods under them.
-      snapshots: { releaseAfter: SHARD === "snapshots" || SHARD === "upgrade" || SHARD === "wake" ? `${RELEASE_AFTER_SECONDS}s` : "24h" },
+      snapshots: {
+        releaseAfter: SHARD === "snapshots" || SHARD === "upgrade" || SHARD === "wake" ? `${RELEASE_AFTER_SECONDS}s` : "24h",
+        // Saved live in the snapshots shard within its test of it, as an exec runs on.
+        ...(SHARD === "snapshots" ? { liveEvery: `${LIVE_EVERY_SECONDS}s` } : {}),
+      },
       // On one agent, but in the snapshots shard, where a session runs on any node, as it may be restored on another than it was saved on.
       ...(SHARD === "snapshots" ? {} : on("agent-0")),
     },

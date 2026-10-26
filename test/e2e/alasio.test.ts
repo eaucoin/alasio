@@ -91,6 +91,7 @@ import {
   ref,
   restartNodeContainer,
   RELEASE_AFTER_SECONDS,
+  LIVE_EVERY_SECONDS,
   runCronJob,
   SESSIONS,
   setUp,
@@ -1608,9 +1609,10 @@ if (inShard("sessions")) {
   });
 }
 
-/** A REPL of a session's bayma, reached as alasio reaches it (./session-repl.ts): a new one holding `value`, and what one holds. */
+/** A REPL of a session's bayma, reached as alasio reaches it (./session-repl.ts): a new one holding `value`, or one whose exec runs until there is a file at `path`, and what one holds. */
 const repl = {
   set: (volumeId: string, value: string) => inAlasio<ReplSet>("./session-repl.ts", "set", volumeId, value),
+  hold: (volumeId: string, path: string) => inAlasio<ReplSet>("./session-repl.ts", "hold", volumeId, path),
   read: (volumeId: string, sessionId: string) => inAlasio<ReplSeen>("./session-repl.ts", "read", volumeId, sessionId),
   fill: (volumeId: string, mebibytes: number) => inAlasio<ReplFilled>("./session-repl.ts", "fill", volumeId, String(mebibytes)),
   sum: (volumeId: string, sessionId: string) => inAlasio<ReplSummed>("./session-repl.ts", "sum", volumeId, sessionId),
@@ -2087,6 +2089,32 @@ if (inShard("snapshots")) {
       await turn("hello from the fork");
       const seen = await repl.read(fork, forked);
       assert.deepEqual([seen.live, seen.checkpointed], [`forked from ${source}`, `forked from ${source}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+    });
+
+    test("a session saved live as its exec runs is released as a delta of the image saved live, and comes back whole from the two", async (t) => {
+      const held = await newSession("none");
+      const went = "/workspace/saved-live";
+      const { sessionId: kept } = await repl.hold(held, went);
+      // Saved live once its exec has run for liveEvery, as the gateway looks at its bound pods every few seconds, then its save.
+      const live = await until(`a snapshot of ${held} taken live`, async () => {
+        const snapshot = await snapshotOf(held);
+        return snapshot?.live === undefined ? undefined : snapshot;
+      }, (LIVE_EVERY_SECONDS + 15) * 1000 + 180_000).catch(async (error: unknown) => {
+        console.error(`# what the sandbox service logged of ${held}:\n${await serviceLogs(held)}`);
+        throw error;
+      });
+      assert.ok(live.live?.running.some(({ sessionId }) => sessionId === kept), `the live save of ${held} caught no exec of ${kept} running: ${JSON.stringify(live.live)}`);
+      t.diagnostic(`saved live as ${live.snapshot}: ${live.bytes} bytes, its sandbox paused ${live.pauseMs} ms`);
+      // Its exec ends, and the session, idle, is released: into a delta of the image saved live.
+      await inSession(held, `require("fs").writeFileSync(${JSON.stringify(went)}, "")`);
+      await untilReleased(held, Date.now());
+      const released = await snapshotOf(held);
+      assert.ok(released && released.live === undefined, `the session ${held} was released into no snapshot of its own: ${JSON.stringify(released)}`);
+      assert.deepEqual(released.layers.slice(1).map(({ digest }) => digest), live.layers.map(({ digest }) => digest), `${released.snapshot} is no delta of ${live.snapshot}`);
+      t.diagnostic(`released into ${released.snapshot}: ${released.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0)} bytes of its own over the ${live.bytes} saved live`);
+      const seen = await repl.read(held, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [`held until ${went}`, `held until ${went}`]);
       assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
     });
 
