@@ -15,14 +15,17 @@
  *   cache, which the saves filled; a cold restore starts with the cache removed and the page
  *   cache dropped.
  *
- * Both variants' restores are of the one save, whose two lines each variant reports.
+ * Both variants' restores are of the one save, whose two lines each variant reports. With
+ * --small-pages, each case also runs on 4 KiB pages, Firecracker's default, its restores
+ * prefetching (`4k`).
  *
  *   node bench.ts --work <dir> --profile <p> --out <results.jsonl> --logs <dir> --host <host.json>
  *     --store <store.json> --driver <driver.mjs> --s3 <s3.ts> [--cases 'poller/256 idle/16'] [--runs 5]
+ *     [--small-pages]
  */
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, copyFileSync, createWriteStream, mkdirSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, createWriteStream, mkdirSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { connect } from "node:net";
 import { join, resolve } from "node:path";
@@ -40,6 +43,7 @@ const { values: options } = parseArgs({
     s3: { type: "string" },
     cases: { type: "string", default: "" },
     runs: { type: "string", default: "5" },
+    "small-pages": { type: "boolean", default: false },
   },
 });
 const option = (name: keyof typeof options): string => {
@@ -69,8 +73,21 @@ const CASES: readonly Case[] = [
 ];
 const cases = options.cases?.trim() ? CASES.filter(({ fixture, sizeMib }) => options.cases?.split(/[\s,]+/u).includes(`${fixture}/${sizeMib}`)) : CASES;
 
-const VARIANTS = ["prefetch", "no-prefetch"] as const;
+/**
+ * The variants: on 2 MiB hugetlbfs pages, the restore with and without the hot set prefetched;
+ * and, with --small-pages, the restore with it prefetched on Firecracker's default page size,
+ * 4 KiB, as a run of its own, whose guest is booted so.
+ */
+const VARIANTS = ["prefetch", "no-prefetch", "4k"] as const;
 type Variant = (typeof VARIANTS)[number];
+interface Pages {
+  readonly hugePages: "2M" | "None";
+  readonly variants: readonly Variant[];
+}
+const PAGES: readonly Pages[] = [
+  { hugePages: "2M", variants: ["prefetch", "no-prefetch"] },
+  ...(options["small-pages"] ? [{ hugePages: "None" as const, variants: ["4k" as const] }] : []),
+];
 const PHASES = ["save-live", "save-stop", "restore-warm", "restore-cold"] as const;
 type Phase = (typeof PHASES)[number];
 
@@ -81,7 +98,7 @@ const BOOT_ARGS = [
   "root=/dev/vda", "ro", "init=/sbin/bench-init", `ip=${GUEST}::172.16.0.1:255.255.255.252::eth0:off`,
 ].join(" ");
 const MEMORY_MIB = 5120;
-const ATTACH_BYTES = 4 * 1024 ** 3;
+const ATTACH_BYTES = 2 * 1024 ** 3;
 const CGROUP = "/sys/fs/cgroup/bench";
 
 const now = (): bigint => process.hrtime.bigint();
@@ -258,8 +275,8 @@ function write(theCase: Case, runIndex: number, line: Line): void {
 }
 
 /** One run of a case: its lines, written as each phase ends. */
-async function runCase(theCase: Case, runIndex: number, checkPause: boolean): Promise<void> {
-  const name = `${theCase.fixture}-${theCase.sizeMib}-${runIndex}`;
+async function runCase(theCase: Case, runIndex: number, { hugePages, variants }: Pages, checkPause: boolean): Promise<void> {
+  const name = `${theCase.fixture}-${theCase.sizeMib}-${runIndex}${hugePages === "2M" ? "" : "-4k"}`;
   const log = join(logs, `${name}.log`);
   const prefix = `firecracker/${process.env["GITHUB_RUN_ID"] ?? "local"}/${name}`;
   const cache = join(work, "cache");
@@ -283,7 +300,7 @@ async function runCase(theCase: Case, runIndex: number, checkPause: boolean): Pr
     await fc.api("PUT", "/drives/rootfs", { drive_id: "rootfs", path_on_host: join(work, "rootfs.ext4"), is_root_device: true, is_read_only: true });
     await fc.api("PUT", "/drives/attach", { drive_id: "attach", path_on_host: attach, is_root_device: false, is_read_only: false });
     await fc.api("PUT", "/network-interfaces/eth0", { iface_id: "eth0", host_dev_name: "tap0", guest_mac: "06:00:ac:10:00:02" });
-    await fc.api("PUT", "/machine-config", { vcpu_count: 2, mem_size_mib: MEMORY_MIB, huge_pages: "2M" });
+    await fc.api("PUT", "/machine-config", { vcpu_count: 2, mem_size_mib: MEMORY_MIB, huge_pages: hugePages });
     const booted = now();
     await fc.api("PUT", "/actions", { action_type: "InstanceStart" });
     await listening(8765, 120_000);
@@ -321,7 +338,7 @@ async function runCase(theCase: Case, runIndex: number, checkPause: boolean): Pr
     const liveSaved = fcmemSave("live", prefix, live, null, snapshots, cache);
     let t1 = now();
     const gaps = driver("gaps", [...endpoint, ...fixtureArgs]);
-    say(VARIANTS, {
+    say(variants, {
       phase: "save-live",
       ok: true,
       failure: null,
@@ -345,7 +362,7 @@ async function runCase(theCase: Case, runIndex: number, checkPause: boolean): Pr
     fc = null;
     const stopSaved = fcmemSave("stop", prefix, stop, "live", snapshots, cache);
     t1 = now();
-    say(VARIANTS, {
+    say(variants, {
       phase: "save-stop",
       ok: true,
       failure: null,
@@ -359,14 +376,14 @@ async function runCase(theCase: Case, runIndex: number, checkPause: boolean): Pr
     rmSync(stop.state);
     rmSync(live.state);
     // The workspace as the instance left it, which each restore is given anew (DESIGN.md section 5).
-    copyFileSync(attach, attachSaved);
+    copySparse(attach, attachSaved);
 
     // The variants in turn, the first of them alternating by run, so neither always goes first.
-    const order = runIndex % 2 === 1 ? VARIANTS : [...VARIANTS].reverse();
+    const order = runIndex % 2 === 1 ? variants : [...variants].reverse();
     for (const phase of ["restore-warm", "restore-cold"] as const) {
       for (const variant of order) {
         try {
-          const restored = await restore({ name: `${name}-${phase}-${variant}`, log, prefix, cache, attach, attachSaved, endpoint, session, theCase, runId: name, cold: phase === "restore-cold", prefetch: variant === "prefetch" });
+          const restored = await restore({ name: `${name}-${phase}-${variant}`, log, prefix, cache, attach, attachSaved, endpoint, session, theCase, runId: name, cold: phase === "restore-cold", prefetch: variant !== "no-prefetch" });
           write(theCase, runIndex, { variant, phase, ...restored });
         } catch (error) {
           write(theCase, runIndex, { variant, phase, ok: false, failure: String(error instanceof Error ? error.message : error) });
@@ -377,7 +394,7 @@ async function runCase(theCase: Case, runIndex: number, checkPause: boolean): Pr
   } catch (error) {
     if (error instanceof PauseCheckFailed) throw error;
     const failure = String(error instanceof Error ? error.message : error);
-    for (const phase of PHASES) if (!done.has(phase)) say(VARIANTS, { phase, ok: false, failure: `${phase} not reached: ${failure}` });
+    for (const phase of PHASES) if (!done.has(phase)) say(variants, { phase, ok: false, failure: `${phase} not reached: ${failure}` });
   } finally {
     if (fc !== null) await fc.kill();
     s3("delete", `${prefix}/`);
@@ -393,6 +410,9 @@ function fcmemSave(id: string, prefix: string, files: { readonly mem: string; re
   const args = ["save", "--mem", files.mem, "--state", files.state, "--prefix", prefix, "--snapshot", id, "--work", snapshots, "--cache", cache, ...(parent === null ? [] : ["--parent", parent])];
   return JSON.parse(run(join(work, "fcmem"), args)) as Record<string, unknown>;
 }
+
+/** Copies a disk image, its holes kept holes. */
+const copySparse = (from: string, to: string): void => void run("cp", ["--sparse=always", from, to]);
 
 const bucketBytes = (prefix: string): number => Number(s3("bytes", prefix)["bytes"]);
 
@@ -415,12 +435,11 @@ interface RestoreOptions {
 }
 
 async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase">> {
-  copyFileSync(o.attachSaved, o.attach);
-  if (o.cold) {
-    rmSync(o.cache, { recursive: true, force: true });
-    run("sync", []);
-    writeFileSync("/proc/sys/vm/drop_caches", "1");
-  }
+  copySparse(o.attachSaved, o.attach);
+  if (o.cold) rmSync(o.cache, { recursive: true, force: true });
+  // Nothing written before is still being written back as the restore runs.
+  run("sync", []);
+  if (o.cold) writeFileSync("/proc/sys/vm/drop_caches", "1");
   const socket = join(work, "uffd.sock");
   const state = join(work, "restore.state");
   const stats = join(work, "uffd.stats.json");
@@ -440,19 +459,21 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
     handler.once("exit", (code) => reject(new Error(`the handler ended before it was ready: ${code}`)));
   });
   let fc: Firecracker | null = null;
+  // The guest's hugetlbfs pages, charged to the cgroup of the process that faults them in: the
+  // handler's, for what it installs, and the instance's, for what Firecracker touches itself.
+  const hugetlb = (): number => counter(handlerGroup, "hugetlb.2MB.current") + (fc === null ? 0 : counter(fc.cgroup, "hugetlb.2MB.current"));
   let hugetlbPeak = 0;
-  const sampler = setInterval(() => {
-    if (fc !== null) hugetlbPeak = Math.max(hugetlbPeak, counter(fc.cgroup, "hugetlb.2MB.current"));
-  }, 20);
+  const sampler = setInterval(() => (hugetlbPeak = Math.max(hugetlbPeak, hugetlb())), 20);
   try {
     [fc] = await Promise.all([Firecracker.start(o.name, o.log), ready]);
     const handlerReady = now();
     await fc.api("PUT", "/snapshot/load", { snapshot_path: state, mem_backend: { backend_type: "Uffd", backend_path: socket }, resume_vm: true });
     const loaded = now();
     const probe = driver("probe", [...o.endpoint, "--session", o.session, "--fixture", o.theCase.fixture, "--run-id", o.runId, "--t0-ns", String(t0)]);
-    hugetlbPeak = Math.max(hugetlbPeak, counter(fc.cgroup, "hugetlb.2MB.current"));
+    const guest = hugetlb();
+    hugetlbPeak = Math.max(hugetlbPeak, guest);
     const handlerRss = Number(/VmRSS:\s+(\d+)/u.exec(readFileSync(`/proc/${handler.pid}/status`, "utf8"))?.[1] ?? 0) * 1024;
-    const memoryBytes = counter(fc.cgroup, "memory.current") + counter(fc.cgroup, "hugetlb.2MB.current") + handlerRss;
+    const memoryBytes = counter(fc.cgroup, "memory.current") + guest + handlerRss;
     const fcPeak = counter(fc.cgroup, "memory.peak");
     await fc.kill();
     fc = null;
@@ -493,6 +514,6 @@ mkdirSync(logs, { recursive: true });
 for (let runIndex = 1; runIndex <= runs; runIndex++) {
   for (const [index, theCase] of cases.entries()) {
     console.log(`run ${runIndex} of ${theCase.fixture}/${theCase.sizeMib}`);
-    await runCase(theCase, runIndex, runIndex === 1 && index === 0);
+    for (const [each, pages] of PAGES.entries()) await runCase(theCase, runIndex, pages, runIndex === 1 && index === 0 && each === 0);
   }
 }

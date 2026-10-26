@@ -389,9 +389,10 @@ func (h *handler) install(ctx context.Context, b int) error {
 		}
 	} else {
 		var data []byte
-		data, err = h.blockData(ctx, src)
-		if err == nil {
+		var release func()
+		if data, release, err = h.chunks.block(ctx, h.header.Objects[src.Object], src.Offset); err == nil {
 			err = copyPages(h.uffd, dst, data)
+			release()
 		}
 	}
 	if err != nil {
@@ -403,19 +404,6 @@ func (h *handler) install(ctx context.Context, b int) error {
 }
 
 var zeroBlock = make([]byte, blockSize)
-
-func (h *handler) blockData(ctx context.Context, src block) ([]byte, error) {
-	obj := h.header.Objects[src.Object]
-	data, err := h.chunks.get(ctx, obj, src.Offset/chunkSize)
-	if err != nil {
-		return nil, err
-	}
-	inner := src.Offset % chunkSize
-	if inner+blockSize > int64(len(data)) {
-		return nil, fmt.Errorf("block at %d of %s past its chunk", src.Offset, obj.Key)
-	}
-	return data[inner : inner+blockSize], nil
-}
 
 // fetchHot fetches the hot set's chunks in order, and hands each hot block on to be installed.
 func (h *handler) fetchHot(ctx context.Context, fetched chan<- int) {
@@ -450,9 +438,9 @@ func (h *handler) fetchHot(ctx context.Context, fetched chan<- int) {
 		go func() {
 			defer workers.Done()
 			for j := range jobs {
-				// The chunk is read here; the installs take it from the chunks as a fault
-				// would, where it is kept.
-				if _, err := h.chunks.get(ctx, j.obj, j.chunk); err != nil {
+				// The chunk is brought into the cache here; the installs read their blocks
+				// from it as a fault would.
+				if err := h.chunks.ensure(ctx, j.obj, j.chunk); err != nil {
 					fmt.Fprintln(os.Stderr, "fcmem: prefetch:", err)
 					continue
 				}

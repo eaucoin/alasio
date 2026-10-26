@@ -69,10 +69,13 @@ echo "+memory +hugetlb" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/n
 sudo mkdir -p /sys/fs/cgroup/bench
 echo "+memory +hugetlb" | sudo tee /sys/fs/cgroup/bench/cgroup.subtree_control >/dev/null
 
+# Firecracker's default page size beside the 2 MiB pages, in one profile's job, the store's own.
+small_pages=()
+[ "$profile" != local ] || small_pages=(--small-pages)
 set -a
 . "$BENCH_DIR/store/store.env"
 set +a
 sudo --preserve-env "$(command -v node)" "$here/bench.ts" \
   --work "$work" --profile "$profile" --out "$BENCH_DIR/results.jsonl" --logs "$BENCH_DIR/logs" \
   --host "$BENCH_DIR/host.json" --store "$BENCH_DIR/store.json" --driver "$here/../common/dist/driver.mjs" \
-  --s3 "$here/../common/store/s3.ts" --cases "${BENCH_CASES:-}" --runs "${BENCH_RUNS:-5}"
+  --s3 "$here/../common/store/s3.ts" --cases "${BENCH_CASES:-}" --runs "${BENCH_RUNS:-5}" "${small_pages[@]}"
