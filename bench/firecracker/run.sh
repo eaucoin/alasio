@@ -18,6 +18,8 @@ FIRECRACKER_SHA256=06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade
 # (vmlinux-6.1.158 there), at its latest build.
 KERNEL_URL=https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261023-dd7c24b0d165-0/x86_64/vmlinux-6.1.188
 KERNEL_SHA256=fc7a33d23a629d64db61ddf12789c737c12edb1702a5ce9d5546b95ca21dc6ca
+GO_VERSION=go1.27.3
+GO_SHA256=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
 IMAGE=ghcr.io/eaucoin/alasio-agent:10.0.0@sha256:b90f8164f77e9a56bd0da0fc1869bc76c1c541742a07751764ffc156fa8fe30a
 
 work=$BENCH_DIR/firecracker
@@ -32,6 +34,10 @@ curl -fsSLo "$work/vmlinux" "$KERNEL_URL"
 echo "$KERNEL_SHA256  $work/vmlinux" | sha256sum --check --strict
 
 # The handler and the guest's init, static, as the guest has no Go of its own.
+curl -fsSLo "$work/go.tgz" "https://go.dev/dl/$GO_VERSION.linux-amd64.tar.gz"
+echo "$GO_SHA256  $work/go.tgz" | sha256sum --check --strict
+tar -xzf "$work/go.tgz" -C "$work"
+export PATH="$work/go/bin:$PATH" GOTOOLCHAIN=local
 (cd "$here" && CGO_ENABLED=0 go build -trimpath -o "$work/fcmem" ./fcmem && CGO_ENABLED=0 go build -trimpath -o "$work/bench-init" ./guest)
 
 # The root filesystem: the session image's, whole, with the init beside it, read-only to every run.
