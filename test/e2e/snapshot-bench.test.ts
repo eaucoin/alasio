@@ -310,6 +310,13 @@ async function sourceOf(node: string, pod: V1Pod): Promise<"cache" | "bucket" | 
   return said === "cache" || said === "bucket" ? said : "unknown";
 }
 
+/** What the node agent of `node` and the sandbox gateway logged of `workspace`, timestamped: their last lines of it, which say where a restore spent its time. */
+async function loggedOf(node: string, workspace: string): Promise<{ readonly agent: string[]; readonly gateway: string[] }> {
+  const of = async (pod: string, container: string) =>
+    (await kube.logs(NAMESPACE, pod, container, { timestamps: true }).catch(() => "")).split("\n").filter((line) => line.includes(workspace)).slice(-25).map((line) => line.slice(0, 400));
+  return { agent: await of((await nodeAgents()).get(node) ?? "", "node-agent"), gateway: await of(await kube.runningPod(NAMESPACE, GATEWAY), "sandbox-gateway") };
+}
+
 /** What the agent of `node` logged of preparing the snapshot `snapshot`: its last line of it. */
 async function preparedLine(node: string, snapshot: string): Promise<string> {
   const pod = (await nodeAgents()).get(node) ?? "";
@@ -337,6 +344,7 @@ async function restore(workspace: string, sessionId: string, fixture: string, ru
   const logged = restoreLogged(await bootLog(node, await sandboxIdOf(node, name)));
   const prepared = await preparedLine(node, manifest.snapshot);
   const source = await sourceOf(node, pod);
+  const logs = await loggedOf(node, workspace);
   const resident = residentNs === null ? null : msBetween(BigInt(probed.t0_ns), residentNs);
   const metrics: Metrics = {
     first_exec_ms: probed.first_exec_ms,
@@ -347,7 +355,7 @@ async function restore(workspace: string, sessionId: string, fixture: string, ru
     memory_bytes: memory.current,
     workload_rss_bytes: probed.workload_rss_bytes,
   };
-  const details = { pod: name, node, source, prepared, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error };
+  const details = { pod: name, node, source, prepared, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs };
   return { probed, metrics, details, pod: name };
 }
 
