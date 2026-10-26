@@ -183,17 +183,18 @@ const base = "http://127.0.0.1:" + port;
 });`;
 
 /** The gateway's release of the workspace, asked from alasio's pod, as alasio asks it, timed by curl: its status and time. */
-async function release(workspace: string): Promise<{ readonly status: number; readonly ms: number }> {
+async function release(workspace: string): Promise<{ readonly status: number; readonly ms: number; readonly said: string }> {
   const token = await mainToken(workspace);
   const printed = await kube.execOk(NAMESPACE, await alasioPod(), [
     "sh",
     "-c",
-    `curl -sS -o /dev/null -w '%{http_code} %{time_total}' -X POST -H "authorization: Bearer $1" "http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}/release"`,
+    `curl -sS -o /tmp/bench-release -w '%{http_code} %{time_total}\\n' -X POST -H "authorization: Bearer $1" "http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}/release"; cat /tmp/bench-release`,
     "sh",
     token,
   ], { container: "alasio" });
-  const [status = "0", seconds = "0"] = printed.trim().split(" ");
-  return { status: Number(status), ms: Number(seconds) * 1000 };
+  const [first = "", ...said] = printed.split("\n");
+  const [status = "0", seconds = "0"] = first.trim().split(" ");
+  return { status: Number(status), ms: Number(seconds) * 1000, said: said.join("\n").trim() };
 }
 
 /** The pod `name` of the sessions' namespace, which must be there. */
@@ -350,6 +351,17 @@ async function coldCaches(workspace: string): Promise<void> {
   }
 }
 
+/**
+ * Has the store's masters compact every volume of which a hundredth is deleted, between runs, as
+ * the runner systems' harnesses do (bench/common/store/up.sh): a run's snapshots, forgotten with
+ * its workspace, free their disk only once compacted, and the next runs' saves need it.
+ */
+async function vacuum(): Promise<void> {
+  const [master] = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("seaweedfs-master")) });
+  if (!master?.metadata?.name) throw new Error("no master of the store runs");
+  await kube.execOk(NAMESPACE, master.metadata.name, ["wget", "-q", "-O", "-", "http://127.0.0.1:9333/vol/vacuum?garbageThreshold=0.01"], { container: "master" });
+}
+
 /** The bytes the workspace's snapshots hold in the bucket. */
 const bucketBytes = async (node: string, workspace: string): Promise<number> => (await inNodeAgent<Held>(node, "./bench-bucket.ts", "bytes", SESSIONS, workspace)).bytes;
 
@@ -454,7 +466,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
 
     phase = "save-stop";
     const released = await release(workspace);
-    if (released.status < 200 || released.status >= 300) throw new Error(`the gateway's release answered ${released.status}`);
+    if (released.status < 200 || released.status >= 300) throw new Error(`the gateway's release answered ${released.status}: ${released.said}`);
     const manifest = JSON.parse(await agentOk(node, "GET", `/snapshots/${SESSIONS}/${workspace}`)) as Manifest;
     const record = JSON.parse(await agentOk(node, "GET", `/workspaces/${SESSIONS}/${workspace}/released`)) as { readonly snapshot: string; readonly release: string };
     if (record.snapshot !== manifest.snapshot) throw new Error(`${workspace} was released into ${record.snapshot}, not its current snapshot ${manifest.snapshot}`);
@@ -502,6 +514,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const removed = await gatewayCall(await mainToken(workspace), "DELETE", "/workspace").catch((error: unknown) => ({ status: 0, said: errorText(error) }));
     if (removed.status !== 204) console.error(`# ${workspace} was not removed: ${removed.status} ${removed.said}`);
     if (node !== "") await agentApi(node, "DELETE", `/workspaces/${SESSIONS}/${copy}`).catch(() => {});
+    await vacuum().catch((error: unknown) => console.error(`# the store was not compacted after ${workspace}: ${errorText(error)}`));
   }
 }
 

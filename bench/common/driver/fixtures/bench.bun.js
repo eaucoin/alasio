@@ -216,9 +216,10 @@ async function stopped(during) {
   Atomics.store(ctl, RUN, 0);
   // Said again by a tick that runs after both stores.
   Atomics.store(ctl, STOPPED, 0);
-  const deadline = now() + 5000;
+  // As long as a restore that loads every page from a store may hold the loop's tick, its pages not yet there.
+  const deadline = now() + 300_000;
   while (Atomics.load(ctl, STOPPED) !== 1) {
-    if (now() > deadline) throw new Error("the background loop did not stop within 5 s");
+    if (now() > deadline) throw new Error("the background loop did not stop within 300 s");
     await sleep(5);
   }
   try {

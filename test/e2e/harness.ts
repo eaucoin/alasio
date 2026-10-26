@@ -780,10 +780,11 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
         masters: { ...(AGENTS >= 2 ? { scaling: { min: 3, max: 3 } } : {}), resources: { requests: { cpu: "10m", memory: "32Mi" } } },
         volumeServers: {
           ...(AGENTS >= 2 ? { scaling: { min: 3, max: 3 } } : {}),
-          storage: { size: "10Gi" },
-          volumes: 30,
+          // The benchmark's snapshots, of up to 3 GiB sessions, two saves of each, as much as a runner's disk takes.
+          storage: { size: SHARD === "bench" ? "80Gi" : "10Gi" },
+          volumes: SHARD === "bench" ? 80 : 30,
           // A runner's disk is mostly images; the store needs only a little of what is left.
-          minFreeSpace: "1GiB",
+          minFreeSpace: SHARD === "bench" ? "5GiB" : "1GiB",
           resources: { requests: { cpu: "10m", memory: "64Mi" } },
         },
         filers: { ...(AGENTS >= 2 ? { scaling: { min: 2, max: 2 } } : {}), resources: { requests: { cpu: "10m", memory: "64Mi" } } },
