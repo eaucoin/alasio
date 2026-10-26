@@ -372,6 +372,25 @@ function end(instance: Instance): void {
   }
 }
 
+/**
+ * Resolves, as a probe that failed, once `instance` stops before `probe` ends: a probe of an
+ * instance that died would wait out its HTTP timeouts. Never, once the probe has ended.
+ */
+async function stopsBefore(instance: Instance, probe: Promise<unknown>): Promise<Ran> {
+  let probed = false;
+  void probe.finally(() => {
+    probed = true;
+  });
+  while (!probed) {
+    await sleep(1000);
+    const state = spawnSync("runc", ["--root", RUNC_ROOT, "state", instance.id], { encoding: "utf8" });
+    if (!probed && (state.status !== 0 || (JSON.parse(state.stdout) as { status: string }).status === "stopped")) {
+      return { status: 1, stdout: "", stderr: "the restored instance stopped before the probe was answered" };
+    }
+  }
+  return new Promise<Ran>(() => {});
+}
+
 /** The cgroup's memory.peak or memory.current, in bytes; null once it is gone. */
 function cgroupBytes(instance: Instance, file: "memory.peak" | "memory.current"): number | null {
   try {
@@ -694,7 +713,7 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
     const args = ["restore", "--detach", "--bundle", instance.bundle, "--image-path", images.top, "--work-path", workDir, "--pid-file", join(instance.bundle, "pid")];
     if (variant === "lazy") {
       // The daemon and the restore meet at lazy-pages.socket in the work directory they share.
-      const lazy = helper("lazy-pages", restoreDir, "criu", ["lazy-pages", "--images-dir", images.top, "--work-dir", workDir, "--log-file", "lazy-pages.log", "-v4", "--status-fd", "3"], ["ignore", "pipe", "pipe", "pipe"]);
+      const lazy = helper("lazy-pages", restoreDir, "criu", ["lazy-pages", "--images-dir", images.top, "--work-dir", workDir, "--log-file", "lazy-pages.log", "--status-fd", "3"], ["ignore", "pipe", "pipe", "pipe"]);
       daemon = lazy;
       await within(new Promise<void>((resolve, reject) => {
         lazy.child.stdio[3]?.once("data", () => resolve());
@@ -708,7 +727,7 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
       throw new Error(`${(error as Error).message}${criuErrors(join(workDir, "restore.log"))}`);
     }
     const restored = now();
-    const probed = await within(probe.ended, RESIDENT_TIMEOUT_MS, "the probe had not answered");
+    const probed = await within(Promise.race([probe.ended, stopsBefore(instance, probe.ended)]), RESIDENT_TIMEOUT_MS, "the probe had not answered");
     if (probed.status !== 0) {
       const state = spawnSync("runc", ["--root", RUNC_ROOT, "state", instance.id], { encoding: "utf8" });
       const daemonSaid = daemon ? ` criu lazy-pages: ${daemon.child.exitCode === null ? "running" : `ended ${daemon.child.exitCode}`}.` : "";
