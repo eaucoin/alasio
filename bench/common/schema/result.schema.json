@@ -56,7 +56,8 @@
         "file": { "$ref": "#/$defs/check" },
         "socket": { "enum": ["open", "closed", "hung", null] },
         "running": { "$ref": "#/$defs/check" },
-        "notice": { "type": ["string", "null"] }
+        "notice": { "type": ["string", "null"] },
+        "notice_agrees": { "$ref": "#/$defs/check" }
       }
     },
     "host": {

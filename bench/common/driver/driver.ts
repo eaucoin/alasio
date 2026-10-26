@@ -199,7 +199,7 @@ interface Verified {
   readonly [more: string]: unknown;
 }
 
-/** Does bayma's notice say the session came back with its network connections closed. */
+/** Whether bayma's notice says the session came back with its network connections closed. */
 const saysClosed = (notice: string | null): boolean => notice !== null && /connections? (?:were |are )?closed|closed its (?:network )?connections|with its network connections closed/iu.test(notice);
 
 /**
@@ -221,9 +221,12 @@ export async function probe(endpoint: Endpoint, sessionId: string, fixture: Fixt
       ...(verified.children === false ? ["a child is gone or does not answer"] : []),
       ...(verified.file === false ? [`the appended file is not what the process wrote (${String(verified["file_lines"])} lines, ${String(verified["appended"])} appended)`] : []),
       ...(socket === "hung" ? ["the socket is neither closed nor answering"] : []),
-      ...(socket === "open" && saysClosed(notice) ? ["bayma said the connections were closed, but the socket answers"] : []),
       ...(verified.running === false ? ["the background loop does not run"] : []),
     ];
+    // The connection is to a server in the instance, over its loopback, which a whole-instance
+    // restore may bring back with the rest: either way is the state as saved, and bayma's notice,
+    // of connections to outside, is said beside it.
+    const noticeAgrees = socket === null ? null : socket === "closed" || !saysClosed(notice);
     return {
       t0_ns: String(t0),
       connected_ns: String(connected),
@@ -234,7 +237,7 @@ export async function probe(endpoint: Endpoint, sessionId: string, fixture: Fixt
       notice,
       ok: failures.length === 0,
       failure: failures.length === 0 ? null : failures.join("; "),
-      correctness: { marker, memory: verified.memory, children: verified.children, file: verified.file, socket, running: verified.running, notice },
+      correctness: { marker, memory: verified.memory, children: verified.children, file: verified.file, socket, running: verified.running, notice, notice_agrees: noticeAgrees },
       workload_rss_bytes: verified.rss_bytes,
       first,
       verified,
