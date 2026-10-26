@@ -5,8 +5,9 @@
 # deleted; a harness that deletes a run's objects may ask a vacuum between runs, untimed:
 # GET :9333/vol/vacuum?garbageThreshold=0.01); and toxiproxy v2.13.0, its API on :8474, which
 # shape.ts puts a profile on.
+# toxiproxy listens on :28333, as SeaweedFS takes its S3 port plus 10000 for the gateway's gRPC.
 # Writes $1/store.env: the variables s3.ts and probe.ts read, the endpoint the profile $2's
-# (the store itself for local, toxiproxy's :18333 otherwise).
+# (the store itself for local, toxiproxy's :28333 otherwise).
 #
 #   bench/common/store/up.sh <data dir> <profile>
 set -euo pipefail
@@ -29,7 +30,7 @@ docker run --detach --name bench-seaweedfs --network host \
 docker run --detach --name bench-toxiproxy --network host "$TOXIPROXY" -host 0.0.0.0 -port 8474 >/dev/null
 
 endpoint=http://127.0.0.1:8333
-[ "$profile" = local ] || endpoint=http://127.0.0.1:18333
+[ "$profile" = local ] || endpoint=http://127.0.0.1:28333
 cat >"$data/store.env" <<EOF
 S3_ENDPOINT=$endpoint
 S3_BUCKET=snapshots
@@ -42,7 +43,7 @@ for _ in $(seq 120); do
   if curl --silent --output /dev/null http://127.0.0.1:8333 && curl --silent --output /dev/null http://127.0.0.1:8474/version; then break; fi
   sleep 1
 done
-node "$here/shape.ts" --profile "$profile" --upstream 127.0.0.1:8333 --listen 0.0.0.0:18333
+node "$here/shape.ts" --profile "$profile" --upstream 127.0.0.1:8333 --listen 0.0.0.0:28333
 set -a
 . "$data/store.env"
 set +a

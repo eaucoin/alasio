@@ -3,7 +3,7 @@
  * answer's first byte delayed by the profile's latency, and each connection's bandwidth held to
  * the profile's, both directions. The proxy is made anew, so nothing of a previous profile stays.
  *
- *   node shape.ts --profile s3-standard [--api http://127.0.0.1:8474] [--listen 0.0.0.0:18333] [--upstream 127.0.0.1:8333]
+ *   node shape.ts --profile s3-standard [--api http://127.0.0.1:8474] [--listen 0.0.0.0:28333] [--upstream 127.0.0.1:8333]
  *
  * Prints the proxy as toxiproxy then describes it. The `local` profile removes the proxy.
  */
@@ -56,7 +56,7 @@ if (/(^|\/)shape\.(ts|mjs)$/u.test(process.argv[1] ?? "")) {
     options: {
       profile: { type: "string" },
       api: { type: "string", default: "http://127.0.0.1:8474" },
-      listen: { type: "string", default: "0.0.0.0:18333" },
+      listen: { type: "string", default: "0.0.0.0:28333" },
       upstream: { type: "string", default: "127.0.0.1:8333" },
     },
   });

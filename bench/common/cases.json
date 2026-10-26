@@ -1,0 +1,11 @@
+[
+  { "fixture": "idle", "size_mib": 16 },
+  { "fixture": "poller", "size_mib": 200 },
+  { "fixture": "poller", "size_mib": 256 },
+  { "fixture": "poller", "size_mib": 1024 },
+  { "fixture": "poller", "size_mib": 3072 },
+  { "fixture": "fan-out", "size_mib": 110 },
+  { "fixture": "saturating", "size_mib": 256 },
+  { "fixture": "saturating", "size_mib": 1024 },
+  { "fixture": "saturating", "size_mib": 3072 }
+]
