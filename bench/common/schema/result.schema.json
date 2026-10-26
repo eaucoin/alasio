@@ -41,8 +41,7 @@
         "resident_how": { "enum": ["signal", "touched", null] },
         "memory_peak_bytes": { "$ref": "#/$defs/bytes" },
         "memory_bytes": { "$ref": "#/$defs/bytes" },
-        "workload_rss_bytes": { "$ref": "#/$defs/bytes" },
-        "overhead_bytes": { "type": ["integer", "null"] }
+        "workload_rss_bytes": { "$ref": "#/$defs/bytes" }
       }
     },
     "correctness": {

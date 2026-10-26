@@ -87,7 +87,7 @@ const TOXIPROXY = "2.13.0";
 const PROXY_UID = 65534;
 
 /** The metrics a result has, null unless measured (bench/common/schema/result.schema.json). */
-const METRICS = ["save_total_ms", "unavailable_ms", "pause_reported_ms", "slowdown", "precopy_passes", "precopy_bytes", "image_bytes", "uploaded_bytes", "first_exec_ms", "verify_ms", "resident_ms", "resident_how", "memory_peak_bytes", "memory_bytes", "workload_rss_bytes", "overhead_bytes"] as const;
+const METRICS = ["save_total_ms", "unavailable_ms", "pause_reported_ms", "slowdown", "precopy_passes", "precopy_bytes", "image_bytes", "uploaded_bytes", "first_exec_ms", "verify_ms", "resident_ms", "resident_how", "memory_peak_bytes", "memory_bytes", "workload_rss_bytes"] as const;
 type Metrics = Partial<Record<(typeof METRICS)[number], number | string | null>>;
 const NO_CHECKS = { marker: null, memory: null, children: null, file: null, socket: null, running: null, notice: null };
 
@@ -331,7 +331,6 @@ async function restore(workspace: string, sessionId: string, fixture: string, ru
     memory_peak_bytes: memory.peak,
     memory_bytes: memory.current,
     workload_rss_bytes: probed.workload_rss_bytes,
-    overhead_bytes: memory.current === null ? null : memory.current - probed.workload_rss_bytes,
   };
   const details = { pod: name, node, prepared, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error };
   return { probed, metrics, details, pod: name };

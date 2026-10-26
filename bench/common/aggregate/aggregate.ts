@@ -89,8 +89,8 @@ export function aggregate(results: readonly Result[]): Cell[] {
 const SHOWN: Readonly<Record<string, readonly string[]>> = {
   "save-live": ["save_total_ms", "unavailable_ms", "pause_reported_ms", "slowdown", "precopy_passes", "precopy_bytes", "uploaded_bytes"],
   "save-stop": ["save_total_ms", "pause_reported_ms", "precopy_passes", "uploaded_bytes"],
-  "restore-warm": ["first_exec_ms", "resident_ms", "verify_ms", "memory_peak_bytes", "overhead_bytes"],
-  "restore-cold": ["first_exec_ms", "resident_ms", "verify_ms", "memory_peak_bytes", "overhead_bytes"],
+  "restore-warm": ["first_exec_ms", "resident_ms", "verify_ms", "memory_peak_bytes", "memory_bytes"],
+  "restore-cold": ["first_exec_ms", "resident_ms", "verify_ms", "memory_peak_bytes", "memory_bytes"],
 };
 
 const shown = (name: string, value: number): string => {
