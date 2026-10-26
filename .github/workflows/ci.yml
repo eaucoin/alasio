@@ -27,6 +27,14 @@ on:
         description: "Runs of each case"
         type: string
         default: "5"
+      images:
+        description: "alasio's images of an earlier run, kept, as ghcr.io/eaucoin/alasio-ci/run-<id>-<attempt> (built anew if empty)"
+        type: string
+        default: ""
+      keep-images:
+        description: "Keep the images this run builds, for later runs, to be deleted by hand"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -68,7 +76,7 @@ jobs:
   # alasio's images, as ci.yml on main builds and pushes them, for the alasio jobs to install.
   images:
     needs: matrix
-    if: needs.matrix.outputs.alasio == 'true'
+    if: needs.matrix.outputs.alasio == 'true' && inputs.images == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -187,7 +195,7 @@ jobs:
       - name: Run ${{ matrix.system }}
         run: bench/${{ matrix.system }}/run.sh "$BENCH_TARGET" "$BENCH_PROFILE"
         env:
-          ALASIO_E2E_REGISTRY: ${{ needs.images.outputs.registry }}
+          ALASIO_E2E_REGISTRY: ${{ inputs.images || needs.images.outputs.registry }}
       - name: Upload the results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -228,10 +236,10 @@ jobs:
           name: summary
           path: summary/
 
-  # Whatever came of the rest, the run's images are deleted, as ci.yml on main does.
+  # Whatever came of the rest, the run's images are deleted, as ci.yml on main does, unless kept.
   delete-images:
     needs: [images, bench]
-    if: always() && needs.images.result != 'skipped'
+    if: always() && needs.images.result != 'skipped' && !inputs.keep-images
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
