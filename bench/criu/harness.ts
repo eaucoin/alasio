@@ -12,7 +12,7 @@
  *   node harness.ts --profile P --work DIR --host host.json --store store.json --dist DIR
  *     --out results.jsonl [--target host] [--runs 5] [--cases 'idle/16 poller/200 ...']
  *     [--rounds converge|phaul] [--pre-dump-mode read|splice] [--stop full|chain]
- *     [--variants 'lazy eager'] [--variant-suffix S]
+ *     [--variants 'lazy eager'] [--lazy-pages-criu criu] [--variant-suffix S]
  *
  * --dist is common's bundles (driver.mjs, s3.mjs); --cases, `<fixture>/<MiB>` words, all of
  * ../common/cases.json where empty.
@@ -55,8 +55,12 @@ const MIN_SHRINK_PERCENT = 10;
 type Rounds = "converge" | "phaul";
 
 const PAGE = 4096;
-/** How long a lazy restore's daemon may take to load every page, and a probe to answer. */
-const RESIDENT_TIMEOUT_MS = 20 * 60_000;
+/**
+ * How long a restore may take, from t0 to the probe answered and to every page resident: 300 s,
+ * eight times what reading the largest image (3 GiB) whole at one connection of emulated S3
+ * Standard (85 MB/s) takes. Past it the restore fails, and says so (README.md).
+ */
+const RESTORE_TIMEOUT_MS = 300_000;
 
 const now = (): bigint => process.hrtime.bigint();
 const msBetween = (from: bigint, to: bigint): number => Number(to - from) / 1e6;
@@ -78,6 +82,7 @@ const { values: options } = parseArgs({
     "pre-dump-mode": { type: "string", default: "read" },
     stop: { type: "string", default: "full" },
     variants: { type: "string", default: "lazy eager" },
+    "lazy-pages-criu": { type: "string", default: "criu" },
     "variant-suffix": { type: "string", default: "" },
   },
 });
@@ -122,6 +127,9 @@ writeFileSync(criuConfig, [
   "tcp-close",
   // The file locks the instance holds (bayma's SQLite state), which only it uses.
   "file-locks",
+  // Page images written and read with O_DIRECT, past the page cache, as alasio's saves and
+  // restores (--direct, restore_direct): a restore's reads are not charged to it as cache.
+  "image-io-mode direct",
   // No packets dropped while a save or a restore runs: with tcp-close there is no connection
   // to keep, and a client's SYN dropped by the lock waits out TCP's 1 s retransmission.
   "network-lock skip",
@@ -161,12 +169,12 @@ function started(file: string, args: readonly string[], stdio: readonly (number 
   return { child, ended };
 }
 
-/** `promise`, or a failure saying `what` where it has not settled within `ms`. */
-async function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+/** `promise`, or the failure `late` where it has not settled within `ms`. */
+async function within<T>(promise: Promise<T>, ms: number, late: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([promise, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${what} within ${ms / 1000} s`)), ms);
+      timer = setTimeout(() => reject(new Error(late)), ms);
     })]);
   } finally {
     clearTimeout(timer);
@@ -661,7 +669,7 @@ async function mounted(run: Run, restoreDir: string): Promise<Images> {
   let released: Promise<void> | null = null;
   const release = () => (released ??= (async () => {
     spawnSync("umount", [mount], { stdio: "ignore" });
-    await within(served.ended, 60_000, "mount-s3 had not ended after its unmount");
+    await within(served.ended, 60_000, "mount-s3 had not ended 60 s after its unmount");
   })());
   const deadline = Date.now() + 60_000;
   while (spawnSync("mountpoint", ["-q", mount]).status !== 0) {
@@ -728,6 +736,7 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
   let images: Images | null = null;
   let daemon: Helper | null = null;
   const t0 = now();
+  const left = ((deadline) => () => Math.max(0, deadline - Date.now()))(Date.now() + RESTORE_TIMEOUT_MS);
   const probe = started(process.execPath, [driver, "probe", ...run.endpoint, "--session", run.session, "--fixture", run.fixture, "--run-id", run.runId, "--t0-ns", String(t0)]);
   try {
     images = warmth === "warm" ? staged(run, chain) : variant === "lazy" ? await mounted(run, restoreDir) : await downloaded(run, restoreDir);
@@ -735,12 +744,12 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
     const args = ["restore", "--detach", "--bundle", instance.bundle, "--image-path", images.top, "--work-path", workDir, "--pid-file", join(instance.bundle, "pid")];
     if (variant === "lazy") {
       // The daemon and the restore meet at lazy-pages.socket in the work directory they share.
-      const lazy = helper("lazy-pages", restoreDir, "criu", ["lazy-pages", "--images-dir", images.top, "--work-dir", workDir, "--log-file", "lazy-pages.log", "--status-fd", "3"], ["ignore", "pipe", "pipe", "pipe"]);
+      const lazy = helper("lazy-pages", restoreDir, required("lazy-pages-criu"), ["lazy-pages", "--images-dir", images.top, "--work-dir", workDir, "--log-file", "lazy-pages.log", "--image-io-mode", "direct", "--status-fd", "3"], ["ignore", "pipe", "pipe", "pipe"]);
       daemon = lazy;
       await within(new Promise<void>((resolve, reject) => {
         lazy.child.stdio[3]?.once("data", () => resolve());
         lazy.ended.then(({ stderr }) => reject(new Error(`criu lazy-pages ended before it was ready: ${stderr.trim()}${criuErrors(join(workDir, "lazy-pages.log"))}`)), reject);
-      }), 60_000, "criu lazy-pages was not ready");
+      }), 60_000, "criu lazy-pages was not ready within 60 s");
       args.push("--lazy-pages");
     }
     try {
@@ -749,7 +758,7 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
       throw new Error(`${(error as Error).message}${criuErrors(join(workDir, "restore.log"))}`);
     }
     const restored = now();
-    const probed = await within(Promise.race([probe.ended, stopsBefore(instance, probe.ended)]), RESIDENT_TIMEOUT_MS, "the probe had not answered");
+    const probed = await within(Promise.race([probe.ended, stopsBefore(instance, probe.ended)]), left(), `the probe had not answered within the restore's bound of ${RESTORE_TIMEOUT_MS / 1000} s`);
     if (probed.status !== 0) {
       const state = spawnSync("runc", ["--root", RUNC_ROOT, "state", instance.id], { encoding: "utf8" });
       const daemonSaid = daemon ? ` criu lazy-pages: ${daemon.child.exitCode === null ? "running" : `ended ${daemon.child.exitCode}`}.` : "";
@@ -762,7 +771,7 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
     const memory = current === null ? null : current + helpers.reduce((sum, each) => sum + rssUnder(each.child), 0);
     let resident = restored;
     if (daemon) {
-      const ended = await within(daemon.ended, RESIDENT_TIMEOUT_MS, "criu lazy-pages had not loaded every page");
+      const ended = await within(daemon.ended, left(), `criu lazy-pages had not loaded every page within the restore's bound of ${RESTORE_TIMEOUT_MS / 1000} s`);
       resident = now();
       if (ended.status !== 0) throw new Error(`criu lazy-pages failed: ${ended.stderr.trim()}${criuErrors(join(workDir, "lazy-pages.log"))}`);
     }

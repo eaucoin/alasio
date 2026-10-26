@@ -71,6 +71,8 @@ benchmark is DESIGN.md; this is how the `criu` system meets it, which knobs it s
 - `chain`: the stopping save as pre-dump rounds and a dump on the live save's image, restored
   lazily, rows `lazy-chain`. This is the evidence that a pre-copied image restores almost
   eagerly.
+- `patched`: the lazy restores with `uffd-eexist.patch` in the lazy-pages daemon (below), rows
+  `lazy-patched`, on `idle` and `fan-out`. **Patched, not upstream**: for information only.
 
 ## Lazy restore from an object store
 
@@ -113,7 +115,15 @@ background transfer finds a lazy page already present (`UFFDIO_COPY` returns `EE
 same page again, forever, and serves no other fault of that process. On the first runs it hit
 one page of `node`'s `.bss` in about half of the warm lazy restores of `idle` and `fan-out`:
 860,000 attempts in 1.8 s, then the instance died. These runs are reported as failures with that
-reason, and stock CRIU is not patched.
+reason, and stock CRIU is not patched. `uffd-eexist.patch` shows the fix: it counts the present
+page as done and wakes any thread waiting on it, and the pages after it stay to be copied. The
+`patched` variant measures it.
+
+A restore is bounded at 300 s, from t0 to the probe's answer and to every page resident: eight
+times what reading the largest image (3 GiB) whole at one connection of emulated S3 Standard
+(85 MB/s) takes. The lazy-pages daemon serves one fault at a time, each with a read of its own
+(through Mountpoint, a GET), so a workload that faults on many pages while the store answers
+slowly can pass the bound. Such a restore fails, and says so.
 
 ## Knobs
 
@@ -134,7 +144,7 @@ reason, and stock CRIU is not patched.
 | network lock | `network-lock skip` (`criu.conf`) | CRIU drops the namespace's packets while a dump or a restore runs, so that a dumped connection sees no RST. With `tcp-close` no connection is kept, which is the case the man page names for `skip`. The first run without it showed the cost: the probe's SYN, dropped during the restore, waited out TCP's 1 s retransmission, about 1 s on every restore's `first_exec_ms` | `Documentation/criu.txt` `--network-lock` |
 | file locks | `file-locks` (`criu.conf`) | bayma's SQLite state holds POSIX locks, which CRIU refuses to dump without it; "only safe to use this for enclosed containers where locks are not held by any processes outside of dumped process tree", which the instance is | `Documentation/criu.txt` `--file-locks`; `man runc-checkpoint` |
 | `--compress` (new in 4.3) | off (default) | the fixtures' memory is random bytes by design (DESIGN.md section 3), so LZ4 has nothing to remove and only adds dump and restore CPU | `Documentation/criu.txt` `--compress` |
-| `--image-io-mode` (new in 4.3) | `writeback` (default) | the upload reads each staged image back as soon as it is written; `direct` would take that read off the page cache | `Documentation/criu.txt` `--image-io-mode` |
+| `--image-io-mode` (new in 4.3) | `direct` (`criu.conf`, and the lazy-pages daemon's own) | page images written and read past the page cache, as alasio's saves and restores are (`--direct`, `restore_direct`). Without it, an eager restore's reads land in the page cache charged to the restored container's cgroup, roughly doubling its `memory.peak` on the first runs (2.5 GB for a 1 GiB `poller`). Through Mountpoint, which takes no `O_DIRECT`, CRIU falls back to buffered reads, as documented | `Documentation/criu.txt` `--image-io-mode` |
 | `--auto-dedup` | off (default) | it punches superseded pages out of the parent images on the staging disk only: the bucket's objects and the restores' reads stay the same | `Documentation/criu.txt` `--auto-dedup` |
 | log level | runc's: `-v4` for every request runc makes (fixed in `criu_linux.go`) | runc's own setting, which its users get | runc `criu_linux.go` (`LogLevel: 4`) |
 | cgroups | `--manage-cgroups-mode soft` (runc's default) | the restored tasks go into the new container's cgroup | `man runc-checkpoint` |

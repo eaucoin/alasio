@@ -3,9 +3,12 @@
 # built from its v4.3 tag (the project publishes no binaries), runc v1.5.2's release binary,
 # and Mountpoint for Amazon S3 1.24.0's package (the lazy cold restore's reads of the bucket).
 # Then `criu check`, which fails the job on a kernel that lacks what the saves and restores need.
+# With `patched`, also criu-patched: the same build with uffd-eexist.patch, which the
+# `lazy-patched` variant's lazy-pages daemon runs (README.md); patched, not upstream.
 #
-#   bench/criu/install.sh
+#   bench/criu/install.sh [patched]
 set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
 CRIU_TAG=v4.3
 CRIU_COMMIT=2b7ac603cda31d015d91c856c34c557cb2300e7d
 RUNC_VERSION=v1.5.2
@@ -29,6 +32,11 @@ git -C "$build" fetch -q --depth 1 https://github.com/checkpoint-restore/criu.gi
 git -C "$build" checkout -q FETCH_HEAD
 make -C "$build" -j"$(nproc)" criu
 sudo install -m 0755 "$build/criu/criu" /usr/local/sbin/criu
+if [ "${1:-}" = patched ]; then
+  git -C "$build" apply "$here/uffd-eexist.patch"
+  make -C "$build" -j"$(nproc)" criu
+  sudo install -m 0755 "$build/criu/criu" /usr/local/sbin/criu-patched
+fi
 rm -rf "$build"
 
 curl -fsSL -o /tmp/runc.amd64 "https://github.com/opencontainers/runc/releases/download/$RUNC_VERSION/runc.amd64"

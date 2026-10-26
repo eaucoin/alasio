@@ -8,7 +8,8 @@
 # With BENCH_DIR, BENCH_RUNS, BENCH_CASES, BENCH_VARIANT and GITHUB_WORKSPACE as the workflow
 # gives them. BENCH_VARIANT `all` is the system as README.md configures it; `phaul` and `splice`
 # are the defaults of the two knobs it tunes on the benchmark, measured beside; `chain` restores
-# lazily a stopping save of pre-dump rounds on the live save's image, the evidence for its full one.
+# lazily a stopping save of pre-dump rounds on the live save's image, the evidence for its full one;
+# `patched` restores lazily with uffd-eexist.patch in the lazy-pages daemon (not upstream).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 target=$1
@@ -22,7 +23,7 @@ mkdir -p "$logs"
 # What the harness writes as root goes to the job's user, for the upload, however it ends.
 trap 'sudo chown -R "$(id -u):$(id -g)" "$logs" "$BENCH_DIR/results.jsonl" 2>/dev/null || true' EXIT
 
-"$here/install.sh" 2>&1 | tee "$logs/install.log"
+"$here/install.sh" $([ "${BENCH_VARIANT:-all}" = patched ] && echo patched) 2>&1 | tee "$logs/install.log"
 
 # The instance's root filesystem: the image's, whole, which the instances mount read-only.
 sudo mkdir -p "$work/rootfs"
@@ -51,6 +52,7 @@ all) knobs=() ;;
 phaul) knobs=(--rounds phaul --variant-suffix phaul) ;;
 splice) knobs=(--pre-dump-mode splice --variant-suffix splice) ;;
 chain) knobs=(--stop chain --variants lazy --variant-suffix chain) ;;
+patched) knobs=(--lazy-pages-criu /usr/local/sbin/criu-patched --variants lazy --variant-suffix patched) ;;
 *) echo "criu has no variant $BENCH_VARIANT" >&2; exit 1 ;;
 esac
 

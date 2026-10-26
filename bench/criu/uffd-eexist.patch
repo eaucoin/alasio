@@ -1,0 +1,34 @@
+diff --git a/criu/uffd.c b/criu/uffd.c
+index a1f6cca..3cf99d3 100644
+--- a/criu/uffd.c
++++ b/criu/uffd.c
+@@ -863,9 +863,26 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
+ 	uffdio_copy.copy = 0;
+ 
+ 	lp_debug(lpi, "uffd_copy: 0x%llx/%ld\n", uffdio_copy.dst, len);
+-	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) &&
+-	    uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
+-		return -1;
++	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy)) {
++		if (errno == EEXIST) {
++			/*
++			 * The page after those copied is present already: it is
++			 * done, not to be asked for again, and a thread waiting
++			 * on it is woken. The pages after it stay to be copied.
++			 */
++			unsigned long done = uffdio_copy.copy > 0 ? uffdio_copy.copy / page_size() : 0;
++			struct uffdio_range range = {
++				.start = address + done * page_size(),
++				.len = page_size(),
++			};
++
++			if (ioctl(lpi->lpfd.fd, UFFDIO_WAKE, &range))
++				lp_debug(lpi, "wake: 0x%llx: %d\n", range.start, errno);
++			*nr_pages = min(done + 1, *nr_pages);
++		} else if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
++			return -1;
++		}
++	}
+ 
+ 	lpi->copied_pages += *nr_pages;
+ 
