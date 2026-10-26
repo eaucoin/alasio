@@ -462,12 +462,12 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const stopLogged = saveLogged(await bootLog(node, sandboxId));
     emit(fixture, sizeMib, run, "save-stop", { ok: true, failure: null }, {
       save_total_ms: released.ms,
-      pause_reported_ms: manifest.pauseMs,
+      pause_reported_ms: stopLogged.pauseMs,
       precopy_passes: 0,
       precopy_bytes: 0,
       image_bytes: manifest.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null,
       uploaded_bytes: heldStop - heldLive,
-    }, NO_CHECKS, { snapshot: manifest.snapshot, upload_ms: manifest.uploadMs, chain: manifest.layers.length, bytes: manifest.bytes, logged: stopLogged.said });
+    }, NO_CHECKS, { snapshot: manifest.snapshot, runsc_checkpoint_ms: manifest.pauseMs, upload_ms: manifest.uploadMs, chain: manifest.layers.length, bytes: manifest.bytes, logged: stopLogged.said });
     done.add(phase);
     await gone(bound.name);
     // The workspace as the release left it, for the cold restore's.
