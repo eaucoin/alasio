@@ -31,6 +31,15 @@ IMAGE=ghcr.io/eaucoin/alasio-agent:10.0.0@sha256:b90f8164f77e9a56bd0da0fc1869bc7
 work=$BENCH_DIR/firecracker
 mkdir -p "$work" "$BENCH_DIR/logs"
 
+# Guest memory on 2 MiB hugetlbfs pages: the 5 GiB of one instance, which the runner holds one
+# of at a time, and a few to spare; taken first, from memory the page cache gives back and
+# compacted, before the builds below fragment it.
+sync
+echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+echo 1 | sudo tee /proc/sys/vm/compact_memory >/dev/null
+echo 2600 | sudo tee /proc/sys/vm/nr_hugepages >/dev/null
+[ "$(cat /proc/sys/vm/nr_hugepages)" -ge 2560 ] || { echo "the runner gave $(cat /proc/sys/vm/nr_hugepages) of 2560 hugepages" >&2; exit 1; }
+
 curl -fsSLo "$work/firecracker.tgz" "https://github.com/firecracker-microvm/firecracker/releases/download/$FIRECRACKER_VERSION/firecracker-$FIRECRACKER_VERSION-x86_64.tgz"
 echo "$FIRECRACKER_SHA256  $work/firecracker.tgz" | sha256sum --check --strict
 tar -xzf "$work/firecracker.tgz" -C "$work"
@@ -75,11 +84,6 @@ size=$(( $(sudo du -sm "$work/rootfs" | cut -f1) * 11 / 10 + 512 ))
 truncate -s "${size}M" "$work/rootfs.ext4"
 sudo mkfs.ext4 -q -F -d "$work/rootfs" "$work/rootfs.ext4"
 sudo rm -rf "$work/rootfs"
-
-# Guest memory on 2 MiB hugetlbfs pages: the 5 GiB of one instance, which the runner holds one
-# of at a time, and a few to spare.
-echo 2600 | sudo tee /proc/sys/vm/nr_hugepages >/dev/null
-[ "$(cat /proc/sys/vm/nr_hugepages)" -ge 2560 ] || { echo "the runner gave $(cat /proc/sys/vm/nr_hugepages) of 2560 hugepages" >&2; exit 1; }
 
 # The guest's network: one tap, which every microVM of the job uses in turn, as a restored one
 # needs the device its snapshot names.

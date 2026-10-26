@@ -87,6 +87,13 @@ interface Setup {
   readonly hugePages: "2M" | "None";
   /** Whether its snapshot API takes sync_snapshot_files, which v1.17.0 added. */
   readonly syncOption: boolean;
+  /**
+   * Its snapshots: Diff, the resident pages, where the release takes one of hugetlbfs memory
+   * without dirty tracking; Full otherwise.
+   */
+  readonly snapshotType: "Diff" | "Full";
+  /** Whether its saves are the system's, and reported; the reference's are only its restores'. */
+  readonly reportsSaves: boolean;
   readonly restorers: readonly Restorer[];
   readonly cases: (theCase: Case) => boolean;
 }
@@ -98,15 +105,18 @@ interface Setup {
  */
 const SETUPS: readonly Setup[] = [
   {
-    suffix: "", firecracker: "firecracker", version: "firecracker v1.17.0", hugePages: "2M", syncOption: true, cases: () => true,
+    suffix: "", firecracker: "firecracker", version: "firecracker v1.17.0", hugePages: "2M", syncOption: true, snapshotType: "Diff", reportsSaves: true, cases: () => true,
     restorers: [{ variant: "prefetch", handler: "fcmem", prefetch: true }, { variant: "no-prefetch", handler: "fcmem", prefetch: false }],
   },
   ...(options["small-pages"] ? [{
-    suffix: "-4k", firecracker: "firecracker", version: "firecracker v1.17.0", hugePages: "None" as const, syncOption: true, cases: () => true,
+    suffix: "-4k", firecracker: "firecracker", version: "firecracker v1.17.0", hugePages: "None" as const, syncOption: true, snapshotType: "Diff" as const, reportsSaves: true, cases: () => true,
     restorers: [{ variant: "4k" as const, handler: "fcmem" as const, prefetch: true }],
   }] : []),
   ...(options["e2b-reference"] ? [{
     suffix: "-e2b", firecracker: join(work, "firecracker-e2b"), version: `e2b-dev/fc-versions ${options["e2b-reference"]}`, hugePages: "2M" as const, syncOption: false,
+    // Its v1.14's mincore bitmap of hugetlbfs memory is short of the slot ("Dirty bitmap is
+    // smaller than the slot size"), so its snapshots are Full, which fcmem stores the same.
+    snapshotType: "Full" as const, reportsSaves: false,
     cases: ({ fixture, sizeMib }: Case) => fixture === "poller" && sizeMib === 1024,
     restorers: [
       { variant: "fcmem-on-e2b-fork" as const, handler: "fcmem" as const, prefetch: true },
@@ -322,7 +332,7 @@ async function runCase(theCase: Case, runIndex: number, setup: Setup, checkPause
   // A save is one, whichever variants restore it: its lines go under the first (DESIGN.md section 6).
   const savedBy = variants.slice(0, 1);
   const say = (variants: readonly Variant[], line: Omit<Line, "variant">) => {
-    for (const variant of variants) write(theCase, runIndex, setup, { ...line, variant });
+    if (setup.reportsSaves || !line.phase.startsWith("save")) for (const variant of variants) write(theCase, runIndex, setup, { ...line, variant });
     done.add(line.phase);
   };
   let fc: Firecracker | null = null;
@@ -441,9 +451,9 @@ async function runCase(theCase: Case, runIndex: number, setup: Setup, checkPause
   }
 }
 
-/** A Diff snapshot to the runner's disk, its files left in the page cache where the release lets them be. */
+/** A snapshot to the runner's disk, its files left in the page cache where the release lets them be. */
 const snapshotOf = (setup: Setup, files: { readonly mem: string; readonly state: string }) => ({
-  snapshot_type: "Diff", snapshot_path: files.state, mem_file_path: files.mem, ...(setup.syncOption ? { sync_snapshot_files: false } : {}),
+  snapshot_type: setup.snapshotType, snapshot_path: files.state, mem_file_path: files.mem, ...(setup.syncOption ? { sync_snapshot_files: false } : {}),
 });
 
 function fcmemSave(id: string, prefix: string, files: { readonly mem: string; readonly state: string }, parent: string | null, snapshots: string, cache: string): Record<string, unknown> {
