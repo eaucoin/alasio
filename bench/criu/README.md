@@ -19,9 +19,11 @@ benchmark is DESIGN.md; this is how the `criu` system meets it, which knobs it s
    session image, read-only, bayma as `agent`, `/attach` bound from the run's own directory,
    2 CPUs and 5 GiB, in a cgroup of its own under `/sys/fs/cgroup/criu-bench`. Its network
    namespace is made by `run.sh` and handed to runc by path. CRIU treats it as external, the way
-   runc's checkpoint tests and Podman set one up. Its stdio are FIFOs the harness holds for the
-   whole job, so they are pipes, which runc hands to a restored container anew (CRIU's
-   `--inherit-fd`, as runc's `checkpoint.bats` runs it).
+   runc's checkpoint tests and Podman set one up. Its stdio are pipes, as a container's are where
+   containerd's shim starts it: stdin held open by a `sleep`, stdout and stderr drained by a
+   `cat` into the job's log. runc hands pipes to a restored container anew (CRIU's
+   `--inherit-fd`, as runc's `checkpoint.bats` runs it). A FIFO or a runner file would be a file
+   CRIU looks for in the container's mounts, and fails to find.
 2. **save-live.** P.Haul-style pre-dump rounds (below):
    `runc checkpoint --pre-dump --image-path <stage>/live-preN --parent-path ../live-pre(N-1)`,
    then `runc checkpoint --leave-running --image-path <stage>/live --parent-path ../live-preK`.

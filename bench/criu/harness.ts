@@ -18,7 +18,7 @@
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, closeSync, constants, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -98,6 +98,8 @@ const preDumpMode = required("pre-dump-mode");
 if (preDumpMode !== "read" && preDumpMode !== "splice") throw new Error("--pre-dump-mode is read or splice");
 const suffix = options["variant-suffix"] ? `-${options["variant-suffix"]}` : "";
 const store = storeFromEnvironment();
+/** kernel.io_uring_disabled, which run.sh sets (README.md). */
+const ioUringDisabled = Number(readFileSync("/proc/sys/kernel/io_uring_disabled", "utf8").trim());
 const rootfs = join(work, "rootfs");
 
 /**
@@ -125,8 +127,8 @@ interface Ran {
 }
 
 /** Runs `file` to its end; throws, with what it said, where it fails. */
-function must(file: string, args: readonly string[], stdio?: readonly (number | "ignore" | "pipe")[]): string {
-  const ran = spawnSync(file, args, { encoding: "utf8", stdio: stdio ? [...stdio] : ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 ** 2 });
+function must(file: string, args: readonly string[]): string {
+  const ran = spawnSync(file, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 ** 2 });
   if (ran.error) throw ran.error;
   if (ran.status !== 0) throw new Error(`${file} ${args.join(" ")} exited ${ran.status}: ${(ran.stderr ?? "").trim().slice(-4000)}`);
   return ran.stdout ?? "";
@@ -173,14 +175,25 @@ function criuErrors(log: string): string {
   return at < 0 ? "" : ` (${log}: ${lines.slice(Math.max(0, at - 5), at + 1).join(" | ")})`;
 }
 
-/** runc, its own log in the job's; where the instance's stdio are its, what it says on failure is only there. */
-function runc(args: readonly string[], stdio?: readonly (number | "ignore" | "pipe")[]): string {
-  const log = join(work, "runc.log");
+const runcLog = join(work, "runc.log");
+const instancesLog = join(work, "instances.log");
+
+/** runc, its own log in the job's. */
+const runc = (args: readonly string[]): string => must("runc", ["--root", RUNC_ROOT, "--log", runcLog, ...args]);
+
+/**
+ * `runc run` or `runc restore` of `instance`, detached, its stdio pipes, as a container's are
+ * where containerd's shim starts it: stdin one a `sleep` holds open and never writes, stdout and
+ * stderr one a `cat` drains into instances.log. Pipes (`pipe:[...]`) are what runc hands a
+ * restored container anew (CRIU's --inherit-fd, as runc's checkpoint.bats runs it); a FIFO or a
+ * file of the runner's would be a file CRIU looks for in the container's mounts.
+ */
+function runcAttached(instance: Instance, args: readonly string[]): void {
   try {
-    return must("runc", ["--root", RUNC_ROOT, "--log", log, ...args], stdio);
+    must("bash", ["-c", 'exec 3< <(exec sleep infinity 2>/dev/null); echo $! >"$1"; exec 4> >(exec cat >>"$2" 2>/dev/null); shift 2; exec runc "$@" <&3 >&4 2>&4 3<&- 4>&-', "_", instance.holder, instancesLog, "--root", RUNC_ROOT, "--log", runcLog, ...args]);
   } catch (error) {
-    const said = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").slice(-5).join(" | ") : "";
-    throw new Error(`${(error as Error).message}${stdio ? ` (runc.log: ${said})` : ""}`);
+    const said = existsSync(runcLog) ? readFileSync(runcLog, "utf8").trim().split("\n").slice(-5).join(" | ") : "";
+    throw new Error(`${(error as Error).message} (runc.log: ${said})`);
   }
 }
 
@@ -296,28 +309,14 @@ function dropCaches(): void {
 // ---------------------------------------------------------------------------------------------
 // The instance
 
-/**
- * The instances' stdio: two FIFOs held open for the whole job, so the instance's stdio are
- * pipes, which runc hands a restored instance anew (CRIU's --inherit-fd of `pipe:[...]`, as
- * runc's own checkpoint tests run it); what it prints is drained into instances.log.
- */
-const stdio = (() => {
-  const dir = join(work, "stdio");
-  mkdirSync(dir, { recursive: true });
-  for (const name of ["in", "out"]) if (!existsSync(join(dir, name))) must("mkfifo", [join(dir, name)]);
-  const input = openSync(join(dir, "in"), constants.O_RDWR);
-  const output = openSync(join(dir, "out"), constants.O_RDWR);
-  const log = openSync(join(work, "instances.log"), "a");
-  spawn("cat", [join(dir, "out")], { stdio: ["ignore", log, log], detached: true }).unref();
-  return [input, output, output] as const;
-})();
-
 let instances = 0;
 
 interface Instance {
   readonly id: string;
   readonly bundle: string;
   readonly cgroup: string;
+  /** Where the PID of the `sleep` that holds its stdin open is. */
+  readonly holder: string;
 }
 
 /** A new container's bundle: the common OCI spec (../common/oci/config.ts), in a cgroup of its own, with CRIU's options. */
@@ -327,7 +326,7 @@ function bundleOf(attach: string): Instance {
   mkdirSync(bundle, { recursive: true });
   const spec = ociConfig({ rootfs, attach, netns: NETNS, port: PORT });
   writeFileSync(join(bundle, "config.json"), JSON.stringify({ ...spec, annotations: { "org.criu.config": criuConfig }, linux: { ...spec.linux, cgroupsPath: `/${CGROUP_PARENT}/${id}` } }, null, 2));
-  return { id, bundle, cgroup: `/sys/fs/cgroup/${CGROUP_PARENT}/${id}` };
+  return { id, bundle, cgroup: `/sys/fs/cgroup/${CGROUP_PARENT}/${id}`, holder: join(bundle, "stdin-holder.pid") };
 }
 
 /** Waits for bayma to answer its status, as a started instance's does once it listens. */
@@ -343,7 +342,7 @@ async function answering(token: string): Promise<void> {
       said = String((error as Error).cause ?? error);
     }
     if (Date.now() > deadline) {
-      const printed = readFileSync(join(work, "instances.log"), "utf8").trim().split("\n").slice(-10).join(" | ");
+      const printed = readFileSync(instancesLog, "utf8").trim().split("\n").slice(-10).join(" | ");
       throw new Error(`bayma did not answer within 120 s of the instance's start (${said}; it printed: ${printed})`);
     }
     await sleep(100);
@@ -352,15 +351,20 @@ async function answering(token: string): Promise<void> {
 
 async function start(run: Run): Promise<Instance> {
   const instance = bundleOf(run.attach);
-  runc(["run", "--detach", "--bundle", instance.bundle, "--pid-file", join(instance.bundle, "pid"), instance.id], stdio);
+  runcAttached(instance, ["run", "--detach", "--bundle", instance.bundle, "--pid-file", join(instance.bundle, "pid"), instance.id]);
   await answering(run.token);
   return instance;
 }
 
-/** Ends `instance` without a save; nothing where it has ended already. */
+/** Ends `instance` without a save, and what holds its stdin; nothing where it has ended already. */
 function end(instance: Instance): void {
   spawnSync("runc", ["--root", RUNC_ROOT, "kill", instance.id, "KILL"], { stdio: "ignore" });
   spawnSync("runc", ["--root", RUNC_ROOT, "delete", "--force", instance.id], { stdio: "ignore" });
+  try {
+    process.kill(Number(readFileSync(instance.holder, "utf8")), "SIGKILL");
+  } catch {
+    // Never started, or ended.
+  }
 }
 
 /** The cgroup's memory.peak or memory.current, in bytes; null once it is gone. */
@@ -430,7 +434,7 @@ function emit(run: Run, phase: string, variant: string, ok: boolean, failure: st
     versions: VERSIONS,
     ci: { run_id: Number(process.env["GITHUB_RUN_ID"] ?? 0), job: `${process.env["GITHUB_JOB"] ?? "local"} criu ${options.target} ${profile}`, sha: process.env["GITHUB_SHA"] ?? "" },
     at: new Date().toISOString(),
-    details: { rounds_policy: rounds, pre_dump_mode: preDumpMode, ...details },
+    details: { rounds_policy: rounds, pre_dump_mode: preDumpMode, io_uring_disabled: ioUringDisabled, pause_check: pauseChecked, ...details },
   };
   appendFileSync(out, `${JSON.stringify(line)}\n`);
 }
@@ -693,7 +697,7 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
       args.push("--lazy-pages");
     }
     try {
-      runc([...args, instance.id], stdio);
+      runcAttached(instance, [...args, instance.id]);
     } catch (error) {
       throw new Error(`${(error as Error).message}${criuErrors(join(workDir, "restore.log"))}`);
     }
@@ -802,9 +806,14 @@ async function runCase(c: Case, number: number): Promise<void> {
   }
 }
 
+/** The pause check's times and what the ticker saw, which every row carries. */
+let pauseChecked: Record<string, number> = {};
+
 /**
- * The job's check of the ticker against runc's own pause (DESIGN.md section 3): an idle
- * fixture paused for 1000 ms must report a gap of 1000 ms +/- 20 ms, or the job reports nothing.
+ * The job's check of the ticker against runc's own pause (DESIGN.md section 3): an idle fixture
+ * paused for 1000 ms must report a gap no shorter than from `runc pause` returning to `runc
+ * resume` starting, nor longer than from the pause starting to the resume returning, 20 ms
+ * slack either side; or the job reports nothing.
  */
 async function pauseCheck(): Promise<void> {
   const run = prepare({ fixture: "idle", sizeMib: 16 }, 0);
@@ -813,13 +822,21 @@ async function pauseCheck(): Promise<void> {
     const set = await driven("setup", [...run.endpoint, "--fixture", "idle", "--size-mib", "16", "--run-id", run.runId]);
     const session = String(set["session_id"]);
     await driven("mark", [...run.endpoint, "--session", session, "--fixture", "idle"]);
+    const pauseAsked = now();
     runc(["pause", instance.id]);
+    const paused = now();
     await sleep(1000);
+    const resumeAsked = now();
     runc(["resume", instance.id]);
+    const resumed = now();
     const gaps = await driven("gaps", [...run.endpoint, "--session", session, "--fixture", "idle"]);
     const gap = gaps["max_gap_ms"] as number;
-    console.log(`pause check: runc paused the instance 1000 ms, the ticker saw ${gap} ms`);
-    if (!(Math.abs(gap - 1000) <= 20)) throw new Error(`the ticker saw ${gap} ms of a 1000 ms pause`);
+    const shortest = msBetween(paused, resumeAsked) - 20;
+    const longest = msBetween(pauseAsked, resumed) + 20;
+    pauseChecked = { ticker_gap_ms: gap, shortest_ms: shortest, longest_ms: longest, pause_asked_ns: Number(pauseAsked), paused_ns: Number(paused), resume_asked_ns: Number(resumeAsked), resumed_ns: Number(resumed) };
+    writeFileSync(join(logs, "pause-check.json"), `${JSON.stringify(pauseChecked)}\n`);
+    console.log(`pause check: runc paused the instance for ${shortest + 20} to ${longest - 20} ms, the ticker saw ${gap} ms`);
+    if (!(gap >= shortest && gap <= longest)) throw new Error(`the ticker saw ${gap} ms of a pause of ${shortest + 20} to ${longest - 20} ms`);
   } finally {
     end(instance);
     rmSync(run.dir, { recursive: true, force: true });
@@ -837,7 +854,5 @@ try {
   await pauseCheck();
   for (let number = 1; number <= Number(options.runs); number++) for (const c of cases) await runCase(c, number);
 } finally {
-  closeSync(stdio[0]);
-  closeSync(stdio[1]);
   for (const name of ["instances.log", "runc.log"]) if (existsSync(join(work, name))) copyFileSync(join(work, name), join(logs, name));
 }
