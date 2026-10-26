@@ -134,6 +134,13 @@ export function selectorLabels(component: string): Labels {
 /** The scale of a component that runs one replica, always. */
 export const ONE: Scale = { min: 1, max: 1 };
 
+/**
+ * The CPU each container of a CronJob's pod requests: the least a pod can, which gives its
+ * cgroup the least weight there is (cpu.weight 1), so a run of the stack's upkeep, which
+ * waits on nobody, yields the CPU to whatever runs beside it, a wake among them.
+ */
+export const BACKGROUND_CPU = "1m";
+
 /** Whether a scaler moves a component of `scale` between its min and max. */
 export const scaled = ({ min, max }: Scale): boolean => min !== max;
 

@@ -26,6 +26,7 @@ import { DATABASE, PAGESERVER_ZONE, ROLE } from "../../../neon/control/secrets.t
 import { imageReference } from "../images.ts";
 import { computeRestartPolicy, computeServingPolicy } from "./admission.ts";
 import {
+  BACKGROUND_CPU,
   claimSpec,
   collectorRuns,
   DATABASE_SECRET,
@@ -803,7 +804,7 @@ function backup(config: InstallConfig): V1CronJob {
       { name: "PGPASSWORD", valueFrom: { secretKeyRef: { name: DATABASE_SECRET, key: "password" } } },
     ],
     securityContext: restrictedContainer(),
-    resources: { requests: { cpu: "100m", memory: "128Mi" }, limits: { memory: "1Gi" } },
+    resources: { requests: { cpu: BACKGROUND_CPU, memory: "128Mi" }, limits: { memory: "1Gi" } },
     volumeMounts: [{ name: "backup", mountPath: "/backup" }],
   };
   const upload: V1Container = {
@@ -853,7 +854,7 @@ function backup(config: InstallConfig): V1CronJob {
     // Its own identity: it writes the backups' bucket and reads what it backs up, and no more.
     envFrom: [{ secretRef: { name: neonName("s3-backups") } }],
     securityContext: restrictedContainer(),
-    resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "512Mi" } },
+    resources: { requests: { cpu: BACKGROUND_CPU, memory: "128Mi" }, limits: { memory: "512Mi" } },
     volumeMounts: [{ name: "backup", mountPath: "/backup" }, { name: "tmp", mountPath: "/tmp" }],
   };
   return {

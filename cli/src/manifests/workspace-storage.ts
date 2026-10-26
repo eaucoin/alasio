@@ -27,7 +27,7 @@ import type { KubernetesObject, V1Container, V1CronJob, V1PodSpec } from "@kuber
 
 import { WORKSPACE_QUOTAS_USER } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
-import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, restrictedContainer, restrictedPod, s3Endpoint, script, stackPlacement } from "./common.ts";
+import { BACKGROUND_CPU, componentName, imagePullSecrets, type Labels, labels, NAMESPACE, restrictedContainer, restrictedPod, s3Endpoint, script, stackPlacement } from "./common.ts";
 import { everyIntervalCron, type InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { VALKEY_PORT, valkeyObjects, valkeyPassword } from "./valkey.ts";
@@ -77,7 +77,7 @@ function adminContainer(config: InstallConfig, name: string, ...lines: string[])
     imagePullPolicy: "IfNotPresent",
     command: ["/bin/sh", "-c", script("set -eu", ...lines)],
     env: [{ name: "META_URL", valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key: "metaurl" } } }],
-    resources: { requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "512Mi" } },
+    resources: { requests: { cpu: BACKGROUND_CPU, memory: "64Mi" }, limits: { memory: "512Mi" } },
   };
 }
 
@@ -204,7 +204,7 @@ function staleSessions(config: InstallConfig): V1CronJob {
     ),
     securityContext: restrictedContainer(),
     env: [{ name: "META_URL", valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key: "metaurl" } } }, { name: "HOME", value: "/tmp" }],
-    resources: { requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "512Mi" } },
+    resources: { requests: { cpu: BACKGROUND_CPU, memory: "64Mi" }, limits: { memory: "512Mi" } },
     volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],
   };
   return {
@@ -259,7 +259,7 @@ function metadataDump(config: InstallConfig): V1CronJob {
     ...adminContainer(config, "dump", 'juicefs dump "$META_URL" /dump/dump.json.gz'),
     securityContext: restrictedContainer(),
     // Its metadata held whole, as Valkey's maxmemory bounds it.
-    resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "1Gi" } },
+    resources: { requests: { cpu: BACKGROUND_CPU, memory: "128Mi" }, limits: { memory: "1Gi" } },
     volumeMounts: [{ name: "dump", mountPath: "/dump" }],
   };
   const upload: V1Container = {
@@ -294,7 +294,7 @@ function metadataDump(config: InstallConfig): V1CronJob {
       { name: "DUMP", value: "/dump" },
     ],
     securityContext: restrictedContainer(),
-    resources: { requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "512Mi" } },
+    resources: { requests: { cpu: BACKGROUND_CPU, memory: "64Mi" }, limits: { memory: "512Mi" } },
     volumeMounts: [{ name: "dump", mountPath: "/dump" }, { name: "tmp", mountPath: "/tmp" }],
   };
   return {

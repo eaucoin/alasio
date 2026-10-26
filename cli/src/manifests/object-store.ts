@@ -44,7 +44,7 @@ import type {
 import { HISTORY_DAYS } from "../../../neon/control/branches.ts";
 import { memoryBytes } from "../capacity.ts";
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, labels, NAMESPACE, neonName, oncePolicyApplies, replicasOf, restrictedContainer, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
+import { BACKGROUND_CPU, claimSpec, componentName, labels, NAMESPACE, neonName, oncePolicyApplies, replicasOf, restrictedContainer, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import { filerStoreMaxmemoryBytes, type InstallConfig, type Scale } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -694,7 +694,7 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
                   `printf '${commands.map((command) => `${command}\\n`).join("")}' | weed shell -master=${masters(config)} -filer=${FILER}:8888`,
                 ],
                 securityContext: restrictedContainer(),
-                resources: { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "256Mi" } },
+                resources: { requests: { cpu: BACKGROUND_CPU, memory: "32Mi" }, limits: { memory: "256Mi" } },
                 volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],
               }],
               volumes: [{ name: "tmp", emptyDir: {} }],
@@ -748,7 +748,7 @@ function filerStoreBackup(config: InstallConfig): KubernetesObject[] {
     ],
     env: [{ name: "KEEP", value: String(filerStore.backups.keep) }, { name: "VALKEYCLI_AUTH", valueFrom: valkeyPassword(FILER_STORE_USERS.backup.secret) }],
     securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
-    resources: { requests: { cpu: "10m", memory: "64Mi" }, limits: { memory: "512Mi" } },
+    resources: { requests: { cpu: BACKGROUND_CPU, memory: "64Mi" }, limits: { memory: "512Mi" } },
     volumeMounts: [{ name: "backups", mountPath: "/backups" }],
   };
   const cronJob: V1CronJob = {

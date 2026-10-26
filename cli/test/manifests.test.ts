@@ -3127,6 +3127,16 @@ describe("scaling", () => {
     for (const { metadata, spec } of cronJobs) assert.equal(placement(spec?.jobTemplate.spec?.template.spec), JSON.stringify([dedicated("stack").nodeSelector, dedicated("stack").tolerations]), metadata?.name);
   });
 
+  test("has each container of a CronJob's pods request the least CPU there is, so its runs weigh least beside a wake, but the lake's passes, which the configuration sizes", () => {
+    const requested = all<V1CronJob>(install(), "CronJob").flatMap(({ metadata, spec }) => {
+      const pod = spec?.jobTemplate.spec?.template.spec;
+      return [...(pod?.initContainers ?? []), ...(pod?.containers ?? [])].map(({ name, resources }) => [`${metadata?.name}/${name}`, resources?.requests?.["cpu"]]);
+    });
+    const lake = (named: string) => /^alasio-lake-(maintenance|merge)\//u.test(named);
+    assert.deepEqual(requested.filter(([named]) => !lake(String(named))).filter(([, cpu]) => cpu !== "1m"), []);
+    assert.deepEqual(requested.filter(([named]) => lake(String(named))).map(([, cpu]) => cpu), ["50m", "50m"]);
+  });
+
   test("a holder of an image with no tini waits on nothing but a SIGTERM, which it ends on itself, never left to its grace's kill", async () => {
     const [shell = "", ...script] = UNTIL_TERM;
     const held = spawn(shell, script, { stdio: "ignore" });
