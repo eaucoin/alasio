@@ -9,7 +9,7 @@ import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import { indexTranscripts } from "../src/harness/claude/search/index.ts";
 import { SETTLE_MS, collectOrphans, indexBatch, indexingLockName, settle } from "../src/harness/claude/search/indexer.ts";
 import { ensureSearchSchema } from "../src/harness/claude/search/schema.ts";
-import { startPostgres, type TestPostgres } from "./support/postgres.ts";
+import { closedBeforeStop, startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 // Set by the first hook.
 let database: TestPostgres | undefined;
@@ -19,10 +19,11 @@ let schemas = 0;
 before(async () => {
   database = await startPostgres();
   pool = new pg.Pool({ connectionString: database.url, max: 6 });
+  // Ended before the server stops, as the test file's tests end, which would terminate its idle connections first.
+  closedBeforeStop(() => pool.end());
 });
 
 after(async () => {
-  await pool?.end();
   await database?.stop();
 });
 

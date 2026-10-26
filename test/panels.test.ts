@@ -21,7 +21,7 @@ import type { HarnessGoals } from "../src/harness/index.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS, type HarnessName } from "../src/harness/names.ts";
 import { Panels, sessionFsDirectory } from "../src/harness/panels.ts";
 import { sessionFsWorkspace } from "../src/workspace/kind.ts";
-import { startPostgres, type TestPostgres } from "./support/postgres.ts";
+import { closedBeforeStop, startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 const STATE_DIR = "/state";
 const [HERE, THERE] = ["/work/here", "/work/there"];
@@ -36,6 +36,8 @@ let savedClaudeHome: string | undefined;
 before(async () => {
   database = await startPostgres();
   pool = new pg.Pool({ connectionString: database.url, max: 4 });
+  // Ended before the server stops, as the test file's tests end, which would terminate its idle connections first.
+  closedBeforeStop(() => pool.end());
   // The SDK's session helpers look for local transcripts here first: none, so the store is read.
   savedClaudeHome = process.env["CLAUDE_CONFIG_DIR"];
   claudeHome = mkdtempSync(join(tmpdir(), "alasio-panels-claude-"));
@@ -46,7 +48,6 @@ after(async () => {
   if (savedClaudeHome === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
   else process.env["CLAUDE_CONFIG_DIR"] = savedClaudeHome;
   rmSync(claudeHome, { recursive: true, force: true });
-  await pool?.end();
   await database?.stop();
 });
 

@@ -9,7 +9,7 @@ import { forkSession, getSessionMessages, importSessionToStore, listSessions } f
 import pg from "pg";
 
 import { NeonSessionStore, docOf, mirrorOnly } from "../src/harness/claude/session-store.ts";
-import { startPostgres, type TestPostgres } from "./support/postgres.ts";
+import { closedBeforeStop, startPostgres, type TestPostgres } from "./support/postgres.ts";
 import { E, KEY, expectEntries, sessionStoreConformance } from "./support/session-store-conformance.ts";
 
 // Set by the first hook.
@@ -27,10 +27,11 @@ async function makeStore(): Promise<NeonSessionStore> {
 before(async () => {
   database = await startPostgres();
   pool = new pg.Pool({ connectionString: database.url, max: 4 });
+  // Ended before the server stops, as the test file's tests end, which would terminate its idle connections first.
+  closedBeforeStop(() => pool.end());
 });
 
 after(async () => {
-  await pool?.end();
   await database?.stop();
 });
 

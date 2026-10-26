@@ -11,7 +11,7 @@ import pg from "pg";
 
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import { adoptTranscripts, ensureLocalTranscript } from "../src/harness/claude/transcripts.ts";
-import { startPostgres, type TestPostgres } from "./support/postgres.ts";
+import { closedBeforeStop, startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 // Set by the first hook.
 let database: TestPostgres | undefined;
@@ -24,10 +24,11 @@ let schemas = 0;
 before(async () => {
   database = await startPostgres();
   pool = new pg.Pool({ connectionString: database.url, max: 4 });
+  // Ended before the server stops, as the test file's tests end, which would terminate its idle connections first.
+  closedBeforeStop(() => pool.end());
 });
 
 after(async () => {
-  await pool?.end();
   await database?.stop();
   if (home) rmSync(home, { recursive: true, force: true });
   if (previousHome === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
