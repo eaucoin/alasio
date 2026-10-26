@@ -712,8 +712,8 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
  * taken by the user that may do that alone, on the backups' schedule; written under a
  * name of its own, then renamed, so a backup that fails leaves none behind but its
  * predecessors, of which the last `keep` are kept. On a volume of their own, outside the
- * store they copy, made, where the cluster has several nodes and another can take it, on
- * another node than the filer store's (the volume is placed by the pod that first mounts
+ * store they copy, made, where the stack has several nodes and another can take it, on
+ * another of them than the filer store's (the volume is placed by the pod that first mounts
  * it, and keeps its pods on its node from then on). `alasio restore-filer-store` puts one
  * back (filerStoreRestore).
  */

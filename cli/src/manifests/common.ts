@@ -266,9 +266,16 @@ export function stackPodSpec(config: InstallConfig): Pick<V1PodSpec, "imagePullS
   return {
     ...imagePullSecrets(config),
     securityContext: restrictedPod(config.neon.runAsUser, config.neon.runAsGroup),
-    ...given("nodeSelector", { ...config.neon.nodeSelector }),
-    ...given("tolerations", [...config.neon.tolerations]),
+    ...stackPlacement(config),
   };
+}
+
+/**
+ * Where every pod of the data stack is placed, those that run as another user than Neon's
+ * too: on Neon's nodes, as its nodeSelector and tolerations say.
+ */
+export function stackPlacement(config: InstallConfig): Pick<V1PodSpec, "nodeSelector" | "tolerations"> {
+  return { ...given("nodeSelector", { ...config.neon.nodeSelector }), ...given("tolerations", [...config.neon.tolerations]) };
 }
 
 /**

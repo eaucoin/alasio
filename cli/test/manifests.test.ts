@@ -3098,6 +3098,35 @@ describe("scaling", () => {
     assert.equal(all<V1DaemonSet>(install({ ...config, lake: { enabled: false } }), "DaemonSet").some(({ metadata }) => metadata?.name === "alasio-lake-image"), false);
   });
 
+  test("runs each CronJob where the images it runs already are, placed as a workload that runs each of them is, so none of its runs pulls an image onto a node alasio may wake on", () => {
+    const dedicated = (role: string) => ({ nodeSelector: { "alasio.dev/role": role }, tolerations: [{ key: "dedicated", operator: "Equal", value: role, effect: "NoSchedule" }] });
+    const objects = install({ alasio: dedicated("alasio"), neon: dedicated("stack"), sessions: dedicated("sessions") });
+    const placement = (spec: V1PodSpec | undefined) => JSON.stringify([spec?.nodeSelector ?? {}, spec?.tolerations ?? []]);
+    const images = (spec: V1PodSpec | undefined) => [...(spec?.initContainers ?? []), ...(spec?.containers ?? [])].map(({ image }) => image ?? "");
+    const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet"), ...all<V1DaemonSet>(objects, "DaemonSet")].map(({ spec }) => spec?.template.spec);
+    const homes = new Set(workloads.flatMap((spec) => images(spec).map((image) => `${placement(spec)} ${image}`)));
+    const cronJobs = all<V1CronJob>(objects, "CronJob");
+    // Each of the installation's, the frequent ones that pulled the stack's images onto a node alasio woke on among them.
+    assert.deepEqual(cronJobs.map(({ metadata }) => metadata?.name).sort(), [
+      "alasio-juicefs-dump",
+      "alasio-juicefs-gc",
+      "alasio-juicefs-quota-check",
+      "alasio-juicefs-sessions",
+      "alasio-lake-maintenance",
+      "alasio-lake-merge",
+      "alasio-neon-backup",
+      "alasio-seaweedfs-filer-store-backup",
+      "alasio-seaweedfs-lifecycle",
+    ]);
+    const homeless = cronJobs.flatMap(({ metadata, spec }) => {
+      const pod = spec?.jobTemplate.spec?.template.spec;
+      return images(pod).filter((image) => !homes.has(`${placement(pod)} ${image}`)).map((image) => `${metadata?.name}: ${image} at ${placement(pod)}`);
+    });
+    assert.deepEqual(homeless, []);
+    // The stack's nodes, whose images they are.
+    for (const { metadata, spec } of cronJobs) assert.equal(placement(spec?.jobTemplate.spec?.template.spec), JSON.stringify([dedicated("stack").nodeSelector, dedicated("stack").tolerations]), metadata?.name);
+  });
+
   test("a holder of an image with no tini waits on nothing but a SIGTERM, which it ends on itself, never left to its grace's kill", async () => {
     const [shell = "", ...script] = UNTIL_TERM;
     const held = spawn(shell, script, { stdio: "ignore" });

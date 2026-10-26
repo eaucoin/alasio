@@ -29,7 +29,7 @@
 import type { KubernetesObject, V1ConfigMap, V1Container, V1EnvVar, V1EnvVarSource, V1PodSpec, V1Service, V1StatefulSet } from "@kubernetes/client-node";
 
 import { imageReference } from "../images.ts";
-import { claimSpec, imagePullSecrets, labels, NAMESPACE, ONE, replicasOf, restrictedContainer, restrictedPod, selectorLabels, sha256 } from "./common.ts";
+import { claimSpec, imagePullSecrets, labels, NAMESPACE, ONE, replicasOf, restrictedContainer, restrictedPod, selectorLabels, sha256, stackPlacement } from "./common.ts";
 import type { Image, InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
@@ -96,9 +96,12 @@ export function valkeyConf(maxmemory: string): string {
   ].join("\n");
 }
 
-/** What a pod that runs the Valkey image on a Valkey's volumes has in its spec: the image's pull Secrets, and its user. */
-export function valkeyPod(config: InstallConfig): Pick<V1PodSpec, "imagePullSecrets" | "securityContext"> {
-  return { ...imagePullSecrets(config), securityContext: restrictedPod(VALKEY_UID, VALKEY_UID) };
+/**
+ * What a pod that runs the Valkey image on a Valkey's volumes has in its spec: the image's
+ * pull Secrets, its user, and the data stack's placement, whose part it is.
+ */
+export function valkeyPod(config: InstallConfig): Pick<V1PodSpec, "imagePullSecrets" | "securityContext" | "nodeSelector" | "tolerations"> {
+  return { ...imagePullSecrets(config), securityContext: restrictedPod(VALKEY_UID, VALKEY_UID), ...stackPlacement(config) };
 }
 
 /** The password in the Secret `name`, a Valkey's or a Valkey user's, as a variable's source. */

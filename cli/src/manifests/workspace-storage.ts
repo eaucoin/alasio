@@ -23,11 +23,11 @@
  *   that died, their locks and the files they held open let go, which a lock a dead client
  *   held is held by until then, seven minutes at most.
  */
-import type { KubernetesObject, V1Container, V1CronJob } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Container, V1CronJob, V1PodSpec } from "@kubernetes/client-node";
 
 import { WORKSPACE_QUOTAS_USER } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
-import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, restrictedContainer, restrictedPod, s3Endpoint, script } from "./common.ts";
+import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, restrictedContainer, restrictedPod, s3Endpoint, script, stackPlacement } from "./common.ts";
 import { everyIntervalCron, type InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { VALKEY_PORT, valkeyObjects, valkeyPassword } from "./valkey.ts";
@@ -82,6 +82,15 @@ function adminContainer(config: InstallConfig, name: string, ...lines: string[])
 }
 
 /**
+ * What a JuiceFS admin pod has in its spec: the image's pull Secrets, nobody as its user,
+ * and the data stack's placement, where the images it runs are already there (JuiceFS's
+ * beside Valkey's server, ./valkey.ts, and Neon's), so a run pulls none onto another node.
+ */
+function adminPod(config: InstallConfig): Pick<V1PodSpec, "imagePullSecrets" | "securityContext" | "nodeSelector" | "tolerations"> {
+  return { ...imagePullSecrets(config), securityContext: restrictedPod(NOBODY, NOBODY), ...stackPlacement(config) };
+}
+
+/**
  * A daily JuiceFS admin task, `component`, whose container `name` runs `lines` restricted
  * as nobody.
  */
@@ -104,8 +113,7 @@ function dailyAdminTask(config: InstallConfig, component: string, schedule: stri
             spec: {
               restartPolicy: "Never",
               ...priority("component"),
-              ...imagePullSecrets(config),
-              securityContext: restrictedPod(NOBODY, NOBODY),
+              ...adminPod(config),
               containers: [{ ...adminContainer(config, name, ...lines), securityContext: restrictedContainer() }],
             },
           },
@@ -217,8 +225,7 @@ function staleSessions(config: InstallConfig): V1CronJob {
             spec: {
               restartPolicy: "Never",
               ...priority("component"),
-              ...imagePullSecrets(config),
-              securityContext: restrictedPod(NOBODY, NOBODY),
+              ...adminPod(config),
               containers: [container],
               volumes: [{ name: "tmp", emptyDir: {} }],
             },
@@ -308,8 +315,7 @@ function metadataDump(config: InstallConfig): V1CronJob {
             spec: {
               restartPolicy: "Never",
               ...priority("component"),
-              ...imagePullSecrets(config),
-              securityContext: restrictedPod(NOBODY, NOBODY),
+              ...adminPod(config),
               initContainers: [dump],
               containers: [upload],
               volumes: [{ name: "dump", emptyDir: {} }, { name: "tmp", emptyDir: {} }],

@@ -23,7 +23,7 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1Secret, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1Secret, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
@@ -4692,6 +4692,11 @@ if (inShard("wake")) {
     const ANSWER_WITHIN_MS = 10_000;
     /** How long the broker's CPU is watched with alasio asleep, KEDA alone asking it of its groups. */
     const ASLEEP_WATCH_MS = 60_000;
+    /**
+     * The stack's CronJobs that run every few minutes, JuiceFS's upkeep, whose runs fall within a wake as often as not: one run
+     * of each made as the first press is, which pulls none of its images, run on the stack's nodes, where they are already.
+     */
+    const FREQUENT = [componentName("juicefs-sessions"), componentName("juicefs-dump")];
 
     /** alasio upped at `scaling`, or the default scale where none: what it is installed with, and what KEDA scales it to. */
     const scaledTo = async (scaling?: { readonly min: number; readonly max: number }) => {
@@ -4749,6 +4754,25 @@ if (inShard("wake")) {
       return said.trim() === "" ? Number.NaN : Number(said.trim()) / 1e6;
     };
 
+    /** A run of the CronJob `name` made now, as its schedule makes one: a Job of its template, whose name it is. */
+    const fire = async (name: string) => {
+      const job = `${name}-wake`;
+      const template = (await kube.get<V1CronJob>(ref("CronJob", name, NAMESPACE)))?.spec?.jobTemplate;
+      assert.ok(template?.spec, `no CronJob ${name}`);
+      const run: V1Job = { apiVersion: "batch/v1", kind: "Job", metadata: { name: job, namespace: NAMESPACE, labels: template.metadata?.labels ?? {} }, spec: template.spec };
+      await kube.apply(run);
+      return job;
+    };
+    /** What kubelet said of the images of the Job `job`'s pods, once it has said it of each of their containers. */
+    const pulledFor = (job: string) =>
+      until(`${job}'s images pulled or found`, async () => {
+        const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: `job-name=${job}` });
+        const names = new Set(pods.map(({ metadata }) => metadata?.name));
+        const containers = pods.flatMap(({ spec }) => [...(spec?.initContainers ?? []), ...(spec?.containers ?? [])]).length;
+        const pulled = (await kube.list<CoreV1Event>("Event", { namespace: NAMESPACE })).filter(({ involvedObject, reason }) => reason === "Pulled" && names.has(involvedObject.name)).map(({ message }) => message ?? "");
+        return pods.length > 0 && pulled.length >= containers ? pulled : undefined;
+      }, 300_000);
+
     test(`a press is answered within ${ANSWER_WITHIN_MS / 1000} s of it, every time of ${SAMPLES}, alasio woken from none by it`, { timeout: 120 * 60_000 }, async (t) => {
       const samples: number[] = [];
       /** The nodes alasio ran on so far, each sample's. */
@@ -4788,6 +4812,7 @@ if (inShard("wake")) {
         // there as on each of alasio's nodes (cli/src/manifests/image-holder.ts), not pulled for the wake.
         const elsewhere = sample === SAMPLES && nodes.some((node) => !ranOn.has(node)) ? [...ranOn] : [];
         for (const node of elsewhere) await kube.patch(ref("Node", node), { spec: { unschedulable: true } });
+        const fired = sample === 1 ? await Promise.all(FREQUENT.map(fire)) : [];
         const mark = (await callsOf()).total;
         const taken = await committed();
         const pressed = Date.now();
@@ -4822,6 +4847,12 @@ if (inShard("wake")) {
           const pulled = (await kube.list<CoreV1Event>("Event", { namespace: NAMESPACE })).filter(({ involvedObject, reason }) => involvedObject.name === woken?.metadata?.name && reason === "Pulled").map(({ message }) => message ?? "");
           t.diagnostic(`# sample ${sample} woken onto ${wokenOn}, which never ran alasio: ${pulled.join("; ") || "no pull said"}`);
           assert.ok(pulled.every((message) => /already present on machine/u.test(message)), `its image pulled for the wake: ${pulled.join("; ")}`);
+        }
+        for (const job of fired) {
+          const pulled = await pulledFor(job);
+          t.diagnostic(`# sample ${sample}, ${job} run as it was pressed: ${pulled.join("; ")}`);
+          assert.ok(pulled.every((message) => /already present on machine/u.test(message)), `${job} pulled its images for its run: ${pulled.join("; ")}`);
+          await kube.remove(ref("Job", job, NAMESPACE));
         }
         ranOn.add(wokenOn);
         samples.push(answered - pressed);
