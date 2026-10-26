@@ -5,8 +5,9 @@ package main
 // block of zeros is stored as nothing, a block whose SHA-256 is its parent snapshot's is mapped
 // to the parent's copy, and every other block is stored, packed in address order into the
 // snapshot's memory object as it is read, which is uploaded in parts while the file is still
-// being read. What is stored goes into the node's chunk cache too, as an E2B node keeps the
-// snapshots it takes in its template cache before it uploads them.
+// being read. The memory file itself is then kept in the node's cache, as the node's copy of the
+// snapshot, which a restore here reads blocks from as E2B's orchestrator does the snapshots it
+// takes from its template cache: the copy Firecracker had to write is the only one written.
 
 import (
 	"bytes"
@@ -136,34 +137,12 @@ func save(args []string) error {
 		}()
 	}
 
-	chunks := newChunks(*cacheDir, s)
-	cacheWrites := make(chan func() error, 4)
-	cacheDone := make(chan error, 1)
-	go func() {
-		var first error
-		for write := range cacheWrites {
-			if err := write(); err != nil && first == nil {
-				first = err
-			}
-		}
-		cacheDone <- first
-	}()
-
 	body, stream := io.Pipe()
 	uploaded := make(chan error, 1)
 	go func() { uploaded <- s.upload(ctx, h.Objects[0].Key, body) }()
 
 	report := saveReport{}
 	var packed int64
-	chunk := make([]byte, 0, chunkSize)
-	flushChunk := func() {
-		if len(chunk) == 0 {
-			return
-		}
-		data, name := bytes.Clone(chunk), chunks.path(h.Objects[0].Key, (packed-int64(len(chunk)))/chunkSize)
-		cacheWrites <- func() error { return chunks.put(name, data) }
-		chunk = chunk[:0]
-	}
 	var streamErr error
 	for i := range n {
 		if !present[i] {
@@ -192,10 +171,6 @@ func save(args []string) error {
 			h.Blocks[i] = block{Object: 0, Offset: packed}
 			h.Hot = append(h.Hot, i)
 			packed += blockSize
-			chunk = append(chunk, r.buf...)
-			if len(chunk) == chunkSize {
-				flushChunk()
-			}
 			report.StoredBlocks++
 		}
 		pool.Put(r.buf)
@@ -204,8 +179,6 @@ func save(args []string) error {
 			break
 		}
 	}
-	flushChunk()
-	close(cacheWrites)
 	if streamErr != nil {
 		stream.CloseWithError(streamErr)
 		<-uploaded
@@ -213,9 +186,6 @@ func save(args []string) error {
 	}
 	stream.Close()
 	if err := <-uploaded; err != nil {
-		return err
-	}
-	if err := <-cacheDone; err != nil {
 		return err
 	}
 	report.MemoryMs = time.Since(start).Milliseconds()
@@ -228,6 +198,7 @@ func save(args []string) error {
 	if err := s.put(ctx, h.State, state); err != nil {
 		return err
 	}
+	headerKey := *prefix + "/" + *id + "/header.json"
 	encoded, err := json.Marshal(h)
 	if err != nil {
 		return err
@@ -235,7 +206,17 @@ func save(args []string) error {
 	if err := storeLocal(*work, *id, encoded, sums); err != nil {
 		return err
 	}
-	if err := s.put(ctx, *prefix+"/"+*id+"/header.json", encoded); err != nil {
+	c := newCache(*cacheDir, s)
+	if err := c.keep(h.Objects[0].Key, *memPath); err != nil {
+		return err
+	}
+	if err := c.keepWhole(h.State, state); err != nil {
+		return err
+	}
+	if err := c.keepWhole(headerKey, encoded); err != nil {
+		return err
+	}
+	if err := s.put(ctx, headerKey, encoded); err != nil {
 		return err
 	}
 	report.MemoryBytes, report.StateBytes, report.HeaderBytes = packed, int64(len(state)), int64(len(encoded))

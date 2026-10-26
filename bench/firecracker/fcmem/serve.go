@@ -12,10 +12,11 @@ package main
 // install is claimed once, and a fault on a block being installed is dropped, as the install's
 // UFFDIO_COPY wakes every thread waiting on it (E2B's install dedup,
 // packages/orchestrator/pkg/sandbox/uffd/userfaultfd/userfaultfd.go). With --prefetch, the
-// header's hot set is fetched from the start, before Firecracker connects, by 16 workers, and
-// installed by 8 as soon as the userfaultfd is here, demand faults going first and a block a
-// fault has claimed skipped (E2B's prefetcher, uffd/prefetch/prefetcher.go, and its defaults
-// memory-prefetch-fetch-workers=16 and -copy-workers=8).
+// header's hot set, the blocks the last save stored, is fetched into the cache from the start,
+// before Firecracker connects, by 16 workers, in address order, and the guest faults them in
+// from there: E2B's "last-cycle" resume prefetch, which E2B replays fetch-only, since installing
+// a diff of gigabytes would put UFFDIO_COPY on the resume's critical path for nothing
+// (pkg/sandbox/sandbox.go, uffd/prefetch/prefetcher.go, its memory-prefetch-fetch-workers=16).
 //
 // If the handler fails, it kills Firecracker, whose guest would otherwise wait on the fault
 // for ever (the document's Caveats).
@@ -38,7 +39,6 @@ import (
 
 const (
 	prefetchFetchWorkers = 16
-	prefetchCopyWorkers  = 8
 	// How long Firecracker has to connect (E2B's handler waits 10 s, uffd/uffd.go).
 	connectTimeout = 10 * time.Second
 )
@@ -62,33 +62,32 @@ type handler struct {
 	start  time.Time
 	peer   int
 	header *header
-	chunks *chunks
+	cache  *cache
 	uffd   int
 	// The guest address of each block, from the regions.
 	addrs    []uintptr
 	pageSize uint64
 	state    []atomic.Uint32
 
-	faults, demandInstalls, prefetchInstalls, zeroInstalls atomic.Int64
-	firstFaultNs, lastInstallNs, prefetchDoneNs            atomic.Int64
+	faults, installs, zeroInstalls              atomic.Int64
+	firstFaultNs, lastInstallNs, prefetchDoneNs atomic.Int64
 }
 
 type serveStats struct {
-	PageSize         uint64 `json:"page_size"`
-	Faults           int64  `json:"faults"`
-	DemandInstalls   int64  `json:"demand_installs"`
-	PrefetchInstalls int64  `json:"prefetch_installs"`
-	ZeroInstalls     int64  `json:"zero_installs"`
-	HotBlocks        int    `json:"hot_blocks"`
-	ChunksFromStore  int64  `json:"chunks_from_store"`
-	ChunksFromCache  int64  `json:"chunks_from_cache"`
-	BytesFetched     int64  `json:"bytes_fetched"`
-	ReadyMs          int64  `json:"ready_ms"`
-	FirstFaultMs     int64  `json:"first_fault_ms"`
-	LastInstallMs    int64  `json:"last_install_ms"`
-	PrefetchDoneMs   int64  `json:"prefetch_done_ms"`
-	InstalledBlocks  int    `json:"installed_blocks"`
-	MaxRSSBytes      int64  `json:"max_rss_bytes"`
+	PageSize        uint64 `json:"page_size"`
+	Faults          int64  `json:"faults"`
+	Installs        int64  `json:"installs"`
+	ZeroInstalls    int64  `json:"zero_installs"`
+	HotBlocks       int    `json:"hot_blocks"`
+	ChunksFromStore int64  `json:"chunks_from_store"`
+	BlocksFromCache int64  `json:"blocks_from_cache"`
+	BytesFetched    int64  `json:"bytes_fetched"`
+	ReadyMs         int64  `json:"ready_ms"`
+	FirstFaultMs    int64  `json:"first_fault_ms"`
+	LastInstallMs   int64  `json:"last_install_ms"`
+	PrefetchDoneMs  int64  `json:"prefetch_done_ms"`
+	InstalledBlocks int    `json:"installed_blocks"`
+	MaxRSSBytes     int64  `json:"max_rss_bytes"`
 }
 
 func serve(args []string) error {
@@ -108,22 +107,24 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	encoded, err := s.get(ctx, *prefix+"/"+*id+"/header.json")
+	h.cache = newCache(*cacheDir, s)
+	encoded, err := h.cache.object(ctx, *prefix+"/"+*id+"/header.json")
 	if err != nil {
 		return err
 	}
 	if h.header, err = decodeHeader(encoded); err != nil {
 		return err
 	}
-	h.chunks = newChunks(*cacheDir, s)
 	h.state = make([]atomic.Uint32, len(h.header.Blocks))
 
 	// The hot set's chunks are fetched while the state file is read and Firecracker loads it.
-	fetched := make(chan int, prefetchFetchWorkers*2)
 	if *prefetch {
-		go h.fetchHot(ctx, fetched)
+		go func() {
+			h.fetchHot(ctx)
+			h.prefetchDoneNs.Store(int64(time.Since(h.start)))
+		}()
 	}
-	state, err := s.get(ctx, h.header.State)
+	state, err := h.cache.object(ctx, h.header.State)
 	if err != nil {
 		return err
 	}
@@ -152,28 +153,6 @@ func serve(args []string) error {
 		h.fatal(err)
 	}
 
-	var prefetchers sync.WaitGroup
-	if *prefetch {
-		for range prefetchCopyWorkers {
-			prefetchers.Add(1)
-			go func() {
-				defer prefetchers.Done()
-				for b := range fetched {
-					if h.state[b].CompareAndSwap(blockMissing, blockInstalling) {
-						if err := h.install(ctx, b); err != nil {
-							h.fatal(err)
-						}
-						h.prefetchInstalls.Add(1)
-					}
-				}
-			}()
-		}
-		go func() {
-			prefetchers.Wait()
-			h.prefetchDoneNs.Store(int64(time.Since(h.start)))
-		}()
-	}
-
 	// The handler ends when Firecracker does, or when it is told to.
 	pidfd, err := unix.PidfdOpen(h.peer, 0)
 	if err != nil {
@@ -194,19 +173,18 @@ func serve(args []string) error {
 	}
 
 	stats := serveStats{
-		PageSize:         h.pageSize,
-		Faults:           h.faults.Load(),
-		DemandInstalls:   h.demandInstalls.Load(),
-		PrefetchInstalls: h.prefetchInstalls.Load(),
-		ZeroInstalls:     h.zeroInstalls.Load(),
-		HotBlocks:        len(h.header.Hot),
-		ChunksFromStore:  h.chunks.fromStore.Load(),
-		ChunksFromCache:  h.chunks.fromCache.Load(),
-		BytesFetched:     h.chunks.bytesFetched.Load(),
-		ReadyMs:          readyMs,
-		FirstFaultMs:     h.firstFaultNs.Load() / 1e6,
-		LastInstallMs:    h.lastInstallNs.Load() / 1e6,
-		PrefetchDoneMs:   h.prefetchDoneNs.Load() / 1e6,
+		PageSize:        h.pageSize,
+		Faults:          h.faults.Load(),
+		Installs:        h.installs.Load(),
+		ZeroInstalls:    h.zeroInstalls.Load(),
+		HotBlocks:       len(h.header.Hot),
+		ChunksFromStore: h.cache.fromStore.Load(),
+		BlocksFromCache: h.cache.fromCache.Load(),
+		BytesFetched:    h.cache.bytesFetched.Load(),
+		ReadyMs:         readyMs,
+		FirstFaultMs:    h.firstFaultNs.Load() / 1e6,
+		LastInstallMs:   h.lastInstallNs.Load() / 1e6,
+		PrefetchDoneMs:  h.prefetchDoneNs.Load() / 1e6,
 	}
 	for i := range h.state {
 		if h.state[i].Load() == blockInstalled {
@@ -335,7 +313,6 @@ func (h *handler) serveLoop(ctx context.Context, pidfd, stopFd int) error {
 						if err := h.install(ctx, b); err != nil {
 							h.fatal(err)
 						}
-						h.demandInstalls.Add(1)
 					}()
 				case h.state[b].Load() == blockInstalled:
 					// A fault read after its block's install, whose thread the install woke.
@@ -390,7 +367,7 @@ func (h *handler) install(ctx context.Context, b int) error {
 	} else {
 		var data []byte
 		var release func()
-		if data, release, err = h.chunks.block(ctx, h.header.Objects[src.Object], src.Offset); err == nil {
+		if data, release, err = h.cache.block(ctx, h.header.Objects[src.Object], src.Offset, b); err == nil {
 			err = copyPages(h.uffd, dst, data)
 			release()
 		}
@@ -399,57 +376,41 @@ func (h *handler) install(ctx context.Context, b int) error {
 		return fmt.Errorf("install block %d at %#x: %w", b, dst, err)
 	}
 	h.state[b].Store(blockInstalled)
+	h.installs.Add(1)
 	h.lastInstallNs.Store(int64(time.Since(h.start)))
 	return nil
 }
 
 var zeroBlock = make([]byte, blockSize)
 
-// fetchHot fetches the hot set's chunks in order, and hands each hot block on to be installed.
-func (h *handler) fetchHot(ctx context.Context, fetched chan<- int) {
+// fetchHot brings the hot set's chunks into the cache, in order.
+func (h *handler) fetchHot(ctx context.Context) {
 	type job struct {
-		blocks []int
-		obj    object
-		chunk  int64
+		obj   object
+		chunk int64
 	}
 	jobs := make(chan job)
 	go func() {
 		defer close(jobs)
-		var current *job
+		var last *job
 		for _, b := range h.header.Hot {
 			src := h.header.Blocks[b]
-			c := src.Offset / chunkSize
-			if current != nil && current.obj.Key == h.header.Objects[src.Object].Key && current.chunk == c {
-				current.blocks = append(current.blocks, b)
-				continue
+			next := job{obj: h.header.Objects[src.Object], chunk: src.Offset / chunkSize}
+			if last == nil || *last != next {
+				jobs <- next
+				last = &next
 			}
-			if current != nil {
-				jobs <- *current
-			}
-			current = &job{blocks: []int{b}, obj: h.header.Objects[src.Object], chunk: c}
-		}
-		if current != nil {
-			jobs <- *current
 		}
 	}()
 	var workers sync.WaitGroup
 	for range prefetchFetchWorkers {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
+		workers.Go(func() {
 			for j := range jobs {
-				// The chunk is brought into the cache here; the installs read their blocks
-				// from it as a fault would.
-				if err := h.chunks.ensure(ctx, j.obj, j.chunk); err != nil {
+				if err := h.cache.ensure(ctx, j.obj, j.chunk); err != nil {
 					fmt.Fprintln(os.Stderr, "fcmem: prefetch:", err)
-					continue
-				}
-				for _, b := range j.blocks {
-					fetched <- b
 				}
 			}
-		}()
+		})
 	}
 	workers.Wait()
-	close(fetched)
 }

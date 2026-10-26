@@ -11,11 +11,11 @@
  * - restore-warm and restore-cold of what save-stop wrote, once with the handler prefetching the
  *   hot set (`prefetch`) and once without (`no-prefetch`): `fcmem serve` takes the guest's
  *   faults, a new Firecracker loads the state file with its memory behind the handler, and the
- *   driver's probe times the first exec and the verify. Warm restores read the node's chunk
- *   cache, which the saves filled; a cold restore starts with the cache removed and the page
- *   cache dropped.
+ *   driver's probe times the first exec and the verify. Warm restores read the node's cache,
+ *   which holds the memory files the saves wrote; a cold restore starts with the cache removed
+ *   and the page cache dropped.
  *
- * Both variants' restores are of the one save, whose two lines each variant reports. With
+ * Both variants' restores are of the one save, whose lines the first variant reports. With
  * --small-pages, each case also runs on 4 KiB pages, Firecracker's default, its restores
  * prefetching (`4k`).
  *
@@ -44,6 +44,7 @@ const { values: options } = parseArgs({
     cases: { type: "string", default: "" },
     runs: { type: "string", default: "5" },
     "small-pages": { type: "boolean", default: false },
+    "e2b-reference": { type: "string", default: "" },
   },
 });
 const option = (name: keyof typeof options): string => {
@@ -65,28 +66,55 @@ interface Case {
   readonly fixture: Fixture;
   readonly sizeMib: number;
 }
-const CASES: readonly Case[] = [
-  { fixture: "idle", sizeMib: 16 },
-  ...[200, 256, 1024, 3072].map((sizeMib) => ({ fixture: "poller" as const, sizeMib })),
-  { fixture: "fan-out", sizeMib: 110 },
-  ...[256, 1024, 3072].map((sizeMib) => ({ fixture: "saturating" as const, sizeMib })),
-];
+/** Every system's cases (DESIGN.md section 7). */
+const CASES: readonly Case[] = (JSON.parse(readFileSync(new URL("../common/cases.json", import.meta.url), "utf8")) as readonly { readonly fixture: Fixture; readonly size_mib: number }[])
+  .map(({ fixture, size_mib }) => ({ fixture, sizeMib: size_mib }));
 const cases = options.cases?.trim() ? CASES.filter(({ fixture, sizeMib }) => options.cases?.split(/[\s,]+/u).includes(`${fixture}/${sizeMib}`)) : CASES;
 
-/**
- * The variants: on 2 MiB hugetlbfs pages, the restore with and without the hot set prefetched;
- * and, with --small-pages, the restore with it prefetched on Firecracker's default page size,
- * 4 KiB, as a run of its own, whose guest is booted so.
- */
-const VARIANTS = ["prefetch", "no-prefetch", "4k"] as const;
+const VARIANTS = ["prefetch", "no-prefetch", "4k", "fcmem-on-e2b-fork", "fcmem-on-e2b-fork-no-prefetch", "e2b-handler", "e2b-handler-no-prefetch"] as const;
 type Variant = (typeof VARIANTS)[number];
-interface Pages {
-  readonly hugePages: "2M" | "None";
-  readonly variants: readonly Variant[];
+/** A restore's handler: fcmem, or E2B's own (e2b/main.go), and whether it prefetches the hot set. */
+interface Restorer {
+  readonly variant: Variant;
+  readonly handler: "fcmem" | "e2b";
+  readonly prefetch: boolean;
 }
-const PAGES: readonly Pages[] = [
-  { hugePages: "2M", variants: ["prefetch", "no-prefetch"] },
-  ...(options["small-pages"] ? [{ hugePages: "None" as const, variants: ["4k" as const] }] : []),
+/** How a run's instance is made, and the restores of its save. */
+interface Setup {
+  readonly suffix: string;
+  readonly firecracker: string;
+  readonly version: string;
+  readonly hugePages: "2M" | "None";
+  /** Whether its snapshot API takes sync_snapshot_files, which v1.17.0 added. */
+  readonly syncOption: boolean;
+  readonly restorers: readonly Restorer[];
+  readonly cases: (theCase: Case) => boolean;
+}
+/**
+ * Every case on 2 MiB hugetlbfs pages, restored with and without the hot set prefetched; with
+ * --small-pages, each also on Firecracker's default page size, 4 KiB, prefetching (`4k`); with
+ * --e2b-reference <its release>, poller/1024 also on E2B's Firecracker, restored by fcmem and by E2B's own
+ * handler, each with and without prefetching.
+ */
+const SETUPS: readonly Setup[] = [
+  {
+    suffix: "", firecracker: "firecracker", version: "firecracker v1.17.0", hugePages: "2M", syncOption: true, cases: () => true,
+    restorers: [{ variant: "prefetch", handler: "fcmem", prefetch: true }, { variant: "no-prefetch", handler: "fcmem", prefetch: false }],
+  },
+  ...(options["small-pages"] ? [{
+    suffix: "-4k", firecracker: "firecracker", version: "firecracker v1.17.0", hugePages: "None" as const, syncOption: true, cases: () => true,
+    restorers: [{ variant: "4k" as const, handler: "fcmem" as const, prefetch: true }],
+  }] : []),
+  ...(options["e2b-reference"] ? [{
+    suffix: "-e2b", firecracker: join(work, "firecracker-e2b"), version: `e2b-dev/fc-versions ${options["e2b-reference"]}`, hugePages: "2M" as const, syncOption: false,
+    cases: ({ fixture, sizeMib }: Case) => fixture === "poller" && sizeMib === 1024,
+    restorers: [
+      { variant: "fcmem-on-e2b-fork" as const, handler: "fcmem" as const, prefetch: true },
+      { variant: "fcmem-on-e2b-fork-no-prefetch" as const, handler: "fcmem" as const, prefetch: false },
+      { variant: "e2b-handler" as const, handler: "e2b" as const, prefetch: true },
+      { variant: "e2b-handler-no-prefetch" as const, handler: "e2b" as const, prefetch: false },
+    ],
+  }] : []),
 ];
 const PHASES = ["save-live", "save-stop", "restore-warm", "restore-cold"] as const;
 type Phase = (typeof PHASES)[number];
@@ -157,12 +185,14 @@ class Firecracker {
     this.socket = socket;
   }
 
-  static async start(name: string, log: string): Promise<Firecracker> {
+  private static started = 0;
+
+  static async start(binary: string, log: string): Promise<Firecracker> {
     // One at a time, at a path short enough for a socket's.
     const socket = join(work, "fc.sock");
     rmSync(socket, { force: true });
-    const cgroupPath = cgroup(`fc-${name}`);
-    const child = startIn(cgroupPath, log, "firecracker", ["--api-sock", socket, "--level", "Warning"]);
+    const cgroupPath = cgroup(`fc-${++Firecracker.started}`);
+    const child = startIn(cgroupPath, log, binary, ["--api-sock", socket, "--level", "Warning"]);
     const fc = new Firecracker(child, cgroupPath, socket);
     for (let tries = 0; ; tries++) {
       try {
@@ -248,7 +278,7 @@ interface Line {
 let pauseCheck: Record<string, unknown> | null = null;
 class PauseCheckFailed extends Error {}
 
-function write(theCase: Case, runIndex: number, line: Line): void {
+function write(theCase: Case, runIndex: number, setup: Setup, line: Line): void {
   const result = {
     schema: 1,
     system: "firecracker",
@@ -266,7 +296,7 @@ function write(theCase: Case, runIndex: number, line: Line): void {
     correctness: { ...nullCorrectness, ...line.correctness },
     host,
     store: storeProbe,
-    versions: { system: "firecracker v1.17.0", bayma: "0.15.2", seaweedfs: "4.48", toxiproxy: "2.13.0", guest_kernel: "6.1.188" },
+    versions: { system: setup.version, bayma: "0.15.2", seaweedfs: "4.48", toxiproxy: "2.13.0", guest_kernel: "6.1.188" },
     ci: { run_id: Number(process.env["GITHUB_RUN_ID"] ?? 0), job: process.env["GITHUB_JOB"] ?? "", sha: process.env["GITHUB_SHA"] ?? "" },
     at: new Date().toISOString(),
     details: { pause_check: pauseCheck, ...line.details },
@@ -275,8 +305,9 @@ function write(theCase: Case, runIndex: number, line: Line): void {
 }
 
 /** One run of a case: its lines, written as each phase ends. */
-async function runCase(theCase: Case, runIndex: number, { hugePages, variants }: Pages, checkPause: boolean): Promise<void> {
-  const name = `${theCase.fixture}-${theCase.sizeMib}-${runIndex}${hugePages === "2M" ? "" : "-4k"}`;
+async function runCase(theCase: Case, runIndex: number, setup: Setup, checkPause: boolean): Promise<void> {
+  const name = `${theCase.fixture}-${theCase.sizeMib}-${runIndex}${setup.suffix}`;
+  const variants = setup.restorers.map(({ variant }) => variant);
   const log = join(logs, `${name}.log`);
   const prefix = `firecracker/${process.env["GITHUB_RUN_ID"] ?? "local"}/${name}`;
   const cache = join(work, "cache");
@@ -288,26 +319,28 @@ async function runCase(theCase: Case, runIndex: number, { hugePages, variants }:
   const token = randomBytes(32).toString("hex");
   const endpoint = ["--url", `http://${GUEST}:8765/mcp`, "--header", `Authorization: Bearer ${token}`];
   const done = new Set<Phase>();
+  // A save is one, whichever variants restore it: its lines go under the first (DESIGN.md section 6).
+  const savedBy = variants.slice(0, 1);
   const say = (variants: readonly Variant[], line: Omit<Line, "variant">) => {
-    for (const variant of variants) write(theCase, runIndex, { ...line, variant });
+    for (const variant of variants) write(theCase, runIndex, setup, { ...line, variant });
     done.add(line.phase);
   };
   let fc: Firecracker | null = null;
   try {
     attachDisk(attach, token);
-    fc = await Firecracker.start(name, log);
+    fc = await Firecracker.start(setup.firecracker, log);
     await fc.api("PUT", "/boot-source", { kernel_image_path: join(work, "vmlinux"), boot_args: BOOT_ARGS });
     await fc.api("PUT", "/drives/rootfs", { drive_id: "rootfs", path_on_host: join(work, "rootfs.ext4"), is_root_device: true, is_read_only: true });
     await fc.api("PUT", "/drives/attach", { drive_id: "attach", path_on_host: attach, is_root_device: false, is_read_only: false });
     await fc.api("PUT", "/network-interfaces/eth0", { iface_id: "eth0", host_dev_name: "tap0", guest_mac: "06:00:ac:10:00:02" });
-    await fc.api("PUT", "/machine-config", { vcpu_count: 2, mem_size_mib: MEMORY_MIB, huge_pages: hugePages });
+    await fc.api("PUT", "/machine-config", { vcpu_count: 2, mem_size_mib: MEMORY_MIB, huge_pages: setup.hugePages });
     const booted = now();
     await fc.api("PUT", "/actions", { action_type: "InstanceStart" });
     await listening(8765, 120_000);
     const bootMs = ms(booted, now());
     const rate = theCase.fixture === "saturating" ? ["--rate-mib-s", String(host.copy_mib_s)] : [];
-    const setup = driver("setup", [...endpoint, "--fixture", theCase.fixture, "--size-mib", String(theCase.sizeMib), "--run-id", name, ...rate]);
-    const session = String(setup["session_id"]);
+    const installed = driver("setup", [...endpoint, "--fixture", theCase.fixture, "--size-mib", String(theCase.sizeMib), "--run-id", name, ...rate]);
+    const session = String(installed["session_id"]);
     const fixtureArgs = ["--session", session, "--fixture", theCase.fixture];
 
     if (checkPause) {
@@ -331,14 +364,15 @@ async function runCase(theCase: Case, runIndex: number, { hugePages, variants }:
     let t0 = now();
     await fc.api("PATCH", "/vm", { state: "Paused" });
     const paused = now();
-    await fc.api("PUT", "/snapshot/create", { snapshot_type: "Diff", snapshot_path: live.state, mem_file_path: live.mem, sync_snapshot_files: false });
+    await fc.api("PUT", "/snapshot/create", snapshotOf(setup, live));
     const snapshotted = now();
     await fc.api("PATCH", "/vm", { state: "Resumed" });
     const resumed = now();
+    const liveStaged = stagedBytes(live.mem);
     const liveSaved = fcmemSave("live", prefix, live, null, snapshots, cache);
     let t1 = now();
     const gaps = driver("gaps", [...endpoint, ...fixtureArgs]);
-    say(variants, {
+    say(savedBy, {
       phase: "save-live",
       ok: true,
       failure: null,
@@ -347,22 +381,22 @@ async function runCase(theCase: Case, runIndex: number, { hugePages, variants }:
         slowdown: (gaps["slowdown"] as number | null) ?? null, precopy_passes: 0, precopy_bytes: 0,
         image_bytes: liveSaved["image_bytes"] as number, uploaded_bytes: bucketBytes(`${prefix}/live/`),
       },
-      details: { boot_ms: bootMs, setup, gaps, snapshot_ms: ms(paused, snapshotted), fcmem: liveSaved, staged_bytes: stagedBytes(live.mem) },
+      details: { boot_ms: bootMs, setup: installed, gaps, snapshot_ms: ms(paused, snapshotted), fcmem: liveSaved, staged_bytes: liveStaged, restored_by: variants },
     });
-    rmSync(live.mem);
 
     // save-stop
     const stop = { mem: join(staging, "stop.mem"), state: join(staging, "stop.state") };
     t0 = now();
     await fc.api("PATCH", "/vm", { state: "Paused" });
     const stopPaused = now();
-    await fc.api("PUT", "/snapshot/create", { snapshot_type: "Diff", snapshot_path: stop.state, mem_file_path: stop.mem, sync_snapshot_files: false });
+    await fc.api("PUT", "/snapshot/create", snapshotOf(setup, stop));
     const stopSnapshotted = now();
     await fc.kill();
     fc = null;
+    const stopStaged = stagedBytes(stop.mem);
     const stopSaved = fcmemSave("stop", prefix, stop, "live", snapshots, cache);
     t1 = now();
-    say(variants, {
+    say(savedBy, {
       phase: "save-stop",
       ok: true,
       failure: null,
@@ -370,23 +404,24 @@ async function runCase(theCase: Case, runIndex: number, { hugePages, variants }:
         save_total_ms: ms(t0, t1), pause_reported_ms: ms(stopPaused, stopSnapshotted), precopy_passes: 0, precopy_bytes: 0,
         image_bytes: stopSaved["image_bytes"] as number, uploaded_bytes: bucketBytes(`${prefix}/stop/`),
       },
-      details: { snapshot_ms: ms(stopPaused, stopSnapshotted), fcmem: stopSaved, staged_bytes: stagedBytes(stop.mem) },
+      details: { snapshot_ms: ms(stopPaused, stopSnapshotted), fcmem: stopSaved, staged_bytes: stopStaged, restored_by: variants },
     });
-    rmSync(stop.mem);
     rmSync(stop.state);
     rmSync(live.state);
     // The workspace as the instance left it, which each restore is given anew (DESIGN.md section 5).
     copySparse(attach, attachSaved);
 
     // The variants in turn, the first of them alternating by run, so neither always goes first.
-    const order = runIndex % 2 === 1 ? variants : [...variants].reverse();
+    if (setup.restorers.some(({ handler }) => handler === "e2b")) run(join(work, "e2b-serve"), ["export", "--prefix", prefix, "--snapshot", "stop"]);
+    const order = runIndex % 2 === 1 ? setup.restorers : [...setup.restorers].reverse();
     for (const phase of ["restore-warm", "restore-cold"] as const) {
-      for (const variant of order) {
+      for (const restorer of order) {
+        const { variant } = restorer;
         try {
-          const restored = await restore({ name: `${name}-${phase}-${variant}`, log, prefix, cache, attach, attachSaved, endpoint, session, theCase, runId: name, cold: phase === "restore-cold", prefetch: variant !== "no-prefetch" });
-          write(theCase, runIndex, { variant, phase, ...restored });
+          const restored = await restore({ restorer, firecracker: setup.firecracker, log, prefix, cache, attach, attachSaved, endpoint, session, theCase, runId: name, cold: phase === "restore-cold" });
+          write(theCase, runIndex, setup, { variant, phase, ...restored });
         } catch (error) {
-          write(theCase, runIndex, { variant, phase, ok: false, failure: String(error instanceof Error ? error.message : error) });
+          write(theCase, runIndex, setup, { variant, phase, ok: false, failure: String(error instanceof Error ? error.message : error) });
         }
       }
       done.add(phase);
@@ -394,7 +429,7 @@ async function runCase(theCase: Case, runIndex: number, { hugePages, variants }:
   } catch (error) {
     if (error instanceof PauseCheckFailed) throw error;
     const failure = String(error instanceof Error ? error.message : error);
-    for (const phase of PHASES) if (!done.has(phase)) say(variants, { phase, ok: false, failure: `${phase} not reached: ${failure}` });
+    for (const phase of PHASES) if (!done.has(phase)) say(phase.startsWith("save") ? savedBy : variants, { phase, ok: false, failure: `${phase} not reached: ${failure}` });
   } finally {
     if (fc !== null) await fc.kill();
     s3("delete", `${prefix}/`);
@@ -405,6 +440,11 @@ async function runCase(theCase: Case, runIndex: number, { hugePages, variants }:
     rmSync(attachSaved, { force: true });
   }
 }
+
+/** A Diff snapshot to the runner's disk, its files left in the page cache where the release lets them be. */
+const snapshotOf = (setup: Setup, files: { readonly mem: string; readonly state: string }) => ({
+  snapshot_type: "Diff", snapshot_path: files.state, mem_file_path: files.mem, ...(setup.syncOption ? { sync_snapshot_files: false } : {}),
+});
 
 function fcmemSave(id: string, prefix: string, files: { readonly mem: string; readonly state: string }, parent: string | null, snapshots: string, cache: string): Record<string, unknown> {
   const args = ["save", "--mem", files.mem, "--state", files.state, "--prefix", prefix, "--snapshot", id, "--work", snapshots, "--cache", cache, ...(parent === null ? [] : ["--parent", parent])];
@@ -420,7 +460,8 @@ const bucketBytes = (prefix: string): number => Number(s3("bytes", prefix)["byte
 const stagedBytes = (path: string): number => Number(run("du", ["--block-size=1", path]).split(/\s+/u)[0]);
 
 interface RestoreOptions {
-  readonly name: string;
+  readonly restorer: Restorer;
+  readonly firecracker: string;
   readonly log: string;
   readonly prefix: string;
   readonly cache: string;
@@ -431,7 +472,6 @@ interface RestoreOptions {
   readonly theCase: Case;
   readonly runId: string;
   readonly cold: boolean;
-  readonly prefetch: boolean;
 }
 
 async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase">> {
@@ -445,19 +485,29 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
   const stats = join(work, "uffd.stats.json");
   for (const path of [socket, state, stats]) rmSync(path, { force: true });
   const handlerGroup = cgroup("uffd");
+  const { handler: kind, prefetch } = o.restorer;
+  const serve = ["serve", "--socket", socket, "--prefix", o.prefix, "--snapshot", "stop", "--state-out", state, "--stats", stats, ...(prefetch ? ["--prefetch"] : [])];
+  const startHandler = (args: readonly string[]): { readonly process: ChildProcess; readonly ready: Promise<void> } => {
+    const child = startIn(handlerGroup, o.log, join(work, kind === "fcmem" ? "fcmem" : "e2b-serve"), args);
+    const ready = new Promise<void>((resolve, reject) => {
+      let said = "";
+      child.stdout?.on("data", (part: Buffer) => {
+        said += part.toString();
+        if (said.includes("ready\n")) resolve();
+      });
+      child.once("exit", (code) => reject(new Error(`the handler ended before it was ready: ${code}`)));
+    });
+    return { process: child, ready };
+  };
+  // E2B's cache lives as long as its process, an orchestrator that holds the snapshots it took:
+  // warm, it is started and has read every block before t0; cold, after, as fcmem always is.
+  const e2bCache = join(work, "e2b-cache");
+  rmSync(e2bCache, { recursive: true, force: true });
+  const early = kind === "e2b" && !o.cold ? startHandler([...serve, "--cache", e2bCache, "--warm"]) : null;
+  if (early !== null) await early.ready;
 
   const t0 = now();
-  const handler = startIn(handlerGroup, o.log, join(work, "fcmem"), [
-    "serve", "--socket", socket, "--prefix", o.prefix, "--snapshot", "stop", "--state-out", state, "--cache", o.cache, "--stats", stats, ...(o.prefetch ? ["--prefetch"] : []),
-  ]);
-  const ready = new Promise<void>((resolve, reject) => {
-    let said = "";
-    handler.stdout?.on("data", (part: Buffer) => {
-      said += part.toString();
-      if (said.includes("ready\n")) resolve();
-    });
-    handler.once("exit", (code) => reject(new Error(`the handler ended before it was ready: ${code}`)));
-  });
+  const { process: handler, ready } = early ?? startHandler([...serve, "--cache", kind === "fcmem" ? o.cache : e2bCache]);
   let fc: Firecracker | null = null;
   // The guest's hugetlbfs pages, charged to the cgroup of the process that faults them in: the
   // handler's, for what it installs, and the instance's, for what Firecracker touches itself.
@@ -465,7 +515,7 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
   let hugetlbPeak = 0;
   const sampler = setInterval(() => (hugetlbPeak = Math.max(hugetlbPeak, hugetlb())), 20);
   try {
-    [fc] = await Promise.all([Firecracker.start(o.name, o.log), ready]);
+    [fc] = await Promise.all([Firecracker.start(o.firecracker, o.log), ready]);
     const handlerReady = now();
     await fc.api("PUT", "/snapshot/load", { snapshot_path: state, mem_backend: { backend_type: "Uffd", backend_path: socket }, resume_vm: true });
     const loaded = now();
@@ -477,6 +527,8 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
     const fcPeak = counter(fc.cgroup, "memory.peak");
     await fc.kill();
     fc = null;
+    // fcmem ends with its Firecracker; E2B's handler is told to.
+    handler.kill("SIGTERM");
     await ended(handler);
     const handlerStats = JSON.parse(readFileSync(stats, "utf8")) as Record<string, number>;
     const memoryPeak = fcPeak + hugetlbPeak + Number(handlerStats["max_rss_bytes"]);
@@ -507,6 +559,7 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
     handler.kill("SIGTERM");
     await ended(handler);
     removeCgroup(handlerGroup);
+    rmSync(e2bCache, { recursive: true, force: true });
   }
 }
 
@@ -514,6 +567,8 @@ mkdirSync(logs, { recursive: true });
 for (let runIndex = 1; runIndex <= runs; runIndex++) {
   for (const [index, theCase] of cases.entries()) {
     console.log(`run ${runIndex} of ${theCase.fixture}/${theCase.sizeMib}`);
-    for (const [each, pages] of PAGES.entries()) await runCase(theCase, runIndex, pages, runIndex === 1 && index === 0 && each === 0);
+    for (const [each, setup] of SETUPS.entries()) {
+      if (setup.cases(theCase)) await runCase(theCase, runIndex, setup, runIndex === 1 && index === 0 && each === 0);
+    }
   }
 }
