@@ -44,7 +44,7 @@ curl -fsSLo "$work/go.tgz" "https://go.dev/dl/$GO_VERSION.linux-amd64.tar.gz"
 echo "$GO_SHA256  $work/go.tgz" | sha256sum --check --strict
 tar -xzf "$work/go.tgz" -C "$work"
 export PATH="$work/go/bin:$PATH" GOTOOLCHAIN=local
-(cd "$here" && CGO_ENABLED=0 go build -trimpath -o "$work/fcmem" ./fcmem && CGO_ENABLED=0 go build -trimpath -o "$work/bench-init" ./guest)
+(cd "$here" && go test -count=1 ./... && CGO_ENABLED=0 go build -trimpath -o "$work/fcmem" ./fcmem && CGO_ENABLED=0 go build -trimpath -o "$work/bench-init" ./guest)
 
 # The reference restores, in the local and S3 Express jobs: E2B's handler, built in E2B's tree
 # with E2B's go.mod, and E2B's Firecracker.

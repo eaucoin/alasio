@@ -27,6 +27,14 @@ const (
 	uploadConcurrency = 16
 )
 
+// objectStore is what fcmem asks of the bucket.
+type objectStore interface {
+	get(ctx context.Context, key string) ([]byte, error)
+	getRange(ctx context.Context, key string, off int64, buf []byte) error
+	put(ctx context.Context, key string, data []byte) error
+	upload(ctx context.Context, key string, body io.Reader) error
+}
+
 type store struct {
 	client *s3.Client
 	bucket string

@@ -34,7 +34,7 @@ import (
 
 type cache struct {
 	dir   string
-	store *store
+	store objectStore
 
 	mu sync.Mutex
 	// The chunks being fetched, and those fetched whose file is being written.
@@ -53,7 +53,7 @@ type fetch struct {
 	err  error
 }
 
-func newCache(dir string, s *store) *cache {
+func newCache(dir string, s objectStore) *cache {
 	c := &cache{dir: dir, store: s, fetching: map[string]*fetch{}, writing: map[string][]byte{}}
 	c.buffers.New = func() any { return make([]byte, blockSize) }
 	return c

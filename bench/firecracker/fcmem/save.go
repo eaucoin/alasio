@@ -43,52 +43,68 @@ type saveReport struct {
 	TotalMs      int64 `json:"total_ms"`
 }
 
+// The snapshot a save puts into the bucket, and where the node keeps its own of it.
+type saveInput struct {
+	memPath, statePath string
+	prefix, id, parent string
+	work, cacheDir     string
+}
+
 func save(args []string) error {
 	fs := flag.NewFlagSet("save", flag.ExitOnError)
-	memPath := fs.String("mem", "", "Firecracker's memory file")
-	statePath := fs.String("state", "", "Firecracker's state file")
-	prefix := fs.String("prefix", "", "key prefix of the snapshots")
-	id := fs.String("snapshot", "", "this snapshot's name")
-	parent := fs.String("parent", "", "the snapshot this one is saved over, taken on this node")
-	work := fs.String("work", "", "where this node keeps its snapshots' headers and block digests")
-	cacheDir := fs.String("cache", "", "the node's chunk cache")
+	var in saveInput
+	fs.StringVar(&in.memPath, "mem", "", "Firecracker's memory file")
+	fs.StringVar(&in.statePath, "state", "", "Firecracker's state file")
+	fs.StringVar(&in.prefix, "prefix", "", "key prefix of the snapshots")
+	fs.StringVar(&in.id, "snapshot", "", "this snapshot's name")
+	fs.StringVar(&in.parent, "parent", "", "the snapshot this one is saved over, taken on this node")
+	fs.StringVar(&in.work, "work", "", "where this node keeps its snapshots' headers and block digests")
+	fs.StringVar(&in.cacheDir, "cache", "", "the node's cache")
 	fs.Parse(args)
 
-	start := time.Now()
 	ctx := context.Background()
 	s, err := newStore(ctx)
 	if err != nil {
 		return err
 	}
-	mem, err := os.Open(*memPath)
+	report, err := saveSnapshot(ctx, s, in)
 	if err != nil {
 		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(report)
+}
+
+func saveSnapshot(ctx context.Context, s objectStore, in saveInput) (saveReport, error) {
+	start := time.Now()
+	mem, err := os.Open(in.memPath)
+	if err != nil {
+		return saveReport{}, err
 	}
 	defer mem.Close()
 	info, err := mem.Stat()
 	if err != nil {
-		return err
+		return saveReport{}, err
 	}
 	if info.Size()%blockSize != 0 {
-		return fmt.Errorf("%s: %d bytes, not whole blocks", *memPath, info.Size())
+		return saveReport{}, fmt.Errorf("%s: %d bytes, not whole blocks", in.memPath, info.Size())
 	}
 	n := int(info.Size() / blockSize)
 	present, err := blocksWithData(int(mem.Fd()), n)
 	if err != nil {
-		return err
+		return saveReport{}, err
 	}
 
-	h := &header{MemSize: info.Size(), BlockSize: blockSize, ChunkSize: chunkSize, State: *prefix + "/" + *id + "/state"}
-	h.Objects = []object{{Key: *prefix + "/" + *id + "/memory"}}
+	h := &header{MemSize: info.Size(), BlockSize: blockSize, ChunkSize: chunkSize, State: in.prefix + "/" + in.id + "/state"}
+	h.Objects = []object{{Key: in.prefix + "/" + in.id + "/memory"}}
 	h.Blocks = make([]block, n)
 	var parentHeader *header
 	var parentSums []byte
-	if *parent != "" {
-		if parentHeader, parentSums, err = loadLocal(*work, *parent); err != nil {
-			return err
+	if in.parent != "" {
+		if parentHeader, parentSums, err = loadLocal(in.work, in.parent); err != nil {
+			return saveReport{}, err
 		}
 		if len(parentHeader.Blocks) != n {
-			return fmt.Errorf("parent %s has %d blocks, this snapshot %d", *parent, len(parentHeader.Blocks), n)
+			return saveReport{}, fmt.Errorf("parent %s has %d blocks, this snapshot %d", in.parent, len(parentHeader.Blocks), n)
 		}
 		h.Objects = append(h.Objects, parentHeader.Objects...)
 	}
@@ -182,47 +198,47 @@ func save(args []string) error {
 	if streamErr != nil {
 		stream.CloseWithError(streamErr)
 		<-uploaded
-		return streamErr
+		return saveReport{}, streamErr
 	}
 	stream.Close()
 	if err := <-uploaded; err != nil {
-		return err
+		return saveReport{}, err
 	}
 	report.MemoryMs = time.Since(start).Milliseconds()
 	h.Objects[0].Size = packed
 
-	state, err := os.ReadFile(*statePath)
+	state, err := os.ReadFile(in.statePath)
 	if err != nil {
-		return err
+		return saveReport{}, err
 	}
 	if err := s.put(ctx, h.State, state); err != nil {
-		return err
+		return saveReport{}, err
 	}
-	headerKey := *prefix + "/" + *id + "/header.json"
+	headerKey := in.prefix + "/" + in.id + "/header.json"
 	encoded, err := json.Marshal(h)
 	if err != nil {
-		return err
+		return saveReport{}, err
 	}
-	if err := storeLocal(*work, *id, encoded, sums); err != nil {
-		return err
+	if err := storeLocal(in.work, in.id, encoded, sums); err != nil {
+		return saveReport{}, err
 	}
-	c := newCache(*cacheDir, s)
-	if err := c.keep(h.Objects[0].Key, *memPath); err != nil {
-		return err
+	c := newCache(in.cacheDir, s)
+	if err := c.keep(h.Objects[0].Key, in.memPath); err != nil {
+		return saveReport{}, err
 	}
 	if err := c.keepWhole(h.State, state); err != nil {
-		return err
+		return saveReport{}, err
 	}
 	if err := c.keepWhole(headerKey, encoded); err != nil {
-		return err
+		return saveReport{}, err
 	}
 	if err := s.put(ctx, headerKey, encoded); err != nil {
-		return err
+		return saveReport{}, err
 	}
 	report.MemoryBytes, report.StateBytes, report.HeaderBytes = packed, int64(len(state)), int64(len(encoded))
 	report.ImageBytes = packed + int64(len(state)) + int64(len(encoded))
 	report.TotalMs = time.Since(start).Milliseconds()
-	return json.NewEncoder(os.Stdout).Encode(report)
+	return report, nil
 }
 
 // blocksWithData says which blocks of the file hold any data, from its holes.

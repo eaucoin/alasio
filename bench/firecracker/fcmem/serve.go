@@ -206,7 +206,9 @@ func serve(args []string) error {
 // leaves the guest waiting on its next fault.
 func (h *handler) fatal(err error) {
 	fmt.Fprintln(os.Stderr, "fcmem:", err)
-	unix.Kill(h.peer, unix.SIGKILL)
+	if h.peer > 0 {
+		unix.Kill(h.peer, unix.SIGKILL)
+	}
 	os.Exit(1)
 }
 
@@ -273,10 +275,14 @@ func (h *handler) mapBlocks(regions []region) error {
 	return nil
 }
 
-func (h *handler) serveLoop(ctx context.Context, pidfd, stopFd int) error {
+// serveLoop answers the guest's faults until one of ends is readable.
+func (h *handler) serveLoop(ctx context.Context, ends ...int) error {
 	index := h.addressIndex()
 	buf := make([]byte, 64*uffdMsgSize)
-	fds := []unix.PollFd{{Fd: int32(h.uffd), Events: unix.POLLIN}, {Fd: int32(pidfd), Events: unix.POLLIN}, {Fd: int32(stopFd), Events: unix.POLLIN}}
+	fds := []unix.PollFd{{Fd: int32(h.uffd), Events: unix.POLLIN}}
+	for _, end := range ends {
+		fds = append(fds, unix.PollFd{Fd: int32(end), Events: unix.POLLIN})
+	}
 	for {
 		if _, err := unix.Poll(fds, -1); err != nil {
 			if err == unix.EINTR {
@@ -284,8 +290,10 @@ func (h *handler) serveLoop(ctx context.Context, pidfd, stopFd int) error {
 			}
 			return err
 		}
-		if fds[1].Revents != 0 || fds[2].Revents != 0 {
-			return nil
+		for _, end := range fds[1:] {
+			if end.Revents != 0 {
+				return nil
+			}
 		}
 		for {
 			n, err := unix.Read(h.uffd, buf)
