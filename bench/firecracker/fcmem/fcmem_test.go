@@ -196,7 +196,7 @@ func TestCacheFetchesAChunkOnceAndKeepsIt(t *testing.T) {
 	// A later handler on the node reads it from the cache's file.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if _, err := os.Stat(c.path(obj.Key, 0)); err == nil {
+		if _, err := os.Stat(c.chunkIn(obj.Key, 0)); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {

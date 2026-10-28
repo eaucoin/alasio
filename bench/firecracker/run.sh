@@ -90,6 +90,9 @@ sudo rm -rf "$work/rootfs"
 sudo ip tuntap add dev tap0 mode tap
 sudo ip addr add 172.16.0.1/30 dev tap0
 sudo ip link set tap0 up
+# The guest's address bound to its MAC (bench.ts), as a restored guest answers ARP only once it
+# runs: a connection to it while the host's entry was stale waited out ARP's 1 s retry.
+sudo ip neigh replace 172.16.0.2 lladdr 06:00:ac:10:00:02 dev tap0 nud permanent
 
 # Each instance and each handler in a cgroup of its own, for their memory and hugetlb counters.
 echo "+memory +hugetlb" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null

@@ -80,7 +80,7 @@ type serveStats struct {
 	ZeroInstalls    int64  `json:"zero_installs"`
 	HotBlocks       int    `json:"hot_blocks"`
 	ChunksFromStore int64  `json:"chunks_from_store"`
-	BlocksFromCache int64  `json:"blocks_from_cache"`
+	BlocksRead      int64  `json:"blocks_read"`
 	BytesFetched    int64  `json:"bytes_fetched"`
 	ReadyMs         int64  `json:"ready_ms"`
 	FirstFaultMs    int64  `json:"first_fault_ms"`
@@ -179,7 +179,7 @@ func serve(args []string) error {
 		ZeroInstalls:    h.zeroInstalls.Load(),
 		HotBlocks:       len(h.header.Hot),
 		ChunksFromStore: h.cache.fromStore.Load(),
-		BlocksFromCache: h.cache.fromCache.Load(),
+		BlocksRead:      h.cache.blocksRead.Load(),
 		BytesFetched:    h.cache.bytesFetched.Load(),
 		ReadyMs:         readyMs,
 		FirstFaultMs:    h.firstFaultNs.Load() / 1e6,
