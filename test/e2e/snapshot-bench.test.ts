@@ -162,7 +162,7 @@ async function agentOk(node: string, method: string, path: string, body?: unknow
  * gateway asks it, timed there from its ask to its manifest committed: the time and the manifest.
  */
 const CHECKPOINT = `
-const [port, environment, workspace, request] = process.argv.slice(1);
+const [port, environment, workspace, request] = process.argv.slice(2);
 const body = require("node:fs").readFileSync(request, "utf8");
 const headers = { authorization: "Bearer " + process.env.${NODE_AGENT_TOKEN_VARIABLE}, "content-type": "application/json" };
 const base = "http://127.0.0.1:" + port;
