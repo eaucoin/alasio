@@ -182,6 +182,12 @@ export function containerdFiles(releases: readonly string[], { systemd }: { read
     "  # before its pod's network policies are in force (src/node-agent/agent.ts resume). One restored keeps none",
     "  # anyway, as its pod has another address.",
     `  allow-live-tcp-migration = "false"`,
+    "  # A sandbox's memory is backed by small pages alone. Linux's folio_split() (00527733d0dc8, v6.15), which",
+    "  # truncation uses since 7460b470a131, races folio_try_get() over the page cache's xarray until v7.0 and stable",
+    "  # 6.18.20 (577a1f495fd7, \"mm/huge_memory: fix a folio_split() race condition with folio_try_get()\"): on a",
+    "  # host whose shmem huge pages are advise or always, about one restore in 50 to 100 found some of a sandbox's",
+    "  # memory zeroed, or holding another page's. Where shmem_enabled is never, this changes nothing.",
+    `  app-huge-pages = "false"`,
     ...(systemd ? ["  # Where systemd runs the machine, kubelet's cgroups are systemd's, and runsc places its sandboxes' through it too.", `  systemd-cgroup = "true"`] : []),
   ];
   const file = (lines: readonly string[]) => `${lines.join("\n")}\n`;

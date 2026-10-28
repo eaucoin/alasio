@@ -94,9 +94,9 @@ test("each gVisor release kept is a runtime of containerd's, after k3s's own con
   assert.ok(template.endsWith(`${runtime("20260921-0-eaucoin-4", "20260921.0-eaucoin.4")}\n${runtime("20260921-0-eaucoin-3", "20260921.0-eaucoin.3")}\n`), template);
   const options = files.get(`${CONTAINERD}/runsc-20260921-0-eaucoin-3.toml`) ?? "";
   assert.match(options, /^# runsc's options for gVisor 20260921\.0-eaucoin\.3, /u);
-  assert.match(options, /\nbinary_name = "\/usr\/local\/lib\/alasio\/gvisor\/20260921\.0-eaucoin\.3\/runsc"\nrestore_direct = true\nrestore_background = true\n\n\[runsc_config\]\n {2}restore-validate-files = "all"\n(?: {2}# [^\n]*\n)+ {2}dirty-tracking = "wp"\n {2}working-set-window = "3s"\n(?: {2}# [^\n]*\n)+ {2}allow-live-tcp-migration = "false"\n$/u);
+  assert.match(options, /\nbinary_name = "\/usr\/local\/lib\/alasio\/gvisor\/20260921\.0-eaucoin\.3\/runsc"\nrestore_direct = true\nrestore_background = true\n\n\[runsc_config\]\n {2}restore-validate-files = "all"\n(?: {2}# [^\n]*\n)+ {2}dirty-tracking = "wp"\n {2}working-set-window = "3s"\n(?: {2}# [^\n]*\n)+ {2}allow-live-tcp-migration = "false"\n(?: {2}# [^\n]*\n)+ {2}app-huge-pages = "false"\n$/u);
   // As the node agent reads them, each the flag its shim passes runsc.
-  assert.deepEqual(runscFlags(options), ["--restore-validate-files=all", "--dirty-tracking=wp", "--working-set-window=3s", "--allow-live-tcp-migration=false"]);
+  assert.deepEqual(runscFlags(options), ["--restore-validate-files=all", "--dirty-tracking=wp", "--working-set-window=3s", "--allow-live-tcp-migration=false", "--app-huge-pages=false"]);
 });
 
 test("containerd's template, after k3s's, which says no snapshotter, has the CRI pull through stargz-snapshotter's daemon, the annotations it reads passed", () => {
@@ -117,7 +117,7 @@ test("a single release kept is one runtime of containerd's, and nothing is rende
 
 test("where systemd runs the machine, runsc places its sandboxes' cgroups through it, and only there", () => {
   const options = (systemd: boolean) => containerdFiles(["20990101.0"], { systemd }).get(`${CONTAINERD}/runsc-20990101-0.toml`) ?? "";
-  assert.match(options(true), /\n {2}allow-live-tcp-migration = "false"\n {2}# [^\n]*\n {2}systemd-cgroup = "true"\n$/u);
+  assert.match(options(true), /\n {2}app-huge-pages = "false"\n {2}# [^\n]*\n {2}systemd-cgroup = "true"\n$/u);
   assert.doesNotMatch(options(false), /systemd/u);
 });
 
