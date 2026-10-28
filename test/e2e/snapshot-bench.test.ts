@@ -326,7 +326,8 @@ async function preparedLine(node: string, snapshot: string): Promise<string> {
 
 /** A restore of the workspace from its snapshot `manifest` through the gateway, its first request the probe's: its result's measures, checks and details, and its pod. */
 async function restore(workspace: string, sessionId: string, fixture: string, runId: string, manifest: Manifest) {
-  const watching = watchRestore(workspace, manifest.release);
+  // Settled whatever comes of the probe, which fails a restore that never answers before its pod is seen.
+  const watching = watchRestore(workspace, manifest.release).then((watched) => ({ watched }), (error: unknown) => ({ error }));
   const probed = await driver<{
     readonly t0_ns: string;
     readonly first_exec_ms: number;
@@ -337,7 +338,9 @@ async function restore(workspace: string, sessionId: string, fixture: string, ru
     readonly workload_rss_bytes: number;
     readonly notice: string | null;
   }>(workspace, "probe", "--session", sessionId, "--fixture", fixture, "--run-id", runId);
-  const { residentNs, pod, error } = await watching;
+  const settled = await watching;
+  if ("error" in settled) throw settled.error;
+  const { residentNs, pod, error } = settled.watched;
   const node = pod.spec?.nodeName ?? "";
   const name = pod.metadata?.name ?? "";
   const memory = await podMemory(node, pod.metadata?.uid ?? "");
