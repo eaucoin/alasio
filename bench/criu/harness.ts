@@ -127,9 +127,6 @@ writeFileSync(criuConfig, [
   "tcp-close",
   // The file locks the instance holds (bayma's SQLite state), which only it uses.
   "file-locks",
-  // Page images written and read with O_DIRECT, past the page cache, as alasio's saves and
-  // restores (--direct, restore_direct): a restore's reads are not charged to it as cache.
-  "image-io-mode direct",
   // No packets dropped while a save or a restore runs: with tcp-close there is no connection
   // to keep, and a client's SYN dropped by the lock waits out TCP's 1 s retransmission.
   "network-lock skip",
@@ -744,7 +741,7 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
     const args = ["restore", "--detach", "--bundle", instance.bundle, "--image-path", images.top, "--work-path", workDir, "--pid-file", join(instance.bundle, "pid")];
     if (variant === "lazy") {
       // The daemon and the restore meet at lazy-pages.socket in the work directory they share.
-      const lazy = helper("lazy-pages", restoreDir, required("lazy-pages-criu"), ["lazy-pages", "--images-dir", images.top, "--work-dir", workDir, "--log-file", "lazy-pages.log", "--image-io-mode", "direct", "--status-fd", "3"], ["ignore", "pipe", "pipe", "pipe"]);
+      const lazy = helper("lazy-pages", restoreDir, required("lazy-pages-criu"), ["lazy-pages", "--images-dir", images.top, "--work-dir", workDir, "--log-file", "lazy-pages.log", "--status-fd", "3"], ["ignore", "pipe", "pipe", "pipe"]);
       daemon = lazy;
       await within(new Promise<void>((resolve, reject) => {
         lazy.child.stdio[3]?.once("data", () => resolve());
