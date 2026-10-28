@@ -153,9 +153,12 @@ const run = (file: string, args: readonly string[], timeout = 0): string => exec
 const DRIVER_TIMEOUT_MS = 600_000;
 
 /** The driver's answer to a command. */
-function driver(command: string, args: readonly string[]): Record<string, unknown> {
-  return JSON.parse(run(process.execPath, [driverPath, command, ...args], DRIVER_TIMEOUT_MS)) as Record<string, unknown>;
+function driver(command: string, args: readonly string[], timeout = DRIVER_TIMEOUT_MS): Record<string, unknown> {
+  return JSON.parse(run(process.execPath, [driverPath, command, ...args], timeout)) as Record<string, unknown>;
 }
+
+/** How long after t0 a restore has for its first exec and its every page (DESIGN.md section 5). */
+const RESTORE_LIMIT_MS = 300_000;
 
 const s3 = (...args: string[]): Record<string, unknown> => JSON.parse(run(process.execPath, [s3Path, ...args])) as Record<string, unknown>;
 
@@ -546,9 +549,18 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
   try {
     [fc] = await Promise.all([Firecracker.start(o.firecracker, o.log), ready]);
     const handlerReady = now();
-    await fc.api("PUT", "/snapshot/load", { snapshot_path: state, mem_backend: { backend_type: "Uffd", backend_path: socket }, resume_vm: true });
+    // E2B's handler gets guest memory as E2B runs it, a memfd whose descriptor comes with the
+    // userfaultfd (its use-memfd flag, on by default, ff:230), which only E2B's Firecracker has.
+    const memfd = kind === "e2b" ? { use_memfd: true } : {};
+    await fc.api("PUT", "/snapshot/load", { snapshot_path: state, mem_backend: { backend_type: "Uffd", backend_path: socket, ...memfd }, resume_vm: true });
     const loaded = now();
-    const probe = driver("probe", [...o.endpoint, "--session", o.session, "--fixture", o.theCase.fixture, "--run-id", o.runId, "--t0-ns", String(t0)]);
+    let probe: Record<string, unknown>;
+    try {
+      probe = driver("probe", [...o.endpoint, "--session", o.session, "--fixture", o.theCase.fixture, "--run-id", o.runId, "--t0-ns", String(t0)], Math.max(1, RESTORE_LIMIT_MS - ms(t0, now())));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ETIMEDOUT") throw error;
+      throw new Error(`the first exec and the verify had not both answered ${RESTORE_LIMIT_MS / 1000} s after t0`);
+    }
     const guest = hugetlb();
     hugetlbPeak = Math.max(hugetlbPeak, guest);
     const handlerRss = Number(/VmRSS:\s+(\d+)/u.exec(readFileSync(`/proc/${handler.pid}/status`, "utf8"))?.[1] ?? 0) * 1024;
@@ -561,14 +573,18 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
     await ended(handler);
     const handlerStats = JSON.parse(readFileSync(stats, "utf8")) as Record<string, number>;
     const memoryPeak = fcPeak + hugetlbPeak + Number(handlerStats["max_rss_bytes"]);
+    // The handler loads only what the guest touches, so its pages are all in once the verify,
+    // which reads every page, has answered.
+    const residentMs = ms(t0, BigInt(String(probe["verify_end_ns"])));
+    const late = residentMs > RESTORE_LIMIT_MS ? [`the pages were not all resident ${RESTORE_LIMIT_MS / 1000} s after t0`] : [];
+    const failures = [...(probe["failure"] === null || probe["failure"] === undefined ? [] : [String(probe["failure"])]), ...late];
     return {
-      ok: probe["ok"] as boolean,
-      failure: (probe["failure"] as string | null) ?? null,
+      ok: probe["ok"] === true && late.length === 0,
+      failure: failures.length === 0 ? null : failures.join("; "),
       metrics: {
         first_exec_ms: probe["first_exec_ms"] as number,
         verify_ms: probe["verify_ms"] as number,
-        // The handler installs what the guest touches and the hot set; nothing loads the rest.
-        resident_ms: ms(t0, BigInt(String(probe["verify_end_ns"]))),
+        resident_ms: residentMs,
         resident_how: "touched",
         memory_peak_bytes: memoryPeak,
         memory_bytes: memoryBytes,
