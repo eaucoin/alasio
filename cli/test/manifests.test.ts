@@ -63,7 +63,6 @@ import { STOP_CALLS_MS, STOP_LINGER_MS } from "../../src/binder/server.ts";
 import { folderStateDir, templateHash } from "../../src/gateway/names.ts";
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { VERSION } from "../src/release.ts";
-import { SETUP_LABEL, setupPod, stackSetupPod } from "../src/setup-pod.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
 /** A NetworkPolicy as rendered, its ingress rules' peers under `from`. */
@@ -4161,36 +4160,6 @@ describe("the relay of an environment's Codex login", () => {
   });
 });
 
-test("the release's setup pod is alasio's own container, its image, environment and Secrets, run once to its end, serving nothing and mounting none of the machine's folders, labelled as alasio's pods but by no ReplicaSet", () => {
-  const objects = install({ host: { enabled: true, uid: 1001, gid: 1002, home: "/home/op", mounts: [{ name: "home", hostPath: "/home/op", mountPath: "/home/op" }] } });
-  const deployment = one<V1Deployment>(objects, "Deployment", "alasio");
-  const alasio = container(deployment);
-  const pod = setupPod(objects);
-  assert.deepEqual([pod.kind, pod.metadata?.name, pod.metadata?.namespace, pod.spec?.restartPolicy], ["Pod", "alasio-setup", "alasio", "Never"]);
-  assert.deepEqual(pod.metadata?.labels, { ...deployment.spec?.template.metadata?.labels, [SETUP_LABEL]: "true" });
-  const [setup, ...others] = pod.spec?.containers ?? [];
-  assert.deepEqual(others, []);
-  assert.deepEqual([setup?.image, setup?.env, setup?.args], [alasio.image, alasio.env, ["node", "/opt/alasio/src/setup/main.ts"]]);
-  assert.deepEqual([setup?.ports, setup?.readinessProbe, setup?.livenessProbe], [undefined, undefined, undefined]);
-  // The machine's folders, which the host profile mounts into alasio, none of its.
-  assert.ok(deployment.spec?.template.spec?.volumes?.some(({ hostPath }) => hostPath !== undefined));
-  assert.equal(pod.spec?.volumes?.some(({ hostPath }) => hostPath !== undefined), false);
-  assert.ok(setup?.volumeMounts?.every(({ name }) => pod.spec?.volumes?.some((volume) => volume.name === name)));
-  assert.equal(pod.spec?.serviceAccountName, "alasio");
-});
-
-test("the release's stack setup's pod is its neon-setup Job's, its image, arguments, environment and service account, run once to its end, labelled as the Job's pods", () => {
-  const objects = install();
-  const job = one<V1Job>(objects, "Job", "alasio-neon-setup");
-  const pod = stackSetupPod(objects);
-  assert.deepEqual([pod.kind, pod.metadata?.name, pod.metadata?.namespace, pod.spec?.restartPolicy], ["Pod", "alasio-stack-setup", "alasio", "Never"]);
-  assert.deepEqual(pod.metadata?.labels, { ...job.spec?.template.metadata?.labels, [SETUP_LABEL]: "true" });
-  assert.deepEqual(pod.spec?.containers, job.spec?.template.spec?.containers);
-  assert.deepEqual(pod.spec?.containers[0]?.args, ["node", "/opt/alasio/neon/control/kube-setup.ts"]);
-  assert.equal(pod.spec?.serviceAccountName, "alasio-neon-setup");
-  assert.throws(() => stackSetupPod(objects.filter(({ kind }) => kind !== "Job")), /has no alasio\/alasio-neon-setup Job/u);
-});
-
 test("runs every container of alasio's image under the image's entrypoint, tini, which ends its program on a SIGTERM that comes before the program handles it: each given its arguments, never a command, which would run in tini's place", () => {
   const objects = install({ host: { enabled: true } });
   const branch = branchObjects(configOf(), "try", BASELINE);
@@ -4202,8 +4171,6 @@ test("runs every container of alasio's image under the image's entrypoint, tini,
   const specs: [string, V1PodSpec][] = [
     ...podSpecs(objects),
     ...podSpecs(branch).map(([name, spec]): [string, V1PodSpec] => [`try/${name}`, spec]),
-    ["alasio-setup", setupPod(objects).spec ?? { containers: [] }],
-    ["alasio-stack-setup", stackSetupPod(objects).spec ?? { containers: [] }],
   ];
   const ofImage = specs.flatMap(([name, spec]) =>
     [...(spec.initContainers ?? []), ...spec.containers].filter((each) => each.image === image).map((each): [string, V1Container] => [`${name}/${each.name}`, each])
@@ -4227,8 +4194,6 @@ test("runs every container of alasio's image under the image's entrypoint, tini,
     "alasio-node-agent/node-agent",
     "alasio-receiver/receiver",
     "alasio-sandbox-gateway/sandbox-gateway",
-    "alasio-setup/alasio",
-    "alasio-stack-setup/setup",
     "alasio-workspace-mount/workspace-mount",
     "alasio/alasio",
     "harness-claude/harness",

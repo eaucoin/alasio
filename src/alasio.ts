@@ -130,9 +130,8 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
 }
 
 /**
- * alasio's store, its state made as it opens: its tables, a branch's state its own, and the
- * harness host's and the Codex login relay's grants; as alasio starts, and as `alasio setup`
- * makes it before (./setup/program.ts).
+ * alasio's store, its state made as it opens, as alasio starts: its tables, a branch's state its
+ * own, and the harness host's and the Codex login relay's grants.
  */
 export const stateStore = (options: Pick<AlasioOptions, "pool" | "stateSchema" | "workingDirectory" | "branch" | "harnessRole" | "codexLoginRole">): Layer.Layer<Store, StoreError> =>
   Store.layer({

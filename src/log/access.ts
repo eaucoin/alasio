@@ -60,11 +60,6 @@
  *   node access.ts environment    makes the environment's principals, their ACLs and its topics
  *   node access.ts forget         deletes the ACLs and the topics, and replaces each
  *                                 principal's credential with one of a random secret
- *
- * and a cut-over runs it there to ask how many partitions a topic has, as it waits for its
- * Telegram topic to be given more (upgrades/):
- *
- *   node access.ts partitions <topic>   prints the topic's partitions, 0 where there is none
  */
 import { pbkdf2Sync, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -344,19 +339,6 @@ const required = (key: string) => {
   return value;
 };
 
-/** Prints how many partitions `topic` has, 0 where there is none, then exits: 0 once said, 1 saying why where it could not be. */
-async function printPartitions(topic: string): Promise<void> {
-  const admin = logAdmin(required("LOG_BROKERS").split(","), required("LOG_ADMIN_PASSWORD"));
-  try {
-    console.log((await admin.topics()).get(topic) ?? 0);
-  } catch (error) {
-    console.error(errorText(error));
-    process.exitCode = 1;
-  } finally {
-    await admin.close().catch(() => {});
-  }
-}
-
 /** Makes, or forgets, the environment its input says, then exits: 0 once done, 1 saying why where it failed. */
 async function changeEnvironment(change: "environment" | "forget"): Promise<void> {
   const access: EnvironmentLogAccess = JSON.parse(readFileSync(0, "utf8"));
@@ -375,11 +357,9 @@ async function changeEnvironment(change: "environment" | "forget"): Promise<void
   }
 }
 
-const [mode, topic] = process.argv.slice(2);
+const [mode] = process.argv.slice(2);
 if (import.meta.url === `file://${process.argv[1]}` && (mode === "environment" || mode === "forget")) {
   await changeEnvironment(mode);
-} else if (import.meta.url === `file://${process.argv[1]}` && mode === "partitions" && topic) {
-  await printPartitions(topic);
 } else if (import.meta.url === `file://${process.argv[1]}`) {
   const brokers = required("LOG_BROKERS").split(",");
   const controllers = controllersWriter(required("LOG_CONTROLLERS").split(","));

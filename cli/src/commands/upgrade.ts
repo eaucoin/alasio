@@ -11,7 +11,6 @@ import { kind, KubeApi } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR } from "../kube/apply.ts";
 import { RELEASE } from "../manifests/common.ts";
 import { VERSION } from "../release.ts";
-import { setupPod, stackSetupPod } from "../setup-pod.ts";
 import { describeTarget, kubeApi, resolveTarget } from "../target.ts";
 import { timeoutFlag, waitOptions } from "./common.ts";
 import { announce, ensureCluster, refuseFirst } from "./up.ts";
@@ -61,24 +60,10 @@ export const upgrade = Command.make("upgrade", {
       "Restart the cluster, where the upgrade does, without waiting for the conversations' harnesses to be released: each turn running is ended, and run again on a harness of its own",
     ),
   ),
-  setupPod: Flag.Boolean("setup-pod").pipe(
-    Flag.withDefault(false),
-    Flag.withDescription("Print, as JSON, changing nothing, the pod of this version's alasio that makes its state alone, for a cut-over to run before the upgrade"),
-  ),
-  setupJob: Flag.Boolean("setup-job").pipe(
-    Flag.withDefault(false),
-    Flag.withDescription(
-      "Print, as JSON, changing nothing, the pod of this version's stack setup, which makes what the stack's secrets lack and renders each service's from them, for a cut-over to run before the setup pod",
-    ),
-  ),
-}, ({ timeout, check, now, setupPod: printSetupPod, setupJob: printSetupJob }) =>
+}, ({ timeout, check, now }) =>
   Effect.gen(function*() {
     const config = yield* loadConfig;
     const target = yield* resolveTarget(config);
-    if (printSetupPod || printSetupJob) {
-      const objects = yield* Effect.provide(Effect.map(installConfig(config), (made) => installationObjects(made)), kubeApi(target));
-      return yield* Console.log(JSON.stringify(printSetupJob ? stackSetupPod(objects) : setupPod(objects), null, 2));
-    }
     if (check) {
       yield* Effect.provide(refusals(config), kubeApi(target));
       return yield* Console.log(`alasio would upgrade ${describeTarget(target)} to ${VERSION}: it refuses nothing there now; nothing was changed.`);
