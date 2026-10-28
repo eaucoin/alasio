@@ -36,7 +36,7 @@ import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { GATEWAY as STORE_GATEWAY } from "../../cli/src/manifests/object-store.ts";
 import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
-import { BINDING_LABEL, FREE_LABEL, keyHash, POOL_LABEL } from "../../src/binder/names.ts";
+import { BINDING_LABEL, FREE_LABEL, keyHash, leaseName, POOL_LABEL } from "../../src/binder/names.ts";
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { BAYMA_CONTAINER, RESTORE_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
@@ -377,10 +377,20 @@ function restoreOutcome(restored: Awaited<ReturnType<typeof restore>>, source: "
   return { ok: probed.ok && failures.length === 0, failure: failures.length === 0 ? null : failures.join("; ") };
 }
 
-/** Ends the restored pod `name` without a save, as a crash ends it, and waits until it is gone. */
-async function endUnsaved(name: string): Promise<void> {
+/**
+ * Ends the restored pod `name` of `workspace` without a save, as a crash ends it, and waits until it
+ * is gone, and the gateway has let its binding go: its Lease gone, as the gateway records what a
+ * binding whose pod went is released into while its Lease holds (src/gateway/sessions.ts
+ * recordLost), which would otherwise write over the record a cold restore is given.
+ */
+async function endUnsaved(workspace: string, name: string): Promise<void> {
   await kube.kill(SESSIONS, name);
   await gone(name);
+  const lease = ref("Lease", leaseName(sessionKey(workspace)), SESSIONS);
+  for (const deadline = Date.now() + 300_000; ; await sleep(1000)) {
+    if ((await kube.get(lease)) === null) return;
+    if (Date.now() > deadline) throw new Error(`the binding of ${workspace} was not let go within 300 s of its pod's end`);
+  }
 }
 
 /** Drops the page cache of `node`, as every restore starts with it dropped, so what ran before leaves it nothing. */
@@ -547,7 +557,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const warm = await restore(workspace, sessionId, fixture, runId, manifest);
     emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, warm.details);
     done.add(phase);
-    await endUnsaved(warm.pod);
+    await endUnsaved(workspace, warm.pod);
 
     phase = "restore-cold";
     await agentOk(node, "DELETE", `/workspaces/${SESSIONS}/${workspace}`);
@@ -559,7 +569,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const cold = await restore(workspace, sessionId, fixture, runId, manifest);
     emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, cold.details);
     done.add(phase);
-    await endUnsaved(cold.pod);
+    await endUnsaved(workspace, cold.pod);
   } catch (error) {
     if (error instanceof Uncalibrated) throw error;
     const why = `${phase}: ${errorText(error)}`;
@@ -574,7 +584,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     }
     for (const each of phases.filter((name) => !done.has(name))) emit(fixture, sizeMib, run, each, { ok: false, failure: each === phase ? why : `not run: ${why}` }, {});
     const bound = await boundPodOf(workspace).catch(() => null);
-    if (bound) await endUnsaved(bound.name).catch(() => {});
+    if (bound) await endUnsaved(workspace, bound.name).catch(() => {});
   } finally {
     // Its snapshots forgotten with it, in the bucket and every node's cache, and the copy of its files: asked again
     // while the gateway still lets the binding of the pod ended under it go (409), so no run's images outlive it.
