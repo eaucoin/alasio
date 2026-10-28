@@ -104,7 +104,7 @@ class Bayma {
       answer = await this.call<ExecAnswer>("wait", { session_id: sessionId, exec_id: answer.exec_id, from_seq: answer.next_seq, yield_time_ms: 300_000 });
       stdout += answer.stdout_text ?? "";
     }
-    if (answer.error_text) throw new Error(`the exec failed: ${answer.error_text}`);
+    if (answer.error_text) throw new Error(`the exec failed: ${answer.error_text}${notice === null ? "" : `; bayma's notice: ${notice}`}`);
     return { stdout, notice };
   }
 
