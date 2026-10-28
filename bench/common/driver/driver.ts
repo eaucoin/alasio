@@ -30,8 +30,8 @@ const source = (name: string): string =>
 
 /** How long any one call may take: a restore through alasio's gateway answers the first only once its pod has started. */
 const CALL_TIMEOUT_MS = 900_000;
-/** How long a probe retries a bayma that is not there yet, as one being restored is not. */
-const CONNECT_TIMEOUT_MS = 900_000;
+/** How long a probe retries a bayma that is not there yet, as one being restored is not: a restore's bound (the design's section 5). */
+const CONNECT_TIMEOUT_MS = 300_000;
 /** How long setup lets the fixture run before it measures its steady rate. */
 const STEADY_MS = 10_000;
 
@@ -83,7 +83,8 @@ class Bayma {
         return await Bayma.connect(endpoint);
       } catch (error) {
         if (Date.now() > deadline || !refused(error)) throw error;
-        await sleep(10);
+        // A server that answered to be asked again (502, 503, 504), as a bayma whose restore's hook has not come yet does, is asked a second on, as its Retry-After says.
+        await sleep(statusOf(error) === undefined ? 10 : 1000);
       }
     }
   }
@@ -121,8 +122,16 @@ class Bayma {
   }
 }
 
-/** Whether `error` is of a server that is not there, or not yet answering. */
+/** The HTTP status an MCP request was answered with, where it was: the SDK's StreamableHTTPError's `code`, whose message holds none. */
+function statusOf(error: unknown): number | undefined {
+  const code = (error as { readonly code?: unknown }).code;
+  return typeof code === "number" && code >= 100 ? code : undefined;
+}
+
+/** Whether `error` is of a server that is not there, or not yet answering, or asking to be asked again. */
 function refused(error: unknown): boolean {
+  const status = statusOf(error);
+  if (status === 502 || status === 503 || status === 504) return true;
   const said = `${error instanceof Error ? `${error.message} ${String((error as { cause?: unknown }).cause)}` : String(error)}`;
   return /ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|fetch failed|socket hang up|UND_ERR|other side closed|502|503|504/u.test(said);
 }
