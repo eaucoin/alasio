@@ -141,8 +141,10 @@ and rclone reads it more slowly than the parallel ranged download does.
 
 ## Known failures
 
-In the full matrix (CI runs 40725473764 and 40724539284; 855 lines), 15 lines failed, all of them Bun's or
-bayma's:
+In the first full matrix (CI runs 40725473764 and 40724539284; 855 lines), 15 lines failed, all of them Bun's
+or bayma's. All of them ran on kernel 6.17.0-1022-azure, where every Bun loss in the benchmark so far happened,
+and two of its three jobs on an AMD EPYC 9V74. The benchmark now pins its jobs to an EPYC 7763 on a 7.0 kernel, and
+those results, kept by CPU model in `results/earlier-by-cpu` on the box, are supplementary:
 
 - 4 restores (s3-standard, poller and saturating) lost the session's Bun runtime after the restore. bayma's
   server, the fixture's other processes and the driver's connections live on, but no exec answers, so the run
