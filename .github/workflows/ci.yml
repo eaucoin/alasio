@@ -35,6 +35,10 @@ on:
         description: "alasio's images of an earlier run, kept, as ghcr.io/eaucoin/alasio-ci/run-<id>-<attempt> (built anew if empty)"
         type: string
         default: ""
+      cpu:
+        description: "The runner CPU model every bench job must have, others failing at once to be re-run (any if empty)"
+        type: string
+        default: "AMD EPYC 7763 64-Core Processor"
       keep-images:
         description: "Keep the images this run builds, for later runs, to be deleted by hand"
         type: boolean
@@ -159,6 +163,15 @@ jobs:
       BENCH_CASES: ${{ inputs.cases }}
       BENCH_RUNS: ${{ inputs.runs }}
     steps:
+      # Every system's measures are of one CPU model, and of the disk that comes with it: a job
+      # elsewhere ends at once, to be re-run (gh run rerun <id> --failed) until it lands on one.
+      - name: The runner's CPU, as pinned
+        env:
+          PINNED: ${{ inputs.cpu }}
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          echo "$model"
+          [ -z "$PINNED" ] || [ "$model" = "$PINNED" ] || { echo "::error::this runner's CPU is $model, not $PINNED: re-run this job"; exit 3; }
       # What the runner comes with that no system uses goes, as ci.yml's end-to-end jobs do it:
       # the images, the caches and k3s's images need the disk.
       - name: Free disk space
