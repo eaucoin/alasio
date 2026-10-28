@@ -563,7 +563,11 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
     }
     const guest = hugetlb();
     hugetlbPeak = Math.max(hugetlbPeak, guest);
-    const handlerRss = Number(/VmRSS:\s+(\d+)/u.exec(readFileSync(`/proc/${handler.pid}/status`, "utf8"))?.[1] ?? 0) * 1024;
+    // The handler's resident memory now and at its most, as the kernel says them at this read
+    // (getrusage's maximum is updated lazily and can be short of the current).
+    const status = readFileSync(`/proc/${handler.pid}/status`, "utf8");
+    const kib = (field: string): number => Number(new RegExp(`${field}:\\s+(\\d+)`, "u").exec(status)?.[1] ?? 0) * 1024;
+    const [handlerRss, handlerPeak] = [kib("VmRSS"), kib("VmHWM")];
     const memoryBytes = counter(fc.cgroup, "memory.current") + guest + handlerRss;
     const fcPeak = counter(fc.cgroup, "memory.peak");
     await fc.kill();
@@ -572,7 +576,7 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
     handler.kill("SIGTERM");
     await ended(handler);
     const handlerStats = JSON.parse(readFileSync(stats, "utf8")) as Record<string, number>;
-    const memoryPeak = fcPeak + hugetlbPeak + Number(handlerStats["max_rss_bytes"]);
+    const memoryPeak = fcPeak + hugetlbPeak + handlerPeak;
     // The handler loads only what the guest touches, so its pages are all in once the verify,
     // which reads every page, has answered.
     const residentMs = ms(t0, BigInt(String(probe["verify_end_ns"])));

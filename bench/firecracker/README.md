@@ -132,7 +132,7 @@ pages. E2B's prefetch is also fetch-only for this source.
   charged to the cgroup of the process that faults it in, the handler's for what `UFFDIO_COPY`
   installs, so the guest's memory is both cgroups' `hugetlb.2MB.current` (sampled every 20 ms
   for the peak). `memory_peak_bytes` is Firecracker's `memory.peak` + that hugetlb peak + the
-  handler's peak RSS; `memory_bytes` is Firecracker's `memory.current` + hugetlb + the handler's
+  handler's `VmHWM`, read as it ends; `memory_bytes` is Firecracker's `memory.current` + hugetlb + the handler's
   RSS after verify. On 4 KiB pages the guest's memory is Firecracker's own `memory.*`.
 - The pause check (DESIGN.md section 3): a 1000 ms `PATCH /vm` pause showed 1002.5 ms on the
   guest's ticker (kvm-clock does not hide a pause).
