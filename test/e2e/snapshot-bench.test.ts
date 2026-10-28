@@ -558,6 +558,10 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const why = `${phase}: ${errorText(error)}`;
     console.error(`# ${fixture} ${sizeMib} MiB run ${run} failed at ${why}`);
     await sayRunner(`${fixture}-${sizeMib}-${run}`);
+    if (node !== "") {
+      const logs = await loggedOf(node, workspace).catch((failed: unknown) => ({ agent: [errorText(failed)], gateway: [] }));
+      appendFileSync(join(BENCH_DIR, "logs", `failure-${fixture}-${sizeMib}-${run}.txt`), `\n\n# the node agent of ${workspace}\n${logs.agent.join("\n")}\n\n# the gateway of ${workspace}\n${logs.gateway.join("\n")}\n`);
+    }
     for (const each of phases.filter((name) => !done.has(name))) emit(fixture, sizeMib, run, each, { ok: false, failure: each === phase ? why : `not run: ${why}` }, {});
     const bound = await boundPodOf(workspace).catch(() => null);
     if (bound) await endUnsaved(bound.name).catch(() => {});
