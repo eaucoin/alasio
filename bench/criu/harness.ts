@@ -318,6 +318,15 @@ function keepLogs(run: Run, dir: string): void {
   }
 }
 
+/** Removes `dir`; one that cannot be, as a mount a restore could not let go of, is said and left. */
+function removeTree(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch (error) {
+    console.error(`${dir} was not removed: ${(error as Error).message}`);
+  }
+}
+
 /** Evicts every file from the page cache, as every restore starts (DESIGN.md section 4). */
 function dropCaches(): void {
   must("sync", []);
@@ -664,9 +673,17 @@ async function mounted(run: Run, restoreDir: string): Promise<Images> {
     "--log-directory", join(restoreDir, "mount-s3-logs"),
   ]);
   let released: Promise<void> | null = null;
+  // Once the restore's processes have let go of the mount; detached where one still holds it,
+  // which mount-s3 then ends with.
   const release = () => (released ??= (async () => {
-    spawnSync("umount", [mount], { stdio: "ignore" });
-    await within(served.ended, 60_000, "mount-s3 had not ended 60 s after its unmount");
+    for (let tries = 0; spawnSync("umount", [mount], { stdio: "ignore" }).status !== 0; tries++) {
+      if (tries === 50) {
+        spawnSync("umount", ["--lazy", mount], { stdio: "ignore" });
+        break;
+      }
+      await sleep(100);
+    }
+    await within(served.ended, 60_000, "mount-s3 had not ended 60 s after its unmount").catch(() => kill(served));
   })());
   const deadline = Date.now() + 60_000;
   while (spawnSync("mountpoint", ["-q", mount]).status !== 0) {
@@ -797,7 +814,7 @@ async function restore(run: Run, variant: Variant, warmth: "warm" | "cold", chai
     if (daemon) kill(daemon);
     await images?.release().catch(() => {});
     keepLogs(run, restoreDir);
-    rmSync(restoreDir, { recursive: true, force: true });
+    removeTree(restoreDir);
   }
 }
 
@@ -864,7 +881,7 @@ async function runCase(c: Case, number: number): Promise<void> {
       (error: unknown) => console.error(`${run.runId}: the bucket's objects were not removed: ${String(error)}`),
     );
     keepLogs(run, run.dir);
-    rmSync(run.dir, { recursive: true, force: true });
+    removeTree(run.dir);
   }
 }
 
