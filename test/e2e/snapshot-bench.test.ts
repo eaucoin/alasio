@@ -559,8 +559,13 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const bound = await boundPodOf(workspace).catch(() => null);
     if (bound) await endUnsaved(bound.name).catch(() => {});
   } finally {
-    // Its snapshots forgotten with it, in the bucket and every node's cache, and the copy of its files.
-    const removed = await gatewayCall(await mainToken(workspace), "DELETE", "/workspace").catch((error: unknown) => ({ status: 0, said: errorText(error) }));
+    // Its snapshots forgotten with it, in the bucket and every node's cache, and the copy of its files: asked again
+    // while the gateway still lets the binding of the pod ended under it go (409), so no run's images outlive it.
+    let removed = { status: 0, said: "" };
+    for (const deadline = Date.now() + 300_000; Date.now() < deadline; await sleep(3000)) {
+      removed = await gatewayCall(await mainToken(workspace), "DELETE", "/workspace").catch((error: unknown) => ({ status: 0, said: errorText(error) }));
+      if (removed.status !== 409) break;
+    }
     if (removed.status !== 204) console.error(`# ${workspace} was not removed: ${removed.status} ${removed.said}`);
     if (node !== "") await agentApi(node, "DELETE", `/workspaces/${SESSIONS}/${copy}`).catch(() => {});
     await vacuum().catch((error: unknown) => console.error(`# the store was not compacted after ${workspace}: ${errorText(error)}`));
