@@ -567,7 +567,10 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     await sayRunner(`${fixture}-${sizeMib}-${run}`);
     if (node !== "") {
       const logs = await loggedOf(node, workspace).catch((failed: unknown) => ({ agent: [errorText(failed)], gateway: [] }));
-      appendFileSync(join(BENCH_DIR, "logs", `failure-${fixture}-${sizeMib}-${run}.txt`), `\n\n# the node agent of ${workspace}\n${logs.agent.join("\n")}\n\n# the gateway of ${workspace}\n${logs.gateway.join("\n")}\n`);
+      // How each pod of its ended, where one did: its containers' last states, as kubelet said them.
+      const pods = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` }).catch(() => [] as V1Pod[]);
+      const states = pods.map((pod) => `${pod.metadata?.name}: ${pod.status?.phase} ${JSON.stringify(pod.status?.containerStatuses?.map(({ name, state, lastState, restartCount }) => ({ name, state, lastState, restartCount })))}`);
+      appendFileSync(join(BENCH_DIR, "logs", `failure-${fixture}-${sizeMib}-${run}.txt`), `\n\n# the node agent of ${workspace}\n${logs.agent.join("\n")}\n\n# the gateway of ${workspace}\n${logs.gateway.join("\n")}\n\n# its pods\n${states.join("\n")}\n`);
     }
     for (const each of phases.filter((name) => !done.has(name))) emit(fixture, sizeMib, run, each, { ok: false, failure: each === phase ? why : `not run: ${why}` }, {});
     const bound = await boundPodOf(workspace).catch(() => null);
