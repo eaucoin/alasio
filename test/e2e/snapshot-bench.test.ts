@@ -563,7 +563,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     // while the gateway still lets the binding of the pod ended under it go (409), so no run's images outlive it.
     let removed = { status: 0, said: "" };
     for (const deadline = Date.now() + 300_000; Date.now() < deadline; await sleep(3000)) {
-      removed = await gatewayCall(await mainToken(workspace), "DELETE", "/workspace").catch((error: unknown) => ({ status: 0, said: errorText(error) }));
+      removed = await mainToken(workspace).then((token) => gatewayCall(token, "DELETE", "/workspace")).catch((error: unknown) => ({ status: 0, said: errorText(error) }));
       if (removed.status !== 409) break;
     }
     if (removed.status !== 204) console.error(`# ${workspace} was not removed: ${removed.status} ${removed.said}`);
@@ -672,7 +672,11 @@ test(`alasio's sessions saved and restored, ${RUNS} runs of ${CASES.length} case
   for (let run = 1; run <= RUNS; run++) {
     for (const { fixture, size_mib } of CASES) {
       const started = Date.now();
-      await runOnce(fixture, size_mib, run);
+      // Where the cluster itself fails under a run, what the runner says of it is kept before the run is.
+      await runOnce(fixture, size_mib, run).catch(async (error: unknown) => {
+        await sayRunner(`${fixture}-${size_mib}-${run}-aborted`);
+        throw error;
+      });
       console.error(`# ${fixture} ${size_mib} MiB run ${run} took ${Math.round((Date.now() - started) / 1000)} s`);
     }
   }
