@@ -105,7 +105,9 @@ To show it does what E2B's does, the reference variants run E2B's own code, unmo
 E2B's own Firecracker: its `uffd`, `uffd/prefetch` and `build` packages, wired as its
 orchestrator's test utilities wire a build device (`nbd/testutils/template_rootfs.go`). They read
 the same snapshot through E2B's header (`e2b-serve export` writes it, objects copied to E2B's
-layout) and E2B's S3 chunker. fcmem runs on the same Firecracker beside it. E2B's cache lives as
+layout) and E2B's S3 chunker, with guest memory in a memfd handed over beside the userfaultfd,
+as E2B runs it (`use-memfd`, on by default, ff:230). fcmem runs on the same Firecracker beside
+it, without the memfd, which it does not use. E2B's cache lives as
 long as its process (an orchestrator that keeps the snapshots it took). So for a warm restore
 E2B's handler is started and has read every block before t0; for a cold one it starts at t0, as
 fcmem always does. Its cache is a memory-mapped file, whose pages the page cache drop before t0
@@ -120,6 +122,8 @@ pages. E2B's prefetch is also fetch-only for this source.
 - `image_bytes`: what the save wrote to the bucket (memory object, state file, header);
   `uploaded_bytes`: the bucket's listing of the snapshot's prefix. `precopy_*`: 0, as
   Firecracker has no pre-copy. `details.staged_bytes`: the memory file on the runner's disk.
+- A restore fails if its first exec and its verify have not answered 300 s after t0 (DESIGN.md
+  section 5); the verify reads every page, so its end is every page resident.
 - `resident_how: "touched"`: nothing loads blocks the guest does not touch (a fetch-only prefetch
   only warms the cache), so `resident_ms` is t0 to the verify's end.
 - Memory: Firecracker and the handler each run in a cgroup of their own. A hugetlbfs page is

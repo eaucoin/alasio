@@ -556,7 +556,7 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
     const loaded = now();
     let probe: Record<string, unknown>;
     try {
-      probe = driver("probe", [...o.endpoint, "--session", o.session, "--fixture", o.theCase.fixture, "--run-id", o.runId, "--t0-ns", String(t0)], Math.max(1, RESTORE_LIMIT_MS - ms(t0, now())));
+      probe = driver("probe", [...o.endpoint, "--session", o.session, "--fixture", o.theCase.fixture, "--run-id", o.runId, "--t0-ns", String(t0)], Math.max(1, Math.ceil(RESTORE_LIMIT_MS - ms(t0, now()))));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ETIMEDOUT") throw error;
       throw new Error(`the first exec and the verify had not both answered ${RESTORE_LIMIT_MS / 1000} s after t0`);
