@@ -14,7 +14,7 @@
  *   release (POST /release), as alasio's own.
  * - Between the warm restore and the cold one the session's workspace is put back as it was at
  *   the release (a JuiceFS clone through the node agent), its snapshot made current again
- *   (./bench-bucket.ts recommit) and its release record written again, and every node's cache of
+ *   (its manifest put back as current.json) and its release record written again, and every node's cache of
  *   it removed, with the node's page cache.
  * - The emulated store profiles put toxiproxy in each node agent's network namespace, the only
  *   client of the snapshots bucket (bench/common/store/shape.ts), the agent's connections to the
@@ -24,7 +24,7 @@
  *
  *   ALASIO_E2E_TARGET=host ALASIO_E2E_SHARD=bench BENCH_DIR=... BENCH_PROFILE=local node --test test/e2e/snapshot-bench.test.ts
  */
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -42,8 +42,7 @@ import { BAYMA_CONTAINER, RESTORE_ANNOTATION } from "../../src/kube/sandbox-shap
 import type { Manifest } from "../../src/node-agent/agent.ts";
 import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
-import type { Held, Recommitted } from "./bench-bucket.ts";
-import { bindSession, boundPodOf, dumpClusterState, gatewayCall, inNodeAgent, kube, mainToken, nodeAgents, onNode, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
+import { bindSession, boundPodOf, dumpClusterState, gatewayCall, kube, mainToken, nodeAgents, onNode, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const now = (): bigint => process.hrtime.bigint();
@@ -159,12 +158,12 @@ async function agentOk(node: string, method: string, path: string, body?: unknow
 }
 
 /**
- * The node agent's live checkpoint of the workspace's sandbox, asked in the agent's pod, as the
+ * The node agent's live checkpoint of the workspace's sandbox, asked in the agent's network, as the
  * gateway asks it, timed there from its ask to its manifest committed: the time and the manifest.
  */
 const CHECKPOINT = `
-const [port, environment, workspace] = process.argv.slice(1);
-const body = require("node:fs").readFileSync(0, "utf8");
+const [port, environment, workspace, request] = process.argv.slice(1);
+const body = require("node:fs").readFileSync(request, "utf8");
 const headers = { authorization: "Bearer " + process.env.${NODE_AGENT_TOKEN_VARIABLE}, "content-type": "application/json" };
 const base = "http://127.0.0.1:" + port;
 (async () => {
@@ -407,7 +406,8 @@ async function vacuum(): Promise<void> {
 }
 
 /** The bytes the workspace's snapshots hold in the bucket. */
-const bucketBytes = async (node: string, workspace: string): Promise<number> => (await inNodeAgent<Held>(node, "./bench-bucket.ts", "bytes", SESSIONS, workspace)).bytes;
+const bucketBytes = async (node: string, workspace: string): Promise<number> =>
+  (JSON.parse(await inAgentNetwork(node, [new URL("dist/s3.mjs", COMMON).pathname, "bytes", `${SESSIONS}/${workspace}/`])) as { readonly bytes: number }).bytes;
 
 /** bayma's state directory `stateDir`, under /home/agent, by the path of the volume the image's /home/agent links into (sandbox/agent/Dockerfile). */
 const mountedStateDir = (stateDir: string): string => (stateDir.startsWith("/home/agent/") ? `/attach/ws/home/${stateDir.slice("/home/agent/".length)}` : stateDir);
@@ -493,8 +493,14 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const sandboxId = await sandboxIdOf(node, bound.name);
     const heldBefore = await bucketBytes(node, workspace);
     await driver(workspace, "mark", "--session", sessionId, "--fixture", fixture);
-    const agent = (await nodeAgents()).get(node) ?? "";
-    const checkpointed = await kube.exec(NAMESPACE, agent, ["node", "-e", CHECKPOINT, String(NODE_AGENT_PORT), SESSIONS, workspace], { container: "node-agent", stdin: JSON.stringify(request) });
+    const asking = join(BENCH_DIR, "checkpoint.cjs");
+    const asked = join(BENCH_DIR, "checkpoint-request.json");
+    writeFileSync(asking, CHECKPOINT);
+    writeFileSync(asked, JSON.stringify(request));
+    const checkpointed = await inAgentNetwork(node, [asking, String(NODE_AGENT_PORT), SESSIONS, workspace, asked]).then(
+      (stdout) => ({ code: 0, stdout, stderr: "" }),
+      (error: unknown) => ({ code: 1, stdout: "", stderr: errorText(error) }),
+    );
     const gaps = await driver<{ readonly max_gap_ms: number; readonly slowdown: number | null }>(workspace, "gaps", "--session", sessionId, "--fixture", fixture);
     const heldLive = await bucketBytes(node, workspace);
     const liveLogged = saveLogged(await bootLog(node, sandboxId));
@@ -546,8 +552,9 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     phase = "restore-cold";
     await agentOk(node, "DELETE", `/workspaces/${SESSIONS}/${workspace}`);
     await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace: copy }, to: { environment: SESSIONS, workspace }, quotaBytes: quota.capacityBytes });
-    const recommitted = await inNodeAgent<Recommitted>(node, "./bench-bucket.ts", "recommit", SESSIONS, workspace, manifest.snapshot);
-    await agentOk(node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: recommitted.snapshot, release: recommitted.release });
+    // Its snapshot current again, its manifest put back as current.json, as a checkpoint commits it (src/node-agent/agent.ts commit).
+    await inAgentNetwork(node, [new URL("dist/s3.mjs", COMMON).pathname, "copy", `${SESSIONS}/${workspace}/manifests/${manifest.snapshot}.json`, `${SESSIONS}/${workspace}/current.json`]);
+    await agentOk(node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: manifest.snapshot, release: manifest.release });
     await coldCaches(workspace);
     const cold = await restore(workspace, sessionId, fixture, runId, manifest);
     emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, cold.details);
@@ -615,13 +622,31 @@ async function storeAddress(): Promise<string> {
  * bucket, from the node, as the agent's pod has no room for its 256 MiB.
  */
 async function probeStore(node: string): Promise<Record<string, number>> {
+  return JSON.parse(await inAgentNetwork(node, [new URL("dist/probe.mjs", COMMON).pathname, "--prefix", "bench-probe/"])) as Record<string, number>;
+}
+
+/**
+ * Runs the Node program `argv` from the node, in the network namespace of the node agent on
+ * `node`, with the agent's key and bucket, the store by its Service's address, and the agent's
+ * token, as the agent's own client of the bucket and the gateway's of the agent: from the node, as
+ * a program run in the agent's container is charged to its memory, which the agent's own work
+ * fills (one such, 137, ended the agent under a save). Its last line printed.
+ */
+async function inAgentNetwork(node: string, argv: readonly string[]): Promise<string> {
   const pid = await agentPid(node);
   const environment = (await onNode(node, `tr '\\0' '\\n' < /proc/${pid}/environ`)).split("\n");
   const of = (name: string) => environment.find((line) => line.startsWith(`${name}=`))?.slice(name.length + 1) ?? "";
-  const given = { S3_ENDPOINT: `http://${await storeAddress()}:8333`, S3_REGION: of("S3_REGION"), S3_BUCKET: of("S3_BUCKET"), AWS_ACCESS_KEY_ID: of("AWS_ACCESS_KEY_ID"), AWS_SECRET_ACCESS_KEY: of("AWS_SECRET_ACCESS_KEY") };
+  const given = {
+    S3_ENDPOINT: `http://${await storeAddress()}:8333`,
+    S3_REGION: of("S3_REGION"),
+    S3_BUCKET: of("S3_BUCKET"),
+    AWS_ACCESS_KEY_ID: of("AWS_ACCESS_KEY_ID"),
+    AWS_SECRET_ACCESS_KEY: of("AWS_SECRET_ACCESS_KEY"),
+    [NODE_AGENT_TOKEN_VARIABLE]: of(NODE_AGENT_TOKEN_VARIABLE),
+  };
   const assignments = Object.entries(given).map(([name, value]) => `${name}='${value}'`).join(" ");
-  const printed = await onNode(node, `nsenter --target ${pid} --net env ${assignments} ${process.execPath} ${new URL("dist/probe.mjs", COMMON).pathname} --prefix bench-probe/`);
-  return JSON.parse(printed.trim().split("\n").at(-1) ?? "{}") as Record<string, number>;
+  const printed = await onNode(node, `nsenter --target ${pid} --net env ${assignments} ${process.execPath} ${argv.map((arg) => `'${arg}'`).join(" ")}`);
+  return printed.trim().split("\n").at(-1) ?? "";
 }
 
 /**

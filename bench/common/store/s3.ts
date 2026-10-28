@@ -8,6 +8,7 @@
  *   node s3.ts download <prefix> <dir>    every object under <prefix> into <dir>: ranged GETs of 32 MiB, 4 at once
  *   node s3.ts bytes <prefix>             the bytes of the objects under <prefix>
  *   node s3.ts delete <prefix>            deletes the objects under <prefix>, a thousand a request
+ *   node s3.ts copy <from> <to>           copies the object <from> as <to>, in the bucket
  *
  * --range-bytes and --at-once change the parts' and ranges' size and how many go at once, over
  * all of a transfer's files together, for a system whose documented practice cuts it otherwise.
@@ -19,6 +20,7 @@ import { parseArgs } from "node:util";
 
 import {
   CompleteMultipartUploadCommand,
+  CopyObjectCommand,
   CreateBucketCommand,
   CreateMultipartUploadCommand,
   DeleteObjectsCommand,
@@ -187,7 +189,8 @@ if (/(^|\/)s3\.(ts|mjs)$/u.test(process.argv[1] ?? "")) {
     : command === "download" ? await download(store, first, second, cut)
     : command === "bytes" ? { prefix: first, bytes: (await list(store, first)).reduce((sum, { bytes }) => sum + bytes, 0) }
     : command === "delete" ? await remove(store, first)
+    : command === "copy" ? await store.client.send(new CopyObjectCommand({ Bucket: store.bucket, Key: second, CopySource: `${store.bucket}/${first}` })).then(() => ({ copied: first, to: second }))
     : null;
-  if (said === null) throw new Error("usage: s3.ts [--at-once N] [--range-bytes B] mkbucket | upload <dir> <prefix> | download <prefix> <dir> | bytes <prefix> | delete <prefix>");
+  if (said === null) throw new Error("usage: s3.ts [--at-once N] [--range-bytes B] mkbucket | upload <dir> <prefix> | download <prefix> <dir> | bytes <prefix> | delete <prefix> | copy <from> <to>");
   console.log(JSON.stringify(said));
 }
