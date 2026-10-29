@@ -9,7 +9,8 @@
 # gives them. BENCH_VARIANT `all` is the system as README.md configures it; `phaul` and `splice`
 # are the defaults of the two knobs it tunes on the benchmark, measured beside; `chain` restores
 # lazily a stopping save of pre-dump rounds on the live save's image, the evidence for its full one;
-# `patched` restores lazily with uffd-eexist.patch in the lazy-pages daemon (not upstream).
+# `patched` restores lazily with uffd-eexist.patch in the lazy-pages daemon (not upstream);
+# `eager` is `all` with the eager restores alone, rows `eager` (saves included).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 target=$1
@@ -53,6 +54,7 @@ phaul) knobs=(--rounds phaul --variant-suffix phaul) ;;
 splice) knobs=(--pre-dump-mode splice --variant-suffix splice) ;;
 chain) knobs=(--stop chain --variants lazy --variant-suffix chain) ;;
 patched) knobs=(--lazy-pages-criu /usr/local/sbin/criu-patched --variants lazy --variant-suffix patched) ;;
+eager) knobs=(--variants eager) ;;
 *) echo "criu has no variant $BENCH_VARIANT" >&2; exit 1 ;;
 esac
 

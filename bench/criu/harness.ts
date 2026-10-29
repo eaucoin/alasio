@@ -703,6 +703,13 @@ async function mounted(run: Run, restoreDir: string): Promise<Images> {
 }
 
 /**
+ * A cold `eager` restore's download, on its critical path: 16 MiB ranges, 16 at once, as gVisor's
+ * `fetch` downloads its image. AWS's S3 performance whitepaper asks one connection for each
+ * 85-90 MB/s wanted, in 8-16 MB ranges.
+ */
+const DOWNLOAD = ["--at-once", "16", "--range-bytes", String(16 << 20)];
+
+/**
  * Cold, eager: the stopping save's manifest, then each directory it names, downloaded with
  * common's s3.mjs (one process a prefix, one after another), then the parents linked.
  */
@@ -711,7 +718,7 @@ async function downloaded(run: Run, restoreDir: string): Promise<Images> {
   const downloads: Helper[] = [];
   const said: unknown[] = [];
   const get = async (key: string, into: string) => {
-    const download = helper(`download-${downloads.length}`, restoreDir, process.execPath, [s3, "download", `${run.prefix}${key}`, into]);
+    const download = helper(`download-${downloads.length}`, restoreDir, process.execPath, [s3, ...DOWNLOAD, "download", `${run.prefix}${key}`, into]);
     downloads.push(download);
     const { status, stdout, stderr } = await download.ended;
     if (status !== 0) throw new Error(`the download of ${key} failed: ${stderr.trim().slice(-2000)}`);

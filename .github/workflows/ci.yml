@@ -20,7 +20,7 @@ on:
         type: string
         default: "local s3-standard s3-express"
       variants:
-        description: "Variants, a job each, of the systems that name them (alasio: as-shipped with-fix; gvisor: all tuned defaults; criu: all phaul splice chain patched); each system's own default where empty or none of its"
+        description: "Variants, a job each, of the systems that name them (alasio: as-shipped with-fix; gvisor: all tuned defaults; criu: all phaul splice chain patched eager); each system's own default where empty or none of its"
         type: string
         default: ""
       cases:
@@ -75,7 +75,7 @@ jobs:
           words() { jq --raw-input --compact-output '[splits("[\\s,]+") | select(. != "")]' <<<"$1"; }
           matrix=$(jq --null-input --compact-output \
             --argjson systems "$(words "$SYSTEMS")" --argjson targets "$(words "$TARGETS")" --argjson profiles "$(words "$PROFILES")" --argjson variants "$(words "$VARIANTS")" '
-            {alasio: ["as-shipped", "with-fix"], gvisor: ["all", "tuned", "defaults"], firecracker: ["all"], criu: ["all", "phaul", "splice", "chain", "patched"]} as $variantsOf
+            {alasio: ["as-shipped", "with-fix"], gvisor: ["all", "tuned", "defaults"], firecracker: ["all"], criu: ["all", "phaul", "splice", "chain", "patched", "eager"]} as $variantsOf
             | {alasio: ["as-shipped", "with-fix"], gvisor: ["all"], firecracker: ["all"], criu: ["all"]} as $defaults
             | ($variantsOf | keys) as $known
             | ["local", "s3-standard", "s3-express"] as $shapes

@@ -52,8 +52,8 @@ benchmark is DESIGN.md; this is how the `criu` system meets it, which knobs it s
    - `eager`, warm: `runc restore --image-path <stage>/stop`. CRIU loads every page before the
      tasks run.
    - `eager`, cold: from t0, the manifest, then each directory it names, downloaded with
-     common's `s3.mjs download` (32 MiB ranged GETs, 4 at once), any `parent` links made, then
-     the restore as warm.
+     common's `s3.mjs download` (16 MiB ranged GETs, 16 at once, as gVisor's `fetch`), any
+     `parent` links made, then the restore as warm.
 
    The probe starts at t0, beside the restore. `resident_ms`: for `lazy`, when the lazy-pages
    daemon has injected every page and ends (it exits once nothing is left, `criu/uffd.c`
@@ -71,6 +71,8 @@ benchmark is DESIGN.md; this is how the `criu` system meets it, which knobs it s
 - `chain`: the stopping save as pre-dump rounds and a dump on the live save's image, restored
   lazily, rows `lazy-chain`. This is the evidence that a pre-copied image restores almost
   eagerly.
+- `eager`: `all` with the eager restores alone, rows `eager`, saves included. Its cold restores
+  replace those of the first pinned runs, whose download took 32 MiB ranges 4 at once.
 - `patched`: the lazy restores with `uffd-eexist.patch` in the lazy-pages daemon (below), rows
   `lazy-patched`, on `idle` and `fan-out`. **Patched, not upstream**: for information only.
 
@@ -138,7 +140,8 @@ slowly can pass the bound. Such a restore fails, and says so.
 | freezing | the cgroup v2 freezer, which runc asks CRIU for | runc's default with cgroup v2 and CRIU 3.14+ | runc `criu_linux.go` (`FreezeCgroup`) |
 | TCP | `tcp-close` (`criu.conf`) | bayma promises that a restored session's connections are closed. With `tcp-close` established connections are neither dumped nor locked, and come back closed. `--tcp-established` would also need the peer to wait out the save | `Documentation/criu.txt` `--tcp-close`; https://criu.org/TCP_connection |
 | image location | the runner's staging disk, then the bucket; each pre-dump uploaded while the next round runs | the documented flow copies each pre-dump's images between rounds (`rsync`). Uploading during the next round keeps the rounds short. The bucket stays off the freeze, as with alasio | https://criu.org/Iterative_migration |
-| upload, eager download | common's `s3.mjs`: 32 MiB parts and ranged GETs, 4 at once | the same client and settings as every runner system, which are alasio's node agent's | DESIGN.md section 4 |
+| upload | common's `s3.mjs`: 32 MiB parts, 4 at once | the same client and settings as every runner system, which are alasio's node agent's | DESIGN.md section 4 |
+| eager download | common's `s3.mjs`: 16 MiB ranged GETs, 16 at once | the download is on the cold restore's critical path, as gVisor `fetch`'s is, so it takes the same settings: AWS asks one connection for each 85-90 MB/s wanted, in 8-16 MB ranges. The first pinned runs took 32 MiB ranges, 4 at once, which the emulated stores' 85 MB/s a connection held to about 340 MB/s; their eager cold restores are superseded (`~/snapshot-bench/compare`, the run list) | AWS, *Best Practices Design Patterns: Optimizing Amazon S3 Performance* |
 | lazy restore | `runc restore --lazy-pages` + `criu lazy-pages`, CRIU's default log level for the daemon | CRIU's post-copy restore; the daemon injects faulted pages first and the rest in the background, then exits | https://criu.org/Lazy_migration; `Documentation/criu.txt` `lazy-pages`; `man runc-restore` |
 | cold lazy reads | Mountpoint 1.24.0, `--read-only --prefix --force-path-style`, defaults otherwise: 8 MiB read parts, 16 threads, no cache | AWS's documented defaults for reading S3 as files; a cache would make cold warm | https://github.com/awslabs/mountpoint-s3/blob/main/doc/CONFIGURATION.md |
 | network lock | `network-lock skip` (`criu.conf`) | CRIU drops the namespace's packets while a dump or a restore runs, so that a dumped connection sees no RST. With `tcp-close` no connection is kept, which is the case the man page names for `skip`. The first run without it showed the cost: the probe's SYN, dropped during the restore, waited out TCP's 1 s retransmission, about 1 s on every restore's `first_exec_ms` | `Documentation/criu.txt` `--network-lock` |
