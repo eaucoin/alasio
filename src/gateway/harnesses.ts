@@ -70,6 +70,8 @@ const UNREACHED_MS = 10 * 60_000;
 const POOLS_LOOKED_MS = 60_000;
 /** How long a released pod's containers are waited for to stop, once its deletion is asked. */
 const STOP_TIMEOUT_MS = 120_000;
+/** How long a host whose drain failed is waited for to be said ended, as kubelet says it some seconds after. */
+const ENDED_WAIT_MS = 10_000;
 
 /** A bound host something goes on in again as it is drained to be released, which is kept. */
 class HostBusy extends Schema.TaggedError<HostBusy>()("HostBusy", { key: Schema.String, pod: Schema.String }) {
@@ -322,9 +324,25 @@ export const makeHarnesses = Effect.fnUntraced(function*(
     });
 
   /**
+   * How the host of `name` of `pool` ended, as kubelet says it within ENDED_WAIT_MS; null where
+   * it does not, or the pod is gone.
+   */
+  const endedWithin = (pool: Pool, name: string): Effect.Effect<string | null, KubeApiError> =>
+    Effect.gen(function*() {
+      const deadline = (yield* Clock.currentTimeMillis) + ENDED_WAIT_MS;
+      for (;;) {
+        const pod = (yield* kube.read("v1", "Pod", pool.namespace, name)) as V1Pod | null;
+        if (pod && hostEnded(pod)) return endedHow(pod);
+        if (!pod || (yield* Clock.currentTimeMillis) >= deadline) return null;
+        yield* Effect.sleep(500);
+      }
+    });
+
+  /**
    * Drains the host of `key`'s binding `binding`, its pod `name`, for drainMs at most, as the
    * module says: one that does not drain in time, or is not reached, is let go of all the same,
-   * and said so; one in which something goes on again is kept (HostBusy).
+   * and said so, with how it ended where it did, as a host that dies of its drain does; one in
+   * which something goes on again is kept (HostBusy).
    */
   const drained = (pool: Pool, key: string, binding: string, name: string): Effect.Effect<void, KubeApiError | HostBusy> =>
     Effect.gen(function*() {
@@ -333,8 +351,10 @@ export const makeHarnesses = Effect.fnUntraced(function*(
       const conversation = conversationOfHarnessKey(key);
       if (!host || !conversation) return;
       const done = yield* host.drain(conversation).pipe(Effect.timeoutOption(drainMs), Effect.result);
-      if (done._tag === "Failure") yield* Effect.logWarning(`${key}'s host in ${name} could not be drained, and is let go of all the same: ${done.failure.message}`);
-      else if (Option.isNone(done.success)) yield* Effect.logWarning(`${key}'s host in ${name} had not drained within ${drainMs / 1000} s, and is let go of all the same`);
+      if (done._tag === "Failure") {
+        const how = yield* endedWithin(pool, name);
+        yield* Effect.logWarning(`${key}'s host in ${name} could not be drained${how === null ? "" : `, as it ended (${how})`}, and is let go of all the same: ${done.failure.message}`);
+      } else if (Option.isNone(done.success)) yield* Effect.logWarning(`${key}'s host in ${name} had not drained within ${drainMs / 1000} s, and is let go of all the same`);
       else if (!done.success.value) return yield* new HostBusy({ key, pod: name });
     });
 
