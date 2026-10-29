@@ -1,7 +1,6 @@
 # Firecracker in the memory-snapshot benchmark
 
-System `firecracker` of the benchmark (`../../../snapshot-bench/DESIGN.md` on the box; DESIGN.md
-below): microVM snapshots of Firecracker v1.17.0, saved to the bucket, restored by a userfaultfd
+System `firecracker` of the benchmark (DESIGN.md, in `~/snapshot-bench` on the box): microVM snapshots of Firecracker v1.17.0, saved to the bucket, restored by a userfaultfd
 page-fault handler that serves guest memory from the bucket on demand, with the practices E2B's
 runtime uses: zero blocks never fetched, a hot set prefetched in the background, a per-host chunk
 cache. The handler and the save tool are `fcmem` (Go, `fcmem/`); `bench.ts` runs the cases,
@@ -100,7 +99,7 @@ against stock Firecracker, though. It installs every read fault with `UFFDIO_COP
 for MISSING only, as stock Firecracker registers it (`persist.rs`, `guest_memory_from_uffd`).
 E2B's fork registers `MISSING | WRITE_PROTECT` (`src/vmm/src/persist/mod.rs:556-559` at
 `431f1fc7`). Its handshake also comes with E2B's storage, header and feature-flag stack. So fcmem
-implements what E2B's handler does, as the table cites, in about 800 lines, tested against a
+implements what E2B's handler does, as the table cites, in about 1,300 lines with its save, tested against a
 real userfaultfd (`fcmem_test.go`).
 
 To show it does what E2B's does, the reference variants run E2B's own code, unmodified, behind
@@ -132,11 +131,23 @@ pages. E2B's prefetch is also fetch-only for this source.
   charged to the cgroup of the process that faults it in, the handler's for what `UFFDIO_COPY`
   installs, so the guest's memory is both cgroups' `hugetlb.2MB.current` (sampled every 20 ms
   for the peak). `memory_peak_bytes` is Firecracker's `memory.peak` + that hugetlb peak + the
-  handler's `VmHWM`, read as it ends; `memory_bytes` is Firecracker's `memory.current` + hugetlb + the handler's
-  RSS after verify. On 4 KiB pages the guest's memory is Firecracker's own `memory.*`.
+  handler's `VmHWM`, read as it ends; `memory_bytes` is Firecracker's `memory.current` + hugetlb
+  + the handler's RSS after verify. On 4 KiB pages the guest's memory is Firecracker's own `memory.*`.
 - The pause check (DESIGN.md section 3): a 1000 ms `PATCH /vm` pause showed 1002.5 ms on the
   guest's ticker (kvm-clock does not hide a pause).
 
 ## Results
 
-In `results/` beside this README on the box: `results.jsonl` (every line) and `summary.md`.
+Final runs at `15e39f1c`, every job on the pinned host (AMD EPYC 7763, kernel 7.0.0-1017-azure):
+local 40796830928, s3-standard 40796849618, s3-express 40796868049. 1069 of 1070 lines passed.
+On the box, `~/snapshot-bench/firecracker/results/` holds `results.jsonl`, `summary.md` (key
+medians and what they say) and `aggregate.md`/`.json` (the common aggregator's tables).
+
+The reference agrees with E2B. On poller/1024 cold, fcmem's verify takes 4.8 s locally and
+13.5 s through s3-express, against 4.8 s and 11.4 s for E2B's handler; first exec with prefetch is 1.2 / 1.7 s
+against 1.4 / 1.9 s. Warm, E2B's is faster (first exec 0.33 s against 0.67 s), because its cache
+is held in memory where fcmem's is on disk.
+
+Open: one cold restore of 225 (local poller/1024, run 5) stalled with the handler idle, nothing
+in flight; its failure is reported. The job now records the handler's counters on such a
+failure, to tell a lost fault from a guest stalled elsewhere.
