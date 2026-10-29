@@ -624,10 +624,22 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
       },
     };
   } catch (error) {
-    // What the handler was doing when the restore failed, into the run's log: a Go program
-    // prints every goroutine's stack as SIGQUIT ends it.
-    handler.kill("SIGQUIT");
-    throw error;
+    // What the handler was doing when the restore failed: fcmem's counters, which it writes as
+    // it is told to end, into the failure; E2B's goroutines' stacks into the run's log, which a
+    // Go program prints as SIGQUIT ends it.
+    if (kind === "e2b") {
+      handler.kill("SIGQUIT");
+      throw error;
+    }
+    handler.kill("SIGTERM");
+    await within(ended(handler), STEP_MS, "the handler's end").catch(() => undefined);
+    let counters = "none";
+    try {
+      counters = readFileSync(stats, "utf8");
+    } catch {
+      // It wrote none.
+    }
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; the handler's counters: ${counters}`);
   } finally {
     clearInterval(sampler);
     if (fc !== null) await fc.kill();

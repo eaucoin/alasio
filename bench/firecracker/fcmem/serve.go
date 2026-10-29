@@ -69,8 +69,8 @@ type handler struct {
 	pageSize uint64
 	state    []atomic.Uint32
 
-	faults, installs, zeroInstalls              atomic.Int64
-	firstFaultNs, lastInstallNs, prefetchDoneNs atomic.Int64
+	faults, installs, zeroInstalls, wakes                    atomic.Int64
+	firstFaultNs, lastFaultNs, lastInstallNs, prefetchDoneNs atomic.Int64
 }
 
 type serveStats struct {
@@ -78,12 +78,14 @@ type serveStats struct {
 	Faults          int64  `json:"faults"`
 	Installs        int64  `json:"installs"`
 	ZeroInstalls    int64  `json:"zero_installs"`
+	Wakes           int64  `json:"wakes"`
 	HotBlocks       int    `json:"hot_blocks"`
 	ChunksFromStore int64  `json:"chunks_from_store"`
 	BlocksRead      int64  `json:"blocks_read"`
 	BytesFetched    int64  `json:"bytes_fetched"`
 	ReadyMs         int64  `json:"ready_ms"`
 	FirstFaultMs    int64  `json:"first_fault_ms"`
+	LastFaultMs     int64  `json:"last_fault_ms"`
 	LastInstallMs   int64  `json:"last_install_ms"`
 	PrefetchDoneMs  int64  `json:"prefetch_done_ms"`
 	InstalledBlocks int    `json:"installed_blocks"`
@@ -177,12 +179,14 @@ func serve(args []string) error {
 		Faults:          h.faults.Load(),
 		Installs:        h.installs.Load(),
 		ZeroInstalls:    h.zeroInstalls.Load(),
+		Wakes:           h.wakes.Load(),
 		HotBlocks:       len(h.header.Hot),
 		ChunksFromStore: h.cache.fromStore.Load(),
 		BlocksRead:      h.cache.blocksRead.Load(),
 		BytesFetched:    h.cache.bytesFetched.Load(),
 		ReadyMs:         readyMs,
 		FirstFaultMs:    h.firstFaultNs.Load() / 1e6,
+		LastFaultMs:     h.lastFaultNs.Load() / 1e6,
 		LastInstallMs:   h.lastInstallNs.Load() / 1e6,
 		PrefetchDoneMs:  h.prefetchDoneNs.Load() / 1e6,
 	}
@@ -311,6 +315,7 @@ func (h *handler) serveLoop(ends ...int) error {
 				if h.faults.Add(1) == 1 {
 					h.firstFaultNs.Store(int64(time.Since(h.start)))
 				}
+				h.lastFaultNs.Store(int64(time.Since(h.start)))
 				b := index(msg.address)
 				if b < 0 {
 					return fmt.Errorf("fault at %#x outside guest memory", msg.address)
@@ -324,6 +329,7 @@ func (h *handler) serveLoop(ends ...int) error {
 					}()
 				case h.state[b].Load() == blockInstalled:
 					// A fault read after its block's install, whose thread the install woke.
+					h.wakes.Add(1)
 					if err := wake(h.uffd, h.addrs[b], blockSize); err != nil {
 						return err
 					}
