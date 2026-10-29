@@ -411,14 +411,12 @@ if (inShard("upgrade")) {
           // not released into, and the session bound from bayma's checkpoints instead.
           assert.ok(!said.some((line) => /could not read|is bound from bayma's checkpoints/u.test(line)), said.join("\n"));
           assert.match(bound.name, /-restore-/u);
-          // Onto the template before, the release before's, its bayma's state named as that one named it; the pools' own now
-          // name it through their pods' mount.
-          const stateDir = (spec: V1PodTemplateSpec["spec"] | undefined) => {
-            const args = spec?.containers.find(({ name }) => name === "bayma")?.args ?? [];
-            return args[args.indexOf("--state-dir") + 1];
-          };
+          // Onto the template before, the release before's, whose sandbox image is that release's; the pools' own now run
+          // this one's.
+          const imageOf = (spec: V1PodTemplateSpec["spec"] | undefined) => spec?.containers.find(({ name }) => name === "bayma")?.image;
           const templates = await gatewayTemplates();
-          assert.deepEqual([stateDir((await sessionPod(RELEASED_SESSION)).spec), stateDir(templates.previous?.spec), stateDir(templates.current.spec)], ["/home/agent/.bayma", "/home/agent/.bayma", "/attach/ws/home/.bayma"]);
+          assert.notEqual(imageOf(templates.previous?.spec), imageOf(templates.current.spec));
+          assert.equal(imageOf((await sessionPod(RELEASED_SESSION)).spec), imageOf(templates.previous?.spec));
           const seen = await repl.read(RELEASED_SESSION, releasedRepl);
           assert.deepEqual([seen.live, seen.checkpointed], [`held on ${PREVIOUS}`, `held on ${PREVIOUS}`]);
           assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
