@@ -197,6 +197,22 @@ function startIn(cgroupPath: string, log: string, file: string, args: readonly s
 const ended = (child: ChildProcess): Promise<void> =>
   child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : new Promise((resolve) => child.once("exit", () => resolve()));
 
+/**
+ * `promise`, or a failure saying what did not happen within `ms`: a step that waits on a guest,
+ * a VMM or a handler that is stuck fails its run rather than the job.
+ */
+function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<never>((_, reject) => (timer = setTimeout(() => reject(new Error(`${what} took longer than ${ms / 1000} s`)), ms)));
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
+
+/** How long a step of a run that takes no time of its own may take. */
+const STEP_MS = 120_000;
+
+/** A line in the job's log, for where a run is. */
+const step = (what: string) => console.log(`${new Date().toISOString()} ${what}`);
+
 /** A Firecracker process and its API. */
 class Firecracker {
   readonly process: ChildProcess;
@@ -230,6 +246,10 @@ class Firecracker {
   }
 
   api(method: string, path: string, body?: unknown): Promise<string> {
+    return within(this.call(method, path, body), STEP_MS, `Firecracker's ${method} ${path}`);
+  }
+
+  private call(method: string, path: string, body?: unknown): Promise<string> {
     return new Promise((resolve, reject) => {
       const payload = body === undefined ? undefined : JSON.stringify(body);
       const req = request({ socketPath: this.socket, method, path, headers: payload === undefined ? {} : { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } }, (res) => {
@@ -245,7 +265,7 @@ class Firecracker {
 
   async kill(): Promise<void> {
     this.process.kill("SIGKILL");
-    await ended(this.process);
+    await within(ended(this.process), STEP_MS, "Firecracker's end");
     removeCgroup(this.cgroup);
   }
 }
@@ -388,6 +408,7 @@ async function runCase(theCase: Case, runIndex: number, setup: Setup, checkPause
     }
 
     // save-live
+    step(`save-live ${name}`);
     const live = { mem: join(staging, "live.mem"), state: join(staging, "live.state") };
     driver("mark", [...endpoint, ...fixtureArgs]);
     let t0 = now();
@@ -414,6 +435,7 @@ async function runCase(theCase: Case, runIndex: number, setup: Setup, checkPause
     });
 
     // save-stop
+    step(`save-stop ${name}`);
     const stop = { mem: join(staging, "stop.mem"), state: join(staging, "stop.state") };
     t0 = now();
     await fc.api("PATCH", "/vm", { state: "Paused" });
@@ -477,11 +499,11 @@ const snapshotOf = (setup: Setup, files: { readonly mem: string; readonly state:
 
 function fcmemSave(id: string, prefix: string, files: { readonly mem: string; readonly state: string }, parent: string | null, snapshots: string, cache: string): Record<string, unknown> {
   const args = ["save", "--mem", files.mem, "--state", files.state, "--prefix", prefix, "--snapshot", id, "--work", snapshots, "--cache", cache, ...(parent === null ? [] : ["--parent", parent])];
-  return JSON.parse(run(join(work, "fcmem"), args)) as Record<string, unknown>;
+  return JSON.parse(run(join(work, "fcmem"), args, DRIVER_TIMEOUT_MS)) as Record<string, unknown>;
 }
 
 /** Copies a disk image, its holes kept holes. */
-const copySparse = (from: string, to: string): void => void run("cp", ["--sparse=always", from, to]);
+const copySparse = (from: string, to: string): void => void run("cp", ["--sparse=always", from, to], STEP_MS);
 
 const bucketBytes = (prefix: string): number => Number(s3("bytes", prefix)["bytes"]);
 
@@ -509,7 +531,7 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
   // Every restore starts with nothing being written back and nothing in the page cache, so a
   // warm one reads the node's copy from its disk, as alasio's reads its node cache with O_DIRECT,
   // whatever ran before it.
-  run("sync", []);
+  run("sync", [], STEP_MS);
   writeFileSync("/proc/sys/vm/drop_caches", "1");
   const socket = join(work, "uffd.sock");
   const state = join(work, "restore.state");
@@ -547,7 +569,8 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
   let hugetlbPeak = 0;
   const sampler = setInterval(() => (hugetlbPeak = Math.max(hugetlbPeak, hugetlb())), 20);
   try {
-    [fc] = await Promise.all([Firecracker.start(o.firecracker, o.log), ready]);
+    step(`restore ${o.runId} ${o.restorer.variant}${o.cold ? " cold" : " warm"}`);
+    [fc] = await Promise.all([Firecracker.start(o.firecracker, o.log), within(ready, STEP_MS, "the handler's start")]);
     const handlerReady = now();
     // E2B's handler gets guest memory as E2B runs it, a memfd whose descriptor comes with the
     // userfaultfd (its use-memfd flag, on by default, ff:230), which only E2B's Firecracker has.
@@ -574,7 +597,7 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
     fc = null;
     // fcmem ends with its Firecracker; E2B's handler is told to.
     handler.kill("SIGTERM");
-    await ended(handler);
+    await within(ended(handler), STEP_MS, "the handler's end");
     const handlerStats = JSON.parse(readFileSync(stats, "utf8")) as Record<string, number>;
     const memoryPeak = fcPeak + hugetlbPeak + handlerPeak;
     // The handler loads only what the guest touches, so its pages are all in once the verify,
@@ -609,7 +632,13 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
     clearInterval(sampler);
     if (fc !== null) await fc.kill();
     handler.kill("SIGTERM");
-    await ended(handler);
+    try {
+      await within(ended(handler), STEP_MS, "the handler's end");
+    } catch {
+      handler.kill("SIGQUIT");
+      handler.kill("SIGKILL");
+      await ended(handler);
+    }
     removeCgroup(handlerGroup);
     rmSync(e2bCache, { recursive: true, force: true });
   }
