@@ -54,6 +54,10 @@ ENV NODE_ENV=production
 ARG REVISION=
 ENV ALASIO_REVISION=${REVISION}
 # tini reaps what the harnesses leave behind and passes SIGTERM on, so alasio shuts
-# down cleanly when its pod stops.
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# down cleanly when its pod stops. It and all it runs write no core file as they crash,
+# as on an Ubuntu host (a soft limit of 0, which a command an agent runs may raise):
+# the container runtime leaves the limit unlimited, and the kernel's default core_pattern
+# writes a core into the crashing process's directory, which is the operator's home where
+# alasio's pods run on their machine: a harness's heap, of GBs, at each crash.
+ENTRYPOINT ["/usr/bin/prlimit", "--core=0:", "--", "/usr/bin/tini", "--"]
 CMD ["node", "/opt/alasio/src/index.ts"]

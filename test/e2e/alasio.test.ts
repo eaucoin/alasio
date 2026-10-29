@@ -911,18 +911,24 @@ if (inShard("sessions")) {
       console.error(`# the node's images, as containerd checks their content:\n${(await onNode(server, "ctr -n k8s.io images check")).trimEnd()}`);
     });
 
-    test("runs each program of alasio's image under tini, the first of its pod's PIDs, so a SIGTERM that comes before the program handles it ends it", async () => {
+    test("runs each program of alasio's image under tini, the first of its pod's PIDs, so a SIGTERM that comes before the program handles it ends it, and with no core file written as it crashes, as on an Ubuntu host", async () => {
       const image = (await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE)))?.spec?.template.spec?.containers[0]?.image;
       // Of each pod of PIDs of its own, as one of the node's PIDs has the node's first.
       const pods = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE })).filter(({ metadata, spec, status }) => !metadata?.deletionTimestamp && !spec?.hostPID && status?.phase === "Running");
       const first = await Promise.all(pods.flatMap(({ metadata, spec, status }) =>
         (spec?.containers ?? [])
           .filter(({ name, image: its }) => its === image && status?.containerStatuses?.some((each) => each.name === name && each.state?.running))
-          .map(async ({ name }): Promise<[string, string]> => [`${metadata?.labels?.["app.kubernetes.io/component"] ?? metadata?.name}/${name}`, (await kube.execOk(NAMESPACE, metadata?.name ?? "", ["cat", "/proc/1/cmdline"], { container: name })).split("\0")[0] ?? ""])
+          .map(async ({ name }): Promise<[string, string, string]> => {
+            const read = (path: string) => kube.execOk(NAMESPACE, metadata?.name ?? "", ["cat", path], { container: name });
+            // The size of its core files, as the kernel holds the program and all it runs to, unless they raise it.
+            const core = /^Max core file size\s+(\S+)/mu.exec(await read("/proc/1/limits"))?.[1] ?? "";
+            return [`${metadata?.labels?.["app.kubernetes.io/component"] ?? metadata?.name}/${name}`, (await read("/proc/1/cmdline")).split("\0")[0] ?? "", core];
+          })
       ));
       const programs = new Set(first.map(([program]) => program));
       for (const program of ["alasio/alasio", "sandbox-gateway/sandbox-gateway", "receiver/receiver", "neon-control/neon-control", "image/image"]) assert.ok(programs.has(program), `no ${program} ran: ${[...programs].join(", ")}`);
       assert.deepEqual(first.filter(([, program]) => program !== "/usr/bin/tini"), []);
+      assert.deepEqual(first.filter(([, , core]) => core !== "0"), []);
     });
 
     test("a new workspace with internet reaches the internet and nothing private", async () => {
