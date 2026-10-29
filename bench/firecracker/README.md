@@ -148,6 +148,9 @@ The reference agrees with E2B. On poller/1024 cold, fcmem's verify takes 4.8 s l
 against 1.4 / 1.9 s. Warm, E2B's is faster (first exec 0.33 s against 0.67 s), because its cache
 is held in memory where fcmem's is on disk.
 
-Open: one cold restore of 225 (local poller/1024, run 5) stalled with the handler idle, nothing
-in flight; its failure is reported. The job now records the handler's counters on such a
-failure, to tell a lost fault from a guest stalled elsewhere.
+One cold restore of 225 (local poller/1024, run 5) stalled with the handler idle, nothing in
+flight, and its failure is reported. A run made only to catch it again, 6 runs of poller/1024,
+poller/3072 and saturating/1024 with every variant (run 40807758316, 228 lines, 66 cold
+restores), passed whole and never woke a fault on a block already in. So the stall did not
+recur, and nothing shows a fault fcmem lost. E2B's handler stalled the same way once, before it
+had its memfd.
