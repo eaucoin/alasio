@@ -634,6 +634,11 @@ test("a detach of a pod's directory that comes as a sweep detaches it waits for 
     at.files("fs-abc123");
     at.pod("gone-0");
     await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "gone-0", "t", {}));
+    // Last changed past its grace, none as the node's clock may run behind its file system's.
+    const directory = join(at.attachRoot, "main", "gone-0");
+    const past = new Date(Date.now() - 120_000);
+    for (const name of readdirSync(directory)) if (name !== "ws") utimesSync(join(directory, name), past, past);
+    utimesSync(directory, past, past);
     let release = () => {};
     at.unmounts.held = new Promise<void>((resolve) => {
       release = resolve;
@@ -648,7 +653,7 @@ test("a detach of a pod's directory that comes as a sweep detaches it waits for 
     release();
     assert.deepEqual(await Promise.all([sweeping, detaching]), [{ detached: ["main/gone-0"], waiting: [] }, undefined]);
     assert.equal(unmounted(), 1);
-    assert.equal(existsSync(join(at.attachRoot, "main", "gone-0")), false);
+    assert.equal(existsSync(directory), false);
   } finally {
     at.done();
   }
