@@ -326,6 +326,16 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+/**
+ * `text` with every bearer credential in it hidden, and every signed token (a base64url JSON object
+ * and its signature, as alasio's callers' tokens are): a command run in a pod is said in full where
+ * it fails, so a token it was given as an argument would otherwise reach the run's logs.
+ */
+export const withoutBearers = (text: string): string =>
+  text
+    .replace(/(bearer\s+)[A-Za-z0-9._~+/=-]+/giu, (_, said: string) => `${said}<hidden>`)
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)?/gu, () => "<hidden>");
+
 /** The objects of the cluster, through the API its kubeconfig reaches, as alasio's command line reaches them. */
 let api: KubeApi["Service"] | undefined;
 let kubeConfig: KubeConfig | undefined;
@@ -411,7 +421,7 @@ export const kube = {
   /** Runs `command` in the pod, which must succeed: what it printed. */
   execOk: async (namespace: string, pod: string, command: readonly string[], options?: ExecOptions): Promise<string> => {
     const ran = await kube.exec(namespace, pod, command, options);
-    if (ran.code !== 0) throw new Error(`${command.join(" ")} in ${namespace}/${pod} exited with ${ran.code}: ${ran.stderr}${ran.stdout}`);
+    if (ran.code !== 0) throw new Error(withoutBearers(`${command.join(" ")} in ${namespace}/${pod} exited with ${ran.code}: ${ran.stderr}${ran.stdout}`));
     return ran.stdout;
   },
 
@@ -521,17 +531,25 @@ export async function mainKeyToken(key: string): Promise<string> {
   return mintToken(environmentKey(Buffer.from(callerKey), "main"), { key, expires: Date.now() + 9 * 60_000, options: { environment: "main" } });
 }
 
-/** What the gateway answers `method path` with, asked as alasio asks it, from its pod, with `token`, `body` sent as it is: its status, what it said, and when it asked to be asked again (its Retry-After), if it did. */
+/**
+ * What the gateway answers `method path` with, asked as alasio asks it, from its pod, with `token`, `body` sent as it is: its status, what it said, and when it asked to be asked again (its Retry-After), if it did.
+ * The token goes in on the command's input, its first line, and to curl as a header file, so it is in no command's arguments.
+ */
 export async function gatewayCall(token: string, method: string, path: string, body?: string, { bind = true } = {}): Promise<{ readonly status: number; readonly said: string; readonly retryAfter: string }> {
   const alasioPod = await kube.runningPod(NAMESPACE, RELEASE);
   const printed = await kube.execOk(NAMESPACE, alasioPod, [
     "sh",
     "-c",
-    `curl -sS -w '\n%header{retry-after}\n%{http_code}' -X ${method} -H "authorization: Bearer $1"${bind ? "" : ` -H '${NO_BIND_HEADER}: never'`}${body === undefined ? "" : " --data-binary @-"} "http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}$2"`,
+    [
+      // The shell's read takes the first line alone, so curl reads the body from what follows it.
+      "IFS= read -r token",
+      `curl -sS -w '\n%header{retry-after}\n%{http_code}' -X ${method} -H @/dev/fd/3${bind ? "" : ` -H '${NO_BIND_HEADER}: never'`}${body === undefined ? "" : " --data-binary @-"} "http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}$1" 3<<HEADER`,
+      "authorization: Bearer $token",
+      "HEADER",
+    ].join("\n"),
     "sh",
-    token,
     path,
-  ], { container: "alasio", ...(body === undefined ? {} : { stdin: body }) });
+  ], { container: "alasio", stdin: `${token}\n${body ?? ""}` });
   const lines = printed.split("\n");
   return { status: Number(lines.at(-1)), said: lines.slice(0, -2).join("\n"), retryAfter: lines.at(-2) ?? "" };
 }

@@ -3,7 +3,8 @@
  * and where it makes its cluster, as CI's end-to-end jobs select each; the lines of a node's
  * logs its failure dump keeps as errors; the configuration the
  * upgrade shard upgrades with; and the Telegram
- * stand-in's reading of what is sent it as a form, as Grafana sends its alerts.
+ * stand-in's reading of what is sent it as a form, as Grafana sends its alerts; and the credentials
+ * a failed command's error hides.
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -12,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { LOGGED_ERROR, runsShard, shardOf, SHARDS, targetOf } from "./e2e/harness.ts";
+import { LOGGED_ERROR, runsShard, shardOf, SHARDS, targetOf, withoutBearers } from "./e2e/harness.ts";
 import { overlaid } from "./e2e/release-config.ts";
 import { createTelegramStub } from "./e2e/telegram-stub.ts";
 
@@ -161,4 +162,15 @@ test("the Telegram stand-in, started again on what it kept, has the webhook, the
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a failed command's error hides a bearer credential and a signed token, and nothing else", () => {
+  const signed = "eyJrZXkiOiJzZXNzaW9uZnM6ZnMtMSIsImV4cGlyZXMiOjF9.lI3d8sX6G-XrOuBM2K4QASSqcvqkoepdXerTlH0HHw0";
+  assert.equal(
+    withoutBearers(`node driver.mjs probe --header Authorization: Bearer ${signed} --session s exited with 1: failed`),
+    "node driver.mjs probe --header Authorization: Bearer <hidden> --session s exited with 1: failed",
+  );
+  assert.equal(withoutBearers("curl -H 'authorization: bearer abc~+/=.def_-' x"), "curl -H 'authorization: bearer <hidden>' x");
+  assert.equal(withoutBearers(`sh -c curl sh ${signed} /release in alasio/pod exited with 7`), "sh -c curl sh <hidden> /release in alasio/pod exited with 7");
+  assert.equal(withoutBearers("node -e count in alasio/pod exited with 1: no such pod"), "node -e count in alasio/pod exited with 1: no such pod");
 });
