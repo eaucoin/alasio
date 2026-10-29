@@ -627,3 +627,57 @@ test("a sweep that cannot tell from runsc whether a pod gone runs still takes it
     at.done();
   }
 });
+
+test("a detach of a pod's directory that comes as a sweep detaches it waits for the sweep, then finds nothing to unmount, and both succeed", async () => {
+  const at = workspacesNode();
+  try {
+    at.files("fs-abc123");
+    at.pod("gone-0");
+    await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "gone-0", "t", {}));
+    let release = () => {};
+    at.unmounts.held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const unmounted = () => at.ran.filter((command) => command.startsWith("umount ")).length;
+    // The sweep, as its pod has gone, unmounting what is attached into it...
+    const sweeping = Effect.runPromise(at.workspaces.sweep(new Map([["main", new Set<string>()]])));
+    while (unmounted() === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+    // ...as the gateway's detach comes, its binding released, its sandbox ended.
+    const detaching = Effect.runPromise(at.workspaces.detach("main", "gone-0", ["c-gone"]));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    release();
+    assert.deepEqual(await Promise.all([sweeping, detaching]), [{ detached: ["main/gone-0"], waiting: [] }, undefined]);
+    assert.equal(unmounted(), 1);
+    assert.equal(existsSync(join(at.attachRoot, "main", "gone-0")), false);
+  } finally {
+    at.done();
+  }
+});
+
+test("a mount point gone before its unmount came is taken as unmounted, as the node's mount table says after; one an unmount fails for that the table holds still fails the detach", async () => {
+  const at = workspacesNode();
+  try {
+    at.files("fs-abc123");
+    for (const pod of ["gone-0", "busy-0"]) {
+      at.pod(pod);
+      await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, pod, "t", {}));
+    }
+    let release = () => {};
+    at.unmounts.held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const detaching = Effect.runPromise(at.workspaces.detach("main", "gone-0", []));
+    while (!at.ran.includes(`umount -l ${join(at.attachRoot, "main", "gone-0", "ws")}`)) await new Promise((resolve) => setTimeout(resolve, 5));
+    // Unmounted meanwhile, by another than this detach, whose umount then finds it not mounted.
+    at.mounts.splice(at.mounts.indexOf(join(at.attachRoot, "main", "gone-0", "ws")), 1);
+    release();
+    await detaching;
+    assert.equal(existsSync(join(at.attachRoot, "main", "gone-0")), false);
+    at.busy.add(join(at.attachRoot, "main", "busy-0", "ws"));
+    const failed = await Effect.runPromise(Effect.flip(at.workspaces.detach("main", "busy-0", [])));
+    assert.match(failed.message, /target is busy/u);
+    assert.equal(existsSync(join(at.attachRoot, "main", "busy-0", "token")), true);
+  } finally {
+    at.done();
+  }
+});

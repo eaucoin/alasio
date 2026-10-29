@@ -509,7 +509,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const juicefs = Option.match(metaUrl, { onNone: () => null, onSome: (url) => makeJuicefs({ metaUrl: Redacted.value(url) }) });
   // What workspace storage holds, as the node's mount counts it, where the agent works with it.
   if (juicefs) yield* observeStorageUsage(WORKSPACES_ROOT);
-  const workspaces = makeWorkspaces({ host, runsc, juicefs });
+  const workspaces = yield* makeWorkspaces({ host, runsc, juicefs });
   const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces });
   // What is attached on the node, kept to the pods the cluster has on it.
   yield* convergeAttachments({ node, workspaces }).pipe(Effect.provide(KubeClient.layer));
