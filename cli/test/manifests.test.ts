@@ -3530,6 +3530,30 @@ describe("the sandbox service", () => {
     }
   });
 
+  test("looks at the binds waiting on each sandbox and harness pool as often as at what alasio scales on, and scales a pool whose min is none back to none at the first look that finds none waiting", () => {
+    const timing = (objects: readonly KubernetesObject[]) =>
+      Object.fromEntries(all<ScaledObject>(objects, "ScaledObject").filter(({ spec }) => spec.triggers.some(({ metadata }) => metadata["valueLocation"] === "waiting")).map(({ metadata, spec }) => [
+        `${metadata?.namespace}/${metadata?.name}`,
+        [spec.minReplicaCount, spec.pollingInterval, spec.cooldownPeriod],
+      ]));
+    const file = { host: { enabled: true }, sessions: { pools: { min: 0, max: 10 } }, harness: { pools: { scaling: { min: 0, max: 5 } } } };
+    assert.deepEqual(timing(install(file)), {
+      "alasio-sessions/sandboxes-none": [0, 1, 0],
+      "alasio-sessions/sandboxes-full": [0, 1, 0],
+      "alasio/harness-codex": [0, 1, 0],
+      "alasio/harness-claude": [0, 1, 0],
+      "alasio/harness-folder-codex": [0, 1, 0],
+      "alasio/harness-folder-claude": [0, 1, 0],
+    });
+    // A branch environment's alike, and each as often as alasio's, where the configuration says another.
+    assert.deepEqual(timing(branchObjects(configOf({ ...file, alasio: { pollingSeconds: 2 } }), "try", BASELINE)), {
+      "alasio-branch-try-sessions/sandboxes-none": [0, 2, 0],
+      "alasio-branch-try-sessions/sandboxes-full": [0, 2, 0],
+      "alasio-branch-try/harness-codex": [0, 2, 0],
+      "alasio-branch-try/harness-claude": [0, 2, 0],
+    });
+  });
+
   test("keeps each pool's pod's bayma's state where its node's agent reads what a live save caught: in the home of the workspace attached into its directory, by a path a mount of its pod holds", async () => {
     const objects = install();
     for (const mode of ["none", "full"] as const) {

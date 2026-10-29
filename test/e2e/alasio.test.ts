@@ -3933,6 +3933,48 @@ if (inShard("agents")) {
       assert.notEqual((await harnessPod()).metadata?.uid, bound.metadata?.uid);
     });
 
+    test("a pool kept at none ends the free pod its Deployment makes in place of a cold bind's at KEDA's next look, not a cooldown after", { timeout: 15 * 60_000 }, async (t) => {
+      const scaler = ref("ScaledObject", "harness-codex", NAMESPACE);
+      const pool = ref("Deployment", "harness-codex", NAMESPACE);
+      /** The pool's free pods, but those being deleted. */
+      const freePods = async () =>
+        (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "alasio.dev/free=true,alasio.dev/pool=harness-codex" })).filter(({ metadata }) => metadata?.deletionTimestamp === undefined);
+      const bound = await boundNow();
+      await kube.patch(scaler, { spec: { minReplicaCount: 0 } });
+      try {
+        // At none, as no bind waits; then its bound pod let go of, so that the next prompt's bind waits for the pool to be scaled.
+        await until("the pool scaled to none", async () => ((await kube.get<V1Deployment>(pool))?.spec?.replicas === 0 ? true : undefined), 6 * 60_000);
+        await kube.remove(ref("Pod", bound.metadata?.name ?? "", NAMESPACE));
+        await until("the deleted pod's binding let go of", async () => ((await harnessPods()).length === 0 ? true : undefined), 300_000);
+        // Each free pod seen from the prompt on, by its name: when it was made, and when it was first seen free no more, claimed or gone.
+        const lives = new Map<string, { made: number; ended?: number }>();
+        let watching = true;
+        const watcher = (async () => {
+          for (; watching; await sleep(1_000)) {
+            const free = await freePods();
+            const now = Date.now();
+            for (const { metadata } of free) if (!lives.has(metadata?.name ?? "")) lives.set(metadata?.name ?? "", { made: new Date(metadata?.creationTimestamp ?? now).getTime() });
+            for (const [name, life] of lives) if (life.ended === undefined && !free.some(({ metadata }) => metadata?.name === name)) life.ended = now;
+          }
+        })();
+        try {
+          await tg.say("cold");
+          await tg.waitFor((call) => answered(call));
+          assert.notEqual((await harnessPod()).metadata?.uid, bound.metadata?.uid);
+          // KEDA's default cooldown would keep the pod made in place of the one bound for 300 s.
+          await until("no free pod left in the pool after the cold bind", async () => ((await freePods()).length === 0 ? true : undefined), 60_000);
+        } finally {
+          watching = false;
+          await watcher;
+          t.diagnostic(`free pods from the prompt on: ${[...lives].map(([name, { made, ended }]) => `${name} ${ended === undefined ? "still free" : `free no more ${((ended - made) / 1000).toFixed(1)} s after it was made`}`).join("; ") || "none seen"}`);
+        }
+      } finally {
+        // Its free pod again, for the tests after.
+        await kube.patch(scaler, { spec: { minReplicaCount: 1 } });
+        await until("a free pod of the pool running again", async () => ((await freePods()).some(({ status }) => status?.phase === "Running") ? true : undefined), 300_000);
+      }
+    });
+
     test("a pool's free pod has no binding and serves nothing; no one but the gateway reaches a bound one", async () => {
       const free = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "alasio.dev/free=true,alasio.dev/pool=harness-codex" }))[0];
       assert.ok(free?.status?.podIP, "the pool has no free pod");
