@@ -222,7 +222,7 @@ func saveSnapshot(ctx context.Context, s objectStore, in saveInput) (saveReport,
 	if err := storeLocal(in.work, in.id, encoded, sums); err != nil {
 		return saveReport{}, err
 	}
-	c := newCache(in.cacheDir, s)
+	c := newCache(in.cacheDir, s, chunkSize)
 	if err := c.keep(h.Objects[0].Key, in.memPath); err != nil {
 		return saveReport{}, err
 	}

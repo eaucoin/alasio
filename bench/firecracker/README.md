@@ -56,6 +56,7 @@ The variants' restores alternate in order by run. Each restore runs alone on the
 | `4k` | Firecracker's default 4 KiB pages, with prefetch, its own saves | every case, `local` only |
 | `fcmem-on-e2b-fork`, `fcmem-on-e2b-fork-no-prefetch` | fcmem behind E2B's Firecracker | poller/1024, `local` and `s3-express`, reference |
 | `e2b-handler`, `e2b-handler-no-prefetch` | E2B's own handler behind E2B's Firecracker | poller/1024, `local` and `s3-express`, reference |
+| `prefetch-16mib-chunks` | `prefetch` with 16 MiB chunks fetched in place of E2B's 4 MiB (`fcmem serve --chunk-bytes`), everything else the same. **Our tuning beyond E2B's**, for sensitivity only: whether the long resident times on slow stores come from the mechanism or from the chunk size. Its job (`BENCH_VARIANT=chunk-16mib`) restores each save with `prefetch` and with it in turn, and only its own lines are reported beside the documented runs | poller/1024, poller/3072, saturating/1024, saturating/3072; `s3-express` and `s3-standard` |
 
 `prefetch` and `no-prefetch` restore the same save, whose lines are written once, under
 `prefetch` (DESIGN.md section 6). The four reference variants restore one save of their own; its

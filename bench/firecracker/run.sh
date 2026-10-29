@@ -6,11 +6,19 @@
 # toxics and bench/common before, and written $BENCH_DIR/host.json and store.json.
 #
 #   bench/firecracker/run.sh <target> <profile>
+#
+# BENCH_VARIANT `all` is the system as README.md configures it; `chunk-16mib` restores each case
+# prefetching with E2B's 4 MiB chunks and with 16 MiB ones, our tuning beyond E2B's, and nothing else.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 target=$1
 profile=$2
 [ "$target" = host ] || { echo "firecracker runs on the host alone, not $target" >&2; exit 1; }
+case "${BENCH_VARIANT:-all}" in
+all) chunks=() ;;
+chunk-16mib) chunks=(--chunk-16mib) ;;
+*) echo "firecracker has no variant $BENCH_VARIANT" >&2; exit 1 ;;
+esac
 
 FIRECRACKER_VERSION=v1.17.0
 FIRECRACKER_SHA256=06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558
@@ -58,7 +66,7 @@ export PATH="$work/go/bin:$PATH" GOTOOLCHAIN=local
 # The reference restores, in the local and S3 Express jobs: E2B's handler, built in E2B's tree
 # with E2B's go.mod, and E2B's Firecracker.
 reference=()
-if [ "$profile" = local ] || [ "$profile" = s3-express ]; then
+if { [ "$profile" = local ] || [ "$profile" = s3-express ]; } && [ ${#chunks[@]} -eq 0 ]; then
   git init -q "$work/e2b-runtime"
   git -C "$work/e2b-runtime" fetch -q --depth 1 https://github.com/e2b-dev/runtime.git "$E2B_RUNTIME_COMMIT"
   git -C "$work/e2b-runtime" checkout -q FETCH_HEAD
@@ -101,11 +109,11 @@ echo "+memory +hugetlb" | sudo tee /sys/fs/cgroup/bench/cgroup.subtree_control >
 
 # Firecracker's default page size beside the 2 MiB pages, in one profile's job, the store's own.
 small_pages=()
-[ "$profile" != local ] || small_pages=(--small-pages)
+[ "$profile" != local ] || [ ${#chunks[@]} -ne 0 ] || small_pages=(--small-pages)
 set -a
 . "$BENCH_DIR/store/store.env"
 set +a
 sudo --preserve-env "$(command -v node)" "$here/bench.ts" \
   --work "$work" --profile "$profile" --out "$BENCH_DIR/results.jsonl" --logs "$BENCH_DIR/logs" \
   --host "$BENCH_DIR/host.json" --store "$BENCH_DIR/store.json" --driver "$here/../common/dist/driver.mjs" \
-  --s3 "$here/../common/store/s3.ts" --cases "${BENCH_CASES:-}" --runs "${BENCH_RUNS:-5}" "${small_pages[@]}" "${reference[@]}"
+  --s3 "$here/../common/store/s3.ts" --cases "${BENCH_CASES:-}" --runs "${BENCH_RUNS:-5}" "${small_pages[@]}" "${reference[@]}" "${chunks[@]}"

@@ -100,6 +100,7 @@ func serve(args []string) error {
 	stateOut := fs.String("state-out", "", "where the state file is written for Firecracker")
 	cacheDir := fs.String("cache", "", "the node's chunk cache")
 	prefetch := fs.Bool("prefetch", false, "prefetch the header's hot set")
+	chunk := fs.Int64("chunk-bytes", chunkSize, "the unit fetched from the bucket, a whole number of blocks: E2B's 4 MiB unless asked")
 	statsOut := fs.String("stats", "", "where the handler's counters are written as it ends")
 	fs.Parse(args)
 
@@ -109,7 +110,10 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	h.cache = newCache(*cacheDir, s)
+	if *chunk <= 0 || *chunk%blockSize != 0 {
+		return fmt.Errorf("a chunk of %d bytes is no whole number of %d-byte blocks", *chunk, blockSize)
+	}
+	h.cache = newCache(*cacheDir, s, *chunk)
 	encoded, err := h.cache.object(ctx, *prefix+"/"+*id+"/header.json")
 	if err != nil {
 		return err
@@ -409,7 +413,7 @@ func (h *handler) fetchHot() {
 		var last *job
 		for _, b := range h.header.Hot {
 			src := h.header.Blocks[b]
-			next := job{obj: h.header.Objects[src.Object], chunk: src.Offset / chunkSize}
+			next := job{obj: h.header.Objects[src.Object], chunk: src.Offset / h.cache.chunk}
 			if last == nil || *last != next {
 				jobs <- next
 				last = &next

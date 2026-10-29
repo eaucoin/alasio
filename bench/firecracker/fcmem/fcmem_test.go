@@ -158,7 +158,7 @@ func TestSaveStoresChangedBlocksAndNoZeros(t *testing.T) {
 		t.Fatalf("stop's objects %+v", h.Objects)
 	}
 	// The node keeps both memory files, where the guest's blocks are.
-	cache := newCache(in.cacheDir, s)
+	cache := newCache(in.cacheDir, s, chunkSize)
 	got, release, err := cache.block(h.Objects[1], 0, 2)
 	if err != nil || !bytes.Equal(got, a) {
 		t.Fatalf("block 2 from the node's copy of live: %v", err)
@@ -176,7 +176,7 @@ func TestCacheFetchesAChunkOnceAndKeepsIt(t *testing.T) {
 	obj := object{Key: "p/s/memory", Size: int64(len(data))}
 	s.put(ctx, obj.Key, data)
 	dir := t.TempDir()
-	c := newCache(dir, s)
+	c := newCache(dir, s, chunkSize)
 
 	// Both blocks of the one chunk at once: one GET.
 	var wait sync.WaitGroup
@@ -204,7 +204,7 @@ func TestCacheFetchesAChunkOnceAndKeepsIt(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	later := newCache(dir, s)
+	later := newCache(dir, s, chunkSize)
 	got, release, err := later.block(obj, blockSize, 1)
 	if err != nil || !bytes.Equal(got, data[blockSize:]) {
 		t.Fatalf("block 1 from the cache: %v", err)
@@ -212,6 +212,35 @@ func TestCacheFetchesAChunkOnceAndKeepsIt(t *testing.T) {
 	release()
 	if s.ranges.Load() != 1 {
 		t.Fatalf("%d ranged GETs after the chunk was cached", s.ranges.Load())
+	}
+}
+
+func TestCacheFetchesALargerChunkWholeAndApartFromAnotherSize(t *testing.T) {
+	ctx := context.Background()
+	s := newMemoryStore()
+	var data []byte
+	for range 8 {
+		data = append(data, randomBlock(t)...)
+	}
+	obj := object{Key: "p/s/memory", Size: int64(len(data))}
+	s.put(ctx, obj.Key, data)
+	dir := t.TempDir()
+
+	// 16 MiB chunks: the last block's fetch brings all 8 blocks in, in one GET.
+	large := newCache(dir, s, 4*chunkSize)
+	for _, b := range []int{7, 0, 3} {
+		got, release, err := large.block(obj, int64(b)*blockSize, b)
+		if err != nil || !bytes.Equal(got, data[b*blockSize:(b+1)*blockSize]) {
+			t.Fatalf("block %d: %v", b, err)
+		}
+		release()
+	}
+	if s.ranges.Load() != 1 {
+		t.Fatalf("%d ranged GETs for one 16 MiB chunk", s.ranges.Load())
+	}
+	// A handler of 4 MiB chunks on the same cache has none of its own chunks marked in.
+	if _, err := os.Stat(newCache(dir, s, chunkSize).chunkIn(obj.Key, 0)); err == nil {
+		t.Fatal("a 16 MiB chunk's marker stood for a 4 MiB chunk")
 	}
 }
 
@@ -228,7 +257,7 @@ func (s *streamStore) openRange(context.Context, string, int64, int64) (io.ReadC
 func TestCacheHandsOutABlockBeforeItsChunkIsIn(t *testing.T) {
 	body, bucket := io.Pipe()
 	s := &streamStore{memoryStore: newMemoryStore(), body: body}
-	c := newCache(t.TempDir(), s)
+	c := newCache(t.TempDir(), s, chunkSize)
 	obj := object{Key: "p/s/memory", Size: chunkSize}
 	first, second := randomBlock(t), randomBlock(t)
 	go bucket.Write(first)
@@ -335,7 +364,7 @@ func TestServeInstallsEachFaultingBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := &handler{start: time.Now(), header: h, cache: newCache(t.TempDir(), s), state: make([]atomic.Uint32, guestBlocks)}
+	handler := &handler{start: time.Now(), header: h, cache: newCache(t.TempDir(), s, chunkSize), state: make([]atomic.Uint32, guestBlocks)}
 	regions, err := handler.handshake(conn)
 	if err != nil {
 		t.Fatal(err)

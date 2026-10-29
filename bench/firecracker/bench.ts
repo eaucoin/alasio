@@ -17,11 +17,12 @@
  *
  * Both variants' restores are of the one save, whose lines the first variant reports. With
  * --small-pages, each case also runs on 4 KiB pages, Firecracker's default, its restores
- * prefetching (`4k`).
+ * prefetching (`4k`). With --chunk-16mib, the restores are `prefetch` and the same with 16 MiB
+ * chunks fetched in place of E2B's 4 MiB (`prefetch-16mib-chunks`), our tuning beyond E2B's.
  *
  *   node bench.ts --work <dir> --profile <p> --out <results.jsonl> --logs <dir> --host <host.json>
  *     --store <store.json> --driver <driver.mjs> --s3 <s3.ts> [--cases 'poller/256 idle/16'] [--runs 5]
- *     [--small-pages]
+ *     [--small-pages] [--chunk-16mib]
  */
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -44,6 +45,7 @@ const { values: options } = parseArgs({
     cases: { type: "string", default: "" },
     runs: { type: "string", default: "5" },
     "small-pages": { type: "boolean", default: false },
+    "chunk-16mib": { type: "boolean", default: false },
     "e2b-reference": { type: "string", default: "" },
   },
 });
@@ -71,13 +73,17 @@ const CASES: readonly Case[] = (JSON.parse(readFileSync(new URL("../common/cases
   .map(({ fixture, size_mib }) => ({ fixture, sizeMib: size_mib }));
 const cases = options.cases?.trim() ? CASES.filter(({ fixture, sizeMib }) => options.cases?.split(/[\s,]+/u).includes(`${fixture}/${sizeMib}`)) : CASES;
 
-const VARIANTS = ["prefetch", "no-prefetch", "4k", "fcmem-on-e2b-fork", "fcmem-on-e2b-fork-no-prefetch", "e2b-handler", "e2b-handler-no-prefetch"] as const;
+const VARIANTS = ["prefetch", "no-prefetch", "prefetch-16mib-chunks", "4k", "fcmem-on-e2b-fork", "fcmem-on-e2b-fork-no-prefetch", "e2b-handler", "e2b-handler-no-prefetch"] as const;
 type Variant = (typeof VARIANTS)[number];
-/** A restore's handler: fcmem, or E2B's own (e2b/main.go), and whether it prefetches the hot set. */
+/**
+ * A restore's handler: fcmem, or E2B's own (e2b/main.go), whether it prefetches the hot set, and
+ * the bytes it fetches at once where not E2B's 4 MiB chunk (fcmem `serve --chunk-bytes`).
+ */
 interface Restorer {
   readonly variant: Variant;
   readonly handler: "fcmem" | "e2b";
   readonly prefetch: boolean;
+  readonly chunkBytes?: number;
 }
 /** How a run's instance is made, and the restores of its save. */
 interface Setup {
@@ -98,7 +104,8 @@ interface Setup {
   readonly cases: (theCase: Case) => boolean;
 }
 /**
- * Every case on 2 MiB hugetlbfs pages, restored with and without the hot set prefetched; with
+ * Every case on 2 MiB hugetlbfs pages, restored with and without the hot set prefetched (with
+ * --chunk-16mib, prefetched with 4 MiB chunks and with 16 MiB ones); with
  * --small-pages, each also on Firecracker's default page size, 4 KiB, prefetching (`4k`); with
  * --e2b-reference <its release>, poller/1024 also on E2B's Firecracker, restored by fcmem and by E2B's own
  * handler, each with and without prefetching.
@@ -106,7 +113,12 @@ interface Setup {
 const SETUPS: readonly Setup[] = [
   {
     suffix: "", firecracker: "firecracker", version: "firecracker v1.17.0", hugePages: "2M", syncOption: true, snapshotType: "Diff", reportsSaves: true, cases: () => true,
-    restorers: [{ variant: "prefetch", handler: "fcmem", prefetch: true }, { variant: "no-prefetch", handler: "fcmem", prefetch: false }],
+    restorers: [
+      { variant: "prefetch", handler: "fcmem", prefetch: true },
+      options["chunk-16mib"]
+        ? { variant: "prefetch-16mib-chunks", handler: "fcmem", prefetch: true, chunkBytes: 16 << 20 }
+        : { variant: "no-prefetch", handler: "fcmem", prefetch: false },
+    ],
   },
   ...(options["small-pages"] ? [{
     suffix: "-4k", firecracker: "firecracker", version: "firecracker v1.17.0", hugePages: "None" as const, syncOption: true, snapshotType: "Diff" as const, reportsSaves: true, cases: () => true,
@@ -538,8 +550,8 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
   const stats = join(work, "uffd.stats.json");
   for (const path of [socket, state, stats]) rmSync(path, { force: true });
   const handlerGroup = cgroup("uffd");
-  const { handler: kind, prefetch } = o.restorer;
-  const serve = ["serve", "--socket", socket, "--prefix", o.prefix, "--snapshot", "stop", "--state-out", state, "--stats", stats, ...(prefetch ? ["--prefetch"] : [])];
+  const { handler: kind, prefetch, chunkBytes } = o.restorer;
+  const serve = ["serve", "--socket", socket, "--prefix", o.prefix, "--snapshot", "stop", "--state-out", state, "--stats", stats, ...(prefetch ? ["--prefetch"] : []), ...(chunkBytes === undefined ? [] : ["--chunk-bytes", String(chunkBytes)])];
   const startHandler = (args: readonly string[]): { readonly process: ChildProcess; readonly ready: Promise<void> } => {
     // Its stdout says only that it is ready; it logs to its stderr.
     const child = startIn(handlerGroup, o.log, join(work, kind === "fcmem" ? "fcmem" : "e2b-serve"), args, true);

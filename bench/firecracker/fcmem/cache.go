@@ -7,7 +7,8 @@ package main
 //	                 (save.go), whose blocks are where the guest's are
 //	<key>.data       a memory object this node fetched, sparse: each chunk fetched where it is
 //	                 in the object
-//	<key>.in/<chunk> a chunk of <key>.data wholly in, made once its last byte is written
+//	<key>.in-<chunk size>/<chunk>
+//	                 a chunk of <key>.data wholly in, made once its last byte is written
 //
 // It outlives the handler process: the next restore on this node reads what the last one
 // fetched. E2B keeps a build's blocks in one sparse file per build with the bitmap of what is
@@ -38,6 +39,8 @@ import (
 type cache struct {
 	dir   string
 	store objectStore
+	// The unit fetched from the bucket, a whole number of blocks: chunkSize, E2B's, unless asked.
+	chunk int64
 
 	mu sync.Mutex
 	// The chunks being fetched, and the data files open for them, by name.
@@ -78,8 +81,8 @@ func (f *fetch) advance(have int64, err error) {
 	f.in.Broadcast()
 }
 
-func newCache(dir string, s objectStore) *cache {
-	c := &cache{dir: dir, store: s, fetching: map[string]*fetch{}, data: map[string]*os.File{}}
+func newCache(dir string, s objectStore, chunk int64) *cache {
+	c := &cache{dir: dir, store: s, chunk: chunk, fetching: map[string]*fetch{}, data: map[string]*os.File{}}
 	c.buffers.New = func() any { return make([]byte, blockSize) }
 	return c
 }
@@ -96,8 +99,14 @@ func (c *cache) fetched(key string) string {
 	return c.whole(key) + ".data"
 }
 
+// chunksIn is where the markers of key's chunks are, one directory a chunk size, so a cache
+// another chunk size filled says nothing of this one's chunks.
+func (c *cache) chunksIn(key string) string {
+	return c.whole(key) + ".in-" + strconv.FormatInt(c.chunk, 10)
+}
+
 func (c *cache) chunkIn(key string, index int64) string {
-	return filepath.Join(c.whole(key)+".in", strconv.FormatInt(index, 10))
+	return filepath.Join(c.chunksIn(key), strconv.FormatInt(index, 10))
 }
 
 // keep moves the memory file of a snapshot this node took into the cache, as obj's copy.
@@ -130,9 +139,9 @@ func (c *cache) block(obj object, off int64, b int) ([]byte, func(), error) {
 	if buf, err := c.read(c.taken(obj.Key), int64(b)*blockSize); !errors.Is(err, fs.ErrNotExist) {
 		return buf, func() { c.buffers.Put(buf) }, err
 	}
-	index := off / chunkSize
+	index := off / c.chunk
 	if f := c.fetch(obj, index); f != nil {
-		if err := f.wait(off%chunkSize + blockSize); err != nil {
+		if err := f.wait(off%c.chunk + blockSize); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -149,7 +158,7 @@ func (c *cache) ensure(obj object, index int64) error {
 		return nil
 	}
 	if f := c.fetch(obj, index); f != nil {
-		return f.wait(min(chunkSize, obj.Size-index*chunkSize))
+		return f.wait(min(c.chunk, obj.Size-index*c.chunk))
 	}
 	return nil
 }
@@ -185,7 +194,7 @@ func (c *cache) fetch(obj object, index int64) *fetch {
 	}
 	f := &fetch{}
 	f.in = sync.NewCond(&f.mu)
-	off := index * chunkSize
+	off := index * c.chunk
 	if off >= obj.Size {
 		f.err = fmt.Errorf("chunk %d past the end of %s, %d bytes", index, obj.Key, obj.Size)
 		return f
@@ -197,7 +206,7 @@ func (c *cache) fetch(obj object, index int64) *fetch {
 	}
 	c.fetching[in] = f
 	go func() {
-		err := c.get(obj.Key, off, min(chunkSize, obj.Size-off), file, f)
+		err := c.get(obj.Key, off, min(c.chunk, obj.Size-off), file, f)
 		if err == nil {
 			err = c.put(in, nil)
 		}
@@ -216,7 +225,7 @@ func (c *cache) dataFile(key string) (*os.File, error) {
 	if file, ok := c.data[key]; ok {
 		return file, nil
 	}
-	if err := os.MkdirAll(c.whole(key)+".in", 0o755); err != nil {
+	if err := os.MkdirAll(c.chunksIn(key), 0o755); err != nil {
 		return nil, err
 	}
 	file, err := os.OpenFile(c.fetched(key), os.O_RDWR|os.O_CREATE, 0o644)
