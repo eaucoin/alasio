@@ -325,6 +325,16 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+/**
+ * `text` with every bearer credential in it hidden, and every signed token (a base64url JSON object
+ * and its signature, as alasio's callers' tokens are): a command run in a pod is said in full where
+ * it fails, and a token it was given as an argument would otherwise reach the run's logs and results.
+ */
+export const withoutBearers = (text: string): string =>
+  text
+    .replace(/(bearer\s+)[A-Za-z0-9._~+/=-]+/giu, (_, said: string) => `${said}<hidden>`)
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)?/gu, () => "<hidden>");
+
 /** The objects of the cluster, through the API its kubeconfig reaches, as alasio's command line reaches them. */
 let api: KubeApi["Service"] | undefined;
 let kubeConfig: KubeConfig | undefined;
@@ -410,7 +420,7 @@ export const kube = {
   /** Runs `command` in the pod, which must succeed: what it printed. */
   execOk: async (namespace: string, pod: string, command: readonly string[], options?: ExecOptions): Promise<string> => {
     const ran = await kube.exec(namespace, pod, command, options);
-    if (ran.code !== 0) throw new Error(`${command.join(" ")} in ${namespace}/${pod} exited with ${ran.code}: ${ran.stderr}${ran.stdout}`);
+    if (ran.code !== 0) throw new Error(withoutBearers(`${command.join(" ")} in ${namespace}/${pod} exited with ${ran.code}: ${ran.stderr}${ran.stdout}`));
     return ran.stdout;
   },
 
