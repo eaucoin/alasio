@@ -14,13 +14,14 @@
  *   best-effort mirror dropped or never saw, matched so nothing is duplicated.
  */
 import { importSessionToStore, type SessionKey, type SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline";
 import { Effect, Schema } from "effect";
 
 import { withLogScope } from "../../shared/log.ts";
-import type { NeonSessionStore } from "./session-store.ts";
+import { entryDigest, type NeonSessionStore } from "./session-store.ts";
 
 const LOG_SCOPE = "claude-transcripts";
 
@@ -54,11 +55,18 @@ export interface AdoptTranscriptsOptions {
   readonly sessions: readonly AdoptedSession[];
 }
 
-/** One of a session's local transcripts: the main one (no subpath) or a subagent's. */
+/** One of a session's local transcripts: the main one (no subpath) or a subagent's, and its file. */
 interface LocalTranscript {
   readonly subpath: string | undefined;
-  readonly entries: readonly SessionStoreEntry[];
+  readonly path: string;
 }
+
+/**
+ * The most entries, and about the most characters of their JSON, a reconcile appends at once:
+ * those the SDK's importSessionToStore appends at once, by default.
+ */
+const APPEND_ENTRIES = 500;
+const APPEND_LENGTH = 1 << 20;
 
 /**
  * Claude Code's home, as the SDK resolves it: from this process's
@@ -124,19 +132,22 @@ export const ensureLocalTranscript = Effect.fnUntraced(function*(
   return true;
 }, withLogScope(LOG_SCOPE));
 
-/** A local transcript's entries, each line as Claude Code wrote it. */
-function readJsonl(path: string): SessionStoreEntry[] {
-  if (!existsSync(path)) return [];
-  const entries: SessionStoreEntry[] = [];
-  for (const line of readFileSync(path, "utf8").split("\n")) {
+/**
+ * A local transcript's entries, each line as Claude Code wrote it, with its length: read a
+ * line at a time, as a long session's transcript runs to hundreds of MB.
+ */
+async function* readJsonl(path: string): AsyncGenerator<{ readonly entry: SessionStoreEntry; readonly length: number }> {
+  for await (const line of createInterface({ input: createReadStream(path, { encoding: "utf8" }), crlfDelay: Infinity })) {
     if (!line.trim()) continue;
+    let entry: SessionStoreEntry;
     try {
-      entries.push(JSON.parse(line));
+      entry = JSON.parse(line);
     } catch {
       // A torn last line from a crash: Claude Code ignores it too.
+      continue;
     }
+    yield { entry, length: line.length };
   }
-  return entries;
 }
 
 /** Where a session's local transcript lives: its project directory, if any. */
@@ -151,13 +162,13 @@ function findProject(home: string, sessionId: string): string | null {
 
 /** The local transcripts of a session, main and subagents, by subpath. */
 function localTranscripts(home: string, projectKey: string, sessionId: string): LocalTranscript[] {
-  const transcripts: LocalTranscript[] = [{ subpath: undefined, entries: readJsonl(transcriptPath(home, projectKey, sessionId)) }];
+  const transcripts: LocalTranscript[] = [{ subpath: undefined, path: transcriptPath(home, projectKey, sessionId) }];
   const subagents = join(home, "projects", projectKey, sessionId, "subagents");
   if (existsSync(subagents)) {
     for (const name of readdirSync(subagents, { recursive: true, encoding: "utf8" })) {
       if (!name.endsWith(".jsonl")) continue;
       const subpath = `subagents/${name.slice(0, -".jsonl".length)}`;
-      transcripts.push({ subpath, entries: readJsonl(join(subagents, name)) });
+      transcripts.push({ subpath, path: join(subagents, name) });
     }
   }
   return transcripts;
@@ -166,33 +177,43 @@ function localTranscripts(home: string, projectKey: string, sessionId: string): 
 /**
  * Adds whatever local entries the store lacks. Returns how many. Entries with
  * a uuid are matched by it; those without, such as the metadata Claude Code
- * writes as it exits, outside the mirror, by their JSON, counted, so an entry
- * written twice is kept twice and one already stored is not added again.
+ * writes as it exits, outside the mirror, by their JSON's digest, counted, so
+ * an entry written twice is kept twice and one already stored is not added
+ * again. One transcript at a time, read a line at a time, and what is missing
+ * appended in batches as the SDK's own import makes them: what it holds is the
+ * keys it matches by and a batch, however long the transcripts.
  */
 async function reconcile(store: NeonSessionStore, home: string, projectKey: string, sessionId: string): Promise<number> {
   let added = 0;
-  for (const { subpath, entries } of localTranscripts(home, projectKey, sessionId)) {
+  for (const { subpath, path } of localTranscripts(home, projectKey, sessionId)) {
     const key: SessionKey = { projectKey, sessionId, ...(subpath ? { subpath } : {}) };
     const storedUuids = await store.uuidsOf(key);
     const storedUuidless = new Map<string, number>();
-    for (const entry of await store.uuidlessEntriesOf(key)) {
-      const text = JSON.stringify(entry);
-      storedUuidless.set(text, (storedUuidless.get(text) ?? 0) + 1);
-    }
-    const missing = entries.filter((entry) => {
-      if (typeof entry.uuid === "string") return !storedUuids.has(entry.uuid);
-      const text = JSON.stringify(entry);
-      const stored = storedUuidless.get(text) ?? 0;
-      if (stored > 0) {
-        storedUuidless.set(text, stored - 1);
-        return false;
-      }
-      return true;
-    });
-    if (missing.length > 0) {
+    for (const digest of await store.uuidlessDigestsOf(key)) storedUuidless.set(digest, (storedUuidless.get(digest) ?? 0) + 1);
+    let missing: SessionStoreEntry[] = [];
+    let missingLength = 0;
+    const appendMissing = async () => {
       await store.append(key, missing);
       added += missing.length;
+      missing = [];
+      missingLength = 0;
+    };
+    for await (const { entry, length } of readJsonl(path)) {
+      if (typeof entry.uuid === "string") {
+        if (storedUuids.has(entry.uuid)) continue;
+      } else {
+        const digest = entryDigest(entry);
+        const stored = storedUuidless.get(digest) ?? 0;
+        if (stored > 0) {
+          storedUuidless.set(digest, stored - 1);
+          continue;
+        }
+      }
+      missing.push(entry);
+      missingLength += length;
+      if (missing.length >= APPEND_ENTRIES || missingLength >= APPEND_LENGTH) await appendMissing();
     }
+    if (missing.length > 0) await appendMissing();
   }
   return added;
 }

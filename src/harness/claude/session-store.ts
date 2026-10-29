@@ -27,6 +27,7 @@ import {
   type SessionStoreEntry,
   type SessionSummaryEntry,
 } from "@anthropic-ai/claude-agent-sdk";
+import { createHash } from "node:crypto";
 import type { Pool } from "pg";
 
 export const DEFAULT_SCHEMA = "claude_sessions";
@@ -268,15 +269,27 @@ export class NeonSessionStore implements SessionStore {
     return new Set(rows.map((row) => row.uuid));
   }
 
-  /** A transcript's entries that have no uuid, in order. */
-  async uuidlessEntriesOf(key: SessionKey): Promise<SessionStoreEntry[]> {
-    const { rows } = await this.#pool.query<{ entry: SessionStoreEntry }>(
-      `select entry from ${this.#schema}.entries
-       where project_key = $1 and session_id = $2 and subpath = $3 and uuid is null order by seq`,
+  /**
+   * The digests of a transcript's entries that have no uuid (entryDigest), made by Postgres:
+   * those entries, the metadata Claude Code writes again on each turn, come to many MB in a
+   * long session's transcript, which its digests are a small part of.
+   */
+  async uuidlessDigestsOf(key: SessionKey): Promise<string[]> {
+    const { rows } = await this.#pool.query<{ digest: string }>(
+      `select encode(sha256(convert_to(entry::text, 'UTF8')), 'hex') as digest from ${this.#schema}.entries
+       where project_key = $1 and session_id = $2 and subpath = $3 and uuid is null`,
       [key.projectKey, key.sessionId, subpathOf(key)],
     );
-    return rows.map((row) => row.entry);
+    return rows.map((row) => row.digest);
   }
+}
+
+/**
+ * An entry's digest, as uuidlessDigestsOf gives a stored one's: the SHA-256 of its JSON, as
+ * append stores it (`json` keeps that text as it is), in hex.
+ */
+export function entryDigest(entry: SessionStoreEntry): string {
+  return createHash("sha256").update(JSON.stringify(entry)).digest("hex");
 }
 
 /**
