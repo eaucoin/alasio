@@ -73,48 +73,61 @@ func ioctl(fd int, req uintptr, arg unsafe.Pointer) error {
 	return nil
 }
 
-// copyPages installs len(src) bytes at dst and wakes the threads faulting there. It retries
-// while the kernel says the address space is changing (EAGAIN), and treats pages some other
-// install has already put there (EEXIST) as done, waking the range so no fault is left waiting.
-func copyPages(fd int, dst uintptr, src []byte) error {
-	for {
+// copyPages installs len(src) bytes at dst, pages of pageSize, and wakes the threads faulting
+// there. It goes on where the kernel stopped: while the address space is changing (EAGAIN), and
+// past a page already there (EEXIST), whose faults it wakes, so that every page of the range is in
+// when it returns.
+func copyPages(fd int, dst uintptr, src []byte, pageSize uintptr) error {
+	for len(src) > 0 {
 		arg := uffdioCopyArg{dst: uint64(dst), src: uint64(uintptr(unsafe.Pointer(&src[0]))), len: uint64(len(src))}
 		err := ioctl(fd, uffdioCopy, unsafe.Pointer(&arg))
-		switch {
-		case err == nil:
+		if err == nil {
 			return nil
+		}
+		if arg.copied > 0 {
+			dst += uintptr(arg.copied)
+			src = src[arg.copied:]
+		}
+		switch {
 		case errors.Is(err, unix.EAGAIN):
-			if arg.copied > 0 {
-				dst += uintptr(arg.copied)
-				src = src[arg.copied:]
-			}
 		case errors.Is(err, unix.EEXIST):
-			return wake(fd, dst, uintptr(len(src)))
+			if err := wake(fd, dst, pageSize); err != nil {
+				return err
+			}
+			dst += pageSize
+			src = src[pageSize:]
 		default:
 			return err
 		}
 	}
+	return nil
 }
 
-// zeroPages maps the zero page over a range of base pages, without a copy.
-func zeroPages(fd int, dst, length uintptr) error {
-	for {
+// zeroPages maps the zero page over length bytes of base pages at dst, as copyPages does a copy.
+func zeroPages(fd int, dst, length, pageSize uintptr) error {
+	for length > 0 {
 		arg := uffdioZeropageArg{rng: uffdioRangeArg{start: uint64(dst), len: uint64(length)}}
 		err := ioctl(fd, uffdioZeropage, unsafe.Pointer(&arg))
-		switch {
-		case err == nil:
+		if err == nil {
 			return nil
+		}
+		if arg.zeroed > 0 {
+			dst += uintptr(arg.zeroed)
+			length -= uintptr(arg.zeroed)
+		}
+		switch {
 		case errors.Is(err, unix.EAGAIN):
-			if arg.zeroed > 0 {
-				dst += uintptr(arg.zeroed)
-				length -= uintptr(arg.zeroed)
-			}
 		case errors.Is(err, unix.EEXIST):
-			return wake(fd, dst, length)
+			if err := wake(fd, dst, pageSize); err != nil {
+				return err
+			}
+			dst += pageSize
+			length -= pageSize
 		default:
 			return err
 		}
 	}
+	return nil
 }
 
 func wake(fd int, start, length uintptr) error {

@@ -371,3 +371,41 @@ func TestServeInstallsEachFaultingBlock(t *testing.T) {
 		t.Fatalf("%d installs, %d of zeros, %d ranged GETs", handler.installs.Load(), handler.zeroInstalls.Load(), s.ranges.Load())
 	}
 }
+
+// A block whose pages are 4 KiB and one of them already there is installed whole around it.
+func TestCopyPagesGoesPastAPageAlreadyThere(t *testing.T) {
+	fd, _, errno := unix.Syscall(unix.SYS_USERFAULTFD, unix.O_CLOEXEC|unix.O_NONBLOCK|uffdUserOnly, 0, 0)
+	if errno != 0 {
+		t.Skipf("no userfaultfd here: %v", errno)
+	}
+	defer unix.Close(int(fd))
+	api := [3]uint64{uffdAPI, 0, 0}
+	if err := ioctl(int(fd), uffdioAPI, unsafe.Pointer(&api)); err != nil {
+		t.Fatal(err)
+	}
+	mem, err := unix.Mmap(-1, 0, blockSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Munmap(mem)
+	base := uintptr(unsafe.Pointer(&mem[0]))
+	reg := [4]uint64{uint64(base), uint64(len(mem)), registerMiss, 0}
+	if err := ioctl(int(fd), uffdioRegister, unsafe.Pointer(&reg)); err != nil {
+		t.Fatal(err)
+	}
+	page := uintptr(os.Getpagesize())
+	data := randomBlock(t)
+	// The page in the middle, there first, with other bytes.
+	if err := copyPages(int(fd), base+blockSize/2, bytes.Repeat([]byte{7}, int(page)), page); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyPages(int(fd), base, data, page); err != nil {
+		t.Fatal(err)
+	}
+	// Every page is now in: reading them faults nothing, which in this process would wait for ever.
+	want := bytes.Clone(data)
+	copy(want[blockSize/2:], bytes.Repeat([]byte{7}, int(page)))
+	if !bytes.Equal(mem, want) {
+		t.Fatal("the block is not the copy around the page that was there")
+	}
+}

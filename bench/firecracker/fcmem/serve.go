@@ -368,15 +368,15 @@ func (h *handler) install(b int) error {
 		h.zeroInstalls.Add(1)
 		if h.pageSize == blockSize {
 			// A hugetlbfs page cannot take the zero page: a copy of zeros.
-			err = copyPages(h.uffd, dst, zeroBlock)
+			err = copyPages(h.uffd, dst, zeroBlock, uintptr(h.pageSize))
 		} else {
-			err = zeroPages(h.uffd, dst, blockSize)
+			err = zeroPages(h.uffd, dst, blockSize, uintptr(h.pageSize))
 		}
 	} else {
 		var data []byte
 		var release func()
 		if data, release, err = h.cache.block(h.header.Objects[src.Object], src.Offset, b); err == nil {
-			err = copyPages(h.uffd, dst, data)
+			err = copyPages(h.uffd, dst, data, uintptr(h.pageSize))
 			release()
 		}
 	}
