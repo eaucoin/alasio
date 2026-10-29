@@ -571,13 +571,14 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
     );
 
   /**
-   * Lets the restored pod `name`, on `node`, restored from `snapshot`, its workspace attached
-   * before it was made, run: once its containers run, paused, its node's agent resumes its
-   * sandbox once the pod's egress is confined there, and the pod is then ready, by its readiness
-   * gate. A pod that ends meanwhile, or cannot start, whose sandbox the agent does not resume, or
-   * whose readiness cannot be set, is refused.
+   * Lets the restored pod `name`, on `node`, restored from `snapshot`, of images of `bytes`
+   * together, its workspace attached before it was made, run: once its containers run, paused,
+   * its node's agent resumes its sandbox once the pod's egress is confined there, waited for as
+   * long as reading those images may take, and the pod is then ready, by its readiness gate. A
+   * pod that ends meanwhile, or cannot start, whose sandbox the agent does not resume, or whose
+   * readiness cannot be set, is refused.
    */
-  const resumeRestored = (pool: Pool, workspace: string, name: string, node: string, snapshot: string): Effect.Effect<void, RestoreRefused> =>
+  const resumeRestored = (pool: Pool, workspace: string, name: string, node: string, snapshot: string, bytes: number): Effect.Effect<void, RestoreRefused> =>
     Effect.gen(function*() {
       const running = yield* podOnce(
         pool,
@@ -595,7 +596,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       // Paused where its policies are not in force (504), or where the bucket fails (502), which
       // may pass; of any other failure its sandbox may have run; paused, too, where the snapshot
       // was taken live and holds the session no more (410), which no try restores.
-      yield* agents.resume(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, podIPs, containerIds, policies, snapshot }).pipe(
+      yield* agents.resume(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, podIPs, containerIds, policies, snapshot }, bytes).pipe(
         Effect.mapError((error) => {
           const status = error._tag === "NodeAgentError" ? error.status : undefined;
           return new RestoreRefused({ reason: error.message, resumed: status !== 502 && status !== 504 && status !== 410, ...(status === 410 ? { stale: true } : {}) });
@@ -634,7 +635,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
 
   const restoring = (pool: Pool, workspace: string, mode: "none" | "full", attaching: Attaching): Restoring => {
     /** What this bind's maker restored, which its pod's readying resumes. */
-    let restored: { readonly pod: string; readonly node: string; readonly snapshot: string; readonly manifest: Manifest; readonly started: number } | null = null;
+    let restored: { readonly pod: string; readonly node: string; readonly snapshot: string; readonly bytes: number; readonly manifest: Manifest; readonly started: number } | null = null;
 
     const make: MakePod = (labels, annotations, binding) =>
       Effect.gen(function*() {
@@ -708,7 +709,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             Effect.tapError(() => attaching.detach(node, name)),
             Effect.mapError((error) => new BindStepFailed({ reason: `its restore's pod could not be made: ${error.message}` })),
           );
-          restored = { pod: pod.metadata?.name ?? "", node, snapshot: from.snapshot, manifest, started };
+          restored = { pod: pod.metadata?.name ?? "", node, snapshot: from.snapshot, bytes: from.bytes, manifest, started };
           return pod;
         }
         // Gone or corrupt (404, 422), or of no node's (409), it never restores; otherwise it may yet.
@@ -726,7 +727,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       Effect.gen(function*() {
         const of = restored;
         if (of === null || of.pod !== pod.metadata?.name) return yield* attach(pod);
-        const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot).pipe(Effect.result);
+        const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot, of.bytes).pipe(Effect.result);
         if (done._tag === "Success") {
           const now = yield* Clock.currentTimeMillis;
           deferredSince.delete(named(pool, workspace));

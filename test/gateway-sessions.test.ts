@@ -813,7 +813,7 @@ test("a release whose sandbox can be saved no more has its bayma go on with the 
   }
 });
 
-/** Its snapshot `snapshot` of the workspace `workspace` of `env`, taken under `r1` on its pool's template. */
+/** Its snapshot `snapshot` of the workspace `workspace` of `env`, taken under `r1` on its pool's template, its pages 64 MiB. */
 const manifestOf = (env: SessionsEnvironment & { template: V1PodTemplateSpec }, workspace: string, snapshot: string): Manifest => ({
   environment: env.namespace,
   workspace,
@@ -821,8 +821,8 @@ const manifestOf = (env: SessionsEnvironment & { template: V1PodTemplateSpec }, 
   release: "r1",
   cpuFeatures: ["sse"],
   podTemplate: { ...env.template },
-  layers: [{ digest: `sha256:${"a".repeat(64)}`, files: [] }],
-  bytes: 0,
+  layers: [{ digest: `sha256:${"a".repeat(64)}`, files: [{ path: "pages.img", bytes: 64 * 1024 ** 2, sha256: "b".repeat(64), etag: '"c"' }] }],
+  bytes: 64 * 1024 ** 2,
   takenAt: "2026-10-17T12:00:00Z",
   pauseMs: 0,
   uploadMs: 0,
@@ -842,7 +842,7 @@ function restoringAgents(current: Manifest | null, released: Released | null, { 
       prepare === "fails"
         ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 502, reason: "the snapshots bucket failed" }))
         : Effect.sync(() => (base.asked.push(`prepare ${node}${gofer ? ` ${gofer.transport}${gofer.pagesRetry ? " retrying pages" : ""}` : ""}`), { manifest: state.current as Manifest, imagePath: "/var/cache/alasio/image", source: "cache" as const })),
-    resume: (node, request) => Effect.sync(() => void base.asked.push(`resume ${node} ${request.pod} ${request.snapshot}`)),
+    resume: (node, request, bytes) => Effect.sync(() => void base.asked.push(`resume ${node} ${request.pod} ${request.snapshot} of ${bytes} bytes`)),
     spend: (_ref, snapshot) => Effect.sync(() => (base.asked.push(`spend ${snapshot}`), void (state.current = null))),
     forget: (ref) => Effect.sync(() => (base.asked.push(`forget ${ref.workspace}`), void (state.current = null))),
   };
@@ -898,7 +898,7 @@ test("a workspace released into its snapshot is restored from it as it is next b
     assert.equal(restored.metadata?.labels?.["alasio.dev/free"], undefined);
     assert.equal(restored.metadata?.annotations?.["alasio.dev/binding-key"], key);
     // Its checkpoint gofer as the release that took it restores best.
-    assert.deepEqual(recorded.asked, [`prepare node-a socket retrying pages`, `resume node-a ${name} ${snapshot}`, `spend ${snapshot}`, `record ${env.namespace}/fs-restored released into none`]);
+    assert.deepEqual(recorded.asked, [`prepare node-a socket retrying pages`, `resume node-a ${name} ${snapshot} of ${64 * 1024 ** 2} bytes`, `spend ${snapshot}`, `record ${env.namespace}/fs-restored released into none`]);
     assert.equal(recorded.attached[0]?.pod, name);
   });
   assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=restored": 1 });

@@ -2378,19 +2378,48 @@ test("alasio has a restored sandbox resumed by its node's agent, or is told why 
     Effect.gen(function*() {
       const here = yield* node("node-1");
       const snapshot = released(s3);
-      yield* (yield* agentsOf(here.agent)).resume("node-1", resumeRequest(snapshot));
+      yield* (yield* agentsOf(here.agent)).resume("node-1", resumeRequest(snapshot), 0);
       assert.deepEqual(here.releases.calls(RELEASE).map((args) => args.slice(-2)), [["resume", CONTAINER], ["resume", OTHER_CONTAINER]]);
 
       // An agent whose wait ended answers 504.
       const late = new PoliciesNotInForce({ namespace: SESSIONS, pod: POD, ip: POD_IP, reason: "KUBE-ROUTER-FORWARD has no jump of what it sends" });
-      const refused = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(late) })).resume("node-1", resumeRequest(snapshot)));
+      const refused = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(late) })).resume("node-1", resumeRequest(snapshot), 0));
       assert.equal(refused.message, `the node agent of node-1 could not resume main/fs-abc's sandbox: ${late.message}`);
       assert.equal(refused._tag === "NodeAgentError" && refused.status, 504);
 
       // One restored from a snapshot that holds the session no more answers 410.
       const outlived = new SnapshotOutlived({ environment: "main", workspace: "fs-abc", snapshot: "20261013T000000000Z-00000001", reason: "bayma's state generation is 6, and was 5 as it was saved" });
-      const gone = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(outlived) })).resume("node-1", resumeRequest(snapshot)));
+      const gone = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(outlived) })).resume("node-1", resumeRequest(snapshot), 0));
       assert.equal(gone._tag === "NodeAgentError" && gone.status, 410);
+    })
+  ));
+
+test("alasio waits for a resume as long as reading the images its sandbox was restored from may take, and no longer", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const snapshot = released(s3);
+      // Each resume the agent is asked, begun, and ended once the test says, or as it ends.
+      let call = { begun: Deferred.makeUnsafe<void>(), ended: Deferred.makeUnsafe<void>() };
+      const agents = yield* agentsOf({ ...here.agent, resume: () => Deferred.succeed(call.begun, undefined).pipe(Effect.andThen(Deferred.await(call.ended))) });
+      yield* Effect.addFinalizer(() => Deferred.succeed(call.ended, undefined));
+      // Of images of 512 MiB together, as a chain whose parent's pages a delta left scattered on a slow store may take to
+      // read: 30 s for its pod's policies, 128 s to read them at 4 MiB/s, and 30 s for bayma's hook, 188 s.
+      const bytes = 512 * 1024 ** 2;
+      yield* Effect.gen(function*() {
+        // Past the minute alasio gave any resume, within its own: waited for.
+        const slow = yield* Effect.forkChild(agents.resume("node-1", resumeRequest(snapshot), bytes));
+        yield* Deferred.await(call.begun);
+        yield* TestClock.adjust("187 seconds");
+        yield* Deferred.succeed(call.ended, undefined);
+        yield* Fiber.join(slow);
+        // One that never ends, given up on past its own.
+        call = { begun: Deferred.makeUnsafe<void>(), ended: Deferred.makeUnsafe<void>() };
+        const stuck = yield* Effect.forkChild(Effect.flip(agents.resume("node-1", resumeRequest(snapshot), bytes)));
+        yield* Deferred.await(call.begun);
+        yield* TestClock.adjust("188 seconds");
+        assert.equal((yield* Fiber.join(stuck)).message, "the node agent of node-1 could not resume main/fs-abc's sandbox: it did not answer within 188 s");
+      }).pipe(Effect.provide(TestClock.layer()));
     })
   ));
 
