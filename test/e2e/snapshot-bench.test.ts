@@ -535,7 +535,11 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     if (released.status < 200 || released.status >= 300) throw new Error(`the gateway's release answered ${released.status}: ${released.said}`);
     const manifest = JSON.parse(await agentOk(node, "GET", `/snapshots/${SESSIONS}/${workspace}`)) as Manifest;
     const record = JSON.parse(await agentOk(node, "GET", `/workspaces/${SESSIONS}/${workspace}/released`)) as { readonly snapshot: string; readonly release: string };
-    if (record.snapshot !== manifest.snapshot) throw new Error(`${workspace} was released into ${record.snapshot}, not its current snapshot ${manifest.snapshot}`);
+    // Its current snapshot is the one it was released into, or one the agent compacted from it since, which is the same
+    // (src/node-agent/agent.ts compactNow), as a chain of the live save's image and the release's delta may be due.
+    if (record.snapshot !== manifest.snapshot && record.snapshot !== manifest.compactedFrom) {
+      throw new Error(`${workspace} was released into ${record.snapshot}, not its current snapshot ${manifest.snapshot}`);
+    }
     const heldStop = await bucketBytes(node, workspace);
     const stopLogged = saveLogged(await bootLog(node, sandboxId));
     emit(fixture, sizeMib, run, "save-stop", { ok: true, failure: null }, {
