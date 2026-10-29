@@ -1543,11 +1543,12 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       const from = yield* restoredFrom(request);
       if (from.live !== undefined) yield* holdsStill(from, from.live, containers);
       yield* Effect.forEach(request.podIPs, forgetConnections, { discard: true });
+      // Its restore reads what its sandbox did not touch first in the background, for a while yet, from its resume on: bayma's
+      // hook, which runsc's resume runs, waits on those reads of the pages it touches, however long after the prepare.
+      storeProxy.resumed(prefixOf(request), backgroundReadMs);
       yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
       // Its sandbox runs from the snapshot it was restored from, which its next checkpoint saves what changed since.
       for (const id of request.containerIds) bases.set(id, from);
-      // Its restore reads what its sandbox did not touch first in the background, for a while yet.
-      storeProxy.resumed(prefixOf(request), backgroundReadMs);
       return waited;
     }).pipe(
       // Its gofer read its options as its pod's containers started, the restore's token among them.

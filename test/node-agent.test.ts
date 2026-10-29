@@ -18,7 +18,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
-import { Cause, ConfigProvider, Effect, Exit, Fiber, Layer, Option, Schedule, Scope, Stream } from "effect";
+import { Cause, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
@@ -206,6 +206,8 @@ interface NodeOptions {
   readonly socket?: boolean;
   /** How long its proxy takes a resumed restore told no bytes of pages to be done once its reads are quiet. */
   readonly quietMs?: number;
+  /** How long its proxy's token of a restore lasts from its prepare, unless its restore is resumed before. */
+  readonly preparedForMs?: number;
   /** How long its runsc may take to describe an image in the bucket. */
   readonly inspectTimeoutMs?: number;
 }
@@ -215,7 +217,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, inspectTimeoutMs }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -228,7 +230,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
       // Its socket in /tmp, short enough for a socket's path, whatever TMPDIR is.
       const sockets = socket ? mkdtempSync(join("/tmp", "alasio-agent-")) : null;
       if (sockets !== null) yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(sockets, { recursive: true, force: true })));
-      const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, ...(sockets === null ? {} : { socket: join(sockets, "store.sock") }), ...(quietMs === undefined ? {} : { quietMs }) }).pipe(Effect.orDie);
+      const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, ...(sockets === null ? {} : { socket: join(sockets, "store.sock") }), ...(quietMs === undefined ? {} : { quietMs }), ...(preparedForMs === undefined ? {} : { preparedForMs }) }).pipe(Effect.orDie);
       const restarted = makeNodeAgent({ node: name, nodeRoot: "/", runsc, cache, bucket, storeProxy, host: host.host, restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince, backgroundReadMs: BACKGROUND_READ_MS, ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }) });
       return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted };
     });
@@ -1199,6 +1201,30 @@ test("a restore from the bucket reads its own images through the agent by a toke
       yield* fetched(other, (yield* other.agent.current(workspace))!);
       assert.equal((yield* other.agent.prepare(workspace)).source, "cache");
       assert.equal(yield* throughProxy(other, fifth, own), 403);
+    })
+  ));
+
+test("a restore from the bucket reads on through its sandbox's resume, however long after its prepare bayma's hook, which the resume runs, waits on its pages", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const manifest = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const own = `main/fs-abc/layers/${manifest.layers[0]?.digest}/pages.img`;
+      // Its containers' resume held until the test lets it end, as bayma's hook, which runsc's resume runs, waits on pages.
+      const begun = Deferred.makeUnsafe<void>();
+      const ended = Deferred.makeUnsafe<void>();
+      const there = yield* node("node-2", {
+        preparedForMs: 500,
+        runsc: (runsc) => ({ ...runsc, resume: (release, id) => Deferred.succeed(begun, undefined).pipe(Effect.andThen(Deferred.await(ended)), Effect.andThen(runsc.resume(release, id))) }),
+      });
+      const prepared = yield* there.agent.prepare({ environment: "main", workspace: "fs-abc" });
+      assert.equal(prepared.source, "bucket");
+      const resuming = yield* Effect.forkChild(there.agent.resume(resumeRequest(manifest.snapshot)));
+      yield* Deferred.await(begun);
+      // Its resume under way past the time its prepare gave its token: its reads go on.
+      yield* Effect.sleep("700 millis");
+      assert.equal(yield* throughProxy(there, tokenIn(prepared.imagePath), own), 200);
+      yield* Deferred.succeed(ended, undefined);
+      yield* Fiber.join(resuming);
     })
   ));
 
