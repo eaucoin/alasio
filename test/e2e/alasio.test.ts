@@ -829,11 +829,13 @@ if (inShard("sessions")) {
       telegram?.close();
     });
 
-    test("a new empty workspace without internet is a session of its own, in a pool's pod, confined", async () => {
+    test("a new empty workspace without internet is a session of its own, in a pool's pod, confined, what it runs under a soft core limit of 0", async () => {
       none = await newSession("none");
       const pod = await sessionPod(none);
       assert.equal(pod.metadata?.labels?.["alasio.dev/pool"], "sandboxes-none");
       if (pod.spec?.runtimeClassName === "gvisor") assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/version","utf8"))'), /gvisor/u);
+      // As on an Ubuntu host: no core file written as it crashes, unless it raises the limit.
+      assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/self/limits","utf8"))'), /^Max core file size\s+0\s/mu);
       await assertNoInternet(none);
       assert.match(await inSession(none, 'console.log(require("fs").existsSync("/var/run/secrets/kubernetes.io/serviceaccount"))'), /false/u);
     });

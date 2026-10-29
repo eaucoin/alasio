@@ -3508,7 +3508,8 @@ describe("the sandbox service", () => {
         { name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
         { name: "POD_NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
       ]);
-      assert.deepEqual(bayma?.command, ["/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"]);
+      // Under a soft core limit of 0, as bayma's image runs it.
+      assert.deepEqual(bayma?.command, ["/usr/bin/prlimit", "--core=0:", "--", "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"]);
       assert.deepEqual(bayma?.args?.slice(-6, -2), ["--token-file", "/attach/token", "--telemetry-token-file", "/attach/token"]);
       // Its sessions snapshotted, as main's are by the gateway: held to the nodes' CPU baseline, its bayma holding a stop it is
       // not given for the gateway's save, and its template named by its own hash, which a snapshot taken on it records.

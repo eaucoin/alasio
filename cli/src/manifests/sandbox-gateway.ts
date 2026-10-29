@@ -210,7 +210,12 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
         image: agent,
         imagePullPolicy: config.images.pullPolicy,
         // bayma, and its hook as a release's snapshot runs it, once its workspace is attached.
-        command: ["/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"],
+        // Under a soft core limit of 0, as bayma's own entrypoint runs it and as on an Ubuntu
+        // host (code a session runs may raise it): gVisor's kernel writes no core file as a
+        // process crashes, but under a RuntimeClass of the host's kernel, whose default
+        // core_pattern writes one into the crashing process's directory, a runtime's memory,
+        // of GBs, would be left in the session's workspace.
+        command: ["/usr/bin/prlimit", "--core=0:", "--", "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"],
         args: [
           "mcp-http",
           "--host",

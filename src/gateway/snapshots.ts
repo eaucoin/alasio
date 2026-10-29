@@ -86,12 +86,13 @@ export function holdsStop(bayma: V1Container | undefined): boolean {
 
 /**
  * The command that runs bayma's hook in bayma's container: bayma, as its container runs
- * it after the init that starts it (the arguments after its `--`), told the state
- * directory it serves. Null when the container runs no bayma with one. Pure, for tests.
+ * it after the programs that start it (the arguments after the last of their `--`), told
+ * the state directory it serves. Null when the container runs no bayma with one. Pure, for
+ * tests.
  */
 export function hookOf(bayma: V1Container): string[] | null {
   const command = bayma.command ?? [];
-  const program = command.includes("--") ? command.slice(command.indexOf("--") + 1) : command;
+  const program = command.slice(command.lastIndexOf("--") + 1);
   const stateDir = stateDirOf(bayma);
   return program.length > 0 && stateDir ? [...program, "sandbox-hook", "--state-dir", stateDir] : null;
 }
