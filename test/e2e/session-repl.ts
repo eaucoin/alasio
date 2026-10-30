@@ -6,6 +6,8 @@
  *
  * - `set <volumeId> <value>`: a new Bun session holding `value` live, in a global, and in
  *   its `$checkpoint`, which bayma commits at the end of the exec; prints its id.
+ * - `hold <volumeId> <path>`: a new Bun session holding `held until <path>` as `set` does,
+ *   in an exec left running until there is a file at `path`; prints its id.
  * - `read <volumeId> <sessionId>`: takes the session over, as a client that reconnected
  *   does, and reads both back in an exec; prints what it held, and what bayma told the
  *   exec of how the session came back.
@@ -57,8 +59,8 @@ export interface ReplSeen {
 }
 
 const [verb, volumeId, argument] = process.argv.slice(2);
-if (!volumeId || !argument || !["set", "read", "fill", "sum"].includes(verb ?? "")) {
-  throw new Error("usage: session-repl.ts set <volumeId> <value> | read <volumeId> <sessionId> | fill <volumeId> <mebibytes> | sum <volumeId> <sessionId>");
+if (!volumeId || !argument || !["set", "hold", "read", "fill", "sum"].includes(verb ?? "")) {
+  throw new Error("usage: session-repl.ts set <volumeId> <value> | hold <volumeId> <path> | read <volumeId> <sessionId> | fill <volumeId> <mebibytes> | sum <volumeId> <sessionId>");
 }
 
 /** The SHA-256 of the bytes the REPL holds live, as an exec prints it. */
@@ -104,6 +106,16 @@ try {
     await release(client, session.session_id);
     const set: ReplSet = { sessionId: session.session_id };
     console.log(JSON.stringify(set));
+  } else if (verb === "hold") {
+    const { session } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "bun", title: "e2e", cwd: "/workspace" });
+    const value = JSON.stringify(`held until ${argument}`);
+    const code = `globalThis.kept = ${value}; $checkpoint = { kept: ${value} }; while (!require("node:fs").existsSync(${JSON.stringify(argument)})) await Bun.sleep(500); console.log("went on")`;
+    // Yielded at once: the exec runs on in bayma, its client gone.
+    const started = await call<BaymaExecResult>(client, "exec", { session_id: session.session_id, code, yield_time_ms: 0 });
+    if (started.error_text) throw new Error(`the exec failed: ${started.error_text}`);
+    await release(client, session.session_id);
+    const held: ReplSet = { sessionId: session.session_id };
+    console.log(JSON.stringify(held));
   } else if (verb === "fill") {
     const { session } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "bun", title: "e2e", cwd: "/workspace" });
     // Random, so that no page of it is one of zeros, which a save could skip.

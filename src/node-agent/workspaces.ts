@@ -19,8 +19,10 @@
  * checkpoint ended it, or its containers stopped), each mount under its directory is
  * unmounted lazily, as the sandbox's gofer keeps them busy to the last, then the directory is
  * removed, so its pod can be deleted: kubelet deletes no pod whose directory holds a mount.
- * And a pod's directory whose pod the cluster no longer has, however it went, a deletion with
- * no grace or a node lost among it, which no one may ever ask to detach, is detached by a sweep
+ * A directory is detached by one detach at a time, and a mount point gone before its unmount
+ * came, as the node's mount table says after, is taken as unmounted. And a pod's directory
+ * whose pod the cluster no longer has, however it went, a deletion with no grace or a node
+ * lost among it, which no one may ever ask to detach, is detached by a sweep
  * (sweep, ./attachments.ts) once the directory has not changed for ORPHAN_GRACE_MS, and no
  * process of runsc's runs for any of the pod's containers: a session's workspace mounted into
  * it, or a harness's binding written for it, alike. A pod runsc does not run, as a harness's
@@ -81,7 +83,7 @@ import { constants, type StatsFs } from "node:fs";
 import { chmod, chown, link, lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, statfs, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { Clock, Effect, Schedule, Schema } from "effect";
+import { Clock, Effect, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import { isValidVolumeId } from "../sandbox/names.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
@@ -395,9 +397,12 @@ export const lookOnNode = (host: HostCommands) => (point: string): Promise<void>
     throw Object.assign(new Error(stderr.trim()), { code });
   });
 
-export function makeWorkspaces(
+export const makeWorkspaces = Effect.fnUntraced(function*(
   { host, runsc, juicefs, mounted = fuseAt, reaches = reaching(lookOnNode(host)), workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID, quotaSettleMs = QUOTA_SETTLE_MS, holds = holdsQuota(), quotaHeldWithinMs = QUOTA_HELD_WITHIN_MS, own = OWN_MOUNTS, orphanGraceMs = ORPHAN_GRACE_MS }: WorkspacesOptions,
-): Workspaces {
+): Effect.fn.Return<Workspaces, never, Scope.Scope> {
+  /** Each pod directory's lock of its detaches, held while one is under way. */
+  const detaching = yield* RcMap.make({ lookup: (_directory: string) => Semaphore.make(1) });
+
   /** Where `ref`'s files are on the node, its names checked. */
   const filesOf = ({ environment, workspace }: WorkspaceRef): Effect.Effect<string, WorkspaceRefused> =>
     !ENVIRONMENT.test(environment) || !isValidVolumeId(workspace)
@@ -414,6 +419,17 @@ export function makeWorkspaces(
   const mountsUnder = (directory: string) =>
     onNode(host, ["cat", "/proc/self/mountinfo"]).pipe(
       Effect.map(({ stdout }) => mountPoints(stdout).filter((point) => point === directory || point.startsWith(`${directory}/`)).toSorted((a, b) => b.length - a.length)),
+    );
+
+  /**
+   * Unmounts the node's mount point `point`, lazily. One whose unmount fails, but that the
+   * node's mount table, read again, holds no more, is unmounted: one gone before its unmount
+   * came, of which umount says it is not mounted, or not there.
+   */
+  const unmountOnNode = (point: string) =>
+    // `-l`, not `--lazy`, which the busybox of k3s's own binaries, first on the node's PATH, does not take.
+    onNode(host, ["umount", "-l", point]).pipe(
+      Effect.catch((error) => Effect.flatMap(mountsUnder(point), (left) => (left.includes(point) ? Effect.fail(error) : Effect.void))),
     );
 
   /** The container `containerId`, where it is the bayma of the pod `namespace`/`pod` of a pool on this node, as the module says; refused otherwise. */
@@ -463,24 +479,30 @@ export function makeWorkspaces(
   const onMount = <A>(what: string, work: () => Promise<A>) =>
     storage(what).pipe(Effect.andThen(Effect.tryPromise({ try: work, catch: (error) => refused(503, `${what}: ${error instanceof Error ? error.message : String(error)}`) })));
 
-/** Detaches what is attached into the directory of `pod` of `namespace`, as the module says: what of the directory it left, as no attach wrote it. */
-const detach = (namespace: string, pod: string, containerIds: readonly string[]): Effect.Effect<void, WorkspaceRefused | HostCommandError> =>
+  /**
+   * Detaches what is attached into the directory of `pod` of `namespace`, as the module says,
+   * one detach of a directory at a time: the gateway's, as it releases its binding, and a
+   * sweep's, as its pod has gone, may come at once, the later finding what the first left.
+   */
+  const detach = (namespace: string, pod: string, containerIds: readonly string[]): Effect.Effect<void, WorkspaceRefused | HostCommandError> =>
     Effect.gen(function*() {
       const directory = yield* podDirectory(namespace, pod);
-      const running = yield* Effect.forEach(containerIds, (id) => runsc.container(id).pipe(Effect.as(true), Effect.orElseSucceed(() => false)));
-      if (running.some(Boolean)) return yield* refused(409, `${pod}'s sandbox still runs: what is attached into it is detached once it can no longer act`);
-      // `-l`, not `--lazy`, which the busybox of k3s's own binaries, first on the node's PATH, does not take.
-      for (const point of yield* mountsUnder(directory)) yield* onNode(host, ["umount", "-l", point]);
-      // And as the agent's own namespace holds them, as one started after the attach does, deepest first.
-      for (const point of (yield* Effect.promise(() => own.under(directory))).toSorted((a, b) => b.length - a.length)) {
-        yield* Effect.tryPromise(() => own.unmount(point)).pipe(Effect.catch((error) => Effect.logWarning(`${point} was not unmounted as the agent sees it: ${error.message}`)));
-      }
-      // Nothing removed where anything is mounted still, on the node or as the agent sees it, which a removal would walk into.
-      const still = [...(yield* mountsUnder(directory)), ...(yield* Effect.promise(() => own.under(directory)))];
-      if (still.length > 0) return yield* refused(409, `${pod}'s directory holds ${[...new Set(still)].join(", ")} still, unmounted as it was: nothing of it is removed`);
-      const left = yield* Effect.promise(() => removeAttached(directory));
-      if (left.length > 0) yield* Effect.logWarning(`${pod}'s directory is left on the node, as it holds what no attach wrote: ${left.join(", ")}`);
-    });
+      const lock = yield* RcMap.get(detaching, directory);
+      yield* Effect.gen(function*() {
+        const running = yield* Effect.forEach(containerIds, (id) => runsc.container(id).pipe(Effect.as(true), Effect.orElseSucceed(() => false)));
+        if (running.some(Boolean)) return yield* refused(409, `${pod}'s sandbox still runs: what is attached into it is detached once it can no longer act`);
+        for (const point of yield* mountsUnder(directory)) yield* unmountOnNode(point);
+        // And as the agent's own namespace holds them, as one started after the attach does, deepest first.
+        for (const point of (yield* Effect.promise(() => own.under(directory))).toSorted((a, b) => b.length - a.length)) {
+          yield* Effect.tryPromise(() => own.unmount(point)).pipe(Effect.catch((error) => Effect.logWarning(`${point} was not unmounted as the agent sees it: ${error.message}`)));
+        }
+        // Nothing removed where anything is mounted still, on the node or as the agent sees it, which a removal would walk into.
+        const still = [...(yield* mountsUnder(directory)), ...(yield* Effect.promise(() => own.under(directory)))];
+        if (still.length > 0) return yield* refused(409, `${pod}'s directory holds ${[...new Set(still)].join(", ")} still, unmounted as it was: nothing of it is removed`);
+        const left = yield* Effect.promise(() => removeAttached(directory));
+        if (left.length > 0) yield* Effect.logWarning(`${pod}'s directory is left on the node, as it holds what no attach wrote: ${left.join(", ")}`);
+      }).pipe(Semaphore.withPermit(lock));
+    }).pipe(Effect.scoped);
 
   /** The directories of pods there are under the attach root, by namespace and pod, as their names are each's. */
   const podDirectories = async (): Promise<{ readonly namespace: string; readonly pod: string; readonly path: string }[]> => {
@@ -768,4 +790,4 @@ const detach = (namespace: string, pod: string, containerIds: readonly string[])
         });
       }),
   };
-}
+});

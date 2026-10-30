@@ -8,7 +8,7 @@ import { after, before, describe, test } from "node:test";
 import { forkSession, getSessionMessages, importSessionToStore, listSessions } from "@anthropic-ai/claude-agent-sdk";
 import pg from "pg";
 
-import { NeonSessionStore, docOf, mirrorOnly } from "../src/harness/claude/session-store.ts";
+import { NeonSessionStore, docOf, entryDigest, mirrorOnly } from "../src/harness/claude/session-store.ts";
 import { closedBeforeStop, startPostgres, type TestPostgres } from "./support/postgres.ts";
 import { E, KEY, expectEntries, sessionStoreConformance } from "./support/session-store-conformance.ts";
 
@@ -130,13 +130,15 @@ describe("alasio's session store", () => {
     assert.deepEqual(await store.listSessionSummaries("proj"), []);
   });
 
-  test("finds a session's project, the uuids it holds, and its entries without one", async () => {
+  test("finds a session's project, the uuids it holds, and the digests of its entries without one, each as entryDigest makes it of the entry", async () => {
     const store = await makeStore();
-    await store.append(KEY, [E("user", { uuid: "u1" }), E("summary")]);
+    // Text whose JSON escapes a NUL and half a surrogate pair, and which is not ASCII.
+    const odd = E("summary", { summary: `a\u0000b ${"😀".slice(0, 1)} é 😀` });
+    await store.append(KEY, [E("user", { uuid: "u1" }), E("summary"), odd]);
     assert.equal(await store.projectKeyOf("sess"), "proj");
     assert.equal(await store.projectKeyOf("missing"), null);
     assert.deepEqual([...(await store.uuidsOf(KEY))], ["u1"]);
-    expectEntries(await store.uuidlessEntriesOf(KEY), [E("summary")]);
+    assert.deepEqual((await store.uuidlessDigestsOf(KEY)).sort(), [entryDigest(E("summary")), entryDigest(odd)].sort());
   });
 
   test("a query's view mirrors every write but offers nothing to resume from", async () => {

@@ -864,8 +864,9 @@ test("status with rights in alasio's namespace alone says what it sees there, an
 test("up and upgrade refuse to start the object store's parts while its data is still on the volume of the one pod it ran as", async (t) => {
   const { alasio, kube } = await installed(t);
   kube.put("persistentvolumeclaims", { apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: { name: "data-alasio-seaweedfs-0", namespace: "alasio" }, spec: {} });
-  const refusal = "the object store still keeps its data on the volume of its one pod, the claim data-alasio-seaweedfs-0, which this release's parts do not use: " +
-    "they would start the stack on an empty store, so alasio does not apply them; move the data onto them first with the release's cut-over, which deletes data-alasio-seaweedfs-0 once it has";
+  const refusal = "the object store still keeps its data on the volume of the one pod it ran as before alasio 6.0.0, the claim data-alasio-seaweedfs-0, which this release's parts do not use: " +
+    "they would start the stack on an empty store, so alasio does not apply them; no release of alasio moves that data onto the parts, so it upgrades no installation " +
+    "that still has it: alasio applies them once data-alasio-seaweedfs-0 is gone, deleted with what it holds";
   assert.equal(failure(await alasio(["up"])), refusal);
   assert.equal(failure(await alasio(["upgrade"])), refusal);
   kube.objects.delete("/api/v1/namespaces/alasio/persistentvolumeclaims/data-alasio-seaweedfs-0");
@@ -915,7 +916,8 @@ test("up changes no count of the object store's masters, nor lowers its volume s
   assert.equal(
     failure(await alasio(["up"])),
     "objectStore.bundled.volumeServers.scaling would remove volume servers that still hold volumes, alasio-seaweedfs-volume-2.alasio-seaweedfs-volume.alasio.svc.cluster.local:8080: " +
-      "move them to the others first, in weed shell in a gateway's buckets container, with lock, then volume.server.evacuate -node alasio-seaweedfs-volume-2.alasio-seaweedfs-volume.alasio.svc.cluster.local:8080 -apply, then unlock; then lower their count",
+      "move them to the others first, in weed shell (kubectl -n alasio exec -it deployment/alasio-seaweedfs -c buckets -- weed shell " +
+      "-master=alasio-seaweedfs-master-0.alasio-seaweedfs-master.alasio.svc.cluster.local:9333 -filer=alasio-seaweedfs-filer:8888), with lock, then volume.server.evacuate -node alasio-seaweedfs-volume-2.alasio-seaweedfs-volume.alasio.svc.cluster.local:8080 -apply, then unlock; then lower their count",
   );
   // Once they hold none, their count is lowered.
   held = 0;
@@ -1703,7 +1705,7 @@ test("an up or upgrade alasio refuses changes nothing of the machine first: no k
   setup.kube.put("persistentvolumeclaims", { apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: { name: "data-alasio-seaweedfs-0", namespace: "alasio" }, spec: {} });
   for (const command of ["up", "upgrade", "upgrade --check"]) {
     const refused = await run(command);
-    assert.match(failure(refused), /^the object store still keeps its data on the volume of its one pod, the claim data-alasio-seaweedfs-0, /u);
+    assert.match(failure(refused), /^the object store still keeps its data on the volume of the one pod it ran as before alasio 6\.0\.0, the claim data-alasio-seaweedfs-0, /u);
     assert.deepEqual(rootSteps(refused), []);
   }
   setup.kube.objects.delete("/api/v1/namespaces/alasio/persistentvolumeclaims/data-alasio-seaweedfs-0");

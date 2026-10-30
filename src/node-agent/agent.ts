@@ -79,7 +79,7 @@ import { withLogScope } from "../shared/log.ts";
 import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCache } from "./cache.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { egressGap, type PodAddress } from "./kube-router.ts";
-import { restoresFromBucket, runscVersion, STORE_SOCKET_ENDPOINT } from "./names.ts";
+import { backgroundReadSeconds, restoresFromBucket, runscVersion, STORE_SOCKET_ENDPOINT } from "./names.ts";
 import { type ReleaseNotInstalled, type Runsc, type RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
 import type { S3Bucket, S3Error } from "./s3.ts";
 import type { StoreProxy, StoreToken, Transport } from "./store-proxy.ts";
@@ -555,6 +555,16 @@ export const SAVE_HOOK_SECONDS = 30;
  * backgroundReadSeconds).
  */
 export const restoreHookSeconds = (backgroundReadMs: number): number => Math.ceil(backgroundReadMs / 1000) + SAVE_HOOK_SECONDS;
+/**
+ * How long a resume of a sandbox restored from images of `bytes` together may take, in
+ * milliseconds: its wait for the pod's network policies, then runsc's resume, which runs
+ * bayma's hook while the sandbox's pages still load, each page the hook touches waited for, as
+ * long as runsc would bound that hook of a sandbox of so many bytes (restoreHookSeconds), read
+ * at the slowest (./names.ts backgroundReadSeconds). One of a large image, or of a chain
+ * whose parent's pages a delta left scattered, on a slow store, is waited for; one stuck
+ * still ends.
+ */
+export const resumeMs = (bytes: number): number => POLICY_WAIT_MS + restoreHookSeconds(backgroundReadSeconds(bytes) * 1000) * 1000;
 /** How often the cache is looked at for what to evict, besides as checkpoints and prepares write to it. */
 const EVICT_POLL: Duration.Input = "1 minute";
 /** How often a resume looks for a restored pod's rules. */
@@ -1543,11 +1553,12 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       const from = yield* restoredFrom(request);
       if (from.live !== undefined) yield* holdsStill(from, from.live, containers);
       yield* Effect.forEach(request.podIPs, forgetConnections, { discard: true });
+      // Its restore reads what its sandbox did not touch first in the background, for a while yet, from its resume on: bayma's
+      // hook, which runsc's resume runs, waits on those reads of the pages it touches, however long after the prepare.
+      storeProxy.resumed(prefixOf(request), backgroundReadMs);
       yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
       // Its sandbox runs from the snapshot it was restored from, which its next checkpoint saves what changed since.
       for (const id of request.containerIds) bases.set(id, from);
-      // Its restore reads what its sandbox did not touch first in the background, for a while yet.
-      storeProxy.resumed(prefixOf(request), backgroundReadMs);
       return waited;
     }).pipe(
       // Its gofer read its options as its pod's containers started, the restore's token among them.

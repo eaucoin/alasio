@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { describe, test } from "node:test";
 import { gunzipSync, gzipSync } from "node:zlib";
 
@@ -54,15 +54,15 @@ import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHIN
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { oneAtATime } from "../src/manifests/volume-lock.ts";
 import { goferOf, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
+import { hostPathOf, readUnder } from "../../src/node-agent/volume.ts";
 import { apiServerUnconfined } from "../src/install.ts";
 import { environmentAccess } from "../src/manifests/log.ts";
 import { carriedPools, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
 import { STOP_GRACE_SECONDS } from "../../src/binder/names.ts";
 import { STOP_CALLS_MS, STOP_LINGER_MS } from "../../src/binder/server.ts";
 import { folderStateDir, templateHash } from "../../src/gateway/names.ts";
-import { hookOf } from "../../src/gateway/snapshots.ts";
+import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { VERSION } from "../src/release.ts";
-import { SETUP_LABEL, setupPod, stackSetupPod } from "../src/setup-pod.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
 /** A NetworkPolicy as rendered, its ingress rules' peers under `from`. */
@@ -3508,7 +3508,8 @@ describe("the sandbox service", () => {
         { name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
         { name: "POD_NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
       ]);
-      assert.deepEqual(bayma?.command, ["/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"]);
+      // Under a soft core limit of 0, as bayma's image runs it.
+      assert.deepEqual(bayma?.command, ["/usr/bin/prlimit", "--core=0:", "--", "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"]);
       assert.deepEqual(bayma?.args?.slice(-6, -2), ["--token-file", "/attach/token", "--telemetry-token-file", "/attach/token"]);
       // Its sessions snapshotted, as main's are by the gateway: held to the nodes' CPU baseline, its bayma holding a stop it is
       // not given for the gateway's save, and its template named by its own hash, which a snapshot taken on it records.
@@ -3520,13 +3521,65 @@ describe("the sandbox service", () => {
       assert.equal(annotations["dev.gvisor.internal.cpufeatures"], BASELINE.join(","));
       assert.equal(hash, templateHash({ ...template, metadata: { ...template?.metadata, annotations } }));
       // Its hook, as a release's snapshot runs it, through the same start.
-      assert.deepEqual(hookOf(bayma ?? { name: "" }), ["/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"]);
+      assert.deepEqual(hookOf(bayma ?? { name: "" }), ["/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"]);
       const scaled = one<ScaledObject>(objects, "ScaledObject", `sandboxes-${mode}`);
       assert.deepEqual([scaled.spec.minReplicaCount, scaled.spec.maxReplicaCount], [1, 10]);
       assert.deepEqual(scaled.spec.triggers, [{
         type: "metrics-api",
         metadata: { url: `http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/alasio-sessions/sandboxes-${mode}`, valueLocation: "waiting", targetValue: "1" },
       }]);
+    }
+  });
+
+  test("looks at the binds waiting on each sandbox and harness pool as often as at what alasio scales on, and scales a pool whose min is none back to none at the first look that finds none waiting", () => {
+    const timing = (objects: readonly KubernetesObject[]) =>
+      Object.fromEntries(all<ScaledObject>(objects, "ScaledObject").filter(({ spec }) => spec.triggers.some(({ metadata }) => metadata["valueLocation"] === "waiting")).map(({ metadata, spec }) => [
+        `${metadata?.namespace}/${metadata?.name}`,
+        [spec.minReplicaCount, spec.pollingInterval, spec.cooldownPeriod],
+      ]));
+    const file = { host: { enabled: true }, sessions: { pools: { min: 0, max: 10 } }, harness: { pools: { scaling: { min: 0, max: 5 } } } };
+    assert.deepEqual(timing(install(file)), {
+      "alasio-sessions/sandboxes-none": [0, 1, 0],
+      "alasio-sessions/sandboxes-full": [0, 1, 0],
+      "alasio/harness-codex": [0, 1, 0],
+      "alasio/harness-claude": [0, 1, 0],
+      "alasio/harness-folder-codex": [0, 1, 0],
+      "alasio/harness-folder-claude": [0, 1, 0],
+    });
+    // A branch environment's alike, and each as often as alasio's, where the configuration says another.
+    assert.deepEqual(timing(branchObjects(configOf({ ...file, alasio: { pollingSeconds: 2 } }), "try", BASELINE)), {
+      "alasio-branch-try-sessions/sandboxes-none": [0, 2, 0],
+      "alasio-branch-try-sessions/sandboxes-full": [0, 2, 0],
+      "alasio-branch-try/harness-codex": [0, 2, 0],
+      "alasio-branch-try/harness-claude": [0, 2, 0],
+    });
+  });
+
+  test("keeps each pool's pod's bayma's state where its node's agent reads what a live save caught: in the home of the workspace attached into its directory, by a path a mount of its pod holds", async () => {
+    const objects = install();
+    for (const mode of ["none", "full"] as const) {
+      const spec = one<V1Deployment>(objects, "Deployment", `sandboxes-${mode}`).spec?.template.spec;
+      const bayma = spec?.containers.find(({ name }) => name === "bayma");
+      const stateDir = bayma ? stateDirOf(bayma) : null;
+      assert.ok(spec && bayma && stateDir, `the pool sandboxes-${mode}'s bayma names no state directory`);
+      // The node, as its agent sees it: each volume of the pod where the container's spec in its
+      // bundle mounts it from, the pod's directory among them, its workspace's files attached at
+      // ws/ (src/node-agent/workspaces.ts), and in their home, bayma's last-save.json.
+      const node = mkdtempSync(join(tmpdir(), "alasio-pool-node-"));
+      try {
+        const mounts = (bayma.volumeMounts ?? []).map(({ name, mountPath }) => ({ destination: mountPath, source: `/volumes/${name}` }));
+        for (const { source } of mounts) mkdirSync(join(node, source), { recursive: true });
+        mkdirSync(join(node, "/volumes/attach/ws/home/.bayma"), { recursive: true });
+        const caught = JSON.stringify({ schemaVersion: 1, generation: 5, running: [] });
+        writeFileSync(join(node, "/volumes/attach/ws/home/.bayma/last-save.json"), caught);
+        mkdirSync(join(node, "bundle"));
+        writeFileSync(join(node, "bundle", "config.json"), JSON.stringify({ mounts }));
+        const held = await hostPathOf(node, "/bundle", posix.join(stateDir, "last-save.json"));
+        assert.ok(held, `no volume of the pool sandboxes-${mode}'s pod holds ${stateDir}`);
+        assert.equal((await readUnder(held, 1024)).toString("utf8"), caught);
+      } finally {
+        rmSync(node, { recursive: true, force: true });
+      }
     }
   });
 
@@ -4132,36 +4185,6 @@ describe("the relay of an environment's Codex login", () => {
   });
 });
 
-test("the release's setup pod is alasio's own container, its image, environment and Secrets, run once to its end, serving nothing and mounting none of the machine's folders, labelled as alasio's pods but by no ReplicaSet", () => {
-  const objects = install({ host: { enabled: true, uid: 1001, gid: 1002, home: "/home/op", mounts: [{ name: "home", hostPath: "/home/op", mountPath: "/home/op" }] } });
-  const deployment = one<V1Deployment>(objects, "Deployment", "alasio");
-  const alasio = container(deployment);
-  const pod = setupPod(objects);
-  assert.deepEqual([pod.kind, pod.metadata?.name, pod.metadata?.namespace, pod.spec?.restartPolicy], ["Pod", "alasio-setup", "alasio", "Never"]);
-  assert.deepEqual(pod.metadata?.labels, { ...deployment.spec?.template.metadata?.labels, [SETUP_LABEL]: "true" });
-  const [setup, ...others] = pod.spec?.containers ?? [];
-  assert.deepEqual(others, []);
-  assert.deepEqual([setup?.image, setup?.env, setup?.args], [alasio.image, alasio.env, ["node", "/opt/alasio/src/setup/main.ts"]]);
-  assert.deepEqual([setup?.ports, setup?.readinessProbe, setup?.livenessProbe], [undefined, undefined, undefined]);
-  // The machine's folders, which the host profile mounts into alasio, none of its.
-  assert.ok(deployment.spec?.template.spec?.volumes?.some(({ hostPath }) => hostPath !== undefined));
-  assert.equal(pod.spec?.volumes?.some(({ hostPath }) => hostPath !== undefined), false);
-  assert.ok(setup?.volumeMounts?.every(({ name }) => pod.spec?.volumes?.some((volume) => volume.name === name)));
-  assert.equal(pod.spec?.serviceAccountName, "alasio");
-});
-
-test("the release's stack setup's pod is its neon-setup Job's, its image, arguments, environment and service account, run once to its end, labelled as the Job's pods", () => {
-  const objects = install();
-  const job = one<V1Job>(objects, "Job", "alasio-neon-setup");
-  const pod = stackSetupPod(objects);
-  assert.deepEqual([pod.kind, pod.metadata?.name, pod.metadata?.namespace, pod.spec?.restartPolicy], ["Pod", "alasio-stack-setup", "alasio", "Never"]);
-  assert.deepEqual(pod.metadata?.labels, { ...job.spec?.template.metadata?.labels, [SETUP_LABEL]: "true" });
-  assert.deepEqual(pod.spec?.containers, job.spec?.template.spec?.containers);
-  assert.deepEqual(pod.spec?.containers[0]?.args, ["node", "/opt/alasio/neon/control/kube-setup.ts"]);
-  assert.equal(pod.spec?.serviceAccountName, "alasio-neon-setup");
-  assert.throws(() => stackSetupPod(objects.filter(({ kind }) => kind !== "Job")), /has no alasio\/alasio-neon-setup Job/u);
-});
-
 test("runs every container of alasio's image under the image's entrypoint, tini, which ends its program on a SIGTERM that comes before the program handles it: each given its arguments, never a command, which would run in tini's place", () => {
   const objects = install({ host: { enabled: true } });
   const branch = branchObjects(configOf(), "try", BASELINE);
@@ -4173,8 +4196,6 @@ test("runs every container of alasio's image under the image's entrypoint, tini,
   const specs: [string, V1PodSpec][] = [
     ...podSpecs(objects),
     ...podSpecs(branch).map(([name, spec]): [string, V1PodSpec] => [`try/${name}`, spec]),
-    ["alasio-setup", setupPod(objects).spec ?? { containers: [] }],
-    ["alasio-stack-setup", stackSetupPod(objects).spec ?? { containers: [] }],
   ];
   const ofImage = specs.flatMap(([name, spec]) =>
     [...(spec.initContainers ?? []), ...spec.containers].filter((each) => each.image === image).map((each): [string, V1Container] => [`${name}/${each.name}`, each])
@@ -4198,8 +4219,6 @@ test("runs every container of alasio's image under the image's entrypoint, tini,
     "alasio-node-agent/node-agent",
     "alasio-receiver/receiver",
     "alasio-sandbox-gateway/sandbox-gateway",
-    "alasio-setup/alasio",
-    "alasio-stack-setup/setup",
     "alasio-workspace-mount/workspace-mount",
     "alasio/alasio",
     "harness-claude/harness",

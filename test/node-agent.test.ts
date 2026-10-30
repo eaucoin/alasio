@@ -18,7 +18,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
-import { Cause, ConfigProvider, Effect, Exit, Fiber, Layer, Option, Schedule, Scope, Stream } from "effect";
+import { Cause, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
@@ -66,7 +66,7 @@ const builtinFs = createRequire(import.meta.url)("node:fs") as typeof import("no
 const RELEASE = "20260921.0-eaucoin.8";
 const CONTAINER = "0123456789abcdef".repeat(4);
 const OTHER_CONTAINER = "fedcba9876543210".repeat(4);
-const HOOK = ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"];
+const HOOK = ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"];
 const POD_TEMPLATE = { metadata: { labels: { "alasio.dev/sandbox": "fs-abc" } }, spec: { containers: [{ name: "bayma", image: "bayma@sha256:00" }] } };
 const RUNSC_ROOT = "/run/containerd/runsc/k8s.io";
 const CREDENTIALS = { accessKeyId: "snapshots0123", secretAccessKey: "a secret" };
@@ -81,8 +81,13 @@ const request = (workspace: string, containerId = CONTAINER): CheckpointRequest 
   podTemplate: POD_TEMPLATE,
 });
 
-/** bayma's state directory, on the volume mounted at /home/agent, where a live checkpoint saves it. */
-const STATE_DIR = "/home/agent/.bayma";
+/**
+ * bayma's state directory, in the home of the workspace attached into its pod's directory, which
+ * the pod mounts at /attach, where a live checkpoint saves it; and where the pod's directory,
+ * `volume`, holds it.
+ */
+const STATE_DIR = "/attach/ws/home/.bayma";
+const stateDirIn = (volume: string): string => join(volume, "ws", "home", ".bayma");
 
 /** A request to checkpoint the workspace's sandbox live. */
 const live = (workspace: string, containerId = CONTAINER): CheckpointRequest => ({ ...request(workspace, containerId), live: { stateDir: STATE_DIR } });
@@ -201,6 +206,8 @@ interface NodeOptions {
   readonly socket?: boolean;
   /** How long its proxy takes a resumed restore told no bytes of pages to be done once its reads are quiet. */
   readonly quietMs?: number;
+  /** How long its proxy's token of a restore lasts from its prepare, unless its restore is resumed before. */
+  readonly preparedForMs?: number;
   /** How long its runsc may take to describe an image in the bucket. */
   readonly inspectTimeoutMs?: number;
 }
@@ -210,7 +217,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, inspectTimeoutMs }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -223,7 +230,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
       // Its socket in /tmp, short enough for a socket's path, whatever TMPDIR is.
       const sockets = socket ? mkdtempSync(join("/tmp", "alasio-agent-")) : null;
       if (sockets !== null) yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(sockets, { recursive: true, force: true })));
-      const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, ...(sockets === null ? {} : { socket: join(sockets, "store.sock") }), ...(quietMs === undefined ? {} : { quietMs }) }).pipe(Effect.orDie);
+      const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, ...(sockets === null ? {} : { socket: join(sockets, "store.sock") }), ...(quietMs === undefined ? {} : { quietMs }), ...(preparedForMs === undefined ? {} : { preparedForMs }) }).pipe(Effect.orDie);
       const restarted = makeNodeAgent({ node: name, nodeRoot: "/", runsc, cache, bucket, storeProxy, host: host.host, restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince, backgroundReadMs: BACKGROUND_READ_MS, ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }) });
       return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted };
     });
@@ -355,7 +362,7 @@ test("a checkpoint saves the sandbox with its release's runsc, uploads its image
           "checkpoint",
           `--image-path=${staged}`,
           "--compression=none",
-          "--save-restore-exec-argv=node /opt/bayma/bayma.js sandbox-hook --state-dir /home/agent/.bayma",
+          "--save-restore-exec-argv=node /opt/bayma/bayma.js sandbox-hook --state-dir /attach/ws/home/.bayma",
           // As long as a restore of it may take to read its pages (BACKGROUND_READ_MS), and the hook's own 30 s.
           "--save-restore-exec-timeout=1830s",
           CONTAINER,
@@ -583,10 +590,10 @@ test("a snapshot taken live is taken whole where a delta of its parent would mak
     Effect.gen(function*() {
       const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
       yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
-      mkdirSync(join(volume, ".bayma"));
-      writeFileSync(join(volume, ".bayma", "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
+      mkdirSync(stateDirIn(volume), { recursive: true });
+      writeFileSync(join(stateDirIn(volume), "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
       const here = yield* node("node-1");
-      here.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/home/agent", source: volume }]);
+      here.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/attach", source: volume }]);
       // Saved live every so often as its exec runs on, each save's delta of 512 bytes, its base 4096.
       const taken: Manifest[] = [];
       for (let count = 0; count < 12; count++) taken.push(yield* here.agent.checkpoint(live("fs-abc")));
@@ -755,9 +762,9 @@ test("a compaction the workspace moves on from meanwhile commits nothing, what i
         // Taken live, the sandbox running on from it, it is not compacted, however large its delta.
         const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
         yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
-        mkdirSync(join(volume, ".bayma"));
-        writeFileSync(join(volume, ".bayma", "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
-        here.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/home/agent", source: volume }]);
+        mkdirSync(stateDirIn(volume), { recursive: true });
+        writeFileSync(join(stateDirIn(volume), "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
+        here.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/attach", source: volume }]);
         yield* here.agent.checkpoint(live("fs-abc"));
         const second = yield* here.agent.checkpoint(live("fs-abc"));
         assert.equal(second.layers.length, 2);
@@ -914,12 +921,12 @@ test("a checkpoint taken live leaves its sandbox running, records what bayma sai
       const workspace = { environment: "main", workspace: "fs-abc" };
       const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
       yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
-      const stateDir = join(volume, ".bayma");
-      mkdirSync(stateDir);
+      const stateDir = stateDirIn(volume);
+      mkdirSync(stateDir, { recursive: true });
       const lastSave = join(stateDir, "last-save.json");
       writeFileSync(lastSave, JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
       const here = yield* node("node-1");
-      here.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/home/agent", source: volume }]);
+      here.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/attach", source: volume }]);
 
       const first = yield* here.agent.checkpoint(live("fs-abc"));
       const saved = here.releases.calls(RELEASE).findLast((args) => args.includes("checkpoint"));
@@ -946,7 +953,7 @@ test("a checkpoint taken live leaves its sandbox running, records what bayma sai
       // What bayma said the save caught cannot be told: no snapshot of it.
       for (const said of ["{", JSON.stringify({ schemaVersion: 2, ...CAUGHT }), JSON.stringify({ schemaVersion: 1, ...CAUGHT, more: true })]) {
         writeFileSync(lastSave, said);
-        assert.match(failure(yield* Effect.exit(here.agent.checkpoint(live("fs-abc")))), /: what its live save caught cannot be told: .*\/home\/agent\/\.bayma\/last-save\.json is none of bayma's: .*; its snapshot is kept/u);
+        assert.match(failure(yield* Effect.exit(here.agent.checkpoint(live("fs-abc")))), /: what its live save caught cannot be told: .*\/attach\/ws\/home\/\.bayma\/last-save\.json is none of bayma's: .*; its snapshot is kept/u);
         assert.deepEqual(yield* here.agent.current(workspace), whole);
       }
       writeFileSync(lastSave, JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
@@ -967,14 +974,14 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
       const workspace = { environment: "main", workspace: "fs-abc" };
       const outside = mkdtempSync(join(tmpdir(), "alasio-volume-"));
       yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(outside, { recursive: true, force: true })));
-      // The volume mounted at /home/agent; beside it, outside it, what the sandbox may link to,
+      // The pod's directory, mounted at /attach; beside it, outside it, what the sandbox may link to,
       // a generation that matches: one read there would let the sandbox resume.
       const volume = join(outside, "volume");
       const elsewhere = join(outside, "elsewhere");
       const matching = JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation });
       mkdirSync(elsewhere, { recursive: true });
       writeFileSync(join(elsewhere, "generation.json"), matching);
-      const stateDir = join(volume, ".bayma");
+      const stateDir = stateDirIn(volume);
       const file = join(stateDir, "generation.json");
       const reset = () => {
         rmSync(stateDir, { recursive: true, force: true });
@@ -984,7 +991,7 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
         reset();
         writeFileSync(file, written);
       };
-      const mounted = [{ destination: "/home/agent", source: volume }];
+      const mounted = [{ destination: "/attach", source: volume }];
 
       const taker = yield* node("node-1");
       taker.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, mounted);
@@ -1012,10 +1019,10 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
       generation(JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation + 1 }));
       yield* refused(there.agent, /bayma's state generation is 6, and was 5 as it was saved/u);
       reset();
-      yield* refused(there.agent, /.*\/volume\/\.bayma\/generation\.json cannot be opened: there is none/u);
+      yield* refused(there.agent, /.*\/volume\/ws\/home\/\.bayma\/generation\.json cannot be opened: there is none/u);
 
       // A link at any name of its path, to what is outside the volume, or to the node's own files, is not followed.
-      const linked = /.*\/volume\/\.bayma(\/generation\.json)? cannot be opened: it is a symbolic link, which is not followed, or no directory/u;
+      const linked = /.*\/volume\/ws\/home\/\.bayma(\/generation\.json)? cannot be opened: it is a symbolic link, which is not followed, or no directory/u;
       reset();
       symlinkSync(join(elsewhere, "generation.json"), file);
       yield* refused(there.agent, linked);
@@ -1058,7 +1065,7 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
         Buffer.from([0x7b, 0xff, 0x7d]),
       ]) {
         generation(malformed);
-        yield* refused(there.agent, /\/home\/agent\/\.bayma\/generation\.json is none of bayma's: [^\n]+/u);
+        yield* refused(there.agent, /\/attach\/ws\/home\/\.bayma\/generation\.json is none of bayma's: [^\n]+/u);
       }
 
       // One not read within its time, as a volume that hangs would leave it, is unread: here the
@@ -1081,7 +1088,7 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
 
       // No volume of its pod holds bayma's state directory.
       there.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, []);
-      yield* refused(there.agent, /no volume of its pod holds \/home\/agent\/\.bayma\/generation\.json/u);
+      yield* refused(there.agent, /no volume of its pod holds \/attach\/ws\/home\/\.bayma\/generation\.json/u);
       there.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, mounted);
 
       // An agent started since the prepare tells the snapshot from the manifest its cache keeps beside it.
@@ -1177,10 +1184,10 @@ test("a restore from the bucket reads its own images through the agent by a toke
       // Its sandbox checkpointed live, all of its memory read: revoked.
       const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
       yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
-      mkdirSync(join(volume, ".bayma"));
-      writeFileSync(join(volume, ".bayma", "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
-      writeFileSync(join(volume, ".bayma", "generation.json"), JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation }));
-      other.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/home/agent", source: volume }]);
+      mkdirSync(stateDirIn(volume), { recursive: true });
+      writeFileSync(join(stateDirIn(volume), "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
+      writeFileSync(join(stateDirIn(volume), "generation.json"), JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation }));
+      other.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/attach", source: volume }]);
       yield* other.agent.checkpoint(live("fs-abc"));
       assert.equal(yield* throughProxy(other, third, own), 403);
       // And at its release, its sandbox ending.
@@ -1194,6 +1201,30 @@ test("a restore from the bucket reads its own images through the agent by a toke
       yield* fetched(other, (yield* other.agent.current(workspace))!);
       assert.equal((yield* other.agent.prepare(workspace)).source, "cache");
       assert.equal(yield* throughProxy(other, fifth, own), 403);
+    })
+  ));
+
+test("a restore from the bucket reads on through its sandbox's resume, however long after its prepare bayma's hook, which the resume runs, waits on its pages", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const manifest = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const own = `main/fs-abc/layers/${manifest.layers[0]?.digest}/pages.img`;
+      // Its containers' resume held until the test lets it end, as bayma's hook, which runsc's resume runs, waits on pages.
+      const begun = Deferred.makeUnsafe<void>();
+      const ended = Deferred.makeUnsafe<void>();
+      const there = yield* node("node-2", {
+        preparedForMs: 500,
+        runsc: (runsc) => ({ ...runsc, resume: (release, id) => Deferred.succeed(begun, undefined).pipe(Effect.andThen(Deferred.await(ended)), Effect.andThen(runsc.resume(release, id))) }),
+      });
+      const prepared = yield* there.agent.prepare({ environment: "main", workspace: "fs-abc" });
+      assert.equal(prepared.source, "bucket");
+      const resuming = yield* Effect.forkChild(there.agent.resume(resumeRequest(manifest.snapshot)));
+      yield* Deferred.await(begun);
+      // Its resume under way past the time its prepare gave its token: its reads go on.
+      yield* Effect.sleep("700 millis");
+      assert.equal(yield* throughProxy(there, tokenIn(prepared.imagePath), own), 200);
+      yield* Deferred.succeed(ended, undefined);
+      yield* Fiber.join(resuming);
     })
   ));
 
@@ -2347,19 +2378,48 @@ test("alasio has a restored sandbox resumed by its node's agent, or is told why 
     Effect.gen(function*() {
       const here = yield* node("node-1");
       const snapshot = released(s3);
-      yield* (yield* agentsOf(here.agent)).resume("node-1", resumeRequest(snapshot));
+      yield* (yield* agentsOf(here.agent)).resume("node-1", resumeRequest(snapshot), 0);
       assert.deepEqual(here.releases.calls(RELEASE).map((args) => args.slice(-2)), [["resume", CONTAINER], ["resume", OTHER_CONTAINER]]);
 
       // An agent whose wait ended answers 504.
       const late = new PoliciesNotInForce({ namespace: SESSIONS, pod: POD, ip: POD_IP, reason: "KUBE-ROUTER-FORWARD has no jump of what it sends" });
-      const refused = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(late) })).resume("node-1", resumeRequest(snapshot)));
+      const refused = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(late) })).resume("node-1", resumeRequest(snapshot), 0));
       assert.equal(refused.message, `the node agent of node-1 could not resume main/fs-abc's sandbox: ${late.message}`);
       assert.equal(refused._tag === "NodeAgentError" && refused.status, 504);
 
       // One restored from a snapshot that holds the session no more answers 410.
       const outlived = new SnapshotOutlived({ environment: "main", workspace: "fs-abc", snapshot: "20261013T000000000Z-00000001", reason: "bayma's state generation is 6, and was 5 as it was saved" });
-      const gone = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(outlived) })).resume("node-1", resumeRequest(snapshot)));
+      const gone = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(outlived) })).resume("node-1", resumeRequest(snapshot), 0));
       assert.equal(gone._tag === "NodeAgentError" && gone.status, 410);
+    })
+  ));
+
+test("alasio waits for a resume as long as reading the images its sandbox was restored from may take, and no longer", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const snapshot = released(s3);
+      // Each resume the agent is asked, begun, and ended once the test says, or as it ends.
+      let call = { begun: Deferred.makeUnsafe<void>(), ended: Deferred.makeUnsafe<void>() };
+      const agents = yield* agentsOf({ ...here.agent, resume: () => Deferred.succeed(call.begun, undefined).pipe(Effect.andThen(Deferred.await(call.ended))) });
+      yield* Effect.addFinalizer(() => Deferred.succeed(call.ended, undefined));
+      // Of images of 512 MiB together, as a chain whose parent's pages a delta left scattered on a slow store may take to
+      // read: 30 s for its pod's policies, 128 s to read them at 4 MiB/s, and 30 s for bayma's hook, 188 s.
+      const bytes = 512 * 1024 ** 2;
+      yield* Effect.gen(function*() {
+        // Past the minute alasio gave any resume, within its own: waited for.
+        const slow = yield* Effect.forkChild(agents.resume("node-1", resumeRequest(snapshot), bytes));
+        yield* Deferred.await(call.begun);
+        yield* TestClock.adjust("187 seconds");
+        yield* Deferred.succeed(call.ended, undefined);
+        yield* Fiber.join(slow);
+        // One that never ends, given up on past its own.
+        call = { begun: Deferred.makeUnsafe<void>(), ended: Deferred.makeUnsafe<void>() };
+        const stuck = yield* Effect.forkChild(Effect.flip(agents.resume("node-1", resumeRequest(snapshot), bytes)));
+        yield* Deferred.await(call.begun);
+        yield* TestClock.adjust("188 seconds");
+        assert.equal((yield* Fiber.join(stuck)).message, "the node agent of node-1 could not resume main/fs-abc's sandbox: it did not answer within 188 s");
+      }).pipe(Effect.provide(TestClock.layer()));
     })
   ));
 
@@ -2705,7 +2765,7 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       // a pool's pod of the sessions' namespace, its directory kubelet made.
       at.pod("pool-0", "alasio-sessions");
       at.annotations.set("container-0", { "io.kubernetes.cri.sandbox-namespace": "alasio-sessions", "io.kubernetes.cri.sandbox-name": "pool-0", "io.kubernetes.cri.container-name": "bayma" });
-      const hook = ["bayma", "sandbox-hook", "stop", "--state-dir", "/home/agent/.bayma"];
+      const hook = ["bayma", "sandbox-hook", "stop", "--state-dir", "/attach/ws/home/.bayma"];
       yield* agents.stop("node-1", { namespace: "alasio-sessions", pod: "pool-0", containerId: "container-0", hook });
       assert.deepEqual(at.execs, [`r container-0 ${hook.join(" ")}`]);
       const notItsPod = yield* Effect.flip(agents.stop("node-1", { namespace: "alasio-sessions", pod: "pool-1", containerId: "container-0", hook }));

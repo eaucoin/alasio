@@ -14,7 +14,7 @@ import type { KubernetesObject, V1Pod, V1StatefulSet } from "@kubernetes/client-
 import { Effect, Schema } from "effect";
 
 import { NAMESPACE } from "../manifests/common.ts";
-import { MASTER, VOLUME_SERVER } from "../manifests/object-store.ts";
+import { FILER, GATEWAY, MASTER, masterAddresses, VOLUME_SERVER } from "../manifests/object-store.ts";
 import { kind, KubeApi, type KubeApiError } from "./api.ts";
 import { selectorOf } from "./rollout.ts";
 
@@ -78,8 +78,9 @@ function parsed(text: string): DirStatus | null {
 /**
  * Refuses `objects` where the cluster's object store still runs all in one, as alasio before
  * its parts did, its data on that pod's volume, which the parts do not use: started, they
- * would run the stack on a store that is empty. Its data is moved onto them by the cut-over
- * that release's upgrade notes give, which deletes that volume's claim once it has.
+ * would run the stack on a store that is empty. No release of alasio moves that data onto the
+ * parts, so such an installation, of a release before 6.0.0, is refused until the claim is gone,
+ * deleted with what it holds.
  */
 export const checkObjectStoreLayout = Effect.fnUntraced(function*(objects: readonly KubernetesObject[]): Effect.fn.Return<void, KubeApiError | ObjectStoreScaleRefused, KubeApi> {
   if (rendered(objects, VOLUME_SERVER) === undefined) return;
@@ -87,9 +88,9 @@ export const checkObjectStoreLayout = Effect.fnUntraced(function*(objects: reado
   const claim = yield* kube.get({ ...kind("PersistentVolumeClaim"), name: ALL_IN_ONE_CLAIM, namespace: NAMESPACE });
   if (claim === null) return;
   return yield* new ObjectStoreScaleRefused({
-    message: `the object store still keeps its data on the volume of its one pod, the claim ${ALL_IN_ONE_CLAIM}, which this release's parts do not use: ` +
-      "they would start the stack on an empty store, so alasio does not apply them; move the data onto them first with the release's cut-over, " +
-      `which deletes ${ALL_IN_ONE_CLAIM} once it has`,
+    message: `the object store still keeps its data on the volume of the one pod it ran as before alasio 6.0.0, the claim ${ALL_IN_ONE_CLAIM}, which this release's parts do not use: ` +
+      "they would start the stack on an empty store, so alasio does not apply them; no release of alasio moves that data onto the parts, so it upgrades no installation " +
+      `that still has it: alasio applies them once ${ALL_IN_ONE_CLAIM} is gone, deleted with what it holds`,
   });
 });
 
@@ -125,8 +126,10 @@ export const checkObjectStoreScale = Effect.fnUntraced(function*(objects: readon
   }
   if (holding.length > 0) {
     const nodes = holding.map(({ Url }) => Url);
+    // weed shell, as a gateway's buckets container runs it, reaching the masters that run.
+    const shell = `kubectl -n ${NAMESPACE} exec -it deployment/${GATEWAY} -c buckets -- weed shell -master=${masterAddresses(masters.now ?? 1)} -filer=${FILER}:8888`;
     return yield* new ObjectStoreScaleRefused({
-      message: `objectStore.bundled.volumeServers.scaling would remove volume servers that still hold volumes, ${nodes.join(", ")}: move them to the others first, in weed shell in a gateway's buckets container, ` +
+      message: `objectStore.bundled.volumeServers.scaling would remove volume servers that still hold volumes, ${nodes.join(", ")}: move them to the others first, in weed shell (${shell}), ` +
         `with lock, then ${nodes.map((node) => `volume.server.evacuate -node ${node} -apply`).join(", ")}, then unlock; then lower their count`,
     });
   }

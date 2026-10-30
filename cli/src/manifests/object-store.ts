@@ -174,8 +174,11 @@ const podAddress = (name: string, service: string, ordinal: number, port: number
 const podAddresses = (name: string, service: string, count: number, port: number) =>
   Array.from({ length: count }, (_, ordinal) => podAddress(name, service, ordinal, port)).join(",");
 
+/** The `count` masters, as the other parts, and `weed shell`, reach them. */
+export const masterAddresses = (count: number): string => podAddresses(MASTER, MASTER, count, 9333);
+
 /** The masters, as the other parts reach them. */
-const masters = ({ objectStore }: InstallConfig) => podAddresses(MASTER, MASTER, objectStore.bundled.masters.scaling.min, 9333);
+const masters = ({ objectStore }: InstallConfig) => masterAddresses(objectStore.bundled.masters.scaling.min);
 
 /** A pod's name and namespace, by which a part names itself to the others. */
 const POD_ENV: V1EnvVar[] = [

@@ -20,7 +20,8 @@
  *   holds them to (./admission.ts folderPodPolicy), and which has none of the Secrets a host
  *   runs on.
  *
- * KEDA keeps `min` free of each, and makes more, to `max`, for the binds that wait; a bound pod
+ * KEDA keeps `min` free of each, and makes more, to `max`, for the binds that wait
+ * (./sandbox-gateway.ts poolScaling); a bound pod
  * is out of its Deployment, which replaces it, and is evicted by no drain (./disruption.ts
  * boundBudget). The gateway may claim, read and delete each pool's pods and hold their
  * bindings' Leases, in each of their namespaces, and make no pod, nor write another Lease there
@@ -66,9 +67,8 @@ import { durationSeconds, type InstallConfig } from "./config.ts";
 import { boundBudget } from "./disruption.ts";
 import { foldersRun } from "./folders.ts";
 import { priority } from "./priorities.ts";
-import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT, GATEWAY_USER } from "./sandbox-gateway.ts";
+import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT, GATEWAY_USER, poolScaling } from "./sandbox-gateway.ts";
 import { harnessPodPolicy, harnessPoolPodPolicy } from "./admission.ts";
-import { scaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 
 /** The component of a harness pool's pods. */
@@ -181,13 +181,8 @@ function poolObjects(config: InstallConfig, environment: Environment, pool: Pool
       template: harnessTemplate(config, environment, pool, folder),
     },
   };
-  // As many free as binds wait for, past `min`: each is claimed by one.
-  const waiting = {
-    type: "metrics-api",
-    metadata: { url: `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/counts/${pool.namespace}/${pool.name}`, valueLocation: "waiting", targetValue: "1" },
-  };
   // Sized as recommended alone: a host's resources change only as a new pod is made.
-  return [deployment, ...scaledObject(deployment, config.harness.pools.scaling, [waiting]), verticalPodAutoscaler(deployment, "Recommended")];
+  return [deployment, ...poolScaling(config, deployment, pool, config.harness.pools.scaling), verticalPodAutoscaler(deployment, "Recommended")];
 }
 
 /** What the gateway may do with a namespace's harness pools: claim, read and delete their pods, and hold their Leases; make none. */

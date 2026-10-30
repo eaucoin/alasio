@@ -9,7 +9,7 @@ import { FetchHttpClient } from "effect/http";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { Gofer } from "../node-agent/names.ts";
-import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, POLICY_WAIT_MS, type ResumeRequest, type WorkspaceRef } from "../node-agent/agent.ts";
+import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, type ResumeRequest, resumeMs, type WorkspaceRef } from "../node-agent/agent.ts";
 import { NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
 import { type PodOwner, Released, type StopRequest, type SyncRequest } from "../node-agent/workspaces.ts";
 
@@ -96,10 +96,11 @@ export interface NodeAgents {
   readonly collect: (workspace: WorkspaceRef) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
   /**
    * Resumes the sandbox `request` names, restored paused in its pod on `node`, once the
-   * pod's network policies are in force there. An agent refuses one whose policies are
-   * not in force within its wait with 504, the sandbox left paused.
+   * pod's network policies are in force there, from images of `bytes` together, which its
+   * resume may wait on (resumeMs). An agent refuses one whose policies are not in force within
+   * its wait with 504, the sandbox left paused.
    */
-  readonly resume: (node: string, request: ResumeRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  readonly resume: (node: string, request: ResumeRequest, bytes: number) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /**
    * Abandons the restore `request` names, into its pod on `node`, of the uid it names,
    * refused before its sandbox resumed: the agent kills what runsc runs for the pod's containers there, so
@@ -184,8 +185,6 @@ export interface BindingRequest extends PodOwner {
 const LONG_CALL = `${OPERATION_LIMIT_SECONDS} seconds` satisfies Duration.Input;
 /** How often alasio asks an agent how a checkpoint or a prepare it started stands. */
 const OPERATION_POLL: Duration.Input = "500 millis";
-/** How long a resume may take: the agent's wait for the pod's network policies, then runsc's resume of its containers. */
-const RESUME_CALL: Duration.Input = Duration.sum(Duration.millis(POLICY_WAIT_MS), Duration.seconds(30));
 /** How long any other call may take. */
 const SHORT_CALL: Duration.Input = "30 seconds";
 /** How long a sandbox's sync may take: what it writes through, which the agent waits a minute for. */
@@ -238,12 +237,15 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
               ...(request.body !== undefined ? { "content-type": "application/json" } : request.bytes !== undefined ? { "content-type": "application/octet-stream" } : {}),
             },
             ...(request.body !== undefined ? { body: JSON.stringify(request.body) } : request.bytes !== undefined ? { body: request.bytes } : {}),
-            signal: AbortSignal.any([signal, AbortSignal.timeout(Duration.toMillis(request.timeout))]),
+            signal,
           });
           return { status: response.status, ok: response.ok, bytes: new Uint8Array(await response.arrayBuffer()), retryAfter: response.headers.get("retry-after") };
         },
         catch: (cause) => failed(cause instanceof Error ? cause.message : String(cause)),
-      });
+      }).pipe(
+        // Past it, as its fiber's clock tells, the request is aborted.
+        Effect.timeoutOrElse({ duration: request.timeout, orElse: () => Effect.fail(failed(`it did not answer within ${Duration.toSeconds(request.timeout)} s`)) }),
+      );
       const text = new TextDecoder().decode(bytes);
       if (ok || (status === 404 && request.absent)) return { status, bytes, text };
       const refusal = Schema.decodeUnknownOption(Schema.fromJsonString(Refusal))(text);
@@ -389,8 +391,8 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
         ask(node, `collect ${workspace.environment}/${workspace.workspace}'s snapshots`, { method: "POST", path: "/collect", body: workspace, timeout: LONG_CALL }, Collected)).pipe(
           Effect.map(({ kept }) => kept),
         ),
-    resume: (node, request) =>
-      send(node, `resume ${request.environment}/${request.workspace}'s sandbox`, { method: "POST", path: "/resume", body: request, timeout: RESUME_CALL }).pipe(Effect.asVoid),
+    resume: (node, request, bytes) =>
+      send(node, `resume ${request.environment}/${request.workspace}'s sandbox`, { method: "POST", path: "/resume", body: request, timeout: Duration.millis(resumeMs(bytes)) }).pipe(Effect.asVoid),
     abandon: (node, request) =>
       ask(node, `abandon ${request.environment}/${request.workspace}'s restore`, { method: "POST", path: "/abandon", body: request, timeout: SHORT_CALL }, Abandoned).pipe(
         Effect.map(({ killed }) => killed),

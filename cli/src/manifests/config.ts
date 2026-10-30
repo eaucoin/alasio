@@ -184,10 +184,12 @@ const Alasio = Schema.Struct({
    */
   scaling: Scaling({ min: 0, max: 3 }, { floor: false, scaled: true, most: TELEGRAM_PARTITIONS }),
   /**
-   * How often KEDA looks at what alasio scales on, and its relay of the Codex login, in seconds:
-   * each second, as alasio asleep wakes only once KEDA has looked and seen what waits, a press
-   * waiting on its answer within Telegram's 15 s above all. Each look asks the log for its
-   * groups' lags, a few requests of each environment's.
+   * How often KEDA looks at what alasio scales on, its relay of the Codex login, and the sandbox
+   * and harness pools, in seconds: each second, as alasio asleep wakes only once KEDA has looked
+   * and seen what waits, a press waiting on its answer within Telegram's 15 s above all, and a
+   * bind that finds no free pod in its pool waits on that look too. Each look asks the log for
+   * its groups' lags, a few requests of each environment's, and the gateway for each pool's
+   * binds waiting.
    */
   pollingSeconds: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be at least 1" })), 1),
   /** How long none of what alasio scales on must have been seen before KEDA scales it back to `min`, in seconds. */
@@ -446,8 +448,8 @@ const Harness = Schema.Struct({
 /** The bayma the host profile's folder instances run, as this release pins it. */
 export const HOST_BAYMA_IMAGE = {
   repository: "ghcr.io/eaucoin/bayma",
-  tag: "0.15.2",
-  digest: "sha256:7d8b04cad57b44fe3e0db18b9616e22c88fb77b03305534e6fc3223d4635501c",
+  tag: "0.15.4",
+  digest: "sha256:54ace1e40ae3c2350dc54d28b0146b176219d710f300dc55f87cad456a3213e3",
 } as const;
 
 const Host = Schema.Struct({

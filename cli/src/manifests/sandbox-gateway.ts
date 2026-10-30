@@ -16,7 +16,7 @@
  *   on its node (src/node-agent/names.ts ATTACH_ROOT, by `subPathExpr` of its namespace and its name) at /attach,
  *   where its workspace is attached once it is bound, its bayma started once its binding's
  *   token is beside it (sandbox/agent/start.sh). KEDA keeps `min` free, and makes more, to
- *   `max`, for the binds that wait; a bound pod is out of its Deployment, which replaces it.
+ *   `max`, for the binds that wait (poolScaling); a bound pod is out of its Deployment, which replaces it.
  *   A pod that ends is ended: it serves one binding. Its template changes as a whole: the old
  *   free pods go as the new come, as none is ready before it is bound. A bound pod is evicted
  *   by no drain (./disruption.ts boundBudget).
@@ -87,12 +87,12 @@ import {
   TINI_SUBREAPER,
 } from "./common.ts";
 import { resumedConditionPolicy, sandboxPodPolicy } from "./admission.ts";
-import { durationSeconds, type InstallConfig } from "./config.ts";
+import { durationSeconds, type InstallConfig, type Scale } from "./config.ts";
 import { LOG_BROKERS, logPrincipalSecret } from "./log.ts";
 import { boundBudget } from "./disruption.ts";
 import { FILER_STORE } from "./object-store.ts";
 import { priority } from "./priorities.ts";
-import { scaledObject } from "./scalers.ts";
+import { type ScaledObject, scaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 import { JUICEFS_ADMIN, VALKEY, VALKEY_ADDRESS, WORKSPACES_CREDENTIALS, workspacesBucketUrl } from "./workspace-storage.ts";
 
@@ -210,15 +210,23 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
         image: agent,
         imagePullPolicy: config.images.pullPolicy,
         // bayma, and its hook as a release's snapshot runs it, once its workspace is attached.
-        command: ["/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"],
+        // Under a soft core limit of 0, as bayma's own entrypoint runs it and as on an Ubuntu
+        // host (code a session runs may raise it): gVisor's kernel writes no core file as a
+        // process crashes, but under a RuntimeClass of the host's kernel, whose default
+        // core_pattern writes one into the crashing process's directory, a runtime's memory,
+        // of GBs, would be left in the session's workspace.
+        command: ["/usr/bin/prlimit", "--core=0:", "--", "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"],
         args: [
           "mcp-http",
           "--host",
           "0.0.0.0",
           "--port",
           String(POOL_POD_PORT),
+          // Its home's, named through the pod's own mount, where its node's agent reads what a live
+          // save caught (src/node-agent/volume.ts hostPathOf), and not through the image's link
+          // of /home/agent to it, which no mount of the pod names.
           "--state-dir",
-          "/home/agent/.bayma",
+          "/attach/ws/home/.bayma",
           "--token-file",
           "/attach/token",
           "--telemetry-token-file",
@@ -265,13 +273,26 @@ function poolObjects(config: InstallConfig, pool: Pool, mode: keyof typeof POOLS
       template,
     },
   };
-  // As many free as binds wait for, past `min`: each is claimed by one.
+  // Sized as recommended alone: a sandbox's resources change only as a new pod is made.
+  return [deployment, ...poolScaling(config, deployment, pool, config.sessions.pools), verticalPodAutoscaler(deployment, "Recommended")];
+}
+
+/**
+ * KEDA's scaling of `deployment`, the pods of the binder's pool `pool`, between `scale`'s min and
+ * max: as many free as binds wait for, past its min, each claimed by one. KEDA looks at the binds
+ * waiting as often as at what alasio scales on, as a bind that finds no free pod waits on that
+ * look; and scales a pool whose min is none back to none at the first look that finds none
+ * waiting. A bind counts waiting until it has claimed its pod (src/binder/binder.ts), which is
+ * then out of the Deployment: so that ends no bound pod, only the free one the Deployment made in
+ * its place, which no bind waits for. KEDA's cooldown is of the scale to none alone: above none,
+ * the pool's HorizontalPodAutoscaler scales it down.
+ */
+export function poolScaling(config: InstallConfig, deployment: V1Deployment, pool: Pool, scale: Scale): ScaledObject[] {
   const waiting = {
     type: "metrics-api",
     metadata: { url: `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/counts/${pool.namespace}/${pool.name}`, valueLocation: "waiting", targetValue: "1" },
   };
-  // Sized as recommended alone: a sandbox's resources change only as a new pod is made.
-  return [deployment, ...scaledObject(deployment, config.sessions.pools, [waiting]), verticalPodAutoscaler(deployment, "Recommended")];
+  return scaledObject(deployment, scale, [waiting], { pollingSeconds: config.alasio.pollingSeconds, cooldownSeconds: 0 });
 }
 
 /** The gateway's configuration, as src/gateway/gateway.ts reads it. */

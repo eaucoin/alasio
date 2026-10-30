@@ -56,7 +56,7 @@ const BAYMA_SPEC = {
     name: "bayma",
     image: "agent",
     command: ["/usr/bin/tini", "-s", "--", "node", "/opt/bayma/bayma.js"],
-    args: ["mcp-http", "--state-dir", "/home/agent/.bayma"],
+    args: ["mcp-http", "--state-dir", "/attach/ws/home/.bayma"],
     env: [{ name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } }],
     // Its own directory on its node, as a pool's template mounts it.
     volumeMounts: [{ name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAME)", mountPropagation: "HostToContainer" }],
@@ -314,7 +314,7 @@ test("a bound gVisor pod idle for its wait is saved whole by its node's agent fi
     assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-abc123 released into s-1`, `detach node-a ${env.namespace}/${bound.pod}`]);
     const [saved] = recorded.saved;
     assert.deepEqual([saved?.environment, saved?.workspace, saved?.namespace, saved?.containerId], [env.namespace, "fs-abc123", env.namespace, "c-0"]);
-    assert.deepEqual(saved?.hook, ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"]);
+    assert.deepEqual(saved?.hook, ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"]);
     assert.equal((saved?.podTemplate as { spec?: { runtimeClassName?: string } }).spec?.runtimeClassName, "gvisor");
     assert.equal(await run(readLease(env.none, key)), null);
   } finally {
@@ -402,7 +402,7 @@ test("a bound pod a release saved, whose bayma ended with the save, its pod's en
   const records = new Map<string, Released | null>();
   // A snapshot taken live once it is bound, which a pod gone unsaved is released into.
   let saved = false;
-  const live: NodeAgents = { ...recording(recorded, records), current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/home/agent/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null) };
+  const live: NodeAgents = { ...recording(recorded, records), current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/attach/ws/home/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null) };
   const { binder, sessions } = await sessionsOf(options(env, 7290), live);
   const key = sessionKey("fs-saved-broken");
   const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
@@ -803,7 +803,7 @@ test("a release whose sandbox can be saved no more has its bayma go on with the 
     assert.deepEqual(counted, { "alasio.sandbox.release.outcome=unsaveable": 1 });
     assert.deepEqual(recorded.asked, [
       `checkpoint node-a ${bound.pod}`,
-      `stop node-a ${bound.pod} node /opt/bayma/bayma.js sandbox-hook stop --state-dir /home/agent/.bayma`,
+      `stop node-a ${bound.pod} node /opt/bayma/bayma.js sandbox-hook stop --state-dir /attach/ws/home/.bayma`,
       `record ${env.namespace}/fs-abc123 released into none`,
       `detach node-a ${env.namespace}/${bound.pod}`,
     ]);
@@ -813,7 +813,7 @@ test("a release whose sandbox can be saved no more has its bayma go on with the 
   }
 });
 
-/** Its snapshot `snapshot` of the workspace `workspace` of `env`, taken under `r1` on its pool's template. */
+/** Its snapshot `snapshot` of the workspace `workspace` of `env`, taken under `r1` on its pool's template, its pages 64 MiB. */
 const manifestOf = (env: SessionsEnvironment & { template: V1PodTemplateSpec }, workspace: string, snapshot: string): Manifest => ({
   environment: env.namespace,
   workspace,
@@ -821,8 +821,8 @@ const manifestOf = (env: SessionsEnvironment & { template: V1PodTemplateSpec }, 
   release: "r1",
   cpuFeatures: ["sse"],
   podTemplate: { ...env.template },
-  layers: [{ digest: `sha256:${"a".repeat(64)}`, files: [] }],
-  bytes: 0,
+  layers: [{ digest: `sha256:${"a".repeat(64)}`, files: [{ path: "pages.img", bytes: 64 * 1024 ** 2, sha256: "b".repeat(64), etag: '"c"' }] }],
+  bytes: 64 * 1024 ** 2,
   takenAt: "2026-10-17T12:00:00Z",
   pauseMs: 0,
   uploadMs: 0,
@@ -842,7 +842,7 @@ function restoringAgents(current: Manifest | null, released: Released | null, { 
       prepare === "fails"
         ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 502, reason: "the snapshots bucket failed" }))
         : Effect.sync(() => (base.asked.push(`prepare ${node}${gofer ? ` ${gofer.transport}${gofer.pagesRetry ? " retrying pages" : ""}` : ""}`), { manifest: state.current as Manifest, imagePath: "/var/cache/alasio/image", source: "cache" as const })),
-    resume: (node, request) => Effect.sync(() => void base.asked.push(`resume ${node} ${request.pod} ${request.snapshot}`)),
+    resume: (node, request, bytes) => Effect.sync(() => void base.asked.push(`resume ${node} ${request.pod} ${request.snapshot} of ${bytes} bytes`)),
     spend: (_ref, snapshot) => Effect.sync(() => (base.asked.push(`spend ${snapshot}`), void (state.current = null))),
     forget: (ref) => Effect.sync(() => (base.asked.push(`forget ${ref.workspace}`), void (state.current = null))),
   };
@@ -898,7 +898,7 @@ test("a workspace released into its snapshot is restored from it as it is next b
     assert.equal(restored.metadata?.labels?.["alasio.dev/free"], undefined);
     assert.equal(restored.metadata?.annotations?.["alasio.dev/binding-key"], key);
     // Its checkpoint gofer as the release that took it restores best.
-    assert.deepEqual(recorded.asked, [`prepare node-a socket retrying pages`, `resume node-a ${name} ${snapshot}`, `spend ${snapshot}`, `record ${env.namespace}/fs-restored released into none`]);
+    assert.deepEqual(recorded.asked, [`prepare node-a socket retrying pages`, `resume node-a ${name} ${snapshot} of ${64 * 1024 ** 2} bytes`, `spend ${snapshot}`, `record ${env.namespace}/fs-restored released into none`]);
     assert.equal(recorded.attached[0]?.pod, name);
   });
   assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=restored": 1 });
@@ -1107,7 +1107,7 @@ test("a bound pod whose execs run is saved live every liveEvery, its sandbox run
       await new Promise((resolve) => setTimeout(resolve, 1_100));
       await look();
       for (const deadline = Date.now() + 5_000; !recorded.asked.includes(`checkpoint node-a ${bound.pod} live`); await new Promise((resolve) => setTimeout(resolve, 50))) assert.ok(Date.now() < deadline);
-      assert.deepEqual(recorded.saved.at(-1)?.live, { stateDir: "/home/agent/.bayma" });
+      assert.deepEqual(recorded.saved.at(-1)?.live, { stateDir: "/attach/ws/home/.bayma" });
       // bayma moved on from the generation it caught: spent.
       stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now(), generation: 2 };
       await look();
@@ -1124,7 +1124,7 @@ test("a bound pod whose bayma ended in it, or was started again, is released as 
   const recorded = agents();
   // Saved live once it is bound.
   let saved = false;
-  const live = { ...recorded.agents, current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/home/agent/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null) };
+  const live = { ...recorded.agents, current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/attach/ws/home/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null) };
   const { binder, sessions } = await sessionsOf(options(env, 7290), live);
   const key = sessionKey("fs-broken");
   const brokenBefore = await releasedFor(env.namespace, "broken");
@@ -1159,7 +1159,7 @@ test("a bound pod whose sandbox was killed for its memory is released as oom, in
   const env = await environment(1, { gvisor: true, memoryLimit: "1Gi" });
   const recorded = agents();
   let saved = false;
-  const live = { ...recorded.agents, current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/home/agent/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null) };
+  const live = { ...recorded.agents, current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/attach/ws/home/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null) };
   const { binder, sessions } = await sessionsOf(options(env, 7290), live);
   const key = sessionKey("fs-killed");
   const [oomBefore, brokenBefore] = [await releasedFor(env.namespace, "oom"), await releasedFor(env.namespace, "broken")];
@@ -1181,7 +1181,7 @@ test("a bound pod whose workspace its node can reach no more, as its node's moun
   let unreachable = "";
   const live: NodeAgents = {
     ...recorded.agents,
-    current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/home/agent/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null),
+    current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/attach/ws/home/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null),
     attachments: (node) => Effect.sync(() => (recorded.asked.push(`attachments ${node}`), [{ namespace: env.namespace, pod: unreachable, reachable: false }])),
   };
   const { binder, sessions } = await sessionsOf(options(env, 7291), live);

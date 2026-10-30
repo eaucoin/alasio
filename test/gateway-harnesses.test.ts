@@ -41,9 +41,9 @@ before(async () => {
 
 const IDLE: HarnessStatus = { busy: false, running: false, cliInitiated: false, held: false, idleSince: 0 };
 
-/** A stand-in for a bound harness host: what it says of its conversation now, what it was asked, by whose token, how long its drain takes, and whether something goes on in it again as it is drained. */
-async function host(): Promise<{ port: number; status: HarnessStatus; working: boolean; drainMs: number; busyAgain: boolean; asked: string[]; bearers: string[]; close: () => void }> {
-  const stand = { status: IDLE, working: false, drainMs: 0, busyAgain: false, asked: [] as string[], bearers: [] as string[] };
+/** A stand-in for a bound harness host: what it says of its conversation now, what it was asked, by whose token, how long its drain takes, whether something goes on in it again as it is drained, and whether it dies of its drain, answering none. */
+async function host(): Promise<{ port: number; status: HarnessStatus; working: boolean; drainMs: number; busyAgain: boolean; diesDraining: boolean; asked: string[]; bearers: string[]; close: () => void }> {
+  const stand = { status: IDLE, working: false, drainMs: 0, busyAgain: false, diesDraining: false, asked: [] as string[], bearers: [] as string[] };
   const server = createServer((incoming, outgoing) => {
     stand.asked.push(incoming.url ?? "");
     stand.bearers.push(String(incoming.headers.authorization));
@@ -51,6 +51,7 @@ async function host(): Promise<{ port: number; status: HarnessStatus; working: b
     incoming.resume();
     if (incoming.url === HOST_PATHS.status) answer(stand.status);
     else if (incoming.url === HOST_PATHS.backgroundWork) answer({ working: stand.working });
+    else if (incoming.url === HOST_PATHS.drain && stand.diesDraining) incoming.socket.destroy();
     else if (incoming.url === HOST_PATHS.drain) setTimeout(() => answer({ drained: !stand.busyAgain }), stand.drainMs);
     else outgoing.writeHead(404).end();
   });
@@ -386,6 +387,38 @@ test("a bound harness whose host is not reached is kept; one whose drain does no
     } finally {
       again.close();
     }
+  } finally {
+    stand.close();
+  }
+});
+
+test("a bound harness whose host dies as it is drained is let go of all the same, said so with how it ended, as kubelet says it once it notices", async () => {
+  const env = await environment(1);
+  const stand = await host();
+  const recorded = agents();
+  try {
+    const { binder, harnesses } = await harnessesOf(env, configOf(env.home, stand.port, { releaseAfterSeconds: 0 }), recorded.agents, 100);
+    const key = harnessKey("telegram:44");
+    const placement = await Effect.runPromise(harnesses.place(key, { environment: "main", harness: "codex", workspace: "session" }));
+    const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+    stand.diesDraining = true;
+    // Aborted, as a host out of its heap is, and started again, kubelet saying so a second after.
+    const died = (async () => {
+      await eventually("its drain asked", () => (stand.asked.includes(HOST_PATHS.drain) ? true : undefined));
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      await run(withKube((kube) => kube.patchPodStatus(env.home, bound.pod, {
+        status: { containerStatuses: [{ name: "harness", image: "alasio", imageID: "", ready: false, restartCount: 1, state: { running: {} }, lastState: { terminated: { exitCode: 134, reason: "Error" } } }] },
+      })));
+    })();
+    const ending = endsOnceDeleted(env.home, bound.pod);
+    const logged: string[] = [];
+    assert.deepEqual(await Effect.runPromise(harnesses.sweep.pipe(Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push(String(message)))])))), [key]);
+    await died;
+    await ending;
+    assert.equal(await run(readLease(env.codex, key)), null);
+    const drained = logged.filter((line) => line.includes("could not be drained"));
+    assert.equal(drained.length, 1, logged.join("\n"));
+    assert.ok(drained[0]?.startsWith(`${key}'s host in ${bound.pod} could not be drained, as it ended (exit code 134, Error), and is let go of all the same: `), drained[0]);
   } finally {
     stand.close();
   }

@@ -29,11 +29,11 @@ import pg from "pg";
 import { memoryBytes } from "../../cli/src/capacity.ts";
 import type { KindName } from "../../cli/src/kube/api.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
-import { componentName, DATABASE_SECRET, MAIN_ENVIRONMENT, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
+import { componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT, WORKSPACE_MOUNT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { pageserverName } from "../../cli/src/manifests/neon.ts";
-import { HOST_BAYMA_IMAGE, TELEGRAM_PARTITIONS } from "../../cli/src/manifests/config.ts";
-import { environmentAccess, environmentName, telegramTopic } from "../../cli/src/manifests/log.ts";
+import { HOST_BAYMA_IMAGE } from "../../cli/src/manifests/config.ts";
+import { environmentAccess } from "../../cli/src/manifests/log.ts";
 import { WEBHOOK, WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import { BINDING_LABEL, FREE_LABEL, keyHash, POOL_LABEL } from "../../src/binder/names.ts";
@@ -91,6 +91,7 @@ import {
   ref,
   restartNodeContainer,
   RELEASE_AFTER_SECONDS,
+  LIVE_EVERY_SECONDS,
   runCronJob,
   SESSIONS,
   setUp,
@@ -322,8 +323,6 @@ if (inShard("upgrade")) {
     /** The folder mounted in the other chat, which holds a file. */
     let folder: string;
     let messages: number;
-    /** Main's conversation's Codex thread, and the thread its history starts in, which 9.0.0 kept the rollouts of and no row names. */
-    let lineage: { readonly store: string; readonly thread: string; readonly parent: string; readonly parentFile: string };
     /** Runs `sql` on the storage controller's database, neon-control's record among it: what psql printed. */
     const onRecord = async (sql: string) =>
       (await kube.execOk(NAMESPACE, `${neonName("controller-db")}-0`, ["psql", "-U", "storage_controller", "-d", "storage_controller", "-Atc", sql], { container: "postgres" })).trim();
@@ -390,13 +389,6 @@ if (inShard("upgrade")) {
     const folderInstances = async () =>
       (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" }))
         .filter((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"]?.endsWith(`:telegram:${FOLDER_CHAT}`));
-    /** containerd's check of the content of the pods' sandbox image, as it records it by `name`: its digest, and whether it holds all of it. */
-    const sandboxImageChecked = async (name: string) => {
-      const [, , digest = "", status = ""] = (await onNode("", `k3s ctr -n k8s.io images check 'name==${name}' | tail -n +2`)).trim().split(/\s+/u);
-      return { digest, whole: status === "complete" };
-    };
-    /** The pods' sandbox image, by the name containerd records it by. */
-    let sandboxImage: string;
     /** A session of main's released into its snapshot on the release before, its record of it that release's, and its REPL there. */
     const RELEASED_SESSION = "fs-e2eupgradereleased";
     let releasedRepl: string;
@@ -411,20 +403,23 @@ if (inShard("upgrade")) {
           await untilReleased(RELEASED_SESSION, Date.now());
           assert.ok(await snapshotOf(RELEASED_SESSION), `${RELEASED_SESSION} was released into no snapshot on ${PREVIOUS}`);
         },
-        keeps: "the session released before, its record read as this release reads one as it is bound, back from bayma's checkpoints, as its snapshot was taken on a pools' template the upgrade changed",
+        keeps: "the session released before, its record read as this release reads one as it is bound, restored whole from its snapshot onto the pools' template it was taken on, which the gateway carries beside the one the upgrade made",
         check: async () => {
           const bound = await bindSession(RELEASED_SESSION);
           const said = (await gatewayLogs()).filter((line) => line.includes(`${SESSIONS}/${RELEASED_SESSION}`));
-          // Its record read, never refused as one it cannot read; its snapshot one it names, taken on the template before,
-          // which an upgrade changes, its image's tag at least: had its record not been read, the snapshot would have been
-          // one it was not released into instead.
-          assert.ok(!said.some((line) => /could not read/u.test(line)), said.join("\n"));
-          assert.ok(said.some((line) => line.includes("is bound from bayma's checkpoints, not from its snapshot: the pool's template it was taken on is no longer kept")), said.join("\n"));
-          assert.doesNotMatch(bound.name, /-restore-/u);
-          // What bayma checkpointed of its REPL, whole; what the REPL held live alone, gone with its sandbox.
+          // Its record read, never refused as one it cannot read: had it not been, the snapshot would have been one it was
+          // not released into, and the session bound from bayma's checkpoints instead.
+          assert.ok(!said.some((line) => /could not read|is bound from bayma's checkpoints/u.test(line)), said.join("\n"));
+          assert.match(bound.name, /-restore-/u);
+          // Onto the template before, the release before's, whose sandbox image is that release's; the pools' own now run
+          // this one's.
+          const imageOf = (spec: V1PodTemplateSpec["spec"] | undefined) => spec?.containers.find(({ name }) => name === "bayma")?.image;
+          const templates = await gatewayTemplates();
+          assert.notEqual(imageOf(templates.previous?.spec), imageOf(templates.current.spec));
+          assert.equal(imageOf((await sessionPod(RELEASED_SESSION)).spec), imageOf(templates.previous?.spec));
           const seen = await repl.read(RELEASED_SESSION, releasedRepl);
-          assert.deepEqual([seen.live, seen.checkpointed], [null, `held on ${PREVIOUS}`]);
-          assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+          assert.deepEqual([seen.live, seen.checkpointed], [`held on ${PREVIOUS}`, `held on ${PREVIOUS}`]);
+          assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
         },
       },
       {
@@ -460,7 +455,6 @@ if (inShard("upgrade")) {
           await tg.say("again");
           await tg.waitFor((call) => answered(call));
           assert.equal(await inSession(volumeId, 'process.stdout.write(require("fs").readFileSync("/workspace/proof", "utf8"))'), "written by main");
-          await lineageResumed(lineage);
           await tg.say("again", FOLDER_CHAT);
           await tg.waitFor((call) => answered(call, FOLDER_CHAT));
           assert.equal(readFileSync(`${folder}/proof`, "utf8"), "written by the folder chat");
@@ -530,8 +524,8 @@ if (inShard("upgrade")) {
           const after = await stackSecrets();
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
-          // And this release adds to the stack's the Codex login relay's role's password and verifier alone.
-          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), ["codexLoginPassword", "verifiers.codex_login"]);
+          // And this release adds none to the stack's.
+          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)), []);
         },
       },
       {
@@ -609,42 +603,6 @@ if (inShard("upgrade")) {
           await tg.waitFor((call) => answered(call));
         },
       },
-      {
-        seeds: "the pods' sandbox image recorded without its layer's content, as the box's was",
-        seed: async () => {
-          // The box's was deleted by a prune of the node's images, which takes it, as no container is
-          // of it and the CRI holds it unpinned, by another name than k3s pins; then pulled again by
-          // the next pod, onto the snapshot of its layer the pods run on still, so containerd fetched
-          // no blob of that layer.
-          const pinned = (await onNode("", `sed -n 's/^ *sandbox = "\\(.*\\)"$/\\1/p' /var/lib/rancher/k3s/agent/etc/containerd/config.toml`)).trim();
-          const { status } = JSON.parse(await onNode("", `k3s crictl inspecti -o json '${pinned}'`)) as { status: { repoTags: string[]; pinned?: boolean } };
-          sandboxImage = status.repoTags[0] ?? "";
-          assert.equal(status.pinned ?? false, false, `the CRI holds ${sandboxImage} pinned, which no prune takes`);
-          const { digest } = await sandboxImageChecked(sandboxImage);
-          await onNode("", `k3s crictl rmi '${pinned}'`);
-          await until(`${sandboxImage}'s content let go of`, async () => (await onNode("", "k3s ctr -n k8s.io content ls -q")).split("\n").includes(digest) ? undefined : true, 120_000);
-          await onNode("", `k3s crictl pull '${pinned}'`);
-          assert.equal((await sandboxImageChecked(sandboxImage)).whole, false, `${sandboxImage} is recorded with all its content`);
-        },
-        keeps: "the sandbox image whole, what containerd lacked of it fetched before anything changed, and pinned, so no prune takes it again",
-        check: async () => {
-          assert.equal((await sandboxImageChecked(sandboxImage)).whole, true, `${sandboxImage} is recorded without all its content`);
-          // Pinned as the CRI read this release's pin again, its k3s restarted on it.
-          const { status } = JSON.parse(await onNode("", `crictl inspecti -o json '${SANDBOX_IMAGE}'`)) as { status: { pinned?: boolean } };
-          assert.equal(status.pinned, true, `the CRI holds ${SANDBOX_IMAGE} unpinned`);
-          assert.match(await inCutOverRecord("cat events.log"), new RegExp(`fetching what containerd lacks of the sandbox image ${sandboxImage.replaceAll(".", "\\.")}, `, "u"));
-        },
-      },
-      {
-        seeds: "the tally 9.0.0 keeps of albums whose files it failed to write",
-        seed: async () => {
-          assert.equal(await onDatabase(NAMESPACE, "select to_regclass('state.media_group_failures') is not null"), "t", `${PREVIOUS} keeps no tally of albums`);
-        },
-        keeps: "no tally of albums, as a turn's host writes a prompt's files",
-        check: async () => {
-          assert.equal(await onDatabase(NAMESPACE, "select to_regclass('state.media_group_failures') is null"), "t", "the tally of albums is kept still");
-        },
-      },
     ];
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
@@ -668,30 +626,18 @@ if (inShard("upgrade")) {
       await tg.waitFor((call) => answered(call));
     });
 
-    test(`the cut-over from ${PREVIOUS}, failing before its point of no return, once every step before it has run, changes nothing but adding this release's secrets, and a run again starts over`, { timeout: 60 * 60_000 }, async () => {
+    test(`the cut-over from ${PREVIOUS}, failing before its point of no return, once every step before it has run, changes nothing, and a run again starts over`, { timeout: 60 * 60_000 }, async () => {
       const applied = await alasioApplied();
       const [secrets, stack] = [await namespaceSecrets(), await stackSecrets()];
       const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
       assert.notEqual(failed.code, 0, failed.stdout);
-      assert.match(failed.stderr, /checking that the upgrade can run [^\n]*\n[^\n]* making what the stack's secrets lack with this release's stack setup[^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
-      // The release's stack setup kept every key of every Secret 9.0.0's made, its value too, and added the Codex login relay's role's
-      // verifier; and of the stack's secrets, kept whole as one value, it kept every field, adding the role's password and verifier alone.
-      const after = await namespaceSecrets();
-      assert.deepEqual(Object.keys(secrets).filter((key) => after[key] !== secrets[key]), []);
-      assert.ok(Object.keys(after).includes(`${DATABASE_SECRET}/codex-login-verifier`), Object.keys(after).filter((key) => !(key in secrets)).join(", "));
-      const stackAfter = await stackSecrets();
-      assert.deepEqual(Object.keys(stack.root).filter((key) => stackAfter.root[key] !== stack.root[key]), []);
-      assert.deepEqual(Object.keys(stackAfter.root).filter((key) => !(key in stack.root)).sort(), ["codexLoginPassword", "verifiers.codex_login"]);
+      assert.match(failed.stderr, /checking that the upgrade can run [^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
+      assert.deepEqual([await namespaceSecrets(), await stackSecrets()], [secrets, stack]);
       assert.ok(!(await recorded()).includes("point-of-no-return"));
       assert.deepEqual(await alasioApplied(), applied);
       assert.ok(await runs(RELEASE), "alasio runs as it did");
       await tg.say("between the cut-overs");
       await tg.waitFor((call) => answered(call));
-    });
-
-    // Last of what 9.0.0 does before the cut-over, as a turn of main's after it would save its rollout again, its history_base as its file says it, none.
-    test(`on ${PREVIOUS}: main's Codex thread given a history starting in a thread no row names, as a fork's does`, { timeout: 10 * 60_000 }, async () => {
-      lineage = await seedLineage();
     });
 
     test(`the cut-over from ${PREVIOUS}, failing past its point of no return, before the upgrade, goes on with it when run again, its checks not run again`, { timeout: 60 * 60_000 }, async () => {
@@ -701,22 +647,11 @@ if (inShard("upgrade")) {
       assert.doesNotMatch(failed.stderr, /upgrading, from the cut-over/u);
       const marks = await recorded();
       assert.ok(marks.includes("point-of-no-return") && !marks.includes("upgraded"), marks.join(", "));
-      // Failing once the upgrade is through, which it records. An update sent once alasio is
-      // stopped for it, unread as the upgrade starts, so the log cannot grow the topic as it rolls,
-      // and KEDA wakes this release's alasio for it: the cut-over stops it again, by pausing its
-      // ScaledObject, as KEDA would start it again were it scaled.
-      const cutting = cutOver({ failAt: "after-the-upgrade" });
-      await until("the cut-over to stop alasio", async () => ((await recorded()).includes("alasio-stopped") ? true : undefined), 30 * 60_000);
-      await tg.say("as alasio is stopped for the upgrade");
-      const through = await cutting;
+      // Failing once the upgrade is through, which it records.
+      const through = await cutOver({ failAt: "after-the-upgrade" });
       assert.notEqual(through.code, 0, through.stdout);
       assert.doesNotMatch(through.stderr, /checking that no branch environment exists|checking that the upgrade can run/u);
       assert.match(through.stderr, /upgrading, from the cut-over begun at [^]*FAILED: a failure injected once the upgrade was through\n$/u);
-      // Upgraded to the default scale, KEDA's: alasio woken for the update, stopped again for the
-      // topic to grow by its ScaledObject paused, not alasio scaled, and the pause lifted after.
-      assert.match(through.stderr, /then stopping it again[^]*telegram\.main has its 6 partitions\n[^\n]* alasio's ScaledObject is paused no more/u);
-      // The update answered, once its alasio was started again.
-      await tg.waitFor((call) => answered(call));
       assert.ok((await recorded()).includes("upgraded"));
     });
 
@@ -730,13 +665,10 @@ if (inShard("upgrade")) {
       upgraded = Date.now();
     });
 
-    // Upgraded to the default scale, as the release before's installation has none of its own: the cut-over grew the topic with
-    // alasio's ScaledObject paused, a scale of its Deployment's being KEDA's to undo, and lifted the pause after. Then fixed at one,
-    // as the suites after reach its pod as one.
-    test(`upgraded from ${PREVIOUS} to the default scale: alasio's ScaledObject, paused as the cut-over grew the topic, is paused no more; then fixed at one`, { timeout: 30 * 60_000 }, async () => {
-      const scaled = await kube.get<KubernetesObject>(ref("ScaledObject", RELEASE, NAMESPACE));
-      assert.ok(scaled, "alasio has no ScaledObject");
-      assert.equal(scaled.metadata?.annotations?.["autoscaling.keda.sh/paused-replicas"], undefined);
+    // Upgraded to the default scale, as the release before's installation has none of its own, KEDA's. Then fixed at one, as the
+    // suites after reach its pod as one.
+    test(`upgraded from ${PREVIOUS} to the default scale, KEDA's; then fixed at one`, { timeout: 30 * 60_000 }, async () => {
+      assert.ok(await kube.get<KubernetesObject>(ref("ScaledObject", RELEASE, NAMESPACE)), "alasio has no ScaledObject");
       const { configFile } = paths();
       const config = JSON.parse(readFileSync(configFile, "utf8"));
       config.install.alasio.scaling = { min: 1, max: 1 };
@@ -746,30 +678,6 @@ if (inShard("upgrade")) {
         const deployment = await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE));
         return deployment?.spec?.replicas === 1 && deployment.status?.readyReplicas === 1 ? true : undefined;
       }, 600_000);
-    });
-
-    test(`upgraded: what ${PREVIOUS} served branch environments their sessions' forks on is gone, as branches ask on the log now: its Service pruned, and alasio's port and the rule admitting them to it applied away`, async () => {
-      assert.equal(await kube.get(ref("Service", componentName("branches"), NAMESPACE)), null);
-      const alasio = await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE));
-      assert.ok(alasio, "alasio's Deployment is gone");
-      assert.deepEqual(alasio.spec?.template.spec?.containers.flatMap(({ ports }) => ports ?? []).filter(({ name }) => name === "branch-forks"), []);
-      const policy = await kube.get<KubernetesObject & { readonly spec?: { readonly ingress?: readonly { readonly from?: readonly { readonly namespaceSelector?: object }[] }[] } }>(ref("NetworkPolicy", componentName("alasio"), NAMESPACE));
-      assert.ok(policy, "alasio's NetworkPolicy is gone");
-      // What it admits, if anything, is of its own namespace's: no branch environment's.
-      assert.deepEqual((policy.spec?.ingress ?? []).filter(({ from }) => from?.some(({ namespaceSelector }) => namespaceSelector !== undefined)), []);
-    });
-
-    test("upgraded: the node's stargz-snapshotter daemon runs with this release's configuration, fetching in chunks of 1 MiB, started again since it was written", async () => {
-      const config = await onNode("", "cat /etc/containerd-stargz-grpc/config.toml");
-      assert.match(config, /^chunk_size = 1048576$/mu);
-      // Started since its configuration was written: the daemon reads its file as it starts alone.
-      const [written = "", started = ""] = (await onNode("", "stat -c %Y /etc/containerd-stargz-grpc/config.toml; date -d \"$(systemctl show stargz-snapshotter -p ActiveEnterTimestamp --value)\" +%s")).trim().split("\n");
-      assert.ok(Number(started) >= Number(written), `the daemon started at ${started}, before its configuration was written at ${written}`);
-    });
-
-    test(`upgraded: alasio's Telegram topic, of one partition on ${PREVIOUS}, has its ${TELEGRAM_PARTITIONS}, given while the cut-over had alasio stopped`, async () => {
-      const partitions = await kube.execOk(NAMESPACE, `${componentName("log")}-0`, ["node", "/opt/alasio/src/log/access.ts", "partitions", telegramTopic(environmentName(MAIN_ENVIRONMENT))], { container: "access" });
-      assert.equal(Number(partitions.trim()), TELEGRAM_PARTITIONS);
     });
 
     for (const { keeps, check } of scenarios) test(`upgraded: ${keeps}`, check);
@@ -921,11 +829,13 @@ if (inShard("sessions")) {
       telegram?.close();
     });
 
-    test("a new empty workspace without internet is a session of its own, in a pool's pod, confined", async () => {
+    test("a new empty workspace without internet is a session of its own, in a pool's pod, confined, what it runs under a soft core limit of 0", async () => {
       none = await newSession("none");
       const pod = await sessionPod(none);
       assert.equal(pod.metadata?.labels?.["alasio.dev/pool"], "sandboxes-none");
       if (pod.spec?.runtimeClassName === "gvisor") assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/version","utf8"))'), /gvisor/u);
+      // As on an Ubuntu host: no core file written as it crashes, unless it raises the limit.
+      assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/self/limits","utf8"))'), /^Max core file size\s+0\s/mu);
       await assertNoInternet(none);
       assert.match(await inSession(none, 'console.log(require("fs").existsSync("/var/run/secrets/kubernetes.io/serviceaccount"))'), /false/u);
     });
@@ -1001,18 +911,24 @@ if (inShard("sessions")) {
       console.error(`# the node's images, as containerd checks their content:\n${(await onNode(server, "ctr -n k8s.io images check")).trimEnd()}`);
     });
 
-    test("runs each program of alasio's image under tini, the first of its pod's PIDs, so a SIGTERM that comes before the program handles it ends it", async () => {
+    test("runs each program of alasio's image under tini, the first of its pod's PIDs, so a SIGTERM that comes before the program handles it ends it, and with no core file written as it crashes, as on an Ubuntu host", async () => {
       const image = (await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE)))?.spec?.template.spec?.containers[0]?.image;
       // Of each pod of PIDs of its own, as one of the node's PIDs has the node's first.
       const pods = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE })).filter(({ metadata, spec, status }) => !metadata?.deletionTimestamp && !spec?.hostPID && status?.phase === "Running");
       const first = await Promise.all(pods.flatMap(({ metadata, spec, status }) =>
         (spec?.containers ?? [])
           .filter(({ name, image: its }) => its === image && status?.containerStatuses?.some((each) => each.name === name && each.state?.running))
-          .map(async ({ name }): Promise<[string, string]> => [`${metadata?.labels?.["app.kubernetes.io/component"] ?? metadata?.name}/${name}`, (await kube.execOk(NAMESPACE, metadata?.name ?? "", ["cat", "/proc/1/cmdline"], { container: name })).split("\0")[0] ?? ""])
+          .map(async ({ name }): Promise<[string, string, string]> => {
+            const read = (path: string) => kube.execOk(NAMESPACE, metadata?.name ?? "", ["cat", path], { container: name });
+            // The size of its core files, as the kernel holds the program and all it runs to, unless they raise it.
+            const core = /^Max core file size\s+(\S+)/mu.exec(await read("/proc/1/limits"))?.[1] ?? "";
+            return [`${metadata?.labels?.["app.kubernetes.io/component"] ?? metadata?.name}/${name}`, (await read("/proc/1/cmdline")).split("\0")[0] ?? "", core];
+          })
       ));
       const programs = new Set(first.map(([program]) => program));
       for (const program of ["alasio/alasio", "sandbox-gateway/sandbox-gateway", "receiver/receiver", "neon-control/neon-control", "image/image"]) assert.ok(programs.has(program), `no ${program} ran: ${[...programs].join(", ")}`);
       assert.deepEqual(first.filter(([, program]) => program !== "/usr/bin/tini"), []);
+      assert.deepEqual(first.filter(([, , core]) => core !== "0"), []);
     });
 
     test("a new workspace with internet reaches the internet and nothing private", async () => {
@@ -1608,9 +1524,10 @@ if (inShard("sessions")) {
   });
 }
 
-/** A REPL of a session's bayma, reached as alasio reaches it (./session-repl.ts): a new one holding `value`, and what one holds. */
+/** A REPL of a session's bayma, reached as alasio reaches it (./session-repl.ts): a new one holding `value`, or one whose exec runs until there is a file at `path`, and what one holds. */
 const repl = {
   set: (volumeId: string, value: string) => inAlasio<ReplSet>("./session-repl.ts", "set", volumeId, value),
+  hold: (volumeId: string, path: string) => inAlasio<ReplSet>("./session-repl.ts", "hold", volumeId, path),
   read: (volumeId: string, sessionId: string) => inAlasio<ReplSeen>("./session-repl.ts", "read", volumeId, sessionId),
   fill: (volumeId: string, mebibytes: number) => inAlasio<ReplFilled>("./session-repl.ts", "fill", volumeId, String(mebibytes)),
   sum: (volumeId: string, sessionId: string) => inAlasio<ReplSummed>("./session-repl.ts", "sum", volumeId, sessionId),
@@ -2087,6 +2004,32 @@ if (inShard("snapshots")) {
       await turn("hello from the fork");
       const seen = await repl.read(fork, forked);
       assert.deepEqual([seen.live, seen.checkpointed], [`forked from ${source}`, `forked from ${source}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+    });
+
+    test("a session saved live as its exec runs is released as a delta of the image saved live, and comes back whole from the two", async (t) => {
+      const held = await newSession("none");
+      const went = "/workspace/saved-live";
+      const { sessionId: kept } = await repl.hold(held, went);
+      // Saved live once its exec has run for liveEvery, as the gateway looks at its bound pods every few seconds, then its save.
+      const live = await until(`a snapshot of ${held} taken live`, async () => {
+        const snapshot = await snapshotOf(held);
+        return snapshot?.live === undefined ? undefined : snapshot;
+      }, (LIVE_EVERY_SECONDS + 15) * 1000 + 180_000).catch(async (error: unknown) => {
+        console.error(`# what the sandbox service logged of ${held}:\n${await serviceLogs(held)}`);
+        throw error;
+      });
+      assert.ok(live.live?.running.some(({ sessionId }) => sessionId === kept), `the live save of ${held} caught no exec of ${kept} running: ${JSON.stringify(live.live)}`);
+      t.diagnostic(`saved live as ${live.snapshot}: ${live.bytes} bytes, its sandbox paused ${live.pauseMs} ms`);
+      // Its exec ends, and the session, idle, is released: into a delta of the image saved live.
+      await inSession(held, `require("fs").writeFileSync(${JSON.stringify(went)}, "")`);
+      await untilReleased(held, Date.now());
+      const released = await snapshotOf(held);
+      assert.ok(released && released.live === undefined, `the session ${held} was released into no snapshot of its own: ${JSON.stringify(released)}`);
+      assert.deepEqual(released.layers.slice(1).map(({ digest }) => digest), live.layers.map(({ digest }) => digest), `${released.snapshot} is no delta of ${live.snapshot}`);
+      t.diagnostic(`released into ${released.snapshot}: ${released.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0)} bytes of its own over the ${live.bytes} saved live`);
+      const seen = await repl.read(held, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [`held until ${went}`, `held until ${went}`]);
       assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
     });
 
@@ -3759,61 +3702,6 @@ async function workInMain(): Promise<string> {
 }
 
 /**
- * Main's conversation's Codex thread given a history starting in another thread, as a fork's
- * does, which 9.0.0 kept the rollout of in Neon and no row of main's names: its rollout's
- * history_base that one's, of the store its rollout is kept in.
- */
-async function seedLineage(): Promise<{ readonly store: string; readonly thread: string; readonly parent: string; readonly parentFile: string }> {
-  const thread = await onDatabase(NAMESPACE, "select codex_session_id from state.conversations where id = 'telegram:1001'");
-  assert.match(thread, /^[0-9a-f-]{36}$/u, "main's conversation has a Codex thread");
-  const store = await onDatabase(NAMESPACE, `select s from (values ('codex_sessions'), ('codex_sessionfs_sessions')) as v(s) where to_regclass(s || '.rollouts') is not null and exists (select from pg_tables where schemaname = s) order by s desc`)
-    .then(async (stores) => {
-      for (const candidate of stores.split("\n").filter(Boolean)) {
-        if (await onDatabase(NAMESPACE, `select count(*) from ${candidate}.rollouts where thread_id = '${thread}'`) !== "0") return candidate;
-      }
-      throw new Error(`no store keeps the rollout of ${thread}`);
-    });
-  // Its turn's last line kept, as Codex writes none after it until the next turn: so 9.0.0's mirror saves the rollout no more, which would
-  // set its history_base again as its file says it, none.
-  await until(`${thread}'s turn complete in ${store}`, async () =>
-    (await onDatabase(NAMESPACE, `select count(*) from ${store}.rollout_chunks c join ${store}.rollouts r using (name) where r.thread_id = '${thread}' and position('"task_complete"' in convert_from(c.bytes, 'UTF8')) > 0`)) === "0" ? undefined : true, 120_000);
-  const parent = randomUUID();
-  const parentFile = `rollout-2026-01-01T00-00-00-${parent}.jsonl`;
-  const meta = `${JSON.stringify({ timestamp: "2026-01-01T00:00:00.000Z", type: "session_meta", payload: { id: parent, timestamp: "2026-01-01T00:00:00.000Z", cwd: "/", source: "vscode" } })}\n`;
-  await onDatabase(NAMESPACE, [
-    `insert into ${store}.rollouts (name, path, thread_id, rollout_id, history_base, size, head_digest, modified_ms) values ('${parentFile}', 'sessions/2026/01/01/${parentFile}', '${parent}', '${parent}', null, ${Buffer.byteLength(meta)}, 'seeded', 1767225600000)`,
-    `insert into ${store}.rollout_chunks (name, start, bytes) values ('${parentFile}', 0, convert_to('${meta.replaceAll("'", "''")}', 'UTF8'))`,
-    `update ${store}.rollouts set history_base = '${parent}' where thread_id = '${thread}'`,
-  ].join("; "));
-  return { store, thread, parent, parentFile };
-}
-
-/**
- * Main's conversation's thread resumed by its pod after the upgrade, its lineage with it: the
- * thread and the one its history starts in its conversation's alone, the pod having written the
- * other back where its Codex reads it; and no pod of another conversation can claim either.
- */
-async function lineageResumed({ store, thread, parent, parentFile }: { readonly store: string; readonly thread: string; readonly parent: string; readonly parentFile: string }): Promise<void> {
-  assert.equal(await onDatabase(NAMESPACE, `select string_agg(session_id || ' ' || conversation_id, ',' order by session_id) from state.conversation_sessions where session_id in ('${thread}', '${parent}')`),
-    [`${thread} telegram:1001`, `${parent} telegram:1001`].sort().join(","));
-  const [pod] = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "alasio.dev/binding" }))
-    .filter(({ metadata }) => metadata?.annotations?.["alasio.dev/binding-key"] === "harness:telegram:1001" && metadata.deletionTimestamp === undefined);
-  assert.ok(pod?.metadata?.name, "no pod is bound to main's conversation's harness");
-  const home = store === "codex_sessionfs_sessions" ? "/var/lib/alasio/state/sessionfs/codex" : "/var/lib/alasio/codex";
-  assert.match(await kube.execOk(NAMESPACE, pod.metadata.name, ["sh", "-c", `find ${home} -name '${parentFile}'`], { container: "harness" }), new RegExp(parentFile.replaceAll(".", "\\."), "u"));
-  // A pod of another conversation, by a grant of its own, claims neither: in one transaction, never committed, the select its last statement, which psql prints.
-  const claimed = await onDatabase(NAMESPACE, [
-    "begin",
-    "insert into state.conversations (id, transport, chat_id) values ('e2e:other', 'e2e', 'other')",
-    "insert into state.harness_grants (conversation_id, binding, secret_sha256) values ('e2e:other', 'e2e', sha256(convert_to('e2e-grant', 'UTF8')))",
-    "set local role harness",
-    "select set_config('alasio.harness_grant', 'e2e-grant', true)",
-    `select state.harness_claim('${thread}')::text || ' ' || state.harness_claim('${parent}')::text || ' ' || (select count(*) from ${store}.rollouts where thread_id in ('${thread}', '${parent}'))`,
-  ].join("; "));
-  assert.equal(claimed.split("\n").filter(Boolean).at(-1), "false false 0");
-}
-
-/**
  * Makes the run's branch environment by `alasio branch create`, with `overrides` over its
  * installation, and `given`, flags of branch create's besides. Its alasio talks to its own bot's stand-in, which `base` forwards to here,
  * as the command line checks its token with it.
@@ -4045,6 +3933,48 @@ if (inShard("agents")) {
       await tg.say("after");
       await tg.waitFor((call) => answered(call));
       assert.notEqual((await harnessPod()).metadata?.uid, bound.metadata?.uid);
+    });
+
+    test("a pool kept at none ends the free pod its Deployment makes in place of a cold bind's at KEDA's next look, not a cooldown after", { timeout: 15 * 60_000 }, async (t) => {
+      const scaler = ref("ScaledObject", "harness-codex", NAMESPACE);
+      const pool = ref("Deployment", "harness-codex", NAMESPACE);
+      /** The pool's free pods, but those being deleted. */
+      const freePods = async () =>
+        (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "alasio.dev/free=true,alasio.dev/pool=harness-codex" })).filter(({ metadata }) => metadata?.deletionTimestamp === undefined);
+      const bound = await boundNow();
+      await kube.patch(scaler, { spec: { minReplicaCount: 0 } });
+      try {
+        // At none, as no bind waits; then its bound pod let go of, so that the next prompt's bind waits for the pool to be scaled.
+        await until("the pool scaled to none", async () => ((await kube.get<V1Deployment>(pool))?.spec?.replicas === 0 ? true : undefined), 6 * 60_000);
+        await kube.remove(ref("Pod", bound.metadata?.name ?? "", NAMESPACE));
+        await until("the deleted pod's binding let go of", async () => ((await harnessPods()).length === 0 ? true : undefined), 300_000);
+        // Each free pod seen from the prompt on, by its name: when it was made, and when it was first seen free no more, claimed or gone.
+        const lives = new Map<string, { made: number; ended?: number }>();
+        let watching = true;
+        const watcher = (async () => {
+          for (; watching; await sleep(1_000)) {
+            const free = await freePods();
+            const now = Date.now();
+            for (const { metadata } of free) if (!lives.has(metadata?.name ?? "")) lives.set(metadata?.name ?? "", { made: new Date(metadata?.creationTimestamp ?? now).getTime() });
+            for (const [name, life] of lives) if (life.ended === undefined && !free.some(({ metadata }) => metadata?.name === name)) life.ended = now;
+          }
+        })();
+        try {
+          await tg.say("cold");
+          await tg.waitFor((call) => answered(call));
+          assert.notEqual((await harnessPod()).metadata?.uid, bound.metadata?.uid);
+          // KEDA's default cooldown would keep the pod made in place of the one bound for 300 s.
+          await until("no free pod left in the pool after the cold bind", async () => ((await freePods()).length === 0 ? true : undefined), 60_000);
+        } finally {
+          watching = false;
+          await watcher;
+          t.diagnostic(`free pods from the prompt on: ${[...lives].map(([name, { made, ended }]) => `${name} ${ended === undefined ? "still free" : `free no more ${((ended - made) / 1000).toFixed(1)} s after it was made`}`).join("; ") || "none seen"}`);
+        }
+      } finally {
+        // Its free pod again, for the tests after.
+        await kube.patch(scaler, { spec: { minReplicaCount: 1 } });
+        await until("a free pod of the pool running again", async () => ((await freePods()).some(({ status }) => status?.phase === "Running") ? true : undefined), 300_000);
+      }
     });
 
     test("a pool's free pod has no binding and serves nothing; no one but the gateway reaches a bound one", async () => {
