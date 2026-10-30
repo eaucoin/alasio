@@ -2489,13 +2489,13 @@ describe("workspace storage", () => {
 describe("node agents", () => {
   const agentOf = (objects: readonly KubernetesObject[]) => one<V1DaemonSet>(objects, "DaemonSet", "alasio-node-agent");
 
-  test("refuse a memory limit that leaves no room for the agent's own memory and a restore's parts not yet on the disk, where sessions are snapshotted", () => {
+  test("refuse a memory limit that leaves no room for the agent's own memory and its downloads' and copies' parts not yet on the disk, where sessions are snapshotted", () => {
     const limited = (memory: string, sessions: Record<string, unknown> = {}) =>
       decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, sessions: { ...sessions, snapshots: { nodeAgent: { resources: { limits: { memory } } } } } });
-    const refused = limited("160Mi");
+    const refused = limited("192Mi");
     assert.ok(Result.isFailure(refused));
-    assert.equal(refused.failure.message, "sessions.snapshots.nodeAgent.resources.limits.memory must be at least 192 MiB: the node agent's own memory, and what a restore holds written and not yet on the disk");
-    assert.ok(Result.isSuccess(limited("192Mi")));
+    assert.equal(refused.failure.message, "sessions.snapshots.nodeAgent.resources.limits.memory must be at least 224 MiB: the node agent's own memory, and what its downloads and copies hold written and not yet on the disk");
+    assert.ok(Result.isSuccess(limited("224Mi")));
   });
 
   test("run privileged in the node's PID namespace, on every node sessions run on, with the node's paths at the same paths", () => {

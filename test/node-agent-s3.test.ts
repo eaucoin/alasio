@@ -148,6 +148,23 @@ test("a file larger than a part is put in parts, some at a time, and got in rang
     assert.deepEqual(received, { bytes: pages.length, sha256: createHash("sha256").update(pages).digest("hex") });
     assert.deepEqual(readFileSync(join(directory, "copy.img")), pages);
     assert.deepEqual(s3.requests.toSorted(), ["bytes=0-999", "bytes=1000-1999", "bytes=2000-2999", "bytes=3000-3499"].map((range) => `GET ${key} ${range}`));
+    // Where the file holds some ranges already, as the object does, the rest alone, in ranges
+    // of a part, around them; then checked whole.
+    s3.requests.length = 0;
+    const partly = join(directory, "partly.img");
+    const held = Buffer.alloc(pages.length);
+    pages.copy(held, 500, 500, 1200);
+    pages.copy(held, 3000, 3000);
+    writeFileSync(partly, held);
+    const filled = await run(bucket.getFile(key, partly, pages.length, [[500, 1200], [3000, 3500]]));
+    assert.deepEqual(filled, { bytes: pages.length, sha256: createHash("sha256").update(pages).digest("hex") });
+    assert.deepEqual(readFileSync(partly), pages);
+    assert.deepEqual(s3.requests.toSorted(), ["bytes=0-499", "bytes=1200-2199", "bytes=2200-2999"].map((range) => `GET ${key} ${range}`));
+    // What it holds that is not the object's is not got again, and found as it is checked.
+    held.fill(7, 600, 700);
+    writeFileSync(partly, held);
+    const wrong = await run(bucket.getFile(key, partly, pages.length, [[500, 1200], [3000, 3500]]));
+    assert.notEqual(wrong.sha256, createHash("sha256").update(pages).digest("hex"));
     // One shorter than its manifest says fails as it is got.
     s3.objects.set(key, pages.subarray(0, 2500));
     const short = await Effect.runPromiseExit(bucket.getFile(key, join(directory, "short.img"), pages.length));

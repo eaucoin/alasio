@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -22,8 +23,8 @@ const PREFIX = "main/fs-abc/layers/";
 const KEY = `${PREFIX}${"a".repeat(64)}/pages.img`;
 const EMPTY = createHash("sha256").update("").digest("hex");
 
-/** How long a proxy's tokens and quiet last, and how often it keeps its tokens, unless told: as the proxy has them; and its socket and tokens file, if any. */
-type Times = Pick<StoreProxyOptions, "preparedForMs" | "quietMs" | "askedWindowMs" | "resumedCeilingMs" | "keptEveryMs" | "socket" | "tokensFile">;
+/** How long a proxy's tokens and quiet last, how often it keeps its tokens, and its copies' buffer, unless told: as the proxy has them; and its socket and tokens file, if any. */
+type Times = Pick<StoreProxyOptions, "preparedForMs" | "quietMs" | "askedWindowMs" | "resumedCeilingMs" | "keptEveryMs" | "socket" | "tokensFile" | "copyBufferBytes">;
 
 /** `effect` with a proxy of a fake bucket holding KEY, of `times`, run to its end; what it logs, put in `logged`. */
 function withProxy<A>(effect: (context: { readonly proxy: StoreProxy; readonly s3: FakeS3 }) => Effect.Effect<A, unknown, Scope.Scope>, times: Times = {}, logged: string[] = []): Promise<A> {
@@ -575,6 +576,52 @@ test("a restore is done reading through the proxy once it has been served every 
       // Of a token there is not, at once.
       assert.equal(yield* doneWithin("ALASIONONE", 100), true);
     }), { quietMs: 100, preparedForMs: 4000 }));
+
+test("what the proxy serves of an object is copied into a file, each part where the object holds it, until the copy is ended, once its writes are through, the ranges it holds told; nothing of a token it does not hold", () =>
+  withProxy(({ proxy, s3 }) =>
+    Effect.gen(function*() {
+      const object = s3.objects.get(KEY) ?? Buffer.alloc(0);
+      const directory = mkdtempSync(join(tmpdir(), "alasio-copy-"));
+      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(directory, { recursive: true, force: true })));
+      const file = join(directory, "pages.img");
+      writeFileSync(file, Buffer.alloc(object.length));
+      const token = minted(proxy);
+      proxy.copy(token.accessKeyId, KEY, file);
+      const read = (range?: string) => Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token, ...(range === undefined ? {} : { range }) }));
+      assert.equal((yield* read("bytes=10-19")).status, 206);
+      assert.equal((yield* read("bytes=2048-4095")).status, 206);
+      assert.deepEqual([...(yield* proxy.copied(token.accessKeyId))], [[KEY, [[10, 20], [2048, 4096]]]]);
+      const copied = readFileSync(file);
+      assert.deepEqual([copied.subarray(10, 20), copied.subarray(2048)], [object.subarray(10, 20), object.subarray(2048)]);
+      assert.deepEqual(copied.subarray(0, 10), Buffer.alloc(10));
+      // Ended: what is served after is not copied.
+      assert.equal((yield* read()).status, 200);
+      assert.deepEqual(readFileSync(file), copied);
+      // Of a token the proxy does not hold, nothing.
+      proxy.copy("ALASIONONE", KEY, file);
+      assert.deepEqual([...(yield* proxy.copied("ALASIONONE"))], []);
+    })
+  ));
+
+test("a part of what the proxy serves that its copies' buffer, of what they hold written and not yet on the disk, has no room for is not copied, and served all the same", () =>
+  withProxy(({ proxy, s3 }) =>
+    Effect.gen(function*() {
+      const object = s3.objects.get(KEY) ?? Buffer.alloc(0);
+      const directory = mkdtempSync(join(tmpdir(), "alasio-copy-"));
+      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(directory, { recursive: true, force: true })));
+      const file = join(directory, "pages.img");
+      writeFileSync(file, Buffer.alloc(4096));
+      const token = minted(proxy);
+      proxy.copy(token.accessKeyId, KEY, file);
+      const read = (range: string) => Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token, range }));
+      // Its first 2000 bytes, written, and not yet synced as the copy holds less than a sync's worth: 1000 bytes of room left.
+      assert.equal((yield* read("bytes=0-1999")).status, 206);
+      yield* sleep(100);
+      const served = yield* read("bytes=2000-4095");
+      assert.deepEqual([served.status, served.body], [206, object.subarray(2000)]);
+      assert.deepEqual([...(yield* proxy.copied(token.accessKeyId))], [[KEY, [[0, 2000]]]]);
+      assert.deepEqual(readFileSync(file), Buffer.concat([object.subarray(0, 2000), Buffer.alloc(2096)]));
+    }), { copyBufferBytes: 3000 }));
 
 test("what the proxy is told of a restore's bytes is of the token it names, never of a later token of the same workspace", () =>
   withProxy(({ proxy }) =>

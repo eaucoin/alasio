@@ -114,8 +114,12 @@ export interface Received {
 export interface S3Bucket {
   /** Puts the file at `path` as the object `key`, streamed: the ETag the bucket answered. */
   readonly putFile: (key: string, path: string) => Effect.Effect<string, S3Error>;
-  /** Writes the object `key`, of `bytes`, to the file at `path`, streamed: its size and SHA-256. */
-  readonly getFile: (key: string, path: string, bytes: number) => Effect.Effect<Received, S3Error>;
+    /**
+   * Writes the object `key`, of `bytes`, to the file at `path`, streamed: its size and SHA-256,
+   * of the whole file. Where the file holds the byte ranges `held` already as the object does,
+   * each [start, end), those are not got again: the rest is written around them.
+   */
+  readonly getFile: (key: string, path: string, bytes: number, held?: readonly (readonly [number, number])[]) => Effect.Effect<Received, S3Error>;
   /** Puts `value` as the object `key`, as JSON. */
   readonly putJson: (key: string, value: unknown) => Effect.Effect<void, S3Error>;
   /** The object `key`, parsed as JSON, or null when there is none. */
@@ -334,6 +338,18 @@ async function writeSynced(file: FileHandle, source: AsyncIterable<Buffer>, star
   return position - start;
 }
 
+/** The ranges of a file of `size` bytes that `held`, each [start, end), sorted and apart, leaves: their first byte and their length. */
+export function missing(held: readonly (readonly [number, number])[], size: number): { readonly start: number; readonly length: number }[] {
+  const left: { start: number; length: number }[] = [];
+  let at = 0;
+  for (const [start, end] of held) {
+    if (start > at) left.push({ start: at, length: Math.min(start, size) - at });
+    at = Math.max(at, end);
+  }
+  if (at < size) left.push({ start: at, length: size - at });
+  return left.filter(({ length }) => length > 0);
+}
+
 /** The bucket of `options`, reached over HTTP(S) as the module says. */
 export function makeS3Bucket(options: S3Options): S3Bucket {
   const { partBytes = PART_BYTES, parallel = PARALLEL, syncBytes = SYNC_BYTES, copyBytes = COPY_BYTES } = options;
@@ -446,18 +462,19 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         }, signal);
       }),
 
-    getFile: (key, path, size) =>
+    getFile: (key, path, size, held = []) =>
       attempt("download", key, async (signal) => {
-        const file = await open(path, "w");
+        const file = await open(path, held.length === 0 ? "w" : "r+");
         try {
-          if (size <= partBytes) {
+          if (held.length === 0 && size <= partBytes) {
             const hash = createHash("sha256");
             const bytes = await getting(async () => writeSynced(file, await succeeded(await call("GET", key, {}, signal)), 0, size, syncBytes, (chunk) => hash.update(chunk)));
             return { bytes, sha256: hash.digest("hex") };
           }
-          // In ranges, each written where it goes, then read again for its hash.
+          // In ranges, each written where it goes, then read again for its hash, what it held
+          // synced to the disk with them.
           await file.truncate(size);
-          const parts = ranges(size);
+          const parts = missing(held, size).flatMap(({ start, length }) => ranges(length).map((part) => ({ start: start + part.start, length: part.length })));
           await eachInParallel(parts.length, parallel, signal, async (index, rangeSignal) => {
             const { start, length } = parts[index] ?? { start: 0, length: 0 };
             await getting(async () => {
@@ -469,6 +486,7 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
               await writeSynced(file, response, start, length, syncBytes);
             });
           });
+          await file.datasync();
         } finally {
           await file.close();
         }

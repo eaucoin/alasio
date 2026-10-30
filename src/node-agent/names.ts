@@ -191,8 +191,15 @@ export const UNSYNCED_DOWNLOAD_BYTES = SNAPSHOT_PARTS_AT_ONCE * SNAPSHOT_SYNC_BY
  */
 export const NODE_AGENT_OWN_BYTES = 160 * 1024 ** 2;
 
-/** The least memory limit a node agent runs under: its own, and a download's budget beside it. */
-export const NODE_AGENT_MEMORY_FLOOR = NODE_AGENT_OWN_BYTES + UNSYNCED_DOWNLOAD_BYTES;
+/**
+ * The node agent's memory budget for what its proxy copies of what it serves a restore into
+ * the node's cache (./store-proxy.ts copy): what it holds written and not yet on the disk, at
+ * most, of every copy together, as much as its gets hold so.
+ */
+export const UNSYNCED_COPY_BYTES = UNSYNCED_DOWNLOAD_BYTES;
+
+/** The least memory limit a node agent runs under: its own, and its downloads' and copies' budgets beside it. */
+export const NODE_AGENT_MEMORY_FLOOR = NODE_AGENT_OWN_BYTES + UNSYNCED_DOWNLOAD_BYTES + UNSYNCED_COPY_BYTES;
 
 /** The variable holding the token the sandbox gateway presents to a node agent. */
 export const NODE_AGENT_TOKEN_VARIABLE = "ALASIO_NODE_AGENT_TOKEN";

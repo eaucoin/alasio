@@ -1134,17 +1134,17 @@ const tokenIn = (imagePath: string) => {
   return { accessKeyId: credentials.access_key_id, secretAccessKey: credentials.secret_access_key };
 };
 
-/** The status of a GET of `key` through `node`'s proxy of the bucket, signed with `token`. */
-const throughProxy = (node: Node, token: { readonly accessKeyId: string; readonly secretAccessKey: string }, key: string): Effect.Effect<number> =>
+/** The status of a GET of `key`, or of its `range`, through `node`'s proxy of the bucket, signed with `token`, once its answer has ended. */
+const throughProxy = (node: Node, token: { readonly accessKeyId: string; readonly secretAccessKey: string }, key: string, range?: string): Effect.Effect<number> =>
   Effect.promise(() =>
     new Promise<number>((resolve, reject) => {
       const url = new URL(node.storeProxy.endpoint);
       const empty = createHash("sha256").update("").digest("hex");
-      const headers: Record<string, string> = { host: url.host, "x-amz-date": new Date().toISOString().replace(/[-:]|\.\d{3}/gu, ""), "x-amz-content-sha256": empty };
+      const headers: Record<string, string> = { host: url.host, "x-amz-date": new Date().toISOString().replace(/[-:]|\.\d{3}/gu, ""), "x-amz-content-sha256": empty, ...(range === undefined ? {} : { range }) };
       headers["authorization"] = sigV4Authorization({ method: "GET", path: `/snapshots/${key}`, query: {}, headers: { ...headers }, payloadHash: empty }, { region: "us-east-1", service: "s3" }, token);
       const asked = httpRequest({ host: url.hostname, port: url.port, path: `/snapshots/${key}`, headers }, (response) => {
         response.resume();
-        resolve(response.statusCode ?? 0);
+        response.once("end", () => resolve(response.statusCode ?? 0));
       });
       asked.on("error", reject);
       asked.end();
@@ -1365,6 +1365,8 @@ test("a restore from the bucket's images are fetched into the cache once it is d
       const layer = `main/fs-abc/layers/${"b".repeat(64)}/pages.img`;
       s3.objects.set(layer, Buffer.alloc(45056 - 4096, 7));
       const there = yield* node("node-2");
+      /** Whether the cache holds the image whole, as a fetch commits it. */
+      const held = () => existsSync(there.cache.image("main", "fs-abc", manifest.layers[0]?.digest ?? ""));
       writeFileSync(join(there.releases.releasesDir, RELEASE, "remote-inspect"), "");
       const restored = Effect.gen(function*() {
         yield* there.cache.clear("main", "fs-abc");
@@ -1377,18 +1379,60 @@ test("a restore from the bucket's images are fetched into the cache once it is d
       // Reading: nothing fetched, until it has been served all its pages.
       const token = yield* restored;
       yield* Effect.sleep("1500 millis");
-      assert.deepEqual(imagesOf(there, "fs-abc"), []);
+      assert.ok(!held());
       assert.equal(yield* throughProxy(there, token, own), 200);
       yield* Effect.sleep("1500 millis");
-      assert.deepEqual(imagesOf(there, "fs-abc"), []);
+      assert.ok(!held());
       assert.equal(yield* throughProxy(there, token, layer), 200);
       yield* fetched(there, manifest);
       // Ended before, as its sandbox is abandoned: fetched then.
       yield* restored;
       yield* Effect.sleep("1500 millis");
-      assert.deepEqual(imagesOf(there, "fs-abc"), []);
+      assert.ok(!held());
       yield* there.agent.abandon({ ...workspace, namespace: SESSIONS, pod: POD, uid: POD_UID });
       yield* fetched(there, manifest);
+    })
+  ));
+
+test("what a restore from the bucket read of its images is not got again: the proxy copied it into the cache as it served it, the rest is fetched, and each file checked whole before the cache holds it", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const taker = yield* node("node-1");
+      const manifest = yield* taker.agent.checkpoint(request("fs-abc"));
+      const digest = manifest.layers[0]?.digest ?? "";
+      const own = `main/fs-abc/layers/${digest}/pages.img`;
+      // Its image's pages and a layer's, 45056 bytes in all, as runsc says of the image.
+      s3.objects.set(`main/fs-abc/layers/${"b".repeat(64)}/pages.img`, Buffer.alloc(45056 - 4096, 7));
+      const there = yield* node("node-2");
+      writeFileSync(join(there.releases.releasesDir, RELEASE, "remote-inspect"), "");
+      const gets = (key: string) => s3.requests.filter((asked) => asked === `GET ${key}` || asked.startsWith(`GET ${key} `)).length;
+      const restored = Effect.gen(function*() {
+        yield* there.cache.clear("main", "fs-abc");
+        const prepared = yield* there.agent.prepare(workspace);
+        const token = tokenIn(prepared.imagePath);
+        yield* there.agent.resume(resumeRequest(manifest.snapshot));
+        return token;
+      });
+      // Its pages read whole through the proxy, in two ranges: got once, the image's other files fetched.
+      const token = yield* restored;
+      assert.equal(yield* throughProxy(there, token, own, "bytes=0-1023"), 206);
+      assert.equal(yield* throughProxy(there, token, own, "bytes=1024-4095"), 206);
+      yield* fetched(there, manifest);
+      assert.equal(gets(own), 2);
+      for (const { path } of manifest.layers[0]?.files ?? []) {
+        if (path !== "pages.img") assert.equal(gets(`main/fs-abc/layers/${digest}/${path}`), 1, path);
+      }
+      assert.deepEqual(readFileSync(join(there.cache.image("main", "fs-abc", digest), "pages.img")), s3.objects.get(own));
+      // Its copy not what the bucket served, as a disk that rots changes it: the cache does not take it.
+      const again = yield* restored;
+      assert.equal(yield* throughProxy(there, again, own), 200);
+      yield* Effect.sleep("200 millis");
+      const copy = join(there.cache.workspace("main", "fs-abc"), LAYERS_DIR, `.${digest}`, "pages.img");
+      writeFileSync(copy, Buffer.alloc(statSync(copy).size, 9));
+      there.storeProxy.revoke("main/fs-abc");
+      yield* Effect.sleep("2500 millis");
+      assert.equal(existsSync(there.cache.image("main", "fs-abc", digest)), false);
     })
   ));
 
@@ -1421,7 +1465,7 @@ test("runsc says how many bytes of pages a restore from the bucket reads from op
       yield* Effect.sleep("50 millis");
       assert.equal(there.storeProxy.reading(), 0);
       const layers = join(there.cache.workspace("main", "fs-abc"), LAYERS_DIR);
-      assert.deepEqual(existsSync(layers) ? readdirSync(layers).filter((name) => name.startsWith(".")) : [], []);
+      assert.deepEqual(existsSync(layers) ? readdirSync(layers).filter((name) => /^\..*\.remote-/u.test(name)) : [], []);
       rmSync(beside("remote-inspect"));
     })
   ));

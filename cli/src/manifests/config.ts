@@ -296,9 +296,10 @@ const Snapshots = Schema.Struct({
   /**
    * The node agent, which takes snapshots on its node and prepares them there. Its memory
    * request is its own, as measured (NODE_AGENT_OWN_BYTES, src/node-agent/names.ts); its
-   * limit is at least that and its budget of what it holds written and not yet on the disk
-   * (NODE_AGENT_MEMORY_FLOOR, 192 MiB), and leaves room over both for the page cache it
-   * reads through, which the kernel reclaims under it.
+   * limit is at least that and its budgets of what its downloads and its copies of what it
+   * serves restores hold written and not yet on the disk (NODE_AGENT_MEMORY_FLOOR, 224 MiB),
+   * and leaves room over them for the page cache it reads through, which the kernel reclaims
+   * under it.
    */
   nodeAgent: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "20m", memory: "160Mi" }, limits: { memory: "512Mi" } }) }), {}),
 });
@@ -925,7 +926,7 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
   if (memoryBytes(nodeAgent.resources.limits["memory"] ?? "0") < NODE_AGENT_MEMORY_FLOOR) {
     return {
       path: ["sessions", "snapshots", "nodeAgent", "resources", "limits", "memory"],
-      issue: `must be at least ${memoryText(NODE_AGENT_MEMORY_FLOOR)}: the node agent's own memory, and what a restore holds written and not yet on the disk`,
+      issue: `must be at least ${memoryText(NODE_AGENT_MEMORY_FLOOR)}: the node agent's own memory, and what its downloads and copies hold written and not yet on the disk`,
     };
   }
   if (config.log.scaling.min === 2) return { path: ["log", "scaling"], issue: "must be 1 or 3: two of KRaft's voters elect no leader once one is gone" };

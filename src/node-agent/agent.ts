@@ -64,7 +64,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { isIP, isIPv6 } from "node:net";
 import { dirname, join, posix, relative } from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -1129,15 +1129,24 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       }),
     );
 
-  /** The image `layer` of the workspace's snapshot `snapshot`, from the bucket, staged in the cache, each file checked against the manifest's as it is received. */
-  const received = (ref: WorkspaceRef, snapshot: string, layer: Layer): Effect.Effect<void, S3Error | CacheError | SnapshotCorrupt> =>
+  /**
+   * The image `layer` of the workspace's, from the bucket, staged in the cache under its digest,
+   * each file checked against the manifest's, whole, as it is received. Staged anew; or, given
+   * `copied`, the byte ranges of its files that the proxy copied as it served them to a
+   * restore (./store-proxy.ts copy), by their keys, as copyRestored staged them: what they
+   * hold of those is not got again.
+   */
+  const received = (ref: WorkspaceRef, layer: Layer, copied?: ReadonlyMap<string, readonly (readonly [number, number])[]>): Effect.Effect<void, S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
       const { environment, workspace } = ref;
-      const directory = yield* cache.stage(environment, workspace, snapshot);
+      const directory = yield* (copied === undefined ? cache.stage(environment, workspace, layer.digest) : cache.staging(environment, workspace, layer.digest));
       for (const file of layer.files) {
         const target = join(directory, file.path);
+        const key = layerKey(ref, layer.digest, file.path);
         yield* onDisk(() => mkdir(dirname(target), { recursive: true }));
-        const got = yield* bucket.getFile(layerKey(ref, layer.digest, file.path), target, file.bytes);
+        // What a file the cache evicted meanwhile held is gone with it.
+        const held = (yield* onDisk(() => access(target).then(() => true, () => false))) ? copied?.get(key) ?? [] : [];
+        const got = yield* bucket.getFile(key, target, file.bytes, held);
         if (got.bytes !== file.bytes || got.sha256 !== file.sha256) {
           return yield* new SnapshotCorrupt({
             environment,
@@ -1149,12 +1158,12 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     });
 
   /** The image `layer`, staged as `received` stages it, among the cache's images, stamped as checked. */
-  const committed = ({ environment, workspace }: WorkspaceRef, snapshot: string, layer: Layer): Effect.Effect<void, CacheError> =>
-    cache.commit(environment, workspace, snapshot, layer.digest).pipe(Effect.andThen(cache.stamp(environment, workspace, layer.digest, layer.files)));
+  const committed = ({ environment, workspace }: WorkspaceRef, layer: Layer): Effect.Effect<void, CacheError> =>
+    cache.commit(environment, workspace, layer.digest, layer.digest).pipe(Effect.andThen(cache.stamp(environment, workspace, layer.digest, layer.files)));
 
   /** The image `layer` of the workspace's, from the bucket into the cache, each file checked against the manifest's as it is received, and stamped so. */
-  const download = (ref: WorkspaceRef, snapshot: string, layer: Layer): Effect.Effect<void, S3Error | CacheError | SnapshotCorrupt> =>
-    received(ref, snapshot, layer).pipe(Effect.andThen(committed(ref, snapshot, layer)));
+  const download = (ref: WorkspaceRef, layer: Layer): Effect.Effect<void, S3Error | CacheError | SnapshotCorrupt> =>
+    received(ref, layer).pipe(Effect.andThen(committed(ref, layer)));
 
   /**
    * Whether the cache's copy of the image `layer` of the workspace's is what the manifest
@@ -1224,30 +1233,58 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     );
 
   /**
+   * Stages in the cache, under its digest, each image of `manifest` it does not hold intact,
+   * each file of it as long as the manifest says and holding nothing yet, and has the proxy
+   * copy into it what it serves of it to the restore that reads by the token `reader`
+   * (./store-proxy.ts copy), for fetchLater to get only the rest.
+   */
+  const copyRestored = (ref: WorkspaceRef, manifest: Manifest, reader: string): Effect.Effect<void, CacheError> =>
+    Effect.forEach(manifest.layers, (layer) =>
+      Effect.gen(function*() {
+        if (yield* intact(ref, layer)) return;
+        const directory = yield* cache.stage(ref.environment, ref.workspace, layer.digest);
+        for (const file of layer.files) {
+          const target = join(directory, file.path);
+          yield* onDisk(async () => {
+            await mkdir(dirname(target), { recursive: true });
+            const handle = await open(target, "w");
+            await handle.truncate(file.bytes).finally(() => handle.close());
+          });
+          storeProxy.copy(reader, layerKey(ref, layer.digest, file.path), target);
+        }
+      }), { discard: true });
+
+  /**
    * Fetches into the cache, one at a time, each image of `manifest` it does not hold, once the
    * restore from the bucket that reads by the token `reader` is done reading it through the
    * proxy (./store-proxy.ts readsDone), in the agent's scope: the next checkpoint of the
    * restored sandbox is a delta of the snapshot's image once the cache holds it. A fetch beside
    * the restore would read the bucket again as the restore reads it, and slow it: the whole
-   * image a second time, the chain of a delta whole. Each is downloaded
+   * image a second time, the chain of a delta whole. What the proxy copied of each image as it
+   * served it to the restore (copyRestored) is not got again: the rest is, and each file is
+   * checked whole against the manifest's before the cache holds it. Each is downloaded
    * beside the workspace's images, which the cache spares meanwhile, holding the workspace
    * only to look at what the cache holds of it and to commit it, so that a checkpoint of the
    * sandbox, as its pod stops, waits on no download; one fetch of a workspace's runs at a time.
    * What fails is said, and leaves that checkpoint whole.
    */
   const fetchLater = (ref: WorkspaceRef, manifest: Manifest, reader: string): Effect.Effect<void> =>
-    Effect.forEach(manifest.layers, (layer) =>
-      inFlightWhile([ref], Effect.gen(function*() {
-        if (yield* exclusive([ref], intact(ref, layer))) return;
-        yield* cache.room(bytesOf([layer]), spared).pipe(Effect.flatMap(logEvicted));
-        yield* received(ref, manifest.snapshot, layer);
-        yield* exclusive([ref], committed(ref, manifest.snapshot, layer));
-        yield* Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": "fetched" }));
-      })).pipe(
-        Effect.tapError((error) => Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": error._tag }))),
-      ), { discard: true }).pipe(
-      (fetching) => Effect.scoped(RcMap.get(fetchLocks, prefixOf(ref)).pipe(Effect.flatMap((lock) => fetching.pipe(Semaphore.withPermit(lock))))),
-      (fetching) => storeProxy.readsDone(reader).pipe(Effect.andThen(fetching)),
+    Effect.gen(function*() {
+      yield* storeProxy.readsDone(reader);
+      const copied = yield* storeProxy.copied(reader);
+      yield* Effect.forEach(manifest.layers, (layer) =>
+        inFlightWhile([ref], Effect.gen(function*() {
+          if (yield* exclusive([ref], intact(ref, layer))) return;
+          yield* cache.room(bytesOf([layer]), spared).pipe(Effect.flatMap(logEvicted));
+          yield* received(ref, layer, copied);
+          yield* exclusive([ref], committed(ref, layer));
+          yield* Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": "fetched" }));
+        })).pipe(
+          Effect.tapError((error) => Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": error._tag }))),
+        ), { discard: true }).pipe(
+        (fetching) => Effect.scoped(RcMap.get(fetchLocks, prefixOf(ref)).pipe(Effect.flatMap((lock) => fetching.pipe(Semaphore.withPermit(lock))))),
+      );
+    }).pipe(
       Effect.tap(() => Effect.logInfo(`fetched the images of the snapshot ${manifest.snapshot} of ${prefixOf(ref)} into the node's cache, for its next delta`)),
       // Within its budget again, the least recently used workspace evicted.
       Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)))),
@@ -1356,7 +1393,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             const missing: Layer[] = [];
             for (const layer of manifest.layers) if (!(yield* intact(ref, layer))) missing.push(layer);
             if (missing.length > 0) yield* cache.room(bytesOf(missing), spared).pipe(Effect.flatMap(logEvicted));
-            yield* Effect.forEach(missing, (layer) => download(ref, snapshot, layer).pipe(Effect.tap(() => Effect.sync(() => downloaded.push(layer)))), { discard: true }).pipe(
+            yield* Effect.forEach(missing, (layer) => download(ref, layer).pipe(Effect.tap(() => Effect.sync(() => downloaded.push(layer)))), { discard: true }).pipe(
               Effect.onError(() => cache.clear(environment, workspace).pipe(Effect.ignore)),
             );
             return yield* verified(yield* cache.prepare(environment, workspace, snapshot, manifest.layers.map(({ digest }) => digest)));
@@ -1390,6 +1427,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           const options = goferOptions(ref, own.digest, token, transport, gofer?.pagesRetry ?? false);
           imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, options);
           yield* expectPages(ref, snapshot, token.accessKeyId, release, options);
+          yield* copyRestored(ref, manifest, token.accessKeyId);
           reader = token.accessKeyId;
         }
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));

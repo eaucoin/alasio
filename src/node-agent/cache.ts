@@ -108,8 +108,13 @@ export interface SnapshotCache {
   readonly workspace: (environment: string, workspace: string) => string;
   /** Where the image `digest` of the workspace is once it is whole. */
   readonly image: (environment: string, workspace: string, digest: string) => string;
-  /** Where an image is written until it is whole and its digest known, `name` the snapshot it is of, emptied first. The workspace is used now. */
+  /**
+   * Where an image is written until it is whole and its digest known, `name` the snapshot it
+   * is of, or its digest where it is known already, emptied first. The workspace is used now.
+   */
   readonly stage: (environment: string, workspace: string, name: string) => Effect.Effect<string, CacheError>;
+  /** Where the image staged as `name` is written, as `stage` made it, kept as it is: made empty where it is not. The workspace is used now. */
+  readonly staging: (environment: string, workspace: string, name: string) => Effect.Effect<string, CacheError>;
   /** Removes the image staged as `name`, as a save that failed left it. */
   readonly unstage: (environment: string, workspace: string, name: string) => Effect.Effect<void, CacheError>;
   /** Moves the image staged as `name` where an image of `digest` is, the workspace used now; one there already is kept, the staged one removed. */
@@ -186,6 +191,12 @@ function checked(environment: string, workspace: string, snapshot: string | null
   if (!NAME.test(environment) || !NAME.test(workspace) || (snapshot !== null && !SNAPSHOT.test(snapshot)) || !digests.every((digest) => DIGEST.test(digest))) {
     throw new Error(`the snapshot cache names no ${JSON.stringify([environment, workspace, snapshot, digests])}`);
   }
+}
+
+/** That `name`, an image's staged as (SnapshotCache.stage), is a snapshot's id or an image's digest, as `checked` checks names. */
+function checkedStage(environment: string, workspace: string, name: string): void {
+  if (DIGEST.test(name)) checked(environment, workspace, null, [name]);
+  else checked(environment, workspace, name);
 }
 
 /** The directory an image is written in until it is whole. */
@@ -286,7 +297,7 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
     image,
 
     stage: (environment, workspace, name) => {
-      checked(environment, workspace, name);
+      checkedStage(environment, workspace, name);
       const directory = join(workspaceDir(environment, workspace), LAYERS_DIR, staged(name));
       return attempt(async () => {
         await rm(directory, { recursive: true, force: true });
@@ -294,13 +305,20 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
       }).pipe(Effect.andThen(use(environment, workspace)), Effect.as(directory));
     },
 
+    staging: (environment, workspace, name) => {
+      checkedStage(environment, workspace, name);
+      const directory = join(workspaceDir(environment, workspace), LAYERS_DIR, staged(name));
+      return attempt(() => mkdir(directory, { recursive: true })).pipe(Effect.andThen(use(environment, workspace)), Effect.as(directory));
+    },
+
     unstage: (environment, workspace, name) => {
-      checked(environment, workspace, name);
+      checkedStage(environment, workspace, name);
       return attempt(() => rm(join(workspaceDir(environment, workspace), LAYERS_DIR, staged(name)), { recursive: true, force: true }));
     },
 
     commit: (environment, workspace, name, digest) => {
-      checked(environment, workspace, name, [digest]);
+      checkedStage(environment, workspace, name);
+      checked(environment, workspace, null, [digest]);
       const from = join(workspaceDir(environment, workspace), LAYERS_DIR, staged(name));
       return holds(environment, workspace, digest).pipe(
         Effect.flatMap((held) => attempt(() => (held ? rm(from, { recursive: true, force: true }) : rename(from, image(environment, workspace, digest))))),

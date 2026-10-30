@@ -28,6 +28,13 @@
  * where told, on a Unix domain socket on the node (socket), which a restore of a release that
  * can (./names.ts goferOf) dials instead, by its path, whatever pod the agent runs in.
  *
+ * Where the agent has it copied (copy), what the proxy serves a restore of an image's file is
+ * written into the file the agent stages it in, in the node's cache, beside being served and
+ * never holding it back: a part its copies leave no room for, of what they may hold written and
+ * not yet on the disk (UNSYNCED_COPY_BYTES), is not copied.
+ * The agent's fetch of the image, once the restore is done reading (readsDone), gets the rest
+ * alone, and checks each file whole before the cache holds it (./agent.ts fetchLater).
+ *
  * A restore reads through the proxy until its sandbox has every page it was saved with,
  * which it reads in the background once it is resumed. One over TCP whose agent stopped
  * meanwhile would be left without the rest, for good, as
@@ -55,7 +62,7 @@
  * resume ends that restore, whose reads are then refused, as no token outlives its ceiling.
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, fdatasync, mkdirSync, openSync, readFileSync, renameSync, rmSync, write, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, request as httpRequest, type Server, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { AddressInfo } from "node:net";
@@ -65,7 +72,7 @@ import { Hash } from "@smithy/hash-node";
 import { SignatureV4 } from "@smithy/signature-v4";
 import { Cause, Effect, FiberSet, Schedule, Schema, type Scope } from "effect";
 
-import { type Gofer, RESTORE_PREPARED_FOR_SECONDS } from "./names.ts";
+import { type Gofer, RESTORE_PREPARED_FOR_SECONDS, SNAPSHOT_SYNC_BYTES, UNSYNCED_COPY_BYTES } from "./names.ts";
 
 /** The bucket the proxy reads, and as whom. */
 export interface ProxiedStore {
@@ -129,6 +136,20 @@ export interface StoreProxy {
    * its reads are quiet; or its token is gone, revoked as its restore ended, or past its time.
    */
   readonly readsDone: (accessKeyId: string) => Effect.Effect<void>;
+  /**
+   * Copies what the proxy serves the restore of the token `accessKeyId` of the object `key`
+   * into the file at `path`, which must be there, each byte where the object holds it, beside
+   * serving it and never holding it back: a part that would have the copies hold more than
+   * copyBufferBytes written and not yet on the disk is not copied. Nothing, of a token it does
+   * not hold.
+   */
+  readonly copy: (accessKeyId: string, key: string, path: string) => void;
+  /**
+   * Ends the copies of the token `accessKeyId`, once their writes are through: the byte
+   * ranges of each object, by its key, each [start, end), sorted and apart, that its file
+   * holds as the object does. What its file holds besides is not the object's.
+   */
+  readonly copied: (accessKeyId: string) => Effect.Effect<ReadonlyMap<string, readonly [number, number][]>>;
 }
 
 /** The proxy could not listen where it was told. */
@@ -224,6 +245,28 @@ export interface StoreProxyOptions {
   readonly askedWindowMs?: number;
   readonly resumedCeilingMs?: number;
   readonly keptEveryMs?: number;
+  /**
+   * The most bytes the copies of what it serves (copy) may hold written and not yet on the
+   * disk, which the kernel counts in the agent's memory and cannot reclaim before they are,
+   * each copy synced whenever it has SNAPSHOT_SYNC_BYTES written since: UNSYNCED_COPY_BYTES
+   * unless told.
+   */
+  readonly copyBufferBytes?: number;
+}
+
+/** A file the proxy copies what it serves of an object into (StoreProxy.copy). */
+interface Copy {
+  readonly fd: number;
+  /** The byte ranges written to it, each [start, end), sorted and apart. */
+  written: [number, number][];
+  /** How many of its writes and syncs are in flight. */
+  writing: number;
+  /** The bytes written to it since it was last synced to the disk. */
+  unsynced: number;
+  /** Whether it was ended (copied, or the proxy's end): no write more is made. */
+  ended: boolean;
+  /** What waits for its writes to be through. */
+  readonly through: (() => void)[];
 }
 
 /** A restore's token, as the proxy holds it, and how its reads go. */
@@ -335,8 +378,19 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
   askedWindowMs = ASKED_WINDOW_MS,
   resumedCeilingMs = RESUMED_CEILING_MS,
   keptEveryMs = KEPT_EVERY_MS,
+  copyBufferBytes = UNSYNCED_COPY_BYTES,
 }: StoreProxyOptions): Effect.fn.Return<StoreProxy, StoreProxyError, Scope.Scope> {
   const tokens = new Map<string, HeldToken>();
+  /** The copies of what the proxy serves, by the token they are of, then by the object's key; what they hold written and not yet on the disk, together. */
+  const copies = new Map<string, Map<string, Copy>>();
+  let copying = 0;
+  // Each file closed once its writes are through, so that no write lands in a file opened later under its descriptor.
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      for (const each of copies.values()) for (const copy of each.values()) endCopy(copy, () => closeSync(copy.fd));
+      copies.clear();
+    })
+  );
   const runFork = yield* FiberSet.makeRuntime();
   /** When the tokens file was last written. */
   let keptAt = 0;
@@ -395,7 +449,7 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
   };
 
   /** Whether `request`, signed as its Authorization says, is signed by the token it names, as the official signer signs: the token's grant, or why not. */
-  const verified = async (request: IncomingMessage, path: string, query: Record<string, string>): Promise<{ readonly token: HeldToken } | { readonly refused: string }> => {
+  const verified = async (request: IncomingMessage, path: string, query: Record<string, string>): Promise<{ readonly token: HeldToken; readonly accessKeyId: string } | { readonly refused: string }> => {
     if (Object.keys(query).some((name) => name.toLowerCase().startsWith("x-amz-"))) return { refused: "a request signed in its query is not taken" };
     const said = AUTHORIZATION.exec(String(request.headers.authorization ?? ""));
     if (!said) return { refused: "the request is not signed with Signature Version 4" };
@@ -430,13 +484,14 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
     );
     const computed = /Signature=([0-9a-f]{64})/u.exec(String(expected.headers["authorization"]))?.[1] ?? "";
     if (computed.length !== signature.length || !timingSafeEqual(Buffer.from(computed), Buffer.from(signature))) return { refused: "the request's signature is not its token's" };
-    return { token };
+    return { token, accessKeyId };
   };
 
   /**
    * Asks the bucket for what `request` asked, as the agent, streaming its answer back: where
-   * its body begins in the object given to `answered` (answerStart), and each part of it
-   * handed to the client's connection, as it is, to `delivered`.
+   * its body begins in the object given to `answered` (answerStart), each part of it to
+   * `received` as the bucket gives it, and the bytes of each handed to the client's
+   * connection, as it is, to `delivered`.
    */
   const forward = async (
     request: IncomingMessage,
@@ -444,6 +499,7 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
     path: string,
     query: Record<string, string>,
     answered: (start: number | null) => void = () => {},
+    received: (chunk: Buffer) => void = () => {},
     delivered: (bytes: number) => void = () => {},
   ): Promise<void> => {
     const headers: Record<string, string> = { host: upstream.host, "x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" };
@@ -472,6 +528,7 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
       // As a pipe streams it, held back while the client's connection is, each part counted
       // once its connection has taken it.
       answer.on("data", (chunk: Buffer) => {
+        received(chunk);
         const more = response.write(chunk, (error) => {
           if (!error) delivered(chunk.length);
         });
@@ -491,6 +548,48 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
     asked.end();
   };
 
+  /** `copy`'s write or sync is through, `bytes` of what the copies hold not on the disk with it. */
+  const copyThrough = (copy: Copy, bytes: number): void => {
+    copying -= bytes;
+    copy.writing -= 1;
+    if (copy.writing === 0) for (const resume of copy.through.splice(0)) resume();
+  };
+
+  /** Ends `copy`: once its writes are through, what it holds not on the disk synced to it, then `done`. */
+  const endCopy = (copy: Copy, done: () => void): void => {
+    copy.ended = true;
+    const settle = () => {
+      if (copy.unsynced === 0) return done();
+      const syncing = copy.unsynced;
+      copy.unsynced = 0;
+      copy.writing += 1;
+      copy.through.push(done);
+      fdatasync(copy.fd, () => copyThrough(copy, syncing));
+    };
+    if (copy.writing === 0) settle();
+    else copy.through.push(settle);
+  };
+
+  /**
+   * Writes `chunk` to `copy`'s file at `at`, where what the copies hold not on the disk
+   * leaves room for it, and records it written once it is; the file synced once it holds
+   * SNAPSHOT_SYNC_BYTES written since it last was, or as the copy ends.
+   */
+  const copyPart = (copy: Copy, chunk: Buffer, at: number): void => {
+    if (copy.ended || copying + chunk.length > copyBufferBytes) return;
+    copying += chunk.length;
+    copy.writing += 1;
+    write(copy.fd, chunk, 0, chunk.length, at, (error) => {
+      if (error) return copyThrough(copy, chunk.length);
+      copy.written = withRange(copy.written, at, at + chunk.length);
+      copy.unsynced += chunk.length;
+      if (copy.unsynced < SNAPSHOT_SYNC_BYTES && !copy.ended) return copyThrough(copy, 0);
+      const syncing = copy.unsynced;
+      copy.unsynced = 0;
+      fdatasync(copy.fd, () => copyThrough(copy, syncing));
+    });
+  };
+
   const handle = (request: IncomingMessage, response: ServerResponse): void => {
     void (async () => {
       const url = new URL(request.url ?? "/", "http://proxy");
@@ -502,7 +601,7 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
       if (key === null) return refuse(response, 403, "AccessDenied", "the request names no object of the snapshots bucket");
       const grant = await verified(request, path, query);
       if ("refused" in grant) return refuse(response, 403, "AccessDenied", grant.refused);
-      const { token } = grant;
+      const { token, accessKeyId } = grant;
       if (!key.startsWith(token.prefix)) return refuse(response, 403, "AccessDenied", "the object is not one the restore reads");
       // Its restore asking still, it lasts the longer, whatever the bucket answers.
       if (token.resumed) asked(token);
@@ -518,8 +617,16 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
         token.lastAt = Date.now();
         if (start !== null && given > 0) served(token, key, start, start + given);
       });
+      // Copied, where the agent has it copied, from where the bucket said its answer begins.
+      const copy = copies.get(accessKeyId)?.get(key);
+      let at: number | null = null;
       await forward(request, response, path, query, (from) => {
         start = isPagesFile(key) ? from : null;
+        at = from;
+      }, (chunk) => {
+        if (copy === undefined || at === null) return;
+        copyPart(copy, chunk, at);
+        at += chunk.length;
       }, (bytes) => {
         given += bytes;
       });
@@ -647,6 +754,26 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
       Effect.asVoid,
     ),
     reading,
+    copy: (accessKeyId, key, path) => {
+      if (!tokens.has(accessKeyId)) return;
+      const of = copies.get(accessKeyId) ?? new Map<string, Copy>();
+      copies.set(accessKeyId, of);
+      if (!of.has(key)) of.set(key, { fd: openSync(path, "r+"), written: [], writing: 0, unsynced: 0, ended: false, through: [] });
+    },
+    copied: (accessKeyId) =>
+      Effect.callback<ReadonlyMap<string, readonly [number, number][]>>((resume) => {
+        const of = copies.get(accessKeyId) ?? new Map<string, Copy>();
+        copies.delete(accessKeyId);
+        let left = of.size;
+        const ended = () => {
+          left -= 1;
+          if (left > 0) return;
+          for (const { fd } of of.values()) closeSync(fd);
+          resume(Effect.succeed(new Map([...of].map(([key, { written }]) => [key, written]))));
+        };
+        if (left === 0) return resume(Effect.succeed(new Map()));
+        for (const copy of of.values()) endCopy(copy, ended);
+      }),
     readsDone: (accessKeyId) =>
       Effect.sync(() => doneReading(accessKeyId)).pipe(
         Effect.repeat({ schedule: Schedule.spaced(READS_POLL), until: (done) => done }),
