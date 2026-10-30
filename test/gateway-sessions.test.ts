@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { before, test } from "node:test";
 
 import { CoreV1Api, KubeConfig, type V1Deployment, type V1Pod, type V1PodSpec, type V1PodTemplateSpec } from "@kubernetes/client-node";
-import { Effect, Layer } from "effect";
+import { Deferred, Effect, Layer } from "effect";
 import { TestClock } from "effect/testing";
 
 import { added, collected } from "./support/metrics.ts";
@@ -986,6 +986,37 @@ test("a workspace whose record names a snapshot it holds no more, or another tha
     assert.deepEqual([recorded.state.current, recorded.state.released], [null, null], why);
     assert.deepEqual(recorded.asked, [`forget fs-stale`, `record ${env.namespace}/fs-stale released into none`], why);
   }
+});
+
+/** An effect that says it has begun, then waits for `other` to have begun too, failing as `what` if it does not within two seconds: what two asked at once finish, and two asked one after the other do not. */
+const together = <A>(begun: Deferred.Deferred<void>, other: Deferred.Deferred<void>, what: string, value: A): Effect.Effect<A, NodeAgentError> =>
+  Deferred.succeed(begun, undefined).pipe(
+    Effect.andThen(Deferred.await(other)),
+    Effect.timeoutOrElse({ duration: "2 seconds", orElse: () => Effect.fail(new NodeAgentError({ node: "node-a", call: what, reason: "it was asked alone" })) }),
+    Effect.as(value),
+  );
+
+test("a restore reads its workspace's record and its current snapshot at once, and asks each node's agent what it holds at once", async () => {
+  const env = await environment(1, { gvisor: true });
+  const snapshot = "20261017T120000000Z-0000000a";
+  const recorded = restoringAgents(manifestOf(env, "fs-together", snapshot), { snapshot, release: "r1" }, { prepare: "fails" });
+  const [record, current, nodeA, nodeB] = [Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>()];
+  const prepared: string[] = [];
+  const agents: NodeAgents = {
+    ...recorded.agents,
+    nodes: Effect.succeed(["node-a", "node-b"]),
+    released: (ref) => together(record, current, "read its record", null).pipe(Effect.andThen(recorded.agents.released(ref))),
+    current: (ref) => together(current, record, "read its snapshot", null).pipe(Effect.andThen(recorded.agents.current(ref))),
+    holdings: (node) => together(node === "node-a" ? nodeA : nodeB, node === "node-a" ? nodeB : nodeA, "say what it holds", null).pipe(Effect.andThen(recorded.agents.holdings(node))),
+    prepare: (node, ref, gofer) => Effect.sync(() => void prepared.push(node)).pipe(Effect.andThen(recorded.agents.prepare(node, ref, gofer))),
+  };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), agents);
+  const key = sessionKey("fs-together");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  // Both nodes found able to restore it, each tried in turn, neither prepared, as the bucket fails: deferred.
+  const refused = await Effect.runPromise(Effect.flip(binder.bind(placement.pool, key, placement)));
+  assert.match(refused.message, /deferred, to be tried again: .*the snapshots bucket failed/u);
+  assert.deepEqual(prepared, ["node-a", "node-b"]);
 });
 
 test("a restore whose snapshot cannot be prepared now is deferred, the bind refused to be tried again, its snapshot kept; and one deferred for long enough falls back", async () => {

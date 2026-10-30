@@ -519,17 +519,17 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
    * The nodes that can restore `manifest` into a pod of `tolerations`, those holding its images
    * first: they have its release, with every CPU feature it was saved with, and take the pod;
    * whether every agent said what its node holds; and whether a node that has them is kept from
-   * the pod only by its readiness.
+   * the pod only by its readiness. Each node's agent, and each Node, is asked at once.
    */
   const nodesFor = (manifest: Manifest, tolerations: readonly V1Toleration[]) =>
     Effect.gen(function*() {
       const found = yield* agents.nodes;
-      const held = yield* Effect.forEach(found, (node) => agents.holdings(node).pipe(Effect.map((holdings) => [holdings]), Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as([])))));
+      const held = yield* Effect.forEach(found, (node) => agents.holdings(node).pipe(Effect.map((holdings) => [holdings]), Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as([])))), { concurrency: "unbounded" });
       const answered = found.length > 0 && held.every((each) => each.length > 0);
       const capable = held.flat().filter(({ releases: installed }) =>
         installed.some(({ release, cpuFeatures }) => release === manifest.release && manifest.cpuFeatures.every((feature) => cpuFeatures.includes(feature)))
       );
-      const takes = yield* Effect.forEach(capable, ({ node }) => schedulable(node, tolerations));
+      const takes = yield* Effect.forEach(capable, ({ node }) => schedulable(node, tolerations), { concurrency: "unbounded" });
       const able = capable.filter((_, index) => takes[index] === "takes");
       const holds = (cached: (typeof able)[number]["cached"]) =>
         cached.some(({ environment: of, workspace, images }) => of === manifest.environment && workspace === manifest.workspace && manifest.layers.every(({ digest }) => images.includes(digest)));
@@ -642,8 +642,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       Effect.gen(function*() {
         if (!snapshots || pool.namespace !== mainNamespace) return null;
         const started = yield* Clock.currentTimeMillis;
-        const record = yield* agents.released(ref(pool, workspace)).pipe(Effect.result);
-        const read = record._tag === "Success" ? yield* agents.current(ref(pool, workspace)).pipe(Effect.result) : record;
+        // Its record and its current snapshot read at once, the restore waiting on both.
+        const [record, current] = yield* Effect.all([agents.released(ref(pool, workspace)).pipe(Effect.result), agents.current(ref(pool, workspace)).pipe(Effect.result)], { concurrency: 2 });
+        const read = record._tag === "Success" ? current : record;
         if (read._tag === "Failure") return yield* (passing(read.failure) ? deferOr : fallBack)(pool, workspace, "unreadable", read.failure.message);
         const manifest = read.success;
         const into = record._tag === "Success" ? record.success : null;
