@@ -219,6 +219,13 @@ after(async () => {
 
 test(`a small session's warm restore traced, ${RUNS} times`, { timeout: 120 * 60_000 }, async () => {
   for (let run = 1; run <= RUNS; run++) await runOnce(run);
+  // What reading the node's filter table costs, whole as the agent's policy check reads it, and by chain: 20 of each, in ms.
+  const costs = TARGET !== "host" ? "" : await onNode("", [
+    "t() { a=$(date +%s%N); for i in $(seq 20); do \"$@\" >/dev/null 2>&1; done; b=$(date +%s%N); echo \"$(( (b - a) / 20000 ))\"; }",
+    "chain=$(iptables-save -t filter | grep -o 'KUBE-POD-FW-[A-Z0-9]*' | head -n 1)",
+    "echo \"bytes $(iptables-save -t filter | wc -c) rules $(iptables-save -t filter | grep -c '^-A') save $(t iptables-save -t filter) forward $(t iptables -t filter -S KUBE-ROUTER-FORWARD) pod $(t iptables -t filter -S \"$chain\") nsenter $(t nsenter --target 1 --mount --net -- true) iptables $(readlink -f $(command -v iptables))\"",
+  ].join("\n")).catch((error: unknown) => String(error));
+  console.log(`# trace-policy-costs ${JSON.stringify(costs)}`);
   // bayma's own spans of its sandbox's hook, as the lake has them, once it has them all: each one's start and length.
   const spans = "select SpanName as name, epoch_ns(Timestamp) as at, Duration as ns, ResourceAttributes as resource from otel.traces where SpanName like 'bayma.sandbox.%' order by Timestamp";
   let rows: Record<string, unknown>[] = [];
