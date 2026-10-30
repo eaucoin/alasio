@@ -599,8 +599,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         Effect.mapError((error) => new RestoreRefused({ reason: error.message, resumed: false })),
       );
       yield* trace(`${workspace} gateway policies-listed`);
-      // Spike: how the resumed condition is written, by turns: patched after the resume, its status replaced whole after it, or patched before it.
-      const variant = (["patch", "replace", "early"] as const)[writes++ % 3] ?? "patch";
+      // Spike: when the resumed condition is written, by turns: after the resume, or before it.
+      const variant = (["patch", "early"] as const)[writes++ % 2] ?? "patch";
       yield* trace(`${workspace} gateway variant ${variant}`);
       const resumedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
       const resumedCondition = { type: RESUMED_CONDITION, status: "True", lastTransitionTime: resumedAt };
@@ -622,12 +622,6 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         yield* kube.patchPodStatus(pool.namespace, name, { status: { conditions: [resumedCondition] } }).pipe(
           Effect.mapError((error) => new RestoreRefused({ reason: `its readiness could not be set: ${error.message}`, resumed: true })),
         );
-      }
-      if (variant === "replace" && kube.replacePodStatus) {
-        const replace = kube.replacePodStatus;
-        const read = (yield* podOf(pool, name).pipe(Effect.mapError((error) => new RestoreRefused({ reason: error.message, resumed: true })))) as V1Pod;
-        const conditions = [...(read.status?.conditions ?? []).filter(({ type }) => type !== RESUMED_CONDITION), { ...resumedCondition, lastTransitionTime: new Date(resumedAt) }];
-        yield* replace(pool.namespace, name, { ...read, status: { ...read.status, conditions } }).pipe(Effect.mapError((error) => new RestoreRefused({ reason: error.message, resumed: true })));
       }
       if (variant !== "early") yield* trace(`${workspace} gateway condition-set`);
     });
