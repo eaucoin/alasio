@@ -123,6 +123,12 @@ export interface StoreProxy {
   readonly drained: Effect.Effect<void>;
   /** How many restores over TCP read through the proxy, as its drain waits on them. */
   readonly reading: () => number;
+  /**
+   * Ends once the restore of the token `accessKeyId` is done reading through the proxy: it
+   * has been served every byte of pages it was expected to, or, told none, it is resumed and
+   * its reads are quiet; or its token is gone, revoked as its restore ended, or past its time.
+   */
+  readonly readsDone: (accessKeyId: string) => Effect.Effect<void>;
 }
 
 /** The proxy could not listen where it was told. */
@@ -154,8 +160,8 @@ export const ASKED_WINDOW_MS = 2 * 60_000;
 export const RESUMED_CEILING_MS = 6 * 60 * 60_000;
 /** How often, at most, the tokens file is written again for the time a token's requests lengthened alone. */
 export const KEPT_EVERY_MS = 30_000;
-/** How often the drain looks at what reads through the proxy. */
-const DRAIN_POLL = "1 second";
+/** How often the drain, and what waits on a restore's reads, look at what reads through the proxy. */
+const READS_POLL = "1 second";
 
 /** The headers of the bucket's answer the proxy gives back; the others are the connection's. */
 const ANSWERED = ["content-length", "content-range", "content-type", "accept-ranges", "etag", "last-modified", "x-amz-request-id", "x-amz-id-2"];
@@ -585,6 +591,15 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
     ).length;
   };
 
+  /** Whether the restore of the token `accessKeyId` is done reading through the proxy, as readsDone says. */
+  const doneReading = (accessKeyId: string): boolean => {
+    const token = tokens.get(accessKeyId);
+    const now = Date.now();
+    if (token === undefined || now >= token.until) return true;
+    if (token.expected === null) return token.resumed && token.under === 0 && now - token.lastAt >= quietMs;
+    return token.servedBytes >= token.expected;
+  };
+
   return {
     endpoint: `http://${shown}:${address.port}`,
     socket: socket ?? null,
@@ -628,9 +643,14 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
     drained: Effect.sync(() => {
       draining = true;
     }).pipe(
-      Effect.andThen(Effect.sync(reading).pipe(Effect.repeat({ schedule: Schedule.spaced(DRAIN_POLL), until: (left) => left === 0 }))),
+      Effect.andThen(Effect.sync(reading).pipe(Effect.repeat({ schedule: Schedule.spaced(READS_POLL), until: (left) => left === 0 }))),
       Effect.asVoid,
     ),
     reading,
+    readsDone: (accessKeyId) =>
+      Effect.sync(() => doneReading(accessKeyId)).pipe(
+        Effect.repeat({ schedule: Schedule.spaced(READS_POLL), until: (done) => done }),
+        Effect.asVoid,
+      ),
   };
 });

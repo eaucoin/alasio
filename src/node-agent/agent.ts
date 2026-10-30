@@ -593,7 +593,7 @@ const copies = meter.createCounter("alasio.node_agent.copies", {
   unit: "{copy}",
 });
 const fetches = meter.createCounter("alasio.node_agent.fetches", {
-  description: "Images of a snapshot restored from the bucket fetched into the node's cache after its restore began, for the next checkpoint's delta, by outcome",
+  description: "Images of a snapshot restored from the bucket fetched into the node's cache once its restore read them, for the next checkpoint's delta, by outcome",
   unit: "{image}",
 });
 const prepares = meter.createCounter("alasio.node_agent.prepares", {
@@ -1224,15 +1224,18 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     );
 
   /**
-   * Fetches into the cache, one at a time, each image of `manifest` it does not hold, after a
-   * restore from the bucket began, in the agent's scope: the next checkpoint of the restored
-   * sandbox is a delta of the snapshot's image once the cache holds it. Each is downloaded
+   * Fetches into the cache, one at a time, each image of `manifest` it does not hold, once the
+   * restore from the bucket that reads by the token `reader` is done reading it through the
+   * proxy (./store-proxy.ts readsDone), in the agent's scope: the next checkpoint of the
+   * restored sandbox is a delta of the snapshot's image once the cache holds it. A fetch beside
+   * the restore would read the bucket again as the restore reads it, and slow it: the whole
+   * image a second time, the chain of a delta whole. Each is downloaded
    * beside the workspace's images, which the cache spares meanwhile, holding the workspace
    * only to look at what the cache holds of it and to commit it, so that a checkpoint of the
    * sandbox, as its pod stops, waits on no download; one fetch of a workspace's runs at a time.
    * What fails is said, and leaves that checkpoint whole.
    */
-  const fetchLater = (ref: WorkspaceRef, manifest: Manifest): Effect.Effect<void> =>
+  const fetchLater = (ref: WorkspaceRef, manifest: Manifest, reader: string): Effect.Effect<void> =>
     Effect.forEach(manifest.layers, (layer) =>
       inFlightWhile([ref], Effect.gen(function*() {
         if (yield* exclusive([ref], intact(ref, layer))) return;
@@ -1244,6 +1247,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         Effect.tapError((error) => Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": error._tag }))),
       ), { discard: true }).pipe(
       (fetching) => Effect.scoped(RcMap.get(fetchLocks, prefixOf(ref)).pipe(Effect.flatMap((lock) => fetching.pipe(Semaphore.withPermit(lock))))),
+      (fetching) => storeProxy.readsDone(reader).pipe(Effect.andThen(fetching)),
       Effect.tap(() => Effect.logInfo(`fetched the images of the snapshot ${manifest.snapshot} of ${prefixOf(ref)} into the node's cache, for its next delta`)),
       // Within its budget again, the least recently used workspace evicted.
       Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)))),
@@ -1290,7 +1294,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * where it holds every image of it intact and this node's runsc restores it there, as
    * `runsc image verify --host` says; otherwise from the bucket, which the restore reads as it
    * goes, through the checkpoint gofer, as the request says it reads it, its images fetched
-   * into the cache meanwhile.
+   * into the cache once it is done reading them (fetchLater).
    */
   const prepare = ({ gofer, ...ref }: PrepareRequest): Effect.Effect<Prepared, PrepareError> =>
     exclusive(
@@ -1375,6 +1379,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             if (!(yield* inBucket(ref, layer))) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${layer.digest} is not in the bucket as it was put` });
           }
         }
+        /** The token the restore reads the bucket by, where it does. */
+        let reader: string | null = null;
         if (imagePath === null) {
           // Through the socket where asked and the proxy serves one; over TCP otherwise.
           if (gofer?.transport === "socket" && storeProxy.socket === null) yield* Effect.logWarning(`the restore of ${prefixOf(ref)} asks to read the snapshots bucket through the node agent's socket, which it does not serve: it reads it over TCP`);
@@ -1384,10 +1390,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           const options = goferOptions(ref, own.digest, token, transport, gofer?.pagesRetry ?? false);
           imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, options);
           yield* expectPages(ref, snapshot, token.accessKeyId, release, options);
+          reader = token.accessKeyId;
         }
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
         prepared.set(prefixOf(ref), manifest);
-        if (source === "bucket" && !fetchedFirst) yield* fetchLater(ref, manifest);
+        if (reader !== null) yield* fetchLater(ref, manifest, reader);
         const preparedMs = (yield* Clock.currentTimeMillis) - started;
         yield* evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)));
         yield* Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": "prepared", "alasio.node_agent.prepare.source": source }));
