@@ -168,6 +168,12 @@ const RESTORE_REFUSED = /OCI runtime restore failed|CompleteRestore|cannot resto
 /** How long a restored pod is waited for to run its containers, its images pulled. */
 const POD_RUNNING_TIMEOUT_MS = 180_000;
 /**
+ * How often a restore's pod is read while it is waited for: its sandbox, restored paused, waits
+ * on the read that finds it running for its resume, a warm restore's about a second and a half
+ * after its pod is made.
+ */
+const POD_POLL = "100 millis";
+/**
  * How long a workspace's restore is deferred for, from its first that was, while what it needs
  * fails for a while (an agent, the bucket, its pod's start, its network policies), before it
  * is bound without its snapshot.
@@ -566,7 +572,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         if (failed !== null) return Effect.fail(new RestoreRefused({ reason: failed.why, resumed: false, failed: failed.refused }));
         return pod && until(pod) ? Effect.succeed(pod) : Effect.fail(new PodNotRunning());
       }),
-      Effect.retry({ while: (error) => error._tag === "PodNotRunning", schedule: Schedule.max([Schedule.spaced("500 millis"), Schedule.during(POD_RUNNING_TIMEOUT_MS)]) }),
+      Effect.retry({ while: (error) => error._tag === "PodNotRunning", schedule: Schedule.max([Schedule.spaced(POD_POLL), Schedule.during(POD_RUNNING_TIMEOUT_MS)]) }),
       Effect.catchTag("PodNotRunning", () => Effect.fail(new RestoreRefused({ reason: `its pod did not ${what} within ${POD_RUNNING_TIMEOUT_MS / 1000} s`, resumed: false }))),
       Effect.catchTag("KubeApiError", (error) => Effect.fail(new RestoreRefused({ reason: error.message, resumed: false }))),
     );

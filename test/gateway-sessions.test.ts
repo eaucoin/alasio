@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { before, test } from "node:test";
 
 import { CoreV1Api, KubeConfig, type V1Deployment, type V1Pod, type V1PodSpec, type V1PodTemplateSpec } from "@kubernetes/client-node";
-import { Deferred, Effect, Layer } from "effect";
+import { Deferred, Effect, Fiber, Layer } from "effect";
 import { TestClock } from "effect/testing";
 
 import { added, collected } from "./support/metrics.ts";
@@ -849,6 +849,15 @@ function restoringAgents(current: Manifest | null, released: Released | null, { 
   return { ...base, state, agents: restoring };
 }
 
+/** The restore's pod of `env`'s pool, once it is made. */
+const restorePodOf = async (env: SessionsEnvironment): Promise<V1Pod> => {
+  for (;;) {
+    const [pod] = (await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/binding")))) as V1Pod[];
+    if (pod?.metadata?.name?.startsWith("sandboxes-none-restore-")) return pod;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+};
+
 test("a workspace released into its snapshot is restored from it as it is next bound, by a pod of its own of the pool's template, its workspace attached into its directory, made for it, before the pod is made, its bayma's hook told why it stopped, paused until its node's agent resumes it, then spent", async () => {
   const env = await environment(1, { gvisor: true });
   await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
@@ -861,13 +870,7 @@ test("a workspace released into its snapshot is restored from it as it is next b
   const counted = await added("alasio.sandbox.restores", async () => {
     const binding = Effect.runPromise(binder.bind(placement.pool, key, placement));
     // Its pod runs, as kubelet would run it, then, once resumed, is ready.
-    const restored = await (async () => {
-      for (;;) {
-        const [pod] = (await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/binding")))) as V1Pod[];
-        if (pod?.metadata?.name?.startsWith("sandboxes-none-restore-")) return pod;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-    })();
+    const restored = await restorePodOf(env);
     const name = restored.metadata?.name ?? "";
     // Never started again, as its container's start restores it from its snapshot.
     assert.equal(restored.spec?.restartPolicy, "Never");
@@ -906,6 +909,31 @@ test("a workspace released into its snapshot is restored from it as it is next b
   assert.equal(((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/free=true")))) as V1Pod[]).length, 1);
 });
 
+test("a restore's pod is read again 100 ms after it was last found not running, its sandbox resumed once it runs", async () => {
+  const env = await environment(1, { gvisor: true });
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
+  const snapshot = "20261017T120000000Z-0000000d";
+  const recorded = restoringAgents(manifestOf(env, "fs-looked", snapshot), { snapshot, release: "r1" });
+  const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+  const key = sessionKey("fs-looked");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const resumed = () => recorded.asked.some((asked) => asked.startsWith("resume "));
+  // Its waits timed by a clock of the test's, which stands still until the test moves it.
+  await Effect.runPromise(Effect.gen(function*() {
+    const binding = yield* Effect.forkChild(binder.bind(placement.pool, key, placement));
+    const name = (yield* Effect.promise(() => restorePodOf(env))).metadata?.name ?? "";
+    // Read once as it was made, not running yet; then it runs, as kubelet would run it.
+    yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 300)));
+    yield* Effect.promise(() => run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-looked", state: { running: {} } }] } }))));
+    assert.ok(!resumed(), recorded.asked.join(", "));
+    yield* TestClock.adjust("100 millis");
+    for (const deadline = Date.now() + 3_000; !resumed(); yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 50)))) {
+      assert.ok(Date.now() < deadline, `its sandbox was not resumed 100 ms after its pod ran: ${recorded.asked.join(", ")}`);
+    }
+    yield* Fiber.interrupt(binding);
+  }).pipe(Effect.provide(TestClock.layer())));
+});
+
 /**
  * A restore of `workspace` whose bayma fails to start as `status` says, of a pool of two free
  * pods: what its bind came to, what the agents were asked, what was abandoned, and what was counted.
@@ -923,13 +951,7 @@ async function failedRestore(workspace: string, status: Record<string, unknown>)
   let name = "";
   const counted = await added("alasio.sandbox.restores", async () => {
     const binding = Effect.runPromise(Effect.result(binder.bind(placement.pool, key, placement)));
-    const restored = await (async () => {
-      for (;;) {
-        const [pod] = (await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/binding")))) as V1Pod[];
-        if (pod?.metadata?.name?.startsWith("sandboxes-none-restore-")) return pod;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-    })();
+    const restored = await restorePodOf(env);
     name = restored.metadata?.name ?? "";
     assert.deepEqual(recorded.attached.map(({ pod, made }) => ({ pod, made })), [{ pod: name, made: true }]);
     // Released as other than its memory running out, its hook told no reason.
