@@ -502,6 +502,13 @@ export interface NodeAgentOptions {
 
 /** The checkpoint gofer's options file for an image in an S3 store (runsc's checkpoint_restore.md). */
 export const GOFER_OPTIONS_FILE = "s3_opts.json";
+/**
+ * How many reads of an image's pages the checkpoint gofer serves at once, each of 16 MiB on a
+ * connection of its own to the agent's proxy of the bucket: an S3 connection delivers some
+ * 85 MB/s, and a restore loading its pages in the background keeps all of them but one in
+ * flight from gVisor eaucoin.15 on, where an earlier loader kept the one its budget found.
+ */
+const GOFER_READ_PARALLEL = 16;
 
 /** The directory of a workspace's manifests, in the bucket. */
 export const MANIFESTS_DIR = "manifests";
@@ -1202,8 +1209,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * The checkpoint gofer's options for the image `own` of the workspace's, its layers under
    * its own prefix of them, as the bucket keeps them, read through the agent's proxy of the
    * bucket with `token`, the restore's own, which reads that prefix alone: by the agent's
-   * pod's address, or by the proxy's socket on the node, as `transport` says; reading again,
-   * for as long as the sandbox runs, the pages a read of failed, where `pagesRetry`.
+   * pod's address, or by the proxy's socket on the node, as `transport` says; GOFER_READ_PARALLEL
+   * reads at once; reading again, for as long as the sandbox runs, the pages a read of failed,
+   * where `pagesRetry`.
    */
   const goferOptions = (ref: WorkspaceRef, own: string, { accessKeyId, secretAccessKey }: StoreToken, transport: Transport, pagesRetry: boolean): string =>
     JSON.stringify({
@@ -1214,6 +1222,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       layers_prefix: `${prefixOf(ref)}/${LAYERS_DIR}/`,
       addressing: "path",
       credentials: { access_key_id: accessKeyId, secret_access_key: secretAccessKey },
+      read_parallel: GOFER_READ_PARALLEL,
       ...(pagesRetry ? { pages_retry: "while-running" } : {}),
     });
 

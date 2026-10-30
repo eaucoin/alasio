@@ -477,6 +477,7 @@ test("the checkpoint of a sandbox restored from a snapshot, which tracks its wri
         object_prefix: `main/fs-abc/layers/${own.digest}/`,
         layers_prefix: "main/fs-abc/layers/",
         addressing: "path",
+        read_parallel: 16,
       });
       assert.match(credentials.access_key_id, /^ALASIO[0-9A-F]{20}$/u);
       assert.equal(Buffer.from(credentials.secret_access_key, "base64url").length, 32);
@@ -1268,6 +1269,7 @@ test("a restore that asks for its checkpoint gofer through the agent's socket, r
         object_prefix: `main/fs-abc/layers/${own.digest}/`,
         layers_prefix: "main/fs-abc/layers/",
         addressing: "path",
+        read_parallel: 16,
         pages_retry: "while-running",
       });
       // Through the socket, its restore waits for the agent that comes back: the drain does not wait on it.
@@ -1282,6 +1284,7 @@ test("a restore that asks for its checkpoint gofer through the agent's socket, r
           object_prefix: `main/fs-abc/layers/${own.digest}/`,
           layers_prefix: "main/fs-abc/layers/",
           addressing: "path",
+          read_parallel: 16,
         });
         assert.equal(there.storeProxy.reading(), 1);
       }
@@ -1295,6 +1298,7 @@ test("a restore that asks for its checkpoint gofer through the agent's socket, r
         object_prefix: `main/fs-abc/layers/${own.digest}/`,
         layers_prefix: "main/fs-abc/layers/",
         addressing: "path",
+        read_parallel: 16,
         pages_retry: "while-running",
       });
     })
