@@ -20,7 +20,7 @@ import { NAMESPACE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { BINDING_LABEL, FREE_LABEL, keyHash } from "../../src/binder/names.ts";
 import { CONTAINERD, gvisorHandler } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
-import { bindSession, boundPodOf, dumpClusterState, gatewayCall, inAlasio, kube, mainToken, nodeAgents, onNode, recordSession, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
+import { bindSession, boundPodOf, dumpClusterState, gatewayCall, inAlasio, kube, lakeQuery, mainToken, nodeAgents, onNode, recordSession, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
 import type { ReplSet } from "./session-repl.ts";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -219,4 +219,12 @@ after(async () => {
 
 test(`a small session's warm restore traced, ${RUNS} times`, { timeout: 120 * 60_000 }, async () => {
   for (let run = 1; run <= RUNS; run++) await runOnce(run);
+  // bayma's own spans of its sandbox's hook, as the lake has them, once it has them all: each one's start and length.
+  const spans = "select SpanName as name, epoch_ns(Timestamp) as at, Duration as ns, ResourceAttributes as resource from otel.traces where SpanName like 'bayma.sandbox.%' order by Timestamp";
+  let rows: Record<string, unknown>[] = [];
+  for (const deadline = Date.now() + 600_000; Date.now() < deadline; await sleep(10_000)) {
+    rows = await lakeQuery(spans).catch((error: unknown) => [{ error: String(error) }]);
+    if (rows.filter((row) => row["name"] === "bayma.sandbox.restore").length >= RUNS) break;
+  }
+  console.log(`# trace-spans ${JSON.stringify(rows, (_key, value: unknown) => (typeof value === "bigint" ? String(value) : value))}`);
 });
