@@ -567,8 +567,12 @@ export const restoreHookSeconds = (backgroundReadMs: number): number => Math.cei
 export const resumeMs = (bytes: number): number => POLICY_WAIT_MS + restoreHookSeconds(backgroundReadSeconds(bytes) * 1000) * 1000;
 /** How often the cache is looked at for what to evict, besides as checkpoints and prepares write to it. */
 const EVICT_POLL: Duration.Input = "1 minute";
-/** How often a resume looks for a restored pod's rules. */
-const POLICY_POLL = "250 millis";
+/**
+ * How often a resume looks for a restored pod's rules: kube-router writes them a few hundred
+ * milliseconds after the pod's address reaches the API server, which the restore waits on.
+ * A look lists a chain or two of the node's filter table, some 5 ms each.
+ */
+const POLICY_POLL = "50 millis";
 /** The most scans an abandon runs for what runsc runs for a pod, each after the kills of the one before (abandonNow). */
 const ABANDON_SCANS = 10;
 
