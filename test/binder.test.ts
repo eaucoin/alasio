@@ -233,6 +233,46 @@ test("a bind that makes its own pod makes it bound to the key from the first, gi
   assert.deepEqual(bindings, [bound.binding]);
 });
 
+test("a pod gated on a condition serves once its containers are ready and the condition holds, before kubelet says it ready, to a bind and to a look at its binding alike, and not before", async () => {
+  const of = await pool();
+  const layer = binderOf({ waitMs: 3_000 });
+  const key = "sessionfs:gated";
+  const status = (conditions: Record<string, string>) => ({
+    status: { phase: "Running", podIP: "10.42.0.251", conditions: Object.entries(conditions).map(([type, holds]) => ({ type, status: holds })) },
+  });
+  const set = (conditions: Record<string, string>) => run(binder(), withKube((client) => client.patchPodStatus(of.namespace, "gated", status(conditions))));
+  // Made running, its containers ready, gated on alasio.dev/resumed, not yet set: kubelet says it unready.
+  const bound = await bindIn(layer, (each) =>
+    Effect.gen(function*() {
+      const binding = yield* Effect.forkChild(each.bind(of, key, {
+        make: (labels, annotations) =>
+          withKube((client) =>
+            client.create<V1Pod>({ apiVersion: "v1", kind: "Pod", metadata: { name: "gated", namespace: of.namespace, labels: { ...labels }, annotations: { ...annotations } }, spec: { containers: [{ name: "bayma", image: "agent" }], readinessGates: [{ conditionType: "alasio.dev/resumed" }] } })
+          ).pipe(Effect.provide(binder())),
+        prepare: () => Effect.promise(() => set({ ContainersReady: "True", Ready: "False" })),
+      }));
+      // Not serving while its gate's condition does not hold.
+      yield* Effect.sleep("1 second");
+      assert.equal(binding.pollUnsafe(), undefined);
+      assert.equal(yield* each.bound(of, key), null);
+      // Its condition set, kubelet not yet told: serving, to the bind waiting on it, and to a look at its binding.
+      yield* Effect.promise(() => set({ ContainersReady: "True", Ready: "False", "alasio.dev/resumed": "True" }));
+      const got = yield* Fiber.join(binding);
+      assert.deepEqual(yield* each.bound(of, key), got);
+      // Its containers unready, as its probe failing makes them: serving no more, whatever its gate says.
+      yield* Effect.promise(() => set({ ContainersReady: "False", Ready: "False", "alasio.dev/resumed": "True" }));
+      assert.equal(yield* each.bound(of, key), null);
+      return got;
+    })
+  );
+  assert.equal(bound.pod, "gated");
+  // A pod gated on nothing serves only once kubelet says it ready, its containers ready or not.
+  await run(binder(), withKube((client) => client.create<V1Pod>({ apiVersion: "v1", kind: "Pod", metadata: { name: "ungated", namespace: of.namespace, labels: { ...freeLabels(of) } }, spec: { containers: [{ name: "bayma", image: "agent" }] } })));
+  await run(binder(), withKube((client) => client.patchPodStatus(of.namespace, "ungated", status({ ContainersReady: "True", Ready: "False" }))));
+  const ungated = await bindIn(layer, (each) => Effect.flip(each.bind(of, "sessionfs:ungated")));
+  assert.ok(ungated instanceof BindTimeout && ungated.waited === "pod serving", String(ungated));
+});
+
 test("a binding under way is renewed however long its pod takes to make, so no other binder takes it over meanwhile", async () => {
   const of = await pool();
   const timing = { renewMs: 300, staleMs: 1_500 };
