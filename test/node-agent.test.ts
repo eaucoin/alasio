@@ -254,8 +254,18 @@ const imagesOf = (node: Node, workspace: string): string[] => {
   return existsSync(directory) ? readdirSync(directory).filter((name) => !/^\..*\.remote-/u.test(name)).sort() : [];
 };
 
-/** Resolves once the node's cache holds every image of `manifest`, stamped as checked, as the agent fetches them after a restore from the bucket began. */
+/**
+ * Resolves once the node's cache holds every image of `manifest`, stamped as checked, as the
+ * agent fetches them once a restore from the bucket is done reading it: here, as the restore
+ * ends, its token revoked, as its sandbox's next checkpoint or abandon revokes it.
+ */
 const fetched = (node: Node, manifest: Manifest) =>
+  Effect.sync(() => node.storeProxy.revoke(`${manifest.environment}/${manifest.workspace}`)).pipe(
+    Effect.andThen(cached(node, manifest)),
+  );
+
+/** Resolves once the node's cache holds every image of `manifest`, stamped as checked. */
+const cached = (node: Node, manifest: Manifest) =>
   Effect.sync(() => {
     const directory = join(node.cacheDir, manifest.environment, manifest.workspace);
     const held = existsSync(join(directory, "layers")) ? readdirSync(join(directory, "layers")) : [];
@@ -1152,7 +1162,8 @@ test("a restore from the bucket reads its own images through the agent by a toke
       assert.ok(image);
       const own = `main/fs-abc/layers/${image.digest}/pages.img`;
       const others = (yield* taker.agent.checkpoint(request("fs-other", OTHER_CONTAINER))).layers[0]?.digest;
-      const other = yield* node("node-2");
+      // Its restores' reads quiet soon once resumed, as runsc says nothing of their bytes here.
+      const other = yield* node("node-2", { quietMs: 100 });
       /** Prepared from the bucket, as a node whose cache holds none of it does, once what a prepare before fetched is cleared: the token it was given. */
       let fetching: Manifest | null = null;
       /** The gofer's options file of the last prepared, which holds its token. */
@@ -1199,9 +1210,12 @@ test("a restore from the bucket reads its own images through the agent by a toke
       assert.equal(yield* throughProxy(other, fourth, `main/fs-abc/layers/${(yield* other.agent.current(workspace))?.layers[0]?.digest}/pages.img`), 200);
       yield* other.agent.checkpoint(request("fs-abc"));
       assert.equal(yield* throughProxy(other, fourth, own), 403);
-      // A prepare from the cache, as of one now held, revokes the one before it too.
+      // A prepare from the cache, as of one now held, revokes the one before it too: fetched once
+      // that restore, resumed, is done reading.
       const fifth = yield* preparedRemote;
-      yield* fetched(other, (yield* other.agent.current(workspace))!);
+      const current = (yield* other.agent.current(workspace))!;
+      yield* other.agent.resume(resumeRequest(current.snapshot));
+      yield* cached(other, current);
       assert.equal((yield* other.agent.prepare(workspace)).source, "cache");
       assert.equal(yield* throughProxy(other, fifth, own), 403);
     })
@@ -1340,6 +1354,45 @@ test("a restore from the bucket is told the bytes of pages its image holds, of e
     })
   ));
 
+test("a restore from the bucket's images are fetched into the cache once it is done reading the bucket, served every byte of pages runsc says it reads, or once it ends, not beside it", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const taker = yield* node("node-1");
+      const manifest = yield* taker.agent.checkpoint(request("fs-abc"));
+      const own = `main/fs-abc/layers/${manifest.layers[0]?.digest}/pages.img`;
+      // Its image's pages, 4096 bytes, and a layer's beside them: 45056 bytes in all, as runsc
+      // says of the image (./support/runsc-image-inspect.json).
+      const layer = `main/fs-abc/layers/${"b".repeat(64)}/pages.img`;
+      s3.objects.set(layer, Buffer.alloc(45056 - 4096, 7));
+      const there = yield* node("node-2");
+      writeFileSync(join(there.releases.releasesDir, RELEASE, "remote-inspect"), "");
+      const restored = Effect.gen(function*() {
+        yield* there.cache.clear("main", "fs-abc");
+        const prepared = yield* there.agent.prepare(workspace);
+        assert.equal(prepared.source, "bucket");
+        const token = tokenIn(prepared.imagePath);
+        yield* there.agent.resume(resumeRequest(manifest.snapshot));
+        return token;
+      });
+      // Reading: nothing fetched, until it has been served all its pages.
+      const token = yield* restored;
+      yield* Effect.sleep("1500 millis");
+      assert.deepEqual(imagesOf(there, "fs-abc"), []);
+      assert.equal(yield* throughProxy(there, token, own), 200);
+      yield* Effect.sleep("1500 millis");
+      assert.deepEqual(imagesOf(there, "fs-abc"), []);
+      assert.equal(yield* throughProxy(there, token, layer), 200);
+      yield* fetched(there, manifest);
+      // Ended before, as its sandbox is abandoned: fetched then.
+      yield* restored;
+      yield* Effect.sleep("1500 millis");
+      assert.deepEqual(imagesOf(there, "fs-abc"), []);
+      yield* there.agent.abandon({ ...workspace, namespace: SESSIONS, pod: POD, uid: POD_UID });
+      yield* fetched(there, manifest);
+    })
+  ));
+
 test("runsc says how many bytes of pages a restore from the bucket reads from options of its own, however soon the restore is resumed and its own removed, and leaves none of them behind", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
@@ -1369,7 +1422,7 @@ test("runsc says how many bytes of pages a restore from the bucket reads from op
       yield* Effect.sleep("50 millis");
       assert.equal(there.storeProxy.reading(), 0);
       const layers = join(there.cache.workspace("main", "fs-abc"), LAYERS_DIR);
-      assert.deepEqual(readdirSync(layers).filter((name) => name.startsWith(".")), []);
+      assert.deepEqual(existsSync(layers) ? readdirSync(layers).filter((name) => name.startsWith(".")) : [], []);
       rmSync(beside("remote-inspect"));
     })
   ));
@@ -1403,7 +1456,8 @@ test("a sandbox restored from the bucket, checkpointed as its pod stops while it
       const base = yield* taker.agent.checkpoint(request("fs-abc"));
       const [image] = base.layers;
       assert.ok(image);
-      const there = yield* node("node-2");
+      // Its restore's reads quiet soon, and its images fetched then.
+      const there = yield* node("node-2", { quietMs: 100 });
       // Each get of its image's files held until the checkpoint is through, as one of a large image takes its time.
       let gotten = () => {};
       const held = new Promise<void>((resolve) => (gotten = resolve));
@@ -1597,7 +1651,7 @@ test("what no snapshot needs any more is collected, but what a restore or a comm
       s3.getDelayMs = 100;
       const reader = yield* node("node-2");
       const restoring = yield* Effect.forkChild(reader.agent.prepare(workspace));
-      yield* Effect.sync(() => s3.requests.some((asked) => asked.startsWith(`GET main/fs-abc/layers/${digestOf(first)}/`))).pipe(
+      yield* Effect.sync(() => s3.requests.some((asked) => asked.includes(` main/fs-abc/layers/${digestOf(first)}/`))).pipe(
         Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: Boolean }),
       );
       const second = yield* here.agent.checkpoint(request("fs-abc", OTHER_CONTAINER));
