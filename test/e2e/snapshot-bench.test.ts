@@ -61,10 +61,11 @@ const RUNS = Number(process.env["BENCH_RUNS"] || 5);
  * The variant: `as-shipped`, alasio 10.0.0 as it runs, whose live checkpoints of a pool's pod
  * fail (mountedStateDir), so its release is a whole stop-and-copy; or `with-fix`, its live
  * checkpoint given bayma's state directory by its mounted path, as alasio's fix, not yet
- * released, gives it, its release then a delta of the live save's image.
+ * released, gives it, its release then a delta of the live save's image; or `whole`, no live
+ * save taken, as of a session released before its first, its release a whole stop-and-copy.
  */
 const VARIANT = variable("BENCH_VARIANT");
-if (VARIANT !== "as-shipped" && VARIANT !== "with-fix") throw new Error(`BENCH_VARIANT is ${VARIANT}, not as-shipped or with-fix`);
+if (VARIANT !== "as-shipped" && VARIANT !== "with-fix" && VARIANT !== "whole") throw new Error(`BENCH_VARIANT is ${VARIANT}, not as-shipped, with-fix or whole`);
 const COMMON = new URL("../../bench/common/", import.meta.url);
 const read = (relative: string): string => readFileSync(new URL(relative, COMMON), "utf8");
 const PROFILES = JSON.parse(read("store/profiles.json")) as Record<string, { readonly emulated: boolean }>;
@@ -111,7 +112,7 @@ function emit(fixture: string, sizeMib: number, run: number, phase: string, outc
     correctness,
     host: JSON.parse(readFileSync(join(BENCH_DIR, "host.json"), "utf8")),
     store,
-    versions: { system: `alasio 10.0.0, gVisor ${RELEASE_UNDER_TEST}`, bayma: "0.15.2", seaweedfs: "4.48", toxiproxy: TOXIPROXY },
+    versions: { system: `alasio 10.0.3, gVisor ${RELEASE_UNDER_TEST}`, bayma: "0.15.4", seaweedfs: "4.48", toxiproxy: TOXIPROXY },
     ci: { run_id: Number(process.env["GITHUB_RUN_ID"] ?? 0), job: process.env["GITHUB_JOB"] ?? "local", sha: process.env["GITHUB_SHA"] ?? "" },
     at: new Date().toISOString(),
     details,
@@ -243,12 +244,15 @@ function saveLogged(lines: readonly string[]): { readonly pauseMs: number | null
   const paused = lines.findLast((line) => line.includes("Tasks resumed after save, paused for"));
   const done = lines.findLast((line) => line.includes("Pre-copy done after"));
   const skipped = lines.findLast((line) => line.includes("Pre-copy skipped"));
+  // The last save's scan of its memory and what it wrote, zero pages among them.
+  const scanned = lines.findLast((line) => line.includes("save scanning took"));
+  const written = lines.findLast((line) => line.includes("bytes written to the pages file"));
   const rounds = /Pre-copy done after (\d+) rounds \([^)]*\): (\d+) bytes/u.exec(done ?? "");
   return {
     pauseMs: paused ? goDurationMs(/paused for (\S+?)\.?$/u.exec(paused)?.[1] ?? "") : null,
     passes: rounds ? Number(rounds[1]) : skipped ? 0 : null,
     precopyBytes: rounds ? Number(rounds[2]) : skipped ? 0 : null,
-    said: [paused, done, skipped].filter((line): line is string => line !== undefined),
+    said: [paused, done, skipped, scanned, written].filter((line): line is string => line !== undefined),
   };
 }
 
@@ -256,10 +260,11 @@ function saveLogged(lines: readonly string[]): { readonly pauseMs: number | null
 function restoreLogged(lines: readonly string[]): { readonly runscRestoreMs: number | null; readonly said: string[] } {
   const first = lines.find((line) => logTimeMs(line) !== null);
   const restored = lines.find((line) => line.includes("Restore successful"));
-  const loaded = lines.find((line) => line.includes("Async page loading completed"));
+  // Each layer's loader's lines: its working set, its end, its rate and its budget.
+  const loading = lines.filter((line) => /Async page loading (completed|read|: )|async loading \d+ bytes from|working set holds/u.test(line));
   const from = first ? logTimeMs(first) : null;
   const to = restored ? logTimeMs(restored) : null;
-  return { runscRestoreMs: from !== null && to !== null ? to - from : null, said: [restored, loaded].filter((line): line is string => line !== undefined) };
+  return { runscRestoreMs: from !== null && to !== null ? to - from : null, said: [restored, ...loading].filter((line): line is string => line !== undefined) };
 }
 
 /** The memory of the pod of uid `uid` on `node`, as its cgroup says: its peak and what it holds now. */
@@ -502,31 +507,35 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const request = { environment: SESSIONS, workspace, namespace: SESSIONS, pod: bound.name, containerId: containerIdOf(pod), hook, podTemplate: await poolTemplate(pod), live: { stateDir: VARIANT === "with-fix" ? mountedStateDir(stateDir) : stateDir } };
     const sandboxId = await sandboxIdOf(node, bound.name);
     const heldBefore = await bucketBytes(node, workspace);
-    await driver(workspace, "mark", "--session", sessionId, "--fixture", fixture);
-    const asking = join(BENCH_DIR, "checkpoint.cjs");
-    const asked = join(BENCH_DIR, "checkpoint-request.json");
-    writeFileSync(asking, CHECKPOINT);
-    writeFileSync(asked, JSON.stringify(request));
-    const checkpointed = await inAgentNetwork(node, [asking, String(NODE_AGENT_PORT), SESSIONS, workspace, asked]).then(
-      (stdout) => ({ code: 0, stdout, stderr: "" }),
-      (error: unknown) => ({ code: 1, stdout: "", stderr: errorText(error) }),
-    );
-    const gaps = await driver<{ readonly max_gap_ms: number; readonly slowdown: number | null }>(workspace, "gaps", "--session", sessionId, "--fixture", fixture);
-    const heldLive = await bucketBytes(node, workspace);
-    const liveLogged = saveLogged(await bootLog(node, sandboxId));
-    const logged = { state_dir: request.live.stateDir, logged: liveLogged.said, gaps };
-    const measured = { unavailable_ms: gaps.max_gap_ms, pause_reported_ms: liveLogged.pauseMs, slowdown: gaps.slowdown, precopy_passes: liveLogged.passes, precopy_bytes: liveLogged.precopyBytes, uploaded_bytes: heldLive - heldBefore };
-    if (checkpointed.code === 0) {
-      const live = JSON.parse(checkpointed.stdout.trim().split("\n").at(-1) ?? "{}") as { readonly ms: number; readonly manifest: Manifest };
-      emit(fixture, sizeMib, run, "save-live", { ok: true, failure: null }, {
-        ...measured,
-        save_total_ms: live.ms,
-        image_bytes: live.manifest.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null,
-      }, NO_CHECKS, { ...logged, snapshot: live.manifest.snapshot, runsc_checkpoint_ms: live.manifest.pauseMs, upload_ms: live.manifest.uploadMs, chain: live.manifest.layers.length });
-    } else {
-      // As alasio 10.0.0 fails it (mountedStateDir): its sandbox saved and running on, the snapshot never committed.
-      const said = /"error":"([^"]*)"/u.exec(checkpointed.stderr)?.[1] ?? checkpointed.stderr.trim().split("\n").at(-1) ?? "";
-      emit(fixture, sizeMib, run, "save-live", { ok: false, failure: `the node agent's live checkpoint failed: ${said}` }, measured, NO_CHECKS, logged);
+    let heldLive = heldBefore;
+    // No live save of `whole`, whose release saves the session whole.
+    if (VARIANT !== "whole") {
+      await driver(workspace, "mark", "--session", sessionId, "--fixture", fixture);
+      const asking = join(BENCH_DIR, "checkpoint.cjs");
+      const asked = join(BENCH_DIR, "checkpoint-request.json");
+      writeFileSync(asking, CHECKPOINT);
+      writeFileSync(asked, JSON.stringify(request));
+      const checkpointed = await inAgentNetwork(node, [asking, String(NODE_AGENT_PORT), SESSIONS, workspace, asked]).then(
+        (stdout) => ({ code: 0, stdout, stderr: "" }),
+        (error: unknown) => ({ code: 1, stdout: "", stderr: errorText(error) }),
+      );
+      const gaps = await driver<{ readonly max_gap_ms: number; readonly slowdown: number | null }>(workspace, "gaps", "--session", sessionId, "--fixture", fixture);
+      heldLive = await bucketBytes(node, workspace);
+      const liveLogged = saveLogged(await bootLog(node, sandboxId));
+      const logged = { state_dir: request.live.stateDir, logged: liveLogged.said, gaps };
+      const measured = { unavailable_ms: gaps.max_gap_ms, pause_reported_ms: liveLogged.pauseMs, slowdown: gaps.slowdown, precopy_passes: liveLogged.passes, precopy_bytes: liveLogged.precopyBytes, uploaded_bytes: heldLive - heldBefore };
+      if (checkpointed.code === 0) {
+        const live = JSON.parse(checkpointed.stdout.trim().split("\n").at(-1) ?? "{}") as { readonly ms: number; readonly manifest: Manifest };
+        emit(fixture, sizeMib, run, "save-live", { ok: true, failure: null }, {
+          ...measured,
+          save_total_ms: live.ms,
+          image_bytes: live.manifest.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null,
+        }, NO_CHECKS, { ...logged, snapshot: live.manifest.snapshot, runsc_checkpoint_ms: live.manifest.pauseMs, upload_ms: live.manifest.uploadMs, chain: live.manifest.layers.length });
+      } else {
+        // As alasio 10.0.0 fails it (mountedStateDir): its sandbox saved and running on, the snapshot never committed.
+        const said = /"error":"([^"]*)"/u.exec(checkpointed.stderr)?.[1] ?? checkpointed.stderr.trim().split("\n").at(-1) ?? "";
+        emit(fixture, sizeMib, run, "save-live", { ok: false, failure: `the node agent's live checkpoint failed: ${said}` }, measured, NO_CHECKS, logged);
+      }
     }
     done.add(phase);
 
