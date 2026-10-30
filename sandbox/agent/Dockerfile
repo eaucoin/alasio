@@ -6,6 +6,8 @@
 # own, and its bayma starts once its binding's token is beside it (start.sh).
 ARG BAYMA_IMAGE=ghcr.io/eaucoin/bayma:0.15.4@sha256:54ace1e40ae3c2350dc54d28b0146b176219d710f300dc55f87cad456a3213e3
 FROM ${BAYMA_IMAGE}
+# Spike: bayma's bundle of track/lean-hook, over the release's.
+COPY bayma-bundle/ /opt/bayma/
 LABEL org.opencontainers.image.source=https://github.com/eaucoin/alasio \
       org.opencontainers.image.description="alasio's session sandboxes: bayma, run as the unprivileged agent"
 RUN usermod --login agent --home /home/agent ubuntu \
