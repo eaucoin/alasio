@@ -829,7 +829,7 @@ const manifestOf = (env: SessionsEnvironment & { template: V1PodTemplateSpec }, 
 });
 
 /** Node agents as `agents` makes them, which hold `current` of the workspace, and its record of `released`; their prepare does as `prepare` says. */
-function restoringAgents(current: Manifest | null, released: Released | null, { prepare = "prepares" as "prepares" | "fails" } = {}) {
+function restoringAgents(current: Manifest | null, released: Released | null, { prepare = "prepares" as "prepares" | "fails" | "finds it corrupt" } = {}) {
   const base = agents();
   const state = { current, released };
   const restoring: NodeAgents = {
@@ -841,6 +841,8 @@ function restoringAgents(current: Manifest | null, released: Released | null, { 
     prepare: (node, _workspace, gofer) =>
       prepare === "fails"
         ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 502, reason: "the snapshots bucket failed" }))
+        : prepare === "finds it corrupt"
+        ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 422, reason: "its image is not in the bucket as it was put" }))
         : Effect.sync(() => (base.asked.push(`prepare ${node}${gofer ? ` ${gofer.transport}${gofer.pagesRetry ? " retrying pages" : ""}` : ""}`), { manifest: state.current as Manifest, imagePath: "/var/cache/alasio/image", source: "cache" as const })),
     resume: (node, request, bytes) => Effect.sync(() => void base.asked.push(`resume ${node} ${request.pod} ${request.snapshot} of ${bytes} bytes`)),
     spend: (_ref, snapshot) => Effect.sync(() => (base.asked.push(`spend ${snapshot}`), void (state.current = null))),
@@ -1039,6 +1041,51 @@ test("a restore reads its workspace's record and its current snapshot at once, a
   const refused = await Effect.runPromise(Effect.flip(binder.bind(placement.pool, key, placement)));
   assert.match(refused.message, /deferred, to be tried again: .*the snapshots bucket failed/u);
   assert.deepEqual(prepared, ["node-a", "node-b"]);
+});
+
+test("a restore attaches its workspace into its pod's directory while its snapshot is prepared", async () => {
+  const env = await environment(1, { gvisor: true });
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
+  const snapshot = "20261017T120000000Z-0000000e";
+  const recorded = restoringAgents(manifestOf(env, "fs-beside", snapshot), { snapshot, release: "r1" });
+  const [preparing, attaching] = [Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>()];
+  const agents: NodeAgents = {
+    ...recorded.agents,
+    prepare: (node, ref, gofer) => together(preparing, attaching, "prepare", null).pipe(Effect.andThen(recorded.agents.prepare(node, ref, gofer))),
+    attach: (node, request) => together(attaching, preparing, "attach", null).pipe(Effect.andThen(recorded.agents.attach(node, request))),
+  };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), agents);
+  const key = sessionKey("fs-beside");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const binding = Effect.runFork(binder.bind(placement.pool, key, placement));
+  const came = await Promise.race([
+    restorePodOf(env).then((pod) => `made ${pod.metadata?.name}`),
+    Effect.runPromise(Effect.flip(Fiber.join(binding))).then((refused) => `refused: ${refused.message}`),
+  ]);
+  assert.equal(came, `made ${recorded.attached[0]?.pod}`);
+  await Effect.runPromise(Fiber.interrupt(binding));
+});
+
+test("what a restore attached beside a prepare that failed is detached: the restore deferred where the failure may pass, fallen back where its snapshot is corrupt", async () => {
+  for (const [prepare, outcome] of [["fails", "deferred"], ["finds it corrupt", "fallback"]] as const) {
+    const env = await environment(1, { gvisor: true });
+    const snapshot = "20261017T120000000Z-0000000f";
+    const recorded = restoringAgents(manifestOf(env, "fs-unprepared", snapshot), { snapshot, release: "r1" }, { prepare });
+    const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+    const key = sessionKey("fs-unprepared");
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    const counted = await added("alasio.sandbox.restores", () => Effect.runPromise(Effect.result(binder.bind(placement.pool, key, placement))));
+    assert.deepEqual(counted, { [`alasio.sandbox.restore.outcome=${outcome},alasio.sandbox.restore.fallback=prepare`]: 1 }, prepare);
+    const [attached] = recorded.attached;
+    assert.ok(attached?.made, `nothing was attached beside the prepare that ${prepare}`);
+    for (const deadline = Date.now() + 10_000; !recorded.asked.includes(`detach node-a ${env.namespace}/${attached.pod}`); await new Promise((resolve) => setTimeout(resolve, 100))) {
+      assert.ok(Date.now() < deadline, `what was attached into ${attached.pod} was not detached: ${recorded.asked.join(", ")}`);
+    }
+    // No pod made for it; one that fell back bound to the pool's free pod, its snapshot forgotten.
+    const bound = (await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/binding")))) as V1Pod[];
+    assert.deepEqual(bound.map((pod) => pod.metadata?.name), outcome === "fallback" ? ["none-0"] : [], prepare);
+    assert.equal(recorded.state.current === null, outcome === "fallback", prepare);
+  }
 });
 
 test("a restore whose snapshot cannot be prepared now is deferred, the bind refused to be tried again, its snapshot kept; and one deferred for long enough falls back", async () => {

@@ -677,21 +677,27 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         // Each node tried in turn: one that cannot restore it (409) leaves the others; one whose bucket or agent fails may pass.
         const failures: (NodeAgentError | KubeApiError)[] = [];
         for (const node of able.success.nodes) {
-          const prepared = yield* agents.prepare(node, ref(pool, workspace), kept.gofer ?? undefined).pipe(Effect.result);
+          // Named before it is made, as its own directory is by its name (ownDirectory); its workspace
+          // attached there while its snapshot is prepared, before the pod is made, so its sandbox, restored as its bayma
+          // starts, finds every file it held open; and, of one stopped as it ran out of its memory, its bayma's hook told
+          // so, for its sessions' next execs.
+          const name = restorePodName(pool.name, randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7));
+          const [prepared, attached] = yield* Effect.all([
+            agents.prepare(node, ref(pool, workspace), kept.gofer ?? undefined).pipe(Effect.result),
+            attaching.attach(node, name, binding, into?.memoryLimit === undefined ? {} : { [SANDBOX_STOP_REASON_VARIABLE]: `it ran out of its memory (${into.memoryLimit})` }).pipe(Effect.result),
+          ], { concurrency: 2 });
           if (prepared._tag === "Failure") {
             failures.push(prepared.failure);
             yield* Effect.logWarning(prepared.failure.message);
+            // Attached for a pod that is not made: detached.
+            if (attached._tag === "Success") yield* attaching.detach(node, name);
             continue;
           }
+          if (attached._tag === "Failure") return yield* attached.failure;
           // What the agent prepared, which a compaction committed since may have made the one compacted from it.
           const from = prepared.success.manifest;
           yield* Effect.logInfo(`restoring ${named(pool, workspace)} on ${node} from its snapshot ${from.snapshot}, taken at ${from.takenAt} under gVisor ${from.release}`);
           const { [FREE_LABEL]: _free, ...own } = base.metadata?.labels ?? {};
-          // Named before it is made, as its own directory is by its name (ownDirectory); its workspace
-          // attached there first, so its sandbox, restored as its bayma starts, finds every file it held open;
-          // and, of one stopped as it ran out of its memory, its bayma's hook told so, for its sessions' next execs.
-          const name = restorePodName(pool.name, randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7));
-          yield* attaching.attach(node, name, binding, into?.memoryLimit === undefined ? {} : { [SANDBOX_STOP_REASON_VARIABLE]: `it ran out of its memory (${into.memoryLimit})` });
           const spec = ownDirectory({ containers: [], ...base.spec }, pool.namespace, name);
           const pod = yield* kube.create<V1Pod>({
             apiVersion: "v1",
