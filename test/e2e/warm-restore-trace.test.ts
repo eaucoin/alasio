@@ -223,6 +223,7 @@ test(`a small session's warm restore traced, ${RUNS} times`, { timeout: 120 * 60
   const costs = TARGET !== "host" ? "" : await onNode("", [
     "t() { a=$(date +%s%N); for i in $(seq 20); do \"$@\" >/dev/null 2>&1; done; b=$(date +%s%N); echo \"$(( (b - a) / 20000 ))\"; }",
     "chain=$(iptables-save -t filter | grep -o 'KUBE-POD-FW-[A-Z0-9]*' | head -n 1)",
+    "for bin in iptables ip6tables; do $bin -t filter -S KUBE-POD-FW-NONE; echo \"$bin missing exit $?\"; $bin -t filter -S KUBE-ROUTER-FORWARD | head -n 3; done 2>&1",
     "echo \"bytes $(iptables-save -t filter | wc -c) rules $(iptables-save -t filter | grep -c '^-A') save $(t iptables-save -t filter) forward $(t iptables -t filter -S KUBE-ROUTER-FORWARD) pod $(t iptables -t filter -S \"$chain\") nsenter $(t nsenter --target 1 --mount --net -- true) iptables $(readlink -f $(command -v iptables))\"",
   ].join("\n")).catch((error: unknown) => String(error));
   console.log(`# trace-policy-costs ${JSON.stringify(costs)}`);
