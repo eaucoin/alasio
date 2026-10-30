@@ -1,5 +1,5 @@
 /**
- * The cut-over of an installation of the release before (upgrades/from-10.0.1.sh), in how it
+ * The cut-over of an installation of the release before (upgrades/from-10.0.2.sh), in how it
  * runs, without a cluster: its checks and refusals, its point of no return, and how a run
  * again goes on from where one before stopped. The end-to-end run's upgrade shard runs it on
  * an installation of that release (test/e2e/alasio.test.ts).
@@ -12,7 +12,7 @@ import { delimiter, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-const SCRIPT = fileURLToPath(new URL("../upgrades/from-10.0.1.sh", import.meta.url));
+const SCRIPT = fileURLToPath(new URL("../upgrades/from-10.0.2.sh", import.meta.url));
 
 /** The PATH the cut-over runs with: `bin`'s, and the system's. */
 const pathOf = (bin: string) => [bin, "/usr/bin", "/bin"].join(delimiter);
@@ -78,7 +78,7 @@ test("the cut-over checks, upgrades past its point of no return, and says it is 
     assert.equal(run.code, 0, run.said);
     assert.deepEqual(at.ran(), ["check", "upgrade"]);
     assert.deepEqual(at.marks(), ["point-of-no-return", "upgraded"]);
-    assert.match(run.said, /cutting over from 10\.0\.1[^\n]*\n[^\n]* checking that no branch environment exists[^\n]*\n[^\n]* checking that the upgrade can run[^\n]*\n[^\n]* past the point of no return[^\n]*\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+    assert.match(run.said, /cutting over from 10\.0\.2[^\n]*\n[^\n]* checking that no branch environment exists[^\n]*\n[^\n]* checking that the upgrade can run[^\n]*\n[^\n]* past the point of no return[^\n]*\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
   } finally {
     at.remove();
   }
@@ -90,7 +90,7 @@ test("the cut-over refuses a branch environment before it changes anything, nami
     at.namespaces("alasio-branch-one\tone\nalasio-branch-two\ttwo\nalasio-sessions\tone\nother\t\n");
     const refused = at.cutOver();
     assert.notEqual(refused.code, 0);
-    assert.match(refused.said, /FAILED: alasio upgrades main alone, and the branch environments 10\.0\.1 made [^\n]*\(alasio branch delete one, alasio branch delete two\)/u);
+    assert.match(refused.said, /FAILED: alasio upgrades main alone, and the branch environments 10\.0\.2 made [^\n]*\(alasio branch delete one, alasio branch delete two\)/u);
     assert.deepEqual([at.ran(), at.marks()], [[], []]);
     // A namespace labelled for a branch that is not that branch's own is no branch environment.
     at.namespaces("alasio-sessions\tone\n");
