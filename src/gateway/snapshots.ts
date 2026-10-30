@@ -168,6 +168,12 @@ const RESTORE_REFUSED = /OCI runtime restore failed|CompleteRestore|cannot resto
 /** How long a restored pod is waited for to run its containers, its images pulled. */
 const POD_RUNNING_TIMEOUT_MS = 180_000;
 /**
+ * How often a restore's pod is read while it is waited for: its sandbox, restored paused, waits
+ * on the read that finds it running for its resume, a warm restore's about a second and a half
+ * after its pod is made.
+ */
+const POD_POLL = "100 millis";
+/**
  * How long a workspace's restore is deferred for, from its first that was, while what it needs
  * fails for a while (an agent, the bucket, its pod's start, its network policies), before it
  * is bound without its snapshot.
@@ -519,17 +525,17 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
    * The nodes that can restore `manifest` into a pod of `tolerations`, those holding its images
    * first: they have its release, with every CPU feature it was saved with, and take the pod;
    * whether every agent said what its node holds; and whether a node that has them is kept from
-   * the pod only by its readiness.
+   * the pod only by its readiness. Each node's agent, and each Node, is asked at once.
    */
   const nodesFor = (manifest: Manifest, tolerations: readonly V1Toleration[]) =>
     Effect.gen(function*() {
       const found = yield* agents.nodes;
-      const held = yield* Effect.forEach(found, (node) => agents.holdings(node).pipe(Effect.map((holdings) => [holdings]), Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as([])))));
+      const held = yield* Effect.forEach(found, (node) => agents.holdings(node).pipe(Effect.map((holdings) => [holdings]), Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as([])))), { concurrency: "unbounded" });
       const answered = found.length > 0 && held.every((each) => each.length > 0);
       const capable = held.flat().filter(({ releases: installed }) =>
         installed.some(({ release, cpuFeatures }) => release === manifest.release && manifest.cpuFeatures.every((feature) => cpuFeatures.includes(feature)))
       );
-      const takes = yield* Effect.forEach(capable, ({ node }) => schedulable(node, tolerations));
+      const takes = yield* Effect.forEach(capable, ({ node }) => schedulable(node, tolerations), { concurrency: "unbounded" });
       const able = capable.filter((_, index) => takes[index] === "takes");
       const holds = (cached: (typeof able)[number]["cached"]) =>
         cached.some(({ environment: of, workspace, images }) => of === manifest.environment && workspace === manifest.workspace && manifest.layers.every(({ digest }) => images.includes(digest)));
@@ -566,7 +572,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         if (failed !== null) return Effect.fail(new RestoreRefused({ reason: failed.why, resumed: false, failed: failed.refused }));
         return pod && until(pod) ? Effect.succeed(pod) : Effect.fail(new PodNotRunning());
       }),
-      Effect.retry({ while: (error) => error._tag === "PodNotRunning", schedule: Schedule.max([Schedule.spaced("500 millis"), Schedule.during(POD_RUNNING_TIMEOUT_MS)]) }),
+      Effect.retry({ while: (error) => error._tag === "PodNotRunning", schedule: Schedule.max([Schedule.spaced(POD_POLL), Schedule.during(POD_RUNNING_TIMEOUT_MS)]) }),
       Effect.catchTag("PodNotRunning", () => Effect.fail(new RestoreRefused({ reason: `its pod did not ${what} within ${POD_RUNNING_TIMEOUT_MS / 1000} s`, resumed: false }))),
       Effect.catchTag("KubeApiError", (error) => Effect.fail(new RestoreRefused({ reason: error.message, resumed: false }))),
     );
@@ -642,8 +648,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       Effect.gen(function*() {
         if (!snapshots || pool.namespace !== mainNamespace) return null;
         const started = yield* Clock.currentTimeMillis;
-        const record = yield* agents.released(ref(pool, workspace)).pipe(Effect.result);
-        const read = record._tag === "Success" ? yield* agents.current(ref(pool, workspace)).pipe(Effect.result) : record;
+        // Its record and its current snapshot read at once, the restore waiting on both.
+        const [record, current] = yield* Effect.all([agents.released(ref(pool, workspace)).pipe(Effect.result), agents.current(ref(pool, workspace)).pipe(Effect.result)], { concurrency: 2 });
+        const read = record._tag === "Success" ? current : record;
         if (read._tag === "Failure") return yield* (passing(read.failure) ? deferOr : fallBack)(pool, workspace, "unreadable", read.failure.message);
         const manifest = read.success;
         const into = record._tag === "Success" ? record.success : null;
@@ -670,21 +677,27 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         // Each node tried in turn: one that cannot restore it (409) leaves the others; one whose bucket or agent fails may pass.
         const failures: (NodeAgentError | KubeApiError)[] = [];
         for (const node of able.success.nodes) {
-          const prepared = yield* agents.prepare(node, ref(pool, workspace), kept.gofer ?? undefined).pipe(Effect.result);
+          // Named before it is made, as its own directory is by its name (ownDirectory); its workspace
+          // attached there while its snapshot is prepared, before the pod is made, so its sandbox, restored as its bayma
+          // starts, finds every file it held open; and, of one stopped as it ran out of its memory, its bayma's hook told
+          // so, for its sessions' next execs.
+          const name = restorePodName(pool.name, randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7));
+          const [prepared, attached] = yield* Effect.all([
+            agents.prepare(node, ref(pool, workspace), kept.gofer ?? undefined).pipe(Effect.result),
+            attaching.attach(node, name, binding, into?.memoryLimit === undefined ? {} : { [SANDBOX_STOP_REASON_VARIABLE]: `it ran out of its memory (${into.memoryLimit})` }).pipe(Effect.result),
+          ], { concurrency: 2 });
           if (prepared._tag === "Failure") {
             failures.push(prepared.failure);
             yield* Effect.logWarning(prepared.failure.message);
+            // Attached for a pod that is not made: detached.
+            if (attached._tag === "Success") yield* attaching.detach(node, name);
             continue;
           }
+          if (attached._tag === "Failure") return yield* attached.failure;
           // What the agent prepared, which a compaction committed since may have made the one compacted from it.
           const from = prepared.success.manifest;
           yield* Effect.logInfo(`restoring ${named(pool, workspace)} on ${node} from its snapshot ${from.snapshot}, taken at ${from.takenAt} under gVisor ${from.release}`);
           const { [FREE_LABEL]: _free, ...own } = base.metadata?.labels ?? {};
-          // Named before it is made, as its own directory is by its name (ownDirectory); its workspace
-          // attached there first, so its sandbox, restored as its bayma starts, finds every file it held open;
-          // and, of one stopped as it ran out of its memory, its bayma's hook told so, for its sessions' next execs.
-          const name = restorePodName(pool.name, randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7));
-          yield* attaching.attach(node, name, binding, into?.memoryLimit === undefined ? {} : { [SANDBOX_STOP_REASON_VARIABLE]: `it ran out of its memory (${into.memoryLimit})` });
           const spec = ownDirectory({ containers: [], ...base.spec }, pool.namespace, name);
           const pod = yield* kube.create<V1Pod>({
             apiVersion: "v1",
@@ -734,9 +747,13 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           deferredSince.delete(named(pool, workspace));
           restores.add(1, { "alasio.sandbox.restore.outcome": "restored" });
           restoreDuration.record((now - of.started) / 1000);
-          // It moves on from its snapshot, whose images go on as the layers of its next; released into none, until its next release.
-          yield* agents.spend(ref(pool, workspace), of.manifest.snapshot).pipe(Effect.catch((error) => Effect.logWarning(`could not spend the snapshot of ${named(pool, workspace)}, which runs on from it: ${error.message}`)));
-          yield* agents.setReleased(ref(pool, workspace), null).pipe(Effect.catch((error) => Effect.logWarning(`could not clear ${named(pool, workspace)}'s record of its release: ${error.message}`)));
+          // It moves on from its snapshot, whose images go on as the layers of its next; released into none, until its next
+          // release: both at once, before its bind is through, while its binding's Lease is still this bind's, as no release
+          // of it may read its record before it is cleared.
+          yield* Effect.all([
+            agents.spend(ref(pool, workspace), of.manifest.snapshot).pipe(Effect.catch((error) => Effect.logWarning(`could not spend the snapshot of ${named(pool, workspace)}, which runs on from it: ${error.message}`))),
+            agents.setReleased(ref(pool, workspace), null).pipe(Effect.catch((error) => Effect.logWarning(`could not clear ${named(pool, workspace)}'s record of its release: ${error.message}`))),
+          ], { concurrency: 2, discard: true });
           return;
         }
         const { reason: why, resumed, stale, failed } = done.failure;
