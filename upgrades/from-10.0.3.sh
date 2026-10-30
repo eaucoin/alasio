@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# An installation of alasio 10.0.2 upgraded to this release, with what the release needs done
+# An installation of alasio 10.0.3 upgraded to this release, with what the release needs done
 # by hand around its upgrade: what the box's cut-over runs, and what the end-to-end run's
-# upgrade shard proves, on an installation of 10.0.2 it put data in (test/e2e/alasio.test.ts).
+# upgrade shard proves, on an installation of 10.0.3 it put data in (test/e2e/alasio.test.ts).
 # Run as root on the host, kubectl reaching the cluster (KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 # for k3s on this machine). Everything is recorded in OUT, which is to be on a disk that
 # outlives a restart of the machine, as /tmp may not.
 #
-#   UPGRADE=<command> UPGRADE_CHECK=<command> CONFIG=<file> OUT=<dir> [FAIL_AT=<point>] upgrades/from-10.0.2.sh
+#   UPGRADE=<command> UPGRADE_CHECK=<command> CONFIG=<file> OUT=<dir> [FAIL_AT=<point>] upgrades/from-10.0.3.sh
 #
 # CONFIG is the configuration's file, the owner's alasio/config.json, which UPGRADE upgrades
 # by and the steps below read, and change where they say.
@@ -28,7 +28,7 @@
 # as the upgrade shard rehearses a failure at each.
 #
 # It upgrades main alone, as alasio upgrade does, which refuses while a branch environment
-# 10.0.2 made exists: it refuses then too, before it changes anything. Delete each first
+# 10.0.3 made exists: it refuses then too, before it changes anything. Delete each first
 # (alasio branch delete <name>), and make it again once upgraded.
 #
 # The changes this release is made of add their steps to it, with what those steps need:
@@ -37,7 +37,7 @@
 # and END lines, which the flow at the end of the script calls. None changes, before the
 # point of no return, what a run that fails there would have to make again: a step that does
 # brings what makes it again, for the flow to run as such a run ends. None has any yet: the
-# upgrade alone takes an installation of 10.0.2 to this release.
+# upgrade alone takes an installation of 10.0.3 to this release.
 #
 # Run again, it goes on from where it stopped: a run that failed before the point of no
 # return starts over. Once past it (OUT/point-of-no-return), a run again goes on from there,
@@ -59,15 +59,15 @@ command -v kubectl >/dev/null || fail "kubectl is not on root's PATH"
 kubectl get --raw=/readyz >/dev/null 2>&1 || fail "kubectl does not reach the cluster: give it k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
 
 if [ ! -e "$OUT/point-of-no-return" ]; then
-  log "cutting over from 10.0.2, recording in $OUT"
+  log "cutting over from 10.0.3, recording in $OUT"
   # What UPGRADE_CHECK refuses that needs no release to read, read before anything changes.
-  log "checking that no branch environment exists, as the upgrade refuses one 10.0.2 made"
+  log "checking that no branch environment exists, as the upgrade refuses one 10.0.3 made"
   # Each by its own namespace, alasio-branch-<name>, which its sessions' is labelled as too.
   namespaces=$(kubectl get namespace -l alasio.dev/branch -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.alasio\.dev/branch}{"\n"}{end}') ||
     fail "the cluster's namespaces could not be listed, so whether a branch environment exists cannot be told"
   branches=$(printf '%s\n' "$namespaces" | awk -F '\t' 'NF == 2 && $1 == "alasio-branch-" $2 { print $2 }')
   [ -z "$branches" ] ||
-    fail "alasio upgrades main alone, and the branch environments 10.0.2 made would not run on what upgrading changes: delete each first ($(printf '%s\n' "$branches" | awk 'NR > 1 { printf ", " } { printf "alasio branch delete %s", $0 }')), and make them again once alasio is upgraded"
+    fail "alasio upgrades main alone, and the branch environments 10.0.3 made would not run on what upgrading changes: delete each first ($(printf '%s\n' "$branches" | awk 'NR > 1 { printf ", " } { printf "alasio branch delete %s", $0 }')), and make them again once alasio is upgraded"
   log "checking that the upgrade can run (upgrade-check.log)"
   accepted || fail "UPGRADE_CHECK failed, so UPGRADE could not run (upgrade-check.log): $(tail -n 3 "$OUT/upgrade-check.log")"
   [ "${FAIL_AT:-}" != before-the-point-of-no-return ] || fail "a failure injected before the point of no return"
