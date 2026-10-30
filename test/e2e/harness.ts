@@ -121,7 +121,7 @@ export function targetOf(value: string | undefined): "host" | "docker" {
 }
 
 /** The shards of the suites, each run on a cluster of its own. */
-export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents", "wake"] as const;
+export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents", "wake", "trace"] as const;
 export type Shard = (typeof SHARDS)[number];
 
 /** The shard `value` names, or none, when it is unset or empty. */
@@ -148,7 +148,7 @@ export function shardOf(value: string | undefined): Shard | undefined {
 export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
 
 /** The shards whose suites need an installation of their own, run only when selected. */
-const OWN_INSTALLATION: readonly Shard[] = ["snapshots", "upgrade", "agents", "wake"];
+const OWN_INSTALLATION: readonly Shard[] = ["snapshots", "upgrade", "agents", "wake", "trace"];
 
 /** Whether a run of the shard `selected`, or of none, runs the suites of `shard`: the snapshots, upgrade, agents and wake shards' only when selected. */
 export const runsShard = (selected: Shard | undefined, shard: Shard): boolean => selected === shard || (selected === undefined && !OWN_INSTALLATION.includes(shard));
@@ -752,7 +752,8 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       // Never released within the run but in the snapshots, upgrade and wake shards: the other suites
       // reach sessions by exec in their pods, which is no exec of bayma's, and a release would end
       // their pods under them.
-      snapshots: {
+      // Spike: the trace shard's released by its test alone, never saved live.
+      snapshots: SHARD === "trace" ? { releaseAfter: "24h", liveEvery: "24h" } : {
         releaseAfter: SHARD === "snapshots" || SHARD === "upgrade" || SHARD === "wake" ? `${RELEASE_AFTER_SECONDS}s` : "24h",
         // Saved live in the snapshots shard within its test of it, as an exec runs on.
         ...(SHARD === "snapshots" ? { liveEvery: `${LIVE_EVERY_SECONDS}s` } : {}),

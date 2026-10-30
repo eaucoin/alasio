@@ -191,7 +191,7 @@ jobs:
               else [.target, (.agents | tostring), .shard] end;
             def named($word): ($word | split("/")) as $parts | name($parts | length) == $parts;
             [({target: "docker", agents: (0, 2)}, {target: "host", agents: 0}) as $cluster
-              | ("sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents", "wake") as $shard
+              | ("sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents", "wake", "trace") as $shard
               | $cluster + {shard: $shard}
               | select(.shard != "upgrade" or .target == "host")
               | if .target == "host" and .shard == "sessions" then . + {firewall: "ufw"} else . end]
@@ -267,7 +267,13 @@ jobs:
       # alasio's package installed, alasio init and up on a cluster of this runner from the
       # images job's images, the shard's end-to-end tests, and alasio uninstall --purge,
       # which leaves nothing of the cluster on the runner (test/e2e/harness.ts).
-      - run: npm run test:e2e
+      # Spike: the trace shard runs its own file alone.
+      - run: |
+          if [ "$ALASIO_E2E_SHARD" = trace ]; then
+            node --test --test-timeout=7200000 --test-force-exit --test-reporter=spec test/e2e/warm-restore-trace.test.ts
+          else
+            npm run test:e2e
+          fi
         env:
           ALASIO_E2E_TARGET: ${{ matrix.target }}
           ALASIO_E2E_AGENTS: ${{ matrix.agents }}
