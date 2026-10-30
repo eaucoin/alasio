@@ -4,7 +4,7 @@
  * address, with the token the gateway and they are given (ALASIO_NODE_AGENT_TOKEN).
  */
 import type { V1Pod } from "@kubernetes/client-node";
-import { Config, Duration, Effect, Redacted, Schedule, Schema } from "effect";
+import { Config, Duration, Effect, Exit, Redacted, Schedule, Schema } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
@@ -190,6 +190,12 @@ const LONG_CALL = `${OPERATION_LIMIT_SECONDS} seconds` satisfies Duration.Input;
  * seconds.
  */
 const OPERATION_POLLS = Schedule.min([Schedule.exponential("25 millis"), Schedule.spaced("500 millis")]);
+/**
+ * How long the agents' addresses, as their pods were listed, are taken as they are: a
+ * restore's calls of its node's agent, a dozen within a second or two, list them once or
+ * twice, and an agent started again on another address is found within it.
+ */
+const ADDRESSES_TTL: Duration.Input = "1 second";
 /** How long any other call may take. */
 const SHORT_CALL: Duration.Input = "30 seconds";
 /** How long a sandbox's sync may take: what it writes through, which the agent waits a minute for. */
@@ -215,8 +221,8 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
   const fetch = yield* FetchHttpClient.Fetch;
   const token = yield* Config.Redacted(NODE_AGENT_TOKEN_VARIABLE);
 
-  /** Each node's agent's address, by its node. */
-  const addresses: Effect.Effect<ReadonlyMap<string, string>, KubeApiError> = kube.list("v1", "Pod", location.namespace, location.selector).pipe(
+  /** Each node's agent's address, by its node, as their pods were listed within ADDRESSES_TTL; a list that failed is not kept. */
+  const addresses: Effect.Effect<ReadonlyMap<string, string>, KubeApiError> = yield* kube.list("v1", "Pod", location.namespace, location.selector).pipe(
     // Pods, as the API server lists them.
     Effect.map((pods) =>
       new Map((pods as readonly V1Pod[]).flatMap((pod) => {
@@ -224,6 +230,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
         return address && pod.spec?.nodeName ? [[pod.spec.nodeName, `http://${address}:${location.port}`] as const] : [];
       }))
     ),
+    Effect.cachedWithTTL((exit) => (Exit.isSuccess(exit) ? ADDRESSES_TTL : Duration.zero)),
   );
 
   /** A call of the agent of `node`, `what` it is asked as a sentence ends: its answer's status, bytes and text, or why it failed. */

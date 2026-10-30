@@ -2313,8 +2313,8 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
     })
   ));
 
-/** alasio's client of the agents, of which there is `agent`, of node-1, served until the scope closes. */
-const agentsOf = (agent: NodeAgent, workspaces: Workspaces = unusedWorkspaces) =>
+/** alasio's client of the agents, of which there is `agent`, of node-1, served until the scope closes; `listed` told of each list of their pods. */
+const agentsOf = (agent: NodeAgent, workspaces: Workspaces = unusedWorkspaces, listed: () => void = () => {}) =>
   Effect.gen(function*() {
     const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent, workspaces });
     const pod: V1Pod = {
@@ -2323,7 +2323,7 @@ const agentsOf = (agent: NodeAgent, workspaces: Workspaces = unusedWorkspaces) =
       status: { podIP: "127.0.0.1", conditions: [{ type: "Ready", status: "True" }] },
     };
     const unreachable = () => Effect.die("only pods are listed");
-    const kube = KubeClient.of({ read: unreachable, list: () => Effect.succeed([pod]), create: unreachable, replace: unreachable, patch: unreachable, patchPodStatus: unreachable, remove: unreachable, exec: unreachable, watch: () => Stream.die("nothing is watched") });
+    const kube = KubeClient.of({ read: unreachable, list: () => Effect.sync(() => (listed(), [pod])), create: unreachable, replace: unreachable, patch: unreachable, patchPodStatus: unreachable, remove: unreachable, exec: unreachable, watch: () => Stream.die("nothing is watched") });
     return yield* makeNodeAgents({ namespace: "alasio", selector: "app.kubernetes.io/component=node-agent", port }).pipe(
       Effect.provide(Layer.merge(Layer.succeed(KubeClient, kube), ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ALASIO_NODE_AGENT_TOKEN: "the token" } })))),
     );
@@ -2385,6 +2385,22 @@ test("alasio learns a prepare that ends in tens of milliseconds, as one from the
       assert.deepEqual((yield* agents.prepare("node-1", ref)).manifest, RELEASED_MANIFEST);
       const took = Date.now() - asked;
       assert.ok(took < 250, `alasio learned the prepare had ended ${took} ms after it asked for it`);
+    })
+  ));
+
+test("alasio finds the agents' addresses by listing their pods once for the calls of a second, and anew after it", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      let lists = 0;
+      const agents = yield* agentsOf(here.agent, unusedWorkspaces, () => void (lists += 1));
+      const ref = { environment: "main", workspace: "fs-abc" };
+      for (let call = 0; call < 3; call += 1) assert.equal(yield* agents.current(ref), null);
+      assert.deepEqual(yield* agents.nodes, ["node-1"]);
+      assert.equal(lists, 1);
+      yield* Effect.sleep("1100 millis");
+      assert.equal(yield* agents.current(ref), null);
+      assert.equal(lists, 2);
     })
   ));
 
