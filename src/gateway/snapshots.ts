@@ -747,9 +747,13 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           deferredSince.delete(named(pool, workspace));
           restores.add(1, { "alasio.sandbox.restore.outcome": "restored" });
           restoreDuration.record((now - of.started) / 1000);
-          // It moves on from its snapshot, whose images go on as the layers of its next; released into none, until its next release.
-          yield* agents.spend(ref(pool, workspace), of.manifest.snapshot).pipe(Effect.catch((error) => Effect.logWarning(`could not spend the snapshot of ${named(pool, workspace)}, which runs on from it: ${error.message}`)));
-          yield* agents.setReleased(ref(pool, workspace), null).pipe(Effect.catch((error) => Effect.logWarning(`could not clear ${named(pool, workspace)}'s record of its release: ${error.message}`)));
+          // It moves on from its snapshot, whose images go on as the layers of its next; released into none, until its next
+          // release: both at once, before its bind is through, while its binding's Lease is still this bind's, as no release
+          // of it may read its record before it is cleared.
+          yield* Effect.all([
+            agents.spend(ref(pool, workspace), of.manifest.snapshot).pipe(Effect.catch((error) => Effect.logWarning(`could not spend the snapshot of ${named(pool, workspace)}, which runs on from it: ${error.message}`))),
+            agents.setReleased(ref(pool, workspace), null).pipe(Effect.catch((error) => Effect.logWarning(`could not clear ${named(pool, workspace)}'s record of its release: ${error.message}`))),
+          ], { concurrency: 2, discard: true });
           return;
         }
         const { reason: why, resumed, stale, failed } = done.failure;

@@ -1066,6 +1066,32 @@ test("a restore attaches its workspace into its pod's directory while its snapsh
   await Effect.runPromise(Fiber.interrupt(binding));
 });
 
+test("a restore spends its snapshot and clears its workspace's record of its release at once, once its sandbox is resumed", async () => {
+  const env = await environment(1, { gvisor: true });
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
+  const snapshot = "20261017T120000000Z-00000010";
+  const recorded = restoringAgents(manifestOf(env, "fs-spent", snapshot), { snapshot, release: "r1" });
+  const [spending, clearing] = [Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>()];
+  const agents: NodeAgents = {
+    ...recorded.agents,
+    spend: (ref, spent) => together(spending, clearing, "spend", null).pipe(Effect.andThen(recorded.agents.spend(ref, spent))),
+    setReleased: (ref, into) => (into === null ? together(clearing, spending, "clear its record", null) : Effect.void).pipe(Effect.andThen(recorded.agents.setReleased(ref, into))),
+  };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), agents);
+  const key = sessionKey("fs-spent");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const binding = Effect.runPromise(binder.bind(placement.pool, key, placement));
+  const name = (await restorePodOf(env)).metadata?.name ?? "";
+  await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-spent", state: { running: {} } }] } })));
+  // Ready once resumed, as kubelet would make it; its bind through once its snapshot is spent and its record cleared.
+  for (const deadline = Date.now() + 10_000; !recorded.asked.includes(`record ${env.namespace}/fs-spent released into none`); await new Promise((resolve) => setTimeout(resolve, 50))) {
+    assert.ok(Date.now() < deadline, `its record was not cleared: ${recorded.asked.join(", ")}`);
+  }
+  await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { conditions: [{ type: "Ready", status: "True" }] } })));
+  assert.equal((await binding).pod, name);
+  assert.deepEqual([recorded.state.current, recorded.state.released], [null, null]);
+});
+
 test("what a restore attached beside a prepare that failed is detached: the restore deferred where the failure may pass, fallen back where its snapshot is corrupt", async () => {
   for (const [prepare, outcome] of [["fails", "deferred"], ["finds it corrupt", "fallback"]] as const) {
     const env = await environment(1, { gvisor: true });
