@@ -75,7 +75,7 @@ import { Clock, type Duration, Effect, RcMap, Schedule, Schema, type Scope, Sema
 import { quantityOf } from "../kube/quantity.ts";
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
-import { withLogScope } from "../shared/log.ts";
+import { trace, withLogScope } from "../shared/log.ts";
 import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCache } from "./cache.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { egressGap, type PodAddress } from "./kube-router.ts";
@@ -1296,6 +1296,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     exclusive(
       [ref],
       Effect.gen(function*() {
+        yield* trace(`${ref.workspace} agent prepare`);
         // A restore of the workspace before this one is done with, its reads of the bucket with it.
         storeProxy.revoke(prefixOf(ref));
         const manifest = yield* current(ref);
@@ -1393,6 +1394,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         yield* Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": "prepared", "alasio.node_agent.prepare.source": source }));
         yield* Effect.annotateCurrentSpan({ "alasio.snapshot.source": source, "alasio.snapshot.bytes": manifest.bytes, "alasio.snapshot.prepare_ms": preparedMs });
         yield* Effect.logInfo(`prepared the snapshot ${snapshot} of ${prefixOf(manifest)} from the ${source}: ${manifest.bytes} bytes in ${preparedMs} ms`);
+        yield* trace(`${ref.workspace} agent prepared`);
         return { manifest, imagePath, source };
       }),
     ).pipe(
@@ -1547,16 +1549,21 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   const resume = (request: ResumeRequest): Effect.Effect<void, ResumeError> =>
     Effect.gen(function*() {
+      yield* trace(`${request.workspace} agent resume-asked`);
       const waited = yield* policiesInForce(request);
+      yield* trace(`${request.workspace} agent policies-in-force ${waited}`);
       yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
       const containers = yield* Effect.forEach(request.containerIds, (id) => ofPod(id, request.namespace, request.pod));
       const from = yield* restoredFrom(request);
       if (from.live !== undefined) yield* holdsStill(from, from.live, containers);
+      yield* trace(`${request.workspace} agent containers-found`);
       yield* Effect.forEach(request.podIPs, forgetConnections, { discard: true });
+      yield* trace(`${request.workspace} agent connections-forgotten`);
       // Its restore reads what its sandbox did not touch first in the background, for a while yet, from its resume on: bayma's
       // hook, which runsc's resume runs, waits on those reads of the pages it touches, however long after the prepare.
       storeProxy.resumed(prefixOf(request), backgroundReadMs);
       yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
+      yield* trace(`${request.workspace} agent runsc-resumed`);
       // Its sandbox runs from the snapshot it was restored from, which its next checkpoint saves what changed since.
       for (const id of request.containerIds) bases.set(id, from);
       return waited;

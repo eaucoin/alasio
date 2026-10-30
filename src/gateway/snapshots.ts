@@ -72,7 +72,7 @@ import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SANDBOX_STOP_REASON_VARIABLE, SESSION_TEMPLATE_ANNOTATION, STOP_WAIT_ARG } from "../kube/sandbox-shape.ts";
 import type { Manifest } from "../node-agent/agent.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
-import { withLogScope } from "../shared/log.ts";
+import { trace, withLogScope } from "../shared/log.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
 import { type GatewaySnapshots as SnapshotsConfig, ownDirectory, restorePodName } from "./names.ts";
 
@@ -587,6 +587,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         (pod) => (pod.status?.containerStatuses ?? []).length > 0 && (pod.status?.containerStatuses ?? []).every(({ state }) => state?.running) && (pod.status?.podIPs?.length ?? 0) > 0,
         "run",
       );
+      yield* trace(`${workspace} gateway saw-running ${running.status?.containerStatuses?.[0]?.state?.running?.startedAt ?? ""}`);
       const containerIds = (running.status?.containerStatuses ?? []).flatMap(({ containerID }) => (containerID ? [containerID.replace(/^[a-z]+:\/\//u, "")] : []));
       const podIPs = (running.status?.podIPs ?? []).map(({ ip }) => ip);
       // The policies that select it, which its node's rules for it must name.
@@ -594,6 +595,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         Effect.map((found) => (found as V1NetworkPolicy[]).filter(({ spec }) => selects(spec?.podSelector, running.metadata?.labels ?? {})).flatMap(({ metadata }) => metadata?.name ?? [])),
         Effect.mapError((error) => new RestoreRefused({ reason: error.message, resumed: false })),
       );
+      yield* trace(`${workspace} gateway policies-listed`);
       // Paused where its policies are not in force (504), or where the bucket fails (502), which
       // may pass; of any other failure its sandbox may have run; paused, too, where the snapshot
       // was taken live and holds the session no more (410), which no try restores.
@@ -603,10 +605,12 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           return new RestoreRefused({ reason: error.message, resumed: status !== 502 && status !== 504 && status !== 410, ...(status === 410 ? { stale: true } : {}) });
         }),
       );
+      yield* trace(`${workspace} gateway resumed`);
       const now = new Date(yield* Clock.currentTimeMillis).toISOString();
       yield* kube.patchPodStatus(pool.namespace, name, { status: { conditions: [{ type: RESUMED_CONDITION, status: "True", lastTransitionTime: now }] } }).pipe(
         Effect.mapError((error) => new RestoreRefused({ reason: `its readiness could not be set: ${error.message}`, resumed: true })),
       );
+      yield* trace(`${workspace} gateway condition-set`);
     });
 
   /** Has the agent of `node` abandon the restore into the pod `name`, refused before its sandbox resumed, as alasio's were: what runsc runs for it killed. */
@@ -642,8 +646,11 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       Effect.gen(function*() {
         if (!snapshots || pool.namespace !== mainNamespace) return null;
         const started = yield* Clock.currentTimeMillis;
+        yield* trace(`${workspace} gateway make`);
         const record = yield* agents.released(ref(pool, workspace)).pipe(Effect.result);
+        yield* trace(`${workspace} gateway record-read`);
         const read = record._tag === "Success" ? yield* agents.current(ref(pool, workspace)).pipe(Effect.result) : record;
+        yield* trace(`${workspace} gateway current-read`);
         if (read._tag === "Failure") return yield* (passing(read.failure) ? deferOr : fallBack)(pool, workspace, "unreadable", read.failure.message);
         const manifest = read.success;
         const into = record._tag === "Success" ? record.success : null;
@@ -661,6 +668,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         const base = templateOf(mode, manifest.podTemplate as V1PodTemplateSpec);
         if (!base) return yield* fallBack(pool, workspace, "template", "the pool's template it was taken on is no longer kept");
         const able = yield* nodesFor(manifest, base.spec?.tolerations ?? []).pipe(Effect.result);
+        yield* trace(`${workspace} gateway nodes-found`);
         if (able._tag === "Failure") return yield* deferOr(pool, workspace, "unreadable", able.failure.message);
         if (able.success.nodes.length === 0) {
           const none = `no node that takes its pod has gVisor ${manifest.release} and every CPU feature it was saved with`;
@@ -671,6 +679,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         const failures: (NodeAgentError | KubeApiError)[] = [];
         for (const node of able.success.nodes) {
           const prepared = yield* agents.prepare(node, ref(pool, workspace), kept.gofer ?? undefined).pipe(Effect.result);
+          yield* trace(`${workspace} gateway prepared`);
           if (prepared._tag === "Failure") {
             failures.push(prepared.failure);
             yield* Effect.logWarning(prepared.failure.message);
@@ -684,7 +693,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           // attached there first, so its sandbox, restored as its bayma starts, finds every file it held open;
           // and, of one stopped as it ran out of its memory, its bayma's hook told so, for its sessions' next execs.
           const name = restorePodName(pool.name, randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7));
+          yield* trace(`${workspace} gateway attach`);
           yield* attaching.attach(node, name, binding, into?.memoryLimit === undefined ? {} : { [SANDBOX_STOP_REASON_VARIABLE]: `it ran out of its memory (${into.memoryLimit})` });
+          yield* trace(`${workspace} gateway attached`);
           const spec = ownDirectory({ containers: [], ...base.spec }, pool.namespace, name);
           const pod = yield* kube.create<V1Pod>({
             apiVersion: "v1",
@@ -710,6 +721,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             Effect.tapError(() => attaching.detach(node, name)),
             Effect.mapError((error) => new BindStepFailed({ reason: `its restore's pod could not be made: ${error.message}` })),
           );
+          yield* trace(`${workspace} gateway pod-created ${name}`);
           restored = { pod: pod.metadata?.name ?? "", node, snapshot: from.snapshot, bytes: from.bytes, manifest, started };
           return pod;
         }
@@ -737,6 +749,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           // It moves on from its snapshot, whose images go on as the layers of its next; released into none, until its next release.
           yield* agents.spend(ref(pool, workspace), of.manifest.snapshot).pipe(Effect.catch((error) => Effect.logWarning(`could not spend the snapshot of ${named(pool, workspace)}, which runs on from it: ${error.message}`)));
           yield* agents.setReleased(ref(pool, workspace), null).pipe(Effect.catch((error) => Effect.logWarning(`could not clear ${named(pool, workspace)}'s record of its release: ${error.message}`)));
+          yield* trace(`${workspace} gateway spent`);
           return;
         }
         const { reason: why, resumed, stale, failed } = done.failure;
