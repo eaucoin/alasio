@@ -31,6 +31,18 @@ const SETTLE_MS = 10_000;
 const WATCH_MS = 50;
 const RUNSC_LOGS = "/var/log/runsc";
 
+/**
+ * What starting a process costs in the restored sandbox, as runsc's resume runs bayma's hook: each
+ * of node alone, node with node:net loaded, and bayma's own bundle, as its hook starts, three
+ * times each, in milliseconds.
+ */
+const HOOK_COSTS = [
+  "t() { a=$(date +%s%N); \"$@\" >/dev/null 2>&1; b=$(date +%s%N); echo \"$(( (b - a) / 1000000 ))\"; }",
+  "for i in 1 2 3; do",
+  "  echo \"node $(t node -e 0) net $(t node -e 'require(\"node:net\")') bayma $(t node /opt/bayma/bayma.js --version) true $(t true)\"",
+  "done",
+].join("\n");
+
 /** What the pod looked like, first seen so, by when. */
 type Seen = Record<string, number>;
 
@@ -98,7 +110,7 @@ function bootLineMs(line: string, day: number): number | null {
 
 /** Of the boot log of the restore's pod sandbox, its first line's time and those of the lines that say how its restore went. */
 async function bootTrace(node: string, pod: string, day: number): Promise<{ readonly seen: Seen; readonly said: string[] }> {
-  const sandbox = (await onNode(node, `k3s crictl pods --name '^${pod}$' --namespace ${SESSIONS} -q | head -n 1`)).trim();
+  const sandbox = (await onNode(node, `(k3s crictl pods --name '^${pod}$' --namespace ${SESSIONS} -q 2>/dev/null || crictl pods --name '^${pod}$' --namespace ${SESSIONS} -q) | head -n 1`)).trim();
   if (sandbox === "") return { seen: {}, said: ["no sandbox"] };
   const lines = (await onNode(node, `cat ${RUNSC_LOGS}/${sandbox}/runsc.log.*.boot.txt 2>/dev/null || true`)).split("\n");
   const seen: Seen = {};
@@ -163,7 +175,7 @@ async function runOnce(run: number): Promise<void> {
   const day = Number(client["asked"]);
   const boot = await bootTrace(node, pod, day).catch((error: unknown) => ({ seen: {}, said: [String(error)] }));
   const steps: Seen = {
-    ...Object.fromEntries(["asked", "connecting", "connected", "acquired", "answered"].map((step) => [`client ${step}`, Number(client[step])])),
+    ...Object.fromEntries(["asked", "connecting", "connected", "acquired", "answered", "again"].map((step) => [`client ${step}`, Number(client[step])])),
     ...Object.fromEntries(Object.entries(seen).map(([step, at]) => [`api ${step}`, at])),
     ...(await gatewayTrace(workspace, Number(client["connecting"]))),
     ...(await agentTrace(node, workspace, Number(client["connecting"]))),
@@ -172,7 +184,8 @@ async function runOnce(run: number): Promise<void> {
   const zero = steps["client connecting"] ?? 0;
   const timeline = Object.entries(steps).filter(([, at]) => at > 0).map(([step, at]) => [step, at - zero] as const).toSorted(([, a], [, b]) => a - b);
   const said = Object.keys(steps).filter((step) => steps[step] === 0);
-  console.log(`# trace-run ${JSON.stringify({ run, target: TARGET, workspace, pod, node, notice: client["notice"], live: client["live"], timeline, said, boot: boot.said, events: await eventsOf(pod), kubelet: await kubeletOf(pod) })}`);
+  const starts = await kube.execOk(SESSIONS, pod, ["sh", "-c", HOOK_COSTS], { container: "bayma" }).catch((error: unknown) => String(error));
+  console.log(`# trace-run ${JSON.stringify({ run, target: TARGET, workspace, pod, node, notice: client["notice"], live: client["live"], timeline, said, starts, boot: boot.said, events: await eventsOf(pod), kubelet: await kubeletOf(pod) })}`);
   await release(workspace);
   for (const deadline = Date.now() + 300_000; Date.now() < deadline; await sleep(3000)) {
     const removed = await gatewayCall(await mainToken(workspace), "DELETE", "/workspace");
