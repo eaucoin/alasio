@@ -78,7 +78,7 @@ import { meter, withAlasioSpan } from "../telemetry/index.ts";
 import { withLogScope } from "../shared/log.ts";
 import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCache } from "./cache.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
-import { egressGap, type PodAddress } from "./kube-router.ts";
+import { type Listing, listedEgressGap, type PodAddress } from "./kube-router.ts";
 import { backgroundReadSeconds, restoresFromBucket, runscVersion, STORE_SOCKET_ENDPOINT } from "./names.ts";
 import { type ReleaseNotInstalled, type Runsc, type RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
 import type { S3Bucket, S3Error } from "./s3.ts";
@@ -1429,9 +1429,17 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       return [...images].sort();
     });
 
+  /**
+   * The chain `chain` of the filter table of `ip`'s family on the node, as iptables lists it;
+   * unlisted where iptables exits 1, as it does for a chain there is not, saying why.
+   */
+  const listed = (ip: string) => (chain: string): Effect.Effect<Listing, HostCommandError> =>
+    onNode(host, [isIPv6(ip) ? "ip6tables" : "iptables", "-t", "filter", "-S", chain], ({ exitCode }) => exitCode === 0 || exitCode === 1).pipe(
+      Effect.map(({ exitCode, stdout, stderr }) => (exitCode === 0 ? { rules: stdout } : { unlisted: stderr.trim() || "it exited 1" })),
+    );
+
   /** What of its rules a pod's address lacks in its family's filter table on the node, as ./kube-router.ts says, or null. */
-  const policyGap = (address: PodAddress): Effect.Effect<string | null, HostCommandError> =>
-    onNode(host, [isIPv6(address.ip) ? "ip6tables-save" : "iptables-save", "-t", "filter"]).pipe(Effect.map(({ stdout }) => egressGap(stdout, address)));
+  const policyGap = (address: PodAddress): Effect.Effect<string | null, HostCommandError> => listedEgressGap(listed(address.ip), address);
 
   /** Waits for every address of the pod's to have its rules, POLICY_WAIT_MS at most: how long it waited, in milliseconds. */
   const policiesInForce = ({ namespace, pod, podIPs, policies }: ResumeRequest): Effect.Effect<number, PoliciesNotInForce | HostCommandError> =>

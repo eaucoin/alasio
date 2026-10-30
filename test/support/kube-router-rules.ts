@@ -161,3 +161,14 @@ export function filterTable(pods: readonly FixturePod[], { family = 4, sync = "1
     "",
   ].join("\n");
 }
+
+/**
+ * What `iptables -t filter -S <chain>` (`ip6tables` of `family` 6) answers on a node whose filter
+ * table is `table`: the chain's rules, after the line that makes it, as iptables-nft prints them;
+ * or, of a chain there is not, what iptables-nft says of one, as it exits 1.
+ */
+export function listChain(table: string, chain: string, family: 4 | 6 = 4): { readonly exitCode: number; readonly stdout: string; readonly stderr: string } {
+  const lines = table.split("\n");
+  if (!lines.includes(`:${chain} - [0:0]`)) return { exitCode: 1, stdout: "", stderr: `${family === 6 ? "ip6tables" : "iptables"}: Incompatible with this kernel.\n` };
+  return { exitCode: 0, stdout: [`-N ${chain}`, ...lines.filter((line) => line.startsWith(`-A ${chain} `))].map((line) => `${line}\n`).join(""), stderr: "" };
+}

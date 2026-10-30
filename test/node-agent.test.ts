@@ -45,7 +45,7 @@ import {
 } from "../src/node-agent/agent.ts";
 import { LAYERS_DIR, makeSnapshotCache, RESERVE_BYTES, type SnapshotCache, type Spared } from "../src/node-agent/cache.ts";
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
-import { egressGap } from "../src/node-agent/kube-router.ts";
+import { egressGap, listedEgressGap, type PodAddress } from "../src/node-agent/kube-router.ts";
 import { makeRunsc, type Runsc, runscFlags } from "../src/node-agent/runsc.ts";
 import { makeS3Bucket, sigV4Authorization } from "../src/node-agent/s3.ts";
 import { makeStoreProxy, type StoreProxy } from "../src/node-agent/store-proxy.ts";
@@ -58,7 +58,7 @@ import { workspacesNode } from "./support/node-workspaces.ts";
 import { makeNodeAgents } from "../src/sandbox/node-agents.ts";
 import { type FakeReleases, fakeReleases, POD_UID } from "./support/fake-runsc.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
-import { clusterDns, filterTable, sessionPod } from "./support/kube-router-rules.ts";
+import { clusterDns, filterTable, listChain, sessionPod } from "./support/kube-router-rules.ts";
 
 /** node:fs as CommonJS has it, whose exports node:fs's ESM ones are synced to (syncBuiltinESMExports). */
 const builtinFs = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
@@ -175,8 +175,9 @@ function fakeHost(): FakeHost {
         Effect.sync(() => {
           fake.ran.push([...command]);
           const [program] = command;
+          const chain = command.at(-1) ?? "";
           return fake.answer(command) ??
-            (program === "conntrack" ? NO_CONNECTIONS : { exitCode: 0, stdout: program === "ip6tables-save" ? fake.ipv6 : fake.ipv4, stderr: "" });
+            (program === "conntrack" ? NO_CONNECTIONS : program === "ip6tables" ? listChain(fake.ipv6, chain, 6) : listChain(fake.ipv4, chain));
         }),
     },
   };
@@ -2037,6 +2038,59 @@ test("a pod's address has kube-router's rules once a jump of what it sends, comm
   assert.equal(gap(programmed, { ...address, ip: POD_IPV6 }), noJump);
 });
 
+const FORWARD = "KUBE-ROUTER-FORWARD";
+/** The command that lists `chain` of the filter table of `family` on a node. */
+const listing = (family: 4 | 6, chain: string) => [family === 6 ? "ip6tables" : "iptables", "-t", "filter", "-S", chain];
+/** The chain of POD's of the filter table `table`, as its jump of what POD sends names it. */
+const podChainOf = (table: string): string => new RegExp(`rule to jump traffic from POD name:${POD} namespace: ${SESSIONS} to chain (KUBE-POD-FW-[A-Z2-7]{16})`, "u").exec(table)?.[1] ?? "";
+
+test("a pod's rules read from KUBE-ROUTER-FORWARD and its own chain alone are found in force, or not, as the whole filter table finds them", () => {
+  const address = { namespace: SESSIONS, pod: POD, ip: POD_IP, policies: SESSION_POLICIES };
+  const programmed = filterTable([clusterDns("10.42.0.3"), sessionPod("fs-other", "10.42.0.9"), sessionPod(POD, POD_IP)]);
+  const rejection = `--comment "rule to REJECT traffic destined for POD name:${POD} namespace: ${SESSIONS}" -m mark ! --mark 0x10000/0x10000 -j REJECT`;
+  const withRejection = (instead: string | null) => programmed.split("\n").flatMap((line) => (line.includes(rejection) ? (instead === null ? [] : [line.replace(rejection, instead)]) : [line])).join("\n");
+  // Every table and address the whole table's check is proven on (egressGap's test, above).
+  const cases: [string, PodAddress, 4 | 6][] = [
+    [programmed, address, 4],
+    [filterTable([sessionPod(POD, POD_IP)], { sync: "1791844099000000000" }), address, 4],
+    [filterTable([clusterDns("10.42.0.3"), sessionPod("fs-other", "10.42.0.9")]), address, 4],
+    [filterTable([sessionPod("fs-old999", POD_IP)]), address, 4],
+    [filterTable([sessionPod("fs-abc1234", POD_IP)]), address, 4],
+    [filterTable([sessionPod(POD, POD_IP, "alasio-sessions-br-1")]), address, 4],
+    [programmed, { ...address, ip: "10.42.0.1" }, 4],
+    [filterTable([{ namespace: SESSIONS, pod: POD, ip: POD_IP, policies: [] }]), { ...address, policies: [] }, 4],
+    [filterTable([{ namespace: SESSIONS, pod: POD, ip: POD_IP, policies: [{ name: "bayma-from-alasio", type: "ingress" }] }]), { ...address, policies: ["bayma-from-alasio"] }, 4],
+    [filterTable([{ namespace: SESSIONS, pod: POD, ip: POD_IP, policies: [{ name: "telemetry-to-alasio", type: "egress" }] }]), { ...address, policies: ["telemetry-to-alasio"] }, 4],
+    [filterTable([{ ...sessionPod(POD, POD_IP), policies: [...sessionPod(POD, POD_IP).policies, { name: "internet-from-full", type: "egress" }] }]), address, 4],
+    [programmed, { ...address, policies: [...SESSION_POLICIES, "internet-from-full"] }, 4],
+    [programmed.replace(/(nw policy [a-z-]+" -j )KUBE-NWPLCY-[A-Z2-7]{16}/gu, (_jump, kept: string) => `${kept}ACCEPT`), address, 4],
+    [withRejection(null), address, 4],
+    [withRejection(rejection.replace(" ! --mark", " --mark")), address, 4],
+    [withRejection(rejection.replace("0x10000/0x10000", "0x20000/0x20000")), address, 4],
+    [withRejection(rejection.replace("namespace: alasio-sessions", "namespace: alasio")), address, 4],
+    [filterTable([sessionPod(POD, POD_IPV6)], { family: 6 }), { ...address, ip: POD_IPV6 }, 6],
+    [programmed, { ...address, ip: POD_IPV6 }, 6],
+  ];
+  const listedGap = (table: string, of: PodAddress, family: 4 | 6) =>
+    Effect.runSync(listedEgressGap((chain) => {
+      const { exitCode, stdout, stderr } = listChain(table, chain, family);
+      return Effect.succeed(exitCode === 0 ? { rules: stdout } : { unlisted: stderr.trim() });
+    }, of));
+  for (const [table, of, family] of cases) assert.equal(listedGap(table, of, family), egressGap(table, of), `${of.ip} as ${of.policies.join(", ")}`);
+
+  // Before kube-router made its chains, none of the rules is there: neither in force, KUBE-ROUTER-FORWARD not listed.
+  const unmade = programmed.split("\n").filter((line) => !/^(:|-A )KUBE-ROUTER-FORWARD /u.test(line)).join("\n");
+  assert.notEqual(egressGap(unmade, address), null);
+  assert.equal(listedGap(unmade, address, 4), "KUBE-ROUTER-FORWARD could not be listed: iptables: Incompatible with this kernel.");
+  // A sync between the two lists, which named the pod's chain anew: the chain the first found is gone, not in force until a look finds both of one sync.
+  const resynced = filterTable([sessionPod(POD, POD_IP)], { sync: "1791844099000000000" });
+  const across = Effect.runSync(listedEgressGap((chain) => {
+    const { exitCode, stdout, stderr } = listChain(chain === FORWARD ? programmed : resynced, chain);
+    return Effect.succeed(exitCode === 0 ? { rules: stdout } : { unlisted: stderr.trim() });
+  }, address));
+  assert.equal(across, `the chain of ${SESSIONS}/${POD}, ${podChainOf(programmed)}, could not be listed: iptables: Incompatible with this kernel.`);
+});
+
 test("a resume waits for the pod's rules on every address, forgets the connections tracked from them, then resumes each container", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
@@ -2047,19 +2101,21 @@ test("a resume waits for the pod's rules on every address, forgets the connectio
       host.ipv4 = filterTable([clusterDns("10.42.0.3"), sessionPod("fs-old999", POD_IP)]);
       const resuming = yield* Effect.forkChild(here.agent.resume(resumeRequest(snapshot, [POD_IP, POD_IPV6])));
       yield* TestClock.adjust("1 second");
-      // Looked for every 250 ms, its sandbox untouched meanwhile.
+      // Looked for every 250 ms, its sandbox untouched meanwhile: KUBE-ROUTER-FORWARD of each family, which has no jump of its IPv4 address's yet.
       assert.equal(resuming.pollUnsafe(), undefined);
-      assert.deepEqual(host.ran.slice(0, 2), [["iptables-save", "-t", "filter"], ["ip6tables-save", "-t", "filter"]]);
-      assert.equal(host.ran.length, 10);
+      assert.deepEqual(host.ran.slice(0, 3), [listing(4, FORWARD), listing(6, FORWARD), listing(6, podChainOf(host.ipv6))]);
+      assert.equal(host.ran.length, 15);
       assert.deepEqual(here.releases.calls(RELEASE), []);
 
       host.ipv4 = programmed;
       host.answer = (command) => (command[0] === "conntrack" && command.includes(POD_IPV6) ? { exitCode: 0, stdout: "", stderr: "conntrack v1.4.8 (conntrack-tools): 2 flow entries have been deleted.\n" } : null);
       yield* TestClock.adjust("250 millis");
       yield* Fiber.join(resuming);
-      assert.deepEqual(host.ran.slice(10), [
-        ["iptables-save", "-t", "filter"],
-        ["ip6tables-save", "-t", "filter"],
+      assert.deepEqual(host.ran.slice(15), [
+        listing(4, FORWARD),
+        listing(4, podChainOf(programmed)),
+        listing(6, FORWARD),
+        listing(6, podChainOf(host.ipv6)),
         ["conntrack", "-D", "-s", POD_IP],
         ["conntrack", "-D", "-s", POD_IPV6, "-f", "ipv6"],
       ]);
@@ -2092,11 +2148,11 @@ test("a resume whose pod's rules do not come within its wait, or whose commands 
       assert.deepEqual(here.releases.calls(RELEASE), []);
       host.ipv6 = programmed;
 
-      // The node has no ip6tables-save, as nsenter says.
-      host.answer = ([program]) => (program === "ip6tables-save" ? { exitCode: 127, stdout: "", stderr: "nsenter: failed to execute ip6tables-save: No such file or directory\n" } : null);
+      // The node has no ip6tables, as nsenter says.
+      host.answer = ([program]) => (program === "ip6tables" ? { exitCode: 127, stdout: "", stderr: "nsenter: failed to execute ip6tables: No such file or directory\n" } : null);
       assert.equal(
         failure(yield* Effect.exit(here.agent.resume(resumeRequest(snapshot, [POD_IPV6])))),
-        "ip6tables-save -t filter on the node failed: nsenter: failed to execute ip6tables-save: No such file or directory",
+        "ip6tables -t filter -S KUBE-ROUTER-FORWARD on the node failed: nsenter: failed to execute ip6tables: No such file or directory",
       );
 
       // conntrack fails, as it does deleting none.
