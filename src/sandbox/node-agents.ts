@@ -183,8 +183,13 @@ export interface BindingRequest extends PodOwner {
 
 /** How long a checkpoint, a prepare or a copy may take. */
 const LONG_CALL = `${OPERATION_LIMIT_SECONDS} seconds` satisfies Duration.Input;
-/** How often alasio asks an agent how a checkpoint or a prepare it started stands. */
-const OPERATION_POLL: Duration.Input = "500 millis";
+/**
+ * How often alasio asks an agent how a checkpoint or a prepare it started stands: 25 ms after
+ * it last asked, then twice as long each time, half a second at most, as a prepare from the
+ * node's cache ends in tens of milliseconds, which a restore waits on, and a checkpoint takes
+ * seconds.
+ */
+const OPERATION_POLLS = Schedule.min([Schedule.exponential("25 millis"), Schedule.spaced("500 millis")]);
 /** How long any other call may take. */
 const SHORT_CALL: Duration.Input = "30 seconds";
 /** How long a sandbox's sync may take: what it writes through, which the agent waits a minute for. */
@@ -272,7 +277,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
       yield* send(node, what, { method: "POST", path, body: request, timeout: SHORT_CALL });
       const standing = { method: "GET", path: `${path}/${encodeURIComponent(request.environment)}/${encodeURIComponent(request.workspace)}`, timeout: SHORT_CALL } as const;
       const ended = yield* ask(node, what, standing, OutcomeOf(value)).pipe(
-        Effect.repeat({ schedule: Schedule.spaced(OPERATION_POLL), while: ({ state }) => state === "running" }),
+        Effect.repeat({ schedule: OPERATION_POLLS, while: ({ state }) => state === "running" }),
         Effect.timeoutOrElse({ duration: LONG_CALL, orElse: () => Effect.fail(new NodeAgentError({ node, call: what, reason: `it had not ended within ${LONG_CALL}` })) }),
       );
       if (ended.state === "done") return ended.value;

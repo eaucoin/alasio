@@ -123,25 +123,27 @@ const RELEASED = "20261013T000000000Z-0000000a";
 /** How long a resumed restore of the test's may read the bucket through an agent. */
 const BACKGROUND_READ_MS = 30 * 60_000;
 
+/** The manifest of a snapshot of fs-abc a release took, RELEASED. */
+const RELEASED_MANIFEST: Manifest = {
+  environment: "main",
+  workspace: "fs-abc",
+  snapshot: RELEASED,
+  release: RELEASE,
+  cpuFeatures: [],
+  podTemplate: POD_TEMPLATE,
+  layers: [{ digest: "a".repeat(64), files: [] }],
+  bytes: 0,
+  takenAt: "2026-10-13T00:00:00.000Z",
+  pauseMs: 0,
+  uploadMs: 0,
+};
+
 /**
  * Puts in the bucket the manifest of a snapshot of fs-abc a release took, RELEASED, as one
  * the sandbox a resume names was restored from: its id.
  */
 const released = (s3: FakeS3): string => {
-  const manifest: Manifest = {
-    environment: "main",
-    workspace: "fs-abc",
-    snapshot: RELEASED,
-    release: RELEASE,
-    cpuFeatures: [],
-    podTemplate: POD_TEMPLATE,
-    layers: [{ digest: "a".repeat(64), files: [] }],
-    bytes: 0,
-    takenAt: "2026-10-13T00:00:00.000Z",
-    pauseMs: 0,
-    uploadMs: 0,
-  };
-  s3.objects.set(`main/fs-abc/manifests/${RELEASED}.json`, Buffer.from(JSON.stringify(manifest)));
+  s3.objects.set(`main/fs-abc/manifests/${RELEASED}.json`, Buffer.from(JSON.stringify(RELEASED_MANIFEST)));
   return RELEASED;
 };
 
@@ -2370,6 +2372,19 @@ test("a checkpoint alasio stops waiting for goes on, one asked for meanwhile is 
       const unprepared = yield* Effect.flip(agents.prepare("node-1", { environment: "main", workspace: "fs-none" }));
       assert.equal(unprepared.message, "the node agent of node-1 could not prepare main/fs-none's snapshot: main/fs-none has no snapshot");
       assert.equal(unprepared._tag === "NodeAgentError" && unprepared.status, 404);
+    })
+  ));
+
+test("alasio learns a prepare that ends in tens of milliseconds, as one from the node's cache does, has ended within tens more", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const ref = { environment: "main", workspace: "fs-abc" };
+      const agents = yield* agentsOf({ ...here.agent, prepare: () => Effect.sleep("40 millis").pipe(Effect.as({ manifest: RELEASED_MANIFEST, imagePath: `/var/lib/alasio/snapshots/main/fs-abc/${RELEASED}`, source: "cache" as const })) });
+      const asked = Date.now();
+      assert.deepEqual((yield* agents.prepare("node-1", ref)).manifest, RELEASED_MANIFEST);
+      const took = Date.now() - asked;
+      assert.ok(took < 250, `alasio learned the prepare had ended ${took} ms after it asked for it`);
     })
   ));
 
