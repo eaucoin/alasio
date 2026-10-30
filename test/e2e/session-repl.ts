@@ -108,8 +108,10 @@ try {
     const acquired = Date.now();
     const { stdout, notice } = await exec(client, argument, "console.log(JSON.stringify({ live: globalThis.kept ?? null, checkpointed: $checkpoint?.kept ?? null }))");
     const answered = Date.now();
+    await exec(client, argument, "console.log(1)");
+    const again = Date.now();
     await release(client, argument);
-    console.log(JSON.stringify({ ...JSON.parse(stdout), notice, asked, connecting, connected, acquired, answered }));
+    console.log(JSON.stringify({ ...JSON.parse(stdout), notice, asked, connecting, connected, acquired, answered, again }));
   } else if (verb === "set") {
     const { session } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "bun", title: "e2e", cwd: "/workspace" });
     const value = JSON.stringify(argument);
