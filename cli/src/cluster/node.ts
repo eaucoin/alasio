@@ -160,6 +160,9 @@ export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
     "kubelet-arg": KUBELET_ARGS,
     "snapshotter": "",
     "pause-image": SANDBOX_IMAGE,
+    // Spike: kubelet's sync loop and status manager said, into a file of their own, for the trace shard.
+    "v": 3,
+    "log": "/var/log/k3s-spike.log",
   };
   return new Map([
     [CONFIG_YAML, `# k3s as alasio's cluster runs it: alasio up writes this file.\n${JSON.stringify(k3s)}\n`],

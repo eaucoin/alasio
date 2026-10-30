@@ -138,7 +138,7 @@ async function eventsOf(pod: string): Promise<string[]> {
 /** Kubelet's lines of `pod` on the host, at the microsecond, as journald keeps k3s's. */
 async function kubeletOf(pod: string): Promise<string[]> {
   if (TARGET !== "host") return [];
-  return (await onNode("", `journalctl -u k3s -o short-precise --since '-3 min' --no-pager | grep -F '${pod}' | grep -E 'SyncLoop|status_manager|atus for pod|RECONCILE|eadiness|prober|Probe|pod_workers|syncPod|generateAPIPodStatus' | head -n 300 || true`)).split("\n").filter(Boolean).map((line) => line.slice(0, 500));
+  return (await onNode("", `grep -F '${pod}' /var/log/k3s-spike.log | grep -E 'SyncLoop|status_manager|atus for pod|RECONCILE|eadiness|prober|Probe|pod_workers|syncPod|PATCH|/status' | head -n 400 || true`)).split("\n").filter(Boolean).map((line) => line.slice(0, 600));
 }
 
 /** Waits until no pod is bound to `workspace`. */
