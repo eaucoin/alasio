@@ -60,8 +60,18 @@ export const running = (pod: V1Pod): boolean => !pod.metadata?.deletionTimestamp
 export const restarted = (pod: V1Pod): boolean =>
   (pod.status?.containerStatuses ?? []).some(({ restartCount, state, lastState }) => restartCount > 0 || state?.terminated !== undefined || lastState?.terminated !== undefined);
 
-/** Whether `pod` runs ready, and is not being deleted: serving its binding. */
-export const serving = (pod: V1Pod): boolean => running(pod) && (pod.status?.conditions ?? []).some(({ type, status }) => type === "Ready" && status === "True");
+/**
+ * Whether `pod` runs ready, and is not being deleted: serving its binding. Ready as kubelet says
+ * it, or as kubelet's own rule has it before kubelet next writes it: its containers ready and
+ * every condition its readiness gates name true. kubelet takes a condition set through the API
+ * server a second or more after it is set, as a restore's pod's resumed one, set once its
+ * sandbox runs (src/gateway/snapshots.ts), whose bind would otherwise wait on it.
+ */
+export const serving = (pod: V1Pod): boolean => {
+  const holds = (type: string) => (pod.status?.conditions ?? []).some((condition) => condition.type === type && condition.status === "True");
+  const gates = pod.spec?.readinessGates ?? [];
+  return running(pod) && (holds("Ready") || (gates.length > 0 && holds("ContainersReady") && gates.every(({ conditionType }) => holds(conditionType))));
+};
 
 /** A Lease as the API holds it, by its key: null where there is none. */
 export const readLease = Effect.fnUntraced(function*(pool: Pool, key: string): Effect.fn.Return<BindingLease | null, KubeApiError, KubeClient> {
