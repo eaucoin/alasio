@@ -460,6 +460,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       Effect.andThen(Effect.logInfo(`forgot the snapshot of ${pool.namespace}/${workspace}: ${why}`)),
     );
 
+  /** Spike: how many resumed conditions were written, for the variant of the next. */
+  let writes = 0;
+
   /** Since when each workspace's restore has been deferred, from the first that was: in memory, as the gateway's start begins a window anew. */
   const deferredSince = new Map<string, number>();
   const named = (pool: Pool, workspace: string) => `${pool.namespace}/${workspace}`;
@@ -596,6 +599,15 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         Effect.mapError((error) => new RestoreRefused({ reason: error.message, resumed: false })),
       );
       yield* trace(`${workspace} gateway policies-listed`);
+      // Spike: how the resumed condition is written, by turns: patched after the resume, its status replaced whole after it, or patched before it.
+      const variant = (["patch", "replace", "early"] as const)[writes++ % 3] ?? "patch";
+      yield* trace(`${workspace} gateway variant ${variant}`);
+      const resumedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+      const resumedCondition = { type: RESUMED_CONDITION, status: "True", lastTransitionTime: resumedAt };
+      if (variant === "early") {
+        yield* kube.patchPodStatus(pool.namespace, name, { status: { conditions: [resumedCondition] } }).pipe(Effect.mapError((error) => new RestoreRefused({ reason: error.message, resumed: false })));
+        yield* trace(`${workspace} gateway condition-set`);
+      }
       // Paused where its policies are not in force (504), or where the bucket fails (502), which
       // may pass; of any other failure its sandbox may have run; paused, too, where the snapshot
       // was taken live and holds the session no more (410), which no try restores.
@@ -606,11 +618,18 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         }),
       );
       yield* trace(`${workspace} gateway resumed`);
-      const now = new Date(yield* Clock.currentTimeMillis).toISOString();
-      yield* kube.patchPodStatus(pool.namespace, name, { status: { conditions: [{ type: RESUMED_CONDITION, status: "True", lastTransitionTime: now }] } }).pipe(
-        Effect.mapError((error) => new RestoreRefused({ reason: `its readiness could not be set: ${error.message}`, resumed: true })),
-      );
-      yield* trace(`${workspace} gateway condition-set`);
+      if (variant === "patch") {
+        yield* kube.patchPodStatus(pool.namespace, name, { status: { conditions: [resumedCondition] } }).pipe(
+          Effect.mapError((error) => new RestoreRefused({ reason: `its readiness could not be set: ${error.message}`, resumed: true })),
+        );
+      }
+      if (variant === "replace" && kube.replacePodStatus) {
+        const replace = kube.replacePodStatus;
+        const read = (yield* podOf(pool, name).pipe(Effect.mapError((error) => new RestoreRefused({ reason: error.message, resumed: true })))) as V1Pod;
+        const conditions = [...(read.status?.conditions ?? []).filter(({ type }) => type !== RESUMED_CONDITION), { ...resumedCondition, lastTransitionTime: new Date(resumedAt) }];
+        yield* replace(pool.namespace, name, { ...read, status: { ...read.status, conditions } }).pipe(Effect.mapError((error) => new RestoreRefused({ reason: error.message, resumed: true })));
+      }
+      if (variant !== "early") yield* trace(`${workspace} gateway condition-set`);
     });
 
   /** Has the agent of `node` abandon the restore into the pod `name`, refused before its sandbox resumed, as alasio's were: what runsc runs for it killed. */

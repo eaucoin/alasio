@@ -278,6 +278,7 @@ jobs:
           ALASIO_E2E_TARGET: ${{ matrix.target }}
           ALASIO_E2E_AGENTS: ${{ matrix.agents }}
           ALASIO_E2E_SHARD: ${{ matrix.shard }}
+          TRACE_RUNS: "12"
           ALASIO_E2E_REGISTRY: ${{ needs.images.outputs.registry }}
           ALASIO_E2E_PREVIOUS: ${{ needs.images.outputs.previous }}
       - name: ufw's rules are as they were before alasio

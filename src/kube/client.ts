@@ -12,7 +12,7 @@ import { PassThrough } from "node:stream";
 import { finished } from "node:stream/promises";
 import { isDeepStrictEqual } from "node:util";
 
-import { CoreV1Api, Exec, KubeConfig, type KubernetesObject, KubernetesObjectApi, PatchStrategy, setHeaderOptions, type V1Status } from "@kubernetes/client-node";
+import { CoreV1Api, Exec, KubeConfig, type KubernetesObject, KubernetesObjectApi, PatchStrategy, setHeaderOptions, type V1Pod, type V1Status } from "@kubernetes/client-node";
 import { Cause, Context, Effect, Layer, Predicate, Queue, Result, Schema, Stream } from "effect";
 
 /** What `exec` is given beyond the command. */
@@ -142,6 +142,8 @@ export class KubeClient extends Context.Service<KubeClient, {
    * conditions by their type.
    */
   readonly patchPodStatus: (namespace: string, name: string, patch: object) => Effect.Effect<void, KubeApiError>;
+  /** Spike: replaces the pod's status whole, at its resourceVersion. */
+  readonly replacePodStatus?: (namespace: string, name: string, pod: V1Pod) => Effect.Effect<void, KubeApiError>;
   /**
    * The objects `plural` of `apiVersion` in the namespace that `labelSelector` selects, as
    * they change: first every one there is, as ADDED, then a bookmark annotated
@@ -297,6 +299,7 @@ export function makeKubeClient(kubeConfig: KubeConfig, { watchSilenceMs = WATCH_
       call(() =>
         core.patchNamespacedPodStatus({ namespace, name, body: patch, fieldManager: "alasio" }, setHeaderOptions("Content-Type", PatchStrategy.StrategicMergePatch))
       ).pipe(Effect.asVoid),
+    replacePodStatus: (namespace, name, pod) => call(() => core.replaceNamespacedPodStatus({ namespace, name, body: pod, fieldManager: "alasio" })).pipe(Effect.asVoid),
     remove: (apiVersion, kind, namespace, name, resourceVersion) =>
       call(() =>
         objects.delete(ref(apiVersion, kind, namespace, name), undefined, undefined, undefined, undefined, "Background", resourceVersion === undefined ? undefined : { preconditions: { resourceVersion } })
