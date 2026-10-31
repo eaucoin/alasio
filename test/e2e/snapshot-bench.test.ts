@@ -40,7 +40,7 @@ import { BINDING_LABEL, FREE_LABEL, keyHash, leaseName, POOL_LABEL } from "../..
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { BAYMA_CONTAINER, RESTORE_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
 import { compactionDue, type Manifest } from "../../src/node-agent/agent.ts";
-import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
+import { CONTAINERD, GVISOR_RELEASES, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { bindSession, boundPodOf, dumpClusterState, gatewayCall, kube, mainToken, nodeAgents, onNode, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
 
@@ -405,6 +405,23 @@ async function endUnsaved(workspace: string, name: string): Promise<void> {
   }
 }
 
+/** Spike: where each run of a release's checkpointgofer is logged: when, by which process, of which arguments. */
+const GOFER_EXECS = "/var/log/gofer-execs.log";
+
+/** Spike: each release's checkpointgofer on `node` wrapped by a script that logs who runs it, then runs it. */
+async function wrapGofers(node: string): Promise<void> {
+  const wrapper = [
+    "#!/bin/sh",
+    "p=$PPID",
+    "g=$(awk '{print $4}' /proc/$p/stat)",
+    `echo "$(date +%s.%N) pid=$$ ppid=$p parent=$(tr '\\0' ' ' < /proc/$p/cmdline | cut -c1-300) grandparent=$(tr '\\0' ' ' < /proc/$g/cmdline | cut -c1-300) args=$*" >> ${GOFER_EXECS}`,
+    'exec "$0.real" "$@"',
+  ].join("\n");
+  const script = join(BENCH_DIR, "gofer-wrapper.sh");
+  writeFileSync(script, `${wrapper}\n`);
+  await onNode(node, `for f in ${GVISOR_RELEASES}/*/gvisor-bin/checkpointgofer; do [ -e "$f.real" ] || mv "$f" "$f.real"; cp '${script}' "$f"; chmod 755 "$f"; done; ls -la ${GVISOR_RELEASES}/*/gvisor-bin/`);
+}
+
 /** Spike: the node agent's log lines of `node`, timestamped. */
 async function agentLines(node: string): Promise<string[]> {
   return (await kube.logs(NAMESPACE, (await nodeAgents()).get(node) ?? "", "node-agent", { timestamps: true })).split("\n");
@@ -659,10 +676,12 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
 
     phase = "restore-warm";
     if (VARIANT !== "kept-cache") await dropPageCache(node);
+    await onNode(node, `echo "# warm ${fixture}/${sizeMib} run ${run} begins $(date +%s.%N)" >> ${GOFER_EXECS}`);
     const sampling = await sampleIo(node, `${fixture}-${sizeMib}-${run}-warm`);
     const warm = await restore(workspace, sessionId, fixture, runId, manifest);
     await sampling.stop();
     const spike = { compaction, io: sampling.file, ...(await tracedRestore(node, workspace, warm.probed)) };
+    await onNode(node, `echo "# warm ${fixture}/${sizeMib} run ${run} ends $(date +%s.%N)" >> ${GOFER_EXECS}`);
     emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, { ...warm.details, spike });
     done.add(phase);
     await endUnsaved(workspace, warm.pod);
@@ -806,6 +825,7 @@ before(async () => {
     await setUp();
     const agents = await nodeAgents();
     for (const node of agents.keys()) await bootLogs(node);
+    for (const node of agents.keys()) await wrapGofers(node);
     await shapeAgents();
     // How the store answers through the profile, from where the saves run: the node agent's network.
     const [node = ""] = (await nodeAgents()).keys();
@@ -818,6 +838,7 @@ before(async () => {
 }, { timeout: 150 * 60_000 });
 
 after(async () => {
+  appendFileSync(join(BENCH_DIR, "logs", "gofer-execs.log"), await onNode("", `cat ${GOFER_EXECS} || true`).catch((error: unknown) => errorText(error)));
   await tearDown();
 }, { timeout: 30 * 60_000 });
 
