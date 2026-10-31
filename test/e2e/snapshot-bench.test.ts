@@ -350,7 +350,7 @@ async function restore(workspace: string, sessionId: string, fixture: string, ru
     readonly notice: string | null;
   }>(workspace, "probe", "--session", sessionId, "--fixture", fixture, "--run-id", runId);
   // Spike: what the restore read into the node's page cache, which was dropped before it.
-  await residency(String(process.env["SPIKE_NODE"] ?? ""), `${fixture}-${runId}-${manifest.snapshot}`);
+  await residency(String(process.env["SPIKE_NODE"] ?? ""), `${fixture}-${runId}-${process.env["SPIKE_PHASE"] ?? ""}`);
   const settled = await watching;
   if ("error" in settled) throw settled.error;
   const { residentNs, pod, error } = settled.watched;
@@ -711,6 +711,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     phase = "restore-warm";
     // Spike: what the node reads into its page cache meanwhile without a restore, as long as one takes.
     process.env["SPIKE_NODE"] = node;
+    process.env["SPIKE_PHASE"] = "warm";
     await dropPageCache(node);
     await sleep(4000);
     await residency(node, `${fixture}-${runId}-control`);
@@ -730,6 +731,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     await inAgentNetwork(node, [new URL("dist/s3.mjs", COMMON).pathname, "copy", `${SESSIONS}/${workspace}/manifests/${manifest.snapshot}.json`, `${SESSIONS}/${workspace}/current.json`]);
     await agentOk(node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: manifest.snapshot, release: manifest.release });
     await coldCaches(workspace);
+    process.env["SPIKE_PHASE"] = "cold";
     const cold = await restore(workspace, sessionId, fixture, runId, manifest);
     emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, cold.details);
     done.add(phase);
