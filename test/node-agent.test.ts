@@ -1631,11 +1631,14 @@ test("a restore from the bucket is told the bytes of pages its image holds, of e
       assert.equal(yield* throughProxy(there, token, layer), 200);
       yield* Effect.sleep("50 millis");
       assert.equal(there.storeProxy.reading(), 0);
+      // Its images fetched into the cache once it is done reading, before the next restore clears it.
+      yield* cached(there, manifest);
       // Told none, as runsc fails to say: done once its quiet has passed.
       said("remote-inspect", false);
       yield* restored;
       yield* Effect.sleep("400 millis");
       assert.equal(there.storeProxy.reading(), 0);
+      yield* cached(there, manifest);
       // Not told in time, as runsc hangs: the same, its runsc killed.
       said("hang-inspect", true);
       yield* restored;
@@ -1646,6 +1649,7 @@ test("a restore from the bucket is told the bytes of pages its image holds, of e
       const inspecting = execFileSync("ps", ["-eo", "args"], { encoding: "utf8" }).split("\n").filter((line) => line.includes(join(there.releases.releasesDir, RELEASE)) && line.includes("inspect"));
       assert.deepEqual(inspecting, []);
       said("hang-inspect", false);
+      yield* cached(there, manifest);
     })
   ));
 
