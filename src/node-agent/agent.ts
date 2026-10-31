@@ -26,7 +26,9 @@
  * is compacted, after its commit and beside whatever else the agent does, one at a time on
  * the node at its lowest priority: its images into one, the image of a new snapshot
  * `compactedFrom` it, committed as the current one only if the workspace has not moved on
- * from it meanwhile. It is the same sandbox at the same moment, so a workspace released into
+ * from it meanwhile; a restore of the workspace on this node stops it, as the workspace moves on
+ * from it with the restore, its runsc killed and what it wrote of its image removed from the
+ * cache and the bucket. It is the same sandbox at the same moment, so a workspace released into
  * the one is restored from the other, which is the next delta's base. A snapshot taken live
  * is never compacted, its sandbox running on from it: one whose parent's chain would be due
  * with it is taken whole instead, which cuts the chain the sandbox goes on extending.
@@ -70,7 +72,7 @@ import { dirname, join, posix, relative } from "node:path";
 import { pipeline } from "node:stream/promises";
 
 import type { BatchObservableResult } from "@opentelemetry/api";
-import { Clock, type Duration, Effect, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
+import { Clock, type Duration, Effect, FiberMap, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import { quantityOf } from "../kube/quantity.ts";
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
@@ -703,6 +705,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   /** Compactions run in the agent's scope, one at a time on the node, beside whatever else it does. */
   const scope = yield* Effect.scope;
   const compacting = yield* Semaphore.make(1);
+  /** Each workspace's compaction, by its prefix, running or waiting to: a restore of the workspace on this node stops it. */
+  const compactionsRunning = yield* FiberMap.make<string>();
 
   /** How many workspaces the cache holds the images of under each release, as the manifests beside them say. */
   const cachedByRelease: Effect.Effect<ReadonlyMap<string, number>, CacheError | Schema.SchemaError> = Effect.gen(function*() {
@@ -968,6 +972,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       // At most as large as the images it is compacted from.
       yield* cache.room(committed.bytes, spared).pipe(Effect.flatMap(logEvicted));
       const staged = yield* cache.stage(environment, workspace, snapshot);
+      /** The compacted image's digest, once the cache holds it, until a manifest names it. */
+      let unnamed: string | null = null;
       return yield* Effect.gen(function*() {
         // runsc writes the image into a directory it makes.
         yield* onDisk(() => rm(staged, { recursive: true, force: true }));
@@ -980,6 +986,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         const referred = yield* runsc.layers(release, staged);
         if (referred.length > 0) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image refers to the images ${referred.join(", ")}, where it is to refer to none` });
         yield* cache.commit(environment, workspace, snapshot, image.digest);
+        unnamed = image.digest;
         const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest)));
         yield* cache.stamp(environment, workspace, image.digest, files);
         const [uploadMs, uploaded] = yield* timed(upload(committed, image.digest, files));
@@ -992,6 +999,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             if ((yield* current(committed))?.snapshot !== committed.snapshot) return false;
             yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
             yield* bucket.putJson(manifestKey(committed, snapshot), manifest);
+            unnamed = null;
             yield* bucket.putJson(`${prefixOf(committed)}/${CURRENT_FILE}`, manifest);
             return true;
           }),
@@ -1006,10 +1014,29 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           `compacted the snapshot ${committed.snapshot} of ${prefixOf(committed)}, as ${why}: its ${committed.layers.length} images, ${committed.bytes} bytes, are the image of its snapshot ${snapshot}, ${manifest.bytes} bytes, in ${compactMs} ms, uploaded in ${uploadMs} ms`,
         );
         return manifest;
-      }).pipe(Effect.onError(() => cache.unstage(environment, workspace, snapshot).pipe(Effect.ignore)));
+      }).pipe(
+        // What it staged goes; and what it wrote of an image no manifest names, in the cache and the bucket, where it was
+        // stopped (prepare) or failed: nothing of it is left to collect, and its upload's parts were aborted with it.
+        Effect.onError(() =>
+          cache.unstage(environment, workspace, snapshot).pipe(
+            Effect.andThen(Effect.suspend(() => (unnamed === null ? Effect.void : forgetImage(committed, unnamed)))),
+            Effect.ignore,
+          )
+        ),
+      );
     });
 
-  /** Compacts `committed` as compactNow does, once no other compaction runs on the node, in the agent's scope: what fails is said, and changes nothing. */
+  /** Removes the image `digest` of the workspace from the cache and from the bucket, as one that no manifest names. */
+  const forgetImage = (ref: WorkspaceRef, digest: string): Effect.Effect<void, S3Error | CacheError> =>
+    cache.drop(ref.environment, ref.workspace, digest).pipe(
+      Effect.andThen(bucket.list(`${prefixOf(ref)}/${LAYERS_DIR}/${digest}/`)),
+      Effect.flatMap((objects) => Effect.forEach(objects, ({ key }) => bucket.remove(key), { discard: true })),
+    );
+
+  /**
+   * Compacts `committed` as compactNow does, once no other compaction runs on the node, in the agent's scope: what fails is
+   * said, and changes nothing. One of the workspace's before it is stopped, as the workspace has moved on from it.
+   */
   const compactLater = (committed: Manifest): Effect.Effect<void> =>
     compactNow(committed).pipe(
       compacting.withPermits(1),
@@ -1017,9 +1044,14 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       (compacting) => inFlightWhile([committed], compacting),
       Effect.tapError((error) => Effect.sync(() => compactions.add(1, { "alasio.node_agent.compaction.outcome": error._tag }))),
       Effect.catch((error) => Effect.logWarning(`compacting the snapshot ${committed.snapshot} of ${prefixOf(committed)} failed, which changes nothing of it: ${error.message}`)),
+      Effect.onInterrupt(() =>
+        Effect.sync(() => compactions.add(1, { "alasio.node_agent.compaction.outcome": "stopped" })).pipe(
+          Effect.andThen(Effect.logInfo(`stopped compacting the snapshot ${committed.snapshot} of ${prefixOf(committed)}, which changes nothing of it`)),
+        )
+      ),
       withAlasioSpan("alasio.node_agent.compaction", { attributes: { ...spanAttributes(committed), "alasio.snapshot": committed.snapshot } }),
       withLogScope("node-agent"),
-      Effect.forkIn(scope),
+      FiberMap.run(compactionsRunning, prefixOf(committed)),
       Effect.asVoid,
     );
 
@@ -1315,6 +1347,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       Effect.gen(function*() {
         // A restore of the workspace before this one is done with, its reads of the bucket with it.
         storeProxy.revoke(prefixOf(ref));
+        // Its compaction is stopped: the restore spends the snapshot, so the workspace moves on from what it would commit,
+        // and it would read and write the node's disk as the restore reads its image there.
+        yield* FiberMap.remove(compactionsRunning, prefixOf(ref));
         const manifest = yield* current(ref);
         if (manifest === null) return yield* new NoSnapshot(ref);
         const { environment, workspace, snapshot, release } = manifest;

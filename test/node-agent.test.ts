@@ -789,6 +789,77 @@ test("a compaction the workspace moves on from meanwhile commits nothing, what i
     )
   ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=superseded": 1, "alasio.node_agent.compaction.outcome=RunscError": 1 })));
 
+test("a restore of the workspace on the node stops its compaction, as runsc compacts or as its image is uploaded, which leaves nothing of the compacted image, and the chain is restored", () =>
+  added("alasio.node_agent.compactions", () =>
+    withBucket(({ s3, node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const here = yield* node("node-1");
+        const runscDir = here.releases.dirOf(RELEASE);
+        const chained = () =>
+          Effect.gen(function*() {
+            writeFileSync(join(runscDir, "delta-pages-bytes"), "512");
+            yield* here.agent.checkpoint(request("fs-abc"));
+            const { manifest } = yield* here.agent.prepare(workspace);
+            yield* here.agent.spend(workspace, manifest.snapshot);
+            yield* here.agent.resume(resumeRequest(manifest.snapshot));
+            writeFileSync(join(runscDir, "delta-pages-bytes"), "4096");
+            return yield* here.agent.checkpoint(request("fs-abc"));
+          });
+        const layersDir = join(here.cacheDir, "main", "fs-abc", "layers");
+        const compacting = (count: number) =>
+          Effect.sync(() => here.releases.calls(RELEASE).filter((args) => args.includes("compact")).length).pipe(
+            Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (called) => called >= count }),
+          );
+        /** What is left of an image of the workspace's that `chain` does not name: in the cache, in the bucket, and as uploads begun. */
+        const leftBeside = (chain: Manifest) => {
+          const named = chain.layers.map(({ digest }) => digest);
+          return {
+            cached: imagesOf(here, "fs-abc").filter((name) => !named.includes(name)),
+            stored: keysOf(s3, "main/fs-abc/layers/").filter((key) => !named.some((digest) => key.startsWith(`main/fs-abc/layers/${digest}/`))),
+            uploading: [...s3.uploads.values()].map(({ key }) => key),
+          };
+        };
+        const restored = (chain: Manifest) =>
+          Effect.gen(function*() {
+            const { manifest, source } = yield* here.agent.prepare(workspace);
+            assert.deepEqual(manifest, chain);
+            assert.equal(source, "cache");
+            assert.deepEqual(leftBeside(chain), { cached: [], stored: [], uploading: [] });
+            yield* here.agent.spend(workspace, chain.snapshot);
+            yield* here.agent.resume(resumeRequest(chain.snapshot));
+          });
+
+        // As runsc compacts: its process is killed, and nothing it was to write is written.
+        writeFileSync(join(runscDir, "hold-compact"), "");
+        const compactedAsRunscRan = yield* chained();
+        yield* compacting(1);
+        yield* restored(compactedAsRunscRan);
+        rmSync(join(runscDir, "hold-compact"));
+        yield* Effect.sleep("200 millis");
+        assert.equal(existsSync(join(runscDir, "compact-priority")), false);
+
+        // As its image is uploaded: its state file put already is removed, its pages, being put, are not written.
+        let letGo = () => {};
+        const held = new Promise<void>((resolve) => (letGo = resolve));
+        const compactedAsUploaded = yield* chained();
+        // Held from here, as runsc compacts before its image is uploaded.
+        s3.holdPut = (key) => (key.endsWith("/pages.img") && !compactedAsUploaded.layers.some(({ digest }) => key.includes(digest)) ? held : null);
+        yield* compacting(2);
+        yield* Effect.sync(() => s3.requests.some((asked) => /^PUT main\/fs-abc\/layers\/\w+\/pages\.img$/u.test(asked) && !compactedAsUploaded.layers.some(({ digest }) => asked.includes(digest)))).pipe(
+          Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (putting) => putting }),
+        );
+        yield* restored(compactedAsUploaded);
+        letGo();
+        yield* Effect.sleep("200 millis");
+        assert.deepEqual(leftBeside(compactedAsUploaded), { cached: [], stored: [], uploading: [] });
+        assert.deepEqual(readdirSync(layersDir).filter((name) => name.startsWith(".")), []);
+        assert.equal(yield* here.agent.current(workspace), null);
+      })
+    )
+    // The two, and the one of the second chain's first delta, which that chain's own restore stopped.
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=stopped": 3 })));
+
 test("a snapshot is committed only once each image it refers to is in the bucket as it was put, put again from the cache where it is not", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
