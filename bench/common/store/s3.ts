@@ -25,6 +25,7 @@ import {
   CreateMultipartUploadCommand,
   DeleteObjectsCommand,
   GetObjectCommand,
+  ListMultipartUploadsCommand,
   ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
@@ -188,6 +189,9 @@ if (/(^|\/)s3\.(ts|mjs)$/u.test(process.argv[1] ?? "")) {
     : command === "upload" ? await upload(store, first, second, cut)
     : command === "download" ? await download(store, first, second, cut)
     : command === "bytes" ? { prefix: first, bytes: (await list(store, first)).reduce((sum, { bytes }) => sum + bytes, 0) }
+    // Spike: the objects under a prefix, and the multipart uploads begun under it and neither completed nor aborted.
+    : command === "keys" ? { prefix: first, keys: (await list(store, first)).map(({ key, bytes }) => `${key} ${bytes}`) }
+    : command === "uploads" ? { prefix: first, uploads: ((await store.client.send(new ListMultipartUploadsCommand({ Bucket: store.bucket, Prefix: first }))).Uploads ?? []).map(({ Key, UploadId }) => `${Key} ${UploadId}`) }
     : command === "delete" ? await remove(store, first)
     : command === "copy" ? await store.client.send(new CopyObjectCommand({ Bucket: store.bucket, Key: second, CopySource: `${store.bucket}/${first}` })).then(() => ({ copied: first, to: second }))
     : null;

@@ -39,7 +39,7 @@ import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.t
 import { BINDING_LABEL, FREE_LABEL, keyHash, leaseName, POOL_LABEL } from "../../src/binder/names.ts";
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { BAYMA_CONTAINER, RESTORE_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
-import type { Manifest } from "../../src/node-agent/agent.ts";
+import { compactionDue, type Manifest } from "../../src/node-agent/agent.ts";
 import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { bindSession, boundPodOf, dumpClusterState, gatewayCall, kube, mainToken, nodeAgents, onNode, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
@@ -66,7 +66,7 @@ const RUNS = Number(process.env["BENCH_RUNS"] || 5);
  * save taken, as of a session released before its first, its release a whole stop-and-copy.
  */
 const VARIANT = variable("BENCH_VARIANT");
-if (VARIANT !== "as-shipped" && VARIANT !== "with-fix" && VARIANT !== "whole") throw new Error(`BENCH_VARIANT is ${VARIANT}, not as-shipped, with-fix or whole`);
+if (VARIANT !== "as-shipped" && VARIANT !== "with-fix" && VARIANT !== "whole" && VARIANT !== "agent-killed") throw new Error(`BENCH_VARIANT is ${VARIANT}, not as-shipped, with-fix or whole`);
 const COMMON = new URL("../../bench/common/", import.meta.url);
 const read = (relative: string): string => readFileSync(new URL(relative, COMMON), "utf8");
 const PROFILES = JSON.parse(read("store/profiles.json")) as Record<string, { readonly emulated: boolean }>;
@@ -399,6 +399,50 @@ async function endUnsaved(workspace: string, name: string): Promise<void> {
   }
 }
 
+/** Spike: the restarts of the node agent of `node`. */
+async function agentRestarts(node: string): Promise<number> {
+  const pod = (await nodeAgents()).get(node) ?? "";
+  return (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.status?.containerStatuses?.find(({ name }) => name === "node-agent")?.restartCount ?? -1;
+}
+
+/**
+ * Spike: kills the node agent of `node` (its program, SIGKILL, as a crash or the kernel's OOM killer would) as it compacts the
+ * workspace's chain, its runsc stopped (SIGSTOP), or as it uploads the compacted image; then says, once it has started again,
+ * what is left of that compaction: its runsc process, the cache's images, the bucket's objects and multipart uploads.
+ */
+async function crashAgent(node: string, workspace: string, at: "compact" | "upload"): Promise<void> {
+  const said: Record<string, unknown> = { workspace, at };
+  const layers = `${SESSIONS}/${workspace}/layers/`;
+  const s3 = new URL("dist/s3.mjs", COMMON).pathname;
+  let pid = "";
+  for (const deadline = Date.now() + 60_000; pid === "" && Date.now() < deadline; await sleep(50)) pid = (await onNode(node, "pgrep -f ' image [c]ompact ' | head -n 1 || true")).trim();
+  said["compact_pid"] = pid;
+  if (at === "compact") await onNode(node, `kill -STOP ${pid}`);
+  else {
+    for (const deadline = Date.now() + 180_000; Date.now() < deadline; await sleep(200)) {
+      const { uploads } = JSON.parse(await inAgentNetwork(node, [s3, "uploads", layers])) as { readonly uploads: string[] };
+      if (uploads.length > 0) {
+        said["uploads_before"] = uploads;
+        break;
+      }
+    }
+  }
+  said["compact_before"] = (await onNode(node, `ps -o pid=,stat=,args= -p ${pid} | cut -c1-200 || echo gone`)).trim();
+  const restarts = await agentRestarts(node);
+  const tini = await agentPid(node);
+  said["killed"] = (await onNode(node, `pkill -9 -e -P ${tini} || true`)).trim();
+  for (const deadline = Date.now() + 300_000; (await agentRestarts(node)) <= restarts || !(await nodeAgents()).has(node); await sleep(1000)) {
+    if (Date.now() > deadline) throw new Error("the node agent did not come back within 300 s of its kill");
+  }
+  await sleep(5000);
+  said["compact_after"] = (await onNode(node, `ps -o pid=,stat=,args= -p ${pid} | cut -c1-200 || echo gone`)).trim();
+  said["compactions_after"] = (await onNode(node, "pgrep -a -f ' image [c]ompact ' | cut -c1-200 || echo none")).trim();
+  said["cache_after"] = (await onNode(node, `ls -la ${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/layers; head -c 400 ${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/manifest.json`)).trim().split("\n");
+  said["keys_after"] = (JSON.parse(await inAgentNetwork(node, [s3, "keys", layers])) as { readonly keys: string[] }).keys;
+  said["uploads_after"] = (JSON.parse(await inAgentNetwork(node, [s3, "uploads", layers])) as { readonly uploads: string[] }).uploads;
+  appendFileSync(join(BENCH_DIR, "logs", "agent-killed.jsonl"), `${JSON.stringify(said)}\n`);
+}
+
 /** Drops the page cache of `node`, as every restore starts with it dropped, so what ran before leaves it nothing. */
 const dropPageCache = (node: string): Promise<string> => onNode(node, "sync && echo 1 > /proc/sys/vm/drop_caches");
 
@@ -561,6 +605,8 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
       uploaded_bytes: heldStop - heldLive,
     }, NO_CHECKS, { snapshot: manifest.snapshot, runsc_checkpoint_ms: manifest.pauseMs, upload_ms: manifest.uploadMs, chain: manifest.layers.length, bytes: manifest.bytes, logged: stopLogged.said });
     done.add(phase);
+    // Spike: the node agent killed as it compacts the release's chain, stopped, or as it uploads the compacted image.
+    if (VARIANT === "agent-killed" && compactionDue(manifest.layers) !== null) await crashAgent(node, workspace, run % 2 === 1 ? "compact" : "upload");
     await gone(bound.name);
     // The workspace as the release left it, for the cold restore's.
     const quota = JSON.parse(await agentOk(node, "GET", `/workspaces/${SESSIONS}/${workspace}/quota`)) as { readonly capacityBytes: number };
