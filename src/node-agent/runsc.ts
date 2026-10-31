@@ -150,6 +150,11 @@ export interface CompactOptions {
   readonly layerPath: string;
   /** The directory of the new image, which must not exist. */
   readonly output: string;
+  /**
+   * What pauses runsc as it compacts, and resumes it: given what to call as it should be
+   * paused or resumed, it answers what to call once runsc has ended (./loading.ts pausing).
+   */
+  readonly pausing?: (pause: (paused: boolean) => void) => () => void;
 }
 
 /**
@@ -183,9 +188,11 @@ export interface Runsc {
    * Writes an image of the memory the image `imagePath` holds, its layers' pages copied into
    * its own, but none written over since, and the working set the image recorded first, as
    * a restore loads it: an image of no layers. It runs at the node's lowest CPU and disk
-   * priorities, as nothing waits on it.
+   * priorities, as nothing waits on it, stopped (SIGSTOP) while `pausing` says so.
    */
   readonly compact: (release: string, options: CompactOptions) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
+  /** Waits until the restore of a container, by its runtime's id, has read every page of its image, as `runsc wait --restore` does. */
+  readonly restored: (release: string, containerId: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   /**
    * Whether this node's `release` restores the image at `imagePath`, its layers where a
    * restore finds them, as `runsc image verify --host` says: whole (the checksums and
@@ -305,8 +312,11 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
   const installed = (release: string): Effect.Effect<void, ReleaseNotInstalled> =>
     releases.pipe(Effect.filterOrFail((names) => names.includes(release), () => new ReleaseNotInstalled({ release })), Effect.asVoid);
 
-  /** Runs `release`'s runsc's `command` with its shim's flags and `args`, at the lowest priority if `lowest`. */
-  const run = (release: string, command: readonly string[], args: readonly string[], lowest = false): Effect.Effect<Ran, RunscError | ReleaseNotInstalled> =>
+  /**
+   * Runs `release`'s runsc's `command` with its shim's flags and `args`, at the lowest priority if `lowest`, stopped and
+   * continued as `pausing` says if given; continued as it is killed, so that the signal ends it.
+   */
+  const run = (release: string, command: readonly string[], args: readonly string[], lowest = false, pausing?: CompactOptions["pausing"]): Effect.Effect<Ran, RunscError | ReleaseNotInstalled> =>
     installed(release).pipe(
       Effect.andThen(Effect.tryPromise({
         try: async (signal) => {
@@ -317,10 +327,14 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
           const argv = [join(releasesDir, release, "runsc"), `--root=${root}`, ...flags, ...command, ...args];
           const [file = "", ...rest] = lowest ? [...LOWEST_PRIORITY, ...argv] : argv;
           return new Promise<Ran>((resolve, reject) => {
-            execFile(file, rest, { signal, maxBuffer: MAX_OUTPUT_BYTES }, (error, stdout, stderr) => {
+            let unpaused: (() => void) | undefined;
+            const child = execFile(file, rest, { signal, maxBuffer: MAX_OUTPUT_BYTES }, (error, stdout, stderr) => {
+              unpaused?.();
               if (error) reject(Object.assign(new Error(stderr.trim() || stdout.trim() || error.message), { exitCode: typeof error.code === "number" ? error.code : undefined }));
               else resolve({ stdout });
             });
+            unpaused = pausing?.((paused) => child.kill(paused ? "SIGSTOP" : "SIGCONT"));
+            if (unpaused !== undefined) signal.addEventListener("abort", () => child.kill("SIGCONT"), { once: true });
           });
         },
         catch: (cause) => {
@@ -397,8 +411,10 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         ),
       ),
 
-    compact: (release, { imagePath, layerPath, output }) =>
-      run(release, ["image", "compact"], [`--output=${output}`, `--layer-path=${layerPath}`, "--working-set-first", imagePath], true).pipe(Effect.asVoid),
+    compact: (release, { imagePath, layerPath, output, pausing }) =>
+      run(release, ["image", "compact"], [`--output=${output}`, `--layer-path=${layerPath}`, "--working-set-first", imagePath], true, pausing).pipe(Effect.asVoid),
+
+    restored: (release, containerId) => run(release, ["wait"], ["--restore", containerId]).pipe(Effect.asVoid),
 
     container: (containerId) =>
       Effect.gen(function*() {

@@ -24,7 +24,8 @@
  *
  * A snapshot a release's checkpoint commits whose chain of images is due (compactionDue)
  * is compacted, after its commit and beside whatever else the agent does, one at a time on
- * the node at its lowest priority: its images into one, the image of a new snapshot
+ * the node at its lowest priority, yielding to the restores on the node that read their
+ * images (./loading.ts): its images into one, the image of a new snapshot
  * `compactedFrom` it, committed as the current one only if the workspace has not moved on
  * from it meanwhile; a restore of the workspace on this node stops it, as the workspace moves on
  * from it with the restore, its runsc killed and what it wrote of its image removed from the
@@ -81,6 +82,7 @@ import { withLogScope } from "../shared/log.ts";
 import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCache } from "./cache.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { type Listing, listedEgressGap, type PodAddress } from "./kube-router.ts";
+import { makeLoading } from "./loading.ts";
 import { backgroundReadSeconds, restoresFromBucket, runscVersion, STORE_SOCKET_ENDPOINT } from "./names.ts";
 import { type ReleaseNotInstalled, type Runsc, type RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
 import type { S3Bucket, S3Error } from "./s3.ts";
@@ -646,23 +648,31 @@ function snapshotId(takenAt: number): string {
   return `${new Date(takenAt).toISOString().replace(/[-:.]/gu, "")}-${randomBytes(4).toString("hex")}`;
 }
 
-/** The SHA-256 of a file, in hex. */
-async function fileSha256(path: string): Promise<string> {
+/** The SHA-256 of a file, in hex; each chunk of it read once `ready` has resolved, where given. */
+async function fileSha256(path: string, ready?: () => Promise<void>): Promise<string> {
   const hash = createHash("sha256");
-  await pipeline(createReadStream(path), hash);
+  if (ready === undefined) await pipeline(createReadStream(path), hash);
+  else {
+    await pipeline(createReadStream(path), async function*(chunks: AsyncIterable<Buffer>) {
+      for await (const chunk of chunks) {
+        await ready();
+        yield chunk;
+      }
+    }, hash);
+  }
   return hash.digest("hex");
 }
 
 /** A file of an image as it is on the disk, before the bucket holds it. */
 type ImageFile = Omit<SnapshotFile, "etag">;
 
-/** The files of an image directory, each with its size and SHA-256, by their paths in it, in order. */
-async function imageFiles(directory: string): Promise<ImageFile[]> {
+/** The files of an image directory, each with its size and SHA-256, by their paths in it, in order; read as fileSha256 reads them. */
+async function imageFiles(directory: string, ready?: () => Promise<void>): Promise<ImageFile[]> {
   const entries = await readdir(directory, { withFileTypes: true, recursive: true });
   const paths = entries.filter((entry) => entry.isFile()).map((entry) => relative(directory, join(entry.parentPath, entry.name))).sort();
   return Promise.all(paths.map(async (path) => {
     const file = join(directory, path);
-    return { path, bytes: (await stat(file)).size, sha256: await fileSha256(file) };
+    return { path, bytes: (await stat(file)).size, sha256: await fileSha256(file, ready) };
   }));
 }
 
@@ -707,6 +717,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   const compacting = yield* Semaphore.make(1);
   /** Each workspace's compaction, by its prefix, running or waiting to: a restore of the workspace on this node stops it. */
   const compactionsRunning = yield* FiberMap.make<string>();
+  /** The restores on this node still reading their images, by workspace prefix, which compactions yield to. */
+  const loading = yield* makeLoading;
+  /** Resolves once no restore on this node reads its image. */
+  const quietly = (): Promise<void> => Effect.runPromise(loading.quiet);
 
   /** How many workspaces the cache holds the images of under each release, as the manifests beside them say. */
   const cachedByRelease: Effect.Effect<ReadonlyMap<string, number>, CacheError | Schema.SchemaError> = Effect.gen(function*() {
@@ -824,10 +838,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       }),
     );
 
-  /** The files of the image `digest` the cache holds of the workspace, uploaded: each with the ETag its upload was answered with. */
-  const upload = (ref: WorkspaceRef, digest: string, files: readonly ImageFile[]): Effect.Effect<Layer, S3Error> =>
+  /** The files of the image `digest` the cache holds of the workspace, uploaded, as putFile puts them: each with the ETag its upload was answered with. */
+  const upload = (ref: WorkspaceRef, digest: string, files: readonly ImageFile[], ready?: () => Promise<void>): Effect.Effect<Layer, S3Error> =>
     Effect.forEach(files, (file) =>
-      bucket.putFile(layerKey(ref, digest, file.path), join(cache.image(ref.environment, ref.workspace, digest), file.path)).pipe(
+      bucket.putFile(layerKey(ref, digest, file.path), join(cache.image(ref.environment, ref.workspace, digest), file.path), ready).pipe(
         Effect.map((etag) => ({ ...file, etag })),
       )).pipe(Effect.map((uploaded) => ({ digest, files: uploaded })));
 
@@ -975,9 +989,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       /** The compacted image's digest, once the cache holds it, until a manifest names it. */
       let unnamed: string | null = null;
       return yield* Effect.gen(function*() {
-        // runsc writes the image into a directory it makes.
+        // runsc writes the image into a directory it makes. It reads and writes the node's disk, as the hashes and the upload
+        // after it read it, beside the restores on this node, which they yield to: runsc stopped while one reads its image, the
+        // others waiting meanwhile.
         yield* onDisk(() => rm(staged, { recursive: true, force: true }));
-        const [compactMs] = yield* timed(runsc.compact(release, { imagePath: cache.image(environment, workspace, own.digest), layerPath: join(cache.workspace(environment, workspace), LAYERS_DIR), output: staged }));
+        const [compactMs] = yield* timed(runsc.compact(release, { imagePath: cache.image(environment, workspace, own.digest), layerPath: join(cache.workspace(environment, workspace), LAYERS_DIR), output: staged, pausing: loading.pausing }));
         yield* Effect.sync(() => compactionDuration.record(compactMs / 1000));
         const image = yield* runsc.inspect(release, staged);
         if (image.version !== runscVersion(release)) {
@@ -987,9 +1003,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         if (referred.length > 0) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image refers to the images ${referred.join(", ")}, where it is to refer to none` });
         yield* cache.commit(environment, workspace, snapshot, image.digest);
         unnamed = image.digest;
-        const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest)));
+        const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest), quietly));
         yield* cache.stamp(environment, workspace, image.digest, files);
-        const [uploadMs, uploaded] = yield* timed(upload(committed, image.digest, files));
+        const [uploadMs, uploaded] = yield* timed(upload(committed, image.digest, files, quietly));
         if (!(yield* inBucket(committed, uploaded))) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image ${image.digest} is not in the bucket as it was put` });
         const manifest: Manifest = { ...committed, snapshot, layers: [uploaded], bytes: bytesOf([uploaded]), uploadMs, compactedFrom: committed.snapshot };
         // What it uploaded, should the workspace have moved on meanwhile, no manifest names, and is collected as any such image is.
@@ -1350,6 +1366,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         // Its compaction is stopped: the restore spends the snapshot, so the workspace moves on from what it would commit,
         // and it would read and write the node's disk as the restore reads its image there.
         yield* FiberMap.remove(compactionsRunning, prefixOf(ref));
+        // It reads its image until runsc says it has read every page (resume), for as long as its sandbox's would take at most.
+        yield* loading.begin(prefixOf(ref), backgroundReadMs);
         const manifest = yield* current(ref);
         if (manifest === null) return yield* new NoSnapshot(ref);
         const { environment, workspace, snapshot, release } = manifest;
@@ -1451,6 +1469,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         return { manifest, imagePath, source };
       }),
     ).pipe(
+      // Prepared for no restore, it reads nothing.
+      Effect.onError(() => loading.end(prefixOf(ref))),
       Effect.tapError((error) => Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": error._tag }))),
       withAlasioSpan("alasio.node_agent.prepare", { attributes: spanAttributes(ref) }),
     );
@@ -1622,8 +1642,17 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
       // Its sandbox runs from the snapshot it was restored from, which its next checkpoint saves what changed since.
       for (const id of request.containerIds) bases.set(id, from);
+      // It reads its image until runsc says it has read every page.
+      yield* Effect.forEach(request.containerIds, (id, index) => runsc.restored(containers[index]?.release ?? "", id), { discard: true }).pipe(
+        Effect.catch((error) => Effect.logWarning(`runsc did not say when the restore of ${prefixOf(request)} has read its image, so the agent's compactions yield to it no more: ${error.message}`)),
+        Effect.andThen(loading.end(prefixOf(request))),
+        withLogScope("node-agent"),
+        Effect.forkIn(scope),
+      );
       return waited;
     }).pipe(
+      // Not resumed, it reads nothing more.
+      Effect.tapError(() => loading.end(prefixOf(request))),
       // Its gofer read its options as its pod's containers started, the restore's token among them.
       Effect.ensuring(goferOptionsGone(request)),
       Effect.tap((waited) =>
@@ -1672,6 +1701,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   const abandon = (request: AbandonRequest): Effect.Effect<readonly Killed[], RunscError> =>
     exclusive([request], Effect.sync(() => storeProxy.revoke(prefixOf(request))).pipe(Effect.andThen(goferOptionsGone(request)), Effect.andThen(abandonNow(request)))).pipe(
+      Effect.ensuring(loading.end(prefixOf(request))),
       Effect.tap(([killed, found]) =>
         Effect.sync(() => abandons.add(1, { "alasio.node_agent.abandon.outcome": "abandoned" })).pipe(
           Effect.andThen(Effect.annotateCurrentSpan({ "alasio.abandon.killed": killed.length })),

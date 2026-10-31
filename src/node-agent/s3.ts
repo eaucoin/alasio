@@ -112,8 +112,11 @@ export interface Received {
 
 /** The bucket, as makeS3Bucket reaches it. */
 export interface S3Bucket {
-  /** Puts the file at `path` as the object `key`, streamed: the ETag the bucket answered. */
-  readonly putFile: (key: string, path: string) => Effect.Effect<string, S3Error>;
+  /**
+   * Puts the file at `path` as the object `key`, streamed: the ETag the bucket answered. Each part of it, or the whole
+   * of one put in one, is sent once `ready` has resolved, where given, as work that yields to another waits.
+   */
+  readonly putFile: (key: string, path: string, ready?: () => Promise<void>) => Effect.Effect<string, S3Error>;
   /** Writes the object `key`, of `bytes`, to the file at `path`, streamed: its size and SHA-256. */
   readonly getFile: (key: string, path: string, bytes: number) => Effect.Effect<Received, S3Error>;
   /** Puts `value` as the object `key`, as JSON. */
@@ -425,10 +428,11 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
     Array.from({ length: Math.ceil(size / partBytes) }, (_, index) => ({ start: index * partBytes, length: Math.min(partBytes, size - index * partBytes) }));
 
   return {
-    putFile: (key, path) =>
+    putFile: (key, path, ready) =>
       attempt("upload", key, async (signal) => {
         const { size } = await stat(path);
         if (size <= partBytes) {
+          await ready?.();
           const response = await succeeded(await call("PUT", key, { body: { file: path, size } }, signal));
           await bodyText(response, 0);
           const etag = response.headers.etag;
@@ -438,6 +442,7 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         const parts = ranges(size);
         return multipart(key, parts.length, async (number, query, partSignal) => {
           const { start, length } = parts[number - 1] ?? { start: 0, length: 0 };
+          await ready?.();
           const response = await succeeded(await call("PUT", key, { query, body: { file: path, size: length, start } }, partSignal));
           await bodyText(response, 0);
           const etag = response.headers.etag;
