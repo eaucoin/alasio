@@ -166,6 +166,7 @@ import {
   NODE_AGENT_TOKEN_VARIABLE,
   POD_IP_VARIABLE,
   RUNSC_ROOT,
+  GVISOR_RELEASE_VARIABLE,
   RESTORES_FROM_BUCKET_SINCE_VARIABLE,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
@@ -464,7 +465,8 @@ const EVICTION_GRACE_MS = 10 * 60_000;
 /**
  * The node agent of the node it runs on (NODE_NAME), as its environment configures it:
  * the bucket (BucketConfig), the token the sandbox gateway presents (NODE_AGENT_TOKEN_VARIABLE), the
- * cache's budget in bytes (SNAPSHOT_CACHE_BYTES_VARIABLE), the first gVisor release that
+ * cache's budget in bytes (SNAPSHOT_CACHE_BYTES_VARIABLE), the gVisor release the node's runtime
+ * starts sandboxes with (GVISOR_RELEASE_VARIABLE), the first gVisor release that
  * restores straight from the bucket (RESTORES_FROM_BUCKET_SINCE_VARIABLE; none unless given,
  * every snapshot then fetched into the cache first), its pod's address (POD_IP_VARIABLE),
  * which it serves the bucket to its node's restores on (STORE_PROXY_PORT, ./store-proxy.ts),
@@ -481,6 +483,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const token = yield* Config.Redacted(NODE_AGENT_TOKEN_VARIABLE);
   const budget = yield* Config.Int(SNAPSHOT_CACHE_BYTES_VARIABLE).pipe(Config.withDefault(DEFAULT_CACHE_BYTES));
   const restoresFromBucketSince = yield* Config.String(RESTORES_FROM_BUCKET_SINCE_VARIABLE).pipe(Config.withDefault(""));
+  const current = yield* Config.String(GVISOR_RELEASE_VARIABLE);
   const backgroundReadSeconds = yield* Config.Int(BACKGROUND_READ_SECONDS_VARIABLE);
   const { secretAccessKey, ...bucket } = yield* BucketConfig;
   const cache = makeSnapshotCache({ root: SNAPSHOT_CACHE_DIR, budget, graceMs: EVICTION_GRACE_MS });
@@ -491,7 +494,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   // agent runs in, its tokens kept beside it, as an agent that starts again reads them back.
   const runDir = yield* Config.String(NODE_AGENT_RUN_DIR_VARIABLE).pipe(Config.withDefault(NODE_AGENT_RUN_DIR));
   const storeProxy = yield* makeStoreProxy({ store: { ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }, host: podIP, port: STORE_PROXY_PORT, socket: storeSocket(runDir), tokensFile: storeTokensFile(runDir) });
-  const runsc = makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT });
+  const runsc = makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT, current });
   const host = makeHostCommands();
   const agent = yield* makeNodeAgent({
     node,

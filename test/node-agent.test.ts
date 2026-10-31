@@ -226,9 +226,9 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
       const cache = makeSnapshotCache({ root: cacheDir, budget, graceMs: 0 });
-      const runsc = changed(makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot }), releases);
-      // The pod's containers run under the node's first release.
+      // The pod's containers run under the node's first release, which its runtime starts sandboxes with.
       const [running] = installed;
+      const runsc = changed(makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot, current: running ?? RELEASE }), releases);
       if (running !== undefined) for (const id of [CONTAINER, OTHER_CONTAINER]) releases.runs(id, running, SESSIONS, POD);
       const host = fakeHost();
       // Its socket in /tmp, short enough for a socket's path, whatever TMPDIR is.
@@ -352,12 +352,28 @@ test("a command is run in a container by its release's runsc's exec, its failure
   const root = mkdtempSync(join(tmpdir(), "alasio-runsc-exec-"));
   try {
     const releases = fakeReleases(root, [RELEASE]);
-    const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot });
+    const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot, current: RELEASE });
     await Effect.runPromise(runsc.exec(RELEASE, "container-0", ["bayma", "sandbox-hook", "stop"], 10_000));
     assert.deepEqual(releases.calls(RELEASE).at(-1)?.filter((arg) => !arg.startsWith("--")), ["exec", "container-0", "bayma", "sandbox-hook", "stop"]);
     writeFileSync(join(releases.dirOf(RELEASE), "fail-exec"), "");
     const failed = await Effect.runPromise(Effect.flip(runsc.exec(RELEASE, "container-0", ["bayma", "sandbox-hook", "stop"], 10_000)));
     assert.match(failed.message, /the hook exited 1/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the node's containers are read with the runsc of the release its runtime starts sandboxes with, whichever others are installed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-runsc-current-"));
+  try {
+    // An older release beside it, first by name, whose runsc reads nothing.
+    const older = "20260921.0-eaucoin.6";
+    const releases = fakeReleases(root, [older, RELEASE]);
+    writeFileSync(join(releases.dirOf(older), "runsc"), "#!/bin/sh\necho 'not this one' >&2\nexit 1\n");
+    releases.runs(CONTAINER, RELEASE, SESSIONS, POD);
+    const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot, current: RELEASE });
+    assert.deepEqual((await Effect.runPromise(runsc.containers)).map(({ id }) => id), [CONTAINER]);
+    assert.equal((await Effect.runPromise(runsc.container(CONTAINER))).release, RELEASE);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -3004,6 +3020,7 @@ test("the agent runs as its own process from its environment, and stops when tol
     NODE_NAME: "node-1",
     POD_IP: "127.0.0.1",
     ALASIO_NODE_AGENT_TOKEN: "the token",
+    ALASIO_GVISOR_RELEASE: RELEASE,
     ALASIO_BACKGROUND_READ_SECONDS: "600",
     S3_ENDPOINT: s3.endpoint,
     S3_REGION: "us-east-1",

@@ -107,6 +107,12 @@ export const goferOf = (release: string, since: string): Gofer | null => (releas
  */
 export const RESTORE_POD = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?-restore-[0-9a-z]{7}$/u;
 
+/**
+ * The variable that gives the node agent the gVisor release the node's runtime starts sandboxes with (its RuntimeClass's,
+ * the first pinned), whose runsc it reads the state every shim keeps with: the one its sandboxes keep in memory.
+ */
+export const GVISOR_RELEASE_VARIABLE = "ALASIO_GVISOR_RELEASE";
+
 /** The variable that gives the node agent the first gVisor release that restores straight from the bucket (restoresFromBucket). */
 export const RESTORES_FROM_BUCKET_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_FROM_BUCKET_SINCE";
 

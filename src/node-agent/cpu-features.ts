@@ -19,7 +19,7 @@ const [release] = process.argv.slice(2);
 
 const report = Effect.gen(function*() {
   if (!release) return yield* Effect.fail(new Error("no gVisor release is named"));
-  const runsc = makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT });
+  const runsc = makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT, current: release });
   const cpuFeatures = yield* runsc.cpuFeatures(release);
   const reported: CpuFeaturesReport = { release, cpuFeatures };
   yield* Effect.promise(() => writeFile(TERMINATION_LOG, JSON.stringify(reported)));

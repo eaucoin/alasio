@@ -28,6 +28,11 @@ export interface RunscOptions {
   readonly root: string;
   /** The node's processes, as the agent sees them in its PID namespace: /proc unless told. */
   readonly procRoot?: string;
+  /**
+   * The release the node's runtime starts sandboxes with, whose runsc reads the state every shim keeps under the root: any
+   * release's reads it, and the one the node's sandboxes run is in memory already, where another's is read from the disk.
+   */
+  readonly current: string;
 }
 
 /** What runsc was asked to do and could not, and what it said. */
@@ -298,7 +303,7 @@ function runsFor(args: readonly string[], root: string, { id, bundle }: ListedCo
  * other than the one it was found with; a kill reads it again just before, so it kills no
  * process but the one found.
  */
-export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc" }: RunscOptions): Runsc {
+export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc", current }: RunscOptions): Runsc {
   const releases = Effect.promise(async () => {
     const entries = await readdir(releasesDir, { withFileTypes: true }).catch(() => []);
     const found = await Promise.all(
@@ -344,14 +349,11 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
       })),
     );
 
-  /** Runs any release's runsc's `command` with `args`: any reads the state every shim keeps under the one root. */
-  const runAny = (command: readonly string[], args: readonly string[]): Effect.Effect<Ran, RunscError> =>
-    Effect.gen(function*() {
-      const failed = (reason: string) => new RunscError({ release: "the node's", command: [...command, ...args].join(" "), reason });
-      const [any] = yield* releases;
-      if (any === undefined) return yield* failed("no gVisor release is installed here");
-      return yield* run(any, command, args).pipe(Effect.mapError((error) => (error._tag === "RunscError" ? error : failed(error.message))));
-    });
+  /** Runs the current release's runsc's `command` with `args`, of the state every shim keeps under the one root. */
+  const runCurrent = (command: readonly string[], args: readonly string[]): Effect.Effect<Ran, RunscError> =>
+    run(current, command, args).pipe(
+      Effect.mapError((error) => (error._tag === "RunscError" ? error : new RunscError({ release: current, command: [...command, ...args].join(" "), reason: error.message }))),
+    );
 
   /** The start time of the node's process `pid`, as its stat says now, or null for one that is gone. */
   const startTimeAt = (pid: string): Promise<string | null> =>
@@ -419,7 +421,7 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
     container: (containerId) =>
       Effect.gen(function*() {
         const failed = (reason: string) => new RunscError({ release: "the node's", command: `state ${containerId}`, reason });
-        const { stdout } = yield* runAny(["state"], [containerId]);
+        const { stdout } = yield* runCurrent(["state"], [containerId]);
         const state = yield* Effect.try({ try: () => Schema.decodeUnknownSync(ContainerState)(JSON.parse(stdout)), catch: (cause) => failed(`its state is not one: ${String(cause)}`) });
         const program = yield* Effect.tryPromise({ try: () => readlink(join(procRoot, String(state.pid), "exe")), catch: (cause) => failed(`its sandbox's process ${state.pid} is not readable: ${String(cause)}`) });
         const [release = "", ...under] = relative(releasesDir, program).split(sep);
@@ -429,7 +431,7 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         return { release, annotations: state.annotations ?? {}, tracksWrites: tracking !== undefined && tracking !== "off", bundle: state.bundle };
       }),
 
-    containers: runAny(["list"], ["--format=json"]).pipe(
+    containers: runCurrent(["list"], ["--format=json"]).pipe(
       Effect.flatMap(({ stdout }) =>
         Effect.try({
           try: () => Schema.decodeUnknownSync(ContainerList)(JSON.parse(stdout)) ?? [],

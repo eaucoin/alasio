@@ -32,6 +32,7 @@ import {
   backgroundReadSeconds,
   CONTAINERD,
   CPU_FEATURES_CONTAINER,
+  GVISOR_RELEASE_VARIABLE,
   GVISOR_RELEASES,
   META_URL_VARIABLE,
   NODE_AGENT_PORT,
@@ -147,6 +148,7 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
               { name: POD_IP_VARIABLE, valueFrom: { fieldRef: { fieldPath: "status.podIP" } } },
               { name: NODE_AGENT_TOKEN_VARIABLE, valueFrom: { secretKeyRef: { name: NODE_AGENT_SECRET, key: "token" } } },
               { name: SNAPSHOT_CACHE_BYTES_VARIABLE, value: String(sizeBytes(sessions.snapshots.nodeCache)) },
+              { name: GVISOR_RELEASE_VARIABLE, value: currentGvisorRelease() },
               { name: RESTORES_FROM_BUCKET_SINCE_VARIABLE, value: NODE_PINS.gvisor.restoresFromBucketSince },
               { name: BACKGROUND_READ_SECONDS_VARIABLE, value: String(backgroundReadSeconds(sandboxBytes)) },
               // Workspace storage's metadata engine, which it sets workspaces' quotas on alone, as a user of its own there: no key of its object store.

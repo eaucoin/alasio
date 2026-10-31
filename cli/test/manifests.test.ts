@@ -2552,7 +2552,7 @@ describe("node agents", () => {
     assert.deepEqual(features?.volumeMounts, container?.volumeMounts?.filter(({ name }) => name !== "snapshots"));
   });
 
-  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their pod's address, their cache's budget in bytes, the first gVisor release that restores from the bucket, how long a resumed restore may read it through them, and workspace storage's metadata engine", () => {
+  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their pod's address, their cache's budget in bytes, the gVisor release their node's runtime starts sandboxes with, the first that restores from the bucket, how long a resumed restore may read it through them, and workspace storage's metadata engine", () => {
     const container = (file: Record<string, unknown> = {}) => agentOf(install(file)).spec?.template.spec?.containers[0];
     const env = (file: Record<string, unknown> = {}) => Object.fromEntries((container(file)?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
     assert.deepEqual(container()?.envFrom, [{ secretRef: { name: "alasio-snapshots" } }]);
@@ -2562,6 +2562,7 @@ describe("node agents", () => {
       POD_IP: { fieldRef: { fieldPath: "status.podIP" } },
       ALASIO_NODE_AGENT_TOKEN: { secretKeyRef: { name: "alasio-node-agent", key: "token" } },
       ALASIO_SNAPSHOT_CACHE_BYTES: "5368709120",
+      ALASIO_GVISOR_RELEASE: NODE_PINS.gvisor.releases[0]?.release,
       ALASIO_GVISOR_RESTORES_FROM_BUCKET_SINCE: "20260921.0-eaucoin.7",
       // A session's 2 GiB, at 4 MiB/s.
       ALASIO_BACKGROUND_READ_SECONDS: "512",
