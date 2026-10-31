@@ -34,6 +34,8 @@
  *   nice value it ran at; or it fails, saying so, while a file
  *   `fail-compact` is beside it, or waits while one `hold-compact` is;
  * - `resume ID`: says nothing; or fails, saying so, while a file `fail-resume` is beside it;
+ * - `wait --restore ID`: says nothing, once no file `hold-wait` is beside it, as runsc once
+ *   the restore has read every page; or fails, saying so, while a file `fail-wait` is;
  * - `exec ID ARGV...`: says nothing; or fails, saying so, while a file `fail-exec` is beside it;
  * - `cpu-features`: the node's, from `cpu-features`, comma-separated;
  * - `state ID`: the container's sandbox's process and its pod's annotations, as
@@ -162,6 +164,9 @@ if (rest[0] === "checkpoint") {
     return;
   }
   compact();
+} else if (rest[0] === "wait" && rest[1] === "--restore") {
+  if (existsSync(join(here, "fail-wait"))) { process.stderr.write("waiting for restore to complete: the container is gone\\n"); process.exit(128); }
+  const held = setInterval(() => { if (!existsSync(join(here, "hold-wait"))) clearInterval(held); }, 20);
 } else if (rest[0] === "resume") {
   if (existsSync(join(here, "fail-resume"))) { process.stderr.write("resume failed: the container is gone\\n"); process.exit(128); }
 } else if (rest[0] === "exec") {

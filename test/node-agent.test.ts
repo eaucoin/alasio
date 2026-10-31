@@ -789,6 +789,237 @@ test("a compaction the workspace moves on from meanwhile commits nothing, what i
     )
   ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=superseded": 1, "alasio.node_agent.compaction.outcome=RunscError": 1 })));
 
+test("a restore of the workspace on the node stops its compaction, as runsc compacts or as its image is uploaded, which leaves nothing of the compacted image, and the chain is restored", () =>
+  added("alasio.node_agent.compactions", () =>
+    withBucket(({ s3, node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const here = yield* node("node-1");
+        const runscDir = here.releases.dirOf(RELEASE);
+        const chained = () =>
+          Effect.gen(function*() {
+            writeFileSync(join(runscDir, "delta-pages-bytes"), "512");
+            yield* here.agent.checkpoint(request("fs-abc"));
+            const { manifest } = yield* here.agent.prepare(workspace);
+            yield* here.agent.spend(workspace, manifest.snapshot);
+            yield* here.agent.resume(resumeRequest(manifest.snapshot));
+            writeFileSync(join(runscDir, "delta-pages-bytes"), "4096");
+            return yield* here.agent.checkpoint(request("fs-abc"));
+          });
+        const layersDir = join(here.cacheDir, "main", "fs-abc", "layers");
+        const compacting = (count: number) =>
+          Effect.sync(() => here.releases.calls(RELEASE).filter((args) => args.includes("compact")).length).pipe(
+            Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (called) => called >= count }),
+          );
+        /** What is left of an image of the workspace's that `chain` does not name: in the cache, in the bucket, and as uploads begun. */
+        const leftBeside = (chain: Manifest) => {
+          const named = chain.layers.map(({ digest }) => digest);
+          return {
+            cached: imagesOf(here, "fs-abc").filter((name) => !named.includes(name)),
+            stored: keysOf(s3, "main/fs-abc/layers/").filter((key) => !named.some((digest) => key.startsWith(`main/fs-abc/layers/${digest}/`))),
+            uploading: [...s3.uploads.values()].map(({ key }) => key),
+          };
+        };
+        const restored = (chain: Manifest) =>
+          Effect.gen(function*() {
+            const { manifest, source } = yield* here.agent.prepare(workspace);
+            assert.deepEqual(manifest, chain);
+            assert.equal(source, "cache");
+            assert.deepEqual(leftBeside(chain), { cached: [], stored: [], uploading: [] });
+            yield* here.agent.spend(workspace, chain.snapshot);
+            yield* here.agent.resume(resumeRequest(chain.snapshot));
+          });
+
+        // As runsc compacts: its process is killed, and nothing it was to write is written.
+        writeFileSync(join(runscDir, "hold-compact"), "");
+        const compactedAsRunscRan = yield* chained();
+        yield* compacting(1);
+        yield* restored(compactedAsRunscRan);
+        rmSync(join(runscDir, "hold-compact"));
+        yield* Effect.sleep("200 millis");
+        assert.equal(existsSync(join(runscDir, "compact-priority")), false);
+
+        // As its image is uploaded: its state file put already is removed, its pages, being put, are not written.
+        let letGo = () => {};
+        const held = new Promise<void>((resolve) => (letGo = resolve));
+        const compactedAsUploaded = yield* chained();
+        // Held from here, as runsc compacts before its image is uploaded.
+        s3.holdPut = (key) => (key.endsWith("/pages.img") && !compactedAsUploaded.layers.some(({ digest }) => key.includes(digest)) ? held : null);
+        yield* compacting(2);
+        yield* Effect.sync(() => s3.requests.some((asked) => /^PUT main\/fs-abc\/layers\/\w+\/pages\.img$/u.test(asked) && !compactedAsUploaded.layers.some(({ digest }) => asked.includes(digest)))).pipe(
+          Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (putting) => putting }),
+        );
+        yield* restored(compactedAsUploaded);
+        letGo();
+        yield* Effect.sleep("200 millis");
+        assert.deepEqual(leftBeside(compactedAsUploaded), { cached: [], stored: [], uploading: [] });
+        assert.deepEqual(readdirSync(layersDir).filter((name) => name.startsWith(".")), []);
+        assert.equal(yield* here.agent.current(workspace), null);
+      })
+    )
+    // The two, and the one of the second chain's first delta, which that chain's own restore stopped.
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=stopped": 3 })));
+
+/**
+ * On `here`, a snapshot of fs-abc whose chain is due to be compacted, as a release makes one, and of fs-other one to
+ * restore beside it; and ways to restore fs-other, which reads its image from its prepare until runsc says it has read it.
+ */
+const yieldingTo = (here: Node) =>
+  Effect.gen(function*() {
+    const runscDir = here.releases.dirOf(RELEASE);
+    const other = { environment: "main", workspace: "fs-other" };
+    yield* here.agent.checkpoint(request("fs-other"));
+    const chained = Effect.gen(function*() {
+      writeFileSync(join(runscDir, "delta-pages-bytes"), "512");
+      yield* here.agent.checkpoint(request("fs-abc"));
+      const { manifest } = yield* here.agent.prepare({ environment: "main", workspace: "fs-abc" });
+      yield* here.agent.spend({ environment: "main", workspace: "fs-abc" }, manifest.snapshot);
+      yield* here.agent.resume(resumeRequest(manifest.snapshot));
+      writeFileSync(join(runscDir, "delta-pages-bytes"), "4096");
+      return yield* here.agent.checkpoint(request("fs-abc"));
+    });
+    return {
+      runscDir,
+      chained,
+      /** fs-other prepared: it reads its image from now on. */
+      prepareOther: here.agent.prepare(other).pipe(Effect.map(({ manifest }) => manifest)),
+      /** fs-other resumed: it has read its image once runsc says so, which it does while no `hold-wait` is beside it. */
+      resumeOther: (snapshot: string) => here.agent.resume({ ...resumeRequest(snapshot), workspace: "fs-other" }),
+      compactions: () => here.releases.calls(RELEASE).filter((args) => args.includes("compact")).length,
+      layersDir: join(here.cacheDir, "main", "fs-abc", "layers"),
+    };
+  });
+
+test("a compaction's runsc is stopped while a restore on its node reads its image, from its start or as it runs", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const { runscDir, chained, prepareOther, resumeOther, compactions, layersDir } = yield* yieldingTo(here);
+      // fs-other is restored as fs-abc's chain is committed: fs-abc's compaction is stopped from its start.
+      const otherSnapshot = yield* prepareOther;
+      const chain = yield* chained;
+      yield* Effect.sleep("300 millis");
+      assert.equal(compactions(), 0);
+      // Resumed, fs-other reads its image until runsc says it has read it.
+      writeFileSync(join(runscDir, "hold-wait"), "");
+      yield* resumeOther(otherSnapshot.snapshot);
+      yield* Effect.sleep("300 millis");
+      assert.equal(compactions(), 0);
+      // Read: fs-abc's compaction goes on.
+      writeFileSync(join(runscDir, "hold-compact"), "");
+      rmSync(join(runscDir, "hold-wait"));
+      yield* Effect.sync(compactions).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (count) => count === 1 }));
+      // fs-other is restored again as runsc compacts: runsc is stopped, and writes nothing, however long it would have held.
+      writeFileSync(join(runscDir, "hold-wait"), "");
+      yield* prepareOther;
+      rmSync(join(runscDir, "hold-compact"));
+      yield* Effect.sleep("300 millis");
+      assert.deepEqual(readdirSync(layersDir).filter((name) => name.startsWith(".") && existsSync(join(layersDir, name, "pages.img"))), []);
+      assert.deepEqual(imagesOf(here, "fs-abc"), chain.layers.map(({ digest }) => digest).sort());
+      // Once it has read its image, runsc goes on, and the compaction commits.
+      yield* resumeOther(otherSnapshot.snapshot);
+      rmSync(join(runscDir, "hold-wait"));
+      assert.ok(yield* compactedFrom(here.agent, chain.snapshot));
+    })
+  ));
+
+test("a compaction stopped while another restore on its node reads its image is stopped by its own workspace's", () =>
+  added("alasio.node_agent.compactions", () =>
+    withBucket(({ node }) =>
+      Effect.gen(function*() {
+        const here = yield* node("node-1");
+        const { runscDir, chained, prepareOther, compactions } = yield* yieldingTo(here);
+        writeFileSync(join(runscDir, "hold-compact"), "");
+        const chain = yield* chained;
+        yield* Effect.sync(compactions).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (count) => count === 1 }));
+        yield* prepareOther;
+        // Its runsc, stopped, is let go on as it is killed, so that the kill ends it, as fs-other still reads its image.
+        const { manifest } = yield* here.agent.prepare({ environment: "main", workspace: "fs-abc" });
+        assert.deepEqual(manifest, chain);
+        const compacting = () => {
+          try {
+            return execFileSync("pgrep", ["-f", `${join(runscDir, "runsc")} .* image compact `], { encoding: "utf8" }).trim();
+          } catch {
+            return "";
+          }
+        };
+        assert.equal(yield* Effect.sync(compacting).pipe(Effect.repeat({ schedule: Schedule.spaced("50 millis"), until: (found) => found === "", times: 40 })), "");
+      })
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=stopped": 1 })));
+
+test("a compaction's hashes and its upload wait while a restore on its node reads its image", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const { runscDir, chained, prepareOther, resumeOther } = yield* yieldingTo(here);
+      const stampsDir = join(here.cacheDir, "main", "fs-abc", "stamps");
+      const inspected = () => here.releases.calls(RELEASE).filter((args) => args.includes("inspect")).length;
+      const chain = yield* chained;
+      const named = (key: string) => chain.layers.some(({ digest }) => key.includes(digest));
+      // Held as runsc describes what it compacted, which the hashes follow.
+      const before = inspected();
+      writeFileSync(join(runscDir, "hold-inspect"), "");
+      yield* Effect.sync(inspected).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (count) => count > before }));
+      const otherSnapshot = yield* prepareOther;
+      rmSync(join(runscDir, "hold-inspect"));
+      yield* Effect.sleep("300 millis");
+      assert.deepEqual(readdirSync(stampsDir).filter((name) => !named(name)), []);
+      // Read, its image is hashed and put, its state file first: the restore of fs-other begins again as that is put.
+      let letGo = () => {};
+      const held = new Promise<void>((resolve) => (letGo = resolve));
+      s3.holdPut = (key) => (key.endsWith("/checkpoint.img") && !named(key) ? held : null);
+      yield* resumeOther(otherSnapshot.snapshot);
+      const putting = (file: string) => s3.requests.some((asked) => asked.startsWith("PUT main/fs-abc/layers/") && asked.endsWith(`/${file}`) && !named(asked));
+      yield* Effect.sync(() => putting("checkpoint.img")).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (put) => put }));
+      assert.equal(readdirSync(stampsDir).filter((name) => !named(name)).length, 1);
+      writeFileSync(join(runscDir, "hold-wait"), "");
+      yield* prepareOther;
+      letGo();
+      yield* Effect.sleep("300 millis");
+      assert.equal(putting("pages.img"), false);
+      // Read again, the rest of it is put, and the compaction commits.
+      yield* resumeOther(otherSnapshot.snapshot);
+      rmSync(join(runscDir, "hold-wait"));
+      assert.ok(yield* compactedFrom(here.agent, chain.snapshot));
+      assert.ok(putting("pages.img"));
+    })
+  ));
+
+test("a restore whose prepare fails, that is not resumed, that is abandoned, or whose reads runsc does not say the end of, reads nothing more: compactions on its node go on", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const { runscDir, chained, prepareOther, resumeOther, compactions } = yield* yieldingTo(here);
+      /** fs-abc's next chain compacted, `ended` restored meanwhile, ending as it does, as its runsc compacts. */
+      const compactedBeside = (ended: Effect.Effect<unknown, unknown>, count: number) =>
+        Effect.gen(function*() {
+          writeFileSync(join(runscDir, "hold-compact"), "");
+          const chain = yield* chained;
+          yield* Effect.sync(compactions).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (called) => called === count }));
+          yield* Effect.exit(ended);
+          rmSync(join(runscDir, "hold-compact"));
+          assert.ok(yield* compactedFrom(here.agent, chain.snapshot));
+        });
+      yield* compactedBeside(Effect.flip(here.agent.prepare({ environment: "main", workspace: "fs-none" })), 1);
+      const resumeFails = (snapshot: string) =>
+        Effect.sync(() => writeFileSync(join(runscDir, "fail-resume"), "")).pipe(
+          Effect.andThen(Effect.flip(resumeOther(snapshot))),
+          Effect.ensuring(Effect.sync(() => rmSync(join(runscDir, "fail-resume")))),
+        );
+      yield* compactedBeside(prepareOther.pipe(Effect.flatMap(({ snapshot }) => resumeFails(snapshot))), 2);
+      yield* compactedBeside(prepareOther.pipe(Effect.andThen(here.agent.abandon({ ...abandonRequest, workspace: "fs-other" }))), 3);
+      // Nor one runsc does not say has read its image.
+      const waitFails = (snapshot: string) =>
+        Effect.sync(() => writeFileSync(join(runscDir, "fail-wait"), "")).pipe(
+          Effect.andThen(resumeOther(snapshot)),
+          Effect.andThen(Effect.sleep("200 millis")),
+          Effect.ensuring(Effect.sync(() => rmSync(join(runscDir, "fail-wait")))),
+        );
+      yield* compactedBeside(prepareOther.pipe(Effect.flatMap(({ snapshot }) => waitFails(snapshot))), 4);
+    })
+  ));
+
 test("a snapshot is committed only once each image it refers to is in the bucket as it was put, put again from the cache where it is not", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {

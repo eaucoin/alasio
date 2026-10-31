@@ -175,6 +175,50 @@ test("a file larger than a part is put in parts, some at a time, and got in rang
   }
 });
 
+test("a file put once it is ready sends each part, or the whole of one put whole, only once it is", async () => {
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
+  try {
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 2 });
+    const pages = Buffer.from(Array.from({ length: 3500 }, (_, index) => index % 251));
+    const source = join(directory, "pages.img");
+    writeFileSync(source, pages);
+    writeFileSync(join(directory, "small.img"), pages.subarray(0, 1000));
+    /** Readiness asked for, each let go by the test in turn. */
+    const asked: (() => void)[] = [];
+    const ready = () => new Promise<void>((resolve) => asked.push(resolve));
+    const settled = () => new Promise((resolve) => setTimeout(resolve, 100));
+    const parts = (key: string) => s3.requests.filter((request) => request.startsWith(`PUT ${key}`)).length;
+
+    const putting = Effect.runPromise(bucket.putFile("main/fs-abc/s1/pages.img", source, ready));
+    await settled();
+    // Begun, as its first two parts ask whether they may go, but none sent.
+    assert.equal(asked.length, 2);
+    assert.equal(parts("main/fs-abc/s1/pages.img"), 0);
+    asked.shift()?.();
+    await settled();
+    assert.equal(parts("main/fs-abc/s1/pages.img"), 1);
+    // Each part after it waits on readiness too.
+    while (asked.length > 0) {
+      asked.shift()?.();
+      await settled();
+    }
+    await putting;
+    assert.deepEqual(s3.objects.get("main/fs-abc/s1/pages.img"), pages);
+    assert.equal(parts("main/fs-abc/s1/pages.img"), 4);
+
+    const whole = Effect.runPromise(bucket.putFile("main/fs-abc/s1/small.img", join(directory, "small.img"), ready));
+    await settled();
+    assert.equal(parts("main/fs-abc/s1/small.img"), 0);
+    asked.shift()?.();
+    await whole;
+    assert.equal(parts("main/fs-abc/s1/small.img"), 1);
+  } finally {
+    await s3.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("the bucket's gets go `parallel` at a time, every one of its files together, each written synced to the disk", async () => {
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));

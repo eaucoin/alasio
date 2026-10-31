@@ -38,6 +38,12 @@ export interface FakeS3 {
   getDelayMs: number;
   /** What a get of the object `key` waits on before it is answered, where it gives one, as one of a large image waits on the network: a test's to settle. */
   holdGet: (key: string) => Promise<void> | null;
+  /**
+   * What a put of the object `key`, or of a part of it, waits on before it is written, where it gives one, as one of a large
+   * image waits on the network: a test's to settle. One whose client has gone meanwhile is not written, as S3 writes no upload
+   * it was not sent whole.
+   */
+  holdPut: (key: string) => Promise<void> | null;
   /** The most gets of objects it has answered at once. */
   readonly mostGetting: () => number;
   readonly close: () => Promise<void>;
@@ -128,6 +134,10 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
       response.on("close", () => void (getting -= 1));
       if (fake.getDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, fake.getDelayMs));
       await fake.holdGet(key);
+    }
+    if (key && method === "PUT") {
+      await fake.holdPut(key);
+      if (request.socket.destroyed) return;
     }
     if (key && url.searchParams.has("uploads") && method === "POST") {
       const id = `upload-${uploads.size + requests.length}`;
@@ -246,6 +256,7 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     refuse: () => null,
     getDelayMs: 0,
     holdGet: () => null,
+    holdPut: () => null,
     mostGetting: () => mostGetting,
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
