@@ -407,11 +407,53 @@ async function endUnsaved(workspace: string, name: string): Promise<void> {
   }
 }
 
+/** Spike: what lists every file under the directories it is given whose pages the page cache holds: its resident bytes, its size, its path. */
+const RESIDENT = `import ctypes, os, stat, sys
+# Each regular file under the directories given whose pages the page cache holds: its resident bytes, its size and its path.
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mmap.restype = ctypes.c_void_p
+libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+PAGE = os.sysconf("SC_PAGE_SIZE")
+PROT_READ, MAP_SHARED, FAILED = 1, 1, ctypes.c_void_p(-1).value
+for top in sys.argv[1:]:
+    if not os.path.isdir(top):
+        continue
+    device = os.stat(top).st_dev
+    for root, dirs, files in os.walk(top):
+        dirs[:] = [d for d in dirs if os.lstat(os.path.join(root, d)).st_dev == device and not os.path.islink(os.path.join(root, d))]
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                info = os.lstat(path)
+                if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
+                    continue
+                fd = os.open(path, os.O_RDONLY | os.O_NOATIME) if os.geteuid() == 0 else os.open(path, os.O_RDONLY)
+            except OSError:
+                continue
+            try:
+                address = libc.mmap(None, info.st_size, PROT_READ, MAP_SHARED, fd, 0)
+                if address in (None, FAILED):
+                    continue
+                pages = (info.st_size + PAGE - 1) // PAGE
+                vector = ctypes.create_string_buffer(pages)
+                if libc.mincore(address, info.st_size, vector) == 0:
+                    resident = sum(1 for byte in vector.raw if byte & 1) * PAGE
+                    if resident > 0:
+                        print(min(resident, info.st_size), info.st_size, path)
+                libc.munmap(address, info.st_size)
+            finally:
+                os.close(fd)
+`;
+
 /** Spike: every file of the node's that the page cache holds pages of now, with how many bytes of it, into logs/resident-<name>.txt. */
 async function residency(node: string, name: string): Promise<void> {
   const file = join(BENCH_DIR, "logs", `resident-${name}.txt`);
+  const script = join(BENCH_DIR, "resident.py");
+  writeFileSync(script, RESIDENT);
   const directories = ["/var/lib/rancher/k3s/agent/containerd", "/var/lib/rancher/k3s/data", "/usr/local/lib/alasio", "/var/lib/alasio", "/var/jfsCache", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/local/bin", "/opt"];
-  await onNode(node, `for d in ${directories.join(" ")}; do [ -d "$d" ] && find "$d" -xdev -type f -size +0 -print0 2>/dev/null; done | xargs -r -0 fincore --bytes --noheadings --raw -o RES,SIZE,FILE 2>/dev/null | awk '$1 > 0' > '${file}'; wc -l < '${file}'`);
+  await onNode(node, `python3 '${script}' ${directories.join(" ")} > '${file}' 2>&1; wc -l < '${file}'`);
 }
 
 /** Spike: the node agent's log lines of `node`, timestamped. */
