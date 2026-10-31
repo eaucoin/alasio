@@ -58,8 +58,9 @@ const BENCH_DIR = variable("BENCH_DIR");
 const PROFILE = variable("BENCH_PROFILE");
 const RUNS = Number(process.env["BENCH_RUNS"] || 5);
 /**
- * The variant: `as-shipped`, alasio 10.0.0 as it runs, whose live checkpoints of a pool's pod
- * fail (mountedStateDir), so its release is a whole stop-and-copy; or `with-fix`, its live
+ * The variant: `as-shipped`, alasio as it runs: 10.0.4's pool pods name bayma's state directory
+ * by its mounted path, so its live checkpoints pass and its release is a delta of the live save's
+ * image (10.0.0's failed, mountedStateDir, its release a whole stop-and-copy); or `with-fix`, its live
  * checkpoint given bayma's state directory by its mounted path, as alasio's fix, not yet
  * released, gives it, its release then a delta of the live save's image; or `whole`, no live
  * save taken, as of a session released before its first, its release a whole stop-and-copy.
@@ -112,7 +113,7 @@ function emit(fixture: string, sizeMib: number, run: number, phase: string, outc
     correctness,
     host: JSON.parse(readFileSync(join(BENCH_DIR, "host.json"), "utf8")),
     store,
-    versions: { system: `alasio 10.0.3, gVisor ${RELEASE_UNDER_TEST}`, bayma: "0.15.4", seaweedfs: "4.48", toxiproxy: TOXIPROXY },
+    versions: { system: `alasio 10.0.4, gVisor ${RELEASE_UNDER_TEST}`, bayma: "0.15.5", seaweedfs: "4.48", toxiproxy: TOXIPROXY },
     ci: { run_id: Number(process.env["GITHUB_RUN_ID"] ?? 0), job: process.env["GITHUB_JOB"] ?? "local", sha: process.env["GITHUB_SHA"] ?? "" },
     at: new Date().toISOString(),
     details,
