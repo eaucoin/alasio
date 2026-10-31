@@ -219,6 +219,23 @@ test("a file put once it is ready sends each part, or the whole of one put whole
   }
 });
 
+test("the multipart uploads begun under a prefix and left, across pages of their listing, are aborted, and those elsewhere left be", async () => {
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  try {
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
+    for (const [id, key] of [["upload-1", "main/fs-abc/layers/d1/pages.img"], ["upload-2", "main/fs-abc/layers/d1/pages.img"], ["upload-3", "main/fs-abc/layers/d1/checkpoint.img"], ["upload-4", "main/fs-def/layers/d1/pages.img"]] as const) {
+      s3.uploads.set(id, { key, parts: new Map() });
+    }
+    // The stand-in lists two a page.
+    assert.equal(await Effect.runPromise(bucket.abortUploads("main/fs-abc/layers/d1/")), 3);
+    assert.deepEqual([...s3.uploads.keys()], ["upload-4"]);
+    assert.equal(s3.requests.filter((asked) => asked.endsWith(" abort")).length, 3);
+    assert.equal(await Effect.runPromise(bucket.abortUploads("main/fs-abc/layers/d1/")), 0);
+  } finally {
+    await s3.close();
+  }
+});
+
 test("the bucket's gets go `parallel` at a time, every one of its files together, each written synced to the disk", async () => {
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));

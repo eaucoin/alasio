@@ -29,6 +29,7 @@ import {
   type AbandonRequest,
   type CheckpointRequest,
   COLLECT_GRACE_MS,
+  COMPACTING_FILE,
   compactionDue,
   type Killed,
   type Layer as Image,
@@ -916,10 +917,14 @@ test("a compaction's runsc is stopped while a restore on its node reads its imag
       yield* Effect.sleep("300 millis");
       assert.deepEqual(readdirSync(layersDir).filter((name) => name.startsWith(".") && existsSync(join(layersDir, name, "pages.img"))), []);
       assert.deepEqual(imagesOf(here, "fs-abc"), chain.layers.map(({ digest }) => digest).sort());
-      // Once it has read its image, runsc goes on, and the compaction commits.
+      // What it compacts into is said beside the images, for an agent that starts again should this one stop meanwhile.
+      const compacting = join(here.cacheDir, "main", "fs-abc", COMPACTING_FILE);
+      const { snapshot: into } = JSON.parse(readFileSync(compacting, "utf8")) as { readonly snapshot: string };
+      // Once it has read its image, runsc goes on, and the compaction commits, saying so no more.
       yield* resumeOther(otherSnapshot.snapshot);
       rmSync(join(runscDir, "hold-wait"));
-      assert.ok(yield* compactedFrom(here.agent, chain.snapshot));
+      assert.equal((yield* compactedFrom(here.agent, chain.snapshot))?.snapshot, into);
+      assert.equal(existsSync(compacting), false);
     })
   ));
 
@@ -948,6 +953,43 @@ test("a compaction stopped while another restore on its node reads its image is 
     )
   ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=stopped": 1 })));
 
+test("an agent that starts again removes what each compaction the one before it left as it stopped wrote: of an image no manifest names, its image and its uploads", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      yield* here.agent.checkpoint(request("fs-abc"));
+      yield* here.agent.checkpoint(request("fs-def"));
+      const workspaceDir = (workspace: string) => join(here.cacheDir, "main", workspace);
+      const unnamed = "a".repeat(64);
+      const named = "b".repeat(64);
+      /** What the agent before left of a compaction of `workspace` into `snapshot`: its file, its staged image, and its image `digest` in the cache and the bucket. */
+      const leftOf = (workspace: string, snapshot: string, digest: string) => {
+        writeFileSync(join(workspaceDir(workspace), COMPACTING_FILE), JSON.stringify({ snapshot, digest }));
+        mkdirSync(join(workspaceDir(workspace), "layers", `.${snapshot}`), { recursive: true });
+        mkdirSync(join(workspaceDir(workspace), "layers", digest), { recursive: true });
+        writeFileSync(join(workspaceDir(workspace), "layers", digest, "checkpoint.img"), "state");
+        s3.objects.set(`main/${workspace}/layers/${digest}/checkpoint.img`, Buffer.from("state"));
+      };
+      // fs-abc's was uploading its image, its pages' upload begun; fs-def's had named its image in a manifest.
+      leftOf("fs-abc", "20261031T120000000Z-0000000a", unnamed);
+      s3.uploads.set("upload-left", { key: `main/fs-abc/layers/${unnamed}/pages.img`, parts: new Map() });
+      leftOf("fs-def", "20261031T120000000Z-0000000b", named);
+      s3.objects.set("main/fs-def/manifests/20261031T120000000Z-0000000b.json", Buffer.from("{}"));
+
+      yield* here.restarted;
+      for (const workspace of ["fs-abc", "fs-def"]) {
+        assert.equal(existsSync(join(workspaceDir(workspace), COMPACTING_FILE)), false);
+        assert.deepEqual(readdirSync(join(workspaceDir(workspace), "layers")).filter((name) => name.startsWith(".")), []);
+      }
+      // Of an image no manifest names, nothing is left; one a manifest names is kept.
+      assert.equal(imagesOf(here, "fs-abc").includes(unnamed), false);
+      assert.deepEqual(keysOf(s3, `main/fs-abc/layers/${unnamed}/`), []);
+      assert.equal(s3.uploads.size, 0);
+      assert.ok(imagesOf(here, "fs-def").includes(named));
+      assert.deepEqual(keysOf(s3, `main/fs-def/layers/${named}/`), [`main/fs-def/layers/${named}/checkpoint.img`]);
+    })
+  ));
+
 test("a compaction's hashes and its upload wait while a restore on its node reads its image", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
@@ -972,7 +1014,9 @@ test("a compaction's hashes and its upload wait while a restore on its node read
       yield* resumeOther(otherSnapshot.snapshot);
       const putting = (file: string) => s3.requests.some((asked) => asked.startsWith("PUT main/fs-abc/layers/") && asked.endsWith(`/${file}`) && !named(asked));
       yield* Effect.sync(() => putting("checkpoint.img")).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (put) => put }));
-      assert.equal(readdirSync(stampsDir).filter((name) => !named(name)).length, 1);
+      const [stamped = ""] = readdirSync(stampsDir).filter((name) => !named(name));
+      // Its image, which no manifest names yet, said beside the images with what it compacts into.
+      assert.equal((JSON.parse(readFileSync(join(here.cacheDir, "main", "fs-abc", COMPACTING_FILE), "utf8")) as { readonly digest?: string }).digest, stamped.replace(/\.json$/u, ""));
       writeFileSync(join(runscDir, "hold-wait"), "");
       yield* prepareOther;
       letGo();

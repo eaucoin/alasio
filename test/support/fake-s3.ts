@@ -2,7 +2,7 @@
  * A stand-in for an S3 API, in process, serving one bucket by path-style URLs as
  * SeaweedFS does: PutObject, CopyObject, GetObject (of a range too), HeadObject, DeleteObject,
  * ListObjectsV2, and multipart uploads (CreateMultipartUpload, UploadPart, UploadPartCopy,
- * CompleteMultipartUpload, AbortMultipartUpload), every
+ * CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads), every
  * request's Signature Version 4 checked against the credentials it is given, with every
  * `x-amz-*` header signed, and a signed payload's hash against the payload. What it was
  * asked is recorded in order, and a request can be made to fail.
@@ -183,6 +183,23 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
         response.writeHead(204).end();
         return;
       }
+    }
+    if (!key && method === "GET" && url.searchParams.has("uploads")) {
+      const prefix = url.searchParams.get("prefix") ?? "";
+      const begun = [...uploads.entries()].map(([id, { key: named }]) => ({ id, key: named })).filter(({ key: named }) => named.startsWith(prefix))
+        .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : a.id < b.id ? -1 : 1));
+      const keyMarker = url.searchParams.get("key-marker");
+      const idMarker = url.searchParams.get("upload-id-marker") ?? "";
+      const after = keyMarker === null ? begun : begun.filter(({ key: named, id }) => named > keyMarker || (named === keyMarker && id > idMarker));
+      const page = after.slice(0, pageSize);
+      const last = page.at(-1);
+      const truncated = after.length > pageSize && last !== undefined;
+      response.writeHead(200, { "content-type": "application/xml" }).end([
+        `<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult><Bucket>${bucket}</Bucket><Prefix>${escapeXml(prefix)}</Prefix>`,
+        ...page.map(({ key: named, id }) => `<Upload><Key>${escapeXml(named)}</Key><UploadId>${id}</UploadId></Upload>`),
+        `<IsTruncated>${truncated}</IsTruncated>${truncated ? `<NextKeyMarker>${escapeXml(last.key)}</NextKeyMarker><NextUploadIdMarker>${last.id}</NextUploadIdMarker>` : ""}</ListMultipartUploadsResult>`,
+      ].join(""));
+      return;
     }
     if (!key && method === "GET" && url.searchParams.get("list-type") === "2") {
       const prefix = url.searchParams.get("prefix") ?? "";

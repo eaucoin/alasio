@@ -131,6 +131,8 @@ export interface S3Bucket {
   readonly remove: (key: string) => Effect.Effect<void, S3Error>;
   /** Every object under `prefix`, in the order of their keys. */
   readonly list: (prefix: string) => Effect.Effect<readonly ListedObject[], S3Error>;
+  /** Aborts every multipart upload begun under `prefix` and neither completed nor aborted, as an uploader that stopped left it: how many. */
+  readonly abortUploads: (prefix: string) => Effect.Effect<number, S3Error>;
 }
 
 /** The payload hash of a request whose payload is not signed, as a streamed upload's is. */
@@ -550,6 +552,27 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
           token = elements(page, "IsTruncated")[0] === "true" ? elements(page, "NextContinuationToken")[0] : undefined;
         } while (token !== undefined);
         return listed;
+      }),
+
+    abortUploads: (prefix) =>
+      attempt("abort", `${prefix}*`, async (signal) => {
+        const begun: { readonly key: string; readonly uploadId: string }[] = [];
+        let after: { readonly key: string; readonly uploadId: string } | undefined;
+        do {
+          const query = { uploads: "", prefix, ...(after === undefined ? {} : { "key-marker": after.key, "upload-id-marker": after.uploadId }) };
+          const page = await bodyText(await succeeded(await call("GET", null, { query }, signal)), Number.POSITIVE_INFINITY);
+          for (const upload of elementsXml(page, "Upload")) {
+            const [key] = elements(upload, "Key");
+            const [uploadId] = elements(upload, "UploadId");
+            if (key === undefined || uploadId === undefined) throw new Error(`it listed an upload with no key or no id: ${upload}`);
+            begun.push({ key, uploadId });
+          }
+          const [key] = elements(page, "NextKeyMarker");
+          const [uploadId] = elements(page, "NextUploadIdMarker");
+          after = elements(page, "IsTruncated")[0] === "true" && key !== undefined && uploadId !== undefined ? { key, uploadId } : undefined;
+        } while (after !== undefined);
+        for (const { key, uploadId } of begun) await bodyText(await succeeded(await call("DELETE", key, { query: { uploadId } }, signal), [404]), 0);
+        return begun.length;
       }),
   };
 }
