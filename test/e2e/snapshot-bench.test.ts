@@ -40,7 +40,7 @@ import { BINDING_LABEL, FREE_LABEL, keyHash, leaseName, POOL_LABEL } from "../..
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { BAYMA_CONTAINER, RESTORE_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
 import { compactionDue, type Manifest } from "../../src/node-agent/agent.ts";
-import { CONTAINERD, GVISOR_RELEASES, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
+import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { bindSession, boundPodOf, dumpClusterState, gatewayCall, kube, mainToken, nodeAgents, onNode, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
 
@@ -405,22 +405,11 @@ async function endUnsaved(workspace: string, name: string): Promise<void> {
   }
 }
 
+/** Spike: where fatrace says, through a warm restore, which process opened which file. */
+const FATRACE = "/var/log/fatrace-warm.log";
+
 /** Spike: where each run of a release's checkpointgofer is logged: when, by which process, of which arguments. */
 const GOFER_EXECS = "/var/log/gofer-execs.log";
-
-/** Spike: each release's checkpointgofer on `node` wrapped by a script that logs who runs it, then runs it. */
-async function wrapGofers(node: string): Promise<void> {
-  const wrapper = [
-    "#!/bin/sh",
-    "p=$PPID",
-    "g=$(awk '{print $4}' /proc/$p/stat)",
-    `echo "$(date +%s.%N) pid=$$ ppid=$p parent=$(tr '\\0' ' ' < /proc/$p/cmdline | cut -c1-300) grandparent=$(tr '\\0' ' ' < /proc/$g/cmdline | cut -c1-300) args=$*" >> ${GOFER_EXECS}`,
-    'exec "$0.real" "$@"',
-  ].join("\n");
-  const script = join(BENCH_DIR, "gofer-wrapper.sh");
-  writeFileSync(script, `${wrapper}\n`);
-  await onNode(node, `for f in ${GVISOR_RELEASES}/*/gvisor-bin/checkpointgofer; do [ -e "$f.real" ] || mv "$f" "$f.real"; cp '${script}' "$f"; chmod 755 "$f"; done; ls -la ${GVISOR_RELEASES}/*/gvisor-bin/`);
-}
 
 /** Spike: the node agent's log lines of `node`, timestamped. */
 async function agentLines(node: string): Promise<string[]> {
@@ -676,12 +665,12 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
 
     phase = "restore-warm";
     if (VARIANT !== "kept-cache") await dropPageCache(node);
-    await onNode(node, `echo "# warm ${fixture}/${sizeMib} run ${run} begins $(date +%s.%N)" >> ${GOFER_EXECS}`);
+    await onNode(node, `echo "# warm ${fixture}/${sizeMib} run ${run} begins $(date +%s.%N)" >> ${GOFER_EXECS}; setsid nohup fatrace -t -f O > ${FATRACE} 2>&1 < /dev/null & echo $! > ${FATRACE}.pid`);
     const sampling = await sampleIo(node, `${fixture}-${sizeMib}-${run}-warm`);
     const warm = await restore(workspace, sessionId, fixture, runId, manifest);
     await sampling.stop();
     const spike = { compaction, io: sampling.file, ...(await tracedRestore(node, workspace, warm.probed)) };
-    await onNode(node, `echo "# warm ${fixture}/${sizeMib} run ${run} ends $(date +%s.%N)" >> ${GOFER_EXECS}`);
+    await onNode(node, `kill $(cat ${FATRACE}.pid); sleep 0.5; echo "# warm ${fixture}/${sizeMib} run ${run} ends $(date +%s.%N)" >> ${GOFER_EXECS}; grep -a -E 'gvisor-bin|eaucoin.1[0-9]/runsc' ${FATRACE} | head -n 60 >> ${GOFER_EXECS}; grep -a -c . ${FATRACE} >> ${GOFER_EXECS}`);
     emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, { ...warm.details, spike });
     done.add(phase);
     await endUnsaved(workspace, warm.pod);
@@ -825,7 +814,7 @@ before(async () => {
     await setUp();
     const agents = await nodeAgents();
     for (const node of agents.keys()) await bootLogs(node);
-    for (const node of agents.keys()) await wrapGofers(node);
+    await onNode("", "apt-get install -y -q fatrace >/dev/null 2>&1 || (apt-get update -q >/dev/null && apt-get install -y -q fatrace >/dev/null); command -v fatrace");
     await shapeAgents();
     // How the store answers through the profile, from where the saves run: the node agent's network.
     const [node = ""] = (await nodeAgents()).keys();
