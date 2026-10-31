@@ -536,6 +536,46 @@ test("a resumed restore whose bytes of pages are not known yet reads however qui
       assert.equal(proxy.reading(), 0);
     }), { quietMs: 100 }));
 
+test("a restore is done reading through the proxy once it has been served every byte of pages it was told, once told none it is resumed and quiet, or once its token is gone: revoked, minted anew, or past its time", () =>
+  withProxy(({ proxy }) =>
+    Effect.gen(function*() {
+      /** Whether the restore of `token` is done reading within `ms`, as what waits on it sees, polling every second. */
+      const doneWithin = (token: StoreToken | string, ms: number) =>
+        proxy.readsDone(typeof token === "string" ? token : token.accessKeyId).pipe(
+          Effect.as(true),
+          Effect.timeoutOrElse({ duration: ms, orElse: () => Effect.succeed(false) }),
+        );
+      // Told its 4096 bytes once known: reading until it has been served them all.
+      const told = minted(proxy);
+      proxy.expect(told.accessKeyId, Number.POSITIVE_INFINITY);
+      assert.equal(yield* doneWithin(told, 1200), false);
+      proxy.expect(told.accessKeyId, 4096);
+      assert.equal(refusal(yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token: told, range: "bytes=0-2047" }))), "206 ");
+      assert.equal(yield* doneWithin(told, 1200), false);
+      assert.equal(refusal(yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token: told, range: "bytes=2048-4095" }))), "206 ");
+      assert.equal(yield* doneWithin(told, 1500), true);
+      // Told none: reading until it is resumed and quiet.
+      const untold = minted(proxy);
+      // The token before, minted anew, is gone.
+      assert.equal(yield* doneWithin(told, 100), true);
+      proxy.expect(untold.accessKeyId, null);
+      assert.equal(yield* doneWithin(untold, 1200), false);
+      proxy.resumed("main/fs-abc", 60_000);
+      assert.equal(yield* doneWithin(untold, 1500), true);
+      // Revoked, as its restore ended.
+      const revoked = minted(proxy, "main/fs-other");
+      proxy.expect(revoked.accessKeyId, Number.POSITIVE_INFINITY);
+      assert.equal(yield* doneWithin(revoked, 1200), false);
+      proxy.revoke("main/fs-other");
+      assert.equal(yield* doneWithin(revoked, 1500), true);
+      // Never resumed, past its prepare's time.
+      const lapsed = minted(proxy, "main/fs-lapsed");
+      proxy.expect(lapsed.accessKeyId, Number.POSITIVE_INFINITY);
+      assert.equal(yield* doneWithin(lapsed, 5500), true);
+      // Of a token there is not, at once.
+      assert.equal(yield* doneWithin("ALASIONONE", 100), true);
+    }), { quietMs: 100, preparedForMs: 4000 }));
+
 test("what the proxy is told of a restore's bytes is of the token it names, never of a later token of the same workspace", () =>
   withProxy(({ proxy }) =>
     Effect.gen(function*() {

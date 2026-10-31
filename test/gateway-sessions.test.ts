@@ -871,7 +871,7 @@ test("a workspace released into its snapshot is restored from it as it is next b
   const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
   const counted = await added("alasio.sandbox.restores", async () => {
     const binding = Effect.runPromise(binder.bind(placement.pool, key, placement));
-    // Its pod runs, as kubelet would run it, then, once resumed, is ready.
+    // Its pod runs, its containers ready, as kubelet would run it: unready until resumed, as its gate says, and bound once resumed, kubelet yet to say it ready.
     const restored = await restorePodOf(env);
     const name = restored.metadata?.name ?? "";
     // Never started again, as its container's start restores it from its snapshot.
@@ -880,13 +880,7 @@ test("a workspace released into its snapshot is restored from it as it is next b
     assert.deepEqual(recorded.attached.map(({ node, pod, made }) => ({ node, pod, made })), [{ node: "node-a", pod: name, made: true }]);
     assert.equal(recorded.attached[0]?.env["BAYMA_SANDBOX_STOP_REASON"], "it ran out of its memory (4Gi)");
     assert.deepEqual(recorded.asked, [`prepare node-a socket retrying pages`]);
-    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-restored", state: { running: {} } }] } })));
-    for (;;) {
-      const pod = (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, name)))) as V1Pod;
-      if (pod.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True")) break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { conditions: [{ type: "Ready", status: "True" }] } })));
+    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-restored", state: { running: {} } }], conditions: [{ type: "ContainersReady", status: "True" }, { type: "Ready", status: "False", reason: "ReadinessGatesNotReady" }] } })));
     const bound = await binding;
     assert.equal(bound.pod, name);
     // Of the pool's template, its sandbox restored paused from the image its node's agent prepared, under the release that took it, on that node.
