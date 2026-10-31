@@ -61,6 +61,9 @@ export interface Endpoint {
   readonly headers: Readonly<Record<string, string>>;
 }
 
+/** Spike: how the probe's connection went, its refusals and when it connected. */
+const connecting: { refusals: string[]; connected_ns: string | null } = { refusals: [], connected_ns: null };
+
 /** A connected client of a bayma. */
 class Bayma {
   private readonly client: Client;
@@ -80,8 +83,12 @@ class Bayma {
     const deadline = Date.now() + CONNECT_TIMEOUT_MS;
     for (;;) {
       try {
-        return await Bayma.connect(endpoint);
+        const connected = await Bayma.connect(endpoint);
+        connecting.connected_ns = String(now());
+        return connected;
       } catch (error) {
+        // Spike: each failed attempt, when and why.
+        connecting.refusals.push(`${Date.now()} ${statusOf(error) ?? ""} ${String(error instanceof Error ? error.message : error).slice(0, 200)}`);
         if (Date.now() > deadline || !refused(error)) throw error;
         // A server that answered to be asked again (502, 503, 504), as a bayma whose restore's hook has not come yet does, is asked a second on, as its Retry-After says.
         await sleep(statusOf(error) === undefined ? 10 : 1000);
@@ -216,6 +223,7 @@ const saysClosed = (notice: string | null): boolean => notice !== null && /conne
  * session over, runs the first exec, then the verify exec, and says what they found.
  */
 export async function probe(endpoint: Endpoint, sessionId: string, fixture: Fixture, runId: string, t0 = now()) {
+  const t0Wall = Date.now();
   return controlling(endpoint, sessionId, async (bayma) => {
     const connected = now();
     const { value: first, notice } = await bayma.bench<Record<string, unknown>>(sessionId, call(fixture, "first"));
@@ -238,6 +246,9 @@ export async function probe(endpoint: Endpoint, sessionId: string, fixture: Fixt
     const noticeAgrees = socket === null ? null : socket === "closed" || !saysClosed(notice);
     return {
       t0_ns: String(t0),
+      t0_wall_ms: t0Wall,
+      initialized_ns: connecting.connected_ns,
+      refusals: connecting.refusals,
       connected_ns: String(connected),
       first_exec_end_ns: String(firstEnd),
       verify_end_ns: String(verifyEnd),

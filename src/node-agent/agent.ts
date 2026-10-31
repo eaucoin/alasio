@@ -75,7 +75,7 @@ import { Clock, type Duration, Effect, RcMap, Schedule, Schema, type Scope, Sema
 import { quantityOf } from "../kube/quantity.ts";
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
-import { withLogScope } from "../shared/log.ts";
+import { trace, withLogScope } from "../shared/log.ts";
 import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCache } from "./cache.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { type Listing, listedEgressGap, type PodAddress } from "./kube-router.ts";
@@ -971,7 +971,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       return yield* Effect.gen(function*() {
         // runsc writes the image into a directory it makes.
         yield* onDisk(() => rm(staged, { recursive: true, force: true }));
+        yield* trace(`${workspace} agent compact-start`);
         const [compactMs] = yield* timed(runsc.compact(release, { imagePath: cache.image(environment, workspace, own.digest), layerPath: join(cache.workspace(environment, workspace), LAYERS_DIR), output: staged }));
+        yield* trace(`${workspace} agent compact-written ${compactMs}`);
         yield* Effect.sync(() => compactionDuration.record(compactMs / 1000));
         const image = yield* runsc.inspect(release, staged);
         if (image.version !== runscVersion(release)) {
@@ -982,7 +984,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         yield* cache.commit(environment, workspace, snapshot, image.digest);
         const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest)));
         yield* cache.stamp(environment, workspace, image.digest, files);
+        yield* trace(`${workspace} agent compact-uploading`);
         const [uploadMs, uploaded] = yield* timed(upload(committed, image.digest, files));
+        yield* trace(`${workspace} agent compact-uploaded`);
         if (!(yield* inBucket(committed, uploaded))) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image ${image.digest} is not in the bucket as it was put` });
         const manifest: Manifest = { ...committed, snapshot, layers: [uploaded], bytes: bytesOf([uploaded]), uploadMs, compactedFrom: committed.snapshot };
         // What it uploaded, should the workspace have moved on meanwhile, no manifest names, and is collected as any such image is.
@@ -1313,6 +1317,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     exclusive(
       [ref],
       Effect.gen(function*() {
+        yield* trace(`${ref.workspace} agent prepare`);
         // A restore of the workspace before this one is done with, its reads of the bucket with it.
         storeProxy.revoke(prefixOf(ref));
         const manifest = yield* current(ref);
@@ -1413,6 +1418,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         yield* Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": "prepared", "alasio.node_agent.prepare.source": source }));
         yield* Effect.annotateCurrentSpan({ "alasio.snapshot.source": source, "alasio.snapshot.bytes": manifest.bytes, "alasio.snapshot.prepare_ms": preparedMs });
         yield* Effect.logInfo(`prepared the snapshot ${snapshot} of ${prefixOf(manifest)} from the ${source}: ${manifest.bytes} bytes in ${preparedMs} ms`);
+        yield* trace(`${ref.workspace} agent prepared`);
         return { manifest, imagePath, source };
       }),
     ).pipe(
@@ -1575,16 +1581,21 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   const resume = (request: ResumeRequest): Effect.Effect<void, ResumeError> =>
     Effect.gen(function*() {
+      yield* trace(`${request.workspace} agent resume-asked`);
       const waited = yield* policiesInForce(request);
+      yield* trace(`${request.workspace} agent policies-in-force ${waited}`);
       yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
       const containers = yield* Effect.forEach(request.containerIds, (id) => ofPod(id, request.namespace, request.pod));
       const from = yield* restoredFrom(request);
       if (from.live !== undefined) yield* holdsStill(from, from.live, containers);
+      yield* trace(`${request.workspace} agent containers-found`);
       yield* Effect.forEach(request.podIPs, forgetConnections, { discard: true });
+      yield* trace(`${request.workspace} agent connections-forgotten`);
       // Its restore reads what its sandbox did not touch first in the background, for a while yet, from its resume on: bayma's
       // hook, which runsc's resume runs, waits on those reads of the pages it touches, however long after the prepare.
       storeProxy.resumed(prefixOf(request), backgroundReadMs);
       yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
+      yield* trace(`${request.workspace} agent runsc-resumed`);
       // Its sandbox runs from the snapshot it was restored from, which its next checkpoint saves what changed since.
       for (const id of request.containerIds) bases.set(id, from);
       return waited;
