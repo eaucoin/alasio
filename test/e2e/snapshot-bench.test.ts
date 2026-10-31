@@ -349,6 +349,8 @@ async function restore(workspace: string, sessionId: string, fixture: string, ru
     readonly workload_rss_bytes: number;
     readonly notice: string | null;
   }>(workspace, "probe", "--session", sessionId, "--fixture", fixture, "--run-id", runId);
+  // Spike: what the restore read into the node's page cache, which was dropped before it.
+  await residency(String(process.env["SPIKE_NODE"] ?? ""), `${fixture}-${runId}-${manifest.snapshot}`);
   const settled = await watching;
   if ("error" in settled) throw settled.error;
   const { residentNs, pod, error } = settled.watched;
@@ -403,6 +405,13 @@ async function endUnsaved(workspace: string, name: string): Promise<void> {
     if ((await kube.get(lease)) === null) return;
     if (Date.now() > deadline) throw new Error(`the binding of ${workspace} was not let go within 300 s of its pod's end`);
   }
+}
+
+/** Spike: every file of the node's that the page cache holds pages of now, with how many bytes of it, into logs/resident-<name>.txt. */
+async function residency(node: string, name: string): Promise<void> {
+  const file = join(BENCH_DIR, "logs", `resident-${name}.txt`);
+  const directories = ["/var/lib/rancher/k3s/agent/containerd", "/var/lib/rancher/k3s/data", "/usr/local/lib/alasio", "/var/lib/alasio", "/var/jfsCache", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/local/bin", "/opt"];
+  await onNode(node, `for d in ${directories.join(" ")}; do [ -d "$d" ] && find "$d" -xdev -type f -size +0 -print0 2>/dev/null; done | xargs -r -0 fincore --bytes --noheadings --raw -o RES,SIZE,FILE 2>/dev/null | awk '$1 > 0' > '${file}'; wc -l < '${file}'`);
 }
 
 /** Spike: the node agent's log lines of `node`, timestamped. */
@@ -658,6 +667,11 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace }, to: { environment: SESSIONS, workspace: copy }, quotaBytes: quota.capacityBytes });
 
     phase = "restore-warm";
+    // Spike: what the node reads into its page cache meanwhile without a restore, as long as one takes.
+    process.env["SPIKE_NODE"] = node;
+    await dropPageCache(node);
+    await sleep(4000);
+    await residency(node, `${fixture}-${runId}-control`);
     if (VARIANT !== "kept-cache") await dropPageCache(node);
     const sampling = await sampleIo(node, `${fixture}-${sizeMib}-${run}-warm`);
     const warm = await restore(workspace, sessionId, fixture, runId, manifest);
