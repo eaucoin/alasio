@@ -81,7 +81,8 @@ jobs:
           retention-days: 3
 
   images:
-    needs: candidate
+    # Spike: after the shards, so that the run holds one runner at a time.
+    needs: [candidate, shards]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -190,6 +191,8 @@ jobs:
   # it a shard on every cluster, target/shard on its target's, or target/agents/shard on
   # one; a word that names none fails the run before any starts.
   shards:
+    # Spike: after the candidate, so that the run holds one runner at a time.
+    needs: candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
