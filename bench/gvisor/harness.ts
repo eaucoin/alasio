@@ -220,10 +220,11 @@ interface Setup {
   /** Whether V8's heap statistics in a node the instance starts are recorded (X-SRV). */
   readonly heapStats: boolean;
   /**
-   * Whether bayma's server runs a last-resort full collection, timed, just before each save (the
-   * endpoint package's X-SRV): its nodeFlags must load SERVER_GC, which runs it on SIGUSR2.
+   * Before which saves bayma's server runs a last-resort full collection, timed (the endpoint
+   * package's X-SRV): none, each, or the release alone (the save that stops it); its nodeFlags
+   * must load SERVER_GC, which runs it on SIGUSR2.
    */
-  readonly serverGc: boolean;
+  readonly serverGc: "none" | "each" | "release";
 }
 
 const TUNED: Setup = {
@@ -254,7 +255,7 @@ const TUNED: Setup = {
   hygiene: null,
   idleSaves: [],
   heapStats: false,
-  serverGc: false,
+  serverGc: "none",
 };
 
 const DEFAULTS: Setup = { ...TUNED, name: "defaults", variant: "defaults", hostSettings: "check", checkpoint: [], background: false, warmDirect: false, lazy: null, warm: [{ variant: "defaults", cache: "dropped" }] };
@@ -308,8 +309,11 @@ process.on("SIGUSR2", () => {
 });
 `;
 
+/** The server's flags for SERVER_GC: its memory reducer off, gc() exposed, the script loaded. */
+const SERVER_GC_FLAGS = ["--no-memory-reducer", "--expose-gc", `--require=${SERVER_GC}`];
+
 /** X-IDLE's source and X-SRV's setups: idle saves traced, then a warm restore, `serverFlags` added. */
-function idleTraced(variant: string, serverFlags: readonly string[]): Setup {
+function idleTraced(variant: string, serverFlags: readonly string[], serverGc: Setup["serverGc"]): Setup {
   const base = traced(variant, { trace: false });
   return {
     ...base,
@@ -318,7 +322,7 @@ function idleTraced(variant: string, serverFlags: readonly string[]): Setup {
     warm: [{ variant, cache: "dropped" }],
     lazy: null,
     nodeFlags: ["--trace-gc", "--trace-memory-reducer", ...serverFlags],
-    serverGc: serverFlags.length > 0,
+    serverGc,
   };
 }
 
@@ -347,7 +351,15 @@ const SETUPS: Record<string, readonly Setup[]> = {
   // marking path, and what each process wrote, by vma (the fork's --dirty-trace=log), the server's
   // collections and memory reducer logged; as bayma runs today, and with the server's memory
   // reducer off and a last-resort full collection just before each save; then restored warm.
-  "idle-traced": [idleTraced("idle-traced", []), idleTraced("idle-srv-gc", ["--no-memory-reducer", "--expose-gc", `--require=${SERVER_GC}`])],
+  "idle-traced": [idleTraced("idle-traced", [], "none"), idleTraced("idle-srv-gc", SERVER_GC_FLAGS, "each"), idleTraced("idle-no-reducer", ["--no-memory-reducer"], "none")],
+  // X-SRV at a release: a session saved and stopped just after its setup, as bayma runs today,
+  // with the server's memory reducer off, and with it off and a last-resort full collection just
+  // before the save; then restored warm, its server's collections logged.
+  "srv-release": [
+    { ...traced("srv-today", { trace: false }), lazy: null, nodeFlags: ["--trace-gc", "--trace-memory-reducer"] },
+    { ...traced("srv-no-reducer", { trace: false }), lazy: null, nodeFlags: ["--trace-gc", "--trace-memory-reducer", "--no-memory-reducer"] },
+    { ...traced("srv-gc", { trace: false }), lazy: null, nodeFlags: ["--trace-gc", "--trace-memory-reducer", ...SERVER_GC_FLAGS], serverGc: "release" },
+  ],
   // G-3 at 200 MiB: what the Bun runtime reads before its first answer, as it comes, with the
   // fixture's heap detector walking the heap at each exec, with Bun's GC timers off, and after a
   // collection in an exec just before the save.
@@ -781,8 +793,8 @@ type ServerGc = Record<string, number> | null;
  * Has bayma's server run its collection before a save, where the setup asks for one: SIGUSR2 to
  * the instance's first `node` process, then its line in the instance's output, `out`, awaited.
  */
-async function serverGc(setup: Setup, logDir: string, id: string, out: string): Promise<ServerGc> {
-  if (!setup.serverGc) return null;
+async function serverGc(setup: Setup, logDir: string, id: string, out: string, release = false): Promise<ServerGc> {
+  if (setup.serverGc === "none" || (setup.serverGc === "release" && !release)) return null;
   const said = () => readFileSync(out, "utf8").split("\n").filter((line) => line.startsWith("BENCH-SERVER-GC "));
   const before = said().length;
   // "UID PID PPID C STIME TIME CMD": the server is the first node, whose main thread node names
@@ -848,7 +860,7 @@ async function save(setup: Setup, logDir: string, p: Paths, live: boolean, nth: 
   const image = live ? p.live : p.stop;
   const prefix = `${p.prefix}${live ? "live" : "stop"}/`;
   const before = await bucketBytes(prefix);
-  const gc = await serverGc(setup, logDir, p.id, join(p.logs, "instance.out"));
+  const gc = await serverGc(setup, logDir, p.id, join(p.logs, "instance.out"), !live);
   await mark?.();
   const t0 = now();
   await runsc(setup, logDir, ["checkpoint", `--image-path=${image}`, ...(live ? ["--leave-running"] : []), ...setup.checkpoint, `--save-restore-exec-argv=${HOOK.join(" ")}`, p.id]);
