@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Installs what the gvisor system runs on a CI runner: upstream gVisor's release (runsc, its
 # shim and its gvisor-bin/ sidecars, from the release tarball, checked against its SHA-512, as
-# gvisor.dev's install guide does it), and rclone, whose FUSE mount of the bucket the `lazy`
-# variant restores through. Run as root.
+# gvisor.dev's install guide does it), or the release binaries of a build of the fork in the
+# directory given, as its fork-ci run left them (the `traced` variants'); and rclone, whose FUSE
+# mount of the bucket the `lazy` variant restores through. Run as root.
+#
+#   bench/gvisor/install.sh [<release directory>]
 set -euo pipefail
+build=${1:-}
 
 GVISOR_RELEASE=20261019.0
 RCLONE_VERSION=v1.75.2
@@ -12,11 +16,17 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 cd "$work"
 
-gvisor="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64"
-curl -fsSLO "$gvisor/gvisor.tar.zstd"
-curl -fsSLO "$gvisor/gvisor.tar.zstd.sha512"
-sha512sum -c gvisor.tar.zstd.sha512
-tar --zstd -xf gvisor.tar.zstd -C /usr/local/bin
+if [ -n "$build" ]; then
+  # An artifact's files come without their modes.
+  chmod -R a+rx "$build"
+  cp -r "$build"/. /usr/local/bin/
+else
+  gvisor="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64"
+  curl -fsSLO "$gvisor/gvisor.tar.zstd"
+  curl -fsSLO "$gvisor/gvisor.tar.zstd.sha512"
+  sha512sum -c gvisor.tar.zstd.sha512
+  tar --zstd -xf gvisor.tar.zstd -C /usr/local/bin
+fi
 /usr/local/bin/runsc --version
 
 rclone="rclone-${RCLONE_VERSION}-linux-amd64"

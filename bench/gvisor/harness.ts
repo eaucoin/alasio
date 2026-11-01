@@ -4,7 +4,8 @@
  * the bucket, restored with `runsc restore --background`: warm from the image directory the
  * save staged, cold from the bucket, either downloaded whole first (`fetch`) or read through
  * an rclone FUSE mount of the bucket as the sandbox runs, the pages file preloaded behind it
- * (`lazy`). README.md says why each setting is what it is.
+ * (`lazy`). README.md says why each setting is what it is. The `traced` setups run the fork's
+ * measurement build instead, which install.sh installs where it is given one (`traced`).
  *
  *   node harness.ts <profile>
  *
@@ -34,9 +35,10 @@ const DOWNLOAD = ["--at-once", "16", "--range-bytes", String(16 << 20)];
 
 const RUNSC = "/usr/local/bin/runsc";
 const RCLONE = "/usr/local/bin/rclone";
-export const GVISOR_RELEASE = "release-20261019.0";
 export const RCLONE_VERSION = "v1.75.2";
 const IMAGE = "ghcr.io/eaucoin/alasio-agent:10.0.0@sha256:b90f8164f77e9a56bd0da0fc1869bc76c1c541742a07751764ffc156fa8fe30a";
+/** The session image of alasio 10.0.5 (bayma 0.15.6), which the traced setups run, as the box does. */
+const IMAGE_10_0_5 = "ghcr.io/eaucoin/alasio-agent:10.0.5@sha256:b870b3981fe519b1ae199f628f939c5ee98eabb18adcc0da55fe35058e933949";
 
 /** runsc's state for the job's sandboxes. */
 const ROOT = "/run/gvbench";
@@ -174,6 +176,18 @@ interface Setup {
   readonly warmDirect: boolean;
   /** A cold restore through rclone's mount of the bucket as well, of this variant, with these `rclone mount` flags. */
   readonly lazy: { readonly variant: string; readonly mount: readonly string[] } | null;
+  /** runsc's flags for every command, besides its root, its logs and its host settings. */
+  readonly flags: readonly string[];
+  /** The session image whose root filesystem the instance runs. */
+  readonly image: string;
+  /** The bayma that image holds. */
+  readonly bayma: string;
+  /** Whether a run saves live before it saves and stops (save-live). */
+  readonly live: boolean;
+  /** The warm restores of each run, in order, and the variant each carries: with the page cache dropped, or kept. */
+  readonly warm: readonly { readonly variant: string; readonly cache: "dropped" | "kept" }[];
+  /** Whether a run restores cold from the bucket downloaded whole (`fetch`). */
+  readonly fetch: boolean;
 }
 
 const TUNED: Setup = {
@@ -189,9 +203,48 @@ const TUNED: Setup = {
     // rclone's own chunked reading, which beat its suggested 16 streams of 4 MiB: README.md, "Tuning".
     mount: ["--read-only", "--vfs-cache-mode", "full"],
   },
+  flags: [],
+  image: IMAGE,
+  bayma: "0.15.2",
+  live: true,
+  warm: [{ variant: "fetch", cache: "dropped" }],
+  fetch: true,
 };
 
-const DEFAULTS: Setup = { name: "defaults", variant: "defaults", hostSettings: "check", checkpoint: [], background: false, warmDirect: false, lazy: null };
+const DEFAULTS: Setup = { ...TUNED, name: "defaults", variant: "defaults", hostSettings: "check", checkpoint: [], background: false, warmDirect: false, lazy: null, warm: [{ variant: "defaults", cache: "dropped" }] };
+
+/**
+ * The fork's measurement build (install.sh given its release's directory; the endpoint package's G-3): runsc as alasio
+ * 10.0.5 configures it ([runsc_config] in cli/src/cluster/k3s.ts), the working set recorded for
+ * 60 s rather than 3 s so that it covers the first exec and the verify, and every await of pages
+ * logged (--async-awaits-trace=log); restored in the background but not paused, so that the
+ * application runs while its pages load, warm with the page cache dropped and then kept, and cold
+ * through rclone's mount on a store's profiles. `uncached` also maps large pmas' accessed ranges
+ * alone while they load, as upstream's c63a70c947 does.
+ */
+const traced = (uncached: boolean): Setup => {
+  const variant = uncached ? "traced-uncached" : "traced";
+  return {
+    ...TUNED,
+    name: variant,
+    variant,
+    lazy: TUNED.lazy && { ...TUNED.lazy, variant: `${variant}-lazy` },
+    flags: [
+      "--restore-validate-files=all",
+      "--dirty-tracking=wp",
+      "--working-set-window=60s",
+      "--allow-live-tcp-migration=false",
+      "--app-huge-pages=false",
+      "--async-awaits-trace=log",
+      ...(uncached ? ["--async-load-internal-mappings=uncached"] : []),
+    ],
+    image: IMAGE_10_0_5,
+    bayma: "0.15.6",
+    live: false,
+    warm: [{ variant, cache: "dropped" }, { variant: `${variant}-kept`, cache: "kept" }],
+    fetch: false,
+  };
+};
 
 /** The host's settings `--host-settings=adjust` changes (runsc/hostsettings), as they are now. */
 const HOST_SETTINGS = ["/sys/kernel/mm/transparent_hugepage/shmem_enabled", "/sys/kernel/mm/transparent_hugepage/defrag", "/proc/sys/vm/max_map_count"];
@@ -209,7 +262,7 @@ function putHostSettings(values: Record<string, string>): void {
 }
 
 /** runsc's flags for every command of a sandbox: its root, its logs in `logDir`, its host settings. */
-const runscFlags = (setup: Setup, logDir: string) => [`--root=${ROOT}`, `--debug-log=${logDir}/`, `--host-settings=${setup.hostSettings}`];
+const runscFlags = (setup: Setup, logDir: string) => [`--root=${ROOT}`, `--debug-log=${logDir}/`, `--host-settings=${setup.hostSettings}`, ...setup.flags];
 
 const runsc = (setup: Setup, logDir: string, args: readonly string[], allowFail = false) => run(RUNSC, [...runscFlags(setup, logDir), ...args], { allowFail });
 
@@ -245,9 +298,9 @@ async function netDown(): Promise<void> {
 }
 
 /** Unpacks the instance image into ROOTFS, once per job. */
-async function prepareRootfs(): Promise<void> {
-  await run("docker", ["pull", "-q", IMAGE]);
-  const container = (await run("docker", ["create", IMAGE])).stdout.trim();
+async function prepareRootfs(image: string): Promise<void> {
+  await run("docker", ["pull", "-q", image]);
+  const container = (await run("docker", ["create", image])).stdout.trim();
   mkdirSync(ROOTFS, { recursive: true });
   await run("bash", ["-c", `docker export ${container} | tar -x -C ${ROOTFS}`]);
   await run("docker", ["rm", container]);
@@ -353,6 +406,8 @@ interface Common {
   readonly store: Record<string, unknown>;
   readonly profile: string;
   readonly emulated: boolean;
+  /** The gVisor the job runs, as its lines name it. */
+  readonly system: string;
 }
 
 type Row = Record<string, unknown>;
@@ -361,7 +416,7 @@ const NULL_SAVE = { save_total_ms: null, unavailable_ms: null, pause_reported_ms
 const NULL_RESTORE = { first_exec_ms: null, verify_ms: null, resident_ms: null, resident_how: null, memory_peak_bytes: null, memory_bytes: null, workload_rss_bytes: null };
 const NULL_CORRECTNESS = { marker: null, memory: null, children: null, file: null, socket: null, running: null, notice: null };
 
-function rowOf(common: Common, at: { fixture: string; size: number; run: number }, variant: string, phase: string, result: { ok: boolean; failure: string | null; metrics: Row; correctness?: Row; details?: Row }, mounted = false): Row {
+function rowOf(common: Common, setup: Setup, at: { fixture: string; size: number; run: number }, variant: string, phase: string, result: { ok: boolean; failure: string | null; metrics: Row; correctness?: Row; details?: Row }, mounted = false): Row {
   const restore = phase.startsWith("restore");
   return {
     schema: 1,
@@ -380,7 +435,7 @@ function rowOf(common: Common, at: { fixture: string; size: number; run: number 
     correctness: { ...NULL_CORRECTNESS, ...result.correctness },
     host: common.host,
     store: common.store,
-    versions: { system: `gVisor ${GVISOR_RELEASE}${mounted ? `, rclone ${RCLONE_VERSION}` : ""}`, bayma: "0.15.2", seaweedfs: "4.48", toxiproxy: "2.13.0" },
+    versions: { system: `${common.system}${mounted ? `, rclone ${RCLONE_VERSION}` : ""}`, bayma: setup.bayma, seaweedfs: "4.48", toxiproxy: "2.13.0" },
     ci: { run_id: Number(process.env["GITHUB_RUN_ID"] ?? 0), job: process.env["GITHUB_JOB"] ?? "", sha: process.env["GITHUB_SHA"] ?? "" },
     at: new Date().toISOString(),
     details: result.details ?? {},
@@ -463,6 +518,8 @@ async function restore(
   try {
     let helperPeak = 0;
     let sampler: ReturnType<typeof peakSampler> | undefined;
+    // t0 on the wall clock as well, which the Sentry's log lines are on.
+    const t0UnixMs = Date.now();
     const t0 = now();
     const probe = background(process.execPath, [DRIVER, "probe", ...endpointArgs, "--session", sessionId, "--fixture", fixture, "--run-id", runId, "--t0-ns", String(t0)], { timeoutMs: RESTORE_DEADLINE_MS + VERIFY_ALLOWANCE_MS });
     try {
@@ -515,6 +572,8 @@ async function restore(
         correctness: said.correctness,
         details: {
           ...prepared.details,
+          t0_unix_ms: t0UnixMs,
+          first_answer_unix_ms: t0UnixMs + said.first_exec_ms,
           prepare_ms: msBetween(t0, restoreStart),
           runsc_restore_ms: msBetween(restoreStart, restored),
           resident_after_verify_ms: msBetween(BigInt(said.verify_end_ns), residentAt),
@@ -617,51 +676,58 @@ async function oneRun(job: Job, setup: Setup, fixture: string, size: number, run
 
     if (pauseCheck) await checkPause(setup, logDir, p.id, sessionId, fixture);
 
-    try {
-      const mark = () => driver("mark", ["--session", sessionId, "--fixture", fixture]);
-      const gaps = () => driver<Gaps>("gaps", ["--session", sessionId, "--fixture", fixture]);
-      emit(job, rowOf(job.common, at, variant, "save-live", saved(await save(setup, logDir, p, true, mark, gaps))));
-    } catch (error) {
-      emit(job, rowOf(job.common, at, variant, "save-live", failed(error)));
-    } finally {
-      rmSync(p.live, { recursive: true, force: true });
+    if (setup.live) {
+      try {
+        const mark = () => driver("mark", ["--session", sessionId, "--fixture", fixture]);
+        const gaps = () => driver<Gaps>("gaps", ["--session", sessionId, "--fixture", fixture]);
+        emit(job, rowOf(job.common, setup, at, variant, "save-live", saved(await save(setup, logDir, p, true, mark, gaps))));
+      } catch (error) {
+        emit(job, rowOf(job.common, setup, at, variant, "save-live", failed(error)));
+      } finally {
+        rmSync(p.live, { recursive: true, force: true });
+      }
     }
     try {
-      emit(job, rowOf(job.common, at, variant, "save-stop", saved(await save(setup, logDir, p, false))));
+      emit(job, rowOf(job.common, setup, at, variant, "save-stop", saved(await save(setup, logDir, p, false))));
     } catch (error) {
       stopped = error instanceof Error ? error.message : String(error);
-      emit(job, rowOf(job.common, at, variant, "save-stop", failed(error)));
+      emit(job, rowOf(job.common, setup, at, variant, "save-stop", failed(error)));
     }
   } catch (error) {
     if (error instanceof PauseCheckFailed) throw error;
     // The instance never got as far as its saves.
     stopped = error instanceof Error ? error.message : String(error);
-    for (const phase of ["save-live", "save-stop"]) emit(job, rowOf(job.common, at, variant, phase, failed(error)));
+    for (const phase of [...(setup.live ? ["save-live"] : []), "save-stop"]) emit(job, rowOf(job.common, setup, at, variant, phase, failed(error)));
   } finally {
     await endInstance(setup, logDir, p.id);
     await netDown();
   }
 
-  const fetched = { variant, lazy: false };
-  const colds = setup.lazy === null ? [fetched] : runNo % 2 === 1 ? [fetched, { variant: setup.lazy.variant, lazy: true }] : [{ variant: setup.lazy.variant, lazy: true }, fetched];
+  const fetched = setup.fetch ? [{ variant, lazy: false }] : [];
+  const lazy = setup.lazy === null ? [] : [{ variant: setup.lazy.variant, lazy: true }];
+  const colds = runNo % 2 === 1 ? [...fetched, ...lazy] : [...lazy, ...fetched];
   if (stopped !== null) {
     const why = { ok: false, failure: `not reached: save-stop failed: ${stopped}`, metrics: {} };
-    emit(job, rowOf(job.common, at, variant, "restore-warm", why));
-    for (const cold of colds) emit(job, rowOf(job.common, at, cold.variant, "restore-cold", why, cold.lazy));
+    for (const warm of setup.warm) emit(job, rowOf(job.common, setup, at, warm.variant, "restore-warm", why));
+    for (const cold of colds) emit(job, rowOf(job.common, setup, at, cold.variant, "restore-cold", why, cold.lazy));
     await cleanRun(p);
     return;
   }
   await run("cp", ["-a", "--reflink=auto", p.attach, p.attachSaved]);
 
   // The image directory the save staged, from the runner's disk: no restore starts with any of
-  // it in the page cache (DESIGN.md section 4).
-  try {
-    await dropCaches();
-    emit(job, rowOf(job.common, at, variant, "restore-warm", await restore(setup, p, fixture, runId, sessionId, "warm", async () => ({
-      imagePath: p.stop, direct: setup.warmDirect, helpers: () => [], details: { source: "staged image directory" },
-    }))));
-  } catch (error) {
-    emit(job, rowOf(job.common, at, variant, "restore-warm", failed(error)));
+  // it in the page cache (DESIGN.md section 4), but one of a setup that restores it again with
+  // the page cache kept, as a node keeps the files of an image its sandboxes run.
+  for (const warm of setup.warm) {
+    try {
+      await rewindAttach(p);
+      if (warm.cache === "dropped") await dropCaches();
+      emit(job, rowOf(job.common, setup, at, warm.variant, "restore-warm", await restore(setup, p, fixture, runId, sessionId, warm.cache === "dropped" ? "warm" : "warm-kept", async () => ({
+        imagePath: p.stop, direct: setup.warmDirect, helpers: () => [], details: { source: "staged image directory", page_cache: warm.cache },
+      }))));
+    } catch (error) {
+      emit(job, rowOf(job.common, setup, at, warm.variant, "restore-warm", failed(error)));
+    }
   }
   rmSync(p.stop, { recursive: true, force: true });
 
@@ -670,9 +736,9 @@ async function oneRun(job: Job, setup: Setup, fixture: string, size: number, run
       await rewindAttach(p);
       await dropCaches();
       const restored = setup.lazy !== null && cold.lazy ? await coldLazy(job, setup, setup.lazy.mount, p, fixture, runId, sessionId) : await coldFetch(setup, p, fixture, runId, sessionId);
-      emit(job, rowOf(job.common, at, cold.variant, "restore-cold", restored, cold.lazy));
+      emit(job, rowOf(job.common, setup, at, cold.variant, "restore-cold", restored, cold.lazy));
     } catch (error) {
-      emit(job, rowOf(job.common, at, cold.variant, "restore-cold", failed(error), cold.lazy));
+      emit(job, rowOf(job.common, setup, at, cold.variant, "restore-cold", failed(error), cold.lazy));
     }
   }
   await cleanRun(p);
@@ -773,8 +839,10 @@ async function main([profile]: readonly string[]): Promise<void> {
   const cases = all.filter(({ fixture, size_mib }) => asked.length === 0 || asked.includes(`${fixture}/${size_mib}`));
   if (cases.length === 0) throw new Error(`no case of ${asked.join(" ")}`);
   const host = JSON.parse(readFileSync(join(BENCH_DIR, "host.json"), "utf8")) as Row;
+  // "runsc version release-20261019.0": upstream's release, or the build install.sh was given.
+  const version = (await run(RUNSC, ["--version"])).stdout.split("\n")[0]?.replace(/^runsc version /u, "") ?? "";
   const job: Job = {
-    common: { host, store: JSON.parse(readFileSync(join(BENCH_DIR, "store.json"), "utf8")) as Row, profile, emulated: profile !== "local" },
+    common: { host, store: JSON.parse(readFileSync(join(BENCH_DIR, "store.json"), "utf8")) as Row, profile, emulated: profile !== "local", system: `gVisor ${version}` },
     runnerSettings: hostSettings(),
     copyMibS: Number(host["copy_mib_s"]),
     results: join(BENCH_DIR, "results.jsonl"),
@@ -789,13 +857,22 @@ async function main([profile]: readonly string[]): Promise<void> {
       RCLONE_CONFIG_BENCH_REGION: process.env["S3_REGION"] ?? "us-east-1",
     },
   };
+  // The job's variant: `all` is the tuned setup, and upstream's defaults beside it on the store
+  // as the box runs it; `tuned` and `defaults` one of them, as a job of its own; `traced` and
+  // `traced-uncached` the fork's measurement build's, each a job of its own.
+  const variantAsked = process.env["BENCH_VARIANT"] ?? "all";
+  const named: Record<string, readonly Setup[]> = {
+    tuned: [TUNED],
+    defaults: [DEFAULTS],
+    traced: [traced(false)],
+    "traced-uncached": [traced(true)],
+  };
+  const setups = named[variantAsked] ?? (profile === "local" ? [TUNED, DEFAULTS] : [TUNED]);
+  const images = new Set(setups.map((setup) => setup.image));
+  if (images.size !== 1) throw new Error(`a job runs one session image, not ${[...images].join(" and ")}`);
   mkdirSync(WORK, { recursive: true });
   await netDown();
-  await prepareRootfs();
-  // The job's variant: `all` is the tuned setup, and upstream's defaults beside it on the store
-  // as the box runs it; `tuned` and `defaults` one of them, as a job of its own.
-  const variantAsked = process.env["BENCH_VARIANT"] ?? "all";
-  const setups = variantAsked === "tuned" ? [TUNED] : variantAsked === "defaults" ? [DEFAULTS] : profile === "local" ? [TUNED, DEFAULTS] : [TUNED];
+  await prepareRootfs([...images][0] ?? IMAGE);
   let checked = false;
   for (let runNo = 1; runNo <= runs; runNo++) {
     for (const { fixture, size_mib } of cases) {

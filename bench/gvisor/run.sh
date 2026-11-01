@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# The gvisor system's job (DESIGN.md section 8): upstream gVisor's release and rclone installed,
-# then every case's runs, as root, which runsc, the network namespace and dropping the page
-# cache need (harness.ts), against the job's store (common/store/up.sh).
+# The gvisor system's job (DESIGN.md section 8): upstream gVisor's release, or the fork's build
+# in GVISOR_RELEASE_DIR where it is set, and rclone installed, then every case's runs, as root,
+# which runsc, the network namespace and dropping the page cache need (harness.ts), against the
+# job's store (common/store/up.sh).
 #
 #   bench/gvisor/run.sh <target> <profile>
 set -euo pipefail
@@ -12,7 +13,7 @@ if [ "$target" != host ]; then
   echo "gvisor runs on the host target alone, not $target" >&2
   exit 2
 fi
-sudo "$here/install.sh"
+sudo "$here/install.sh" "${GVISOR_RELEASE_DIR:-}"
 set -a
 . "$BENCH_DIR/store/store.env"
 set +a

@@ -43,6 +43,16 @@ carry variant `fetch`, and `lazy` has only `restore-cold` rows. Variant `default
 profile; the job's variant `defaults`, or `all`) is the same run with everything as runsc and the
 runner come: no checkpoint or restore flag but the hook, and the runner's host settings.
 
+Variants `traced` and `traced-uncached` (a job each; ci.yml's `gvisor-run` names the fork-ci run
+whose build they install) run the fork's measurement build of `spike/val-first-exec` on alasio
+10.0.5's session image, with runsc's flags as alasio 10.0.5 sets them, the working set recorded
+for 60 s and every await of pages logged (`--async-awaits-trace=log`); `traced-uncached` adds
+`--async-load-internal-mappings=uncached`. No live save; the warm restore twice, page cache
+dropped (`traced`) then kept (`traced-kept`), and cold through rclone's mount (`traced-lazy`).
+Restores run in the background, not paused, so that the application runs while its pages load;
+each restore's details carry `t0_unix_ms` and `first_answer_unix_ms`, on the clock of the
+Sentry's log, whose lines the endpoint package's G-3 reads.
+
 ## What is measured, and how
 
 - `pause_reported_ms`: runsc's boot log (`--debug-log`; `pkg/sentry/state/state.go`), from the

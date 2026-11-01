@@ -20,7 +20,7 @@ on:
         type: string
         default: "local s3-standard s3-express"
       variants:
-        description: "Variants, a job each, of the systems that name them (alasio: as-shipped with-fix whole; gvisor: all tuned defaults; criu: all phaul splice chain patched eager; firecracker: all chunk-16mib); each system's own default where empty or none of its"
+        description: "Variants, a job each, of the systems that name them (alasio: as-shipped with-fix whole; gvisor: all tuned defaults traced traced-uncached; criu: all phaul splice chain patched eager; firecracker: all chunk-16mib); each system's own default where empty or none of its"
         type: string
         default: ""
       cases:
@@ -43,6 +43,10 @@ on:
         description: "The prefix of the runner kernel's release every bench job must have, others failing at once to be re-run (any if empty)"
         type: string
         default: "7.0."
+      gvisor-run:
+        description: "A fork-ci run of eaucoin/gvisor whose release-<sha> artifact the gvisor system installs in place of upstream's release (for its traced variants)"
+        type: string
+        default: ""
       keep-images:
         description: "Keep the images this run builds, for later runs, to be deleted by hand"
         type: boolean
@@ -75,7 +79,7 @@ jobs:
           words() { jq --raw-input --compact-output '[splits("[\\s,]+") | select(. != "")]' <<<"$1"; }
           matrix=$(jq --null-input --compact-output \
             --argjson systems "$(words "$SYSTEMS")" --argjson targets "$(words "$TARGETS")" --argjson profiles "$(words "$PROFILES")" --argjson variants "$(words "$VARIANTS")" '
-            {alasio: ["as-shipped", "with-fix", "whole"], gvisor: ["all", "tuned", "defaults"], firecracker: ["all", "chunk-16mib"], criu: ["all", "phaul", "splice", "chain", "patched", "eager"]} as $variantsOf
+            {alasio: ["as-shipped", "with-fix", "whole"], gvisor: ["all", "tuned", "defaults", "traced", "traced-uncached"], firecracker: ["all", "chunk-16mib"], criu: ["all", "phaul", "splice", "chain", "patched", "eager"]} as $variantsOf
             | {alasio: ["as-shipped", "with-fix"], gvisor: ["all"], firecracker: ["all"], criu: ["all"]} as $defaults
             | ($variantsOf | keys) as $known
             | ["local", "s3-standard", "s3-express"] as $shapes
@@ -222,6 +226,17 @@ jobs:
           . "$BENCH_DIR/store/store.env"
           set +a
           node bench/common/dist/probe.mjs | tee "$BENCH_DIR/store.json"
+      # The fork's build that gvisor-run names, for the gvisor system to install.
+      - name: The fork's build
+        if: matrix.system == 'gvisor' && inputs.gvisor-run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ inputs.gvisor-run }}
+        run: |
+          gh run download "$RUN" -R eaucoin/gvisor --pattern 'release-*' -D "$BENCH_DIR/gvisor-build"
+          dir=$(find "$BENCH_DIR/gvisor-build" -mindepth 1 -maxdepth 1 -type d)
+          ls -lR "$dir" | head -30
+          echo "GVISOR_RELEASE_DIR=$dir" >>"$GITHUB_ENV"
       - name: Run ${{ matrix.system }}
         run: bench/${{ matrix.system }}/run.sh "$BENCH_TARGET" "$BENCH_PROFILE"
         env:
