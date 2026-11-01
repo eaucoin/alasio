@@ -12,7 +12,7 @@ const zlib = require("node:zlib");
 const util = require("node:util");
 const { EventEmitter } = require("node:events");
 const { Database } = require("bun:sqlite");
-const { serialize } = require("bun:jsc");
+const { heapStats, serialize } = require("bun:jsc");
 
 if (globalThis.bench) throw new Error("this session holds a fixture already");
 
@@ -140,9 +140,12 @@ let marked = null;
 // When the last of the fixture's execs ended, on the monotonic clock and the wall clock: the first
 // exec after a restore says how far each moved since, as a restored sandbox's monotonic clock
 // jumps forward by the time the sandbox was saved.
-let lastExec = { monotonic: now(), wall: Date.now() };
+// It also leaves garbage it holds weakly, and the heap's size: the next exec says whether a
+// collection took the garbage since, and how the heap changed, as JavaScriptCore logs its
+// collections to the runtime's stderr, which bayma does not pass on.
+let lastExec = { monotonic: now(), wall: Date.now(), garbage: new WeakRef({}), heap: heapStats() };
 const ended = (answer) => {
-  lastExec = { monotonic: now(), wall: Date.now() };
+  lastExec = { monotonic: now(), wall: Date.now(), garbage: new WeakRef({ left: [] }), heap: heapStats() };
   return answer;
 };
 
@@ -185,7 +188,17 @@ globalThis.bench = {
    * a walk of it; and how far the clocks moved since the last exec.
    */
   first() {
-    return ended({ marker, records: records.length, last: records.at(-1).id, monotonic_gap_ms: now() - lastExec.monotonic, wall_gap_ms: Date.now() - lastExec.wall });
+    const heap = heapStats();
+    return ended({
+      marker,
+      records: records.length,
+      last: records.at(-1).id,
+      monotonic_gap_ms: now() - lastExec.monotonic,
+      wall_gap_ms: Date.now() - lastExec.wall,
+      collected_since: lastExec.garbage.deref() === undefined,
+      heap_size_delta: heap.heapSize - lastExec.heap.heapSize,
+      object_count_delta: heap.objectCount - lastExec.heap.objectCount,
+    });
   },
   /** Everything the session holds, read and compared with what the last exec left. */
   verify() {
