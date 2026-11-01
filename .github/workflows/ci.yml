@@ -508,18 +508,30 @@ jobs:
           grep -q 'Calibrating the clocks takes two samples' runsc/boot/restore.go || { echo "::error::the go branch's restore has no clock pre-calibration"; exit 1; }
           # The runner's Go, which fetches the toolchain go.mod asks for (GOTOOLCHAIN=auto).
           GOTOOLCHAIN=auto go version
-          CGO_ENABLED=0 go build -o "$RUNNER_TEMP/runsc-pre" ./runsc
-          sed -i '/^\tclocks.Update(false)$/d' runsc/boot/restore.go
-          ! grep -q '^\tclocks.Update(false)$' runsc/boot/restore.go
-          git diff --stat
-          CGO_ENABLED=0 go build -o "$RUNNER_TEMP/runsc-not" ./runsc
-          sudo install -m 0755 "$RUNNER_TEMP/runsc-pre" "$RUNNER_TEMP/runsc-not" /usr/local/bin/
+          # The sidecars runsc runs beside itself (gvisor-bin/), as master's latest build ships them, C ones among them, which
+          # Go alone does not build; runsc and the Sentry's sidecar built here, from the go branch, as it is and without
+          # the restore's first clock sample, the release checks skipped (GVISOR_ENFORCE_RELEASE=SKIP).
+          master=https://storage.googleapis.com/gvisor/releases/master/latest/x86_64
+          mkdir -p "$RUNNER_TEMP/master"
+          curl -fsSL "$master/gvisor.tar.zstd" | tar --zstd -x -C "$RUNNER_TEMP/master"
+          ls -laR "$RUNNER_TEMP/master" | head -30
+          for build in pre not; do
+            if [ "$build" = not ]; then
+              sed -i '/^\tclocks.Update(false)$/d' runsc/boot/restore.go
+              ! grep -q '^\tclocks.Update(false)$' runsc/boot/restore.go
+              git diff --stat
+            fi
+            out="$RUNNER_TEMP/$build"
+            mkdir -p "$out" && cp -a "$RUNNER_TEMP/master/." "$out/"
+            CGO_ENABLED=0 go build -o "$out/runsc" ./runsc
+            CGO_ENABLED=0 go build -o "$out/gvisor-bin/gvisor_sentry" ./runsc/cmd/sentry
+          done
           sudo mkdir -p /mnt/val && sudo chown "$USER" /mnt/val
       - name: The first reads of the time after a restore
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/out"
-          sudo --preserve-env=ImageOS,ImageVersion python3 bench/val/g18.py --with /usr/local/bin/runsc-pre --without /usr/local/bin/runsc-not --out "$RUNNER_TEMP/out/g18.jsonl"
+          GVISOR_ENFORCE_RELEASE=SKIP sudo --preserve-env=ImageOS,ImageVersion,GVISOR_ENFORCE_RELEASE python3 bench/val/g18.py --with "$RUNNER_TEMP/pre/runsc" --without "$RUNNER_TEMP/not/runsc" --out "$RUNNER_TEMP/out/g18.jsonl"
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
