@@ -66,7 +66,7 @@
  * stays until they end.
  */
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { isIP, isIPv6 } from "node:net";
 import { dirname, join, posix, relative } from "node:path";
@@ -83,7 +83,7 @@ import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCach
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { type Listing, listedEgressGap, type PodAddress } from "./kube-router.ts";
 import { makeLoading } from "./loading.ts";
-import { backgroundReadSeconds, restoresFromBucket, runscVersion, STORE_SOCKET_ENDPOINT } from "./names.ts";
+import { backgroundReadSeconds, restoresFromBucket, runscVersion, savedByRelease, STORE_SOCKET_ENDPOINT } from "./names.ts";
 import { type ReleaseNotInstalled, type Runsc, type RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
 import type { S3Bucket, S3Error } from "./s3.ts";
 import type { StoreProxy, StoreToken, Transport } from "./store-proxy.ts";
@@ -931,7 +931,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       // What the save caught, as bayma's hook wrote it as the sandbox was saved.
       const caught = live === undefined ? undefined : yield* lastSave(request, live, [container]);
       const image = yield* runsc.inspect(release, staged);
-      if (image.version !== runscVersion(release)) {
+      if (!savedByRelease(image.version, release)) {
         return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image says runsc ${image.version} saved it, not ${runscVersion(release)}` });
       }
       // Each image it holds pages of is one of its parent's, whose files its manifest says.
@@ -1008,7 +1008,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         const [compactMs] = yield* timed(runsc.compact(release, { imagePath: cache.image(environment, workspace, own.digest), layerPath: join(cache.workspace(environment, workspace), LAYERS_DIR), output: staged, pausing: loading.pausing }));
         yield* Effect.sync(() => compactionDuration.record(compactMs / 1000));
         const image = yield* runsc.inspect(release, staged);
-        if (image.version !== runscVersion(release)) {
+        if (!savedByRelease(image.version, release)) {
           return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image says runsc ${image.version} wrote it, not ${runscVersion(release)}` });
         }
         const referred = yield* runsc.layers(release, staged);
@@ -1302,18 +1302,27 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * reads at once; reading again, for as long as the sandbox runs, the pages a read of failed,
    * where `pagesRetry`.
    */
-  const goferOptions = (ref: WorkspaceRef, own: string, { accessKeyId, secretAccessKey }: StoreToken, transport: Transport, pagesRetry: boolean): string =>
-    JSON.stringify({
-      ...(transport === "socket" && storeProxy.socket !== null ? { endpoint: STORE_SOCKET_ENDPOINT, socket: storeProxy.socket } : { endpoint: storeProxy.endpoint }),
+  const goferOptions = (ref: WorkspaceRef, own: string, { accessKeyId, secretAccessKey }: StoreToken, transport: Transport, pagesRetry: boolean): string => {
+    // Spike (validation G-10): where the benchmark put bench-direct.json beside the proxy's socket, the gofer reads the
+    // store through the socket it names, a plain relay to the store, with the store's own key: the proxy off its path.
+    const direct = storeProxy.socket === null ? null : join(dirname(storeProxy.socket), "bench-direct.json");
+    const relay = direct !== null && existsSync(direct) ? (JSON.parse(readFileSync(direct, "utf8")) as { readonly socket: string; readonly access_key_id: string; readonly secret_access_key: string }) : null;
+    return JSON.stringify({
+      ...(relay !== null
+        ? { endpoint: "http://alasio-store-relay", socket: relay.socket }
+        : transport === "socket" && storeProxy.socket !== null
+        ? { endpoint: STORE_SOCKET_ENDPOINT, socket: storeProxy.socket }
+        : { endpoint: storeProxy.endpoint }),
       region: storeProxy.region,
       bucket: storeProxy.bucket,
       object_prefix: `${prefixOf(ref)}/${LAYERS_DIR}/${own}/`,
       layers_prefix: `${prefixOf(ref)}/${LAYERS_DIR}/`,
       addressing: "path",
-      credentials: { access_key_id: accessKeyId, secret_access_key: secretAccessKey },
+      credentials: relay !== null ? { access_key_id: relay.access_key_id, secret_access_key: relay.secret_access_key } : { access_key_id: accessKeyId, secret_access_key: secretAccessKey },
       read_parallel: GOFER_READ_PARALLEL,
       ...(pagesRetry ? { pages_retry: "while-running" } : {}),
     });
+  };
 
   /**
    * Removes the checkpoint gofer's options file of each snapshot prepared of the workspace,

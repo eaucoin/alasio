@@ -47,6 +47,22 @@ on:
         description: "Keep the images this run builds, for later runs, to be deleted by hand"
         type: boolean
         default: false
+      gvisor-run:
+        description: "Spike: the fork-ci run of eaucoin/gvisor whose release artifact alasio's jobs install as the first pinned release"
+        type: string
+        default: ""
+      gvisor-sha:
+        description: "Spike: the commit of that artifact (release-<sha>)"
+        type: string
+        default: ""
+      arms:
+        description: "Spike: the arms of each cold restore, as JSON (test/e2e/snapshot-bench.test.ts Arm)"
+        type: string
+        default: '[{"name":"base"}]'
+      warm:
+        description: "Spike: restore warm too"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -119,7 +135,8 @@ jobs:
           SOURCE: https://github.com/${{ github.repository }}
         run: |
           declare -A pids
-          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-log:neon/log" "alasio-collector:neon/collector" "alasio-webhook:webhook" "alasio-node:cluster/node"; do
+          # Spike: no node image, whose build pins gVisor's archive by its sha512: the host target installs the candidate's.
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-log:neon/log" "alasio-collector:neon/collector" "alasio-webhook:webhook"; do
             name=${image%%:*}
             {
               if [ "$name" = alasio-node ]; then
@@ -166,6 +183,8 @@ jobs:
       BENCH_VARIANT: ${{ matrix.variant }}
       BENCH_CASES: ${{ inputs.cases }}
       BENCH_RUNS: ${{ inputs.runs }}
+      BENCH_ARMS: ${{ inputs.arms }}
+      BENCH_WARM: ${{ inputs.warm && '1' || '0' }}
     steps:
       # Every system's measures are of one CPU model, and of the disk that comes with it: a job
       # elsewhere ends at once, to be re-run (gh run rerun <id> --failed) until it lands on one.
@@ -222,6 +241,25 @@ jobs:
           . "$BENCH_DIR/store/store.env"
           set +a
           node bench/common/dist/probe.mjs | tee "$BENCH_DIR/store.json"
+      # Spike: the candidate gVisor, as fork-ci built it, packed as a release archive, served on the
+      # runner for alasio's host install as the first pinned release, and pinned by its sha512.
+      - name: The candidate gVisor
+        if: matrix.system == 'alasio' && inputs.gvisor-run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ inputs.gvisor-run }}
+          SHA: ${{ inputs.gvisor-sha }}
+        run: |
+          sudo apt-get install -y socat >/dev/null
+          mkdir -p "$RUNNER_TEMP/candidate/release" "$RUNNER_TEMP/candidate/serve"
+          gh run download "$RUN" -R eaucoin/gvisor -n "release-$SHA" -D "$RUNNER_TEMP/candidate/release"
+          chmod -R a+rx "$RUNNER_TEMP/candidate/release"
+          tar -C "$RUNNER_TEMP/candidate/release" --zstd -cf "$RUNNER_TEMP/candidate/serve/gvisor-x86_64.tar.zstd" .
+          "$RUNNER_TEMP/candidate/release/runsc" --version
+          sum=$(sha512sum "$RUNNER_TEMP/candidate/serve/gvisor-x86_64.tar.zstd" | cut -d' ' -f1)
+          jq --arg sum "$sum" '.gvisor.releases[0].sha512 = $sum' cluster/node/pins.json >"$RUNNER_TEMP/pins.json" && mv "$RUNNER_TEMP/pins.json" cluster/node/pins.json
+          (cd "$RUNNER_TEMP/candidate/serve" && nohup python3 -m http.server 8099 --bind 127.0.0.1 >"$RUNNER_TEMP/candidate/http.log" 2>&1 &)
+          sleep 1 && curl -fsS -o /dev/null http://127.0.0.1:8099/gvisor-x86_64.tar.zstd
       - name: Run ${{ matrix.system }}
         run: bench/${{ matrix.system }}/run.sh "$BENCH_TARGET" "$BENCH_PROFILE"
         env:

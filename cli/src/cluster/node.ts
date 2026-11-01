@@ -76,7 +76,8 @@ export const downloads = ({ k3s, gvisor, stargz }: NodePins): {
   installScript: { url: `https://raw.githubusercontent.com/k3s-io/k3s/${k3s.installScript.commit}/install.sh`, algorithm: "sha256", digest: k3s.installScript.sha256 },
   gvisor: new Map(gvisor.releases.map(({ release, sha512 }) => [
     release,
-    { url: `https://github.com/eaucoin/gvisor/releases/download/release-${encodeURIComponent(release)}/gvisor-x86_64.tar.zstd`, algorithm: "sha512", digest: sha512 },
+    // Spike (validation): the candidate's archive, packed and served on the runner by the bench job, in place of the first release's.
+    { url: release === gvisor.releases[0]?.release ? "http://127.0.0.1:8099/gvisor-x86_64.tar.zstd" : `https://github.com/eaucoin/gvisor/releases/download/release-${encodeURIComponent(release)}/gvisor-x86_64.tar.zstd`, algorithm: "sha512", digest: sha512 },
   ])),
   stargz: {
     url: `https://github.com/containerd/stargz-snapshotter/releases/download/${encodeURIComponent(stargz.version)}/stargz-snapshotter-${encodeURIComponent(stargz.version)}-linux-amd64.tar.gz`,

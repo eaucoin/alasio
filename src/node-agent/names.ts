@@ -134,6 +134,9 @@ export const gvisorRuntimeClass = (release: string): string => `gvisor-${gvisorL
 /** The version runsc of gVisor's `release` reports, and saves its images with: its release's tag. */
 export const runscVersion = (release: string): string => `release-${release}`;
 
+/** Spike (validation): whether runsc of `version` is `release`'s, or a candidate build past its tag, which says `git describe`. */
+export const savedByRelease = (version: string, release: string): boolean => version === runscVersion(release) || version.startsWith(`${runscVersion(release)}-`);
+
 /**
  * The directory alasio's pods keep on a node, which nothing of k3s's removes: the workspaces'
  * JuiceFS mount and its state and cache, its juicefs, and the pool pods' directories, which

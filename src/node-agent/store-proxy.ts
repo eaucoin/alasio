@@ -498,12 +498,15 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
       if (request.method !== "GET") return refuse(response, 405, "MethodNotAllowed", `${request.method} is not taken: a restore reads`);
       if (Object.keys(query).some((name) => !QUERY_KEPT.has(name) && !name.toLowerCase().startsWith("x-amz-"))) return refuse(response, 400, "InvalidRequest", "the request asks what a restore's read does not");
       const path = url.pathname;
+      // Spike (validation G-8): each request's times, as Unix milliseconds with fractions, one JSON line on stderr.
+      const traced = { arrived: performance.timeOrigin + performance.now(), verified: 0, answered: 0, ended: 0, status: 0, bytes: 0 };
       const key = keyOf(path, store.bucket);
       if (key === null) return refuse(response, 403, "AccessDenied", "the request names no object of the snapshots bucket");
       const grant = await verified(request, path, query);
       if ("refused" in grant) return refuse(response, 403, "AccessDenied", grant.refused);
       const { token } = grant;
       if (!key.startsWith(token.prefix)) return refuse(response, 403, "AccessDenied", "the object is not one the restore reads");
+      traced.verified = performance.timeOrigin + performance.now();
       // Its restore asking still, it lasts the longer, whatever the bucket answers.
       if (token.resumed) asked(token);
       // Under way until its answer ends, however it ends; the bytes of a pages file it gave
@@ -517,9 +520,14 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
         token.under -= 1;
         token.lastAt = Date.now();
         if (start !== null && given > 0) served(token, key, start, start + given);
+        traced.ended = performance.timeOrigin + performance.now();
+        traced.bytes = given;
+        traced.status = response.statusCode;
+        process.stderr.write(`${JSON.stringify({ storeProxyTrace: { key, range: request.headers.range ?? null, ...traced } })}\n`);
       });
       await forward(request, response, path, query, (from) => {
         start = isPagesFile(key) ? from : null;
+        traced.answered = performance.timeOrigin + performance.now();
       }, (bytes) => {
         given += bytes;
       });

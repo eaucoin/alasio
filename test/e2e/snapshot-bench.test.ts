@@ -40,7 +40,7 @@ import { BINDING_LABEL, FREE_LABEL, keyHash, leaseName, POOL_LABEL } from "../..
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { BAYMA_CONTAINER, RESTORE_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
-import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
+import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_RUN_DIR, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { bindSession, boundPodOf, dumpClusterState, gatewayCall, kube, mainToken, nodeAgents, onNode, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
 
@@ -75,6 +75,24 @@ const ASKED = (process.env["BENCH_CASES"] ?? "").split(/[\s,]+/u).filter(Boolean
 const CASES = ASKED.length === 0 ? ALL_CASES : ALL_CASES.filter(({ fixture, size_mib }) => ASKED.includes(`${fixture}/${size_mib}`));
 const HOST = JSON.parse(readFileSync(join(BENCH_DIR, "host.json"), "utf8")) as { readonly copy_mib_s: number };
 const RELEASE_UNDER_TEST = NODE_PINS.gvisor.releases[0]?.release ?? "";
+
+/**
+ * Spike (validation G-7, G-8, G-10, G-12): the arms each run's cold restore is made with, one after
+ * another from the same release, in an order that turns by one each run, so that each arm restores
+ * the same image as the others, on the same runner: `runsc`, the flags its restore's runsc options
+ * add (the release under test's [runsc_config]); `direct`, its checkpoint gofer reading the store
+ * through a plain relay with the store's own key, not through the node agent's proxy; `cache`, its
+ * gofer writing what it reads into a directory of the run's (--checkpoint-gofer-cache-dir).
+ */
+interface Arm {
+  readonly name: string;
+  readonly runsc?: Readonly<Record<string, string>>;
+  readonly direct?: boolean;
+  readonly cache?: boolean;
+}
+const ARMS = JSON.parse(process.env["BENCH_ARMS"] || `[{"name":"base"}]`) as readonly Arm[];
+/** Spike: whether each run restores warm too (BENCH_WARM=0: cold alone). */
+const WARM = process.env["BENCH_WARM"] !== "0";
 
 /** Where the benchmark's bundles go in the pods that run them. */
 const IN_POD = "/tmp/bench";
@@ -475,6 +493,87 @@ async function sayRunner(name: string): Promise<void> {
   appendFileSync(join(BENCH_DIR, "logs", `failure-${name}.txt`), said);
 }
 
+/** The checkpoint gofer's log of the pod sandbox `sandboxId` on `node`: its lines. */
+async function goferLog(node: string, sandboxId: string): Promise<string[]> {
+  if (sandboxId === "") return [];
+  return (await onNode(node, `cat ${RUNSC_LOGS}/${sandboxId}/runsc.log.*.checkpointgofer.txt 2>/dev/null || true`)).split("\n");
+}
+
+/** Spike: where the node agent keeps the file that sends its restores' gofers through the relay (agent.ts goferOptions). */
+const DIRECT_FILE = `${NODE_AGENT_RUN_DIR}/bench-direct.json`;
+/** Spike: the relay's socket, a plain copy of bytes to the store's Service, as the agent's own connections go. */
+const RELAY_SOCKET = `${NODE_AGENT_RUN_DIR}/relay.sock`;
+/** Spike: where an arm's gofer writes what it reads (Arm.cache). */
+const CACHE_DIR = join(BENCH_DIR, "gofer-cache");
+
+/** Whether the relay runs, on the nodes it was started on. */
+const relaying = new Set<string>();
+
+/**
+ * Spike: makes `arm` the way the node's next restores read: its runsc flags as the release under
+ * test's options' last lines (the [runsc_config] table's, which the shim reads as each sandbox
+ * starts), between two marks that the next arm's replace; the relay's file for the agent where it
+ * reads directly, the relay started in the agent's network namespace the first time.
+ */
+async function setArm(node: string, arm: Arm): Promise<void> {
+  const options = `${CONTAINERD}/${gvisorHandler(RELEASE_UNDER_TEST)}.toml`;
+  const flags = { ...arm.runsc, ...(arm.cache ? { "checkpoint-gofer-cache-dir": CACHE_DIR } : {}) };
+  const lines = ["  # bench arm begin", ...Object.entries(flags).map(([flag, value]) => `  ${flag} = "${value}"`), "  # bench arm end"];
+  await onNode(node, `sed -i '/# bench arm begin/,/# bench arm end/d' ${options} && printf '%s\\n' ${lines.map((line) => `'${line}'`).join(" ")} >> ${options} && rm -rf ${CACHE_DIR}`);
+  if (!arm.direct) {
+    await onNode(node, `rm -f ${DIRECT_FILE}`);
+    return;
+  }
+  const pid = await agentPid(node);
+  if (!relaying.has(node)) {
+    // Connections to the store's Service, which the emulated profiles send through toxiproxy as the agent's own are.
+    await onNode(node, `rm -f ${RELAY_SOCKET}; nsenter --target ${pid} --net socat UNIX-LISTEN:${RELAY_SOCKET},fork,mode=600 TCP:${await storeAddress()}:8333 >${BENCH_DIR}/logs/relay-${node}.log 2>&1 &`);
+    await onNode(node, `for _ in $(seq 50); do [ -S ${RELAY_SOCKET} ] && exit 0; sleep 0.2; done; exit 1`);
+    relaying.add(node);
+  }
+  const environment = (await onNode(node, `tr '\\0' '\\n' < /proc/${pid}/environ`)).split("\n");
+  const of = (name: string) => environment.find((line) => line.startsWith(`${name}=`))?.slice(name.length + 1) ?? "";
+  const relay = JSON.stringify({ socket: RELAY_SOCKET, access_key_id: of("AWS_ACCESS_KEY_ID"), secret_access_key: of("AWS_SECRET_ACCESS_KEY") });
+  await onNode(node, `umask 077 && cat > ${DIRECT_FILE} <<'EOF'\n${relay}\nEOF`);
+}
+
+/** Spike: the CPU time each pod of `uids` on `node` used so far, in seconds, as its cgroup says, by uid. */
+async function cpuOf(node: string, uids: readonly string[]): Promise<Record<string, number>> {
+  const printed = await onNode(node, uids.map((uid) => `dir=$(find /sys/fs/cgroup -maxdepth 6 -type d \\( -name '*pod${uid}*' -o -name '*pod${uid.replaceAll("-", "_")}*' \\) | head -n 1); [ -n "$dir" ] && echo "${uid} $(sed -n 's/^usage_usec //p' "$dir/cpu.stat")"`).join("; ") + "; true");
+  return Object.fromEntries(printed.split("\n").map((line) => line.trim().split(" ")).filter((parts) => parts.length === 2).map(([uid = "", usec = "0"]) => [uid, Number(usec) / 1e6]));
+}
+
+/** Spike: the pods of alasio's namespace, by uid: their names, which the store's, the agents' and the rest's CPU is told by. */
+async function namespacePods(): Promise<Map<string, string>> {
+  const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE });
+  return new Map(pods.map((pod) => [pod.metadata?.uid ?? "", pod.metadata?.name ?? ""] as const).filter(([uid]) => uid !== ""));
+}
+
+/** Spike: the lines the node agent of `node` logged of fetching the snapshot `snapshot` into its cache, done or failed. */
+async function fetchLines(node: string, snapshot: string): Promise<string[]> {
+  const pod = (await nodeAgents()).get(node) ?? "";
+  return (await kube.logs(NAMESPACE, pod, "node-agent")).split("\n").filter((line) => line.includes(`the images of the snapshot ${snapshot} `) && (line.includes("fetched the images") || line.includes("could not fetch")));
+}
+
+/** Spike: waits for the fetch of the snapshot `snapshot` that the restore after `before` such lines started to end, and says how it ended and when. */
+async function fetchEnded(node: string, snapshot: string, before: number): Promise<{ readonly line: string | null; readonly at: number | null }> {
+  for (const deadline = Date.now() + 600_000; Date.now() < deadline; await sleep(2000)) {
+    const lines = await fetchLines(node, snapshot);
+    if (lines.length > before) return { line: (lines.at(-1) ?? "").slice(0, 300), at: Date.now() };
+  }
+  return { line: null, at: null };
+}
+
+/** Spike: the store proxy's lines (store-proxy.ts) the node agent of `node` logged of requests that arrived at or after `fromMs`, as Unix ms. */
+async function proxyTraces(node: string, fromMs: number): Promise<string[]> {
+  const pod = (await nodeAgents()).get(node) ?? "";
+  return (await kube.logs(NAMESPACE, pod, "node-agent")).split("\n").filter((line) => {
+    if (!line.includes("storeProxyTrace")) return false;
+    const arrived = /"arrived":([0-9.]+)/u.exec(line)?.[1];
+    return arrived !== undefined && Number(arrived) >= fromMs;
+  });
+}
+
 /** One run of a case, every phase of it written, as the module says; what fails is written as failed, and the run goes on to its cleanup. */
 async function runOnce(fixture: string, sizeMib: number, run: number): Promise<void> {
   const workspace = `fs-${randomBytes(6).toString("hex")}`;
@@ -567,23 +666,52 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace }, to: { environment: SESSIONS, workspace: copy }, quotaBytes: quota.capacityBytes });
 
     phase = "restore-warm";
-    await dropPageCache(node);
-    const warm = await restore(workspace, sessionId, fixture, runId, manifest);
-    emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, warm.details);
+    if (WARM) {
+      await dropPageCache(node);
+      const warm = await restore(workspace, sessionId, fixture, runId, manifest);
+      emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, warm.details);
+      await endUnsaved(workspace, warm.pod);
+    }
     done.add(phase);
-    await endUnsaved(workspace, warm.pod);
 
     phase = "restore-cold";
-    await agentOk(node, "DELETE", `/workspaces/${SESSIONS}/${workspace}`);
-    await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace: copy }, to: { environment: SESSIONS, workspace }, quotaBytes: quota.capacityBytes });
-    // Its snapshot current again, its manifest put back as current.json, as a checkpoint commits it (src/node-agent/agent.ts commit).
-    await inAgentNetwork(node, [new URL("dist/s3.mjs", COMMON).pathname, "copy", `${SESSIONS}/${workspace}/manifests/${manifest.snapshot}.json`, `${SESSIONS}/${workspace}/current.json`]);
-    await agentOk(node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: manifest.snapshot, release: manifest.release });
-    await coldCaches(workspace);
-    const cold = await restore(workspace, sessionId, fixture, runId, manifest);
-    emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, cold.details);
+    // Spike: each arm restores the same image cold, in an order that turns by one each run.
+    for (let index = 0; index < ARMS.length; index++) {
+      const arm = ARMS[(index + run - 1) % ARMS.length] as Arm;
+      await agentOk(node, "DELETE", `/workspaces/${SESSIONS}/${workspace}`);
+      await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace: copy }, to: { environment: SESSIONS, workspace }, quotaBytes: quota.capacityBytes });
+      // Its snapshot current again, its manifest put back as current.json, as a checkpoint commits it (src/node-agent/agent.ts commit).
+      await inAgentNetwork(node, [new URL("dist/s3.mjs", COMMON).pathname, "copy", `${SESSIONS}/${workspace}/manifests/${manifest.snapshot}.json`, `${SESSIONS}/${workspace}/current.json`]);
+      await agentOk(node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: manifest.snapshot, release: manifest.release });
+      await setArm(node, arm);
+      await coldCaches(workspace);
+      const fetchesBefore = (await fetchLines(node, manifest.snapshot)).length;
+      const pods = await namespacePods();
+      const cpuBefore = await cpuOf(node, [...pods.keys()]);
+      const askedMs = Date.now();
+      const cold = await restore(workspace, sessionId, fixture, runId, manifest);
+      const cpuAfter = await cpuOf(node, [...pods.keys()]);
+      const restorePod = await podNamed(cold.pod).catch(() => null);
+      const sandboxCpu = restorePod ? (await cpuOf(node, [restorePod.metadata?.uid ?? ""]))[restorePod.metadata?.uid ?? ""] ?? null : null;
+      const cpu = Object.fromEntries([...pods].map(([uid, name]) => [name, Math.round(((cpuAfter[uid] ?? 0) - (cpuBefore[uid] ?? 0)) * 1000) / 1000]).filter(([, seconds]) => (seconds as number) > 0.05));
+      const fetched = await fetchEnded(node, manifest.snapshot, fetchesBefore);
+      const cached = arm.cache ? (await onNode(node, `du -sb --apparent-size ${CACHE_DIR} 2>/dev/null; du -sb ${CACHE_DIR} 2>/dev/null; true`)).trim() : null;
+      const sandboxId = await sandboxIdOf(node, cold.pod);
+      const traced = [...(await bootLog(node, sandboxId)).filter((line) => /Async page loading|Kernel load took|Restore successful|MemoryFile.*loaded metadata|Starting checkpoint gofer/u.test(line)), ...(await goferLog(node, sandboxId)).filter((line) => line.includes("S3 read trace") || line.includes("Opening s3://")), ...(await proxyTraces(node, askedMs))];
+      writeFileSync(join(BENCH_DIR, "logs", `trace-${runId}-${arm.name}.txt`), `${traced.join("\n")}\n`);
+      emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, {
+        ...cold.details,
+        arm: arm.name,
+        arm_flags: arm,
+        cpu_s: cpu,
+        sandbox_cpu_s: sandboxCpu,
+        fetch: { ...fetched, after_ms: fetched.at === null ? null : fetched.at - askedMs },
+        cache: cached,
+        trace_lines: traced.length,
+      });
+      await endUnsaved(workspace, cold.pod);
+    }
     done.add(phase);
-    await endUnsaved(workspace, cold.pod);
   } catch (error) {
     if (error instanceof Uncalibrated) throw error;
     const why = `${phase}: ${errorText(error)}`;
@@ -622,7 +750,7 @@ async function bootLogs(node: string): Promise<void> {
   for (const { release } of NODE_PINS.gvisor.releases) {
     const options = `${CONTAINERD}/${gvisorHandler(release)}.toml`;
     // [runsc_config] is the options' last table (cli/src/cluster/k3s.ts).
-    await onNode(node, `grep -q '^  debug-log' ${options} || printf '  debug-log = "${RUNSC_LOGS}/%%ID%%/"\\n  debug-command = "boot"\\n' >> ${options}; tail -n 4 ${options}`);
+    await onNode(node, `grep -q '^  debug-log' ${options} || printf '  debug-log = "${RUNSC_LOGS}/%%ID%%/"\\n  debug-command = "boot,checkpointgofer"\\n' >> ${options}; tail -n 4 ${options}`);
   }
   const free = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${FREE_LABEL}=true` });
   for (const pod of free) await kube.remove(ref("Pod", pod.metadata?.name ?? "", SESSIONS));
