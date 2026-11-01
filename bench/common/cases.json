@@ -12,8 +12,10 @@
   { "fixture": "repl-bun", "size_mib": 64 },
   { "fixture": "repl-bun", "size_mib": 200 },
   { "fixture": "repl-bun-checkpointed", "size_mib": 64 },
+  { "fixture": "repl-bun-checkpointed", "size_mib": 200 },
   { "fixture": "repl-python", "size_mib": 20 },
   { "fixture": "repl-python", "size_mib": 64 },
   { "fixture": "repl-python", "size_mib": 200 },
-  { "fixture": "repl-python-checkpointed", "size_mib": 64 }
+  { "fixture": "repl-python-checkpointed", "size_mib": 64 },
+  { "fixture": "repl-python-checkpointed", "size_mib": 200 }
 ]
