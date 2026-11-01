@@ -105,6 +105,8 @@ const IN_POD = "/tmp/bench";
 const MCP_URL = `http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}/mcp`;
 /** The pattern of the sandboxes' boot logs, on the node. */
 const RUNSC_LOGS = "/var/log/runsc";
+/** The CRI client on a node: k3s's own on the host target; the docker target's node image's, as k3s there has no crictl command. */
+const CRICTL = TARGET === "host" ? "k3s crictl" : "crictl";
 /** Spike: the chain of rules, in each node agent's network namespace, that counts its traffic with the store (storeBytes). */
 const STORE_CHAIN = "BENCH-STORE";
 /** toxiproxy's release, as the runner systems' store runs it (bench/common/store/up.sh). */
@@ -250,7 +252,7 @@ async function gone(name: string, timeoutMs = 180_000): Promise<void> {
 
 /** The id of the pod sandbox of the pod `name`, as containerd names it, which its sandbox's boot log is under. */
 async function sandboxIdOf(node: string, name: string): Promise<string> {
-  return (await onNode(node, `k3s crictl pods --name '^${name}$' --namespace ${SESSIONS} -q | head -n 1`)).trim();
+  return (await onNode(node, `${CRICTL} pods --name '^${name}$' --namespace ${SESSIONS} -q | head -n 1`)).trim();
 }
 
 /** The boot log of the pod sandbox `sandboxId` on `node`: its lines. */
@@ -1053,7 +1055,7 @@ async function bootLogs(node: string): Promise<void> {
 async function agentPid(node: string): Promise<string> {
   const pod = (await nodeAgents()).get(node) ?? "";
   const agentId = (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.status?.containerStatuses?.find(({ name }) => name === "node-agent")?.containerID?.replace(/^[a-z]+:\/\//u, "") ?? "";
-  return (await onNode(node, `k3s crictl inspect --output go-template --template '{{.info.pid}}' ${agentId}`)).trim();
+  return (await onNode(node, `${CRICTL} inspect --output go-template --template '{{.info.pid}}' ${agentId}`)).trim();
 }
 
 /** The address of the store's Service, which the node agents reach the bucket at. */
