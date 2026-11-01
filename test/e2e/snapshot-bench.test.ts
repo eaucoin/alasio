@@ -625,7 +625,11 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
   try {
     const created = await gatewayCall(await mainToken(workspace), "POST", "/workspace");
     if (created.status !== 204) throw new Error(`the gateway made no workspace: ${created.status} ${created.said}`);
+    // Spike (X-PT): how long each bind took, the job's first on a node that has pulled nothing of
+    // the session image yet.
+    const binding = Date.now();
     await bindSession(workspace);
+    appendFileSync(join(BENCH_DIR, "logs", "binds.txt"), `${fixture}-${sizeMib}-${run} ${Date.now() - binding}\n`);
     const setup = await driver<{ readonly session_id: string }>(workspace, "setup", "--fixture", fixture, "--size-mib", String(sizeMib), "--run-id", runId, "--rate-mib-s", String(HOST.copy_mib_s), "--workspace", "/workspace");
     const sessionId = setup.session_id;
 
