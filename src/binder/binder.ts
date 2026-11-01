@@ -21,6 +21,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Clock, Context, Effect, Fiber, Layer, Schema, Semaphore } from "effect";
 
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
+import { trace } from "../shared/log.ts";
 import { meter } from "../telemetry/index.ts";
 import { BINDING_TIMEOUT_MS, type BindingLease, boundPod, claim, holdLease, markReleasing, readLease, RELEASING_ANNOTATION, releaseLease, renewLease, serving, stale, takeLease, unmarkReleasing } from "./bindings.ts";
 import { boundAnnotations, boundLabels, type Pool } from "./names.ts";
@@ -156,7 +157,12 @@ export class Binder extends Context.Service<Binder, {
           Effect.gen(function*() {
             for (;;) {
               const pod = (yield* kube.read("v1", "Pod", pool.namespace, name)) as V1Pod | null;
-              if (pod && serving(pod) && pod.status?.podIP) return { binding, pod: name, address: pod.status.podIP };
+              if (pod && serving(pod) && pod.status?.podIP) {
+                const ready = pod.status.conditions?.find(({ type }) => type === "Ready")?.lastTransitionTime;
+                const containerReady = pod.status.containerStatuses?.[0]?.ready;
+                yield* trace(`${key} binder serving ready-since=${ready instanceof Date ? ready.toISOString() : String(ready)} container-ready=${String(containerReady)}`);
+                return { binding, pod: name, address: pod.status.podIP };
+              }
               if ((yield* Clock.currentTimeMillis) >= deadline) return yield* new BindTimeout({ key, pool: pool.name, waited: "pod serving" });
               yield* Effect.sleep(BIND_POLL_MS);
             }
@@ -172,7 +178,9 @@ export class Binder extends Context.Service<Binder, {
           Effect.gen(function*() {
             const already = yield* provide(boundPod(pool, key));
             if (already?.metadata?.name) yield* kube.remove("v1", "Pod", pool.namespace, already.metadata.name);
+            yield* trace(`${key} binder pod-for`);
             const made = make ? yield* make(boundLabels(pool, key), boundAnnotations(key), binding) : null;
+            yield* trace(`${key} binder made`);
             if (made) return { pod: made, start: "made" as const };
             const claimed = yield* provide(claim(pool, key));
             if (claimed) return { pod: claimed, start: "warm" as const };
@@ -237,6 +245,7 @@ export class Binder extends Context.Service<Binder, {
                   yield* prepare(pod, taken.metadata?.uid ?? "").pipe(
                     Effect.tapError(() => kube.remove("v1", "Pod", pool.namespace, pod.metadata?.name ?? "").pipe(Effect.ignore)),
                   );
+                  yield* trace(`${key} binder readied`);
                 }
                 return pod;
               });
@@ -244,6 +253,7 @@ export class Binder extends Context.Service<Binder, {
             const { value: pod, lease } = yield* renewing(taken, readied, (held) => provide(releaseLease(held)).pipe(Effect.ignore));
             const name = pod.metadata?.name ?? "";
             const holding = lease ? yield* provide(holdLease(lease, name)) : null;
+            yield* trace(`${key} binder held`);
             return holding ? { lease: holding, name, start } : null;
           });
 
@@ -275,9 +285,11 @@ export class Binder extends Context.Service<Binder, {
           Effect.gen(function*() {
             const asked = yield* Clock.currentTimeMillis;
             const deadline = asked + (options.waitMs ?? waitMs);
+            yield* trace(`${key} binder bind`);
             for (;;) {
               const taken = yield* provide(takeLease(pool, key, binder, staleMs));
               if (taken.taken) {
+                yield* trace(`${key} binder lease-taken`);
                 const bound = yield* underWay(pool, key, taken.lease, options, deadline);
                 if (bound === null) continue;
                 const served = yield* servingBy(pool, key, bound.lease.metadata?.uid ?? "", bound.name, deadline);

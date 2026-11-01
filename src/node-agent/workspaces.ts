@@ -86,6 +86,7 @@ import { join } from "node:path";
 import { Clock, Effect, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import { isValidVolumeId } from "../sandbox/names.ts";
+import { trace } from "../shared/log.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import type { Juicefs, JuicefsError, Quota } from "./juicefs.ts";
 import { BAYMA_CONTAINER, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
@@ -468,11 +469,15 @@ export const makeWorkspaces = Effect.fnUntraced(function*(
     Effect.gen(function*() {
       const directory = join(files, "..");
       if (!(yield* there(directory))) return;
-      const looked = Effect.promise(() => holds(directory, workspacesRoot));
+      // Spike: how many looks, and how long, the quota's wait took, for test/e2e/orchestration.test.ts.
+      let looks = 0;
+      const started = Date.now();
+      const looked = Effect.promise(() => holds(directory, workspacesRoot)).pipe(Effect.tap(() => Effect.sync(() => void looks++)));
       const held = withinMs === 0 ? yield* looked : yield* looked.pipe(
         Effect.repeat({ schedule: Schedule.spaced(QUOTA_LOOK_MS), until: (is) => is }),
         Effect.timeoutOrElse({ duration: withinMs, orElse: () => Effect.succeed(false) }),
       );
+      if (withinMs !== 0) yield* trace(`${ref.workspace} agent quota-held looks=${looks},waited=${Date.now() - started},held=${held}`);
       if (!held) return yield* refused(503, `${what}: the node's mount of workspace storage does not hold ${ref.environment}/${ref.workspace}'s quota yet`);
     });
   /** `work` done on the node's mount, there, a failure of it refused as workspace storage's not answering. */
