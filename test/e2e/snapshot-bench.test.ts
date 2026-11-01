@@ -672,8 +672,9 @@ const dropPageCache = (node: string): Promise<string> => onNode(node, "sync && e
 
 /**
  * Removes every node's cache of the workspace, by its agent, as the gateway removes a deleted
- * workspace's (src/gateway/snapshots.ts forgetDeleted), which spares what the agent still holds
- * the workspace in flight for; asked again for 20 s, then, where the agent still spares it, by
+ * workspace's (src/gateway/snapshots.ts forgetDeleted), which spares a workspace used within the
+ * cache's grace, as a restore may still read it (src/node-agent/cache.ts discard), as the warm
+ * restore's was a minute before; asked again for 20 s, then, where the agent still spares it, by
  * hand, as the 10.0.4 baseline removed it, which no compaction is writing by then (the warm
  * restore's prepare stopped the release's); and the nodes' page cache, so a restore reads it from
  * the bucket. How each node's went.
