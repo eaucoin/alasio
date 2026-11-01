@@ -35,7 +35,7 @@ stop() {
 }
 
 if [ ! -f "$work/ready" ]; then
-  mkdir -p "$work"
+  sudo mkdir -p "$work" && sudo chown "$USER" "$work"
   command -v qemu-system-x86_64 >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq qemu-system-x86 qemu-utils cloud-image-utils; }
   sudo chmod 666 /dev/kvm
   curl -fsSL -o "$work/base.qcow2" "$image"
