@@ -219,6 +219,11 @@ interface Setup {
   readonly idleSaves: readonly number[];
   /** Whether V8's heap statistics in a node the instance starts are recorded (X-SRV). */
   readonly heapStats: boolean;
+  /**
+   * Whether bayma's server runs a last-resort full collection, timed, just before each save (the
+   * endpoint package's X-SRV): its nodeFlags must load SERVER_GC, which runs it on SIGUSR2.
+   */
+  readonly serverGc: boolean;
 }
 
 const TUNED: Setup = {
@@ -249,6 +254,7 @@ const TUNED: Setup = {
   hygiene: null,
   idleSaves: [],
   heapStats: false,
+  serverGc: false,
 };
 
 const DEFAULTS: Setup = { ...TUNED, name: "defaults", variant: "defaults", hostSettings: "check", checkpoint: [], background: false, warmDirect: false, lazy: null, warm: [{ variant: "defaults", cache: "dropped" }] };
@@ -285,6 +291,37 @@ function traced(variant: string, { uncached = false, window = "60s", trace = tru
   };
 }
 
+/** The instance's file, under its /attach, that runs a server's collection on SIGUSR2. */
+const SERVER_GC = "/attach/server-gc.cjs";
+
+/** The script at SERVER_GC: a timed last-resort full collection on SIGUSR2, said on stderr. */
+const SERVER_GC_SCRIPT = `"use strict";
+// The bench's (the endpoint package's X-SRV): on SIGUSR2, a last-resort full collection, timed.
+const v8 = require("node:v8");
+process.on("SIGUSR2", () => {
+  const before = v8.getHeapStatistics();
+  const start = process.hrtime.bigint();
+  globalThis.gc({ type: "major", execution: "sync", flavor: "last-resort" });
+  const ms = Number(process.hrtime.bigint() - start) / 1e6;
+  const after = v8.getHeapStatistics();
+  process.stderr.write("BENCH-SERVER-GC " + JSON.stringify({ ms, used_before: before.used_heap_size, used_after: after.used_heap_size, total_before: before.total_heap_size, total_after: after.total_heap_size, physical_before: before.total_physical_size, physical_after: after.total_physical_size }) + "\\n");
+});
+`;
+
+/** X-IDLE's source and X-SRV's setups: idle saves traced, then a warm restore, `serverFlags` added. */
+function idleTraced(variant: string, serverFlags: readonly string[]): Setup {
+  const base = traced(variant, { trace: false });
+  return {
+    ...base,
+    flags: [...base.flags, "--dirty-trace=log"],
+    idleSaves: [5, 30, 120],
+    warm: [{ variant, cache: "dropped" }],
+    lazy: null,
+    nodeFlags: ["--trace-gc", "--trace-memory-reducer", ...serverFlags],
+    serverGc: serverFlags.length > 0,
+  };
+}
+
 /** The job's setups, by the variant its job runs. */
 const SETUPS: Record<string, readonly Setup[]> = {
   tuned: [TUNED],
@@ -306,6 +343,11 @@ const SETUPS: Record<string, readonly Setup[]> = {
     { ...traced("idle", { trace: false }), idleSaves: [5, 30, 120], warm: [], lazy: null },
     { ...traced("idle-quiet", { trace: false }), idleSaves: [5, 30, 120], warm: [], lazy: null, env: ["BUN_GC_TIMER_DISABLE=1", "MIMALLOC_PURGE_HOLES=0"] },
   ],
+  // X-IDLE's source and X-SRV: the idle saves with what each save's pages hold, by memory kind and
+  // marking path, and what each process wrote, by vma (the fork's --dirty-trace=log), the server's
+  // collections and memory reducer logged; as bayma runs today, and with the server's memory
+  // reducer off and a last-resort full collection just before each save; then restored warm.
+  "idle-traced": [idleTraced("idle-traced", []), idleTraced("idle-srv-gc", ["--no-memory-reducer", "--expose-gc", `--require=${SERVER_GC}`])],
   // X-HYG: the image a session saves as it comes, with its allocators asked to return memory at
   // once, and after a collection (and Bun's shrink of its heap) in an exec just before the save.
   hygiene: [
@@ -556,6 +598,7 @@ async function makeAttach(attach: string): Promise<void> {
   mkdirSync(join(attach, "ws", "home"), { recursive: true });
   writeFileSync(join(attach, "env"), "");
   writeFileSync(join(attach, "token"), token);
+  writeFileSync(join(attach, SERVER_GC.slice("/attach/".length)), SERVER_GC_SCRIPT);
   await run("chown", ["-R", "1000:1000", attach]);
 }
 
@@ -722,6 +765,29 @@ interface Gaps {
   readonly slowdown: number | null;
 }
 
+/** What the server's collection before a save said (SERVER_GC_SCRIPT's line), or null. */
+type ServerGc = Record<string, number> | null;
+
+/**
+ * Has bayma's server run its collection before a save, where the setup asks for one: SIGUSR2 to
+ * the instance's first `node` process, then its line in the instance's output, `out`, awaited.
+ */
+async function serverGc(setup: Setup, logDir: string, id: string, out: string): Promise<ServerGc> {
+  if (!setup.serverGc) return null;
+  const said = () => readFileSync(out, "utf8").split("\n").filter((line) => line.startsWith("BENCH-SERVER-GC "));
+  const before = said().length;
+  // "UID PID PPID C STIME TIME CMD": the server is the first node.
+  const server = (await runsc(setup, logDir, ["ps", id])).stdout.split("\n").slice(1).map((line) => line.trim().split(/\s+/u)).find((cols) => cols.at(-1) === "node");
+  if (!server?.[1]) throw new Error("no node process in the instance for the server's collection");
+  await runsc(setup, logDir, ["kill", `--pid=${server[1]}`, id, "USR2"]);
+  const deadline = Date.now() + 15_000;
+  while (said().length <= before) {
+    if (Date.now() > deadline) throw new Error("the server said nothing of its collection within 15 s");
+    await sleep(100);
+  }
+  return JSON.parse(said()[before]!.slice("BENCH-SERVER-GC ".length)) as Record<string, number>;
+}
+
 /**
  * X-IDLE: the instance, idle since its setup, saved live, then live again after each of
  * setup.idleSaves, each save incremental over the one before (`--parent-image-path`, with the
@@ -731,7 +797,9 @@ interface Gaps {
 async function idleSaves(job: Job, setup: Setup, logDir: string, p: Paths, at: { fixture: string; size: number; run: number }, saves: number): Promise<number> {
   const checkpoint = (image: string, parent?: string) =>
     runsc(setup, logDir, ["checkpoint", `--image-path=${image}`, "--leave-running", ...(parent === undefined ? [] : [`--parent-image-path=${parent}`]), ...setup.checkpoint, `--save-restore-exec-argv=${HOOK.join(" ")}`, p.id]);
+  const out = join(p.logs, "instance.out");
   let parent = join(p.dir, "idle-0");
+  await serverGc(setup, logDir, p.id, out);
   await checkpoint(parent);
   saves++;
   for (const [index, seconds] of setup.idleSaves.entries()) {
@@ -739,6 +807,7 @@ async function idleSaves(job: Job, setup: Setup, logDir: string, p: Paths, at: {
     const image = join(p.dir, `idle-${index + 1}`);
     try {
       await sleep(seconds * 1000);
+      const gc = await serverGc(setup, logDir, p.id, out);
       const t0 = now();
       await checkpoint(image, parent);
       const t1 = now();
@@ -747,7 +816,7 @@ async function idleSaves(job: Job, setup: Setup, logDir: string, p: Paths, at: {
         ok: true,
         failure: null,
         metrics: { save_total_ms: msBetween(t0, t1), pause_reported_ms: pause.ms, precopy_passes: 0, precopy_bytes: 0, image_bytes: dirBytes(image), uploaded_bytes: null },
-        details: { idle_s: seconds, parent: `idle-${index}`, files: dirFiles(image), sentry: pause.lines },
+        details: { idle_s: seconds, parent: `idle-${index}`, files: dirFiles(image), sentry: pause.lines, ...(gc === null ? {} : { server_gc: gc }) },
       }));
       rmSync(parent, { recursive: true, force: true });
       parent = image;
@@ -769,6 +838,7 @@ async function save(setup: Setup, logDir: string, p: Paths, live: boolean, nth: 
   const image = live ? p.live : p.stop;
   const prefix = `${p.prefix}${live ? "live" : "stop"}/`;
   const before = await bucketBytes(prefix);
+  const gc = await serverGc(setup, logDir, p.id, join(p.logs, "instance.out"));
   await mark?.();
   const t0 = now();
   await runsc(setup, logDir, ["checkpoint", `--image-path=${image}`, ...(live ? ["--leave-running"] : []), ...setup.checkpoint, `--save-restore-exec-argv=${HOOK.join(" ")}`, p.id]);
@@ -789,7 +859,7 @@ async function save(setup: Setup, logDir: string, p: Paths, live: boolean, nth: 
       image_bytes: dirBytes(image),
       uploaded_bytes: (await bucketBytes(prefix)) - before,
     },
-    details: { checkpoint_ms: msBetween(t0, saved), upload_ms: msBetween(saved, t1), upload, files: dirFiles(image), ...(window ? { gaps: window } : {}), sentry: pause.lines },
+    details: { checkpoint_ms: msBetween(t0, saved), upload_ms: msBetween(saved, t1), upload, files: dirFiles(image), ...(window ? { gaps: window } : {}), sentry: pause.lines, ...(gc === null ? {} : { server_gc: gc }) },
   };
 }
 
