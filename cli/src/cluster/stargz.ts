@@ -15,7 +15,12 @@
  * port, plain HTTP where the mirror is, no path rewritten. It takes no registry's login,
  * as alasio's registries ask for none; an image it cannot read lazily is pulled whole.
  */
+import { existsSync } from "node:fs";
+
 import type { Registries } from "./k3s.ts";
+
+/** Spike (X-PT): the file whose presence turns FUSE passthrough on in stargzConfig. */
+export const SPIKE_PASSTHROUGH = "/etc/alasio-spike/stargz-passthrough";
 
 /** The snapshotter's name, which containerd's CRI pulls with. */
 export const SNAPSHOTTER = "alasio-stargz";
@@ -102,10 +107,11 @@ export function stargzConfig(registries?: Registries): string {
     "enable = true",
     `address = ${tomlString(FUSE_MANAGER_SOCKET)}`,
     `path = ${tomlString("/usr/local/bin/stargz-fuse-manager")}`,
-    // Spike (X-PT): with ALASIO_SPIKE_STARGZ_PASSTHROUGH=1 where the node is made, a file opened
-    // through the mount is merged into one backing file once and read by the kernel from it,
-    // without the daemon's round trips, the merge's buffer within the daemon's memory limit.
-    ...(process.env["ALASIO_SPIKE_STARGZ_PASSTHROUGH"] === "1" ? ["", "[fuse]", "passthrough = true", `merge_buffer_size = ${32 << 20}`] : []),
+    // Spike (X-PT): where SPIKE_PASSTHROUGH exists on the machine alasio runs on (the bench's
+    // run.sh makes it; alasio's steps as root run through sudo, which drops the environment), a
+    // file opened through the mount is merged into one backing file once and read by the kernel
+    // from it, without the daemon's round trips, the merge's buffer within the daemon's memory limit.
+    ...(existsSync(SPIKE_PASSTHROUGH) ? ["", "[fuse]", "passthrough = true", `merge_buffer_size = ${32 << 20}`] : []),
     ...mirrors.flatMap(([host, reached]) =>
       reached.flatMap((url) => [
         "",

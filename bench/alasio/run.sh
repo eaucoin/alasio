@@ -13,5 +13,13 @@ mkdir -p "$BENCH_DIR/logs"
 # commit failed", run 40712100149). Said in logs/writeback.txt.
 sudo sysctl -w vm.dirty_bytes=268435456 vm.dirty_background_bytes=67108864 | tee "$BENCH_DIR/logs/writeback.txt"
 npm ci
+# Spike (X-PT): the passthrough variants' node has stargz-snapshotter serve files through FUSE
+# passthrough (cli/src/cluster/stargz.ts SPIKE_PASSTHROUGH), the others not.
+if [[ ${ALASIO_SPIKE_STARGZ_PASSTHROUGH:-} == 1 ]]; then
+  sudo mkdir -p /etc/alasio-spike
+  sudo touch /etc/alasio-spike/stargz-passthrough
+else
+  sudo rm -f /etc/alasio-spike/stargz-passthrough
+fi
 ALASIO_E2E_TARGET=$1 ALASIO_E2E_AGENTS=0 ALASIO_E2E_SHARD=bench BENCH_PROFILE=$2 \
   node --test --test-timeout=21600000 --test-force-exit --test-reporter=spec test/e2e/snapshot-bench.test.ts
