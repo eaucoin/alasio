@@ -100,6 +100,12 @@ const WARM = process.env["BENCH_WARM"] !== "0";
  * recorded, whose frames the measure counts; one phase "codec".
  */
 const CODEC = process.env["BENCH_CODEC"] === "1";
+/**
+ * Spike (validation G-30): BENCH_ZSTD=1 puts beside each image's pages file in the bucket, once
+ * it is released, a seekable zstd copy of it (bench/codec seekable, frames of 256 KiB at level 1),
+ * which an arm's gofer reads with --checkpoint-gofer-pages-compression=zstd.
+ */
+const ZSTD = process.env["BENCH_ZSTD"] === "1";
 
 /** Where the benchmark's bundles go in the pods that run them. */
 const IN_POD = "/tmp/bench";
@@ -618,6 +624,20 @@ async function codecOf(node: string, workspace: string, sessionId: string, fixtu
   };
 }
 
+/** Spike (validation G-30): the seekable zstd copy of each image of `manifest`'s pages, compressed on `node` and put beside it in the bucket; what it took. */
+async function zstdCopies(node: string, workspace: string, manifest: Manifest): Promise<Record<string, unknown>[]> {
+  const copies: Record<string, unknown>[] = [];
+  for (const { digest } of manifest.layers) {
+    const dir = join(BENCH_DIR, "zst", digest);
+    const compressed = JSON.parse((await onNode(node, `mkdir -p ${dir} && ${BENCH_DIR}/codec-bin seekable --in ${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/layers/${digest}/pages.img --out ${dir}/pages.img.zst --frame 262144 --level 1`)).trim().split("\n").at(-1) ?? "{}") as Record<string, unknown>;
+    const started = Date.now();
+    await inAgentNetwork(node, [new URL("dist/s3.mjs", COMMON).pathname, "upload", dir, `${SESSIONS}/${workspace}/layers/${digest}/`]);
+    await onNode(node, `rm -rf ${dir}`);
+    copies.push({ digest, ...compressed, upload_ms: Date.now() - started });
+  }
+  return copies;
+}
+
 /** One run of a case, every phase of it written, as the module says; what fails is written as failed, and the run goes on to its cleanup. */
 async function runOnce(fixture: string, sizeMib: number, run: number): Promise<void> {
   const workspace = `fs-${randomBytes(6).toString("hex")}`;
@@ -712,6 +732,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
       done.add(phase);
       return;
     }
+    const zstd = ZSTD ? await zstdCopies(node, workspace, manifest) : null;
     // The workspace as the release left it, for the cold restore's.
     const quota = JSON.parse(await agentOk(node, "GET", `/workspaces/${SESSIONS}/${workspace}/quota`)) as { readonly capacityBytes: number };
     await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace }, to: { environment: SESSIONS, workspace: copy }, quotaBytes: quota.capacityBytes });
@@ -758,6 +779,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
         sandbox_cpu_s: sandboxCpu,
         fetch: { ...fetched, after_ms: fetched.at === null ? null : fetched.at - askedMs },
         cache: cached,
+        zstd,
         trace_lines: traced.length,
       });
       await endUnsaved(workspace, cold.pod);

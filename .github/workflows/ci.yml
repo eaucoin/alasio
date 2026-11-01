@@ -67,6 +67,10 @@ on:
         description: "Spike: measure how each released image compresses (bench/codec) instead of restoring it cold"
         type: boolean
         default: false
+      zstd:
+        description: "Spike: put a seekable zstd copy of each released image's pages beside it in the bucket, for arms that read it"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -190,6 +194,7 @@ jobs:
       BENCH_ARMS: ${{ inputs.arms }}
       BENCH_WARM: ${{ inputs.warm && '1' || '0' }}
       BENCH_CODEC: ${{ inputs.codec && '1' || '0' }}
+      BENCH_ZSTD: ${{ inputs.zstd && '1' || '0' }}
     steps:
       # Every system's measures are of one CPU model, and of the disk that comes with it: a job
       # elsewhere ends at once, to be re-run (gh run rerun <id> --failed) until it lands on one.
@@ -267,15 +272,16 @@ jobs:
           sleep 1 && curl -fsS -o /dev/null http://127.0.0.1:8099/gvisor-x86_64.tar.zstd
       # Spike: the codec measure, built with the Go of its module, and run first on random bytes, the runner quiet.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        if: matrix.system == 'alasio' && inputs.codec
+        if: matrix.system == 'alasio' && (inputs.codec || inputs.zstd)
         with:
           go-version: "1.25"
           cache: false
       - name: The codec measure
-        if: matrix.system == 'alasio' && inputs.codec
+        if: matrix.system == 'alasio' && (inputs.codec || inputs.zstd)
         run: |
-          (cd bench/codec && go build -o "$BENCH_DIR/codec-bin" .)
-          GOMAXPROCS=2 "$BENCH_DIR/codec-bin" random --bytes 268435456 | tee "$BENCH_DIR/codec-random.jsonl"
+          mkdir -p "$BENCH_DIR"
+          (cd bench/codec && go test ./... && go build -o "$BENCH_DIR/codec-bin" .)
+          if [ "$BENCH_CODEC" = 1 ]; then GOMAXPROCS=2 "$BENCH_DIR/codec-bin" random --bytes 268435456 | tee "$BENCH_DIR/codec-random.jsonl"; fi
       - name: Run ${{ matrix.system }}
         run: bench/${{ matrix.system }}/run.sh "$BENCH_TARGET" "$BENCH_PROFILE"
         env:

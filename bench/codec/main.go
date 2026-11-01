@@ -8,13 +8,20 @@
 //
 //	codec image --pages DIR/pages.img --inspect inspect.json [--ws ws.json] [--label L]
 //	codec random --bytes N
+//	codec seekable --in pages.img --out pages.img.zst [--frame 262144] [--level 1]
+//
+// seekable writes a pages file as zstd's seekable format (contrib/seekable_format): independent
+// frames of --frame logical bytes, each with its content checksum, then the seek table in a
+// skippable frame, entries without checksums; it prints its sizes and time.
 //
 // inspect.json is `runsc image inspect --json --extents` of the image; ws.json the same of the
 // image saved after a restore of it, whose working set was recorded as the sandbox ran.
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -437,8 +444,82 @@ func main() {
 			panic(err)
 		}
 		measure(*label, img.Digest, "referenced", ref, nil, emit)
+	case "seekable":
+		fl := flag.NewFlagSet("seekable", flag.ExitOnError)
+		in := fl.String("in", "", "the pages file")
+		out := fl.String("out", "", "the seekable zstd file to write")
+		frame := fl.Int("frame", 256<<10, "logical bytes per frame")
+		level := fl.Int("level", 1, "zstd level")
+		fl.Parse(os.Args[2:])
+		written, logical, took, err := writeSeekable(*in, *out, *frame, *level)
+		if err != nil {
+			panic(err)
+		}
+		if err := enc.Encode(map[string]any{"in": *in, "logical_bytes": logical, "physical_bytes": written, "ratio": float64(logical) / float64(written), "seconds": took.Seconds(), "frame_bytes": *frame, "level": *level}); err != nil {
+			panic(err)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		os.Exit(2)
 	}
+}
+
+// writeSeekable writes the file in as a seekable zstd file out, as the seekable command says;
+// it returns the bytes written and read, and the time it took.
+func writeSeekable(in, out string, frameBytes, level int) (int64, int64, time.Duration, error) {
+	start := time.Now()
+	src, err := os.Open(in)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer src.Close()
+	dst, err := os.Create(out)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer dst.Close()
+	w := bufio.NewWriterSize(dst, 4<<20)
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)), zstd.WithEncoderConcurrency(1), zstd.WithEncoderCRC(true))
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	var table []byte
+	var written, logical int64
+	frames := uint32(0)
+	buf := make([]byte, frameBytes)
+	var cbuf []byte
+	for {
+		n, err := io.ReadFull(src, buf)
+		if n > 0 {
+			cbuf = enc.EncodeAll(buf[:n], cbuf[:0])
+			if _, err := w.Write(cbuf); err != nil {
+				return 0, 0, 0, err
+			}
+			table = binary.LittleEndian.AppendUint32(table, uint32(len(cbuf)))
+			table = binary.LittleEndian.AppendUint32(table, uint32(n))
+			written += int64(len(cbuf))
+			logical += int64(n)
+			frames++
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		if err != nil {
+			return 0, 0, 0, err
+		}
+	}
+	var tail []byte
+	tail = binary.LittleEndian.AppendUint32(tail, 0x184D2A5E)
+	tail = binary.LittleEndian.AppendUint32(tail, uint32(len(table)+9))
+	tail = append(tail, table...)
+	tail = binary.LittleEndian.AppendUint32(tail, frames)
+	tail = append(tail, 0)
+	tail = binary.LittleEndian.AppendUint32(tail, 0x8F92EAB1)
+	if _, err := w.Write(tail); err != nil {
+		return 0, 0, 0, err
+	}
+	if err := w.Flush(); err != nil {
+		return 0, 0, 0, err
+	}
+	return written + int64(len(tail)), logical, time.Since(start), dst.Sync()
 }
