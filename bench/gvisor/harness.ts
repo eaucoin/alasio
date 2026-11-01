@@ -785,8 +785,9 @@ async function serverGc(setup: Setup, logDir: string, id: string, out: string): 
   if (!setup.serverGc) return null;
   const said = () => readFileSync(out, "utf8").split("\n").filter((line) => line.startsWith("BENCH-SERVER-GC "));
   const before = said().length;
-  // "UID PID PPID C STIME TIME CMD": the server is the first node.
-  const server = (await runsc(setup, logDir, ["ps", id])).stdout.split("\n").slice(1).map((line) => line.trim().split(/\s+/u)).find((cols) => cols.at(-1) === "node");
+  // "UID PID PPID C STIME TIME CMD": the server is the first node, whose main thread node names
+  // MainThread.
+  const server = (await runsc(setup, logDir, ["ps", id])).stdout.split("\n").slice(1).map((line) => line.trim().split(/\s+/u)).find((cols) => cols.at(-1) === "node" || cols.at(-1) === "MainThread");
   if (!server?.[1]) throw new Error("no node process in the instance for the server's collection");
   await runsc(setup, logDir, ["kill", `--pid=${server[1]}`, id, "USR2"]);
   const deadline = Date.now() + 15_000;
