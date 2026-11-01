@@ -87,7 +87,7 @@ def prearm(a: argparse.Namespace) -> None:
     rootfs = c_rootfs()
     for mib in a.sizes:
         for rate in a.rates:
-            sb = Sandbox(a.runsc, rootfs, ["/wpw", str(mib), str(rate)], flags(a, 65536), props=[f"MemoryMax={mib + 1536}M", "MemorySwapMax=0"])
+            sb = Sandbox(a.runsc, rootfs, ["/wpw", str(mib), str(rate)], flags(a, 65536), props=[f"MemoryMax={2 * mib + 2048}M", "MemorySwapMax=0"])
             try:
                 sb.start()
                 save_lines(sb.checkpoint(image_dir("prearm"), PLAIN)["lines"])
@@ -106,6 +106,9 @@ def prearm(a: argparse.Namespace) -> None:
                               "checkpoint_s": ck["s"], "kernel_save": s.get("kernel_save"), "host": host()}
                     emit(a.out, record)
                     log(f"prearm {mib} MiB at {rate} MiB/s rep {rep}: gap {record['gap_s']}, in-pause arm {record['in_pause_arm_s']}, pause {record['pause_logged_s']}")
+            except RuntimeError as error:
+                emit(a.out, {"part": "prearm", "platform": a.platform, "mib": mib, "rate_mib_s": rate, "error": str(error)[-6000:], "host": host()})
+                log(f"prearm {a.platform} {mib} MiB at {rate} MiB/s failed: {str(error)[-3000:]}")
             finally:
                 sb.destroy()
                 sb.remove()
@@ -151,6 +154,9 @@ def rates(a: argparse.Namespace) -> None:
                           "host": host()}
                 emit(a.out, record)
                 log(f"rates {case} rep {rep}: {record['delta_written_bytes']} B in {epoch} s, arm {record['arm_s']}")
+        except (RuntimeError, TimeoutError) as error:
+            emit(a.out, {"part": "rates", "platform": a.platform, "case": case, "error": str(error)[-6000:], "host": host()})
+            log(f"rates {case} failed: {str(error)[-3000:]}")
         finally:
             sb.destroy()
             sb.remove()
