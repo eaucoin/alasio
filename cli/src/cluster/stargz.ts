@@ -102,6 +102,13 @@ export function stargzConfig(registries?: Registries): string {
     "enable = true",
     `address = ${tomlString(FUSE_MANAGER_SOCKET)}`,
     `path = ${tomlString("/usr/local/bin/stargz-fuse-manager")}`,
+    "",
+    "# Spike (X-PT): a file opened through the mount is merged into one backing file once and read",
+    "# by the kernel from it, without the daemon's round trips, the merge's buffer within the",
+    "# daemon's memory limit.",
+    "[fuse]",
+    "passthrough = true",
+    `merge_buffer_size = ${32 << 20}`,
     ...mirrors.flatMap(([host, reached]) =>
       reached.flatMap((url) => [
         "",
