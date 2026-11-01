@@ -16,6 +16,10 @@
  * - `sum <volumeId> <sessionId>`: takes the session over and prints the SHA-256 of the bytes
  *   it holds live, null where it holds none, and bayma's notice to the exec.
  *
+ * - Spike: `trace <volumeId> <sessionId>`: as `read`, each step's wall clock beside, and a
+ *   second exec after the first; `rewrite <volumeId> <sessionId>`: takes the session over and
+ *   writes every byte `fill` filled anew, printing how many and how long it took.
+ *
  * Each lets go of its control of the session before it ends, so that the next takes it over
  * at once: bayma keeps a controller's lease for as long as it sees its client connected, and
  * a client's close may reach it after the next client's acquire does.
@@ -59,7 +63,7 @@ export interface ReplSeen {
 }
 
 const [verb, volumeId, argument] = process.argv.slice(2);
-if (!volumeId || !argument || !["set", "hold", "read", "fill", "sum"].includes(verb ?? "")) {
+if (!volumeId || !argument || !["set", "hold", "read", "fill", "sum", "trace", "rewrite"].includes(verb ?? "")) {
   throw new Error("usage: session-repl.ts set <volumeId> <value> | hold <volumeId> <path> | read <volumeId> <sessionId> | fill <volumeId> <mebibytes> | sum <volumeId> <sessionId>");
 }
 
@@ -91,15 +95,33 @@ async function exec(client: Client, sessionId: string, code: string): Promise<{ 
   return { stdout: done.stdout_text ?? "", notice: done.notice ?? null };
 }
 
+// Spike: when the trace verb asked, each step's wall clock.
+const asked = Date.now();
 const { sessionsGateway } = loadAlasioConfig();
 if (!sessionsGateway) throw new Error("the installation gives alasio no sandbox gateway");
 const bayma = await Effect.runPromise(makeGatewayWorkspaces(sessionsGateway).endpoint(volumeId, "none"));
 
 const client = new Client({ name: "alasio-e2e", version: "1.0.0" });
+const connecting = Date.now();
 // The transport is one; the SDK declares its sessionId `string | undefined` where Transport has it optional.
 await client.connect(new StreamableHTTPClientTransport(new URL(bayma.url), { requestInit: { headers: bayma.headers } }) as Transport);
+const connected = Date.now();
 try {
-  if (verb === "set") {
+  if (verb === "trace") {
+    await call(client, "session.acquire_controller", { session_id: argument });
+    const acquired = Date.now();
+    const { stdout, notice } = await exec(client, argument, "console.log(JSON.stringify({ live: globalThis.kept ?? null, checkpointed: $checkpoint?.kept ?? null }))");
+    const answered = Date.now();
+    await exec(client, argument, "console.log(1)");
+    const again = Date.now();
+    await release(client, argument);
+    console.log(JSON.stringify({ ...JSON.parse(stdout), notice, asked, connecting, connected, acquired, answered, again }));
+  } else if (verb === "rewrite") {
+    await call(client, "session.acquire_controller", { session_id: argument });
+    const { stdout } = await exec(client, argument, "const t0 = performance.now(); require(\"node:crypto\").randomFillSync(globalThis.filled); console.log(JSON.stringify({ bytes: globalThis.filled.length, ms: performance.now() - t0 }))");
+    await release(client, argument);
+    console.log(JSON.stringify({ ...JSON.parse(stdout), asked, connected }));
+  } else if (verb === "set") {
     const { session } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "bun", title: "e2e", cwd: "/workspace" });
     const value = JSON.stringify(argument);
     await exec(client, session.session_id, `globalThis.kept = ${value}; $checkpoint = { kept: ${value} }; console.log("set")`);
