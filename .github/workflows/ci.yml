@@ -1,85 +1,87 @@
 name: ci
 
-# On demand only, as an end-to-end run builds every image and brings clusters up.
+# Spike, not for main: the endpoint package's validation experiments of the orchestration
+# area (E3, E4, E9, E10, E14, G-18, E8 = X-ZSWAP, X-OOM, X-ARM), on this throwaway branch
+# alone: the branch's own ci.yml, as GitHub dispatches only workflows whose file is on the
+# default branch. `experiments` names the jobs: orch and wake, end-to-end shards of alasio on
+# the host target (test/e2e/orchestration.test.ts, the wake shard of test/e2e/alasio.test.ts);
+# arm, uffd, zswap, oom and g18, raw runsc or the host's kernel on a runner (bench/val/).
 on:
   workflow_dispatch:
     inputs:
-      # Some of the end-to-end jobs alone, for a change that needs no more proven (the
-      # shards job says which); the unit, package and images jobs run whatever it says.
-      shards:
-        description: "End-to-end jobs to run, each a shard, target/shard or target/agents/shard (all if empty)"
+      experiments:
+        description: "Jobs, of orch wake arm uffd zswap oom g18"
+        type: string
+        default: "orch"
+      orch-parts:
+        description: "Parts of the orch shard, of restore density pause (all if empty)"
         type: string
         default: ""
-      # The release the upgrade shard upgrades from, which an installation runs before it
-      # upgrades to this: npm's latest, as the box's is, unless another is named.
+      arm-parts:
+        description: "Parts of the arm job, of carm prearm rates"
+        type: string
+        default: "carm prearm rates"
+      kernels:
+        description: "Kernels of the uffd and oom jobs, of runner vm612"
+        type: string
+        default: "runner vm612"
       previous:
-        description: "Release the upgrade shard upgrades from, as 10.0.4 (npm's latest if empty)"
+        description: "Release the images job's stand-ins of the release before are built on (npm's latest if empty)"
         type: string
         default: ""
+      images:
+        description: "alasio's images of an earlier run, kept, as ghcr.io/eaucoin/alasio-ci/run-<id>-<attempt> (built anew if empty)"
+        type: string
+        default: ""
+      keep-images:
+        description: "Keep the images this run builds, for later runs, to be deleted by hand"
+        type: boolean
+        default: false
+      cpu:
+        description: "The runner CPU model every job must have, others failing at once to be re-run (any if empty)"
+        type: string
+        default: "AMD EPYC 7763 64-Core Processor"
+      kernel:
+        description: "The prefix of the runner kernel's release every job must have (any if empty)"
+        type: string
+        default: "7.0."
 
 permissions:
   contents: read
 
 env:
-  # Where the images job pushes the images, once, for every end-to-end job to pull: under
-  # run-<id>-<attempt>, packages of the attempt's own, which the last job deletes whole.
-  # A package GitHub's token makes here is linked to this public repository, and public as
-  # it is, so alasio init and the clusters' nodes pull them without a login.
   REGISTRY: ghcr.io/eaucoin/alasio-ci
+  GVISOR_RELEASE: 20260921.0-eaucoin.15
 
 jobs:
-  unit:
+  plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      e2e: ${{ steps.plan.outputs.e2e }}
+      raw: ${{ steps.plan.outputs.raw }}
+      arm: ${{ steps.plan.outputs.arm }}
+      kernels: ${{ steps.plan.outputs.kernels }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24.14.0
-          cache: npm
-      - run: npm ci
-      # The lake's package installed too, as a checkout that builds its image has it: its
-      # modules then resolve its own copies, which the root's tests must work beside.
-      - run: npm ci --prefix neon/lake
-      - run: npm run typecheck
-      - run: npm test
-
-  # The object store's S3 gateway under the load the box puts it under, in Docker, as
-  # SeaweedFS leaves it and as alasio runs it (test/gateway-memory.test.ts): several GiB,
-  # on a runner of its own.
-  gateway-memory:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      # Some 10 GiB go to the store's volume server, more than a runner has free: what of its
-      # software this job does not use goes first (Go stays, for the gateway's heap profile).
-      - run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup && df -h /
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24.14.0
-          cache: npm
-      - run: npm ci
-      - run: npm run test:gateway-memory
+      - id: plan
+        name: Say the jobs
+        shell: bash
         env:
-          ALASIO_GATEWAY_LOAD: "1"
-
-  package:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24.14.0
-          cache: npm
-      - run: npm ci
-      # Builds the command line and packs its npm package; checks that the package holds
-      # the built command line alone, with the CRD it applies; and runs alasio --version
-      # and --help from an install of it.
-      - run: node tooling/cli-package.ts
+          EXPERIMENTS: ${{ inputs.experiments }}
+          KERNELS: ${{ inputs.kernels }}
+        run: |
+          words() { jq --raw-input --compact-output '[splits("[\\s,]+") | select(. != "")]' <<<"$1"; }
+          all=$(words "$EXPERIMENTS")
+          unknown=$(jq -r '[.[] | select(IN("orch", "wake", "arm", "uffd", "zswap", "oom", "g18") | not)] | join(", ")' <<<"$all")
+          [ -z "$unknown" ] || { echo "::error::no experiment $unknown"; exit 1; }
+          echo "e2e=$(jq -c '[.[] | select(IN("orch", "wake"))]' <<<"$all")" | tee -a "$GITHUB_OUTPUT"
+          echo "raw=$(jq -c '[.[] | select(IN("orch", "wake") | not)]' <<<"$all")" | tee -a "$GITHUB_OUTPUT"
+          echo "arm=$(jq -c 'if any(.[]; . == "arm") then ["systrap", "kvm"] else [] end' <<<"$all")" | tee -a "$GITHUB_OUTPUT"
+          echo "kernels=$(words "$KERNELS")" | tee -a "$GITHUB_OUTPUT"
 
   images:
+    needs: plan
+    if: needs.plan.outputs.e2e != '[]' && inputs.images == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -161,64 +163,27 @@ jobs:
           echo "registry=$PUSH_TO" >>"$GITHUB_OUTPUT"
           exit "$failed"
 
-  # The end-to-end jobs, each a shard of the suites on a cluster: in Docker on one node,
-  # and on a server with two agents, so the stack and sessions spread; and k3s on the
-  # runner itself, the host target, which the runner's sudo, asking for no password, lets
-  # alasio install, on one: behind ufw for one shard, as a server often is, and without a
-  # firewall for the others. The shards need nothing of each other's: alasio on
-  # Kubernetes, workspaces on JuiceFS, Neon, alasio's telemetry, branch environments, and
-  # how alasio is scaled, sized and drained, sessions' whole-sandbox snapshots, conversations'
-  # harnesses in pools of their own, and, on the
-  # host target alone, as the box's, alasio upgraded from the release before
-  # (test/e2e/harness.ts). All of them, or those the run's shards input names, each word of
-  # it a shard on every cluster, target/shard on its target's, or target/agents/shard on
-  # one; a word that names none fails the run before any starts.
-  shards:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-    steps:
-      - id: matrix
-        name: Say the end-to-end jobs
-        shell: bash
-        env:
-          SHARDS: ${{ inputs.shards }}
-        run: |
-          matrix=$(jq --null-input --raw-output --arg shards "$SHARDS" '
-            def name($parts):
-              if $parts == 1 then [.shard] elif $parts == 2 then [.target, .shard]
-              else [.target, (.agents | tostring), .shard] end;
-            def named($word): ($word | split("/")) as $parts | name($parts | length) == $parts;
-            [({target: "docker", agents: (0, 2)}, {target: "host", agents: 0}) as $cluster
-              | ("sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents", "wake") as $shard
-              | $cluster + {shard: $shard}
-              | select(.shard != "upgrade" or .target == "host")
-              | if .target == "host" and .shard == "sessions" then . + {firewall: "ufw"} else . end]
-            | . as $jobs
-            | [$shards | splits("[\\s,]+") | select(. != "")] as $words
-            | [$words[] | select(. as $word | $jobs | any(named($word)) | not)] as $unnamed
-            | if $unnamed != [] then
-                "::error::shards names no end-to-end job by \($unnamed | join(", "))\n" | halt_error(1)
-              elif $words == [] then .
-              else map(select(any(named($words[]); .))) end
-            | "matrix=\({include: .} | tojson)"')
-          echo "$matrix" | tee --append "$GITHUB_OUTPUT"
 
   e2e:
-    needs: [shards, images]
+    needs: [plan, images]
+    if: always() && needs.plan.outputs.e2e != '[]' && (needs.images.result == 'success' || inputs.images != '')
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 180
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.shards.outputs.matrix) }}
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.e2e) }}
     steps:
-      # The cluster holds Neon's images and the agent image, bayma's with every runtime
-      # it serves, unpacked: far more disk than a runner starts with free, so the
-      # software it comes with that this job does not use goes first. Each directory is
-      # moved aside, as setup-node installs Node in a tool cache made anew, then removed,
-      # and Docker's images pruned, all at once, in the background, while the job readies
-      # the run; the step before the run waits for it.
+      - name: The runner's CPU and kernel, as pinned
+        shell: bash
+        env:
+          PINNED_CPU: ${{ inputs.cpu }}
+          PINNED_KERNEL: ${{ inputs.kernel }}
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          echo "CPU $model, kernel $(uname -r), $(nproc) cores, $(free -g | awk '/Mem:/ { print $2 }') GiB"
+          [ -z "$PINNED_CPU" ] || [ "$model" = "$PINNED_CPU" ] || { echo "::error::this runner's CPU is $model, not $PINNED_CPU: re-run this job"; exit 3; }
+          [ -z "$PINNED_KERNEL" ] || [[ $(uname -r) == "$PINNED_KERNEL"* ]] || { echo "::error::this runner's kernel is $(uname -r), not $PINNED_KERNEL*: re-run this job"; exit 3; }
       - name: Free disk space, in the background
         shell: bash
         run: |
@@ -252,40 +217,33 @@ jobs:
           cat "$RUNNER_TEMP/disk-freed.log"
           df -h /
           exit "$(cat "$RUNNER_TEMP/disk-freed")"
-      # ufw active, denying all that comes in, as alasio finds it on a server: alasio lets the
-      # cluster's networks in (cli/src/cluster/node.ts), and its rules, said now, are to be
-      # the same once alasio is removed.
-      - name: Enable ufw, denying what comes in
-        if: matrix.firewall == 'ufw'
-        run: |
-          command -v ufw >/dev/null || sudo apt-get install --yes ufw
-          sudo ufw default deny incoming
-          sudo ufw default allow outgoing
-          sudo ufw --force enable
-          sudo ufw status verbose
-          sudo ufw show added | tee "$RUNNER_TEMP/ufw-rules"
-      # alasio's package installed, alasio init and up on a cluster of this runner from the
-      # images job's images, the shard's end-to-end tests, and alasio uninstall --purge,
-      # which leaves nothing of the cluster on the runner (test/e2e/harness.ts).
-      - run: npm run test:e2e
+      - name: The ${{ matrix.shard }} shard, on the host target
+        shell: bash
         env:
-          ALASIO_E2E_TARGET: ${{ matrix.target }}
-          ALASIO_E2E_AGENTS: ${{ matrix.agents }}
+          ALASIO_E2E_TARGET: host
+          ALASIO_E2E_AGENTS: "0"
           ALASIO_E2E_SHARD: ${{ matrix.shard }}
-          ALASIO_E2E_REGISTRY: ${{ needs.images.outputs.registry }}
+          ALASIO_E2E_REGISTRY: ${{ inputs.images || needs.images.outputs.registry }}
           ALASIO_E2E_PREVIOUS: ${{ needs.images.outputs.previous }}
-      - name: ufw's rules are as they were before alasio
-        if: matrix.firewall == 'ufw'
+          ORCH_PARTS: ${{ inputs.orch-parts }}
         run: |
-          sudo ufw status verbose
-          sudo ufw show added | diff "$RUNNER_TEMP/ufw-rules" -
+          mkdir -p "$RUNNER_TEMP/out"
+          if [ "$ALASIO_E2E_SHARD" = orch ]; then
+            node --test --test-timeout=10800000 --test-force-exit --test-reporter=spec test/e2e/orchestration.test.ts 2>&1 | tee "$RUNNER_TEMP/out/orch.log"
+          else
+            npm run test:e2e 2>&1 | tee "$RUNNER_TEMP/out/$ALASIO_E2E_SHARD.log"
+          fi
+          exit "${PIPESTATUS[0]}"
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: val-e2e-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
 
-  # Whatever came of the rest, the run's images are deleted, those of each of its attempts,
-  # pushed whole or not; so a failed run is re-run whole, its images built anew, as a
-  # re-run of its failed jobs alone would find them gone.
   delete-images:
     needs: [images, e2e]
-    if: always()
+    if: always() && needs.images.result == 'success' && !inputs.keep-images
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -299,16 +257,260 @@ jobs:
           failed=0
           for attempt in $(seq "$GITHUB_RUN_ATTEMPT"); do
             for name in alasio alasio-agent alasio-lake alasio-grafana alasio-log alasio-collector alasio-webhook alasio-node alasio-harness-stand-ins alasio-harness-stand-ins-previous; do
-              image="$REGISTRY/run-$GITHUB_RUN_ID-$attempt/$name"
               package="alasio-ci/run-$GITHUB_RUN_ID-$attempt/$name"
               if said=$(gh api --method DELETE "/users/eaucoin/packages/container/${package//\//%2F}" 2>&1); then
-                echo "deleted $image"
+                echo "deleted $package"
               elif [[ $said == *"HTTP 404"* ]]; then
-                echo "no $image to delete"
+                echo "no $package to delete"
               else
-                echo "::error::$image was not deleted: $said"
+                echo "::error::$package was not deleted: $said"
                 failed=1
               fi
             done
           done
           exit "$failed"
+
+  # X-ARM (G-19, G-20 as built, G-22, G-24): bench/val/arm.py, on systrap and kvm.
+  arm:
+    needs: plan
+    if: needs.plan.outputs.arm != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.plan.outputs.arm) }}
+    steps:
+      - name: The runner's CPU and kernel, as pinned
+        shell: bash
+        env:
+          PINNED_CPU: ${{ inputs.cpu }}
+          PINNED_KERNEL: ${{ inputs.kernel }}
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          echo "CPU $model, kernel $(uname -r), $(nproc) cores, $(free -g | awk '/Mem:/ { print $2 }') GiB"
+          [ -z "$PINNED_CPU" ] || [ "$model" = "$PINNED_CPU" ] || { echo "::error::this runner's CPU is $model, not $PINNED_CPU: re-run this job"; exit 3; }
+          [ -z "$PINNED_KERNEL" ] || [[ $(uname -r) == "$PINNED_KERNEL"* ]] || { echo "::error::this runner's kernel is $(uname -r), not $PINNED_KERNEL*: re-run this job"; exit 3; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install gVisor ${{ env.GVISOR_RELEASE }}, as alasio's nodes run it
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          base=https://github.com/eaucoin/gvisor/releases/download/release-$GVISOR_RELEASE
+          curl -fsSLO "$base/gvisor-x86_64.tar.zstd"
+          curl -fsSLO "$base/gvisor-x86_64.tar.zstd.sha512"
+          sha512sum -c gvisor-x86_64.tar.zstd.sha512
+          mkdir -p gvisor && tar --zstd -xf gvisor-x86_64.tar.zstd -C gvisor
+          sudo install -m 0755 "$(find gvisor -name runsc -type f | head -n 1)" /usr/local/bin/runsc
+          runsc --version
+          sudo mkdir -p /mnt/val && sudo chown "$USER" /mnt/val
+          sudo swapoff -a
+      - name: KVM for the sandboxes
+        if: matrix.platform == 'kvm'
+        run: sudo chmod 666 /dev/kvm && ls -la /dev/kvm
+      - name: Arming and first writes
+        shell: bash
+        env:
+          PARTS: ${{ inputs.arm-parts }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          for part in $PARTS; do
+            if [ "$part" = rates ] && [ "$PLATFORM" != systrap ]; then continue; fi
+            sudo --preserve-env=ImageOS,ImageVersion python3 bench/val/arm.py "$part" --runsc /usr/local/bin/runsc --platform "$PLATFORM" --out "$RUNNER_TEMP/out/arm-$PLATFORM.jsonl"
+          done
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: val-arm-${{ matrix.platform }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+
+  # G-23 and the host's floor: bench/val/uffd.c on the runner's 7.0 and in a VM of Debian 13's 6.12.
+  uffd:
+    needs: plan
+    if: contains(needs.plan.outputs.raw, '"uffd"')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ${{ fromJSON(needs.plan.outputs.kernels) }}
+    steps:
+      - name: The runner's CPU and kernel, as pinned
+        shell: bash
+        env:
+          PINNED_CPU: ${{ inputs.cpu }}
+          PINNED_KERNEL: ${{ inputs.kernel }}
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          echo "CPU $model, kernel $(uname -r), $(nproc) cores, $(free -g | awk '/Mem:/ { print $2 }') GiB"
+          [ -z "$PINNED_CPU" ] || [ "$model" = "$PINNED_CPU" ] || { echo "::error::this runner's CPU is $model, not $PINNED_CPU: re-run this job"; exit 3; }
+          [ -z "$PINNED_KERNEL" ] || [[ $(uname -r) == "$PINNED_KERNEL"* ]] || { echo "::error::this runner's kernel is $(uname -r), not $PINNED_KERNEL*: re-run this job"; exit 3; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: userfaultfd write protection
+        shell: bash
+        env:
+          KERNEL: ${{ matrix.kernel }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          gcc -O2 -static -pthread -o "$RUNNER_TEMP/uffd" bench/val/uffd.c
+          sudo swapoff -a
+          run='./uffd arm 1024 5 && ./uffd arm 3072 5 && ./uffd fault 256 5 && ./uffd fault 1024 3 && ./uffd efault'
+          if [ "$KERNEL" = runner ]; then
+            (cd "$RUNNER_TEMP" && uname -r && sudo sh -c "$run") | tee "$RUNNER_TEMP/out/uffd-$KERNEL.jsonl"
+          else
+            bench/val/vm612.sh 12288 "$run" "$RUNNER_TEMP/uffd" | tee "$RUNNER_TEMP/out/uffd-$KERNEL.jsonl"
+          fi
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: val-uffd-${{ matrix.kernel }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+
+  # E8 = X-ZSWAP: bench/val/zswap.py.
+  zswap:
+    needs: plan
+    if: contains(needs.plan.outputs.raw, '"zswap"')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: The runner's CPU and kernel, as pinned
+        shell: bash
+        env:
+          PINNED_CPU: ${{ inputs.cpu }}
+          PINNED_KERNEL: ${{ inputs.kernel }}
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          echo "CPU $model, kernel $(uname -r), $(nproc) cores, $(free -g | awk '/Mem:/ { print $2 }') GiB"
+          [ -z "$PINNED_CPU" ] || [ "$model" = "$PINNED_CPU" ] || { echo "::error::this runner's CPU is $model, not $PINNED_CPU: re-run this job"; exit 3; }
+          [ -z "$PINNED_KERNEL" ] || [[ $(uname -r) == "$PINNED_KERNEL"* ]] || { echo "::error::this runner's kernel is $(uname -r), not $PINNED_KERNEL*: re-run this job"; exit 3; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install gVisor ${{ env.GVISOR_RELEASE }}, as alasio's nodes run it
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          base=https://github.com/eaucoin/gvisor/releases/download/release-$GVISOR_RELEASE
+          curl -fsSLO "$base/gvisor-x86_64.tar.zstd"
+          curl -fsSLO "$base/gvisor-x86_64.tar.zstd.sha512"
+          sha512sum -c gvisor-x86_64.tar.zstd.sha512
+          mkdir -p gvisor && tar --zstd -xf gvisor-x86_64.tar.zstd -C gvisor
+          sudo install -m 0755 "$(find gvisor -name runsc -type f | head -n 1)" /usr/local/bin/runsc
+          runsc --version
+          sudo mkdir -p /mnt/val && sudo chown "$USER" /mnt/val
+          sudo swapoff -a
+      - name: A frozen sandbox reclaimed into zswap and faulted back
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          command -v lz4 >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq lz4 zstd >/dev/null; }
+          sudo --preserve-env=ImageOS,ImageVersion python3 bench/val/zswap.py --runsc /usr/local/bin/runsc --out "$RUNNER_TEMP/out/zswap.jsonl"
+          sudo --preserve-env=ImageOS,ImageVersion python3 bench/val/zswap.py --runsc /usr/local/bin/runsc --out "$RUNNER_TEMP/out/zswap.jsonl" --compressors lz4 --contents random --sizes 1024 --reps 3
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: val-zswap
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+
+  # X-OOM: bench/val/oom.py on the runner's 7.0 and in a VM of Debian 13's 6.12.
+  oom:
+    needs: plan
+    if: contains(needs.plan.outputs.raw, '"oom"')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ${{ fromJSON(needs.plan.outputs.kernels) }}
+    steps:
+      - name: The runner's CPU and kernel, as pinned
+        shell: bash
+        env:
+          PINNED_CPU: ${{ inputs.cpu }}
+          PINNED_KERNEL: ${{ inputs.kernel }}
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          echo "CPU $model, kernel $(uname -r), $(nproc) cores, $(free -g | awk '/Mem:/ { print $2 }') GiB"
+          [ -z "$PINNED_CPU" ] || [ "$model" = "$PINNED_CPU" ] || { echo "::error::this runner's CPU is $model, not $PINNED_CPU: re-run this job"; exit 3; }
+          [ -z "$PINNED_KERNEL" ] || [[ $(uname -r) == "$PINNED_KERNEL"* ]] || { echo "::error::this runner's kernel is $(uname -r), not $PINNED_KERNEL*: re-run this job"; exit 3; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install gVisor ${{ env.GVISOR_RELEASE }}, as alasio's nodes run it
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          base=https://github.com/eaucoin/gvisor/releases/download/release-$GVISOR_RELEASE
+          curl -fsSLO "$base/gvisor-x86_64.tar.zstd"
+          curl -fsSLO "$base/gvisor-x86_64.tar.zstd.sha512"
+          sha512sum -c gvisor-x86_64.tar.zstd.sha512
+          mkdir -p gvisor && tar --zstd -xf gvisor-x86_64.tar.zstd -C gvisor
+          sudo install -m 0755 "$(find gvisor -name runsc -type f | head -n 1)" /usr/local/bin/runsc
+          runsc --version
+          sudo mkdir -p /mnt/val && sudo chown "$USER" /mnt/val
+          sudo swapoff -a
+      - name: An OOM of two sandboxes' parent
+        shell: bash
+        env:
+          KERNEL: ${{ matrix.kernel }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          gcc -O2 -static -o bench/val/om bench/val/om.c
+          if [ "$KERNEL" = runner ]; then
+            sudo --preserve-env=ImageOS,ImageVersion python3 bench/val/oom.py --runsc /usr/local/bin/runsc --out "$RUNNER_TEMP/out/oom-$KERNEL.jsonl"
+          else
+            bench/val/vm612.sh 12288 'swapoff -a; python3 oom.py --runsc /val/runsc --out /val/oom.jsonl >&2; cat /val/oom.jsonl' \
+              /usr/local/bin/runsc bench/val/common.py bench/val/oom.py bench/val/om bench/val/om.c > "$RUNNER_TEMP/out/oom-$KERNEL.jsonl"
+          fi
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: val-oom-${{ matrix.kernel }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+
+  # G-18: upstream gVisor master with and without the restore's first clock sample, bench/val/g18.py.
+  g18:
+    needs: plan
+    if: contains(needs.plan.outputs.raw, '"g18"')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: The runner's CPU and kernel, as pinned
+        shell: bash
+        env:
+          PINNED_CPU: ${{ inputs.cpu }}
+          PINNED_KERNEL: ${{ inputs.kernel }}
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          echo "CPU $model, kernel $(uname -r), $(nproc) cores, $(free -g | awk '/Mem:/ { print $2 }') GiB"
+          [ -z "$PINNED_CPU" ] || [ "$model" = "$PINNED_CPU" ] || { echo "::error::this runner's CPU is $model, not $PINNED_CPU: re-run this job"; exit 3; }
+          [ -z "$PINNED_KERNEL" ] || [[ $(uname -r) == "$PINNED_KERNEL"* ]] || { echo "::error::this runner's kernel is $(uname -r), not $PINNED_KERNEL*: re-run this job"; exit 3; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Upstream master's runsc, as it is and without the first clock sample
+        shell: bash
+        run: |
+          git clone --quiet --depth 1 --branch go https://github.com/google/gvisor "$RUNNER_TEMP/gvisor"
+          cd "$RUNNER_TEMP/gvisor"
+          echo "upstream go branch at $(git rev-parse HEAD): $(git log -1 --format=%s)"
+          grep -q 'Calibrating the clocks takes two samples' runsc/boot/restore.go || { echo "::error::the go branch's restore has no clock pre-calibration"; exit 1; }
+          # The runner's Go, which fetches the toolchain go.mod asks for (GOTOOLCHAIN=auto).
+          GOTOOLCHAIN=auto go version
+          CGO_ENABLED=0 go build -o "$RUNNER_TEMP/runsc-pre" ./runsc
+          sed -i '/^\tclocks.Update(false)$/d' runsc/boot/restore.go
+          ! grep -q '^\tclocks.Update(false)$' runsc/boot/restore.go
+          git diff --stat
+          CGO_ENABLED=0 go build -o "$RUNNER_TEMP/runsc-not" ./runsc
+          sudo install -m 0755 "$RUNNER_TEMP/runsc-pre" "$RUNNER_TEMP/runsc-not" /usr/local/bin/
+          sudo mkdir -p /mnt/val && sudo chown "$USER" /mnt/val
+      - name: The first reads of the time after a restore
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          sudo --preserve-env=ImageOS,ImageVersion python3 bench/val/g18.py --with /usr/local/bin/runsc-pre --without /usr/local/bin/runsc-not --out "$RUNNER_TEMP/out/g18.jsonl"
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: val-g18
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
