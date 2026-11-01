@@ -168,6 +168,12 @@ class Sandbox:
         cg = sh("systemctl", "show", "-P", "ControlGroup", f"{self.unit}.scope").stdout.strip()
         return Path(f"/sys/fs/cgroup{cg}")
 
+    def memory_events(self) -> str:
+        try:
+            return (self.cgroup() / "memory.events").read_text().replace("\n", " ")
+        except OSError as error:
+            return f"unread: {error}"
+
     def run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         return sh(*self.runsc(*args), check=check)
 
@@ -178,7 +184,8 @@ class Sandbox:
         ck = subprocess.run(self.runsc("checkpoint", f"--image-path={image}", *flags, self.cid), capture_output=True, text=True)
         took = time.monotonic() - t0
         if ck.returncode != 0:
-            raise RuntimeError(f"checkpoint {' '.join(flags)} failed: {ck.stderr[-2000:]}")
+            raise RuntimeError(f"checkpoint {' '.join(flags)} failed: {ck.stderr[-2000:]}; the scope's memory.events: "
+                               f"{self.memory_events()}; the Sentry's last lines: {self.boot_log()[-30:]}")
         # The Sentry's lines may land a moment after the command returns.
         time.sleep(0.2)
         return {"s": took, "lines": self.boot_log()[mark:]}

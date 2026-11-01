@@ -55,7 +55,7 @@ def carm(a: argparse.Namespace) -> None:
     rootfs = c_rootfs()
     for unit in a.units:
         for mib in a.sizes:
-            sb = Sandbox(a.runsc, rootfs, ["/wpw", str(mib)], flags(a, unit), props=[f"MemoryMax={mib + 1536}M", "MemorySwapMax=0"])
+            sb = Sandbox(a.runsc, rootfs, ["/wpw", str(mib)], flags(a, unit), props=[f"MemoryMax={2 * mib + 2048}M", "MemorySwapMax=0"])
             try:
                 ready = sb.start()
                 # The first save starts the tracking, every unit armed.
@@ -75,6 +75,9 @@ def carm(a: argparse.Namespace) -> None:
                                   "host": host()}
                         emit(a.out, record)
                         log(f"  rep {rep} fill {fill} %: wrote {pages} pages in {ms:.1f} ms; arm {record['arm_s']}; pause {record['pause_logged_s']}")
+            except RuntimeError as error:
+                emit(a.out, {"part": "carm", "platform": a.platform, "unit": unit, "mib": mib, "error": str(error)[-6000:], "host": host()})
+                log(f"carm {a.platform} unit {unit} {mib} MiB failed: {str(error)[-3000:]}")
             finally:
                 sb.destroy()
                 sb.remove()
