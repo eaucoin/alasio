@@ -67,6 +67,7 @@ import type { V1Container, V1Deployment, V1LabelSelector, V1NetworkPolicy, V1Nod
 import { Clock, Effect, Schedule, Schema, Semaphore } from "effect";
 
 import { BindStepFailed, type MakePod } from "../binder/binder.ts";
+import { servedOnResumed } from "../binder/bindings.ts";
 import { FREE_LABEL, type Pool } from "../binder/names.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import {
@@ -619,7 +620,11 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       // Paused where its policies are not in force (504), or where the bucket fails (502), which
       // may pass; of any other failure its sandbox may have run; paused, too, where the snapshot
       // was taken live and holds the session no more (410), which no try restores.
-      yield* agents.resume(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, podIPs, containerIds, policies, snapshot }, bytes).pipe(
+      // Spike (E15): a standby served once resumed has its agent probe its MCP port before its resume is answered.
+      const port = servedOnResumed.has(`${pool.namespace}/${name}`)
+        ? (running.spec?.containers ?? []).flatMap(({ ports }) => ports ?? []).find((each) => each.name === "mcp")?.containerPort
+        : undefined;
+      yield* agents.resume(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, podIPs, containerIds, policies, snapshot, ...(port === undefined ? {} : { probePort: port }) }, bytes).pipe(
         Effect.mapError((error) => {
           const status = error._tag === "NodeAgentError" ? error.status : undefined;
           return new RestoreRefused({ reason: error.message, resumed: status !== 502 && status !== 504 && status !== 410, ...(status === 410 ? { stale: true } : {}) });
@@ -783,7 +788,10 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           const stopReason = into?.memoryLimit === undefined ? {} : { [SANDBOX_STOP_REASON_VARIABLE]: `it ran out of its memory (${into.memoryLimit})` };
           // Spike (E15): every other restore into a standby pod of the node, where one is ready, claimed for this
           // binding: its workspace attached into its directory and its image prepared, then restored into it, paused.
-          const standbyTurnNow = standbyMode === "alternate" && standbyTurn++ % 2 === 1;
+          // Turns of three: a pod made for it; a standby served as kubelet says it is ready; a standby served once resumed
+          // and its agent saw it accept (servedOnResumed).
+          const turn = standbyMode === "alternate" ? standbyTurn++ % 3 : 0;
+          const standbyTurnNow = turn !== 0;
           const nextStandby = Effect.asVoid(Effect.forkDetach(Effect.delay(ensureStandby(pool, node, base, kept.runtimeClassName), "15 seconds")));
           if (standbyTurnNow) {
             yield* mark("read");
@@ -792,6 +800,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             if (standby === null) yield* Effect.logWarning(`no standby of ${pool.namespace} was claimed on ${node}: ${named(pool, workspace)} is restored into a pod made for it`);
             else {
               const name = standby.metadata?.name ?? "";
+              if (turn === 2) servedOnResumed.add(`${pool.namespace}/${name}`);
               const dropped = kube.remove("v1", "Pod", pool.namespace, name).pipe(Effect.ignore);
               const [prepared, attached] = yield* Effect.all([
                 agents.prepare(node, ref(pool, workspace), kept.gofer ?? undefined).pipe(Effect.result),
@@ -890,7 +899,10 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         const of = restored;
         if (of === null || of.pod !== pod.metadata?.name) return yield* attach(pod);
         const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot, of.bytes, mark).pipe(Effect.result);
-        if (standbyMode !== "") yield* Effect.logInfo(`restore phases of ${named(pool, workspace)} into ${of.pod}: ${JSON.stringify(phases)}`).pipe(withLogScope("snapshots"));
+        if (standbyMode !== "") {
+          const arm = servedOnResumed.has(`${pool.namespace}/${of.pod}`) ? "standby served once resumed" : of.pod.length > 0 && phases.some(([phase]) => phase === "claimed") ? "standby served as kubelet says" : "made";
+          yield* Effect.logInfo(`restore phases of ${named(pool, workspace)} into ${of.pod} (${arm}): ${JSON.stringify(phases)}`).pipe(withLogScope("snapshots"));
+        }
         if (done._tag === "Success") {
           const now = yield* Clock.currentTimeMillis;
           deferredSince.delete(named(pool, workspace));

@@ -264,6 +264,10 @@ export const CheckpointRequest = Schema.Struct({
 export type CheckpointRequest = typeof CheckpointRequest.Type;
 
 /** A request to resume a workspace's sandbox, restored paused in a pod on this node. */
+/** Spike (E15): how long the agent's own probe of a resumed sandbox waits for it to accept, at most, and how often it tries. */
+const PROBE_WAIT_MS = 5_000;
+const PROBE_POLL_MS = 10;
+
 export const ResumeRequest = Schema.Struct({
   environment: Name,
   workspace: Name,
@@ -278,6 +282,11 @@ export const ResumeRequest = Schema.Struct({
   policies: Schema.Array(PodName).check(Schema.isMaxLength(64)),
   /** The snapshot its sandbox was restored from, whose manifest says whether it may run. */
   snapshot: SnapshotId,
+  /**
+   * Spike (E15): a port of the pod's the agent connects to from the node once the sandbox is resumed, as kubelet's
+   * readiness probe would, its resume answered only once it accepts, PROBE_WAIT_MS at most.
+   */
+  probePort: Schema.optional(Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(65535))),
 });
 export type ResumeRequest = typeof ResumeRequest.Type;
 
@@ -1669,6 +1678,21 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       Effect.mapError((error) => new SnapshotOutlived({ environment: manifest.environment, workspace: manifest.workspace, snapshot: manifest.snapshot, reason: error.message })),
     );
 
+  /** Spike (E15): connects to `port` of the pod's first address from the node until it accepts, PROBE_WAIT_MS at most, saying how long that took; one that never does is said, not failed. */
+  const probed = (request: ResumeRequest, port: number): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      const start = yield* Clock.currentTimeMillis;
+      const ip = request.podIPs[0] ?? "";
+      const target = isIPv6(ip) ? `[${ip}]` : ip;
+      const tries = Math.ceil(PROBE_WAIT_MS / PROBE_POLL_MS);
+      const script = `for i in $(seq ${tries}); do (exec 3<>/dev/tcp/${target}/${port}) 2>/dev/null && exit 0; sleep ${PROBE_POLL_MS / 1000}; done; exit 1`;
+      const ran = yield* onNode(host, ["bash", "-c", script]).pipe(Effect.result);
+      const took = (yield* Clock.currentTimeMillis) - start;
+      yield* ran._tag === "Success"
+        ? Effect.logInfo(`probed ${request.namespace}/${request.pod} on ${port}: it accepted ${took} ms after its resume`)
+        : Effect.logWarning(`probed ${request.namespace}/${request.pod} on ${port}: it did not accept within ${took} ms of its resume: ${ran.failure.message}`);
+    });
+
   const resume = (request: ResumeRequest): Effect.Effect<void, ResumeError> =>
     Effect.gen(function*() {
       const waited = yield* policiesInForce(request);
@@ -1681,6 +1705,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       // hook, which runsc's resume runs, waits on those reads of the pages it touches, however long after the prepare.
       storeProxy.resumed(prefixOf(request), backgroundReadMs);
       yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
+      if (request.probePort !== undefined) yield* probed(request, request.probePort);
       // Its sandbox runs from the snapshot it was restored from, which its next checkpoint saves what changed since.
       for (const id of request.containerIds) bases.set(id, from);
       // It reads its image until runsc says it has read every page.

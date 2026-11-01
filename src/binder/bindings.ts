@@ -23,6 +23,7 @@ import type { KubernetesObject, V1Pod } from "@kubernetes/client-node";
 import { Clock, Effect } from "effect";
 
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
+import { RESUMED_CONDITION } from "../kube/sandbox-shape.ts";
 import { BINDING_LABEL, boundAnnotations, boundLabels, FREE_LABEL, freeLabels, KEY_ANNOTATION, keyHash, leaseName, type Pool, POOL_LABEL } from "./names.ts";
 
 /** The annotation of a binding's Lease while it is released: the releasing binder. */
@@ -60,6 +61,9 @@ export const running = (pod: V1Pod): boolean => !pod.metadata?.deletionTimestamp
 export const restarted = (pod: V1Pod): boolean =>
   (pod.status?.containerStatuses ?? []).some(({ restartCount, state, lastState }) => restartCount > 0 || state?.terminated !== undefined || lastState?.terminated !== undefined);
 
+/** Spike (E15): the pods, by namespace and name, that serve once resumed, as `serving` says. */
+export const servedOnResumed = new Set<string>();
+
 /**
  * Whether `pod` runs ready, and is not being deleted: serving its binding. Ready as kubelet says
  * it, or as kubelet's own rule has it before kubelet next writes it: its containers ready and
@@ -70,6 +74,9 @@ export const restarted = (pod: V1Pod): boolean =>
 export const serving = (pod: V1Pod): boolean => {
   const holds = (type: string) => (pod.status?.conditions ?? []).some((condition) => condition.type === type && condition.status === "True");
   const gates = pod.spec?.readinessGates ?? [];
+  // Spike (E15): a standby the gateway restored into, in the arm that serves it so, serves once its sandbox is resumed, and
+  // its node's agent saw it accept on its port (src/gateway/snapshots.ts), whatever kubelet's probe says of its containers.
+  if (servedOnResumed.has(`${pod.metadata?.namespace}/${pod.metadata?.name}`) && running(pod) && holds(RESUMED_CONDITION)) return true;
   return running(pod) && (holds("Ready") || (gates.length > 0 && holds("ContainersReady") && gates.every(({ conditionType }) => holds(conditionType))));
 };
 

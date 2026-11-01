@@ -1,8 +1,10 @@
 /**
  * Spike, not for main: the kernel-standby validation's restores into standby pods (the endpoint
- * package's E15). The gateway, given ALASIO_SPIKE_STANDBY=alternate, restores every other
- * session into a standby pod of its node, kept ready there, the others into a pod made for
- * them, as it does today (src/gateway/snapshots.ts). Each run makes a workspace, a Bun REPL in it
+ * package's E15). The gateway, given ALASIO_SPIKE_STANDBY=alternate, restores sessions in turns
+ * of three: into a pod made for it, as it does today; into a standby pod of its node, kept ready
+ * there, served once kubelet says its containers are ready; and into a standby served once it is
+ * resumed and its node's agent saw it accept on its port (src/gateway/snapshots.ts). kubelet logs
+ * at v=4, and each run keeps what it said of the restoring pod's probes. Each run makes a workspace, a Bun REPL in it
  * (session-repl.ts set), has the gateway release it into a snapshot, waits SETTLE_MS, then reads
  * the REPL back through the gateway (session-repl.ts trace), which restores it, and checks it
  * holds what it was set to. A run is a standby's where the pod it was restored into was made
@@ -25,8 +27,8 @@ import { bindSession, boundPodOf, dumpClusterState, gatewayCall, inAlasio, kube,
 import type { ReplSet } from "./session-repl.ts";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-/** Restores, half of them into standbys. */
-const RUNS = Number(process.env["STANDBY_RUNS"] || 40);
+/** Restores, in turns of three: into a pod made for it, into a standby served as kubelet says it is ready, into a standby served once resumed. */
+const RUNS = Number(process.env["STANDBY_RUNS"] || 60);
 /** How long after its release each session is restored: more than the gateway waits to make the next standby, and its boot. */
 const SETTLE_MS = 25_000;
 const RUNSC_LOGS = "/var/log/runsc";
@@ -44,6 +46,18 @@ async function bootLines(node: string, sandbox: string): Promise<string[]> {
   if (sandbox === "") return ["no sandbox"];
   const lines = (await onNode(node, `cat ${RUNSC_LOGS}/${sandbox}/runsc.log.*.boot.txt 2>/dev/null || true`)).split("\n");
   return lines.filter((line) => SAID.test(line)).map((line) => line.slice(0, 600));
+}
+
+/** What kubelet logged of the pod `pod`'s probes and status on `node` since `since`, epoch ms: k3s's journal, kubelet at v=4 (raiseKubeletVerbosity). */
+async function kubeletLines(node: string, pod: string, since: number): Promise<string[]> {
+  const said = await onNode(node, `journalctl -u k3s --since @${Math.floor(since / 1000) - 5} --no-pager -o short-iso-precise | grep -F '${pod}' | grep -E 'Probe|probe|ContainersReady|Ready|status' | tail -n 80`).catch((error: unknown) => `could not be read: ${String(error)}`);
+  return said.split("\n").filter((line) => line.length > 0).map((line) => line.slice(0, 500));
+}
+
+/** Has kubelet on `node` log at v=4, its probes' results among what it says, through its debug flags, by the API server's node proxy. */
+async function raiseKubeletVerbosity(node: string): Promise<void> {
+  const said = await onNode(node, `printf 4 | k3s kubectl replace --raw /api/v1/nodes/${node}/proxy/debug/flags/v -f - 2>&1 || true`);
+  console.log(`# kubelet verbosity on ${node}: ${said.trim()}`);
 }
 
 /** Waits until no pod is bound to `workspace`. */
@@ -83,7 +97,9 @@ async function runOnce(run: number): Promise<boolean> {
   await sleep(2_000);
   const restore = await bootLines(restorer.node, await sandboxOf(restorer.node, restorer.name));
   const ready = standbys.map((each) => ({ name: each.metadata?.name, phase: each.status?.phase }));
-  console.log(`# standby-run ${JSON.stringify({ run, target: TARGET, workspace, restorer, standby, correct, made, releasedAt, standbys: ready, client, restore })}`);
+  const kubelet = await kubeletLines(restorer.node, restorer.name, releasedAt);
+  const conditions = (pod?.status?.conditions ?? []).map(({ type, status, lastTransitionTime }) => ({ type, status, lastTransitionTime }));
+  console.log(`# standby-run ${JSON.stringify({ run, target: TARGET, workspace, restorer, standby, correct, made, releasedAt, standbys: ready, client, restore, conditions, kubelet })}`);
   await release(workspace);
   for (const deadline = Date.now() + 300_000; Date.now() < deadline; await sleep(3000)) {
     const removed = await gatewayCall(await mainToken(workspace), "DELETE", "/workspace");
@@ -106,7 +122,10 @@ async function bootLogs(node: string): Promise<void> {
 before(async () => {
   try {
     await setUp();
-    for (const node of (await nodeAgents()).keys()) await bootLogs(node);
+    for (const node of (await nodeAgents()).keys()) {
+      await bootLogs(node);
+      await raiseKubeletVerbosity(node);
+    }
   } catch (error) {
     await dumpClusterState();
     throw error;
@@ -123,7 +142,7 @@ async function standbyLogs(): Promise<void> {
     const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: `app.kubernetes.io/component=${component}` });
     for (const pod of pods) {
       const logged = await kube.logs(NAMESPACE, pod.metadata?.name ?? "", container).catch((error: unknown) => `could not be read: ${String(error)}`);
-      for (const line of logged.split("\n").filter((each) => /standby|restore phases|resumed the sandbox/iu.test(each))) console.log(`# ${component} ${line.slice(0, 1500)}`);
+      for (const line of logged.split("\n").filter((each) => /standby|restore phases|resumed the sandbox|probed /iu.test(each))) console.log(`# ${component} ${line.slice(0, 1500)}`);
     }
   };
   await of("sandbox-gateway", "sandbox-gateway");
@@ -146,7 +165,7 @@ test(`restores into standby pods and into pods made for them, ${RUNS} in all`, {
     await standbyLogs();
   }
   console.log(`# standby-summary ${JSON.stringify({ runs: RUNS, intoStandbys })}`);
-  if (intoStandbys < RUNS / 2 - 2) {
+  if (intoStandbys < (RUNS * 2) / 3 - 2) {
     await dumpClusterState();
     throw new Error(`only ${intoStandbys} of ${RUNS} restores were into standbys`);
   }
