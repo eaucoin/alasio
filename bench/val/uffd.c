@@ -35,6 +35,7 @@
 #include <sys/mman.h>
 #include <signal.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -110,6 +111,15 @@ static int protect(int uffd, uint8_t* p, size_t bytes, int on, int dontwake) {
   return ioctl(uffd, UFFDIO_WRITEPROTECT, &w);
 }
 
+// The uffd-wp bit (57) of the page at `p` in this process's pagemap; -1 where it cannot be read.
+static int uffd_wp_bit(void* p) {
+  int fd = open("/proc/self/pagemap", O_RDONLY);
+  uint64_t entry = 0;
+  ssize_t got = fd < 0 ? -1 : pread(fd, &entry, sizeof entry, (off_t)((uintptr_t)p / PAGE * sizeof entry));
+  if (fd >= 0) close(fd);
+  return got == sizeof entry ? (int)((entry >> 57) & 1) : -1;
+}
+
 static void arm(size_t mib, int reps) {
   size_t bytes = mib << 20;
   const char* modes[] = {"async", "sync"};
@@ -122,10 +132,20 @@ static void arm(size_t mib, int reps) {
       continue;
     }
     uint8_t* p = memfd_map(bytes);
+    // The same writes with nothing armed, for comparison: a quarter of the pages, once.
+    double b0 = now_s();
+    for (size_t off = 0; off < bytes / 4; off += PAGE) p[off]++;
+    printf("{\"test\":\"baseline\",\"mode\":\"%s\",\"mib\":%zu,\"write_ns_per_page\":%.1f}\n", modes[m], mib, (now_s() - b0) * 1e9 / (bytes / 4 / PAGE));
     reg(uffd, p, bytes);
     double t0 = now_s();
     protect(uffd, p, bytes, 1, 0);
     double first = now_s() - t0;
+    // Whether arming marked the first page write-protected (pagemap's bit 57, PM_UFFD_WP), and whether a write
+    // in async mode cleared it, as the kernel's fault path does.
+    int armed = uffd_wp_bit(p);
+    if (async) p[0]++;
+    printf("{\"test\":\"pagemap\",\"mode\":\"%s\",\"mib\":%zu,\"wp_after_arm\":%d,\"wp_after_write\":%d}\n", modes[m], mib, armed, async ? uffd_wp_bit(p) : -1);
+    protect(uffd, p, PAGE, 1, 0);
     int fills[] = {0, 25, 100};
     for (int f = 0; f < 3; f++) {
       double whole[64], ranges[64], writes[64];
@@ -171,6 +191,8 @@ static void arm(size_t mib, int reps) {
 
 struct handler {
   int uffd;
+  // The mapping's start, which units are aligned to (mmap aligns it to a page alone).
+  uintptr_t base;
   size_t unit;
   int copy;
   uint8_t* staging;
@@ -186,7 +208,7 @@ static void* handle(void* arg) {
     struct uffd_msg msg;
     if (read(h->uffd, &msg, sizeof msg) != sizeof msg) continue;
     if (msg.event != UFFD_EVENT_PAGEFAULT) continue;
-    uintptr_t at = msg.arg.pagefault.address & ~(h->unit - 1);
+    uintptr_t at = h->base + ((msg.arg.pagefault.address - h->base) & ~(h->unit - 1));
     if (h->copy) memcpy(h->staging, (void*)at, h->unit);
     // Retried where the kernel asks (EAGAIN while the mm changes); said and given up on otherwise.
     int tries = 0;
@@ -218,7 +240,7 @@ static void fault(size_t mib, int reps) {
         uint8_t* p = memfd_map(bytes);
         reg(uffd, p, bytes);
         protect(uffd, p, bytes, 1, 0);
-        struct handler h = {.uffd = uffd, .unit = units[u], .copy = copy, .staging = aligned_alloc(PAGE, UNIT)};
+        struct handler h = {.uffd = uffd, .base = (uintptr_t)p, .unit = units[u], .copy = copy, .staging = aligned_alloc(PAGE, UNIT)};
         fprintf(stderr, "fault: %zu MiB, unit %zu, copy %d, rep %d\n", mib, units[u], copy, r);
         pthread_t th;
         pthread_create(&th, NULL, handle, &h);
@@ -254,7 +276,7 @@ static void efault_one(int user_mode_only, const char* who) {
   fprintf(stderr, "efault: as %s, user mode only %d\n", who, user_mode_only);
   reg(uffd, p, UNIT);
   protect(uffd, p, UNIT, 1, 0);
-  struct handler h = {.uffd = uffd, .unit = PAGE, .copy = 0, .staging = NULL};
+  struct handler h = {.uffd = uffd, .base = (uintptr_t)p, .unit = PAGE, .copy = 0, .staging = NULL};
   pthread_t th;
   pthread_create(&th, NULL, handle, &h);
   int fd = open("/proc/self/stat", O_RDONLY);
@@ -275,8 +297,24 @@ static void efault_one(int user_mode_only, const char* who) {
   close(uffd);
 }
 
+// efault_one(user_mode_only, who) in a child of its own, given 10 s: one that hangs is said so, not waited on.
+static void efault_child(int user_mode_only, const char* who) {
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid == 0) {
+    alarm(10);
+    efault_one(user_mode_only, who);
+    fflush(stdout);
+    _exit(0);
+  }
+  int status = 0;
+  waitpid(pid, &status, 0);
+  if (WIFSIGNALED(status)) {
+    printf("{\"test\":\"efault\",\"as\":\"%s\",\"user_mode_only\":%d,\"hung\":\"killed by signal %d after 10 s\"}\n", who, user_mode_only, WTERMSIG(status));
+  }
+}
+
 static void efault(void) {
-  alarm(60);
   FILE* f = fopen("/proc/sys/vm/unprivileged_userfaultfd", "r");
   int unpriv = -1;
   if (f) {
@@ -284,11 +322,11 @@ static void efault(void) {
     fclose(f);
   }
   printf("{\"test\":\"sysctl\",\"unprivileged_userfaultfd\":%d}\n", unpriv);
-  efault_one(1, "root");
-  efault_one(0, "root");
+  efault_child(1, "root");
+  efault_child(0, "root");
   if (setgid(65534) == 0 && setuid(65534) == 0) {
-    efault_one(1, "nobody");
-    efault_one(0, "nobody");
+    efault_child(1, "nobody");
+    efault_child(0, "nobody");
   }
 }
 
