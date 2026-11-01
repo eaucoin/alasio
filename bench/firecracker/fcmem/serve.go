@@ -71,10 +71,16 @@ type handler struct {
 
 	faults, installs, zeroInstalls, wakes                    atomic.Int64
 	firstFaultNs, lastFaultNs, lastInstallNs, prefetchDoneNs atomic.Int64
+
+	// touches are the blocks the guest touched, in the order of their first faults, each with
+	// that fault's time since start in microseconds and whether it is a block of zeros. Only the
+	// serve loop appends to it.
+	touches [][3]int64
 }
 
 type serveStats struct {
 	PageSize        uint64 `json:"page_size"`
+	StartUnixNs     int64  `json:"start_unix_ns"`
 	Faults          int64  `json:"faults"`
 	Installs        int64  `json:"installs"`
 	ZeroInstalls    int64  `json:"zero_installs"`
@@ -90,6 +96,8 @@ type serveStats struct {
 	PrefetchDoneMs  int64  `json:"prefetch_done_ms"`
 	InstalledBlocks int    `json:"installed_blocks"`
 	MaxRSSBytes     int64  `json:"max_rss_bytes"`
+	// Touches is [microseconds since start, block, 1 if zeros] per block, in first-fault order.
+	Touches [][3]int64 `json:"touches"`
 }
 
 func serve(args []string) error {
@@ -180,6 +188,7 @@ func serve(args []string) error {
 
 	stats := serveStats{
 		PageSize:        h.pageSize,
+		StartUnixNs:     h.start.UnixNano(),
 		Faults:          h.faults.Load(),
 		Installs:        h.installs.Load(),
 		ZeroInstalls:    h.zeroInstalls.Load(),
@@ -193,6 +202,7 @@ func serve(args []string) error {
 		LastFaultMs:     h.lastFaultNs.Load() / 1e6,
 		LastInstallMs:   h.lastInstallNs.Load() / 1e6,
 		PrefetchDoneMs:  h.prefetchDoneNs.Load() / 1e6,
+		Touches:         h.touches,
 	}
 	for i := range h.state {
 		if h.state[i].Load() == blockInstalled {
@@ -326,6 +336,11 @@ func (h *handler) serveLoop(ends ...int) error {
 				}
 				switch {
 				case h.state[b].CompareAndSwap(blockMissing, blockInstalling):
+					zero := int64(0)
+					if h.header.Blocks[b].Object < 0 {
+						zero = 1
+					}
+					h.touches = append(h.touches, [3]int64{time.Since(h.start).Microseconds(), int64(b), zero})
 					go func() {
 						if err := h.install(b); err != nil {
 							h.fatal(err)

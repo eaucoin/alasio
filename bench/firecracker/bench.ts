@@ -63,7 +63,7 @@ const host = JSON.parse(readFileSync(option("host"), "utf8")) as { readonly copy
 const storeProbe = JSON.parse(readFileSync(option("store"), "utf8")) as Record<string, unknown>;
 const runs = Number(options.runs);
 
-type Fixture = "idle" | "poller" | "fan-out" | "saturating";
+type Fixture = "idle" | "poller" | "fan-out" | "saturating" | "repl-bun" | "repl-bun-checkpointed" | "repl-python" | "repl-python-checkpointed";
 interface Case {
   readonly fixture: Fixture;
   readonly sizeMib: number;
@@ -572,6 +572,8 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
   const early = kind === "e2b" && !o.cold ? startHandler([...serve, "--cache", e2bCache, "--warm"]) : null;
   if (early !== null) await early.ready;
 
+  // t0 on the wall clock as well, which fcmem's first touches are timed on.
+  const t0UnixMs = Date.now();
   const t0 = now();
   const { process: handler, ready } = early ?? startHandler([...serve, "--cache", kind === "fcmem" ? o.cache : e2bCache]);
   let fc: Firecracker | null = null;
@@ -631,6 +633,7 @@ async function restore(o: RestoreOptions): Promise<Omit<Line, "variant" | "phase
       },
       correctness: probe["correctness"] as Record<string, unknown>,
       details: {
+        t0_unix_ms: t0UnixMs, first_answer_unix_ms: t0UnixMs + (probe["first_exec_ms"] as number),
         handler_ready_ms: ms(t0, handlerReady), load_ms: ms(handlerReady, loaded), handler: handlerStats,
         instance_memory_peak_bytes: fcPeak, instance_hugetlb_peak_bytes: hugetlbPeak, probe,
       },
