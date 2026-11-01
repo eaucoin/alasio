@@ -806,6 +806,62 @@ test("a compaction the workspace moves on from meanwhile commits nothing, what i
     )
   ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=superseded": 1, "alasio.node_agent.compaction.outcome=RunscError": 1 })));
 
+test("a compaction checks its image in the bucket once it holds the workspace, and puts back from the cache what a collection took of it as it waited, before it commits it", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const here = yield* node("node-1");
+      const runscDir = here.releases.dirOf(RELEASE);
+      writeFileSync(join(runscDir, "delta-pages-bytes"), "512");
+      yield* here.agent.checkpoint(request("fs-abc"));
+      const { manifest } = yield* here.agent.prepare(workspace);
+      yield* here.agent.spend(workspace, manifest.snapshot);
+      yield* here.agent.resume(resumeRequest(manifest.snapshot));
+      writeFileSync(join(runscDir, "delta-pages-bytes"), "4096");
+      writeFileSync(join(runscDir, "hold-compact"), "");
+      const delta = yield* here.agent.checkpoint(request("fs-abc"));
+      yield* Effect.sync(() => here.releases.calls(RELEASE).some((args) => args.includes("compact"))).pipe(
+        Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: Boolean }),
+      );
+      // A fork's copy holds the workspace, its copies of the delta's images held, and a collection waits for it.
+      let letGo = () => {};
+      const held = new Promise<void>((resolve) => (letGo = resolve));
+      let copying = () => {};
+      const copied = new Promise<void>((resolve) => (copying = resolve));
+      s3.holdPut = (key) => (key.startsWith("br-1/fs-fork/") ? (copying(), held) : null);
+      const copy = yield* Effect.forkChild(here.agent.copy(workspace, { environment: "br-1", workspace: "fs-fork" }));
+      yield* Effect.promise(() => copied);
+      // Its clock past the grace of what the compaction uploads, as the store's may stand: what no manifest names is taken.
+      const collecting = yield* Effect.forkChild(
+        Effect.gen(function*() {
+          yield* TestClock.setTime(Date.now() + COLLECT_GRACE_MS + 60_000);
+          return yield* here.agent.collect(workspace);
+        }).pipe(Effect.provide(TestClock.layer())),
+      );
+      yield* Effect.sleep("100 millis");
+      // The compaction uploads its image, then waits for the workspace behind the collection.
+      rmSync(join(runscDir, "hold-compact"));
+      const named = (key: string) => delta.layers.some(({ digest }) => key.startsWith(`main/fs-abc/layers/${digest}/`));
+      yield* Effect.sync(() => keysOf(s3, "main/fs-abc/layers/").filter((key) => !named(key)).length).pipe(
+        Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (uploaded) => uploaded === IMAGE_FILES.length }),
+      );
+      yield* Effect.sleep("100 millis");
+      letGo();
+      yield* Fiber.join(copy);
+      assert.deepEqual(yield* Fiber.join(collecting), delta.layers.map(({ digest }) => digest).sort());
+      // Committed whole: its image in the bucket as the cache holds it.
+      const compacted = yield* compactedFrom(here.agent, delta.snapshot);
+      assert.ok(compacted);
+      const [image] = compacted.layers;
+      assert.ok(image);
+      const imageDir = join(here.cacheDir, "main", "fs-abc", "layers", image.digest);
+      assert.deepEqual(filesOf(imageDir), image.files);
+      const imageKey = (path: string) => `main/fs-abc/layers/${image.digest}/${path}`;
+      assert.deepEqual(keysOf(s3, imageKey("")), image.files.map(({ path }) => imageKey(path)));
+      for (const { path, etag } of image.files) assert.equal(`"${md5(s3.objects.get(imageKey(path)) ?? Buffer.alloc(0))}"`, etag);
+    })
+  ));
+
 test("a restore of the workspace on the node stops its compaction, as runsc compacts or as its image is uploaded, which leaves nothing of the compacted image, and the chain is restored", () =>
   added("alasio.node_agent.compactions", () =>
     withBucket(({ s3, node }) =>

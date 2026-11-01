@@ -975,7 +975,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * base of the next delta of a sandbox restored from it, if the workspace has not moved on
    * from `committed` meanwhile. Its new snapshot, or null where it did not compact it.
    * Nothing waits on it: it writes and uploads its image before it holds the workspace, then
-   * commits it once it holds it, as a checkpoint commits its own.
+   * checks it in the bucket and commits it once it holds it, as a checkpoint commits its own.
    */
   const compactNow = (committed: Manifest): Effect.Effect<Manifest | null, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
@@ -1019,21 +1019,23 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest), quietly));
         yield* cache.stamp(environment, workspace, image.digest, files);
         const [uploadMs, uploaded] = yield* timed(upload(committed, image.digest, files, quietly));
-        if (!(yield* inBucket(committed, uploaded))) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image ${image.digest} is not in the bucket as it was put` });
-        const manifest: Manifest = { ...committed, snapshot, layers: [uploaded], bytes: bytesOf([uploaded]), uploadMs, compactedFrom: committed.snapshot };
         // What it uploaded, should the workspace have moved on meanwhile, no manifest names, and is collected as any such image is.
-        const written = yield* exclusive(
+        const manifest = yield* exclusive(
           [committed],
           Effect.gen(function*() {
-            if ((yield* current(committed))?.snapshot !== committed.snapshot) return false;
-            yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
-            yield* bucket.putJson(manifestKey(committed, snapshot), manifest);
+            if ((yield* current(committed))?.snapshot !== committed.snapshot) return null;
+            // Checked only now that it holds the workspace, which a collection on this node holds too: one may have taken
+            // what it uploaded, which no manifest named, as it waited for it. The cache holds its image, spared meanwhile.
+            const layer = yield* layerInBucket(committed, uploaded);
+            const compacted: Manifest = { ...committed, snapshot, layers: [layer], bytes: bytesOf([layer]), uploadMs, compactedFrom: committed.snapshot };
+            yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(compacted)));
+            yield* bucket.putJson(manifestKey(committed, snapshot), compacted);
             unnamed = null;
-            yield* bucket.putJson(`${prefixOf(committed)}/${CURRENT_FILE}`, manifest);
-            return true;
+            yield* bucket.putJson(`${prefixOf(committed)}/${CURRENT_FILE}`, compacted);
+            return compacted;
           }),
         );
-        if (!written) {
+        if (manifest === null) {
           yield* Effect.sync(() => compactions.add(1, { "alasio.node_agent.compaction.outcome": "superseded" }));
           yield* Effect.logInfo(`compacted the snapshot ${committed.snapshot} of ${prefixOf(committed)}, as ${why}, but the workspace moved on from it meanwhile: the compacted image is left to be collected`);
           return null;
