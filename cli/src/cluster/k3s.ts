@@ -176,8 +176,9 @@ export function containerdFiles(releases: readonly string[], { systemd }: { read
     "  # that the node agent's next checkpoint of it saves only those (src/node-agent/agent.ts); and the pages it",
     "  # touches in its first seconds after a restore are recorded, for its next restore to read first.",
     `  dirty-tracking = "wp"`,
-    // Spike: live checkpoints copy-on-write, with the fork under test (M10's prototype), where the benchmark asks.
-    ...(process.env["BENCH_COW"] === "on" ? [`  cow = "on"`] : []),
+    // Spike: live checkpoints copy-on-write, with the fork under test (M10's prototype). Said here outright: the
+    // node's files are written by the CLI's root helper, whose environment is not the benchmark's.
+    `  cow = "on"`,
     `  working-set-window = "3s"`,
     "  # A checkpoint ends the sandbox's TCP connections through its network device, whose link saves and restores",
     "  # none (fdbased, without SaveRestore): a checkpoint that stops the sandbox aborts and closes each as it saves",
