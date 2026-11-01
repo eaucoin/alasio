@@ -102,7 +102,7 @@ jobs:
             {alasio: ["as-shipped", "with-fix", "whole"], gvisor: ["all", "tuned", "defaults"], firecracker: ["all", "chunk-16mib"], criu: ["all", "phaul", "splice", "chain", "patched", "eager"]} as $variantsOf
             | {alasio: ["as-shipped", "with-fix"], gvisor: ["all"], firecracker: ["all"], criu: ["all"]} as $defaults
             | ($variantsOf | keys) as $known
-            | ["local", "s3-standard", "s3-express"] as $shapes
+            | ["local", "s3-standard", "s3-express", "s3-standard-jitter"] as $shapes
             | if ($systems - $known) != [] then "::error::no system \($systems - $known | join(", "))\n" | halt_error(1)
               elif ($profiles - $shapes) != [] then "::error::no profile \($profiles - $shapes | join(", "))\n" | halt_error(1)
               else . end

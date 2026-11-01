@@ -14,6 +14,10 @@ export interface Profile {
   readonly emulated: boolean;
   readonly first_byte_ms: number | null;
   readonly bytes_per_second: number | null;
+  /** Spike (validation G-11): the latency's spread either side, and the fraction of connections slower by tail_ms. */
+  readonly jitter_ms?: number;
+  readonly tail_fraction?: number;
+  readonly tail_ms?: number;
 }
 
 export const PROFILES = JSON.parse(readFileSync(new URL("./profiles.json", import.meta.url), "utf8")) as Readonly<Record<string, Profile>>;
@@ -24,7 +28,8 @@ const NAME = "store";
 /** The toxics of `profile`, as toxiproxy takes them: its bandwidth toxic's rate is in KB/s, bytes per millisecond. */
 export function toxicsOf(profile: Profile): readonly Record<string, unknown>[] {
   const toxics: Record<string, unknown>[] = [];
-  if (profile.first_byte_ms !== null) toxics.push({ name: "first-byte", type: "latency", stream: "downstream", toxicity: 1, attributes: { latency: profile.first_byte_ms, jitter: 0 } });
+  if (profile.first_byte_ms !== null) toxics.push({ name: "first-byte", type: "latency", stream: "downstream", toxicity: 1, attributes: { latency: profile.first_byte_ms, jitter: profile.jitter_ms ?? 0 } });
+  if (profile.tail_fraction !== undefined && profile.tail_ms !== undefined) toxics.push({ name: "tail", type: "latency", stream: "downstream", toxicity: profile.tail_fraction, attributes: { latency: profile.tail_ms, jitter: 0 } });
   if (profile.bytes_per_second !== null) {
     const rate = Math.round(profile.bytes_per_second / 1000);
     toxics.push({ name: "bandwidth-down", type: "bandwidth", stream: "downstream", toxicity: 1, attributes: { rate } });

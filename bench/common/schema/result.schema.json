@@ -17,10 +17,10 @@
     "target": { "enum": ["host", "docker"] },
     "fixture": { "enum": ["idle", "poller", "fan-out", "saturating", "repl-bun", "repl-bun-checkpointed", "repl-python", "repl-python-checkpointed"] },
     "size_mib": { "type": "integer", "minimum": 1 },
-    "profile": { "enum": ["local", "s3-standard", "s3-express"] },
+    "profile": { "enum": ["local", "s3-standard", "s3-express", "s3-standard-jitter"] },
     "emulated": { "type": "boolean" },
     "run": { "type": "integer", "minimum": 1 },
-    "phase": { "enum": ["save-live", "save-stop", "restore-warm", "restore-cold"] },
+    "phase": { "enum": ["save-live", "save-stop", "restore-warm", "restore-cold", "codec"] },
     "ok": { "type": "boolean" },
     "failure": { "type": ["string", "null"] },
     "metrics": {

@@ -10,16 +10,27 @@
     "first_byte_ms": 150,
     "bytes_per_second": 85000000,
     "about": "S3 Standard: 'consistent small object latencies (and first-byte-out latencies for larger objects) of roughly 100-200 milliseconds', and 'one concurrent request for each 85-90 MB/s of desired network throughput'. 150 ms is the middle of the range, 85 MB/s its low end.",
-    "sources": ["https://d1.awsstatic.com/whitepapers/AmazonS3BestPractices.pdf"]
+    "sources": [
+      "https://d1.awsstatic.com/whitepapers/AmazonS3BestPractices.pdf"
+    ]
   },
   "s3-express": {
     "emulated": true,
     "first_byte_ms": 5,
     "bytes_per_second": 85000000,
-    "about": "S3 Express One Zone: 'consistent single-digit millisecond first-byte read and write request latencies—up to 10x faster than S3 Standard'; 5 ms is the middle of single digits. Its connections have 'a fixed upper bound on the number of bytes that can be uploaded or downloaded per second', of which AWS publishes no figure: S3 Standard's is used.",
+    "about": "S3 Express One Zone: 'consistent single-digit millisecond first-byte read and write request latencies\u2014up to 10x faster than S3 Standard'; 5 ms is the middle of single digits. Its connections have 'a fixed upper bound on the number of bytes that can be uploaded or downloaded per second', of which AWS publishes no figure: S3 Standard's is used.",
     "sources": [
       "https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-performance.html",
       "https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-optimizing-performance-design-patterns.html"
     ]
+  },
+  "s3-standard-jitter": {
+    "emulated": true,
+    "first_byte_ms": 150,
+    "bytes_per_second": 85000000,
+    "jitter_ms": 140,
+    "tail_fraction": 0.05,
+    "tail_ms": 1000,
+    "about": "Spike (validation G-11): S3 Standard's profile with its first byte spread uniformly over 10-290 ms (toxiproxy's latency jitter, drawn for each chunk), and one connection in 20 slower by a further second for its life (a second latency toxic of toxicity 0.05): a store whose tail a fixed latency does not show. Not a measured profile of S3; a test of whether hedging helps where a tail exists."
   }
 }
