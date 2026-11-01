@@ -93,6 +93,13 @@ interface Arm {
 const ARMS = JSON.parse(process.env["BENCH_ARMS"] || `[{"name":"base"}]`) as readonly Arm[];
 /** Spike: whether each run restores warm too (BENCH_WARM=0: cold alone). */
 const WARM = process.env["BENCH_WARM"] !== "0";
+/**
+ * Spike (validation G-28, G-29): BENCH_CODEC=1 measures, of each run's released image, how its
+ * pages compress (bench/codec, built at $BENCH_DIR/codec-bin) instead of restoring it cold: the
+ * image, restored warm, its first exec answered, saved again 5 s later with the working set it
+ * recorded, whose frames the measure counts; one phase "codec".
+ */
+const CODEC = process.env["BENCH_CODEC"] === "1";
 
 /** Where the benchmark's bundles go in the pods that run them. */
 const IN_POD = "/tmp/bench";
@@ -574,12 +581,49 @@ async function proxyTraces(node: string, fromMs: number): Promise<string[]> {
   });
 }
 
+/**
+ * Spike (validation G-28, G-29): the codec measure of the image `manifest` of `workspace`, whose
+ * session is released, as CODEC says: its extents, then those of the image saved after a warm
+ * restore of it and its first exec, and its working set, inspected by the release's runsc, then
+ * bench/codec over its pages; the lines bench/codec printed appended to $BENCH_DIR/codec.jsonl.
+ */
+async function codecOf(node: string, workspace: string, sessionId: string, fixture: string, runId: string, manifest: Manifest): Promise<Record<string, unknown>> {
+  const runsc = `${gvisorDirectory(manifest.release)}/runsc`;
+  const root = `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/layers`;
+  const out = join(BENCH_DIR, "codec");
+  mkdirSync(out, { recursive: true });
+  const image = `${root}/${manifest.layers[0]?.digest ?? ""}`;
+  await onNode(node, `${runsc} image inspect --json --extents ${image} > ${out}/${runId}-image.json`);
+  const warm = await restore(workspace, sessionId, fixture, runId, manifest);
+  await sleep(5000);
+  const released = await release(workspace);
+  if (released.status < 200 || released.status >= 300) throw new Error(`the gateway's release after the warm restore answered ${released.status}: ${released.said}`);
+  await gone(warm.pod);
+  const after = JSON.parse(await agentOk(node, "GET", `/snapshots/${SESSIONS}/${workspace}`)) as Manifest;
+  await onNode(node, `${runsc} image inspect --json --extents --layer-path=${root} ${root}/${after.layers[0]?.digest ?? ""} > ${out}/${runId}-after.json`);
+  const started = Date.now();
+  const printed = await onNode(node, `GOMAXPROCS=2 ${BENCH_DIR}/codec-bin image --pages ${image}/pages.img --inspect ${out}/${runId}-image.json --ws ${out}/${runId}-after.json --label '${runId}'`);
+  appendFileSync(join(BENCH_DIR, "codec.jsonl"), printed.endsWith("\n") ? printed : `${printed}\n`);
+  const lines = printed.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+  const ratio = (codec: string, frame: number, over: string) => lines.find((line) => line["codec"] === codec && line["frame_bytes"] === frame && line["over"] === over)?.["ratio"] ?? null;
+  return {
+    first_exec_ms: warm.metrics.first_exec_ms,
+    snapshot_after: after.snapshot,
+    measured_s: (Date.now() - started) / 1000,
+    zstd1_256k: ratio("zstd-1", 262144, "all"),
+    zstd3_256k: ratio("zstd-3", 262144, "all"),
+    lz4_256k: ratio("lz4", 262144, "all"),
+    a_f_256k: lines.find((line) => line["codec"] === "zstd-1" && line["frame_bytes"] === 262144)?.["a_f"] ?? null,
+    working_set_bytes: lines[0]?.["working_set_bytes"] ?? null,
+  };
+}
+
 /** One run of a case, every phase of it written, as the module says; what fails is written as failed, and the run goes on to its cleanup. */
 async function runOnce(fixture: string, sizeMib: number, run: number): Promise<void> {
   const workspace = `fs-${randomBytes(6).toString("hex")}`;
   const copy = `${workspace}-copy`;
   const runId = `${process.env["GITHUB_RUN_ID"] ?? "local"}-${PROFILE}-${fixture}-${sizeMib}-${run}`;
-  const phases = ["save-live", "save-stop", "restore-warm", "restore-cold"];
+  const phases = CODEC ? ["save-live", "save-stop", "codec"] : ["save-live", "save-stop", "restore-warm", "restore-cold"];
   let phase = "setup";
   const done = new Set<string>();
   let node = "";
@@ -661,6 +705,13 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     }, NO_CHECKS, { snapshot: manifest.snapshot, runsc_checkpoint_ms: manifest.pauseMs, upload_ms: manifest.uploadMs, chain: manifest.layers.length, bytes: manifest.bytes, logged: stopLogged.said });
     done.add(phase);
     await gone(bound.name);
+    if (CODEC) {
+      phase = "codec";
+      const measured = await codecOf(node, workspace, sessionId, fixture, runId, manifest);
+      emit(fixture, sizeMib, run, "codec", { ok: true, failure: null }, { image_bytes: manifest.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null }, NO_CHECKS, measured);
+      done.add(phase);
+      return;
+    }
     // The workspace as the release left it, for the cold restore's.
     const quota = JSON.parse(await agentOk(node, "GET", `/workspaces/${SESSIONS}/${workspace}/quota`)) as { readonly capacityBytes: number };
     await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace }, to: { environment: SESSIONS, workspace: copy }, quotaBytes: quota.capacityBytes });

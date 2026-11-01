@@ -63,6 +63,10 @@ on:
         description: "Spike: restore warm too"
         type: boolean
         default: true
+      codec:
+        description: "Spike: measure how each released image compresses (bench/codec) instead of restoring it cold"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -185,6 +189,7 @@ jobs:
       BENCH_RUNS: ${{ inputs.runs }}
       BENCH_ARMS: ${{ inputs.arms }}
       BENCH_WARM: ${{ inputs.warm && '1' || '0' }}
+      BENCH_CODEC: ${{ inputs.codec && '1' || '0' }}
     steps:
       # Every system's measures are of one CPU model, and of the disk that comes with it: a job
       # elsewhere ends at once, to be re-run (gh run rerun <id> --failed) until it lands on one.
@@ -260,6 +265,17 @@ jobs:
           jq --arg sum "$sum" '.gvisor.releases[0].sha512 = $sum' cluster/node/pins.json >"$RUNNER_TEMP/pins.json" && mv "$RUNNER_TEMP/pins.json" cluster/node/pins.json
           (cd "$RUNNER_TEMP/candidate/serve" && nohup python3 -m http.server 8099 --bind 127.0.0.1 >"$RUNNER_TEMP/candidate/http.log" 2>&1 &)
           sleep 1 && curl -fsS -o /dev/null http://127.0.0.1:8099/gvisor-x86_64.tar.zstd
+      # Spike: the codec measure, built with the Go of its module, and run first on random bytes, the runner quiet.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: matrix.system == 'alasio' && inputs.codec
+        with:
+          go-version: "1.25"
+          cache: false
+      - name: The codec measure
+        if: matrix.system == 'alasio' && inputs.codec
+        run: |
+          (cd bench/codec && go build -o "$BENCH_DIR/codec-bin" .)
+          GOMAXPROCS=2 "$BENCH_DIR/codec-bin" random --bytes 268435456 | tee "$BENCH_DIR/codec-random.jsonl"
       - name: Run ${{ matrix.system }}
         run: bench/${{ matrix.system }}/run.sh "$BENCH_TARGET" "$BENCH_PROFILE"
         env:
@@ -274,6 +290,9 @@ jobs:
             ${{ env.BENCH_DIR }}/host.json
             ${{ env.BENCH_DIR }}/store.json
             ${{ env.BENCH_DIR }}/logs/
+            ${{ env.BENCH_DIR }}/codec.jsonl
+            ${{ env.BENCH_DIR }}/codec-random.jsonl
+            ${{ env.BENCH_DIR }}/codec/
           if-no-files-found: warn
 
   aggregate:
