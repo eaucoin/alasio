@@ -647,6 +647,7 @@ async function restore(
       const probed = await Promise.race([ok(probe, "the probe"), failed, ended]).finally(() => clearTimeout(slow));
       const said = JSON.parse(probed.stdout.trim().split("\n").at(-1) ?? "") as {
         ok: boolean; failure: string | null; first_exec_ms: number; verify_ms: number; workload_rss_bytes: number; correctness: Row; verify_end_ns: string;
+        first: Row; first_stderr: string;
       };
       if (said.first_exec_ms > RESTORE_DEADLINE_MS) throw new Error(`the first exec answered ${Math.round(said.first_exec_ms)} ms after the restore was asked, past the ${RESTORE_DEADLINE_MS / 1000} s a restore has`);
       const left = RESTORE_DEADLINE_MS - msBetween(t0, now());
@@ -676,6 +677,9 @@ async function restore(
           ...prepared.details,
           t0_unix_ms: t0UnixMs,
           first_answer_unix_ms: t0UnixMs + said.first_exec_ms,
+          // What the fixture's first exec said, and what its runtime wrote to stderr meanwhile.
+          first: said.first,
+          first_stderr: said.first_stderr,
           prepare_ms: msBetween(t0, restoreStart),
           runsc_restore_ms: msBetween(restoreStart, restored),
           resident_after_verify_ms: msBetween(BigInt(said.verify_end_ns), residentAt),
