@@ -204,7 +204,7 @@ export const makeSessions = Effect.fnUntraced(function*(
         });
       // Restored from the snapshot it was released into, where it was, by a pod of its own, its workspace attached first (./snapshots.ts).
       const restoring = snapshots.restoring(pool, volumeId, mode, {
-        attach: (node, pod, binding, env) => attachInto(node, pod, binding, true, env),
+        attach: (node, pod, binding, env, made = true) => attachInto(node, pod, binding, made, env),
         detach: (node, pod) => detachOnceGone(pool, node, pod),
       });
       return {

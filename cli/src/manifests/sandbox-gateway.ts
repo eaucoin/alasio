@@ -412,6 +412,8 @@ function gatewayObjects(config: InstallConfig, carried: Carried): KubernetesObje
             args: ["node", "/opt/alasio/src/gateway/main.ts"],
             env: [
               { name: GATEWAY_CONFIG_VARIABLE, value: "/etc/gateway/config.json" },
+              // Spike (E15): every other restore into a standby pod (src/gateway/snapshots.ts).
+              { name: "ALASIO_SPIKE_STANDBY", value: "alternate" },
               key(CALLER_KEY_VARIABLE, "caller-key"),
               key(BINDING_KEY_VARIABLE, "binding-key"),
               { name: NODE_AGENT_TOKEN_VARIABLE, valueFrom: { secretKeyRef: { name: componentName("node-agent"), key: "token" } } },

@@ -10,6 +10,7 @@ import { FetchHttpClient } from "effect/http";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { Gofer } from "../node-agent/names.ts";
 import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, type ResumeRequest, resumeMs, type WorkspaceRef } from "../node-agent/agent.ts";
+import { type StandbyRestoreRequest, StandbyRestored } from "../node-agent/standby.ts";
 import { NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
 import { type PodOwner, Released, type StopRequest, type SyncRequest } from "../node-agent/workspaces.ts";
 
@@ -94,6 +95,8 @@ export interface NodeAgents {
   readonly spend: (workspace: WorkspaceRef, snapshot: string) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** Collects what of the workspace's in the bucket no snapshot needs any more: the digests of the images kept. */
   readonly collect: (workspace: WorkspaceRef) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
+  /** Spike (E15): restores `request`'s image into the standby pod it names on `node`, paused, as the agent's ./standby.ts says: its containers, and how long each took. */
+  readonly standbyRestore: (node: string, request: StandbyRestoreRequest) => Effect.Effect<StandbyRestored, NodeAgentError | KubeApiError>;
   /**
    * Resumes the sandbox `request` names, restored paused in its pod on `node`, once the
    * pod's network policies are in force there, from images of `bytes` together, which its
@@ -403,6 +406,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
         ask(node, `collect ${workspace.environment}/${workspace.workspace}'s snapshots`, { method: "POST", path: "/collect", body: workspace, timeout: LONG_CALL }, Collected)).pipe(
           Effect.map(({ kept }) => kept),
         ),
+    standbyRestore: (node, request) => ask(node, `restore into the standby ${request.namespace}/${request.pod}`, { method: "POST", path: "/standby/restore", body: request, timeout: LONG_CALL }, StandbyRestored),
     resume: (node, request, bytes) =>
       send(node, `resume ${request.environment}/${request.workspace}'s sandbox`, { method: "POST", path: "/resume", body: request, timeout: Duration.millis(resumeMs(bytes)) }).pipe(Effect.asVoid),
     abandon: (node, request) =>

@@ -180,6 +180,7 @@ import {
 import { type Failure, makeOperations, type Operations } from "./operations.ts";
 import { makeRunsc } from "./runsc.ts";
 import { makeS3Bucket } from "./s3.ts";
+import { restoreIntoStandby, StandbyRestoreRequest } from "./standby.ts";
 import { makeStoreProxy, type StoreProxyError } from "./store-proxy.ts";
 import { observeStorageUsage } from "./storage-usage.ts";
 
@@ -320,6 +321,10 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     }
     if (method === "POST" && url === "/resume") {
       return body(ResumeRequest).pipe(Effect.flatMap(agent.resume), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    }
+    // Spike (E15): a restore into a standby pod on this node (./standby.ts).
+    if (method === "POST" && url === "/standby/restore") {
+      return body(StandbyRestoreRequest).pipe(Effect.flatMap(restoreIntoStandby), Effect.map((restored) => answer(200, restored)));
     }
     if (method === "POST" && url === "/abandon") {
       return body(AbandonRequest).pipe(Effect.flatMap(agent.abandon), Effect.map((killed) => answer(200, { killed })));

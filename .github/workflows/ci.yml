@@ -25,6 +25,10 @@ on:
         description: "The commit that run built, which names its artifact release-<sha>"
         type: string
         required: true
+      trace-test:
+        description: "The test file of test/e2e/ the trace shard runs"
+        type: string
+        default: "restore-trace.test.ts"
       cpu:
         description: "The runner CPU model every end-to-end job must have, others failing at once to be re-run (any if empty)"
         type: string
@@ -308,7 +312,8 @@ jobs:
       # Spike: the trace shard runs its own file alone.
       - run: |
           if [ "$ALASIO_E2E_SHARD" = trace ]; then
-            node --test --test-timeout=7200000 --test-force-exit --test-reporter=spec test/e2e/restore-trace.test.ts
+            [[ "$TRACE_TEST" =~ ^[a-z-]+\.test\.ts$ ]] || { echo "::error::no such test: $TRACE_TEST"; exit 1; }
+            node --test --test-timeout=9000000 --test-force-exit --test-reporter=spec "test/e2e/$TRACE_TEST"
           else
             npm run test:e2e
           fi
@@ -316,6 +321,7 @@ jobs:
           ALASIO_E2E_TARGET: ${{ matrix.target }}
           ALASIO_E2E_AGENTS: ${{ matrix.agents }}
           ALASIO_E2E_SHARD: ${{ matrix.shard }}
+          TRACE_TEST: ${{ inputs.trace-test }}
           ALASIO_E2E_REGISTRY: ${{ needs.images.outputs.registry }}
           ALASIO_E2E_PREVIOUS: ${{ needs.images.outputs.previous }}
       - name: ufw's rules are as they were before alasio

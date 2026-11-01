@@ -49,6 +49,16 @@ export const RESTORE_ANNOTATION = "dev.gvisor.internal.restore.host-image-path";
 export const RESTORE_PAUSED_ANNOTATION = "dev.gvisor.internal.restore.paused";
 /** The condition of a restored pod's readiness gate, which alasio sets once its sandbox is resumed. */
 export const RESUMED_CONDITION = "alasio.dev/resumed";
+/**
+ * Spike (the kernel-standby validation's E15): the fork's annotation that boots a pod's
+ * sandbox with its containers created and none started, a standby, until a restore into it
+ * is asked over the Unix socket it names (gvisor-fork spike/val-standby).
+ */
+export const STANDBY_ANNOTATION = "dev.gvisor.internal.restore.standby";
+/** Spike: the label of a standby pod of a pool, by its node, which its claim by a restore takes off. */
+export const STANDBY_LABEL = "alasio.dev/standby";
+/** Spike: where a standby pod's shim listens for its restore, as `<namespace>/<pod>.sock`, under the node's /run, which its agent mounts. */
+export const STANDBY_SOCKETS = "/run/alasio/standby";
 /** Where a node agent keeps the snapshots it prepares, as `<environment>/<workspace>/<snapshot>` (../node-agent/cache.ts). */
 export const SNAPSHOT_CACHE_DIR = "/var/lib/alasio/snapshots";
 /**

@@ -34,7 +34,7 @@ import { BINDING_LABEL, FREE_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../../
 import { branchNamespace, branchSessionsNamespace } from "../../../src/branch/names.ts";
 import { ATTACH_VOLUME, FOLDER_KEY_PREFIX, FOLDER_POOL, FOLDER_POD, folderPodSpec, folderTokenSecret, ownDirectory, SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
 import { BUSY_ANNOTATIONS, BUSY_LABEL } from "../../../src/kube/busy-label.ts";
-import { RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SNAPSHOT_CACHE_DIR, SNAPSHOT_ID } from "../../../src/kube/sandbox-shape.ts";
+import { RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SNAPSHOT_CACHE_DIR, SNAPSHOT_ID, STANDBY_ANNOTATION, STANDBY_LABEL, STANDBY_SOCKETS } from "../../../src/kube/sandbox-shape.ts";
 import { ATTACH_ROOT, RESTORE_POD } from "../../../src/node-agent/names.ts";
 import { componentName, labels, NAMESPACE, neonName, RELEASE } from "./common.ts";
 
@@ -395,6 +395,43 @@ function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClass
   return `(${pinned("object.spec", restoring)} && ${pinned("variables.labels", labels)} && ${pinned("variables.annotations", annotations)})`;
 }
 
+/** Spike (E15): a standby pod's socket, its namespace's and its own name's, under the node's /run (src/node-agent/standby.ts). */
+const STANDBY_SOCKET = new Check((expression) => `${expression} == ${JSON.stringify(`${STANDBY_SOCKETS}/`)} + object.metadata.namespace + "/" + object.metadata.name + ".sock" && object.metadata.name.matches(${JSON.stringify(RESTORE_POD.source)})`);
+
+/**
+ * Spike (E15): a standby pod of the pool template `template`, as the gateway makes it
+ * (src/gateway/snapshots.ts ensureStandby): a restore's pod (restorePod), but not yet bound, its
+ * own directory made by kubelet as it starts, and booted as a standby, its sandbox's
+ * containers created and none started, until a restore claims it.
+ */
+function standbyPod(template: V1PodTemplateSpec, runtimeClasses: readonly string[]): string {
+  const owned = ownDirectory(template.spec ?? { containers: [] }, "", "");
+  const volumes = (owned.volumes ?? []).map((volume) => (volume.name === ATTACH_VOLUME ? { name: ATTACH_VOLUME, hostPath: { path: OWN_DIRECTORY, type: "DirectoryOrCreate" } } : volume));
+  const restoredOn: Pinned = {
+    nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: [matching(NODE_NAME)] }] }] } },
+  };
+  const standing = poolPodSpec({
+    ...template,
+    spec: {
+      ...owned,
+      volumes,
+      restartPolicy: "Never",
+      runtimeClassName: oneOf(...runtimeClasses),
+      readinessGates: [...((template.spec?.readinessGates ?? []) as unknown as Pinned[]), { conditionType: RESUMED_CONDITION }],
+      affinity: restoredOn,
+    } as unknown as V1PodSpec,
+  });
+  const { [FREE_LABEL]: _free, ...own } = (template.metadata?.labels ?? {}) as PinnedMap;
+  const labels = { ...own, [STANDBY_LABEL]: matching(NODE_NAME) } as PinnedMap;
+  const annotations = {
+    ...(template.metadata?.annotations ?? {}),
+    [STANDBY_ANNOTATION]: STANDBY_SOCKET,
+    vpaObservedContainers: optional(ANY_STRING),
+    vpaUpdates: optional(ANY_STRING),
+  } as PinnedMap;
+  return `(${pinned("object.spec", standing)} && ${pinned("variables.labels", labels)} && ${pinned("variables.annotations", annotations)})`;
+}
+
 /**
  * Every pod of a namespace of sessions, main's or a branch environment's, made or changed by
  * anyone, held to what the pools' templates, `templates`, make, as Pod Security's restricted
@@ -423,11 +460,16 @@ export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sess
     const annotations = { ...(template.metadata?.annotations ?? {}), vpaObservedContainers: optional(ANY_STRING), vpaUpdates: optional(ANY_STRING) } as PinnedMap;
     return { name: `made${index}`, expression: `${pinned("object.spec", poolPodSpec(template))} && ${pinned("variables.labels", labels)} && ${pinned("variables.annotations", annotations)}` };
   });
-  const restoring = (restores?.templates ?? []).map((template, index) => ({ name: `restored${index}`, expression: restorePod(template, sessionsNamespace, restores?.runtimeClasses ?? []) }));
+  const restoring = [
+    ...(restores?.templates ?? []).map((template, index) => ({ name: `restored${index}`, expression: restorePod(template, sessionsNamespace, restores?.runtimeClasses ?? []) })),
+    // Spike (E15): and standby pods of them.
+    ...(restores?.templates ?? []).map((template, index) => ({ name: `standby${index}`, expression: standbyPod(template, restores?.runtimeClasses ?? []) })),
+  ];
   const restored = restores
     ? [`(request.namespace == ${JSON.stringify(sessionsNamespace)} && request.userInfo.username == ${JSON.stringify(restores.restorer)} && (${restoring.map(({ name }) => `variables.${name}`).join(" || ")}))`]
     : [];
-  const bound = [BINDING_LABEL, FREE_LABEL];
+  // Spike (E15): a standby's label taken off as a restore claims it.
+  const bound = [BINDING_LABEL, FREE_LABEL, STANDBY_LABEL];
   const policy = {
     apiVersion: "admissionregistration.k8s.io/v1",
     kind: "ValidatingAdmissionPolicy",
