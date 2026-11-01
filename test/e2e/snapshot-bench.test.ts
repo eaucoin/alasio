@@ -1218,12 +1218,23 @@ async function parentMetadata(): Promise<Record<string, unknown>> {
  * node agent's network (E12 = G-9), with the CPU its pods used, and its conditional PUTs (E11);
  * the same sweep of a single SeaweedFS server on the runner, as the other systems' store
  * (bench/common/store/up.sh), through the same profile; and, on the local profile, whether a
- * delta needs only its parent's metadata (G-13). Each in logs/store-<what>.json.
+ * delta needs only its parent's metadata (G-13); and, asked alone, the conditional PUTs again with
+ * alasio's gateways and filers scaled out, as the box's may run several (`scaled`). Each in
+ * logs/store-<what>.json. BENCH_STORE_SCALED=1 runs that alone.
  */
 async function storeExperiments(): Promise<void> {
   const [node = ""] = (await nodeAgents()).keys();
   const write = (what: string, value: unknown) => writeFileSync(join(BENCH_DIR, "logs", `store-${what}.json`), `${JSON.stringify(value, null, 1)}\n`);
   const sweepScript = new URL("dist/sweep.mjs", COMMON).pathname;
+  if (process.env["BENCH_STORE_SCALED"] === "1") {
+    // Three gateways and two filers, each request of the racers going to any gateway through the Service.
+    const kubectl = `k3s kubectl --namespace ${NAMESPACE}`;
+    await onNode(node, `${kubectl} scale deployment/${STORE_GATEWAY} --replicas=3 && ${kubectl} scale statefulset/${STORE_GATEWAY}-filer --replicas=2`);
+    await onNode(node, `${kubectl} rollout status deployment/${STORE_GATEWAY} --timeout=600s && ${kubectl} rollout status statefulset/${STORE_GATEWAY}-filer --timeout=600s`);
+    const pods = (await onNode(node, `${kubectl} get pods -o wide`)).trim().split("\n").filter((line) => line.includes("seaweedfs"));
+    write("conditional-alasio-scaled", { pods, ...(await withCpu(node, async () => JSON.parse(await inAgentNetwork(node, [sweepScript, "conditional", "--prefix", "bench-conditional-scaled/", "--races", "100", "--racers", "32"])))) });
+    return;
+  }
   for (const round of [1, 2, 3]) {
     write(`sweep-alasio-${round}`, await withCpu(node, async () => JSON.parse(await inAgentNetwork(node, [sweepScript, "sweep", "--prefix", `bench-sweep-${round}/`]))));
   }
