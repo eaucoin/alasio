@@ -603,6 +603,12 @@ async function tracedRestore(node: string, workspace: string, probed: Record<str
 /** Spike: the step `name` of `steps`, or null. */
 const stepAt = (steps: readonly [string, number][], name: string): number | null => steps.find(([step]) => step === name)?.[1] ?? null;
 
+/** Spike: from the step `from` of `steps` to the step `to`, or null where either is not there. */
+function between(steps: readonly [string, number][], from: string, to: string): number | null {
+  const [start, end] = [stepAt(steps, from), stepAt(steps, to)];
+  return start === null || end === null ? null : end - start;
+}
+
 /**
  * Spike: whether the release's compaction of the chain ran as the phase whose steps are `steps`
  * began: started before it, not yet through its upload.
@@ -661,18 +667,30 @@ const dropPageCache = (node: string): Promise<string> => onNode(node, "sync && e
 
 /**
  * Removes every node's cache of the workspace, by its agent, as the gateway removes a deleted
- * workspace's (src/gateway/snapshots.ts forgetDeleted), which spares what a restore still reads;
- * asked again until it has; and the nodes' page cache, so a restore reads it from the bucket.
+ * workspace's (src/gateway/snapshots.ts forgetDeleted), which spares what the agent still holds
+ * the workspace in flight for; asked again for 20 s, then, where the agent still spares it, by
+ * hand, as the 10.0.4 baseline removed it, which no compaction is writing by then (the warm
+ * restore's prepare stopped the release's); and the nodes' page cache, so a restore reads it from
+ * the bucket. How each node's went.
  */
-async function coldCaches(workspace: string): Promise<void> {
-  for (const node of (await nodeAgents()).keys()) {
-    for (const deadline = Date.now() + 120_000; ; await sleep(1000)) {
-      const { discarded } = JSON.parse(await agentOk(node, "DELETE", `/cache/${SESSIONS}/${workspace}`)) as { readonly discarded: boolean };
-      if (discarded) break;
-      if (Date.now() > deadline) throw new Error(`the agent of ${node} kept its cache of ${workspace} for 120 s, as a restore of it still read it`);
+async function coldCaches(workspace: string): Promise<Record<string, unknown>> {
+  const how: Record<string, unknown> = {};
+  for (const [node, pod] of await nodeAgents()) {
+    const started = Date.now();
+    let discarded = false;
+    for (const deadline = started + 20_000; !discarded && Date.now() < deadline; await sleep(1000)) {
+      discarded = (JSON.parse(await agentOk(node, "DELETE", `/cache/${SESSIONS}/${workspace}`)) as { readonly discarded: boolean }).discarded;
+    }
+    if (!discarded) {
+      const held = await onNode(node, `ls -la ${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace} ${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/${LAYERS_DIR} 2>&1 | head -n 30`);
+      await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}`], { container: "node-agent" });
+      how[node] = { by: "hand", agent_refused_ms: Date.now() - started, held: held.trim().split("\n") };
+    } else {
+      how[node] = { by: "agent", ms: Date.now() - started };
     }
     await dropPageCache(node);
   }
+  return how;
 }
 
 /**
@@ -885,7 +903,8 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
           ...measured,
           save_total_ms: live.ms,
           image_bytes: imageBytes,
-          durable_store_ms: stepAt(liveSteps, "agent checkpoint-committed"),
+          // From the agent's ask, as the gateway's keepLive asks it, to its manifest committed in the store.
+          durable_store_ms: between(liveSteps, "agent checkpoint-asked", "agent checkpoint-committed"),
           uploaded_over_needed: imageBytes ? liveSentBytes / imageBytes : null,
         }, NO_CHECKS, { ...logged, snapshot: live.manifest.snapshot, runsc_checkpoint_ms: live.manifest.pauseMs, upload_ms: live.manifest.uploadMs, chain: live.manifest.layers.length, lives });
       } else {
@@ -926,7 +945,8 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
       kernel_save_ms: stopLogged.kernelMs,
       memory_save_ms: stopLogged.memoryMs,
       overall_save_ms: stopLogged.overallMs,
-      durable_store_ms: stepAt(stopSteps, "agent checkpoint-committed"),
+      // From the release's arrival at the front to its checkpoint's manifest committed in the store.
+      durable_store_ms: between(stopSteps, "front release", "agent checkpoint-committed"),
       store_sent_bytes: stopSentBytes,
       uploaded_over_needed: stopImageBytes ? stopSentBytes / stopImageBytes : null,
     }, NO_CHECKS, {
@@ -960,12 +980,12 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     // Its snapshot current again, its manifest put back as current.json, as a checkpoint commits it (src/node-agent/agent.ts commit).
     await inAgentNetwork(node, [new URL("dist/s3.mjs", COMMON).pathname, "copy", `${SESSIONS}/${workspace}/manifests/${manifest.snapshot}.json`, `${SESSIONS}/${workspace}/current.json`]);
     await agentOk(node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: manifest.snapshot, release: manifest.release });
-    await coldCaches(workspace);
+    const cacheRemoved = await coldCaches(workspace);
     // Spike: a mixed run's cold restore beside the background session's restore, from the node's cache, begun as it is.
     const coldBeside = behind === null ? null : settledFrom(driver(behind.workspace, "probe", "--session", behind.sessionId, "--fixture", BACKGROUND.fixture, "--run-id", `${runId}-background`), Date.now());
     const cold = await restore(node, workspace, sessionId, fixture, runId, manifest, "cold");
     const mixedCold = coldBeside === null ? null : { beside: "restore", ...(await coldBeside) };
-    emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, { ...cold.details, mixed: mixedCold });
+    emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, { ...cold.details, cache_removed: cacheRemoved, mixed: mixedCold });
     done.add(phase);
     await endUnsaved(workspace, cold.pod);
   } catch (error) {
