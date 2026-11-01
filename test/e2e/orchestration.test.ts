@@ -514,6 +514,14 @@ async function pauses(): Promise<void> {
   if (!bound) throw new Error(`no pod is bound to ${workspace}`);
   const { pod } = await podIds(node, bound.name);
   console.log(`# orch-pause-pod ${JSON.stringify({ probes: pod.spec?.containers.map(({ name, readinessProbe, livenessProbe, startupProbe }) => ({ name, readinessProbe, livenessProbe, startupProbe })), runtimeClass: pod.spec?.runtimeClassName })}`);
+  // Where kubelet puts the sandbox's processes, and what it writes there, for X-OOM: each cgroup of the pod's, its
+  // memory.oom.group and memory.max, and the commands of the processes in it.
+  const cgroups = await onNode(node, [
+    `pod=$(find /sys/fs/cgroup -maxdepth 6 -type d \\( -name '*pod${pod.metadata?.uid ?? ""}*' -o -name '*pod${(pod.metadata?.uid ?? "").replaceAll("-", "_")}*' \\) | head -n 1)`,
+    `[ -n "$pod" ] || exit 0`,
+    `find "$pod" -type d | while read -r dir; do echo "$dir oom.group=$(cat "$dir/memory.oom.group") max=$(cat "$dir/memory.max") procs=$(for pid in $(cat "$dir/cgroup.procs"); do cat /proc/$pid/comm; done | sort | uniq -c | tr -s ' ' | paste -sd ',')"; done`,
+  ].join("; "));
+  console.log(`# orch-pause-cgroups ${JSON.stringify(cgroups.trim().split("\n"))}`);
   for (let index = 0; index < PAUSES; index++) await pauseOnce(index, workspace, sessionId, node, bound.name, index === PAUSES - 1 ? LONG_PAUSE_MS : 2000);
   // What alasio's sweep and gateway said meanwhile of the session.
   const gateway = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("sandbox-gateway")) });
