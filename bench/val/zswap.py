@@ -44,7 +44,7 @@ def rootfs(corpus_mib: int) -> Path:
     root = WORK / "rootfs-z"
     if not (root / "zsw").exists():
         (root / "tmp").mkdir(parents=True, exist_ok=True)
-        sh("gcc", "-O2", "-static", "-o", str(root / "zsw"), str(HERE / "zsw.c"))
+        sh("gcc", "-O2", "-static", "-pthread", "-o", str(root / "zsw"), str(HERE / "zsw.c"))
         # Real bytes of moderate compressibility: the runner's shared libraries and Python's sources, as a heap holds code-like data and text.
         sh("sh", "-c", f"(cat /usr/lib/x86_64-linux-gnu/*.so* 2>/dev/null; find /usr/lib/python3* -name '*.py' -exec cat {{}} + 2>/dev/null) | head -c {corpus_mib}M > {root}/corpus")
     return root
@@ -79,6 +79,7 @@ def main() -> None:
     p.add_argument("--sizes", type=int, nargs="+", default=[256, 1024, 3072])
     p.add_argument("--contents", nargs="+", default=["corpus"])
     p.add_argument("--reps", type=int, default=5)
+    p.add_argument("--threads", type=int, default=1, help="threads faulting the memory back (ptouch), 1 for one (touch)")
     a = p.parse_args()
     WORK.mkdir(parents=True, exist_ok=True)
     if not ZSWAP.exists():
@@ -120,13 +121,13 @@ def main() -> None:
                         t0 = time.monotonic()
                         sb.run("resume", sb.cid)
                         resume_s = time.monotonic() - t0
-                        faulted_s, faulted = sb.ask("touch", "TOUCHED")
+                        faulted_s, faulted = sb.ask("touch", "TOUCHED") if a.threads == 1 else sb.ask(f"ptouch {a.threads}", "PTOUCHED")
                         after = stat(cg)
                         resident_s, resident = sb.ask("touch", "TOUCHED")
                         moved = before["current"] - reclaimed["current"]
                         fault_ms, resident_ms = float(faulted.split()[1]), float(resident.split()[1])
                         record = {
-                            "compressor": taken, "content": content, "mib": mib, "rep": rep, "writeback": writeback,
+                            "compressor": taken, "content": content, "mib": mib, "rep": rep, "threads": a.threads, "writeback": writeback,
                             "pause_s": pause_s, "reclaim_s": reclaim_s, "reclaim_said": reclaim.stderr.strip()[-200:],
                             "reclaimed_bytes": moved, "reclaim_Bps": moved / reclaim_s if reclaim_s > 0 else None,
                             "zswap_bytes": reclaimed.get("zswap"), "zswapped_bytes": reclaimed.get("zswapped"),

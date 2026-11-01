@@ -21,6 +21,10 @@ on:
         description: "Parts of the arm job, of carm prearm rates"
         type: string
         default: "carm prearm rates"
+      zswap-args:
+        description: "Arguments of the zswap job's bench/val/zswap.py beside --runsc and --out"
+        type: string
+        default: ""
       kernels:
         description: "Kernels of the uffd and oom jobs, of runner vm612"
         type: string
@@ -411,11 +415,12 @@ jobs:
           sudo swapoff -a
       - name: A frozen sandbox reclaimed into zswap and faulted back
         shell: bash
+        env:
+          ZSWAP_ARGS: ${{ inputs.zswap-args }}
         run: |
           mkdir -p "$RUNNER_TEMP/out"
           command -v lz4 >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq lz4 zstd >/dev/null; }
-          sudo --preserve-env=ImageOS,ImageVersion python3 bench/val/zswap.py --runsc /usr/local/bin/runsc --out "$RUNNER_TEMP/out/zswap.jsonl"
-          sudo --preserve-env=ImageOS,ImageVersion python3 bench/val/zswap.py --runsc /usr/local/bin/runsc --out "$RUNNER_TEMP/out/zswap.jsonl" --compressors lz4 --contents random --sizes 1024 --reps 3
+          sudo --preserve-env=ImageOS,ImageVersion python3 bench/val/zswap.py --runsc /usr/local/bin/runsc --out "$RUNNER_TEMP/out/zswap.jsonl" $ZSWAP_ARGS
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

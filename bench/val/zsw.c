@@ -4,12 +4,15 @@
 // "random"), prints "READY <ms>", then serves commands read from stdin:
 //
 //   touch    reads one word of every 4 KiB page, answering "TOUCHED <ms> <sum>";
+//   ptouch N the same in N threads, each over its own part, answering
+//            "PTOUCHED <ms> <sum>";
 //   ping X   answers "PONG X".
 //
-// Build: gcc -O2 -static -o zsw zsw.c
+// Build: gcc -O2 -static -pthread -o zsw zsw.c
 
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +25,18 @@ static double now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+struct part {
+  uint8_t* from;
+  size_t bytes;
+  uint64_t sum;
+};
+
+static void* touch_part(void* arg) {
+  struct part* p = arg;
+  for (size_t off = 0; off < p->bytes; off += 4096) p->sum += *(volatile uint64_t*)(p->from + off);
+  return NULL;
 }
 
 int main(int argc, char** argv) {
@@ -70,6 +85,23 @@ int main(int argc, char** argv) {
       uint64_t sum = 0;
       for (size_t off = 0; off < bytes; off += 4096) sum += *(volatile uint64_t*)(buf + off);
       printf("TOUCHED %.3f %llu\n", now_ms() - s, (unsigned long long)sum);
+    } else if (!strncmp(line, "ptouch", 6)) {
+      int n = atoi(line + 7);
+      if (n < 1 || n > 64) n = 1;
+      struct part parts[64];
+      pthread_t threads[64];
+      size_t each = bytes / n / 4096 * 4096;
+      double s = now_ms();
+      for (int i = 0; i < n; i++) {
+        parts[i] = (struct part){.from = buf + i * each, .bytes = i == n - 1 ? bytes - i * each : each, .sum = 0};
+        pthread_create(&threads[i], NULL, touch_part, &parts[i]);
+      }
+      uint64_t sum = 0;
+      for (int i = 0; i < n; i++) {
+        pthread_join(threads[i], NULL);
+        sum += parts[i].sum;
+      }
+      printf("PTOUCHED %.3f %llu\n", now_ms() - s, (unsigned long long)sum);
     } else if (!strncmp(line, "ping", 4)) {
       printf("PONG%s", line + 4);
     } else if (!strncmp(line, "quit", 4)) {
