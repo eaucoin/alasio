@@ -132,7 +132,8 @@ export const gvisorHandler = (release: string): string => `runsc-${gvisorLabel(r
 export const gvisorRuntimeClass = (release: string): string => `gvisor-${gvisorLabel(release)}`;
 
 /** The version runsc of gVisor's `release` reports, and saves its images with: its release's tag. */
-export const runscVersion = (release: string): string => `release-${release}`;
+// Spike: the fork's candidate build says the version git describe gave it, which the jobs put here.
+export const runscVersion = (release: string): string => (release === "20260921.0-eaucoin.16" ? "CANDIDATE_VERSION" : `release-${release}`);
 
 /**
  * The directory alasio's pods keep on a node, which nothing of k3s's removes: the workspaces'

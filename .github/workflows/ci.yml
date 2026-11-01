@@ -16,6 +16,23 @@ on:
         description: "Release the upgrade shard upgrades from, as 10.0.4 (npm's latest if empty)"
         type: string
         default: ""
+      # Spike: the gVisor fork's build the sessions run, as the candidate job packs it.
+      fork-run:
+        description: "The fork-ci run of eaucoin/gvisor whose release artifact the sessions run"
+        type: string
+        required: true
+      fork-sha:
+        description: "The commit that run built, which names its artifact release-<sha>"
+        type: string
+        required: true
+      cpu:
+        description: "The runner CPU model every end-to-end job must have, others failing at once to be re-run (any if empty)"
+        type: string
+        default: "AMD EPYC 7763 64-Core Processor"
+      kernel:
+        description: "The prefix of the runner kernel's release every end-to-end job must have"
+        type: string
+        default: "7.0."
 
 permissions:
   contents: read
@@ -28,58 +45,39 @@ env:
   REGISTRY: ghcr.io/eaucoin/alasio-ci
 
 jobs:
-  unit:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24.14.0
-          cache: npm
-      - run: npm ci
-      # The lake's package installed too, as a checkout that builds its image has it: its
-      # modules then resolve its own copies, which the root's tests must work beside.
-      - run: npm ci --prefix neon/lake
-      - run: npm run typecheck
-      - run: npm test
-
-  # The object store's S3 gateway under the load the box puts it under, in Docker, as
-  # SeaweedFS leaves it and as alasio runs it (test/gateway-memory.test.ts): several GiB,
-  # on a runner of its own.
-  gateway-memory:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      # Some 10 GiB go to the store's volume server, more than a runner has free: what of its
-      # software this job does not use goes first (Go stays, for the gateway's heap profile).
-      - run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup && df -h /
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24.14.0
-          cache: npm
-      - run: npm ci
-      - run: npm run test:gateway-memory
-        env:
-          ALASIO_GATEWAY_LOAD: "1"
-
-  package:
+  # Spike: a build of the gVisor fork, the bazel job's release artifact of a fork-ci run,
+  # packed as a release's archive, which pins.json names 20260921.0-eaucoin.16: its sha512 for
+  # the jobs to pin, the version its runsc says for the node agent to expect, and the archive
+  # for them to install.
+  candidate:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      sha512: ${{ steps.pack.outputs.sha512 }}
+      version: ${{ steps.pack.outputs.version }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - id: pack
+        name: Pack the candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORK_RUN: ${{ inputs.fork-run }}
+          FORK_SHA: ${{ inputs.fork-sha }}
+        run: |
+          gh run download "$FORK_RUN" --repo eaucoin/gvisor --name "release-$FORK_SHA" --dir release
+          chmod +x release/runsc release/containerd-shim-runsc-v1 release/gvisor-bin/*
+          version=$(release/runsc --version | sed -n 's/^runsc version //p')
+          echo "version=$version" | tee --append "$GITHUB_OUTPUT"
+          mkdir candidate
+          tar -C release --zstd -cf candidate/gvisor-x86_64.tar.zstd runsc containerd-shim-runsc-v1 gvisor-bin
+          echo "sha512=$(sha512sum candidate/gvisor-x86_64.tar.zstd | cut -d ' ' -f 1)" | tee --append "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          node-version: 24.14.0
-          cache: npm
-      - run: npm ci
-      # Builds the command line and packs its npm package; checks that the package holds
-      # the built command line alone, with the CRD it applies; and runs alasio --version
-      # and --help from an install of it.
-      - run: node tooling/cli-package.ts
+          name: gvisor-candidate
+          path: candidate/
+          retention-days: 3
 
   images:
+    needs: candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -90,6 +88,20 @@ jobs:
       previous: ${{ steps.previous.outputs.previous }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gvisor-candidate
+          path: ${{ runner.temp }}/candidate
+      - name: Pin the candidate
+        env:
+          SHA512: ${{ needs.candidate.outputs.sha512 }}
+          VERSION: ${{ needs.candidate.outputs.version }}
+        run: |
+          sed -i "s/CANDIDATE_SHA512/$SHA512/" cluster/node/pins.json
+          sed -i "s/CANDIDATE_VERSION/$VERSION/" src/node-agent/names.ts
+          grep -A 1 eaucoin.16 cluster/node/pins.json
+          grep -n "$VERSION" src/node-agent/names.ts
+          cp "$RUNNER_TEMP/candidate/gvisor-x86_64.tar.zstd" cluster/node/gvisor-candidate.tar.zstd
       # For tooling/node-image.ts, which says the node image's pins, and npm, which says the
       # release the upgrade shard upgrades from.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -191,7 +203,7 @@ jobs:
               else [.target, (.agents | tostring), .shard] end;
             def named($word): ($word | split("/")) as $parts | name($parts | length) == $parts;
             [({target: "docker", agents: (0, 2)}, {target: "host", agents: 0}) as $cluster
-              | ("sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents", "wake") as $shard
+              | ("sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade", "agents", "wake", "trace") as $shard
               | $cluster + {shard: $shard}
               | select(.shard != "upgrade" or .target == "host")
               | if .target == "host" and .shard == "sessions" then . + {firewall: "ufw"} else . end]
@@ -206,13 +218,24 @@ jobs:
           echo "$matrix" | tee --append "$GITHUB_OUTPUT"
 
   e2e:
-    needs: [shards, images]
+    needs: [shards, images, candidate]
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.shards.outputs.matrix) }}
     steps:
+      # Spike: every measure is of one CPU model and kernel; a job elsewhere ends at once, to be re-run.
+      - name: The runner's CPU and kernel, as pinned
+        env:
+          PINNED: ${{ inputs.cpu }}
+          KERNEL: ${{ inputs.kernel }}
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          release=$(uname -r)
+          echo "$model, $release"
+          [ -z "$PINNED" ] || [ "$model" = "$PINNED" ] || { echo "::error::this runner's CPU is $model, not $PINNED: re-run this job"; exit 3; }
+          [[ $release == "$KERNEL"* ]] || { echo "::error::this runner's kernel is $release, not $KERNEL*: re-run this job"; exit 3; }
       # The cluster holds Neon's images and the agent image, bayma's with every runtime
       # it serves, unpacked: far more disk than a runner starts with free, so the
       # software it comes with that this job does not use goes first. Each directory is
@@ -241,6 +264,21 @@ jobs:
             echo "$status" >"$RUNNER_TEMP/disk-freed.part" && mv "$RUNNER_TEMP/disk-freed.part" "$RUNNER_TEMP/disk-freed"
           ) >"$RUNNER_TEMP/disk-freed.log" 2>&1 &
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gvisor-candidate
+          path: ${{ runner.temp }}/candidate
+      - name: Pin the candidate
+        env:
+          SHA512: ${{ needs.candidate.outputs.sha512 }}
+          VERSION: ${{ needs.candidate.outputs.version }}
+        run: |
+          sed -i "s/CANDIDATE_SHA512/$SHA512/" cluster/node/pins.json
+          sed -i "s/CANDIDATE_VERSION/$VERSION/" src/node-agent/names.ts
+          grep -A 1 eaucoin.16 cluster/node/pins.json
+          grep -n "$VERSION" src/node-agent/names.ts
+          # The host target downloads it from here (cli/src/cluster/node.ts).
+          (cd "$RUNNER_TEMP/candidate" && nohup python3 -m http.server 8787 --bind 127.0.0.1 >/dev/null 2>&1 &)
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.14.0
@@ -267,7 +305,13 @@ jobs:
       # alasio's package installed, alasio init and up on a cluster of this runner from the
       # images job's images, the shard's end-to-end tests, and alasio uninstall --purge,
       # which leaves nothing of the cluster on the runner (test/e2e/harness.ts).
-      - run: npm run test:e2e
+      # Spike: the trace shard runs its own file alone.
+      - run: |
+          if [ "$ALASIO_E2E_SHARD" = trace ]; then
+            node --test --test-timeout=7200000 --test-force-exit --test-reporter=spec test/e2e/restore-trace.test.ts
+          else
+            npm run test:e2e
+          fi
         env:
           ALASIO_E2E_TARGET: ${{ matrix.target }}
           ALASIO_E2E_AGENTS: ${{ matrix.agents }}

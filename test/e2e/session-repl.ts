@@ -59,7 +59,8 @@ export interface ReplSeen {
 }
 
 const [verb, volumeId, argument] = process.argv.slice(2);
-if (!volumeId || !argument || !["set", "hold", "read", "fill", "sum"].includes(verb ?? "")) {
+// Spike: trace and files, for the kernel-standby validation's restores.
+if (!volumeId || !argument || !["set", "hold", "read", "fill", "sum", "trace", "files"].includes(verb ?? "")) {
   throw new Error("usage: session-repl.ts set <volumeId> <value> | hold <volumeId> <path> | read <volumeId> <sessionId> | fill <volumeId> <mebibytes> | sum <volumeId> <sessionId>");
 }
 
@@ -95,11 +96,32 @@ const { sessionsGateway } = loadAlasioConfig();
 if (!sessionsGateway) throw new Error("the installation gives alasio no sandbox gateway");
 const bayma = await Effect.runPromise(makeGatewayWorkspaces(sessionsGateway).endpoint(volumeId, "none"));
 
+const asked = Date.now();
 const client = new Client({ name: "alasio-e2e", version: "1.0.0" });
 // The transport is one; the SDK declares its sessionId `string | undefined` where Transport has it optional.
 await client.connect(new StreamableHTTPClientTransport(new URL(bayma.url), { requestInit: { headers: bayma.headers } }) as Transport);
+const connected = Date.now();
 try {
-  if (verb === "set") {
+  if (verb === "trace") {
+    // Spike: each step's wall clock, the restore among them, as the session comes back.
+    await call(client, "session.acquire_controller", { session_id: argument });
+    const acquired = Date.now();
+    const { stdout, notice } = await exec(client, argument, "console.log(JSON.stringify({ live: globalThis.kept ?? null, checkpointed: $checkpoint?.kept ?? null, open: globalThis.held?.length ?? 0 }))");
+    const answered = Date.now();
+    await exec(client, argument, "console.log(1)");
+    const again = Date.now();
+    await release(client, argument);
+    console.log(JSON.stringify({ ...JSON.parse(stdout), notice, asked, connected, acquired, answered, again }));
+  } else if (verb === "files") {
+    // Spike: a session holding `argument` files of the workspace open, 100 a directory, each written first.
+    const { session } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "bun", title: "e2e", cwd: "/workspace" });
+    const value = JSON.stringify(`holding ${argument} files`);
+    const code = `const fs = require("node:fs"); globalThis.held = []; for (let i = 0; i < ${Number(argument)}; i++) { const dir = "/workspace/tree/d" + Math.floor(i / 100); if (i % 100 === 0) fs.mkdirSync(dir, { recursive: true }); const path = dir + "/f" + i; fs.writeFileSync(path, String(i)); globalThis.held.push(fs.openSync(path, "r")); } globalThis.kept = ${value}; $checkpoint = { kept: ${value} }; console.log("set")`;
+    await exec(client, session.session_id, code);
+    await release(client, session.session_id);
+    const set: ReplSet = { sessionId: session.session_id };
+    console.log(JSON.stringify(set));
+  } else if (verb === "set") {
     const { session } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "bun", title: "e2e", cwd: "/workspace" });
     const value = JSON.stringify(argument);
     await exec(client, session.session_id, `globalThis.kept = ${value}; $checkpoint = { kept: ${value} }; console.log("set")`);

@@ -13,6 +13,8 @@
 ARG K3S_IMAGE
 FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS gvisor
 ARG GVISOR_RELEASES
+# Spike: the fork's candidate build, as a release's archive, which the images job puts here.
+COPY gvisor-candidate.tar.zstd /tmp/gvisor-candidate.tar.zstd
 # Of each release's archive, what the host target installs of it too: runsc and its shim,
 # and gvisor-bin/, the Sentry and the binaries runsc runs beside it.
 RUN set -eu; \
@@ -20,7 +22,8 @@ RUN set -eu; \
     test -n "${GVISOR_RELEASES}"; \
     for pair in ${GVISOR_RELEASES}; do \
       release="${pair%%:*}"; \
-      wget -q -O /tmp/gvisor.tar.zstd "https://github.com/eaucoin/gvisor/releases/download/release-${release}/gvisor-x86_64.tar.zstd"; \
+      if [ "$release" = 20260921.0-eaucoin.16 ]; then cp /tmp/gvisor-candidate.tar.zstd /tmp/gvisor.tar.zstd; \
+      else wget -q -O /tmp/gvisor.tar.zstd "https://github.com/eaucoin/gvisor/releases/download/release-${release}/gvisor-x86_64.tar.zstd"; fi; \
       echo "${pair#*:}  /tmp/gvisor.tar.zstd" | sha512sum -c -; \
       mkdir -p /tmp/gvisor "/gvisor/${release}"; \
       zstd -dc /tmp/gvisor.tar.zstd | tar -x -C /tmp/gvisor; \
