@@ -311,6 +311,8 @@ const SETUPS: Record<string, readonly Setup[]> = {
   hygiene: [
     { ...traced("hygiene-none", { trace: false }), warm: [], lazy: null },
     { ...traced("hygiene-env", { trace: false }), warm: [], lazy: null, env: ["MIMALLOC_PURGE_DELAY=0", "PYTHONMALLOC=malloc"] },
+    // An exec that does nothing, the others' time and effect apart from what they ask.
+    { ...traced("hygiene-noop", { trace: false }), warm: [], lazy: null, hygiene: { bun: "undefined", python: "None" } },
     { ...traced("hygiene-gc", { trace: false }), warm: [], lazy: null, hygiene: { bun: "Bun.gc(true)", python: "import gc\ngc.collect()" } },
     { ...traced("hygiene-gc-trim", { trace: false }), warm: [], lazy: null, hygiene: { bun: "Bun.gc(true)\nBun.shrink()", python: "import ctypes, gc\ngc.collect()\nctypes.CDLL(\"libc.so.6\").malloc_trim(0)" } },
   ],
