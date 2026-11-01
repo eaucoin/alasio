@@ -708,19 +708,30 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
    */
   const claimStandby = (pool: Pool, node: string, base: V1PodTemplateSpec, runtimeClassName: string, labels: Readonly<Record<string, string>>, annotations: Readonly<Record<string, string>>) =>
     Effect.gen(function*() {
-      const ready = (yield* standbysOf(pool, node, base, runtimeClassName)).filter((pod) =>
+      const found = yield* standbysOf(pool, node, base, runtimeClassName);
+      const ready = found.filter((pod) =>
         pod.status?.phase === "Running" && (pod.status?.podIPs?.length ?? 0) > 0 && (pod.status?.containerStatuses ?? []).length > 0 &&
         (pod.status?.containerStatuses ?? []).every(({ state }) => state?.running)
       );
+      if (ready.length === 0) {
+        const said = found.map((pod) => `${pod.metadata?.name} ${pod.status?.phase} ${JSON.stringify((pod.status?.containerStatuses ?? []).map(({ state }) => state))}`);
+        yield* Effect.logWarning(`no standby of ${pool.namespace} on ${node} is ready, of ${found.length}: ${said.join("; ")}`);
+      }
       for (const pod of ready) {
-        const claimed = yield* kube.patch("v1", "Pod", pool.namespace, pod.metadata?.name ?? "", {
-          metadata: { resourceVersion: pod.metadata?.resourceVersion, labels: { ...labels, [STANDBY_LABEL]: null }, annotations },
+        // Relabelled by an update conditioned on the version read, as the binder claims a free pod (../binder/bindings.ts claim).
+        const { [STANDBY_LABEL]: _standby, ...own } = pod.metadata?.labels ?? {};
+        const claimed = yield* kube.replace<V1Pod>({
+          ...pod,
+          // A listed object's own, as a list's items come without them.
+          apiVersion: "v1",
+          kind: "Pod",
+          metadata: { ...pod.metadata, labels: { ...own, ...labels }, annotations: { ...pod.metadata?.annotations, ...annotations } },
         }).pipe(Effect.result);
-        if (claimed._tag === "Success") return claimed.success as V1Pod;
-        yield* Effect.logInfo(`could not claim the standby ${pool.namespace}/${pod.metadata?.name}: ${claimed.failure.message}`);
+        if (claimed._tag === "Success") return claimed.success;
+        yield* Effect.logWarning(`could not claim the standby ${pool.namespace}/${pod.metadata?.name}: ${claimed.failure.message}`);
       }
       return null;
-    });
+    }).pipe(Effect.tapError((error) => Effect.logWarning(`could not look for a standby of ${pool.namespace} on ${node}: ${error.message}`)));
 
   const restoring = (pool: Pool, workspace: string, mode: "none" | "full", attaching: Attaching): Restoring => {
     /** What this bind's maker restored, which its pod's readying resumes. */
@@ -766,7 +777,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           const nextStandby = Effect.asVoid(Effect.forkDetach(Effect.delay(ensureStandby(pool, node, base, kept.runtimeClassName), "15 seconds")));
           if (standbyTurnNow) {
             const standby = yield* claimStandby(pool, node, base, kept.runtimeClassName, labels, annotations).pipe(Effect.orElseSucceed(() => null));
-            if (standby === null) yield* Effect.logInfo(`no standby of ${pool.namespace} is ready on ${node}: ${named(pool, workspace)} is restored into a pod made for it`);
+            if (standby === null) yield* Effect.logWarning(`no standby of ${pool.namespace} was claimed on ${node}: ${named(pool, workspace)} is restored into a pod made for it`);
             else {
               const name = standby.metadata?.name ?? "";
               const dropped = kube.remove("v1", "Pod", pool.namespace, name).pipe(Effect.ignore);

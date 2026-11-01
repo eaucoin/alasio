@@ -18,6 +18,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 
 import { NODE_PINS } from "../../cli/src/cluster/node.ts";
 import { FREE_LABEL } from "../../src/binder/names.ts";
+import { NAMESPACE } from "../../cli/src/manifests/common.ts";
 import { STANDBY_LABEL } from "../../src/kube/sandbox-shape.ts";
 import { CONTAINERD, gvisorHandler } from "../../src/node-agent/names.ts";
 import { bindSession, boundPodOf, dumpClusterState, gatewayCall, inAlasio, kube, mainToken, nodeAgents, onNode, recordSession, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
@@ -116,6 +117,19 @@ after(async () => {
   await tearDown();
 }, { timeout: 30 * 60_000 });
 
+/** What the sandbox gateway's and the node agents' pods logged of standbys. */
+async function standbyLogs(): Promise<void> {
+  const of = async (component: string, container: string) => {
+    const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: `app.kubernetes.io/component=${component}` });
+    for (const pod of pods) {
+      const logged = await kube.logs(NAMESPACE, pod.metadata?.name ?? "", container).catch((error: unknown) => `could not be read: ${String(error)}`);
+      for (const line of logged.split("\n").filter((each) => /standby/iu.test(each))) console.log(`# ${component} ${line.slice(0, 1500)}`);
+    }
+  };
+  await of("sandbox-gateway", "sandbox-gateway");
+  await of("node-agent", "node-agent");
+}
+
 test(`restores into standby pods and into pods made for them, ${RUNS} in all`, { timeout: 150 * 60_000 }, async () => {
   let intoStandbys = 0;
   try {
@@ -123,6 +137,8 @@ test(`restores into standby pods and into pods made for them, ${RUNS} in all`, {
   } catch (error) {
     await dumpClusterState();
     throw error;
+  } finally {
+    await standbyLogs();
   }
   console.log(`# standby-summary ${JSON.stringify({ runs: RUNS, intoStandbys })}`);
   if (intoStandbys < RUNS / 2 - 2) throw new Error(`only ${intoStandbys} of ${RUNS} restores were into standbys`);
