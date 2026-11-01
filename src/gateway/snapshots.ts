@@ -598,14 +598,16 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
    * pod that ends meanwhile, or cannot start, whose sandbox the agent does not resume, or whose
    * readiness cannot be set, is refused.
    */
-  const resumeRestored = (pool: Pool, workspace: string, name: string, node: string, snapshot: string, bytes: number): Effect.Effect<void, RestoreRefused> =>
+  const resumeRestored = (pool: Pool, workspace: string, name: string, node: string, snapshot: string, bytes: number, mark: (phase: string) => Effect.Effect<void> = () => Effect.void): Effect.Effect<void, RestoreRefused> =>
     Effect.gen(function*() {
+      yield* mark("readying");
       const running = yield* podOnce(
         pool,
         name,
         (pod) => (pod.status?.containerStatuses ?? []).length > 0 && (pod.status?.containerStatuses ?? []).every(({ state }) => state?.running) && (pod.status?.podIPs?.length ?? 0) > 0,
         "run",
       );
+      yield* mark("running");
       const containerIds = (running.status?.containerStatuses ?? []).flatMap(({ containerID }) => (containerID ? [containerID.replace(/^[a-z]+:\/\//u, "")] : []));
       const podIPs = (running.status?.podIPs ?? []).map(({ ip }) => ip);
       // The policies that select it, which its node's rules for it must name.
@@ -613,6 +615,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         Effect.map((found) => (found as V1NetworkPolicy[]).filter(({ spec }) => selects(spec?.podSelector, running.metadata?.labels ?? {})).flatMap(({ metadata }) => metadata?.name ?? [])),
         Effect.mapError((error) => new RestoreRefused({ reason: error.message, resumed: false })),
       );
+      yield* mark("policies listed");
       // Paused where its policies are not in force (504), or where the bucket fails (502), which
       // may pass; of any other failure its sandbox may have run; paused, too, where the snapshot
       // was taken live and holds the session no more (410), which no try restores.
@@ -622,10 +625,12 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           return new RestoreRefused({ reason: error.message, resumed: status !== 502 && status !== 504 && status !== 410, ...(status === 410 ? { stale: true } : {}) });
         }),
       );
+      yield* mark("resumed by the agent");
       const now = new Date(yield* Clock.currentTimeMillis).toISOString();
       yield* kube.patchPodStatus(pool.namespace, name, { status: { conditions: [{ type: RESUMED_CONDITION, status: "True", lastTransitionTime: now }] } }).pipe(
         Effect.mapError((error) => new RestoreRefused({ reason: `its readiness could not be set: ${error.message}`, resumed: true })),
       );
+      yield* mark("readiness set");
     });
 
   /** Has the agent of `node` abandon the restore into the pod `name`, refused before its sandbox resumed, as alasio's were: what runsc runs for it killed. */
@@ -736,11 +741,16 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
   const restoring = (pool: Pool, workspace: string, mode: "none" | "full", attaching: Attaching): Restoring => {
     /** What this bind's maker restored, which its pod's readying resumes. */
     let restored: { readonly pod: string; readonly node: string; readonly snapshot: string; readonly bytes: number; readonly manifest: Manifest; readonly started: number } | null = null;
+    /** Spike (E15): when each step of this restore ended, in ms since it started, logged once it is ready. */
+    const phases: [string, number][] = [];
+    const mark = (phase: string) => Effect.map(Clock.currentTimeMillis, (now) => void phases.push([phase, now - phasesFrom]));
+    let phasesFrom = 0;
 
     const make: MakePod = (labels, annotations, binding) =>
       Effect.gen(function*() {
         if (!snapshots || pool.namespace !== mainNamespace) return null;
         const started = yield* Clock.currentTimeMillis;
+        phasesFrom = started;
         // Its record and its current snapshot read at once, the restore waiting on both.
         const [record, current] = yield* Effect.all([agents.released(ref(pool, workspace)).pipe(Effect.result), agents.current(ref(pool, workspace)).pipe(Effect.result)], { concurrency: 2 });
         const read = record._tag === "Success" ? current : record;
@@ -776,7 +786,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           const standbyTurnNow = standbyMode === "alternate" && standbyTurn++ % 2 === 1;
           const nextStandby = Effect.asVoid(Effect.forkDetach(Effect.delay(ensureStandby(pool, node, base, kept.runtimeClassName), "15 seconds")));
           if (standbyTurnNow) {
+            yield* mark("read");
             const standby = yield* claimStandby(pool, node, base, kept.runtimeClassName, labels, annotations).pipe(Effect.orElseSucceed(() => null));
+            yield* mark("claimed");
             if (standby === null) yield* Effect.logWarning(`no standby of ${pool.namespace} was claimed on ${node}: ${named(pool, workspace)} is restored into a pod made for it`);
             else {
               const name = standby.metadata?.name ?? "";
@@ -795,12 +807,14 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
                 }
                 continue;
               }
+              yield* mark("prepared and attached");
               const from = prepared.success.manifest;
               yield* Effect.logInfo(`restoring ${named(pool, workspace)} on ${node} into the standby ${name} from its snapshot ${from.snapshot}, taken at ${from.takenAt} under gVisor ${from.release}`);
               const into = yield* agents.standbyRestore(node, { namespace: pool.namespace, pod: name, imagePath: prepared.success.imagePath }).pipe(
                 Effect.tapError(() => Effect.andThen(dropped, attaching.detach(node, name))),
                 Effect.mapError((error) => new BindStepFailed({ reason: `its restore into the standby ${name} failed: ${error.message}` })),
               );
+              yield* mark("restored into the standby");
               yield* Effect.logInfo(`restored ${named(pool, workspace)} into the standby ${name}, paused: ${into.containers.map((id, index) => `${id} in ${into.milliseconds[index]} ms`).join(", ")}`);
               restored = { pod: name, node, snapshot: from.snapshot, bytes: from.bytes, manifest, started };
               yield* nextStandby;
@@ -812,6 +826,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           // starts, finds every file it held open; and, of one stopped as it ran out of its memory, its bayma's hook told
           // so, for its sessions' next execs.
           const name = restorePodName(pool.name, randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7));
+          if (!standbyTurnNow) yield* mark("read");
           const [prepared, attached] = yield* Effect.all([
             agents.prepare(node, ref(pool, workspace), kept.gofer ?? undefined).pipe(Effect.result),
             attaching.attach(node, name, binding, stopReason).pipe(Effect.result),
@@ -824,6 +839,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             continue;
           }
           if (attached._tag === "Failure") return yield* attached.failure;
+          yield* mark("prepared and attached");
           // What the agent prepared, which a compaction committed since may have made the one compacted from it.
           const from = prepared.success.manifest;
           yield* Effect.logInfo(`restoring ${named(pool, workspace)} on ${node} from its snapshot ${from.snapshot}, taken at ${from.takenAt} under gVisor ${from.release}`);
@@ -854,6 +870,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             Effect.mapError((error) => new BindStepFailed({ reason: `its restore's pod could not be made: ${error.message}` })),
           );
           restored = { pod: pod.metadata?.name ?? "", node, snapshot: from.snapshot, bytes: from.bytes, manifest, started };
+          yield* mark("pod made");
           if (standbyMode === "alternate") yield* nextStandby;
           return pod;
         }
@@ -872,7 +889,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       Effect.gen(function*() {
         const of = restored;
         if (of === null || of.pod !== pod.metadata?.name) return yield* attach(pod);
-        const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot, of.bytes).pipe(Effect.result);
+        const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot, of.bytes, mark).pipe(Effect.result);
+        if (standbyMode !== "") yield* Effect.logInfo(`restore phases of ${named(pool, workspace)} into ${of.pod}: ${JSON.stringify(phases)}`).pipe(withLogScope("snapshots"));
         if (done._tag === "Success") {
           const now = yield* Clock.currentTimeMillis;
           deferredSince.delete(named(pool, workspace));

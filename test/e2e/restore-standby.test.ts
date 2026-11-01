@@ -117,13 +117,13 @@ after(async () => {
   await tearDown();
 }, { timeout: 30 * 60_000 });
 
-/** What the sandbox gateway's and the node agents' pods logged of standbys. */
+/** What the sandbox gateway's and the node agents' pods logged of standbys, of each restore's phases, and of each resume. */
 async function standbyLogs(): Promise<void> {
   const of = async (component: string, container: string) => {
     const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: `app.kubernetes.io/component=${component}` });
     for (const pod of pods) {
       const logged = await kube.logs(NAMESPACE, pod.metadata?.name ?? "", container).catch((error: unknown) => `could not be read: ${String(error)}`);
-      for (const line of logged.split("\n").filter((each) => /standby/iu.test(each))) console.log(`# ${component} ${line.slice(0, 1500)}`);
+      for (const line of logged.split("\n").filter((each) => /standby|restore phases|resumed the sandbox/iu.test(each))) console.log(`# ${component} ${line.slice(0, 1500)}`);
     }
   };
   await of("sandbox-gateway", "sandbox-gateway");
