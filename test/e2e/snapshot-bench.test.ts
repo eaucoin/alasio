@@ -309,8 +309,9 @@ function saveLogged(lines: readonly string[]): {
   const pausing = started === -1 ? undefined : lines[started];
   const armed = lines.filter((line) => line.includes("Dirty tracking: armed")).slice(-10);
   const timers = last.filter((line) => /(Kernel|Memory files|Overall|Split filesystem|CPUID) save took|Pausing root network namespace took|Kernel save stats/u.test(line));
-  // Spike (M10, G-25): a copy-on-write save's own lines, its arm while the session ran before the pause among them.
-  const cow = lines.filter((line) => /[Cc]opy-on-write save|Save point taken|Tasks paused in|Quiesced in|filesystems prepared in|Dirty tracking epoch ended/u.test(line)).slice(-12);
+  // Spike (M10, G-25): a copy-on-write save's own lines, its arm while the session ran before the pause among them, and
+  // its release's; and where the pause goes before the save point, filesystem by filesystem.
+  const cow = lines.filter((line) => /[Cc]opy-on-write (save|release)|Release asked|Save point taken|Tasks paused in|Quiesced in|Unsavable mappings invalidated|filesystems prepared in|Dirty tracking epoch ended|VFS PrepareSave of|gofer save stats/u.test(line)).slice(-40);
   const rounds = /Pre-copy done after (\d+) rounds \([^)]*\): (\d+) bytes/u.exec(done ?? "");
   const gc = /in (\S+), the world stopped for (\S+) of it/u.exec(collected ?? "");
   const split = {
