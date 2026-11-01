@@ -1510,7 +1510,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         }
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
         prepared.set(prefixOf(ref), manifest);
-        if (reader !== null) yield* fetchLater(ref, manifest, reader);
+        // Spike (validation G-10): a restore that reads through the benchmark's relay is not fetched into the cache, as the
+        // proxy, which would tell when it is done reading, never sees its reads.
+        if (reader !== null && !(storeProxy.socket !== null && existsSync(join(dirname(storeProxy.socket), "bench-direct.json")))) yield* fetchLater(ref, manifest, reader);
         const preparedMs = (yield* Clock.currentTimeMillis) - started;
         yield* evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)));
         yield* Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": "prepared", "alasio.node_agent.prepare.source": source }));
