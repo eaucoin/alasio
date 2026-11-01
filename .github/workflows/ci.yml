@@ -327,9 +327,11 @@ jobs:
   # Whatever came of the rest, the run's images are deleted, those of each of its attempts,
   # pushed whole or not; so a failed run is re-run whole, its images built anew, as a
   # re-run of its failed jobs alone would find them gone.
+  # Spike: kept where an end-to-end job failed, as one on another runner CPU does, so that it can
+  # be re-run alone (gh run rerun --failed), this job with it; deleted by hand where it is not.
   delete-images:
     needs: [images, e2e]
-    if: always()
+    if: always() && needs.e2e.result != 'failure'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
