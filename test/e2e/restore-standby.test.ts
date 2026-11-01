@@ -141,5 +141,8 @@ test(`restores into standby pods and into pods made for them, ${RUNS} in all`, {
     await standbyLogs();
   }
   console.log(`# standby-summary ${JSON.stringify({ runs: RUNS, intoStandbys })}`);
-  if (intoStandbys < RUNS / 2 - 2) throw new Error(`only ${intoStandbys} of ${RUNS} restores were into standbys`);
+  if (intoStandbys < RUNS / 2 - 2) {
+    await dumpClusterState();
+    throw new Error(`only ${intoStandbys} of ${RUNS} restores were into standbys`);
+  }
 });
