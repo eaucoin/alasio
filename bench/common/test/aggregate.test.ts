@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { aggregate, median, p95, read, type Result } from "../aggregate/aggregate.ts";
+import { aggregate, median, nearestRank, p95, read, type Result } from "../aggregate/aggregate.ts";
 import { toxicsOf } from "../store/shape.ts";
 
 const line = (run: number, ok: boolean, first: number | null): Result & Record<string, unknown> => ({
@@ -39,11 +39,17 @@ test("p95 is the nearest rank: with five runs, the largest", () => {
   assert.equal(p95(Array.from({ length: 40 }, (_, index) => index + 1)), 38);
 });
 
+test("of 20 runs, the nearest-rank p50 is the 10th, p95 the second largest and p99 the largest", () => {
+  const twenty = Array.from({ length: 20 }, (_, index) => index + 1);
+  assert.deepEqual([nearestRank(twenty, 0.5), nearestRank(twenty, 0.95), nearestRank(twenty, 0.99)], [10, 19, 20]);
+  assert.equal(median(twenty), 10.5);
+});
+
 test("a cell's statistics are of the runs that passed, the others listed with why", () => {
   const [cell] = aggregate([line(1, true, 10), line(2, true, 30), line(3, false, 1), line(4, true, 20), line(5, true, null)]);
   assert.ok(cell);
   assert.deepEqual([cell.runs, cell.passed], [5, 4]);
-  assert.deepEqual(cell.metrics["first_exec_ms"], { n: 3, median: 20, p95: 30 });
+  assert.deepEqual(cell.metrics["first_exec_ms"], { n: 3, median: 20, p50: 20, p95: 30, p99: 30 });
   assert.equal(cell.metrics["resident_how"], undefined);
   assert.deepEqual(cell.failures, [{ run: 3, failure: "the marker is not the run's" }]);
 });

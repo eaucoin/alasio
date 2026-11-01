@@ -1,7 +1,9 @@
 /**
  * The aggregator: reads any number of results.jsonl, checks each line against the schema, and
- * writes, per system x variant x target x fixture x size x profile x phase, the median and p95
- * (nearest rank) of every metric over the runs that passed, and the runs that failed with why.
+ * writes, per system x variant x target x fixture x size x profile x phase, the p50, p95 and p99
+ * (nearest rank, 05-verification/benchmark.md) of every metric over the runs that passed, with
+ * the median as the memo gave it (the mean of the two middle values of an even count), and the
+ * runs that failed with why.
  *
  *   node aggregate.ts --out <dir> results.jsonl...
  *
@@ -29,11 +31,13 @@ export interface Result {
   readonly metrics: Readonly<Record<string, number | string | null>>;
 }
 
-/** The median and p95 of one metric over a cell's runs that passed. */
+/** One metric's statistics over a cell's runs that passed: the memo's median, and the nearest-rank p50, p95 and p99. */
 export interface Statistic {
   readonly n: number;
   readonly median: number;
+  readonly p50: number;
   readonly p95: number;
+  readonly p99: number;
 }
 
 /** A cell: one system x variant x target x fixture x size x profile x phase. */
@@ -51,10 +55,13 @@ export function median(sorted: readonly number[]): number {
   return sorted.length % 2 === 1 ? (sorted[middle] ?? NaN) : ((sorted[middle - 1] ?? NaN) + (sorted[middle] ?? NaN)) / 2;
 }
 
-/** The nearest-rank p95 of `values`, sorted: the ceil(0.95 n)th; with 5 runs, the largest. */
-export function p95(sorted: readonly number[]): number {
-  return sorted[Math.max(0, Math.ceil(0.95 * sorted.length) - 1)] ?? NaN;
+/** The nearest-rank `q` quantile of `values`, sorted: the ceil(q n)th smallest; with 20 runs, p95 the second largest and p99 the largest. */
+export function nearestRank(sorted: readonly number[], q: number): number {
+  return sorted[Math.max(0, Math.ceil(q * sorted.length) - 1)] ?? NaN;
 }
+
+/** The nearest-rank p95 of `values`, sorted; with 5 runs, the largest. */
+export const p95 = (sorted: readonly number[]): number => nearestRank(sorted, 0.95);
 
 const KEY_FIELDS = ["system", "variant", "target", "fixture", "size_mib", "profile", "emulated", "phase"] as const;
 
@@ -72,7 +79,7 @@ export function aggregate(results: readonly Result[]): Cell[] {
     const metrics: Record<string, Statistic> = {};
     for (const name of names) {
       const values = passed.map(({ metrics: each }) => each[name]).filter((value): value is number => typeof value === "number").sort((a, b) => a - b);
-      if (values.length > 0) metrics[name] = { n: values.length, median: median(values), p95: p95(values) };
+      if (values.length > 0) metrics[name] = { n: values.length, median: median(values), p50: nearestRank(values, 0.5), p95: p95(values), p99: nearestRank(values, 0.99) };
     }
     const key = Object.fromEntries(KEY_FIELDS.map((field) => [field, first[field]])) as Cell["key"];
     return {
@@ -101,7 +108,7 @@ const shown = (name: string, value: number): string => {
 
 /** summary.md: a table per phase, a row per cell, median / p95 of each metric. */
 export function markdown(cells: readonly Cell[]): string {
-  const lines = ["# Snapshot benchmark summary", "", "Median / p95 (nearest rank) over the runs that passed; `passed` of `runs`. Emulated profiles are labelled so.", ""];
+  const lines = ["# Snapshot benchmark summary", "", "p50 / p95 / p99 (nearest rank) over the runs that passed; `passed` of `runs`. Emulated profiles are labelled so.", ""];
   for (const [phase, names] of Object.entries(SHOWN)) {
     const of = cells.filter(({ key }) => key.phase === phase);
     if (of.length === 0) continue;
@@ -110,7 +117,7 @@ export function markdown(cells: readonly Cell[]): string {
       const profile = key.emulated ? `${key.profile} (emulated)` : key.profile;
       const values = names.map((name) => {
         const statistic = metrics[name];
-        return statistic ? `${shown(name, statistic.median)} / ${shown(name, statistic.p95)}` : "-";
+        return statistic ? `${shown(name, statistic.p50)} / ${shown(name, statistic.p95)} / ${shown(name, statistic.p99)}` : "-";
       });
       lines.push(`| ${key.system} | ${key.variant} | ${key.target} | ${key.fixture} | ${key.size_mib} | ${profile} | ${passed}/${runs} | ${values.join(" | ")} |`);
     }
