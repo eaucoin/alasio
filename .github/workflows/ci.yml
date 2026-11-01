@@ -75,7 +75,7 @@ jobs:
           words() { jq --raw-input --compact-output '[splits("[\\s,]+") | select(. != "")]' <<<"$1"; }
           matrix=$(jq --null-input --compact-output \
             --argjson systems "$(words "$SYSTEMS")" --argjson targets "$(words "$TARGETS")" --argjson profiles "$(words "$PROFILES")" --argjson variants "$(words "$VARIANTS")" '
-            {alasio: ["as-shipped", "with-fix", "whole"], gvisor: ["all", "tuned", "defaults"], firecracker: ["all", "chunk-16mib"], criu: ["all", "phaul", "splice", "chain", "patched", "eager"]} as $variantsOf
+            {alasio: ["as-shipped", "with-fix", "whole", "no-compaction", "settled", "kept-cache"], gvisor: ["all", "tuned", "defaults"], firecracker: ["all", "chunk-16mib"], criu: ["all", "phaul", "splice", "chain", "patched", "eager"]} as $variantsOf
             | {alasio: ["as-shipped", "with-fix"], gvisor: ["all"], firecracker: ["all"], criu: ["all"]} as $defaults
             | ($variantsOf | keys) as $known
             | ["local", "s3-standard", "s3-express"] as $shapes

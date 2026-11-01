@@ -39,7 +39,7 @@ import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.t
 import { BINDING_LABEL, FREE_LABEL, keyHash, leaseName, POOL_LABEL } from "../../src/binder/names.ts";
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { BAYMA_CONTAINER, RESTORE_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
-import type { Manifest } from "../../src/node-agent/agent.ts";
+import { compactionDue, type Manifest } from "../../src/node-agent/agent.ts";
 import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { bindSession, boundPodOf, dumpClusterState, gatewayCall, kube, mainToken, nodeAgents, onNode, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
@@ -66,7 +66,13 @@ const RUNS = Number(process.env["BENCH_RUNS"] || 5);
  * save taken, as of a session released before its first, its release a whole stop-and-copy.
  */
 const VARIANT = variable("BENCH_VARIANT");
-if (VARIANT !== "as-shipped" && VARIANT !== "with-fix" && VARIANT !== "whole") throw new Error(`BENCH_VARIANT is ${VARIANT}, not as-shipped, with-fix or whole`);
+/**
+ * Spike: as-shipped, but `no-compaction` kills the release's compaction of the chain as it starts,
+ * `settled` waits until it ends before the warm restore, and `kept-cache` leaves the node's page
+ * cache as it is for the warm restore.
+ */
+const SPIKE_VARIANTS = ["no-compaction", "settled", "kept-cache"];
+if (VARIANT !== "as-shipped" && VARIANT !== "with-fix" && VARIANT !== "whole" && !SPIKE_VARIANTS.includes(VARIANT)) throw new Error(`BENCH_VARIANT is ${VARIANT}, not as-shipped, with-fix or whole`);
 const COMMON = new URL("../../bench/common/", import.meta.url);
 const read = (relative: string): string => readFileSync(new URL(relative, COMMON), "utf8");
 const PROFILES = JSON.parse(read("store/profiles.json")) as Record<string, { readonly emulated: boolean }>;
@@ -399,6 +405,89 @@ async function endUnsaved(workspace: string, name: string): Promise<void> {
   }
 }
 
+/** Spike: the node agent's log lines of `node`, timestamped. */
+async function agentLines(node: string): Promise<string[]> {
+  return (await kube.logs(NAMESPACE, (await nodeAgents()).get(node) ?? "", "node-agent", { timestamps: true })).split("\n");
+}
+
+/** Spike: kills the compaction of `snapshot` as it starts, and waits until the agent says it failed: when, from the ask, it was killed. */
+async function killCompaction(node: string, snapshot: string): Promise<Record<string, unknown>> {
+  const started = Date.now();
+  for (const deadline = started + 120_000; Date.now() < deadline; await sleep(50)) {
+    const killed = (await onNode(node, "pkill -e -f ' image [c]ompact ' || true")).trim();
+    if (killed !== "") {
+      const at = Date.now() - started;
+      for (const until = Date.now() + 60_000; Date.now() < until; await sleep(500)) {
+        const said = (await agentLines(node)).find((line) => line.includes(`compacting the snapshot ${snapshot} `));
+        if (said) return { killed_after_ms: at, killed, said: said.slice(0, 300) };
+      }
+      return { killed_after_ms: at, killed, said: null };
+    }
+  }
+  return { killed_after_ms: null };
+}
+
+/** Spike: waits until the compaction of `snapshot` has ended, however it did: how long that took, and what the agent said. */
+async function compactionEnded(node: string, snapshot: string): Promise<Record<string, unknown>> {
+  const started = Date.now();
+  for (const deadline = started + 900_000; Date.now() < deadline; await sleep(1000)) {
+    const said = (await agentLines(node)).find((line) => line.includes(`compacted the snapshot ${snapshot} `) || line.includes(`compacting the snapshot ${snapshot} `));
+    if (said) return { waited_ms: Date.now() - started, said: said.slice(0, 300) };
+  }
+  throw new Error(`the compaction of ${snapshot} did not end within 900 s`);
+}
+
+/**
+ * Spike: samples, every 200 ms until stopped, the node's disks, its I/O and CPU pressure, its CPU
+ * time and each runsc process's bytes read and written, into logs/io-<name>.txt.
+ */
+async function sampleIo(node: string, name: string): Promise<{ readonly file: string; readonly stop: () => Promise<void> }> {
+  const file = join(BENCH_DIR, "logs", `io-${name}.txt`);
+  const stop = join(BENCH_DIR, `io-${name}.stop`);
+  const script = join(BENCH_DIR, "io-sample.sh");
+  writeFileSync(script, [
+    "while [ ! -e \"$2\" ]; do",
+    "  echo \"@ $(date +%s%N)\"",
+    "  grep -E ' (sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|dm-[0-9]+) ' /proc/diskstats",
+    "  echo \"pio $(head -n 1 /proc/pressure/io)\"",
+    "  echo \"pcpu $(head -n 1 /proc/pressure/cpu)\"",
+    "  head -n 1 /proc/stat",
+    "  for p in $(pgrep -f 'runsc|bayma'); do",
+    "    echo \"p $p $(grep -E '^(read|write)_bytes' /proc/$p/io 2>/dev/null | tr '\\n' ' ')| $(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200)\"",
+    "  done",
+    "  sleep 0.2",
+    "done",
+  ].join("\n"));
+  await onNode(node, `rm -f '${stop}'; setsid nohup sh '${script}' '${file}' '${stop}' > '${file}' 2>&1 < /dev/null &`);
+  return { file, stop: async () => void (await onNode(node, `touch '${stop}'; sleep 0.5; rm -f '${stop}'`)) };
+}
+
+/**
+ * Spike: the restore's steps, as the gateway's and the agent's trace lines and the probe say
+ * them, each in milliseconds from the probe's t0.
+ */
+async function tracedRestore(node: string, workspace: string, probed: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const t0 = Number(probed["t0_wall_ms"]);
+  const t0Ns = BigInt(String(probed["t0_ns"]));
+  const steps: Record<string, number> = {};
+  const gateways = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("sandbox-gateway")) });
+  const lines = [
+    ...(await Promise.all(gateways.map((pod) => kube.logs(NAMESPACE, pod.metadata?.name ?? "", "sandbox-gateway").catch(() => "")))).flatMap((logged) => logged.split("\n")),
+    ...(await agentLines(node)),
+  ];
+  for (const line of lines) {
+    const matched = /trace (\S+) (\S+) (\S+)(.*) @(\d+)$/u.exec(line);
+    if (!matched || !matched[1]?.includes(workspace) || Number(matched[5]) < t0 - 60_000) continue;
+    const step = `${matched[2]} ${matched[3]}${matched[3]?.startsWith("compact") || matched[3] === "policies-in-force" ? ` ${matched[4]?.trim() ?? ""}` : ""}`;
+    steps[step] ??= Number(matched[5]) - t0;
+  }
+  const fromT0 = (key: string) => (typeof probed[key] === "string" ? Number(BigInt(probed[key] as string) - t0Ns) / 1e6 : null);
+  return {
+    steps: Object.entries(steps).toSorted(([, a], [, b]) => a - b),
+    probe: { initialized: fromT0("initialized_ns"), acquired: fromT0("connected_ns"), first_exec_end: fromT0("first_exec_end_ns"), refusals: probed["refusals"] },
+  };
+}
+
 /** Drops the page cache of `node`, as every restore starts with it dropped, so what ran before leaves it nothing. */
 const dropPageCache = (node: string): Promise<string> => onNode(node, "sync && echo 1 > /proc/sys/vm/drop_caches");
 
@@ -561,15 +650,20 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
       uploaded_bytes: heldStop - heldLive,
     }, NO_CHECKS, { snapshot: manifest.snapshot, runsc_checkpoint_ms: manifest.pauseMs, upload_ms: manifest.uploadMs, chain: manifest.layers.length, bytes: manifest.bytes, logged: stopLogged.said });
     done.add(phase);
+    // Spike: the release's compaction of the chain, where one is due, killed as it starts, or waited for.
+    const compaction = compactionDue(manifest.layers) === null ? null : VARIANT === "no-compaction" ? await killCompaction(node, manifest.snapshot) : VARIANT === "settled" ? await compactionEnded(node, manifest.snapshot) : null;
     await gone(bound.name);
     // The workspace as the release left it, for the cold restore's.
     const quota = JSON.parse(await agentOk(node, "GET", `/workspaces/${SESSIONS}/${workspace}/quota`)) as { readonly capacityBytes: number };
     await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace }, to: { environment: SESSIONS, workspace: copy }, quotaBytes: quota.capacityBytes });
 
     phase = "restore-warm";
-    await dropPageCache(node);
+    if (VARIANT !== "kept-cache") await dropPageCache(node);
+    const sampling = await sampleIo(node, `${fixture}-${sizeMib}-${run}-warm`);
     const warm = await restore(workspace, sessionId, fixture, runId, manifest);
-    emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, warm.details);
+    await sampling.stop();
+    const spike = { compaction, io: sampling.file, ...(await tracedRestore(node, workspace, warm.probed)) };
+    emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, { ...warm.details, spike });
     done.add(phase);
     await endUnsaved(workspace, warm.pod);
 
