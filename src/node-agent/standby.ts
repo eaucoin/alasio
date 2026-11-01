@@ -8,9 +8,12 @@
  * answered `{ containers, milliseconds }`, each of its containers restored from the image in
  * the order they were created, paused, until the agent resumes them as it resumes a restore's
  * pod (./agent.ts resume). A second request is refused (409), as the socket goes once one is
- * taken.
+ * taken. Where each container has a shim of its own (no shim grouping, as on alasio's nodes),
+ * the root's socket restores the pod's sandbox container alone, and each other container's shim
+ * listens on `<pod>.<container>.sock` beside it for its own: the agent asks the root's first,
+ * then each container's.
  */
-import { access } from "node:fs/promises";
+import { access, readdir } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 
 import { Effect, Schema } from "effect";
@@ -47,36 +50,48 @@ const SOCKET_WAIT_MS = 10_000;
 /** How long a restore into a standby may take. */
 const RESTORE_TIMEOUT_MS = 120_000;
 
+/** The sockets of the standby pod `namespace`/`pod`'s containers' own shims, where they have them. */
+const containerSockets = async (namespace: string, pod: string): Promise<string[]> =>
+  (await readdir(`${STANDBY_SOCKETS}/${namespace}`)).filter((name) => name.startsWith(`${pod}.`) && name.endsWith(".sock") && name !== `${pod}.sock`).map((name) => `${STANDBY_SOCKETS}/${namespace}/${name}`);
+
+/** Asks the shim listening on `socket` to restore `body`, as the module says. */
+const askShim = async (request: StandbyRestoreRequest, socket: string, body: string): Promise<StandbyRestored> => {
+  const { status, text } = await new Promise<{ status: number; text: string }>((resolve, reject) => {
+    const asked = httpRequest(
+      { socketPath: socket, path: "/restore", method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, timeout: RESTORE_TIMEOUT_MS },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => resolve({ status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") }));
+        response.on("error", reject);
+      },
+    );
+    asked.on("timeout", () => asked.destroy(new Error(`it did not answer within ${RESTORE_TIMEOUT_MS / 1000} s`)));
+    asked.on("error", reject);
+    asked.end(body);
+  });
+  if (status !== 200) throw new StandbyRestoreFailed({ message: `the standby ${request.namespace}/${request.pod}'s ${socket} refused the restore (${status}): ${text.trim()}`, status });
+  return Schema.decodeUnknownSync(StandbyRestored)(JSON.parse(text));
+};
+
 /** Restores `request`'s image into its standby pod, paused, as the module says. */
 export const restoreIntoStandby = (request: StandbyRestoreRequest): Effect.Effect<StandbyRestored, StandbyRestoreFailed> =>
   Effect.tryPromise({
     try: async () => {
       const socket = standbySocket(request.namespace, request.pod);
+      // The root's socket, and the containers' own where their shims are not grouped: each shim makes its socket as kubelet starts its container.
+      const exists = (path: string) => access(path).then(() => true, () => false);
+      let containers: string[] = [];
       for (const deadline = Date.now() + SOCKET_WAIT_MS; ; await new Promise((resolve) => setTimeout(resolve, 50))) {
-        try {
-          await access(socket);
-          break;
-        } catch {
-          if (Date.now() > deadline) throw new StandbyRestoreFailed({ message: `the standby ${request.namespace}/${request.pod} has no socket ${socket}` });
-        }
+        const root = await exists(socket);
+        if (root) containers = await containerSockets(request.namespace, request.pod);
+        if (root && (containers.length > 0 || Date.now() > deadline)) break;
+        if (Date.now() > deadline) throw new StandbyRestoreFailed({ message: `the standby ${request.namespace}/${request.pod} has no socket ${socket}` });
       }
       const body = JSON.stringify({ imagePath: request.imagePath, paused: true });
-      const { status, text } = await new Promise<{ status: number; text: string }>((resolve, reject) => {
-        const asked = httpRequest(
-          { socketPath: socket, path: "/restore", method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, timeout: RESTORE_TIMEOUT_MS },
-          (response) => {
-            const chunks: Buffer[] = [];
-            response.on("data", (chunk: Buffer) => chunks.push(chunk));
-            response.on("end", () => resolve({ status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") }));
-            response.on("error", reject);
-          },
-        );
-        asked.on("timeout", () => asked.destroy(new Error(`it did not answer within ${RESTORE_TIMEOUT_MS / 1000} s`)));
-        asked.on("error", reject);
-        asked.end(body);
-      });
-      if (status !== 200) throw new StandbyRestoreFailed({ message: `the standby ${request.namespace}/${request.pod} refused the restore (${status}): ${text.trim()}`, status });
-      return Schema.decodeUnknownSync(StandbyRestored)(JSON.parse(text));
+      const restored = [await askShim(request, socket, body)];
+      for (const each of containers) restored.push(await askShim(request, each, body));
+      return { containers: restored.flatMap((one) => one.containers), milliseconds: restored.flatMap((one) => one.milliseconds) };
     },
     catch: (cause) =>
       cause instanceof StandbyRestoreFailed

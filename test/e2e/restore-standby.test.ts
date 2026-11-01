@@ -128,6 +128,11 @@ async function standbyLogs(): Promise<void> {
   };
   await of("sandbox-gateway", "sandbox-gateway");
   await of("node-agent", "node-agent");
+  // What the shims said of standbys, from containerd's log, and the shims that run.
+  for (const node of (await nodeAgents()).keys()) {
+    const said = await onNode(node, "f=/var/lib/rancher/k3s/agent/containerd/containerd.log; grep -E 'standby|Created container|is not a standby|to container' \"$f\" | tail -n 300; pgrep -af containerd-shim-runsc | cut -c 1-300").catch((error: unknown) => `could not be read: ${String(error)}`);
+    for (const line of said.split("\n")) console.log(`# shim ${line.slice(0, 1500)}`);
+  }
 }
 
 test(`restores into standby pods and into pods made for them, ${RUNS} in all`, { timeout: 150 * 60_000 }, async () => {
