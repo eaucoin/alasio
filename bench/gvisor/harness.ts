@@ -742,7 +742,9 @@ async function idleSaves(job: Job, setup: Setup, logDir: string, p: Paths, at: {
       const t0 = now();
       await checkpoint(image, parent);
       const t1 = now();
-      const pause = savePause(bootLog(logDir), saves++, true);
+      // `runsc checkpoint` returns at "Save succeeded", which the Sentry logs before it resumes
+      // the tasks: its "Tasks resumed after save." can follow the command's return.
+      const pause = await settledSavePause(logDir, saves++);
       emit(job, rowOf(job.common, setup, at, variant, "save-live", {
         ok: true,
         failure: null,
@@ -758,6 +760,19 @@ async function idleSaves(job: Job, setup: Setup, logDir: string, p: Paths, at: {
   }
   rmSync(parent, { recursive: true, force: true });
   return saves;
+}
+
+/** The `nth` live save's pause, once the Sentry has logged its end (within 5 s). */
+async function settledSavePause(logDir: string, nth: number): Promise<ReturnType<typeof savePause>> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    try {
+      return savePause(bootLog(logDir), nth, true);
+    } catch (error) {
+      if (Date.now() > deadline) throw error;
+      await sleep(100);
+    }
+  }
 }
 
 /**
