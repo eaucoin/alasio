@@ -514,10 +514,18 @@ async function goferLog(node: string, sandboxId: string): Promise<string[]> {
 
 /** Spike: where the node agent keeps the file that sends its restores' gofers through the relay (agent.ts goferOptions). */
 const DIRECT_FILE = `${NODE_AGENT_RUN_DIR}/bench-direct.json`;
+/** Spike: where the node agent keeps the file that has it fetch no restore into its cache (agent.ts prepare). */
+const NO_FETCH_FILE = `${NODE_AGENT_RUN_DIR}/bench-no-fetch`;
 /** Spike: the relay's socket, a plain copy of bytes to the store's Service, as the agent's own connections go. */
 const RELAY_SOCKET = `${NODE_AGENT_RUN_DIR}/relay.sock`;
 /** Spike: where an arm's gofer writes what it reads (Arm.cache). */
 const CACHE_DIR = join(BENCH_DIR, "gofer-cache");
+
+/**
+ * Spike: whether a restore of `arm` is fetched into the node's cache afterwards: not where the
+ * proxy cannot tell when it is done reading, as it reads through the relay or compressed pages.
+ */
+const fetchedAfter = (arm: Arm): boolean => !arm.direct && arm.runsc?.["checkpoint-gofer-pages-compression"] === undefined;
 
 /** Whether the relay runs, on the nodes it was started on. */
 const relaying = new Set<string>();
@@ -533,6 +541,7 @@ async function setArm(node: string, arm: Arm): Promise<void> {
   const flags = { ...arm.runsc, ...(arm.cache ? { "checkpoint-gofer-cache-dir": CACHE_DIR } : {}) };
   const lines = ["  # bench arm begin", ...Object.entries(flags).map(([flag, value]) => `  ${flag} = "${value}"`), "  # bench arm end"];
   await onNode(node, `sed -i '/# bench arm begin/,/# bench arm end/d' ${options} && printf '%s\\n' ${lines.map((line) => `'${line}'`).join(" ")} >> ${options} && rm -rf ${CACHE_DIR}`);
+  await onNode(node, fetchedAfter(arm) ? `rm -f ${NO_FETCH_FILE}` : `touch ${NO_FETCH_FILE}`);
   if (!arm.direct) {
     await onNode(node, `rm -f ${DIRECT_FILE}`);
     return;
@@ -766,8 +775,8 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
       const restorePod = await podNamed(cold.pod).catch(() => null);
       const sandboxCpu = restorePod ? (await cpuOf(node, [restorePod.metadata?.uid ?? ""]))[restorePod.metadata?.uid ?? ""] ?? null : null;
       const cpu = Object.fromEntries([...pods].map(([uid, name]) => [name, Math.round(((cpuAfter[uid] ?? 0) - (cpuBefore[uid] ?? 0)) * 1000) / 1000]).filter(([, seconds]) => (seconds as number) > 0.05));
-      // A restore through the relay is fetched into no cache (src/node-agent/agent.ts prepare).
-      const fetched = arm.direct ? { line: null, at: null } : await fetchEnded(node, manifest.snapshot, fetchesBefore);
+      // A restore through the relay or of compressed pages is fetched into no cache (src/node-agent/agent.ts prepare).
+      const fetched = fetchedAfter(arm) ? await fetchEnded(node, manifest.snapshot, fetchesBefore) : { line: null, at: null };
       const cached = arm.cache ? (await onNode(node, `du -sb --apparent-size ${CACHE_DIR} 2>/dev/null; du -sb ${CACHE_DIR} 2>/dev/null; true`)).trim() : null;
       const sandboxId = await sandboxIdOf(node, cold.pod);
       const traced = [...(await bootLog(node, sandboxId)).filter((line) => /Async page loading|Kernel load took|Restore successful|MemoryFile.*loaded metadata|Starting checkpoint gofer/u.test(line)), ...(await goferLog(node, sandboxId)).filter((line) => line.includes("S3 read trace") || line.includes("Opening s3://")), ...(await proxyTraces(node, askedMs))];
