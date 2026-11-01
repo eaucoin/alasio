@@ -90,6 +90,8 @@ static uint8_t* memfd_map(size_t bytes) {
     exit(1);
   }
   close(fd);
+  // Small pages, as the Sentry maps its memory file (alasio runs app-huge-pages false): one fault per page.
+  if (madvise(p, bytes, MADV_NOHUGEPAGE) < 0) perror("madvise");
   for (size_t off = 0; off < bytes; off += PAGE) p[off] = 1;
   return p;
 }
