@@ -33,6 +33,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <signal.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -185,14 +186,23 @@ static void* handle(void* arg) {
     if (msg.event != UFFD_EVENT_PAGEFAULT) continue;
     uintptr_t at = msg.arg.pagefault.address & ~(h->unit - 1);
     if (h->copy) memcpy(h->staging, (void*)at, h->unit);
-    protect(h->uffd, (uint8_t*)at, h->unit, 0, 0);
-    h->faults++;
+    // Retried where the kernel asks (EAGAIN while the mm changes); said and given up on otherwise.
+    int tries = 0;
+    while (protect(h->uffd, (uint8_t*)at, h->unit, 0, 0) < 0) {
+      if (errno != EAGAIN || ++tries > 1000) {
+        fprintf(stderr, "unprotect of %#lx failed: %s\n", (unsigned long)at, strerror(errno));
+        break;
+      }
+    }
+    if (++h->faults % 65536 == 0) fprintf(stderr, "fault: %ld faults resolved\n", h->faults);
   }
   return NULL;
 }
 
 static void fault(size_t mib, int reps) {
   size_t bytes = mib << 20;
+  // A fault no handler resolves would hang the writer forever: a minute per measurement at most.
+  alarm(60 * reps * 4);
   size_t units[] = {PAGE, UNIT};
   for (int u = 0; u < 2; u++) {
     for (int copy = 0; copy < 2; copy++) {
@@ -207,6 +217,7 @@ static void fault(size_t mib, int reps) {
         reg(uffd, p, bytes);
         protect(uffd, p, bytes, 1, 0);
         struct handler h = {.uffd = uffd, .unit = units[u], .copy = copy, .staging = aligned_alloc(PAGE, UNIT)};
+        fprintf(stderr, "fault: %zu MiB, unit %zu, copy %d, rep %d\n", mib, units[u], copy, r);
         pthread_t th;
         pthread_create(&th, NULL, handle, &h);
         double t0 = now_s();
@@ -238,6 +249,7 @@ static void efault_one(int user_mode_only, const char* who) {
     return;
   }
   uint8_t* p = memfd_map(UNIT);
+  fprintf(stderr, "efault: as %s, user mode only %d\n", who, user_mode_only);
   reg(uffd, p, UNIT);
   protect(uffd, p, UNIT, 1, 0);
   struct handler h = {.uffd = uffd, .unit = PAGE, .copy = 0, .staging = NULL};
@@ -262,6 +274,7 @@ static void efault_one(int user_mode_only, const char* who) {
 }
 
 static void efault(void) {
+  alarm(60);
   FILE* f = fopen("/proc/sys/vm/unprivileged_userfaultfd", "r");
   int unpriv = -1;
   if (f) {

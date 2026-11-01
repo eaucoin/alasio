@@ -360,7 +360,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/out"
           gcc -O2 -static -pthread -o "$RUNNER_TEMP/uffd" bench/val/uffd.c
           sudo swapoff -a
-          run='./uffd arm 1024 5 && ./uffd arm 3072 5 && ./uffd fault 256 5 && ./uffd fault 1024 3 && ./uffd efault'
+          run='./uffd efault; ./uffd fault 256 5; ./uffd fault 1024 3; ./uffd arm 1024 5; ./uffd arm 3072 5'
           if [ "$KERNEL" = runner ]; then
             (cd "$RUNNER_TEMP" && uname -r && sudo sh -c "$run") | tee "$RUNNER_TEMP/out/uffd-$KERNEL.jsonl"
           else
