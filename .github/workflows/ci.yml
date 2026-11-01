@@ -301,7 +301,11 @@ jobs:
           curl -fsSLO "$base/gvisor-x86_64.tar.zstd.sha512"
           sha512sum -c gvisor-x86_64.tar.zstd.sha512
           mkdir -p gvisor && tar --zstd -xf gvisor-x86_64.tar.zstd -C gvisor
-          sudo install -m 0755 "$(find gvisor -name runsc -type f | head -n 1)" /usr/local/bin/runsc
+          # runsc with its sidecars (gvisor-bin/), which it finds beside itself.
+          from=$(dirname "$(find gvisor -name runsc -type f | head -n 1)")
+          ls -la "$from"
+          sudo cp -a "$from"/. /usr/local/bin/
+          tar -cf "$RUNNER_TEMP/runsc-bundle.tar" -C "$from" .
           runsc --version
           sudo mkdir -p /mnt/val && sudo chown "$USER" /mnt/val
           sudo swapoff -a
@@ -396,7 +400,11 @@ jobs:
           curl -fsSLO "$base/gvisor-x86_64.tar.zstd.sha512"
           sha512sum -c gvisor-x86_64.tar.zstd.sha512
           mkdir -p gvisor && tar --zstd -xf gvisor-x86_64.tar.zstd -C gvisor
-          sudo install -m 0755 "$(find gvisor -name runsc -type f | head -n 1)" /usr/local/bin/runsc
+          # runsc with its sidecars (gvisor-bin/), which it finds beside itself.
+          from=$(dirname "$(find gvisor -name runsc -type f | head -n 1)")
+          ls -la "$from"
+          sudo cp -a "$from"/. /usr/local/bin/
+          tar -cf "$RUNNER_TEMP/runsc-bundle.tar" -C "$from" .
           runsc --version
           sudo mkdir -p /mnt/val && sudo chown "$USER" /mnt/val
           sudo swapoff -a
@@ -445,7 +453,11 @@ jobs:
           curl -fsSLO "$base/gvisor-x86_64.tar.zstd.sha512"
           sha512sum -c gvisor-x86_64.tar.zstd.sha512
           mkdir -p gvisor && tar --zstd -xf gvisor-x86_64.tar.zstd -C gvisor
-          sudo install -m 0755 "$(find gvisor -name runsc -type f | head -n 1)" /usr/local/bin/runsc
+          # runsc with its sidecars (gvisor-bin/), which it finds beside itself.
+          from=$(dirname "$(find gvisor -name runsc -type f | head -n 1)")
+          ls -la "$from"
+          sudo cp -a "$from"/. /usr/local/bin/
+          tar -cf "$RUNNER_TEMP/runsc-bundle.tar" -C "$from" .
           runsc --version
           sudo mkdir -p /mnt/val && sudo chown "$USER" /mnt/val
           sudo swapoff -a
@@ -459,8 +471,8 @@ jobs:
           if [ "$KERNEL" = runner ]; then
             sudo --preserve-env=ImageOS,ImageVersion python3 bench/val/oom.py --runsc /usr/local/bin/runsc --out "$RUNNER_TEMP/out/oom-$KERNEL.jsonl"
           else
-            bench/val/vm612.sh 12288 'swapoff -a; python3 oom.py --runsc /val/runsc --out /val/oom.jsonl >&2; cat /val/oom.jsonl' \
-              /usr/local/bin/runsc bench/val/common.py bench/val/oom.py bench/val/om bench/val/om.c > "$RUNNER_TEMP/out/oom-$KERNEL.jsonl"
+            bench/val/vm612.sh 12288 'swapoff -a; tar -xf runsc-bundle.tar; python3 oom.py --runsc /val/runsc --out /val/oom.jsonl >&2; cat /val/oom.jsonl' \
+              "$RUNNER_TEMP/runsc-bundle.tar" bench/val/common.py bench/val/oom.py bench/val/om bench/val/om.c > "$RUNNER_TEMP/out/oom-$KERNEL.jsonl"
           fi
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
