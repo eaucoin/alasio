@@ -85,7 +85,12 @@ const read = (relative: string): string => readFileSync(new URL(relative, COMMON
 const PROFILES = JSON.parse(read("store/profiles.json")) as Record<string, { readonly emulated: boolean }>;
 const ALL_CASES = JSON.parse(read("cases.json")) as { readonly fixture: string; readonly size_mib: number }[];
 const ASKED = (process.env["BENCH_CASES"] ?? "").split(/[\s,]+/u).filter(Boolean);
-const CASES = ASKED.length === 0 ? ALL_CASES : ALL_CASES.filter(({ fixture, size_mib }) => ASKED.includes(`${fixture}/${size_mib}`));
+/** The cases asked, as fixture/MiB, of the benchmark's or not (a deep chain's idle/1024, endpoint E16); every case of the benchmark's where none is. */
+const CASES = ASKED.length === 0 ? ALL_CASES : ASKED.map((asked) => {
+  const [fixture = "", size = ""] = asked.split("/");
+  if (!ALL_CASES.some((each) => each.fixture === fixture) || !/^[1-9][0-9]*$/u.test(size)) throw new Error(`BENCH_CASES asks for ${asked}, no fixture/MiB of the benchmark's fixtures`);
+  return { fixture, size_mib: Number(size) };
+});
 const HOST = JSON.parse(readFileSync(join(BENCH_DIR, "host.json"), "utf8")) as { readonly copy_mib_s: number };
 const RELEASE_UNDER_TEST = NODE_PINS.gvisor.releases[0]?.release ?? "";
 /** The release of alasio under test, and of the bayma its sessions run (sandbox/agent/Dockerfile's BAYMA_IMAGE). */
