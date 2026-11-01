@@ -12,6 +12,7 @@
 import array
 import collections
 import datetime
+import gc
 import gzip
 import hashlib
 import json
@@ -73,10 +74,28 @@ class Bench:
                 kept.append(self.record(-1 - len(kept)))
             bayma_write_checkpoint({"records": kept})
         self.expected = self.digest()
+        # The collections of the cyclic GC, as (wall time, generation, collected, ms), and when
+        # the last of the fixture's execs ended on the monotonic and the wall clock: the first exec
+        # after a restore says which collections ran since, and how far each clock moved, as a
+        # restored sandbox's monotonic clock jumps forward by the time the sandbox was saved.
+        self.collections = collections.deque(maxlen=1000)
+        self.collection_start = None
+        gc.callbacks.append(self._collected)
+        self.ended()
         self.measuring = threading.Event()
         self.max_gap_ms = 0.0
         self.ticks = 0
         threading.Thread(target=self._tick, daemon=True).start()
+
+    def _collected(self, phase, info):
+        if phase == "start":
+            self.collection_start = time.perf_counter()
+        elif self.collection_start is not None:
+            self.collections.append((time.time(), info["generation"], info["collected"], (time.perf_counter() - self.collection_start) * 1000))
+
+    def ended(self, answer=None):
+        self.last_exec = (time.monotonic(), time.time())
+        return answer
 
     def word(self):
         # The frequent words far more often, as in text.
@@ -138,7 +157,7 @@ class Bench:
                 last = now
 
     def baseline(self):
-        return {"baseline_mib_s": 0, "rss_bytes": rss_bytes()}
+        return self.ended({"baseline_mib_s": 0, "rss_bytes": rss_bytes()})
 
     def work(self):
         # One exec of an agent's work: a search, a top list, counts per tag, statistics, a report
@@ -158,26 +177,37 @@ class Bench:
         self.db.commit()
         kinds = self.db.execute("SELECT kind, count(*) AS n FROM events GROUP BY kind ORDER BY n DESC LIMIT 5").fetchall()
         self.expected = self.digest()
-        return {"tag": tag, "found": len(found), "spread": spread, "report_bytes": len(report), "kinds": len(kinds), "records": len(self.records), "rss_bytes": rss_bytes()}
+        return self.ended({"tag": tag, "found": len(found), "spread": spread, "report_bytes": len(report), "kinds": len(kinds), "records": len(self.records), "rss_bytes": rss_bytes()})
 
     def mark(self):
         self.max_gap_ms = 0.0
         self.ticks = 0
         self.marked_at = time.monotonic()
         self.measuring.set()
-        return {"marked": True}
+        return self.ended({"marked": True})
 
     def gaps(self):
         self.measuring.clear()
-        return {"max_gap_ms": self.max_gap_ms, "ticks": self.ticks, "window_ms": (time.monotonic() - self.marked_at) * 1000, "rate_mib_s": 0, "slowdown": None}
+        return self.ended({"max_gap_ms": self.max_gap_ms, "ticks": self.ticks, "window_ms": (time.monotonic() - self.marked_at) * 1000, "rate_mib_s": 0, "slowdown": None})
 
     def first(self):
-        # The first exec after a restore, as an agent's often is: a look at what the session holds, not a walk of it.
-        return {"marker": self.marker, "records": len(self.records), "last": self.records[-1]["id"]}
+        # The first exec after a restore, as an agent's often is: a look at what the session holds,
+        # not a walk of it; and the collections since the last exec ended, and how far the clocks
+        # moved.
+        monotonic, wall = self.last_exec
+        since = [each for each in self.collections if each[0] > wall]
+        return self.ended({
+            "marker": self.marker,
+            "records": len(self.records),
+            "last": self.records[-1]["id"],
+            "monotonic_gap_ms": (time.monotonic() - monotonic) * 1000,
+            "wall_gap_ms": (time.time() - wall) * 1000,
+            "collections": [{"generation": generation, "collected": collected, "ms": ms} for _, generation, collected, ms in since],
+        })
 
     def verify(self):
         # Everything the session holds, read and compared with what the last exec left.
-        return {"marker": self.marker, "memory": self.digest() == self.expected, "children": None, "file": None, "socket": None, "running": None, "records": len(self.records), "rss_bytes": rss_bytes()}
+        return self.ended({"marker": self.marker, "memory": self.digest() == self.expected, "children": None, "file": None, "socket": None, "running": None, "records": len(self.records), "rss_bytes": rss_bytes()})
 
 
 bench = Bench(PARAMS)

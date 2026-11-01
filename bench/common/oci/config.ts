@@ -9,9 +9,9 @@
  */
 import { parseArgs } from "node:util";
 
-/** The instance's command, as alasio's pool pods run it (cli/src/manifests/sandbox-gateway.ts). */
-export const command = (port: number): string[] => [
-  "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js",
+/** The instance's command, as alasio's pool pods run it (cli/src/manifests/sandbox-gateway.ts), bayma's server given `nodeFlags`. */
+export const command = (port: number, nodeFlags: readonly string[] = []): string[] => [
+  "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", ...nodeFlags, "/opt/bayma/bayma.js",
   "mcp-http", "--host", "0.0.0.0", "--port", String(port), "--state-dir", "/home/agent/.bayma", "--token-file", "/attach/token",
 ];
 
@@ -21,18 +21,29 @@ export const HOOK = ["/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js
 /** runc spec's default capabilities. */
 const CAPABILITIES = ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"];
 
-export function config({ rootfs, attach, netns, port = 8765, cgroupsPath }: { readonly rootfs: string; readonly attach: string; readonly netns: string; readonly port?: number; readonly cgroupsPath?: string }) {
+export function config({ rootfs, attach, netns, port = 8765, cgroupsPath, env = [], nodeFlags = [] }: {
+  readonly rootfs: string;
+  readonly attach: string;
+  readonly netns: string;
+  readonly port?: number;
+  readonly cgroupsPath?: string;
+  /** Variables beside the spec's, as `NAME=value`. */
+  readonly env?: readonly string[];
+  /** node's flags for bayma's server. */
+  readonly nodeFlags?: readonly string[];
+}) {
   return {
     ociVersion: "1.2.0",
     process: {
       terminal: false,
       user: { uid: 1000, gid: 1000 },
-      args: command(port),
+      args: command(port, nodeFlags),
       env: [
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "HOME=/home/agent",
         "USER=agent",
         "BAYMA_PAYLOAD_DIR=/opt/bayma/payload",
+        ...env,
       ],
       cwd: "/attach",
       capabilities: { bounding: CAPABILITIES, effective: CAPABILITIES, permitted: CAPABILITIES },

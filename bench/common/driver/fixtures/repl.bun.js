@@ -137,10 +137,18 @@ ticker.postMessage({ ctl, counters });
 const now = () => Number(process.hrtime.bigint()) / 1e6;
 let expected = digest();
 let marked = null;
+// When the last of the fixture's execs ended, on the monotonic clock and the wall clock: the first
+// exec after a restore says how far each moved since, as a restored sandbox's monotonic clock
+// jumps forward by the time the sandbox was saved.
+let lastExec = { monotonic: now(), wall: Date.now() };
+const ended = (answer) => {
+  lastExec = { monotonic: now(), wall: Date.now() };
+  return answer;
+};
 
 globalThis.bench = {
   baseline() {
-    return { baseline_mib_s: 0, rss_bytes: rss() };
+    return ended({ baseline_mib_s: 0, rss_bytes: rss() });
   },
   /**
    * One exec of an agent's work: a search, a top list, counts per tag, a report compressed; some
@@ -157,7 +165,7 @@ globalThis.bench = {
     for (let i = 0; i < records.length / 200; i++) add();
     const kinds = db.query("SELECT kind, count(*) AS n FROM events GROUP BY kind ORDER BY n DESC LIMIT 5").all();
     expected = digest();
-    return { tag, found: found.length, report_bytes: report.byteLength, kinds: kinds.length, records: records.length, rss_bytes: rss(), preview: util.inspect(top[0]?.name) };
+    return ended({ tag, found: found.length, report_bytes: report.byteLength, kinds: kinds.length, records: records.length, rss_bytes: rss(), preview: util.inspect(top[0]?.name) });
   },
   mark() {
     counters[MAX_GAP_MS] = 0;
@@ -165,21 +173,24 @@ globalThis.bench = {
     marked = now();
     Atomics.store(ctl, MEASURE, 1);
     Atomics.notify(ctl, MEASURE);
-    return { marked: true };
+    return ended({ marked: true });
   },
   gaps() {
     Atomics.store(ctl, MEASURE, 0);
     if (marked === null) throw new Error("no window was marked");
-    return { max_gap_ms: counters[MAX_GAP_MS], ticks: counters[TICKS], window_ms: now() - marked, rate_mib_s: 0, slowdown: null };
+    return ended({ max_gap_ms: counters[MAX_GAP_MS], ticks: counters[TICKS], window_ms: now() - marked, rate_mib_s: 0, slowdown: null });
   },
-  /** The first exec after a restore, as an agent's often is: a look at what the session holds, not a walk of it. */
+  /**
+   * The first exec after a restore, as an agent's often is: a look at what the session holds, not
+   * a walk of it; and how far the clocks moved since the last exec.
+   */
   first() {
-    return { marker, records: records.length, last: records.at(-1).id };
+    return ended({ marker, records: records.length, last: records.at(-1).id, monotonic_gap_ms: now() - lastExec.monotonic, wall_gap_ms: Date.now() - lastExec.wall });
   },
   /** Everything the session holds, read and compared with what the last exec left. */
   verify() {
     const found = digest();
-    return { marker, memory: found === expected, children: null, file: null, socket: null, running: null, records: records.length, rss_bytes: rss() };
+    return ended({ marker, memory: found === expected, children: null, file: null, socket: null, running: null, records: records.length, rss_bytes: rss() });
   },
 };
 

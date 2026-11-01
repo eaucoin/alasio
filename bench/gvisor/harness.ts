@@ -203,6 +203,22 @@ interface Setup {
   readonly again: boolean;
   /** How long the probe waits between the first exec and the verify, which reads every page. */
   readonly verifyAfterMs: number;
+  /** Variables the instance's processes run with, as `NAME=value`, beside the spec's. */
+  readonly env: readonly string[];
+  /** node's flags for bayma's server. */
+  readonly nodeFlags: readonly string[];
+  /**
+   * The exec run in the fixture's session before it is saved and stopped, by runtime, as a hook's
+   * hygiene before a save would run it (the endpoint package's X-HYG), or null for none.
+   */
+  readonly hygiene: { readonly bun: string; readonly python: string } | null;
+  /**
+   * The idle times, in seconds, after which the instance, saved live once, is saved live again,
+   * each save incremental over the one before (the endpoint package's X-IDLE).
+   */
+  readonly idleSaves: readonly number[];
+  /** Whether V8's heap statistics in a node the instance starts are recorded (X-SRV). */
+  readonly heapStats: boolean;
 }
 
 const TUNED: Setup = {
@@ -228,6 +244,11 @@ const TUNED: Setup = {
   sampleIO: false,
   again: false,
   verifyAfterMs: 0,
+  env: [],
+  nodeFlags: [],
+  hygiene: null,
+  idleSaves: [],
+  heapStats: false,
 };
 
 const DEFAULTS: Setup = { ...TUNED, name: "defaults", variant: "defaults", hostSettings: "check", checkpoint: [], background: false, warmDirect: false, lazy: null, warm: [{ variant: "defaults", cache: "dropped" }] };
@@ -241,7 +262,7 @@ const DEFAULTS: Setup = { ...TUNED, name: "defaults", variant: "defaults", hostS
  * and then kept, and cold through rclone's mount. `uncached` also maps large pmas' accessed ranges
  * alone while they load, as upstream's c63a70c947 does.
  */
-function traced(variant: string, { uncached = false, window = "60s" } = {}): Setup {
+function traced(variant: string, { uncached = false, window = "60s", trace = true } = {}): Setup {
   return {
     ...TUNED,
     name: variant,
@@ -253,7 +274,7 @@ function traced(variant: string, { uncached = false, window = "60s" } = {}): Set
       `--working-set-window=${window}`,
       "--allow-live-tcp-migration=false",
       "--app-huge-pages=false",
-      "--async-awaits-trace=log",
+      ...(trace ? ["--async-awaits-trace=log"] : []),
       ...(uncached ? ["--async-load-internal-mappings=uncached"] : []),
     ],
     image: IMAGE_10_0_5,
@@ -275,6 +296,24 @@ const SETUPS: Record<string, readonly Setup[]> = {
   // G-14: the working set of the first exec alone (3 s, the probe's verify after it), saved with
   // the sandbox again and read first by the restore of that image.
   "traced-again": [{ ...traced("traced-again", { window: "3s" }), lazy: null, warm: [{ variant: "traced-again", cache: "dropped" }], again: true, verifyAfterMs: 4000 }],
+  // X-FIRST and X-SRV: JavaScriptCore's collections logged (in the first exec's stderr), the
+  // server's V8 collections and memory reducer logged (in the restore's output), the heap's
+  // limits a node sees in the sandbox; Python's collections the fixture records itself.
+  "traced-gc": [{ ...traced("traced-gc"), lazy: null, env: ["BUN_JSC_logGC=1"], nodeFlags: ["--trace-gc", "--trace-memory-reducer"], heapStats: true }],
+  // X-IDLE: a session left idle, saved live, then live and incrementally after 5, 30 and 120 s,
+  // as it comes and with Bun's GC timer and mimalloc's purge of holes off.
+  idle: [
+    { ...traced("idle", { trace: false }), idleSaves: [5, 30, 120], warm: [], lazy: null },
+    { ...traced("idle-quiet", { trace: false }), idleSaves: [5, 30, 120], warm: [], lazy: null, env: ["BUN_GC_TIMER_DISABLE=1", "MIMALLOC_PURGE_HOLES=0"] },
+  ],
+  // X-HYG: the image a session saves as it comes, with its allocators asked to return memory at
+  // once, and after a collection (and Bun's shrink of its heap) in an exec just before the save.
+  hygiene: [
+    { ...traced("hygiene-none", { trace: false }), warm: [], lazy: null },
+    { ...traced("hygiene-env", { trace: false }), warm: [], lazy: null, env: ["MIMALLOC_PURGE_DELAY=0", "PYTHONMALLOC=malloc"] },
+    { ...traced("hygiene-gc", { trace: false }), warm: [], lazy: null, hygiene: { bun: "Bun.gc(true)", python: "import gc\ngc.collect()" } },
+    { ...traced("hygiene-gc-trim", { trace: false }), warm: [], lazy: null, hygiene: { bun: "Bun.gc(true)\nBun.shrink()", python: "import ctypes, gc\ngc.collect()\nctypes.CDLL(\"libc.so.6\").malloc_trim(0)" } },
+  ],
   // G-2: upstream's warm restore with the page cache dropped, holding all but the image, and kept,
   // the disk and pressure sampled through each.
   evicted: [{ ...TUNED, name: "evicted", variant: "evicted", live: false, fetch: false, lazy: null, sampleIO: true, warm: [{ variant: "evicted-dropped", cache: "dropped" }, { variant: "evicted", cache: "evicted" }, { variant: "evicted-kept", cache: "kept" }] }],
@@ -340,10 +379,10 @@ async function prepareRootfs(image: string): Promise<void> {
   await run("docker", ["rm", container]);
 }
 
-/** The bundle of an instance whose /attach is `attach`, in `dir`: the runner systems' spec, its cgroup named. */
-function writeBundle(dir: string, id: string, attach: string): void {
+/** The bundle of an instance whose /attach is `attach`, in `dir`: the runner systems' spec, its cgroup named, the setup's environment and server's node flags. */
+function writeBundle(dir: string, id: string, attach: string, setup: Setup): void {
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "config.json"), JSON.stringify(config({ rootfs: ROOTFS, attach, netns: `/var/run/netns/${NETNS}`, port: PORT, cgroupsPath: `/gvbench/${id}` }), null, 2));
+  writeFileSync(join(dir, "config.json"), JSON.stringify(config({ rootfs: ROOTFS, attach, netns: `/var/run/netns/${NETNS}`, port: PORT, cgroupsPath: `/gvbench/${id}`, env: setup.env, nodeFlags: setup.nodeFlags }), null, 2));
 }
 
 const cgroupDir = (id: string) => `/sys/fs/cgroup/gvbench/${id}`;
@@ -678,10 +717,49 @@ interface Gaps {
 }
 
 /**
- * A save: `runsc checkpoint` into the run's staging directory (live: `--leave-running`, the
- * fixture's window around it), then the image uploaded; done when its last object is in.
+ * X-IDLE: the instance, idle since its setup, saved live, then live again after each of
+ * setup.idleSaves, each save incremental over the one before (`--parent-image-path`, with the
+ * dirty tracking the setup's flags turn on): a line per incremental save, of variant
+ * `<variant>-idle-<seconds>s`, saying the bytes it wrote. Returns the instance's saves so far.
  */
-async function save(setup: Setup, logDir: string, p: Paths, live: boolean, mark?: () => Promise<unknown>, gaps?: () => Promise<Gaps>) {
+async function idleSaves(job: Job, setup: Setup, logDir: string, p: Paths, at: { fixture: string; size: number; run: number }, saves: number): Promise<number> {
+  const checkpoint = (image: string, parent?: string) =>
+    runsc(setup, logDir, ["checkpoint", `--image-path=${image}`, "--leave-running", ...(parent === undefined ? [] : [`--parent-image-path=${parent}`]), ...setup.checkpoint, `--save-restore-exec-argv=${HOOK.join(" ")}`, p.id]);
+  let parent = join(p.dir, "idle-0");
+  await checkpoint(parent);
+  saves++;
+  for (const [index, seconds] of setup.idleSaves.entries()) {
+    const variant = `${setup.variant}-idle-${seconds}s`;
+    const image = join(p.dir, `idle-${index + 1}`);
+    try {
+      await sleep(seconds * 1000);
+      const t0 = now();
+      await checkpoint(image, parent);
+      const t1 = now();
+      const pause = savePause(bootLog(logDir), saves++, true);
+      emit(job, rowOf(job.common, setup, at, variant, "save-live", {
+        ok: true,
+        failure: null,
+        metrics: { save_total_ms: msBetween(t0, t1), pause_reported_ms: pause.ms, precopy_passes: 0, precopy_bytes: 0, image_bytes: dirBytes(image), uploaded_bytes: null },
+        details: { idle_s: seconds, parent: `idle-${index}`, files: dirFiles(image), sentry: pause.lines },
+      }));
+      rmSync(parent, { recursive: true, force: true });
+      parent = image;
+    } catch (error) {
+      emit(job, rowOf(job.common, setup, at, variant, "save-live", failed(error)));
+      break;
+    }
+  }
+  rmSync(parent, { recursive: true, force: true });
+  return saves;
+}
+
+/**
+ * A save, the instance's `nth`: `runsc checkpoint` into the run's staging directory (live:
+ * `--leave-running`, the fixture's window around it), then the image uploaded; done when its
+ * last object is in.
+ */
+async function save(setup: Setup, logDir: string, p: Paths, live: boolean, nth: number, mark?: () => Promise<unknown>, gaps?: () => Promise<Gaps>) {
   const image = live ? p.live : p.stop;
   const prefix = `${p.prefix}${live ? "live" : "stop"}/`;
   const before = await bucketBytes(prefix);
@@ -692,7 +770,7 @@ async function save(setup: Setup, logDir: string, p: Paths, live: boolean, mark?
   const upload = await s3<{ files: number; bytes: number }>(["upload", image, prefix]);
   const t1 = now();
   const window = await gaps?.();
-  const pause = savePause(bootLog(logDir), live ? 0 : 1, live);
+  const pause = savePause(bootLog(logDir), nth, live);
   return {
     ok: true,
     failure: null,
@@ -721,7 +799,7 @@ async function oneRun(job: Job, setup: Setup, fixture: string, size: number, run
   rmSync(p.dir, { recursive: true, force: true });
   rmSync(p.logs, { recursive: true, force: true });
   await makeAttach(p.attach);
-  writeBundle(p.bundle, p.id, p.attach);
+  writeBundle(p.bundle, p.id, p.attach, setup);
   const logDir = join(p.logs, "instance");
   mkdirSync(logDir, { recursive: true });
   if (setup.hostSettings === "check") putHostSettings(job.runnerSettings);
@@ -729,6 +807,10 @@ async function oneRun(job: Job, setup: Setup, fixture: string, size: number, run
   let sessionId = "";
   let stopped: string | null = null;
   let settings: Record<string, string> = {};
+  // The instance's saves so far, which its Sentry's log numbers.
+  let saves = 0;
+  // V8's heap statistics in a node the instance starts, as its bayma's server sees them.
+  let serverHeap: unknown = null;
   const saved = (result: Awaited<ReturnType<typeof save>>) => ({ ...result, details: { ...result.details, host_settings: settings } });
   await netUp();
   try {
@@ -739,20 +821,24 @@ async function oneRun(job: Job, setup: Setup, fixture: string, size: number, run
     sessionId = ready.session_id;
 
     if (pauseCheck) await checkPause(setup, logDir, p.id, sessionId, fixture);
+    if (setup.heapStats) serverHeap = JSON.parse((await runsc(setup, logDir, ["exec", p.id, "node", "-e", "console.log(JSON.stringify(require('v8').getHeapStatistics()))"])).stdout.trim());
 
     if (setup.live) {
       try {
         const mark = () => driver("mark", ["--session", sessionId, "--fixture", fixture]);
         const gaps = () => driver<Gaps>("gaps", ["--session", sessionId, "--fixture", fixture]);
-        emit(job, rowOf(job.common, setup, at, variant, "save-live", saved(await save(setup, logDir, p, true, mark, gaps))));
+        emit(job, rowOf(job.common, setup, at, variant, "save-live", saved(await save(setup, logDir, p, true, saves++, mark, gaps))));
       } catch (error) {
         emit(job, rowOf(job.common, setup, at, variant, "save-live", failed(error)));
       } finally {
         rmSync(p.live, { recursive: true, force: true });
       }
     }
+    if (setup.idleSaves.length > 0) saves = await idleSaves(job, setup, logDir, p, at, saves);
+    const hygiene = setup.hygiene === null ? null : await driver<{ exec_ms: number }>("run", ["--session", sessionId, "--code", setup.hygiene[fixture.startsWith("repl-python") ? "python" : "bun"]]);
     try {
-      emit(job, rowOf(job.common, setup, at, variant, "save-stop", saved(await save(setup, logDir, p, false))));
+      const result = saved(await save(setup, logDir, p, false, saves++));
+      emit(job, rowOf(job.common, setup, at, variant, "save-stop", { ...result, details: { ...result.details, ...(hygiene === null ? {} : { hygiene_exec_ms: hygiene.exec_ms }), ...(serverHeap === null ? {} : { server_heap: serverHeap }) } }));
     } catch (error) {
       stopped = error instanceof Error ? error.message : String(error);
       emit(job, rowOf(job.common, setup, at, variant, "save-stop", failed(error)));

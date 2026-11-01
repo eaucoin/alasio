@@ -6,6 +6,7 @@
  *   node driver.mjs mark   --url U [--header ...] --session S --fixture F
  *   node driver.mjs gaps   --url U [--header ...] --session S --fixture F
  *   node driver.mjs probe  --url U [--header ...] --session S --fixture F --run-id R [--t0-ns T] [--verify-after-ms M]
+ *   node driver.mjs run    --url U [--header ...] --session S --code C
  *   node driver.mjs close  --url U [--header ...] --session S
  *   node driver.mjs now
  *
@@ -56,6 +57,7 @@ interface ExecAnswer {
   readonly done?: boolean;
   readonly next_seq?: number;
   readonly stdout_text?: string;
+  readonly stderr_text?: string;
   readonly error_text?: string;
   readonly notice?: string;
 }
@@ -101,25 +103,27 @@ class Bayma {
     return (result.structuredContent as T | undefined) ?? (JSON.parse(text) as T);
   }
 
-  /** Runs `code` to its end: its stdout whole, and bayma's notice, if it gave one. */
-  async exec(sessionId: string, code: string): Promise<{ readonly stdout: string; readonly notice: string | null }> {
+  /** Runs `code` to its end: its stdout and stderr whole, and bayma's notice, if it gave one. */
+  async exec(sessionId: string, code: string): Promise<{ readonly stdout: string; readonly stderr: string; readonly notice: string | null }> {
     let answer = await this.call<ExecAnswer>("exec", { session_id: sessionId, code, yield_time_ms: 300_000 });
     let stdout = answer.stdout_text ?? "";
+    let stderr = answer.stderr_text ?? "";
     const notice = answer.notice ?? null;
     while (answer.done === false) {
       answer = await this.call<ExecAnswer>("wait", { session_id: sessionId, exec_id: answer.exec_id, from_seq: answer.next_seq, yield_time_ms: 300_000 });
       stdout += answer.stdout_text ?? "";
+      stderr += answer.stderr_text ?? "";
     }
     if (answer.error_text) throw new Error(`the exec failed: ${answer.error_text}${notice === null ? "" : `; bayma's notice: ${notice}`}`);
-    return { stdout, notice };
+    return { stdout, stderr, notice };
   }
 
-  /** Runs `code`, which prints `BENCH:<json>`, and parses that line. */
-  async bench<T>(sessionId: string, code: string): Promise<{ readonly value: T; readonly notice: string | null }> {
-    const { stdout, notice } = await this.exec(sessionId, code);
+  /** Runs `code`, which prints `BENCH:<json>`, and parses that line; with the exec's stderr. */
+  async bench<T>(sessionId: string, code: string): Promise<{ readonly value: T; readonly stderr: string; readonly notice: string | null }> {
+    const { stdout, stderr, notice } = await this.exec(sessionId, code);
     const line = stdout.split("\n").findLast((each) => each.startsWith("BENCH:"));
     if (line === undefined) throw new Error(`the exec printed no result: ${stdout.slice(-2000)}`);
-    return { value: JSON.parse(line.slice("BENCH:".length)) as T, notice };
+    return { value: JSON.parse(line.slice("BENCH:".length)) as T, stderr, notice };
   }
 
   close(): Promise<void> {
@@ -226,7 +230,7 @@ const saysClosed = (notice: string | null): boolean => notice !== null && /conne
 export async function probe(endpoint: Endpoint, sessionId: string, fixture: Fixture, runId: string, t0 = now(), verifyAfterMs = 0) {
   return controlling(endpoint, sessionId, async (bayma) => {
     const connected = now();
-    const { value: first, notice } = await bayma.bench<Record<string, unknown>>(sessionId, call(fixture, "first"));
+    const { value: first, stderr: firstStderr, notice } = await bayma.bench<Record<string, unknown>>(sessionId, call(fixture, "first"));
     const firstEnd = now();
     await sleep(verifyAfterMs);
     const { value: verified } = await bayma.bench<Verified>(sessionId, call(fixture, "verify"));
@@ -258,10 +262,20 @@ export async function probe(endpoint: Endpoint, sessionId: string, fixture: Fixt
       correctness: { marker, memory: verified.memory, children: verified.children, file: verified.file, socket, running: verified.running, notice, notice_agrees: noticeAgrees },
       workload_rss_bytes: verified.rss_bytes,
       first,
+      // What the runtime wrote to stderr in the first exec, as a runtime's own collector logs there.
+      first_stderr: firstStderr.slice(-8192),
       verified,
     };
   }, Bayma.connectWhenUp);
 }
+
+/** Runs `code` in `sessionId`, taking it over: how long it took, and its stdout. */
+export const runCode = (endpoint: Endpoint, sessionId: string, code: string) =>
+  controlling(endpoint, sessionId, async (bayma) => {
+    const started = now();
+    const { stdout } = await bayma.exec(sessionId, code);
+    return { exec_ms: ms(started, now()), stdout: stdout.slice(-8192) };
+  });
 
 export async function close(endpoint: Endpoint, sessionId: string): Promise<Record<string, unknown>> {
   const bayma = await Bayma.connect(endpoint);
@@ -311,6 +325,7 @@ async function main(argv: readonly string[]): Promise<unknown> {
       session: { type: "string" },
       "t0-ns": { type: "string" },
       "verify-after-ms": { type: "string", default: "0" },
+      code: { type: "string" },
     },
   });
   if (command === "now") return { now_ns: String(now()) };
@@ -330,8 +345,9 @@ async function main(argv: readonly string[]): Promise<unknown> {
   if (command === "probe") {
     return probe(endpoint, sessionId, fixtureOf(values.fixture), required(values["run-id"], "run-id"), values["t0-ns"] ? BigInt(values["t0-ns"]) : now(), Number(values["verify-after-ms"]));
   }
+  if (command === "run") return runCode(endpoint, sessionId, required(values.code, "code"));
   if (command === "close") return close(endpoint, sessionId);
-  throw new Error(`no command ${command}: setup, mark, gaps, probe, close or now`);
+  throw new Error(`no command ${command}: setup, mark, gaps, probe, run, close or now`);
 }
 
 // Run as a program, not imported, nor bundled into another's (../driver/build.ts).

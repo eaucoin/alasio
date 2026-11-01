@@ -60,6 +60,19 @@ with the page cache dropped (`evicted-dropped`), holding all but the image's fil
 and kept (`evicted-kept`), the host's disks and pressure sampled every 200 ms through each
 (`logs/<run>/<restore>.io.txt`).
 
+Variants on the fork's build without the trace, for bayma's runtimes: `traced-gc` logs
+JavaScriptCore's collections (`BUN_JSC_logGC=1`, in the first exec's stderr, `first_stderr` in
+the probe's details) and the server's V8 collections and memory reducer (`--trace-gc
+--trace-memory-reducer`, in the restore's output), and records the V8 heap's limits a node sees
+in the sandbox (`server_heap` on save-stop's line); the realistic fixtures' first exec says the
+Python collections since the exec before and how far the monotonic and wall clocks moved (X-FIRST,
+X-SRV). `idle` saves an idle instance live, then live and incrementally after 5, 30 and 120 s, a
+`save-live` line of variant `<setup>-idle-<s>s` each, as the instance comes and with
+`BUN_GC_TIMER_DISABLE=1 MIMALLOC_PURGE_HOLES=0` (`idle-quiet`; X-IDLE). `hygiene` saves and stops
+it as it comes, with `MIMALLOC_PURGE_DELAY=0 PYTHONMALLOC=malloc`, and after an exec that collects
+(`Bun.gc(true)`; `gc.collect()`) or also shrinks the heap or trims the allocator
+(`Bun.shrink()`; `malloc_trim(0)`), whose time save-stop's line says (X-HYG).
+
 ## What is measured, and how
 
 - `pause_reported_ms`: runsc's boot log (`--debug-log`; `pkg/sentry/state/state.go`), from the
