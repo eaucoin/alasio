@@ -264,7 +264,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/candidate/release" "$RUNNER_TEMP/candidate/serve"
           gh run download "$RUN" -R eaucoin/gvisor -n "release-$SHA" -D "$RUNNER_TEMP/candidate/release"
           chmod -R a+rx "$RUNNER_TEMP/candidate/release"
-          tar -C "$RUNNER_TEMP/candidate/release" --zstd -cf "$RUNNER_TEMP/candidate/serve/gvisor-x86_64.tar.zstd" .
+          # Entries named as the release's own archive names them, without "./" (cli/src/cluster/node.ts InstallGvisor).
+          tar -C "$RUNNER_TEMP/candidate/release" --zstd -cf "$RUNNER_TEMP/candidate/serve/gvisor-x86_64.tar.zstd" runsc containerd-shim-runsc-v1 gvisor-bin
           "$RUNNER_TEMP/candidate/release/runsc" --version
           sum=$(sha512sum "$RUNNER_TEMP/candidate/serve/gvisor-x86_64.tar.zstd" | cut -d' ' -f1)
           jq --arg sum "$sum" '.gvisor.releases[0].sha512 = $sum' cluster/node/pins.json >"$RUNNER_TEMP/pins.json" && mv "$RUNNER_TEMP/pins.json" cluster/node/pins.json
