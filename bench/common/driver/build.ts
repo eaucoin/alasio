@@ -12,7 +12,7 @@ const sources = Object.fromEntries(fixtures.map((name) => [name, readFileSync(ne
 const path = (relative: string) => new URL(relative, import.meta.url).pathname;
 
 await build({
-  entryPoints: { driver: path("./driver.ts"), probe: path("../store/probe.ts"), s3: path("../store/s3.ts") },
+  entryPoints: { driver: path("./driver.ts"), probe: path("../store/probe.ts"), s3: path("../store/s3.ts"), sweep: path("../store/sweep.ts") },
   outdir: path("../dist"),
   outExtension: { ".js": ".mjs" },
   bundle: true,

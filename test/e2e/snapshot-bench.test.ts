@@ -26,7 +26,7 @@
  */
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, before, test } from "node:test";
 
 import type { V1Deployment, V1Pod, V1Service } from "@kubernetes/client-node";
@@ -38,9 +38,11 @@ import { GATEWAY as STORE_GATEWAY } from "../../cli/src/manifests/object-store.t
 import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { BINDING_LABEL, FREE_LABEL, keyHash, leaseName, POOL_LABEL } from "../../src/binder/names.ts";
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
+import { LAYERS_DIR } from "../../src/node-agent/cache.ts";
 import { BAYMA_CONTAINER, RESTORE_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
 import { compactionDue, type Manifest } from "../../src/node-agent/agent.ts";
-import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT } from "../../src/node-agent/names.ts";
+import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
+import { runscFlags } from "../../src/node-agent/runsc.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { bindSession, boundPodOf, dumpClusterState, gatewayCall, kube, lakeQuery, mainToken, nodeAgents, onNode, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
 
@@ -72,8 +74,12 @@ const VARIANT = variable("BENCH_VARIANT");
  * `settled` waits until it ends before the warm restore, and `kept-cache` leaves the node's page
  * cache as it is for the warm restore.
  */
-const SPIKE_VARIANTS = ["no-compaction", "settled", "kept-cache"];
-if (VARIANT !== "as-shipped" && VARIANT !== "with-fix" && VARIANT !== "whole" && !SPIKE_VARIANTS.includes(VARIANT)) throw new Error(`BENCH_VARIANT is ${VARIANT}, not as-shipped, with-fix or whole`);
+const SPIKE_VARIANTS = ["no-compaction", "settled", "kept-cache", "mixed", "mixed-iocost"];
+/** Spike: `chain-N`, as-shipped but N - 1 live saves taken, each a delta of the one before, so that the release's delta makes a chain of N images (endpoint E16). */
+const CHAIN = /^chain-([0-9]+)$/u.exec(VARIANT);
+if (VARIANT !== "as-shipped" && VARIANT !== "with-fix" && VARIANT !== "whole" && !SPIKE_VARIANTS.includes(VARIANT) && !CHAIN) throw new Error(`BENCH_VARIANT is ${VARIANT}, not as-shipped, with-fix or whole`);
+/** The live saves a run takes before its release. */
+const LIVE_SAVES = CHAIN ? Number(CHAIN[1]) - 1 : 1;
 const COMMON = new URL("../../bench/common/", import.meta.url);
 const read = (relative: string): string => readFileSync(new URL(relative, COMMON), "utf8");
 const PROFILES = JSON.parse(read("store/profiles.json")) as Record<string, { readonly emulated: boolean }>;
@@ -145,9 +151,9 @@ function emit(fixture: string, sizeMib: number, run: number, phase: string, outc
 
 const alasioPod = () => kube.runningPod(NAMESPACE, RELEASE);
 
-/** Copies `file` of bench/common/dist into the container of the pod, as IN_POD/<file>. */
+/** Copies `file` of bench/common/dist into the container of the pod, as IN_POD/<file>, renamed into place, so that a driver another run of it started meanwhile reads it whole. */
 async function copyIn(pod: string, container: string, file: string): Promise<void> {
-  await kube.execOk(NAMESPACE, pod, ["sh", "-c", `mkdir -p ${IN_POD} && cat > ${IN_POD}/${file}`], { container, stdin: read(`dist/${file}`) });
+  await kube.execOk(NAMESPACE, pod, ["sh", "-c", `mkdir -p ${IN_POD} && cat > ${IN_POD}/.${file}.$$ && mv ${IN_POD}/.${file}.$$ ${IN_POD}/${file}`], { container, stdin: read(`dist/${file}`) });
 }
 
 /** Runs the driver's `command` in alasio's pod, of the workspace `workspace`, through the gateway: what it printed. */
@@ -486,7 +492,7 @@ async function restore(node: string, workspace: string, sessionId: string, fixtu
     page_cache: kind === "cold" ? "dropped" : PAGE_CACHE,
     compaction_at_t0: compactionAtT0(spike.steps),
   };
-  const details = { pod: name, node, source, prepared, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(), spike };
+  const details = { pod: name, node, source, prepared, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(), spike };
   return { probed, metrics, details, pod: name };
 }
 
@@ -734,6 +740,78 @@ async function sayRunner(name: string): Promise<void> {
   appendFileSync(join(BENCH_DIR, "logs", `failure-${name}.txt`), said);
 }
 
+/** Spike: whether the run's restores run beside another session's release and restore (endpoint E6): `mixed`, as shipped; `mixed-iocost`, with blk-iocost on (ioCost). */
+const MIXED = VARIANT === "mixed" || VARIANT === "mixed-iocost";
+/** Spike: the background session of a mixed run: a whole-heap writer, whose release's delta makes its chain due to be compacted. */
+const BACKGROUND = { fixture: "saturating", sizeMib: 1024 } as const;
+
+/** Spike: a mixed run's background session, set up and saved live once, so that its release is a delta: its workspace and session. */
+async function background(runId: string): Promise<{ readonly workspace: string; readonly sessionId: string; readonly node: string }> {
+  const workspace = `fs-${randomBytes(6).toString("hex")}`;
+  const created = await gatewayCall(await mainToken(workspace), "POST", "/workspace");
+  if (created.status !== 204) throw new Error(`the gateway made no background workspace: ${created.status} ${created.said}`);
+  await bindSession(workspace);
+  const { session_id: sessionId } = await driver<{ readonly session_id: string }>(workspace, "setup", "--fixture", BACKGROUND.fixture, "--size-mib", String(BACKGROUND.sizeMib), "--run-id", `${runId}-background`, "--rate-mib-s", String(HOST.copy_mib_s), "--workspace", "/workspace");
+  const bound = await boundPodOf(workspace);
+  if (!bound) throw new Error(`no pod is bound to the background ${workspace}`);
+  const pod = await podNamed(bound.name);
+  const bayma = pod.spec?.containers.find(({ name }) => name === BAYMA_CONTAINER);
+  const hook = bayma ? hookOf(bayma) : null;
+  const stateDir = bayma ? stateDirOf(bayma) : null;
+  if (!hook || !stateDir) throw new Error(`the background pod ${bound.name} runs no bayma with a state directory`);
+  const request = { environment: SESSIONS, workspace, namespace: SESSIONS, pod: bound.name, containerId: containerIdOf(pod), hook, podTemplate: await poolTemplate(pod), live: { stateDir } };
+  const asking = join(BENCH_DIR, "checkpoint.cjs");
+  const asked = join(BENCH_DIR, "checkpoint-background.json");
+  writeFileSync(asking, CHECKPOINT);
+  writeFileSync(asked, JSON.stringify(request));
+  await inAgentNetwork(bound.node, [asking, String(NODE_AGENT_PORT), SESSIONS, workspace, asked]);
+  return { workspace, sessionId, node: bound.node };
+}
+
+/** Spike: what of a promise's work came: its value or its error's text, and when it ended, in milliseconds from `t0`. */
+const settledFrom = <T>(work: Promise<T>, t0: number) =>
+  work.then((value) => ({ ok: true, value, ended_ms: Date.now() - t0 }), (error: unknown) => ({ ok: false, value: errorText(error), ended_ms: Date.now() - t0 }));
+
+/**
+ * Spike: blk-iocost on for the node's disk that holds /var/lib (the node's cache, the store's
+ * volumes and k3s), its cost model measured there by fio, not the kernel's default for its kind,
+ * its QoS the kernel's defaults; and the node agents' and the store's pods weighted 10 to the
+ * sandboxes' 100, the io controller enabled down to them. What it set, in logs/iocost.txt.
+ */
+async function ioCost(node: string): Promise<void> {
+  const uids = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE })).filter(({ metadata }) => /seaweedfs|node-agent/u.test(metadata?.name ?? "")).map(({ metadata }) => metadata?.uid ?? "");
+  const script = [
+    "set -eu",
+    "disk=$(lsblk -no PKNAME \"$(findmnt -no SOURCE --target /var/lib)\" | head -n 1)",
+    "[ -n \"$disk\" ] || disk=$(basename \"$(findmnt -no SOURCE --target /var/lib)\")",
+    "dev=$(cat /sys/block/$disk/dev)",
+    "echo \"disk $disk $dev rotational $(cat /sys/block/$disk/queue/rotational) scheduler $(cat /sys/block/$disk/queue/scheduler)\"",
+    "command -v fio >/dev/null || apt-get install -y -qq fio >/dev/null",
+    "f=/var/lib/bench-iocost.fio",
+    "run() { fio --name=m --filename=$f --size=2G --direct=1 --ioengine=libaio --runtime=8 --time_based --output-format=json \"$@\" | python3 -c 'import json,sys; j=json.load(sys.stdin)[\"jobs\"][0]; print(int(j[\"read\"][\"bw_bytes\"]+j[\"write\"][\"bw_bytes\"]), int(j[\"read\"][\"iops\"]+j[\"write\"][\"iops\"]))'; }",
+    "set -- $(run --rw=read --bs=1M --iodepth=32); rbps=$1",
+    "set -- $(run --rw=read --bs=4k --iodepth=32); rseqiops=$2",
+    "set -- $(run --rw=randread --bs=4k --iodepth=32); rrandiops=$2",
+    "set -- $(run --rw=write --bs=1M --iodepth=32); wbps=$1",
+    "set -- $(run --rw=write --bs=4k --iodepth=32); wseqiops=$2",
+    "set -- $(run --rw=randwrite --bs=4k --iodepth=32); wrandiops=$2",
+    "rm -f $f",
+    "echo \"$dev ctrl=user model=linear rbps=$rbps rseqiops=$rseqiops rrandiops=$rrandiops wbps=$wbps wseqiops=$wseqiops wrandiops=$wrandiops\" > /sys/fs/cgroup/io.cost.model",
+    "echo \"$dev enable=1\" > /sys/fs/cgroup/io.cost.qos",
+    "echo model; cat /sys/fs/cgroup/io.cost.model; echo qos; cat /sys/fs/cgroup/io.cost.qos",
+    `for uid in ${uids.join(" ")}; do`,
+    "  dir=$(find /sys/fs/cgroup -maxdepth 6 -type d \\( -name \"*pod$uid*\" -o -name \"*pod$(echo $uid | tr - _)*\" \\) | head -n 1)",
+    "  [ -n \"$dir\" ] || continue",
+    "  up=$(dirname \"$dir\"); chain=\"\"; while [ \"$up\" != /sys/fs/cgroup ]; do chain=\"$up $chain\"; up=$(dirname \"$up\"); done",
+    "  for each in /sys/fs/cgroup $chain; do grep -qw io \"$each/cgroup.subtree_control\" || echo +io > \"$each/cgroup.subtree_control\"; done",
+    "  echo \"default 10\" > \"$dir/io.weight\"",
+    "  echo \"weight $dir $(cat $dir/io.weight | head -n 1)\"",
+    "done",
+  ].join("\n");
+  writeFileSync(join(BENCH_DIR, "iocost.sh"), script);
+  appendFileSync(join(BENCH_DIR, "logs", "iocost.txt"), await onNode(node, `sh ${join(BENCH_DIR, "iocost.sh")} 2>&1`));
+}
+
 /** One run of a case, every phase of it written, as the module says; what fails is written as failed, and the run goes on to its cleanup. */
 async function runOnce(fixture: string, sizeMib: number, run: number): Promise<void> {
   const workspace = `fs-${randomBytes(6).toString("hex")}`;
@@ -743,12 +821,15 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
   let phase = "setup";
   const done = new Set<string>();
   let node = "";
+  let behind: Awaited<ReturnType<typeof background>> | null = null;
   try {
     const created = await gatewayCall(await mainToken(workspace), "POST", "/workspace");
     if (created.status !== 204) throw new Error(`the gateway made no workspace: ${created.status} ${created.said}`);
     await bindSession(workspace);
     const setup = await driver<{ readonly session_id: string }>(workspace, "setup", "--fixture", fixture, "--size-mib", String(sizeMib), "--run-id", runId, "--rate-mib-s", String(HOST.copy_mib_s), "--workspace", "/workspace");
     const sessionId = setup.session_id;
+    // Spike: a mixed run's background session, beside the run's own.
+    behind = MIXED ? await background(runId) : null;
 
     phase = "save-live";
     const bound = await boundPodOf(workspace);
@@ -768,8 +849,10 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const sandboxId = await sandboxIdOf(node, bound.name);
     const heldBefore = await bucketBytes(node, workspace);
     let heldLive = heldBefore;
-    // No live save of `whole`, whose release saves the session whole.
-    if (VARIANT !== "whole") {
+    // No live save of `whole`, whose release saves the session whole; a chain-N's N - 1, each a delta of the one before, all but the last written in its details.
+    const lives: Record<string, unknown>[] = [];
+    for (let saved = 1; VARIANT !== "whole" && saved <= LIVE_SAVES; saved++) {
+      const heldBeforeSave = heldLive;
       await driver(workspace, "mark", "--session", sessionId, "--fixture", fixture);
       const asking = join(BENCH_DIR, "checkpoint.cjs");
       const asked = join(BENCH_DIR, "checkpoint-request.json");
@@ -788,23 +871,28 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
       const liveSteps = await traced(node, workspace, liveT0);
       const logged = { state_dir: request.live.stateDir, logged: liveLogged.said, gaps, pause_split: liveLogged.split, t0_wall_ms: liveT0, end_wall_ms: Date.now(), spike: { steps: liveSteps } };
       const measured = {
-        unavailable_ms: gaps.max_gap_ms, pause_reported_ms: liveLogged.pauseMs, slowdown: gaps.slowdown, precopy_passes: liveLogged.passes, precopy_bytes: liveLogged.precopyBytes, uploaded_bytes: heldLive - heldBefore,
+        unavailable_ms: gaps.max_gap_ms, pause_reported_ms: liveLogged.pauseMs, slowdown: gaps.slowdown, precopy_passes: liveLogged.passes, precopy_bytes: liveLogged.precopyBytes, uploaded_bytes: heldLive - heldBeforeSave,
         kernel_save_ms: liveLogged.kernelMs, memory_save_ms: liveLogged.memoryMs, overall_save_ms: liveLogged.overallMs, store_sent_bytes: liveSentBytes,
       };
       if (checkpointed.code === 0) {
         const live = JSON.parse(checkpointed.stdout.trim().split("\n").at(-1) ?? "{}") as { readonly ms: number; readonly manifest: Manifest };
         const imageBytes = live.manifest.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null;
+        if (saved < LIVE_SAVES) {
+          lives.push({ ...measured, save_total_ms: live.ms, image_bytes: imageBytes, chain: live.manifest.layers.length, snapshot: live.manifest.snapshot });
+          continue;
+        }
         emit(fixture, sizeMib, run, "save-live", { ok: true, failure: null }, {
           ...measured,
           save_total_ms: live.ms,
           image_bytes: imageBytes,
           durable_store_ms: stepAt(liveSteps, "agent checkpoint-committed"),
           uploaded_over_needed: imageBytes ? liveSentBytes / imageBytes : null,
-        }, NO_CHECKS, { ...logged, snapshot: live.manifest.snapshot, runsc_checkpoint_ms: live.manifest.pauseMs, upload_ms: live.manifest.uploadMs, chain: live.manifest.layers.length });
+        }, NO_CHECKS, { ...logged, snapshot: live.manifest.snapshot, runsc_checkpoint_ms: live.manifest.pauseMs, upload_ms: live.manifest.uploadMs, chain: live.manifest.layers.length, lives });
       } else {
         // As alasio 10.0.0 fails it (mountedStateDir): its sandbox saved and running on, the snapshot never committed.
         const said = /"error":"([^"]*)"/u.exec(checkpointed.stderr)?.[1] ?? checkpointed.stderr.trim().split("\n").at(-1) ?? "";
-        emit(fixture, sizeMib, run, "save-live", { ok: false, failure: `the node agent's live checkpoint failed: ${said}` }, measured, NO_CHECKS, logged);
+        emit(fixture, sizeMib, run, "save-live", { ok: false, failure: `the node agent's live checkpoint failed: ${said}` }, measured, NO_CHECKS, { ...logged, lives });
+        break;
       }
     }
     done.add(phase);
@@ -857,8 +945,12 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     if (PAGE_CACHE === "dropped") await dropPageCache(node);
     // What the agent sent the store from the release's end on, before the warm restore: the release's compaction's upload, where one ran.
     const compactionSent = (await storeBytes(node)).sent - stopSent - stopSentBytes;
+    // Spike: a mixed run's warm restore beside the background session's release, its checkpoint, upload and compaction, begun half a second before.
+    const warmBeside = behind === null ? null : settledFrom(release(behind.workspace), Date.now());
+    if (warmBeside !== null) await sleep(500);
     const warm = await restore(node, workspace, sessionId, fixture, runId, manifest, "warm");
-    emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, { ...warm.details, compaction_sent_bytes: compactionSent, spike: { ...warm.details.spike, compaction } });
+    const mixedWarm = warmBeside === null ? null : { beside: "release", ...(await warmBeside) };
+    emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, { ...warm.details, compaction_sent_bytes: compactionSent, mixed: mixedWarm, spike: { ...warm.details.spike, compaction } });
     done.add(phase);
     await endUnsaved(workspace, warm.pod);
 
@@ -869,8 +961,11 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     await inAgentNetwork(node, [new URL("dist/s3.mjs", COMMON).pathname, "copy", `${SESSIONS}/${workspace}/manifests/${manifest.snapshot}.json`, `${SESSIONS}/${workspace}/current.json`]);
     await agentOk(node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: manifest.snapshot, release: manifest.release });
     await coldCaches(workspace);
+    // Spike: a mixed run's cold restore beside the background session's restore, from the node's cache, begun as it is.
+    const coldBeside = behind === null ? null : settledFrom(driver(behind.workspace, "probe", "--session", behind.sessionId, "--fixture", BACKGROUND.fixture, "--run-id", `${runId}-background`), Date.now());
     const cold = await restore(node, workspace, sessionId, fixture, runId, manifest, "cold");
-    emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, cold.details);
+    const mixedCold = coldBeside === null ? null : { beside: "restore", ...(await coldBeside) };
+    emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, { ...cold.details, mixed: mixedCold });
     done.add(phase);
     await endUnsaved(workspace, cold.pod);
   } catch (error) {
@@ -898,6 +993,16 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     }
     if (removed.status !== 204) console.error(`# ${workspace} was not removed: ${removed.status} ${removed.said}`);
     if (node !== "") await agentApi(node, "DELETE", `/workspaces/${SESSIONS}/${copy}`).catch(() => {});
+    // Spike: a mixed run's background session ended unsaved and forgotten with its workspace.
+    if (behind !== null) {
+      const backgroundPod = await boundPodOf(behind.workspace).catch(() => null);
+      if (backgroundPod) await endUnsaved(behind.workspace, backgroundPod.name).catch(() => {});
+      const forgotten = behind.workspace;
+      for (const deadline = Date.now() + 300_000; Date.now() < deadline; await sleep(3000)) {
+        const said = await mainToken(forgotten).then((token) => gatewayCall(token, "DELETE", "/workspace")).catch((error: unknown) => ({ status: 0, said: errorText(error) }));
+        if (said.status !== 409) break;
+      }
+    }
     await vacuum().catch((error: unknown) => console.error(`# the store was not compacted after ${workspace}: ${errorText(error)}`));
   }
 }
@@ -995,6 +1100,126 @@ async function shapeAgents(): Promise<void> {
   }
 }
 
+/** What the job runs: `runs`, every case's runs, as the module says; or `store`, the store's own experiments alone (storeExperiments). */
+const MODE = process.env["BENCH_MODE"] || "runs";
+if (MODE !== "runs" && MODE !== "store") throw new Error(`BENCH_MODE is ${MODE}, not runs or store`);
+
+/** Spike: the CPU time the cgroup of the pod of uid `uid` on `node` has used, in microseconds, or null. */
+async function podCpuUs(node: string, uid: string): Promise<number | null> {
+  const printed = await onNode(node, [
+    `dir=$(find /sys/fs/cgroup -maxdepth 6 -type d \\( -name '*pod${uid}*' -o -name '*pod${uid.replaceAll("-", "_")}*' \\) | head -n 1)`,
+    `[ -n "$dir" ] && sed -n 's/^usage_usec //p' "$dir/cpu.stat"`,
+  ].join("; ")).catch(() => "");
+  return printed.trim() === "" ? null : Number(printed.trim());
+}
+
+/** Spike: the CPU time each of the store's pods, and each node agent, has used, in microseconds, by pod name. */
+async function storeCpu(node: string): Promise<Record<string, number | null>> {
+  const pods = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE })).filter(({ metadata }) => /seaweedfs|node-agent|valkey/u.test(metadata?.name ?? ""));
+  return Object.fromEntries(await Promise.all(pods.map(async (pod) => [pod.metadata?.name ?? "", await podCpuUs(node, pod.metadata?.uid ?? "")] as const)));
+}
+
+/** Spike: `run` timed, with the CPU each store pod used meanwhile, in seconds. */
+async function withCpu<T>(node: string, run: () => Promise<T>): Promise<{ readonly said: T; readonly seconds: number; readonly cpu_s: Record<string, number | null> }> {
+  const before = await storeCpu(node);
+  const started = Date.now();
+  const said = await run();
+  const seconds = (Date.now() - started) / 1000;
+  const after = await storeCpu(node);
+  const cpu = Object.fromEntries(Object.entries(after).map(([name, used]) => [name, used === null || before[name] === null || before[name] === undefined ? null : (used - (before[name] ?? 0)) / 1e6]));
+  return { said, seconds, cpu_s: cpu };
+}
+
+/**
+ * Spike: whether a delta checkpoint needs of its parent image its pages' metadata alone
+ * (endpoint G-13): a session saved live, whole, by its agent; then, on the node, runsc's own
+ * checkpoint of its sandbox, running on, as a delta of a directory that holds nothing of the
+ * parent (which must fail), then of one that holds the parent's pages_meta.img alone, each traced
+ * for the files it opens; the delta's inspection and layers; and the session ended unsaved.
+ */
+async function parentMetadata(): Promise<Record<string, unknown>> {
+  const workspace = `fs-${randomBytes(6).toString("hex")}`;
+  const created = await gatewayCall(await mainToken(workspace), "POST", "/workspace");
+  if (created.status !== 204) throw new Error(`the gateway made no workspace: ${created.status} ${created.said}`);
+  await bindSession(workspace);
+  try {
+    const { session_id: sessionId } = await driver<{ readonly session_id: string }>(workspace, "setup", "--fixture", "poller", "--size-mib", "64", "--run-id", `parent-metadata-${workspace}`, "--rate-mib-s", String(HOST.copy_mib_s), "--workspace", "/workspace");
+    const bound = await boundPodOf(workspace);
+    if (!bound) throw new Error(`no pod is bound to ${workspace}`);
+    const pod = await podNamed(bound.name);
+    const bayma = pod.spec?.containers.find(({ name }) => name === BAYMA_CONTAINER);
+    const hook = bayma ? hookOf(bayma) : null;
+    const stateDir = bayma ? stateDirOf(bayma) : null;
+    if (!hook || !stateDir) throw new Error(`the pod ${bound.name} runs no bayma with a state directory`);
+    const containerId = containerIdOf(pod);
+    const request = { environment: SESSIONS, workspace, namespace: SESSIONS, pod: bound.name, containerId, hook, podTemplate: await poolTemplate(pod), live: { stateDir } };
+    const asking = join(BENCH_DIR, "checkpoint.cjs");
+    const asked = join(BENCH_DIR, "checkpoint-request.json");
+    writeFileSync(asking, CHECKPOINT);
+    writeFileSync(asked, JSON.stringify(request));
+    const live = JSON.parse(await inAgentNetwork(bound.node, [asking, String(NODE_AGENT_PORT), SESSIONS, workspace, asked])) as { readonly manifest: Manifest };
+    const [layer] = live.manifest.layers;
+    if (!layer || live.manifest.layers.length !== 1) throw new Error(`the live save of ${workspace} is not one whole image: ${live.manifest.layers.length} layers`);
+    const parent = `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/${LAYERS_DIR}/${layer.digest}`;
+    const work = join(BENCH_DIR, "parent-metadata");
+    const release = live.manifest.release;
+    const flags = runscFlags(await onNode(bound.node, `cat ${CONTAINERD}/${gvisorHandler(release)}.toml`));
+    const runsc = [`${gvisorDirectory(release)}/runsc`, `--root=${RUNSC_ROOT}`, ...flags].map((arg) => `'${arg}'`).join(" ");
+    await onNode(bound.node, `mkdir -p ${work}/empty ${work}/metadata-only && cp ${parent}/pages_meta.img ${work}/metadata-only/ && (command -v strace >/dev/null || apt-get install -y -qq strace >/dev/null)`);
+    const parentFiles = (await onNode(bound.node, `cd ${parent} && ls -l`)).trim().split("\n");
+    const deltas: Record<string, unknown> = {};
+    for (const name of ["empty", "metadata-only"]) {
+      const delta = `${work}/delta-${name}`;
+      const said = await onNode(bound.node, `strace -f -qq -e trace=openat,open -o ${work}/strace-${name}.txt ${runsc} checkpoint --image-path=${delta} --compression=none --parent-image-path=${work}/${name} --leave-running ${containerId} 2>&1; echo "exit $?"`);
+      const opened = (await onNode(bound.node, `grep -E '${work}/${name}|${parent}' ${work}/strace-${name}.txt | grep -v ENOENT | sed -E 's/^[0-9]+ +//' | sort -u | head -n 40 || true`)).trim().split("\n").filter(Boolean);
+      const missing = (await onNode(bound.node, `grep -E '${work}/${name}' ${work}/strace-${name}.txt | grep ENOENT | sed -E 's/^[0-9]+ +//' | sort -u | head -n 20 || true`)).trim().split("\n").filter(Boolean);
+      const inspected = await onNode(bound.node, `${runsc} image inspect --json ${delta} 2>&1 | head -c 4000 || true`);
+      const layers = await onNode(bound.node, `${runsc} image layers ${delta} 2>&1 || true`);
+      const files = (await onNode(bound.node, `ls -l ${delta} 2>&1 || true`)).trim().split("\n");
+      deltas[name] = { said: said.trim().split("\n").slice(-5), opened, missing, layers: layers.trim().split("\n"), refers_to_parent: layers.includes(layer.digest), files, inspected: inspected.slice(0, 4000) };
+    }
+    const sandboxLog = saveLogged(await bootLog(bound.node, await sandboxIdOf(bound.node, bound.name)));
+    void sessionId;
+    await endUnsaved(workspace, bound.name);
+    return { workspace, parent: layer.digest, parent_files: parentFiles, deltas, logged: sandboxLog.said };
+  } finally {
+    await mainToken(workspace).then((token) => gatewayCall(token, "DELETE", "/workspace")).catch(() => {});
+  }
+}
+
+/**
+ * Spike: the store's own experiments, for the job's profile: the sweep of alasio's store from the
+ * node agent's network (E12 = G-9), with the CPU its pods used, and its conditional PUTs (E11);
+ * the same sweep of a single SeaweedFS server on the runner, as the other systems' store
+ * (bench/common/store/up.sh), through the same profile; and, on the local profile, whether a
+ * delta needs only its parent's metadata (G-13). Each in logs/store-<what>.json.
+ */
+async function storeExperiments(): Promise<void> {
+  const [node = ""] = (await nodeAgents()).keys();
+  const write = (what: string, value: unknown) => writeFileSync(join(BENCH_DIR, "logs", `store-${what}.json`), `${JSON.stringify(value, null, 1)}\n`);
+  const sweepScript = new URL("dist/sweep.mjs", COMMON).pathname;
+  for (const round of [1, 2, 3]) {
+    write(`sweep-alasio-${round}`, await withCpu(node, async () => JSON.parse(await inAgentNetwork(node, [sweepScript, "sweep", "--prefix", `bench-sweep-${round}/`]))));
+  }
+  write("conditional-alasio", await withCpu(node, async () => JSON.parse(await inAgentNetwork(node, [sweepScript, "conditional", "--prefix", "bench-conditional/"]))));
+  // The other systems' store, one server on the runner, its profile shaped by its own toxiproxy.
+  const single = join(BENCH_DIR, "single-store");
+  await onNode(node, `PATH=${dirname(process.execPath)}:$PATH ${new URL("store/up.sh", COMMON).pathname} ${single} ${PROFILE} > ${BENCH_DIR}/logs/single-store-up.txt 2>&1`);
+  try {
+    for (const round of [1, 2, 3]) {
+      const started = Date.now();
+      const cpuBefore = await onNode(node, "cat /sys/fs/cgroup/system.slice/docker-$(docker inspect --format '{{.Id}}' bench-seaweedfs).scope/cpu.stat | sed -n 's/^usage_usec //p'");
+      const said = await onNode(node, `set -a; . ${single}/store.env; set +a; ${process.execPath} ${sweepScript} sweep --prefix bench-sweep-${round}/`);
+      const cpuAfter = await onNode(node, "cat /sys/fs/cgroup/system.slice/docker-$(docker inspect --format '{{.Id}}' bench-seaweedfs).scope/cpu.stat | sed -n 's/^usage_usec //p'");
+      write(`sweep-single-${round}`, { said: JSON.parse(said.trim().split("\n").at(-1) ?? "null"), seconds: (Date.now() - started) / 1000, cpu_s: { "bench-seaweedfs": (Number(cpuAfter) - Number(cpuBefore)) / 1e6 } });
+    }
+    write("conditional-single", JSON.parse((await onNode(node, `set -a; . ${single}/store.env; set +a; ${process.execPath} ${sweepScript} conditional`)).trim().split("\n").at(-1) ?? "null"));
+  } finally {
+    await onNode(node, "docker rm -f bench-seaweedfs bench-toxiproxy >/dev/null 2>&1 || true");
+  }
+  if (PROFILE === "local") write("parent-metadata", await parentMetadata());
+}
+
 before(async () => {
   try {
     mkdirSync(join(BENCH_DIR, "logs"), { recursive: true });
@@ -1003,6 +1228,7 @@ before(async () => {
     for (const node of agents.keys()) await bootLogs(node);
     await shapeAgents();
     for (const node of (await nodeAgents()).keys()) await countStore(node);
+    if (VARIANT === "mixed-iocost") for (const node of (await nodeAgents()).keys()) await ioCost(node);
     // How the store answers through the profile, from where the saves run: the node agent's network.
     const [node = ""] = (await nodeAgents()).keys();
     store = await probeStore(node);
@@ -1018,6 +1244,7 @@ after(async () => {
 }, { timeout: 30 * 60_000 });
 
 test(`alasio's sessions saved and restored, ${RUNS} runs of ${CASES.length} cases, through ${PROFILE}`, { timeout: 330 * 60_000 }, async () => {
+  if (MODE === "store") return await storeExperiments();
   for (let run = 1; run <= RUNS; run++) {
     for (const { fixture, size_mib } of CASES) {
       const started = Date.now();
