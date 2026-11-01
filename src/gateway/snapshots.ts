@@ -438,7 +438,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         return "keep" as const;
       }
       if (already.success) return { saved: already.success };
+      yield* trace(`${workspace} gateway release-record-read`);
       const taken = yield* take(pool, workspace, name);
+      yield* trace(`${workspace} gateway release-taken ${taken.outcome}`);
       releases.add(1, { "alasio.sandbox.release.outcome": taken.outcome });
       if (taken.outcome === "failed") {
         yield* Effect.logWarning(`could not snapshot ${pool.namespace}/${workspace}: ${taken.why}; it runs on, still bound`);
@@ -456,6 +458,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         Effect.retry({ times: 3, schedule: Schedule.exponential("200 millis") }),
         Effect.catch((error) => Effect.logWarning(`${pool.namespace}/${workspace}'s release into ${saved?.snapshot ?? "no snapshot"} could not be recorded, so its next bind comes back from bayma's checkpoints: ${error.message}`)),
       );
+      yield* trace(`${workspace} gateway release-recorded`);
       return { saved };
     }).pipe(withLogScope("snapshots"));
 

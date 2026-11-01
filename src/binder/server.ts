@@ -515,12 +515,15 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       }
       if (incoming.method === "POST" && url === RELEASE_PATH) {
         incoming.resume();
+        yield* trace(`${key} front release`);
         const released = yield* poolOf(key, claims.options ?? {}).pipe(
           // Its requests under way through any replica let end first; then its route forgotten, as its binding is released.
           Effect.tap(({ pool }) => Effect.andThen(quiet(pool, key), Effect.sync(() => routes.delete(slot(pool, key))))),
+          Effect.tap(() => trace(`${key} front quiet`)),
           Effect.flatMap(({ pool, release, reset }) => Effect.andThen(reset ?? Effect.void, binder.release(pool, key, release))),
           Effect.result,
         );
+        yield* trace(`${key} front released`);
         if (released._tag === "Success" && released.success === "busy") {
           return answer(outgoing, 409, { error: `${key} is being bound or released now: none was released`, busy: true }, { "retry-after": String(RETRY_AFTER_S) });
         }

@@ -70,6 +70,7 @@ import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { isValidVolumeId, sessionKey, volumeIdOfKey } from "../sandbox/names.ts";
+import { trace } from "../shared/log.ts";
 import { meter } from "../telemetry/index.ts";
 import type { Environments } from "./environments.ts";
 import type { GatewaySnapshots as GatewaySnapshotsConfig } from "./names.ts";
@@ -265,10 +266,15 @@ export const makeSessions = Effect.fnUntraced(function*(
       if (!pod) return;
       const node = pod.spec?.nodeName ?? "";
       const containers = containerIdsOf(pod);
+      yield* trace(`${volumeId} gateway release-save`);
       if ((yield* snapshots.save(pool, volumeId, name)) === "keep") return yield* new BindStepFailed({ reason: `its sandbox was not saved, and runs on` });
+      yield* trace(`${volumeId} gateway release-saved`);
       yield* kube.remove("v1", "Pod", pool.namespace, name);
+      yield* trace(`${volumeId} gateway release-pod-deleted`);
       yield* stopped(pool, name);
+      yield* trace(`${volumeId} gateway release-stopped`);
       yield* timed(detachDuration, pool, agents.detach(node, pool.namespace, name, containers));
+      yield* trace(`${volumeId} gateway release-detached`);
     });
 
 

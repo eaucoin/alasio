@@ -275,9 +275,12 @@ export class Binder extends Context.Service<Binder, {
             if (!pod || lease.metadata?.annotations?.[RELEASING_ANNOTATION]) return "busy";
             const marked = yield* provide(markReleasing(lease, binder));
             if (!marked) return "busy";
+            yield* trace(`${key} binder release-marked`);
             const { lease: held } = yield* renewing(marked, () => before({ pod, binding: marked.metadata?.uid ?? "" }), (renewed) => provide(unmarkReleasing(renewed)).pipe(Effect.ignore));
+            yield* trace(`${key} binder release-ended`);
             yield* kube.remove("v1", "Pod", pool.namespace, pod);
             if (held) yield* provide(releaseLease(held)).pipe(Effect.catchIf(hasStatus(409), () => Effect.void));
+            yield* trace(`${key} binder release-lease-released`);
             return "released";
           });
 

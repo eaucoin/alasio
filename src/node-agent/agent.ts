@@ -887,6 +887,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   const take = (request: CheckpointRequest): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | ContainerElsewhere | S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
       const { environment, workspace, containerId, podTemplate } = request;
+      yield* trace(`${workspace} agent checkpoint-locked`);
       const running = yield* ofPod(containerId, request.namespace, request.pod);
       const { tracksWrites } = running;
       const takenAt = yield* Clock.currentTimeMillis;
@@ -928,6 +929,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         ...(own === undefined ? {} : { parentImagePath: cache.image(environment, workspace, own.digest) }),
         live: live !== undefined,
       }));
+      yield* trace(`${workspace} agent runsc-checkpointed ${pauseMs}`);
       // What the save caught, as bayma's hook wrote it as the sandbox was saved.
       const caught = live === undefined ? undefined : yield* lastSave(request, live, [container]);
       const image = yield* runsc.inspect(release, staged);
@@ -943,6 +945,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       yield* cache.commit(environment, workspace, snapshot, image.digest);
       const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest)));
       yield* cache.stamp(environment, workspace, image.digest, files);
+      yield* trace(`${workspace} agent checkpoint-cached`);
       const [uploadMs, layers] = yield* timed(Effect.gen(function*() {
         const uploaded = yield* upload(request, image.digest, files);
         if (!(yield* inBucket(request, uploaded))) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${image.digest} is not in the bucket as it was put` });
@@ -962,9 +965,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         uploadMs,
         ...(caught === undefined ? {} : { live: caught }),
       };
+      yield* trace(`${workspace} agent checkpoint-uploaded ${uploadMs}`);
       yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
       yield* bucket.putJson(manifestKey(request, snapshot), manifest);
       yield* bucket.putJson(`${prefixOf(request)}/${CURRENT_FILE}`, manifest);
+      yield* trace(`${workspace} agent checkpoint-committed`);
       return manifest;
     }).pipe(Effect.onError(() => cache.unstage(request.environment, request.workspace, snapshot).pipe(Effect.ignore)));
 
@@ -1166,7 +1171,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         Effect.tapError(() => Effect.sync(() => bases.delete(request.containerId))),
         Effect.mapError((error) => failed(error, `${error.message}; its snapshot is kept, as a live checkpoint that fails changes nothing`)),
       );
-    return exclusive([request], committed.pipe(Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)))))).pipe(
+    return trace(`${request.workspace} agent checkpoint-asked`).pipe(Effect.andThen(exclusive([request], committed.pipe(Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message))))))), Effect.tap(() => trace(`${request.workspace} agent checkpoint-done`))).pipe(
       // A release's: compacted once it no longer holds the workspace, where its chain is due.
       Effect.tap((manifest) => (request.live === undefined ? compactLater(manifest) : Effect.void)),
       Effect.tap((manifest) =>
