@@ -15,7 +15,7 @@ import { Context, Effect, Layer, Schema } from "effect";
 
 import { consumeGroup, errorText, type Feed, type Received } from "../log/consume.ts";
 import { joinTopic, type TopicLog } from "../log/topic.ts";
-import { withLogScope } from "../shared/log.ts";
+import { trace, withLogScope } from "../shared/log.ts";
 
 /** Where the environment's updates are: the log's brokers, its principal on them, its topic and its group. */
 export type TelegramLog = TopicLog;
@@ -81,20 +81,24 @@ function describeDefect(defect: unknown): string {
  * (../log/consume.ts). An update whose handling dies is skipped, said; one the store failed
  * leaves the member, which joins again from where it was last told.
  */
-export const consumeUpdates = (processUpdate: ProcessUpdate): Effect.Effect<never, never, TelegramUpdates> =>
-  Effect.flatMap(TelegramUpdates, ({ join }) =>
+export const consumeUpdates = (processUpdate: ProcessUpdate): Effect.Effect<never, never, TelegramUpdates> => {
+  // Spike: the group joined and the first update handed over, for the wake shard's split of a wake (E14).
+  let handed = false;
+  return Effect.flatMap(TelegramUpdates, ({ join }) =>
     consumeGroup({
       name: "Telegram's updates",
-      join,
+      join: join.pipe(Effect.tap(() => trace("wake consumer joined"))),
       handle: (received: ReceivedUpdate) =>
+        (handed ? Effect.void : Effect.andThen(Effect.sync(() => void (handed = true)), trace(`wake consumer first-update ${received.update?.update_id ?? ""}`))).pipe(Effect.andThen(
         received.update === null
           ? Effect.logError(`Skipping ${received.position}, which is no update of Telegram's`)
           : processUpdate(received.update).pipe(
             Effect.catchDefect((defect) => Effect.logError(`Skipping update ${received.update?.update_id} after processing failure: ${describeDefect(defect)}`)),
             Effect.mapError((error) => `keeping update ${received.update?.update_id}: ${errorText(error)}`),
-          ),
+          ))),
     })
   ).pipe(withLogScope("telegram-app"));
+};
 
 /** The environment's updates' log, from alasio's environment. */
 export function telegramLogOf(env: NodeJS.ProcessEnv): TelegramLog {

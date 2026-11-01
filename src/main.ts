@@ -16,19 +16,22 @@ import { stopsAsItsPodIsDeleted } from "./kube/own-pod.ts";
 import { Neon } from "./neon/connect.ts";
 import { LakeWake } from "./neon/lake-wake.ts";
 import { serveAlasio } from "./alasio.ts";
-import { withLogScope } from "./shared/log.ts";
+import { trace, withLogScope } from "./shared/log.ts";
 import { runAlasio } from "./shared/run.ts";
 import { TelegramUpdates } from "./telegram/update-consumer.ts";
 
 const alasio = Effect.gen(function*() {
   // Before all else, as a SIGTERM may be lost as alasio starts: its pod's deletion stops it as one would.
   yield* stopsAsItsPodIsDeleted;
+  // Spike: the process's start and its modules loaded, for the wake shard's split of a wake (E14).
+  yield* trace(`wake main modules-loaded ${Math.round(performance.timeOrigin)}`);
   const config = loadAlasioConfig();
   // alasio's state, Claude Code's transcripts and Codex's rollouts are kept in alasio's
   // Neon, which the deployment runs, and which its harness pools' pods write as their turns
   // run; the lake's loader is told of each write, where the lake runs. Neon may take minutes
   // to answer, and a stop meanwhile stops the wait.
   const neon = yield* Neon.make.pipe(Effect.provideServiceEffect(LakeWake, config.lakeWake ? LakeWake.make(config.lakeWake) : Effect.succeed(LakeWake.none)));
+  yield* trace("wake main neon-ready");
   const sessionFsRollouts = yield* neon.sessionFsRollouts;
   // A branch asks main to fork the sessions it inherited, on main's forks topic, and hears
   // its answers among its own events; main reads its forks topic and answers on theirs.

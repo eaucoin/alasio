@@ -4768,6 +4768,13 @@ if (inShard("wake")) {
           if (lines[0]) at("first line", lines[0].at);
           const telegramStarted = lines.find(({ text }) => /Starting Telegram/u.test(text));
           if (telegramStarted) at("Telegram started", telegramStarted.at);
+          // Spike (E14): the process's start, its modules loaded, Neon answering, the group joined and the update handed over, by alasio's own clock.
+          for (const { text } of lines) {
+            const traced = /trace wake (\S+) (\S+)(?: (\S+))? @(\d+)$/u.exec(text);
+            if (!traced) continue;
+            if (traced[2] === "modules-loaded" && traced[3]) at("process started", Number(traced[3]));
+            at(`${traced[1]} ${traced[2]}`, Number(traced[4]));
+          }
         }
         for (const node of elsewhere) await kube.patch(ref("Node", node), { spec: { unschedulable: null } });
         const woken = (await alasioPods())[0];
