@@ -75,7 +75,7 @@ jobs:
           words() { jq --raw-input --compact-output '[splits("[\\s,]+") | select(. != "")]' <<<"$1"; }
           matrix=$(jq --null-input --compact-output \
             --argjson systems "$(words "$SYSTEMS")" --argjson targets "$(words "$TARGETS")" --argjson profiles "$(words "$PROFILES")" --argjson variants "$(words "$VARIANTS")" '
-            {alasio: ["as-shipped", "with-fix", "whole", "no-compaction", "settled", "kept-cache"], gvisor: ["all", "tuned", "defaults"], firecracker: ["all", "chunk-16mib"], criu: ["all", "phaul", "splice", "chain", "patched", "eager"]} as $variantsOf
+            {alasio: ["as-shipped", "with-fix", "whole", "no-compaction", "settled", "kept-cache", "passthrough", "passthrough-kept"], gvisor: ["all", "tuned", "defaults"], firecracker: ["all", "chunk-16mib"], criu: ["all", "phaul", "splice", "chain", "patched", "eager"]} as $variantsOf
             | {alasio: ["as-shipped", "with-fix"], gvisor: ["all"], firecracker: ["all"], criu: ["all"]} as $defaults
             | ($variantsOf | keys) as $known
             | ["local", "s3-standard", "s3-express"] as $shapes
@@ -164,6 +164,8 @@ jobs:
       BENCH_PROFILE: ${{ matrix.profile }}
       # The variant a job runs: alasio's, one a job; criu's, its default ("all") or a tuning one; "all" for the others, which run all theirs.
       BENCH_VARIANT: ${{ matrix.variant }}
+      # Spike (X-PT): the variants whose nodes' stargz-snapshotter serves files through FUSE passthrough.
+      ALASIO_SPIKE_STARGZ_PASSTHROUGH: ${{ startsWith(matrix.variant, 'passthrough') && '1' || '' }}
       BENCH_CASES: ${{ inputs.cases }}
       BENCH_RUNS: ${{ inputs.runs }}
     steps:

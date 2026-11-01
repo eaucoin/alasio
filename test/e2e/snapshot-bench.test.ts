@@ -29,10 +29,10 @@ import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
-import type { V1Deployment, V1Pod, V1Service } from "@kubernetes/client-node";
+import type { CoreV1Event, V1Deployment, V1Pod, V1Service } from "@kubernetes/client-node";
 
 import { NODE_PINS } from "../../cli/src/cluster/node.ts";
-import { STARGZ_ROOT } from "../../cli/src/cluster/stargz.ts";
+import { STARGZ_CONFIG } from "../../cli/src/cluster/stargz.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { GATEWAY as STORE_GATEWAY } from "../../cli/src/manifests/object-store.ts";
@@ -72,7 +72,14 @@ const VARIANT = variable("BENCH_VARIANT");
  * `settled` waits until it ends before the warm restore, and `kept-cache` leaves the node's page
  * cache as it is for the warm restore.
  */
-const SPIKE_VARIANTS = ["no-compaction", "settled", "kept-cache"];
+const SPIKE_VARIANTS = ["no-compaction", "settled", "kept-cache", "passthrough", "passthrough-kept"];
+/**
+ * Spike (X-PT): `passthrough` and `passthrough-kept` are as-shipped and kept-cache on a node whose
+ * stargz-snapshotter serves files through FUSE passthrough (ALASIO_SPIKE_STARGZ_PASSTHROUGH=1,
+ * which the job sets for them). Whether the warm restore keeps the node's page cache.
+ */
+const KEPT_CACHE = VARIANT === "kept-cache" || VARIANT === "passthrough-kept";
+if (VARIANT.startsWith("passthrough") !== (process.env["ALASIO_SPIKE_STARGZ_PASSTHROUGH"] === "1")) throw new Error(`BENCH_VARIANT ${VARIANT} and ALASIO_SPIKE_STARGZ_PASSTHROUGH disagree`);
 if (VARIANT !== "as-shipped" && VARIANT !== "with-fix" && VARIANT !== "whole" && !SPIKE_VARIANTS.includes(VARIANT)) throw new Error(`BENCH_VARIANT is ${VARIANT}, not as-shipped, with-fix or whole`);
 const COMMON = new URL("../../bench/common/", import.meta.url);
 const read = (relative: string): string => readFileSync(new URL(relative, COMMON), "utf8");
@@ -440,32 +447,6 @@ async function compactionEnded(node: string, snapshot: string): Promise<Record<s
 }
 
 /**
- * Spike: samples, every 200 ms until stopped, the node's disks, its I/O and CPU pressure, its CPU
- * time and each runsc process's bytes read and written, into logs/io-<name>.txt.
- */
-async function sampleIo(node: string, name: string): Promise<{ readonly file: string; readonly stop: () => Promise<void> }> {
-  const file = join(BENCH_DIR, "logs", `io-${name}.txt`);
-  const stop = join(BENCH_DIR, `io-${name}.stop`);
-  const script = join(BENCH_DIR, "io-sample.sh");
-  writeFileSync(script, [
-    "while [ ! -e \"$2\" ]; do",
-    "  echo \"@ $(date +%s%N)\"",
-    "  grep -E ' (sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|dm-[0-9]+) ' /proc/diskstats",
-    "  echo \"pio $(head -n 1 /proc/pressure/io)\"",
-    "  echo \"pcpu $(head -n 1 /proc/pressure/cpu)\"",
-    "  head -n 1 /proc/stat",
-    "  for c in /sys/fs/fuse/connections/*; do echo \"fuse $c $(cat $c/waiting 2>/dev/null)\"; done",
-    "  for p in $(pgrep -f 'runsc|bayma|stargz|juicefs|containerd|k3s'); do",
-    "    echo \"p $p $(grep -E '^(rchar|read_bytes|write_bytes)' /proc/$p/io 2>/dev/null | tr '\\n' ' ')cpu $(cut -d' ' -f14,15 /proc/$p/stat 2>/dev/null) | $(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200)\"",
-    "  done",
-    "  sleep 0.2",
-    "done",
-  ].join("\n"));
-  await onNode(node, `rm -f '${stop}'; setsid nohup sh '${script}' '${file}' '${stop}' > '${file}' 2>&1 < /dev/null &`);
-  return { file, stop: async () => void (await onNode(node, `touch '${stop}'; sleep 0.5; rm -f '${stop}'`)) };
-}
-
-/**
  * Spike: the restore's steps, as the gateway's and the agent's trace lines and the probe say
  * them, each in milliseconds from the probe's t0.
  */
@@ -489,52 +470,6 @@ async function tracedRestore(node: string, workspace: string, probed: Record<str
     steps: Object.entries(steps).toSorted(([, a], [, b]) => a - b),
     probe: { initialized: fromT0("initialized_ns"), acquired: fromT0("connected_ns"), first_exec_end: fromT0("first_exec_end_ns"), refusals: probed["refusals"] },
   };
-}
-
-/**
- * Spike (X-PC): what the node has read, by cgroup and by process, and what its memory caches,
- * into logs/reads-<name>.txt: every cgroup's io.stat, /proc/meminfo, and the read bytes and CPU
- * time of the stargz daemon, its FUSE manager, JuiceFS, containerd, k3s, runsc and bayma; and,
- * where `files`, the page cache that cachestat(2) counts over the stargz daemon's root (its cache
- * files and, through its FUSE mounts, the session image's files as the sandbox sees them) and the
- * node's own binaries, by directory, with the 60 files that hold most of it.
- */
-async function nodeReads(node: string, name: string, files: boolean): Promise<string> {
-  const file = join(BENCH_DIR, "logs", `reads-${name}.txt`);
-  const helper = join(BENCH_DIR, "cachestat.py");
-  writeFileSync(helper, [
-    "import collections, ctypes, json, os, stat, sys",
-    "libc = ctypes.CDLL(None, use_errno=True)",
-    "class Range(ctypes.Structure): _fields_ = [('off', ctypes.c_uint64), ('len', ctypes.c_uint64)]",
-    "class Stat(ctypes.Structure): _fields_ = [(n, ctypes.c_uint64) for n in ('nr_cache', 'nr_dirty', 'nr_writeback', 'nr_evicted', 'nr_recently_evicted')]",
-    "totals, top = collections.Counter(), []",
-    "for root in sys.argv[1:]:",
-    "    for directory, _, names in os.walk(root):",
-    "        key = '/'.join(directory.split('/')[: root.count('/') + 4])",
-    "        for each in names:",
-    "            path = os.path.join(directory, each)",
-    "            try:",
-    "                if not stat.S_ISREG(os.lstat(path).st_mode): continue",
-    "                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)",
-    "            except OSError: continue",
-    "            try:",
-    "                cached = Stat()",
-    "                if libc.syscall(451, fd, ctypes.byref(Range(0, 0)), ctypes.byref(cached), 0) == 0 and cached.nr_cache:",
-    "                    totals[key] += cached.nr_cache * 4096",
-    "                    top.append((cached.nr_cache * 4096, path))",
-    "            finally: os.close(fd)",
-    "print(json.dumps({'by_directory': dict(totals.most_common()), 'top': sorted(top, reverse=True)[:60]}))",
-  ].join("\n"));
-  const roots = [STARGZ_ROOT, "/usr/local/lib/alasio", "/usr/local/bin", "/var/lib/rancher/k3s/data"];
-  await onNode(node, [
-    `{ echo "@ $(date +%s%N)"`,
-    "for f in $(find /sys/fs/cgroup -name io.stat); do echo \"io $f $(tr '\\n' ';' < $f)\"; done",
-    "grep -E '^(Buffers|Cached|Mapped|Shmem):' /proc/meminfo",
-    "for p in $(pgrep -f 'runsc|bayma|stargz|juicefs|containerd|k3s'); do echo \"p $p $(grep -E '^(rchar|read_bytes)' /proc/$p/io 2>/dev/null | tr '\\n' ' ')cpu $(cut -d' ' -f14,15 /proc/$p/stat 2>/dev/null) | $(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200)\"; done",
-    ...(files ? [`echo "cachestat $(python3 '${helper}' ${roots.join(" ")})"`] : []),
-    `} >> '${file}' 2>&1`,
-  ].join("; "));
-  return file;
 }
 
 /** Drops the page cache of `node`, as every restore starts with it dropped, so what ran before leaves it nothing. */
@@ -711,18 +646,10 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace }, to: { environment: SESSIONS, workspace: copy }, quotaBytes: quota.capacityBytes });
 
     phase = "restore-warm";
-    // Spike (X-PC): what the node reads in as long as a restore takes, without one, as a control.
-    if (VARIANT !== "kept-cache") await dropPageCache(node);
-    await nodeReads(node, `${fixture}-${sizeMib}-${run}-control`, false);
-    await sleep(4000);
-    await nodeReads(node, `${fixture}-${sizeMib}-${run}-control`, true);
-    if (VARIANT !== "kept-cache") await dropPageCache(node);
-    const reads = await nodeReads(node, `${fixture}-${sizeMib}-${run}-warm`, false);
-    const sampling = await sampleIo(node, `${fixture}-${sizeMib}-${run}-warm`);
+    // Spike (X-PT): nothing sampled through the restore, for its time.
+    if (!KEPT_CACHE) await dropPageCache(node);
     const warm = await restore(workspace, sessionId, fixture, runId, manifest);
-    await sampling.stop();
-    await nodeReads(node, `${fixture}-${sizeMib}-${run}-warm`, true);
-    const spike = { compaction, io: sampling.file, reads, ...(await tracedRestore(node, workspace, warm.probed)) };
+    const spike = { compaction, ...(await tracedRestore(node, workspace, warm.probed)) };
     emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, { ...warm.details, spike });
     done.add(phase);
     await endUnsaved(workspace, warm.pod);
@@ -860,12 +787,40 @@ async function shapeAgents(): Promise<void> {
   }
 }
 
+/**
+ * Spike (X-PT): how the sessions' pool pods first started on the job's fresh node, the session
+ * image's first pull and first opens: each pod's creation and conditions, its containers' starts,
+ * and kubelet's events of its images, in logs/first-start.json.
+ */
+async function firstStarts(): Promise<void> {
+  const pods = await kube.list<V1Pod>("Pod", { namespace: SESSIONS });
+  const events = await kube.list<CoreV1Event>("Event", { namespace: SESSIONS });
+  writeFileSync(join(BENCH_DIR, "logs", "first-start.json"), JSON.stringify({
+    pods: pods.map((pod) => ({
+      name: pod.metadata?.name,
+      created: pod.metadata?.creationTimestamp,
+      conditions: pod.status?.conditions?.map(({ type, status, lastTransitionTime }) => ({ type, status, at: lastTransitionTime })),
+      containers: pod.status?.containerStatuses?.map(({ name, image, state }) => ({ name, image, started: state?.running?.startedAt })),
+    })),
+    events: events
+      .filter(({ reason }) => ["Pulling", "Pulled", "Created", "Started"].includes(reason ?? ""))
+      .map(({ involvedObject, reason, message, firstTimestamp, eventTime, lastTimestamp }) => ({ pod: involvedObject.name, reason, message, first: firstTimestamp ?? eventTime, last: lastTimestamp })),
+  }, null, 1));
+}
+
 before(async () => {
   try {
     mkdirSync(join(BENCH_DIR, "logs"), { recursive: true });
     await setUp();
     const agents = await nodeAgents();
-    for (const node of agents.keys()) await bootLogs(node);
+    await firstStarts();
+    for (const node of agents.keys()) {
+      // Spike (X-PT): the node's stargz-snapshotter configured as the variant asks.
+      const configured = await onNode(node, `cat ${STARGZ_CONFIG}`);
+      writeFileSync(join(BENCH_DIR, "logs", `stargz-config-${node || "host"}.toml`), configured);
+      if (/^passthrough = true$/mu.test(configured) !== VARIANT.startsWith("passthrough")) throw new Error(`the node's stargz-snapshotter is not configured as ${VARIANT} asks`);
+      await bootLogs(node);
+    }
     await shapeAgents();
     // How the store answers through the profile, from where the saves run: the node agent's network.
     const [node = ""] = (await nodeAgents()).keys();
