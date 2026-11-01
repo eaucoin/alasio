@@ -10,9 +10,11 @@
  *   lines (src/shared/log.ts), the quota waits of both attaches among them, the sandbox's boot
  *   log, kubelet's and kube-router's lines (k3s at v=3, cli/src/cluster/node.ts) and the pod's
  *   events are read. Each run is one `# orch-restore <json>` line.
- * - `density` (E4): for each count of DENSITY_PODS, that many idle pods of a pool of no
- *   binder's (POOL_LABEL `val-idle`, the pause image, runc) on the sessions' node, which every
- *   pool's network policy selects; then PROBES pods made, each timed from its address in the API
+ * - `density` (E4): for each count of DENSITY_PODS, that many idle pods (the pause image, runc)
+ *   on the sessions' node, in a namespace of the test's own (DENSITY_NAMESPACE: alasio's admission
+ *   policy lets no pod but a pool's into the sessions' namespace), under network policies of its
+ *   own shaped as the pools' are (a default deny, ingress and egress for the pool's pods, the full
+ *   internet for those labelled so); then PROBES pods made, each timed from its address in the API
  *   to its rules in the node's filter table; then RELABELS relabels of one idle pod into and out
  *   of the full-internet policy, each timed from the patch to its rules. kube-router's own sync
  *   times are read from its lines. Each count is one `# orch-density <json>` line.
@@ -28,14 +30,14 @@
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
 
-import type { CoreV1Event, V1NetworkPolicy, V1Pod } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1Namespace, V1Pod } from "@kubernetes/client-node";
 
 import { SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
 import { NODE_PINS } from "../../cli/src/cluster/node.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { NAMESPACE, selectorLabels } from "../../cli/src/manifests/common.ts";
-import { BINDING_LABEL, FREE_LABEL, keyHash, POOL_LABEL } from "../../src/binder/names.ts";
-import { BAYMA_CONTAINER, NET_MODE_LABEL } from "../../src/kube/sandbox-shape.ts";
+import { BINDING_LABEL, FREE_LABEL, keyHash } from "../../src/binder/names.ts";
+import { BAYMA_CONTAINER } from "../../src/kube/sandbox-shape.ts";
 import { NODE_PATH } from "../../src/node-agent/host.ts";
 import { CONTAINERD, gvisorDirectory, gvisorHandler, RUNSC_ROOT } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
@@ -57,8 +59,10 @@ const WATCH_MS = 50;
 const RUNSC_LOGS = "/var/log/runsc";
 const K3S_LOG = "/var/log/k3s-spike.log";
 const CTR_EVENTS = "/var/log/ctr-events.log";
-/** The pool no binder serves, whose pods every pool's network policy selects. */
-const IDLE_POOL = "val-idle";
+/** The density part's namespace, its pods' label, and the label its full-internet policy selects. */
+const DENSITY_NAMESPACE = "val-density";
+const IDLE_LABEL = "val.alasio.dev/idle";
+const FULL_LABEL = "val.alasio.dev/net";
 
 /** When each step was first seen, in milliseconds since the epoch. */
 type Seen = Record<string, number>;
@@ -289,12 +293,12 @@ async function sessionsNode(): Promise<string> {
   return node;
 }
 
-/** An idle pod of IDLE_POOL named `name` on `node`, of the pause image, run by runc. */
+/** An idle pod named `name` on `node`, of the pause image, run by runc, in DENSITY_NAMESPACE. */
 function idlePod(name: string, node: string): V1Pod {
   return {
     apiVersion: "v1",
     kind: "Pod",
-    metadata: { name, namespace: SESSIONS, labels: { [POOL_LABEL]: IDLE_POOL } },
+    metadata: { name, namespace: DENSITY_NAMESPACE, labels: { [IDLE_LABEL]: "true" } },
     spec: {
       nodeName: node,
       automountServiceAccountToken: false,
@@ -312,12 +316,38 @@ function idlePod(name: string, node: string): V1Pod {
   };
 }
 
+/**
+ * DENSITY_NAMESPACE and its network policies, shaped as the sessions' are
+ * (cli/src/manifests/network-policies.ts sessionPolicies, poolPolicies): a default deny; the idle
+ * pods reached from main's namespace on one port and reaching it on one; those labelled FULL_LABEL
+ * full reaching the internet beside. Returns the full-internet policy's name.
+ */
+async function densityNamespace(): Promise<string> {
+  await kube.apply({ apiVersion: "v1", kind: "Namespace", metadata: { name: DENSITY_NAMESPACE } } as V1Namespace);
+  // As the API server takes it, its ingress's peers under `from` (client-node's model says `_from`).
+  const policy = (name: string, spec: Record<string, unknown>): KubernetesObject => ({ apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy", metadata: { name, namespace: DENSITY_NAMESPACE }, spec } as KubernetesObject);
+  const main = { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": NAMESPACE } } };
+  await kube.apply(policy("val-default-deny", { podSelector: {}, policyTypes: ["Ingress", "Egress"] }));
+  await kube.apply(policy("val-pool", {
+    podSelector: { matchLabels: { [IDLE_LABEL]: "true" } },
+    policyTypes: ["Ingress", "Egress"],
+    ingress: [{ from: [main], ports: [{ protocol: "TCP", port: 7290 }] }],
+    egress: [{ to: [main], ports: [{ protocol: "TCP", port: 4318 }] }],
+  }));
+  await kube.apply(policy("val-full", {
+    podSelector: { matchLabels: { [IDLE_LABEL]: "true", [FULL_LABEL]: "full" } },
+    policyTypes: ["Egress"],
+    egress: [{ to: [{ ipBlock: { cidr: "0.0.0.0/0", except: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] } }] }],
+  }));
+  return "val-full";
+}
+
 /** Waits until the pod `name` runs with an address: when the API first said its address, and the address. */
 async function addressed(name: string, timeoutMs = 120_000): Promise<{ readonly at: number; readonly ip: string }> {
   for (const deadline = Date.now() + timeoutMs; ; await sleep(20)) {
-    const pod = await kube.get<V1Pod>(ref("Pod", name, SESSIONS));
+    const pod = await kube.get<V1Pod>(ref("Pod", name, DENSITY_NAMESPACE));
     if (pod?.status?.podIP) return { at: Date.now(), ip: pod.status.podIP };
-    if (Date.now() > deadline) throw new Error(`${SESSIONS}/${name} has no address after ${timeoutMs} ms: ${JSON.stringify(pod?.status ?? null)}`);
+    if (Date.now() > deadline) throw new Error(`${DENSITY_NAMESPACE}/${name} has no address after ${timeoutMs} ms: ${JSON.stringify(pod?.status ?? null)}`);
   }
 }
 
@@ -355,9 +385,7 @@ const median = (values: readonly number[]): number | null => {
 
 async function density(): Promise<void> {
   const node = await sessionsNode();
-  const policies = await kube.list<V1NetworkPolicy>("NetworkPolicy", { namespace: SESSIONS });
-  const full = policies.find(({ spec }) => spec?.podSelector?.matchLabels?.[NET_MODE_LABEL] === "full")?.metadata?.name;
-  if (!full) throw new Error(`no network policy of ${SESSIONS} selects ${NET_MODE_LABEL}=full: ${policies.map(({ metadata }) => metadata?.name).join(", ")}`);
+  const full = await densityNamespace();
   let made = 0;
   for (const count of DENSITY_PODS) {
     for (; made < count; made++) await kube.apply(idlePod(`val-idle-${made}`, node));
@@ -372,7 +400,7 @@ async function density(): Promise<void> {
       const { at, ip } = await addressed(name);
       const rules = await rulesWhen(node, ip, "KUBE-NWPLCY-", true);
       probes.push({ ipToRulesMs: rules.at === null ? null : rules.at - at, looks: rules.looks });
-      await kube.remove(ref("Pod", name, SESSIONS));
+      await kube.remove(ref("Pod", name, DENSITY_NAMESPACE));
     }
     // One idle pod relabelled into the full-internet policy and out again, from the patch to its rules.
     const relabelled = "val-idle-0";
@@ -383,7 +411,7 @@ async function density(): Promise<void> {
       const polling = rulesWhen(node, ip, full, into);
       await sleep(30);
       const patched = Date.now();
-      await kube.patch(ref("Pod", relabelled, SESSIONS), { metadata: { labels: { [NET_MODE_LABEL]: into ? "full" : null } } });
+      await kube.patch(ref("Pod", relabelled, DENSITY_NAMESPACE), { metadata: { labels: { [FULL_LABEL]: into ? "full" : null } } });
       const patchMs = Date.now() - patched;
       const rules = await polling;
       relabels.push({ into, patchMs, patchToRulesMs: rules.at === null ? null : rules.at - patched, looks: rules.looks });
@@ -402,7 +430,7 @@ async function density(): Promise<void> {
       syncs: syncs.map(({ at, ms }) => [at - syncFrom, ms]),
     })}`);
   }
-  for (let index = 0; index < made; index++) await kube.remove(ref("Pod", `val-idle-${index}`, SESSIONS));
+  for (let index = 0; index < made; index++) await kube.remove(ref("Pod", `val-idle-${index}`, DENSITY_NAMESPACE));
 }
 
 /** The task of `id` as containerd lists it, as `ctr task ls` prints its line: its status. */
@@ -410,10 +438,10 @@ async function taskStatus(node: string, id: string): Promise<string> {
   return (await onNode(node, `k3s ctr -n k8s.io task ls | awk '$1 == "${id}" { print $3 }'`)).trim();
 }
 
-/** What runsc says of the containers of the pod sandbox `sandbox` under the shim's root: each's id and status. */
-async function runscStatus(node: string, sandbox: string): Promise<string> {
+/** What runsc says of the containers under the shim's root: each's id, its first 12 characters, and status. */
+async function runscStatus(node: string): Promise<string> {
   const binary = `${gvisorDirectory(NODE_PINS.gvisor.releases[0]?.release ?? "")}/runsc`;
-  return (await onNode(node, `${binary} --root=${RUNSC_ROOT} list --format=json 2>&1 | head -c 4000 || true`)).split("\n").join(" ").replace(/\s+/gu, " ").slice(0, 2000) + ` (sandbox ${sandbox})`;
+  return (await onNode(node, `${binary} --root=${RUNSC_ROOT} list --format=json 2>&1 | grep -o '"id":"[0-9a-f]\\{12\\}\\|"status":"[a-z]*"' | paste -sd ' ' || true`)).trim();
 }
 
 /** The memory its pod's cgroup charges, as memory.current says, in bytes. */
@@ -445,7 +473,7 @@ async function pauseOnce(index: number, workspace: string, sessionId: string, no
   const pausing = Date.now();
   const paused = await onNode(node, `k3s ctr -n k8s.io task pause ${container} 2>&1; echo "exit $?"`);
   const pausedAt = Date.now();
-  const status = { task: await taskStatus(node, container), sandboxTask: await taskStatus(node, sandbox), runsc: await runscStatus(node, sandbox), crictl: (await onNode(node, `k3s crictl inspect ${container} 2>/dev/null | grep -m1 '"state"' || true`)).trim() };
+  const status = { task: await taskStatus(node, container), sandboxTask: await taskStatus(node, sandbox), runsc: await runscStatus(node), crictl: (await onNode(node, `k3s crictl inspect ${container} 2>/dev/null | grep -m1 '"state"' || true`)).trim() };
   // Asked while paused: answered once resumed.
   const asked = inAlasio<Record<string, number | string | null>>("./session-repl.ts", "trace", workspace, sessionId).then((seen) => ({ seen }), (error: unknown) => ({ error: String(error) }));
   await sleep(holdMs);
