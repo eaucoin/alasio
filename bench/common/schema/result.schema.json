@@ -11,7 +11,7 @@
     "check": { "type": ["boolean", "null"] }
   },
   "properties": {
-    "schema": { "const": 1 },
+    "schema": { "enum": [1, 2] },
     "system": { "enum": ["alasio", "gvisor", "firecracker", "criu"] },
     "variant": { "type": "string", "pattern": "^[a-z0-9-]+$" },
     "target": { "enum": ["host", "docker"] },
@@ -41,7 +41,26 @@
         "resident_how": { "enum": ["signal", "touched", null] },
         "memory_peak_bytes": { "$ref": "#/$defs/bytes" },
         "memory_bytes": { "$ref": "#/$defs/bytes" },
-        "workload_rss_bytes": { "$ref": "#/$defs/bytes" }
+        "workload_rss_bytes": { "$ref": "#/$defs/bytes" },
+        "kernel_save_ms": { "$ref": "#/$defs/ms" },
+        "memory_save_ms": { "$ref": "#/$defs/ms" },
+        "overall_save_ms": { "$ref": "#/$defs/ms" },
+        "durable_store_ms": { "$ref": "#/$defs/ms" },
+        "store_sent_bytes": { "$ref": "#/$defs/bytes" },
+        "uploaded_over_needed": { "type": ["number", "null"], "minimum": 0 },
+        "restore_kernel_load_ms": { "$ref": "#/$defs/ms" },
+        "restore_memory_load_ms": { "$ref": "#/$defs/ms" },
+        "restore_to_running_ms": { "$ref": "#/$defs/ms" },
+        "runsc_resume_ms": { "$ref": "#/$defs/ms" },
+        "policy_wait_ms": { "$ref": "#/$defs/ms" },
+        "probe_exec_ms": { "$ref": "#/$defs/ms" },
+        "orchestration_ms": { "type": ["number", "null"] },
+        "loaded_bytes": { "$ref": "#/$defs/bytes" },
+        "store_received_bytes": { "$ref": "#/$defs/bytes" },
+        "disk_read_bytes": { "$ref": "#/$defs/bytes" },
+        "read_amplification": { "type": ["number", "null"], "minimum": 0 },
+        "page_cache": { "enum": ["dropped", "kept", null] },
+        "compaction_at_t0": { "enum": ["none", "running", null] }
       }
     },
     "correctness": {

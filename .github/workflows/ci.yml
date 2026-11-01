@@ -1,4 +1,5 @@
 name: ci
+run-name: ${{ inputs.label || 'ci' }}
 
 # The memory-snapshot benchmark, on this throwaway branch alone: the branch's
 # own ci.yml, as GitHub dispatches only workflows whose file is on the default branch. One job
@@ -47,6 +48,14 @@ on:
         description: "Keep the images this run builds, for later runs, to be deleted by hand"
         type: boolean
         default: false
+      label:
+        description: "The run's name, as the runs list says it (ci if empty)"
+        type: string
+        default: ""
+      settings:
+        description: "Settings of the bench jobs, as NAME=value words, each set in their environment (BENCH_ ones alone)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -222,6 +231,14 @@ jobs:
           . "$BENCH_DIR/store/store.env"
           set +a
           node bench/common/dist/probe.mjs | tee "$BENCH_DIR/store.json"
+      - name: The run's settings
+        env:
+          SETTINGS: ${{ inputs.settings }}
+        run: |
+          for setting in $SETTINGS; do
+            [[ $setting =~ ^BENCH_[A-Z0-9_]+=[A-Za-z0-9_./:,-]*$ ]] || { echo "::error::$setting is no BENCH_NAME=value"; exit 1; }
+            echo "$setting" | tee --append "$GITHUB_ENV"
+          done
       - name: Run ${{ matrix.system }}
         run: bench/${{ matrix.system }}/run.sh "$BENCH_TARGET" "$BENCH_PROFILE"
         env:

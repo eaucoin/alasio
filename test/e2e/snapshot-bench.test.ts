@@ -40,9 +40,9 @@ import { BINDING_LABEL, FREE_LABEL, keyHash, leaseName, POOL_LABEL } from "../..
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { BAYMA_CONTAINER, RESTORE_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
 import { compactionDue, type Manifest } from "../../src/node-agent/agent.ts";
-import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
+import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
-import { bindSession, boundPodOf, dumpClusterState, gatewayCall, kube, mainToken, nodeAgents, onNode, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
+import { bindSession, boundPodOf, dumpClusterState, gatewayCall, kube, lakeQuery, mainToken, nodeAgents, onNode, ref, SESSIONS, setUp, tearDown, TARGET } from "./harness.ts";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const now = (): bigint => process.hrtime.bigint();
@@ -58,12 +58,13 @@ const BENCH_DIR = variable("BENCH_DIR");
 const PROFILE = variable("BENCH_PROFILE");
 const RUNS = Number(process.env["BENCH_RUNS"] || 5);
 /**
- * The variant: `as-shipped`, alasio as it runs: 10.0.4's pool pods name bayma's state directory
- * by its mounted path, so its live checkpoints pass and its release is a delta of the live save's
- * image (10.0.0's failed, mountedStateDir, its release a whole stop-and-copy); or `with-fix`, its live
- * checkpoint given bayma's state directory by its mounted path, as alasio's fix, not yet
- * released, gives it, its release then a delta of the live save's image; or `whole`, no live
- * save taken, as of a session released before its first, its release a whole stop-and-copy.
+ * The variant: `as-shipped`, alasio as it runs, its live checkpoints given bayma's state
+ * directory as the pool's pods name it, its release a delta of the live save's image, and the
+ * node's page cache dropped before every restore; `kept-cache`, the same, but the node's page
+ * cache left as it is for the warm restore, as a node running other sandboxes keeps the sandbox
+ * image's files; `with-fix`, its live checkpoint given bayma's state directory by its mounted
+ * path; or `whole`, no live save taken, as of a session released before its first, its release a
+ * whole stop-and-copy.
  */
 const VARIANT = variable("BENCH_VARIANT");
 /**
@@ -81,6 +82,11 @@ const ASKED = (process.env["BENCH_CASES"] ?? "").split(/[\s,]+/u).filter(Boolean
 const CASES = ASKED.length === 0 ? ALL_CASES : ALL_CASES.filter(({ fixture, size_mib }) => ASKED.includes(`${fixture}/${size_mib}`));
 const HOST = JSON.parse(readFileSync(join(BENCH_DIR, "host.json"), "utf8")) as { readonly copy_mib_s: number };
 const RELEASE_UNDER_TEST = NODE_PINS.gvisor.releases[0]?.release ?? "";
+/** The release of alasio under test, and of the bayma its sessions run (sandbox/agent/Dockerfile's BAYMA_IMAGE). */
+const ALASIO_UNDER_TEST = (JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { readonly version: string }).version;
+const BAYMA_UNDER_TEST = /^ARG BAYMA_IMAGE=\S+:([0-9][^@\s]*)/mu.exec(readFileSync(new URL("../../sandbox/agent/Dockerfile", import.meta.url), "utf8"))?.[1] ?? "";
+/** Whether the node's page cache is dropped before the warm restore: kept by `kept-cache` alone. */
+const PAGE_CACHE = VARIANT === "kept-cache" ? "kept" : "dropped";
 
 /** Where the benchmark's bundles go in the pods that run them. */
 const IN_POD = "/tmp/bench";
@@ -88,22 +94,32 @@ const IN_POD = "/tmp/bench";
 const MCP_URL = `http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}/mcp`;
 /** The pattern of the sandboxes' boot logs, on the node. */
 const RUNSC_LOGS = "/var/log/runsc";
+/** Spike: the chain of rules, in each node agent's network namespace, that counts its traffic with the store (storeBytes). */
+const STORE_CHAIN = "BENCH-STORE";
 /** toxiproxy's release, as the runner systems' store runs it (bench/common/store/up.sh). */
 const TOXIPROXY = "2.13.0";
 /** The user toxiproxy runs as in an agent's network namespace, whose connections are not sent to it again. */
 const PROXY_UID = 65534;
 
 /** The metrics a result has, null unless measured (bench/common/schema/result.schema.json). */
-const METRICS = ["save_total_ms", "unavailable_ms", "pause_reported_ms", "slowdown", "precopy_passes", "precopy_bytes", "image_bytes", "uploaded_bytes", "first_exec_ms", "verify_ms", "resident_ms", "resident_how", "memory_peak_bytes", "memory_bytes", "workload_rss_bytes"] as const;
+const METRICS = [
+  "save_total_ms", "unavailable_ms", "pause_reported_ms", "slowdown", "precopy_passes", "precopy_bytes", "image_bytes", "uploaded_bytes", "first_exec_ms", "verify_ms", "resident_ms", "resident_how", "memory_peak_bytes", "memory_bytes", "workload_rss_bytes",
+  // Schema 2: the mechanism's own splits, from runsc's boot log; the product's, from the trace lines; what moved, from the node's counters.
+  "kernel_save_ms", "memory_save_ms", "overall_save_ms", "durable_store_ms", "store_sent_bytes", "uploaded_over_needed",
+  "restore_kernel_load_ms", "restore_memory_load_ms", "restore_to_running_ms", "runsc_resume_ms", "policy_wait_ms", "probe_exec_ms", "orchestration_ms",
+  "loaded_bytes", "store_received_bytes", "disk_read_bytes", "read_amplification", "page_cache", "compaction_at_t0",
+] as const;
 type Metrics = Partial<Record<(typeof METRICS)[number], number | string | null>>;
 const NO_CHECKS = { marker: null, memory: null, children: null, file: null, socket: null, running: null, notice: null };
 
 let store: Record<string, number> = {};
+/** Spike: when the last restore's probe began, on the wall clock, whose bayma span the lake is waited on for. */
+let lastRestoreAt = 0;
 
 /** Appends one phase's result. */
 function emit(fixture: string, sizeMib: number, run: number, phase: string, outcome: { readonly ok: boolean; readonly failure: string | null }, metrics: Metrics, correctness: Record<string, unknown> = NO_CHECKS, details: Record<string, unknown> = {}): void {
   const line = {
-    schema: 1,
+    schema: 2,
     system: "alasio",
     variant: VARIANT,
     target: TARGET,
@@ -119,7 +135,7 @@ function emit(fixture: string, sizeMib: number, run: number, phase: string, outc
     correctness,
     host: JSON.parse(readFileSync(join(BENCH_DIR, "host.json"), "utf8")),
     store,
-    versions: { system: `alasio 10.0.4, gVisor ${RELEASE_UNDER_TEST}`, bayma: "0.15.5", seaweedfs: "4.48", toxiproxy: TOXIPROXY },
+    versions: { system: `alasio ${ALASIO_UNDER_TEST}, gVisor ${RELEASE_UNDER_TEST}`, bayma: BAYMA_UNDER_TEST, seaweedfs: "4.48", toxiproxy: TOXIPROXY },
     ci: { run_id: Number(process.env["GITHUB_RUN_ID"] ?? 0), job: process.env["GITHUB_JOB"] ?? "local", sha: process.env["GITHUB_SHA"] ?? "" },
     at: new Date().toISOString(),
     details,
@@ -246,32 +262,100 @@ function logTimeMs(line: string): number | null {
   return matched ? (Number(matched[1]) * 3600 + Number(matched[2]) * 60 + Number(matched[3])) * 1000 : null;
 }
 
-/** What a sandbox's boot log says of its last save: its pause, and its pre-copy's rounds and bytes. */
-function saveLogged(lines: readonly string[]): { readonly pauseMs: number | null; readonly passes: number | null; readonly precopyBytes: number | null; readonly said: string[] } {
-  const paused = lines.findLast((line) => line.includes("Tasks resumed after save, paused for"));
+/** The last bracketed Go duration a line matching `pattern` of `lines` gives (runsc's "... took [1.5s]."), in milliseconds, or null. */
+function tookMs(lines: readonly string[], pattern: RegExp): number | null {
+  const said = lines.findLast((line) => pattern.test(line));
+  const duration = said === undefined ? undefined : /took \[([^\]]+)\]/u.exec(said)?.[1];
+  return duration === undefined ? null : goDurationMs(duration);
+}
+
+/**
+ * What a sandbox's boot log says of its last save: its pause, its pre-copy's rounds and bytes,
+ * and the save's own splits, of the lines after its last "Sandbox save started": the kernel's
+ * state, the memory files', and the whole, and the collection before it with the time it
+ * stopped the world.
+ */
+function saveLogged(lines: readonly string[]): {
+  readonly pauseMs: number | null;
+  readonly passes: number | null;
+  readonly precopyBytes: number | null;
+  readonly kernelMs: number | null;
+  readonly memoryMs: number | null;
+  readonly overallMs: number | null;
+  readonly split: Record<string, number | null>;
+  readonly said: string[];
+} {
+  const started = lines.findLastIndex((line) => line.includes("Sandbox save started"));
+  const last = started === -1 ? [] : lines.slice(started);
+  const paused = last.findLast((line) => line.includes("Tasks resumed after save, paused for"));
   const done = lines.findLast((line) => line.includes("Pre-copy done after"));
   const skipped = lines.findLast((line) => line.includes("Pre-copy skipped"));
   // The last save's scan of its memory and what it wrote, zero pages among them.
-  const scanned = lines.findLast((line) => line.includes("save scanning took"));
-  const written = lines.findLast((line) => line.includes("bytes written to the pages file"));
+  const scanned = last.findLast((line) => line.includes("save scanning took"));
+  const written = last.findLast((line) => line.includes("bytes written to the pages file"));
+  const collected = last.findLast((line) => line.includes("Collected the save's garbage"));
+  // When the save paused the sandbox, and each arming of its dirty tracking, its time and size, before and after.
+  const pausing = started === -1 ? undefined : lines[started];
+  const armed = lines.filter((line) => line.includes("Dirty tracking: armed")).slice(-10);
+  const timers = last.filter((line) => /(Kernel|Memory files|Overall|Split filesystem|CPUID) save took|Pausing root network namespace took|Kernel save stats/u.test(line));
   const rounds = /Pre-copy done after (\d+) rounds \([^)]*\): (\d+) bytes/u.exec(done ?? "");
+  const gc = /in (\S+), the world stopped for (\S+) of it/u.exec(collected ?? "");
+  const split = {
+    gc_ms: gc?.[1] === undefined ? null : goDurationMs(gc[1]),
+    gc_world_stopped_ms: gc?.[2] === undefined ? null : goDurationMs(gc[2]),
+    cpuid_ms: tookMs(last, /CPUID save took/u),
+    network_pause_ms: tookMs(last, /Pausing root network namespace took/u),
+    kernel_ms: tookMs(last, /Kernel save took/u),
+    split_fs_ms: tookMs(last, /Split filesystem save took/u),
+    memory_files_ms: tookMs(last, /Memory files save took/u),
+    overall_ms: tookMs(last, /Overall save took/u),
+  };
   return {
     pauseMs: paused ? goDurationMs(/paused for (\S+?)\.?$/u.exec(paused)?.[1] ?? "") : null,
     passes: rounds ? Number(rounds[1]) : skipped ? 0 : null,
     precopyBytes: rounds ? Number(rounds[2]) : skipped ? 0 : null,
-    said: [paused, done, skipped, scanned, written].filter((line): line is string => line !== undefined),
+    kernelMs: split.kernel_ms,
+    memoryMs: split.memory_files_ms,
+    overallMs: split.overall_ms,
+    split,
+    said: [pausing, paused, done, skipped, scanned, written, collected, ...timers, ...armed].filter((line): line is string => line !== undefined),
   };
 }
 
-/** What a restored sandbox's boot log says: how long runsc took from its start to the restore's success, and its pages' loading. */
-function restoreLogged(lines: readonly string[]): { readonly runscRestoreMs: number | null; readonly said: string[] } {
+/**
+ * What a restored sandbox's boot log says: how long runsc took from its start to the restore's
+ * success, every page loaded; its splits, the kernel's state and the memory files' metadata
+ * loaded, and its start to its load's end, runnable; the bytes its layers' loaders loaded; and
+ * those lines.
+ */
+function restoreLogged(lines: readonly string[]): {
+  readonly runscRestoreMs: number | null;
+  readonly kernelLoadMs: number | null;
+  readonly memoryLoadMs: number | null;
+  readonly toRunningMs: number | null;
+  readonly loadedBytes: number | null;
+  readonly said: string[];
+} {
   const first = lines.find((line) => logTimeMs(line) !== null);
   const restored = lines.find((line) => line.includes("Restore successful"));
+  const loaded = lines.find((line) => line.includes("Overall load took"));
   // Each layer's loader's lines: its working set, its end, its rate and its budget.
   const loading = lines.filter((line) => /Async page loading (completed|read|: )|async loading \d+ bytes from|working set holds/u.test(line));
+  const timers = lines.filter((line) => /(Kernel|Memory files|Overall|CPUID) load took|Starting to restore|Restored container|Dirty tracking: armed/u.test(line));
+  const completed = loading.flatMap((line) => /Async page loading completed in \S+ \((\d+) bytes/u.exec(line)?.[1] ?? []);
   const from = first ? logTimeMs(first) : null;
-  const to = restored ? logTimeMs(restored) : null;
-  return { runscRestoreMs: from !== null && to !== null ? to - from : null, said: [restored, ...loading].filter((line): line is string => line !== undefined) };
+  const between = (line: string | undefined) => {
+    const to = line ? logTimeMs(line) : null;
+    return from !== null && to !== null ? to - from : null;
+  };
+  return {
+    runscRestoreMs: between(restored),
+    kernelLoadMs: tookMs(lines, /Kernel load took/u),
+    memoryLoadMs: tookMs(lines, /Memory files load took/u),
+    toRunningMs: between(loaded),
+    loadedBytes: completed.length === 0 ? null : completed.reduce((sum, bytes) => sum + Number(bytes), 0),
+    said: [restored, ...timers, ...loading].filter((line): line is string => line !== undefined),
+  };
 }
 
 /** The memory of the pod of uid `uid` on `node`, as its cgroup says: its peak and what it holds now. */
@@ -335,12 +419,19 @@ async function preparedLine(node: string, snapshot: string): Promise<string> {
   return line ? line.slice(line.indexOf("prepared")) : "not logged";
 }
 
-/** A restore of the workspace from its snapshot `manifest` through the gateway, its first request the probe's: its result's measures, checks and details, and its pod. */
-async function restore(workspace: string, sessionId: string, fixture: string, runId: string, manifest: Manifest) {
+/**
+ * A restore of the workspace from its snapshot `manifest` through the gateway, its first request
+ * the probe's, on `node`, whose agent restores it: its result's measures, checks and details, and
+ * its pod. A cold one's bytes from the store are counted until the fetch it starts is through.
+ */
+async function restore(node: string, workspace: string, sessionId: string, fixture: string, runId: string, manifest: Manifest, kind: "warm" | "cold") {
+  const storeBefore = await storeBytes(node);
+  const diskBefore = await diskReadBytes(node);
   // Settled whatever comes of the probe, which fails a restore that never answers before its pod is seen.
   const watching = watchRestore(workspace, manifest.release).then((watched) => ({ watched }), (error: unknown) => ({ error }));
   const probed = await driver<{
     readonly t0_ns: string;
+    readonly t0_wall_ms: number;
     readonly first_exec_ms: number;
     readonly verify_ms: number;
     readonly ok: boolean;
@@ -349,17 +440,28 @@ async function restore(workspace: string, sessionId: string, fixture: string, ru
     readonly workload_rss_bytes: number;
     readonly notice: string | null;
   }>(workspace, "probe", "--session", sessionId, "--fixture", fixture, "--run-id", runId);
+  lastRestoreAt = probed.t0_wall_ms;
   const settled = await watching;
   if ("error" in settled) throw settled.error;
   const { residentNs, pod, error } = settled.watched;
-  const node = pod.spec?.nodeName ?? "";
+  const diskRead = (await diskReadBytes(node)) - diskBefore;
+  const storeReceived = (kind === "cold" ? await storeQuiet(node) : (await storeBytes(node)).received) - storeBefore.received;
   const name = pod.metadata?.name ?? "";
+  if (pod.spec?.nodeName !== node) throw new Error(`the restore's pod ${name} runs on ${pod.spec?.nodeName}, not on ${node}, whose counters the run reads`);
   const memory = await podMemory(node, pod.metadata?.uid ?? "");
   const logged = restoreLogged(await bootLog(node, await sandboxIdOf(node, name)));
   const prepared = await preparedLine(node, manifest.snapshot);
   const source = await sourceOf(node, pod);
   const logs = await loggedOf(node, workspace);
+  const spike = await tracedRestore(node, workspace, probed as unknown as Record<string, unknown>);
   const resident = residentNs === null ? null : msBetween(BigInt(probed.t0_ns), residentNs);
+  const resumed = stepAt(spike.steps, "agent runsc-resumed");
+  const forgotten = stepAt(spike.steps, "agent connections-forgotten");
+  const runscResume = resumed !== null && forgotten !== null ? resumed - forgotten : null;
+  const policyWait = /^agent policies-in-force (\d+)$/u.exec(spike.steps.find(([step]) => step.startsWith("agent policies-in-force"))?.[0] ?? "")?.[1];
+  const { initialized, first_exec_end: firstEnd } = spike.probe as { readonly initialized: number | null; readonly first_exec_end: number | null };
+  const probeExec = initialized !== null && firstEnd !== null ? firstEnd - initialized : null;
+  const loaded = logged.loadedBytes;
   const metrics: Metrics = {
     first_exec_ms: probed.first_exec_ms,
     verify_ms: probed.verify_ms,
@@ -368,8 +470,23 @@ async function restore(workspace: string, sessionId: string, fixture: string, ru
     memory_peak_bytes: memory.peak,
     memory_bytes: memory.current,
     workload_rss_bytes: probed.workload_rss_bytes,
+    restore_kernel_load_ms: logged.kernelLoadMs,
+    restore_memory_load_ms: logged.memoryLoadMs,
+    restore_to_running_ms: logged.toRunningMs,
+    runsc_resume_ms: runscResume,
+    policy_wait_ms: policyWait === undefined ? null : Number(policyWait),
+    probe_exec_ms: probeExec,
+    // What of the first exec's time is neither runsc's restore to runnable, its resume with bayma's hook, nor the probe's MCP session and exec.
+    orchestration_ms: logged.toRunningMs !== null && runscResume !== null && probeExec !== null ? probed.first_exec_ms - logged.toRunningMs - runscResume - probeExec : null,
+    loaded_bytes: loaded,
+    store_received_bytes: storeReceived,
+    disk_read_bytes: diskRead,
+    // Of a cold restore, what the store sent the node for it, its fetch included; of a warm one, what the node's disks read.
+    read_amplification: loaded === null || loaded === 0 ? null : (kind === "cold" ? storeReceived : diskRead) / loaded,
+    page_cache: kind === "cold" ? "dropped" : PAGE_CACHE,
+    compaction_at_t0: compactionAtT0(spike.steps),
   };
-  const details = { pod: name, node, source, prepared, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs };
+  const details = { pod: name, node, source, prepared, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(), spike };
   return { probed, metrics, details, pod: name };
 }
 
@@ -438,63 +555,116 @@ async function compactionEnded(node: string, snapshot: string): Promise<Record<s
 }
 
 /**
- * Spike: samples, every 200 ms until stopped, the node's disks, its I/O and CPU pressure, its CPU
- * time and each runsc process's bytes read and written, into logs/io-<name>.txt.
+ * Spike: the steps of `workspace`'s phase that began at `t0` (the wall clock's milliseconds), as
+ * the gateway's and the agent's trace lines say them, each in milliseconds from `t0`: of each step,
+ * its first line at or after `t0`, or, where none is, its last in the minute before (a compaction
+ * the phase began under). A step's line's number, or single word, is kept in its name.
  */
-async function sampleIo(node: string, name: string): Promise<{ readonly file: string; readonly stop: () => Promise<void> }> {
-  const file = join(BENCH_DIR, "logs", `io-${name}.txt`);
-  const stop = join(BENCH_DIR, `io-${name}.stop`);
-  const script = join(BENCH_DIR, "io-sample.sh");
-  writeFileSync(script, [
-    "while [ ! -e \"$2\" ]; do",
-    "  echo \"@ $(date +%s%N)\"",
-    "  grep -E ' (sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|dm-[0-9]+) ' /proc/diskstats",
-    "  echo \"pio $(head -n 1 /proc/pressure/io)\"",
-    "  echo \"pcpu $(head -n 1 /proc/pressure/cpu)\"",
-    "  head -n 1 /proc/stat",
-    "  for p in $(pgrep -f 'runsc|bayma'); do",
-    "    echo \"p $p $(grep -E '^(read|write)_bytes' /proc/$p/io 2>/dev/null | tr '\\n' ' ')| $(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200)\"",
-    "  done",
-    "  sleep 0.2",
-    "done",
-  ].join("\n"));
-  await onNode(node, `rm -f '${stop}'; setsid nohup sh '${script}' '${file}' '${stop}' > '${file}' 2>&1 < /dev/null &`);
-  return { file, stop: async () => void (await onNode(node, `touch '${stop}'; sleep 0.5; rm -f '${stop}'`)) };
-}
-
-/**
- * Spike: the restore's steps, as the gateway's and the agent's trace lines and the probe say
- * them, each in milliseconds from the probe's t0.
- */
-async function tracedRestore(node: string, workspace: string, probed: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const t0 = Number(probed["t0_wall_ms"]);
-  const t0Ns = BigInt(String(probed["t0_ns"]));
-  const steps: Record<string, number> = {};
+async function traced(node: string, workspace: string, t0: number): Promise<[string, number][]> {
   const gateways = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("sandbox-gateway")) });
   const lines = [
     ...(await Promise.all(gateways.map((pod) => kube.logs(NAMESPACE, pod.metadata?.name ?? "", "sandbox-gateway").catch(() => "")))).flatMap((logged) => logged.split("\n")),
     ...(await agentLines(node)),
   ];
+  const after = new Map<string, number>();
+  const before = new Map<string, number>();
   for (const line of lines) {
     const matched = /trace (\S+) (\S+) (\S+)(.*) @(\d+)$/u.exec(line);
-    if (!matched || !matched[1]?.includes(workspace) || Number(matched[5]) < t0 - 60_000) continue;
-    const step = `${matched[2]} ${matched[3]}${matched[3]?.startsWith("compact") || matched[3] === "policies-in-force" ? ` ${matched[4]?.trim() ?? ""}` : ""}`;
-    steps[step] ??= Number(matched[5]) - t0;
+    if (!matched || !matched[1]?.includes(workspace)) continue;
+    const rest = matched[4]?.trim() ?? "";
+    const step = `${matched[2]} ${matched[3]}${/^(\d+|[a-z]+)$/u.test(rest) ? ` ${rest}` : ""}`;
+    const at = Number(matched[5]) - t0;
+    if (at >= 0) {
+      if (!after.has(step) || (after.get(step) ?? 0) > at) after.set(step, at);
+    } else if (at >= -60_000) {
+      before.set(step, Math.max(before.get(step) ?? -Infinity, at));
+    }
   }
+  for (const [step, at] of before) if (!after.has(step)) after.set(step, at);
+  return [...after].toSorted(([, a], [, b]) => a - b);
+}
+
+/** Spike: a restore's steps (traced), and the probe's own, in milliseconds from the probe's t0. */
+async function tracedRestore(node: string, workspace: string, probed: Record<string, unknown>): Promise<{ readonly steps: [string, number][]; readonly probe: Record<string, unknown> }> {
+  const t0Ns = BigInt(String(probed["t0_ns"]));
   const fromT0 = (key: string) => (typeof probed[key] === "string" ? Number(BigInt(probed[key] as string) - t0Ns) / 1e6 : null);
   return {
-    steps: Object.entries(steps).toSorted(([, a], [, b]) => a - b),
+    steps: await traced(node, workspace, Number(probed["t0_wall_ms"])),
     probe: { initialized: fromT0("initialized_ns"), acquired: fromT0("connected_ns"), first_exec_end: fromT0("first_exec_end_ns"), refusals: probed["refusals"] },
   };
+}
+
+/** Spike: the step `name` of `steps`, or null. */
+const stepAt = (steps: readonly [string, number][], name: string): number | null => steps.find(([step]) => step === name)?.[1] ?? null;
+
+/**
+ * Spike: whether the release's compaction of the chain ran as the phase whose steps are `steps`
+ * began: started before it, not yet through its upload.
+ */
+function compactionAtT0(steps: readonly [string, number][]): "running" | "none" {
+  const started = steps.find(([step]) => step === "agent compact-start");
+  const uploaded = steps.find(([step]) => step === "agent compact-uploaded");
+  return started !== undefined && started[1] < 0 && (uploaded === undefined || uploaded[1] >= 0) ? "running" : "none";
+}
+
+/**
+ * Spike: the bytes that moved between the node agents' network and the store, as counted by
+ * the rules countStore puts in the agent's network namespace on `node`: sent to it and received
+ * from it, all the agent's clients of the bucket together (its uploads, its proxy of the restores'
+ * reads, its fetches), and toxiproxy's on the emulated profiles, which carries them.
+ */
+async function storeBytes(node: string): Promise<{ readonly sent: number; readonly received: number }> {
+  const listed = await onNode(node, `nsenter --target ${await agentPid(node)} --net sh -c 'iptables -L ${STORE_CHAIN} -v -x -n'`);
+  const bytes = (direction: string) => Number(listed.split("\n").find((line) => line.includes(`/* ${direction} */`))?.trim().split(/\s+/u)[1] ?? NaN);
+  return { sent: bytes("sent"), received: bytes("received") };
+}
+
+/** Spike: counts, in the agent's network namespace on `node`, what it sends to the store's Service and receives from it (storeBytes). */
+async function countStore(node: string): Promise<void> {
+  const address = await storeAddress();
+  const inNetns = `nsenter --target ${await agentPid(node)} --net`;
+  await onNode(node, [
+    `${inNetns} iptables -N ${STORE_CHAIN}`,
+    `${inNetns} iptables -A ${STORE_CHAIN} ! -o lo -d ${address} -p tcp --dport 8333 -m comment --comment sent`,
+    `${inNetns} iptables -A ${STORE_CHAIN} ! -i lo -s ${address} -p tcp --sport 8333 -m comment --comment received`,
+    `${inNetns} iptables -I OUTPUT -j ${STORE_CHAIN}`,
+    `${inNetns} iptables -I INPUT -j ${STORE_CHAIN}`,
+  ].join(" && "));
+}
+
+/** Spike: the bytes the node's disks have read, as /proc/diskstats counts their sectors. */
+async function diskReadBytes(node: string): Promise<number> {
+  const listed = await onNode(node, "grep -E ' (sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+) ' /proc/diskstats");
+  return listed.split("\n").filter(Boolean).reduce((sum, line) => sum + Number(line.trim().split(/\s+/u)[5] ?? 0) * 512, 0);
+}
+
+/** Spike: waits until the store has sent `node`'s agent nothing for 3 s, within 180 s, as the fetch a cold restore starts runs: what it received meanwhile. */
+async function storeQuiet(node: string): Promise<number> {
+  let last = (await storeBytes(node)).received;
+  let quietSince = Date.now();
+  for (const deadline = Date.now() + 180_000; Date.now() < deadline && Date.now() - quietSince < 3000; await sleep(500)) {
+    const now = (await storeBytes(node)).received;
+    if (now !== last) quietSince = Date.now();
+    last = now;
+  }
+  return last;
 }
 
 /** Drops the page cache of `node`, as every restore starts with it dropped, so what ran before leaves it nothing. */
 const dropPageCache = (node: string): Promise<string> => onNode(node, "sync && echo 1 > /proc/sys/vm/drop_caches");
 
-/** Removes every node's cache of the workspace, and the nodes' page cache, so a restore reads it from the bucket. */
+/**
+ * Removes every node's cache of the workspace, by its agent, as the gateway removes a deleted
+ * workspace's (src/gateway/snapshots.ts forgetDeleted), which spares what a restore still reads;
+ * asked again until it has; and the nodes' page cache, so a restore reads it from the bucket.
+ */
 async function coldCaches(workspace: string): Promise<void> {
-  for (const [node, pod] of await nodeAgents()) {
-    await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}`], { container: "node-agent" });
+  for (const node of (await nodeAgents()).keys()) {
+    for (const deadline = Date.now() + 120_000; ; await sleep(1000)) {
+      const { discarded } = JSON.parse(await agentOk(node, "DELETE", `/cache/${SESSIONS}/${workspace}`)) as { readonly discarded: boolean };
+      if (discarded) break;
+      if (Date.now() > deadline) throw new Error(`the agent of ${node} kept its cache of ${workspace} for 120 s, as a restore of it still read it`);
+    }
     await dropPageCache(node);
   }
 }
@@ -605,21 +775,31 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
       const asked = join(BENCH_DIR, "checkpoint-request.json");
       writeFileSync(asking, CHECKPOINT);
       writeFileSync(asked, JSON.stringify(request));
+      const liveT0 = Date.now();
+      const liveSent = (await storeBytes(node)).sent;
       const checkpointed = await inAgentNetwork(node, [asking, String(NODE_AGENT_PORT), SESSIONS, workspace, asked]).then(
         (stdout) => ({ code: 0, stdout, stderr: "" }),
         (error: unknown) => ({ code: 1, stdout: "", stderr: errorText(error) }),
       );
       const gaps = await driver<{ readonly max_gap_ms: number; readonly slowdown: number | null }>(workspace, "gaps", "--session", sessionId, "--fixture", fixture);
+      const liveSentBytes = (await storeBytes(node)).sent - liveSent;
       heldLive = await bucketBytes(node, workspace);
       const liveLogged = saveLogged(await bootLog(node, sandboxId));
-      const logged = { state_dir: request.live.stateDir, logged: liveLogged.said, gaps };
-      const measured = { unavailable_ms: gaps.max_gap_ms, pause_reported_ms: liveLogged.pauseMs, slowdown: gaps.slowdown, precopy_passes: liveLogged.passes, precopy_bytes: liveLogged.precopyBytes, uploaded_bytes: heldLive - heldBefore };
+      const liveSteps = await traced(node, workspace, liveT0);
+      const logged = { state_dir: request.live.stateDir, logged: liveLogged.said, gaps, pause_split: liveLogged.split, t0_wall_ms: liveT0, end_wall_ms: Date.now(), spike: { steps: liveSteps } };
+      const measured = {
+        unavailable_ms: gaps.max_gap_ms, pause_reported_ms: liveLogged.pauseMs, slowdown: gaps.slowdown, precopy_passes: liveLogged.passes, precopy_bytes: liveLogged.precopyBytes, uploaded_bytes: heldLive - heldBefore,
+        kernel_save_ms: liveLogged.kernelMs, memory_save_ms: liveLogged.memoryMs, overall_save_ms: liveLogged.overallMs, store_sent_bytes: liveSentBytes,
+      };
       if (checkpointed.code === 0) {
         const live = JSON.parse(checkpointed.stdout.trim().split("\n").at(-1) ?? "{}") as { readonly ms: number; readonly manifest: Manifest };
+        const imageBytes = live.manifest.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null;
         emit(fixture, sizeMib, run, "save-live", { ok: true, failure: null }, {
           ...measured,
           save_total_ms: live.ms,
-          image_bytes: live.manifest.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null,
+          image_bytes: imageBytes,
+          durable_store_ms: stepAt(liveSteps, "agent checkpoint-committed"),
+          uploaded_over_needed: imageBytes ? liveSentBytes / imageBytes : null,
         }, NO_CHECKS, { ...logged, snapshot: live.manifest.snapshot, runsc_checkpoint_ms: live.manifest.pauseMs, upload_ms: live.manifest.uploadMs, chain: live.manifest.layers.length });
       } else {
         // As alasio 10.0.0 fails it (mountedStateDir): its sandbox saved and running on, the snapshot never committed.
@@ -630,7 +810,10 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     done.add(phase);
 
     phase = "save-stop";
+    const stopT0 = Date.now();
+    const stopSent = (await storeBytes(node)).sent;
     const released = await release(workspace);
+    const stopSentBytes = (await storeBytes(node)).sent - stopSent;
     if (released.status < 200 || released.status >= 300) throw new Error(`the gateway's release answered ${released.status}: ${released.said}`);
     const manifest = JSON.parse(await agentOk(node, "GET", `/snapshots/${SESSIONS}/${workspace}`)) as Manifest;
     const record = JSON.parse(await agentOk(node, "GET", `/workspaces/${SESSIONS}/${workspace}/released`)) as { readonly snapshot: string; readonly release: string };
@@ -641,6 +824,10 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     }
     const heldStop = await bucketBytes(node, workspace);
     const stopLogged = saveLogged(await bootLog(node, sandboxId));
+    const stopSteps = await traced(node, workspace, stopT0);
+    // The release's own image, which a compaction since may have replaced as the manifest's.
+    const releasedLayer = manifest.compactedFrom === undefined ? manifest.layers[0] : undefined;
+    const stopImageBytes = releasedLayer?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null;
     emit(fixture, sizeMib, run, "save-stop", { ok: true, failure: null }, {
       save_total_ms: released.ms,
       pause_reported_ms: stopLogged.pauseMs,
@@ -648,7 +835,16 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
       precopy_bytes: 0,
       image_bytes: manifest.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null,
       uploaded_bytes: heldStop - heldLive,
-    }, NO_CHECKS, { snapshot: manifest.snapshot, runsc_checkpoint_ms: manifest.pauseMs, upload_ms: manifest.uploadMs, chain: manifest.layers.length, bytes: manifest.bytes, logged: stopLogged.said });
+      kernel_save_ms: stopLogged.kernelMs,
+      memory_save_ms: stopLogged.memoryMs,
+      overall_save_ms: stopLogged.overallMs,
+      durable_store_ms: stepAt(stopSteps, "agent checkpoint-committed"),
+      store_sent_bytes: stopSentBytes,
+      uploaded_over_needed: stopImageBytes ? stopSentBytes / stopImageBytes : null,
+    }, NO_CHECKS, {
+      snapshot: manifest.snapshot, runsc_checkpoint_ms: manifest.pauseMs, upload_ms: manifest.uploadMs, chain: manifest.layers.length, bytes: manifest.bytes, compacted_from: manifest.compactedFrom ?? null,
+      logged: stopLogged.said, pause_split: stopLogged.split, t0_wall_ms: stopT0, end_wall_ms: Date.now(), spike: { steps: stopSteps },
+    });
     done.add(phase);
     // Spike: the release's compaction of the chain, where one is due, killed as it starts, or waited for.
     const compaction = compactionDue(manifest.layers) === null ? null : VARIANT === "no-compaction" ? await killCompaction(node, manifest.snapshot) : VARIANT === "settled" ? await compactionEnded(node, manifest.snapshot) : null;
@@ -658,12 +854,11 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace }, to: { environment: SESSIONS, workspace: copy }, quotaBytes: quota.capacityBytes });
 
     phase = "restore-warm";
-    if (VARIANT !== "kept-cache") await dropPageCache(node);
-    const sampling = await sampleIo(node, `${fixture}-${sizeMib}-${run}-warm`);
-    const warm = await restore(workspace, sessionId, fixture, runId, manifest);
-    await sampling.stop();
-    const spike = { compaction, io: sampling.file, ...(await tracedRestore(node, workspace, warm.probed)) };
-    emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, { ...warm.details, spike });
+    if (PAGE_CACHE === "dropped") await dropPageCache(node);
+    // What the agent sent the store from the release's end on, before the warm restore: the release's compaction's upload, where one ran.
+    const compactionSent = (await storeBytes(node)).sent - stopSent - stopSentBytes;
+    const warm = await restore(node, workspace, sessionId, fixture, runId, manifest, "warm");
+    emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, { ...warm.details, compaction_sent_bytes: compactionSent, spike: { ...warm.details.spike, compaction } });
     done.add(phase);
     await endUnsaved(workspace, warm.pod);
 
@@ -674,7 +869,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     await inAgentNetwork(node, [new URL("dist/s3.mjs", COMMON).pathname, "copy", `${SESSIONS}/${workspace}/manifests/${manifest.snapshot}.json`, `${SESSIONS}/${workspace}/current.json`]);
     await agentOk(node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: manifest.snapshot, release: manifest.release });
     await coldCaches(workspace);
-    const cold = await restore(workspace, sessionId, fixture, runId, manifest);
+    const cold = await restore(node, workspace, sessionId, fixture, runId, manifest, "cold");
     emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, cold.details);
     done.add(phase);
     await endUnsaved(workspace, cold.pod);
@@ -807,6 +1002,7 @@ before(async () => {
     const agents = await nodeAgents();
     for (const node of agents.keys()) await bootLogs(node);
     await shapeAgents();
+    for (const node of (await nodeAgents()).keys()) await countStore(node);
     // How the store answers through the profile, from where the saves run: the node agent's network.
     const [node = ""] = (await nodeAgents()).keys();
     store = await probeStore(node);
@@ -833,4 +1029,14 @@ test(`alasio's sessions saved and restored, ${RUNS} runs of ${CASES.length} case
       console.error(`# ${fixture} ${size_mib} MiB run ${run} took ${Math.round((Date.now() - started) / 1000)} s`);
     }
   }
+  // Spike: bayma's own spans of its sandbox's hook, as the lake has them once it has one of the last restore's: each one's
+  // start and length, in logs/bayma-spans.jsonl, which data/build.py matches to the phase whose window holds its start.
+  const spans = "select SpanName as name, epoch_ns(Timestamp) as at_ns, Duration as ns, SpanAttributes as attributes from otel.traces where SpanName like 'bayma.sandbox.%' order by Timestamp";
+  const until = BigInt(lastRestoreAt) * 1_000_000n;
+  let rows: Record<string, unknown>[] = [];
+  for (const deadline = Date.now() + 300_000; Date.now() < deadline; await sleep(10_000)) {
+    rows = await lakeQuery(spans).catch((error: unknown) => [{ error: errorText(error) }]);
+    if (rows.some((row) => row["name"] === "bayma.sandbox.restore" && BigInt(String(row["at_ns"])) > until)) break;
+  }
+  writeFileSync(join(BENCH_DIR, "logs", "bayma-spans.jsonl"), rows.map((row) => JSON.stringify(row, (_key, value: unknown) => (typeof value === "bigint" ? String(value) : value))).join("\n"));
 });
