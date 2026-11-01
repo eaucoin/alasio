@@ -336,7 +336,7 @@ const SETUPS: Record<string, readonly Setup[]> = {
   // X-FIRST and X-SRV: JavaScriptCore's collections logged (in the first exec's stderr), the
   // server's V8 collections and memory reducer logged (in the restore's output), the heap's
   // limits a node sees in the sandbox; Python's collections the fixture records itself.
-  "traced-gc": [{ ...traced("traced-gc"), lazy: null, env: ["BUN_JSC_logGC=1"], nodeFlags: ["--trace-gc", "--trace-memory-reducer"], heapStats: true }],
+  "traced-gc": [{ ...traced("traced-gc"), lazy: null, env: ["BUN_JSC_logGC=1", "BENCH_HEAP_DETECTOR=1"], nodeFlags: ["--trace-gc", "--trace-memory-reducer"], heapStats: true }],
   // X-IDLE: a session left idle, saved live, then live and incrementally after 5, 30 and 120 s,
   // as it comes and with Bun's GC timer and mimalloc's purge of holes off.
   idle: [
@@ -348,6 +348,15 @@ const SETUPS: Record<string, readonly Setup[]> = {
   // collections and memory reducer logged; as bayma runs today, and with the server's memory
   // reducer off and a last-resort full collection just before each save; then restored warm.
   "idle-traced": [idleTraced("idle-traced", []), idleTraced("idle-srv-gc", ["--no-memory-reducer", "--expose-gc", `--require=${SERVER_GC}`])],
+  // G-3 at 200 MiB: what the Bun runtime reads before its first answer, as it comes, with the
+  // fixture's heap detector walking the heap at each exec, with Bun's GC timers off, and after a
+  // collection in an exec just before the save.
+  "bun-reads": [
+    { ...traced("bun-plain"), lazy: null },
+    { ...traced("bun-detector"), lazy: null, env: ["BENCH_HEAP_DETECTOR=1"] },
+    { ...traced("bun-quiet"), lazy: null, env: ["BUN_GC_TIMER_DISABLE=1"] },
+    { ...traced("bun-gc"), lazy: null, hygiene: { bun: "Bun.gc(true)", python: "None" } },
+  ],
   // X-HYG: the image a session saves as it comes, with its allocators asked to return memory at
   // once, and after a collection (and Bun's shrink of its heap) in an exec just before the save.
   hygiene: [
