@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 
 import { build } from "esbuild";
 
-const fixtures = ["bench.bun.js", "fan-out.py"];
+const fixtures = ["bench.bun.js", "fan-out.py", "repl.bun.js", "repl.py"];
 const sources = Object.fromEntries(fixtures.map((name) => [name, readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8")]));
 const path = (relative: string) => new URL(relative, import.meta.url).pathname;
 
