@@ -20,7 +20,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
-export const FIXTURES = ["idle", "poller", "fan-out", "saturating"] as const;
+export const FIXTURES = ["idle", "poller", "fan-out", "saturating", "repl-bun", "repl-bun-checkpointed", "repl-python", "repl-python-checkpointed"] as const;
 export type Fixture = (typeof FIXTURES)[number];
 
 /** The fixtures' sources, as the bundle embeds them, or read beside this file when it runs unbundled. */
@@ -34,13 +34,18 @@ const CALL_TIMEOUT_MS = 900_000;
 const CONNECT_TIMEOUT_MS = 300_000;
 /** How long setup lets the fixture run before it measures its steady rate. */
 const STEADY_MS = 10_000;
+/** The execs of work setup runs in a realistic fixture after installing it, as an agent's session runs a few. */
+const WORK_EXECS = 3;
 
 export const now = (): bigint => process.hrtime.bigint();
 const ms = (from: bigint, to: bigint): number => Number(to - from) / 1e6;
 const sleep = (wait: number) => new Promise<void>((resolve) => setTimeout(resolve, wait));
 
 /** The runtime a fixture runs in. */
-export const runtimeOf = (fixture: Fixture): "bun" | "python" => (fixture === "fan-out" ? "python" : "bun");
+export const runtimeOf = (fixture: Fixture): "bun" | "python" => (fixture === "fan-out" || fixture.startsWith("repl-python") ? "python" : "bun");
+
+/** Whether a fixture is a realistic REPL session (repl.bun.js, repl.py), which setup works with a few execs. */
+const realistic = (fixture: Fixture): boolean => fixture.startsWith("repl-");
 
 /** The marker a fixture holds live: what the driver compares what it reads back with. */
 export const markerOf = (runId: string, fixture: Fixture): string => createHash("sha256").update(`${runId}/${fixture}`).digest("hex");
@@ -147,8 +152,8 @@ function call(fixture: Fixture, method: string): string {
 function installer(fixture: Fixture, params: Record<string, unknown>): string {
   const json = JSON.stringify(params);
   return runtimeOf(fixture) === "python"
-    ? `import json\nPARAMS = json.loads(${JSON.stringify(json)})\n${source("fan-out.py")}`
-    : `const PARAMS = ${json};\n${source("bench.bun.js")}`;
+    ? `import json\nPARAMS = json.loads(${JSON.stringify(json)})\n${source(realistic(fixture) ? "repl.py" : "fan-out.py")}`
+    : `const PARAMS = ${json};\n${source(realistic(fixture) ? "repl.bun.js" : "bench.bun.js")}`;
 }
 
 /** Runs `use` with a client of `endpoint` holding control of `sessionId`, which it lets go of after. */
@@ -181,10 +186,12 @@ export async function setup(endpoint: Endpoint, { fixture, sizeMib, runId, rateM
     const started = now();
     const { value: installed } = await bayma.bench<Record<string, unknown>>(session.session_id, installer(fixture, { fixture, sizeMib, runId, rateMibS, workspace }));
     const installedAt = now();
+    const worked: Record<string, unknown>[] = [];
+    if (realistic(fixture)) for (let exec = 0; exec < WORK_EXECS; exec++) worked.push((await bayma.bench<Record<string, unknown>>(session.session_id, call(fixture, "work"))).value);
     await sleep(STEADY_MS);
     const { value: steady } = await bayma.bench<Record<string, unknown>>(session.session_id, call(fixture, "baseline"));
     await bayma.call("session.release_controller", { session_id: session.session_id });
-    return { session_id: session.session_id, fixture, size_mib: sizeMib, install_ms: ms(started, installedAt), ...installed, ...steady };
+    return { session_id: session.session_id, fixture, size_mib: sizeMib, install_ms: ms(started, installedAt), ...installed, ...(worked.length === 0 ? {} : { worked }), ...steady };
   } finally {
     await bayma.close();
   }

@@ -15,7 +15,7 @@
     "system": { "enum": ["alasio", "gvisor", "firecracker", "criu"] },
     "variant": { "type": "string", "pattern": "^[a-z0-9-]+$" },
     "target": { "enum": ["host", "docker"] },
-    "fixture": { "enum": ["idle", "poller", "fan-out", "saturating"] },
+    "fixture": { "enum": ["idle", "poller", "fan-out", "saturating", "repl-bun", "repl-bun-checkpointed", "repl-python", "repl-python-checkpointed"] },
     "size_mib": { "type": "integer", "minimum": 1 },
     "profile": { "enum": ["local", "s3-standard", "s3-express"] },
     "emulated": { "type": "boolean" },
