@@ -51,7 +51,14 @@ for 60 s and every await of pages logged (`--async-awaits-trace=log`); `traced-u
 dropped (`traced`) then kept (`traced-kept`), and cold through rclone's mount (`traced-lazy`).
 Restores run in the background, not paused, so that the application runs while its pages load;
 each restore's details carry `t0_unix_ms` and `first_answer_unix_ms`, on the clock of the
-Sentry's log, whose lines the endpoint package's G-3 reads.
+Sentry's log, whose lines the endpoint package's G-3 reads. Variant `traced-strace` logs the
+restored sandbox's system calls with their times (`--strace` on the restore alone, G-4);
+`traced-again` records the working set for 3 s, the probe's verify 4 s after its first exec,
+saves the sandbox of its warm restore again and restores that image (`traced-again-again`),
+which reads that working set first (G-14). Variant `evicted` (G-2) is upstream's warm restore
+with the page cache dropped (`evicted-dropped`), holding all but the image's files (`evicted`),
+and kept (`evicted-kept`), the host's disks and pressure sampled every 200 ms through each
+(`logs/<run>/<restore>.io.txt`).
 
 ## What is measured, and how
 

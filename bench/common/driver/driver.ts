@@ -5,7 +5,7 @@
  *   node driver.mjs setup  --url U [--header 'Name: value']... --fixture F --size-mib N --run-id R [--rate-mib-s X] [--workspace /workspace]
  *   node driver.mjs mark   --url U [--header ...] --session S --fixture F
  *   node driver.mjs gaps   --url U [--header ...] --session S --fixture F
- *   node driver.mjs probe  --url U [--header ...] --session S --fixture F --run-id R [--t0-ns T]
+ *   node driver.mjs probe  --url U [--header ...] --session S --fixture F --run-id R [--t0-ns T] [--verify-after-ms M]
  *   node driver.mjs close  --url U [--header ...] --session S
  *   node driver.mjs now
  *
@@ -220,13 +220,15 @@ const saysClosed = (notice: string | null): boolean => notice !== null && /conne
 
 /**
  * The restore probe: from `t0` (the restore asked; now, where not given), connects, takes the
- * session over, runs the first exec, then the verify exec, and says what they found.
+ * session over, runs the first exec, then, `verifyAfterMs` later, the verify exec, and says what
+ * they found.
  */
-export async function probe(endpoint: Endpoint, sessionId: string, fixture: Fixture, runId: string, t0 = now()) {
+export async function probe(endpoint: Endpoint, sessionId: string, fixture: Fixture, runId: string, t0 = now(), verifyAfterMs = 0) {
   return controlling(endpoint, sessionId, async (bayma) => {
     const connected = now();
     const { value: first, notice } = await bayma.bench<Record<string, unknown>>(sessionId, call(fixture, "first"));
     const firstEnd = now();
+    await sleep(verifyAfterMs);
     const { value: verified } = await bayma.bench<Verified>(sessionId, call(fixture, "verify"));
     const verifyEnd = now();
     const marker = verified.marker === markerOf(runId, fixture) && first["marker"] === verified.marker;
@@ -308,6 +310,7 @@ async function main(argv: readonly string[]): Promise<unknown> {
       workspace: { type: "string", default: "/workspace" },
       session: { type: "string" },
       "t0-ns": { type: "string" },
+      "verify-after-ms": { type: "string", default: "0" },
     },
   });
   if (command === "now") return { now_ns: String(now()) };
@@ -325,7 +328,7 @@ async function main(argv: readonly string[]): Promise<unknown> {
   if (command === "mark") return mark(endpoint, sessionId, fixtureOf(values.fixture));
   if (command === "gaps") return gaps(endpoint, sessionId, fixtureOf(values.fixture));
   if (command === "probe") {
-    return probe(endpoint, sessionId, fixtureOf(values.fixture), required(values["run-id"], "run-id"), values["t0-ns"] ? BigInt(values["t0-ns"]) : now());
+    return probe(endpoint, sessionId, fixtureOf(values.fixture), required(values["run-id"], "run-id"), values["t0-ns"] ? BigInt(values["t0-ns"]) : now(), Number(values["verify-after-ms"]));
   }
   if (command === "close") return close(endpoint, sessionId);
   throw new Error(`no command ${command}: setup, mark, gaps, probe, close or now`);

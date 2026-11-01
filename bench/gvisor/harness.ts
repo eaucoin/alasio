@@ -184,10 +184,25 @@ interface Setup {
   readonly bayma: string;
   /** Whether a run saves live before it saves and stops (save-live). */
   readonly live: boolean;
-  /** The warm restores of each run, in order, and the variant each carries: with the page cache dropped, or kept. */
-  readonly warm: readonly { readonly variant: string; readonly cache: "dropped" | "kept" }[];
+  /**
+   * The warm restores of each run, in order, and the variant each carries: with the page cache
+   * dropped, kept, or holding all but the image's files (`evicted`, the endpoint package's G-2).
+   */
+  readonly warm: readonly { readonly variant: string; readonly cache: "dropped" | "kept" | "evicted" }[];
   /** Whether a run restores cold from the bucket downloaded whole (`fetch`). */
   readonly fetch: boolean;
+  /** runsc's flags for its restores alone, which the sandboxes they start run with. */
+  readonly restoreFlags: readonly string[];
+  /** Whether the host's disk and pressure are sampled every 200 ms through each restore. */
+  readonly sampleIO: boolean;
+  /**
+   * Whether the sandbox of the first warm restore is saved again once its first exec has
+   * answered, and that image restored (variant `-again`): the working set the first restore
+   * recorded is read first (the endpoint package's G-14).
+   */
+  readonly again: boolean;
+  /** How long the probe waits between the first exec and the verify, which reads every page. */
+  readonly verifyAfterMs: number;
 }
 
 const TUNED: Setup = {
@@ -209,21 +224,24 @@ const TUNED: Setup = {
   live: true,
   warm: [{ variant: "fetch", cache: "dropped" }],
   fetch: true,
+  restoreFlags: [],
+  sampleIO: false,
+  again: false,
+  verifyAfterMs: 0,
 };
 
 const DEFAULTS: Setup = { ...TUNED, name: "defaults", variant: "defaults", hostSettings: "check", checkpoint: [], background: false, warmDirect: false, lazy: null, warm: [{ variant: "defaults", cache: "dropped" }] };
 
 /**
- * The fork's measurement build (install.sh given its release's directory; the endpoint package's G-3): runsc as alasio
- * 10.0.5 configures it ([runsc_config] in cli/src/cluster/k3s.ts), the working set recorded for
- * 60 s rather than 3 s so that it covers the first exec and the verify, and every await of pages
- * logged (--async-awaits-trace=log); restored in the background but not paused, so that the
- * application runs while its pages load, warm with the page cache dropped and then kept, and cold
- * through rclone's mount on a store's profiles. `uncached` also maps large pmas' accessed ranges
+ * The fork's measurement build (install.sh given its release's directory; the endpoint package's
+ * G-3): runsc as alasio 10.0.5 configures it ([runsc_config] in cli/src/cluster/k3s.ts), the
+ * working set recorded for 60 s rather than 3 s so that it covers the first exec and the verify,
+ * and every await of pages logged (--async-awaits-trace=log); restored in the background but not
+ * paused, so that the application runs while its pages load, warm with the page cache dropped
+ * and then kept, and cold through rclone's mount. `uncached` also maps large pmas' accessed ranges
  * alone while they load, as upstream's c63a70c947 does.
  */
-const traced = (uncached: boolean): Setup => {
-  const variant = uncached ? "traced-uncached" : "traced";
+function traced(variant: string, { uncached = false, window = "60s" } = {}): Setup {
   return {
     ...TUNED,
     name: variant,
@@ -232,7 +250,7 @@ const traced = (uncached: boolean): Setup => {
     flags: [
       "--restore-validate-files=all",
       "--dirty-tracking=wp",
-      "--working-set-window=60s",
+      `--working-set-window=${window}`,
       "--allow-live-tcp-migration=false",
       "--app-huge-pages=false",
       "--async-awaits-trace=log",
@@ -244,6 +262,22 @@ const traced = (uncached: boolean): Setup => {
     warm: [{ variant, cache: "dropped" }, { variant: `${variant}-kept`, cache: "kept" }],
     fetch: false,
   };
+}
+
+/** The job's setups, by the variant its job runs. */
+const SETUPS: Record<string, readonly Setup[]> = {
+  tuned: [TUNED],
+  defaults: [DEFAULTS],
+  traced: [traced("traced")],
+  "traced-uncached": [traced("traced-uncached", { uncached: true })],
+  // G-4: the restored sandbox's system calls, the hook's among them, logged with their times.
+  "traced-strace": [{ ...traced("traced-strace"), lazy: null, restoreFlags: ["--strace"] }],
+  // G-14: the working set of the first exec alone (3 s, the probe's verify after it), saved with
+  // the sandbox again and read first by the restore of that image.
+  "traced-again": [{ ...traced("traced-again", { window: "3s" }), lazy: null, warm: [{ variant: "traced-again", cache: "dropped" }], again: true, verifyAfterMs: 4000 }],
+  // G-2: upstream's warm restore with the page cache dropped, holding all but the image, and kept,
+  // the disk and pressure sampled through each.
+  evicted: [{ ...TUNED, name: "evicted", variant: "evicted", live: false, fetch: false, lazy: null, sampleIO: true, warm: [{ variant: "evicted-dropped", cache: "dropped" }, { variant: "evicted", cache: "evicted" }, { variant: "evicted-kept", cache: "kept" }] }],
 };
 
 /** The host's settings `--host-settings=adjust` changes (runsc/hostsettings), as they are now. */
@@ -493,6 +527,29 @@ async function dropCaches(): Promise<void> {
   writeFileSync("/proc/sys/vm/drop_caches", "1");
 }
 
+/** Drops the page cache of the image's files alone, as a node evicts an image it no longer runs. */
+async function evictImage(image: string): Promise<void> {
+  await run("sync", []);
+  for (const name of readdirSync(image)) await run("dd", [`if=${join(image, name)}`, "iflag=nocache", "count=0", "status=none"]);
+}
+
+/**
+ * Samples the host's disks' counters (/proc/diskstats) and its I/O and CPU pressure
+ * (/proc/pressure) every 200 ms into `out`, each sample's lines after its time on the wall clock,
+ * until stopped.
+ */
+function ioSampler(out: string) {
+  const disk = /^\s*\d+\s+\d+\s+(?:sd[a-z]+|vd[a-z]+|nvme\d+n\d+)\s/u;
+  const sample = () => {
+    const disks = readFileSync("/proc/diskstats", "utf8").split("\n").filter((line) => disk.test(line));
+    const pressure = ["io", "cpu"].map((kind) => readFileSync(`/proc/pressure/${kind}`, "utf8").trim().split("\n").map((line) => `${kind} ${line}`));
+    appendFileSync(out, `@${Date.now()}\n${[...disks, ...pressure.flat()].join("\n")}\n`);
+  };
+  sample();
+  const timer = setInterval(sample, 200);
+  return { stop: () => { clearInterval(timer); sample(); } };
+}
+
 /** Puts back /attach as the save that ended the instance left it. */
 async function rewindAttach(p: Paths): Promise<void> {
   rmSync(p.attach, { recursive: true, force: true });
@@ -501,7 +558,8 @@ async function rewindAttach(p: Paths): Promise<void> {
 
 /**
  * One restore of the save-stop image: `prepare` (inside t0) readies the image directory and
- * says what to restore from; the restore, the probe and `runsc wait --restore` then run.
+ * says what to restore from; the restore, the probe and `runsc wait --restore` then run. Where
+ * `saveTo` is given, the restored sandbox is then saved there, as it ends.
  */
 async function restore(
   setup: Setup,
@@ -511,24 +569,28 @@ async function restore(
   sessionId: string,
   name: string,
   prepare: () => Promise<{ readonly imagePath: string; readonly direct: boolean; readonly helpers: () => readonly number[]; readonly details: Row; readonly helperPeakBytes?: number }>,
+  saveTo?: string,
 ): Promise<{ ok: boolean; failure: string | null; metrics: Row; correctness?: Row; details: Row }> {
   const logDir = join(p.logs, name);
   mkdirSync(logDir, { recursive: true });
   await netUp();
+  const io = setup.sampleIO ? ioSampler(join(p.logs, `${name}.io.txt`)) : undefined;
   try {
     let helperPeak = 0;
     let sampler: ReturnType<typeof peakSampler> | undefined;
     // t0 on the wall clock as well, which the Sentry's log lines are on.
     const t0UnixMs = Date.now();
     const t0 = now();
-    const probe = background(process.execPath, [DRIVER, "probe", ...endpointArgs, "--session", sessionId, "--fixture", fixture, "--run-id", runId, "--t0-ns", String(t0)], { timeoutMs: RESTORE_DEADLINE_MS + VERIFY_ALLOWANCE_MS });
+    const probe = background(process.execPath, [
+      DRIVER, "probe", ...endpointArgs, "--session", sessionId, "--fixture", fixture, "--run-id", runId, "--t0-ns", String(t0), "--verify-after-ms", String(setup.verifyAfterMs),
+    ], { timeoutMs: RESTORE_DEADLINE_MS + VERIFY_ALLOWANCE_MS + setup.verifyAfterMs });
     try {
       const prepared = await prepare();
       helperPeak += prepared.helperPeakBytes ?? 0;
       sampler = peakSampler(prepared.helpers);
       const restoreStart = now();
       await sandboxCommand(setup, logDir, join(p.logs, `${name}.out`), [
-        "restore", "--detach", `--bundle=${p.bundle}`, `--image-path=${prepared.imagePath}`, ...(setup.background ? ["--background"] : []), ...(prepared.direct ? ["--direct"] : []), p.id,
+        ...setup.restoreFlags, "restore", "--detach", `--bundle=${p.bundle}`, `--image-path=${prepared.imagePath}`, ...(setup.background ? ["--background"] : []), ...(prepared.direct ? ["--direct"] : []), p.id,
       ]);
       const restored = now();
       const waited = runsc(setup, logDir, ["wait", "--restore", p.id]).then(() => now());
@@ -557,6 +619,7 @@ async function restore(
       helperPeak += sampler.stop();
       sampler = undefined;
       const log = bootLog(logDir);
+      if (saveTo !== undefined) await runsc(setup, logDir, ["checkpoint", `--image-path=${saveTo}`, ...setup.checkpoint, `--save-restore-exec-argv=${HOOK.join(" ")}`, p.id]);
       return {
         ok: said.ok,
         failure: said.failure,
@@ -588,6 +651,7 @@ async function restore(
       writeFileSync(join(p.logs, `${name}.probe.err`), (await probe.done).stderr);
     }
   } finally {
+    io?.stop();
     await endInstance(setup, logDir, p.id);
     await netDown();
   }
@@ -718,18 +782,41 @@ async function oneRun(job: Job, setup: Setup, fixture: string, size: number, run
   // The image directory the save staged, from the runner's disk: no restore starts with any of
   // it in the page cache (DESIGN.md section 4), but one of a setup that restores it again with
   // the page cache kept, as a node keeps the files of an image its sandboxes run.
-  for (const warm of setup.warm) {
+  const again = { image: join(p.dir, "image-again"), attach: join(p.dir, "attach.again") };
+  for (const [index, warm] of setup.warm.entries()) {
+    const saveAgain = setup.again && index === 0;
     try {
       await rewindAttach(p);
       if (warm.cache === "dropped") await dropCaches();
-      emit(job, rowOf(job.common, setup, at, warm.variant, "restore-warm", await restore(setup, p, fixture, runId, sessionId, warm.cache === "dropped" ? "warm" : "warm-kept", async () => ({
+      if (warm.cache === "evicted") await evictImage(p.stop);
+      emit(job, rowOf(job.common, setup, at, warm.variant, "restore-warm", await restore(setup, p, fixture, runId, sessionId, warm.cache === "dropped" ? "warm" : `warm-${warm.cache}`, async () => ({
         imagePath: p.stop, direct: setup.warmDirect, helpers: () => [], details: { source: "staged image directory", page_cache: warm.cache },
-      }))));
+      }), saveAgain ? again.image : undefined)));
+      // The attach as the save again left it, for the restore of that image.
+      if (saveAgain) await run("cp", ["-a", "--reflink=auto", p.attach, again.attach]);
     } catch (error) {
       emit(job, rowOf(job.common, setup, at, warm.variant, "restore-warm", failed(error)));
     }
   }
   rmSync(p.stop, { recursive: true, force: true });
+  // The image saved again from the first warm restore's sandbox, which holds the working set that
+  // restore recorded, restored as the first was; the attach it saved is the one to restore with.
+  if (setup.again) {
+    const variantAgain = `${variant}-again`;
+    try {
+      if (!existsSync(again.attach)) throw new Error("not reached: the first warm restore was not saved again");
+      rmSync(p.attach, { recursive: true, force: true });
+      await run("cp", ["-a", "--reflink=auto", again.attach, p.attach]);
+      await dropCaches();
+      emit(job, rowOf(job.common, setup, at, variantAgain, "restore-warm", await restore(setup, p, fixture, runId, sessionId, "warm-again", async () => ({
+        imagePath: again.image, direct: setup.warmDirect, helpers: () => [], details: { source: "image saved again from the first warm restore", page_cache: "dropped" },
+      }))));
+    } catch (error) {
+      emit(job, rowOf(job.common, setup, at, variantAgain, "restore-warm", failed(error)));
+    }
+    rmSync(again.image, { recursive: true, force: true });
+    rmSync(again.attach, { recursive: true, force: true });
+  }
 
   for (const cold of colds) {
     try {
@@ -858,16 +945,9 @@ async function main([profile]: readonly string[]): Promise<void> {
     },
   };
   // The job's variant: `all` is the tuned setup, and upstream's defaults beside it on the store
-  // as the box runs it; `tuned` and `defaults` one of them, as a job of its own; `traced` and
-  // `traced-uncached` the fork's measurement build's, each a job of its own.
+  // as the box runs it; any other one of SETUPS, as a job of its own.
   const variantAsked = process.env["BENCH_VARIANT"] ?? "all";
-  const named: Record<string, readonly Setup[]> = {
-    tuned: [TUNED],
-    defaults: [DEFAULTS],
-    traced: [traced(false)],
-    "traced-uncached": [traced(true)],
-  };
-  const setups = named[variantAsked] ?? (profile === "local" ? [TUNED, DEFAULTS] : [TUNED]);
+  const setups = SETUPS[variantAsked] ?? (profile === "local" ? [TUNED, DEFAULTS] : [TUNED]);
   const images = new Set(setups.map((setup) => setup.image));
   if (images.size !== 1) throw new Error(`a job runs one session image, not ${[...images].join(" and ")}`);
   mkdirSync(WORK, { recursive: true });
