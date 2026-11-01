@@ -32,6 +32,7 @@ import { after, before, test } from "node:test";
 import type { V1Deployment, V1Pod, V1Service } from "@kubernetes/client-node";
 
 import { NODE_PINS } from "../../cli/src/cluster/node.ts";
+import { STARGZ_ROOT } from "../../cli/src/cluster/stargz.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { GATEWAY as STORE_GATEWAY } from "../../cli/src/manifests/object-store.ts";
@@ -281,13 +282,14 @@ async function podMemory(node: string, uid: string): Promise<{ readonly peak: nu
     `[ -n "$dir" ] || exit 0`,
     `echo "peak $(cat "$dir/memory.peak")"`,
     `echo "current $(cat "$dir/memory.current")"`,
-    `grep -E '^(anon|file) ' "$dir/memory.stat"`,
+    `grep -E '^(anon|file|shmem|file_mapped|workingset_refault_file) ' "$dir/memory.stat"`,
   ].join("; "));
   const field = (name: string) => {
     const value = printed.split("\n").find((line) => line.startsWith(`${name} `))?.split(" ")[1];
     return value === undefined ? null : Number(value);
   };
-  return { peak: field("peak"), current: field("current"), stat: { anon: field("anon") ?? 0, file: field("file") ?? 0 } };
+  const stat = Object.fromEntries(["anon", "file", "shmem", "file_mapped", "workingset_refault_file"].map((name) => [name, field(name) ?? 0]));
+  return { peak: field("peak"), current: field("current"), stat };
 }
 
 /**
@@ -452,8 +454,9 @@ async function sampleIo(node: string, name: string): Promise<{ readonly file: st
     "  echo \"pio $(head -n 1 /proc/pressure/io)\"",
     "  echo \"pcpu $(head -n 1 /proc/pressure/cpu)\"",
     "  head -n 1 /proc/stat",
-    "  for p in $(pgrep -f 'runsc|bayma'); do",
-    "    echo \"p $p $(grep -E '^(read|write)_bytes' /proc/$p/io 2>/dev/null | tr '\\n' ' ')| $(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200)\"",
+    "  for c in /sys/fs/fuse/connections/*; do echo \"fuse $c $(cat $c/waiting 2>/dev/null)\"; done",
+    "  for p in $(pgrep -f 'runsc|bayma|stargz|juicefs|containerd|k3s'); do",
+    "    echo \"p $p $(grep -E '^(rchar|read_bytes|write_bytes)' /proc/$p/io 2>/dev/null | tr '\\n' ' ')cpu $(cut -d' ' -f14,15 /proc/$p/stat 2>/dev/null) | $(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200)\"",
     "  done",
     "  sleep 0.2",
     "done",
@@ -486,6 +489,52 @@ async function tracedRestore(node: string, workspace: string, probed: Record<str
     steps: Object.entries(steps).toSorted(([, a], [, b]) => a - b),
     probe: { initialized: fromT0("initialized_ns"), acquired: fromT0("connected_ns"), first_exec_end: fromT0("first_exec_end_ns"), refusals: probed["refusals"] },
   };
+}
+
+/**
+ * Spike (X-PC): what the node has read, by cgroup and by process, and what its memory caches,
+ * into logs/reads-<name>.txt: every cgroup's io.stat, /proc/meminfo, and the read bytes and CPU
+ * time of the stargz daemon, its FUSE manager, JuiceFS, containerd, k3s, runsc and bayma; and,
+ * where `files`, the page cache that cachestat(2) counts over the stargz daemon's root (its cache
+ * files and, through its FUSE mounts, the session image's files as the sandbox sees them) and the
+ * node's own binaries, by directory, with the 60 files that hold most of it.
+ */
+async function nodeReads(node: string, name: string, files: boolean): Promise<string> {
+  const file = join(BENCH_DIR, "logs", `reads-${name}.txt`);
+  const helper = join(BENCH_DIR, "cachestat.py");
+  writeFileSync(helper, [
+    "import collections, ctypes, json, os, stat, sys",
+    "libc = ctypes.CDLL(None, use_errno=True)",
+    "class Range(ctypes.Structure): _fields_ = [('off', ctypes.c_uint64), ('len', ctypes.c_uint64)]",
+    "class Stat(ctypes.Structure): _fields_ = [(n, ctypes.c_uint64) for n in ('nr_cache', 'nr_dirty', 'nr_writeback', 'nr_evicted', 'nr_recently_evicted')]",
+    "totals, top = collections.Counter(), []",
+    "for root in sys.argv[1:]:",
+    "    for directory, _, names in os.walk(root):",
+    "        key = '/'.join(directory.split('/')[: root.count('/') + 4])",
+    "        for each in names:",
+    "            path = os.path.join(directory, each)",
+    "            try:",
+    "                if not stat.S_ISREG(os.lstat(path).st_mode): continue",
+    "                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)",
+    "            except OSError: continue",
+    "            try:",
+    "                cached = Stat()",
+    "                if libc.syscall(451, fd, ctypes.byref(Range(0, 0)), ctypes.byref(cached), 0) == 0 and cached.nr_cache:",
+    "                    totals[key] += cached.nr_cache * 4096",
+    "                    top.append((cached.nr_cache * 4096, path))",
+    "            finally: os.close(fd)",
+    "print(json.dumps({'by_directory': dict(totals.most_common()), 'top': sorted(top, reverse=True)[:60]}))",
+  ].join("\n"));
+  const roots = [STARGZ_ROOT, "/usr/local/lib/alasio", "/usr/local/bin", "/var/lib/rancher/k3s/data"];
+  await onNode(node, [
+    `{ echo "@ $(date +%s%N)"`,
+    "for f in $(find /sys/fs/cgroup -name io.stat); do echo \"io $f $(tr '\\n' ';' < $f)\"; done",
+    "grep -E '^(Buffers|Cached|Mapped|Shmem):' /proc/meminfo",
+    "for p in $(pgrep -f 'runsc|bayma|stargz|juicefs|containerd|k3s'); do echo \"p $p $(grep -E '^(rchar|read_bytes)' /proc/$p/io 2>/dev/null | tr '\\n' ' ')cpu $(cut -d' ' -f14,15 /proc/$p/stat 2>/dev/null) | $(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200)\"; done",
+    ...(files ? [`echo "cachestat $(python3 '${helper}' ${roots.join(" ")})"`] : []),
+    `} >> '${file}' 2>&1`,
+  ].join("; "));
+  return file;
 }
 
 /** Drops the page cache of `node`, as every restore starts with it dropped, so what ran before leaves it nothing. */
@@ -658,11 +707,18 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace }, to: { environment: SESSIONS, workspace: copy }, quotaBytes: quota.capacityBytes });
 
     phase = "restore-warm";
+    // Spike (X-PC): what the node reads in as long as a restore takes, without one, as a control.
     if (VARIANT !== "kept-cache") await dropPageCache(node);
+    await nodeReads(node, `${fixture}-${sizeMib}-${run}-control`, false);
+    await sleep(4000);
+    await nodeReads(node, `${fixture}-${sizeMib}-${run}-control`, true);
+    if (VARIANT !== "kept-cache") await dropPageCache(node);
+    const reads = await nodeReads(node, `${fixture}-${sizeMib}-${run}-warm`, false);
     const sampling = await sampleIo(node, `${fixture}-${sizeMib}-${run}-warm`);
     const warm = await restore(workspace, sessionId, fixture, runId, manifest);
     await sampling.stop();
-    const spike = { compaction, io: sampling.file, ...(await tracedRestore(node, workspace, warm.probed)) };
+    await nodeReads(node, `${fixture}-${sizeMib}-${run}-warm`, true);
+    const spike = { compaction, io: sampling.file, reads, ...(await tracedRestore(node, workspace, warm.probed)) };
     emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, { ...warm.details, spike });
     done.add(phase);
     await endUnsaved(workspace, warm.pod);
