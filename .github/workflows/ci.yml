@@ -239,6 +239,20 @@ jobs:
             [[ $setting =~ ^BENCH_[A-Z0-9_]+=[A-Za-z0-9_./:,-]*$ ]] || { echo "::error::$setting is no BENCH_NAME=value"; exit 1; }
             echo "$setting" | tee --append "$GITHUB_ENV"
           done
+      # Spike: the gVisor fork's build under test (BENCH_GVISOR_RUN, a run of its Fork repeat with a tarball), served on
+      # the runner for alasio to install as its current release (cli/src/cluster/node.ts downloads).
+      - name: The gVisor build under test
+        if: env.BENCH_GVISOR_RUN != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dir="$BENCH_DIR/gvisor"
+          mkdir -p "$dir"
+          gh run download "$BENCH_GVISOR_RUN" -R eaucoin/gvisor -n gvisor-x86_64 -D "$dir"
+          (cd "$dir" && sha512sum -c gvisor-x86_64.tar.zstd.sha512)
+          nohup python3 -m http.server 8975 --bind 127.0.0.1 --directory "$dir" >"$BENCH_DIR/gvisor-http.log" 2>&1 &
+          echo "BENCH_GVISOR_URL=http://127.0.0.1:8975/gvisor-x86_64.tar.zstd" >>"$GITHUB_ENV"
+          echo "BENCH_GVISOR_SHA512=$(cut -d' ' -f1 "$dir/gvisor-x86_64.tar.zstd.sha512")" >>"$GITHUB_ENV"
       - name: Run ${{ matrix.system }}
         run: bench/${{ matrix.system }}/run.sh "$BENCH_TARGET" "$BENCH_PROFILE"
         env:

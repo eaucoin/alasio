@@ -74,9 +74,12 @@ export const downloads = ({ k3s, gvisor, stargz }: NodePins): {
 } => ({
   k3s: { url: `https://github.com/k3s-io/k3s/releases/download/${encodeURIComponent(k3s.version)}/k3s`, algorithm: "sha256", digest: k3s.sha256 },
   installScript: { url: `https://raw.githubusercontent.com/k3s-io/k3s/${k3s.installScript.commit}/install.sh`, algorithm: "sha256", digest: k3s.installScript.sha256 },
-  gvisor: new Map(gvisor.releases.map(({ release, sha512 }) => [
+  gvisor: new Map(gvisor.releases.map(({ release, sha512 }, index) => [
     release,
-    { url: `https://github.com/eaucoin/gvisor/releases/download/release-${encodeURIComponent(release)}/gvisor-x86_64.tar.zstd`, algorithm: "sha512", digest: sha512 },
+    // Spike: the benchmark runs a build of the fork under test as the current release, served on the runner.
+    index === 0 && process.env["BENCH_GVISOR_URL"] && process.env["BENCH_GVISOR_SHA512"]
+      ? { url: process.env["BENCH_GVISOR_URL"], algorithm: "sha512", digest: process.env["BENCH_GVISOR_SHA512"] }
+      : { url: `https://github.com/eaucoin/gvisor/releases/download/release-${encodeURIComponent(release)}/gvisor-x86_64.tar.zstd`, algorithm: "sha512", digest: sha512 },
   ])),
   stargz: {
     url: `https://github.com/containerd/stargz-snapshotter/releases/download/${encodeURIComponent(stargz.version)}/stargz-snapshotter-${encodeURIComponent(stargz.version)}-linux-amd64.tar.gz`,
