@@ -28,6 +28,7 @@ import { SNAPSHOT_ID } from "../src/kube/sandbox-shape.ts";
 import {
   type AbandonRequest,
   type CheckpointRequest,
+  CLOCK_SKEW_MS,
   COLLECT_GRACE_MS,
   COMPACTING_FILE,
   compactionDue,
@@ -862,6 +863,53 @@ test("a compaction checks its image in the bucket once it holds the workspace, a
     })
   ));
 
+/** Resolves once `done` says so, looked at every 10 ms of the process's time: under a TestClock, which holds Schedule's waits as it holds Effect.sleep's. */
+const until = (done: () => boolean | Promise<boolean>) =>
+  Effect.promise(async () => {
+    while (!(await done())) await new Promise((resolve) => setTimeout(resolve, 10));
+  });
+
+test("a compaction whose upload began the collection's grace ago, less the clocks' skew, or longer commits nothing, and leaves nothing of its image", () =>
+  added("alasio.node_agent.compactions", () =>
+    withBucket(({ s3, node }) =>
+      Effect.gen(function*() {
+        yield* TestClock.setTime(Date.now());
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const here = yield* node("node-1");
+        const runscDir = here.releases.dirOf(RELEASE);
+        writeFileSync(join(runscDir, "delta-pages-bytes"), "512");
+        yield* here.agent.checkpoint(request("fs-abc"));
+        const { manifest } = yield* here.agent.prepare(workspace);
+        yield* here.agent.spend(workspace, manifest.snapshot);
+        yield* here.agent.resume(resumeRequest(manifest.snapshot));
+        writeFileSync(join(runscDir, "delta-pages-bytes"), "4096");
+        writeFileSync(join(runscDir, "hold-compact"), "");
+        const delta = yield* here.agent.checkpoint(request("fs-abc"));
+        const named = (key: string) => delta.layers.some(({ digest }) => key.startsWith(`main/fs-abc/layers/${digest}/`));
+        // Its image's first file held as it is put, as the clock moves on.
+        let letGo = () => {};
+        const held = new Promise<void>((resolve) => (letGo = resolve));
+        let putting = () => {};
+        const put = new Promise<void>((resolve) => (putting = resolve));
+        s3.holdPut = (key) => (key.startsWith("main/fs-abc/layers/") && !named(key) ? (putting(), held) : null);
+        rmSync(join(runscDir, "hold-compact"));
+        yield* Effect.promise(() => put);
+        /** How many compactions have ended, as their outcomes are counted. */
+        const ended = async () => (await collected("alasio.node_agent.compactions")).reduce((sum, { value }) => sum + value, 0);
+        const before = yield* Effect.promise(ended);
+        yield* TestClock.adjust(COLLECT_GRACE_MS - CLOCK_SKEW_MS);
+        s3.holdPut = () => null;
+        letGo();
+        yield* until(async () => (await ended()) > before);
+        // Its chain stays current, and what it wrote is removed, as of a compaction that fails.
+        assert.deepEqual(yield* here.agent.current(workspace), delta);
+        assert.deepEqual(keysOf(s3, "main/fs-abc/layers/").filter((key) => !named(key)), []);
+        assert.deepEqual(imagesOf(here, "fs-abc"), delta.layers.map(({ digest }) => digest).sort());
+        assert.equal(existsSync(join(here.cacheDir, "main", "fs-abc", COMPACTING_FILE)), false);
+      }).pipe(Effect.provide(TestClock.layer()))
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=CommitOverdue": 1 })));
+
 test("a restore of the workspace on the node stops its compaction, as runsc compacts or as its image is uploaded, which leaves nothing of the compacted image, and the chain is restored", () =>
   added("alasio.node_agent.compactions", () =>
     withBucket(({ s3, node }) =>
@@ -1177,6 +1225,41 @@ test("a snapshot is committed only once each image it refers to is in the bucket
       );
       assert.equal(yield* there.agent.current(workspace), null);
     })
+  ));
+
+test("a snapshot whose first upload began the collection's grace ago, less the clocks' skew, or longer is not committed: a release's is forgotten, as a checkpoint that fails forgets it", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      yield* TestClock.setTime(Date.now());
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const here = yield* node("node-1");
+      /** A checkpoint of fs-abc, its image's first file held as it is put while the clock moves on by `elapsed`: how it ended. */
+      const heldFor = (elapsed: number) =>
+        Effect.gen(function*() {
+          let letGo = () => {};
+          const held = new Promise<void>((resolve) => (letGo = resolve));
+          let putting = () => {};
+          const put = new Promise<void>((resolve) => (putting = resolve));
+          s3.holdPut = (key) => (key.startsWith("main/fs-abc/layers/") ? (putting(), held) : null);
+          const checkpoint = yield* Effect.forkChild(Effect.exit(here.agent.checkpoint(request("fs-abc"))));
+          yield* Effect.promise(() => put);
+          yield* TestClock.adjust(elapsed);
+          s3.holdPut = () => null;
+          letGo();
+          return yield* Fiber.join(checkpoint);
+        });
+      const within = COLLECT_GRACE_MS - CLOCK_SKEW_MS;
+      const committed = yield* heldFor(within - 1);
+      assert.ok(Exit.isSuccess(committed));
+      assert.deepEqual(yield* here.agent.current(workspace), committed.value);
+      assert.match(
+        failure(yield* heldFor(within)),
+        new RegExp(`^checkpointing main/fs-abc failed: the snapshot ${SNAPSHOT_ID} of main/fs-abc is not committed: its upload began 3300 s ago, 55 min or more, by when a collection may have taken what it uploaded; its snapshot is forgotten, as the workspace has moved on since it was taken$`, "u"),
+      );
+      assert.equal(yield* here.agent.current(workspace), null);
+      assert.deepEqual(keysOf(s3, "main/fs-abc/"), []);
+      assert.equal(cachesAny(here, "fs-abc"), false);
+    }).pipe(Effect.provide(TestClock.layer()))
   ));
 
 test("a checkpoint of a container no sandbox runs, as one whose release is asked again once the checkpoint before it ended its sandbox, keeps the workspace's snapshot, restorable, and says so", () =>

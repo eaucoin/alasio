@@ -38,8 +38,9 @@
  * images and manifests that neither the current snapshot, nor the latest, which a sandbox
  * restored from it may still extend, nor the one the latest was compacted from, which one
  * restored from it may extend as well, nor one superseded within COLLECT_GRACE_MS names, nor
- * written within it, as a commit writes its images before its manifest. A restore or a
- * copy that read a manifest just before it was superseded reads its images within that.
+ * written within it, as a commit writes its images before its manifest: one whose first
+ * upload began that long ago, less CLOCK_SKEW_MS, is refused. A restore or a copy that read
+ * a manifest just before it was superseded reads its images within that.
  *
  * A sandbox is restored paused, in a pod of a new address, whose network policies
  * kube-router puts in force on the node as it next syncs (./kube-router.ts): until then
@@ -360,6 +361,22 @@ export class SnapshotCorrupt extends Schema.TaggedError<SnapshotCorrupt>()("Snap
   }
 }
 
+/**
+ * A snapshot of a workspace's is not committed, its first upload having begun so long ago,
+ * COLLECT_GRACE_MS less CLOCK_SKEW_MS or longer, that a collection may have taken what it
+ * uploaded, which no manifest names until the commit.
+ */
+export class CommitOverdue extends Schema.TaggedError<CommitOverdue>()("CommitOverdue", {
+  environment: Schema.String,
+  workspace: Schema.String,
+  snapshot: Schema.String,
+  uploadedMsAgo: Schema.Number,
+}) {
+  override get message(): string {
+    return `the snapshot ${this.snapshot} of ${this.environment}/${this.workspace} is not committed: its upload began ${Math.floor(this.uploadedMsAgo / 1000)} s ago, ${(COLLECT_GRACE_MS - CLOCK_SKEW_MS) / 60_000} min or more, by when a collection may have taken what it uploaded`;
+  }
+}
+
 /** A checkpoint failed: why, and what became of the workspace's snapshot. */
 export class CheckpointFailed extends Schema.TaggedError<CheckpointFailed>()("CheckpointFailed", {
   environment: Schema.String,
@@ -528,9 +545,17 @@ export const CURRENT_FILE = "current.json";
 export const COMPACTING_FILE = "compacting.json";
 /**
  * How long what a snapshot superseded needs, and what a commit wrote, is kept: longer than
- * a restore or a copy reads the images of a manifest it read, and than a commit takes.
+ * a restore or a copy reads the images of a manifest it read, and than a commit takes, one
+ * that takes longer, less CLOCK_SKEW_MS, refused.
  */
 export const COLLECT_GRACE_MS = 60 * 60_000;
+/**
+ * How far apart the clocks that time a commit and its collection may stand: the agent's that
+ * commits, the store's that says when each object was written, and the collecting agent's.
+ * A commit whose first upload began COLLECT_GRACE_MS less this ago or longer is refused
+ * (CommitOverdue), as a collection may have taken what it uploaded and no manifest names yet.
+ */
+export const CLOCK_SKEW_MS = 5 * 60_000;
 /**
  * The most of a file of bayma's state directory the agent reads: one larger is not read,
  * and what it says is not told.
@@ -880,11 +905,23 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     });
 
   /**
+   * Fails where the commit of the workspace's snapshot `snapshot`, whose first upload began at
+   * `uploadedAt` by this agent's clock, is overdue (CommitOverdue): checked last before its
+   * manifest is written, as a collection keeps what it uploaded only so long.
+   */
+  const inTime = ({ environment, workspace }: WorkspaceRef, snapshot: string, uploadedAt: number): Effect.Effect<void, CommitOverdue> =>
+    Clock.currentTimeMillis.pipe(
+      Effect.flatMap((now) =>
+        now - uploadedAt < COLLECT_GRACE_MS - CLOCK_SKEW_MS ? Effect.void : Effect.fail(new CommitOverdue({ environment, workspace, snapshot, uploadedMsAgo: now - uploadedAt }))
+      ),
+    );
+
+  /**
    * The snapshot of the sandbox `request` names, taken and committed as the module says:
    * its manifest. A delta of its base, its sandbox tracking its writes and the base's image
    * in the cache; whole otherwise.
    */
-  const take = (request: CheckpointRequest): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | ContainerElsewhere | S3Error | CacheError | SnapshotCorrupt> =>
+  const take = (request: CheckpointRequest): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | ContainerElsewhere | S3Error | CacheError | SnapshotCorrupt | CommitOverdue> =>
     Effect.gen(function*() {
       const { environment, workspace, containerId, podTemplate } = request;
       const running = yield* ofPod(containerId, request.namespace, request.pod);
@@ -915,7 +952,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * Saves the sandbox `request` names into `staged`, a delta of `parent`'s image if given,
    * and commits it as the snapshot `snapshot`: its manifest. What it staged goes if it fails.
    */
-  const commit = (request: CheckpointRequest, snapshot: string, takenAt: number, staged: string, parent: Manifest | null, container: RunningContainer): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt> =>
+  const commit = (request: CheckpointRequest, snapshot: string, takenAt: number, staged: string, parent: Manifest | null, container: RunningContainer): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt | CommitOverdue> =>
     Effect.gen(function*() {
       const { environment, workspace, containerId, hook, podTemplate, live } = request;
       const { release } = container;
@@ -943,11 +980,13 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       yield* cache.commit(environment, workspace, snapshot, image.digest);
       const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest)));
       yield* cache.stamp(environment, workspace, image.digest, files);
+      const uploadedAt = yield* Clock.currentTimeMillis;
       const [uploadMs, layers] = yield* timed(Effect.gen(function*() {
         const uploaded = yield* upload(request, image.digest, files);
         if (!(yield* inBucket(request, uploaded))) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${image.digest} is not in the bucket as it was put` });
         return [uploaded, ...yield* Effect.forEach(referred, (layer) => layerInBucket(request, layer))];
       }));
+      yield* inTime(request, snapshot, uploadedAt);
       const manifest: Manifest = {
         environment,
         workspace,
@@ -977,7 +1016,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * Nothing waits on it: it writes and uploads its image before it holds the workspace, then
    * checks it in the bucket and commits it once it holds it, as a checkpoint commits its own.
    */
-  const compactNow = (committed: Manifest): Effect.Effect<Manifest | null, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt> =>
+  const compactNow = (committed: Manifest): Effect.Effect<Manifest | null, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt | CommitOverdue> =>
     Effect.gen(function*() {
       const why = compactionDue(committed.layers);
       if (why === null) return null;
@@ -1018,6 +1057,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         unnamed = image.digest;
         const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest), quietly));
         yield* cache.stamp(environment, workspace, image.digest, files);
+        const uploadedAt = yield* Clock.currentTimeMillis;
         const [uploadMs, uploaded] = yield* timed(upload(committed, image.digest, files, quietly));
         // What it uploaded, should the workspace have moved on meanwhile, no manifest names, and is collected as any such image is.
         const manifest = yield* exclusive(
@@ -1027,6 +1067,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             // Checked only now that it holds the workspace, which a collection on this node holds too: one may have taken
             // what it uploaded, which no manifest named, as it waited for it. The cache holds its image, spared meanwhile.
             const layer = yield* layerInBucket(committed, uploaded);
+            yield* inTime(committed, snapshot, uploadedAt);
             const compacted: Manifest = { ...committed, snapshot, layers: [layer], bytes: bytesOf([layer]), uploadMs, compactedFrom: committed.snapshot };
             yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(compacted)));
             yield* bucket.putJson(manifestKey(committed, snapshot), compacted);
