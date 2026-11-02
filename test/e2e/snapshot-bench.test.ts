@@ -74,7 +74,7 @@ const VARIANT = variable("BENCH_VARIANT");
  * `settled` waits until it ends before the warm restore, and `kept-cache` leaves the node's page
  * cache as it is for the warm restore.
  */
-const SPIKE_VARIANTS = ["no-compaction", "settled", "kept-cache", "mixed", "mixed-iocost"];
+const SPIKE_VARIANTS = ["no-compaction", "settled", "kept-cache", "mixed", "mixed-iocost", "cold-by-hand"];
 /** Spike: `chain-N`, as-shipped but N - 1 live saves taken, each a delta of the one before, so that the release's delta makes a chain of N images (endpoint E16). */
 const CHAIN = /^chain-([0-9]+)$/u.exec(VARIANT);
 if (VARIANT !== "as-shipped" && VARIANT !== "with-fix" && VARIANT !== "whole" && !SPIKE_VARIANTS.includes(VARIANT) && !CHAIN) throw new Error(`BENCH_VARIANT is ${VARIANT}, not as-shipped, with-fix or whole`);
@@ -686,7 +686,8 @@ async function coldCaches(workspace: string): Promise<Record<string, unknown>> {
   for (const [node, pod] of await nodeAgents()) {
     const started = Date.now();
     let discarded = false;
-    for (const deadline = started + 20_000; !discarded && Date.now() < deadline; await sleep(1000)) {
+    // Spike: `cold-by-hand` removes it by hand at once, as the 10.0.4 baseline did, with no 20 s asking the agent first.
+    for (const deadline = started + (VARIANT === "cold-by-hand" ? 0 : 20_000); !discarded && Date.now() < deadline; await sleep(1000)) {
       discarded = (JSON.parse(await agentOk(node, "DELETE", `/cache/${SESSIONS}/${workspace}`)) as { readonly discarded: boolean }).discarded;
     }
     if (!discarded) {
