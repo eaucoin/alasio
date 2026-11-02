@@ -13,6 +13,23 @@
 set -eu
 attach="${ALASIO_ATTACH:-/attach}"
 workspace="${ALASIO_WORKSPACE:-/workspace}"
+# Spike (X-PT): with ALASIO_SPIKE_WARM_OPEN=1, as the pool's pod starts and before its binding,
+# every file of 1 MiB or more of node, bayma, its Bun and Python payloads and its toolbelt is
+# opened once, so that stargz-snapshotter's passthrough merges it into its backing file now and
+# not under the first session that opens it; said on stderr.
+if [ "${ALASIO_SPIKE_WARM_OPEN:-}" = 1 ] && [ ! -e /tmp/alasio-spike-warmed ]; then
+  started=$(date +%s%N)
+  files=0
+  bytes=0
+  for file in $(readlink -f "$(command -v node)") $(find /opt/bayma -maxdepth 1 -type f -size +1M) $(find /opt/bayma/payload/bun /opt/bayma/payload/python /opt/bayma-data -xdev -type f -size +1M 2>/dev/null); do
+    if head -c 1 "$file" >/dev/null 2>&1; then
+      files=$((files + 1))
+      bytes=$((bytes + $(stat -c %s "$file")))
+    fi
+  done
+  echo "alasio-spike-warm: opened $files files of $bytes bytes in $(( ($(date +%s%N) - started) / 1000000 )) ms" >&2
+  : > /tmp/alasio-spike-warmed
+fi
 until [ -s "$attach/token" ]; do sleep 0.1; done
 case " $* " in
 *" mcp-http "*)

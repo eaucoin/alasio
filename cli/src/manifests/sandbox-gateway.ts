@@ -27,7 +27,10 @@
  *   the old goes.
  */
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
+
+import { SPIKE_PASSTHROUGH } from "../cluster/stargz.ts";
 
 import type {
   KubernetesObject,
@@ -240,6 +243,10 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
           { name: "HOME", value: "/home/agent" },
           { name: "USER", value: "agent" },
           { name: "BAYMA_PAYLOAD_DIR", value: "/opt/bayma/payload" },
+          // Spike (X-PT): where the node serves the image through FUSE passthrough, the pod opens
+          // the image's large files as it starts, before its binding, so that their first-open
+          // merge is paid off the bind's path (sandbox/agent/start.sh).
+          ...(existsSync(SPIKE_PASSTHROUGH) ? [{ name: "ALASIO_SPIKE_WARM_OPEN", value: "1" }] : []),
         ],
         ports: [{ name: "mcp", containerPort: POOL_POD_PORT }],
         readinessProbe: { tcpSocket: { port: "mcp" }, periodSeconds: 2 },

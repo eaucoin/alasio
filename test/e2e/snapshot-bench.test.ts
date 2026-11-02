@@ -793,9 +793,27 @@ async function shapeAgents(): Promise<void> {
  * and kubelet's events of its images, in logs/first-start.json.
  */
 async function firstStarts(): Promise<void> {
+  // Spike (X-PT): with passthrough, the pool's pods open the image's large files as they start
+  // (sandbox/agent/start.sh), and the first bind waits until every pod running said so, its time
+  // and the pods' kept.
+  const warmed: Record<string, string> = {};
+  if (VARIANT.startsWith("passthrough")) {
+    for (const deadline = Date.now() + 900_000; ; await sleep(2000)) {
+      const running = (await kube.list<V1Pod>("Pod", { namespace: SESSIONS })).filter((pod) => pod.status?.phase === "Running");
+      for (const pod of running) {
+        const name = pod.metadata?.name ?? "";
+        if (warmed[name]) continue;
+        const said = (await kube.logs(SESSIONS, name, BAYMA_CONTAINER).catch(() => "")).split("\n").find((line) => line.startsWith("alasio-spike-warm: "));
+        if (said) warmed[name] = `${new Date().toISOString()} ${said}`;
+      }
+      if (running.length > 0 && running.every((pod) => warmed[pod.metadata?.name ?? ""])) break;
+      if (Date.now() > deadline) throw new Error("the pool's pods did not say within 900 s that they opened the image's files");
+    }
+  }
   const pods = await kube.list<V1Pod>("Pod", { namespace: SESSIONS });
   const events = await kube.list<CoreV1Event>("Event", { namespace: SESSIONS });
   writeFileSync(join(BENCH_DIR, "logs", "first-start.json"), JSON.stringify({
+    warmed,
     pods: pods.map((pod) => ({
       name: pod.metadata?.name,
       created: pod.metadata?.creationTimestamp,
