@@ -180,6 +180,8 @@ export function containerdFiles(releases: readonly string[], { systemd }: { read
     // older release's runsc knows no such flag). Said here outright: the node's files are written by the CLI's root
     // helper, whose environment is not the benchmark's.
     ...(release === releases[0] ? [`  cow = "on"`] : []),
+    // Spike: copy-on-write saves stage up to 512 MiB of pages captured before writes, rather than runsc's 64 MiB.
+    ...(release === releases[0] ? [`  cow-staging-max = "536870912"`] : []),
     `  working-set-window = "3s"`,
     "  # A checkpoint ends the sandbox's TCP connections through its network device, whose link saves and restores",
     "  # none (fdbased, without SaveRestore): a checkpoint that stops the sandbox aborts and closes each as it saves",
