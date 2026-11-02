@@ -799,14 +799,15 @@ async function firstStarts(): Promise<void> {
   const warmed: Record<string, string> = {};
   if (VARIANT.startsWith("passthrough")) {
     for (const deadline = Date.now() + 900_000; ; await sleep(2000)) {
-      const running = (await kube.list<V1Pod>("Pod", { namespace: SESSIONS })).filter((pod) => pod.status?.phase === "Running");
+      const live = (await kube.list<V1Pod>("Pod", { namespace: SESSIONS })).filter((pod) => !pod.metadata?.deletionTimestamp);
+      const running = live.filter((pod) => pod.status?.phase === "Running");
       for (const pod of running) {
         const name = pod.metadata?.name ?? "";
         if (warmed[name]) continue;
         const said = (await kube.logs(SESSIONS, name, BAYMA_CONTAINER).catch(() => "")).split("\n").find((line) => line.startsWith("alasio-spike-warm: "));
         if (said) warmed[name] = `${new Date().toISOString()} ${said}`;
       }
-      if (running.length > 0 && running.every((pod) => warmed[pod.metadata?.name ?? ""])) break;
+      if (live.length > 0 && running.length === live.length && running.every((pod) => warmed[pod.metadata?.name ?? ""])) break;
       if (Date.now() > deadline) throw new Error("the pool's pods did not say within 900 s that they opened the image's files");
     }
   }
@@ -831,7 +832,6 @@ before(async () => {
     mkdirSync(join(BENCH_DIR, "logs"), { recursive: true });
     await setUp();
     const agents = await nodeAgents();
-    await firstStarts();
     for (const node of agents.keys()) {
       // Spike (X-PT): the node's stargz-snapshotter configured as the variant asks.
       const configured = await onNode(node, `cat ${STARGZ_CONFIG}`);
@@ -839,6 +839,8 @@ before(async () => {
       if (/^passthrough = true$/mu.test(configured) !== VARIANT.startsWith("passthrough")) throw new Error(`the node's stargz-snapshotter is not configured as ${VARIANT} asks`);
       await bootLogs(node);
     }
+    // After bootLogs, which makes the pool's free pods again: the pods the first binds claim.
+    await firstStarts();
     await shapeAgents();
     // How the store answers through the profile, from where the saves run: the node agent's network.
     const [node = ""] = (await nodeAgents()).keys();
