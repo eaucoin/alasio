@@ -55,7 +55,7 @@ const BAYMA_SPEC = {
   containers: [{
     name: "bayma",
     image: "agent",
-    command: ["/usr/bin/tini", "-s", "--", "node", "/opt/bayma/bayma.js"],
+    command: ["/usr/bin/tini", "-s", "--", "node", "--no-memory-reducer", "--expose-gc", "/opt/bayma/bayma.js"],
     args: ["mcp-http", "--state-dir", "/attach/ws/home/.bayma"],
     env: [{ name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } }],
     // Its own directory on its node, as a pool's template mounts it.
@@ -331,7 +331,7 @@ test("a bound gVisor pod idle for its wait is saved whole by its node's agent fi
     assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-abc123 released into s-1`, `detach node-a ${env.namespace}/${bound.pod}`]);
     const [saved] = recorded.saved;
     assert.deepEqual([saved?.environment, saved?.workspace, saved?.namespace, saved?.containerId], [env.namespace, "fs-abc123", env.namespace, "c-0"]);
-    assert.deepEqual(saved?.hook, ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"]);
+    assert.deepEqual(saved?.hook, ["node", "--no-memory-reducer", "--expose-gc", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"]);
     assert.equal((saved?.podTemplate as { spec?: { runtimeClassName?: string } }).spec?.runtimeClassName, "gvisor");
   } finally {
     stand.close();
@@ -853,7 +853,7 @@ test("a release whose sandbox can be saved no more has its bayma go on with the 
     await letGo(env.none, key);
     assert.deepEqual(recorded.asked, [
       `checkpoint node-a ${bound.pod}`,
-      `stop node-a ${bound.pod} node /opt/bayma/bayma.js sandbox-hook stop --state-dir /attach/ws/home/.bayma`,
+      `stop node-a ${bound.pod} node --no-memory-reducer --expose-gc /opt/bayma/bayma.js sandbox-hook stop --state-dir /attach/ws/home/.bayma`,
       `record ${env.namespace}/fs-abc123 released into none`,
       `detach node-a ${env.namespace}/${bound.pod}`,
     ]);

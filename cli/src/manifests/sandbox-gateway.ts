@@ -214,8 +214,10 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
         // host (code a session runs may raise it): gVisor's kernel writes no core file as a
         // process crashes, but under a RuntimeClass of the host's kernel, whose default
         // core_pattern writes one into the crashing process's directory, a runtime's memory,
-        // of GBs, would be left in the session's workspace.
-        command: ["/usr/bin/prlimit", "--core=0:", "--", "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"],
+        // of GBs, would be left in the session's workspace. Its node without V8's memory reducer,
+        // as bayma's own entrypoint runs it, its garbage collected by bayma as a save ends its
+        // sandbox (--expose-gc), never between execs.
+        command: ["/usr/bin/prlimit", "--core=0:", "--", "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "--no-memory-reducer", "--expose-gc", "/opt/bayma/bayma.js"],
         args: [
           "mcp-http",
           "--host",

@@ -3510,7 +3510,7 @@ describe("the sandbox service", () => {
         { name: "POD_NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
       ]);
       // Under a soft core limit of 0, as bayma's image runs it.
-      assert.deepEqual(bayma?.command, ["/usr/bin/prlimit", "--core=0:", "--", "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"]);
+      assert.deepEqual(bayma?.command, ["/usr/bin/prlimit", "--core=0:", "--", "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "--no-memory-reducer", "--expose-gc", "/opt/bayma/bayma.js"]);
       assert.deepEqual(bayma?.args?.slice(-6, -2), ["--token-file", "/attach/token", "--telemetry-token-file", "/attach/token"]);
       // Its sessions snapshotted, as main's are by the gateway: held to the nodes' CPU baseline, its bayma holding a stop it is
       // not given for the gateway's save, and its template named by its own hash, which a snapshot taken on it records.
@@ -3522,7 +3522,7 @@ describe("the sandbox service", () => {
       assert.equal(annotations["dev.gvisor.internal.cpufeatures"], BASELINE.join(","));
       assert.equal(hash, templateHash({ ...template, metadata: { ...template?.metadata, annotations } }));
       // Its hook, as a release's snapshot runs it, through the same start.
-      assert.deepEqual(hookOf(bayma ?? { name: "" }), ["/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"]);
+      assert.deepEqual(hookOf(bayma ?? { name: "" }), ["/usr/local/bin/alasio-start", "node", "--no-memory-reducer", "--expose-gc", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"]);
       const scaled = one<ScaledObject>(objects, "ScaledObject", `sandboxes-${mode}`);
       assert.deepEqual([scaled.spec.minReplicaCount, scaled.spec.maxReplicaCount], [1, 10]);
       assert.deepEqual(scaled.spec.triggers, [{

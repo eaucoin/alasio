@@ -68,7 +68,7 @@ const builtinFs = createRequire(import.meta.url)("node:fs") as typeof import("no
 const RELEASE = "20260921.0-eaucoin.8";
 const CONTAINER = "0123456789abcdef".repeat(4);
 const OTHER_CONTAINER = "fedcba9876543210".repeat(4);
-const HOOK = ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"];
+const HOOK = ["node", "--no-memory-reducer", "--expose-gc", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"];
 const POD_TEMPLATE = { metadata: { labels: { "alasio.dev/sandbox": "fs-abc" } }, spec: { containers: [{ name: "bayma", image: "bayma@sha256:00" }] } };
 const RUNSC_ROOT = "/run/containerd/runsc/k8s.io";
 const CREDENTIALS = { accessKeyId: "snapshots0123", secretAccessKey: "a secret" };
@@ -404,7 +404,7 @@ test("a checkpoint saves the sandbox with its release's runsc, uploads its image
           "checkpoint",
           `--image-path=${staged}`,
           "--compression=none",
-          "--save-restore-exec-argv=node /opt/bayma/bayma.js sandbox-hook --state-dir /attach/ws/home/.bayma",
+          "--save-restore-exec-argv=node --no-memory-reducer --expose-gc /opt/bayma/bayma.js sandbox-hook --state-dir /attach/ws/home/.bayma",
           // As long as a restore of it may take to read its pages (BACKGROUND_READ_MS), and the hook's own 30 s.
           "--save-restore-exec-timeout=1830s",
           CONTAINER,
