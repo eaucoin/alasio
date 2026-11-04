@@ -530,6 +530,12 @@ export const GOFER_OPTIONS_FILE = "s3_opts.json";
  * flight from gVisor eaucoin.15 on, where an earlier loader kept the one its budget found.
  */
 const GOFER_READ_PARALLEL = 16;
+/**
+ * How many files of images the agent looks at in the bucket at once, as a checkpoint checks
+ * what it refers to, and a restore from the bucket every image of its chain, three files an
+ * image: each look a round trip to the store, some 150 ms on S3 Standard.
+ */
+const BUCKET_HEADS = 16;
 
 /** The directory of a workspace's manifests, in the bucket. */
 export const MANIFESTS_DIR = "manifests";
@@ -879,21 +885,34 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         Effect.map((etag) => ({ ...file, etag })),
       )).pipe(Effect.map((uploaded) => ({ digest, files: uploaded })));
 
-  /** Whether every file of `layer` of the workspace's is in the bucket as it was put: of its size, and of the ETag its upload was answered with. */
-  const inBucket = (ref: WorkspaceRef, layer: Layer): Effect.Effect<boolean, S3Error> =>
-    Effect.forEach(layer.files, ({ path, bytes, etag }) =>
+  /**
+   * Those of `layers` of the workspace's, in their order, a file of which is not in the bucket
+   * as it was put, of its size and of the ETag its upload was answered with; none where every
+   * file is. Their files are looked at BUCKET_HEADS at a time.
+   */
+  const notInBucket = (ref: WorkspaceRef, layers: readonly Layer[]): Effect.Effect<readonly Layer[], S3Error> =>
+    Effect.forEach(layers.flatMap((layer) => layer.files.map((file) => ({ layer, file }))), ({ layer, file: { path, bytes, etag } }) =>
       bucket.head(layerKey(ref, layer.digest, path)).pipe(
-        Effect.map((stored) => stored !== null && stored.bytes === bytes && stored.etag === etag),
-      )).pipe(Effect.map((each) => each.every(Boolean)));
+        Effect.map((stored) => (stored !== null && stored.bytes === bytes && stored.etag === etag ? null : layer)),
+      ), { concurrency: BUCKET_HEADS }).pipe(Effect.map((missing) => layers.filter((layer) => missing.includes(layer))));
+
+  /** Whether every file of `layer` of the workspace's is in the bucket as it was put (notInBucket). */
+  const inBucket = (ref: WorkspaceRef, layer: Layer): Effect.Effect<boolean, S3Error> => Effect.map(notInBucket(ref, [layer]), (missing) => missing.length === 0);
 
   /**
    * `layer`, an image of the workspace's that a new snapshot refers to, as the bucket holds
-   * it: as it was put, checked; or put again from the cache, whose files must be the
-   * manifest's, where the bucket lost it or holds another of its digest.
+   * it: as it was put, checked; or put again from the cache (putAgain).
    */
   const layerInBucket = (ref: WorkspaceRef, layer: Layer): Effect.Effect<Layer, S3Error | CacheError | SnapshotCorrupt> =>
+    Effect.flatMap(inBucket(ref, layer), (held) => (held ? Effect.succeed(layer) : putAgain(ref, layer)));
+
+  /**
+   * `layer`, an image of the workspace's that a new snapshot refers to, which the bucket lost,
+   * or holds another of its digest: put again from the cache, whose files must be the
+   * manifest's.
+   */
+  const putAgain = (ref: WorkspaceRef, layer: Layer): Effect.Effect<Layer, S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
-      if (yield* inBucket(ref, layer)) return layer;
       const reason = `its image ${layer.digest} is not in the bucket as it was put`;
       if (!(yield* cache.holds(ref.environment, ref.workspace, layer.digest))) return yield* new SnapshotCorrupt({ ...ref, reason: `${reason}, nor in this node's cache` });
       const files = yield* onDisk(() => imageFiles(cache.image(ref.environment, ref.workspace, layer.digest)));
@@ -983,8 +1002,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       const uploadedAt = yield* Clock.currentTimeMillis;
       const [uploadMs, layers] = yield* timed(Effect.gen(function*() {
         const uploaded = yield* upload(request, image.digest, files);
-        if (!(yield* inBucket(request, uploaded))) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${image.digest} is not in the bucket as it was put` });
-        return [uploaded, ...yield* Effect.forEach(referred, (layer) => layerInBucket(request, layer))];
+        // Its own image and those it refers to looked at together, as the prepare of a restore looks at its chain's.
+        const missing = yield* notInBucket(request, [uploaded, ...referred]);
+        if (missing.includes(uploaded)) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${image.digest} is not in the bucket as it was put` });
+        return [uploaded, ...yield* Effect.forEach(referred, (layer) => (missing.includes(layer) ? putAgain(request, layer) : Effect.succeed(layer)))];
       }));
       yield* inTime(request, snapshot, uploadedAt);
       const manifest: Manifest = {
@@ -1524,10 +1545,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           );
         }
         if (imagePath === null) {
-          // Read as the restore goes, each of its images must be in the bucket as it was put.
-          for (const layer of manifest.layers) {
-            if (!(yield* inBucket(ref, layer))) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${layer.digest} is not in the bucket as it was put` });
-          }
+          // Read as the restore goes, each of its images must be in the bucket as it was put: the files of all of them
+          // looked at together, as a chain's are many, and each look a round trip to the store.
+          const [missing] = yield* notInBucket(ref, manifest.layers);
+          if (missing !== undefined) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${missing.digest} is not in the bucket as it was put` });
         }
         /** The token the restore reads the bucket by, where it does. */
         let reader: string | null = null;

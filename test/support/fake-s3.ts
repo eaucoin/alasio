@@ -5,7 +5,8 @@
  * CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads), every
  * request's Signature Version 4 checked against the credentials it is given, with every
  * `x-amz-*` header signed, and a signed payload's hash against the payload. What it was
- * asked is recorded in order, and a request can be made to fail.
+ * asked is recorded in order, a request can be made to fail, and its gets and heads to wait,
+ * as they would on a network.
  */
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -46,6 +47,12 @@ export interface FakeS3 {
   holdPut: (key: string) => Promise<void> | null;
   /** The most gets of objects it has answered at once. */
   readonly mostGetting: () => number;
+  /** How long it waits before it answers a head of an object, as a store's first byte takes. */
+  headDelayMs: number;
+  /** The most heads of objects it has answered at once, since it was last forgotten. */
+  readonly mostHeading: () => number;
+  /** Forgets the most heads it has answered at once, counting anew from those it answers now. */
+  readonly forgetMostHeading: () => void;
   readonly close: () => Promise<void>;
 }
 
@@ -90,6 +97,8 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
   const uploads = new Map<string, { readonly key: string; readonly parts: Map<number, Buffer> }>();
   let getting = 0;
   let mostGetting = 0;
+  let heading = 0;
+  let mostHeading = 0;
   const etagOf = (bytes: Buffer): string => `"${createHash("md5").update(bytes).digest("hex")}"`;
 
   const handle = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -134,6 +143,12 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
       response.on("close", () => void (getting -= 1));
       if (fake.getDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, fake.getDelayMs));
       await fake.holdGet(key);
+    }
+    if (key && method === "HEAD") {
+      heading += 1;
+      mostHeading = Math.max(mostHeading, heading);
+      response.on("close", () => void (heading -= 1));
+      if (fake.headDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, fake.headDelayMs));
     }
     if (key && method === "PUT") {
       await fake.holdPut(key);
@@ -275,6 +290,9 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     holdGet: () => null,
     holdPut: () => null,
     mostGetting: () => mostGetting,
+    headDelayMs: 0,
+    mostHeading: () => mostHeading,
+    forgetMostHeading: () => void (mostHeading = heading),
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
   return fake;

@@ -247,6 +247,17 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   }
 }
 
+/** `requests`, as the fake store records them, with each run of heads in a row sorted, as the agent looks at the files of images at once. */
+const headsSorted = (requests: readonly string[]): string[] => {
+  const sorted: string[] = [];
+  for (const each of requests) {
+    let at = sorted.length;
+    if (each.startsWith("HEAD ")) while (at > 0 && sorted[at - 1]!.startsWith("HEAD ") && sorted[at - 1]! > each) at -= 1;
+    sorted.splice(at, 0, each);
+  }
+  return sorted;
+};
+
 /** Whether the cache of a node holds anything of a workspace. */
 const cachesAny = (node: Node, workspace: string): boolean => existsSync(join(node.cacheDir, "main", workspace));
 
@@ -421,12 +432,12 @@ test("a checkpoint saves the sandbox with its release's runsc, uploads its image
       });
       const prefix = `main/fs-abc/layers/${image.digest}`;
       // Its image's files, each then looked at, then its manifest, then the commit.
-      assert.deepEqual(s3.requests, [
+      assert.deepEqual(headsSorted(s3.requests), headsSorted([
         ...IMAGE_FILES.map((path) => `PUT ${prefix}/${path}`),
         ...IMAGE_FILES.map((path) => `HEAD ${prefix}/${path}`),
         `PUT main/fs-abc/manifests/${snapshot}.json`,
         "PUT main/fs-abc/current.json",
-      ]);
+      ]));
       assert.deepEqual(JSON.parse(s3.objects.get("main/fs-abc/current.json")?.toString() ?? ""), first);
       assert.deepEqual(JSON.parse(s3.objects.get(`main/fs-abc/manifests/${snapshot}.json`)?.toString() ?? ""), first);
       assert.deepEqual(yield* here.agent.current({ environment: "main", workspace: "fs-abc" }), first);
@@ -473,13 +484,13 @@ test("the checkpoint of a sandbox restored from a snapshot, which tracks its wri
       assert.deepEqual(layers, base.layers);
       assert.equal(delta.bytes, own.files.reduce((sum, { bytes }) => sum + bytes, 0) + base.bytes);
       // Only its own image goes up; the one it refers to is looked at, as it was put.
-      assert.deepEqual(s3.requests.slice(asked), [
+      assert.deepEqual(headsSorted(s3.requests.slice(asked)), headsSorted([
         ...IMAGE_FILES.map((path) => `PUT main/fs-abc/layers/${own.digest}/${path}`),
         ...IMAGE_FILES.map((path) => `HEAD main/fs-abc/layers/${own.digest}/${path}`),
         ...IMAGE_FILES.map((path) => `HEAD main/fs-abc/layers/${baseImage.digest}/${path}`),
         `PUT main/fs-abc/manifests/${delta.snapshot}.json`,
         "PUT main/fs-abc/current.json",
-      ]);
+      ]));
       // Restored on a third node, it is read from the bucket, its own image and its layers each under its digest.
       const third = yield* node("node-3");
       const remote = yield* third.agent.prepare(workspace);
@@ -520,6 +531,34 @@ test("the checkpoint of a sandbox restored from a snapshot, which tracks its wri
       assert.equal((yield* there.agent.checkpoint(request("fs-abc"))).layers.length, 1);
       // And one of a sandbox restored from none.
       assert.equal((yield* there.agent.checkpoint(request("fs-abc", OTHER_CONTAINER))).layers.length, 1);
+    })
+  ));
+
+test("a checkpoint looks at the files of its own image and of those it refers to in the bucket at once, and a restore from the bucket at those of every image of its chain, each look a round trip to the store", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      // Restored on another node, its next snapshot there a delta of it: a chain of two images.
+      const there = yield* node("node-2");
+      const { manifest } = yield* there.agent.prepare(workspace);
+      yield* there.agent.spend(workspace, manifest.snapshot);
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
+      yield* fetched(there, base);
+      // Every head of the store's takes as long as S3 Standard's first byte.
+      s3.headDelayMs = 150;
+      s3.forgetMostHeading();
+      const delta = yield* there.agent.checkpoint(request("fs-abc"));
+      assert.equal(delta.layers.length, 2);
+      const files = delta.layers.flatMap(({ digest, files }) => files.map(({ path }) => `HEAD main/fs-abc/layers/${digest}/${path}`));
+      assert.equal(s3.mostHeading(), files.length);
+      // Restored on a third node from the bucket.
+      const third = yield* node("node-3");
+      const asked = s3.requests.length;
+      s3.forgetMostHeading();
+      assert.equal((yield* third.agent.prepare(workspace)).source, "bucket");
+      assert.deepEqual(s3.requests.slice(asked).filter((each) => each.startsWith("HEAD")).toSorted(), files.toSorted());
+      assert.equal(s3.mostHeading(), files.length);
     })
   ));
 
@@ -1980,7 +2019,7 @@ test("a snapshot is prepared from the node's cache where it holds it whole and i
       const remote = yield* other.agent.prepare(workspace);
       assert.deepEqual(remote, { manifest, imagePath: join(other.cacheDir, "main", "fs-abc", manifest.snapshot), source: "bucket" });
       assert.deepEqual(goferOptionsOf(remote.imagePath).files, ["s3_opts.json"]);
-      assert.deepEqual(s3.requests.slice(asked, asked + 1 + IMAGE_FILES.length), ["GET main/fs-abc/current.json", ...IMAGE_FILES.map((path) => `HEAD main/fs-abc/layers/${image.digest}/${path}`)]);
+      assert.deepEqual(headsSorted(s3.requests.slice(asked, asked + 1 + IMAGE_FILES.length)), headsSorted(["GET main/fs-abc/current.json", ...IMAGE_FILES.map((path) => `HEAD main/fs-abc/layers/${image.digest}/${path}`)]));
       yield* fetched(other, manifest);
       assert.deepEqual(downloads(), files);
       assert.deepEqual(JSON.parse(readFileSync(join(other.cacheDir, "main", "fs-abc", "manifest.json"), "utf8")), manifest);
