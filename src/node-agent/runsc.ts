@@ -372,7 +372,9 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         ...(parentImagePath === undefined ? [] : [`--parent-image-path=${parentImagePath}`]),
         // Its pages written as the sandbox runs, past the page cache, which the pause then waits on.
         ...(live ? ["--leave-running", "--precopy=auto", "--precopy-throttle=on", "--direct"] : []),
-        `--save-restore-exec-argv=${hook.join(" ")}`,
+        // The hook told a live save from one that ends the sandbox, as gVisor tells it neither, and
+        // bayma collects its garbage only as its sandbox ends.
+        `--save-restore-exec-argv=${[...hook, ...(live ? ["--leave-running"] : [])].join(" ")}`,
         `--save-restore-exec-timeout=${hookTimeout}`,
         containerId,
       ]).pipe(Effect.asVoid),

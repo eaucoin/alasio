@@ -1415,6 +1415,8 @@ test("a checkpoint taken live leaves its sandbox running, records what bayma sai
       const saved = here.releases.calls(RELEASE).findLast((args) => args.includes("checkpoint"));
       const LIVE_FLAGS = ["--leave-running", "--precopy=auto", "--precopy-throttle=on", "--direct"];
       assert.deepEqual(saved?.filter((arg) => LIVE_FLAGS.includes(arg)), LIVE_FLAGS);
+      // Its hook told the save leaves its sandbox running, as a release's is not.
+      assert.ok(saved?.includes(`--save-restore-exec-argv=${[...HOOK, "--leave-running"].join(" ")}`), saved?.join(" "));
       assert.deepEqual(first.live, { stateDir: STATE_DIR, ...CAUGHT });
       assert.deepEqual(yield* here.agent.current(workspace), first);
       // Its sandbox runs on from the image it was saved to, so the next is a delta of it.
