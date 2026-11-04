@@ -9,9 +9,10 @@
  *   a token may be held to (`grants`); 503 with a Retry-After where its pool had no pod for it
  *   in time.
  * - `POST /release`: releases the token's key's binding, as its placement says what comes
- *   before, and resets what its placement keeps of its binds (204), as it does where it has
- *   none; 409 `{ "busy": true }` with a Retry-After where another bind or release of it is
- *   under way, so none was released; 503 where it could not be released now, its binding kept.
+ *   before and after, and resets what its placement keeps of its binds (204, once what comes
+ *   before is done, what comes after running on), as it does where it has none; 409
+ *   `{ "busy": true }` with a Retry-After where another bind or release of it is under way, so
+ *   none was released; 503 where it could not be released now, its binding kept.
  *   It waits first for the binding's calls under way (its requests but GETs, as an MCP client's
  *   stream it listens on is) through any replica of the front to end, for RELEASE_HOLD_MS at most, so no call to its pod is cut short by its caller's release,
  *   as an exec's would be, its pod's state saved with the call open: only a real loss, its pod
@@ -89,7 +90,7 @@ import { Clock, Deferred, Effect, Exit, Option, Schema, type Scope } from "effec
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken } from "../shared/tokens.ts";
-import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
+import { type BindOptions, Binder, type BindStepFailed, type BindTimeout, type ReleaseSteps } from "./binder.ts";
 import { boundIn, counts, touchLease } from "./bindings.ts";
 import { EVENTS_PATH, GATEWAY_READINESS, NO_BIND_HEADER, NOT_PASSED_HEADER, PINNED_HEADER, type Pool, STOP_GRACE_SECONDS } from "./names.ts";
 import { eventStream, proxy, type Route } from "./proxy.ts";
@@ -222,8 +223,8 @@ export class PlacementHeld extends Schema.TaggedError<PlacementHeld>()("Placemen
 
 /**
  * Where a key is bound: its pool, how its pod is made, where it is not claimed, and what comes
- * before its release; whether a bind of it is held, and why (`held`), as one that is is
- * refused; and what is told of each bind of it as it ends (`settled`): why it failed, or null
+ * before its release and after it (./binder.ts ReleaseSteps); whether a bind of it is held,
+ * and why (`held`), as one that is is refused; and what is told of each bind of it as it ends (`settled`): why it failed, or null
  * where it went through; and what its caller's release resets of what is kept of its binds
  * (`reset`), as their failures, whether or not it was bound.
  */
@@ -231,7 +232,7 @@ export interface Placement extends BindOptions {
   readonly pool: Pool;
   /** The port its pod serves on, where its pool's pods serve on another than the front's `podPort`. */
   readonly port?: number | undefined;
-  readonly release?: ((bound: { readonly pod: string; readonly binding: string }) => Effect.Effect<void, { readonly message: string }>) | undefined;
+  readonly release?: ReleaseSteps<{ readonly message: string }, { readonly message: string }> | undefined;
   readonly held?: Effect.Effect<string | null> | undefined;
   readonly settled?: ((failure: string | null) => Effect.Effect<void>) | undefined;
   readonly reset?: Effect.Effect<void, { readonly message: string }> | undefined;

@@ -471,7 +471,7 @@ export const makeFolders = Effect.fnUntraced(function*(
         make: make(key, folder.harness, folder.conversation),
         prepare: prepare(key),
         // Released as it is when idle: its pod gone, its REPL sessions dumped as it stopped.
-        release: ({ pod }) => releasedPod(key, pod).pipe(Effect.tap(() => released(pool, "asked"))),
+        release: { before: ({ pod }) => releasedPod(key, pod).pipe(Effect.tap(() => released(pool, "asked"))) },
         // Bound again only as its caller asks, where its binds failed one after another.
         held: options["retry"] === "1" ? Effect.succeed(null) : heldBy(key),
         settled: settled(key),
@@ -485,7 +485,7 @@ export const makeFolders = Effect.fnUntraced(function*(
   const sweep = yield* makeSweep({
     pools: Effect.succeed([pool]),
     idleness: baymaIdleness({ podPort, releaseAfterMs, idlePollMs, bindingKey }),
-    release: (_pool: Pool, key: string) => binder.release(pool, key, ({ pod }) => releasedPod(key, pod)).pipe(Effect.tap((done) => (done === "released" ? released(pool, "idle") : Effect.void))),
+    release: (_pool: Pool, key: string) => binder.release(pool, key, { before: ({ pod }) => releasedPod(key, pod) }).pipe(Effect.tap((done) => (done === "released" ? released(pool, "idle") : Effect.void))),
   });
 
   const live: Effect.Effect<void, KubeApiError> = Effect.gen(function*() {
@@ -498,7 +498,7 @@ export const makeFolders = Effect.fnUntraced(function*(
       const killed = killedForMemory(pod, BAYMA_CONTAINER);
       const ended = killed ? `ran out of its memory (${memoryLimitOf(pod, BAYMA_CONTAINER) ?? "its limit"})` : "ended";
       yield* Effect.logWarning(`${key}'s bayma ${ended} in its folder instance ${pod.metadata?.name}, which serves its binding no more: it is released, the next bind making another`);
-      yield* Effect.forkDetach(binder.release(pool, key, ({ pod: name }) => releasedPod(key, name), pod.metadata?.name ?? "").pipe(
+      yield* Effect.forkDetach(binder.release(pool, key, { before: ({ pod: name }) => releasedPod(key, name) }, pod.metadata?.name ?? "").pipe(
         Effect.tap((done) => (done === "released" ? released(pool, killed ? "oom" : "broken") : Effect.void)),
         Effect.catch((error) => Effect.logWarning(`releasing ${key}, whose bayma ended, failed: ${error.message}`)),
       ));

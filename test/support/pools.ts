@@ -345,11 +345,13 @@ export const standInPools = ({ database, standIns = {}, branch }: StandInPoolsOp
         const pod = pods.get(key);
         return pod?.bound ? { binding: pod.bound.binding, pod: pod.name, address: "127.0.0.1" } : null;
       }),
-      release: (_pool, key, before, only) =>
+      release: (_pool, key, { before, after } = {}, only) =>
         Effect.gen(function*() {
           const pod = pods.get(key);
           if (!pod?.bound || (only !== undefined && only !== pod.name)) return "unbound" satisfies Released;
-          if (before) yield* before({ pod: pod.name, binding: pod.bound.binding });
+          const bound = { pod: pod.name, binding: pod.bound.binding };
+          if (before) yield* before(bound);
+          if (after) yield* Effect.orDie(after(bound));
           yield* Scope.close(pod.bound.scope, Exit.void);
           pods.delete(key);
           return "released" satisfies Released;

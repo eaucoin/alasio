@@ -27,6 +27,12 @@ import { BINDING_LABEL, boundAnnotations, boundLabels, FREE_LABEL, freeLabels, K
 
 /** The annotation of a binding's Lease while it is released: the releasing binder. */
 export const RELEASING_ANNOTATION = "alasio.dev/releasing";
+/**
+ * The annotation of a binding's Lease whose release was through, and told of, what of its pod
+ * comes after it under way, or left to the next release to end, where it failed: `true`, until
+ * the Lease goes, so the binding is told of as released once.
+ */
+export const RELEASED_ANNOTATION = "alasio.dev/released";
 
 /** How long a binding under way may go unrenewed before another binder takes it over, by default. */
 export const BINDING_TIMEOUT_MS = 60_000;
@@ -162,6 +168,14 @@ export const heldLeases = Effect.fnUntraced(function*(pool: Pool): Effect.fn.Ret
   return leases.filter(({ spec }) => spec?.holderIdentity);
 });
 
+/** Marks the Lease `lease` of a binding being released through (RELEASED_ANNOTATION), by an update conditioned on its version: the Lease, or null where it changed meanwhile. */
+export const markReleased = Effect.fnUntraced(function*(lease: BindingLease): Effect.fn.Return<BindingLease | null, KubeApiError, KubeClient> {
+  const kube = yield* KubeClient;
+  return yield* kube.replace({ ...lease, metadata: { ...lease.metadata, annotations: { ...lease.metadata?.annotations, [RELEASED_ANNOTATION]: "true" } } }).pipe(
+    Effect.catchIf((error) => hasStatus(409)(error) || hasStatus(404)(error), () => Effect.succeed(null)),
+  );
+});
+
 /** Takes the releasing mark off the Lease `lease`, by an update conditioned on its version: the Lease, or null where it changed meanwhile. */
 export const unmarkReleasing = Effect.fnUntraced(function*(lease: BindingLease): Effect.fn.Return<BindingLease | null, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;
@@ -249,7 +263,8 @@ export const counts = Effect.fnUntraced(function*(pool: Pool): Effect.fn.Return<
  * be saving it as it ends. A binding under way, its pod not yet named, is left to its binder,
  * or to the next to take it over; and so is one being released, whose releaser deletes its pod
  * before its Lease, and tells of its release itself, unless it has stopped renewing it, so a
- * binding released is never told of as lost too. And a free pod a container of which ended or
+ * binding released is never told of as lost too; nor is one whose release was through, its
+ * pod's end failing after (RELEASED_ANNOTATION), told of as it is let go. And a free pod a container of which ended or
  * started again (restarted), which no bind claims, is deleted as it was read, for its Deployment
  * to make another; one claimed since is left to its binder. What was set right, as names.
  */
@@ -274,7 +289,7 @@ export const reconcile = Effect.fnUntraced(function*(
   yield* Effect.forEach(orphans, ({ metadata }) => kube.remove("v1", "Pod", pool.namespace, metadata?.name ?? ""), { discard: true });
   // One changed since it was read, as by its binder, is no more this one's to let go, nor to tell of.
   const letGone = yield* Effect.forEach(gone, (lease) => before(lease).pipe(Effect.andThen(releaseLease(lease)), Effect.as(true), Effect.catchIf(hasStatus(409), () => Effect.succeed(false))));
-  yield* Effect.forEach(gone.filter((_, n) => letGone[n]), letGo, { discard: true });
+  yield* Effect.forEach(gone.filter((lease, n) => letGone[n] && lease.metadata?.annotations?.[RELEASED_ANNOTATION] === undefined), letGo, { discard: true });
   const free = (yield* kube.list("v1", "Pod", pool.namespace, selector(freeLabels(pool)))) as V1Pod[];
   const broken = free.filter((pod) => !pod.metadata?.deletionTimestamp && restarted(pod) && pod.metadata?.labels?.[BINDING_LABEL] === undefined && pod.metadata?.annotations?.[KEY_ANNOTATION] === undefined);
   const deleted = yield* Effect.forEach(broken, ({ metadata }) =>

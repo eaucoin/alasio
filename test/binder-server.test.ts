@@ -587,7 +587,7 @@ test("a caller's release runs what its placement says comes before, then lets it
   const before: string[] = [];
   let failing = true;
   const served = await front(of, stand.port, {
-    release: ({ pod }) => Effect.suspend(() => (before.push(pod), failing ? Effect.fail({ message: "its sandbox was not saved, and runs on" }) : Effect.void)),
+    release: { before: ({ pod }) => Effect.suspend(() => (before.push(pod), failing ? Effect.fail({ message: "its sandbox was not saved, and runs on" }) : Effect.void)) },
   });
   try {
     const key = "sessionfs:released";
@@ -623,7 +623,7 @@ test("a caller's release waits for its binding's calls under way, through this r
   await once(slowPod, "listening");
   const podPort = (slowPod.address() as AddressInfo).port;
   const other = await front(of, podPort);
-  const served = await front(of, podPort, { peers: [`127.0.0.1:${other.port}`], release: () => Effect.sync(() => void happened.push("released")) });
+  const served = await front(of, podPort, { peers: [`127.0.0.1:${other.port}`], release: { before: () => Effect.sync(() => void happened.push("released")) } });
   try {
     const key = "sessionfs:held-by-its-calls";
     const call = (through: { port: number }, path: string) => fetch(`http://127.0.0.1:${through.port}${path}`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" });

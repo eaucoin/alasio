@@ -3,7 +3,7 @@ import { isIP } from "node:net";
 import { before, test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
-import { Effect, Fiber, Layer } from "effect";
+import { Deferred, Effect, Fiber, Layer } from "effect";
 
 import { added } from "./support/metrics.ts";
 import { BIND_DURATION, BindStepFailed, BindTimeout, Binder, type BinderOptions } from "../src/binder/binder.ts";
@@ -354,11 +354,11 @@ test("a release of a key's binding of one pod releases none the key was bound to
   await run(binder(), withKube((client) => client.remove("v1", "Pod", of.namespace, first.pod)));
   const again = await bindIn(layer, (each) => each.bind(of, "sessionfs:workspace"));
   let before = 0;
-  assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace", () => Effect.sync(() => void (before += 1)), first.pod)), "unbound");
+  assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace", { before: () => Effect.sync(() => void (before += 1)) }, first.pod)), "unbound");
   assert.equal(before, 0);
   assert.equal((await run(binder(), readLease(of, "sessionfs:workspace")))?.spec?.holderIdentity, again.pod);
   assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [again.pod]);
-  assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace", () => Effect.void, again.pod)), "released");
+  assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace", {}, again.pod)), "released");
 });
 
 test("reconciling a pool leaves a binding being released to its releaser, its pod gone first, unless its releaser stopped renewing it", async () => {
@@ -388,14 +388,15 @@ test("a release runs what comes before it, its Lease renewed, then deletes the p
   const first = await bindIn(layer, (each) => each.bind(of, "sessionfs:workspace"));
   const happened: string[] = [];
   const releasing = bindIn(layer, (each) =>
-    each.release(of, "sessionfs:workspace", ({ pod, binding }) =>
-      Effect.gen(function*() {
-        happened.push(`before ${pod} ${binding === first.binding}`);
-        // Longer than a release goes unrenewed before it is stale, as a checkpoint may be.
-        yield* Effect.sleep(3_000);
-        happened.push("checkpointed");
-      })
-    )
+    each.release(of, "sessionfs:workspace", {
+      before: ({ pod, binding }) =>
+        Effect.gen(function*() {
+          happened.push(`before ${pod} ${binding === first.binding}`);
+          // Longer than a release goes unrenewed before it is stale, as a checkpoint may be.
+          yield* Effect.sleep(3_000);
+          happened.push("checkpointed");
+        }),
+    })
   );
   await new Promise((resolve) => setTimeout(resolve, 500));
   const again = bindIn(binderOf({ renewMs: 300, staleMs: 1_500 }), (each) => Effect.tap(each.bind(of, "sessionfs:workspace"), () => Effect.sync(() => void happened.push("bound again"))));
@@ -406,17 +407,82 @@ test("a release runs what comes before it, its Lease renewed, then deletes the p
   assert.notEqual(bound.binding, first.binding);
 });
 
+test("a release with a step after is through once its step before is: the step after runs on, its Lease held, marked releasing and renewed, so a bind meanwhile waits for it, and a release asked again finds none; then its pod and Lease go, and the key binds anew", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  const layer = binderOf({ renewMs: 300, staleMs: 1_500 });
+  const first = await bindIn(layer, (each) => each.bind(of, "sessionfs:workspace"));
+  const happened: string[] = [];
+  const ending = Effect.runSync(Deferred.make<void>());
+  const released = await bindIn(layer, (each) =>
+    each.release(of, "sessionfs:workspace", {
+      before: () => Effect.sync(() => void happened.push("saved")),
+      after: ({ pod }) => Effect.andThen(Deferred.await(ending), Effect.sync(() => void happened.push(`ended ${pod}`))),
+    }));
+  assert.deepEqual([released, happened], ["released", ["saved"]]);
+  const lease = await run(binder(), readLease(of, "sessionfs:workspace"));
+  assert.deepEqual([lease?.spec?.holderIdentity, lease?.metadata?.annotations?.["alasio.dev/released"]], [first.pod, "true"]);
+  assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [first.pod]);
+  assert.equal(await bindIn(binderOf(), (each) => each.release(of, "sessionfs:workspace", { before: () => Effect.sync(() => void happened.push("saved again")) })), "unbound");
+  const again = bindIn(binderOf({ renewMs: 300, staleMs: 1_500 }), (each) => Effect.tap(each.bind(of, "sessionfs:workspace"), () => Effect.sync(() => void happened.push("bound again"))));
+  // Longer than a release goes unrenewed before it is stale, as a pod's containers may take to stop.
+  await new Promise((resolve) => setTimeout(resolve, 2_000));
+  assert.deepEqual(happened, ["saved"]);
+  Effect.runSync(Deferred.succeed(ending, undefined));
+  const bound = await again;
+  assert.deepEqual(happened, ["saved", `ended ${first.pod}`, "bound again"]);
+  assert.notEqual(bound.pod, first.pod);
+  assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [bound.pod]);
+});
+
+test("a hold of a key whose release is through waits for what comes after it, as its releaser's caller was told it is released, then holds the key", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const layer = binderOf();
+  await bindIn(layer, (each) => each.bind(of, "sessionfs:workspace"));
+  const happened: string[] = [];
+  const ending = Effect.runSync(Deferred.make<void>());
+  assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace", { after: () => Effect.andThen(Deferred.await(ending), Effect.sync(() => void happened.push("ended"))) })), "released");
+  const holding = bindIn(binderOf(), (each) => each.hold(of, "sessionfs:workspace", Effect.sync(() => void happened.push("held"))));
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  assert.deepEqual(happened, []);
+  Effect.runSync(Deferred.succeed(ending, undefined));
+  assert.deepEqual(await holding, { value: undefined });
+  assert.deepEqual(happened, ["ended", "held"]);
+});
+
+test("a release whose step after fails, once it was through, keeps the binding, no longer marked releasing but released still, for the next release to end, which says it ended it, not released it", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const layer = binderOf();
+  const bound = await bindIn(layer, (each) => each.bind(of, "sessionfs:workspace"));
+  const failing = { message: "its containers had not stopped" };
+  assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace", { after: () => Effect.fail(failing) })), "released");
+  for (const deadline = Date.now() + 5_000; (await run(binder(), readLease(of, "sessionfs:workspace")))?.metadata?.annotations?.["alasio.dev/releasing"]; await new Promise((resolve) => setTimeout(resolve, 50))) {
+    assert.ok(Date.now() < deadline, "its binding stayed marked releasing");
+  }
+  const kept = await run(binder(), readLease(of, "sessionfs:workspace"));
+  assert.deepEqual([kept?.spec?.holderIdentity, kept?.metadata?.annotations?.["alasio.dev/released"]], [bound.pod, "true"]);
+  let ended = 0;
+  assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace", { after: () => Effect.sync(() => void (ended += 1)) })), "ended");
+  for (const deadline = Date.now() + 5_000; (await run(binder(), readLease(of, "sessionfs:workspace"))) !== null; await new Promise((resolve) => setTimeout(resolve, 50))) {
+    assert.ok(Date.now() < deadline, "its binding was not let go");
+  }
+  assert.equal(ended, 1);
+  assert.deepEqual(await boundPods(of), []);
+});
+
 test("of two releases of one binding at once one alone goes on, and one whose step before fails keeps the binding", async () => {
   const of = await pool();
   await freePods(of, 1);
   const layer = binderOf();
   const bound = await bindIn(layer, (each) => each.bind(of, "sessionfs:workspace"));
-  const failing = await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (each) => Effect.flip(each.release(of, "sessionfs:workspace", () => Effect.fail("the checkpoint failed")))), layer));
+  const failing = await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (each) => Effect.flip(each.release(of, "sessionfs:workspace", { before: () => Effect.fail("the checkpoint failed") }))), layer));
   assert.equal(failing, "the checkpoint failed");
   const lease = await run(binder(), readLease(of, "sessionfs:workspace"));
   assert.deepEqual([lease?.spec?.holderIdentity, lease?.metadata?.annotations?.["alasio.dev/releasing"]], [bound.pod, undefined]);
   let before = 0;
-  const released = await Promise.all([binderOf(), binderOf()].map((each) => bindIn(each, (binderService) => binderService.release(of, "sessionfs:workspace", () => Effect.sleep(500).pipe(Effect.andThen(Effect.sync(() => void (before += 1))))))));
+  const released = await Promise.all([binderOf(), binderOf()].map((each) => bindIn(each, (binderService) => binderService.release(of, "sessionfs:workspace", { before: () => Effect.sleep(500).pipe(Effect.andThen(Effect.sync(() => void (before += 1)))) }))));
   assert.deepEqual([released.toSorted(), before], [["busy", "released"], 1]);
   assert.equal(await run(binder(), readLease(of, "sessionfs:workspace")), null);
   assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace")), "unbound");

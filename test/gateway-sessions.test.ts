@@ -12,7 +12,7 @@ import { TestClock } from "effect/testing";
 
 import { added, collected } from "./support/metrics.ts";
 import { Binder } from "../src/binder/binder.ts";
-import { markReleasing, readLease, reconcile, releaseLease, takeLease, touchLease } from "../src/binder/bindings.ts";
+import { type BindingLease, markReleasing, readLease, reconcile, releaseLease, takeLease, touchLease } from "../src/binder/bindings.ts";
 import { freeLabels, leaseName, type Pool } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
 import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
@@ -174,6 +174,22 @@ const releasedFor = async (namespace: string, reason: string): Promise<number> =
     })
     .reduce((sum, { value }) => sum + value, 0);
 
+/**
+ * `key`'s binding's Lease in `pool` once `done` holds of it, as what comes after a release runs
+ * on once the release is through: within ten seconds, `what` said where it does not.
+ */
+const leaseOnce = async (pool: Pool, key: string, done: (lease: BindingLease | null) => boolean, what: string): Promise<BindingLease | null> => {
+  for (const deadline = Date.now() + 10_000;; await new Promise((resolve) => setTimeout(resolve, 50))) {
+    const lease = await run(readLease(pool, key));
+    if (done(lease)) return lease;
+    assert.ok(Date.now() < deadline, what);
+  }
+};
+/** Once `key`'s binding in `pool` is let go. */
+const letGo = (pool: Pool, key: string) => leaseOnce(pool, key, (lease) => lease === null, `${key}'s binding was not let go`);
+/** `key`'s binding in `pool`, kept once its release's end failed, marked releasing no more. */
+const keptAfter = (pool: Pool, key: string) => leaseOnce(pool, key, (lease) => lease?.metadata?.annotations?.["alasio.dev/releasing"] === undefined, `${key}'s binding stayed marked releasing`);
+
 /** The gateway's sessions' options, of the environment `env`, main, whose sessions are snapshotted under the release `r1`, onto its pool's template. */
 const options = (env: SessionsEnvironment & { template?: V1PodTemplateSpec }, podPort: number): SessionsOptions => ({
   environments: found([env]),
@@ -292,8 +308,8 @@ test("a bound pod whose bayma is idle is kept while a request of it came within 
     await stopping;
     assert.deepEqual(released, [key]);
     assert.deepEqual(counted, { [`alasio.binder.pool=${placement.pool.name},k8s.namespace.name=${env.namespace},alasio.gateway.release.reason=idle`]: 1 });
+    await letGo(env.none, key);
     assert.deepEqual(recorded.detached, [`node-a ${bound.pod} c-0`]);
-    assert.equal(await run(readLease(env.none, key)), null);
   } finally {
     stand.close();
   }
@@ -310,19 +326,45 @@ test("a bound gVisor pod idle for its wait is saved whole by its node's agent fi
     const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
     stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 600_000 };
     assert.deepEqual(await Effect.runPromise(sessions.sweep), [key]);
+    await letGo(env.none, key);
     // Its release recorded with the workspace, for its next bind, before its workspace is detached.
     assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-abc123 released into s-1`, `detach node-a ${env.namespace}/${bound.pod}`]);
     const [saved] = recorded.saved;
     assert.deepEqual([saved?.environment, saved?.workspace, saved?.namespace, saved?.containerId], [env.namespace, "fs-abc123", env.namespace, "c-0"]);
     assert.deepEqual(saved?.hook, ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"]);
     assert.equal((saved?.podTemplate as { spec?: { runtimeClassName?: string } }).spec?.runtimeClassName, "gvisor");
-    assert.equal(await run(readLease(env.none, key)), null);
   } finally {
     stand.close();
   }
 });
 
-test("a release asked again after its save took its snapshot, as one whose detach failed is, is released into that snapshot, never saved anew: the snapshot kept, and recorded, for its next bind to restore", async () => {
+test("a release its caller asks is through once its snapshot is recorded, before its pod's containers stopped: its workspace detached as they stop, after it, a release asked again meanwhile finding none, and a bind meanwhile waiting for the detach", async () => {
+  const env = await environment(2, { gvisor: true });
+  const recorded = agents();
+  // Its save leaves its pod's containers running as the API says them, as kubelet tells of a sandbox ended seconds after.
+  const lingering: NodeAgents = {
+    ...recorded.agents,
+    checkpoint: (node, request) => Effect.sync(() => (recorded.asked.push(`checkpoint ${node} ${request.pod}`), { snapshot: "s-1" } as unknown as Manifest)),
+  };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), lingering);
+  const key = sessionKey("fs-window");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  assert.equal(await Effect.runPromise(binder.release(placement.pool, key, placement.release)), "released");
+  assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-window released into s-1`]);
+  assert.equal(await Effect.runPromise(binder.release(placement.pool, key, placement.release)), "unbound");
+  const again = Effect.runPromise(binder.bind(placement.pool, key, placement)).then((rebound) => (recorded.asked.push("bound again"), rebound));
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  assert.ok((await run(readLease(env.none, key)))?.metadata?.annotations?.["alasio.dev/releasing"]);
+  assert.deepEqual(recorded.asked.slice(2), []);
+  // Its containers stopped, as kubelet says once its deletion ended them.
+  await run(withKube((kube) => kube.patchPodStatus(env.namespace, bound.pod, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated: { exitCode: 0 } } }] } })));
+  const rebound = await again;
+  assert.deepEqual(recorded.asked.slice(2), [`detach node-a ${env.namespace}/${bound.pod}`, "bound again"]);
+  assert.notEqual(rebound.pod, bound.pod);
+});
+
+test("a release asked again after its save took its snapshot, as one whose detach failed is, is released into that snapshot, never saved anew: the snapshot kept, and recorded, for its next bind to restore, and the binding counted released once, as the release that was through was", async () => {
   const env = await environment(1, { gvisor: true });
   const stand = await bayma();
   const recorded = agents();
@@ -347,16 +389,19 @@ test("a release asked again after its save took its snapshot, as one whose detac
     const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
     const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
     stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 600_000 };
-    // Its first release saved, its bayma ended with the save, then failed at its detach, its binding kept.
-    assert.deepEqual(await Effect.runPromise(sessions.sweep), []);
-    assert.notEqual(await run(readLease(env.none, key)), null);
-    const ended = (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, bound.pod)))) as V1Pod | null;
-    assert.ok(ended?.status?.containerStatuses?.find(({ name }) => name === "bayma")?.state?.terminated, "its bayma did not end with its save");
-    // Asked again, as its pod ends: released into the snapshot its first took, not saved again.
-    for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) {
-      assert.ok(Date.now() < deadline, `its binding was not let go: ${recorded.asked.join(", ")}`);
-      await Effect.runPromise(Effect.provide(Effect.all([sessions.sweep, sessions.drain]), Layer.fresh(KubeClient.layer)));
-    }
+    const counted = await added(RELEASES, async () => {
+      // Its first release through as it saved, its bayma ended with the save, then failed at its detach, its binding kept.
+      assert.deepEqual(await Effect.runPromise(sessions.sweep), [key]);
+      assert.notEqual(await keptAfter(env.none, key), null);
+      const ended = (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, bound.pod)))) as V1Pod | null;
+      assert.ok(ended?.status?.containerStatuses?.find(({ name }) => name === "bayma")?.state?.terminated, "its bayma did not end with its save");
+      // Asked again, as its pod ends: released into the snapshot its first took, not saved again.
+      for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) {
+        assert.ok(Date.now() < deadline, `its binding was not let go: ${recorded.asked.join(", ")}`);
+        await Effect.runPromise(Effect.provide(Effect.all([sessions.sweep, sessions.drain]), Layer.fresh(KubeClient.layer)));
+      }
+    });
+    assert.deepEqual(counted, { [`alasio.binder.pool=${placement.pool.name},k8s.namespace.name=${env.namespace},alasio.gateway.release.reason=idle`]: 1 });
     assert.deepEqual(recorded.asked.filter((asked) => asked.startsWith("checkpoint")), [`checkpoint node-a ${bound.pod}`]);
     assert.deepEqual(records.get(`${env.namespace}/fs-again`), { snapshot: "s-1", release: undefined, pod: bound.pod });
   } finally {
@@ -371,7 +416,7 @@ const recording = (recorded: ReturnType<typeof agents>, records: Map<string, Rel
   setReleased: (ref, into) => Effect.andThen(recorded.agents.setReleased(ref, into), Effect.sync(() => void records.set(`${ref.environment}/${ref.workspace}`, into))),
 });
 
-test("a binding whose pod a release saved went before the release was through, as one whose detach failed and whose pod then went is, is let go as lost released into that snapshot, not the one taken live, nor none", async () => {
+test("a binding whose pod a release saved went before the release was done, as one whose detach failed and whose pod then went is, is let go released into that snapshot, not the one taken live, nor none, counted released once, as the release that was through was, not as lost", async () => {
   const env = await environment(1, { gvisor: true });
   const stand = await bayma();
   const recorded = agents();
@@ -384,11 +429,13 @@ test("a binding whose pod a release saved went before the release was through, a
     const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
     const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
     stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 600_000 };
-    assert.deepEqual(await Effect.runPromise(sessions.sweep), []);
+    assert.deepEqual(await Effect.runPromise(sessions.sweep), [key]);
+    await keptAfter(env.none, key);
     assert.deepEqual(records.get(`${env.namespace}/fs-gone-saved`), { snapshot: "s-1", release: undefined, pod: bound.pod });
-    // Its pod gone for good, as kubelet ends it, before the release was asked again: its binding let go as lost.
+    // Its pod gone for good, as kubelet ends it, before the release was asked again: its binding let go, told of as lost no more.
     await core().deleteNamespacedPod({ name: bound.pod, namespace: env.namespace, gracePeriodSeconds: 0 });
-    const set = await run(reconcile(env.none, (lease) => sessions.lost(env.none, lease), (lease) => sessions.recordLost(env.none, lease)));
+    let set: { readonly leases: readonly string[] } = { leases: [] };
+    assert.deepEqual(await added(RELEASES, async () => (set = await run(reconcile(env.none, (lease) => sessions.lost(env.none, lease), (lease) => sessions.recordLost(env.none, lease))))), {});
     assert.equal(set.leases.length, 1);
     assert.deepEqual(records.get(`${env.namespace}/fs-gone-saved`), { snapshot: "s-1", release: undefined, pod: bound.pod });
   } finally {
@@ -481,7 +528,7 @@ test("a release whose save fails leaving the sandbox running keeps the binding, 
         assert.deepEqual([lease?.spec?.holderIdentity, lease?.metadata?.annotations?.["alasio.dev/releasing"]], [bound.pod, undefined], outcome);
         assert.deepEqual(recorded.detached, [], outcome);
       } else {
-        assert.equal(lease, null, outcome);
+        await letGo(env.none, key);
         assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-abc123 released into none`, `detach node-a ${env.namespace}/${bound.pod}`], outcome);
       }
     } finally {
@@ -782,8 +829,10 @@ test("each attach and detach is timed, and each binding released counted by why:
       assert.equal(await Effect.runPromise(binder.release(placement.pool, key, placement.release)), "released");
     });
     assert.deepEqual(asked, { [`alasio.binder.pool=${placement.pool.name},${of},alasio.gateway.release.reason=asked`]: 1 });
+    // Its workspace detached once the release is through, as its pod's containers stop.
+    await stopping;
+    await letGo(env.none, key);
   });
-  await stopping;
   assert.deepEqual(detached, { [of]: 1 });
   const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-gone", namespace: env.namespace, annotations: { "alasio.dev/binding-key": key } }, spec: { holderIdentity: "none-0" } };
   assert.deepEqual(await added(RELEASES, () => Effect.runPromise(sessions.lost(env.none, lease))), { [`alasio.binder.pool=${env.none.name},${of},alasio.gateway.release.reason=lost`]: 1 });
@@ -801,13 +850,13 @@ test("a release whose sandbox can be saved no more has its bayma go on with the 
     stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 600_000 };
     const counted = await added("alasio.sandbox.releases", async () => assert.deepEqual(await Effect.runPromise(sessions.sweep), [key]));
     assert.deepEqual(counted, { "alasio.sandbox.release.outcome=unsaveable": 1 });
+    await letGo(env.none, key);
     assert.deepEqual(recorded.asked, [
       `checkpoint node-a ${bound.pod}`,
       `stop node-a ${bound.pod} node /opt/bayma/bayma.js sandbox-hook stop --state-dir /attach/ws/home/.bayma`,
       `record ${env.namespace}/fs-abc123 released into none`,
       `detach node-a ${env.namespace}/${bound.pod}`,
     ]);
-    assert.equal(await run(readLease(env.none, key)), null);
   } finally {
     stand.close();
   }

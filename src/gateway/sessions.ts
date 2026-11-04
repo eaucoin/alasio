@@ -6,10 +6,11 @@
  * attaching the workspace into it, with the binding's token beside it, which the pod's bayma
  * starts on; and released once its bayma has run no exec, and no request of it has come, for
  * `releaseAfterMs` (../binder/sweep.ts): its sandbox saved whole by its node's agent, which
- * ends it, the workspace detached once it has ended, then the pod deleted, so a pod serves one
- * binding. Whether a bound pod is idle is asked of its bayma at most once every `idlePollMs`
- * (IDLE_POLL_MS by default): at most four requests a minute of each bound pod's, and one a
- * release's wait for most.
+ * ends it, the release through once its snapshot is in the store; then, in the background, the
+ * workspace detached once it has ended, then the pod deleted, so a pod serves one binding, the
+ * key bound anew only then. Whether a bound pod is idle is asked of its bayma at most once
+ * every `idlePollMs` (IDLE_POLL_MS by default): at most four requests a minute of each bound
+ * pod's, and one a release's wait for most.
  *
  * Its callers reach workspaces through it alone (operate), each of its own environment, as its
  * token names it, signed by that environment's key: the node agents are the gateway's. Under
@@ -17,7 +18,8 @@
  * - `POST /workspace`: makes it, of `quotaBytes` (204); again, sets its quota anew.
  * - `DELETE /workspace`: deletes it (204), as it does one there is not, its snapshots
  *   forgotten with it (./snapshots.ts forget), under its binding's Lease, which binds of it
- *   wait for; 409 while it is bound, or being bound or released.
+ *   wait for; 409 while it is bound, or being bound or released, but once a release of it is
+ *   through, its pod's end after it waited for (../binder/binder.ts hold).
  * - `GET /workspace/files?path=<path>&max=<bytes>`, `PUT /workspace/files?path=<path>`: its
  *   file at `path`, as the node agents read and write one (200, 204).
  * - `GET /workspace/quota`: `{ capacityBytes, usedBytes }` (200); 404 where it has none.
@@ -60,7 +62,7 @@ import { lookup } from "node:dns/promises";
 import type { V1Pod } from "@kubernetes/client-node";
 import { Clock, Effect, Schema } from "effect";
 
-import { type Binder, BindStepFailed } from "../binder/binder.ts";
+import { type Binder, BindStepFailed, type ReleaseSteps } from "../binder/binder.ts";
 import { type BindingLease, heldLeases } from "../binder/bindings.ts";
 import { BINDING_LABEL, KEY_ANNOTATION, keyHash, type Pool, POOL_LABEL } from "../binder/names.ts";
 import { type Answer, type Operation, type Placement, PlacementRefused } from "../binder/server.ts";
@@ -210,8 +212,8 @@ export const makeSessions = Effect.fnUntraced(function*(
       return {
         pool,
         make: restoring.make,
-        // Released as it is when idle: saved whole first, then detached, then deleted.
-        release: ({ pod }) => endAndDetach(pool, volumeId, pod).pipe(Effect.tap(() => released(pool, "asked"))),
+        // Released as it is when idle: saved whole first, then, as the release is answered, ended and detached, then deleted.
+        release: savedThenEnded(pool, volumeId, released(pool, "asked")),
         // A free pod's workspace attached; what was attached into one whose readying failed,
         // which the binder deletes, detached once its containers stopped, its directory with it.
         prepare: (got, binding) =>
@@ -253,30 +255,31 @@ export const makeSessions = Effect.fnUntraced(function*(
     });
 
   /**
-   * Ends the sandbox of `name`, the bound pod of the workspace `volumeId`, so its workspace
-   * can be detached, then detaches it: saved whole first, its release recorded for its next
-   * bind (./snapshots.ts); a save that leaves it running fails the release, which keeps the
-   * binding. Then its pod's deletion ends what of it runs on, its containers stopped, and the
-   * workspace is detached, for the binder to delete the pod.
+   * A release of the binding of the workspace `volumeId` of `pool`: before it, the sandbox of
+   * its bound pod saved whole, its release recorded for its next bind (./snapshots.ts), so the
+   * release is through once its snapshot is in the store; a save that leaves it running fails
+   * the release, which keeps the binding. After it, its pod's deletion ends what of it runs on,
+   * and the workspace is detached once its containers stopped (endAndDetach), for the binder to
+   * delete the pod, the key bound anew only then. `through` is run once the release is.
    */
-  const endAndDetach = (pool: Pool, volumeId: string, name: string): Effect.Effect<void, KubeApiError | NodeAgentError | BindStepFailed> =>
-    Effect.gen(function*() {
-      const pod = (yield* kube.read("v1", "Pod", pool.namespace, name)) as V1Pod | null;
-      if (!pod) return;
-      const node = pod.spec?.nodeName ?? "";
-      const containers = containerIdsOf(pod);
-      if ((yield* snapshots.save(pool, volumeId, name)) === "keep") return yield* new BindStepFailed({ reason: `its sandbox was not saved, and runs on` });
-      yield* kube.remove("v1", "Pod", pool.namespace, name);
-      yield* stopped(pool, name);
-      yield* timed(detachDuration, pool, agents.detach(node, pool.namespace, name, containers));
-    });
-
+  const savedThenEnded = (pool: Pool, volumeId: string, through: Effect.Effect<void> = Effect.void): ReleaseSteps<KubeApiError | BindStepFailed, KubeApiError | NodeAgentError | BindStepFailed> => {
+    let saved: V1Pod | null = null;
+    return {
+      before: ({ pod: name }) =>
+        Effect.gen(function*() {
+          saved = (yield* kube.read("v1", "Pod", pool.namespace, name)) as V1Pod | null;
+          if (saved && (yield* snapshots.save(pool, volumeId, name)) === "keep") return yield* new BindStepFailed({ reason: `its sandbox was not saved, and runs on` });
+          yield* through;
+        }),
+      after: () => (saved ? endAndDetach(pool, saved) : Effect.void),
+    };
+  };
 
   const sweep = yield* makeSweep({
     pools,
     idleness: baymaIdleness({ podPort, releaseAfterMs, idlePollMs, bindingKey }),
     release: (pool: Pool, key: string) =>
-      binder.release(pool, key, ({ pod: name }) => endAndDetach(pool, volumeIdOfKey(key) ?? "", name)).pipe(
+      binder.release(pool, key, savedThenEnded(pool, volumeIdOfKey(key) ?? "")).pipe(
         Effect.tap((done) =>
           done === "released"
             ? released(pool, "idle")
@@ -314,7 +317,7 @@ export const makeSessions = Effect.fnUntraced(function*(
         started.push(key);
         // Released as the binder releases one, its Lease marked releasing first: a release of the gateway's own under way is one of none,
         // and one of the key bound anew since, to another pod, is none of this pod's.
-        yield* Effect.forkDetach(binder.release(pool, key, () => drained(pool, workspace, pod), pod.metadata?.name ?? "").pipe(
+        yield* Effect.forkDetach(binder.release(pool, key, { before: () => drained(pool, workspace, pod) }, pod.metadata?.name ?? "").pipe(
           Effect.tap((done) =>
             done === "released"
               ? released(pool, "deleted")
@@ -344,7 +347,7 @@ export const makeSessions = Effect.fnUntraced(function*(
 
   /** Releases the binding of `key` of `pool`, its pod `pod`, as `before` says, counting it released for `reason`. */
   const releaseFor = (pool: Pool, key: string, pod: V1Pod, reason: "broken" | "oom", before: (name: string) => Effect.Effect<void, KubeApiError | NodeAgentError | BindStepFailed>) => {
-    return binder.release(pool, key, (bound) => before(bound.pod), pod.metadata?.name ?? "").pipe(
+    return binder.release(pool, key, { before: (bound) => before(bound.pod) }, pod.metadata?.name ?? "").pipe(
       Effect.tap((done) =>
         done === "released" ? released(pool, reason) : Effect.void
       ),
@@ -353,7 +356,7 @@ export const makeSessions = Effect.fnUntraced(function*(
   };
 
   /** Ends what of `pod`, a bound pod of `pool`, runs on, then detaches its workspace once its containers stopped. */
-  const endAndDetachUnsaved = (pool: Pool, pod: V1Pod) =>
+  const endAndDetach = (pool: Pool, pod: V1Pod) =>
     Effect.gen(function*() {
       const name = pod.metadata?.name ?? "";
       yield* kube.remove("v1", "Pod", pool.namespace, name);
@@ -407,13 +410,13 @@ export const makeSessions = Effect.fnUntraced(function*(
               // Of one killed for its memory, the limit kept with it, for its restore to tell its bayma; of one saved by a release
               // whose pod's end failed after, that snapshot kept.
               snapshots.releasedUnsaved(pool, workspace, pod.metadata?.name ?? "", memoryLimit),
-              endAndDetachUnsaved(pool, pod),
+              endAndDetach(pool, pod),
             )));
           continue;
         }
         const status = yield* statusOf(lease, pod);
         if (status === null) continue;
-        const unsaveable = releaseFor(pool, key, pod, "broken", () => Effect.andThen(snapshots.endUnsaveable(pool, workspace, pod.metadata?.name ?? ""), endAndDetachUnsaved(pool, pod)));
+        const unsaveable = releaseFor(pool, key, pod, "broken", () => Effect.andThen(snapshots.endUnsaveable(pool, workspace, pod.metadata?.name ?? ""), endAndDetach(pool, pod)));
         yield* snapshots.keepLive(pool, workspace, pod, status, yield* Clock.currentTimeMillis, unsaveable);
       }
     }

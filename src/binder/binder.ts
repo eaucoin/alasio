@@ -22,7 +22,7 @@ import { Clock, Context, Effect, Fiber, Layer, Schema, Semaphore } from "effect"
 
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
 import { meter } from "../telemetry/index.ts";
-import { BINDING_TIMEOUT_MS, type BindingLease, boundPod, claim, holdLease, markReleasing, readLease, RELEASING_ANNOTATION, releaseLease, renewLease, serving, stale, takeLease, unmarkReleasing } from "./bindings.ts";
+import { BINDING_TIMEOUT_MS, type BindingLease, boundPod, claim, holdLease, markReleased, markReleasing, readLease, RELEASED_ANNOTATION, RELEASING_ANNOTATION, releaseLease, renewLease, serving, stale, takeLease, unmarkReleasing } from "./bindings.ts";
 import { boundAnnotations, boundLabels, type Pool } from "./names.ts";
 
 /** How often a bind looks again, for a free pod, a binding another has under way, or its pod serving. */
@@ -105,25 +105,49 @@ export class BindStepFailed extends Schema.TaggedError<BindStepFailed>()("BindSt
 }
 
 /**
- * How a release of a key went: its binding released; none, the key bound nowhere; or none,
- * as another binder is binding or releasing it now.
+ * How a release of a key went: its binding released; its binding ended, released already by a
+ * release that was through, whose end of its pod failed after (`ended`), so it is told of as
+ * released once; none, the key bound nowhere; or none, as another binder is binding or
+ * releasing it now.
  */
-export type Released = "released" | "unbound" | "busy";
+export type Released = "released" | "ended" | "unbound" | "busy";
+
+/** A binding being released, as its steps are given it: its pod, and its binding, its Lease's uid. */
+export interface Releasing {
+  readonly pod: string;
+  readonly binding: string;
+}
+
+/**
+ * What a release runs of the binding it releases: `before`, as a checkpoint of its pod, the
+ * release through once it is done; and `after`, what of its pod is ended once it is through,
+ * run in the background, as a pod's containers take seconds to stop, which no caller of the
+ * release need wait for.
+ */
+export interface ReleaseSteps<E, F> {
+  readonly before?: ((bound: Releasing) => Effect.Effect<void, E>) | undefined;
+  readonly after?: ((bound: Releasing) => Effect.Effect<void, F>) | undefined;
+}
 
 export class Binder extends Context.Service<Binder, {
   /** The key bound in the pool, as the module says. */
   readonly bind: (pool: Pool, key: string, options?: BindOptions) => Effect.Effect<Bound, KubeApiError | BindTimeout | BindStepFailed>;
   /**
    * Releases the key's binding, binds of it waiting meanwhile: `before` run, as a checkpoint
-   * of its pod, then its pod deleted, then its Lease; where `pod` is given, only a binding of
-   * that pod, as one found ending, and none bound since, which is unbound to it. How it went
-   * (Released).
+   * of its pod, then `after`, then its pod deleted, then its Lease; where `pod` is given, only
+   * a binding of that pod, as one found ending, and none bound since, which is unbound to it.
+   * How it went (Released), once `before` is done: what comes after it runs on in the
+   * background, binds of the key waiting for it still, and a release asked again meanwhile
+   * finds none to release; where it fails, the binding is kept, marked released still, for the
+   * next release to end, which says it `ended`.
    */
-  readonly release: <E = never>(pool: Pool, key: string, before?: (bound: { readonly pod: string; readonly binding: string }) => Effect.Effect<void, E>, pod?: string) => Effect.Effect<Released, KubeApiError | E>;
+  readonly release: <E = never, F extends { readonly message: string } = never>(pool: Pool, key: string, steps?: ReleaseSteps<E, F>, pod?: string) => Effect.Effect<Released, KubeApiError | E>;
   /**
    * Runs `effect` holding the key's binding Lease, as a bind holds it under way, renewed the
    * while, binds of it waiting meanwhile; then lets it go: what `effect` came to, or null,
    * `effect` not run, where the key is bound, or being bound or released by another binder.
+   * One whose release was through, what comes after it under way, is waited for, up to the
+   * binder's `waitMs`, as its caller was told it is released.
    */
   readonly hold: <A, E>(pool: Pool, key: string, effect: Effect.Effect<A, E>) => Effect.Effect<{ readonly value: A } | null, KubeApiError | E>;
   /** How many binds of the pool wait for a free pod now, in this binder. */
@@ -247,14 +271,41 @@ export class Binder extends Context.Service<Binder, {
             return holding ? { lease: holding, name, start } : null;
           });
 
+        /** Whether `lease` is of a binding whose release was through, what of its pod comes after it under way by `now`. */
+        const releaseEnding = (lease: BindingLease, now: number): boolean =>
+          lease.metadata?.annotations?.[RELEASED_ANNOTATION] !== undefined && lease.metadata.annotations[RELEASING_ANNOTATION] !== undefined && !stale(lease, staleMs, now);
+
+        /** Deletes `pool`'s pod `pod` of a binding released, then its Lease `held`, where this release holds it still. */
+        const ended = (pool: Pool, pod: string, held: BindingLease | null): Effect.Effect<void, KubeApiError> =>
+          Effect.gen(function*() {
+            yield* kube.remove("v1", "Pod", pool.namespace, pod);
+            if (held) yield* provide(releaseLease(held)).pipe(Effect.catchIf(hasStatus(409), () => Effect.void));
+          });
+
+        /**
+         * Ends the binding of `pool`'s pod `pod` whose release is through, its Lease `held`, where
+         * this release holds it still: `after` run, its Lease renewed the while, then ended. Where
+         * `after` fails, the binding is kept, no longer marked releasing, and the failure given.
+         */
+        const ending = <F>(pool: Pool, pod: string, held: BindingLease | null, after: Effect.Effect<void, F>): Effect.Effect<void, KubeApiError | F> =>
+          Effect.gen(function*() {
+            const lease = held ? (yield* renewing(held, () => after, (renewed) => provide(unmarkReleasing(renewed)).pipe(Effect.ignore))).lease : yield* Effect.as(after, null);
+            yield* ended(pool, pod, lease);
+          });
+
         /**
          * Releases `key`'s binding, of the pod `only` alone where it is given: its Lease marked
          * releasing, by an update conditioned on the version read, so of two releases one alone
          * goes on, and binds of the key wait for it; `before` run, its Lease renewed the while;
-         * then its pod deleted, then its Lease. Where `before` fails, the binding is kept, no
-         * longer marked releasing, and the failure given.
+         * then its pod deleted, then its Lease; where there is an `after`, ended so in the
+         * background once it is run (ending), its Lease marked released first, so a release
+         * asked again meanwhile finds none to release, while binds of the key wait on. Where
+         * `before` fails, the binding is kept, no longer marked releasing, and the failure given;
+         * where `after` fails, it is kept so too, marked released still, and the failure logged,
+         * for the next release to end it, which runs its own steps and says it `ended`, the
+         * binding released once.
          */
-        const releaseBinding = <E>(pool: Pool, key: string, before: (bound: { readonly pod: string; readonly binding: string }) => Effect.Effect<void, E>, only?: string): Effect.Effect<Released, KubeApiError | E> =>
+        const releaseBinding = <E, F extends { readonly message: string }>(pool: Pool, key: string, { before, after }: ReleaseSteps<E, F>, only?: string): Effect.Effect<Released, KubeApiError | E> =>
           Effect.gen(function*() {
             const lease = yield* provide(readLease(pool, key));
             const pod = lease?.spec?.holderIdentity;
@@ -262,13 +313,24 @@ export class Binder extends Context.Service<Binder, {
             if (!lease || (!pod && stale(lease, staleMs, yield* Clock.currentTimeMillis))) return "unbound";
             // Bound to another pod since, as the key was bound anew: none of `only`'s to release.
             if (only !== undefined && pod && pod !== only) return "unbound";
+            // Released already: what comes after under way, none to release again; or failed, ended now, released once.
+            const already = lease.metadata?.annotations?.[RELEASED_ANNOTATION] !== undefined;
+            if (already && lease.metadata?.annotations?.[RELEASING_ANNOTATION]) return "unbound";
             if (!pod || lease.metadata?.annotations?.[RELEASING_ANNOTATION]) return "busy";
+            const done = already ? "ended" : "released";
             const marked = yield* provide(markReleasing(lease, binder));
             if (!marked) return "busy";
-            const { lease: held } = yield* renewing(marked, () => before({ pod, binding: marked.metadata?.uid ?? "" }), (renewed) => provide(unmarkReleasing(renewed)).pipe(Effect.ignore));
-            yield* kube.remove("v1", "Pod", pool.namespace, pod);
-            if (held) yield* provide(releaseLease(held)).pipe(Effect.catchIf(hasStatus(409), () => Effect.void));
-            return "released";
+            const bound = { pod, binding: marked.metadata?.uid ?? "" };
+            const { lease: held } = yield* renewing(marked, () => before ? before(bound) : Effect.void, (renewed) => provide(unmarkReleasing(renewed)).pipe(Effect.ignore));
+            if (!after) {
+              yield* ended(pool, pod, held);
+              return done;
+            }
+            const through = held && !already ? yield* provide(markReleased(held)) : held;
+            yield* Effect.forkDetach(ending(pool, pod, through, after(bound)).pipe(
+              Effect.catch((error) => Effect.logWarning(`${key}'s release was through, but ending its pod ${pod} failed: ${error.message}`)),
+            ));
+            return done;
           });
 
         const bind = (pool: Pool, key: string, options: BindOptions = {}): Effect.Effect<Bound, KubeApiError | BindTimeout | BindStepFailed> =>
@@ -308,7 +370,14 @@ export class Binder extends Context.Service<Binder, {
 
         const hold = <A, E>(pool: Pool, key: string, effect: Effect.Effect<A, E>): Effect.Effect<{ readonly value: A } | null, KubeApiError | E> =>
           Effect.gen(function*() {
-            const taken = yield* provide(takeLease(pool, key, binder, staleMs));
+            const deadline = (yield* Clock.currentTimeMillis) + waitMs;
+            let taken = yield* provide(takeLease(pool, key, binder, staleMs));
+            // A binding whose release was through, what of its pod comes after it under way, is waited for, as its
+            // releaser's caller was told it is released.
+            while (!taken.taken && releaseEnding(taken.lease, yield* Clock.currentTimeMillis) && (yield* Clock.currentTimeMillis) < deadline) {
+              yield* Effect.sleep(BIND_POLL_MS);
+              taken = yield* provide(takeLease(pool, key, binder, staleMs));
+            }
             if (!taken.taken) return null;
             const { value, lease } = yield* renewing(taken.lease, () => effect, (held) => provide(releaseLease(held)).pipe(Effect.ignore));
             if (lease) yield* provide(releaseLease(lease)).pipe(Effect.catchIf(hasStatus(409), () => Effect.void));
@@ -329,7 +398,7 @@ export class Binder extends Context.Service<Binder, {
           bind,
           bound,
           hold,
-          release: (pool, key, before = () => Effect.void, pod) => releaseBinding(pool, key, before, pod),
+          release: (pool, key, steps = {}, pod) => releaseBinding(pool, key, steps, pod),
           waiting: (pool) => Effect.sync(() => waits.get(poolKey(pool)) ?? 0),
         });
       }),

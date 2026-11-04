@@ -366,12 +366,14 @@ export const makeHarnesses = Effect.fnUntraced(function*(
    */
   const releaseAs = (pool: Pool, key: string, reason: ReleaseReason, drain: boolean, only?: string, told = (binding: string) => releasedFor(pool, key, binding, reason)) => {
     let binding = "";
-    return binder.release(pool, key, (bound) =>
-      Effect.gen(function*() {
-        binding = bound.binding;
-        if (drain) yield* drained(pool, key, bound.binding, bound.pod);
-        yield* ended(pool, bound.pod);
-      }), only).pipe(
+    return binder.release(pool, key, {
+      before: (bound) =>
+        Effect.gen(function*() {
+          binding = bound.binding;
+          if (drain) yield* drained(pool, key, bound.binding, bound.pod);
+          yield* ended(pool, bound.pod);
+        }),
+    }, only).pipe(
       Effect.tap((done) => (done === "released" ? told(binding) : Effect.void)),
       Effect.catchTag("HostBusy", (busy) => Effect.as(Effect.logInfo(busy.message), "busy" as const)),
     );
