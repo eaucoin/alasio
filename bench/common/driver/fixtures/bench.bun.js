@@ -30,11 +30,24 @@ const HELD_TICKS = 6;
 const POLLS = 7;
 const MAX_GAP_MS = 8;
 const TICKS = 9;
+// Spike: when the background loop's threads ran, in wall-clock milliseconds, which a restore's
+// checks read to tell where a stall was: the appender's longest write and gap between writes,
+// the write it is in (0 when none), and the rewriter's longest gap and tick.
+const APPEND_MAX_WRITE_MS = 10;
+const APPEND_MAX_WRITE_AT = 11;
+const APPEND_MAX_GAP_MS = 12;
+const APPEND_MAX_GAP_AT = 13;
+const APPEND_WRITING_SINCE = 14;
+const APPEND_LAST_AT = 15;
+const REWRITE_MAX_GAP_MS = 16;
+const REWRITE_MAX_GAP_AT = 17;
+const REWRITE_LAST_AT = 18;
+const REWRITE_MAX_TICK_MS = 19;
 
 const { fixture, sizeMib, runId, rateMibS = 0, workspace = "/workspace" } = PARAMS;
 const count = Math.max(1, Math.round(sizeMib));
 const ctl = new Int32Array(new SharedArrayBuffer(4 * 4));
-const counters = new Float64Array(new SharedArrayBuffer(8 * 16));
+const counters = new Float64Array(new SharedArrayBuffer(8 * 32));
 const versions = new Uint32Array(new SharedArrayBuffer(4 * count));
 const chunks = [];
 
@@ -132,7 +145,13 @@ onmessage = async ({ data: p }) => {
       const now = performance.now();
       if (!running()) {
         last = now;
+        counters[${REWRITE_LAST_AT}] = 0;
         return;
+      }
+      const wall = Date.now();
+      if (counters[${REWRITE_LAST_AT}] > 0 && wall - counters[${REWRITE_LAST_AT}] > counters[${REWRITE_MAX_GAP_MS}]) {
+        counters[${REWRITE_MAX_GAP_MS}] = wall - counters[${REWRITE_LAST_AT}];
+        counters[${REWRITE_MAX_GAP_AT}] = wall;
       }
       // At most a second owed, as a loop that falls behind does not catch up in one tick.
       owed = Math.min(rateMibS, owed + (rateMibS * (now - last)) / 1000);
@@ -141,6 +160,9 @@ onmessage = async ({ data: p }) => {
         rewrite(next);
         next = (next + 1) % chunks.length;
       }
+      const ended = Date.now();
+      if (ended - wall > counters[${REWRITE_MAX_TICK_MS}]) counters[${REWRITE_MAX_TICK_MS}] = ended - wall;
+      counters[${REWRITE_LAST_AT}] = ended;
     }, 10);
     const server = Bun.spawn([process.execPath, "-e", "const s = Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data(socket, data) { socket.write(data); } } }); console.log(s.port);"], { stdout: "pipe" });
     held.push(server.pid);
@@ -163,8 +185,24 @@ onmessage = async ({ data: p }) => {
     });
     const file = fs.openSync(workspace + "/bench-append.log", "a");
     setInterval(() => {
-      if (!running()) return;
+      if (!running()) {
+        counters[${APPEND_LAST_AT}] = 0;
+        return;
+      }
+      const started = Date.now();
+      if (counters[${APPEND_LAST_AT}] > 0 && started - counters[${APPEND_LAST_AT}] > counters[${APPEND_MAX_GAP_MS}]) {
+        counters[${APPEND_MAX_GAP_MS}] = started - counters[${APPEND_LAST_AT}];
+        counters[${APPEND_MAX_GAP_AT}] = started;
+      }
+      counters[${APPEND_WRITING_SINCE}] = started;
       fs.writeSync(file, "seq " + counters[${APPENDED}] + "\\n");
+      const written = Date.now();
+      counters[${APPEND_WRITING_SINCE}] = 0;
+      if (written - started > counters[${APPEND_MAX_WRITE_MS}]) {
+        counters[${APPEND_MAX_WRITE_MS}] = written - started;
+        counters[${APPEND_MAX_WRITE_AT}] = written;
+      }
+      counters[${APPEND_LAST_AT}] = written;
       counters[${APPENDED}] += 1;
       if (counters[${SOCKET_CLOSED}] === 0) {
         socket.write("ping\\n");
@@ -210,9 +248,10 @@ function rssBytes() {
   return [process.pid, ...held].reduce((sum, pid) => sum + of(pid), 0);
 }
 
-/** Stops the background loop, as a check needs memory and files to stand still, `during` it. */
-async function stopped(during) {
+/** Stops the background loop, as a check needs memory and files to stand still, `during` it; when, in `timing` (spike). */
+async function stopped(during, timing = {}) {
   if (!loop) return during();
+  timing.stop_asked = Date.now();
   Atomics.store(ctl, RUN, 0);
   // Said again by a tick that runs after both stores.
   Atomics.store(ctl, STOPPED, 0);
@@ -222,10 +261,12 @@ async function stopped(during) {
     if (now() > deadline) throw new Error("the background loop did not stop within 300 s");
     await sleep(5);
   }
+  timing.stopped = Date.now();
   try {
     return await during();
   } finally {
     Atomics.store(ctl, RUN, 1);
+    timing.run_again = Date.now();
   }
 }
 
@@ -244,15 +285,55 @@ function memoryIntact() {
   return bad;
 }
 
-/** Whether `counter` grows within `ms`. */
-async function grows(counter, ms) {
+/**
+ * Whether `counter` grows within `ms`; spike: how its polls went, in `polls` where given: their
+ * count, the longest wait between two, and whether the counter had grown by the time the
+ * deadline was seen passed, which it then answers no to whatever the last wait was.
+ */
+async function grows(counter, ms, polls = null) {
   const before = counters[counter];
   const deadline = now() + ms;
+  let last = now();
   while (now() < deadline) {
     if (counters[counter] > before) return true;
     await sleep(10);
+    if (polls) {
+      const at = now();
+      polls.count = (polls.count ?? 0) + 1;
+      polls.max_wait_ms = Math.max(polls.max_wait_ms ?? 0, at - last);
+      last = at;
+    }
   }
+  if (polls) polls.grown_at_deadline = counters[counter] > before;
   return false;
+}
+
+/** Spike: resets the loop's stall measures and starts the ticker's, for a check. */
+function armStalls() {
+  for (const index of [APPEND_MAX_WRITE_MS, APPEND_MAX_WRITE_AT, APPEND_MAX_GAP_MS, APPEND_MAX_GAP_AT, REWRITE_MAX_GAP_MS, REWRITE_MAX_GAP_AT, REWRITE_MAX_TICK_MS]) counters[index] = 0;
+  counters[MAX_GAP_MS] = 0;
+  counters[TICKS] = 0;
+  Atomics.store(ctl, MEASURE, 1);
+  Atomics.notify(ctl, MEASURE);
+}
+
+/** Spike: the loop's and the ticker's stall measures since armStalls, the ticker stopped. */
+function stallsSeen() {
+  Atomics.store(ctl, MEASURE, 0);
+  return {
+    append_max_write_ms: counters[APPEND_MAX_WRITE_MS],
+    append_max_write_at: counters[APPEND_MAX_WRITE_AT],
+    append_max_gap_ms: counters[APPEND_MAX_GAP_MS],
+    append_max_gap_at: counters[APPEND_MAX_GAP_AT],
+    append_writing_since: counters[APPEND_WRITING_SINCE],
+    append_last_at: counters[APPEND_LAST_AT],
+    rewrite_max_gap_ms: counters[REWRITE_MAX_GAP_MS],
+    rewrite_max_gap_at: counters[REWRITE_MAX_GAP_AT],
+    rewrite_max_tick_ms: counters[REWRITE_MAX_TICK_MS],
+    rewrite_last_at: counters[REWRITE_LAST_AT],
+    ticker_max_gap_ms: counters[MAX_GAP_MS],
+    ticker_ticks: counters[TICKS],
+  };
 }
 
 const alive = (pid) => {
@@ -297,26 +378,41 @@ globalThis.bench = {
   /** The first exec after a restore: the marker it holds live, and the loop's counters; for saturating, a full GC and every page read. */
   async first() {
     const seen = { marker, chunks: chunks.length, rewrites: counters[REWRITES] };
+    // Spike: when each step ran, and the loop's stalls over the exec.
+    const timing = { start: Date.now() };
+    armStalls();
     if (fixture === "saturating") {
       Bun.gc(true);
-      seen.bad_chunks = await stopped(memoryIntact);
+      timing.gc_end = Date.now();
+      seen.bad_chunks = await stopped(() => {
+        const bad = memoryIntact();
+        timing.memory_end = Date.now();
+        return bad;
+      }, timing);
     }
+    timing.end = Date.now();
+    seen.timing = { ...timing, ...stallsSeen() };
     return seen;
   },
   /** Every check: memory, children, the file, the socket, the loop running; and what the fixture holds. */
   async verify() {
     const result = { marker, memory: null, children: null, file: null, socket: null, running: null };
+    // Spike: when each step ran, how the checks' polls went, and the loop's stalls over the exec.
+    const timing = { start: Date.now() };
+    armStalls();
     const bad = await stopped(async () => {
       const found = memoryIntact();
+      timing.memory_end = Date.now();
       if (fixture === "saturating") {
         const lines = fs.readFileSync(`${workspace}/bench-append.log`, "utf8").split("\n").filter(Boolean);
+        timing.file_read_end = Date.now();
         const appended = counters[APPENDED];
         result.file = lines.length === appended && lines.every((line, index) => line === `seq ${index}`);
         result.file_lines = lines.length;
         result.appended = appended;
       }
       return found;
-    });
+    }, timing);
     result.memory = bad.length === 0;
     result.bad_chunks = bad;
     if (fixture === "poller") {
@@ -324,10 +420,27 @@ globalThis.bench = {
       result.children = held.every(alive) && spawned && (await grows(HELD_TICKS, 2500));
     }
     if (fixture === "saturating") {
-      result.file = result.file && (await grows(APPENDED, 300));
+      const appendedBefore = counters[APPENDED];
+      const polls = {};
+      timing.file_grows_start = Date.now();
+      const grew = await grows(APPENDED, 300, polls);
+      timing.file_grows_end = Date.now();
+      timing.file_polls = polls;
+      result.file = result.file && grew;
+      if (!grew) {
+        // Spike: where the appender was as the check gave up, and when it wrote again, looked at
+        // for up to 15 s more, which changes no check's answer.
+        timing.at_give_up = { writing_since: counters[APPEND_WRITING_SINCE], append_last_at: counters[APPEND_LAST_AT], rewrite_last_at: counters[REWRITE_LAST_AT], appended: counters[APPENDED] };
+        const looked = Date.now();
+        while (counters[APPENDED] === appendedBefore && Date.now() - looked < 15_000) await sleep(10);
+        timing.appended_again = counters[APPENDED] > appendedBefore ? Date.now() : null;
+      }
       result.socket = counters[SOCKET_CLOSED] === 1 ? "closed" : (await grows(ECHOED, 2000)) ? "open" : "hung";
+      timing.socket_end = Date.now();
     }
     if (loop) result.running = await grows(REWRITES, 1000);
+    timing.end = Date.now();
+    result.timing = { ...timing, ...stallsSeen() };
     result.rss_bytes = rssBytes();
     return result;
   },

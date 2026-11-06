@@ -96,6 +96,9 @@ const RELEASE_UNDER_TEST = NODE_PINS.gvisor.releases[0]?.release ?? "";
 /** The release of alasio under test, and of the bayma its sessions run (sandbox/agent/Dockerfile's BAYMA_IMAGE). */
 const ALASIO_UNDER_TEST = (JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { readonly version: string }).version;
 const BAYMA_UNDER_TEST = /^ARG BAYMA_IMAGE=\S+:([0-9][^@\s]*)/mu.exec(readFileSync(new URL("../../sandbox/agent/Dockerfile", import.meta.url), "utf8"))?.[1] ?? "";
+/** Spike: runsc flags for the release under test, as BENCH_RUNSC_CONFIG names them: state-engine:wire, say. */
+const RUNSC_CONFIG = (process.env["BENCH_RUNSC_CONFIG"] ?? "").split(",").filter(Boolean);
+for (const word of RUNSC_CONFIG) if (!/^[a-z][a-z0-9-]*:[A-Za-z0-9_./-]+$/u.test(word)) throw new Error(`BENCH_RUNSC_CONFIG's ${word} is no flag:value`);
 /** Whether the node's page cache is dropped before the warm restore: kept by `kept-cache` alone. */
 const PAGE_CACHE = VARIANT === "kept-cache" ? "kept" : "dropped";
 
@@ -499,8 +502,24 @@ async function restore(node: string, workspace: string, sessionId: string, fixtu
     page_cache: kind === "cold" ? "dropped" : PAGE_CACHE,
     compaction_at_t0: compactionAtT0(spike.steps),
   };
-  const details = { pod: name, node, source, prepared, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(), spike };
+  // Spike: the fixture's own timing of its first exec and its verify, with the loop's stalls.
+  const timingOf = (said: unknown): unknown => (typeof said === "object" && said !== null ? ((said as Record<string, unknown>)["timing"] ?? null) : null);
+  const answered = probed as unknown as Record<string, unknown>;
+  const fixtureTiming = { first: timingOf(answered["first"]), verify: timingOf(answered["verified"]) };
+  // Spike: a restore that failed keeps its sandbox's whole boot log, and the node's JuiceFS log's end.
+  if (!probed.ok) await keepFailedLogs(node, name, `${runId}-${kind}`);
+  const details = { pod: name, node, source, prepared, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(), spike, fixture_timing: fixtureTiming };
   return { probed, metrics, details, pod: name };
+}
+
+/** Spike: keeps the boot log of the sandbox of pod `name` on `node`, and the end of the node's JuiceFS log, as `label`'s, gzipped, in the job's logs. */
+async function keepFailedLogs(node: string, name: string, label: string): Promise<void> {
+  const logs = join(BENCH_DIR, "logs");
+  const sandboxId = await sandboxIdOf(node, name).catch(() => "");
+  await onNode(node, [
+    `cat ${RUNSC_LOGS}/${sandboxId}/runsc.log.*.boot.txt 2>/dev/null | gzip > ${logs}/boot-${label}.txt.gz`,
+    `for each in $(find /run/alasio -name juicefs.log 2>/dev/null); do echo "# $each"; tail -c 2000000 "$each"; done | gzip > ${logs}/juicefs-${label}.txt.gz`,
+  ].join("; ")).catch((failed: unknown) => console.error(`# the logs of ${label} were not kept: ${errorText(failed)}`));
 }
 
 /** How long a restore may take to its first exec's answer, and to every page resident, from its t0 (the benchmark's design, section 5). */
@@ -1046,6 +1065,13 @@ async function bootLogs(node: string): Promise<void> {
     const options = `${CONTAINERD}/${gvisorHandler(release)}.toml`;
     // [runsc_config] is the options' last table (cli/src/cluster/k3s.ts).
     await onNode(node, `grep -q '^  debug-log' ${options} || printf '  debug-log = "${RUNSC_LOGS}/%%ID%%/"\\n  debug-command = "boot"\\n' >> ${options}; tail -n 4 ${options}`);
+    // Spike: the release under test's runsc flags of BENCH_RUNSC_CONFIG, as name:value words separated by commas.
+    if (release === RELEASE_UNDER_TEST) {
+      for (const word of RUNSC_CONFIG) {
+        const [flag = "", value = ""] = word.split(":");
+        await onNode(node, `grep -q '^  ${flag} = ' ${options} || printf '  ${flag} = "${value}"\\n' >> ${options}; tail -n 6 ${options}`);
+      }
+    }
   }
   const free = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${FREE_LABEL}=true` });
   for (const pod of free) await kube.remove(ref("Pod", pod.metadata?.name ?? "", SESSIONS));
