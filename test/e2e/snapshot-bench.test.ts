@@ -506,20 +506,36 @@ async function restore(node: string, workspace: string, sessionId: string, fixtu
   const timingOf = (said: unknown): unknown => (typeof said === "object" && said !== null ? ((said as Record<string, unknown>)["timing"] ?? null) : null);
   const answered = probed as unknown as Record<string, unknown>;
   const fixtureTiming = { first: timingOf(answered["first"]), verify: timingOf(answered["verified"]) };
-  // Spike: a restore that failed keeps its sandbox's whole boot log, and the node's JuiceFS log's end.
-  if (!probed.ok) await keepFailedLogs(node, name, `${runId}-${kind}`);
-  const details = { pod: name, node, source, prepared, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(), spike, fixture_timing: fixtureTiming };
+  // Spike: every restore keeps its sandbox's whole boot log, and one that failed the node's JuiceFS log's end too.
+  await keepFailedLogs(node, name, `${runId}-${kind}`, !probed.ok);
+  // Spike: the CPU the restore's pod has used since it was made, and how often its quota held it.
+  const cpu = await podCpuStat(node, pod.metadata?.uid ?? "");
+  const details = { pod: name, node, source, prepared, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(), spike, fixture_timing: fixtureTiming, cpu };
   return { probed, metrics, details, pod: name };
 }
 
-/** Spike: keeps the boot log of the sandbox of pod `name` on `node`, and the end of the node's JuiceFS log, as `label`'s, gzipped, in the job's logs. */
-async function keepFailedLogs(node: string, name: string, label: string): Promise<void> {
+/** Spike: keeps the boot log of the sandbox of pod `name` on `node`, and where `juicefs` the end of the node's JuiceFS log, as `label`'s, gzipped, in the job's logs. */
+async function keepFailedLogs(node: string, name: string, label: string, juicefs: boolean): Promise<void> {
   const logs = join(BENCH_DIR, "logs");
   const sandboxId = await sandboxIdOf(node, name).catch(() => "");
   await onNode(node, [
     `cat ${RUNSC_LOGS}/${sandboxId}/runsc.log.*.boot.txt 2>/dev/null | gzip > ${logs}/boot-${label}.txt.gz`,
-    `for each in $(find /run/alasio -name juicefs.log 2>/dev/null); do echo "# $each"; tail -c 2000000 "$each"; done | gzip > ${logs}/juicefs-${label}.txt.gz`,
+    ...(juicefs ? [`for each in $(find /run/alasio -name juicefs.log 2>/dev/null); do echo "# $each"; tail -c 2000000 "$each"; done | gzip > ${logs}/juicefs-${label}.txt.gz`] : []),
   ].join("; ")).catch((failed: unknown) => console.error(`# the logs of ${label} were not kept: ${errorText(failed)}`));
+}
+
+/** Spike: the pod of uid `uid` on `node`, as its cgroup's cpu.stat says: CPU used and its quota's periods, throttled ones and time; null where not found. */
+async function podCpuStat(node: string, uid: string): Promise<Record<string, number> | null> {
+  const printed = await onNode(node, [
+    `dir=$(find /sys/fs/cgroup -maxdepth 6 -type d \\( -name '*pod${uid}*' -o -name '*pod${uid.replaceAll("-", "_")}*' \\) | head -n 1)`,
+    `[ -n "$dir" ] && cat "$dir/cpu.stat"`,
+  ].join("; ")).catch(() => "");
+  const stat: Record<string, number> = {};
+  for (const line of printed.split("\n")) {
+    const [key, value] = line.trim().split(" ");
+    if (key && value && /^[0-9]+$/u.test(value)) stat[key] = Number(value);
+  }
+  return Object.keys(stat).length === 0 ? null : stat;
 }
 
 /** How long a restore may take to its first exec's answer, and to every page resident, from its t0 (the benchmark's design, section 5). */
