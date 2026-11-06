@@ -1,0 +1,7 @@
+{
+  "extends": "../common/tsconfig.json",
+  "compilerOptions": {
+    "typeRoots": ["../common/node_modules/@types"]
+  },
+  "include": ["*.ts"]
+}
