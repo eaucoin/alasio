@@ -130,6 +130,22 @@ test("the gvisor RuntimeClass runs the current release, and each release kept ha
   ]);
 });
 
+test("the releases pinned, the fork's own numbers starting again on each base, are each a runtime and a RuntimeClass of a name of its own, a DNS label", () => {
+  const releases = pins.gvisor.releases.map(({ release }) => release);
+  const classes = gvisorRuntimeClasses(releases);
+  const names = classes.map(({ metadata }) => metadata?.name ?? "");
+  const handlers = [...new Set(classes.map(({ handler }) => handler))];
+  assert.equal(new Set(names).size, releases.length + 1);
+  assert.equal(handlers.length, releases.length);
+  for (const name of [...names, ...handlers]) assert.match(name, /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u);
+  // Of a base after the one before it, whose number is higher: told apart by the base, not the number.
+  assert.deepEqual(gvisorRuntimeClasses(["20261102.0-eaucoin.1", "20260921.0-eaucoin.16"]).map(({ metadata, handler }) => [metadata?.name, handler]), [
+    ["gvisor", "runsc-20261102-0-eaucoin-1"],
+    ["gvisor-20261102-0-eaucoin-1", "runsc-20261102-0-eaucoin-1"],
+    ["gvisor-20260921-0-eaucoin-16", "runsc-20260921-0-eaucoin-16"],
+  ]);
+});
+
 test("the RuntimeClasses deleted are alasio's of releases no longer kept, and any desired with another handler, which cannot change", () => {
   const desired = gvisorRuntimeClasses(["21000101.0", "20990101.0"]);
   const others = { metadata: { name: "kata" }, handler: "kata" };

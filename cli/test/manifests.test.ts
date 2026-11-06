@@ -3621,9 +3621,14 @@ describe("the sandbox service", () => {
   });
 
   test("a restore of a snapshot taken under a release at or past the first that restores through a socket asks for its checkpoint gofer through a socket, reading again pages a read of failed; one before it, or where none is named, the agent's own way", () => {
+    const socket = { transport: "socket", pagesRetry: true };
+    // By the base's date and patch first, then the fork's own number, which starts again at 1 on each base: past it
+    // of a later base, whatever its number, and before it of an earlier one.
     assert.deepEqual(
-      ["20260921.0-eaucoin.8", "20260921.0-eaucoin.9", "20260921.1-eaucoin.1"].map((release) => goferOf(release, "20260921.0-eaucoin.9")),
-      [null, { transport: "socket", pagesRetry: true }, { transport: "socket", pagesRetry: true }],
+      ["20260921.0-eaucoin.8", "20260921.0-eaucoin.9", "20260921.0-eaucoin.16", "20260921.1-eaucoin.1", "20261102.0-eaucoin.1", "20260801.0-eaucoin.16"].map((release) =>
+        goferOf(release, "20260921.0-eaucoin.9")
+      ),
+      [null, socket, socket, socket, socket, null],
     );
     assert.equal(goferOf("20260921.0-eaucoin.9", ""), null);
   });
