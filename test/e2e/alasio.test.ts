@@ -834,8 +834,11 @@ if (inShard("sessions")) {
       const pod = await sessionPod(none);
       assert.equal(pod.metadata?.labels?.["alasio.dev/pool"], "sandboxes-none");
       if (pod.spec?.runtimeClassName === "gvisor") assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/version","utf8"))'), /gvisor/u);
-      // As on an Ubuntu host: no core file written as it crashes, unless it raises the limit.
-      assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/self/limits","utf8"))'), /^Max core file size\s+0\s/mu);
+      // As on an Ubuntu host: no core file written as it crashes, unless it raises the limit. Read of the container's
+      // first process, whose limits bayma and all it runs inherit: a process an exec starts takes those the container's
+      // spec gives, as under runc, and under gVisor too from release-20261102.0 on, which gives each container and each
+      // exec a set of its own.
+      assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/1/limits","utf8"))'), /^Max core file size\s+0\s/mu);
       await assertNoInternet(none);
       assert.match(await inSession(none, 'console.log(require("fs").existsSync("/var/run/secrets/kubernetes.io/serviceaccount"))'), /false/u);
     });
