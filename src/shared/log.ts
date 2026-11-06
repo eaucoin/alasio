@@ -108,3 +108,6 @@ const alasioLogger = EffectLogger.make<unknown, void>(({ message, logLevel, caus
 
 /** alasio's logger in place of Effect's default one. */
 export const AlasioLoggerLayer = EffectLogger.layer([alasioLogger]);
+
+/** Spike: a line marking a step of a warm restore, at the wall clock's millisecond, for test/e2e/warm-restore-trace.test.ts. */
+export const trace = (what: string): Effect.Effect<void> => Effect.suspend(() => Effect.logInfo(`trace ${what} @${Date.now()}`));
