@@ -137,9 +137,14 @@ onmessage = async ({ data: p }) => {
       // At most a second owed, as a loop that falls behind does not catch up in one tick.
       owed = Math.min(rateMibS, owed + (rateMibS * (now - last)) / 1000);
       last = now;
-      for (; owed >= 1; owed -= 1) {
+      // A tick yields the thread once it has rewritten for 20 ms, what it still owes left to the next
+      // ticks, so that the appender, whose ticks run on this thread too, keeps its pace: after a cold
+      // restore, a catch-up of up to a second of rewrites held it past the verify's 300 ms.
+      while (owed >= 1) {
         rewrite(next);
         next = (next + 1) % chunks.length;
+        owed -= 1;
+        if (performance.now() - now >= 20) break;
       }
     }, 10);
     const server = Bun.spawn([process.execPath, "-e", "const s = Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data(socket, data) { socket.write(data); } } }); console.log(s.port);"], { stdout: "pipe" });
