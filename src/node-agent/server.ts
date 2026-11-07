@@ -24,10 +24,11 @@
  *   every checkpoint of it after will. 404 when it has none the agent keeps (./operations.ts).
  * - `POST /prepare`, `{ environment, workspace, manifest, gofer? }`: starts preparing the
  *   workspace's snapshot of `manifest`, its current one as alasio read it, for a restore on
- *   this node (202), from this node's cache, or else from the bucket, which the restore reads
- *   as it goes, unless a prepare of it runs, which goes on; `gofer`, `{ transport: "socket" |
- *   "tcp", pagesRetry }`, says how its checkpoint gofer reads the bucket through the agent
- *   (./agent.ts PrepareRequest), over TCP unless given.
+ *   this node, from this node's cache, or else from the bucket, which the restore reads as it
+ *   goes, unless a prepare of it runs, which goes on: answered how it ended where it has within
+ *   PREPARE_ANSWER_MS, as `GET /prepare/...` answers it (200), or that it runs (202); `gofer`,
+ *   `{ transport: "socket" | "tcp", pagesRetry }`, says how its checkpoint gofer reads the
+ *   bucket through the agent (./agent.ts PrepareRequest), over TCP unless given.
  * - `GET /prepare/<environment>/<workspace>`: how its last prepare stands, as a
  *   checkpoint's does, `value` `{ manifest, imagePath, source }`, `source` "cache" or
  *   "bucket"; `status` 409 when this node cannot restore it (its
@@ -261,6 +262,13 @@ const RELEASED = /^\/workspaces\/([^/]+)\/([^/]+)\/released$/u;
 const WORKSPACE = /^\/workspaces\/([^/]+)\/([^/]+)$/u;
 const WORKSPACES = /^\/workspaces\/([^/]+)$/u;
 
+/**
+ * How long a prepare's request waits for it to end before it is answered that it runs: one from
+ * the node's cache ends in tens of milliseconds, and one from the bucket within some hundreds, as
+ * it looks at its images there, which a restore waits on.
+ */
+const PREPARE_ANSWER_MS = 2_000;
+
 /** How long a 503 asks its caller to wait before it asks again, in seconds. */
 const RETRY_AFTER_S = 2;
 
@@ -330,7 +338,11 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     }
     if (method === "GET" && checkpoint) return outcome(checkpoints, checkpoint);
     if (method === "POST" && url === "/prepare") {
-      return body(PrepareRequest).pipe(Effect.flatMap((asked) => prepares.start(keyOf(asked), logged(agent.prepare(asked)))), Effect.as(started));
+      return body(PrepareRequest).pipe(
+        Effect.flatMap((asked) => prepares.start(keyOf(asked), logged(agent.prepare(asked))).pipe(Effect.andThen(prepares.outcomeWithin(keyOf(asked), PREPARE_ANSWER_MS)))),
+        // Answered as it ended, where it has; that it runs, otherwise, to be asked how it stands.
+        Effect.map((found) => (found === null || found.state === "running" ? started : answer(200, found))),
+      );
     }
     if (method === "GET" && prepare) return outcome(prepares, prepare);
     if (method === "POST" && url === "/copies") {
