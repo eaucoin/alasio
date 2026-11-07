@@ -18,7 +18,8 @@
  * snapshot no longer holds what the workspace is, whose files and processes have moved
  * on since it was taken, so a checkpoint that fails forgets it rather than leave it to be
  * restored. A snapshot restored is spent: no longer current, its images go on as the layers
- * of the next. A copy gives a workspace another's current snapshot, as a session forked
+ * of the next; its commit is removed only as the bucket holds it as it was read, by its ETag,
+ * so a commit another node's agent writes meanwhile stands. A copy gives a workspace another's current snapshot, as a session forked
  * from another restores what the other was: its images copied in the bucket, then its
  * manifest, then its commit, as a checkpoint writes them.
  *
@@ -473,7 +474,8 @@ export interface NodeAgent {
   /**
    * Makes the workspace's current snapshot current no more, if it is `snapshot` still, or one
    * compacted from it, which is the same: one its sandbox was restored from, or one taken
-   * live whose exec has ended. Its images go on as the layers of its next.
+   * live whose exec has ended. Its images go on as the layers of its next. One committed since
+   * by any node's agent stands (spendNow).
    */
   readonly spend: (workspace: WorkspaceRef, snapshot: string) => Effect.Effect<void, S3Error | SnapshotCorrupt>;
   /** Forgets the workspace's snapshots, in the bucket and in the cache. */
@@ -837,24 +839,45 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       return [(yield* Clock.currentTimeMillis) - start, value] as const;
     });
 
-  /** The manifest the object `key` holds, of the workspace `ref`'s: one of another workspace's is none of it. */
-  const manifestAt = (ref: WorkspaceRef, key: string): Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt> =>
-    bucket.getJson(key).pipe(
+  /** The manifest the object `key` holds, of the workspace `ref`'s, and the ETag the bucket holds it by: one of another workspace's is none of it. */
+  const taggedManifestAt = (ref: WorkspaceRef, key: string): Effect.Effect<{ readonly manifest: Manifest; readonly etag: string } | null, S3Error | SnapshotCorrupt> =>
+    bucket.getTaggedJson(key).pipe(
       Effect.flatMap((found) =>
         found === null
           ? Effect.succeed(null)
-          : Schema.decodeUnknownEffect(Manifest)(found).pipe(
+          : Schema.decodeUnknownEffect(Manifest)(found.value).pipe(
             Effect.mapError((error) => new SnapshotCorrupt({ ...ref, reason: `its ${key.slice(prefixOf(ref).length + 1)} is not a manifest: ${error.message}` })),
             Effect.filterOrFail(
               (manifest) => prefixOf(manifest) === prefixOf(ref),
               (manifest) => new SnapshotCorrupt({ ...ref, reason: `its ${key.slice(prefixOf(ref).length + 1)} names ${prefixOf(manifest)}` }),
             ),
+            Effect.map((manifest) => ({ manifest, etag: found.etag })),
           )
       ),
     );
 
+  /** The manifest the object `key` holds, of the workspace `ref`'s, as taggedManifestAt reads it. */
+  const manifestAt = (ref: WorkspaceRef, key: string): Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt> =>
+    Effect.map(taggedManifestAt(ref, key), (found) => found?.manifest ?? null);
+
   /** The workspace's current snapshot, as its `current.json` says. */
   const current = (ref: WorkspaceRef): Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt> => manifestAt(ref, `${prefixOf(ref)}/${CURRENT_FILE}`);
+
+  /**
+   * Makes the workspace's current snapshot current no more where it is `snapshot`, or one compacted from it, which is the
+   * same: its manifest, or null where it is neither. Its `current.json` is removed only as the bucket holds it as it was read
+   * (removeIf, by its ETag): the agent of another node may commit the workspace's next snapshot meanwhile, a release of its
+   * sandbox restored there, or a compaction there, which no lock of this agent's holds back. One written since is read again,
+   * and stands where it is another.
+   */
+  const spendNow = (ref: WorkspaceRef, snapshot: string): Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt> =>
+    Effect.gen(function*() {
+      for (;;) {
+        const found = yield* taggedManifestAt(ref, `${prefixOf(ref)}/${CURRENT_FILE}`);
+        if (found === null || (found.manifest.snapshot !== snapshot && found.manifest.compactedFrom !== snapshot)) return null;
+        if (yield* bucket.removeIf(`${prefixOf(ref)}/${CURRENT_FILE}`, found.etag)) return found.manifest;
+      }
+    });
 
   /** Forgets the workspace's snapshots: the cache's copy, then in the bucket, uncommitted first and then its objects deleted. */
   const forgetNow = (ref: WorkspaceRef): Effect.Effect<void, S3Error | CacheError> =>
@@ -1844,17 +1867,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     current,
     copy: (from, to) => copy(from, to).pipe(withLogScope("node-agent")),
     spend: (ref, snapshot) =>
-      exclusive(
-        [ref],
-        current(ref).pipe(
-          // One compacted from it is the same snapshot, which a compaction committed as the restore read it.
-          Effect.flatMap((manifest) =>
-            manifest !== null && (manifest.snapshot === snapshot || manifest.compactedFrom === snapshot)
-              ? bucket.remove(`${prefixOf(ref)}/${CURRENT_FILE}`).pipe(Effect.as(manifest))
-              : Effect.succeed(null)
-          ),
-        ),
-      ).pipe(
+      exclusive([ref], spendNow(ref, snapshot)).pipe(
         Effect.tap((spent) =>
           spent === null
             ? Effect.logInfo(`spent nothing of ${prefixOf(ref)} for the snapshot ${snapshot}: the workspace's current snapshot is neither it nor one compacted from it`)

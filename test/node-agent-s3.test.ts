@@ -51,7 +51,7 @@ test("requests are signed as AWS's Signature Version 4 test suite signs them", (
 
 const CREDENTIALS = { accessKeyId: "snapshots0123", secretAccessKey: "a secret" };
 
-test("the bucket takes files and JSON, gives them back, says what it holds, copies within itself, lists a prefix across pages, and deletes, every request signed", async () => {
+test("the bucket takes files and JSON, gives them back, says what it holds, copies within itself, lists a prefix across pages, and deletes, as of an ETag too, every request signed", async () => {
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS, pageSize: 2 });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
   try {
@@ -103,6 +103,18 @@ test("the bucket takes files and JSON, gives them back, says what it holds, copi
     await run(bucket.remove("main/fs-abc/s2/a"));
     await run(bucket.remove("main/fs-abc/s2/a"));
     assert.equal(s3.objects.has("main/fs-abc/s2/a"), false);
+
+    // Removed as of the ETag it was read with alone: not once written over since, nor once gone.
+    const read = await run(bucket.getTaggedJson("main/fs-abc/current.json"));
+    assert.deepEqual(read?.value, { snapshot: "s1" });
+    assert.equal(await run(bucket.getTaggedJson("main/fs-none/current.json")), null);
+    await run(bucket.putJson("main/fs-abc/current.json", { snapshot: "s2" }));
+    assert.equal(await run(bucket.removeIf("main/fs-abc/current.json", read?.etag ?? "")), false);
+    assert.deepEqual(await run(bucket.getJson("main/fs-abc/current.json")), { snapshot: "s2" });
+    const again = await run(bucket.getTaggedJson("main/fs-abc/current.json"));
+    assert.equal(await run(bucket.removeIf("main/fs-abc/current.json", again?.etag ?? "")), true);
+    assert.equal(s3.objects.has("main/fs-abc/current.json"), false);
+    assert.equal(await run(bucket.removeIf("main/fs-abc/current.json", again?.etag ?? "")), false);
 
     const missing = await Effect.runPromiseExit(bucket.getFile("main/fs-abc/s9/none", join(directory, "none"), 10));
     assert.ok(Exit.isFailure(missing));

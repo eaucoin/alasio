@@ -1,6 +1,6 @@
 /**
  * A stand-in for an S3 API, in process, serving one bucket by path-style URLs as
- * SeaweedFS does: PutObject, CopyObject, GetObject (of a range too), HeadObject, DeleteObject,
+ * SeaweedFS does: PutObject, CopyObject, GetObject (of a range too), HeadObject, DeleteObject (as of an ETag too),
  * ListObjectsV2, and multipart uploads (CreateMultipartUpload, UploadPart, UploadPartCopy,
  * CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads), every
  * request's Signature Version 4 checked against the credentials it is given, with every
@@ -256,7 +256,7 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
         response.writeHead(206, { "content-length": part.length, "content-range": `bytes ${first}-${last}/${object.length}` }).end(part);
         return;
       }
-      response.writeHead(200, { "content-length": object.length }).end(object);
+      response.writeHead(200, { "content-length": object.length, etag: etagHeld(key, object) }).end(object);
       return;
     }
     if (key && method === "HEAD") {
@@ -266,6 +266,12 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
       return;
     }
     if (method === "DELETE") {
+      // As of the ETag it was read with, where asked: refused where it is another, or none, as SeaweedFS refuses it.
+      const ifMatch = request.headers["if-match"];
+      const object = objects.get(key);
+      if (ifMatch !== undefined && (object === undefined || etagHeld(key, object).replaceAll('"', "") !== ifMatch.replaceAll('"', ""))) {
+        return error(response, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+      }
       objects.delete(key);
       etags.delete(key);
       writtenAt.delete(key);

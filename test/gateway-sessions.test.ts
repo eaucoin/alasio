@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { before, test } from "node:test";
 
 import { CoreV1Api, KubeConfig, type V1Deployment, type V1Pod, type V1PodSpec, type V1PodTemplateSpec } from "@kubernetes/client-node";
-import { Deferred, Effect, Fiber, Layer } from "effect";
+import { Deferred, Effect, Fiber, Layer, Scope } from "effect";
 import { TestClock } from "effect/testing";
 
 import { added, collected } from "./support/metrics.ts";
@@ -207,10 +207,14 @@ const options = (env: SessionsEnvironment & { template?: V1PodTemplateSpec }, po
 });
 
 /** The gateway's sessions and its Binder, on clients of their own. */
-const sessionsOf = (opts: SessionsOptions, nodeAgents: NodeAgents) =>
+/**
+ * The gateway's sessions of `opts`, on `nodeAgents`, what they run in the background running for as long as the test's
+ * process, their KubeClient as `kubeOf` makes it of the API server's.
+ */
+const sessionsOf = (opts: SessionsOptions, nodeAgents: NodeAgents, kubeOf: (kube: KubeClient["Service"]) => KubeClient["Service"] = (kube) => kube) =>
   Effect.runPromise(Effect.provide(Effect.gen(function*() {
     const binder = yield* Binder;
-    return { binder, sessions: yield* makeSessions(opts, nodeAgents, binder) };
+    return { binder, sessions: yield* makeSessions(opts, nodeAgents, binder).pipe(Scope.provide(yield* Scope.make()), Effect.updateService(KubeClient, kubeOf)) };
   }), Layer.provideMerge(Binder.layer({ waitMs: 5_000 }), Layer.fresh(KubeClient.layer))));
 
 test("a session's workspace is placed in its environment's pool of its internet, and readied by its node's agent attaching it with its binding's token", async () => {
@@ -887,18 +891,29 @@ function restoringAgents(current: Manifest | null, released: Released | null, { 
     setReleased: (ref, into) => Effect.sync(() => (base.asked.push(`record ${ref.environment}/${ref.workspace} released into ${into?.snapshot ?? "none"}`), void (state.released = into))),
     current: () => Effect.sync(() => state.current),
     holdings: (node) => Effect.succeed({ node, releases: [{ release: "r1", cpuFeatures: ["sse", "avx"] }], cached: [] }),
-    prepare: (node, _workspace, gofer) =>
+    prepare: (node, ref, gofer) =>
       prepare === "fails"
         ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 502, reason: "the snapshots bucket failed" }))
         : prepare === "finds it corrupt"
         ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 422, reason: "its image is not in the bucket as it was put" }))
-        : Effect.sync(() => (base.asked.push(`prepare ${node}${gofer ? ` ${gofer.transport}${gofer.pagesRetry ? " retrying pages" : ""}` : ""}`), { manifest: state.current as Manifest, imagePath: "/var/cache/alasio/image", source: "cache" as const })),
+        : Effect.sync(() => (base.asked.push(`prepare ${node}${gofer ? ` ${gofer.transport}${gofer.pagesRetry ? " retrying pages" : ""}` : ""}`), { manifest: state.current as Manifest, imagePath: `/var/lib/alasio/snapshots/${ref.environment}/${ref.workspace}/${(state.current as Manifest).snapshot}`, source: "cache" as const })),
     resume: (node, request, bytes) => Effect.sync(() => void base.asked.push(`resume ${node} ${request.pod} ${request.snapshot} of ${bytes} bytes`)),
-    spend: (_ref, snapshot) => Effect.sync(() => (base.asked.push(`spend ${snapshot}`), void (state.current = null))),
+    // As an agent does it: only where the workspace is at `snapshot` still.
+    spend: (node, _ref, snapshot) => Effect.sync(() => (base.asked.push(`spend ${node} ${snapshot}`), void (state.current = state.current?.snapshot === snapshot ? null : state.current))),
     forget: (ref) => Effect.sync(() => (base.asked.push(`forget ${ref.workspace}`), void (state.current = null))),
   };
   return { ...base, state, agents: restoring };
 }
+
+/** Waits until the agents `asked` were asked to spend `snapshot` on `node`. */
+const spent = async (asked: readonly string[], node: string, snapshot: string): Promise<void> => {
+  for (const deadline = Date.now() + 10_000; !asked.includes(`spend ${node} ${snapshot}`); await new Promise((resolve) => setTimeout(resolve, 50))) {
+    assert.ok(Date.now() < deadline, `${snapshot} was not spent on ${node}: ${asked.join(", ")}`);
+  }
+};
+
+/** Why `pod`'s resumed condition holds, as it says whether its snapshot is spent yet. */
+const resumedReason = (pod: V1Pod | null): string | undefined => pod?.status?.conditions?.find(({ type }) => type === "alasio.dev/resumed")?.reason;
 
 /** The restore's pod of `env`'s pool, once it is made. */
 const restorePodOf = async (env: SessionsEnvironment): Promise<V1Pod> => {
@@ -933,7 +948,7 @@ test("a workspace released into its snapshot is restored from it as it is next b
     const bound = await binding;
     assert.equal(bound.pod, name);
     // Of the pool's template, its sandbox restored paused from the image its node's agent prepared, under the release that took it, on that node.
-    assert.deepEqual([restored.metadata?.annotations?.["dev.gvisor.internal.restore.host-image-path"], restored.metadata?.annotations?.["dev.gvisor.internal.restore.paused"]], ["/var/cache/alasio/image", "true"]);
+    assert.deepEqual([restored.metadata?.annotations?.["dev.gvisor.internal.restore.host-image-path"], restored.metadata?.annotations?.["dev.gvisor.internal.restore.paused"]], [`/var/lib/alasio/snapshots/${env.namespace}/fs-restored/${snapshot}`, "true"]);
     assert.equal(restored.spec?.runtimeClassName, "gvisor-r1");
     const plain = (value: unknown) => JSON.parse(JSON.stringify(value)) as unknown;
     // Its own directory named by its volume's path, not a subpath, so its workspace, attached first, is bound into its container with it.
@@ -945,8 +960,18 @@ test("a workspace released into its snapshot is restored from it as it is next b
     // Bound from the first, and no pool's free pod, which its ReplicaSet would take for its own.
     assert.equal(restored.metadata?.labels?.["alasio.dev/free"], undefined);
     assert.equal(restored.metadata?.annotations?.["alasio.dev/binding-key"], key);
-    // Its checkpoint gofer as the release that took it restores best.
-    assert.deepEqual(recorded.asked, [`prepare node-a socket retrying pages`, `resume node-a ${name} ${snapshot} of ${64 * 1024 ** 2} bytes`, `spend ${snapshot}`, `record ${env.namespace}/fs-restored released into none`]);
+    // Its checkpoint gofer as the release that took it restores best; its record cleared before its bind is through, and its
+    // snapshot spent after, by its node's agent, its pod no longer saying it is to be.
+    await spent(recorded.asked, "node-a", snapshot);
+    assert.deepEqual(recorded.asked, [
+      `prepare node-a socket retrying pages`,
+      `resume node-a ${name} ${snapshot} of ${64 * 1024 ** 2} bytes`,
+      `record ${env.namespace}/fs-restored released into none`,
+      `spend node-a ${snapshot}`,
+    ]);
+    for (const deadline = Date.now() + 10_000; resumedReason(await restorePodOf(env)) !== "SnapshotSpent"; await new Promise((resolve) => setTimeout(resolve, 50))) {
+      assert.ok(Date.now() < deadline, `${name} does not say its snapshot is spent`);
+    }
     assert.equal(recorded.attached[0]?.pod, name);
   });
   assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=restored": 1 });
@@ -1109,30 +1134,77 @@ test("a restore attaches its workspace into its pod's directory while its snapsh
   await Effect.runPromise(Fiber.interrupt(binding));
 });
 
-test("a restore spends its snapshot and clears its workspace's record of its release at once, once its sandbox is resumed", async () => {
+test("a restore's bind is through, its record cleared, before its snapshot is spent by its node's agent, tried again until it is, which leaves the snapshot a release committed meanwhile", async () => {
   const env = await environment(1, { gvisor: true });
   await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
   const snapshot = "20261017T120000000Z-00000010";
+  const newer = "20261017T130000000Z-00000011";
   const recorded = restoringAgents(manifestOf(env, "fs-spent", snapshot), { snapshot, release: "r1" });
-  const [spending, clearing] = [Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>()];
+  // Its spend fails twice, as an agent started again does, then waits until the test lets it.
+  const released = Deferred.makeUnsafe<void>();
+  let spends = 0;
   const agents: NodeAgents = {
     ...recorded.agents,
-    spend: (ref, spent) => together(spending, clearing, "spend", null).pipe(Effect.andThen(recorded.agents.spend(ref, spent))),
-    setReleased: (ref, into) => (into === null ? together(clearing, spending, "clear its record", null) : Effect.void).pipe(Effect.andThen(recorded.agents.setReleased(ref, into))),
+    spend: (node, ref, spending) =>
+      Effect.suspend(() => (++spends <= 2 ? Effect.fail(new NodeAgentError({ node, call: "spend", status: 503, reason: "no agent is ready there" })) : Deferred.await(released))).pipe(
+        Effect.andThen(recorded.agents.spend(node, ref, spending)),
+      ),
   };
   const { binder, sessions } = await sessionsOf(options(env, 7290), agents);
   const key = sessionKey("fs-spent");
   const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
   const binding = Effect.runPromise(binder.bind(placement.pool, key, placement));
   const name = (await restorePodOf(env)).metadata?.name ?? "";
-  await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-spent", state: { running: {} } }] } })));
-  // Ready once resumed, as kubelet would make it; its bind through once its snapshot is spent and its record cleared.
-  for (const deadline = Date.now() + 10_000; !recorded.asked.includes(`record ${env.namespace}/fs-spent released into none`); await new Promise((resolve) => setTimeout(resolve, 50))) {
-    assert.ok(Date.now() < deadline, `its record was not cleared: ${recorded.asked.join(", ")}`);
-  }
-  await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { conditions: [{ type: "Ready", status: "True" }] } })));
+  await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-spent", state: { running: {} } }], conditions: [{ type: "ContainersReady", status: "True" }] } })));
+  // Bound once resumed, its record cleared, its spend not done.
   assert.equal((await binding).pod, name);
-  assert.deepEqual([recorded.state.current, recorded.state.released], [null, null]);
+  assert.equal(recorded.state.released, null);
+  assert.equal(recorded.state.current?.snapshot, snapshot);
+  // Released meanwhile into a newer snapshot, which it commits, as its release's save does: it stands.
+  recorded.state.current = manifestOf(env, "fs-spent", newer);
+  Deferred.doneUnsafe(released, Effect.void);
+  await spent(recorded.asked, "node-a", snapshot);
+  assert.equal(spends, 3);
+  assert.equal(recorded.state.current.snapshot, newer);
+});
+
+test("a restored pod whose snapshot is not spent, as a gateway that stopped before it was leaves it, has it spent by its node's agent as a gateway next looks at its bound pods, its resumed condition saying so; one whose sandbox was not resumed has none spent", async () => {
+  const env = await environment(1, { gvisor: true });
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
+  const snapshot = "20261017T120000000Z-00000012";
+  const recorded = restoringAgents(manifestOf(env, "fs-unspent", snapshot), { snapshot, release: "r1" });
+  // Restored by a gateway that stops before its spend is through.
+  const { binder, sessions: stopping } = await sessionsOf(options(env, 7290), { ...recorded.agents, spend: () => Effect.never });
+  const key = sessionKey("fs-unspent");
+  const placement = await Effect.runPromise(stopping.place(key, { environment: env.name, mode: "none" }));
+  const binding = Effect.runPromise(binder.bind(placement.pool, key, placement));
+  const name = (await restorePodOf(env)).metadata?.name ?? "";
+  // Scheduled onto its node, as the scheduler binds it.
+  await run(withKube((kube) => kube.create({ apiVersion: "v1", kind: "Binding", metadata: { name, namespace: env.namespace }, target: { apiVersion: "v1", kind: "Node", name: "node-a" } } as never)));
+  await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-unspent", state: { running: {} } }], conditions: [{ type: "ContainersReady", status: "True" }] } })));
+  assert.equal((await binding).pod, name);
+  assert.equal(recorded.state.current?.snapshot, snapshot);
+  const read = async () => (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, name)))) as V1Pod | null;
+  assert.equal(resumedReason(await read()), "SnapshotUnspent");
+  // The gateway after it, as it looks at its bound pods.
+  const { sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+  const look = () => Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
+  await look();
+  await spent(recorded.asked, "node-a", snapshot);
+  assert.equal(recorded.state.current, null);
+  for (const deadline = Date.now() + 10_000; resumedReason(await read()) !== "SnapshotSpent"; await new Promise((resolve) => setTimeout(resolve, 50))) {
+    assert.ok(Date.now() < deadline, `${name} does not say its snapshot is spent`);
+  }
+  // Spent, it is spent no more as it is looked at again.
+  const asked = recorded.asked.length;
+  await look();
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepEqual(recorded.asked.slice(asked), []);
+  // Its sandbox not resumed, as its readiness gate's condition says: none spent.
+  await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { conditions: [{ type: "alasio.dev/resumed", status: "False", reason: "SnapshotUnspent" }] } })));
+  await look();
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepEqual(recorded.asked.slice(asked), []);
 });
 
 test("what a restore attached beside a prepare that failed is detached: the restore deferred where the failure may pass, fallen back where its snapshot is corrupt", async () => {
@@ -1256,14 +1328,14 @@ async function baymaOfGeneration(): Promise<{ port: number; status: { execsRunni
   return { port: (server.address() as AddressInfo).port, get status() { return stand.status; }, set status(value) { stand.status = value; }, close: () => server.close() };
 }
 
-test("a bound pod whose execs run is saved live every liveEvery, its sandbox running on, and its snapshot spent once bayma's generation moves on from it", async () => {
+test("a bound pod whose execs run is saved live every liveEvery, its sandbox running on, and its snapshot spent by its node's agent once bayma's generation moves on from it", async () => {
   const env = await environment(1, { gvisor: true });
   const stand = await baymaOfGeneration();
   const recorded = agents();
-  const spent: string[] = [];
+  const spentOn: string[] = [];
   try {
     const opts = options(env, stand.port);
-    const { binder, sessions } = await sessionsOf({ ...opts, snapshots: { ...opts.snapshots!, liveEverySeconds: 1 } }, { ...recorded.agents, spend: (_ref, snapshot) => Effect.sync(() => void spent.push(snapshot)) });
+    const { binder, sessions } = await sessionsOf({ ...opts, snapshots: { ...opts.snapshots!, liveEverySeconds: 1 } }, { ...recorded.agents, spend: (node, _ref, snapshot) => Effect.sync(() => void spentOn.push(`${node} ${snapshot}`)) });
     const key = sessionKey("fs-busy");
     const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
     const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
@@ -1281,7 +1353,8 @@ test("a bound pod whose execs run is saved live every liveEvery, its sandbox run
       stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now(), generation: 2 };
       await look();
     });
-    assert.deepEqual(spent, ["s-live"]);
+    // By the agent of its node, which saved it.
+    assert.deepEqual(spentOn, ["node-a s-live"]);
     assert.deepEqual(counted, { "alasio.sandbox.live_checkpoint.outcome=taken": 1, "alasio.sandbox.live_checkpoint.outcome=spent": 1 });
   } finally {
     stand.close();

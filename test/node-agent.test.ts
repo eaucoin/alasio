@@ -790,6 +790,28 @@ test("a spend of a snapshot spends the one compacted from it, which a compaction
     })
   ));
 
+test("a spend leaves the workspace's next snapshot current, which another node's agent commits between the spend's read of its current one and its removal", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const restored = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const there = yield* node("node-2");
+      const next = yield* there.agent.checkpoint(request("fs-other"));
+      // As the spend asks the bucket to remove the snapshot it read, its sandbox, released on another node, commits its next.
+      const committed = Buffer.from(JSON.stringify({ ...next, workspace: "fs-abc" }));
+      s3.refuse = (method, key) => {
+        if (method === "DELETE" && key === "main/fs-abc/current.json" && s3.objects.get(key) !== committed) s3.objects.set(key, committed);
+        return null;
+      };
+      yield* there.agent.spend(workspace, restored.snapshot);
+      assert.equal((yield* there.agent.current(workspace))?.snapshot, next.snapshot);
+      // Spent as it was read, it is no more current.
+      s3.refuse = () => null;
+      yield* there.agent.spend(workspace, next.snapshot);
+      assert.equal(yield* there.agent.current(workspace), null);
+    })
+  ));
+
 test("a compaction the workspace moves on from meanwhile commits nothing, what it reads no collection discards meanwhile, one that fails changes nothing, and a live snapshot is never compacted", () =>
   added("alasio.node_agent.compactions", () =>
     withBucket(({ node }) =>
