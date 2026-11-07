@@ -228,11 +228,14 @@ export type WorkspaceRef = typeof WorkspaceRef.Type;
 export const GoferRequest = Schema.Struct({ transport: Schema.Literals(["socket", "tcp"]), pagesRetry: Schema.Boolean });
 
 /**
- * A request to prepare a workspace's current snapshot for a restore, and how its checkpoint
- * gofer reads the bucket, if it does: over TCP, its reads tried as many times as the gofer
- * tries them, unless asked otherwise.
+ * A request to prepare a workspace's snapshot for a restore: its manifest, the workspace's
+ * current one as alasio read it, which the restore waits on no second read of; and how its
+ * checkpoint gofer reads the bucket, if it does: over TCP, its reads tried as many times as
+ * the gofer tries them, unless asked otherwise.
  */
-export const PrepareRequest = Schema.Struct({ ...WorkspaceRef.fields, gofer: Schema.optional(GoferRequest) });
+export const PrepareRequest = Schema.Struct({ ...WorkspaceRef.fields, manifest: Manifest, gofer: Schema.optional(GoferRequest) }).check(
+  Schema.makeFilter(({ environment, workspace, manifest }) => (manifest.environment === environment && manifest.workspace === workspace) || "its manifest must be the workspace's"),
+);
 export type PrepareRequest = typeof PrepareRequest.Type;
 
 /** A request to copy a workspace's current snapshot to another. */
@@ -456,7 +459,7 @@ export class ContainerElsewhere extends Schema.TaggedError<ContainerElsewhere>()
 }
 
 /** How preparing a snapshot fails. */
-export type PrepareError = NoSnapshot | Unrestorable | SnapshotCorrupt | AgentStopping | S3Error | CacheError | RunscError;
+export type PrepareError = Unrestorable | SnapshotCorrupt | AgentStopping | S3Error | CacheError | RunscError;
 
 /** How resuming a sandbox fails. */
 export type ResumeError = PoliciesNotInForce | ContainerElsewhere | SnapshotOutlived | HostCommandError | RunscError | ReleaseNotInstalled | S3Error | SnapshotCorrupt;
@@ -465,7 +468,7 @@ export type ResumeError = PoliciesNotInForce | ContainerElsewhere | SnapshotOutl
 export interface NodeAgent {
   /** Checkpoints a workspace's sandbox and makes it the workspace's snapshot: its manifest. */
   readonly checkpoint: (request: CheckpointRequest) => Effect.Effect<Manifest, CheckpointFailed | SandboxUnsaveable>;
-  /** The workspace's current snapshot in this node's cache, checked against its manifest, for a restore on this node. */
+  /** The workspace's snapshot of the request's manifest in this node's cache, checked against it, for a restore on this node. */
   readonly prepare: (request: PrepareRequest) => Effect.Effect<Prepared, PrepareError>;
   /** The manifest of the workspace's current snapshot, or null. */
   readonly current: (workspace: WorkspaceRef) => Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt>;
@@ -1485,7 +1488,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * goes, through the checkpoint gofer, as the request says it reads it, its images fetched
    * into the cache once it is done reading them (fetchLater).
    */
-  const prepare = ({ gofer, ...ref }: PrepareRequest): Effect.Effect<Prepared, PrepareError> =>
+  const prepare = ({ gofer, manifest, ...ref }: PrepareRequest): Effect.Effect<Prepared, PrepareError> =>
     exclusive(
       [ref],
       Effect.gen(function*() {
@@ -1496,8 +1499,6 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         yield* FiberMap.remove(compactionsRunning, prefixOf(ref));
         // It reads its image until runsc says it has read every page (resume), for as long as its sandbox's would take at most.
         yield* loading.begin(prefixOf(ref), backgroundReadMs);
-        const manifest = yield* current(ref);
-        if (manifest === null) return yield* new NoSnapshot(ref);
         const { environment, workspace, snapshot, release } = manifest;
         yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot });
         const why = yield* unrestorable(manifest);

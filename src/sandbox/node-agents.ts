@@ -9,7 +9,7 @@ import { FetchHttpClient } from "effect/http";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { Gofer } from "../node-agent/names.ts";
-import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, type ResumeRequest, resumeMs, type WorkspaceRef } from "../node-agent/agent.ts";
+import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, type PrepareRequest, type ResumeRequest, resumeMs, type WorkspaceRef } from "../node-agent/agent.ts";
 import { NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
 import { type PodOwner, Released, type StopRequest, type SyncRequest } from "../node-agent/workspaces.ts";
 
@@ -76,10 +76,12 @@ export interface NodeAgents {
   /** Snapshots the sandbox of the container `request` names, on `node`, and commits it: its manifest. The sandbox ends. */
   readonly checkpoint: (node: string, request: CheckpointRequest) => Effect.Effect<Manifest, NodeAgentError | KubeApiError>;
   /**
-   * The workspace's current snapshot, prepared on `node` for a restore there, its checkpoint
-   * gofer as `gofer` says, where it says; the agent's own way where not.
+   * The workspace's snapshot of `manifest`, its current one as alasio read it, prepared on
+   * `node` for a restore there, its checkpoint gofer as `gofer` says, where it says; the
+   * agent's own way where not. Refused, with no status, as what may pass, where the agent
+   * answered with a prepare of another snapshot of the workspace's, which ran as it was asked.
    */
-  readonly prepare: (node: string, workspace: WorkspaceRef, gofer?: Gofer) => Effect.Effect<Prepared, NodeAgentError | KubeApiError>;
+  readonly prepare: (node: string, workspace: WorkspaceRef, manifest: Manifest, gofer?: Gofer) => Effect.Effect<Prepared, NodeAgentError | KubeApiError>;
   /** The workspace's current snapshot, or null when it has none, as an agent reads it. */
   readonly current: (workspace: WorkspaceRef) => Effect.Effect<Manifest | null, NodeAgentError | KubeApiError>;
   /** Makes the current snapshot of `from` that of `to` too: `to`'s manifest. An agent refuses one of `from` without a snapshot with 404. */
@@ -279,7 +281,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
    * prepare) of the workspace `request` names, which it runs whatever becomes of this
    * call: started, then asked how it stands until it has ended, within LONG_CALL.
    */
-  const operate = <A, I>(node: string, what: string, path: string, request: WorkspaceRef & { readonly gofer?: Gofer }, value: Schema.Codec<A, I>): Effect.Effect<A, NodeAgentError | KubeApiError> =>
+  const operate = <A, I>(node: string, what: string, path: string, request: CheckpointRequest | PrepareRequest, value: Schema.Codec<A, I>): Effect.Effect<A, NodeAgentError | KubeApiError> =>
     Effect.gen(function*() {
       yield* send(node, what, { method: "POST", path, body: request, timeout: SHORT_CALL });
       const standing = { method: "GET", path: `${path}/${encodeURIComponent(request.environment)}/${encodeURIComponent(request.workspace)}`, timeout: SHORT_CALL } as const;
@@ -366,7 +368,16 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     writeFile: (workspace, path, bytes) =>
       Effect.flatMap(anyNode, (node) => send(node, `write ${path} of ${workspace.environment}/${workspace.workspace}`, { method: "PUT", path: filePath(workspace, path), bytes, timeout: SHORT_CALL })).pipe(Effect.asVoid),
     checkpoint: (node, request) => operate(node, `snapshot ${request.environment}/${request.workspace}`, "/checkpoints", request, Manifest),
-    prepare: (node, workspace, gofer) => operate(node, `prepare ${workspace.environment}/${workspace.workspace}'s snapshot`, "/prepare", gofer ? { ...workspace, gofer } : workspace, Prepared),
+    prepare: (node, workspace, manifest, gofer) => {
+      const what = `prepare ${workspace.environment}/${workspace.workspace}'s snapshot ${manifest.snapshot}`;
+      return operate(node, what, "/prepare", { ...workspace, manifest, ...(gofer ? { gofer } : {}) }, Prepared).pipe(
+        // Asked while one of another snapshot of the workspace's ran, which it is: refused, as one that may pass.
+        Effect.filterOrFail(
+          (prepared) => prepared.manifest.snapshot === manifest.snapshot,
+          (prepared) => new NodeAgentError({ node, call: what, reason: `a prepare of its snapshot ${prepared.manifest.snapshot} ran as it was asked, which it came to` }),
+        ),
+      );
+    },
     current: (workspace) =>
       Effect.gen(function*() {
         const node = yield* anyNode;
