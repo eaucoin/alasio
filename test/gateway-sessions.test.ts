@@ -891,12 +891,12 @@ function restoringAgents(current: Manifest | null, released: Released | null, { 
     setReleased: (ref, into) => Effect.sync(() => (base.asked.push(`record ${ref.environment}/${ref.workspace} released into ${into?.snapshot ?? "none"}`), void (state.released = into))),
     current: () => Effect.sync(() => state.current),
     holdings: (node) => Effect.succeed({ node, releases: [{ release: "r1", cpuFeatures: ["sse", "avx"] }], cached: [] }),
-    prepare: (node, ref, gofer) =>
+    prepare: (node, ref, manifest, gofer) =>
       prepare === "fails"
         ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 502, reason: "the snapshots bucket failed" }))
         : prepare === "finds it corrupt"
         ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 422, reason: "its image is not in the bucket as it was put" }))
-        : Effect.sync(() => (base.asked.push(`prepare ${node}${gofer ? ` ${gofer.transport}${gofer.pagesRetry ? " retrying pages" : ""}` : ""}`), { manifest: state.current as Manifest, imagePath: `/var/lib/alasio/snapshots/${ref.environment}/${ref.workspace}/${(state.current as Manifest).snapshot}`, source: "cache" as const })),
+        : Effect.sync(() => (base.asked.push(`prepare ${node}${gofer ? ` ${gofer.transport}${gofer.pagesRetry ? " retrying pages" : ""}` : ""}`), { manifest, imagePath: `/var/lib/alasio/snapshots/${ref.environment}/${ref.workspace}/${manifest.snapshot}`, source: "cache" as const })),
     resume: (node, request, bytes) => Effect.sync(() => void base.asked.push(`resume ${node} ${request.pod} ${request.snapshot} of ${bytes} bytes`)),
     // As an agent does it: only where the workspace is at `snapshot` still.
     spend: (node, _ref, snapshot) => Effect.sync(() => (base.asked.push(`spend ${node} ${snapshot}`), void (state.current = state.current?.snapshot === snapshot ? null : state.current))),
@@ -1100,7 +1100,7 @@ test("a restore reads its workspace's record and its current snapshot at once, a
     released: (ref) => together(record, current, "read its record", null).pipe(Effect.andThen(recorded.agents.released(ref))),
     current: (ref) => together(current, record, "read its snapshot", null).pipe(Effect.andThen(recorded.agents.current(ref))),
     holdings: (node) => together(node === "node-a" ? nodeA : nodeB, node === "node-a" ? nodeB : nodeA, "say what it holds", null).pipe(Effect.andThen(recorded.agents.holdings(node))),
-    prepare: (node, ref, gofer) => Effect.sync(() => void prepared.push(node)).pipe(Effect.andThen(recorded.agents.prepare(node, ref, gofer))),
+    prepare: (node, ref, manifest, gofer) => Effect.sync(() => void prepared.push(node)).pipe(Effect.andThen(recorded.agents.prepare(node, ref, manifest, gofer))),
   };
   const { binder, sessions } = await sessionsOf(options(env, 7290), agents);
   const key = sessionKey("fs-together");
@@ -1119,7 +1119,7 @@ test("a restore attaches its workspace into its pod's directory while its snapsh
   const [preparing, attaching] = [Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>()];
   const agents: NodeAgents = {
     ...recorded.agents,
-    prepare: (node, ref, gofer) => together(preparing, attaching, "prepare", null).pipe(Effect.andThen(recorded.agents.prepare(node, ref, gofer))),
+    prepare: (node, ref, manifest, gofer) => together(preparing, attaching, "prepare", null).pipe(Effect.andThen(recorded.agents.prepare(node, ref, manifest, gofer))),
     attach: (node, request) => together(attaching, preparing, "attach", null).pipe(Effect.andThen(recorded.agents.attach(node, request))),
   };
   const { binder, sessions } = await sessionsOf(options(env, 7290), agents);

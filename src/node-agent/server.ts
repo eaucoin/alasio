@@ -22,14 +22,15 @@
  *   workspace's snapshot was forgotten, as it is, or, of one saved live, kept; 410 where its
  *   sandbox can be saved no more, its restore having failed to read some of its pages, as
  *   every checkpoint of it after will. 404 when it has none the agent keeps (./operations.ts).
- * - `POST /prepare`, `{ environment, workspace, gofer? }`: starts preparing the workspace's
- *   current snapshot for a restore on this node (202), from this node's cache, or else from
- *   the bucket, which the restore reads as it goes, unless a prepare of it runs, which goes
- *   on; `gofer`, `{ transport: "socket" | "tcp", pagesRetry }`, says how its checkpoint gofer
- *   reads the bucket through the agent (./agent.ts PrepareRequest), over TCP unless given.
+ * - `POST /prepare`, `{ environment, workspace, manifest, gofer? }`: starts preparing the
+ *   workspace's snapshot of `manifest`, its current one as alasio read it, for a restore on
+ *   this node (202), from this node's cache, or else from the bucket, which the restore reads
+ *   as it goes, unless a prepare of it runs, which goes on; `gofer`, `{ transport: "socket" |
+ *   "tcp", pagesRetry }`, says how its checkpoint gofer reads the bucket through the agent
+ *   (./agent.ts PrepareRequest), over TCP unless given.
  * - `GET /prepare/<environment>/<workspace>`: how its last prepare stands, as a
  *   checkpoint's does, `value` `{ manifest, imagePath, source }`, `source` "cache" or
- *   "bucket"; `status` 404 when it has no snapshot, 409 when this node cannot restore it (its
+ *   "bucket"; `status` 409 when this node cannot restore it (its
  *   release is not installed here, or this node's CPU lacks a feature it was saved with, or
  *   its runsc does not restore it, as `runsc image verify --host` says), 422 when its image is
  *   not what its manifest says, 502 when the bucket failed or cannot be told from the node,
