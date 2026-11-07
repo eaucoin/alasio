@@ -20,13 +20,17 @@ export interface NodeAgentsLocation {
   readonly port: number;
 }
 
-/** A node agent could not be asked, or refused: which node's, what, the status it answered with, when it asked to be asked again (its Retry-After), and why. */
+/**
+ * A node agent could not be asked, or refused: which node's, what, the status it answered with, when it asked to be asked
+ * again (its Retry-After), why, and whether the call was never sent, as one to a node with no agent ready there is not.
+ */
 export class NodeAgentError extends Schema.TaggedError<NodeAgentError>()("NodeAgentError", {
   node: Schema.String,
   call: Schema.String,
   status: Schema.optional(Schema.Number),
   retryAfter: Schema.optional(Schema.String),
   reason: Schema.String,
+  unsent: Schema.optional(Schema.Boolean),
 }) {
   override get message(): string {
     return `the node agent of ${this.node} could not ${this.call}: ${this.reason}`;
@@ -103,10 +107,12 @@ export interface NodeAgents {
   /** Collects what of the workspace's in the bucket no snapshot needs any more: the digests of the images kept. */
   readonly collect: (workspace: WorkspaceRef) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
   /**
-   * Resumes the sandbox `request` names, restored paused in its pod on `node`, once the
-   * pod's network policies are in force there, from images of `bytes` together, which its
-   * resume may wait on (resumeMs). An agent refuses one whose policies are not in force within
-   * its wait with 504, the sandbox left paused.
+   * Resumes the sandbox `request` names, restored paused in its pod on `node`, asked as the
+   * pod is made: once the pod runs, and its network policies are in force there, from images
+   * of `bytes` together, which its resume may wait on (resumeMs); answered once the pod accepts
+   * connections on its bayma's port, as kubelet's readiness probe would find it ready. An agent
+   * refuses one whose pod does not run, or whose policies are not in force, within its wait
+   * with 504, the sandbox left paused.
    */
   readonly resume: (node: string, request: ResumeRequest, bytes: number) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /**
@@ -261,7 +267,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
       const failed = (reason: string, status?: number, retryAfter?: string | null) =>
         new NodeAgentError({ node, call: what, reason, ...(status === undefined ? {} : { status }), ...(retryAfter === undefined || retryAfter === null ? {} : { retryAfter }) });
       const base = (yield* addresses).get(node);
-      if (!base) return yield* failed("no agent is ready there");
+      if (!base) return yield* new NodeAgentError({ node, call: what, reason: "no agent is ready there", unsent: true });
       const { status, ok, bytes, retryAfter, tag } = yield* Effect.tryPromise({
         try: async (signal) => {
           const response = await fetch(`${base}${request.path}`, {

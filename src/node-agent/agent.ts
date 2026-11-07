@@ -45,9 +45,15 @@
  *
  * A sandbox is restored paused, in a pod of a new address, whose network policies
  * kube-router puts in force on the node as it next syncs (./kube-router.ts): until then
- * what the pod sends goes through, whatever they say. Its resume waits for them, then
- * forgets the connections tracked from its addresses, then resumes its containers; one
- * whose policies are not in force within POLICY_WAIT_MS leaves it paused.
+ * what the pod sends goes through, whatever they say. Its resume, asked as its pod is made,
+ * waits for the pod to run its containers, as the API server says it with its addresses,
+ * which kube-router reads; then for its policies, then forgets the connections tracked from
+ * its addresses, then resumes its containers; then, before it is answered, waits for the
+ * pod to accept connections on the port its bayma serves on, from the node, as kubelet's
+ * readiness probe finds it ready, so that what serves the pod once its resume is answered
+ * waits on no probe of kubelet's. One whose pod does not run within
+ * RESTORE_RUNNING_WAIT_MS, or whose policies are not in force within POLICY_WAIT_MS, leaves
+ * it paused.
  *
  * A restore alasio refuses before it resumes the sandbox is abandoned: the agent kills
  * what runsc runs for the pod's containers, their sandbox and gofers among it, so that the
@@ -74,9 +80,11 @@ import { isIP, isIPv6 } from "node:net";
 import { dirname, join, posix, relative } from "node:path";
 import { pipeline } from "node:stream/promises";
 
+import type { V1Pod } from "@kubernetes/client-node";
 import type { BatchObservableResult } from "@opentelemetry/api";
 import { Clock, type Duration, Effect, FiberMap, Option, RcMap, Schedule, Schema, type Scope, Semaphore, Stream, SubscriptionRef } from "effect";
 
+import type { KubeApiError } from "../kube/client.ts";
 import { quantityOf } from "../kube/quantity.ts";
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
@@ -85,7 +93,7 @@ import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCach
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { type Listing, listedEgressGap, type PodAddress } from "./kube-router.ts";
 import { makeLoading } from "./loading.ts";
-import { backgroundReadSeconds, restoresFromBucket, runscVersion, STORE_SOCKET_ENDPOINT } from "./names.ts";
+import { backgroundReadSeconds, RESTORE_RUNNING_WAIT_MS, restoresFromBucket, runscVersion, STORE_SOCKET_ENDPOINT } from "./names.ts";
 import { type ReleaseNotInstalled, type Runsc, type RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
 import { type S3Bucket, S3Error } from "./s3.ts";
 import type { StoreProxy, StoreToken, Transport } from "./store-proxy.ts";
@@ -268,23 +276,27 @@ export const CheckpointRequest = Schema.Struct({
 });
 export type CheckpointRequest = typeof CheckpointRequest.Type;
 
-/** A request to resume a workspace's sandbox, restored paused in a pod on this node. */
+/** A request to resume a workspace's sandbox, restored paused in a pod on this node, once the pod runs. */
 export const ResumeRequest = Schema.Struct({
   environment: Name,
   workspace: Name,
   /** The pod's namespace and name, as its network policies' rules name it, which its containers must be of. */
   namespace: Name,
   pod: PodName,
-  /** The pod's addresses, one of each family it has, in their canonical form, as Kubernetes gives them. */
-  podIPs: Schema.Array(Schema.String.check(Schema.makeFilter((ip) => isIP(ip) !== 0 || "must be an IP address"))).check(Schema.isMinLength(1)),
-  /** The pod's containers, each resumed, by the release that runs it. */
-  containerIds: Schema.Array(ContainerId).check(Schema.isMinLength(1)),
   /** The network policies of its namespace that select the pod, by name, which its rules must run what it sends through. */
   policies: Schema.Array(PodName).check(Schema.isMaxLength(64)),
   /** The snapshot its sandbox was restored from, whose manifest says whether it may run. */
   snapshot: SnapshotId,
+  /** The port its bayma serves on, which the pod accepts connections on once it is ready. */
+  port: Schema.Number.check(Schema.isInt(), Schema.isBetween({ minimum: 1, maximum: 65_535 })),
 });
 export type ResumeRequest = typeof ResumeRequest.Type;
+
+/** A pod restored into, running: its addresses, one of each family it has, in their canonical form, and its containers, by containerd's ids, as the API server says them. */
+interface RunningPod {
+  readonly podIPs: readonly string[];
+  readonly containerIds: readonly string[];
+}
 
 /** A request to abandon a workspace's restore, which alasio refused before it resumed its sandbox, in a pod on this node. */
 export const AbandonRequest = Schema.Struct({
@@ -449,6 +461,39 @@ export class PoliciesNotInForce extends Schema.TaggedError<PoliciesNotInForce>()
   }
 }
 
+/** A restored pod did not run its containers, with its addresses, within RESTORE_RUNNING_WAIT_MS, or went: which, and why. Its sandbox stays paused. */
+export class PodNotRunning extends Schema.TaggedError<PodNotRunning>()("PodNotRunning", {
+  namespace: Schema.String,
+  pod: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return `${this.namespace}/${this.pod} does not run its containers, so its sandbox is left paused: ${this.reason}`;
+  }
+}
+
+/**
+ * How long a resumed sandbox's pod is waited for to accept connections on its bayma's port,
+ * how long each try is given, as kubelet's probe gives one by default, and how long after one
+ * that fails the next is: its netstack, restored whole, accepts at once, as it does for
+ * kubelet's probe even while paused, so one that has not by then has no listener.
+ */
+export const ACCEPT_WAIT_MS = 10_000;
+const ACCEPT_TRY_SECONDS = 1;
+const ACCEPT_POLL_MS = 10;
+
+/** A resumed sandbox's pod did not accept connections on its bayma's port within ACCEPT_WAIT_MS: which, on which address and port. */
+export class NotAccepting extends Schema.TaggedError<NotAccepting>()("NotAccepting", {
+  namespace: Schema.String,
+  pod: Schema.String,
+  address: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return `${this.namespace}/${this.pod} did not accept connections on ${this.address} within ${ACCEPT_WAIT_MS / 1000} s of its resume, as kubelet's readiness probe would find it: ${this.reason}`;
+  }
+}
+
 /** A container is not the named pod's: whose it is. */
 export class ContainerElsewhere extends Schema.TaggedError<ContainerElsewhere>()("ContainerElsewhere", {
   containerId: Schema.String,
@@ -468,7 +513,7 @@ class WrittenMeanwhile extends Schema.TaggedError<WrittenMeanwhile>()("WrittenMe
 export type PrepareError = Unrestorable | SnapshotCorrupt | AgentStopping | S3Error | CacheError | RunscError;
 
 /** How resuming a sandbox fails. */
-export type ResumeError = PoliciesNotInForce | ContainerElsewhere | SnapshotOutlived | HostCommandError | RunscError | ReleaseNotInstalled | S3Error | SnapshotCorrupt;
+export type ResumeError = PodNotRunning | KubeApiError | PoliciesNotInForce | ContainerElsewhere | SnapshotOutlived | NotAccepting | HostCommandError | RunscError | ReleaseNotInstalled | S3Error | SnapshotCorrupt;
 
 /** What a node agent does; see makeNodeAgent. */
 export interface NodeAgent {
@@ -535,6 +580,12 @@ export interface NodeAgentOptions {
   readonly backgroundReadMs: number;
   /** How long runsc may take to say how many bytes of pages a restore from the bucket reads, INSPECT_TIMEOUT_MS unless told. */
   readonly inspectTimeoutMs?: number;
+  /**
+   * The pod `name` of `namespace` as the API server says it each time it changes, from as it
+   * is now; null where it is gone: what a resume waits on for its pod to run (./server.ts, by
+   * the agent's ServiceAccount, which reads the sessions' pods).
+   */
+  readonly pods: (namespace: string, name: string) => Stream.Stream<V1Pod | null, KubeApiError>;
 }
 
 /** The checkpoint gofer's options file for an image in an S3 store (runsc's checkpoint_restore.md). */
@@ -627,14 +678,14 @@ export const SAVE_HOOK_SECONDS = 30;
 export const restoreHookSeconds = (backgroundReadMs: number): number => Math.ceil(backgroundReadMs / 1000) + SAVE_HOOK_SECONDS;
 /**
  * How long a resume of a sandbox restored from images of `bytes` together may take, in
- * milliseconds: its wait for the pod's network policies, then runsc's resume, which runs
- * bayma's hook while the sandbox's pages still load, each page the hook touches waited for, as
- * long as runsc would bound that hook of a sandbox of so many bytes (restoreHookSeconds), read
- * at the slowest (./names.ts backgroundReadSeconds). One of a large image, or of a chain
- * whose parent's pages a delta left scattered, on a slow store, is waited for; one stuck
- * still ends.
+ * milliseconds: its wait for its pod to run, then for the pod's network policies, then
+ * runsc's resume, which runs bayma's hook while the sandbox's pages still load, each page the
+ * hook touches waited for, as long as runsc would bound that hook of a sandbox of so many bytes
+ * (restoreHookSeconds), read at the slowest (./names.ts backgroundReadSeconds), then its wait
+ * for the pod to accept connections. One of a large image, or of a chain whose parent's pages a
+ * delta left scattered, on a slow store, is waited for; one stuck still ends.
  */
-export const resumeMs = (bytes: number): number => POLICY_WAIT_MS + restoreHookSeconds(backgroundReadSeconds(bytes) * 1000) * 1000;
+export const resumeMs = (bytes: number): number => RESTORE_RUNNING_WAIT_MS + POLICY_WAIT_MS + restoreHookSeconds(backgroundReadSeconds(bytes) * 1000) * 1000 + ACCEPT_WAIT_MS;
 /** How often the cache is looked at for what to evict, besides as checkpoints and prepares write to it. */
 const EVICT_POLL: Duration.Input = "1 minute";
 /**
@@ -649,6 +700,11 @@ const SPEND_READS = { times: 3, schedule: Schedule.exponential("50 millis") };
  * A look lists a chain or two of the node's filter table, some 5 ms each.
  */
 const POLICY_POLL = "50 millis";
+/**
+ * How a resume's watch of its pod that fails, as one whose connection drops does, is asked again:
+ * five times more in all, 100 ms after it failed, then twice as long each time.
+ */
+const WATCH_TRIES = { times: 5, schedule: Schedule.exponential("100 millis") };
 /** The most scans an abandon runs for what runsc runs for a pod, each after the kills of the one before (abandonNow). */
 const ABANDON_SCANS = 10;
 
@@ -789,7 +845,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, backgroundReadMs, inspectTimeoutMs = INSPECT_TIMEOUT_MS }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, backgroundReadMs, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   /** How many calls of the cache's may have changed what it holds: what holdingsAfter waits on, and what holdings reads its listing as of. */
   const cacheChanges = yield* SubscriptionRef.make(0);
   const cache = telling(given, SubscriptionRef.update(cacheChanges, (count) => count + 1));
@@ -1751,7 +1807,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   const policyGap = (address: PodAddress): Effect.Effect<string | null, HostCommandError> => listedEgressGap(listed(address.ip), address);
 
   /** Waits for every address of the pod's to have its rules, POLICY_WAIT_MS at most: how long it waited, in milliseconds. */
-  const policiesInForce = ({ namespace, pod, podIPs, policies }: ResumeRequest): Effect.Effect<number, PoliciesNotInForce | HostCommandError> =>
+  const policiesInForce = ({ namespace, pod, podIPs, policies }: ResumeRequest & RunningPod): Effect.Effect<number, PoliciesNotInForce | HostCommandError> =>
     Effect.gen(function*() {
       const start = yield* Clock.currentTimeMillis;
       for (;;) {
@@ -1862,33 +1918,86 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       Effect.mapError((error) => new SnapshotOutlived({ environment: manifest.environment, workspace: manifest.workspace, snapshot: manifest.snapshot, reason: error.message })),
     );
 
+  /**
+   * The pod `request` names, restored into, once it runs every container of its, with its
+   * addresses, as the API server says it, whose watch is asked again as it ends, and as it fails,
+   * as one whose connection drops does, up to WATCH_TRIES times: refused where it is gone, or has
+   * not within RESTORE_RUNNING_WAIT_MS, and where what the API server says of it is none the
+   * agent takes, as an address or a container's id of another form.
+   */
+  const runningPod = ({ namespace, pod: name }: ResumeRequest): Effect.Effect<RunningPod, PodNotRunning | KubeApiError> =>
+    Effect.gen(function*() {
+      const refused = (reason: string) => new PodNotRunning({ namespace, pod: name, reason });
+      /** What of `found` a resume needs once it runs, or null while it does not. */
+      const runningOf = (found: V1Pod): Effect.Effect<RunningPod | null, PodNotRunning> => {
+        const statuses = found.status?.containerStatuses ?? [];
+        const podIPs = (found.status?.podIPs ?? []).map(({ ip }) => ip);
+        if (statuses.length === 0 || !statuses.every(({ state }) => state?.running) || podIPs.length === 0) return Effect.succeed(null);
+        const containerIds = statuses.map(({ containerID }) => containerID?.replace(/^[a-z]+:\/\//u, "") ?? "");
+        if (podIPs.some((ip) => isIP(ip) === 0)) return Effect.fail(refused(`its addresses are not all IP addresses: ${podIPs.join(", ")}`));
+        if (containerIds.some((id) => !Schema.is(ContainerId)(id))) return Effect.fail(refused(`its containers' ids are not all containerd's: ${containerIds.join(", ")}`));
+        return Effect.succeed({ podIPs, containerIds });
+      };
+      for (;;) {
+        const found = yield* pods(namespace, name).pipe(
+          Stream.mapEffect((each) => (each === null ? Effect.fail(refused("it is gone")) : runningOf(each))),
+          Stream.filter((each): each is RunningPod => each !== null),
+          Stream.runHead,
+          Effect.retry({ ...WATCH_TRIES, while: (error) => error._tag === "KubeApiError" }),
+        );
+        if (Option.isSome(found)) return found.value;
+      }
+    }).pipe(
+      Effect.timeoutOrElse({ duration: RESTORE_RUNNING_WAIT_MS, orElse: () => Effect.fail(new PodNotRunning({ namespace, pod: name, reason: `it did not within ${RESTORE_RUNNING_WAIT_MS / 1000} s` })) }),
+    );
+
+  /**
+   * Waits for the pod `request` names to accept connections on its bayma's port, at the first
+   * of its addresses, `running`'s, from the node, as kubelet's readiness probe connects, each
+   * try given ACCEPT_TRY_SECONDS, as kubelet gives its own: tried again ACCEPT_POLL_MS after each
+   * that fails, for ACCEPT_WAIT_MS at most, by one shell of the agent's own in the node's
+   * network; refused where it does not.
+   */
+  const accepting = ({ namespace, pod, port }: ResumeRequest, { podIPs: [ip = ""] }: RunningPod): Effect.Effect<void, NotAccepting | HostCommandError> => {
+    const address = isIPv6(ip) ? `[${ip}]:${port}` : `${ip}:${port}`;
+    const tried = `until timeout ${ACCEPT_TRY_SECONDS} bash -c 'exec 3<>/dev/tcp/${ip}/${port}' 2>/dev/null; do sleep ${ACCEPT_POLL_MS / 1000}; done`;
+    return host.inNetwork(["timeout", String(ACCEPT_WAIT_MS / 1000), "bash", "-c", tried]).pipe(
+      Effect.flatMap(({ exitCode, stderr }) =>
+        exitCode === 0 ? Effect.void : Effect.fail(new NotAccepting({ namespace, pod, address, reason: stderr.trim() || `no try connected, the last ended ${exitCode}` }))
+      ),
+    );
+  };
+
   const resume = (request: ResumeRequest): Effect.Effect<void, ResumeError> =>
     Effect.gen(function*() {
-      const waited = yield* policiesInForce(request);
+      const running = yield* runningPod(request);
+      const waited = yield* policiesInForce({ ...request, ...running });
       yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
-      const containers = yield* Effect.forEach(request.containerIds, (id) => ofPod(id, request.namespace, request.pod));
+      const containers = yield* Effect.forEach(running.containerIds, (id) => ofPod(id, request.namespace, request.pod));
       const from = yield* restoredFrom(request);
       if (from.live !== undefined) yield* holdsStill(from, from.live, containers);
-      yield* Effect.forEach(request.podIPs, forgetConnections, { discard: true });
+      yield* Effect.forEach(running.podIPs, forgetConnections, { discard: true });
       // Its restore reads what its sandbox did not touch first in the background, for a while yet, from its resume on: bayma's
       // hook, which runsc's resume runs, waits on those reads of the pages it touches, however long after the prepare.
       storeProxy.resumed(prefixOf(request), backgroundReadMs);
-      yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
+      yield* Effect.forEach(running.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
       // Its sandbox runs from the snapshot it was restored from, which its next checkpoint saves what changed since.
-      for (const id of request.containerIds) bases.set(id, from);
+      for (const id of running.containerIds) bases.set(id, from);
       // It reads its image until runsc says it has read every page.
-      yield* Effect.forEach(request.containerIds, (id, index) => runsc.restored(containers[index]?.release ?? "", id), { discard: true }).pipe(
+      yield* Effect.forEach(running.containerIds, (id, index) => runsc.restored(containers[index]?.release ?? "", id), { discard: true }).pipe(
         Effect.catch((error) => Effect.logWarning(`runsc did not say when the restore of ${prefixOf(request)} has read its image, so the agent's compactions yield to it no more: ${error.message}`)),
         Effect.andThen(loading.end(prefixOf(request))),
         withLogScope("node-agent"),
         Effect.forkIn(scope),
       );
-      return waited;
+      return [waited, running] as const;
     }).pipe(
-      // Not resumed, it reads nothing more.
-      Effect.tapError(() => loading.end(prefixOf(request))),
+      // Not resumed, as it failed or its request went, it reads nothing more.
+      Effect.onError(() => loading.end(prefixOf(request))),
       // Its gofer read its options as its pod's containers started, the restore's token among them.
       Effect.ensuring(goferOptionsGone(request)),
+      // Ready as kubelet's probe would find it, before it is answered.
+      Effect.flatMap(([waited, running]) => Effect.as(accepting(request, running), waited)),
       Effect.tap((waited) =>
         Effect.sync(() => resumes.add(1, { "alasio.node_agent.resume.outcome": "resumed" })).pipe(
           Effect.andThen(Effect.logInfo(`resumed the sandbox of ${prefixOf(request)} in ${request.namespace}/${request.pod}, its network policies in force after ${waited} ms`)),

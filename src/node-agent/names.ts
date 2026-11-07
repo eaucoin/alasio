@@ -224,11 +224,17 @@ export const OPERATION_LIMIT_SECONDS = 15 * 60;
 export const HOLDINGS_WAIT_MS = 25_000;
 
 /**
+ * How long a restore's pod is waited for to run its containers, its images pulled: by the
+ * gateway, as it may not start, and by its node's agent, which resumes its sandbox once it runs.
+ */
+export const RESTORE_RUNNING_WAIT_MS = 180_000;
+
+/**
  * How long a restore from the bucket may take from its prepare to its resume, which its token
- * lasts unless resumed before (./store-proxy.ts): the longest it takes, alasio waiting 3
- * minutes for its pod to run (POD_RUNNING_TIMEOUT_MS in src/gateway/snapshots.ts), then the
- * agent's resume waiting for the pod's network policies before it resumes its containers,
- * from which its token lasts as its resumed restore reads, and a margin.
+ * lasts unless resumed before (./store-proxy.ts): the longest it takes, its pod waited for to
+ * run for 3 minutes (RESTORE_RUNNING_WAIT_MS), then the agent's resume waiting for the pod's
+ * network policies before it resumes its containers, from which its token lasts as its
+ * resumed restore reads, and a margin.
  */
 export const RESTORE_PREPARED_FOR_SECONDS = 5 * 60;
 

@@ -22,8 +22,9 @@
  * gateway presents, the Secret both are given. Of the cluster's API it reads the pods alone, as
  * its ServiceAccount, of the namespaces it attaches into: main's, its sessions' and, made with
  * each branch environment (./branch.ts), each branch's (nodeAgentPodReaders), as it watches them
- * to keep what is attached on its node to the pods there are (src/node-agent/attachments.ts):
- * no other right, and nothing of any other namespace.
+ * to keep what is attached on its node to the pods there are (src/node-agent/attachments.ts),
+ * and a restore's pod until it runs, to resume it (src/node-agent/agent.ts): no other right, and
+ * nothing of any other namespace.
  */
 import type { KubernetesObject, V1DaemonSet, V1Role, V1RoleBinding, V1ServiceAccount, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
 

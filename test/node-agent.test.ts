@@ -18,12 +18,12 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
-import { Cause, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Scope, Stream } from "effect";
+import { Cause, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schedule, Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
 import { added, collected } from "./support/metrics.ts";
-import { KubeClient } from "../src/kube/client.ts";
+import { KubeApiError, KubeClient } from "../src/kube/client.ts";
 import { SNAPSHOT_ID } from "../src/kube/sandbox-shape.ts";
 import {
   type AbandonRequest,
@@ -40,6 +40,7 @@ import {
   memoryLimitOf,
   NoSnapshot,
   type NodeAgent,
+  type NodeAgentOptions,
   PoliciesNotInForce,
   holdingsTag,
   type Prepared,
@@ -60,7 +61,7 @@ import { makeStoreProxy, type StoreProxy } from "../src/node-agent/store-proxy.t
 import { NODE_PINS } from "../cli/src/cluster/node.ts";
 import { NODE_AGENT_PORT, restoresFromBucket, STORE_PROXY_PORT } from "../src/node-agent/names.ts";
 import { makeOperations } from "../src/node-agent/operations.ts";
-import { serveNodeAgent } from "../src/node-agent/server.ts";
+import { podChanges, serveNodeAgent } from "../src/node-agent/server.ts";
 import type { Workspaces } from "../src/node-agent/workspaces.ts";
 import { workspacesNode } from "./support/node-workspaces.ts";
 import { makeNodeAgents } from "../src/sandbox/node-agents.ts";
@@ -114,16 +115,27 @@ const POD_IPV6 = "fd00:42::f";
 /** The network policies that select a session's pod, as sessionPod's rules run it through them. */
 const SESSION_POLICIES = ["default-deny", "bayma-from-alasio", "telemetry-to-alasio"];
 
-/** A request to resume fs-abc's sandbox, restored from `snapshot`. */
-const resumeRequest = (snapshot: string, podIPs: readonly string[] = [POD_IP], containerIds: readonly string[] = [CONTAINER, OTHER_CONTAINER]): ResumeRequest => ({
+/** The port a session's bayma serves on. */
+const BAYMA_PORT = 8000;
+
+/** A request to resume fs-abc's sandbox, restored from `snapshot`, in its pod POD. */
+const resumeRequest = (snapshot: string): ResumeRequest => ({
   environment: "main",
   workspace: "fs-abc",
   namespace: SESSIONS,
   pod: POD,
-  podIPs,
-  containerIds,
   policies: SESSION_POLICIES,
   snapshot,
+  port: BAYMA_PORT,
+});
+
+/** A pod restored into, as the API server says it: running each of `containerIds`, of the addresses `podIPs`; or not yet. */
+const restoredPod = ({ podIPs, containerIds }: { readonly podIPs: readonly string[]; readonly containerIds: readonly string[] }, running = true): V1Pod => ({
+  metadata: { name: POD, namespace: SESSIONS },
+  status: {
+    ...(running ? { podIPs: podIPs.map((ip) => ({ ip })) } : {}),
+    containerStatuses: containerIds.map((id) => ({ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: `containerd://${id}`, state: running ? { running: {} } : { waiting: {} } })),
+  },
 });
 
 /** The id of the snapshot of fs-abc `released` puts the manifest of in the bucket. */
@@ -170,6 +182,9 @@ interface FakeHost {
   ipv4: string;
   ipv6: string;
   answer: (command: readonly string[]) => HostRun | null;
+  /** What was run in its network alone, in order; and whether what it connects to there accepts. */
+  readonly connected: string[][];
+  accepts: boolean;
 }
 
 function fakeHost(): FakeHost {
@@ -178,6 +193,8 @@ function fakeHost(): FakeHost {
     ipv4: filterTable([clusterDns("10.42.0.3"), sessionPod(POD, POD_IP)]),
     ipv6: filterTable([clusterDns("fd00:42::3"), sessionPod(POD, POD_IPV6)], { family: 6 }),
     answer: () => null,
+    connected: [],
+    accepts: true,
     host: {
       run: (command) =>
         Effect.sync(() => {
@@ -187,6 +204,7 @@ function fakeHost(): FakeHost {
           return fake.answer(command) ??
             (program === "conntrack" ? NO_CONNECTIONS : program === "ip6tables" ? listChain(fake.ipv6, chain, 6) : listChain(fake.ipv4, chain));
         }),
+      inNetwork: (command) => Effect.sync(() => (fake.connected.push([...command]), { exitCode: fake.accepts ? 0 : 1, stdout: "", stderr: "" })),
     },
   };
   return fake;
@@ -206,6 +224,8 @@ interface Node {
   readonly storeProxy: StoreProxy;
   readonly agent: NodeAgent;
   readonly restarted: Effect.Effect<NodeAgent, never, Scope.Scope>;
+  /** The pod its restores are into, as the API server says it as a resume watches it: running, of these addresses and containers, unless gone. */
+  readonly pod: { podIPs: readonly string[]; containerIds: readonly string[]; gone: boolean };
 }
 
 /** What a node of the test's has: its releases, its cache's budget, and the runsc its agent runs, the node's as `runsc` changes it. */
@@ -221,6 +241,8 @@ interface NodeOptions {
   readonly preparedForMs?: number;
   /** How long its runsc may take to describe an image in the bucket. */
   readonly inspectTimeoutMs?: number;
+  /** The pods as the API server says them as they change, as its agent watches one; its `pod` unless given. */
+  readonly pods?: NodeAgentOptions["pods"];
   /** Its cache as `cache` changes it. */
   readonly cache?: (cache: SnapshotCache) => SnapshotCache;
 }
@@ -230,7 +252,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, cache: cached = (cache) => cache }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, pods, cache: cached = (cache) => cache }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -244,8 +266,21 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
       const sockets = socket ? mkdtempSync(join("/tmp", "alasio-agent-")) : null;
       if (sockets !== null) yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(sockets, { recursive: true, force: true })));
       const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, ...(sockets === null ? {} : { socket: join(sockets, "store.sock") }), ...(quietMs === undefined ? {} : { quietMs }), ...(preparedForMs === undefined ? {} : { preparedForMs }) }).pipe(Effect.orDie);
-      const restarted = makeNodeAgent({ node: name, nodeRoot: "/", runsc, cache, bucket, storeProxy, host: host.host, restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince, backgroundReadMs: BACKGROUND_READ_MS, ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }) });
-      return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted };
+      const pod = { podIPs: [POD_IP] as readonly string[], containerIds: [CONTAINER, OTHER_CONTAINER] as readonly string[], gone: false };
+      const restarted = makeNodeAgent({
+        node: name,
+        nodeRoot: "/",
+        runsc,
+        cache,
+        bucket,
+        storeProxy,
+        host: host.host,
+        restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince,
+        backgroundReadMs: BACKGROUND_READ_MS,
+        ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }),
+        pods: pods ?? (() => Stream.suspend(() => Stream.make(pod.gone ? null : restoredPod(pod)))),
+      });
+      return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted, pod };
     });
   try {
     await Effect.runPromise(Effect.scoped(body({ s3, node })));
@@ -1264,7 +1299,7 @@ test("a compaction's hashes and its upload wait while a restore on its node read
     })
   ));
 
-test("a restore whose prepare fails, that is not resumed, that is abandoned, or whose reads runsc does not say the end of, reads nothing more: compactions on its node go on", () =>
+test("a restore whose prepare fails, that is not resumed, that is abandoned, whose reads runsc does not say the end of, or whose resume is interrupted, reads nothing more: compactions on its node go on", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
       const here = yield* node("node-1");
@@ -1295,6 +1330,14 @@ test("a restore whose prepare fails, that is not resumed, that is abandoned, or 
           Effect.ensuring(Effect.sync(() => rmSync(join(runscDir, "fail-wait")))),
         );
       yield* compactedBeside(prepareOther.pipe(Effect.flatMap(({ snapshot }) => waitFails(snapshot))), 4);
+      // Nor one whose resume is interrupted, as its request's end interrupts it, as it waits for its pod's rules.
+      const rules = here.host.ipv4;
+      const interrupted = (snapshot: string) =>
+        Effect.sync(() => void (here.host.ipv4 = filterTable([clusterDns("10.42.0.3")]))).pipe(
+          Effect.andThen(Effect.exit(Effect.timeout(resumeOther(snapshot), "200 millis"))),
+          Effect.ensuring(Effect.sync(() => void (here.host.ipv4 = rules))),
+        );
+      yield* compactedBeside(prepareOther.pipe(Effect.flatMap(({ snapshot }) => interrupted(snapshot))), 5);
     })
   ));
 
@@ -2408,7 +2451,8 @@ test("a checkpoint's images, the one it stages and the parent it saves a delta o
       yield* here.agent.checkpoint(request("fs-abc"));
       const { manifest } = yield* preparing(here.agent, workspace);
       yield* here.agent.spend(workspace, manifest.snapshot);
-      yield* here.agent.resume(resumeRequest(manifest.snapshot, [POD_IP], [CONTAINER]));
+      here.pod.containerIds = [CONTAINER];
+      yield* here.agent.resume(resumeRequest(manifest.snapshot));
       const held = join(here.releases.dirOf(RELEASE), "hold-checkpoint");
       writeFileSync(held, "");
       const checkpoints = () => here.releases.calls(RELEASE).filter((args) => args.includes("checkpoint")).length;
@@ -2709,7 +2753,8 @@ test("a resume waits for the pod's rules on every address, forgets the connectio
       const { host } = here;
       const programmed = host.ipv4;
       host.ipv4 = filterTable([clusterDns("10.42.0.3"), sessionPod("fs-old999", POD_IP)]);
-      const resuming = yield* Effect.forkChild(here.agent.resume(resumeRequest(snapshot, [POD_IP, POD_IPV6])));
+      here.pod.podIPs = [POD_IP, POD_IPV6];
+      const resuming = yield* Effect.forkChild(here.agent.resume(resumeRequest(snapshot)));
       yield* TestClock.adjust("1 second");
       // Looked for every 50 ms, its sandbox untouched meanwhile: KUBE-ROUTER-FORWARD of each family, which has no jump of its IPv4 address's yet.
       assert.equal(resuming.pollUnsafe(), undefined);
@@ -2736,6 +2781,74 @@ test("a resume waits for the pod's rules on every address, forgets the connectio
     }).pipe(Effect.provide(TestClock.layer()))
   ));
 
+test("a resume waits for its pod to run its containers with its addresses, as the API server says it, and is answered once the pod accepts connections on its bayma's port from the node, as kubelet's readiness probe would find it; one whose pod goes, or that does not accept, is refused, saying why", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const changes = yield* Queue.unbounded<V1Pod | null>();
+      const here = yield* node("node-1", { pods: () => Stream.fromQueue(changes) });
+      const snapshot = released(s3);
+      const pod = { podIPs: [POD_IP], containerIds: [CONTAINER, OTHER_CONTAINER] };
+      const resuming = yield* Effect.forkChild(here.agent.resume(resumeRequest(snapshot)));
+      // Made, its containers not running yet: nothing looked at, nor resumed.
+      yield* Queue.offer(changes, restoredPod(pod, false));
+      yield* Effect.sleep("200 millis");
+      assert.equal(resuming.pollUnsafe(), undefined);
+      assert.deepEqual([here.host.ran, here.host.connected, here.releases.calls(RELEASE)], [[], [], []]);
+      // Running, with its address: its rules looked for, then its containers resumed, then connected to on its port, from the node.
+      yield* Queue.offer(changes, restoredPod(pod));
+      yield* Fiber.join(resuming);
+      assert.deepEqual(here.releases.calls(RELEASE).map((args) => args.slice(-2)), [["resume", CONTAINER], ["resume", OTHER_CONTAINER]]);
+      assert.deepEqual(here.host.connected.map((command) => command.slice(0, 4)), [["timeout", "10", "bash", "-c"]]);
+      assert.match(here.host.connected[0]?.[4] ?? "", new RegExp(`^until timeout 1 bash -c 'exec 3<>/dev/tcp/${POD_IP}/${BAYMA_PORT}'`, "u"));
+
+      // One that does not accept once resumed: refused, its sandbox running.
+      here.host.accepts = false;
+      yield* Queue.offer(changes, restoredPod(pod));
+      assert.equal(
+        failure(yield* Effect.exit(here.agent.resume(resumeRequest(snapshot)))),
+        `${SESSIONS}/${POD} did not accept connections on ${POD_IP}:${BAYMA_PORT} within 10 s of its resume, as kubelet's readiness probe would find it: no try connected, the last ended 1`,
+      );
+      assert.equal(here.releases.calls(RELEASE).filter((args) => args.includes("resume")).length, 4);
+
+      // One whose pod goes before it runs: its sandbox left paused.
+      yield* Queue.offer(changes, restoredPod(pod, false));
+      yield* Queue.offer(changes, null);
+      assert.equal(failure(yield* Effect.exit(here.agent.resume(resumeRequest(snapshot)))), `${SESSIONS}/${POD} does not run its containers, so its sandbox is left paused: it is gone`);
+      assert.equal(here.releases.calls(RELEASE).filter((args) => args.includes("resume")).length, 4);
+    })
+  ));
+
+test("a resume watches its pod again where its watch fails, as one whose connection drops does, a few times, and watches it by its name alone", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const pod = { podIPs: [POD_IP], containerIds: [CONTAINER, OTHER_CONTAINER] };
+      const dropped = new KubeApiError({ cause: new Error("the watch's connection was lost") });
+      let watches = 0;
+      let drops = 2;
+      const here = yield* node("node-1", { pods: () => Stream.suspend(() => (++watches, drops-- > 0 ? Stream.fail(dropped) : Stream.make(restoredPod(pod)))) });
+      const snapshot = released(s3);
+      yield* here.agent.resume(resumeRequest(snapshot));
+      assert.equal(watches, 3);
+      assert.deepEqual(here.releases.calls(RELEASE).map((args) => args.slice(-2)), [["resume", CONTAINER], ["resume", OTHER_CONTAINER]]);
+      // One that fails each time it is asked again: refused, as the API server cannot be asked of the pod, its sandbox left paused.
+      drops = Number.POSITIVE_INFINITY;
+      watches = 0;
+      assert.equal(failure(yield* Effect.exit(here.agent.resume(resumeRequest(snapshot)))), dropped.message);
+      assert.equal(watches, 6);
+      assert.equal(here.releases.calls(RELEASE).filter((args) => args.includes("resume")).length, 2);
+      // Its pod watched by its name, as the API server selects it, not as one of its namespace's.
+      const asked: string[] = [];
+      const unreachable = () => Effect.die("only the pod is watched");
+      const kube = KubeClient.of({
+        read: unreachable, list: unreachable, create: unreachable, replace: unreachable, patch: unreachable, patchPodStatus: unreachable, remove: unreachable, exec: unreachable,
+        watch: (apiVersion, plural, namespace, labelSelector, from, fieldSelector) =>
+          Stream.suspend(() => (asked.push([apiVersion, plural, namespace, labelSelector, from, fieldSelector].join(" ")), Stream.make({ type: "ADDED", object: restoredPod(pod) } as const))),
+      });
+      assert.deepEqual(Option.getOrNull(yield* Stream.runHead(podChanges(kube)(SESSIONS, POD))), restoredPod(pod));
+      assert.deepEqual(asked, [`v1 pods ${SESSIONS}   metadata.name=${POD}`]);
+    })
+  ));
+
 test("a resume whose pod's rules do not come within its wait, or whose commands fail, leaves the sandbox paused, saying why", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
@@ -2746,7 +2859,8 @@ test("a resume whose pod's rules do not come within its wait, or whose commands 
 
       // Its IPv6 address's rules do not come.
       host.ipv6 = filterTable([sessionPod("fs-old999", POD_IPV6)], { family: 6 });
-      const waiting = yield* Effect.forkChild(here.agent.resume(resumeRequest(snapshot, [POD_IP, POD_IPV6])));
+      here.pod.podIPs = [POD_IP, POD_IPV6];
+      const waiting = yield* Effect.forkChild(here.agent.resume(resumeRequest(snapshot)));
       yield* TestClock.adjust("29 seconds");
       assert.equal(waiting.pollUnsafe(), undefined);
       yield* TestClock.adjust("1 second");
@@ -2760,11 +2874,13 @@ test("a resume whose pod's rules do not come within its wait, or whose commands 
 
       // The node has no ip6tables, as nsenter says.
       host.answer = ([program]) => (program === "ip6tables" ? { exitCode: 127, stdout: "", stderr: "nsenter: failed to execute ip6tables: No such file or directory\n" } : null);
+      here.pod.podIPs = [POD_IPV6];
       assert.equal(
-        failure(yield* Effect.exit(here.agent.resume(resumeRequest(snapshot, [POD_IPV6])))),
+        failure(yield* Effect.exit(here.agent.resume(resumeRequest(snapshot)))),
         "ip6tables -t filter -S KUBE-ROUTER-FORWARD on the node failed: nsenter: failed to execute ip6tables: No such file or directory",
       );
 
+      here.pod.podIPs = [POD_IP];
       // conntrack fails, as it does deleting none.
       host.answer = ([program]) => (program === "conntrack" ? { exitCode: 1, stdout: "", stderr: "conntrack v1.4.8 (conntrack-tools): Operation failed: Operation not permitted\n" } : null);
       assert.equal(
@@ -2780,7 +2896,7 @@ test("a resume whose pod's rules do not come within its wait, or whose commands 
     }).pipe(Effect.provide(TestClock.layer()))
   ));
 
-test("commands run on the node enter its mounts and network from its PID 1, with k3s's binaries on their PATH, and say how they exited", async () => {
+test("commands run on the node enter its mounts and network from its PID 1, or its network alone, with k3s's binaries on their PATH, and say how they exited", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-node-host-"));
   try {
     const nsenter = join(root, "nsenter");
@@ -2793,6 +2909,7 @@ test("commands run on the node enter its mounts and network from its PID 1, with
     });
     assert.equal(NODE_PATH, "/var/lib/rancher/k3s/data/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/var/lib/rancher/k3s/data/current/bin/aux:/bin/aux");
     assert.deepEqual(await Effect.runPromise(host.run(["fail"])), { exitCode: 4, stdout: `--target 1 --mount --net -- fail\nPATH=${NODE_PATH}\n`, stderr: "it failed\n" });
+    assert.deepEqual(await Effect.runPromise(host.inNetwork(["bash", "-c", "true"])), { exitCode: 0, stdout: `--target 1 --net -- bash -c true\nPATH=${NODE_PATH}\n`, stderr: "" });
     const missing = await Effect.runPromise(Effect.flip(makeHostCommands(join(root, "none")).run(["conntrack", "-L"])));
     assert.match(missing.message, /^conntrack -L on the node failed: .*ENOENT/u);
   } finally {
@@ -2964,9 +3081,9 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       yield* here.storeProxy.drained;
       failed(503, "the node agent is stopping, so it prepares no restore of main/fs-other from the bucket: its next one does")(yield* run("prepare", { environment: "main", workspace: "fs-other", manifest: other }));
 
-      error(400, /podIPs/u)(yield* call("POST", "/resume", { ...resumeRequest(RELEASED), podIPs: ["10.42.0.300"] }));
-      error(400, /podIPs/u)(yield* call("POST", "/resume", { ...resumeRequest(RELEASED), podIPs: [] }));
-      error(400, /containerIds/u)(yield* call("POST", "/resume", { ...resumeRequest(RELEASED), containerIds: ["short"] }));
+      error(400, /port/u)(yield* call("POST", "/resume", { ...resumeRequest(RELEASED), port: 0 }));
+      error(400, /port/u)(yield* call("POST", "/resume", { ...resumeRequest(RELEASED), port: 65_536 }));
+      error(400, /policies/u)(yield* call("POST", "/resume", { ...resumeRequest(RELEASED), policies: ["Not a name"] }));
       error(400, /pod/u)(yield* call("POST", "/resume", { ...resumeRequest(RELEASED), pod: "fs_abc123" }));
       assert.deepEqual(yield* call("POST", "/resume", resumeRequest(released(s3))), { status: 204, body: null });
       assert.deepEqual(here.releases.calls(RELEASE).slice(-2).map((args) => args.slice(-2)), [["resume", CONTAINER], ["resume", OTHER_CONTAINER]]);
@@ -3219,21 +3336,22 @@ test("alasio waits for a resume as long as reading the images its sandbox was re
       const agents = yield* agentsOf({ ...here.agent, resume: () => Deferred.succeed(call.begun, undefined).pipe(Effect.andThen(Deferred.await(call.ended))) });
       yield* Effect.addFinalizer(() => Deferred.succeed(call.ended, undefined));
       // Of images of 512 MiB together, as a chain whose parent's pages a delta left scattered on a slow store may take to
-      // read: 30 s for its pod's policies, 128 s to read them at 4 MiB/s, and 30 s for bayma's hook, 188 s.
+      // read: 180 s for its pod to run, 30 s for its policies, 128 s to read them at 4 MiB/s, 30 s for bayma's hook, and
+      // 10 s for the pod to accept, 378 s.
       const bytes = 512 * 1024 ** 2;
       yield* Effect.gen(function*() {
         // Past the minute alasio gave any resume, within its own: waited for.
         const slow = yield* Effect.forkChild(agents.resume("node-1", resumeRequest(snapshot), bytes));
         yield* Deferred.await(call.begun);
-        yield* TestClock.adjust("187 seconds");
+        yield* TestClock.adjust("377 seconds");
         yield* Deferred.succeed(call.ended, undefined);
         yield* Fiber.join(slow);
         // One that never ends, given up on past its own.
         call = { begun: Deferred.makeUnsafe<void>(), ended: Deferred.makeUnsafe<void>() };
         const stuck = yield* Effect.forkChild(Effect.flip(agents.resume("node-1", resumeRequest(snapshot), bytes)));
         yield* Deferred.await(call.begun);
-        yield* TestClock.adjust("188 seconds");
-        assert.equal((yield* Fiber.join(stuck)).message, "the node agent of node-1 could not resume main/fs-abc's sandbox: it did not answer within 188 s");
+        yield* TestClock.adjust("378 seconds");
+        assert.equal((yield* Fiber.join(stuck)).message, "the node agent of node-1 could not resume main/fs-abc's sandbox: it did not answer within 378 s");
       }).pipe(Effect.provide(TestClock.layer()));
     })
   ));
