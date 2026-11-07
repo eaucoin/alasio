@@ -8,7 +8,8 @@
  * finds an image's layers; or, for one read from the bucket, the checkpoint gofer's options
  * file alone, until its restore has read it, and which runsc describes it from a copy of, in
  * `<root>/.inspect/`, apart from every workspace, so that no clear or eviction of the
- * workspace removes it while runsc reads it (remoteCopy). An image is written in a directory
+ * workspace removes it while runsc reads it (remoteCopy), as runsc verifies a chain of images
+ * the cache stages from a copy of its own there (chainCopy). An image is written in a directory
  * of its own beside the layers, whose name begins with ".", and moved among them once it is
  * whole and its digest known, so what the cache holds is always whole; what a stopped agent
  * left half written is removed as the next one starts.
@@ -19,7 +20,7 @@
  * is taken as the one checked, without reading it again (stamped). A modification time is of
  * the filesystem's granularity, so a file put in its place of the same size, on an inode used
  * again, within one tick of it, is not seen: what holds the image whole there is runsc's
- * verify of it as it is prepared and the SHA-256 of each file as it is downloaded.
+ * verify of it as it is staged or prepared and the SHA-256 of each file as it is downloaded.
  *
  * The cache holds at most `budget` bytes, its least recently used workspaces evicted whole
  * first, but for any used within `grace`, which a restore may still be reading, and any its
@@ -52,7 +53,7 @@ export const RESERVE_BYTES = 2 * 1024 ** 3;
 /** The directory of a workspace's images, each in one named by its digest; and of a snapshot's, its layers. */
 export const LAYERS_DIR = "layers";
 
-/** The directory, under the cache's root and of no workspace, of the copies of options runsc inspects a snapshot in the bucket by (remoteCopy): its name begins with ".", as no workspace's environment does. */
+/** The directory, under the cache's root and of no workspace, of the copies of options runsc inspects a snapshot in the bucket by (remoteCopy), and of the chains it verifies as the cache stages them (chainCopy): its name begins with ".", as no workspace's environment does. */
 const INSPECT_DIR = ".inspect";
 
 /** The directory of a workspace's images' stamps, each named by its image's digest. */
@@ -155,6 +156,14 @@ export interface SnapshotCache {
    * stopped agent left is removed as the next starts; removed as the scope ends.
    */
   readonly remoteCopy: (environment: string, workspace: string, snapshot: string, name: string, options: string) => Effect.Effect<string, CacheError, Scope.Scope>;
+  /**
+   * A directory of its own holding the chain of images `digests` of the workspace as prepare
+   * makes one, linked to the cache's, every one of which the cache must hold: what runsc
+   * verifies an image by as the cache stages it, apart from every workspace (INSPECT_DIR), so
+   * that no restore's directory is touched; one a stopped agent left is removed as the next
+   * starts; removed as the scope ends. The workspace is not used by it.
+   */
+  readonly chainCopy: (environment: string, workspace: string, digests: readonly string[]) => Effect.Effect<string, CacheError, Scope.Scope>;
   /** Removes everything of the workspace. */
   readonly clear: (environment: string, workspace: string) => Effect.Effect<void, CacheError>;
   /**
@@ -171,7 +180,7 @@ export interface SnapshotCache {
    * workspaces as `evict` does: those evicted. Fails, saying so, where it cannot.
    */
   readonly room: (bytes: number, spared: Spared) => Effect.Effect<readonly CachedWorkspace[], CacheError>;
-  /** Removes what was left half written, and the copies of options left (remoteCopy). */
+  /** Removes what was left half written, and the copies left (remoteCopy, chainCopy). */
   readonly clean: Effect.Effect<void, CacheError>;
 }
 
@@ -277,6 +286,22 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
     return found;
   });
 
+  /**
+   * Makes `directory` the chain of images `digests` of the workspace, as a restore reads one: the
+   * files of the first, linked to the cache's, and in its `layers/` each of the others, a link
+   * to the cache's.
+   */
+  const linkChain = async (directory: string, environment: string, workspace: string, digests: readonly string[]): Promise<void> => {
+    const [own, ...layers] = digests;
+    await mkdir(join(directory, LAYERS_DIR), { recursive: true });
+    const ownDir = image(environment, workspace, own ?? "");
+    for (const entry of await readdir(ownDir, { withFileTypes: true })) {
+      if (entry.isFile()) await link(join(ownDir, entry.name), join(directory, entry.name));
+    }
+    // Relative, so the link holds wherever the cache is mounted.
+    for (const digest of layers) await symlink(relative(join(directory, LAYERS_DIR), image(environment, workspace, digest)), join(directory, LAYERS_DIR, digest));
+  };
+
   /** Removes `cached` whole. */
   const remove = (cached: CachedWorkspace): Effect.Effect<void, CacheError> =>
     attempt(() => rm(workspaceDir(cached.environment, cached.workspace), { recursive: true, force: true }));
@@ -348,16 +373,9 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
     prepare: (environment, workspace, snapshot, digests) => {
       checked(environment, workspace, snapshot, digests);
       const directory = join(workspaceDir(environment, workspace), snapshot);
-      const [own, ...layers] = digests;
       return attempt(async () => {
         await rm(directory, { recursive: true, force: true });
-        await mkdir(join(directory, LAYERS_DIR), { recursive: true });
-        const ownDir = image(environment, workspace, own ?? "");
-        for (const entry of await readdir(ownDir, { withFileTypes: true })) {
-          if (entry.isFile()) await link(join(ownDir, entry.name), join(directory, entry.name));
-        }
-        // Relative, so the link holds wherever the cache is mounted.
-        for (const digest of layers) await symlink(join("..", "..", LAYERS_DIR, digest), join(directory, LAYERS_DIR, digest));
+        await linkChain(directory, environment, workspace, digests);
       }).pipe(Effect.andThen(use(environment, workspace)), Effect.as(directory));
     },
 
@@ -388,6 +406,20 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
           // One of its own however many are made of the snapshot at once, owner-only from its making.
           const directory = await mkdtemp(join(copies, `${environment}.${workspace}.${snapshot}-`));
           await writeFile(join(directory, name), options, { mode: 0o600, flag: "wx" });
+          return directory;
+        }),
+        (directory) => attempt(() => rm(directory, { recursive: true, force: true })).pipe(Effect.ignore),
+      );
+    },
+
+    chainCopy: (environment, workspace, digests) => {
+      checked(environment, workspace, null, digests);
+      const copies = join(root, INSPECT_DIR);
+      return Effect.acquireRelease(
+        attempt(async () => {
+          await mkdir(copies, { recursive: true, mode: 0o700 });
+          const directory = await mkdtemp(join(copies, `${environment}.${workspace}.chain-`));
+          await linkChain(directory, environment, workspace, digests);
           return directory;
         }),
         (directory) => attempt(() => rm(directory, { recursive: true, force: true })).pipe(Effect.ignore),
