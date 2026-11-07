@@ -217,6 +217,13 @@ export const SNAPSHOT_CACHE_BYTES_VARIABLE = "ALASIO_SNAPSHOT_CACHE_BYTES";
 export const OPERATION_LIMIT_SECONDS = 15 * 60;
 
 /**
+ * How long an agent holds a request for what its node holds (`GET /holdings`), asked as of
+ * what alasio has of it, before it answers that nothing changed: alasio asks again at once, so
+ * what it keeps of every node changes as the node's does, and an agent gone is found within it.
+ */
+export const HOLDINGS_WAIT_MS = 25_000;
+
+/**
  * How long a restore from the bucket may take from its prepare to its resume, which its token
  * lasts unless resumed before (./store-proxy.ts): the longest it takes, alasio waiting 3
  * minutes for its pod to run (POD_RUNNING_TIMEOUT_MS in src/gateway/snapshots.ts), then the

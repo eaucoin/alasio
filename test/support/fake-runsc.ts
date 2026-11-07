@@ -214,6 +214,8 @@ export interface FakeReleases {
    * false, its spec, in its bundle, mounting `mounts`, and its pod's uid `uid`, POD_UID unless given.
    */
   readonly runs: (containerId: string, release: string, namespace: string, pod: string, tracksWrites?: boolean, mounts?: readonly OciMount[], uid?: string) => void;
+  /** Installs `release` beside the others, as a node is given one it keeps. */
+  readonly installs: (release: string) => void;
 }
 
 /** The uid of the pod a container runs in, as containerd's annotations say it, unless FakeReleases.runs is given another. */
@@ -225,12 +227,13 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
   const containerdDir = join(root, "containerd");
   mkdirSync(containerdDir, { recursive: true });
   const dirOf = (release: string) => join(releasesDir, release);
-  for (const release of releases) {
+  const installs = (release: string) => {
     mkdirSync(dirOf(release), { recursive: true });
     writeFileSync(join(dirOf(release), "runsc"), SCRIPT);
     chmodSync(join(dirOf(release), "runsc"), 0o755);
     writeFileSync(join(containerdDir, `${gvisorHandler(release)}.toml`), 'restore_direct = true\n\n[runsc_config]\n  systemd-cgroup = "true"\n');
-  }
+  };
+  for (const release of releases) installs(release);
   const procRoot = join(root, "proc");
   const containers = join(releasesDir, "containers.json");
   const bundleOf = (containerId: string) => join(root, "bundles", containerId);
@@ -281,6 +284,7 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     containerdDir,
     procRoot,
     runs,
+    installs,
     dirOf,
     bundleOf,
     starts,

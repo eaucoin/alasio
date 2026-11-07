@@ -101,7 +101,7 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
       released: () => Effect.succeed(null),
       // What is attached on its node is reachable, unless a test says otherwise.
       attachments: () => Effect.succeed([]),
-      prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
+      prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, held: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
       readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, listEnvironments: unused(), quota: unused, sync: unused, bindFree: unused,
       checkpoint: (node, request) =>
         Effect.gen(function*() {
@@ -890,7 +890,7 @@ function restoringAgents(current: Manifest | null, released: Released | null, { 
     released: () => Effect.sync(() => state.released),
     setReleased: (ref, into) => Effect.sync(() => (base.asked.push(`record ${ref.environment}/${ref.workspace} released into ${into?.snapshot ?? "none"}`), void (state.released = into))),
     current: () => Effect.sync(() => state.current),
-    holdings: (node) => Effect.succeed({ node, releases: [{ release: "r1", cpuFeatures: ["sse", "avx"] }], cached: [] }),
+    held: (node) => Effect.succeed({ node, releases: [{ release: "r1", cpuFeatures: ["sse", "avx"] }], cached: [] }),
     prepare: (node, ref, manifest, gofer) =>
       prepare === "fails"
         ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 502, reason: "the snapshots bucket failed" }))
@@ -1088,7 +1088,7 @@ const together = <A>(begun: Deferred.Deferred<void>, other: Deferred.Deferred<vo
     Effect.as(value),
   );
 
-test("a restore reads its workspace's record and its current snapshot at once, and asks each node's agent what it holds at once", async () => {
+test("a restore reads its workspace's record and its current snapshot at once, and what each node holds at once", async () => {
   const env = await environment(1, { gvisor: true });
   const snapshot = "20261017T120000000Z-0000000a";
   const recorded = restoringAgents(manifestOf(env, "fs-together", snapshot), { snapshot, release: "r1" }, { prepare: "fails" });
@@ -1099,7 +1099,7 @@ test("a restore reads its workspace's record and its current snapshot at once, a
     nodes: Effect.succeed(["node-a", "node-b"]),
     released: (ref) => together(record, current, "read its record", null).pipe(Effect.andThen(recorded.agents.released(ref))),
     current: (ref) => together(current, record, "read its snapshot", null).pipe(Effect.andThen(recorded.agents.current(ref))),
-    holdings: (node) => together(node === "node-a" ? nodeA : nodeB, node === "node-a" ? nodeB : nodeA, "say what it holds", null).pipe(Effect.andThen(recorded.agents.holdings(node))),
+    held: (node) => together(node === "node-a" ? nodeA : nodeB, node === "node-a" ? nodeB : nodeA, "say what it holds", null).pipe(Effect.andThen(recorded.agents.held(node))),
     prepare: (node, ref, manifest, gofer) => Effect.sync(() => void prepared.push(node)).pipe(Effect.andThen(recorded.agents.prepare(node, ref, manifest, gofer))),
   };
   const { binder, sessions } = await sessionsOf(options(env, 7290), agents);

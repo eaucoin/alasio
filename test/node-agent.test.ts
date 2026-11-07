@@ -41,6 +41,7 @@ import {
   NoSnapshot,
   type NodeAgent,
   PoliciesNotInForce,
+  holdingsTag,
   type Prepared,
   type PrepareError,
   type PrepareRequest,
@@ -220,6 +221,8 @@ interface NodeOptions {
   readonly preparedForMs?: number;
   /** How long its runsc may take to describe an image in the bucket. */
   readonly inspectTimeoutMs?: number;
+  /** Its cache as `cache` changes it. */
+  readonly cache?: (cache: SnapshotCache) => SnapshotCache;
 }
 
 /** A bucket and a directory of the test's, and nodes made on them, removed after `body`. */
@@ -227,11 +230,11 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, cache: cached = (cache) => cache }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
-      const cache = makeSnapshotCache({ root: cacheDir, budget, graceMs: 0 });
+      const cache = cached(makeSnapshotCache({ root: cacheDir, budget, graceMs: 0 }));
       // The pod's containers run under the node's first release, which its runtime starts sandboxes with.
       const [running] = installed;
       const runsc = changed(makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot, current: running ?? RELEASE }), releases);
@@ -2963,6 +2966,12 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
 const agentsOf = (agent: NodeAgent, workspaces: Workspaces = unusedWorkspaces, listed: () => void = () => {}) =>
   Effect.gen(function*() {
     const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent, workspaces });
+    return yield* clientOf(port, listed);
+  });
+
+/** alasio's client of the agents, of which there is one, of node-1, on the loopback's `port`; `listed` told of each list of their pods. */
+const clientOf = (port: number, listed: () => void = () => {}) =>
+  Effect.gen(function*() {
     const pod: V1Pod = {
       metadata: { name: "node-agent-1", namespace: "alasio" },
       spec: { nodeName: "node-1", containers: [] },
@@ -3050,6 +3059,93 @@ test("alasio refuses, as what may pass, a prepare its agent answers with another
       assert.deepEqual((yield* Fiber.join(running)).manifest, RELEASED_MANIFEST);
       // Asked once that one has ended, its own.
       assert.deepEqual((yield* agents.prepare("node-1", ref, newer)).manifest, newer);
+    })
+  ));
+
+test("what a node holds is listed once a change of its cache, however many ask as of it, its releases read each time", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      let lists = 0;
+      const here = yield* node("node-1", { cache: (cache) => ({ ...cache, list: Effect.suspend(() => ((lists += 1), cache.list)) }) });
+      // Once the eviction its agent runs as it starts, which may change what its cache holds, is through.
+      yield* Effect.sleep("200 millis");
+      const started = lists;
+      const before = yield* here.agent.holdings;
+      for (let ask = 0; ask < 4; ask += 1) assert.deepEqual(yield* here.agent.holdings, before);
+      // As many waiting as of it, its wait over.
+      assert.deepEqual(yield* Effect.all([1, 2, 3].map(() => here.agent.holdingsAfter(holdingsTag(before), 100)), { concurrency: "unbounded" }), [null, null, null]);
+      assert.equal(lists - started, 1);
+      // Listed anew once its cache may have changed.
+      yield* here.agent.discard({ environment: "main", workspace: "fs-abc" }, []);
+      yield* here.agent.holdings;
+      assert.equal(lists - started, 2);
+      // A release installed meanwhile is told whatever its cache did.
+      here.releases.installs("20261101.0-eaucoin.9");
+      assert.deepEqual((yield* here.agent.holdings).releases.map(({ release }) => release).toSorted(), [RELEASE, "20261101.0-eaucoin.9"].toSorted());
+      assert.equal(lists - started, 2);
+    })
+  ));
+
+test("what a node holds is told once it changes, as its cache does, at once where the tag asked as of names other, and not within the wait where it does not change", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const before = yield* here.agent.holdings;
+      assert.equal(yield* here.agent.holdingsAfter(holdingsTag(before), 50), null);
+      assert.deepEqual(yield* here.agent.holdingsAfter("0".repeat(64), 50), before);
+      const waiting = yield* Effect.forkChild(here.agent.holdingsAfter(holdingsTag(before), 10_000));
+      yield* Effect.sleep("100 millis");
+      assert.equal(waiting.pollUnsafe(), undefined);
+      yield* here.agent.checkpoint(request("fs-abc"));
+      assert.deepEqual((yield* Fiber.join(waiting))?.cached.map(({ workspace }) => workspace), ["fs-abc"]);
+    })
+  ));
+
+test("alasio keeps what each node holds as its agent says it, asked once and told after as it changes, tagged, asked again once its agent is gone", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const asked: string[] = [];
+      const counting: NodeAgent = { ...here.agent, holdings: here.agent.holdings.pipe(Effect.tap(() => Effect.sync(() => void asked.push("now")))) };
+      const serving = yield* Scope.make();
+      const served = { port: 0, host: "127.0.0.1", token: "the token", agent: counting, workspaces: unusedWorkspaces };
+      const { port } = yield* serveNodeAgent(served).pipe(Scope.provide(serving));
+      const agents = yield* clientOf(port);
+      assert.deepEqual((yield* agents.held("node-1")).cached, []);
+      // Told as its cache changes, asked no more.
+      yield* here.agent.checkpoint(request("fs-abc"));
+      yield* agents.held("node-1").pipe(Effect.repeat({ schedule: Schedule.spaced("20 millis"), until: ({ cached }) => cached.length === 1 }), Effect.timeout("5 seconds"));
+      assert.deepEqual(asked, ["now"]);
+      // Its agent gone, what was kept of it is forgotten, as the next restore finds; asked of the one serving after it.
+      yield* Scope.close(serving, Exit.void);
+      yield* agents.held("node-1").pipe(Effect.repeat({ schedule: Schedule.spaced("20 millis") }), Effect.flip, Effect.timeout("5 seconds"));
+      yield* serveNodeAgent({ ...served, port });
+      assert.deepEqual((yield* agents.held("node-1")).cached.map(({ workspace }) => workspace), ["fs-abc"]);
+      assert.deepEqual(asked, ["now", "now"]);
+    })
+  ));
+
+test("an agent that stops refuses what it is asked of what its node holds as of a tag, held or asked meanwhile, which ends alasio's watch of it, rather than answer that nothing changed, as it would again and again", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const resumed = yield* Deferred.make<void>();
+      // A resume that runs on as the agent stops, which its stop waits for.
+      const agent: NodeAgent = { ...here.agent, resume: () => Deferred.await(resumed) };
+      const serving = yield* Scope.make();
+      const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent, workspaces: unusedWorkspaces }).pipe(Scope.provide(serving));
+      const agents = yield* clientOf(port);
+      const tag = holdingsTag(yield* here.agent.holdings);
+      // Held by the agent, as nothing changes.
+      const held = fetch(`http://127.0.0.1:${port}/holdings`, { headers: { authorization: "Bearer the token", "if-none-match": `"${tag}"` } });
+      const resuming = yield* Effect.forkChild(agents.resume("node-1", resumeRequest(RELEASED), 0));
+      yield* Effect.sleep("100 millis");
+      const stopping = yield* Effect.forkChild(Scope.close(serving, Exit.void));
+      const answered = yield* Effect.promise(() => held);
+      assert.deepEqual([answered.status, yield* Effect.promise(() => answered.json())], [503, { error: "the node agent is stopping: what its node holds is told by the agent after it" }]);
+      yield* Deferred.succeed(resumed, undefined);
+      yield* Fiber.join(resuming);
+      yield* Fiber.join(stopping);
     })
   ));
 
