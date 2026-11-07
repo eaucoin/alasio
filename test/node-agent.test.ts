@@ -413,7 +413,12 @@ test("a checkpoint saves the sandbox with its release's runsc, uploads its image
       const here = yield* node("node-1");
       const first = yield* here.agent.checkpoint(request("fs-abc"));
       const staged = join(here.cacheDir, "main", "fs-abc", "layers", `.${first.snapshot}`);
-      assert.deepEqual(here.releases.calls(RELEASE), [
+      // Its image verified, as a restore of it here would be, beside its upload, from a copy of its own, gone after.
+      const [verified, ...more] = here.releases.calls(RELEASE).slice(3);
+      assert.deepEqual([verified?.slice(0, -1), more], [[`--root=${RUNSC_ROOT}`, "--systemd-cgroup=true", "image", "verify", "--host"], []]);
+      assert.ok(verified?.at(-1)?.startsWith(join(here.cacheDir, ".inspect", "main.fs-abc.chain-")) && !existsSync(verified.at(-1) ?? ""));
+      assert.deepEqual(JSON.parse(readFileSync(join(here.cacheDir, "main", "fs-abc", "verified.json"), "utf8")), { release: RELEASE, digests: first.layers.map(({ digest }) => digest) });
+      assert.deepEqual(here.releases.calls(RELEASE).slice(0, 3), [
         [
           `--root=${RUNSC_ROOT}`,
           "--systemd-cgroup=true",
@@ -613,7 +618,7 @@ test("a cached image that is not what its manifest says is read again from the b
     })
   ));
 
-test("a prepared snapshot of a release before the bucket's is verified by runsc, its images read again from the bucket where those the cache held fail it, and refused where those fail it too", () =>
+test("a snapshot is verified by runsc as the cache stages it, which its prepare takes, or else as it is prepared; one of a release before the bucket's has its images read again from the bucket where those the cache held fail it, and is refused where those fail it too", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
       const workspace = { environment: "main", workspace: "fs-abc" };
@@ -631,8 +636,14 @@ test("a prepared snapshot of a release before the bucket's is verified by runsc,
       const [own] = delta.layers;
       assert.ok(own);
       const verified = () => there.releases.calls(OLDER).filter((args) => args.includes("verify"));
-      // Prepared from the cache, verified there.
+      // Verified as the cache staged it, from a copy of its own; prepared from the cache, verified no more.
+      const staged = verified().length;
+      assert.ok(verified().at(-1)?.at(-1)?.startsWith(join(there.cacheDir, ".inspect", "main.fs-abc.chain-")));
       const prepared = yield* preparing(there.agent, workspace);
+      assert.deepEqual([prepared.source, verified().length], ["cache", staged]);
+      // Staged where nothing says it was verified, as by an agent before this one: verified as it is prepared.
+      rmSync(join(there.cacheDir, "main", "fs-abc", "verified.json"));
+      assert.deepEqual(yield* preparing(there.agent, workspace), prepared);
       assert.deepEqual(verified().at(-1)?.slice(-4), ["image", "verify", "--host", prepared.imagePath]);
       // Its base's pages metadata changed in place as its stamp does not see, its size and times kept, as a disk that rots changes it.
       const meta = join(there.cacheDir, "main", "fs-abc", "layers", baseImage.digest, "pages_meta.img");
@@ -880,8 +891,8 @@ test("a compaction the workspace moves on from meanwhile commits nothing, what i
         assert.deepEqual(imagesOf(here, "fs-abc"), reading);
         yield* here.agent.spend(workspace, moved.snapshot);
         rmSync(join(runscDir, "hold-compact"));
-        yield* Effect.sync(() => readdirSync(layersDir).some((name) => name.startsWith("."))).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (staging) => !staging }));
-        yield* Effect.sleep("200 millis");
+        // Ended, as what says it compacts is gone.
+        yield* Effect.sync(() => existsSync(join(here.cacheDir, "main", "fs-abc", COMPACTING_FILE))).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (compacting) => !compacting }));
         assert.equal(yield* here.agent.current(workspace), null);
         // One that fails leaves the snapshot as it was committed, and nothing it staged.
         writeFileSync(join(runscDir, "fail-compact"), "");
@@ -2070,10 +2081,12 @@ test("a snapshot is prepared from the node's cache where it holds it whole and i
       const files = image.files.map(({ path }) => `GET main/fs-abc/layers/${image.digest}/${path}`);
       const downloads = () => s3.requests.filter((asked) => asked.startsWith("GET main/fs-abc/layers/"));
 
-      // The node that took it has it, which its runsc restores, as it says.
+      // The node that took it has it, which its runsc restores, as it said as its cache staged it.
       const linked = join(taker.cacheDir, "main", "fs-abc", manifest.snapshot);
+      const verifies = () => taker.releases.calls(RELEASE).filter((args) => args.includes("verify")).length;
+      const staged = verifies();
       assert.deepEqual(yield* preparing(taker.agent, workspace), { manifest, imagePath: linked, source: "cache" });
-      assert.deepEqual(taker.releases.calls(RELEASE).at(-1), [`--root=${RUNSC_ROOT}`, "--systemd-cgroup=true", "image", "verify", "--host", linked]);
+      assert.deepEqual([staged, verifies()], [1, 1]);
       assert.deepEqual(downloads(), []);
 
       // Another node reads it from the bucket, each of its images there as it was put, as the restore goes; and fetches it meanwhile, once.
@@ -2894,8 +2907,14 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       const { cached, ...held } = holdings.body as { readonly cached: readonly { readonly usedAt: string }[] };
       assert.deepEqual(held, { node: "node-1", releases: [{ release: RELEASE, cpuFeatures: ["sse", "avx", "avx2"] }] });
       assert.deepEqual(cached.map(({ usedAt, ...rest }) => (assert.ok(Date.parse(usedAt) <= Date.now()), rest)), [
-        // Its image, its manifest beside it, and its image's stamp.
-        { environment: "main", workspace: "fs-abc", images: [manifest.layers[0]?.digest], bytes: manifest.bytes + JSON.stringify(manifest).length + statSync(join(here.cacheDir, "main", "fs-abc", "stamps", `${manifest.layers[0]?.digest}.json`)).size },
+        // Its image, its manifest beside it, its image's stamp, and what says runsc verified it as it was staged.
+        {
+          environment: "main",
+          workspace: "fs-abc",
+          images: [manifest.layers[0]?.digest],
+          bytes: manifest.bytes + JSON.stringify(manifest).length + statSync(join(here.cacheDir, "main", "fs-abc", "stamps", `${manifest.layers[0]?.digest}.json`)).size +
+            statSync(join(here.cacheDir, "main", "fs-abc", "verified.json")).size,
+        },
       ]);
 
       // Snapshots it cannot restore, or that are not what they say, and a bucket that fails.
