@@ -75,7 +75,7 @@ import { dirname, join, posix, relative } from "node:path";
 import { pipeline } from "node:stream/promises";
 
 import type { BatchObservableResult } from "@opentelemetry/api";
-import { Clock, type Duration, Effect, FiberMap, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
+import { Clock, type Duration, Effect, FiberMap, Option, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import { quantityOf } from "../kube/quantity.ts";
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
@@ -549,6 +549,12 @@ export const MANIFEST_FILE = "manifest.json";
 /** The object of a workspace's current snapshot. */
 export const CURRENT_FILE = "current.json";
 /**
+ * The file, beside a workspace's images in the cache, of the chain of its images runsc last
+ * verified there as the cache staged them (verifiedStaged), a VerifiedChain: a prepare of a
+ * snapshot of that chain, under that release, its images intact since, takes it as verified.
+ */
+export const VERIFIED_FILE = "verified.json";
+/**
  * The file, beside a workspace's images in the cache, of the compaction that writes one: the snapshot it compacts into, and
  * its image's digest once the cache holds it; there until it has ended, so that an agent that starts again after one that
  * stopped as it compacted removes what that one wrote (recoverCompactions).
@@ -684,6 +690,9 @@ const cachedSnapshots = meter.createObservableGauge("alasio.node_agent.cache.sna
 
 /** The release a cached manifest names, of all it says. */
 const CachedRelease = Schema.fromJsonString(Schema.Struct({ release: Schema.String }));
+
+/** A chain of images runsc verified, as VERIFIED_FILE says it: the release that verified it, and its images' digests, in the chain's order. */
+const VerifiedChain = Schema.fromJsonString(Schema.Struct({ release: Release, digests: Schema.Array(Schema.String.check(Schema.isPattern(DIGEST))) }));
 
 /** A compaction under way, as COMPACTING_FILE says it. */
 const Compacting = Schema.fromJsonString(Schema.Struct({ snapshot: SnapshotId, digest: Schema.optional(Schema.String.check(Schema.isPattern(DIGEST))) }));
@@ -1026,13 +1035,16 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest)));
       yield* cache.stamp(environment, workspace, image.digest, files);
       const uploadedAt = yield* Clock.currentTimeMillis;
-      const [uploadMs, layers] = yield* timed(Effect.gen(function*() {
-        const uploaded = yield* upload(request, image.digest, files);
-        // Its own image and those it refers to looked at together, as the prepare of a restore looks at its chain's.
-        const missing = yield* notInBucket(request, [uploaded, ...referred]);
-        if (missing.includes(uploaded)) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${image.digest} is not in the bucket as it was put` });
-        return [uploaded, ...yield* Effect.forEach(referred, (layer) => (missing.includes(layer) ? putAgain(request, layer) : Effect.succeed(layer)))];
-      }));
+      const [[uploadMs, layers], verified] = yield* Effect.all([
+        timed(Effect.gen(function*() {
+          const uploaded = yield* upload(request, image.digest, files);
+          // Its own image and those it refers to looked at together, as the prepare of a restore looks at its chain's.
+          const missing = yield* notInBucket(request, [uploaded, ...referred]);
+          if (missing.includes(uploaded)) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${image.digest} is not in the bucket as it was put` });
+          return [uploaded, ...yield* Effect.forEach(referred, (layer) => (missing.includes(layer) ? putAgain(request, layer) : Effect.succeed(layer)))];
+        })),
+        verifiedStaged({ environment, workspace, snapshot, release }, [image.digest, ...referred.map(({ digest }) => digest)]),
+      ], { concurrency: 2 });
       yield* inTime(request, snapshot, uploadedAt);
       const manifest: Manifest = {
         environment,
@@ -1049,6 +1061,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         ...(caught === undefined ? {} : { live: caught }),
       };
       yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
+      if (verified) yield* sayVerified(manifest);
       yield* bucket.putJson(manifestKey(request, snapshot), manifest);
       yield* bucket.putJson(`${prefixOf(request)}/${CURRENT_FILE}`, manifest);
       return manifest;
@@ -1105,7 +1118,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest), quietly));
         yield* cache.stamp(environment, workspace, image.digest, files);
         const uploadedAt = yield* Clock.currentTimeMillis;
-        const [uploadMs, uploaded] = yield* timed(upload(committed, image.digest, files, quietly));
+        const [[uploadMs, uploaded], verified] = yield* Effect.all([
+          timed(upload(committed, image.digest, files, quietly)),
+          verifiedStaged({ environment, workspace, snapshot, release }, [image.digest]),
+        ], { concurrency: 2 });
         // What it uploaded, should the workspace have moved on meanwhile, no manifest names, and is collected as any such image is.
         const manifest = yield* exclusive(
           [committed],
@@ -1117,6 +1133,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             yield* inTime(committed, snapshot, uploadedAt);
             const compacted: Manifest = { ...committed, snapshot, layers: [layer], bytes: bytesOf([layer]), uploadMs, compactedFrom: committed.snapshot };
             yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(compacted)));
+            if (verified) yield* sayVerified(compacted);
             yield* bucket.putJson(manifestKey(committed, snapshot), compacted);
             unnamed = null;
             yield* bucket.putJson(`${prefixOf(committed)}/${CURRENT_FILE}`, compacted);
@@ -1356,8 +1373,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * checkpoint or a compaction writes it, which its manifest records, and as a download
    * receives it, against its manifest's. Between, the cache holds them to what they were by
    * each one's size, inode and modification time, which whatever writes or replaces a file
-   * changes; and a prepare has runsc verify the image's structure, its pages metadata's
-   * checksums and each layer's identity and size. What changes a file's bytes in place, its
+   * changes; and runsc verifies the image's structure, its pages metadata's checksums and each
+   * layer's identity and size, as the cache stages it (verifiedStaged), or else as a prepare
+   * prepares it. What changes a file's bytes in place, its
    * size and modification time kept, as a disk that rots does, is not seen until the restore
    * reads those pages.
    */
@@ -1383,6 +1401,61 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       const missing = manifest.cpuFeatures.filter((feature) => !here.has(feature));
       return missing.length > 0 ? `this node's CPU lacks features it was saved with: ${missing.join(", ")}` : null;
     });
+
+  /**
+   * runsc's verdict on the image of `manifest` prepared at `path` (runsc image verify --host):
+   * whole and restorable here, `path`; Unrestorable where this node's runsc restores it not
+   * (another version, a CPU feature, a platform); otherwise, malformed or missing a layer,
+   * corrupt.
+   */
+  const verifiedAt = ({ environment, workspace, snapshot, release }: Pick<Manifest, "environment" | "workspace" | "snapshot" | "release">, path: string): Effect.Effect<string, Unrestorable | SnapshotCorrupt | RunscError> =>
+    runsc.verify(release, path).pipe(
+      Effect.catchTag("ReleaseNotInstalled", (error) => Effect.fail(new Unrestorable({ environment, workspace, snapshot, reason: error.message }))),
+      Effect.flatMap((found): Effect.Effect<string, Unrestorable | SnapshotCorrupt | RunscError> => {
+        if (found.restorable) return Effect.succeed(path);
+        if (found.status === VERIFY_STATUSES.notRestorable) {
+          return Effect.fail(new Unrestorable({ environment, workspace, snapshot, reason: `this node's runsc does not restore it: ${found.said}` }));
+        }
+        return Effect.fail(new SnapshotCorrupt({ environment, workspace, reason: `runsc image verify exited ${found.status}: ${found.said}` }));
+      }),
+    );
+
+  /** The chain of images, by their digests, `manifest` restores from: its image, then its layers. */
+  const chainOf = (manifest: Manifest): readonly string[] => manifest.layers.map(({ digest }) => digest);
+
+  /** Whether runsc verified the chain of `manifest`'s images in the cache under its release as the cache staged them, as VERIFIED_FILE says. */
+  const verifiedAlready = (manifest: Manifest): Effect.Effect<boolean> =>
+    Effect.promise(() => readFile(join(cache.workspace(manifest.environment, manifest.workspace), VERIFIED_FILE), "utf8").catch(() => null)).pipe(
+      Effect.map((text) => {
+        const said = text === null ? Option.none() : Schema.decodeUnknownOption(VerifiedChain)(text);
+        return Option.isSome(said) && said.value.release === manifest.release && JSON.stringify(said.value.digests) === JSON.stringify(chainOf(manifest));
+      }),
+    );
+
+  /**
+   * Whether runsc verifies the chain of images `digests` of `of`'s workspace as the cache has
+   * just staged its first, a checkpoint's or a compaction's, as the prepare of a restore of it
+   * would (verifiedAt), from a copy of its own (chainCopy), beside the image's upload: one the
+   * cache does not hold whole, or that runsc does not verify, is not, said so, and its prepare
+   * verifies it. What a restore's prepare fetches into the cache is verified as it prepares
+   * it; what is fetched after a restore read it from the bucket (fetchLater) is its own
+   * snapshot's, which it spends, and its next snapshot's chain is verified as its checkpoint
+   * stages it.
+   */
+  const verifiedStaged = (of: Pick<Manifest, "environment" | "workspace" | "snapshot" | "release">, digests: readonly string[]): Effect.Effect<boolean> =>
+    Effect.gen(function*() {
+      for (const digest of digests) if (!(yield* cache.holds(of.environment, of.workspace, digest))) return false;
+      yield* Effect.scoped(Effect.flatMap(cache.chainCopy(of.environment, of.workspace, digests), (copy) => verifiedAt(of, copy)));
+      return true;
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning(`runsc did not verify the images of the snapshot ${of.snapshot} of ${prefixOf(of)} as the node's cache staged them, so a restore of it here verifies them: ${error.message}`).pipe(Effect.as(false))
+      ),
+    );
+
+  /** Says beside the workspace's images that runsc verified `manifest`'s chain as the cache staged it (VERIFIED_FILE). */
+  const sayVerified = (manifest: Manifest): Effect.Effect<void, CacheError> =>
+    onDisk(() => writeFile(join(cache.workspace(manifest.environment, manifest.workspace), VERIFIED_FILE), JSON.stringify({ release: manifest.release, digests: chainOf(manifest) })));
 
   /**
    * The checkpoint gofer's options for the image `own` of the workspace's, its layers under
@@ -1506,31 +1579,17 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         const started = yield* Clock.currentTimeMillis;
         const [own] = manifest.layers;
         if (own === undefined) return yield* new SnapshotCorrupt({ environment, workspace, reason: "its manifest names no image" });
-        /**
-         * runsc's verdict on the image prepared at `path` (runsc image verify --host): whole
-         * and restorable here; Unrestorable where this node's runsc restores it not (another
-         * version, a CPU feature, a platform); otherwise, malformed or missing a layer, corrupt.
-         */
-        const verified = (path: string) =>
-          runsc.verify(release, path).pipe(
-            Effect.catchTag("ReleaseNotInstalled", (error) => Effect.fail(new Unrestorable({ environment, workspace, snapshot, reason: error.message }))),
-            Effect.flatMap((found): Effect.Effect<string, Unrestorable | SnapshotCorrupt | RunscError> => {
-              if (found.restorable) return Effect.succeed(path);
-              if (found.status === VERIFY_STATUSES.notRestorable) {
-                return Effect.fail(new Unrestorable({ environment, workspace, snapshot, reason: `this node's runsc does not restore it: ${found.said}` }));
-              }
-              return Effect.fail(new SnapshotCorrupt({ environment, workspace, reason: `runsc image verify exited ${found.status}: ${found.said}` }));
-            }),
-          );
+        const verified = (path: string) => verifiedAt(manifest, path);
         // The images the cache holds as they were checked (intact): where it holds them all,
-        // prepared from it and verified by runsc; one that does not verify has the images read
-        // from the bucket instead.
+        // prepared from it and verified by runsc, as they were as the cache staged them where
+        // it says so (verifiedStaged); one that does not verify has the images read from the
+        // bucket instead.
         let imagePath: string | null = null;
         let held = true;
         for (const layer of manifest.layers) if (!(yield* intact(ref, layer))) held = false;
         if (held) {
           const linked = yield* cache.prepare(environment, workspace, snapshot, manifest.layers.map(({ digest }) => digest));
-          imagePath = yield* verified(linked).pipe(
+          imagePath = yield* ((yield* verifiedAlready(manifest)) ? Effect.succeed(linked) : verified(linked)).pipe(
             Effect.catchTag("SnapshotCorrupt", (error) =>
               Effect.logWarning(`the node's cached copy of the snapshot ${snapshot} of ${prefixOf(ref)} does not restore (${error.reason}): it is read from the bucket`).pipe(
                 Effect.andThen(cache.clear(environment, workspace)),
