@@ -2965,10 +2965,15 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
         call("GET", `/${operation}/main/${workspace}`).pipe(
           Effect.repeat({ schedule: Schedule.spaced("20 millis"), while: ({ status, body }) => status === 200 && (body as { readonly state: string }).state === "running" }),
         );
-      /** Starts the `operation` of `request`, which the agent answers it has, and how it ended. */
+      /**
+       * Starts the `operation` of `request`, which the agent answers it has, and how it ended: as
+       * it answers its start, where a prepare ended as it waited, as asked after otherwise.
+       */
       const run = (operation: string, request: { readonly environment: string; readonly workspace: string; readonly [field: string]: unknown }) =>
         Effect.gen(function*() {
-          assert.deepEqual(yield* call("POST", `/${operation === "checkpoints" ? "checkpoints" : "prepare"}`, request), { status: 202, body: { state: "running" } });
+          const begun = yield* call("POST", `/${operation === "checkpoints" ? "checkpoints" : "prepare"}`, request);
+          if (operation === "prepare" && begun.status === 200) return begun;
+          assert.deepEqual(begun, { status: 202, body: { state: "running" } });
           return yield* ended(operation, request.workspace);
         });
       /** That `answered` says an operation failed with `status`, as `message` says. */
@@ -3170,16 +3175,20 @@ test("a checkpoint alasio stops waiting for goes on, one asked for meanwhile is 
     })
   ));
 
-test("alasio learns a prepare that ends in tens of milliseconds, as one from the node's cache does, has ended within tens more", () =>
+test("alasio learns a prepare that ends within the agent's short wait, as one from the node's cache or the bucket does, has ended as its start is answered, asking no more", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
       const here = yield* node("node-1");
       const ref = { environment: "main", workspace: "fs-abc" };
-      const agents = yield* agentsOf({ ...here.agent, prepare: () => Effect.sleep("40 millis").pipe(Effect.as({ manifest: RELEASED_MANIFEST, imagePath: `/var/lib/alasio/snapshots/main/fs-abc/${RELEASED}`, source: "cache" as const })) });
-      const asked = Date.now();
-      assert.deepEqual((yield* agents.prepare("node-1", ref, RELEASED_MANIFEST)).manifest, RELEASED_MANIFEST);
-      const took = Date.now() - asked;
-      assert.ok(took < 250, `alasio learned the prepare had ended ${took} ms after it asked for it`);
+      const prepared = { manifest: RELEASED_MANIFEST, imagePath: `/var/lib/alasio/snapshots/main/fs-abc/${RELEASED}`, source: "cache" as const };
+      for (const takes of [40, 600]) {
+        const agents = yield* agentsOf({ ...here.agent, prepare: () => Effect.sleep(takes).pipe(Effect.as(prepared)) });
+        const asked = Date.now();
+        assert.deepEqual((yield* agents.prepare("node-1", ref, RELEASED_MANIFEST)).manifest, RELEASED_MANIFEST);
+        // Asked how it stood after 25, 75, 175, 375 and 775 ms, alasio would learn of the second at 775 ms.
+        const took = Date.now() - asked;
+        assert.ok(took < takes + 100, `alasio learned the prepare of ${takes} ms had ended ${took} ms after it asked for it`);
+      }
     })
   ));
 

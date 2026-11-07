@@ -204,10 +204,10 @@ export interface BindingRequest extends PodOwner {
 /** How long a checkpoint, a prepare or a copy may take. */
 const LONG_CALL = `${OPERATION_LIMIT_SECONDS} seconds` satisfies Duration.Input;
 /**
- * How often alasio asks an agent how a checkpoint or a prepare it started stands: 25 ms after
- * it last asked, then twice as long each time, half a second at most, as a prepare from the
- * node's cache ends in tens of milliseconds, which a restore waits on, and a checkpoint takes
- * seconds.
+ * How often alasio asks an agent how a checkpoint or a prepare it started stands, where its
+ * start was not answered as it ended: 25 ms after it last asked, then twice as long each time,
+ * half a second at most, as a prepare from the bucket may end within a second or two, which a
+ * restore waits on, and a checkpoint takes seconds.
  */
 const OPERATION_POLLS = Schedule.min([Schedule.exponential("25 millis"), Schedule.spaced("500 millis")]);
 /**
@@ -307,18 +307,23 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
   /**
    * What the agent of `node` comes to as it runs the operation of `path` (a checkpoint, a
    * prepare) of the workspace `request` names, which it runs whatever becomes of this
-   * call: started, then asked how it stands until it has ended, within LONG_CALL.
+   * call: started, answered as it ended where its start waited for it to end, as a short
+   * prepare's does, else asked how it stands until it has ended, within LONG_CALL.
    */
   const operate = <A, I>(node: string, what: string, path: string, request: CheckpointRequest | PrepareRequest, value: Schema.Codec<A, I>): Effect.Effect<A, NodeAgentError | KubeApiError> =>
     Effect.gen(function*() {
-      yield* send(node, what, { method: "POST", path, body: request, timeout: SHORT_CALL });
+      const begun = yield* send(node, what, { method: "POST", path, body: request, timeout: SHORT_CALL });
       const standing = { method: "GET", path: `${path}/${encodeURIComponent(request.environment)}/${encodeURIComponent(request.workspace)}`, timeout: SHORT_CALL } as const;
-      const ended = yield* ask(node, what, standing, OutcomeOf(value)).pipe(
-        Effect.repeat({ schedule: OPERATION_POLLS, while: ({ state }) => state === "running" }),
-        Effect.timeoutOrElse({ duration: LONG_CALL, orElse: () => Effect.fail(new NodeAgentError({ node, call: what, reason: `it had not ended within ${LONG_CALL}` })) }),
-      );
+      const ended = begun.status === 200
+        ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(OutcomeOf(value)))(begun.text).pipe(
+          Effect.mapError((error) => new NodeAgentError({ node, call: what, reason: `its answer is not one: ${error.message}` })),
+        )
+        : yield* ask(node, what, standing, OutcomeOf(value)).pipe(
+          Effect.repeat({ schedule: OPERATION_POLLS, while: ({ state }) => state === "running" }),
+          Effect.timeoutOrElse({ duration: LONG_CALL, orElse: () => Effect.fail(new NodeAgentError({ node, call: what, reason: `it had not ended within ${LONG_CALL}` })) }),
+        );
       if (ended.state === "done") return ended.value;
-      // Repeated while it ran, it ran no more.
+      // Answered as it ended, or repeated while it ran, it ran no more.
       if (ended.state === "running") return yield* Effect.die("an operation ended running");
       return yield* new NodeAgentError({ node, call: what, reason: ended.error, status: ended.status });
     });

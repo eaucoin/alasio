@@ -3,7 +3,8 @@
  * checkpoint, or a prepare. Each runs on its own, in the agent's scope, whatever becomes
  * of the request that started it, as a client that gives up (alasio restarting, its call
  * timed out) would otherwise interrupt runsc in the middle of a save, or a download into
- * the cache. The client asks how it went until it has ended (./server.ts).
+ * the cache. The client asks how it went until it has ended, unless the request that started
+ * it waited for it to end, which a short one does (./server.ts).
  *
  * A workspace has one of each kind at a time: one started while one runs is that one. Its
  * outcome is kept until the next starts, or for OUTCOME_TTL_MS after it ended, whichever
@@ -37,6 +38,8 @@ export interface Operations<A, E> {
   readonly start: (key: string, operation: Effect.Effect<A, E>) => Effect.Effect<void>;
   /** How the operation of `key` stands, or null when there is none, or its outcome is no longer kept. */
   readonly outcome: (key: string) => Effect.Effect<Outcome<A> | null>;
+  /** How the operation of `key` stands once it has ended, or after `waitMs` where it runs on, as `outcome` says. */
+  readonly outcomeWithin: (key: string, waitMs: number) => Effect.Effect<Outcome<A> | null>;
 }
 
 /**
@@ -47,6 +50,8 @@ export interface Operations<A, E> {
 export const makeOperations = Effect.fnUntraced(function*<A, E>(scope: Scope.Scope, failure: (cause: Cause.Cause<E>) => Failure): Effect.fn.Return<Operations<A, E>> {
   const entries = new Map<string, { readonly outcome: Outcome<A>; readonly endedAt: number | null }>();
   const running = new Set<Fiber.Fiber<A, E>>();
+  /** The operation running of each key, by its fiber. */
+  const runningOf = new Map<string, Fiber.Fiber<A, E>>();
   const runIn = yield* Scope.fork(scope);
   // Run before the scope's own closes runIn, as finalizers run in the reverse of their order.
   yield* Scope.addFinalizer(scope, Effect.suspend(() =>
@@ -73,8 +78,17 @@ export const makeOperations = Effect.fnUntraced(function*<A, E>(scope: Scope.Sco
         entries.set(key, { outcome: { state: "running" }, endedAt: null });
         const fiber = yield* operation.pipe(Effect.onExit(ended(key)), Effect.forkIn(runIn));
         running.add(fiber);
-        fiber.addObserver(() => running.delete(fiber));
+        runningOf.set(key, fiber);
+        fiber.addObserver(() => {
+          running.delete(fiber);
+          if (runningOf.get(key) === fiber) runningOf.delete(key);
+        });
       }),
     outcome: (key) => Effect.map(expire, () => entries.get(key)?.outcome ?? null),
+    outcomeWithin: (key, waitMs) =>
+      Effect.suspend(() => {
+        const fiber = runningOf.get(key);
+        return fiber === undefined ? Effect.void : Effect.asVoid(Effect.timeoutOption(Fiber.await(fiber), waitMs));
+      }).pipe(Effect.andThen(Effect.map(expire, () => entries.get(key)?.outcome ?? null))),
   };
 });
