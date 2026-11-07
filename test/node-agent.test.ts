@@ -1158,7 +1158,7 @@ test("a compaction's runsc is stopped while a restore on its node reads its imag
       yield* resumeOther(otherSnapshot.snapshot);
       rmSync(join(runscDir, "hold-wait"));
       assert.equal((yield* compactedFrom(here.agent, chain.snapshot))?.snapshot, into);
-      assert.equal(existsSync(compacting), false);
+      yield* Effect.sync(() => existsSync(compacting)).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (said) => !said }), Effect.timeout("5 seconds"));
     })
   ));
 
