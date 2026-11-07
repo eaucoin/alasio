@@ -78,6 +78,7 @@ import type { Manifest } from "../node-agent/agent.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { withLogScope } from "../shared/log.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
+import { RESTORE_RUNNING_WAIT_MS } from "../node-agent/names.ts";
 import { type GatewaySnapshots as SnapshotsConfig, ownDirectory, restorePodName } from "./names.ts";
 
 /** Why a session with a snapshot was resumed without it. */
@@ -169,12 +170,9 @@ const START_FAILURES: ReadonlySet<string> = new Set(["CrashLoopBackOff", "RunCon
  */
 const RESTORE_REFUSED = /OCI runtime restore failed|CompleteRestore|cannot restore container|restore[^;]*validat/iu;
 
-/** How long a restored pod is waited for to run its containers, its images pulled. */
-const POD_RUNNING_TIMEOUT_MS = 180_000;
 /**
- * How often a restore's pod is read while it is waited for: its sandbox, restored paused, waits
- * on the read that finds it running for its resume, a warm restore's about a second and a half
- * after its pod is made.
+ * How often a restore's pod is read while it is waited for to run, for a start that fails: its
+ * sandbox's resume waits on none of it, as its node's agent watches the pod itself.
  */
 const POD_POLL = "100 millis";
 /**
@@ -197,8 +195,8 @@ function tolerates(toleration: V1Toleration, taint: { readonly key: string; read
   return toleration.key === taint.key && (toleration.value ?? "") === (taint.value ?? "");
 }
 
-/** A restore's pod does not run its containers yet. */
-class PodNotRunning extends Schema.TaggedError<PodNotRunning>()("PodNotRunning", {}) {}
+/** A restore's pod does not run its containers yet, as it was read; or it was not read, why said. */
+class PodNotRunning extends Schema.TaggedError<PodNotRunning>()("PodNotRunning", { unread: Schema.optional(Schema.String) }) {}
 
 /** Why a restore's pod did not come back, whether its sandbox ran meanwhile, and whether its snapshot holds the session no more (as alasio's RestoreFailure). */
 class RestoreRefused extends Schema.TaggedError<RestoreRefused>()("RestoreRefused", {
@@ -353,15 +351,19 @@ export interface GatewaySnapshots {
 export const BaymaStatus = Schema.Struct({ execsRunning: Schema.Number, execsQueued: Schema.Number, idleSinceMs: Schema.NullOr(Schema.Number), generation: Schema.Number });
 export type BaymaStatus = typeof BaymaStatus.Type;
 
-/** What makeGatewaySnapshots is given: the node agents, how main's sessions are snapshotted, none where they are not, and main's sessions' namespace. */
+/**
+ * What makeGatewaySnapshots is given: the node agents, how main's sessions are snapshotted, none
+ * where they are not, main's sessions' namespace, and the port their pods' bayma serves on.
+ */
 export interface GatewaySnapshotsOptions {
   readonly agents: NodeAgents;
   readonly snapshots: SnapshotsConfig | null;
   readonly mainNamespace: string;
+  readonly port: number;
 }
 
 /** The gateway's snapshots, as the module says, on its node agents and the KubeClient, what they run in the background run while the scope lasts. */
-export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapshots, mainNamespace }: GatewaySnapshotsOptions): Effect.fn.Return<GatewaySnapshots, never, KubeClient | Scope.Scope> {
+export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapshots, mainNamespace, port }: GatewaySnapshotsOptions): Effect.fn.Return<GatewaySnapshots, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
   const scope = yield* Effect.scope;
   const ref = (pool: Pool, workspace: string) => ({ environment: pool.namespace, workspace });
@@ -568,19 +570,24 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
 
   /**
    * Why the restore's pod `pod` will not come back now, where it will not: it ended, or a
-   * container of it ended, or could not start, started again by kubelet only to fail; and
-   * whether what failed is the restore itself, runsc refusing the snapshot, as its container's
-   * message says (RESTORE_REFUSED), which no try restores, or what may pass, as a pull or a node's
-   * hiccup.
+   * container of it ended, or could not start, started again by kubelet only to fail; whether
+   * what failed is the restore itself, runsc refusing the snapshot, as its container's message
+   * says (RESTORE_REFUSED), which no try restores, or what may pass, as a pull or a node's
+   * hiccup; and whether a container of it ran meanwhile, its sandbox restored, which its node's
+   * agent, resuming it once it runs, may have resumed.
    */
-  const failedStart = (pod: V1Pod | null): { readonly why: string; readonly refused: boolean } | null => {
-    if (pod?.status?.phase === "Failed" || pod?.status?.phase === "Succeeded") return { why: `its pod ended (${pod.status.reason ?? pod.status.phase})`, refused: false };
-    for (const status of [...(pod?.status?.initContainerStatuses ?? []), ...(pod?.status?.containerStatuses ?? [])]) {
+  const failedStart = (pod: V1Pod | null): { readonly why: string; readonly refused: boolean; readonly ran: boolean } | null => {
+    const statuses = [...(pod?.status?.initContainerStatuses ?? []), ...(pod?.status?.containerStatuses ?? [])];
+    // One that ended had run where it says when it started, which one that could not start does not, or as the epoch.
+    const started = (ended: { readonly startedAt?: unknown } | undefined) => ended?.startedAt !== undefined && Date.parse(String(ended.startedAt)) > 0;
+    const ran = statuses.some(({ state, lastState }) => state?.running !== undefined || started(state?.terminated) || started(lastState?.terminated));
+    if (pod?.status?.phase === "Failed" || pod?.status?.phase === "Succeeded") return { why: `its pod ended (${pod.status.reason ?? pod.status.phase})`, refused: false, ran };
+    for (const status of statuses) {
       const ended = status.state?.terminated;
       const before = status.lastState?.terminated;
       const waiting = status.state?.waiting;
       const said = [ended?.message, before?.message, waiting?.message].filter((message) => message !== undefined).join("; ");
-      const failure = (why: string) => ({ why: `its ${status.name} ${why}`, refused: RESTORE_REFUSED.test(said) });
+      const failure = (why: string) => ({ why: `its ${status.name} ${why}`, refused: RESTORE_REFUSED.test(said), ran });
       if (ended) return failure(`ended (${ended.message ?? ended.reason ?? ended.exitCode})`);
       if (status.restartCount > 0 || before) return failure(`could not start (${before?.message ?? before?.reason ?? "started again"})`);
       if (waiting?.reason !== undefined && START_FAILURES.has(waiting.reason)) return failure(`could not start (${waiting.message ?? waiting.reason})`);
@@ -588,51 +595,69 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
     return null;
   };
 
-  /** The restore's pod `name` of `pool`, once `until` holds of it, `what` it waits for; refused where it will not come back now (failedStart), never to be tried again where runsc refused its restore, and refused where it does not within POD_RUNNING_TIMEOUT_MS. */
+  /**
+   * The restore's pod `name` of `pool`, once `until` holds of it, `what` it waits for; refused where it will not come back
+   * now (failedStart), never to be tried again where runsc refused its restore, and refused where it does not within
+   * RESTORE_RUNNING_WAIT_MS. A read that fails is read again, as one that finds it not yet so is: it says nothing of the
+   * pod, whose node's agent may have resumed it meanwhile, so one refused as the last of its reads failed is taken as resumed.
+   */
   const podOnce = (pool: Pool, name: string, until: (pod: V1Pod) => boolean, what: string): Effect.Effect<V1Pod, RestoreRefused> =>
     podOf(pool, name).pipe(
       Effect.flatMap((pod): Effect.Effect<V1Pod, PodNotRunning | RestoreRefused> => {
         const failed = failedStart(pod);
-        if (failed !== null) return Effect.fail(new RestoreRefused({ reason: failed.why, resumed: false, failed: failed.refused }));
-        return pod && until(pod) ? Effect.succeed(pod) : Effect.fail(new PodNotRunning());
+        // One that ran may have been resumed meanwhile by its node's agent, which resumes it once it runs.
+        if (failed !== null) return Effect.fail(new RestoreRefused({ reason: failed.why, resumed: failed.ran, failed: failed.refused }));
+        return pod && until(pod) ? Effect.succeed(pod) : Effect.fail(new PodNotRunning({}));
       }),
-      Effect.retry({ while: (error) => error._tag === "PodNotRunning", schedule: Schedule.max([Schedule.spaced(POD_POLL), Schedule.during(POD_RUNNING_TIMEOUT_MS)]) }),
-      Effect.catchTag("PodNotRunning", () => Effect.fail(new RestoreRefused({ reason: `its pod did not ${what} within ${POD_RUNNING_TIMEOUT_MS / 1000} s`, resumed: false }))),
-      Effect.catchTag("KubeApiError", (error) => Effect.fail(new RestoreRefused({ reason: error.message, resumed: false }))),
+      Effect.catchTag("KubeApiError", (error) => Effect.fail(new PodNotRunning({ unread: error.message }))),
+      Effect.retry({ while: (error) => error._tag === "PodNotRunning", schedule: Schedule.max([Schedule.spaced(POD_POLL), Schedule.during(RESTORE_RUNNING_WAIT_MS)]) }),
+      Effect.catchTag("PodNotRunning", ({ unread }) =>
+        Effect.fail(
+          new RestoreRefused(
+            unread === undefined
+              ? { reason: `its pod did not ${what} within ${RESTORE_RUNNING_WAIT_MS / 1000} s`, resumed: false }
+              : { reason: `its pod could not be read for ${RESTORE_RUNNING_WAIT_MS / 1000} s: ${unread}`, resumed: true },
+          ),
+        )
+      ),
     );
 
   /**
    * Lets the restored pod `name`, on `node`, restored from `snapshot`, of images of `bytes`
-   * together, its workspace attached before it was made, run: once its containers run, paused,
-   * its node's agent resumes its sandbox once the pod's egress is confined there, waited for as
-   * long as reading those images may take, and the pod is then ready, by its readiness gate, and its
-   * workspace's record of its release cleared beside it. A pod that ends meanwhile, or cannot
-   * start, whose sandbox the agent does not resume, or whose readiness cannot be set, is refused.
+   * together, of `labels`, its workspace attached before it was made, run: its node's agent,
+   * asked at once, resumes its sandbox, paused, once the pod runs its containers and its egress
+   * is confined there, waited for as long as reading those images may take, and answers once
+   * the pod accepts connections on the port its bayma serves on, as kubelet's readiness probe
+   * would find it ready; the pod is then ready, by its readiness gate, which its bind serves on
+   * (../binder/bindings.ts serving), and its workspace's record of its release cleared beside it.
+   * A pod that ends meanwhile, or cannot start, as it is read until it runs, whose sandbox the
+   * agent does not resume, or whose readiness cannot be set, is refused.
    */
-  const resumeRestored = (pool: Pool, workspace: string, name: string, node: string, snapshot: string, bytes: number): Effect.Effect<void, RestoreRefused> =>
+  const resumeRestored = (pool: Pool, workspace: string, name: string, node: string, snapshot: string, bytes: number, labels: Readonly<Record<string, string>>): Effect.Effect<void, RestoreRefused> =>
     Effect.gen(function*() {
-      const running = yield* podOnce(
-        pool,
-        name,
-        (pod) => (pod.status?.containerStatuses ?? []).length > 0 && (pod.status?.containerStatuses ?? []).every(({ state }) => state?.running) && (pod.status?.podIPs?.length ?? 0) > 0,
-        "run",
-      );
-      const containerIds = (running.status?.containerStatuses ?? []).flatMap(({ containerID }) => (containerID ? [containerID.replace(/^[a-z]+:\/\//u, "")] : []));
-      const podIPs = (running.status?.podIPs ?? []).map(({ ip }) => ip);
-      // The policies that select it, which its node's rules for it must name.
+      // The policies that select it, as the labels it was made with say, which its node's rules for it must name.
       const policies = yield* kube.list("networking.k8s.io/v1", "NetworkPolicy", pool.namespace, "").pipe(
-        Effect.map((found) => (found as V1NetworkPolicy[]).filter(({ spec }) => selects(spec?.podSelector, running.metadata?.labels ?? {})).flatMap(({ metadata }) => metadata?.name ?? [])),
+        Effect.map((found) => (found as V1NetworkPolicy[]).filter(({ spec }) => selects(spec?.podSelector, labels)).flatMap(({ metadata }) => metadata?.name ?? [])),
         Effect.mapError((error) => new RestoreRefused({ reason: error.message, resumed: false })),
       );
-      // Paused where its policies are not in force (504), or where the bucket fails (502), which
-      // may pass; of any other failure its sandbox may have run; paused, too, where the snapshot
-      // was taken live and holds the session no more (410), which no try restores.
-      yield* agents.resume(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, podIPs, containerIds, policies, snapshot }, bytes).pipe(
+      // Paused where its pod does not run, or goes, or its policies are not in force (504), where
+      // the API server cannot be asked of it (503), or where the bucket fails (502), which may
+      // pass; paused, too, where the snapshot was taken live and holds the session no more (410),
+      // which no try restores, and where the agent refused the request itself (4xx), or it was
+      // never sent, its agent unknown to the API server. Its sandbox may have run where a command
+      // failed, or the pod did not accept once resumed (500), and where the call failed unanswered.
+      const resumed = agents.resume(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, policies, snapshot, port }, bytes).pipe(
         Effect.mapError((error) => {
           const status = error._tag === "NodeAgentError" ? error.status : undefined;
-          return new RestoreRefused({ reason: error.message, resumed: status !== 502 && status !== 504 && status !== 410, ...(status === 410 ? { stale: true } : {}) });
+          const ran = error._tag === "NodeAgentError" && (status === undefined || status === 500);
+          return new RestoreRefused({ reason: error.message, resumed: ran, ...(status === 410 ? { stale: true } : {}) });
         }),
       );
+      // Read until it runs, as its agent waits for it to: one that cannot start is refused, its agent's wait given up.
+      const started = podOnce(pool, name, (pod) => (pod.status?.containerStatuses ?? []).length > 0 && (pod.status?.containerStatuses ?? []).every(({ state }) => state?.running), "run").pipe(
+        Effect.andThen(Effect.never),
+      );
+      yield* Effect.raceFirst(resumed, started);
       const now = new Date(yield* Clock.currentTimeMillis).toISOString();
       // Released into none, until its next release, before its bind is through, while its binding's Lease is still this
       // bind's, as no release of it may read its record before it is cleared: a record that names its snapshot is never read
@@ -723,7 +748,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
 
   const restoring = (pool: Pool, workspace: string, mode: "none" | "full", attaching: Attaching): Restoring => {
     /** What this bind's maker restored, which its pod's readying resumes. */
-    let restored: { readonly pod: string; readonly node: string; readonly snapshot: string; readonly bytes: number; readonly manifest: Manifest; readonly started: number } | null = null;
+    let restored: { readonly pod: string; readonly node: string; readonly snapshot: string; readonly bytes: number; readonly manifest: Manifest; readonly labels: Readonly<Record<string, string>>; readonly started: number } | null = null;
 
     const make: MakePod = (labels, annotations, binding) =>
       Effect.gen(function*() {
@@ -802,7 +827,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             Effect.tapError(() => attaching.detach(node, name)),
             Effect.mapError((error) => new BindStepFailed({ reason: `its restore's pod could not be made: ${error.message}` })),
           );
-          restored = { pod: pod.metadata?.name ?? "", node, snapshot: manifest.snapshot, bytes: manifest.bytes, manifest, started };
+          restored = { pod: pod.metadata?.name ?? "", node, snapshot: manifest.snapshot, bytes: manifest.bytes, manifest, labels: pod.metadata?.labels ?? {}, started };
           return pod;
         }
         // Gone or corrupt (404, 422), or of no node's (409), it never restores; otherwise it may yet.
@@ -820,7 +845,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       Effect.gen(function*() {
         const of = restored;
         if (of === null || of.pod !== pod.metadata?.name) return yield* attach(pod);
-        const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot, of.bytes).pipe(Effect.result);
+        const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot, of.bytes, of.labels).pipe(Effect.result);
         if (done._tag === "Success") {
           const now = yield* Clock.currentTimeMillis;
           deferredSince.delete(named(pool, workspace));

@@ -68,15 +68,24 @@ export const restarted = (pod: V1Pod): boolean =>
 
 /**
  * Whether `pod` runs ready, and is not being deleted: serving its binding. Ready as kubelet says
- * it, or as kubelet's own rule has it before kubelet next writes it: its containers ready and
- * every condition its readiness gates name true. kubelet takes a condition set through the API
- * server a second or more after it is set, as a restore's pod's resumed one, set once its
- * sandbox runs (src/gateway/snapshots.ts), whose bind would otherwise wait on it.
+ * it; or, of a pod of readiness gates, once every condition they name is true, whatever kubelet
+ * said of its containers before the last of them was set: what sets them checks the pod serves
+ * before it does, as a restore's pod's resumed one is set once its node's agent found it accepting
+ * on its port, as kubelet's probe would (src/gateway/snapshots.ts). kubelet takes a condition set
+ * through the API server a second or more after it is set, and runs its readiness probe of a
+ * container started before the pod could serve only every probe period, either of which a bind
+ * would otherwise wait on. Its containers unready since, as of the same second or later, as the
+ * API server keeps a condition's time, as a probe that fails after makes them, it serves no more.
  */
 export const serving = (pod: V1Pod): boolean => {
-  const holds = (type: string) => (pod.status?.conditions ?? []).some((condition) => condition.type === type && condition.status === "True");
+  const conditions = pod.status?.conditions ?? [];
+  const holds = (type: string) => conditions.some((condition) => condition.type === type && condition.status === "True");
+  /** When the condition `type` last changed, in milliseconds since the epoch: 0 where it has not been said. */
+  const changedAt = (type: string) => new Date(conditions.find((condition) => condition.type === type)?.lastTransitionTime ?? 0).getTime() || 0;
   const gates = pod.spec?.readinessGates ?? [];
-  return running(pod) && (holds("Ready") || (gates.length > 0 && holds("ContainersReady") && gates.every(({ conditionType }) => holds(conditionType))));
+  const gated = gates.length > 0 && gates.every(({ conditionType }) => holds(conditionType));
+  const unreadySince = conditions.some(({ type, status }) => type === "ContainersReady" && status !== "True") ? changedAt("ContainersReady") : null;
+  return running(pod) && (holds("Ready") || (gated && (unreadySince === null || unreadySince < Math.max(...gates.map(({ conditionType }) => changedAt(conditionType))))));
 };
 
 /** A Lease as the API holds it, by its key: null where there is none. */

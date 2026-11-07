@@ -65,6 +65,7 @@ export function workspacesNode({ quotaHeldWithinMs = 1_000, orphanGraceMs = 0 }:
           return { exitCode: 0, stdout: "", stderr: "" };
         }),
       ),
+    inNetwork: () => Effect.die("nothing is run in the node's network"),
   };
   // JuiceFS's command, as a stand-in: each call's arguments and password logged, each directory's quota kept in a file of its own.
   const juicefs = join(root, "juicefs");

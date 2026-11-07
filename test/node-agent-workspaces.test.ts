@@ -32,7 +32,7 @@ test("what is attached into a pod is looked at in the node's mount namespace, wh
     ["/attach/pool-2/ws", { exitCode: 2, stdout: "", stderr: "ls: cannot access '/attach/pool-2/ws': Input/output error\n" }],
     ["/attach/pool-3/ws", { exitCode: 1, stdout: "", stderr: "ls: /attach/pool-3/ws: Permission denied\n" }],
   ]);
-  const host = { run: (command: readonly string[]) => Effect.sync(() => (ran.push(command.join(" ")), said.get(command.at(-1) ?? "") ?? { exitCode: 0, stdout: "", stderr: "" })) };
+  const host = { run: (command: readonly string[]) => Effect.sync(() => (ran.push(command.join(" ")), said.get(command.at(-1) ?? "") ?? { exitCode: 0, stdout: "", stderr: "" })), inNetwork: () => Effect.die("nothing is run in the node's network") };
   const reaches = reaching(lookOnNode(host));
   assert.deepEqual(await Promise.all([0, 1, 2, 3].map((n) => reaches(`/attach/pool-${n}/ws`))), [true, false, false, true]);
   assert.equal(ran[0], "ls -d -- /attach/pool-0/ws");

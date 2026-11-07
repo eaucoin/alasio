@@ -40,17 +40,21 @@
  *   makes the current snapshot of `from` that of `to` too, copied in the bucket, as a
  *   session forked from another restores what the other was: `to`'s manifest (200). 404
  *   when `from` has none; 502 when the bucket failed, which leaves `to` without a snapshot.
- * - `POST /resume`, `{ environment, workspace, namespace, pod, podIPs, containerIds,
- *   policies, snapshot }`: resumes the workspace's sandbox, restored paused from
- *   `snapshot` in the pod `namespace`/`pod` on this node, once the pod's network policies, `policies`, are in
- *   force here for each of its addresses `podIPs` (./kube-router.ts): the connections tracked from
- *   them forgotten, then each of its containers `containerIds` (containerd's ids) resumed
- *   (204). 504 when its policies were not in force within the agent's wait, saying for
- *   which address what was missing, its sandbox left paused; 410 when it was restored from
- *   a snapshot taken live that holds the session no more, bayma's state generation having
- *   moved on since, or that cannot be told, or from one whose manifest no node or bucket
- *   holds, its sandbox left paused; 502 when the bucket failed to give that manifest, its
- *   sandbox left paused; 500 when a command failed.
+ * - `POST /resume`, `{ environment, workspace, namespace, pod, policies, snapshot, port }`:
+ *   resumes the workspace's sandbox, restored paused from `snapshot` in the pod
+ *   `namespace`/`pod` on this node, asked as the pod is made: once the pod runs each of its
+ *   containers, as the API server says it, and the pod's network policies, `policies`, are in
+ *   force here for each of its addresses (./kube-router.ts), the connections tracked from them
+ *   forgotten, then each of its containers resumed; answered once the pod accepts connections
+ *   on `port`, its bayma's, from the node, as kubelet's readiness probe would find it ready
+ *   (204). 504 when the pod did not run within the agent's wait, or went, or its policies
+ *   were not in force within it, saying for which address what was missing, its sandbox left
+ *   paused; 503 when the API server could not be asked of the pod, its sandbox left paused;
+ *   410 when it was restored from a snapshot taken live that holds the session no more,
+ *   bayma's state generation having moved on since, or that cannot be told, or from one whose
+ *   manifest no node or bucket holds, its sandbox left paused; 502 when the bucket failed to
+ *   give that manifest, its sandbox left paused; 500 when a command failed, or the pod did not
+ *   accept connections once resumed.
  * - `POST /abandon`, `{ environment, workspace, namespace, pod, uid }`: abandons the
  *   workspace's restore into the pod `namespace`/`pod` of the uid `uid` on this node, which
  *   alasio refused before it resumed its sandbox: kills each process runsc runs for the pod's containers, their
@@ -137,10 +141,11 @@
 import { createServer } from "node:http";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
-import { Cause, Config, Deferred, Effect, Option, Redacted, Schema, type Scope } from "effect";
+import type { V1Pod } from "@kubernetes/client-node";
+import { Cause, Config, Deferred, Effect, Option, Redacted, Schema, type Scope, Stream } from "effect";
 import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 
-import { KubeClient } from "../kube/client.ts";
+import { INITIAL_EVENTS_END, type KubeApiError, KubeClient } from "../kube/client.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken, sameToken } from "../shared/tokens.ts";
 import {
@@ -238,6 +243,8 @@ const STATUS: Readonly<Record<string, number>> = {
   AgentStopping: 503,
   SnapshotOutlived: 410,
   PoliciesNotInForce: 504,
+  PodNotRunning: 504,
+  KubeApiError: 503,
   SandboxUnsaveable: 410,
   JuicefsError: 503,
 };
@@ -469,6 +476,30 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
   return { port: server.address._tag === "UnixPathAddress" ? port : server.address.port };
 });
 
+/**
+ * The pod `name` of `namespace` as `kube` watches it, by its name alone: as it is once listed,
+ * then each time it changes; null where it is not there once it was listed, and once it is
+ * deleted. The stream ends as the watch does, now and then.
+ */
+export const podChanges = (kube: KubeClient["Service"]) => (namespace: string, name: string): Stream.Stream<V1Pod | null, KubeApiError> =>
+  Stream.suspend(() => {
+    let listed = false;
+    let there = false;
+    return kube.watch("v1", "pods", namespace, "", undefined, `metadata.name=${name}`).pipe(
+      Stream.map(({ type, object }): V1Pod | null | undefined => {
+        if (type === "BOOKMARK") {
+          // The list's end alone, which a bookmark of the list says, tells of one not there.
+          if (listed || object.metadata?.annotations?.[INITIAL_EVENTS_END] !== "true") return undefined;
+          listed = true;
+          return there ? undefined : null;
+        }
+        there = type !== "DELETED";
+        return there ? (object as V1Pod) : null;
+      }),
+      Stream.filter((pod): pod is V1Pod | null => pod !== undefined),
+    );
+  });
+
 /** The bucket the agent keeps snapshots in, as its Secret gives it (S3_*, AWS_*). */
 const BucketConfig = Config.all({
   endpoint: Config.String("S3_ENDPOINT"),
@@ -519,6 +550,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const storeProxy = yield* makeStoreProxy({ store: { ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }, host: podIP, port: STORE_PROXY_PORT, socket: storeSocket(runDir), tokensFile: storeTokensFile(runDir) });
   const runsc = makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT, current });
   const host = makeHostCommands();
+  const kube = yield* Effect.provide(Effect.service(KubeClient), KubeClient.layer);
   const agent = yield* makeNodeAgent({
     node,
     nodeRoot: NODE_ROOT,
@@ -529,6 +561,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     host,
     restoresFromBucketSince,
     backgroundReadMs: backgroundReadSeconds * 1000,
+    pods: podChanges(kube),
   });
   // Workspace storage's metadata engine, where the agent is given it, which it sets quotas on alone.
   const metaUrl = yield* Config.option(Config.Redacted(META_URL_VARIABLE));

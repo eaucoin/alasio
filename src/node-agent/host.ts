@@ -2,9 +2,10 @@
  * Commands run on the node itself, as its own processes run them: in the namespaces of
  * its PID 1, which the agent sees as it runs in the node's PID namespace, its mounts (so
  * the node's own binaries) and its network (so its packet filter and connection
- * tracking), entered with nsenter. nsenter is util-linux's, which every Ubuntu image has,
- * alasio's (../../Dockerfile) among them; what it runs is the node's, iptables and
- * conntrack among them, so the image needs neither.
+ * tracking), entered with nsenter; or, the agent's own binaries, in its network alone, as
+ * the node reaches its pods. nsenter is util-linux's, which every Ubuntu image has,
+ * alasio's (../../Dockerfile) among them; what it runs on the node is the node's, iptables
+ * and conntrack among them, so the image needs neither.
  */
 import { execFile } from "node:child_process";
 
@@ -43,6 +44,11 @@ export class HostCommandError extends Schema.TaggedError<HostCommandError>()("Ho
 export interface HostCommands {
   /** Runs `command` on the node: how it exited, whatever its status; fails when it could not be run. */
   readonly run: (command: readonly string[]) => Effect.Effect<HostRun, HostCommandError>;
+  /**
+   * Runs `command`, of the agent's own image, in the node's network alone, as the node itself
+   * reaches its pods: how it exited, whatever its status; fails when it could not be run.
+   */
+  readonly inNetwork: (command: readonly string[]) => Effect.Effect<HostRun, HostCommandError>;
 }
 
 /** The image's nsenter. */
@@ -53,19 +59,23 @@ const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 /** Commands run on the node, as the module says, entering it with `nsenter`. */
 export function makeHostCommands(nsenter = NSENTER): HostCommands {
+  /** Runs `command` in the namespaces of the node's PID 1 `entered` names, as `run` says. */
+  const entering = (entered: readonly string[]) => (command: readonly string[]): Effect.Effect<HostRun, HostCommandError> =>
+    Effect.tryPromise({
+      try: (signal) =>
+        new Promise<HostRun>((resolve, reject) => {
+          execFile(nsenter, ["--target", "1", ...entered, "--", ...command], { env: { PATH: NODE_PATH }, signal, maxBuffer: MAX_OUTPUT_BYTES }, (error, stdout, stderr) => {
+            // A status of its own is the command's, or nsenter's when it could not run it (126, 127).
+            if (error === null || typeof error.code === "number") resolve({ exitCode: typeof error?.code === "number" ? error.code : 0, stdout, stderr });
+            else reject(error);
+          });
+        }),
+      catch: (cause) => new HostCommandError({ command: command.join(" "), reason: cause instanceof Error ? cause.message : String(cause) }),
+    });
   return {
-    run: (command) =>
-      Effect.tryPromise({
-        try: (signal) =>
-          new Promise<HostRun>((resolve, reject) => {
-            execFile(nsenter, ["--target", "1", "--mount", "--net", "--", ...command], { env: { PATH: NODE_PATH }, signal, maxBuffer: MAX_OUTPUT_BYTES }, (error, stdout, stderr) => {
-              // A status of its own is the command's, or nsenter's when it could not run it (126, 127).
-              if (error === null || typeof error.code === "number") resolve({ exitCode: typeof error?.code === "number" ? error.code : 0, stdout, stderr });
-              else reject(error);
-            });
-          }),
-        catch: (cause) => new HostCommandError({ command: command.join(" "), reason: cause instanceof Error ? cause.message : String(cause) }),
-      }),
+    run: entering(["--mount", "--net"]),
+    // Its mounts the agent's, so of its own binaries those of NODE_PATH's directories.
+    inNetwork: entering(["--net"]),
   };
 }
 

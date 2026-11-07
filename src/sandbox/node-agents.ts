@@ -103,10 +103,12 @@ export interface NodeAgents {
   /** Collects what of the workspace's in the bucket no snapshot needs any more: the digests of the images kept. */
   readonly collect: (workspace: WorkspaceRef) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
   /**
-   * Resumes the sandbox `request` names, restored paused in its pod on `node`, once the
-   * pod's network policies are in force there, from images of `bytes` together, which its
-   * resume may wait on (resumeMs). An agent refuses one whose policies are not in force within
-   * its wait with 504, the sandbox left paused.
+   * Resumes the sandbox `request` names, restored paused in its pod on `node`, asked as the
+   * pod is made: once the pod runs, and its network policies are in force there, from images
+   * of `bytes` together, which its resume may wait on (resumeMs); answered once the pod accepts
+   * connections on its bayma's port, as kubelet's readiness probe would find it ready. An agent
+   * refuses one whose pod does not run, or whose policies are not in force, within its wait
+   * with 504, the sandbox left paused.
    */
   readonly resume: (node: string, request: ResumeRequest, bytes: number) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /**

@@ -233,15 +233,21 @@ test("a bind that makes its own pod makes it bound to the key from the first, gi
   assert.deepEqual(bindings, [bound.binding]);
 });
 
-test("a pod gated on a condition serves once its containers are ready and the condition holds, before kubelet says it ready, to a bind and to a look at its binding alike, and not before", async () => {
+test("a pod gated on a condition serves once the condition holds, whatever kubelet said of its containers before it was set, before kubelet says it ready, to a bind and to a look at its binding alike, and not before, nor once its containers are unready since", async () => {
   const of = await pool();
   const layer = binderOf({ waitMs: 3_000 });
   const key = "sessionfs:gated";
-  const status = (conditions: Record<string, string>) => ({
-    status: { phase: "Running", podIP: "10.42.0.251", conditions: Object.entries(conditions).map(([type, holds]) => ({ type, status: holds })) },
+  /** Each condition as it holds, and when it last changed, `[status, time]`, the API server keeping its time to the second. */
+  const status = (conditions: Record<string, string | readonly [string, string]>) => ({
+    status: {
+      phase: "Running",
+      podIP: "10.42.0.251",
+      conditions: Object.entries(conditions).map(([type, said]) => (typeof said === "string" ? { type, status: said } : { type, status: said[0], lastTransitionTime: said[1] })),
+    },
   });
-  const set = (conditions: Record<string, string>) => run(binder(), withKube((client) => client.patchPodStatus(of.namespace, "gated", status(conditions))));
-  // Made running, its containers ready, gated on alasio.dev/resumed, not yet set: kubelet says it unready.
+  const set = (conditions: Record<string, string | readonly [string, string]>) => run(binder(), withKube((client) => client.patchPodStatus(of.namespace, "gated", status(conditions))));
+  const [probed, resumed, later] = ["2026-11-08T10:00:00Z", "2026-11-08T10:00:02Z", "2026-11-08T10:00:05Z"];
+  // Made running, gated on alasio.dev/resumed, not yet set, its containers not ready, as a probe of kubelet's that failed before it could serve leaves them: kubelet says it unready.
   const bound = await bindIn(layer, (each) =>
     Effect.gen(function*() {
       const binding = yield* Effect.forkChild(each.bind(of, key, {
@@ -249,19 +255,21 @@ test("a pod gated on a condition serves once its containers are ready and the co
           withKube((client) =>
             client.create<V1Pod>({ apiVersion: "v1", kind: "Pod", metadata: { name: "gated", namespace: of.namespace, labels: { ...labels }, annotations: { ...annotations } }, spec: { containers: [{ name: "bayma", image: "agent" }], readinessGates: [{ conditionType: "alasio.dev/resumed" }] } })
           ).pipe(Effect.provide(binder())),
-        prepare: () => Effect.promise(() => set({ ContainersReady: "True", Ready: "False" })),
+        prepare: () => Effect.promise(() => set({ ContainersReady: ["False", probed], Ready: ["False", probed] })),
       }));
       // Not serving while its gate's condition does not hold.
       yield* Effect.sleep("1 second");
       assert.equal(binding.pollUnsafe(), undefined);
       assert.equal(yield* each.bound(of, key), null);
-      // Its condition set, kubelet not yet told: serving, to the bind waiting on it, and to a look at its binding.
-      yield* Effect.promise(() => set({ ContainersReady: "True", Ready: "False", "alasio.dev/resumed": "True" }));
+      // Its condition set, kubelet not yet told, nor its probe passed again: serving, to the bind waiting on it, and to a look at its binding.
+      yield* Effect.promise(() => set({ ContainersReady: ["False", probed], Ready: ["False", probed], "alasio.dev/resumed": ["True", resumed] }));
       const got = yield* Fiber.join(binding);
       assert.deepEqual(yield* each.bound(of, key), got);
-      // Its containers unready, as its probe failing makes them: serving no more, whatever its gate says.
-      yield* Effect.promise(() => set({ ContainersReady: "False", Ready: "False", "alasio.dev/resumed": "True" }));
-      assert.equal(yield* each.bound(of, key), null);
+      // Its containers unready since, as its probe failing after makes them, or within the second it was set: serving no more, whatever its gate says.
+      for (const since of [later, resumed]) {
+        yield* Effect.promise(() => set({ ContainersReady: ["False", since], Ready: ["False", since], "alasio.dev/resumed": ["True", resumed] }));
+        assert.equal(yield* each.bound(of, key), null, since);
+      }
       return got;
     })
   );

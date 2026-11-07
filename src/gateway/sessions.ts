@@ -174,7 +174,7 @@ export const makeSessions = Effect.fnUntraced(function*(
   binder: Binder["Service"],
 ): Effect.fn.Return<Sessions, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
-  const snapshots = yield* makeGatewaySnapshots({ agents, snapshots: snapshotsConfig, mainNamespace });
+  const snapshots = yield* makeGatewaySnapshots({ agents, snapshots: snapshotsConfig, mainNamespace, port: podPort });
   const pools = Effect.map(environments.current, (current) => current.flatMap(({ namespace }) => (Object.values(poolNames) as string[]).map((name): Pool => ({ name, namespace }))));
   /** The address `host` resolves to. */
   const addressOf = (host: string): Effect.Effect<string, BindStepFailed> =>
