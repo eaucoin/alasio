@@ -73,7 +73,11 @@
  *   them: `{ discarded }`, whether it did (200).
  * - `GET /holdings`: `{ node, releases: [{ release, cpuFeatures }], cached: [{ environment,
  *   workspace, images, bytes, usedAt }] }`: this node's gVisor releases, with the CPU
- *   features each sees on it, and the workspaces whose images its cache holds, by digest.
+ *   features each sees on it, and the workspaces whose images its cache holds, by digest,
+ *   tagged (its ETag, ./agent.ts holdingsTag) (200). Asked `If-None-Match` a tag, it answers
+ *   once what the node holds is other than what the tag names, as its cache changes, or at
+ *   once where it is; 304 where it is not within HOLDINGS_WAIT_MS, or as the agent stops:
+ *   what alasio keeps of each node's holdings follows the node's so.
  * - `POST /workspaces`, `{ environment, workspace, quotaBytes }`: makes the workspace, its
  *   directory and its quota (./workspaces.ts) (204); again, sets its quota anew.
  * - `POST /workspaces/clones`, `{ from, to, quotaBytes }`: makes the workspace `to`, of any
@@ -136,7 +140,7 @@
 import { createServer } from "node:http";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
-import { Cause, Config, Effect, Option, Redacted, Schema, type Scope } from "effect";
+import { Cause, Config, Deferred, Effect, Option, Redacted, Schema, type Scope } from "effect";
 import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { KubeClient } from "../kube/client.ts";
@@ -147,6 +151,7 @@ import {
   type CheckpointFailed,
   CheckpointRequest,
   CopyRequest,
+  holdingsTag,
   makeNodeAgent,
   type Manifest,
   type NodeAgent,
@@ -166,6 +171,7 @@ import {
   BACKGROUND_READ_SECONDS_VARIABLE,
   CONTAINERD,
   GVISOR_RELEASES,
+  HOLDINGS_WAIT_MS,
   META_URL_VARIABLE,
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
@@ -301,6 +307,8 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
   const checkpoints = yield* makeOperations<Manifest, CheckpointFailed | SandboxUnsaveable>(scope, failureOf);
   const prepares = yield* makeOperations<Prepared, PrepareError>(scope, failureOf);
   const started = answer(202, { state: "running" });
+  /** Done as the agent's API stops, before it waits for the requests under way to end: those held for a change (`GET /holdings`) are answered at once. */
+  const stopping = yield* Deferred.make<void>();
   /** How the operation of `operations` for the workspace a path names stands. */
   const outcome = <A, E>(operations: Operations<A, E>, path: RegExpExecArray) =>
     workspaceOf(path).pipe(
@@ -347,7 +355,17 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     if (method === "POST" && url === "/collect") {
       return body(WorkspaceRef).pipe(Effect.flatMap(agent.collect), Effect.map((kept) => answer(200, { kept })));
     }
-    if (method === "GET" && url === "/holdings") return agent.holdings.pipe(Effect.map((holdings) => answer(200, holdings)));
+    if (method === "GET" && url === "/holdings") {
+      // As of what the caller has, where it says it, once that is no more, or at once.
+      const seen = /^"([0-9a-f]{64})"$/u.exec(request.headers["if-none-match"] ?? "")?.[1];
+      return (seen === undefined ? agent.holdings : agent.holdingsAfter(seen, HOLDINGS_WAIT_MS).pipe(Effect.raceFirst(Effect.as(Deferred.await(stopping), null)))).pipe(
+        Effect.map((holdings) =>
+          holdings === null
+            ? HttpServerResponse.empty({ status: 304, headers: { etag: `"${seen}"` } })
+            : HttpServerResponse.jsonUnsafe(holdings, { status: 200, headers: { etag: `"${holdingsTag(holdings)}"` } })
+        ),
+      );
+    }
     const environment = ENVIRONMENT.exec(url);
     if (method === "GET" && environment) {
       return Schema.decodeUnknownEffect(WorkspaceRef.fields.environment)(decodeURIComponent(environment[1] ?? "")).pipe(
@@ -455,6 +473,8 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
 
   const server = yield* NodeHttpServer.make(() => createServer(), { port, host });
   yield* server.serve(handle);
+  // Run before the server's own stop, which waits for what is under way.
+  yield* Effect.addFinalizer(() => Deferred.succeed(stopping, undefined));
   // Listening on a TCP port, its address is an internet one.
   return { port: server.address._tag === "UnixPathAddress" ? port : server.address.port };
 });

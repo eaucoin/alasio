@@ -532,12 +532,13 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
    * The nodes that can restore `manifest` into a pod of `tolerations`, those holding its images
    * first: they have its release, with every CPU feature it was saved with, and take the pod;
    * whether every agent said what its node holds; and whether a node that has them is kept from
-   * the pod only by its readiness. Each node's agent, and each Node, is asked at once.
+   * the pod only by its readiness. What each node holds as its agent last said it (held), and
+   * each Node, are read at once.
    */
   const nodesFor = (manifest: Manifest, tolerations: readonly V1Toleration[]) =>
     Effect.gen(function*() {
       const found = yield* agents.nodes;
-      const held = yield* Effect.forEach(found, (node) => agents.holdings(node).pipe(Effect.map((holdings) => [holdings]), Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as([])))), { concurrency: "unbounded" });
+      const held = yield* Effect.forEach(found, (node) => agents.held(node).pipe(Effect.map((holdings) => [holdings]), Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as([])))), { concurrency: "unbounded" });
       const answered = found.length > 0 && held.every((each) => each.length > 0);
       const capable = held.flat().filter(({ releases: installed }) =>
         installed.some(({ release, cpuFeatures }) => release === manifest.release && manifest.cpuFeatures.every((feature) => cpuFeatures.includes(feature)))

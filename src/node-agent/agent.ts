@@ -74,7 +74,7 @@ import { dirname, join, posix, relative } from "node:path";
 import { pipeline } from "node:stream/promises";
 
 import type { BatchObservableResult } from "@opentelemetry/api";
-import { Clock, type Duration, Effect, FiberMap, Option, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
+import { Clock, Deferred, type Duration, Effect, FiberMap, Option, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import { quantityOf } from "../kube/quantity.ts";
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
@@ -318,6 +318,9 @@ export interface Holdings {
   readonly cached: readonly { readonly environment: string; readonly workspace: string; readonly images: readonly string[]; readonly bytes: number; readonly usedAt: string }[];
 }
 
+/** The tag of what a node holds, `holdings`, which changes as it does: its SHA-256, in hex. Pure, for tests. */
+export const holdingsTag = (holdings: Holdings): string => createHash("sha256").update(JSON.stringify(holdings)).digest("hex");
+
 /** A workspace has no current snapshot. */
 export class NoSnapshot extends Schema.TaggedError<NoSnapshot>()("NoSnapshot", {
   environment: Schema.String,
@@ -492,6 +495,11 @@ export interface NodeAgent {
   /** Abandons the workspace's restore into a pod on this node, alasio having refused it before its resume, as the module says: what it killed. */
   readonly abandon: (request: AbandonRequest) => Effect.Effect<readonly Killed[], RunscError>;
   readonly holdings: Effect.Effect<Holdings, RunscError | ReleaseNotInstalled | CacheError>;
+  /**
+   * What this node holds, once it is other than what the tag `seen` names (holdingsTag), as
+   * its cache changes, or at once where it is; null where it is not within `waitMs`.
+   */
+  readonly holdingsAfter: (seen: string, waitMs: number) => Effect.Effect<Holdings | null, RunscError | ReleaseNotInstalled | CacheError>;
 }
 
 /**
@@ -745,12 +753,38 @@ export function memoryLimitOf(podTemplate: Readonly<Record<string, unknown>>): n
   }, 0);
 }
 
+/**
+ * `cache`, `changed` run after each of its calls that may change what it holds, the images of
+ * its workspaces, their bytes, or when each was used, whatever came of the call.
+ */
+function telling(cache: SnapshotCache, changed: Effect.Effect<void>): SnapshotCache {
+  const told = <Args extends readonly unknown[], A, E>(call: (...args: Args) => Effect.Effect<A, E>) => (...args: Args) => call(...args).pipe(Effect.ensuring(changed));
+  return {
+    ...cache,
+    stage: told(cache.stage),
+    commit: told(cache.commit),
+    prepare: told(cache.prepare),
+    prepareRemote: told(cache.prepareRemote),
+    drop: told(cache.drop),
+    clear: told(cache.clear),
+    discard: told(cache.discard),
+    evict: told(cache.evict),
+    room: told(cache.room),
+  };
+}
+
 /** `run`, on the node's disk, failing as the cache does. */
 const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache, bucket, storeProxy, host, restoresFromBucketSince, backgroundReadMs, inspectTimeoutMs = INSPECT_TIMEOUT_MS }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, backgroundReadMs, inspectTimeoutMs = INSPECT_TIMEOUT_MS }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+  /** Done as what the cache holds next may change, then made anew: what holdingsAfter waits on. */
+  let cacheChanged = Deferred.makeUnsafe<void>();
+  const cache = telling(given, Effect.sync(() => {
+    Deferred.doneUnsafe(cacheChanged, Effect.void);
+    cacheChanged = Deferred.makeUnsafe<void>();
+  }));
   const locks = yield* RcMap.make({ lookup: (_workspace: string) => Semaphore.make(1) });
   /** One fetch of each workspace's images at a time (fetchLater), beside its operations. */
   const fetchLocks = yield* RcMap.make({ lookup: (_workspace: string) => Semaphore.make(1) });
@@ -1890,6 +1924,20 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     return { node, releases, cached };
   });
 
+  const holdingsAfter = (seen: string, waitMs: number): Effect.Effect<Holdings | null, RunscError | ReleaseNotInstalled | CacheError> =>
+    Effect.gen(function*() {
+      const deadline = (yield* Clock.currentTimeMillis) + waitMs;
+      for (;;) {
+        // The change to come taken before it is read, so one as it is read is not missed.
+        const next = cacheChanged;
+        const now = yield* holdings;
+        if (holdingsTag(now) !== seen) return now;
+        const left = deadline - (yield* Clock.currentTimeMillis);
+        if (left <= 0) return null;
+        yield* Deferred.await(next).pipe(Effect.timeoutOption(left));
+      }
+    });
+
   // The cache returns within its budget on its own too, as what was used within the grace passes it, though no checkpoint or prepare runs.
   yield* evict.pipe(
     Effect.catch((error) => Effect.logWarning(error.message)),
@@ -1938,6 +1986,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     resume: (request) => resume(request).pipe(withLogScope("node-agent")),
     abandon: (request) => abandon(request).pipe(withLogScope("node-agent")),
     holdings,
+    holdingsAfter,
     workspaces: (environment) =>
       bucket.list(`${environment}/`).pipe(
         // What else the bucket holds under it is no workspace's of the agent's.

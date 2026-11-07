@@ -10,7 +10,7 @@ import { FetchHttpClient } from "effect/http";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { Gofer } from "../node-agent/names.ts";
 import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, type PrepareRequest, type ResumeRequest, resumeMs, type WorkspaceRef } from "../node-agent/agent.ts";
-import { NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
+import { HOLDINGS_WAIT_MS, NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
 import { type PodOwner, Released, type StopRequest, type SyncRequest } from "../node-agent/workspaces.ts";
 
 /** Where the node agents are: their pods' namespace and labels, and the port they serve on. */
@@ -40,6 +40,12 @@ export const Holdings = Schema.Struct({
   cached: Schema.Array(Schema.Struct({ environment: Schema.String, workspace: Schema.String, images: Schema.Array(Schema.String), bytes: Schema.Number, usedAt: Schema.String })),
 });
 export type Holdings = typeof Holdings.Type;
+
+/** What a node holds, and the tag its agent says it with, which changes as it does (../node-agent/agent.ts holdingsTag). */
+interface TaggedHoldings {
+  readonly holdings: Holdings;
+  readonly tag: string;
+}
 
 /** A snapshot prepared on a node: what it is, and where its image is there. */
 const Prepared = Schema.Struct({ manifest: Manifest, imagePath: Schema.String, source: Schema.Literals(["cache", "bucket"]) });
@@ -110,8 +116,14 @@ export interface NodeAgents {
    * that its teardown waits on none of it. What it killed.
    */
   readonly abandon: (node: string, request: AbandonRequest) => Effect.Effect<readonly Killed[], NodeAgentError | KubeApiError>;
-  /** What `node` holds. */
+  /** What `node` holds, as its agent says it now. */
   readonly holdings: (node: string) => Effect.Effect<Holdings, NodeAgentError | KubeApiError>;
+  /**
+   * What `node` holds, as its agent last said it: kept as it changes, by a request its agent
+   * answers once it does (watchHoldings), so a restore's choice of its node asks no agent;
+   * asked of its agent where none is kept yet, as of an agent that has just started.
+   */
+  readonly held: (node: string) => Effect.Effect<Holdings, NodeAgentError | KubeApiError>;
   /** The workspaces of `environment` the bucket holds anything of. */
   readonly workspaces: (environment: string) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
   /** Has `node`'s cache discard the workspace's images but `keep`, unless a restore there may be reading them: whether it did. */
@@ -203,10 +215,16 @@ const OPERATION_POLLS = Schedule.min([Schedule.exponential("25 millis"), Schedul
 const ADDRESSES_TTL: Duration.Input = "1 second";
 /** How long any other call may take. */
 const SHORT_CALL: Duration.Input = "30 seconds";
+/** How long a request for what a node holds, asked as of a tag, may take: as long as its agent holds it, and as long as any other call beside. */
+const HOLDINGS_CALL: Duration.Input = Duration.millis(HOLDINGS_WAIT_MS + Duration.toMillis(SHORT_CALL));
 /** How long a sandbox's sync may take: what it writes through, which the agent waits a minute for. */
 const SYNC_CALL: Duration.Input = "90 seconds";
 
-/** A call of an agent: what, with what (JSON, or bytes as they are), for how long; with `absent`, a 404 is an answer, not a failure. */
+/**
+ * A call of an agent: what, with what (JSON, or bytes as they are), for how long; with
+ * `absent`, a 404 is an answer, not a failure; with `seen`, asked as of what the tag names
+ * (If-None-Match), a 304 is an answer too.
+ */
 interface AgentCall {
   readonly method: "GET" | "POST" | "PUT" | "DELETE";
   readonly path: string;
@@ -214,6 +232,7 @@ interface AgentCall {
   readonly bytes?: Uint8Array;
   readonly timeout: Duration.Input;
   readonly absent?: true;
+  readonly seen?: string;
 }
 
 /** Whether `pod` runs, ready, with an address. */
@@ -238,25 +257,27 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     Effect.cachedWithTTL((exit) => (Exit.isSuccess(exit) ? ADDRESSES_TTL : Duration.zero)),
   );
 
-  /** A call of the agent of `node`, `what` it is asked as a sentence ends: its answer's status, bytes and text, or why it failed. */
-  const send = (node: string, what: string, request: AgentCall): Effect.Effect<{ readonly status: number; readonly bytes: Uint8Array; readonly text: string }, NodeAgentError | KubeApiError> =>
+  /** A call of the agent of `node`, `what` it is asked as a sentence ends: its answer's status, bytes, text and tag (its ETag), or why it failed. */
+  const send = (node: string, what: string, request: AgentCall): Effect.Effect<{ readonly status: number; readonly bytes: Uint8Array; readonly text: string; readonly tag: string | null }, NodeAgentError | KubeApiError> =>
     Effect.gen(function*() {
       const failed = (reason: string, status?: number, retryAfter?: string | null) =>
         new NodeAgentError({ node, call: what, reason, ...(status === undefined ? {} : { status }), ...(retryAfter === undefined || retryAfter === null ? {} : { retryAfter }) });
       const base = (yield* addresses).get(node);
       if (!base) return yield* failed("no agent is ready there");
-      const { status, ok, bytes, retryAfter } = yield* Effect.tryPromise({
+      const { status, ok, bytes, retryAfter, tag } = yield* Effect.tryPromise({
         try: async (signal) => {
           const response = await fetch(`${base}${request.path}`, {
             method: request.method,
             headers: {
               authorization: `Bearer ${Redacted.value(token)}`,
               ...(request.body !== undefined ? { "content-type": "application/json" } : request.bytes !== undefined ? { "content-type": "application/octet-stream" } : {}),
+              ...(request.seen !== undefined ? { "if-none-match": `"${request.seen}"` } : {}),
             },
             ...(request.body !== undefined ? { body: JSON.stringify(request.body) } : request.bytes !== undefined ? { body: request.bytes } : {}),
             signal,
           });
-          return { status: response.status, ok: response.ok, bytes: new Uint8Array(await response.arrayBuffer()), retryAfter: response.headers.get("retry-after") };
+          const etag = /^"([^"]*)"$/u.exec(response.headers.get("etag") ?? "")?.[1] ?? null;
+          return { status: response.status, ok: response.ok, bytes: new Uint8Array(await response.arrayBuffer()), retryAfter: response.headers.get("retry-after"), tag: etag };
         },
         catch: (cause) => failed(cause instanceof Error ? cause.message : String(cause)),
       }).pipe(
@@ -264,7 +285,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
         Effect.timeoutOrElse({ duration: request.timeout, orElse: () => Effect.fail(failed(`it did not answer within ${Duration.toSeconds(request.timeout)} s`)) }),
       );
       const text = new TextDecoder().decode(bytes);
-      if (ok || (status === 404 && request.absent)) return { status, bytes, text };
+      if (ok || (status === 404 && request.absent) || (status === 304 && request.seen !== undefined)) return { status, bytes, text, tag };
       const refusal = Schema.decodeUnknownOption(Schema.fromJsonString(Refusal))(text);
       return yield* failed(refusal._tag === "Some" ? refusal.value.error : `it answered ${status}`, status, retryAfter);
     });
@@ -297,6 +318,50 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
       if (ended.state === "running") return yield* Effect.die("an operation ended running");
       return yield* new NodeAgentError({ node, call: what, reason: ended.error, status: ended.status });
     });
+
+  const holdingsCall = "say what it holds";
+
+  /** What the agent of `node` said it holds in `answered`, an answer of `GET /holdings`, and its tag. */
+  const taggedIn = (node: string, { text, tag }: { readonly text: string; readonly tag: string | null }): Effect.Effect<TaggedHoldings, NodeAgentError> =>
+    tag === null
+      ? Effect.fail(new NodeAgentError({ node, call: holdingsCall, reason: "its answer bears no tag" }))
+      : Schema.decodeUnknownEffect(Schema.fromJsonString(Holdings))(text).pipe(
+        Effect.map((holdings) => ({ holdings, tag })),
+        Effect.mapError((error) => new NodeAgentError({ node, call: holdingsCall, reason: `its answer is not one: ${error.message}` })),
+      );
+
+  /** What `node` holds, as its agent says it now. */
+  const holdingsNow = (node: string): Effect.Effect<TaggedHoldings, NodeAgentError | KubeApiError> =>
+    Effect.flatMap(send(node, holdingsCall, { method: "GET", path: "/holdings", timeout: SHORT_CALL }), (answered) => taggedIn(node, answered));
+
+  /** What `node` holds once it is other than what the tag `seen` names, as its agent says it; null where it is not within HOLDINGS_WAIT_MS. */
+  const holdingsSince = (node: string, seen: string): Effect.Effect<TaggedHoldings | null, NodeAgentError | KubeApiError> =>
+    Effect.flatMap(
+      send(node, holdingsCall, { method: "GET", path: "/holdings", seen, timeout: HOLDINGS_CALL }),
+      (answered) => (answered.status === 304 ? Effect.succeed(null) : taggedIn(node, answered)),
+    );
+
+  /** What each node holds, as its agent last said it, by node, while it is watched (watchHoldings). */
+  const kept = new Map<string, TaggedHoldings>();
+
+  /**
+   * Keeps what `node` holds, as kept now, as its agent says it each time it changes: asked as
+   * of what is kept (holdingsSince), again as soon as it answers, in the background, until a
+   * request fails, as one of an agent that stopped does; what is kept of it is then forgotten,
+   * for the next restore to ask it anew.
+   */
+  const watchHoldings = (node: string): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      for (let seen = kept.get(node); seen !== undefined; seen = kept.get(node)) {
+        const changed = yield* holdingsSince(node, seen.tag);
+        if (changed !== null) kept.set(node, changed);
+      }
+    }).pipe(
+      Effect.catch((error) => Effect.logInfo(`what node ${node} holds is asked of its agent anew by the next restore: ${error.message}`)),
+      Effect.ensuring(Effect.sync(() => kept.delete(node))),
+      Effect.forkDetach,
+      Effect.asVoid,
+    );
 
   /** Any node with a ready agent: each reads, copies and forgets in the bucket as well as another. */
   const anyNode: Effect.Effect<string, NodeAgentError | KubeApiError> = Effect.flatMap(addresses, (known) => {
@@ -424,6 +489,22 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
         Effect.map(({ killed }) => killed),
       ),
     holdings: (node) => ask(node, "say what it holds", { method: "GET", path: "/holdings", timeout: SHORT_CALL }, Holdings),
+    held: (node) =>
+      Effect.suspend(() => {
+        const known = kept.get(node);
+        if (known) return Effect.succeed(known.holdings);
+        return holdingsNow(node).pipe(
+          Effect.tap((now) =>
+            Effect.suspend(() => {
+              // Watched once, however many restores asked at once.
+              if (kept.has(node)) return Effect.void;
+              kept.set(node, now);
+              return watchHoldings(node);
+            })
+          ),
+          Effect.map(({ holdings }) => holdings),
+        );
+      }),
     workspaces: (environment) =>
       Effect.flatMap(anyNode, (node) =>
         ask(node, `list ${environment}'s snapshots`, { method: "GET", path: `/snapshots/${encodeURIComponent(environment)}`, timeout: SHORT_CALL }, Listed)).pipe(

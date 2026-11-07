@@ -41,6 +41,7 @@ import {
   NoSnapshot,
   type NodeAgent,
   PoliciesNotInForce,
+  holdingsTag,
   type Prepared,
   type PrepareError,
   type PrepareRequest,
@@ -2942,6 +2943,12 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
 const agentsOf = (agent: NodeAgent, workspaces: Workspaces = unusedWorkspaces, listed: () => void = () => {}) =>
   Effect.gen(function*() {
     const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent, workspaces });
+    return yield* clientOf(port, listed);
+  });
+
+/** alasio's client of the agents, of which there is one, of node-1, on the loopback's `port`; `listed` told of each list of their pods. */
+const clientOf = (port: number, listed: () => void = () => {}) =>
+  Effect.gen(function*() {
     const pod: V1Pod = {
       metadata: { name: "node-agent-1", namespace: "alasio" },
       spec: { nodeName: "node-1", containers: [] },
@@ -3010,6 +3017,45 @@ test("alasio learns a prepare that ends in tens of milliseconds, as one from the
       assert.deepEqual((yield* agents.prepare("node-1", ref, RELEASED_MANIFEST)).manifest, RELEASED_MANIFEST);
       const took = Date.now() - asked;
       assert.ok(took < 250, `alasio learned the prepare had ended ${took} ms after it asked for it`);
+    })
+  ));
+
+test("what a node holds is told once it changes, as its cache does, at once where the tag asked as of names other, and not within the wait where it does not change", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const before = yield* here.agent.holdings;
+      assert.equal(yield* here.agent.holdingsAfter(holdingsTag(before), 50), null);
+      assert.deepEqual(yield* here.agent.holdingsAfter("0".repeat(64), 50), before);
+      const waiting = yield* Effect.forkChild(here.agent.holdingsAfter(holdingsTag(before), 10_000));
+      yield* Effect.sleep("100 millis");
+      assert.equal(waiting.pollUnsafe(), undefined);
+      yield* here.agent.checkpoint(request("fs-abc"));
+      assert.deepEqual((yield* Fiber.join(waiting))?.cached.map(({ workspace }) => workspace), ["fs-abc"]);
+    })
+  ));
+
+test("alasio keeps what each node holds as its agent says it, asked once and told after as it changes, tagged, asked again once its agent is gone", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const asked: string[] = [];
+      const counting: NodeAgent = { ...here.agent, holdings: here.agent.holdings.pipe(Effect.tap(() => Effect.sync(() => void asked.push("now")))) };
+      const serving = yield* Scope.make();
+      const served = { port: 0, host: "127.0.0.1", token: "the token", agent: counting, workspaces: unusedWorkspaces };
+      const { port } = yield* serveNodeAgent(served).pipe(Scope.provide(serving));
+      const agents = yield* clientOf(port);
+      assert.deepEqual((yield* agents.held("node-1")).cached, []);
+      // Told as its cache changes, asked no more.
+      yield* here.agent.checkpoint(request("fs-abc"));
+      yield* agents.held("node-1").pipe(Effect.repeat({ schedule: Schedule.spaced("20 millis"), until: ({ cached }) => cached.length === 1 }), Effect.timeout("5 seconds"));
+      assert.deepEqual(asked, ["now"]);
+      // Its agent gone, what was kept of it is forgotten, as the next restore finds; asked of the one serving after it.
+      yield* Scope.close(serving, Exit.void);
+      yield* agents.held("node-1").pipe(Effect.repeat({ schedule: Schedule.spaced("20 millis") }), Effect.flip, Effect.timeout("5 seconds"));
+      yield* serveNodeAgent({ ...served, port });
+      assert.deepEqual((yield* agents.held("node-1")).cached.map(({ workspace }) => workspace), ["fs-abc"]);
+      assert.deepEqual(asked, ["now", "now"]);
     })
   ));
 

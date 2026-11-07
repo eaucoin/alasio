@@ -75,7 +75,7 @@ function agents({ fails = false } = {}): { agents: NodeAgents; bound: (BindingRe
     agents: {
       nodes: Effect.succeed(["node-a"]),
       current: unused, released: unused, attachments: unused, attach: unused, checkpoint: unused, stop: unused, setReleased: unused, clearReleased: unused,
-      prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
+      prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, held: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
       readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, listEnvironments: unused(), quota: unused, sync: unused,
       bindFree: (node, request) =>
         failing ? ((failing = false), Effect.fail(new NodeAgentError({ node, call: "bind", status: 409, reason: "it has its binding already" }))) : Effect.sync(() => void bound.push({ node, ...request })),
