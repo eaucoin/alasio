@@ -3,8 +3,8 @@
  * (`<endpoint>/<bucket>/<key>`, as SeaweedFS serves them), every request signed with AWS
  * Signature Version 4 (sigV4Authorization). No SDK: the agent puts objects from files and
  * gets them into files, puts and reads small JSON objects, copies objects within the
- * bucket, says an object's size and ETag, deletes objects, and lists those under a
- * prefix, and nothing else.
+ * bucket, says an object's size and ETag, deletes objects, where asked only while each is
+ * the one its ETag names, and lists those under a prefix, and nothing else.
  *
  * A file larger than a part (`partBytes`) is put as a multipart upload, its parts sent
  * `parallel` at a time, and got in ranges of a part, as many at a time: one stream of
@@ -104,6 +104,12 @@ export interface ListedObject {
   readonly writtenAt: number;
 }
 
+/** An object of JSON as getTaggedJson reads it: what it holds, and its ETag. */
+export interface TaggedJson {
+  readonly value: unknown;
+  readonly etag: string;
+}
+
 /** What getFile wrote: how many bytes, and their SHA-256 in hex. */
 export interface Received {
   readonly bytes: number;
@@ -123,12 +129,19 @@ export interface S3Bucket {
   readonly putJson: (key: string, value: unknown) => Effect.Effect<void, S3Error>;
   /** The object `key`, parsed as JSON, or null when there is none. */
   readonly getJson: (key: string) => Effect.Effect<unknown, S3Error>;
+  /** The object `key`, parsed as JSON, and the ETag the bucket holds it by, or null when there is none. */
+  readonly getTaggedJson: (key: string) => Effect.Effect<TaggedJson | null, S3Error>;
   /** Copies the object `from`, of `bytes`, as the object `to`, in the bucket, none of its bytes through this client. */
   readonly copy: (from: string, to: string, bytes: number) => Effect.Effect<void, S3Error>;
   /** The object `key`'s size and ETag, or null when there is none. */
   readonly head: (key: string) => Effect.Effect<StoredObject | null, S3Error>;
   /** Deletes the object `key`; one there is not is gone already. */
   readonly remove: (key: string) => Effect.Effect<void, S3Error>;
+  /**
+   * Deletes the object `key` where the bucket holds it still as the ETag `etag` names it (`If-Match`), as one written since
+   * answers another: whether it did; one written since, or gone, is left as it is.
+   */
+  readonly removeIf: (key: string, etag: string) => Effect.Effect<boolean, S3Error>;
   /** Every object under `prefix`, in the order of their keys. */
   readonly list: (prefix: string) => Effect.Effect<readonly ListedObject[], S3Error>;
   /** Aborts every multipart upload begun under `prefix` and neither completed nor aborted, as an uploader that stopped left it: how many. */
@@ -144,6 +157,8 @@ const IDLE_TIMEOUT_MS = 60_000;
 const ERROR_BODY_BYTES = 64 * 1024;
 /** The most a JSON object of the bucket's may hold: a manifest, which names a snapshot's few files, is a few KiB. */
 const JSON_BYTES = 1024 * 1024;
+/** What a request made only as the object it names is so answers, where it is not: none (404), another (412), or one being written (409). */
+const REFUSED_CONDITIONS: readonly number[] = [404, 409, 412];
 
 const sha256Hex = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
 const hmac = (key: string | Buffer, data: string): Buffer => createHmac("sha256", key).update(data).digest();
@@ -425,6 +440,21 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
     }
   };
 
+  /** The object `key`, parsed as JSON, and the ETag it was answered with, if any, or null when there is none. */
+  const readJson = async (key: string, signal: AbortSignal): Promise<{ readonly value: unknown; readonly etag: string | undefined } | null> => {
+    const response = await succeeded(await call("GET", key, {}, signal), [404]);
+    if (response.statusCode === 404) {
+      await bodyText(response, 0);
+      return null;
+    }
+    const text = await boundedText(response, JSON_BYTES);
+    try {
+      return { value: JSON.parse(text) as unknown, etag: response.headers.etag };
+    } catch {
+      throw new Error("it is not JSON");
+    }
+  };
+
   /** The ranges of an object of `size` bytes, a part each: their first byte and their length. */
   const ranges = (size: number): { readonly start: number; readonly length: number }[] =>
     Array.from({ length: Math.ceil(size / partBytes) }, (_, index) => ({ start: index * partBytes, length: Math.min(partBytes, size - index * partBytes) }));
@@ -490,19 +520,14 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         await bodyText(await succeeded(await call("PUT", key, { headers: { "content-type": "application/json" }, body: { bytes } }, signal)), 0);
       }),
 
-    getJson: (key) =>
+    getJson: (key) => attempt("read", key, (signal) => readJson(key, signal)).pipe(Effect.map((found) => found?.value ?? null)),
+
+    getTaggedJson: (key) =>
       attempt("read", key, async (signal) => {
-        const response = await succeeded(await call("GET", key, {}, signal), [404]);
-        if (response.statusCode === 404) {
-          await bodyText(response, 0);
-          return null;
-        }
-        const text = await boundedText(response, JSON_BYTES);
-        try {
-          return JSON.parse(text) as unknown;
-        } catch {
-          throw new Error("it is not JSON");
-        }
+        const found = await readJson(key, signal);
+        if (found === null) return null;
+        if (!found.etag) throw new Error("it was answered with no ETag");
+        return { value: found.value, etag: found.etag };
       }),
 
     copy: (from, to, size) =>
@@ -534,6 +559,15 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
     remove: (key) =>
       attempt("deletion", key, async (signal) => {
         await bodyText(await succeeded(await call("DELETE", key, {}, signal), [404]), 0);
+      }),
+
+    removeIf: (key, etag) =>
+      attempt("deletion", key, async (signal) => {
+        // Refused where it is another (412), or none: SeaweedFS answers 412 for one not there too, S3 404; and where a write
+        // of it runs at once (409, S3's ConditionalRequestConflict), which is another once it is through.
+        const response = await succeeded(await call("DELETE", key, { headers: { "if-match": etag } }, signal), REFUSED_CONDITIONS);
+        await bodyText(response, 0);
+        return !REFUSED_CONDITIONS.includes(response.statusCode ?? 0);
       }),
 
     list: (prefix) =>

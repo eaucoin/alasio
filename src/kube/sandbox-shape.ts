@@ -49,6 +49,13 @@ export const RESTORE_ANNOTATION = "dev.gvisor.internal.restore.host-image-path";
 export const RESTORE_PAUSED_ANNOTATION = "dev.gvisor.internal.restore.paused";
 /** The condition of a restored pod's readiness gate, which alasio sets once its sandbox is resumed. */
 export const RESUMED_CONDITION = "alasio.dev/resumed";
+/**
+ * The reasons of a restored pod's resumed condition (RESUMED_CONDITION): that the snapshot it was
+ * restored from, as the last name of its RESTORE_ANNOTATION's path says it, is yet to be spent, as
+ * its sandbox runs on from it; and that it is (../gateway/snapshots.ts spendLater).
+ */
+export const UNSPENT_REASON = "SnapshotUnspent";
+export const SPENT_REASON = "SnapshotSpent";
 /** Where a node agent keeps the snapshots it prepares, as `<environment>/<workspace>/<snapshot>` (../node-agent/cache.ts). */
 export const SNAPSHOT_CACHE_DIR = "/var/lib/alasio/snapshots";
 /**

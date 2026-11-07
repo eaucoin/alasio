@@ -60,7 +60,7 @@
 import { lookup } from "node:dns/promises";
 
 import type { V1Pod } from "@kubernetes/client-node";
-import { Clock, Effect, Schema } from "effect";
+import { Clock, Effect, Schema, type Scope } from "effect";
 
 import { type Binder, BindStepFailed, type ReleaseSteps } from "../binder/binder.ts";
 import { type BindingLease, heldLeases } from "../binder/bindings.ts";
@@ -155,7 +155,7 @@ export interface Sessions {
   readonly sweep: Effect.Effect<readonly string[], KubeApiError>;
   /** Releases each bound pod of the gateway's pools that is ending though the gateway did not end it, as the module says, in the background: which keys, of those it began. */
   readonly drain: Effect.Effect<readonly string[], KubeApiError>;
-  /** Looks at each bound pod for one whose bayma ended, and keeps the snapshot taken live of each that runs true to it, as the module says. */
+  /** Looks at each bound pod for one whose bayma ended, and of each that runs spends the snapshot it was restored from and keeps the snapshot taken of it live true to it, as the module says. */
   readonly live: Effect.Effect<void, KubeApiError>;
   /** Records what the binding `lease` of `pool`, whose pod went while it was bound, is released into, while its Lease holds still. */
   readonly recordLost: (pool: Pool, lease: BindingLease) => Effect.Effect<void>;
@@ -167,12 +167,12 @@ export interface Sessions {
   readonly operate: (claims: TokenClaims, operation: Operation) => Effect.Effect<Answer>;
 }
 
-/** The gateway's sessions, as the module says, on the node agents, the binder, and the KubeClient. */
+/** The gateway's sessions, as the module says, on the node agents, the binder, and the KubeClient, what they run in the background run while the scope lasts. */
 export const makeSessions = Effect.fnUntraced(function*(
   { environments, pools: poolNames, releaseAfterMs, podPort, bindingKey, idlePollMs = IDLE_POLL_MS, telemetry, quotaBytes, snapshots: snapshotsConfig = null, mainNamespace = "" }: SessionsOptions,
   agents: NodeAgents,
   binder: Binder["Service"],
-): Effect.fn.Return<Sessions, never, KubeClient> {
+): Effect.fn.Return<Sessions, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
   const snapshots = yield* makeGatewaySnapshots({ agents, snapshots: snapshotsConfig, mainNamespace });
   const pools = Effect.map(environments.current, (current) => current.flatMap(({ namespace }) => (Object.values(poolNames) as string[]).map((name): Pool => ({ name, namespace }))));
@@ -369,8 +369,10 @@ export const makeSessions = Effect.fnUntraced(function*(
    * in it, or whose workspace its node can reach no more (the node's mount of workspace storage
    * ended under it, as its mount's pod killed with no successor leaves it), which serves no more,
    * is released into the snapshot taken of it live, if any, as broken, or as oom where its
-   * sandbox was killed for its memory; and of each that runs, the snapshot taken of it live is kept true to it
-   * (./snapshots.ts keepLive), one that can be saved no more released now.
+   * sandbox was killed for its memory; and of each that runs, the snapshot it was restored from
+   * spent where its restore's bind did not spend it (./snapshots.ts spendRestored), and the
+   * snapshot taken of it live kept true to it (./snapshots.ts keepLive), one that can be saved no
+   * more released now.
    */
   const live: Effect.Effect<void, KubeApiError> = Effect.gen(function*() {
     // The workspaces bound in each namespace, of all its pools.
@@ -414,6 +416,8 @@ export const makeSessions = Effect.fnUntraced(function*(
             )));
           continue;
         }
+        // Restored, its snapshot spent, where its restore's bind did not spend it.
+        yield* snapshots.spendRestored(pool, workspace, pod);
         const status = yield* statusOf(lease, pod);
         if (status === null) continue;
         const unsaveable = releaseFor(pool, key, pod, "broken", () => Effect.andThen(snapshots.endUnsaveable(pool, workspace, pod.metadata?.name ?? ""), endAndDetach(pool, pod)));

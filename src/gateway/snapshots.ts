@@ -25,17 +25,20 @@
  * saved with, those that hold its images first; its workspace attached into its directory there,
  * made for it, before its pod is made, so its sandbox, restored as its bayma starts, finds every
  * file it held open, as a restore reopens each; left paused until its node's agent sees its egress
- * confined there, then resumed, and ready. One whose restore runsc refuses falls back at once;
- * one whose pod cannot start otherwise, as a pull or a node's hiccup fails it, is deferred, as
- * the others that may pass. Only the snapshot the record says it was
- * released into restores, or one its node's agent compacted from it since, which is the same:
- * one it has moved on from since is stale. A restore that cannot be done now, as what it needs
- * fails for a while, is deferred, its snapshot kept, the bind refused to be tried again, for
- * DEFER_FOR_MS from its first; one that never can, or one deferred for that long, falls back,
- * its snapshot and its record forgotten, the workspace bound to a free pod of its pool, from
- * bayma's checkpoints, why logged and counted (alasio.sandbox.restores). A restore refused
- * before its sandbox resumed is abandoned on its node first, as alasio's were. Main's sessions
- * alone are snapshotted, as alasio's were.
+ * confined there, then resumed, and ready, its record of its release cleared; once its bind is
+ * through, its snapshot is spent in the background by its node's agent, only where it is the
+ * current one still, its pod's resumed condition saying it is to be until it is, so that a gateway
+ * started again meanwhile spends it as it next looks at its bound pods (spendLater, spendRestored). One whose
+ * restore runsc refuses falls back at once; one whose pod cannot start otherwise, as a pull or a
+ * node's hiccup fails it, is deferred, as the others that may pass. Only the snapshot the record
+ * says it was released into restores, or one its node's agent compacted from it since, which is the
+ * same: one it has moved on from since is stale. A restore that cannot be done now, as what it
+ * needs fails for a while, is deferred, its snapshot kept, the bind refused to be tried again, for
+ * DEFER_FOR_MS from its first; one that never can, or one deferred for that long, falls back, its
+ * snapshot and its record forgotten, the workspace bound to a free pod of its pool, from bayma's
+ * checkpoints, why logged and counted (alasio.sandbox.restores). A restore refused before its
+ * sandbox resumed is abandoned on its node first, as alasio's were. Main's sessions alone are
+ * snapshotted, as alasio's were.
  *
  * A bound pod ended by other than the gateway, as a drain, an eviction or a deletion through
  * the API server ends one, is saved while its bayma holds its stop for it (saveStopping), as
@@ -62,14 +65,15 @@
  * (releasesNamed), as `alasio up` keeps those installed.
  */
 import { randomBytes } from "node:crypto";
+import { posix } from "node:path";
 
 import type { V1Container, V1Deployment, V1LabelSelector, V1NetworkPolicy, V1Node, V1Pod, V1PodTemplateSpec, V1Toleration } from "@kubernetes/client-node";
-import { Clock, Effect, Schedule, Schema, Semaphore } from "effect";
+import { Clock, Effect, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import { BindStepFailed, type MakePod } from "../binder/binder.ts";
 import { FREE_LABEL, type Pool } from "../binder/names.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
-import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SANDBOX_STOP_REASON_VARIABLE, SESSION_TEMPLATE_ANNOTATION, STOP_WAIT_ARG } from "../kube/sandbox-shape.ts";
+import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SANDBOX_STOP_REASON_VARIABLE, SESSION_TEMPLATE_ANNOTATION, SNAPSHOT_ID, SPENT_REASON, STOP_WAIT_ARG, UNSPENT_REASON } from "../kube/sandbox-shape.ts";
 import type { Manifest } from "../node-agent/agent.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { withLogScope } from "../shared/log.ts";
@@ -216,6 +220,23 @@ class RestoreRefused extends Schema.TaggedError<RestoreRefused>()("RestoreRefuse
  */
 const UNSAVEABLE_STATUS = 410;
 
+/**
+ * How a restored workspace's spend of its snapshot is tried again where it fails: five times more,
+ * 200 ms after the first, then twice as long each time, some 6 s in all, as an agent started again,
+ * or the bucket's moment, passes; and how its record's clearing is, three times more, before its
+ * bind is through.
+ */
+const SPEND_TRIES = { times: 5, schedule: Schedule.exponential("200 millis") };
+const CLEAR_TRIES = { times: 3, schedule: Schedule.exponential("200 millis") };
+/**
+ * When a restored workspace whose spend's tries all failed is spent again, as its pod is looked at: a minute after, then
+ * twice as long after each that fails again, an hour at most, each said once.
+ */
+const SPEND_AGAIN_MS = { first: 60_000, most: 60 * 60_000 };
+
+/** A snapshot's id, whole, as the last name of the path of the image a restored pod was restored from. */
+const RESTORED_SNAPSHOT = new RegExp(`^${SNAPSHOT_ID}$`, "u");
+
 /** How many workspaces' snapshots are read at once, as what releases they name is read. */
 const READS_AT_ONCE = 8;
 
@@ -286,10 +307,16 @@ export interface GatewaySnapshots {
   readonly liveSnapshotOf: (pool: Pool, workspace: string) => Effect.Effect<SavedSnapshot | null>;
   /** Records the workspace, whose pod ended unsaved, released into the snapshot taken of it live, if any, unless a release's save of that pod took one already. */
   readonly releasedUnsaved: (pool: Pool, workspace: string, pod: string, memoryLimit?: string | null) => Effect.Effect<void, NodeAgentError | KubeApiError>;
-  /** Of the bindings of the sessions' namespace `namespace`, forgets what was kept live of those of workspaces not among `bound`, as they are bound no more. */
+  /** Of the bindings of the sessions' namespace `namespace`, forgets what was kept live, and when a spend is tried again, of those of workspaces not among `bound`, as they are bound no more. */
   readonly forgetLive: (namespace: string, bound: ReadonlySet<string>) => Effect.Effect<void>;
   /** How a bind of `workspace` of `pool`, of its sessions' internet `mode`, restores it, as the module says, its workspace attached as `attaching` says. */
   readonly restoring: (pool: Pool, workspace: string, mode: "none" | "full", attaching: Attaching) => Restoring;
+  /**
+   * Spends the snapshot `pod`, bound to `workspace` of `pool`, was restored from, in the background, where its resumed
+   * condition says it is unspent (UNSPENT_REASON), as a gateway that stopped before its restore's bind spent it, or whose
+   * tries all failed, leaves it: as the module says.
+   */
+  readonly spendRestored: (pool: Pool, workspace: string, pod: V1Pod) => Effect.Effect<void>;
   /**
    * Saves the sandbox of `pod`, bound to `workspace` of `pool`, for its release, as the module
    * says, and records what it was released into: the binding kept where it runs on, or
@@ -338,9 +365,10 @@ export interface GatewaySnapshotsOptions {
   readonly mainNamespace: string;
 }
 
-/** The gateway's snapshots, as the module says, on its node agents and the KubeClient. */
-export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapshots, mainNamespace }: GatewaySnapshotsOptions): Effect.fn.Return<GatewaySnapshots, never, KubeClient> {
+/** The gateway's snapshots, as the module says, on its node agents and the KubeClient, what they run in the background run while the scope lasts. */
+export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapshots, mainNamespace }: GatewaySnapshotsOptions): Effect.fn.Return<GatewaySnapshots, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
+  const scope = yield* Effect.scope;
   const ref = (pool: Pool, workspace: string) => ({ environment: pool.namespace, workspace });
 
   /** The pod `name` of `pool`, as the API server has it now. */
@@ -581,9 +609,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
    * Lets the restored pod `name`, on `node`, restored from `snapshot`, of images of `bytes`
    * together, its workspace attached before it was made, run: once its containers run, paused,
    * its node's agent resumes its sandbox once the pod's egress is confined there, waited for as
-   * long as reading those images may take, and the pod is then ready, by its readiness gate. A
-   * pod that ends meanwhile, or cannot start, whose sandbox the agent does not resume, or whose
-   * readiness cannot be set, is refused.
+   * long as reading those images may take, and the pod is then ready, by its readiness gate, and its
+   * workspace's record of its release cleared beside it. A pod that ends meanwhile, or cannot
+   * start, whose sandbox the agent does not resume, or whose readiness cannot be set, is refused.
    */
   const resumeRestored = (pool: Pool, workspace: string, name: string, node: string, snapshot: string, bytes: number): Effect.Effect<void, RestoreRefused> =>
     Effect.gen(function*() {
@@ -610,9 +638,92 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         }),
       );
       const now = new Date(yield* Clock.currentTimeMillis).toISOString();
-      yield* kube.patchPodStatus(pool.namespace, name, { status: { conditions: [{ type: RESUMED_CONDITION, status: "True", lastTransitionTime: now }] } }).pipe(
-        Effect.mapError((error) => new RestoreRefused({ reason: `its readiness could not be set: ${error.message}`, resumed: true })),
+      // Released into none, until its next release, before its bind is through, while its binding's Lease is still this
+      // bind's, as no release of it may read its record before it is cleared: a record that names its snapshot is never read
+      // again, whatever comes of its spend. Tried a few times; where it cannot be, a release of it records anew. One whose
+      // readiness cannot be set falls back, its record cleared so too.
+      const [ready] = yield* Effect.all([
+        // Its snapshot unspent, until it is (spendLater); its failure waits for the clear, which it does not cut short.
+        kube.patchPodStatus(pool.namespace, name, { status: { conditions: [{ type: RESUMED_CONDITION, status: "True", lastTransitionTime: now, reason: UNSPENT_REASON }] } }).pipe(Effect.result),
+        agents.setReleased(ref(pool, workspace), null).pipe(
+          Effect.retry(CLEAR_TRIES),
+          Effect.catch((error) => Effect.logWarning(`could not clear ${named(pool, workspace)}'s record of its release: ${error.message}`)),
+        ),
+      ], { concurrency: 2 });
+      if (ready._tag === "Failure") return yield* new RestoreRefused({ reason: `its readiness could not be set: ${ready.failure.message}`, resumed: true });
+    });
+
+  /** The restored pods whose snapshots are spent now (spendLater), by namespace and name: each once at a time. */
+  const spending = new Set<string>();
+  /**
+   * Of each workspace whose restore's spend has failed, by its pool's namespace and name: its pod, how many of its spends
+   * have failed in a row, and when it is spent again (spendRestored). In memory, as the gateway's start spends anew.
+   */
+  const spendAgain = new Map<string, { readonly pod: string; readonly failed: number; readonly at: number }>();
+
+  /**
+   * Spends the snapshot `snapshot` of `workspace` of `pool`, whose sandbox was restored from it into the pod `name` on `node`,
+   * and runs on from it, in the background, in the gateway's scope, by the agent of `node`, as the agent the pod's next
+   * checkpoint commits through is: its images go on as the layers of its next. Tried again (SPEND_TRIES), what still fails
+   * said; once done, its pod's resumed condition says so (SPENT_REASON), where it said it unspent since its resume, so that
+   * a gateway started again before, or one whose tries all failed, spends it as it next looks at its bound pods
+   * (spendRestored), later each time it fails again (SPEND_AGAIN_MS). Its bind is through meanwhile, its binding's Lease no
+   * longer held for it, so a release of it may be asked meanwhile, which commits the snapshot it takes: it is spent only
+   * where the workspace's current snapshot is that one still (or one compacted from it), as the bucket holds it as it was
+   * read (../node-agent/agent.ts spendNow), so that release's stands.
+   */
+  const spendLater = (pool: Pool, workspace: string, name: string, node: string, snapshot: string): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      const pod = `${pool.namespace}/${name}`;
+      if (spending.has(pod)) return Effect.void;
+      spending.add(pod);
+      const it = named(pool, workspace);
+      return agents.spend(node, ref(pool, workspace), snapshot).pipe(
+        Effect.retry(SPEND_TRIES),
+        Effect.matchEffect({
+          onFailure: (error) =>
+            Effect.gen(function*() {
+              const now = yield* Clock.currentTimeMillis;
+              const before = spendAgain.get(it);
+              const failed = (before?.pod === name ? before.failed : 0) + 1;
+              const after = Math.min(SPEND_AGAIN_MS.first * 2 ** (failed - 1), SPEND_AGAIN_MS.most);
+              spendAgain.set(it, { pod: name, failed, at: now + after });
+              yield* Effect.logWarning(`could not spend the snapshot ${snapshot} of ${it}, which runs on from it, so it is spent again in ${after / 1000} s, as its pod is looked at: ${error.message}`);
+            }),
+          onSuccess: () =>
+            Effect.andThen(
+              Effect.sync(() => void spendAgain.delete(it)),
+              kube.patchPodStatus(pool.namespace, name, { status: { conditions: [{ type: RESUMED_CONDITION, status: "True", reason: SPENT_REASON }] } }),
+            ).pipe(
+              // One gone has nothing left to say.
+              Effect.catchIf((error) => error.status === 404, () => Effect.void),
+              Effect.catch((error) => Effect.logWarning(`could not say ${pod}'s snapshot ${snapshot} is spent, so it is spent again as its pod is next looked at: ${error.message}`)),
+            ),
+        }),
+        Effect.ensuring(Effect.sync(() => void spending.delete(pod))),
+        withLogScope("snapshots"),
+        Effect.forkIn(scope),
+        Effect.asVoid,
       );
+    });
+
+  /**
+   * Spends the snapshot `pod` was restored from where its resumed condition says it unspent (spendLater), not before its last
+   * spend's failure says (SPEND_AGAIN_MS); what is kept of the spends of another pod of the workspace's, one ended, forgotten.
+   */
+  const spendRestored = (pool: Pool, workspace: string, pod: V1Pod): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      const it = named(pool, workspace);
+      const name = pod.metadata?.name ?? "";
+      const again = spendAgain.get(it);
+      if (again !== undefined && again.pod !== name) spendAgain.delete(it);
+      // Of a sandbox resumed alone, as its readiness gate's condition says: one never resumed runs on from no snapshot.
+      const resumed = (pod.status?.conditions ?? []).find(({ type, status }) => type === RESUMED_CONDITION && status === "True");
+      // The snapshot it was restored from, the last name of the path of the image it was restored from, under the snapshot cache.
+      const snapshot = posix.basename(pod.metadata?.annotations?.[RESTORE_ANNOTATION] ?? "");
+      const node = pod.spec?.nodeName;
+      if (resumed?.reason !== UNSPENT_REASON || !node || !RESTORED_SNAPSHOT.test(snapshot)) return Effect.void;
+      return Effect.flatMap(Clock.currentTimeMillis, (now) => (again?.pod === name && now < again.at ? Effect.void : spendLater(pool, workspace, name, node, snapshot)));
     });
 
   /** Has the agent of `node` abandon the restore into the pod `name`, refused before its sandbox resumed, as alasio's were: what runsc runs for it killed. */
@@ -747,13 +858,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           deferredSince.delete(named(pool, workspace));
           restores.add(1, { "alasio.sandbox.restore.outcome": "restored" });
           restoreDuration.record((now - of.started) / 1000);
-          // It moves on from its snapshot, whose images go on as the layers of its next; released into none, until its next
-          // release: both at once, before its bind is through, while its binding's Lease is still this bind's, as no release
-          // of it may read its record before it is cleared.
-          yield* Effect.all([
-            agents.spend(ref(pool, workspace), of.manifest.snapshot).pipe(Effect.catch((error) => Effect.logWarning(`could not spend the snapshot of ${named(pool, workspace)}, which runs on from it: ${error.message}`))),
-            agents.setReleased(ref(pool, workspace), null).pipe(Effect.catch((error) => Effect.logWarning(`could not clear ${named(pool, workspace)}'s record of its release: ${error.message}`))),
-          ], { concurrency: 2, discard: true });
+          // Its bind waits on none of its snapshot's spend, which a release of it asked meanwhile leaves be.
+          yield* spendLater(pool, workspace, of.pod, of.node, of.manifest.snapshot);
           return;
         }
         const { reason: why, resumed, stale, failed } = done.failure;
@@ -878,7 +984,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       const taken = takenLive.get(it);
       if (taken && taken.generation !== status.generation) {
         takenLive.delete(it);
-        yield* agents.spend(ref(pool, workspace), taken.snapshot).pipe(
+        yield* agents.spend(pod.spec?.nodeName ?? "", ref(pool, workspace), taken.snapshot).pipe(
           Effect.tap(() => Effect.sync(() => liveCheckpoints.add(1, { "alasio.sandbox.live_checkpoint.outcome": "spent" }))),
           Effect.tap(() => Effect.logInfo(`spent the snapshot ${taken.snapshot} of ${it}, taken live, which has moved on from it`)),
           Effect.catch((error) => Effect.logWarning(`could not spend the snapshot ${taken.snapshot} of ${it}, which has moved on from it: ${error.message}`)),
@@ -916,7 +1022,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
 
   const forgetLive = (namespace: string, bound: ReadonlySet<string>): Effect.Effect<void> =>
     Effect.sync(() => {
-      for (const map of [takenLive, busySince, savedLiveAt]) {
+      for (const map of [takenLive, busySince, savedLiveAt, spendAgain]) {
         for (const it of [...map.keys()]) if (it.startsWith(`${namespace}/`) && !bound.has(it.slice(namespace.length + 1))) map.delete(it);
       }
     });
@@ -994,5 +1100,5 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
     return releases;
   });
 
-  return { save, saveStopping, endUnsaveable, keepLive, liveSnapshotOf, releasedUnsaved, forgetLive, restoring, forget: forgetDeleted, copy, collect, releasesNamed };
+  return { save, saveStopping, endUnsaveable, keepLive, liveSnapshotOf, releasedUnsaved, forgetLive, restoring, spendRestored, forget: forgetDeleted, copy, collect, releasesNamed };
 });
