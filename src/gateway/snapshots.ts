@@ -710,7 +710,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           // so, for its sessions' next execs.
           const name = restorePodName(pool.name, randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7));
           const [prepared, attached] = yield* Effect.all([
-            agents.prepare(node, ref(pool, workspace), kept.gofer ?? undefined).pipe(Effect.result),
+            agents.prepare(node, ref(pool, workspace), manifest, kept.gofer ?? undefined).pipe(Effect.result),
             attaching.attach(node, name, binding, into?.memoryLimit === undefined ? {} : { [SANDBOX_STOP_REASON_VARIABLE]: `it ran out of its memory (${into.memoryLimit})` }).pipe(Effect.result),
           ], { concurrency: 2 });
           if (prepared._tag === "Failure") {
@@ -721,9 +721,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             continue;
           }
           if (attached._tag === "Failure") return yield* attached.failure;
-          // What the agent prepared, which a compaction committed since may have made the one compacted from it.
-          const from = prepared.success.manifest;
-          yield* Effect.logInfo(`restoring ${named(pool, workspace)} on ${node} from its snapshot ${from.snapshot}, taken at ${from.takenAt} under gVisor ${from.release}`);
+          yield* Effect.logInfo(`restoring ${named(pool, workspace)} on ${node} from its snapshot ${manifest.snapshot}, taken at ${manifest.takenAt} under gVisor ${manifest.release}`);
           const { [FREE_LABEL]: _free, ...own } = base.metadata?.labels ?? {};
           const spec = ownDirectory({ containers: [], ...base.spec }, pool.namespace, name);
           const pod = yield* kube.create<V1Pod>({
@@ -750,7 +748,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             Effect.tapError(() => attaching.detach(node, name)),
             Effect.mapError((error) => new BindStepFailed({ reason: `its restore's pod could not be made: ${error.message}` })),
           );
-          restored = { pod: pod.metadata?.name ?? "", node, snapshot: from.snapshot, bytes: from.bytes, manifest, started };
+          restored = { pod: pod.metadata?.name ?? "", node, snapshot: manifest.snapshot, bytes: manifest.bytes, manifest, started };
           return pod;
         }
         // Gone or corrupt (404, 422), or of no node's (409), it never restores; otherwise it may yet.
