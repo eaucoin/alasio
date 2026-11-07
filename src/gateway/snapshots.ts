@@ -216,6 +216,13 @@ class RestoreRefused extends Schema.TaggedError<RestoreRefused>()("RestoreRefuse
  */
 const UNSAVEABLE_STATUS = 410;
 
+/**
+ * How a restored workspace's moving on from its snapshot, its spend and the clearing of its record,
+ * is tried again where it fails: five times more, 200 ms after the first, then twice as long each
+ * time, some 6 s in all, as an agent started again, or the bucket's moment, passes.
+ */
+const MOVED_ON_TRIES = { times: 5, schedule: Schedule.exponential("200 millis") };
+
 /** How many workspaces' snapshots are read at once, as what releases they name is read. */
 const READS_AT_ONCE = 8;
 
@@ -615,6 +622,26 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       );
     });
 
+  /**
+   * Has `workspace` of `pool`, whose sandbox was restored from `snapshot` and runs on from it, move on from it: the
+   * snapshot spent, whose images go on as the layers of its next, and the workspace released into none, until its next
+   * release; both at once, each tried again (MOVED_ON_TRIES), what still fails said. Its bind is through meanwhile, its
+   * binding's Lease no longer held for them, so a release of it may be asked meanwhile, which commits the snapshot it takes
+   * and records it: each is done only where the workspace is at `snapshot` still, its current snapshot spent where it is
+   * that one (or one compacted from it), its record cleared where it names that one, so that release's stand.
+   */
+  const movedOn = (pool: Pool, workspace: string, snapshot: string): Effect.Effect<void> =>
+    Effect.all([
+      agents.spend(ref(pool, workspace), snapshot).pipe(
+        Effect.retry(MOVED_ON_TRIES),
+        Effect.catch((error) => Effect.logWarning(`could not spend the snapshot ${snapshot} of ${named(pool, workspace)}, which runs on from it: ${error.message}`)),
+      ),
+      agents.clearReleased(ref(pool, workspace), snapshot).pipe(
+        Effect.retry(MOVED_ON_TRIES),
+        Effect.catch((error) => Effect.logWarning(`could not clear ${named(pool, workspace)}'s record of its release into ${snapshot}: ${error.message}`)),
+      ),
+    ], { concurrency: 2, discard: true }).pipe(withLogScope("snapshots"));
+
   /** Has the agent of `node` abandon the restore into the pod `name`, refused before its sandbox resumed, as alasio's were: what runsc runs for it killed. */
   const abandon = (pool: Pool, workspace: string, name: string, node: string): Effect.Effect<void> =>
     podOf(pool, name).pipe(
@@ -747,13 +774,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           deferredSince.delete(named(pool, workspace));
           restores.add(1, { "alasio.sandbox.restore.outcome": "restored" });
           restoreDuration.record((now - of.started) / 1000);
-          // It moves on from its snapshot, whose images go on as the layers of its next; released into none, until its next
-          // release: both at once, before its bind is through, while its binding's Lease is still this bind's, as no release
-          // of it may read its record before it is cleared.
-          yield* Effect.all([
-            agents.spend(ref(pool, workspace), of.manifest.snapshot).pipe(Effect.catch((error) => Effect.logWarning(`could not spend the snapshot of ${named(pool, workspace)}, which runs on from it: ${error.message}`))),
-            agents.setReleased(ref(pool, workspace), null).pipe(Effect.catch((error) => Effect.logWarning(`could not clear ${named(pool, workspace)}'s record of its release: ${error.message}`))),
-          ], { concurrency: 2, discard: true });
+          // Its bind waits on none of its moving on from its snapshot.
+          yield* Effect.forkDetach(movedOn(pool, workspace, of.manifest.snapshot));
           return;
         }
         const { reason: why, resumed, stale, failed } = done.failure;

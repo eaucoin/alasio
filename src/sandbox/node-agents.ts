@@ -58,6 +58,8 @@ const Listed = Schema.Struct({ workspaces: Schema.Array(Schema.String) });
 const ListedEnvironments = Schema.Struct({ environments: Schema.Array(Schema.String) });
 const Collected = Schema.Struct({ kept: Schema.Array(Schema.String) });
 const Discarded = Schema.Struct({ discarded: Schema.Boolean });
+/** What an agent answers a record of a release cleared where it named a snapshot with. */
+const Cleared = Schema.Struct({ cleared: Schema.Boolean });
 /** What an agent answers an abandon with: the processes of runsc's it killed. */
 const Abandoned = Schema.Struct({ killed: Schema.Array(Schema.Struct({ containerId: Schema.String, pid: Schema.Number })) });
 
@@ -159,6 +161,8 @@ export interface NodeAgents {
   readonly released: (workspace: WorkspaceRef) => Effect.Effect<Released | null, NodeAgentError | KubeApiError>;
   /** Records the snapshot the workspace is released into, or none, through any agent. */
   readonly setReleased: (workspace: WorkspaceRef, released: Released | null) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** Records none where the workspace's record names `snapshot` still, through any agent, a record written since left as it is: whether it did. */
+  readonly clearReleased: (workspace: WorkspaceRef, snapshot: string) => Effect.Effect<boolean, NodeAgentError | KubeApiError>;
   /** The workspace's quota, and what it holds, through any agent; null where it has none. */
   readonly quota: (workspace: WorkspaceRef) => Effect.Effect<{ readonly capacityBytes: number; readonly usedBytes: number } | null, NodeAgentError | KubeApiError>;
   /** Writes `bytes` as the workspace's file at `path`, as any agent writes it. */
@@ -352,6 +356,14 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
           ...(released === null ? {} : { body: released }),
           timeout: SHORT_CALL,
         })).pipe(Effect.asVoid),
+    clearReleased: (workspace, snapshot) =>
+      Effect.flatMap(anyNode, (node) =>
+        ask(
+          node,
+          `clear ${workspace.environment}/${workspace.workspace}'s record of its release into ${snapshot}`,
+          { method: "DELETE", path: `${releasedPath(workspace)}?snapshot=${encodeURIComponent(snapshot)}`, timeout: SHORT_CALL },
+          Cleared,
+        )).pipe(Effect.map(({ cleared }) => cleared)),
     quota: (workspace) =>
       Effect.gen(function*() {
         const node = yield* anyNode;

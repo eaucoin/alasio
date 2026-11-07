@@ -2743,6 +2743,7 @@ const unusedWorkspaces: Workspaces = {
   sync: () => Effect.die("no sandbox is told to write its files through"),
   released: () => Effect.die("no workspace's release is read"),
   setReleased: () => Effect.die("no workspace's release is recorded"),
+  clearReleased: () => Effect.die("no workspace's release is cleared"),
 };
 
 test("the agent's API takes alasio's token alone, and answers each route as it says", () =>
@@ -3417,6 +3418,12 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       yield* agents.setReleased(made, into);
       assert.deepEqual(yield* agents.released(made), into);
       yield* agents.setReleased(made, null);
+      assert.equal(yield* agents.released(made), null);
+      // Cleared as a restore of it clears it: only where it names the snapshot restored still.
+      yield* agents.setReleased(made, into);
+      assert.equal(yield* agents.clearReleased(made, "20261017T110000000Z-00000009"), false);
+      assert.deepEqual(yield* agents.released(made), into);
+      assert.equal(yield* agents.clearReleased(made, into.snapshot), true);
       assert.equal(yield* agents.released(made), null);
       const unrecorded = yield* Effect.flip(agents.setReleased(fork, into));
       assert.equal(unrecorded._tag === "NodeAgentError" && unrecorded.status, 404);

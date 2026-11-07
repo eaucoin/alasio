@@ -88,6 +88,10 @@
  * - `PUT /workspaces/<environment>/<workspace>/released`, `{ snapshot, release }`: records the
  *   snapshot it is released into (204); 404 where there is no such workspace.
  * - `DELETE /workspaces/<environment>/<workspace>/released`: records none (204).
+ * - `DELETE /workspaces/<environment>/<workspace>/released?snapshot=<snapshot>`: records none
+ *   where its record names `snapshot` still, as a restore of it clears it once its bind is
+ *   through, a record written since left as it is (./workspaces.ts clearReleased):
+ *   `{ cleared }`, whether it did (200); 404 where there is no such workspace.
  * - `GET /workspaces/<environment>/<workspace>/quota`: `{ capacityBytes, usedBytes }`, its
  *   quota and what it holds (200); 404 where it has none.
  * - `POST /attach`, `{ environment, workspace, pod, token, env, made? }`: attaches the workspace's
@@ -242,6 +246,7 @@ const CACHED = /^\/cache\/([^/]+)\/([^/?]+)(?:\?keep=([^&]*))?$/u;
 const FILES = /^\/files\/([^/]+)\/([^/?]+)\?(.*)$/u;
 const QUOTA = /^\/workspaces\/([^/]+)\/([^/]+)\/quota$/u;
 const RELEASED = /^\/workspaces\/([^/]+)\/([^/]+)\/released$/u;
+const RELEASED_INTO = /^\/workspaces\/([^/]+)\/([^/]+)\/released\?snapshot=([^&]+)$/u;
 const WORKSPACE = /^\/workspaces\/([^/]+)\/([^/]+)$/u;
 const WORKSPACES = /^\/workspaces\/([^/]+)$/u;
 
@@ -388,6 +393,13 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
             ? Effect.map(workspaces.released(ref), (record) => (record === null ? answer(404, { error: "the workspace records no release" }) : answer(200, record)))
             : Effect.flatMap(method === "PUT" ? body(Released) : Effect.succeed(null), (record) => workspaces.setReleased(ref, record)).pipe(Effect.as(HttpServerResponse.empty({ status: 204 })))
         ),
+      );
+    }
+    const releasedInto = RELEASED_INTO.exec(url);
+    if (method === "DELETE" && releasedInto) {
+      return workspaceOf(releasedInto).pipe(
+        Effect.flatMap((ref) => workspaces.clearReleased(ref, decodeURIComponent(releasedInto[3] ?? ""))),
+        Effect.map((cleared) => answer(200, { cleared })),
       );
     }
     if (method === "POST" && url === "/attach") {

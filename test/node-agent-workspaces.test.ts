@@ -477,6 +477,34 @@ test("a workspace records the snapshot it was released into beside its files, ou
   }
 });
 
+test("a workspace's record of its release is cleared as a restore clears it, only where it names the snapshot restored still: one that names another, written meanwhile, stands, and nothing is left beside it", async () => {
+  const at = workspacesNode();
+  try {
+    const ref = { environment: "main", workspace: "fs-cleared" };
+    const files = at.files("fs-cleared");
+    const restored = { snapshot: "20261017T120000000Z-0000000a", release: "20260921.0-eaucoin.8" };
+    const newer = { snapshot: "20261017T130000000Z-0000000b", release: "20260921.0-eaucoin.8", pod: "pool-0" };
+    // None to clear.
+    assert.equal(await Effect.runPromise(at.workspaces.clearReleased(ref, restored.snapshot)), false);
+    // Released again since, into a newer: left as it is.
+    await Effect.runPromise(at.workspaces.setReleased(ref, newer));
+    assert.equal(await Effect.runPromise(at.workspaces.clearReleased(ref, restored.snapshot)), false);
+    assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), newer);
+    // Still the one restored: cleared.
+    await Effect.runPromise(at.workspaces.setReleased(ref, restored));
+    assert.equal(await Effect.runPromise(at.workspaces.clearReleased(ref, restored.snapshot)), true);
+    assert.equal(await Effect.runPromise(at.workspaces.released(ref)), null);
+    assert.deepEqual(readdirSync(join(files, "..")), ["files"]);
+    // One that is no record is none of the snapshot's, left as it is.
+    writeFileSync(join(files, "..", "released.json"), "{\"snapshot\":\"../../x\"}");
+    assert.equal(await Effect.runPromise(at.workspaces.clearReleased(ref, restored.snapshot)), false);
+    assert.deepEqual(readdirSync(join(files, "..")).sort(), ["files", "released.json"]);
+    assert.equal(await refusal(at.workspaces.clearReleased({ environment: "main", workspace: "fs-never" }, restored.snapshot)), 404);
+  } finally {
+    at.done();
+  }
+});
+
 test("nothing is made, cloned, attached or recorded where workspace storage is not mounted at the root, as for the moment its mount is handed over, nor written beneath it", async () => {
   const at = workspacesNode();
   try {

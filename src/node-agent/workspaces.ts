@@ -75,7 +75,11 @@
  * keeps the snapshot it was last released into (`released.json`, a Released), which its
  * gateway records as it releases it and reads as it binds it, holding its binding's Lease
  * meanwhile, the one writer at a time: written whole or not at all, a file of its own synced
- * then renamed over it, the directory synced after.
+ * then renamed over it, the directory synced after. A restore clears it once its bind is
+ * through, its Lease no longer held for it, so a release may record another meanwhile: it is
+ * cleared only where it records the snapshot restored still (clearReleased), taken aside by a
+ * rename and linked back where it records another after all, so a record written meanwhile
+ * stands.
  */
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -83,7 +87,7 @@ import { constants, type StatsFs } from "node:fs";
 import { chmod, chown, link, lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, statfs, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { Clock, Effect, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
+import { Clock, Effect, Option, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import { isValidVolumeId } from "../sandbox/names.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
@@ -233,6 +237,8 @@ export interface Workspaces {
   readonly released: (ref: WorkspaceRef) => Effect.Effect<Released | null, WorkspaceRefused>;
   /** Records the snapshot `ref` is released into, or none, as the module says; refused where there is no such workspace. */
   readonly setReleased: (ref: WorkspaceRef, released: Released | null) => Effect.Effect<void, WorkspaceRefused>;
+  /** Records none where `ref`'s record names `snapshot` still, as the module says: whether it did; refused where there is no such workspace. */
+  readonly clearReleased: (ref: WorkspaceRef, snapshot: string) => Effect.Effect<boolean, WorkspaceRefused>;
 }
 
 /** How long a file of a workspace may take to read or write: the workspace's storage may not answer. */
@@ -752,10 +758,7 @@ export const makeWorkspaces = Effect.fnUntraced(function*(
     released: (ref) =>
       Effect.gen(function*() {
         const directory = join(yield* filesOf(ref), "..");
-        const text = yield* onMount(`${ref.environment}/${ref.workspace}'s release could not be read`, () =>
-          readFile(join(directory, RELEASED_FILE), { encoding: "utf8", flag: constants.O_RDONLY | constants.O_NOFOLLOW }).catch((error: NodeJS.ErrnoException) =>
-            error.code === "ENOENT" ? null : Promise.reject(error)
-          ));
+        const text = yield* onMount(`${ref.environment}/${ref.workspace}'s release could not be read`, () => recordAt(join(directory, RELEASED_FILE)));
         if (text === null) return null;
         return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Released))(text).pipe(
           Effect.mapError(() => refused(500, `${ref.environment}/${ref.workspace}'s record of its release is not one`)),
@@ -781,13 +784,48 @@ export const makeWorkspaces = Effect.fnUntraced(function*(
             }
             await rename(staged, file);
           }
-          const parent = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
-          try {
-            await parent.sync();
-          } finally {
-            await parent.close();
-          }
+          await synced(directory);
+        });
+      }),
+
+    clearReleased: (ref, snapshot) =>
+      Effect.gen(function*() {
+        const directory = join(yield* filesOf(ref), "..");
+        if (!(yield* there(directory))) return yield* refused(404, `there is no workspace ${ref.environment}/${ref.workspace}`);
+        const file = join(directory, RELEASED_FILE);
+        /** Whether the record at `path` names `snapshot`: none, or one that is no record, does not. */
+        const names = async (path: string) => {
+          const text = await recordAt(path);
+          const record = text === null ? Option.none() : Schema.decodeUnknownOption(Schema.fromJsonString(Released))(text);
+          return Option.isSome(record) && record.value.snapshot === snapshot;
+        };
+        return yield* onMount(`${ref.environment}/${ref.workspace}'s record of its release into ${snapshot} could not be cleared`, async () => {
+          // One that records another is left as it is, as it was read.
+          if (!(await names(file))) return false;
+          const taken = `${file}.${randomBytes(8).toString("hex")}`;
+          const moved = await rename(file, taken).then(() => true, (error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? false : Promise.reject(error)));
+          if (!moved) return false;
+          const cleared = await names(taken);
+          // Written over between the read and the rename: linked back, unless another was written since, which stands.
+          if (!cleared) await link(taken, file).catch((error: NodeJS.ErrnoException) => (error.code === "EEXIST" ? undefined : Promise.reject(error)));
+          await unlink(taken);
+          await synced(directory);
+          return cleared;
         });
       }),
   };
 });
+
+/** The text of the record of a release at `path`, none of a link; null where there is none. */
+const recordAt = (path: string): Promise<string | null> =>
+  readFile(path, { encoding: "utf8", flag: constants.O_RDONLY | constants.O_NOFOLLOW }).catch((error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? null : Promise.reject(error)));
+
+/** Syncs `directory`, so what was renamed, linked or removed in it stays so. */
+async function synced(directory: string): Promise<void> {
+  const parent = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
+  try {
+    await parent.sync();
+  } finally {
+    await parent.close();
+  }
+}
