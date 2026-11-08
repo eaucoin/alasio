@@ -62,6 +62,13 @@
  *   sandbox and gofers among them, that is still the one it found, so that the pod's
  *   teardown waits on none of them: `{ killed: [{ containerId, pid }] }` (200). 500 when
  *   runsc's containers, or the node's processes, could not be read, or one not killed.
+ * - `POST /standby/restore`, `{ environment, workspace, namespace, pod, imagePath }`: restores
+ *   the workspace's image, `imagePath`, as this node's agent prepared it, into the standby pod
+ *   `namespace`/`pod` on this node, paused, asking each of its shims in turn (./standby.ts):
+ *   `{ containers, milliseconds }`, its containers and how long each took (200). 403 where
+ *   `imagePath` is no image of the workspace's in the snapshot cache; 409 where the standby
+ *   takes no restore, as no shim of it listens or its shim took one already, nothing of it run;
+ *   500 where its restore failed, which ends its sandbox.
  * - `GET /snapshots/<environment>/<workspace>`: the manifest of its current snapshot (200),
  *   or 404.
  * - `DELETE /snapshots/<environment>/<workspace>`: forgets its snapshots, in the bucket and
@@ -195,6 +202,7 @@ import {
 import { type Failure, makeOperations, type Operations } from "./operations.ts";
 import { makeRunsc } from "./runsc.ts";
 import { makeS3Bucket } from "./s3.ts";
+import { makeStandbyRestores, StandbyRestoreRequest, type StandbyRestores } from "./standby.ts";
 import { makeStoreProxy, type StoreProxyError } from "./store-proxy.ts";
 import { observeStorageUsage } from "./storage-usage.ts";
 
@@ -205,6 +213,8 @@ export interface NodeAgentServerOptions {
   readonly token: string;
   readonly agent: NodeAgent;
   readonly workspaces: Workspaces;
+  /** The restores into standby pods on the node, whose shims listen under STANDBY_SOCKETS unless given. */
+  readonly standbys?: StandbyRestores;
 }
 
 /** The most a file written into a workspace may be: a received file's, Telegram's largest a bot gets, with room. */
@@ -248,6 +258,8 @@ const STATUS: Readonly<Record<string, number>> = {
   KubeApiError: 503,
   SandboxUnsaveable: 410,
   JuicefsError: 503,
+  StandbyImageRefused: 403,
+  StandbyUnavailable: 409,
 };
 
 const SNAPSHOT = /^\/snapshots\/([^/]+)\/([^/]+)$/u;
@@ -314,6 +326,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
   token,
   agent,
   workspaces,
+  standbys = makeStandbyRestores(),
 }: NodeAgentServerOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope> {
   const scope = yield* Effect.scope;
   const checkpoints = yield* makeOperations<Manifest, CheckpointFailed | SandboxUnsaveable>(scope, failureOf);
@@ -350,6 +363,9 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     }
     if (method === "POST" && url === "/resume") {
       return body(ResumeRequest).pipe(Effect.flatMap(agent.resume), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    }
+    if (method === "POST" && url === "/standby/restore") {
+      return body(StandbyRestoreRequest).pipe(Effect.flatMap(standbys.restore), Effect.map((restored) => answer(200, restored)));
     }
     if (method === "POST" && url === "/abandon") {
       return body(AbandonRequest).pipe(Effect.flatMap(agent.abandon), Effect.map((killed) => answer(200, { killed })));

@@ -11,6 +11,7 @@ import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { Gofer } from "../node-agent/names.ts";
 import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, type PrepareRequest, type ResumeRequest, resumeMs, type WorkspaceRef } from "../node-agent/agent.ts";
 import { HOLDINGS_WAIT_MS, NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
+import { type StandbyRestoreRequest, StandbyRestored } from "../node-agent/standby.ts";
 import { type PodOwner, Released, type StopRequest, type SyncRequest } from "../node-agent/workspaces.ts";
 
 /** Where the node agents are: their pods' namespace and labels, and the port they serve on. */
@@ -111,6 +112,13 @@ export interface NodeAgents {
    * with 504, the sandbox left paused.
    */
   readonly resume: (node: string, request: ResumeRequest, bytes: number) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /**
+   * Restores the workspace's image `request` names, as the agent of `node` prepared it, into
+   * the standby pod it names there, paused, until resumed as a restore's pod is: its containers,
+   * and how long each took. An agent refuses one whose standby takes no restore with 409,
+   * nothing of it run; one whose restore failed, which ends its sandbox, fails with 500.
+   */
+  readonly restoreStandby: (node: string, request: StandbyRestoreRequest) => Effect.Effect<StandbyRestored, NodeAgentError | KubeApiError>;
   /**
    * Abandons the restore `request` names, into its pod on `node`, of the uid it names,
    * refused before its sandbox resumed: the agent kills what runsc runs for the pod's containers there, so
@@ -486,6 +494,8 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
         ),
     resume: (node, request, bytes) =>
       send(node, `resume ${request.environment}/${request.workspace}'s sandbox`, { method: "POST", path: "/resume", body: request, timeout: Duration.millis(resumeMs(bytes)) }).pipe(Effect.asVoid),
+    restoreStandby: (node, request) =>
+      ask(node, `restore ${request.environment}/${request.workspace} into the standby ${request.namespace}/${request.pod}`, { method: "POST", path: "/standby/restore", body: request, timeout: LONG_CALL }, StandbyRestored),
     abandon: (node, request) =>
       ask(node, `abandon ${request.environment}/${request.workspace}'s restore`, { method: "POST", path: "/abandon", body: request, timeout: SHORT_CALL }, Abandoned).pipe(
         Effect.map(({ killed }) => killed),

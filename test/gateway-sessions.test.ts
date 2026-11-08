@@ -101,7 +101,7 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
       released: () => Effect.succeed(null),
       // What is attached on its node is reachable, unless a test says otherwise.
       attachments: () => Effect.succeed([]),
-      prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, held: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
+      prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, held: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused, restoreStandby: unused,
       readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, listEnvironments: unused(), quota: unused, sync: unused, bindFree: unused,
       checkpoint: (node, request) =>
         Effect.gen(function*() {

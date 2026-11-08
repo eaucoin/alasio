@@ -56,6 +56,16 @@ export const RESUMED_CONDITION = "alasio.dev/resumed";
  */
 export const UNSPENT_REASON = "SnapshotUnspent";
 export const SPENT_REASON = "SnapshotSpent";
+/**
+ * The fork's annotation that boots a pod's sandbox as a standby: its containers created and
+ * none started, until a restore into it is asked of its shim over the Unix socket it names,
+ * on the node (../node-agent/standby.ts).
+ */
+export const STANDBY_ANNOTATION = "dev.gvisor.internal.restore.standby";
+/** The label of a standby pod of a pool, its node's name, which the restore that claims it takes off. */
+export const STANDBY_LABEL = "alasio.dev/standby";
+/** Where a standby pod's shims listen on its node, as `<namespace>/<pod>.sock`, and each of its containers' own beside it. */
+export const STANDBY_SOCKETS = "/run/alasio/standby";
 /** Where a node agent keeps the snapshots it prepares, as `<environment>/<workspace>/<snapshot>` (../node-agent/cache.ts). */
 export const SNAPSHOT_CACHE_DIR = "/var/lib/alasio/snapshots";
 /**
