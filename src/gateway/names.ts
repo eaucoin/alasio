@@ -206,11 +206,15 @@ const Template = Schema.Record(Schema.String, Schema.Unknown);
  */
 export const GatewaySnapshots = Schema.Struct({
   liveEverySeconds: Schema.Number,
-  /** Each kept release, its RuntimeClass, and the checkpoint gofer a restore of a snapshot it took asks for, if any (../node-agent/names.ts goferOf). */
+  /**
+   * Each kept release, its RuntimeClass, the checkpoint gofer a restore of a snapshot it took asks for, if any
+   * (../node-agent/names.ts goferOf), and whether its shim restores into a standby (restoresIntoStandby).
+   */
   releases: Schema.Array(Schema.Struct({
     release: Schema.String,
     runtimeClassName: Schema.String,
     gofer: Schema.NullOr(Schema.Struct({ transport: Schema.Literals(["socket", "tcp"]), pagesRetry: Schema.Boolean })),
+    standby: Schema.Boolean,
   })),
   templates: Schema.Struct({
     none: Schema.Struct({ current: Template, previous: Schema.NullOr(Template) }),

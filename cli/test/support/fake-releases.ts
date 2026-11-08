@@ -50,7 +50,7 @@ export function fakeReleases(
   const stargzArchive = gzipSync(tarArchive([...stargzFiles].map(([name, content]): TarEntry => ({ name, type: "file", mode: 0o755, content: Buffer.from(content) }))));
   const pins: NodePins = {
     k3s: { ...NODE_PINS.k3s, version: k3s, sha256: sha("sha256", binary), installScript: { commit: `commit-of-${k3s}`, sha256: sha("sha256", script) } },
-    gvisor: { restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince, restoresThroughSocketSince: NODE_PINS.gvisor.restoresThroughSocketSince, releases: [...archives].map(([release, archive]) => ({ release, sha512: sha("sha512", archive) })) },
+    gvisor: { restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince, restoresThroughSocketSince: NODE_PINS.gvisor.restoresThroughSocketSince, ...(NODE_PINS.gvisor.restoresIntoStandbySince === undefined ? {} : { restoresIntoStandbySince: NODE_PINS.gvisor.restoresIntoStandbySince }), releases: [...archives].map(([release, archive]) => ({ release, sha512: sha("sha512", archive) })) },
     stargz: { version: stargz, sha256: sha("sha256", stargzArchive) },
   };
   const from = downloads(pins);

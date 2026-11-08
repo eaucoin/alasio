@@ -118,6 +118,8 @@ export interface SessionsOptions {
   /** How main's sessions are snapshotted (./snapshots.ts), none where they are not, and main's sessions' namespace. */
   readonly snapshots?: GatewaySnapshotsConfig | null;
   readonly mainNamespace?: string;
+  /** How long after a restore on a node the next standby is made there, as ./standbys.ts says unless given. */
+  readonly standbyAfterMs?: number;
 }
 
 /** The most of a workspace's file read where the caller says no less: a received file's, as the node agents write one. */
@@ -169,12 +171,12 @@ export interface Sessions {
 
 /** The gateway's sessions, as the module says, on the node agents, the binder, and the KubeClient, what they run in the background run while the scope lasts. */
 export const makeSessions = Effect.fnUntraced(function*(
-  { environments, pools: poolNames, releaseAfterMs, podPort, bindingKey, idlePollMs = IDLE_POLL_MS, telemetry, quotaBytes, snapshots: snapshotsConfig = null, mainNamespace = "" }: SessionsOptions,
+  { environments, pools: poolNames, releaseAfterMs, podPort, bindingKey, idlePollMs = IDLE_POLL_MS, telemetry, quotaBytes, snapshots: snapshotsConfig = null, mainNamespace = "", standbyAfterMs }: SessionsOptions,
   agents: NodeAgents,
   binder: Binder["Service"],
 ): Effect.fn.Return<Sessions, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
-  const snapshots = yield* makeGatewaySnapshots({ agents, snapshots: snapshotsConfig, mainNamespace, port: podPort });
+  const snapshots = yield* makeGatewaySnapshots({ agents, snapshots: snapshotsConfig, mainNamespace, port: podPort, ...(standbyAfterMs === undefined ? {} : { standbyAfterMs }) });
   const pools = Effect.map(environments.current, (current) => current.flatMap(({ namespace }) => (Object.values(poolNames) as string[]).map((name): Pool => ({ name, namespace }))));
   /** The address `host` resolves to. */
   const addressOf = (host: string): Effect.Effect<string, BindStepFailed> =>
@@ -204,9 +206,9 @@ export const makeSessions = Effect.fnUntraced(function*(
             ...(made ? { made } : {}),
           })).pipe(Effect.mapError((error) => new BindStepFailed({ reason: error.message })));
         });
-      // Restored from the snapshot it was released into, where it was, by a pod of its own, its workspace attached first (./snapshots.ts).
+      // Restored from the snapshot it was released into, where it was, by a pod of its own, or its node's standby, its workspace attached first (./snapshots.ts).
       const restoring = snapshots.restoring(pool, volumeId, mode, {
-        attach: (node, pod, binding, env) => attachInto(node, pod, binding, true, env),
+        attach: (node, pod, binding, env, made) => attachInto(node, pod, binding, made, env),
         detach: (node, pod) => detachOnceGone(pool, node, pod),
       });
       return {

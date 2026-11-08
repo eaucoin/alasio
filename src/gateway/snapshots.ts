@@ -28,8 +28,12 @@
  * confined there, then resumed, and ready, its record of its release cleared; once its bind is
  * through, its snapshot is spent in the background by its node's agent, only where it is the
  * current one still, its pod's resumed condition saying it is to be until it is, so that a gateway
- * started again meanwhile spends it as it next looks at its bound pods (spendLater, spendRestored). One whose
- * restore runsc refuses falls back at once; one whose pod cannot start otherwise, as a pull or a
+ * started again meanwhile spends it as it next looks at its bound pods (spendLater, spendRestored). Where the
+ * release's shim restores into a standby, and the node keeps one of that template and release (./standbys.ts),
+ * the restore claims it instead, its
+ * workspace attached into its directory, and its node's agent restores the snapshot into it, paused, as
+ * into a pod made for it; one whose restore so fails is given up, and the restore made into a pod of its
+ * own. One whose restore runsc refuses falls back at once; one whose pod cannot start otherwise, as a pull or a
  * node's hiccup fails it, is deferred, as the others that may pass. Only the snapshot the record
  * says it was released into restores, or one its node's agent compacted from it since, which is the
  * same: one it has moved on from since is stale. A restore that cannot be done now, as what it
@@ -72,7 +76,7 @@ import { Clock, Effect, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import { BindStepFailed, type MakePod } from "../binder/binder.ts";
 import { FREE_LABEL, type Pool } from "../binder/names.ts";
-import { type KubeApiError, KubeClient } from "../kube/client.ts";
+import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
 import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SANDBOX_STOP_REASON_VARIABLE, SESSION_TEMPLATE_ANNOTATION, SNAPSHOT_ID, SPENT_REASON, STOP_WAIT_ARG, UNSPENT_REASON } from "../kube/sandbox-shape.ts";
 import type { Manifest } from "../node-agent/agent.ts";
 import { RESTORE_RUNNING_WAIT_MS } from "../node-agent/names.ts";
@@ -80,6 +84,7 @@ import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { withLogScope } from "../shared/log.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
 import { type GatewaySnapshots as SnapshotsConfig, ownDirectory, restorePodName } from "./names.ts";
+import { makeStandbys } from "./standbys.ts";
 
 /** Why a session with a snapshot was resumed without it. */
 export type Fallback = "release" | "template" | "stale" | "node" | "prepare" | "restore" | "unreadable";
@@ -272,13 +277,13 @@ export interface Restoring {
 }
 
 /**
- * How a restore's workspace is attached into the directory of its pod, `pod`, on `node`, made for
- * it, before the pod is (`attach`, of the binding `binding`), its bayma's hook given the variables
- * `env` beside its own; and how what was attached is detached, once the pod has gone, as its
- * restore did not come back (`detach`).
+ * How a restore's workspace is attached into the directory of its pod, `pod`, on `node` (`attach`,
+ * of the binding `binding`): made for it, before the pod is, where `made`, or the one kubelet made
+ * of a standby it claimed; its bayma's hook given the variables `env` beside its own; and how what
+ * was attached is detached, once the pod has gone, as its restore did not come back (`detach`).
  */
 export interface Attaching {
-  readonly attach: (node: string, pod: string, binding: string, env: Readonly<Record<string, string>>) => Effect.Effect<void, BindStepFailed>;
+  readonly attach: (node: string, pod: string, binding: string, env: Readonly<Record<string, string>>, made: boolean) => Effect.Effect<void, BindStepFailed>;
   readonly detach: (node: string, pod: string) => Effect.Effect<void>;
 }
 
@@ -365,12 +370,16 @@ export interface GatewaySnapshotsOptions {
   readonly snapshots: SnapshotsConfig | null;
   readonly mainNamespace: string;
   readonly port: number;
+  /** How long after a restore on a node the next standby is made there: STANDBY_AFTER_MS unless given (./standbys.ts). */
+  readonly standbyAfterMs?: number;
 }
 
 /** The gateway's snapshots, as the module says, on its node agents and the KubeClient, what they run in the background run while the scope lasts. */
-export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapshots, mainNamespace, port }: GatewaySnapshotsOptions): Effect.fn.Return<GatewaySnapshots, never, KubeClient | Scope.Scope> {
+export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapshots, mainNamespace, port, standbyAfterMs }: GatewaySnapshotsOptions): Effect.fn.Return<GatewaySnapshots, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
   const scope = yield* Effect.scope;
+  /** The standby pods main's restores claim, where its sessions are snapshotted (./standbys.ts). */
+  const standbys = snapshots ? yield* makeStandbys(mainNamespace, standbyAfterMs === undefined ? {} : { afterMs: standbyAfterMs }) : null;
   const ref = (pool: Pool, workspace: string) => ({ environment: pool.namespace, workspace });
 
   /** The pod `name` of `pool`, as the API server has it now. */
@@ -695,8 +704,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       // again, whatever comes of its spend. Tried a few times; where it cannot be, a release of it records anew. One whose
       // readiness cannot be set falls back, its record cleared so too.
       const [ready] = yield* Effect.all([
-        // Its snapshot unspent, until it is (spendLater); its failure waits for the clear, which it does not cut short.
-        kube.patchPodStatus(pool.namespace, name, { status: { conditions: [{ type: RESUMED_CONDITION, status: "True", lastTransitionTime: now, reason: UNSPENT_REASON }] } }).pipe(Effect.result),
+        // Its snapshot unspent, until it is (spendLater), named, as a standby's pod carries no image's path that says it; its
+        // failure waits for the clear, which it does not cut short.
+        kube.patchPodStatus(pool.namespace, name, { status: { conditions: [{ type: RESUMED_CONDITION, status: "True", lastTransitionTime: now, reason: UNSPENT_REASON, message: snapshot }] } }).pipe(Effect.result),
         agents.setReleased(ref(pool, workspace), null).pipe(
           Effect.retry(CLEAR_TRIES),
           Effect.catch((error) => Effect.logWarning(`could not clear ${named(pool, workspace)}'s record of its release: ${error.message}`)),
@@ -771,8 +781,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       if (again !== undefined && again.pod !== name) spendAgain.delete(it);
       // Of a sandbox resumed alone, as its readiness gate's condition says: one never resumed runs on from no snapshot.
       const resumed = (pod.status?.conditions ?? []).find(({ type, status }) => type === RESUMED_CONDITION && status === "True");
-      // The snapshot it was restored from, the last name of the path of the image it was restored from, under the snapshot cache.
-      const snapshot = posix.basename(pod.metadata?.annotations?.[RESTORE_ANNOTATION] ?? "");
+      // The snapshot it was restored from, the last name of the path of the image it was restored from, under the snapshot cache,
+      // or, of a standby restored into, which names no image, as its condition says it.
+      const snapshot = posix.basename(pod.metadata?.annotations?.[RESTORE_ANNOTATION] ?? resumed?.message ?? "");
       const node = pod.spec?.nodeName;
       if (resumed?.reason !== UNSPENT_REASON || !node || !RESTORED_SNAPSHOT.test(snapshot)) return Effect.void;
       return Effect.flatMap(Clock.currentTimeMillis, (now) => (again?.pod === name && now < again.at ? Effect.void : spendLater(pool, workspace, name, node, snapshot)));
@@ -843,17 +854,85 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           ].map((said) => `, ${said}`).join("");
           return yield* (able.success.answered ? fallBack(pool, workspace, "node", none) : deferOr(pool, workspace, "node", `${none} of the nodes whose agents answered${unasked}`));
         }
+        // The standbys it is restored into and kept as, where the shim of the release that took it restores into one.
+        const standing = kept.standby ? standbys : null;
         // Each node tried in turn: one that cannot restore it (409) leaves the others; one whose bucket or agent fails may pass.
         const failures: (NodeAgentError | KubeApiError)[] = [];
         for (const node of able.success.nodes) {
+          // Of one stopped as it ran out of its memory, its bayma's hook told so, for its sessions' next execs.
+          const stopReason = into?.memoryLimit === undefined ? {} : { [SANDBOX_STOP_REASON_VARIABLE]: `it ran out of its memory (${into.memoryLimit})` };
+          // Into the node's standby of its template and release, where one runs there, claimed for its binding first, so the
+          // sync of its network policies its labels start runs as it is restored into (./standbys.ts); its workspace attached
+          // into its directory as its snapshot is prepared, then restored into it, paused. One whose restore cannot be done so
+          // is given up, the restore made into a pod of its own as below. Claimed uninterruptibly, so that a bind given up from
+          // its claim on leaves no standby claimed for it. One whose claim cannot be told made or not, its answer lost, may be the
+          // binding's: the bind fails, as one whose pod's creation fails does, rather than make it another.
+          const tried = standing === null ? null : yield* Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
+            const standby = yield* standing.claim(pool, node, base, kept.runtimeClassName, labels, annotations).pipe(
+              Effect.mapError((error) => new BindStepFailed({ reason: error.message })),
+            );
+            if (standby === null) return null;
+            const name = standby.metadata?.name ?? "";
+            /**
+             * The standby given up, `why`: deleted, as a restore's pod that did not come back is, tried a few times, one gone
+             * already taken as deleted, what was attached into it detached once it has gone; whether it is gone. One that is
+             * not leaves the bind to fail rather than make the binding another pod beside it.
+             */
+            const giveUp = (why: string): Effect.Effect<boolean> =>
+              Effect.logWarning(`the standby ${pool.namespace}/${name} on ${node} is given up for ${named(pool, workspace)}: ${why}`).pipe(
+                Effect.andThen(kube.remove("v1", "Pod", pool.namespace, name).pipe(
+                  Effect.catchIf(hasStatus(404), () => Effect.void),
+                  Effect.retry({ schedule: Schedule.spaced("500 millis"), times: 3 }),
+                  Effect.as(true),
+                  Effect.catch((error) => Effect.logWarning(`could not delete the standby ${pool.namespace}/${name}: ${error.message}`).pipe(Effect.as(false))),
+                )),
+                Effect.tap(() => attaching.detach(node, name)),
+              );
+            /** Fails the bind where the standby `gone` says is not, as it may run on with the binding's labels. */
+            const unless = (gone: boolean) => (gone ? Effect.void : Effect.fail(new BindStepFailed({ reason: `the standby ${pool.namespace}/${name}, given up, could not be deleted` })));
+            // Restored into: the standby; its prepare failed, as one for a pod made for it may; or given up otherwise.
+            return yield* restore(Effect.gen(function*() {
+              const [prepared, attached] = yield* Effect.all([
+                agents.prepare(node, ref(pool, workspace), manifest, kept.gofer ?? undefined).pipe(Effect.result),
+                attaching.attach(node, name, binding, stopReason, false).pipe(Effect.result),
+              ], { concurrency: 2 });
+              if (attached._tag === "Failure") {
+                yield* giveUp(attached.failure.message);
+                return yield* attached.failure;
+              }
+              if (prepared._tag === "Failure") {
+                yield* unless(yield* giveUp(prepared.failure.message));
+                return { unprepared: prepared.failure } as const;
+              }
+              yield* Effect.logInfo(`restoring ${named(pool, workspace)} on ${node} into the standby ${name} from its snapshot ${manifest.snapshot}, taken at ${manifest.takenAt} under gVisor ${manifest.release}`);
+              const done = yield* agents.restoreStandby(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, imagePath: prepared.success.imagePath }).pipe(Effect.result);
+              if (done._tag === "Failure") {
+                yield* unless(yield* giveUp(`its restore failed, so it is restored into a pod made for it: ${done.failure.message}`));
+                return { fellBack: true } as const;
+              }
+              return { restored: standby } as const;
+            })).pipe(
+              // A bind given up meanwhile leaves no standby claimed for it.
+              Effect.onInterrupt(() => giveUp("its bind was given up")),
+            );
+          }));
+          if (standing !== null && tried !== null && "restored" in tried) {
+            restored = { pod: tried.restored.metadata?.name ?? "", node, snapshot: manifest.snapshot, bytes: manifest.bytes, manifest, labels: tried.restored.metadata?.labels ?? {}, started };
+            yield* standing.keep(pool, node, base, kept.runtimeClassName);
+            return tried.restored;
+          }
+          if (tried !== null && "unprepared" in tried) {
+            // As a prepare for a pod made for it does, it leaves the node to the others.
+            failures.push(tried.unprepared);
+            continue;
+          }
           // Named before it is made, as its own directory is by its name (ownDirectory); its workspace
           // attached there while its snapshot is prepared, before the pod is made, so its sandbox, restored as its bayma
-          // starts, finds every file it held open; and, of one stopped as it ran out of its memory, its bayma's hook told
-          // so, for its sessions' next execs.
+          // starts, finds every file it held open.
           const name = restorePodName(pool.name, randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7));
           const [prepared, attached] = yield* Effect.all([
             agents.prepare(node, ref(pool, workspace), manifest, kept.gofer ?? undefined).pipe(Effect.result),
-            attaching.attach(node, name, binding, into?.memoryLimit === undefined ? {} : { [SANDBOX_STOP_REASON_VARIABLE]: `it ran out of its memory (${into.memoryLimit})` }).pipe(Effect.result),
+            attaching.attach(node, name, binding, stopReason, true).pipe(Effect.result),
           ], { concurrency: 2 });
           if (prepared._tag === "Failure") {
             failures.push(prepared.failure);
@@ -891,6 +970,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             Effect.mapError((error) => new BindStepFailed({ reason: `its restore's pod could not be made: ${error.message}` })),
           );
           restored = { pod: pod.metadata?.name ?? "", node, snapshot: manifest.snapshot, bytes: manifest.bytes, manifest, labels: pod.metadata?.labels ?? {}, started };
+          // A standby kept on the node for the next restore of its template and release there.
+          if (standing !== null) yield* standing.keep(pool, node, base, kept.runtimeClassName);
           return pod;
         }
         // Gone or corrupt (404, 422), or of no node's (409), it never restores; otherwise it may yet.

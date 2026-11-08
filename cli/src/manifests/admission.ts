@@ -34,7 +34,7 @@ import { BINDING_LABEL, FREE_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../../
 import { branchNamespace, branchSessionsNamespace } from "../../../src/branch/names.ts";
 import { ATTACH_VOLUME, FOLDER_KEY_PREFIX, FOLDER_POOL, FOLDER_POD, folderPodSpec, folderTokenSecret, ownDirectory, SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
 import { BUSY_ANNOTATIONS, BUSY_LABEL } from "../../../src/kube/busy-label.ts";
-import { RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SNAPSHOT_CACHE_DIR, SNAPSHOT_ID } from "../../../src/kube/sandbox-shape.ts";
+import { RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SNAPSHOT_CACHE_DIR, SNAPSHOT_ID, STANDBY_ANNOTATION, STANDBY_LABEL, STANDBY_SOCKETS } from "../../../src/kube/sandbox-shape.ts";
 import { ATTACH_ROOT, RESTORE_POD } from "../../../src/node-agent/names.ts";
 import { componentName, labels, NAMESPACE, neonName, RELEASE } from "./common.ts";
 
@@ -395,6 +395,43 @@ function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClass
   return `(${pinned("object.spec", restoring)} && ${pinned("variables.labels", labels)} && ${pinned("variables.annotations", annotations)})`;
 }
 
+/** A standby's socket on its node: its namespace's and its own name's, under the standbys', its name a restore's pod's. */
+const STANDBY_SOCKET = new Check((expression) => `${expression} == ${JSON.stringify(`${STANDBY_SOCKETS}/`)} + object.metadata.namespace + "/" + object.metadata.name + ".sock" && object.metadata.name.matches(${JSON.stringify(RESTORE_POD.source)})`);
+
+/**
+ * A standby of the pool template `template`, as the gateway makes it (src/gateway/standbys.ts) and
+ * the API server stores it: a restore's pod (restorePod) but for its binding, which it has none of
+ * until a restore claims it, its image, which it has none of, as it boots a standby, its socket
+ * its own, and its own directory, which kubelet makes, empty.
+ */
+function standbyPod(template: V1PodTemplateSpec, runtimeClasses: readonly string[]): string {
+  const owned = ownDirectory(template.spec ?? { containers: [] }, "", "");
+  const volumes = (owned.volumes ?? []).map((volume) => (volume.name === ATTACH_VOLUME ? { name: ATTACH_VOLUME, hostPath: { path: OWN_DIRECTORY, type: "DirectoryOrCreate" } } : volume));
+  const restoredOn: Pinned = {
+    nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: [matching(NODE_NAME)] }] }] } },
+  };
+  const standing = poolPodSpec({
+    ...template,
+    spec: {
+      ...owned,
+      volumes,
+      restartPolicy: "Never",
+      runtimeClassName: oneOf(...runtimeClasses),
+      readinessGates: [...((template.spec?.readinessGates ?? []) as unknown as Pinned[]), { conditionType: RESUMED_CONDITION }],
+      affinity: restoredOn,
+    } as unknown as V1PodSpec,
+  });
+  const { [FREE_LABEL]: _free, ...own } = (template.metadata?.labels ?? {}) as PinnedMap;
+  const labels = { ...own, [STANDBY_LABEL]: matching(NODE_NAME) } as PinnedMap;
+  const annotations = {
+    ...(template.metadata?.annotations ?? {}),
+    [STANDBY_ANNOTATION]: STANDBY_SOCKET,
+    vpaObservedContainers: optional(ANY_STRING),
+    vpaUpdates: optional(ANY_STRING),
+  } as PinnedMap;
+  return `(${pinned("object.spec", standing)} && ${pinned("variables.labels", labels)} && ${pinned("variables.annotations", annotations)})`;
+}
+
 /**
  * Every pod of a namespace of sessions, main's or a branch environment's, made or changed by
  * anyone, held to what the pools' templates, `templates`, make, as Pod Security's restricted
@@ -405,11 +442,12 @@ function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClass
  * - A pod made is a pod of one of `templates`, as the API server stores it (poolPodSpec), its
  *   template's labels and annotations, its ReplicaSet's template hash beside them, and what
  *   VPA notes; or a restore's of main's sessions, of a template a snapshot restores onto
- *   (restorePod), made by the gateway alone; and no other pod is made there.
+ *   (restorePod), or a standby of one (standbyPod), made by the gateway alone; and no other pod
+ *   is made there.
  * - A pod changed keeps its spec whole (its resources change by pods/resize, which this does
  *   not match), and of its labels and annotations changes those a binding has alone (its free
- *   label taken off, its binding's put on) and those that keep its node, and of its owners lets
- *   go alone.
+ *   label, or its standby's, taken off, its binding's put on) and those that keep its node, and
+ *   of its owners lets go alone.
  * - No pod gets an ephemeral container.
  *
  * It fails closed: where it cannot say, the API server refuses.
@@ -423,11 +461,14 @@ export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sess
     const annotations = { ...(template.metadata?.annotations ?? {}), vpaObservedContainers: optional(ANY_STRING), vpaUpdates: optional(ANY_STRING) } as PinnedMap;
     return { name: `made${index}`, expression: `${pinned("object.spec", poolPodSpec(template))} && ${pinned("variables.labels", labels)} && ${pinned("variables.annotations", annotations)}` };
   });
-  const restoring = (restores?.templates ?? []).map((template, index) => ({ name: `restored${index}`, expression: restorePod(template, sessionsNamespace, restores?.runtimeClasses ?? []) }));
+  const restoring = [
+    ...(restores?.templates ?? []).map((template, index) => ({ name: `restored${index}`, expression: restorePod(template, sessionsNamespace, restores?.runtimeClasses ?? []) })),
+    ...(restores?.templates ?? []).map((template, index) => ({ name: `standby${index}`, expression: standbyPod(template, restores?.runtimeClasses ?? []) })),
+  ];
   const restored = restores
     ? [`(request.namespace == ${JSON.stringify(sessionsNamespace)} && request.userInfo.username == ${JSON.stringify(restores.restorer)} && (${restoring.map(({ name }) => `variables.${name}`).join(" || ")}))`]
     : [];
-  const bound = [BINDING_LABEL, FREE_LABEL];
+  const bound = [BINDING_LABEL, FREE_LABEL, STANDBY_LABEL];
   const policy = {
     apiVersion: "admissionregistration.k8s.io/v1",
     kind: "ValidatingAdmissionPolicy",
@@ -459,7 +500,7 @@ export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sess
         { expression: "request.?subResource.orValue('') != 'ephemeralcontainers'", message: "no pod of a namespace of sessions gets an ephemeral container" },
         {
           expression: `request.operation != 'CREATE' || !variables.pooled || ${[...made.map(({ name }) => `variables.${name}`), ...restored].join(" || ")}`,
-          message: "a pod of a sandbox pool is its pool's template, as alasio up renders it, or a restore's of one, as the sandbox gateway makes it, and nothing else",
+          message: "a pod of a sandbox pool is its pool's template, as alasio up renders it, or a restore's or a standby of one, as the sandbox gateway makes it, and nothing else",
         },
         { expression: "request.operation != 'CREATE' || variables.pooled", message: "no pod is made in a namespace of sessions but a sandbox pool's" },
         { expression: "request.operation != 'UPDATE' || object.spec == oldObject.spec", message: "no pod's spec changes in a namespace of sessions" },

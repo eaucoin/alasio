@@ -101,6 +101,16 @@ export interface Gofer {
 export const goferOf = (release: string, since: string): Gofer | null => (releaseAtOrPast(release, since) ? { transport: "socket", pagesRetry: true } : null);
 
 /**
+ * Whether the shim of gVisor's `release` restores into a standby, a pod booted ahead of its
+ * restore (../kube/sandbox-shape.ts STANDBY_ANNOTATION), soundly: one at or past `since`, the
+ * first release that does, as cluster/node/pins.json says it (gvisor.restoresIntoStandbySince).
+ * One before it runs a standby's containers as it would any pod's, and takes no restore into it;
+ * or, as the fork's .3, takes one, but leaves a standby's container it stops with its I/O open,
+ * which CRI waits on the end of, to stop it and as containerd starts again.
+ */
+export const restoresIntoStandby = (release: string, since: string): boolean => releaseAtOrPast(release, since);
+
+/**
  * The name of a restore's pod, as the gateway makes it (../gateway/names.ts restorePodName): its
  * pool's, `-restore-`, then seven of base 36's digits; the one name whose directory the node
  * agent makes for it, before the pod is made.

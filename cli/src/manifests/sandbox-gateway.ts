@@ -58,7 +58,7 @@ import {
   templateHash,
 } from "../../../src/gateway/names.ts";
 import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, CPU_FEATURES_ANNOTATION, NET_MODE_LABEL, SESSION_TEMPLATE_ANNOTATION, STOP_WAIT_ARG } from "../../../src/kube/sandbox-shape.ts";
-import { ATTACH_ROOT, goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
+import { ATTACH_ROOT, goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, restoresIntoStandby, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
 import { memoryBytes } from "../capacity.ts";
 import { NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
@@ -324,7 +324,12 @@ function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
     snapshots: poolsSnapshotted(carried.cpuBaseline)
       ? {
         liveEverySeconds: durationSeconds(config.sessions.snapshots.liveEvery) ?? 0,
-        releases: carried.gvisorReleases.map((release) => ({ release, runtimeClassName: gvisorRuntimeClass(release), gofer: goferOf(release, NODE_PINS.gvisor.restoresThroughSocketSince) })),
+        releases: carried.gvisorReleases.map((release) => ({
+          release,
+          runtimeClassName: gvisorRuntimeClass(release),
+          gofer: goferOf(release, NODE_PINS.gvisor.restoresThroughSocketSince),
+          standby: restoresIntoStandby(release, NODE_PINS.gvisor.restoresIntoStandbySince ?? ""),
+        })),
         templates: { none: templates("none"), full: templates("full") },
       }
       : null,

@@ -53,7 +53,7 @@ import { UNTIL_TERM } from "../src/manifests/image-holder.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { oneAtATime } from "../src/manifests/volume-lock.ts";
-import { goferOf, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
+import { goferOf, restoresIntoStandby, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
 import { hostPathOf, readUnder } from "../../src/node-agent/volume.ts";
 import { apiServerUnconfined } from "../src/install.ts";
 import { environmentAccess } from "../src/manifests/log.ts";
@@ -3650,6 +3650,15 @@ describe("the sandbox service", () => {
     assert.equal(goferOf("20260921.0-eaucoin.9", ""), null);
   });
 
+  test("a restore of a snapshot taken under a release at or past the first whose shim restores into a standby soundly, as the pins name it, may be restored into one; one before it, or where none is named, never", () => {
+    assert.deepEqual(
+      ["20261102.0-eaucoin.3", "20261102.0-eaucoin.4", "20261102.0-eaucoin.10", "20261102.1-eaucoin.1", "20260921.0-eaucoin.16"].map((release) => restoresIntoStandby(release, "20261102.0-eaucoin.4")),
+      [false, true, true, true, false],
+    );
+    assert.equal(restoresIntoStandby("20261102.0-eaucoin.4", ""), false);
+  });
+
+
   test("binds through a gateway of alasio's image, configured with its pools and the node agents, its keys the stack's, which may claim and delete its pools' pods and hold their Leases alone", () => {
     const objects = install();
     const gateway = one<V1Deployment>(objects, "Deployment", "alasio-sandbox-gateway");
@@ -3692,6 +3701,8 @@ describe("the sandbox service", () => {
           release,
           runtimeClassName: `gvisor-${release.split(".").join("-")}`,
           gofer: release === "20260921.0-eaucoin.8" ? null : { transport: "socket", pagesRetry: true },
+          // Restored into a standby where its shim restores into one soundly, as the pins name the first that does.
+          standby: restoresIntoStandby(release, NODE_PINS.gvisor.restoresIntoStandbySince ?? ""),
         })),
         templates: Object.fromEntries((["none", "full"] as const).map((mode) => [mode, { current: JSON.parse(JSON.stringify(one<V1Deployment>(objects, "Deployment", `sandboxes-${mode}`).spec?.template)), previous: null }])),
       },

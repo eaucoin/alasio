@@ -43,9 +43,10 @@ import { GATEWAY_RESTART_MS } from "../../src/sandbox/gateway-passing.ts";
 import { TOKEN_TTL_MS } from "../../src/sandbox/gateway-client.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
+import { STANDBY_LABEL } from "../../src/kube/sandbox-shape.ts";
 import { GVISOR_RELEASE_ANNOTATION, GVISOR_RUNTIME_CLASS_LABELS, SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
 import { gvisorReleases, NODE_PINS } from "../../cli/src/cluster/node.ts";
-import { ATTACH_ROOT, goferOf, gvisorDirectory, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
+import { ATTACH_ROOT, goferOf, gvisorDirectory, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, restoresIntoStandby, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { BACKGROUND_REPORT, ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
 import { ANSWER } from "./codex-stand-in.ts";
@@ -1683,6 +1684,12 @@ const repl = {
   sum: (volumeId: string, sessionId: string) => inAlasio<ReplSummed>("./session-repl.ts", "sum", volumeId, sessionId),
 };
 
+/** Code for a session's bayma that writes a MiB of random bytes at `path`, its directory made, and says their SHA-256. */
+const writeRandom = (path: string) =>
+  `const f=require("fs"),p=${JSON.stringify(path)},b=require("crypto").randomBytes(1<<20);f.mkdirSync(require("path").dirname(p),{recursive:true});f.writeFileSync(p,b);process.stdout.write(require("crypto").createHash("sha256").update(b).digest("hex"))`;
+/** Code for a session's bayma that says the SHA-256 of the file at `path`. */
+const digestOf = (path: string) => `process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(${JSON.stringify(path)})).digest("hex"))`;
+
 /** What bayma tells the first exec of a session that came back whole with its sandbox, and of one that came back from its checkpoint. */
 const CAME_BACK_WHOLE = /^bayma: this session came back whole with bayma's sandbox, restored from a snapshot taken at /u;
 const CAME_BACK_FROM_CHECKPOINT = /^bayma: this session came back from its checkpoint /u;
@@ -2021,6 +2028,71 @@ if (inShard("snapshots")) {
         assert.ok(Date.now() < deadline, "no alert on restores falling back reached Telegram");
         await sleep(5_000);
       }
+    });
+
+    test("a session restored where a restore ran before is restored into the standby its node keeps of the same template and gVisor release, claimed for it, whole, its workspace's files with it, and another is kept there after it; saved again from the standby, live and as it is released, it is restored from that save whole", { skip: !restoresIntoStandby(NODE_PINS.gvisor.releases[0]?.release ?? "", NODE_PINS.gvisor.restoresIntoStandbySince ?? "") && "the current gVisor release's shim restores into no standby" }, async (t) => {
+      const standing = await newSession("none");
+      let { sessionId: kept } = await repl.set(standing, `restored by ${standing}`);
+      await untilReleased(standing, Date.now());
+      // Restored once, as any is, which keeps a standby on the node it was restored on.
+      const { node } = await bindSession(standing);
+      /** The standby of `node` that runs, each of its containers started, other than `besides`. */
+      const standbyOn = (besides = "") =>
+        until(`a standby running on ${node}`, async () =>
+          (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${STANDBY_LABEL}=${node}` })).find((pod) =>
+            pod.metadata?.name !== besides && !pod.metadata?.deletionTimestamp && pod.status?.phase === "Running" &&
+            (pod.status.containerStatuses ?? []).length > 0 && (pod.status.containerStatuses ?? []).every(({ state }) => state?.running !== undefined)
+          ), 300_000);
+      const standby = await standbyOn();
+      assert.match(standby.metadata?.name ?? "", /^sandboxes-none-restore-/u);
+      assert.equal(standby.metadata?.annotations?.["dev.gvisor.internal.restore.standby"], `/run/alasio/standby/${SESSIONS}/${standby.metadata?.name}.sock`);
+      // A file of its workspace written before it is released again, which the sandbox restored into the standby, whose
+      // workspace is attached after it booted, is to find whole.
+      const before = await inSession(standing, writeRandom("/workspace/standby/before"));
+      // Released again, from the node that holds its images: restored into the standby, which it is bound to, its REPL whole.
+      ({ sessionId: kept } = await repl.set(standing, `restored into a standby by ${standing}`));
+      await untilReleased(standing, Date.now());
+      const asked = Date.now();
+      const bound = await bindSession(standing);
+      t.diagnostic(`bound ${Date.now() - asked} ms after it was asked for, on ${bound.node}`);
+      assert.deepEqual(bound, { name: standby.metadata?.name, node });
+      const claimed = await sessionPod(standing);
+      assert.equal(claimed.metadata?.labels?.[STANDBY_LABEL], undefined);
+      assert.ok(claimed.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True"), JSON.stringify(claimed.status?.conditions));
+      const seen = await repl.read(standing, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [`restored into a standby by ${standing}`, `restored into a standby by ${standing}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+      assertNoCapability(claimed);
+      await assertNoInternet(standing);
+      assert.ok((await gatewayLogs()).some((line) => line.includes(`restoring ${SESSIONS}/${standing} on ${node} into the standby ${standby.metadata?.name} `)), `the gateway logged no restore of ${standing} into ${standby.metadata?.name}`);
+      // Another kept on the node after it.
+      await standbyOn(standby.metadata?.name);
+      // Its workspace as the restored sandbox sees it: the file written before, whole, and one written now.
+      assert.equal(await inSession(standing, digestOf("/workspace/standby/before")), before);
+      const after = await inSession(standing, writeRandom("/workspace/standby/after"));
+      // Saved again from the sandbox restored into the standby: live, as an exec of it runs past liveEvery, then as it is released.
+      const went = "/workspace/standby/went";
+      const { sessionId: held } = await repl.hold(standing, went);
+      const live = await until(`a snapshot of ${standing} taken live from the standby`, async () => {
+        const snapshot = await snapshotOf(standing);
+        return snapshot?.live === undefined ? undefined : snapshot;
+      }, (LIVE_EVERY_SECONDS + 15) * 1000 + 180_000);
+      assert.ok(live.live?.running.some(({ sessionId }) => sessionId === held), `the live save of ${standing} caught no exec of ${held} running: ${JSON.stringify(live.live)}`);
+      await inSession(standing, `require("fs").writeFileSync(${JSON.stringify(went)}, "")`);
+      await untilReleased(standing, Date.now());
+      const released = await snapshotOf(standing);
+      assert.ok(released && released.live === undefined, `the session ${standing} was released into no snapshot of its own: ${JSON.stringify(released)}`);
+      t.diagnostic(`saved live from the standby as ${live.snapshot}, then released into ${released.snapshot}`);
+      // Restored again from that save, wherever its restore goes: its REPLs live, its files whole.
+      const again = await repl.read(standing, held);
+      assert.deepEqual([again.live, again.checkpointed], [`held until ${went}`, `held until ${went}`]);
+      assert.match(again.notice ?? "", CAME_BACK_WHOLE);
+      const first = await repl.read(standing, kept);
+      assert.deepEqual([first.live, first.checkpointed], [`restored into a standby by ${standing}`, `restored into a standby by ${standing}`]);
+      assert.deepEqual(
+        [await inSession(standing, digestOf("/workspace/standby/before")), await inSession(standing, digestOf("/workspace/standby/after"))],
+        [before, after],
+      );
     });
 
     test("a session saved on one node is restored on another, from the bucket, its REPL whole and its workspace's files with it, as a directory of the file system is no node's", { skip: AGENTS < 2 && "one node" }, async (t) => {

@@ -39,7 +39,14 @@ import { tarEntries } from "./tar.ts";
  * one before it, which sandboxes snapshotted under it are restored with, and
  * stargz-snapshotter's release.
  */
-export type NodePins = typeof pins;
+export type NodePins = typeof pins & {
+  /**
+   * The first gVisor release whose shim restores into a standby pod soundly, from which a
+   * kept release's sandboxes are restored into one (src/node-agent/names.ts
+   * restoresIntoStandby); none restores into one where none is named.
+   */
+  readonly gvisor: { readonly restoresIntoStandbySince?: string };
+};
 
 /** This version's pins, cluster/node/pins.json's. */
 export const NODE_PINS: NodePins = pins;

@@ -6,8 +6,8 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { before, test } from "node:test";
 
-import { CoreV1Api, KubeConfig, type V1Deployment, type V1Pod, type V1PodSpec, type V1PodTemplateSpec } from "@kubernetes/client-node";
-import { Deferred, Effect, Fiber, Layer, Schedule, Scope } from "effect";
+import { CoreV1Api, KubeConfig, type V1Deployment, type V1Node, type V1Pod, type V1PodSpec, type V1PodTemplateSpec } from "@kubernetes/client-node";
+import { Deferred, Effect, Exit, Fiber, Layer, Schedule, Scope } from "effect";
 import { TestClock } from "effect/testing";
 
 import { added, collected } from "./support/metrics.ts";
@@ -18,6 +18,7 @@ import { verifyToken } from "../src/binder/tokens.ts";
 import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
 import { RELEASES } from "../src/gateway/releases.ts";
 import { ATTACH_DURATION, DETACH_DURATION, makeSessions, type SessionsOptions } from "../src/gateway/sessions.ts";
+import { makeStandbys, type Standbys } from "../src/gateway/standbys.ts";
 import { KubeApiError, KubeClient } from "../src/kube/client.ts";
 import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
 import type { Released } from "../src/node-agent/workspaces.ts";
@@ -42,10 +43,22 @@ const core = () => {
 
 const run = <A, E>(effect: Effect.Effect<A, E, KubeClient>): Promise<A> => Effect.runPromise(Effect.provide(effect, Layer.fresh(KubeClient.layer)));
 
+/**
+ * The Node `name`, Ready, as its kubelet says it is, its not-ready taint off, which the API server gives a Node it admits
+ * and the node lifecycle controller takes off once it is Ready.
+ */
+async function readyNode(name: string): Promise<void> {
+  await core().createNode({ body: { apiVersion: "v1", kind: "Node", metadata: { name } } });
+  const node = await core().replaceNode({ name, body: { ...(await core().readNode({ name })), spec: { taints: [] } } });
+  await core().replaceNodeStatus({ name, body: { ...node, status: { conditions: [{ type: "Ready", status: "True", reason: "KubeletReady", message: "" }] } } });
+}
+
 before(async () => {
   process.env["KUBECONFIG"] = (await startKubeApiServer()).kubeconfig;
   // The RuntimeClass gVisor pods name, as the API server admits no pod of one there is not.
   await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor" }, handler: "runsc" } as never)));
+  // The node the pools' pods run on, Ready, as a node standbys are kept on is.
+  await readyNode("node-a");
 });
 
 let namespaces = 0;
@@ -197,7 +210,7 @@ const options = (env: SessionsEnvironment & { template?: V1PodTemplateSpec }, po
   mainNamespace: env.namespace,
   snapshots: {
     liveEverySeconds: 600,
-    releases: [{ release: "r1", runtimeClassName: "gvisor-r1", gofer: { transport: "socket", pagesRetry: true } }],
+    releases: [{ release: "r1", runtimeClassName: "gvisor-r1", gofer: { transport: "socket", pagesRetry: true }, standby: true }],
     templates: { none: { current: { ...env.template }, previous: null }, full: { current: { ...env.template }, previous: null } },
   },
   pools: { none: "sandboxes-none", full: "sandboxes-full" },
@@ -1021,6 +1034,162 @@ test("a workspace released into its snapshot is restored from it as it is next b
   assert.equal(((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/free=true")))) as V1Pod[]).length, 1);
 });
 
+/** The standbys of `env`'s pool on node-a, not being deleted, once there are `count` of them. */
+const standbysOf = async (env: SessionsEnvironment, count: number): Promise<V1Pod[]> => {
+  for (const deadline = Date.now() + 10_000;; await new Promise((resolve) => setTimeout(resolve, 50))) {
+    const found = ((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/standby=node-a")))) as V1Pod[]).filter((pod) => !pod.metadata?.deletionTimestamp);
+    if (found.length === count) return found;
+    assert.ok(Date.now() < deadline, `${count} standbys were not kept on node-a: ${found.map((pod) => pod.metadata?.name).join(", ")}`);
+  }
+};
+
+/** `name` of `env` running, as kubelet runs a pod, its address and its containers its own. */
+const runs = (env: SessionsEnvironment, name: string) =>
+  run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: `containerd://c-${name}`, state: { running: {} } }] } })));
+
+test("a workspace restored on a node is restored next into the standby kept there of its template and release, claimed for its binding, its workspace attached into the directory kubelet made, its snapshot restored into it, paused, by its node's agent, then resumed; another kept after it; and one whose restore fails is given up for a pod made for it", async () => {
+  const env = await environment(1, { gvisor: true });
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
+  const recorded = restoringAgents(manifestOf(env, "fs-first", "20261017T120000000Z-00000010"), { snapshot: "20261017T120000000Z-00000010", release: "r1" });
+  const into = { fails: false };
+  const agents: NodeAgents = {
+    ...recorded.agents,
+    restoreStandby: (node, request) =>
+      Effect.sync(() => void recorded.asked.push(`restore ${request.environment}/${request.workspace} into ${node} ${request.pod} from ${request.imagePath}`)).pipe(
+        Effect.andThen(into.fails ? Effect.fail(new NodeAgentError({ node, call: "restore into the standby", status: 500, reason: "its shim answered 500" })) : Effect.succeed({ containers: ["c-pause", "c-bayma"], milliseconds: [21, 312] })),
+      ),
+  };
+  const { binder, sessions } = await sessionsOf({ ...options(env, 7290), standbyAfterMs: 0 }, agents);
+  /** Binds `workspace`, released into `snapshot`: the pod it is bound to, once `ready` has let the pod it gets run. */
+  const restore = async (workspace: string, snapshot: string, ready: (pods: V1Pod[]) => Promise<void>) => {
+    recorded.state.current = manifestOf(env, workspace, snapshot);
+    recorded.state.released = { snapshot, release: "r1" };
+    const key = sessionKey(workspace);
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    const binding = Effect.runPromise(binder.bind(placement.pool, key, placement));
+    await ready((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/binding")))) as V1Pod[]);
+    const bound = await binding;
+    await spent(recorded.asked, "node-a", snapshot);
+    return bound.pod;
+  };
+  // The first on the node, which keeps none yet, into a pod made for it.
+  const first = await restore("fs-first", "20261017T120000000Z-00000010", async () => runs(env, (await restorePodOf(env)).metadata?.name ?? ""));
+  // A standby kept there after it, of its template and release: a restore's pod, unbound, booted as a standby on a socket of its own.
+  const [standby] = await standbysOf(env, 1);
+  const name = standby?.metadata?.name ?? "";
+  assert.match(name, /^sandboxes-none-restore-[0-9a-z]{7}$/u);
+  assert.notEqual(name, first);
+  const plain = (value: unknown) => JSON.parse(JSON.stringify(value)) as unknown;
+  assert.equal(standby?.spec?.runtimeClassName, "gvisor-r1");
+  assert.equal(standby?.spec?.restartPolicy, "Never");
+  assert.equal(standby?.metadata?.annotations?.["dev.gvisor.internal.restore.standby"], `/run/alasio/standby/${env.namespace}/${name}.sock`);
+  assert.equal(standby?.metadata?.annotations?.["dev.gvisor.internal.restore.host-image-path"], undefined);
+  assert.deepEqual([standby?.metadata?.labels?.["alasio.dev/binding"], standby?.metadata?.labels?.["alasio.dev/free"], standby?.metadata?.labels?.["alasio.dev/pool"]], [undefined, undefined, "sandboxes-none"]);
+  // Its own directory, which kubelet makes as it starts.
+  assert.deepEqual(plain(standby?.spec?.volumes?.find((volume) => volume.name === "attach")), { name: "attach", hostPath: { path: `/var/lib/alasio/attach/${env.namespace}/${name}`, type: "DirectoryOrCreate" } });
+  assert.deepEqual(plain(standby?.spec?.readinessGates), [{ conditionType: "alasio.dev/resumed" }]);
+  assert.deepEqual(plain(standby?.spec?.affinity?.nodeAffinity?.requiredDuringSchedulingIgnoredDuringExecution?.nodeSelectorTerms), [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["node-a"] }] }]);
+  // Claimed once it runs: restored into, as the next restore on the node.
+  await runs(env, name);
+  recorded.attached.length = 0;
+  recorded.asked.length = 0;
+  const second = await restore("fs-second", "20261017T120000000Z-00000011", async () => {});
+  assert.equal(second, name);
+  const claimed = (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, name)))) as V1Pod;
+  assert.equal(claimed.metadata?.labels?.["alasio.dev/standby"], undefined);
+  // Its resumed condition names the snapshot it runs on from, which no image's path on it says, for a gateway started again to spend it.
+  assert.equal(claimed.status?.conditions?.find(({ type }) => type === "alasio.dev/resumed")?.message, "20261017T120000000Z-00000011");
+  assert.equal(claimed.metadata?.annotations?.["alasio.dev/binding-key"], sessionKey("fs-second"));
+  assert.ok(claimed.metadata?.labels?.["alasio.dev/binding"]);
+  // Its workspace attached into the directory kubelet made, before its snapshot was restored into it, then resumed as a restore's pod is.
+  assert.deepEqual(recorded.attached.map(({ pod, made }) => ({ pod, made })), [{ pod: name, made: undefined }]);
+  assert.deepEqual(recorded.asked.slice(0, 3), [
+    "prepare node-a socket retrying pages",
+    `restore ${env.namespace}/fs-second into node-a ${name} from /var/lib/alasio/snapshots/${env.namespace}/fs-second/20261017T120000000Z-00000011`,
+    `resume node-a ${name} 20261017T120000000Z-00000011 on 7290, of ${64 * 1024 ** 2} bytes`,
+  ]);
+  // Another kept after it; one whose restore fails is given up, deleted, and the restore made into a pod of its own.
+  const [next] = await standbysOf(env, 1);
+  const nextName = next?.metadata?.name ?? "";
+  assert.notEqual(nextName, name);
+  await runs(env, nextName);
+  into.fails = true;
+  recorded.asked.length = 0;
+  const third = await restore("fs-third", "20261017T120000000Z-00000012", async () => {
+    for (const deadline = Date.now() + 10_000;; await new Promise((resolve) => setTimeout(resolve, 50))) {
+      const made = ((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/binding")))) as V1Pod[]).find((pod) =>
+        pod.metadata?.annotations?.["alasio.dev/binding-key"] === sessionKey("fs-third") && pod.metadata.name !== nextName
+      );
+      if (made) return runs(env, made.metadata?.name ?? "");
+      assert.ok(Date.now() < deadline, "no pod was made for the restore whose standby failed");
+    }
+  });
+  assert.notEqual(third, nextName);
+  assert.equal(await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, nextName))), null);
+  assert.deepEqual(recorded.asked.slice(0, 3), [
+    "prepare node-a socket retrying pages",
+    `restore ${env.namespace}/fs-third into node-a ${nextName} from /var/lib/alasio/snapshots/${env.namespace}/fs-third/20261017T120000000Z-00000012`,
+    "prepare node-a socket retrying pages",
+  ]);
+  assert.ok(recorded.detached.some((detached) => detached.startsWith(`node-a ${nextName} `)), recorded.detached.join(", "));
+});
+
+test("a restore into a standby that fails, the standby then not deleted, fails its bind rather than make the binding another pod beside it", async () => {
+  const env = await environment(1, { gvisor: true });
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
+  const recorded = restoringAgents(manifestOf(env, "fs-kept", "20261017T120000000Z-00000014"), { snapshot: "20261017T120000000Z-00000014", release: "r1" });
+  const into = { fails: false };
+  const agents: NodeAgents = {
+    ...recorded.agents,
+    restoreStandby: (node) => (into.fails ? Effect.fail(new NodeAgentError({ node, call: "restore into the standby", status: 500, reason: "its shim answered 500" })) : Effect.succeed({ containers: ["c-pause", "c-bayma"], milliseconds: [21, 312] })),
+  };
+  // Every standby's deletion by the gateway failing, as an API server that cannot be reached for it.
+  const { binder, sessions } = await sessionsOf({ ...options(env, 7290), standbyAfterMs: 0 }, agents, (kube) => ({
+    ...kube,
+    remove: (apiVersion, kind, namespace, name, resourceVersion) =>
+      kind === "Pod" && resourceVersion === undefined && into.fails ? Effect.fail(new KubeApiError({ status: 503, cause: new Error("unavailable") })) : kube.remove(apiVersion, kind, namespace, name, resourceVersion),
+  }));
+  const bind = async (workspace: string, snapshot: string) => {
+    recorded.state.current = manifestOf(env, workspace, snapshot);
+    recorded.state.released = { snapshot, release: "r1" };
+    const key = sessionKey(workspace);
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    return { key, bound: Effect.runPromise(binder.bind(placement.pool, key, placement)) };
+  };
+  // The first restore on the node, into a pod made for it, keeps a standby there.
+  const first = await bind("fs-kept", "20261017T120000000Z-00000014");
+  await runs(env, (await restorePodOf(env)).metadata?.name ?? "");
+  await first.bound;
+  const [standby] = await standbysOf(env, 1);
+  const name = standby?.metadata?.name ?? "";
+  await runs(env, name);
+  into.fails = true;
+  const second = await bind("fs-unkept", "20261017T120000000Z-00000015");
+  await assert.rejects(second.bound, /the standby \S+, given up, could not be deleted/u);
+  // No pod made for the binding beside the standby it claimed.
+  const bound = ((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/binding")))) as V1Pod[]).filter((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"] === second.key);
+  assert.deepEqual(bound.map((pod) => pod.metadata?.name), [name]);
+});
+
+test("a workspace restored under a release whose shim restores into no standby is kept none on its node, as its shim would run a standby's containers", async () => {
+  const env = await environment(1, { gvisor: true });
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
+  const snapshot = "20261017T120000000Z-00000013";
+  const recorded = restoringAgents(manifestOf(env, "fs-unkept", snapshot), { snapshot, release: "r1" });
+  const given = options(env, 7290);
+  const snapshots = given.snapshots ? { ...given.snapshots, releases: given.snapshots.releases.map((release) => ({ ...release, standby: false })) } : null;
+  const { binder, sessions } = await sessionsOf({ ...given, snapshots, standbyAfterMs: 0 }, recorded.agents);
+  const key = sessionKey("fs-unkept");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const binding = Effect.runPromise(binder.bind(placement.pool, key, placement));
+  await runs(env, (await restorePodOf(env)).metadata?.name ?? "");
+  await binding;
+  await spent(recorded.asked, "node-a", snapshot);
+  // Given the while one would be made in, of no wait.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepEqual(await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/standby"))), []);
+});
+
 test("a restore's node agent is asked to resume its sandbox as its pod is made, before the pod runs, as it waits for the pod itself, and the bind waits for its answer", async () => {
   const env = await environment(1, { gvisor: true });
   await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
@@ -1676,4 +1845,155 @@ test("a bound pod whose workspace its node can reach no more, as its node's moun
   // That one alone.
   assert.equal(await releasedFor(env.namespace, "broken"), brokenBefore + 1);
   assert.notEqual(other.pod, bound.pod);
+});
+
+// The gateway's standbys (../src/gateway/standbys.ts) alone: none kept on a node cordoned, not Ready or gone, a claim whose
+// answer was lost read again, and a gateway that stops deleting its own alone.
+
+/** The RuntimeClass the standbys name, made as their first namespace is, as the API server admits no pod of one there is not. */
+const STANDBY_RUNTIME_CLASS = "gvisor-standbys";
+
+let standbyNamespaces = 0;
+
+/** A namespace of sessions of its own for the standbys, its pool, and the pool's template. */
+async function standbySessions(): Promise<{ readonly namespace: string; readonly pool: Pool; readonly template: V1PodTemplateSpec }> {
+  const namespace = `standbys-${(standbyNamespaces += 1)}`;
+  await run(withKube((kube) => kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: namespace } })));
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: STANDBY_RUNTIME_CLASS }, handler: "runsc" } as never).pipe(Effect.ignore)));
+  const pool: Pool = { name: "sandboxes-none", namespace };
+  const template: V1PodTemplateSpec = {
+    metadata: { labels: { "alasio.dev/pool": pool.name, "alasio.dev/free": "true" }, annotations: { "alasio.dev/session-template": "t-current" } },
+    spec: { containers: [{ name: "bayma", image: "agent" }] },
+  };
+  return { namespace, pool, template };
+}
+
+/** The gateway's standbys of `namespace`, kept at once and looked at every 100 ms, their KubeClient as `kubeOf` makes it: and how they stop. */
+async function keptStandbys(namespace: string, kubeOf: (kube: KubeClient["Service"]) => KubeClient["Service"] = (kube) => kube): Promise<{ readonly standbys: Standbys; readonly stop: () => Promise<void> }> {
+  const scope = await Effect.runPromise(Scope.make());
+  const standbys = await run(makeStandbys(namespace, { afterMs: 0, sweepMs: 100 }).pipe(Scope.provide(scope), Effect.updateService(KubeClient, kubeOf)));
+  return { standbys, stop: () => Effect.runPromise(Scope.close(scope, Exit.void)) };
+}
+
+/** The standbys of `namespace` on `node`, not being deleted, once there are `count` of them, within five seconds. */
+async function standbysOnNode(namespace: string, node: string, count: number): Promise<V1Pod[]> {
+  for (const deadline = Date.now() + 5_000;; await new Promise((resolve) => setTimeout(resolve, 50))) {
+    const found = ((await run(withKube((kube) => kube.list("v1", "Pod", namespace, `alasio.dev/standby=${node}`)))) as V1Pod[]).filter((pod) => !pod.metadata?.deletionTimestamp);
+    if (found.length === count) return found;
+    assert.ok(Date.now() < deadline, `${count} standbys were not kept on ${node}: ${found.map((pod) => pod.metadata?.name).join(", ")}`);
+  }
+}
+
+/** `name` of `namespace` running, as kubelet runs a pod, its address and its containers its own. */
+const runsIn = (namespace: string, name: string) =>
+  run(withKube((kube) => kube.patchPodStatus(namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: `containerd://c-${name}`, state: { running: {} } }] } })));
+
+/** The Node `name`, cordoned where `cordoned`, of no condition: not Ready. */
+const nodeOf = (name: string, cordoned: boolean) => run(withKube((kube) => kube.create<V1Node>({ apiVersion: "v1", kind: "Node", metadata: { name }, spec: { unschedulable: cordoned } })));
+
+test("a standby is deleted once its node is cordoned or gone, and none is made on a node cordoned, not Ready or gone, as a drain would find it there, and one aimed at a node gone would stay pending", async () => {
+  const { namespace, pool, template } = await standbySessions();
+  const { standbys, stop } = await keptStandbys(namespace);
+  try {
+    await readyNode("node-cordoned");
+    await Effect.runPromise(standbys.keep(pool, "node-cordoned", template, STANDBY_RUNTIME_CLASS));
+    await standbysOnNode(namespace, "node-cordoned", 1);
+    await run(withKube((kube) => kube.patch("v1", "Node", "", "node-cordoned", { spec: { unschedulable: true } })));
+    await standbysOnNode(namespace, "node-cordoned", 0);
+    await Effect.runPromise(standbys.keep(pool, "node-cordoned", template, STANDBY_RUNTIME_CLASS));
+    await nodeOf("node-unready", false);
+    await Effect.runPromise(standbys.keep(pool, "node-unready", template, STANDBY_RUNTIME_CLASS));
+    await Effect.runPromise(standbys.keep(pool, "node-none", template, STANDBY_RUNTIME_CLASS));
+    // Kept on a node Ready, pending, and deleted once its Node is, as the cluster never collects a pod it never bound.
+    await readyNode("node-gone");
+    await Effect.runPromise(standbys.keep(pool, "node-gone", template, STANDBY_RUNTIME_CLASS));
+    await standbysOnNode(namespace, "node-gone", 1);
+    await run(withKube((kube) => kube.remove("v1", "Node", "", "node-gone")));
+    await standbysOnNode(namespace, "node-gone", 0);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    for (const node of ["node-cordoned", "node-unready", "node-none", "node-gone"]) await standbysOnNode(namespace, node, 0);
+  } finally {
+    await stop();
+    await run(withKube((kube) => Effect.forEach(["node-cordoned", "node-unready"], (name) => kube.remove("v1", "Node", "", name), { discard: true })));
+  }
+});
+
+test("a standby whose claim's answer was lost is the binding's where, read again, it carries its labels and annotations; one another restore claimed meanwhile is left to it", async () => {
+  const { namespace, pool, template } = await standbySessions();
+  const labels = { "alasio.dev/binding": "b-lost" };
+  const annotations = { "alasio.dev/binding-key": "session:lost" };
+  // Each claim made, and its answer lost, as a reset after the API server applied it.
+  for (const node of ["node-lost", "node-raced"]) await readyNode(node);
+  const { standbys, stop } = await keptStandbys(namespace, (kube) => ({ ...kube, replace: (object) => Effect.andThen(kube.replace(object), Effect.fail(new KubeApiError({ cause: new Error("socket hang up") }))) }));
+  try {
+    await Effect.runPromise(standbys.keep(pool, "node-lost", template, STANDBY_RUNTIME_CLASS));
+    const [standby] = await standbysOnNode(namespace, "node-lost", 1);
+    await runsIn(namespace, standby?.metadata?.name ?? "");
+    const claimed = await Effect.runPromise(standbys.claim(pool, "node-lost", template, STANDBY_RUNTIME_CLASS, labels, annotations));
+    assert.equal(claimed?.metadata?.name, standby?.metadata?.name);
+    assert.deepEqual([claimed?.metadata?.labels?.["alasio.dev/binding"], claimed?.metadata?.labels?.["alasio.dev/standby"], claimed?.metadata?.annotations?.["alasio.dev/binding-key"]], ["b-lost", undefined, "session:lost"]);
+  } finally {
+    await stop();
+  }
+  // Claimed by another restore between its read and this one's update, which the API server refuses (409): not this one's.
+  const rival = { "alasio.dev/binding": "b-rival" };
+  const { standbys: raced, stop: stopRaced } = await keptStandbys(namespace, (kube) => ({
+    ...kube,
+    replace: (object) => {
+      const { ["alasio.dev/standby"]: _standby, ...own } = object.metadata?.labels ?? {};
+      return Effect.andThen(kube.replace({ ...object, metadata: { ...object.metadata, labels: { ...own, ...rival } } }), kube.replace(object));
+    },
+  }));
+  try {
+    await Effect.runPromise(raced.keep(pool, "node-raced", template, STANDBY_RUNTIME_CLASS));
+    const [standby] = await standbysOnNode(namespace, "node-raced", 1);
+    await runsIn(namespace, standby?.metadata?.name ?? "");
+    assert.equal(await Effect.runPromise(raced.claim(pool, "node-raced", template, STANDBY_RUNTIME_CLASS, labels, annotations)), null);
+    const read = (await run(withKube((kube) => kube.read("v1", "Pod", namespace, standby?.metadata?.name ?? "")))) as V1Pod | null;
+    assert.equal(read?.metadata?.labels?.["alasio.dev/binding"], "b-rival");
+  } finally {
+    await stopRaced();
+  }
+});
+
+test("a gateway that starts deletes every standby there, a gateway's beside it among them, but none a restore claimed", async () => {
+  const { namespace, pool, template } = await standbySessions();
+  for (const node of ["node-beside", "node-claimed"]) await readyNode(node);
+  const beside = await keptStandbys(namespace);
+  try {
+    await Effect.runPromise(beside.standbys.keep(pool, "node-beside", template, STANDBY_RUNTIME_CLASS));
+    await Effect.runPromise(beside.standbys.keep(pool, "node-claimed", template, STANDBY_RUNTIME_CLASS));
+    await standbysOnNode(namespace, "node-beside", 1);
+    const [standby] = await standbysOnNode(namespace, "node-claimed", 1);
+    await runsIn(namespace, standby?.metadata?.name ?? "");
+    const claimed = await Effect.runPromise(beside.standbys.claim(pool, "node-claimed", template, STANDBY_RUNTIME_CLASS, { "alasio.dev/binding": "b-claimed" }, {}));
+    assert.equal(claimed?.metadata?.name, standby?.metadata?.name);
+    const starting = await keptStandbys(namespace);
+    await starting.stop();
+    await standbysOnNode(namespace, "node-beside", 0);
+    // Claimed, it carries the standby label no more: a session's pod, left to its binding.
+    const read = (await run(withKube((kube) => kube.read("v1", "Pod", namespace, standby?.metadata?.name ?? "")))) as V1Pod | null;
+    assert.ok(read && !read.metadata?.deletionTimestamp, "the claimed standby was deleted");
+  } finally {
+    await beside.stop();
+  }
+});
+
+test("a gateway that stops deletes the standbys it made, not those of a gateway rolled in beside it", async () => {
+  const { namespace, pool, template } = await standbySessions();
+  for (const node of ["node-before", "node-after"]) await readyNode(node);
+  const older = await keptStandbys(namespace);
+  const newer = await keptStandbys(namespace);
+  try {
+    await Effect.runPromise(older.standbys.keep(pool, "node-before", template, STANDBY_RUNTIME_CLASS));
+    await Effect.runPromise(newer.standbys.keep(pool, "node-after", template, STANDBY_RUNTIME_CLASS));
+    await standbysOnNode(namespace, "node-before", 1);
+    await standbysOnNode(namespace, "node-after", 1);
+    await older.stop();
+    await standbysOnNode(namespace, "node-before", 0);
+    await standbysOnNode(namespace, "node-after", 1);
+  } finally {
+    await newer.stop();
+  }
+  await standbysOnNode(namespace, "node-after", 0);
 });
