@@ -36,8 +36,7 @@
 # through, after it. Each change's steps are a section of their own below, between its BEGIN
 # and END lines, which the flow at the end of the script calls. None changes, before the
 # point of no return, what a run that fails there would have to make again: a step that does
-# brings what makes it again, for the flow to run as such a run ends. None has any yet: the
-# upgrade alone takes an installation of 10.0.9 to this release.
+# brings what makes it again, for the flow to run as such a run ends.
 #
 # Run again, it goes on from where it stopped: a run that failed before the point of no
 # return starts over. Once past it (OUT/point-of-no-return), a run again goes on from there,
@@ -53,6 +52,71 @@ fail() {
 }
 # Whether UPGRADE_CHECK passes now, what it said in OUT/upgrade-check.log.
 accepted() { bash -c "$UPGRADE_CHECK" >"$OUT/upgrade-check.log" 2>&1; }
+
+# BEGIN the sandbox gateway stopped.
+#
+# This release's node agents answer a restore as 10.0.9's did not: its prepare is given the
+# manifest the gateway read, and its resume is asked as its pod is made, with the port its bayma
+# serves on. The upgrade rolls the agents node by node, so 10.0.9's gateway, asking an agent
+# rolled already, would have its restore's prepare refused, and forget the snapshot it restores.
+# So, past the point of no return, before the upgrade, the gateway is stopped, its pods gone,
+# until the upgrade applies this release's, which it does once the node agents have rolled on
+# the Ready nodes, or ten minutes on regardless, saying which have not and why
+# (cli/src/manifests/sandbox-gateway.ts), and which restores through this release's agents
+# alone, deferring a restore no node of them can take while another's agent is not. Every
+# session operation goes through the gateway: while it is stopped, each fails, a turn's bind,
+# its execs and a session's release among them, as they do while it rolls, for longer. Once, as
+# OUT/gateway-stopped says it was, the count it ran at kept in OUT/gateway-replicas, as first
+# read. Should the upgrade fail, the failure says whether the gateway runs, as the upgrade may
+# have applied it before it failed; where it is stopped still, a run again goes on with the
+# upgrade, which starts it. To stay on 10.0.9 instead, while no node agent of this release runs
+# (kubectl -n alasio get pods -l app.kubernetes.io/component=node-agent -L
+# app.kubernetes.io/version), scale it back to that count (kubectl -n alasio scale deployment
+# alasio-sandbox-gateway --replicas=<count>), as the failure says; once one does, as where the
+# upgrade failed with the agents partly rolled, 10.0.9's gateway would have its restores refused
+# there, and the way back is forward alone: the cut-over run again. Its pods' end is waited for
+# STOP_WAIT_SECONDS (10 min) at most, looking every POLL_SECONDS (5).
+
+NS=alasio
+GATEWAY=alasio-sandbox-gateway
+STOP_WAIT_SECONDS=${STOP_WAIT_SECONDS:-600}
+POLL_SECONDS=${POLL_SECONDS:-5}
+k() { kubectl -n "$NS" "$@"; }
+# Whether alasio's namespace has no pod of the selector `$1` within `$2` seconds, looking every
+# POLL_SECONDS; the run failing where its pods cannot be listed, as nothing can be told then.
+gone() {
+  local waited=0 listed
+  while :; do
+    listed=$(k get pod -l "$1" -o name) || fail "the pods of $1 in $NS could not be listed"
+    [ -n "$listed" ] || return 0
+    [ "$waited" -lt "$2" ] || return 1
+    sleep "$POLL_SECONDS"
+    waited=$((waited + POLL_SECONDS))
+  done
+}
+# Fails the run as an upgrade that failed does, saying whether the sandbox gateway runs, as the upgrade may have applied it
+# before it failed, and the way on from there.
+upgrade_failed() {
+  local running
+  running=$(k get deployment "$GATEWAY" -o jsonpath='{.spec.replicas}') || running=""
+  case "$running" in
+    0) fail "the upgrade failed (upgrade.log): the sandbox gateway stays stopped, every session operation failing, until the cut-over run again gets the upgrade through; to stay on 10.0.9 instead, only while no node agent of this release runs (kubectl -n $NS get pods -l app.kubernetes.io/component=node-agent -L app.kubernetes.io/version), kubectl -n $NS scale deployment $GATEWAY --replicas=$(cat "$OUT/gateway-replicas"); once one runs, the cut-over run again is the way back" ;;
+    "") fail "the upgrade failed (upgrade.log), and whether it had started the sandbox gateway again could not be read (kubectl -n $NS get deployment $GATEWAY): the cut-over run again goes on with the upgrade" ;;
+    *) fail "the upgrade failed (upgrade.log) once it had started the sandbox gateway again, at $running: the cut-over run again goes on with the upgrade" ;;
+  esac
+}
+gateway_stopped_past() {
+  [ ! -e "$OUT/gateway-stopped" ] || return 0
+  log "stopping the sandbox gateway, so that no restore runs as the node agents roll: every session operation fails until the upgrade starts it again"
+  # Its count before the cut-over stopped it, kept as first read: a run again after a stop that failed reads none.
+  [ -e "$OUT/gateway-replicas" ] || { k get deployment "$GATEWAY" -o jsonpath='{.spec.replicas}' >"$OUT/gateway-replicas.read" && mv "$OUT/gateway-replicas.read" "$OUT/gateway-replicas"; } ||
+    fail "the sandbox gateway's count could not be read"
+  k scale deployment "$GATEWAY" --replicas=0 >/dev/null || fail "the sandbox gateway could not be stopped"
+  gone app.kubernetes.io/component=sandbox-gateway "$STOP_WAIT_SECONDS" || fail "the sandbox gateway did not stop within ${STOP_WAIT_SECONDS} s"
+  date -u +%FT%TZ >"$OUT/gateway-stopped"
+  log "the sandbox gateway stopped, to be started again by the upgrade"
+}
+# END the sandbox gateway stopped.
 
 command -v kubectl >/dev/null || fail "kubectl is not on root's PATH"
 [ -r "$CONFIG" ] || fail "CONFIG $CONFIG cannot be read"
@@ -77,9 +141,10 @@ fi
 
 if [ ! -e "$OUT/upgraded" ]; then
   [ "${FAIL_AT:-}" != past-the-point-of-no-return ] || fail "a failure injected past the point of no return, before the upgrade"
+  gateway_stopped_past
   log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
   printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
-  bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" || fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it"
+  bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" || upgrade_failed
   date -u +%FT%TZ >"$OUT/upgraded"
 fi
 [ "${FAIL_AT:-}" != after-the-upgrade ] || fail "a failure injected once the upgrade was through"

@@ -553,16 +553,19 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
 
   /**
    * The nodes that can restore `manifest` into a pod of `tolerations`, those holding its images
-   * first: they have its release, with every CPU feature it was saved with, and take the pod;
-   * whether every agent said what its node holds; and whether a node that has them is kept from
-   * the pod only by its readiness. What each node holds as its agent last said it (held), and
-   * each Node, are read at once.
+   * first: of those whose agent is of the gateway's release, which alone restore, they have its
+   * release, with every CPU feature it was saved with, and take the pod; whether every node's agent
+   * said what its node holds, one of another release, as one not yet rolled, or one not ready, as
+   * one starting, crashing or on a node that is not Ready, saying nothing, so that a restore that
+   * finds no node defers rather than fall back, for DEFER_FOR_MS at most, as every deferral; and
+   * whether a node that has them is kept from the pod only by its readiness. What each node holds
+   * as its agent last said it (held), and each Node, are read at once.
    */
   const nodesFor = (manifest: Manifest, tolerations: readonly V1Toleration[]) =>
     Effect.gen(function*() {
-      const found = yield* agents.nodes;
+      const { nodes: found, others, unready, unseen } = yield* agents.releaseNodes;
       const held = yield* Effect.forEach(found, (node) => agents.held(node).pipe(Effect.map((holdings) => [holdings]), Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as([])))), { concurrency: "unbounded" });
-      const answered = found.length > 0 && held.every((each) => each.length > 0);
+      const answered = found.length > 0 && others.length === 0 && unready.length === 0 && unseen === 0 && held.every((each) => each.length > 0);
       const capable = held.flat().filter(({ releases: installed }) =>
         installed.some(({ release, cpuFeatures }) => release === manifest.release && manifest.cpuFeatures.every((feature) => cpuFeatures.includes(feature)))
       );
@@ -570,7 +573,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       const able = capable.filter((_, index) => takes[index] === "takes");
       const holds = (cached: (typeof able)[number]["cached"]) =>
         cached.some(({ environment: of, workspace, images }) => of === manifest.environment && workspace === manifest.workspace && manifest.layers.every(({ digest }) => images.includes(digest)));
-      return { nodes: [...able.filter(({ cached }) => holds(cached)), ...able.filter(({ cached }) => !holds(cached))].map(({ node }) => node), answered, unready: takes.includes("unready") };
+      return { nodes: [...able.filter(({ cached }) => holds(cached)), ...able.filter(({ cached }) => !holds(cached))].map(({ node }) => node), answered, others, unanswered: unready, unseen, unready: takes.includes("unready") };
     });
 
   /**
@@ -656,9 +659,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       // pass; paused, too, where the snapshot was taken live and holds the session no more (410),
       // which no try restores, where the agent refused the request itself (4xx), and where it was
       // never sent, as its node has no agent ready, or none of this release's: abandoned, and
-      // deferred but where no try restores it. Its sandbox may have run where a command failed,
-      // or the pod did not accept once resumed (500), and where the call was sent and failed
-      // unanswered.
+      // deferred, as every deferral for DEFER_FOR_MS at most, but where no try restores it. Its
+      // sandbox may have run where a command failed, or the pod did not accept once resumed (500),
+      // and where the call was sent and failed unanswered.
       const resumed = agents.resume(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, policies, snapshot, port }, bytes).pipe(
         Effect.mapError((error) => {
           const status = error._tag === "NodeAgentError" ? error.status : undefined;
@@ -817,7 +820,13 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         if (able.success.nodes.length === 0) {
           const none = `no node that takes its pod has gVisor ${manifest.release} and every CPU feature it was saved with`;
           if (able.success.unready) return yield* deferOr(pool, workspace, "node", `${none}: one that has them is not Ready`);
-          return yield* (able.success.answered ? fallBack(pool, workspace, "node", none) : deferOr(pool, workspace, "node", `${none} of the nodes whose agents answered`));
+          const { others, unanswered, unseen } = able.success;
+          const unasked = [
+            ...(others.length === 0 ? [] : [`those of ${others.join(", ")} being of another release`]),
+            ...(unanswered.length === 0 ? [] : [`those of ${unanswered.join(", ")} not ready`]),
+            ...(unseen === 0 ? [] : [`${unseen} more of the agents' nodes having none yet`]),
+          ].map((said) => `, ${said}`).join("");
+          return yield* (able.success.answered ? fallBack(pool, workspace, "node", none) : deferOr(pool, workspace, "node", `${none} of the nodes whose agents answered${unasked}`));
         }
         // Each node tried in turn: one that cannot restore it (409) leaves the others; one whose bucket or agent fails may pass.
         const failures: (NodeAgentError | KubeApiError)[] = [];

@@ -10,7 +10,7 @@
  *
  * Its controllers are make-believe: what is applied is at once as the cluster would make
  * it once it runs (a CRD established, a Job complete, a workload rolled out with a ready
- * pod, or none once scaled to none, a deleted claim's volume reclaimed), unless the test says an object is stuck (its
+ * pod, a DaemonSet's of its revision, or none once scaled to none, a deleted claim's volume reclaimed), unless the test says an object is stuck (its
  * pods wait on an image pull the cluster warns about, its data is never deleted, or, a
  * Job's, it runs on) or, for a Job, fails.
  */
@@ -354,10 +354,22 @@ export async function serveFakeKube(): Promise<FakeKube> {
       const message = said.get(`${name}/${initName}`);
       return message === undefined ? [] : [{ name: initName, ready: false, restartCount: 0, image, imageID: "", state: { terminated: { exitCode: 0, reason: "Completed", message } } }];
     });
+    // A DaemonSet's revision, its pods labelled with its hash, as its controller labels them; and the cluster's one node its pod
+    // is on, Ready, where the test has not said what it is.
+    const revision = object.kind === "DaemonSet" ? { "controller-revision-hash": `${name}-${generation}` } : {};
+    if (object.kind === "DaemonSet") {
+      if (!objects.has("/api/v1/nodes/machine")) put("nodes", { apiVersion: "v1", kind: "Node", metadata: { name: "machine" }, status: { conditions: [{ type: "Ready", status: "True" }] } });
+      put("controllerrevisions", {
+        apiVersion: "apps/v1",
+        kind: "ControllerRevision",
+        metadata: { name: `${name}-${generation}`, ...(namespace ? { namespace } : {}), labels: { ...template?.metadata?.labels, ...revision }, ownerReferences: [{ uid: object.metadata["uid"] }] },
+        revision: generation,
+      });
+    }
     put("pods", {
       apiVersion: "v1",
       kind: "Pod",
-      metadata: { name: pod, ...(namespace ? { namespace } : {}), labels: template?.metadata?.labels ?? {}, creationTimestamp: new Date().toISOString() },
+      metadata: { name: pod, ...(namespace ? { namespace } : {}), labels: { ...template?.metadata?.labels, ...revision }, creationTimestamp: new Date().toISOString() },
       // On the cluster's one node, a pod stuck pulling its image as one that runs is.
       spec: { nodeName: "machine" },
       status: blocked
@@ -426,7 +438,8 @@ export async function serveFakeKube(): Promise<FakeKube> {
     const gone = [object];
     for (const [other, each] of [...objects]) {
       const inside = object.kind === "Namespace" && each.metadata.namespace === name;
-      const owned = each.kind === "Pod" && each.metadata.namespace === namespace && each.metadata.name.startsWith(`${name}-`);
+      const owned = (each.kind === "Pod" && each.metadata.namespace === namespace && each.metadata.name.startsWith(`${name}-`)) ||
+        ((each.metadata["ownerReferences"] as { uid?: unknown }[] | undefined) ?? []).some(({ uid }) => uid === object.metadata["uid"]);
       if (inside || owned) {
         objects.delete(other);
         gone.push(each);

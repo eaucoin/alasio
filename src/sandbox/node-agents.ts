@@ -2,22 +2,34 @@
  * The node agents (../node-agent/), as the sandbox gateway calls them: each node's, found by
  * its pod there, as the profile's `snapshots.agents` select them, reached on its pod's
  * address, with the token the gateway and they are given (ALASIO_NODE_AGENT_TOKEN).
+ *
+ * The agents roll node by node as alasio is upgraded, so for a while a node's may be of the
+ * release before the gateway's, as its pod's version label says. What every release's agents
+ * answer alike goes to whichever serves the node; what this release's answer otherwise, a
+ * restore's choice of its node, its prepare and its resume, goes to this release's alone
+ * (ownRelease), as one to an agent of another is never sent.
  */
-import type { V1Pod } from "@kubernetes/client-node";
+import type { V1DaemonSet, V1Pod } from "@kubernetes/client-node";
 import { Config, Duration, Effect, Exit, Redacted, Schedule, Schema, type Scope } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
+import { daemonPodNode } from "../kube/daemon-pods.ts";
 import type { Gofer } from "../node-agent/names.ts";
 import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, type PrepareRequest, type ResumeRequest, resumeMs, type WorkspaceRef } from "../node-agent/agent.ts";
 import { HOLDINGS_WAIT_MS, NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
 import { type PodOwner, Released, type StopRequest, type SyncRequest } from "../node-agent/workspaces.ts";
 
-/** Where the node agents are: their pods' namespace and labels, and the port they serve on. */
+/**
+ * Where the node agents are: their pods' namespace and labels, their DaemonSet's name, and the port they serve on; and the
+ * release the gateway is of, as their pods' version label names one.
+ */
 export interface NodeAgentsLocation {
   readonly namespace: string;
   readonly selector: string;
+  readonly daemonSet: string;
   readonly port: number;
+  readonly release: string;
 }
 
 /**
@@ -83,13 +95,21 @@ const OutcomeOf = <A, I>(value: Schema.Codec<A, I>) =>
 export interface NodeAgents {
   /** The nodes with a ready agent on them. */
   readonly nodes: Effect.Effect<readonly string[], KubeApiError>;
+  /**
+   * The nodes with a ready agent of the gateway's release on them, which alone restore; those whose ready agent is of
+   * another; those an agent's pod is on, or is to be on, of which none is ready, as one starting, crashing, not yet scheduled
+   * or on a node that is not Ready; and how many more nodes the agents' DaemonSet runs a pod on, or is to, have none listed
+   * yet, as one whose old pod is gone and whose new one is not yet made.
+   */
+  readonly releaseNodes: Effect.Effect<{ readonly nodes: readonly string[]; readonly others: readonly string[]; readonly unready: readonly string[]; readonly unseen: number }, KubeApiError>;
   /** Snapshots the sandbox of the container `request` names, on `node`, and commits it: its manifest. The sandbox ends. */
   readonly checkpoint: (node: string, request: CheckpointRequest) => Effect.Effect<Manifest, NodeAgentError | KubeApiError>;
   /**
    * The workspace's snapshot of `manifest`, its current one as alasio read it, prepared on
    * `node` for a restore there, its checkpoint gofer as `gofer` says, where it says; the
    * agent's own way where not. Refused, with no status, as what may pass, where the agent
-   * answered with a prepare of another snapshot of the workspace's, which ran as it was asked.
+   * answered with a prepare of another snapshot of the workspace's, which ran as it was asked;
+   * and, unsent, where the node's agent is not of the gateway's release.
    */
   readonly prepare: (node: string, workspace: WorkspaceRef, manifest: Manifest, gofer?: Gofer) => Effect.Effect<Prepared, NodeAgentError | KubeApiError>;
   /** The workspace's current snapshot, or null when it has none, as an agent reads it. */
@@ -112,7 +132,8 @@ export interface NodeAgents {
    * of `bytes` together, which its resume may wait on (resumeMs); answered once the pod accepts
    * connections on its bayma's port, as kubelet's readiness probe would find it ready. An agent
    * refuses one whose pod does not run, or whose policies are not in force, within its wait
-   * with 504, the sandbox left paused.
+   * with 504, the sandbox left paused. Refused unsent where the node's agent is not of the
+   * gateway's release.
    */
   readonly resume: (node: string, request: ResumeRequest, bytes: number) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /**
@@ -126,7 +147,8 @@ export interface NodeAgents {
   /**
    * What `node` holds, as its agent last said it: kept as it changes, by a request its agent
    * answers once it does (watchHoldings), so a restore's choice of its node asks no agent;
-   * asked of its agent where none is kept yet, as of an agent that has just started.
+   * asked of its agent where none is kept yet, as of an agent that has just started; refused
+   * unsent where it is not of the gateway's release.
    */
   readonly held: (node: string) => Effect.Effect<Holdings, NodeAgentError | KubeApiError>;
   /** The workspaces of `environment` the bucket holds anything of. */
@@ -211,7 +233,7 @@ const LONG_CALL = `${OPERATION_LIMIT_SECONDS} seconds` satisfies Duration.Input;
  */
 const OPERATION_POLLS = Schedule.min([Schedule.exponential("25 millis"), Schedule.spaced("500 millis")]);
 /**
- * How long the agents' addresses, as their pods were listed, are taken as they are: a
+ * How long the agents' addresses, as their pods were listed, and their DaemonSet's count of nodes, are taken as they are: a
  * restore's calls of its node's agent, a dozen within a second or two, list them once or
  * twice, and an agent started again on another address is found within it.
  */
@@ -226,7 +248,8 @@ const SYNC_CALL: Duration.Input = "90 seconds";
 /**
  * A call of an agent: what, with what (JSON, or bytes as they are), for how long; with
  * `absent`, a 404 is an answer, not a failure; with `seen`, asked as of what the tag names
- * (If-None-Match), a 304 is an answer too.
+ * (If-None-Match), a 304 is an answer too; with `ownRelease`, sent to an agent of the
+ * gateway's release alone.
  */
 interface AgentCall {
   readonly method: "GET" | "POST" | "PUT" | "DELETE";
@@ -236,6 +259,16 @@ interface AgentCall {
   readonly timeout: Duration.Input;
   readonly absent?: true;
   readonly seen?: string;
+  readonly ownRelease?: true;
+}
+
+/** The label an agent's pod says its release with. */
+const VERSION_LABEL = "app.kubernetes.io/version";
+
+/** A node's ready agent: where it is reached, and its release, as its pod's VERSION_LABEL says it; none where it says none. */
+interface Agent {
+  readonly base: string;
+  readonly release: string | null;
 }
 
 /** Whether `pod` runs, ready, with an address. */
@@ -249,16 +282,34 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
   const token = yield* Config.Redacted(NODE_AGENT_TOKEN_VARIABLE);
   const scope = yield* Effect.scope;
 
-  /** Each node's agent's address, by its node, as their pods were listed within ADDRESSES_TTL; a list that failed is not kept. */
-  const addresses: Effect.Effect<ReadonlyMap<string, string>, KubeApiError> = yield* kube.list("v1", "Pod", location.namespace, location.selector).pipe(
-    // Pods, as the API server lists them.
-    Effect.map((pods) =>
-      new Map((pods as readonly V1Pod[]).flatMap((pod) => {
-        const address = readyAt(pod);
-        return address && pod.spec?.nodeName ? [[pod.spec.nodeName, `http://${address}:${location.port}`] as const] : [];
-      }))
+  /** The agents' pods, as the API server lists them. */
+  const pods: Effect.Effect<readonly V1Pod[], KubeApiError> = Effect.map(kube.list("v1", "Pod", location.namespace, location.selector), (found) => found as readonly V1Pod[]);
+  /**
+   * Of the agents' pods `found`, each node's ready agent, by its node; and the nodes an agent's pod is on, or is to be on, of
+   * which none is ready, as one starting, crashing, not yet scheduled or on a node that is not Ready is.
+   */
+  const agentsOf = (found: readonly V1Pod[]): { readonly ready: ReadonlyMap<string, Agent>; readonly unready: ReadonlySet<string> } => {
+    const ready = new Map(found.flatMap((pod) => {
+      const address = readyAt(pod);
+      const agent: Agent = { base: `http://${address}:${location.port}`, release: pod.metadata?.labels?.[VERSION_LABEL] ?? null };
+      return address && pod.spec?.nodeName ? [[pod.spec.nodeName, agent] as const] : [];
+    }));
+    return { ready, unready: new Set(found.map(daemonPodNode).filter((node): node is string => node !== null && !ready.has(node))) };
+  };
+  /** What is read within ADDRESSES_TTL is taken as it is; a read that failed is not kept. */
+  const briefly = <A>(read: Effect.Effect<A, KubeApiError>) => Effect.cachedWithTTL(read, (exit) => (Exit.isSuccess(exit) ? ADDRESSES_TTL : Duration.zero));
+  /** Each node's ready agent, by its node, as their pods were listed (agentsOf), which every call is sent to: of the pods alone. */
+  const addresses: Effect.Effect<ReadonlyMap<string, Agent>, KubeApiError> = yield* briefly(Effect.map(pods, (found) => agentsOf(found).ready));
+  /**
+   * The agents, as their pods were listed (agentsOf), and how many nodes their DaemonSet runs a pod on, or is to, as it says
+   * (none where there is no DaemonSet): the pods and it read together, so the count is of the moment the pods are, for a
+   * restore's choice of its node alone, which a DaemonSet that cannot be read fails, and nothing else.
+   */
+  const counted: Effect.Effect<{ readonly ready: ReadonlyMap<string, Agent>; readonly unready: ReadonlySet<string>; readonly desired: number }, KubeApiError> = yield* briefly(
+    Effect.map(
+      Effect.all([pods, kube.read("apps/v1", "DaemonSet", location.namespace, location.daemonSet)], { concurrency: 2 }),
+      ([found, set]) => ({ ...agentsOf(found), desired: (set as V1DaemonSet | null)?.status?.desiredNumberScheduled ?? 0 }),
     ),
-    Effect.cachedWithTTL((exit) => (Exit.isSuccess(exit) ? ADDRESSES_TTL : Duration.zero)),
   );
 
   /** A call of the agent of `node`, `what` it is asked as a sentence ends: its answer's status, bytes, text and tag (its ETag), or why it failed. */
@@ -266,8 +317,12 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     Effect.gen(function*() {
       const failed = (reason: string, status?: number, retryAfter?: string | null) =>
         new NodeAgentError({ node, call: what, reason, ...(status === undefined ? {} : { status }), ...(retryAfter === undefined || retryAfter === null ? {} : { retryAfter }) });
-      const base = (yield* addresses).get(node);
-      if (!base) return yield* new NodeAgentError({ node, call: what, reason: "no agent is ready there", unsent: true });
+      const agent = (yield* addresses).get(node);
+      if (!agent) return yield* new NodeAgentError({ node, call: what, reason: "no agent is ready there", unsent: true });
+      if (request.ownRelease && agent.release !== location.release) {
+        return yield* new NodeAgentError({ node, call: what, reason: `its agent is of ${agent.release === null ? "no release it says" : `release ${agent.release}`}, not this gateway's ${location.release}`, unsent: true });
+      }
+      const { base } = agent;
       const { status, ok, bytes, retryAfter, tag } = yield* Effect.tryPromise({
         try: async (signal) => {
           const response = await fetch(`${base}${request.path}`, {
@@ -308,12 +363,13 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
    * What the agent of `node` comes to as it runs the operation of `path` (a checkpoint, a
    * prepare) of the workspace `request` names, which it runs whatever becomes of this
    * call: started, answered as it ended where its start waited for it to end, as a short
-   * prepare's does, else asked how it stands until it has ended, within LONG_CALL.
+   * prepare's does, else asked how it stands until it has ended, within LONG_CALL; each
+   * call as `sent` says (ownRelease).
    */
-  const operate = <A, I>(node: string, what: string, path: string, request: CheckpointRequest | PrepareRequest, value: Schema.Codec<A, I>): Effect.Effect<A, NodeAgentError | KubeApiError> =>
+  const operate = <A, I>(node: string, what: string, path: string, request: CheckpointRequest | PrepareRequest, value: Schema.Codec<A, I>, sent: Pick<AgentCall, "ownRelease"> = {}): Effect.Effect<A, NodeAgentError | KubeApiError> =>
     Effect.gen(function*() {
-      const begun = yield* send(node, what, { method: "POST", path, body: request, timeout: SHORT_CALL });
-      const standing = { method: "GET", path: `${path}/${encodeURIComponent(request.environment)}/${encodeURIComponent(request.workspace)}`, timeout: SHORT_CALL } as const;
+      const begun = yield* send(node, what, { method: "POST", path, body: request, timeout: SHORT_CALL, ...sent });
+      const standing = { method: "GET", path: `${path}/${encodeURIComponent(request.environment)}/${encodeURIComponent(request.workspace)}`, timeout: SHORT_CALL, ...sent } as const;
       const ended = begun.status === 200
         ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(OutcomeOf(value)))(begun.text).pipe(
           Effect.mapError((error) => new NodeAgentError({ node, call: what, reason: `its answer is not one: ${error.message}` })),
@@ -341,12 +397,12 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
 
   /** What `node` holds, as its agent says it now. */
   const holdingsNow = (node: string): Effect.Effect<TaggedHoldings, NodeAgentError | KubeApiError> =>
-    Effect.flatMap(send(node, holdingsCall, { method: "GET", path: "/holdings", timeout: SHORT_CALL }), (answered) => taggedIn(node, answered));
+    Effect.flatMap(send(node, holdingsCall, { method: "GET", path: "/holdings", timeout: SHORT_CALL, ownRelease: true }), (answered) => taggedIn(node, answered));
 
   /** What `node` holds once it is other than what the tag `seen` names, as its agent says it; null where it is not within HOLDINGS_WAIT_MS. */
   const holdingsSince = (node: string, seen: string): Effect.Effect<TaggedHoldings | null, NodeAgentError | KubeApiError> =>
     Effect.flatMap(
-      send(node, holdingsCall, { method: "GET", path: "/holdings", seen, timeout: HOLDINGS_CALL }),
+      send(node, holdingsCall, { method: "GET", path: "/holdings", seen, timeout: HOLDINGS_CALL, ownRelease: true }),
       (answered) => (answered.status === 304 ? Effect.succeed(null) : taggedIn(node, answered)),
     );
 
@@ -384,6 +440,15 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
 
   return {
     nodes: Effect.map(addresses, (known) => [...known.keys()]),
+    releaseNodes: Effect.map(counted, ({ ready, unready, desired }) => {
+      const all = [...ready];
+      return {
+        nodes: all.flatMap(([node, { release }]) => (release === location.release ? [node] : [])),
+        others: all.flatMap(([node, { release }]) => (release === location.release ? [] : [node])),
+        unready: [...unready],
+        unseen: Math.max(0, desired - ready.size - unready.size),
+      };
+    }),
     attach: (node, request) => send(node, `attach ${request.environment}/${request.workspace} into ${request.pod}`, { method: "POST", path: "/attach", body: request, timeout: SHORT_CALL }).pipe(Effect.asVoid),
     bindFree: (node, request) => send(node, `give ${request.namespace}/${request.pod} its binding`, { method: "POST", path: "/bindings", body: request, timeout: SHORT_CALL }).pipe(Effect.asVoid),
     detach: (node, namespace, pod, containerIds) => send(node, `detach what is attached into ${namespace}/${pod}`, { method: "POST", path: "/detach", body: { namespace, pod, containerIds }, timeout: SHORT_CALL }).pipe(Effect.asVoid),
@@ -447,7 +512,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     checkpoint: (node, request) => operate(node, `snapshot ${request.environment}/${request.workspace}`, "/checkpoints", request, Manifest),
     prepare: (node, workspace, manifest, gofer) => {
       const what = `prepare ${workspace.environment}/${workspace.workspace}'s snapshot ${manifest.snapshot}`;
-      return operate(node, what, "/prepare", { ...workspace, manifest, ...(gofer ? { gofer } : {}) }, Prepared).pipe(
+      return operate(node, what, "/prepare", { ...workspace, manifest, ...(gofer ? { gofer } : {}) }, Prepared, { ownRelease: true }).pipe(
         // Asked while one of another snapshot of the workspace's ran, which it is: refused, as one that may pass.
         Effect.filterOrFail(
           (prepared) => prepared.manifest.snapshot === manifest.snapshot,
@@ -489,7 +554,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
           Effect.map(({ kept }) => kept),
         ),
     resume: (node, request, bytes) =>
-      send(node, `resume ${request.environment}/${request.workspace}'s sandbox`, { method: "POST", path: "/resume", body: request, timeout: Duration.millis(resumeMs(bytes)) }).pipe(Effect.asVoid),
+      send(node, `resume ${request.environment}/${request.workspace}'s sandbox`, { method: "POST", path: "/resume", body: request, timeout: Duration.millis(resumeMs(bytes)), ownRelease: true }).pipe(Effect.asVoid),
     abandon: (node, request) =>
       ask(node, `abandon ${request.environment}/${request.workspace}'s restore`, { method: "POST", path: "/abandon", body: request, timeout: SHORT_CALL }, Abandoned).pipe(
         Effect.map(({ killed }) => killed),

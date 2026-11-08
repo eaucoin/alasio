@@ -57,7 +57,7 @@ import { goferOf, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
 import { hostPathOf, readUnder } from "../../src/node-agent/volume.ts";
 import { apiServerUnconfined } from "../src/install.ts";
 import { environmentAccess } from "../src/manifests/log.ts";
-import { carriedPools, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
+import { carriedPools, recordedCpuBaseline, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
 import { STOP_GRACE_SECONDS } from "../../src/binder/names.ts";
 import { STOP_CALLS_MS, STOP_LINGER_MS } from "../../src/binder/server.ts";
 import { folderStateDir, templateHash } from "../../src/gateway/names.ts";
@@ -2711,6 +2711,17 @@ describe("security", () => {
     assert.ok(STOP_LINGER_MS < STOP_CALLS_MS && STOP_CALLS_MS < STOP_GRACE_SECONDS * 1000);
   });
 
+  // A restore goes through its own release's node agents alone, so a gateway started as they roll defers it until they have.
+  test("applies the sandbox gateway once the node agents have rolled", () => {
+    const gateway = one<V1Deployment>(install(), "Deployment", "alasio-sandbox-gateway");
+    assert.equal(gateway.metadata?.annotations?.["alasio.dev/applied-once-rolled"], "DaemonSet/alasio/alasio-node-agent");
+    assert.equal(gateway.metadata?.annotations?.["alasio.dev/applied-after"], undefined);
+    assert.ok(install().some(({ kind, metadata }) => kind === "DaemonSet" && metadata?.name === "alasio-node-agent"));
+    // And reads that DaemonSet alone, as it says on how many nodes it runs an agent.
+    const role = all<V1Role>(install(), "Role").find(({ metadata }) => metadata?.name === "alasio-sandbox-gateway" && metadata.namespace === "alasio");
+    assert.deepEqual(role?.rules?.find(({ resources }) => resources?.includes("daemonsets")), { apiGroups: ["apps"], resources: ["daemonsets"], verbs: ["get"], resourceNames: ["alasio-node-agent"] });
+  });
+
   test("lets alasio label its own pod busy in its own namespace, and keep its last start in its ConfigMap of that, and nothing else, nothing of its sessions or folder instances, which are the sandbox gateway's", () => {
     const rolesOf = (objects: readonly KubernetesObject[]) =>
       Object.fromEntries(all<V1Role>(objects, "Role").filter((role) => role.metadata?.name === "alasio").map(({ metadata, rules }) => [metadata?.namespace, rules]));
@@ -3615,6 +3626,12 @@ describe("the sandbox service", () => {
     // Unchanged since: carried on; changed again: the second, the first no more.
     assert.deepEqual(carriedPools(configOf(cpu("102m")), gatewayOf(second), kept), carried);
     assert.deepEqual(carriedPools(configOf(cpu("103m")), gatewayOf(second), kept).none, templateOf(second, "none"));
+    // Of the release before's, a configuration this release's schema would not read whole, carried all the same, as across an
+    // upgrade, with the CPU baseline its pools hold sessions to.
+    const { nodeAgents: { release: _release, ...nodeAgents }, ...rest } = JSON.parse(gatewayOf(first) ?? "{}") as { nodeAgents: { release?: string } };
+    const before = JSON.stringify({ ...rest, nodeAgents, retired: true });
+    assert.deepEqual(carriedPools(configOf(cpu("102m")), before, kept), carried);
+    assert.deepEqual(recordedCpuBaseline(before), BASELINE);
     // Of a configuration that is none, or of sessions not snapshotted, none.
     assert.deepEqual(carriedPools(configOf(cpu("102m")), "{ not JSON", kept), { none: null, full: null });
     assert.deepEqual(carriedPools(configOf(cpu("102m")), gatewayOf(first), { ...kept, cpuBaseline: null }), { none: null, full: null });
@@ -3658,7 +3675,8 @@ describe("the sandbox service", () => {
       // A new session's volume's size, 10Gi by default.
       quotaBytes: 10 * 1024 ** 3,
       pools: { none: "sandboxes-none", full: "sandboxes-full" },
-      nodeAgents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", port: 8484 },
+      // Every release's node agents, this release's named, which alone restore.
+      nodeAgents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", daemonSet: "alasio-node-agent", port: 8484, release: VERSION },
       // Where bound pods' bayma exports its telemetry: the receiver's Service.
       receiver: { host: "alasio-receiver.alasio.svc.cluster.local", port: 4318 },
       // No folder workspaces, of no host profile.

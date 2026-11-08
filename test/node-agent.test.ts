@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 
-import type { V1Pod } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Pod } from "@kubernetes/client-node";
 import { Cause, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schedule, Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 
@@ -3107,24 +3107,43 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
     })
   ));
 
-/** alasio's client of the agents, of which there is `agent`, of node-1, served until the scope closes; `listed` told of each list of their pods. */
-const agentsOf = (agent: NodeAgent, workspaces: Workspaces = unusedWorkspaces, listed: () => void = () => {}) =>
+/** The release of alasio, whose client of the agents the tests' is, and of their agents, unless a test says. */
+const GATEWAY_RELEASE = "10.1.0";
+
+/**
+ * alasio's client of the agents, of which there is `agent`, of node-1, of `release`, served until the scope closes, beside the
+ * agents' pods `beside`, their DaemonSet running a pod on `desired` nodes, as each read of it says, one that says none refused;
+ * `listed` told of each list of their pods.
+ */
+const agentsOf = (agent: NodeAgent, workspaces: Workspaces = unusedWorkspaces, listed: () => void = () => {}, release = GATEWAY_RELEASE, beside: readonly V1Pod[] = [], desired: () => number | null = () => 1 + beside.length) =>
   Effect.gen(function*() {
     const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent, workspaces });
-    return yield* clientOf(port, listed);
+    return yield* clientOf(port, listed, release, beside, desired);
   });
 
-/** alasio's client of the agents, of which there is one, of node-1, on the loopback's `port`; `listed` told of each list of their pods. */
-const clientOf = (port: number, listed: () => void = () => {}) =>
+/**
+ * alasio's client of the agents, of which there is one, of node-1, of `release`, on the loopback's `port`, beside the agents'
+ * pods `beside`, their DaemonSet running a pod on `desired` nodes, as each read of it says, one that says none refused;
+ * `listed` told of each list of their pods.
+ */
+const clientOf = (port: number, listed: () => void = () => {}, release = GATEWAY_RELEASE, beside: readonly V1Pod[] = [], desired: () => number | null = () => 1 + beside.length) =>
   Effect.gen(function*() {
     const pod: V1Pod = {
-      metadata: { name: "node-agent-1", namespace: "alasio" },
+      metadata: { name: "node-agent-1", namespace: "alasio", labels: { "app.kubernetes.io/version": release } },
       spec: { nodeName: "node-1", containers: [] },
       status: { podIP: "127.0.0.1", conditions: [{ type: "Ready", status: "True" }] },
     };
-    const unreachable = () => Effect.die("only pods are listed");
-    const kube = KubeClient.of({ read: unreachable, list: () => Effect.sync(() => (listed(), [pod])), create: unreachable, replace: unreachable, patch: unreachable, patchPodStatus: unreachable, remove: unreachable, exec: unreachable, watch: () => Stream.die("nothing is watched") });
-    return yield* makeNodeAgents({ namespace: "alasio", selector: "app.kubernetes.io/component=node-agent", port }).pipe(
+    const unreachable = () => Effect.die("only pods are listed, and their DaemonSet read");
+    const read = (_apiVersion: string, kind: string) => (kind === "DaemonSet"
+      ? Effect.suspend(() => {
+        const count = desired();
+        return count === null
+          ? Effect.fail(new KubeApiError({ status: 403, cause: new Error("daemonsets.apps is forbidden") }))
+          : Effect.succeed({ apiVersion: "apps/v1", kind, status: { desiredNumberScheduled: count } } as KubernetesObject);
+      })
+      : unreachable());
+    const kube = KubeClient.of({ read, list: () => Effect.sync(() => (listed(), [pod, ...beside])), create: unreachable, replace: unreachable, patch: unreachable, patchPodStatus: unreachable, remove: unreachable, exec: unreachable, watch: () => Stream.die("nothing is watched") });
+    return yield* makeNodeAgents({ namespace: "alasio", selector: "app.kubernetes.io/component=node-agent", daemonSet: "alasio-node-agent", port, release: GATEWAY_RELEASE }).pipe(
       Effect.provide(Layer.merge(Layer.succeed(KubeClient, kube), ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ALASIO_NODE_AGENT_TOKEN: "the token" } })))),
     );
   });
@@ -3298,19 +3317,81 @@ test("an agent that stops refuses what it is asked of what its node holds as of 
     })
   ));
 
-test("alasio finds the agents' addresses by listing their pods once for the calls of a second, and anew after it", () =>
+test("alasio finds the agents' addresses by listing their pods once for the calls of a second, and anew after it, a restore's choice of its node reading their DaemonSet's count with them", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
       const here = yield* node("node-1");
       let lists = 0;
-      const agents = yield* agentsOf(here.agent, unusedWorkspaces, () => void (lists += 1));
+      let reads = 0;
+      // The DaemonSet runs a pod on one more node with each read, as one does while nodes join.
+      const agents = yield* agentsOf(here.agent, unusedWorkspaces, () => void (lists += 1), GATEWAY_RELEASE, [], () => (reads += 1));
       const ref = { environment: "main", workspace: "fs-abc" };
       for (let call = 0; call < 3; call += 1) assert.equal(yield* agents.current(ref), null);
       assert.deepEqual(yield* agents.nodes, ["node-1"]);
-      assert.equal(lists, 1);
+      for (let call = 0; call < 2; call += 1) assert.deepEqual(yield* agents.releaseNodes, { nodes: ["node-1"], others: [], unready: [], unseen: 0 });
+      assert.deepEqual([lists, reads], [2, 1]);
       yield* Effect.sleep("1100 millis");
       assert.equal(yield* agents.current(ref), null);
-      assert.equal(lists, 2);
+      assert.deepEqual(yield* agents.releaseNodes, { nodes: ["node-1"], others: [], unready: [], unseen: 1 });
+      assert.deepEqual([lists, reads], [4, 2]);
+    })
+  ));
+
+test("alasio asks the agents all but a restore's choice of its node by their pods alone, so a DaemonSet it cannot read fails none of it", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const agents = yield* agentsOf(here.agent, unusedWorkspaces, () => {}, GATEWAY_RELEASE, [], () => null);
+      const ref = { environment: "main", workspace: "fs-abc" };
+      assert.equal(yield* agents.current(ref), null);
+      assert.deepEqual(yield* agents.nodes, ["node-1"]);
+      const refused = yield* Effect.flip(agents.releaseNodes);
+      assert.equal(refused._tag, "KubeApiError");
+      assert.equal(yield* agents.current(ref), null);
+    })
+  ));
+
+test("alasio restores nothing through an agent of another release, as one not yet rolled is: its node is chosen by no restore, and its prepare, resume and holdings are never sent; all else it asks as it asks any", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const agents = yield* agentsOf(here.agent, unusedWorkspaces, () => {}, "10.0.9");
+      const ref = { environment: "main", workspace: "fs-abc" };
+      assert.deepEqual(yield* agents.nodes, ["node-1"]);
+      assert.deepEqual(yield* agents.releaseNodes, { nodes: [], others: ["node-1"], unready: [], unseen: 0 });
+      const asked = s3.requests.length;
+      for (const refused of [
+        yield* Effect.flip(agents.prepare("node-1", ref, RELEASED_MANIFEST)),
+        yield* Effect.flip(agents.resume("node-1", resumeRequest(RELEASED), 0)),
+        yield* Effect.flip(agents.held("node-1")),
+      ]) {
+        assert.ok(refused._tag === "NodeAgentError" && refused.unsent === true && refused.status === undefined, refused.message);
+        assert.match(refused.message, new RegExp(`its agent is of release 10\\.0\\.9, not this gateway's ${GATEWAY_RELEASE.replaceAll(".", "\\.")}$`, "u"));
+      }
+      assert.equal(s3.requests.length, asked);
+      // What every release's agents answer alike, it asks of it.
+      assert.equal(yield* agents.current(ref), null);
+      assert.ok(s3.requests.length > asked);
+    })
+  ));
+
+test("alasio counts a node whose agent's pod is not ready, as one starting, crashing, not yet scheduled or on a node that is not Ready is, among the unready, asking it nothing, and the nodes its DaemonSet runs one on of none listed yet", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const starting: V1Pod = { metadata: { name: "node-agent-2", namespace: "alasio", labels: { "app.kubernetes.io/version": GATEWAY_RELEASE } }, spec: { nodeName: "node-2", containers: [] }, status: { podIP: "127.0.0.2", conditions: [{ type: "Ready", status: "False" }] } };
+      // One made and not yet scheduled, the node it is to be on named by the affinity its DaemonSet gives it.
+      const unscheduled: V1Pod = {
+        metadata: { name: "node-agent-3", namespace: "alasio", labels: { "app.kubernetes.io/version": GATEWAY_RELEASE } },
+        spec: { containers: [], affinity: { nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["node-3"] }] }] } } } },
+        status: { phase: "Pending" },
+      };
+      // And the DaemonSet runs one on a fourth node, whose old pod is gone and whose new one is not yet made.
+      const agents = yield* agentsOf(here.agent, unusedWorkspaces, () => {}, GATEWAY_RELEASE, [starting, unscheduled], () => 4);
+      assert.deepEqual(yield* agents.releaseNodes, { nodes: ["node-1"], others: [], unready: ["node-2", "node-3"], unseen: 1 });
+      assert.deepEqual(yield* agents.nodes, ["node-1"]);
+      const refused = yield* Effect.flip(agents.held("node-2"));
+      assert.ok(refused._tag === "NodeAgentError" && refused.unsent === true, refused.message);
     })
   ));
 

@@ -8,11 +8,28 @@
  * ready, from its pods' state and the cluster's warnings about them. A workload's pod that
  * stops within its grace, as a node agent's does while restores read the bucket through
  * it, holds the wait past its timeout until it is gone, and the timeout after: the wait says
- * so, with what the pod last logged.
+ * so, with what the pod last logged. A DaemonSet is ready once it has rolled on the Ready nodes it
+ * runs a pod on, those not Ready left be (readyApartFromNotReady); and one a workload is held for is
+ * waited for to have rolled so for a while, and gone on from where it has not (awaitRolled).
  */
-import type { CoreV1Event, KubernetesObject, V1ContainerStatus, V1Deployment, V1Pod, V1StatefulSet } from "@kubernetes/client-node";
+import type {
+  CoreV1Event,
+  KubernetesObject,
+  V1ContainerStatus,
+  V1ControllerRevision,
+  V1DaemonSet,
+  V1Deployment,
+  V1Node,
+  V1NodeSelectorRequirement,
+  V1Pod,
+  V1PodSpec,
+  V1StatefulSet,
+  V1Taint,
+  V1Toleration,
+} from "@kubernetes/client-node";
 import { Clock, Duration, Effect, Schedule, Schema, Stream } from "effect";
 
+import { daemonPodNode } from "../../../src/kube/daemon-pods.ts";
 import { describeRef, kind, KubeApi, type KubeApiError, type ObjectRef } from "./api.ts";
 
 /**
@@ -306,7 +323,7 @@ const UNRETRIEVABLE_LOG = /^unable to retrieve container logs for /u;
  */
 const lastLogged = (pod: V1Pod): Effect.Effect<string, never, KubeApi> =>
   Effect.flatMap(KubeApi, (kube) =>
-    kube.logs(pod.metadata?.namespace ?? "", pod.metadata?.name ?? "", { container: pod.spec?.containers[0]?.name ?? "", tailLines: 1 }).pipe(
+    kube.logs(pod.metadata?.namespace ?? "", pod.metadata?.name ?? "", { container: (pod.spec?.containers ?? [])[0]?.name ?? "", tailLines: 1 }).pipe(
       Stream.decodeText,
       Stream.mkString,
       Effect.map((text) => text.trimEnd().split("\n").at(-1)?.trim() ?? ""),
@@ -315,12 +332,15 @@ const lastLogged = (pod: V1Pod): Effect.Effect<string, never, KubeApi> =>
     ));
 
 /**
- * Where `object`, a workload, is (readinessOf), and, while it waits, which of its pods stop,
- * each as it may until its grace ends, and what it last logged.
+ * Where `object`, a workload, is (readinessOf), a DaemonSet ready apart from the nodes that are not
+ * Ready (readyApartFromNotReady); and, while it waits, which of its pods stop, each as it may until
+ * its grace ends, and what it last logged.
  */
 const workloadReadiness = (object: KubernetesObject & { spec?: { selector?: { matchLabels?: Record<string, string> } } }): Effect.Effect<Readiness, KubeApiError, KubeApi> =>
   Effect.gen(function*() {
     const state = yield* readinessOf(object);
+    // What a DaemonSet runs on a node not Ready is not ready until that node is, which no wait mends.
+    if (state._tag === "Waiting" && object.kind === "DaemonSet" && (yield* readyApartFromNotReady(object as V1DaemonSet))) return READY;
     const matchLabels = object.spec?.selector?.matchLabels;
     if (state._tag !== "Waiting" || !matchLabels) return state;
     const kube = yield* KubeApi;
@@ -378,3 +398,155 @@ export const awaitGone = (refs: readonly ObjectRef[], options: WaitOptions): Eff
 /** Waits until every Job ref has ended, complete or failed, or is gone. */
 export const awaitEnded = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
   awaitAll(refs, (ref) => Effect.map(current(ref), (job) => (job === null || readiness(job)._tag !== "Waiting" ? READY : waiting("running"))), diagnose, options);
+
+const NODE = kind("Node");
+const CONTROLLER_REVISION = kind("ControllerRevision");
+
+/** Whether `node` is Ready, as its condition says. */
+const isReady = (node: V1Node): boolean => (node.status?.conditions ?? []).some(({ type, status }) => type === "Ready" && status === "True");
+
+/**
+ * The tolerations of the DaemonSet's pods: its template's own, and those its controller gives each beside them, as
+ * Kubernetes' AddOrUpdateDaemonPodTolerations does: of a node not ready or unreachable (NoExecute), of its pressures and
+ * its cordon (NoSchedule); and of its network not yet set up only for a pod on the host's network.
+ */
+const daemonTolerations = (template: V1PodSpec | undefined): V1Toleration[] => [
+  ...(template?.tolerations ?? []),
+  { key: "node.kubernetes.io/not-ready", operator: "Exists", effect: "NoExecute" },
+  { key: "node.kubernetes.io/unreachable", operator: "Exists", effect: "NoExecute" },
+  ...["disk-pressure", "memory-pressure", "pid-pressure", "unschedulable"].map((taint) => ({ key: `node.kubernetes.io/${taint}`, operator: "Exists", effect: "NoSchedule" })),
+  ...(template?.hostNetwork ? [{ key: "node.kubernetes.io/network-unavailable", operator: "Exists", effect: "NoSchedule" }] : []),
+];
+
+/** Whether `toleration` tolerates `taint`, as the scheduler matches them. */
+const tolerates = ({ key, operator, value, effect }: V1Toleration, taint: V1Taint): boolean =>
+  (effect === undefined || effect === "" || effect === taint.effect) &&
+  (operator === "Exists" ? key === undefined || key === "" || key === taint.key : key === taint.key && (value ?? "") === (taint.value ?? ""));
+
+/** Whether `node` meets `requirement` of a node selector term, of its labels or, for `metadata.name`, its name. */
+const meets = (node: V1Node, of: "labels" | "fields", { key, operator, values = [] }: V1NodeSelectorRequirement): boolean => {
+  const found = of === "fields" ? (key === "metadata.name" ? node.metadata?.name : undefined) : node.metadata?.labels?.[key];
+  switch (operator) {
+    case "In":
+      return found !== undefined && values.includes(found);
+    case "NotIn":
+      return found === undefined || !values.includes(found);
+    case "Exists":
+      return found !== undefined;
+    case "DoesNotExist":
+      return found === undefined;
+    case "Gt":
+    case "Lt": {
+      const [bound] = values;
+      if (found === undefined || bound === undefined || !/^-?\d+$/u.test(found)) return false;
+      return operator === "Gt" ? Number(found) > Number(bound) : Number(found) < Number(bound);
+    }
+    default:
+      return false;
+  }
+};
+
+/**
+ * Whether the DaemonSet `set` runs a pod on `node`, as its controller decides it: the node its template names, where it
+ * names one; one of every label its template's node selector names, of a term of its template's required node affinity
+ * (as each term is matched, its expressions and fields together, any one term enough), and whose taints that take effect
+ * on a pod (NoSchedule, NoExecute) its pods tolerate, those the controller gives them among (daemonTolerations). Its
+ * preferred affinity places no pod, and is not read.
+ */
+const runsOn = (set: V1DaemonSet, node: V1Node): boolean => {
+  const template = set.spec?.template.spec;
+  const labels = node.metadata?.labels ?? {};
+  const named = template?.nodeName === undefined || template.nodeName === "" || template.nodeName === node.metadata?.name;
+  const selected = Object.entries(template?.nodeSelector ?? {}).every(([key, value]) => labels[key] === value);
+  const terms = template?.affinity?.nodeAffinity?.requiredDuringSchedulingIgnoredDuringExecution?.nodeSelectorTerms;
+  const affine = terms === undefined || terms.some(({ matchExpressions = [], matchFields = [] }) =>
+    (matchExpressions.length > 0 || matchFields.length > 0) &&
+    matchExpressions.every((requirement) => meets(node, "labels", requirement)) && matchFields.every((requirement) => meets(node, "fields", requirement))
+  );
+  const tolerations = daemonTolerations(template);
+  const tolerated = (node.spec?.taints ?? []).filter(({ effect }) => effect === "NoSchedule" || effect === "NoExecute").every((taint) =>
+    tolerations.some((toleration) => tolerates(toleration, taint))
+  );
+  return named && selected && affine && tolerated;
+};
+
+/**
+ * Where the DaemonSet `set` has rolled: the nodes it runs a pod on (runsOn) that are Ready, cordoned or not, as a cordoned
+ * node still runs what is on it; and of those, each on which none of its pods, there or to be there, is of its current
+ * revision, running and ready, as one its rollout has not reached is, one crashing, one not yet scheduled, or one whose old
+ * pod is gone and whose new one is not yet made, with its pods; and how many it runs a pod on that are not Ready.
+ */
+const rolloutOf = (set: V1DaemonSet): Effect.Effect<{ readonly ready: number; readonly unrolled: readonly { readonly node: string; readonly pods: readonly V1Pod[] }[]; readonly notReady: number }, KubeApiError, KubeApi> =>
+  Effect.gen(function*() {
+    const kube = yield* KubeApi;
+    const namespace = set.metadata?.namespace;
+    const matchLabels = set.spec?.selector?.matchLabels ?? {};
+    const [pods, nodes, revisions] = yield* Effect.all([
+      kube.list<V1Pod>(POD, { namespace, labelSelector: podSelectorOf(matchLabels) }),
+      kube.list<V1Node>(NODE),
+      kube.list<V1ControllerRevision>(CONTROLLER_REVISION, { namespace, labelSelector: selectorOf(matchLabels) }),
+    ], { concurrency: 3 });
+    // Its current revision, the latest of its own, as its pods' controller-revision-hash label names it.
+    const current = revisions.filter(({ metadata }) => metadata?.ownerReferences?.some(({ uid }) => uid === set.metadata?.uid))
+      .sort((a, b) => b.revision - a.revision)[0]?.metadata?.labels?.["controller-revision-hash"];
+    const eligible = nodes.filter((node) => runsOn(set, node));
+    const byNode = new Map<string, V1Pod[]>(eligible.filter(isReady).map(({ metadata }) => [metadata?.name ?? "", []]));
+    for (const pod of pods) byNode.get(daemonPodNode(pod) ?? "")?.push(pod);
+    const rolled = (pod: V1Pod) =>
+      current !== undefined && pod.metadata?.deletionTimestamp === undefined && pod.metadata?.labels?.["controller-revision-hash"] === current &&
+      (pod.status?.conditions ?? []).some(({ type, status }) => type === "Ready" && status === "True");
+    return {
+      ready: byNode.size,
+      unrolled: [...byNode].filter(([, on]) => !on.some(rolled)).map(([node, on]) => ({ node, pods: on })),
+      notReady: eligible.length - byNode.size,
+    };
+  });
+
+/**
+ * Whether the DaemonSet `set`, whose readiness by its status falls short, is as ready as it can be: its controller has seen
+ * its rollout, it runs a pod on a Ready node (rolloutOf) and has rolled on every one, and what its status counts short,
+ * of the nodes it runs a pod on (desiredNumberScheduled), updated or ready, is no more than the nodes it runs one on that
+ * are not Ready, whose pods no apply readies until they are. One whose every node is not Ready, running nothing ready,
+ * is not; one that runs a pod on no node at all, of none desired, is ready by its status already.
+ */
+const readyApartFromNotReady = (set: V1DaemonSet): Effect.Effect<boolean, KubeApiError, KubeApi> =>
+  Effect.gen(function*() {
+    if ((set.status?.observedGeneration ?? 0) < (set.metadata?.generation ?? 0)) return false;
+    const { ready, unrolled, notReady } = yield* rolloutOf(set);
+    const desired = set.status?.desiredNumberScheduled ?? 0;
+    const short = desired - Math.min(set.status?.updatedNumberScheduled ?? 0, set.status?.numberReady ?? 0);
+    return ready > 0 && unrolled.length === 0 && short <= notReady;
+  });
+
+/**
+ * Waits, as `options` say, until the DaemonSet `ref` has rolled on the Ready nodes it runs a pod on (rolloutOf), cordoned or
+ * not, those not Ready left be: each runs one of its current revision, ready; and one that runs a pod on any node runs one on
+ * a Ready node. Whether it has; where not, said as a warning, naming each node it has not rolled on, with what is wrong with
+ * its pods and what each last logged, as a crashing one's says why, for its caller to go on regardless.
+ */
+export const awaitRolled = (ref: ObjectRef, options: WaitOptions): Effect.Effect<boolean, never, KubeApi> =>
+  awaitAll(
+    [ref],
+    (of) =>
+      Effect.gen(function*() {
+        const set = yield* (yield* KubeApi).get<V1DaemonSet>(of);
+        if (!set) return waiting("not found");
+        if ((set.status?.observedGeneration ?? 0) < (set.metadata?.generation ?? 0)) return waiting("not yet rolled out");
+        const { ready, unrolled } = yield* rolloutOf(set);
+        if (unrolled.length > 0) return waiting(`not rolled on ${unrolled.map(({ node }) => node).join(", ")}`);
+        return ready === 0 && (set.status?.desiredNumberScheduled ?? 0) > 0 ? waiting("no node it runs a pod on is Ready") : READY;
+      }),
+    (of) =>
+      Effect.gen(function*() {
+        const set = yield* (yield* KubeApi).get<V1DaemonSet>(of);
+        if (!set) return [];
+        const { unrolled } = yield* rolloutOf(set);
+        return yield* Effect.forEach(unrolled, ({ node, pods }) =>
+          Effect.map(Effect.forEach(pods, (pod) => Effect.map(lastLogged(pod), (line) => [...podProblems(pod), ...(line === "" ? [] : [`pod ${pod.metadata?.name} last saying: ${line}`])])), (said) =>
+            `node ${node}: ${pods.length === 0 ? "no pod of it yet" : said.flat().join("; ") || "its pod is not yet of the current revision"}`));
+      }),
+    options,
+  ).pipe(
+    Effect.as(true),
+    Effect.catch((error) => Effect.logWarning(`going on though ${describeRef(ref)} has not rolled on every Ready node it runs a pod on: ${error.message}`).pipe(Effect.as(false))),
+  );

@@ -68,7 +68,17 @@ export function componentName(component: string): string {
  */
 export const APPLIED_AFTER_ANNOTATION = "alasio.dev/applied-after";
 
-/** The value of APPLIED_AFTER_ANNOTATION that names `workloads`. */
+/**
+ * The annotation of a workload applied only once the DaemonSets it names have rolled on the
+ * Ready nodes they run a pod on, as APPLIED_AFTER_ANNOTATION names them, waited for ROLLED_WAIT
+ * at most and applied regardless after it, said (../kube/rollout.ts awaitRolled): for a
+ * workload that would rather not run beside the DaemonSet's pods of the release before, but
+ * must not be held from running by a node that is not Ready, or a pod of the DaemonSet's that
+ * crashes.
+ */
+export const APPLIED_ONCE_ROLLED_ANNOTATION = "alasio.dev/applied-once-rolled";
+
+/** The value of APPLIED_AFTER_ANNOTATION, or of APPLIED_ONCE_ROLLED_ANNOTATION, that names `workloads`. */
 export const appliedAfter = (workloads: readonly { readonly kind: string; readonly namespace: string; readonly name: string }[]): string =>
   workloads.map(({ kind, namespace, name }) => `${kind}/${namespace}/${name}`).join(",");
 

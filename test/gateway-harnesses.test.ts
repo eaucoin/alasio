@@ -74,6 +74,7 @@ function agents({ fails = false } = {}): { agents: NodeAgents; bound: (BindingRe
     detached,
     agents: {
       nodes: Effect.succeed(["node-a"]),
+      releaseNodes: unused(),
       current: unused, released: unused, attachments: unused, attach: unused, checkpoint: unused, stop: unused, setReleased: unused,
       prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, held: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
       readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, listEnvironments: unused(), quota: unused, sync: unused,

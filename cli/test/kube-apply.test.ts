@@ -20,7 +20,7 @@ import { installationObjects } from "../src/install.ts";
 import { kind, KubeApi } from "../src/kube/api.ts";
 import { applyInstallation, removeInstallation } from "../src/kube/apply.ts";
 import { checkAutoscalers } from "../src/kube/autoscalers.ts";
-import { READY_ONCE_BOUND_ANNOTATION, readiness, readinessOf } from "../src/kube/rollout.ts";
+import { awaitRolled, READY_ONCE_BOUND_ANNOTATION, readiness, readinessOf } from "../src/kube/rollout.ts";
 import { type FakeKube, serveFakeKube } from "./support/fake-kube.ts";
 
 const WAIT = { timeout: "2 seconds", poll: "10 millis" } as const;
@@ -108,7 +108,8 @@ test("an installation is applied as alasio, in the order what runs needs it, eve
     assert.equal(query.get("fieldManager"), "alasio");
     assert.equal(query.get("force"), "true");
   }
-  const stored = [...kube.objects.values()].filter(({ kind }) => kind !== "Pod");
+  // What the cluster makes of them, their pods and DaemonSets' revisions, and its node, aside.
+  const stored = [...kube.objects.values()].filter(({ kind }) => kind !== "Pod" && kind !== "ControllerRevision" && kind !== "Node");
   // All but the Jobs, deleted once run.
   assert.equal(stored.length, objectsOf().filter(({ kind }) => kind !== "Job").length);
   for (const object of stored) assert.equal(object.metadata.labels?.["alasio.dev/installation"], "alasio", `${object.kind} ${object.metadata.name}`);
@@ -253,17 +254,11 @@ test("a workload one of whose pods stops within its grace, as a node agent's doe
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   };
-  // Once it waits, past its timeout, it waits on, saying for what.
-  for (let waited = 0; !progress.some((line) => line.startsWith("waiting for ")); waited++) {
-    assert.ok(waited < 3000, progress.join("\n"));
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  // Once it waits for every workload, saying for what, it waits on past its timeout: whenever that wait begins, after the
+  // gateway's for the agents to roll, which that pod holds its bound.
+  await said(`waiting for alasio-node-agent (0 of 1 nodes ready; pod alasio-node-agent-before on machine stopping, as it may until ${until.toISOString()}, last saying: the node agent of machine stops once the restores reading the snapshots bucket through it are done: 1 read it now)`);
   await new Promise((resolve) => setTimeout(resolve, 1500));
   assert.equal(ended, false);
-  assert.ok(
-    progress.includes(`waiting for alasio-node-agent (0 of 1 nodes ready; pod alasio-node-agent-before on machine stopping, as it may until ${until.toISOString()}, last saying: the node agent of machine stops once the restores reading the snapshots bucket through it are done: 1 read it now)`),
-    progress.join("\n"),
-  );
   // What it last logged, alone read.
   assert.ok(kube.logReads.length > 0);
   assert.ok(kube.logReads.every((query) => query.get("tailLines") === "1"), kube.logReads.map(String).join("; "));
@@ -329,7 +324,8 @@ test("removing an installation keeps what holds data, and with purge deletes it 
   const { kube, run } = await rig(t);
   await run(applyInstallation(objectsOf(), WAIT));
   await run(removeInstallation({ purge: false }, WAIT));
-  const left = [...kube.objects.values()].filter(({ kind }) => kind !== "Pod").map(({ kind, metadata }) => `${kind} ${metadata.name}`).sort();
+  // The cluster's own, its pods and its node, aside.
+  const left = [...kube.objects.values()].filter(({ kind }) => kind !== "Pod" && kind !== "Node").map(({ kind, metadata }) => `${kind} ${metadata.name}`).sort();
   assert.deepEqual(left, [
     "CustomResourceDefinition cloudeventsources.eventing.keda.sh",
     "CustomResourceDefinition clustercloudeventsources.eventing.keda.sh",
@@ -344,7 +340,8 @@ test("removing an installation keeps what holds data, and with purge deletes it 
     "PersistentVolumeClaim alasio-seaweedfs-filer-store-backups",
   ]);
   await run(removeInstallation({ purge: true }, WAIT));
-  assert.deepEqual([...kube.objects.keys()], []);
+  // But the cluster's node.
+  assert.deepEqual([...kube.objects.keys()], ["/api/v1/nodes/machine"]);
 });
 
 test("what scales a workload is applied after the workloads, and a ScaledObject, which KEDA finalizes, is deleted and waited for before KEDA is, pruned or removed", async (t) => {
@@ -468,6 +465,8 @@ test("the nodes' mount of workspace storage is applied only once the Valkeys it 
   assert.match(error.message, /StatefulSet alasio\/alasio-valkey: /u);
   assert.ok(changed().includes("statefulsets/alasio-valkey"));
   assert.ok(!changed().includes("daemonsets/alasio-workspace-mount"), "the mount was applied as its metadata engine was not ready");
+  // The sandbox gateway, held for the node agents alone, applied all the same, the Valkeys' wait holding it not.
+  assert.ok(changed().includes("deployments/alasio-sandbox-gateway"), changed().join(", "));
   // Ready, the mount is applied after both Valkeys, said.
   kube.stuck.delete("alasio-valkey");
   const since = kube.changes.length;
@@ -476,6 +475,205 @@ test("the nodes' mount of workspace storage is applied only once the Valkeys it 
   const mount = order.indexOf("daemonsets/alasio-workspace-mount");
   assert.ok(mount > order.indexOf("statefulsets/alasio-valkey") && mount > order.indexOf("statefulsets/alasio-seaweedfs-filer-store"), order.join(", "));
   assert.ok(progress.includes("applying DaemonSet alasio/alasio-workspace-mount once StatefulSet alasio/alasio-valkey, StatefulSet alasio/alasio-seaweedfs-filer-store are ready"), progress.join("\n"));
+});
+
+test("the sandbox gateway is applied once the node agents have rolled on the Ready nodes, one not Ready holding it not, one cordoned as any other; an agent that does not run holds it its bound at most, said by its node and why, and what comes after is applied all the same", async (t) => {
+  const { kube, run, progress } = await rig(t);
+  const objects = objectsOf();
+  const agents = objects.find(({ kind: of, metadata }) => of === "DaemonSet" && metadata?.name === "alasio-node-agent");
+  assert.ok(agents, "the installation has no node agents");
+  const labels = (agents as { spec: { selector: { matchLabels: Record<string, string> } } }).spec.selector.matchLabels;
+  const nodeOf = (name: string, ready: boolean, unschedulable = false) =>
+    kube.objects.set(`/api/v1/nodes/${name}`, {
+      apiVersion: "v1",
+      kind: "Node",
+      metadata: { name },
+      spec: { unschedulable, taints: unschedulable ? [{ key: "node.kubernetes.io/unschedulable", effect: "NoSchedule" }] : [] },
+      status: { conditions: [{ type: "Ready", status: ready ? "True" : "Unknown" }] },
+    });
+  /** An agent of the release before's on `node`, not ready. */
+  const before = (node: string) =>
+    kube.objects.set(`/api/v1/namespaces/alasio/pods/alasio-node-agent-${node}`, {
+      apiVersion: "v1",
+      kind: "Pod",
+      metadata: { name: `alasio-node-agent-${node}`, namespace: "alasio", labels: { ...labels, "controller-revision-hash": "before" } },
+      spec: { nodeName: node },
+      status: { phase: "Running", conditions: [{ type: "Ready", status: "False" }] },
+    });
+  // The cluster's one node is Ready; another is not, with an agent of the release before's on it.
+  nodeOf("machine", true);
+  nodeOf("gone-quiet", false);
+  before("gone-quiet");
+  const patched = (from: number) => kube.changes.slice(from).filter(({ method }) => method === "PATCH").map(({ path }) => `${pluralOf(path)}/${path.split("/").at(-1)}`);
+  await run(applyInstallation(objects, WAIT));
+  // Waited on neither.
+  assert.ok(!progress.some((line) => line.startsWith("waiting for alasio-node-agent")), progress.join("\n"));
+  const order = patched(0);
+  assert.ok(order.indexOf("deployments/alasio-sandbox-gateway") > order.indexOf("daemonsets/alasio-node-agent"), order.join(", "));
+  assert.ok(!progress.some((line) => line.startsWith("going on though")), progress.join("\n"));
+
+  // A Ready node cordoned runs what is on it, sessions through its agent among them: its agent of the release before's holds
+  // the gateway its bound, said.
+  nodeOf("draining", true, true);
+  before("draining");
+  await run(applyInstallation(objects, { timeout: "500 millis", poll: "10 millis" }));
+  const cordoned = progress.find((line) => line.startsWith("going on though DaemonSet alasio/alasio-node-agent has not rolled"));
+  assert.ok(cordoned, progress.join("\n"));
+  assert.match(cordoned, /node draining: pod alasio-node-agent-draining is Running/u);
+  assert.doesNotMatch(cordoned, /gone-quiet|machine/u);
+  kube.objects.delete("/api/v1/nodes/draining");
+  kube.objects.delete("/api/v1/namespaces/alasio/pods/alasio-node-agent-draining");
+
+  // Its agent on the Ready node does not run: the gateway applied once its bound has passed, said, and the phase after it.
+  progress.length = 0;
+  kube.stuck.add("alasio-node-agent");
+  const since = kube.changes.length;
+  const error = await run(Effect.flip(applyInstallation(objects, { timeout: "500 millis", poll: "10 millis" })));
+  // The wait for every workload after the apply is its own, and fails as it did.
+  assert.equal(error._tag, "NotReadyInTime");
+  const after = patched(since);
+  assert.ok(after.includes("deployments/alasio-sandbox-gateway"), after.join(", "));
+  assert.ok(after.indexOf("deployments/alasio-sandbox-gateway") < after.findIndex((change) => change.startsWith("scaledobjects/") || change.startsWith("verticalpodautoscalers/")), after.join(", "));
+  const warned = progress.find((line) => line.startsWith("going on though DaemonSet alasio/alasio-node-agent has not rolled"));
+  assert.ok(warned, progress.join("\n"));
+  assert.match(warned, /node machine: container [^ ]+ of pod alasio-node-agent-0 is waiting: ImagePullBackOff/u);
+  assert.doesNotMatch(warned, /gone-quiet/u);
+});
+
+test("the sandbox gateway waits on a Ready node the node agents run on that has none of them yet, or one not yet scheduled, naming each; not on one whose taint they do not tolerate", async (t) => {
+  const { kube, run, progress } = await rig(t);
+  const objects = objectsOf();
+  const agents = objects.find(({ kind: of, metadata }) => of === "DaemonSet" && metadata?.name === "alasio-node-agent");
+  assert.ok(agents, "the installation has no node agents");
+  const labels = (agents as { spec: { selector: { matchLabels: Record<string, string> } } }).spec.selector.matchLabels;
+  const nodeOf = (name: string, taints: readonly Record<string, string>[] = []) =>
+    kube.objects.set(`/api/v1/nodes/${name}`, { apiVersion: "v1", kind: "Node", metadata: { name }, spec: { taints }, status: { conditions: [{ type: "Ready", status: "True" }] } });
+  nodeOf("machine");
+  // One whose old agent is gone and whose new one is not yet made; one whose new one is made and not yet scheduled; one the
+  // agents do not run on; and one whose network is not yet set up, which the controller gives a pod not on the host's
+  // network no toleration of.
+  nodeOf("between");
+  nodeOf("scheduling");
+  nodeOf("dedicated", [{ key: "example.com/dedicated", value: "other", effect: "NoSchedule" }]);
+  nodeOf("unnetworked", [{ key: "node.kubernetes.io/network-unavailable", effect: "NoSchedule" }]);
+  kube.objects.set("/api/v1/namespaces/alasio/pods/alasio-node-agent-scheduling", {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: "alasio-node-agent-scheduling", namespace: "alasio", labels },
+    spec: { affinity: { nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["scheduling"] }] }] } } } },
+    status: { phase: "Pending" },
+  });
+  // Applied all the same once its bound has passed, the DaemonSet's own status saying its one pod ready.
+  await run(applyInstallation(objects, { timeout: "500 millis", poll: "10 millis" }));
+  const warned = progress.find((line) => line.startsWith("going on though DaemonSet alasio/alasio-node-agent has not rolled"));
+  assert.ok(warned, progress.join("\n"));
+  assert.match(warned, /node between: no pod of it yet/u);
+  assert.match(warned, /node scheduling: pod alasio-node-agent-scheduling is Pending/u);
+  assert.doesNotMatch(warned, /machine|dedicated|unnetworked/u);
+});
+
+test("a DaemonSet is waited on to roll on the nodes its controller runs its pods on: by the node its template names, its node selector, its required node affinity, and the taints its pods tolerate, its own and those its controller gives them", async (t) => {
+  const { kube, run, progress } = await rig(t);
+  const node = (name: string, labels: Record<string, string>, taints: readonly Record<string, string>[] = [], ready = true) =>
+    kube.objects.set(`/api/v1/nodes/${name}`, { apiVersion: "v1", kind: "Node", metadata: { name, labels }, spec: { taints }, status: { conditions: [{ type: "Ready", status: ready ? "True" : "False" }] } });
+  const ours = { pool: "sessions", zone: "a" };
+  node("plain", ours);
+  node("cordoned", ours, [{ key: "node.kubernetes.io/unschedulable", effect: "NoSchedule" }]);
+  node("pressed", ours, [{ key: "node.kubernetes.io/memory-pressure", effect: "NoSchedule" }]);
+  node("tolerated", ours, [{ key: "example.com/dedicated", value: "agents", effect: "NoExecute" }]);
+  node("down", ours, [{ key: "node.kubernetes.io/not-ready", effect: "NoExecute" }], false);
+  node("unnetworked", ours, [{ key: "node.kubernetes.io/network-unavailable", effect: "NoSchedule" }]);
+  node("untolerated", ours, [{ key: "example.com/dedicated", value: "other", effect: "NoSchedule" }]);
+  node("unselected", { ...ours, pool: "other" });
+  node("elsewhere", { ...ours, zone: "b" });
+  node("unlabelled", { pool: "sessions" });
+  kube.put("daemonsets", {
+    apiVersion: "apps/v1",
+    kind: "DaemonSet",
+    metadata: { name: "node-service", namespace: "kube-system", uid: "node-service", generation: 1 },
+    spec: {
+      selector: { matchLabels: { app: "node-service" } },
+      template: {
+        metadata: { labels: { app: "node-service" } },
+        spec: {
+          containers: [{ name: "service", image: "example.com/node-service:1" }],
+          nodeSelector: { pool: "sessions" },
+          tolerations: [{ key: "example.com/dedicated", operator: "Equal", value: "agents" }],
+          affinity: { nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchExpressions: [{ key: "zone", operator: "In", values: ["a", "c"] }] }] } } },
+        },
+      },
+    },
+    status: { observedGeneration: 1, desiredNumberScheduled: 5, updatedNumberScheduled: 0, numberReady: 0 },
+  });
+  const rolled = await run(awaitRolled({ ...kind("DaemonSet"), namespace: "kube-system", name: "node-service" }, { timeout: "200 millis", poll: "10 millis" }));
+  assert.equal(rolled, false);
+  const warned = progress.find((line) => line.startsWith("going on though DaemonSet kube-system/node-service has not rolled"));
+  assert.ok(warned, progress.join("\n"));
+  const named = [...warned.matchAll(/node ([a-z-]+): no pod of it yet/gu)].map(([, name]) => name).sort();
+  assert.deepEqual(named, ["cordoned", "plain", "pressed", "tolerated"]);
+  // One whose template names its node runs a pod on that node alone.
+  kube.put("daemonsets", {
+    apiVersion: "apps/v1",
+    kind: "DaemonSet",
+    metadata: { name: "pinned", namespace: "kube-system", uid: "pinned", generation: 1 },
+    spec: {
+      selector: { matchLabels: { app: "pinned" } },
+      template: { metadata: { labels: { app: "pinned" } }, spec: { containers: [{ name: "service", image: "example.com/node-service:1" }], nodeName: "pressed" } },
+    },
+    status: { observedGeneration: 1, desiredNumberScheduled: 1, updatedNumberScheduled: 0, numberReady: 0 },
+  });
+  assert.equal(await run(awaitRolled({ ...kind("DaemonSet"), namespace: "kube-system", name: "pinned" }, { timeout: "200 millis", poll: "10 millis" })), false);
+  const pinned = progress.find((line) => line.startsWith("going on though DaemonSet kube-system/pinned has not rolled"));
+  assert.ok(pinned, progress.join("\n"));
+  assert.deepEqual([...pinned.matchAll(/node ([a-z-]+): no pod of it yet/gu)].map(([, name]) => name), ["pressed"]);
+});
+
+test("a DaemonSet whose pods are unready only on nodes not Ready is as ready as it can be, so the apply is through; one with none ready on a Ready node, or with an unready one on a Ready node cordoned, is not", async (t) => {
+  const { kube, run } = await rig(t);
+  const node = (name: string, ready: boolean, cordoned = false) =>
+    kube.objects.set(`/api/v1/nodes/${name}`, {
+      apiVersion: "v1",
+      kind: "Node",
+      metadata: { name },
+      spec: { unschedulable: cordoned, taints: cordoned ? [{ key: "node.kubernetes.io/unschedulable", effect: "NoSchedule" }] : [] },
+      status: { conditions: [{ type: "Ready", status: ready ? "True" : "Unknown" }] },
+    });
+  // The node the fake runs the node agents' one pod on is not Ready, its pod not ready with it; another is, its agent of the
+  // current revision ready, as the DaemonSet makes it.
+  node("machine", false);
+  node("other", true);
+  kube.stuck.add("alasio-node-agent");
+  const ofOther = "/api/v1/namespaces/alasio/pods/alasio-node-agent-other";
+  const mirrored = setInterval(() => {
+    const made = kube.get("/api/v1/namespaces/alasio/pods/alasio-node-agent-0");
+    if (!made || !kube.objects.has("/api/v1/nodes/other")) return;
+    kube.put("pods", { apiVersion: "v1", kind: "Pod", metadata: { name: "alasio-node-agent-other", namespace: "alasio", labels: { ...made.metadata.labels } }, spec: { nodeName: "other" }, status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] } });
+  }, 5);
+  t.after(() => clearInterval(mirrored));
+  await run(applyInstallation(objectsOf(), { timeout: "500 millis", poll: "10 millis" }));
+  // Its every node not Ready, it runs nothing ready, and is not.
+  kube.objects.delete("/api/v1/nodes/other");
+  kube.objects.delete(ofOther);
+  const none = await run(Effect.flip(applyInstallation(objectsOf(), { timeout: "500 millis", poll: "10 millis" })));
+  assert.equal(none._tag, "NotReadyInTime");
+  assert.match(none.message, /DaemonSet alasio\/alasio-node-agent: /u);
+  // A Ready node, cordoned or not, whose agent is not ready, holds it as before.
+  for (const cordoned of [false, true]) {
+    node("machine", true, cordoned);
+    const error = await run(Effect.flip(applyInstallation(objectsOf(), { timeout: "500 millis", poll: "10 millis" })));
+    assert.equal(error._tag, "NotReadyInTime");
+    assert.match(error.message, /DaemonSet alasio\/alasio-node-agent: /u);
+  }
+});
+
+test("an apply whose wait for the workloads others are held for fails, and whose apply of those held for DaemonSets to roll fails too, says both", async (t) => {
+  const { kube, run, progress } = await rig(t);
+  kube.stuck.add("alasio-valkey");
+  kube.busy.set("PATCH /apis/apps/v1/namespaces/alasio/deployments/alasio-sandbox-gateway", [{ status: 422 }]);
+  const error = await run(Effect.flip(applyInstallation(objectsOf(), { timeout: "300 millis", poll: "10 millis" })));
+  assert.equal(error._tag, "NotReadyInTime");
+  assert.match(error.message, /StatefulSet alasio\/alasio-valkey: /u);
+  assert.ok(progress.some((line) => line.startsWith("applying what was held for DaemonSets to roll failed too: ")), progress.join("\n"));
 });
 
 test("the wait for the Valkeys the mount waits on and the wait for every workload share one timeout: a Valkey ready only late leaves the rest what is left of it", async (t) => {

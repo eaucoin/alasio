@@ -96,6 +96,7 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
     saved,
     agents: {
       nodes: Effect.succeed(["node-a"]),
+      releaseNodes: Effect.succeed({ nodes: ["node-a"], others: [], unready: [], unseen: 0 }),
       // No workspace of theirs has a snapshot to restore, nor a record of a release, unless a test gives it one.
       current: () => Effect.succeed(null),
       released: () => Effect.succeed(null),
@@ -1151,6 +1152,64 @@ test("a workspace whose record names a snapshot it holds no more, or another tha
   }
 });
 
+test("a restore whose every node's agent is of another release, as one not yet rolled as alasio is upgraded, is deferred, its snapshot and its record kept, not fallen back", async () => {
+  const env = await environment(1, { gvisor: true });
+  const snapshot = "20261017T120000000Z-00000017";
+  const recorded = restoringAgents(manifestOf(env, "fs-rolling", snapshot), { snapshot, release: "r1" });
+  const { binder, sessions } = await sessionsOf(options(env, 7290), { ...recorded.agents, releaseNodes: Effect.succeed({ nodes: [], others: ["node-a"], unready: [], unseen: 0 }) });
+  const key = sessionKey("fs-rolling");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const counted = await added("alasio.sandbox.restores", async () => {
+    const refused = await Effect.runPromise(Effect.flip(binder.bind(placement.pool, key, placement)));
+    assert.match(refused.message, /deferred, to be tried again: .*of the nodes whose agents answered, those of node-a being of another release/u);
+  });
+  assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=deferred,alasio.sandbox.restore.fallback=node": 1 });
+  assert.equal(recorded.state.current?.snapshot, snapshot);
+  assert.equal(recorded.state.released?.snapshot, snapshot);
+  assert.ok(!recorded.asked.some((asked) => asked.startsWith("forget") || asked.startsWith("prepare")), recorded.asked.join("\n"));
+});
+
+test("a restore no node that answered can take, while another node's agent is not ready, as one starting or crashing is, is deferred, its snapshot kept, not fallen back", async () => {
+  const env = await environment(1, { gvisor: true });
+  const snapshot = "20261017T120000000Z-00000018";
+  const recorded = restoringAgents(manifestOf(env, "fs-unready-agent", snapshot), { snapshot, release: "r1" });
+  // Node-a's agent says it has no gVisor r1; node-b's is not ready.
+  const agents: NodeAgents = {
+    ...recorded.agents,
+    releaseNodes: Effect.succeed({ nodes: ["node-a"], others: [], unready: ["node-b"], unseen: 0 }),
+    held: (node) => Effect.succeed({ node, releases: [{ release: "r2", cpuFeatures: ["sse"] }], cached: [] }),
+  };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), agents);
+  const key = sessionKey("fs-unready-agent");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const counted = await added("alasio.sandbox.restores", async () => {
+    const refused = await Effect.runPromise(Effect.flip(binder.bind(placement.pool, key, placement)));
+    assert.match(refused.message, /deferred, to be tried again: .*of the nodes whose agents answered, those of node-b not ready/u);
+  });
+  assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=deferred,alasio.sandbox.restore.fallback=node": 1 });
+  assert.equal(recorded.state.current?.snapshot, snapshot);
+});
+
+test("a restore no node that answered can take, while a node the agents' DaemonSet runs on has no agent listed yet, as one whose old pod is gone and whose new one is not yet made, is deferred, its snapshot kept", async () => {
+  const env = await environment(1, { gvisor: true });
+  const snapshot = "20261017T120000000Z-00000019";
+  const recorded = restoringAgents(manifestOf(env, "fs-unseen-agent", snapshot), { snapshot, release: "r1" });
+  const agents: NodeAgents = {
+    ...recorded.agents,
+    releaseNodes: Effect.succeed({ nodes: ["node-a"], others: [], unready: [], unseen: 1 }),
+    held: (node) => Effect.succeed({ node, releases: [{ release: "r2", cpuFeatures: ["sse"] }], cached: [] }),
+  };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), agents);
+  const key = sessionKey("fs-unseen-agent");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const counted = await added("alasio.sandbox.restores", async () => {
+    const refused = await Effect.runPromise(Effect.flip(binder.bind(placement.pool, key, placement)));
+    assert.match(refused.message, /deferred, to be tried again: .*1 more of the agents' nodes having none yet/u);
+  });
+  assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=deferred,alasio.sandbox.restore.fallback=node": 1 });
+  assert.equal(recorded.state.current?.snapshot, snapshot);
+});
+
 /** An effect that says it has begun, then waits for `other` to have begun too, failing as `what` if it does not within two seconds: what two asked at once finish, and two asked one after the other do not. */
 const together = <A>(begun: Deferred.Deferred<void>, other: Deferred.Deferred<void>, what: string, value: A): Effect.Effect<A, NodeAgentError> =>
   Deferred.succeed(begun, undefined).pipe(
@@ -1168,6 +1227,7 @@ test("a restore reads its workspace's record and its current snapshot at once, a
   const agents: NodeAgents = {
     ...recorded.agents,
     nodes: Effect.succeed(["node-a", "node-b"]),
+    releaseNodes: Effect.succeed({ nodes: ["node-a", "node-b"], others: [], unready: [], unseen: 0 }),
     released: (ref) => together(record, current, "read its record", null).pipe(Effect.andThen(recorded.agents.released(ref))),
     current: (ref) => together(current, record, "read its snapshot", null).pipe(Effect.andThen(recorded.agents.current(ref))),
     held: (node) => together(node === "node-a" ? nodeA : nodeB, node === "node-a" ? nodeB : nodeA, "say what it holds", null).pipe(Effect.andThen(recorded.agents.held(node))),

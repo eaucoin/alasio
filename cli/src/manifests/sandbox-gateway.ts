@@ -50,8 +50,8 @@ import {
   BINDING_KEY_VARIABLE,
   CALLER_KEY_VARIABLE,
   GATEWAY_CONFIG_VARIABLE,
-  GatewayConfig as GatewayConfigSchema,
   type GatewayConfig,
+  GatewaySnapshots,
   FOLDERS_NAMESPACE_VARIABLE,
   RECEIVER_PORT_VARIABLE,
   SESSIONS_NAMESPACE_VARIABLE,
@@ -63,12 +63,14 @@ import { memoryBytes } from "../capacity.ts";
 import { NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { READY_ONCE_BOUND_ANNOTATION } from "../kube/rollout.ts";
+import { VERSION } from "../release.ts";
 import { type Carried, type CpuBaseline, type Kept, type PreviousPools, sessionsNamespace, stopWaitSeconds } from "./alasio.ts";
 import { folderTemplate, foldersRun } from "./folders.ts";
 import { harnessesConfig } from "./harness-pools.ts";
 import {
   accountRole,
   APPLIED_AFTER_ANNOTATION,
+  APPLIED_ONCE_ROLLED_ANNOTATION,
   appliedAfter,
   componentName,
   type Environment,
@@ -122,6 +124,13 @@ export const poolsOf = (config: InstallConfig, environment: Environment): Record
 };
 
 /**
+ * What `alasio up` carries forward of the live gateway's configuration, read alone: its snapshots' templates. The rest is
+ * the configuration of the release that wrote it, which another release's schema reads otherwise, as an upgrade's does:
+ * read whole, an upgrade would carry nothing.
+ */
+const LiveTemplates = Schema.Struct({ snapshots: Schema.NullOr(Schema.Struct({ templates: GatewaySnapshots.fields.templates })) });
+
+/**
  * Each sandbox pool's template before the current one, as the gateway's configuration it
  * replaces, `liveGateway` (its ConfigMap's `config.json`), carried it: the one it rendered, where
  * the template changes, or else the one it carried; none where it rendered none, as where its
@@ -133,7 +142,7 @@ export const poolsOf = (config: InstallConfig, environment: Environment): Record
 export function carriedPools(config: InstallConfig, liveGateway: string | undefined, kept: Kept): PreviousPools {
   const none: PreviousPools = { none: null, full: null };
   if (!poolsSnapshotted(kept.cpuBaseline) || liveGateway === undefined) return none;
-  const held = Schema.decodeUnknownOption(Schema.fromJsonString(GatewayConfigSchema))(liveGateway);
+  const held = Schema.decodeUnknownOption(Schema.fromJsonString(LiveTemplates))(liveGateway);
   if (held._tag === "None" || held.value.snapshots === null) return none;
   const pools = poolsOf(config, MAIN_ENVIRONMENT);
   const carry = (mode: keyof typeof POOLS): V1PodTemplateSpec | null => {
@@ -151,7 +160,7 @@ export function carriedPools(config: InstallConfig, liveGateway: string | undefi
  */
 export function recordedCpuBaseline(liveGateway: string | undefined): CpuBaseline {
   if (liveGateway === undefined) return null;
-  const held = Schema.decodeUnknownOption(Schema.fromJsonString(GatewayConfigSchema))(liveGateway);
+  const held = Schema.decodeUnknownOption(Schema.fromJsonString(LiveTemplates))(liveGateway);
   if (held._tag === "None") return null;
   const recorded = (held.value.snapshots?.templates.none.current as V1PodTemplateSpec | undefined)?.metadata?.annotations?.[CPU_FEATURES_ANNOTATION];
   return recorded ? recorded.split(",") : null;
@@ -320,10 +329,14 @@ function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
       }
       : null,
     pools: { none: POOLS.none, full: POOLS.full },
+    // Every release's node agents, as each serves its node's pods while they roll, node by node; a restore asks this
+    // release's alone, by its version, as those of another prepare and resume as it does not.
     nodeAgents: {
       namespace: NAMESPACE,
       selector: Object.entries(selectorLabels("node-agent")).map(([label, value]) => `${label}=${value}`).join(","),
+      daemonSet: componentName("node-agent"),
       port: NODE_AGENT_PORT,
+      release: VERSION,
     },
     receiver: { host: `${RECEIVER}.${NAMESPACE}.svc.cluster.local`, port: config.telemetry.receiverPort },
     // Folder conversations' instances, of the host profile, where the installation has folder workspaces.
@@ -380,8 +393,12 @@ function gatewayIdentity(): KubernetesObject[] {
     serviceAccount(GATEWAY, GATEWAY_COMPONENT),
     nodesRole,
     nodesBinding,
-    // The node agents, by their pods, which it attaches workspaces through.
-    ...accountRole(GATEWAY, GATEWAY_COMPONENT, NAMESPACE, [{ apiGroups: [""], resources: ["pods"], verbs: ["list"] }]),
+    // The node agents, by their pods, which it attaches workspaces through, and their DaemonSet, as it says on how many nodes
+    // it runs one (../../../src/sandbox/node-agents.ts).
+    ...accountRole(GATEWAY, GATEWAY_COMPONENT, NAMESPACE, [
+      { apiGroups: [""], resources: ["pods"], verbs: ["list"] },
+      { apiGroups: ["apps"], resources: ["daemonsets"], verbs: ["get"], resourceNames: [componentName("node-agent")] },
+    ]),
     ...environmentsFinder(GATEWAY, GATEWAY_COMPONENT),
   ];
 }
@@ -394,7 +411,14 @@ function gatewayObjects(config: InstallConfig, carried: Carried): KubernetesObje
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
     kind: "Deployment",
-    metadata: { name: GATEWAY, namespace: NAMESPACE, labels: labels(GATEWAY_COMPONENT) },
+    metadata: {
+      name: GATEWAY,
+      namespace: NAMESPACE,
+      labels: labels(GATEWAY_COMPONENT),
+      // Rolled once the node agents have, on the Ready nodes, or after a while regardless, as a restore goes through
+      // its own release's agents alone: one it started as they roll would be deferred until they had.
+      annotations: { [APPLIED_ONCE_ROLLED_ANNOTATION]: appliedAfter([{ kind: "DaemonSet", namespace: NAMESPACE, name: componentName("node-agent") }]) },
+    },
     spec: {
       replicas: 1,
       selector: { matchLabels: selectorLabels(GATEWAY_COMPONENT) },

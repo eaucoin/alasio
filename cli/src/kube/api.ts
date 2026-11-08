@@ -62,6 +62,8 @@ const KINDS = {
   Deployment: { apiVersion: "apps/v1", plural: "deployments", namespaced: true },
   StatefulSet: { apiVersion: "apps/v1", plural: "statefulsets", namespaced: true },
   DaemonSet: { apiVersion: "apps/v1", plural: "daemonsets", namespaced: true },
+  // What a DaemonSet's rollout is of: its revisions, their latest its current one.
+  ControllerRevision: { apiVersion: "apps/v1", plural: "controllerrevisions", namespaced: true },
   Job: { apiVersion: "batch/v1", plural: "jobs", namespaced: true },
   CronJob: { apiVersion: "batch/v1", plural: "cronjobs", namespaced: true },
   ScaledObject: { apiVersion: "keda.sh/v1alpha1", plural: "scaledobjects", namespaced: true },
