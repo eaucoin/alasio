@@ -39,7 +39,7 @@ import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.t
 import { BINDING_LABEL, FREE_LABEL, keyHash, leaseName, POOL_LABEL } from "../../src/binder/names.ts";
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { LAYERS_DIR } from "../../src/node-agent/cache.ts";
-import { BAYMA_CONTAINER, RESTORE_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
+import { BAYMA_CONTAINER, RESTORE_ANNOTATION, STANDBY_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
 import { compactionDue, type Manifest } from "../../src/node-agent/agent.ts";
 import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
 import { runscFlags } from "../../src/node-agent/runsc.ts";
@@ -341,7 +341,7 @@ function saveLogged(lines: readonly string[]): {
  * loaded, and its start to its load's end, runnable; the bytes its layers' loaders loaded; and
  * those lines.
  */
-function restoreLogged(lines: readonly string[]): {
+function restoreLogged(lines: readonly string[], standby = false): {
   readonly runscRestoreMs: number | null;
   readonly kernelLoadMs: number | null;
   readonly memoryLoadMs: number | null;
@@ -349,7 +349,8 @@ function restoreLogged(lines: readonly string[]): {
   readonly loadedBytes: number | null;
   readonly said: string[];
 } {
-  const first = lines.find((line) => logTimeMs(line) !== null);
+  // A standby's sandbox booted long before its restore: its restore's own start, as its boot process takes it up, instead.
+  const first = lines.find((line) => logTimeMs(line) !== null && (!standby || /Restoring a total of \d+ containers/u.test(line)));
   const restored = lines.find((line) => line.includes("Restore successful"));
   const loaded = lines.find((line) => line.includes("Overall load took"));
   // Each layer's loader's lines: its working set, its end, its rate and its budget.
@@ -400,6 +401,8 @@ async function watchRestore(workspace: string, release: string): Promise<{ reado
     if (!pod || containerId === "") continue;
     const node = pod.spec?.nodeName ?? "";
     const waited = await onNode(node, `${gvisorDirectory(release)}/runsc --root=${RUNSC_ROOT} wait --restore ${containerId}`).then(() => null, (error: unknown) => (error instanceof Error ? error.message : String(error)));
+    // A standby claimed, its containers created long before, until the restore into it begins.
+    if (waited !== null && pod.metadata?.annotations?.[STANDBY_ANNOTATION] !== undefined && /sandbox is not being restored, cannot wait for restore: state=created/u.test(waited)) continue;
     return { residentNs: waited === null ? now() : null, pod, error: waited };
   }
   throw new Error(`no restore's pod of ${workspace} had its container within 900 s`);
@@ -411,8 +414,9 @@ async function watchRestore(workspace: string, release: string): Promise<{ reado
  * cache; or the checkpoint gofer's options alone, the bucket, which the agent removes once the
  * sandbox resumes, leaving the directory without the image's files.
  */
-async function sourceOf(node: string, pod: V1Pod): Promise<"cache" | "bucket" | "unknown"> {
-  const directory = pod.metadata?.annotations?.[RESTORE_ANNOTATION] ?? "";
+async function sourceOf(node: string, pod: V1Pod, prepared: string): Promise<"cache" | "bucket" | "unknown"> {
+  // A standby's, which no annotation names, as its agent prepared it.
+  const directory = pod.metadata?.annotations?.[RESTORE_ANNOTATION] ?? (pod.metadata?.annotations?.[STANDBY_ANNOTATION] === undefined ? "" : prepared);
   if (directory === "") return "unknown";
   const said = (await onNode(node, `if [ -e '${directory}/pages.img' ]; then echo cache; elif [ -d '${directory}' ]; then echo bucket; else echo unknown; fi`)).trim();
   return said === "cache" || said === "bucket" ? said : "unknown";
@@ -462,9 +466,11 @@ async function restore(node: string, workspace: string, sessionId: string, fixtu
   const name = pod.metadata?.name ?? "";
   if (pod.spec?.nodeName !== node) throw new Error(`the restore's pod ${name} runs on ${pod.spec?.nodeName}, not on ${node}, whose counters the run reads`);
   const memory = await podMemory(node, pod.metadata?.uid ?? "");
-  const logged = restoreLogged(await bootLog(node, await sandboxIdOf(node, name)));
+  // Restored into a standby of its node's (src/gateway/standbys.ts), or into a pod made for it.
+  const standby = pod.metadata?.annotations?.[STANDBY_ANNOTATION] !== undefined;
+  const logged = restoreLogged(await bootLog(node, await sandboxIdOf(node, name)), standby);
   const prepared = await preparedLine(node, manifest.snapshot);
-  const source = await sourceOf(node, pod);
+  const source = await sourceOf(node, pod, `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/${manifest.snapshot}`);
   const logs = await loggedOf(node, workspace);
   const spike = await tracedRestore(node, workspace, probed as unknown as Record<string, unknown>);
   const resident = residentNs === null ? null : msBetween(BigInt(probed.t0_ns), residentNs);
@@ -499,7 +505,7 @@ async function restore(node: string, workspace: string, sessionId: string, fixtu
     page_cache: kind === "cold" ? "dropped" : PAGE_CACHE,
     compaction_at_t0: compactionAtT0(spike.steps),
   };
-  const details = { pod: name, node, source, prepared, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(), spike };
+  const details = { pod: name, node, standby, source, prepared, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(), spike };
   return { probed, metrics, details, pod: name };
 }
 
