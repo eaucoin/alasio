@@ -987,6 +987,106 @@ test("a workspace released into its snapshot is restored from it as it is next b
   assert.equal(((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/free=true")))) as V1Pod[]).length, 1);
 });
 
+/** The standbys of `env`'s pool on node-a, not being deleted, once there are `count` of them. */
+const standbysOf = async (env: SessionsEnvironment, count: number): Promise<V1Pod[]> => {
+  for (const deadline = Date.now() + 10_000;; await new Promise((resolve) => setTimeout(resolve, 50))) {
+    const found = ((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/standby=node-a")))) as V1Pod[]).filter((pod) => !pod.metadata?.deletionTimestamp);
+    if (found.length === count) return found;
+    assert.ok(Date.now() < deadline, `${count} standbys were not kept on node-a: ${found.map((pod) => pod.metadata?.name).join(", ")}`);
+  }
+};
+
+/** `name` of `env` running, as kubelet runs a pod, its address and its containers its own. */
+const runs = (env: SessionsEnvironment, name: string) =>
+  run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: `containerd://c-${name}`, state: { running: {} } }] } })));
+
+test("a workspace restored on a node is restored next into the standby kept there of its template and release, claimed for its binding, its workspace attached into the directory kubelet made, its snapshot restored into it, paused, by its node's agent, then resumed; another kept after it; and one whose restore fails is given up for a pod made for it", async () => {
+  const env = await environment(1, { gvisor: true });
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
+  const recorded = restoringAgents(manifestOf(env, "fs-first", "20261017T120000000Z-00000010"), { snapshot: "20261017T120000000Z-00000010", release: "r1" });
+  const into = { fails: false };
+  const agents: NodeAgents = {
+    ...recorded.agents,
+    restoreStandby: (node, request) =>
+      Effect.sync(() => void recorded.asked.push(`restore ${request.environment}/${request.workspace} into ${node} ${request.pod} from ${request.imagePath}`)).pipe(
+        Effect.andThen(into.fails ? Effect.fail(new NodeAgentError({ node, call: "restore into the standby", status: 500, reason: "its shim answered 500" })) : Effect.succeed({ containers: ["c-pause", "c-bayma"], milliseconds: [21, 312] })),
+      ),
+  };
+  const { binder, sessions } = await sessionsOf({ ...options(env, 7290), standbyAfterMs: 0 }, agents);
+  /** Binds `workspace`, released into `snapshot`: the pod it is bound to, once `ready` has let the pod it gets run. */
+  const restore = async (workspace: string, snapshot: string, ready: (pods: V1Pod[]) => Promise<void>) => {
+    recorded.state.current = manifestOf(env, workspace, snapshot);
+    recorded.state.released = { snapshot, release: "r1" };
+    const key = sessionKey(workspace);
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    const binding = Effect.runPromise(binder.bind(placement.pool, key, placement));
+    await ready((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/binding")))) as V1Pod[]);
+    const bound = await binding;
+    await spent(recorded.asked, "node-a", snapshot);
+    return bound.pod;
+  };
+  // The first on the node, which keeps none yet, into a pod made for it.
+  const first = await restore("fs-first", "20261017T120000000Z-00000010", async () => runs(env, (await restorePodOf(env)).metadata?.name ?? ""));
+  // A standby kept there after it, of its template and release: a restore's pod, unbound, booted as a standby on a socket of its own.
+  const [standby] = await standbysOf(env, 1);
+  const name = standby?.metadata?.name ?? "";
+  assert.match(name, /^sandboxes-none-restore-[0-9a-z]{7}$/u);
+  assert.notEqual(name, first);
+  const plain = (value: unknown) => JSON.parse(JSON.stringify(value)) as unknown;
+  assert.equal(standby?.spec?.runtimeClassName, "gvisor-r1");
+  assert.equal(standby?.spec?.restartPolicy, "Never");
+  assert.equal(standby?.metadata?.annotations?.["dev.gvisor.internal.restore.standby"], `/run/alasio/standby/${env.namespace}/${name}.sock`);
+  assert.equal(standby?.metadata?.annotations?.["dev.gvisor.internal.restore.host-image-path"], undefined);
+  assert.deepEqual([standby?.metadata?.labels?.["alasio.dev/binding"], standby?.metadata?.labels?.["alasio.dev/free"], standby?.metadata?.labels?.["alasio.dev/pool"]], [undefined, undefined, "sandboxes-none"]);
+  // Its own directory, which kubelet makes as it starts.
+  assert.deepEqual(plain(standby?.spec?.volumes?.find((volume) => volume.name === "attach")), { name: "attach", hostPath: { path: `/var/lib/alasio/attach/${env.namespace}/${name}`, type: "DirectoryOrCreate" } });
+  assert.deepEqual(plain(standby?.spec?.readinessGates), [{ conditionType: "alasio.dev/resumed" }]);
+  assert.deepEqual(plain(standby?.spec?.affinity?.nodeAffinity?.requiredDuringSchedulingIgnoredDuringExecution?.nodeSelectorTerms), [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["node-a"] }] }]);
+  // Claimed once it runs: restored into, as the next restore on the node.
+  await runs(env, name);
+  recorded.attached.length = 0;
+  recorded.asked.length = 0;
+  const second = await restore("fs-second", "20261017T120000000Z-00000011", async () => {});
+  assert.equal(second, name);
+  const claimed = (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, name)))) as V1Pod;
+  assert.equal(claimed.metadata?.labels?.["alasio.dev/standby"], undefined);
+  // Its resumed condition names the snapshot it runs on from, which no image's path on it says, for a gateway started again to spend it.
+  assert.equal(claimed.status?.conditions?.find(({ type }) => type === "alasio.dev/resumed")?.message, "20261017T120000000Z-00000011");
+  assert.equal(claimed.metadata?.annotations?.["alasio.dev/binding-key"], sessionKey("fs-second"));
+  assert.ok(claimed.metadata?.labels?.["alasio.dev/binding"]);
+  // Its workspace attached into the directory kubelet made, before its snapshot was restored into it, then resumed as a restore's pod is.
+  assert.deepEqual(recorded.attached.map(({ pod, made }) => ({ pod, made })), [{ pod: name, made: undefined }]);
+  assert.deepEqual(recorded.asked.slice(0, 3), [
+    "prepare node-a socket retrying pages",
+    `restore ${env.namespace}/fs-second into node-a ${name} from /var/cache/alasio/image`,
+    `resume node-a ${name} 20261017T120000000Z-00000011 on 7290, of ${64 * 1024 ** 2} bytes`,
+  ]);
+  // Another kept after it; one whose restore fails is given up, deleted, and the restore made into a pod of its own.
+  const [next] = await standbysOf(env, 1);
+  const nextName = next?.metadata?.name ?? "";
+  assert.notEqual(nextName, name);
+  await runs(env, nextName);
+  into.fails = true;
+  recorded.asked.length = 0;
+  const third = await restore("fs-third", "20261017T120000000Z-00000012", async () => {
+    for (const deadline = Date.now() + 10_000;; await new Promise((resolve) => setTimeout(resolve, 50))) {
+      const made = ((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/binding")))) as V1Pod[]).find((pod) =>
+        pod.metadata?.annotations?.["alasio.dev/binding-key"] === sessionKey("fs-third") && pod.metadata.name !== nextName
+      );
+      if (made) return runs(env, made.metadata?.name ?? "");
+      assert.ok(Date.now() < deadline, "no pod was made for the restore whose standby failed");
+    }
+  });
+  assert.notEqual(third, nextName);
+  assert.equal(await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, nextName))), null);
+  assert.deepEqual(recorded.asked.slice(0, 3), [
+    "prepare node-a socket retrying pages",
+    `restore ${env.namespace}/fs-third into node-a ${nextName} from /var/cache/alasio/image`,
+    "prepare node-a socket retrying pages",
+  ]);
+  assert.ok(recorded.detached.some((detached) => detached.startsWith(`node-a ${nextName} `)), recorded.detached.join(", "));
+});
+
 test("a restore's node agent is asked to resume its sandbox as its pod is made, before the pod runs, as it waits for the pod itself, and the bind waits for its answer", async () => {
   const env = await environment(1, { gvisor: true });
   await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));

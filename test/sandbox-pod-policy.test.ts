@@ -3,7 +3,8 @@
  * server holds pods to it: a pool's pod as its ReplicaSet makes it from its template is
  * admitted, and the same pod with any field it pins changed is refused; a pod bound changes its
  * binding's labels and annotations alone; no pod gets an ephemeral container; and no pod but a
- * pool's is made in a namespace of sessions. And the gateway's restores' readiness (the
+ * pool's is made in a namespace of sessions; a restore's pod, or a standby, is made by the gateway
+ * alone, and a standby claimed as a free pod is. And the gateway's restores' readiness (the
  * resumed-condition policy): it sets a restore's pod's resumed condition true, and nothing else
  * of any pod's status.
  */
@@ -315,4 +316,76 @@ test("the sandbox gateway sets a restore's pod's resumed condition true, and not
   for (const [what, patch] of Object.entries(changes)) assert.ok(refused(await statusPatchedAs(GATEWAY_USER, restore.name, patch)), what);
   // Of a free pod, gated on nothing, not even its condition.
   assert.ok(refused(await statusPatchedAs(GATEWAY_USER, free.name, resumed)), "a free pod");
+});
+
+/** A standby of the pool's, as the gateway makes it of its template, on `node`, changed as `change` says. */
+function standbyPod(node = "node-a", change: (pod: { metadata: Record<string, unknown>; spec: V1PodSpec }) => void = () => {}): V1Pod {
+  const name = `sandboxes-none-restore-${String((restores += 1)).padStart(7, "0")}`;
+  const own = ownDirectory(template?.spec as V1PodSpec, SESSIONS, name);
+  const { ["alasio.dev/free"]: _free, ...labels } = template?.metadata?.labels ?? {};
+  const [release] = gvisorReleases(NODE_PINS);
+  const pod = structuredClone({
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: {
+      name,
+      namespace: SESSIONS,
+      labels: { ...labels, "alasio.dev/standby": node },
+      annotations: { ...template?.metadata?.annotations, "dev.gvisor.internal.restore.standby": `/run/alasio/standby/${SESSIONS}/${name}.sock` },
+    },
+    spec: {
+      ...own,
+      volumes: own.volumes?.map((volume) => (volume.name === "attach" ? { ...volume, hostPath: { ...volume.hostPath!, type: "DirectoryOrCreate" } } : volume)),
+      restartPolicy: "Never",
+      runtimeClassName: gvisorRuntimeClass(release ?? ""),
+      readinessGates: [{ conditionType: "alasio.dev/resumed" }],
+      affinity: { nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: [node] }] }] } } },
+    },
+  });
+  change(pod as never);
+  return pod as V1Pod;
+}
+
+test("a standby of a pool's template is made by the sandbox gateway alone, booted as one on its own socket, its directory kubelet's, under a release kept, on one node, unbound; and a restore claims it as the binder claims a free pod", async () => {
+  const made = await madeAs(GATEWAY_USER, standbyPod());
+  assert.ok("name" in made, JSON.stringify(made));
+  const changes: Record<string, (pod: { metadata: Record<string, unknown>; spec: V1PodSpec }) => void> = {
+    "another release's": (pod) => void (pod.spec.runtimeClassName = "runc"),
+    "free": (pod) => void ((pod.metadata["labels"] as Record<string, string>)["alasio.dev/free"] = "true"),
+    "bound from the first": (pod) => void ((pod.metadata["labels"] as Record<string, string>)["alasio.dev/binding"] = "0".repeat(40)),
+    "no standby's label": (pod) => void delete (pod.metadata["labels"] as Record<string, string>)["alasio.dev/standby"],
+    "restored from an image": (pod) => void ((pod.metadata["annotations"] as Record<string, string>)["dev.gvisor.internal.restore.host-image-path"] = `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/fs-abc123/20261017T120000000Z-0000000a`),
+    "another pod's socket": (pod) => void ((pod.metadata["annotations"] as Record<string, string>)["dev.gvisor.internal.restore.standby"] = `/run/alasio/standby/${SESSIONS}/sandboxes-none-restore-0000000.sock`),
+    "a socket elsewhere": (pod) => void ((pod.metadata["annotations"] as Record<string, string>)["dev.gvisor.internal.restore.standby"] = "/run/containerd/containerd.sock"),
+    "no socket": (pod) => void delete (pod.metadata["annotations"] as Record<string, string>)["dev.gvisor.internal.restore.standby"],
+    "never resumed": (pod) => void (pod.spec.readinessGates = []),
+    "started again": (pod) => void (pod.spec.restartPolicy = "Always"),
+    "on any node": (pod) => void delete pod.spec.affinity,
+    "another image": (pod) => void (pod.spec.containers[0]!.image = "busybox"),
+    "another pod's directory": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = `/var/lib/alasio/attach/${SESSIONS}/sandboxes-none-0`),
+    "every pod's directory": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = "/var/lib/alasio/attach"),
+  };
+  for (const [what, change] of Object.entries(changes)) {
+    const refused = await madeAs(GATEWAY_USER, standbyPod("node-a", change));
+    assert.ok("refused" in refused && /sandbox-pods/u.test(refused.refused), `${what}: ${JSON.stringify(refused)}`);
+  }
+  // Nor by anyone but the gateway.
+  const other = await madeAs("system:serviceaccount:alasio:alasio", standbyPod());
+  assert.ok("refused" in other && /sandbox-pods/u.test(other.refused), JSON.stringify(other));
+  // Claimed, its standby's label taken off and its binding's put on, as the binder claims a free pod; nothing else of it changes.
+  const read = () => withKube((kube) => kube.read("v1", "Pod", SESSIONS, made.name)) as Promise<V1Pod>;
+  const replaced = (change: (pod: V1Pod) => void) =>
+    read().then((pod) => {
+      change(pod);
+      return withKube((kube) => kube.replace(pod).pipe(Effect.as("replaced"), Effect.catch((error) => Effect.succeed(error.message))));
+    });
+  assert.match(await replaced((pod) => void (pod.metadata!.annotations!["dev.gvisor.internal.restore.standby"] = "/run/containerd/containerd.sock")), /sandbox-pods/u);
+  assert.equal(await replaced((pod) => {
+    const labels = { ...pod.metadata?.labels };
+    delete labels["alasio.dev/standby"];
+    pod.metadata = { ...pod.metadata, labels: { ...labels, "alasio.dev/binding": "0".repeat(40) }, annotations: { ...pod.metadata?.annotations, "alasio.dev/binding-key": "sessionfs:fs-abc123", "karpenter.sh/do-not-disrupt": "true", "cluster-autoscaler.kubernetes.io/safe-to-evict": "false" } };
+  }), "replaced");
+  // Its resumed condition the gateway's to set, as a restore's pod's.
+  const resumed = { status: { conditions: [{ type: "alasio.dev/resumed", status: "True", lastTransitionTime: new Date().toISOString() }] } };
+  assert.ok("name" in (await statusPatchedAs(GATEWAY_USER, made.name, resumed)));
 });

@@ -43,6 +43,7 @@ import { GATEWAY_RESTART_MS } from "../../src/sandbox/gateway-passing.ts";
 import { TOKEN_TTL_MS } from "../../src/sandbox/gateway-client.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
+import { STANDBY_LABEL } from "../../src/kube/sandbox-shape.ts";
 import { SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
 import { NODE_PINS } from "../../cli/src/cluster/node.ts";
 import { ATTACH_ROOT, goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
@@ -1856,6 +1857,42 @@ if (inShard("snapshots")) {
       assert.ok(["CapPrm:", "CapEff:", "CapBnd:"].every((set) => capabilities.some((line) => line.startsWith(set))), held);
       assert.deepEqual(capabilities.filter((line) => !/^Cap\w+:\s+0+$/u.test(line)), [], held);
       await assertNoInternet(session);
+    });
+
+    test("a session restored where a restore ran before is restored into the standby its node keeps of the same template and gVisor release, claimed for it, whole, and another is kept there after it", async (t) => {
+      const standing = await newSession("none");
+      let { sessionId: kept } = await repl.set(standing, `restored by ${standing}`);
+      await untilReleased(standing, Date.now());
+      // Restored once, as any is, which keeps a standby on the node it was restored on.
+      const { node } = await bindSession(standing);
+      /** The standby of `node` that runs, each of its containers started, other than `besides`. */
+      const standbyOn = (besides = "") =>
+        until(`a standby running on ${node}`, async () =>
+          (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${STANDBY_LABEL}=${node}` })).find((pod) =>
+            pod.metadata?.name !== besides && !pod.metadata?.deletionTimestamp && pod.status?.phase === "Running" &&
+            (pod.status.containerStatuses ?? []).length > 0 && (pod.status.containerStatuses ?? []).every(({ state }) => state?.running !== undefined)
+          ), 300_000);
+      const standby = await standbyOn();
+      assert.match(standby.metadata?.name ?? "", /^sandboxes-none-restore-/u);
+      assert.equal(standby.metadata?.annotations?.["dev.gvisor.internal.restore.standby"], `/run/alasio/standby/${SESSIONS}/${standby.metadata?.name}.sock`);
+      // Released again, from the node that holds its images: restored into the standby, which it is bound to, its REPL whole.
+      ({ sessionId: kept } = await repl.set(standing, `restored into a standby by ${standing}`));
+      await untilReleased(standing, Date.now());
+      const asked = Date.now();
+      const bound = await bindSession(standing);
+      t.diagnostic(`bound ${Date.now() - asked} ms after it was asked for, on ${bound.node}`);
+      assert.deepEqual(bound, { name: standby.metadata?.name, node });
+      const claimed = await sessionPod(standing);
+      assert.equal(claimed.metadata?.labels?.[STANDBY_LABEL], undefined);
+      assert.ok(claimed.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True"), JSON.stringify(claimed.status?.conditions));
+      const seen = await repl.read(standing, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [`restored into a standby by ${standing}`, `restored into a standby by ${standing}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+      assertNoCapability(claimed);
+      await assertNoInternet(standing);
+      assert.ok((await gatewayLogs()).some((line) => line.includes(`restoring ${SESSIONS}/${standing} on ${node} into the standby ${standby.metadata?.name} `)), `the gateway logged no restore of ${standing} into ${standby.metadata?.name}`);
+      // Another kept on the node after it.
+      await standbyOn(standby.metadata?.name);
     });
 
     test("a session whose snapshot's image is corrupted comes back from bayma's checkpoints, as the gateway logs and bayma tells the next exec, which the alert on restores falling back says", async () => {
